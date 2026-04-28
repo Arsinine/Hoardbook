@@ -16,7 +16,7 @@
 	let path = '';
 	let pathAlias = '';
 	let depth = 3;
-	let excludeRaw = '.git, node_modules, __pycache__, .DS_Store';
+	let excludeRaw = '';
 	let hashFiles = true;
 	let watchChanges = true;
 	let publishTree = false;
@@ -38,10 +38,13 @@
 		try {
 			const exclude = excludeRaw.split(',').map((s) => s.trim()).filter(Boolean);
 			const collection = await scanDirectory({ path, path_alias: pathAlias, depth, exclude });
-			dispatch('scanned', collection);
-			close();
+			// Only dispatch result if the dialog is still open (user didn't cancel mid-scan).
+			if (open) {
+				dispatch('scanned', collection);
+				close();
+			}
 		} catch (e) {
-			toast(String(e), 'error');
+			if (open) toast(String(e), 'error');
 		} finally {
 			scanning = false;
 		}
@@ -49,6 +52,7 @@
 
 	function close() {
 		open = false;
+		scanning = false; // Reset so reopening the dialog is not stuck in "Scanning…"
 		path = '';
 		pathAlias = '';
 		depth = 3;
@@ -113,9 +117,14 @@
 				<div class="field">
 					<div class="field-label-row">
 						<label class="field-label">Exclude patterns</label>
-						<span class="field-hint">comma-separated</span>
+						<span class="field-hint">comma-separated, leave blank to include everything</span>
 					</div>
-					<input class="hb-input hb-mono" type="text" bind:value={excludeRaw} />
+					<input
+						class="hb-input hb-mono"
+						type="text"
+						placeholder=".git, node_modules, __pycache__, .DS_Store, *.tmp"
+						bind:value={excludeRaw}
+					/>
 				</div>
 
 				<!-- Toggles -->

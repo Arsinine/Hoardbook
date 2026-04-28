@@ -3,7 +3,7 @@ use hb_core::{
     DocType, SignedEnvelope,
     types::{Collection, DirectoryItem, ItemType},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::{
@@ -11,6 +11,15 @@ use crate::{
     store::DataStore,
     SharedIdentity, SharedRelay,
 };
+
+/// Collection with publication status, returned to the frontend.
+#[derive(Debug, Clone, Serialize)]
+pub struct CollectionEntry {
+    #[serde(flatten)]
+    pub collection: Collection,
+    /// True if this collection has been signed and published.
+    pub published: bool,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ScanOptions {
@@ -33,15 +42,17 @@ pub async fn scan_directory(
 
     let depth = opts.depth.min(10);
     let slug = Collection::slug_from_alias(&opts.path_alias);
-    let listing = scan_recursive(root, depth, 0, &opts.exclude).map_err(cmd_err)?;
+    let (listing, total_bytes) = scan_recursive(root, depth, 0, &opts.exclude).map_err(cmd_err)?;
     let item_count = count_items(&listing);
+    let est_size = if total_bytes > 0 { Some(format_size(total_bytes)) } else { None };
 
     let collection = Collection {
         slug,
         path_alias: opts.path_alias,
         description: None,
         item_count,
-        est_size: None,
+        est_size,
+        total_bytes,
         content_type: vec![],
         last_updated: chrono::Utc::now(),
         listing,
@@ -61,12 +72,59 @@ pub async fn scan_directory(
 }
 
 #[tauri::command]
-pub async fn get_collections(store: State<'_, DataStore>) -> CmdResult<Vec<Collection>> {
+pub async fn delete_collection(
+    slug: String,
+    store: State<'_, DataStore>,
+) -> CmdResult<()> {
+    let safe_slug = is_valid_slug(&slug)
+        .then_some(slug.as_str())
+        .ok_or("Invalid collection slug")?;
+    store.delete_collection(safe_slug).map_err(cmd_err)
+}
+
+#[tauri::command]
+pub async fn get_collections(store: State<'_, DataStore>) -> CmdResult<Vec<CollectionEntry>> {
+    // Signed (published) collections.
     let envelopes = store.list_collections().map_err(cmd_err)?;
-    envelopes
+    let mut entries: Vec<CollectionEntry> = envelopes
         .into_iter()
-        .map(|env| env.parse_payload::<Collection>().map_err(cmd_err))
-        .collect()
+        .filter_map(|env| env.parse_payload::<Collection>().ok())
+        .map(|c| CollectionEntry { collection: c, published: true })
+        .collect();
+
+    // Draft-only collections (scanned but not yet published).
+    let draft_slugs = store.list_draft_only_slugs().map_err(cmd_err)?;
+    for slug in draft_slugs {
+        if let Ok(Some(col)) = store.load_collection_draft(&slug) {
+            entries.push(CollectionEntry { collection: col, published: false });
+        }
+    }
+
+    entries.sort_by(|a, b| a.collection.path_alias.cmp(&b.collection.path_alias));
+    Ok(entries)
+}
+
+/// Update the editable metadata fields (description, content_type) of a collection draft.
+#[tauri::command]
+pub async fn update_collection_meta(
+    slug: String,
+    description: Option<String>,
+    content_type: Vec<String>,
+    store: State<'_, DataStore>,
+) -> CmdResult<()> {
+    let safe_slug = is_valid_slug(&slug)
+        .then_some(slug.as_str())
+        .ok_or("Invalid collection slug")?;
+
+    // Load the draft, update fields, and re-save.
+    let mut col = store
+        .load_collection_draft(safe_slug)
+        .map_err(cmd_err)?
+        .ok_or_else(|| format!("No draft found for collection '{safe_slug}'"))?;
+
+    col.description = description;
+    col.content_type = content_type;
+    store.save_collection_draft(&col).map_err(cmd_err)
 }
 
 #[tauri::command]
@@ -121,8 +179,9 @@ fn scan_recursive(
     max_depth: u32,
     current_depth: u32,
     exclude: &[String],
-) -> anyhow::Result<Vec<DirectoryItem>> {
+) -> anyhow::Result<(Vec<DirectoryItem>, u64)> {
     let mut items = vec![];
+    let mut total_bytes: u64 = 0;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -132,11 +191,12 @@ fn scan_recursive(
         let meta = entry.metadata()?;
         let path = entry.path();
         if meta.is_dir() {
-            let children = if current_depth + 1 < max_depth {
+            let (children, sub_bytes) = if current_depth + 1 < max_depth {
                 scan_recursive(&path, max_depth, current_depth + 1, exclude)?
             } else {
-                vec![]
+                (vec![], 0)
             };
+            total_bytes += sub_bytes;
             items.push(DirectoryItem {
                 name,
                 item_type: ItemType::Folder,
@@ -148,6 +208,7 @@ fn scan_recursive(
                 children,
             });
         } else if meta.is_file() {
+            total_bytes += meta.len();
             items.push(DirectoryItem {
                 name: name.clone(),
                 item_type: ItemType::File,
@@ -168,7 +229,7 @@ fn scan_recursive(
         (ItemType::File, ItemType::Folder) => std::cmp::Ordering::Greater,
         _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
-    Ok(items)
+    Ok((items, total_bytes))
 }
 
 fn is_excluded(name: &str, patterns: &[String]) -> bool {

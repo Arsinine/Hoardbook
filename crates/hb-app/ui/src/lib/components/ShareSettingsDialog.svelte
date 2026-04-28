@@ -21,6 +21,7 @@
 
 	let speedCapStr = '';
 	let downloadLimitStr = '';
+	let newPath = '';
 
 	$: if (open && slug) loadSettings();
 
@@ -56,6 +57,14 @@
 		} finally {
 			saving = false;
 		}
+	}
+
+	function addPath() {
+		const p = newPath.trim();
+		if (p && !settings.allowed_paths.includes(p)) {
+			settings.allowed_paths = [...settings.allowed_paths, p];
+		}
+		newPath = '';
 	}
 
 	function handleBackdrop(e: MouseEvent) {
@@ -139,10 +148,30 @@
 						</div>
 
 						<div class="row-group">
-							<div class="group-label">Allowed files</div>
-							<div class="row-sub" style="margin-bottom:0">
-								Leaving this empty allows downloading any file in the collection.
-								Specific path restrictions will be configurable once a collection is scanned.
+							<div class="group-label">Allowed paths</div>
+							<div class="row-sub">
+								Restricts downloads to these paths only. Leave empty to allow all files.
+								Use glob patterns: <code>**/*.mkv</code>, <code>Season 1/**</code>
+							</div>
+							{#if settings.allowed_paths.length > 0}
+								<div class="path-chips">
+									{#each settings.allowed_paths as p, i}
+										<span class="path-chip">
+											<span class="path-chip-text">{p}</span>
+											<button class="path-chip-x" on:click={() => { settings.allowed_paths = settings.allowed_paths.filter((_, idx) => idx !== i); }}>×</button>
+										</span>
+									{/each}
+								</div>
+							{/if}
+							<div class="path-add-row">
+								<input
+									class="hb-input hb-mono"
+									type="text"
+									placeholder="Season 1/** or **/*.mkv"
+									bind:value={newPath}
+									on:keydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addPath(); } }}
+								/>
+								<button class="btn-default-sm" on:click={addPath} disabled={!newPath.trim()}>Add</button>
 							</div>
 						</div>
 					{/if}
@@ -267,6 +296,44 @@
 		justify-content: flex-end;
 		gap: 8px;
 	}
+
+	code {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		background: var(--bg-input);
+		border: 1px solid var(--border);
+		border-radius: 3px;
+		padding: 1px 4px;
+		color: var(--fg);
+	}
+
+	.path-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+	.path-chip {
+		display: inline-flex; align-items: center; gap: 3px;
+		background: var(--bg-input); border: 1px solid var(--border);
+		border-radius: 5px; padding: 2px 4px 2px 8px;
+		font-family: var(--font-mono); font-size: 11px; color: var(--fg);
+	}
+	.path-chip-text { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.path-chip-x {
+		background: none; border: none; cursor: pointer;
+		color: var(--fg-dim); font-size: 14px; line-height: 1;
+		padding: 0; display: flex; align-items: center;
+	}
+	.path-chip-x:hover { color: var(--fg); }
+
+	.path-add-row { display: flex; gap: 6px; align-items: center; }
+
+	.hb-mono { font-family: var(--font-mono); font-size: 12px; }
+
+	.btn-default-sm {
+		display: inline-flex; align-items: center; justify-content: center;
+		padding: 5px 11px; font-family: var(--font-ui); font-size: 12px; font-weight: 500;
+		color: var(--fg); background: transparent;
+		border: 1px solid var(--border-strong); border-radius: 6px;
+		cursor: pointer; white-space: nowrap; flex-shrink: 0; height: 28px;
+	}
+	.btn-default-sm:disabled { opacity: 0.4; cursor: not-allowed; }
 
 	.btn-primary {
 		display: inline-flex; align-items: center; gap: 6px;

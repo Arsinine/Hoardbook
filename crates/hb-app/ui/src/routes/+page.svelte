@@ -1,13 +1,92 @@
 <script lang="ts">
-	import { saveProfile, publishProfile, publishCollection, getShareSettings } from '$lib/api.js';
-	import { profile, collections, identity, toast } from '$lib/stores.js';
+	import { saveProfile, publishProfile, publishCollection, deleteCollection, updateCollectionMeta, getShareSettings, generateKeypair, saveSettings, hasPublishedProfile } from '$lib/api.js';
+	import { profile, collections, identity, toast, appReady } from '$lib/stores.js';
+	import { onMount } from 'svelte';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
 	import ScanDialog from '$lib/components/ScanDialog.svelte';
 	import ShareSettingsDialog from '$lib/components/ShareSettingsDialog.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
-	import type { Collection, Profile } from '$lib/types.js';
+	import type { Collection, Profile, SocialLink } from '$lib/types.js';
 
+	const LANGUAGES = [
+		'Afrikaans','Albanian','Arabic','Armenian','Azerbaijani','Basque','Belarusian',
+		'Bengali','Bulgarian','Catalan','Chinese','Croatian','Czech','Danish','Dutch',
+		'English','Estonian','Finnish','French','Galician','Georgian','German','Greek',
+		'Hebrew','Hindi','Hungarian','Icelandic','Indonesian','Italian','Japanese',
+		'Kannada','Kazakh','Korean','Latvian','Lithuanian','Macedonian','Malay',
+		'Maltese','Mongolian','Norwegian','Persian','Polish','Portuguese','Romanian',
+		'Russian','Serbian','Slovak','Slovenian','Spanish','Swedish','Tagalog','Tamil',
+		'Telugu','Thai','Turkish','Ukrainian','Urdu','Uzbek','Vietnamese','Welsh',
+	];
+
+	$: langSuggestions = langInput.length > 0
+		? LANGUAGES.filter(l => l.toLowerCase().startsWith(langInput.toLowerCase()) && !form.languages.includes(l))
+		: [];
+
+	// ── Onboarding state ────────────────────────────────────────────────────────
+	let obStep = 1; // 1=keypair, 2=name, 3=done
+	let obGenerating = false;
+
+	$: if ($appReady && obStep === 1) {
+		if ($identity && $profile?.display_name) obStep = 3;
+		else if ($identity) obStep = 2;
+	}
+
+	async function obGenerateKeypair() {
+		obGenerating = true;
+		try {
+			const info = await generateKeypair();
+			identity.set(info);
+			obStep = 2;
+		} catch (e) { toast(String(e), 'error'); }
+		finally { obGenerating = false; }
+	}
+
+	async function obSaveName() {
+		if (!form.display_name.trim()) return;
+		saving = true;
+		try {
+			form.updated = new Date().toISOString();
+			await saveProfile(form);
+			profile.set({ ...form });
+			obStep = 3;
+		} catch (e) { toast(String(e), 'error'); }
+		finally { saving = false; }
+	}
+
+	// ── Publish-button dirty tracking ───────────────────────────────────────────
+	// Snapshot of the profile as it was last published (undefined = never published).
+	let publishedSnapshot: string | null = null;
+
+	onMount(async () => {
+		const wasPublished = await hasPublishedProfile().catch(() => false);
+		if (wasPublished && $profile) {
+			publishedSnapshot = stableProfileJson($profile);
+		}
+	});
+
+	function stableProfileJson(p: Profile): string {
+		// Exclude auto-computed fields that change on every save.
+		const { updated, est_size, ...rest } = p;
+		return JSON.stringify(rest);
+	}
+
+	$: profileDirty = publishedSnapshot === null || stableProfileJson(form) !== publishedSnapshot;
+
+	// ── Disk size computation ────────────────────────────────────────────────────
+	function formatBytes(b: number): string {
+		const GB = 1073741824, MB = 1048576, KB = 1024;
+		if (b >= GB) return (b / GB).toFixed(1) + ' GB';
+		if (b >= MB) return (b / MB).toFixed(1) + ' MB';
+		if (b >= KB) return (b / KB).toFixed(1) + ' KB';
+		return b + ' B';
+	}
+
+	$: totalBytes = $collections.reduce((s, c) => s + (c.total_bytes ?? 0), 0);
+	$: diskSize = totalBytes > 0 ? formatBytes(totalBytes) : '—';
+
+	// ── Regular state ────────────────────────────────────────────────────────────
 	let scanOpen = false;
 	let scanTitle = 'Add collection';
 	let scanInitialPath = '';
@@ -18,6 +97,17 @@
 	let shareOpen = false;
 	let langInput = '';
 
+	const SOCIAL_PLATFORMS = [
+		{ value: 'reddit',   label: 'Reddit' },
+		{ value: 'discord',  label: 'Discord' },
+		{ value: 'matrix',   label: 'Matrix' },
+		{ value: 'bluesky',  label: 'Bluesky' },
+		{ value: 'mastodon', label: 'Mastodon' },
+		{ value: 'github',   label: 'GitHub' },
+		{ value: 'twitter',  label: 'Twitter/X' },
+		{ value: 'other',    label: 'Other' },
+	];
+
 	let form: Profile = {
 		display_name: '',
 		bio: undefined,
@@ -27,8 +117,18 @@
 		languages: [],
 		contact_hint: undefined,
 		email: undefined,
+		location: undefined,
+		social_links: [],
 		updated: new Date().toISOString(),
 	};
+
+	function addSocialLink() {
+		form.social_links = [...form.social_links, { platform: 'reddit', handle: '' }];
+	}
+
+	function removeSocialLink(i: number) {
+		form.social_links = form.social_links.filter((_, idx) => idx !== i);
+	}
 
 	// Only initialize once — don't reset form after save/publish
 	let profileLoaded = false;
@@ -45,8 +145,9 @@
 		saving = true;
 		try {
 			form.updated = new Date().toISOString();
+			form.est_size = totalBytes > 0 ? diskSize : undefined;
 			await saveProfile(form);
-			profile.set(form);
+			profile.set({ ...form });
 			toast('Profile saved');
 		} catch (e) {
 			toast(String(e), 'error');
@@ -60,9 +161,11 @@
 		publishing = true;
 		try {
 			form.updated = new Date().toISOString();
+			form.est_size = totalBytes > 0 ? diskSize : undefined;
 			await saveProfile(form);
-			profile.set(form);
+			profile.set({ ...form });
 			await publishProfile();
+			publishedSnapshot = stableProfileJson(form);
 			toast('Profile published to relay');
 		} catch (e) {
 			toast(String(e), 'error');
@@ -75,6 +178,16 @@
 		try {
 			await publishCollection(slug);
 			toast('Collection published');
+		} catch (e) {
+			toast(String(e), 'error');
+		}
+	}
+
+	async function handleDeleteCollection(slug: string) {
+		try {
+			await deleteCollection(slug);
+			collections.update((cols) => cols.filter((c) => c.slug !== slug));
+			toast('Collection removed');
 		} catch (e) {
 			toast(String(e), 'error');
 		}
@@ -120,16 +233,26 @@
 
 	$: totalItems = $collections.reduce((s, c) => s + c.item_count, 0);
 
+	function addLang(name: string) {
+		if (!form.languages.includes(name)) {
+			form.languages = [...form.languages, name];
+		}
+		langInput = '';
+	}
+
 	function handleLangKey(e: KeyboardEvent) {
 		if (e.key === 'Enter' || e.key === ',') {
 			e.preventDefault();
-			const tag = langInput.trim().replace(/,$/, '').toLowerCase();
-			if (tag && !form.languages.includes(tag)) {
-				form.languages = [...form.languages, tag];
-			}
-			langInput = '';
+			const raw = langInput.trim().replace(/,$/, '');
+			const match = LANGUAGES.find(l => l.toLowerCase() === raw.toLowerCase())
+				?? (langSuggestions.length === 1 ? langSuggestions[0] : null);
+			if (match) addLang(match);
+			// silently discard unrecognized input
 		} else if (e.key === 'Backspace' && !langInput && form.languages.length > 0) {
 			form.languages = form.languages.slice(0, -1);
+		} else if (e.key === 'Tab' && langSuggestions.length > 0) {
+			e.preventDefault();
+			addLang(langSuggestions[0]);
 		}
 	}
 
@@ -138,8 +261,8 @@
 	}
 </script>
 
-{#if !$identity}
-	<!-- Onboarding state -->
+{#if obStep < 3}
+	<!-- Onboarding flow -->
 	<div class="onboarding">
 		<div class="ob-logo">H</div>
 		<div class="ob-text">
@@ -148,15 +271,36 @@
 		</div>
 		<div class="ob-card">
 			<div class="ob-card-head">
-				<span class="sect-label">Step 1 of 3</span>
+				<span class="sect-label">Step {obStep} of 2</span>
+				<div class="ob-dots">
+					<div class="ob-dot" class:ob-dot-active={obStep === 1} class:ob-dot-done={obStep > 1} />
+					<div class="ob-dot" class:ob-dot-active={obStep === 2} class:ob-dot-done={obStep > 2} />
+				</div>
 			</div>
-			<div class="ob-card-title">Create your identity</div>
-			<div class="ob-card-sub">Hoardbook uses a local Ed25519 keypair as your identity. No email, no server account.</div>
-			<div class="ob-notice">
-				<span class="ob-notice-icon">{@html icons.shield}</span>
-				<div class="ob-notice-text">Your private key is stored locally and never transmitted. Back it up somewhere safe.</div>
-			</div>
-			<a href="/settings" class="btn-primary btn-full">Generate keypair</a>
+
+			{#if obStep === 1}
+				<div class="ob-card-title">Create your identity</div>
+				<div class="ob-card-sub">Hoardbook uses a local Ed25519 keypair as your identity. No email, no server account.</div>
+				<div class="ob-notice">
+					<span class="ob-notice-icon">{@html icons.shield}</span>
+					<div class="ob-notice-text">Your private key is stored locally and never transmitted. Back it up somewhere safe.</div>
+				</div>
+				<button class="btn-primary btn-full" on:click={obGenerateKeypair} disabled={obGenerating}>
+					{obGenerating ? 'Generating…' : 'Generate keypair'}
+				</button>
+			{:else if obStep === 2}
+				<div class="ob-card-title">Name yourself</div>
+				<div class="ob-card-sub">Pick a display name. This is what others see when they look you up. You can add more profile details later.</div>
+				<div class="field" style="margin-bottom:16px">
+					<label class="field-label" for="ob-name">Display name <span class="accent-dot">•</span></label>
+					<input id="ob-name" class="hb-input" type="text" placeholder="e.g. DataHoarder_42"
+						bind:value={form.display_name}
+						on:keydown={(e) => e.key === 'Enter' && obSaveName()} />
+				</div>
+				<button class="btn-primary btn-full" on:click={obSaveName} disabled={!form.display_name.trim() || saving}>
+					{saving ? 'Saving…' : 'Get started →'}
+				</button>
+			{/if}
 		</div>
 	</div>
 {:else}
@@ -170,8 +314,8 @@
 			<button class="btn-ghost btn-sm" on:click={handleSave} disabled={!form.display_name || saving}>
 				{saving ? 'Saving…' : 'Save draft'}
 			</button>
-			<button class="btn-primary btn-sm" on:click={handlePublish} disabled={publishing}>
-				{publishing ? 'Publishing…' : 'Publish profile'}
+			<button class="btn-primary btn-sm" on:click={handlePublish} disabled={publishing || !profileDirty} title={!profileDirty ? 'No changes since last publish' : undefined}>
+				{publishing ? 'Publishing…' : profileDirty ? 'Publish profile' : 'Published ✓'}
 			</button>
 		</div>
 	</div>
@@ -204,8 +348,8 @@
 						<input class="hb-input" type="number" min="1990" max="2099" placeholder="2003" bind:value={form.since} />
 					</div>
 					<div class="field">
-						<label class="field-label">Est. size</label>
-						<input class="hb-input" type="text" placeholder="14.2 TB" bind:value={form.est_size} />
+						<span class="field-label">Disk size (auto)</span>
+						<span class="field-readonly">{diskSize}</span>
 					</div>
 				</div>
 
@@ -213,26 +357,60 @@
 					<label class="field-label">Languages</label>
 					<!-- svelte-ignore a11y-click-events-have-key-events -->
 					<!-- svelte-ignore a11y-no-static-element-interactions -->
-					<div class="tag-wrap" on:click={(e) => { if (e.target === e.currentTarget) e.currentTarget.querySelector('input')?.focus(); }}>
-						{#each form.languages as lang, i}
-							<span class="lang-tag">
-								{lang}
-								<button class="lang-x" on:click={() => removeLang(i)} title="Remove">×</button>
-							</span>
-						{/each}
-						<input
-							class="lang-input"
-							type="text"
-							placeholder={form.languages.length === 0 ? 'en, jp, de…' : 'Add…'}
-							bind:value={langInput}
-							on:keydown={handleLangKey}
-						/>
+					<div class="lang-wrap-outer">
+						<div class="tag-wrap" on:click={(e) => { if (e.target === e.currentTarget) e.currentTarget.querySelector('input')?.focus(); }}>
+							{#each form.languages as lang, i}
+								<span class="lang-tag">
+									{lang}
+									<button class="lang-x" on:click={() => removeLang(i)} title="Remove">×</button>
+								</span>
+							{/each}
+							<input
+								class="lang-input"
+								type="text"
+								placeholder={form.languages.length === 0 ? 'English, Japanese…' : 'Add…'}
+								bind:value={langInput}
+								on:keydown={handleLangKey}
+							/>
+						</div>
+						{#if langSuggestions.length > 0}
+							<div class="lang-suggestions">
+								{#each langSuggestions.slice(0, 5) as s}
+									<!-- svelte-ignore a11y-click-events-have-key-events -->
+									<div class="lang-suggestion" on:click={() => addLang(s)} role="option" aria-selected="false">{s}</div>
+								{/each}
+							</div>
+						{/if}
 					</div>
 				</div>
 
 				<div class="field">
 					<label class="field-label">Contact email</label>
 					<input class="hb-input hb-input-mono" type="email" placeholder="you@example.com" bind:value={form.contact_hint} />
+				</div>
+
+				<div class="field">
+					<label class="field-label">Region / City</label>
+					<input class="hb-input" type="text" placeholder="Tokyo, EU/Germany, North America…" bind:value={form.location} />
+				</div>
+
+				<div class="field">
+					<div class="field-label-row">
+						<span class="field-label">Social links</span>
+						<button class="btn-add-link" on:click={addSocialLink}>+ Add</button>
+					</div>
+					{#each form.social_links as link, i}
+						<div class="social-row">
+							<select class="social-select" bind:value={link.platform}>
+								{#each SOCIAL_PLATFORMS as p}
+									<option value={p.value}>{p.label}</option>
+								{/each}
+							</select>
+							<input class="hb-input social-handle" type="text" placeholder="username or handle"
+								bind:value={link.handle} />
+							<button class="social-remove" on:click={() => removeSocialLink(i)} title="Remove">×</button>
+						</div>
+					{/each}
 				</div>
 			</div>
 		</div>
@@ -259,6 +437,10 @@
 					<div class="stat-label">Collections</div>
 					<div class="stat-value">{$collections.length}</div>
 				</div>
+				<div class="stat">
+					<div class="stat-label">Total Size</div>
+					<div class="stat-value">{diskSize}</div>
+				</div>
 			</div>
 
 			<div class="coll-list">
@@ -268,9 +450,13 @@
 					{#each $collections as col}
 						<CollectionPanel collection={col}>
 							<div class="coll-actions">
+								{#if !col.published}
+									<span class="draft-badge">Draft</span>
+								{/if}
 								<button class="btn-ghost btn-sm" on:click={() => openRescan(col)}>Rescan</button>
 								<button class="btn-ghost btn-sm" on:click={() => openShare(col.slug)}>Share</button>
 								<button class="btn-ghost btn-sm" on:click={() => handlePublishCollection(col.slug)}>Publish</button>
+								<button class="btn-ghost btn-sm btn-danger-ghost" on:click={() => handleDeleteCollection(col.slug)}>Remove</button>
 							</div>
 						</CollectionPanel>
 					{/each}
@@ -320,9 +506,48 @@
 		padding: 22px;
 	}
 
-	.ob-card-head { margin-bottom: 16px; }
+	.ob-card-head { margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; }
+
+	.ob-dots { display: flex; gap: 6px; }
+	.ob-dot {
+		width: 8px; height: 8px; border-radius: 50%;
+		background: var(--bg-elev3);
+		border: 1px solid var(--border-strong);
+		transition: background 0.2s;
+	}
+	.ob-dot-active { background: var(--accent); border-color: var(--accent); }
+	.ob-dot-done { background: color-mix(in oklch, var(--accent) 40%, transparent); border-color: var(--accent); }
+
+	/* Social links */
+	.field-label-row { display: flex; justify-content: space-between; align-items: baseline; }
+
+	.btn-add-link {
+		font-size: 11px; color: var(--accent); background: transparent;
+		border: none; cursor: pointer; font-family: var(--font-ui); padding: 0;
+	}
+	.btn-add-link:hover { text-decoration: underline; }
+
+	.social-row { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
+
+	.social-select {
+		height: 34px; padding: 0 8px;
+		background: var(--bg-input); border: 1px solid var(--border);
+		border-radius: 7px; color: var(--fg); font-family: var(--font-ui);
+		font-size: 12px; cursor: pointer; flex-shrink: 0; width: 110px;
+	}
+	.social-select:focus { outline: none; border-color: var(--accent); }
+
+	.social-handle { flex: 1; }
+
+	.social-remove {
+		background: none; border: none; cursor: pointer; color: var(--fg-dim);
+		font-size: 18px; line-height: 1; padding: 0 2px; display: flex; align-items: center;
+		flex-shrink: 0;
+	}
+	.social-remove:hover { color: var(--fg); }
 
 	.ob-card-title { font-size: 17px; font-weight: 600; color: var(--fg); margin-bottom: 6px; }
+
 
 	.ob-card-sub { font-size: 12.5px; color: var(--fg-muted); margin-bottom: 18px; line-height: 1.5; }
 
@@ -414,9 +639,22 @@
 
 	.coll-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
 
+	.field-readonly {
+		height: 34px;
+		display: flex;
+		align-items: center;
+		padding: 0 11px;
+		background: var(--bg-elev2);
+		border: 1px solid var(--border);
+		border-radius: 7px;
+		font-size: 13px;
+		color: var(--fg-muted);
+		font-feature-settings: 'tnum';
+	}
+
 	.stats {
 		display: grid;
-		grid-template-columns: repeat(2, 1fr);
+		grid-template-columns: repeat(3, 1fr);
 		gap: 10px;
 		margin: 16px 0 18px;
 		flex-shrink: 0;
@@ -453,6 +691,20 @@
 		gap: 4px;
 		padding: 8px 10px;
 		border-top: 1px solid var(--divider);
+		align-items: center;
+	}
+
+	.draft-badge {
+		font-size: 10px;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.8px;
+		color: oklch(0.75 0.14 60);
+		background: oklch(0.25 0.06 60);
+		border: 1px solid oklch(0.45 0.10 60 / 0.4);
+		border-radius: 4px;
+		padding: 1px 6px;
+		flex-shrink: 0;
 	}
 
 	.empty { color: var(--fg-dim); font-size: 12.5px; text-align: center; padding: 32px 0; }
@@ -556,6 +808,26 @@
 	}
 	.lang-input::placeholder { color: var(--fg-dim); }
 
+	.lang-wrap-outer { position: relative; }
+	.lang-suggestions {
+		position: absolute;
+		top: calc(100% + 3px);
+		left: 0; right: 0;
+		background: var(--bg-elev2);
+		border: 1px solid var(--border);
+		border-radius: 7px;
+		overflow: hidden;
+		z-index: 10;
+		box-shadow: 0 8px 24px oklch(0 0 0 / 0.25);
+	}
+	.lang-suggestion {
+		padding: 7px 12px;
+		font-size: 12.5px;
+		color: var(--fg);
+		cursor: pointer;
+	}
+	.lang-suggestion:hover { background: var(--bg-elev3); }
+
 	.hb-textarea {
 		height: auto;
 		min-height: 64px;
@@ -607,6 +879,9 @@
 	}
 
 	.btn-ghost:disabled { opacity: 0.5; cursor: not-allowed; }
+
+	.btn-danger-ghost { color: var(--error, #e05c5c); }
+	.btn-danger-ghost:hover { background: color-mix(in oklch, var(--error, #e05c5c) 10%, transparent); }
 
 	.btn-sm { padding: 5px 11px; font-size: 12px; height: 28px; }
 

@@ -10,6 +10,6 @@ pub use crypto::{HoardbookKeypair, hb_id_decode, hb_id_encode};
 pub use envelope::{DocType, SignedEnvelope};
 pub use error::HbError;
 pub use types::{
-    ChatMessage, Collection, DirectoryItem, HeartbeatBody, ItemType, Profile, StoredKeypair,
-    Succession,
+    ChannelMessage, ChatMessage, Collection, DirectoryItem, HeartbeatBody, ItemType, Profile,
+    SocialLink, StoredKeypair, Succession,
 };

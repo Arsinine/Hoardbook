@@ -7,8 +7,10 @@
 //!     error → [u32-LE msg-len]  [UTF-8 error message]
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use globset::{Glob, GlobSetBuilder};
 use iroh::{Endpoint, EndpointAddr};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,6 +23,9 @@ pub const XFER_ALPN: &[u8] = b"/hoardbook/xfer/1";
 struct XferRequest {
     slug: String,
     path: String,
+    /// Honor-system requester identity. Server verifies against contacts when require_follow=true.
+    #[serde(default)]
+    requester_hb_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +92,33 @@ async fn handle_connection(
         return send_error(&mut send, "Sharing is disabled for this collection").await;
     }
 
+    // Enforce require_follow
+    if settings.require_follow {
+        let requester = req.requester_hb_id.as_deref().unwrap_or("");
+        if requester.is_empty() {
+            return send_error(&mut send, "This collection requires you to follow the owner first").await;
+        }
+        let contacts = store.list_contacts().unwrap_or_default();
+        if !contacts.iter().any(|c| c.hb_id == requester) {
+            return send_error(&mut send, "This collection is restricted to followers only").await;
+        }
+    }
+
+    // Enforce download_limit
+    if let Some(limit) = settings.download_limit {
+        let current = store.acquire_download_slot();
+        if current > limit {
+            store.release_download_slot();
+            return send_error(&mut send, "Download limit reached — try again later").await;
+        }
+    }
+    // RAII guard to decrement on exit
+    let _slot_guard = if settings.download_limit.is_some() {
+        Some(DownloadSlotGuard { store: store.clone() })
+    } else {
+        None
+    };
+
     if !is_allowed_path(&req.path, &settings.allowed_paths) {
         return send_error(&mut send, "File is not in the allowed download paths").await;
     }
@@ -117,15 +149,112 @@ async fn handle_connection(
     send.write_u64_le(file_size).await.context("write file size")?;
 
     let mut reader = tokio::io::BufReader::new(file);
-    tokio::io::copy(&mut reader, &mut send).await.context("stream file")?;
+
+    if let Some(kbps) = settings.speed_cap_kbps {
+        throttled_copy(&mut reader, &mut send, kbps as u64 * 1024).await.context("throttled stream")?;
+    } else {
+        tokio::io::copy(&mut reader, &mut send).await.context("stream file")?;
+    }
+
     send.shutdown().await.context("shutdown send")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Path matching — glob-aware
+// ---------------------------------------------------------------------------
+
+fn is_allowed_path(path: &str, allowed: &[String]) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+
+    // Build a glob set from the allowed patterns.
+    // Fall back to simple prefix matching if a pattern is not valid glob syntax.
+    let mut builder = GlobSetBuilder::new();
+    let mut plain_prefixes: Vec<&str> = vec![];
+
+    for pat in allowed {
+        let trimmed = pat.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.ends_with('/') {
+            plain_prefixes.push(trimmed);
+        } else {
+            match Glob::new(trimmed) {
+                Ok(g) => { builder.add(g); }
+                Err(_) => plain_prefixes.push(trimmed),
+            }
+        }
+    }
+
+    // Check plain prefix matches
+    for prefix in &plain_prefixes {
+        if path.starts_with(prefix) {
+            return true;
+        }
+    }
+
+    // Check glob matches
+    if let Ok(set) = builder.build() {
+        if set.is_match(path) {
+            return true;
+        }
+    }
+
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Rate-limited copy
+// ---------------------------------------------------------------------------
+
+async fn throttled_copy(
+    reader: &mut (impl AsyncReadExt + Unpin),
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    bytes_per_sec: u64,
+) -> Result<()> {
+    const CHUNK: usize = 65_536; // 64 KB
+    let mut buf = vec![0u8; CHUNK];
+
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+
+        let start = tokio::time::Instant::now();
+        writer.write_all(&buf[..n]).await?;
+
+        // Sleep to hit the target rate.
+        let budget = Duration::from_secs_f64(n as f64 / bytes_per_sec as f64);
+        let elapsed = start.elapsed();
+        if budget > elapsed {
+            tokio::time::sleep(budget - elapsed).await;
+        }
+    }
 
     Ok(())
 }
 
-fn is_allowed_path(path: &str, allowed: &[String]) -> bool {
-    allowed.is_empty() || allowed.iter().any(|prefix| path.starts_with(prefix.as_str()))
+// ---------------------------------------------------------------------------
+// Download slot RAII guard
+// ---------------------------------------------------------------------------
+
+struct DownloadSlotGuard {
+    store: DataStore,
 }
+
+impl Drop for DownloadSlotGuard {
+    fn drop(&mut self) {
+        self.store.release_download_slot();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error helper
+// ---------------------------------------------------------------------------
 
 async fn send_error(
     send: &mut iroh::endpoint::SendStream,
@@ -151,6 +280,7 @@ pub async fn download_file(
     slug: &str,
     path: &str,
     save_path: &str,
+    requester_hb_id: Option<String>,
 ) -> Result<u64> {
     let peer_addr: EndpointAddr =
         serde_json::from_str(peer_addr_json).context("parse peer EndpointAddr")?;
@@ -163,7 +293,11 @@ pub async fn download_file(
     let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?;
 
     // Send request
-    let req = XferRequest { slug: slug.to_string(), path: path.to_string() };
+    let req = XferRequest {
+        slug: slug.to_string(),
+        path: path.to_string(),
+        requester_hb_id,
+    };
     let req_bytes = serde_json::to_vec(&req).context("serialize request")?;
     send.write_u32_le(req_bytes.len() as u32).await.context("write req len")?;
     send.write_all(&req_bytes).await.context("write req")?;
@@ -194,4 +328,27 @@ pub async fn download_file(
 
     conn.close(0u32.into(), b"");
     Ok(written)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_pattern_matches_extension() {
+        assert!(is_allowed_path("Movies/Akira.mkv", &["**/*.mkv".to_string()]));
+        assert!(is_allowed_path("Season 1/E01.mkv", &["Season 1/**".to_string()]));
+        assert!(!is_allowed_path("Season 2/E01.mkv", &["Season 1/**".to_string()]));
+        assert!(is_allowed_path("anything", &[]));
+    }
+
+    #[test]
+    fn prefix_matching_still_works() {
+        assert!(is_allowed_path("Movies/foo.mp4", &["Movies/".to_string()]));
+        assert!(!is_allowed_path("Other/foo.mp4", &["Movies/".to_string()]));
+    }
 }

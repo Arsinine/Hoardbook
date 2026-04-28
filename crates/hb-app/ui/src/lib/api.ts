@@ -9,8 +9,10 @@ function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 import type {
 	CachedPeer,
 	Collection,
+	DirectoryPeer,
 	IdentityInfo,
 	Profile,
+	ReceivedChannelMessage,
 	ReceivedMessage,
 	ScanOptions,
 	ShareSettings,
@@ -24,7 +26,7 @@ export const getIdentity = () => invoke<IdentityInfo | null>('get_identity');
 
 export const getHbId = () => invoke<string>('get_hb_id');
 
-export const validateHbId = (hb_id: string) => invoke<boolean>('validate_hb_id', { hb_id });
+export const validateHbId = (hb_id: string) => invoke<boolean>('validate_hb_id', { hbId: hb_id });
 
 export const exportKeypair = () => invoke<string>('export_keypair');
 
@@ -46,6 +48,12 @@ export const publishProfile = () => invoke<void>('publish_profile');
 
 export const unpublishProfile = () => invoke<void>('unpublish_profile');
 
+export const hasPublishedProfile = () => invoke<boolean>('has_published_profile');
+
+/** Returns [available, takenByPubkey]. */
+export const checkNameAvailable = (displayName: string) =>
+	invoke<[boolean, string | null]>('check_name_available', { displayName });
+
 // ── Collections ───────────────────────────────────────────────────────────────
 
 export const scanDirectory = (opts: ScanOptions) =>
@@ -53,31 +61,44 @@ export const scanDirectory = (opts: ScanOptions) =>
 
 export const getCollections = () => invoke<Collection[]>('get_collections');
 
+export const deleteCollection = (slug: string) => invoke<void>('delete_collection', { slug });
+
 export const publishCollection = (slug: string) =>
 	invoke<void>('publish_collection', { slug });
+
+export const updateCollectionMeta = (slug: string, description: string | undefined, contentType: string[]) =>
+	invoke<void>('update_collection_meta', { slug, description, contentType });
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
 export interface Settings {
 	relay_urls: string[];
 	allow_dms: boolean;
+	recommended: boolean;
 }
 
 export const getSettings = () => invoke<Settings>('get_settings');
 
 export const saveSettings = (settings: Settings) => invoke<void>('save_settings', { settings });
 
+export const checkRelay = (url: string) => invoke<void>('check_relay', { url });
+
 // ── Browse / Contacts ─────────────────────────────────────────────────────────
 
-export const pasteKey = (hb_id: string) => invoke<CachedPeer>('paste_key', { hb_id });
+export const pasteKey = (hb_id: string) => invoke<CachedPeer>('paste_key', { hbId: hb_id });
 
-export const follow = (hb_id: string) => invoke<void>('follow', { hb_id });
+export const follow = (hb_id: string) => invoke<void>('follow', { hbId: hb_id });
 
 export const getContacts = () => invoke<CachedPeer[]>('get_contacts');
 
-export const unfollowContact = (hb_id: string) => invoke<void>('unfollow_contact', { hb_id });
+export const unfollowContact = (hb_id: string) => invoke<void>('unfollow_contact', { hbId: hb_id });
 
-export const refreshContact = (hb_id: string) => invoke<CachedPeer>('refresh_contact', { hb_id });
+export const refreshContact = (hb_id: string) => invoke<CachedPeer>('refresh_contact', { hbId: hb_id });
+
+export const setContactTags = (hb_id: string, tags: string[]) =>
+	invoke<void>('set_contact_tags', { hbId: hb_id, tags });
+
+export const getDirectory = () => invoke<DirectoryPeer[]>('get_directory');
 
 // ── Sharing ───────────────────────────────────────────────────────────────────
 
@@ -93,7 +114,7 @@ export const requestDownload = (
 	slug: string,
 	path: string,
 	save_path: string,
-) => invoke<number>('request_download', { peer_hb_id, peer_node_addr, slug, path, save_path });
+) => invoke<number>('request_download', { peerHbId: peer_hb_id, peerNodeAddr: peer_node_addr, slug, path, savePath: save_path });
 
 // ── Chat ──────────────────────────────────────────────────────────────────────
 
@@ -101,3 +122,9 @@ export const sendMessage = (to: string, content: string) =>
 	invoke<ReceivedMessage>('send_message', { to, content });
 
 export const getMessages = () => invoke<ReceivedMessage[]>('get_messages');
+
+export const getChannelMessages = (channel: string) =>
+	invoke<ReceivedChannelMessage[]>('get_channel_messages', { channel });
+
+export const postChannelMessage = (channel: string, content: string) =>
+	invoke<ReceivedChannelMessage>('post_channel_message', { channel, content });

@@ -5,6 +5,15 @@ use serde::{Deserialize, Serialize};
 // Profile
 // ---------------------------------------------------------------------------
 
+/// A single social / contact link the user chooses to display publicly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SocialLink {
+    /// Lowercase platform identifier, e.g. "reddit", "discord", "matrix".
+    pub platform: String,
+    /// The user's handle or URL on that platform.
+    pub handle: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub display_name: String,
@@ -20,12 +29,18 @@ pub struct Profile {
     pub est_size: Option<String>,
     #[serde(default)]
     pub languages: Vec<String>,
-    /// Freeform contact hint, e.g. "u/username on Reddit".
+    /// Freeform contact hint (legacy field, prefer email / social_links).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contact_hint: Option<String>,
     /// Publicly visible email address — user opts in by setting this field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    /// City or region the user is based in, e.g. "Tokyo" or "EU/Germany".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// Optional social/contact links (Reddit, Discord, Matrix, etc.).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub social_links: Vec<SocialLink>,
     pub updated: DateTime<Utc>,
 }
 
@@ -46,6 +61,9 @@ pub struct Collection {
     pub item_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub est_size: Option<String>,
+    /// Raw byte total of all files in this collection, computed at scan time.
+    #[serde(default)]
+    pub total_bytes: u64,
     #[serde(default)]
     pub content_type: Vec<String>,
     pub last_updated: DateTime<Utc>,
@@ -120,6 +138,9 @@ pub struct Succession {
 /// Only non-None fields are included in the JCS-canonical form.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatBody {
+    /// When true, the peer opts into the relay's public directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listed: Option<bool>,
     /// Optional iroh NodeAddr (base64-encoded). Included only in direct mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_addr: Option<String>,
@@ -146,6 +167,19 @@ pub struct ChatMessage {
     #[serde(default)]
     pub encrypted: bool,
     /// Timestamp included in the signed payload to prevent replay.
+    pub sent_at: DateTime<Utc>,
+}
+
+// ---------------------------------------------------------------------------
+// ChannelMessage
+// ---------------------------------------------------------------------------
+
+/// Signed payload for a public channel post (e.g. General).
+/// Posted to `/v1/channel/:channel` on the relay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelMessage {
+    pub channel: String,
+    pub content: String,
     pub sent_at: DateTime<Utc>,
 }
 

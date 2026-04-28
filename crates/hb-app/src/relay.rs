@@ -1,22 +1,18 @@
 //! HTTP client for communicating with Hoardbook relays.
-//!
-//! Phase 1: queries all known relays in parallel; first successful response wins.
-//! Direct connections (iroh) are deferred to Phase 2.
 
 use anyhow::{anyhow, Context, Result};
-use hb_core::{ChatMessage, SignedEnvelope};
+use hb_core::{ChannelMessage, ChatMessage, SignedEnvelope};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::store::CachedPeer;
 
-/// Hardcoded bootstrap relay URLs shipped in the binary.
 const BOOTSTRAP_RELAYS: &[&str] = &[
-    // TODO: add a community relay URL once one is hosted.
+    "http://198.51.100.1:3000",
 ];
 
 // ---------------------------------------------------------------------------
-// Wire types — mirrors the relay's JSON responses
+// Wire types
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -35,13 +31,30 @@ struct PublishRequest<'a> {
     document: &'a SignedEnvelope,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DirectoryEntry {
+    pub pubkey: String,
+    /// The full signed profile envelope (so the caller can extract the profile).
+    pub profile: SignedEnvelope,
+}
+
+#[derive(Debug, Deserialize)]
+struct DirectoryResponse {
+    peers: Vec<DirectoryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NameCheckResponse {
+    pub available: bool,
+    pub taken_by: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // RelayClient
 // ---------------------------------------------------------------------------
 
 pub struct RelayClient {
     http: Client,
-    /// Relay URLs to try, in priority order (bootstrap seeds first).
     relay_urls: std::sync::RwLock<Vec<String>>,
 }
 
@@ -62,12 +75,18 @@ impl RelayClient {
         }
     }
 
-    pub fn set_relay_urls(&self, urls: Vec<String>) {
+    /// Update relay URLs, always prepending bootstrap relays so they are never lost.
+    pub fn set_relay_urls(&self, user_urls: Vec<String>) {
+        let mut urls: Vec<String> = BOOTSTRAP_RELAYS.iter().map(|s| s.to_string()).collect();
+        for url in user_urls {
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
         *self.relay_urls.write().unwrap() = urls;
     }
 
     /// Publish a signed envelope to all known relays.
-    /// Succeeds if at least one relay accepts it.
     pub async fn publish(&self, doc_type: &str, envelope: &SignedEnvelope) -> Result<()> {
         let body = PublishRequest { doc_type, document: envelope };
         let mut last_err = anyhow!("no relays configured");
@@ -96,7 +115,6 @@ impl RelayClient {
     }
 
     /// Fetch a peer's cached profile and collections from the relay.
-    /// Queries all known relays in parallel and returns the first success.
     pub async fn fetch_peer(&self, hb_id: &str) -> Result<CachedPeer> {
         use tokio::task::JoinSet;
 
@@ -139,6 +157,7 @@ impl RelayClient {
                         online: peer_resp.online,
                         node_addr: peer_resp.node_addr,
                         last_fetched: chrono::Utc::now(),
+                        local_tags: vec![],
                     });
                 }
                 Ok(Err(e)) => last_err = e,
@@ -150,8 +169,6 @@ impl RelayClient {
     }
 
     /// Fetch messages from all relays addressed to `my_pubkey`.
-    /// Merges results from all relays, deduplicating by (from_key, sent_at).
-    /// Each envelope's signature is verified before inclusion.
     pub async fn fetch_messages(
         &self,
         my_pubkey: &str,
@@ -171,7 +188,6 @@ impl RelayClient {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(body) = resp.json::<MessagesResponse>().await {
                         for envelope in body.messages {
-                            // Verify signature before trusting any content.
                             if envelope.verify().is_err() {
                                 tracing::warn!("dropped message with invalid signature");
                                 continue;
@@ -197,17 +213,169 @@ impl RelayClient {
         Ok(all_messages)
     }
 
-    /// Send a heartbeat to all relays to signal liveness.
-    /// Called every 5 minutes by the background task in lib.rs.
+    /// Fetch the relay's public directory of listed peers.
+    /// Tries the first relay that responds.
+    pub async fn fetch_directory(&self) -> Result<Vec<DirectoryEntry>> {
+        let relay_urls = self.relay_urls.read().unwrap().clone();
+
+        for url in &relay_urls {
+            let endpoint = format!("{url}/v1/directory");
+            match self.http.get(&endpoint).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(body) = resp.json::<DirectoryResponse>().await {
+                        return Ok(body.peers);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!("relay {url} directory fetch failed: {e}"),
+            }
+        }
+
+        Ok(vec![])
+    }
+
+    /// Fetch recent messages from the general channel.
+    pub async fn fetch_channel_messages(
+        &self,
+        channel: &str,
+    ) -> Result<Vec<(String, ChannelMessage)>> {
+        #[derive(Deserialize)]
+        struct ChannelResponse {
+            messages: Vec<SignedEnvelope>,
+        }
+
+        let relay_urls = self.relay_urls.read().unwrap().clone();
+
+        for url in &relay_urls {
+            let endpoint = format!("{url}/v1/channel/{channel}");
+            match self.http.get(&endpoint).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(body) = resp.json::<ChannelResponse>().await {
+                        let mut msgs = Vec::new();
+                        for envelope in body.messages {
+                            if envelope.verify().is_err() {
+                                tracing::warn!("dropped channel message with invalid signature");
+                                continue;
+                            }
+                            if let Ok(msg) = envelope.parse_payload::<ChannelMessage>() {
+                                msgs.push((envelope.public_key, msg));
+                            }
+                        }
+                        return Ok(msgs);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!("relay {url} channel fetch failed: {e}"),
+            }
+        }
+
+        Ok(vec![])
+    }
+
+    /// Post a signed channel message envelope to all relays.
+    pub async fn post_channel_message(
+        &self,
+        channel: &str,
+        envelope: &SignedEnvelope,
+    ) -> Result<()> {
+        let mut last_err = anyhow!("no relays configured");
+        let relay_urls = self.relay_urls.read().unwrap().clone();
+
+        for url in &relay_urls {
+            let endpoint = format!("{url}/v1/channel/{channel}");
+            match self.http.post(&endpoint).json(envelope).send().await {
+                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                    last_err = anyhow!(
+                        "Relay {} does not support public channels — redeploy with the latest hb-relay image.",
+                        url
+                    );
+                }
+                Ok(resp) => {
+                    last_err = anyhow!(
+                        "relay {} returned {}: {}",
+                        url,
+                        resp.status(),
+                        resp.text().await.unwrap_or_default()
+                    );
+                }
+                Err(e) => {
+                    last_err = anyhow!("relay {} unreachable: {e}", url);
+                    tracing::warn!("relay {url} unreachable: {e}");
+                }
+            }
+        }
+
+        Err(last_err)
+    }
+
+    /// Check if a display name is available on the relay (anti-spoofing).
+    /// Returns `(available, taken_by_pubkey)`.
+    pub async fn check_name(&self, display_name: &str) -> Result<NameCheckResponse> {
+        let relay_urls = self.relay_urls.read().unwrap().clone();
+
+        for url in &relay_urls {
+            let encoded = urlencoding::encode(display_name);
+            let endpoint = format!("{url}/v1/name/{encoded}");
+            match self.http.get(&endpoint).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(body) = resp.json::<NameCheckResponse>().await {
+                        return Ok(body);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!("relay {url} name check failed: {e}"),
+            }
+        }
+
+        // If no relay responds, assume available (don't block publishing).
+        Ok(NameCheckResponse { available: true, taken_by: None })
+    }
+
+    /// Ping a single relay URL to verify it is reachable.
+    pub async fn check_url(url: &str) -> Result<()> {
+        #[derive(Deserialize)]
+        struct HealthResponse { ok: bool }
+
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+
+        let endpoint = format!("{}/v1/health", url.trim_end_matches('/'));
+        let resp = client
+            .get(&endpoint)
+            .send()
+            .await
+            .context("relay unreachable")?;
+
+        if !resp.status().is_success() {
+            return Err(anyhow!("relay returned HTTP {}", resp.status()));
+        }
+
+        let health: HealthResponse = resp
+            .json()
+            .await
+            .context("relay response is not valid JSON — probably not an HB relay")?;
+
+        if !health.ok {
+            return Err(anyhow!("relay health check returned ok=false"));
+        }
+
+        Ok(())
+    }
+
+    /// Send a heartbeat to all relays.
     pub async fn send_heartbeat(
         &self,
         keypair: &hb_core::HoardbookKeypair,
         node_addr: Option<String>,
+        listed: bool,
     ) -> Result<()> {
         use hb_core::types::HeartbeatBody;
 
         let signed_at = chrono::Utc::now().to_rfc3339();
         let body = HeartbeatBody {
+            listed: if listed { Some(true) } else { None },
             node_addr: node_addr.clone(),
             public_key: keypair.hb_id(),
             signed_at: signed_at.clone(),
@@ -221,6 +389,7 @@ impl RelayClient {
             signed_at: String,
             node_addr: Option<String>,
             signature: String,
+            listed: Option<bool>,
         }
 
         let req = HeartbeatRequest {
@@ -228,6 +397,7 @@ impl RelayClient {
             signed_at,
             node_addr,
             signature,
+            listed: if listed { Some(true) } else { None },
         };
 
         let relay_urls = self.relay_urls.read().unwrap().clone();

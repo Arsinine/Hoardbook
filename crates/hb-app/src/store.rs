@@ -15,6 +15,7 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
 use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use hb_core::{StoredKeypair, SignedEnvelope};
@@ -47,11 +48,25 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 #[derive(Clone)]
 pub struct DataStore {
     pub(crate) base: PathBuf,
+    /// Tracks concurrent active downloads for enforcing download_limit.
+    pub(crate) active_downloads: Arc<AtomicU32>,
 }
 
 impl DataStore {
     pub fn new(base: PathBuf) -> Self {
-        Self { base }
+        Self { base, active_downloads: Arc::new(AtomicU32::new(0)) }
+    }
+
+    pub fn active_download_count(&self) -> u32 {
+        self.active_downloads.load(Ordering::Relaxed)
+    }
+
+    pub fn acquire_download_slot(&self) -> u32 {
+        self.active_downloads.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn release_download_slot(&self) {
+        self.active_downloads.fetch_sub(1, Ordering::Relaxed);
     }
 
     // -- Paths ---------------------------------------------------------------
@@ -151,8 +166,51 @@ impl DataStore {
         Ok(results)
     }
 
+    /// List slug names that have draft files but no signed file.
+    pub fn list_draft_only_slugs(&self) -> Result<Vec<String>> {
+        let dir = self.base.join("collections");
+        if !dir.exists() {
+            return Ok(vec![]);
+        }
+        let mut drafts = vec![];
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if path.extension().map(|e| e == "json").unwrap_or(false)
+                && stem.ends_with(".draft")
+            {
+                let slug = stem.trim_end_matches(".draft").to_string();
+                // Only include if no signed version exists.
+                let signed = self.collection_signed_path(&slug);
+                if !signed.exists() {
+                    drafts.push(slug);
+                }
+            }
+        }
+        Ok(drafts)
+    }
+
+    /// Load a draft collection by slug.
+    pub fn load_collection_draft(&self, slug: &str) -> Result<Option<Collection>> {
+        read_json(&self.collection_draft_path(slug)).context("loading collection draft")
+    }
+
     pub fn share_settings_path(&self, slug: &str) -> PathBuf {
         self.base.join("sharing").join(format!("{slug}.json"))
+    }
+
+    pub fn delete_collection(&self, slug: &str) -> Result<()> {
+        for path in &[
+            self.collection_draft_path(slug),
+            self.collection_signed_path(slug),
+            self.share_settings_path(slug),
+        ] {
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+        }
+        Ok(())
     }
 
     // -- Settings ------------------------------------------------------------
@@ -201,6 +259,10 @@ impl DataStore {
 
     // -- Contacts ------------------------------------------------------------
 
+    pub fn load_contact(&self, pubkey_hash: &str) -> Result<Option<CachedPeer>> {
+        read_json(&self.contact_path(pubkey_hash)).context("loading contact")
+    }
+
     pub fn save_contact(&self, pubkey_hash: &str, peer: &CachedPeer) -> Result<()> {
         write_json(&self.contact_path(pubkey_hash), peer)
             .context("saving contact")
@@ -248,6 +310,9 @@ pub struct CachedPeer {
     pub online: bool,
     pub node_addr: Option<String>,
     pub last_fetched: chrono::DateTime<chrono::Utc>,
+    /// User-defined tags for organizing contacts locally. Never shared.
+    #[serde(default)]
+    pub local_tags: Vec<String>,
 }
 
 impl CachedPeer {

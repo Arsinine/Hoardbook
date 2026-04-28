@@ -61,11 +61,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let app = Router::new()
-        .route("/v1/publish",           post(handlers::publish))
-        .route("/v1/heartbeat",         post(handlers::heartbeat))
-        .route("/v1/peer/:pubkey",      get(handlers::get_peer))
-        .route("/v1/messages/:pubkey",  get(handlers::get_messages))
-        .route("/v1/health",            get(handlers::health))
+        .route("/v1/publish",                post(handlers::publish))
+        .route("/v1/heartbeat",              post(handlers::heartbeat))
+        .route("/v1/peer/:pubkey",           get(handlers::get_peer))
+        .route("/v1/messages/:pubkey",       get(handlers::get_messages))
+        .route("/v1/directory",              get(handlers::get_directory))
+        .route("/v1/channel/:channel",       get(handlers::get_channel).post(handlers::post_channel))
+        .route("/v1/name/:display_name",     get(handlers::check_name))
+        .route("/v1/health",                 get(handlers::health))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 

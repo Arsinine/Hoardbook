@@ -16,6 +16,7 @@ pub enum DocType {
     Collection,
     Succession,
     Message,
+    Channel,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +102,8 @@ mod tests {
             languages: vec!["en".into()],
             contact_hint: None,
             email: None,
+            location: None,
+            social_links: vec![],
             updated: Utc::now(),
         }
     }
@@ -156,6 +159,8 @@ mod tests {
             languages: vec![],
             contact_hint: None,
             email: None,
+            location: None,
+            social_links: vec![],
             updated: Utc::now(),
         };
         let env = SignedEnvelope::create(&kp, DocType::Profile, &profile).unwrap();

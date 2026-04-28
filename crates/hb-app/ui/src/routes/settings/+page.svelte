@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { generateKeypair, getHbId, getSettings, saveSettings, saveKeypairFile, importKeypair, wipeData } from '$lib/api.js';
+	import { generateKeypair, getHbId, getSettings, saveSettings, saveKeypairFile, importKeypair, wipeData, checkRelay } from '$lib/api.js';
+	import { relaunch } from '@tauri-apps/plugin-process';
 	import { save, open as openFileDialog } from '@tauri-apps/plugin-dialog';
 	import { identity, profile, collections, contacts, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
@@ -14,8 +15,25 @@
 	let relayUrls: string[] = [];
 	let newRelay = '';
 	let savingRelays = false;
+	let addingRelay = false;
+
+	type RelayStatus = 'checking' | 'ok' | 'error';
+	let relayStatuses: Record<string, RelayStatus> = {};
+
+	async function probeRelay(url: string) {
+		relayStatuses[url] = 'checking';
+		relayStatuses = relayStatuses;
+		try {
+			await checkRelay(url);
+			relayStatuses[url] = 'ok';
+		} catch {
+			relayStatuses[url] = 'error';
+		}
+		relayStatuses = relayStatuses;
+	}
 
 	let allowDms = true;
+	let recommended = false;
 	let settingsLoaded = false;
 
 	let wipeConfirm = false;
@@ -26,7 +44,10 @@
 			const s = await getSettings();
 			relayUrls = s.relay_urls;
 			allowDms = s.allow_dms ?? true;
+			recommended = s.recommended ?? false;
 			settingsLoaded = true;
+			// Probe all saved relays in parallel.
+			relayUrls.forEach(probeRelay);
 		} catch { settingsLoaded = true; }
 	});
 
@@ -46,7 +67,19 @@
 	async function handleCopy() {
 		try {
 			const id = await getHbId();
-			await navigator.clipboard.writeText(id);
+			// Try the modern clipboard API first; fall back to execCommand for
+			// environments where navigator.clipboard is restricted.
+			try {
+				await navigator.clipboard.writeText(id);
+			} catch {
+				const el = document.createElement('textarea');
+				el.value = id;
+				el.style.cssText = 'position:fixed;opacity:0;pointer-events:none';
+				document.body.appendChild(el);
+				el.select();
+				document.execCommand('copy');
+				document.body.removeChild(el);
+			}
 			copied = true;
 			setTimeout(() => (copied = false), 2000);
 		} catch {
@@ -92,7 +125,16 @@
 	async function toggleAllowDms() {
 		allowDms = !allowDms;
 		try {
-			await saveSettings({ relay_urls: relayUrls, allow_dms: allowDms });
+			await saveSettings({ relay_urls: relayUrls, allow_dms: allowDms, recommended });
+		} catch (e) {
+			toast(String(e), 'error');
+		}
+	}
+
+	async function toggleRecommended() {
+		recommended = !recommended;
+		try {
+			await saveSettings({ relay_urls: relayUrls, allow_dms: allowDms, recommended });
 		} catch (e) {
 			toast(String(e), 'error');
 		}
@@ -102,34 +144,45 @@
 		wiping = true;
 		try {
 			await wipeData();
-			identity.set(null);
-			profile.set(null);
-			collections.set([]);
-			contacts.set([]);
-			wipeConfirm = false;
-			toast('All data wiped. Restart the app to begin fresh.');
+			await relaunch();
 		} catch (e) {
 			toast(String(e), 'error');
-		} finally {
 			wiping = false;
 		}
 	}
 
-	function addRelay() {
+	async function addRelay() {
 		const url = newRelay.trim().replace(/\/$/, '');
 		if (!url || relayUrls.includes(url)) return;
+		if (!url.startsWith('http://') && !url.startsWith('https://')) {
+			toast('Relay URL must start with http:// or https://', 'error');
+			return;
+		}
+		addingRelay = true;
+		try {
+			await checkRelay(url);
+		} catch (e) {
+			toast(`Could not connect to relay: ${String(e)}`, 'error');
+			addingRelay = false;
+			return;
+		}
 		relayUrls = [...relayUrls, url];
+		relayStatuses[url] = 'ok';
+		relayStatuses = relayStatuses;
 		newRelay = '';
+		addingRelay = false;
 	}
 
 	function removeRelay(url: string) {
 		relayUrls = relayUrls.filter((u) => u !== url);
+		const { [url]: _, ...rest } = relayStatuses;
+		relayStatuses = rest;
 	}
 
 	async function handleSaveRelays() {
 		savingRelays = true;
 		try {
-			await saveSettings({ relay_urls: relayUrls, allow_dms: allowDms });
+			await saveSettings({ relay_urls: relayUrls, allow_dms: allowDms, recommended });
 			toast('Relay settings saved');
 		} catch (e) {
 			toast(String(e), 'error');
@@ -142,10 +195,17 @@
 	$: idInitial = idName[0]?.toUpperCase() ?? 'Y';
 	$: idHue = avatarHue(idInitial);
 
-	function relayStatusColor(status: string) {
-		if (status === 'connected') return 'var(--online)';
+	function relayDotColor(status: RelayStatus | undefined) {
+		if (status === 'ok') return 'var(--online)';
 		if (status === 'error') return 'var(--error)';
-		return 'var(--fg-muted)';
+		return 'var(--fg-dim)'; // checking or unknown
+	}
+
+	function relayStatusLabel(status: RelayStatus | undefined) {
+		if (status === 'ok') return 'Connected';
+		if (status === 'error') return 'Unreachable';
+		if (status === 'checking') return 'Checking…';
+		return 'Not checked';
 	}
 </script>
 
@@ -214,12 +274,16 @@
 			<div class="relay-empty">No relays configured. Add one to publish and browse.</div>
 		{:else}
 			{#each relayUrls as url}
+				{@const status = relayStatuses[url]}
 				<div class="relay-row">
-					<div class="relay-dot" style="background:var(--fg-muted)" />
+					<div class="relay-dot" style="background:{relayDotColor(status)}" class:relay-dot-pulse={status === 'checking'} />
 					<div class="relay-info">
 						<div class="relay-url">{url}</div>
-						<div class="relay-meta"><span>Configured</span></div>
+						<div class="relay-meta">
+							<span class:status-ok={status === 'ok'} class:status-err={status === 'error'}>{relayStatusLabel(status)}</span>
+						</div>
 					</div>
+					<button class="icon-btn" title="Re-check" on:click={() => probeRelay(url)}>{@html icons.refresh}</button>
 					<button class="icon-btn" on:click={() => removeRelay(url)}>{@html icons.close}</button>
 				</div>
 			{/each}
@@ -229,11 +293,13 @@
 			<input
 				class="hb-input hb-mono"
 				type="text"
-				placeholder="https://relay.example.org"
+				placeholder="http://relay.example.com:3000"
 				bind:value={newRelay}
 				on:keydown={(e) => e.key === 'Enter' && addRelay()}
 			/>
-			<button class="btn-default btn-sm" on:click={addRelay} disabled={!newRelay.trim()}>Add</button>
+			<button class="btn-default btn-sm" on:click={addRelay} disabled={!newRelay.trim() || addingRelay}>
+				{addingRelay ? 'Checking…' : 'Add'}
+			</button>
 			<button class="btn-primary btn-sm" on:click={handleSaveRelays} disabled={savingRelays}>
 				{savingRelays ? 'Saving…' : 'Save'}
 			</button>
@@ -253,6 +319,16 @@
 				<span class="toggle-thumb" />
 			</button>
 		</div>
+		<div class="surface-divider" />
+		<div class="toggle-row">
+			<div class="toggle-text">
+				<div class="toggle-label">Appear in Recommended contacts</div>
+				<div class="toggle-sub">Others can discover you without needing your hb_id. Requires relay support.</div>
+			</div>
+			<button class="toggle" class:toggle-on={recommended} on:click={toggleRecommended}>
+				<span class="toggle-thumb" />
+			</button>
+		</div>
 	</div>
 
 	<!-- Danger Zone -->
@@ -262,7 +338,7 @@
 		<div class="danger-row">
 			<div>
 				<div class="toggle-label">Wipe all data</div>
-				<div class="toggle-sub">Permanently delete your keypair, profile, collections, and contacts. This cannot be undone.</div>
+				<div class="toggle-sub">Permanently removes your identity, profile, and app data from this device. Your actual files on disk are not touched — only Hoardbook's database is cleared.</div>
 			</div>
 			{#if !wipeConfirm}
 				<button class="btn-danger btn-sm" on:click={() => (wipeConfirm = true)}>Wipe data</button>
@@ -354,7 +430,7 @@
 
 	.id-hint { font-size: 11.5px; color: var(--fg-dim); }
 
-	.id-btns { display: flex; gap: 8px; flex-shrink: 0; }
+	.id-btns { display: flex; gap: 8px; flex-shrink: 0; align-items: center; }
 
 	.no-id-text { font-size: 13px; color: var(--fg-muted); }
 
@@ -396,6 +472,15 @@
 
 	.relay-empty { padding: 14px 16px; font-size: 12.5px; color: var(--fg-dim); }
 
+	.status-ok  { color: var(--online); }
+	.status-err { color: var(--error); }
+
+	@keyframes pulse {
+		0%, 100% { opacity: 1; }
+		50%       { opacity: 0.3; }
+	}
+	.relay-dot-pulse { animation: pulse 1s ease-in-out infinite; }
+
 	.relay-add-row {
 		padding: 12px 16px;
 		display: flex;
@@ -420,6 +505,8 @@
 	.hb-input::placeholder { color: var(--fg-dim); }
 	.hb-input:focus { border-color: var(--accent); }
 	.hb-mono { font-family: var(--font-mono); }
+
+	.surface-divider { height: 1px; background: var(--divider); margin: 4px 0; }
 
 	/* Toggles */
 	.toggle-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
@@ -508,11 +595,12 @@
 	.btn-default {
 		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
 		padding: 8px 14px; font-family: var(--font-ui); font-size: 13px; font-weight: 500;
-		color: var(--fg); background: transparent;
+		color: var(--fg); background: var(--bg-elev2);
 		border: 1px solid var(--border-strong); border-radius: 7px;
 		cursor: pointer; white-space: nowrap; user-select: none; line-height: 1;
 		flex-shrink: 0; min-width: max-content;
 	}
+	.btn-default:hover { background: var(--bg-elev3); }
 	.btn-default:disabled { opacity: 0.5; cursor: not-allowed; }
 	.btn-ghost {
 		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
@@ -529,6 +617,6 @@
 		cursor: pointer; white-space: nowrap; user-select: none; line-height: 1;
 	}
 	.btn-danger:disabled { opacity: 0.5; cursor: not-allowed; }
-	.btn-sm { padding: 5px 11px; font-size: 12px; }
+	.btn-sm { padding: 5px 11px; font-size: 12px; height: 28px; }
 	.btn-icon { gap: 5px; }
 </style>

@@ -48,12 +48,17 @@ pub async fn request_download(
     path: String,
     save_path: String,
     endpoint: State<'_, SharedEndpoint>,
+    identity: State<'_, crate::SharedIdentity>,
 ) -> CmdResult<u64> {
-    let _ = peer_hb_id; // used for logging / future require_follow checks
-
     let addr_json = peer_node_addr.ok_or_else(|| {
         "Peer has no P2P address — they need to be online and running a recent Hoardbook version.".to_string()
     })?;
+
+    // Include our own hb_id so the server can enforce require_follow.
+    let my_hb_id = {
+        let guard = identity.read().await;
+        guard.as_ref().map(|kp| kp.hb_id())
+    };
 
     // Clone the endpoint Arc so we don't hold the read lock during the transfer.
     let ep = {
@@ -63,7 +68,7 @@ pub async fn request_download(
             .clone()
     };
 
-    crate::transfer::download_file(&ep, &addr_json, &slug, &path, &save_path)
+    crate::transfer::download_file(&ep, &addr_json, &slug, &path, &save_path, my_hb_id)
         .await
         .map_err(|e| e.to_string())
 }

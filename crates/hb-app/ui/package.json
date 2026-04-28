@@ -26,7 +26,8 @@
     "@skeletonlabs/skeleton": "^2.0.0",
     "@skeletonlabs/tw-plugin": "^0.4.1",
     "@tauri-apps/api": "^2.0.0",
-    "@tauri-apps/plugin-dialog": "^2.0.0"
+    "@tauri-apps/plugin-dialog": "^2.0.0",
+    "@tauri-apps/plugin-process": "^2.3.1"
   },
   "type": "module"
 }

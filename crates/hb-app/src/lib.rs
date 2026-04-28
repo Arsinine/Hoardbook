@@ -58,6 +58,7 @@ pub(crate) async fn start_iroh_endpoint(
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app
@@ -104,6 +105,7 @@ pub fn run() {
             let identity2    = Arc::clone(&identity);
             let relay2       = Arc::clone(&relay);
             let endpoint2    = Arc::clone(&endpoint_state);
+            let store2       = DataStore::new(data_dir.clone());
             tauri::async_runtime::spawn(async move {
                 let mut interval =
                     tokio::time::interval(tokio::time::Duration::from_secs(300));
@@ -117,7 +119,13 @@ pub fn run() {
                                 serde_json::to_string(&ep.addr()).ok()
                             })
                         };
-                        if let Err(e) = relay2.send_heartbeat(kp, node_addr).await {
+                        let listed = store2
+                            .load_settings()
+                            .ok()
+                            .flatten()
+                            .map(|s| s.recommended)
+                            .unwrap_or(false);
+                        if let Err(e) = relay2.send_heartbeat(kp, node_addr, listed).await {
                             tracing::debug!("heartbeat failed: {e}");
                         }
                     }
@@ -140,18 +148,27 @@ pub fn run() {
             commands::profile::get_profile,
             commands::profile::publish_profile,
             commands::profile::unpublish_profile,
+            commands::profile::has_published_profile,
+            commands::profile::check_name_available,
             commands::collection::scan_directory,
             commands::collection::get_collections,
+            commands::collection::delete_collection,
             commands::collection::publish_collection,
+            commands::collection::update_collection_meta,
             commands::browse::paste_key,
             commands::browse::follow,
             commands::browse::get_contacts,
             commands::browse::unfollow_contact,
             commands::browse::refresh_contact,
+            commands::browse::set_contact_tags,
+            commands::browse::get_directory,
             commands::settings::get_settings,
             commands::settings::save_settings,
+            commands::settings::check_relay,
             commands::chat::send_message,
             commands::chat::get_messages,
+            commands::chat::get_channel_messages,
+            commands::chat::post_channel_message,
             commands::sharing::get_share_settings,
             commands::sharing::save_share_settings,
             commands::sharing::request_download,

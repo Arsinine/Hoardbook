@@ -3,7 +3,7 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
 	import { getIdentity, getProfile, getCollections, getContacts } from '$lib/api.js';
-	import { identity, profile, collections, contacts, toastMessage } from '$lib/stores.js';
+	import { identity, profile, collections, contacts, toastMessage, appReady, unreadCount } from '$lib/stores.js';
 	import { navIcons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
 
@@ -12,12 +12,12 @@
 		try { profile.set(await getProfile()); } catch { }
 		try { collections.set(await getCollections()); } catch { }
 		try { contacts.set(await getContacts()); } catch { }
+		appReady.set(true);
 	});
 
 	const navItems = [
 		{ href: '/', label: 'Home' },
 		{ href: '/contacts', label: 'Contacts' },
-		{ href: '/browse', label: 'Browse' },
 		{ href: '/chat', label: 'Chat' },
 		{ href: '/settings', label: 'Settings' },
 	];
@@ -44,6 +44,9 @@
 			<a href={item.href} class="nav-item" class:nav-active={active}>
 				<span class="nav-icon" class:nav-icon-active={active}>{@html navIcons[item.label]}</span>
 				{item.label}
+				{#if item.label === 'Chat' && $unreadCount > 0}
+					<span class="nav-badge">{$unreadCount > 99 ? '99+' : $unreadCount}</span>
+				{/if}
 			</a>
 		{/each}
 
@@ -148,6 +151,19 @@
 		color: var(--fg-muted);
 		display: flex;
 		flex-shrink: 0;
+	}
+
+	.nav-badge {
+		margin-left: auto;
+		font-size: 9.5px;
+		font-weight: 700;
+		padding: 1px 5px;
+		border-radius: 999px;
+		background: var(--accent);
+		color: var(--accent-text);
+		min-width: 16px;
+		text-align: center;
+		font-feature-settings: 'tnum';
 	}
 
 	.nav-icon-active {
