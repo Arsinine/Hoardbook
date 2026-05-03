@@ -98,7 +98,10 @@ impl Collection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectoryItem {
     pub name: String,
-    #[serde(rename = "type")]
+    // Previously serialized as "type" with lowercase variants.
+    // Now serializes as "item_type" with PascalCase variants (matching TS types).
+    // #[serde(alias = "type")] accepts old stored data transparently.
+    #[serde(alias = "type")]
     pub item_type: ItemType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
@@ -115,9 +118,11 @@ pub struct DirectoryItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
 pub enum ItemType {
+    // Accept old lowercase values from existing stored data.
+    #[serde(alias = "folder")]
     Folder,
+    #[serde(alias = "file")]
     File,
 }
 

@@ -25,12 +25,14 @@
 		: [];
 
 	// ── Onboarding state ────────────────────────────────────────────────────────
-	let obStep = 1; // 1=keypair, 2=name, 3=done
+	// 0=loading (waiting for appReady), 1=keypair, 2=name, 3=done
+	let obStep = 0;
 	let obGenerating = false;
 
-	$: if ($appReady && obStep === 1) {
+	$: if ($appReady && obStep === 0) {
 		if ($identity && $profile?.display_name) obStep = 3;
 		else if ($identity) obStep = 2;
+		else obStep = 1;
 	}
 
 	async function obGenerateKeypair() {
@@ -328,7 +330,11 @@
 	}
 </script>
 
-{#if obStep < 3}
+{#if obStep === 0}
+	<div class="loading-screen">
+		<div class="loading-logo">H</div>
+	</div>
+{:else if obStep < 3}
 	<!-- Onboarding flow -->
 	<div class="onboarding">
 		<div class="ob-logo">H</div>
@@ -593,6 +599,29 @@
 {/if}
 
 <style>
+	/* Loading screen */
+	.loading-screen {
+		display: flex;
+		height: 100%;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.loading-logo {
+		width: 40px; height: 40px;
+		border-radius: 10px;
+		background: linear-gradient(135deg, var(--accent) 0%, oklch(0.55 0.18 100) 100%);
+		display: flex; align-items: center; justify-content: center;
+		font-weight: 800; font-size: 22px; color: var(--accent-text);
+		opacity: 0.6;
+		animation: pulse 1.4s ease-in-out infinite;
+	}
+
+	@keyframes pulse {
+		0%, 100% { opacity: 0.4; transform: scale(0.95); }
+		50% { opacity: 0.8; transform: scale(1); }
+	}
+
 	/* Onboarding */
 	.onboarding {
 		display: flex;

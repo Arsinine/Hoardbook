@@ -1,6 +1,8 @@
 <script lang="ts">
-	import { contacts } from '$lib/stores.js';
+	import { contacts, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
+	import { requestDownload } from '$lib/api.js';
+	import { save } from '@tauri-apps/plugin-dialog';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import type { CachedPeer, Collection, DirectoryItem } from '$lib/types.js';
 
@@ -85,6 +87,34 @@
 		if (bytes > 1e6) return (bytes / 1e6).toFixed(1) + ' MB';
 		if (bytes > 1e3) return (bytes / 1e3).toFixed(0) + ' KB';
 		return bytes + ' B';
+	}
+
+	// Build the relative path for a file within the collection.
+	function itemPath(item: DirectoryItem): string {
+		return [...folderStack.map(f => f.name), item.name].join('/');
+	}
+
+	let downloading: string | null = null;
+
+	async function handleDownload(item: DirectoryItem) {
+		if (!selectedPeer || !selectedCollection || item.item_type !== 'File') return;
+		const savePath = await save({ defaultPath: item.name }).catch(() => null);
+		if (!savePath) return;
+		downloading = item.name;
+		try {
+			await requestDownload(
+				selectedPeer.hb_id,
+				selectedPeer.node_addr ?? null,
+				selectedCollection.slug,
+				itemPath(item),
+				savePath,
+			);
+			toast(`Download started: ${item.name}`);
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			downloading = null;
+		}
 	}
 </script>
 
@@ -209,6 +239,8 @@
 									class:file-folder={item.item_type === 'Folder'}
 									class:file-leaf={item.item_type === 'File'}
 									on:click={() => { if (item.item_type === 'Folder') enterFolder(item); }}
+									on:dblclick={() => handleDownload(item)}
+									title={item.item_type === 'File' ? 'Double-click to download' : undefined}
 								>
 									<span class="file-icon">
 										{@html item.item_type === 'Folder' ? icons.folder : icons.file}
@@ -216,6 +248,13 @@
 									<span class="file-name">{item.name}</span>
 									<span class="file-size">{item.size ?? ''}</span>
 									<span class="file-type">{item.format ?? ''}</span>
+									{#if item.item_type === 'File'}
+										<span class="file-dl" class:file-dl-busy={downloading === item.name}>
+											{@html downloading === item.name ? '…' : icons.download}
+										</span>
+									{:else}
+										<span class="file-dl" />
+									{/if}
 								</button>
 							{/each}
 						</div>
@@ -518,7 +557,7 @@
 
 	.file-header {
 		display: grid;
-		grid-template-columns: 1fr 80px 90px;
+		grid-template-columns: 1fr 80px 90px 28px;
 		padding: 6px 14px 6px 40px;
 		border-bottom: 1px solid var(--border);
 		position: sticky;
@@ -540,7 +579,7 @@
 
 	.file-row {
 		display: grid;
-		grid-template-columns: 20px 1fr 80px 90px;
+		grid-template-columns: 20px 1fr 80px 90px 28px;
 		align-items: center;
 		padding: 5px 14px;
 		background: transparent;
@@ -592,4 +631,19 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
+
+	.file-dl {
+		grid-column: 5;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		color: var(--fg-dim);
+		opacity: 0;
+		transition: opacity 0.1s;
+		font-size: 11px;
+	}
+
+	.file-row:hover .file-dl { opacity: 1; }
+
+	.file-dl-busy { opacity: 1 !important; color: var(--accent); }
 </style>

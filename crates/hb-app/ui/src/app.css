@@ -38,3 +38,115 @@ html, body {
 *, *::before, *::after { box-sizing: border-box; }
 
 ::selection { background: oklch(0.78 0.14 70 / 0.3); }
+
+/* ── Icon animation keyframes ─────────────────────────────────────── */
+@keyframes hb-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+@keyframes hb-hop {
+  0%   { transform: translateY(0); }
+  40%  { transform: translateY(-3px); }
+  100% { transform: translateY(0); }
+}
+@keyframes hb-nudge-up {
+  0%   { transform: translateY(0); }
+  50%  { transform: translateY(-2px); }
+  100% { transform: translateY(0); }
+}
+@keyframes hb-pulse-scale {
+  0%   { transform: scale(1); }
+  50%  { transform: scale(1.18); }
+  100% { transform: scale(1); }
+}
+@keyframes hb-dl {
+  0%   { transform: translateY(0); }
+  50%  { transform: translateY(2px); }
+  100% { transform: translateY(0); }
+}
+@keyframes hb-send {
+  0%   { transform: translate(0, 0); }
+  50%  { transform: translate(2px, -2px); }
+  100% { transform: translate(0, 0); }
+}
+@keyframes hb-shake {
+  0%   { transform: translateX(0); }
+  20%  { transform: translateX(-2px); }
+  50%  { transform: translateX(2px); }
+  80%  { transform: translateX(-2px); }
+  100% { transform: translateX(0); }
+}
+@keyframes hb-bounce-down {
+  0%   { transform: translateY(0); }
+  50%  { transform: translateY(2px); }
+  100% { transform: translateY(0); }
+}
+@keyframes hb-bounce-right {
+  0%   { transform: translateX(0); }
+  50%  { transform: translateX(2px); }
+  100% { transform: translateX(0); }
+}
+
+/* ── Base transform setup for animated icons ──────────────────────── */
+.hb-icon-settings,
+.hb-icon-globe,
+.hb-icon-user,
+.hb-icon-chat,
+.hb-icon-home,
+.hb-icon-refresh,
+.hb-icon-download,
+.hb-icon-send,
+.hb-icon-trash,
+.hb-icon-close,
+.hb-icon-chevdown,
+.hb-icon-chevright,
+.hb-icon-plus,
+.hb-icon-search {
+  transform-box: fill-box;
+  transform-origin: center;
+  overflow: visible;
+}
+.hb-home-roof {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+/* ── Nav icon hover animations ────────────────────────────────────── */
+/* Settings: smooth gear rotation */
+.hb-icon-settings {
+  transition: transform 0.5s ease;
+}
+.nav-item:hover .hb-icon-settings {
+  transform: rotate(45deg);
+}
+
+/* Globe: spin */
+.nav-item:hover .hb-icon-globe {
+  animation: hb-spin 0.65s ease-in-out;
+}
+
+/* Home: roof hops up */
+.nav-item:hover .hb-home-roof {
+  animation: hb-hop 0.35s ease-out;
+}
+
+/* Contacts: nudge up */
+.nav-item:hover .hb-icon-user {
+  animation: hb-nudge-up 0.3s ease-out;
+}
+
+/* Chat: pulse */
+.nav-item:hover .hb-icon-chat {
+  animation: hb-pulse-scale 0.35s ease-out;
+}
+
+/* ── Utility icon hover animations ─────────────────────────────────── */
+.hb-icon-refresh:hover  { animation: hb-spin 0.5s ease-in-out; }
+.hb-icon-download:hover { animation: hb-dl 0.4s ease-out; }
+.hb-icon-send:hover     { animation: hb-send 0.35s ease-out; }
+.hb-icon-trash:hover    { animation: hb-shake 0.4s ease-in-out; }
+.hb-icon-close:hover    { animation: hb-spin 0.3s ease-in-out; }
+.hb-icon-chevdown:hover  { animation: hb-bounce-down 0.3s ease-out; }
+.hb-icon-chevright:hover { animation: hb-bounce-right 0.3s ease-out; }
+.hb-icon-plus:hover     { animation: hb-pulse-scale 0.25s ease-out; }
+.hb-icon-search:hover   { animation: hb-pulse-scale 0.25s ease-out; }

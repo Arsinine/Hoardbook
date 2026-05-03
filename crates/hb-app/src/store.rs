@@ -139,7 +139,7 @@ impl DataStore {
     }
 
     pub fn load_profile_draft(&self) -> Result<Option<Profile>> {
-        read_json(&self.profile_draft_path()).context("loading profile draft")
+        read_json_lenient(&self.profile_draft_path()).context("loading profile draft")
     }
 
     pub fn save_profile_signed(&self, env: &SignedEnvelope) -> Result<()> {

@@ -18,7 +18,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const tag = context.ref.replace('refs/tags/', '');
+            const tag = '${{ github.ref_name }}';
             const { data } = await github.rest.repos.createRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -29,44 +29,7 @@ jobs:
             });
             return data.id;
 
-  build-windows:
-    needs: create-release
-    permissions:
-      contents: write
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install frontend dependencies
-        working-directory: crates/hb-app/ui
-        run: npm install
-
-      - name: Build app
-        working-directory: crates/hb-app
-        run: cargo tauri build
-
-      - name: Package portable exe
-        shell: pwsh
-        run: |
-          Compress-Archive `
-            -Path "target/release/hb-app.exe" `
-            -DestinationPath "Hoardbook_${{ github.ref_name }}_windows_x64_portable.zip"
-
-      - name: Upload portable exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >
-          gh release upload ${{ github.ref_name }}
-          "Hoardbook_${{ github.ref_name }}_windows_x64_portable.zip"
-          --repo ${{ github.repository }}
-
-  build-linux-macos:
+  build-tauri:
     needs: create-release
     permissions:
       contents: write
@@ -74,6 +37,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - platform: windows-latest
+            args: ''
           - platform: ubuntu-22.04
             args: ''
           - platform: macos-latest
@@ -106,7 +71,14 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Required for update package signing.
+          # Generate with: cargo tauri signer generate -w ~/.tauri/hoardbook.key
+          # Set TAURI_SIGNING_PRIVATE_KEY in repo Settings → Secrets → Actions.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           releaseId: ${{ needs.create-release.outputs.release-id }}
           projectPath: crates/hb-app
           args: ${{ matrix.args }}
+          # tauri-action uploads artifacts AND generates latest.json when all jobs finish.
+          updaterJsonPreferNsis: true
