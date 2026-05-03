@@ -1,23 +1,64 @@
 <script lang="ts">
 	import '../app.css';
 	import { onMount } from 'svelte';
+	import { get } from 'svelte/store';
 	import { page } from '$app/stores';
-	import { getIdentity, getProfile, getCollections, getContacts } from '$lib/api.js';
-	import { identity, profile, collections, contacts, toastMessage, appReady, unreadCount } from '$lib/stores.js';
+	import { getIdentity, getProfile, getCollections, getContacts, getMessages } from '$lib/api.js';
+	import { identity, profile, collections, contacts, inboxMessages, toastMessage, appReady, unreadCount } from '$lib/stores.js';
 	import { navIcons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
+	import { getVersion } from '@tauri-apps/api/app';
 
-	onMount(async () => {
-		try { identity.set(await getIdentity()); } catch { }
-		try { profile.set(await getProfile()); } catch { }
-		try { collections.set(await getCollections()); } catch { }
-		try { contacts.set(await getContacts()); } catch { }
-		appReady.set(true);
+	let appVersion = '';
+
+	// Module-level set: persists across page navigation (layout never remounts in SvelteKit).
+	const seenLayoutKeys = new Set<string>();
+
+	onMount(() => {
+		// Async init (IIFE so onMount can return a sync cleanup function).
+		(async () => {
+			try { identity.set(await getIdentity()); } catch { }
+			try { profile.set(await getProfile()); } catch { }
+			try { collections.set(await getCollections()); } catch { }
+			try { contacts.set(await getContacts()); } catch { }
+			try { appVersion = await getVersion(); } catch { appVersion = '0.1.0'; }
+
+			// Seed initial message keys without showing a badge (they're not "new").
+			try {
+				const initial = await getMessages();
+				for (const m of initial) seenLayoutKeys.add(`${m.from}|${m.sent_at}`);
+				inboxMessages.set(initial);
+			} catch { }
+
+			appReady.set(true);
+		})();
+
+		// Background poll: keeps inboxMessages fresh and drives the nav badge.
+		const poll = setInterval(async () => {
+			if (!get(identity)) return;
+			try {
+				const msgs = await getMessages();
+				const onChat = get(page).url.pathname === '/chat';
+				let newCount = 0;
+				for (const m of msgs) {
+					const key = `${m.from}|${m.sent_at}`;
+					if (!seenLayoutKeys.has(key)) {
+						seenLayoutKeys.add(key);
+						if (!onChat) newCount++;
+					}
+				}
+				inboxMessages.set(msgs);
+				if (newCount > 0) unreadCount.update(n => n + newCount);
+			} catch { }
+		}, 20_000);
+
+		return () => clearInterval(poll);
 	});
 
 	const navItems = [
 		{ href: '/', label: 'Home' },
 		{ href: '/contacts', label: 'Contacts' },
+		{ href: '/browse', label: 'Browse' },
 		{ href: '/chat', label: 'Chat' },
 		{ href: '/settings', label: 'Settings' },
 	];
@@ -61,6 +102,10 @@
 					<div class="id-key">{idShort}</div>
 				</div>
 			</div>
+		{/if}
+
+		{#if appVersion}
+			<div class="version-tag">v{appVersion}</div>
 		{/if}
 	</div>
 
@@ -201,6 +246,15 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+
+	.version-tag {
+		font-size: 10px;
+		color: var(--fg-dim);
+		text-align: center;
+		padding: 4px 0 2px;
+		font-family: var(--font-mono);
+		letter-spacing: 0.3px;
 	}
 
 	.main {

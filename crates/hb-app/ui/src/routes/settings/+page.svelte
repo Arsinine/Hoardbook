@@ -1,16 +1,52 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { generateKeypair, getHbId, getSettings, saveSettings, saveKeypairFile, importKeypair, wipeData, checkRelay } from '$lib/api.js';
+	import { generateKeypair, getHbId, getSettings, saveSettings, importKeypair, wipeData, checkRelay, checkUpdate, installUpdate } from '$lib/api.js';
+	import type { UpdateInfo } from '$lib/api.js';
 	import { relaunch } from '@tauri-apps/plugin-process';
-	import { save, open as openFileDialog } from '@tauri-apps/plugin-dialog';
+	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
+	import { getVersion } from '@tauri-apps/api/app';
 	import { identity, profile, collections, contacts, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
 
 	let generating = false;
 	let copied = false;
-	let exporting = false;
 	let importing = false;
+	let appVersion = '';
+
+	// Update state
+	let updateChecking = false;
+	let updateInstalling = false;
+	let updateInfo: UpdateInfo | null = null;
+	let updateChecked = false;
+	let updateError = '';
+
+	async function doCheckUpdate() {
+		updateChecking = true;
+		updateError = '';
+		updateInfo = null;
+		updateChecked = false;
+		try {
+			updateInfo = await checkUpdate();
+			updateChecked = true;
+		} catch (e) {
+			updateError = String(e).replace(/^Error: /, '');
+		} finally {
+			updateChecking = false;
+		}
+	}
+
+	async function doInstallUpdate() {
+		updateInstalling = true;
+		try {
+			await installUpdate();
+		} catch (e) {
+			toast(String(e), 'error');
+			updateInstalling = false;
+		}
+	}
+
+	const BOOTSTRAP_RELAY = 'http://198.51.100.1:3000';
 
 	let relayUrls: string[] = [];
 	let newRelay = '';
@@ -19,8 +55,15 @@
 
 	type RelayStatus = 'checking' | 'ok' | 'error';
 	let relayStatuses: Record<string, RelayStatus> = {};
+	let bootstrapStatus: RelayStatus = 'checking';
 
 	async function probeRelay(url: string) {
+		if (url === BOOTSTRAP_RELAY) {
+			bootstrapStatus = 'checking';
+			try { await checkRelay(url); bootstrapStatus = 'ok'; }
+			catch { bootstrapStatus = 'error'; }
+			return;
+		}
 		relayStatuses[url] = 'checking';
 		relayStatuses = relayStatuses;
 		try {
@@ -40,13 +83,18 @@
 	let wiping = false;
 
 	onMount(async () => {
+		try { appVersion = await getVersion(); } catch { appVersion = ''; }
+		// Always probe the bootstrap relay immediately.
+		probeRelay(BOOTSTRAP_RELAY).then(() => {}).catch(() => {
+			bootstrapStatus = 'error';
+		});
 		try {
 			const s = await getSettings();
-			relayUrls = s.relay_urls;
+			// Filter out bootstrap relay from user list (it's shown separately).
+			relayUrls = s.relay_urls.filter(u => u !== BOOTSTRAP_RELAY);
 			allowDms = s.allow_dms ?? true;
 			recommended = s.recommended ?? false;
 			settingsLoaded = true;
-			// Probe all saved relays in parallel.
 			relayUrls.forEach(probeRelay);
 		} catch { settingsLoaded = true; }
 	});
@@ -84,23 +132,6 @@
 			setTimeout(() => (copied = false), 2000);
 		} catch {
 			toast('Could not copy to clipboard', 'error');
-		}
-	}
-
-	async function handleExport() {
-		exporting = true;
-		try {
-			const path = await save({
-				defaultPath: 'hoardbook-keypair.json',
-				filters: [{ name: 'JSON', extensions: ['json'] }],
-			});
-			if (!path) return;
-			await saveKeypairFile(path);
-			toast(`Keypair saved to ${path} — contains your private key, guard this file`);
-		} catch (e) {
-			toast(String(e), 'error');
-		} finally {
-			exporting = false;
 		}
 	}
 
@@ -235,19 +266,11 @@
 			<div class="field-label" style="margin-bottom:6px">Your Hoardbook ID</div>
 			<div class="id-display">
 				<span class="id-text">{$identity.hb_id}</span>
-				<button class="icon-btn" on:click={handleCopy} title="Copy">{@html icons.copy}</button>
+				<button class="icon-btn" on:click={handleCopy} title="Copy to clipboard">{@html icons.copy}</button>
 			</div>
 
 			<div class="id-actions">
-				<span class="id-hint">Share this so others can look you up.</span>
-				<div class="id-btns">
-					<button class="btn-default btn-sm btn-icon" on:click={handleCopy}>
-						{@html icons.copy} {copied ? 'Copied!' : 'Copy'}
-					</button>
-					<button class="btn-default btn-sm btn-icon" on:click={handleExport} disabled={exporting}>
-						{@html icons.key} {exporting ? 'Exporting…' : 'Export key'}
-					</button>
-				</div>
+				<span class="id-hint">{copied ? 'Copied!' : 'Share this so others can look you up.'}</span>
 			</div>
 		</div>
 	{:else}
@@ -270,24 +293,31 @@
 	</div>
 
 	<div class="surface surface-nop">
-		{#if relayUrls.length === 0}
-			<div class="relay-empty">No relays configured. Add one to publish and browse.</div>
-		{:else}
-			{#each relayUrls as url}
-				{@const status = relayStatuses[url]}
-				<div class="relay-row">
-					<div class="relay-dot" style="background:{relayDotColor(status)}" class:relay-dot-pulse={status === 'checking'} />
-					<div class="relay-info">
-						<div class="relay-url">{url}</div>
-						<div class="relay-meta">
-							<span class:status-ok={status === 'ok'} class:status-err={status === 'error'}>{relayStatusLabel(status)}</span>
-						</div>
-					</div>
-					<button class="icon-btn" title="Re-check" on:click={() => probeRelay(url)}>{@html icons.refresh}</button>
-					<button class="icon-btn" on:click={() => removeRelay(url)}>{@html icons.close}</button>
+		<!-- Bootstrap relay — always present, non-removable -->
+		<div class="relay-row">
+			<div class="relay-dot" style="background:{relayDotColor(bootstrapStatus)}" class:relay-dot-pulse={bootstrapStatus === 'checking'} />
+			<div class="relay-info">
+				<div class="relay-url">{BOOTSTRAP_RELAY}</div>
+				<div class="relay-meta">
+					<span class:status-ok={bootstrapStatus === 'ok'} class:status-err={bootstrapStatus === 'error'}>{relayStatusLabel(bootstrapStatus)}</span>
 				</div>
-			{/each}
-		{/if}
+			</div>
+			<button class="icon-btn" title="Re-check" on:click={() => probeRelay(BOOTSTRAP_RELAY)}>{@html icons.refresh}</button>
+		</div>
+		{#each relayUrls as url}
+			{@const status = relayStatuses[url]}
+			<div class="relay-row">
+				<div class="relay-dot" style="background:{relayDotColor(status)}" class:relay-dot-pulse={status === 'checking'} />
+				<div class="relay-info">
+					<div class="relay-url">{url}</div>
+					<div class="relay-meta">
+						<span class:status-ok={status === 'ok'} class:status-err={status === 'error'}>{relayStatusLabel(status)}</span>
+					</div>
+				</div>
+				<button class="icon-btn" title="Re-check" on:click={() => probeRelay(url)}>{@html icons.refresh}</button>
+				<button class="icon-btn" on:click={() => removeRelay(url)}>{@html icons.close}</button>
+			</div>
+		{/each}
 		<!-- Add relay row -->
 		<div class="relay-add-row">
 			<input
@@ -329,6 +359,33 @@
 				<span class="toggle-thumb" />
 			</button>
 		</div>
+	</div>
+
+	<!-- Updates -->
+	<div class="section-label">Updates</div>
+	<div class="surface">
+		<div class="update-row">
+			<div class="toggle-text">
+				<div class="toggle-label">App version</div>
+				<div class="toggle-sub">Currently running v{appVersion || '…'}</div>
+			</div>
+			<div class="update-actions">
+				{#if updateInfo}
+					<span class="update-available-text">v{updateInfo.version} available</span>
+					<button class="btn-primary btn-sm" on:click={doInstallUpdate} disabled={updateInstalling}>
+						{updateInstalling ? 'Installing…' : 'Install & restart'}
+					</button>
+				{:else if updateChecked}
+					<span class="update-ok-text">Up to date</span>
+				{/if}
+				<button class="btn-default btn-sm" on:click={doCheckUpdate} disabled={updateChecking}>
+					{updateChecking ? 'Checking…' : 'Check for updates'}
+				</button>
+			</div>
+		</div>
+		{#if updateError}
+			<div class="update-error-text">{updateError}</div>
+		{/if}
 	</div>
 
 	<!-- Danger Zone -->
@@ -430,8 +487,6 @@
 
 	.id-hint { font-size: 11.5px; color: var(--fg-dim); }
 
-	.id-btns { display: flex; gap: 8px; flex-shrink: 0; align-items: center; }
-
 	.no-id-text { font-size: 13px; color: var(--fg-muted); }
 
 	.field-label { font-size: 11px; color: var(--fg-muted); font-weight: 500; }
@@ -469,8 +524,6 @@
 		color: var(--fg-dim);
 		margin-top: 2px;
 	}
-
-	.relay-empty { padding: 14px 16px; font-size: 12.5px; color: var(--fg-dim); }
 
 	.status-ok  { color: var(--online); }
 	.status-err { color: var(--error); }
@@ -560,6 +613,13 @@
 		white-space: nowrap;
 	}
 
+	/* Updates */
+	.update-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+	.update-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
+	.update-available-text { font-size: 12px; color: var(--accent); font-weight: 600; white-space: nowrap; }
+	.update-ok-text { font-size: 12px; color: var(--online); white-space: nowrap; }
+	.update-error-text { font-size: 11.5px; color: var(--error); margin-top: 4px; }
+
 	/* Pills */
 	.pill {
 		display: inline-flex; align-items: center; gap: 5px;
@@ -618,5 +678,4 @@
 	}
 	.btn-danger:disabled { opacity: 0.5; cursor: not-allowed; }
 	.btn-sm { padding: 5px 11px; font-size: 12px; height: 28px; }
-	.btn-icon { gap: 5px; }
 </style>

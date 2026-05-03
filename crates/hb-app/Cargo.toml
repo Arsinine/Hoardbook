@@ -31,5 +31,6 @@ reqwest = { version = "0.12", features = ["json"] }
 sha2    = "0.10"
 iroh    = { version = "0.98", default-features = false, features = ["tls-ring"] }
 tauri-plugin-process = "2"
+tauri-plugin-updater = "2"
 globset = "0.4"
 urlencoding = "2"

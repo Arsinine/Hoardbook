@@ -254,10 +254,11 @@ pub async fn get_heartbeat(
     Ok(row)
 }
 
-/// Returns `(pubkey, profile_envelope)` for listed peers that have a profile.
-/// Peers that are listed but have no profile are excluded from results.
+/// Returns `(pubkey, profile_envelope)` for listed peers seen within the last 24 hours.
+/// Peers that are listed but have no profile, or haven't heartbeated in 24h, are excluded.
 pub async fn get_listed_peers(pool: &SqlitePool) -> Result<Vec<(String, String)>> {
     let now = now_secs();
+    let cutoff = now - SECS_PER_DAY;
     let rows: Vec<(String, String)> = sqlx::query_as(
         r#"
         SELECT h.pubkey, d.envelope
@@ -267,15 +268,35 @@ pub async fn get_listed_peers(pool: &SqlitePool) -> Result<Vec<(String, String)>
            AND d.doc_type = 'profile'
            AND d.expires_at > ?
         WHERE h.listed = 1
+          AND h.last_seen > ?
         ORDER BY h.last_seen DESC
         LIMIT 200
         "#,
     )
     .bind(now)
+    .bind(cutoff)
     .fetch_all(pool)
     .await?;
 
     Ok(rows)
+}
+
+/// Remove a peer from the directory and delete their published documents.
+/// Their heartbeat row is kept (for last-seen history) but listed is set to 0.
+pub async fn deactivate_peer(pool: &SqlitePool, pubkey: &str) -> Result<()> {
+    sqlx::query("UPDATE heartbeats SET listed = 0 WHERE pubkey = ?")
+        .bind(pubkey)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM documents WHERE pubkey = ?")
+        .bind(pubkey)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM collections WHERE pubkey = ?")
+        .bind(pubkey)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Check if a display_name is already taken by a different pubkey.

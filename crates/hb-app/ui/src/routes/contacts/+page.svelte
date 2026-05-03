@@ -12,13 +12,31 @@
 	let directory: DirectoryPeer[] = [];
 	let directoryLoading = false;
 
-	onMount(async () => {
+	async function loadDirectory() {
 		directoryLoading = true;
 		try { directory = await getDirectory(); } catch { /* relay may be unreachable */ }
 		finally { directoryLoading = false; }
+	}
+
+	// IP warning modal state (task 8)
+	let showIpWarning = false;
+	let pendingDownloadDetail: { peerId: string; slug: string; path: string } | null = null;
+
+	onMount(() => {
+		loadDirectory();
+		// Refresh all contacts in parallel on page load (task 4)
+		$contacts.forEach(async (c) => {
+			try {
+				const updated = await refreshContact(c.hb_id);
+				contacts.update(cs => cs.map(x => x.hb_id === c.hb_id ? { ...x, ...updated, local_tags: x.local_tags } : x));
+			} catch { /* silent — relay may be unreachable */ }
+		});
 	});
 
-	$: recommendedPeers = directory.filter(d => !$contacts.some(c => c.hb_id === d.hb_id));
+	// Exclude contacts already followed AND the current user's own ID.
+	$: recommendedPeers = directory.filter(
+		d => !$contacts.some(c => c.hb_id === d.hb_id) && d.hb_id !== $identity?.hb_id
+	);
 
 	async function handleFollowDirectory(peer: DirectoryPeer) {
 		try {
@@ -99,7 +117,7 @@
 		refreshing = hb_id;
 		try {
 			const updated = await refreshContact(hb_id);
-			contacts.update((cs) => cs.map((c) => (c.hb_id === hb_id ? updated : c)));
+			contacts.update((cs) => cs.map((c) => (c.hb_id === hb_id ? { ...updated, local_tags: c.local_tags } : c)));
 			toast('Contact refreshed');
 		} catch (e) {
 			toast(String(e), 'error');
@@ -119,16 +137,40 @@
 	}
 
 	async function handleDownload(e: CustomEvent<{ peerId: string; slug: string; path: string }>) {
-		const filename = e.detail.path.split('/').pop() ?? e.detail.path;
+		const peer = $contacts.find((c) => c.hb_id === e.detail.peerId);
+		if (peer?.node_addr) {
+			// Direct P2P connection will be used — warn about IP exposure first
+			pendingDownloadDetail = e.detail;
+			showIpWarning = true;
+			return;
+		}
+		await proceedWithDownload(e.detail);
+	}
+
+	async function proceedWithDownload(detail: { peerId: string; slug: string; path: string }) {
+		const filename = detail.path.split('/').pop() ?? detail.path;
 		const savePath = await save({ defaultPath: filename });
 		if (!savePath) return;
-		const peer = $contacts.find((c) => c.hb_id === e.detail.peerId);
+		const peer = $contacts.find((c) => c.hb_id === detail.peerId);
 		try {
-			await requestDownload(e.detail.peerId, peer?.node_addr ?? null, e.detail.slug, e.detail.path, savePath);
+			await requestDownload(detail.peerId, peer?.node_addr ?? null, detail.slug, detail.path, savePath);
 			toast(`Downloading to ${savePath}`);
 		} catch (err) {
 			toast(String(err), 'error');
 		}
+	}
+
+	async function confirmIpWarning() {
+		showIpWarning = false;
+		if (pendingDownloadDetail) {
+			await proceedWithDownload(pendingDownloadDetail);
+			pendingDownloadDetail = null;
+		}
+	}
+
+	function cancelIpWarning() {
+		showIpWarning = false;
+		pendingDownloadDetail = null;
 	}
 
 	function shortId(hb_id: string) {
@@ -147,6 +189,13 @@
 		const hrs = Math.floor(mins / 60);
 		if (hrs < 24) return `${hrs}h ago`;
 		return `${Math.floor(hrs / 24)}d ago`;
+	}
+
+	function lastSeenLabel(peer: import('$lib/types.js').CachedPeer): string {
+		// Prefer relay-provided last_seen_at (accurate activity time) over last_fetched (our fetch time).
+		const ts = peer.last_seen_at ?? peer.last_fetched;
+		if (!ts) return 'never';
+		return formatLastSeen(ts);
 	}
 
 	// Tag editing state
@@ -312,6 +361,9 @@
 			<div class="divider-line" />
 			<span class="divider-label">Recommended</span>
 			<div class="divider-line" />
+			<button class="icon-btn" title="Refresh recommended" on:click={loadDirectory} disabled={directoryLoading}>
+				{@html icons.refresh}
+			</button>
 		</div>
 		{#if directoryLoading}
 			<div class="empty">Loading recommended peers…</div>
@@ -360,6 +412,25 @@
 	{/if}
 
 	<!-- Contacts list -->
+	<!-- IP Exposure Warning Modal (task 8) -->
+	{#if showIpWarning}
+		<div class="modal-overlay" on:click={cancelIpWarning} role="dialog" aria-modal="true">
+			<!-- svelte-ignore a11y-click-events-have-key-events -->
+			<!-- svelte-ignore a11y-no-static-element-interactions -->
+			<div class="modal" on:click|stopPropagation>
+				<div class="modal-title">{@html icons.shield} Direct connection</div>
+				<p class="modal-body">
+					This download uses a direct P2P connection, which will expose your IP address to the other peer.
+					If privacy is a concern, ask them to disable file sharing or wait until they are reachable through the relay.
+				</p>
+				<div class="modal-actions">
+					<button class="btn-ghost btn-sm" on:click={cancelIpWarning}>Cancel</button>
+					<button class="btn-primary btn-sm" on:click={confirmIpWarning}>I understand, proceed</button>
+				</div>
+			</div>
+		</div>
+	{/if}
+
 	{#if $contacts.length === 0}
 		<div class="empty">No contacts yet. Look up a peer above and follow them.</div>
 	{:else if filteredContacts.length === 0}
@@ -372,36 +443,37 @@
 				{@const hue = avatarHue(initial)}
 				<div class="contact-block">
 					<div class="contact-card">
-						<Avatar letter={initial} size={42} {hue} />
+						<Avatar letter={initial} size={34} {hue} />
 						<div class="contact-info">
 							<div class="name-row">
 								<span class="peer-name">{name}</span>
 								{#if peer.online}
-									<span class="pill pill-online"><span class="pill-dot" /> Online</span>
+									<span class="pill pill-online"><span class="pill-dot" /></span>
 								{:else}
 									<span class="pill pill-offline">Offline</span>
 								{/if}
-								<span class="last-seen">seen {peer.last_fetched ? formatLastSeen(peer.last_fetched) : 'never'}</span>
+								<span class="last-seen">seen {lastSeenLabel(peer)}</span>
+								<div style="flex:1" />
+								<button
+									class="btn-ghost btn-xs btn-icon"
+									on:click={() => handleRefresh(peer.hb_id)}
+									disabled={refreshing === peer.hb_id}
+									title="Refresh"
+								>
+									<span>{@html icons.refresh}</span>
+								</button>
+								<button class="btn-ghost btn-xs btn-danger" on:click={() => handleUnfollow(peer.hb_id)} title="Unfollow">
+									Unfollow
+								</button>
+								<button class="btn-default btn-xs" on:click={() => handleExpand(peer)}>
+									{expanded === peer.hb_id ? 'Hide' : 'Browse'}
+								</button>
 							</div>
-							<div class="mono">{shortId(peer.hb_id)}</div>
-							{#if peer.profile?.bio}
-								<p class="bio">{peer.profile.bio}</p>
-							{/if}
-
-							<!-- Location / email / social links -->
-							{#if peer.profile?.location || peer.profile?.email || (peer.profile?.social_links?.length ?? 0) > 0}
-								<div class="contact-meta">
-									{#if peer.profile?.location}
-										<span class="meta-chip">{@html icons.location ?? '📍'} {peer.profile.location}</span>
-									{/if}
-									{#if peer.profile?.email}
-										<a class="meta-chip meta-link" href="mailto:{peer.profile.email}">{peer.profile.email}</a>
-									{/if}
-									{#each (peer.profile?.social_links ?? []) as link}
-										<span class="meta-chip meta-social">{link.platform}: {link.handle}</span>
-									{/each}
-								</div>
-							{/if}
+							<div class="contact-sub-row">
+								<div class="mono">{shortId(peer.hb_id)}</div>
+								{#if peer.profile?.est_size}<span class="sub-dot">·</span><span class="sub-meta">~{peer.profile.est_size}</span>{/if}
+								{#if peer.collections.length > 0}<span class="sub-dot">·</span><span class="sub-meta">{peer.collections.length} collection{peer.collections.length !== 1 ? 's' : ''}</span>{/if}
+							</div>
 
 							<!-- Local tags -->
 							<div class="tag-row">
@@ -427,39 +499,14 @@
 									<button class="tag-add-btn" on:click={() => { editingTagsFor = peer.hb_id; tagInput = ''; }}>+ tag</button>
 								{/if}
 							</div>
-
-							<div class="contact-footer">
-								{#if peer.profile?.est_size}
-									<span class="tnum">~{peer.profile.est_size}</span>
-								{/if}
-								{#if peer.collections.length > 0}
-									<span class="dot">·</span>
-									<span>{peer.collections.length} collection{peer.collections.length !== 1 ? 's' : ''}</span>
-								{/if}
-								<div style="flex:1" />
-								<button
-									class="btn-ghost btn-sm btn-icon"
-									on:click={() => handleRefresh(peer.hb_id)}
-									disabled={refreshing === peer.hb_id}
-								>
-									<span>{@html icons.refresh}</span>
-									{refreshing === peer.hb_id ? '…' : 'Refresh'}
-								</button>
-								<button class="btn-ghost btn-sm btn-danger" on:click={() => handleUnfollow(peer.hb_id)}>
-									Unfollow
-								</button>
-								<button
-									class="btn-default btn-sm"
-									on:click={() => handleExpand(peer)}
-								>
-									{expanded === peer.hb_id ? 'Hide' : 'View'} collections
-								</button>
-							</div>
 						</div>
 					</div>
 
 					{#if expanded === peer.hb_id}
 						<div class="collections-indent">
+							{#if peer.profile?.bio}
+								<p class="contact-bio">{peer.profile.bio}</p>
+							{/if}
 							{#if autoRefreshing === peer.hb_id}
 								<p class="no-coll">Checking for collections…</p>
 							{:else if peer.collections.length === 0}
@@ -594,9 +641,15 @@
 	.section-divider {
 		display: flex;
 		align-items: center;
-		gap: 12px;
+		gap: 8px;
 		margin: 4px 0 20px;
 	}
+
+	.icon-btn {
+		background: transparent; border: none; cursor: pointer;
+		color: var(--fg-muted); display: flex; padding: 2px; flex-shrink: 0;
+	}
+	.icon-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 	.divider-line { flex: 1; height: 1px; background: var(--divider); }
 
@@ -634,45 +687,45 @@
 		background: var(--bg-elev1);
 		border: 1px solid var(--border);
 		border-radius: 10px;
-		padding: 14px;
+		padding: 10px 12px;
 		display: flex;
-		gap: 14px;
+		gap: 10px;
 		align-items: flex-start;
 	}
 
 	.contact-info { flex: 1; min-width: 0; }
 
-	.last-seen { font-size: 11px; color: var(--fg-dim); margin-left: auto; }
+	.last-seen { font-size: 10.5px; color: var(--fg-dim); }
 
-	.bio { font-size: 12.5px; color: var(--fg-muted); margin-top: 6px; line-height: 1.5; }
+	.contact-sub-row {
+		display: flex; align-items: center; gap: 5px;
+		margin-top: 2px; font-size: 11px; color: var(--fg-muted);
+	}
+	.sub-dot { color: var(--fg-dim); }
+	.sub-meta { color: var(--fg-muted); font-feature-settings: 'tnum'; }
 
-	.contact-meta { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
-
-	.meta-chip {
-		font-size: 11px;
-		color: var(--fg-muted);
+	/* Modal */
+	.modal-overlay {
+		position: fixed; inset: 0;
+		background: oklch(0 0 0 / 0.6);
+		display: flex; align-items: center; justify-content: center;
+		z-index: 9000;
+	}
+	.modal {
 		background: var(--bg-elev2);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		padding: 1px 7px;
-		white-space: nowrap;
+		border: 1px solid var(--border-strong);
+		border-radius: 12px;
+		padding: 22px;
+		max-width: 400px;
+		width: calc(100vw - 48px);
+		box-shadow: 0 20px 60px oklch(0 0 0 / 0.5);
 	}
-
-	.meta-link {
-		color: var(--accent);
-		text-decoration: none;
+	.modal-title {
+		font-size: 15px; font-weight: 600; color: var(--fg);
+		margin-bottom: 10px; display: flex; gap: 8px; align-items: center;
 	}
-	.meta-link:hover { text-decoration: underline; }
-
-	.meta-social { font-family: var(--font-mono); font-size: 10.5px; }
-
-	.contact-footer {
-		display: flex; gap: 8px; align-items: center;
-		margin-top: 8px; font-size: 11.5px; color: var(--fg-muted);
-	}
-
-	.tnum { font-feature-settings: 'tnum'; }
-	.dot { color: var(--fg-dim); }
+	.modal-body { font-size: 13px; color: var(--fg-muted); line-height: 1.55; margin: 0 0 18px; }
+	.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
 	/* Tag filter bar */
 	.tag-filter-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
@@ -711,6 +764,8 @@
 	.collections-indent { padding-left: 56px; display: flex; flex-direction: column; gap: 8px; }
 
 	.no-coll { font-size: 12px; color: var(--fg-dim); }
+
+	.contact-bio { font-size: 12.5px; color: var(--fg-muted); line-height: 1.55; margin: 0 0 6px; }
 
 	/* Pills */
 	.pill {
@@ -756,6 +811,7 @@
 	}
 	.btn-ghost:disabled { opacity: 0.5; cursor: not-allowed; }
 	.btn-sm { padding: 5px 11px; font-size: 12px; }
+	.btn-xs { padding: 3px 8px; font-size: 11px; height: 24px; }
 	.btn-icon { gap: 4px; }
 	.btn-danger { color: var(--red, #e05c5c); }
 	.btn-danger:hover { background: color-mix(in oklch, var(--red, #e05c5c) 10%, transparent); }

@@ -5,3 +5,4 @@ pub mod identity;
 pub mod profile;
 pub mod settings;
 pub mod sharing;
+pub mod update;

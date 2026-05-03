@@ -1,5 +1,5 @@
 use chrono::Utc;
-use hb_core::{ChannelMessage, DocType, SignedEnvelope, types::ChatMessage};
+use hb_core::{ChannelMessage, DocType, HbId, SignedEnvelope, types::ChatMessage};
 use serde::Serialize;
 use tauri::State;
 
@@ -24,14 +24,12 @@ pub struct ReceivedMessage {
 /// Returns the sent message so the frontend can append it immediately.
 #[tauri::command]
 pub async fn send_message(
-    to: String,
+    to: HbId,
     content: String,
     identity: State<'_, SharedIdentity>,
     relay: State<'_, SharedRelay>,
 ) -> CmdResult<ReceivedMessage> {
-    // Validate recipient and decode their public key for encryption.
-    let recipient_pubkey = hb_core::hb_id_decode(&to)
-        .map_err(|_| "Invalid recipient ID".to_string())?;
+    let recipient_pubkey = to.pubkey();
 
     let trimmed = content.trim().to_string();
     if trimmed.is_empty() {
@@ -55,7 +53,7 @@ pub async fn send_message(
 
     let sent_at = Utc::now();
     let msg = ChatMessage {
-        to: to.clone(),
+        to: to.to_string(),
         content: encrypted_content,
         encrypted: true,
         sent_at,
@@ -68,8 +66,8 @@ pub async fn send_message(
 
     Ok(ReceivedMessage {
         from,
-        to,
-        content: trimmed, // return plaintext to the frontend
+        to: to.to_string(),
+        content: trimmed,
         sent_at: sent_at.to_rfc3339(),
         encrypted: true,
     })

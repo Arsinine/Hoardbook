@@ -54,6 +54,8 @@ pub async fn scan_directory(
         est_size,
         total_bytes,
         content_type: vec![],
+        languages: vec![],
+        sorted: false,
         last_updated: chrono::Utc::now(),
         listing,
     };
@@ -104,12 +106,14 @@ pub async fn get_collections(store: State<'_, DataStore>) -> CmdResult<Vec<Colle
     Ok(entries)
 }
 
-/// Update the editable metadata fields (description, content_type) of a collection draft.
+/// Update the editable metadata fields of a collection draft.
 #[tauri::command]
 pub async fn update_collection_meta(
     slug: String,
     description: Option<String>,
     content_type: Vec<String>,
+    languages: Vec<String>,
+    sorted: bool,
     store: State<'_, DataStore>,
 ) -> CmdResult<()> {
     let safe_slug = is_valid_slug(&slug)
@@ -124,6 +128,8 @@ pub async fn update_collection_meta(
 
     col.description = description;
     col.content_type = content_type;
+    col.languages = languages;
+    col.sorted = sorted;
     store.save_collection_draft(&col).map_err(cmd_err)
 }
 

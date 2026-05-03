@@ -198,6 +198,10 @@ pub struct PeerResponse {
     pub online: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_addr: Option<String>,
+    /// Unix timestamp of the peer's last heartbeat, so clients can display
+    /// accurate "last seen" times rather than just online/offline status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<i64>,
 }
 
 const ONLINE_THRESHOLD_SECS: i64 = 600;
@@ -222,12 +226,12 @@ pub async fn get_peer(
         .filter_map(|s| serde_json::from_str(&s).ok())
         .collect();
 
-    let (online, node_addr) = match db::get_heartbeat(&state.pool, &pubkey).await? {
+    let (online, node_addr, last_seen_at) = match db::get_heartbeat(&state.pool, &pubkey).await? {
         Some((last_seen, addr)) => {
             let age = chrono::Utc::now().timestamp() - last_seen;
-            (age < ONLINE_THRESHOLD_SECS, addr)
+            (age < ONLINE_THRESHOLD_SECS, addr, Some(last_seen))
         }
-        None => (false, None),
+        None => (false, None, None),
     };
 
     Ok(Json(PeerResponse {
@@ -236,6 +240,7 @@ pub async fn get_peer(
         succession,
         online,
         node_addr,
+        last_seen_at,
     }))
 }
 
@@ -425,6 +430,58 @@ pub async fn check_name(
         available: taken_by.is_none(),
         taken_by,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/deactivate  — signed self-removal request
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct DeactivateRequest {
+    pub public_key: String,
+    pub signed_at: String,
+    pub action: String,
+    pub signature: String,
+}
+
+#[derive(Serialize)]
+struct DeactivateBody {
+    public_key: String,
+    signed_at: String,
+    action: String,
+}
+
+pub async fn deactivate_peer(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Json(body): Json<DeactivateRequest>,
+) -> Result<StatusCode, AppError> {
+    if !state.rate_limiter.check(&addr.ip().to_string()) {
+        return Err(AppError::BadRequest("rate limit exceeded".into()));
+    }
+
+    if body.action != "deactivate" {
+        return Err(AppError::BadRequest("invalid action".into()));
+    }
+
+    if !timestamp_is_fresh(&body.signed_at).unwrap_or(false) {
+        return Err(AppError::BadRequest("timestamp out of acceptable range".into()));
+    }
+
+    let signed = DeactivateBody {
+        public_key: body.public_key.clone(),
+        signed_at: body.signed_at.clone(),
+        action: body.action.clone(),
+    };
+    let signed_value = serde_json::to_value(&signed)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+
+    let pubkey_bytes = hb_core::hb_id_decode(&body.public_key)?;
+    hb_core::crypto::verify(&pubkey_bytes, &signed_value, &body.signature)?;
+
+    db::deactivate_peer(&state.pool, &body.public_key).await?;
+
+    Ok(StatusCode::OK)
 }
 
 // ---------------------------------------------------------------------------

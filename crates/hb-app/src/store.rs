@@ -41,6 +41,27 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
+/// Like read_json but returns Ok(None) instead of propagating a parse error.
+/// Used for settings and contacts so that a version mismatch (new app loading
+/// old config) silently falls back to defaults rather than crashing.
+fn read_json_lenient<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path)?;
+    match serde_json::from_slice(&bytes) {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => {
+            tracing::warn!(
+                "Config file {:?} could not be parsed (version mismatch?): {e}. \
+                 Falling back to defaults.",
+                path
+            );
+            Ok(None)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DataStore
 // ---------------------------------------------------------------------------
@@ -220,7 +241,7 @@ impl DataStore {
     }
 
     pub fn load_settings(&self) -> Result<Option<crate::commands::settings::Settings>> {
-        read_json(&self.settings_path()).context("loading settings")
+        read_json_lenient(&self.settings_path()).context("loading settings")
     }
 
     // -- Share settings ------------------------------------------------------
@@ -286,7 +307,7 @@ impl DataStore {
             let entry = entry?;
             let path = entry.path();
             if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(Some(peer)) = read_json::<CachedPeer>(&path) {
+                if let Ok(Some(peer)) = read_json_lenient::<CachedPeer>(&path) {
                     results.push(peer);
                 }
             }
@@ -310,6 +331,10 @@ pub struct CachedPeer {
     pub online: bool,
     pub node_addr: Option<String>,
     pub last_fetched: chrono::DateTime<chrono::Utc>,
+    /// Last time the relay received a heartbeat from this peer (relay-side timestamp).
+    /// More accurate than last_fetched for "last seen" display.
+    #[serde(default)]
+    pub last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
     /// User-defined tags for organizing contacts locally. Never shared.
     #[serde(default)]
     pub local_tags: Vec<String>,

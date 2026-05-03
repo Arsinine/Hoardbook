@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { saveProfile, publishProfile, publishCollection, deleteCollection, updateCollectionMeta, getShareSettings, generateKeypair, saveSettings, hasPublishedProfile } from '$lib/api.js';
-	import { profile, collections, identity, toast, appReady } from '$lib/stores.js';
+	import { profile, collections, identity, toast, appReady, homeDraft } from '$lib/stores.js';
 	import { onMount } from 'svelte';
-	import { icons, avatarHue } from '$lib/icons.js';
+	import { icons, socialIcons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
 	import ScanDialog from '$lib/components/ScanDialog.svelte';
 	import ShareSettingsDialog from '$lib/components/ShareSettingsDialog.svelte';
@@ -98,15 +98,17 @@
 	let langInput = '';
 
 	const SOCIAL_PLATFORMS = [
-		{ value: 'reddit',   label: 'Reddit' },
-		{ value: 'discord',  label: 'Discord' },
-		{ value: 'matrix',   label: 'Matrix' },
-		{ value: 'bluesky',  label: 'Bluesky' },
-		{ value: 'mastodon', label: 'Mastodon' },
-		{ value: 'github',   label: 'GitHub' },
-		{ value: 'twitter',  label: 'Twitter/X' },
-		{ value: 'other',    label: 'Other' },
+		{ value: 'reddit',   label: 'Reddit',   abbr: 'r/' },
+		{ value: 'discord',  label: 'Discord',  abbr: 'DC' },
+		{ value: 'matrix',   label: 'Matrix',   abbr: '[M]' },
+		{ value: 'bluesky',  label: 'Bluesky',  abbr: 'BS' },
+		{ value: 'mastodon', label: 'Mastodon', abbr: 'MT' },
+		{ value: 'github',   label: 'GitHub',   abbr: 'GH' },
+		{ value: 'twitter',  label: 'Twitter/X',abbr: 'X' },
+		{ value: 'other',    label: 'Other',    abbr: '···' },
 	];
+
+	let activeSocialPlatform: string | null = null;
 
 	let form: Profile = {
 		display_name: '',
@@ -122,20 +124,37 @@
 		updated: new Date().toISOString(),
 	};
 
-	function addSocialLink() {
-		form.social_links = [...form.social_links, { platform: 'reddit', handle: '' }];
+	function toggleSocialPlatform(platform: string) {
+		activeSocialPlatform = activeSocialPlatform === platform ? null : platform;
 	}
 
-	function removeSocialLink(i: number) {
-		form.social_links = form.social_links.filter((_, idx) => idx !== i);
+	function setSocialHandle(platform: string, handle: string) {
+		const idx = form.social_links.findIndex(l => l.platform === platform);
+		if (handle.trim()) {
+			if (idx >= 0) {
+				form.social_links[idx].handle = handle;
+				form.social_links = form.social_links;
+			} else {
+				form.social_links = [...form.social_links, { platform, handle }];
+			}
+		} else {
+			if (idx >= 0) form.social_links = form.social_links.filter((_, i) => i !== idx);
+		}
 	}
 
-	// Only initialize once — don't reset form after save/publish
+	function removeSocialByPlatform(platform: string) {
+		form.social_links = form.social_links.filter(l => l.platform !== platform);
+		activeSocialPlatform = null;
+	}
+
+	// Persist form in store across navigation — load from homeDraft first, then $profile.
 	let profileLoaded = false;
-	$: if ($profile && !profileLoaded) {
-		form = { ...$profile };
+	$: if ($appReady && !profileLoaded) {
+		form = $homeDraft ?? ($profile ? { ...$profile } : form);
 		profileLoaded = true;
 	}
+	// Keep homeDraft in sync whenever form changes.
+	$: if (profileLoaded) homeDraft.set({ ...form });
 
 	$: nameInitial = form.display_name?.[0]?.toUpperCase() ?? 'Y';
 	$: nameHue = avatarHue(nameInitial);
@@ -177,10 +196,58 @@
 	async function handlePublishCollection(slug: string) {
 		try {
 			await publishCollection(slug);
+			collections.update(cols => cols.map(c => c.slug === slug ? { ...c, published: true } : c));
 			toast('Collection published');
 		} catch (e) {
 			toast(String(e), 'error');
 		}
+	}
+
+	// ── Collection language / notes / sorted management ──────────────────────────
+	let colLangInputs: Record<string, string> = {};
+	let colNotes: Record<string, string> = {};
+	let colSorted: Record<string, boolean> = {};
+	$: $collections.forEach(c => {
+		if (!(c.slug in colLangInputs)) colLangInputs[c.slug] = '';
+		if (!(c.slug in colNotes)) colNotes[c.slug] = c.description ?? '';
+		if (!(c.slug in colSorted)) colSorted[c.slug] = c.sorted ?? false;
+	});
+
+	async function saveColMeta(col: import('$lib/types.js').Collection) {
+		const slug = col.slug;
+		const desc = (colNotes[slug] ?? '').trim() || undefined;
+		const sorted = colSorted[slug] ?? false;
+		try {
+			await updateCollectionMeta(slug, desc, col.content_type, col.languages ?? [], sorted);
+			collections.update(cols => cols.map(c =>
+				c.slug === slug ? { ...c, description: desc, sorted } : c
+			));
+		} catch (e) { toast(String(e), 'error'); }
+	}
+
+	async function addColLang(slug: string, langStr: string) {
+		const lang = langStr.trim();
+		if (!lang) return;
+		const col = $collections.find(c => c.slug === slug);
+		if (!col) return;
+		const langs = col.languages ?? [];
+		if (langs.includes(lang)) { colLangInputs[slug] = ''; return; }
+		const newLangs = [...langs, lang];
+		colLangInputs[slug] = '';
+		try {
+			await updateCollectionMeta(slug, col.description, col.content_type, newLangs, colSorted[slug] ?? false);
+			collections.update(cols => cols.map(c => c.slug === slug ? { ...c, languages: newLangs } : c));
+		} catch (e) { toast(String(e), 'error'); }
+	}
+
+	async function removeColLang(slug: string, lang: string) {
+		const col = $collections.find(c => c.slug === slug);
+		if (!col) return;
+		const newLangs = (col.languages ?? []).filter(l => l !== lang);
+		try {
+			await updateCollectionMeta(slug, col.description, col.content_type, newLangs, colSorted[slug] ?? false);
+			collections.update(cols => cols.map(c => c.slug === slug ? { ...c, languages: newLangs } : c));
+		} catch (e) { toast(String(e), 'error'); }
 	}
 
 	async function handleDeleteCollection(slug: string) {
@@ -395,22 +462,38 @@
 				</div>
 
 				<div class="field">
-					<div class="field-label-row">
-						<span class="field-label">Social links</span>
-						<button class="btn-add-link" on:click={addSocialLink}>+ Add</button>
+					<div class="social-icons-row">
+						{#each SOCIAL_PLATFORMS as p}
+							{@const link = form.social_links.find(l => l.platform === p.value)}
+							<button
+								class="social-icon-btn"
+								class:social-icon-active={!!(link?.handle)}
+								class:social-icon-selected={activeSocialPlatform === p.value}
+								title={p.label + (link?.handle ? ': ' + link.handle : '')}
+								on:click={() => toggleSocialPlatform(p.value)}
+							>
+								<span class="social-icon-abbr">{@html socialIcons[p.value] ?? p.abbr}</span>
+								{#if link?.handle}<span class="social-icon-dot" />{/if}
+							</button>
+						{/each}
 					</div>
-					{#each form.social_links as link, i}
-						<div class="social-row">
-							<select class="social-select" bind:value={link.platform}>
-								{#each SOCIAL_PLATFORMS as p}
-									<option value={p.value}>{p.label}</option>
-								{/each}
-							</select>
-							<input class="hb-input social-handle" type="text" placeholder="username or handle"
-								bind:value={link.handle} />
-							<button class="social-remove" on:click={() => removeSocialLink(i)} title="Remove">×</button>
+					{#if activeSocialPlatform}
+						{@const activePlat = SOCIAL_PLATFORMS.find(p => p.value === activeSocialPlatform)}
+						{@const activeLink = form.social_links.find(l => l.platform === activeSocialPlatform)}
+						<div class="social-edit-row">
+							<span class="social-edit-label">{activePlat?.label}</span>
+							<input
+								class="hb-input social-handle"
+								type="text"
+								placeholder="username or handle"
+								value={activeLink?.handle ?? ''}
+								on:input={(e) => { if (activeSocialPlatform) setSocialHandle(activeSocialPlatform, e.currentTarget.value); }}
+							/>
+							{#if activeLink?.handle}
+								<button class="social-remove" on:click={() => { if (activeSocialPlatform) removeSocialByPlatform(activeSocialPlatform); }} title="Remove">×</button>
+							{/if}
 						</div>
-					{/each}
+					{/if}
 				</div>
 			</div>
 		</div>
@@ -449,6 +532,46 @@
 				{:else}
 					{#each $collections as col}
 						<CollectionPanel collection={col}>
+							<!-- Language tags -->
+							<div class="coll-lang-row">
+								{#each (col.languages ?? []) as lang}
+									<span class="lang-tag">
+										{lang}
+										<button class="lang-x" on:click={() => removeColLang(col.slug, lang)} title="Remove">×</button>
+									</span>
+								{/each}
+								<input
+									class="lang-input lang-input-sm"
+									type="text"
+									placeholder="+ language"
+									bind:value={colLangInputs[col.slug]}
+									on:keydown={(e) => {
+										if (e.key === 'Enter' || e.key === ',') {
+											e.preventDefault();
+											addColLang(col.slug, colLangInputs[col.slug] ?? '');
+										}
+									}}
+								/>
+							</div>
+							<!-- Notes + sorted -->
+							<div class="coll-notes-row">
+								<textarea
+									class="coll-notes-input"
+									rows="2"
+									placeholder="Add notes about this collection (visible to peers)…"
+									bind:value={colNotes[col.slug]}
+									on:blur={() => saveColMeta(col)}
+								></textarea>
+								<label class="sorted-label">
+									<input
+										type="checkbox"
+										class="sorted-check"
+										bind:checked={colSorted[col.slug]}
+										on:change={() => saveColMeta(col)}
+									/>
+									Sorted
+								</label>
+							</div>
 							<div class="coll-actions">
 								{#if !col.published}
 									<span class="draft-badge">Draft</span>
@@ -518,24 +641,33 @@
 	.ob-dot-active { background: var(--accent); border-color: var(--accent); }
 	.ob-dot-done { background: color-mix(in oklch, var(--accent) 40%, transparent); border-color: var(--accent); }
 
-	/* Social links */
-	.field-label-row { display: flex; justify-content: space-between; align-items: baseline; }
-
-	.btn-add-link {
-		font-size: 11px; color: var(--accent); background: transparent;
-		border: none; cursor: pointer; font-family: var(--font-ui); padding: 0;
+	/* Social links — icon row */
+	.social-icons-row {
+		display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 4px;
 	}
-	.btn-add-link:hover { text-decoration: underline; }
-
-	.social-row { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
-
-	.social-select {
-		height: 34px; padding: 0 8px;
-		background: var(--bg-input); border: 1px solid var(--border);
-		border-radius: 7px; color: var(--fg); font-family: var(--font-ui);
-		font-size: 12px; cursor: pointer; flex-shrink: 0; width: 110px;
+	.social-icon-btn {
+		position: relative;
+		display: flex; align-items: center; justify-content: center;
+		width: 38px; height: 28px;
+		border-radius: 6px;
+		background: var(--bg-elev2); border: 1px solid var(--border);
+		cursor: pointer; font-family: var(--font-mono); color: var(--fg-muted);
+		font-size: 10px; font-weight: 600; letter-spacing: -0.3px;
+		transition: border-color 0.1s, background 0.1s, color 0.1s;
 	}
-	.social-select:focus { outline: none; border-color: var(--accent); }
+	.social-icon-btn:hover { border-color: var(--fg-muted); color: var(--fg); }
+	.social-icon-active { background: color-mix(in oklch, var(--accent) 12%, transparent); border-color: var(--accent); color: var(--accent); }
+	.social-icon-selected { border-color: var(--accent); background: var(--accent-soft); }
+	.social-icon-abbr { pointer-events: none; }
+	.social-icon-dot {
+		position: absolute; bottom: 3px; right: 3px;
+		width: 4px; height: 4px; border-radius: 50%; background: var(--accent);
+	}
+
+	.social-edit-row { display: flex; gap: 6px; align-items: center; margin-top: 2px; }
+	.social-edit-label {
+		font-size: 11px; color: var(--fg-muted); font-weight: 500; white-space: nowrap; min-width: 54px;
+	}
 
 	.social-handle { flex: 1; }
 
@@ -685,6 +817,63 @@
 	}
 
 	.coll-list { display: flex; flex-direction: column; gap: 10px; }
+
+	.coll-lang-row {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 4px;
+		padding: 6px 10px 4px;
+		border-top: 1px solid var(--divider);
+		align-items: center;
+	}
+
+	.lang-input-sm {
+		height: 22px;
+		padding: 0 7px;
+		font-size: 11px;
+		min-width: 80px;
+	}
+
+	.coll-notes-row {
+		display: flex;
+		gap: 8px;
+		padding: 6px 10px;
+		border-top: 1px solid var(--divider);
+		align-items: flex-start;
+	}
+
+	.coll-notes-input {
+		flex: 1;
+		background: transparent;
+		border: none;
+		outline: none;
+		font-family: var(--font-ui);
+		font-size: 11.5px;
+		color: var(--fg);
+		resize: none;
+		line-height: 1.5;
+		padding: 0;
+	}
+	.coll-notes-input::placeholder { color: var(--fg-dim); }
+
+	.sorted-label {
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		font-size: 11px;
+		color: var(--fg-muted);
+		cursor: pointer;
+		flex-shrink: 0;
+		padding-top: 2px;
+		white-space: nowrap;
+	}
+
+	.sorted-check {
+		accent-color: var(--accent);
+		width: 13px;
+		height: 13px;
+		cursor: pointer;
+	}
 
 	.coll-actions {
 		display: flex;

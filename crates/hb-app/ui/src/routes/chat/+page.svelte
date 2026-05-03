@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import { goto } from '$app/navigation';
 	import { contacts, identity, inboxMessages, sentMessages, unreadCount, toast } from '$lib/stores.js';
 	import { getMessages, sendMessage, getChannelMessages, postChannelMessage } from '$lib/api.js';
 	import { icons, avatarHue } from '$lib/icons.js';
@@ -14,8 +15,11 @@
 	let threadEl: HTMLElement;
 	let generalThreadEl: HTMLElement;
 
+	// Stable set of message keys we've already counted for badge purposes.
+	// Format: `${from}|${sent_at}` — prevents double-counting on relay inconsistencies.
+	let seenMessageKeys = new Set<string>();
+
 	// Per-peer "seen" snapshot: hb_id → inbox count at last view.
-	// Badge = max(0, currentCount - seenCount).
 	let seenCounts: Record<string, number> = {};
 
 	// General channel state
@@ -64,6 +68,15 @@
 
 	$: myId = $identity?.hb_id ?? '';
 
+	// Merge inbox senders who aren't contacts into a unified conversation list.
+	// This lets recipients see DMs from people who haven't followed them back.
+	$: inboxSenderIds = [...new Set($inboxMessages.map(m => m.from))];
+	$: inboxOnlyPeers = inboxSenderIds
+		.filter(id => id !== myId && !$contacts.some(c => c.hb_id === id))
+		.map(id => ({ hb_id: id, profile: undefined, collections: [], online: false, node_addr: undefined, last_fetched: '', last_seen_at: undefined, local_tags: [] } satisfies CachedPeer));
+
+	$: allConversationPeers = [...$contacts, ...inboxOnlyPeers];
+
 	$: conversation = selectedPeer
 		? [
 				...$inboxMessages.filter((m) => m.from === selectedPeer!.hb_id),
@@ -71,26 +84,19 @@
 			].sort((a, b) => a.sent_at.localeCompare(b.sent_at))
 		: [];
 
-	onMount(async () => {
+	// Resolve display name for a sender hb_id (for general chat).
+	function senderName(hb_id: string): string {
+		if (hb_id === myId) return 'You';
+		const contact = $contacts.find(c => c.hb_id === hb_id);
+		if (contact?.profile?.display_name) return contact.profile.display_name;
+		return shortId(hb_id);
+	}
+
+	onMount(() => {
 		// Clear unread badge when entering the chat page.
 		unreadCount.set(0);
-		await refreshInbox();
-
-		// Poll every 20 seconds for new messages.
-		const poll = setInterval(async () => {
-			if (!$identity) return;
-			try {
-				const msgs = await getMessages();
-				const prevCount = $inboxMessages.length;
-				inboxMessages.set(msgs);
-				const newCount = msgs.length - prevCount;
-				if (newCount > 0) {
-					unreadCount.update(n => n + newCount);
-				}
-			} catch { /* silent poll failure */ }
-		}, 20_000);
-
-		return () => clearInterval(poll);
+		refreshInbox(); // fire-and-forget; handles its own loading state
+		// Message polling is handled by +layout.svelte so the nav badge works from any page.
 	});
 
 	async function refreshInbox() {
@@ -98,11 +104,13 @@
 		loading = true;
 		try {
 			const msgs = await getMessages();
+			// Seed seen keys so layout poll doesn't double-badge already-fetched messages.
+			for (const m of msgs) seenMessageKeys.add(`${m.from}|${m.sent_at}`);
 			inboxMessages.set(msgs);
 			unreadCount.set(0);
-			// Mark any open conversation as fully seen.
-			if (selectedPeer) {
-				seenCounts[selectedPeer.hb_id] = msgs.filter((m) => m.from === selectedPeer!.hb_id).length;
+			// Seed per-peer seen counts from current inbox so remounting shows no false unread.
+			for (const m of msgs) {
+				seenCounts[m.from] = msgs.filter(x => x.from === m.from).length;
 			}
 		} catch (e) {
 			toast(String(e), 'error');
@@ -114,7 +122,6 @@
 	async function selectPeer(peer: CachedPeer) {
 		selectedPeer = peer;
 		showGeneral = false;
-		// Mark all current messages from this peer as seen so the badge clears.
 		seenCounts[peer.hb_id] = $inboxMessages.filter((m) => m.from === peer.hb_id).length;
 		await tick();
 		scrollToBottom();
@@ -127,6 +134,8 @@
 		draft = '';
 		try {
 			const sent = await sendMessage(selectedPeer.hb_id, content);
+			// Track sent message so poll doesn't re-badge it.
+			seenMessageKeys.add(`${sent.from}|${sent.sent_at}`);
 			sentMessages.update((prev) => [...prev, sent]);
 			await tick();
 			scrollToBottom();
@@ -162,12 +171,19 @@
 	}
 
 	$: unreadCounts = Object.fromEntries(
-		$contacts.map((c) => {
+		allConversationPeers.map((c) => {
 			const total = $inboxMessages.filter((m) => m.from === c.hb_id).length;
 			const seen = seenCounts[c.hb_id] ?? 0;
 			return [c.hb_id, Math.max(0, total - seen)];
 		})
 	);
+
+	function viewProfile(peer: CachedPeer) {
+		goto('/contacts');
+	}
+
+	// Show a privacy notice if the selected peer is not in contacts (may have DMs restricted).
+	$: selectedIsContact = selectedPeer ? $contacts.some(c => c.hb_id === selectedPeer!.hb_id) : false;
 </script>
 
 {#if !$identity}
@@ -205,20 +221,22 @@
 					</div>
 				</button>
 				<div class="convo-divider">Direct Messages</div>
-				{#if $contacts.length === 0}
-					<div class="convo-empty">Add contacts via Browse to start chatting.</div>
+				{#if allConversationPeers.length === 0}
+					<div class="convo-empty">Add contacts via Contacts to start chatting.</div>
 				{:else}
-					{#each $contacts as peer}
+					{#each allConversationPeers as peer}
 						{@const name = peer.profile?.display_name ?? shortId(peer.hb_id)}
 						{@const initial = name[0]?.toUpperCase() ?? '?'}
 						{@const hue = avatarHue(initial)}
 						{@const unread = unreadCounts[peer.hb_id] ?? 0}
 						{@const active = selectedPeer?.hb_id === peer.hb_id}
+						{@const isContact = $contacts.some(c => c.hb_id === peer.hb_id)}
 						<button class="convo-item" class:convo-active={active} on:click={() => selectPeer(peer)}>
 							<Avatar letter={initial} size={34} {hue} />
 							<div class="convo-info">
 								<div class="convo-row">
 									<span class="convo-name" class:convo-name-active={active}>{name}</span>
+									{#if !isContact}<span class="convo-req-dot" title="Message request" />{/if}
 								</div>
 								<div class="convo-preview-row">
 									{#if unread > 0}
@@ -267,7 +285,7 @@
 								</div>
 							{/if}
 							<div class="channel-msg" class:channel-msg-me={isMe}>
-								<span class="channel-sender">{isMe ? 'You' : shortId(msg.from)}</span>
+								<span class="channel-sender">{senderName(msg.from)}</span>
 								<span class="channel-time">{formatTime(msg.sent_at)}</span>
 								<p class="channel-text">{msg.content}</p>
 							</div>
@@ -325,7 +343,7 @@
 						</div>
 						<span class="mono">{shortId(selectedPeer.hb_id)}</span>
 					</div>
-					<button class="btn-ghost btn-sm" on:click={() => {}}>View profile</button>
+					<button class="btn-ghost btn-sm" on:click={() => { if (selectedPeer) viewProfile(selectedPeer); }}>View profile</button>
 				</div>
 
 				<!-- Privacy banner -->
@@ -333,6 +351,21 @@
 					<span class="privacy-icon">{@html icons.shield}</span>
 					<span>Messages are unencrypted and publicly readable on relays. Don't share secrets.</span>
 				</div>
+
+				<!-- Offline notice -->
+				{#if !selectedPeer.online}
+					<div class="offline-banner">
+						<span class="offline-dot" />
+						<span>{selectedPeer.profile?.display_name ?? shortId(selectedPeer.hb_id)} is offline — your message will be delivered when they come online.</span>
+					</div>
+				{/if}
+
+				<!-- Notice for message requests (sender not in recipient's contacts) -->
+				{#if !selectedIsContact}
+					<div class="request-banner">
+						<span>This person may not have followed you back — their privacy settings may filter your messages.</span>
+					</div>
+				{/if}
 
 				<!-- Thread -->
 				<div class="thread" bind:this={threadEl}>
@@ -363,28 +396,21 @@
 				<!-- Compose -->
 				<div class="composer">
 					<div class="compose-box">
-						<div class="compose-area" contenteditable="false">
-							<textarea
-								class="compose-input"
-								placeholder="Type a message…"
-								bind:value={draft}
-								on:keydown={handleKeydown}
-								disabled={sending}
-								rows="2"
-							></textarea>
-						</div>
+						<textarea
+							class="compose-input"
+							placeholder="Type a message…"
+							bind:value={draft}
+							on:keydown={handleKeydown}
+							disabled={sending}
+							rows="2"
+						></textarea>
 						<div class="compose-footer">
-							<div class="compose-tools">
-								<span class="tool-icon">{@html icons.link}</span>
-								<span class="tool-icon">{@html icons.file}</span>
-							</div>
 							<button
-								class="btn-primary btn-sm btn-icon"
+								class="btn-primary btn-send"
 								on:click={handleSend}
 								disabled={!draft.trim() || sending}
 							>
-								{sending ? '…' : 'Send'}
-								<span>{@html icons.send}</span>
+								{sending ? '…' : 'Send'} <span>{@html icons.send}</span>
 							</button>
 						</div>
 					</div>
@@ -508,7 +534,6 @@
 		font-size: 11.5px;
 		font-weight: 600;
 		color: var(--fg-muted);
-		font-family: var(--font-mono);
 		margin-right: 8px;
 	}
 
@@ -551,10 +576,15 @@
 
 	.convo-info { flex: 1; min-width: 0; }
 
-	.convo-row { display: flex; justify-content: space-between; align-items: baseline; gap: 4px; }
+	.convo-row { display: flex; justify-content: space-between; align-items: center; gap: 4px; }
 
-	.convo-name { font-size: 13px; font-weight: 500; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.convo-name { font-size: 13px; font-weight: 500; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 	.convo-name-active { font-weight: 600; }
+
+	.convo-req-dot {
+		width: 6px; height: 6px; border-radius: 50%;
+		background: oklch(0.75 0.16 60); flex-shrink: 0;
+	}
 
 	.convo-preview-row { display: flex; align-items: center; margin-top: 2px; gap: 4px; }
 
@@ -621,6 +651,29 @@
 	}
 
 	.privacy-icon { color: var(--accent); display: flex; }
+
+	.offline-banner {
+		padding: 7px 18px;
+		background: color-mix(in oklch, var(--fg-dim) 8%, transparent);
+		border-bottom: 1px solid var(--border);
+		font-size: 11.5px;
+		color: var(--fg-muted);
+		display: flex;
+		gap: 8px;
+		align-items: center;
+	}
+	.offline-dot {
+		width: 7px; height: 7px; border-radius: 50%;
+		background: var(--fg-dim); flex-shrink: 0;
+	}
+
+	.request-banner {
+		padding: 6px 18px;
+		background: oklch(0.22 0.06 60 / 0.6);
+		border-bottom: 1px solid oklch(0.45 0.12 60 / 0.3);
+		font-size: 11.5px;
+		color: oklch(0.82 0.12 60);
+	}
 
 	.thread {
 		flex: 1;
@@ -694,11 +747,18 @@
 	}
 	.compose-input::placeholder { color: var(--fg-dim); }
 
-	.compose-footer { display: flex; justify-content: space-between; align-items: center; }
+	.compose-footer { display: flex; justify-content: flex-end; align-items: center; }
 
-	.compose-tools { display: flex; gap: 12px; color: var(--fg-muted); }
-
-	.tool-icon { display: flex; cursor: pointer; }
+	.btn-send {
+		display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+		padding: 6px 14px;
+		font-family: var(--font-ui); font-size: 12px; font-weight: 600;
+		color: var(--accent-text); background: var(--accent);
+		border: 1px solid var(--accent); border-radius: 7px;
+		cursor: pointer; white-space: nowrap; user-select: none; line-height: 1;
+		min-width: 68px;
+	}
+	.btn-send:disabled { opacity: 0.5; cursor: not-allowed; }
 
 	/* Pills */
 	.pill {

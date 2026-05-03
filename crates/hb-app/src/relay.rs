@@ -22,6 +22,7 @@ struct PeerResponse {
     collections: Vec<SignedEnvelope>,
     online: bool,
     node_addr: Option<String>,
+    last_seen_at: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -150,6 +151,8 @@ impl RelayClient {
                         .iter()
                         .filter_map(|e| e.parse_payload().ok())
                         .collect();
+                    let last_seen_at = peer_resp.last_seen_at
+                        .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0));
                     return Ok(CachedPeer {
                         hb_id: hb_id.to_string(),
                         profile,
@@ -157,6 +160,7 @@ impl RelayClient {
                         online: peer_resp.online,
                         node_addr: peer_resp.node_addr,
                         last_fetched: chrono::Utc::now(),
+                        last_seen_at,
                         local_tags: vec![],
                     });
                 }
@@ -359,6 +363,44 @@ impl RelayClient {
 
         if !health.ok {
             return Err(anyhow!("relay health check returned ok=false"));
+        }
+
+        Ok(())
+    }
+
+    /// Notify all relays that this identity is being deactivated (best-effort).
+    /// Called before wiping local data so the relay stops recommending this peer.
+    pub async fn deactivate_self(&self, keypair: &hb_core::HoardbookKeypair) -> Result<()> {
+        #[derive(Serialize)]
+        struct DeactivateBody<'a> {
+            public_key: &'a str,
+            signed_at: &'a str,
+            action: &'static str,
+        }
+
+        #[derive(Serialize)]
+        struct DeactivateRequest<'a> {
+            public_key: &'a str,
+            signed_at: String,
+            action: &'static str,
+            signature: String,
+        }
+
+        let hb_id = keypair.hb_id();
+        let signed_at = chrono::Utc::now().to_rfc3339();
+
+        let body = DeactivateBody { public_key: &hb_id, signed_at: &signed_at, action: "deactivate" };
+        let body_value = serde_json::to_value(&body)?;
+        let signature = keypair.sign(&body_value);
+
+        let req = DeactivateRequest { public_key: &hb_id, signed_at, action: "deactivate", signature };
+
+        let relay_urls = self.relay_urls.read().unwrap().clone();
+        for url in &relay_urls {
+            let endpoint = format!("{url}/v1/deactivate");
+            if let Err(e) = self.http.post(&endpoint).json(&req).send().await {
+                tracing::debug!("deactivation to {url} failed: {e}");
+            }
         }
 
         Ok(())

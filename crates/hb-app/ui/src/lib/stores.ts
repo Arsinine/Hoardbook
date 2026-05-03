@@ -6,6 +6,9 @@ export const profile = writable<Profile | null>(null);
 export const collections = writable<Collection[]>([]);
 export const contacts = writable<CachedPeer[]>([]);
 
+/** Draft profile form that persists across navigation until saved/published or app closes. */
+export const homeDraft = writable<Profile | null>(null);
+
 /** Messages received from the relay (inbox), fetched on the chat page. */
 export const inboxMessages = writable<ReceivedMessage[]>([]);
 

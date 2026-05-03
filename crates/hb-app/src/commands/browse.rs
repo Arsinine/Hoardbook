@@ -1,4 +1,4 @@
-use hb_core::{hb_id_decode, types::Profile};
+use hb_core::{HbId, types::Profile};
 use serde::Serialize;
 use tauri::State;
 
@@ -10,14 +10,13 @@ use crate::{
 
 #[tauri::command]
 pub async fn paste_key(
-    hb_id: String,
+    hb_id: HbId,
     relay: State<'_, SharedRelay>,
     identity: State<'_, SharedIdentity>,
 ) -> CmdResult<CachedPeer> {
-    hb_id_decode(&hb_id).map_err(cmd_err)?;
     let guard = identity.read().await;
     if let Some(ref kp) = *guard {
-        if kp.hb_id() == hb_id {
+        if kp.hb_id() == *hb_id {
             return Err("You cannot look up your own ID".into());
         }
     }
@@ -31,11 +30,10 @@ pub async fn paste_key(
 
 #[tauri::command]
 pub async fn follow(
-    hb_id: String,
+    hb_id: HbId,
     relay: State<'_, SharedRelay>,
     store: State<'_, DataStore>,
 ) -> CmdResult<()> {
-    hb_id_decode(&hb_id).map_err(cmd_err)?;
     let peer = relay.fetch_peer(&hb_id).await.map_err(cmd_err)?;
     let hash = CachedPeer::pubkey_hash(&hb_id);
     store.save_contact(&hash, &peer).map_err(cmd_err)
@@ -48,21 +46,19 @@ pub async fn get_contacts(store: State<'_, DataStore>) -> CmdResult<Vec<CachedPe
 
 #[tauri::command]
 pub async fn unfollow_contact(
-    hb_id: String,
+    hb_id: HbId,
     store: State<'_, DataStore>,
 ) -> CmdResult<()> {
-    hb_id_decode(&hb_id).map_err(cmd_err)?;
     let hash = CachedPeer::pubkey_hash(&hb_id);
     store.delete_contact(&hash).map_err(cmd_err)
 }
 
 #[tauri::command]
 pub async fn refresh_contact(
-    hb_id: String,
+    hb_id: HbId,
     relay: State<'_, SharedRelay>,
     store: State<'_, DataStore>,
 ) -> CmdResult<CachedPeer> {
-    hb_id_decode(&hb_id).map_err(cmd_err)?;
     let peer = relay.fetch_peer(&hb_id).await.map_err(cmd_err)?;
     let hash = CachedPeer::pubkey_hash(&hb_id);
     // Preserve local_tags across refresh.
@@ -97,11 +93,10 @@ pub async fn get_directory(relay: State<'_, SharedRelay>) -> CmdResult<Vec<Direc
 /// Set user-defined local tags on a contact. Tags are stored locally and never shared.
 #[tauri::command]
 pub async fn set_contact_tags(
-    hb_id: String,
+    hb_id: HbId,
     tags: Vec<String>,
     store: State<'_, DataStore>,
 ) -> CmdResult<()> {
-    hb_id_decode(&hb_id).map_err(cmd_err)?;
     let hash = CachedPeer::pubkey_hash(&hb_id);
     let mut peer = store
         .load_contact(&hash)

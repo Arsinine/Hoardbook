@@ -40,6 +40,7 @@
 declare module '$env/static/private' {
 	export const LESSOPEN: string;
 	export const CONDA_PROMPT_MODIFIER: string;
+	export const AI_AGENT: string;
 	export const USER: string;
 	export const CLAUDE_CODE_ENTRYPOINT: string;
 	export const npm_config_user_agent: string;
@@ -58,6 +59,7 @@ declare module '$env/static/private' {
 	export const npm_config_local_prefix: string;
 	export const _CE_M: string;
 	export const WSL_DISTRO_NAME: string;
+	export const CODEX_COMPANION_SESSION_ID: string;
 	export const COLOR: string;
 	export const WAYLAND_DISPLAY: string;
 	export const LOGNAME: string;
@@ -73,6 +75,7 @@ declare module '$env/static/private' {
 	export const npm_config_cache: string;
 	export const POSH_SHELL_VERSION: string;
 	export const _CE_CONDA: string;
+	export const CLAUDE_PLUGIN_DATA: string;
 	export const npm_config_node_gyp: string;
 	export const PATH: string;
 	export const NODE: string;
@@ -111,6 +114,13 @@ declare module '$env/static/private' {
 	export const WSLENV: string;
 	export const INIT_CWD: string;
 	export const EDITOR: string;
+	export const TEST: string;
+	export const VITEST: string;
+	export const NODE_ENV: string;
+	export const PROD: string;
+	export const DEV: string;
+	export const BASE_URL: string;
+	export const MODE: string;
 }
 
 /**
@@ -199,6 +209,7 @@ declare module '$env/dynamic/private' {
 	export const env: {
 		LESSOPEN: string;
 		CONDA_PROMPT_MODIFIER: string;
+		AI_AGENT: string;
 		USER: string;
 		CLAUDE_CODE_ENTRYPOINT: string;
 		npm_config_user_agent: string;
@@ -217,6 +228,7 @@ declare module '$env/dynamic/private' {
 		npm_config_local_prefix: string;
 		_CE_M: string;
 		WSL_DISTRO_NAME: string;
+		CODEX_COMPANION_SESSION_ID: string;
 		COLOR: string;
 		WAYLAND_DISPLAY: string;
 		LOGNAME: string;
@@ -232,6 +244,7 @@ declare module '$env/dynamic/private' {
 		npm_config_cache: string;
 		POSH_SHELL_VERSION: string;
 		_CE_CONDA: string;
+		CLAUDE_PLUGIN_DATA: string;
 		npm_config_node_gyp: string;
 		PATH: string;
 		NODE: string;
@@ -270,6 +283,13 @@ declare module '$env/dynamic/private' {
 		WSLENV: string;
 		INIT_CWD: string;
 		EDITOR: string;
+		TEST: string;
+		VITEST: string;
+		NODE_ENV: string;
+		PROD: string;
+		DEV: string;
+		BASE_URL: string;
+		MODE: string;
 		[key: `PUBLIC_${string}`]: undefined;
 		[key: `${string}`]: string | undefined;
 	}

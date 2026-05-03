@@ -67,6 +67,52 @@ fn checksum(data: &[u8]) -> [u8; 4] {
 }
 
 // ---------------------------------------------------------------------------
+// HbId newtype
+// ---------------------------------------------------------------------------
+
+/// A validated Hoardbook ID string (`hb1_…`).
+/// Guaranteed to decode successfully — checksum is verified at construction.
+/// Implements `Deserialize` so Tauri IPC validation happens at the boundary.
+#[derive(Debug, Clone)]
+pub struct HbId(String);
+
+impl HbId {
+    /// Return the 32 raw public-key bytes (infallible — invariant is checked at construction).
+    pub fn pubkey(&self) -> [u8; 32] {
+        hb_id_decode(&self.0).expect("HbId invariant: string is always valid")
+    }
+}
+
+impl std::ops::Deref for HbId {
+    type Target = str;
+    fn deref(&self) -> &str { &self.0 }
+}
+
+impl std::fmt::Display for HbId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<HbId> for String {
+    fn from(id: HbId) -> String { id.0 }
+}
+
+impl serde::Serialize for HbId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for HbId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        hb_id_decode(&s).map_err(serde::de::Error::custom)?;
+        Ok(HbId(s))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Keypair
 // ---------------------------------------------------------------------------
 

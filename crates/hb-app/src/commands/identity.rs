@@ -181,6 +181,14 @@ pub async fn wipe_data(
     relay: State<'_, SharedRelay>,
     endpoint: State<'_, SharedEndpoint>,
 ) -> CmdResult<()> {
+    // Best-effort: notify relay before wiping so it removes this peer from the directory.
+    {
+        let guard = identity.read().await;
+        if let Some(ref kp) = *guard {
+            let _ = relay.deactivate_self(kp).await;
+        }
+    }
+
     store.wipe().map_err(cmd_err)?;
     *identity.write().await = None;
     relay.set_relay_urls(vec![]);

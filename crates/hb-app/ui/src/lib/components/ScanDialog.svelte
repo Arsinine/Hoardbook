@@ -17,9 +17,6 @@
 	let pathAlias = '';
 	let depth = 3;
 	let excludeRaw = '';
-	let hashFiles = true;
-	let watchChanges = true;
-	let publishTree = false;
 	let scanning = false;
 
 	$: if (open) {
@@ -127,36 +124,6 @@
 					/>
 				</div>
 
-				<!-- Toggles -->
-				<div class="toggles-group">
-					<div class="toggle-row">
-						<div class="toggle-text">
-							<div class="toggle-label">Index file hashes</div>
-							<div class="toggle-sub">Enables exact-match discovery</div>
-						</div>
-						<button class="toggle" class:toggle-on={hashFiles} on:click={() => (hashFiles = !hashFiles)}>
-							<span class="toggle-thumb" />
-						</button>
-					</div>
-					<div class="toggle-row">
-						<div class="toggle-text">
-							<div class="toggle-label">Watch for changes</div>
-							<div class="toggle-sub">Re-scan automatically on FS events</div>
-						</div>
-						<button class="toggle" class:toggle-on={watchChanges} on:click={() => (watchChanges = !watchChanges)}>
-							<span class="toggle-thumb" />
-						</button>
-					</div>
-					<div class="toggle-row">
-						<div class="toggle-text">
-							<div class="toggle-label">Publish file tree</div>
-							<div class="toggle-sub">Show full structure to followers</div>
-						</div>
-						<button class="toggle" class:toggle-on={publishTree} on:click={() => (publishTree = !publishTree)}>
-							<span class="toggle-thumb" />
-						</button>
-					</div>
-				</div>
 			</div>
 
 			<!-- Footer -->
@@ -329,59 +296,6 @@
 		border: 2px solid var(--accent);
 		box-shadow: 0 2px 6px oklch(0 0 0 / 0.4);
 		cursor: pointer;
-	}
-
-	.toggles-group {
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-		padding: 10px 12px;
-		background: var(--bg-elev2);
-		border: 1px solid var(--border);
-		border-radius: 7px;
-	}
-
-	.toggle-row {
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-		gap: 12px;
-	}
-
-	.toggle-text { flex: 1; }
-
-	.toggle-label { font-size: 12.5px; color: var(--fg); font-weight: 500; }
-
-	.toggle-sub { font-size: 11px; color: var(--fg-dim); margin-top: 1px; }
-
-	.toggle {
-		width: 30px; height: 17px;
-		border-radius: 99px;
-		background: var(--bg-elev3);
-		border: 1px solid var(--border-strong);
-		position: relative;
-		flex-shrink: 0;
-		cursor: pointer;
-		transition: background 0.15s, border-color 0.15s;
-	}
-
-	.toggle-on {
-		background: var(--accent);
-		border-color: var(--accent);
-	}
-
-	.toggle-thumb {
-		position: absolute;
-		top: 1px; left: 1px;
-		width: 13px; height: 13px;
-		border-radius: 50%;
-		background: var(--fg-muted);
-		transition: left 0.15s, background 0.15s;
-	}
-
-	.toggle-on .toggle-thumb {
-		left: 14px;
-		background: var(--accent-text);
 	}
 
 	/* Buttons */

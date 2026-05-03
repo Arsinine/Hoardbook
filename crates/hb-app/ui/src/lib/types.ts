@@ -53,6 +53,9 @@ export interface Collection {
 	est_size?: string;
 	total_bytes: number;
 	content_type: string[];
+	languages: string[];
+	/** True when the listing is alphabetically sorted. */
+	sorted?: boolean;
 	last_updated: string;
 	listing: DirectoryItem[];
 	/** True if this collection has been signed and published to the relay. */
@@ -66,6 +69,8 @@ export interface CachedPeer {
 	online: boolean;
 	node_addr?: string;
 	last_fetched: string;
+	/** ISO datetime from the relay's last heartbeat — accurate "last seen" time. */
+	last_seen_at?: string;
 	local_tags: string[];
 }
 

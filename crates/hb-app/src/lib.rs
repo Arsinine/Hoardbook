@@ -60,6 +60,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -172,6 +173,8 @@ pub fn run() {
             commands::sharing::get_share_settings,
             commands::sharing::save_share_settings,
             commands::sharing::request_download,
+            commands::update::check_update,
+            commands::update::install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Hoardbook");

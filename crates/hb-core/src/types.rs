@@ -66,6 +66,11 @@ pub struct Collection {
     pub total_bytes: u64,
     #[serde(default)]
     pub content_type: Vec<String>,
+    #[serde(default)]
+    pub languages: Vec<String>,
+    /// True when the listing is alphabetically sorted (e.g. a curated music library).
+    #[serde(default)]
+    pub sorted: bool,
     pub last_updated: DateTime<Utc>,
     pub listing: Vec<DirectoryItem>,
 }

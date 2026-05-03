@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/directory",              get(handlers::get_directory))
         .route("/v1/channel/:channel",       get(handlers::get_channel).post(handlers::post_channel))
         .route("/v1/name/:display_name",     get(handlers::check_name))
+        .route("/v1/deactivate",             post(handlers::deactivate_peer))
         .route("/v1/health",                 get(handlers::health))
         .with_state(state)
         .layer(TraceLayer::new_for_http());

@@ -66,8 +66,8 @@ export const deleteCollection = (slug: string) => invoke<void>('delete_collectio
 export const publishCollection = (slug: string) =>
 	invoke<void>('publish_collection', { slug });
 
-export const updateCollectionMeta = (slug: string, description: string | undefined, contentType: string[]) =>
-	invoke<void>('update_collection_meta', { slug, description, contentType });
+export const updateCollectionMeta = (slug: string, description: string | undefined, contentType: string[], languages: string[], sorted: boolean) =>
+	invoke<void>('update_collection_meta', { slug, description, contentType, languages, sorted });
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
@@ -128,3 +128,9 @@ export const getChannelMessages = (channel: string) =>
 
 export const postChannelMessage = (channel: string, content: string) =>
 	invoke<ReceivedChannelMessage>('post_channel_message', { channel, content });
+
+// ── Updates ───────────────────────────────────────────────────────────────────
+
+export interface UpdateInfo { version: string; body?: string; }
+export const checkUpdate   = () => invoke<UpdateInfo | null>('check_update');
+export const installUpdate = () => invoke<void>('install_update');

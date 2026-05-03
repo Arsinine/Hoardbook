@@ -1,3 +1,6 @@
 HOARDBOOK_SPEC.md
 target/
 .claude/
+node_modules/
+CLAUDE.md
+graphify-out/
