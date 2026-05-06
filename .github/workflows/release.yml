@@ -142,8 +142,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $exe = "target/release/hb-app.exe"
+          $exe = "Hoardbook_${{ github.ref_name }}.exe"
           $zip = "Hoardbook_${{ github.ref_name }}_windows_x64_portable.zip"
+          Copy-Item "target/release/hb-app.exe" $exe
           Compress-Archive -Path $exe -DestinationPath $zip
           gh release upload '${{ github.ref_name }}' $exe $zip --repo ${{ github.repository }}
 
