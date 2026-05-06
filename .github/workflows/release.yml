@@ -58,6 +58,57 @@ jobs:
         with:
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
+      - name: Verify updater signing secret is set
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY repo secret is not set."
+            echo "::error::Without it tauri-action skips latest.json and the in-app updater"
+            echo "::error::fails with 'Could not fetch a valid release JSON from the remote'."
+            echo "::error::Generate a key with 'cargo tauri signer generate' and add it to"
+            echo "::error::repo Settings → Secrets → Actions as TAURI_SIGNING_PRIVATE_KEY."
+            exit 1
+          fi
+
+      - name: Sync app version with git tag
+        shell: bash
+        run: |
+          # Tag is like 'v0.2.5'; strip the leading 'v'.
+          tag='${{ github.ref_name }}'
+          version="${tag#v}"
+          echo "Bumping app version → $version"
+          # Cargo.toml: replace only the package version, not dependency versions.
+          # The package block's first 'version = "..."' line is what we target.
+          python3 - "$version" <<'PY'
+          import re, sys
+          v = sys.argv[1]
+          path = 'crates/hb-app/Cargo.toml'
+          with open(path) as f: src = f.read()
+          # Replace the first version assignment in the [package] section.
+          new = re.sub(
+              r'(\[package\][^\[]*?\nversion\s*=\s*)"[^"]+"',
+              r'\1"' + v + '"',
+              src,
+              count=1,
+              flags=re.S,
+          )
+          assert new != src, f"failed to bump version in {path}"
+          with open(path, 'w') as f: f.write(new)
+          PY
+          # tauri.conf.json: top-level "version".
+          python3 - "$version" <<'PY'
+          import json, sys
+          v = sys.argv[1]
+          path = 'crates/hb-app/tauri.conf.json'
+          with open(path) as f: cfg = json.load(f)
+          cfg['version'] = v
+          with open(path, 'w') as f: json.dump(cfg, f, indent=2)
+          PY
+          # Also refresh Cargo.lock so the tauri build doesn't fail with --locked.
+          cargo update -p hb-app --precise "$version" || true
+
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
@@ -80,7 +131,9 @@ jobs:
           releaseId: ${{ needs.create-release.outputs.release-id }}
           projectPath: crates/hb-app
           args: ${{ matrix.args }}
-          # tauri-action uploads artifacts AND generates latest.json when all jobs finish.
+          # Generate platform-specific updater metadata; the consolidate-updater
+          # job downstream merges them into a single latest.json.
+          includeUpdaterJson: true
           updaterJsonPreferNsis: true
 
       - name: Upload portable exe and zip
@@ -100,6 +153,24 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     steps:
+      - name: Verify latest.json is on the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The in-app updater fetches releases/latest/download/latest.json.
+          # If it's missing, every user sees "Could not fetch a valid release
+          # JSON from the remote" — fail loudly here instead.
+          assets=$(gh release view '${{ github.ref_name }}' \
+            --repo ${{ github.repository }} \
+            --json assets --jq '.assets[].name')
+          echo "Release assets:"; echo "$assets"
+          if ! echo "$assets" | grep -qx 'latest.json'; then
+            echo "::error::latest.json is missing from release ${{ github.ref_name }}."
+            echo "::error::tauri-action did not upload it — usually a signing config issue."
+            echo "::error::Check that TAURI_SIGNING_PRIVATE_KEY and ..._PASSWORD secrets are valid."
+            exit 1
+          fi
+
       - name: Publish release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

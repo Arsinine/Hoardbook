@@ -42,7 +42,19 @@ export const wipeData = () => invoke<void>('wipe_data');
 
 export const saveProfile = (profile: Profile) => invoke<void>('save_profile', { profile });
 
-export const getProfile = () => invoke<Profile | null>('get_profile');
+// Backend serde may omit empty Vec fields (skip_serializing_if). Coerce them
+// back to [] so frontend code can call .find/.map without crashing.
+function normalizeProfile(p: Profile | null): Profile | null {
+	if (!p) return p;
+	return {
+		...p,
+		tags: p.tags ?? [],
+		languages: p.languages ?? [],
+		social_links: p.social_links ?? [],
+	};
+}
+
+export const getProfile = () => invoke<Profile | null>('get_profile').then(normalizeProfile);
 
 export const publishProfile = () => invoke<void>('publish_profile');
 

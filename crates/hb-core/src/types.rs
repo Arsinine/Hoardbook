@@ -39,7 +39,9 @@ pub struct Profile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
     /// Optional social/contact links (Reddit, Discord, Matrix, etc.).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Always serialized — even when empty — so the frontend reliably gets
+    /// an array instead of `undefined`.
+    #[serde(default)]
     pub social_links: Vec<SocialLink>,
     pub updated: DateTime<Utc>,
 }
@@ -232,6 +234,52 @@ mod tests {
         assert_eq!(Collection::slug_from_alias("90s Anime!!"), "90s-anime");
         assert_eq!(Collection::slug_from_alias("VHS / Rips"), "vhs-rips");
         assert_eq!(Collection::slug_from_alias("  spaces  "), "spaces");
+    }
+
+    #[test]
+    fn profile_legacy_json_without_social_links_deserializes() {
+        // A profile saved by an older Hoardbook version (v0.1.x) had no
+        // `social_links` field. The new app must still load it without error.
+        let legacy_json = r#"{
+            "display_name": "Gundam",
+            "tags": [],
+            "languages": [],
+            "updated": "2026-04-01T00:00:00Z"
+        }"#;
+        let parsed: Profile =
+            serde_json::from_str(legacy_json).expect("legacy profile must deserialize");
+        assert_eq!(parsed.display_name, "Gundam");
+        assert!(parsed.social_links.is_empty());
+    }
+
+    #[test]
+    fn profile_empty_social_links_round_trips_as_array() {
+        // Bug: when `social_links` was tagged `skip_serializing_if = "Vec::is_empty"`,
+        // an empty vec was OMITTED from the JSON sent over Tauri IPC. The frontend
+        // then saw `social_links: undefined` and crashed on `form.social_links.find()`,
+        // leaving the main panel blank after launch.
+        //
+        // The contract for any Vec field exposed to the frontend: serialize as `[]`
+        // when empty, never omit. Option fields may still skip-serialize because
+        // `?.` handles undefined cleanly on the JS side.
+        let profile = Profile {
+            display_name: "Gundam".into(),
+            bio: None,
+            tags: vec![],
+            since: None,
+            est_size: None,
+            languages: vec![],
+            contact_hint: None,
+            email: None,
+            location: None,
+            social_links: vec![],
+            updated: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(
+            json.contains("\"social_links\":[]"),
+            "social_links must appear as [] in JSON, got: {json}"
+        );
     }
 
     #[test]
