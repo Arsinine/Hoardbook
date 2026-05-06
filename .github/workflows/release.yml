@@ -136,6 +136,30 @@ jobs:
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
 
+      - name: Verify updater signatures were produced
+        shell: bash
+        run: |
+          # tauri-action silently skips latest.json upload when no .sig files
+          # exist (see upload-version-json.ts: "Signature not found ... Skipping").
+          # Fail loudly here so a misconfigured signing secret is obvious.
+          # Search both target/release/bundle (windows, linux) and
+          # target/<triple>/release/bundle (macOS uses --target).
+          mapfile -t sigs < <(find target -path '*release/bundle/*' -name '*.sig' 2>/dev/null)
+          if [ ${#sigs[@]} -eq 0 ]; then
+            echo "::error::No .sig files found under target/release/bundle/ —"
+            echo "::error::Tauri did not sign the bundles even though TAURI_SIGNING_PRIVATE_KEY"
+            echo "::error::is set. Check that:"
+            echo "::error::  1. TAURI_SIGNING_PRIVATE_KEY is the FILE CONTENTS, not a path."
+            echo "::error::     The value should start with 'untrusted comment:' on the first line."
+            echo "::error::  2. If your key has a password, TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+            echo "::error::     is set in repo secrets too. If your key has no password, the"
+            echo "::error::     password secret must still exist (set it to an empty string)."
+            echo "::error::  3. tauri.conf.json plugins.updater.pubkey matches the private key."
+            exit 1
+          fi
+          echo "Signatures produced:"
+          printf '  %s\n' "${sigs[@]}"
+
       - name: Upload portable exe and zip
         if: matrix.platform == 'windows-latest'
         shell: pwsh
