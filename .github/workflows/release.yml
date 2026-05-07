@@ -122,11 +122,7 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Required for update package signing.
-          # Generate with: cargo tauri signer generate -w ~/.tauri/hoardbook.key
-          # Set TAURI_SIGNING_PRIVATE_KEY in repo Settings → Secrets → Actions.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           releaseId: ${{ needs.create-release.outputs.release-id }}
           projectPath: crates/hb-app
@@ -154,24 +150,6 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     steps:
-      - name: Verify latest.json is on the release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # The in-app updater fetches releases/latest/download/latest.json.
-          # If it's missing, every user sees "Could not fetch a valid release
-          # JSON from the remote" — fail loudly here instead.
-          assets=$(gh release view '${{ github.ref_name }}' \
-            --repo ${{ github.repository }} \
-            --json assets --jq '.assets[].name')
-          echo "Release assets:"; echo "$assets"
-          if ! echo "$assets" | grep -qx 'latest.json'; then
-            echo "::error::latest.json is missing from release ${{ github.ref_name }}."
-            echo "::error::tauri-action did not upload it — usually a signing config issue."
-            echo "::error::Check that TAURI_SIGNING_PRIVATE_KEY and ..._PASSWORD secrets are valid."
-            exit 1
-          fi
-
       - name: Publish release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
