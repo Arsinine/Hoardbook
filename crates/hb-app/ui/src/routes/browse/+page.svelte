@@ -292,12 +292,12 @@
 	<!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
 	<div class="ctx-backdrop" on:click={closeCtxMenu} />
 	<div class="ctx-menu" style="left:{ctxMenu.x}px;top:{ctxMenu.y}px">
-		<button class="ctx-item" on:click={() => { handleDownload(ctxMenu!.item); closeCtxMenu(); }}>
+		<button class="ctx-item" on:click={() => { if (ctxMenu) handleDownload(ctxMenu.item); closeCtxMenu(); }}>
 			<span class="ctx-icon">{@html icons.download}</span>
 			Download
 		</button>
 		<button class="ctx-item" on:click={() => {
-			navigator.clipboard.writeText(itemPath(ctxMenu!.item)).catch(() => {});
+			if (ctxMenu) navigator.clipboard.writeText(itemPath(ctxMenu.item)).catch(() => {});
 			closeCtxMenu();
 		}}>
 			<span class="ctx-icon">{@html icons.copy}</span>
