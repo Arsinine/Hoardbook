@@ -78,10 +78,6 @@ impl DataStore {
         Self { base, active_downloads: Arc::new(AtomicU32::new(0)) }
     }
 
-    pub fn active_download_count(&self) -> u32 {
-        self.active_downloads.load(Ordering::Relaxed)
-    }
-
     pub fn acquire_download_slot(&self) -> u32 {
         self.active_downloads.fetch_add(1, Ordering::Relaxed) + 1
     }

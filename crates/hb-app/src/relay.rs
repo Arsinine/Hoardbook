@@ -144,25 +144,7 @@ impl RelayClient {
         while let Some(result) = set.join_next().await {
             match result {
                 Ok(Ok(peer_resp)) => {
-                    let profile = peer_resp.profile
-                        .as_ref()
-                        .and_then(|e| e.parse_payload().ok());
-                    let collections = peer_resp.collections
-                        .iter()
-                        .filter_map(|e| e.parse_payload().ok())
-                        .collect();
-                    let last_seen_at = peer_resp.last_seen_at
-                        .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0));
-                    return Ok(CachedPeer {
-                        hb_id: hb_id.to_string(),
-                        profile,
-                        collections,
-                        online: peer_resp.online,
-                        node_addr: peer_resp.node_addr,
-                        last_fetched: chrono::Utc::now(),
-                        last_seen_at,
-                        local_tags: vec![],
-                    });
+                    return Ok(parse_peer_response(hb_id, peer_resp));
                 }
                 Ok(Err(e)) => last_err = e,
                 Err(e) => last_err = anyhow!("task error: {e}"),
@@ -171,7 +153,51 @@ impl RelayClient {
 
         Err(last_err)
     }
+}
 
+/// Build a `CachedPeer` from a raw relay response, verifying every envelope's
+/// Ed25519 signature before accepting its contents.  Tampered or unsigned
+/// envelopes are silently dropped (with a tracing warning).
+fn parse_peer_response(hb_id: &str, resp: PeerResponse) -> CachedPeer {
+    let profile = resp.profile
+        .as_ref()
+        .filter(|e| {
+            if e.verify().is_err() {
+                tracing::warn!("peer {hb_id}: profile signature invalid, discarding");
+                return false;
+            }
+            true
+        })
+        .and_then(|e| e.parse_payload().ok());
+
+    let collections = resp.collections
+        .iter()
+        .filter(|e| {
+            if e.verify().is_err() {
+                tracing::warn!("peer {hb_id}: collection signature invalid, discarding");
+                return false;
+            }
+            true
+        })
+        .filter_map(|e| e.parse_payload().ok())
+        .collect();
+
+    let last_seen_at = resp.last_seen_at
+        .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0));
+
+    CachedPeer {
+        hb_id: hb_id.to_string(),
+        profile,
+        collections,
+        online: resp.online,
+        node_addr: resp.node_addr,
+        last_fetched: chrono::Utc::now(),
+        last_seen_at,
+        local_tags: vec![],
+    }
+}
+
+impl RelayClient {
     /// Fetch messages from all relays addressed to `my_pubkey`.
     pub async fn fetch_messages(
         &self,
@@ -451,5 +477,112 @@ impl RelayClient {
         }
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hb_core::{DocType, SignedEnvelope};
+    use hb_core::crypto::HoardbookKeypair;
+    use hb_core::types::{Collection, Profile};
+    use chrono::Utc;
+
+    fn make_profile(name: &str) -> Profile {
+        Profile {
+            display_name: name.into(),
+            bio: None,
+            tags: vec![],
+            since: None,
+            est_size: None,
+            languages: vec![],
+            contact_hint: None,
+            email: None,
+            location: None,
+            social_links: vec![],
+            updated: Utc::now(),
+        }
+    }
+
+    fn make_collection(slug: &str) -> Collection {
+        Collection {
+            slug: slug.into(),
+            path_alias: slug.into(),
+            description: None,
+            item_count: 0,
+            est_size: None,
+            total_bytes: 0,
+            content_type: vec![],
+            languages: vec![],
+            sorted: false,
+            last_updated: Utc::now(),
+            listing: vec![],
+        }
+    }
+
+    fn peer_resp_with_profile(env: Option<SignedEnvelope>) -> PeerResponse {
+        PeerResponse {
+            profile: env,
+            collections: vec![],
+            online: true,
+            node_addr: None,
+            last_seen_at: None,
+        }
+    }
+
+    #[test]
+    fn valid_profile_is_accepted() {
+        let kp = HoardbookKeypair::generate();
+        let env = SignedEnvelope::create(&kp, DocType::Profile, &make_profile("legit")).unwrap();
+        let cached = parse_peer_response(&kp.hb_id(), peer_resp_with_profile(Some(env)));
+        assert!(cached.profile.is_some());
+        assert_eq!(cached.profile.unwrap().display_name, "legit");
+    }
+
+    #[test]
+    fn tampered_profile_is_discarded() {
+        let kp = HoardbookKeypair::generate();
+        let mut env = SignedEnvelope::create(&kp, DocType::Profile, &make_profile("honest")).unwrap();
+        env.payload["display_name"] = serde_json::json!("hacker");
+        let cached = parse_peer_response("hb1_test", peer_resp_with_profile(Some(env)));
+        assert!(cached.profile.is_none(), "tampered profile must be discarded");
+    }
+
+    #[test]
+    fn tampered_collection_is_discarded() {
+        let kp = HoardbookKeypair::generate();
+        let mut env = SignedEnvelope::create(&kp, DocType::Collection, &make_collection("books")).unwrap();
+        env.payload["slug"] = serde_json::json!("injected");
+        let resp = PeerResponse {
+            profile: None,
+            collections: vec![env],
+            online: false,
+            node_addr: None,
+            last_seen_at: None,
+        };
+        let cached = parse_peer_response("hb1_test", resp);
+        assert!(cached.collections.is_empty(), "tampered collection must be discarded");
+    }
+
+    #[test]
+    fn mixed_collections_keep_only_valid() {
+        let kp = HoardbookKeypair::generate();
+        let valid = SignedEnvelope::create(&kp, DocType::Collection, &make_collection("good")).unwrap();
+        let mut tampered = SignedEnvelope::create(&kp, DocType::Collection, &make_collection("bad")).unwrap();
+        tampered.payload["slug"] = serde_json::json!("injected");
+        let resp = PeerResponse {
+            profile: None,
+            collections: vec![valid, tampered],
+            online: false,
+            node_addr: None,
+            last_seen_at: None,
+        };
+        let cached = parse_peer_response("hb1_test", resp);
+        assert_eq!(cached.collections.len(), 1);
+        assert_eq!(cached.collections[0].slug, "good");
     }
 }

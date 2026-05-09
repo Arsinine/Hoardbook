@@ -45,7 +45,6 @@ declare module '$env/static/private' {
 	export const CLAUDE_CODE_ENTRYPOINT: string;
 	export const npm_config_user_agent: string;
 	export const GIT_EDITOR: string;
-	export const SSH_AGENT_PID: string;
 	export const npm_node_execpath: string;
 	export const SHLVL: string;
 	export const POWERLINE_COMMAND: string;
@@ -71,7 +70,6 @@ declare module '$env/static/private' {
 	export const npm_config_prefix: string;
 	export const npm_config_npm_version: string;
 	export const TERM: string;
-	export const OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: string;
 	export const npm_config_cache: string;
 	export const POSH_SHELL_VERSION: string;
 	export const _CE_CONDA: string;
@@ -89,12 +87,12 @@ declare module '$env/static/private' {
 	export const LANG: string;
 	export const LS_COLORS: string;
 	export const npm_lifecycle_script: string;
-	export const SSH_AUTH_SOCK: string;
 	export const CONDA_PYTHON_EXE: string;
 	export const SHELL: string;
 	export const npm_package_version: string;
 	export const npm_lifecycle_event: string;
 	export const PYENV_VIRTUALENV_DISABLE_PROMPT: string;
+	export const CLAUDE_CODE_SESSION_ID: string;
 	export const LESSCLOSE: string;
 	export const CLAUDECODE: string;
 	export const OSTYPE: string;
@@ -214,7 +212,6 @@ declare module '$env/dynamic/private' {
 		CLAUDE_CODE_ENTRYPOINT: string;
 		npm_config_user_agent: string;
 		GIT_EDITOR: string;
-		SSH_AGENT_PID: string;
 		npm_node_execpath: string;
 		SHLVL: string;
 		POWERLINE_COMMAND: string;
@@ -240,7 +237,6 @@ declare module '$env/dynamic/private' {
 		npm_config_prefix: string;
 		npm_config_npm_version: string;
 		TERM: string;
-		OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: string;
 		npm_config_cache: string;
 		POSH_SHELL_VERSION: string;
 		_CE_CONDA: string;
@@ -258,12 +254,12 @@ declare module '$env/dynamic/private' {
 		LANG: string;
 		LS_COLORS: string;
 		npm_lifecycle_script: string;
-		SSH_AUTH_SOCK: string;
 		CONDA_PYTHON_EXE: string;
 		SHELL: string;
 		npm_package_version: string;
 		npm_lifecycle_event: string;
 		PYENV_VIRTUALENV_DISABLE_PROMPT: string;
+		CLAUDE_CODE_SESSION_ID: string;
 		LESSCLOSE: string;
 		CLAUDECODE: string;
 		OSTYPE: string;

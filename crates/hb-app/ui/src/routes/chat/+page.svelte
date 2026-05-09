@@ -2,7 +2,7 @@
 	import { onMount, tick } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { contacts, identity, inboxMessages, sentMessages, unreadCount, toast } from '$lib/stores.js';
-	import { getMessages, sendMessage, getChannelMessages, postChannelMessage } from '$lib/api.js';
+	import { getMessages, sendMessage, getChannelMessages, postChannelMessage, pasteKey } from '$lib/api.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import type { CachedPeer, ReceivedChannelMessage, ReceivedMessage } from '$lib/types.js';
@@ -84,19 +84,93 @@
 			].sort((a, b) => a.sent_at.localeCompare(b.sent_at))
 		: [];
 
-	// Resolve display name for a sender hb_id (for general chat).
+	// Cache of display_name for senders who aren't in $contacts (message requests).
+	// Populated lazily by fetchNonContactNames(); never causes re-triggers because
+	// we only write when a key is absent.
+	let peerNameCache: Record<string, string> = {};
+	const fetchingNames = new Set<string>(); // prevents duplicate in-flight fetches
+
+	async function fetchNonContactNames(peers: CachedPeer[]) {
+		for (const peer of peers) {
+			if (fetchingNames.has(peer.hb_id) || peerNameCache[peer.hb_id]) continue;
+			fetchingNames.add(peer.hb_id);
+			try {
+				const fetched = await pasteKey(peer.hb_id);
+				if (fetched.profile?.display_name) {
+					peerNameCache = { ...peerNameCache, [peer.hb_id]: fetched.profile.display_name };
+				}
+			} catch { /* relay unreachable or peer has no profile — fall back to shortId */ }
+		}
+	}
+
+	// Eagerly fetch names for senders in message requests whenever the list changes.
+	$: fetchNonContactNames(inboxOnlyPeers);
+
+	// Also fetch names for unknown general-channel senders we encounter.
+	$: {
+		const unknownChannelSenders = [...new Set(channelMessages.map(m => m.from))]
+			.filter(id => id !== myId && !$contacts.some(c => c.hb_id === id) && !peerNameCache[id]);
+		if (unknownChannelSenders.length > 0) {
+			fetchNonContactNames(unknownChannelSenders.map(id => ({
+				hb_id: id, profile: undefined, collections: [], online: false,
+				node_addr: undefined, last_fetched: '', last_seen_at: undefined, local_tags: [],
+			}) satisfies CachedPeer));
+		}
+	}
+
+	// Resolve display name for a sender hb_id — contacts first, then fetched cache.
 	function senderName(hb_id: string): string {
 		if (hb_id === myId) return 'You';
 		const contact = $contacts.find(c => c.hb_id === hb_id);
 		if (contact?.profile?.display_name) return contact.profile.display_name;
+		if (peerNameCache[hb_id]) return peerNameCache[hb_id];
 		return shortId(hb_id);
 	}
 
 	onMount(() => {
 		// Clear unread badge when entering the chat page.
 		unreadCount.set(0);
-		refreshInbox(); // fire-and-forget; handles its own loading state
-		// Message polling is handled by +layout.svelte so the nav badge works from any page.
+		refreshInbox();
+
+		// Fast local poll — refreshes DMs every 4s while the chat page is open.
+		// The layout's 20s poll still runs for the nav badge; this one updates
+		// the thread in near-real-time when a conversation is active.
+		const fastPoll = setInterval(async () => {
+			if (!$identity) return;
+			try {
+				const msgs = await getMessages();
+				// Detect genuinely new messages for the selected peer and auto-scroll.
+				if (selectedPeer) {
+					const prevCount = $inboxMessages.filter(m => m.from === selectedPeer!.hb_id).length;
+					const nextCount = msgs.filter(m => m.from === selectedPeer!.hb_id).length;
+					if (nextCount > prevCount) {
+						inboxMessages.set(msgs);
+						await tick();
+						scrollToBottom();
+						return;
+					}
+				}
+				inboxMessages.set(msgs);
+			} catch { /* relay unreachable */ }
+		}, 4_000);
+
+		// Fast channel poll — refreshes general channel every 4s when viewing it.
+		const channelPoll = setInterval(async () => {
+			if (!showGeneral) return;
+			try {
+				const fresh = await getChannelMessages('general');
+				if (fresh.length !== channelMessages.length) {
+					channelMessages = fresh;
+					await tick();
+					if (generalThreadEl) generalThreadEl.scrollTop = generalThreadEl.scrollHeight;
+				}
+			} catch { /* relay unreachable */ }
+		}, 4_000);
+
+		return () => {
+			clearInterval(fastPoll);
+			clearInterval(channelPoll);
+		};
 	});
 
 	async function refreshInbox() {
