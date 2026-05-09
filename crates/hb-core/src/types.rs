@@ -117,6 +117,10 @@ pub struct DirectoryItem {
     pub note: Option<String>,
     #[serde(default)]
     pub children: Vec<DirectoryItem>,
+    /// SHA-256 hex digest of the file contents, computed at scan time.
+    /// `None` for directory entries. Used to verify integrity after download.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -293,6 +297,7 @@ mod tests {
             tags: vec!["kurosawa".into()],
             note: None,
             children: vec![],
+            sha256: None,
         };
         let json = serde_json::to_string(&item).unwrap();
         let back: DirectoryItem = serde_json::from_str(&json).unwrap();

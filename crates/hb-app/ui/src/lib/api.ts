@@ -1,4 +1,5 @@
 import { invoke as _invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
@@ -126,7 +127,28 @@ export const requestDownload = (
 	slug: string,
 	path: string,
 	save_path: string,
-) => invoke<number>('request_download', { peerHbId: peer_hb_id, peerNodeAddr: peer_node_addr, slug, path, savePath: save_path });
+	expected_sha256?: string,
+) => invoke<number>('request_download', { peerHbId: peer_hb_id, peerNodeAddr: peer_node_addr, slug, path, savePath: save_path, expectedSha256: expected_sha256 ?? null });
+
+export const cancelDownload = (id: number) =>
+	invoke<boolean>('cancel_download', { downloadId: id });
+
+interface DownloadProgressPayload {
+	id: number;
+	filename: string;
+	bytes_done: number;
+	bytes_total: number;
+	bytes_per_sec: number;
+	status: 'active' | 'done' | 'error' | 'cancelled';
+	error?: string;
+}
+
+export async function listenDownloadProgress(
+	cb: (ev: DownloadProgressPayload) => void,
+): Promise<() => void> {
+	if (!isTauri) return () => {};
+	return listen<DownloadProgressPayload>('download:progress', ({ payload }) => cb(payload));
+}
 
 // ── Chat ──────────────────────────────────────────────────────────────────────
 

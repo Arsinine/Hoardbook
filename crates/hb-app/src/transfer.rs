@@ -6,16 +6,83 @@
 //!     ok    → [u64-LE file-size] [file bytes]
 //!     error → [u32-LE msg-len]  [UTF-8 error message]
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use globset::{Glob, GlobSetBuilder};
 use iroh::{Endpoint, EndpointAddr};
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{Mutex, oneshot};
 
 use crate::store::DataStore;
+
+// ---------------------------------------------------------------------------
+// Download registry — tracks in-flight downloads and their cancel tokens
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadProgressEvent {
+    pub id: u64,
+    pub filename: String,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub bytes_per_sec: u64,
+    pub status: DownloadStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DownloadStatus {
+    Active,
+    Done,
+    Cancelled,
+    Error,
+}
+
+pub struct DownloadRegistry {
+    next_id: AtomicU64,
+    cancels: Mutex<HashMap<u64, oneshot::Sender<()>>>,
+}
+
+impl DownloadRegistry {
+    pub fn new() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            cancels: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn next_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub async fn register(&self, id: u64) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cancels.lock().await.insert(id, tx);
+        rx
+    }
+
+    pub async fn cancel(&self, id: u64) -> bool {
+        if let Some(tx) = self.cancels.lock().await.remove(&id) {
+            tx.send(()).is_ok()
+        } else {
+            false
+        }
+    }
+
+    pub async fn remove(&self, id: u64) {
+        self.cancels.lock().await.remove(&id);
+    }
+}
+
+pub type SharedDownloadRegistry = Arc<DownloadRegistry>;
 
 pub const XFER_ALPN: &[u8] = b"/hoardbook/xfer/1";
 
@@ -272,8 +339,8 @@ async fn send_error(
 // Client — called from the request_download command
 // ---------------------------------------------------------------------------
 
-/// Connect to a peer and download a single file.
-/// Returns the number of bytes written.
+/// Connect to a peer and download a single file, emitting progress events.
+/// Respects cancellation via the registry. Returns bytes written.
 pub async fn download_file(
     endpoint: &Endpoint,
     peer_addr_json: &str,
@@ -281,7 +348,33 @@ pub async fn download_file(
     path: &str,
     save_path: &str,
     requester_hb_id: Option<String>,
+    expected_sha256: Option<String>,
+    download_id: u64,
+    registry: SharedDownloadRegistry,
+    app: AppHandle,
 ) -> Result<u64> {
+    let filename = Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+        .to_string();
+
+    let mut cancel_rx = registry.register(download_id).await;
+
+    let emit_progress = |bytes_done: u64, bytes_total: u64, bps: u64, status: DownloadStatus, error: Option<String>| {
+        let _ = app.emit("download:progress", DownloadProgressEvent {
+            id: download_id,
+            filename: filename.clone(),
+            bytes_done,
+            bytes_total,
+            bytes_per_sec: bps,
+            status,
+            error,
+        });
+    };
+
+    emit_progress(0, 0, 0, DownloadStatus::Active, None);
+
     let peer_addr: EndpointAddr =
         serde_json::from_str(peer_addr_json).context("parse peer EndpointAddr")?;
 
@@ -292,7 +385,6 @@ pub async fn download_file(
 
     let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?;
 
-    // Send request
     let req = XferRequest {
         slug: slug.to_string(),
         path: path.to_string(),
@@ -303,31 +395,105 @@ pub async fn download_file(
     send.write_all(&req_bytes).await.context("write req")?;
     send.shutdown().await.context("shutdown send")?;
 
-    // Read response
     let status = recv.read_u8().await.context("read status")?;
-
     if status != 0 {
         let err_len = recv.read_u32_le().await.context("read err len")?;
         let mut err_bytes = vec![0u8; err_len as usize];
         recv.read_exact(&mut err_bytes).await.context("read err")?;
-        return Err(anyhow!(String::from_utf8_lossy(&err_bytes).into_owned()));
+        let msg = String::from_utf8_lossy(&err_bytes).into_owned();
+        emit_progress(0, 0, 0, DownloadStatus::Error, Some(msg.clone()));
+        registry.remove(download_id).await;
+        return Err(anyhow!(msg));
     }
 
     let file_size = recv.read_u64_le().await.context("read file size")?;
+    emit_progress(0, file_size, 0, DownloadStatus::Active, None);
 
-    // Create parent dirs and output file
     if let Some(parent) = Path::new(save_path).parent() {
         tokio::fs::create_dir_all(parent).await.context("create dirs")?;
     }
     let out = tokio::fs::File::create(save_path).await.context("create output file")?;
     let mut writer = tokio::io::BufWriter::new(out);
 
-    let mut limited = (&mut recv).take(file_size);
-    let written = tokio::io::copy(&mut limited, &mut writer).await.context("stream download")?;
+    // Chunked copy with progress emission every ~250 KB, cancel check per chunk.
+    const CHUNK: usize = 256 * 1024;
+    let mut buf = vec![0u8; CHUNK];
+    let mut bytes_done: u64 = 0;
+    let start = Instant::now();
+    let mut last_emit = Instant::now();
+
+    loop {
+        // Cancel check
+        if cancel_rx.try_recv().is_ok() {
+            drop(writer);
+            let _ = tokio::fs::remove_file(save_path).await;
+            emit_progress(bytes_done, file_size, 0, DownloadStatus::Cancelled, None);
+            registry.remove(download_id).await;
+            conn.close(0u32.into(), b"cancelled");
+            return Err(anyhow!("Download cancelled"));
+        }
+
+        let remaining = (file_size - bytes_done) as usize;
+        if remaining == 0 { break; }
+        let to_read = remaining.min(CHUNK);
+        // Quinn-style read returns Option<usize> — None means stream ended.
+        let n = match recv.read(&mut buf[..to_read]).await.context("read chunk")? {
+            Some(n) => n,
+            None => break,
+        };
+        if n == 0 { break; }
+
+        writer.write_all(&buf[..n]).await.context("write chunk")?;
+        bytes_done += n as u64;
+
+        // Emit every 250 ms
+        if last_emit.elapsed().as_millis() >= 250 {
+            let elapsed_secs = start.elapsed().as_secs_f64().max(0.001);
+            let bps = (bytes_done as f64 / elapsed_secs) as u64;
+            emit_progress(bytes_done, file_size, bps, DownloadStatus::Active, None);
+            last_emit = Instant::now();
+        }
+    }
+
     writer.flush().await.context("flush")?;
 
+    if let Some(ref expected) = expected_sha256 {
+        let written = tokio::fs::read(save_path).await.context("re-read for integrity check")?;
+        if let Err(e) = verify_hash(&written, expected) {
+            let _ = tokio::fs::remove_file(save_path).await;
+            let msg = format!("Integrity check failed: {e}");
+            emit_progress(bytes_done, file_size, 0, DownloadStatus::Error, Some(msg.clone()));
+            registry.remove(download_id).await;
+            conn.close(0u32.into(), b"hash-mismatch");
+            return Err(anyhow!(msg));
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64().max(0.001);
+    let bps = (bytes_done as f64 / elapsed) as u64;
+    emit_progress(bytes_done, file_size, bps, DownloadStatus::Done, None);
+    registry.remove(download_id).await;
     conn.close(0u32.into(), b"");
-    Ok(written)
+    Ok(bytes_done)
+}
+
+// ---------------------------------------------------------------------------
+// Integrity helpers
+// ---------------------------------------------------------------------------
+
+pub(crate) fn sha256_bytes(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(data))
+}
+
+/// Return `Ok(())` if `data` hashes to `expected_hex`; `Err` otherwise.
+pub(crate) fn verify_hash(data: &[u8], expected_hex: &str) -> anyhow::Result<()> {
+    let actual = sha256_bytes(data);
+    anyhow::ensure!(
+        actual == expected_hex,
+        "SHA256 mismatch: got {actual}, expected {expected_hex}"
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -350,5 +516,39 @@ mod tests {
     fn prefix_matching_still_works() {
         assert!(is_allowed_path("Movies/foo.mp4", &["Movies/".to_string()]));
         assert!(!is_allowed_path("Other/foo.mp4", &["Movies/".to_string()]));
+    }
+
+    #[test]
+    fn sha256_bytes_known_content() {
+        use sha2::{Digest, Sha256};
+        let expected = hex::encode(Sha256::digest(b"hello world"));
+        assert_eq!(sha256_bytes(b"hello world"), expected);
+    }
+
+    #[test]
+    fn sha256_bytes_empty() {
+        use sha2::{Digest, Sha256};
+        let expected = hex::encode(Sha256::digest(b""));
+        assert_eq!(sha256_bytes(b""), expected);
+    }
+
+    #[test]
+    fn verify_hash_accepts_matching_content() {
+        let data = b"some file content";
+        let hash = sha256_bytes(data);
+        assert!(verify_hash(data, &hash).is_ok());
+    }
+
+    #[test]
+    fn verify_hash_rejects_corrupted_content() {
+        let hash = sha256_bytes(b"original");
+        let result = verify_hash(b"corrupted", &hash);
+        assert!(result.is_err(), "mismatched hash must return Err");
+    }
+
+    #[test]
+    fn verify_hash_rejects_garbage_hex() {
+        let result = verify_hash(b"data", "not-even-hex");
+        assert!(result.is_err());
     }
 }

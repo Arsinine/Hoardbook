@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::{
-    SharedEndpoint,
+    SharedDownloadRegistry, SharedEndpoint,
     error::{CmdResult, cmd_err},
     store::DataStore,
 };
@@ -40,27 +40,29 @@ pub async fn save_share_settings(
 }
 
 /// Download a file from a peer's shared collection via direct iroh P2P connection.
+/// Returns the download ID so the frontend can track progress or cancel.
 #[tauri::command]
 pub async fn request_download(
-    peer_hb_id: String,
+    _peer_hb_id: String,
     peer_node_addr: Option<String>,
     slug: String,
     path: String,
     save_path: String,
+    expected_sha256: Option<String>,
+    app: AppHandle,
     endpoint: State<'_, SharedEndpoint>,
     identity: State<'_, crate::SharedIdentity>,
+    registry: State<'_, SharedDownloadRegistry>,
 ) -> CmdResult<u64> {
     let addr_json = peer_node_addr.ok_or_else(|| {
         "Peer has no P2P address — they need to be online and running a recent Hoardbook version.".to_string()
     })?;
 
-    // Include our own hb_id so the server can enforce require_follow.
     let my_hb_id = {
         let guard = identity.read().await;
         guard.as_ref().map(|kp| kp.hb_id())
     };
 
-    // Clone the endpoint Arc so we don't hold the read lock during the transfer.
     let ep = {
         let guard = endpoint.read().await;
         guard.as_ref()
@@ -68,7 +70,28 @@ pub async fn request_download(
             .clone()
     };
 
-    crate::transfer::download_file(&ep, &addr_json, &slug, &path, &save_path, my_hb_id)
-        .await
-        .map_err(|e| e.to_string())
+    let id = registry.next_id();
+    let reg = (*registry).clone();
+
+    // Spawn the transfer so the Tauri command returns the ID immediately
+    // (the frontend subscribes to progress events instead of awaiting).
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = crate::transfer::download_file(
+            &ep, &addr_json, &slug, &path, &save_path, my_hb_id, expected_sha256, id, reg, app,
+        ).await {
+            tracing::warn!("download {id} failed: {e}");
+        }
+    });
+
+    Ok(id)
+}
+
+/// Cancel an active download by ID. The download loop will detect the signal,
+/// close the connection, and delete the partial file.
+#[tauri::command]
+pub async fn cancel_download(
+    download_id: u64,
+    registry: State<'_, SharedDownloadRegistry>,
+) -> CmdResult<bool> {
+    Ok(registry.cancel(download_id).await)
 }

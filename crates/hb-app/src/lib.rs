@@ -14,9 +14,10 @@ use tauri::Manager;
 use tokio::sync::RwLock;
 
 /// Managed state types — Arc-wrapped so they can be cloned into background tasks.
-pub type SharedIdentity = Arc<RwLock<Option<HoardbookKeypair>>>;
-pub type SharedRelay    = Arc<RelayClient>;
-pub type SharedEndpoint = Arc<RwLock<Option<iroh::Endpoint>>>;
+pub type SharedIdentity        = Arc<RwLock<Option<HoardbookKeypair>>>;
+pub type SharedRelay           = Arc<RelayClient>;
+pub type SharedEndpoint        = Arc<RwLock<Option<iroh::Endpoint>>>;
+pub type SharedDownloadRegistry = Arc<transfer::DownloadRegistry>;
 
 // ---------------------------------------------------------------------------
 // iroh endpoint lifecycle helper
@@ -82,10 +83,14 @@ pub fn run() {
                 .unwrap_or_default();
             let relay: SharedRelay = Arc::new(RelayClient::new(saved_relays));
 
+            let download_registry: SharedDownloadRegistry =
+                Arc::new(transfer::DownloadRegistry::new());
+
             app.manage(DataStore::new(data_dir.clone()));
             app.manage(Arc::clone(&identity));
             app.manage(Arc::clone(&relay));
             app.manage(Arc::clone(&endpoint_state));
+            app.manage(Arc::clone(&download_registry));
 
             // If a keypair is already on disk, start the iroh endpoint immediately.
             if let Ok(Some(stored)) = store_tmp.load_keypair() {
@@ -173,6 +178,7 @@ pub fn run() {
             commands::sharing::get_share_settings,
             commands::sharing::save_share_settings,
             commands::sharing::request_download,
+            commands::sharing::cancel_download,
             commands::update::check_update,
             commands::update::install_update,
         ])

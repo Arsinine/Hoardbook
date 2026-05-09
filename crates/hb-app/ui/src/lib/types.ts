@@ -43,6 +43,7 @@ export interface DirectoryItem {
 	tags: string[];
 	note?: string;
 	children: DirectoryItem[];
+	sha256?: string;
 }
 
 export interface Collection {
@@ -99,4 +100,18 @@ export interface ShareSettings {
 	speed_cap_kbps?: number;
 	download_limit?: number;
 	require_follow: boolean;
+}
+
+export interface DownloadItem {
+	id: number;
+	filename: string;
+	/** Absolute path on disk where the file is being saved. */
+	save_path: string;
+	bytes_done: number;
+	bytes_total: number;
+	bytes_per_sec: number;
+	status: 'active' | 'done' | 'error' | 'cancelled';
+	error?: string;
+	/** Unix timestamp (ms) when the download was first seen. */
+	started_at: number;
 }

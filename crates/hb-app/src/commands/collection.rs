@@ -3,6 +3,7 @@ use hb_core::{
     DocType, SignedEnvelope,
     types::{Collection, DirectoryItem, ItemType},
 };
+use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -212,9 +213,13 @@ fn scan_recursive(
                 tags: vec![],
                 note: None,
                 children,
+                sha256: None,
             });
         } else if meta.is_file() {
             total_bytes += meta.len();
+            let sha256 = std::fs::read(&path)
+                .ok()
+                .map(|bytes| hex::encode(Sha256::digest(&bytes)));
             items.push(DirectoryItem {
                 name: name.clone(),
                 item_type: ItemType::File,
@@ -227,6 +232,7 @@ fn scan_recursive(
                 tags: vec![],
                 note: None,
                 children: vec![],
+                sha256,
             });
         }
     }
@@ -315,5 +321,32 @@ mod tests {
         assert_eq!(format_size(1_048_576), "1.0 MB");
         assert_eq!(format_size(1_073_741_824), "1.0 GB");
         assert_eq!(format_size(10 * 1_073_741_824), "10.0 GB");
+    }
+
+    #[test]
+    fn scan_computes_sha256_for_files() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.txt"), b"hello world").unwrap();
+
+        let (items, _) = scan_recursive(dir.path(), 1, 0, &[]).unwrap();
+        let item = items.iter().find(|i| i.name == "data.txt").unwrap();
+
+        let expected = hex::encode(Sha256::digest(b"hello world"));
+        assert_eq!(
+            item.sha256.as_deref(),
+            Some(expected.as_str()),
+            "file item must carry its SHA256"
+        );
+    }
+
+    #[test]
+    fn scan_folders_have_no_sha256() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+
+        let (items, _) = scan_recursive(dir.path(), 2, 0, &[]).unwrap();
+        let folder = items.iter().find(|i| i.name == "subdir").unwrap();
+        assert!(folder.sha256.is_none(), "folders must not have a sha256");
     }
 }

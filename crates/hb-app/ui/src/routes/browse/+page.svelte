@@ -1,9 +1,10 @@
 <script lang="ts">
-	import { contacts, toast } from '$lib/stores.js';
+	import { contacts, downloads, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import { requestDownload } from '$lib/api.js';
 	import { save } from '@tauri-apps/plugin-dialog';
 	import Avatar from '$lib/components/Avatar.svelte';
+	import DownloadQueue from '$lib/components/DownloadQueue.svelte';
 	import type { CachedPeer, Collection, DirectoryItem } from '$lib/types.js';
 
 	type BcItem =
@@ -94,28 +95,45 @@
 		return [...folderStack.map(f => f.name), item.name].join('/');
 	}
 
-	let downloading: string | null = null;
+	// ── Context menu ────────────────────────────────────────────────────────────
+	let ctxMenu: { x: number; y: number; item: DirectoryItem } | null = null;
+
+	function openCtxMenu(e: MouseEvent, item: DirectoryItem) {
+		if (item.item_type !== 'File') return;
+		e.preventDefault();
+		ctxMenu = { x: e.clientX, y: e.clientY, item };
+	}
+
+	function closeCtxMenu() { ctxMenu = null; }
 
 	async function handleDownload(item: DirectoryItem) {
 		if (!selectedPeer || !selectedCollection || item.item_type !== 'File') return;
 		const savePath = await save({ defaultPath: item.name }).catch(() => null);
 		if (!savePath) return;
-		downloading = item.name;
 		try {
-			await requestDownload(
+			const id = await requestDownload(
 				selectedPeer.hb_id,
 				selectedPeer.node_addr ?? null,
 				selectedCollection.slug,
 				itemPath(item),
 				savePath,
+				item.sha256,
 			);
-			toast(`Download started: ${item.name}`);
+			// Seed the store immediately so the queue panel appears before the first event.
+			downloads.update(list => [
+				...list,
+				{ id, filename: item.name, save_path: savePath,
+				  bytes_done: 0, bytes_total: 0, bytes_per_sec: 0,
+				  status: 'active', started_at: Date.now() },
+			]);
 		} catch (e) {
 			toast(String(e), 'error');
-		} finally {
-			downloading = null;
 		}
 	}
+
+	$: activeDownloadNames = new Set(
+		$downloads.filter(d => d.status === 'active').map(d => d.filename)
+	);
 </script>
 
 <div class="browse-shell">
@@ -240,7 +258,8 @@
 									class:file-leaf={item.item_type === 'File'}
 									on:click={() => { if (item.item_type === 'Folder') enterFolder(item); }}
 									on:dblclick={() => handleDownload(item)}
-									title={item.item_type === 'File' ? 'Double-click to download' : undefined}
+									on:contextmenu={(e) => openCtxMenu(e, item)}
+									title={item.item_type === 'File' ? 'Double-click or right-click to download' : undefined}
 								>
 									<span class="file-icon">
 										{@html item.item_type === 'Folder' ? icons.folder : icons.file}
@@ -249,8 +268,8 @@
 									<span class="file-size">{item.size ?? ''}</span>
 									<span class="file-type">{item.format ?? ''}</span>
 									{#if item.item_type === 'File'}
-										<span class="file-dl" class:file-dl-busy={downloading === item.name}>
-											{@html downloading === item.name ? '…' : icons.download}
+										<span class="file-dl" class:file-dl-busy={activeDownloadNames.has(item.name)}>
+											{@html activeDownloadNames.has(item.name) ? '…' : icons.download}
 										</span>
 									{:else}
 										<span class="file-dl" />
@@ -263,7 +282,29 @@
 			{/if}
 		{/if}
 	</div>
+
+	<!-- Download queue sidebar — only visible when there are queued downloads -->
+	<DownloadQueue />
 </div>
+
+<!-- Context menu -->
+{#if ctxMenu}
+	<!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+	<div class="ctx-backdrop" on:click={closeCtxMenu} />
+	<div class="ctx-menu" style="left:{ctxMenu.x}px;top:{ctxMenu.y}px">
+		<button class="ctx-item" on:click={() => { handleDownload(ctxMenu!.item); closeCtxMenu(); }}>
+			<span class="ctx-icon">{@html icons.download}</span>
+			Download
+		</button>
+		<button class="ctx-item" on:click={() => {
+			navigator.clipboard.writeText(itemPath(ctxMenu!.item)).catch(() => {});
+			closeCtxMenu();
+		}}>
+			<span class="ctx-icon">{@html icons.copy}</span>
+			Copy path
+		</button>
+	</div>
+{/if}
 
 <style>
 	.browse-shell {
@@ -646,4 +687,43 @@
 	.file-row:hover .file-dl { opacity: 1; }
 
 	.file-dl-busy { opacity: 1 !important; color: var(--accent); }
+
+	/* ── Context menu ────────────────────────────────────────────── */
+
+	.ctx-backdrop {
+		position: fixed;
+		inset: 0;
+		z-index: 999;
+	}
+
+	.ctx-menu {
+		position: fixed;
+		z-index: 1000;
+		min-width: 160px;
+		background: var(--bg-elev3);
+		border: 1px solid var(--border-strong);
+		border-radius: 8px;
+		padding: 4px;
+		box-shadow: 0 8px 24px oklch(0 0 0 / 0.4);
+	}
+
+	.ctx-item {
+		display: flex;
+		align-items: center;
+		gap: 9px;
+		width: 100%;
+		padding: 7px 10px;
+		background: transparent;
+		border: none;
+		border-radius: 5px;
+		font-family: var(--font-ui);
+		font-size: 12.5px;
+		color: var(--fg);
+		cursor: pointer;
+		text-align: left;
+	}
+
+	.ctx-item:hover { background: var(--bg-elev2); }
+
+	.ctx-icon { color: var(--fg-dim); display: flex; flex-shrink: 0; }
 </style>

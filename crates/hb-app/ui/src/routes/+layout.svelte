@@ -3,8 +3,8 @@
 	import { onMount } from 'svelte';
 	import { get } from 'svelte/store';
 	import { page } from '$app/stores';
-	import { getIdentity, getProfile, getCollections, getContacts, getMessages } from '$lib/api.js';
-	import { identity, profile, collections, contacts, inboxMessages, toastMessage, appReady, unreadCount } from '$lib/stores.js';
+	import { getIdentity, getProfile, getCollections, getContacts, getMessages, listenDownloadProgress } from '$lib/api.js';
+	import { identity, profile, collections, contacts, inboxMessages, toastMessage, appReady, unreadCount, downloads, applyDownloadEvent } from '$lib/stores.js';
 	import { navIcons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import { getVersion } from '@tauri-apps/api/app';
@@ -33,6 +33,12 @@
 			appReady.set(true);
 		})();
 
+		// Download progress listener — persists across page navigation.
+		let unlistenDownload: (() => void) | undefined;
+		listenDownloadProgress(ev => {
+			downloads.update(list => applyDownloadEvent(list, ev));
+		}).then(fn => { unlistenDownload = fn; });
+
 		// Background poll: keeps inboxMessages fresh and drives the nav badge.
 		const poll = setInterval(async () => {
 			if (!get(identity)) return;
@@ -52,7 +58,10 @@
 			} catch { }
 		}, 20_000);
 
-		return () => clearInterval(poll);
+		return () => {
+			clearInterval(poll);
+			unlistenDownload?.();
+		};
 	});
 
 	const navItems = [

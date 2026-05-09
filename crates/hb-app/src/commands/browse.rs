@@ -83,7 +83,12 @@ pub async fn get_directory(relay: State<'_, SharedRelay>) -> CmdResult<Vec<Direc
     let peers = entries
         .into_iter()
         .map(|e| {
-            let profile = e.profile.parse_payload().ok();
+            let profile = if e.profile.verify().is_ok() {
+                e.profile.parse_payload().ok()
+            } else {
+                tracing::warn!("directory entry {} has invalid profile signature, discarding", e.pubkey);
+                None
+            };
             DirectoryPeer { hb_id: e.pubkey, profile }
         })
         .collect();

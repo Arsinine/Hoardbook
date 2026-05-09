@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { pasteKey, follow, refreshContact, requestDownload, unfollowContact, setContactTags, getDirectory } from '$lib/api.js';
 	import { save } from '@tauri-apps/plugin-dialog';
-	import { contacts, identity, toast } from '$lib/stores.js';
+	import { contacts, identity, toast, downloads } from '$lib/stores.js';
+	import DownloadQueue from '$lib/components/DownloadQueue.svelte';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
@@ -153,8 +154,13 @@
 		if (!savePath) return;
 		const peer = $contacts.find((c) => c.hb_id === detail.peerId);
 		try {
-			await requestDownload(detail.peerId, peer?.node_addr ?? null, detail.slug, detail.path, savePath);
-			toast(`Downloading to ${savePath}`);
+			const id = await requestDownload(detail.peerId, peer?.node_addr ?? null, detail.slug, detail.path, savePath);
+			downloads.update(list => [
+				...list,
+				{ id, filename, save_path: savePath,
+				  bytes_done: 0, bytes_total: 0, bytes_per_sec: 0,
+				  status: 'active', started_at: Date.now() },
+			]);
 		} catch (err) {
 			toast(String(err), 'error');
 		}
@@ -230,6 +236,8 @@
 	$: allTags = [...new Set($contacts.flatMap(c => c.local_tags ?? []))].sort();
 </script>
 
+<div class="contacts-shell">
+<div class="contacts-main">
 <!-- TopBar -->
 <div class="topbar">
 	<div>
@@ -523,8 +531,25 @@
 		</div>
 	{/if}
 </div>
+</div>
+<DownloadQueue />
+</div>
 
 <style>
+	.contacts-shell {
+		display: flex;
+		flex: 1;
+		overflow: hidden;
+		min-width: 0;
+	}
+	.contacts-main {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		overflow: hidden;
+		min-width: 0;
+	}
+
 	.topbar {
 		padding: 16px 24px;
 		border-bottom: 1px solid var(--border);
