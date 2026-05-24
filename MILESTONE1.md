@@ -274,7 +274,7 @@ Unit: `directory_item_no_hash_in_json`, `collection_no_internal_fields`, `conten
 
 ---
 
-### TASK 6 [ ]: Relay SQLite Schema and DB Layer
+### TASK 6 [x]: Relay SQLite Schema and DB Layer
 
 **Depends on:** none  **Parallel with:** T1–T3
 
@@ -303,12 +303,12 @@ CREATE INDEX idx_messages_to ON messages(to_key, sent_at DESC);
 DB layer (`db.rs`) exposes: `upsert_heartbeat`, `get_heartbeat`, `insert_message`, `get_messages_for`, `count_messages_for`, `expire_messages`, `count_stored_peers`. Migration runs the `DROP TABLE IF EXISTS documents`, `DROP TABLE IF EXISTS collections`, `DROP TABLE IF EXISTS channel_messages` cleanup already present in the existing migrate function. Schema migrations are idempotent.
 
 **Acceptance criteria:**
-- [ ] Migration runs without error on fresh DB and on re-run
-- [ ] `documents` and `collections` tables do not exist after migration
-- [ ] Duplicate `(from_key, sent_at)` inserts are silently ignored (INSERT OR IGNORE)
-- [ ] `count_messages_for` counts only non-expired messages
-- [ ] `expire_messages` deletes rows where `expires_at < unixepoch()`
-- [ ] Heartbeat rows are never deleted by the expiry function
+- [x] Migration runs without error on fresh DB and on re-run
+- [x] `documents` and `collections` tables do not exist after migration
+- [x] Duplicate `(from_key, sent_at)` inserts are silently ignored (INSERT OR IGNORE)
+- [x] `count_messages_for` counts only non-expired messages
+- [x] `expire_messages` deletes rows where `expires_at < unixepoch()`
+- [x] Heartbeat rows are never deleted by the expiry function
 
 **Tests required:**
 Unit: `migration_idempotent`, `message_dedup_silently_ignored`, `expire_removes_old_messages`, `heartbeat_not_expired`, `count_messages_non_expired_only`
@@ -322,22 +322,22 @@ Integration: `heartbeat_and_message_roundtrip`
 
 ---
 
-### TASK 7 [ ]: POST /v1/publish Handler — Messages Only
+### TASK 7 [x]: POST /v1/publish Handler — Messages Only
 
 **Depends on:** T4, T5, T6  **Parallel with:** T8, T9, T10, T11
 
 **Scope:** The publish handler accepts **only `type: "message"`**. Any other type returns 400. Flow: parse `{type, document}`; reject non-message types immediately; size-check (6 KB limit on encrypted content); deserialise as `SignedEnvelope`; call `verify()`; parse `ChatMessage`; validate recipient hb_id format; check timestamp freshness (±5 min); check mailbox cap (500 messages via `count_messages_for`); insert. Returns 200 / 400 / 413 / 429 (rate limit). Spec §Relay API — "POST /v1/publish" (scoped to messages).
 
 **Acceptance criteria:**
-- [ ] `type: "profile"` → 400 immediately
-- [ ] `type: "collection"` → 400 immediately
-- [ ] `type: "succession"` → 400 immediately
-- [ ] Valid signed message envelope → 200
-- [ ] Tampered message envelope → 400
-- [ ] Message timestamp >5 min old → 400
-- [ ] Invalid recipient hb_id → 400
-- [ ] 501st message to same recipient → 400 with "mailbox" in body
-- [ ] Rate limit exceeded → 429
+- [x] `type: "profile"` → 400 immediately
+- [x] `type: "collection"` → 400 immediately
+- [x] `type: "succession"` → 400 immediately
+- [x] Valid signed message envelope → 200
+- [x] Tampered message envelope → 400
+- [x] Message timestamp >5 min old → 400
+- [x] Invalid recipient hb_id → 400
+- [x] 501st message to same recipient → 400 with "mailbox" in body
+- [x] Rate limit exceeded → 429
 
 **Tests required:**
 Unit: `publish_non_message_types_rejected`, `publish_valid_message`, `publish_tampered_message`, `publish_stale_timestamp`, `publish_invalid_recipient`, `mailbox_cap_enforced`
@@ -350,18 +350,18 @@ Integration: `publish_then_fetch_messages`
 
 ---
 
-### TASK 8 [ ]: POST /v1/heartbeat Handler
+### TASK 8 [x]: POST /v1/heartbeat Handler
 
 **Depends on:** T4, T6  **Parallel with:** T7, T9, T10, T11
 
 **Scope:** Verify signature over `JCS({node_addr?, public_key, signed_at})`; check timestamp freshness (±5 min); upsert heartbeat row. Rate limit: 1 request/minute per key (429 on excess). `node_addr` stored when present; set NULL when absent. Spec §Relay API — "POST /v1/heartbeat".
 
 **Acceptance criteria:**
-- [ ] Valid heartbeat → 200; `last_seen` updated in DB within 1 second
-- [ ] Stale timestamp → 400
-- [ ] Invalid signature → 400
-- [ ] Second heartbeat from same key within 60 s → 429
-- [ ] `node_addr` stored when provided; NULL when not
+- [x] Valid heartbeat → 200; `last_seen` updated in DB within 1 second
+- [x] Stale timestamp → 400
+- [x] Invalid signature → 400
+- [x] Second heartbeat from same key within 60 s → 429
+- [x] `node_addr` stored when provided; NULL when not
 
 **Tests required:**
 Unit: `heartbeat_valid`, `heartbeat_stale`, `heartbeat_invalid_sig`, `heartbeat_rate_limited`, `node_addr_stored_and_cleared`
@@ -374,7 +374,7 @@ Integration: `heartbeat_sets_online_status`
 
 ---
 
-### TASK 9 [ ]: GET /v1/peer/:pubkey — Status and NodeAddr Only
+### TASK 9 [x]: GET /v1/peer/:pubkey — Status and NodeAddr Only
 
 **Depends on:** T6  **Parallel with:** T7, T8, T10, T11
 
@@ -389,12 +389,12 @@ Integration: `heartbeat_sets_online_status`
 `node_addr` present only when `online: true`. `last_seen_at` is a Unix integer. Unknown key → 200 with `{"online":false,"last_seen_at":null}`. Invalid key format → 400. Online threshold: heartbeat within last 600 seconds. Spec §Relay API — "GET /v1/peer/:pubkey" (scoped to status).
 
 **Acceptance criteria:**
-- [ ] Unknown valid key → 200 with `online: false`, no `node_addr`
-- [ ] Invalid key format → 400
-- [ ] Online peer (recent heartbeat) → `online: true` + `node_addr` present
-- [ ] Offline peer (heartbeat >600 s ago) → `online: false`, no `node_addr`
-- [ ] `last_seen_at` is Unix integer, not ISO string
-- [ ] Response contains no `profile`, `collections`, or `succession` fields
+- [x] Unknown valid key → 200 with `online: false`, no `node_addr`
+- [x] Invalid key format → 400
+- [x] Online peer (recent heartbeat) → `online: true` + `node_addr` present
+- [x] Offline peer (heartbeat >600 s ago) → `online: false`, no `node_addr`
+- [x] `last_seen_at` is Unix integer, not ISO string
+- [x] Response contains no `profile`, `collections`, or `succession` fields
 
 **Tests required:**
 Unit: `get_peer_unknown_key`, `get_peer_invalid_format`, `get_peer_online`, `get_peer_offline_after_600s`, `response_has_no_profile_fields`
@@ -408,17 +408,17 @@ Integration: `heartbeat_then_get_peer_shows_online`
 
 ---
 
-### TASK 10 [ ]: GET /v1/messages/:pubkey
+### TASK 10 [x]: GET /v1/messages/:pubkey
 
 **Depends on:** T6  **Parallel with:** T7, T8, T9, T11
 
 **Scope:** Validate hb_id format; return up to 100 most-recent non-expired messages addressed to `pubkey`, oldest first. Spec §Relay API — "GET /v1/messages/:pubkey".
 
 **Acceptance criteria:**
-- [ ] Invalid key format → 400
-- [ ] Returns messages chronologically (oldest first)
-- [ ] Returns at most 100 messages even if 150 exist
-- [ ] Expired messages not returned
+- [x] Invalid key format → 400
+- [x] Returns messages chronologically (oldest first)
+- [x] Returns at most 100 messages even if 150 exist
+- [x] Expired messages not returned
 
 **Tests required:**
 Unit: `get_messages_invalid_key`, `get_messages_chronological`, `get_messages_cap_100`, `get_messages_excludes_expired`
@@ -430,7 +430,7 @@ Unit: `get_messages_invalid_key`, `get_messages_chronological`, `get_messages_ca
 
 ---
 
-### TASK 11 [ ]: GET /v1/health, Relay Peering, TTL Expiry, and Mailbox Cap
+### TASK 11 [x]: GET /v1/health, Relay Peering, TTL Expiry, and Mailbox Cap
 
 **Depends on:** T6  **Parallel with:** T7, T8, T9, T10
 
@@ -445,11 +445,11 @@ Unit: `get_messages_invalid_key`, `get_messages_chronological`, `get_messages_ca
 **(D) Mailbox cap:** 500 messages per recipient. The cap is enforced in T7 via `count_messages_for`. Exceeding it → 400 with "mailbox" in body.
 
 **Acceptance criteria:**
-- [ ] `GET /v1/health` returns valid JSON with `ok: true`, `stored_peers`, and `peers`
-- [ ] `peers` populated from `PEER_RELAYS` env var
-- [ ] Message from 31 days ago absent after expiry task runs
-- [ ] Heartbeat rows survive expiry
-- [ ] 501st message to recipient → 400
+- [x] `GET /v1/health` returns valid JSON with `ok: true`, `stored_peers`, and `peers`
+- [x] `peers` populated from `PEER_RELAYS` env var
+- [x] Message from 31 days ago absent after expiry task runs
+- [x] Heartbeat rows survive expiry
+- [x] 501st message to recipient → 400
 
 **Tests required:**
 Unit: `health_response_format`, `expire_old_messages`, `heartbeat_survives_expiry`, `mailbox_cap_constant_is_500`
@@ -463,7 +463,7 @@ Integration: `relay_peering_depth_one_accepted`, `relay_peering_depth_two_reject
 
 ---
 
-### CHECKPOINT 1 [ ]: Relay Binary Complete
+### CHECKPOINT 1 [x]: Relay Binary Complete
 
 **Gate condition:** Relay binary serves all five endpoints (heartbeat, get_peer, publish, get_messages, health) with correct behaviour. Profile and collection storage does not exist. Relay is a pure bootstrap + DM relay.
 

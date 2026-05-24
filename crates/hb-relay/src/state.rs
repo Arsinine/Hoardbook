@@ -43,8 +43,8 @@ impl RateLimiter {
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
-    /// Maximum accepted size of a collection envelope in bytes.
-    pub max_collection_bytes: usize,
     /// Rate limiter for publish + heartbeat endpoints.
     pub rate_limiter: RateLimiter,
+    /// Known peer relay URLs advertised in GET /v1/health (seeded from PEER_RELAYS env var).
+    pub peer_relays: Vec<String>,
 }

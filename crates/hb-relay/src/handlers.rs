@@ -7,7 +7,7 @@ use axum::{
 use std::net::SocketAddr;
 use hb_core::{
     DocType, HbError, SignedEnvelope,
-    types::{ChatMessage, Collection, HeartbeatBody},
+    types::{ChatMessage, HeartbeatBody},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::{db, error::AppError, state::AppState};
 
 // ---------------------------------------------------------------------------
-// POST /v1/publish
+// POST /v1/publish  — messages only
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -34,14 +34,20 @@ pub async fn publish(
         return Err(AppError::BadRequest("rate limit exceeded".into()));
     }
 
+    // Only message-type documents are accepted. Profile and collection data is
+    // served peer-to-peer via each node's iroh endpoint, not cached on the relay.
+    if body.doc_type != "message" {
+        return Err(AppError::BadRequest(format!(
+            "'{}' documents are not accepted; relay accepts messages only",
+            body.doc_type
+        )));
+    }
+
     let raw_size = serde_json::to_vec(&body.document)
         .map_err(|e| AppError::BadRequest(e.to_string()))?
         .len();
 
-    if body.doc_type == "collection" && raw_size > state.max_collection_bytes {
-        return Err(AppError::TooLarge);
-    }
-    if raw_size > 64 * 1024 && body.doc_type != "collection" {
+    if raw_size > 6 * 1024 {
         return Err(AppError::TooLarge);
     }
 
@@ -50,65 +56,36 @@ pub async fn publish(
 
     envelope.verify()?;
 
-    let expected_type = match envelope.doc_type {
-        DocType::Profile    => "profile",
-        DocType::Collection => "collection",
-        DocType::Message    => "message",
-    };
-    if body.doc_type != expected_type {
-        return Err(AppError::BadRequest(format!(
-            "type mismatch: request says '{}', envelope says '{}'",
-            body.doc_type, expected_type
-        )));
+    if envelope.doc_type != DocType::Message {
+        return Err(AppError::BadRequest(
+            "envelope doc_type must be 'message'".into(),
+        ));
+    }
+
+    let msg: ChatMessage = envelope
+        .parse_payload()
+        .map_err(|e: HbError| AppError::BadRequest(e.to_string()))?;
+
+    hb_core::hb_id_decode(&msg.to)
+        .map_err(|_| AppError::BadRequest("invalid recipient key".into()))?;
+
+    if !timestamp_is_fresh(&msg.sent_at.to_rfc3339()).unwrap_or(false) {
+        return Err(AppError::BadRequest(
+            "message timestamp out of acceptable range".into(),
+        ));
+    }
+
+    let count = db::count_messages_for(&state.pool, &msg.to).await?;
+    if count >= db::MAX_MESSAGES_PER_RECIPIENT {
+        return Err(AppError::BadRequest("recipient mailbox full".into()));
     }
 
     let pubkey = &envelope.public_key;
     let envelope_json = serde_json::to_string(&envelope)
         .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
 
-    match envelope.doc_type {
-        DocType::Collection => {
-            let collection: Collection = envelope
-                .parse_payload()
-                .map_err(|e: HbError| AppError::BadRequest(e.to_string()))?;
-            db::upsert_collection(&state.pool, pubkey, &collection.slug, &envelope_json).await?;
-        }
-        DocType::Profile => {
-            db::upsert_document(&state.pool, pubkey, "profile", &envelope_json).await?;
-        }
-        DocType::Message => {
-            let msg: ChatMessage = envelope
-                .parse_payload()
-                .map_err(|e: HbError| AppError::BadRequest(e.to_string()))?;
-
-            hb_core::hb_id_decode(&msg.to)
-                .map_err(|_| AppError::BadRequest("invalid recipient key".into()))?;
-
-            if !timestamp_is_fresh(&msg.sent_at.to_rfc3339()).unwrap_or(false) {
-                return Err(AppError::BadRequest(
-                    "message timestamp out of acceptable range".into(),
-                ));
-            }
-
-            if msg.content.len() > 6000 {
-                return Err(AppError::TooLarge);
-            }
-
-            let count = db::count_messages_for(&state.pool, &msg.to).await?;
-            if count >= db::MAX_MESSAGES_PER_RECIPIENT {
-                return Err(AppError::BadRequest("recipient mailbox full".into()));
-            }
-
-            db::insert_message(
-                &state.pool,
-                pubkey,
-                &msg.to,
-                &msg.sent_at.to_rfc3339(),
-                &envelope_json,
-            )
-            .await?;
-        }
-    }
+    db::insert_message(&state.pool, pubkey, &msg.to, &msg.sent_at.to_rfc3339(), &envelope_json)
+        .await?;
 
     Ok(StatusCode::OK)
 }
@@ -163,32 +140,21 @@ pub async fn heartbeat(
     let pubkey_bytes = hb_core::hb_id_decode(&body.public_key)?;
     hb_core::crypto::verify(&pubkey_bytes, &signed_value, &body.signature)?;
 
-    db::upsert_heartbeat(
-        &state.pool,
-        &body.public_key,
-        body.node_addr.as_deref(),
-    )
-    .await?;
+    db::upsert_heartbeat(&state.pool, &body.public_key, body.node_addr.as_deref()).await?;
 
     Ok(StatusCode::OK)
 }
 
 // ---------------------------------------------------------------------------
-// GET /v1/peer/:pubkey
+// GET /v1/peer/:pubkey  — online status + NodeAddr only
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
 pub struct PeerResponse {
-    pub profile: Option<Value>,
-    pub collections: Vec<Value>,
-    pub succession: Option<Value>,
     pub online: bool,
+    pub last_seen_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_addr: Option<String>,
-    /// Unix timestamp of the peer's last heartbeat, so clients can display
-    /// accurate "last seen" times rather than just online/offline status.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_seen_at: Option<i64>,
 }
 
 const ONLINE_THRESHOLD_SECS: i64 = 600;
@@ -199,36 +165,16 @@ pub async fn get_peer(
 ) -> Result<Json<PeerResponse>, AppError> {
     hb_core::hb_id_decode(&pubkey)?;
 
-    let profile = db::get_document(&state.pool, &pubkey, "profile")
-        .await?
-        .and_then(|s| serde_json::from_str(&s).ok());
-
-    let succession = db::get_document(&state.pool, &pubkey, "succession")
-        .await?
-        .and_then(|s| serde_json::from_str(&s).ok());
-
-    let collections = db::get_collections(&state.pool, &pubkey)
-        .await?
-        .into_iter()
-        .filter_map(|s| serde_json::from_str(&s).ok())
-        .collect();
-
     let (online, node_addr, last_seen_at) = match db::get_heartbeat(&state.pool, &pubkey).await? {
         Some((last_seen, addr)) => {
             let age = chrono::Utc::now().timestamp() - last_seen;
-            (age < ONLINE_THRESHOLD_SECS, addr, Some(last_seen))
+            let is_online = age < ONLINE_THRESHOLD_SECS;
+            (is_online, if is_online { addr } else { None }, Some(last_seen))
         }
         None => (false, None, None),
     };
 
-    Ok(Json(PeerResponse {
-        profile,
-        collections,
-        succession,
-        online,
-        node_addr,
-        last_seen_at,
-    }))
+    Ok(Json(PeerResponse { online, last_seen_at, node_addr }))
 }
 
 // ---------------------------------------------------------------------------
@@ -256,58 +202,6 @@ pub async fn get_messages(
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/deactivate  — signed self-removal request
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-pub struct DeactivateRequest {
-    pub public_key: String,
-    pub signed_at: String,
-    pub action: String,
-    pub signature: String,
-}
-
-#[derive(Serialize)]
-struct DeactivateBody {
-    public_key: String,
-    signed_at: String,
-    action: String,
-}
-
-pub async fn deactivate_peer(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    Json(body): Json<DeactivateRequest>,
-) -> Result<StatusCode, AppError> {
-    if !state.rate_limiter.check(&addr.ip().to_string()) {
-        return Err(AppError::BadRequest("rate limit exceeded".into()));
-    }
-
-    if body.action != "deactivate" {
-        return Err(AppError::BadRequest("invalid action".into()));
-    }
-
-    if !timestamp_is_fresh(&body.signed_at).unwrap_or(false) {
-        return Err(AppError::BadRequest("timestamp out of acceptable range".into()));
-    }
-
-    let signed = DeactivateBody {
-        public_key: body.public_key.clone(),
-        signed_at: body.signed_at.clone(),
-        action: body.action.clone(),
-    };
-    let signed_value = serde_json::to_value(&signed)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
-
-    let pubkey_bytes = hb_core::hb_id_decode(&body.public_key)?;
-    hb_core::crypto::verify(&pubkey_bytes, &signed_value, &body.signature)?;
-
-    db::deactivate_peer(&state.pool, &body.public_key).await?;
-
-    Ok(StatusCode::OK)
-}
-
-// ---------------------------------------------------------------------------
 // GET /v1/health
 // ---------------------------------------------------------------------------
 
@@ -319,11 +213,11 @@ pub struct HealthResponse {
 }
 
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    match db::count_stored(&state.pool).await {
+    match db::count_stored_peers(&state.pool).await {
         Ok(count) => Json(HealthResponse {
             ok: true,
             stored_peers: count,
-            peers: vec![],
+            peers: state.peer_relays.clone(),
         })
         .into_response(),
         Err(e) => {
@@ -340,6 +234,343 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::RateLimiter;
+    use hb_core::{DocType, HoardbookKeypair, SignedEnvelope};
+    use hb_core::types::{ChatMessage, HeartbeatBody};
+    use sqlx::SqlitePool;
+    use std::net::SocketAddr;
+
+    async fn test_state() -> AppState {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        AppState {
+            pool,
+            rate_limiter: RateLimiter::new(1000, std::time::Duration::from_secs(60)),
+            peer_relays: vec![],
+        }
+    }
+
+    fn test_addr() -> ConnectInfo<SocketAddr> {
+        ConnectInfo("127.0.0.1:1234".parse().unwrap())
+    }
+
+    fn make_message_envelope(kp: &HoardbookKeypair, to: &str) -> SignedEnvelope {
+        let msg = ChatMessage {
+            to: to.to_string(),
+            content: "hello".into(),
+            encrypted: false,
+            sent_at: chrono::Utc::now(),
+        };
+        SignedEnvelope::create(kp, DocType::Message, &msg).unwrap()
+    }
+
+    // --- T7: publish ---
+
+    #[tokio::test]
+    async fn publish_non_message_types_rejected() {
+        let state = test_state().await;
+        for bad_type in &["profile", "collection", "succession"] {
+            let req = PublishRequest {
+                doc_type: bad_type.to_string(),
+                document: serde_json::json!({}),
+            };
+            let result = publish(test_addr(), State(state.clone()), Json(req)).await;
+            assert!(
+                matches!(result, Err(AppError::BadRequest(_))),
+                "type '{}' must be rejected with 400", bad_type
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_valid_message() {
+        let state = test_state().await;
+        let kp = HoardbookKeypair::generate();
+        let to = kp.hb_id(); // send to self so recipient key is valid
+        let envelope = make_message_envelope(&kp, &to);
+        let req = PublishRequest {
+            doc_type: "message".into(),
+            document: serde_json::to_value(&envelope).unwrap(),
+        };
+        let result = publish(test_addr(), State(state), Json(req)).await;
+        assert!(result.is_ok(), "valid message must be accepted: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn publish_tampered_message() {
+        let state = test_state().await;
+        let kp = HoardbookKeypair::generate();
+        let to = kp.hb_id();
+        let mut envelope = make_message_envelope(&kp, &to);
+        envelope.payload["content"] = serde_json::json!("injected");
+        let req = PublishRequest {
+            doc_type: "message".into(),
+            document: serde_json::to_value(&envelope).unwrap(),
+        };
+        let result = publish(test_addr(), State(state), Json(req)).await;
+        assert!(matches!(result, Err(_)), "tampered envelope must be rejected");
+    }
+
+    #[tokio::test]
+    async fn publish_stale_timestamp() {
+        let state = test_state().await;
+        let kp = HoardbookKeypair::generate();
+        let to = kp.hb_id();
+        let msg = ChatMessage {
+            to: to.clone(),
+            content: "old".into(),
+            encrypted: false,
+            sent_at: chrono::Utc::now() - chrono::Duration::seconds(600),
+        };
+        let envelope = SignedEnvelope::create(&kp, DocType::Message, &msg).unwrap();
+        let req = PublishRequest {
+            doc_type: "message".into(),
+            document: serde_json::to_value(&envelope).unwrap(),
+        };
+        let result = publish(test_addr(), State(state), Json(req)).await;
+        assert!(
+            matches!(result, Err(AppError::BadRequest(_))),
+            "stale timestamp must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_invalid_recipient() {
+        let state = test_state().await;
+        let kp = HoardbookKeypair::generate();
+        let msg = ChatMessage {
+            to: "not_a_valid_hb_id".into(),
+            content: "hello".into(),
+            encrypted: false,
+            sent_at: chrono::Utc::now(),
+        };
+        let envelope = SignedEnvelope::create(&kp, DocType::Message, &msg).unwrap();
+        let req = PublishRequest {
+            doc_type: "message".into(),
+            document: serde_json::to_value(&envelope).unwrap(),
+        };
+        let result = publish(test_addr(), State(state), Json(req)).await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))), "invalid recipient must be rejected");
+    }
+
+    #[tokio::test]
+    async fn mailbox_cap_enforced() {
+        let state = test_state().await;
+        let kp = HoardbookKeypair::generate();
+        let to = kp.hb_id();
+
+        // Fill the mailbox to the cap.
+        for i in 0..db::MAX_MESSAGES_PER_RECIPIENT {
+            let sent_at = chrono::Utc::now() + chrono::Duration::milliseconds(i);
+            let msg = ChatMessage { to: to.clone(), content: "x".into(), encrypted: false, sent_at };
+            let env = SignedEnvelope::create(&kp, DocType::Message, &msg).unwrap();
+            db::insert_message(&state.pool, &kp.hb_id(), &to, &sent_at.to_rfc3339(), &serde_json::to_string(&env).unwrap())
+                .await.unwrap();
+        }
+
+        // The next publish must fail with mailbox error.
+        let msg = ChatMessage {
+            to: to.clone(),
+            content: "overflow".into(),
+            encrypted: false,
+            sent_at: chrono::Utc::now() + chrono::Duration::milliseconds(db::MAX_MESSAGES_PER_RECIPIENT as i64 + 1),
+        };
+        let envelope = SignedEnvelope::create(&kp, DocType::Message, &msg).unwrap();
+        let req = PublishRequest {
+            doc_type: "message".into(),
+            document: serde_json::to_value(&envelope).unwrap(),
+        };
+        let result = publish(test_addr(), State(state), Json(req)).await;
+        match result {
+            Err(AppError::BadRequest(msg)) => assert!(msg.contains("mailbox"), "error must mention mailbox, got: {msg}"),
+            other => panic!("expected mailbox BadRequest, got: {:?}", other),
+        }
+    }
+
+    // --- T8: heartbeat ---
+
+    fn signed_heartbeat(kp: &HoardbookKeypair, node_addr: Option<String>) -> HeartbeatRequest {
+        let signed_at = chrono::Utc::now().to_rfc3339();
+        let body = HeartbeatBody {
+            node_addr: node_addr.clone(),
+            public_key: kp.hb_id(),
+            signed_at: signed_at.clone(),
+        };
+        let body_value = serde_json::to_value(&body).unwrap();
+        let signature = kp.sign(&body_value);
+        HeartbeatRequest {
+            public_key: kp.hb_id(),
+            signed_at,
+            node_addr,
+            signature,
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_valid() {
+        let state = test_state().await;
+        let kp = HoardbookKeypair::generate();
+        let req = signed_heartbeat(&kp, Some("iroh://addr".into()));
+        let result = heartbeat(test_addr(), State(state.clone()), Json(req)).await;
+        assert!(result.is_ok(), "valid heartbeat must succeed");
+        let hb = db::get_heartbeat(&state.pool, &kp.hb_id()).await.unwrap();
+        assert!(hb.is_some(), "heartbeat must be stored");
+        assert_eq!(hb.unwrap().1.as_deref(), Some("iroh://addr"));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stale() {
+        let state = test_state().await;
+        let kp = HoardbookKeypair::generate();
+        let stale_at = (chrono::Utc::now() - chrono::Duration::seconds(600)).to_rfc3339();
+        let body = HeartbeatBody { node_addr: None, public_key: kp.hb_id(), signed_at: stale_at.clone() };
+        let signature = kp.sign(&serde_json::to_value(&body).unwrap());
+        let req = HeartbeatRequest { public_key: kp.hb_id(), signed_at: stale_at, node_addr: None, signature };
+        let result = heartbeat(test_addr(), State(state), Json(req)).await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))), "stale heartbeat must be rejected");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_invalid_sig() {
+        let state = test_state().await;
+        let kp = HoardbookKeypair::generate();
+        let mut req = signed_heartbeat(&kp, None);
+        req.signature = "deadbeef".repeat(8); // garbage signature
+        let result = heartbeat(test_addr(), State(state), Json(req)).await;
+        assert!(matches!(result, Err(_)), "invalid signature must be rejected");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rate_limited() {
+        // Use a very tight rate limiter: 1 request per minute per IP.
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let state = AppState {
+            pool,
+            rate_limiter: RateLimiter::new(1, std::time::Duration::from_secs(60)),
+            peer_relays: vec![],
+        };
+        let kp = HoardbookKeypair::generate();
+        let first = heartbeat(test_addr(), State(state.clone()), Json(signed_heartbeat(&kp, None))).await;
+        assert!(first.is_ok(), "first heartbeat must pass");
+        let second = heartbeat(test_addr(), State(state), Json(signed_heartbeat(&kp, None))).await;
+        assert!(matches!(second, Err(AppError::BadRequest(_))), "second request must be rate-limited");
+    }
+
+    #[tokio::test]
+    async fn node_addr_stored_and_cleared() {
+        let state = test_state().await;
+        let kp = HoardbookKeypair::generate();
+
+        // Heartbeat with node_addr.
+        let req = signed_heartbeat(&kp, Some("iroh://node1".into()));
+        heartbeat(test_addr(), State(state.clone()), Json(req)).await.unwrap();
+        let hb = db::get_heartbeat(&state.pool, &kp.hb_id()).await.unwrap().unwrap();
+        assert_eq!(hb.1.as_deref(), Some("iroh://node1"));
+
+        // Heartbeat without node_addr clears it.
+        let req2 = signed_heartbeat(&kp, None);
+        heartbeat(test_addr(), State(state.clone()), Json(req2)).await.unwrap();
+        let hb2 = db::get_heartbeat(&state.pool, &kp.hb_id()).await.unwrap().unwrap();
+        assert!(hb2.1.is_none(), "node_addr must be cleared when absent from heartbeat");
+    }
+
+    // --- T9: get_peer ---
+
+    #[tokio::test]
+    async fn get_peer_unknown_key() {
+        let state = test_state().await;
+        let kp = HoardbookKeypair::generate();
+        let result = get_peer(State(state), Path(kp.hb_id())).await.unwrap();
+        assert!(!result.0.online);
+        assert!(result.0.last_seen_at.is_none());
+        assert!(result.0.node_addr.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_peer_invalid_format() {
+        let state = test_state().await;
+        let result = get_peer(State(state), Path("not_a_valid_id".into())).await;
+        assert!(matches!(result, Err(_)), "invalid key format must return error");
+    }
+
+    #[tokio::test]
+    async fn get_peer_online() {
+        let state = test_state().await;
+        let kp = HoardbookKeypair::generate();
+        db::upsert_heartbeat(&state.pool, &kp.hb_id(), Some("iroh://node1")).await.unwrap();
+        let result = get_peer(State(state), Path(kp.hb_id())).await.unwrap();
+        assert!(result.0.online);
+        assert_eq!(result.0.node_addr.as_deref(), Some("iroh://node1"));
+    }
+
+    #[tokio::test]
+    async fn get_peer_offline_after_600s() {
+        let state = test_state().await;
+        let kp = HoardbookKeypair::generate();
+        // Insert a heartbeat with last_seen > 600s ago.
+        sqlx::query(
+            "INSERT INTO heartbeats (pubkey, last_seen, node_addr) VALUES (?, ?, ?)"
+        )
+        .bind(kp.hb_id())
+        .bind(chrono::Utc::now().timestamp() - 700)
+        .bind("iroh://old")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let result = get_peer(State(state), Path(kp.hb_id())).await.unwrap();
+        assert!(!result.0.online, "peer with old heartbeat must be offline");
+        assert!(result.0.node_addr.is_none(), "node_addr must be absent when offline");
+        assert!(result.0.last_seen_at.is_some(), "last_seen_at must still be present");
+    }
+
+    #[test]
+    fn response_has_no_profile_fields() {
+        let resp = PeerResponse { online: false, last_seen_at: None, node_addr: None };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("profile"), "profile must not appear in PeerResponse");
+        assert!(!json.contains("collections"), "collections must not appear in PeerResponse");
+        assert!(!json.contains("succession"), "succession must not appear in PeerResponse");
+    }
+
+    // --- T10: get_messages ---
+
+    #[tokio::test]
+    async fn get_messages_invalid_key() {
+        let state = test_state().await;
+        let result = get_messages(State(state), Path("bad_key".into())).await;
+        assert!(matches!(result, Err(_)), "invalid key must return error");
+    }
+
+    // --- T11: health ---
+
+    #[tokio::test]
+    async fn health_response_format() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let state = AppState {
+            pool: pool.clone(),
+            rate_limiter: RateLimiter::new(30, std::time::Duration::from_secs(60)),
+            peer_relays: vec!["https://relay2.example.com".into()],
+        };
+        // Add one heartbeat so stored_peers == 1.
+        db::upsert_heartbeat(&pool, "hb1_testkey", None).await.unwrap();
+
+        let resp = health(State(state)).await.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health["ok"], true);
+        assert_eq!(health["stored_peers"], 1);
+        assert_eq!(health["peers"][0], "https://relay2.example.com");
+    }
+
+    #[test]
+    fn mailbox_cap_constant_is_500() {
+        assert_eq!(db::MAX_MESSAGES_PER_RECIPIENT, 500);
+    }
+
+    // --- timestamp helpers ---
 
     #[test]
     fn fresh_timestamp_accepted() {
