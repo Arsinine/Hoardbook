@@ -33,16 +33,25 @@ pub struct Profile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contact_hint: Option<String>,
     /// Publicly visible email address — user opts in by setting this field.
+    // Approved extension: not in base spec
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     /// City or region the user is based in, e.g. "Tokyo" or "EU/Germany".
+    // Approved extension: not in base spec
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
     /// Optional social/contact links (Reddit, Discord, Matrix, etc.).
     /// Always serialized — even when empty — so the frontend reliably gets
     /// an array instead of `undefined`.
+    // Approved extension: not in base spec
     #[serde(default)]
     pub social_links: Vec<SocialLink>,
+    /// Freeform flags for what the user is willing to do: "trade", "seed", "upload", etc.
+    #[serde(default)]
+    pub willing_to: Vec<String>,
+    /// Computed as union of all published collections; never edited directly.
+    #[serde(default)]
+    pub content_types: Vec<String>,
     pub updated: DateTime<Utc>,
 }
 
@@ -63,16 +72,13 @@ pub struct Collection {
     pub item_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub est_size: Option<String>,
-    /// Raw byte total of all files in this collection, computed at scan time.
+    /// Content type categories for this collection. Renamed from `content_type` (v0.1.x alias kept for backward compat).
+    #[serde(default, alias = "content_type")]
+    pub content_types: Vec<String>,
     #[serde(default)]
-    pub total_bytes: u64,
-    #[serde(default)]
-    pub content_type: Vec<String>,
+    pub tags: Vec<String>,
     #[serde(default)]
     pub languages: Vec<String>,
-    /// True when the listing is alphabetically sorted (e.g. a curated music library).
-    #[serde(default)]
-    pub sorted: bool,
     pub last_updated: DateTime<Utc>,
     pub listing: Vec<DirectoryItem>,
 }
@@ -117,10 +123,6 @@ pub struct DirectoryItem {
     pub note: Option<String>,
     #[serde(default)]
     pub children: Vec<DirectoryItem>,
-    /// SHA-256 hex digest of the file contents, computed at scan time.
-    /// `None` for directory entries. Used to verify integrity after download.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,20 +135,6 @@ pub enum ItemType {
 }
 
 // ---------------------------------------------------------------------------
-// Succession
-// ---------------------------------------------------------------------------
-
-/// Signed by the *old* private key. Links old identity → new identity.
-/// Published to relays alongside the old key so followers auto-migrate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Succession {
-    pub old_key: String,
-    pub new_key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
 // HeartbeatBody
 // ---------------------------------------------------------------------------
 
@@ -154,9 +142,6 @@ pub struct Succession {
 /// Only non-None fields are included in the JCS-canonical form.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatBody {
-    /// When true, the peer opts into the relay's public directory.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub listed: Option<bool>,
     /// Optional iroh NodeAddr (base64-encoded). Included only in direct mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_addr: Option<String>,
@@ -183,19 +168,6 @@ pub struct ChatMessage {
     #[serde(default)]
     pub encrypted: bool,
     /// Timestamp included in the signed payload to prevent replay.
-    pub sent_at: DateTime<Utc>,
-}
-
-// ---------------------------------------------------------------------------
-// ChannelMessage
-// ---------------------------------------------------------------------------
-
-/// Signed payload for a public channel post (e.g. General).
-/// Posted to `/v1/channel/:channel` on the relay.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelMessage {
-    pub channel: String,
-    pub content: String,
     pub sent_at: DateTime<Utc>,
 }
 
@@ -277,6 +249,8 @@ mod tests {
             email: None,
             location: None,
             social_links: vec![],
+            willing_to: vec![],
+            content_types: vec![],
             updated: chrono::Utc::now(),
         };
         let json = serde_json::to_string(&profile).unwrap();
@@ -297,7 +271,6 @@ mod tests {
             tags: vec!["kurosawa".into()],
             note: None,
             children: vec![],
-            sha256: None,
         };
         let json = serde_json::to_string(&item).unwrap();
         let back: DirectoryItem = serde_json::from_str(&json).unwrap();
@@ -309,5 +282,64 @@ mod tests {
         assert!(back.children.is_empty());
         // note: None must be absent from JSON, not serialized as null
         assert!(!json.contains("\"note\""), "absent note field must not appear in JSON");
+    }
+
+    #[test]
+    fn directory_item_no_hash_in_json() {
+        let item = DirectoryItem {
+            name: "film.mkv".into(),
+            item_type: ItemType::File,
+            size: Some("14.2GB".into()),
+            format: Some("MKV".into()),
+            year: None,
+            tags: vec![],
+            note: None,
+            children: vec![],
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(
+            !json.contains("sha256"),
+            "DirectoryItem must not expose sha256 in serialized form, got: {json}"
+        );
+    }
+
+    #[test]
+    fn collection_no_internal_fields() {
+        let col = Collection {
+            slug: "films".into(),
+            path_alias: "Films".into(),
+            description: None,
+            item_count: 0,
+            est_size: None,
+            content_types: vec![],
+            tags: vec![],
+            languages: vec![],
+            last_updated: chrono::Utc::now(),
+            listing: vec![],
+        };
+        let json = serde_json::to_string(&col).unwrap();
+        assert!(
+            !json.contains("total_bytes"),
+            "Collection must not expose total_bytes in serialized form"
+        );
+        assert!(
+            !json.contains("\"sorted\""),
+            "Collection must not expose sorted in serialized form"
+        );
+    }
+
+    #[test]
+    fn content_types_union_sorted_deduped() {
+        // Validate that content_types union logic produces a sorted, deduplicated
+        // list — the same logic used in publish_collection.
+        let type_sets: Vec<Vec<String>> = vec![
+            vec!["video".into(), "audio".into()],
+            vec!["audio".into(), "image".into()],
+            vec!["video".into()],
+        ];
+        let mut aggregate: Vec<String> = type_sets.into_iter().flatten().collect();
+        aggregate.sort();
+        aggregate.dedup();
+        assert_eq!(aggregate, vec!["audio", "image", "video"]);
     }
 }

@@ -6,7 +6,7 @@ use axum::{
 };
 use std::net::SocketAddr;
 use hb_core::{
-    ChannelMessage, DocType, HbError, SignedEnvelope,
+    DocType, HbError, SignedEnvelope,
     types::{ChatMessage, Collection, HeartbeatBody},
 };
 use serde::{Deserialize, Serialize};
@@ -53,13 +53,7 @@ pub async fn publish(
     let expected_type = match envelope.doc_type {
         DocType::Profile    => "profile",
         DocType::Collection => "collection",
-        DocType::Succession => "succession",
         DocType::Message    => "message",
-        DocType::Channel    => {
-            return Err(AppError::BadRequest(
-                "channel messages must be posted to /v1/channel/:channel".into(),
-            ));
-        }
     };
     if body.doc_type != expected_type {
         return Err(AppError::BadRequest(format!(
@@ -81,9 +75,6 @@ pub async fn publish(
         }
         DocType::Profile => {
             db::upsert_document(&state.pool, pubkey, "profile", &envelope_json).await?;
-        }
-        DocType::Succession => {
-            db::upsert_document(&state.pool, pubkey, "succession", &envelope_json).await?;
         }
         DocType::Message => {
             let msg: ChatMessage = envelope
@@ -117,7 +108,6 @@ pub async fn publish(
             )
             .await?;
         }
-        DocType::Channel => unreachable!("handled above"),
     }
 
     Ok(StatusCode::OK)
@@ -145,7 +135,6 @@ pub struct HeartbeatRequest {
     pub signed_at: String,
     pub node_addr: Option<String>,
     pub signature: String,
-    pub listed: Option<bool>,
 }
 
 pub async fn heartbeat(
@@ -164,7 +153,6 @@ pub async fn heartbeat(
     }
 
     let signed_body = HeartbeatBody {
-        listed: body.listed,
         node_addr: body.node_addr.clone(),
         public_key: body.public_key.clone(),
         signed_at: body.signed_at.clone(),
@@ -179,7 +167,6 @@ pub async fn heartbeat(
         &state.pool,
         &body.public_key,
         body.node_addr.as_deref(),
-        body.listed.unwrap_or(false),
     )
     .await?;
 
@@ -266,170 +253,6 @@ pub async fn get_messages(
         .collect();
 
     Ok(Json(MessagesResponse { messages }))
-}
-
-// ---------------------------------------------------------------------------
-// GET /v1/directory  — listed peers with profiles
-// ---------------------------------------------------------------------------
-
-#[derive(Serialize)]
-pub struct DirectoryEntry {
-    pub pubkey: String,
-    pub profile: Value,
-}
-
-#[derive(Serialize)]
-pub struct DirectoryResponse {
-    pub peers: Vec<DirectoryEntry>,
-}
-
-pub async fn get_directory(
-    State(state): State<AppState>,
-) -> Result<Json<DirectoryResponse>, AppError> {
-    let rows = db::get_listed_peers(&state.pool).await?;
-
-    let peers = rows
-        .into_iter()
-        .filter_map(|(pubkey, env_json)| {
-            let profile: Value = serde_json::from_str(&env_json).ok()?;
-            Some(DirectoryEntry { pubkey, profile })
-        })
-        .collect();
-
-    Ok(Json(DirectoryResponse { peers }))
-}
-
-// ---------------------------------------------------------------------------
-// GET /v1/channel/general
-// ---------------------------------------------------------------------------
-
-#[derive(Serialize)]
-pub struct ChannelResponse {
-    pub channel: String,
-    pub messages: Vec<Value>,
-}
-
-pub async fn get_channel(
-    State(state): State<AppState>,
-    Path(channel): Path<String>,
-) -> Result<Json<ChannelResponse>, AppError> {
-    if channel != "general" {
-        return Err(AppError::BadRequest("unknown channel".into()));
-    }
-
-    let envelopes = db::get_channel_messages(&state.pool, &channel).await?;
-    let messages = envelopes
-        .into_iter()
-        .filter_map(|s| serde_json::from_str::<Value>(&s).ok())
-        .collect();
-
-    Ok(Json(ChannelResponse { channel, messages }))
-}
-
-// ---------------------------------------------------------------------------
-// POST /v1/channel/general
-// ---------------------------------------------------------------------------
-
-pub async fn post_channel(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    Path(channel): Path<String>,
-    Json(envelope_val): Json<Value>,
-) -> Result<StatusCode, AppError> {
-    if !state.rate_limiter.check(&addr.ip().to_string()) {
-        return Err(AppError::BadRequest("rate limit exceeded".into()));
-    }
-
-    if channel != "general" {
-        return Err(AppError::BadRequest("unknown channel".into()));
-    }
-
-    let raw_size = serde_json::to_vec(&envelope_val)
-        .map_err(|e| AppError::BadRequest(e.to_string()))?
-        .len();
-    if raw_size > 8 * 1024 {
-        return Err(AppError::TooLarge);
-    }
-
-    let envelope: SignedEnvelope = serde_json::from_value(envelope_val)
-        .map_err(|e| AppError::BadRequest(format!("invalid envelope: {e}")))?;
-
-    if envelope.doc_type != DocType::Channel {
-        return Err(AppError::BadRequest("envelope must have doc_type 'channel'".into()));
-    }
-
-    envelope.verify()?;
-
-    let msg: ChannelMessage = envelope
-        .parse_payload()
-        .map_err(|e: HbError| AppError::BadRequest(e.to_string()))?;
-
-    if msg.channel != channel {
-        return Err(AppError::BadRequest("channel mismatch".into()));
-    }
-
-    if !timestamp_is_fresh(&msg.sent_at.to_rfc3339()).unwrap_or(false) {
-        return Err(AppError::BadRequest("message timestamp out of acceptable range".into()));
-    }
-
-    if msg.content.len() > 1000 {
-        return Err(AppError::TooLarge);
-    }
-
-    let count = db::count_channel_messages(&state.pool, &channel).await?;
-    if count >= db::MAX_CHANNEL_MESSAGES {
-        // Prune oldest message to make room (sliding window behaviour).
-        sqlx::query(
-            "DELETE FROM channel_messages WHERE id = (SELECT MIN(id) FROM channel_messages WHERE channel = ?)"
-        )
-        .bind(&channel)
-        .execute(&state.pool)
-        .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
-    }
-
-    let envelope_json = serde_json::to_string(&envelope)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
-
-    db::insert_channel_message(
-        &state.pool,
-        &envelope.public_key,
-        &channel,
-        &msg.sent_at.to_rfc3339(),
-        &envelope_json,
-    )
-    .await?;
-
-    Ok(StatusCode::OK)
-}
-
-// ---------------------------------------------------------------------------
-// GET /v1/name/:display_name  — anti-spoofing name check
-// ---------------------------------------------------------------------------
-
-#[derive(Serialize)]
-pub struct NameCheckResponse {
-    pub available: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub taken_by: Option<String>,
-}
-
-pub async fn check_name(
-    State(state): State<AppState>,
-    Path(display_name): Path<String>,
-) -> Result<Json<NameCheckResponse>, AppError> {
-    // Empty or too-long names are trivially available from a relay perspective.
-    if display_name.is_empty() || display_name.len() > 64 {
-        return Ok(Json(NameCheckResponse { available: true, taken_by: None }));
-    }
-
-    // Pass an empty exclude_pubkey so any match counts as taken.
-    let taken_by = db::check_display_name(&state.pool, &display_name, "").await?;
-
-    Ok(Json(NameCheckResponse {
-        available: taken_by.is_none(),
-        taken_by,
-    }))
 }
 
 // ---------------------------------------------------------------------------
