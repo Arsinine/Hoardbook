@@ -51,10 +51,10 @@ pub async fn generate_keypair(
     store.save_keypair(&stored).map_err(cmd_err)?;
     let info = IdentityInfo::from_keypair(&kp);
 
-    // Start iroh P2P endpoint with this keypair's key.
-    crate::start_iroh_endpoint(kp.private_key_bytes(), (*store).clone(), (*endpoint).clone())
-        .await
-        .map_err(cmd_err)?;
+    // iroh endpoint startup is non-fatal: identity is committed, endpoint retried on next launch.
+    if let Err(e) = crate::start_iroh_endpoint(kp.private_key_bytes(), (*store).clone(), (*endpoint).clone()).await {
+        tracing::warn!("iroh endpoint startup failed after keypair generate: {e}");
+    }
 
     *identity.write().await = Some(kp);
     Ok(info)
@@ -90,9 +90,10 @@ pub async fn import_keypair(
     store.save_keypair(&stored).map_err(cmd_err)?;
     let info = IdentityInfo::from_keypair(&kp);
 
-    crate::start_iroh_endpoint(&private_bytes, (*store).clone(), (*endpoint).clone())
-        .await
-        .map_err(cmd_err)?;
+    // iroh endpoint startup is non-fatal: keypair is committed regardless.
+    if let Err(e) = crate::start_iroh_endpoint(&private_bytes, (*store).clone(), (*endpoint).clone()).await {
+        tracing::warn!("iroh endpoint startup failed after keypair import: {e}");
+    }
 
     *identity.write().await = Some(kp);
     Ok(info)
