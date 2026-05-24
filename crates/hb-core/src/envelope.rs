@@ -14,9 +14,7 @@ use crate::jcs;
 pub enum DocType {
     Profile,
     Collection,
-    Succession,
     Message,
-    Channel,
 }
 
 // ---------------------------------------------------------------------------
@@ -37,7 +35,7 @@ pub enum DocType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedEnvelope {
     pub doc_type: DocType,
-    /// The typed document (Profile / Collection / Succession) as a JSON value.
+    /// The typed document (Profile / Collection / Message) as a JSON value.
     pub payload: serde_json::Value,
     /// The author's Hoardbook ID (`hb1_...`).
     pub public_key: String,
@@ -104,6 +102,8 @@ mod tests {
             email: None,
             location: None,
             social_links: vec![],
+            willing_to: vec![],
+            content_types: vec![],
             updated: Utc::now(),
         }
     }
@@ -161,6 +161,8 @@ mod tests {
             email: None,
             location: None,
             social_links: vec![],
+            willing_to: vec![],
+            content_types: vec![],
             updated: Utc::now(),
         };
         let env = SignedEnvelope::create(&kp, DocType::Profile, &profile).unwrap();
@@ -189,5 +191,54 @@ mod tests {
         let json_str = serde_json::to_string(&env).unwrap();
         let restored: SignedEnvelope = serde_json::from_str(&json_str).unwrap();
         restored.verify().expect("signature should survive JSON roundtrip");
+    }
+
+    #[test]
+    fn vec_fields_always_serialised() {
+        // Vec fields in Profile must always appear as [] in the signed payload —
+        // never omitted — so the frontend reliably gets an array, not undefined.
+        let kp = HoardbookKeypair::generate();
+        let profile = Profile {
+            display_name: "test".into(),
+            bio: None,
+            tags: vec![],
+            since: None,
+            est_size: None,
+            languages: vec![],
+            contact_hint: None,
+            email: None,
+            location: None,
+            social_links: vec![],
+            willing_to: vec![],
+            content_types: vec![],
+            updated: Utc::now(),
+        };
+        let env = SignedEnvelope::create(&kp, DocType::Profile, &profile).unwrap();
+        let payload_json = serde_json::to_string(&env.payload).unwrap();
+        for field in &["tags", "languages", "social_links", "willing_to", "content_types"] {
+            assert!(
+                payload_json.contains(&format!("\"{}\":[]", field)),
+                "Vec field '{}' must appear as [] in the payload, got: {payload_json}",
+                field
+            );
+        }
+    }
+
+    /// Milestone T1 integration: hb_id_survives_envelope_roundtrip
+    /// The hb_id embedded in public_key must round-trip through JSON serialization
+    /// and remain decodable and signature-verifiable after deserialization.
+    #[test]
+    fn hb_id_survives_envelope_roundtrip() {
+        use crate::crypto::hb_id_decode;
+        let kp = HoardbookKeypair::generate();
+        let original_hb_id = kp.hb_id();
+        let env = SignedEnvelope::create(&kp, DocType::Profile, &test_profile()).unwrap();
+
+        let json_str = serde_json::to_string(&env).unwrap();
+        let restored: SignedEnvelope = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(restored.public_key, original_hb_id, "hb_id must survive JSON roundtrip");
+        hb_id_decode(&restored.public_key).expect("restored public_key must decode as valid hb_id");
+        restored.verify().expect("signature must be valid after roundtrip");
     }
 }

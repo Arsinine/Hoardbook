@@ -3,7 +3,6 @@ use hb_core::{
     DocType, SignedEnvelope,
     types::{Collection, DirectoryItem, ItemType},
 };
-use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -53,10 +52,9 @@ pub async fn scan_directory(
         description: None,
         item_count,
         est_size,
-        total_bytes,
-        content_type: vec![],
+        content_types: vec![],
+        tags: vec![],
         languages: vec![],
-        sorted: false,
         last_updated: chrono::Utc::now(),
         listing,
     };
@@ -112,9 +110,9 @@ pub async fn get_collections(store: State<'_, DataStore>) -> CmdResult<Vec<Colle
 pub async fn update_collection_meta(
     slug: String,
     description: Option<String>,
-    content_type: Vec<String>,
+    content_types: Vec<String>,
+    tags: Vec<String>,
     languages: Vec<String>,
-    sorted: bool,
     store: State<'_, DataStore>,
 ) -> CmdResult<()> {
     let safe_slug = is_valid_slug(&slug)
@@ -128,9 +126,9 @@ pub async fn update_collection_meta(
         .ok_or_else(|| format!("No draft found for collection '{safe_slug}'"))?;
 
     col.description = description;
-    col.content_type = content_type;
+    col.content_types = content_types;
+    col.tags = tags;
     col.languages = languages;
-    col.sorted = sorted;
     store.save_collection_draft(&col).map_err(cmd_err)
 }
 
@@ -163,7 +161,109 @@ pub async fn publish_collection(
 
     let envelope = SignedEnvelope::create(kp, DocType::Collection, &collection).map_err(cmd_err)?;
     store.save_collection_signed(safe_slug, &envelope).map_err(cmd_err)?;
-    relay.publish("collection", &envelope).await.map_err(cmd_err)
+    relay.publish("collection", &envelope).await.map_err(cmd_err)?;
+
+    // Recompute profile content_types aggregate from all published collections.
+    let all_envelopes = store.list_collections().map_err(cmd_err)?;
+    let mut aggregate: Vec<String> = all_envelopes
+        .iter()
+        .filter_map(|env| env.parse_payload::<Collection>().ok())
+        .flat_map(|c| c.content_types)
+        .collect();
+    aggregate.sort();
+    aggregate.dedup();
+
+    if let Some(mut profile) = store.load_profile_draft().map_err(cmd_err)? {
+        profile.content_types = aggregate;
+        store.save_profile_draft(&profile).map_err(cmd_err)?;
+        // Re-publish profile if it was previously published.
+        if store.load_profile_signed().map_err(cmd_err)?.is_some() {
+            let prof_env = SignedEnvelope::create(kp, DocType::Profile, &profile).map_err(cmd_err)?;
+            store.save_profile_signed(&prof_env).map_err(cmd_err)?;
+            relay.publish("profile", &prof_env).await.map_err(cmd_err)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Export a collection's listing as plain text or markdown checklist.
+/// Returns the rendered string; the caller writes it to clipboard.
+#[tauri::command]
+pub async fn export_collection(
+    slug: String,
+    format: String,
+    store: State<'_, DataStore>,
+) -> CmdResult<String> {
+    let safe_slug = is_valid_slug(&slug)
+        .then_some(slug.as_str())
+        .ok_or("Invalid collection slug")?;
+
+    // Prefer the published (signed) version; fall back to draft.
+    let collection: Collection = if let Some(env) = store
+        .list_collections()
+        .map_err(cmd_err)?
+        .into_iter()
+        .find(|e| e.parse_payload::<Collection>().ok().map_or(false, |c| c.slug == safe_slug))
+    {
+        env.parse_payload().map_err(cmd_err)?
+    } else {
+        store
+            .load_collection_draft(safe_slug)
+            .map_err(cmd_err)?
+            .ok_or_else(|| format!("Collection '{safe_slug}' not found"))?
+    };
+
+    let out = match format.as_str() {
+        "markdown" => render_markdown(&collection.listing, 0),
+        _ => render_text(&collection.listing, 0),
+    };
+
+    Ok(format!("{}\n\n{}", collection.path_alias, out))
+}
+
+fn render_text(items: &[DirectoryItem], depth: usize) -> String {
+    use hb_core::types::ItemType;
+    let indent = "  ".repeat(depth);
+    items
+        .iter()
+        .map(|item| {
+            let prefix = if item.item_type == ItemType::Folder { "📁 " } else { "   " };
+            let size = item.size.as_deref().map(|s| format!(" [{s}]")).unwrap_or_default();
+            let children = if !item.children.is_empty() {
+                format!("\n{}", render_text(&item.children, depth + 1))
+            } else {
+                String::new()
+            };
+            format!("{indent}{prefix}{}{size}{children}", item.name)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_markdown(items: &[DirectoryItem], depth: usize) -> String {
+    use hb_core::types::ItemType;
+    let indent = "  ".repeat(depth);
+    items
+        .iter()
+        .map(|item| {
+            if item.item_type == ItemType::Folder {
+                let children = if !item.children.is_empty() {
+                    format!("\n{}", render_markdown(&item.children, depth + 1))
+                } else {
+                    String::new()
+                };
+                format!("{indent}- **{}**{children}", item.name)
+            } else {
+                let mut meta = vec![];
+                if let Some(fmt) = &item.format { meta.push(fmt.clone()); }
+                if let Some(sz) = &item.size { meta.push(sz.clone()); }
+                let meta_str = if meta.is_empty() { String::new() } else { format!(" `{}`", meta.join(", ")) };
+                format!("{indent}- [ ] {}{meta_str}", item.name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -213,13 +313,9 @@ fn scan_recursive(
                 tags: vec![],
                 note: None,
                 children,
-                sha256: None,
             });
         } else if meta.is_file() {
             total_bytes += meta.len();
-            let sha256 = std::fs::read(&path)
-                .ok()
-                .map(|bytes| hex::encode(Sha256::digest(&bytes)));
             items.push(DirectoryItem {
                 name: name.clone(),
                 item_type: ItemType::File,
@@ -232,7 +328,6 @@ fn scan_recursive(
                 tags: vec![],
                 note: None,
                 children: vec![],
-                sha256,
             });
         }
     }
@@ -323,30 +418,4 @@ mod tests {
         assert_eq!(format_size(10 * 1_073_741_824), "10.0 GB");
     }
 
-    #[test]
-    fn scan_computes_sha256_for_files() {
-        use sha2::{Digest, Sha256};
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("data.txt"), b"hello world").unwrap();
-
-        let (items, _) = scan_recursive(dir.path(), 1, 0, &[]).unwrap();
-        let item = items.iter().find(|i| i.name == "data.txt").unwrap();
-
-        let expected = hex::encode(Sha256::digest(b"hello world"));
-        assert_eq!(
-            item.sha256.as_deref(),
-            Some(expected.as_str()),
-            "file item must carry its SHA256"
-        );
-    }
-
-    #[test]
-    fn scan_folders_have_no_sha256() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("subdir")).unwrap();
-
-        let (items, _) = scan_recursive(dir.path(), 2, 0, &[]).unwrap();
-        let folder = items.iter().find(|i| i.name == "subdir").unwrap();
-        assert!(folder.sha256.is_none(), "folders must not have a sha256");
-    }
 }
