@@ -15,14 +15,13 @@ const BOOTSTRAP_RELAYS: &[&str] = &[
 // Wire types
 // ---------------------------------------------------------------------------
 
+/// Relay GET /v1/peer/:pubkey response — online status + NodeAddr only.
+/// Profile and collection data is fetched via iroh (T17/T20), not the relay.
 #[derive(Debug, Deserialize)]
 struct PeerResponse {
-    profile: Option<SignedEnvelope>,
-    #[serde(default)]
-    collections: Vec<SignedEnvelope>,
     online: bool,
-    node_addr: Option<String>,
     last_seen_at: Option<i64>,
+    node_addr: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,40 +142,16 @@ impl RelayClient {
     }
 }
 
-/// Build a `CachedPeer` from a raw relay response, verifying every envelope's
-/// Ed25519 signature before accepting its contents.  Tampered or unsigned
-/// envelopes are silently dropped (with a tracing warning).
+/// Build a `CachedPeer` from a relay status response.
+/// Profile and collections are populated later by the iroh browse flow (T20).
 fn parse_peer_response(hb_id: &str, resp: PeerResponse) -> CachedPeer {
-    let profile = resp.profile
-        .as_ref()
-        .filter(|e| {
-            if e.verify().is_err() {
-                tracing::warn!("peer {hb_id}: profile signature invalid, discarding");
-                return false;
-            }
-            true
-        })
-        .and_then(|e| e.parse_payload().ok());
-
-    let collections = resp.collections
-        .iter()
-        .filter(|e| {
-            if e.verify().is_err() {
-                tracing::warn!("peer {hb_id}: collection signature invalid, discarding");
-                return false;
-            }
-            true
-        })
-        .filter_map(|e| e.parse_payload().ok())
-        .collect();
-
     let last_seen_at = resp.last_seen_at
         .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0));
 
     CachedPeer {
         hb_id: hb_id.to_string(),
-        profile,
-        collections,
+        profile: None,
+        collections: vec![],
         online: resp.online,
         node_addr: resp.node_addr,
         last_fetched: chrono::Utc::now(),
@@ -263,44 +238,6 @@ impl RelayClient {
         Ok(())
     }
 
-    /// Notify all relays that this identity is being deactivated (best-effort).
-    /// Called before wiping local data so the relay stops recommending this peer.
-    pub async fn deactivate_self(&self, keypair: &hb_core::HoardbookKeypair) -> Result<()> {
-        #[derive(Serialize)]
-        struct DeactivateBody<'a> {
-            public_key: &'a str,
-            signed_at: &'a str,
-            action: &'static str,
-        }
-
-        #[derive(Serialize)]
-        struct DeactivateRequest<'a> {
-            public_key: &'a str,
-            signed_at: String,
-            action: &'static str,
-            signature: String,
-        }
-
-        let hb_id = keypair.hb_id();
-        let signed_at = chrono::Utc::now().to_rfc3339();
-
-        let body = DeactivateBody { public_key: &hb_id, signed_at: &signed_at, action: "deactivate" };
-        let body_value = serde_json::to_value(&body)?;
-        let signature = keypair.sign(&body_value);
-
-        let req = DeactivateRequest { public_key: &hb_id, signed_at, action: "deactivate", signature };
-
-        let relay_urls = self.relay_urls.read().unwrap().clone();
-        for url in &relay_urls {
-            let endpoint = format!("{url}/v1/deactivate");
-            if let Err(e) = self.http.post(&endpoint).json(&req).send().await {
-                tracing::debug!("deactivation to {url} failed: {e}");
-            }
-        }
-
-        Ok(())
-    }
-
     /// Send a heartbeat to all relays.
     pub async fn send_heartbeat(
         &self,
@@ -352,103 +289,26 @@ impl RelayClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hb_core::{DocType, SignedEnvelope};
-    use hb_core::crypto::HoardbookKeypair;
-    use hb_core::types::{Collection, Profile};
-    use chrono::Utc;
 
-    fn make_profile(name: &str) -> Profile {
-        Profile {
-            display_name: name.into(),
-            bio: None,
-            tags: vec![],
-            since: None,
-            est_size: None,
-            languages: vec![],
-            contact_hint: None,
-            email: None,
-            location: None,
-            social_links: vec![],
-            willing_to: vec![],
-            content_types: vec![],
-            updated: Utc::now(),
-        }
-    }
-
-    fn make_collection(slug: &str) -> Collection {
-        Collection {
-            slug: slug.into(),
-            path_alias: slug.into(),
-            description: None,
-            item_count: 0,
-            est_size: None,
-            content_types: vec![],
-            tags: vec![],
-            languages: vec![],
-            last_updated: Utc::now(),
-            listing: vec![],
-        }
-    }
-
-    fn peer_resp_with_profile(env: Option<SignedEnvelope>) -> PeerResponse {
-        PeerResponse {
-            profile: env,
-            collections: vec![],
+    #[test]
+    fn online_peer_response_parsed() {
+        let resp = PeerResponse {
             online: true,
-            node_addr: None,
-            last_seen_at: None,
-        }
-    }
-
-    #[test]
-    fn valid_profile_is_accepted() {
-        let kp = HoardbookKeypair::generate();
-        let env = SignedEnvelope::create(&kp, DocType::Profile, &make_profile("legit")).unwrap();
-        let cached = parse_peer_response(&kp.hb_id(), peer_resp_with_profile(Some(env)));
-        assert!(cached.profile.is_some());
-        assert_eq!(cached.profile.unwrap().display_name, "legit");
-    }
-
-    #[test]
-    fn tampered_profile_is_discarded() {
-        let kp = HoardbookKeypair::generate();
-        let mut env = SignedEnvelope::create(&kp, DocType::Profile, &make_profile("honest")).unwrap();
-        env.payload["display_name"] = serde_json::json!("hacker");
-        let cached = parse_peer_response("hb1_test", peer_resp_with_profile(Some(env)));
-        assert!(cached.profile.is_none(), "tampered profile must be discarded");
-    }
-
-    #[test]
-    fn tampered_collection_is_discarded() {
-        let kp = HoardbookKeypair::generate();
-        let mut env = SignedEnvelope::create(&kp, DocType::Collection, &make_collection("books")).unwrap();
-        env.payload["slug"] = serde_json::json!("injected");
-        let resp = PeerResponse {
-            profile: None,
-            collections: vec![env],
-            online: false,
-            node_addr: None,
-            last_seen_at: None,
+            last_seen_at: Some(1_716_400_000),
+            node_addr: Some("iroh://abc123".into()),
         };
-        let cached = parse_peer_response("hb1_test", resp);
-        assert!(cached.collections.is_empty(), "tampered collection must be discarded");
+        let cached = parse_peer_response("hb1_testkey", resp);
+        assert!(cached.online);
+        assert_eq!(cached.node_addr.as_deref(), Some("iroh://abc123"));
+        assert!(cached.profile.is_none(), "relay response must not populate profile");
+        assert!(cached.collections.is_empty(), "relay response must not populate collections");
     }
 
     #[test]
-    fn mixed_collections_keep_only_valid() {
-        let kp = HoardbookKeypair::generate();
-        let valid = SignedEnvelope::create(&kp, DocType::Collection, &make_collection("good")).unwrap();
-        let mut tampered = SignedEnvelope::create(&kp, DocType::Collection, &make_collection("bad")).unwrap();
-        tampered.payload["slug"] = serde_json::json!("injected");
-        let resp = PeerResponse {
-            profile: None,
-            collections: vec![valid, tampered],
-            online: false,
-            node_addr: None,
-            last_seen_at: None,
-        };
-        let cached = parse_peer_response("hb1_test", resp);
-        assert_eq!(cached.collections.len(), 1);
-        assert_eq!(cached.collections[0].slug, "good");
+    fn offline_peer_response_parsed() {
+        let resp = PeerResponse { online: false, last_seen_at: Some(1_000_000), node_addr: None };
+        let cached = parse_peer_response("hb1_testkey", resp);
+        assert!(!cached.online);
+        assert!(cached.node_addr.is_none());
     }
 }

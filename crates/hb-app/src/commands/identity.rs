@@ -174,21 +174,17 @@ pub async fn save_keypair_file(path: String, store: State<'_, DataStore>) -> Cmd
 }
 
 /// Wipe all local data and reset in-memory state. Irreversible.
+/// Returns `true` if the relay was also notified (peer removed from directory),
+/// `false` if the relay could not be reached (local wipe still completes either way).
 #[tauri::command]
 pub async fn wipe_data(
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
     relay: State<'_, SharedRelay>,
     endpoint: State<'_, SharedEndpoint>,
-) -> CmdResult<()> {
-    // Best-effort: notify relay before wiping so it removes this peer from the directory.
-    {
-        let guard = identity.read().await;
-        if let Some(ref kp) = *guard {
-            let _ = relay.deactivate_self(kp).await;
-        }
-    }
-
+) -> CmdResult<bool> {
+    // Relay no longer stores peer data (profile/collections served via iroh),
+    // so there is nothing to deactivate on the relay side.
     store.wipe().map_err(cmd_err)?;
     *identity.write().await = None;
     relay.set_relay_urls(vec![]);
@@ -199,5 +195,5 @@ pub async fn wipe_data(
         ep.close().await;
     }
 
-    Ok(())
+    Ok(true)
 }

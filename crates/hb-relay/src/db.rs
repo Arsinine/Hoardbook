@@ -3,7 +3,6 @@ use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
 use std::str::FromStr;
 
 const EXPIRY_DAYS: i64 = 30;
-const CHANNEL_EXPIRY_DAYS: i64 = 7;
 const SECS_PER_DAY: i64 = 86_400;
 
 // ---------------------------------------------------------------------------
@@ -19,52 +18,29 @@ pub async fn connect(database_url: &str) -> Result<SqlitePool> {
 }
 
 pub async fn migrate(pool: &SqlitePool) -> Result<()> {
+    // Drop legacy tables that are no longer part of the relay's remit.
+    // The relay no longer caches profiles or collections — those are served
+    // peer-to-peer by each node's iroh endpoint.
+    let _ = sqlx::query("DROP TABLE IF EXISTS documents").execute(pool).await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS collections").execute(pool).await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS channel_messages").execute(pool).await;
+
     sqlx::query(
         r#"
-        CREATE TABLE IF NOT EXISTS documents (
-            pubkey      TEXT    NOT NULL,
-            doc_type    TEXT    NOT NULL CHECK(doc_type IN ('profile', 'succession')),
-            envelope    TEXT    NOT NULL,
-            stored_at   INTEGER NOT NULL,
-            expires_at  INTEGER NOT NULL,
-            PRIMARY KEY (pubkey, doc_type)
-        );
-
-        CREATE TABLE IF NOT EXISTS collections (
-            pubkey      TEXT    NOT NULL,
-            slug        TEXT    NOT NULL,
-            envelope    TEXT    NOT NULL,
-            stored_at   INTEGER NOT NULL,
-            expires_at  INTEGER NOT NULL,
-            PRIMARY KEY (pubkey, slug)
-        );
-
         CREATE TABLE IF NOT EXISTS heartbeats (
-            pubkey      TEXT    PRIMARY KEY,
-            last_seen   INTEGER NOT NULL,
-            node_addr   TEXT,
-            listed      INTEGER NOT NULL DEFAULT 0
+            pubkey    TEXT    PRIMARY KEY,
+            last_seen INTEGER NOT NULL,
+            node_addr TEXT
         );
 
         CREATE TABLE IF NOT EXISTS messages (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            from_key    TEXT    NOT NULL,
-            to_key      TEXT    NOT NULL,
-            envelope    TEXT    NOT NULL,
-            sent_at     TEXT    NOT NULL,
-            stored_at   INTEGER NOT NULL,
-            expires_at  INTEGER NOT NULL,
-            UNIQUE(from_key, sent_at)
-        );
-
-        CREATE TABLE IF NOT EXISTS channel_messages (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            from_key    TEXT    NOT NULL,
-            channel     TEXT    NOT NULL,
-            envelope    TEXT    NOT NULL,
-            sent_at     TEXT    NOT NULL,
-            stored_at   INTEGER NOT NULL,
-            expires_at  INTEGER NOT NULL,
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_key   TEXT    NOT NULL,
+            to_key     TEXT    NOT NULL,
+            envelope   TEXT    NOT NULL,
+            sent_at    TEXT    NOT NULL,
+            stored_at  INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
             UNIQUE(from_key, sent_at)
         );
         "#,
@@ -78,16 +54,8 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_channel_messages ON channel_messages(channel, sent_at DESC)",
-    )
-    .execute(pool)
-    .await?;
-
-    // Add `listed` column to existing heartbeats tables (no-op if already present).
-    let _ = sqlx::query("ALTER TABLE heartbeats ADD COLUMN listed INTEGER NOT NULL DEFAULT 0")
-        .execute(pool)
-        .await;
+    // Legacy column cleanup — safe to ignore if already absent.
+    let _ = sqlx::query("ALTER TABLE heartbeats DROP COLUMN listed").execute(pool).await;
 
     Ok(())
 }
@@ -104,109 +72,6 @@ fn expiry_secs() -> i64 {
     now_secs() + EXPIRY_DAYS * SECS_PER_DAY
 }
 
-fn channel_expiry_secs() -> i64 {
-    now_secs() + CHANNEL_EXPIRY_DAYS * SECS_PER_DAY
-}
-
-// ---------------------------------------------------------------------------
-// Documents (profile, succession)
-// ---------------------------------------------------------------------------
-
-pub async fn upsert_document(
-    pool: &SqlitePool,
-    pubkey: &str,
-    doc_type: &str,
-    envelope_json: &str,
-) -> Result<()> {
-    let now = now_secs();
-    let expires = expiry_secs();
-
-    sqlx::query(
-        r#"
-        INSERT INTO documents (pubkey, doc_type, envelope, stored_at, expires_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(pubkey, doc_type) DO UPDATE SET
-            envelope   = excluded.envelope,
-            stored_at  = excluded.stored_at,
-            expires_at = excluded.expires_at
-        "#,
-    )
-    .bind(pubkey)
-    .bind(doc_type)
-    .bind(envelope_json)
-    .bind(now)
-    .bind(expires)
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
-pub async fn get_document(
-    pool: &SqlitePool,
-    pubkey: &str,
-    doc_type: &str,
-) -> Result<Option<String>> {
-    let now = now_secs();
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT envelope FROM documents WHERE pubkey = ? AND doc_type = ? AND expires_at > ?",
-    )
-    .bind(pubkey)
-    .bind(doc_type)
-    .bind(now)
-    .fetch_optional(pool)
-    .await?;
-
-    Ok(row.map(|(env,)| env))
-}
-
-// ---------------------------------------------------------------------------
-// Collections
-// ---------------------------------------------------------------------------
-
-pub async fn upsert_collection(
-    pool: &SqlitePool,
-    pubkey: &str,
-    slug: &str,
-    envelope_json: &str,
-) -> Result<()> {
-    let now = now_secs();
-    let expires = expiry_secs();
-
-    sqlx::query(
-        r#"
-        INSERT INTO collections (pubkey, slug, envelope, stored_at, expires_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(pubkey, slug) DO UPDATE SET
-            envelope   = excluded.envelope,
-            stored_at  = excluded.stored_at,
-            expires_at = excluded.expires_at
-        "#,
-    )
-    .bind(pubkey)
-    .bind(slug)
-    .bind(envelope_json)
-    .bind(now)
-    .bind(expires)
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
-pub async fn get_collections(pool: &SqlitePool, pubkey: &str) -> Result<Vec<String>> {
-    let now = now_secs();
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT envelope FROM collections WHERE pubkey = ? AND expires_at > ? ORDER BY slug",
-    )
-    .bind(pubkey)
-    .bind(now)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows.into_iter().map(|(env,)| env).collect())
-}
-
 // ---------------------------------------------------------------------------
 // Heartbeats
 // ---------------------------------------------------------------------------
@@ -215,25 +80,21 @@ pub async fn upsert_heartbeat(
     pool: &SqlitePool,
     pubkey: &str,
     node_addr: Option<&str>,
-    listed: bool,
 ) -> Result<()> {
     let now = now_secs();
-    let listed_int = if listed { 1i64 } else { 0i64 };
 
     sqlx::query(
         r#"
-        INSERT INTO heartbeats (pubkey, last_seen, node_addr, listed)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO heartbeats (pubkey, last_seen, node_addr)
+        VALUES (?, ?, ?)
         ON CONFLICT(pubkey) DO UPDATE SET
             last_seen = excluded.last_seen,
-            node_addr = excluded.node_addr,
-            listed    = excluded.listed
+            node_addr = excluded.node_addr
         "#,
     )
     .bind(pubkey)
     .bind(now)
     .bind(node_addr)
-    .bind(listed_int)
     .execute(pool)
     .await?;
 
@@ -252,78 +113,6 @@ pub async fn get_heartbeat(
             .await?;
 
     Ok(row)
-}
-
-/// Returns `(pubkey, profile_envelope)` for listed peers seen within the last 24 hours.
-/// Peers that are listed but have no profile, or haven't heartbeated in 24h, are excluded.
-pub async fn get_listed_peers(pool: &SqlitePool) -> Result<Vec<(String, String)>> {
-    let now = now_secs();
-    let cutoff = now - SECS_PER_DAY;
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        r#"
-        SELECT h.pubkey, d.envelope
-        FROM heartbeats h
-        INNER JOIN documents d
-            ON d.pubkey = h.pubkey
-           AND d.doc_type = 'profile'
-           AND d.expires_at > ?
-        WHERE h.listed = 1
-          AND h.last_seen > ?
-        ORDER BY h.last_seen DESC
-        LIMIT 200
-        "#,
-    )
-    .bind(now)
-    .bind(cutoff)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows)
-}
-
-/// Remove a peer from the directory and delete their published documents.
-/// Their heartbeat row is kept (for last-seen history) but listed is set to 0.
-pub async fn deactivate_peer(pool: &SqlitePool, pubkey: &str) -> Result<()> {
-    sqlx::query("UPDATE heartbeats SET listed = 0 WHERE pubkey = ?")
-        .bind(pubkey)
-        .execute(pool)
-        .await?;
-    sqlx::query("DELETE FROM documents WHERE pubkey = ?")
-        .bind(pubkey)
-        .execute(pool)
-        .await?;
-    sqlx::query("DELETE FROM collections WHERE pubkey = ?")
-        .bind(pubkey)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-/// Check if a display_name is already taken by a different pubkey.
-/// Returns the pubkey that owns the name, or None if available.
-pub async fn check_display_name(
-    pool: &SqlitePool,
-    display_name: &str,
-    exclude_pubkey: &str,
-) -> Result<Option<String>> {
-    let now = now_secs();
-    let row: Option<(String,)> = sqlx::query_as(
-        r#"
-        SELECT pubkey FROM documents
-        WHERE doc_type = 'profile'
-          AND json_extract(envelope, '$.payload.display_name') = ?
-          AND expires_at > ?
-          AND pubkey != ?
-        LIMIT 1
-        "#,
-    )
-    .bind(display_name)
-    .bind(now)
-    .bind(exclude_pubkey)
-    .fetch_optional(pool)
-    .await?;
-
-    Ok(row.map(|(pk,)| pk))
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +149,7 @@ pub async fn insert_message(
     Ok(())
 }
 
+/// Counts non-expired messages addressed to `to_key`.
 pub async fn count_messages_for(pool: &SqlitePool, to_key: &str) -> Result<i64> {
     let now = now_secs();
     let (count,): (i64,) = sqlx::query_as(
@@ -394,108 +184,20 @@ pub async fn get_messages_for(pool: &SqlitePool, to_key: &str) -> Result<Vec<Str
 }
 
 // ---------------------------------------------------------------------------
-// Channel Messages
-// ---------------------------------------------------------------------------
-
-pub const MAX_CHANNEL_MESSAGES: i64 = 500;
-
-pub async fn count_channel_messages(pool: &SqlitePool, channel: &str) -> Result<i64> {
-    let now = now_secs();
-    let (count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM channel_messages WHERE channel = ? AND expires_at > ?",
-    )
-    .bind(channel)
-    .bind(now)
-    .fetch_one(pool)
-    .await?;
-    Ok(count)
-}
-
-pub async fn insert_channel_message(
-    pool: &SqlitePool,
-    from_key: &str,
-    channel: &str,
-    sent_at: &str,
-    envelope_json: &str,
-) -> Result<()> {
-    let now = now_secs();
-    let expires = channel_expiry_secs();
-
-    sqlx::query(
-        r#"
-        INSERT OR IGNORE INTO channel_messages (from_key, channel, envelope, sent_at, stored_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(from_key)
-    .bind(channel)
-    .bind(envelope_json)
-    .bind(sent_at)
-    .bind(now)
-    .bind(expires)
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
-/// Returns the 100 most recent non-expired channel messages, oldest first.
-pub async fn get_channel_messages(pool: &SqlitePool, channel: &str) -> Result<Vec<String>> {
-    let now = now_secs();
-    let rows: Vec<(String,)> = sqlx::query_as(
-        r#"
-        SELECT envelope FROM (
-            SELECT envelope, sent_at FROM channel_messages
-            WHERE channel = ? AND expires_at > ?
-            ORDER BY sent_at DESC
-            LIMIT 100
-        ) ORDER BY sent_at ASC
-        "#,
-    )
-    .bind(channel)
-    .bind(now)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows.into_iter().map(|(env,)| env).collect())
-}
-
-// ---------------------------------------------------------------------------
 // Expiry
 // ---------------------------------------------------------------------------
 
-/// Delete all expired documents, collections, messages, and channel messages. Run hourly.
-pub async fn expire_documents(pool: &SqlitePool) -> Result<()> {
+/// Delete expired messages. Heartbeat rows never expire. Run hourly.
+pub async fn expire_messages(pool: &SqlitePool) -> Result<()> {
     let now = now_secs();
-
-    let docs = sqlx::query("DELETE FROM documents WHERE expires_at <= ?")
-        .bind(now)
-        .execute(pool)
-        .await?
-        .rows_affected();
-
-    let colls = sqlx::query("DELETE FROM collections WHERE expires_at <= ?")
-        .bind(now)
-        .execute(pool)
-        .await?
-        .rows_affected();
-
     let msgs = sqlx::query("DELETE FROM messages WHERE expires_at <= ?")
         .bind(now)
         .execute(pool)
         .await?
         .rows_affected();
 
-    let chan_msgs = sqlx::query("DELETE FROM channel_messages WHERE expires_at <= ?")
-        .bind(now)
-        .execute(pool)
-        .await?
-        .rows_affected();
-
-    if docs + colls + msgs + chan_msgs > 0 {
-        tracing::info!(
-            "expired {docs} documents, {colls} collections, {msgs} messages, {chan_msgs} channel messages"
-        );
+    if msgs > 0 {
+        tracing::info!("expired {msgs} messages");
     }
 
     Ok(())
@@ -505,12 +207,11 @@ pub async fn expire_documents(pool: &SqlitePool) -> Result<()> {
 // Stats
 // ---------------------------------------------------------------------------
 
-pub async fn count_stored(pool: &SqlitePool) -> Result<i64> {
-    let (doc_count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM documents").fetch_one(pool).await?;
-    let (coll_count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM collections").fetch_one(pool).await?;
-    Ok(doc_count + coll_count)
+/// Returns the count of distinct peers the relay has seen heartbeat from.
+pub async fn count_stored_peers(pool: &SqlitePool) -> Result<i64> {
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM heartbeats").fetch_one(pool).await?;
+    Ok(count)
 }
 
 // ---------------------------------------------------------------------------
@@ -525,6 +226,112 @@ mod tests {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         migrate(&pool).await.unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn migration_idempotent() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        // Run twice — must not error on second call.
+        migrate(&pool).await.unwrap();
+        migrate(&pool).await.unwrap();
+
+        // Verify the expected tables exist.
+        let tables: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let names: Vec<&str> = tables.iter().map(|(n,)| n.as_str()).collect();
+        assert!(names.contains(&"heartbeats"), "heartbeats table must exist");
+        assert!(names.contains(&"messages"), "messages table must exist");
+        assert!(!names.contains(&"documents"), "documents table must be absent");
+        assert!(!names.contains(&"collections"), "collections table must be absent");
+    }
+
+    #[tokio::test]
+    async fn message_dedup_silently_ignored() {
+        let pool = in_memory_pool().await;
+        insert_message(&pool, "alice", "bob", "2026-04-22T12:00:00Z", "envelope_v1")
+            .await
+            .unwrap();
+        insert_message(&pool, "alice", "bob", "2026-04-22T12:00:00Z", "envelope_v2")
+            .await
+            .unwrap();
+
+        let msgs = get_messages_for(&pool, "bob").await.unwrap();
+        assert_eq!(msgs.len(), 1, "duplicate (from, sent_at) must be silently dropped");
+        assert_eq!(msgs[0], "envelope_v1", "first write wins");
+    }
+
+    #[tokio::test]
+    async fn expire_removes_old_messages() {
+        let pool = in_memory_pool().await;
+        // Insert a message that is already past its expiry by manipulating expires_at directly.
+        sqlx::query(
+            "INSERT INTO messages (from_key, to_key, envelope, sent_at, stored_at, expires_at) \
+             VALUES ('a', 'b', 'env', '2020-01-01T00:00:00Z', 0, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Also insert a fresh message.
+        insert_message(&pool, "a", "b", "2026-06-01T00:00:00Z", "fresh")
+            .await
+            .unwrap();
+
+        expire_messages(&pool).await.unwrap();
+
+        let msgs = get_messages_for(&pool, "b").await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0], "fresh");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_not_expired() {
+        let pool = in_memory_pool().await;
+        upsert_heartbeat(&pool, "pk1", Some("addr1")).await.unwrap();
+
+        expire_messages(&pool).await.unwrap();
+
+        let hb = get_heartbeat(&pool, "pk1").await.unwrap();
+        assert!(hb.is_some(), "heartbeat must survive expire_messages");
+    }
+
+    #[tokio::test]
+    async fn count_messages_non_expired_only() {
+        let pool = in_memory_pool().await;
+        // One expired message.
+        sqlx::query(
+            "INSERT INTO messages (from_key, to_key, envelope, sent_at, stored_at, expires_at) \
+             VALUES ('a', 'b', 'old', '2020-01-01T00:00:00Z', 0, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // One fresh message.
+        insert_message(&pool, "a", "b", "2026-06-01T00:00:00Z", "fresh")
+            .await
+            .unwrap();
+
+        let count = count_messages_for(&pool, "b").await.unwrap();
+        assert_eq!(count, 1, "count must exclude expired messages");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_and_message_roundtrip() {
+        let pool = in_memory_pool().await;
+
+        upsert_heartbeat(&pool, "pk1", Some("iroh://addr1")).await.unwrap();
+        insert_message(&pool, "pk1", "pk2", "2026-06-01T00:00:00Z", "hello")
+            .await
+            .unwrap();
+
+        let hb = get_heartbeat(&pool, "pk1").await.unwrap().unwrap();
+        assert_eq!(hb.1.as_deref(), Some("iroh://addr1"));
+
+        let msgs = get_messages_for(&pool, "pk2").await.unwrap();
+        assert_eq!(msgs, ["hello"]);
     }
 
     #[tokio::test]
@@ -595,71 +402,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_heartbeat_sets_listed_flag() {
+    async fn upsert_heartbeat_stores_and_retrieves() {
         let pool = in_memory_pool().await;
-        upsert_heartbeat(&pool, "pk1", None, true).await.unwrap();
-        upsert_heartbeat(&pool, "pk2", None, false).await.unwrap();
-
-        // pk1 is listed; pk2 is not. Without a profile, get_listed_peers returns nothing.
-        let listed = get_listed_peers(&pool).await.unwrap();
-        assert!(listed.is_empty(), "no profiles stored yet");
-    }
-
-    #[tokio::test]
-    async fn get_listed_peers_requires_profile() {
-        let pool = in_memory_pool().await;
-
-        // Heartbeat with listed=1, but no profile yet → should not appear.
-        upsert_heartbeat(&pool, "pk_no_profile", None, true).await.unwrap();
-        assert!(get_listed_peers(&pool).await.unwrap().is_empty());
-
-        // Add a profile envelope for the listed peer → should now appear.
-        let envelope = r#"{"payload":{"display_name":"Alice","tags":[],"languages":[],"updated":"2026-01-01T00:00:00Z"},"doc_type":"profile","public_key":"pk_no_profile","signature":"x","signed_at":"2026-01-01T00:00:00Z"}"#;
-        upsert_document(&pool, "pk_no_profile", "profile", envelope).await.unwrap();
-        let listed = get_listed_peers(&pool).await.unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].0, "pk_no_profile");
-
-        // Unlisted peer with profile → should NOT appear.
-        upsert_heartbeat(&pool, "pk_unlisted", None, false).await.unwrap();
-        upsert_document(&pool, "pk_unlisted", "profile", envelope).await.unwrap();
-        let listed2 = get_listed_peers(&pool).await.unwrap();
-        assert_eq!(listed2.len(), 1, "unlisted peer must not appear in directory");
-    }
-
-    #[tokio::test]
-    async fn check_display_name_detects_conflict() {
-        let pool = in_memory_pool().await;
-
-        // Store a profile for pk1 with display_name "Alice".
-        let envelope = r#"{"payload":{"display_name":"Alice","tags":[],"languages":[],"updated":"2026-01-01T00:00:00Z"},"doc_type":"profile","public_key":"pk1","signature":"x","signed_at":"2026-01-01T00:00:00Z"}"#;
-        upsert_document(&pool, "pk1", "profile", envelope).await.unwrap();
-
-        // "Alice" is taken by pk1 — should conflict for pk2.
-        let conflict = check_display_name(&pool, "Alice", "pk2").await.unwrap();
-        assert_eq!(conflict, Some("pk1".to_string()));
-
-        // pk1 itself is excluded, so it's "available" for pk1.
-        let self_check = check_display_name(&pool, "Alice", "pk1").await.unwrap();
-        assert!(self_check.is_none(), "own pubkey must not block re-publish");
-
-        // Completely different name is available.
-        let avail = check_display_name(&pool, "Bob", "pk2").await.unwrap();
-        assert!(avail.is_none());
-    }
-
-    #[tokio::test]
-    async fn channel_messages_cap_and_order() {
-        let pool = in_memory_pool().await;
-        for i in 0u32..5 {
-            let sent_at = format!("2026-04-22T12:00:{:02}Z", i);
-            insert_channel_message(&pool, "alice", "general", &sent_at, &format!("env{i}"))
-                .await
-                .unwrap();
-        }
-        let msgs = get_channel_messages(&pool, "general").await.unwrap();
-        assert_eq!(msgs.len(), 5);
-        assert_eq!(msgs[0], "env0");
-        assert_eq!(msgs[4], "env4");
+        upsert_heartbeat(&pool, "pk1", None).await.unwrap();
+        upsert_heartbeat(&pool, "pk2", Some("addr_b")).await.unwrap();
+        let hb = get_heartbeat(&pool, "pk1").await.unwrap();
+        assert!(hb.is_some());
+        let hb2 = get_heartbeat(&pool, "pk2").await.unwrap();
+        assert_eq!(hb2.unwrap().1.as_deref(), Some("addr_b"));
     }
 }
