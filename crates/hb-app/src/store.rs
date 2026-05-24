@@ -24,7 +24,7 @@ use hb_core::{StoredKeypair, SignedEnvelope};
 // Generic helpers
 // ---------------------------------------------------------------------------
 
-fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
+fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -89,7 +89,12 @@ impl DataStore {
     // -- Paths ---------------------------------------------------------------
 
     pub fn keypair_path(&self) -> PathBuf {
-        self.base.join("identity").join("keypair.json")
+        // .bin on Windows (DPAPI-encrypted opaque blob), .json on Linux (plain chmod 600).
+        #[cfg(target_os = "windows")]
+        let filename = "keypair.bin";
+        #[cfg(not(target_os = "windows"))]
+        let filename = "keypair.json";
+        self.base.join("identity").join(filename)
     }
 
     pub fn profile_signed_path(&self) -> PathBuf {
@@ -119,12 +124,67 @@ impl DataStore {
     // -- Identity ------------------------------------------------------------
 
     pub fn save_keypair(&self, kp: &StoredKeypair) -> Result<()> {
-        write_json(&self.keypair_path(), kp)
-            .context("saving keypair")
+        let path = self.keypair_path();
+        if let Some(parent) = path.parent() {
+            // Mode 0700 on Linux so the identity dir is accessible only to the owner.
+            #[cfg(not(target_os = "windows"))]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)
+                    .ok(); // already-exists is fine
+            }
+            #[cfg(target_os = "windows")]
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        let json = serde_json::to_string_pretty(kp)?;
+
+        #[cfg(target_os = "windows")]
+        {
+            let encrypted = hb_dpapi::encrypt(json.as_bytes())
+                .context("DPAPI encryption failed")?;
+            std::fs::write(&path, encrypted)?;
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let first_write = !path.exists();
+            std::fs::write(&path, json.as_bytes())?;
+            // Restrict to owner read/write only.
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            if first_write {
+                tracing::warn!(
+                    "Private key stored as a plain file at {:?}. Keep your home directory secure.",
+                    path
+                );
+            }
+        }
+
+        Ok(())
     }
 
     pub fn load_keypair(&self) -> Result<Option<StoredKeypair>> {
-        read_json(&self.keypair_path()).context("loading keypair")
+        let path = self.keypair_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path).context("reading keypair file")?;
+
+        #[cfg(target_os = "windows")]
+        let json_bytes = hb_dpapi::decrypt(&bytes).context("DPAPI decryption failed")?;
+
+        #[cfg(not(target_os = "windows"))]
+        let json_bytes = bytes;
+
+        Ok(Some(serde_json::from_slice(&json_bytes).context("parsing keypair")?))
     }
 
     // -- Profile -------------------------------------------------------------
@@ -342,5 +402,63 @@ impl CachedPeer {
         use sha2::{Digest, Sha256};
         let hash = Sha256::digest(hb_id.as_bytes());
         hex::encode(&hash[..8])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group — local-only contact grouping (not signed, not shared)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Group {
+    pub name: String,
+    pub pubkeys: Vec<String>,
+}
+
+impl DataStore {
+    pub fn groups_path(&self) -> PathBuf {
+        self.base.join("groups.json")
+    }
+
+    pub fn load_groups(&self) -> Result<Vec<Group>> {
+        Ok(read_json_lenient::<Vec<Group>>(&self.groups_path())
+            .context("loading groups")?
+            .unwrap_or_default())
+    }
+
+    pub fn save_groups(&self, groups: &[Group]) -> Result<()> {
+        write_json(&self.groups_path(), groups).context("saving groups")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Watch — saved tag/content-type query (local-only)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Watch {
+    pub name: String,
+    pub tags: Vec<String>,
+    pub content_types: Vec<String>,
+    #[serde(default)]
+    pub last_fired: Option<chrono::DateTime<chrono::Utc>>,
+    /// hb_ids already notified — prevents re-firing for the same peer.
+    #[serde(default)]
+    pub seen_pubkeys: Vec<String>,
+}
+
+impl DataStore {
+    pub fn watches_path(&self) -> PathBuf {
+        self.base.join("watches.json")
+    }
+
+    pub fn load_watches(&self) -> Result<Vec<Watch>> {
+        Ok(read_json_lenient::<Vec<Watch>>(&self.watches_path())
+            .context("loading watches")?
+            .unwrap_or_default())
+    }
+
+    pub fn save_watches(&self, watches: &[Watch]) -> Result<()> {
+        write_json(&self.watches_path(), watches).context("saving watches")
     }
 }
