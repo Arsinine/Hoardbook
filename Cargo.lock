@@ -2179,6 +2179,7 @@ dependencies = [
  "chrono",
  "globset",
  "hb-core",
+ "hb-dpapi",
  "hex",
  "iroh",
  "reqwest 0.12.28",
@@ -2215,6 +2216,14 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "x25519-dalek",
+]
+
+[[package]]
+name = "hb-dpapi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

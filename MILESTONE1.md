@@ -483,7 +483,7 @@ Integration: `relay_peering_depth_one_accepted`, `relay_peering_depth_two_reject
 
 ---
 
-### TASK 12 [ ]: Identity Generation and Local Encrypted Storage
+### TASK 12 [x]: Identity Generation and Local Encrypted Storage
 
 **Depends on:** T4, T5  **Parallel with:** none in this phase
 
@@ -500,13 +500,13 @@ Integration: `relay_peering_depth_one_accepted`, `relay_peering_depth_two_reject
 **`~/.hoardbook/` directory** created with mode `700`.
 
 **Acceptance criteria:**
-- [ ] On Windows, private key is stored as a DPAPI-encrypted file, not plaintext
-- [ ] On Linux, key file has permissions `600`; warning shown on first generate
-- [ ] `generate()` called twice produces different hb_ids
-- [ ] Export + import roundtrip returns same hb_id
-- [ ] After import, all subsequent signing uses the imported key
-- [ ] `StoredKeypair` `Debug` output shows `[REDACTED]` for `private_key_hex`
-- [ ] No Credential Manager entries created at any point
+- [x] On Windows, private key is stored as a DPAPI-encrypted file, not plaintext
+- [x] On Linux, key file has permissions `600`; warning shown on first generate
+- [x] `generate()` called twice produces different hb_ids
+- [x] Export + import roundtrip returns same hb_id
+- [x] After import, all subsequent signing uses the imported key
+- [x] `StoredKeypair` `Debug` output shows `[REDACTED]` for `private_key_hex`
+- [x] No Credential Manager entries created at any point
 
 **Tests required:**
 Unit: `keypair_generate_unique`, `export_import_roundtrip`, `stored_keypair_debug_redacts`

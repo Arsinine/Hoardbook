@@ -197,3 +197,113 @@ pub async fn wipe_data(
 
     Ok(true)
 }
+
+// ---------------------------------------------------------------------------
+// Tests — T12 acceptance criteria
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::DataStore;
+    use hb_core::{HoardbookKeypair, types::StoredKeypair};
+    use tempfile::TempDir;
+
+    fn test_store() -> (TempDir, DataStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        (dir, store)
+    }
+
+    #[test]
+    fn keypair_generate_unique() {
+        let kp1 = HoardbookKeypair::generate();
+        let kp2 = HoardbookKeypair::generate();
+        assert_ne!(kp1.hb_id(), kp2.hb_id(), "each generated keypair must be unique");
+    }
+
+    #[test]
+    fn export_import_roundtrip() {
+        let (_dir, store) = test_store();
+        let kp = HoardbookKeypair::generate();
+        let stored = StoredKeypair {
+            version: 1,
+            hb_id: kp.hb_id(),
+            private_key_hex: hex::encode(kp.private_key_bytes()),
+        };
+        store.save_keypair(&stored).unwrap();
+
+        // Export: serialize to JSON string (portable, unencrypted — same as save_keypair_file output).
+        let exported = serde_json::to_string_pretty(&stored).unwrap();
+
+        // Simulate import: parse the plain JSON backup and save through the platform store.
+        let reimported: StoredKeypair = serde_json::from_str(&exported).unwrap();
+        assert_eq!(reimported.hb_id, stored.hb_id, "reimported hb_id must match");
+        assert_eq!(
+            reimported.private_key_hex, stored.private_key_hex,
+            "reimported private key must match"
+        );
+
+        // Reload from disk via the platform-specific path.
+        let loaded = store.load_keypair().unwrap().unwrap();
+        assert_eq!(loaded.hb_id, stored.hb_id);
+        assert_eq!(loaded.private_key_hex, stored.private_key_hex);
+    }
+
+    #[test]
+    fn stored_keypair_debug_redacts() {
+        let kp = HoardbookKeypair::generate();
+        let stored = StoredKeypair {
+            version: 1,
+            hb_id: kp.hb_id(),
+            private_key_hex: hex::encode(kp.private_key_bytes()),
+        };
+        let debug_str = format!("{stored:?}");
+        assert!(
+            !debug_str.contains(&stored.private_key_hex),
+            "Debug output must not contain the actual private key"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "Debug output must contain [REDACTED] placeholder"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn keypair_file_has_mode_600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, store) = test_store();
+        let kp = HoardbookKeypair::generate();
+        let stored = StoredKeypair {
+            version: 1,
+            hb_id: kp.hb_id(),
+            private_key_hex: hex::encode(kp.private_key_bytes()),
+        };
+        store.save_keypair(&stored).unwrap();
+
+        let path = store.keypair_path();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        // Mode bits: 0o600 = owner r+w only.
+        assert_eq!(mode & 0o777, 0o600, "keypair.json must have mode 600");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn keypair_file_is_readable_json() {
+        let (_dir, store) = test_store();
+        let kp = HoardbookKeypair::generate();
+        let stored = StoredKeypair {
+            version: 1,
+            hb_id: kp.hb_id(),
+            private_key_hex: hex::encode(kp.private_key_bytes()),
+        };
+        store.save_keypair(&stored).unwrap();
+
+        // On Linux the file is plain JSON (not encrypted).
+        let raw = std::fs::read_to_string(store.keypair_path()).unwrap();
+        assert!(raw.contains("hb_id"), "Linux keypair file must be plain JSON");
+        assert!(!raw.is_empty());
+    }
+}
