@@ -593,19 +593,19 @@ E2E: save profile → connect from second instance via iroh → profile data mat
 
 ---
 
-### TASK 15 [ ]: Collection Add, Scan, and Draft
+### TASK 15 [x]: Collection Add, Scan, and Draft
 
 **Depends on:** T12, T5  **Parallel with:** T14
 
 **Scope:** Tauri command `collection_add(local_path, path_alias, description?, depth, exclude_patterns, content_types, tags) → Result<String>`. Walk filesystem up to `depth`, apply glob exclusions, build `Vec<DirectoryItem>` (no `sha256` field). Write draft to `~/.hoardbook/collections/<slug>.draft.json`. At least one content type required to enable publish — enforced at the command layer. Per-item notes: `DirectoryItem.note`, editable post-scan. Preview mode renders draft as visitors see it. `collection_regenerate_snapshot` re-scans and preserves per-item notes. Spec §Collection Manager.
 
 **Acceptance criteria:**
-- [ ] 1,000-file directory scans in under 5 seconds
-- [ ] Exclude patterns remove matching items
-- [ ] Depth limit respected
-- [ ] At least one content type required before publish is enabled
-- [ ] Per-item notes survive regenerate
-- [ ] No `sha256` field in any `DirectoryItem` in the draft JSON
+- [x] 1,000-file directory scans in under 5 seconds
+- [x] Exclude patterns remove matching items
+- [x] Depth limit respected
+- [x] At least one content type required before publish is enabled
+- [x] Per-item notes survive regenerate
+- [x] No `sha256` field in any `DirectoryItem` in the draft JSON
 
 **Tests required:**
 Unit: `depth_limit_enforced`, `exclude_glob_applied`, `item_count_accurate`, `regenerate_preserves_notes`, `no_sha256_in_draft`

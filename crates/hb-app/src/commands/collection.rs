@@ -47,7 +47,7 @@ pub async fn scan_directory(
     let item_count = count_items(&listing);
     let est_size = if total_bytes > 0 { Some(format_size(total_bytes)) } else { None };
 
-    let collection = Collection {
+    let mut collection = Collection {
         slug,
         path_alias: opts.path_alias,
         description: None,
@@ -59,6 +59,12 @@ pub async fn scan_directory(
         last_updated: chrono::Utc::now(),
         listing,
     };
+
+    // Preserve per-item notes from the existing draft (rescan scenario).
+    if let Ok(Some(prev)) = store.load_collection_draft(&collection.slug) {
+        let notes = collect_notes(&prev.listing);
+        collection.listing = apply_notes(collection.listing, &notes);
+    }
 
     store.save_collection_draft(&collection).map_err(cmd_err)?;
 
@@ -158,6 +164,10 @@ pub async fn publish_collection(
 
     let bytes = std::fs::read(&draft_path).map_err(cmd_err)?;
     let collection: Collection = serde_json::from_slice(&bytes).map_err(cmd_err)?;
+
+    if collection.content_types.is_empty() {
+        return Err("At least one content type is required before publishing a collection.".into());
+    }
 
     let envelope = SignedEnvelope::create(kp, DocType::Collection, &collection).map_err(cmd_err)?;
     store.save_collection_signed(safe_slug, &envelope).map_err(cmd_err)?;
@@ -354,6 +364,32 @@ fn count_items(items: &[DirectoryItem]) -> u64 {
     items.iter().fold(0, |acc, item| acc + 1 + count_items(&item.children))
 }
 
+/// Build a flat name→note map from an existing listing (for note preservation across rescans).
+fn collect_notes(items: &[DirectoryItem]) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for item in items {
+        if let Some(note) = &item.note {
+            map.insert(item.name.clone(), note.clone());
+        }
+        map.extend(collect_notes(&item.children));
+    }
+    map
+}
+
+/// Apply previously collected notes to a freshly scanned listing.
+fn apply_notes(
+    mut items: Vec<DirectoryItem>,
+    notes: &std::collections::HashMap<String, String>,
+) -> Vec<DirectoryItem> {
+    for item in &mut items {
+        if let Some(note) = notes.get(&item.name) {
+            item.note = Some(note.clone());
+        }
+        item.children = apply_notes(std::mem::take(&mut item.children), notes);
+    }
+    items
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -406,4 +442,100 @@ mod tests {
         assert_eq!(format_size(10 * 1_073_741_824), "10.0 GB");
     }
 
+    // ── T15 acceptance tests ─────────────────────────────────────────────────
+
+    fn make_dir_tree(root: &std::path::Path) {
+        // level1/level2/level3/deep.txt  (3 levels under root)
+        let deep = root.join("level1").join("level2").join("level3");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("deep.txt"), b"x").unwrap();
+        std::fs::write(root.join("level1").join("level2").join("mid.txt"), b"x").unwrap();
+        std::fs::write(root.join("level1").join("top.txt"), b"x").unwrap();
+        std::fs::write(root.join("root.txt"), b"x").unwrap();
+    }
+
+    #[test]
+    fn depth_limit_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        make_dir_tree(dir.path());
+
+        // depth=3: root(0) → level1(1) → level2(2) → level3 NOT recursed (2+1 < 3 is false).
+        let (items, _) = scan_recursive(dir.path(), 3, 0, &[]).unwrap();
+        let json = serde_json::to_string(&items).unwrap();
+        assert!(json.contains("top.txt"), "level1 files must be present");
+        assert!(json.contains("mid.txt"), "level2 files must be present");
+        assert!(!json.contains("deep.txt"), "level3 files must be absent at depth=3");
+
+        // depth=10: all levels included.
+        let (items_full, _) = scan_recursive(dir.path(), 10, 0, &[]).unwrap();
+        let json_full = serde_json::to_string(&items_full).unwrap();
+        assert!(json_full.contains("deep.txt"), "full depth must include level3");
+    }
+
+    #[test]
+    fn exclude_glob_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("movie.mkv"), b"x").unwrap();
+        std::fs::write(dir.path().join("movie.nfo"), b"x").unwrap();
+        std::fs::write(dir.path().join("readme.txt"), b"x").unwrap();
+
+        let (items, _) = scan_recursive(dir.path(), 1, 0, &["*.nfo".to_string()]).unwrap();
+        let names: Vec<_> = items.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains(&"movie.mkv"));
+        assert!(names.contains(&"readme.txt"));
+        assert!(!names.contains(&"movie.nfo"), "*.nfo must be excluded");
+    }
+
+    #[test]
+    fn item_count_accurate() {
+        let dir = tempfile::tempdir().unwrap();
+        make_dir_tree(dir.path()); // root.txt + level1/(top.txt + level2/(mid.txt + level3/(deep.txt)))
+        let (items, _) = scan_recursive(dir.path(), 10, 0, &[]).unwrap();
+        let total = count_items(&items);
+        // Items: root.txt, level1(dir), top.txt, level2(dir), mid.txt, level3(dir), deep.txt = 7
+        assert_eq!(total, 7, "expected 7 items (4 files + 3 dirs), got {total}");
+    }
+
+    #[test]
+    fn regenerate_preserves_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("film.mkv"), b"x").unwrap();
+        std::fs::write(dir.path().join("extra.txt"), b"x").unwrap();
+
+        // First scan — simulate a note added to film.mkv.
+        let (mut items, _) = scan_recursive(dir.path(), 1, 0, &[]).unwrap();
+        for item in &mut items {
+            if item.name == "film.mkv" {
+                item.note = Some("Director's cut".into());
+            }
+        }
+
+        // Second scan — fresh, no notes yet.
+        let (new_items, _) = scan_recursive(dir.path(), 1, 0, &[]).unwrap();
+        assert!(new_items.iter().all(|i| i.note.is_none()), "fresh scan has no notes");
+
+        // Apply preserved notes.
+        let notes = collect_notes(&items);
+        let merged = apply_notes(new_items, &notes);
+        let film = merged.iter().find(|i| i.name == "film.mkv").unwrap();
+        assert_eq!(film.note.as_deref(), Some("Director's cut"));
+        let extra = merged.iter().find(|i| i.name == "extra.txt").unwrap();
+        assert!(extra.note.is_none(), "note-less item stays note-less");
+    }
+
+    #[test]
+    fn no_sha256_in_draft() {
+        let item = DirectoryItem {
+            name: "film.mkv".into(),
+            item_type: ItemType::File,
+            size: Some("14.2 GB".into()),
+            format: Some("MKV".into()),
+            year: None,
+            tags: vec![],
+            note: None,
+            children: vec![],
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(!json.contains("sha256"), "DirectoryItem must not expose sha256: {json}");
+    }
 }
