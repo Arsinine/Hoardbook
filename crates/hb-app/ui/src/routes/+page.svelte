@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { saveProfile, publishProfile, publishCollection, deleteCollection, updateCollectionMeta, getShareSettings, generateKeypair, saveSettings, hasPublishedProfile } from '$lib/api.js';
+	import { saveProfile, publishProfile, publishCollection, deleteCollection, updateCollectionMeta, exportCollection, getShareSettings, generateKeypair, hasPublishedProfile, saveKeypairFile, importKeypair } from '$lib/api.js';
+	import { save as saveDialog, open as openDialog } from '@tauri-apps/plugin-dialog';
 	import { profile, collections, identity, toast, appReady, homeDraft } from '$lib/stores.js';
 	import { onMount } from 'svelte';
 	import { icons, socialIcons, avatarHue } from '$lib/icons.js';
@@ -7,7 +8,7 @@
 	import ScanDialog from '$lib/components/ScanDialog.svelte';
 	import ShareSettingsDialog from '$lib/components/ShareSettingsDialog.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
-	import type { Collection, Profile, SocialLink } from '$lib/types.js';
+	import type { Collection, Profile } from '$lib/types.js';
 
 	const LANGUAGES = [
 		'Afrikaans','Albanian','Arabic','Armenian','Azerbaijani','Basque','Belarusian',
@@ -25,13 +26,15 @@
 		: [];
 
 	// ── Onboarding state ────────────────────────────────────────────────────────
-	// 0=loading (waiting for appReady), 1=keypair, 2=name, 3=done
+	// 0=loading, 1=keypair, 2=name, 3=collection (skippable), 4=done
 	let obStep = 0;
 	let obGenerating = false;
+	let obKeypairRevealed = false; // true after generation: show hb_id + export options
+	let quratOverlayOpen = false;  // privacy overlay before Qurator import
 
 	$: if ($appReady && obStep === 0) {
-		if ($identity && $profile?.display_name) obStep = 3;
-		else if ($identity) obStep = 2;
+		if ($identity && $profile?.display_name) obStep = 4;
+		else if ($identity) { obKeypairRevealed = true; obStep = 1; }
 		else obStep = 1;
 	}
 
@@ -40,13 +43,41 @@
 		try {
 			const info = await generateKeypair();
 			identity.set(info);
-			obStep = 2;
+			obKeypairRevealed = true; // stay on step 1 to show hb_id + export options
 		} catch (e) { toast(String(e), 'error'); }
 		finally { obGenerating = false; }
 	}
 
+	async function obExportBackup() {
+		const path = await saveDialog({
+			defaultPath: 'hoardbook-keypair-backup.json',
+			filters: [{ name: 'JSON backup', extensions: ['json'] }],
+		});
+		if (path) {
+			try {
+				await saveKeypairFile(path);
+				toast('Backup saved', 'success');
+			} catch (e) { toast(String(e), 'error'); }
+		}
+		obStep = 2;
+	}
+
+	async function obImportFromQurator() {
+		quratOverlayOpen = false;
+		const path = await openDialog({
+			filters: [{ name: 'JSON keypair', extensions: ['json'] }],
+		});
+		if (path) {
+			try {
+				const info = await importKeypair(path as string);
+				identity.set(info);
+				obKeypairRevealed = true;
+			} catch (e) { toast(String(e), 'error'); }
+		}
+	}
+
 	async function obSaveName() {
-		if (!form.display_name.trim()) return;
+		if (!form.display_name.trim()) { obStep = 3; return; }
 		saving = true;
 		try {
 			form.updated = new Date().toISOString();
@@ -98,6 +129,35 @@
 	let shareSlug = '';
 	let shareOpen = false;
 	let langInput = '';
+	let tagInput = '';
+	let willingInput = '';
+
+	const WILLING_OPTIONS = ['seed', 'trade', 'upload', 'request', 'lend'];
+
+	function addTag(raw: string) {
+		const t = raw.trim().replace(/,$/, '').toLowerCase();
+		if (t && !form.tags.includes(t)) form.tags = [...form.tags, t];
+		tagInput = '';
+	}
+
+	function handleTagKey(e: KeyboardEvent) {
+		if (e.key === 'Enter' || e.key === ',') {
+			e.preventDefault();
+			addTag(tagInput);
+		} else if (e.key === 'Backspace' && !tagInput && form.tags.length > 0) {
+			form.tags = form.tags.slice(0, -1);
+		}
+	}
+
+	function removeTag(i: number) { form.tags = form.tags.filter((_, idx) => idx !== i); }
+
+	function toggleWilling(opt: string) {
+		if (form.willing_to.includes(opt)) {
+			form.willing_to = form.willing_to.filter(w => w !== opt);
+		} else {
+			form.willing_to = [...form.willing_to, opt];
+		}
+	}
 
 	const SOCIAL_PLATFORMS = [
 		{ value: 'reddit',   label: 'Reddit',   abbr: 'r/' },
@@ -123,6 +183,8 @@
 		email: undefined,
 		location: undefined,
 		social_links: [],
+		willing_to: [],
+		content_types: [],
 		updated: new Date().toISOString(),
 	};
 
@@ -215,12 +277,12 @@
 		if (!(c.slug in colSorted)) colSorted[c.slug] = c.sorted ?? false;
 	});
 
-	async function saveColMeta(col: import('$lib/types.js').Collection) {
+	async function saveColMeta(col: Collection) {
 		const slug = col.slug;
 		const desc = (colNotes[slug] ?? '').trim() || undefined;
 		const sorted = colSorted[slug] ?? false;
 		try {
-			await updateCollectionMeta(slug, desc, col.content_type, col.languages ?? [], sorted);
+			await updateCollectionMeta(slug, desc, col.content_types, col.tags ?? [], col.languages ?? [], sorted);
 			collections.update(cols => cols.map(c =>
 				c.slug === slug ? { ...c, description: desc, sorted } : c
 			));
@@ -237,7 +299,7 @@
 		const newLangs = [...langs, lang];
 		colLangInputs[slug] = '';
 		try {
-			await updateCollectionMeta(slug, col.description, col.content_type, newLangs, colSorted[slug] ?? false);
+			await updateCollectionMeta(slug, col.description, col.content_types, col.tags ?? [], newLangs, colSorted[slug] ?? false);
 			collections.update(cols => cols.map(c => c.slug === slug ? { ...c, languages: newLangs } : c));
 		} catch (e) { toast(String(e), 'error'); }
 	}
@@ -247,7 +309,7 @@
 		if (!col) return;
 		const newLangs = (col.languages ?? []).filter(l => l !== lang);
 		try {
-			await updateCollectionMeta(slug, col.description, col.content_type, newLangs, colSorted[slug] ?? false);
+			await updateCollectionMeta(slug, col.description, col.content_types, col.tags ?? [], newLangs, colSorted[slug] ?? false);
 			collections.update(cols => cols.map(c => c.slug === slug ? { ...c, languages: newLangs } : c));
 		} catch (e) { toast(String(e), 'error'); }
 	}
@@ -288,7 +350,7 @@
 		scanOpen = true;
 	}
 
-	async function openRescan(col: import('$lib/types.js').Collection) {
+	async function openRescan(col: Collection) {
 		scanTitle = 'Rescan collection';
 		scanInitialAlias = col.path_alias;
 		try {
@@ -328,13 +390,24 @@
 	function removeLang(i: number) {
 		form.languages = form.languages.filter((_, idx) => idx !== i);
 	}
+
+	let exportMenuSlug: string | null = null;
+
+	async function handleExport(slug: string, format: 'text' | 'markdown') {
+		exportMenuSlug = null;
+		try {
+			const text = await exportCollection(slug, format);
+			await navigator.clipboard.writeText(text);
+			toast('Copied to clipboard');
+		} catch (e) { toast(String(e), 'error'); }
+	}
 </script>
 
 {#if obStep === 0}
 	<div class="loading-screen">
 		<div class="loading-logo">H</div>
 	</div>
-{:else if obStep < 3}
+{:else if obStep < 4}
 	<!-- Onboarding flow -->
 	<div class="onboarding">
 		<div class="ob-logo">H</div>
@@ -344,38 +417,96 @@
 		</div>
 		<div class="ob-card">
 			<div class="ob-card-head">
-				<span class="sect-label">Step {obStep} of 2</span>
+				<span class="sect-label">Step {obStep} of 3</span>
 				<div class="ob-dots">
 					<div class="ob-dot" class:ob-dot-active={obStep === 1} class:ob-dot-done={obStep > 1} />
 					<div class="ob-dot" class:ob-dot-active={obStep === 2} class:ob-dot-done={obStep > 2} />
+					<div class="ob-dot" class:ob-dot-active={obStep === 3} class:ob-dot-done={obStep > 3} />
 				</div>
 			</div>
 
 			{#if obStep === 1}
-				<div class="ob-card-title">Create your identity</div>
-				<div class="ob-card-sub">Hoardbook uses a local Ed25519 keypair as your identity. No email, no server account.</div>
-				<div class="ob-notice">
-					<span class="ob-notice-icon">{@html icons.shield}</span>
-					<div class="ob-notice-text">Your private key is stored locally and never transmitted. Back it up somewhere safe.</div>
-				</div>
-				<button class="btn-primary btn-full" on:click={obGenerateKeypair} disabled={obGenerating}>
-					{obGenerating ? 'Generating…' : 'Generate keypair'}
-				</button>
+				{#if !obKeypairRevealed}
+					<div class="ob-card-title">Create your identity</div>
+					<div class="ob-card-sub">Hoardbook uses a local Ed25519 keypair as your identity. No email, no server account.</div>
+					<div class="ob-notice">
+						<span class="ob-notice-icon">{@html icons.shield}</span>
+						<div class="ob-notice-text">Your private key is stored locally and never transmitted. Back it up somewhere safe.</div>
+					</div>
+					<button class="btn-primary btn-full" on:click={obGenerateKeypair} disabled={obGenerating}>
+						{obGenerating ? 'Generating…' : 'Generate keypair'}
+					</button>
+					<button class="btn-ghost btn-full ob-skip" style="margin-top:8px" on:click={() => { quratOverlayOpen = true; }}>
+						Import from Qurator
+					</button>
+				{:else}
+					<div class="ob-card-title">Your identity is ready</div>
+					<div class="ob-card-sub">This is your Hoardbook ID. Share it so others can find and connect with you.</div>
+					<div class="ob-hbid-row">
+						<span class="ob-hbid mono">{$identity?.hb_id ?? ''}</span>
+						<button class="btn-ghost btn-sm" on:click={() => { navigator.clipboard.writeText($identity?.hb_id ?? ''); toast('Copied', 'success'); }}>Copy</button>
+					</div>
+					<div class="ob-notice" style="margin-top:12px">
+						<span class="ob-notice-icon">{@html icons.shield}</span>
+						<div class="ob-notice-text">Back up your private key now. Without it, your identity cannot be recovered.</div>
+					</div>
+					<button class="btn-primary btn-full" on:click={obExportBackup}>
+						Export backup file
+					</button>
+					<button class="btn-ghost btn-full ob-skip" on:click={() => obStep = 2}>
+						I'll do it later
+					</button>
+				{/if}
 			{:else if obStep === 2}
 				<div class="ob-card-title">Name yourself</div>
-				<div class="ob-card-sub">Pick a display name. This is what others see when they look you up. You can add more profile details later.</div>
+				<div class="ob-card-sub">Pick a display name. All fields are optional — you can fill them in later from the profile page.</div>
 				<div class="field" style="margin-bottom:16px">
-					<label class="field-label" for="ob-name">Display name <span class="accent-dot">•</span></label>
+					<label class="field-label" for="ob-name">Display name</label>
 					<input id="ob-name" class="hb-input" type="text" placeholder="e.g. DataHoarder_42"
 						bind:value={form.display_name}
 						on:keydown={(e) => e.key === 'Enter' && obSaveName()} />
 				</div>
-				<button class="btn-primary btn-full" on:click={obSaveName} disabled={!form.display_name.trim() || saving}>
-					{saving ? 'Saving…' : 'Get started →'}
+				<button class="btn-primary btn-full" on:click={obSaveName} disabled={saving}>
+					{saving ? 'Saving…' : form.display_name.trim() ? 'Continue →' : 'Skip'}
+				</button>
+				<button class="btn-ghost btn-full ob-skip" on:click={() => obStep = 3}>
+					Skip
+				</button>
+			{:else if obStep === 3}
+				<div class="ob-card-title">Add your first collection</div>
+				<div class="ob-card-sub">Point Hoardbook at a folder to catalog what you keep. You can scan more folders later from the home screen.</div>
+				<button class="btn-primary btn-full" on:click={() => { scanTitle = 'Add collection'; scanInitialPath = ''; scanInitialAlias = ''; scanOpen = true; obStep = 4; }}>
+					{@html icons.folder} Scan a folder
+				</button>
+				<button class="btn-ghost btn-full ob-skip" on:click={() => obStep = 4}>
+					Skip for now
 				</button>
 			{/if}
 		</div>
 	</div>
+
+	{#if quratOverlayOpen}
+		<div class="ob-overlay" on:click|self={() => quratOverlayOpen = false}>
+			<div class="ob-overlay-card">
+				<div class="ob-card-title">Import from Qurator</div>
+				<div class="ob-card-sub" style="margin-bottom:16px">
+					<strong>Privacy notice:</strong> Your keypair backup file contains your private key in plain JSON.
+					Import it only from a file you exported yourself. Hoardbook will re-encrypt it locally —
+					the file itself will not be modified. Your private key is never sent to any server.
+				</div>
+				<div class="ob-notice">
+					<span class="ob-notice-icon">{@html icons.shield}</span>
+					<div class="ob-notice-text">Only import a backup file from a source you trust. A compromised key cannot be revoked.</div>
+				</div>
+				<button class="btn-primary btn-full" on:click={obImportFromQurator}>
+					I understand — choose file
+				</button>
+				<button class="btn-ghost btn-full ob-skip" on:click={() => quratOverlayOpen = false}>
+					Cancel
+				</button>
+			</div>
+		</div>
+	{/if}
 {:else}
 	<!-- TopBar -->
 	<div class="topbar">
@@ -432,7 +563,7 @@
 					<!-- svelte-ignore a11y-no-static-element-interactions -->
 					<div class="lang-wrap-outer">
 						<div class="tag-wrap" on:click={(e) => { if (e.target === e.currentTarget) e.currentTarget.querySelector('input')?.focus(); }}>
-							{#each form.languages as lang, i}
+							{#each form.languages as lang, i (lang)}
 								<span class="lang-tag">
 									{lang}
 									<button class="lang-x" on:click={() => removeLang(i)} title="Remove">×</button>
@@ -448,7 +579,7 @@
 						</div>
 						{#if langSuggestions.length > 0}
 							<div class="lang-suggestions">
-								{#each langSuggestions.slice(0, 5) as s}
+								{#each langSuggestions.slice(0, 5) as s (s)}
 									<!-- svelte-ignore a11y-click-events-have-key-events -->
 									<div class="lang-suggestion" on:click={() => addLang(s)} role="option" aria-selected="false">{s}</div>
 								{/each}
@@ -469,7 +600,7 @@
 
 				<div class="field">
 					<div class="social-icons-row">
-						{#each SOCIAL_PLATFORMS as p}
+						{#each SOCIAL_PLATFORMS as p (p.value)}
 							{@const link = form.social_links.find(l => l.platform === p.value)}
 							<button
 								class="social-icon-btn"
@@ -501,6 +632,41 @@
 						</div>
 					{/if}
 				</div>
+
+				<div class="field">
+					<label class="field-label">Tags</label>
+					<div class="tag-wrap">
+						{#each form.tags as tag, i (tag)}
+							<span class="lang-tag">{tag}<button class="lang-x" on:click={() => removeTag(i)} title="Remove">×</button></span>
+						{/each}
+						<input class="lang-input" type="text" placeholder="anime, scifi, docs…"
+							bind:value={tagInput} on:keydown={handleTagKey} />
+					</div>
+				</div>
+
+				<div class="field">
+					<label class="field-label">Willing to</label>
+					<div class="willing-row">
+						{#each WILLING_OPTIONS as opt (opt)}
+							<button class="willing-btn" class:willing-active={form.willing_to.includes(opt)}
+								on:click={() => toggleWilling(opt)}>
+								{opt}
+							</button>
+						{/each}
+					</div>
+				</div>
+
+				{#if form.content_types.length > 0}
+					<div class="field">
+						<span class="field-label">Content types (auto)</span>
+						<div class="badge-row-sm">
+							{#each form.content_types as ct (ct)}
+								<span class="ct-badge">{ct}</span>
+							{/each}
+						</div>
+						<div class="field-hint">Auto-computed from your published collections.</div>
+					</div>
+				{/if}
 			</div>
 		</div>
 
@@ -536,11 +702,11 @@
 				{#if $collections.length === 0}
 					<div class="empty">No collections yet. Click "Add collection" to scan a directory.</div>
 				{:else}
-					{#each $collections as col}
+					{#each $collections as col (col.slug)}
 						<CollectionPanel collection={col}>
 							<!-- Language tags -->
 							<div class="coll-lang-row">
-								{#each (col.languages ?? []) as lang}
+								{#each (col.languages ?? []) as lang (lang)}
 									<span class="lang-tag">
 										{lang}
 										<button class="lang-x" on:click={() => removeColLang(col.slug, lang)} title="Remove">×</button>
@@ -583,6 +749,15 @@
 									<span class="draft-badge">Draft</span>
 								{/if}
 								<button class="btn-ghost btn-sm" on:click={() => openRescan(col)}>Rescan</button>
+								<div class="export-wrap">
+									<button class="btn-ghost btn-sm" on:click={() => exportMenuSlug = exportMenuSlug === col.slug ? null : col.slug}>Export ▾</button>
+									{#if exportMenuSlug === col.slug}
+										<div class="export-menu">
+											<button class="export-item" on:click={() => handleExport(col.slug, 'text')}>Plain text</button>
+											<button class="export-item" on:click={() => handleExport(col.slug, 'markdown')}>Markdown checklist</button>
+										</div>
+									{/if}
+								</div>
 								<button class="btn-ghost btn-sm" on:click={() => openShare(col.slug)}>Share</button>
 								<button class="btn-ghost btn-sm" on:click={() => handlePublishCollection(col.slug)}>Publish</button>
 								<button class="btn-ghost btn-sm btn-danger-ghost" on:click={() => handleDeleteCollection(col.slug)}>Remove</button>
@@ -669,6 +844,49 @@
 	}
 	.ob-dot-active { background: var(--accent); border-color: var(--accent); }
 	.ob-dot-done { background: color-mix(in oklch, var(--accent) 40%, transparent); border-color: var(--accent); }
+
+	/* HB-ID display row in step 1 post-generate */
+	.ob-hbid-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		background: var(--bg-elev2);
+		border: 1px solid var(--border);
+		border-radius: 7px;
+		padding: 8px 10px;
+		margin-bottom: 12px;
+	}
+
+	.ob-hbid {
+		flex: 1;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--fg);
+		word-break: break-all;
+		line-height: 1.5;
+	}
+
+	/* Qurator import privacy overlay */
+	.ob-overlay {
+		position: fixed;
+		inset: 0;
+		background: oklch(0 0 0 / 0.55);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		z-index: 200;
+		backdrop-filter: blur(3px);
+	}
+
+	.ob-overlay-card {
+		width: 400px;
+		max-width: calc(100vw - 40px);
+		background: var(--bg-elev1);
+		border: 1px solid var(--border);
+		border-radius: 10px;
+		padding: 22px;
+		box-shadow: 0 24px 60px oklch(0 0 0 / 0.4);
+	}
 
 	/* Social links — icon row */
 	.social-icons-row {
@@ -925,6 +1143,28 @@
 		flex-shrink: 0;
 	}
 
+	.export-wrap { position: relative; }
+
+	.export-menu {
+		position: absolute;
+		top: calc(100% + 4px);
+		left: 0;
+		background: var(--bg-elev2);
+		border: 1px solid var(--border);
+		border-radius: 7px;
+		overflow: hidden;
+		z-index: 50;
+		box-shadow: 0 8px 24px oklch(0 0 0 / 0.25);
+		min-width: 160px;
+	}
+
+	.export-item {
+		display: block; width: 100%; text-align: left;
+		padding: 7px 12px; font-size: 12.5px; font-family: var(--font-ui);
+		background: transparent; border: none; cursor: pointer; color: var(--fg);
+	}
+	.export-item:hover { background: var(--bg-elev3); }
+
 	.empty { color: var(--fg-dim); font-size: 12.5px; text-align: center; padding: 32px 0; }
 
 	/* Shared */
@@ -1054,6 +1294,42 @@
 		resize: vertical;
 	}
 
+	.willing-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+
+	.willing-btn {
+		font-size: 11.5px;
+		padding: 4px 10px;
+		border-radius: 5px;
+		border: 1px solid var(--border);
+		background: var(--bg-elev2);
+		color: var(--fg-muted);
+		cursor: pointer;
+		font-family: inherit;
+		transition: background 0.1s, color 0.1s, border-color 0.1s;
+	}
+
+	.willing-btn:hover { background: var(--bg-elev3); }
+
+	.willing-active {
+		background: color-mix(in oklch, var(--accent) 14%, transparent) !important;
+		color: var(--accent) !important;
+		border-color: color-mix(in oklch, var(--accent) 30%, transparent) !important;
+	}
+
+	.badge-row-sm { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 4px; }
+
+	.ct-badge {
+		font-size: 11px;
+		padding: 2px 8px;
+		border-radius: 4px;
+		background: color-mix(in oklch, var(--accent) 10%, transparent);
+		color: var(--accent);
+		border: 1px solid color-mix(in oklch, var(--accent) 20%, transparent);
+		text-transform: capitalize;
+	}
+
+	.field-hint { font-size: 11px; color: var(--fg-dim); margin-top: 4px; }
+
 	/* Add collection button — dedicated class to avoid global style interference */
 	.btn-add {
 		display: inline-flex;
@@ -1104,4 +1380,5 @@
 	.btn-sm { padding: 5px 11px; font-size: 12px; height: 28px; }
 
 	.btn-full { width: 100%; height: auto; padding: 10px 14px; }
+	.ob-skip { margin-top: 4px; font-size: 12px; }
 </style>
