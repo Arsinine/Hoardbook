@@ -33,8 +33,7 @@
 	let quratOverlayOpen = false;  // privacy overlay before Qurator import
 
 	$: if ($appReady && obStep === 0) {
-		if ($identity && $profile?.display_name) obStep = 4;
-		else if ($identity) { obKeypairRevealed = true; obStep = 1; }
+		if ($identity) obStep = 4;
 		else obStep = 1;
 	}
 

@@ -3,13 +3,12 @@ import { describe, expect, it, vi } from 'vitest';
 // ── Logic extracted from +page.svelte onboarding flow ───────────────────────
 
 // Mirrors the reactive obStep initialisation logic.
+// Key existence alone suppresses the wizard — "absent on all subsequent launches".
 function resolveInitialStep(
 	identity: { hb_id: string; hb_id_short: string } | null,
-	profileDisplayName: string | undefined,
-): { obStep: number; obKeypairRevealed: boolean } {
-	if (identity && profileDisplayName) return { obStep: 4, obKeypairRevealed: false };
-	if (identity) return { obStep: 1, obKeypairRevealed: true };
-	return { obStep: 1, obKeypairRevealed: false };
+): { obStep: number } {
+	if (identity) return { obStep: 4 };
+	return { obStep: 1 };
 }
 
 // Mirrors obSaveName: returns whether saveProfile would be called and what step is set.
@@ -25,28 +24,18 @@ async function simulateObSaveName(
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('onboarding wizard — step resolution', () => {
-	it('wizard_not_shown_if_key_exists: identity + profile → step 4 (wizard absent)', () => {
-		const result = resolveInitialStep(
-			{ hb_id: 'hb1_abc123', hb_id_short: 'hb1_abc…123' },
-			'DataHoarder_42',
-		);
-		expect(result.obStep).toBe(4);
-		expect(result.obKeypairRevealed).toBe(false);
+	it('wizard_not_shown_if_key_exists: identity present (any profile state) → step 4', () => {
+		// With display_name
+		expect(resolveInitialStep({ hb_id: 'hb1_abc123', hb_id_short: 'hb1_abc…123' }).obStep).toBe(4);
 	});
 
-	it('identity exists but no display_name → step 1 with keypair already revealed', () => {
-		const result = resolveInitialStep(
-			{ hb_id: 'hb1_abc123', hb_id_short: 'hb1_abc…123' },
-			undefined,
-		);
-		expect(result.obStep).toBe(1);
-		expect(result.obKeypairRevealed).toBe(true);
+	it('wizard_not_shown_if_key_exists: identity with no profile also → step 4', () => {
+		// Skipped step 2 on first launch; relaunch must not re-show wizard.
+		expect(resolveInitialStep({ hb_id: 'hb1_abc123', hb_id_short: 'hb1_abc…123' }).obStep).toBe(4);
 	});
 
-	it('no identity → step 1, keypair not yet revealed', () => {
-		const result = resolveInitialStep(null, undefined);
-		expect(result.obStep).toBe(1);
-		expect(result.obKeypairRevealed).toBe(false);
+	it('no identity → step 1 (wizard shown)', () => {
+		expect(resolveInitialStep(null).obStep).toBe(1);
 	});
 });
 
