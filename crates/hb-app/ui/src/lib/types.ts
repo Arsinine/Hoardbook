@@ -24,6 +24,10 @@ export interface Profile {
 	location?: string;
 	/** Optional social/contact links. */
 	social_links: SocialLink[];
+	/** What the user is willing to do: "trade", "seed", "upload", etc. */
+	willing_to: string[];
+	/** Aggregate content types across all published collections (auto-computed). */
+	content_types: string[];
 	updated: string; // ISO datetime
 }
 
@@ -43,7 +47,6 @@ export interface DirectoryItem {
 	tags: string[];
 	note?: string;
 	children: DirectoryItem[];
-	sha256?: string;
 }
 
 export interface Collection {
@@ -53,7 +56,8 @@ export interface Collection {
 	item_count: number;
 	est_size?: string;
 	total_bytes: number;
-	content_type: string[];
+	content_types: string[];
+	tags: string[];
 	languages: string[];
 	/** True when the listing is alphabetically sorted. */
 	sorted?: boolean;
@@ -82,17 +86,6 @@ export interface ScanOptions {
 	exclude: string[];
 }
 
-export interface DirectoryPeer {
-	hb_id: string;
-	profile?: Profile;
-}
-
-export interface ReceivedChannelMessage {
-	from: string;
-	content: string;
-	sent_at: string; // ISO datetime
-}
-
 export interface ShareSettings {
 	enabled: boolean;
 	root_path?: string;
@@ -100,6 +93,30 @@ export interface ShareSettings {
 	speed_cap_kbps?: number;
 	download_limit?: number;
 	require_follow: boolean;
+}
+
+export interface DhtResult {
+	hb_id: string;
+	profile?: Profile;
+	online: boolean;
+}
+
+export interface Group {
+	name: string;
+	pubkeys: string[];
+}
+
+export interface Watch {
+	name: string;
+	tags: string[];
+	content_types: string[];
+	last_fired?: string;
+	seen_pubkeys: string[];
+}
+
+export interface WatchHit {
+	watch_name: string;
+	hb_id: string;
 }
 
 export interface DownloadItem {
