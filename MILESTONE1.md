@@ -575,7 +575,7 @@ E2E: save profile → connect from second instance via iroh → profile data mat
 
 ---
 
-### CHECKPOINT 2 [ ]: Identity + Profile Operational
+### CHECKPOINT 2 [x]: Identity + Profile Operational
 
 **Gate condition:** User generates a keypair (DPAPI-encrypted on Windows), completes or skips the wizard, and has a locally-signed profile ready to serve.
 
