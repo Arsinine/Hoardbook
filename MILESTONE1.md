@@ -549,18 +549,18 @@ E2E: fresh install → complete wizard → relaunch → wizard absent
 
 ---
 
-### TASK 14 [ ]: Profile Editor — Sign Locally, No Relay Publish
+### TASK 14 [x]: Profile Editor — Sign Locally, No Relay Publish
 
 **Depends on:** T12  **Parallel with:** T15
 
 **Scope:** Tauri commands: `profile_get() → Result<Option<Profile>>`, `profile_save(profile: Profile) → Result<()>`. Profile is signed locally and written to `~/.hoardbook/identity/profile.signed.json`. The signed file is what the iroh node server (T17) will serve to connecting peers. There is **no relay publish** — profile data lives on the node, not the relay. The "Publish" button in the UI becomes "Save and Activate" — it signs the profile and makes it live for incoming peer connections. Unpublish means deleting the signed file; the node will return "no profile" to connecting peers. UI: form with all spec profile fields + approved extensions (email, location, social_links). `content_types` absent from form (computed). Live preview. Spec §Profile Editor.
 
 **Acceptance criteria:**
-- [ ] Profile saved as `profile.signed.json` locally
-- [ ] No HTTP call to any relay on profile save
-- [ ] `content_types` in the signed file is computed as the union of all collection content_types; not user-editable
-- [ ] Live preview matches what a visitor sees when they connect via iroh
-- [ ] "Unpublish" deletes the signed file; iroh server returns empty profile to peers
+- [x] Profile saved as `profile.signed.json` locally
+- [x] No HTTP call to any relay on profile save
+- [x] `content_types` in the signed file is computed as the union of all collection content_types; not user-editable
+- [x] Live preview matches what a visitor sees when they connect via iroh
+- [x] "Unpublish" deletes the signed file; iroh server returns empty profile to peers
 
 **Tests required:**
 Unit: `profile_signed_with_correct_key`, `content_types_auto_computed`, `no_relay_call_on_save`

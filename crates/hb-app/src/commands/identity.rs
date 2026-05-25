@@ -205,7 +205,6 @@ pub async fn wipe_data(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::store::DataStore;
     use hb_core::{HoardbookKeypair, types::StoredKeypair};
     use tempfile::TempDir;
