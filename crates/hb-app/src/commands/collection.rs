@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::{
+    commands::profile::compute_content_types,
     error::{CmdResult, cmd_err},
     store::DataStore,
-    SharedIdentity, SharedRelay,
+    SharedIdentity,
 };
 
 /// Collection with publication status, returned to the frontend.
@@ -137,7 +138,6 @@ pub async fn publish_collection(
     slug: String,
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
-    relay: State<'_, SharedRelay>,
 ) -> CmdResult<()> {
     let guard = identity.read().await;
     let kp = guard
@@ -161,26 +161,14 @@ pub async fn publish_collection(
 
     let envelope = SignedEnvelope::create(kp, DocType::Collection, &collection).map_err(cmd_err)?;
     store.save_collection_signed(safe_slug, &envelope).map_err(cmd_err)?;
-    relay.publish("collection", &envelope).await.map_err(cmd_err)?;
 
-    // Recompute profile content_types aggregate from all published collections.
-    let all_envelopes = store.list_collections().map_err(cmd_err)?;
-    let mut aggregate: Vec<String> = all_envelopes
-        .iter()
-        .filter_map(|env| env.parse_payload::<Collection>().ok())
-        .flat_map(|c| c.content_types)
-        .collect();
-    aggregate.sort();
-    aggregate.dedup();
-
+    // Recompute and re-sign profile content_types if a signed profile exists.
     if let Some(mut profile) = store.load_profile_draft().map_err(cmd_err)? {
-        profile.content_types = aggregate;
+        profile.content_types = compute_content_types(&store);
         store.save_profile_draft(&profile).map_err(cmd_err)?;
-        // Re-publish profile if it was previously published.
         if store.load_profile_signed().map_err(cmd_err)?.is_some() {
             let prof_env = SignedEnvelope::create(kp, DocType::Profile, &profile).map_err(cmd_err)?;
             store.save_profile_signed(&prof_env).map_err(cmd_err)?;
-            relay.publish("profile", &prof_env).await.map_err(cmd_err)?;
         }
     }
 
