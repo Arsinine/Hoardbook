@@ -522,19 +522,19 @@ E2E: generate key → export backup → delete key file → reimport → app fun
 
 ---
 
-### TASK 13 [ ]: Onboarding Wizard — 3-Step UI
+### TASK 13 [x]: Onboarding Wizard — 3-Step UI
 
 **Depends on:** T12  **Parallel with:** none
 
 **Scope:** SvelteKit route `/onboarding`. Shown only on first run (no key file present). **Step 1:** Generate button → calls `identity_generate_keypair`, displays hb_id, offers backup export ("Export backup file" / "I'll do it later"). Qurator import option with privacy overlay. **Step 2:** Profile fields (display_name, bio, tags, est_size, since, contact_hint, willing_to) — all optional; Skip advances without saving. **Step 3:** Add a collection (path, name, depth) — optional; Skip or Done → main app. No key rotation prompt anywhere in the wizard. Spec §Onboarding.
 
 **Acceptance criteria:**
-- [ ] Wizard shown on first launch; absent on all subsequent launches
-- [ ] Generate button disabled during key generation; spinner shown
-- [ ] hb_id displayed and copyable after generation
-- [ ] Step 2 Skip writes nothing
-- [ ] No key rotation or succession mentioned anywhere in the wizard
-- [ ] Qurator import shows privacy overlay before proceeding
+- [x] Wizard shown on first launch; absent on all subsequent launches
+- [x] Generate button disabled during key generation; spinner shown
+- [x] hb_id displayed and copyable after generation
+- [x] Step 2 Skip writes nothing
+- [x] No key rotation or succession mentioned anywhere in the wizard
+- [x] Qurator import shows privacy overlay before proceeding
 
 **Tests required:**
 Unit: `wizard_not_shown_if_key_exists`, `step2_skip_writes_nothing`
