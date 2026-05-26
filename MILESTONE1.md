@@ -620,17 +620,17 @@ E2E: add collection → preview → edit per-item note → regenerate → note p
 
 ---
 
-### TASK 16 [ ]: Collection Sign — Local Only
+### TASK 16 [x]: Collection Sign — Local Only
 
 **Depends on:** T15, T14  **Parallel with:** none in this phase
 
 **Scope:** Tauri command `collection_publish(slug: String) → Result<()>`. Loads draft, creates `SignedEnvelope` (doc_type=Collection), writes to `<slug>.signed.json`, calls `profile_save` to recompute `content_types`. **No relay push.** The signed file is served by the iroh node (T17). Publishing is always manual. Spec §Collection Manager — "Snapshot trigger".
 
 **Acceptance criteria:**
-- [ ] Signed envelope written to `~/.hoardbook/collections/<slug>.signed.json`
-- [ ] No HTTP call to any relay on publish
-- [ ] Profile `content_types` recomputed and profile re-signed after collection publish
-- [ ] `envelope.verify()` returns `Ok(())` on the output file
+- [x] Signed envelope written to `~/.hoardbook/collections/<slug>.signed.json`
+- [x] No HTTP call to any relay on publish
+- [x] Profile `content_types` recomputed and profile re-signed after collection publish
+- [x] `envelope.verify()` returns `Ok(())` on the output file
 
 **Tests required:**
 Unit: `publish_signs_with_current_key`, `no_relay_call_on_publish`, `profile_content_types_updated`
@@ -645,7 +645,7 @@ E2E: publish collection → connect from second instance via iroh → collection
 
 ---
 
-### CHECKPOINT 3 [ ]: Collection Flow Complete
+### CHECKPOINT 3 [x]: Collection Flow Complete
 
 **Gate condition:** User can add, configure, preview, and publish collections locally. Signed files on disk are verifiable. Profile content_types updated on collection publish.
 

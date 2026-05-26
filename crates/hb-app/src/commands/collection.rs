@@ -141,22 +141,15 @@ pub async fn update_collection_meta(
     store.save_collection_draft(&col).map_err(cmd_err)
 }
 
-#[tauri::command]
-pub async fn publish_collection(
-    slug: String,
-    store: State<'_, DataStore>,
-    identity: State<'_, SharedIdentity>,
-) -> CmdResult<()> {
-    let guard = identity.read().await;
-    let kp = guard
-        .as_ref()
-        .ok_or("No identity loaded. Generate a keypair first.")?;
-
-    // Re-derive the slug from what was stored rather than trusting the caller directly.
-    // This prevents a crafted slug like "../identity/keypair" from escaping the
-    // collections/ directory.
-    let safe_slug = is_valid_slug(&slug)
-        .then_some(slug.as_str())
+/// Core publish logic extracted for testability.
+/// Validates slug, enforces content_types, signs, and updates profile.
+pub(crate) fn publish_collection_inner(
+    slug: &str,
+    store: &DataStore,
+    kp: &hb_core::HoardbookKeypair,
+) -> Result<(), String> {
+    let safe_slug = is_valid_slug(slug)
+        .then_some(slug)
         .ok_or("Invalid collection slug")?;
 
     let draft_path = store.collection_draft_path(safe_slug);
@@ -176,7 +169,7 @@ pub async fn publish_collection(
 
     // Recompute and re-sign profile content_types if a signed profile exists.
     if let Some(mut profile) = store.load_profile_draft().map_err(cmd_err)? {
-        profile.content_types = compute_content_types(&store);
+        profile.content_types = compute_content_types(store);
         store.save_profile_draft(&profile).map_err(cmd_err)?;
         if store.load_profile_signed().map_err(cmd_err)?.is_some() {
             let prof_env = SignedEnvelope::create(kp, DocType::Profile, &profile).map_err(cmd_err)?;
@@ -185,6 +178,19 @@ pub async fn publish_collection(
     }
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn publish_collection(
+    slug: String,
+    store: State<'_, DataStore>,
+    identity: State<'_, SharedIdentity>,
+) -> CmdResult<()> {
+    let guard = identity.read().await;
+    let kp = guard
+        .as_ref()
+        .ok_or("No identity loaded. Generate a keypair first.")?;
+    publish_collection_inner(&slug, &store, kp)
 }
 
 /// Export a collection's listing as plain text or markdown checklist.
@@ -578,6 +584,140 @@ mod tests {
         let subdir = merged.iter().find(|i| i.name == "subdir").unwrap();
         let sub_readme = subdir.children.iter().find(|i| i.name == "readme.txt").unwrap();
         assert!(sub_readme.note.is_none(), "subdirectory readme must not inherit root note");
+    }
+
+    // ── T16 acceptance tests ─────────────────────────────────────────────────
+
+    fn make_published_collection(store: &DataStore, kp: &hb_core::HoardbookKeypair, slug: &str, content_types: Vec<String>) {
+        let col = hb_core::Collection {
+            slug: slug.to_string(),
+            path_alias: slug.to_string(),
+            description: None,
+            item_count: 1,
+            est_size: None,
+            content_types,
+            tags: vec![],
+            languages: vec![],
+            last_updated: chrono::Utc::now(),
+            listing: vec![],
+        };
+        store.save_collection_draft(&col).unwrap();
+        let env = hb_core::SignedEnvelope::create(kp, hb_core::DocType::Collection, &col).unwrap();
+        store.save_collection_signed(slug, &env).unwrap();
+    }
+
+    fn make_collection_draft(store: &DataStore, slug: &str, content_types: Vec<String>) {
+        let col = hb_core::Collection {
+            slug: slug.to_string(),
+            path_alias: slug.to_string(),
+            description: None,
+            item_count: 1,
+            est_size: None,
+            content_types,
+            tags: vec![],
+            languages: vec![],
+            last_updated: chrono::Utc::now(),
+            listing: vec![],
+        };
+        store.save_collection_draft(&col).unwrap();
+    }
+
+    #[test]
+    fn publish_signs_with_current_key() {
+        use hb_core::{HoardbookKeypair, SignedEnvelope, DocType};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let kp = HoardbookKeypair::generate();
+
+        make_collection_draft(&store, "my-films", vec!["video".to_string()]);
+
+        // Call the real publish path.
+        publish_collection_inner("my-films", &store, &kp).unwrap();
+
+        let signed_path = store.collection_signed_path("my-films");
+        assert!(signed_path.exists(), "signed.json must be written to disk");
+
+        let bytes = std::fs::read(&signed_path).unwrap();
+        let loaded: SignedEnvelope = serde_json::from_slice(&bytes).unwrap();
+        assert!(loaded.verify().is_ok(), "envelope.verify() must return Ok(())");
+        assert_eq!(loaded.doc_type, DocType::Collection);
+    }
+
+    #[test]
+    fn publish_rejects_invalid_slug() {
+        use hb_core::HoardbookKeypair;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let kp = HoardbookKeypair::generate();
+
+        let err = publish_collection_inner("../evil", &store, &kp).unwrap_err();
+        assert!(err.contains("Invalid collection slug"), "got: {err}");
+    }
+
+    #[test]
+    fn publish_rejects_empty_content_types() {
+        use hb_core::HoardbookKeypair;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let kp = HoardbookKeypair::generate();
+
+        make_collection_draft(&store, "no-types", vec![]);
+
+        let err = publish_collection_inner("no-types", &store, &kp).unwrap_err();
+        assert!(err.contains("content type"), "got: {err}");
+    }
+
+    #[test]
+    fn profile_content_types_updated_after_publish() {
+        use hb_core::{HoardbookKeypair, SignedEnvelope, DocType, Profile};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let kp = HoardbookKeypair::generate();
+
+        // Create and sign two existing collections via the helper.
+        make_published_collection(&store, &kp, "films", vec!["video".to_string()]);
+
+        // Create a profile draft + signed profile with empty content_types.
+        let profile = Profile {
+            display_name: "Test".to_string(),
+            bio: None,
+            tags: vec![],
+            since: None,
+            est_size: None,
+            languages: vec![],
+            contact_hint: None,
+            email: None,
+            location: None,
+            social_links: vec![],
+            willing_to: vec![],
+            content_types: vec![],
+            updated: chrono::Utc::now(),
+        };
+        store.save_profile_draft(&profile).unwrap();
+        let prof_env = SignedEnvelope::create(&kp, DocType::Profile, &profile).unwrap();
+        store.save_profile_signed(&prof_env).unwrap();
+
+        // Add a second collection and publish via the real command path.
+        make_collection_draft(&store, "books", vec!["text".to_string()]);
+        publish_collection_inner("books", &store, &kp).unwrap();
+
+        // Profile must now be re-signed with merged content_types.
+        let reloaded_env = store.load_profile_signed().unwrap().unwrap();
+        assert!(reloaded_env.verify().is_ok(), "re-signed profile must verify");
+        let reloaded: Profile = reloaded_env.parse_payload().unwrap();
+        let mut expected = vec!["text".to_string(), "video".to_string()];
+        expected.sort();
+        let mut actual = reloaded.content_types.clone();
+        actual.sort();
+        assert_eq!(actual, expected, "profile content_types must be union of all collections");
     }
 
     #[test]
