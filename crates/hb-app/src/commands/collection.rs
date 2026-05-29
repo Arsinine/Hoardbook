@@ -44,6 +44,12 @@ pub async fn scan_directory(
 
     let depth = opts.depth.min(10);
     let slug = Collection::slug_from_alias(&opts.path_alias);
+    if !is_valid_slug(&slug) {
+        return Err(format!(
+            "'{}' produces an invalid collection slug — use only letters, numbers, and hyphens",
+            opts.path_alias
+        ));
+    }
     let globs = build_glob_set(&opts.exclude);
     let (listing, total_bytes) = scan_recursive(root, depth, 0, &globs, "").map_err(cmd_err)?;
     let item_count = count_items(&listing);

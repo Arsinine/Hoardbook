@@ -108,6 +108,7 @@ DMs
 polish
   T16 → T26 (export listing)  ∥
   T12 + T10 + T22 + T23 → T27 (settings page)
+  T27 → T28 (in-app updater)
 ```
 
 **Parallel opportunities:**
@@ -662,7 +663,7 @@ E2E: publish collection → connect from second instance via iroh → collection
 
 ---
 
-### TASK 17 [ ]: iroh Node Server — Serve Profile + Collections, Accept Direct DMs
+### TASK 17 [x]: iroh Node Server — Serve Profile + Collections, Accept Direct DMs
 
 **Depends on:** T12, T16  **Parallel with:** T18, T19
 
@@ -679,13 +680,13 @@ Response: { "ok": true } | { "ok": false, "error": "..." }
 The server reads signed files from `~/.hoardbook/identity/profile.signed.json` and `~/.hoardbook/collections/*.signed.json` to respond to `get_profile` requests. For incoming `send_dm` requests: verify the envelope signature, validate the recipient matches own hb_id, queue the message for the inbox (in-memory queue, drained by `dm_fetch_inbox`). The iroh NodeAddr is stored in app state so the heartbeat task (T18) can include it.
 
 **Acceptance criteria:**
-- [ ] iroh endpoint starts on app launch and binds a local port
-- [ ] `get_profile` request returns the current signed profile + all signed collections
-- [ ] `get_profile` returns empty response when no profile is published
-- [ ] `send_dm` request: verifies signature, queues message if recipient matches own key
-- [ ] `send_dm` request: rejects if recipient hb_id does not match own key
-- [ ] iroh NodeAddr is accessible to the heartbeat task for inclusion in heartbeat payload
-- [ ] Server handles concurrent connections without blocking
+- [x] iroh endpoint starts on app launch and binds a local port
+- [x] `get_profile` request returns the current signed profile + all signed collections
+- [x] `get_profile` returns empty response when no profile is published
+- [x] `send_dm` request: verifies signature, queues message if recipient matches own key
+- [x] `send_dm` request: rejects if recipient hb_id does not match own key
+- [x] iroh NodeAddr is accessible to the heartbeat task for inclusion in heartbeat payload
+- [x] Server handles concurrent connections without blocking
 
 **Tests required:**
 Unit: `get_profile_returns_signed_files`, `send_dm_validates_recipient`, `send_dm_wrong_recipient_rejected`
@@ -1046,9 +1047,40 @@ Integration: `settings_persist_across_restart`
 
 ---
 
+### TASK 28 [ ]: In-App Updater
+
+**Depends on:** T27 (settings page — update check lives under Key management)  **Parallel with:** none
+
+**Scope:** Wire `tauri-plugin-updater` (already in `Cargo.toml`) so the app can check for and install updates from the configured endpoint. Two entry points: automatic check on launch (background, silent unless update found) and manual "Check for updates" button in Settings → Key management. Update endpoint URL configured via `tauri.conf.json` `[plugins.updater]` or environment variable; CI publishes signed update manifests to that endpoint.
+
+Commands (`commands/update.rs`): `check_update() → Result<Option<UpdateInfo>>` returns `{version, notes, date}` when an update is available or `None` if already current. `install_update() → Result<()>` downloads, verifies the Tauri signature, and triggers the installer (relaunch on Windows; prompt on Linux).
+
+Capabilities (`gen/schemas/capabilities.json`) must include `updater:allow-check` and `updater:allow-download-and-install` — without these Tauri v2 blocks the plugin at runtime.
+
+**Acceptance criteria:**
+- [ ] `tauri_plugin_updater::Builder` registered in `lib.rs`
+- [ ] `updater:allow-check` and `updater:allow-download-and-install` present in `capabilities.json`
+- [ ] `check_update` returns `None` when on current version; returns `UpdateInfo` when a newer manifest exists
+- [ ] `install_update` verifies the Tauri update signature before applying
+- [ ] Background check on launch shows in-app notification only if update found; no UI noise otherwise
+- [ ] Manual check button in Settings reflects the result within 10 s
+
+**Tests required:**
+Unit: `check_update_returns_none_on_current_version`, `check_update_returns_info_on_newer`, `install_update_requires_valid_signature`
+Integration: `updater_capabilities_present_in_manifest`
+
+**Verification steps:**
+1. `cargo test -p hb-app -- update`
+2. Point updater endpoint at a mock manifest with a higher version; launch app — notification appears
+3. `cat crates/hb-app/gen/schemas/capabilities.json | jq '.default.permissions'` — must contain both updater entries
+
+**Definition of done:** Update check and install verified end-to-end on Windows; capabilities confirmed in manifest.
+
+---
+
 ### CHECKPOINT 8 (FINAL) [ ]: Phase 1 MVP Complete
 
-**Gate condition:** All 27 tasks complete. The following five user journeys execute end-to-end on Windows (primary) and Linux (secondary):
+**Gate condition:** All 28 tasks complete. The following five user journeys execute end-to-end on Windows (primary) and Linux (secondary):
 
 1. Fresh install → generate key → onboarding → publish profile + collection (locally signed) → share hb_id
 2. Second user pastes hb_id → fetches profile via iroh directly → follows → assigns to group
@@ -1076,7 +1108,7 @@ Integration: `settings_persist_across_restart`
 
 ## PLAN SUMMARY FOR HUMAN REVIEW
 
-**Total tasks:** 27
+**Total tasks:** 28
 
 ---
 
