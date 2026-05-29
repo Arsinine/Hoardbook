@@ -2,6 +2,7 @@
 
 mod commands;
 mod error;
+mod heartbeat;
 mod node;
 mod relay;
 mod store;
@@ -15,11 +16,13 @@ use tauri::Manager;
 use tokio::sync::RwLock;
 
 /// Managed state types — Arc-wrapped so they can be cloned into background tasks.
-pub type SharedIdentity         = Arc<RwLock<Option<HoardbookKeypair>>>;
-pub type SharedRelay            = Arc<RelayClient>;
-pub type SharedEndpoint         = Arc<RwLock<Option<iroh::Endpoint>>>;
-pub type SharedDownloadRegistry = Arc<transfer::DownloadRegistry>;
-pub type SharedDmQueue          = node::SharedDmQueue;
+pub type SharedIdentity           = Arc<RwLock<Option<HoardbookKeypair>>>;
+pub type SharedRelay              = Arc<RelayClient>;
+pub type SharedEndpoint           = Arc<RwLock<Option<iroh::Endpoint>>>;
+pub type SharedDownloadRegistry   = Arc<transfer::DownloadRegistry>;
+pub type SharedDmQueue            = node::SharedDmQueue;
+/// Sender half of the heartbeat-cancel channel. Send `true` to stop the task.
+pub type SharedCancelHeartbeat    = Arc<tokio::sync::watch::Sender<bool>>;
 
 // ---------------------------------------------------------------------------
 // iroh endpoint lifecycle helper
@@ -57,6 +60,8 @@ pub(crate) async fn start_iroh_endpoint(
     Ok(())
 }
 
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+
 /// Dispatch incoming iroh connections by ALPN to the appropriate protocol handler.
 async fn run_accept_loop(
     endpoint: iroh::Endpoint,
@@ -64,6 +69,7 @@ async fn run_accept_loop(
     own_hb_id: String,
     dm_queue: SharedDmQueue,
 ) {
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
         let incoming = match endpoint.accept().await {
             Some(inc) => inc,
@@ -73,11 +79,17 @@ async fn run_accept_loop(
             }
         };
 
+        let permit = match sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => { tracing::warn!("connection semaphore closed"); break; }
+        };
+
         let store_clone = store.clone();
         let queue_clone = dm_queue.clone();
         let hb_id_clone = own_hb_id.clone();
 
         tokio::spawn(async move {
+            let _permit = permit;
             let accepting = match incoming.accept() {
                 Ok(a) => a,
                 Err(e) => { tracing::debug!("iroh incoming reject: {e}"); return; }
@@ -115,7 +127,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -152,15 +163,28 @@ pub fn run() {
             let download_registry: SharedDownloadRegistry =
                 Arc::new(transfer::DownloadRegistry::new());
 
+            let (hb_cancel_tx, hb_cancel_rx) = tokio::sync::watch::channel(false);
+            let hb_cancel: SharedCancelHeartbeat = Arc::new(hb_cancel_tx);
+
             app.manage(DataStore::new(data_dir.clone()));
             app.manage(Arc::clone(&identity));
             app.manage(Arc::clone(&relay));
             app.manage(Arc::clone(&endpoint_state));
             app.manage(Arc::clone(&download_registry));
             app.manage(Arc::clone(&dm_queue));
+            app.manage(Arc::clone(&hb_cancel));
 
-            // If a keypair is already on disk, start the iroh endpoint immediately.
+            // If a keypair is already on disk, populate identity and start the iroh endpoint.
             if let Ok(Some(stored)) = store_tmp.load_keypair() {
+                // Populate SharedIdentity synchronously so the heartbeat task always
+                // has a keypair when it fires its first beat 15 s after launch.
+                if let Ok(bytes) = hex::decode(&stored.private_key_hex) {
+                    let arr: Result<[u8; 32], _> = bytes.try_into();
+                    if let Ok(arr) = arr {
+                        *identity.blocking_write() = Some(HoardbookKeypair::from_bytes(&arr));
+                    }
+                }
+
                 let ep_arc = Arc::clone(&endpoint_state);
                 let q_arc = Arc::clone(&dm_queue);
                 let store_for_ep = DataStore::new(data_dir.clone());
@@ -179,29 +203,13 @@ pub fn run() {
                 });
             }
 
-            // Background heartbeat every 5 minutes — includes iroh node_addr when available.
-            let identity2    = Arc::clone(&identity);
-            let relay2       = Arc::clone(&relay);
-            let endpoint2    = Arc::clone(&endpoint_state);
-            tauri::async_runtime::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(tokio::time::Duration::from_secs(300));
-                loop {
-                    interval.tick().await;
-                    let guard = identity2.read().await;
-                    if let Some(ref kp) = *guard {
-                        let node_addr = {
-                            let ep_guard = endpoint2.read().await;
-                            ep_guard.as_ref().and_then(|ep| {
-                                serde_json::to_string(&ep.addr()).ok()
-                            })
-                        };
-                        if let Err(e) = relay2.send_heartbeat(kp, node_addr).await {
-                            tracing::debug!("heartbeat failed: {e}");
-                        }
-                    }
-                }
-            });
+            // Background heartbeat: first fires within 30 s, then every 5 minutes.
+            tauri::async_runtime::spawn(heartbeat::run_heartbeat_loop(
+                Arc::clone(&relay),
+                Arc::clone(&identity),
+                Arc::clone(&endpoint_state),
+                hb_cancel_rx,
+            ));
 
             Ok(())
         })
@@ -242,8 +250,6 @@ pub fn run() {
             commands::sharing::save_share_settings,
             commands::sharing::request_download,
             commands::sharing::cancel_download,
-            commands::update::check_update,
-            commands::update::install_update,
             commands::dht::dht_search,
             commands::dht::dht_start_announce,
             commands::dht::dht_stop_announce,
