@@ -99,42 +99,7 @@ struct XferRequest {
 // Server — runs as a background task on the local iroh endpoint
 // ---------------------------------------------------------------------------
 
-pub async fn run_server(endpoint: Endpoint, store: DataStore) {
-    loop {
-        let incoming = match endpoint.accept().await {
-            Some(inc) => inc,
-            None => {
-                tracing::debug!("iroh endpoint closed — transfer server exiting");
-                break;
-            }
-        };
-
-        let store_clone = store.clone();
-        tokio::spawn(async move {
-            let accepting = match incoming.accept() {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::debug!("iroh incoming reject: {e}");
-                    return;
-                }
-            };
-
-            let conn = match accepting.await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!("iroh handshake error: {e}");
-                    return;
-                }
-            };
-
-            if let Err(e) = handle_connection(conn, store_clone).await {
-                tracing::warn!("transfer session error: {e}");
-            }
-        });
-    }
-}
-
-async fn handle_connection(
+pub(crate) async fn handle_xfer_connection(
     conn: iroh::endpoint::Connection,
     store: DataStore,
 ) -> Result<()> {

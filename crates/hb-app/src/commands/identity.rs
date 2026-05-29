@@ -3,7 +3,7 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::{
-    SharedEndpoint, SharedIdentity, SharedRelay,
+    SharedDmQueue, SharedEndpoint, SharedIdentity, SharedRelay,
     error::{CmdResult, cmd_err},
     store::DataStore,
 };
@@ -36,6 +36,7 @@ pub async fn generate_keypair(
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
     endpoint: State<'_, SharedEndpoint>,
+    dm_queue: State<'_, SharedDmQueue>,
 ) -> CmdResult<IdentityInfo> {
     if store.load_keypair().map_err(cmd_err)?.is_some() {
         return Err("A keypair already exists. Use rotate_keypair to replace it.".into());
@@ -52,7 +53,13 @@ pub async fn generate_keypair(
     let info = IdentityInfo::from_keypair(&kp);
 
     // iroh endpoint startup is non-fatal: identity is committed, endpoint retried on next launch.
-    if let Err(e) = crate::start_iroh_endpoint(kp.private_key_bytes(), (*store).clone(), (*endpoint).clone()).await {
+    if let Err(e) = crate::start_iroh_endpoint(
+        kp.private_key_bytes(),
+        (*store).clone(),
+        (*endpoint).clone(),
+        (*dm_queue).clone(),
+        kp.hb_id(),
+    ).await {
         tracing::warn!("iroh endpoint startup failed after keypair generate: {e}");
     }
 
@@ -67,6 +74,7 @@ pub async fn import_keypair(
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
     endpoint: State<'_, SharedEndpoint>,
+    dm_queue: State<'_, SharedDmQueue>,
 ) -> CmdResult<IdentityInfo> {
     if store.load_keypair().map_err(cmd_err)?.is_some() {
         return Err("A keypair already exists. Wipe data first to import a different keypair.".into());
@@ -91,7 +99,13 @@ pub async fn import_keypair(
     let info = IdentityInfo::from_keypair(&kp);
 
     // iroh endpoint startup is non-fatal: keypair is committed regardless.
-    if let Err(e) = crate::start_iroh_endpoint(&private_bytes, (*store).clone(), (*endpoint).clone()).await {
+    if let Err(e) = crate::start_iroh_endpoint(
+        &private_bytes,
+        (*store).clone(),
+        (*endpoint).clone(),
+        (*dm_queue).clone(),
+        kp.hb_id(),
+    ).await {
         tracing::warn!("iroh endpoint startup failed after keypair import: {e}");
     }
 
@@ -120,6 +134,9 @@ pub async fn get_identity(
         .map_err(|_| "keypair file has invalid length".to_string())?;
 
     let kp = HoardbookKeypair::from_bytes(&bytes);
+    if kp.hb_id() != stored.hb_id {
+        return Err("Stored keypair is corrupted: derived public key does not match stored hb_id".into());
+    }
     let info = IdentityInfo::from_keypair(&kp);
     *identity.write().await = Some(kp);
     Ok(Some(info))
@@ -183,12 +200,14 @@ pub async fn wipe_data(
     identity: State<'_, SharedIdentity>,
     relay: State<'_, SharedRelay>,
     endpoint: State<'_, SharedEndpoint>,
+    dm_queue: State<'_, SharedDmQueue>,
 ) -> CmdResult<bool> {
     // Relay no longer stores peer data (profile/collections served via iroh),
     // so there is nothing to deactivate on the relay side.
     store.wipe().map_err(cmd_err)?;
     *identity.write().await = None;
     relay.set_relay_urls(vec![]);
+    dm_queue.lock().await.clear();
 
     // Close and clear the iroh endpoint.
     let mut ep_guard = endpoint.write().await;

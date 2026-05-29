@@ -1,5 +1,4 @@
-use hb_core::{HbId, types::Profile};
-use serde::Serialize;
+use hb_core::HbId;
 use tauri::State;
 
 use crate::{
@@ -62,37 +61,11 @@ pub async fn refresh_contact(
     let peer = relay.fetch_peer(&hb_id).await.map_err(cmd_err)?;
     let hash = CachedPeer::pubkey_hash(&hb_id);
     // Preserve local_tags across refresh.
-    let existing = store.load_contact(&hash).map_err(cmd_err)?.unwrap_or(peer.clone());
+    let existing = store.load_contact(&hash).map_err(cmd_err)?.unwrap_or_else(|| peer.clone());
     let mut updated = peer;
     updated.local_tags = existing.local_tags;
     store.save_contact(&hash, &updated).map_err(cmd_err)?;
     Ok(updated)
-}
-
-/// A directory entry returned from the relay's public listing.
-#[derive(Debug, Clone, Serialize)]
-pub struct DirectoryPeer {
-    pub hb_id: String,
-    pub profile: Option<Profile>,
-}
-
-/// Fetch the relay's recommended/listed peers directory.
-#[tauri::command]
-pub async fn get_directory(relay: State<'_, SharedRelay>) -> CmdResult<Vec<DirectoryPeer>> {
-    let entries = relay.fetch_directory().await.map_err(cmd_err)?;
-    let peers = entries
-        .into_iter()
-        .map(|e| {
-            let profile = if e.profile.verify().is_ok() {
-                e.profile.parse_payload().ok()
-            } else {
-                tracing::warn!("directory entry {} has invalid profile signature, discarding", e.pubkey);
-                None
-            };
-            DirectoryPeer { hb_id: e.pubkey, profile }
-        })
-        .collect();
-    Ok(peers)
 }
 
 /// Set user-defined local tags on a contact. Tags are stored locally and never shared.

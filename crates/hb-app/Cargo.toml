@@ -40,3 +40,4 @@ hb-dpapi = { path = "../hb-dpapi" }
 
 [dev-dependencies]
 tempfile = "3"
+iroh = { version = "0.98", default-features = false, features = ["tls-ring"] }

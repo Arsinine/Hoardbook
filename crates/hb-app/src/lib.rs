@@ -2,6 +2,7 @@
 
 mod commands;
 mod error;
+mod node;
 mod relay;
 mod store;
 mod transfer;
@@ -14,27 +15,30 @@ use tauri::Manager;
 use tokio::sync::RwLock;
 
 /// Managed state types — Arc-wrapped so they can be cloned into background tasks.
-pub type SharedIdentity        = Arc<RwLock<Option<HoardbookKeypair>>>;
-pub type SharedRelay           = Arc<RelayClient>;
-pub type SharedEndpoint        = Arc<RwLock<Option<iroh::Endpoint>>>;
+pub type SharedIdentity         = Arc<RwLock<Option<HoardbookKeypair>>>;
+pub type SharedRelay            = Arc<RelayClient>;
+pub type SharedEndpoint         = Arc<RwLock<Option<iroh::Endpoint>>>;
 pub type SharedDownloadRegistry = Arc<transfer::DownloadRegistry>;
+pub type SharedDmQueue          = node::SharedDmQueue;
 
 // ---------------------------------------------------------------------------
 // iroh endpoint lifecycle helper
 // ---------------------------------------------------------------------------
 
 /// Create (or replace) the iroh P2P endpoint from the given private key bytes,
-/// persist it in `endpoint_state`, and spawn the transfer accept loop.
+/// persist it in `endpoint_state`, and spawn the unified accept loop.
 pub(crate) async fn start_iroh_endpoint(
     private_bytes: &[u8; 32],
     store: DataStore,
     endpoint_state: SharedEndpoint,
+    dm_queue: SharedDmQueue,
+    own_hb_id: String,
 ) -> anyhow::Result<()> {
     let secret_key = iroh::SecretKey::from_bytes(private_bytes);
 
     let new_ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(secret_key)
-        .alpns(vec![transfer::XFER_ALPN.to_vec()])
+        .alpns(vec![transfer::XFER_ALPN.to_vec(), node::NODE_ALPN.to_vec()])
         .bind()
         .await?;
 
@@ -45,12 +49,62 @@ pub(crate) async fn start_iroh_endpoint(
         old.close().await;
     }
 
-    // Spawn the file-transfer accept loop.
+    // Spawn the unified protocol accept loop.
     let server_ep = new_ep.clone();
-    tauri::async_runtime::spawn(transfer::run_server(server_ep, store));
+    tauri::async_runtime::spawn(run_accept_loop(server_ep, store, own_hb_id, dm_queue));
 
     *guard = Some(new_ep);
     Ok(())
+}
+
+/// Dispatch incoming iroh connections by ALPN to the appropriate protocol handler.
+async fn run_accept_loop(
+    endpoint: iroh::Endpoint,
+    store: DataStore,
+    own_hb_id: String,
+    dm_queue: SharedDmQueue,
+) {
+    loop {
+        let incoming = match endpoint.accept().await {
+            Some(inc) => inc,
+            None => {
+                tracing::debug!("iroh endpoint closed — accept loop exiting");
+                break;
+            }
+        };
+
+        let store_clone = store.clone();
+        let queue_clone = dm_queue.clone();
+        let hb_id_clone = own_hb_id.clone();
+
+        tokio::spawn(async move {
+            let accepting = match incoming.accept() {
+                Ok(a) => a,
+                Err(e) => { tracing::debug!("iroh incoming reject: {e}"); return; }
+            };
+            let conn = match accepting.await {
+                Ok(c) => c,
+                Err(e) => { tracing::debug!("iroh handshake error: {e}"); return; }
+            };
+
+            // Clone ALPN before moving conn into the handler.
+            let alpn = conn.alpn().to_vec();
+            if alpn == transfer::XFER_ALPN {
+                if let Err(e) = transfer::handle_xfer_connection(conn, store_clone).await {
+                    tracing::warn!("xfer session error: {e}");
+                }
+            } else if alpn == node::NODE_ALPN {
+                if let Err(e) =
+                    node::handle_node_connection(conn, store_clone, &hb_id_clone, queue_clone)
+                        .await
+                {
+                    tracing::warn!("node session error: {e}");
+                }
+            } else {
+                tracing::debug!("unknown ALPN on incoming connection, dropping");
+            }
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +137,7 @@ pub fn run() {
 
             let identity: SharedIdentity = Arc::new(RwLock::new(None));
             let endpoint_state: SharedEndpoint = Arc::new(RwLock::new(None));
+            let dm_queue: SharedDmQueue = Arc::new(tokio::sync::Mutex::new(vec![]));
 
             // Load saved relay URLs from settings, if any.
             let store_tmp = DataStore::new(data_dir.clone());
@@ -102,15 +157,21 @@ pub fn run() {
             app.manage(Arc::clone(&relay));
             app.manage(Arc::clone(&endpoint_state));
             app.manage(Arc::clone(&download_registry));
+            app.manage(Arc::clone(&dm_queue));
 
             // If a keypair is already on disk, start the iroh endpoint immediately.
             if let Ok(Some(stored)) = store_tmp.load_keypair() {
                 let ep_arc = Arc::clone(&endpoint_state);
+                let q_arc = Arc::clone(&dm_queue);
                 let store_for_ep = DataStore::new(data_dir.clone());
+                let hb_id = stored.hb_id.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Ok(bytes) = hex::decode(&stored.private_key_hex) {
                         if let Ok(arr) = bytes.try_into() {
-                            if let Err(e) = start_iroh_endpoint(&arr, store_for_ep, ep_arc).await {
+                            if let Err(e) =
+                                start_iroh_endpoint(&arr, store_for_ep, ep_arc, q_arc, hb_id)
+                                    .await
+                            {
                                 tracing::warn!("iroh endpoint startup failed: {e}");
                             }
                         }
@@ -151,6 +212,7 @@ pub fn run() {
             commands::identity::get_hb_id,
             commands::identity::validate_hb_id,
             commands::identity::get_node_addr,
+            node::fetch_direct_dm_inbox,
             commands::identity::export_keypair,
             commands::identity::save_keypair_file,
             commands::identity::wipe_data,
