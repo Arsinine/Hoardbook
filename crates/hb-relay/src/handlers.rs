@@ -1,5 +1,5 @@
 use axum::{
-    extract::{ConnectInfo, Path, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -81,6 +81,16 @@ pub async fn publish(
     }
 
     let pubkey = &envelope.public_key;
+
+    // M6: stop one sender monopolizing a recipient, or flooding many recipients.
+    if db::count_messages_from_to(&state.pool, pubkey, &msg.to).await? >= db::MAX_MESSAGES_PER_PAIR {
+        return Err(AppError::BadRequest(
+            "too many undelivered messages to this recipient".into(),
+        ));
+    }
+    if db::count_messages_from(&state.pool, pubkey).await? >= db::MAX_MESSAGES_PER_SENDER {
+        return Err(AppError::BadRequest("sender message quota exceeded".into()));
+    }
     let envelope_json = serde_json::to_string(&envelope)
         .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
 
@@ -106,39 +116,33 @@ fn timestamp_is_fresh(ts: &str) -> Option<bool> {
 // POST /v1/heartbeat
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-pub struct HeartbeatRequest {
-    pub public_key: String,
-    pub signed_at: String,
-    pub node_addr: Option<String>,
-    pub signature: String,
-}
-
 pub async fn heartbeat(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
-    Json(body): Json<HeartbeatRequest>,
+    Json(envelope): Json<SignedEnvelope>,
 ) -> Result<StatusCode, AppError> {
     if !state.rate_limiter.check(&addr.ip().to_string()) {
         return Err(AppError::BadRequest("rate limit exceeded".into()));
     }
+
+    // L16: a heartbeat is a self-contained SignedEnvelope — verify it like any
+    // other signed document instead of reconstructing the signed body by hand.
+    envelope.verify()?;
+    if envelope.doc_type != DocType::Heartbeat {
+        return Err(AppError::BadRequest(
+            "envelope doc_type must be 'heartbeat'".into(),
+        ));
+    }
+
+    let body: HeartbeatBody = envelope
+        .parse_payload()
+        .map_err(|e: HbError| AppError::BadRequest(e.to_string()))?;
 
     if !timestamp_is_fresh(&body.signed_at).unwrap_or(false) {
         return Err(AppError::BadRequest(
             "heartbeat timestamp out of acceptable range".into(),
         ));
     }
-
-    let signed_body = HeartbeatBody {
-        node_addr: body.node_addr.clone(),
-        public_key: body.public_key.clone(),
-        signed_at: body.signed_at.clone(),
-    };
-    let signed_value = serde_json::to_value(&signed_body)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
-
-    let pubkey_bytes = hb_core::hb_id_decode(&body.public_key)?;
-    hb_core::crypto::verify(&pubkey_bytes, &signed_value, &body.signature)?;
 
     db::upsert_heartbeat(&state.pool, &body.public_key, body.node_addr.as_deref()).await?;
 
@@ -160,9 +164,13 @@ pub struct PeerResponse {
 const ONLINE_THRESHOLD_SECS: i64 = 600;
 
 pub async fn get_peer(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path(pubkey): Path<String>,
 ) -> Result<Json<PeerResponse>, AppError> {
+    if !state.rate_limiter.check(&addr.ip().to_string()) {
+        return Err(AppError::BadRequest("rate limit exceeded".into()));
+    }
     hb_core::hb_id_decode(&pubkey)?;
 
     let (online, node_addr, last_seen_at) = match db::get_heartbeat(&state.pool, &pubkey).await? {
@@ -181,16 +189,49 @@ pub async fn get_peer(
 // GET /v1/messages/:pubkey
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct MessagesResponse {
     pub messages: Vec<Value>,
 }
 
+/// Signed read-authorization for a mailbox fetch (H3). The client signs a JCS-canonical
+/// `{purpose, public_key, signed_at}` with its private key; the relay reconstructs that
+/// object from the PATH pubkey and verifies, so a signature only ever authorizes the
+/// signer's own mailbox.
+#[derive(Deserialize)]
+pub struct MailboxAuthQuery {
+    pub signed_at: String,
+    pub signature: String,
+}
+
+pub const MAILBOX_READ_PURPOSE: &str = "hoardbook.mailbox.read.v1";
+
 pub async fn get_messages(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path(pubkey): Path<String>,
+    Query(auth): Query<MailboxAuthQuery>,
 ) -> Result<Json<MessagesResponse>, AppError> {
-    hb_core::hb_id_decode(&pubkey)?;
+    if !state.rate_limiter.check(&addr.ip().to_string()) {
+        return Err(AppError::BadRequest("rate limit exceeded".into()));
+    }
+
+    let pubkey_bytes = hb_core::hb_id_decode(&pubkey)?;
+
+    if !timestamp_is_fresh(&auth.signed_at).unwrap_or(false) {
+        return Err(AppError::BadRequest(
+            "auth timestamp out of acceptable range".into(),
+        ));
+    }
+
+    // Reconstruct the signed object from the PATH pubkey so the signed public_key is
+    // forced to equal the mailbox being read; verify against that same key.
+    let signed = serde_json::json!({
+        "purpose": MAILBOX_READ_PURPOSE,
+        "public_key": pubkey,
+        "signed_at": auth.signed_at,
+    });
+    hb_core::crypto::verify(&pubkey_bytes, &signed, &auth.signature)?;
 
     let envelopes = db::get_messages_for(&state.pool, &pubkey).await?;
     let messages = envelopes
@@ -389,21 +430,13 @@ mod tests {
 
     // --- T8: heartbeat ---
 
-    fn signed_heartbeat(kp: &HoardbookKeypair, node_addr: Option<String>) -> HeartbeatRequest {
-        let signed_at = chrono::Utc::now().to_rfc3339();
+    fn signed_heartbeat(kp: &HoardbookKeypair, node_addr: Option<String>) -> SignedEnvelope {
         let body = HeartbeatBody {
-            node_addr: node_addr.clone(),
-            public_key: kp.hb_id(),
-            signed_at: signed_at.clone(),
-        };
-        let body_value = serde_json::to_value(&body).unwrap();
-        let signature = kp.sign(&body_value);
-        HeartbeatRequest {
-            public_key: kp.hb_id(),
-            signed_at,
             node_addr,
-            signature,
-        }
+            public_key: kp.hb_id(),
+            signed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        SignedEnvelope::create(kp, DocType::Heartbeat, &body).unwrap()
     }
 
     #[tokio::test]
@@ -423,10 +456,9 @@ mod tests {
         let state = test_state().await;
         let kp = HoardbookKeypair::generate();
         let stale_at = (chrono::Utc::now() - chrono::Duration::seconds(600)).to_rfc3339();
-        let body = HeartbeatBody { node_addr: None, public_key: kp.hb_id(), signed_at: stale_at.clone() };
-        let signature = kp.sign(&serde_json::to_value(&body).unwrap());
-        let req = HeartbeatRequest { public_key: kp.hb_id(), signed_at: stale_at, node_addr: None, signature };
-        let result = heartbeat(test_addr(), State(state), Json(req)).await;
+        let body = HeartbeatBody { node_addr: None, public_key: kp.hb_id(), signed_at: stale_at };
+        let env = SignedEnvelope::create(&kp, DocType::Heartbeat, &body).unwrap();
+        let result = heartbeat(test_addr(), State(state), Json(env)).await;
         assert!(matches!(result, Err(AppError::BadRequest(_))), "stale heartbeat must be rejected");
     }
 
@@ -481,7 +513,7 @@ mod tests {
     async fn get_peer_unknown_key() {
         let state = test_state().await;
         let kp = HoardbookKeypair::generate();
-        let result = get_peer(State(state), Path(kp.hb_id())).await.unwrap();
+        let result = get_peer(test_addr(), State(state), Path(kp.hb_id())).await.unwrap();
         assert!(!result.0.online);
         assert!(result.0.last_seen_at.is_none());
         assert!(result.0.node_addr.is_none());
@@ -490,7 +522,7 @@ mod tests {
     #[tokio::test]
     async fn get_peer_invalid_format() {
         let state = test_state().await;
-        let result = get_peer(State(state), Path("not_a_valid_id".into())).await;
+        let result = get_peer(test_addr(), State(state), Path("not_a_valid_id".into())).await;
         assert!(matches!(result, Err(_)), "invalid key format must return error");
     }
 
@@ -499,7 +531,7 @@ mod tests {
         let state = test_state().await;
         let kp = HoardbookKeypair::generate();
         db::upsert_heartbeat(&state.pool, &kp.hb_id(), Some("iroh://node1")).await.unwrap();
-        let result = get_peer(State(state), Path(kp.hb_id())).await.unwrap();
+        let result = get_peer(test_addr(), State(state), Path(kp.hb_id())).await.unwrap();
         assert!(result.0.online);
         assert_eq!(result.0.node_addr.as_deref(), Some("iroh://node1"));
     }
@@ -518,7 +550,7 @@ mod tests {
         .execute(&state.pool)
         .await
         .unwrap();
-        let result = get_peer(State(state), Path(kp.hb_id())).await.unwrap();
+        let result = get_peer(test_addr(), State(state), Path(kp.hb_id())).await.unwrap();
         assert!(!result.0.online, "peer with old heartbeat must be offline");
         assert!(result.0.node_addr.is_none(), "node_addr must be absent when offline");
         assert!(result.0.last_seen_at.is_some(), "last_seen_at must still be present");
@@ -533,13 +565,72 @@ mod tests {
         assert!(!json.contains("succession"), "succession must not appear in PeerResponse");
     }
 
-    // --- T10: get_messages ---
+    // --- T10: get_messages (H3 authenticated) ---
+
+    fn signed_mailbox_query(signer: &HoardbookKeypair, mailbox: &str) -> Query<MailboxAuthQuery> {
+        let signed_at = chrono::Utc::now().to_rfc3339();
+        let signed = serde_json::json!({
+            "purpose": MAILBOX_READ_PURPOSE,
+            "public_key": mailbox,
+            "signed_at": signed_at,
+        });
+        Query(MailboxAuthQuery { signed_at, signature: signer.sign(&signed) })
+    }
 
     #[tokio::test]
     async fn get_messages_invalid_key() {
         let state = test_state().await;
-        let result = get_messages(State(state), Path("bad_key".into())).await;
+        let kp = HoardbookKeypair::generate();
+        let q = signed_mailbox_query(&kp, "bad_key");
+        let result = get_messages(test_addr(), State(state), Path("bad_key".into()), q).await;
         assert!(matches!(result, Err(_)), "invalid key must return error");
+    }
+
+    #[tokio::test]
+    async fn get_messages_valid_auth_returns_ok() {
+        let state = test_state().await;
+        let kp = HoardbookKeypair::generate();
+        let q = signed_mailbox_query(&kp, &kp.hb_id());
+        let result = get_messages(test_addr(), State(state), Path(kp.hb_id()), q).await;
+        assert!(result.is_ok(), "valid signed read must be accepted: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn get_messages_unsigned_or_forged_rejected() {
+        let state = test_state().await;
+        let kp = HoardbookKeypair::generate();
+        // Forged signature.
+        let mut q = signed_mailbox_query(&kp, &kp.hb_id());
+        q.signature = "deadbeef".repeat(8);
+        let result = get_messages(test_addr(), State(state.clone()), Path(kp.hb_id()), q).await;
+        assert!(matches!(result, Err(_)), "forged signature must be rejected");
+    }
+
+    #[tokio::test]
+    async fn get_messages_wrong_identity_rejected() {
+        // A valid signature by key A must NOT read key B's mailbox (signed key == path key).
+        let state = test_state().await;
+        let attacker = HoardbookKeypair::generate();
+        let victim = HoardbookKeypair::generate();
+        // attacker signs over the VICTIM's mailbox id, but with the attacker's key.
+        let q = signed_mailbox_query(&attacker, &victim.hb_id());
+        let result = get_messages(test_addr(), State(state), Path(victim.hb_id()), q).await;
+        assert!(matches!(result, Err(_)), "signature by non-owner must be rejected");
+    }
+
+    #[tokio::test]
+    async fn get_messages_stale_auth_rejected() {
+        let state = test_state().await;
+        let kp = HoardbookKeypair::generate();
+        let stale_at = (chrono::Utc::now() - chrono::Duration::seconds(600)).to_rfc3339();
+        let signed = serde_json::json!({
+            "purpose": MAILBOX_READ_PURPOSE,
+            "public_key": kp.hb_id(),
+            "signed_at": stale_at,
+        });
+        let q = Query(MailboxAuthQuery { signed_at: stale_at, signature: kp.sign(&signed) });
+        let result = get_messages(test_addr(), State(state), Path(kp.hb_id()), q).await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))), "stale auth must be rejected");
     }
 
     // --- T11: health ---

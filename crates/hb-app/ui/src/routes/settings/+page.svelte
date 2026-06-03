@@ -1,11 +1,12 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { generateKeypair, getHbId, getSettings, saveSettings, importKeypair, wipeData, checkRelay, checkUpdate, installUpdate } from '$lib/api.js';
+	import { generateKeypair, getHbId, getSettings, saveSettings, importKeypair, wipeData, checkRelay, checkUpdate, installUpdate, watchesGet, watchesDelete } from '$lib/api.js';
 	import type { UpdateInfo } from '$lib/api.js';
+	import type { Watch } from '$lib/types.js';
 	import { relaunch } from '@tauri-apps/plugin-process';
-	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
+	import { open as openFileDialog, confirm } from '@tauri-apps/plugin-dialog';
 	import { getVersion } from '@tauri-apps/api/app';
-	import { identity, profile, collections, contacts, toast } from '$lib/stores.js';
+	import { identity, profile, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
 
@@ -84,14 +85,13 @@
 	}
 
 	let allowDms = true;
-	let recommended = false;
-	let settingsLoaded = false;
 
 	let wipeConfirm = false;
 	let wiping = false;
 
 	onMount(async () => {
 		try { appVersion = await getVersion(); } catch { appVersion = ''; }
+		loadWatches();
 		// Always probe the bootstrap relay immediately.
 		probeRelay(BOOTSTRAP_RELAY).then(() => {}).catch(() => {
 			bootstrapStatus = 'error';
@@ -101,10 +101,8 @@
 			// Filter out bootstrap relay from user list (it's shown separately).
 			relayUrls = s.relay_urls.filter(u => u !== BOOTSTRAP_RELAY);
 			allowDms = s.allow_dms ?? true;
-			recommended = s.recommended ?? false;
-			settingsLoaded = true;
 			relayUrls.forEach(probeRelay);
-		} catch { settingsLoaded = true; }
+		} catch { /* proceed with defaults if settings load fails */ }
 	});
 
 	async function handleGenerate() {
@@ -164,25 +162,25 @@
 	async function toggleAllowDms() {
 		allowDms = !allowDms;
 		try {
-			await saveSettings({ relay_urls: relayUrls, allow_dms: allowDms, recommended });
-		} catch (e) {
-			toast(String(e), 'error');
-		}
-	}
-
-	async function toggleRecommended() {
-		recommended = !recommended;
-		try {
-			await saveSettings({ relay_urls: relayUrls, allow_dms: allowDms, recommended });
+			await saveSettings({ relay_urls: relayUrls, allow_dms: allowDms });
 		} catch (e) {
 			toast(String(e), 'error');
 		}
 	}
 
 	async function handleWipe() {
+		const ok = await confirm(
+			'This is permanent and cannot be undone. All identity, profile, and app data will be removed from this device.',
+			{ title: 'Wipe all data?', kind: 'warning' },
+		);
+		if (!ok) { wipeConfirm = false; return; }
 		wiping = true;
 		try {
-			await wipeData();
+			const deactivated = await wipeData();
+			if (!deactivated) {
+				toast('Data wiped. Your published data may linger on the relay for up to 24 hours — the relay could not be reached.', 'warning');
+				await new Promise(r => setTimeout(r, 5000));
+			}
 			await relaunch();
 		} catch (e) {
 			toast(String(e), 'error');
@@ -221,13 +219,33 @@
 	async function handleSaveRelays() {
 		savingRelays = true;
 		try {
-			await saveSettings({ relay_urls: relayUrls, allow_dms: allowDms, recommended });
+			await saveSettings({ relay_urls: relayUrls, allow_dms: allowDms });
 			toast('Relay settings saved');
 		} catch (e) {
 			toast(String(e), 'error');
 		} finally {
 			savingRelays = false;
 		}
+	}
+
+	// Watches
+	let watches: Watch[] = [];
+
+	async function loadWatches() {
+		try { watches = await watchesGet(); } catch { /* no watches */ }
+	}
+
+	async function handleDeleteWatch(name: string) {
+		try {
+			await watchesDelete(name);
+			watches = watches.filter(w => w.name !== name);
+			toast(`Watch "${name}" deleted`);
+		} catch (e) { toast(String(e), 'error'); }
+	}
+
+	function formatWatchDate(iso: string | undefined): string {
+		if (!iso) return 'Never';
+		return new Date(iso).toLocaleDateString();
 	}
 
 	$: idName = $profile?.display_name ?? 'You';
@@ -312,7 +330,7 @@
 			</div>
 			<button class="icon-btn" title="Re-check" on:click={() => probeRelay(BOOTSTRAP_RELAY)}>{@html icons.refresh}</button>
 		</div>
-		{#each relayUrls as url}
+		{#each relayUrls as url (url)}
 			{@const status = relayStatuses[url]}
 			<div class="relay-row">
 				<div class="relay-dot" style="background:{relayDotColor(status)}" class:relay-dot-pulse={status === 'checking'} />
@@ -357,16 +375,6 @@
 				<span class="toggle-thumb" />
 			</button>
 		</div>
-		<div class="surface-divider" />
-		<div class="toggle-row">
-			<div class="toggle-text">
-				<div class="toggle-label">Appear in Recommended contacts</div>
-				<div class="toggle-sub">Others can discover you without needing your hb_id. Requires relay support.</div>
-			</div>
-			<button class="toggle" class:toggle-on={recommended} on:click={toggleRecommended}>
-				<span class="toggle-thumb" />
-			</button>
-		</div>
 	</div>
 
 	<!-- Updates -->
@@ -393,6 +401,35 @@
 		</div>
 		{#if updateError}
 			<div class="update-error-text">{updateError}</div>
+		{/if}
+	</div>
+
+	<!-- Watches -->
+	<div class="section-label">Watches</div>
+
+	<div class="surface">
+		{#if watches.length === 0}
+			<div class="watches-empty">No saved watches. Create one from the Discover tab in Contacts.</div>
+		{:else}
+			<div class="watch-list">
+				{#each watches as w (w.name)}
+					<div class="watch-row-item">
+						<div class="watch-info">
+							<div class="watch-name">{w.name}</div>
+							<div class="watch-detail">
+								{#if w.content_types.length > 0}
+									<span class="watch-chip">{w.content_types.join(', ')}</span>
+								{/if}
+								{#if w.tags.length > 0}
+									<span class="watch-chip tags">#{w.tags.join(', #')}</span>
+								{/if}
+								<span class="watch-fired">Last triggered: {formatWatchDate(w.last_fired)}</span>
+							</div>
+						</div>
+						<button class="btn-ghost btn-sm btn-danger-text" on:click={() => handleDeleteWatch(w.name)}>Delete</button>
+					</div>
+				{/each}
+			</div>
 		{/if}
 	</div>
 
@@ -599,6 +636,36 @@
 		transition: left 0.15s, background 0.15s;
 	}
 	.toggle-on .toggle-thumb { left: 14px; background: var(--accent-text); }
+
+	/* Watches */
+	.watches-empty { font-size: 12.5px; color: var(--fg-dim); padding: 4px 0; }
+
+	.watch-list { display: flex; flex-direction: column; gap: 1px; }
+
+	.watch-row-item {
+		display: flex; align-items: center; gap: 10px;
+		padding: 10px 0;
+		border-bottom: 1px solid var(--divider);
+	}
+	.watch-row-item:last-child { border-bottom: none; }
+
+	.watch-info { flex: 1; min-width: 0; }
+
+	.watch-name { font-size: 13px; font-weight: 500; color: var(--fg); }
+
+	.watch-detail { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 3px; align-items: center; }
+
+	.watch-chip {
+		font-size: 10.5px; padding: 1px 7px; border-radius: 4px;
+		background: color-mix(in oklch, var(--accent) 12%, transparent);
+		color: var(--accent);
+		border: 1px solid color-mix(in oklch, var(--accent) 20%, transparent);
+	}
+	.watch-chip.tags { background: var(--bg-elev3); color: var(--fg-muted); border-color: var(--border); }
+
+	.watch-fired { font-size: 10.5px; color: var(--fg-dim); }
+
+	.btn-danger-text { color: var(--red, #e05c5c); }
 
 	/* Danger zone */
 	.danger-row {

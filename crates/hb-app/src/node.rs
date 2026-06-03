@@ -98,7 +98,10 @@ pub(crate) async fn handle_node_stream(
     dm_queue: &SharedDmQueue,
 ) -> Result<()> {
     let req_len = recv.read_u32_le().await.context("read req len")?;
-    if req_len > 1024 * 1024 {
+    // M13: cap at 64 KiB to match the transfer-request cap. The largest legitimate
+    // node request is a SendDm envelope, well under this; the old 1 MiB cap allowed
+    // a peer to force an oversized allocation per connection.
+    if req_len > 64 * 1024 {
         return Err(anyhow!("request too large: {req_len} bytes"));
     }
     let mut req_bytes = vec![0u8; req_len as usize];

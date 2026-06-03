@@ -64,6 +64,19 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Background task: sweep expired rate-limiter entries so the map can't grow
+    // without bound from IP rotation (M5).
+    {
+        let rate_limiter = state.rate_limiter.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                rate_limiter.sweep();
+            }
+        });
+    }
+
     let app = Router::new()
         .route("/v1/publish",          post(handlers::publish))
         .route("/v1/heartbeat",        post(handlers::heartbeat))

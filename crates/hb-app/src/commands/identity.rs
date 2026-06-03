@@ -1,6 +1,7 @@
 use hb_core::{HoardbookKeypair, hb_id_decode, types::StoredKeypair};
 use serde::Serialize;
 use tauri::State;
+use zeroize::Zeroize;
 
 use crate::{
     SharedDmQueue, SharedEndpoint, SharedIdentity, SharedRelay,
@@ -85,13 +86,14 @@ pub async fn import_keypair(
     let stored: StoredKeypair = serde_json::from_str(&json)
         .map_err(|e| format!("Invalid keypair file: {e}"))?;
 
-    let private_bytes: [u8; 32] = hex::decode(&stored.private_key_hex)
+    let mut private_bytes: [u8; 32] = hex::decode(&stored.private_key_hex)
         .map_err(|e| format!("Invalid private key hex: {e}"))?
         .try_into()
         .map_err(|_| "Private key must be exactly 32 bytes".to_string())?;
 
     let kp = HoardbookKeypair::from_bytes(&private_bytes);
     if kp.hb_id() != stored.hb_id {
+        private_bytes.zeroize();
         return Err("Keypair file is corrupted: public key does not match the private key".into());
     }
 
@@ -108,6 +110,10 @@ pub async fn import_keypair(
     ).await {
         tracing::warn!("iroh endpoint startup failed after keypair import: {e}");
     }
+
+    // Best-effort: scrub the transient private-key buffer (L15/hardening). The
+    // keypair itself still holds the key for the session, as required.
+    private_bytes.zeroize();
 
     *identity.write().await = Some(kp);
     Ok(info)
@@ -128,12 +134,13 @@ pub async fn get_identity(
         None => return Ok(None),
     };
 
-    let bytes: [u8; 32] = hex::decode(&stored.private_key_hex)
+    let mut bytes: [u8; 32] = hex::decode(&stored.private_key_hex)
         .map_err(cmd_err)?
         .try_into()
         .map_err(|_| "keypair file has invalid length".to_string())?;
 
     let kp = HoardbookKeypair::from_bytes(&bytes);
+    bytes.zeroize();
     if kp.hb_id() != stored.hb_id {
         return Err("Stored keypair is corrupted: derived public key does not match stored hb_id".into());
     }

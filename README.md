@@ -50,17 +50,21 @@ hb-app/     — Tauri 2.x desktop app (Rust backend + SvelteKit UI)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/v1/publish` | Publish a signed profile, collection, succession, or DM |
-| `POST` | `/v1/heartbeat` | Update online status; opt into public directory with `listed: true` |
-| `GET`  | `/v1/peer/:pubkey` | Fetch a peer's profile, collections, and online status |
-| `GET`  | `/v1/messages/:pubkey` | Fetch DMs addressed to a pubkey |
-| `GET`  | `/v1/directory` | List peers that opted into the public directory (require published profile) |
-| `GET`  | `/v1/channel/:channel` | Fetch recent public channel messages |
-| `POST` | `/v1/channel/:channel` | Post a signed message to a public channel |
-| `GET`  | `/v1/name/:display_name` | Check if a display name is taken (anti-spoofing) |
-| `GET`  | `/v1/health` | Relay health and stored-document count |
+| `POST` | `/v1/publish` | Publish a signed DM envelope (messages only; profiles/collections are served peer-to-peer via iroh) |
+| `POST` | `/v1/heartbeat` | Update online status + `node_addr` (a signed `DocType::Heartbeat` envelope) |
+| `GET`  | `/v1/peer/:pubkey` | Fetch a peer's online status and `node_addr` |
+| `GET`  | `/v1/messages/:pubkey?signed_at&signature` | Fetch DMs — **requires a signed read-authorization proving ownership of `:pubkey`** |
+| `GET`  | `/v1/health` | Relay health and stored-peer count |
 
-All documents are `SignedEnvelope` — a JCS-canonicalized JSON payload with an Ed25519 signature. The relay verifies every signature before storing anything.
+All documents are `SignedEnvelope` — a JCS-canonicalized JSON payload **plus header (`doc_type`, `public_key`, `signed_at`)** under one Ed25519 signature. The relay verifies every signature before storing anything.
+
+> **Planned (not yet implemented):** a public directory (`/v1/directory`), channels (`/v1/channel/:channel`), and display-name lookup (`/v1/name/:display_name`). These are not in the current router and will need their own authorization review before they ship.
+
+**Security notes**
+- **Transport:** clients require `https://` relay URLs. `http://` is rejected unless `HB_ALLOW_INSECURE_RELAY=1` is set (dev/test only; off in release). The relay binary serves plain HTTP and is expected to sit behind a TLS-terminating reverse proxy.
+- **Mailbox privacy:** reads are authenticated (a signature by the recipient key), so third parties cannot harvest a mailbox. The relay operator, however, still sees DM metadata (sender, recipient, timing) and stores ciphertext — DMs are end-to-end encrypted (X25519 + XChaCha20-Poly1305 with `{from,to,sent_at}` as AEAD associated data), so content stays private from the operator.
+- **`allow_dms`** is a client-side display filter, not a relay-enforced access control.
+- **Key storage:** private keys are DPAPI-encrypted on Windows and stored as `chmod 600` plaintext JSON on Linux/macOS (a passphrase-protected keystore is a planned hardening).
 
 ---
 

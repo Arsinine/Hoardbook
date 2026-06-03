@@ -120,6 +120,12 @@ pub async fn get_heartbeat(
 // ---------------------------------------------------------------------------
 
 pub const MAX_MESSAGES_PER_RECIPIENT: i64 = 500;
+/// Per-(sender, recipient) cap — stops one sender from monopolizing a recipient's
+/// mailbox under the global cap (M6).
+pub const MAX_MESSAGES_PER_PAIR: i64 = 50;
+/// Per-sender cap across all recipients — stops one sender from flooding many
+/// distinct mailboxes (M6).
+pub const MAX_MESSAGES_PER_SENDER: i64 = 200;
 
 pub async fn insert_message(
     pool: &SqlitePool,
@@ -156,6 +162,33 @@ pub async fn count_messages_for(pool: &SqlitePool, to_key: &str) -> Result<i64> 
         "SELECT COUNT(*) FROM messages WHERE to_key = ? AND expires_at > ?",
     )
     .bind(to_key)
+    .bind(now)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+/// Counts non-expired messages from `from_key` to `to_key` (per-pair cap, M6).
+pub async fn count_messages_from_to(pool: &SqlitePool, from_key: &str, to_key: &str) -> Result<i64> {
+    let now = now_secs();
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM messages WHERE from_key = ? AND to_key = ? AND expires_at > ?",
+    )
+    .bind(from_key)
+    .bind(to_key)
+    .bind(now)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+/// Counts non-expired messages sent by `from_key` to any recipient (per-sender cap, M6).
+pub async fn count_messages_from(pool: &SqlitePool, from_key: &str) -> Result<i64> {
+    let now = now_secs();
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM messages WHERE from_key = ? AND expires_at > ?",
+    )
+    .bind(from_key)
     .bind(now)
     .fetch_one(pool)
     .await?;
