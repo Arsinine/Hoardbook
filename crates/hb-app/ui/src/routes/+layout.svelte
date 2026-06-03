@@ -17,7 +17,12 @@
 	onMount(() => {
 		// Async init (IIFE so onMount can return a sync cleanup function).
 		(async () => {
-			try { identity.set(await getIdentity()); } catch { }
+			try { identity.set(await getIdentity()); } catch (e) {
+				// A DPAPI or I/O failure loading the saved keypair. The user will be
+				// shown the onboarding screen. If they try to generate a new keypair the
+				// backend will surface a specific recovery message.
+				console.error('getIdentity failed:', e);
+			}
 			try { profile.set(await getProfile()); } catch { }
 			try { collections.set(await getCollections()); } catch { }
 			try { contacts.set(await getContacts()); } catch { }

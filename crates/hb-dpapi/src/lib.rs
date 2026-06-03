@@ -35,7 +35,7 @@ pub fn decrypt(_data: &[u8]) -> Result<Vec<u8>> {
 #[cfg(target_os = "windows")]
 mod win {
     use anyhow::{anyhow, Result};
-    use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows_sys::Win32::Foundation::{GetLastError, LocalFree, HLOCAL};
     use windows_sys::Win32::Security::Cryptography::{
         CryptProtectData, CryptUnprotectData,
     };
@@ -65,7 +65,8 @@ mod win {
         };
 
         if ok == 0 {
-            return Err(anyhow!("CryptProtectData failed"));
+            let err = unsafe { GetLastError() };
+            return Err(anyhow!("CryptProtectData failed (Windows error {err:#010x})"));
         }
 
         let out = unsafe { std::slice::from_raw_parts(dst.pb, dst.cb as usize).to_vec() };
@@ -90,7 +91,8 @@ mod win {
         };
 
         if ok == 0 {
-            return Err(anyhow!("CryptUnprotectData failed"));
+            let err = unsafe { GetLastError() };
+            return Err(anyhow!("CryptUnprotectData failed (Windows error {err:#010x})"));
         }
 
         let out = unsafe { std::slice::from_raw_parts(dst.pb, dst.cb as usize).to_vec() };

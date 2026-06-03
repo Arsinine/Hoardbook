@@ -39,8 +39,22 @@ pub async fn generate_keypair(
     endpoint: State<'_, SharedEndpoint>,
     dm_queue: State<'_, SharedDmQueue>,
 ) -> CmdResult<IdentityInfo> {
-    if store.load_keypair().map_err(cmd_err)?.is_some() {
-        return Err("A keypair already exists. Use rotate_keypair to replace it.".into());
+    match store.load_keypair() {
+        Ok(Some(_)) => return Err("A keypair already exists. Use rotate_keypair to replace it.".into()),
+        Ok(None) => {} // no keypair on disk — proceed
+        Err(e) => {
+            // The file exists but cannot be read/decrypted (e.g. DPAPI failure after a
+            // Windows credential change, or a corrupted file).  Don't propagate the raw
+            // crypto error; instead surface an actionable message.
+            if store.keypair_path().exists() {
+                return Err(format!(
+                    "Existing keypair data cannot be read ({e}). \
+                     Go to Settings → Wipe data to clear all local data and start over."
+                ).into());
+            }
+            // File absent but read still failed — unexpected, propagate.
+            return Err(cmd_err(e));
+        }
     }
 
     let kp = HoardbookKeypair::generate();

@@ -175,7 +175,11 @@ pub fn run() {
             app.manage(Arc::clone(&hb_cancel));
 
             // If a keypair is already on disk, populate identity and start the iroh endpoint.
-            if let Ok(Some(stored)) = store_tmp.load_keypair() {
+            let keypair_load_result = store_tmp.load_keypair();
+            if let Err(ref e) = keypair_load_result {
+                tracing::error!("Failed to load keypair on startup: {e:#}");
+            }
+            if let Ok(Some(stored)) = keypair_load_result {
                 // Populate SharedIdentity synchronously so the heartbeat task always
                 // has a keypair when it fires its first beat 15 s after launch.
                 if let Ok(bytes) = hex::decode(&stored.private_key_hex) {
