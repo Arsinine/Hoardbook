@@ -52,18 +52,20 @@
 			defaultPath: 'hoardbook-keypair-backup.json',
 			filters: [{ name: 'JSON backup', extensions: ['json'] }],
 		});
-		if (path) {
-			const ok = await confirm(
-				'This file contains your private key. Store it somewhere safe and never share it.',
-				{ title: 'Save keypair backup', kind: 'warning' },
-			);
-			if (!ok) return;
-			try {
-				await saveKeypairFile(path);
-				toast('Backup saved', 'success');
-			} catch (e) { toast(String(e), 'error'); }
+		if (!path) return; // dialog cancelled — stay on step 1, let user click "I'll do it later"
+		const ok = await confirm(
+			'This file contains your private key. Store it somewhere safe and never share it.',
+			{ title: 'Save keypair backup', kind: 'warning' },
+		);
+		if (!ok) return;
+		try {
+			await saveKeypairFile(path);
+			toast('Backup saved', 'success');
+			obStep = 2;
+		} catch (e) {
+			// Export failed — stay on step 1 so the user can retry or explicitly skip.
+			toast(String(e), 'error');
 		}
-		obStep = 2;
 	}
 
 	async function obImportFromQurator() {
