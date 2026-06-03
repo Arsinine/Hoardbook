@@ -4,7 +4,8 @@
 	import { get } from 'svelte/store';
 	import { page } from '$app/stores';
 	import { getIdentity, getProfile, getCollections, getContacts, getMessages, listenDownloadProgress } from '$lib/api.js';
-	import { identity, profile, collections, contacts, inboxMessages, toastMessage, appReady, unreadCount, downloads, applyDownloadEvent } from '$lib/stores.js';
+	import { identity, profile, collections, contacts, inboxMessages, toastMessage, appReady, unreadCount, downloads, applyDownloadEvent, toast } from '$lib/stores.js';
+	import { listen } from '@tauri-apps/api/event';
 	import { navIcons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import { getVersion } from '@tauri-apps/api/app';
@@ -44,6 +45,19 @@
 			downloads.update(list => applyDownloadEvent(list, ev));
 		}).then(fn => { unlistenDownload = fn; });
 
+		// Update-available event from the backend background check.
+		let unlistenUpdate: (() => void) | undefined;
+		listen<string>('update-available', (event) => {
+			toast(`Update v${event.payload} available — check Settings to install`, 'success');
+		}).then(fn => { unlistenUpdate = fn; });
+
+		// Direct DM received via iroh — increment unread badge if not on the chat page.
+		let unlistenDm: (() => void) | undefined;
+		listen<number>('dm-received', () => {
+			const onChat = window.location.pathname === '/chat';
+			if (!onChat) unreadCount.update(n => n + 1);
+		}).then(fn => { unlistenDm = fn; });
+
 		// Background poll: keeps inboxMessages fresh and drives the nav badge.
 		const poll = setInterval(async () => {
 			if (!get(identity)) return;
@@ -66,6 +80,8 @@
 		return () => {
 			clearInterval(poll);
 			unlistenDownload?.();
+			unlistenUpdate?.();
+			unlistenDm?.();
 		};
 	});
 

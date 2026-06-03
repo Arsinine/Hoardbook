@@ -11,6 +11,10 @@ use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+// Optional TLS: set TLS_CERT and TLS_KEY env vars to paths of a PEM cert + key file.
+// When both are set the relay serves HTTPS directly; otherwise plain HTTP.
+// For production, a Caddy/nginx reverse proxy is also an option.
+
 use state::AppState;
 
 #[tokio::main]
@@ -86,13 +90,29 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
-    tracing::info!("hb-relay listening on {bind_addr}");
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
+    let tls_cert = std::env::var("TLS_CERT").ok();
+    let tls_key  = std::env::var("TLS_KEY").ok();
+
+    match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => {
+            tracing::info!("hb-relay listening on {bind_addr} (TLS)");
+            let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+                .await
+                .with_context(|| format!("failed to load TLS cert={cert} key={key}"))?;
+            axum_server::bind_rustls(bind_addr, tls_config)
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                .await?;
+        }
+        _ => {
+            tracing::info!("hb-relay listening on {bind_addr}");
+            let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await?;
+        }
+    }
 
     Ok(())
 }
