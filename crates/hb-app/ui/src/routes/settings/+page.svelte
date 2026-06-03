@@ -169,11 +169,6 @@
 	}
 
 	async function handleWipe() {
-		const ok = await confirm(
-			'This is permanent and cannot be undone. All identity, profile, and app data will be removed from this device.',
-			{ title: 'Wipe all data?', kind: 'warning' },
-		);
-		if (!ok) { wipeConfirm = false; return; }
 		wiping = true;
 		try {
 			const deactivated = await wipeData();
