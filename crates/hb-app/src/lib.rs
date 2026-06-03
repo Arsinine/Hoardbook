@@ -17,6 +17,7 @@ use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
 };
+use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::RwLock;
 
 /// Managed state types — Arc-wrapped so they can be cloned into background tasks.
