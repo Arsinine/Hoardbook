@@ -216,7 +216,7 @@ pub async fn export_collection(
         .list_collections()
         .map_err(cmd_err)?
         .into_iter()
-        .find(|e| e.parse_payload::<Collection>().ok().map_or(false, |c| c.slug == safe_slug))
+        .find(|e| e.parse_payload::<Collection>().ok().is_some_and(|c| c.slug == safe_slug))
     {
         env.parse_payload().map_err(cmd_err)?
     } else {

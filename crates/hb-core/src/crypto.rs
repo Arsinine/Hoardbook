@@ -7,7 +7,7 @@
 
 use base64::Engine as _;
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -36,7 +36,7 @@ pub fn hb_id_encode(pubkey: &[u8; 32]) -> String {
 pub fn hb_id_decode(id: &str) -> Result<[u8; 32], HbError> {
     let encoded = id
         .strip_prefix("hb1_")
-        .ok_or_else(|| HbError::InvalidId("missing hb1_ prefix".into()))?;
+        .ok_or(HbError::InvalidPrefix)?;
 
     let bytes = bs58::decode(encoded)
         .into_vec()
@@ -172,11 +172,16 @@ impl HoardbookKeypair {
     // -------------------------------------------------------------------------
 
     /// Encrypt `plaintext` for `recipient_pubkey` (raw Ed25519 bytes from hb_id_decode).
+    /// `aad` is authenticated-but-not-encrypted associated data (L12) — the recipient
+    /// must supply byte-identical AAD to decrypt. Callers bind the message context
+    /// (`{from, to, sent_at}`) here so a ciphertext can't be replayed under a
+    /// different sender/recipient/timestamp.
     /// Returns `base64(nonce[24] || ciphertext)`.
     pub fn encrypt_for(
         &self,
         recipient_pubkey: &[u8; 32],
         plaintext: &str,
+        aad: &[u8],
     ) -> Result<String, crate::error::HbError> {
         let recipient_x25519 = ed25519_pubkey_to_x25519(recipient_pubkey)?;
         let my_x25519 = self.to_x25519_secret();
@@ -189,7 +194,7 @@ impl HoardbookKeypair {
 
         let cipher = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key));
         let ciphertext = cipher
-            .encrypt(nonce, plaintext.as_bytes())
+            .encrypt(nonce, Payload { msg: plaintext.as_bytes(), aad })
             .map_err(|_| crate::error::HbError::EncryptionFailed)?;
 
         let mut packed = Vec::with_capacity(24 + ciphertext.len());
@@ -205,6 +210,7 @@ impl HoardbookKeypair {
         &self,
         sender_pubkey: &[u8; 32],
         encrypted: &str,
+        aad: &[u8],
     ) -> Result<String, crate::error::HbError> {
         let sender_x25519 = ed25519_pubkey_to_x25519(sender_pubkey)?;
         let my_x25519 = self.to_x25519_secret();
@@ -225,7 +231,7 @@ impl HoardbookKeypair {
 
         let cipher = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key));
         let plaintext_bytes = cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(nonce, Payload { msg: ciphertext, aad })
             .map_err(|_| crate::error::HbError::DecryptionFailed)?;
 
         String::from_utf8(plaintext_bytes).map_err(|_| crate::error::HbError::DecryptionFailed)
@@ -307,6 +313,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Milestone T2: generate_uniqueness
+    #[test]
+    fn generate_uniqueness() {
+        let kp1 = HoardbookKeypair::generate();
+        let kp2 = HoardbookKeypair::generate();
+        assert_ne!(kp1.hb_id(), kp2.hb_id(), "each generate() call must produce a unique keypair");
+    }
+
     #[test]
     fn encode_decode_roundtrip() {
         let kp = HoardbookKeypair::generate();
@@ -360,30 +374,82 @@ mod tests {
         assert!(matches!(result, Err(HbError::InvalidSignature)));
     }
 
+    /// Milestone T2 integration: sign_order_invariant
+    /// JCS must produce the same canonical bytes regardless of key insertion order,
+    /// so signatures over logically identical objects must be identical.
+    #[test]
+    fn sign_order_invariant() {
+        let kp = HoardbookKeypair::generate();
+        let a = json!({ "b": 2, "a": 1 });
+        let b = json!({ "a": 1, "b": 2 });
+        assert_eq!(
+            kp.sign(&a),
+            kp.sign(&b),
+            "signatures over same-content objects must match regardless of key order"
+        );
+    }
+
     // ---------- hb_id_decode rejection cases ----------
+
+    /// Milestone T1: prefix_rejection — wrong prefix returns InvalidPrefix specifically
+    #[test]
+    fn prefix_rejection() {
+        // "hb2_" prefix → InvalidPrefix
+        let kp = HoardbookKeypair::generate();
+        let valid = kp.hb_id();
+        let hb2 = format!("hb2_{}", &valid[4..]);
+        assert!(matches!(hb_id_decode(&hb2), Err(HbError::InvalidPrefix)));
+        // No prefix at all
+        assert!(matches!(hb_id_decode(&valid[4..]), Err(HbError::InvalidPrefix)));
+        // Empty string
+        assert!(matches!(hb_id_decode(""), Err(HbError::InvalidPrefix)));
+        // Wrong case
+        assert!(matches!(hb_id_decode("HB1_something"), Err(HbError::InvalidPrefix)));
+    }
 
     #[test]
     fn hb_id_decode_rejects_wrong_prefix() {
         let kp = HoardbookKeypair::generate();
         let valid = kp.hb_id();
-        // Strip the "hb1_" prefix
         let stripped = &valid[4..];
-        assert!(matches!(hb_id_decode(stripped), Err(HbError::InvalidId(_))));
-        assert!(matches!(hb_id_decode(""), Err(HbError::InvalidId(_))));
-        assert!(matches!(hb_id_decode("HB1_something"), Err(HbError::InvalidId(_))));
+        assert!(matches!(hb_id_decode(stripped), Err(HbError::InvalidPrefix)));
+        assert!(matches!(hb_id_decode(""), Err(HbError::InvalidPrefix)));
+        assert!(matches!(hb_id_decode("HB1_something"), Err(HbError::InvalidPrefix)));
     }
 
+    /// Milestone T1: base58_excludes_ambiguous
     #[test]
-    fn hb_id_decode_rejects_invalid_base58() {
+    fn base58_excludes_ambiguous() {
         // '0', 'O', 'I', 'l' are not valid base58 characters
         assert!(matches!(hb_id_decode("hb1_0OIl"), Err(HbError::InvalidId(_))));
     }
 
     #[test]
-    fn hb_id_decode_rejects_wrong_length() {
-        // Too short: valid prefix but only a few bytes of base58
+    fn hb_id_decode_rejects_invalid_base58() {
+        assert!(matches!(hb_id_decode("hb1_0OIl"), Err(HbError::InvalidId(_))));
+    }
+
+    /// Milestone T1: length_rejection_short
+    #[test]
+    fn length_rejection_short() {
         assert!(matches!(hb_id_decode("hb1_abc"), Err(HbError::InvalidId(_))));
-        // Too long: extra bytes appended
+        assert!(matches!(hb_id_decode("hb1_"), Err(HbError::InvalidId(_))));
+    }
+
+    /// Milestone T1: length_rejection_long
+    #[test]
+    fn length_rejection_long() {
+        let kp = HoardbookKeypair::generate();
+        let long = format!("{}AAAA", kp.hb_id());
+        assert!(matches!(
+            hb_id_decode(&long),
+            Err(HbError::InvalidId(_)) | Err(HbError::InvalidChecksum)
+        ));
+    }
+
+    #[test]
+    fn hb_id_decode_rejects_wrong_length() {
+        assert!(matches!(hb_id_decode("hb1_abc"), Err(HbError::InvalidId(_))));
         let kp = HoardbookKeypair::generate();
         let long = format!("{}AAAA", kp.hb_id());
         assert!(matches!(
@@ -419,9 +485,29 @@ mod tests {
         // A zero nonce or fixed nonce would make all ciphertexts identical for identical inputs.
         let alice = HoardbookKeypair::generate();
         let bob = HoardbookKeypair::generate();
-        let ct1 = alice.encrypt_for(&bob.public_key_bytes(), "same message").unwrap();
-        let ct2 = alice.encrypt_for(&bob.public_key_bytes(), "same message").unwrap();
+        let ct1 = alice.encrypt_for(&bob.public_key_bytes(), "same message", b"").unwrap();
+        let ct2 = alice.encrypt_for(&bob.public_key_bytes(), "same message", b"").unwrap();
         assert_ne!(ct1, ct2, "nonce must be random — reuse would break stream-cipher secrecy");
+    }
+
+    /// L12: AAD must match byte-for-byte or decryption fails.
+    #[test]
+    fn aad_mismatch_fails_decrypt() {
+        let alice = HoardbookKeypair::generate();
+        let bob = HoardbookKeypair::generate();
+        let ct = alice
+            .encrypt_for(&bob.public_key_bytes(), "secret", b"from=alice;to=bob")
+            .unwrap();
+        // Correct AAD decrypts.
+        assert_eq!(
+            bob.decrypt_from(&alice.public_key_bytes(), &ct, b"from=alice;to=bob").unwrap(),
+            "secret"
+        );
+        // Tampered AAD (e.g. attacker rewrites the recipient) fails the tag check.
+        assert!(
+            bob.decrypt_from(&alice.public_key_bytes(), &ct, b"from=alice;to=eve").is_err(),
+            "AAD mismatch must fail decryption"
+        );
     }
 
     #[test]
@@ -433,12 +519,12 @@ mod tests {
 
         // Alice encrypts for Bob
         let ciphertext = alice
-            .encrypt_for(&bob.public_key_bytes(), plaintext)
+            .encrypt_for(&bob.public_key_bytes(), plaintext, b"")
             .expect("encryption should succeed");
 
         // Bob decrypts from Alice
         let recovered = bob
-            .decrypt_from(&alice.public_key_bytes(), &ciphertext)
+            .decrypt_from(&alice.public_key_bytes(), &ciphertext, b"")
             .expect("decryption should succeed");
 
         assert_eq!(recovered, plaintext);
@@ -451,11 +537,11 @@ mod tests {
         let eve = HoardbookKeypair::generate();
 
         let ciphertext = alice
-            .encrypt_for(&bob.public_key_bytes(), "secret")
+            .encrypt_for(&bob.public_key_bytes(), "secret", b"")
             .unwrap();
 
         // Eve tries to decrypt using Alice's public key — wrong shared secret
-        let result = eve.decrypt_from(&alice.public_key_bytes(), &ciphertext);
+        let result = eve.decrypt_from(&alice.public_key_bytes(), &ciphertext, b"");
         assert!(result.is_err(), "decryption with wrong key must fail");
     }
 
@@ -465,7 +551,7 @@ mod tests {
         let bob = HoardbookKeypair::generate();
 
         let ciphertext = alice
-            .encrypt_for(&bob.public_key_bytes(), "secret message")
+            .encrypt_for(&bob.public_key_bytes(), "secret message", b"")
             .unwrap();
 
         // Flip a byte in the base64 to corrupt the ciphertext
@@ -475,7 +561,7 @@ mod tests {
         bytes[30] ^= 0xFF;
         let tampered = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
-        let result = bob.decrypt_from(&alice.public_key_bytes(), &tampered);
+        let result = bob.decrypt_from(&alice.public_key_bytes(), &tampered, b"");
         assert!(result.is_err(), "tampered ciphertext must not decrypt");
     }
 
@@ -485,9 +571,9 @@ mod tests {
         // the shared secret is derived from (sender_priv × recipient_pub), so the roles matter.
         let alice = HoardbookKeypair::generate();
         let bob = HoardbookKeypair::generate();
-        let ct = alice.encrypt_for(&bob.public_key_bytes(), "secret").unwrap();
+        let ct = alice.encrypt_for(&bob.public_key_bytes(), "secret", b"").unwrap();
         // Bob tries to decrypt, incorrectly treating himself as the sender
-        let result = bob.decrypt_from(&bob.public_key_bytes(), &ct);
+        let result = bob.decrypt_from(&bob.public_key_bytes(), &ct, b"");
         assert!(result.is_err(), "ECDH shared secret must depend on both parties' distinct keys");
     }
 }

@@ -23,10 +23,24 @@ impl RateLimiter {
         }
     }
 
+    /// Drop entries whose window has fully elapsed. Called periodically so the map
+    /// can't grow without bound from IP rotation (M5).
+    pub fn sweep(&self) {
+        let mut map = self.state.lock().unwrap();
+        let now = Instant::now();
+        let window = self.window;
+        map.retain(|_, (start, _)| now.duration_since(*start) < window);
+    }
+
     /// Returns `true` if the request should be allowed, `false` if rate-limited.
     pub fn check(&self, ip: &str) -> bool {
         let mut map = self.state.lock().unwrap();
         let now = Instant::now();
+        // Opportunistic eviction: bound memory even between periodic sweeps.
+        if map.len() > 10_000 {
+            let window = self.window;
+            map.retain(|_, (start, _)| now.duration_since(*start) < window);
+        }
         let entry = map.entry(ip.to_string()).or_insert((now, 0));
         if now.duration_since(entry.0) >= self.window {
             *entry = (now, 1);

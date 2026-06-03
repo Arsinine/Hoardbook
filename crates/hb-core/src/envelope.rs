@@ -15,6 +15,7 @@ pub enum DocType {
     Profile,
     Collection,
     Message,
+    Heartbeat,
 }
 
 // ---------------------------------------------------------------------------
@@ -52,20 +53,28 @@ impl SignedEnvelope {
         payload: &T,
     ) -> Result<Self, HbError> {
         let payload_value = serde_json::to_value(payload)?;
-        let signature = keypair.sign(&payload_value);
+        let signed_at = Utc::now();
+        let public_key = keypair.hb_id();
+        // L11: sign the header (doc_type, public_key, signed_at) together with the
+        // payload, so a relay/MITM can't mutate envelope metadata without breaking
+        // the signature.
+        let to_sign = signing_value(&doc_type, &signed_at, &public_key, &payload_value);
+        let signature = keypair.sign(&to_sign);
         Ok(Self {
             doc_type,
             payload: payload_value,
-            public_key: keypair.hb_id(),
+            public_key,
             signature,
-            signed_at: Utc::now(),
+            signed_at,
         })
     }
 
     /// Verify the envelope's signature. Returns `Ok(())` if valid.
     pub fn verify(&self) -> Result<(), HbError> {
         let pubkey_bytes = crypto::hb_id_decode(&self.public_key)?;
-        crypto::verify(&pubkey_bytes, &self.payload, &self.signature)
+        let to_verify =
+            signing_value(&self.doc_type, &self.signed_at, &self.public_key, &self.payload);
+        crypto::verify(&pubkey_bytes, &to_verify, &self.signature)
     }
 
     /// Deserialize the payload into a concrete type.
@@ -77,6 +86,24 @@ impl SignedEnvelope {
     pub fn canonical_payload_bytes(&self) -> Vec<u8> {
         jcs::canonicalize(&self.payload)
     }
+}
+
+/// Build the exact JSON value that gets signed: the header fields plus the payload.
+/// Used by both `create` and `verify` so the signed bytes always match (L11).
+fn signing_value(
+    doc_type: &DocType,
+    signed_at: &DateTime<Utc>,
+    public_key: &str,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "header": {
+            "doc_type": doc_type,
+            "public_key": public_key,
+            "signed_at": signed_at,
+        },
+        "payload": payload,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +153,31 @@ mod tests {
         env.payload["display_name"] = serde_json::Value::String("hacker".into());
         let result = env.verify();
         assert!(matches!(result, Err(HbError::InvalidSignature)));
+    }
+
+    /// L11: the header (doc_type, public_key, signed_at) is now covered by the signature.
+    #[test]
+    fn verify_rejects_tampered_header() {
+        let kp = HoardbookKeypair::generate();
+        let profile = test_profile();
+
+        let mut env = SignedEnvelope::create(&kp, DocType::Profile, &profile).unwrap();
+        env.doc_type = DocType::Message;
+        assert!(
+            matches!(env.verify(), Err(HbError::InvalidSignature)),
+            "doc_type tamper must break the signature"
+        );
+
+        let mut env2 = SignedEnvelope::create(&kp, DocType::Profile, &profile).unwrap();
+        env2.signed_at += chrono::Duration::seconds(1);
+        assert!(
+            matches!(env2.verify(), Err(HbError::InvalidSignature)),
+            "signed_at tamper must break the signature"
+        );
+
+        let mut env3 = SignedEnvelope::create(&kp, DocType::Profile, &profile).unwrap();
+        env3.public_key = HoardbookKeypair::generate().hb_id();
+        assert!(env3.verify().is_err(), "public_key tamper must fail verification");
     }
 
     #[test]

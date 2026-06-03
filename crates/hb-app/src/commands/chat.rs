@@ -1,5 +1,5 @@
 use chrono::Utc;
-use hb_core::{ChannelMessage, DocType, HbId, SignedEnvelope, types::ChatMessage};
+use hb_core::{DocType, HbId, SignedEnvelope, types::ChatMessage};
 use serde::Serialize;
 use tauri::State;
 
@@ -8,6 +8,17 @@ use crate::{
     SharedIdentity, SharedRelay,
     store::DataStore,
 };
+
+/// L12: associated data that binds a message ciphertext to its routing and
+/// timestamp. Built only from unencrypted fields, so the recipient can reconstruct
+/// it before decrypting. Must be byte-identical on encrypt and decrypt.
+fn message_aad(from: &str, to: &str, sent_at_rfc3339: &str) -> Vec<u8> {
+    hb_core::jcs::canonicalize(&serde_json::json!({
+        "from": from,
+        "to": to,
+        "sent_at": sent_at_rfc3339,
+    }))
+}
 
 /// A decoded, sender-attributed chat message returned to the frontend.
 /// Content is always plaintext — decryption happens here before returning.
@@ -47,11 +58,14 @@ pub async fn send_message(
         .as_ref()
         .ok_or("No identity loaded. Generate a keypair first.")?;
 
+    let sent_at = Utc::now();
+    let from = kp.hb_id();
+    let aad = message_aad(&from, &to.to_string(), &sent_at.to_rfc3339());
+
     let encrypted_content = kp
-        .encrypt_for(&recipient_pubkey, &trimmed)
+        .encrypt_for(&recipient_pubkey, &trimmed, &aad)
         .map_err(cmd_err)?;
 
-    let sent_at = Utc::now();
     let msg = ChatMessage {
         to: to.to_string(),
         content: encrypted_content,
@@ -60,7 +74,6 @@ pub async fn send_message(
     };
 
     let envelope = SignedEnvelope::create(kp, DocType::Message, &msg).map_err(cmd_err)?;
-    let from = kp.hb_id();
 
     relay.publish("message", &envelope).await.map_err(cmd_err)?;
 
@@ -71,66 +84,6 @@ pub async fn send_message(
         sent_at: sent_at.to_rfc3339(),
         encrypted: true,
     })
-}
-
-/// A decoded channel message returned to the frontend.
-#[derive(Debug, Clone, Serialize)]
-pub struct ReceivedChannelMessage {
-    pub from: String,
-    pub content: String,
-    pub sent_at: String,
-}
-
-/// Fetch recent messages from a public channel.
-#[tauri::command]
-pub async fn get_channel_messages(
-    channel: String,
-    relay: State<'_, SharedRelay>,
-) -> CmdResult<Vec<ReceivedChannelMessage>> {
-    let raw = relay.fetch_channel_messages(&channel).await.map_err(cmd_err)?;
-    let messages = raw
-        .into_iter()
-        .map(|(from, msg)| ReceivedChannelMessage {
-            from,
-            content: msg.content,
-            sent_at: msg.sent_at.to_rfc3339(),
-        })
-        .collect();
-    Ok(messages)
-}
-
-/// Post a plain-text message to a public channel.
-#[tauri::command]
-pub async fn post_channel_message(
-    channel: String,
-    content: String,
-    identity: State<'_, SharedIdentity>,
-    relay: State<'_, SharedRelay>,
-) -> CmdResult<ReceivedChannelMessage> {
-    let trimmed = content.trim().to_string();
-    if trimmed.is_empty() {
-        return Err("Message cannot be empty".into());
-    }
-    if trimmed.len() > 1000 {
-        return Err(format!("Message too long ({} chars, max 1000)", trimmed.len()));
-    }
-
-    let guard = identity.read().await;
-    let kp = guard.as_ref().ok_or("No identity loaded.")?;
-
-    let sent_at = Utc::now();
-    let msg = ChannelMessage {
-        channel: channel.clone(),
-        content: trimmed.clone(),
-        sent_at,
-    };
-
-    let envelope = SignedEnvelope::create(kp, DocType::Channel, &msg).map_err(cmd_err)?;
-    let from = kp.hb_id();
-
-    relay.post_channel_message(&channel, &envelope).await.map_err(cmd_err)?;
-
-    Ok(ReceivedChannelMessage { from, content: trimmed, sent_at: sent_at.to_rfc3339() })
 }
 
 /// Fetch and decrypt messages from all relays addressed to the current user's inbox.
@@ -144,9 +97,8 @@ pub async fn get_messages(
 ) -> CmdResult<Vec<ReceivedMessage>> {
     let guard = identity.read().await;
     let kp = guard.as_ref().ok_or("No identity loaded.")?;
-    let my_pubkey = kp.hb_id();
 
-    let raw = relay.fetch_messages(&my_pubkey).await.map_err(cmd_err)?;
+    let raw = relay.fetch_messages(kp).await.map_err(cmd_err)?;
 
     // Build contact allow-list if DMs from strangers are disabled.
     let settings = store.load_settings().map_err(cmd_err)?;
@@ -161,14 +113,16 @@ pub async fn get_messages(
     let messages = raw
         .into_iter()
         .filter(|(from, _)| {
-            contact_ids.as_ref().map_or(true, |ids| ids.contains(from))
+            contact_ids.as_ref().is_none_or(|ids| ids.contains(from))
         })
         .map(|(from, msg)| {
             let content = if msg.encrypted {
                 match hb_core::hb_id_decode(&from) {
-                    Ok(sender_pubkey) => kp
-                        .decrypt_from(&sender_pubkey, &msg.content)
-                        .unwrap_or_else(|_| "[decryption failed]".to_string()),
+                    Ok(sender_pubkey) => {
+                        let aad = message_aad(&from, &msg.to, &msg.sent_at.to_rfc3339());
+                        kp.decrypt_from(&sender_pubkey, &msg.content, &aad)
+                            .unwrap_or_else(|_| "[decryption failed]".to_string())
+                    }
                     Err(_) => "[unknown sender key]".to_string(),
                 }
             } else {

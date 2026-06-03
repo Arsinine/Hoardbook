@@ -41,9 +41,10 @@ pub async fn save_share_settings(
 
 /// Download a file from a peer's shared collection via direct iroh P2P connection.
 /// Returns the download ID so the frontend can track progress or cancel.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn request_download(
-    _peer_hb_id: String,
+    peer_hb_id: String,
     peer_node_addr: Option<String>,
     slug: String,
     path: String,
@@ -51,17 +52,11 @@ pub async fn request_download(
     expected_sha256: Option<String>,
     app: AppHandle,
     endpoint: State<'_, SharedEndpoint>,
-    identity: State<'_, crate::SharedIdentity>,
     registry: State<'_, SharedDownloadRegistry>,
 ) -> CmdResult<u64> {
     let addr_json = peer_node_addr.ok_or_else(|| {
         "Peer has no P2P address — they need to be online and running a recent Hoardbook version.".to_string()
     })?;
-
-    let my_hb_id = {
-        let guard = identity.read().await;
-        guard.as_ref().map(|kp| kp.hb_id())
-    };
 
     let ep = {
         let guard = endpoint.read().await;
@@ -77,7 +72,7 @@ pub async fn request_download(
     // (the frontend subscribes to progress events instead of awaiting).
     tauri::async_runtime::spawn(async move {
         if let Err(e) = crate::transfer::download_file(
-            &ep, &addr_json, &slug, &path, &save_path, my_hb_id, expected_sha256, id, reg, app,
+            &ep, &addr_json, &peer_hb_id, &slug, &path, &save_path, expected_sha256, id, reg, app,
         ).await {
             tracing::warn!("download {id} failed: {e}");
         }

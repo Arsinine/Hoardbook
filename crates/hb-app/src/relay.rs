@@ -8,8 +8,41 @@ use serde::{Deserialize, Serialize};
 use crate::store::CachedPeer;
 
 const BOOTSTRAP_RELAYS: &[&str] = &[
+    // Plaintext bootstrap. In release builds (HB_ALLOW_INSECURE_RELAY unset) this is
+    // filtered out by `is_acceptable_relay_url`, so the client fails loud until an
+    // https relay is configured / the bootstrap host is fronted with TLS (H1).
     "http://141.98.199.138:3000",
 ];
+
+/// Insecure (http) relays are permitted only when explicitly enabled for dev/test.
+/// Off by default in release so production clients never speak plaintext to a relay.
+fn insecure_relays_allowed() -> bool {
+    std::env::var("HB_ALLOW_INSECURE_RELAY").map(|v| v == "1").unwrap_or(false)
+}
+
+/// A relay URL is acceptable only if it uses https — unless insecure relays are
+/// explicitly enabled via `HB_ALLOW_INSECURE_RELAY=1` (H1). The gate is the env
+/// flag, not the hostname, so a plaintext URL can never slip through by claiming
+/// to be loopback.
+fn is_acceptable_relay_url(url: &str) -> bool {
+    let u = url.trim();
+    u.starts_with("https://") || (insecure_relays_allowed() && u.starts_with("http://"))
+}
+
+/// Filter a candidate URL list down to acceptable relays, logging each rejection.
+fn acceptable_relays<I: IntoIterator<Item = String>>(urls: I) -> Vec<String> {
+    urls.into_iter()
+        .filter(|u| {
+            let ok = is_acceptable_relay_url(u);
+            if !ok {
+                tracing::warn!(
+                    "ignoring insecure relay URL {u:?} (set HB_ALLOW_INSECURE_RELAY=1 to allow http for dev)"
+                );
+            }
+            ok
+        })
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -42,11 +75,12 @@ pub struct RelayClient {
 
 impl RelayClient {
     pub fn new(extra_relays: Vec<String>) -> Self {
-        let mut relay_urls: Vec<String> = BOOTSTRAP_RELAYS
+        let mut candidates: Vec<String> = BOOTSTRAP_RELAYS
             .iter()
             .map(|s| s.to_string())
             .collect();
-        relay_urls.extend(extra_relays);
+        candidates.extend(extra_relays);
+        let relay_urls = acceptable_relays(candidates);
 
         Self {
             http: Client::builder()
@@ -65,7 +99,7 @@ impl RelayClient {
                 urls.push(url);
             }
         }
-        *self.relay_urls.write().unwrap() = urls;
+        *self.relay_urls.write().unwrap() = acceptable_relays(urls);
     }
 
     /// Publish a signed envelope to all known relays.
@@ -164,7 +198,7 @@ impl RelayClient {
     /// Fetch messages from all relays addressed to `my_pubkey`.
     pub async fn fetch_messages(
         &self,
-        my_pubkey: &str,
+        keypair: &hb_core::HoardbookKeypair,
     ) -> Result<Vec<(String, ChatMessage)>> {
         #[derive(Deserialize)]
         struct MessagesResponse {
@@ -172,12 +206,34 @@ impl RelayClient {
         }
 
         let relay_urls = self.relay_urls.read().unwrap().clone();
+        if relay_urls.is_empty() {
+            return Err(anyhow!(
+                "No secure relay configured. Add an https relay in Settings (or set HB_ALLOW_INSECURE_RELAY=1 for local development)."
+            ));
+        }
+
+        let my_pubkey = keypair.hb_id();
+        // H3: sign the mailbox-read request so the relay can prove we own this key.
+        let signed_at = chrono::Utc::now().to_rfc3339();
+        let signed = serde_json::json!({
+            "purpose": "hoardbook.mailbox.read.v1",
+            "public_key": my_pubkey,
+            "signed_at": signed_at,
+        });
+        let signature = keypair.sign(&signed);
+
         let mut all_messages: Vec<(String, ChatMessage)> = Vec::new();
         let mut seen: std::collections::HashSet<(String, String)> = Default::default();
 
         for url in &relay_urls {
             let endpoint = format!("{url}/v1/messages/{my_pubkey}");
-            match self.http.get(&endpoint).send().await {
+            match self
+                .http
+                .get(&endpoint)
+                .query(&[("signed_at", signed_at.as_str()), ("signature", signature.as_str())])
+                .send()
+                .await
+            {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(body) = resp.json::<MessagesResponse>().await {
                         for envelope in body.messages {
@@ -210,6 +266,12 @@ impl RelayClient {
     pub async fn check_url(url: &str) -> Result<()> {
         #[derive(Deserialize)]
         struct HealthResponse { ok: bool }
+
+        if !is_acceptable_relay_url(url) {
+            return Err(anyhow!(
+                "relay URL must use https:// (set HB_ALLOW_INSECURE_RELAY=1 to allow http for local development)"
+            ));
+        }
 
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -244,36 +306,21 @@ impl RelayClient {
         keypair: &hb_core::HoardbookKeypair,
         node_addr: Option<String>,
     ) -> Result<()> {
-        use hb_core::types::HeartbeatBody;
+        use hb_core::{types::HeartbeatBody, DocType};
 
-        let signed_at = chrono::Utc::now().to_rfc3339();
+        // L16: heartbeats are a self-contained SignedEnvelope, verified by the relay
+        // like every other signed document (no bespoke server-side reconstruction).
         let body = HeartbeatBody {
-            node_addr: node_addr.clone(),
-            public_key: keypair.hb_id(),
-            signed_at: signed_at.clone(),
-        };
-        let body_value = serde_json::to_value(&body)?;
-        let signature = keypair.sign(&body_value);
-
-        #[derive(Serialize)]
-        struct HeartbeatRequest {
-            public_key: String,
-            signed_at: String,
-            node_addr: Option<String>,
-            signature: String,
-        }
-
-        let req = HeartbeatRequest {
-            public_key: keypair.hb_id(),
-            signed_at,
             node_addr,
-            signature,
+            public_key: keypair.hb_id(),
+            signed_at: chrono::Utc::now().to_rfc3339(),
         };
+        let envelope = SignedEnvelope::create(keypair, DocType::Heartbeat, &body)?;
 
         let relay_urls = self.relay_urls.read().unwrap().clone();
         for url in &relay_urls {
             let endpoint = format!("{url}/v1/heartbeat");
-            if let Err(e) = self.http.post(&endpoint).json(&req).send().await {
+            if let Err(e) = self.http.post(&endpoint).json(&envelope).send().await {
                 tracing::debug!("heartbeat to {url} failed: {e}");
             }
         }

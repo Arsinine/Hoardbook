@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { saveProfile, publishProfile, publishCollection, deleteCollection, updateCollectionMeta, exportCollection, getShareSettings, generateKeypair, hasPublishedProfile, saveKeypairFile, importKeypair } from '$lib/api.js';
-	import { save as saveDialog, open as openDialog } from '@tauri-apps/plugin-dialog';
+	import { save as saveDialog, open as openDialog, confirm } from '@tauri-apps/plugin-dialog';
 	import { profile, collections, identity, toast, appReady, homeDraft } from '$lib/stores.js';
 	import { onMount } from 'svelte';
 	import { icons, socialIcons, avatarHue } from '$lib/icons.js';
@@ -53,6 +53,11 @@
 			filters: [{ name: 'JSON backup', extensions: ['json'] }],
 		});
 		if (path) {
+			const ok = await confirm(
+				'This file contains your private key. Store it somewhere safe and never share it.',
+				{ title: 'Save keypair backup', kind: 'warning' },
+			);
+			if (!ok) return;
 			try {
 				await saveKeypairFile(path);
 				toast('Backup saved', 'success');
