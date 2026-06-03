@@ -36,7 +36,7 @@
 			// when latest.json is missing from the GitHub release (the release was
 			// built before signing was properly configured). Translate it.
 			if (raw.toLowerCase().includes('could not fetch') || raw.toLowerCase().includes('release json')) {
-				updateError = 'Update server returned no data — the latest release may not have been built with a signing key. Check github.com/fluxtheory/Hoardbook/releases for a manual download.';
+				updateError = 'Update server returned no data — the latest release may not have been built with a signing key. Check github.com/Arsinine/Hoardbook/releases for a manual download.';
 			} else {
 				updateError = raw;
 			}
