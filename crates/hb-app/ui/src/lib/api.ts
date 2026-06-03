@@ -10,13 +10,16 @@ function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 import type {
 	CachedPeer,
 	Collection,
+	DhtResult,
 	DirectoryPeer,
+	Group,
 	IdentityInfo,
 	Profile,
-	ReceivedChannelMessage,
 	ReceivedMessage,
 	ScanOptions,
 	ShareSettings,
+	Watch,
+	WatchHit,
 } from './types.js';
 
 // ── Identity ─────────────────────────────────────────────────────────────────
@@ -79,15 +82,17 @@ export const deleteCollection = (slug: string) => invoke<void>('delete_collectio
 export const publishCollection = (slug: string) =>
 	invoke<void>('publish_collection', { slug });
 
-export const updateCollectionMeta = (slug: string, description: string | undefined, contentType: string[], languages: string[], sorted: boolean) =>
-	invoke<void>('update_collection_meta', { slug, description, contentType, languages, sorted });
+export const updateCollectionMeta = (slug: string, description: string | undefined, contentTypes: string[], tags: string[], languages: string[], sorted: boolean) =>
+	invoke<void>('update_collection_meta', { slug, description, contentTypes, tags, languages, sorted });
+
+export const exportCollection = (slug: string, format: 'text' | 'markdown') =>
+	invoke<string>('export_collection', { slug, format });
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
 export interface Settings {
 	relay_urls: string[];
 	allow_dms: boolean;
-	recommended: boolean;
 }
 
 export const getSettings = () => invoke<Settings>('get_settings');
@@ -157,14 +162,36 @@ export const sendMessage = (to: string, content: string) =>
 
 export const getMessages = () => invoke<ReceivedMessage[]>('get_messages');
 
-export const getChannelMessages = (channel: string) =>
-	invoke<ReceivedChannelMessage[]>('get_channel_messages', { channel });
-
-export const postChannelMessage = (channel: string, content: string) =>
-	invoke<ReceivedChannelMessage>('post_channel_message', { channel, content });
-
 // ── Updates ───────────────────────────────────────────────────────────────────
 
 export interface UpdateInfo { version: string; body?: string; }
 export const checkUpdate   = () => invoke<UpdateInfo | null>('check_update');
 export const installUpdate = () => invoke<void>('install_update');
+
+// ── DHT ───────────────────────────────────────────────────────────────────────
+
+export const dhtSearch = (tags: string[], contentTypes: string[]) =>
+	invoke<DhtResult[]>('dht_search', { tags, contentTypes });
+export const dhtStartAnnounce = () => invoke<void>('dht_start_announce');
+export const dhtStopAnnounce  = () => invoke<void>('dht_stop_announce');
+
+// ── Groups ────────────────────────────────────────────────────────────────────
+
+export const groupsGet    = () => invoke<Group[]>('groups_get');
+export const groupsCreate = (name: string) => invoke<Group>('groups_create', { name });
+export const groupsRename = (oldName: string, newName: string) =>
+	invoke<void>('groups_rename', { oldName, newName });
+export const groupsDelete   = (name: string) => invoke<void>('groups_delete', { name });
+export const groupsAssign   = (hbId: string, groupName: string) =>
+	invoke<void>('groups_assign', { hbId, groupName });
+export const groupsUnassign = (hbId: string, groupName: string) =>
+	invoke<void>('groups_unassign', { hbId, groupName });
+
+// ── Watches ───────────────────────────────────────────────────────────────────
+
+export const watchesGet    = () => invoke<Watch[]>('watches_get');
+export const watchesCreate = (name: string, tags: string[], contentTypes: string[]) =>
+	invoke<Watch>('watches_create', { name, tags, contentTypes });
+export const watchesDelete   = (name: string) => invoke<void>('watches_delete', { name });
+export const watchesEvaluate = (candidates: string[]) =>
+	invoke<WatchHit[]>('watches_evaluate', { candidates });
