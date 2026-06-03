@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use hb_core::{ChatMessage, SignedEnvelope};
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{Emitter, State};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
@@ -146,9 +146,24 @@ pub async fn handle_node_connection(
     store: DataStore,
     own_hb_id: &str,
     dm_queue: SharedDmQueue,
+    app: tauri::AppHandle,
 ) -> Result<()> {
+    let len_before = dm_queue.lock().await.len();
     let (send, recv) = conn.accept_bi().await.context("accept_bi")?;
-    handle_node_stream(send, recv, &store, own_hb_id, &dm_queue).await
+    handle_node_stream(send, recv, &store, own_hb_id, &dm_queue).await?;
+    let len_after = dm_queue.lock().await.len();
+    if len_after > len_before {
+        let _ = app.emit("dm-received", len_after);
+        if let Some(tray) = app.tray_by_id("hb_tray") {
+            let tip = if len_after == 1 {
+                "Hoardbook — 1 unread message".to_string()
+            } else {
+                format!("Hoardbook — {len_after} unread messages")
+            };
+            let _ = tray.set_tooltip(Some(&tip));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

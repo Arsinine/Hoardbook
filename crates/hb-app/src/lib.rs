@@ -12,7 +12,11 @@ use std::sync::Arc;
 use hb_core::HoardbookKeypair;
 use relay::RelayClient;
 use store::DataStore;
-use tauri::Manager;
+use tauri::{
+    Emitter, Manager,
+    menu::{MenuBuilder, MenuItemBuilder},
+    tray::TrayIconBuilder,
+};
 use tokio::sync::RwLock;
 
 /// Managed state types — Arc-wrapped so they can be cloned into background tasks.
@@ -36,6 +40,7 @@ pub(crate) async fn start_iroh_endpoint(
     endpoint_state: SharedEndpoint,
     dm_queue: SharedDmQueue,
     own_hb_id: String,
+    app: tauri::AppHandle,
 ) -> anyhow::Result<()> {
     let secret_key = iroh::SecretKey::from_bytes(private_bytes);
 
@@ -54,7 +59,7 @@ pub(crate) async fn start_iroh_endpoint(
 
     // Spawn the unified protocol accept loop.
     let server_ep = new_ep.clone();
-    tauri::async_runtime::spawn(run_accept_loop(server_ep, store, own_hb_id, dm_queue));
+    tauri::async_runtime::spawn(run_accept_loop(server_ep, store, own_hb_id, dm_queue, app));
 
     *guard = Some(new_ep);
     Ok(())
@@ -68,6 +73,7 @@ async fn run_accept_loop(
     store: DataStore,
     own_hb_id: String,
     dm_queue: SharedDmQueue,
+    app: tauri::AppHandle,
 ) {
     let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
@@ -87,6 +93,7 @@ async fn run_accept_loop(
         let store_clone = store.clone();
         let queue_clone = dm_queue.clone();
         let hb_id_clone = own_hb_id.clone();
+        let app_clone = app.clone();
 
         tokio::spawn(async move {
             let _permit = permit;
@@ -107,7 +114,7 @@ async fn run_accept_loop(
                 }
             } else if alpn == node::NODE_ALPN {
                 if let Err(e) =
-                    node::handle_node_connection(conn, store_clone, &hb_id_clone, queue_clone)
+                    node::handle_node_connection(conn, store_clone, &hb_id_clone, queue_clone, app_clone)
                         .await
                 {
                     tracing::warn!("node session error: {e}");
@@ -127,6 +134,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -174,6 +182,28 @@ pub fn run() {
             app.manage(Arc::clone(&dm_queue));
             app.manage(Arc::clone(&hb_cancel));
 
+            // System tray — "Open Hoardbook" / "Quit".
+            let show_item = MenuItemBuilder::with_id("show", "Open Hoardbook").build(app)?;
+            let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+            let tray_menu = MenuBuilder::new(app).items(&[&show_item, &quit_item]).build()?;
+            TrayIconBuilder::with_id("hb_tray")
+                .icon(app.default_window_icon().unwrap().clone())
+                .menu(&tray_menu)
+                .tooltip("Hoardbook")
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "quit" => app.exit(0),
+                    "show" => {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        }
+                    }
+                    _ => {}
+                })
+                .build(app)?;
+
+            let app_handle = app.handle().clone();
+
             // If a keypair is already on disk, populate identity and start the iroh endpoint.
             let keypair_load_result = store_tmp.load_keypair();
             if let Err(ref e) = keypair_load_result {
@@ -193,11 +223,12 @@ pub fn run() {
                 let q_arc = Arc::clone(&dm_queue);
                 let store_for_ep = DataStore::new(data_dir.clone());
                 let hb_id = stored.hb_id.clone();
+                let app_for_ep = app_handle.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Ok(bytes) = hex::decode(&stored.private_key_hex) {
                         if let Ok(arr) = bytes.try_into() {
                             if let Err(e) =
-                                start_iroh_endpoint(&arr, store_for_ep, ep_arc, q_arc, hb_id)
+                                start_iroh_endpoint(&arr, store_for_ep, ep_arc, q_arc, hb_id, app_for_ep)
                                     .await
                             {
                                 tracing::warn!("iroh endpoint startup failed: {e}");
@@ -215,7 +246,32 @@ pub fn run() {
                 hb_cancel_rx,
             ));
 
+            // Background update check: silent unless a newer version is found.
+            let app_for_update = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                match app_for_update.updater_builder().build() {
+                    Ok(updater) => match updater.check().await {
+                        Ok(Some(update)) => {
+                            tracing::info!("Update available: v{}", update.version);
+                            let _ = app_for_update.emit("update-available", &update.version);
+                        }
+                        Ok(None) => tracing::debug!("App is up to date"),
+                        Err(e) => tracing::debug!("Background update check failed: {e}"),
+                    },
+                    Err(e) => tracing::debug!("Updater not configured: {e}"),
+                }
+            });
+
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Closing the window hides it to the system tray rather than quitting.
+            // "Quit" from the tray menu calls app.exit(0) which bypasses this.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::identity::generate_keypair,

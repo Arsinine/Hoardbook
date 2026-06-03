@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Default capabilities","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open","dialog:allow-save","process:allow-restart","updater:allow-check","updater:allow-download-and-install"]}}
+{"default":{"identifier":"default","description":"Default capabilities","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open","dialog:allow-save","dialog:allow-confirm","dialog:allow-message","process:allow-restart","updater:allow-check","updater:allow-download-and-install"]}}

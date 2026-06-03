@@ -34,6 +34,7 @@ fn shorten(id: &str) -> String {
 /// Errors if a keypair already exists — the frontend must call `rotate_keypair` to replace it.
 #[tauri::command]
 pub async fn generate_keypair(
+    app: tauri::AppHandle,
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
     endpoint: State<'_, SharedEndpoint>,
@@ -74,6 +75,7 @@ pub async fn generate_keypair(
         (*endpoint).clone(),
         (*dm_queue).clone(),
         kp.hb_id(),
+        app,
     ).await {
         tracing::warn!("iroh endpoint startup failed after keypair generate: {e}");
     }
@@ -85,6 +87,7 @@ pub async fn generate_keypair(
 /// Import a keypair from a previously exported JSON file.
 #[tauri::command]
 pub async fn import_keypair(
+    app: tauri::AppHandle,
     path: String,
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
@@ -121,6 +124,7 @@ pub async fn import_keypair(
         (*endpoint).clone(),
         (*dm_queue).clone(),
         kp.hb_id(),
+        app,
     ).await {
         tracing::warn!("iroh endpoint startup failed after keypair import: {e}");
     }
