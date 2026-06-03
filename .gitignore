@@ -4,3 +4,6 @@ target/
 node_modules/
 CLAUDE.md
 graphify-out/
+*.db
+*.db-shm
+*.db-wal
