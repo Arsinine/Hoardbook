@@ -267,6 +267,8 @@ pub fn run() {
             commands::watches::watches_create,
             commands::watches::watches_delete,
             commands::watches::watches_evaluate,
+            commands::update::check_update,
+            commands::update::install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Hoardbook");
