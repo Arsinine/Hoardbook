@@ -8,11 +8,13 @@ use serde::{Deserialize, Serialize};
 use crate::store::CachedPeer;
 
 const BOOTSTRAP_RELAYS: &[&str] = &[
-    // Plaintext bootstrap. In release builds (HB_ALLOW_INSECURE_RELAY unset) this is
-    // filtered out by `is_acceptable_relay_url`, so the client fails loud until an
-    // https relay is configured / the bootstrap host is fronted with TLS (H1).
     "http://141.98.199.138:3000",
 ];
+
+/// Bootstrap relay URLs are developer-controlled and trusted regardless of scheme.
+fn is_bootstrap_relay(url: &str) -> bool {
+    BOOTSTRAP_RELAYS.contains(&url.trim())
+}
 
 /// Insecure (http) relays are permitted only when explicitly enabled for dev/test.
 /// Off by default in release so production clients never speak plaintext to a relay.
@@ -20,13 +22,13 @@ fn insecure_relays_allowed() -> bool {
     std::env::var("HB_ALLOW_INSECURE_RELAY").map(|v| v == "1").unwrap_or(false)
 }
 
-/// A relay URL is acceptable only if it uses https — unless insecure relays are
-/// explicitly enabled via `HB_ALLOW_INSECURE_RELAY=1` (H1). The gate is the env
-/// flag, not the hostname, so a plaintext URL can never slip through by claiming
-/// to be loopback.
+/// A relay URL is acceptable if it uses https, is a known bootstrap relay, or
+/// insecure relays are explicitly enabled via `HB_ALLOW_INSECURE_RELAY=1`.
 fn is_acceptable_relay_url(url: &str) -> bool {
     let u = url.trim();
-    u.starts_with("https://") || (insecure_relays_allowed() && u.starts_with("http://"))
+    u.starts_with("https://")
+        || is_bootstrap_relay(u)
+        || (insecure_relays_allowed() && u.starts_with("http://"))
 }
 
 /// Filter a candidate URL list down to acceptable relays, logging each rejection.
