@@ -37,7 +37,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQyMUE5REQ2OTBERTY0Q0EKUldUS1pONlExcDBhUXBqdm0yUlFIeUNhR3d2OGtvai9XWGFlaVg2djlXbU8xeFM0d0F6d1RKcFIK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEExREM4NzJFRDFDNTJBODgKUldTSUtzWFJMb2Zjb2RmN2JWOXM4akt0Mk1JbkZNeW9YTlNWTktWOC9IUXVaVjY1aVJVc3hzQzUK",
       "endpoints": [
         "https://github.com/Arsinine/Hoardbook/releases/latest/download/latest.json"
       ]
