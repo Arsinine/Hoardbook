@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use hb_core::{ChatMessage, SignedEnvelope};
+use hb_core::{ChatMessage, Collection, Profile, SignedEnvelope};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,6 +22,9 @@ pub const NODE_ALPN: &[u8] = b"/hoardbook/node/1";
 
 /// Maximum number of direct DMs held in the in-memory queue before rejecting new ones.
 const MAX_DM_QUEUE: usize = 500;
+
+/// Cap on the framed get_profile response (profile + collection envelopes).
+const MAX_PROFILE_RESPONSE_BYTES: u32 = 4 * 1024 * 1024;
 
 pub type SharedDmQueue = Arc<Mutex<Vec<SignedEnvelope>>>;
 
@@ -81,6 +84,90 @@ pub(crate) fn validate_dm(envelope: &SignedEnvelope, own_hb_id: &str) -> Result<
         ));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Client — fetch profile + collections over an iroh stream
+// ---------------------------------------------------------------------------
+
+/// Stream-level get_profile exchange: send the request, parse the response,
+/// verify every envelope's signature and `public_key`, and decode payloads.
+/// Invalid envelopes are silently dropped with a warning log.
+pub(crate) async fn fetch_profile_via_stream(
+    mut send: impl tokio::io::AsyncWrite + Unpin,
+    mut recv: impl tokio::io::AsyncRead + Unpin,
+    expected_hb_id: &str,
+) -> Result<(Option<Profile>, Vec<Collection>)> {
+    let req_bytes = serde_json::to_vec(&serde_json::json!({"type": "get_profile"}))
+        .context("serialize get_profile request")?;
+    send.write_u32_le(req_bytes.len() as u32).await.context("write req len")?;
+    send.write_all(&req_bytes).await.context("write req")?;
+    send.shutdown().await.context("shutdown send")?;
+
+    let resp_len = recv.read_u32_le().await.context("read resp len")?;
+    if resp_len > MAX_PROFILE_RESPONSE_BYTES {
+        return Err(anyhow!("response too large: {resp_len} bytes"));
+    }
+    let mut resp_bytes = vec![0u8; resp_len as usize];
+    recv.read_exact(&mut resp_bytes).await.context("read response")?;
+
+    let resp: GetProfileResponse =
+        serde_json::from_slice(&resp_bytes).context("parse get_profile response")?;
+
+    let profile = resp.profile.and_then(|env| decode_envelope::<Profile>(env, expected_hb_id, "profile"));
+    let collections = resp
+        .collections
+        .into_iter()
+        .filter_map(|env| decode_envelope::<Collection>(env, expected_hb_id, "collection"))
+        .collect();
+
+    Ok((profile, collections))
+}
+
+fn decode_envelope<T: for<'de> serde::Deserialize<'de>>(
+    env: SignedEnvelope,
+    expected_hb_id: &str,
+    kind: &str,
+) -> Option<T> {
+    if env.public_key != expected_hb_id {
+        tracing::warn!(
+            "{kind} envelope public_key {} does not match expected {expected_hb_id} — discarding",
+            env.public_key
+        );
+        return None;
+    }
+    if let Err(e) = env.verify() {
+        tracing::warn!("{kind} envelope signature invalid: {e} — discarding");
+        return None;
+    }
+    match env.parse_payload::<T>() {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!("{kind} envelope payload parse error: {e} — discarding");
+            None
+        }
+    }
+}
+
+/// Connect to a remote iroh node and fetch their profile + collections.
+///
+/// `node_addr_str` is the JSON-serialised `iroh::EndpointAddr` stored by the relay
+/// (produced by `serde_json::to_string(&endpoint.addr())`). Invalid or tampered
+/// envelopes are silently discarded with a warning log. Returns `Err` only on
+/// connection / IO failure.
+pub async fn fetch_profile_via_iroh(
+    endpoint: &iroh::Endpoint,
+    node_addr_str: &str,
+    expected_hb_id: &str,
+) -> Result<(Option<Profile>, Vec<Collection>)> {
+    let peer_addr: iroh::EndpointAddr =
+        serde_json::from_str(node_addr_str).context("parse peer EndpointAddr")?;
+    let conn = endpoint
+        .connect(peer_addr, NODE_ALPN)
+        .await
+        .context("iroh connect")?;
+    let (send, recv) = conn.open_bi().await.context("open_bi")?;
+    fetch_profile_via_stream(send, recv, expected_hb_id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -338,5 +425,89 @@ mod tests {
         assert!(resp.profile.is_some(), "profile must be returned via iroh");
 
         server_task.await.unwrap();
+    }
+
+    // ── T20: client-side verify discards tampered envelopes ──────────────────
+
+    /// Build the (server_send, server_recv, client_send, client_recv) tuple and
+    /// drive `handle_node_stream` on the server side over an in-memory duplex.
+    async fn spawn_server_with_store(
+        store: DataStore,
+        own_hb_id: String,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    ) {
+        let dm_queue: SharedDmQueue = Arc::new(Mutex::new(vec![]));
+        let (server_side, client_side) = tokio::io::duplex(64 * 1024);
+        let (client_recv, client_send) = tokio::io::split(client_side);
+        let (server_recv, server_send) = tokio::io::split(server_side);
+
+        let task = tokio::spawn(async move {
+            // Tests only need a successful single exchange; ignore errors at teardown.
+            let _ = handle_node_stream(server_send, server_recv, &store, &own_hb_id, &dm_queue).await;
+        });
+        (task, client_send, client_recv)
+    }
+
+    #[tokio::test]
+    async fn tampered_envelope_discarded() {
+        let (_dir, store) = test_store();
+        let signer = HoardbookKeypair::generate();
+        let impostor = HoardbookKeypair::generate();
+
+        // Sign with `signer`, then advertise the impostor as the author.
+        let prof = hb_core::Profile {
+            display_name: "Mallory".to_string(),
+            bio: None, tags: vec![], since: None, est_size: None, languages: vec![],
+            contact_hint: None, email: None, location: None, social_links: vec![],
+            willing_to: vec![], content_types: vec![], updated: chrono::Utc::now(),
+        };
+        let mut env = SignedEnvelope::create(&signer, DocType::Profile, &prof).unwrap();
+        env.public_key = impostor.hb_id(); // tamper: header doesn't match signing key
+        store.save_profile_signed(&env).unwrap();
+
+        let (task, send, recv) =
+            spawn_server_with_store(store, signer.hb_id()).await;
+
+        let (profile, _collections) =
+            fetch_profile_via_stream(send, recv, &impostor.hb_id())
+                .await
+                .expect("stream exchange completes");
+
+        assert!(profile.is_none(), "tampered envelope must be silently discarded");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_signature_discarded() {
+        let (_dir, store) = test_store();
+        let kp = HoardbookKeypair::generate();
+
+        let prof = hb_core::Profile {
+            display_name: "Carol".to_string(),
+            bio: None, tags: vec![], since: None, est_size: None, languages: vec![],
+            contact_hint: None, email: None, location: None, social_links: vec![],
+            willing_to: vec![], content_types: vec![], updated: chrono::Utc::now(),
+        };
+        let mut env = SignedEnvelope::create(&kp, DocType::Profile, &prof).unwrap();
+        // Mutate one hex character of the signature so verification fails.
+        let mut sig = env.signature.clone();
+        let first = sig.remove(0);
+        let flipped = if first == '0' { '1' } else { '0' };
+        sig.insert(0, flipped);
+        env.signature = sig;
+        store.save_profile_signed(&env).unwrap();
+
+        let (task, send, recv) = spawn_server_with_store(store, kp.hb_id()).await;
+
+        let (profile, _collections) =
+            fetch_profile_via_stream(send, recv, &kp.hb_id())
+                .await
+                .expect("stream exchange completes");
+
+        assert!(profile.is_none(), "envelope with bad signature must be discarded");
+        task.await.unwrap();
     }
 }
