@@ -47,10 +47,15 @@ async fn main() -> anyhow::Result<()> {
 
     db::migrate(&pool).await.context("migration failed")?;
 
+    // Default 30/min. Set RATE_LIMIT_MAX higher on test deployments.
+    let rate_limit_max: u32 = std::env::var("RATE_LIMIT_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+
     let state = AppState {
         pool: pool.clone(),
-        // 30 publish/heartbeat requests per IP per minute.
-        rate_limiter: state::RateLimiter::new(30, std::time::Duration::from_secs(60)),
+        rate_limiter: state::RateLimiter::new(rate_limit_max, std::time::Duration::from_secs(60)),
         peer_relays,
     };
 

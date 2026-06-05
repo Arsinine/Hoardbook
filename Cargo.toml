@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/hb-core", "crates/hb-relay", "crates/hb-app", "crates/hb-dpapi"]
+members = ["crates/hb-core", "crates/hb-relay", "crates/hb-app", "crates/hb-dpapi", "crates/hb-it"]
 resolver = "2"
 
 [patch.crates-io]
