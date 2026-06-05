@@ -1,10 +1,8 @@
-# Security Fixes — Session Handover
+# Session Handover
 
-**Branch:** `feat/security-fixes` (off `main`)
-**Plan:** `planning/security-fixes.md` (Chorus-reviewed, 2 rounds) · **Audit:** `planning/security-review.md`
-**Status:** Workstreams A–F implemented. Full Rust workspace **green** — `cargo test --workspace`: hb-core **49**, hb-relay **40**, hb-app **42**. **Not yet committed.**
+**Status as of 2026-06-05:** Security fixes (workstreams A–F) committed to `main` in `02fd1a4`. T18, T19, T26, T27, T28 marked complete in MILESTONE1.md. Working tree is clean.
 
-> Build note: `/mnt/c` (WSL2 9p mount) throws intermittent I/O errors (`os error 22`, `rustc-LLVM IO failure`) under heavy compile load, and the host C: drive runs near-full. If a build dies with an I/O error, just re-run it (artifacts persist). `CARGO_INCREMENTAL=0` reduces the churn. A `cargo clean` was run this session to free ~15G.
+> Build note: `/mnt/c` (WSL2 9p mount) throws intermittent I/O errors (`os error 22`, `rustc-LLVM IO failure`) under heavy compile load, and the host C: drive runs near-full. If a build dies with an I/O error, just re-run it (artifacts persist). `CARGO_INCREMENTAL=0` reduces the churn.
 
 ---
 
@@ -43,15 +41,31 @@
 
 ---
 
-## Still TODO
+## Remaining TODOs (as of 2026-06-05)
 
-1. **Commit (hunk-staged).** NOT done. Complication: most edited hb-app files (`chat.rs`, `sharing.rs`, `identity.rs`, `transfer.rs`, `node.rs`, `relay.rs`, `tauri.conf.json`) already had **pre-existing uncommitted WIP** from before this session, so a whole-file `git add` would bundle unrelated changes. `git add -p` is interactive (blocked in the agent env). Options: stage purely-mine files whole + `git apply --cached` hand-built hunks for the overlapping ones, or do it manually. Untracked & purely mine: `planning/security-fixes.md`, `planning/security-review.md`, `HANDOVER.md`.
-2. **Frontend confirm dialogs (M4 key-export + L15 wipe).** `export_keypair`, `save_keypair_file`, `wipe_data` are still callable from the webview with no confirmation. `tauri-plugin-dialog` is already a dependency — wire a confirm modal in the Svelte UI (`crates/hb-app/ui/src`) before invoking these commands. Backend (CSP, zeroize) is done; this is frontend-only.
-3. **CSP runtime verification.** The CSP string in `tauri.conf.json` is untested against the live SvelteKit webview — `npm run tauri dev` and confirm nothing is blocked (inline styles are allowed; tighten/loosen `connect-src`/`img-src` if the app breaks).
-4. **Workstream A integration tests.** Plan called for download node-id-mismatch, symlink-escape, and a combined MITM test. `handle_xfer_connection`/`download_file` take a real `iroh::Connection`/live endpoint — needs a testable inner-fn refactor (like `node.rs::handle_node_stream` does with duplex streams) to test without QUIC. The slug validator, H3 auth, AAD, and header-tamper paths ARE tested.
-5. **`cargo clippy --workspace`** not run this session (skipped). Run before merge.
-6. **Bootstrap relay TLS (infra, not code).** `relay.rs` still ships `http://141.98.199.138:3000`, filtered out in release builds. Stand up an `https://` relay endpoint (TLS-terminating reverse proxy in front of the plain-HTTP relay binary) and update `BOOTSTRAP_RELAYS`, or release clients have no default relay.
-7. **`graphify update .`** not run (CLAUDE.md asks for it after code changes) — refresh `graphify-out/`.
+### Blocking MVP (Checkpoint 8)
+
+1. **T20 — iroh-direct profile fetch.** `browse.rs` commands exist and `relay.fetch_peer()` retrieves `node_addr` from the relay. The remaining piece: use that `node_addr` to open an iroh connection, send a `get_profile` request (T17 protocol), receive + verify signed envelopes, and populate `profile`/`collections` on the returned peer. Stale-cache fallback and offline error card also need wiring.
+
+2. **T24 — iroh-first DM send.** `send_message` works via relay today. Needs: check online status + `node_addr`, attempt iroh `send_dm`, fall back to `relay.publish()` only on failure.
+
+3. **T25 — DM inbox deduplication + placeholder.** Real-time `dm-received` event and relay poll both work. Remaining: dedup across sources by `(from_key, sent_at)`, `[Unable to decrypt]` placeholder on decryption failure, inbox-grouped-by-sender UI.
+
+4. **T21 — Follow/contact UX gaps.** Multi-group membership, drag-and-drop reassignment, and group picker shown on follow are not confirmed implemented.
+
+### Security / quality (pre-ship)
+
+5. **Frontend confirm dialogs.** `export_keypair`, `save_keypair_file`, `wipe_data` callable from webview with no confirmation. Wire `tauri-plugin-dialog` confirm modal in Svelte UI before invoking these commands.
+
+6. **CSP runtime verification.** CSP in `tauri.conf.json` untested against live SvelteKit webview — run `npm run tauri dev` and confirm nothing is blocked.
+
+7. **Transfer integration tests.** `handle_xfer_connection`/`download_file` need inner-fn refactor (like `node.rs::handle_node_stream` does with duplex streams) to test without live QUIC.
+
+8. **`cargo clippy --workspace`** — run before any release tag.
+
+### Infra
+
+9. **Bootstrap relay TLS.** `relay.rs` ships `http://141.98.199.138:3000`, filtered in release builds. Stand up `https://` TLS endpoint and update `BOOTSTRAP_RELAYS` or release clients have no default relay.
 
 ## Out of scope (tracked, intentionally not built)
 - Signed per-file SHA-256 in collection listings (complements H2 content integrity).
