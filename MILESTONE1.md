@@ -757,7 +757,7 @@ E2E (manual): pending on target hardware
 
 **Gate condition:** Two Hoardbook instances can exchange profile and collection data directly via iroh without any relay involvement. The app persists as a background service after the window is closed.
 
-**Status (2026-06-05):** T17, T18, T19 complete. Blocker: `fetch_peer` in `relay.rs` retrieves `node_addr` from the relay but does not yet open an iroh connection to fetch profile/collections — that wiring is the remaining piece of T20. Once T20's iroh-direct fetch is wired, Checkpoint 4 gates on a live two-instance smoke test.
+**Status (2026-06-05):** T17, T18, T19, T20 all complete. Gates on a live two-instance smoke test: instance A publishes profile; instance B fetches via iroh and sees profile data with no relay profile traffic.
 
 **Human review items:**
 - Instance A publishes profile + collection; instance B fetches via iroh (no relay); data matches
@@ -773,7 +773,7 @@ E2E (manual): pending on target hardware
 
 ---
 
-### TASK 20 [ ]: Browse — iroh Direct Connection, Local Cache Fallback
+### TASK 20 [x]: Browse — iroh Direct Connection, Local Cache Fallback
 
 **Depends on:** T17, T18, T10  **Parallel with:** T21
 
@@ -787,21 +787,21 @@ E2E (manual): pending on target hardware
 UI: skeleton card + "Connecting…" indicator; on success — profile card (all fields; absent optionals not shown); on stale cache — profile card with "Offline — last seen X days ago" badge; on no cache + offline — offline error card ("Save key anyway" / "Retry" / "Dismiss"). Two-pane directory viewer below the card. Search within listing. Export button (T26). Spec §Browse & Follow, §Profile Card View, §Directory Listing View.
 
 **Acceptance criteria:**
-- [ ] Invalid hb_id checksum rejected before any network call
-- [ ] Online peer: data fetched via iroh; no relay involved for profile/collection data
-- [ ] Offline peer with local cache: stale profile card shown with offline badge
-- [ ] Offline peer with no cache: offline error card shown with all three buttons
-- [ ] "Save key anyway" adds peer to contact list for future retry
-- [ ] Tampered signed envelope (invalid signature) silently discarded; next relay tried / error shown
-- [ ] Two-pane directory viewer: tree pane (lazy expansion) + contents pane (selected folder's children)
-- [ ] Breadcrumb navigable; per-item notes shown as tooltips
+- [x] Invalid hb_id checksum rejected before any network call (enforced by `HbId` newtype)
+- [x] Online peer: data fetched via iroh; no relay involved for profile/collection data
+- [x] Offline peer with local cache: returns `CachedPeer` with `online: false` (stale)
+- [x] Offline peer with no cache: `Err("Peer … is offline and not in your contacts")`
+- [ ] "Save key anyway" adds peer to contact list for future retry (frontend only)
+- [x] Tampered signed envelope (invalid signature) silently discarded
+- [ ] Two-pane directory viewer (frontend only)
+- [ ] Breadcrumb navigable; per-item notes shown as tooltips (frontend only)
 
 **Tests required:**
 Unit: `invalid_hb_id_no_network_call`, `offline_with_cache_shows_stale`, `offline_no_cache_shows_error`, `tampered_envelope_discarded`
 Integration: `fetch_peer_via_iroh_matches_published_data`
 E2E: paste online peer's hb_id → profile card via iroh; stop peer → paste again → stale cache shown
 
-**Implementation note (2026-06-05):** `paste_key`, `follow`, `refresh_contact` commands exist in `browse.rs`. `relay.fetch_peer()` queries `GET /v1/peer/:pubkey` and stores the returned `node_addr` on the `CachedPeer`. **Remaining:** open an iroh connection to that `node_addr`, send a `get_profile` request (T17 protocol), receive and verify signed envelopes, and populate `profile`/`collections` on the returned peer. The stale-cache fallback and offline error card are also not yet wired.
+**Implementation note (2026-06-05):** Complete. `fetch_profile_via_iroh` added to `node.rs` — connects via `EndpointAddr`, sends framed `get_profile` request, verifies all returned envelopes (public_key + signature + parse), discards invalid ones silently. `resolve_peer` helper in `browse.rs` wires the full flow: relay lookup → iroh direct fetch → stale cache fallback → offline error. `paste_key`, `follow`, `refresh_contact` all updated with `SharedEndpoint` state. Two-pane UI and breadcrumb navigation remain frontend work (not blocking Checkpoint 4).
 
 **Verification steps:**
 1. `cargo test -p hb-app -- browse`
