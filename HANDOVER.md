@@ -24,6 +24,14 @@
 - Two new tests passing: `tampered_envelope_discarded`, `invalid_signature_discarded`.
 - **62/62 hb-app tests green.**
 
+### T24 + T25 — iroh-first DM send + unified inbox (`1330028`)
+- **`crates/hb-app/src/node.rs`** — added `send_dm_via_stream` / `send_dm_via_iroh` following the same duplex-testable pattern as `fetch_profile_via_stream`.
+- **`crates/hb-app/src/commands/chat.rs`** — fully rewritten:
+  - `send_message`: `try_send_via_iroh` (relay lookup → iroh connect → `send_dm` request) falls back to `relay.publish()` transparently. `SharedEndpoint` added as state.
+  - `get_messages`: drains `SharedDmQueue` (direct iroh path), fetches relay, deduplicates by `(from, sent_at)`, decrypts both sources. `"[Unable to decrypt]"` placeholder on any failure. Sorted oldest-first.
+- **4 new tests:** `send_dm_via_stream_accepted`, `dedup_across_sources`, `decryption_failure_placeholder`, `unknown_sender_key_placeholder`.
+- **66/66 hb-app tests green.**
+
 ### Security fixes (earlier in session, committed in `02fd1a4`)
 All security workstreams A–F from `planning/security-fixes.md` are committed. See that file for the full list. Key items:
 - H2: iroh peer identity verified before connect (MITM prevention)
@@ -37,20 +45,6 @@ All security workstreams A–F from `planning/security-fixes.md` are committed. 
 ## What's next
 
 ### MVP blockers (Checkpoint 8 requires all of these)
-
-**T24 — iroh-first DM send** *(highest priority — unblocks T25)*
-- `send_message` in `commands/chat.rs` currently sends via relay only.
-- Needs: check relay for `online` + `node_addr` → try `node::fetch_profile_via_iroh`-style `send_dm` over iroh → fall back to `relay.publish()` on failure.
-- The iroh server side already handles `SendDm` requests (`node.rs::handle_node_stream`).
-- Pattern to follow: `resolve_peer` in `browse.rs` for the relay-then-iroh lookup.
-
-**T25 — DM inbox dedup + placeholder** *(depends on T24)*
-- Real-time `dm-received` Tauri event fires from `node.rs` ✓
-- Relay poll via `get_messages` works ✓
-- **Remaining:**
-  - Dedup across sources by `(from_key, sent_at)` — both the direct queue and relay fetch can deliver the same message
-  - `[Unable to decrypt]` placeholder on decryption failure (currently returns error string)
-  - Inbox grouped by sender in the UI (frontend work)
 
 **T21 — Follow/contact UX gaps** *(backend mostly done; frontend gaps)*
 - Multi-group membership per contact: `groups.rs` stores groups as `Vec<Group { name, pubkeys }>`; a contact can appear in multiple groups' `pubkeys` vecs. Check whether the UI exposes this.
