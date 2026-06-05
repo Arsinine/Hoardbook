@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod commands;
+mod dht_service;
 mod error;
 mod heartbeat;
 mod node;
@@ -27,7 +28,10 @@ pub type SharedEndpoint           = Arc<RwLock<Option<iroh::Endpoint>>>;
 pub type SharedDownloadRegistry   = Arc<transfer::DownloadRegistry>;
 pub type SharedDmQueue            = node::SharedDmQueue;
 /// Sender half of the heartbeat-cancel channel. Send `true` to stop the task.
-pub type SharedCancelHeartbeat    = Arc<tokio::sync::watch::Sender<bool>>;
+pub type SharedCancelHeartbeat = Arc<tokio::sync::watch::Sender<bool>>;
+/// Sender for the DHT service cancel/trigger channel.
+/// Send `false` to wake the announce loop immediately; `true` to shut it down.
+pub type SharedDhtCancel = Arc<tokio::sync::watch::Sender<bool>>;
 
 // ---------------------------------------------------------------------------
 // iroh endpoint lifecycle helper
@@ -175,6 +179,9 @@ pub fn run() {
             let (hb_cancel_tx, hb_cancel_rx) = tokio::sync::watch::channel(false);
             let hb_cancel: SharedCancelHeartbeat = Arc::new(hb_cancel_tx);
 
+            let (dht_cancel_tx, _dht_rx0) = tokio::sync::watch::channel(false);
+            let dht_cancel: SharedDhtCancel = Arc::new(dht_cancel_tx);
+
             app.manage(DataStore::new(data_dir.clone()));
             app.manage(Arc::clone(&identity));
             app.manage(Arc::clone(&relay));
@@ -182,6 +189,7 @@ pub fn run() {
             app.manage(Arc::clone(&download_registry));
             app.manage(Arc::clone(&dm_queue));
             app.manage(Arc::clone(&hb_cancel));
+            app.manage(Arc::clone(&dht_cancel));
 
             // System tray — "Open Hoardbook" / "Quit".
             let show_item = MenuItemBuilder::with_id("show", "Open Hoardbook").build(app)?;
@@ -245,6 +253,30 @@ pub fn run() {
                 Arc::clone(&identity),
                 Arc::clone(&endpoint_state),
                 hb_cancel_rx,
+            ));
+
+            // DHT identity port from saved settings (falls back to 6882).
+            let dht_identity_port = store_tmp
+                .load_settings()
+                .ok()
+                .flatten()
+                .map(|s| s.dht_identity_port)
+                .unwrap_or(6882);
+
+            // TCP server: responds to DHT searchers with a signed identity payload.
+            tauri::async_runtime::spawn(dht_service::run_identity_server(
+                dht_identity_port,
+                Arc::clone(&identity),
+                Arc::clone(&relay),
+                dht_cancel.subscribe(),
+            ));
+
+            // Background announce loop: re-announces opted-in tags every 30 min.
+            tauri::async_runtime::spawn(dht_service::run_dht_announce_loop(
+                Arc::clone(&identity),
+                Arc::clone(&relay),
+                DataStore::new(data_dir.clone()),
+                dht_cancel.subscribe(),
             ));
 
             // Background update check: silent unless a newer version is found.

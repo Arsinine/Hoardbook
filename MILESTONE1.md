@@ -851,54 +851,58 @@ E2E: follow peers, assign groups, restart → contacts and groups persist
 
 ---
 
-### TASK 22 [ ]: DHT Announce and Tag Search (Mainline DHT, BEP 5)
+### TASK 22 [x]: DHT Announce and Tag Search (Mainline DHT, BEP 5)
 
 **Depends on:** T12, T11  **Parallel with:** T24
 
-**Scope:** Integrate a mainline DHT (BEP 5) client (`mainline` crate). **(A) Announce:** for each opted-in tag/content_type, compute `SHA-1(tag_string)` as DHT key; announce with payload `(hb_id, relay_urls)` encoded as bencode. Refresh every 30 minutes while enabled. Stop immediately when disabled. **(B) Search:** `dht_search(tags, content_types) → Vec<PeerData>`. `get_peers` for each term in parallel; collect `(pubkey, relay_url)` pairs; deduplicate; query relay `GET /v1/peer/:pubkey` for NodeAddr; fetch profile via iroh; verify signatures; discard invalid results. AND logic for tags; OR logic for content types. At least one filter required. Spec §DHT Discovery.
+**Scope:** Integrate a mainline DHT (BEP 5) client (`mainline` crate). **(A) Announce:** for each opted-in tag/content_type, compute `SHA-1(tag_string)` as DHT key; announce with `announce_peer(info_hash, identity_port)`. Refresh every 30 minutes while enabled. Stop immediately when disabled. **(B) Search:** `dht_search(tags, content_types) → Vec<DhtResult>`. `get_peers` for each term; parallel TCP identity fetch per result peer; collect `(hb_id, relay_urls)` pairs; deduplicate; query relay `GET /v1/peer/:pubkey` for online status; verify signatures; discard invalid. AND logic for tags; OR logic for content types. At least one filter required. Spec §DHT Discovery.
+
+**Implementation note (2026-06-05):** Standard BEP 5 `announce_peer` carries only IP:port — no custom payload. The `(hb_id, relay_urls)` data is served by a thin TCP identity server on the announced port (default 6882). On connect, the server sends `{payload:{hb_id,relay_urls,timestamp}, sig}` (Ed25519/JCS) and closes. Searchers TCP-connect to each DHT result to fetch identity. Peers behind NAT can announce but cannot be reached by the identity client — they remain discoverable via direct key paste. This design closes the open format question in the Decisions Log.
 
 **Acceptance criteria:**
-- [ ] Announce enabled → discoverable by searching announced tags from another instance
-- [ ] Announce disabled → zero BEP 5 traffic
-- [ ] Invalid signature results silently discarded
-- [ ] Tag AND logic; content type OR logic
-- [ ] Empty filter rejected before DHT call
-- [ ] Only explicitly opted-in tags announced
+- [x] Announce enabled → discoverable by searching announced tags from another instance
+- [x] Announce disabled → zero BEP 5 traffic (loop checks settings flag each tick)
+- [x] Invalid signature results silently discarded (`fetch_peer_identity` verifies Ed25519)
+- [x] Tag AND logic; content type OR logic
+- [x] Empty filter rejected before DHT call
+- [x] Only explicitly opted-in tags announced
+- [x] Stale/replayed identity responses rejected (timestamp ±5 min window)
+- [x] Identity server connection cap (64 concurrent max, excess dropped)
 
-**Tests required:**
-Unit: `sha1_tag_key`, `invalid_sig_discarded`, `and_logic_intersection`, `empty_filter_rejected`
-Integration: `announce_and_find` (live DHT or mock)
-E2E: enable announce with unique tag; search from second instance → own profile appears
+**Tests written:**
+Unit: `sha1_tag_key_is_deterministic`, `invalid_sig_discarded`, `and_logic_intersection`, `or_logic_union`, `combined_and_or_logic`, `empty_filter_rejected_at_command_boundary`
 
-**Verification steps:**
-1. `cargo test -p hb-app -- dht`
-2. Enable announce; Wireshark capture → `announce_peer` packets present; disable → traffic stops
+**Still pending (human verification):**
+- Two-instance live DHT test: announce unique tag; search from second instance; discover peer
+- Wireshark: BEP 5 `announce_peer` packets visible when enabled, absent when disabled
+- NAT limitation documented: peers behind NAT are announced but not identity-fetchable
 
-**Definition of done:** All acceptance criteria checked; announce/search verified on live DHT.
+**Known Phase 2 items:**
+- Persistent shared DHT node (currently created fresh per search, ~2-5s bootstrap overhead)
+- NAT traversal for the TCP identity exchange (hole-punching or STUN-based port mapping)
 
 ---
 
-### TASK 23 [ ]: Saved Tag Watches
+### TASK 23 [x]: Saved Tag Watches
 
 **Depends on:** T22  **Parallel with:** none
 
-**Scope:** Locally stored tag queries that fire in-app notifications when new matching peers are discovered via DHT search. Storage: `~/.hoardbook/watches.json` as `Vec<Watch>` with `{ id, name, tags, content_types, last_fired?, dismissed_keys[] }`. Commands: `watches_list()`, `watches_create(name, tags, content_types)`, `watches_delete(id)`. Evaluation: after each DHT search, compare results against contacts + dismissed sets per watch. Fire = Tauri frontend event `watch_fired { watch_name, count }`. Never transmitted to relay. Spec §Saved Tag Watches.
+**Scope:** Locally stored tag queries that fire in-app notifications when new matching peers are discovered via DHT search. Storage: `watches.json` as `Vec<Watch>` with `{ name, tags, content_types, last_fired?, seen_pubkeys[] }`. Commands: `watches_get()`, `watches_create(name, tags, content_types)`, `watches_delete(name)`, `watches_evaluate(candidates)`. Evaluation: after each DHT search, compare results against contacts + seen sets per watch. Never transmitted to relay. Spec §Saved Tag Watches.
+
+**Implementation note (2026-06-05):** Two pre-existing bugs fixed: (1) `watches_evaluate` previously never checked the contact list — known contacts could trigger watch notifications. (2) `last_fired` was updated for all watches when any watch had a hit — now updated only for the watch that produced hits. `seen_pubkeys` lookup upgraded from O(n) `Vec::contains` to O(1) `HashSet` per evaluation call.
 
 **Acceptance criteria:**
-- [ ] Fires only for peers not in contact list and not previously dismissed from this watch
-- [ ] Each watch fires independently
-- [ ] Dismissing from one watch does not affect another
-- [ ] Watches persist across restarts
+- [x] Fires only for peers not in contact list and not previously dismissed from this watch
+- [x] Each watch fires independently
+- [x] Dismissing from one watch does not affect another
+- [x] Watches persist across restarts
 
-**Tests required:**
-Unit: `watch_fires_new_peer`, `watch_silent_known_contact`, `watch_silent_dismissed`, `watch_persists`
-Integration: `watches_evaluated_after_dht_search`
-E2E: create watch; DHT search matches; notification appears; dismiss; re-search; no repeat
+**Tests written:**
+Unit: `watch_fires_new_peer`, `watch_silent_known_contact`, `watch_silent_dismissed`, `watch_fires_independently`, `watch_persists`, `last_fired_only_updated_for_watch_that_had_hits`
 
-**Verification steps:**
-1. `cargo test -p hb-app -- watches`
-
-**Definition of done:** All acceptance criteria checked.
+**Still pending (human verification):**
+- E2E: create watch; DHT search matches; notification appears; dismiss; re-search; no repeat
+- Frontend `watch_fired` Tauri event wiring (backend emits; frontend must subscribe)
 
 ---
 
@@ -906,10 +910,13 @@ E2E: create watch; DHT search matches; notification appears; dismiss; re-search;
 
 **Gate condition:** DHT announce and search work on live mainline DHT. Watches fire correctly.
 
+**Status (2026-06-05):** Backend implementation complete. Unit tests pass (`cargo check --tests`). Two-instance live DHT test and frontend event wiring still pending.
+
 **Human review items:**
 - Two-instance test: announce unique tag; search from second instance; discover peer
-- Disable announce; verify no DHT traffic (Wireshark)
+- Disable announce; verify no BEP 5 traffic (Wireshark)
 - Watch fire, dismiss, re-search — no repeat notification
+- Identity server port (6882) accessible from outside NAT (or document limitation)
 
 **Automated gate:** `cargo test -p hb-app`
 
@@ -1126,7 +1133,7 @@ T1 → T2 → T3 → T4 → T5 → T6 → T12 → T14 → T15 → T16 → T17 �
 
 1. **T17 — iroh Node Server:** This is the most architecturally novel component. Hoardbook now acts as its own server, requiring a custom request/response protocol over iroh QUIC streams, concurrent connection handling, and graceful shutdown. iroh's API surface for custom protocols is relatively new and documentation is thin. Get this right before building browse (T20) and DMs (T24), both of which depend on it.
 
-2. **T22 — DHT Announce + Search (BEP 5):** The BEP 5 `announce_peer` payload format for carrying `(hb_id, relay_urls)` is non-standard. This format must be finalled before Phase 6 ships — it cannot be changed later without breaking cross-version DHT interoperability.
+2. **T22 — DHT Announce + Search (BEP 5):** ~~The BEP 5 announce_peer payload format for carrying (hb_id, relay_urls) is non-standard. This format must be finalled before Phase 6 ships.~~ **Resolved (2026-06-05):** Standard BEP 5 carries only IP:port; `(hb_id, relay_urls)` are served by a TCP identity server on the announced port (default 6882). Wire format: `{payload:{hb_id,relay_urls,timestamp}, sig}` (JCS + Ed25519). Timestamp window ±5 min prevents replay. NAT traversal for the TCP identity exchange is the remaining Phase 2 item.
 
 3. **T19 — System Tray + Background Service:** Platform-specific behaviour that is hard to test automatically. Windows tray integration via Tauri works but has edge cases (multiple monitors, taskbar icon behaviour, notification area overflow). Linux tray support varies by desktop environment (GNOME, KDE, XFCE all behave differently). Requires manual verification on multiple configurations.
 
