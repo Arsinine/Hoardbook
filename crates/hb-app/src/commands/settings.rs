@@ -9,6 +9,7 @@ use crate::{
 };
 
 fn default_true() -> bool { true }
+fn default_dht_port() -> u16 { 6882 }
 
 /// Probe a relay URL. Returns Ok(()) if reachable and valid.
 #[tauri::command]
@@ -21,6 +22,18 @@ pub struct Settings {
     pub relay_urls: Vec<String>,
     #[serde(default = "default_true")]
     pub allow_dms: bool,
+    /// Whether to announce tags/content-types on the mainline DHT.
+    #[serde(default)]
+    pub dht_announce_enabled: bool,
+    /// Tags to announce on the DHT (only announced when dht_announce_enabled).
+    #[serde(default)]
+    pub dht_announce_tags: Vec<String>,
+    /// Content types to announce on the DHT.
+    #[serde(default)]
+    pub dht_announce_content_types: Vec<String>,
+    /// TCP port for the DHT identity server (announced as BEP 5 peer port).
+    #[serde(default = "default_dht_port")]
+    pub dht_identity_port: u16,
 }
 
 #[tauri::command]

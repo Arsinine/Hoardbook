@@ -93,6 +93,11 @@ impl RelayClient {
         }
     }
 
+    /// Return the current relay URL list.
+    pub fn get_relay_urls(&self) -> Vec<String> {
+        self.relay_urls.read().unwrap().clone()
+    }
+
     /// Update relay URLs, always prepending bootstrap relays so they are never lost.
     pub fn set_relay_urls(&self, user_urls: Vec<String>) {
         let mut urls: Vec<String> = BOOTSTRAP_RELAYS.iter().map(|s| s.to_string()).collect();
