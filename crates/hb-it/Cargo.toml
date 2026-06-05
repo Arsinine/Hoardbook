@@ -1,0 +1,18 @@
+[package]
+name    = "hb-it"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "hb-it"
+path = "src/main.rs"
+
+[dependencies]
+hb-core    = { path = "../hb-core" }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+chrono     = { workspace = true }
+tokio      = { workspace = true }
+anyhow     = { workspace = true }
+reqwest    = { version = "0.12", features = ["json"] }
+sha1       = "0.10"
