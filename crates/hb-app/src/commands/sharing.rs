@@ -1,26 +1,10 @@
-use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
 use crate::{
     SharedDownloadRegistry, SharedEndpoint,
     error::{CmdResult, cmd_err},
-    store::DataStore,
+    store::{DataStore, ShareSettings},
 };
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ShareSettings {
-    pub enabled: bool,
-    /// Absolute filesystem path to the collection root directory.
-    pub root_path: Option<String>,
-    /// Relative paths (within root) that are downloadable. Empty = all files allowed.
-    pub allowed_paths: Vec<String>,
-    /// Speed cap in KB/s. None = unlimited.
-    pub speed_cap_kbps: Option<u32>,
-    /// Max simultaneous downloads allowed. None = unlimited.
-    pub download_limit: Option<u32>,
-    /// If true, only peers you follow can download.
-    pub require_follow: bool,
-}
 
 #[tauri::command]
 pub async fn get_share_settings(
@@ -68,8 +52,6 @@ pub async fn request_download(
     let id = registry.next_id();
     let reg = (*registry).clone();
 
-    // Spawn the transfer so the Tauri command returns the ID immediately
-    // (the frontend subscribes to progress events instead of awaiting).
     tauri::async_runtime::spawn(async move {
         if let Err(e) = crate::transfer::download_file(
             &ep, &addr_json, &peer_hb_id, &slug, &path, &save_path, expected_sha256, id, reg, app,
@@ -81,8 +63,7 @@ pub async fn request_download(
     Ok(id)
 }
 
-/// Cancel an active download by ID. The download loop will detect the signal,
-/// close the connection, and delete the partial file.
+/// Cancel an active download by ID.
 #[tauri::command]
 pub async fn cancel_download(
     download_id: u64,

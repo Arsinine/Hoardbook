@@ -14,9 +14,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::{
-    commands::settings::Settings,
     error::CmdResult,
-    store::DataStore,
+    store::{DataStore, Settings},
 };
 
 pub const NODE_ALPN: &[u8] = b"/hoardbook/node/1";

@@ -4,7 +4,7 @@ use tauri::State;
 use zeroize::Zeroize;
 
 use crate::{
-    SharedDmQueue, SharedEndpoint, SharedIdentity, SharedRelay,
+    SharedDmQueue, SharedDownloadRegistry, SharedEndpoint, SharedIdentity, SharedRelay,
     error::{CmdResult, cmd_err},
     store::DataStore,
 };
@@ -39,6 +39,7 @@ pub async fn generate_keypair(
     identity: State<'_, SharedIdentity>,
     endpoint: State<'_, SharedEndpoint>,
     dm_queue: State<'_, SharedDmQueue>,
+    registry: State<'_, SharedDownloadRegistry>,
 ) -> CmdResult<IdentityInfo> {
     match store.load_keypair() {
         Ok(Some(_)) => return Err("A keypair already exists. Use rotate_keypair to replace it.".into()),
@@ -76,6 +77,7 @@ pub async fn generate_keypair(
         (*dm_queue).clone(),
         kp.hb_id(),
         app,
+        (*registry).clone(),
     ).await {
         tracing::warn!("iroh endpoint startup failed after keypair generate: {e}");
     }
@@ -93,6 +95,7 @@ pub async fn import_keypair(
     identity: State<'_, SharedIdentity>,
     endpoint: State<'_, SharedEndpoint>,
     dm_queue: State<'_, SharedDmQueue>,
+    registry: State<'_, SharedDownloadRegistry>,
 ) -> CmdResult<IdentityInfo> {
     if store.load_keypair().map_err(cmd_err)?.is_some() {
         return Err("A keypair already exists. Wipe data first to import a different keypair.".into());
@@ -125,6 +128,7 @@ pub async fn import_keypair(
         (*dm_queue).clone(),
         kp.hb_id(),
         app,
+        (*registry).clone(),
     ).await {
         tracing::warn!("iroh endpoint startup failed after keypair import: {e}");
     }
@@ -195,22 +199,33 @@ pub async fn get_node_addr(endpoint: State<'_, SharedEndpoint>) -> CmdResult<Opt
 }
 
 /// Export the stored keypair as a JSON string for the user to save to a file.
+/// Uses the in-memory keypair to avoid a DPAPI round-trip.
 #[tauri::command]
-pub async fn export_keypair(store: State<'_, DataStore>) -> CmdResult<String> {
-    let stored = store
-        .load_keypair()
-        .map_err(cmd_err)?
-        .ok_or("No keypair to export.")?;
+pub async fn export_keypair(identity: State<'_, SharedIdentity>) -> CmdResult<String> {
+    let guard = identity.read().await;
+    let kp = guard.as_ref().ok_or("No identity loaded.")?;
+    let stored = StoredKeypair {
+        version: 1,
+        hb_id: kp.hb_id(),
+        private_key_hex: hex::encode(kp.private_key_bytes()),
+    };
     serde_json::to_string_pretty(&stored).map_err(cmd_err)
 }
 
 /// Write the exported keypair JSON to a user-chosen absolute path.
+/// Uses the in-memory keypair to avoid a DPAPI round-trip.
 #[tauri::command]
-pub async fn save_keypair_file(path: String, store: State<'_, DataStore>) -> CmdResult<()> {
-    let stored = store
-        .load_keypair()
-        .map_err(cmd_err)?
-        .ok_or("No keypair to export.")?;
+pub async fn save_keypair_file(
+    path: String,
+    identity: State<'_, SharedIdentity>,
+) -> CmdResult<()> {
+    let guard = identity.read().await;
+    let kp = guard.as_ref().ok_or("No identity loaded.")?;
+    let stored = StoredKeypair {
+        version: 1,
+        hb_id: kp.hb_id(),
+        private_key_hex: hex::encode(kp.private_key_bytes()),
+    };
     let json = serde_json::to_string_pretty(&stored).map_err(cmd_err)?;
     std::fs::write(&path, json).map_err(cmd_err)?;
     Ok(())
@@ -231,7 +246,7 @@ pub async fn wipe_data(
     // so there is nothing to deactivate on the relay side.
     store.wipe().map_err(cmd_err)?;
     *identity.write().await = None;
-    relay.set_relay_urls(vec![]);
+    relay.set_relay_urls(vec![]).await;
     dm_queue.lock().await.clear();
 
     // Close and clear the iroh endpoint.

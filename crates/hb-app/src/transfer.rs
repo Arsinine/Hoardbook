@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{Arc, atomic::{AtomicU32, AtomicU64, Ordering}};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -49,6 +49,8 @@ pub enum DownloadStatus {
 pub struct DownloadRegistry {
     next_id: AtomicU64,
     cancels: Mutex<HashMap<u64, oneshot::Sender<()>>>,
+    /// Counts concurrent active server-side downloads for enforcing download_limit.
+    active_downloads: AtomicU32,
 }
 
 impl DownloadRegistry {
@@ -56,11 +58,22 @@ impl DownloadRegistry {
         Self {
             next_id: AtomicU64::new(1),
             cancels: Mutex::new(HashMap::new()),
+            active_downloads: AtomicU32::new(0),
         }
     }
 
     pub fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Increment the active-download counter and return the new count.
+    pub fn acquire_slot(&self) -> u32 {
+        self.active_downloads.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Decrement the active-download counter.
+    pub fn release_slot(&self) {
+        self.active_downloads.fetch_sub(1, Ordering::Relaxed);
     }
 
     pub async fn register(&self, id: u64) -> oneshot::Receiver<()> {
@@ -106,6 +119,7 @@ pub(crate) async fn handle_xfer_stream(
     mut recv: impl tokio::io::AsyncRead + Unpin,
     remote_hb_id: &str,
     store: &DataStore,
+    registry: &SharedDownloadRegistry,
 ) -> Result<()> {
     // Read request
     let req_len = recv.read_u32_le().await.context("read req len")?;
@@ -142,15 +156,15 @@ pub(crate) async fn handle_xfer_stream(
 
     // Enforce download_limit
     if let Some(limit) = settings.download_limit {
-        let current = store.acquire_download_slot();
+        let current = registry.acquire_slot();
         if current > limit {
-            store.release_download_slot();
+            registry.release_slot();
             return send_error(&mut send, "Download limit reached — try again later").await;
         }
     }
     // RAII guard to decrement on exit
     let _slot_guard = if settings.download_limit.is_some() {
-        Some(DownloadSlotGuard { store: store.clone() })
+        Some(DownloadSlotGuard { registry: registry.clone() })
     } else {
         None
     };
@@ -211,12 +225,13 @@ pub(crate) async fn handle_xfer_stream(
 pub(crate) async fn handle_xfer_connection(
     conn: iroh::endpoint::Connection,
     store: DataStore,
+    registry: SharedDownloadRegistry,
 ) -> Result<()> {
     // The iroh-authenticated identity of the remote peer (from its TLS cert).
     // This == the requester's hb_id and is the ONLY trustworthy requester identity.
     let remote_hb_id = hb_core::hb_id_encode(conn.remote_id().as_bytes());
     let (send, recv) = conn.accept_bi().await.context("accept_bi")?;
-    handle_xfer_stream(send, recv, &remote_hb_id, &store).await
+    handle_xfer_stream(send, recv, &remote_hb_id, &store, &registry).await
 }
 
 // ---------------------------------------------------------------------------
@@ -302,12 +317,12 @@ async fn throttled_copy(
 // ---------------------------------------------------------------------------
 
 struct DownloadSlotGuard {
-    store: DataStore,
+    registry: SharedDownloadRegistry,
 }
 
 impl Drop for DownloadSlotGuard {
     fn drop(&mut self) {
-        self.store.release_download_slot();
+        self.registry.release_slot();
     }
 }
 
@@ -599,12 +614,13 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
+        let registry = std::sync::Arc::new(DownloadRegistry::new());
 
         let (srv, cli) = tokio::io::duplex(64 * 1024);
         let (mut cli_r, mut cli_w) = tokio::io::split(cli);
         let (srv_r, srv_w) = tokio::io::split(srv);
         tokio::spawn(async move {
-            let _ = handle_xfer_stream(srv_w, srv_r, "any-id", &store).await;
+            let _ = handle_xfer_stream(srv_w, srv_r, "any-id", &store, &registry).await;
         });
 
         let req = serde_json::json!({"slug": "../etc/passwd", "path": "file.txt"});
@@ -624,7 +640,7 @@ mod tests {
 
     #[tokio::test]
     async fn xfer_stream_require_follow_blocks_stranger() {
-        use crate::{commands::sharing::ShareSettings, store::DataStore};
+        use crate::store::{DataStore, ShareSettings};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
@@ -637,12 +653,13 @@ mod tests {
         let stranger = hb_core::HoardbookKeypair::generate();
         let remote_id = stranger.hb_id();
 
+        let registry = std::sync::Arc::new(DownloadRegistry::new());
         let (srv, cli) = tokio::io::duplex(64 * 1024);
         let (mut cli_r, mut cli_w) = tokio::io::split(cli);
         let (srv_r, srv_w) = tokio::io::split(srv);
         let s2 = store.clone(); let id2 = remote_id.clone();
         tokio::spawn(async move {
-            let _ = handle_xfer_stream(srv_w, srv_r, &id2, &s2).await;
+            let _ = handle_xfer_stream(srv_w, srv_r, &id2, &s2, &registry).await;
         });
 
         let req_b = serde_json::to_vec(&serde_json::json!({"slug":"col","path":"f.txt"})).unwrap();
@@ -661,7 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn xfer_stream_require_follow_allows_contact() {
-        use crate::{commands::sharing::ShareSettings, store::{CachedPeer, DataStore}};
+        use crate::store::{CachedPeer, DataStore, ShareSettings};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
@@ -682,12 +699,13 @@ mod tests {
             },
         ).unwrap();
 
+        let registry = std::sync::Arc::new(DownloadRegistry::new());
         let (srv, cli) = tokio::io::duplex(64 * 1024);
         let (mut cli_r, mut cli_w) = tokio::io::split(cli);
         let (srv_r, srv_w) = tokio::io::split(srv);
         let s2 = store.clone(); let id2 = remote_id.clone();
         tokio::spawn(async move {
-            let _ = handle_xfer_stream(srv_w, srv_r, &id2, &s2).await;
+            let _ = handle_xfer_stream(srv_w, srv_r, &id2, &s2, &registry).await;
         });
 
         let req_b = serde_json::to_vec(&serde_json::json!({"slug":"col","path":"f.txt"})).unwrap();
@@ -710,7 +728,7 @@ mod tests {
     #[tokio::test]
     async fn xfer_stream_symlink_escape_rejected() {
         use std::os::unix::fs::symlink;
-        use crate::{commands::sharing::ShareSettings, store::DataStore};
+        use crate::store::{DataStore, ShareSettings};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let outer = tempfile::tempdir().unwrap(); // outside the share root
@@ -729,11 +747,12 @@ mod tests {
             ..Default::default()
         }).unwrap();
 
+        let registry = std::sync::Arc::new(DownloadRegistry::new());
         let (srv, cli) = tokio::io::duplex(64 * 1024);
         let (mut cli_r, mut cli_w) = tokio::io::split(cli);
         let (srv_r, srv_w) = tokio::io::split(srv);
         tokio::spawn(async move {
-            let _ = handle_xfer_stream(srv_w, srv_r, "any-id", &store).await;
+            let _ = handle_xfer_stream(srv_w, srv_r, "any-id", &store, &registry).await;
         });
 
         let req_b = serde_json::to_vec(

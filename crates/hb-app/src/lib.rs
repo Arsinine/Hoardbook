@@ -46,6 +46,7 @@ pub(crate) async fn start_iroh_endpoint(
     dm_queue: SharedDmQueue,
     own_hb_id: String,
     app: tauri::AppHandle,
+    download_registry: SharedDownloadRegistry,
 ) -> anyhow::Result<()> {
     let secret_key = iroh::SecretKey::from_bytes(private_bytes);
 
@@ -64,7 +65,7 @@ pub(crate) async fn start_iroh_endpoint(
 
     // Spawn the unified protocol accept loop.
     let server_ep = new_ep.clone();
-    tauri::async_runtime::spawn(run_accept_loop(server_ep, store, own_hb_id, dm_queue, app));
+    tauri::async_runtime::spawn(run_accept_loop(server_ep, store, own_hb_id, dm_queue, app, download_registry));
 
     *guard = Some(new_ep);
     Ok(())
@@ -79,6 +80,7 @@ async fn run_accept_loop(
     own_hb_id: String,
     dm_queue: SharedDmQueue,
     app: tauri::AppHandle,
+    download_registry: SharedDownloadRegistry,
 ) {
     let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
@@ -99,6 +101,7 @@ async fn run_accept_loop(
         let queue_clone = dm_queue.clone();
         let hb_id_clone = own_hb_id.clone();
         let app_clone = app.clone();
+        let registry_clone = download_registry.clone();
 
         tokio::spawn(async move {
             let _permit = permit;
@@ -114,7 +117,7 @@ async fn run_accept_loop(
             // Clone ALPN before moving conn into the handler.
             let alpn = conn.alpn().to_vec();
             if alpn == transfer::XFER_ALPN {
-                if let Err(e) = transfer::handle_xfer_connection(conn, store_clone).await {
+                if let Err(e) = transfer::handle_xfer_connection(conn, store_clone, registry_clone).await {
                     tracing::warn!("xfer session error: {e}");
                 }
             } else if alpn == node::NODE_ALPN {
@@ -132,6 +135,132 @@ async fn run_accept_loop(
 }
 
 // ---------------------------------------------------------------------------
+// Setup helpers — each owns one concern from the setup closure
+// ---------------------------------------------------------------------------
+
+/// Create the app data directory with restrictive permissions (mode 0700 on Unix).
+fn create_app_data_dir(path: &std::path::Path) {
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .expect("could not create app data dir");
+    }
+    #[cfg(target_os = "windows")]
+    std::fs::create_dir_all(path).expect("could not create app data dir");
+}
+
+/// Build the system tray with "Open Hoardbook" and "Quit" items.
+fn build_system_tray(app: &mut tauri::App) -> tauri::Result<()> {
+    let show_item = MenuItemBuilder::with_id("show", "Open Hoardbook").build(app)?;
+    let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+    let tray_menu = MenuBuilder::new(app).items(&[&show_item, &quit_item]).build()?;
+    TrayIconBuilder::with_id("hb_tray")
+        .icon(app.default_window_icon().unwrap().clone())
+        .menu(&tray_menu)
+        .tooltip("Hoardbook")
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "quit" => app.exit(0),
+            "show" => {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+            _ => {}
+        })
+        .build(app)?;
+    Ok(())
+}
+
+/// If a keypair is on disk, populate `identity` and spawn the iroh endpoint.
+/// Non-fatal: a failed endpoint logs a warning and the user can retry by restarting.
+fn restore_identity_and_start_endpoint(
+    store: DataStore,
+    identity: SharedIdentity,
+    endpoint_state: SharedEndpoint,
+    dm_queue: SharedDmQueue,
+    download_registry: SharedDownloadRegistry,
+    app: tauri::AppHandle,
+) {
+    let keypair_result = store.load_keypair();
+    if let Err(ref e) = keypair_result {
+        tracing::error!("Failed to load keypair on startup: {e:#}");
+    }
+    let Ok(Some(stored)) = keypair_result else { return };
+
+    let private_arr: Option<[u8; 32]> = hex::decode(&stored.private_key_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok());
+
+    let Some(arr) = private_arr else { return };
+
+    // Populate synchronously so the heartbeat task has a keypair at its first fire (15 s).
+    *identity.blocking_write() = Some(HoardbookKeypair::from_bytes(&arr));
+
+    let hb_id = stored.hb_id.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) =
+            start_iroh_endpoint(&arr, store, endpoint_state, dm_queue, hb_id, app, download_registry)
+                .await
+        {
+            tracing::warn!("iroh endpoint startup failed: {e}");
+        }
+    });
+}
+
+/// Spawn all long-running background tasks (heartbeat, DHT, update check).
+fn spawn_background_tasks(
+    relay: SharedRelay,
+    identity: SharedIdentity,
+    endpoint_state: SharedEndpoint,
+    hb_cancel_rx: tokio::sync::watch::Receiver<bool>,
+    dht_identity_port: u16,
+    dht_cancel: SharedDhtCancel,
+    store: DataStore,
+    app: tauri::AppHandle,
+) {
+    tauri::async_runtime::spawn(heartbeat::run_heartbeat_loop(
+        Arc::clone(&relay),
+        Arc::clone(&identity),
+        Arc::clone(&endpoint_state),
+        hb_cancel_rx,
+    ));
+
+    tauri::async_runtime::spawn(dht_service::run_identity_server(
+        dht_identity_port,
+        Arc::clone(&identity),
+        Arc::clone(&relay),
+        dht_cancel.subscribe(),
+    ));
+
+    tauri::async_runtime::spawn(dht_service::run_dht_announce_loop(
+        Arc::clone(&identity),
+        Arc::clone(&relay),
+        store,
+        dht_cancel.subscribe(),
+    ));
+
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+        match app.updater_builder().build() {
+            Ok(updater) => match updater.check().await {
+                Ok(Some(update)) => {
+                    tracing::info!("Update available: v{}", update.version);
+                    let _ = app.emit("update-available", &update.version);
+                }
+                Ok(None) => tracing::debug!("App is up to date"),
+                Err(e) => tracing::debug!("Background update check failed: {e}"),
+            },
+            Err(e) => tracing::debug!("Updater not configured: {e}"),
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // App entry point
 // ---------------------------------------------------------------------------
 
@@ -146,43 +275,24 @@ pub fn run() {
                 .app_data_dir()
                 .expect("could not resolve app data dir");
 
-            // Mode 0700 on Linux — data dir accessible only to the owning user.
-            #[cfg(not(target_os = "windows"))]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                std::fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o700)
-                    .create(&data_dir)
-                    .expect("could not create app data dir");
-            }
-            #[cfg(target_os = "windows")]
-            std::fs::create_dir_all(&data_dir).expect("could not create app data dir");
+            create_app_data_dir(&data_dir);
+
+            let store = DataStore::new(data_dir);
+            let settings = store.load_settings().ok().flatten().unwrap_or_default();
 
             let identity: SharedIdentity = Arc::new(RwLock::new(None));
             let endpoint_state: SharedEndpoint = Arc::new(RwLock::new(None));
             let dm_queue: SharedDmQueue = Arc::new(tokio::sync::Mutex::new(vec![]));
-
-            // Load saved relay URLs from settings, if any.
-            let store_tmp = DataStore::new(data_dir.clone());
-            let saved_relays = store_tmp
-                .load_settings()
-                .ok()
-                .flatten()
-                .map(|s| s.relay_urls)
-                .unwrap_or_default();
-            let relay: SharedRelay = Arc::new(RelayClient::new(saved_relays));
-
+            let relay: SharedRelay = Arc::new(RelayClient::new(settings.relay_urls));
             let download_registry: SharedDownloadRegistry =
                 Arc::new(transfer::DownloadRegistry::new());
 
             let (hb_cancel_tx, hb_cancel_rx) = tokio::sync::watch::channel(false);
             let hb_cancel: SharedCancelHeartbeat = Arc::new(hb_cancel_tx);
-
-            let (dht_cancel_tx, _dht_rx0) = tokio::sync::watch::channel(false);
+            let (dht_cancel_tx, _) = tokio::sync::watch::channel(false);
             let dht_cancel: SharedDhtCancel = Arc::new(dht_cancel_tx);
 
-            app.manage(DataStore::new(data_dir.clone()));
+            app.manage(store.clone());
             app.manage(Arc::clone(&identity));
             app.manage(Arc::clone(&relay));
             app.manage(Arc::clone(&endpoint_state));
@@ -191,116 +301,34 @@ pub fn run() {
             app.manage(Arc::clone(&hb_cancel));
             app.manage(Arc::clone(&dht_cancel));
 
-            // System tray — "Open Hoardbook" / "Quit".
-            let show_item = MenuItemBuilder::with_id("show", "Open Hoardbook").build(app)?;
-            let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
-            let tray_menu = MenuBuilder::new(app).items(&[&show_item, &quit_item]).build()?;
-            TrayIconBuilder::with_id("hb_tray")
-                .icon(app.default_window_icon().unwrap().clone())
-                .menu(&tray_menu)
-                .tooltip("Hoardbook")
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "quit" => app.exit(0),
-                    "show" => {
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.set_focus();
-                        }
-                    }
-                    _ => {}
-                })
-                .build(app)?;
+            build_system_tray(app)?;
 
             let app_handle = app.handle().clone();
 
-            // If a keypair is already on disk, populate identity and start the iroh endpoint.
-            let keypair_load_result = store_tmp.load_keypair();
-            if let Err(ref e) = keypair_load_result {
-                tracing::error!("Failed to load keypair on startup: {e:#}");
-            }
-            if let Ok(Some(stored)) = keypair_load_result {
-                // Populate SharedIdentity synchronously so the heartbeat task always
-                // has a keypair when it fires its first beat 15 s after launch.
-                if let Ok(bytes) = hex::decode(&stored.private_key_hex) {
-                    let arr: Result<[u8; 32], _> = bytes.try_into();
-                    if let Ok(arr) = arr {
-                        *identity.blocking_write() = Some(HoardbookKeypair::from_bytes(&arr));
-                    }
-                }
+            restore_identity_and_start_endpoint(
+                store.clone(),
+                Arc::clone(&identity),
+                Arc::clone(&endpoint_state),
+                Arc::clone(&dm_queue),
+                Arc::clone(&download_registry),
+                app_handle.clone(),
+            );
 
-                let ep_arc = Arc::clone(&endpoint_state);
-                let q_arc = Arc::clone(&dm_queue);
-                let store_for_ep = DataStore::new(data_dir.clone());
-                let hb_id = stored.hb_id.clone();
-                let app_for_ep = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Ok(bytes) = hex::decode(&stored.private_key_hex) {
-                        if let Ok(arr) = bytes.try_into() {
-                            if let Err(e) =
-                                start_iroh_endpoint(&arr, store_for_ep, ep_arc, q_arc, hb_id, app_for_ep)
-                                    .await
-                            {
-                                tracing::warn!("iroh endpoint startup failed: {e}");
-                            }
-                        }
-                    }
-                });
-            }
-
-            // Background heartbeat: first fires within 30 s, then every 5 minutes.
-            tauri::async_runtime::spawn(heartbeat::run_heartbeat_loop(
+            spawn_background_tasks(
                 Arc::clone(&relay),
                 Arc::clone(&identity),
                 Arc::clone(&endpoint_state),
                 hb_cancel_rx,
-            ));
-
-            // DHT identity port from saved settings (falls back to 6882).
-            let dht_identity_port = store_tmp
-                .load_settings()
-                .ok()
-                .flatten()
-                .map(|s| s.dht_identity_port)
-                .unwrap_or(6882);
-
-            // TCP server: responds to DHT searchers with a signed identity payload.
-            tauri::async_runtime::spawn(dht_service::run_identity_server(
-                dht_identity_port,
-                Arc::clone(&identity),
-                Arc::clone(&relay),
-                dht_cancel.subscribe(),
-            ));
-
-            // Background announce loop: re-announces opted-in tags every 30 min.
-            tauri::async_runtime::spawn(dht_service::run_dht_announce_loop(
-                Arc::clone(&identity),
-                Arc::clone(&relay),
-                DataStore::new(data_dir.clone()),
-                dht_cancel.subscribe(),
-            ));
-
-            // Background update check: silent unless a newer version is found.
-            let app_for_update = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-                match app_for_update.updater_builder().build() {
-                    Ok(updater) => match updater.check().await {
-                        Ok(Some(update)) => {
-                            tracing::info!("Update available: v{}", update.version);
-                            let _ = app_for_update.emit("update-available", &update.version);
-                        }
-                        Ok(None) => tracing::debug!("App is up to date"),
-                        Err(e) => tracing::debug!("Background update check failed: {e}"),
-                    },
-                    Err(e) => tracing::debug!("Updater not configured: {e}"),
-                }
-            });
+                settings.dht_identity_port,
+                Arc::clone(&dht_cancel),
+                store,
+                app_handle,
+            );
 
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing the window hides it to the system tray rather than quitting.
-            // "Quit" from the tray menu calls app.exit(0) which bypasses this.
+            // Closing hides to tray; "Quit" from the tray calls app.exit(0) instead.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();

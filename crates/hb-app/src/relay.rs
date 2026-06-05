@@ -72,7 +72,7 @@ struct PublishRequest<'a> {
 
 pub struct RelayClient {
     http: Client,
-    relay_urls: std::sync::RwLock<Vec<String>>,
+    relay_urls: tokio::sync::RwLock<Vec<String>>,
 }
 
 impl RelayClient {
@@ -89,31 +89,31 @@ impl RelayClient {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("failed to build HTTP client"),
-            relay_urls: std::sync::RwLock::new(relay_urls),
+            relay_urls: tokio::sync::RwLock::new(relay_urls),
         }
     }
 
     /// Return the current relay URL list.
-    pub fn get_relay_urls(&self) -> Vec<String> {
-        self.relay_urls.read().unwrap().clone()
+    pub async fn get_relay_urls(&self) -> Vec<String> {
+        self.relay_urls.read().await.clone()
     }
 
     /// Update relay URLs, always prepending bootstrap relays so they are never lost.
-    pub fn set_relay_urls(&self, user_urls: Vec<String>) {
+    pub async fn set_relay_urls(&self, user_urls: Vec<String>) {
         let mut urls: Vec<String> = BOOTSTRAP_RELAYS.iter().map(|s| s.to_string()).collect();
         for url in user_urls {
             if !urls.contains(&url) {
                 urls.push(url);
             }
         }
-        *self.relay_urls.write().unwrap() = acceptable_relays(urls);
+        *self.relay_urls.write().await = acceptable_relays(urls);
     }
 
     /// Publish a signed envelope to all known relays.
     /// Returns Ok(()) if at least one relay accepts the document; logs failures for the rest.
     pub async fn publish(&self, doc_type: &str, envelope: &SignedEnvelope) -> Result<()> {
         let body = PublishRequest { doc_type, document: envelope };
-        let relay_urls = self.relay_urls.read().unwrap().clone();
+        let relay_urls = self.relay_urls.read().await.clone();
         let mut succeeded = false;
         let mut last_err = anyhow!("no relays configured");
 
@@ -148,7 +148,7 @@ impl RelayClient {
         use tokio::task::JoinSet;
 
         let mut set: JoinSet<Result<PeerResponse>> = JoinSet::new();
-        let relay_urls = self.relay_urls.read().unwrap().clone();
+        let relay_urls = self.relay_urls.read().await.clone();
 
         for url in &relay_urls {
             let endpoint = format!("{url}/v1/peer/{hb_id}");
@@ -212,7 +212,7 @@ impl RelayClient {
             messages: Vec<SignedEnvelope>,
         }
 
-        let relay_urls = self.relay_urls.read().unwrap().clone();
+        let relay_urls = self.relay_urls.read().await.clone();
         if relay_urls.is_empty() {
             return Err(anyhow!(
                 "No secure relay configured. Add an https relay in Settings (or set HB_ALLOW_INSECURE_RELAY=1 for local development)."
@@ -324,7 +324,7 @@ impl RelayClient {
         };
         let envelope = SignedEnvelope::create(keypair, DocType::Heartbeat, &body)?;
 
-        let relay_urls = self.relay_urls.read().unwrap().clone();
+        let relay_urls = self.relay_urls.read().await.clone();
         for url in &relay_urls {
             let endpoint = format!("{url}/v1/heartbeat");
             if let Err(e) = self.http.post(&endpoint).json(&envelope).send().await {

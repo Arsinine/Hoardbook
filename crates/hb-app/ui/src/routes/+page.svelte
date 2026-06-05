@@ -410,12 +410,22 @@
 
 {#if obStep === 0}
 	<div class="loading-screen">
-		<div class="loading-logo">H</div>
+		<div class="loading-logo">
+			<svg viewBox="0 0 18 24" width="24" height="32" style="overflow:visible" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+				<line x1="4" y1="-8" x2="4" y2="22"/>
+				<path d="M4 12.5 C4 8 15 8 15 12.5 L15 22"/>
+			</svg>
+		</div>
 	</div>
 {:else if obStep < 4}
 	<!-- Onboarding flow -->
 	<div class="onboarding">
-		<div class="ob-logo">H</div>
+		<div class="ob-logo">
+			<svg viewBox="0 0 18 24" width="30" height="40" style="overflow:visible" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+				<line x1="4" y1="-8" x2="4" y2="22"/>
+				<path d="M4 12.5 C4 8 15 8 15 12.5 L15 22"/>
+			</svg>
+		</div>
 		<div class="ob-text">
 			<div class="ob-title">Welcome to Hoardbook</div>
 			<div class="ob-sub">A peer-to-peer field guide for data hoarders. Publish what you keep, find others who keep it too.</div>
@@ -792,7 +802,8 @@
 		border-radius: 10px;
 		background: linear-gradient(135deg, var(--accent) 0%, oklch(0.55 0.18 100) 100%);
 		display: flex; align-items: center; justify-content: center;
-		font-weight: 800; font-size: 22px; color: var(--accent-text);
+		color: var(--accent-text);
+		overflow: hidden;
 		opacity: 0.6;
 		animation: pulse 1.4s ease-in-out infinite;
 	}
@@ -819,8 +830,8 @@
 		border-radius: 14px;
 		background: linear-gradient(135deg, var(--accent) 0%, oklch(0.55 0.18 100) 100%);
 		display: flex; align-items: center; justify-content: center;
-		font-weight: 800; font-size: 28px; color: var(--accent-text);
-		letter-spacing: -1.5px;
+		color: var(--accent-text);
+		overflow: hidden;
 		box-shadow: 0 12px 40px -8px var(--accent-soft), inset 0 1px 0 oklch(1 0 0 / 0.2);
 	}
 
