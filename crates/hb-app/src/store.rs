@@ -15,10 +15,45 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
 use anyhow::{Context, Result};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use hb_core::{StoredKeypair, SignedEnvelope};
+
+// ---------------------------------------------------------------------------
+// Settings — persisted user preferences
+// ---------------------------------------------------------------------------
+
+fn default_true() -> bool { true }
+fn default_dht_port() -> u16 { 6882 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Settings {
+    pub relay_urls: Vec<String>,
+    #[serde(default = "default_true")]
+    pub allow_dms: bool,
+    #[serde(default)]
+    pub dht_announce_enabled: bool,
+    #[serde(default)]
+    pub dht_announce_tags: Vec<String>,
+    #[serde(default)]
+    pub dht_announce_content_types: Vec<String>,
+    #[serde(default = "default_dht_port")]
+    pub dht_identity_port: u16,
+}
+
+// ---------------------------------------------------------------------------
+// ShareSettings — per-collection P2P sharing config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ShareSettings {
+    pub enabled: bool,
+    pub root_path: Option<String>,
+    pub allowed_paths: Vec<String>,
+    pub speed_cap_kbps: Option<u32>,
+    pub download_limit: Option<u32>,
+    pub require_follow: bool,
+}
 
 // ---------------------------------------------------------------------------
 // Generic helpers
@@ -69,21 +104,11 @@ fn read_json_lenient<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 #[derive(Clone)]
 pub struct DataStore {
     pub(crate) base: PathBuf,
-    /// Tracks concurrent active downloads for enforcing download_limit.
-    pub(crate) active_downloads: Arc<AtomicU32>,
 }
 
 impl DataStore {
     pub fn new(base: PathBuf) -> Self {
-        Self { base, active_downloads: Arc::new(AtomicU32::new(0)) }
-    }
-
-    pub fn acquire_download_slot(&self) -> u32 {
-        self.active_downloads.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
-    pub fn release_download_slot(&self) {
-        self.active_downloads.fetch_sub(1, Ordering::Relaxed);
+        Self { base }
     }
 
     // -- Paths ---------------------------------------------------------------
@@ -292,28 +317,21 @@ impl DataStore {
 
     // -- Settings ------------------------------------------------------------
 
-    pub fn save_settings(&self, settings: &crate::commands::settings::Settings) -> Result<()> {
+    pub fn save_settings(&self, settings: &Settings) -> Result<()> {
         write_json(&self.settings_path(), settings).context("saving settings")
     }
 
-    pub fn load_settings(&self) -> Result<Option<crate::commands::settings::Settings>> {
+    pub fn load_settings(&self) -> Result<Option<Settings>> {
         read_json_lenient(&self.settings_path()).context("loading settings")
     }
 
     // -- Share settings ------------------------------------------------------
 
-    pub fn save_share_settings(
-        &self,
-        slug: &str,
-        settings: &crate::commands::sharing::ShareSettings,
-    ) -> Result<()> {
+    pub fn save_share_settings(&self, slug: &str, settings: &ShareSettings) -> Result<()> {
         write_json(&self.share_settings_path(slug), settings).context("saving share settings")
     }
 
-    pub fn load_share_settings(
-        &self,
-        slug: &str,
-    ) -> Result<Option<crate::commands::sharing::ShareSettings>> {
+    pub fn load_share_settings(&self, slug: &str) -> Result<Option<ShareSettings>> {
         read_json(&self.share_settings_path(slug)).context("loading share settings")
     }
 
@@ -376,7 +394,6 @@ impl DataStore {
 // CachedPeer — one file per followed peer in contacts/
 // ---------------------------------------------------------------------------
 
-use serde::Deserialize;
 use hb_core::types::{Collection, Profile};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

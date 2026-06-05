@@ -105,7 +105,12 @@
 	<div class="sidebar">
 		<!-- Brand -->
 		<div class="brand">
-			<div class="brand-logo">H</div>
+			<div class="brand-logo">
+				<svg viewBox="0 0 18 24" width="15" height="20" style="overflow:visible" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+					<line x1="4" y1="-8" x2="4" y2="22"/>
+					<path d="M4 12.5 C4 8 15 8 15 12.5 L15 22"/>
+				</svg>
+			</div>
 			<span class="brand-name">Hoardbook</span>
 		</div>
 
@@ -189,9 +194,8 @@
 		border-radius: 6px;
 		background: linear-gradient(135deg, var(--accent) 0%, oklch(0.55 0.18 100) 100%);
 		display: flex; align-items: center; justify-content: center;
-		font-weight: 800; font-size: 13px;
 		color: var(--accent-text);
-		letter-spacing: -0.5px;
+		overflow: hidden;
 	}
 
 	.brand-name {

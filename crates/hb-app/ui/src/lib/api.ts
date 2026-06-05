@@ -15,7 +15,6 @@ import type {
 	Group,
 	IdentityInfo,
 	Profile,
-	ReceivedChannelMessage,
 	ReceivedMessage,
 	ScanOptions,
 	ShareSettings,
@@ -162,12 +161,6 @@ export const sendMessage = (to: string, content: string) =>
 	invoke<ReceivedMessage>('send_message', { to, content });
 
 export const getMessages = () => invoke<ReceivedMessage[]>('get_messages');
-
-export const getChannelMessages = (channel: string) =>
-	invoke<ReceivedChannelMessage[]>('get_channel_messages', { channel });
-
-export const postChannelMessage = (channel: string, content: string) =>
-	invoke<ReceivedChannelMessage>('post_channel_message', { channel, content });
 
 // ── Updates ───────────────────────────────────────────────────────────────────
 

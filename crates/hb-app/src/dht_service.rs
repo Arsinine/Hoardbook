@@ -62,6 +62,9 @@ pub fn sha1_id(data: &[u8]) -> mainline::Id {
 /// Initial 30-second delay allows the identity to load before the first announce.
 /// Wakes immediately when `cancel_rx` changes: `false` = re-check settings now,
 /// `true` = shut down.
+///
+/// A single DHT node is created once and reused across cycles so its routing
+/// table warms up instead of bootstrapping from scratch every 30 min.
 pub async fn run_dht_announce_loop(
     identity: SharedIdentity,
     _relay: Arc<RelayClient>,
@@ -75,11 +78,18 @@ pub async fn run_dht_announce_loop(
         }
     }
 
+    let dht = match mainline::Dht::builder().build() {
+        Ok(d) => d.as_async(),
+        Err(e) => {
+            tracing::warn!("DHT announce: failed to create DHT node: {e}");
+            return;
+        }
+    };
+
     loop {
         let settings = store.load_settings().ok().flatten().unwrap_or_default();
 
         if settings.dht_announce_enabled {
-            // Check identity is loaded; get hb_id for logging only.
             let hb_id_str = {
                 let guard = identity.read().await;
                 guard.as_ref().map(|kp| kp.hb_id())
@@ -93,31 +103,22 @@ pub async fn run_dht_announce_loop(
                     .collect();
 
                 if !terms.is_empty() {
-                    match mainline::Dht::builder().build() {
-                        Err(e) => tracing::warn!("DHT announce: failed to create DHT node: {e}"),
-                        Ok(d) => {
-                            let dht = d.as_async();
-                            for term in &terms {
-                                let info_hash = sha1_id(term.as_bytes());
-                                match dht
-                                    .announce_peer(info_hash, Some(settings.dht_identity_port))
-                                    .await
-                                {
-                                    Ok(_) => tracing::debug!(
-                                        "DHT announced {:?} on port {}",
-                                        term,
-                                        settings.dht_identity_port
-                                    ),
-                                    Err(e) => tracing::warn!("DHT announce {:?}: {e}", term),
-                                }
-                            }
-                            tracing::info!(
-                                "DHT announce complete: {} terms, hb_id={}",
-                                terms.len(),
-                                hb_id_str
-                            );
+                    for term in &terms {
+                        let info_hash = sha1_id(term.as_bytes());
+                        match dht.announce_peer(info_hash, Some(settings.dht_identity_port)).await {
+                            Ok(_) => tracing::debug!(
+                                "DHT announced {:?} on port {}",
+                                term,
+                                settings.dht_identity_port
+                            ),
+                            Err(e) => tracing::warn!("DHT announce {:?}: {e}", term),
                         }
                     }
+                    tracing::info!(
+                        "DHT announce complete: {} terms, hb_id={}",
+                        terms.len(),
+                        hb_id_str
+                    );
                 }
             }
         }
@@ -205,7 +206,7 @@ async fn serve_identity(
         let guard = identity.read().await;
         let Some(ref kp) = *guard else { return };
         let hb_id = kp.hb_id();
-        let relay_urls = relay.get_relay_urls();
+        let relay_urls = relay.get_relay_urls().await;
         let payload = serde_json::json!({
             "hb_id": hb_id,
             "relay_urls": relay_urls,

@@ -2,18 +2,16 @@
 	import { onMount, tick } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { contacts, identity, inboxMessages, sentMessages, unreadCount, toast } from '$lib/stores.js';
-	import { getMessages, sendMessage, getChannelMessages, postChannelMessage, pasteKey } from '$lib/api.js';
+	import { getMessages, sendMessage, pasteKey } from '$lib/api.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
-	import type { CachedPeer, ReceivedChannelMessage, ReceivedMessage } from '$lib/types.js';
+	import type { CachedPeer, ReceivedMessage } from '$lib/types.js';
 
 	let loading = false;
 	let sending = false;
 	let selectedPeer: CachedPeer | null = null;
-	let showGeneral = false;
 	let draft = '';
 	let threadEl: HTMLElement;
-	let generalThreadEl: HTMLElement;
 
 	// Stable set of message keys we've already counted for badge purposes.
 	// Format: `${from}|${sent_at}` — prevents double-counting on relay inconsistencies.
@@ -21,50 +19,6 @@
 
 	// Per-peer "seen" snapshot: hb_id → inbox count at last view.
 	let seenCounts: Record<string, number> = {};
-
-	// General channel state
-	let channelMessages: ReceivedChannelMessage[] = [];
-	let channelDraft = '';
-	let sendingChannel = false;
-	let channelLoading = false;
-
-	async function loadChannel() {
-		channelLoading = true;
-		try {
-			channelMessages = await getChannelMessages('general');
-			await tick();
-			if (generalThreadEl) generalThreadEl.scrollTop = generalThreadEl.scrollHeight;
-		} catch { /* relay may be unreachable */ }
-		finally { channelLoading = false; }
-	}
-
-	async function selectGeneral() {
-		showGeneral = true;
-		selectedPeer = null;
-		await loadChannel();
-	}
-
-	async function handleChannelSend() {
-		if (!channelDraft.trim() || sendingChannel) return;
-		sendingChannel = true;
-		const content = channelDraft.trim();
-		channelDraft = '';
-		try {
-			const sent = await postChannelMessage('general', content);
-			channelMessages = [...channelMessages, sent];
-			await tick();
-			if (generalThreadEl) generalThreadEl.scrollTop = generalThreadEl.scrollHeight;
-		} catch (e) {
-			toast(String(e), 'error');
-			channelDraft = content;
-		} finally {
-			sendingChannel = false;
-		}
-	}
-
-	function handleChannelKeydown(e: KeyboardEvent) {
-		if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleChannelSend(); }
-	}
 
 	$: myId = $identity?.hb_id ?? '';
 
@@ -106,18 +60,6 @@
 	// Eagerly fetch names for senders in message requests whenever the list changes.
 	$: fetchNonContactNames(inboxOnlyPeers);
 
-	// Also fetch names for unknown general-channel senders we encounter.
-	$: {
-		const unknownChannelSenders = [...new Set(channelMessages.map(m => m.from))]
-			.filter(id => id !== myId && !$contacts.some(c => c.hb_id === id) && !peerNameCache[id]);
-		if (unknownChannelSenders.length > 0) {
-			fetchNonContactNames(unknownChannelSenders.map(id => ({
-				hb_id: id, profile: undefined, collections: [], online: false,
-				node_addr: undefined, last_fetched: '', last_seen_at: undefined, local_tags: [],
-			}) satisfies CachedPeer));
-		}
-	}
-
 	// Resolve display name for a sender hb_id — contacts first, then fetched cache.
 	function senderName(hb_id: string): string {
 		if (hb_id === myId) return 'You';
@@ -154,22 +96,8 @@
 			} catch { /* relay unreachable */ }
 		}, 4_000);
 
-		// Fast channel poll — refreshes general channel every 4s when viewing it.
-		const channelPoll = setInterval(async () => {
-			if (!showGeneral) return;
-			try {
-				const fresh = await getChannelMessages('general');
-				if (fresh.length !== channelMessages.length) {
-					channelMessages = fresh;
-					await tick();
-					if (generalThreadEl) generalThreadEl.scrollTop = generalThreadEl.scrollHeight;
-				}
-			} catch { /* relay unreachable */ }
-		}, 4_000);
-
 		return () => {
 			clearInterval(fastPoll);
-			clearInterval(channelPoll);
 		};
 	});
 
@@ -195,7 +123,6 @@
 
 	async function selectPeer(peer: CachedPeer) {
 		selectedPeer = peer;
-		showGeneral = false;
 		seenCounts[peer.hb_id] = $inboxMessages.filter((m) => m.from === peer.hb_id).length;
 		await tick();
 		scrollToBottom();
@@ -282,19 +209,6 @@
 				</div>
 			</div>
 			<div class="convo-list">
-				<!-- General channel — always pinned at top -->
-				<button class="convo-item convo-general" class:convo-active={showGeneral} on:click={selectGeneral}>
-					<div class="general-icon">#</div>
-					<div class="convo-info">
-						<div class="convo-row">
-							<span class="convo-name" class:convo-name-active={showGeneral}>General</span>
-						</div>
-						<div class="convo-preview-row">
-							<span class="convo-preview-text">Community channel</span>
-						</div>
-					</div>
-				</button>
-				<div class="convo-divider">Direct Messages</div>
 				{#if allConversationPeers.length === 0}
 					<div class="convo-empty">Add contacts via Contacts to start chatting.</div>
 				{:else}
@@ -326,72 +240,7 @@
 
 		<!-- Conversation pane -->
 		<div class="convo-pane">
-			{#if showGeneral}
-				<div class="pane-header">
-					<div class="general-icon general-icon-lg">#</div>
-					<div class="pane-peer-info">
-						<div class="pane-peer-name">General</div>
-						<span class="mono">Community channel — public, unencrypted</span>
-					</div>
-					<button class="icon-btn" on:click={loadChannel} disabled={channelLoading} title="Refresh">
-						{@html icons.refresh}
-					</button>
-				</div>
-				<div class="privacy-banner">
-					<span class="privacy-icon">{@html icons.shield}</span>
-					<span>All messages in this channel are public and visible to anyone on the relay.</span>
-				</div>
-				<div class="thread" bind:this={generalThreadEl}>
-					{#if channelLoading}
-						<p class="thread-empty">Loading…</p>
-					{:else if channelMessages.length === 0}
-						<p class="thread-empty">No messages yet. Be the first to say hello!</p>
-					{:else}
-						{#each channelMessages as msg, i}
-							{@const isMe = msg.from === myId}
-							{@const prevMsg = i > 0 ? channelMessages[i - 1] : null}
-							{@const showDate = !prevMsg || formatDate(msg.sent_at) !== formatDate(prevMsg.sent_at)}
-							{#if showDate}
-								<div class="day-marker">
-									<div class="day-line" />
-									<span class="day-label">{formatDate(msg.sent_at)}</span>
-									<div class="day-line" />
-								</div>
-							{/if}
-							<div class="channel-msg" class:channel-msg-me={isMe}>
-								<span class="channel-sender">{senderName(msg.from)}</span>
-								<span class="channel-time">{formatTime(msg.sent_at)}</span>
-								<p class="channel-text">{msg.content}</p>
-							</div>
-						{/each}
-					{/if}
-				</div>
-				{#if $identity}
-					<div class="composer">
-						<div class="compose-box">
-							<textarea
-								class="compose-input"
-								placeholder="Post to #general…"
-								bind:value={channelDraft}
-								on:keydown={handleChannelKeydown}
-								disabled={sendingChannel}
-								rows="2"
-							></textarea>
-							<div class="compose-footer">
-								<span class="compose-hint">Public · no encryption</span>
-								<button
-									class="btn-primary btn-sm btn-icon"
-									on:click={handleChannelSend}
-									disabled={!channelDraft.trim() || sendingChannel}
-								>
-									{sendingChannel ? '…' : 'Post'}
-									<span>{@html icons.send}</span>
-								</button>
-							</div>
-						</div>
-					</div>
-				{/if}
-			{:else if !selectedPeer}
+			{#if !selectedPeer}
 				<div class="convo-empty-state">
 					<p>Select a contact to view the conversation.</p>
 					<p class="privacy-note">
@@ -572,61 +421,6 @@
 		font-weight: 600;
 		text-transform: uppercase;
 		letter-spacing: 1px;
-		color: var(--fg-dim);
-	}
-
-	.convo-general { margin-bottom: 2px; }
-
-	.general-icon {
-		width: 34px; height: 34px;
-		border-radius: 9px;
-		background: var(--accent-soft);
-		border: 1px solid color-mix(in oklch, var(--accent) 25%, transparent);
-		display: flex; align-items: center; justify-content: center;
-		font-size: 16px; font-weight: 700;
-		color: var(--accent);
-		flex-shrink: 0;
-	}
-
-	.general-icon-lg {
-		width: 36px; height: 36px;
-		border-radius: 10px;
-		font-size: 18px;
-	}
-
-	.convo-preview-text { font-size: 11px; color: var(--fg-dim); }
-
-	/* Channel messages */
-	.channel-msg {
-		padding: 6px 0;
-		border-bottom: 1px solid var(--divider);
-	}
-	.channel-msg:last-child { border-bottom: none; }
-	.channel-msg-me .channel-sender { color: var(--accent); }
-
-	.channel-sender {
-		font-size: 11.5px;
-		font-weight: 600;
-		color: var(--fg-muted);
-		margin-right: 8px;
-	}
-
-	.channel-time {
-		font-size: 10.5px;
-		color: var(--fg-dim);
-	}
-
-	.channel-text {
-		font-size: 13px;
-		line-height: 1.5;
-		white-space: pre-wrap;
-		word-break: break-word;
-		margin: 3px 0 0;
-		color: var(--fg);
-	}
-
-	.compose-hint {
-		font-size: 11px;
 		color: var(--fg-dim);
 	}
 
