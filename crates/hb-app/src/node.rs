@@ -171,6 +171,59 @@ pub async fn fetch_profile_via_iroh(
 }
 
 // ---------------------------------------------------------------------------
+// Client — send a DM over an iroh stream
+// ---------------------------------------------------------------------------
+
+/// Stream-level send_dm exchange: serialise the request, write it framed,
+/// read the response, and return Ok(()) or an error string from the remote.
+pub(crate) async fn send_dm_via_stream(
+    mut send: impl tokio::io::AsyncWrite + Unpin,
+    mut recv: impl tokio::io::AsyncRead + Unpin,
+    envelope: &SignedEnvelope,
+) -> Result<()> {
+    let req_bytes =
+        serde_json::to_vec(&serde_json::json!({"type": "send_dm", "envelope": envelope}))
+            .context("serialize send_dm request")?;
+    send.write_u32_le(req_bytes.len() as u32).await.context("write req len")?;
+    send.write_all(&req_bytes).await.context("write req")?;
+    send.shutdown().await.context("shutdown send")?;
+
+    let resp_len = recv.read_u32_le().await.context("read resp len")?;
+    if resp_len > 64 * 1024 {
+        return Err(anyhow!("send_dm response too large: {resp_len} bytes"));
+    }
+    let mut resp_bytes = vec![0u8; resp_len as usize];
+    recv.read_exact(&mut resp_bytes).await.context("read response")?;
+
+    #[derive(serde::Deserialize)]
+    struct SendDmResult { ok: bool, error: Option<String> }
+    let result: SendDmResult =
+        serde_json::from_slice(&resp_bytes).context("parse send_dm response")?;
+    if result.ok {
+        Ok(())
+    } else {
+        Err(anyhow!("send_dm rejected: {}", result.error.unwrap_or_default()))
+    }
+}
+
+/// Connect to a remote iroh node and deliver a DM envelope directly.
+/// Returns `Err` on connection/IO failure or if the remote node rejected the message.
+pub async fn send_dm_via_iroh(
+    endpoint: &iroh::Endpoint,
+    node_addr_str: &str,
+    envelope: &SignedEnvelope,
+) -> Result<()> {
+    let peer_addr: iroh::EndpointAddr =
+        serde_json::from_str(node_addr_str).context("parse peer EndpointAddr")?;
+    let conn = endpoint
+        .connect(peer_addr, NODE_ALPN)
+        .await
+        .context("iroh connect")?;
+    let (send, recv) = conn.open_bi().await.context("open_bi")?;
+    send_dm_via_stream(send, recv, envelope).await
+}
+
+// ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
 
