@@ -267,7 +267,15 @@ fn ed25519_pubkey_to_x25519(
 }
 
 /// Derive a 256-bit symmetric key from an X25519 shared secret using HKDF-SHA256.
-/// Salt `b"hoardbook-ecdh-v1"` provides domain separation per RFC 5869.
+///
+/// # Wire compatibility
+/// The salt `b"hoardbook-ecdh-v1"` was introduced as a deliberate protocol flag-day
+/// (commit 311d88e). Any message encrypted before that commit used a `None`-salt
+/// (RFC 5869 §2.2 all-zeros, 32 bytes) and produces a *different* derived key — those
+/// messages cannot be decrypted by this code. This is acceptable because the project
+/// has not shipped any release to end users. If a future protocol break is necessary,
+/// bump the salt to `b"hoardbook-ecdh-v2"` and add a version discriminant to the
+/// envelope so receivers can select the right path.
 fn derive_key(shared_secret: &[u8]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(Some(b"hoardbook-ecdh-v1"), shared_secret);
     let mut key = [0u8; 32];

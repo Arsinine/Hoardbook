@@ -241,8 +241,10 @@ pub async fn get_messages(
     hb_core::crypto::verify(&pubkey_bytes, &signed, &auth.signature)?;
 
     let envelopes = db::get_messages_for(&state.pool, &pubkey).await?;
-    // M1: delete delivered messages so the mailbox doesn't grow unboundedly.
-    db::delete_messages_for(&state.pool, &pubkey).await?;
+    // M1: mailbox growth is controlled by the 30-day TTL expiry task.
+    // We do NOT delete here — deleting before the response is confirmed delivered
+    // would silently lose messages on any network failure (at-most-once).
+    // A proper ACK-based deletion endpoint is tracked in HANDOVER as a post-MVP item.
     let messages = envelopes
         .into_iter()
         .filter_map(|s| serde_json::from_str::<Value>(&s).ok())
