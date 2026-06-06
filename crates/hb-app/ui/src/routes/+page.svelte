@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { saveProfile, publishProfile, publishCollection, deleteCollection, updateCollectionMeta, exportCollection, getShareSettings, generateKeypair, hasPublishedProfile, saveKeypairFile, importKeypair } from '$lib/api.js';
 	import { save as saveDialog, open as openDialog, confirm } from '@tauri-apps/plugin-dialog';
-	import { profile, collections, identity, toast, appReady, homeDraft } from '$lib/stores.js';
+	import { profile, collections, identity, toast, appReady, homeDraft, identityLoadError } from '$lib/stores.js';
 	import { onMount } from 'svelte';
 	import { icons, socialIcons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
@@ -34,7 +34,8 @@
 
 	$: if ($appReady && obStep === 0) {
 		if ($identity) obStep = 4;
-		else obStep = 1;
+		else if (!$identityLoadError) obStep = 1;
+		// identityLoadError set: stay at 0; the error screen is shown in the template.
 	}
 
 	async function obGenerateKeypair() {
@@ -409,14 +410,25 @@
 </script>
 
 {#if obStep === 0}
-	<div class="loading-screen">
-		<div class="loading-logo">
-			<svg viewBox="0 0 18 24" width="24" height="32" style="overflow:visible" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-				<line x1="4" y1="-8" x2="4" y2="22"/>
-				<path d="M4 12.5 C4 8 15 8 15 12.5 L15 22"/>
-			</svg>
+	{#if $appReady && $identityLoadError}
+		<div class="loading-screen">
+			<div class="id-error-card">
+				<div class="id-error-title">Identity file unreadable</div>
+				<div class="id-error-body">Your keypair file exists but could not be decrypted. This usually means the Windows credentials used to encrypt it have changed.</div>
+				<div class="id-error-detail">{$identityLoadError}</div>
+				<a href="/settings" class="btn-primary btn-sm id-error-btn">Open Settings → Wipe data</a>
+			</div>
 		</div>
-	</div>
+	{:else}
+		<div class="loading-screen">
+			<div class="loading-logo">
+				<svg viewBox="0 0 18 24" width="24" height="32" style="overflow:visible" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+					<line x1="4" y1="-8" x2="4" y2="22"/>
+					<path d="M4 12.5 C4 8 15 8 15 12.5 L15 22"/>
+				</svg>
+			</div>
+		</div>
+	{/if}
 {:else if obStep < 4}
 	<!-- Onboarding flow -->
 	<div class="onboarding">
@@ -800,9 +812,10 @@
 	.loading-logo {
 		width: 40px; height: 40px;
 		border-radius: 10px;
-		background: linear-gradient(135deg, var(--accent) 0%, oklch(0.55 0.18 100) 100%);
+		background: var(--bg-elev3);
+		border: 1px solid color-mix(in oklch, var(--accent) 22%, transparent);
 		display: flex; align-items: center; justify-content: center;
-		color: var(--accent-text);
+		color: var(--accent);
 		overflow: hidden;
 		opacity: 0.6;
 		animation: pulse 1.4s ease-in-out infinite;
@@ -812,6 +825,31 @@
 		0%, 100% { opacity: 0.4; transform: scale(0.95); }
 		50% { opacity: 0.8; transform: scale(1); }
 	}
+
+	/* Identity load error */
+	.id-error-card {
+		width: 380px;
+		background: var(--bg-elev1);
+		border: 1px solid oklch(0.65 0.18 25 / 0.35);
+		border-radius: 10px;
+		padding: 22px;
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+	}
+	.id-error-title { font-size: 15px; font-weight: 600; color: var(--fg); }
+	.id-error-body { font-size: 13px; color: var(--fg-muted); line-height: 1.55; }
+	.id-error-detail {
+		font-family: var(--font-mono);
+		font-size: 10.5px;
+		color: oklch(0.75 0.12 25);
+		background: oklch(0.20 0.04 25 / 0.5);
+		border: 1px solid oklch(0.45 0.12 25 / 0.3);
+		border-radius: 6px;
+		padding: 8px 10px;
+		word-break: break-word;
+	}
+	.id-error-btn { align-self: flex-start; text-decoration: none; margin-top: 4px; }
 
 	/* Onboarding */
 	.onboarding {
@@ -828,11 +866,12 @@
 	.ob-logo {
 		width: 56px; height: 56px;
 		border-radius: 14px;
-		background: linear-gradient(135deg, var(--accent) 0%, oklch(0.55 0.18 100) 100%);
+		background: var(--bg-elev3);
+		border: 1px solid color-mix(in oklch, var(--accent) 28%, transparent);
 		display: flex; align-items: center; justify-content: center;
-		color: var(--accent-text);
+		color: var(--accent);
 		overflow: hidden;
-		box-shadow: 0 12px 40px -8px var(--accent-soft), inset 0 1px 0 oklch(1 0 0 / 0.2);
+		box-shadow: 0 8px 28px -6px oklch(0.78 0.14 70 / 0.18);
 	}
 
 	.ob-text { text-align: center; max-width: 380px; }

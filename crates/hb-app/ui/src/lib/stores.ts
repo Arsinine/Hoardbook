@@ -20,6 +20,9 @@ export const toastMessage = writable<{ text: string; kind: 'success' | 'error' }
 /** True once the layout's initial data fetch has completed. */
 export const appReady = writable(false);
 
+/** Set when the identity file exists but cannot be decrypted (e.g. DPAPI failure). */
+export const identityLoadError = writable<string | null>(null);
+
 /** Count of messages received since the chat page was last opened. */
 export const unreadCount = writable(0);
 

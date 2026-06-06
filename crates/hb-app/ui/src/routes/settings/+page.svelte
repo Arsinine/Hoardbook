@@ -95,7 +95,7 @@
 				await dhtStopAnnounce();
 				dhtEnabled = false;
 			} else {
-				await dhtStartAnnounce(parseCsv(dhtTagsRaw), parseCsv(dhtCtRaw));
+				await dhtStartAnnounce();
 				dhtEnabled = true;
 			}
 		} catch (e) {
@@ -203,11 +203,9 @@
 	async function handleWipe() {
 		wiping = true;
 		try {
-			const deactivated = await wipeData();
-			if (!deactivated) {
-				toast('Data wiped. Your published data may linger on the relay for up to 24 hours — the relay could not be reached.', 'warning');
-				await new Promise(r => setTimeout(r, 5000));
-			}
+			await wipeData();
+			toast('Data wiped. Published data may linger on the relay for up to 24 hours. Restarting…');
+			await new Promise(r => setTimeout(r, 3000));
 			await relaunch();
 		} catch (e) {
 			toast(String(e), 'error');
