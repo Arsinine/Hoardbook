@@ -1,12 +1,12 @@
 <script lang="ts">
-	import { pasteKey, follow, refreshContact, requestDownload, unfollowContact, setContactTags, getDirectory, dhtSearch, watchesCreate, watchesEvaluate } from '$lib/api.js';
+	import { pasteKey, follow, refreshContact, requestDownload, unfollowContact, setContactTags, getDirectory, dhtSearch, watchesCreate, watchesEvaluate, groupsGet, contactUpdateGroups } from '$lib/api.js';
 	import { save } from '@tauri-apps/plugin-dialog';
 	import { contacts, identity, toast, downloads } from '$lib/stores.js';
 	import DownloadQueue from '$lib/components/DownloadQueue.svelte';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
-	import type { CachedPeer, DirectoryPeer, DhtResult } from '$lib/types.js';
+	import type { CachedPeer, DirectoryPeer, DhtResult, Group } from '$lib/types.js';
 	import { onMount } from 'svelte';
 
 	// Recommended directory
@@ -23,8 +23,43 @@
 	let showIpWarning = false;
 	let pendingDownloadDetail: { peerId: string; slug: string; path: string } | null = null;
 
+	// Groups state
+	let groups: Group[] = [];
+
+	async function loadGroups() {
+		try { groups = await groupsGet(); } catch { /* non-fatal */ }
+	}
+
+	// Stale: last_fetched more than 7 days ago.
+	function isStale(peer: CachedPeer): boolean {
+		if (!peer.last_fetched) return false;
+		return Date.now() - new Date(peer.last_fetched).getTime() > 7 * 24 * 60 * 60 * 1000;
+	}
+
+	// Which groups a contact belongs to (derived from groups[].pubkeys).
+	function contactGroups(hb_id: string): string[] {
+		return groups.filter(g => g.pubkeys.includes(hb_id)).map(g => g.name);
+	}
+
+	// Group picker for follow flow (lookup result + DHT).
+	let followGroupName = '';
+	let dhtFollowGroupName: Record<string, string> = {};
+
+	// Per-contact group-change select: hb_id → selected group name or '' for Ungrouped.
+	let contactGroupEditing: Record<string, boolean> = {};
+
+	async function handleMoveGroup(hb_id: string, newGroupName: string) {
+		const groupNames = newGroupName ? [newGroupName] : [];
+		try {
+			await contactUpdateGroups(hb_id, groupNames);
+			await loadGroups();
+		} catch (e) { toast(String(e), 'error'); }
+		contactGroupEditing = { ...contactGroupEditing, [hb_id]: false };
+	}
+
 	onMount(() => {
 		loadDirectory();
+		loadGroups();
 		// Refresh all contacts in parallel on page load (task 4)
 		$contacts.forEach(async (c) => {
 			try {
@@ -78,12 +113,14 @@
 		if (!result) return;
 		following = true;
 		try {
-			await follow(result.hb_id);
+			await follow(result.hb_id, followGroupName || undefined);
 			contacts.update((cs) => {
 				if (cs.find((c) => c.hb_id === result!.hb_id)) return cs;
 				return [...cs, result!];
 			});
+			await loadGroups();
 			toast(`Following ${result.profile?.display_name ?? result.hb_id}`);
+			followGroupName = '';
 		} catch (e) {
 			toast(String(e), 'error');
 		} finally {
@@ -266,9 +303,11 @@
 
 	async function handleFollowDht(r: DhtResult) {
 		try {
-			await follow(r.hb_id);
+			const groupName = dhtFollowGroupName[r.hb_id] || undefined;
+			await follow(r.hb_id, groupName);
 			const fetched = await pasteKey(r.hb_id);
 			contacts.update(cs => cs.find(c => c.hb_id === r.hb_id) ? cs : [...cs, fetched]);
+			await loadGroups();
 			toast(`Following ${r.profile?.display_name ?? r.hb_id}`);
 		} catch (e) {
 			toast(String(e), 'error');
@@ -357,6 +396,14 @@
 								<span class="mono">{result.hb_id.slice(0, 18)}…{result.hb_id.slice(-4)}</span>
 							</div>
 							<div class="profile-actions">
+								{#if !alreadyFollowed && groups.length > 0}
+									<select class="group-select" bind:value={followGroupName}>
+										<option value="">Ungrouped</option>
+										{#each groups as g (g.name)}
+											<option value={g.name}>{g.name}</option>
+										{/each}
+									</select>
+								{/if}
 								<button
 									class="btn-primary btn-sm"
 									on:click={handleFollow}
@@ -522,6 +569,14 @@
 									<p class="rec-bio">{r.profile.bio}</p>
 								{/if}
 							</div>
+							{#if !isFollowed && groups.length > 0}
+								<select class="group-select" bind:value={dhtFollowGroupName[r.hb_id]}>
+									<option value="">Ungrouped</option>
+									{#each groups as g (g.name)}
+										<option value={g.name}>{g.name}</option>
+									{/each}
+								</select>
+							{/if}
 							<button class="btn-primary btn-sm" on:click={() => handleFollowDht(r)} disabled={isFollowed}>
 								{isFollowed ? 'Following' : 'Follow'}
 							</button>
@@ -597,6 +652,8 @@
 				{@const name = peer.profile?.display_name ?? 'Unknown'}
 				{@const initial = name[0]?.toUpperCase() ?? '?'}
 				{@const hue = avatarHue(initial)}
+				{@const peerGroups = contactGroups(peer.hb_id)}
+				{@const stale = isStale(peer) && !peer.online}
 				<div class="contact-block">
 					<div class="contact-card">
 						<Avatar letter={initial} size={34} {hue} />
@@ -605,6 +662,8 @@
 								<span class="peer-name">{name}</span>
 								{#if peer.online}
 									<span class="pill pill-online"><span class="pill-dot" /></span>
+								{:else if stale}
+									<span class="pill pill-stale" title="Last fetched {new Date(peer.last_fetched).toLocaleDateString()}">Stale</span>
 								{:else}
 									<span class="pill pill-offline">Offline</span>
 								{/if}
@@ -630,6 +689,35 @@
 								{#if peer.profile?.est_size}<span class="sub-dot">·</span><span class="sub-meta">~{peer.profile.est_size}</span>{/if}
 								{#if peer.collections.length > 0}<span class="sub-dot">·</span><span class="sub-meta">{peer.collections.length} collection{peer.collections.length !== 1 ? 's' : ''}</span>{/if}
 							</div>
+
+							<!-- Groups -->
+							{#if peerGroups.length > 0 || contactGroupEditing[peer.hb_id]}
+								<div class="group-row">
+									{#each peerGroups as gname}
+										<span class="group-pill">{gname}</span>
+									{/each}
+									{#if contactGroupEditing[peer.hb_id]}
+										<select
+											class="group-select group-select-inline"
+											on:change={(e) => handleMoveGroup(peer.hb_id, e.currentTarget.value)}
+										>
+											<option value="">Ungrouped</option>
+											{#each groups as g (g.name)}
+												<option value={g.name} selected={peerGroups.includes(g.name)}>{g.name}</option>
+											{/each}
+										</select>
+										<button class="tag-x" on:click={() => { contactGroupEditing = { ...contactGroupEditing, [peer.hb_id]: false }; }}>×</button>
+									{:else if groups.length > 0}
+										<button class="tag-add-btn" on:click={() => { contactGroupEditing = { ...contactGroupEditing, [peer.hb_id]: true }; }}>
+											{peerGroups.length > 0 ? '✎' : '+ group'}
+										</button>
+									{/if}
+								</div>
+							{:else if groups.length > 0}
+								<div class="group-row">
+									<button class="tag-add-btn" on:click={() => { contactGroupEditing = { ...contactGroupEditing, [peer.hb_id]: true }; }}>+ group</button>
+								</div>
+							{/if}
 
 							<!-- Local tags -->
 							<div class="tag-row">
@@ -972,6 +1060,27 @@
 		background: color-mix(in oklch, var(--fg-muted) 12%, transparent);
 		border: 1px solid color-mix(in oklch, var(--fg-muted) 20%, transparent);
 	}
+	.pill-stale {
+		color: oklch(0.75 0.12 60);
+		background: oklch(0.22 0.06 60 / 0.4);
+		border: 1px solid oklch(0.50 0.10 60 / 0.3);
+	}
+
+	/* Group row on contact cards */
+	.group-row { display: flex; flex-wrap: wrap; gap: 4px; margin: 3px 0 2px; align-items: center; min-height: 20px; }
+	.group-pill {
+		display: inline-flex; align-items: center;
+		padding: 1px 8px; border-radius: 4px; font-size: 11px; font-weight: 500;
+		background: color-mix(in oklch, var(--accent) 10%, transparent);
+		border: 1px solid color-mix(in oklch, var(--accent) 22%, transparent);
+		color: var(--accent);
+	}
+	.group-select {
+		height: 26px; padding: 0 6px; border-radius: 5px; font-size: 11.5px;
+		background: var(--bg-input); border: 1px solid var(--border); color: var(--fg);
+		font-family: var(--font-ui); cursor: pointer;
+	}
+	.group-select-inline { height: 22px; font-size: 11px; }
 
 	/* Buttons */
 	.btn-primary {

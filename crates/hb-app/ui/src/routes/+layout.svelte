@@ -4,7 +4,7 @@
 	import { get } from 'svelte/store';
 	import { page } from '$app/stores';
 	import { getIdentity, getProfile, getCollections, getContacts, getMessages, listenDownloadProgress } from '$lib/api.js';
-	import { identity, profile, collections, contacts, inboxMessages, toastMessage, appReady, unreadCount, downloads, applyDownloadEvent, toast } from '$lib/stores.js';
+	import { identity, profile, collections, contacts, inboxMessages, toastMessage, appReady, unreadCount, downloads, applyDownloadEvent, toast, identityLoadError } from '$lib/stores.js';
 	import { listen } from '@tauri-apps/api/event';
 	import { navIcons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
@@ -18,11 +18,14 @@
 	onMount(() => {
 		// Async init (IIFE so onMount can return a sync cleanup function).
 		(async () => {
-			try { identity.set(await getIdentity()); } catch (e) {
-				// A DPAPI or I/O failure loading the saved keypair. The user will be
-				// shown the onboarding screen. If they try to generate a new keypair the
-				// backend will surface a specific recovery message.
+			try {
+				identity.set(await getIdentity());
+				identityLoadError.set(null);
+			} catch (e) {
+				// A DPAPI or I/O failure loading the saved keypair. Record the error so
+				// the home page can show a recovery screen instead of the onboarding wizard.
 				console.error('getIdentity failed:', e);
+				identityLoadError.set(String(e));
 			}
 			try { profile.set(await getProfile()); } catch { }
 			try { collections.set(await getCollections()); } catch { }
@@ -192,9 +195,10 @@
 	.brand-logo {
 		width: 24px; height: 24px;
 		border-radius: 6px;
-		background: linear-gradient(135deg, var(--accent) 0%, oklch(0.55 0.18 100) 100%);
+		background: var(--bg-elev3);
+		border: 1px solid color-mix(in oklch, var(--accent) 22%, transparent);
 		display: flex; align-items: center; justify-content: center;
-		color: var(--accent-text);
+		color: var(--accent);
 		overflow: hidden;
 	}
 

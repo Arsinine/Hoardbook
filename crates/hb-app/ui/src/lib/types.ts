@@ -95,6 +95,11 @@ export interface ShareSettings {
 	require_follow: boolean;
 }
 
+export interface DirectoryPeer {
+	hb_id: string;
+	profile?: Profile;
+}
+
 export interface DhtResult {
 	hb_id: string;
 	profile?: Profile;

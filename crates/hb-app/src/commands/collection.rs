@@ -37,21 +37,34 @@ pub async fn scan_directory(
     opts: ScanOptions,
     store: State<'_, DataStore>,
 ) -> CmdResult<Collection> {
-    let root = Path::new(&opts.path);
-    if !root.is_dir() {
-        return Err(format!("{} is not a directory", opts.path));
-    }
+    let root = std::path::PathBuf::from(&opts.path);
 
     let depth = opts.depth.min(10);
     let slug = Collection::slug_from_alias(&opts.path_alias);
     if !is_valid_slug(&slug) {
         return Err(format!(
-            "'{}' produces an invalid collection slug — use only letters, numbers, and hyphens",
+            "'{}' produces an invalid collection slug — use only letters, numbers, hyphens, or Unicode characters; avoid spaces and symbols",
             opts.path_alias
         ));
     }
     let globs = build_glob_set(&opts.exclude);
-    let (listing, total_bytes) = scan_recursive(root, depth, 0, &globs, "").map_err(cmd_err)?;
+
+    // Run the blocking filesystem walk (including the is_dir check) on a dedicated
+    // thread with a 30-second deadline so a stale SMB mount cannot block either the
+    // is_dir probe or the recursive scan on the async thread.
+    let (listing, total_bytes) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
+            scan_recursive(&root, depth, 0, &globs, "")
+        }),
+    )
+    .await
+    .map_err(|_| {
+        "Directory scan timed out after 30 seconds — check that the path is accessible and try again.".to_string()
+    })?
+    .map_err(|e| format!("Scan task panicked: {e}"))?
+    .map_err(cmd_err)?;
     let item_count = count_items(&listing);
     let est_size = if total_bytes > 0 { Some(format_size(total_bytes)) } else { None };
 
@@ -282,11 +295,12 @@ fn render_markdown(items: &[DirectoryItem], depth: usize) -> String {
 // Slug validation
 // ---------------------------------------------------------------------------
 
-/// A valid slug contains only ASCII alphanumerics and hyphens.
-/// This is enforced before constructing any file paths from slug values,
+/// A valid slug contains only Unicode alphanumerics and hyphens.
+/// Path-traversal characters (`/`, `.`, `\`, `:`, `%`, NUL, whitespace) are
+/// not alphanumeric in any Unicode category and are therefore rejected here,
 /// preventing path traversal attacks (e.g., "../identity/keypair").
 pub(crate) fn is_valid_slug(slug: &str) -> bool {
-    !slug.is_empty() && slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    !slug.is_empty() && slug.chars().all(|c| c.is_alphanumeric() || c == '-')
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +464,11 @@ mod tests {
         assert!(is_valid_slug("anime2019"));
         assert!(is_valid_slug("VHS-rips"));
         assert!(is_valid_slug("a")); // single char is fine
+        // Non-ASCII scripts: letters are alphanumeric in Unicode, path traversal
+        // characters (/.\:%) are not — so non-ASCII collections are allowed.
+        assert!(is_valid_slug("映画コレクション"));
+        assert!(is_valid_slug("фильмы-2023"));
+        assert!(is_valid_slug("韓国ドラマ-collection"));
     }
 
     #[test]

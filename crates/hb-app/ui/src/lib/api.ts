@@ -108,7 +108,8 @@ export const checkRelay = (url: string) => invoke<void>('check_relay', { url });
 
 export const pasteKey = (hb_id: string) => invoke<CachedPeer>('paste_key', { hbId: hb_id });
 
-export const follow = (hb_id: string) => invoke<void>('follow', { hbId: hb_id });
+export const follow = (hb_id: string, groupName?: string) =>
+	invoke<void>('follow', { hbId: hb_id, groupName: groupName ?? null });
 
 export const getContacts = () => invoke<CachedPeer[]>('get_contacts');
 
@@ -189,6 +190,10 @@ export const groupsAssign   = (hbId: string, groupName: string) =>
 	invoke<void>('groups_assign', { hbId, groupName });
 export const groupsUnassign = (hbId: string, groupName: string) =>
 	invoke<void>('groups_unassign', { hbId, groupName });
+
+/** Atomically replace all group memberships for a contact. Pass [] for Ungrouped. */
+export const contactUpdateGroups = (hbId: string, groupNames: string[]) =>
+	invoke<void>('contact_update_groups', { hbId, groupNames });
 
 // ── Watches ───────────────────────────────────────────────────────────────────
 

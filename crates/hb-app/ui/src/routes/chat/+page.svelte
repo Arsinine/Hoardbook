@@ -29,7 +29,20 @@
 		.filter(id => id !== myId && !$contacts.some(c => c.hb_id === id))
 		.map(id => ({ hb_id: id, profile: undefined, collections: [], online: false, node_addr: undefined, last_fetched: '', last_seen_at: undefined, local_tags: [] } satisfies CachedPeer));
 
-	$: allConversationPeers = [...$contacts, ...inboxOnlyPeers];
+	function latestMessageTime(hb_id: string): string {
+		const msgs = $inboxMessages.filter(m => m.from === hb_id || m.to === hb_id);
+		if (msgs.length === 0) return '';
+		return msgs.reduce((latest, m) => m.sent_at > latest ? m.sent_at : latest, '');
+	}
+
+	$: allConversationPeers = [...$contacts, ...inboxOnlyPeers].sort((a, b) => {
+		const aT = latestMessageTime(a.hb_id);
+		const bT = latestMessageTime(b.hb_id);
+		if (!aT && !bT) return 0;
+		if (!aT) return 1;
+		if (!bT) return -1;
+		return bT.localeCompare(aT); // newest first
+	});
 
 	$: conversation = selectedPeer
 		? [
@@ -213,7 +226,7 @@
 					<div class="convo-empty">Add contacts via Contacts to start chatting.</div>
 				{:else}
 					{#each allConversationPeers as peer}
-						{@const name = peer.profile?.display_name ?? shortId(peer.hb_id)}
+						{@const name = senderName(peer.hb_id)}
 						{@const initial = name[0]?.toUpperCase() ?? '?'}
 						{@const hue = avatarHue(initial)}
 						{@const unread = unreadCounts[peer.hb_id] ?? 0}
