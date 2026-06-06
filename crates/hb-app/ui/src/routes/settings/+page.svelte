@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { generateKeypair, getHbId, getSettings, saveSettings, importKeypair, wipeData, checkRelay, checkUpdate, installUpdate, watchesGet, watchesDelete } from '$lib/api.js';
+	import { generateKeypair, getHbId, getSettings, saveSettings, importKeypair, wipeData, checkRelay, checkUpdate, installUpdate, watchesGet, watchesDelete, dhtStartAnnounce, dhtStopAnnounce } from '$lib/api.js';
 	import type { UpdateInfo } from '$lib/api.js';
 	import type { Watch } from '$lib/types.js';
 	import { relaunch } from '@tauri-apps/plugin-process';
@@ -78,6 +78,33 @@
 
 	let allowDms = true;
 
+	// DHT Announce
+	let dhtEnabled = false;
+	let dhtTagsRaw = '';
+	let dhtCtRaw = '';
+	let dhtSaving = false;
+
+	function parseCsv(raw: string): string[] {
+		return raw.split(',').map(s => s.trim()).filter(Boolean);
+	}
+
+	async function toggleDhtAnnounce() {
+		dhtSaving = true;
+		try {
+			if (dhtEnabled) {
+				await dhtStopAnnounce();
+				dhtEnabled = false;
+			} else {
+				await dhtStartAnnounce(parseCsv(dhtTagsRaw), parseCsv(dhtCtRaw));
+				dhtEnabled = true;
+			}
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			dhtSaving = false;
+		}
+	}
+
 	let wipeConfirm = false;
 	let wiping = false;
 
@@ -93,6 +120,9 @@
 			// Filter out bootstrap relay from user list (it's shown separately).
 			relayUrls = s.relay_urls.filter(u => u !== BOOTSTRAP_RELAY);
 			allowDms = s.allow_dms ?? true;
+			dhtEnabled = s.dht_announce_enabled ?? false;
+			dhtTagsRaw = (s.dht_announce_tags ?? []).join(', ');
+			dhtCtRaw = (s.dht_announce_content_types ?? []).join(', ');
 			relayUrls.forEach(probeRelay);
 		} catch { /* proceed with defaults if settings load fails */ }
 	});
@@ -151,10 +181,20 @@
 		}
 	}
 
+	function fullSettings() {
+		return {
+			relay_urls: relayUrls,
+			allow_dms: allowDms,
+			dht_announce_enabled: dhtEnabled,
+			dht_announce_tags: parseCsv(dhtTagsRaw),
+			dht_announce_content_types: parseCsv(dhtCtRaw),
+		};
+	}
+
 	async function toggleAllowDms() {
 		allowDms = !allowDms;
 		try {
-			await saveSettings({ relay_urls: relayUrls, allow_dms: allowDms });
+			await saveSettings(fullSettings());
 		} catch (e) {
 			toast(String(e), 'error');
 		}
@@ -206,7 +246,7 @@
 	async function handleSaveRelays() {
 		savingRelays = true;
 		try {
-			await saveSettings({ relay_urls: relayUrls, allow_dms: allowDms });
+			await saveSettings(fullSettings());
 			toast('Relay settings saved');
 		} catch (e) {
 			toast(String(e), 'error');
@@ -359,6 +399,34 @@
 				<div class="toggle-sub">Off means only people you follow can DM you</div>
 			</div>
 			<button class="toggle" class:toggle-on={allowDms} on:click={toggleAllowDms}>
+				<span class="toggle-thumb" />
+			</button>
+		</div>
+	</div>
+
+	<!-- DHT Discovery -->
+	<div class="section-label">DHT Discovery</div>
+
+	<div class="surface">
+		<div class="dht-fields">
+			<div class="field-label">Tags to announce (comma-separated)</div>
+			<input class="hb-input" placeholder="anime, manga, retro" bind:value={dhtTagsRaw} disabled={dhtEnabled} />
+			<div class="field-label" style="margin-top:8px">Content types (comma-separated)</div>
+			<input class="hb-input" placeholder="video, book, music" bind:value={dhtCtRaw} disabled={dhtEnabled} />
+			{#if dhtEnabled}
+				<div class="dht-hint">Disable to edit announced tags.</div>
+			{/if}
+		</div>
+		<div class="toggle-row">
+			<div class="toggle-text">
+				<div class="toggle-label">Announce on mainline DHT</div>
+				<div class="toggle-sub">
+					{dhtEnabled
+						? 'Active — peers can discover you via tag search.'
+						: 'Off — peers can only find you by pasting your ID.'}
+				</div>
+			</div>
+			<button class="toggle" class:toggle-on={dhtEnabled} on:click={toggleDhtAnnounce} disabled={dhtSaving}>
 				<span class="toggle-thumb" />
 			</button>
 		</div>
@@ -653,6 +721,10 @@
 	.watch-fired { font-size: 10.5px; color: var(--fg-dim); }
 
 	.btn-danger-text { color: var(--red, #e05c5c); }
+
+	/* DHT */
+	.dht-fields { display: flex; flex-direction: column; gap: 4px; }
+	.dht-hint { font-size: 11px; color: var(--fg-dim); margin-top: 4px; }
 
 	/* Danger zone */
 	.danger-row {

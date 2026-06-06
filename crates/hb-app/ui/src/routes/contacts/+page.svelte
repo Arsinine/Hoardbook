@@ -1,12 +1,12 @@
 <script lang="ts">
-	import { pasteKey, follow, refreshContact, requestDownload, unfollowContact, setContactTags, getDirectory } from '$lib/api.js';
+	import { pasteKey, follow, refreshContact, requestDownload, unfollowContact, setContactTags, getDirectory, dhtSearch, watchesCreate, watchesEvaluate } from '$lib/api.js';
 	import { save } from '@tauri-apps/plugin-dialog';
 	import { contacts, identity, toast, downloads } from '$lib/stores.js';
 	import DownloadQueue from '$lib/components/DownloadQueue.svelte';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
-	import type { CachedPeer, DirectoryPeer } from '$lib/types.js';
+	import type { CachedPeer, DirectoryPeer, DhtResult } from '$lib/types.js';
 	import { onMount } from 'svelte';
 
 	// Recommended directory
@@ -227,6 +227,72 @@
 		} catch (e) { toast(String(e), 'error'); }
 	}
 
+	// DHT Discover
+	let dhtTagInput = '';
+	let dhtCtInput = '';
+	let dhtResults: DhtResult[] = [];
+	let dhtSearching = false;
+	let dhtSearched = false;
+	let showWatchForm = false;
+	let watchName = '';
+	let savingWatch = false;
+
+	async function handleDhtSearch() {
+		const tags = dhtTagInput.split(',').map(s => s.trim()).filter(Boolean);
+		const cts = dhtCtInput.split(',').map(s => s.trim()).filter(Boolean);
+		if (tags.length === 0 && cts.length === 0) {
+			toast('Enter at least one tag or content type', 'error');
+			return;
+		}
+		dhtSearching = true;
+		dhtSearched = false;
+		dhtResults = [];
+		try {
+			dhtResults = await dhtSearch(tags, cts);
+			dhtSearched = true;
+			const candidates = dhtResults.map(r => r.hb_id);
+			if (candidates.length > 0) {
+				const hits = await watchesEvaluate(candidates);
+				for (const hit of hits) {
+					toast(`Watch "${hit.watch_name}" — new peer found`);
+				}
+			}
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			dhtSearching = false;
+		}
+	}
+
+	async function handleFollowDht(r: DhtResult) {
+		try {
+			await follow(r.hb_id);
+			const fetched = await pasteKey(r.hb_id);
+			contacts.update(cs => cs.find(c => c.hb_id === r.hb_id) ? cs : [...cs, fetched]);
+			toast(`Following ${r.profile?.display_name ?? r.hb_id}`);
+		} catch (e) {
+			toast(String(e), 'error');
+		}
+	}
+
+	async function handleSaveWatch() {
+		const name = watchName.trim();
+		if (!name) return;
+		const tags = dhtTagInput.split(',').map(s => s.trim()).filter(Boolean);
+		const cts = dhtCtInput.split(',').map(s => s.trim()).filter(Boolean);
+		savingWatch = true;
+		try {
+			await watchesCreate(name, tags, cts);
+			toast(`Watch "${name}" saved`);
+			showWatchForm = false;
+			watchName = '';
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			savingWatch = false;
+		}
+	}
+
 	// Filter by tag
 	let filterTag = '';
 	$: filteredContacts = filterTag
@@ -402,6 +468,88 @@
 			</div>
 		{/if}
 	{/if}
+
+	<!-- Discover (DHT tag search) -->
+	<div class="section-divider">
+		<div class="divider-line" />
+		<span class="divider-label">Discover</span>
+		<div class="divider-line" />
+	</div>
+
+	<div class="discover-form">
+		<div class="discover-inputs">
+			<input
+				class="disc-input"
+				placeholder="Tags: anime, manga…"
+				bind:value={dhtTagInput}
+				on:keydown={(e) => e.key === 'Enter' && handleDhtSearch()}
+			/>
+			<input
+				class="disc-input"
+				placeholder="Content types: video, book…"
+				bind:value={dhtCtInput}
+				on:keydown={(e) => e.key === 'Enter' && handleDhtSearch()}
+			/>
+			<button
+				class="btn-primary"
+				on:click={handleDhtSearch}
+				disabled={dhtSearching || (!dhtTagInput.trim() && !dhtCtInput.trim())}
+			>
+				{dhtSearching ? 'Searching…' : 'Search DHT'}
+			</button>
+		</div>
+
+		{#if dhtSearched}
+			{#if dhtResults.length === 0}
+				<div class="empty">No peers found on the DHT for those filters.</div>
+			{:else}
+				<div class="rec-list">
+					{#each dhtResults as r (r.hb_id)}
+						{@const name = r.profile?.display_name ?? r.hb_id.slice(0, 12) + '…'}
+						{@const initial = name[0]?.toUpperCase() ?? '?'}
+						{@const hue = avatarHue(initial)}
+						{@const isFollowed = $contacts.some(c => c.hb_id === r.hb_id)}
+						<div class="rec-card">
+							<Avatar letter={initial} size={38} {hue} />
+							<div class="rec-info">
+								<div class="name-row">
+									<span class="peer-name">{name}</span>
+									{#if r.online}
+										<span class="pill pill-online"><span class="pill-dot" /></span>
+									{/if}
+								</div>
+								{#if r.profile?.bio}
+									<p class="rec-bio">{r.profile.bio}</p>
+								{/if}
+							</div>
+							<button class="btn-primary btn-sm" on:click={() => handleFollowDht(r)} disabled={isFollowed}>
+								{isFollowed ? 'Following' : 'Follow'}
+							</button>
+						</div>
+					{/each}
+				</div>
+
+				{#if !showWatchForm}
+					<button class="btn-ghost btn-sm" on:click={() => { showWatchForm = true; }}>
+						+ Save as watch
+					</button>
+				{:else}
+					<div class="watch-save-row">
+						<input
+							class="disc-input"
+							placeholder="Watch name…"
+							bind:value={watchName}
+							on:keydown={(e) => e.key === 'Enter' && handleSaveWatch()}
+						/>
+						<button class="btn-primary btn-sm" on:click={handleSaveWatch} disabled={!watchName.trim() || savingWatch}>
+							{savingWatch ? '…' : 'Save watch'}
+						</button>
+						<button class="btn-ghost btn-sm" on:click={() => { showWatchForm = false; watchName = ''; }}>Cancel</button>
+					</div>
+				{/if}
+			{/if}
+		{/if}
+	</div>
 
 	<!-- Divider + tag filter -->
 	<div class="section-divider">
@@ -751,6 +899,20 @@
 	}
 	.modal-body { font-size: 13px; color: var(--fg-muted); line-height: 1.55; margin: 0 0 18px; }
 	.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+	/* Discover (DHT) */
+	.discover-form { margin-bottom: 8px; display: flex; flex-direction: column; gap: 10px; }
+	.discover-inputs { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+	.disc-input {
+		flex: 1; min-width: 120px;
+		padding: 0 11px; height: 34px;
+		background: var(--bg-input); border: 1px solid var(--border); border-radius: 7px;
+		font-family: var(--font-ui); font-size: 13px; color: var(--fg); outline: none;
+	}
+	.disc-input::placeholder { color: var(--fg-dim); }
+	.disc-input:focus { border-color: var(--accent); }
+	.watch-save-row { display: flex; gap: 8px; align-items: center; }
+	.rec-bio { font-size: 11.5px; color: var(--fg-muted); line-height: 1.4; margin: 2px 0 0; }
 
 	/* Tag filter bar */
 	.tag-filter-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
