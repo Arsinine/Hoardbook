@@ -170,23 +170,30 @@ impl RelayClient {
 
         // M3: collect all responses and return the one with the highest last_seen_at
         // so stale data from a slow relay doesn't shadow a fresher result.
+        // Cap the wait at 5 s so a single unresponsive relay doesn't gate the result.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut best: Option<PeerResponse> = None;
         let mut last_err = anyhow!("no relays configured");
-        while let Some(result) = set.join_next().await {
-            match result {
-                Ok(Ok(peer_resp)) => {
-                    let fresher = match &best {
-                        None => true,
-                        Some(prev) => peer_resp.last_seen_at > prev.last_seen_at,
-                    };
-                    if fresher {
-                        best = Some(peer_resp);
+        loop {
+            match tokio::time::timeout_at(deadline, set.join_next()).await {
+                Err(_elapsed) => break, // deadline reached — return best so far
+                Ok(None) => break,      // all tasks finished
+                Ok(Some(task_result)) => match task_result {
+                    Ok(Ok(peer_resp)) => {
+                        let fresher = match &best {
+                            None => true,
+                            Some(prev) => peer_resp.last_seen_at > prev.last_seen_at,
+                        };
+                        if fresher {
+                            best = Some(peer_resp);
+                        }
                     }
-                }
-                Ok(Err(e)) => last_err = e,
-                Err(e) => last_err = anyhow!("task error: {e}"),
+                    Ok(Err(e)) => last_err = e,
+                    Err(e) => last_err = anyhow!("task error: {e}"),
+                },
             }
         }
+        set.abort_all();
 
         match best {
             Some(resp) => Ok(parse_peer_response(hb_id, resp)),

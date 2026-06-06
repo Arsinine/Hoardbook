@@ -17,12 +17,17 @@
 - **T21 backend acceptance criteria met.** Remaining items are frontend-only (drag-and-drop UI, group picker in the follow modal, status badge for stale >7d contacts).
 
 ### Audit findings addressed (from Chorus tri-review, 2026-06-06)
-- **L1** — HKDF salt: `crypto.rs` `derive_key` now passes `Some(b"hoardbook-ecdh-v1")` as salt per RFC 5869.
+- **L1** — HKDF salt: `crypto.rs` `derive_key` now passes `Some(b"hoardbook-ecdh-v1")` as salt per RFC 5869. Wire-compat comment added explaining this is a deliberate pre-release flag-day; messages encrypted before commit 311d88e cannot be decrypted by this code (acceptable: no shipped users).
 - **M4** — `node_addr` size cap: relay `handlers.rs` heartbeat handler rejects `node_addr` > 2048 bytes with 400. New test `heartbeat_oversized_node_addr_rejected`.
-- **M1** — Consume-on-read: relay `handlers.rs` `get_messages` now deletes delivered messages after a successful DB fetch (`db::delete_messages_for`). Prevents unbounded mailbox growth.
-- **M3** — Parallel publish + freshest peer: `relay.rs` (app) `publish` is now parallel (`JoinSet`); `fetch_peer` collects all relay responses and returns the one with the highest `last_seen_at` rather than the first.
+- **M1** — Consume-on-read reverted: an earlier attempt deleted messages from `get_messages` — Chorus reviewers (and Codex) correctly identified this as at-most-once with message-loss on dropped connections. Reverted; 30-day TTL expiry task controls mailbox growth instead. ACK-based deletion remains a post-MVP item (see below).
+- **M3** — Parallel publish + freshest peer: `relay.rs` (app) `publish` is now parallel (`JoinSet`); `fetch_peer` collects all relay responses and returns the one with the highest `last_seen_at`. Added 5-second deadline (`timeout_at`) so a single unresponsive relay no longer gates the result.
 - **L4** — Mailbox cap test fixed: `mailbox_cap_enforced` now drives the 500th and 501st messages through the `publish` handler (not direct DB inserts) so a regression removing the handler-level cap check would be caught.
 - **Clippy clean**: all three pre-existing warnings fixed (`PublishRequest` dead struct removed, useless `.into()` removed, `too_many_arguments` suppressed with `#[allow]`).
+
+### Chorus second-pass findings (accepted as known tradeoffs or deferred)
+- **fetch_peer relay trust**: `last_seen_at` is relay-supplied; a malicious relay can claim a far-future timestamp to win selection. Accepted for MVP — relay selection is not security-critical (node_addr is cryptographically verified by iroh separately). Post-MVP: cap `last_seen_at` to `now()` on the client side.
+- **Group TOCTOU**: `contact_update_groups` + `follow` do load-modify-save with no locking. In a single-process Tauri desktop app concurrent group mutations are near-impossible in practice. Accepted for MVP; a proper fix requires a `Mutex<()>` guard around file operations or migrating groups to SQLite.
+- **follow() silent group-not-found**: returns `Ok(())` when `group_name` is supplied but the group doesn't exist (falls through to Ungrouped). Intentional — UI only surfaces existing group names; a missing group means the UI is stale, and the contact is still saved.
 
 ### Previous session (preserved for context)
 - T20 — iroh-direct profile fetch (`c912b3e`, `4c9dc00`)
@@ -63,6 +68,7 @@
 - **H1** — Mailbox read tokens are replay-reusable (±300s window, no nonce tracking). Re-evaluate once TLS bootstrap relay is live.
 - **H2** — Linux private key stored as plaintext JSON. Use `keyring` crate (secret-service) on Linux.
 - **H3** — DM queue is in-memory; restarts silently lose messages. Persist to SQLite, drain on delivery.
+- **M1-ack** — Mailbox messages are never deleted by the client (TTL only). Add an explicit `DELETE /v1/messages/:pubkey/:id` endpoint so the client can ACK delivery after confirming the response was received.
 - **H5** — IP-only rate limiting. Add per-sender key rate limit on `publish`.
 - **M2** — `get_messages` fetches full mailbox every poll. Add `?since=<ISO8601>` parameter.
 - **M5** — `resolve_peer` clones `Option<iroh::Endpoint>` across an await.
