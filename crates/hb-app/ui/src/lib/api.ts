@@ -93,6 +93,9 @@ export const exportCollection = (slug: string, format: 'text' | 'markdown') =>
 export interface Settings {
 	relay_urls: string[];
 	allow_dms: boolean;
+	dht_announce_enabled: boolean;
+	dht_announce_tags: string[];
+	dht_announce_content_types: string[];
 }
 
 export const getSettings = () => invoke<Settings>('get_settings');

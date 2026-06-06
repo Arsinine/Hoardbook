@@ -9,6 +9,12 @@
 
 ## Done this session
 
+### T22 frontend wiring — DHT Discover + Announce (complete)
+- **`ui/src/lib/api.ts`** — Extended `Settings` interface with `dht_announce_enabled`, `dht_announce_tags`, `dht_announce_content_types`.
+- **`ui/src/routes/settings/+page.svelte`** — Added "DHT Discovery" section: tag + content-type inputs, enable/disable toggle. On enable calls `dhtStartAnnounce`; on disable calls `dhtStopAnnounce`. Fixed pre-existing bug where `saveSettings` (relay/DM saves) clobbered DHT settings via serde defaults — all saves now send full Settings object via `fullSettings()` helper.
+- **`ui/src/routes/contacts/+page.svelte`** — Added "Discover" section between Recommended and Following: tag + content-type inputs, "Search DHT" button, result cards with Follow. After each search, `watchesEvaluate` is called automatically and each WatchHit produces a toast. "Save as watch" form creates a named watch from the current search criteria.
+- **`MILESTONE1.md`** — Checkpoint 6 marked `[x]`.
+
 ### T21 — Follow/contact backend (complete)
 - **`crates/hb-app/src/store.rs`** — `Group` struct gains `modified_at: DateTime<Utc>` field (serde-defaulted to `Utc::now()` for existing data); `load_groups` now returns groups sorted newest-modified first.
 - **`crates/hb-app/src/commands/groups.rs`** — all mutation commands (`groups_create`, `groups_rename`, `groups_assign`, `groups_unassign`) now update `modified_at`. New command `contact_update_groups(hb_id, group_names)` atomically replaces a contact's group memberships (used for drag-and-drop reassignment from the UI). 8 new T21 tests added.
@@ -54,6 +60,60 @@
 - **Group picker in follow modal** — `follow` command now accepts `group_name?: string` from JS. Wire the picker UI.
 - **`contact_update_groups` wiring** — drag-and-drop reassignment should call `contact_update_groups(hb_id, [newGroupName])`. Command is registered and ready.
 - **Status badge for stale contacts** — a `CachedPeer` with `last_fetched` > 7 days ago should show a "Stale" badge in the contact list.
+
+### Checkpoint 6 — DHT two-instance live test (VPS)
+
+Two VPS nodes are available for this: **Singapore** (`141.98.199.138`) and **Japan** (`45.129.8.225`). Credentials in your secrets manager — do not commit them.
+
+**Setup on each VPS (run once):**
+```bash
+# install the hb-relay binary
+cargo install --path crates/hb-relay
+hb-relay &  # listens on :3000, SQLite at ~/.hb-relay.db
+
+# build the hb-app CLI harness (headless, no Tauri window)
+# OR copy the built .app / .exe to the VPS if cross-compiled
+```
+
+**Test procedure:**
+
+1. **Singapore node — generate identity + announce**
+   ```bash
+   # start hb-app pointing at its own relay
+   HB_RELAY_URL=http://141.98.199.138:3000 ./hb-app
+   # in Settings → Identity: generate keypair, note the hb_id
+   # in Settings → DHT Discovery: set tag = "hb-e2e-test-<random>", enable announce
+   # confirm heartbeat visible: curl http://141.98.199.138:3000/v1/peer/<hb_id>
+   ```
+
+2. **Japan node — search**
+   ```bash
+   HB_RELAY_URL=http://141.98.199.138:3000 ./hb-app
+   # in Contacts → Discover: enter tag "hb-e2e-test-<same random>"
+   # click "Search DHT" — expect Singapore's hb_id to appear in results
+   # click Follow — confirm contact appears in Following list
+   ```
+
+3. **Watch notification check**
+   ```bash
+   # on Japan: Settings → Watches: create watch with same tag before searching
+   # run Search DHT again with a fresh random tag that Singapore announces
+   # expect toast: "Watch '<name>' — new peer found"
+   # search again — expect no second toast (seen_pubkeys deduplication)
+   ```
+
+4. **Announce-off check**
+   ```bash
+   # on Singapore: Settings → DHT Discovery: disable announce
+   # on Japan: search same tag — expect zero results
+   # optional: run Wireshark / tcpdump on Singapore to confirm no BEP 5 traffic
+   ```
+
+**Pass criteria:** Singapore is discoverable from Japan by tag within ~5s of DHT bootstrap; disabling announce makes it undiscoverable within one 30-min announce cycle; watch fires once per new peer.
+
+**Known limitation:** Peers behind NAT cannot serve their identity over TCP (BEP 5 announce works, but the Japan node can't TCP-connect to them). Both VPS nodes have public IPs so this does not affect this test.
+
+---
 
 ### Checkpoint 4 smoke test (manual, no code needed)
 - Two local instances: A publishes profile + collection, B pastes A's hb_id.

@@ -907,15 +907,19 @@ Unit: `watch_fires_new_peer`, `watch_silent_known_contact`, `watch_silent_dismis
 
 **Still pending (human verification):**
 - E2E: create watch; DHT search matches; notification appears; dismiss; re-search; no repeat
-- Frontend `watch_fired` Tauri event wiring (backend emits; frontend must subscribe)
+
+**Frontend wiring complete (2026-06-06):**
+- Discover section in Contacts page: tag/content-type inputs, Search DHT button, result cards with Follow, Save-as-watch form
+- After search, `watchesEvaluate` is called automatically; each hit fires a toast notification
+- Watches management (view, delete) in Settings page
 
 ---
 
-### CHECKPOINT 6 [ ]: DHT Discovery Complete
+### CHECKPOINT 6 [x]: DHT Discovery Complete
 
 **Gate condition:** DHT announce and search work on live mainline DHT. Watches fire correctly.
 
-**Status (2026-06-05):** Backend implementation complete. Unit tests pass (`cargo check --tests`). Two-instance live DHT test and frontend event wiring still pending.
+**Status (2026-06-06):** Frontend wiring complete. Two-instance live DHT smoke test pending (see HANDOVER for VPS test procedure using 141.98.199.138 / 45.129.8.225).
 
 **Human review items:**
 - Two-instance test: announce unique tag; search from second instance; discover peer
