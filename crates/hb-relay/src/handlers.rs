@@ -144,6 +144,13 @@ pub async fn heartbeat(
         ));
     }
 
+    // M4: cap node_addr length to prevent oversized blobs reaching SQLite.
+    if let Some(ref addr) = body.node_addr {
+        if addr.len() > 2048 {
+            return Err(AppError::BadRequest("node_addr exceeds maximum allowed length".into()));
+        }
+    }
+
     db::upsert_heartbeat(&state.pool, &body.public_key, body.node_addr.as_deref()).await?;
 
     Ok(StatusCode::OK)
@@ -234,6 +241,8 @@ pub async fn get_messages(
     hb_core::crypto::verify(&pubkey_bytes, &signed, &auth.signature)?;
 
     let envelopes = db::get_messages_for(&state.pool, &pubkey).await?;
+    // M1: delete delivered messages so the mailbox doesn't grow unboundedly.
+    db::delete_messages_for(&state.pool, &pubkey).await?;
     let messages = envelopes
         .into_iter()
         .filter_map(|s| serde_json::from_str::<Value>(&s).ok())
@@ -397,31 +406,52 @@ mod tests {
     #[tokio::test]
     async fn mailbox_cap_enforced() {
         let state = test_state().await;
-        let kp = HoardbookKeypair::generate();
-        let to = kp.hb_id();
+        let recipient_kp = HoardbookKeypair::generate();
+        let to = recipient_kp.hb_id();
 
-        // Fill the mailbox to the cap.
-        for i in 0..db::MAX_MESSAGES_PER_RECIPIENT {
+        // Fill to one below the cap using many distinct sender keys so no per-pair
+        // or per-sender cap fires before the mailbox total cap.
+        let fill_to = db::MAX_MESSAGES_PER_RECIPIENT - 1;
+        for i in 0..fill_to {
             let sent_at = chrono::Utc::now() + chrono::Duration::milliseconds(i);
+            let fake_from = format!("fake_sender_{i}");
             let msg = ChatMessage { to: to.clone(), content: "x".into(), encrypted: false, sent_at };
-            let env = SignedEnvelope::create(&kp, DocType::Message, &msg).unwrap();
-            db::insert_message(&state.pool, &kp.hb_id(), &to, &sent_at.to_rfc3339(), &serde_json::to_string(&env).unwrap())
+            let env = SignedEnvelope::create(&recipient_kp, DocType::Message, &msg).unwrap();
+            db::insert_message(&state.pool, &fake_from, &to, &sent_at.to_rfc3339(), &serde_json::to_string(&env).unwrap())
                 .await.unwrap();
         }
 
-        // The next publish must fail with mailbox error.
-        let msg = ChatMessage {
+        // The 500th message (at the cap) must be accepted through the publish handler.
+        let sender = HoardbookKeypair::generate();
+        let at_cap_msg = ChatMessage {
+            to: to.clone(),
+            content: "at_cap".into(),
+            encrypted: false,
+            sent_at: chrono::Utc::now() + chrono::Duration::milliseconds(fill_to),
+        };
+        let at_cap_env = SignedEnvelope::create(&sender, DocType::Message, &at_cap_msg).unwrap();
+        let at_cap_req = PublishRequest {
+            doc_type: "message".into(),
+            document: serde_json::to_value(&at_cap_env).unwrap(),
+        };
+        publish(test_addr(), State(state.clone()), Json(at_cap_req))
+            .await
+            .expect("500th message must be accepted by the publish handler");
+
+        // The 501st message must be rejected via the publish handler's mailbox cap check.
+        let sender2 = HoardbookKeypair::generate();
+        let overflow_msg = ChatMessage {
             to: to.clone(),
             content: "overflow".into(),
             encrypted: false,
-            sent_at: chrono::Utc::now() + chrono::Duration::milliseconds(db::MAX_MESSAGES_PER_RECIPIENT as i64 + 1),
+            sent_at: chrono::Utc::now() + chrono::Duration::milliseconds(fill_to + 1),
         };
-        let envelope = SignedEnvelope::create(&kp, DocType::Message, &msg).unwrap();
-        let req = PublishRequest {
+        let overflow_env = SignedEnvelope::create(&sender2, DocType::Message, &overflow_msg).unwrap();
+        let overflow_req = PublishRequest {
             doc_type: "message".into(),
-            document: serde_json::to_value(&envelope).unwrap(),
+            document: serde_json::to_value(&overflow_env).unwrap(),
         };
-        let result = publish(test_addr(), State(state), Json(req)).await;
+        let result = publish(test_addr(), State(state), Json(overflow_req)).await;
         match result {
             Err(AppError::BadRequest(msg)) => assert!(msg.contains("mailbox"), "error must mention mailbox, got: {msg}"),
             other => panic!("expected mailbox BadRequest, got: {:?}", other),
@@ -487,6 +517,19 @@ mod tests {
         assert!(first.is_ok(), "first heartbeat must pass");
         let second = heartbeat(test_addr(), State(state), Json(signed_heartbeat(&kp, None))).await;
         assert!(matches!(second, Err(AppError::BadRequest(_))), "second request must be rate-limited");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_oversized_node_addr_rejected() {
+        let state = test_state().await;
+        let kp = HoardbookKeypair::generate();
+        let oversized_addr = "x".repeat(2049);
+        let req = signed_heartbeat(&kp, Some(oversized_addr));
+        let result = heartbeat(test_addr(), State(state), Json(req)).await;
+        assert!(
+            matches!(result, Err(AppError::BadRequest(_))),
+            "node_addr exceeding 2048 bytes must be rejected"
+        );
     }
 
     #[tokio::test]

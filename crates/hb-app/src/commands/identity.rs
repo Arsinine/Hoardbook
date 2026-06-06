@@ -52,7 +52,7 @@ pub async fn generate_keypair(
                 return Err(format!(
                     "Existing keypair data cannot be read ({e}). \
                      Go to Settings → Wipe data to clear all local data and start over."
-                ).into());
+                ));
             }
             // File absent but read still failed — unexpected, propagate.
             return Err(cmd_err(e));

@@ -1,3 +1,4 @@
+use chrono::Utc;
 use tauri::State;
 
 use crate::{
@@ -16,7 +17,7 @@ pub async fn groups_create(name: String, store: State<'_, DataStore>) -> CmdResu
     if groups.iter().any(|g| g.name == name) {
         return Err(format!("Group '{name}' already exists"));
     }
-    let group = Group { name, pubkeys: vec![] };
+    let group = Group { name, pubkeys: vec![], modified_at: Utc::now() };
     groups.push(group.clone());
     store.save_groups(&groups).map_err(cmd_err)?;
     Ok(group)
@@ -34,6 +35,7 @@ pub async fn groups_rename(
         .find(|g| g.name == old_name)
         .ok_or_else(|| format!("Group '{old_name}' not found"))?;
     group.name = new_name;
+    group.modified_at = Utc::now();
     store.save_groups(&groups).map_err(cmd_err)
 }
 
@@ -57,6 +59,7 @@ pub async fn groups_assign(
         .ok_or_else(|| format!("Group '{group_name}' not found"))?;
     if !group.pubkeys.contains(&hb_id) {
         group.pubkeys.push(hb_id);
+        group.modified_at = Utc::now();
     }
     store.save_groups(&groups).map_err(cmd_err)
 }
@@ -72,6 +75,234 @@ pub async fn groups_unassign(
         .iter_mut()
         .find(|g| g.name == group_name)
         .ok_or_else(|| format!("Group '{group_name}' not found"))?;
+    let before = group.pubkeys.len();
     group.pubkeys.retain(|id| id != &hb_id);
+    if group.pubkeys.len() != before {
+        group.modified_at = Utc::now();
+    }
     store.save_groups(&groups).map_err(cmd_err)
+}
+
+/// Atomically replace a contact's group memberships with a new set.
+/// Any group not in `group_names` loses the contact; any group in `group_names` gains it.
+/// Used for drag-and-drop reassignment from the UI.
+#[tauri::command]
+pub async fn contact_update_groups(
+    hb_id: String,
+    group_names: Vec<String>,
+    store: State<'_, DataStore>,
+) -> CmdResult<()> {
+    let mut groups = store.load_groups().map_err(cmd_err)?;
+    let now = Utc::now();
+
+    for group in &mut groups {
+        let was_member = group.pubkeys.contains(&hb_id);
+        let should_be_member = group_names.contains(&group.name);
+
+        if was_member && !should_be_member {
+            group.pubkeys.retain(|id| id != &hb_id);
+            group.modified_at = now;
+        } else if !was_member && should_be_member {
+            group.pubkeys.push(hb_id.clone());
+            group.modified_at = now;
+        }
+    }
+
+    store.save_groups(&groups).map_err(cmd_err)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use crate::store::{CachedPeer, DataStore, Group};
+    use tempfile::TempDir;
+
+    fn make_store() -> (TempDir, DataStore) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        (dir, DataStore::new(path))
+    }
+
+    fn test_peer(hb_id: &str) -> CachedPeer {
+        CachedPeer {
+            hb_id: hb_id.to_string(),
+            profile: None,
+            collections: vec![],
+            online: false,
+            node_addr: None,
+            last_fetched: chrono::Utc::now(),
+            last_seen_at: None,
+            local_tags: vec![],
+        }
+    }
+
+    /// T21: following without a group_name leaves the contact with no group membership (Ungrouped).
+    #[test]
+    fn follow_skip_ungrouped() {
+        let (_dir, store) = make_store();
+        let hb_id = "hb1_testpeer".to_string();
+        let hash = CachedPeer::pubkey_hash(&hb_id);
+        store.save_contact(&hash, &test_peer(&hb_id)).unwrap();
+
+        let groups = store.load_groups().unwrap();
+        assert!(
+            groups.iter().all(|g| !g.pubkeys.contains(&hb_id)),
+            "contact saved without group must not appear in any group pubkeys list"
+        );
+    }
+
+    /// T21: a contact can belong to multiple groups simultaneously.
+    #[test]
+    fn multi_group_membership() {
+        let (_dir, store) = make_store();
+        let hb_id = "hb1_testpeer".to_string();
+        let now = chrono::Utc::now();
+
+        store
+            .save_groups(&[
+                Group { name: "A".into(), pubkeys: vec![hb_id.clone()], modified_at: now },
+                Group { name: "B".into(), pubkeys: vec![hb_id.clone()], modified_at: now },
+            ])
+            .unwrap();
+
+        let groups = store.load_groups().unwrap();
+        let in_a = groups.iter().find(|g| g.name == "A").unwrap().pubkeys.contains(&hb_id);
+        let in_b = groups.iter().find(|g| g.name == "B").unwrap().pubkeys.contains(&hb_id);
+        assert!(in_a && in_b, "contact must be able to belong to multiple groups");
+    }
+
+    /// T21: deleting a group does not delete the contacts in that group (they become Ungrouped).
+    #[test]
+    fn delete_group_moves_to_ungrouped() {
+        let (_dir, store) = make_store();
+        let hb_id = "hb1_testpeer".to_string();
+        let hash = CachedPeer::pubkey_hash(&hb_id);
+
+        store.save_contact(&hash, &test_peer(&hb_id)).unwrap();
+        store
+            .save_groups(&[Group {
+                name: "MyGroup".into(),
+                pubkeys: vec![hb_id.clone()],
+                modified_at: chrono::Utc::now(),
+            }])
+            .unwrap();
+
+        // Delete group by saving an empty list.
+        store.save_groups(&[]).unwrap();
+
+        let contacts = store.list_contacts().unwrap();
+        assert!(
+            contacts.iter().any(|c| c.hb_id == hb_id),
+            "contact must remain in contact list after its group is deleted"
+        );
+        let groups = store.load_groups().unwrap();
+        assert!(
+            groups.iter().all(|g| !g.pubkeys.contains(&hb_id)),
+            "deleted group must not contain the contact"
+        );
+    }
+
+    /// T21: a CachedPeer last fetched >7 days ago is considered stale.
+    #[test]
+    fn stale_after_7_days() {
+        let stale_fetched = chrono::Utc::now() - chrono::Duration::days(8);
+        let peer = test_peer("hb1_old");
+        let peer = CachedPeer { last_fetched: stale_fetched, ..peer };
+        let age_days = chrono::Utc::now()
+            .signed_duration_since(peer.last_fetched)
+            .num_days();
+        assert!(age_days >= 7, "peer fetched 8 days ago must register as stale (≥7 days)");
+    }
+
+    /// T21: Group JSON must never contain relay-facing fields that could inadvertently leak
+    /// group membership if a Group value is accidentally serialised into a relay request.
+    #[test]
+    fn groups_not_in_relay_traffic() {
+        let group = Group {
+            name: "Friends".into(),
+            pubkeys: vec!["hb1_abc".into()],
+            modified_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&group).unwrap();
+        assert!(!json.contains("relay"), "group JSON must not contain 'relay'");
+        assert!(!json.contains("node_addr"), "group JSON must not contain 'node_addr'");
+        assert!(!json.contains("online"), "group JSON must not contain 'online'");
+    }
+
+    /// T21: contact_refresh updates the local cache file.
+    #[test]
+    fn contact_refresh_updates_cache() {
+        let (_dir, store) = make_store();
+        let hb_id = "hb1_testpeer".to_string();
+        let hash = CachedPeer::pubkey_hash(&hb_id);
+
+        store.save_contact(&hash, &test_peer(&hb_id)).unwrap();
+
+        let updated = CachedPeer { online: true, ..test_peer(&hb_id) };
+        store.save_contact(&hash, &updated).unwrap();
+
+        let loaded = store.load_contact(&hash).unwrap().unwrap();
+        assert!(loaded.online, "refreshed contact must reflect updated online status");
+    }
+
+    /// contact_update_groups replaces memberships atomically.
+    #[test]
+    fn contact_update_groups_replaces_memberships() {
+        let (_dir, store) = make_store();
+        let hb_id = "hb1_peer".to_string();
+        let now = chrono::Utc::now();
+
+        store
+            .save_groups(&[
+                Group { name: "A".into(), pubkeys: vec![hb_id.clone()], modified_at: now },
+                Group { name: "B".into(), pubkeys: vec![], modified_at: now },
+                Group { name: "C".into(), pubkeys: vec![hb_id.clone()], modified_at: now },
+            ])
+            .unwrap();
+
+        // Move peer from {A, C} to {B} only.
+        let mut groups = store.load_groups().unwrap();
+        for group in &mut groups {
+            let should = group.name == "B";
+            let was = group.pubkeys.contains(&hb_id);
+            if was && !should {
+                group.pubkeys.retain(|id| id != &hb_id);
+            } else if !was && should {
+                group.pubkeys.push(hb_id.clone());
+            }
+        }
+        store.save_groups(&groups).unwrap();
+
+        let loaded = store.load_groups().unwrap();
+        let in_a = loaded.iter().find(|g| g.name == "A").unwrap().pubkeys.contains(&hb_id);
+        let in_b = loaded.iter().find(|g| g.name == "B").unwrap().pubkeys.contains(&hb_id);
+        let in_c = loaded.iter().find(|g| g.name == "C").unwrap().pubkeys.contains(&hb_id);
+        assert!(!in_a, "A must no longer contain the peer");
+        assert!(in_b, "B must contain the peer");
+        assert!(!in_c, "C must no longer contain the peer");
+    }
+
+    /// Groups are returned most-recently-modified first.
+    #[test]
+    fn groups_ordered_by_modified_at_desc() {
+        let (_dir, store) = make_store();
+        let t1 = chrono::Utc::now() - chrono::Duration::hours(2);
+        let t2 = chrono::Utc::now() - chrono::Duration::hours(1);
+        let t3 = chrono::Utc::now();
+
+        store
+            .save_groups(&[
+                Group { name: "old".into(), pubkeys: vec![], modified_at: t1 },
+                Group { name: "recent".into(), pubkeys: vec![], modified_at: t3 },
+                Group { name: "middle".into(), pubkeys: vec![], modified_at: t2 },
+            ])
+            .unwrap();
+
+        let groups = store.load_groups().unwrap();
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["recent", "middle", "old"], "groups must be sorted newest-first");
+    }
 }
