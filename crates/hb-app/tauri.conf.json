@@ -41,7 +41,10 @@
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI2Q0ZERjVDRTFBRDI5MgpSV1NTMGhyTzlmMXNDeE1FR1k2Y1BXTXc4RlQvZ0U1TVN6QmlwT28zL1dwSU8rK3B6ZXlxNU5TYgo=",
       "endpoints": [
         "https://github.com/Arsinine/Hoardbook/releases/latest/download/latest.json"
-      ]
+      ],
+      "windows": {
+        "installMode": "quiet"
+      }
     }
   }
 }
