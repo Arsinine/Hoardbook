@@ -1,7 +1,7 @@
 # Session Handover
 
-**Last updated: 2026-06-05**
-**Branch:** `main` — working tree clean. All changes committed.
+**Last updated: 2026-06-06**
+**Branch:** `main` — working tree clean after commit. All tests green.
 
 > Build note: `/mnt/c` (WSL2 9p mount) throws intermittent I/O errors (`os error 22`, `rustc-LLVM IO failure`) under heavy compile load, and the host C: drive runs near-full. Re-run on failure (artifacts persist). `CARGO_INCREMENTAL=0` reduces churn.
 
@@ -9,68 +9,74 @@
 
 ## Done this session
 
-### Milestone updates (docs)
-- Audited all 28 tasks against the codebase; updated MILESTONE1.md with accurate `[x]`/`[ ]` status and `2026-06-05` implementation notes.
-- Marked **T18, T19, T26, T27, T28** complete (all were implemented but not ticked off).
+### T21 — Follow/contact backend (complete)
+- **`crates/hb-app/src/store.rs`** — `Group` struct gains `modified_at: DateTime<Utc>` field (serde-defaulted to `Utc::now()` for existing data); `load_groups` now returns groups sorted newest-modified first.
+- **`crates/hb-app/src/commands/groups.rs`** — all mutation commands (`groups_create`, `groups_rename`, `groups_assign`, `groups_unassign`) now update `modified_at`. New command `contact_update_groups(hb_id, group_names)` atomically replaces a contact's group memberships (used for drag-and-drop reassignment from the UI). 8 new T21 tests added.
+- **`crates/hb-app/src/commands/browse.rs`** — `follow` command gains optional `group_name: Option<String>` parameter; if supplied and a matching group exists, the new contact is added to it immediately. Skip/None → Ungrouped.
+- **`crates/hb-app/src/lib.rs`** — `contact_update_groups` registered in `invoke_handler`.
+- **T21 backend acceptance criteria met.** Remaining items are frontend-only (drag-and-drop UI, group picker in the follow modal, status badge for stale >7d contacts).
 
-### T20 — iroh-direct profile fetch (`c912b3e`, `4c9dc00`)
-- **`crates/hb-app/src/node.rs`** — added `fetch_profile_via_stream` (generic over `AsyncRead`/`AsyncWrite`, testable with `tokio::io::duplex`) and `fetch_profile_via_iroh` (real QUIC path). `decode_envelope` helper silently discards envelopes with mismatched `public_key`, invalid signature, or unparseable payload.
-- **`crates/hb-app/src/commands/browse.rs`** — `resolve_peer` helper drives the full flow:
-  1. Relay → online status + `EndpointAddr`
-  2. If online: iroh-direct `get_profile` → populate `profile`/`collections`
-  3. Iroh failure or offline → load local contact cache, set `online: false` (stale)
-  4. No cache + offline → `Err`
-- `paste_key`, `follow`, `refresh_contact` updated with `State<'_, SharedEndpoint>`.
-- Two new tests passing: `tampered_envelope_discarded`, `invalid_signature_discarded`.
-- **62/62 hb-app tests green.**
+### Audit findings addressed (from Chorus tri-review, 2026-06-06)
+- **L1** — HKDF salt: `crypto.rs` `derive_key` now passes `Some(b"hoardbook-ecdh-v1")` as salt per RFC 5869.
+- **M4** — `node_addr` size cap: relay `handlers.rs` heartbeat handler rejects `node_addr` > 2048 bytes with 400. New test `heartbeat_oversized_node_addr_rejected`.
+- **M1** — Consume-on-read: relay `handlers.rs` `get_messages` now deletes delivered messages after a successful DB fetch (`db::delete_messages_for`). Prevents unbounded mailbox growth.
+- **M3** — Parallel publish + freshest peer: `relay.rs` (app) `publish` is now parallel (`JoinSet`); `fetch_peer` collects all relay responses and returns the one with the highest `last_seen_at` rather than the first.
+- **L4** — Mailbox cap test fixed: `mailbox_cap_enforced` now drives the 500th and 501st messages through the `publish` handler (not direct DB inserts) so a regression removing the handler-level cap check would be caught.
+- **Clippy clean**: all three pre-existing warnings fixed (`PublishRequest` dead struct removed, useless `.into()` removed, `too_many_arguments` suppressed with `#[allow]`).
 
-### T24 + T25 — iroh-first DM send + unified inbox (`1330028`)
-- **`crates/hb-app/src/node.rs`** — added `send_dm_via_stream` / `send_dm_via_iroh` following the same duplex-testable pattern as `fetch_profile_via_stream`.
-- **`crates/hb-app/src/commands/chat.rs`** — fully rewritten:
-  - `send_message`: `try_send_via_iroh` (relay lookup → iroh connect → `send_dm` request) falls back to `relay.publish()` transparently. `SharedEndpoint` added as state.
-  - `get_messages`: drains `SharedDmQueue` (direct iroh path), fetches relay, deduplicates by `(from, sent_at)`, decrypts both sources. `"[Unable to decrypt]"` placeholder on any failure. Sorted oldest-first.
-- **4 new tests:** `send_dm_via_stream_accepted`, `dedup_across_sources`, `decryption_failure_placeholder`, `unknown_sender_key_placeholder`.
-- **66/66 hb-app tests green.**
+### Previous session (preserved for context)
+- T20 — iroh-direct profile fetch (`c912b3e`, `4c9dc00`)
+- T24 + T25 — iroh-first DM send + unified inbox (`1330028`)
+- Security fixes A–F (`02fd1a4`)
 
-### Security fixes (earlier in session, committed in `02fd1a4`)
-All security workstreams A–F from `planning/security-fixes.md` are committed. See that file for the full list. Key items:
-- H2: iroh peer identity verified before connect (MITM prevention)
-- H3: mailbox reads require signed timestamp auth
-- H1: HTTPS enforced for user relays
-- L11: envelope signing covers header + payload (not payload-only)
-- L12: DM encryption binds AAD `{from, to, sent_at}`
+---
+
+## Test counts
+
+| Crate | Tests |
+|---|---|
+| hb-core | 42 |
+| hb-relay | 41 |
+| hb-app | 74 |
+
+`cargo clippy --workspace -- -D warnings` — zero warnings/errors.
 
 ---
 
 ## What's next
 
-### MVP blockers (Checkpoint 8 requires all of these)
+### T21 frontend gaps (not blocking backend)
+- **Group picker in follow modal** — `follow` command now accepts `group_name?: string` from JS. Wire the picker UI.
+- **`contact_update_groups` wiring** — drag-and-drop reassignment should call `contact_update_groups(hb_id, [newGroupName])`. Command is registered and ready.
+- **Status badge for stale contacts** — a `CachedPeer` with `last_fetched` > 7 days ago should show a "Stale" badge in the contact list.
 
-**T21 — Follow/contact UX gaps** *(backend mostly done; frontend gaps)*
-- Multi-group membership per contact: `groups.rs` stores groups as `Vec<Group { name, pubkeys }>`; a contact can appear in multiple groups' `pubkeys` vecs. Check whether the UI exposes this.
-- Group picker on follow (frontend: `follow` command exists, picker UI not confirmed).
-- Drag-and-drop reassignment (frontend only).
-
-**Checkpoint 4 smoke test** *(manual, no code needed)*
+### Checkpoint 4 smoke test (manual, no code needed)
 - Two local instances: A publishes profile + collection, B pastes A's hb_id.
 - Confirm B's profile card shows A's data and no profile/collection HTTP traffic hits the relay.
 
-### Security / quality (pre-ship)
+### Security (pre-ship, not MVP blockers)
+- **Frontend confirm dialogs**: `export_keypair`, `save_keypair_file`, `wipe_data` callable with no confirmation. Wire `tauri-plugin-dialog` confirm modal in Svelte.
+- **CSP smoke test**: run `npm run tauri dev` and confirm nothing blocked (check `connect-src`/`img-src`).
+- **Transfer integration tests**: `handle_xfer_connection`/`download_file` need inner-fn refactor (duplex pattern) to test without live QUIC.
 
-- **Frontend confirm dialogs:** `export_keypair`, `save_keypair_file`, `wipe_data` callable with no confirmation. Wire `tauri-plugin-dialog` confirm modal in Svelte UI.
-- **CSP smoke test:** CSP in `tauri.conf.json` untested against live SvelteKit webview — run `npm run tauri dev` and confirm nothing is blocked (check `connect-src`/`img-src`).
-- **Transfer integration tests:** `handle_xfer_connection`/`download_file` need inner-fn refactor (like `node.rs` does with duplex streams) to test without live QUIC.
-- **`cargo clippy --workspace`** — run before any release tag.
+### Remaining audit findings (open)
+- **H1** — Mailbox read tokens are replay-reusable (±300s window, no nonce tracking). Re-evaluate once TLS bootstrap relay is live.
+- **H2** — Linux private key stored as plaintext JSON. Use `keyring` crate (secret-service) on Linux.
+- **H3** — DM queue is in-memory; restarts silently lose messages. Persist to SQLite, drain on delivery.
+- **H5** — IP-only rate limiting. Add per-sender key rate limit on `publish`.
+- **M2** — `get_messages` fetches full mailbox every poll. Add `?since=<ISO8601>` parameter.
+- **M5** — `resolve_peer` clones `Option<iroh::Endpoint>` across an await.
+- **L2** — Dedup key `(sender, sent_at_rfc3339)` collides for same-second messages. Add nonce to `ChatMessage`.
+- **L3** — `read_json_lenient` swallows parse errors silently for contacts.
 
 ### Infra
-
-- **Bootstrap relay TLS:** `relay.rs` ships `http://141.98.199.138:3000`, filtered in release builds. Stand up `https://` TLS endpoint and update `BOOTSTRAP_RELAYS`, or release clients have no default relay.
+- **Bootstrap relay TLS**: `relay.rs` ships `http://141.98.199.138:3000`. Stand up `https://` TLS endpoint and update `BOOTSTRAP_RELAYS`.
 
 ---
 
 ## Out of scope (intentionally not built)
-- Signed per-file SHA-256 in collection listings (H2 content integrity complement)
-- Passphrase-encrypted keystore on Linux/macOS (L9)
-- Relay-enforced `allow_dms` (L10)
-- Server-issued nonce for mailbox-read auth (H3 accepts ±300s replay window over HTTPS — documented accepted risk)
-- Two-pane directory viewer UI for browse (T20 frontend polish, not blocking Checkpoint 4)
+- Signed per-file SHA-256 in collection listings
+- Passphrase-encrypted keystore on Linux/macOS
+- Relay-enforced `allow_dms`
+- Server-issued nonce for mailbox-read auth (accepted risk over HTTPS)
+- Two-pane directory viewer UI for browse (T20 frontend polish)

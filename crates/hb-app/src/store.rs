@@ -426,10 +426,17 @@ impl CachedPeer {
 // Group — local-only contact grouping (not signed, not shared)
 // ---------------------------------------------------------------------------
 
+fn default_group_modified_at() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
     pub name: String,
     pub pubkeys: Vec<String>,
+    /// Last modification time — used to order groups most-recently-modified first.
+    #[serde(default = "default_group_modified_at")]
+    pub modified_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl DataStore {
@@ -438,9 +445,11 @@ impl DataStore {
     }
 
     pub fn load_groups(&self) -> Result<Vec<Group>> {
-        Ok(read_json_lenient::<Vec<Group>>(&self.groups_path())
+        let mut groups = read_json_lenient::<Vec<Group>>(&self.groups_path())
             .context("loading groups")?
-            .unwrap_or_default())
+            .unwrap_or_default();
+        groups.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+        Ok(groups)
     }
 
     pub fn save_groups(&self, groups: &[Group]) -> Result<()> {

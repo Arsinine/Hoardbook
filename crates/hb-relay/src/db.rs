@@ -220,6 +220,15 @@ pub async fn get_messages_for(pool: &SqlitePool, to_key: &str) -> Result<Vec<Str
 // Expiry
 // ---------------------------------------------------------------------------
 
+/// Delete all messages addressed to `to_key` (M1: consume-on-read to prevent unbounded growth).
+pub async fn delete_messages_for(pool: &SqlitePool, to_key: &str) -> Result<()> {
+    sqlx::query("DELETE FROM messages WHERE to_key = ?")
+        .bind(to_key)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Delete expired messages. Heartbeat rows never expire. Run hourly.
 pub async fn expire_messages(pool: &SqlitePool) -> Result<()> {
     let now = now_secs();

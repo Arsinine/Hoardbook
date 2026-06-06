@@ -267,8 +267,9 @@ fn ed25519_pubkey_to_x25519(
 }
 
 /// Derive a 256-bit symmetric key from an X25519 shared secret using HKDF-SHA256.
+/// Salt `b"hoardbook-ecdh-v1"` provides domain separation per RFC 5869.
 fn derive_key(shared_secret: &[u8]) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(None, shared_secret);
+    let hk = Hkdf::<Sha256>::new(Some(b"hoardbook-ecdh-v1"), shared_secret);
     let mut key = [0u8; 32];
     hk.expand(b"hoardbook-chat-v1", &mut key)
         .expect("32 bytes is always a valid HKDF output length");

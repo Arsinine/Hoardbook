@@ -89,13 +89,28 @@ pub async fn paste_key(
 #[tauri::command]
 pub async fn follow(
     hb_id: HbId,
+    group_name: Option<String>,
     relay: State<'_, SharedRelay>,
     endpoint: State<'_, SharedEndpoint>,
     store: State<'_, DataStore>,
 ) -> CmdResult<()> {
     let peer = resolve_peer(&hb_id, &relay, &endpoint, &store).await?;
     let hash = CachedPeer::pubkey_hash(&hb_id);
-    store.save_contact(&hash, &peer).map_err(cmd_err)
+    store.save_contact(&hash, &peer).map_err(cmd_err)?;
+
+    if let Some(gname) = group_name {
+        let mut groups = store.load_groups().map_err(cmd_err)?;
+        if let Some(group) = groups.iter_mut().find(|g| g.name == gname) {
+            if !group.pubkeys.contains(&hb_id.to_string()) {
+                group.pubkeys.push(hb_id.to_string());
+                group.modified_at = chrono::Utc::now();
+            }
+            store.save_groups(&groups).map_err(cmd_err)?;
+        }
+        // Group not found → contact saved as Ungrouped; not an error.
+    }
+
+    Ok(())
 }
 
 #[tauri::command]

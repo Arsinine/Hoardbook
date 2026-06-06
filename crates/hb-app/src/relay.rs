@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use hb_core::{ChatMessage, SignedEnvelope};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::store::CachedPeer;
 
@@ -59,13 +59,6 @@ struct PeerResponse {
     node_addr: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct PublishRequest<'a> {
-    #[serde(rename = "type")]
-    doc_type: &'a str,
-    document: &'a SignedEnvelope,
-}
-
 // ---------------------------------------------------------------------------
 // RelayClient
 // ---------------------------------------------------------------------------
@@ -109,34 +102,41 @@ impl RelayClient {
         *self.relay_urls.write().await = acceptable_relays(urls);
     }
 
-    /// Publish a signed envelope to all known relays.
+    /// Publish a signed envelope to all known relays in parallel.
     /// Returns Ok(()) if at least one relay accepts the document; logs failures for the rest.
     pub async fn publish(&self, doc_type: &str, envelope: &SignedEnvelope) -> Result<()> {
-        let body = PublishRequest { doc_type, document: envelope };
-        let relay_urls = self.relay_urls.read().await.clone();
-        let mut succeeded = false;
-        let mut last_err = anyhow!("no relays configured");
+        use tokio::task::JoinSet;
 
-        for url in &relay_urls {
+        // Serialize once; each task gets its own clone (Value is Clone).
+        let body_value = serde_json::json!({ "type": doc_type, "document": envelope });
+        let relay_urls = self.relay_urls.read().await.clone();
+
+        let mut set: JoinSet<Result<()>> = JoinSet::new();
+        for url in relay_urls {
             let endpoint = format!("{url}/v1/publish");
-            match self.http.post(&endpoint).json(&body).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    succeeded = true;
-                }
-                Ok(resp) => {
-                    let err = anyhow!(
+            let client = self.http.clone();
+            let body_clone = body_value.clone();
+            set.spawn(async move {
+                match client.post(&endpoint).json(&body_clone).send().await {
+                    Ok(resp) if resp.status().is_success() => Ok(()),
+                    Ok(resp) => Err(anyhow!(
                         "relay {} returned {}: {}",
-                        url,
+                        endpoint,
                         resp.status(),
                         resp.text().await.unwrap_or_default()
-                    );
-                    tracing::warn!("{err}");
-                    last_err = err;
+                    )),
+                    Err(e) => Err(anyhow!("relay {} unreachable: {e}", endpoint)),
                 }
-                Err(e) => {
-                    tracing::warn!("relay {url} unreachable: {e}");
-                    last_err = anyhow!("relay {} unreachable: {e}", url);
-                }
+            });
+        }
+
+        let mut succeeded = false;
+        let mut last_err = anyhow!("no relays configured");
+        while let Some(result) = set.join_next().await {
+            match result {
+                Ok(Ok(())) => succeeded = true,
+                Ok(Err(e)) => { tracing::warn!("{e}"); last_err = e; }
+                Err(e) => last_err = anyhow!("task error: {e}"),
             }
         }
 
@@ -168,18 +168,30 @@ impl RelayClient {
             });
         }
 
+        // M3: collect all responses and return the one with the highest last_seen_at
+        // so stale data from a slow relay doesn't shadow a fresher result.
+        let mut best: Option<PeerResponse> = None;
         let mut last_err = anyhow!("no relays configured");
         while let Some(result) = set.join_next().await {
             match result {
                 Ok(Ok(peer_resp)) => {
-                    return Ok(parse_peer_response(hb_id, peer_resp));
+                    let fresher = match &best {
+                        None => true,
+                        Some(prev) => peer_resp.last_seen_at > prev.last_seen_at,
+                    };
+                    if fresher {
+                        best = Some(peer_resp);
+                    }
                 }
                 Ok(Err(e)) => last_err = e,
                 Err(e) => last_err = anyhow!("task error: {e}"),
             }
         }
 
-        Err(last_err)
+        match best {
+            Some(resp) => Ok(parse_peer_response(hb_id, resp)),
+            None => Err(last_err),
+        }
     }
 }
 

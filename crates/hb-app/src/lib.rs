@@ -213,6 +213,7 @@ fn restore_identity_and_start_endpoint(
 }
 
 /// Spawn all long-running background tasks (heartbeat, DHT, update check).
+#[allow(clippy::too_many_arguments)]
 fn spawn_background_tasks(
     relay: SharedRelay,
     identity: SharedIdentity,
@@ -380,6 +381,7 @@ pub fn run() {
             commands::groups::groups_delete,
             commands::groups::groups_assign,
             commands::groups::groups_unassign,
+            commands::groups::contact_update_groups,
             commands::watches::watches_get,
             commands::watches::watches_create,
             commands::watches::watches_delete,
