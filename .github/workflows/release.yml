@@ -94,7 +94,14 @@ jobs:
               count=1,
               flags=re.S,
           )
-          assert new != src, f"failed to bump version in {path}"
+          # Idempotent: the source version may already equal the tag (we now keep
+          # them in sync), so don't require a change — just verify the [package]
+          # version is now exactly `v`.
+          assert re.search(
+              r'\[package\][^\[]*?\nversion\s*=\s*"' + re.escape(v) + r'"',
+              new,
+              flags=re.S,
+          ), f"failed to set version {v} in {path}"
           with open(path, 'w') as f: f.write(new)
           PY
           # tauri.conf.json: top-level "version".
