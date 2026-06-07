@@ -1,9 +1,47 @@
 # Session Handover
 
-**Last updated: 2026-06-06**
-**Branch:** `main` — working tree clean after commit. All tests green.
+**Last updated: 2026-06-07**
+**Branch:** `main` — **uncommitted changes** in `crates/hb-app/src/commands/collection.rs` (Add Collection hang fix + 3 regression tests). All `hb-app` collection tests green on Linux.
 
 > Build note: `/mnt/c` (WSL2 9p mount) throws intermittent I/O errors (`os error 22`, `rustc-LLVM IO failure`) under heavy compile load, and the host C: drive runs near-full. Re-run on failure (artifacts persist). `CARGO_INCREMENTAL=0` reduces churn.
+
+---
+
+## ⚠️ Add Collection — "Scanning…" infinite hang (Windows) — fix applied, PENDING WINDOWS VERIFICATION
+
+**Status:** Root-caused to a single construct, hardened fix applied + 3 regression tests added (green on Linux). **The bug does NOT reproduce on Linux** — it must be verified on Windows before this is considered closed.
+
+### Symptom (reported on `Hoardbook_v0.4.1.exe`, Windows)
+- Add Collection → pick a folder (incl. an **empty** one) → "Start scan" → button stuck on **"Scanning…" forever**. Never times out, no error toast.
+- The webview is **fully responsive** the whole time (user can drag/maximize the window, move the depth slider, re-browse). Only the scan never completes.
+
+### Diagnosis
+That symptom = the `invoke('scan_directory')` **promise never settles** (frontend `finally { scanning = false }` only runs if the promise resolves/rejects). With a live webview, that means the **backend command panicked or never returned**, and the IPC response was never sent. Release builds set `windows_subsystem = "windows"` (`crates/hb-app/src/main.rs:1`) → **a panic has no console and is completely silent**, which is why there's no error anywhere.
+
+The only change to scanning between "worked" and "broke" was commit **`365f53b`** ("SMB scan hang" fix), which wrapped the walk in:
+```rust
+tokio::time::timeout(30s, tokio::task::spawn_blocking(|| { ensure!(is_dir); scan_recursive(...) }))
+```
+Both `tokio::time::timeout` and `tokio::task::spawn_blocking` require the **executing runtime's tokio time/blocking drivers**. If that requirement isn't met on the Windows runtime, the command panics on first poll → silent hang. This is the prime suspect (an empty folder is instant, so it's not a slow-scan/SMB issue, and not data-dependent).
+
+### Evidence gathered (all on Linux — could NOT reproduce)
+- Backend logic is correct: 3 new regression tests pass in ~0.1s (empty folder; spaces + trailing separator; **driven on Tauri's real `async_runtime`** via `tauri::async_runtime::spawn`/`block_on`).
+- Confirmed Tauri 2.10.3's default runtime is `Runtime::new()` (multi-thread, `enable_all` → time driver present), and `hb-app` does **not** override it → on Linux the construct is fine.
+- Downloaded `Hoardbook_0.4.1_amd64.AppImage`, extracted, launched under WSLg — the Linux app runs without crashing.
+- `v0.4.1` tag == current `HEAD` (`513cc83`), so the shipped binary is exactly this source (no version skew).
+
+### Fix applied — `crates/hb-app/src/commands/collection.rs`
+- Extracted `scan_directory_inner(opts, &DataStore)` (mirrors existing `publish_collection_inner`); `#[tauri::command] scan_directory` is now a thin wrapper (`store.inner()`).
+- Replaced the raw-tokio construct with **`tauri::async_runtime::spawn_blocking`** (guaranteed to run in Tauri's runtime) + an inner `std::thread` + **`std::sync::mpsc::recv_timeout(30s)`** for the deadline. This has **no dependency on the tokio time driver** and preserves the SMB-timeout intent (orphan the wedged walk thread, return a timeout error).
+- 3 regression tests added: `scan_empty_directory_completes_without_hang`, `scan_path_with_spaces_and_trailing_separator`, `scan_completes_on_tauri_async_runtime`.
+
+### NEXT — verify on Windows (the fix is unconfirmed on the platform where the bug lives)
+The decisive check needs the **Windows MSVC Rust toolchain**; no GUI clicking required:
+1. **Reproduce the root cause:** temporarily restore the old `tokio::time::timeout(tokio::task::spawn_blocking(...))` block, then run `cargo test -p hb-app --lib scan_completes_on_tauri_async_runtime` **on Windows**. If it panics/hangs there (but passes on Linux) → root cause confirmed.
+2. **Confirm the fix:** restore the new version, re-run `cargo test -p hb-app --lib commands::collection::tests` on Windows → all should pass.
+3. **(Optional) live capture:** build a **debug** (console-enabled) binary, run from PowerShell with `RUST_BACKTRACE=full`, click Add Collection → empty folder, read the panic/backtrace from stderr.
+
+If Windows verification shows the fix is insufficient, the next suspect is the **WebView2 IPC layer** (Windows) rather than the command logic — and a frontend safety net (client-side timeout in `ScanDialog.svelte` `handleScan`, > 30s so it only fires on a true stall) should be added so the dialog can never be permanently trapped.
 
 ---
 

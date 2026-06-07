@@ -37,6 +37,13 @@ pub async fn scan_directory(
     opts: ScanOptions,
     store: State<'_, DataStore>,
 ) -> CmdResult<Collection> {
+    scan_directory_inner(opts, store.inner()).await
+}
+
+/// Core scan + persist logic, extracted for testability (mirrors
+/// `publish_collection_inner`). Walks the directory off the async runtime
+/// thread under a deadline, then builds and persists the draft collection.
+async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult<Collection> {
     let root = std::path::PathBuf::from(&opts.path);
 
     let depth = opts.depth.min(10);
@@ -49,22 +56,38 @@ pub async fn scan_directory(
     }
     let globs = build_glob_set(&opts.exclude);
 
-    // Run the blocking filesystem walk (including the is_dir check) on a dedicated
-    // thread with a 30-second deadline so a stale SMB mount cannot block either the
-    // is_dir probe or the recursive scan on the async thread.
-    let (listing, total_bytes) = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
-            scan_recursive(&root, depth, 0, &globs, "")
-        }),
-    )
+    // Walk the filesystem off the async runtime thread under a hard deadline.
+    // We deliberately avoid `tokio::time::timeout` + `tokio::task::spawn_blocking`:
+    // those require the executing runtime's tokio time/blocking drivers, and when
+    // that requirement isn't met the command panics. Release builds set
+    // `windows_subsystem = "windows"` (no console), so such a panic is silent — the
+    // IPC response is never sent and the dialog hangs on "Scanning…" forever.
+    // Tauri's own `spawn_blocking` plus a std `recv_timeout` deadline has no such
+    // hidden runtime dependency.
+    let scan = move || -> anyhow::Result<(Vec<DirectoryItem>, u64)> {
+        anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
+        scan_recursive(&root, depth, 0, &globs, "")
+    };
+    let (listing, total_bytes) = match tauri::async_runtime::spawn_blocking(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // A stale SMB mount can wedge `read_dir`; run the walk on its own thread so
+        // we can abandon it after the deadline instead of blocking forever.
+        std::thread::spawn(move || {
+            let _ = tx.send(scan());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(result) => result.map_err(cmd_err),
+            Err(_) => Err(
+                "Directory scan timed out after 30 seconds — check that the path is accessible and try again."
+                    .to_string(),
+            ),
+        }
+    })
     .await
-    .map_err(|_| {
-        "Directory scan timed out after 30 seconds — check that the path is accessible and try again.".to_string()
-    })?
-    .map_err(|e| format!("Scan task panicked: {e}"))?
-    .map_err(cmd_err)?;
+    {
+        Ok(inner) => inner?,
+        Err(e) => return Err(format!("Scan task failed: {e}")),
+    };
     let item_count = count_items(&listing);
     let est_size = if total_bytes > 0 { Some(format_size(total_bytes)) } else { None };
 
@@ -553,6 +576,109 @@ mod tests {
         let total = count_items(&items);
         // Items: root.txt, level1(dir), top.txt, level2(dir), mid.txt, level3(dir), deep.txt = 7
         assert_eq!(total, 7, "expected 7 items (4 files + 3 dirs), got {total}");
+    }
+
+    /// Regression: scanning an *empty* directory must return promptly and
+    /// successfully — it must not leave the UI stuck on "Scanning…" forever.
+    /// This exercises the real async path (`spawn_blocking` + `tokio::time::timeout`)
+    /// through `scan_directory_inner`. The outer `timeout` ensures a regression
+    /// that makes the command hang (e.g. a panic in the spawn/timeout path that
+    /// drops the IPC response) fails the test instead of hanging CI.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_empty_directory_completes_without_hang() {
+        use tempfile::TempDir;
+
+        let work = TempDir::new().unwrap(); // the empty folder being scanned
+        let data = TempDir::new().unwrap(); // datastore root
+        let store = DataStore::new(data.path().to_path_buf());
+
+        let opts = ScanOptions {
+            path: work.path().to_string_lossy().into_owned(),
+            path_alias: "Empty Folder".into(),
+            depth: 3,
+            exclude: vec![],
+        };
+
+        let collection = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            scan_directory_inner(opts, &store),
+        )
+        .await
+        .expect("scan of an empty directory must complete, not hang on \"Scanning…\"")
+        .expect("scan of an empty directory must succeed");
+
+        assert_eq!(collection.item_count, 0, "empty folder has zero items");
+        assert!(collection.est_size.is_none(), "empty folder has no size estimate");
+        assert!(collection.listing.is_empty(), "empty folder has an empty listing");
+
+        // The draft must be persisted so the empty collection shows up in the list.
+        let draft = store.load_collection_draft(&collection.slug).unwrap();
+        assert!(draft.is_some(), "empty-folder scan must still save a draft");
+    }
+
+    /// Regression: a path containing spaces with a trailing separator (mimicking
+    /// a Windows path such as `C:\Users\Flux T\Downloads\`) plus a display name
+    /// with spaces must scan successfully — not hang, and not fail slug validation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_path_with_spaces_and_trailing_separator() {
+        use tempfile::TempDir;
+
+        let parent = TempDir::new().unwrap();
+        let spaced = parent.path().join("My Empty Folder");
+        std::fs::create_dir(&spaced).unwrap();
+        // Append a trailing separator, mimicking C:\Users\FluxT\Downloads\
+        let with_sep = format!("{}{}", spaced.to_string_lossy(), std::path::MAIN_SEPARATOR);
+
+        let data = TempDir::new().unwrap();
+        let store = DataStore::new(data.path().to_path_buf());
+
+        let opts = ScanOptions {
+            path: with_sep,
+            path_alias: "My Downloads Backup".into(), // spaces → slug "my-downloads-backup"
+            depth: 3,
+            exclude: vec![],
+        };
+
+        let collection = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            scan_directory_inner(opts, &store),
+        )
+        .await
+        .expect("scan of a spaced/trailing-separator path must complete, not hang")
+        .expect("scan of a spaced/trailing-separator path must succeed");
+
+        assert_eq!(collection.slug, "my-downloads-backup", "spaces in alias map to hyphens");
+        assert_eq!(collection.item_count, 0);
+    }
+
+    /// Regression: drive the scan on **Tauri's own async runtime** — the same
+    /// runtime that executes `#[tauri::command]`s in the real app. If the
+    /// `tokio::time::timeout` + `spawn_blocking` construct were to panic on this
+    /// runtime (e.g. a missing time driver), the spawned task would die without
+    /// sending an IPC response and the dialog would hang on "Scanning…" forever.
+    /// `block_on` of the join handle surfaces such a panic as an `Err` here.
+    #[test]
+    fn scan_completes_on_tauri_async_runtime() {
+        use tempfile::TempDir;
+
+        let work = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let store = DataStore::new(data.path().to_path_buf());
+
+        let opts = ScanOptions {
+            path: work.path().to_string_lossy().into_owned(),
+            path_alias: "Empty".into(),
+            depth: 3,
+            exclude: vec![],
+        };
+
+        let handle =
+            tauri::async_runtime::spawn(async move { scan_directory_inner(opts, &store).await });
+        let collection = tauri::async_runtime::block_on(handle)
+            .expect("command task must not panic on Tauri's async runtime")
+            .expect("scan must succeed");
+
+        assert_eq!(collection.item_count, 0);
     }
 
     #[test]
