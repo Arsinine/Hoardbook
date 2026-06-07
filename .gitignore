@@ -7,3 +7,12 @@ graphify-out/
 *.db
 *.db-shm
 *.db-wal
+
+# Local release artifacts (downloaded/built installers, not source)
+Hoardbook_*.exe
+Hoardbook_*.AppImage
+Hoardbook_*.dmg
+Hoardbook_*.deb
+
+# Multi-agent review scratch state
+.work/
