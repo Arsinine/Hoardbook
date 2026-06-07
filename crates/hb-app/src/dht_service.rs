@@ -59,67 +59,95 @@ pub fn sha1_id(data: &[u8]) -> mainline::Id {
 
 /// Announce opted-in tags/content-types on the mainline DHT every 30 minutes.
 ///
-/// Initial 30-second delay allows the identity to load before the first announce.
-/// Wakes immediately when `cancel_rx` changes: `false` = re-check settings now,
-/// `true` = shut down.
+/// DHT discovery is **opt-in**, so the mainline node is built *lazily* — only
+/// once `dht_announce_enabled` is set — and then reused across cycles so its
+/// routing table warms up instead of bootstrapping from scratch every 30 min.
+/// Building it unconditionally bootstraps mainline on every launch; on networks
+/// that block outbound DHT UDP that bootstrap spins in a no-backoff retry storm
+/// that pegs the CPU and starves the rest of the app (e.g. directory scans hang).
 ///
-/// A single DHT node is created once and reused across cycles so its routing
-/// table warms up instead of bootstrapping from scratch every 30 min.
+/// Wakes immediately when `cancel_rx` changes: `false` = re-check settings now
+/// (e.g. the user just toggled announce), `true` = shut down.
 pub async fn run_dht_announce_loop(
     identity: SharedIdentity,
     _relay: Arc<RelayClient>,
     store: crate::store::DataStore,
     mut cancel_rx: watch::Receiver<bool>,
 ) {
-    tokio::select! {
-        _ = tokio::time::sleep(INITIAL_DELAY) => {}
-        _ = cancel_rx.changed() => {
-            if *cancel_rx.borrow() { return; }
-        }
-    }
+    // A receiver from `subscribe()` reports its current value as unseen, so the
+    // first `changed().await` would return immediately. Mark it seen so the
+    // delays/waits below actually wait.
+    cancel_rx.mark_unchanged();
 
-    let dht = match mainline::Dht::builder().build() {
-        Ok(d) => d.as_async(),
-        Err(e) => {
-            tracing::warn!("DHT announce: failed to create DHT node: {e}");
-            return;
-        }
-    };
+    let mut dht: Option<AsyncDht> = None;
 
     loop {
         let settings = store.load_settings().ok().flatten().unwrap_or_default();
 
-        if settings.dht_announce_enabled {
-            let hb_id_str = {
-                let guard = identity.read().await;
-                guard.as_ref().map(|kp| kp.hb_id())
-            };
-            if let Some(hb_id_str) = hb_id_str {
-                let terms: Vec<String> = settings
-                    .dht_announce_tags
-                    .iter()
-                    .chain(settings.dht_announce_content_types.iter())
-                    .cloned()
-                    .collect();
+        if !settings.dht_announce_enabled {
+            // Idle until the user enables announce or the app shuts down. Crucially,
+            // never bootstrap the DHT here — the default user must pay no DHT cost.
+            if cancel_rx.changed().await.is_err() || *cancel_rx.borrow() {
+                return;
+            }
+            continue;
+        }
 
-                if !terms.is_empty() {
-                    for term in &terms {
-                        let info_hash = sha1_id(term.as_bytes());
-                        match dht.announce_peer(info_hash, Some(settings.dht_identity_port)).await {
-                            Ok(_) => tracing::debug!(
-                                "DHT announced {:?} on port {}",
-                                term,
-                                settings.dht_identity_port
-                            ),
-                            Err(e) => tracing::warn!("DHT announce {:?}: {e}", term),
+        if dht.is_none() {
+            // First announce since launch: give the identity a moment to load,
+            // then bootstrap the node once.
+            tokio::select! {
+                _ = tokio::time::sleep(INITIAL_DELAY) => {}
+                _ = cancel_rx.changed() => {
+                    if *cancel_rx.borrow() { return; }
+                }
+            }
+            match mainline::Dht::builder().build() {
+                Ok(d) => dht = Some(d.as_async()),
+                Err(e) => {
+                    tracing::warn!("DHT announce: failed to create DHT node: {e}");
+                    // Back off before retrying so a persistent failure doesn't spin.
+                    tokio::select! {
+                        _ = tokio::time::sleep(ANNOUNCE_INTERVAL) => {}
+                        _ = cancel_rx.changed() => {
+                            if *cancel_rx.borrow() { return; }
                         }
                     }
-                    tracing::info!(
-                        "DHT announce complete: {} terms, hb_id={}",
-                        terms.len(),
-                        hb_id_str
-                    );
+                    continue;
                 }
+            }
+        }
+        let dht = dht.as_ref().expect("DHT built above");
+
+        let hb_id_str = {
+            let guard = identity.read().await;
+            guard.as_ref().map(|kp| kp.hb_id())
+        };
+        if let Some(hb_id_str) = hb_id_str {
+            let terms: Vec<String> = settings
+                .dht_announce_tags
+                .iter()
+                .chain(settings.dht_announce_content_types.iter())
+                .cloned()
+                .collect();
+
+            if !terms.is_empty() {
+                for term in &terms {
+                    let info_hash = sha1_id(term.as_bytes());
+                    match dht.announce_peer(info_hash, Some(settings.dht_identity_port)).await {
+                        Ok(_) => tracing::debug!(
+                            "DHT announced {:?} on port {}",
+                            term,
+                            settings.dht_identity_port
+                        ),
+                        Err(e) => tracing::warn!("DHT announce {:?}: {e}", term),
+                    }
+                }
+                tracing::info!(
+                    "DHT announce complete: {} terms, hb_id={}",
+                    terms.len(),
+                    hb_id_str
+                );
             }
         }
 
