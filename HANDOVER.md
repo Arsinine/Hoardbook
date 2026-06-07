@@ -1,47 +1,82 @@
 # Session Handover
 
-**Last updated: 2026-06-07**
-**Branch:** `main` — **uncommitted changes** in `crates/hb-app/src/commands/collection.rs` (Add Collection hang fix + 3 regression tests). All `hb-app` collection tests green on Linux.
+**Last updated: 2026-06-07 (evening — DHT root cause fixed)**
+**Branch:** `main`. The `scan_directory_inner` refactor + 3 regression tests are committed (defensive, kept). **The real fix — the DHT lazy-build change in `dht_service.rs` — is applied in the working tree (uncommitted), compiles, passes `hb-app` tests, clippy-clean on Linux. PENDING WINDOWS VERIFICATION (CPU check, see below).**
 
 > Build note: `/mnt/c` (WSL2 9p mount) throws intermittent I/O errors (`os error 22`, `rustc-LLVM IO failure`) under heavy compile load, and the host C: drive runs near-full. Re-run on failure (artifacts persist). `CARGO_INCREMENTAL=0` reduces churn.
 
 ---
 
-## ⚠️ Add Collection — "Scanning…" infinite hang (Windows) — fix applied, PENDING WINDOWS VERIFICATION
+## ⚠️ Add Collection — "Scanning…" infinite hang (Windows) — REAL CAUSE FOUND + FIXED (pending Windows verify)
 
-**Status:** Root-caused to a single construct, hardened fix applied + 3 regression tests added (green on Linux). **The bug does NOT reproduce on Linux** — it must be verified on Windows before this is considered closed.
+**Status:** Previous "tokio time driver missing on Windows" theory is **disproven on Windows**. Real culprit is a **runaway `mainline::rpc::socket` UDP retry storm caused by two bugs in `dht_service::run_dht_announce_loop`**. The scan_directory refactor in HEAD is harmless but does not fix the hang. **The DHT fix is now applied (working tree) — see "Fix applied" below.**
 
-### Symptom (reported on `Hoardbook_v0.4.1.exe`, Windows)
-- Add Collection → pick a folder (incl. an **empty** one) → "Start scan" → button stuck on **"Scanning…" forever**. Never times out, no error toast.
-- The webview is **fully responsive** the whole time (user can drag/maximize the window, move the depth slider, re-browse). Only the scan never completes.
+### Symptom (still as reported on `Hoardbook_v0.4.1.exe`, Windows)
+- Add Collection → pick any folder (incl. empty) → "Start scan" → button stuck on "Scanning…" forever, no error toast.
+- Webview itself stays responsive (window drag, slider) — it's in a separate `msedgewebview2` process.
 
-### Diagnosis
-That symptom = the `invoke('scan_directory')` **promise never settles** (frontend `finally { scanning = false }` only runs if the promise resolves/rejects). With a live webview, that means the **backend command panicked or never returned**, and the IPC response was never sent. Release builds set `windows_subsystem = "windows"` (`crates/hb-app/src/main.rs:1`) → **a panic has no console and is completely silent**, which is why there's no error anywhere.
+### What the Windows investigation actually showed (2026-06-07)
 
-The only change to scanning between "worked" and "broke" was commit **`365f53b`** ("SMB scan hang" fix), which wrapped the walk in:
+1. **Previous theory ruled out.** Reverted the body of `scan_directory_inner` to v0.4.1's raw `tokio::time::timeout(tokio::task::spawn_blocking(...))` block and ran `scan_completes_on_tauri_async_runtime` **on Windows MSVC** → **passed in 0.01s, no panic**. The construct does not require any runtime driver that's missing on Windows; the diagnosis in the prior session was wrong. Restored the new version; HEAD is unchanged.
+2. **Live binary observation.** Launched the shipped `Hoardbook_v0.4.1.exe` (PID 47996, then 32204 on relaunch) and sampled CPU **with no user interaction**:
+   - Steady-state **~280% CPU continuously from startup** — not climbing, not transient, ~14s CPU per 5s wall clock.
+   - 28-44 threads, 3 in `Running` state at any time.
+   - This is incompatible with the "silent panic, IPC never sent" model — the backend is *actively running*, very loudly.
+3. **Identifying the runaway.** Wired a temporary `tracing-subscriber::fmt` init at the top of `pub fn run()` (debug builds already keep the console; `windows_subsystem` is `cfg_attr(not(debug_assertions), …)`), built `target/debug/hb-app.exe`, ran with `RUST_LOG=hb_app=debug,iroh=info,mainline=debug,reqwest=warn` and captured stderr to `.work/diag.log`. **1641 lines in 25 seconds, 1636 of them `mainline::rpc::socket`**:
+   ```
+   T+0.18s INFO  mainline::dht: Mainline DHT listening address=0.0.0.0:6881
+   T+0.18s DEBUG mainline::rpc: Bootstrapping the routing table
+   T+0.24s WARN  mainline::rpc::socket: IO error … (os error 10060)
+   T+0.30s WARN  mainline::rpc::socket: IO error … (os error 10060)
+   … ~16/sec, indefinitely …
+   ```
+   `os error 10060` = WSAETIMEDOUT. Windows firewall blocks outbound UDP to DHT bootstrap nodes (router.bittorrent.com / dht.libtorrent.org / …), `mainline` retries with no backoff. Diagnostic changes have been **reverted**; `git status` is clean. `.work/diag.log` is preserved (untracked, ~1 MB) for inspection.
+
+### The two bugs (both in `crates/hb-app/src/dht_service.rs`)
+
+**Bug #1 — `INITIAL_DELAY` is bypassed (lines 74–79).**
 ```rust
-tokio::time::timeout(30s, tokio::task::spawn_blocking(|| { ensure!(is_dir); scan_recursive(...) }))
+tokio::select! {
+    _ = tokio::time::sleep(INITIAL_DELAY) => {}
+    _ = cancel_rx.changed() => {              // returns IMMEDIATELY
+        if *cancel_rx.borrow() { return; }    // borrow == false → falls through
+    }
+}
+let dht = match mainline::Dht::builder().build() { … };   // runs at app launch
 ```
-Both `tokio::time::timeout` and `tokio::task::spawn_blocking` require the **executing runtime's tokio time/blocking drivers**. If that requirement isn't met on the Windows runtime, the command panics on first poll → silent hang. This is the prime suspect (an empty folder is instant, so it's not a slow-scan/SMB issue, and not data-dependent).
+A freshly `.subscribe()`d `tokio::sync::watch::Receiver` has its initial value marked **unseen** (`subscribe()`'s documented behaviour), so `changed().await` returns on first poll. The cancel-value check (`false`) lets execution fall through to `mainline::Dht::builder().build()` — **the DHT is constructed within ~200 ms of process start**, not 30 s later. Trace timestamps in `.work/diag.log` confirm this.
 
-### Evidence gathered (all on Linux — could NOT reproduce)
-- Backend logic is correct: 3 new regression tests pass in ~0.1s (empty folder; spaces + trailing separator; **driven on Tauri's real `async_runtime`** via `tauri::async_runtime::spawn`/`block_on`).
-- Confirmed Tauri 2.10.3's default runtime is `Runtime::new()` (multi-thread, `enable_all` → time driver present), and `hb-app` does **not** override it → on Linux the construct is fine.
-- Downloaded `Hoardbook_0.4.1_amd64.AppImage`, extracted, launched under WSLg — the Linux app runs without crashing.
-- `v0.4.1` tag == current `HEAD` (`513cc83`), so the shipped binary is exactly this source (no version skew).
+**Bug #2 — DHT is constructed even when announce is disabled (lines 81–124).**
+The `if settings.dht_announce_enabled` check sits **inside** the loop, *after* `mainline::Dht::builder().build()`. So users who never opted in to DHT discovery (i.e. nearly everyone — it's an opt-in feature shipped in T22) still pay the full bootstrap cost on every launch. The setting only gates whether to *announce*, not whether to *exist*.
 
-### Fix applied — `crates/hb-app/src/commands/collection.rs`
-- Extracted `scan_directory_inner(opts, &DataStore)` (mirrors existing `publish_collection_inner`); `#[tauri::command] scan_directory` is now a thin wrapper (`store.inner()`).
-- Replaced the raw-tokio construct with **`tauri::async_runtime::spawn_blocking`** (guaranteed to run in Tauri's runtime) + an inner `std::thread` + **`std::sync::mpsc::recv_timeout(30s)`** for the deadline. This has **no dependency on the tokio time driver** and preserves the SMB-timeout intent (orphan the wedged walk thread, return a timeout error).
-- 3 regression tests added: `scan_empty_directory_completes_without_hang`, `scan_path_with_spaces_and_trailing_separator`, `scan_completes_on_tauri_async_runtime`.
+### Why this manifests as "Scanning… forever"
+~280% sustained CPU from `mainline::rpc::socket` retries either (a) starves Tauri's tokio worker pool so the `spawn_blocking(scan_directory)` task never gets picked up, or (b) creates so much process-wide scheduler pressure that the IPC response back to WebView2 is delayed past any user patience. Either explanation cleanly accounts for: empty folder hangs (no scan work, but no IPC reply either), webview stays responsive (separate process), and the bug never reproduces on Linux (outbound UDP for DHT bootstrap usually succeeds → bootstrap finishes in seconds → no retry storm → no CPU burn).
 
-### NEXT — verify on Windows (the fix is unconfirmed on the platform where the bug lives)
-The decisive check needs the **Windows MSVC Rust toolchain**; no GUI clicking required:
-1. **Reproduce the root cause:** temporarily restore the old `tokio::time::timeout(tokio::task::spawn_blocking(...))` block, then run `cargo test -p hb-app --lib scan_completes_on_tauri_async_runtime` **on Windows**. If it panics/hangs there (but passes on Linux) → root cause confirmed.
-2. **Confirm the fix:** restore the new version, re-run `cargo test -p hb-app --lib commands::collection::tests` on Windows → all should pass.
-3. **(Optional) live capture:** build a **debug** (console-enabled) binary, run from PowerShell with `RUST_BACKTRACE=full`, click Add Collection → empty folder, read the panic/backtrace from stderr.
+### Fix applied — `crates/hb-app/src/dht_service.rs::run_dht_announce_loop`
 
-If Windows verification shows the fix is insufficient, the next suspect is the **WebView2 IPC layer** (Windows) rather than the command logic — and a frontend safety net (client-side timeout in `ScanDialog.svelte` `handleScan`, > 30s so it only fires on a true stall) should be added so the dialog can never be permanently trapped.
+Implemented exactly the lazy-build approach. The DHT node is now `Option<AsyncDht>`, built **only** once `dht_announce_enabled` is set, and reused across cycles:
+- **Bug #1:** `cancel_rx.mark_unchanged()` at the top, so the first `changed().await` no longer returns immediately (the receiver comes from `dht_cancel.subscribe()`, lib.rs:245).
+- **Bug #2:** when `!dht_announce_enabled` the loop idles on `cancel_rx.changed().await` (returns on shutdown, `continue`s on re-check) and **never calls `mainline::Dht::builder().build()`**. The build + `INITIAL_DELAY` only run on the first enabled cycle; a build failure now backs off `ANNOUNCE_INTERVAL` before retrying instead of returning.
+- The toggle path still works: `dht_start_announce`/`dht_stop_announce` send `dht_cancel.send(false)`, which wakes the idle `changed()` → re-reads settings → builds on enable.
+
+Verified on Linux: compiles, `cargo test -p hb-app --lib dht_service::tests` green, `cargo clippy -p hb-app` clean. The announce logic itself is unchanged.
+
+Notes / follow-ups (not done):
+- **Tear-down on disable** is still a follow-up — once built, `mainline` exposes no clean shutdown, so disabling after enabling leaves the node alive until app exit. Acceptable for MVP (the default never-enabled user is fully protected).
+- A **frontend safety net** (≈35 s client-side timeout in `ScanDialog.svelte::handleScan`) is still worth adding so the dialog can never trap itself again, independent of this root cause.
+- The loop is not cleanly unit-testable (it builds a real DHT / runs forever), so no automated regression test was added — verification is the Windows CPU check below.
+
+### Verifying the fix
+On Windows MSVC:
+1. `cargo build -p hb-app --bin hb-app` (debug — has console).
+2. Run from PowerShell, watch `Get-Process hb-app | %{ $_.CPU }` over ~30 s — should sit near-idle (a few % CPU), not climb at ~3 s/s. (Optionally re-add the tracing-subscriber init temporarily and confirm `.work/diag.log` no longer has `mainline::rpc::socket` spam.)
+3. Click Add Collection → empty folder → Start scan. Should complete in <1 s.
+
+### State checklist after this session
+- HEAD: includes the `scan_directory_inner` refactor + 3 regression tests. All 19 `commands::collection::tests` pass on Windows MSVC (0.11 s).
+- `scan_directory` change is defensive (still correct, no time-driver dependency) — leave it in.
+- **Working tree: the DHT fix in `dht_service.rs` is applied but UNCOMMITTED**, plus this HANDOVER edit. Commit it, then rebuild on Windows to verify (CPU check above). `.work/diag.log` preserved (untracked) as evidence.
+- `Hoardbook_v0.4.1.exe` in repo root is the unfixed shipped binary; will continue to hang until a new build ships with the DHT fix.
 
 ---
 
