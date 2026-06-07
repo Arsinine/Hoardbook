@@ -30,7 +30,7 @@
 			try { profile.set(await getProfile()); } catch { }
 			try { collections.set(await getCollections()); } catch { }
 			try { contacts.set(await getContacts()); } catch { }
-			try { appVersion = await getVersion(); } catch { appVersion = '0.1.0'; }
+			try { appVersion = await getVersion(); } catch { appVersion = '0.4.2'; }
 
 			// Seed initial message keys without showing a badge (they're not "new").
 			try {
