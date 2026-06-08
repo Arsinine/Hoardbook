@@ -16,3 +16,11 @@ Hoardbook_*.deb
 
 # Multi-agent review scratch state
 .work/
+
+# Local regression-test authoring prompt (not shipped)
+REGRESSION.md
+
+# Internal planning/handover docs (kept local, not shipped)
+HANDOVER.md
+MILESTONE1.md
+planning/

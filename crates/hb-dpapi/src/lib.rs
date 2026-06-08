@@ -51,7 +51,9 @@ mod win {
         let src = DataBlob { cb: data.len() as u32, pb: data.as_ptr() as *mut u8 };
         let mut dst = DataBlob { cb: 0, pb: std::ptr::null_mut() };
 
-        // CRYPTPROTECT_UI_FORBIDDEN = 0x8 — never show a GUI dialog.
+        // CRYPTPROTECT_UI_FORBIDDEN = 0x1 — never show a GUI dialog.
+        // NOTE: 0x8 is CRYPTPROTECT_CRED_SYNC, which performs a credential-sync
+        // operation and returns TRUE *without encrypting*, leaving pDataOut null.
         let ok = unsafe {
             CryptProtectData(
                 &src as *const DataBlob as *const _,
@@ -59,7 +61,7 @@ mod win {
                 std::ptr::null(),        // no optional entropy
                 std::ptr::null_mut(),    // pvReserved
                 std::ptr::null(),        // no prompt
-                0x8,
+                0x1,
                 &mut dst as *mut DataBlob as *mut _,
             )
         };
@@ -67,6 +69,9 @@ mod win {
         if ok == 0 {
             let err = unsafe { GetLastError() };
             return Err(anyhow!("CryptProtectData failed (Windows error {err:#010x})"));
+        }
+        if dst.pb.is_null() {
+            return Err(anyhow!("CryptProtectData reported success but returned a null blob"));
         }
 
         let out = unsafe { std::slice::from_raw_parts(dst.pb, dst.cb as usize).to_vec() };
@@ -93,6 +98,9 @@ mod win {
         if ok == 0 {
             let err = unsafe { GetLastError() };
             return Err(anyhow!("CryptUnprotectData failed (Windows error {err:#010x})"));
+        }
+        if dst.pb.is_null() {
+            return Err(anyhow!("CryptUnprotectData reported success but returned a null blob"));
         }
 
         let out = unsafe { std::slice::from_raw_parts(dst.pb, dst.cb as usize).to_vec() };

@@ -221,9 +221,9 @@
 									{col.item_count} item{col.item_count !== 1 ? 's' : ''}
 									{#if col.est_size}· {col.est_size}{:else if col.total_bytes}· {fmtBytes(col.total_bytes)}{/if}
 								</div>
-								{#if col.content_type.length > 0 || col.sorted}
+								{#if (col.content_types?.length ?? 0) > 0 || col.sorted}
 									<div class="col-tags">
-										{#each col.content_type.slice(0, 3) as t}
+										{#each (col.content_types ?? []).slice(0, 3) as t}
 											<span class="tag">{t}</span>
 										{/each}
 										{#if col.sorted}

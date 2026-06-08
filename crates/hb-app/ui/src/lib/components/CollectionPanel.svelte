@@ -12,7 +12,7 @@
 
 	let expanded = false;
 
-	$: fmt = collection.content_type[0] ?? '';
+	$: fmt = collection.content_types?.[0] ?? '';
 
 	function handleDownload(path: string) {
 		if (peerId) dispatch('download', { peerId, slug: collection.slug, path });
