@@ -1,9 +1,25 @@
 # Session Handover
 
-**Last updated: 2026-06-07 (evening — DHT root cause fixed)**
+**Last updated: 2026-06-08 (DPAPI keypair-encryption bug found + fixed; see "Multi-platform test suite" below)**
 **Branch:** `main`. The `scan_directory_inner` refactor + 3 regression tests are committed (defensive, kept). **The real fix — the DHT lazy-build change in `dht_service.rs` — is applied in the working tree (uncommitted), compiles, passes `hb-app` tests, clippy-clean on Linux. PENDING WINDOWS VERIFICATION (CPU check, see below).**
 
 > Build note: `/mnt/c` (WSL2 9p mount) throws intermittent I/O errors (`os error 22`, `rustc-LLVM IO failure`) under heavy compile load, and the host C: drive runs near-full. Re-run on failure (artifacts persist). `CARGO_INCREMENTAL=0` reduces churn.
+
+---
+
+## ✅ Multi-platform test suite — REQUIRED (motivated by a latent Windows-only DPAPI bug)
+
+**2026-06-08:** Found + fixed a critical bug present in every Windows build — the root cause of the 0-byte `keypair.bin` → "Identity file unreadable" recovery screen.
+
+**Bug:** `crates/hb-dpapi/src/lib.rs::encrypt` passed flag `0x8` to `CryptProtectData`, with a comment misnaming it `CRYPTPROTECT_UI_FORBIDDEN`. `0x8` is actually `CRYPTPROTECT_CRED_SYNC` — a credential-sync op that returns `TRUE` **without encrypting**, leaving `pDataOut` null. The correct value is `0x1`. Every keypair "encryption" was therefore a no-op returning an empty blob → a 0-byte file. Debug builds abort on the resulting `slice::from_raw_parts(null,…)` (Rust UB check); release builds silently write the empty file → recovery screen on next launch. **Fixed:** flag `0x8` → `0x1`, plus a defensive null-blob guard in both `encrypt`/`decrypt`. `cargo test -p hb-dpapi` now passes on Windows (verified; keypair.bin writes 406 bytes in the real app).
+
+**Why it was never caught:** the hb-dpapi tests are `#[cfg(all(test, target_os = "windows"))]`, and all dev + CI ran on **Linux/WSL** — so they **never executed**. Single-OS testing makes every `#[cfg(target_os = …)]` / FFI / DPAPI / keyring / path-handling branch invisible.
+
+**Action required — multi-platform CI matrix** so platform-gated tests actually run:
+- GitHub Actions matrix `{windows-latest, macos-latest, ubuntu-latest}` → `cargo test --workspace` (+ `cargo clippy`) on each. A green Linux run must no longer be treated as "tests pass".
+- Guarantee every `#[cfg(target_os = "windows")]` / `"macos"` / `"linux"` test runs on its native runner. Treat the presence of such a gate as a hard requirement to include that OS in the matrix.
+- Add a Windows-native end-to-end identity test (generate → `save_keypair` → reload via `load_keypair`/`get_identity` → decrypt) so save/load wiring is covered, not just the in-crate DPAPI round-trip.
+- Audit all `#[cfg(target_os)]`-gated code so no platform branch is left untested.
 
 ---
 
@@ -77,6 +93,49 @@ On Windows MSVC:
 - `scan_directory` change is defensive (still correct, no time-driver dependency) — leave it in.
 - **Working tree: the DHT fix in `dht_service.rs` is applied but UNCOMMITTED**, plus this HANDOVER edit. Commit it, then rebuild on Windows to verify (CPU check above). `.work/diag.log` preserved (untracked) as evidence.
 - `Hoardbook_v0.4.1.exe` in repo root is the unfixed shipped binary; will continue to hang until a new build ships with the DHT fix.
+
+---
+
+## ⚠️ Second profiling test (2026-06-07, post-DHT-fix) — DHT was NOT the cause; runaway is a host-side GUI-loop spin
+
+Re-profiled the **release** `hb-app.exe` that already contains the committed DHT fix (`641f7ba`), then captured an instrumented **debug** build (temporary `tracing-subscriber` init in `run()` — now reverted, tree clean). The CPU runaway persists, but every network/DHT/iroh theory is **disproven**. Method + evidence:
+
+**Ruled OUT (each with direct evidence):**
+- **Not network / DHT / iroh.** `Get-NetUDPEndpoint`/`Get-NetTCPConnection` on the live PID show **zero UDP sockets** — iroh and mainline DHT *both* always bind UDP, so neither is running. The previous session's `mainline::rpc::socket` storm is gone; the DHT fix worked. iroh additionally never starts here because `%APPDATA%\net.hoardbook\identity\keypair.bin` is **0 bytes** → `load_keypair` fails with DPAPI `0x57` (confirmed in the trace) → `start_iroh_endpoint` is skipped.
+- **Not the tokio background tasks.** With no identity, the heartbeat loop no-ops, the DHT loop idles correctly on `cancel_rx.changed().await`, and the identity server blocks on `accept()`. The instrumented trace is **completely silent** after the two startup lines despite ~1 core burning.
+- **Not the webview renderer / CSS.** During the spin the **host `hb-app.exe` burns ~1 core while the `msedgewebview2.exe` process is idle (<1 CPU-s)**. Neutralising every `animation: … infinite` in the built CSS and rebuilding **did not** reduce the spin. No `setInterval`/`requestAnimationFrame` flood and no self-retriggering Svelte `$:` reactive block in the mounted routes.
+
+**What it IS (narrowed):**
+- A **host-process native busy-loop**: **2 threads pegged in `Running`** (~0.6 + ~0.45 core), burning ~1 core on the debug build / ~1.8 cores on release. tao/wry/WebView2 use the `log` crate (not `tracing`), so they emit nothing under our subscriber — consistent with the spin living in that GUI/event-loop layer.
+- **Foreground-dependent.** It only spins while the Hoardbook window is the foreground/visible window (a hidden-window launch stayed flat at 10 threads / 0.1 CPU; backgrounding it makes the per-thread deltas drop to ~0). This is the classic Tauri-on-Windows idle-CPU signature (continuous compositor/redraw wakeups of the in-proc WebView2 controller + tao message loop).
+
+**Next diagnostic step (needs heavier tooling than this box has):** symbolicate the two hot threads with WPA/xperf (only in-box `wpr` + `tracerpt` are present; no `xperf`/WPA, so a 428 MB ETL couldn't be resolved to functions). Likely remediations to try once the frame is known: bump `tauri`/`wry`/`tao`, or pass WebView2 `additionalBrowserArgs` to disable the feature driving continuous composition. **The `keypair.bin` being 0 bytes is itself a bug to fix** (a failed/partial keypair write left an empty file → permanent "Identity file unreadable" recovery screen) and is a clean repro of the foreground spin.
+
+**Amplifier — process stacking.** Found a leftover instance (PID 55936) holding **10 042 CPU-seconds**: repeated launches of the windowed app each spawn a full process + window + backend that keeps spinning, so CPU compounds across stale copies. This is what drove the original "~280–640% from startup" readings, and a stale instance owning ports/state while a fresh window starts is a plausible contributor to the "Scanning… forever" report. Fixed by the singleton work below.
+
+> Tooling note: traces/evidence preserved under `.work/` (`diag5.log` = the instrumented startup trace; the 428 MB `hbcpu.etl` was deleted to reclaim disk). The temporary `tracing-subscriber` instrumentation has been reverted — `git status` shows only this HANDOVER edit.
+
+## TODO: Make Hoardbook a singleton (single-instance) — only one running at a time
+
+Per user request and the stacking evidence above. The Tauri builder currently registers no single-instance guard, so every launch (or every double-click) starts a brand-new process + window + backend tokio runtime, and stale copies keep burning CPU.
+
+**Fix:** add [`tauri-plugin-single-instance`](https://github.com/tauri-apps/plugins-workspace/tree/v2/plugins/single-instance) (v2):
+- `cargo add tauri-plugin-single-instance` in `crates/hb-app`.
+- Register it **first** in `run()` (it must be the first plugin):
+  ```rust
+  .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+      // a second launch was attempted — focus the existing window instead
+      if let Some(w) = app.get_webview_window("main") {
+          let _ = w.show();
+          let _ = w.set_focus();
+      }
+  }))
+  ```
+- This makes the second process exit immediately and hand off to the running one, so there can only ever be one backend.
+
+Acceptance: launch hb-app twice → second invocation does not create a new process; the existing window gains focus; `Get-Process hb-app` shows exactly one PID. This also prevents future zombie-stacking from masking/inflating CPU during profiling.
+
+> Note: the singleton guard fixes the *amplifier* (stacked zombie processes), not the underlying single-instance host-side GUI-loop spin documented above — both need addressing. The busy-loop's exact native frame still needs WPA/xperf symbolication (not available on this box).
 
 ---
 
