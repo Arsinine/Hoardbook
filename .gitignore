@@ -16,3 +16,6 @@ Hoardbook_*.deb
 
 # Multi-agent review scratch state
 .work/
+
+# Local regression-test authoring prompt (not shipped)
+REGRESSION.md
