@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import type { ReceivedMessage, ReceivedChannelMessage } from './types.js';
+import type { ReceivedMessage } from './types.js';
 
 // ── Issue: chat doesn't update in real time ───────────────────────────────────
 // The layout poll runs every 20s — too slow for a chat page. The chat page
@@ -40,18 +40,5 @@ describe('chat real-time polling', () => {
 
 		expect(newMessages).toHaveLength(1);
 		expect(newMessages[0].sent_at).toBe('2026-01-01T10:00:30Z');
-	});
-
-	it('channel poll accumulates only new channel messages', () => {
-		const c1: ReceivedChannelMessage = { from: 'hb1_alice', content: 'hello', sent_at: '2026-01-01T10:00:00Z' };
-		const c2: ReceivedChannelMessage = { from: 'hb1_bob', content: 'world', sent_at: '2026-01-01T10:00:10Z' };
-
-		function channelKey(m: ReceivedChannelMessage) { return `${m.from}|${m.sent_at}`; }
-		const seen = new Set([channelKey(c1)]);
-
-		const batch = [c1, c2];
-		const newOnes = batch.filter(m => !seen.has(channelKey(m)));
-		expect(newOnes).toHaveLength(1);
-		expect(newOnes[0].content).toBe('world');
 	});
 });

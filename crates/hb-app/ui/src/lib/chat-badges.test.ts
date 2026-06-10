@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { ReceivedMessage } from './types.js';
 
 function makeMsg(from: string, sent_at: string): ReceivedMessage {
-	return { from, to: 'me', content: 'hello', sent_at, encrypted: false };
+	return { from, to: 'me', content: 'hello', sent_at };
 }
 
 // Mirrors unreadCounts derivation when seenCounts is empty (simulates remount)
