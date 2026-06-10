@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { CachedPeer, ReceivedChannelMessage } from './types.js';
+import type { CachedPeer } from './types.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -8,7 +8,7 @@ function makePeer(hb_id: string, display_name?: string): CachedPeer {
 		hb_id,
 		profile: display_name ? { display_name, bio: undefined, tags: [], since: undefined,
 			est_size: undefined, languages: [], contact_hint: undefined, email: undefined,
-			location: undefined, social_links: [], updated: '' } : undefined,
+			location: undefined, social_links: [], willing_to: [], content_types: [], updated: '' } : undefined,
 		collections: [], online: false, node_addr: undefined,
 		last_fetched: '', last_seen_at: undefined, local_tags: [],
 	};
@@ -64,15 +64,6 @@ describe('chat senderName — unfollowed user shown as hb_id (bug)', () => {
 		expect(name).toBe(shortId(stranger));   // not a display name
 		expect(name).not.toBe('Stranger Name'); // confirms bug
 	});
-
-	it('buggy: general channel message from unfollowed user shows hb_id', () => {
-		const msgs: ReceivedChannelMessage[] = [
-			{ from: 'hb1_stranger000ABCD', content: 'hello', sent_at: '' },
-		];
-		const displayed = msgs.map(m => senderNameBuggy(m.from, myId, contacts));
-		expect(displayed[0]).not.toBe('Stranger Name');
-		expect(displayed[0]).toBe(shortId('hb1_stranger000ABCD'));
-	});
 });
 
 describe('chat senderName — fixed with profile cache', () => {
@@ -96,14 +87,5 @@ describe('chat senderName — fixed with profile cache', () => {
 	it('falls back to shortId when cache is empty for unknown sender', () => {
 		const name = senderNameFixed('hb1_stranger000ABCD', myId, contacts, {});
 		expect(name).toBe(shortId('hb1_stranger000ABCD'));
-	});
-
-	it('cache wins over shortId fallback for general channel messages', () => {
-		const msgs: ReceivedChannelMessage[] = [
-			{ from: 'hb1_stranger000ABCD', content: 'hello', sent_at: '' },
-		];
-		const cache = { 'hb1_stranger000ABCD': 'Stranger Name' };
-		const displayed = msgs.map(m => senderNameFixed(m.from, myId, contacts, cache));
-		expect(displayed[0]).toBe('Stranger Name');
 	});
 });

@@ -54,6 +54,51 @@ pub fn sha1_id(data: &[u8]) -> mainline::Id {
 }
 
 // ---------------------------------------------------------------------------
+// Loop decisions (extracted so the lazy-build / initial-delay invariants are
+// unit-testable without building a real DHT or running the loop forever)
+// ---------------------------------------------------------------------------
+
+/// What `run_dht_announce_loop` does on a given cycle.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DhtCycle {
+    /// Announce disabled — idle without ever building the DHT node.
+    Idle,
+    /// Enabled, no node yet — lazily build one (once).
+    Build,
+    /// Enabled, node already built — announce on the existing node.
+    Announce,
+}
+
+/// The loop's single build gate. Locks HANDOVER Bug #2: when announce is disabled
+/// the action is always `Idle` and the DHT is **never** built — regardless of node
+/// state — so the default, never-opted-in user pays zero DHT bootstrap cost (the old
+/// code built unconditionally, spinning a no-backoff UDP retry storm on networks that
+/// block DHT). Built lazily on the first enabled cycle, then reused (`Announce`).
+pub(crate) fn dht_cycle_action(dht_announce_enabled: bool, dht_built: bool) -> DhtCycle {
+    if !dht_announce_enabled {
+        DhtCycle::Idle
+    } else if !dht_built {
+        DhtCycle::Build
+    } else {
+        DhtCycle::Announce
+    }
+}
+
+/// Wait out `INITIAL_DELAY` before the first DHT build, returning early only if
+/// cancellation fires (returns `true` = stop). Arms `cancel_rx` with
+/// `mark_unchanged()` first — HANDOVER Bug #1: a watch receiver whose current value
+/// is still marked *unseen* makes `changed()` resolve on the first poll, which would
+/// let the select fall through immediately and skip the delay, building the DHT at
+/// process start. A real cancel sent *during* the delay still wins via `changed()`.
+async fn await_initial_delay(cancel_rx: &mut watch::Receiver<bool>) -> bool {
+    cancel_rx.mark_unchanged();
+    tokio::select! {
+        _ = tokio::time::sleep(INITIAL_DELAY) => false,
+        _ = cancel_rx.changed() => *cancel_rx.borrow(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Background announce loop
 // ---------------------------------------------------------------------------
 
@@ -74,48 +119,43 @@ pub async fn run_dht_announce_loop(
     store: crate::store::DataStore,
     mut cancel_rx: watch::Receiver<bool>,
 ) {
-    // A receiver from `subscribe()` reports its current value as unseen, so the
-    // first `changed().await` would return immediately. Mark it seen so the
-    // delays/waits below actually wait.
-    cancel_rx.mark_unchanged();
-
     let mut dht: Option<AsyncDht> = None;
 
     loop {
         let settings = store.load_settings().ok().flatten().unwrap_or_default();
 
-        if !settings.dht_announce_enabled {
-            // Idle until the user enables announce or the app shuts down. Crucially,
-            // never bootstrap the DHT here — the default user must pay no DHT cost.
-            if cancel_rx.changed().await.is_err() || *cancel_rx.borrow() {
-                return;
-            }
-            continue;
-        }
-
-        if dht.is_none() {
-            // First announce since launch: give the identity a moment to load,
-            // then bootstrap the node once.
-            tokio::select! {
-                _ = tokio::time::sleep(INITIAL_DELAY) => {}
-                _ = cancel_rx.changed() => {
-                    if *cancel_rx.borrow() { return; }
+        match dht_cycle_action(settings.dht_announce_enabled, dht.is_some()) {
+            DhtCycle::Idle => {
+                // Announce disabled: idle until the user enables it or the app shuts
+                // down. Crucially, never bootstrap the DHT here — the default,
+                // never-opted-in user must pay no DHT cost.
+                if cancel_rx.changed().await.is_err() || *cancel_rx.borrow() {
+                    return;
                 }
+                continue;
             }
-            match mainline::Dht::builder().build() {
-                Ok(d) => dht = Some(d.as_async()),
-                Err(e) => {
-                    tracing::warn!("DHT announce: failed to create DHT node: {e}");
-                    // Back off before retrying so a persistent failure doesn't spin.
-                    tokio::select! {
-                        _ = tokio::time::sleep(ANNOUNCE_INTERVAL) => {}
-                        _ = cancel_rx.changed() => {
-                            if *cancel_rx.borrow() { return; }
+            DhtCycle::Build => {
+                // First announce since launch: wait out INITIAL_DELAY (giving the
+                // identity a moment to load), then bootstrap the node once.
+                if await_initial_delay(&mut cancel_rx).await {
+                    return; // cancelled during the delay
+                }
+                match mainline::Dht::builder().build() {
+                    Ok(d) => dht = Some(d.as_async()),
+                    Err(e) => {
+                        tracing::warn!("DHT announce: failed to create DHT node: {e}");
+                        // Back off before retrying so a persistent failure doesn't spin.
+                        tokio::select! {
+                            _ = tokio::time::sleep(ANNOUNCE_INTERVAL) => {}
+                            _ = cancel_rx.changed() => {
+                                if *cancel_rx.borrow() { return; }
+                            }
                         }
+                        continue;
                     }
-                    continue;
                 }
             }
+            DhtCycle::Announce => {}
         }
         let dht = dht.as_ref().expect("DHT built above");
 
@@ -370,6 +410,65 @@ mod tests {
         assert_eq!(a, b, "same input must produce same Id");
         let c = sha1_id(b"documentary");
         assert_ne!(a, c, "different inputs must produce different Ids");
+    }
+
+    // HANDOVER scenario 5, Bug #2: `dht_cycle_action` is the loop's single build
+    // gate (the loop `match`es on it). When announce is disabled the action must be
+    // `Idle` — never `Build` — no matter the node state, so the default user never
+    // bootstraps the DHT. A regression that builds while disabled has to break this.
+    #[test]
+    fn dht_cycle_idles_and_never_builds_when_disabled() {
+        assert_eq!(dht_cycle_action(false, false), DhtCycle::Idle);
+        // Disabled => Idle even if a node somehow already exists: never (re)build.
+        assert_eq!(dht_cycle_action(false, true), DhtCycle::Idle);
+        // Enabled, no node yet => build exactly once.
+        assert_eq!(dht_cycle_action(true, false), DhtCycle::Build);
+        // Enabled, node present => reuse it, never rebuild.
+        assert_eq!(dht_cycle_action(true, true), DhtCycle::Announce);
+    }
+
+    // HANDOVER scenario 5, Bug #1: `await_initial_delay` (used by the loop before the
+    // first build) must wait out INITIAL_DELAY and must NOT short-circuit when
+    // `cancel_rx`'s value is still marked *unseen* — the state that skipped the delay
+    // and let the DHT bootstrap at process start. The helper arms the receiver via
+    // `mark_unchanged()`; reverting that call regresses this test (the timeout would
+    // resolve `Ok` immediately instead of `Err`). INITIAL_DELAY is 30s, so a correct
+    // helper is still sleeping well past the 50ms probe.
+    #[tokio::test]
+    async fn await_initial_delay_does_not_short_circuit_on_unseen_cancel() {
+        use std::time::Duration;
+        use tokio::sync::watch;
+
+        let (tx, mut cancel_rx) = watch::channel(false);
+        tx.send(false).unwrap(); // bump version → cancel_rx's current value is unseen
+        assert!(cancel_rx.has_changed().unwrap(), "precondition: value is unseen");
+
+        let waited =
+            tokio::time::timeout(Duration::from_millis(50), await_initial_delay(&mut cancel_rx))
+                .await;
+        assert!(
+            waited.is_err(),
+            "await_initial_delay must wait out INITIAL_DELAY, not short-circuit on an unseen cancel value"
+        );
+    }
+
+    // Companion to the above: a real cancel sent *during* the delay must still stop
+    // the loop promptly (mark_unchanged must not swallow a genuine shutdown signal).
+    #[tokio::test]
+    async fn await_initial_delay_returns_true_when_cancelled_during_wait() {
+        use tokio::sync::watch;
+
+        let (tx, cancel_rx) = watch::channel(false);
+        let mut cancel_rx = cancel_rx;
+        let handle = tokio::spawn(async move { await_initial_delay(&mut cancel_rx).await });
+        // current-thread test runtime: yield so the spawned helper arms + reaches the
+        // select await point, then request shutdown.
+        tokio::task::yield_now().await;
+        tx.send(true).unwrap();
+        assert!(
+            handle.await.unwrap(),
+            "a shutdown sent during the initial delay must return true (stop the loop)"
+        );
     }
 
     #[tokio::test]

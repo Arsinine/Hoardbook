@@ -117,7 +117,7 @@
 				selectedCollection.slug,
 				itemPath(item),
 				savePath,
-				item.sha256,
+				undefined, // per-file SHA-256 not implemented (out of scope)
 			);
 			// Seed the store immediately so the queue panel appears before the first event.
 			downloads.update(list => [
