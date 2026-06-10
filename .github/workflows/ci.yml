@@ -1,0 +1,88 @@
+name: CI
+
+# Multi-platform test matrix. Motivated by a latent Windows-only DPAPI bug that
+# shipped undetected because the hb-dpapi tests are `#[cfg(target_os = "windows")]`
+# and CI/dev ran only on Linux. Every `#[cfg(target_os = ...)]`-gated test must run
+# on its native runner, so a green Linux run is no longer treated as "tests pass".
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: test (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      # hb-app embeds frontendDist (`ui/build`) at compile time via
+      # `tauri::generate_context!`, so the frontend must be built before any
+      # `cargo` command that compiles hb-app, on every OS in the matrix.
+      - name: Build frontend (required to compile hb-app)
+        working-directory: crates/hb-app/ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+      # Clippy runs across the workspace for signal, but is NON-BLOCKING: the
+      # harness/app crates carry pre-existing clippy debt under current stable
+      # clippy (e.g. hb-it unused import, hb-relay redundant-pattern-matching,
+      # hb-app/commands/watches.rs ptr_arg + from_ref). Cleaning that is a
+      # separate follow-up; it must not gate these regression tests. The hard
+      # gates here are `cargo test --workspace` (every OS) + svelte-check + vitest.
+      - name: cargo clippy --workspace (non-blocking)
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  frontend:
+    name: frontend checks (svelte-check + vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install frontend dependencies
+        working-directory: crates/hb-app/ui
+        run: npm ci
+
+      # svelte-check is the build-level guard for the content_types contract:
+      # reading a nonexistent singular `content_type` is a strict-mode type error.
+      - name: svelte-check
+        working-directory: crates/hb-app/ui
+        run: npm run check
+
+      - name: vitest
+        working-directory: crates/hb-app/ui
+        run: npm test
