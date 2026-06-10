@@ -203,6 +203,14 @@ impl DataStore {
         }
         let bytes = std::fs::read(&path).context("reading keypair file")?;
 
+        // A 0-byte keypair file is a failed/partial write (e.g. the DPAPI
+        // CRED_SYNC bug wrote an empty blob). Treat it as "absent" so the app
+        // regenerates an identity instead of dead-ending forever on the
+        // "Identity file unreadable" recovery screen.
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+
         #[cfg(target_os = "windows")]
         let json_bytes = hb_dpapi::decrypt(&bytes).context("DPAPI decryption failed")?;
 
@@ -486,5 +494,90 @@ impl DataStore {
 
     pub fn save_watches(&self, watches: &[Watch]) -> Result<()> {
         write_json(&self.watches_path(), watches).context("saving watches")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_store() -> (TempDir, DataStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        (dir, store)
+    }
+
+    // HANDOVER scenario 2: a 0-byte keypair file (the on-disk symptom of the
+    // DPAPI CRED_SYNC bug) must be treated as "absent" so the app regenerates,
+    // not as an unreadable identity that dead-ends the recovery screen forever.
+    // Cross-platform: an empty file fails decrypt (Windows) / JSON parse (Linux)
+    // identically, so this asserts Ok(None) on every OS.
+    #[test]
+    fn empty_keypair_file_treated_as_absent() {
+        let (_dir, store) = test_store();
+        let path = store.keypair_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap(); // 0-byte keypair.bin / keypair.json
+
+        let loaded = store.load_keypair().expect("empty keypair file must not error");
+        assert!(
+            loaded.is_none(),
+            "a 0-byte keypair file must load as None (absent), got {loaded:?}"
+        );
+    }
+
+    // HANDOVER scenario 3: end-to-end identity wiring through DataStore on
+    // Windows — generate -> save_keypair (DPAPI-encrypt + write) -> load_keypair
+    // (read + DPAPI-decrypt) -> reconstruct the keypair. This covers the save/load
+    // glue, not just the in-crate DPAPI roundtrip. With the CRED_SYNC (0x8) bug,
+    // save_keypair wrote an empty blob, so the asserts on the on-disk bytes and
+    // the recovered hb_id both fail.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn keypair_save_load_roundtrip_windows() {
+        use hb_core::HoardbookKeypair;
+        let (_dir, store) = test_store();
+        let kp = HoardbookKeypair::generate();
+        let stored = StoredKeypair {
+            version: 1,
+            hb_id: kp.hb_id(),
+            private_key_hex: hex::encode(kp.private_key_bytes()),
+        };
+        let plaintext_json = serde_json::to_string_pretty(&stored).unwrap();
+
+        store.save_keypair(&stored).expect("save_keypair must succeed");
+
+        // The on-disk blob must be a real DPAPI ciphertext: non-empty and not the
+        // plaintext JSON. CRED_SYNC produced a 0-byte file here.
+        let on_disk = std::fs::read(store.keypair_path()).unwrap();
+        assert!(!on_disk.is_empty(), "keypair.bin must not be 0 bytes");
+        assert_ne!(
+            on_disk.as_slice(),
+            plaintext_json.as_bytes(),
+            "keypair.bin must be encrypted, not stored as plaintext JSON"
+        );
+
+        // Reload through the platform path and reconstruct the live keypair.
+        let loaded = store
+            .load_keypair()
+            .expect("load_keypair must succeed")
+            .expect("keypair must be present after save");
+        assert_eq!(loaded.hb_id, stored.hb_id, "reloaded hb_id must match");
+
+        let bytes: [u8; 32] = hex::decode(&loaded.private_key_hex)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let recovered = HoardbookKeypair::from_bytes(&bytes);
+        assert_eq!(
+            recovered.hb_id(),
+            kp.hb_id(),
+            "keypair reconstructed from the reloaded identity must match the original"
+        );
     }
 }
