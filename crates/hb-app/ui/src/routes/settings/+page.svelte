@@ -323,6 +323,14 @@
 			<div class="id-actions">
 				<span class="id-hint">{copied ? 'Copied!' : 'Share this so others can look you up.'}</span>
 			</div>
+
+			{#if $identity.key_storage === 'plain-file'}
+				<div class="key-storage-warn">
+					{@html icons.key} Your private key is stored as a protected file (not in an OS
+					keyring) on this platform. Anyone with access to your user account can read it —
+					keep this device and your home directory secure. Keyring support is planned.
+				</div>
+			{/if}
 		</div>
 	{:else}
 		<div class="surface">
@@ -559,6 +567,20 @@
 	.identity-name { font-size: 14px; font-weight: 600; }
 
 	.identity-created { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
+
+	.key-storage-warn {
+		margin-top: 12px;
+		padding: 10px 12px;
+		border: 1px solid color-mix(in oklch, var(--accent) 35%, transparent);
+		background: color-mix(in oklch, var(--accent) 8%, transparent);
+		border-radius: 7px;
+		font-size: 12px;
+		color: var(--fg-muted);
+		display: flex;
+		gap: 8px;
+		align-items: flex-start;
+		line-height: 1.5;
+	}
 
 	.id-display {
 		background: var(--bg);

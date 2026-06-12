@@ -22,3 +22,8 @@ axum-server     = { version = "0.7", features = ["tls-rustls"] }
 sqlx            = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 tower-http      = { version = "0.5", features = ["trace"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# File-backed test DBs for the cap-atomicity tests — a `sqlite::memory:` pool gives
+# each pooled connection its own database, which would void any concurrency assertion.
+tempfile = "3"

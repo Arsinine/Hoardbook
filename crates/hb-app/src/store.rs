@@ -357,6 +357,11 @@ impl DataStore {
         if settings.exists() {
             std::fs::remove_file(&settings)?;
         }
+        // The PEX address cache is network-learned data — clear it with everything else.
+        let peers = self.peers_path();
+        if peers.exists() {
+            std::fs::remove_file(&peers)?;
+        }
         Ok(())
     }
 
@@ -462,6 +467,33 @@ impl DataStore {
 
     pub fn save_groups(&self, groups: &[Group]) -> Result<()> {
         write_json(&self.groups_path(), groups).context("saving groups")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Peer address cache (PEX) — peers.json, spec data model
+// ---------------------------------------------------------------------------
+
+impl DataStore {
+    pub fn peers_path(&self) -> PathBuf {
+        self.base.join("peers.json")
+    }
+
+    /// Load the PEX peer address cache: `{ hb_id → entry }`. Lenient like other
+    /// local config — a version mismatch falls back to an empty cache.
+    pub fn load_peer_cache(
+        &self,
+    ) -> Result<std::collections::HashMap<String, crate::pex::PeerAddrEntry>> {
+        Ok(read_json_lenient(&self.peers_path())
+            .context("loading peer cache")?
+            .unwrap_or_default())
+    }
+
+    pub fn save_peer_cache(
+        &self,
+        entries: &std::collections::HashMap<String, crate::pex::PeerAddrEntry>,
+    ) -> Result<()> {
+        write_json(&self.peers_path(), entries).context("saving peer cache")
     }
 }
 

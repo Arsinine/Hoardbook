@@ -4,7 +4,8 @@ use tauri::State;
 use zeroize::Zeroize;
 
 use crate::{
-    SharedDmQueue, SharedDownloadRegistry, SharedEndpoint, SharedIdentity, SharedRelay,
+    SharedDmQueue, SharedDownloadRegistry, SharedEndpoint, SharedIdentity, SharedPeerCache,
+    SharedRelay,
     error::{CmdResult, cmd_err},
     store::DataStore,
 };
@@ -13,13 +14,21 @@ use crate::{
 pub struct IdentityInfo {
     pub hb_id: String,
     pub hb_id_short: String,
+    /// How the private key is protected at rest on this platform:
+    /// "os-encrypted" (Windows DPAPI) or "plain-file" (Linux/macOS 0600 file).
+    /// The frontend shows the L9 storage warning when this is "plain-file".
+    pub key_storage: &'static str,
 }
+
+/// Spec (v0.7, Private key storage): Linux/macOS keep the key as a 0600 plaintext file
+/// until the Phase 2 keyring integration lands; the UI must say so explicitly.
+const KEY_STORAGE: &str = if cfg!(target_os = "windows") { "os-encrypted" } else { "plain-file" };
 
 impl IdentityInfo {
     fn from_keypair(kp: &HoardbookKeypair) -> Self {
         let hb_id = kp.hb_id();
         let hb_id_short = shorten(&hb_id);
-        Self { hb_id, hb_id_short }
+        Self { hb_id, hb_id_short, key_storage: KEY_STORAGE }
     }
 }
 
@@ -31,7 +40,8 @@ fn shorten(id: &str) -> String {
 }
 
 /// Generate a fresh keypair and persist it.
-/// Errors if a keypair already exists — the frontend must call `rotate_keypair` to replace it.
+/// Errors if a keypair already exists — identities are fixed in Phase 1 (key rotation is a
+/// Phase 2 item); the only way to replace an identity is Settings → Wipe data.
 #[tauri::command]
 pub async fn generate_keypair(
     app: tauri::AppHandle,
@@ -40,9 +50,10 @@ pub async fn generate_keypair(
     endpoint: State<'_, SharedEndpoint>,
     dm_queue: State<'_, SharedDmQueue>,
     registry: State<'_, SharedDownloadRegistry>,
+    peer_cache: State<'_, SharedPeerCache>,
 ) -> CmdResult<IdentityInfo> {
     match store.load_keypair() {
-        Ok(Some(_)) => return Err("A keypair already exists. Use rotate_keypair to replace it.".into()),
+        Ok(Some(_)) => return Err("A keypair already exists. Wipe data first to generate a new identity.".into()),
         Ok(None) => {} // no keypair on disk — proceed
         Err(e) => {
             // The file exists but cannot be read/decrypted (e.g. DPAPI failure after a
@@ -78,6 +89,7 @@ pub async fn generate_keypair(
         kp.hb_id(),
         app,
         (*registry).clone(),
+        (*peer_cache).clone(),
     ).await {
         tracing::warn!("iroh endpoint startup failed after keypair generate: {e}");
     }
@@ -96,6 +108,7 @@ pub async fn import_keypair(
     endpoint: State<'_, SharedEndpoint>,
     dm_queue: State<'_, SharedDmQueue>,
     registry: State<'_, SharedDownloadRegistry>,
+    peer_cache: State<'_, SharedPeerCache>,
 ) -> CmdResult<IdentityInfo> {
     if store.load_keypair().map_err(cmd_err)?.is_some() {
         return Err("A keypair already exists. Wipe data first to import a different keypair.".into());
@@ -129,6 +142,7 @@ pub async fn import_keypair(
         kp.hb_id(),
         app,
         (*registry).clone(),
+        (*peer_cache).clone(),
     ).await {
         tracing::warn!("iroh endpoint startup failed after keypair import: {e}");
     }
@@ -241,6 +255,7 @@ pub async fn wipe_data(
     relay: State<'_, SharedRelay>,
     endpoint: State<'_, SharedEndpoint>,
     dm_queue: State<'_, SharedDmQueue>,
+    peer_cache: State<'_, SharedPeerCache>,
 ) -> CmdResult<bool> {
     // Relay no longer stores peer data (profile/collections served via iroh),
     // so there is nothing to deactivate on the relay side.
@@ -248,6 +263,7 @@ pub async fn wipe_data(
     *identity.write().await = None;
     relay.set_relay_urls(vec![]).await;
     dm_queue.lock().await.clear();
+    peer_cache.lock().await.clear();
 
     // Close and clear the iroh endpoint.
     let mut ep_guard = endpoint.write().await;
