@@ -231,7 +231,12 @@ pub(crate) async fn handle_xfer_connection(
     // This == the requester's hb_id and is the ONLY trustworthy requester identity.
     let remote_hb_id = hb_core::hb_id_encode(conn.remote_id().as_bytes());
     let (send, recv) = conn.accept_bi().await.context("accept_bi")?;
-    handle_xfer_stream(send, recv, &remote_hb_id, &store, &registry).await
+    let res = handle_xfer_stream(send, recv, &remote_hb_id, &store, &registry).await;
+    // Hold the connection open until the client has read the response. Small error
+    // responses (e.g. the require_follow denial) otherwise race a CONNECTION_CLOSE on
+    // fast links and are seen as a truncated read. See conn::drain_connection.
+    crate::conn::drain_connection(&conn).await;
+    res
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +379,41 @@ pub async fn download_file(
     registry: SharedDownloadRegistry,
     app: AppHandle,
 ) -> Result<u64> {
+    // Thin Tauri wrapper: forward every progress event to the webview. All the real
+    // work lives in `download_file_inner`, which is Tauri-free so the integration
+    // harness (hb-p2p-it) can drive the exact same streaming / integrity-check /
+    // cancellation path without an AppHandle.
+    download_file_inner(
+        endpoint,
+        peer_addr_json,
+        expected_peer_hb_id,
+        slug,
+        path,
+        save_path,
+        expected_sha256,
+        download_id,
+        registry,
+        move |ev| { let _ = app.emit("download:progress", ev); },
+    )
+    .await
+}
+
+/// Tauri-free core of [`download_file`]. `on_progress` receives every progress
+/// event; the command wrapper forwards them to the webview, while tests and the
+/// `hb-p2p-it` harness pass a no-op or logging closure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn download_file_inner(
+    endpoint: &Endpoint,
+    peer_addr_json: &str,
+    expected_peer_hb_id: &str,
+    slug: &str,
+    path: &str,
+    save_path: &str,
+    expected_sha256: Option<String>,
+    download_id: u64,
+    registry: SharedDownloadRegistry,
+    on_progress: impl Fn(DownloadProgressEvent),
+) -> Result<u64> {
     let filename = Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -383,7 +423,7 @@ pub async fn download_file(
     let mut cancel_rx = registry.register(download_id).await;
 
     let emit_progress = |bytes_done: u64, bytes_total: u64, bps: u64, status: DownloadStatus, error: Option<String>| {
-        let _ = app.emit("download:progress", DownloadProgressEvent {
+        on_progress(DownloadProgressEvent {
             id: download_id,
             filename: filename.clone(),
             bytes_done,

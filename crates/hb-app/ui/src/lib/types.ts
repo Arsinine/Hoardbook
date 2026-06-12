@@ -3,6 +3,8 @@
 export interface IdentityInfo {
 	hb_id: string;
 	hb_id_short: string;
+	/** "os-encrypted" (Windows DPAPI) or "plain-file" (Linux/macOS 0600 file). */
+	key_storage: 'os-encrypted' | 'plain-file';
 }
 
 export interface SocialLink {
