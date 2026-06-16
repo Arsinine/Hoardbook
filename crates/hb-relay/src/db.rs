@@ -155,6 +155,69 @@ pub async fn insert_message(
     Ok(())
 }
 
+/// Outcome of [`insert_message_capped`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum InsertOutcome {
+    Inserted,
+    /// Same `(from_key, sent_at)` already stored — silently deduplicated (B4).
+    Duplicate,
+    /// One of the three caps (recipient / pair / sender) would be exceeded.
+    CapExceeded,
+}
+
+/// Atomic check-and-insert enforcing all three mailbox caps in one statement
+/// (A6b fix). The publish handler's separate count+insert was a TOCTOU window: a
+/// concurrent burst at the cap boundary could overshoot it. SQLite serializes
+/// writers, so evaluating the cap subqueries inside the INSERT itself closes the race.
+pub async fn insert_message_capped(
+    pool: &SqlitePool,
+    from_key: &str,
+    to_key: &str,
+    sent_at: &str,
+    envelope_json: &str,
+) -> Result<InsertOutcome> {
+    let now = now_secs();
+    let expires = expiry_secs();
+
+    let result = sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO messages (from_key, to_key, envelope, sent_at, stored_at, expires_at)
+        SELECT ?1, ?2, ?3, ?4, ?5, ?6
+        WHERE (SELECT COUNT(*) FROM messages WHERE to_key = ?2 AND expires_at > ?5) < ?7
+          AND (SELECT COUNT(*) FROM messages WHERE from_key = ?1 AND to_key = ?2 AND expires_at > ?5) < ?8
+          AND (SELECT COUNT(*) FROM messages WHERE from_key = ?1 AND expires_at > ?5) < ?9
+        "#,
+    )
+    .bind(from_key)        // ?1
+    .bind(to_key)          // ?2
+    .bind(envelope_json)   // ?3
+    .bind(sent_at)         // ?4
+    .bind(now)             // ?5 — stored_at, reused as "now" in the cap subqueries
+    .bind(expires)         // ?6
+    .bind(MAX_MESSAGES_PER_RECIPIENT) // ?7
+    .bind(MAX_MESSAGES_PER_PAIR)      // ?8
+    .bind(MAX_MESSAGES_PER_SENDER)    // ?9
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() == 1 {
+        return Ok(InsertOutcome::Inserted);
+    }
+    // 0 rows: either the UNIQUE(from_key, sent_at) dedup fired (OR IGNORE) or a cap held.
+    let (exists,): (i64,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM messages WHERE from_key = ? AND sent_at = ?)",
+    )
+    .bind(from_key)
+    .bind(sent_at)
+    .fetch_one(pool)
+    .await?;
+    if exists == 1 {
+        Ok(InsertOutcome::Duplicate)
+    } else {
+        Ok(InsertOutcome::CapExceeded)
+    }
+}
+
 /// Counts non-expired messages addressed to `to_key`.
 pub async fn count_messages_for(pool: &SqlitePool, to_key: &str) -> Result<i64> {
     let now = now_secs();
@@ -432,6 +495,72 @@ mod tests {
     #[tokio::test]
     async fn mailbox_cap_constant_matches_handler_expectation() {
         assert_eq!(MAX_MESSAGES_PER_RECIPIENT, 500);
+    }
+
+    /// A6b regression: a concurrent burst at the per-pair cap boundary must not
+    /// overshoot it. Uses a file-backed DB — with `sqlite::memory:` every pooled
+    /// connection gets its own database, which would void the assertion.
+    #[tokio::test]
+    async fn concurrent_inserts_respect_pair_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("a6b.db");
+        let pool = connect(&format!("sqlite://{}", db_path.display())).await.unwrap();
+        migrate(&pool).await.unwrap();
+
+        // 45 sequential messages (per-pair cap is 50) — mirrors the A6a setup.
+        for i in 0..45 {
+            insert_message(&pool, "alice", "bob", &format!("2026-06-12T00:00:{i:02}.000Z"), "env")
+                .await
+                .unwrap();
+        }
+
+        // 10 concurrent inserts racing at the boundary: exactly 5 may land.
+        let mut handles = tokio::task::JoinSet::new();
+        for i in 0..10 {
+            let pool = pool.clone();
+            handles.spawn(async move {
+                insert_message_capped(
+                    &pool,
+                    "alice",
+                    "bob",
+                    &format!("2026-06-12T00:01:{i:02}.000Z"),
+                    "env",
+                )
+                .await
+                .unwrap()
+            });
+        }
+        let mut inserted = 0;
+        let mut capped = 0;
+        while let Some(res) = handles.join_next().await {
+            match res.unwrap() {
+                InsertOutcome::Inserted => inserted += 1,
+                InsertOutcome::CapExceeded => capped += 1,
+                InsertOutcome::Duplicate => panic!("unexpected duplicate"),
+            }
+        }
+        assert_eq!(inserted, 5, "exactly 5 inserts may reach the cap of 50");
+        assert_eq!(capped, 5, "the rest must be rejected by the atomic cap check");
+        assert_eq!(
+            count_messages_from_to(&pool, "alice", "bob").await.unwrap(),
+            MAX_MESSAGES_PER_PAIR,
+            "stored total must equal the cap exactly"
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_insert_duplicate_detected() {
+        let pool = in_memory_pool().await;
+        let first = insert_message_capped(&pool, "a", "b", "2026-06-12T00:00:00Z", "env_v1")
+            .await
+            .unwrap();
+        assert_eq!(first, InsertOutcome::Inserted);
+        let second = insert_message_capped(&pool, "a", "b", "2026-06-12T00:00:00Z", "env_v2")
+            .await
+            .unwrap();
+        assert_eq!(second, InsertOutcome::Duplicate, "same (from, sent_at) must dedup, not cap");
+        let msgs = get_messages_for(&pool, "b").await.unwrap();
+        assert_eq!(msgs, ["env_v1"], "first write wins");
     }
 
     #[tokio::test]

@@ -15,7 +15,8 @@ use crate::{
 /// L12: associated data that binds a message ciphertext to its routing and
 /// timestamp. Built only from unencrypted fields, so the recipient can
 /// reconstruct it before decrypting. Must be byte-identical on encrypt and decrypt.
-fn message_aad(from: &str, to: &str, sent_at_rfc3339: &str) -> Vec<u8> {
+/// pub(crate) so the hb-p2p-it harness drives the same encrypt/decrypt binding.
+pub(crate) fn message_aad(from: &str, to: &str, sent_at_rfc3339: &str) -> Vec<u8> {
     hb_core::jcs::canonicalize(&serde_json::json!({
         "from": from,
         "to": to,
@@ -45,6 +46,7 @@ pub async fn send_message(
     identity: State<'_, SharedIdentity>,
     relay: State<'_, SharedRelay>,
     endpoint: State<'_, SharedEndpoint>,
+    peer_cache: State<'_, crate::SharedPeerCache>,
 ) -> CmdResult<ReceivedMessage> {
     let recipient_pubkey = to.pubkey();
 
@@ -72,7 +74,8 @@ pub async fn send_message(
     drop(guard);
 
     // Try iroh-direct first; fall back to relay on any failure.
-    let delivered_direct = try_send_via_iroh(&relay, &endpoint, &to, &envelope).await;
+    let delivered_direct =
+        try_send_via_iroh(&relay, &endpoint, &to, &envelope, &peer_cache).await;
 
     if !delivered_direct {
         relay.publish("message", &envelope).await.map_err(cmd_err)?;
@@ -94,12 +97,28 @@ async fn try_send_via_iroh(
     endpoint_state: &tokio::sync::RwLock<Option<iroh::Endpoint>>,
     to: &str,
     envelope: &SignedEnvelope,
+    peer_cache: &crate::SharedPeerCache,
 ) -> bool {
-    let peer = match relay.fetch_peer(to).await {
-        Ok(p) => p,
-        Err(e) => { tracing::debug!("relay lookup for iroh-DM failed: {e}"); return false; }
-    };
-    let Some(addr) = peer.node_addr.filter(|_| peer.online) else { return false; };
+    // Address candidates: relay-reported (when online) first, then the PEX cache.
+    let mut candidates: Vec<String> = vec![];
+    match relay.fetch_peer(to).await {
+        Ok(peer) => {
+            if let Some(addr) = peer.node_addr.filter(|_| peer.online) {
+                candidates.push(addr);
+            }
+        }
+        Err(e) => tracing::debug!("relay lookup for iroh-DM failed: {e}"),
+    }
+    if let Some(entry) = peer_cache.lock().await.get(to) {
+        if let Some(addr) = &entry.node_addr {
+            if !candidates.contains(addr) {
+                candidates.push(addr.clone());
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return false;
+    }
 
     let ep_guard = endpoint_state.read().await;
     let Some(ref ep) = *ep_guard else {
@@ -107,10 +126,16 @@ async fn try_send_via_iroh(
         return false;
     };
 
-    match node::send_dm_via_iroh(ep, &addr, envelope).await {
-        Ok(()) => { tracing::debug!("DM delivered directly via iroh to {to}"); true }
-        Err(e) => { tracing::warn!("iroh-direct DM to {to} failed ({e}), falling back to relay"); false }
+    for addr in candidates {
+        match node::send_dm_via_iroh(ep, &addr, envelope, Some(peer_cache.clone())).await {
+            Ok(()) => {
+                tracing::debug!("DM delivered directly via iroh to {to}");
+                return true;
+            }
+            Err(e) => tracing::warn!("iroh-direct DM to {to} failed ({e}), trying next route"),
+        }
     }
+    false
 }
 
 /// Fetch and decrypt the unified DM inbox: direct iroh queue + relay poll.

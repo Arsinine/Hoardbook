@@ -152,22 +152,33 @@ fn decode_envelope<T: for<'de> serde::Deserialize<'de>>(
 /// Connect to a remote iroh node and fetch their profile + collections.
 ///
 /// `node_addr_str` is the JSON-serialised `iroh::EndpointAddr` stored by the relay
-/// (produced by `serde_json::to_string(&endpoint.addr())`). Invalid or tampered
-/// envelopes are silently discarded with a warning log. Returns `Err` only on
+/// (produced by `serde_json::to_string(&endpoint.addr())`). The addr's embedded id is
+/// verified against `expected_hb_id` before connecting (H2 — same check as downloads),
+/// so a lying relay or poisoned PEX entry cannot redirect the browse. Invalid or
+/// tampered envelopes are silently discarded with a warning log. Returns `Err` only on
 /// connection / IO failure.
+///
+/// If `pex` is given, a background peer-address gossip exchange runs on the same
+/// connection after the fetch completes (never delaying it) — spec Resolved Decision 9.
 pub async fn fetch_profile_via_iroh(
     endpoint: &iroh::Endpoint,
     node_addr_str: &str,
     expected_hb_id: &str,
+    pex: Option<crate::pex::SharedPeerCache>,
 ) -> Result<(Option<Profile>, Vec<Collection>)> {
     let peer_addr: iroh::EndpointAddr =
         serde_json::from_str(node_addr_str).context("parse peer EndpointAddr")?;
+    crate::transfer::verify_peer_identity(&peer_addr, expected_hb_id)?;
     let conn = endpoint
         .connect(peer_addr, NODE_ALPN)
         .await
         .context("iroh connect")?;
     let (send, recv) = conn.open_bi().await.context("open_bi")?;
-    fetch_profile_via_stream(send, recv, expected_hb_id).await
+    let result = fetch_profile_via_stream(send, recv, expected_hb_id).await;
+    if let Some(cache) = pex {
+        crate::pex::spawn_client_pex(conn, endpoint.clone(), cache);
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -208,10 +219,14 @@ pub(crate) async fn send_dm_via_stream(
 
 /// Connect to a remote iroh node and deliver a DM envelope directly.
 /// Returns `Err` on connection/IO failure or if the remote node rejected the message.
+///
+/// If `pex` is given, a background peer-address gossip exchange runs on the same
+/// connection after delivery (never delaying it) — spec Resolved Decision 9.
 pub async fn send_dm_via_iroh(
     endpoint: &iroh::Endpoint,
     node_addr_str: &str,
     envelope: &SignedEnvelope,
+    pex: Option<crate::pex::SharedPeerCache>,
 ) -> Result<()> {
     let peer_addr: iroh::EndpointAddr =
         serde_json::from_str(node_addr_str).context("parse peer EndpointAddr")?;
@@ -220,7 +235,11 @@ pub async fn send_dm_via_iroh(
         .await
         .context("iroh connect")?;
     let (send, recv) = conn.open_bi().await.context("open_bi")?;
-    send_dm_via_stream(send, recv, envelope).await
+    let result = send_dm_via_stream(send, recv, envelope).await;
+    if let Some(cache) = pex {
+        crate::pex::spawn_client_pex(conn, endpoint.clone(), cache);
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -280,29 +299,55 @@ pub(crate) async fn handle_node_stream(
     Ok(())
 }
 
+/// Tauri-free core of [`handle_node_connection`]: primary bi-stream → unread-DM hook →
+/// optional PEX gossip stream → graceful connection drain. The full wrapper only adds
+/// the desktop notification closure; the `hb-p2p-it` harness and the conn-close race
+/// tests drive this exact path with a no-op hook, so the drain is covered by tests.
+pub(crate) async fn handle_node_connection_core(
+    conn: &iroh::endpoint::Connection,
+    store: &DataStore,
+    own_hb_id: &str,
+    dm_queue: &SharedDmQueue,
+    pex: Option<&crate::pex::PexState>,
+    on_dms_received: impl FnOnce(usize),
+) -> Result<()> {
+    let len_before = dm_queue.lock().await.len();
+    let res = match conn.accept_bi().await.context("accept_bi") {
+        Ok((send, recv)) => handle_node_stream(send, recv, store, own_hb_id, dm_queue).await,
+        Err(e) => Err(e),
+    };
+    // Notify before the PEX wait + drain so a lingering client never delays it.
+    let len_after = dm_queue.lock().await.len();
+    if len_after > len_before {
+        on_dms_received(len_after);
+    }
+    if let Some(pex_state) = pex {
+        crate::pex::serve_pex_on_conn(conn, &pex_state.endpoint, &pex_state.cache).await;
+    }
+    crate::conn::drain_connection(conn).await;
+    res
+}
+
 pub async fn handle_node_connection(
     conn: iroh::endpoint::Connection,
     store: DataStore,
     own_hb_id: &str,
     dm_queue: SharedDmQueue,
+    pex: Option<crate::pex::PexState>,
     app: tauri::AppHandle,
 ) -> Result<()> {
-    let len_before = dm_queue.lock().await.len();
-    let (send, recv) = conn.accept_bi().await.context("accept_bi")?;
-    handle_node_stream(send, recv, &store, own_hb_id, &dm_queue).await?;
-    let len_after = dm_queue.lock().await.len();
-    if len_after > len_before {
-        let _ = app.emit("dm-received", len_after);
+    handle_node_connection_core(&conn, &store, own_hb_id, &dm_queue, pex.as_ref(), |unread| {
+        let _ = app.emit("dm-received", unread);
         if let Some(tray) = app.tray_by_id("hb_tray") {
-            let tip = if len_after == 1 {
+            let tip = if unread == 1 {
                 "Hoardbook — 1 unread message".to_string()
             } else {
-                format!("Hoardbook — {len_after} unread messages")
+                format!("Hoardbook — {unread} unread messages")
             };
             let _ = tray.set_tooltip(Some(&tip));
         }
-    }
-    Ok(())
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
