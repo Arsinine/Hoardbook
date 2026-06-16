@@ -7,12 +7,15 @@ edition = "2021"
 name = "hb-it"
 path = "src/main.rs"
 
+# M2 — the L2 integration runner, rewritten from the retired custom-HTTP hb-relay client into a
+# headless Nostr client. Drives hb-net's RelayClient against a real ephemeral relay (strfry),
+# covering Suites N / DM / DISC / ID + the L2 Suite AB rows. TAP 13 to stdout; exit 0/1.
+
 [dependencies]
 hb-core    = { path = "../hb-core" }
-serde      = { workspace = true }
-serde_json = { workspace = true }
-chrono     = { workspace = true }
+hb-net     = { path = "../hb-net" }
+nostr-sdk  = { workspace = true }
+nostr      = { version = "=0.43.1", features = ["nip44", "nip59"] }
 tokio      = { workspace = true }
 anyhow     = { workspace = true }
-reqwest    = { version = "0.12", features = ["json"] }
-sha1       = "0.10"
+serde_json = { workspace = true }
