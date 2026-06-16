@@ -8,11 +8,15 @@ pub async fn run(cfg: &Config) -> Vec<TestResult> {
     out.push(a2_cross_relay_isolation(cfg).await);
     out.extend(a3_timestamp_freshness(cfg).await);
     out.push(a4_concurrent_heartbeats(cfg).await);
-    out.push(a5_rate_limiting(cfg).await);
     if cfg.slow {
+        // A5 needs the relay's rate cap small enough to exceed in a short burst. The --slow
+        // run raises RATE_LIMIT_MAX to 10000, so A5 would have to fire 10005 requests — skip
+        // it here; the fast pass (cap 30) covers rate limiting.
+        out.push(TestResult::skip("A5: rate limiting enforced", "fast-run only (relay cap raised for --slow)"));
         out.extend(a6_mailbox_race(cfg).await);
         out.push(a7_per_sender_cap(cfg).await);
     } else {
+        out.push(a5_rate_limiting(cfg).await);
         out.push(TestResult::skip("A6: mailbox fill race", "requires --slow (RATE_LIMIT_MAX=10000 on relays)"));
         out.push(TestResult::skip("A7: per-sender cap cross-relay", "requires --slow (RATE_LIMIT_MAX=10000 on relays)"));
     }
@@ -228,6 +232,11 @@ async fn a5_rate_limiting(cfg: &Config) -> TestResult {
             format!("{successes} requests succeeded, but cap is {} — rate limiter not enforcing", cfg.rate_limit_max),
         );
     }
+    // This test intentionally saturated relay-jp's per-IP rate window. The relay rate-limits
+    // ALL endpoints per IP (publish/heartbeat/messages/peer) and returns 400 on exceed, so
+    // later relay-jp tests from this same IP (B2, D4) would otherwise be collaterally
+    // throttled. Wait for the 60s window to drain so the suite stays isolated.
+    tokio::time::sleep(std::time::Duration::from_secs(61)).await;
     TestResult::ok(name)
 }
 

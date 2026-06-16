@@ -1,10 +1,30 @@
 # Hoardbook
 
-A peer-to-peer social phonebook for data hoarders. Publish a signed snapshot of your collection, find others with similar interests, and connect directly — no accounts, no central server that owns your data.
+A peer-to-peer phonebook for data hoarders — the directory layer of the Qurator family. Publish a signed snapshot of your collection, let likeminded people find and verify you, and connect directly. No accounts, and no central server that owns your data.
 
-> **Status: v0.3.x — core functionality working. Windows and Linux builds available.**
+> **Shipped build: v0.4.x** — core functionality working, Windows + Linux. The "Current build" sections below describe what runs **today**.
+>
+> **⚠️ Direction: a major v0.9 "Nostr pivot" is specced and in progress.** Identity moves to a Nostr `npub`, signaling/discovery/DMs move to the public Nostr relay network, and collection listings become encrypted events. **The shipped build still uses the prior design.** Target architecture and migration plan: [`HOARDBOOK_SPEC.md`](HOARDBOOK_SPEC.md) v0.9.
 
 ---
+
+## The v0.9 Nostr pivot (where this is heading)
+
+Hoardbook is migrating from a self-run relay + mainline-DHT + Ed25519 design to a Nostr-native one:
+
+- **Identity → Nostr `npub` (secp256k1).** One identity across Hoardbook, Qurator, and the wider Nostr network. Ed25519 survives only as the bound iroh file-transfer key.
+- **Nostr relays replace the self-run relay *and* the DHT** for discovery, presence, peer-address, and DMs (NIP-17 gift-wrapped). NAT-immune; no bespoke relay to fund or maintain (we seed one off-the-shelf relay for liquidity, not as a dependency).
+- **Listings are encrypted on relays.** Your file tree is a NIP-44-encrypted event readable only by holders of your **share code** (`npub` + browse-key). Browsing is a relay read + decrypt, so **browsing no longer exposes your IP** — only an opt-in direct file transfer does. You also stay browsable while offline.
+- **iroh shrinks to a file-transfer-only data plane.**
+- **Hoardbook is the phonebook to Qurator's "club"** — standalone-capable, but companion-shaped.
+
+This removes the single self-funded relay (a SPOF and privacy chokepoint), makes discovery NAT-immune, and makes browsing IP-private — structurally fixing the worst findings of the prior architecture review. Full rationale, threat model, and migration plan are in the spec.
+
+---
+
+## Current build (v0.4.x — pre-pivot)
+
+> Everything from here down describes the **shipped** build, which predates the v0.9 pivot above.
 
 ## What it does
 
@@ -16,7 +36,7 @@ Profile and collection data is served **peer-to-peer via iroh QUIC** — not cac
 
 ## Features
 
-- **Identity** — Ed25519 keypairs. Your ID is a ~52-character `hb1_…` string derived from your public key with a checksum. No email, no username, no phone number.
+- **Identity** — Ed25519 keypairs. Your ID is a ~53-character `hb1_…` string derived from your public key with a checksum. No email, no username, no phone number.
 - **Collections** — Publish a signed directory tree with metadata: item counts, estimated size, content tags, format info, per-item notes. Contacts get a two-pane file browser.
 - **Profile** — Display name, bio, region, contact email, social links (Reddit, Discord, Matrix, Bluesky, GitHub, etc.), languages, and hoarding stats.
 - **Direct P2P** — Profile and collection data is fetched directly over iroh (QUIC/NAT traversal). No relay round-trip for browsing.
@@ -33,13 +53,13 @@ Profile and collection data is served **peer-to-peer via iroh QUIC** — not cac
 
 ## Privacy model
 
-**Relay-only is the default privacy stance.** Your IP address is never exposed to peers unless you opt in to direct iroh connections (the app warns once before enabling this).
+**Browsing is direct peer-to-peer, and direct P2P exposes your IP address.** When you browse a peer, your app opens a direct iroh (QUIC) connection to them, so they see your IP and you see theirs — the same as any P2P app, including BitTorrent. **There is no relay-only / IP-hiding mode**; the relay holds no listings, so there is nothing for it to proxy. The app shows a one-time notice at first run making this explicit. (An opt-in iroh relay-only transport — trading speed and trusting the relay operator in exchange for not revealing your IP to peers — is a possible future option, not a current feature.)
 
-In relay-only mode, peers see your `node_addr` only if you have heartbeated recently — and only via the relay's `/v1/peer/:pubkey` response. The relay operator sees DM metadata (sender, recipient, timing) and stores encrypted ciphertext; it cannot read content.
+The relay operator sees DM metadata (sender, recipient, timing) and stores encrypted ciphertext it cannot read, plus your `node_addr` and IP when you heartbeat. The relay never receives your profile or collections.
 
-All signed documents are verified before the relay stores or forwards them. The relay cannot forge anything — every envelope is Ed25519-signed by the originating keypair.
+All signed documents are verified before the relay forwards a DM. The relay cannot forge anything — every envelope is Ed25519-signed by the originating keypair.
 
-Your data is stored as local signed JSON files (`profile.signed.json`, `<slug>.signed.json`, `keypair.bin`). Nothing lives in a central database.
+Your data is stored as local signed JSON files (`profile.signed.json`, `<slug>.signed.json`, `keypair.bin`) under `~/.hoardbook`. Nothing lives in a central database. Back up the whole directory, not just the key: there is no account recovery — a lost key is a lost identity, and you re-establish yourself by posting a new key under the same contact handle.
 
 ---
 
@@ -190,11 +210,19 @@ In the app, go to **Settings → Relays**, paste your relay URL (must be `https:
 
 ## Roadmap
 
-- [ ] Docker image for relay self-hosting
+**v0.9 — Nostr pivot (in progress; see [`HOARDBOOK_SPEC.md`](HOARDBOOK_SPEC.md)):**
+- [ ] secp256k1 `npub` identity + bound Ed25519 iroh node key (`npub`→node binding; reworked H2/H17)
+- [ ] Nostr relays for discovery / presence / DMs (NIP-17, NIP-44, NIP-65); retire `hb-relay`, mainline DHT, UPnP/NAT-PMP, PEX
+- [ ] Encrypted collection listings under a browse-key; share codes; IP-private (relay-mediated) browsing; offline browse
+- [ ] Seed one off-the-shelf Hoardbook Nostr relay (strfry); NIP-13 PoW support
+- [ ] Portable passphrase-encrypted whole-directory backup (DPAPI isn't portable)
+
+**Beyond the pivot:**
 - [ ] macOS support
-- [ ] Relay peering / community relay network
-- [ ] Passphrase-protected keystore (Linux hardening)
+- [ ] Private collections (per-trusted-`npub` encrypted)
+- [ ] OS-keyring keystore (Linux/macOS hardening)
 - [ ] Static HTML collection export
+- [ ] Qurator integration panel (shared `npub`)
 
 ---
 

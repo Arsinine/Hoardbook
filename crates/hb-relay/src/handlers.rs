@@ -83,6 +83,9 @@ pub async fn publish(
     let pubkey = &envelope.public_key;
 
     // M6: stop one sender monopolizing a recipient, or flooding many recipients.
+    // These pre-checks exist for the specific error messages; the atomic insert
+    // below is the authoritative enforcement (A6b — the separate count+insert was
+    // a TOCTOU window that concurrent bursts slipped through).
     if db::count_messages_from_to(&state.pool, pubkey, &msg.to).await? >= db::MAX_MESSAGES_PER_PAIR {
         return Err(AppError::BadRequest(
             "too many undelivered messages to this recipient".into(),
@@ -94,10 +97,15 @@ pub async fn publish(
     let envelope_json = serde_json::to_string(&envelope)
         .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
 
-    db::insert_message(&state.pool, pubkey, &msg.to, &msg.sent_at.to_rfc3339(), &envelope_json)
-        .await?;
-
-    Ok(StatusCode::OK)
+    match db::insert_message_capped(&state.pool, pubkey, &msg.to, &msg.sent_at.to_rfc3339(), &envelope_json)
+        .await?
+    {
+        // Duplicate (from, sent_at) stays a silent 200 — same dedup contract as B4.
+        db::InsertOutcome::Inserted | db::InsertOutcome::Duplicate => Ok(StatusCode::OK),
+        db::InsertOutcome::CapExceeded => Err(AppError::BadRequest(
+            "recipient mailbox full".into(),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
