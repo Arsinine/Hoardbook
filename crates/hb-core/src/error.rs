@@ -31,4 +31,29 @@ pub enum HbError {
 
     #[error("invalid encrypted message format")]
     InvalidEncryptedMessage,
+
+    // --- v0.9 Nostr core (M1) ---
+    #[error("nostr error: {0}")]
+    Nostr(String),
+
+    #[error("bech32 error: {0}")]
+    Bech32(String),
+
+    #[error("invalid share code: {0}")]
+    InvalidShareCode(String),
+
+    #[error("unsupported version byte: {0}")]
+    UnsupportedVersion(u8),
+
+    #[error("invalid event: {0}")]
+    InvalidEvent(String),
+
+    #[error("binding signed by unexpected identity")]
+    WrongSigner,
+
+    #[error("binding token expired")]
+    BindingExpired,
+
+    #[error("binding token not yet valid")]
+    BindingNotYetValid,
 }

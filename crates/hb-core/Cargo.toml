@@ -10,6 +10,12 @@ thiserror  = { workspace = true }
 chrono     = { workspace = true }
 hex        = { workspace = true }
 
+# --- v0.9 Nostr core (M1). Pinned to the M0-verified surface (=0.43.1) so a silent
+#     minor bump can't break the interop suite. bech32 0.11 = the `Hrp`/encode/decode API. ---
+nostr             = { version = "=0.43.1", features = ["nip44"] }
+bech32            = "0.11"
+
+# --- legacy v0.4.3 core (still used by hb-app/hb-relay/hb-it until M4 deletes them) ---
 ed25519-dalek     = { version = "2", features = ["rand_core"] }
 rand              = "0.8"
 sha2              = "0.10"
