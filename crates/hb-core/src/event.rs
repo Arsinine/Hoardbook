@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::HbError;
 use crate::identity::{verify_event, Identity};
 use crate::listing::{decrypt_listing, encrypt_listing, BrowseKey};
+use crate::tag_util::{tag_u8, tag_val, TagU8};
 use crate::version::{check_schema, CRYPTO_V, SCHEMA_V};
 
 /// Public teaser kind — parameterized-replaceable (30xxx).
@@ -97,19 +98,23 @@ pub fn parse_listing_event(
         .identifier()
         .ok_or_else(|| HbError::InvalidEvent("listing event missing d=slug".into()))?
         .to_string();
-    let crypto_v = tag_val(event, TAG_CRYPTO)
+    // Schema version: the content is ciphertext, so the signed `hb-v` tag is authoritative —
+    // validate it (a future version is refused, not silently mis-read).
+    let schema = tag_val(event, TAG_SCHEMA)
         .and_then(|s| s.parse::<u8>().ok())
-        .ok_or_else(|| HbError::InvalidEvent("listing event missing crypto version".into()))?;
+        .ok_or_else(|| HbError::InvalidEvent("listing event missing or malformed schema version".into()))?;
+    check_schema(schema)?;
+    let crypto_v = match tag_u8(event, TAG_CRYPTO) {
+        TagU8::Value(v) => v,
+        TagU8::Missing => {
+            return Err(HbError::InvalidEvent("listing event missing crypto version tag".into()))
+        }
+        TagU8::Malformed(s) => {
+            return Err(HbError::InvalidEvent(format!("listing event malformed crypto version: {s}")))
+        }
+    };
     let json = decrypt_listing(browse_key, crypto_v, &event.content)?;
     Ok((slug, json))
-}
-
-fn tag_val(event: &Event, name: &str) -> Option<String> {
-    event
-        .tags
-        .find(TagKind::custom(name))
-        .and_then(|t| t.content())
-        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -204,6 +209,44 @@ mod tests {
         let other: BrowseKey = rand::random();
         let ev = build_listing_event(&id, "x", &bk, "{}").unwrap();
         assert!(parse_listing_event(&ev, &other).is_err());
+    }
+
+    #[test]
+    fn listing_rejects_unknown_schema_v() {
+        // A listing event whose signed hb-v tag claims a future version is refused on parse,
+        // not silently accepted (the forward-compat contract the other parsers uphold).
+        let id = Identity::generate();
+        let bk: BrowseKey = rand::random();
+        let content = encrypt_listing(&bk, "{}").unwrap();
+        let ev = id
+            .sign(EventBuilder::new(Kind::from_u16(KIND_LISTING), content).tags([
+                Tag::identifier("x"),
+                Tag::custom(TagKind::custom(TAG_SCHEMA), [(SCHEMA_V + 1).to_string()]),
+                Tag::custom(TagKind::custom(TAG_CRYPTO), [CRYPTO_V.to_string()]),
+            ]))
+            .unwrap();
+        assert!(matches!(
+            parse_listing_event(&ev, &bk),
+            Err(HbError::UnsupportedVersion(v)) if v == SCHEMA_V + 1
+        ));
+    }
+
+    #[test]
+    fn listing_malformed_crypto_version_distinguished() {
+        let id = Identity::generate();
+        let bk: BrowseKey = rand::random();
+        let content = encrypt_listing(&bk, "{}").unwrap();
+        let ev = id
+            .sign(EventBuilder::new(Kind::from_u16(KIND_LISTING), content).tags([
+                Tag::identifier("x"),
+                Tag::custom(TagKind::custom(TAG_SCHEMA), [SCHEMA_V.to_string()]),
+                Tag::custom(TagKind::custom(TAG_CRYPTO), ["256".to_string()]),
+            ]))
+            .unwrap();
+        match parse_listing_event(&ev, &bk) {
+            Err(HbError::InvalidEvent(m)) => assert!(m.contains("malformed"), "got: {m}"),
+            other => panic!("expected malformed crypto version, got {other:?}"),
+        }
     }
 
     #[test]
