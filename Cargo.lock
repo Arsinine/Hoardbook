@@ -2426,12 +2426,11 @@ name = "hb-it"
 version = "0.4.3"
 dependencies = [
  "anyhow",
- "chrono",
  "hb-core",
- "reqwest 0.12.28",
- "serde",
+ "hb-net",
+ "nostr",
+ "nostr-sdk",
  "serde_json",
- "sha1",
  "tokio",
 ]
 
@@ -2448,6 +2447,18 @@ dependencies = [
  "rand 0.8.5",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
+]
+
+[[package]]
+name = "hb-net"
+version = "0.4.3"
+dependencies = [
+ "hb-core",
+ "nostr",
+ "nostr-sdk",
+ "serde_json",
+ "thiserror 1.0.69",
  "tokio",
 ]
 

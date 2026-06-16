@@ -63,6 +63,51 @@ jobs:
         continue-on-error: true
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # L2 — the appraisal-requested "integration in CI" leg, now possible because Nostr relays are
+  # off-the-shelf and ephemeral. Spins TWO strfry relays (so the multi-relay cases DM4/ID4/AB8
+  # actually run) using the vendored crates/hb-it/strfry.conf, then drives hb-net's client via
+  # hb-it. Ubuntu-only (the relay is Linux/Docker); needs no frontend (hb-it doesn't touch hb-app).
+  integration:
+    name: integration (L2 — ephemeral Nostr relay)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # GitHub `services:` containers start before checkout, so the vendored strfry.conf can't be
+      # volume-mounted into one — start strfry in a run: step after checkout instead (M2 brief §6).
+      - name: Start two ephemeral strfry relays
+        run: |
+          docker run -d --name relay1 -p 7777:7777 \
+            -v "$PWD/crates/hb-it/strfry.conf:/etc/strfry.conf:ro" \
+            -v strfrydb1:/app/strfry-db dockurr/strfry
+          docker run -d --name relay2 -p 7778:7777 \
+            -v "$PWD/crates/hb-it/strfry.conf:/etc/strfry.conf:ro" \
+            -v strfrydb2:/app/strfry-db dockurr/strfry
+
+      - name: Wait for the relays to accept connections
+        run: |
+          for port in 7777 7778; do
+            for i in $(seq 1 30); do
+              if (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null; then
+                echo "relay on $port is up"; break
+              fi
+              if [ "$i" -eq 30 ]; then echo "relay on $port never came up"; exit 1; fi
+              sleep 1
+            done
+          done
+          sleep 2
+
+      - name: Run the L2 integration suite (hb-it)
+        run: cargo run -p hb-it --locked -- --relay ws://127.0.0.1:7777 --relay ws://127.0.0.1:7778 --pow 8
+
+      - name: Relay logs (on failure)
+        if: failure()
+        run: docker logs relay1 && docker logs relay2
+
   frontend:
     name: frontend checks (svelte-check + vitest)
     runs-on: ubuntu-latest
