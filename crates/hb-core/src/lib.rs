@@ -15,6 +15,7 @@ pub mod event;
 pub mod identity;
 pub mod listing;
 pub mod sharecode;
+mod tag_util;
 pub mod version;
 
 pub use crypto::{HbId, HoardbookKeypair, hb_id_decode, hb_id_encode};

@@ -149,4 +149,28 @@ mod tests {
 
         assert_eq!(event.id.to_hex(), expected, "NIP-01 id must match the canonical SHA-256");
     }
+
+    #[test]
+    fn nip01_id_matches_known_vector_with_tags() {
+        // Same interop check, now with tags present, so the tag serialization is covered too
+        // (NIP-01 canonical form: [0, pubkey, created_at, kind, [["t","anime"],…], content]).
+        let id = Identity::generate();
+        let created_at = 1_700_000_000u64;
+        let kind = 30_117u16;
+        let content = "teaser";
+        let event = EventBuilder::new(Kind::from_u16(kind), content)
+            .tags([Tag::hashtag("anime"), Tag::identifier("hoardbook-teaser")])
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(id.keys())
+            .unwrap();
+
+        let pubkey_hex = id.public_key().to_hex();
+        let canonical = serde_json::to_string(&serde_json::json!([
+            0, pubkey_hex, created_at, kind, [["t", "anime"], ["d", "hoardbook-teaser"]], content
+        ]))
+        .unwrap();
+        let expected = hex::encode(Sha256::digest(canonical.as_bytes()));
+
+        assert_eq!(event.id.to_hex(), expected, "tagged NIP-01 id must match canonical SHA-256");
+    }
 }

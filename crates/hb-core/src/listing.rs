@@ -24,10 +24,15 @@ const HKDF_SALT: &[u8] = b"hoardbook/browse-key";
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 /// Derive the NIP-44 conversation key from the browse-key for a given crypto version.
+/// The HKDF `info` is a labelled, version-bearing context string (RFC 5869 domain
+/// separation, matching the labelled convention in `crypto.rs`), so each crypto version
+/// derives an independent key.
 fn conversation_key(browse_key: &BrowseKey, crypto_v: u8) -> ConversationKey {
+    let mut info = b"hoardbook/browse-key/v".to_vec();
+    info.push(crypto_v);
     let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), browse_key);
     let mut ck = [0u8; 32];
-    hk.expand(&[crypto_v], &mut ck)
+    hk.expand(&info, &mut ck)
         .expect("32 is a valid HKDF-SHA256 output length");
     ConversationKey::new(ck)
 }
