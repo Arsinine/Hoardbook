@@ -89,9 +89,29 @@ impl RelayClient {
         Ok(dedup_by_id(events))
     }
 
-    /// The configured relay set.
+    /// The relay set passed to `connect`. (Relays added later via `ensure_relays` are connected on
+    /// the underlying client but not recorded here — this getter reports the initial configured set.)
     pub fn relays(&self) -> &[String] {
         &self.relays
+    }
+
+    /// Ensure the client is connected to every relay in `relays`, adding + connecting any not in the
+    /// configured set. This is how the browse flow **acts on** NIP-65 resolution — connecting to a
+    /// peer's advertised outbox before fetching their events, so a peer who publishes only to their
+    /// own relays is still reachable. Best-effort and idempotent: a relay that fails to connect is
+    /// skipped (existing connections keep working); `add_relay` is a no-op for already-known relays.
+    pub async fn ensure_relays(&self, relays: &[String], timeout: Duration) -> Result<(), NetError> {
+        let mut added = false;
+        for r in relays {
+            if !self.relays.contains(r) && self.client.add_relay(r.as_str()).await.is_ok() {
+                added = true;
+            }
+        }
+        if added {
+            // Connect the newly-added relays; already-connected ones are unaffected.
+            let _ = self.client.try_connect(timeout).await;
+        }
+        Ok(())
     }
 
     /// Close all relay connections.
