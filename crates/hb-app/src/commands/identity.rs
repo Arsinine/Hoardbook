@@ -1,34 +1,40 @@
-use hb_core::{HoardbookKeypair, hb_id_decode, types::StoredKeypair};
+//! Identity commands on the v0.9 Nostr model: a secp256k1 `npub`, a bound iroh transport key, and
+//! the account browse-key (the `hbk` share code). Replaces the legacy Ed25519 keypair identity.
+
 use serde::Serialize;
 use tauri::State;
-use zeroize::Zeroize;
 
 use crate::{
-    SharedDmQueue, SharedDownloadRegistry, SharedEndpoint, SharedIdentity, SharedPeerCache,
-    SharedRelay,
+    identity_state::{AppIdentity, SharedIdentity},
     error::{CmdResult, cmd_err},
     store::DataStore,
+    SharedDownloadRegistry, SharedEndpoint,
 };
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IdentityInfo {
-    pub hb_id: String,
-    pub hb_id_short: String,
-    /// How the private key is protected at rest on this platform:
-    /// "os-encrypted" (Windows DPAPI) or "plain-file" (Linux/macOS 0600 file).
-    /// The frontend shows the L9 storage warning when this is "plain-file".
+    /// The bech32 `npub` — the identity everywhere.
+    pub npub: String,
+    pub npub_short: String,
+    /// The full `hbk…` share code (npub + account browse-key) — the "club pass" to hand out.
+    pub share_code: String,
+    /// How the private key is protected at rest: "os-encrypted" (Windows DPAPI) or "plain-file".
     pub key_storage: &'static str,
 }
 
-/// Spec (v0.7, Private key storage): Linux/macOS keep the key as a 0600 plaintext file
-/// until the Phase 2 keyring integration lands; the UI must say so explicitly.
+/// Spec: Linux/macOS keep the key as a 0600 plaintext file until the Phase-2 keyring lands; the
+/// UI shows the storage warning when this is "plain-file".
 const KEY_STORAGE: &str = if cfg!(target_os = "windows") { "os-encrypted" } else { "plain-file" };
 
 impl IdentityInfo {
-    fn from_keypair(kp: &HoardbookKeypair) -> Self {
-        let hb_id = kp.hb_id();
-        let hb_id_short = shorten(&hb_id);
-        Self { hb_id, hb_id_short, key_storage: KEY_STORAGE }
+    fn from_identity(id: &AppIdentity) -> anyhow::Result<Self> {
+        let npub = id.npub();
+        Ok(Self {
+            npub_short: shorten(&npub),
+            share_code: id.share_code()?,
+            npub,
+            key_storage: KEY_STORAGE,
+        })
     }
 }
 
@@ -39,66 +45,49 @@ fn shorten(id: &str) -> String {
     format!("{}…{}", &id[..8], &id[id.len() - 4..])
 }
 
-/// Generate a fresh keypair and persist it.
-/// Errors if a keypair already exists — identities are fixed in Phase 1 (key rotation is a
-/// Phase 2 item); the only way to replace an identity is Settings → Wipe data.
+/// Generate a fresh identity (npub + iroh key + account browse-key) and persist it.
+/// Errors if an identity already exists — identities are fixed in Phase 1 (the only way to replace
+/// one is Settings → Wipe data).
 #[tauri::command]
 pub async fn generate_keypair(
     app: tauri::AppHandle,
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
     endpoint: State<'_, SharedEndpoint>,
-    dm_queue: State<'_, SharedDmQueue>,
     registry: State<'_, SharedDownloadRegistry>,
-    peer_cache: State<'_, SharedPeerCache>,
 ) -> CmdResult<IdentityInfo> {
-    match store.load_keypair() {
-        Ok(Some(_)) => return Err("A keypair already exists. Wipe data first to generate a new identity.".into()),
-        Ok(None) => {} // no keypair on disk — proceed
+    match store.load_identity() {
+        Ok(Some(_)) => return Err("An identity already exists. Wipe data first to generate a new one.".into()),
+        Ok(None) => {}
         Err(e) => {
-            // The file exists but cannot be read/decrypted (e.g. DPAPI failure after a
-            // Windows credential change, or a corrupted file).  Don't propagate the raw
-            // crypto error; instead surface an actionable message.
-            if store.keypair_path().exists() {
+            if store.identity_path().exists() {
                 return Err(format!(
-                    "Existing keypair data cannot be read ({e}). \
+                    "Existing identity data cannot be read ({e}). \
                      Go to Settings → Wipe data to clear all local data and start over."
                 ));
             }
-            // File absent but read still failed — unexpected, propagate.
             return Err(cmd_err(e));
         }
     }
 
-    let kp = HoardbookKeypair::generate();
-    let stored = StoredKeypair {
-        version: 1,
-        hb_id: kp.hb_id(),
-        private_key_hex: hex::encode(kp.private_key_bytes()),
-    };
-
-    store.save_keypair(&stored).map_err(cmd_err)?;
-    let info = IdentityInfo::from_keypair(&kp);
+    let app_id = AppIdentity::generate();
+    let stored = app_id.to_stored().map_err(cmd_err)?;
+    store.save_identity(&stored).map_err(cmd_err)?;
+    let info = IdentityInfo::from_identity(&app_id).map_err(cmd_err)?;
+    let iroh_secret = app_id.iroh_secret;
 
     // iroh endpoint startup is non-fatal: identity is committed, endpoint retried on next launch.
     if let Err(e) = crate::start_iroh_endpoint(
-        kp.private_key_bytes(),
-        (*store).clone(),
-        (*endpoint).clone(),
-        (*dm_queue).clone(),
-        kp.hb_id(),
-        app,
-        (*registry).clone(),
-        (*peer_cache).clone(),
+        &iroh_secret, (*store).clone(), (*endpoint).clone(), app, (*registry).clone(),
     ).await {
-        tracing::warn!("iroh endpoint startup failed after keypair generate: {e}");
+        tracing::warn!("iroh endpoint startup failed after identity generate: {e}");
     }
 
-    *identity.write().await = Some(kp);
+    *identity.write().await = Some(app_id);
     Ok(info)
 }
 
-/// Import a keypair from a previously exported JSON file.
+/// Import an identity from a previously exported JSON file (a `StoredIdentity`).
 #[tauri::command]
 pub async fn import_keypair(
     app: tauri::AppHandle,
@@ -106,182 +95,129 @@ pub async fn import_keypair(
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
     endpoint: State<'_, SharedEndpoint>,
-    dm_queue: State<'_, SharedDmQueue>,
     registry: State<'_, SharedDownloadRegistry>,
-    peer_cache: State<'_, SharedPeerCache>,
 ) -> CmdResult<IdentityInfo> {
-    if store.load_keypair().map_err(cmd_err)?.is_some() {
-        return Err("A keypair already exists. Wipe data first to import a different keypair.".into());
+    if store.load_identity().map_err(cmd_err)?.is_some() {
+        return Err("An identity already exists. Wipe data first to import a different one.".into());
     }
 
     let json = std::fs::read_to_string(&path)
         .map_err(|e| format!("Could not read file: {e}"))?;
-    let stored: StoredKeypair = serde_json::from_str(&json)
-        .map_err(|e| format!("Invalid keypair file: {e}"))?;
+    let stored: crate::store::StoredIdentity = serde_json::from_str(&json)
+        .map_err(|e| format!("Invalid identity file: {e}"))?;
 
-    let mut private_bytes: [u8; 32] = hex::decode(&stored.private_key_hex)
-        .map_err(|e| format!("Invalid private key hex: {e}"))?
-        .try_into()
-        .map_err(|_| "Private key must be exactly 32 bytes".to_string())?;
+    let app_id = AppIdentity::from_stored(&stored)
+        .map_err(|e| format!("Identity file is corrupted: {e}"))?;
 
-    let kp = HoardbookKeypair::from_bytes(&private_bytes);
-    if kp.hb_id() != stored.hb_id {
-        private_bytes.zeroize();
-        return Err("Keypair file is corrupted: public key does not match the private key".into());
-    }
+    store.save_identity(&stored).map_err(cmd_err)?;
+    let info = IdentityInfo::from_identity(&app_id).map_err(cmd_err)?;
+    let iroh_secret = app_id.iroh_secret;
 
-    store.save_keypair(&stored).map_err(cmd_err)?;
-    let info = IdentityInfo::from_keypair(&kp);
-
-    // iroh endpoint startup is non-fatal: keypair is committed regardless.
     if let Err(e) = crate::start_iroh_endpoint(
-        &private_bytes,
-        (*store).clone(),
-        (*endpoint).clone(),
-        (*dm_queue).clone(),
-        kp.hb_id(),
-        app,
-        (*registry).clone(),
-        (*peer_cache).clone(),
+        &iroh_secret, (*store).clone(), (*endpoint).clone(), app, (*registry).clone(),
     ).await {
-        tracing::warn!("iroh endpoint startup failed after keypair import: {e}");
+        tracing::warn!("iroh endpoint startup failed after identity import: {e}");
     }
 
-    // Best-effort: scrub the transient private-key buffer (L15/hardening). The
-    // keypair itself still holds the key for the session, as required.
-    private_bytes.zeroize();
-
-    *identity.write().await = Some(kp);
+    *identity.write().await = Some(app_id);
     Ok(info)
 }
 
-/// Load the current keypair from disk. Returns `None` if no keypair exists yet.
+/// Load the current identity from disk. Returns `None` if no identity exists yet.
 #[tauri::command]
 pub async fn get_identity(
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
 ) -> CmdResult<Option<IdentityInfo>> {
-    if let Some(ref kp) = *identity.read().await {
-        return Ok(Some(IdentityInfo::from_keypair(kp)));
+    if let Some(ref id) = *identity.read().await {
+        return Ok(Some(IdentityInfo::from_identity(id).map_err(cmd_err)?));
     }
 
-    let stored = match store.load_keypair().map_err(cmd_err)? {
+    let stored = match store.load_identity().map_err(cmd_err)? {
         Some(s) => s,
         None => return Ok(None),
     };
-
-    let mut bytes: [u8; 32] = hex::decode(&stored.private_key_hex)
-        .map_err(cmd_err)?
-        .try_into()
-        .map_err(|_| "keypair file has invalid length".to_string())?;
-
-    let kp = HoardbookKeypair::from_bytes(&bytes);
-    bytes.zeroize();
-    if kp.hb_id() != stored.hb_id {
-        return Err("Stored keypair is corrupted: derived public key does not match stored hb_id".into());
-    }
-    let info = IdentityInfo::from_keypair(&kp);
-    *identity.write().await = Some(kp);
+    let app_id = AppIdentity::from_stored(&stored)
+        .map_err(|e| format!("Stored identity is corrupted: {e}"))?;
+    let info = IdentityInfo::from_identity(&app_id).map_err(cmd_err)?;
+    *identity.write().await = Some(app_id);
     Ok(Some(info))
 }
 
-/// Return the raw Hoardbook ID string for sharing.
+/// Return the full `hbk…` share code to hand out.
 #[tauri::command]
-pub async fn get_hb_id(identity: State<'_, SharedIdentity>) -> CmdResult<String> {
+pub async fn get_share_code(identity: State<'_, SharedIdentity>) -> CmdResult<String> {
     identity
         .read()
         .await
         .as_ref()
-        .map(|kp| kp.hb_id())
-        .ok_or_else(|| "No identity loaded.".into())
+        .ok_or_else(|| "No identity loaded.".to_string())?
+        .share_code()
+        .map_err(cmd_err)
 }
 
-/// Validate a Hoardbook ID string (checksum check only, no network).
+/// Validate a pasted share code (npub or hbk) — codec/checksum only, no network.
 #[tauri::command]
-pub async fn validate_hb_id(hb_id: String) -> CmdResult<bool> {
-    Ok(hb_id_decode(&hb_id).is_ok())
+pub async fn validate_share_code(code: String) -> CmdResult<bool> {
+    Ok(hb_core::ShareCode::parse(&code).is_ok())
 }
 
 /// Return the current iroh EndpointAddr as a JSON string, or None if not initialised.
 #[tauri::command]
 pub async fn get_node_addr(endpoint: State<'_, SharedEndpoint>) -> CmdResult<Option<String>> {
     let guard = endpoint.read().await;
-    let addr = guard.as_ref().map(|ep| {
-        serde_json::to_string(&ep.addr()).unwrap_or_default()
-    });
+    let addr = guard.as_ref().map(|ep| serde_json::to_string(&ep.addr()).unwrap_or_default());
     Ok(addr)
 }
 
-/// Export the stored keypair as a JSON string for the user to save to a file.
-/// Uses the in-memory keypair to avoid a DPAPI round-trip.
+/// Export the stored identity as a JSON string for the user to save to a file.
 #[tauri::command]
 pub async fn export_keypair(identity: State<'_, SharedIdentity>) -> CmdResult<String> {
     let guard = identity.read().await;
-    let kp = guard.as_ref().ok_or("No identity loaded.")?;
-    let stored = StoredKeypair {
-        version: 1,
-        hb_id: kp.hb_id(),
-        private_key_hex: hex::encode(kp.private_key_bytes()),
-    };
+    let id = guard.as_ref().ok_or("No identity loaded.")?;
+    let stored = id.to_stored().map_err(cmd_err)?;
     serde_json::to_string_pretty(&stored).map_err(cmd_err)
 }
 
-/// Write the exported keypair JSON to a user-chosen absolute path.
-/// Uses the in-memory keypair to avoid a DPAPI round-trip.
+/// Write the exported identity JSON to a user-chosen absolute path.
 #[tauri::command]
 pub async fn save_keypair_file(
     path: String,
     identity: State<'_, SharedIdentity>,
 ) -> CmdResult<()> {
     let guard = identity.read().await;
-    let kp = guard.as_ref().ok_or("No identity loaded.")?;
-    let stored = StoredKeypair {
-        version: 1,
-        hb_id: kp.hb_id(),
-        private_key_hex: hex::encode(kp.private_key_bytes()),
-    };
+    let id = guard.as_ref().ok_or("No identity loaded.")?;
+    let stored = id.to_stored().map_err(cmd_err)?;
     let json = serde_json::to_string_pretty(&stored).map_err(cmd_err)?;
     std::fs::write(&path, json).map_err(cmd_err)?;
     Ok(())
 }
 
 /// Wipe all local data and reset in-memory state. Irreversible.
-/// Returns `true` if the relay was also notified (peer removed from directory),
-/// `false` if the relay could not be reached (local wipe still completes either way).
 #[tauri::command]
 pub async fn wipe_data(
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
-    relay: State<'_, SharedRelay>,
     endpoint: State<'_, SharedEndpoint>,
-    dm_queue: State<'_, SharedDmQueue>,
-    peer_cache: State<'_, SharedPeerCache>,
 ) -> CmdResult<bool> {
-    // Relay no longer stores peer data (profile/collections served via iroh),
-    // so there is nothing to deactivate on the relay side.
     store.wipe().map_err(cmd_err)?;
     *identity.write().await = None;
-    relay.set_relay_urls(vec![]).await;
-    dm_queue.lock().await.clear();
-    peer_cache.lock().await.clear();
 
-    // Close and clear the iroh endpoint.
     let mut ep_guard = endpoint.write().await;
     if let Some(ep) = ep_guard.take() {
         ep.close().await;
     }
-
     Ok(true)
 }
 
 // ---------------------------------------------------------------------------
-// Tests — T12 acceptance criteria
+// Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use crate::identity_state::AppIdentity;
     use crate::store::DataStore;
-    use hb_core::{HoardbookKeypair, types::StoredKeypair};
     use tempfile::TempDir;
 
     fn test_store() -> (TempDir, DataStore) {
@@ -291,94 +227,28 @@ mod tests {
     }
 
     #[test]
-    fn keypair_generate_unique() {
-        let kp1 = HoardbookKeypair::generate();
-        let kp2 = HoardbookKeypair::generate();
-        assert_ne!(kp1.hb_id(), kp2.hb_id(), "each generated keypair must be unique");
+    fn identity_generate_unique() {
+        let a = AppIdentity::generate();
+        let b = AppIdentity::generate();
+        assert_ne!(a.npub(), b.npub(), "each generated identity is unique");
     }
 
     #[test]
-    fn export_import_roundtrip() {
+    fn export_import_roundtrip_via_store() {
         let (_dir, store) = test_store();
-        let kp = HoardbookKeypair::generate();
-        let stored = StoredKeypair {
-            version: 1,
-            hb_id: kp.hb_id(),
-            private_key_hex: hex::encode(kp.private_key_bytes()),
-        };
-        store.save_keypair(&stored).unwrap();
+        let app_id = AppIdentity::generate();
+        let npub = app_id.npub();
+        let stored = app_id.to_stored().unwrap();
+        store.save_identity(&stored).unwrap();
 
-        // Export: serialize to JSON string (portable, unencrypted — same as save_keypair_file output).
+        // Export = the JSON of StoredIdentity.
         let exported = serde_json::to_string_pretty(&stored).unwrap();
+        let reimported: crate::store::StoredIdentity = serde_json::from_str(&exported).unwrap();
+        let back = AppIdentity::from_stored(&reimported).unwrap();
+        assert_eq!(back.npub(), npub, "reimported npub must match");
 
-        // Simulate import: parse the plain JSON backup and save through the platform store.
-        let reimported: StoredKeypair = serde_json::from_str(&exported).unwrap();
-        assert_eq!(reimported.hb_id, stored.hb_id, "reimported hb_id must match");
-        assert_eq!(
-            reimported.private_key_hex, stored.private_key_hex,
-            "reimported private key must match"
-        );
-
-        // Reload from disk via the platform-specific path.
-        let loaded = store.load_keypair().unwrap().unwrap();
-        assert_eq!(loaded.hb_id, stored.hb_id);
-        assert_eq!(loaded.private_key_hex, stored.private_key_hex);
-    }
-
-    #[test]
-    fn stored_keypair_debug_redacts() {
-        let kp = HoardbookKeypair::generate();
-        let stored = StoredKeypair {
-            version: 1,
-            hb_id: kp.hb_id(),
-            private_key_hex: hex::encode(kp.private_key_bytes()),
-        };
-        let debug_str = format!("{stored:?}");
-        assert!(
-            !debug_str.contains(&stored.private_key_hex),
-            "Debug output must not contain the actual private key"
-        );
-        assert!(
-            debug_str.contains("[REDACTED]"),
-            "Debug output must contain [REDACTED] placeholder"
-        );
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn keypair_file_has_mode_600() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let (_dir, store) = test_store();
-        let kp = HoardbookKeypair::generate();
-        let stored = StoredKeypair {
-            version: 1,
-            hb_id: kp.hb_id(),
-            private_key_hex: hex::encode(kp.private_key_bytes()),
-        };
-        store.save_keypair(&stored).unwrap();
-
-        let path = store.keypair_path();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        // Mode bits: 0o600 = owner r+w only.
-        assert_eq!(mode & 0o777, 0o600, "keypair.json must have mode 600");
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn keypair_file_is_readable_json() {
-        let (_dir, store) = test_store();
-        let kp = HoardbookKeypair::generate();
-        let stored = StoredKeypair {
-            version: 1,
-            hb_id: kp.hb_id(),
-            private_key_hex: hex::encode(kp.private_key_bytes()),
-        };
-        store.save_keypair(&stored).unwrap();
-
-        // On Linux the file is plain JSON (not encrypted).
-        let raw = std::fs::read_to_string(store.keypair_path()).unwrap();
-        assert!(raw.contains("hb_id"), "Linux keypair file must be plain JSON");
-        assert!(!raw.is_empty());
+        let loaded = store.load_identity().unwrap().unwrap();
+        let loaded_id = AppIdentity::from_stored(&loaded).unwrap();
+        assert_eq!(loaded_id.npub(), npub);
     }
 }

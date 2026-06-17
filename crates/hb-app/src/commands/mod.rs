@@ -1,7 +1,6 @@
 pub mod browse;
 pub mod chat;
 pub mod collection;
-pub mod dht;
 pub mod groups;
 pub mod identity;
 pub mod profile;

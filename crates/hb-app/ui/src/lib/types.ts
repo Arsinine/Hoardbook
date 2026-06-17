@@ -1,8 +1,11 @@
 // Mirrors hb-core Rust types
 
 export interface IdentityInfo {
-	hb_id: string;
-	hb_id_short: string;
+	/** The bech32 `npub` — the identity everywhere. */
+	npub: string;
+	npub_short: string;
+	/** The full `hbk…` share code (npub + account browse-key) to hand out. */
+	share_code: string;
 	/** "os-encrypted" (Windows DPAPI) or "plain-file" (Linux/macOS 0600 file). */
 	key_storage: 'os-encrypted' | 'plain-file';
 }
@@ -34,8 +37,8 @@ export interface Profile {
 }
 
 export interface ReceivedMessage {
-	from: string;  // sender hb_id
-	to: string;    // recipient hb_id
+	from: string;  // real sender npub (recovered from the NIP-17 seal)
+	to: string;    // recipient npub
 	content: string;
 	sent_at: string; // ISO datetime
 }
@@ -70,14 +73,16 @@ export interface Collection {
 }
 
 export interface CachedPeer {
-	hb_id: string;
+	/** The peer's Nostr identity (bech32 npub) — the stable contact key. */
+	npub: string;
+	/** Hex account browse-key captured from a full `hbk` code (unlocks listings + address). */
+	browse_key_hex?: string;
+	/** Local impersonation-resistant petname, bound to npub. */
+	petname?: string;
 	profile?: Profile;
 	collections: Collection[];
 	online: boolean;
-	node_addr?: string;
 	last_fetched: string;
-	/** ISO datetime from the relay's last heartbeat — accurate "last seen" time. */
-	last_seen_at?: string;
 	local_tags: string[];
 }
 
@@ -97,17 +102,6 @@ export interface ShareSettings {
 	require_follow: boolean;
 }
 
-export interface DirectoryPeer {
-	hb_id: string;
-	profile?: Profile;
-}
-
-export interface DhtResult {
-	hb_id: string;
-	profile?: Profile;
-	online: boolean;
-}
-
 export interface Group {
 	name: string;
 	pubkeys: string[];
@@ -123,7 +117,7 @@ export interface Watch {
 
 export interface WatchHit {
 	watch_name: string;
-	hb_id: string;
+	npub: string;
 }
 
 export interface DownloadItem {
