@@ -56,4 +56,24 @@ pub enum HbError {
 
     #[error("binding token not yet valid")]
     BindingNotYetValid,
+
+    // --- v0.9 transfer auth (M4): the H2/H17 binding gate + resource caps ---
+    /// The H17 follower gate denied the requester (their npub is not followed).
+    /// The message intentionally carries "restricted to followers" — the wire-string
+    /// the xfer server returns to an untrusted requester.
+    #[error("this collection is restricted to followers only")]
+    RestrictedToFollowers,
+
+    /// An xfer request frame declared a length over the 64 KiB cap (AB7).
+    #[error("request exceeds the maximum size of {max} bytes (declared {declared})")]
+    RequestTooLarge { declared: usize, max: usize },
+
+    /// A pre-auth binding-token frame declared a length over the cap (AB7 / Mission §5):
+    /// rejected *before* any allocation so a hostile length-prefix can't drive a pre-auth OOM.
+    #[error("token frame exceeds the maximum size of {max} bytes (declared {declared})")]
+    TokenFrameTooLarge { declared: usize, max: usize },
+
+    /// The per-npub concurrent download limit is reached (AB7).
+    #[error("download limit reached — try again later")]
+    DownloadLimitReached,
 }

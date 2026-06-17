@@ -76,7 +76,7 @@ async fn id3(ctx: &Ctx) -> Result<()> {
     let now = now();
     let a = Identity::generate();
     let b = Identity::generate();
-    let presence = build_binding(&a, &[3u8; 32], &["addr".into()], now, 30 * 60)?;
+    let presence = build_binding(&a, &[3u8; 32], &["addr".into()], &[5u8; 32], now, 30 * 60)?;
 
     let client = ctx.connect(&a).await?;
     client.publish(&presence).await?;
