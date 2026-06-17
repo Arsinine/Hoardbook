@@ -12,15 +12,6 @@ pub(crate) fn tag_val(event: &Event, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// All values of the custom tag `name` (everything after the tag name).
-pub(crate) fn tag_vals(event: &Event, name: &str) -> Vec<String> {
-    event
-        .tags
-        .find(TagKind::custom(name))
-        .map(|t| t.as_slice().iter().skip(1).cloned().collect())
-        .unwrap_or_default()
-}
-
 /// Read a custom tag as a `u8`, distinguishing *absent* from *malformed* (so callers can
 /// report which actually happened, per the M1 review).
 pub(crate) fn tag_u8(event: &Event, name: &str) -> TagU8 {
