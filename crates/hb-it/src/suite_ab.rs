@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use anyhow::{ensure, Result};
-use hb_core::binding::{build_binding, verify_binding, KIND_PRESENCE};
+use hb_core::binding::{build_binding, resolve_node_key, verify_binding, KIND_PRESENCE};
 use hb_core::event::{
     build_listing_event, build_teaser, parse_listing_event, parse_teaser, Teaser, KIND_LISTING,
     KIND_TEASER,
@@ -24,6 +24,7 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
         result("AB2 spam-DM block post-unwrap", ab2(ctx).await),
         result("AB3 junk-teaser resilience", ab3(ctx).await),
         result("AB8 hostile relay", ab8(ctx).await),
+        result("AB8b forged binding resolves to no node key", ab8b(ctx).await),
         result("AB9 re-key kills leaked code", ab9(ctx).await),
         result("AB10 metadata bounds", ab10(ctx).await),
     ]
@@ -126,7 +127,7 @@ async fn ab8(ctx: &Ctx) -> Result<()> {
     // Seed a teaser, a listing, and a presence for the hostile-action checks.
     let tea = build_teaser(&a, &teaser("victim", &[ctx.tag("ab8")]))?;
     let listing = build_listing_event(&a, "ab8", &[8u8; 32], r#"{"slug":"ab8","entries":[]}"#)?;
-    let presence = build_binding(&a, &[8u8; 32], &["addr".into()], now, 30 * 60)?;
+    let presence = build_binding(&a, &[8u8; 32], &["addr".into()], &[8u8; 32], now, 30 * 60)?;
     let client = ctx.connect(&a).await?;
     client.publish(&tea).await?;
     client.publish(&listing).await?;
@@ -154,7 +155,7 @@ async fn ab8(ctx: &Ctx) -> Result<()> {
     );
 
     // (4) A REPLAYED stale presence reads offline, not online.
-    let stale = build_binding(&a, &[8u8; 32], &["addr".into()], now - 20 * 60, 30 * 60)?;
+    let stale = build_binding(&a, &[8u8; 32], &["addr".into()], &[8u8; 32], now - 20 * 60, 30 * 60)?;
     ensure!(!is_online(stale.created_at.as_u64(), now), "replayed stale presence read as online");
 
     // (2) A WITHHELD event is still found via another relay (multi-relay only).
@@ -176,6 +177,40 @@ async fn ab8(ctx: &Ctx) -> Result<()> {
     } else {
         eprintln!("   AB8: withheld-event sub-case skipped (needs a 2nd --relay)");
     }
+    Ok(())
+}
+
+async fn ab8b(ctx: &Ctx) -> Result<()> {
+    // The L2 wire half of AB8 (the QUIC dial-refusal stays AB8/P2 at L3). A hostile relay serves a
+    // binding whose node key is **not vouched** by the npub the downloader expects to reach. Assert
+    // the *resolution-level* refusal — not merely "verify errors" (which AB8/L1 already covers):
+    // `resolve_node_key` yields **no dialable node key**, so the sealed address is never handed back.
+    let now = now();
+    let target = Identity::generate(); // the npub the downloader wants to reach
+    let impostor = Identity::generate(); // an impostor whose presence the relay substitutes
+
+    // The relay serves the impostor's (validly-signed) presence as if it spoke for `target`.
+    let forged =
+        build_binding(&impostor, &[42u8; 32], &["198.51.100.66:6666".into()], &[8u8; 32], now, 30 * 60)?;
+    let client = ctx.connect(&impostor).await?;
+    client.publish(&forged).await?;
+    settle().await;
+    let got = client
+        .fetch(Filter::new().author(impostor.public_key()).kind(Kind::from_u16(KIND_PRESENCE)), FETCH_TIMEOUT)
+        .await?;
+    client.disconnect().await;
+    ensure!(got.len() == 1, "AB8b setup fetch failed");
+
+    // H2 resolution: a presence not authored by `target` yields no node key → nothing to dial.
+    ensure!(
+        matches!(resolve_node_key(&got[0], &target.public_key(), now), Err(HbError::WrongSigner)),
+        "a forged binding resolved to a dialable node key for the wrong npub"
+    );
+    // verify_binding fails for `target` too, so its sealed address is never even reached.
+    ensure!(
+        verify_binding(&got[0], &target.public_key(), now).is_err(),
+        "a forged binding verified as the target's"
+    );
     Ok(())
 }
 
