@@ -1,0 +1,15 @@
+{
+  "_comment": "Cross-language golden fixture for the impersonation-resistant fingerprint (M3 decision #7, AB4b). SOURCE OF TRUTH: crates/hb-core/src/fingerprint.rs::fingerprint. The Rust test `fingerprint_matches_golden_vectors` pins the algorithm to these values; the frontend identity-display.test.ts pins its RENDERING to them. Do NOT re-derive the fingerprint in TypeScript — the UI gets it over the Tauri boundary. Regenerate both sides together if the algorithm changes.",
+  "vectors": [
+    {
+      "npub": "npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d",
+      "words": ["jade", "fjord", "jade"],
+      "colorHex": "#dc025b"
+    },
+    {
+      "npub": "npub1ccz8l9zpa47k6vz9gphftsrumpw80rjt3nhnefat4symjhrsnmjs38mnyd",
+      "words": ["garnet", "onyx", "harbor"],
+      "colorHex": "#ed5cb9"
+    }
+  ]
+}

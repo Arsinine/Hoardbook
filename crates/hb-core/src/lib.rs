@@ -12,6 +12,7 @@ pub mod types;
 //     the npub→iroh binding, the hbk share code. The foundation everything migrates to. ---
 pub mod binding;
 pub mod event;
+pub mod fingerprint;
 pub mod identity;
 pub mod listing;
 pub mod sharecode;
@@ -27,6 +28,7 @@ pub use types::{
 };
 
 pub use binding::{build_binding, verify_binding, Binding};
+pub use fingerprint::{fingerprint, Fingerprint};
 pub use identity::Identity;
 pub use listing::{decrypt_listing, encrypt_listing, BrowseKey};
 pub use sharecode::ShareCode;

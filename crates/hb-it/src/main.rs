@@ -17,6 +17,7 @@ use harness::Ctx;
 
 mod harness;
 mod suite_ab;
+mod suite_browse;
 mod suite_disc;
 mod suite_dm;
 mod suite_id;
@@ -45,6 +46,8 @@ async fn main() -> Result<()> {
     results.extend(suite_id::run(&ctx).await);
     eprintln!("-- Suite AB: adversarial (L2 rows) --");
     results.extend(suite_ab::run(&ctx).await);
+    eprintln!("-- Suite BROWSE: M3 value loop (publish / discover / browse / re-key) --");
+    results.extend(suite_browse::run(&ctx).await);
 
     tap::print_results(&results);
 
