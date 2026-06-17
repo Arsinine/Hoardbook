@@ -2,19 +2,15 @@
 
 mod commands;
 mod conn;
-mod dht_service;
 mod error;
-mod heartbeat;
-mod node;
+mod identity_state;
+mod net;
 mod p2p_it;
-mod pex;
-mod relay;
+mod presence;
 mod store;
 mod transfer;
 
 use std::sync::Arc;
-use hb_core::HoardbookKeypair;
-use relay::RelayClient;
 use store::DataStore;
 use tauri::{
     Emitter, Manager,
@@ -24,42 +20,34 @@ use tauri::{
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::RwLock;
 
+pub use identity_state::{AppIdentity, SharedIdentity};
+
 /// Managed state types — Arc-wrapped so they can be cloned into background tasks.
-pub type SharedIdentity           = Arc<RwLock<Option<HoardbookKeypair>>>;
-pub type SharedRelay              = Arc<RelayClient>;
-pub type SharedEndpoint           = Arc<RwLock<Option<iroh::Endpoint>>>;
-pub type SharedDownloadRegistry   = Arc<transfer::DownloadRegistry>;
-pub type SharedDmQueue            = node::SharedDmQueue;
-/// PEX peer address cache (peers.json) — spec Resolved Decision 9.
-pub type SharedPeerCache          = pex::SharedPeerCache;
-/// Sender half of the heartbeat-cancel channel. Send `true` to stop the task.
-pub type SharedCancelHeartbeat = Arc<tokio::sync::watch::Sender<bool>>;
-/// Sender for the DHT service cancel/trigger channel.
-/// Send `false` to wake the announce loop immediately; `true` to shut it down.
-pub type SharedDhtCancel = Arc<tokio::sync::watch::Sender<bool>>;
+pub type SharedEndpoint = Arc<RwLock<Option<iroh::Endpoint>>>;
+pub type SharedDownloadRegistry = Arc<transfer::DownloadRegistry>;
+/// Sender half of the presence-loop cancel channel. Send `true` to stop the task.
+pub type SharedCancelPresence = Arc<tokio::sync::watch::Sender<bool>>;
 
 // ---------------------------------------------------------------------------
 // iroh endpoint lifecycle helper
 // ---------------------------------------------------------------------------
 
-/// Create (or replace) the iroh P2P endpoint from the given private key bytes,
-/// persist it in `endpoint_state`, and spawn the unified accept loop.
-#[allow(clippy::too_many_arguments)]
+/// Create (or replace) the iroh P2P endpoint from the bound iroh transport key, persist it in
+/// `endpoint_state`, and spawn the accept loop. iroh now dispatches **only** `XFER_ALPN` (the
+/// node-browse ALPN was retired in M4 — browsing is a relay read).
 pub(crate) async fn start_iroh_endpoint(
-    private_bytes: &[u8; 32],
+    iroh_secret: &[u8; 32],
     store: DataStore,
     endpoint_state: SharedEndpoint,
-    dm_queue: SharedDmQueue,
-    own_hb_id: String,
     app: tauri::AppHandle,
     download_registry: SharedDownloadRegistry,
-    peer_cache: SharedPeerCache,
 ) -> anyhow::Result<()> {
-    let secret_key = iroh::SecretKey::from_bytes(private_bytes);
+    let _ = &app; // reserved for future per-connection notifications
+    let secret_key = iroh::SecretKey::from_bytes(iroh_secret);
 
     let new_ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(secret_key)
-        .alpns(vec![transfer::XFER_ALPN.to_vec(), node::NODE_ALPN.to_vec()])
+        .alpns(vec![transfer::XFER_ALPN.to_vec()])
         .bind()
         .await?;
 
@@ -70,11 +58,8 @@ pub(crate) async fn start_iroh_endpoint(
         old.close().await;
     }
 
-    // Spawn the unified protocol accept loop.
     let server_ep = new_ep.clone();
-    tauri::async_runtime::spawn(run_accept_loop(
-        server_ep, store, own_hb_id, dm_queue, app, download_registry, peer_cache,
-    ));
+    tauri::async_runtime::spawn(run_accept_loop(server_ep, store, download_registry));
 
     *guard = Some(new_ep);
     Ok(())
@@ -82,16 +67,11 @@ pub(crate) async fn start_iroh_endpoint(
 
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
-/// Dispatch incoming iroh connections by ALPN to the appropriate protocol handler.
-#[allow(clippy::too_many_arguments)]
+/// Dispatch incoming iroh connections. Only `XFER_ALPN` is served — every other ALPN is dropped.
 async fn run_accept_loop(
     endpoint: iroh::Endpoint,
     store: DataStore,
-    own_hb_id: String,
-    dm_queue: SharedDmQueue,
-    app: tauri::AppHandle,
     download_registry: SharedDownloadRegistry,
-    peer_cache: SharedPeerCache,
 ) {
     let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
@@ -109,14 +89,7 @@ async fn run_accept_loop(
         };
 
         let store_clone = store.clone();
-        let queue_clone = dm_queue.clone();
-        let hb_id_clone = own_hb_id.clone();
-        let app_clone = app.clone();
         let registry_clone = download_registry.clone();
-        let pex_state = pex::PexState {
-            cache: Arc::clone(&peer_cache),
-            endpoint: endpoint.clone(),
-        };
 
         tokio::spawn(async move {
             let _permit = permit;
@@ -129,19 +102,10 @@ async fn run_accept_loop(
                 Err(e) => { tracing::debug!("iroh handshake error: {e}"); return; }
             };
 
-            // Clone ALPN before moving conn into the handler.
             let alpn = conn.alpn().to_vec();
             if alpn == transfer::XFER_ALPN {
                 if let Err(e) = transfer::handle_xfer_connection(conn, store_clone, registry_clone).await {
                     tracing::warn!("xfer session error: {e}");
-                }
-            } else if alpn == node::NODE_ALPN {
-                if let Err(e) = node::handle_node_connection(
-                    conn, store_clone, &hb_id_clone, queue_clone, Some(pex_state), app_clone,
-                )
-                .await
-                {
-                    tracing::warn!("node session error: {e}");
                 }
             } else {
                 tracing::debug!("unknown ALPN on incoming connection, dropping");
@@ -192,75 +156,57 @@ fn build_system_tray(app: &mut tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
-/// If a keypair is on disk, populate `identity` and spawn the iroh endpoint.
+/// If an identity is on disk, populate `identity` and spawn the iroh endpoint.
 /// Non-fatal: a failed endpoint logs a warning and the user can retry by restarting.
 fn restore_identity_and_start_endpoint(
     store: DataStore,
     identity: SharedIdentity,
     endpoint_state: SharedEndpoint,
-    dm_queue: SharedDmQueue,
     download_registry: SharedDownloadRegistry,
-    peer_cache: SharedPeerCache,
     app: tauri::AppHandle,
 ) {
-    let keypair_result = store.load_keypair();
-    if let Err(ref e) = keypair_result {
-        tracing::error!("Failed to load keypair on startup: {e:#}");
-    }
-    let Ok(Some(stored)) = keypair_result else { return };
+    let stored = match store.load_identity() {
+        Ok(Some(s)) => s,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::error!("Failed to load identity on startup: {e:#}");
+            return;
+        }
+    };
+    let app_id = match AppIdentity::from_stored(&stored) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!("Stored identity is corrupted: {e:#}");
+            return;
+        }
+    };
+    let iroh_secret = app_id.iroh_secret;
 
-    let private_arr: Option<[u8; 32]> = hex::decode(&stored.private_key_hex)
-        .ok()
-        .and_then(|b| b.try_into().ok());
+    // Populate synchronously so the presence task has an identity at its first fire.
+    *identity.blocking_write() = Some(app_id);
 
-    let Some(arr) = private_arr else { return };
-
-    // Populate synchronously so the heartbeat task has a keypair at its first fire (15 s).
-    *identity.blocking_write() = Some(HoardbookKeypair::from_bytes(&arr));
-
-    let hb_id = stored.hb_id.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = start_iroh_endpoint(
-            &arr, store, endpoint_state, dm_queue, hb_id, app, download_registry, peer_cache,
-        )
-        .await
+        if let Err(e) =
+            start_iroh_endpoint(&iroh_secret, store, endpoint_state, app, download_registry).await
         {
             tracing::warn!("iroh endpoint startup failed: {e}");
         }
     });
 }
 
-/// Spawn all long-running background tasks (heartbeat, DHT, update check).
-#[allow(clippy::too_many_arguments)]
+/// Spawn the long-running background tasks: the presence-publish loop + the update check.
 fn spawn_background_tasks(
-    relay: SharedRelay,
     identity: SharedIdentity,
     endpoint_state: SharedEndpoint,
-    hb_cancel_rx: tokio::sync::watch::Receiver<bool>,
-    dht_identity_port: u16,
-    dht_cancel: SharedDhtCancel,
+    presence_cancel_rx: tokio::sync::watch::Receiver<bool>,
     store: DataStore,
     app: tauri::AppHandle,
 ) {
-    tauri::async_runtime::spawn(heartbeat::run_heartbeat_loop(
-        Arc::clone(&relay),
-        Arc::clone(&identity),
-        Arc::clone(&endpoint_state),
-        hb_cancel_rx,
-    ));
-
-    tauri::async_runtime::spawn(dht_service::run_identity_server(
-        dht_identity_port,
-        Arc::clone(&identity),
-        Arc::clone(&relay),
-        dht_cancel.subscribe(),
-    ));
-
-    tauri::async_runtime::spawn(dht_service::run_dht_announce_loop(
-        Arc::clone(&identity),
-        Arc::clone(&relay),
+    tauri::async_runtime::spawn(presence::run_presence_loop(
+        identity,
+        endpoint_state,
         store,
-        dht_cancel.subscribe(),
+        presence_cancel_rx,
     ));
 
     tauri::async_runtime::spawn(async move {
@@ -284,7 +230,6 @@ fn spawn_background_tasks(
 // ---------------------------------------------------------------------------
 
 /// Entry point for the `hb-p2p-it` headless P2P integration harness binary.
-/// Kept separate from `run()` so the harness never starts the Tauri app. See p2p_it.rs.
 pub async fn run_p2p_it() -> std::process::ExitCode {
     p2p_it::run().await
 }
@@ -307,32 +252,20 @@ pub fn run() {
             create_app_data_dir(&data_dir);
 
             let store = DataStore::new(data_dir);
-            let settings = store.load_settings().ok().flatten().unwrap_or_default();
 
             let identity: SharedIdentity = Arc::new(RwLock::new(None));
             let endpoint_state: SharedEndpoint = Arc::new(RwLock::new(None));
-            let dm_queue: SharedDmQueue = Arc::new(tokio::sync::Mutex::new(vec![]));
-            let relay: SharedRelay = Arc::new(RelayClient::new(settings.relay_urls));
             let download_registry: SharedDownloadRegistry =
                 Arc::new(transfer::DownloadRegistry::new());
-            // Loads peers.json and purges entries stale for >30 days (spec PEX rules).
-            let peer_cache: SharedPeerCache =
-                Arc::new(tokio::sync::Mutex::new(pex::PeerCache::load(store.clone())));
 
-            let (hb_cancel_tx, hb_cancel_rx) = tokio::sync::watch::channel(false);
-            let hb_cancel: SharedCancelHeartbeat = Arc::new(hb_cancel_tx);
-            let (dht_cancel_tx, _) = tokio::sync::watch::channel(false);
-            let dht_cancel: SharedDhtCancel = Arc::new(dht_cancel_tx);
+            let (presence_cancel_tx, presence_cancel_rx) = tokio::sync::watch::channel(false);
+            let presence_cancel: SharedCancelPresence = Arc::new(presence_cancel_tx);
 
             app.manage(store.clone());
             app.manage(Arc::clone(&identity));
-            app.manage(Arc::clone(&relay));
             app.manage(Arc::clone(&endpoint_state));
             app.manage(Arc::clone(&download_registry));
-            app.manage(Arc::clone(&dm_queue));
-            app.manage(Arc::clone(&peer_cache));
-            app.manage(Arc::clone(&hb_cancel));
-            app.manage(Arc::clone(&dht_cancel));
+            app.manage(Arc::clone(&presence_cancel));
 
             build_system_tray(app)?;
 
@@ -342,19 +275,14 @@ pub fn run() {
                 store.clone(),
                 Arc::clone(&identity),
                 Arc::clone(&endpoint_state),
-                Arc::clone(&dm_queue),
                 Arc::clone(&download_registry),
-                Arc::clone(&peer_cache),
                 app_handle.clone(),
             );
 
             spawn_background_tasks(
-                Arc::clone(&relay),
                 Arc::clone(&identity),
                 Arc::clone(&endpoint_state),
-                hb_cancel_rx,
-                settings.dht_identity_port,
-                Arc::clone(&dht_cancel),
+                presence_cancel_rx,
                 store,
                 app_handle,
             );
@@ -372,10 +300,9 @@ pub fn run() {
             commands::identity::generate_keypair,
             commands::identity::import_keypair,
             commands::identity::get_identity,
-            commands::identity::get_hb_id,
-            commands::identity::validate_hb_id,
+            commands::identity::get_share_code,
+            commands::identity::validate_share_code,
             commands::identity::get_node_addr,
-            node::fetch_direct_dm_inbox,
             commands::identity::export_keypair,
             commands::identity::save_keypair_file,
             commands::identity::wipe_data,
@@ -405,9 +332,6 @@ pub fn run() {
             commands::sharing::save_share_settings,
             commands::sharing::request_download,
             commands::sharing::cancel_download,
-            commands::dht::dht_search,
-            commands::dht::dht_start_announce,
-            commands::dht::dht_stop_announce,
             commands::groups::groups_get,
             commands::groups::groups_create,
             commands::groups::groups_rename,

@@ -8,9 +8,9 @@
 	$: name = peer.profile?.display_name ?? 'Unknown';
 	$: initial = name[0]?.toUpperCase() ?? '?';
 	$: hue = avatarHue(initial);
-	$: shortId = peer.hb_id.length > 14
-		? peer.hb_id.slice(0, 8) + '…' + peer.hb_id.slice(-4)
-		: peer.hb_id;
+	$: shortId = peer.npub.length > 14
+		? peer.npub.slice(0, 8) + '…' + peer.npub.slice(-4)
+		: peer.npub;
 </script>
 
 <div class="card">

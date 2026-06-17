@@ -3,14 +3,16 @@ import type { CachedPeer } from './types.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function makePeer(hb_id: string, display_name?: string): CachedPeer {
+function makePeer(npub: string, display_name?: string): CachedPeer {
 	return {
-		hb_id,
+		npub,
+		browse_key_hex: undefined,
+		petname: undefined,
 		profile: display_name ? { display_name, bio: undefined, tags: [], since: undefined,
 			est_size: undefined, languages: [], contact_hint: undefined, email: undefined,
 			location: undefined, social_links: [], willing_to: [], content_types: [], updated: '' } : undefined,
-		collections: [], online: false, node_addr: undefined,
-		last_fetched: '', last_seen_at: undefined, local_tags: [],
+		collections: [], online: false,
+		last_fetched: '', local_tags: [],
 	};
 }
 
@@ -27,7 +29,7 @@ function senderNameBuggy(
 	contacts: CachedPeer[],
 ): string {
 	if (hb_id === myId) return 'You';
-	const contact = contacts.find(c => c.hb_id === hb_id);
+	const contact = contacts.find(c => c.npub === hb_id);
 	if (contact?.profile?.display_name) return contact.profile.display_name;
 	return shortId(hb_id);
 }
@@ -40,7 +42,7 @@ function senderNameFixed(
 	profileCache: Record<string, string>,
 ): string {
 	if (hb_id === myId) return 'You';
-	const contact = contacts.find(c => c.hb_id === hb_id);
+	const contact = contacts.find(c => c.npub === hb_id);
 	if (contact?.profile?.display_name) return contact.profile.display_name;
 	if (profileCache[hb_id]) return profileCache[hb_id];
 	return shortId(hb_id);

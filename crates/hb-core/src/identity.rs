@@ -1,8 +1,8 @@
 //! Nostr-native identity: a secp256k1 / BIP-340 Schnorr keypair, its `npub` (NIP-19),
 //! and NIP-01 event signing / verification (spec §Why Cryptographic Identity?, §The Key).
 //!
-//! This replaces the legacy Ed25519 `HoardbookKeypair` / `hb1_` identity. The Ed25519 key
-//! survives only as the iroh transport key (see `binding`), never as identity.
+//! This is the sole cryptographic identity. An Ed25519 key survives only as the bound iroh
+//! transport key (see `binding`), never as identity.
 
 use nostr::prelude::*;
 
@@ -13,6 +13,7 @@ fn nostr_err(e: impl std::fmt::Display) -> HbError {
 }
 
 /// A Hoardbook identity — the one irreplaceable secret.
+#[derive(Clone)]
 pub struct Identity {
     keys: Keys,
 }

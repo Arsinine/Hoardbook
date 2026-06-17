@@ -1,10 +1,22 @@
-//! iroh-based P2P file transfer.
+//! iroh-based P2P file transfer with the v0.9 binding gate (H2/H17).
 //!
 //! Protocol (`/hoardbook/xfer/1`):
-//!   Client → Server  [u32-LE request-len] [JSON XferRequest]
+//!   Client → Server  [u32-LE token-len] [binding-token JSON]      ← H17, the FIRST frame
+//!                     [u32-LE request-len] [JSON XferRequest]
 //!   Server → Client  [u8 status: 0=ok 1=error]
 //!     ok    → [u64-LE file-size] [file bytes]
 //!     error → [u32-LE msg-len]  [UTF-8 error message]
+//!
+//! **H17 (server):** the requester presents an `npub`-signed binding token as the first
+//! length-prefixed frame. The server caps the declared length *before* allocating
+//! (`check_token_frame_len`), verifies the token (`verify_binding_token` → the requester's npub),
+//! matches the token's bound node key to `conn.remote_id()` (the QUIC-authenticated remote), then
+//! gates `require_follow` on the **npub** (`follower_gate`) — never a retired per-node id. The pure
+//! trust logic lives in `hb-core::gate`; this file is the I/O caller.
+//!
+//! **H2 (client):** the downloader resolves the peer's node key from their *verified presence
+//! binding* (`hb-core::resolve_node_key`) before any QUIC — see `commands::sharing` — so a lying
+//! relay can't redirect a download to an impostor.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,12 +26,23 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use globset::{Glob, GlobSetBuilder};
 use iroh::{Endpoint, EndpointAddr};
+use nostr::prelude::ToBech32;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, oneshot};
 
 use crate::store::DataStore;
+
+/// Freshness window a presented binding token must fall within (matches the gate's skew window).
+pub const TOKEN_MAX_AGE: Duration = Duration::from_secs(300);
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 // ---------------------------------------------------------------------------
 // Download registry — tracks in-flight downloads and their cancel tokens
@@ -103,28 +126,65 @@ pub const XFER_ALPN: &[u8] = b"/hoardbook/xfer/1";
 struct XferRequest {
     slug: String,
     path: String,
-    // NOTE: there is intentionally no requester-identity field here. The server
-    // authorizes `require_follow` against `conn.remote_id()` — the iroh-authenticated
-    // remote endpoint id (== the requester's hb_id) — never a self-claimed JSON value.
+    // The requester identity is NOT a self-claimed JSON field — it is the npub authenticated by
+    // the binding token in the preceding frame, matched to conn.remote_id(). See handle_xfer_stream.
 }
 
 // ---------------------------------------------------------------------------
 // Server — runs as a background task on the local iroh endpoint
 // ---------------------------------------------------------------------------
 
-/// Inner handler for a single xfer request/response. Extracted with generic
-/// stream bounds so it can be tested without real QUIC networking.
+/// The npubs of every saved contact — the H17 follower allow-list.
+fn follower_npubs(store: &DataStore) -> Vec<nostr::PublicKey> {
+    store
+        .list_contacts()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| hb_core::identity::parse_npub(&c.npub).ok())
+        .collect()
+}
+
+/// Inner handler for a single xfer request/response. Extracted with generic stream bounds so it
+/// can be tested without real QUIC networking. `remote_node_key` is the QUIC-authenticated remote
+/// endpoint id (`conn.remote_id()`), the only trustworthy node identity.
 pub(crate) async fn handle_xfer_stream(
     mut send: impl tokio::io::AsyncWrite + Unpin,
     mut recv: impl tokio::io::AsyncRead + Unpin,
-    remote_hb_id: &str,
+    remote_node_key: &[u8; 32],
     store: &DataStore,
     registry: &SharedDownloadRegistry,
 ) -> Result<()> {
-    // Read request
+    // ── H17 frame 1: the binding token (verified before any file request is parsed) ──
+    let token_len = recv.read_u32_le().await.context("read token len")?;
+    // Cap the declared length BEFORE allocating, so a hostile prefix can't drive a pre-auth OOM.
+    if let Err(e) = hb_core::check_token_frame_len(token_len as usize) {
+        return send_error(&mut send, &format!("Binding token rejected: {e}")).await;
+    }
+    let mut token_bytes = vec![0u8; token_len as usize];
+    recv.read_exact(&mut token_bytes).await.context("read token")?;
+    let token = match hb_core::Token::from_bytes(&token_bytes) {
+        Ok(t) => t,
+        Err(e) => return send_error(&mut send, &format!("Invalid binding token: {e}")).await,
+    };
+    let now = unix_now();
+    let requester_npub = match hb_core::verify_binding_token(&token, now, TOKEN_MAX_AGE) {
+        Ok(npub) => npub,
+        Err(e) => return send_error(&mut send, &format!("Binding token rejected: {e}")).await,
+    };
+    // The (now-authenticated) bound node key must equal the QUIC remote id: a token minted for
+    // node A does not authorise a connection from node B.
+    match token.node_key() {
+        Ok(bound) if &bound == remote_node_key => {}
+        Ok(_) => {
+            return send_error(&mut send, "Binding token does not match the connecting node").await
+        }
+        Err(e) => return send_error(&mut send, &format!("Invalid binding token: {e}")).await,
+    }
+
+    // ── frame 2: the file request ──
     let req_len = recv.read_u32_le().await.context("read req len")?;
-    if req_len > 64 * 1024 {
-        return Err(anyhow!("request too large"));
+    if let Err(e) = hb_core::check_request_len(req_len as usize) {
+        return send_error(&mut send, &format!("Request rejected: {e}")).await;
     }
     let mut req_bytes = vec![0u8; req_len as usize];
     recv.read_exact(&mut req_bytes).await.context("read req")?;
@@ -145,19 +205,17 @@ pub(crate) async fn handle_xfer_stream(
         return send_error(&mut send, "Sharing is disabled for this collection").await;
     }
 
-    // H17: enforce require_follow against the authenticated remote identity, not a
-    // self-claimed request field.
-    if settings.require_follow {
-        let contacts = store.list_contacts().unwrap_or_default();
-        if !contacts.iter().any(|c| c.hb_id == remote_hb_id) {
-            return send_error(&mut send, "This collection is restricted to followers only").await;
-        }
+    // H17: gate require_follow on the authenticated npub (not a self-claimed field, not a per-node id).
+    if hb_core::follower_gate(settings.require_follow, &follower_npubs(store), &requester_npub)
+        .is_err()
+    {
+        return send_error(&mut send, "This collection is restricted to followers only").await;
     }
 
     // Enforce download_limit
     if let Some(limit) = settings.download_limit {
         let current = registry.acquire_slot();
-        if current > limit {
+        if hb_core::check_download_limit(current, Some(limit)).is_err() {
             registry.release_slot();
             return send_error(&mut send, "Download limit reached — try again later").await;
         }
@@ -191,10 +249,10 @@ pub(crate) async fn handle_xfer_stream(
         return send_error(&mut send, "File not found").await;
     }
 
-    // M8: defense-in-depth against symlink escape. The `..`/absolute check above
-    // operates on the unresolved path; resolve symlinks and confirm the real target
-    // still lives under the (also-resolved) root. canonicalize() also normalizes
-    // Windows UNC `\\?\` prefixes on both sides, so starts_with compares like-for-like.
+    // M8: defense-in-depth against symlink escape. The `..`/absolute check above operates on the
+    // unresolved path; resolve symlinks and confirm the real target still lives under the
+    // (also-resolved) root. canonicalize() also normalizes Windows UNC `\\?\` prefixes on both
+    // sides, so starts_with compares like-for-like.
     let canon_root = tokio::fs::canonicalize(&root)
         .await
         .context("canonicalize share root")?;
@@ -227,14 +285,14 @@ pub(crate) async fn handle_xfer_connection(
     store: DataStore,
     registry: SharedDownloadRegistry,
 ) -> Result<()> {
-    // The iroh-authenticated identity of the remote peer (from its TLS cert).
-    // This == the requester's hb_id and is the ONLY trustworthy requester identity.
-    let remote_hb_id = hb_core::hb_id_encode(conn.remote_id().as_bytes());
+    // The iroh-authenticated identity of the remote peer (its endpoint id, from the QUIC/TLS
+    // handshake). The binding token's bound node key is matched against this.
+    let remote_node_key: [u8; 32] = *conn.remote_id().as_bytes();
     let (send, recv) = conn.accept_bi().await.context("accept_bi")?;
-    let res = handle_xfer_stream(send, recv, &remote_hb_id, &store, &registry).await;
-    // Hold the connection open until the client has read the response. Small error
-    // responses (e.g. the require_follow denial) otherwise race a CONNECTION_CLOSE on
-    // fast links and are seen as a truncated read. See conn::drain_connection.
+    let res = handle_xfer_stream(send, recv, &remote_node_key, &store, &registry).await;
+    // Hold the connection open until the client has read the response. Small error responses
+    // (e.g. the require_follow denial) otherwise race a CONNECTION_CLOSE on fast links and are
+    // seen as a truncated read. See conn::drain_connection.
     crate::conn::drain_connection(&conn).await;
     res
 }
@@ -348,29 +406,18 @@ async fn send_error(
 }
 
 // ---------------------------------------------------------------------------
-// Client — called from the request_download command
+// Client — called from the request_download command (after H2 resolution)
 // ---------------------------------------------------------------------------
 
-/// Check that `peer_addr.id` matches `expected_peer_hb_id` before connecting.
-/// Extracted as a pure function so it can be unit-tested without a live endpoint.
-pub(crate) fn verify_peer_identity(peer_addr: &EndpointAddr, expected_peer_hb_id: &str) -> Result<()> {
-    let expected_id = iroh::EndpointId::from_bytes(&hb_core::hb_id_decode(expected_peer_hb_id)?)
-        .context("expected peer hb_id is not a valid endpoint key")?;
-    if peer_addr.id != expected_id {
-        return Err(anyhow!(
-            "Peer address does not match the expected identity — refusing to connect (the relay may be lying)."
-        ));
-    }
-    Ok(())
-}
-
-/// Connect to a peer and download a single file, emitting progress events.
-/// Respects cancellation via the registry. Returns bytes written.
+/// Connect to a peer and download a single file, emitting progress events. `peer_addr` and
+/// `token_bytes` are produced by the caller after H2 binding resolution (see `commands::sharing`):
+/// `peer_addr` is built from the node key the peer's *verified presence binding* vouches for, and
+/// `token_bytes` is the downloader's own `npub`-signed binding token (the first XFER frame).
 #[allow(clippy::too_many_arguments)]
 pub async fn download_file(
     endpoint: &Endpoint,
-    peer_addr_json: &str,
-    expected_peer_hb_id: &str,
+    peer_addr: EndpointAddr,
+    token_bytes: Vec<u8>,
     slug: &str,
     path: &str,
     save_path: &str,
@@ -379,14 +426,10 @@ pub async fn download_file(
     registry: SharedDownloadRegistry,
     app: AppHandle,
 ) -> Result<u64> {
-    // Thin Tauri wrapper: forward every progress event to the webview. All the real
-    // work lives in `download_file_inner`, which is Tauri-free so the integration
-    // harness (hb-p2p-it) can drive the exact same streaming / integrity-check /
-    // cancellation path without an AppHandle.
     download_file_inner(
         endpoint,
-        peer_addr_json,
-        expected_peer_hb_id,
+        peer_addr,
+        token_bytes,
         slug,
         path,
         save_path,
@@ -398,14 +441,14 @@ pub async fn download_file(
     .await
 }
 
-/// Tauri-free core of [`download_file`]. `on_progress` receives every progress
-/// event; the command wrapper forwards them to the webview, while tests and the
-/// `hb-p2p-it` harness pass a no-op or logging closure.
+/// Tauri-free core of [`download_file`]. `on_progress` receives every progress event; the command
+/// wrapper forwards them to the webview, while tests and the `hb-p2p-it` harness pass a no-op or
+/// logging closure.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn download_file_inner(
     endpoint: &Endpoint,
-    peer_addr_json: &str,
-    expected_peer_hb_id: &str,
+    peer_addr: EndpointAddr,
+    token_bytes: Vec<u8>,
     slug: &str,
     path: &str,
     save_path: &str,
@@ -436,17 +479,6 @@ pub(crate) async fn download_file_inner(
 
     emit_progress(0, 0, 0, DownloadStatus::Active, None);
 
-    let peer_addr: EndpointAddr =
-        serde_json::from_str(peer_addr_json).context("parse peer EndpointAddr")?;
-
-    // H2: verify peer identity before opening any QUIC connection; see `verify_peer_identity`.
-    if let Err(e) = verify_peer_identity(&peer_addr, expected_peer_hb_id) {
-        let msg = e.to_string();
-        emit_progress(0, 0, 0, DownloadStatus::Error, Some(msg.clone()));
-        registry.remove(download_id).await;
-        return Err(e);
-    }
-
     let conn = endpoint
         .connect(peer_addr, XFER_ALPN)
         .await
@@ -454,10 +486,11 @@ pub(crate) async fn download_file_inner(
 
     let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?;
 
-    let req = XferRequest {
-        slug: slug.to_string(),
-        path: path.to_string(),
-    };
+    // H17 frame 1: our binding token, then frame 2: the file request.
+    send.write_u32_le(token_bytes.len() as u32).await.context("write token len")?;
+    send.write_all(&token_bytes).await.context("write token")?;
+
+    let req = XferRequest { slug: slug.to_string(), path: path.to_string() };
     let req_bytes = serde_json::to_vec(&req).context("serialize request")?;
     send.write_u32_le(req_bytes.len() as u32).await.context("write req len")?;
     send.write_all(&req_bytes).await.context("write req")?;
@@ -545,6 +578,48 @@ pub(crate) async fn download_file_inner(
     Ok(bytes_done)
 }
 
+/// Build the requester's binding-token wire frame: an `npub`-signed token over `own_node_key`,
+/// stamped now. The H2-resolved peer address + this token are the two inputs `download_file` needs.
+pub(crate) fn build_token_frame(
+    identity: &hb_core::Identity,
+    own_node_key: &[u8; 32],
+) -> Result<Vec<u8>> {
+    let token = hb_core::build_binding_token(identity, own_node_key, unix_now())
+        .map_err(|e| anyhow!("build binding token: {e}"))?;
+    Ok(token.to_bytes())
+}
+
+/// Resolve a peer's dialable [`EndpointAddr`] from their **verified** presence binding (H2): the
+/// node key is taken from the binding (not a relay-supplied address), and the transport addresses
+/// are unsealed from the binding under the peer's browse-key. A relay that serves a forged/expired
+/// binding, or a missing/locked sealed address, yields a reasoned `Err` — never a dial.
+pub(crate) fn resolve_peer_addr(
+    presence: &nostr::Event,
+    peer_npub: &nostr::PublicKey,
+    peer_browse_key: &hb_core::BrowseKey,
+) -> Result<EndpointAddr> {
+    let now = unix_now();
+    let binding = hb_core::verify_binding(presence, peer_npub, now)
+        .map_err(|e| anyhow!("peer presence binding rejected: {e}"))?;
+    let addrs = binding
+        .addr
+        .unseal(peer_browse_key)
+        .map_err(|e| anyhow!("no reachable address for peer: {e}"))?;
+    let raw = addrs
+        .first()
+        .ok_or_else(|| anyhow!("peer advertised no transport address"))?;
+    // The sealed payload is the peer's serialized iroh EndpointAddr (id + transport addrs).
+    let endpoint_addr: EndpointAddr =
+        serde_json::from_str(raw).context("parse sealed peer EndpointAddr")?;
+    // Defense-in-depth: the dialed node id must equal the node key the signed binding vouches for.
+    if *endpoint_addr.id.as_bytes() != binding.node_key {
+        return Err(anyhow!(
+            "peer's sealed address does not match the node key its binding vouches for — refusing to connect"
+        ));
+    }
+    Ok(endpoint_addr)
+}
+
 // ---------------------------------------------------------------------------
 // Integrity helpers
 // ---------------------------------------------------------------------------
@@ -564,6 +639,12 @@ pub(crate) fn verify_hash(data: &[u8], expected_hex: &str) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Build the npub of a public key (used by tests + callers needing the bech32 form).
+#[allow(dead_code)]
+fn npub_of(pk: &nostr::PublicKey) -> String {
+    pk.to_bech32().unwrap_or_else(|_| pk.to_hex())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -571,6 +652,59 @@ pub(crate) fn verify_hash(data: &[u8], expected_hex: &str) -> anyhow::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{CachedPeer, DataStore, ShareSettings};
+    use hb_core::Identity;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn node_key() -> [u8; 32] {
+        rand::random()
+    }
+
+    /// Write a valid binding token + request frame to `cli_w`, returning nothing.
+    async fn write_token_and_request<W: AsyncWriteExt + Unpin>(
+        cli_w: &mut W,
+        requester: &Identity,
+        requester_node: &[u8; 32],
+        slug: &str,
+        path: &str,
+    ) {
+        let token =
+            hb_core::build_binding_token(requester, requester_node, unix_now()).unwrap();
+        let tb = token.to_bytes();
+        cli_w.write_u32_le(tb.len() as u32).await.unwrap();
+        cli_w.write_all(&tb).await.unwrap();
+        let req = serde_json::to_vec(&serde_json::json!({"slug": slug, "path": path})).unwrap();
+        cli_w.write_u32_le(req.len() as u32).await.unwrap();
+        cli_w.write_all(&req).await.unwrap();
+        cli_w.shutdown().await.unwrap();
+    }
+
+    async fn read_error<R: AsyncReadExt + Unpin>(cli_r: &mut R) -> String {
+        let status = cli_r.read_u8().await.unwrap();
+        assert_eq!(status, 1, "expected an error status byte");
+        let elen = cli_r.read_u32_le().await.unwrap();
+        let mut ebuf = vec![0u8; elen as usize];
+        cli_r.read_exact(&mut ebuf).await.unwrap();
+        String::from_utf8(ebuf).unwrap()
+    }
+
+    fn save_contact(store: &DataStore, npub: &str) {
+        store
+            .save_contact(
+                &CachedPeer::pubkey_hash(npub),
+                &CachedPeer {
+                    npub: npub.to_string(),
+                    browse_key_hex: None,
+                    petname: None,
+                    profile: None,
+                    collections: vec![],
+                    online: false,
+                    last_fetched: chrono::Utc::now(),
+                    local_tags: vec![],
+                },
+            )
+            .unwrap();
+    }
 
     #[test]
     fn glob_pattern_matches_extension() {
@@ -587,20 +721,6 @@ mod tests {
     }
 
     #[test]
-    fn sha256_bytes_known_content() {
-        use sha2::{Digest, Sha256};
-        let expected = hex::encode(Sha256::digest(b"hello world"));
-        assert_eq!(sha256_bytes(b"hello world"), expected);
-    }
-
-    #[test]
-    fn sha256_bytes_empty() {
-        use sha2::{Digest, Sha256};
-        let expected = hex::encode(Sha256::digest(b""));
-        assert_eq!(sha256_bytes(b""), expected);
-    }
-
-    #[test]
     fn verify_hash_accepts_matching_content() {
         let data = b"some file content";
         let hash = sha256_bytes(data);
@@ -610,78 +730,34 @@ mod tests {
     #[test]
     fn verify_hash_rejects_corrupted_content() {
         let hash = sha256_bytes(b"original");
-        let result = verify_hash(b"corrupted", &hash);
-        assert!(result.is_err(), "mismatched hash must return Err");
+        assert!(verify_hash(b"corrupted", &hash).is_err());
     }
 
-    #[test]
-    fn verify_hash_rejects_garbage_hex() {
-        let result = verify_hash(b"data", "not-even-hex");
-        assert!(result.is_err());
-    }
-
-    // ── H2: verify_peer_identity ──────────────────────────────────────────────
-
-    #[test]
-    fn verify_peer_id_accepts_matching_identity() {
-        use std::collections::BTreeSet;
-        let kp = hb_core::HoardbookKeypair::generate();
-        let bytes = hb_core::hb_id_decode(&kp.hb_id()).unwrap();
-        let id = iroh::EndpointId::from_bytes(&bytes).unwrap();
-        let peer_addr = EndpointAddr { id, addrs: BTreeSet::new() };
-        assert!(verify_peer_identity(&peer_addr, &kp.hb_id()).is_ok());
-    }
-
-    #[test]
-    fn verify_peer_id_rejects_mismatched_identity() {
-        use std::collections::BTreeSet;
-        let kp    = hb_core::HoardbookKeypair::generate();
-        let other = hb_core::HoardbookKeypair::generate();
-        let bytes = hb_core::hb_id_decode(&kp.hb_id()).unwrap();
-        let id = iroh::EndpointId::from_bytes(&bytes).unwrap();
-        let peer_addr = EndpointAddr { id, addrs: BTreeSet::new() };
-        // peer_addr.id is kp's key, but we claim it belongs to other — must reject.
-        let err = verify_peer_identity(&peer_addr, &other.hb_id()).unwrap_err();
-        assert!(err.to_string().contains("does not match"), "got: {err}");
-    }
-
-    // ── handle_xfer_stream integration tests ─────────────────────────────────
-    // Use tokio::io::duplex() to exercise the full framing without real QUIC.
+    // ── H17: the binding gate over the wire (duplex, no QUIC) ──────────────────
 
     #[tokio::test]
     async fn xfer_stream_invalid_slug_rejected() {
-        use crate::store::DataStore;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
         let registry = std::sync::Arc::new(DownloadRegistry::new());
+
+        let requester = Identity::generate();
+        let rnode = node_key();
 
         let (srv, cli) = tokio::io::duplex(64 * 1024);
         let (mut cli_r, mut cli_w) = tokio::io::split(cli);
         let (srv_r, srv_w) = tokio::io::split(srv);
         tokio::spawn(async move {
-            let _ = handle_xfer_stream(srv_w, srv_r, "any-id", &store, &registry).await;
+            let _ = handle_xfer_stream(srv_w, srv_r, &rnode, &store, &registry).await;
         });
 
-        let req = serde_json::json!({"slug": "../etc/passwd", "path": "file.txt"});
-        let req_b = serde_json::to_vec(&req).unwrap();
-        cli_w.write_u32_le(req_b.len() as u32).await.unwrap();
-        cli_w.write_all(&req_b).await.unwrap();
-        cli_w.shutdown().await.unwrap();
-
-        let status = cli_r.read_u8().await.unwrap();
-        assert_eq!(status, 1);
-        let elen = cli_r.read_u32_le().await.unwrap();
-        let mut ebuf = vec![0u8; elen as usize];
-        cli_r.read_exact(&mut ebuf).await.unwrap();
-        let msg = String::from_utf8(ebuf).unwrap();
+        write_token_and_request(&mut cli_w, &requester, &rnode, "../etc/passwd", "f.txt").await;
+        let msg = read_error(&mut cli_r).await;
         assert!(msg.contains("Invalid collection slug"), "got: {msg}");
     }
 
     #[tokio::test]
     async fn xfer_stream_require_follow_blocks_stranger() {
-        use crate::store::{DataStore, ShareSettings};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
         store.save_share_settings("col", &ShareSettings {
@@ -690,36 +766,24 @@ mod tests {
             ..Default::default()
         }).unwrap();
 
-        let stranger = hb_core::HoardbookKeypair::generate();
-        let remote_id = stranger.hb_id();
-
+        let stranger = Identity::generate();
+        let rnode = node_key();
         let registry = std::sync::Arc::new(DownloadRegistry::new());
         let (srv, cli) = tokio::io::duplex(64 * 1024);
         let (mut cli_r, mut cli_w) = tokio::io::split(cli);
         let (srv_r, srv_w) = tokio::io::split(srv);
-        let s2 = store.clone(); let id2 = remote_id.clone();
+        let s2 = store.clone();
         tokio::spawn(async move {
-            let _ = handle_xfer_stream(srv_w, srv_r, &id2, &s2, &registry).await;
+            let _ = handle_xfer_stream(srv_w, srv_r, &rnode, &s2, &registry).await;
         });
 
-        let req_b = serde_json::to_vec(&serde_json::json!({"slug":"col","path":"f.txt"})).unwrap();
-        cli_w.write_u32_le(req_b.len() as u32).await.unwrap();
-        cli_w.write_all(&req_b).await.unwrap();
-        cli_w.shutdown().await.unwrap();
-
-        let status = cli_r.read_u8().await.unwrap();
-        assert_eq!(status, 1);
-        let elen = cli_r.read_u32_le().await.unwrap();
-        let mut ebuf = vec![0u8; elen as usize];
-        cli_r.read_exact(&mut ebuf).await.unwrap();
-        let msg = String::from_utf8(ebuf).unwrap();
+        write_token_and_request(&mut cli_w, &stranger, &rnode, "col", "f.txt").await;
+        let msg = read_error(&mut cli_r).await;
         assert!(msg.contains("restricted to followers"), "got: {msg}");
     }
 
     #[tokio::test]
     async fn xfer_stream_require_follow_allows_contact() {
-        use crate::store::{CachedPeer, DataStore, ShareSettings};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
         store.save_share_settings("col", &ShareSettings {
@@ -728,56 +792,84 @@ mod tests {
             ..Default::default()
         }).unwrap();
 
-        let peer_kp = hb_core::HoardbookKeypair::generate();
-        let remote_id = peer_kp.hb_id();
-        store.save_contact(
-            &CachedPeer::pubkey_hash(&remote_id),
-            &CachedPeer {
-                hb_id: remote_id.clone(), profile: None, collections: vec![],
-                online: false, node_addr: None, last_fetched: chrono::Utc::now(),
-                last_seen_at: None, local_tags: vec![],
-            },
-        ).unwrap();
-
+        let peer = Identity::generate();
+        save_contact(&store, &peer.npub()); // npub is a follower
+        let rnode = node_key();
         let registry = std::sync::Arc::new(DownloadRegistry::new());
         let (srv, cli) = tokio::io::duplex(64 * 1024);
         let (mut cli_r, mut cli_w) = tokio::io::split(cli);
         let (srv_r, srv_w) = tokio::io::split(srv);
-        let s2 = store.clone(); let id2 = remote_id.clone();
+        let s2 = store.clone();
         tokio::spawn(async move {
-            let _ = handle_xfer_stream(srv_w, srv_r, &id2, &s2, &registry).await;
+            let _ = handle_xfer_stream(srv_w, srv_r, &rnode, &s2, &registry).await;
         });
 
-        let req_b = serde_json::to_vec(&serde_json::json!({"slug":"col","path":"f.txt"})).unwrap();
-        cli_w.write_u32_le(req_b.len() as u32).await.unwrap();
-        cli_w.write_all(&req_b).await.unwrap();
-        cli_w.shutdown().await.unwrap();
+        write_token_and_request(&mut cli_w, &peer, &rnode, "col", "f.txt").await;
+        let msg = read_error(&mut cli_r).await;
+        // Passed the follower gate; the next failure is "File not found", not the gate.
+        assert!(!msg.contains("restricted to followers"), "contact must pass; got: {msg}");
+    }
 
-        let status = cli_r.read_u8().await.unwrap();
-        assert_eq!(status, 1, "expect a non-follower error, not success");
-        let elen = cli_r.read_u32_le().await.unwrap();
-        let mut ebuf = vec![0u8; elen as usize];
-        cli_r.read_exact(&mut ebuf).await.unwrap();
-        let msg = String::from_utf8(ebuf).unwrap();
-        // Contact passed require_follow; next failure is "File not found", not the follower gate.
-        assert!(!msg.contains("restricted to followers"),
-            "contact must pass require_follow check; got: {msg}");
+    #[tokio::test]
+    async fn xfer_stream_rejects_token_for_a_different_node() {
+        // AB4: a token bound to node A presented on a connection from node B is refused — the
+        // bound node key must match conn.remote_id().
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        store.save_share_settings("col", &ShareSettings {
+            enabled: true, root_path: Some(dir.path().to_str().unwrap().to_string()),
+            ..Default::default()
+        }).unwrap();
+
+        let requester = Identity::generate();
+        let token_node = node_key();      // token is minted for this node
+        let connecting_node = node_key(); // but the connection is from a different node
+        let registry = std::sync::Arc::new(DownloadRegistry::new());
+        let (srv, cli) = tokio::io::duplex(64 * 1024);
+        let (mut cli_r, mut cli_w) = tokio::io::split(cli);
+        let (srv_r, srv_w) = tokio::io::split(srv);
+        tokio::spawn(async move {
+            let _ = handle_xfer_stream(srv_w, srv_r, &connecting_node, &store, &registry).await;
+        });
+
+        // Token bound to token_node, but server sees connecting_node as the remote.
+        write_token_and_request(&mut cli_w, &requester, &token_node, "col", "f.txt").await;
+        let msg = read_error(&mut cli_r).await;
+        assert!(msg.contains("does not match the connecting node"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn xfer_stream_rejects_oversize_token_frame() {
+        // AB7: a hostile token-frame length prefix beyond the cap is refused before any allocation.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let rnode = node_key();
+        let registry = std::sync::Arc::new(DownloadRegistry::new());
+        let (srv, cli) = tokio::io::duplex(64 * 1024);
+        let (mut cli_r, mut cli_w) = tokio::io::split(cli);
+        let (srv_r, srv_w) = tokio::io::split(srv);
+        tokio::spawn(async move {
+            let _ = handle_xfer_stream(srv_w, srv_r, &rnode, &store, &registry).await;
+        });
+
+        // Declare a token length far past the 8 KiB cap; never send the bytes.
+        cli_w.write_u32_le((hb_core::MAX_TOKEN_FRAME_BYTES as u32) + 1).await.unwrap();
+        cli_w.flush().await.unwrap();
+        let msg = read_error(&mut cli_r).await;
+        assert!(msg.contains("Binding token rejected"), "got: {msg}");
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn xfer_stream_symlink_escape_rejected() {
         use std::os::unix::fs::symlink;
-        use crate::store::{DataStore, ShareSettings};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let outer = tempfile::tempdir().unwrap(); // outside the share root
-        let root  = tempfile::tempdir().unwrap(); // share root
-        let db    = tempfile::tempdir().unwrap(); // DataStore base
+        let outer = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
 
         let secret = outer.path().join("secret.txt");
         std::fs::write(&secret, b"secret content").unwrap();
-        // Symlink inside root pointing outside
         symlink(&secret, root.path().join("escape.txt")).unwrap();
 
         let store = DataStore::new(db.path().to_path_buf());
@@ -787,27 +879,18 @@ mod tests {
             ..Default::default()
         }).unwrap();
 
+        let requester = Identity::generate();
+        let rnode = node_key();
         let registry = std::sync::Arc::new(DownloadRegistry::new());
         let (srv, cli) = tokio::io::duplex(64 * 1024);
         let (mut cli_r, mut cli_w) = tokio::io::split(cli);
         let (srv_r, srv_w) = tokio::io::split(srv);
         tokio::spawn(async move {
-            let _ = handle_xfer_stream(srv_w, srv_r, "any-id", &store, &registry).await;
+            let _ = handle_xfer_stream(srv_w, srv_r, &rnode, &store, &registry).await;
         });
 
-        let req_b = serde_json::to_vec(
-            &serde_json::json!({"slug":"col","path":"escape.txt"})
-        ).unwrap();
-        cli_w.write_u32_le(req_b.len() as u32).await.unwrap();
-        cli_w.write_all(&req_b).await.unwrap();
-        cli_w.shutdown().await.unwrap();
-
-        let status = cli_r.read_u8().await.unwrap();
-        assert_eq!(status, 1, "expect error for symlink escape");
-        let elen = cli_r.read_u32_le().await.unwrap();
-        let mut ebuf = vec![0u8; elen as usize];
-        cli_r.read_exact(&mut ebuf).await.unwrap();
-        let msg = String::from_utf8(ebuf).unwrap();
+        write_token_and_request(&mut cli_w, &requester, &rnode, "col", "escape.txt").await;
+        let msg = read_error(&mut cli_r).await;
         assert!(msg.contains("Invalid file path"), "symlink escape must be rejected; got: {msg}");
     }
 }

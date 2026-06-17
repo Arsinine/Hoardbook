@@ -48,7 +48,7 @@ pub async fn groups_delete(name: String, store: State<'_, DataStore>) -> CmdResu
 
 #[tauri::command]
 pub async fn groups_assign(
-    hb_id: String,
+    npub: String,
     group_name: String,
     store: State<'_, DataStore>,
 ) -> CmdResult<()> {
@@ -57,8 +57,8 @@ pub async fn groups_assign(
         .iter_mut()
         .find(|g| g.name == group_name)
         .ok_or_else(|| format!("Group '{group_name}' not found"))?;
-    if !group.pubkeys.contains(&hb_id) {
-        group.pubkeys.push(hb_id);
+    if !group.pubkeys.contains(&npub) {
+        group.pubkeys.push(npub);
         group.modified_at = Utc::now();
     }
     store.save_groups(&groups).map_err(cmd_err)
@@ -66,7 +66,7 @@ pub async fn groups_assign(
 
 #[tauri::command]
 pub async fn groups_unassign(
-    hb_id: String,
+    npub: String,
     group_name: String,
     store: State<'_, DataStore>,
 ) -> CmdResult<()> {
@@ -76,7 +76,7 @@ pub async fn groups_unassign(
         .find(|g| g.name == group_name)
         .ok_or_else(|| format!("Group '{group_name}' not found"))?;
     let before = group.pubkeys.len();
-    group.pubkeys.retain(|id| id != &hb_id);
+    group.pubkeys.retain(|id| id != &npub);
     if group.pubkeys.len() != before {
         group.modified_at = Utc::now();
     }
@@ -88,7 +88,7 @@ pub async fn groups_unassign(
 /// Used for drag-and-drop reassignment from the UI.
 #[tauri::command]
 pub async fn contact_update_groups(
-    hb_id: String,
+    npub: String,
     group_names: Vec<String>,
     store: State<'_, DataStore>,
 ) -> CmdResult<()> {
@@ -96,14 +96,14 @@ pub async fn contact_update_groups(
     let now = Utc::now();
 
     for group in &mut groups {
-        let was_member = group.pubkeys.contains(&hb_id);
+        let was_member = group.pubkeys.contains(&npub);
         let should_be_member = group_names.contains(&group.name);
 
         if was_member && !should_be_member {
-            group.pubkeys.retain(|id| id != &hb_id);
+            group.pubkeys.retain(|id| id != &npub);
             group.modified_at = now;
         } else if !was_member && should_be_member {
-            group.pubkeys.push(hb_id.clone());
+            group.pubkeys.push(npub.clone());
             group.modified_at = now;
         }
     }
@@ -126,15 +126,15 @@ mod tests {
         (dir, DataStore::new(path))
     }
 
-    fn test_peer(hb_id: &str) -> CachedPeer {
+    fn test_peer(npub: &str) -> CachedPeer {
         CachedPeer {
-            hb_id: hb_id.to_string(),
+            npub: npub.to_string(),
+            browse_key_hex: None,
+            petname: None,
             profile: None,
             collections: vec![],
             online: false,
-            node_addr: None,
             last_fetched: chrono::Utc::now(),
-            last_seen_at: None,
             local_tags: vec![],
         }
     }
@@ -143,13 +143,13 @@ mod tests {
     #[test]
     fn follow_skip_ungrouped() {
         let (_dir, store) = make_store();
-        let hb_id = "hb1_testpeer".to_string();
-        let hash = CachedPeer::pubkey_hash(&hb_id);
-        store.save_contact(&hash, &test_peer(&hb_id)).unwrap();
+        let npub = "hb1_testpeer".to_string();
+        let hash = CachedPeer::pubkey_hash(&npub);
+        store.save_contact(&hash, &test_peer(&npub)).unwrap();
 
         let groups = store.load_groups().unwrap();
         assert!(
-            groups.iter().all(|g| !g.pubkeys.contains(&hb_id)),
+            groups.iter().all(|g| !g.pubkeys.contains(&npub)),
             "contact saved without group must not appear in any group pubkeys list"
         );
     }
@@ -158,19 +158,19 @@ mod tests {
     #[test]
     fn multi_group_membership() {
         let (_dir, store) = make_store();
-        let hb_id = "hb1_testpeer".to_string();
+        let npub = "hb1_testpeer".to_string();
         let now = chrono::Utc::now();
 
         store
             .save_groups(&[
-                Group { name: "A".into(), pubkeys: vec![hb_id.clone()], modified_at: now },
-                Group { name: "B".into(), pubkeys: vec![hb_id.clone()], modified_at: now },
+                Group { name: "A".into(), pubkeys: vec![npub.clone()], modified_at: now },
+                Group { name: "B".into(), pubkeys: vec![npub.clone()], modified_at: now },
             ])
             .unwrap();
 
         let groups = store.load_groups().unwrap();
-        let in_a = groups.iter().find(|g| g.name == "A").unwrap().pubkeys.contains(&hb_id);
-        let in_b = groups.iter().find(|g| g.name == "B").unwrap().pubkeys.contains(&hb_id);
+        let in_a = groups.iter().find(|g| g.name == "A").unwrap().pubkeys.contains(&npub);
+        let in_b = groups.iter().find(|g| g.name == "B").unwrap().pubkeys.contains(&npub);
         assert!(in_a && in_b, "contact must be able to belong to multiple groups");
     }
 
@@ -178,14 +178,14 @@ mod tests {
     #[test]
     fn delete_group_moves_to_ungrouped() {
         let (_dir, store) = make_store();
-        let hb_id = "hb1_testpeer".to_string();
-        let hash = CachedPeer::pubkey_hash(&hb_id);
+        let npub = "hb1_testpeer".to_string();
+        let hash = CachedPeer::pubkey_hash(&npub);
 
-        store.save_contact(&hash, &test_peer(&hb_id)).unwrap();
+        store.save_contact(&hash, &test_peer(&npub)).unwrap();
         store
             .save_groups(&[Group {
                 name: "MyGroup".into(),
-                pubkeys: vec![hb_id.clone()],
+                pubkeys: vec![npub.clone()],
                 modified_at: chrono::Utc::now(),
             }])
             .unwrap();
@@ -195,12 +195,12 @@ mod tests {
 
         let contacts = store.list_contacts().unwrap();
         assert!(
-            contacts.iter().any(|c| c.hb_id == hb_id),
+            contacts.iter().any(|c| c.npub == npub),
             "contact must remain in contact list after its group is deleted"
         );
         let groups = store.load_groups().unwrap();
         assert!(
-            groups.iter().all(|g| !g.pubkeys.contains(&hb_id)),
+            groups.iter().all(|g| !g.pubkeys.contains(&npub)),
             "deleted group must not contain the contact"
         );
     }
@@ -236,12 +236,12 @@ mod tests {
     #[test]
     fn contact_refresh_updates_cache() {
         let (_dir, store) = make_store();
-        let hb_id = "hb1_testpeer".to_string();
-        let hash = CachedPeer::pubkey_hash(&hb_id);
+        let npub = "hb1_testpeer".to_string();
+        let hash = CachedPeer::pubkey_hash(&npub);
 
-        store.save_contact(&hash, &test_peer(&hb_id)).unwrap();
+        store.save_contact(&hash, &test_peer(&npub)).unwrap();
 
-        let updated = CachedPeer { online: true, ..test_peer(&hb_id) };
+        let updated = CachedPeer { online: true, ..test_peer(&npub) };
         store.save_contact(&hash, &updated).unwrap();
 
         let loaded = store.load_contact(&hash).unwrap().unwrap();
@@ -252,14 +252,14 @@ mod tests {
     #[test]
     fn contact_update_groups_replaces_memberships() {
         let (_dir, store) = make_store();
-        let hb_id = "hb1_peer".to_string();
+        let npub = "hb1_peer".to_string();
         let now = chrono::Utc::now();
 
         store
             .save_groups(&[
-                Group { name: "A".into(), pubkeys: vec![hb_id.clone()], modified_at: now },
+                Group { name: "A".into(), pubkeys: vec![npub.clone()], modified_at: now },
                 Group { name: "B".into(), pubkeys: vec![], modified_at: now },
-                Group { name: "C".into(), pubkeys: vec![hb_id.clone()], modified_at: now },
+                Group { name: "C".into(), pubkeys: vec![npub.clone()], modified_at: now },
             ])
             .unwrap();
 
@@ -267,19 +267,19 @@ mod tests {
         let mut groups = store.load_groups().unwrap();
         for group in &mut groups {
             let should = group.name == "B";
-            let was = group.pubkeys.contains(&hb_id);
+            let was = group.pubkeys.contains(&npub);
             if was && !should {
-                group.pubkeys.retain(|id| id != &hb_id);
+                group.pubkeys.retain(|id| id != &npub);
             } else if !was && should {
-                group.pubkeys.push(hb_id.clone());
+                group.pubkeys.push(npub.clone());
             }
         }
         store.save_groups(&groups).unwrap();
 
         let loaded = store.load_groups().unwrap();
-        let in_a = loaded.iter().find(|g| g.name == "A").unwrap().pubkeys.contains(&hb_id);
-        let in_b = loaded.iter().find(|g| g.name == "B").unwrap().pubkeys.contains(&hb_id);
-        let in_c = loaded.iter().find(|g| g.name == "C").unwrap().pubkeys.contains(&hb_id);
+        let in_a = loaded.iter().find(|g| g.name == "A").unwrap().pubkeys.contains(&npub);
+        let in_b = loaded.iter().find(|g| g.name == "B").unwrap().pubkeys.contains(&npub);
+        let in_c = loaded.iter().find(|g| g.name == "C").unwrap().pubkeys.contains(&npub);
         assert!(!in_a, "A must no longer contain the peer");
         assert!(in_b, "B must contain the peer");
         assert!(!in_c, "C must no longer contain the peer");

@@ -1,134 +1,120 @@
-use hb_core::HbId;
+//! Contacts: paste a share code, follow, refresh — rewired onto the M3 `hb-net` browse API.
+//!
+//! A "contact" is now keyed on the peer's **npub** (+ the account browse-key captured from a full
+//! `hbk` code, which unlocks their listings + presence address). Resolving a peer is a **relay
+//! read**: fetch their public teaser (`browse_share_code`) and their presence binding (for online
+//! status). Full collection browsing is the dedicated M3 browse route (now the default) — the
+//! inline `collections` on a contact is no longer populated here.
+
+use chrono::Utc;
+use nostr::prelude::ToBech32;
 use tauri::State;
+
+use hb_core::event::Teaser;
+use hb_core::{ShareCode, Identity};
+use hb_net::browse_share_code;
 
 use crate::{
     error::{CmdResult, cmd_err},
-    node::fetch_profile_via_iroh,
-    pex::{PeerAddrEntry, SharedPeerCache},
-    relay::RelayClient,
+    net,
     store::{CachedPeer, DataStore},
-    SharedEndpoint, SharedIdentity, SharedRelay,
+    identity_state::SharedIdentity,
 };
 
-/// Resolve a peer to a `CachedPeer` with profile populated, in this priority order:
-///   1. Ask the relay for liveness (online + node_addr).
-///   2. Fetch profile + collections directly over iroh — trying the relay-reported
-///      address first, then the local PEX cache entry (so long-lived nodes can reach
-///      known peers even when every relay is unreachable).
-///   3. If iroh fails everywhere, fall back to the local contact cache
-///      with `online: false` (stale).
-///   4. If there is no cache either, return an error.
+/// Map a public teaser into the local `Profile` shape the contacts UI renders.
+fn teaser_to_profile(t: Teaser) -> hb_core::types::Profile {
+    hb_core::types::Profile {
+        display_name: t.display_name,
+        bio: if t.bio.is_empty() { None } else { Some(t.bio) },
+        tags: t.tags,
+        content_types: t.content_types,
+        since: None,
+        est_size: None,
+        languages: vec![],
+        contact_hint: None,
+        email: None,
+        location: None,
+        social_links: vec![],
+        willing_to: vec![],
+        updated: Utc::now(),
+    }
+}
+
+/// Resolve a share code to a `CachedPeer`: fetch the public teaser + the presence binding (online
+/// status), as a pure relay read. Falls back to the local cache (stale, offline) when the relays
+/// yield nothing.
 async fn resolve_peer(
-    hb_id: &str,
-    relay: &RelayClient,
-    endpoint_state: &tokio::sync::RwLock<Option<iroh::Endpoint>>,
+    share_code: &ShareCode,
+    me: &Identity,
     store: &DataStore,
-    peer_cache: &SharedPeerCache,
 ) -> Result<CachedPeer, String> {
-    let mut peer = match relay.fetch_peer(hb_id).await {
-        Ok(p) => p,
-        Err(e) => {
-            // Every relay failed — synthesize an offline shell and let the PEX cache
-            // supply an address below. Only error out if that also yields nothing.
-            tracing::warn!("relay lookup for {hb_id} failed ({e}); trying PEX cache");
-            CachedPeer {
-                hb_id: hb_id.to_string(),
-                profile: None,
-                collections: vec![],
-                online: false,
-                node_addr: None,
-                last_fetched: chrono::Utc::now(),
-                last_seen_at: None,
-                local_tags: vec![],
-            }
-        }
+    let peer = share_code.pubkey();
+    let npub = peer.to_bech32().map_err(cmd_err)?;
+    let seed = net::relay_urls(store);
+
+    let client = net::connect(me, store).await.map_err(cmd_err)?;
+    let browse = browse_share_code(&client, share_code, "", &seed, &seed, net::RELAY_TIMEOUT)
+        .await
+        .map_err(cmd_err);
+    // Online = a fresh, valid presence binding exists for this npub.
+    let online = match crate::presence::fetch_peer_presence(&client, &peer, net::RELAY_TIMEOUT).await {
+        Ok(Some(ev)) => hb_core::verify_binding(
+            &ev,
+            &peer,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        )
+        .is_ok(),
+        _ => false,
     };
+    client.disconnect().await;
 
-    // Candidate addresses, deduplicated: relay-reported (only when online) first,
-    // then the local PEX cache entry.
-    let mut candidates: Vec<String> = vec![];
-    if peer.online {
-        if let Some(addr) = peer.node_addr.clone() {
-            candidates.push(addr);
-        }
-    }
-    if let Some(entry) = peer_cache.lock().await.get(hb_id) {
-        if let Some(addr) = &entry.node_addr {
-            if !candidates.contains(addr) {
-                candidates.push(addr.clone());
-            }
+    let profile = browse.ok().and_then(|b| b.teaser).map(teaser_to_profile);
+
+    // Fall back to the cached contact if the relay yielded no teaser.
+    if profile.is_none() {
+        if let Some(mut stale) = store.load_contact(&CachedPeer::pubkey_hash(&npub)).map_err(cmd_err)? {
+            stale.online = online;
+            return Ok(stale);
         }
     }
 
-    if !candidates.is_empty() {
-        let endpoint_opt = endpoint_state.read().await.clone();
-        match endpoint_opt {
-            Some(endpoint) => {
-                for addr in candidates {
-                    match fetch_profile_via_iroh(&endpoint, &addr, hb_id, Some(peer_cache.clone())).await {
-                        Ok((profile, collections)) => {
-                            peer.profile = profile;
-                            peer.collections = collections;
-                            // Reaching the node directly is stronger evidence than a
-                            // heartbeat: mark online and remember the working address.
-                            peer.online = true;
-                            peer.node_addr = Some(addr.clone());
-                            peer_cache.lock().await.record(PeerAddrEntry {
-                                hb_id: hb_id.to_string(),
-                                node_addr: Some(addr),
-                                relay_url: None,
-                                last_seen_at: chrono::Utc::now(),
-                            });
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::warn!("iroh-direct fetch for {hb_id} via candidate failed: {e}");
-                        }
-                    }
-                }
-            }
-            None => tracing::warn!("iroh endpoint not initialised — skipping direct fetch"),
-        }
-    }
+    Ok(CachedPeer {
+        npub,
+        browse_key_hex: share_code.browse_key().map(hex::encode),
+        petname: profile.as_ref().map(|p| p.display_name.clone()),
+        profile,
+        collections: vec![],
+        online,
+        last_fetched: Utc::now(),
+        local_tags: vec![],
+    })
+}
 
-    if peer.profile.is_some() {
-        return Ok(peer);
-    }
-
-    let hash = CachedPeer::pubkey_hash(hb_id);
-    if let Some(mut stale) = store.load_contact(&hash).map_err(cmd_err)? {
-        stale.online = false;
-        return Ok(stale);
-    }
-
-    if peer.online {
-        Err(format!("Could not fetch profile for {hb_id} (peer online but unreachable)"))
-    } else {
-        Err(format!("Peer {hb_id} is offline and not in your contacts"))
-    }
+/// Snapshot the loaded identity (cloned) or error if none.
+async fn identity_clone(identity: &SharedIdentity) -> Result<Identity, String> {
+    identity
+        .read()
+        .await
+        .as_ref()
+        .map(|id| id.identity.clone())
+        .ok_or_else(|| "No identity loaded. Generate a keypair first.".to_string())
 }
 
 #[tauri::command]
 pub async fn paste_key(
-    hb_id: HbId,
-    relay: State<'_, SharedRelay>,
+    code: String,
     identity: State<'_, SharedIdentity>,
-    endpoint: State<'_, SharedEndpoint>,
     store: State<'_, DataStore>,
-    peer_cache: State<'_, crate::SharedPeerCache>,
 ) -> CmdResult<CachedPeer> {
-    let guard = identity.read().await;
-    if let Some(ref kp) = *guard {
-        if kp.hb_id() == *hb_id {
-            return Err("You cannot look up your own ID".into());
-        }
+    let share_code = ShareCode::parse(&code).map_err(|e| format!("Invalid share code: {e}"))?;
+    let me = identity_clone(&identity).await?;
+    if me.public_key() == share_code.pubkey() {
+        return Err("You cannot look up your own code".into());
     }
-    drop(guard);
-
-    let peer = resolve_peer(&hb_id, &relay, &endpoint, &store, &peer_cache).await?;
-
-    // If we couldn't get a profile from iroh and there's no cache, resolve_peer already errored.
-    // Here, profile is Some unless the peer is online but has not yet published one.
+    let peer = resolve_peer(&share_code, &me, &store).await?;
     if peer.profile.is_none() && peer.online {
         return Err("This peer has not published a profile yet".into());
     }
@@ -137,29 +123,27 @@ pub async fn paste_key(
 
 #[tauri::command]
 pub async fn follow(
-    hb_id: HbId,
+    code: String,
     group_name: Option<String>,
-    relay: State<'_, SharedRelay>,
-    endpoint: State<'_, SharedEndpoint>,
+    identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
-    peer_cache: State<'_, crate::SharedPeerCache>,
 ) -> CmdResult<()> {
-    let peer = resolve_peer(&hb_id, &relay, &endpoint, &store, &peer_cache).await?;
-    let hash = CachedPeer::pubkey_hash(&hb_id);
-    store.save_contact(&hash, &peer).map_err(cmd_err)?;
+    let share_code = ShareCode::parse(&code).map_err(|e| format!("Invalid share code: {e}"))?;
+    let me = identity_clone(&identity).await?;
+    let peer = resolve_peer(&share_code, &me, &store).await?;
+    let npub = peer.npub.clone();
+    store.save_contact(&CachedPeer::pubkey_hash(&npub), &peer).map_err(cmd_err)?;
 
     if let Some(gname) = group_name {
         let mut groups = store.load_groups().map_err(cmd_err)?;
         if let Some(group) = groups.iter_mut().find(|g| g.name == gname) {
-            if !group.pubkeys.contains(&hb_id.to_string()) {
-                group.pubkeys.push(hb_id.to_string());
-                group.modified_at = chrono::Utc::now();
+            if !group.pubkeys.contains(&npub) {
+                group.pubkeys.push(npub);
+                group.modified_at = Utc::now();
             }
             store.save_groups(&groups).map_err(cmd_err)?;
         }
-        // Group not found → contact saved as Ungrouped; not an error.
     }
-
     Ok(())
 }
 
@@ -169,28 +153,42 @@ pub async fn get_contacts(store: State<'_, DataStore>) -> CmdResult<Vec<CachedPe
 }
 
 #[tauri::command]
-pub async fn unfollow_contact(
-    hb_id: HbId,
-    store: State<'_, DataStore>,
-) -> CmdResult<()> {
-    let hash = CachedPeer::pubkey_hash(&hb_id);
-    store.delete_contact(&hash).map_err(cmd_err)
+pub async fn unfollow_contact(npub: String, store: State<'_, DataStore>) -> CmdResult<()> {
+    store.delete_contact(&CachedPeer::pubkey_hash(&npub)).map_err(cmd_err)
+}
+
+/// Rebuild a share code from a saved contact (npub + cached browse-key) so a refresh can re-read.
+fn contact_share_code(contact: &CachedPeer) -> Result<ShareCode, String> {
+    let pubkey = hb_core::identity::parse_npub(&contact.npub).map_err(cmd_err)?;
+    match &contact.browse_key_hex {
+        Some(hexk) => {
+            let bytes: [u8; 32] = hex::decode(hexk)
+                .map_err(cmd_err)?
+                .try_into()
+                .map_err(|_| "stored browse-key is not 32 bytes".to_string())?;
+            Ok(ShareCode::Full { pubkey, browse_key: bytes })
+        }
+        None => Ok(ShareCode::FollowOnly { pubkey }),
+    }
 }
 
 #[tauri::command]
 pub async fn refresh_contact(
-    hb_id: HbId,
-    relay: State<'_, SharedRelay>,
-    endpoint: State<'_, SharedEndpoint>,
+    npub: String,
+    identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
-    peer_cache: State<'_, crate::SharedPeerCache>,
 ) -> CmdResult<CachedPeer> {
-    let peer = resolve_peer(&hb_id, &relay, &endpoint, &store, &peer_cache).await?;
-    let hash = CachedPeer::pubkey_hash(&hb_id);
-    // Preserve local_tags across refresh.
-    let existing = store.load_contact(&hash).map_err(cmd_err)?.unwrap_or_else(|| peer.clone());
-    let mut updated = peer;
+    let hash = CachedPeer::pubkey_hash(&npub);
+    let existing = store
+        .load_contact(&hash)
+        .map_err(cmd_err)?
+        .ok_or_else(|| format!("Contact {npub} not found"))?;
+    let share_code = contact_share_code(&existing)?;
+    let me = identity_clone(&identity).await?;
+    let mut updated = resolve_peer(&share_code, &me, &store).await?;
+    // Preserve local-only state across refresh.
     updated.local_tags = existing.local_tags;
+    updated.petname = existing.petname.or(updated.petname);
     store.save_contact(&hash, &updated).map_err(cmd_err)?;
     Ok(updated)
 }
@@ -198,15 +196,15 @@ pub async fn refresh_contact(
 /// Set user-defined local tags on a contact. Tags are stored locally and never shared.
 #[tauri::command]
 pub async fn set_contact_tags(
-    hb_id: HbId,
+    npub: String,
     tags: Vec<String>,
     store: State<'_, DataStore>,
 ) -> CmdResult<()> {
-    let hash = CachedPeer::pubkey_hash(&hb_id);
+    let hash = CachedPeer::pubkey_hash(&npub);
     let mut peer = store
         .load_contact(&hash)
         .map_err(cmd_err)?
-        .ok_or_else(|| format!("Contact {hb_id} not found"))?;
+        .ok_or_else(|| format!("Contact {npub} not found"))?;
     peer.local_tags = tags;
     store.save_contact(&hash, &peer).map_err(cmd_err)
 }
