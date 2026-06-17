@@ -1,15 +1,12 @@
 #![forbid(unsafe_code)]
 
-// --- legacy v0.4.3 core: Ed25519 identity / JCS / SignedEnvelope.
-//     Consumed by hb-app until its M4 Nostr cutover completes; deleted with that consumer. ---
-pub mod crypto;
-pub mod envelope;
+// --- Shared domain types (collections / profiles) consumed across crates. ---
 pub mod error;
-pub mod jcs;
 pub mod types;
 
-// --- v0.9 Nostr core (M1): secp256k1 identity, NIP-01 events, NIP-44 listings,
-//     the npub→iroh binding, the hbk share code. The foundation everything migrates to. ---
+// --- v0.9 Nostr core: secp256k1 identity, NIP-01 events, NIP-44 listings,
+//     the npub→iroh binding + xfer gate, the hbk share code. (The legacy Ed25519
+//     identity / JCS / signed-envelope core was removed with its hb-app consumer in M4.) ---
 pub mod binding;
 pub mod event;
 pub mod fingerprint;
@@ -20,13 +17,8 @@ pub mod sharecode;
 mod tag_util;
 pub mod version;
 
-pub use crypto::{HbId, HoardbookKeypair, hb_id_decode, hb_id_encode};
-pub use envelope::{DocType, SignedEnvelope};
 pub use error::HbError;
-pub use types::{
-    ChatMessage, Collection, DirectoryItem, HeartbeatBody, ItemType, Profile,
-    SocialLink, StoredKeypair,
-};
+pub use types::{Collection, DirectoryItem, ItemType, Profile, SocialLink};
 
 pub use binding::{
     build_binding, resolve_node_key, seal_addrs, unseal_addrs, verify_binding, Binding, SealedAddr,

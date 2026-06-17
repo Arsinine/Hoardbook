@@ -1,55 +1,150 @@
+//! Direct messages over NIP-17 (spec §Direct Messages).
+//!
+//! M4 cutover: the legacy signed-envelope DM + JCS-AAD + iroh-direct/relay
+//! store-and-forward path is gone. A DM is now a NIP-17 gift wrap (`hb-net::wrap_dm`) published
+//! to the configured relays; the inbox fetches kind-1059 wraps addressed to us and unwraps them
+//! (`hb-net::unwrap_dm`), recovering the **real sender npub** from inside the seal. The legacy
+//! DM history is intentionally **not** carried forward (decided break — pre-launch zero-user).
+//!
+//! `send_dm_inner` / `fetch_dms_inner` are the Tauri-free seam (mirroring `download_file_inner`);
+//! the pure decode logic (`decode_dms`) is L1-tested without a relay (the wire is proven by
+//! `hb-it` Suite DM).
+
 use std::collections::HashSet;
 
-use chrono::Utc;
-use hb_core::{DocType, HbId, SignedEnvelope, types::ChatMessage};
+use chrono::{TimeZone, Utc};
+use nostr::prelude::*;
 use serde::Serialize;
 use tauri::State;
 
+use hb_net::{unwrap_dm, wrap_dm, RelayClient};
+
 use crate::{
-    error::{CmdResult, cmd_err},
-    node,
+    error::{cmd_err, CmdResult},
+    identity_state::SharedIdentity,
+    net,
     store::DataStore,
-    SharedDmQueue, SharedEndpoint, SharedIdentity, SharedRelay,
 };
 
-/// L12: associated data that binds a message ciphertext to its routing and
-/// timestamp. Built only from unencrypted fields, so the recipient can
-/// reconstruct it before decrypting. Must be byte-identical on encrypt and decrypt.
-/// pub(crate) so the hb-p2p-it harness drives the same encrypt/decrypt binding.
-pub(crate) fn message_aad(from: &str, to: &str, sent_at_rfc3339: &str) -> Vec<u8> {
-    hb_core::jcs::canonicalize(&serde_json::json!({
-        "from": from,
-        "to": to,
-        "sent_at": sent_at_rfc3339,
-    }))
-}
-
-/// A decoded, sender-attributed chat message returned to the frontend.
-/// Content is always plaintext — decryption happens here before returning.
-#[derive(Debug, Clone, Serialize)]
+/// A decoded, sender-attributed chat message returned to the frontend. The sender is the **real**
+/// npub recovered from the NIP-17 seal — never the ephemeral wrap key.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ReceivedMessage {
+    /// Real sender npub (bech32).
     pub from: String,
+    /// Recipient npub (bech32) — us for inbound, the peer for our sent echo.
     pub to: String,
     pub content: String,
-    pub sent_at: String, // ISO 8601
-    pub encrypted: bool,
+    /// RFC3339 timestamp from the inner rumor (the real send time).
+    pub sent_at: String,
 }
 
-/// Encrypt and send a chat message to `to`.
-/// Delivery order: iroh-direct when the peer is online; relay store-and-forward otherwise.
-/// Falls back to relay automatically on iroh failure (transparent to caller).
-/// Returns the sent message so the frontend can append it immediately.
+/// Parse a DM recipient from a pasted npub or full `hbk` share code → its public key.
+fn parse_recipient(s: &str) -> Result<PublicKey, String> {
+    hb_core::ShareCode::parse(s)
+        .map(|sc| sc.pubkey())
+        .map_err(|e| format!("Invalid recipient: {e}"))
+}
+
+fn npub_of(pk: &PublicKey) -> String {
+    pk.to_bech32().unwrap_or_else(|_| pk.to_hex())
+}
+
+fn rfc3339_of(unix_secs: u64) -> String {
+    Utc.timestamp_opt(unix_secs as i64, 0)
+        .single()
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339()
+}
+
+// ---------------------------------------------------------------------------
+// The Tauri-free seam (composes hb-net::wrap_dm / unwrap_dm over a RelayClient)
+// ---------------------------------------------------------------------------
+
+/// Build the NIP-17 gift wrap for `content` from `identity` to `recipient` (no I/O). Thin alias
+/// over `hb-net::wrap_dm`, named for the seam + its L1 conformance tests.
+pub(crate) async fn build_dm(
+    identity: &hb_core::Identity,
+    recipient: &PublicKey,
+    content: &str,
+) -> Result<Event, hb_net::NetError> {
+    wrap_dm(identity, recipient, content).await
+}
+
+/// Send a DM: build the gift wrap and publish it to the connected relays. Returns the wrap.
+pub(crate) async fn send_dm_inner(
+    client: &RelayClient,
+    identity: &hb_core::Identity,
+    recipient: &PublicKey,
+    content: &str,
+) -> Result<Event, hb_net::NetError> {
+    let wrap = build_dm(identity, recipient, content).await?;
+    client.publish(&wrap).await?;
+    Ok(wrap)
+}
+
+/// Decode a batch of gift-wrap events into sender-attributed messages (pure; no relay). A wrap not
+/// addressed to us, tampered, or malformed is **skipped with a log, never a panic**. When
+/// `contact_npubs` is `Some`, messages from npubs outside the set are dropped (the `allow_dms` off
+/// case). Result is sorted oldest-first by send time.
+pub(crate) async fn decode_dms(
+    own_npub: &str,
+    identity: &hb_core::Identity,
+    gift_wraps: Vec<Event>,
+    contact_npubs: Option<&HashSet<String>>,
+) -> Vec<ReceivedMessage> {
+    let mut out: Vec<ReceivedMessage> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new(); // (from, sent_at) dedup
+    for wrap in gift_wraps {
+        match unwrap_dm(identity, &wrap).await {
+            Ok(dm) => {
+                let from = npub_of(&dm.sender);
+                if contact_npubs.is_some_and(|ids| !ids.contains(&from)) {
+                    continue;
+                }
+                let sent_at = rfc3339_of(dm.created_at);
+                if !seen.insert((from.clone(), sent_at.clone())) {
+                    continue;
+                }
+                out.push(ReceivedMessage {
+                    from,
+                    to: own_npub.to_string(),
+                    content: dm.content,
+                    sent_at,
+                });
+            }
+            Err(e) => tracing::debug!("skipping undecryptable/foreign gift wrap: {e}"),
+        }
+    }
+    out.sort_by(|a, b| a.sent_at.cmp(&b.sent_at));
+    out
+}
+
+/// Fetch + decode the NIP-17 inbox: gift wraps (kind 1059) addressed to us, unwrapped.
+pub(crate) async fn fetch_dms_inner(
+    client: &RelayClient,
+    identity: &hb_core::Identity,
+    own_npub: &str,
+    contact_npubs: Option<&HashSet<String>>,
+    timeout: std::time::Duration,
+) -> Result<Vec<ReceivedMessage>, hb_net::NetError> {
+    let filter = Filter::new().kind(Kind::GiftWrap).pubkey(identity.public_key());
+    let wraps = client.fetch(filter, timeout).await?;
+    Ok(decode_dms(own_npub, identity, wraps, contact_npubs).await)
+}
+
+// ---------------------------------------------------------------------------
+// Tauri commands
+// ---------------------------------------------------------------------------
+
+/// Encrypt + send a chat message to `to` (an npub or full share code) over NIP-17.
 #[tauri::command]
 pub async fn send_message(
-    to: HbId,
+    to: String,
     content: String,
     identity: State<'_, SharedIdentity>,
-    relay: State<'_, SharedRelay>,
-    endpoint: State<'_, SharedEndpoint>,
-    peer_cache: State<'_, crate::SharedPeerCache>,
+    store: State<'_, DataStore>,
 ) -> CmdResult<ReceivedMessage> {
-    let recipient_pubkey = to.pubkey();
-
     let trimmed = content.trim().to_string();
     if trimmed.is_empty() {
         return Err("Message cannot be empty".into());
@@ -58,308 +153,144 @@ pub async fn send_message(
         return Err(format!("Message too long ({} chars, max 4096)", trimmed.len()));
     }
 
-    let guard = identity.read().await;
-    let kp = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
+    let recipient = parse_recipient(&to)?;
 
-    let sent_at = Utc::now();
-    let from = kp.hb_id();
-    let aad = message_aad(&from, &to.to_string(), &sent_at.to_rfc3339());
+    let (from, id_clone) = {
+        let guard = identity.read().await;
+        let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
+        (id.npub(), id.identity.clone())
+    };
 
-    let encrypted_content = kp.encrypt_for(&recipient_pubkey, &trimmed, &aad).map_err(cmd_err)?;
-
-    let msg = ChatMessage { to: to.to_string(), content: encrypted_content, encrypted: true, sent_at };
-    let envelope = SignedEnvelope::create(kp, DocType::Message, &msg).map_err(cmd_err)?;
-
-    // Drop the identity lock before the (potentially slow) network calls.
-    drop(guard);
-
-    // Try iroh-direct first; fall back to relay on any failure.
-    let delivered_direct =
-        try_send_via_iroh(&relay, &endpoint, &to, &envelope, &peer_cache).await;
-
-    if !delivered_direct {
-        relay.publish("message", &envelope).await.map_err(cmd_err)?;
-    }
+    let client = net::connect(&id_clone, &store).await.map_err(cmd_err)?;
+    let result = send_dm_inner(&client, &id_clone, &recipient, &trimmed).await;
+    client.disconnect().await;
+    result.map_err(cmd_err)?;
 
     Ok(ReceivedMessage {
         from,
-        to: to.to_string(),
+        to: npub_of(&recipient),
         content: trimmed,
-        sent_at: msg.sent_at.to_rfc3339(),
-        encrypted: true,
+        sent_at: Utc::now().to_rfc3339(),
     })
 }
 
-/// Attempt iroh-direct delivery. Returns true if the remote node accepted the message.
-/// All failures are logged and swallowed — the caller falls back to relay.
-async fn try_send_via_iroh(
-    relay: &crate::relay::RelayClient,
-    endpoint_state: &tokio::sync::RwLock<Option<iroh::Endpoint>>,
-    to: &str,
-    envelope: &SignedEnvelope,
-    peer_cache: &crate::SharedPeerCache,
-) -> bool {
-    // Address candidates: relay-reported (when online) first, then the PEX cache.
-    let mut candidates: Vec<String> = vec![];
-    match relay.fetch_peer(to).await {
-        Ok(peer) => {
-            if let Some(addr) = peer.node_addr.filter(|_| peer.online) {
-                candidates.push(addr);
-            }
-        }
-        Err(e) => tracing::debug!("relay lookup for iroh-DM failed: {e}"),
-    }
-    if let Some(entry) = peer_cache.lock().await.get(to) {
-        if let Some(addr) = &entry.node_addr {
-            if !candidates.contains(addr) {
-                candidates.push(addr.clone());
-            }
-        }
-    }
-    if candidates.is_empty() {
-        return false;
-    }
-
-    let ep_guard = endpoint_state.read().await;
-    let Some(ref ep) = *ep_guard else {
-        tracing::debug!("iroh endpoint not initialised — falling back to relay for DM");
-        return false;
-    };
-
-    for addr in candidates {
-        match node::send_dm_via_iroh(ep, &addr, envelope, Some(peer_cache.clone())).await {
-            Ok(()) => {
-                tracing::debug!("DM delivered directly via iroh to {to}");
-                return true;
-            }
-            Err(e) => tracing::warn!("iroh-direct DM to {to} failed ({e}), trying next route"),
-        }
-    }
-    false
-}
-
-/// Fetch and decrypt the unified DM inbox: direct iroh queue + relay poll.
-/// Deduplicates by `(from, sent_at)` so messages delivered via both paths appear once.
-/// Respects `allow_dms`: when off, only messages from contacts are returned.
+/// Fetch + decrypt the NIP-17 inbox. Respects `allow_dms`: when off, only contacts' messages.
 #[tauri::command]
 pub async fn get_messages(
     identity: State<'_, SharedIdentity>,
-    relay: State<'_, SharedRelay>,
     store: State<'_, DataStore>,
-    dm_queue: State<'_, SharedDmQueue>,
 ) -> CmdResult<Vec<ReceivedMessage>> {
-    let guard = identity.read().await;
-    let kp = guard.as_ref().ok_or("No identity loaded.")?;
-    let own_hb_id = kp.hb_id();
+    let (own_npub, id_clone) = {
+        let guard = identity.read().await;
+        let id = guard.as_ref().ok_or("No identity loaded.")?;
+        (id.npub(), id.identity.clone())
+    };
 
-    // Build contact allow-list if DMs from strangers are disabled.
-    let settings = store.load_settings().map_err(cmd_err)?;
-    let allow_dms = settings.as_ref().map(|s| s.allow_dms).unwrap_or(true);
-    let contact_ids: Option<HashSet<String>> = if !allow_dms {
-        Some(store.list_contacts().map_err(cmd_err)?.into_iter().map(|c| c.hb_id).collect())
-    } else {
+    let allow_dms = store.load_settings().map_err(cmd_err)?.map(|s| s.allow_dms).unwrap_or(true);
+    let contact_npubs: Option<HashSet<String>> = if allow_dms {
         None
+    } else {
+        Some(store.list_contacts().map_err(cmd_err)?.into_iter().map(|c| c.npub).collect())
     };
 
-    let mut messages: Vec<ReceivedMessage> = Vec::new();
-    let mut seen: HashSet<(String, String)> = HashSet::new(); // (from, sent_at_rfc3339)
-
-    // ── Source A: direct iroh queue (drain without dropping; keep for dedup) ──
-    let direct_envelopes: Vec<SignedEnvelope> = {
-        let mut q = dm_queue.lock().await;
-        std::mem::take(&mut *q)
-    };
-    for env in direct_envelopes {
-        if let Some(msg) = decode_dm_envelope(&env, kp, &own_hb_id, &contact_ids) {
-            let key = (msg.from.clone(), msg.sent_at.clone());
-            if seen.insert(key) {
-                messages.push(msg);
-            }
-        }
-    }
-
-    // ── Source B: relay poll ──
-    match relay.fetch_messages(kp).await {
-        Ok(raw) => {
-            for (from, chat_msg) in raw {
-                if contact_ids.as_ref().is_some_and(|ids| !ids.contains(&from)) {
-                    continue;
-                }
-                let sent_at = chat_msg.sent_at.to_rfc3339();
-                let key = (from.clone(), sent_at.clone());
-                if !seen.insert(key) {
-                    continue; // already delivered via iroh
-                }
-                let content = decrypt_content(kp, &from, &chat_msg, &own_hb_id);
-                messages.push(ReceivedMessage { from, to: chat_msg.to, content, sent_at, encrypted: chat_msg.encrypted });
-            }
-        }
-        Err(e) => tracing::warn!("relay inbox fetch failed: {e}"),
-    }
-
-    // Sort oldest first within the combined result.
-    messages.sort_by(|a, b| a.sent_at.cmp(&b.sent_at));
-
-    Ok(messages)
-}
-
-/// Decode a raw DM envelope from the direct iroh queue into a `ReceivedMessage`.
-/// Returns None if the message fails verification, is not addressed to us, or is
-/// filtered by the allow_dms setting.
-fn decode_dm_envelope(
-    env: &SignedEnvelope,
-    kp: &hb_core::HoardbookKeypair,
-    own_hb_id: &str,
-    contact_ids: &Option<HashSet<String>>,
-) -> Option<ReceivedMessage> {
-    if env.verify().is_err() {
-        tracing::warn!("direct DM from {} has invalid signature — discarding", env.public_key);
-        return None;
-    }
-    let msg: ChatMessage = env.parse_payload().ok()?;
-    if msg.to != own_hb_id {
-        return None;
-    }
-    let from = env.public_key.clone();
-    if contact_ids.as_ref().is_some_and(|ids| !ids.contains(&from)) {
-        return None;
-    }
-    let content = decrypt_content(kp, &from, &msg, own_hb_id);
-    Some(ReceivedMessage { from, to: msg.to, content, sent_at: msg.sent_at.to_rfc3339(), encrypted: msg.encrypted })
-}
-
-fn decrypt_content(
-    kp: &hb_core::HoardbookKeypair,
-    from: &str,
-    msg: &ChatMessage,
-    own_hb_id: &str,
-) -> String {
-    if !msg.encrypted {
-        return msg.content.clone();
-    }
-    let aad = message_aad(from, own_hb_id, &msg.sent_at.to_rfc3339());
-    match hb_core::hb_id_decode(from) {
-        Ok(sender_pubkey) => kp
-            .decrypt_from(&sender_pubkey, &msg.content, &aad)
-            .unwrap_or_else(|_| "[Unable to decrypt]".to_string()),
-        Err(_) => "[Unable to decrypt]".to_string(),
-    }
+    let client = net::connect(&id_clone, &store).await.map_err(cmd_err)?;
+    let result =
+        fetch_dms_inner(&client, &id_clone, &own_npub, contact_npubs.as_ref(), net::RELAY_TIMEOUT)
+            .await;
+    client.disconnect().await;
+    result.map_err(cmd_err)
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests — the DM seam (L1, no relay; the wire is proven by hb-it Suite DM)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-
-    use hb_core::{DocType, HoardbookKeypair, SignedEnvelope, types::ChatMessage};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     use super::*;
-    use crate::node::{SharedDmQueue, handle_node_stream};
-    use crate::store::DataStore;
-    use tempfile::TempDir;
+    use hb_core::Identity;
 
-    fn test_store() -> (TempDir, DataStore) {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().to_path_buf();
-        (dir, DataStore::new(path))
-    }
-
-    fn make_dm_envelope(from_kp: &HoardbookKeypair, to_hb_id: &str) -> SignedEnvelope {
-        let msg = ChatMessage {
-            to: to_hb_id.to_string(),
-            content: "hello".to_string(),
-            encrypted: false,
-            sent_at: chrono::Utc::now(),
-        };
-        SignedEnvelope::create(from_kp, DocType::Message, &msg).unwrap()
-    }
-
-    /// send_dm_via_stream + handle_node_stream round-trip over a duplex pair.
     #[tokio::test]
-    async fn send_dm_via_stream_accepted() {
-        let (_dir, store) = test_store();
-        let recipient_kp = HoardbookKeypair::generate();
-        let own_hb_id = recipient_kp.hb_id();
-        let sender_kp = HoardbookKeypair::generate();
-        let envelope = make_dm_envelope(&sender_kp, &own_hb_id);
-        let dm_queue: SharedDmQueue = Arc::new(Mutex::new(vec![]));
-
-        let (server_side, client_side) = tokio::io::duplex(64 * 1024);
-        let (client_recv, client_send) = tokio::io::split(client_side);
-        let (server_recv, server_send) = tokio::io::split(server_side);
-
-        let store_srv = store.clone();
-        let hb_id_srv = own_hb_id.clone();
-        let q_srv = dm_queue.clone();
-        let server = tokio::spawn(async move {
-            handle_node_stream(server_send, server_recv, &store_srv, &hb_id_srv, &q_srv).await.unwrap();
-        });
-
-        crate::node::send_dm_via_stream(client_send, client_recv, &envelope).await.unwrap();
-        server.await.unwrap();
-
-        let q = dm_queue.lock().await;
-        assert_eq!(q.len(), 1, "DM must land in the server's queue");
+    async fn send_dm_inner_produces_a_nip17_giftwrap() {
+        // build_dm (the no-I/O half of send_dm_inner) yields a kind-1059 gift wrap signed by an
+        // ephemeral key — never the sender's npub (DM2).
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let wrap = build_dm(&alice, &bob.public_key(), "back room is open").await.unwrap();
+        assert_eq!(wrap.kind, Kind::GiftWrap, "DM wrap must be kind 1059");
+        assert_ne!(wrap.pubkey, alice.public_key(), "wrap must not be signed by the sender");
     }
 
-    /// get_messages deduplicates a message that arrives via both the direct queue
-    /// and the relay fetch.
     #[tokio::test]
-    async fn dedup_across_sources() {
-        let recipient_kp = HoardbookKeypair::generate();
-        let sender_kp = HoardbookKeypair::generate();
-        let own_hb_id = recipient_kp.hb_id();
-
-        let msg = ChatMessage {
-            to: own_hb_id.clone(),
-            content: "hello dedup".to_string(),
-            encrypted: false,
-            sent_at: chrono::DateTime::from_timestamp(1_000_000, 0).unwrap(),
-        };
-        let env = SignedEnvelope::create(&sender_kp, DocType::Message, &msg).unwrap();
-
-        // Prime the seen set with the same (from, sent_at) key.
-        let from = env.public_key.clone();
-        let sent_at = msg.sent_at.to_rfc3339();
-        let mut seen: std::collections::HashSet<(String, String)> = Default::default();
-
-        // First occurrence inserts → true.
-        assert!(seen.insert((from.clone(), sent_at.clone())));
-        // Second occurrence (relay path) → false (already seen).
-        assert!(!seen.insert((from, sent_at)));
+    async fn send_dm_inner_inner_rumor_is_kind_14() {
+        // NIP-17 conformance: the sealed inner rumor is an unsigned kind-14 (PrivateDirectMessage)
+        // event. A round-trip test alone could pass on a non-conformant inner event a real NIP-17
+        // peer would reject. The recovered sender is the real npub, not the ephemeral wrap key.
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let wrap = build_dm(&alice, &bob.public_key(), "hi").await.unwrap();
+        let unwrapped = nostr::nips::nip59::extract_rumor(bob.keys(), &wrap).await.unwrap();
+        assert_eq!(
+            unwrapped.rumor.kind,
+            Kind::PrivateDirectMessage,
+            "inner rumor must be kind 14 (private direct message)"
+        );
+        assert_eq!(unwrapped.sender, alice.public_key(), "rumor sender is the real npub");
     }
 
-    /// Decryption failure produces the spec placeholder string.
-    #[test]
-    fn decryption_failure_placeholder() {
-        let kp = HoardbookKeypair::generate();
-        let other_kp = HoardbookKeypair::generate();
-        let msg = ChatMessage {
-            to: kp.hb_id(),
-            content: "not-valid-ciphertext".to_string(),
-            encrypted: true,
-            sent_at: chrono::Utc::now(),
-        };
-        let result = decrypt_content(&kp, &other_kp.hb_id(), &msg, &kp.hb_id());
-        assert_eq!(result, "[Unable to decrypt]");
+    #[tokio::test]
+    async fn fetch_dms_inner_unwraps_to_sender_and_plaintext() {
+        // decode_dms recovers the REAL sender npub + plaintext from the seal.
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let wrap = build_dm(&alice, &bob.public_key(), "secret tape list").await.unwrap();
+        let msgs = decode_dms(&bob.npub(), &bob, vec![wrap], None).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].from, alice.npub(), "from is the real sender npub");
+        assert_eq!(msgs[0].to, bob.npub());
+        assert_eq!(msgs[0].content, "secret tape list");
     }
 
-    /// Messages from unknown senders also produce the placeholder.
+    #[tokio::test]
+    async fn fetch_dms_inner_rejects_malformed_giftwrap_not_panicked() {
+        // A corrupt/foreign gift wrap from a hostile relay → skipped with a reason, never a panic.
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        // A plain text note is not a gift wrap addressed to bob.
+        let garbage = alice.sign(EventBuilder::new(Kind::TextNote, "not a wrap")).unwrap();
+        let real = build_dm(&alice, &bob.public_key(), "real").await.unwrap();
+        let msgs = decode_dms(&bob.npub(), &bob, vec![garbage, real], None).await;
+        assert_eq!(msgs.len(), 1, "only the real DM decodes; the garbage is skipped");
+        assert_eq!(msgs[0].content, "real");
+    }
+
+    #[tokio::test]
+    async fn decode_dms_honours_contact_allow_list() {
+        // allow_dms off: a stranger's DM is filtered out; a contact's is kept.
+        let me = Identity::generate();
+        let contact = Identity::generate();
+        let stranger = Identity::generate();
+        let from_contact = build_dm(&contact, &me.public_key(), "hey").await.unwrap();
+        let from_stranger = build_dm(&stranger, &me.public_key(), "spam").await.unwrap();
+        let allow: HashSet<String> = [contact.npub()].into_iter().collect();
+        let msgs =
+            decode_dms(&me.npub(), &me, vec![from_contact, from_stranger], Some(&allow)).await;
+        assert_eq!(msgs.len(), 1, "only the contact's DM survives the allow-list");
+        assert_eq!(msgs[0].from, contact.npub());
+    }
+
     #[test]
-    fn unknown_sender_key_placeholder() {
-        let kp = HoardbookKeypair::generate();
-        let msg = ChatMessage {
-            to: kp.hb_id(),
-            content: "gibberish".to_string(),
-            encrypted: true,
-            sent_at: chrono::Utc::now(),
+    fn dm_path_no_longer_builds_a_signed_envelope() {
+        // The legacy DM payload is gone: ReceivedMessage carries only npub-attributed fields, with
+        // no `encrypted` flag and no JCS-AAD concept. Asserted by the serialized shape.
+        let msg = ReceivedMessage {
+            from: "npub1from".into(),
+            to: "npub1to".into(),
+            content: "x".into(),
+            sent_at: "2026-06-17T00:00:00Z".into(),
         };
-        let result = decrypt_content(&kp, "not-a-valid-hb-id", &msg, &kp.hb_id());
-        assert_eq!(result, "[Unable to decrypt]");
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("encrypted"), "no legacy `encrypted` flag");
+        assert!(json.contains("\"from\":\"npub1from\""));
     }
 }

@@ -468,10 +468,10 @@
 					</button>
 				{:else}
 					<div class="ob-card-title">Your identity is ready</div>
-					<div class="ob-card-sub">This is your Hoardbook ID. Share it so others can find and connect with you.</div>
+					<div class="ob-card-sub">This is your Hoardbook share code. Share it so others can follow you and browse your collections.</div>
 					<div class="ob-hbid-row">
-						<span class="ob-hbid mono">{$identity?.hb_id ?? ''}</span>
-						<button class="btn-ghost btn-sm" on:click={() => { navigator.clipboard.writeText($identity?.hb_id ?? ''); toast('Copied', 'success'); }}>Copy</button>
+						<span class="ob-hbid mono">{$identity?.share_code ?? ''}</span>
+						<button class="btn-ghost btn-sm" on:click={() => { navigator.clipboard.writeText($identity?.share_code ?? ''); toast('Copied', 'success'); }}>Copy</button>
 					</div>
 					<div class="ob-notice" style="margin-top:12px">
 						<span class="ob-notice-icon">{@html icons.shield}</span>
@@ -558,7 +558,7 @@
 				<Avatar letter={nameInitial} size={48} hue={nameHue} />
 				<div class="profile-header-info">
 					<div class="profile-name">{form.display_name || 'DataHoarder'}</div>
-					<span class="mono">{$identity?.hb_id_short ?? ''}</span>
+					<span class="mono">{$identity?.npub_short ?? ''}</span>
 				</div>
 			</div>
 

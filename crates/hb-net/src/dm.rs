@@ -12,12 +12,15 @@ use nostr::prelude::*;
 
 use crate::error::NetError;
 
-/// A DM after unwrapping: the *real* sender (recovered from the seal, not the ephemeral wrap)
-/// and the plaintext.
+/// A DM after unwrapping: the *real* sender (recovered from the seal, not the ephemeral wrap),
+/// the plaintext, and the inner rumor's `created_at` (the true send time — the outer gift-wrap
+/// timestamp is randomised by NIP-59, so it must never be used for ordering).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectMessage {
     pub sender: PublicKey,
     pub content: String,
+    /// Unix seconds from the inner kind-14 rumor — the real send time.
+    pub created_at: u64,
 }
 
 /// Gift-wrap `message` from `identity` to `recipient` (NIP-17). The returned event (kind 1059)
@@ -42,6 +45,7 @@ pub async fn unwrap_dm(identity: &Identity, gift_wrap: &Event) -> Result<DirectM
     Ok(DirectMessage {
         sender: unwrapped.sender,
         content: unwrapped.rumor.content,
+        created_at: unwrapped.rumor.created_at.as_u64(),
     })
 }
 
@@ -68,6 +72,23 @@ mod tests {
         assert_ne!(wrap.pubkey, alice.public_key(), "wrap must not be signed by the sender");
         assert_ne!(wrap.pubkey, bob.public_key(), "nor by the recipient");
         assert_eq!(wrap.kind, Kind::GiftWrap);
+    }
+
+    #[tokio::test]
+    async fn nip17_created_at_is_inner_send_time_not_outer_wrap() {
+        // The outer gift wrap's timestamp is randomised into the past by NIP-59; the inner rumor
+        // carries the real send time. DirectMessage.created_at must reflect the inner time, so it
+        // is never older than the (randomised-past) outer wrap timestamp.
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let wrap = wrap_dm(&alice, &bob.public_key(), "when?").await.unwrap();
+        let dm = unwrap_dm(&bob, &wrap).await.unwrap();
+        assert!(
+            dm.created_at >= wrap.created_at.as_u64(),
+            "inner send time {} must not predate the randomised-past wrap time {}",
+            dm.created_at,
+            wrap.created_at.as_u64()
+        );
     }
 
     #[tokio::test]

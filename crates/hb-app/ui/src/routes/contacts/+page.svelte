@@ -1,23 +1,13 @@
 <script lang="ts">
-	import { pasteKey, follow, refreshContact, requestDownload, unfollowContact, setContactTags, getDirectory, dhtSearch, watchesCreate, watchesEvaluate, groupsGet, contactUpdateGroups } from '$lib/api.js';
+	import { pasteKey, follow, refreshContact, requestDownload, unfollowContact, setContactTags, groupsGet, contactUpdateGroups } from '$lib/api.js';
 	import { save } from '@tauri-apps/plugin-dialog';
 	import { contacts, identity, toast, downloads } from '$lib/stores.js';
 	import DownloadQueue from '$lib/components/DownloadQueue.svelte';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
-	import type { CachedPeer, DirectoryPeer, DhtResult, Group } from '$lib/types.js';
+	import type { CachedPeer, Group } from '$lib/types.js';
 	import { onMount } from 'svelte';
-
-	// Recommended directory
-	let directory: DirectoryPeer[] = [];
-	let directoryLoading = false;
-
-	async function loadDirectory() {
-		directoryLoading = true;
-		try { directory = await getDirectory(); } catch { /* relay may be unreachable */ }
-		finally { directoryLoading = false; }
-	}
 
 	// IP warning modal state (task 8)
 	let showIpWarning = false;
@@ -41,9 +31,8 @@
 		return groups.filter(g => g.pubkeys.includes(hb_id)).map(g => g.name);
 	}
 
-	// Group picker for follow flow (lookup result + DHT).
+	// Group picker for the follow flow.
 	let followGroupName = '';
-	let dhtFollowGroupName: Record<string, string> = {};
 
 	// Per-contact group-change select: hb_id → selected group name or '' for Ungrouped.
 	let contactGroupEditing: Record<string, boolean> = {};
@@ -58,30 +47,15 @@
 	}
 
 	onMount(() => {
-		loadDirectory();
 		loadGroups();
 		// Refresh all contacts in parallel on page load (task 4)
 		$contacts.forEach(async (c) => {
 			try {
-				const updated = await refreshContact(c.hb_id);
-				contacts.update(cs => cs.map(x => x.hb_id === c.hb_id ? { ...x, ...updated, local_tags: x.local_tags } : x));
+				const updated = await refreshContact(c.npub);
+				contacts.update(cs => cs.map(x => x.npub === c.npub ? { ...x, ...updated, local_tags: x.local_tags } : x));
 			} catch { /* silent — relay may be unreachable */ }
 		});
 	});
-
-	// Exclude contacts already followed AND the current user's own ID.
-	$: recommendedPeers = directory.filter(
-		d => !$contacts.some(c => c.hb_id === d.hb_id) && d.hb_id !== $identity?.hb_id
-	);
-
-	async function handleFollowDirectory(peer: DirectoryPeer) {
-		try {
-			await follow(peer.hb_id);
-			const fetched = await pasteKey(peer.hb_id);
-			contacts.update(cs => cs.find(c => c.hb_id === peer.hb_id) ? cs : [...cs, fetched]);
-			toast(`Following ${peer.profile?.display_name ?? peer.hb_id}`);
-		} catch (e) { toast(String(e), 'error'); }
-	}
 
 	// Lookup state
 	let input = '';
@@ -89,12 +63,12 @@
 	let following = false;
 	let result: CachedPeer | null = null;
 
-	$: alreadyFollowed = $contacts.some((c) => c.hb_id === result?.hb_id);
+	$: alreadyFollowed = $contacts.some((c) => c.npub === result?.npub);
 
 	async function handleLookup() {
 		const id = input.trim();
 		if (!id) return;
-		if (id === $identity?.hb_id) {
+		if (id === $identity?.npub) {
 			toast("That's your own ID — you can't add yourself as a contact.", 'error');
 			return;
 		}
@@ -113,13 +87,13 @@
 		if (!result) return;
 		following = true;
 		try {
-			await follow(result.hb_id, followGroupName || undefined);
+			await follow(result.npub, followGroupName || undefined);
 			contacts.update((cs) => {
-				if (cs.find((c) => c.hb_id === result!.hb_id)) return cs;
+				if (cs.find((c) => c.npub === result!.npub)) return cs;
 				return [...cs, result!];
 			});
 			await loadGroups();
-			toast(`Following ${result.profile?.display_name ?? result.hb_id}`);
+			toast(`Following ${result.profile?.display_name ?? result.npub}`);
 			followGroupName = '';
 		} catch (e) {
 			toast(String(e), 'error');
@@ -134,7 +108,7 @@
 	let autoRefreshing: string | null = null;
 
 	async function handleExpand(peer: CachedPeer) {
-		const id = peer.hb_id;
+		const id = peer.npub;
 		if (expanded === id) {
 			expanded = null;
 			return;
@@ -145,7 +119,7 @@
 			autoRefreshing = id;
 			try {
 				const updated = await refreshContact(id);
-				contacts.update(cs => cs.map(c => c.hb_id === id ? { ...c, ...updated, local_tags: c.local_tags } : c));
+				contacts.update(cs => cs.map(c => c.npub === id ? { ...c, ...updated, local_tags: c.local_tags } : c));
 			} catch { /* silent — don't nag if relay is unreachable */ }
 			finally { autoRefreshing = null; }
 		}
@@ -155,7 +129,7 @@
 		refreshing = hb_id;
 		try {
 			const updated = await refreshContact(hb_id);
-			contacts.update((cs) => cs.map((c) => (c.hb_id === hb_id ? { ...updated, local_tags: c.local_tags } : c)));
+			contacts.update((cs) => cs.map((c) => (c.npub === hb_id ? { ...updated, local_tags: c.local_tags } : c)));
 			toast('Contact refreshed');
 		} catch (e) {
 			toast(String(e), 'error');
@@ -167,7 +141,7 @@
 	async function handleUnfollow(hb_id: string) {
 		try {
 			await unfollowContact(hb_id);
-			contacts.update((cs) => cs.filter((c) => c.hb_id !== hb_id));
+			contacts.update((cs) => cs.filter((c) => c.npub !== hb_id));
 			toast('Contact removed');
 		} catch (e) {
 			toast(String(e), 'error');
@@ -175,23 +149,17 @@
 	}
 
 	async function handleDownload(e: CustomEvent<{ peerId: string; slug: string; path: string }>) {
-		const peer = $contacts.find((c) => c.hb_id === e.detail.peerId);
-		if (peer?.node_addr) {
-			// Direct P2P connection will be used — warn about IP exposure first
-			pendingDownloadDetail = e.detail;
-			showIpWarning = true;
-			return;
-		}
-		await proceedWithDownload(e.detail);
+		// Every download is now a direct, binding-gated P2P connection — always warn about IP exposure.
+		pendingDownloadDetail = e.detail;
+		showIpWarning = true;
 	}
 
 	async function proceedWithDownload(detail: { peerId: string; slug: string; path: string }) {
 		const filename = detail.path.split('/').pop() ?? detail.path;
 		const savePath = await save({ defaultPath: filename });
 		if (!savePath) return;
-		const peer = $contacts.find((c) => c.hb_id === detail.peerId);
 		try {
-			const id = await requestDownload(detail.peerId, peer?.node_addr ?? null, detail.slug, detail.path, savePath);
+			const id = await requestDownload(detail.peerId, detail.slug, detail.path, savePath);
 			downloads.update(list => [
 				...list,
 				{ id, filename, save_path: savePath,
@@ -235,8 +203,7 @@
 	}
 
 	function lastSeenLabel(peer: import('$lib/types.js').CachedPeer): string {
-		// Prefer relay-provided last_seen_at (accurate activity time) over last_fetched (our fetch time).
-		const ts = peer.last_seen_at ?? peer.last_fetched;
+		const ts = peer.last_fetched;
 		if (!ts) return 'never';
 		return formatLastSeen(ts);
 	}
@@ -252,7 +219,7 @@
 		tagInput = '';
 		try {
 			await setContactTags(hb_id, newTags);
-			contacts.update(cs => cs.map(c => c.hb_id === hb_id ? { ...c, local_tags: newTags } : c));
+			contacts.update(cs => cs.map(c => c.npub === hb_id ? { ...c, local_tags: newTags } : c));
 		} catch (e) { toast(String(e), 'error'); }
 	}
 
@@ -260,76 +227,8 @@
 		const newTags = current_tags.filter(t => t !== tag);
 		try {
 			await setContactTags(hb_id, newTags);
-			contacts.update(cs => cs.map(c => c.hb_id === hb_id ? { ...c, local_tags: newTags } : c));
+			contacts.update(cs => cs.map(c => c.npub === hb_id ? { ...c, local_tags: newTags } : c));
 		} catch (e) { toast(String(e), 'error'); }
-	}
-
-	// DHT Discover
-	let dhtTagInput = '';
-	let dhtCtInput = '';
-	let dhtResults: DhtResult[] = [];
-	let dhtSearching = false;
-	let dhtSearched = false;
-	let showWatchForm = false;
-	let watchName = '';
-	let savingWatch = false;
-
-	async function handleDhtSearch() {
-		const tags = dhtTagInput.split(',').map(s => s.trim()).filter(Boolean);
-		const cts = dhtCtInput.split(',').map(s => s.trim()).filter(Boolean);
-		if (tags.length === 0 && cts.length === 0) {
-			toast('Enter at least one tag or content type', 'error');
-			return;
-		}
-		dhtSearching = true;
-		dhtSearched = false;
-		dhtResults = [];
-		try {
-			dhtResults = await dhtSearch(tags, cts);
-			dhtSearched = true;
-			const candidates = dhtResults.map(r => r.hb_id);
-			if (candidates.length > 0) {
-				const hits = await watchesEvaluate(candidates);
-				for (const hit of hits) {
-					toast(`Watch "${hit.watch_name}" — new peer found`);
-				}
-			}
-		} catch (e) {
-			toast(String(e), 'error');
-		} finally {
-			dhtSearching = false;
-		}
-	}
-
-	async function handleFollowDht(r: DhtResult) {
-		try {
-			const groupName = dhtFollowGroupName[r.hb_id] || undefined;
-			await follow(r.hb_id, groupName);
-			const fetched = await pasteKey(r.hb_id);
-			contacts.update(cs => cs.find(c => c.hb_id === r.hb_id) ? cs : [...cs, fetched]);
-			await loadGroups();
-			toast(`Following ${r.profile?.display_name ?? r.hb_id}`);
-		} catch (e) {
-			toast(String(e), 'error');
-		}
-	}
-
-	async function handleSaveWatch() {
-		const name = watchName.trim();
-		if (!name) return;
-		const tags = dhtTagInput.split(',').map(s => s.trim()).filter(Boolean);
-		const cts = dhtCtInput.split(',').map(s => s.trim()).filter(Boolean);
-		savingWatch = true;
-		try {
-			await watchesCreate(name, tags, cts);
-			toast(`Watch "${name}" saved`);
-			showWatchForm = false;
-			watchName = '';
-		} catch (e) {
-			toast(String(e), 'error');
-		} finally {
-			savingWatch = false;
-		}
 	}
 
 	// Filter by tag
@@ -380,9 +279,9 @@
 					<div class="profile-inner">
 						<div class="profile-top">
 							<Avatar
-								letter={(result.profile?.display_name ?? result.hb_id)[0].toUpperCase()}
+								letter={(result.profile?.display_name ?? result.npub)[0].toUpperCase()}
 								size={52}
-								hue={avatarHue((result.profile?.display_name ?? result.hb_id)[0])}
+								hue={avatarHue((result.profile?.display_name ?? result.npub)[0])}
 							/>
 							<div class="profile-name-col">
 								<div class="name-row">
@@ -393,7 +292,7 @@
 										<span class="pill pill-offline">Offline</span>
 									{/if}
 								</div>
-								<span class="mono">{result.hb_id.slice(0, 18)}…{result.hb_id.slice(-4)}</span>
+								<span class="mono">{result.npub.slice(0, 18)}…{result.npub.slice(-4)}</span>
 							</div>
 							<div class="profile-actions">
 								{#if !alreadyFollowed && groups.length > 0}
@@ -476,136 +375,6 @@
 		{/if}
 	</div>
 
-	<!-- Recommended peers from relay directory -->
-	{#if recommendedPeers.length > 0 || directoryLoading}
-		<div class="section-divider">
-			<div class="divider-line" />
-			<span class="divider-label">Recommended</span>
-			<div class="divider-line" />
-			<button class="icon-btn" title="Refresh recommended" on:click={loadDirectory} disabled={directoryLoading}>
-				{@html icons.refresh}
-			</button>
-		</div>
-		{#if directoryLoading}
-			<div class="empty">Loading recommended peers…</div>
-		{:else}
-			<div class="rec-list">
-				{#each recommendedPeers as peer}
-					{@const name = peer.profile?.display_name ?? peer.hb_id.slice(0, 12) + '…'}
-					{@const initial = name[0]?.toUpperCase() ?? '?'}
-					{@const hue = avatarHue(initial)}
-					<div class="rec-card">
-						<Avatar letter={initial} size={38} {hue} />
-						<div class="rec-info">
-							<div class="name-row">
-								<span class="peer-name">{name}</span>
-							</div>
-							{#if peer.profile?.bio}
-								<p class="bio">{peer.profile.bio}</p>
-							{/if}
-							{#if peer.profile?.location}
-								<span class="rec-location">{peer.profile.location}</span>
-							{/if}
-						</div>
-						<button class="btn-primary btn-sm" on:click={() => handleFollowDirectory(peer)}>
-							Follow
-						</button>
-					</div>
-				{/each}
-			</div>
-		{/if}
-	{/if}
-
-	<!-- Discover (DHT tag search) -->
-	<div class="section-divider">
-		<div class="divider-line" />
-		<span class="divider-label">Discover</span>
-		<div class="divider-line" />
-	</div>
-
-	<div class="discover-form">
-		<div class="discover-inputs">
-			<input
-				class="disc-input"
-				placeholder="Tags: anime, manga…"
-				bind:value={dhtTagInput}
-				on:keydown={(e) => e.key === 'Enter' && handleDhtSearch()}
-			/>
-			<input
-				class="disc-input"
-				placeholder="Content types: video, book…"
-				bind:value={dhtCtInput}
-				on:keydown={(e) => e.key === 'Enter' && handleDhtSearch()}
-			/>
-			<button
-				class="btn-primary"
-				on:click={handleDhtSearch}
-				disabled={dhtSearching || (!dhtTagInput.trim() && !dhtCtInput.trim())}
-			>
-				{dhtSearching ? 'Searching…' : 'Search DHT'}
-			</button>
-		</div>
-
-		{#if dhtSearched}
-			{#if dhtResults.length === 0}
-				<div class="empty">No peers found on the DHT for those filters.</div>
-			{:else}
-				<div class="rec-list">
-					{#each dhtResults as r (r.hb_id)}
-						{@const name = r.profile?.display_name ?? r.hb_id.slice(0, 12) + '…'}
-						{@const initial = name[0]?.toUpperCase() ?? '?'}
-						{@const hue = avatarHue(initial)}
-						{@const isFollowed = $contacts.some(c => c.hb_id === r.hb_id)}
-						<div class="rec-card">
-							<Avatar letter={initial} size={38} {hue} />
-							<div class="rec-info">
-								<div class="name-row">
-									<span class="peer-name">{name}</span>
-									{#if r.online}
-										<span class="pill pill-online"><span class="pill-dot" /></span>
-									{/if}
-								</div>
-								{#if r.profile?.bio}
-									<p class="rec-bio">{r.profile.bio}</p>
-								{/if}
-							</div>
-							{#if !isFollowed && groups.length > 0}
-								<select class="group-select" bind:value={dhtFollowGroupName[r.hb_id]}>
-									<option value="">Ungrouped</option>
-									{#each groups as g (g.name)}
-										<option value={g.name}>{g.name}</option>
-									{/each}
-								</select>
-							{/if}
-							<button class="btn-primary btn-sm" on:click={() => handleFollowDht(r)} disabled={isFollowed}>
-								{isFollowed ? 'Following' : 'Follow'}
-							</button>
-						</div>
-					{/each}
-				</div>
-
-				{#if !showWatchForm}
-					<button class="btn-ghost btn-sm" on:click={() => { showWatchForm = true; }}>
-						+ Save as watch
-					</button>
-				{:else}
-					<div class="watch-save-row">
-						<input
-							class="disc-input"
-							placeholder="Watch name…"
-							bind:value={watchName}
-							on:keydown={(e) => e.key === 'Enter' && handleSaveWatch()}
-						/>
-						<button class="btn-primary btn-sm" on:click={handleSaveWatch} disabled={!watchName.trim() || savingWatch}>
-							{savingWatch ? '…' : 'Save watch'}
-						</button>
-						<button class="btn-ghost btn-sm" on:click={() => { showWatchForm = false; watchName = ''; }}>Cancel</button>
-					</div>
-				{/if}
-			{/if}
-		{/if}
-	</div>
-
 	<!-- Divider + tag filter -->
 	<div class="section-divider">
 		<div class="divider-line" />
@@ -652,7 +421,7 @@
 				{@const name = peer.profile?.display_name ?? 'Unknown'}
 				{@const initial = name[0]?.toUpperCase() ?? '?'}
 				{@const hue = avatarHue(initial)}
-				{@const peerGroups = contactGroups(peer.hb_id)}
+				{@const peerGroups = contactGroups(peer.npub)}
 				{@const stale = isStale(peer) && !peer.online}
 				<div class="contact-block">
 					<div class="contact-card">
@@ -671,51 +440,51 @@
 								<div style="flex:1" />
 								<button
 									class="btn-ghost btn-xs btn-icon"
-									on:click={() => handleRefresh(peer.hb_id)}
-									disabled={refreshing === peer.hb_id}
+									on:click={() => handleRefresh(peer.npub)}
+									disabled={refreshing === peer.npub}
 									title="Refresh"
 								>
 									<span>{@html icons.refresh}</span>
 								</button>
-								<button class="btn-ghost btn-xs btn-danger" on:click={() => handleUnfollow(peer.hb_id)} title="Unfollow">
+								<button class="btn-ghost btn-xs btn-danger" on:click={() => handleUnfollow(peer.npub)} title="Unfollow">
 									Unfollow
 								</button>
 								<button class="btn-default btn-xs" on:click={() => handleExpand(peer)}>
-									{expanded === peer.hb_id ? 'Hide' : 'Browse'}
+									{expanded === peer.npub ? 'Hide' : 'Browse'}
 								</button>
 							</div>
 							<div class="contact-sub-row">
-								<div class="mono">{shortId(peer.hb_id)}</div>
+								<div class="mono">{shortId(peer.npub)}</div>
 								{#if peer.profile?.est_size}<span class="sub-dot">·</span><span class="sub-meta">~{peer.profile.est_size}</span>{/if}
 								{#if peer.collections.length > 0}<span class="sub-dot">·</span><span class="sub-meta">{peer.collections.length} collection{peer.collections.length !== 1 ? 's' : ''}</span>{/if}
 							</div>
 
 							<!-- Groups -->
-							{#if peerGroups.length > 0 || contactGroupEditing[peer.hb_id]}
+							{#if peerGroups.length > 0 || contactGroupEditing[peer.npub]}
 								<div class="group-row">
 									{#each peerGroups as gname}
 										<span class="group-pill">{gname}</span>
 									{/each}
-									{#if contactGroupEditing[peer.hb_id]}
+									{#if contactGroupEditing[peer.npub]}
 										<select
 											class="group-select group-select-inline"
-											on:change={(e) => handleMoveGroup(peer.hb_id, e.currentTarget.value)}
+											on:change={(e) => handleMoveGroup(peer.npub, e.currentTarget.value)}
 										>
 											<option value="">Ungrouped</option>
 											{#each groups as g (g.name)}
 												<option value={g.name} selected={peerGroups.includes(g.name)}>{g.name}</option>
 											{/each}
 										</select>
-										<button class="tag-x" on:click={() => { contactGroupEditing = { ...contactGroupEditing, [peer.hb_id]: false }; }}>×</button>
+										<button class="tag-x" on:click={() => { contactGroupEditing = { ...contactGroupEditing, [peer.npub]: false }; }}>×</button>
 									{:else if groups.length > 0}
-										<button class="tag-add-btn" on:click={() => { contactGroupEditing = { ...contactGroupEditing, [peer.hb_id]: true }; }}>
+										<button class="tag-add-btn" on:click={() => { contactGroupEditing = { ...contactGroupEditing, [peer.npub]: true }; }}>
 											{peerGroups.length > 0 ? '✎' : '+ group'}
 										</button>
 									{/if}
 								</div>
 							{:else if groups.length > 0}
 								<div class="group-row">
-									<button class="tag-add-btn" on:click={() => { contactGroupEditing = { ...contactGroupEditing, [peer.hb_id]: true }; }}>+ group</button>
+									<button class="tag-add-btn" on:click={() => { contactGroupEditing = { ...contactGroupEditing, [peer.npub]: true }; }}>+ group</button>
 								</div>
 							{/if}
 
@@ -724,40 +493,40 @@
 								{#each (peer.local_tags ?? []) as tag}
 									<span class="local-tag">
 										{tag}
-										<button class="tag-x" on:click={() => handleRemoveTag(peer.hb_id, peer.local_tags ?? [], tag)}>×</button>
+										<button class="tag-x" on:click={() => handleRemoveTag(peer.npub, peer.local_tags ?? [], tag)}>×</button>
 									</span>
 								{/each}
-								{#if editingTagsFor === peer.hb_id}
+								{#if editingTagsFor === peer.npub}
 									<input
 										class="tag-input"
 										type="text"
 										placeholder="tag…"
 										bind:value={tagInput}
 										on:keydown={(e) => {
-											if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); handleAddTag(peer.hb_id, peer.local_tags ?? []); }
+											if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); handleAddTag(peer.npub, peer.local_tags ?? []); }
 											if (e.key === 'Escape') { editingTagsFor = null; tagInput = ''; }
 										}}
 										on:blur={() => { editingTagsFor = null; tagInput = ''; }}
 									/>
 								{:else}
-									<button class="tag-add-btn" on:click={() => { editingTagsFor = peer.hb_id; tagInput = ''; }}>+ tag</button>
+									<button class="tag-add-btn" on:click={() => { editingTagsFor = peer.npub; tagInput = ''; }}>+ tag</button>
 								{/if}
 							</div>
 						</div>
 					</div>
 
-					{#if expanded === peer.hb_id}
+					{#if expanded === peer.npub}
 						<div class="collections-indent">
 							{#if peer.profile?.bio}
 								<p class="contact-bio">{peer.profile.bio}</p>
 							{/if}
-							{#if autoRefreshing === peer.hb_id}
+							{#if autoRefreshing === peer.npub}
 								<p class="no-coll">Checking for collections…</p>
 							{:else if peer.collections.length === 0}
 								<p class="no-coll">No collections published.</p>
 							{:else}
 								{#each peer.collections as col}
-									<CollectionPanel collection={col} peerId={peer.hb_id} on:download={handleDownload} />
+									<CollectionPanel collection={col} peerId={peer.npub} on:download={handleDownload} />
 								{/each}
 							{/if}
 						</div>

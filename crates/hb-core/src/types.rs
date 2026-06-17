@@ -135,68 +135,6 @@ pub enum ItemType {
 }
 
 // ---------------------------------------------------------------------------
-// HeartbeatBody
-// ---------------------------------------------------------------------------
-
-/// The body signed for a heartbeat request.
-/// Only non-None fields are included in the JCS-canonical form.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeartbeatBody {
-    /// Optional iroh NodeAddr (base64-encoded). Included only in direct mode.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node_addr: Option<String>,
-    /// The sender's Hoardbook ID.
-    pub public_key: String,
-    /// ISO 8601 timestamp — included in the signed payload to prevent replay.
-    pub signed_at: String,
-}
-
-// ---------------------------------------------------------------------------
-// ChatMessage
-// ---------------------------------------------------------------------------
-
-/// The signed payload for a peer-to-peer chat message.
-/// Stored in the relay addressed to the `to` key's inbox.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatMessage {
-    /// Recipient's Hoardbook ID.
-    pub to: String,
-    /// When `encrypted` is false: plaintext content (max 4096 bytes).
-    /// When `encrypted` is true: `base64(nonce[24] || xchacha20poly1305_ciphertext)`.
-    pub content: String,
-    /// True when content is E2E-encrypted (X25519 DH + ChaCha20-Poly1305).
-    #[serde(default)]
-    pub encrypted: bool,
-    /// Timestamp included in the signed payload to prevent replay.
-    pub sent_at: DateTime<Utc>,
-}
-
-// ---------------------------------------------------------------------------
-// StoredKeypair
-// ---------------------------------------------------------------------------
-
-/// On-disk representation of the keypair before OS keychain encryption.
-/// The app layer wraps this in the OS keychain; hb-core only handles the
-/// serialization format.
-#[derive(Serialize, Deserialize)]
-pub struct StoredKeypair {
-    pub version: u32,
-    pub hb_id: String,
-    /// Hex-encoded 32-byte Ed25519 private key.
-    pub private_key_hex: String,
-}
-
-impl std::fmt::Debug for StoredKeypair {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StoredKeypair")
-            .field("version", &self.version)
-            .field("hb_id", &self.hb_id)
-            .field("private_key_hex", &"[REDACTED]")
-            .finish()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

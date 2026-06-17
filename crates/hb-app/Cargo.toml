@@ -28,6 +28,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 hb-core    = { path = "../hb-core" }
+hb-net     = { path = "../hb-net" }
+# Direct `nostr` dep pinned to hb-core/hb-net's version, with the protocol features the app
+# touches (NIP-44 listing crypto via hb-core, NIP-59/17 gift-wrap DMs via hb-net).
+nostr      = { version = "=0.43.1", features = ["nip44", "nip59"] }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 thiserror  = { workspace = true }
@@ -37,19 +41,15 @@ tokio      = { workspace = true }
 tracing    = { workspace = true }
 hex        = { workspace = true }
 zeroize    = "1"
+rand       = "0.8"
 
 tauri               = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
-reqwest = { version = "0.12", features = ["json"] }
 sha2    = "0.10"
 iroh    = { version = "0.98", default-features = false, features = ["tls-ring"] }
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
 globset = "0.4"
-urlencoding = "2"
-mainline = "6"
-sha1     = "0.10"
-futures  = "0.3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 hb-dpapi = { path = "../hb-dpapi" }
