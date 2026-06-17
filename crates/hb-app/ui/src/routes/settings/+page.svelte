@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { generateKeypair, getHbId, getSettings, saveSettings, importKeypair, wipeData, checkRelay, checkUpdate, installUpdate, watchesGet, watchesDelete, dhtStartAnnounce, dhtStopAnnounce } from '$lib/api.js';
+	import { generateKeypair, getShareCode, getSettings, saveSettings, importKeypair, wipeData, checkRelay, checkUpdate, installUpdate, watchesGet, watchesDelete } from '$lib/api.js';
 	import type { UpdateInfo } from '$lib/api.js';
 	import type { Watch } from '$lib/types.js';
 	import { relaunch } from '@tauri-apps/plugin-process';
@@ -78,33 +78,6 @@
 
 	let allowDms = true;
 
-	// DHT Announce
-	let dhtEnabled = false;
-	let dhtTagsRaw = '';
-	let dhtCtRaw = '';
-	let dhtSaving = false;
-
-	function parseCsv(raw: string): string[] {
-		return raw.split(',').map(s => s.trim()).filter(Boolean);
-	}
-
-	async function toggleDhtAnnounce() {
-		dhtSaving = true;
-		try {
-			if (dhtEnabled) {
-				await dhtStopAnnounce();
-				dhtEnabled = false;
-			} else {
-				await dhtStartAnnounce();
-				dhtEnabled = true;
-			}
-		} catch (e) {
-			toast(String(e), 'error');
-		} finally {
-			dhtSaving = false;
-		}
-	}
-
 	let wipeConfirm = false;
 	let wiping = false;
 
@@ -120,9 +93,6 @@
 			// Filter out bootstrap relay from user list (it's shown separately).
 			relayUrls = s.relay_urls.filter(u => u !== BOOTSTRAP_RELAY);
 			allowDms = s.allow_dms ?? true;
-			dhtEnabled = s.dht_announce_enabled ?? false;
-			dhtTagsRaw = (s.dht_announce_tags ?? []).join(', ');
-			dhtCtRaw = (s.dht_announce_content_types ?? []).join(', ');
 			relayUrls.forEach(probeRelay);
 		} catch { /* proceed with defaults if settings load fails */ }
 	});
@@ -142,7 +112,7 @@
 
 	async function handleCopy() {
 		try {
-			const id = await getHbId();
+			const id = await getShareCode();
 			// Try the modern clipboard API first; fall back to execCommand for
 			// environments where navigator.clipboard is restricted.
 			try {
@@ -185,9 +155,6 @@
 		return {
 			relay_urls: relayUrls,
 			allow_dms: allowDms,
-			dht_announce_enabled: dhtEnabled,
-			dht_announce_tags: parseCsv(dhtTagsRaw),
-			dht_announce_content_types: parseCsv(dhtCtRaw),
 		};
 	}
 
@@ -314,9 +281,9 @@
 				<span class="pill pill-online"><span class="pill-dot" />Active</span>
 			</div>
 
-			<div class="field-label" style="margin-bottom:6px">Your Hoardbook ID</div>
+			<div class="field-label" style="margin-bottom:6px">Your share code</div>
 			<div class="id-display">
-				<span class="id-text">{$identity.hb_id}</span>
+				<span class="id-text">{$identity.share_code}</span>
 				<button class="icon-btn" on:click={handleCopy} title="Copy to clipboard">{@html icons.copy}</button>
 			</div>
 
@@ -410,33 +377,6 @@
 		</div>
 	</div>
 
-	<!-- DHT Discovery -->
-	<div class="section-label">DHT Discovery</div>
-
-	<div class="surface">
-		<div class="dht-fields">
-			<div class="field-label">Tags to announce (comma-separated)</div>
-			<input class="hb-input" placeholder="anime, manga, retro" bind:value={dhtTagsRaw} disabled={dhtEnabled} />
-			<div class="field-label" style="margin-top:8px">Content types (comma-separated)</div>
-			<input class="hb-input" placeholder="video, book, music" bind:value={dhtCtRaw} disabled={dhtEnabled} />
-			{#if dhtEnabled}
-				<div class="dht-hint">Disable to edit announced tags.</div>
-			{/if}
-		</div>
-		<div class="toggle-row">
-			<div class="toggle-text">
-				<div class="toggle-label">Announce on mainline DHT</div>
-				<div class="toggle-sub">
-					{dhtEnabled
-						? 'Active — peers can discover you via tag search.'
-						: 'Off — peers can only find you by pasting your ID.'}
-				</div>
-			</div>
-			<button class="toggle" class:toggle-on={dhtEnabled} on:click={toggleDhtAnnounce} disabled={dhtSaving}>
-				<span class="toggle-thumb" />
-			</button>
-		</div>
-	</div>
 
 	<!-- Updates -->
 	<div class="section-label">Updates</div>

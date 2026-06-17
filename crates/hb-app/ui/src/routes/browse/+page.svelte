@@ -23,13 +23,13 @@
 			const q = search.toLowerCase();
 			return (
 				(p.profile?.display_name?.toLowerCase().includes(q) ?? false) ||
-				p.hb_id.toLowerCase().includes(q)
+				p.npub.toLowerCase().includes(q)
 			);
 		})
 		.sort((a, b) => {
 			if (a.online !== b.online) return a.online ? -1 : 1;
-			const na = a.profile?.display_name ?? a.hb_id;
-			const nb = b.profile?.display_name ?? b.hb_id;
+			const na = a.profile?.display_name ?? a.npub;
+			const nb = b.profile?.display_name ?? b.npub;
 			return na.localeCompare(nb);
 		});
 
@@ -50,11 +50,11 @@
 	];
 
 	function peerName(peer: CachedPeer): string {
-		return peer.profile?.display_name ?? peer.hb_id.slice(0, 10) + '…';
+		return peer.profile?.display_name ?? peer.npub.slice(0, 10) + '…';
 	}
 
 	function peerInitial(peer: CachedPeer): string {
-		return (peer.profile?.display_name?.[0] ?? peer.hb_id[0]).toUpperCase();
+		return (peer.profile?.display_name?.[0] ?? peer.npub[0]).toUpperCase();
 	}
 
 	function selectPeer(peer: CachedPeer) {
@@ -112,8 +112,7 @@
 		if (!savePath) return;
 		try {
 			const id = await requestDownload(
-				selectedPeer.hb_id,
-				selectedPeer.node_addr ?? null,
+				selectedPeer.npub,
 				selectedCollection.slug,
 				itemPath(item),
 				savePath,
@@ -153,12 +152,12 @@
 			{:else if filteredContacts.length === 0}
 				<div class="left-empty">No matches</div>
 			{:else}
-				{#each filteredContacts as peer (peer.hb_id)}
+				{#each filteredContacts as peer (peer.npub)}
 					{@const letter = peerInitial(peer)}
 					{@const hue = avatarHue(letter)}
 					<button
 						class="contact-row"
-						class:contact-selected={selectedPeer?.hb_id === peer.hb_id}
+						class:contact-selected={selectedPeer?.npub === peer.npub}
 						on:click={() => selectPeer(peer)}
 					>
 						<div class="avatar-wrap">

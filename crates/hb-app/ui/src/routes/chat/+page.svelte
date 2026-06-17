@@ -20,14 +20,14 @@
 	// Per-peer "seen" snapshot: hb_id → inbox count at last view.
 	let seenCounts: Record<string, number> = {};
 
-	$: myId = $identity?.hb_id ?? '';
+	$: myId = $identity?.npub ?? '';
 
 	// Merge inbox senders who aren't contacts into a unified conversation list.
 	// This lets recipients see DMs from people who haven't followed them back.
 	$: inboxSenderIds = [...new Set($inboxMessages.map(m => m.from))];
 	$: inboxOnlyPeers = inboxSenderIds
-		.filter(id => id !== myId && !$contacts.some(c => c.hb_id === id))
-		.map(id => ({ hb_id: id, profile: undefined, collections: [], online: false, node_addr: undefined, last_fetched: '', last_seen_at: undefined, local_tags: [] } satisfies CachedPeer));
+		.filter(id => id !== myId && !$contacts.some(c => c.npub === id))
+		.map(id => ({ npub: id, browse_key_hex: undefined, petname: undefined, profile: undefined, collections: [], online: false, last_fetched: '', local_tags: [] } satisfies CachedPeer));
 
 	function latestMessageTime(hb_id: string): string {
 		const msgs = $inboxMessages.filter(m => m.from === hb_id || m.to === hb_id);
@@ -36,8 +36,8 @@
 	}
 
 	$: allConversationPeers = [...$contacts, ...inboxOnlyPeers].sort((a, b) => {
-		const aT = latestMessageTime(a.hb_id);
-		const bT = latestMessageTime(b.hb_id);
+		const aT = latestMessageTime(a.npub);
+		const bT = latestMessageTime(b.npub);
 		if (!aT && !bT) return 0;
 		if (!aT) return 1;
 		if (!bT) return -1;
@@ -46,8 +46,8 @@
 
 	$: conversation = selectedPeer
 		? [
-				...$inboxMessages.filter((m) => m.from === selectedPeer!.hb_id),
-				...$sentMessages.filter((m) => m.to === selectedPeer!.hb_id)
+				...$inboxMessages.filter((m) => m.from === selectedPeer!.npub),
+				...$sentMessages.filter((m) => m.to === selectedPeer!.npub)
 			].sort((a, b) => a.sent_at.localeCompare(b.sent_at))
 		: [];
 
@@ -59,12 +59,12 @@
 
 	async function fetchNonContactNames(peers: CachedPeer[]) {
 		for (const peer of peers) {
-			if (fetchingNames.has(peer.hb_id) || peerNameCache[peer.hb_id]) continue;
-			fetchingNames.add(peer.hb_id);
+			if (fetchingNames.has(peer.npub) || peerNameCache[peer.npub]) continue;
+			fetchingNames.add(peer.npub);
 			try {
-				const fetched = await pasteKey(peer.hb_id);
+				const fetched = await pasteKey(peer.npub);
 				if (fetched.profile?.display_name) {
-					peerNameCache = { ...peerNameCache, [peer.hb_id]: fetched.profile.display_name };
+					peerNameCache = { ...peerNameCache, [peer.npub]: fetched.profile.display_name };
 				}
 			} catch { /* relay unreachable or peer has no profile — fall back to shortId */ }
 		}
@@ -76,7 +76,7 @@
 	// Resolve display name for a sender hb_id — contacts first, then fetched cache.
 	function senderName(hb_id: string): string {
 		if (hb_id === myId) return 'You';
-		const contact = $contacts.find(c => c.hb_id === hb_id);
+		const contact = $contacts.find(c => c.npub === hb_id);
 		if (contact?.profile?.display_name) return contact.profile.display_name;
 		if (peerNameCache[hb_id]) return peerNameCache[hb_id];
 		return shortId(hb_id);
@@ -96,8 +96,8 @@
 				const msgs = await getMessages();
 				// Detect genuinely new messages for the selected peer and auto-scroll.
 				if (selectedPeer) {
-					const prevCount = $inboxMessages.filter(m => m.from === selectedPeer!.hb_id).length;
-					const nextCount = msgs.filter(m => m.from === selectedPeer!.hb_id).length;
+					const prevCount = $inboxMessages.filter(m => m.from === selectedPeer!.npub).length;
+					const nextCount = msgs.filter(m => m.from === selectedPeer!.npub).length;
 					if (nextCount > prevCount) {
 						inboxMessages.set(msgs);
 						await tick();
@@ -136,7 +136,7 @@
 
 	async function selectPeer(peer: CachedPeer) {
 		selectedPeer = peer;
-		seenCounts[peer.hb_id] = $inboxMessages.filter((m) => m.from === peer.hb_id).length;
+		seenCounts[peer.npub] = $inboxMessages.filter((m) => m.from === peer.npub).length;
 		await tick();
 		scrollToBottom();
 	}
@@ -147,7 +147,7 @@
 		const content = draft.trim();
 		draft = '';
 		try {
-			const sent = await sendMessage(selectedPeer.hb_id, content);
+			const sent = await sendMessage(selectedPeer.npub, content);
 			// Track sent message so poll doesn't re-badge it.
 			seenMessageKeys.add(`${sent.from}|${sent.sent_at}`);
 			sentMessages.update((prev) => [...prev, sent]);
@@ -186,9 +186,9 @@
 
 	$: unreadCounts = Object.fromEntries(
 		allConversationPeers.map((c) => {
-			const total = $inboxMessages.filter((m) => m.from === c.hb_id).length;
-			const seen = seenCounts[c.hb_id] ?? 0;
-			return [c.hb_id, Math.max(0, total - seen)];
+			const total = $inboxMessages.filter((m) => m.from === c.npub).length;
+			const seen = seenCounts[c.npub] ?? 0;
+			return [c.npub, Math.max(0, total - seen)];
 		})
 	);
 
@@ -197,7 +197,7 @@
 	}
 
 	// Show a privacy notice if the selected peer is not in contacts (may have DMs restricted).
-	$: selectedIsContact = selectedPeer ? $contacts.some(c => c.hb_id === selectedPeer!.hb_id) : false;
+	$: selectedIsContact = selectedPeer ? $contacts.some(c => c.npub === selectedPeer!.npub) : false;
 </script>
 
 {#if !$identity}
@@ -226,12 +226,12 @@
 					<div class="convo-empty">Add contacts via Contacts to start chatting.</div>
 				{:else}
 					{#each allConversationPeers as peer}
-						{@const name = senderName(peer.hb_id)}
+						{@const name = senderName(peer.npub)}
 						{@const initial = name[0]?.toUpperCase() ?? '?'}
 						{@const hue = avatarHue(initial)}
-						{@const unread = unreadCounts[peer.hb_id] ?? 0}
-						{@const active = selectedPeer?.hb_id === peer.hb_id}
-						{@const isContact = $contacts.some(c => c.hb_id === peer.hb_id)}
+						{@const unread = unreadCounts[peer.npub] ?? 0}
+						{@const active = selectedPeer?.npub === peer.npub}
+						{@const isContact = $contacts.some(c => c.npub === peer.npub)}
 						<button class="convo-item" class:convo-active={active} on:click={() => selectPeer(peer)}>
 							<Avatar letter={initial} size={34} {hue} />
 							<div class="convo-info">
@@ -264,20 +264,20 @@
 				<!-- Header -->
 				<div class="pane-header">
 					<Avatar
-						letter={(selectedPeer.profile?.display_name ?? selectedPeer.hb_id)[0].toUpperCase()}
+						letter={(selectedPeer.profile?.display_name ?? selectedPeer.npub)[0].toUpperCase()}
 						size={36}
-						hue={avatarHue((selectedPeer.profile?.display_name ?? selectedPeer.hb_id)[0])}
+						hue={avatarHue((selectedPeer.profile?.display_name ?? selectedPeer.npub)[0])}
 					/>
 					<div class="pane-peer-info">
 						<div class="pane-peer-row">
-							<span class="pane-peer-name">{selectedPeer.profile?.display_name ?? shortId(selectedPeer.hb_id)}</span>
+							<span class="pane-peer-name">{selectedPeer.profile?.display_name ?? shortId(selectedPeer.npub)}</span>
 							{#if selectedPeer.online}
 								<span class="pill pill-online"><span class="pill-dot" /> Online</span>
 							{:else}
 								<span class="pill pill-offline">Offline</span>
 							{/if}
 						</div>
-						<span class="mono">{shortId(selectedPeer.hb_id)}</span>
+						<span class="mono">{shortId(selectedPeer.npub)}</span>
 					</div>
 					<button class="btn-ghost btn-sm" on:click={() => { if (selectedPeer) viewProfile(selectedPeer); }}>View profile</button>
 				</div>
@@ -292,7 +292,7 @@
 				{#if !selectedPeer.online}
 					<div class="offline-banner">
 						<span class="offline-dot" />
-						<span>{selectedPeer.profile?.display_name ?? shortId(selectedPeer.hb_id)} is offline — your message will be delivered when they come online.</span>
+						<span>{selectedPeer.profile?.display_name ?? shortId(selectedPeer.npub)} is offline — your message will be delivered when they come online.</span>
 					</div>
 				{/if}
 

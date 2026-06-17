@@ -99,7 +99,7 @@
 	$: currentPath = $page.url.pathname;
 	$: idName = $profile?.display_name ?? 'You';
 	$: idInitial = idName[0]?.toUpperCase() ?? 'Y';
-	$: idShort = $identity ? $identity.hb_id.slice(0, 8) + '…' + $identity.hb_id.slice(-4) : '';
+	$: idShort = $identity ? $identity.npub.slice(0, 8) + '…' + $identity.npub.slice(-4) : '';
 	$: idHue = avatarHue(idInitial);
 </script>
 

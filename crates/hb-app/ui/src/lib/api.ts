@@ -10,8 +10,6 @@ function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 import type {
 	CachedPeer,
 	Collection,
-	DhtResult,
-	DirectoryPeer,
 	Group,
 	IdentityInfo,
 	Profile,
@@ -28,9 +26,11 @@ export const generateKeypair = () => invoke<IdentityInfo>('generate_keypair');
 
 export const getIdentity = () => invoke<IdentityInfo | null>('get_identity');
 
-export const getHbId = () => invoke<string>('get_hb_id');
+/** The full `hbk…` share code to hand out. */
+export const getShareCode = () => invoke<string>('get_share_code');
 
-export const validateHbId = (hb_id: string) => invoke<boolean>('validate_hb_id', { hbId: hb_id });
+export const validateShareCode = (code: string) =>
+	invoke<boolean>('validate_share_code', { code });
 
 export const exportKeypair = () => invoke<string>('export_keypair');
 
@@ -66,10 +66,6 @@ export const unpublishProfile = () => invoke<void>('unpublish_profile');
 
 export const hasPublishedProfile = () => invoke<boolean>('has_published_profile');
 
-/** Returns [available, takenByPubkey]. */
-export const checkNameAvailable = (displayName: string) =>
-	invoke<[boolean, string | null]>('check_name_available', { displayName });
-
 // ── Collections ───────────────────────────────────────────────────────────────
 
 export const scanDirectory = (opts: ScanOptions) =>
@@ -93,9 +89,6 @@ export const exportCollection = (slug: string, format: 'text' | 'markdown') =>
 export interface Settings {
 	relay_urls: string[];
 	allow_dms: boolean;
-	dht_announce_enabled: boolean;
-	dht_announce_tags: string[];
-	dht_announce_content_types: string[];
 }
 
 export const getSettings = () => invoke<Settings>('get_settings');
@@ -106,21 +99,20 @@ export const checkRelay = (url: string) => invoke<void>('check_relay', { url });
 
 // ── Browse / Contacts ─────────────────────────────────────────────────────────
 
-export const pasteKey = (hb_id: string) => invoke<CachedPeer>('paste_key', { hbId: hb_id });
+/** `code` is a pasted share code (bare npub or full `hbk…`). */
+export const pasteKey = (code: string) => invoke<CachedPeer>('paste_key', { code });
 
-export const follow = (hb_id: string, groupName?: string) =>
-	invoke<void>('follow', { hbId: hb_id, groupName: groupName ?? null });
+export const follow = (code: string, groupName?: string) =>
+	invoke<void>('follow', { code, groupName: groupName ?? null });
 
 export const getContacts = () => invoke<CachedPeer[]>('get_contacts');
 
-export const unfollowContact = (hb_id: string) => invoke<void>('unfollow_contact', { hbId: hb_id });
+export const unfollowContact = (npub: string) => invoke<void>('unfollow_contact', { npub });
 
-export const refreshContact = (hb_id: string) => invoke<CachedPeer>('refresh_contact', { hbId: hb_id });
+export const refreshContact = (npub: string) => invoke<CachedPeer>('refresh_contact', { npub });
 
-export const setContactTags = (hb_id: string, tags: string[]) =>
-	invoke<void>('set_contact_tags', { hbId: hb_id, tags });
-
-export const getDirectory = () => invoke<DirectoryPeer[]>('get_directory');
+export const setContactTags = (npub: string, tags: string[]) =>
+	invoke<void>('set_contact_tags', { npub, tags });
 
 // ── Sharing ───────────────────────────────────────────────────────────────────
 
@@ -131,13 +123,12 @@ export const saveShareSettings = (slug: string, settings: ShareSettings) =>
 	invoke<void>('save_share_settings', { slug, settings });
 
 export const requestDownload = (
-	peer_hb_id: string,
-	peer_node_addr: string | null,
+	peer: string,
 	slug: string,
 	path: string,
 	save_path: string,
 	expected_sha256?: string,
-) => invoke<number>('request_download', { peerHbId: peer_hb_id, peerNodeAddr: peer_node_addr, slug, path, savePath: save_path, expectedSha256: expected_sha256 ?? null });
+) => invoke<number>('request_download', { peer, slug, path, savePath: save_path, expectedSha256: expected_sha256 ?? null });
 
 export const cancelDownload = (id: number) =>
 	invoke<boolean>('cancel_download', { downloadId: id });
@@ -172,13 +163,6 @@ export interface UpdateInfo { version: string; body?: string; }
 export const checkUpdate   = () => invoke<UpdateInfo | null>('check_update');
 export const installUpdate = () => invoke<void>('install_update');
 
-// ── DHT ───────────────────────────────────────────────────────────────────────
-
-export const dhtSearch = (tags: string[], contentTypes: string[]) =>
-	invoke<DhtResult[]>('dht_search', { tags, contentTypes });
-export const dhtStartAnnounce = () => invoke<void>('dht_start_announce');
-export const dhtStopAnnounce  = () => invoke<void>('dht_stop_announce');
-
 // ── Groups ────────────────────────────────────────────────────────────────────
 
 export const groupsGet    = () => invoke<Group[]>('groups_get');
@@ -186,14 +170,14 @@ export const groupsCreate = (name: string) => invoke<Group>('groups_create', { n
 export const groupsRename = (oldName: string, newName: string) =>
 	invoke<void>('groups_rename', { oldName, newName });
 export const groupsDelete   = (name: string) => invoke<void>('groups_delete', { name });
-export const groupsAssign   = (hbId: string, groupName: string) =>
-	invoke<void>('groups_assign', { hbId, groupName });
-export const groupsUnassign = (hbId: string, groupName: string) =>
-	invoke<void>('groups_unassign', { hbId, groupName });
+export const groupsAssign   = (npub: string, groupName: string) =>
+	invoke<void>('groups_assign', { npub, groupName });
+export const groupsUnassign = (npub: string, groupName: string) =>
+	invoke<void>('groups_unassign', { npub, groupName });
 
 /** Atomically replace all group memberships for a contact. Pass [] for Ungrouped. */
-export const contactUpdateGroups = (hbId: string, groupNames: string[]) =>
-	invoke<void>('contact_update_groups', { hbId, groupNames });
+export const contactUpdateGroups = (npub: string, groupNames: string[]) =>
+	invoke<void>('contact_update_groups', { npub, groupNames });
 
 // ── Watches ───────────────────────────────────────────────────────────────────
 

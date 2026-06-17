@@ -1,27 +1,27 @@
 import { describe, expect, it } from 'vitest';
 import type { CachedPeer } from './types.js';
 
-function makePeer(hb_id: string, local_tags: string[]): CachedPeer {
+function makePeer(npub: string, local_tags: string[]): CachedPeer {
 	return {
-		hb_id,
+		npub,
+		browse_key_hex: undefined,
+		petname: undefined,
 		profile: undefined,
 		collections: [],
 		online: false,
-		node_addr: undefined,
 		last_fetched: '2026-01-01T00:00:00Z',
-		last_seen_at: undefined,
 		local_tags,
 	};
 }
 
 // Mirrors the buggy handleRefresh in contacts/+page.svelte (pre-fix)
-function refreshBuggy(contacts: CachedPeer[], hb_id: string, updated: CachedPeer): CachedPeer[] {
-	return contacts.map(c => c.hb_id === hb_id ? updated : c);
+function refreshBuggy(contacts: CachedPeer[], npub: string, updated: CachedPeer): CachedPeer[] {
+	return contacts.map(c => c.npub === npub ? updated : c);
 }
 
 // Mirrors the fixed handleRefresh
-function refreshFixed(contacts: CachedPeer[], hb_id: string, updated: CachedPeer): CachedPeer[] {
-	return contacts.map(c => c.hb_id === hb_id ? { ...updated, local_tags: c.local_tags } : c);
+function refreshFixed(contacts: CachedPeer[], npub: string, updated: CachedPeer): CachedPeer[] {
+	return contacts.map(c => c.npub === npub ? { ...updated, local_tags: c.local_tags } : c);
 }
 
 describe('contact handleRefresh + tag filter', () => {
@@ -53,7 +53,7 @@ describe('contact handleRefresh + tag filter', () => {
 		const contacts = refreshFixed([original], 'hb1_alice', fromRelay);
 		const filtered = contacts.filter(c => c.local_tags?.includes('anime'));
 		expect(filtered).toHaveLength(1);
-		expect(filtered[0].hb_id).toBe('hb1_alice');
+		expect(filtered[0].npub).toBe('hb1_alice');
 	});
 
 	it('fixed: other contacts are unaffected', () => {

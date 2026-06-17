@@ -148,7 +148,7 @@ pub fn verify_binding_token(
 
 /// The H17 follower gate (pure). Admits the request when `require_follow` is off, or when the
 /// requester's npub is in `followers`; otherwise rejects with the "restricted to followers" wire
-/// string. The gate keys on **npub**, never the retired `hb_id`.
+/// string. The gate keys on **npub**, never a per-node transport id.
 pub fn follower_gate(
     require_follow: bool,
     followers: &[PublicKey],

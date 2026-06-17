@@ -10,7 +10,7 @@ use crate::{
 #[derive(Debug, Serialize)]
 pub struct WatchHit {
     pub watch_name: String,
-    pub hb_id: String,
+    pub npub: String,
 }
 
 #[tauri::command]
@@ -42,7 +42,7 @@ pub async fn watches_delete(name: String, store: State<'_, DataStore>) -> CmdRes
     store.save_watches(&watches).map_err(cmd_err)
 }
 
-/// Evaluate `candidates` (hb_ids from a DHT search) against all saved watches.
+/// Evaluate `candidates` (npubs from a DHT search) against all saved watches.
 ///
 /// A candidate fires a watch when it is:
 /// - NOT already in the user's contact list, and
@@ -62,7 +62,7 @@ pub async fn watches_evaluate(
     let mut watches = store.load_watches().map_err(cmd_err)?;
 
     let contacts = store.list_contacts().map_err(cmd_err)?;
-    let contact_hb_ids: HashSet<String> = contacts.iter().map(|c| c.hb_id.clone()).collect();
+    let contact_npubs: HashSet<String> = contacts.iter().map(|c| c.npub.clone()).collect();
 
     let mut hits: Vec<WatchHit> = Vec::new();
 
@@ -70,15 +70,15 @@ pub async fn watches_evaluate(
         // Build a set for O(1) lookup instead of O(n) Vec::contains on every candidate.
         let seen: HashSet<String> = watch.seen_pubkeys.iter().cloned().collect();
         let before = hits.len();
-        for hb_id in &candidates {
-            if contact_hb_ids.contains(hb_id) {
+        for npub in &candidates {
+            if contact_npubs.contains(npub) {
                 continue; // already a known contact — not a discovery
             }
-            if seen.contains(hb_id) {
+            if seen.contains(npub) {
                 continue; // already notified for this watch
             }
-            hits.push(WatchHit { watch_name: watch.name.clone(), hb_id: hb_id.clone() });
-            watch.seen_pubkeys.push(hb_id.clone());
+            hits.push(WatchHit { watch_name: watch.name.clone(), npub: npub.clone() });
+            watch.seen_pubkeys.push(npub.clone());
         }
         if hits.len() > before {
             watch.last_fired = Some(chrono::Utc::now());
@@ -105,7 +105,7 @@ mod tests {
     }
 
     fn run_evaluate(
-        watches: &mut Vec<Watch>,
+        watches: &mut [Watch],
         candidates: &[&str],
         contacts: &HashSet<String>,
     ) -> Vec<WatchHit> {
@@ -113,11 +113,11 @@ mod tests {
         for watch in watches.iter_mut() {
             let seen: HashSet<String> = watch.seen_pubkeys.iter().cloned().collect();
             let before = hits.len();
-            for &hb_id in candidates {
-                if contacts.contains(hb_id) { continue; }
-                if seen.contains(hb_id) { continue; }  // O(1) HashSet lookup
-                hits.push(WatchHit { watch_name: watch.name.clone(), hb_id: hb_id.to_string() });
-                watch.seen_pubkeys.push(hb_id.to_string());
+            for &npub in candidates {
+                if contacts.contains(npub) { continue; }
+                if seen.contains(npub) { continue; }  // O(1) HashSet lookup
+                hits.push(WatchHit { watch_name: watch.name.clone(), npub: npub.to_string() });
+                watch.seen_pubkeys.push(npub.to_string());
             }
             if hits.len() > before {
                 watch.last_fired = Some(chrono::Utc::now());
@@ -138,7 +138,7 @@ mod tests {
         let contacts = HashSet::new();
         let hits = run_evaluate(&mut watches, &["hb1_newpeer"], &contacts);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].hb_id, "hb1_newpeer");
+        assert_eq!(hits[0].npub, "hb1_newpeer");
         assert_eq!(hits[0].watch_name, "test-watch");
     }
 
@@ -202,7 +202,7 @@ mod tests {
             last_fired: None,
             seen_pubkeys: vec![],
         };
-        store.save_watches(&[watch.clone()]).unwrap();
+        store.save_watches(std::slice::from_ref(&watch)).unwrap();
 
         let loaded = store.load_watches().unwrap();
         assert_eq!(loaded.len(), 1);

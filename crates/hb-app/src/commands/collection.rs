@@ -1,18 +1,22 @@
 use std::path::Path;
 use globset::{Glob, GlobSetBuilder};
-use hb_core::{
-    DocType, SignedEnvelope,
-    types::{Collection, DirectoryItem, ItemType},
-};
+use hb_core::types::{Collection, DirectoryItem, ItemType};
+use hb_core::{BrowseKey, Identity};
+use hb_net::publish_listing;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::{
     commands::profile::compute_content_types,
     error::{CmdResult, cmd_err},
+    net,
     store::DataStore,
     SharedIdentity,
 };
+
+/// NIP-44 listing split budget (NIP-44 caps plaintext, the relay caps the event ~64 KiB; ≤40 KB
+/// keeps a single part well under both). Larger listings split per-folder (hb-net::split_listing).
+const LISTING_MAX_BYTES: usize = 40_000;
 
 /// Collection with publication status, returned to the frontend.
 #[derive(Debug, Clone, Serialize)]
@@ -136,22 +140,14 @@ pub async fn delete_collection(
 
 #[tauri::command]
 pub async fn get_collections(store: State<'_, DataStore>) -> CmdResult<Vec<CollectionEntry>> {
-    // Signed (published) collections.
-    let envelopes = store.list_collections().map_err(cmd_err)?;
-    let mut entries: Vec<CollectionEntry> = envelopes
-        .into_iter()
-        .filter_map(|env| env.parse_payload::<Collection>().ok())
-        .map(|c| CollectionEntry { collection: c, published: true })
-        .collect();
-
-    // Draft-only collections (scanned but not yet published).
-    let draft_slugs = store.list_draft_only_slugs().map_err(cmd_err)?;
-    for slug in draft_slugs {
+    // Every collection is a local draft; `published` reflects whether a listing was published.
+    let mut entries: Vec<CollectionEntry> = Vec::new();
+    for slug in store.list_collection_slugs().map_err(cmd_err)? {
         if let Ok(Some(col)) = store.load_collection_draft(&slug) {
-            entries.push(CollectionEntry { collection: col, published: false });
+            let published = store.is_published(&slug);
+            entries.push(CollectionEntry { collection: col, published });
         }
     }
-
     entries.sort_by(|a, b| a.collection.path_alias.cmp(&b.collection.path_alias));
     Ok(entries)
 }
@@ -183,42 +179,76 @@ pub async fn update_collection_meta(
     store.save_collection_draft(&col).map_err(cmd_err)
 }
 
-/// Core publish logic extracted for testability.
-/// Validates slug, enforces content_types, signs, and updates profile.
-pub(crate) fn publish_collection_inner(
-    slug: &str,
-    store: &DataStore,
-    kp: &hb_core::HoardbookKeypair,
-) -> Result<(), String> {
-    let safe_slug = is_valid_slug(slug)
-        .then_some(slug)
-        .ok_or("Invalid collection slug")?;
-
-    let draft_path = store.collection_draft_path(safe_slug);
-    if !draft_path.exists() {
-        return Err(format!("No draft found for collection '{safe_slug}'"));
+/// Map a `Collection` draft to the render-model listing JSON: the directory tree moves from
+/// `listing` to `entries` (what `hb-net::render_listing` consumes), the rest stays as metadata.
+/// Pure — unit-tested without a relay.
+pub(crate) fn collection_to_listing_json(col: &Collection) -> Result<String, String> {
+    let mut v = serde_json::to_value(col).map_err(cmd_err)?;
+    if let serde_json::Value::Object(ref mut map) = v {
+        if let Some(listing) = map.remove("listing") {
+            map.insert("entries".into(), listing);
+        }
     }
+    serde_json::to_string(&v).map_err(cmd_err)
+}
 
-    let bytes = std::fs::read(&draft_path).map_err(cmd_err)?;
-    let collection: Collection = serde_json::from_slice(&bytes).map_err(cmd_err)?;
-
+/// Validate + load a draft and produce its listing JSON, ready to publish. Pure (no relay) so the
+/// validation paths are L1-testable.
+pub(crate) fn prepare_listing(slug: &str, store: &DataStore) -> Result<String, String> {
+    let safe_slug = is_valid_slug(slug).then_some(slug).ok_or("Invalid collection slug")?;
+    let collection = store
+        .load_collection_draft(safe_slug)
+        .map_err(cmd_err)?
+        .ok_or_else(|| format!("No draft found for collection '{safe_slug}'"))?;
     if collection.content_types.is_empty() {
         return Err("At least one content type is required before publishing a collection.".into());
     }
+    collection_to_listing_json(&collection)
+}
 
-    let envelope = SignedEnvelope::create(kp, DocType::Collection, &collection).map_err(cmd_err)?;
-    store.save_collection_signed(safe_slug, &envelope).map_err(cmd_err)?;
+/// Publish a collection's listing (encrypted under the account browse-key) via `hb-net`, mark it
+/// published locally, and republish the teaser if a profile is published (so its content_types
+/// stay current).
+pub(crate) async fn publish_collection_inner(
+    slug: &str,
+    store: &DataStore,
+    identity: &Identity,
+    browse_key: &BrowseKey,
+) -> Result<(), String> {
+    let listing_json = prepare_listing(slug, store)?;
 
-    // Recompute and re-sign profile content_types if a signed profile exists.
-    if let Some(mut profile) = store.load_profile_draft().map_err(cmd_err)? {
-        profile.content_types = compute_content_types(store);
-        store.save_profile_draft(&profile).map_err(cmd_err)?;
-        if store.load_profile_signed().map_err(cmd_err)?.is_some() {
-            let prof_env = SignedEnvelope::create(kp, DocType::Profile, &profile).map_err(cmd_err)?;
-            store.save_profile_signed(&prof_env).map_err(cmd_err)?;
+    let client = net::connect(identity, store).await.map_err(cmd_err)?;
+    let published =
+        publish_listing(&client, identity, slug, browse_key, &listing_json, LISTING_MAX_BYTES).await;
+    client.disconnect().await;
+    let published = published.map_err(cmd_err)?;
+
+    // Local published marker (the "published" badge + content_types union).
+    let marker = serde_json::json!({ "parts": published.parts }).to_string();
+    store.save_published(slug, &marker).map_err(cmd_err)?;
+
+    // Keep a published teaser's content_types current.
+    if store.is_published("profile") {
+        if let Some(mut profile) = store.load_profile_draft().map_err(cmd_err)? {
+            profile.content_types = compute_content_types(store);
+            store.save_profile_draft(&profile).map_err(cmd_err)?;
+            let teaser = hb_core::event::Teaser {
+                display_name: profile.display_name.clone(),
+                bio: profile.bio.clone().unwrap_or_default(),
+                tags: profile.tags.clone(),
+                content_types: profile.content_types.clone(),
+            };
+            if let Ok(event) = hb_core::event::build_teaser(identity, &teaser) {
+                if let Ok(client) = net::connect(identity, store).await {
+                    let _ = client.publish(&event).await;
+                    client.disconnect().await;
+                    if let Ok(json) = serde_json::to_string(&event) {
+                        let _ = store.save_published("profile", &json);
+                    }
+                }
+            }
         }
     }
-
     Ok(())
 }
 
@@ -228,11 +258,12 @@ pub async fn publish_collection(
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
 ) -> CmdResult<()> {
-    let guard = identity.read().await;
-    let kp = guard
-        .as_ref()
-        .ok_or("No identity loaded. Generate a keypair first.")?;
-    publish_collection_inner(&slug, &store, kp)
+    let (id_clone, browse_key) = {
+        let guard = identity.read().await;
+        let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
+        (id.identity.clone(), id.browse_key)
+    };
+    publish_collection_inner(&slug, &store, &id_clone, &browse_key).await
 }
 
 /// Export a collection's listing as plain text or markdown checklist.
@@ -247,20 +278,10 @@ pub async fn export_collection(
         .then_some(slug.as_str())
         .ok_or("Invalid collection slug")?;
 
-    // Prefer the published (signed) version; fall back to draft.
-    let collection: Collection = if let Some(env) = store
-        .list_collections()
+    let collection: Collection = store
+        .load_collection_draft(safe_slug)
         .map_err(cmd_err)?
-        .into_iter()
-        .find(|e| e.parse_payload::<Collection>().ok().is_some_and(|c| c.slug == safe_slug))
-    {
-        env.parse_payload().map_err(cmd_err)?
-    } else {
-        store
-            .load_collection_draft(safe_slug)
-            .map_err(cmd_err)?
-            .ok_or_else(|| format!("Collection '{safe_slug}' not found"))?
-    };
+        .ok_or_else(|| format!("Collection '{safe_slug}' not found"))?;
 
     let out = match format.as_str() {
         "markdown" => render_markdown(&collection.listing, 0),
@@ -737,28 +758,10 @@ mod tests {
         assert!(sub_readme.note.is_none(), "subdirectory readme must not inherit root note");
     }
 
-    // ── T16 acceptance tests ─────────────────────────────────────────────────
-
-    fn make_published_collection(store: &DataStore, kp: &hb_core::HoardbookKeypair, slug: &str, content_types: Vec<String>) {
-        let col = hb_core::Collection {
-            slug: slug.to_string(),
-            path_alias: slug.to_string(),
-            description: None,
-            item_count: 1,
-            est_size: None,
-            content_types,
-            tags: vec![],
-            languages: vec![],
-            last_updated: chrono::Utc::now(),
-            listing: vec![],
-        };
-        store.save_collection_draft(&col).unwrap();
-        let env = hb_core::SignedEnvelope::create(kp, hb_core::DocType::Collection, &col).unwrap();
-        store.save_collection_signed(slug, &env).unwrap();
-    }
+    // ── publish-path unit tests (pure; the wire is proven by hb-it Suite BROWSE) ──────────────
 
     fn make_collection_draft(store: &DataStore, slug: &str, content_types: Vec<String>) {
-        let col = hb_core::Collection {
+        let col = Collection {
             slug: slug.to_string(),
             path_alias: slug.to_string(),
             description: None,
@@ -774,101 +777,64 @@ mod tests {
     }
 
     #[test]
-    fn publish_signs_with_current_key() {
-        use hb_core::{HoardbookKeypair, SignedEnvelope, DocType};
-        use tempfile::TempDir;
-
-        let dir = TempDir::new().unwrap();
-        let store = DataStore::new(dir.path().to_path_buf());
-        let kp = HoardbookKeypair::generate();
-
-        make_collection_draft(&store, "my-films", vec!["video".to_string()]);
-
-        // Call the real publish path.
-        publish_collection_inner("my-films", &store, &kp).unwrap();
-
-        let signed_path = store.collection_signed_path("my-films");
-        assert!(signed_path.exists(), "signed.json must be written to disk");
-
-        let bytes = std::fs::read(&signed_path).unwrap();
-        let loaded: SignedEnvelope = serde_json::from_slice(&bytes).unwrap();
-        assert!(loaded.verify().is_ok(), "envelope.verify() must return Ok(())");
-        assert_eq!(loaded.doc_type, DocType::Collection);
+    fn listing_json_maps_listing_to_entries_and_renders() {
+        // collection_to_listing_json moves the tree to `entries`; the result must round-trip through
+        // hb-net::render_listing (the format the browse side consumes).
+        let col = Collection {
+            slug: "criterion".into(),
+            path_alias: "Criterion".into(),
+            description: None,
+            item_count: 1,
+            est_size: None,
+            content_types: vec!["video".into()],
+            tags: vec![],
+            languages: vec![],
+            last_updated: chrono::Utc::now(),
+            listing: vec![DirectoryItem {
+                name: "Ran (1985)".into(),
+                item_type: ItemType::File,
+                size: Some("12GB".into()),
+                format: Some("MKV".into()),
+                year: Some(1985),
+                tags: vec![],
+                note: None,
+                children: vec![],
+            }],
+        };
+        let json = collection_to_listing_json(&col).unwrap();
+        assert!(json.contains("\"entries\""), "tree must be under `entries`");
+        assert!(!json.contains("\"listing\""), "`listing` key must be renamed away");
+        let rendered = hb_net::render_listing(&[json]).unwrap();
+        assert!(rendered.complete());
+        assert_eq!(rendered.entries.len(), 1);
+        assert_eq!(rendered.meta.get("slug").and_then(|v| v.as_str()), Some("criterion"));
     }
 
     #[test]
-    fn publish_rejects_invalid_slug() {
-        use hb_core::HoardbookKeypair;
-        use tempfile::TempDir;
-
-        let dir = TempDir::new().unwrap();
+    fn prepare_listing_rejects_invalid_slug() {
+        let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
-        let kp = HoardbookKeypair::generate();
-
-        let err = publish_collection_inner("../evil", &store, &kp).unwrap_err();
+        let err = prepare_listing("../evil", &store).unwrap_err();
         assert!(err.contains("Invalid collection slug"), "got: {err}");
     }
 
     #[test]
-    fn publish_rejects_empty_content_types() {
-        use hb_core::HoardbookKeypair;
-        use tempfile::TempDir;
-
-        let dir = TempDir::new().unwrap();
+    fn prepare_listing_rejects_empty_content_types() {
+        let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
-        let kp = HoardbookKeypair::generate();
-
         make_collection_draft(&store, "no-types", vec![]);
-
-        let err = publish_collection_inner("no-types", &store, &kp).unwrap_err();
+        let err = prepare_listing("no-types", &store).unwrap_err();
         assert!(err.contains("content type"), "got: {err}");
     }
 
     #[test]
-    fn profile_content_types_updated_after_publish() {
-        use hb_core::{HoardbookKeypair, SignedEnvelope, DocType, Profile};
-        use tempfile::TempDir;
-
-        let dir = TempDir::new().unwrap();
+    fn get_collections_published_flag_tracks_marker() {
+        let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
-        let kp = HoardbookKeypair::generate();
-
-        // Create and sign two existing collections via the helper.
-        make_published_collection(&store, &kp, "films", vec!["video".to_string()]);
-
-        // Create a profile draft + signed profile with empty content_types.
-        let profile = Profile {
-            display_name: "Test".to_string(),
-            bio: None,
-            tags: vec![],
-            since: None,
-            est_size: None,
-            languages: vec![],
-            contact_hint: None,
-            email: None,
-            location: None,
-            social_links: vec![],
-            willing_to: vec![],
-            content_types: vec![],
-            updated: chrono::Utc::now(),
-        };
-        store.save_profile_draft(&profile).unwrap();
-        let prof_env = SignedEnvelope::create(&kp, DocType::Profile, &profile).unwrap();
-        store.save_profile_signed(&prof_env).unwrap();
-
-        // Add a second collection and publish via the real command path.
-        make_collection_draft(&store, "books", vec!["text".to_string()]);
-        publish_collection_inner("books", &store, &kp).unwrap();
-
-        // Profile must now be re-signed with merged content_types.
-        let reloaded_env = store.load_profile_signed().unwrap().unwrap();
-        assert!(reloaded_env.verify().is_ok(), "re-signed profile must verify");
-        let reloaded: Profile = reloaded_env.parse_payload().unwrap();
-        let mut expected = vec!["text".to_string(), "video".to_string()];
-        expected.sort();
-        let mut actual = reloaded.content_types.clone();
-        actual.sort();
-        assert_eq!(actual, expected, "profile content_types must be union of all collections");
+        make_collection_draft(&store, "films", vec!["video".into()]);
+        assert!(!store.is_published("films"));
+        store.save_published("films", "{}").unwrap();
+        assert!(store.is_published("films"), "marker presence => published");
     }
 
     #[test]
