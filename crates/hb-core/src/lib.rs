@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 // --- legacy v0.4.3 core: Ed25519 identity / JCS / SignedEnvelope.
-//     Still consumed by hb-app, hb-relay, hb-it; deleted in M4 with those consumers. ---
+//     Consumed by hb-app until its M4 Nostr cutover completes; deleted with that consumer. ---
 pub mod crypto;
 pub mod envelope;
 pub mod error;
