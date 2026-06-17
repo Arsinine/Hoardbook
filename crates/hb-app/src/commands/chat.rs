@@ -94,23 +94,25 @@ pub(crate) async fn decode_dms(
     contact_npubs: Option<&HashSet<String>>,
 ) -> Vec<ReceivedMessage> {
     let mut out: Vec<ReceivedMessage> = Vec::new();
-    let mut seen: HashSet<(String, String)> = HashSet::new(); // (from, sent_at) dedup
+    // Dedup by the gift-wrap **event id** — Nostr's own uniqueness key. Deduping by
+    // (sender, second-granular timestamp) would silently drop distinct same-second messages from
+    // the same sender (chorus M4p2 finding); each NIP-17 wrap is a distinct event with a distinct id.
+    let mut seen: HashSet<EventId> = HashSet::new();
     for wrap in gift_wraps {
+        if !seen.insert(wrap.id) {
+            continue;
+        }
         match unwrap_dm(identity, &wrap).await {
             Ok(dm) => {
                 let from = npub_of(&dm.sender);
                 if contact_npubs.is_some_and(|ids| !ids.contains(&from)) {
                     continue;
                 }
-                let sent_at = rfc3339_of(dm.created_at);
-                if !seen.insert((from.clone(), sent_at.clone())) {
-                    continue;
-                }
                 out.push(ReceivedMessage {
                     from,
                     to: own_npub.to_string(),
                     content: dm.content,
-                    sent_at,
+                    sent_at: rfc3339_of(dm.created_at),
                 });
             }
             Err(e) => tracing::debug!("skipping undecryptable/foreign gift wrap: {e}"),
@@ -277,6 +279,23 @@ mod tests {
             decode_dms(&me.npub(), &me, vec![from_contact, from_stranger], Some(&allow)).await;
         assert_eq!(msgs.len(), 1, "only the contact's DM survives the allow-list");
         assert_eq!(msgs[0].from, contact.npub());
+    }
+
+    #[tokio::test]
+    async fn decode_dms_keeps_distinct_same_sender_messages() {
+        // chorus M4p2 finding: dedup must key on the gift-wrap event id, not (sender, second). Two
+        // distinct DMs from the same sender (each a distinct NIP-17 wrap) must both survive, even
+        // when their inner timestamps land in the same second.
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let a = build_dm(&alice, &bob.public_key(), "first").await.unwrap();
+        let b = build_dm(&alice, &bob.public_key(), "second").await.unwrap();
+        assert_ne!(a.id, b.id, "distinct messages are distinct wraps");
+        let msgs = decode_dms(&bob.npub(), &bob, vec![a.clone(), b, a], None).await;
+        // Two distinct messages survive; the re-delivered duplicate of `a` is collapsed by id.
+        assert_eq!(msgs.len(), 2, "both distinct messages kept; the duplicate wrap deduped");
+        let contents: HashSet<&str> = msgs.iter().map(|m| m.content.as_str()).collect();
+        assert!(contents.contains("first") && contents.contains("second"));
     }
 
     #[test]
