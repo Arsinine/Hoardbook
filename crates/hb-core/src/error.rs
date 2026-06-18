@@ -5,12 +5,6 @@ pub enum HbError {
     #[error("invalid Hoardbook ID: {0}")]
     InvalidId(String),
 
-    #[error("invalid Hoardbook ID prefix (expected 'hb1_')")]
-    InvalidPrefix,
-
-    #[error("invalid checksum in Hoardbook ID")]
-    InvalidChecksum,
-
     #[error("invalid public key: {0}")]
     InvalidPublicKey(String),
 
