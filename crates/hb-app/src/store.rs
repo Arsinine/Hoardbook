@@ -29,6 +29,17 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 fn default_true() -> bool { true }
 
+/// How a downloaded update is applied (spec §Auto-updater threat model). `Auto` is the Obsidian
+/// deferred-install default (apply on quit / next launch); `Confirm` gates the apply on explicit
+/// user assent for the cautious. Minisign verification is unconditional in both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateApplyMode {
+    #[default]
+    Auto,
+    Confirm,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
     /// Configured Nostr relays (seed + write). Empty = the app has no relays yet.
@@ -36,6 +47,17 @@ pub struct Settings {
     /// When false, only DMs from saved contacts are surfaced.
     #[serde(default = "default_true")]
     pub allow_dms: bool,
+    /// The one-time pre-first-download IP-exposure notice has been acknowledged (spec §Onboarding).
+    /// Shown iff this is false; acknowledging persists it.
+    #[serde(default)]
+    pub privacy_notice_acknowledged: bool,
+    /// How updates apply (Obsidian deferred-install vs confirm-before-apply).
+    #[serde(default)]
+    pub update_apply_mode: UpdateApplyMode,
+    /// The app version last seen running — drives the "now on vX.Y" visible-after notice. The
+    /// writer normalizes it to the running-version string, so comparison is exact-string equality.
+    #[serde(default)]
+    pub last_seen_version: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +162,11 @@ impl DataStore {
 
     // -- Paths ---------------------------------------------------------------
 
+    /// The root `~/.hoardbook` directory the backup archives.
+    pub fn base_dir(&self) -> &Path {
+        &self.base
+    }
+
     pub fn identity_path(&self) -> PathBuf {
         // .bin on Windows (DPAPI-encrypted opaque blob), .json on Linux (plain chmod 600).
         #[cfg(target_os = "windows")]
@@ -202,13 +229,24 @@ impl DataStore {
 
         #[cfg(not(target_os = "windows"))]
         {
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
             let first_write = !path.exists();
-            std::fs::write(&path, json.as_bytes())?;
-            // Restrict to owner read/write only.
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-            }
+            // Create the file *already* at 0600 (the `.mode()` applies at creation) so the nsec is
+            // never briefly world-readable in the window a bare `write` + follow-up `chmod` leaves
+            // (convergent chorus finding: Codex/Gemini/Kimi). `.mode()` is ignored for an existing
+            // file, so re-assert 0600 on the open fd to also cover a pre-existing file left with
+            // looser perms by an older build. The parent dir is 0700, so a symlink-swap pre-attack
+            // on this path is already out of reach (no O_NOFOLLOW needed).
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)?;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            f.write_all(json.as_bytes())?;
             if first_write {
                 tracing::warn!(
                     "Private key stored as a plain file at {:?}. Keep your home directory secure.",
@@ -579,6 +617,48 @@ mod tests {
         store.save_identity(&sample_identity()).unwrap();
         let mode = std::fs::metadata(store.identity_path()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "identity.json must have mode 600");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn save_identity_tightens_a_preexisting_loose_file() {
+        // Regression for the convergent chorus finding: even if an older build (or a tampered
+        // profile) left the identity file world-readable, a re-save (e.g. an import / restore
+        // re-wrap) must re-assert 0600 — never leave a widen-window on the nsec.
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, store) = test_store();
+        store.save_identity(&sample_identity()).unwrap();
+        let path = store.identity_path();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        store.save_identity(&sample_identity()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "a re-save must re-assert 0600 on a pre-existing loose file");
+    }
+
+    #[test]
+    fn settings_gains_fields_with_backward_compatible_defaults() {
+        // An old settings.json lacking the M5 fields must still deserialize (serde(default)).
+        let old = r#"{"relay_urls":["wss://r.example"],"allow_dms":true}"#;
+        let s: Settings = serde_json::from_str(old).expect("old settings must still deserialize");
+        assert_eq!(s.relay_urls, vec!["wss://r.example".to_string()]);
+        assert!(!s.privacy_notice_acknowledged, "defaults to not-acknowledged");
+        assert_eq!(s.update_apply_mode, UpdateApplyMode::Auto, "defaults to Obsidian auto-apply");
+        assert_eq!(s.last_seen_version, "", "defaults to empty (fresh install)");
+    }
+
+    #[test]
+    fn privacy_notice_shown_once_then_acknowledged_persists() {
+        let (_dir, store) = test_store();
+        // Fresh profile: the notice should show (not yet acknowledged).
+        let s = store.load_settings().unwrap().unwrap_or_default();
+        assert!(!s.privacy_notice_acknowledged, "shown iff not acknowledged");
+        // Acknowledge + persist.
+        let mut s = s;
+        s.privacy_notice_acknowledged = true;
+        store.save_settings(&s).unwrap();
+        // Reload: it stays acknowledged, so it never shows again.
+        let reloaded = store.load_settings().unwrap().unwrap();
+        assert!(reloaded.privacy_notice_acknowledged, "acknowledgement persists across reload");
     }
 
     #[test]

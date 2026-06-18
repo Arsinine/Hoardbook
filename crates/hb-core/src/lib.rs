@@ -7,6 +7,7 @@ pub mod types;
 // --- v0.9 Nostr core: secp256k1 identity, NIP-01 events, NIP-44 listings,
 //     the npub→iroh binding + xfer gate, the hbk share code. (The legacy Ed25519
 //     identity / JCS / signed-envelope core was removed with its hb-app consumer in M4.) ---
+pub mod backup;
 pub mod binding;
 pub mod event;
 pub mod fingerprint;
@@ -20,6 +21,10 @@ pub mod version;
 pub use error::HbError;
 pub use types::{Collection, DirectoryItem, ItemType, Profile, SocialLink};
 
+pub use backup::{
+    decrypt_backup, encrypt_backup, is_encrypted_backup, BackupMode, BACKUP_FORMAT_VER,
+    MIN_PASSPHRASE_LEN,
+};
 pub use binding::{
     build_binding, resolve_node_key, seal_addrs, unseal_addrs, verify_binding, Binding, SealedAddr,
 };

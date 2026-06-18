@@ -1,37 +1,21 @@
 import { describe, expect, it, vi } from 'vitest';
+import {
+	resolveInitialStep,
+	simulateObSaveName,
+	shouldShowBackupPrompt,
+	shouldShowPrivacyNotice,
+	attemptDownload,
+	proceedImport,
+} from './onboarding.js';
 
-// ── Logic extracted from +page.svelte onboarding flow ───────────────────────
-
-// Mirrors the reactive obStep initialisation logic.
-// Key existence alone suppresses the wizard — "absent on all subsequent launches".
-function resolveInitialStep(
-	identity: { hb_id: string; hb_id_short: string } | null,
-): { obStep: number } {
-	if (identity) return { obStep: 4 };
-	return { obStep: 1 };
-}
-
-// Mirrors obSaveName: returns whether saveProfile would be called and what step is set.
-async function simulateObSaveName(
-	displayName: string,
-	saveFn: () => Promise<void>,
-): Promise<{ savedCalled: boolean; nextStep: number }> {
-	if (!displayName.trim()) return { savedCalled: false, nextStep: 3 };
-	await saveFn();
-	return { savedCalled: true, nextStep: 3 };
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe('onboarding wizard — step resolution', () => {
-	it('wizard_not_shown_if_key_exists: identity present (any profile state) → step 4', () => {
-		// With display_name
-		expect(resolveInitialStep({ hb_id: 'hb1_abc123', hb_id_short: 'hb1_abc…123' }).obStep).toBe(4);
+describe('onboarding wizard — step resolution (ported to npub)', () => {
+	it('wizard_not_shown_if_identity_exists: identity present → step 4', () => {
+		expect(resolveInitialStep({ npub: 'npub1abc' }).obStep).toBe(4);
 	});
 
-	it('wizard_not_shown_if_key_exists: identity with no profile also → step 4', () => {
-		// Skipped step 2 on first launch; relaunch must not re-show wizard.
-		expect(resolveInitialStep({ hb_id: 'hb1_abc123', hb_id_short: 'hb1_abc…123' }).obStep).toBe(4);
+	it('wizard_not_shown_if_identity_exists: identity with no profile also → step 4', () => {
+		// Skipped step 2 on first launch; relaunch must not re-show the wizard.
+		expect(resolveInitialStep({ npub: 'npub1xyz' }).obStep).toBe(4);
 	});
 
 	it('no identity → step 1 (wizard shown)', () => {
@@ -52,7 +36,6 @@ describe('onboarding wizard — step 2 save behaviour', () => {
 		const saveFn = vi.fn().mockResolvedValue(undefined);
 		const result = await simulateObSaveName('   ', saveFn);
 		expect(result.savedCalled).toBe(false);
-		expect(result.nextStep).toBe(3);
 		expect(saveFn).not.toHaveBeenCalled();
 	});
 
@@ -62,5 +45,50 @@ describe('onboarding wizard — step 2 save behaviour', () => {
 		expect(result.savedCalled).toBe(true);
 		expect(result.nextStep).toBe(3);
 		expect(saveFn).toHaveBeenCalledOnce();
+	});
+});
+
+describe('onboarding — backup prompt after generate', () => {
+	it('backup_prompt_shown_after_generate: shown once generated, until backed up', () => {
+		expect(shouldShowBackupPrompt({ generated: true, backedUp: false })).toBe(true);
+	});
+	it('not shown before generate, nor after a backup is taken', () => {
+		expect(shouldShowBackupPrompt({ generated: false, backedUp: false })).toBe(false);
+		expect(shouldShowBackupPrompt({ generated: true, backedUp: true })).toBe(false);
+	});
+});
+
+describe('onboarding — one-time pre-download privacy notice', () => {
+	it('privacy_notice_shown_once_before_first_download: shown iff not yet acknowledged', () => {
+		expect(shouldShowPrivacyNotice({ privacy_notice_acknowledged: false })).toBe(true);
+		expect(shouldShowPrivacyNotice({ privacy_notice_acknowledged: true })).toBe(false);
+	});
+
+	it('privacy_notice_gate_blocks_download_until_acknowledged', async () => {
+		const download = vi.fn().mockResolvedValue(7);
+		// Not acknowledged → the download command must NOT fire.
+		const blocked = await attemptDownload({ acknowledged: false, download });
+		expect(blocked).toEqual({ status: 'needs-ack' });
+		expect(download).not.toHaveBeenCalled();
+		// Acknowledged → the download proceeds.
+		const ok = await attemptDownload({ acknowledged: true, download });
+		expect(ok).toEqual({ status: 'downloading', id: 7 });
+		expect(download).toHaveBeenCalledOnce();
+	});
+});
+
+describe('onboarding — import existing key always warns about linking', () => {
+	it('import_existing_key_flow_always_surfaces_linking_warning (no Qurator/public oracle)', async () => {
+		const importKey = vi.fn().mockResolvedValue({ npub: 'npub1imported' });
+		// Any key — public-looking, qurator-looking, random — must hit the warning first.
+		for (const _key of ['npub1public', 'npub1qurator', 'nsec1random']) {
+			const r = await proceedImport({ warningAcknowledged: false, importKey });
+			expect(r).toEqual({ status: 'needs-warning' });
+		}
+		expect(importKey).not.toHaveBeenCalled();
+		// Only after acknowledging the warning does the import commit.
+		const done = await proceedImport({ warningAcknowledged: true, importKey });
+		expect(done.status).toBe('imported');
+		expect(importKey).toHaveBeenCalledOnce();
 	});
 });

@@ -1,10 +1,14 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { generateKeypair, getShareCode, getSettings, saveSettings, importKeypair, wipeData, checkRelay, checkUpdate, installUpdate, watchesGet, watchesDelete } from '$lib/api.js';
-	import type { UpdateInfo } from '$lib/api.js';
+	import { generateKeypair, getShareCode, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, watchesGet, watchesDelete } from '$lib/api.js';
+	import type { Settings, UpdateInfo } from '$lib/api.js';
 	import type { Watch } from '$lib/types.js';
+	import { keyView } from '$lib/key-view.js';
+	import { passphraseStrength, backupModeOptions, type BackupMode } from '$lib/backup-export.js';
+	import { updateNoticeVM, nextApplyMode, withApplyMode } from '$lib/update-ux.js';
+	import QRCode from 'qrcode';
 	import { relaunch } from '@tauri-apps/plugin-process';
-	import { open as openFileDialog, confirm } from '@tauri-apps/plugin-dialog';
+	import { open as openFileDialog, save as saveFileDialog, confirm } from '@tauri-apps/plugin-dialog';
 	import { getVersion } from '@tauri-apps/api/app';
 	import { identity, profile, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
@@ -12,15 +16,122 @@
 
 	let generating = false;
 	let copied = false;
-	let importing = false;
 	let appVersion = '';
 
-	// Update state
+	// Full settings object, preserved so saving one field never resets the others (the new M5
+	// fields privacy_notice_acknowledged / update_apply_mode / last_seen_version live here too).
+	let settings: Settings = {
+		relay_urls: [], allow_dms: true, privacy_notice_acknowledged: false,
+		update_apply_mode: 'auto', last_seen_version: '',
+	};
+
+	// ── 3-key identity view + share-code QR ──────────────────────────────────────
+	$: kv = $identity ? keyView($identity) : null;
+	let shareQrSvg = '';
+
+	async function showShareQr() {
+		try {
+			const code = await getShareCode();
+			shareQrSvg = shareQrSvg ? '' : await QRCode.toString(code, { type: 'svg', margin: 1 });
+		} catch (e) { toast(String(e), 'error'); }
+	}
+
+	// ── Backup / restore ─────────────────────────────────────────────────────────
+	const backupModes = backupModeOptions();
+	let backupMode: BackupMode = 'passphrase';
+	let backupPass = '';
+	let backingUp = false;
+	$: backupStrength = passphraseStrength(backupPass);
+
+	async function handleBackup() {
+		if (backupMode === 'passphrase' && !backupStrength.acceptable) {
+			toast(backupStrength.reason ?? 'Choose a stronger passphrase', 'error');
+			return;
+		}
+		const path = await saveFileDialog({
+			defaultPath: 'hoardbook-backup.hbk',
+			filters: [{ name: 'Hoardbook backup', extensions: ['hbk'] }],
+		});
+		if (!path) return;
+		if (backupMode === 'plaintext') {
+			const ok = await confirm(
+				'This backup is UNENCRYPTED — the file IS your identity. Anyone who obtains it becomes you. Store it like a master key. Continue?',
+				{ title: 'Plaintext backup', kind: 'warning' },
+			);
+			if (!ok) return;
+		}
+		backingUp = true;
+		try {
+			await backupData(backupMode === 'passphrase' ? backupPass : null, path);
+			toast('Backup saved', 'success');
+			backupPass = '';
+		} catch (e) { toast(String(e), 'error'); }
+		finally { backingUp = false; }
+	}
+
+	// Restore: pick a file → peek (does it need a passphrase?) → confirm wipe → restore → relaunch.
+	let restoreNeedsPass = false;
+	let restorePass = '';
+	let restorePath: string | null = null;
+	let restoring = false;
+
+	async function pickRestore() {
+		const path = await openFileDialog({
+			multiple: false,
+			filters: [{ name: 'Hoardbook backup', extensions: ['hbk', 'json'] }],
+		});
+		if (!path) return;
+		try {
+			restoreNeedsPass = await peekBackup(path as string);
+		} catch (e) { toast(`Not a valid Hoardbook backup: ${String(e)}`, 'error'); return; }
+		restorePath = path as string;
+		restorePass = '';
+		if (!restoreNeedsPass) doRestore();
+	}
+
+	async function doRestore() {
+		if (!restorePath) return;
+		const ok = await confirm(
+			'Restoring REPLACES all current data on this device with the backup, then restarts. Continue?',
+			{ title: 'Restore from backup', kind: 'warning' },
+		);
+		if (!ok) return;
+		restoring = true;
+		try {
+			await wipeData();
+			const info = await restoreData(restoreNeedsPass ? restorePass : null, restorePath);
+			identity.set(info);
+			restorePath = null; restorePass = ''; restoreNeedsPass = false;
+			toast('Backup restored — restarting…');
+			await new Promise(r => setTimeout(r, 2500));
+			await relaunch();
+		} catch (e) { toast(String(e), 'error'); restoring = false; }
+	}
+
+	// ── Import a different Nostr key (always warns about linking) ─────────────────
+	let importOpen = false;
+	let importNsecValue = '';
+	let importWarnAck = false;
+	let importingNsec = false;
+
+	async function handleImportNsec() {
+		importingNsec = true;
+		try {
+			const info = await importNsec(importNsecValue.trim());
+			identity.set(info);
+			importOpen = false; importNsecValue = ''; importWarnAck = false;
+			toast('Nostr key imported');
+		} catch (e) { toast(String(e), 'error'); }
+		finally { importingNsec = false; }
+	}
+
+	// ── Updates (Obsidian deferred-install) ──────────────────────────────────────
 	let updateChecking = false;
-	let updateInstalling = false;
+	let updateStaging = false;
 	let updateInfo: UpdateInfo | null = null;
 	let updateChecked = false;
 	let updateError = '';
+	let stagedVersion: string | null = null;
 
 	async function doCheckUpdate() {
 		updateChecking = true;
@@ -37,14 +148,25 @@
 		}
 	}
 
-	async function doInstallUpdate() {
-		updateInstalling = true;
+	// Background download + minisign-verify, staged for deferred install — NO immediate restart.
+	async function doDownloadUpdate() {
+		updateStaging = true;
 		try {
-			await installUpdate();
-		} catch (e) {
-			toast(String(e), 'error');
-			updateInstalling = false;
-		}
+			stagedVersion = await downloadUpdate();
+			if (stagedVersion) {
+				toast(`Update v${stagedVersion} downloaded — it applies when you restart`, 'success');
+			}
+		} catch (e) { toast(String(e), 'error'); }
+		finally { updateStaging = false; }
+	}
+
+	async function doApplyUpdate() {
+		try { await applyStagedUpdate(); } catch (e) { toast(String(e), 'error'); }
+	}
+
+	async function toggleApplyMode() {
+		settings = withApplyMode(fullSettings(), nextApplyMode(settings.update_apply_mode));
+		try { await saveSettings(settings); } catch (e) { toast(String(e), 'error'); }
 	}
 
 	const BOOTSTRAP_RELAY = 'http://141.98.199.138:3000';
@@ -76,7 +198,8 @@
 		relayStatuses = relayStatuses;
 	}
 
-	let allowDms = true;
+	$: allowDms = settings.allow_dms;
+	$: applyMode = settings.update_apply_mode;
 
 	let wipeConfirm = false;
 	let wiping = false;
@@ -89,12 +212,16 @@
 			bootstrapStatus = 'error';
 		});
 		try {
-			const s = await getSettings();
+			settings = await getSettings();
 			// Filter out bootstrap relay from user list (it's shown separately).
-			relayUrls = s.relay_urls.filter(u => u !== BOOTSTRAP_RELAY);
-			allowDms = s.allow_dms ?? true;
+			relayUrls = settings.relay_urls.filter(u => u !== BOOTSTRAP_RELAY);
 			relayUrls.forEach(probeRelay);
 		} catch { /* proceed with defaults if settings load fails */ }
+		// Visible-after "now running vX.Y" notice — fires once per version change.
+		try {
+			const notice = updateNoticeVM(await takeUpdateNotice());
+			if (notice.show) toast(`Now running v${notice.version} — see the changelog for what's new`, 'success');
+		} catch { /* updater not configured */ }
 	});
 
 	async function handleGenerate() {
@@ -133,33 +260,13 @@
 		}
 	}
 
-	async function handleImport() {
-		importing = true;
-		try {
-			const path = await openFileDialog({
-				multiple: false,
-				filters: [{ name: 'Hoardbook keypair', extensions: ['json'] }],
-			});
-			if (!path) return;
-			const info = await importKeypair(path as string);
-			identity.set(info);
-			toast('Keypair imported — your identity has been restored');
-		} catch (e) {
-			toast(String(e), 'error');
-		} finally {
-			importing = false;
-		}
-	}
-
-	function fullSettings() {
-		return {
-			relay_urls: relayUrls,
-			allow_dms: allowDms,
-		};
+	// Merge live relay edits into the preserved settings object so save never drops a field.
+	function fullSettings(): Settings {
+		return { ...settings, relay_urls: relayUrls };
 	}
 
 	async function toggleAllowDms() {
-		allowDms = !allowDms;
+		settings = { ...settings, allow_dms: !settings.allow_dms };
 		try {
 			await saveSettings(fullSettings());
 		} catch (e) {
@@ -211,7 +318,8 @@
 	async function handleSaveRelays() {
 		savingRelays = true;
 		try {
-			await saveSettings(fullSettings());
+			settings = fullSettings();
+			await saveSettings(settings);
 			toast('Relay settings saved');
 		} catch (e) {
 			toast(String(e), 'error');
@@ -270,46 +378,135 @@
 	<!-- Identity -->
 	<div class="section-label">Identity</div>
 
-	{#if $identity}
+	{#if $identity && kv}
 		<div class="surface">
 			<div class="identity-top">
 				<Avatar letter={idInitial} size={56} hue={idHue} />
 				<div class="identity-info">
 					<div class="identity-name">{idName}</div>
-					<div class="identity-created">Ed25519 keypair</div>
+					<div class="identity-created">Nostr identity (npub)</div>
 				</div>
 				<span class="pill pill-online"><span class="pill-dot" />Active</span>
 			</div>
 
-			<div class="field-label" style="margin-bottom:6px">Your share code</div>
-			<div class="id-display">
-				<span class="id-text">{$identity.share_code}</span>
-				<button class="icon-btn" on:click={handleCopy} title="Copy to clipboard">{@html icons.copy}</button>
-			</div>
+			<!-- The three keys: npub (irreplaceable), iroh node key (public), share code (carries the browse-key). -->
+			{#each kv.rows as row (row.label)}
+				<div class="field-label" style="margin-bottom:4px">{row.label}{#if row.sensitive} <span class="key-secret">secret</span>{/if}</div>
+				<div class="id-display">
+					<span class="id-text">{row.value}</span>
+					{#if row.label === 'Share code'}
+						<button class="icon-btn" on:click={handleCopy} title="Copy share code">{@html icons.copy}</button>
+						<button class="icon-btn" on:click={showShareQr} title="Show QR code">{@html icons.qr}</button>
+					{/if}
+				</div>
+			{/each}
 
+			{#if shareQrSvg}
+				<div class="qr-box">{@html shareQrSvg}</div>
+				<div class="id-hint">Scan to import your share code on another device. Treat it as secret — it unlocks your listings.</div>
+			{/if}
 			<div class="id-actions">
-				<span class="id-hint">{copied ? 'Copied!' : 'Share this so others can look you up.'}</span>
+				<span class="id-hint">{copied ? 'Copied!' : 'Hand out your share code so others can look you up.'}</span>
 			</div>
 
-			{#if $identity.key_storage === 'plain-file'}
+			<div class="no-recovery">{@html icons.key} {kv.noRecoveryNotice}</div>
+
+			{#if kv.showStorageWarning}
 				<div class="key-storage-warn">
-					{@html icons.key} Your private key is stored as a protected file (not in an OS
-					keyring) on this platform. Anyone with access to your user account can read it —
+					{@html icons.key} Your key is stored as a protected file ({kv.storageLabel}), not in an
+					OS keyring on this platform. Anyone with access to your user account can read it —
 					keep this device and your home directory secure. Keyring support is planned.
+				</div>
+			{/if}
+		</div>
+
+		<!-- Backup / restore -->
+		<div class="section-label">Backup &amp; restore</div>
+		<div class="surface">
+			<div class="field-label">Export a portable backup of your whole profile (all three keys + collections, contacts, settings). Store it somewhere safe — it is your only protection against losing your identity.</div>
+			<div class="backup-modes">
+				{#each backupModes as opt (opt.mode)}
+					<label class="backup-mode" class:backup-mode-on={backupMode === opt.mode}>
+						<input type="radio" name="backupMode" value={opt.mode} bind:group={backupMode} />
+						<div>
+							<div class="backup-mode-label">{opt.label}{#if opt.warned} ⚠{/if}</div>
+							<div class="toggle-sub">{opt.description}</div>
+						</div>
+					</label>
+				{/each}
+			</div>
+			{#if backupMode === 'passphrase'}
+				<input class="hb-input" type="password" placeholder="Backup passphrase (min 12 characters)" bind:value={backupPass} />
+				{#if backupPass}
+					<div class="strength-row">
+						<div class="strength-bar"><div class="strength-fill" style="width:{backupStrength.score * 25}%" class:strength-bad={!backupStrength.acceptable}></div></div>
+						<span class="strength-label">{backupStrength.label}</span>
+					</div>
+					{#if backupStrength.reason}<div class="toggle-sub">{backupStrength.reason}</div>{/if}
+				{/if}
+			{/if}
+			<div style="display:flex; gap:8px; flex-wrap:wrap;">
+				<button class="btn-primary btn-sm" on:click={handleBackup} disabled={backingUp || (backupMode === 'passphrase' && !backupStrength.acceptable)}>
+					{backingUp ? 'Exporting…' : 'Export backup'}
+				</button>
+				<button class="btn-default btn-sm" on:click={pickRestore} disabled={restoring}>
+					{@html icons.key} {restoring ? 'Restoring…' : 'Restore from backup'}
+				</button>
+			</div>
+			{#if restoreNeedsPass && restorePath}
+				<div class="restore-pass">
+					<input class="hb-input" type="password" placeholder="Backup passphrase" bind:value={restorePass} />
+					<button class="btn-primary btn-sm" on:click={doRestore} disabled={!restorePass || restoring}>Restore</button>
+					<button class="btn-ghost btn-sm" on:click={() => { restorePath = null; restoreNeedsPass = false; }}>Cancel</button>
+				</div>
+			{/if}
+		</div>
+
+		<!-- Import a different key -->
+		<div class="section-label">Use a different Nostr key</div>
+		<div class="surface">
+			{#if !importOpen}
+				<div class="toggle-row">
+					<div class="toggle-text">
+						<div class="toggle-label">Import an existing Nostr key</div>
+						<div class="toggle-sub">Replaces this identity. Wipe data first if you already have one.</div>
+					</div>
+					<button class="btn-default btn-sm" on:click={() => (importOpen = true)}>Import nsec</button>
+				</div>
+			{:else}
+				<div class="link-warn">
+					{@html icons.key} <strong>Linking warning:</strong> if this key is public — or the
+					same key you use in Qurator or anywhere else — importing it links that identity to your
+					Hoardbook activity and de-pseudonymizes you. Only continue if you understand this.
+				</div>
+				<label class="ack-row"><input type="checkbox" bind:checked={importWarnAck} /> I understand the linking implication.</label>
+				<input class="hb-input hb-mono" type="password" placeholder="nsec1…" bind:value={importNsecValue} />
+				<div style="display:flex; gap:8px;">
+					<button class="btn-primary btn-sm" on:click={handleImportNsec} disabled={!importWarnAck || !importNsecValue.trim() || importingNsec}>
+						{importingNsec ? 'Importing…' : 'Import key'}
+					</button>
+					<button class="btn-ghost btn-sm" on:click={() => { importOpen = false; importNsecValue = ''; importWarnAck = false; }}>Cancel</button>
 				</div>
 			{/if}
 		</div>
 	{:else}
 		<div class="surface">
-			<p class="no-id-text">No identity yet. Generate a keypair or restore from a backup.</p>
+			<p class="no-id-text">No identity yet. Generate one, or restore from a backup.</p>
 			<div style="display:flex; gap:8px; flex-wrap:wrap;">
 				<button class="btn-primary" on:click={handleGenerate} disabled={generating}>
-					{generating ? 'Generating…' : 'Generate keypair'}
+					{generating ? 'Generating…' : 'Generate identity'}
 				</button>
-				<button class="btn-default" on:click={handleImport} disabled={importing}>
-					{@html icons.key} {importing ? 'Importing…' : 'Import from backup'}
+				<button class="btn-default" on:click={pickRestore} disabled={restoring}>
+					{@html icons.key} {restoring ? 'Restoring…' : 'Restore from backup'}
 				</button>
 			</div>
+			{#if restoreNeedsPass && restorePath}
+				<div class="restore-pass">
+					<input class="hb-input" type="password" placeholder="Backup passphrase" bind:value={restorePass} />
+					<button class="btn-primary btn-sm" on:click={doRestore} disabled={!restorePass || restoring}>Restore</button>
+					<button class="btn-ghost btn-sm" on:click={() => { restorePath = null; restoreNeedsPass = false; }}>Cancel</button>
+				</div>
+			{/if}
 		</div>
 	{/if}
 
@@ -387,10 +584,13 @@
 				<div class="toggle-sub">Currently running v{appVersion || '…'}</div>
 			</div>
 			<div class="update-actions">
-				{#if updateInfo}
+				{#if stagedVersion}
+					<span class="update-available-text">v{stagedVersion} downloaded</span>
+					<button class="btn-primary btn-sm" on:click={doApplyUpdate}>Restart &amp; apply</button>
+				{:else if updateInfo}
 					<span class="update-available-text">v{updateInfo.version} available</span>
-					<button class="btn-primary btn-sm" on:click={doInstallUpdate} disabled={updateInstalling}>
-						{updateInstalling ? 'Installing…' : 'Install & restart'}
+					<button class="btn-primary btn-sm" on:click={doDownloadUpdate} disabled={updateStaging}>
+						{updateStaging ? 'Downloading…' : 'Download update'}
 					</button>
 				{:else if updateChecked}
 					<span class="update-ok-text">Up to date</span>
@@ -399,6 +599,18 @@
 					{updateChecking ? 'Checking…' : 'Check for updates'}
 				</button>
 			</div>
+		</div>
+		{#if stagedVersion}
+			<div class="toggle-sub">Downloaded and verified. It installs automatically when you quit Hoardbook (or click "Restart &amp; apply").</div>
+		{/if}
+		<div class="toggle-row" style="margin-top:4px">
+			<div class="toggle-text">
+				<div class="toggle-label">Confirm before applying updates</div>
+				<div class="toggle-sub">On: updates wait for your "Restart &amp; apply". Off: applied automatically on quit (verified by signature either way).</div>
+			</div>
+			<button class="toggle" class:toggle-on={applyMode === 'confirm'} on:click={toggleApplyMode} aria-label="Toggle confirm before applying">
+				<span class="toggle-thumb" />
+			</button>
 		</div>
 		{#if updateError}
 			<div class="update-error-text">{updateError}</div>
@@ -772,4 +984,44 @@
 	}
 	.btn-danger:disabled { opacity: 0.5; cursor: not-allowed; }
 	.btn-sm { padding: 5px 11px; font-size: 12px; height: 28px; }
+
+	/* M5: 3-key view, backup/restore, import-nsec, share QR */
+	.key-secret {
+		font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.5px;
+		color: var(--error); border: 1px solid color-mix(in oklch, var(--error) 30%, transparent);
+		border-radius: 4px; padding: 0 5px; margin-left: 4px;
+	}
+	.no-recovery {
+		margin-top: 4px; padding: 10px 12px; border-radius: 7px;
+		border: 1px solid color-mix(in oklch, var(--error) 25%, transparent);
+		background: color-mix(in oklch, var(--error) 7%, transparent);
+		font-size: 11.5px; color: var(--fg-muted); line-height: 1.5;
+		display: flex; gap: 8px; align-items: flex-start;
+	}
+	.qr-box {
+		display: flex; justify-content: center; padding: 12px;
+		background: oklch(0.98 0 0); border-radius: 8px; margin-top: 8px;
+	}
+	.qr-box :global(svg) { width: 180px; height: 180px; }
+	.backup-modes { display: flex; flex-direction: column; gap: 8px; }
+	.backup-mode {
+		display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px;
+		border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+	}
+	.backup-mode-on { border-color: var(--accent); background: color-mix(in oklch, var(--accent) 7%, transparent); }
+	.backup-mode-label { font-size: 12.5px; font-weight: 500; color: var(--fg); }
+	.strength-row { display: flex; align-items: center; gap: 10px; }
+	.strength-bar { flex: 1; height: 6px; border-radius: 99px; background: var(--bg-elev3); overflow: hidden; }
+	.strength-fill { height: 100%; background: var(--online); transition: width 0.15s; }
+	.strength-fill.strength-bad { background: var(--error); }
+	.strength-label { font-size: 11px; color: var(--fg-dim); white-space: nowrap; }
+	.restore-pass { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+	.link-warn {
+		padding: 10px 12px; border-radius: 7px;
+		border: 1px solid color-mix(in oklch, var(--accent) 35%, transparent);
+		background: color-mix(in oklch, var(--accent) 8%, transparent);
+		font-size: 11.5px; color: var(--fg-muted); line-height: 1.5;
+		display: flex; gap: 8px; align-items: flex-start;
+	}
+	.ack-row { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--fg-muted); }
 </style>
