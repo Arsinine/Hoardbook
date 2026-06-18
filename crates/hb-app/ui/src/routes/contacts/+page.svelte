@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { pasteKey, follow, refreshContact, requestDownload, unfollowContact, setContactTags, groupsGet, contactUpdateGroups } from '$lib/api.js';
+	import { ensureDownloadPrivacyAck } from '$lib/privacy-gate.js';
 	import { save } from '@tauri-apps/plugin-dialog';
 	import { contacts, identity, toast, downloads } from '$lib/stores.js';
 	import DownloadQueue from '$lib/components/DownloadQueue.svelte';
@@ -155,6 +156,8 @@
 	}
 
 	async function proceedWithDownload(detail: { peerId: string; slug: string; path: string }) {
+		// One-time IP-exposure notice before the first direct download (browsing leaks nothing).
+		if (!(await ensureDownloadPrivacyAck())) return;
 		const filename = detail.path.split('/').pop() ?? detail.path;
 		const savePath = await save({ defaultPath: filename });
 		if (!savePath) return;

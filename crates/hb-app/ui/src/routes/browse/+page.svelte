@@ -2,6 +2,7 @@
 	import { contacts, downloads, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import { requestDownload } from '$lib/api.js';
+	import { ensureDownloadPrivacyAck } from '$lib/privacy-gate.js';
 	import { save } from '@tauri-apps/plugin-dialog';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import DownloadQueue from '$lib/components/DownloadQueue.svelte';
@@ -108,6 +109,8 @@
 
 	async function handleDownload(item: DirectoryItem) {
 		if (!selectedPeer || !selectedCollection || item.item_type !== 'File') return;
+		// One-time IP-exposure notice before the first direct download (browsing leaks nothing).
+		if (!(await ensureDownloadPrivacyAck())) return;
 		const savePath = await save({ defaultPath: item.name }).catch(() => null);
 		if (!savePath) return;
 		try {

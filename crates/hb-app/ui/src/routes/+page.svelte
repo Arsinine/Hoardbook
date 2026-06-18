@@ -1,6 +1,7 @@
 <script lang="ts">
-	import { saveProfile, publishProfile, publishCollection, deleteCollection, updateCollectionMeta, exportCollection, getShareSettings, generateKeypair, hasPublishedProfile, saveKeypairFile, importKeypair } from '$lib/api.js';
-	import { save as saveDialog, open as openDialog, confirm } from '@tauri-apps/plugin-dialog';
+	import { saveProfile, publishProfile, publishCollection, deleteCollection, updateCollectionMeta, exportCollection, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec } from '$lib/api.js';
+	import { passphraseStrength } from '$lib/backup-export.js';
+	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { profile, collections, identity, toast, appReady, homeDraft, identityLoadError } from '$lib/stores.js';
 	import { onMount } from 'svelte';
 	import { icons, socialIcons, avatarHue } from '$lib/icons.js';
@@ -29,8 +30,14 @@
 	// 0=loading, 1=keypair, 2=name, 3=collection (skippable), 4=done
 	let obStep = 0;
 	let obGenerating = false;
-	let obKeypairRevealed = false; // true after generation: show hb_id + export options
-	let quratOverlayOpen = false;  // privacy overlay before Qurator import
+	let obKeypairRevealed = false; // true after generation: show npub + share code + backup prompt
+	let importOverlayOpen = false; // linking-warning overlay before importing an existing nsec
+	let obImportNsec = '';
+	let obImportWarnAck = false;
+	let obImporting = false;
+	let obBackupPass = '';        // passphrase for the post-generate portable backup
+	let obBackingUp = false;
+	$: obBackupStrength = passphraseStrength(obBackupPass);
 
 	$: if ($appReady && obStep === 0) {
 		if ($identity) obStep = 4;
@@ -43,43 +50,49 @@
 		try {
 			const info = await generateKeypair();
 			identity.set(info);
-			obKeypairRevealed = true; // stay on step 1 to show hb_id + export options
+			obKeypairRevealed = true; // stay on step 1 to show the share code + backup prompt
 		} catch (e) { toast(String(e), 'error'); }
 		finally { obGenerating = false; }
 	}
 
+	// Post-generate portable backup (whole profile, passphrase-encrypted). Replaces the legacy
+	// key-only plaintext export.
 	async function obExportBackup() {
+		if (!obBackupStrength.acceptable) {
+			toast(obBackupStrength.reason ?? 'Choose a stronger passphrase', 'error');
+			return;
+		}
+		obBackingUp = true;
 		try {
 			const path = await saveDialog({
-				defaultPath: 'hoardbook-keypair-backup.json',
-				filters: [{ name: 'JSON backup', extensions: ['json'] }],
+				defaultPath: 'hoardbook-backup.hbk',
+				filters: [{ name: 'Hoardbook backup', extensions: ['hbk'] }],
 			});
 			if (!path) return; // dialog cancelled
-			const ok = await confirm(
-				'This file contains your private key. Store it somewhere safe and never share it.',
-				{ title: 'Save keypair backup', kind: 'warning' },
-			);
-			if (!ok) return;
-			await saveKeypairFile(path);
-			toast('Backup saved', 'success');
+			await backupData(obBackupPass, path);
+			toast('Backup saved — keep it somewhere safe', 'success');
+			obBackupPass = '';
 			obStep = 2;
 		} catch (e) {
 			toast(String(e), 'error');
+		} finally {
+			obBackingUp = false;
 		}
 	}
 
-	async function obImportFromQurator() {
-		quratOverlayOpen = false;
-		const path = await openDialog({
-			filters: [{ name: 'JSON keypair', extensions: ['json'] }],
-		});
-		if (path) {
-			try {
-				const info = await importKeypair(path as string);
-				identity.set(info);
-				obKeypairRevealed = true;
-			} catch (e) { toast(String(e), 'error'); }
-		}
+	// Import an existing Nostr key — ALWAYS behind the de-pseudonymization linking warning (there is
+	// no offline oracle to tell whether a pasted key is public/Qurator).
+	async function obImportExistingKey() {
+		obImporting = true;
+		try {
+			const info = await importNsec(obImportNsec.trim());
+			identity.set(info);
+			importOverlayOpen = false;
+			obImportNsec = '';
+			obImportWarnAck = false;
+			obKeypairRevealed = true;
+		} catch (e) { toast(String(e), 'error'); }
+		finally { obImporting = false; }
 	}
 
 	async function obSaveName() {
@@ -455,16 +468,16 @@
 			{#if obStep === 1}
 				{#if !obKeypairRevealed}
 					<div class="ob-card-title">Create your identity</div>
-					<div class="ob-card-sub">Hoardbook uses a local Ed25519 keypair as your identity. No email, no server account.</div>
+					<div class="ob-card-sub">Hoardbook uses a Nostr key (your <span class="mono">npub</span>) as your identity. No email, no server account. It is stored encrypted on this device and never sent to a server.</div>
 					<div class="ob-notice">
 						<span class="ob-notice-icon">{@html icons.shield}</span>
-						<div class="ob-notice-text">Your private key is stored locally and never transmitted. Back it up somewhere safe.</div>
+						<div class="ob-notice-text">Your key is stored locally and never transmitted. There is no recovery if you lose it — so you'll back it up next.</div>
 					</div>
 					<button class="btn-primary btn-full" on:click={obGenerateKeypair} disabled={obGenerating}>
-						{obGenerating ? 'Generating…' : 'Generate keypair'}
+						{obGenerating ? 'Generating…' : 'Generate my Hoardbook identity'}
 					</button>
-					<button class="btn-ghost btn-full ob-skip" style="margin-top:8px" on:click={() => { quratOverlayOpen = true; }}>
-						Import from Qurator
+					<button class="btn-ghost btn-full ob-skip" style="margin-top:8px" on:click={() => { importOverlayOpen = true; }}>
+						Already have a Nostr key? Import
 					</button>
 				{:else}
 					<div class="ob-card-title">Your identity is ready</div>
@@ -475,10 +488,14 @@
 					</div>
 					<div class="ob-notice" style="margin-top:12px">
 						<span class="ob-notice-icon">{@html icons.shield}</span>
-						<div class="ob-notice-text">Back up your private key now. Without it, your identity cannot be recovered.</div>
+						<div class="ob-notice-text">Export a backup now and store it somewhere safe. <strong>If you lose this key your identity is gone — there is no recovery.</strong></div>
 					</div>
-					<button class="btn-primary btn-full" on:click={obExportBackup}>
-						Export backup file
+					<input class="hb-input" style="margin-top:10px" type="password" placeholder="Backup passphrase (min 12 characters)" bind:value={obBackupPass} />
+					{#if obBackupPass && !obBackupStrength.acceptable}
+						<div class="ob-card-sub" style="margin-top:4px">{obBackupStrength.reason ?? 'Choose a stronger passphrase.'}</div>
+					{/if}
+					<button class="btn-primary btn-full" style="margin-top:10px" on:click={obExportBackup} disabled={obBackingUp || !obBackupStrength.acceptable}>
+						{obBackingUp ? 'Exporting…' : 'Export backup file'}
 					</button>
 					<button class="btn-ghost btn-full ob-skip" on:click={() => obStep = 2}>
 						I'll do it later
@@ -512,23 +529,27 @@
 		</div>
 	</div>
 
-	{#if quratOverlayOpen}
-		<div class="ob-overlay" on:click|self={() => quratOverlayOpen = false}>
+	{#if importOverlayOpen}
+		<div class="ob-overlay" on:click|self={() => importOverlayOpen = false}>
 			<div class="ob-overlay-card">
-				<div class="ob-card-title">Import from Qurator</div>
+				<div class="ob-card-title">Import an existing Nostr key</div>
 				<div class="ob-card-sub" style="margin-bottom:16px">
-					<strong>Privacy notice:</strong> Your keypair backup file contains your private key in plain JSON.
-					Import it only from a file you exported yourself. Hoardbook will re-encrypt it locally —
-					the file itself will not be modified. Your private key is never sent to any server.
+					Paste your <span class="mono">nsec</span>. Hoardbook keeps the matching <span class="mono">npub</span>
+					as your identity and mints a fresh transport key + browse-key. Your secret key is stored
+					encrypted on this device and never sent to a server.
 				</div>
 				<div class="ob-notice">
 					<span class="ob-notice-icon">{@html icons.shield}</span>
-					<div class="ob-notice-text">Only import a backup file from a source you trust. A compromised key cannot be revoked.</div>
+					<div class="ob-notice-text"><strong>Linking warning:</strong> if this is a public key — or the same
+						key you use in Qurator or elsewhere — importing it links that identity to your Hoardbook
+						activity and de-pseudonymizes you. Only continue if you understand this.</div>
 				</div>
-				<button class="btn-primary btn-full" on:click={obImportFromQurator}>
-					I understand — choose file
+				<label class="ob-ack"><input type="checkbox" bind:checked={obImportWarnAck} /> I understand the linking implication.</label>
+				<input class="hb-input mono" style="margin-top:10px" type="password" placeholder="nsec1…" bind:value={obImportNsec} />
+				<button class="btn-primary btn-full" style="margin-top:10px" on:click={obImportExistingKey} disabled={!obImportWarnAck || !obImportNsec.trim() || obImporting}>
+					{obImporting ? 'Importing…' : 'Import key'}
 				</button>
-				<button class="btn-ghost btn-full ob-skip" on:click={() => quratOverlayOpen = false}>
+				<button class="btn-ghost btn-full ob-skip" on:click={() => { importOverlayOpen = false; obImportNsec = ''; obImportWarnAck = false; }}>
 					Cancel
 				</button>
 			</div>
@@ -539,7 +560,7 @@
 	<div class="topbar">
 		<div>
 			<div class="topbar-title">My Profile</div>
-			<div class="topbar-sub">Visible to anyone with your hb_id</div>
+			<div class="topbar-sub">Visible to anyone with your npub</div>
 		</div>
 		<div class="topbar-actions">
 			<button class="btn-ghost btn-sm" on:click={handleSave} disabled={!form.display_name || saving}>

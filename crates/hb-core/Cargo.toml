@@ -15,7 +15,18 @@ hex        = { workspace = true }
 nostr             = { version = "=0.43.1", features = ["nip44"] }
 bech32            = "0.11"
 
-# --- legacy v0.4.3 core (still used by hb-app until its M4 Nostr cutover completes) ---
+# --- M5 portable backup crypto: Argon2id (KDF) → XChaCha20-Poly1305 (AEAD). `zeroize`
+#     wipes the derived key; `unicode-normalization` NFKC-normalizes the passphrase so a backup
+#     made on one OS decrypts on another. XChaCha20-Poly1305 ships in `chacha20poly1305` 0.10 with
+#     no extra feature (the brief's `xchacha20poly1305` feature does not exist in this version);
+#     the default `alloc` feature provides the AAD `Payload` API. ---
+argon2                = { workspace = true }
+unicode-normalization = { workspace = true }
+zeroize               = { workspace = true }
+
+# --- legacy v0.4.3 core (these became unused when M4 deleted the legacy crypto/envelope/jcs
+#     modules; left in place — removing them is out of M5 scope. `chacha20poly1305` is revived
+#     by the M5 backup core). ---
 ed25519-dalek     = { version = "2", features = ["rand_core"] }
 rand              = "0.8"
 sha2              = "0.10"
