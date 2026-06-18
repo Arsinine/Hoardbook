@@ -56,16 +56,80 @@ pub(crate) async fn run() -> ExitCode {
             Ok(code) => code,
             Err(e) => { eprintln!("[probe] error: {e:#}"); ExitCode::FAILURE }
         },
+        // backup/restore: exercise the M5 portable-backup seam across *real* machines (the one
+        // thing the offline dev env could not — restore on different hardware). Prints the npub on
+        // each side so a caller can assert the identity survives the round-trip.
+        Some("backup") => match run_backup(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => { eprintln!("[backup] error: {e:#}"); ExitCode::FAILURE }
+        },
+        Some("restore") => match run_restore(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => { eprintln!("[restore] error: {e:#}"); ExitCode::FAILURE }
+        },
         _ => {
             eprintln!(
-                "usage: hb-p2p-it <serve|probe> [options]\n\
+                "usage: hb-p2p-it <serve|probe|backup|restore> [options]\n\
                  \n\
-                 serve --data-dir <dir> --relay <url>... [--follow <npub>]\n\
-                 probe --peer <hbk…> --relay <url>... [--save-dir <dir>]"
+                 serve   --data-dir <dir> --relay <url>... [--follow <npub>]\n\
+                 probe   --peer <hbk…> --relay <url>... [--save-dir <dir>]\n\
+                 backup  --data-dir <dir> --out <file> (--passphrase <pp> | --plaintext)\n\
+                 restore --data-dir <empty-dir> --in <file> [--passphrase <pp>]"
             );
             ExitCode::FAILURE
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// backup / restore — M5 portable-backup seam, exercised across real machines
+// ---------------------------------------------------------------------------
+
+fn run_backup(args: &[String]) -> Result<()> {
+    let data_dir = PathBuf::from(
+        flag_value(args, "--data-dir").ok_or_else(|| anyhow!("backup requires --data-dir <dir>"))?,
+    );
+    let out = PathBuf::from(
+        flag_value(args, "--out").ok_or_else(|| anyhow!("backup requires --out <file>"))?,
+    );
+    let store = DataStore::new(data_dir);
+    let app_id = load_or_create_identity(&store)?;
+    let plaintext = args.iter().any(|a| a == "--plaintext");
+    let mode = if plaintext {
+        hb_core::BackupMode::Plaintext
+    } else {
+        hb_core::BackupMode::Passphrase(
+            flag_value(args, "--passphrase")
+                .ok_or_else(|| anyhow!("backup requires --passphrase <pp> (or --plaintext)"))?,
+        )
+    };
+    let archive = crate::backup::backup_inner(&store, mode).map_err(|e| anyhow!("backup: {e}"))?;
+    std::fs::write(&out, &archive).with_context(|| format!("write {}", out.display()))?;
+    println!("backed_up_npub={}", app_id.npub());
+    println!("archive={} bytes={} encrypted={}", out.display(), archive.len(), !plaintext);
+    Ok(())
+}
+
+fn run_restore(args: &[String]) -> Result<()> {
+    let data_dir = PathBuf::from(
+        flag_value(args, "--data-dir")
+            .ok_or_else(|| anyhow!("restore requires --data-dir <empty-dir>"))?,
+    );
+    let input = PathBuf::from(
+        flag_value(args, "--in").ok_or_else(|| anyhow!("restore requires --in <file>"))?,
+    );
+    let archive = std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
+    let store = DataStore::new(data_dir);
+    crate::backup::restore_inner(&store, &archive, flag_value(args, "--passphrase"))
+        .map_err(|e| anyhow!("restore: {e}"))?;
+    // Load-only (NOT load_or_create): a restore that left no identity must error, not silently
+    // mint a fresh npub that would print as a false "restored" success (chorus: Gemini + opencode).
+    let stored = store
+        .load_identity()?
+        .ok_or_else(|| anyhow!("restore wrote no identity — the archive did not contain one"))?;
+    let app_id = AppIdentity::from_stored(&stored).map_err(|e| anyhow!("load restored identity: {e}"))?;
+    println!("restored_npub={}", app_id.npub());
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
