@@ -1,6 +1,6 @@
 [package]
 name    = "hb-core"
-version = "0.4.3"
+version = "0.9.0"
 edition = "2021"
 
 [dependencies]
@@ -24,14 +24,12 @@ argon2                = { workspace = true }
 unicode-normalization = { workspace = true }
 zeroize               = { workspace = true }
 
-# --- legacy v0.4.3 core (these became unused when M4 deleted the legacy crypto/envelope/jcs
-#     modules; left in place — removing them is out of M5 scope. `chacha20poly1305` is revived
-#     by the M5 backup core). ---
-ed25519-dalek     = { version = "2", features = ["rand_core"] }
+# --- shared crypto primitives still in use post-pivot: `rand` (key/salt/nonce), `sha2`
+#     (fingerprint + HKDF), `chacha20poly1305` (M5 backup XChaCha20-Poly1305), `hkdf` + `base64`
+#     (NIP-44 listing envelope). The dead M4 leftovers — `ed25519-dalek`, `bs58`, `x25519-dalek` —
+#     were removed at the v0.9.0 release (zero use sites after the Ed25519 / `hb1_` / X25519 deletion). ---
 rand              = "0.8"
 sha2              = "0.10"
-bs58              = "0.5"
-x25519-dalek      = { version = "2", features = ["static_secrets"] }
 chacha20poly1305  = "0.10"
 hkdf              = "0.12"
 base64            = "0.22"

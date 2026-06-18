@@ -6,6 +6,7 @@
 	import { keyView } from '$lib/key-view.js';
 	import { passphraseStrength, backupModeOptions, type BackupMode } from '$lib/backup-export.js';
 	import { updateNoticeVM, nextApplyMode, withApplyMode } from '$lib/update-ux.js';
+	import { DEFAULT_RELAYS, validateRelayUrl } from '$lib/relays.js';
 	import QRCode from 'qrcode';
 	import { relaunch } from '@tauri-apps/plugin-process';
 	import { open as openFileDialog, save as saveFileDialog, confirm } from '@tauri-apps/plugin-dialog';
@@ -169,8 +170,6 @@
 		try { await saveSettings(settings); } catch (e) { toast(String(e), 'error'); }
 	}
 
-	const BOOTSTRAP_RELAY = 'http://141.98.199.138:3000';
-
 	let relayUrls: string[] = [];
 	let newRelay = '';
 	let savingRelays = false;
@@ -178,15 +177,8 @@
 
 	type RelayStatus = 'checking' | 'ok' | 'error';
 	let relayStatuses: Record<string, RelayStatus> = {};
-	let bootstrapStatus: RelayStatus = 'checking';
 
 	async function probeRelay(url: string) {
-		if (url === BOOTSTRAP_RELAY) {
-			bootstrapStatus = 'checking';
-			try { await checkRelay(url); bootstrapStatus = 'ok'; }
-			catch { bootstrapStatus = 'error'; }
-			return;
-		}
 		relayStatuses[url] = 'checking';
 		relayStatuses = relayStatuses;
 		try {
@@ -207,14 +199,11 @@
 	onMount(async () => {
 		try { appVersion = await getVersion(); } catch { appVersion = ''; }
 		loadWatches();
-		// Always probe the bootstrap relay immediately.
-		probeRelay(BOOTSTRAP_RELAY).then(() => {}).catch(() => {
-			bootstrapStatus = 'error';
-		});
 		try {
 			settings = await getSettings();
-			// Filter out bootstrap relay from user list (it's shown separately).
-			relayUrls = settings.relay_urls.filter(u => u !== BOOTSTRAP_RELAY);
+			// Fresh install has no saved relays — show the curated public defaults (the backend
+			// falls back to the same set). The user can edit or remove them.
+			relayUrls = settings.relay_urls.length ? settings.relay_urls : [...DEFAULT_RELAYS];
 			relayUrls.forEach(probeRelay);
 		} catch { /* proceed with defaults if settings load fails */ }
 		// Visible-after "now running vX.Y" notice — fires once per version change.
@@ -288,12 +277,10 @@
 	}
 
 	async function addRelay() {
-		const url = newRelay.trim().replace(/\/$/, '');
-		if (!url || relayUrls.includes(url)) return;
-		if (!url.startsWith('http://') && !url.startsWith('https://')) {
-			toast('Relay URL must start with http:// or https://', 'error');
-			return;
-		}
+		const check = validateRelayUrl(newRelay);
+		if (!check.ok) { toast(check.error, 'error'); return; }
+		const url = check.url;
+		if (relayUrls.includes(url)) return;
 		addingRelay = true;
 		try {
 			await checkRelay(url);
@@ -516,17 +503,6 @@
 	</div>
 
 	<div class="surface surface-nop">
-		<!-- Bootstrap relay — always present, non-removable -->
-		<div class="relay-row">
-			<div class="relay-dot" style="background:{relayDotColor(bootstrapStatus)}" class:relay-dot-pulse={bootstrapStatus === 'checking'} />
-			<div class="relay-info">
-				<div class="relay-url">{BOOTSTRAP_RELAY}</div>
-				<div class="relay-meta">
-					<span class:status-ok={bootstrapStatus === 'ok'} class:status-err={bootstrapStatus === 'error'}>{relayStatusLabel(bootstrapStatus)}</span>
-				</div>
-			</div>
-			<button class="icon-btn" title="Re-check" on:click={() => probeRelay(BOOTSTRAP_RELAY)}>{@html icons.refresh}</button>
-		</div>
 		{#each relayUrls as url (url)}
 			{@const status = relayStatuses[url]}
 			<div class="relay-row">
@@ -546,7 +522,7 @@
 			<input
 				class="hb-input hb-mono"
 				type="text"
-				placeholder="http://relay.example.com:3000"
+				placeholder="wss://relay.example.com"
 				bind:value={newRelay}
 				on:keydown={(e) => e.key === 'Enter' && addRelay()}
 			/>
