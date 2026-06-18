@@ -8,6 +8,9 @@ export interface IdentityInfo {
 	share_code: string;
 	/** "os-encrypted" (Windows DPAPI) or "plain-file" (Linux/macOS 0600 file). */
 	key_storage: 'os-encrypted' | 'plain-file';
+	/** The bound iroh node PUBLIC key (hex) — safe to display. The browse-key is never exposed
+	 *  as raw bytes (only inside the `hbk` share code). */
+	iroh_node_key: string;
 }
 
 export interface SocialLink {

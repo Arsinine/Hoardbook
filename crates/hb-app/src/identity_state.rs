@@ -41,6 +41,17 @@ impl AppIdentity {
         }
     }
 
+    /// Import an existing Nostr secret key (`nsec` or hex): the pasted key becomes the `npub`,
+    /// and a **fresh** iroh transport key + account browse-key are minted (the other two keys are
+    /// regenerable and need not — must not — be carried in from elsewhere). Distinct from the
+    /// whole-directory restore path. A malformed key is a reasoned `Err`, never a panic.
+    pub fn from_nsec(nsec: &str) -> Result<Self> {
+        let identity = Identity::from_secret(nsec)
+            .map_err(|e| anyhow!(e.to_string()))
+            .context("parsing the imported Nostr secret key")?;
+        Ok(Self { identity, iroh_secret: rand::random(), browse_key: rand::random() })
+    }
+
     /// Reconstruct from the on-disk record.
     pub fn from_stored(s: &StoredIdentity) -> Result<Self> {
         let identity = Identity::from_secret(&s.nsec)

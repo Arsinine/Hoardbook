@@ -3,13 +3,16 @@
 
 use serde::Serialize;
 use tauri::State;
+use zeroize::Zeroizing;
 
 use crate::{
+    backup::backup_inner,
     identity_state::{AppIdentity, SharedIdentity},
     error::{CmdResult, cmd_err},
     store::DataStore,
     SharedDownloadRegistry, SharedEndpoint,
 };
+use hb_core::BackupMode;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IdentityInfo {
@@ -20,6 +23,9 @@ pub struct IdentityInfo {
     pub share_code: String,
     /// How the private key is protected at rest: "os-encrypted" (Windows DPAPI) or "plain-file".
     pub key_storage: &'static str,
+    /// The bound iroh node **public** key (hex) — safe to display; the presence binding vouches
+    /// for it. The browse-key is *never* surfaced as raw bytes (only via the `hbk` share code).
+    pub iroh_node_key: String,
 }
 
 /// Spec: Linux/macOS keep the key as a 0600 plaintext file until the Phase-2 keyring lands; the
@@ -34,6 +40,7 @@ impl IdentityInfo {
             share_code: id.share_code()?,
             npub,
             key_storage: KEY_STORAGE,
+            iroh_node_key: hex::encode(id.iroh_node_key()),
         })
     }
 }
@@ -87,40 +94,46 @@ pub async fn generate_keypair(
     Ok(info)
 }
 
-/// Import an identity from a previously exported JSON file (a `StoredIdentity`).
+/// Import an existing Nostr secret key (`nsec`/hex): validate it, derive the matching `npub`, and
+/// mint a fresh iroh key + browse-key. Refuses if an identity already exists (wipe-first). The
+/// `nsec` is held in a zeroize-on-drop buffer for the call.
+///
+/// The UI must surface the de-pseudonymization implication of linking a public/Qurator `npub`
+/// **before** invoking this — there is no offline oracle to detect a "public" key, so the UI
+/// always warns (no hardcoded list, no relay lookup).
 #[tauri::command]
-pub async fn import_keypair(
+pub async fn import_nsec(
     app: tauri::AppHandle,
-    path: String,
+    nsec: String,
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
     endpoint: State<'_, SharedEndpoint>,
     registry: State<'_, SharedDownloadRegistry>,
 ) -> CmdResult<IdentityInfo> {
-    if store.load_identity().map_err(cmd_err)?.is_some() {
-        return Err("An identity already exists. Wipe data first to import a different one.".into());
-    }
-
-    let json = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Could not read file: {e}"))?;
-    let stored: crate::store::StoredIdentity = serde_json::from_str(&json)
-        .map_err(|e| format!("Invalid identity file: {e}"))?;
-
-    let app_id = AppIdentity::from_stored(&stored)
-        .map_err(|e| format!("Identity file is corrupted: {e}"))?;
-
-    store.save_identity(&stored).map_err(cmd_err)?;
+    let nsec = Zeroizing::new(nsec);
+    let app_id = import_nsec_inner(&store, &nsec).map_err(cmd_err)?;
     let info = IdentityInfo::from_identity(&app_id).map_err(cmd_err)?;
     let iroh_secret = app_id.iroh_secret;
 
     if let Err(e) = crate::start_iroh_endpoint(
         &iroh_secret, (*store).clone(), (*endpoint).clone(), app, (*registry).clone(),
     ).await {
-        tracing::warn!("iroh endpoint startup failed after identity import: {e}");
+        tracing::warn!("iroh endpoint startup failed after nsec import: {e}");
     }
 
     *identity.write().await = Some(app_id);
     Ok(info)
+}
+
+/// Tauri-free import seam: validate the nsec, mint fresh transport/browse keys, persist (re-wrap at
+/// rest). Refuses when an identity already exists. Drives the L1 tests.
+pub fn import_nsec_inner(store: &DataStore, nsec: &str) -> anyhow::Result<AppIdentity> {
+    if store.load_identity()?.is_some() {
+        anyhow::bail!("An identity already exists. Wipe data first to import a different key.");
+    }
+    let app_id = AppIdentity::from_nsec(nsec)?;
+    store.save_identity(&app_id.to_stored()?)?;
+    Ok(app_id)
 }
 
 /// Load the current identity from disk. Returns `None` if no identity exists yet.
@@ -170,27 +183,68 @@ pub async fn get_node_addr(endpoint: State<'_, SharedEndpoint>) -> CmdResult<Opt
     Ok(addr)
 }
 
-/// Export the stored identity as a JSON string for the user to save to a file.
+/// Export a **portable, whole-`~/.hoardbook` backup** to `path`. `passphrase = Some` →
+/// Argon2id → XChaCha20-Poly1305 (the portable default); `passphrase = None` → the plaintext
+/// export (behind the UI's blunt "this file *is* your identity" warning). Replaces the legacy
+/// key-only plaintext export.
 #[tauri::command]
-pub async fn export_keypair(identity: State<'_, SharedIdentity>) -> CmdResult<String> {
-    let guard = identity.read().await;
-    let id = guard.as_ref().ok_or("No identity loaded.")?;
-    let stored = id.to_stored().map_err(cmd_err)?;
-    serde_json::to_string_pretty(&stored).map_err(cmd_err)
+pub async fn backup_data(
+    passphrase: Option<String>,
+    path: String,
+    store: State<'_, DataStore>,
+) -> CmdResult<()> {
+    let pass = passphrase.map(Zeroizing::new);
+    let mode = match &pass {
+        Some(p) => BackupMode::Passphrase(p.as_str()),
+        None => BackupMode::Plaintext,
+    };
+    let archive = backup_inner(store.inner(), mode).map_err(cmd_err)?;
+    std::fs::write(&path, &archive).map_err(|e| format!("Could not write backup file: {e}"))?;
+    Ok(())
 }
 
-/// Write the exported identity JSON to a user-chosen absolute path.
+/// Does the backup at `path` need a passphrase? Lets the UI decide whether to prompt (cheap — no
+/// KDF). Returns an error for a non-backup / unknown-version file.
 #[tauri::command]
-pub async fn save_keypair_file(
+pub async fn peek_backup(path: String) -> CmdResult<bool> {
+    let archive = std::fs::read(&path).map_err(|e| format!("Could not read backup file: {e}"))?;
+    hb_core::is_encrypted_backup(&archive).map_err(cmd_err)
+}
+
+/// Restore a whole-directory backup, re-wrapping the secrets under the local at-rest scheme. The
+/// archive header is self-describing, so `passphrase` is optional (an encrypted archive + `None`
+/// is a reasoned error). Refuses a non-empty profile — the UI wipes first, then re-calls.
+#[tauri::command]
+pub async fn restore_data(
+    app: tauri::AppHandle,
+    passphrase: Option<String>,
     path: String,
+    store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
-) -> CmdResult<()> {
-    let guard = identity.read().await;
-    let id = guard.as_ref().ok_or("No identity loaded.")?;
-    let stored = id.to_stored().map_err(cmd_err)?;
-    let json = serde_json::to_string_pretty(&stored).map_err(cmd_err)?;
-    std::fs::write(&path, json).map_err(cmd_err)?;
-    Ok(())
+    endpoint: State<'_, SharedEndpoint>,
+    registry: State<'_, SharedDownloadRegistry>,
+) -> CmdResult<IdentityInfo> {
+    let archive = std::fs::read(&path).map_err(|e| format!("Could not read backup file: {e}"))?;
+    let pass = passphrase.map(Zeroizing::new);
+    crate::backup::restore_inner(store.inner(), &archive, pass.as_ref().map(|p| p.as_str()))
+        .map_err(cmd_err)?;
+
+    let stored = store
+        .load_identity()
+        .map_err(cmd_err)?
+        .ok_or("Backup restored, but it contained no identity.")?;
+    let app_id = AppIdentity::from_stored(&stored).map_err(cmd_err)?;
+    let info = IdentityInfo::from_identity(&app_id).map_err(cmd_err)?;
+    let iroh_secret = app_id.iroh_secret;
+
+    if let Err(e) = crate::start_iroh_endpoint(
+        &iroh_secret, (*store).clone(), (*endpoint).clone(), app, (*registry).clone(),
+    ).await {
+        tracing::warn!("iroh endpoint startup failed after restore: {e}");
+    }
+
+    *identity.write().await = Some(app_id);
+    Ok(info)
 }
 
 /// Wipe all local data and reset in-memory state. Irreversible.
@@ -216,14 +270,20 @@ pub async fn wipe_data(
 
 #[cfg(test)]
 mod tests {
+    use super::import_nsec_inner;
     use crate::identity_state::AppIdentity;
     use crate::store::DataStore;
+    use nostr::prelude::ToBech32;
     use tempfile::TempDir;
 
     fn test_store() -> (TempDir, DataStore) {
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
         (dir, store)
+    }
+
+    fn nsec_of(id: &AppIdentity) -> String {
+        id.identity.keys().secret_key().to_bech32().unwrap()
     }
 
     #[test]
@@ -234,21 +294,66 @@ mod tests {
     }
 
     #[test]
-    fn export_import_roundtrip_via_store() {
+    fn identity_info_exposes_npub_node_key_and_share_code() {
+        let id = AppIdentity::generate();
+        let info = super::IdentityInfo::from_identity(&id).unwrap();
+        assert!(info.npub.starts_with("npub1"));
+        assert!(info.share_code.starts_with("hbk1"));
+        // The node key is the iroh PUBLIC key, hex; the browse-key is NOT exposed as raw bytes.
+        assert_eq!(info.iroh_node_key, hex::encode(id.iroh_node_key()));
+        assert_eq!(info.iroh_node_key.len(), 64, "32-byte public key as hex");
+        assert!(!info.share_code.contains(&hex::encode(id.browse_key)),
+            "raw browse-key bytes must never appear in the surfaced info");
+    }
+
+    #[test]
+    fn key_storage_reports_plain_file_off_windows() {
+        let id = AppIdentity::generate();
+        let info = super::IdentityInfo::from_identity(&id).unwrap();
+        #[cfg(target_os = "windows")]
+        assert_eq!(info.key_storage, "os-encrypted");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(info.key_storage, "plain-file", "drives the Linux/macOS 0600 storage warning");
+    }
+
+    #[test]
+    fn import_valid_nsec_yields_matching_npub() {
         let (_dir, store) = test_store();
-        let app_id = AppIdentity::generate();
-        let npub = app_id.npub();
-        let stored = app_id.to_stored().unwrap();
-        store.save_identity(&stored).unwrap();
+        let source = AppIdentity::generate();
+        let nsec = nsec_of(&source);
+        let imported = import_nsec_inner(&store, &nsec).unwrap();
+        assert_eq!(imported.npub(), source.npub(), "the imported npub matches the source key");
+        // Persisted and reloadable.
+        let reloaded = AppIdentity::from_stored(&store.load_identity().unwrap().unwrap()).unwrap();
+        assert_eq!(reloaded.npub(), source.npub());
+    }
 
-        // Export = the JSON of StoredIdentity.
-        let exported = serde_json::to_string_pretty(&stored).unwrap();
-        let reimported: crate::store::StoredIdentity = serde_json::from_str(&exported).unwrap();
-        let back = AppIdentity::from_stored(&reimported).unwrap();
-        assert_eq!(back.npub(), npub, "reimported npub must match");
+    #[test]
+    fn import_malformed_nsec_rejected_with_reason() {
+        let (_dir, store) = test_store();
+        // AppIdentity holds secrets and is intentionally not Debug, so inspect the Err side directly.
+        let err = import_nsec_inner(&store, "not-a-valid-nsec").err().expect("malformed key is refused");
+        assert!(!err.to_string().is_empty(), "rejection carries a reason");
+        assert!(store.load_identity().unwrap().is_none(), "nothing persisted on a bad key");
+    }
 
-        let loaded = store.load_identity().unwrap().unwrap();
-        let loaded_id = AppIdentity::from_stored(&loaded).unwrap();
-        assert_eq!(loaded_id.npub(), npub);
+    #[test]
+    fn import_when_identity_exists_refused() {
+        let (_dir, store) = test_store();
+        store.save_identity(&AppIdentity::generate().to_stored().unwrap()).unwrap();
+        let nsec = nsec_of(&AppIdentity::generate());
+        let err = import_nsec_inner(&store, &nsec).err().expect("import into an occupied profile is refused");
+        assert!(err.to_string().contains("already exists"), "got {err}");
+    }
+
+    #[test]
+    fn imported_identity_mints_fresh_iroh_and_browse_keys() {
+        // The imported npub is reused; the other two keys are freshly minted, not carried in.
+        let source = AppIdentity::generate();
+        let nsec = nsec_of(&source);
+        let imported = AppIdentity::from_nsec(&nsec).unwrap();
+        assert_eq!(imported.npub(), source.npub());
+        assert_ne!(imported.iroh_node_key(), source.iroh_node_key(), "fresh iroh key");
+        assert_ne!(imported.browse_key, source.browse_key, "fresh browse-key");
     }
 }
