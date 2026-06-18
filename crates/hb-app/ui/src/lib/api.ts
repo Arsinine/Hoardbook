@@ -32,11 +32,22 @@ export const getShareCode = () => invoke<string>('get_share_code');
 export const validateShareCode = (code: string) =>
 	invoke<boolean>('validate_share_code', { code });
 
-export const exportKeypair = () => invoke<string>('export_keypair');
+/** Import an existing Nostr secret key (`nsec`/hex). The UI must show the linking-privacy warning
+ *  first (there is no offline oracle to detect a public/Qurator npub). */
+export const importNsec = (nsec: string) => invoke<IdentityInfo>('import_nsec', { nsec });
 
-export const saveKeypairFile = (path: string) => invoke<void>('save_keypair_file', { path });
+/** Export a portable whole-`~/.hoardbook` backup to `path`. `passphrase = null` is the plaintext
+ *  export (behind a blunt warning); a passphrase encrypts with Argon2id → XChaCha20-Poly1305. */
+export const backupData = (passphrase: string | null, path: string) =>
+	invoke<void>('backup_data', { passphrase, path });
 
-export const importKeypair = (path: string) => invoke<IdentityInfo>('import_keypair', { path });
+/** Does the backup at `path` need a passphrase to restore? (cheap header peek, no KDF) */
+export const peekBackup = (path: string) => invoke<boolean>('peek_backup', { path });
+
+/** Restore a whole-directory backup, re-wrapping secrets at rest. The target must be empty (wipe
+ *  first); `passphrase = null` works for a plaintext archive. */
+export const restoreData = (passphrase: string | null, path: string) =>
+	invoke<IdentityInfo>('restore_data', { passphrase, path });
 
 export const getNodeAddr = () => invoke<string | null>('get_node_addr');
 
@@ -86,9 +97,17 @@ export const exportCollection = (slug: string, format: 'text' | 'markdown') =>
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
+export type UpdateApplyMode = 'auto' | 'confirm';
+
 export interface Settings {
 	relay_urls: string[];
 	allow_dms: boolean;
+	/** The one-time pre-first-download IP-exposure notice has been acknowledged. */
+	privacy_notice_acknowledged: boolean;
+	/** How updates apply: 'auto' (Obsidian deferred-install) or 'confirm' (confirm-before-apply). */
+	update_apply_mode: UpdateApplyMode;
+	/** App version last seen running — drives the visible-after "now on vX.Y" notice. */
+	last_seen_version: string;
 }
 
 export const getSettings = () => invoke<Settings>('get_settings');
@@ -96,6 +115,9 @@ export const getSettings = () => invoke<Settings>('get_settings');
 export const saveSettings = (settings: Settings) => invoke<void>('save_settings', { settings });
 
 export const checkRelay = (url: string) => invoke<void>('check_relay', { url });
+
+/** Record that the one-time pre-first-download IP-exposure notice was acknowledged. */
+export const acknowledgePrivacyNotice = () => invoke<void>('acknowledge_privacy_notice');
 
 // ── Browse / Contacts ─────────────────────────────────────────────────────────
 
@@ -160,8 +182,15 @@ export const getMessages = () => invoke<ReceivedMessage[]>('get_messages');
 // ── Updates ───────────────────────────────────────────────────────────────────
 
 export interface UpdateInfo { version: string; body?: string; }
+export interface UpdateNotice { version: string; }
 export const checkUpdate   = () => invoke<UpdateInfo | null>('check_update');
-export const installUpdate = () => invoke<void>('install_update');
+/** Background download + minisign-verify, staged for deferred install (Obsidian pattern). Returns
+ *  the staged version, or null if up to date. Does NOT restart. */
+export const downloadUpdate = () => invoke<string | null>('download_update');
+/** Apply a staged update now and relaunch (explicit user action). */
+export const applyStagedUpdate = () => invoke<void>('apply_staged_update');
+/** The once-per-version "now running vX.Y" notice (visible-after); returns null if no version change. */
+export const takeUpdateNotice = () => invoke<UpdateNotice | null>('take_update_notice');
 
 // ── Groups ────────────────────────────────────────────────────────────────────
 

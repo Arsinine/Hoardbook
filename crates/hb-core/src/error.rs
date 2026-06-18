@@ -76,4 +76,27 @@ pub enum HbError {
     /// The per-npub concurrent download limit is reached (AB7).
     #[error("download limit reached — try again later")]
     DownloadLimitReached,
+
+    // --- v1.0 portable backup crypto (M5): Argon2id → XChaCha20-Poly1305 ---
+    /// The archive is not a Hoardbook backup (bad magic / too short / truncated header).
+    #[error("not a Hoardbook backup archive: {0}")]
+    InvalidBackup(String),
+
+    /// The archive declares a `format_ver` this build does not speak. A v1 decoder speaks
+    /// only v1 — a bumped/unknown version is a clean reject, never a misparse.
+    #[error("unsupported backup format version: {0}")]
+    UnsupportedBackupVersion(u8),
+
+    /// An encrypted (`mode=1`) archive was handed to decrypt without a passphrase.
+    #[error("this backup is passphrase-encrypted — a passphrase is required to restore it")]
+    PassphraseRequired,
+
+    /// The passphrase is below the minimum length (measured on the NFKC-normalized form).
+    #[error("passphrase too short — use at least {min} characters")]
+    PassphraseTooShort { min: usize },
+
+    /// A KDF parameter in the (not-yet-authenticated) header is outside the accepted range.
+    /// Rejected *before* Argon2id runs so a hostile archive can't OOM / thread-exhaust restore.
+    #[error("backup KDF parameter out of range: {0}")]
+    BackupParamsOutOfRange(String),
 }

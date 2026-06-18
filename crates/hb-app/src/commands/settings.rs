@@ -32,3 +32,12 @@ pub async fn save_settings(
     // here is all that's needed — no shared relay client to update.
     store.save_settings(&settings).map_err(cmd_err)
 }
+
+/// Record that the one-time pre-first-download IP-exposure notice has been acknowledged. The UI
+/// calls this once, before the first file download (browsing leaks nothing). Idempotent.
+#[tauri::command]
+pub async fn acknowledge_privacy_notice(store: State<'_, DataStore>) -> CmdResult<()> {
+    let mut settings = store.load_settings().map_err(cmd_err)?.unwrap_or_default();
+    settings.privacy_notice_acknowledged = true;
+    store.save_settings(&settings).map_err(cmd_err)
+}

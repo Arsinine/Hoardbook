@@ -42,6 +42,9 @@ tracing    = { workspace = true }
 hex        = { workspace = true }
 zeroize    = "1"
 rand       = "0.8"
+# Whole-directory backup archive (M5). Restore treats every entry as hostile input
+# (path-traversal / symlink / tar-bomb guards).
+tar        = "0.4"
 
 tauri               = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"

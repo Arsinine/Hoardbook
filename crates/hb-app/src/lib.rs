@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod backup;
 mod commands;
 mod conn;
 mod error;
@@ -9,6 +10,7 @@ mod p2p_it;
 mod presence;
 mod store;
 mod transfer;
+mod update_logic;
 
 use std::sync::Arc;
 use store::DataStore;
@@ -257,6 +259,7 @@ pub fn run() {
             let endpoint_state: SharedEndpoint = Arc::new(RwLock::new(None));
             let download_registry: SharedDownloadRegistry =
                 Arc::new(transfer::DownloadRegistry::new());
+            let staged_update: commands::update::SharedStagedUpdate = Arc::default();
 
             let (presence_cancel_tx, presence_cancel_rx) = tokio::sync::watch::channel(false);
             let presence_cancel: SharedCancelPresence = Arc::new(presence_cancel_tx);
@@ -266,6 +269,7 @@ pub fn run() {
             app.manage(Arc::clone(&endpoint_state));
             app.manage(Arc::clone(&download_registry));
             app.manage(Arc::clone(&presence_cancel));
+            app.manage(Arc::clone(&staged_update));
 
             build_system_tray(app)?;
 
@@ -298,13 +302,14 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::identity::generate_keypair,
-            commands::identity::import_keypair,
+            commands::identity::import_nsec,
             commands::identity::get_identity,
             commands::identity::get_share_code,
             commands::identity::validate_share_code,
             commands::identity::get_node_addr,
-            commands::identity::export_keypair,
-            commands::identity::save_keypair_file,
+            commands::identity::backup_data,
+            commands::identity::peek_backup,
+            commands::identity::restore_data,
             commands::identity::wipe_data,
             commands::profile::save_profile,
             commands::profile::get_profile,
@@ -326,6 +331,7 @@ pub fn run() {
             commands::settings::get_settings,
             commands::settings::save_settings,
             commands::settings::check_relay,
+            commands::settings::acknowledge_privacy_notice,
             commands::chat::send_message,
             commands::chat::get_messages,
             commands::sharing::get_share_settings,
@@ -344,8 +350,17 @@ pub fn run() {
             commands::watches::watches_delete,
             commands::watches::watches_evaluate,
             commands::update::check_update,
-            commands::update::install_update,
+            commands::update::download_update,
+            commands::update::apply_staged_update,
+            commands::update::take_update_notice,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Hoardbook");
+        .build(tauri::generate_context!())
+        .expect("error while running Hoardbook")
+        // Obsidian deferred-install: apply a staged update as the app quits (Auto mode), so the
+        // running-exe lock never bites and the user saw no mid-session interruption.
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                commands::update::apply_staged_on_exit(app);
+            }
+        });
 }
