@@ -22,6 +22,7 @@ mod suite_disc;
 mod suite_dm;
 mod suite_id;
 mod suite_n;
+mod survey;
 mod tap;
 
 #[tokio::main]
@@ -34,6 +35,14 @@ async fn main() -> Result<()> {
         ctx.multi(),
         ctx.pow
     );
+
+    // Survey mode (out-of-CI): per-relay acceptance probe instead of the cooperative L2 suites.
+    if ctx.survey {
+        eprintln!("\n-- Survey: per-relay acceptance probe (kinds / new-key / retention / PoW) --");
+        let results = survey::run(&ctx.relays).await;
+        tap::print_results(&results);
+        return Ok(()); // informational — a rejection is a finding, not a build failure
+    }
 
     let mut results = Vec::new();
     eprintln!("\n-- Suite N: Nostr events (publish / fetch / replace / delete) --");
@@ -60,6 +69,7 @@ async fn main() -> Result<()> {
 fn parse_args(args: &[String]) -> Result<Ctx> {
     let mut relays: Vec<String> = Vec::new();
     let mut pow: u8 = 0;
+    let mut survey = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -79,8 +89,9 @@ fn parse_args(args: &[String]) -> Result<Ctx> {
                     .parse()
                     .map_err(|_| anyhow::anyhow!("--pow must be an integer 0-255"))?;
             }
+            "--survey" => survey = true,
             other => bail!(
-                "unknown argument: {other}\nusage: hb-it --relay <ws-url> [--relay <2nd>] [--pow <bits>]"
+                "unknown argument: {other}\nusage: hb-it --relay <ws-url> [--relay <2nd>] [--pow <bits>] [--survey]"
             ),
         }
         i += 1;
@@ -90,5 +101,5 @@ fn parse_args(args: &[String]) -> Result<Ctx> {
     }
     // A fresh key's hex is a convenient per-run-unique token for namespacing discovery tags.
     let run_id = hb_core::Identity::generate().public_key().to_hex()[..16].to_string();
-    Ok(Ctx { relays, pow, run_id })
+    Ok(Ctx { relays, pow, run_id, survey })
 }

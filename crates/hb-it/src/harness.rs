@@ -23,6 +23,8 @@ pub struct Ctx {
     /// against a relay that already holds events from earlier runs (CI relays are fresh; this
     /// keeps local re-runs honest).
     pub run_id: String,
+    /// Survey mode (`--survey`): probe each relay's acceptance instead of running the L2 suites.
+    pub survey: bool,
 }
 
 impl Ctx {
