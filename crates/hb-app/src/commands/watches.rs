@@ -42,7 +42,7 @@ pub async fn watches_delete(name: String, store: State<'_, DataStore>) -> CmdRes
     store.save_watches(&watches).map_err(cmd_err)
 }
 
-/// Evaluate `candidates` (npubs from a DHT search) against all saved watches.
+/// Evaluate `candidates` (npubs from a Nostr tag search) against all saved watches.
 ///
 /// A candidate fires a watch when it is:
 /// - NOT already in the user's contact list, and
@@ -53,7 +53,7 @@ pub async fn watches_delete(name: String, store: State<'_, DataStore>) -> CmdRes
 /// one new hit this call.
 ///
 /// Tag/content-type matching is the caller's responsibility: pass only candidates
-/// that were returned by a DHT search using the watch's own filter criteria.
+/// that were returned by a Nostr tag search using the watch's own filter criteria.
 #[tauri::command]
 pub async fn watches_evaluate(
     candidates: Vec<String>,
