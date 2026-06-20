@@ -2,14 +2,11 @@
 
 mod backup;
 mod commands;
-mod conn;
 mod error;
 mod identity_state;
 mod net;
-mod p2p_it;
 mod presence;
 mod store;
-mod transfer;
 mod update_logic;
 
 use std::sync::Arc;
@@ -25,96 +22,8 @@ use tokio::sync::RwLock;
 pub use identity_state::{AppIdentity, SharedIdentity};
 
 /// Managed state types — Arc-wrapped so they can be cloned into background tasks.
-pub type SharedEndpoint = Arc<RwLock<Option<iroh::Endpoint>>>;
-pub type SharedDownloadRegistry = Arc<transfer::DownloadRegistry>;
 /// Sender half of the presence-loop cancel channel. Send `true` to stop the task.
 pub type SharedCancelPresence = Arc<tokio::sync::watch::Sender<bool>>;
-
-// ---------------------------------------------------------------------------
-// iroh endpoint lifecycle helper
-// ---------------------------------------------------------------------------
-
-/// Create (or replace) the iroh P2P endpoint from the bound iroh transport key, persist it in
-/// `endpoint_state`, and spawn the accept loop. iroh now dispatches **only** `XFER_ALPN` (the
-/// node-browse ALPN was retired in M4 — browsing is a relay read).
-pub(crate) async fn start_iroh_endpoint(
-    iroh_secret: &[u8; 32],
-    store: DataStore,
-    endpoint_state: SharedEndpoint,
-    app: tauri::AppHandle,
-    download_registry: SharedDownloadRegistry,
-) -> anyhow::Result<()> {
-    let _ = &app; // reserved for future per-connection notifications
-    let secret_key = iroh::SecretKey::from_bytes(iroh_secret);
-
-    let new_ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(secret_key)
-        .alpns(vec![transfer::XFER_ALPN.to_vec()])
-        .bind()
-        .await?;
-
-    let mut guard = endpoint_state.write().await;
-
-    // Gracefully close any previous endpoint (its accept loop will exit naturally).
-    if let Some(old) = guard.take() {
-        old.close().await;
-    }
-
-    let server_ep = new_ep.clone();
-    tauri::async_runtime::spawn(run_accept_loop(server_ep, store, download_registry));
-
-    *guard = Some(new_ep);
-    Ok(())
-}
-
-const MAX_CONCURRENT_CONNECTIONS: usize = 64;
-
-/// Dispatch incoming iroh connections. Only `XFER_ALPN` is served — every other ALPN is dropped.
-async fn run_accept_loop(
-    endpoint: iroh::Endpoint,
-    store: DataStore,
-    download_registry: SharedDownloadRegistry,
-) {
-    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
-    loop {
-        let incoming = match endpoint.accept().await {
-            Some(inc) => inc,
-            None => {
-                tracing::debug!("iroh endpoint closed — accept loop exiting");
-                break;
-            }
-        };
-
-        let permit = match sem.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => { tracing::warn!("connection semaphore closed"); break; }
-        };
-
-        let store_clone = store.clone();
-        let registry_clone = download_registry.clone();
-
-        tokio::spawn(async move {
-            let _permit = permit;
-            let accepting = match incoming.accept() {
-                Ok(a) => a,
-                Err(e) => { tracing::debug!("iroh incoming reject: {e}"); return; }
-            };
-            let conn = match accepting.await {
-                Ok(c) => c,
-                Err(e) => { tracing::debug!("iroh handshake error: {e}"); return; }
-            };
-
-            let alpn = conn.alpn().to_vec();
-            if alpn == transfer::XFER_ALPN {
-                if let Err(e) = transfer::handle_xfer_connection(conn, store_clone, registry_clone).await {
-                    tracing::warn!("xfer session error: {e}");
-                }
-            } else {
-                tracing::debug!("unknown ALPN on incoming connection, dropping");
-            }
-        });
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Setup helpers — each owns one concern from the setup closure
@@ -158,15 +67,9 @@ fn build_system_tray(app: &mut tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
-/// If an identity is on disk, populate `identity` and spawn the iroh endpoint.
-/// Non-fatal: a failed endpoint logs a warning and the user can retry by restarting.
-fn restore_identity_and_start_endpoint(
-    store: DataStore,
-    identity: SharedIdentity,
-    endpoint_state: SharedEndpoint,
-    download_registry: SharedDownloadRegistry,
-    app: tauri::AppHandle,
-) {
+/// If an identity is on disk, populate `identity` for the session. (No transport to start —
+/// Hoardbook moves no files; file transfer lives in the Mascara companion.)
+fn restore_identity(store: DataStore, identity: SharedIdentity) {
     let stored = match store.load_identity() {
         Ok(Some(s)) => s,
         Ok(None) => return,
@@ -182,31 +85,19 @@ fn restore_identity_and_start_endpoint(
             return;
         }
     };
-    let iroh_secret = app_id.iroh_secret;
-
     // Populate synchronously so the presence task has an identity at its first fire.
     *identity.blocking_write() = Some(app_id);
-
-    tauri::async_runtime::spawn(async move {
-        if let Err(e) =
-            start_iroh_endpoint(&iroh_secret, store, endpoint_state, app, download_registry).await
-        {
-            tracing::warn!("iroh endpoint startup failed: {e}");
-        }
-    });
 }
 
 /// Spawn the long-running background tasks: the presence-publish loop + the update check.
 fn spawn_background_tasks(
     identity: SharedIdentity,
-    endpoint_state: SharedEndpoint,
     presence_cancel_rx: tokio::sync::watch::Receiver<bool>,
     store: DataStore,
     app: tauri::AppHandle,
 ) {
     tauri::async_runtime::spawn(presence::run_presence_loop(
         identity,
-        endpoint_state,
         store,
         presence_cancel_rx,
     ));
@@ -225,15 +116,6 @@ fn spawn_background_tasks(
             Err(e) => tracing::debug!("Updater not configured: {e}"),
         }
     });
-}
-
-// ---------------------------------------------------------------------------
-// Integration harness entry point
-// ---------------------------------------------------------------------------
-
-/// Entry point for the `hb-p2p-it` headless P2P integration harness binary.
-pub async fn run_p2p_it() -> std::process::ExitCode {
-    p2p_it::run().await
 }
 
 // ---------------------------------------------------------------------------
@@ -256,9 +138,6 @@ pub fn run() {
             let store = DataStore::new(data_dir);
 
             let identity: SharedIdentity = Arc::new(RwLock::new(None));
-            let endpoint_state: SharedEndpoint = Arc::new(RwLock::new(None));
-            let download_registry: SharedDownloadRegistry =
-                Arc::new(transfer::DownloadRegistry::new());
             let staged_update: commands::update::SharedStagedUpdate = Arc::default();
 
             let (presence_cancel_tx, presence_cancel_rx) = tokio::sync::watch::channel(false);
@@ -266,8 +145,6 @@ pub fn run() {
 
             app.manage(store.clone());
             app.manage(Arc::clone(&identity));
-            app.manage(Arc::clone(&endpoint_state));
-            app.manage(Arc::clone(&download_registry));
             app.manage(Arc::clone(&presence_cancel));
             app.manage(Arc::clone(&staged_update));
 
@@ -275,17 +152,10 @@ pub fn run() {
 
             let app_handle = app.handle().clone();
 
-            restore_identity_and_start_endpoint(
-                store.clone(),
-                Arc::clone(&identity),
-                Arc::clone(&endpoint_state),
-                Arc::clone(&download_registry),
-                app_handle.clone(),
-            );
+            restore_identity(store.clone(), Arc::clone(&identity));
 
             spawn_background_tasks(
                 Arc::clone(&identity),
-                Arc::clone(&endpoint_state),
                 presence_cancel_rx,
                 store,
                 app_handle,
@@ -306,7 +176,6 @@ pub fn run() {
             commands::identity::get_identity,
             commands::identity::get_share_code,
             commands::identity::validate_share_code,
-            commands::identity::get_node_addr,
             commands::identity::backup_data,
             commands::identity::peek_backup,
             commands::identity::restore_data,
@@ -336,8 +205,6 @@ pub fn run() {
             commands::chat::get_messages,
             commands::sharing::get_share_settings,
             commands::sharing::save_share_settings,
-            commands::sharing::request_download,
-            commands::sharing::cancel_download,
             commands::groups::groups_get,
             commands::groups::groups_create,
             commands::groups::groups_rename,

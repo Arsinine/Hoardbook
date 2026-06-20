@@ -3,8 +3,8 @@
 	import { onMount } from 'svelte';
 	import { get } from 'svelte/store';
 	import { page } from '$app/stores';
-	import { getIdentity, getProfile, getCollections, getContacts, getMessages, listenDownloadProgress } from '$lib/api.js';
-	import { identity, profile, collections, contacts, inboxMessages, toastMessage, appReady, unreadCount, downloads, applyDownloadEvent, toast, identityLoadError } from '$lib/stores.js';
+	import { getIdentity, getProfile, getCollections, getContacts, getMessages } from '$lib/api.js';
+	import { identity, profile, collections, contacts, inboxMessages, toastMessage, appReady, unreadCount, toast, identityLoadError } from '$lib/stores.js';
 	import { listen } from '@tauri-apps/api/event';
 	import { navIcons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
@@ -42,12 +42,6 @@
 			appReady.set(true);
 		})();
 
-		// Download progress listener — persists across page navigation.
-		let unlistenDownload: (() => void) | undefined;
-		listenDownloadProgress(ev => {
-			downloads.update(list => applyDownloadEvent(list, ev));
-		}).then(fn => { unlistenDownload = fn; });
-
 		// Update-available event from the backend background check.
 		let unlistenUpdate: (() => void) | undefined;
 		listen<string>('update-available', (event) => {
@@ -82,7 +76,6 @@
 
 		return () => {
 			clearInterval(poll);
-			unlistenDownload?.();
 			unlistenUpdate?.();
 			unlistenDm?.();
 		};

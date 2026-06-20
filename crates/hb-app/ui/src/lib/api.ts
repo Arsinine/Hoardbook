@@ -1,5 +1,4 @@
 import { invoke as _invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
@@ -48,8 +47,6 @@ export const peekBackup = (path: string) => invoke<boolean>('peek_backup', { pat
  *  first); `passphrase = null` works for a plaintext archive. */
 export const restoreData = (passphrase: string | null, path: string) =>
 	invoke<IdentityInfo>('restore_data', { passphrase, path });
-
-export const getNodeAddr = () => invoke<string | null>('get_node_addr');
 
 export const wipeData = () => invoke<void>('wipe_data');
 
@@ -144,33 +141,6 @@ export const getShareSettings = (slug: string) =>
 export const saveShareSettings = (slug: string, settings: ShareSettings) =>
 	invoke<void>('save_share_settings', { slug, settings });
 
-export const requestDownload = (
-	peer: string,
-	slug: string,
-	path: string,
-	save_path: string,
-	expected_sha256?: string,
-) => invoke<number>('request_download', { peer, slug, path, savePath: save_path, expectedSha256: expected_sha256 ?? null });
-
-export const cancelDownload = (id: number) =>
-	invoke<boolean>('cancel_download', { downloadId: id });
-
-interface DownloadProgressPayload {
-	id: number;
-	filename: string;
-	bytes_done: number;
-	bytes_total: number;
-	bytes_per_sec: number;
-	status: 'active' | 'done' | 'error' | 'cancelled';
-	error?: string;
-}
-
-export async function listenDownloadProgress(
-	cb: (ev: DownloadProgressPayload) => void,
-): Promise<() => void> {
-	if (!isTauri) return () => {};
-	return listen<DownloadProgressPayload>('download:progress', ({ payload }) => cb(payload));
-}
 
 // ── Chat ──────────────────────────────────────────────────────────────────────
 
