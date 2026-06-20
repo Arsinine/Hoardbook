@@ -87,8 +87,6 @@ pub struct StoredIdentity {
     pub version: u8,
     /// secp256k1 secret key as bech32 `nsec…` — the one irreplaceable secret.
     pub nsec: String,
-    /// Hex-encoded 32-byte Ed25519 iroh transport secret key (bound to the npub via presence).
-    pub iroh_secret_hex: String,
     /// Hex-encoded 32-byte account browse-key.
     pub browse_key_hex: String,
 }
@@ -98,7 +96,6 @@ impl std::fmt::Debug for StoredIdentity {
         f.debug_struct("StoredIdentity")
             .field("version", &self.version)
             .field("nsec", &"[REDACTED]")
-            .field("iroh_secret_hex", &"[REDACTED]")
             .field("browse_key_hex", &"[REDACTED]")
             .finish()
     }
@@ -571,7 +568,6 @@ mod tests {
         StoredIdentity {
             version: 1,
             nsec,
-            iroh_secret_hex: hex::encode([7u8; 32]),
             browse_key_hex: hex::encode([9u8; 32]),
         }
     }
@@ -596,7 +592,6 @@ mod tests {
         store.save_identity(&stored).unwrap();
         let loaded = store.load_identity().unwrap().unwrap();
         assert_eq!(loaded.nsec, stored.nsec);
-        assert_eq!(loaded.iroh_secret_hex, stored.iroh_secret_hex);
         assert_eq!(loaded.browse_key_hex, stored.browse_key_hex);
     }
 

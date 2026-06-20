@@ -6,9 +6,9 @@
 //! (`hb-net::unwrap_dm`), recovering the **real sender npub** from inside the seal. The legacy
 //! DM history is intentionally **not** carried forward (decided break — pre-launch zero-user).
 //!
-//! `send_dm_inner` / `fetch_dms_inner` are the Tauri-free seam (mirroring `download_file_inner`);
-//! the pure decode logic (`decode_dms`) is L1-tested without a relay (the wire is proven by
-//! `hb-it` Suite DM).
+//! `send_dm_inner` / `fetch_dms_inner` are the Tauri-free seam (the pure `_inner` fns, callable
+//! without a Tauri `State`); the pure decode logic (`decode_dms`) is L1-tested without a relay (the
+//! wire is proven by `hb-it` Suite DM).
 
 use std::collections::HashSet;
 

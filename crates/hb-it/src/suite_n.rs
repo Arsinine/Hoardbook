@@ -24,7 +24,6 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
         result("N4 oversize listing split/restitch", n4(ctx).await),
         result("N5 NIP-09 deletion", n5(ctx).await),
         result("N6 presence freshness", n6(ctx).await),
-        result("PRES1 presence address sealed", pres1(ctx).await),
     ]
 }
 
@@ -191,10 +190,10 @@ async fn n5(ctx: &Ctx) -> Result<()> {
 async fn n6(ctx: &Ctx) -> Result<()> {
     let now = now();
 
-    // A freshly-refreshed presence reads online and carries a verifiable npub→node binding.
+    // A freshly-refreshed presence reads online and carries a verifiable npub freshness binding
+    // (v0.9.6: presence is status-only — no node key, no address; transport lives in Mascara).
     let id = Identity::generate();
-    let node = [6u8; 32];
-    let fresh = build_binding(&id, &node, &["addr-a".into()], &bk(6), now, 30 * 60)?;
+    let fresh = build_binding(&id, now, 30 * 60)?;
     let client = ctx.connect(&id).await?;
     client.publish(&fresh).await?;
     settle().await;
@@ -203,14 +202,13 @@ async fn n6(ctx: &Ctx) -> Result<()> {
         .await?;
     client.disconnect().await;
     ensure!(got.len() == 1, "expected 1 presence event, got {}", got.len());
-    let binding = verify_binding(&got[0], &id.public_key(), now)?;
-    ensure!(binding.node_key == node, "binding recovered the wrong node key");
+    verify_binding(&got[0], &id.public_key(), now)?; // signature + author-pin + window verify
     ensure!(is_online(got[0].created_at.as_u64(), now), "fresh presence read as offline");
 
     // A 15-minute-old presence (different peer, so it doesn't replace the fresh one) reads
     // offline, while its binding still verifies.
     let id2 = Identity::generate();
-    let stale = build_binding(&id2, &[7u8; 32], &[], &bk(7), now - 15 * 60, 30 * 60)?;
+    let stale = build_binding(&id2, now - 15 * 60, 30 * 60)?;
     let c2 = ctx.connect(&id2).await?;
     c2.publish(&stale).await?;
     settle().await;
@@ -221,46 +219,6 @@ async fn n6(ctx: &Ctx) -> Result<()> {
     ensure!(got2.len() == 1, "expected 1 stale presence, got {}", got2.len());
     ensure!(!is_online(got2[0].created_at.as_u64(), now), "15-min-old presence read as online");
     verify_binding(&got2[0], &id2.public_key(), now)?; // binding still valid, just stale
-    Ok(())
-}
-
-/// PRES1 — the presence node-address is **ciphertext** on the relay (M4 seal). A non-holder sees no
-/// plaintext endpoint; a browse-key holder unseals the dialable address; and the public binding plus
-/// freshness still verify without the browse-key (ties N6/ID3 — the seal is invisible to
-/// online-status).
-async fn pres1(ctx: &Ctx) -> Result<()> {
-    let now = now();
-    let id = Identity::generate();
-    let node = [9u8; 32];
-    let key = bk(7);
-    let addrs = vec!["198.51.100.7:4242".to_string()];
-
-    let presence = build_binding(&id, &node, &addrs, &key, now, 30 * 60)?;
-    let client = ctx.connect(&id).await?;
-    client.publish(&presence).await?;
-    settle().await;
-    let got = client
-        .fetch(Filter::new().author(id.public_key()).kind(Kind::from_u16(KIND_PRESENCE)), FETCH_TIMEOUT)
-        .await?;
-    client.disconnect().await;
-    ensure!(got.len() == 1, "expected 1 presence event, got {}", got.len());
-    let ev = &got[0];
-
-    // The relay-visible event must NOT contain the plaintext node address.
-    ensure!(
-        !ev.as_json().contains("198.51.100.7"),
-        "presence event leaked the plaintext node address on the relay"
-    );
-
-    // The public binding + freshness verify for ANY reader (no browse-key needed).
-    let binding = verify_binding(ev, &id.public_key(), now)?;
-    ensure!(binding.node_key == node, "public binding recovered the wrong node key");
-    ensure!(is_online(ev.created_at.as_u64(), now), "fresh sealed presence read offline");
-    ensure!(binding.addr.is_available(), "the sealed address tag is missing");
-
-    // A browse-key holder unseals the dialable address; a non-holder cannot.
-    ensure!(binding.addr.unseal(&key)? == addrs, "holder failed to unseal the sealed address");
-    ensure!(binding.addr.unseal(&bk(88)).is_err(), "a non-holder unsealed the address");
     Ok(())
 }
 

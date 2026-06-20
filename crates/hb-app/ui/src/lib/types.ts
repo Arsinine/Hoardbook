@@ -8,9 +8,6 @@ export interface IdentityInfo {
 	share_code: string;
 	/** "os-encrypted" (Windows DPAPI) or "plain-file" (Linux/macOS 0600 file). */
 	key_storage: 'os-encrypted' | 'plain-file';
-	/** The bound iroh node PUBLIC key (hex) — safe to display. The browse-key is never exposed
-	 *  as raw bytes (only inside the `hbk` share code). */
-	iroh_node_key: string;
 }
 
 export interface SocialLink {
@@ -123,16 +120,4 @@ export interface WatchHit {
 	npub: string;
 }
 
-export interface DownloadItem {
-	id: number;
-	filename: string;
-	/** Absolute path on disk where the file is being saved. */
-	save_path: string;
-	bytes_done: number;
-	bytes_total: number;
-	bytes_per_sec: number;
-	status: 'active' | 'done' | 'error' | 'cancelled';
-	error?: string;
-	/** Unix timestamp (ms) when the download was first seen. */
-	started_at: number;
-}
+// (DownloadItem removed — file transfer moved to the Mascara companion.)

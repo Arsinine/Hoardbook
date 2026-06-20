@@ -1,21 +1,20 @@
-//! Presence: the signed `npub`→iroh-node binding, with the node **address sealed** under the
-//! account browse-key (spec §Data Model → "Encrypted presence node-address"; M4 decision #4).
+//! Presence: a status-only online beacon. Hoardbook moves no files (transfer lives in the Mascara
+//! companion — INV-4), so presence carries **no dialable address and no node key** — it is purely a
+//! freshness signal so peers can see you're recently online.
 //!
-//! Replaces the legacy HTTP keepalive push. The app republishes a fresh, sealed presence binding to the
-//! configured relays on a ~5-minute cadence; the public `npub`→node binding + `expires_at` stay
-//! plaintext-verifiable (online-status freshness), while only a share-code (browse-key) holder can
-//! unseal the dialable address.
+//! Republished to the configured relays on a ~5-minute cadence as a signed, kind-11111 event
+//! (`build_binding`); `verify_binding` on the reader side checks signature + author-pin +
+//! freshness/expiry for online status.
 
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use hb_core::{build_binding, BrowseKey, Identity};
+use hb_core::{build_binding, Identity};
 use hb_net::RelayClient;
 use nostr::prelude::*;
 
 use crate::identity_state::SharedIdentity;
 use crate::store::DataStore;
-use crate::SharedEndpoint;
 
 /// Binding validity window. Presence refreshes every ~5 min, so 30 min is a generous backstop
 /// (and well within the `MAX_BINDING_TTL_SECS` cap hb-core enforces).
@@ -32,25 +31,18 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Build + publish a sealed presence binding for the current endpoint address. The sealed payload
-/// is the serialized iroh `EndpointAddr` (id + transport addrs); only a browse-key holder unseals
-/// it (`transfer::resolve_peer_addr`).
-pub(crate) async fn publish_presence(
-    client: &RelayClient,
-    identity: &Identity,
-    iroh_node_key: &[u8; 32],
-    endpoint_addr_json: &str,
-    browse_key: &BrowseKey,
-) -> Result<()> {
-    let addrs = vec![endpoint_addr_json.to_string()];
-    let event = build_binding(identity, iroh_node_key, &addrs, browse_key, unix_now(), PRESENCE_TTL_SECS)
-        .map_err(|e| anyhow!("build presence binding: {e}"))?;
+/// Build + publish a status-only presence beacon: a signed kind-11111 event carrying only
+/// freshness/expiry — no node key, no dialable address (transfer moved to Mascara). The reader only
+/// checks signature + author-pin + freshness for online status.
+pub(crate) async fn publish_presence(client: &RelayClient, identity: &Identity) -> Result<()> {
+    let event = build_binding(identity, unix_now(), PRESENCE_TTL_SECS)
+        .map_err(|e| anyhow!("build presence beacon: {e}"))?;
     client.publish(&event).await.map_err(|e| anyhow!("publish presence: {e}"))?;
     Ok(())
 }
 
 /// Fetch a peer's newest presence event (kind 11111, author-pinned). The caller verifies the
-/// binding (`transfer::resolve_peer_addr` / `hb-core::verify_binding`) before trusting it.
+/// binding (`hb-core::verify_binding`) before trusting it for online status.
 pub(crate) async fn fetch_peer_presence(
     client: &RelayClient,
     peer: &PublicKey,
@@ -68,7 +60,6 @@ pub(crate) async fn fetch_peer_presence(
 /// cycle. `false` on the cancel channel wakes it early; `true` shuts it down.
 pub(crate) async fn run_presence_loop(
     identity: SharedIdentity,
-    endpoint_state: SharedEndpoint,
     store: DataStore,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -85,23 +76,17 @@ pub(crate) async fn run_presence_loop(
         }
         delay = Duration::from_secs(PRESENCE_REFRESH_SECS);
 
-        // Snapshot the identity (clone the secp256k1 key) and node key without holding the lock
-        // across the network call.
+        // Snapshot the identity (clone the secp256k1 key) without holding the lock across the
+        // network call.
         let snapshot = {
             let guard = identity.read().await;
-            guard.as_ref().map(|id| (id.identity.clone(), id.iroh_node_key(), id.browse_key))
+            guard.as_ref().map(|id| id.identity.clone())
         };
-        let Some((id, node_key, browse_key)) = snapshot else { continue };
-
-        let addr_json = {
-            let ep_guard = endpoint_state.read().await;
-            ep_guard.as_ref().and_then(|ep| serde_json::to_string(&ep.addr()).ok())
-        };
-        let Some(addr_json) = addr_json else { continue };
+        let Some(id) = snapshot else { continue };
 
         match crate::net::connect(&id, &store).await {
             Ok(client) => {
-                if let Err(e) = publish_presence(&client, &id, &node_key, &addr_json, &browse_key).await {
+                if let Err(e) = publish_presence(&client, &id).await {
                     tracing::debug!("presence publish failed: {e}");
                 }
                 client.disconnect().await;
