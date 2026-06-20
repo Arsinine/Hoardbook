@@ -1,18 +1,12 @@
 <script lang="ts">
-	import { pasteKey, follow, refreshContact, requestDownload, unfollowContact, setContactTags, groupsGet, contactUpdateGroups } from '$lib/api.js';
-	import { ensureDownloadPrivacyAck } from '$lib/privacy-gate.js';
-	import { save } from '@tauri-apps/plugin-dialog';
-	import { contacts, identity, toast, downloads } from '$lib/stores.js';
-	import DownloadQueue from '$lib/components/DownloadQueue.svelte';
+	import { pasteKey, follow, refreshContact, unfollowContact, setContactTags, groupsGet, contactUpdateGroups } from '$lib/api.js';
+	import { contacts, identity, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import type { CachedPeer, Group } from '$lib/types.js';
 	import { onMount } from 'svelte';
 
-	// IP warning modal state (task 8)
-	let showIpWarning = false;
-	let pendingDownloadDetail: { peerId: string; slug: string; path: string } | null = null;
 
 	// Groups state
 	let groups: Group[] = [];
@@ -149,43 +143,6 @@
 		}
 	}
 
-	async function handleDownload(e: CustomEvent<{ peerId: string; slug: string; path: string }>) {
-		// Every download is now a direct, binding-gated P2P connection — always warn about IP exposure.
-		pendingDownloadDetail = e.detail;
-		showIpWarning = true;
-	}
-
-	async function proceedWithDownload(detail: { peerId: string; slug: string; path: string }) {
-		// One-time IP-exposure notice before the first direct download (browsing leaks nothing).
-		if (!(await ensureDownloadPrivacyAck())) return;
-		const filename = detail.path.split('/').pop() ?? detail.path;
-		const savePath = await save({ defaultPath: filename });
-		if (!savePath) return;
-		try {
-			const id = await requestDownload(detail.peerId, detail.slug, detail.path, savePath);
-			downloads.update(list => [
-				...list,
-				{ id, filename, save_path: savePath,
-				  bytes_done: 0, bytes_total: 0, bytes_per_sec: 0,
-				  status: 'active', started_at: Date.now() },
-			]);
-		} catch (err) {
-			toast(String(err), 'error');
-		}
-	}
-
-	async function confirmIpWarning() {
-		showIpWarning = false;
-		if (pendingDownloadDetail) {
-			await proceedWithDownload(pendingDownloadDetail);
-			pendingDownloadDetail = null;
-		}
-	}
-
-	function cancelIpWarning() {
-		showIpWarning = false;
-		pendingDownloadDetail = null;
-	}
 
 	function shortId(hb_id: string) {
 		return hb_id.length > 14 ? hb_id.slice(0, 8) + '…' + hb_id.slice(-4) : hb_id;
@@ -395,25 +352,6 @@
 	{/if}
 
 	<!-- Contacts list -->
-	<!-- IP Exposure Warning Modal (task 8) -->
-	{#if showIpWarning}
-		<div class="modal-overlay" on:click={cancelIpWarning} role="dialog" aria-modal="true">
-			<!-- svelte-ignore a11y-click-events-have-key-events -->
-			<!-- svelte-ignore a11y-no-static-element-interactions -->
-			<div class="modal" on:click|stopPropagation>
-				<div class="modal-title">{@html icons.shield} Direct connection</div>
-				<p class="modal-body">
-					This download uses a direct P2P connection, which will expose your IP address to the other peer.
-					If privacy is a concern, ask them to disable file sharing or wait until they are reachable through the relay.
-				</p>
-				<div class="modal-actions">
-					<button class="btn-ghost btn-sm" on:click={cancelIpWarning}>Cancel</button>
-					<button class="btn-primary btn-sm" on:click={confirmIpWarning}>I understand, proceed</button>
-				</div>
-			</div>
-		</div>
-	{/if}
-
 	{#if $contacts.length === 0}
 		<div class="empty">No contacts yet. Look up a peer above and follow them.</div>
 	{:else if filteredContacts.length === 0}
@@ -529,7 +467,7 @@
 								<p class="no-coll">No collections published.</p>
 							{:else}
 								{#each peer.collections as col}
-									<CollectionPanel collection={col} peerId={peer.npub} on:download={handleDownload} />
+									<CollectionPanel collection={col} />
 								{/each}
 							{/if}
 						</div>
@@ -540,7 +478,6 @@
 	{/if}
 </div>
 </div>
-<DownloadQueue />
 </div>
 
 <style>

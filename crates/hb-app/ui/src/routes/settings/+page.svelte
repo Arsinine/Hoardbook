@@ -870,10 +870,6 @@
 
 	.btn-danger-text { color: var(--red, #e05c5c); }
 
-	/* DHT */
-	.dht-fields { display: flex; flex-direction: column; gap: 4px; }
-	.dht-hint { font-size: 11px; color: var(--fg-dim); margin-top: 4px; }
-
 	/* Danger zone */
 	.danger-row {
 		display: flex;

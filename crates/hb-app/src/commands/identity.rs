@@ -10,7 +10,6 @@ use crate::{
     identity_state::{AppIdentity, SharedIdentity},
     error::{CmdResult, cmd_err},
     store::DataStore,
-    SharedDownloadRegistry, SharedEndpoint,
 };
 use hb_core::BackupMode;
 
@@ -23,9 +22,6 @@ pub struct IdentityInfo {
     pub share_code: String,
     /// How the private key is protected at rest: "os-encrypted" (Windows DPAPI) or "plain-file".
     pub key_storage: &'static str,
-    /// The bound iroh node **public** key (hex) — safe to display; the presence binding vouches
-    /// for it. The browse-key is *never* surfaced as raw bytes (only via the `hbk` share code).
-    pub iroh_node_key: String,
 }
 
 /// Spec: Linux/macOS keep the key as a 0600 plaintext file until the Phase-2 keyring lands; the
@@ -40,7 +36,6 @@ impl IdentityInfo {
             share_code: id.share_code()?,
             npub,
             key_storage: KEY_STORAGE,
-            iroh_node_key: hex::encode(id.iroh_node_key()),
         })
     }
 }
@@ -57,11 +52,8 @@ fn shorten(id: &str) -> String {
 /// one is Settings → Wipe data).
 #[tauri::command]
 pub async fn generate_keypair(
-    app: tauri::AppHandle,
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
-    endpoint: State<'_, SharedEndpoint>,
-    registry: State<'_, SharedDownloadRegistry>,
 ) -> CmdResult<IdentityInfo> {
     match store.load_identity() {
         Ok(Some(_)) => return Err("An identity already exists. Wipe data first to generate a new one.".into()),
@@ -81,14 +73,6 @@ pub async fn generate_keypair(
     let stored = app_id.to_stored().map_err(cmd_err)?;
     store.save_identity(&stored).map_err(cmd_err)?;
     let info = IdentityInfo::from_identity(&app_id).map_err(cmd_err)?;
-    let iroh_secret = app_id.iroh_secret;
-
-    // iroh endpoint startup is non-fatal: identity is committed, endpoint retried on next launch.
-    if let Err(e) = crate::start_iroh_endpoint(
-        &iroh_secret, (*store).clone(), (*endpoint).clone(), app, (*registry).clone(),
-    ).await {
-        tracing::warn!("iroh endpoint startup failed after identity generate: {e}");
-    }
 
     *identity.write().await = Some(app_id);
     Ok(info)
@@ -103,23 +87,13 @@ pub async fn generate_keypair(
 /// always warns (no hardcoded list, no relay lookup).
 #[tauri::command]
 pub async fn import_nsec(
-    app: tauri::AppHandle,
     nsec: String,
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
-    endpoint: State<'_, SharedEndpoint>,
-    registry: State<'_, SharedDownloadRegistry>,
 ) -> CmdResult<IdentityInfo> {
     let nsec = Zeroizing::new(nsec);
     let app_id = import_nsec_inner(&store, &nsec).map_err(cmd_err)?;
     let info = IdentityInfo::from_identity(&app_id).map_err(cmd_err)?;
-    let iroh_secret = app_id.iroh_secret;
-
-    if let Err(e) = crate::start_iroh_endpoint(
-        &iroh_secret, (*store).clone(), (*endpoint).clone(), app, (*registry).clone(),
-    ).await {
-        tracing::warn!("iroh endpoint startup failed after nsec import: {e}");
-    }
 
     *identity.write().await = Some(app_id);
     Ok(info)
@@ -175,14 +149,6 @@ pub async fn validate_share_code(code: String) -> CmdResult<bool> {
     Ok(hb_core::ShareCode::parse(&code).is_ok())
 }
 
-/// Return the current iroh EndpointAddr as a JSON string, or None if not initialised.
-#[tauri::command]
-pub async fn get_node_addr(endpoint: State<'_, SharedEndpoint>) -> CmdResult<Option<String>> {
-    let guard = endpoint.read().await;
-    let addr = guard.as_ref().map(|ep| serde_json::to_string(&ep.addr()).unwrap_or_default());
-    Ok(addr)
-}
-
 /// Export a **portable, whole-`~/.hoardbook` backup** to `path`. `passphrase = Some` →
 /// Argon2id → XChaCha20-Poly1305 (the portable default); `passphrase = None` → the plaintext
 /// export (behind the UI's blunt "this file *is* your identity" warning). Replaces the legacy
@@ -216,13 +182,10 @@ pub async fn peek_backup(path: String) -> CmdResult<bool> {
 /// is a reasoned error). Refuses a non-empty profile — the UI wipes first, then re-calls.
 #[tauri::command]
 pub async fn restore_data(
-    app: tauri::AppHandle,
     passphrase: Option<String>,
     path: String,
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
-    endpoint: State<'_, SharedEndpoint>,
-    registry: State<'_, SharedDownloadRegistry>,
 ) -> CmdResult<IdentityInfo> {
     let archive = std::fs::read(&path).map_err(|e| format!("Could not read backup file: {e}"))?;
     let pass = passphrase.map(Zeroizing::new);
@@ -235,13 +198,6 @@ pub async fn restore_data(
         .ok_or("Backup restored, but it contained no identity.")?;
     let app_id = AppIdentity::from_stored(&stored).map_err(cmd_err)?;
     let info = IdentityInfo::from_identity(&app_id).map_err(cmd_err)?;
-    let iroh_secret = app_id.iroh_secret;
-
-    if let Err(e) = crate::start_iroh_endpoint(
-        &iroh_secret, (*store).clone(), (*endpoint).clone(), app, (*registry).clone(),
-    ).await {
-        tracing::warn!("iroh endpoint startup failed after restore: {e}");
-    }
 
     *identity.write().await = Some(app_id);
     Ok(info)
@@ -252,15 +208,9 @@ pub async fn restore_data(
 pub async fn wipe_data(
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
-    endpoint: State<'_, SharedEndpoint>,
 ) -> CmdResult<bool> {
     store.wipe().map_err(cmd_err)?;
     *identity.write().await = None;
-
-    let mut ep_guard = endpoint.write().await;
-    if let Some(ep) = ep_guard.take() {
-        ep.close().await;
-    }
     Ok(true)
 }
 
@@ -294,14 +244,12 @@ mod tests {
     }
 
     #[test]
-    fn identity_info_exposes_npub_node_key_and_share_code() {
+    fn identity_info_exposes_npub_and_share_code() {
         let id = AppIdentity::generate();
         let info = super::IdentityInfo::from_identity(&id).unwrap();
         assert!(info.npub.starts_with("npub1"));
         assert!(info.share_code.starts_with("hbk1"));
-        // The node key is the iroh PUBLIC key, hex; the browse-key is NOT exposed as raw bytes.
-        assert_eq!(info.iroh_node_key, hex::encode(id.iroh_node_key()));
-        assert_eq!(info.iroh_node_key.len(), 64, "32-byte public key as hex");
+        // The browse-key is NOT exposed as raw bytes (only via the hbk share code).
         assert!(!info.share_code.contains(&hex::encode(id.browse_key)),
             "raw browse-key bytes must never appear in the surfaced info");
     }
@@ -347,13 +295,12 @@ mod tests {
     }
 
     #[test]
-    fn imported_identity_mints_fresh_iroh_and_browse_keys() {
-        // The imported npub is reused; the other two keys are freshly minted, not carried in.
+    fn imported_identity_mints_fresh_browse_key() {
+        // The imported npub is reused; the browse-key is freshly minted, not carried in.
         let source = AppIdentity::generate();
         let nsec = nsec_of(&source);
         let imported = AppIdentity::from_nsec(&nsec).unwrap();
         assert_eq!(imported.npub(), source.npub());
-        assert_ne!(imported.iroh_node_key(), source.iroh_node_key(), "fresh iroh key");
         assert_ne!(imported.browse_key, source.browse_key, "fresh browse-key");
     }
 }
