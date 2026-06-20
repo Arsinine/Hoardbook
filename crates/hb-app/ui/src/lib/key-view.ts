@@ -1,7 +1,6 @@
-// The Settings "three keys" view-model (spec §Identity Management / §10 Settings). Surfaces the
-// npub, the bound iroh node PUBLIC key, and the share code, plus the at-rest storage status and the
-// no-recovery / Linux-0600 warnings. The browse-key is NEVER rendered as raw bytes — only inside
-// the `hbk` share code.
+// The Settings key view-model (spec §Identity Management / §10 Settings). Surfaces the npub and the
+// share code, plus the at-rest storage status and the no-recovery / Linux-0600 warnings. The
+// browse-key is NEVER rendered as raw bytes — only inside the `hbk` share code.
 
 import type { IdentityInfo } from './types.js';
 
@@ -31,7 +30,6 @@ export function keyView(id: IdentityInfo): KeyView {
 	return {
 		rows: [
 			{ label: 'Your npub', value: id.npub, sensitive: false },
-			{ label: 'iroh node key', value: id.iroh_node_key, sensitive: false },
 			// The share code embeds the browse-key — secret. The raw browse-key is never a row.
 			{ label: 'Share code', value: id.share_code, sensitive: true },
 		],

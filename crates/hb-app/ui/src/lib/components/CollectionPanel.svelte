@@ -1,22 +1,13 @@
 <script lang="ts">
-	import { createEventDispatcher } from 'svelte';
 	import type { Collection } from '../types.js';
 	import DirItem from './DirItem.svelte';
 	import { icons } from '$lib/icons.js';
 
 	export let collection: Collection;
-	/** When set, file items show download buttons */
-	export let peerId: string | undefined = undefined;
-
-	const dispatch = createEventDispatcher<{ download: { peerId: string; slug: string; path: string } }>();
 
 	let expanded = false;
 
 	$: fmt = collection.content_types?.[0] ?? '';
-
-	function handleDownload(path: string) {
-		if (peerId) dispatch('download', { peerId, slug: collection.slug, path });
-	}
 </script>
 
 <div class="panel">
@@ -50,7 +41,7 @@
 			{:else}
 				<ul class="dir-list">
 					{#each collection.listing as item}
-						<DirItem {item} depth={0} onDownload={peerId ? handleDownload : undefined} />
+						<DirItem {item} depth={0} />
 					{/each}
 				</ul>
 			{/if}

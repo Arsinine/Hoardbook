@@ -6,7 +6,6 @@
 	export let item: DirectoryItem;
 	export let depth: number = 0;
 	export let pathPrefix: string = '';
-	export let onDownload: ((path: string) => void) | undefined = undefined;
 
 	let open = false;
 	$: isFolder = item.item_type === 'Folder';
@@ -25,7 +24,7 @@
 		{#if open && item.children.length > 0}
 			<ul class="dir-children">
 				{#each item.children as child}
-					<DirItem item={child} depth={depth + 1} pathPrefix={fullPath} {onDownload} />
+					<DirItem item={child} depth={depth + 1} pathPrefix={fullPath} />
 				{/each}
 			</ul>
 		{/if}
@@ -35,11 +34,6 @@
 			<span class="dir-file-name">{item.name}</span>
 			{#if item.size}
 				<span class="dir-size">{item.size}</span>
-			{/if}
-			{#if onDownload}
-				<button class="dl-btn" on:click={() => onDownload?.(fullPath)} title="Download {item.name}">
-					{@html icons.download}
-				</button>
 			{/if}
 		</div>
 	{/if}
@@ -81,19 +75,6 @@
 	.dir-file-name { color: var(--fg-muted); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 	.dir-size { color: var(--fg-dim); font-feature-settings: 'tnum'; flex-shrink: 0; }
-
-	.dl-btn {
-		background: transparent;
-		border: none;
-		cursor: pointer;
-		color: var(--fg-dim);
-		display: flex;
-		padding: 2px;
-		flex-shrink: 0;
-		opacity: 0.6;
-		transition: opacity 0.1s, color 0.1s;
-	}
-	.dl-btn:hover { opacity: 1; color: var(--accent); }
 
 	.dir-children { list-style: none; padding: 0; margin: 0; }
 </style>

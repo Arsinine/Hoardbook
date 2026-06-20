@@ -53,6 +53,27 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace --locked
 
+      # INV-4 (v0.9.6): Hoardbook moves no files. The transfer plane — the iroh transport dep, the
+      # xfer/follower gate + the sealed presence address (hb-core), and the DownloadQueue UI — moved
+      # to the Mascara companion and must not creep back (the standing honeypot tripwire). Greps code
+      # CONSTRUCTS (dep lines, module decls, retired symbols, the component file), not prose, so the
+      # legitimate "moved to Mascara" doc comments don't trip it. Ubuntu-only — one grep pass suffices.
+      - name: INV-4 sweep — no file-transfer plane in Hoardbook
+        if: matrix.platform == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -uo pipefail
+          fail=0
+          sweep() { local desc="$1"; shift; if out=$(grep -rnE "$@" 2>/dev/null); then echo "::error::INV-4 regression — $desc:"; echo "$out"; fail=1; fi; }
+          sweep "iroh (or an iroh-* crate) is back in Cargo.lock" 'name = "iroh[-"]' Cargo.lock
+          sweep "iroh dep in a crate manifest"        'iroh' crates/*/Cargo.toml
+          sweep "retired xfer crypto in hb-core"      'seal_addrs|unseal_addrs|resolve_node_key|verify_binding_token|follower_gate|SealedAddr|KIND_XFER' crates/hb-core/src
+          # Covers `mod x`, `pub mod x`, `pub(crate)/pub(super)/pub(in ..) mod x`, and a same-line `#[cfg(..)] mod x`.
+          sweep "a transfer/gate module declaration"  '^[[:space:]]*(#\[[^]]*\][[:space:]]*)*(pub(\([^)]*\))?[[:space:]]+)?mod[[:space:]]+(transfer|conn|p2p_it|gate)\b' crates
+          sweep "the DownloadQueue component is back" 'DownloadQueue' crates/hb-app/ui/src
+          if [ "$fail" -ne 0 ]; then echo "::error::Hoardbook moves no files (INV-4) — the above belongs in Mascara."; exit 1; fi
+          echo "INV-4 sweep clean — no file-transfer plane in Hoardbook."
+
       # Clippy runs across the workspace for signal, but is NON-BLOCKING: the
       # harness/app crates carry pre-existing clippy debt under current stable
       # clippy (e.g. hb-it unused import, hb-relay redundant-pattern-matching,
