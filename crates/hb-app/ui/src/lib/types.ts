@@ -89,8 +89,19 @@ export interface CachedPeer {
 export interface ScanOptions {
 	path: string;
 	path_alias: string;
-	depth: number;
+	/** Relative, "/"-separated dir paths the user checked in the folder-tree picker. Each is walked
+	 *  fully; root-level loose files are always included. (Replaces the old `depth` slider — M8.) */
+	include: string[];
 	exclude: string[];
+}
+
+/** An immediate child directory of a scanned path — one node of the folder-tree picker. */
+export interface SubdirEntry {
+	name: string;
+	/** Absolute path on disk, used to lazily expand this node's own children. */
+	path: string;
+	/** True if this directory has sub-directories of its own (drives the ▶ expander). */
+	has_children: boolean;
 }
 
 export interface ShareSettings {

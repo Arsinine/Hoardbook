@@ -9,6 +9,8 @@ export interface KeyRow {
 	value: string;
 	/** A secret-bearing value the UI should treat carefully (the share code carries the browse-key). */
 	sensitive: boolean;
+	/** Optional sub-note clarifying the row's purpose (public handle vs private access pass). */
+	hint?: string;
 }
 
 export interface KeyView {
@@ -29,9 +31,21 @@ export function keyView(id: IdentityInfo): KeyView {
 	const plainFile = id.key_storage === 'plain-file';
 	return {
 		rows: [
-			{ label: 'Your npub', value: id.npub, sensitive: false },
-			// The share code embeds the browse-key — secret. The raw browse-key is never a row.
-			{ label: 'Share code', value: id.share_code, sensitive: true },
+			// Lead with the share code: it both finds the user and unlocks browsing (it embeds the
+			// npub). It carries the browse-key, so it is PRIVATE — hand it only to people you trust.
+			{
+				label: 'Share code',
+				value: id.share_code,
+				sensitive: true,
+				hint: 'Private — give it to people you want browsing your collections. It also lets them find, follow, and DM you. Keep it off public threads.',
+			},
+			// The npub stays: it is the SAFE-to-post-publicly handle (no browse-key), unlike the share code.
+			{
+				label: 'Your npub',
+				value: id.npub,
+				sensitive: false,
+				hint: 'Public — post it anywhere so people can find, follow, and DM you. It does not unlock browsing.',
+			},
 		],
 		storageLabel: plainFile ? 'Protected file (0600)' : 'Encrypted by your OS',
 		showStorageWarning: plainFile,

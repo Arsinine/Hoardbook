@@ -29,17 +29,6 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 fn default_true() -> bool { true }
 
-/// How a downloaded update is applied (spec §Auto-updater threat model). `Auto` is the Obsidian
-/// deferred-install default (apply on quit / next launch); `Confirm` gates the apply on explicit
-/// user assent for the cautious. Minisign verification is unconditional in both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum UpdateApplyMode {
-    #[default]
-    Auto,
-    Confirm,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
     /// Configured Nostr relays (seed + write). Empty = the app has no relays yet.
@@ -51,9 +40,6 @@ pub struct Settings {
     /// Shown iff this is false; acknowledging persists it.
     #[serde(default)]
     pub privacy_notice_acknowledged: bool,
-    /// How updates apply (Obsidian deferred-install vs confirm-before-apply).
-    #[serde(default)]
-    pub update_apply_mode: UpdateApplyMode,
     /// The app version last seen running — drives the "now on vX.Y" visible-after notice. The
     /// writer normalizes it to the running-version string, so comparison is exact-string equality.
     #[serde(default)]
@@ -637,7 +623,6 @@ mod tests {
         let s: Settings = serde_json::from_str(old).expect("old settings must still deserialize");
         assert_eq!(s.relay_urls, vec!["wss://r.example".to_string()]);
         assert!(!s.privacy_notice_acknowledged, "defaults to not-acknowledged");
-        assert_eq!(s.update_apply_mode, UpdateApplyMode::Auto, "defaults to Obsidian auto-apply");
         assert_eq!(s.last_seen_version, "", "defaults to empty (fresh install)");
     }
 

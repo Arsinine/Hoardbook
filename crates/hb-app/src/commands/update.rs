@@ -83,22 +83,12 @@ pub async fn apply_staged_update(
     app.restart();
 }
 
-/// Deferred Obsidian apply, called from the app's `ExitRequested` hook: if an update is staged and
-/// the apply mode is `Auto`, install it as the app quits (so the running-exe lock never bites and
-/// the user saw no mid-session interruption). Best-effort — logged, never panics. **I/O boundary:
-/// not exercised in the offline dev env.**
+/// Deferred Obsidian apply, called from the app's `ExitRequested` hook: if an update is staged,
+/// install it as the app quits (so the running-exe lock never bites and the user saw no mid-session
+/// interruption). Best-effort — logged, never panics. **I/O boundary: not exercised in the offline
+/// dev env.**
 pub fn apply_staged_on_exit(app: &tauri::AppHandle) {
     let staged = app.state::<SharedStagedUpdate>();
-    let apply_mode = app
-        .state::<DataStore>()
-        .load_settings()
-        .ok()
-        .flatten()
-        .map(|s| s.update_apply_mode)
-        .unwrap_or_default();
-    if crate::update_logic::apply_requires_confirmation(apply_mode) {
-        return; // Confirm mode: the user applies explicitly via apply_staged_update.
-    }
     let inner = staged.lock().unwrap().inner.take();
     if let Some((update, bytes)) = inner {
         match update.install(&bytes) {

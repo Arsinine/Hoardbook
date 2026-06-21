@@ -1,12 +1,10 @@
 //! Pure update-decision logic for the Obsidian deferred-install pattern (spec §Auto-updater threat
-//! model). These are the **CI-testable** half of the updater: version-change detection, the
-//! visible-after notice gate, and the confirm-before-apply gate.
+//! model). These are the **CI-testable** half of the updater: version-change detection and the
+//! visible-after notice gate.
 //!
 //! The actual `download()` / `install()` over a real signed release is the **I/O boundary**
 //! (`commands::update`) and is **not** exercised here — minisign verification, the staged download,
 //! and the on-quit apply need a published signed artifact + a real OS installer (decision #7/#8).
-
-use crate::store::UpdateApplyMode;
 
 /// Has the running version changed since the one last seen? **Exact string equality** — not semver
 /// parsing. The writer normalizes `last_seen` to the running-version string on first write, so
@@ -20,12 +18,6 @@ pub fn version_changed(last_seen: &str, current: &str) -> bool {
 /// change: the caller persists `last_seen = current` after showing it, so it does not re-fire.
 pub fn should_show_update_notice(last_seen: &str, current: &str) -> bool {
     version_changed(last_seen, current)
-}
-
-/// Does applying a staged update require explicit user assent? `Auto` applies on quit / next launch
-/// (Obsidian default); `Confirm` gates the apply.
-pub fn apply_requires_confirmation(mode: UpdateApplyMode) -> bool {
-    matches!(mode, UpdateApplyMode::Confirm)
 }
 
 #[cfg(test)]
@@ -59,11 +51,5 @@ mod tests {
         // Caller persists last_seen = current after showing it.
         last_seen = current.to_string();
         assert!(!should_show_update_notice(&last_seen, current), "does not re-fire on the next launch");
-    }
-
-    #[test]
-    fn confirm_apply_mode_gates_install() {
-        assert!(apply_requires_confirmation(UpdateApplyMode::Confirm), "Confirm requires assent");
-        assert!(!apply_requires_confirmation(UpdateApplyMode::Auto), "Auto applies without a prompt");
     }
 }

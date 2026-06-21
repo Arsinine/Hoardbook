@@ -1,10 +1,12 @@
 <script lang="ts">
 	import { createEventDispatcher } from 'svelte';
 	import { open as openDialog } from '@tauri-apps/plugin-dialog';
-	import { scanDirectory } from '../api.js';
+	import { scanDirectory, listSubdirs } from '../api.js';
 	import { toast } from '../stores.js';
 	import { icons } from '$lib/icons.js';
-	import type { Collection } from '../types.js';
+	import { serializeInclude, selectAllTopLevel } from '../scan-tree.js';
+	import ScanTreeNode from './ScanTreeNode.svelte';
+	import type { Collection, SubdirEntry } from '../types.js';
 
 	const dispatch = createEventDispatcher<{ scanned: Collection; close: void }>();
 
@@ -15,18 +17,71 @@
 
 	let path = '';
 	let pathAlias = '';
-	let depth = 3;
 	let excludeRaw = '';
 	let scanning = false;
+
+	// Folder-tree picker state (M8 — replaces the scan-depth slider, HANDOVER §A2.1).
+	let topLevel: SubdirEntry[] | null = null;
+	let checked = new Set<string>();
+	let treeLoading = false;
+	let treeError = '';
+	let loadedPath = '';
+	let wasOpen = false;
 
 	$: if (open) {
 		path = initialPath;
 		pathAlias = initialAlias;
 	}
 
+	// Load the tree once per open transition when a path is already known (re-scan reopen).
+	$: {
+		if (open && !wasOpen) {
+			wasOpen = true;
+			if (initialPath) loadTopLevel(initialPath);
+		} else if (!open && wasOpen) {
+			wasOpen = false;
+		}
+	}
+
+	$: selectedCount = checked.size;
+
+	async function loadTopLevel(p: string) {
+		if (!p) return;
+		treeLoading = true;
+		treeError = '';
+		checked = new Set();
+		topLevel = null;
+		try {
+			topLevel = await listSubdirs(p);
+			loadedPath = p;
+		} catch (e) {
+			treeError = String(e);
+			topLevel = [];
+		} finally {
+			treeLoading = false;
+		}
+	}
+
 	async function browse() {
 		const selected = await openDialog({ directory: true, multiple: false, title: 'Select directory' });
-		if (selected) path = selected as string;
+		if (selected) {
+			path = selected as string;
+			await loadTopLevel(path);
+		}
+	}
+
+	function toggleCheck(rel: string) {
+		if (checked.has(rel)) checked.delete(rel);
+		else checked.add(rel);
+		checked = checked; // reassign so reactivity flows through the recursive tree
+	}
+
+	function selectAll() {
+		if (topLevel) checked = selectAllTopLevel(topLevel.map((n) => n.name));
+	}
+
+	function clearAll() {
+		checked = new Set();
 	}
 
 	async function handleScan() {
@@ -34,7 +89,8 @@
 		scanning = true;
 		try {
 			const exclude = excludeRaw.split(',').map((s) => s.trim()).filter(Boolean);
-			const collection = await scanDirectory({ path, path_alias: pathAlias, depth, exclude });
+			const include = serializeInclude(checked);
+			const collection = await scanDirectory({ path, path_alias: pathAlias, include, exclude });
 			// Only dispatch result if the dialog is still open (user didn't cancel mid-scan).
 			if (open) {
 				dispatch('scanned', collection);
@@ -52,11 +108,12 @@
 		scanning = false; // Reset so reopening the dialog is not stuck in "Scanning…"
 		path = '';
 		pathAlias = '';
-		depth = 3;
+		topLevel = null;
+		checked = new Set();
+		treeError = '';
+		loadedPath = '';
 		dispatch('close');
 	}
-
-	$: pct = ((depth / 6) * 100).toFixed(1);
 </script>
 
 {#if open}
@@ -99,15 +156,42 @@
 					<input class="hb-input" type="text" placeholder="Criterion Collection" bind:value={pathAlias} />
 				</div>
 
-				<!-- Scan depth -->
+				<!-- Folder selection tree -->
 				<div class="field">
-					<div class="slider-header">
-						<span class="field-label">Scan depth</span>
-						<span class="slider-val">{depth} levels</span>
+					<div class="field-label-row">
+						<span class="field-label">Folders to include</span>
+						{#if topLevel && topLevel.length > 0}
+							<div class="tree-actions">
+								<button class="link-btn" type="button" on:click={selectAll}>Select all</button>
+								<button class="link-btn" type="button" on:click={clearAll}>Clear</button>
+							</div>
+						{/if}
 					</div>
-					<div class="slider-wrap">
-						<input type="range" class="slider" min="1" max="6" bind:value={depth} />
+					<div class="tree-box">
+						{#if treeLoading}
+							<div class="tree-hint">Listing folders…</div>
+						{:else if treeError}
+							<div class="tree-hint tree-error">{treeError}</div>
+						{:else if !path}
+							<div class="tree-hint">Choose a directory to pick folders.</div>
+						{:else if topLevel === null}
+							<div class="tree-hint">
+								<button class="link-btn" type="button" on:click={() => loadTopLevel(path)}>
+									List folders in this directory
+								</button>
+							</div>
+						{:else if topLevel.length === 0}
+							<div class="tree-hint">No sub-folders — root-level files will be included.</div>
+						{:else}
+							{#each topLevel as node (node.path)}
+								<ScanTreeNode {node} rel={node.name} {checked} onToggle={toggleCheck} />
+							{/each}
+						{/if}
 					</div>
+					<span class="field-hint">
+						Checked folders are scanned in full; root-level files are always included.{#if selectedCount > 0}
+							· {selectedCount} folder{selectedCount !== 1 ? 's' : ''} selected{/if}
+					</span>
 				</div>
 
 				<!-- Exclude patterns -->
@@ -269,34 +353,33 @@
 
 	.hb-mono { font-family: var(--font-mono); }
 
-	.slider-header { display: flex; justify-content: space-between; align-items: baseline; }
+	/* Folder-tree picker */
+	.tree-actions { display: flex; gap: 10px; }
 
-	.slider-val { font-size: 13px; font-weight: 600; color: var(--fg); font-feature-settings: 'tnum'; }
-
-	.slider-wrap { padding: 0 8px; }
-
-	.slider {
-		-webkit-appearance: none;
-		appearance: none;
-		width: 100%;
-		height: 4px;
-		background: var(--bg-elev3);
-		border-radius: 99px;
-		outline: none;
-		margin: 6px 0;
-	}
-
-	.slider::-webkit-slider-thumb {
-		-webkit-appearance: none;
-		appearance: none;
-		width: 14px;
-		height: 14px;
-		border-radius: 50%;
-		background: var(--fg);
-		border: 2px solid var(--accent);
-		box-shadow: 0 2px 6px oklch(0 0 0 / 0.4);
+	.link-btn {
+		background: transparent;
+		border: none;
 		cursor: pointer;
+		color: var(--accent);
+		font-family: var(--font-ui);
+		font-size: 11px;
+		padding: 0;
 	}
+
+	.link-btn:hover { text-decoration: underline; }
+
+	.tree-box {
+		max-height: 200px;
+		overflow-y: auto;
+		padding: 8px;
+		background: var(--bg-input);
+		border: 1px solid var(--border);
+		border-radius: 7px;
+	}
+
+	.tree-hint { font-size: 12px; color: var(--fg-dim); padding: 4px 2px; }
+
+	.tree-error { color: var(--danger, #e5484d); }
 
 	/* Buttons */
 	.btn-primary {

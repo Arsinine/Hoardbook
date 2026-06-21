@@ -31,9 +31,23 @@ pub struct CollectionEntry {
 pub struct ScanOptions {
     pub path: String,
     pub path_alias: String,
-    pub depth: u32,
+    /// Relative, "/"-separated directory paths the user checked in the folder-tree picker. Each
+    /// checked folder (and everything under it) is walked in full; root-level loose files are always
+    /// included. Replaces the former `depth` slider (M8, HANDOVER §A2.1).
+    #[serde(default)]
+    pub include: Vec<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
+}
+
+/// An immediate child directory of a scanned path — drives one node of the folder-tree picker.
+#[derive(Debug, Clone, Serialize)]
+pub struct SubdirEntry {
+    pub name: String,
+    /// Absolute path on disk (handed back so the frontend can lazily expand this node).
+    pub path: String,
+    /// True if this directory itself contains at least one sub-directory (drives the ▶ expander).
+    pub has_children: bool,
 }
 
 #[tauri::command]
@@ -44,13 +58,38 @@ pub async fn scan_directory(
     scan_directory_inner(opts, store.inner()).await
 }
 
+/// List the immediate child directories of `path` for the folder-tree picker. Lazy (called once per
+/// expand), sorted, deadline-guarded — a wedged SMB mount must not hang `read_dir` forever.
+#[tauri::command]
+pub async fn list_subdirs(path: String) -> CmdResult<Vec<SubdirEntry>> {
+    // Same off-runtime + deadline discipline as `scan_directory` (see the comment there).
+    match tauri::async_runtime::spawn_blocking(move || {
+        run_blocking_with_deadline(
+            move || list_subdirs_core(&path),
+            std::time::Duration::from_secs(30),
+        )
+        .map_err(|e| {
+            if e == DEADLINE_EXCEEDED {
+                "Listing sub-folders timed out — check that the path is accessible and try again."
+                    .to_string()
+            } else {
+                e
+            }
+        })
+    })
+    .await
+    {
+        Ok(inner) => inner,
+        Err(e) => Err(format!("Sub-folder listing task failed: {e}")),
+    }
+}
+
 /// Core scan + persist logic, extracted for testability (mirrors
 /// `publish_collection_inner`). Walks the directory off the async runtime
 /// thread under a deadline, then builds and persists the draft collection.
 async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult<Collection> {
     let root = std::path::PathBuf::from(&opts.path);
 
-    let depth = opts.depth.min(10);
     let slug = Collection::slug_from_alias(&opts.path_alias);
     if !is_valid_slug(&slug) {
         return Err(format!(
@@ -59,6 +98,7 @@ async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult
         ));
     }
     let globs = build_glob_set(&opts.exclude);
+    let include = IncludeSet::new(opts.include.clone());
 
     // Walk the filesystem off the async runtime thread under a hard deadline.
     // We deliberately avoid `tokio::time::timeout` + `tokio::task::spawn_blocking`:
@@ -70,22 +110,18 @@ async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult
     // hidden runtime dependency.
     let scan = move || -> anyhow::Result<(Vec<DirectoryItem>, u64)> {
         anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
-        scan_recursive(&root, depth, 0, &globs, "")
+        scan_selective(&root, &include, &globs)
     };
     let (listing, total_bytes) = match tauri::async_runtime::spawn_blocking(move || {
-        let (tx, rx) = std::sync::mpsc::channel();
-        // A stale SMB mount can wedge `read_dir`; run the walk on its own thread so
-        // we can abandon it after the deadline instead of blocking forever.
-        std::thread::spawn(move || {
-            let _ = tx.send(scan());
-        });
-        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-            Ok(result) => result.map_err(cmd_err),
-            Err(_) => Err(
+        run_blocking_with_deadline(scan, std::time::Duration::from_secs(30)).map_err(|e| {
+            // Preserve the prior caller-facing timeout copy.
+            if e == DEADLINE_EXCEEDED {
                 "Directory scan timed out after 30 seconds — check that the path is accessible and try again."
-                    .to_string(),
-            ),
-        }
+                    .to_string()
+            } else {
+                e
+            }
+        })
     })
     .await
     {
@@ -351,34 +387,133 @@ pub(crate) fn is_valid_slug(slug: &str) -> bool {
 // Filesystem scanner
 // ---------------------------------------------------------------------------
 
-fn scan_recursive(
+/// Sentinel returned by `run_blocking_with_deadline` when the work outlives the deadline, so callers
+/// can substitute their own user-facing copy.
+const DEADLINE_EXCEEDED: &str = "__deadline_exceeded__";
+
+/// Run a blocking `work` closure on its own thread and abandon it after `timeout`. A stale SMB mount
+/// can wedge `read_dir` indefinitely; this guarantees the command returns instead of hanging the UI.
+/// Pure (no async, no Tauri) so the deadline path is directly unit-testable.
+fn run_blocking_with_deadline<T: Send + 'static>(
+    work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+    timeout: std::time::Duration,
+) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result.map_err(cmd_err),
+        Err(_) => Err(DEADLINE_EXCEEDED.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Selection-aware scanner (M8 — folder-tree picker, HANDOVER §A2.1)
+// ---------------------------------------------------------------------------
+
+/// The set of relative, "/"-separated directory paths the user checked in the folder-tree picker.
+/// Mirrors the frontend `lib/scan-tree.ts` so backend and UI agree on inclusion semantics.
+pub(crate) struct IncludeSet {
+    checked: Vec<String>,
+}
+
+impl IncludeSet {
+    pub(crate) fn new(checked: Vec<String>) -> Self {
+        Self { checked }
+    }
+
+    /// `rel` is included iff it is itself checked or lives under a checked ancestor.
+    pub(crate) fn is_included(&self, rel: &str) -> bool {
+        self.checked
+            .iter()
+            .any(|c| rel == c || rel.starts_with(&format!("{c}/")))
+    }
+
+    /// True iff some checked path lives strictly below `rel` (so `rel` is only an *ancestor* of a
+    /// selection — traverse it to reach the selection, but withhold its own loose files).
+    pub(crate) fn has_descendant_under(&self, rel: &str) -> bool {
+        let prefix = format!("{rel}/");
+        self.checked.iter().any(|c| c.starts_with(&prefix))
+    }
+}
+
+/// F1 (privacy boundary): reject an `include` entry that is absolute or contains `..`, then
+/// `canonicalize()` the resolved sub-path and assert it still lives under the canonicalized
+/// collection root. A crafted `include` (e.g. `../../etc`, an absolute path, or a symlink that
+/// escapes) must never let `scan_selective` walk — and therefore publish — files outside the chosen
+/// tree. This guard is the scan-path analogue of the slug guard (which does NOT cover scan
+/// sub-paths).
+pub(crate) fn contained_under_root(root: &Path, rel: &str) -> Result<std::path::PathBuf, String> {
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return Err(format!("include path '{rel}' must be relative to the collection root"));
+    }
+    if rel_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("include path '{rel}' must not contain '..'"));
+    }
+    let canon_root = root
+        .canonicalize()
+        .map_err(|e| format!("collection root is not accessible: {e}"))?;
+    let resolved = canon_root
+        .join(rel_path)
+        .canonicalize()
+        .map_err(|e| format!("include path '{rel}' is not accessible: {e}"))?;
+    if !resolved.starts_with(&canon_root) {
+        return Err(format!("include path '{rel}' escapes the collection root"));
+    }
+    Ok(resolved)
+}
+
+/// Selection-aware directory walk (replaces the depth-limited `scan_recursive`). Always lists
+/// root-level loose files; fully recurses a subdir iff it (or an ancestor) is checked; for a dir
+/// that is only an *ancestor* of a selection, traverses it but withholds its own loose files;
+/// otherwise skips it. Validates every `include` entry against the root (F1) before any walk.
+pub(crate) fn scan_selective(
+    root: &Path,
+    include: &IncludeSet,
+    exclude: &globset::GlobSet,
+) -> anyhow::Result<(Vec<DirectoryItem>, u64)> {
+    // F1: containment check on every checked path BEFORE walking anything.
+    for c in &include.checked {
+        contained_under_root(root, c).map_err(|e| anyhow::anyhow!(e))?;
+    }
+    scan_selective_walk(root, include, exclude, "")
+}
+
+fn scan_selective_walk(
     dir: &Path,
-    max_depth: u32,
-    current_depth: u32,
+    include: &IncludeSet,
     exclude: &globset::GlobSet,
     rel_prefix: &str,
 ) -> anyhow::Result<(Vec<DirectoryItem>, u64)> {
+    let is_root = rel_prefix.is_empty();
+    // Loose files are listed at the root and inside any included directory; an ancestor-only
+    // directory withholds them.
+    let list_loose_files = is_root || include.is_included(rel_prefix);
+
     let mut items = vec![];
     let mut total_bytes: u64 = 0;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let rel_path = if rel_prefix.is_empty() {
-            name.clone()
-        } else {
-            format!("{rel_prefix}/{name}")
-        };
+        let rel_path = if is_root { name.clone() } else { format!("{rel_prefix}/{name}") };
         if exclude.is_match(&rel_path) {
             continue;
         }
         let meta = entry.metadata()?;
         let path = entry.path();
         if meta.is_dir() {
-            let (children, sub_bytes) = if current_depth + 1 < max_depth {
-                scan_recursive(&path, max_depth, current_depth + 1, exclude, &rel_path)?
-            } else {
-                (vec![], 0)
-            };
+            let included = include.is_included(&rel_path);
+            // Recurse into a directory that is selected (full subtree) OR only an ancestor of a
+            // selection (to reach the checked descendant). Skip everything else entirely.
+            if !included && !include.has_descendant_under(&rel_path) {
+                continue;
+            }
+            let (children, sub_bytes) = scan_selective_walk(&path, include, exclude, &rel_path)?;
             total_bytes += sub_bytes;
             items.push(DirectoryItem {
                 name,
@@ -390,7 +525,7 @@ fn scan_recursive(
                 note: None,
                 children,
             });
-        } else if meta.is_file() {
+        } else if meta.is_file() && list_loose_files {
             total_bytes += meta.len();
             items.push(DirectoryItem {
                 name: name.clone(),
@@ -413,6 +548,38 @@ fn scan_recursive(
         _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
     Ok((items, total_bytes))
+}
+
+/// Enumerate the immediate child *directories* of `path` (sorted), each tagged with whether it has
+/// sub-directories of its own (drives the picker's ▶ expander). Pure core behind `list_subdirs`.
+pub(crate) fn list_subdirs_core(path: &str) -> anyhow::Result<Vec<SubdirEntry>> {
+    let root = Path::new(path);
+    anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
+    let mut entries: Vec<SubdirEntry> = vec![];
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.metadata()?.is_dir() {
+            continue;
+        }
+        let child_path = entry.path();
+        entries.push(SubdirEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            has_children: dir_has_subdir(&child_path),
+            path: child_path.to_string_lossy().into_owned(),
+        });
+    }
+    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(entries)
+}
+
+/// Cheap "does this directory contain at least one sub-directory?" probe (stops at the first hit).
+/// An unreadable directory reports `false` rather than erroring — the expander simply won't show.
+fn dir_has_subdir(dir: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    rd.filter_map(|e| e.ok())
+        .any(|e| e.metadata().map(|m| m.is_dir()).unwrap_or(false))
 }
 
 fn build_glob_set(patterns: &[String]) -> globset::GlobSet {
@@ -541,22 +708,202 @@ mod tests {
         build_glob_set(&[])
     }
 
+    /// Build an `IncludeSet` from string slices (test ergonomics).
+    fn include(paths: &[&str]) -> IncludeSet {
+        IncludeSet::new(paths.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// Selection-walk fixture:
+    ///   root.txt
+    ///   a/ a_loose.txt  b/ b_file.txt  c/ c_file.txt
+    ///   x/ x_loose.txt  y/ y_file.txt
+    fn make_selective_tree(root: &std::path::Path) {
+        let abc = root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&abc).unwrap();
+        std::fs::write(abc.join("c_file.txt"), b"x").unwrap();
+        std::fs::write(root.join("a").join("b").join("b_file.txt"), b"x").unwrap();
+        std::fs::write(root.join("a").join("a_loose.txt"), b"x").unwrap();
+        let xy = root.join("x").join("y");
+        std::fs::create_dir_all(&xy).unwrap();
+        std::fs::write(xy.join("y_file.txt"), b"x").unwrap();
+        std::fs::write(root.join("x").join("x_loose.txt"), b"x").unwrap();
+        std::fs::write(root.join("root.txt"), b"x").unwrap();
+    }
+
+    // ── Track F: scan_selective (selection-aware walk) ────────────────────────
+
+    /// (a) A subset of subdirs `include`d → only those recurse fully; others skipped.
     #[test]
-    fn depth_limit_enforced() {
+    fn scan_selective_only_recurses_included_subtree() {
         let dir = tempfile::tempdir().unwrap();
-        make_dir_tree(dir.path());
+        make_selective_tree(dir.path());
 
-        // depth=3: root(0) → level1(1) → level2(2) → level3 NOT recursed (2+1 < 3 is false).
-        let (items, _) = scan_recursive(dir.path(), 3, 0, &empty_globs(), "").unwrap();
+        let (items, _) = scan_selective(dir.path(), &include(&["a"]), &empty_globs()).unwrap();
         let json = serde_json::to_string(&items).unwrap();
-        assert!(json.contains("top.txt"), "level1 files must be present");
-        assert!(json.contains("mid.txt"), "level2 files must be present");
-        assert!(!json.contains("deep.txt"), "level3 files must be absent at depth=3");
+        // The whole `a` subtree is present...
+        assert!(json.contains("a_loose.txt"), "included dir's loose files present");
+        assert!(json.contains("b_file.txt"), "included dir recurses fully");
+        assert!(json.contains("c_file.txt"), "included dir recurses to full depth");
+        // ...and the unselected `x` subtree is entirely absent.
+        assert!(!json.contains("x_loose.txt"), "unselected dir's files must be absent");
+        assert!(!json.contains("y_file.txt"), "unselected dir is not walked");
+    }
 
-        // depth=10: all levels included.
-        let (items_full, _) = scan_recursive(dir.path(), 10, 0, &empty_globs(), "").unwrap();
-        let json_full = serde_json::to_string(&items_full).unwrap();
-        assert!(json_full.contains("deep.txt"), "full depth must include level3");
+    /// (b) Ancestor-only traversal — `include = ["a/b"]` traverses `a` but does NOT list `a`'s loose
+    /// files; fully lists `a/b`.
+    #[test]
+    fn scan_selective_ancestor_only_omits_loose_files() {
+        let dir = tempfile::tempdir().unwrap();
+        make_selective_tree(dir.path());
+
+        let (items, _) = scan_selective(dir.path(), &include(&["a/b"]), &empty_globs()).unwrap();
+        let json = serde_json::to_string(&items).unwrap();
+        // `a` is only an ancestor → traversed to reach a/b, but its own loose files are withheld.
+        assert!(!json.contains("a_loose.txt"), "ancestor-only dir's loose files must be withheld");
+        // a/b is the selection → fully listed.
+        assert!(json.contains("b_file.txt"), "selected subdir's files present");
+        assert!(json.contains("c_file.txt"), "selected subdir recurses fully");
+        // the `a` folder node still exists (so the path to a/b renders).
+        let a = items.iter().find(|i| i.name == "a").expect("a folder node present as a path");
+        assert_eq!(a.item_type, ItemType::Folder);
+        assert!(a.children.iter().any(|c| c.name == "b"), "a contains the selected b");
+        assert!(!a.children.iter().any(|c| c.item_type == ItemType::File),
+            "ancestor-only `a` lists no loose files of its own");
+        // unselected sibling `x` absent.
+        assert!(!json.contains("x_loose.txt"));
+    }
+
+    /// (c) Root-level loose files are always present regardless of `include`.
+    #[test]
+    fn scan_selective_root_files_always_present() {
+        let dir = tempfile::tempdir().unwrap();
+        make_selective_tree(dir.path());
+
+        for inc in [include(&[]), include(&["x"]), include(&["a/b"])] {
+            let (items, _) = scan_selective(dir.path(), &inc, &empty_globs()).unwrap();
+            assert!(items.iter().any(|i| i.name == "root.txt"),
+                "root-level loose files are always included");
+        }
+    }
+
+    /// (d) `include = []` → root files only, no subdir contents.
+    #[test]
+    fn scan_selective_empty_include_is_root_only() {
+        let dir = tempfile::tempdir().unwrap();
+        make_selective_tree(dir.path());
+
+        let (items, _) = scan_selective(dir.path(), &include(&[]), &empty_globs()).unwrap();
+        let json = serde_json::to_string(&items).unwrap();
+        assert!(json.contains("root.txt"), "root files present");
+        // No subdir is selected → none are listed at all.
+        assert!(!json.contains("a_loose.txt"));
+        assert!(!json.contains("b_file.txt"));
+        assert!(!json.contains("x_loose.txt"));
+        assert!(items.iter().all(|i| i.item_type == ItemType::File),
+            "with no selection, only loose root files appear (no folders)");
+    }
+
+    /// (e) F1 containment — an `include` entry that escapes the canonicalized root is a reasoned
+    /// `Err` from scan_selective's OWN guard, and NOTHING outside the root is ever listed. This is
+    /// the selection-walk privacy boundary.
+    #[test]
+    fn scan_selective_rejects_escaping_include_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        make_selective_tree(dir.path());
+        let err = scan_selective(dir.path(), &include(&["../../../etc"]), &empty_globs())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes") || err.contains(".."), "reasoned containment error: {err}");
+    }
+
+    #[test]
+    fn scan_selective_rejects_absolute_include() {
+        let dir = tempfile::tempdir().unwrap();
+        make_selective_tree(dir.path());
+        let abs = if cfg!(windows) { "C:\\Windows" } else { "/etc" };
+        let err = scan_selective(dir.path(), &include(&[abs]), &empty_globs())
+            .unwrap_err()
+            .to_string();
+        assert!(!err.is_empty(), "absolute include path rejected: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_selective_rejects_symlink_escape() {
+        // A checked subdir that is a symlink pointing OUTSIDE the root must not exfiltrate files:
+        // canonicalize() follows the link and the under-root prefix check fails.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), b"top secret").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        make_selective_tree(dir.path());
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+
+        let err = scan_selective(dir.path(), &include(&["escape"]), &empty_globs())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes") || err.contains("root"), "symlink escape rejected: {err}");
+
+        // And the legitimate selection never leaks the outside file.
+        let (items, _) = scan_selective(dir.path(), &include(&["a"]), &empty_globs()).unwrap();
+        let json = serde_json::to_string(&items).unwrap();
+        assert!(!json.contains("secret.txt"), "no file outside the root is ever listed");
+    }
+
+    // ── IncludeSet truth table (mirrors the frontend scan-tree.ts) ────────────
+
+    #[test]
+    fn include_set_is_included_and_descendant_logic() {
+        let inc = include(&["a", "x/y"]);
+        // is_included: exact or under a checked ancestor.
+        assert!(inc.is_included("a"));
+        assert!(inc.is_included("a/b"));
+        assert!(inc.is_included("a/b/c"));
+        assert!(inc.is_included("x/y"));
+        assert!(inc.is_included("x/y/z"));
+        assert!(!inc.is_included("x"), "x is only an ancestor of the checked x/y");
+        assert!(!inc.is_included("ab"), "prefix must respect the path separator (not 'a' ⊂ 'ab')");
+        // has_descendant_under: some checked path lives strictly below `rel`.
+        assert!(inc.has_descendant_under("x"));
+        assert!(!inc.has_descendant_under("a"), "a is itself checked, not an ancestor-of-checked");
+        assert!(!inc.has_descendant_under("x/y"), "x/y is the checked leaf, has no checked descendant");
+    }
+
+    // ── list_subdirs (lazy child enumeration for the picker) ──────────────────
+
+    #[test]
+    fn list_subdirs_returns_sorted_immediate_children_with_has_children() {
+        let dir = tempfile::tempdir().unwrap();
+        make_selective_tree(dir.path());
+
+        let entries = list_subdirs_core(&dir.path().to_string_lossy()).unwrap();
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        // immediate child DIRECTORIES only, sorted; loose files excluded.
+        assert_eq!(names, vec!["a", "x"], "immediate child dirs, sorted, no files");
+        let a = entries.iter().find(|e| e.name == "a").unwrap();
+        assert!(a.has_children, "a has subdir b → expander shown");
+        // a leaf dir reports no children.
+        let leaf = list_subdirs_core(&dir.path().join("a").join("b").join("c").to_string_lossy()).unwrap();
+        assert!(leaf.is_empty(), "c has no subdirs");
+    }
+
+    #[test]
+    fn list_subdirs_nonexistent_path_is_reasoned_err_not_panic() {
+        let err = list_subdirs_core("/no/such/path/xyzzy-7f3a").unwrap_err().to_string();
+        assert!(!err.is_empty(), "missing path returns a reasoned Err");
+    }
+
+    #[test]
+    fn deadline_helper_returns_err_on_wedged_work() {
+        // Simulates a wedged SMB read_dir: the work outlives the deadline → Err, never a hang.
+        let res: Result<(), String> = run_blocking_with_deadline(
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                Ok(())
+            },
+            std::time::Duration::from_millis(50),
+        );
+        assert!(res.is_err(), "work that outlives the deadline must error, not block");
     }
 
     #[test]
@@ -567,7 +914,7 @@ mod tests {
         std::fs::write(dir.path().join("readme.txt"), b"x").unwrap();
 
         let globs = build_glob_set(&["*.nfo".to_string()]);
-        let (items, _) = scan_recursive(dir.path(), 1, 0, &globs, "").unwrap();
+        let (items, _) = scan_selective(dir.path(), &include(&[]), &globs).unwrap();
         let names: Vec<_> = items.iter().map(|i| i.name.as_str()).collect();
         assert!(names.contains(&"movie.mkv"));
         assert!(names.contains(&"readme.txt"));
@@ -583,7 +930,7 @@ mod tests {
         std::fs::write(sub.join("ep1.mkv"), b"x").unwrap();
 
         let globs = build_glob_set(&["**/*.nfo".to_string()]);
-        let (items, _) = scan_recursive(dir.path(), 10, 0, &globs, "").unwrap();
+        let (items, _) = scan_selective(dir.path(), &include(&["Season 1"]), &globs).unwrap();
         let json = serde_json::to_string(&items).unwrap();
         assert!(!json.contains("ep1.nfo"), "nested *.nfo must be excluded by **/*.nfo glob");
         assert!(json.contains("ep1.mkv"), "mkv must remain");
@@ -593,7 +940,9 @@ mod tests {
     fn item_count_accurate() {
         let dir = tempfile::tempdir().unwrap();
         make_dir_tree(dir.path()); // root.txt + level1/(top.txt + level2/(mid.txt + level3/(deep.txt)))
-        let (items, _) = scan_recursive(dir.path(), 10, 0, &empty_globs(), "").unwrap();
+        // Selecting the top-level `level1` walks its whole subtree (full depth — the point of the
+        // selective walk); root.txt is always included.
+        let (items, _) = scan_selective(dir.path(), &include(&["level1"]), &empty_globs()).unwrap();
         let total = count_items(&items);
         // Items: root.txt, level1(dir), top.txt, level2(dir), mid.txt, level3(dir), deep.txt = 7
         assert_eq!(total, 7, "expected 7 items (4 files + 3 dirs), got {total}");
@@ -616,7 +965,7 @@ mod tests {
         let opts = ScanOptions {
             path: work.path().to_string_lossy().into_owned(),
             path_alias: "Empty Folder".into(),
-            depth: 3,
+            include: vec![],
             exclude: vec![],
         };
 
@@ -656,7 +1005,7 @@ mod tests {
         let opts = ScanOptions {
             path: with_sep,
             path_alias: "My Downloads Backup".into(), // spaces → slug "my-downloads-backup"
-            depth: 3,
+            include: vec![],
             exclude: vec![],
         };
 
@@ -689,7 +1038,7 @@ mod tests {
         let opts = ScanOptions {
             path: work.path().to_string_lossy().into_owned(),
             path_alias: "Empty".into(),
-            depth: 3,
+            include: vec![],
             exclude: vec![],
         };
 
@@ -709,7 +1058,7 @@ mod tests {
         std::fs::write(dir.path().join("extra.txt"), b"x").unwrap();
 
         // First scan — simulate a note added to film.mkv.
-        let (mut items, _) = scan_recursive(dir.path(), 1, 0, &empty_globs(), "").unwrap();
+        let (mut items, _) = scan_selective(dir.path(), &include(&[]), &empty_globs()).unwrap();
         for item in &mut items {
             if item.name == "film.mkv" {
                 item.note = Some("Director's cut".into());
@@ -717,7 +1066,7 @@ mod tests {
         }
 
         // Second scan — fresh, no notes yet.
-        let (new_items, _) = scan_recursive(dir.path(), 1, 0, &empty_globs(), "").unwrap();
+        let (new_items, _) = scan_selective(dir.path(), &include(&[]), &empty_globs()).unwrap();
         assert!(new_items.iter().all(|i| i.note.is_none()), "fresh scan has no notes");
 
         // Apply preserved notes, keyed by relative path.
@@ -738,7 +1087,7 @@ mod tests {
         std::fs::write(dir.path().join("readme.txt"), b"x").unwrap();
         std::fs::write(sub.join("readme.txt"), b"x").unwrap();
 
-        let (mut items, _) = scan_recursive(dir.path(), 10, 0, &empty_globs(), "").unwrap();
+        let (mut items, _) = scan_selective(dir.path(), &include(&["subdir"]), &empty_globs()).unwrap();
         // Add note only to the root readme.txt.
         for item in &mut items {
             if item.name == "readme.txt" {
@@ -746,7 +1095,7 @@ mod tests {
             }
         }
 
-        let (new_items, _) = scan_recursive(dir.path(), 10, 0, &empty_globs(), "").unwrap();
+        let (new_items, _) = scan_selective(dir.path(), &include(&["subdir"]), &empty_globs()).unwrap();
         let notes = collect_notes(&items, "");
         let merged = apply_notes(new_items, &notes, "");
 
