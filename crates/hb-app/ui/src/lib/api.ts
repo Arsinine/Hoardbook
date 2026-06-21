@@ -15,6 +15,7 @@ import type {
 	ReceivedMessage,
 	ScanOptions,
 	ShareSettings,
+	SubdirEntry,
 	Watch,
 	WatchHit,
 } from './types.js';
@@ -79,6 +80,10 @@ export const hasPublishedProfile = () => invoke<boolean>('has_published_profile'
 export const scanDirectory = (opts: ScanOptions) =>
 	invoke<Collection>('scan_directory', { opts });
 
+/** Immediate child directories of `path`, for lazy folder-tree expansion (M8). */
+export const listSubdirs = (path: string) =>
+	invoke<SubdirEntry[]>('list_subdirs', { path });
+
 export const getCollections = () => invoke<Collection[]>('get_collections');
 
 export const deleteCollection = (slug: string) => invoke<void>('delete_collection', { slug });
@@ -94,15 +99,11 @@ export const exportCollection = (slug: string, format: 'text' | 'markdown') =>
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
-export type UpdateApplyMode = 'auto' | 'confirm';
-
 export interface Settings {
 	relay_urls: string[];
 	allow_dms: boolean;
 	/** The one-time pre-first-download IP-exposure notice has been acknowledged. */
 	privacy_notice_acknowledged: boolean;
-	/** How updates apply: 'auto' (Obsidian deferred-install) or 'confirm' (confirm-before-apply). */
-	update_apply_mode: UpdateApplyMode;
 	/** App version last seen running — drives the visible-after "now on vX.Y" notice. */
 	last_seen_version: string;
 }

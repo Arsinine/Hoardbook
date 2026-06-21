@@ -6,6 +6,7 @@ mod error;
 mod identity_state;
 mod net;
 mod presence;
+mod single_instance;
 mod store;
 mod update_logic;
 
@@ -123,7 +124,29 @@ fn spawn_background_tasks(
 // ---------------------------------------------------------------------------
 
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+
+    // Single-instance enforcement (M8): a second launch focuses the existing window instead of
+    // spawning a duplicate (a duplicate opens its own relay connections + presence loop, so it would
+    // double-publish presence under one npub — collapsing to one process collapses that to one
+    // publisher). The v2 docs require this be the FIRST plugin so the second-instance argv is
+    // captured before other setup. Desktop-only; mobile has no single-instance concern.
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // TODO(M-later): route second-instance argv as an "open this share code" deep-link.
+            use single_instance::{FocusAction, FocusableWindow, focus_existing};
+            // Absorbing call-site expression (F10): a stale/destroyed handle's method errors are
+            // swallowed inside `focus_existing`, never panicking the surviving instance.
+            let win = app.get_webview_window("main");
+            if focus_existing(win.as_ref().map(|w| w as &dyn FocusableWindow)) == FocusAction::NoWindow
+            {
+                tracing::warn!("single-instance: second launch but no main window to focus");
+            }
+        }));
+    }
+
+    builder
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -186,6 +209,7 @@ pub fn run() {
             commands::profile::unpublish_profile,
             commands::profile::has_published_profile,
             commands::collection::scan_directory,
+            commands::collection::list_subdirs,
             commands::collection::get_collections,
             commands::collection::delete_collection,
             commands::collection::publish_collection,
