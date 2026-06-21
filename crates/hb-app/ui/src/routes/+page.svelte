@@ -11,15 +11,16 @@
 	import Avatar from '$lib/components/Avatar.svelte';
 	import type { Collection, Profile } from '$lib/types.js';
 
+	// Each language is shown in its own language (autonym).
 	const LANGUAGES = [
-		'Afrikaans','Albanian','Arabic','Armenian','Azerbaijani','Basque','Belarusian',
-		'Bengali','Bulgarian','Catalan','Chinese','Croatian','Czech','Danish','Dutch',
-		'English','Estonian','Finnish','French','Galician','Georgian','German','Greek',
-		'Hebrew','Hindi','Hungarian','Icelandic','Indonesian','Italian','Japanese',
-		'Kannada','Kazakh','Korean','Latvian','Lithuanian','Macedonian','Malay',
-		'Maltese','Mongolian','Norwegian','Persian','Polish','Portuguese','Romanian',
-		'Russian','Serbian','Slovak','Slovenian','Spanish','Swedish','Tagalog','Tamil',
-		'Telugu','Thai','Turkish','Ukrainian','Urdu','Uzbek','Vietnamese','Welsh',
+		'Afrikaans','Shqip','العربية','Հայերեն','Azərbaycanca','Euskara','Беларуская',
+		'বাংলা','Български','Català','中文','Hrvatski','Čeština','Dansk','Nederlands',
+		'English','Eesti','Suomi','Français','Galego','ქართული','Deutsch','Ελληνικά',
+		'עברית','हिन्दी','Magyar','Íslenska','Bahasa Indonesia','Italiano','日本語',
+		'ಕನ್ನಡ','Қазақша','한국어','Latviešu','Lietuvių','Македонски','Bahasa Melayu',
+		'Malti','Монгол','Norsk','فارسی','Polski','Português','Română',
+		'Русский','Српски','Slovenčina','Slovenščina','Español','Svenska','Tagalog','தமிழ்',
+		'తెలుగు','ไทย','Türkçe','Українська','اردو','Oʻzbekcha','Tiếng Việt','Cymraeg',
 	];
 
 	$: langSuggestions = langInput.length > 0
@@ -125,6 +126,8 @@
 	}
 
 	$: profileDirty = publishedSnapshot === null || stableProfileJson(form) !== publishedSnapshot;
+	// Never-published is the critical case: the profile isn't searchable until it's pushed to a relay.
+	$: neverPublished = publishedSnapshot === null;
 
 	// ── Disk size computation ────────────────────────────────────────────────────
 	function formatBytes(b: number): string {
@@ -151,7 +154,7 @@
 	let tagInput = '';
 	let willingInput = '';
 
-	const WILLING_OPTIONS = ['seed', 'trade', 'upload', 'request', 'lend'];
+	const WILLING_OPTIONS = ['seed', 'trade', 'upload'];
 
 	function addTag(raw: string) {
 		const t = raw.trim().replace(/,$/, '').toLowerCase();
@@ -481,7 +484,7 @@
 					</button>
 				{:else}
 					<div class="ob-card-title">Your identity is ready</div>
-					<div class="ob-card-sub">This is your Hoardbook share code. Share it so others can follow you and browse your collections.</div>
+					<div class="ob-card-sub">This is your <strong>share code</strong> — hand it to people you want browsing your collections, and keep it private (it unlocks your listings).</div>
 					<div class="ob-hbid-row">
 						<span class="ob-hbid mono">{$identity?.share_code ?? ''}</span>
 						<button class="btn-ghost btn-sm" on:click={() => { navigator.clipboard.writeText($identity?.share_code ?? ''); toast('Copied', 'success'); }}>Copy</button>
@@ -560,13 +563,21 @@
 	<div class="topbar">
 		<div>
 			<div class="topbar-title">My Profile</div>
-			<div class="topbar-sub">Visible to anyone with your npub</div>
+			<div class="topbar-sub">
+				{#if neverPublished}
+					<span class="pub-status pub-warn">● Not published yet — others can't find you in search until you publish</span>
+				{:else if profileDirty}
+					<span class="pub-status pub-warn">● Unpublished changes — re-publish to update your public listing</span>
+				{:else}
+					<span class="pub-status pub-ok">● Published — you're discoverable in search</span>
+				{/if}
+			</div>
 		</div>
 		<div class="topbar-actions">
 			<button class="btn-ghost btn-sm" on:click={handleSave} disabled={!form.display_name || saving}>
 				{saving ? 'Saving…' : 'Save draft'}
 			</button>
-			<button class="btn-primary btn-sm" on:click={handlePublish} disabled={publishing || !profileDirty} title={!profileDirty ? 'No changes since last publish' : undefined}>
+			<button class="btn-primary btn-sm" class:publish-pulse={neverPublished && !publishing} on:click={handlePublish} disabled={publishing || !profileDirty} title={!profileDirty ? 'No changes since last publish' : undefined}>
 				{publishing ? 'Publishing…' : profileDirty ? 'Publish profile' : 'Published ✓'}
 			</button>
 		</div>
@@ -620,7 +631,7 @@
 							<input
 								class="lang-input"
 								type="text"
-								placeholder={form.languages.length === 0 ? 'English, Japanese…' : 'Add…'}
+								placeholder={form.languages.length === 0 ? 'English, 日本語…' : 'Add…'}
 								bind:value={langInput}
 								on:keydown={handleLangKey}
 							/>
@@ -643,7 +654,7 @@
 
 				<div class="field">
 					<label class="field-label">Region / City</label>
-					<input class="hb-input" type="text" placeholder="Tokyo, EU/Germany, North America…" bind:value={form.location} />
+					<input class="hb-input" type="text" bind:value={form.location} />
 				</div>
 
 				<div class="field">
@@ -1036,6 +1047,19 @@
 	.topbar-title { font-size: 17px; font-weight: 600; color: var(--fg); letter-spacing: -0.3px; }
 	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
 	.topbar-actions { display: flex; gap: 8px; align-items: center; }
+
+	/* Publish-state hint + attention pulse — make "unpublished = not searchable" obvious. */
+	.pub-status { font-size: 12px; }
+	.pub-warn { color: var(--accent); }
+	.pub-ok { color: var(--fg-dim); }
+
+	.publish-pulse { animation: publish-pulse 1.8s ease-out infinite; }
+	@keyframes publish-pulse {
+		0%   { box-shadow: 0 0 0 0 oklch(0.62 0.19 255 / 0.55); }
+		70%  { box-shadow: 0 0 0 7px oklch(0.62 0.19 255 / 0); }
+		100% { box-shadow: 0 0 0 0 oklch(0.62 0.19 255 / 0); }
+	}
+	@media (prefers-reduced-motion: reduce) { .publish-pulse { animation: none; } }
 
 	/* Body layout */
 	.body {

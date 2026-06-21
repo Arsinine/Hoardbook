@@ -5,7 +5,7 @@
 	import type { Watch } from '$lib/types.js';
 	import { keyView } from '$lib/key-view.js';
 	import { passphraseStrength, backupModeOptions, type BackupMode } from '$lib/backup-export.js';
-	import { updateNoticeVM, nextApplyMode, withApplyMode } from '$lib/update-ux.js';
+	import { updateNoticeVM } from '$lib/update-ux.js';
 	import { DEFAULT_RELAYS, validateRelayUrl } from '$lib/relays.js';
 	import QRCode from 'qrcode';
 	import { relaunch } from '@tauri-apps/plugin-process';
@@ -20,10 +20,10 @@
 	let appVersion = '';
 
 	// Full settings object, preserved so saving one field never resets the others (the new M5
-	// fields privacy_notice_acknowledged / update_apply_mode / last_seen_version live here too).
+	// fields privacy_notice_acknowledged / last_seen_version live here too).
 	let settings: Settings = {
 		relay_urls: [], allow_dms: true, privacy_notice_acknowledged: false,
-		update_apply_mode: 'auto', last_seen_version: '',
+		last_seen_version: '',
 	};
 
 	// ── 3-key identity view + share-code QR ──────────────────────────────────────
@@ -165,11 +165,6 @@
 		try { await applyStagedUpdate(); } catch (e) { toast(String(e), 'error'); }
 	}
 
-	async function toggleApplyMode() {
-		settings = withApplyMode(fullSettings(), nextApplyMode(settings.update_apply_mode));
-		try { await saveSettings(settings); } catch (e) { toast(String(e), 'error'); }
-	}
-
 	let relayUrls: string[] = [];
 	let newRelay = '';
 	let savingRelays = false;
@@ -191,7 +186,6 @@
 	}
 
 	$: allowDms = settings.allow_dms;
-	$: applyMode = settings.update_apply_mode;
 
 	let wipeConfirm = false;
 	let wiping = false;
@@ -226,16 +220,15 @@
 		}
 	}
 
-	async function handleCopy() {
+	async function handleCopy(text: string) {
 		try {
-			const id = await getShareCode();
 			// Try the modern clipboard API first; fall back to execCommand for
 			// environments where navigator.clipboard is restricted.
 			try {
-				await navigator.clipboard.writeText(id);
+				await navigator.clipboard.writeText(text);
 			} catch {
 				const el = document.createElement('textarea');
-				el.value = id;
+				el.value = text;
 				el.style.cssText = 'position:fixed;opacity:0;pointer-events:none';
 				document.body.appendChild(el);
 				el.select();
@@ -381,20 +374,21 @@
 				<div class="field-label" style="margin-bottom:4px">{row.label}{#if row.sensitive} <span class="key-secret">secret</span>{/if}</div>
 				<div class="id-display">
 					<span class="id-text">{row.value}</span>
+					<button class="icon-btn" on:click={() => handleCopy(row.value)} title={row.label === 'Share code' ? 'Copy share code' : 'Copy npub'}>{@html icons.copy}</button>
 					{#if row.label === 'Share code'}
-						<button class="icon-btn" on:click={handleCopy} title="Copy share code">{@html icons.copy}</button>
 						<button class="icon-btn" on:click={showShareQr} title="Show QR code">{@html icons.qr}</button>
 					{/if}
 				</div>
+				{#if row.hint}<div class="id-hint" style="margin-bottom:12px">{row.hint}</div>{/if}
 			{/each}
 
 			{#if shareQrSvg}
 				<div class="qr-box">{@html shareQrSvg}</div>
 				<div class="id-hint">Scan to import your share code on another device. Treat it as secret — it unlocks your listings.</div>
 			{/if}
-			<div class="id-actions">
-				<span class="id-hint">{copied ? 'Copied!' : 'Hand out your share code so others can look you up.'}</span>
-			</div>
+			{#if copied}
+				<div class="id-actions"><span class="id-hint">Copied!</span></div>
+			{/if}
 
 			<div class="no-recovery">{@html icons.key} {kv.noRecoveryNotice}</div>
 
@@ -579,15 +573,6 @@
 		{#if stagedVersion}
 			<div class="toggle-sub">Downloaded and verified. It installs automatically when you quit Hoardbook (or click "Restart &amp; apply").</div>
 		{/if}
-		<div class="toggle-row" style="margin-top:4px">
-			<div class="toggle-text">
-				<div class="toggle-label">Confirm before applying updates</div>
-				<div class="toggle-sub">On: updates wait for your "Restart &amp; apply". Off: applied automatically on quit (verified by signature either way).</div>
-			</div>
-			<button class="toggle" class:toggle-on={applyMode === 'confirm'} on:click={toggleApplyMode} aria-label="Toggle confirm before applying">
-				<span class="toggle-thumb" />
-			</button>
-		</div>
 		{#if updateError}
 			<div class="update-error-text">{updateError}</div>
 		{/if}

@@ -50,5 +50,10 @@ globset = "0.4"
 [target.'cfg(target_os = "windows")'.dependencies]
 hb-dpapi = { path = "../hb-dpapi" }
 
+# Single-instance enforcement (M8) — desktop-only; the plugin (and the concern) does not exist on
+# mobile, so gate the dependency itself off the mobile targets, not just its usage.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = "2"
+
 [dev-dependencies]
 tempfile = "3"

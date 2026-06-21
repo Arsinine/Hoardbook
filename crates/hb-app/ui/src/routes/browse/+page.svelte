@@ -2,6 +2,7 @@
 	import { contacts } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
+	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
 	import type { CachedPeer, Collection, DirectoryItem } from '$lib/types.js';
 
 	type BcItem =
@@ -45,6 +46,11 @@
 		...(selectedCollection ? [{ label: selectedCollection.path_alias, kind: 'collection' as const }] : []),
 		...folderStack.map((f, i) => ({ label: f.name, kind: 'folder' as const, index: i })),
 	];
+
+	// Feature-tooltip anchor data (HOARDBOOK_SPEC §8).
+	$: peerWillingTo = selectedPeer?.profile?.willing_to ?? [];
+	// A peer followed by bare npub (no share code) has sealed listings — they can't be decrypted.
+	$: listingsLocked = !!selectedPeer && !selectedPeer.browse_key_hex && selectedPeer.collections.length === 0;
 
 	function peerName(peer: CachedPeer): string {
 		return peer.profile?.display_name ?? peer.npub.slice(0, 10) + '…';
@@ -170,9 +176,28 @@
 				{/each}
 			</div>
 
+			<!-- Willing-to hints for the selected peer (off-platform exchange preferences) -->
+			{#if !selectedCollection && peerWillingTo.length > 0}
+				<div class="willing-bar">
+					<span class="willing-label">
+						Willing to<FeatureTooltip key="willing-to" />
+					</span>
+					{#each peerWillingTo as w}
+						<span class="willing-chip">{w}</span>
+					{/each}
+				</div>
+			{/if}
+
 			<!-- Collections grid -->
 			{#if !selectedCollection}
-				{#if selectedPeer.collections.length === 0}
+				{#if listingsLocked}
+					<div class="empty-state">
+						<div class="empty-icon">{@html icons.folder}</div>
+						<div class="empty-label">
+							🔒 Listings locked<FeatureTooltip key="listings-locked" />
+						</div>
+					</div>
+				{:else if selectedPeer.collections.length === 0}
 					<div class="empty-state">
 						<div class="empty-icon">{@html icons.folder}</div>
 						<div class="empty-label">No public collections</div>
@@ -239,6 +264,11 @@
 							{/each}
 						</div>
 					{/if}
+					<!-- The listing is metadata only — Hoardbook moves no files (H4/INV-4). -->
+					<div class="no-download-note">
+						<span>Metadata only — Hoardbook moves no files.</span>
+						<FeatureTooltip key="no-download" />
+					</div>
 				</div>
 			{/if}
 		{/if}
@@ -408,7 +438,50 @@
 		display: flex;
 	}
 
-	.empty-label { font-size: 12.5px; }
+	.empty-label { font-size: 12.5px; display: inline-flex; align-items: center; }
+
+	/* Willing-to hints bar */
+	.willing-bar {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 6px;
+		padding: 8px 16px;
+		border-bottom: 1px solid var(--divider);
+		flex-shrink: 0;
+	}
+
+	.willing-label {
+		display: inline-flex;
+		align-items: center;
+		font-size: 10.5px;
+		font-weight: 600;
+		letter-spacing: 0.3px;
+		text-transform: uppercase;
+		color: var(--fg-dim);
+	}
+
+	.willing-chip {
+		font-size: 11px;
+		padding: 2px 8px;
+		border-radius: 999px;
+		background: var(--accent-soft);
+		color: var(--accent);
+		border: 1px solid color-mix(in oklch, var(--accent) 30%, transparent);
+	}
+
+	/* No-download footer note */
+	.no-download-note {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+		padding: 10px 16px;
+		margin-top: auto;
+		border-top: 1px solid var(--divider);
+		font-size: 11.5px;
+		color: var(--fg-dim);
+		flex-shrink: 0;
+	}
 
 	/* Breadcrumb */
 
