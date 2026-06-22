@@ -1,10 +1,11 @@
 <script lang="ts">
-	import { pasteKey, follow, refreshContact, unfollowContact, setContactTags, groupsGet, contactUpdateGroups } from '$lib/api.js';
+	import { pasteKey, follow, refreshContact, unfollowContact, setContactTags, groupsGet, contactUpdateGroups, groupsSetTrusted, browsePrivateCollections } from '$lib/api.js';
 	import { contacts, identity, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
-	import type { CachedPeer, Group } from '$lib/types.js';
+	import type { CachedPeer, Collection, Group } from '$lib/types.js';
+	import { NOT_DRM_NOTE, isTrusted } from '$lib/private-collections-view.js';
 	import { onMount } from 'svelte';
 
 
@@ -13,6 +14,28 @@
 
 	async function loadGroups() {
 		try { groups = await groupsGet(); } catch { /* non-fatal */ }
+	}
+
+	// M10: Private collections trusted peers have sealed to me, keyed by author npub. A non-trusted
+	// viewer simply has no entry — there is no locked-teaser hint.
+	let privateByAuthor: Record<string, Collection[]> = {};
+
+	async function loadPrivate() {
+		try {
+			const groups = await browsePrivateCollections();
+			const map: Record<string, Collection[]> = {};
+			for (const g of groups) map[g.npub] = g.collections;
+			privateByAuthor = map;
+		} catch { /* non-fatal — relays may be unreachable */ }
+	}
+
+	// Mark a contact group trusted/untrusted (M10). Trusted groups receive every Private collection
+	// on the next publish; un-trusting revokes on the next republish only (not retroactively).
+	async function toggleTrusted(g: Group) {
+		try {
+			await groupsSetTrusted(g.name, !isTrusted(g));
+			await loadGroups();
+		} catch (e) { toast(String(e), 'error'); }
 	}
 
 	// Stale: last_fetched more than 7 days ago.
@@ -43,6 +66,7 @@
 
 	onMount(() => {
 		loadGroups();
+		loadPrivate();
 		// Refresh all contacts in parallel on page load (task 4)
 		$contacts.forEach(async (c) => {
 			try {
@@ -351,6 +375,21 @@
 		</div>
 	{/if}
 
+	<!-- Trusted groups (M10): mark a group trusted to seal Private collections to its members -->
+	{#if groups.length > 0}
+		<div class="trusted-groups">
+			<div class="trusted-label">Trusted groups <span class="trusted-hint">— receive your Private collections</span></div>
+			<div class="trusted-chips">
+				{#each groups as g (g.name)}
+					<label class="trusted-chip" class:is-trusted={isTrusted(g)}>
+						<input type="checkbox" checked={isTrusted(g)} on:change={() => toggleTrusted(g)} />
+						{g.name}
+					</label>
+				{/each}
+			</div>
+		</div>
+	{/if}
+
 	<!-- Contacts list -->
 	{#if $contacts.length === 0}
 		<div class="empty">No contacts yet. Look up a peer above and follow them.</div>
@@ -469,6 +508,18 @@
 								{#each peer.collections as col}
 									<CollectionPanel collection={col} />
 								{/each}
+							{/if}
+
+							<!-- Private collections this peer has sealed to me (M10). Absent (not
+							     "locked") for a non-trusted viewer — nothing to show, no hint. -->
+							{#if (privateByAuthor[peer.npub] ?? []).length > 0}
+								<div class="private-section">
+									<div class="section-label">Private collections <span class="private-badge">trusted</span></div>
+									{#each privateByAuthor[peer.npub] as col}
+										<CollectionPanel collection={col} />
+									{/each}
+									<p class="not-drm-note">{NOT_DRM_NOTE}</p>
+								</div>
 							{/if}
 						</div>
 					{/if}
@@ -604,6 +655,28 @@
 		font-size: 10.5px; color: var(--fg-dim);
 		text-transform: uppercase; letter-spacing: 1.2px; font-weight: 600;
 	}
+
+	/* M10 — trusted-groups strip + private-collection display */
+	.trusted-groups { padding: 8px 0; display: flex; flex-direction: column; gap: 6px; }
+	.trusted-label { font-size: 11.5px; font-weight: 600; color: var(--fg-muted); }
+	.trusted-hint { font-weight: 400; color: var(--fg-dim); }
+	.trusted-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+	.trusted-chip {
+		display: inline-flex; align-items: center; gap: 5px;
+		padding: 3px 9px; border: 1px solid var(--border); border-radius: 999px;
+		font-size: 12px; cursor: pointer; color: var(--fg-muted);
+	}
+	.trusted-chip.is-trusted {
+		border-color: var(--accent);
+		color: var(--accent);
+		background: color-mix(in oklch, var(--accent) 12%, transparent);
+	}
+	.private-section { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+	.private-badge {
+		font-size: 9.5px; padding: 1px 6px; border-radius: 999px; letter-spacing: 0.5px;
+		background: color-mix(in oklch, var(--accent) 16%, transparent); color: var(--accent);
+	}
+	.not-drm-note { margin: 2px 0 0; font-size: 11px; line-height: 1.4; color: var(--fg-dim); }
 
 	.coll-list-sm { display: flex; flex-direction: column; gap: 8px; }
 

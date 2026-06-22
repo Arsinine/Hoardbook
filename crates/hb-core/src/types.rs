@@ -59,6 +59,18 @@ pub struct Profile {
 // Collection
 // ---------------------------------------------------------------------------
 
+/// Who a collection's listing is sealed *to* (spec §Private Collections). `Public` listings are
+/// encrypted under the shared browse-key (anyone with the share code can browse — M3); `Private`
+/// listings are gift-wrapped per-trusted-`npub` and the browse-key explicitly cannot open them
+/// (M10). The default is `Public`, so a collection stored before M10 (with no `visibility` field)
+/// loads as public — never silently private.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum Visibility {
+    #[default]
+    Public,
+    Private,
+}
+
 /// One shared root directory — a user may publish multiple collections.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Collection {
@@ -79,6 +91,10 @@ pub struct Collection {
     pub tags: Vec<String>,
     #[serde(default)]
     pub languages: Vec<String>,
+    /// Who the listing is sealed to (spec §Private Collections). `#[serde(default)]` ⇒ a
+    /// pre-M10 stored collection loads as `Public`.
+    #[serde(default)]
+    pub visibility: Visibility,
     pub last_updated: DateTime<Utc>,
     pub listing: Vec<DirectoryItem>,
 }
@@ -252,6 +268,7 @@ mod tests {
             content_types: vec![],
             tags: vec![],
             languages: vec![],
+            visibility: Visibility::Public,
             last_updated: chrono::Utc::now(),
             listing: vec![],
         };
@@ -264,6 +281,45 @@ mod tests {
             !json.contains("\"sorted\""),
             "Collection must not expose sorted in serialized form"
         );
+    }
+
+    #[test]
+    fn visibility_defaults_to_public_for_pre_m10_collections() {
+        // A collection JSON written before M10 has no `visibility` field; it must load as Public,
+        // never silently Private (that would hide a public collection / mis-route the seal).
+        let legacy_json = r#"{
+            "slug": "criterion",
+            "path_alias": "Criterion",
+            "item_count": 1,
+            "content_types": ["video"],
+            "last_updated": "2026-04-01T00:00:00Z",
+            "listing": []
+        }"#;
+        let parsed: Collection =
+            serde_json::from_str(legacy_json).expect("pre-M10 collection must deserialize");
+        assert_eq!(parsed.visibility, Visibility::Public, "missing visibility ⇒ Public");
+        assert_eq!(Visibility::default(), Visibility::Public);
+    }
+
+    #[test]
+    fn visibility_round_trips_private() {
+        let col = Collection {
+            slug: "vault".into(),
+            path_alias: "Vault".into(),
+            description: None,
+            item_count: 0,
+            est_size: None,
+            content_types: vec!["video".into()],
+            tags: vec![],
+            languages: vec![],
+            visibility: Visibility::Private,
+            last_updated: chrono::Utc::now(),
+            listing: vec![],
+        };
+        let json = serde_json::to_string(&col).unwrap();
+        assert!(json.contains("\"visibility\":\"Private\""), "got: {json}");
+        let back: Collection = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.visibility, Visibility::Private);
     }
 
     #[test]

@@ -27,6 +27,7 @@ mod suite_disc;
 mod suite_dm;
 mod suite_id;
 mod suite_n;
+mod suite_priv;
 mod survey;
 mod tap;
 
@@ -89,6 +90,8 @@ async fn main() -> Result<()> {
     results.extend(suite_ab::run(&ctx).await);
     eprintln!("-- Suite BROWSE: M3 value loop (publish / discover / browse / re-key) --");
     results.extend(suite_browse::run(&ctx).await);
+    eprintln!("-- Suite PRIV: Private Collections (per-recipient gift-wrapped listings, M10) --");
+    results.extend(suite_priv::run(&ctx).await);
     eprintln!("-- Suite COUNT: relay-derived count + canary exclusion (M9) --");
     results.extend(suite_count::run(&ctx).await);
     eprintln!("-- Suite CANARY: live-backbone probe cycle + cross-region + soak (M9) --");

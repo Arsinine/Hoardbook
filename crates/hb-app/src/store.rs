@@ -572,6 +572,11 @@ pub struct Group {
     /// Last modification time — used to order groups most-recently-modified first.
     #[serde(default = "default_group_modified_at")]
     pub modified_at: chrono::DateTime<chrono::Utc>,
+    /// Marks this group as **trusted** (M10): its members' `npub`s receive a per-recipient
+    /// sealed copy of every Private collection. `#[serde(default)]` ⇒ a pre-M10 group loads as
+    /// untrusted (false), so trust is never silently granted on upgrade. Local-only, never shared.
+    #[serde(default)]
+    pub trusted: bool,
 }
 
 impl DataStore {
@@ -779,6 +784,7 @@ mod tests {
                 content_types: vec![],
                 tags: vec![],
                 languages: vec![],
+                visibility: hb_core::types::Visibility::Public,
                 last_updated: chrono::Utc::now(),
                 listing: vec![],
             };

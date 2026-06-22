@@ -668,6 +668,7 @@ mod tests {
                 content_types: vec![],
                 tags: vec![],
                 languages: vec![],
+                visibility: hb_core::types::Visibility::Public,
                 last_updated: chrono::Utc::now(),
                 listing: vec![],
             };
@@ -810,6 +811,7 @@ mod tests {
             content_types: vec!["video".into()],
             tags: vec![],
             languages: vec![],
+            visibility: hb_core::types::Visibility::Public,
             last_updated: chrono::Utc::now(),
             listing: listing.clone(),
         };
