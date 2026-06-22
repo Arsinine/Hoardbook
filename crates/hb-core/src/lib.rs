@@ -11,11 +11,13 @@ pub mod types;
 //     v0.9.6 — Hoardbook moves no files.) ---
 pub mod backup;
 pub mod binding;
+pub mod count;
 pub mod event;
 pub mod fingerprint;
 pub mod identity;
 pub mod listing;
 pub mod sharecode;
+pub mod snapshot;
 mod tag_util;
 pub mod version;
 
@@ -27,8 +29,10 @@ pub use backup::{
     MIN_PASSPHRASE_LEN,
 };
 pub use binding::{build_binding, verify_binding, Binding};
+pub use count::{count_distinct_online, count_distinct_userbase, is_canary, CANARY_MARKER};
 pub use fingerprint::{fingerprint, Fingerprint};
 pub use identity::Identity;
 pub use listing::{decrypt_listing, encrypt_listing, BrowseKey};
 pub use sharecode::ShareCode;
+pub use snapshot::{snapshot_fingerprint, unchanged_since, SnapshotFingerprint};
 pub use version::SCHEMA_V;

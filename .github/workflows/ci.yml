@@ -136,8 +136,22 @@ jobs:
             sleep 1
           done
 
-      - name: Run the L2 integration suite (hb-it)
+      - name: Run the L2 integration suite (hb-it) — incl. Suite COUNT + Suite CANARY (M9)
         run: cargo run -p hb-it --locked -- --relay ws://127.0.0.1:7777 --relay ws://127.0.0.1:7778 --pow 8
+
+      # M9 Track K: exercise the canary CLI end-to-end (the systemd oneshot form). A green backbone
+      # must exit 0; a deliberately-broken relay must exit nonzero (the alarm fires). The two relays
+      # simulate SG↔JP for the cross-region step.
+      - name: Canary CLI — green backbone exits 0
+        run: cargo run -p hb-it --locked -- --canary --relay ws://127.0.0.1:7777 --relay ws://127.0.0.1:7778
+
+      - name: Canary CLI — broken relay exits nonzero (alarm fires)
+        run: |
+          if cargo run -p hb-it --locked -- --canary --relay ws://127.0.0.1:1; then
+            echo "::error::canary exited 0 against a broken relay — the alarm did not fire"; exit 1
+          else
+            echo "canary correctly exited nonzero against a broken relay"
+          fi
 
       - name: Relay logs (on failure)
         if: failure()
@@ -166,3 +180,43 @@ jobs:
       - name: vitest
         working-directory: crates/hb-app/ui
         run: npm test
+
+  # L4 — the profiling gate (M9, Decision #18). Ubuntu-only, like frontend. Two cheap surfaces (no
+  # webkit/frontend build needed): (a) the frontend recursive-tree profiler over M9's standalone
+  # 2000-node fixture, compared to the checked-in perf-budgets.json (fails on a regression beyond
+  # tolerance); (b) the F2 count-tally wall-clock budget (hb-core, no frontend dep). The Rust
+  # background-loop idle guard (presence + watch loops idle; the spinning fixture must fail) runs in
+  # the main `test` matrix as part of `cargo test --workspace`, so it isn't duplicated here.
+  profiling:
+    name: profiling (L4 — perf budgets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        working-directory: crates/hb-app/ui
+        run: npm ci
+
+      - name: Frontend L4 profiler + budget gate
+        working-directory: crates/hb-app/ui
+        run: npm run profile
+
+      - name: Upload profiling report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: profiling-report
+          path: crates/hb-app/ui/profiling-report.json
+          if-no-files-found: ignore
+
+      # F2 — the count tally must complete under its wall-clock budget (hb-core only, no frontend).
+      - name: F2 count-tally wall-clock budget
+        run: cargo test -p hb-core --locked count_tally_over_500_events_is_under_budget_f2

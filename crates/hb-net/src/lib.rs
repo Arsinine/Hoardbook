@@ -17,6 +17,7 @@
 pub mod browse;
 pub mod cache;
 pub mod client;
+pub mod count;
 pub mod discover;
 pub mod dm;
 pub mod error;
@@ -32,6 +33,7 @@ pub use browse::{
 };
 pub use cache::{cache_decision, CacheDecision, CachedListing, CACHE_FRESH_SECS};
 pub use client::{dedup_by_id, teaser_search_filter, PublishOutcome, RelayClient};
+pub use count::{count_online, count_userbase, presence_count_filter, userbase_filter};
 pub use discover::{ingest_teasers, select_newest_by_created_at, teaser_matches, SearchHit};
 pub use dm::{unwrap_dm, wrap_dm, DirectMessage};
 pub use error::NetError;

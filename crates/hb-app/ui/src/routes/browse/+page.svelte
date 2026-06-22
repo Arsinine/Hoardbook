@@ -1,9 +1,46 @@
 <script lang="ts">
+	import { onMount, onDestroy } from 'svelte';
 	import { contacts } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
+	import { getSettings, onlineCount, type OnlineCount } from '$lib/api.js';
+	import { onlineChipView } from '$lib/online-chip.js';
 	import type { CachedPeer, Collection, DirectoryItem } from '$lib/types.js';
+
+	// ── "🟢 N online" chip (M9) — relay-derived, no telemetry. Best-effort + cached on the backend;
+	//    polled on a slow tick so it never becomes a drain (L4-budgeted). Hidden when the setting is
+	//    off; shows "–" while the count is unknown (m4).
+	let onlineData: OnlineCount | null = null;
+	let showOnline = true;
+	$: chip = onlineChipView(onlineData, showOnline);
+
+	const ONLINE_POLL_MS = 60_000;
+	let onlinePollTimer: ReturnType<typeof setInterval> | undefined;
+
+	async function refreshOnline() {
+		try {
+			onlineData = await onlineCount();
+		} catch {
+			/* leave the last value; the chip shows "–" until a relay answers */
+		}
+	}
+
+	onMount(async () => {
+		try {
+			showOnline = (await getSettings()).show_online_count;
+		} catch {
+			/* default to showing the chip if settings fail to load */
+		}
+		if (showOnline) {
+			await refreshOnline();
+			onlinePollTimer = setInterval(refreshOnline, ONLINE_POLL_MS);
+		}
+	});
+
+	onDestroy(() => {
+		if (onlinePollTimer) clearInterval(onlinePollTimer);
+	});
 
 	type BcItem =
 		| { label: string; kind: 'contact' }
@@ -116,6 +153,9 @@
 	<div class="left-panel">
 		<div class="panel-top">
 			<span class="panel-title">People</span>
+			{#if chip.show}
+				<span class="online-chip" class:online-chip-muted={chip.unknown} title="Hoarders online now (relay-derived; no telemetry)">{chip.label}</span>
+			{/if}
 		</div>
 		<div class="search-wrap">
 			<span class="search-icon">{@html icons.search}</span>
@@ -309,6 +349,10 @@
 	}
 
 	.panel-top {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 8px;
 		padding: 14px 14px 10px;
 		border-bottom: 1px solid var(--divider);
 	}
@@ -319,6 +363,17 @@
 		letter-spacing: 0.6px;
 		text-transform: uppercase;
 		color: var(--fg-dim);
+	}
+
+	.online-chip {
+		font-size: 11px;
+		font-weight: 600;
+		color: var(--fg-dim);
+		white-space: nowrap;
+	}
+
+	.online-chip-muted {
+		opacity: 0.55;
 	}
 
 	.search-wrap {

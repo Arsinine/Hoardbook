@@ -11,13 +11,18 @@
 //! `--pow <bits>` exercises the DISC5 NIP-13 path. Output: TAP 13 to stdout; exit 0 if all pass,
 //! 1 if any fail.
 
+use std::time::Duration;
+
 use anyhow::{bail, Result};
 
 use harness::Ctx;
 
+mod canary;
 mod harness;
 mod suite_ab;
 mod suite_browse;
+mod suite_canary;
+mod suite_count;
 mod suite_disc;
 mod suite_dm;
 mod suite_id;
@@ -44,6 +49,33 @@ async fn main() -> Result<()> {
         return Ok(()); // informational — a rejection is a finding, not a build failure
     }
 
+    // Canary mode (HANDOVER §A2.2): the live-backbone probe. With --interval it loops forever (the
+    // systemd daemon form, logging an alert on each failure); without, it runs one cycle and exits
+    // with its code (the systemd oneshot+timer form). Every event is hb-canary-tagged, so it never
+    // pollutes real counts/discovery.
+    if ctx.canary {
+        if let Some(interval) = ctx.interval {
+            eprintln!("hb-canary daemon: probing every {interval}s");
+            loop {
+                let run = canary::run_canary(&ctx.relays).await;
+                tap::print_results(&run.to_tap());
+                println!("{}", run.to_json());
+                if !run.all_passed() {
+                    eprintln!("[ALERT] hb-canary FAILED — {}", run.to_json());
+                }
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+            }
+        } else {
+            let run = canary::run_canary(&ctx.relays).await;
+            tap::print_results(&run.to_tap());
+            println!("{}", run.to_json());
+            if !run.all_passed() {
+                eprintln!("[ALERT] hb-canary FAILED — {}", run.to_json());
+            }
+            std::process::exit(run.exit_code());
+        }
+    }
+
     let mut results = Vec::new();
     eprintln!("\n-- Suite N: Nostr events (publish / fetch / replace / delete) --");
     results.extend(suite_n::run(&ctx).await);
@@ -57,6 +89,10 @@ async fn main() -> Result<()> {
     results.extend(suite_ab::run(&ctx).await);
     eprintln!("-- Suite BROWSE: M3 value loop (publish / discover / browse / re-key) --");
     results.extend(suite_browse::run(&ctx).await);
+    eprintln!("-- Suite COUNT: relay-derived count + canary exclusion (M9) --");
+    results.extend(suite_count::run(&ctx).await);
+    eprintln!("-- Suite CANARY: live-backbone probe cycle + cross-region + soak (M9) --");
+    results.extend(suite_canary::run(&ctx).await);
 
     tap::print_results(&results);
 
@@ -70,6 +106,8 @@ fn parse_args(args: &[String]) -> Result<Ctx> {
     let mut relays: Vec<String> = Vec::new();
     let mut pow: u8 = 0;
     let mut survey = false;
+    let mut canary = false;
+    let mut interval: Option<u64> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -90,8 +128,18 @@ fn parse_args(args: &[String]) -> Result<Ctx> {
                     .map_err(|_| anyhow::anyhow!("--pow must be an integer 0-255"))?;
             }
             "--survey" => survey = true,
+            "--canary" => canary = true,
+            "--interval" => {
+                i += 1;
+                interval = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--interval requires a seconds count"))?
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--interval must be a positive integer (seconds)"))?,
+                );
+            }
             other => bail!(
-                "unknown argument: {other}\nusage: hb-it --relay <ws-url> [--relay <2nd>] [--pow <bits>] [--survey]"
+                "unknown argument: {other}\nusage: hb-it --relay <ws-url> [--relay <2nd>] [--pow <bits>] [--survey] [--canary [--interval <secs>]]"
             ),
         }
         i += 1;
@@ -101,5 +149,5 @@ fn parse_args(args: &[String]) -> Result<Ctx> {
     }
     // A fresh key's hex is a convenient per-run-unique token for namespacing discovery tags.
     let run_id = hb_core::Identity::generate().public_key().to_hex()[..16].to_string();
-    Ok(Ctx { relays, pow, run_id, survey })
+    Ok(Ctx { relays, pow, run_id, survey, canary, interval })
 }
