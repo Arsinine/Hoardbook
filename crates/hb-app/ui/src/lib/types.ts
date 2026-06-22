@@ -54,6 +54,11 @@ export interface DirectoryItem {
 	children: DirectoryItem[];
 }
 
+/** Who a collection's listing is sealed to (M10). `Public` = the shared browse-key (anyone with
+ *  the share code); `Private` = per-trusted-`npub` gift-wrapped (the browse-key cannot open it).
+ *  Matches the Rust `Visibility` serde (PascalCase). */
+export type Visibility = 'Public' | 'Private';
+
 export interface Collection {
 	slug: string;
 	path_alias: string;
@@ -64,12 +69,20 @@ export interface Collection {
 	content_types: string[];
 	tags: string[];
 	languages: string[];
+	/** Public (default) or Private (M10). Absent ⇒ Public (a pre-M10 collection). */
+	visibility?: Visibility;
 	/** True when the listing is alphabetically sorted. */
 	sorted?: boolean;
 	last_updated: string;
 	listing: DirectoryItem[];
 	/** True if this collection has been signed and published to the relay. */
 	published?: boolean;
+}
+
+/** A trusted peer's decrypted Private collections, grouped by author npub (M10 browse). */
+export interface PrivatePeerCollections {
+	npub: string;
+	collections: Collection[];
 }
 
 export interface CachedPeer {
@@ -116,6 +129,9 @@ export interface ShareSettings {
 export interface Group {
 	name: string;
 	pubkeys: string[];
+	/** Marks the group trusted (M10): its members receive a sealed copy of every Private
+	 *  collection. Absent ⇒ untrusted (a pre-M10 group). */
+	trusted?: boolean;
 }
 
 export interface Watch {

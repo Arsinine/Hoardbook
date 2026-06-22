@@ -13,9 +13,11 @@ import type {
 	IdentityInfo,
 	Profile,
 	ReceivedMessage,
+	PrivatePeerCollections,
 	ScanOptions,
 	ShareSettings,
 	SubdirEntry,
+	Visibility,
 	Watch,
 	WatchHit,
 } from './types.js';
@@ -93,6 +95,14 @@ export const publishCollection = (slug: string) =>
 
 export const updateCollectionMeta = (slug: string, description: string | undefined, contentTypes: string[], tags: string[], languages: string[], sorted: boolean) =>
 	invoke<void>('update_collection_meta', { slug, description, contentTypes, tags, languages, sorted });
+
+/** Set a collection's visibility (M10). Public = browse-key; Private = per-trusted-npub sealed. */
+export const updateCollectionVisibility = (slug: string, visibility: Visibility) =>
+	invoke<void>('update_collection_visibility', { slug, visibility });
+
+/** Fetch + decrypt the Private collections trusted peers have sealed to me, grouped by author. */
+export const browsePrivateCollections = () =>
+	invoke<PrivatePeerCollections[]>('browse_private_collections');
 
 export const exportCollection = (slug: string, format: 'text' | 'markdown') =>
 	invoke<string>('export_collection', { slug, format });
@@ -195,6 +205,10 @@ export const groupsAssign   = (npub: string, groupName: string) =>
 	invoke<void>('groups_assign', { npub, groupName });
 export const groupsUnassign = (npub: string, groupName: string) =>
 	invoke<void>('groups_unassign', { npub, groupName });
+
+/** Mark a contact group trusted/untrusted for Private collections (M10). */
+export const groupsSetTrusted = (name: string, trusted: boolean) =>
+	invoke<void>('groups_set_trusted', { name, trusted });
 
 /** Atomically replace all group memberships for a contact. Pass [] for Ungrouped. */
 export const contactUpdateGroups = (npub: string, groupNames: string[]) =>

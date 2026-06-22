@@ -11,8 +11,10 @@ chrono     = { workspace = true }
 hex        = { workspace = true }
 
 # --- v0.9 Nostr core (M1). Pinned to the M0-verified surface (=0.43.1) so a silent
-#     minor bump can't break the interop suite. bech32 0.11 = the `Hrp`/encode/decode API. ---
-nostr             = { version = "=0.43.1", features = ["nip44"] }
+#     minor bump can't break the interop suite. bech32 0.11 = the `Hrp`/encode/decode API.
+#     nip44 = the symmetric listing/CEK crypto; nip59 = the NIP-17/59 seal + gift-wrap
+#     (kind 1059) the M10 private-collection seal reuses (never re-implemented). ---
+nostr             = { version = "=0.43.1", features = ["nip44", "nip59"] }
 bech32            = "0.11"
 
 # --- M5 portable backup crypto: Argon2id (KDF) → XChaCha20-Poly1305 (AEAD). `zeroize`

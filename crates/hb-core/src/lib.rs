@@ -16,13 +16,14 @@ pub mod event;
 pub mod fingerprint;
 pub mod identity;
 pub mod listing;
+pub mod priv_listing;
 pub mod sharecode;
 pub mod snapshot;
 mod tag_util;
 pub mod version;
 
 pub use error::HbError;
-pub use types::{Collection, DirectoryItem, ItemType, Profile, SocialLink};
+pub use types::{Collection, DirectoryItem, ItemType, Profile, SocialLink, Visibility};
 
 pub use backup::{
     decrypt_backup, encrypt_backup, is_encrypted_backup, BackupMode, BACKUP_FORMAT_VER,
@@ -32,7 +33,8 @@ pub use binding::{build_binding, verify_binding, Binding};
 pub use count::{count_distinct_online, count_distinct_userbase, is_canary, CANARY_MARKER};
 pub use fingerprint::{fingerprint, Fingerprint};
 pub use identity::Identity;
-pub use listing::{decrypt_listing, encrypt_listing, BrowseKey};
+pub use listing::{decrypt_listing, encrypt_listing, BrowseKey, ContentKey};
+pub use priv_listing::{open_private_listing, seal_private_listing, OpenedPrivate, KIND_PRIV_LISTING};
 pub use sharecode::ShareCode;
 pub use snapshot::{snapshot_fingerprint, unchanged_since, SnapshotFingerprint};
 pub use version::SCHEMA_V;

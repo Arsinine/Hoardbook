@@ -75,13 +75,18 @@ pub async fn publish_profile(
     Ok(())
 }
 
-/// Compute the sorted, deduplicated union of content_types across all **published** collections.
+/// Compute the sorted, deduplicated union of content_types across all **published, public**
+/// collections. **Private collections are excluded (M10, F25):** the public teaser must leak
+/// nothing about private holdings, so a private-only content-type never surfaces as a public `t`
+/// tag (and is not tag-discoverable).
 pub(crate) fn compute_content_types(store: &DataStore) -> Vec<String> {
     let mut types: Vec<String> = Vec::new();
     for slug in store.list_collection_slugs().unwrap_or_default() {
         if store.is_published(&slug) {
             if let Ok(Some(col)) = store.load_collection_draft(&slug) {
-                types.extend(col.content_types);
+                if col.visibility == hb_core::Visibility::Public {
+                    types.extend(col.content_types);
+                }
             }
         }
     }
@@ -123,7 +128,7 @@ async fn identity_clone(identity: &SharedIdentity) -> Option<hb_core::Identity> 
 mod tests {
     use super::*;
     use crate::store::DataStore;
-    use hb_core::types::Collection;
+    use hb_core::types::{Collection, Visibility};
     use tempfile::TempDir;
 
     fn test_store() -> (TempDir, DataStore) {
@@ -151,6 +156,15 @@ mod tests {
     }
 
     fn published_collection(store: &DataStore, slug: &str, ctypes: Vec<String>) {
+        published_collection_vis(store, slug, ctypes, Visibility::Public);
+    }
+
+    fn published_collection_vis(
+        store: &DataStore,
+        slug: &str,
+        ctypes: Vec<String>,
+        visibility: Visibility,
+    ) {
         let col = Collection {
             slug: slug.into(),
             path_alias: slug.into(),
@@ -160,6 +174,7 @@ mod tests {
             content_types: ctypes,
             tags: vec![],
             languages: vec![],
+            visibility,
             last_updated: chrono::Utc::now(),
             listing: vec![],
         };
@@ -188,12 +203,30 @@ mod tests {
         let unpublished = Collection {
             slug: "drafts".into(), path_alias: "drafts".into(), description: None,
             item_count: 0, est_size: None, content_types: vec!["software".into()],
-            tags: vec![], languages: vec![], last_updated: chrono::Utc::now(), listing: vec![],
+            tags: vec![], languages: vec![], visibility: Visibility::Public,
+            last_updated: chrono::Utc::now(), listing: vec![],
         };
         store.save_collection_draft(&unpublished).unwrap();
 
         let types = compute_content_types(&store);
         assert_eq!(types, vec!["audio", "text", "video"], "sorted+deduped union of published only");
         assert!(!types.contains(&"software".to_string()));
+    }
+
+    #[test]
+    fn teaser_aggregation_excludes_private_collections() {
+        // M10/F25: a content-type that exists ONLY in a private collection must never surface in
+        // the public teaser aggregation (it would otherwise leak a private holding + become
+        // tag-discoverable). A published *private* collection contributes nothing.
+        let (_dir, store) = test_store();
+        published_collection(&store, "public-films", vec!["video".into()]);
+        published_collection_vis(&store, "secret-stash", vec!["forbidden".into()], Visibility::Private);
+
+        let types = compute_content_types(&store);
+        assert_eq!(types, vec!["video"], "only the public collection's type appears");
+        assert!(
+            !types.contains(&"forbidden".to_string()),
+            "a private-only content-type must NOT leak into the public teaser"
+        );
     }
 }

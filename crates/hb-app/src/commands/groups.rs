@@ -17,7 +17,7 @@ pub async fn groups_create(name: String, store: State<'_, DataStore>) -> CmdResu
     if groups.iter().any(|g| g.name == name) {
         return Err(format!("Group '{name}' already exists"));
     }
-    let group = Group { name, pubkeys: vec![], modified_at: Utc::now() };
+    let group = Group { name, pubkeys: vec![], modified_at: Utc::now(), trusted: false };
     groups.push(group.clone());
     store.save_groups(&groups).map_err(cmd_err)?;
     Ok(group)
@@ -80,6 +80,26 @@ pub async fn groups_unassign(
     if group.pubkeys.len() != before {
         group.modified_at = Utc::now();
     }
+    store.save_groups(&groups).map_err(cmd_err)
+}
+
+/// Mark a contact group **trusted** (or not) for Private collections (M10). A trusted group's
+/// members each receive a per-recipient sealed copy of every Private collection on the next
+/// publish; un-trusting a group revokes them on the *next* republish (it cannot recall an
+/// already-fetched copy — the honest "not DRM" caveat, surfaced in the UI). Local-only.
+#[tauri::command]
+pub async fn groups_set_trusted(
+    name: String,
+    trusted: bool,
+    store: State<'_, DataStore>,
+) -> CmdResult<()> {
+    let mut groups = store.load_groups().map_err(cmd_err)?;
+    let group = groups
+        .iter_mut()
+        .find(|g| g.name == name)
+        .ok_or_else(|| format!("Group '{name}' not found"))?;
+    group.trusted = trusted;
+    group.modified_at = Utc::now();
     store.save_groups(&groups).map_err(cmd_err)
 }
 
@@ -163,8 +183,8 @@ mod tests {
 
         store
             .save_groups(&[
-                Group { name: "A".into(), pubkeys: vec![npub.clone()], modified_at: now },
-                Group { name: "B".into(), pubkeys: vec![npub.clone()], modified_at: now },
+                Group { name: "A".into(), pubkeys: vec![npub.clone()], modified_at: now, trusted: false },
+                Group { name: "B".into(), pubkeys: vec![npub.clone()], modified_at: now, trusted: false },
             ])
             .unwrap();
 
@@ -187,6 +207,7 @@ mod tests {
                 name: "MyGroup".into(),
                 pubkeys: vec![npub.clone()],
                 modified_at: chrono::Utc::now(),
+                trusted: false,
             }])
             .unwrap();
 
@@ -225,6 +246,7 @@ mod tests {
             name: "Friends".into(),
             pubkeys: vec!["hb1_abc".into()],
             modified_at: chrono::Utc::now(),
+            trusted: false,
         };
         let json = serde_json::to_string(&group).unwrap();
         assert!(!json.contains("relay"), "group JSON must not contain 'relay'");
@@ -257,9 +279,9 @@ mod tests {
 
         store
             .save_groups(&[
-                Group { name: "A".into(), pubkeys: vec![npub.clone()], modified_at: now },
-                Group { name: "B".into(), pubkeys: vec![], modified_at: now },
-                Group { name: "C".into(), pubkeys: vec![npub.clone()], modified_at: now },
+                Group { name: "A".into(), pubkeys: vec![npub.clone()], modified_at: now, trusted: false },
+                Group { name: "B".into(), pubkeys: vec![], modified_at: now, trusted: false },
+                Group { name: "C".into(), pubkeys: vec![npub.clone()], modified_at: now, trusted: false },
             ])
             .unwrap();
 
@@ -285,6 +307,31 @@ mod tests {
         assert!(!in_c, "C must no longer contain the peer");
     }
 
+    /// M10: the `trusted` flag defaults to false for a pre-M10 group and round-trips through the
+    /// store. Trust must never be silently granted on upgrade (it routes Private collections).
+    #[test]
+    fn group_trusted_flag_defaults_false_and_round_trips() {
+        let (_dir, store) = make_store();
+        let now = chrono::Utc::now();
+        // A groups.json written before M10 has no `trusted` field → must load as untrusted.
+        let legacy = r#"[{"name":"old","pubkeys":[],"modified_at":"2026-04-01T00:00:00Z"}]"#;
+        std::fs::write(store.groups_path(), legacy).unwrap();
+        let loaded = store.load_groups().unwrap();
+        assert!(!loaded[0].trusted, "a pre-M10 group must load as untrusted (false)");
+
+        // Marking trusted persists.
+        store
+            .save_groups(&[Group {
+                name: "vault".into(),
+                pubkeys: vec!["npubx".into()],
+                modified_at: now,
+                trusted: true,
+            }])
+            .unwrap();
+        let back = store.load_groups().unwrap();
+        assert!(back.iter().find(|g| g.name == "vault").unwrap().trusted, "trusted must persist");
+    }
+
     /// Groups are returned most-recently-modified first.
     #[test]
     fn groups_ordered_by_modified_at_desc() {
@@ -295,9 +342,9 @@ mod tests {
 
         store
             .save_groups(&[
-                Group { name: "old".into(), pubkeys: vec![], modified_at: t1 },
-                Group { name: "recent".into(), pubkeys: vec![], modified_at: t3 },
-                Group { name: "middle".into(), pubkeys: vec![], modified_at: t2 },
+                Group { name: "old".into(), pubkeys: vec![], modified_at: t1, trusted: false },
+                Group { name: "recent".into(), pubkeys: vec![], modified_at: t3, trusted: false },
+                Group { name: "middle".into(), pubkeys: vec![], modified_at: t2, trusted: false },
             ])
             .unwrap();
 
