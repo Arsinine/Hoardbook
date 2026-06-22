@@ -1,0 +1,9 @@
+{
+  "_comment": "M9 Track L (L4) frontend perf budgets. Ceilings for the recursive-tree workload the heavy components share, over M9's 2000-node fixture. SEEDED GENEROUSLY (observed baseline ~5-11ms scriptMs / ~1.4-2.5ms longTaskMs on CI-class hardware) so noise never trips the gate; tighten on a clean run (launch calibration, like the online freshness window). nodeCount is deterministic and matched exactly. The `profiling` CI job fails when a metric exceeds its ceiling x tolerance.",
+  "tolerance": 1.0,
+  "targets": {
+    "DirItem":         { "scriptMs": 200, "longTaskMs": 60, "heapKb": 60000, "nodeCount": 2000 },
+    "CollectionPanel": { "scriptMs": 200, "longTaskMs": 60, "heapKb": 60000, "nodeCount": 2000 },
+    "ScanTreeNode":    { "scriptMs": 200, "longTaskMs": 60, "heapKb": 60000, "nodeCount": 2000 }
+  }
+}

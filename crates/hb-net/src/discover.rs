@@ -50,6 +50,9 @@ pub fn ingest_teasers(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut hits: Vec<SearchHit> = Vec::new();
     for ev in events {
+        if hb_core::is_canary(&ev) {
+            continue; // F-canary: the VPS canary's synthetic teasers never surface in discovery
+        }
         if ev.content.len() > MAX_TEASER_BYTES {
             continue; // AB3: oversize body bounded before any parse
         }
@@ -164,6 +167,22 @@ mod tests {
         let hits = ingest_teasers(vec![tampered, good.clone()], &["anime".into()], &[], 100);
         assert_eq!(hits.len(), 1, "only the validly-signed teaser survives");
         assert_eq!(hits[0].npub, good.pubkey.to_bech32().unwrap());
+    }
+
+    #[test]
+    fn canary_marked_teaser_excluded_from_discovery() {
+        // F-canary: a validly-signed teaser carrying the hb-canary marker must NOT surface in a tag
+        // search — the canary's synthetic traffic stays out of discovery (parity with the counts).
+        let real = Identity::generate();
+        let canary = Identity::generate();
+        let real_ev = ev(&real, &teaser_with(&["anime"], &["video"]));
+        // The canary teaser carries hb-canary as a tag → a `t`=hb-canary marker.
+        let mut canary_teaser = teaser_with(&["anime"], &["video"]);
+        canary_teaser.tags.push(hb_core::CANARY_MARKER.to_string());
+        let canary_ev = ev(&canary, &canary_teaser);
+        let hits = ingest_teasers(vec![canary_ev, real_ev.clone()], &["anime".into()], &[], 100);
+        assert_eq!(hits.len(), 1, "only the real teaser surfaces");
+        assert_eq!(hits[0].npub, real_ev.pubkey.to_bech32().unwrap(), "the canary teaser is excluded");
     }
 
     #[test]

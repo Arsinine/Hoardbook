@@ -3,6 +3,7 @@ pub mod chat;
 pub mod collection;
 pub mod groups;
 pub mod identity;
+pub mod online;
 pub mod profile;
 pub mod settings;
 pub mod sharing;

@@ -46,6 +46,13 @@ sha2    = "0.10"
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
 globset = "0.4"
+# M9 snapshot auto-update: cross-platform filesystem watcher (inotify / FSEvents /
+# ReadDirectoryChangesW). Kept behind a thin wrapper (`spawn_fs_watcher`) so the OS watcher is never
+# in a unit test — the pure `watch_plan` is fake-clock tested. `async-trait` gives the injectable
+# `PublishSink` seam the watch loop publishes through, so the loop is testable with a fake sink (no
+# RelayClient).
+notify      = "6"
+async-trait = "0.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 hb-dpapi = { path = "../hb-dpapi" }

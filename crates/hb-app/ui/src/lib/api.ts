@@ -106,6 +106,12 @@ export interface Settings {
 	privacy_notice_acknowledged: boolean;
 	/** App version last seen running — drives the visible-after "now on vX.Y" notice. */
 	last_seen_version: string;
+	/** M9: auto-update a published listing when its source tree changes (filesystem-watch). */
+	snapshot_auto_update: boolean;
+	/** M9: opt-in low-frequency reconcile poll for shares edited from another host (SMB). */
+	snapshot_reconcile_poll: boolean;
+	/** M9: show the optional "🟢 N online" indicator (relay-derived; no telemetry). */
+	show_online_count: boolean;
 }
 
 export const getSettings = () => invoke<Settings>('get_settings');
@@ -116,6 +122,21 @@ export const checkRelay = (url: string) => invoke<void>('check_relay', { url });
 
 /** Record that the one-time pre-first-download IP-exposure notice was acknowledged. */
 export const acknowledgePrivacyNotice = () => invoke<void>('acknowledge_privacy_notice');
+
+// ── Network stats (M9 — relay-derived count, no telemetry) ──────────────────────
+
+/**
+ * The "🟢 N online" chip's data. `online` is `null` when the count is unknown (no cache yet and no
+ * reachable relay) — render "–" / hide, never a misleading "0". An estimate per relay-set.
+ */
+export interface OnlineCount {
+	online: number | null;
+	fetched_at: string | null;
+	relay_set: string[];
+}
+
+/** Best-effort, cached online count (relay-derived). Returns immediately; refreshes in the background. */
+export const onlineCount = () => invoke<OnlineCount>('online_count');
 
 // ── Browse / Contacts ─────────────────────────────────────────────────────────
 

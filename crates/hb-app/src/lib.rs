@@ -9,7 +9,9 @@ mod presence;
 mod single_instance;
 mod store;
 mod update_logic;
+mod watch;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use store::DataStore;
 use tauri::{
@@ -25,6 +27,12 @@ pub use identity_state::{AppIdentity, SharedIdentity};
 /// Managed state types — Arc-wrapped so they can be cloned into background tasks.
 /// Sender half of the presence-loop cancel channel. Send `true` to stop the task.
 pub type SharedCancelPresence = Arc<tokio::sync::watch::Sender<bool>>;
+/// Sender half of the snapshot-watch-loop cancel channel.
+pub type SharedCancelWatch = Arc<tokio::sync::watch::Sender<bool>>;
+
+/// Keeps the OS filesystem watcher alive for the process lifetime (dropping it stops watching).
+/// Managed as state purely so it isn't dropped at the end of `setup`.
+struct WatcherHandle(#[allow(dead_code)] std::sync::Mutex<notify::RecommendedWatcher>);
 
 // ---------------------------------------------------------------------------
 // Setup helpers — each owns one concern from the setup closure
@@ -97,10 +105,12 @@ fn spawn_background_tasks(
     store: DataStore,
     app: tauri::AppHandle,
 ) {
+    // The wakeup counter is the L4 idle-guard hook; in prod it is written-and-ignored.
     tauri::async_runtime::spawn(presence::run_presence_loop(
         identity,
         store,
         presence_cancel_rx,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
     ));
 
     tauri::async_runtime::spawn(async move {
@@ -117,6 +127,65 @@ fn spawn_background_tasks(
             Err(e) => tracing::debug!("Updater not configured: {e}"),
         }
     });
+}
+
+/// Spawn the snapshot-watch task (M9): the bounded launch reconcile + the debounced fs-watch that
+/// re-publishes a changed listing. Returns the OS watcher to keep alive. Respects
+/// `snapshot_auto_update`: off ⇒ manual-only (no watcher, no launch reconcile) — the pre-M9
+/// behaviour. The setting is read at startup; a runtime toggle takes effect on the next launch.
+fn spawn_watch_task(
+    store: DataStore,
+    identity: SharedIdentity,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    app: tauri::AppHandle,
+) -> Option<notify::RecommendedWatcher> {
+    let auto = store
+        .load_settings()
+        .ok()
+        .flatten()
+        .map(|s| s.snapshot_auto_update)
+        .unwrap_or(true);
+    if !auto {
+        tracing::info!("snapshot auto-update is off — watch loop not started (manual-only)");
+        return None;
+    }
+
+    let watched = watch::watched_from_store(&store);
+    let roots: Vec<PathBuf> = watched.iter().map(|w| w.root.clone()).collect();
+    let cfg = watch::WatchCfg { watched, ..Default::default() };
+
+    // The OS watcher feeds fs events into the loop; kept alive by the caller (managed state).
+    let (fs_tx, fs_rx) = tokio::sync::mpsc::channel(256);
+    let watcher = match watch::spawn_fs_watcher(&roots, fs_tx) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            tracing::warn!("could not start filesystem watcher: {e}");
+            None
+        }
+    };
+
+    // Forward launch-reconcile progress to the UI as a Tauri event ("Checking snapshots… N of M").
+    let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<watch::SnapshotProgress>();
+    let app_for_prog = app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(p) = prog_rx.recv().await {
+            let _ = app_for_prog
+                .emit("snapshot-progress", serde_json::json!({ "checked": p.checked, "total": p.total }));
+        }
+    });
+
+    let sink = Arc::new(watch::RelayPublishSink { store: store.clone(), identity });
+    tauri::async_runtime::spawn(watch::run_watch_loop(
+        store,
+        cfg,
+        sink,
+        fs_rx,
+        cancel_rx,
+        watch::WATCH_TICK,
+        Some(prog_tx),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    ));
+    watcher
 }
 
 // ---------------------------------------------------------------------------
@@ -162,14 +231,20 @@ pub fn run() {
 
             let identity: SharedIdentity = Arc::new(RwLock::new(None));
             let staged_update: commands::update::SharedStagedUpdate = Arc::default();
+            let online_cache: commands::online::SharedOnlineCache = Arc::default();
 
             let (presence_cancel_tx, presence_cancel_rx) = tokio::sync::watch::channel(false);
             let presence_cancel: SharedCancelPresence = Arc::new(presence_cancel_tx);
 
+            let (watch_cancel_tx, watch_cancel_rx) = tokio::sync::watch::channel(false);
+            let watch_cancel: SharedCancelWatch = Arc::new(watch_cancel_tx);
+
             app.manage(store.clone());
             app.manage(Arc::clone(&identity));
             app.manage(Arc::clone(&presence_cancel));
+            app.manage(Arc::clone(&watch_cancel));
             app.manage(Arc::clone(&staged_update));
+            app.manage(Arc::clone(&online_cache));
 
             build_system_tray(app)?;
 
@@ -180,9 +255,16 @@ pub fn run() {
             spawn_background_tasks(
                 Arc::clone(&identity),
                 presence_cancel_rx,
-                store,
-                app_handle,
+                store.clone(),
+                app_handle.clone(),
             );
+
+            // M9: the snapshot-watch sibling task (single watcher per app — single-instance, M8).
+            if let Some(watcher) =
+                spawn_watch_task(store, Arc::clone(&identity), watch_cancel_rx, app_handle)
+            {
+                app.manage(WatcherHandle(std::sync::Mutex::new(watcher)));
+            }
 
             Ok(())
         })
@@ -225,6 +307,7 @@ pub fn run() {
             commands::settings::save_settings,
             commands::settings::check_relay,
             commands::settings::acknowledge_privacy_notice,
+            commands::online::online_count,
             commands::chat::send_message,
             commands::chat::get_messages,
             commands::sharing::get_share_settings,
