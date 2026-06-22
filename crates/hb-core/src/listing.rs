@@ -20,7 +20,15 @@ use crate::version::{check_crypto, CRYPTO_V};
 /// A 32-byte symmetric browse-key.
 pub type BrowseKey = [u8; 32];
 
+/// A 32-byte random **content-encryption key** (CEK). A private listing's body is sealed once
+/// under a fresh CEK (spec §Private Collections; M10 Decision A), and that CEK is then wrapped to
+/// each trusted `npub`. Distinct type-alias from [`BrowseKey`] for readability — the two derive
+/// **domain-separated** NIP-44 keys (different HKDF salt + info), so the browse-key can never open
+/// a CEK-sealed body even if the byte values coincided.
+pub type ContentKey = [u8; 32];
+
 const HKDF_SALT: &[u8] = b"hoardbook/browse-key";
+const HKDF_SALT_CEK: &[u8] = b"hoardbook/cek";
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 /// Derive the NIP-44 conversation key from the browse-key for a given crypto version.
@@ -44,6 +52,50 @@ pub fn encrypt_listing(browse_key: &BrowseKey, listing_json: &str) -> Result<Str
     let bytes =
         encrypt_to_bytes(&ck, listing_json.as_bytes()).map_err(|e| HbError::Nostr(e.to_string()))?;
     Ok(B64.encode(bytes))
+}
+
+/// Derive the NIP-44 conversation key from a **content-encryption key** for a given crypto
+/// version. Same labelled-HKDF construction as [`conversation_key`] (RFC 5869 domain separation),
+/// but with a **distinct salt** (`hoardbook/cek`) and `info` (`hoardbook/cek/v…`), so a CEK and a
+/// browse-key with identical bytes still derive *different* keys — the browse-key path can never
+/// open a CEK-sealed body (M10 Decision A', the headline negative).
+fn cek_conversation_key(cek: &ContentKey, crypto_v: u8) -> ConversationKey {
+    let mut info = b"hoardbook/cek/v".to_vec();
+    info.push(crypto_v);
+    let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT_CEK), cek);
+    let mut ck = [0u8; 32];
+    hk.expand(&info, &mut ck)
+        .expect("32 is a valid HKDF-SHA256 output length");
+    ConversationKey::new(ck)
+}
+
+/// Encrypt a private-listing **body** under a content-encryption key at the current crypto
+/// version (M10). The CEK is a raw 32-byte symmetric key, so this is the same HKDF→NIP-44-v2
+/// **symmetric** primitive the browse-key path ships — *not* a raw `NIP-44_encrypt(CEK,…)` call
+/// (NIP-44's public API is ECDH-keyed; a CEK is not a secp256k1 private key). The caller records
+/// [`CRYPTO_V`] in the wrap + the inner event's signed `hb-cv` tag.
+pub fn encrypt_with_cek(cek: &ContentKey, plaintext: &str) -> Result<String, HbError> {
+    let ck = cek_conversation_key(cek, CRYPTO_V);
+    let bytes =
+        encrypt_to_bytes(&ck, plaintext.as_bytes()).map_err(|e| HbError::Nostr(e.to_string()))?;
+    Ok(B64.encode(bytes))
+}
+
+/// Decrypt a private-listing body. `crypto_v` is the version carried in the (recipient-decrypted)
+/// CEK wrap + the inner event tag; an unknown version is refused before any decryption is
+/// attempted (the same forward-compat contract `decrypt_listing` upholds).
+pub fn decrypt_with_cek(
+    cek: &ContentKey,
+    crypto_v: u8,
+    content_b64: &str,
+) -> Result<String, HbError> {
+    check_crypto(crypto_v)?;
+    let ck = cek_conversation_key(cek, crypto_v);
+    let bytes = B64
+        .decode(content_b64.as_bytes())
+        .map_err(|_| HbError::InvalidEncryptedMessage)?;
+    let plain = decrypt_to_bytes(&ck, &bytes).map_err(|_| HbError::DecryptionFailed)?;
+    String::from_utf8(plain).map_err(|_| HbError::DecryptionFailed)
 }
 
 /// Decrypt a listing. `crypto_v` is the version read from the listing event's signed tag; an
@@ -119,6 +171,51 @@ mod tests {
             decrypt_listing(&bk, CRYPTO_V + 1, &ct),
             Err(HbError::UnsupportedVersion(v)) if v == CRYPTO_V + 1
         ));
+    }
+
+    #[test]
+    fn cek_body_roundtrips() {
+        let cek: ContentKey = rand::random();
+        let ct = encrypt_with_cek(&cek, LISTING).unwrap();
+        assert_eq!(decrypt_with_cek(&cek, CRYPTO_V, &ct).unwrap(), LISTING);
+    }
+
+    #[test]
+    fn cek_wrong_key_fails_cleanly() {
+        let a: ContentKey = rand::random();
+        let b: ContentKey = rand::random();
+        let ct = encrypt_with_cek(&a, LISTING).unwrap();
+        assert!(matches!(decrypt_with_cek(&b, CRYPTO_V, &ct), Err(HbError::DecryptionFailed)));
+    }
+
+    #[test]
+    fn cek_unknown_version_is_recognised_not_misdecrypted() {
+        let cek: ContentKey = rand::random();
+        let ct = encrypt_with_cek(&cek, LISTING).unwrap();
+        assert!(matches!(
+            decrypt_with_cek(&cek, CRYPTO_V + 1, &ct),
+            Err(HbError::UnsupportedVersion(v)) if v == CRYPTO_V + 1
+        ));
+    }
+
+    #[test]
+    fn cek_and_browse_key_are_domain_separated() {
+        // THE HEADLINE NEGATIVE (helper level): even if a CEK and a browse-key held the *same 32
+        // bytes*, the CEK-keyed body cannot be opened by the browse-key path — the HKDF salt/info
+        // differ, so the derived conversation keys differ. A browse-key can NEVER read a private
+        // body. (The wire-level version of this lives in priv_listing's `open` negatives.)
+        let shared: [u8; 32] = rand::random();
+        let body = encrypt_with_cek(&shared, LISTING).unwrap();
+        // Same bytes, but interpreted as a browse-key → must NOT decrypt the CEK-sealed body.
+        assert!(
+            decrypt_listing(&shared, CRYPTO_V, &body).is_err(),
+            "a browse-key must not open a body sealed under the same bytes as a CEK"
+        );
+        // And the conversation keys are concretely different.
+        let cek_ck = cek_conversation_key(&shared, CRYPTO_V);
+        let bk_ck = conversation_key(&shared, CRYPTO_V);
+        let probe = encrypt_to_bytes(&cek_ck, b"x").unwrap();
+        assert!(decrypt_to_bytes(&bk_ck, &probe).is_err(), "CEK vs browse-key keys must diverge");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::path::Path;
 use globset::{Glob, GlobSetBuilder};
-use hb_core::types::{Collection, DirectoryItem, ItemType};
+use hb_core::types::{Collection, DirectoryItem, ItemType, Visibility};
 use hb_core::{BrowseKey, Identity};
 use hb_net::publish_listing;
 use serde::{Deserialize, Serialize};
@@ -140,14 +140,21 @@ async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult
         content_types: vec![],
         tags: vec![],
         languages: vec![],
+        // A freshly-scanned collection is Public by default; the user opts a collection into
+        // Private explicitly via the visibility selector (M10). A rescan preserves the prior
+        // visibility below (alongside notes).
+        visibility: Visibility::Public,
         last_updated: chrono::Utc::now(),
         listing,
     };
 
-    // Preserve per-item notes from the existing draft (rescan scenario).
+    // Preserve per-item notes AND the prior visibility from the existing draft (rescan scenario) —
+    // a rescan must never silently flip a Private collection back to Public (that would re-publish
+    // privately-marked data on the public path next publish).
     if let Ok(Some(prev)) = store.load_collection_draft(&collection.slug) {
         let notes = collect_notes(&prev.listing, "");
         collection.listing = apply_notes(collection.listing, &notes, "");
+        collection.visibility = prev.visibility;
     }
 
     store.save_collection_draft(&collection).map_err(cmd_err)?;
@@ -287,9 +294,47 @@ pub(crate) fn prepare_listing(slug: &str, store: &DataStore) -> Result<String, S
     collection_to_listing_json(&collection)
 }
 
-/// Publish a collection's listing (encrypted under the account browse-key) via `hb-net`, mark it
-/// published locally, and republish the teaser if a profile is published (so its content_types
-/// stay current).
+/// Current unix time in seconds (the seal/publish timestamp). A clock before 1970 reads as 0.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Collect the recipient pubkeys a **Private** collection must be sealed to: every `npub` in a
+/// group marked `trusted`, parsed + deduped. Errs if there is no trusted audience (publishing a
+/// Private collection to nobody is a mistake, not a silent no-op). An unparseable id (e.g. a legacy
+/// non-Nostr contact) is skipped. Pure — unit-tested without a relay.
+pub(crate) fn private_recipients(store: &DataStore) -> Result<Vec<nostr::PublicKey>, String> {
+    use std::collections::BTreeSet;
+    let groups = store.load_groups().map_err(cmd_err)?;
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out: Vec<nostr::PublicKey> = Vec::new();
+    for g in groups.iter().filter(|g| g.trusted) {
+        for npub in &g.pubkeys {
+            if seen.insert(npub.clone()) {
+                if let Ok(pk) = hb_core::identity::parse_npub(npub) {
+                    out.push(pk);
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(
+            "This collection is Private, but you have no trusted contacts. Mark a contact group as \
+             trusted (and add members) before publishing a Private collection."
+                .into(),
+        );
+    }
+    Ok(out)
+}
+
+/// Publish a collection's listing. **Branches on visibility (M10):** a *Public* collection is
+/// encrypted once under the account browse-key (M3); a *Private* collection is sealed per trusted
+/// `npub` and gift-wrapped — the browse-key is **not** used and the public teaser is **not** touched
+/// (no private holding leaks). Marks it published locally and (public only) keeps a published
+/// teaser's content_types current.
 pub(crate) async fn publish_collection_inner(
     slug: &str,
     store: &DataStore,
@@ -297,6 +342,17 @@ pub(crate) async fn publish_collection_inner(
     browse_key: &BrowseKey,
 ) -> Result<(), String> {
     let listing_json = prepare_listing(slug, store)?;
+
+    // Visibility gate: a Private collection takes the sealed, per-recipient path and never touches
+    // the browse-key or the public teaser.
+    let visibility = store
+        .load_collection_draft(slug)
+        .map_err(cmd_err)?
+        .map(|c| c.visibility)
+        .unwrap_or(Visibility::Public);
+    if visibility == Visibility::Private {
+        return publish_private_collection_inner(slug, store, identity, &listing_json).await;
+    }
 
     let client = net::connect(identity, store).await.map_err(cmd_err)?;
     let published =
@@ -340,6 +396,36 @@ pub(crate) async fn publish_collection_inner(
     Ok(())
 }
 
+/// Seal + publish a Private collection (M10): one gift-wrapped (1059) event per trusted `npub`,
+/// multi-published to all relays. The browse-key is unused; the public teaser is untouched.
+async fn publish_private_collection_inner(
+    slug: &str,
+    store: &DataStore,
+    identity: &Identity,
+    listing_json: &str,
+) -> Result<(), String> {
+    let recipients = private_recipients(store)?;
+    let events = hb_core::seal_private_listing(identity, &recipients, listing_json, now_secs())
+        .map_err(cmd_err)?;
+
+    let client = net::connect(identity, store).await.map_err(cmd_err)?;
+    let res = hb_net::publish_private_listing(&client, &events).await;
+    client.disconnect().await;
+    res.map_err(cmd_err)?;
+
+    // Local published marker — records the *private* tier + the recipient count (the N× multiplier
+    // INV-8 calls out), distinct from the public path's `parts`.
+    let marker = serde_json::json!({ "private": true, "recipients": recipients.len() }).to_string();
+    store.save_published(slug, &marker).map_err(cmd_err)?;
+
+    // M9 storm-guard fingerprint, same as the public path.
+    if let Ok(Some(col)) = store.load_collection_draft(slug) {
+        let fp = hb_core::snapshot_fingerprint(&col.listing);
+        let _ = store.save_snapshot_fingerprint(slug, &fp);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn publish_collection(
     slug: String,
@@ -352,6 +438,25 @@ pub async fn publish_collection(
         (id.identity.clone(), id.browse_key)
     };
     publish_collection_inner(&slug, &store, &id_clone, &browse_key).await
+}
+
+/// Set a collection's visibility (Public / Private). The selector default is Public; a collection
+/// becomes Private only by explicit choice (M10). The next publish honours the new visibility.
+#[tauri::command]
+pub async fn update_collection_visibility(
+    slug: String,
+    visibility: Visibility,
+    store: State<'_, DataStore>,
+) -> CmdResult<()> {
+    let safe_slug = is_valid_slug(&slug)
+        .then_some(slug.as_str())
+        .ok_or("Invalid collection slug")?;
+    let mut col = store
+        .load_collection_draft(safe_slug)
+        .map_err(cmd_err)?
+        .ok_or_else(|| format!("No draft found for collection '{safe_slug}'"))?;
+    col.visibility = visibility;
+    store.save_collection_draft(&col).map_err(cmd_err)
 }
 
 /// Export a collection's listing as plain text or markdown checklist.
@@ -1171,6 +1276,7 @@ mod tests {
             content_types,
             tags: vec![],
             languages: vec![],
+            visibility: Visibility::Public,
             last_updated: chrono::Utc::now(),
             listing: vec![],
         };
@@ -1190,6 +1296,7 @@ mod tests {
             content_types: vec!["video".into()],
             tags: vec![],
             languages: vec![],
+            visibility: Visibility::Public,
             last_updated: chrono::Utc::now(),
             listing: vec![DirectoryItem {
                 name: "Ran (1985)".into(),
@@ -1236,6 +1343,76 @@ mod tests {
         assert!(!store.is_published("films"));
         store.save_published("films", "{}").unwrap();
         assert!(store.is_published("films"), "marker presence => published");
+    }
+
+    // ── M10: visibility + private-recipient gathering ────────────────────────────────
+
+    #[test]
+    fn collection_draft_defaults_public_and_flips_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        make_collection_draft(&store, "vault", vec!["video".into()]);
+        assert_eq!(
+            store.load_collection_draft("vault").unwrap().unwrap().visibility,
+            Visibility::Public,
+            "a fresh draft is Public"
+        );
+        // Mirror update_collection_visibility's core (load → set → save).
+        let mut col = store.load_collection_draft("vault").unwrap().unwrap();
+        col.visibility = Visibility::Private;
+        store.save_collection_draft(&col).unwrap();
+        assert_eq!(
+            store.load_collection_draft("vault").unwrap().unwrap().visibility,
+            Visibility::Private,
+            "visibility change persists through the store"
+        );
+    }
+
+    #[test]
+    fn private_recipients_requires_an_explicit_trusted_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        // No groups → Err (a Private collection with no audience is a mistake).
+        assert!(private_recipients(&store).is_err());
+        // An UN-trusted group with members is still not an audience — trust is explicit.
+        let a = hb_core::Identity::generate().npub();
+        store
+            .save_groups(&[crate::store::Group {
+                name: "friends".into(),
+                pubkeys: vec![a],
+                modified_at: chrono::Utc::now(),
+                trusted: false,
+            }])
+            .unwrap();
+        assert!(private_recipients(&store).is_err(), "an untrusted group is not a recipient set");
+    }
+
+    #[test]
+    fn private_recipients_collects_trusted_deduped_skips_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let a = hb_core::Identity::generate();
+        let b = hb_core::Identity::generate();
+        store
+            .save_groups(&[
+                crate::store::Group {
+                    name: "inner".into(),
+                    // a, b, and a legacy non-Nostr id that must be skipped (not crash).
+                    pubkeys: vec![a.npub(), b.npub(), "hb1_legacy_junk".into()],
+                    modified_at: chrono::Utc::now(),
+                    trusted: true,
+                },
+                crate::store::Group {
+                    name: "also".into(),
+                    pubkeys: vec![a.npub()], // duplicate of `a` across groups → collapsed
+                    modified_at: chrono::Utc::now(),
+                    trusted: true,
+                },
+            ])
+            .unwrap();
+        let recips = private_recipients(&store).unwrap();
+        assert_eq!(recips.len(), 2, "two distinct valid npubs (junk skipped, dup collapsed)");
+        assert!(recips.contains(&a.public_key()) && recips.contains(&b.public_key()));
     }
 
     #[test]

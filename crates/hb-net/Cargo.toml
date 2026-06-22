@@ -18,6 +18,8 @@ nostr-sdk  = { workspace = true }
 nostr      = { version = "=0.43.1", features = ["nip44", "nip59"] }
 serde_json = { workspace = true }
 thiserror  = { workspace = true }
+# Bounded, deterministic dedup-key fallback for a slug-less private listing (M10 chorus fix).
+sha2       = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true }

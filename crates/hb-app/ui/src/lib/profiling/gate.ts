@@ -4,6 +4,9 @@
 // calibration, like the count freshness window).
 
 import type { ProfileReport, TargetMetrics } from './profile';
+// Re-export so `gate`'s consumers (profile.test.ts) can import the type from this module too —
+// pre-existing M9 gap surfaced by the stricter type-check; one-line fix, no behaviour change.
+export type { ProfileReport } from './profile';
 
 /** A per-target ceiling for each budgeted metric. Omit a metric to leave it unbudgeted. */
 export interface TargetBudget {

@@ -1,5 +1,7 @@
 <script lang="ts">
-	import { saveProfile, publishProfile, publishCollection, deleteCollection, updateCollectionMeta, exportCollection, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec } from '$lib/api.js';
+	import { saveProfile, publishProfile, publishCollection, deleteCollection, updateCollectionMeta, updateCollectionVisibility, exportCollection, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec } from '$lib/api.js';
+	import VisibilitySelector from '$lib/components/VisibilitySelector.svelte';
+	import { visibilityOf } from '$lib/private-collections-view.js';
 	import { passphraseStrength } from '$lib/backup-export.js';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { profile, collections, identity, toast, appReady, homeDraft, identityLoadError } from '$lib/stores.js';
@@ -9,7 +11,7 @@
 	import ScanDialog from '$lib/components/ScanDialog.svelte';
 	import ShareSettingsDialog from '$lib/components/ShareSettingsDialog.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
-	import type { Collection, Profile } from '$lib/types.js';
+	import type { Collection, Profile, Visibility } from '$lib/types.js';
 
 	// Each language is shown in its own language (autonym).
 	const LANGUAGES = [
@@ -293,11 +295,22 @@
 	let colLangInputs: Record<string, string> = {};
 	let colNotes: Record<string, string> = {};
 	let colSorted: Record<string, boolean> = {};
+	let colVisibility: Record<string, Visibility> = {};
 	$: $collections.forEach(c => {
 		if (!(c.slug in colLangInputs)) colLangInputs[c.slug] = '';
 		if (!(c.slug in colNotes)) colNotes[c.slug] = c.description ?? '';
 		if (!(c.slug in colSorted)) colSorted[c.slug] = c.sorted ?? false;
+		if (!(c.slug in colVisibility)) colVisibility[c.slug] = visibilityOf(c);
 	});
+
+	// M10: switch a collection between Public (browse-key) and Private (per-trusted-npub sealed).
+	async function setColVisibility(slug: string, visibility: Visibility) {
+		colVisibility[slug] = visibility;
+		try {
+			await updateCollectionVisibility(slug, visibility);
+			collections.update(cols => cols.map(c => c.slug === slug ? { ...c, visibility } : c));
+		} catch (e) { toast(String(e), 'error'); }
+	}
 
 	async function saveColMeta(col: Collection) {
 		const slug = col.slug;
@@ -784,6 +797,13 @@
 									}}
 								/>
 							</div>
+							<!-- Visibility (Public / Private) — M10 -->
+							<div class="coll-visibility-row">
+								<VisibilitySelector
+									visibility={colVisibility[col.slug] ?? 'Public'}
+									on:change={(e) => setColVisibility(col.slug, e.detail)}
+								/>
+							</div>
 							<!-- Notes + sorted -->
 							<div class="coll-notes-row">
 								<textarea
@@ -1179,6 +1199,11 @@
 		padding: 0 7px;
 		font-size: 11px;
 		min-width: 80px;
+	}
+
+	.coll-visibility-row {
+		padding: 6px 10px;
+		border-top: 1px solid var(--divider);
 	}
 
 	.coll-notes-row {
