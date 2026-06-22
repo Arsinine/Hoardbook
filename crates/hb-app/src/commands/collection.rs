@@ -160,7 +160,52 @@ async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult
     share.root_path = Some(opts.path.clone());
     store.save_share_settings(&collection.slug, &share).map_err(cmd_err)?;
 
+    // M9: persist the exact scan parameters so the snapshot watch can faithfully re-scan this tree
+    // (same root, same checked folders, same exclusions) when the source changes.
+    store
+        .save_scan_spec(
+            &collection.slug,
+            &crate::store::ScanSpec {
+                root: opts.path.clone(),
+                include: opts.include.clone(),
+                exclude: opts.exclude.clone(),
+            },
+        )
+        .map_err(cmd_err)?;
+
     Ok(collection)
+}
+
+/// Re-scan a published collection's source tree using its persisted [`ScanSpec`], returning the
+/// freshly-scanned directory tree (notes preserved from the existing draft). Returns `Ok(None)` if
+/// the collection has no scan spec (e.g. a pre-M9 draft) — the watch then skips it. Touches the
+/// filesystem (under the same 30 s deadline as the initial scan) but **not** the network, so the
+/// re-scan decision is testable without a relay.
+pub(crate) fn rescan_listing(slug: &str, store: &DataStore) -> Result<Option<Vec<DirectoryItem>>, String> {
+    let Some(spec) = store.load_scan_spec(slug).map_err(cmd_err)? else {
+        return Ok(None);
+    };
+    let root = std::path::PathBuf::from(&spec.root);
+    let globs = build_glob_set(&spec.exclude);
+    let include = IncludeSet::new(spec.include.clone());
+    let scan = move || -> anyhow::Result<(Vec<DirectoryItem>, u64)> {
+        anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
+        scan_selective(&root, &include, &globs)
+    };
+    let (mut listing, _bytes) =
+        run_blocking_with_deadline(scan, std::time::Duration::from_secs(30)).map_err(|e| {
+            if e == DEADLINE_EXCEEDED {
+                format!("re-scan of '{slug}' timed out after 30 seconds")
+            } else {
+                e
+            }
+        })?;
+    // Preserve per-item notes from the existing draft (same as the manual rescan path).
+    if let Ok(Some(prev)) = store.load_collection_draft(slug) {
+        let notes = collect_notes(&prev.listing, "");
+        listing = apply_notes(listing, &notes, "");
+    }
+    Ok(Some(listing))
 }
 
 #[tauri::command]
@@ -262,6 +307,13 @@ pub(crate) async fn publish_collection_inner(
     // Local published marker (the "published" badge + content_types union).
     let marker = serde_json::json!({ "parts": published.parts }).to_string();
     store.save_published(slug, &marker).map_err(cmd_err)?;
+
+    // M9: record the snapshot fingerprint of what we just published, so a later watch re-scan that
+    // hashes equal is a no-op (the republish-storm guard) and a real change re-publishes exactly once.
+    if let Ok(Some(col)) = store.load_collection_draft(slug) {
+        let fp = hb_core::snapshot_fingerprint(&col.listing);
+        let _ = store.save_snapshot_fingerprint(slug, &fp);
+    }
 
     // Keep a published teaser's content_types current.
     if store.is_published("profile") {
@@ -602,7 +654,7 @@ fn format_size(bytes: u64) -> String {
     else { format!("{bytes} B") }
 }
 
-fn count_items(items: &[DirectoryItem]) -> u64 {
+pub(crate) fn count_items(items: &[DirectoryItem]) -> u64 {
     items.iter().fold(0, |acc, item| acc + 1 + count_items(&item.children))
 }
 

@@ -19,11 +19,12 @@
 	let copied = false;
 	let appVersion = '';
 
-	// Full settings object, preserved so saving one field never resets the others (the new M5
-	// fields privacy_notice_acknowledged / last_seen_version live here too).
+	// Full settings object, preserved so saving one field never resets the others (the M5 fields
+	// privacy_notice_acknowledged / last_seen_version + the M9 snapshot/online toggles live here too).
 	let settings: Settings = {
 		relay_urls: [], allow_dms: true, privacy_notice_acknowledged: false,
 		last_seen_version: '',
+		snapshot_auto_update: true, snapshot_reconcile_poll: false, show_online_count: true,
 	};
 
 	// ── 3-key identity view + share-code QR ──────────────────────────────────────
@@ -249,6 +250,22 @@
 
 	async function toggleAllowDms() {
 		settings = { ...settings, allow_dms: !settings.allow_dms };
+		try {
+			await saveSettings(fullSettings());
+		} catch (e) {
+			toast(String(e), 'error');
+		}
+	}
+
+	// M9 reactive mirrors of the snapshot/online toggles (preserved through full-object saves).
+	$: snapshotAutoUpdate = settings.snapshot_auto_update;
+	$: snapshotReconcilePoll = settings.snapshot_reconcile_poll;
+	$: showOnlineCount = settings.show_online_count;
+
+	// Toggle one boolean field and persist the whole object (never drop another field — the M5
+	// fullSettings() gotcha).
+	async function toggleSetting(field: 'snapshot_auto_update' | 'snapshot_reconcile_poll' | 'show_online_count') {
+		settings = { ...settings, [field]: !settings[field] };
 		try {
 			await saveSettings(fullSettings());
 		} catch (e) {
@@ -539,6 +556,40 @@
 				<div class="toggle-sub">Off means only people you follow can DM you</div>
 			</div>
 			<button class="toggle" class:toggle-on={allowDms} on:click={toggleAllowDms}>
+				<span class="toggle-thumb" />
+			</button>
+		</div>
+
+		<div class="toggle-row">
+			<div class="toggle-text">
+				<div class="toggle-label">Auto-update snapshots on change</div>
+				<div class="toggle-sub">
+					Re-publish a shared listing when its folder changes (filesystem-watch). Off = manual
+					"Regenerate" only. Note: a watch sees your local edits, not server-side changes another
+					host makes on an SMB share — those reconcile on launch.
+				</div>
+			</div>
+			<button class="toggle" class:toggle-on={snapshotAutoUpdate} on:click={() => toggleSetting('snapshot_auto_update')}>
+				<span class="toggle-thumb" />
+			</button>
+		</div>
+
+		<div class="toggle-row">
+			<div class="toggle-text">
+				<div class="toggle-label">Reconcile poll for remotely-edited shares</div>
+				<div class="toggle-sub">Low-frequency re-check for shares you edit from another host (SMB). Off by default.</div>
+			</div>
+			<button class="toggle" class:toggle-on={snapshotReconcilePoll} on:click={() => toggleSetting('snapshot_reconcile_poll')}>
+				<span class="toggle-thumb" />
+			</button>
+		</div>
+
+		<div class="toggle-row">
+			<div class="toggle-text">
+				<div class="toggle-label">Show "🟢 N online" indicator</div>
+				<div class="toggle-sub">Relay-derived; no telemetry is sent. The count is read from public relay events, never reported by your client.</div>
+			</div>
+			<button class="toggle" class:toggle-on={showOnlineCount} on:click={() => toggleSetting('show_online_count')}>
 				<span class="toggle-thumb" />
 			</button>
 		</div>

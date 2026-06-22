@@ -29,7 +29,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 fn default_true() -> bool { true }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     /// Configured Nostr relays (seed + write). Empty = the app has no relays yet.
     pub relay_urls: Vec<String>,
@@ -44,6 +44,32 @@ pub struct Settings {
     /// writer normalizes it to the running-version string, so comparison is exact-string equality.
     #[serde(default)]
     pub last_seen_version: String,
+    /// M9: auto-update a published listing when its source tree changes (filesystem-watch). On by
+    /// default; off = today's manual-only "Regenerate" behaviour (Decision #17).
+    #[serde(default = "default_true")]
+    pub snapshot_auto_update: bool,
+    /// M9: an opt-in low-frequency reconcile poll for users who edit their shares from another host
+    /// (SMB server-side edits a local watch can't see). Off by default — most users don't need it.
+    #[serde(default)]
+    pub snapshot_reconcile_poll: bool,
+    /// M9: show the optional "🟢 N online" indicator (relay-derived; no telemetry). On by default;
+    /// off hides the chip.
+    #[serde(default = "default_true")]
+    pub show_online_count: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            relay_urls: Vec::new(),
+            allow_dms: true,
+            privacy_notice_acknowledged: false,
+            last_seen_version: String::new(),
+            snapshot_auto_update: true,
+            snapshot_reconcile_poll: false,
+            show_online_count: true,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +84,25 @@ pub struct ShareSettings {
     pub speed_cap_kbps: Option<u32>,
     pub download_limit: Option<u32>,
     pub require_follow: bool,
+}
+
+// ---------------------------------------------------------------------------
+// ScanSpec — the parameters a collection was scanned with (M9)
+// ---------------------------------------------------------------------------
+
+/// The exact scan parameters a collection draft was built from, persisted so the snapshot watch can
+/// **faithfully re-scan** the same tree (same root, same checked folders, same exclusions) when the
+/// source changes. Without this the watch couldn't reproduce the user's folder-tree selection.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ScanSpec {
+    /// Absolute path of the collection root on disk.
+    pub root: String,
+    /// Relative "/"-separated directory paths the user checked in the folder-tree picker (M8).
+    #[serde(default)]
+    pub include: Vec<String>,
+    /// Exclude globs.
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -313,12 +358,59 @@ impl DataStore {
             self.collection_draft_path(slug),
             self.published_path(slug),
             self.share_settings_path(slug),
+            self.scan_spec_path(slug),
+            self.snapshot_fingerprint_path(slug),
         ] {
             if path.exists() {
                 std::fs::remove_file(path)?;
             }
         }
         Ok(())
+    }
+
+    // -- Scan spec (M9 — faithful re-scan for the snapshot watch) ------------
+
+    pub fn scan_spec_path(&self, slug: &str) -> PathBuf {
+        self.base.join("collections").join(format!("{slug}.scan.json"))
+    }
+
+    pub fn save_scan_spec(&self, slug: &str, spec: &ScanSpec) -> Result<()> {
+        write_json(&self.scan_spec_path(slug), spec).context("saving scan spec")
+    }
+
+    pub fn load_scan_spec(&self, slug: &str) -> Result<Option<ScanSpec>> {
+        read_json_lenient(&self.scan_spec_path(slug)).context("loading scan spec")
+    }
+
+    // -- Snapshot fingerprint (M9 — republish storm guard) -------------------
+
+    /// Path of the last-published snapshot fingerprint (the storm-guard baseline). Lives beside the
+    /// published-event marker; the published listing is encrypted with a random nonce, so its
+    /// ciphertext can't be diffed — the plaintext-tree fingerprint is what the watch compares.
+    pub fn snapshot_fingerprint_path(&self, slug: &str) -> PathBuf {
+        self.base.join("published").join(format!("{slug}.fp.json"))
+    }
+
+    pub fn save_snapshot_fingerprint(
+        &self,
+        slug: &str,
+        fp: &hb_core::SnapshotFingerprint,
+    ) -> Result<()> {
+        write_json(&self.snapshot_fingerprint_path(slug), fp).context("saving snapshot fingerprint")
+    }
+
+    pub fn load_snapshot_fingerprint(&self, slug: &str) -> Result<Option<hb_core::SnapshotFingerprint>> {
+        read_json_lenient(&self.snapshot_fingerprint_path(slug)).context("loading snapshot fingerprint")
+    }
+
+    /// Slugs of every **published** collection (those with a published-event marker) — the scope the
+    /// snapshot watch and the launch re-scan operate over (public listings only; M9).
+    pub fn list_published_slugs(&self) -> Result<Vec<String>> {
+        Ok(self
+            .list_collection_slugs()?
+            .into_iter()
+            .filter(|slug| self.is_published(slug))
+            .collect())
     }
 
     // -- Published events (NIP-09 enablement) --------------------------------
@@ -618,12 +710,85 @@ mod tests {
 
     #[test]
     fn settings_gains_fields_with_backward_compatible_defaults() {
-        // An old settings.json lacking the M5 fields must still deserialize (serde(default)).
+        // An old settings.json lacking the M5/M9 fields must still deserialize (serde(default)).
         let old = r#"{"relay_urls":["wss://r.example"],"allow_dms":true}"#;
         let s: Settings = serde_json::from_str(old).expect("old settings must still deserialize");
         assert_eq!(s.relay_urls, vec!["wss://r.example".to_string()]);
         assert!(!s.privacy_notice_acknowledged, "defaults to not-acknowledged");
         assert_eq!(s.last_seen_version, "", "defaults to empty (fresh install)");
+        // M9 fields default sensibly on an old file: auto-update + online-count ON, reconcile OFF.
+        assert!(s.snapshot_auto_update, "snapshot auto-update defaults ON");
+        assert!(!s.snapshot_reconcile_poll, "reconcile poll defaults OFF");
+        assert!(s.show_online_count, "online-count chip defaults ON");
+    }
+
+    #[test]
+    fn full_object_save_preserves_all_m9_fields() {
+        // The M5 fullSettings() gotcha guard: saving the whole object must round-trip every field,
+        // never silently drop one. Persist a non-default mix and reload it.
+        let (_dir, store) = test_store();
+        let s = Settings {
+            relay_urls: vec!["wss://r.example".into()],
+            allow_dms: false,
+            privacy_notice_acknowledged: true,
+            last_seen_version: "0.9.7".into(),
+            snapshot_auto_update: false,
+            snapshot_reconcile_poll: true,
+            show_online_count: false,
+        };
+        store.save_settings(&s).unwrap();
+        let r = store.load_settings().unwrap().unwrap();
+        assert_eq!(r.relay_urls, s.relay_urls);
+        assert!(!r.allow_dms);
+        assert!(r.privacy_notice_acknowledged);
+        assert_eq!(r.last_seen_version, "0.9.7");
+        assert!(!r.snapshot_auto_update, "auto-update toggle preserved");
+        assert!(r.snapshot_reconcile_poll, "reconcile toggle preserved");
+        assert!(!r.show_online_count, "online-count toggle preserved");
+    }
+
+    #[test]
+    fn snapshot_fingerprint_and_scan_spec_roundtrip() {
+        use hb_core::SnapshotFingerprint;
+        let (_dir, store) = test_store();
+        let fp = SnapshotFingerprint("deadbeef".into());
+        store.save_snapshot_fingerprint("films", &fp).unwrap();
+        assert_eq!(store.load_snapshot_fingerprint("films").unwrap(), Some(fp));
+
+        let spec = ScanSpec {
+            root: "/mnt/share/films".into(),
+            include: vec!["criterion".into()],
+            exclude: vec!["*.nfo".into()],
+        };
+        store.save_scan_spec("films", &spec).unwrap();
+        let loaded = store.load_scan_spec("films").unwrap().unwrap();
+        assert_eq!(loaded.root, "/mnt/share/films");
+        assert_eq!(loaded.include, vec!["criterion".to_string()]);
+    }
+
+    #[test]
+    fn list_published_slugs_only_returns_published() {
+        let (_dir, store) = test_store();
+        let mk = |slug: &str| {
+            let col = Collection {
+                slug: slug.into(),
+                path_alias: slug.into(),
+                description: None,
+                item_count: 0,
+                est_size: None,
+                content_types: vec![],
+                tags: vec![],
+                languages: vec![],
+                last_updated: chrono::Utc::now(),
+                listing: vec![],
+            };
+            store.save_collection_draft(&col).unwrap();
+        };
+        mk("published-one");
+        mk("draft-only");
+        store.save_published("published-one", "{}").unwrap();
+        let slugs = store.list_published_slugs().unwrap();
+        assert_eq!(slugs, vec!["published-one".to_string()], "only the published collection is in scope");
     }
 
     #[test]

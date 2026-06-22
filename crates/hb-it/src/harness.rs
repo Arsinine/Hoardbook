@@ -25,6 +25,11 @@ pub struct Ctx {
     pub run_id: String,
     /// Survey mode (`--survey`): probe each relay's acceptance instead of running the L2 suites.
     pub survey: bool,
+    /// Canary mode (`--canary`): run the live-backbone probe instead of the cooperative L2 suites.
+    pub canary: bool,
+    /// `--interval <secs>`: in canary mode, loop forever on this cadence (the daemon form); `None`
+    /// runs one cycle and exits with its code (the oneshot/timer form).
+    pub interval: Option<u64>,
 }
 
 impl Ctx {
