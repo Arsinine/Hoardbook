@@ -85,6 +85,7 @@
 		{ href: '/', label: 'Home' },
 		{ href: '/contacts', label: 'Contacts' },
 		{ href: '/browse', label: 'Browse' },
+		{ href: '/topics', label: 'Topics' },
 		{ href: '/chat', label: 'Chat' },
 		{ href: '/settings', label: 'Settings' },
 	];
