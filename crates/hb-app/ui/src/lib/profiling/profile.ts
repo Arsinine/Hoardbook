@@ -37,7 +37,7 @@ interface TargetSpec {
 	depth: number;
 }
 
-/** The heavy recursive-tree surfaces (corrected M9 targets: DownloadQueue was deleted in M7). */
+/** The heavy recursive-tree surfaces (corrected M9 targets: the download-queue panel was deleted in M7). */
 const TARGETS: TargetSpec[] = [
 	{ name: 'DirItem', nodeCount: 2000, depth: 5 }, // the recursive browse tree
 	{ name: 'CollectionPanel', nodeCount: 2000, depth: 4 }, // a published listing tree
