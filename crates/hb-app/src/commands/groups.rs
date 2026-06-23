@@ -149,6 +149,7 @@ mod tests {
     fn test_peer(npub: &str) -> CachedPeer {
         CachedPeer {
             npub: npub.to_string(),
+            source: crate::store::ContactSource::Manual,
             browse_key_hex: None,
             petname: None,
             profile: None,

@@ -29,6 +29,14 @@ impl Identity {
         Ok(Self { keys: Keys::parse(secret).map_err(nostr_err)? })
     }
 
+    /// Wrap a raw `Keys` as an identity. Used by the §11 Topics public-join path, where the
+    /// "redeemer" of a public-join credential is a **deterministic keypair derived from the topic
+    /// name** (any joiner derives the same keys), not a real person — so the seal-opening machinery
+    /// (which takes an `Identity`) can be driven with a derived, name-scoped keypair.
+    pub fn from_keys(keys: Keys) -> Self {
+        Self { keys }
+    }
+
     /// The public key as a bech32 `npub` (NIP-19) — the identity everywhere.
     pub fn npub(&self) -> String {
         // A freshly built/parsed key always bech32-encodes; surfaced as a String for the UI.
