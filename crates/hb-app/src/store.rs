@@ -475,7 +475,13 @@ impl DataStore {
                 std::fs::remove_dir_all(&path)?;
             }
         }
-        for file in &[self.settings_path(), self.groups_path(), self.watches_path()] {
+        for file in &[
+            self.settings_path(),
+            self.groups_path(),
+            self.watches_path(),
+            self.topics_path(),
+            self.topic_nonces_path(),
+        ] {
             if file.exists() {
                 std::fs::remove_file(file)?;
             }
@@ -527,10 +533,30 @@ impl DataStore {
 
 use hb_core::types::{Collection, Profile};
 
+/// How a contact entered your local contact list (M11). **`Manual`** = you added them by hand (a
+/// share code / paste-key). **`Topic`** = auto-added because you share a §11 Topic — a distinct badge,
+/// so topic-sourced contacts are always distinguishable from people you added deliberately. A topic
+/// contact still has **no browse-key** (joining a Topic unlocks no listings — INV-2); browsing them
+/// needs their share code, exchanged one-to-one as normal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ContactSource {
+    /// Added by hand. The default, so a pre-M11 contact (no `source` field) loads as `Manual` — a
+    /// topic badge is never silently applied on upgrade.
+    #[default]
+    Manual,
+    /// Auto-added via a shared Topic.
+    Topic,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedPeer {
     /// The peer's Nostr identity (bech32 `npub`) — the stable key the follower-gate keys on.
     pub npub: String,
+    /// How this contact was added — `Manual` (by hand) or `Topic` (auto-added via a shared Topic).
+    /// `#[serde(default)]` ⇒ a pre-M11 contact loads as `Manual` (never silently flagged a topic
+    /// contact on upgrade).
+    #[serde(default)]
+    pub source: ContactSource,
     /// The peer's account browse-key (hex), captured from a full `hbk` share code — lets us
     /// decrypt their listings + unseal their presence address. `None` for a follow-only contact.
     #[serde(default)]
@@ -626,6 +652,58 @@ impl DataStore {
 
     pub fn save_watches(&self, watches: &[Watch]) -> Result<()> {
         write_json(&self.watches_path(), watches).context("saving watches")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StoredTopic — a §11 Topic I'm a member of (local, M11)
+// ---------------------------------------------------------------------------
+
+use hb_core::topic::{TopicKey, TopicMeta};
+
+/// A Topic I have joined, persisted locally so I can read/post/leave across restarts. The `key` is the
+/// room secret (hex-serialized, the gate to the roster + channel); `membership_json` is my published
+/// membership event (opaque), kept so leaving can NIP-09-retract it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredTopic {
+    #[serde(flatten)]
+    pub meta: TopicMeta,
+    pub key: TopicKey,
+    pub joined_at: u64,
+    /// My published membership event JSON (opaque) — kept so `leave` can retract exactly that event.
+    #[serde(default)]
+    pub membership_json: Option<String>,
+}
+
+impl DataStore {
+    pub fn topics_path(&self) -> PathBuf {
+        self.base.join("topics.json")
+    }
+
+    pub fn load_topics(&self) -> Result<Vec<StoredTopic>> {
+        Ok(read_json_lenient::<Vec<StoredTopic>>(&self.topics_path())
+            .context("loading topics")?
+            .unwrap_or_default())
+    }
+
+    pub fn save_topics(&self, topics: &[StoredTopic]) -> Result<()> {
+        write_json(&self.topics_path(), topics).context("saving topics")
+    }
+
+    pub fn topic_nonces_path(&self) -> PathBuf {
+        self.base.join("topic_nonces.json")
+    }
+
+    /// The persisted **seen-nonce set** (redeemed invites, keyed `(topic_id, invitee)`). Persisting it
+    /// is what stops a restart re-accepting an old invite (M11 Decision E). Device-local by design.
+    pub fn load_topic_nonces(&self) -> Result<std::collections::HashSet<String>> {
+        Ok(read_json_lenient::<std::collections::HashSet<String>>(&self.topic_nonces_path())
+            .context("loading topic nonces")?
+            .unwrap_or_default())
+    }
+
+    pub fn save_topic_nonces(&self, nonces: &std::collections::HashSet<String>) -> Result<()> {
+        write_json(&self.topic_nonces_path(), nonces).context("saving topic nonces")
     }
 }
 

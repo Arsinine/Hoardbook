@@ -83,6 +83,7 @@ async fn resolve_peer(
 
     Ok(CachedPeer {
         npub,
+        source: crate::store::ContactSource::Manual,
         browse_key_hex: share_code.browse_key().map(hex::encode),
         petname: profile.as_ref().map(|p| p.display_name.clone()),
         profile,

@@ -8,5 +8,6 @@ pub mod private;
 pub mod profile;
 pub mod settings;
 pub mod sharing;
+pub mod topics;
 pub mod update;
 pub mod watches;

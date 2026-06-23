@@ -85,9 +85,15 @@ export interface PrivatePeerCollections {
 	collections: Collection[];
 }
 
+/** How a contact entered the list (M11). `Manual` = added by hand; `Topic` = auto-added via a shared
+ *  §11 Topic (a distinct badge). Absent ⇒ `Manual` (a pre-M11 contact). */
+export type ContactSource = 'Manual' | 'Topic';
+
 export interface CachedPeer {
 	/** The peer's Nostr identity (bech32 npub) — the stable contact key. */
 	npub: string;
+	/** How this contact was added — `Manual` or `Topic` (auto-added via a shared Topic). Absent ⇒ Manual. */
+	source?: ContactSource;
 	/** Hex account browse-key captured from a full `hbk` code (unlocks listings + address). */
 	browse_key_hex?: string;
 	/** Local impersonation-resistant petname, bound to npub. */
@@ -145,6 +151,35 @@ export interface Watch {
 export interface WatchHit {
 	watch_name: string;
 	npub: string;
+}
+
+// ── Topics (M11; spec §11) ───────────────────────────────────────────────────
+
+/** A Topic I'm a member of (local view). */
+export interface TopicView {
+	topic_id: string;
+	name: string;
+	description: string;
+	tags: string[];
+	private: boolean;
+	joined_at: number;
+}
+
+/** A discovered public Topic (non-member view) — the roster identities are NOT here (members-only);
+ *  the count is a deliberately **spoofable** estimate. */
+export interface DiscoveredTopic {
+	topic_id: string;
+	name: string;
+	description: string;
+	tags: string[];
+	member_count_estimate: number;
+}
+
+/** A decrypted 24h channel post. */
+export interface ChannelPost {
+	author_npub: string;
+	body: string;
+	ts: number;
 }
 
 // (DownloadItem removed — file transfer moved to the Mascara companion.)

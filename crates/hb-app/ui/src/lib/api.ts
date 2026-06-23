@@ -20,6 +20,9 @@ import type {
 	Visibility,
 	Watch,
 	WatchHit,
+	TopicView,
+	DiscoveredTopic,
+	ChannelPost,
 } from './types.js';
 
 // ── Identity ─────────────────────────────────────────────────────────────────
@@ -222,3 +225,40 @@ export const watchesCreate = (name: string, tags: string[], contentTypes: string
 export const watchesDelete   = (name: string) => invoke<void>('watches_delete', { name });
 export const watchesEvaluate = (candidates: string[]) =>
 	invoke<WatchHit[]>('watches_evaluate', { candidates });
+
+// ── Topics (M11; spec §11) ─────────────────────────────────────────────────────
+
+export const topicList = () => invoke<TopicView[]>('topic_list');
+
+export const topicCreate = (
+	name: string,
+	description: string,
+	tags: string[],
+	isPrivate: boolean,
+) => invoke<TopicView>('topic_create', { name, description, tags, private: isPrivate });
+
+export const topicDiscover = (tags: string[]) =>
+	invoke<DiscoveredTopic[]>('topic_discover', { tags });
+
+export const topicJoinPublic = (name: string) =>
+	invoke<TopicView>('topic_join_public', { name });
+
+/** Redeem a private-Topic invite addressed to me (returns the joined Topic, or null if none found). */
+export const topicRedeemInvite = () => invoke<TopicView | null>('topic_redeem_invite');
+
+export const topicRequestJoin = (memberNpub: string, topicId: string, name: string) =>
+	invoke<void>('topic_request_join', { memberNpub, topicId, name });
+
+/** Invite/admit a peer into a Topic I'm in (any member may invite — M3). */
+export const topicInvite = (topicId: string, inviteeNpub: string) =>
+	invoke<void>('topic_invite', { topicId, inviteeNpub });
+
+export const topicLeave = (topicId: string) => invoke<void>('topic_leave', { topicId });
+
+export const topicRoster = (topicId: string) => invoke<string[]>('topic_roster', { topicId });
+
+export const topicChannel = (topicId: string) =>
+	invoke<ChannelPost[]>('topic_channel', { topicId });
+
+export const topicPost = (topicId: string, body: string) =>
+	invoke<void>('topic_post', { topicId, body });

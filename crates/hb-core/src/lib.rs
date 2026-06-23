@@ -20,6 +20,7 @@ pub mod priv_listing;
 pub mod sharecode;
 pub mod snapshot;
 mod tag_util;
+pub mod topic;
 pub mod version;
 
 pub use error::HbError;
@@ -36,5 +37,11 @@ pub use identity::Identity;
 pub use listing::{decrypt_listing, encrypt_listing, BrowseKey, ContentKey};
 pub use priv_listing::{open_private_listing, seal_private_listing, OpenedPrivate, KIND_PRIV_LISTING};
 pub use sharecode::ShareCode;
+pub use topic::{
+    build_announce, build_public_join, member_sign_keys, mint_invite, new_topic, open_membership,
+    open_post, parse_announce, public_join_identity, public_join_keys, redeem_invite, roster,
+    seal_membership, seal_post, topic_id_for_name, Membership, NonceSet, Post, TopicKey, TopicMeta,
+    KIND_TOPIC_ANNOUNCE, KIND_TOPIC_INVITE, KIND_TOPIC_MEMBER, KIND_TOPIC_POST, POST_TTL_SECS,
+};
 pub use snapshot::{snapshot_fingerprint, unchanged_since, SnapshotFingerprint};
 pub use version::SCHEMA_V;
