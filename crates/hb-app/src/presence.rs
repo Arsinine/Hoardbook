@@ -14,6 +14,7 @@ use hb_net::RelayClient;
 use nostr::prelude::*;
 
 use crate::identity_state::SharedIdentity;
+use crate::net::SharedRelay;
 use crate::store::DataStore;
 
 /// Binding validity window. Presence refreshes every ~5 min, so 30 min is a generous backstop
@@ -63,6 +64,7 @@ pub(crate) async fn fetch_peer_presence(
 pub(crate) async fn run_presence_loop(
     identity: SharedIdentity,
     store: DataStore,
+    relay: SharedRelay,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
     wakeups: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
@@ -88,12 +90,13 @@ pub(crate) async fn run_presence_loop(
         };
         let Some(id) = snapshot else { continue };
 
-        match crate::net::connect(&id, &store).await {
+        // M12 W1: ride the persistent shared client (one cheap publish, not a reconnect). Never
+        // disconnect — the client lives for the session.
+        match crate::net::client(&id, &store, &relay).await {
             Ok(client) => {
                 if let Err(e) = publish_presence(&client, &id).await {
                     tracing::debug!("presence publish failed: {e}");
                 }
-                client.disconnect().await;
             }
             Err(e) => tracing::debug!("presence: no relay this cycle ({e})"),
         }
@@ -115,12 +118,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
         let identity: SharedIdentity = Arc::new(RwLock::new(None));
+        let relay = crate::net::new_shared();
         let wakeups = Arc::new(AtomicU64::new(0));
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         let handle = tokio::spawn(run_presence_loop(
             identity,
             store,
+            relay,
             cancel_rx,
             Arc::clone(&wakeups),
         ));

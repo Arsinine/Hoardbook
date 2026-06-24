@@ -101,6 +101,7 @@ fn restore_identity(store: DataStore, identity: SharedIdentity) {
 /// Spawn the long-running background tasks: the presence-publish loop + the update check.
 fn spawn_background_tasks(
     identity: SharedIdentity,
+    relay: net::SharedRelay,
     presence_cancel_rx: tokio::sync::watch::Receiver<bool>,
     store: DataStore,
     app: tauri::AppHandle,
@@ -109,6 +110,7 @@ fn spawn_background_tasks(
     tauri::async_runtime::spawn(presence::run_presence_loop(
         identity,
         store,
+        relay,
         presence_cancel_rx,
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
     ));
@@ -136,6 +138,7 @@ fn spawn_background_tasks(
 fn spawn_watch_task(
     store: DataStore,
     identity: SharedIdentity,
+    relay: net::SharedRelay,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     app: tauri::AppHandle,
 ) -> Option<notify::RecommendedWatcher> {
@@ -174,7 +177,7 @@ fn spawn_watch_task(
         }
     });
 
-    let sink = Arc::new(watch::RelayPublishSink { store: store.clone(), identity });
+    let sink = Arc::new(watch::RelayPublishSink { store: store.clone(), identity, relay });
     tauri::async_runtime::spawn(watch::run_watch_loop(
         store,
         cfg,
@@ -230,6 +233,8 @@ pub fn run() {
             let store = DataStore::new(data_dir);
 
             let identity: SharedIdentity = Arc::new(RwLock::new(None));
+            // M12 W1: the one persistent shared relay client, lazily built on first network use.
+            let relay: net::SharedRelay = net::new_shared();
             let staged_update: commands::update::SharedStagedUpdate = Arc::default();
             let online_cache: commands::online::SharedOnlineCache = Arc::default();
 
@@ -241,6 +246,7 @@ pub fn run() {
 
             app.manage(store.clone());
             app.manage(Arc::clone(&identity));
+            app.manage(Arc::clone(&relay));
             app.manage(Arc::clone(&presence_cancel));
             app.manage(Arc::clone(&watch_cancel));
             app.manage(Arc::clone(&staged_update));
@@ -254,6 +260,7 @@ pub fn run() {
 
             spawn_background_tasks(
                 Arc::clone(&identity),
+                Arc::clone(&relay),
                 presence_cancel_rx,
                 store.clone(),
                 app_handle.clone(),
@@ -261,7 +268,7 @@ pub fn run() {
 
             // M9: the snapshot-watch sibling task (single watcher per app — single-instance, M8).
             if let Some(watcher) =
-                spawn_watch_task(store, Arc::clone(&identity), watch_cancel_rx, app_handle)
+                spawn_watch_task(store, Arc::clone(&identity), Arc::clone(&relay), watch_cancel_rx, app_handle)
             {
                 app.manage(WatcherHandle(std::sync::Mutex::new(watcher)));
             }
@@ -305,9 +312,11 @@ pub fn run() {
             commands::browse::unfollow_contact,
             commands::browse::refresh_contact,
             commands::browse::set_contact_tags,
+            commands::browse::search_peers,
             commands::settings::get_settings,
             commands::settings::save_settings,
             commands::settings::check_relay,
+            commands::settings::relay_status,
             commands::settings::acknowledge_privacy_notice,
             commands::online::online_count,
             commands::chat::send_message,

@@ -25,6 +25,7 @@
 //! distinguishable at a glance. Widening `WORDS` raises the grinding cost but never closes it.
 
 use nostr::prelude::PublicKey;
+use serde::{Deserialize, Serialize};
 
 /// 16 short, visually-distinct words (4 bits of selection each). Kept deliberately small so a
 /// human can compare two fingerprints at a glance.
@@ -34,7 +35,12 @@ const WORDS: [&str; 16] = [
 ];
 
 /// A deterministic, at-a-glance fingerprint of an `npub`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializes in camelCase (`{ words, colorHex }`) so the value crosses the Tauri boundary in the
+/// exact shape `ui/src/lib/identity-display.ts::Fingerprint` and `fingerprint_vectors.json` already
+/// use — the UI renders it verbatim, never re-deriving (M3 decision #7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Fingerprint {
     /// Three words selected from well-separated key bytes.
     pub words: Vec<String>,

@@ -10,22 +10,26 @@
 		topicLeave,
 		topicInvite,
 		topicRoster,
-		topicChannel,
-		topicPost,
 	} from '$lib/api.js';
-	import type { TopicView, DiscoveredTopic, ChannelPost } from '$lib/types.js';
-	import { memberCountLabel } from '$lib/topics-view.js';
+	import type { TopicView, DiscoveredTopic } from '$lib/types.js';
+	import { memberCountLabel, TOPIC_ROOTS, composeTopicPath, subPathLabel, groupTopicsByRoot } from '$lib/topics-view.js';
 	import TopicJoinConsent from '$lib/components/TopicJoinConsent.svelte';
 
 	let mine: TopicView[] = [];
 	let discovered: DiscoveredTopic[] = [];
 	let busy = false;
 
-	// Create form
-	let newName = '';
+	// Create form. W4: a PUBLIC Topic is a category root (picker — a bad root is unrepresentable) + a
+	// freeform sub-path (e.g. video / animation/anime). A PRIVATE Topic keeps a freeform name.
+	let newRoot: string = TOPIC_ROOTS[0];
+	let newSubPath = '';
+	let newName = ''; // private (freeform) name
 	let newDesc = '';
 	let newTags = '';
 	let newPrivate = false;
+	// The composed public path, previewed under the inputs.
+	$: composedPublicName = composeTopicPath(newRoot, newSubPath);
+	$: discoveredTree = groupTopicsByRoot(discovered);
 
 	// Discover
 	let searchTags = '';
@@ -33,11 +37,10 @@
 	// The consent gate: which Topic (public name + private flag) is pending a join.
 	let pendingJoin: { name: string; isPrivate: boolean } | null = null;
 
-	// Open Topic (roster + channel)
+	// Open Topic (roster + invite). The 24h channel now lives in Chat (a persistent channel entry per
+	// joined Topic); posting moved there, so this panel keeps only membership management.
 	let openTopic: TopicView | null = null;
 	let roster: string[] = [];
-	let posts: ChannelPost[] = [];
-	let draft = '';
 	let inviteNpub = '';
 
 	function splitTags(s: string): string[] {
@@ -54,12 +57,17 @@
 
 	onMount(loadMine);
 
+	// The effective name to create: a freeform private name, or the composed category path for public.
+	$: createName = newPrivate ? newName.trim() : composedPublicName;
+	$: canCreate = newPrivate ? newName.trim().length > 0 : composedPublicName.length > 0;
+
 	async function create() {
-		if (!newName.trim()) return;
+		if (!canCreate) return;
 		busy = true;
 		try {
-			await topicCreate(newName.trim(), newDesc.trim(), splitTags(newTags), newPrivate);
-			newName = newDesc = newTags = '';
+			await topicCreate(createName, newDesc.trim(), splitTags(newTags), newPrivate);
+			newName = newSubPath = newDesc = newTags = '';
+			newRoot = TOPIC_ROOTS[0];
 			newPrivate = false;
 			await loadMine();
 			toast('Topic created', 'success');
@@ -140,21 +148,8 @@
 	async function open(t: TopicView) {
 		openTopic = t;
 		roster = [];
-		posts = [];
 		try {
 			roster = await topicRoster(t.topic_id);
-			posts = await topicChannel(t.topic_id);
-		} catch (e) {
-			toast(String(e), 'error');
-		}
-	}
-
-	async function send() {
-		if (!openTopic || !draft.trim()) return;
-		try {
-			await topicPost(openTopic.topic_id, draft.trim());
-			draft = '';
-			posts = await topicChannel(openTopic.topic_id);
 		} catch (e) {
 			toast(String(e), 'error');
 		}
@@ -180,25 +175,43 @@
 		<div class="col">
 			<div class="card">
 				<h2>Create a Topic</h2>
-				<input placeholder="name (e.g. 80s-anime)" bind:value={newName} />
+				{#if newPrivate}
+					<input placeholder="name (freeform, e.g. back room)" bind:value={newName} />
+				{:else}
+					<!-- W4: a public Topic is a category root (picker) + freeform sub-path. The root picker
+					     makes a non-category root unrepresentable; the backend re-validates authoritatively. -->
+					<div class="path-row">
+						<select class="root-pick" bind:value={newRoot}>
+							{#each TOPIC_ROOTS as r}<option value={r}>{r}</option>{/each}
+						</select>
+						<span class="path-sep">/</span>
+						<input class="grow" placeholder="sub-path (e.g. animation/anime) — optional" bind:value={newSubPath} />
+					</div>
+					<div class="muted path-preview">Topic path: <code>{composedPublicName}</code></div>
+				{/if}
 				<input placeholder="description" bind:value={newDesc} />
 				<input placeholder="tags, comma-separated" bind:value={newTags} />
 				<label class="check"><input type="checkbox" bind:checked={newPrivate} /> Private (unlisted)</label>
-				<button disabled={busy || !newName.trim()} on:click={create}>Create</button>
+				<button disabled={busy || !canCreate} on:click={create}>Create</button>
 			</div>
 
 			<div class="card">
 				<h2>Discover public Topics</h2>
 				<input placeholder="search tags, comma-separated" bind:value={searchTags} />
 				<button disabled={busy} on:click={discover}>Discover</button>
-				{#each discovered as d (d.topic_id)}
-					<div class="row">
-						<div class="grow">
-							<div class="name">{d.name}</div>
-							<div class="muted">{memberCountLabel(d.member_count_estimate)}</div>
+				<!-- W4: results render as a collapsible tree split on '/' (root category → sub-paths),
+				     activity-ranked within each root by the backend. -->
+				{#each discoveredTree as group (group.root)}
+					<div class="tree-root">{group.root}</div>
+					{#each group.topics as d (d.topic_id)}
+						<div class="row tree-child">
+							<div class="grow">
+								<div class="name">{subPathLabel(d.name) || d.name}</div>
+								<div class="muted">{memberCountLabel(d.member_count_estimate)}</div>
+							</div>
+							<button on:click={() => askToJoin(d.name, false)}>Join</button>
 						</div>
-						<button on:click={() => askToJoin(d.name, false)}>Join</button>
-					</div>
+					{/each}
 				{/each}
 				<button class="link" disabled={busy} on:click={redeemInvite}>Redeem a private invite addressed to me</button>
 			</div>
@@ -225,7 +238,7 @@
 
 			{#if openTopic}
 				<div class="card">
-					<h2>{openTopic.name} — roster & 24h channel</h2>
+					<h2>{openTopic.name} — roster</h2>
 					<div class="muted">Roster ({roster.length})</div>
 					<ul class="roster">
 						{#each roster as npub (npub)}<li>{npub.slice(0, 12)}…{npub.slice(-4)}</li>{/each}
@@ -236,16 +249,7 @@
 						<button on:click={invite}>Invite</button>
 					</div>
 
-					<div class="muted">Channel (wiped after 24h)</div>
-					<ul class="channel">
-						{#each posts as p (p.author_npub + p.ts)}
-							<li><span class="who">{p.author_npub.slice(0, 10)}…</span> {p.body}</li>
-						{/each}
-					</ul>
-					<div class="compose">
-						<input placeholder="say something…" bind:value={draft} on:keydown={(e) => e.key === 'Enter' && send()} />
-						<button on:click={send}>Post</button>
-					</div>
+					<a class="channel-link" href="/chat">💬 Open this Topic's channel in Chat →</a>
 				</div>
 			{/if}
 		</div>
@@ -314,11 +318,19 @@
 	.name { font-size: 13px; font-weight: 600; }
 	.muted { font-size: 11.5px; color: var(--fg-dim); }
 	.tag { font-size: 10px; color: var(--accent); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
-	.roster, .channel { list-style: none; margin: 0; padding: 0; font-size: 12px; max-height: 160px; overflow-y: auto; }
-	.roster li, .channel li { padding: 3px 0; }
-	.channel .who { color: var(--fg-dim); font-family: var(--font-mono); }
-	.invite, .compose { display: flex; gap: 6px; }
-	.invite input, .compose input { flex: 1; }
+	.path-row { display: flex; align-items: center; gap: 6px; }
+	.path-row .grow { flex: 1; min-width: 0; }
+	.root-pick { padding: 6px 9px; background: var(--bg-elev2); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; font: inherit; }
+	.path-sep { color: var(--fg-dim); }
+	.path-preview { font-size: 11px; }
+	.path-preview code { font-family: var(--font-mono); color: var(--fg-muted); }
+	.tree-root { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; color: var(--fg-dim); margin-top: 8px; }
+	.tree-child { padding-left: 12px; }
+	.roster { list-style: none; margin: 0; padding: 0; font-size: 12px; max-height: 160px; overflow-y: auto; }
+	.roster li { padding: 3px 0; }
+	.invite { display: flex; gap: 6px; }
+	.invite input { flex: 1; }
+	.channel-link { display: inline-block; margin-top: 4px; font-size: 12px; color: var(--accent); text-decoration: none; }
 	.modal-backdrop {
 		position: fixed; inset: 0; z-index: 9998;
 		background: oklch(0 0 0 / 0.45);

@@ -157,6 +157,7 @@ mod tests {
             online: false,
             last_fetched: chrono::Utc::now(),
             local_tags: vec![],
+            fingerprint: None,
         }
     }
 

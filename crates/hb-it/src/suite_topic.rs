@@ -8,8 +8,8 @@
 
 use anyhow::{anyhow, ensure, Result};
 use hb_core::topic::{
-    build_announce, build_public_join, roster, seal_membership, NonceSet, TopicKey, TopicMeta,
-    KIND_TOPIC_MEMBER, POST_TTL_SECS,
+    build_announce, build_public_join, roster, seal_membership, topic_id_for_name, NonceSet,
+    TopicKey, TopicMeta, KIND_TOPIC_MEMBER, POST_TTL_SECS,
 };
 use hb_core::{new_topic, Identity};
 use hb_net::{
@@ -33,21 +33,25 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
         result("TOPIC7 M3: any member may invite — a non-creator admits a newcomer (intended)", topic7(ctx).await),
         result("TOPIC8 leave retracts (roster shrinks); last leave ⇒ dissolved (empty roster)", topic8(ctx).await),
         result("TOPIC9 channel: NIP-40 expiry tag present + the client filters >24h locally", topic9(ctx).await),
+        result("TOPIC10 W4: same path (case/space variant) converges + activity-ranked discovery", topic10(ctx).await),
     ]
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────────────────────────
 
 /// A per-test-unique public Topic (so the name-derived `topic_id` can't collide across tests/runs).
+/// W4: a public name is a **category-rooted path** now (`video/…`), so the per-test suffix sits under
+/// the `video` root.
 fn mk_public(ctx: &Ctx, suffix: &str) -> (TopicMeta, TopicKey) {
-    let name = format!("hbit-topic-{}-{}", suffix, ctx.run_id);
-    new_topic(&name, "a subject group", vec![ctx.tag(&format!("topic-{suffix}"))], false)
+    let name = format!("video/hbit-topic-{}-{}", suffix, ctx.run_id);
+    new_topic(&name, "a subject group", vec![ctx.tag(&format!("topic-{suffix}"))], false).unwrap()
 }
 
-/// A per-test-unique private Topic (random topic_id, no announce).
+/// A per-test-unique private Topic (random topic_id, no announce; freeform name — W4 root rule is
+/// public-only).
 fn mk_private(ctx: &Ctx, suffix: &str) -> (TopicMeta, TopicKey) {
     let name = format!("hbit-priv-{}-{}", suffix, ctx.run_id);
-    new_topic(&name, "secret", vec![ctx.tag(&format!("priv-{suffix}"))], true)
+    new_topic(&name, "secret", vec![ctx.tag(&format!("priv-{suffix}"))], true).unwrap()
 }
 
 /// Create a public Topic: publish the announce + the public-join credential + the creator's own
@@ -84,7 +88,7 @@ async fn topic1_inner(ctx: &Ctx) -> Result<()> {
         let found = discover_public_topics(&rc, &meta.tags, FETCH_TIMEOUT).await?;
         let members = fetch_membership_events(&rc, &meta.topic_id, FETCH_TIMEOUT).await?;
         rc.disconnect().await;
-        ensure!(found.iter().any(|m| m.topic_id == meta.topic_id), "relay {idx}: announce missing");
+        ensure!(found.iter().any(|(m, _)| m.topic_id == meta.topic_id), "relay {idx}: announce missing");
         ensure!(!members.is_empty(), "relay {idx}: membership missing");
     }
     Ok(())
@@ -100,7 +104,7 @@ async fn topic2(ctx: &Ctx) -> Result<()> {
     // (a) A non-member holds no key: raw membership events exist (ciphertext), but the roster
     //     identities are unreadable. member_count works WITHOUT a key (it's the discovery signal).
     let non_member = Identity::generate();
-    let (_om, wrong_key) = new_topic("unrelated", "", vec![], false);
+    let (_om, wrong_key) = new_topic("other/unrelated", "", vec![], false).unwrap();
     let nc = ctx.connect(&non_member).await?;
     let raw = fetch_membership_events(&nc, &meta.topic_id, FETCH_TIMEOUT).await?;
     ensure!(!raw.is_empty(), "membership events are on the relay (ciphertext)");
@@ -205,7 +209,7 @@ async fn topic5(ctx: &Ctx) -> Result<()> {
     // A non-member's public discovery (by the topic's tag) finds nothing — it is unlisted.
     let discovered = discover_public_topics(&cc, &meta.tags, FETCH_TIMEOUT).await?;
     ensure!(
-        !discovered.iter().any(|m| m.topic_id == meta.topic_id),
+        !discovered.iter().any(|(m, _)| m.topic_id == meta.topic_id),
         "a private Topic must NOT be publicly discoverable"
     );
 
@@ -386,5 +390,55 @@ async fn topic9(ctx: &Ctx) -> Result<()> {
         !later.iter().any(|p| p.body == "fresh post"),
         "the client filters a >24h post locally regardless of the relay"
     );
+    Ok(())
+}
+
+// ── TOPIC10 (W4: path convergence + activity-ranked discovery) ─────────────────────────────────────
+
+async fn topic10(ctx: &Ctx) -> Result<()> {
+    let tag = ctx.tag("w4");
+    // The SAME public path, typed two ways (case + spacing): both normalize to the same canonical
+    // path → the same topic_id (so two creators land in the same room — Decision K/L).
+    let canonical = format!("video/hbit-{}-w4/anime", ctx.run_id);
+    let variant = format!("VIDEO / hbit-{}-w4 / Anime", ctx.run_id);
+    let junk = format!("video/hbit-{}-w4/loner", ctx.run_id);
+
+    // Creator A makes the populated path (announce + public-join credential + A's membership).
+    let a = Identity::generate();
+    let (meta_a, key_a) = new_topic(&canonical, "anime", vec![tag.clone()], false).unwrap();
+    create_public(ctx, &a, &meta_a, &key_a).await?;
+
+    // B joins via the case/space VARIANT name — the public-join keypair derives from the normalized
+    // path, so B reconstructs A's credential target and redeems the SAME room (convergence).
+    let b = Identity::generate();
+    let bc = ctx.connect(&b).await?;
+    let mut seen = NonceSet::new();
+    let (rmeta, rkey) = join_public(&bc, &variant, &mut seen, now(), FETCH_TIMEOUT)
+        .await?
+        .ok_or_else(|| anyhow!("B could not join via the path variant — public-join derivation diverged"))?;
+    ensure!(rmeta.topic_id == topic_id_for_name(&canonical), "the variant did not converge to the canonical topic_id");
+    ensure!(rmeta.topic_id == meta_a.topic_id, "variant + canonical must be the same room");
+    join_topic(&bc, &rkey, &rmeta.topic_id, &b, now()).await?;
+    settle().await;
+    let rost = fetch_roster(&bc, &meta_a.topic_id, &key_a, FETCH_TIMEOUT).await?;
+    bc.disconnect().await;
+    ensure!(rost.len() == 2, "the shared roster should hold both A and B (got {})", rost.len());
+
+    // A junk singleton under the SAME discovery tag (1 member) must rank BELOW the populated path (2).
+    let c = Identity::generate();
+    let (meta_junk, key_junk) = new_topic(&junk, "loner", vec![tag.clone()], false).unwrap();
+    create_public(ctx, &c, &meta_junk, &key_junk).await?;
+    settle().await;
+
+    let dc = ctx.connect(&a).await?;
+    let ranked = discover_public_topics(&dc, &[tag.clone()], FETCH_TIMEOUT).await?;
+    dc.disconnect().await;
+    let pos_pop = ranked.iter().position(|(m, _)| m.topic_id == meta_a.topic_id);
+    let pos_junk = ranked.iter().position(|(m, _)| m.topic_id == meta_junk.topic_id);
+    let (pop, jnk) = (
+        pos_pop.ok_or_else(|| anyhow!("the populated path was not discovered"))?,
+        pos_junk.ok_or_else(|| anyhow!("the junk singleton was not discovered"))?,
+    );
+    ensure!(pop < jnk, "activity ranking: the 2-member path ({pop}) must rank above the 1-member singleton ({jnk})");
     Ok(())
 }

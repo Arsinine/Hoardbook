@@ -133,6 +133,19 @@ export const saveSettings = (settings: Settings) => invoke<void>('save_settings'
 
 export const checkRelay = (url: string) => invoke<void>('check_relay', { url });
 
+/** Live per-relay reachability on the data path (M12 W1, Decision D) — so a "–"/Offline read can
+ *  say *why*. One entry per **configured** relay. */
+export interface RelayHealth {
+	url: string;
+	/** Lowercase status label: `connected` / `connecting` / `disconnected` / … */
+	status: string;
+	connected: boolean;
+	lastError: string | null;
+}
+
+/** Live status of the persistent shared client's configured relays. Best-effort. */
+export const relayStatus = () => invoke<RelayHealth[]>('relay_status');
+
 /** Record that the one-time pre-first-download IP-exposure notice was acknowledged. */
 export const acknowledgePrivacyNotice = () => invoke<void>('acknowledge_privacy_notice');
 
@@ -167,6 +180,24 @@ export const refreshContact = (npub: string) => invoke<CachedPeer>('refresh_cont
 
 export const setContactTags = (npub: string, tags: string[]) =>
 	invoke<void>('set_contact_tags', { npub, tags });
+
+// ── Discovery (§6) — M12 W3 ─────────────────────────────────────────────────────
+
+/** A §6 Discovery teaser card. Carries only the opt-in public teaser + the §7 fingerprint — never a
+ *  listing or browse-key (DISC3): a hit surfaces the advertisement, not the hoard. */
+export interface PeerSearchHit {
+	npub: string;
+	display_name: string;
+	bio: string | null;
+	tags: string[];
+	content_types: string[];
+	fingerprint: { words: string[]; colorHex: string } | null;
+}
+
+/** Search public teasers by tag (AND) / content-type (OR). ≥1 filter is required (the backend
+ *  rejects an empty search — no unfiltered global peer list). */
+export const searchPeers = (tags: string[], contentTypes: string[]) =>
+	invoke<PeerSearchHit[]>('search_peers', { tags, contentTypes });
 
 // ── Sharing ───────────────────────────────────────────────────────────────────
 
