@@ -30,17 +30,19 @@ pub mod split;
 pub mod topic;
 
 pub use browse::{
-    browse_share_code, parse_share_code, publish_listing, resolve_peer_relays, search_teasers,
-    BrowseResult, PublishedListing,
+    browse_share_code, parse_share_code, publish_listing, resolve_peer_relays,
+    resolve_recipient_relays, search_teasers, BrowseResult, PublishedListing,
 };
 pub use cache::{cache_decision, CacheDecision, CachedListing, CACHE_FRESH_SECS};
-pub use client::{dedup_by_id, teaser_search_filter, PublishOutcome, RelayClient};
+pub use client::{
+    dedup_by_id, pool_is_live, teaser_search_filter, PublishOutcome, RelayClient, RelayHealth,
+};
 pub use count::{count_online, count_userbase, presence_count_filter, userbase_filter};
 pub use discover::{ingest_teasers, select_newest_by_created_at, teaser_matches, SearchHit};
 pub use dm::{unwrap_dm, wrap_dm, DirectMessage};
 pub use error::NetError;
 pub use nip09::build_deletion;
-pub use nip65::{bootstrap_order, build_relay_list, parse_relay_list, RelayList};
+pub use nip65::{bootstrap_order, build_relay_list, inbox_order, parse_relay_list, RelayList};
 pub use priv_browse::{dedup_newest, fetch_private_listings, publish_private_listing};
 pub use pow::{leading_zero_bits, mine_pow, pow_difficulty};
 pub use render::{render_listing, RenderedListing, MAX_LISTING_PARTS};
@@ -49,5 +51,5 @@ pub use topic::{
     approve_join, discover_public_topics, fetch_channel, fetch_invite, fetch_join_requests,
     fetch_membership_events, fetch_roster, join_public, join_request_message, join_topic,
     leave_topic, member_count, parse_join_request, post_to_channel, publish_topic, request_join,
-    JoinRequest, INVITE_TTL_SECS,
+    JoinRequest, INVITE_TTL_SECS, TOPIC_DISCOVERY_CAP,
 };

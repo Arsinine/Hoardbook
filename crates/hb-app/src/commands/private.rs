@@ -15,7 +15,7 @@ use hb_net::fetch_private_listings;
 use crate::{
     error::{cmd_err, CmdResult},
     identity_state::SharedIdentity,
-    net,
+    net::{self, SharedRelay},
     store::DataStore,
 };
 
@@ -62,6 +62,7 @@ pub(crate) fn contact_author_allowlist(store: &DataStore) -> Vec<nostr::PublicKe
 pub async fn browse_private_collections(
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
 ) -> CmdResult<Vec<PrivatePeerCollections>> {
     let me = {
         let guard = identity.read().await;
@@ -75,10 +76,10 @@ pub async fn browse_private_collections(
         return Ok(vec![]); // no followed authors → nothing to accept (and nothing leaks)
     }
 
-    let client = net::connect(&me, &store).await.map_err(cmd_err)?;
-    let opened = fetch_private_listings(&client, &me, &allowlist, net::RELAY_TIMEOUT).await;
-    client.disconnect().await;
-    let opened = opened.map_err(cmd_err)?;
+    let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
+    let opened = fetch_private_listings(&client, &me, &allowlist, net::RELAY_TIMEOUT)
+        .await
+        .map_err(cmd_err)?;
 
     // Group the decrypted listings under the inner author's npub for the UI.
     let mut by_author: std::collections::BTreeMap<String, Vec<Collection>> =

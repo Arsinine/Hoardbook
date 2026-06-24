@@ -49,3 +49,53 @@ export function memberCountLabel(estimate: number): string {
 export function isDissolved(rosterSize: number): boolean {
 	return rosterSize <= 0;
 }
+
+// ── W4: public Topic paths (fixed-root category + freeform sub-path) ──────────────────────────────
+
+/** The six fixed-root categories a **public** Topic path must start with (mirrors `hb-core`'s
+ *  `TOPIC_ROOTS`). The create form offers these as a picker, so a bad root is *unrepresentable* in
+ *  the UI — and the backend re-validates authoritatively. */
+export const TOPIC_ROOTS = ['video', 'audio', 'image', 'text', 'software', 'other'] as const;
+
+/** Compose a public Topic path from the picked root + a freeform sub-path. Empty / slash-junk
+ *  sub-segments are dropped; the result is `root` (just the category) or `root/sub/segments`. The
+ *  backend re-normalizes (NFKC + lowercase + depth cap), so this is convenience, not the barrier. */
+export function composeTopicPath(root: string, subPath: string): string {
+	const subs = subPath.split('/').map((s) => s.trim()).filter(Boolean);
+	return [root, ...subs].join('/');
+}
+
+/** Split a Topic name into its path segments (for the collapsible tree). */
+export function splitTopicPath(name: string): string[] {
+	return name.split('/').map((s) => s.trim()).filter(Boolean);
+}
+
+/** The sub-path label (everything below the root) for display under a root group; '' for a bare root. */
+export function subPathLabel(name: string): string {
+	return splitTopicPath(name).slice(1).join('/');
+}
+
+export interface TopicGroup<T> {
+	root: string;
+	topics: T[];
+}
+
+/** Group discovered Topics by their root category (the first path segment) for the collapsible tree
+ *  (root category → sub-paths). Roots are ordered by [`TOPIC_ROOTS`]; an unexpected root sorts last.
+ *  Within a root, input order is preserved (the backend already activity-ranks). */
+export function groupTopicsByRoot<T extends { name: string }>(topics: T[]): TopicGroup<T>[] {
+	const byRoot = new Map<string, T[]>();
+	for (const t of topics) {
+		const root = splitTopicPath(t.name)[0] ?? 'other';
+		const bucket = byRoot.get(root);
+		if (bucket) bucket.push(t);
+		else byRoot.set(root, [t]);
+	}
+	const rank = (r: string) => {
+		const i = (TOPIC_ROOTS as readonly string[]).indexOf(r);
+		return i < 0 ? TOPIC_ROOTS.length : i;
+	};
+	return [...byRoot.entries()]
+		.sort((a, b) => rank(a[0]) - rank(b[0]))
+		.map(([root, ts]) => ({ root, topics: ts }));
+}

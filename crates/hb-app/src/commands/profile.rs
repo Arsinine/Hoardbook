@@ -10,7 +10,7 @@ use tauri::State;
 use crate::{
     error::{cmd_err, CmdResult},
     identity_state::SharedIdentity,
-    net,
+    net::{self, SharedRelay},
     store::DataStore,
 };
 
@@ -47,6 +47,7 @@ fn profile_to_teaser(profile: &Profile) -> Teaser {
 pub async fn publish_profile(
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
+    relay: State<'_, SharedRelay>,
 ) -> CmdResult<()> {
     let id_clone = {
         let guard = identity.read().await;
@@ -65,10 +66,8 @@ pub async fn publish_profile(
     let teaser = profile_to_teaser(&profile);
     let event = build_teaser(&id_clone, &teaser).map_err(cmd_err)?;
 
-    let client = net::connect(&id_clone, &store).await.map_err(cmd_err)?;
-    let res = client.publish(&event).await;
-    client.disconnect().await;
-    res.map_err(cmd_err)?;
+    let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
+    client.publish(&event).await.map_err(cmd_err)?;
 
     // Store the published event so unpublish can issue a NIP-09 deletion.
     store.save_published(PROFILE_KEY, &event.as_json()).map_err(cmd_err)?;
@@ -99,6 +98,7 @@ pub(crate) fn compute_content_types(store: &DataStore) -> Vec<String> {
 pub async fn unpublish_profile(
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
+    relay: State<'_, SharedRelay>,
 ) -> CmdResult<()> {
     // Best-effort NIP-09 deletion of the previously-published teaser, then drop the local marker.
     if let Some(json) = store.load_published(PROFILE_KEY).map_err(cmd_err)? {
@@ -106,9 +106,8 @@ pub async fn unpublish_profile(
             (Event::from_json(&json), identity_clone(&identity).await)
         {
             if let Ok(deletion) = hb_net::build_deletion(&id_clone, &event) {
-                if let Ok(client) = net::connect(&id_clone, &store).await {
+                if let Ok(client) = net::client(&id_clone, &store, &relay).await {
                     let _ = client.publish(&deletion).await;
-                    client.disconnect().await;
                 }
             }
         }

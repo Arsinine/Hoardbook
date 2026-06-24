@@ -255,9 +255,72 @@ struct InvitePayload {
 
 // ── topic-id + topic creation ────────────────────────────────────────────────────────────────────
 
+/// The fixed-root categories a **public** Topic path's first segment must be — the existing
+/// content-type enum (M12 W4, Decision K). Validated **client-side**: this is not a registry, not a
+/// gatekeeper, not moderated. Below the root, sub-paths are freeform; pollution is made *inert*
+/// (content-addressed convergence + activity-ranked discovery + normalization), not prevented.
+pub const TOPIC_ROOTS: [&str; 6] = ["video", "audio", "image", "text", "software", "other"];
+
+/// Max segments in a public Topic path (root + 5 sub-segments). A deeper path is rejected so a flood
+/// of junk paths can't make the discovery tree unbounded (Decision K + M).
+pub const MAX_TOPIC_DEPTH: usize = 6;
+
+/// Normalize a Topic path into canonical segments (M12 W4, Decision K), **in order**: **NFKC**
+/// (Unicode compatibility — so a full-width `ｖｉｄｅｏ` or a ligature normalizes to the ASCII form),
+/// then **`to_lowercase()` AFTER NFKC**, then split on `/`, trim each segment, and drop empty
+/// segments (collapsing `//`, leading/trailing `/`). No depth check here — that is validation. Pure.
+fn normalize_path_segments(name: &str) -> Vec<String> {
+    use unicode_normalization::UnicodeNormalization;
+    let nfkc: String = name.nfkc().collect();
+    let lowered = nfkc.to_lowercase(); // lowercase AFTER NFKC (chorus: order matters)
+    lowered
+        .split('/')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// The canonical normalized path string for a Topic name (segments rejoined with `/`). Used by both
+/// [`topic_id_for_name`] and [`public_join_keys`], so a name and its public-join keypair always agree.
+fn normalize_name(name: &str) -> String {
+    normalize_path_segments(name).join("/")
+}
+
+/// The fixed root category of a public Topic name (its first normalized segment) if it is one of
+/// [`TOPIC_ROOTS`], else `None` (a non-category root — e.g. `blah/...` or a bare `anime` — is invalid).
+pub fn topic_root(name: &str) -> Option<&'static str> {
+    let segs = normalize_path_segments(name);
+    let first = segs.first()?;
+    TOPIC_ROOTS.iter().copied().find(|r| r == first)
+}
+
+/// Validate a **public** Topic path (M12 W4, Decision K) — **backend-authoritative** (the UI root
+/// picker is a convenience, not the only barrier): ≥1 segment, the root ∈ [`TOPIC_ROOTS`], and depth
+/// ≤ [`MAX_TOPIC_DEPTH`]. Private Topics keep freeform names (this is a public-namespace rule only).
+pub fn validate_public_name(name: &str) -> Result<(), HbError> {
+    let segs = normalize_path_segments(name);
+    if segs.is_empty() {
+        return Err(HbError::InvalidEvent("a public Topic name cannot be empty".into()));
+    }
+    if topic_root(name).is_none() {
+        return Err(HbError::InvalidEvent(format!(
+            "a public Topic's first path segment must be a category ({}); got '{}'",
+            TOPIC_ROOTS.join("/"),
+            segs[0]
+        )));
+    }
+    if segs.len() > MAX_TOPIC_DEPTH {
+        return Err(HbError::InvalidEvent(format!(
+            "a public Topic path may be at most {MAX_TOPIC_DEPTH} segments deep; got {}",
+            segs.len()
+        )));
+    }
+    Ok(())
+}
+
 /// The deterministic `topic_id` for a **public** Topic name — `hex(SHA256("hoardbook/topic-id" ‖
-/// normalized_name))`, so two people naming the same public Topic land in the **same room**
-/// (name reuse, Decision C). Normalization = trim + lowercase.
+/// normalized_path))`, so two people naming the same public Topic (any case/spacing/extra-slash
+/// variant, or a NFKC-equivalent Unicode form) land in the **same room** (name reuse, Decision C/L).
 pub fn topic_id_for_name(name: &str) -> String {
     let mut h = Sha256::new();
     h.update(b"hoardbook/topic-id");
@@ -265,28 +328,32 @@ pub fn topic_id_for_name(name: &str) -> String {
     hex::encode(h.finalize())
 }
 
-fn normalize_name(name: &str) -> String {
-    name.trim().to_lowercase()
-}
-
-/// Mint a new Topic: a fresh random `topic_key` + its `TopicMeta`. A **public** Topic gets a
-/// name-derived `topic_id` (shared room); a **private** Topic gets a random `topic_id` (unguessable,
-/// unlisted). The key is random either way — a recreated public Topic reuses the id but gets a **new**
-/// key (Decision C), so old-key membership events correctly fail to decrypt against the new room.
-pub fn new_topic(name: &str, description: &str, tags: Vec<String>, private: bool) -> (TopicMeta, TopicKey) {
-    let topic_id = if private {
-        hex::encode(rand::random::<[u8; 32]>())
+/// Mint a new Topic: a fresh random `topic_key` + its `TopicMeta`. A **public** Topic is
+/// **validated** (root ∈ category + depth cap — Decision K) and gets a name-derived `topic_id` over
+/// its **normalized path** (shared room); its stored `name` is the canonical path. A **private**
+/// Topic keeps its freeform name + a random `topic_id` (unguessable, unlisted — the root/depth rules
+/// do not apply). The key is random either way — a recreated public Topic reuses the id but gets a
+/// **new** key (Decision C), so old-key membership events correctly fail to decrypt against the new room.
+pub fn new_topic(
+    name: &str,
+    description: &str,
+    tags: Vec<String>,
+    private: bool,
+) -> Result<(TopicMeta, TopicKey), HbError> {
+    let (topic_id, stored_name) = if private {
+        (hex::encode(rand::random::<[u8; 32]>()), name.to_string())
     } else {
-        topic_id_for_name(name)
+        validate_public_name(name)?;
+        (topic_id_for_name(name), normalize_name(name))
     };
     let meta = TopicMeta {
         topic_id,
-        name: name.to_string(),
+        name: stored_name,
         description: description.to_string(),
         tags,
         private,
     };
-    (meta, TopicKey::generate())
+    Ok((meta, TopicKey::generate()))
 }
 
 // ── symmetric topic crypto (domain-separated from the browse-key + the CEK) ──────────────────────
@@ -761,11 +828,74 @@ mod tests {
     const NOW: u64 = 1_700_000_000;
 
     fn public_topic() -> (TopicMeta, TopicKey) {
-        new_topic("80s-anime", "VHS rips & fansubs", vec!["anime".into(), "vhs".into()], false)
+        // W4: public names are category-rooted paths now ("video/…", not a bare "80s-anime").
+        new_topic("video/80s-anime", "VHS rips & fansubs", vec!["anime".into(), "vhs".into()], false).unwrap()
     }
 
     fn private_topic() -> (TopicMeta, TopicKey) {
-        new_topic("back-room", "private", vec![], true)
+        new_topic("back-room", "private", vec![], true).unwrap()
+    }
+
+    // ───────────────────────── W4: path normalization + fixed-root rule ─────────────────────────
+
+    #[test]
+    fn path_normalizes_case_space_and_extra_slashes_to_one_id() {
+        // Decision K: every trivial variant (case / spacing / leading-trailing-doubled slash)
+        // collapses to ONE normalized path → ONE topic_id (so two creators land in the same room).
+        let canonical = topic_id_for_name("video/animation/anime");
+        for variant in [
+            "Video / Animation / Anime",
+            "  video/animation/anime  ",
+            "video//animation///anime",
+            "/video/animation/anime/",
+            "VIDEO/Animation/ANIME",
+        ] {
+            assert_eq!(topic_id_for_name(variant), canonical, "variant {variant:?} must converge to one id");
+        }
+    }
+
+    #[test]
+    fn path_nfkc_unicode_normalizes_to_the_ascii_id() {
+        // Decision K (Codex #5): a full-width Unicode root NFKC-normalizes to the ASCII category, and
+        // lowercase is applied AFTER NFKC — so `ＶＩＤＥＯ/anime` resolves to the same id as `video/anime`.
+        let ascii = topic_id_for_name("video/anime");
+        assert_eq!(topic_id_for_name("ＶＩＤＥＯ/anime"), ascii, "full-width root → same id (NFKC then lowercase)");
+        // And NFKC makes the full-width root a valid category (else the root check would reject it).
+        assert_eq!(topic_root("ＶＩＤＥＯ/anime"), Some("video"));
+    }
+
+    #[test]
+    fn public_name_with_non_category_root_is_rejected() {
+        // The answer to "what stops /blah/test/video/video?": the root `blah` isn't a category.
+        assert!(new_topic("blah/test/video", "", vec![], false).is_err(), "non-category root rejected");
+        assert!(new_topic("anime", "", vec![], false).is_err(), "a bare non-category name is rejected");
+        assert!(validate_public_name("blah").is_err());
+    }
+
+    #[test]
+    fn public_name_exceeding_depth_cap_is_rejected() {
+        // MAX_TOPIC_DEPTH segments is OK; one deeper is rejected (junk can't make the tree unbounded).
+        let at_cap = std::iter::once("video").chain(std::iter::repeat("x").take(MAX_TOPIC_DEPTH - 1)).collect::<Vec<_>>().join("/");
+        assert!(new_topic(&at_cap, "", vec![], false).is_ok(), "a path at the depth cap is accepted");
+        let too_deep = std::iter::once("video").chain(std::iter::repeat("x").take(MAX_TOPIC_DEPTH)).collect::<Vec<_>>().join("/");
+        assert!(new_topic(&too_deep, "", vec![], false).is_err(), "a path past the depth cap is rejected");
+    }
+
+    #[test]
+    fn valid_category_path_is_accepted_and_name_is_normalized() {
+        let (meta, _key) = new_topic(" Video / Animation / Anime ", "", vec![], false).unwrap();
+        assert_eq!(meta.name, "video/animation/anime", "the stored name is the canonical normalized path");
+        assert!(!meta.private);
+    }
+
+    #[test]
+    fn private_topic_keeps_freeform_name_and_random_id() {
+        // The root/depth rules are a PUBLIC-namespace rule only — a private Topic keeps its freeform
+        // name (no category root required) and a random, unlisted id.
+        let (a, _) = new_topic("back room: 90s tapes", "", vec![], true).unwrap();
+        let (b, _) = new_topic("back room: 90s tapes", "", vec![], true).unwrap();
+        assert_eq!(a.name, "back room: 90s tapes", "private name is kept verbatim (freeform)");
+        assert_ne!(a.topic_id, b.topic_id, "private ids are random (not name-derived)");
     }
 
     // ───────────────────────── THE NEGATIVES (first, hardest) ─────────────────────────
@@ -782,7 +912,7 @@ mod tests {
         // And the parser returns meta with no key channel at all.
         let parsed = parse_announce(&ev).unwrap();
         assert_eq!(parsed.topic_id, meta.topic_id);
-        assert_eq!(parsed.name, "80s-anime");
+        assert_eq!(parsed.name, "video/80s-anime", "the announce carries the canonical normalized path");
         assert!(!parsed.private);
     }
 
@@ -818,7 +948,7 @@ mod tests {
         let member = Identity::generate();
         let m = seal_membership(&key, &meta.topic_id, &member, NOW).unwrap();
         let p = seal_post(&key, &meta.topic_id, &member, "hi", NOW).unwrap();
-        let (_other_meta, wrong_key) = new_topic("other", "", vec![], false);
+        let (_other_meta, wrong_key) = new_topic("other", "", vec![], false).unwrap();
         assert!(matches!(open_membership(&wrong_key, &m), Err(HbError::DecryptionFailed)));
         assert!(matches!(open_post(&wrong_key, &p, NOW), Err(HbError::DecryptionFailed)));
     }
@@ -977,7 +1107,7 @@ mod tests {
         let member = Identity::generate();
         let old_ev = seal_membership(&old_key, &meta.topic_id, &member, NOW).unwrap();
         // Recreate: same name ⇒ same topic_id, fresh key.
-        let (meta2, new_key) = new_topic(&meta.name, "recreated", vec![], false);
+        let (meta2, new_key) = new_topic(&meta.name, "recreated", vec![], false).unwrap();
         assert_eq!(meta2.topic_id, meta.topic_id, "name reuse ⇒ same topic_id");
         assert!(open_membership(&new_key, &old_ev).is_err(), "old-key membership fails under the new key");
         assert!(roster(&new_key, &[old_ev]).is_empty(), "stale events do not pollute the recreated roster");
