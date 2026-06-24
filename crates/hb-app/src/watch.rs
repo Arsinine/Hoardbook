@@ -31,6 +31,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::commands::collection::{count_items, publish_collection_inner, rescan_listing};
 use crate::identity_state::SharedIdentity;
+use crate::net::SharedRelay;
 use crate::store::DataStore;
 
 /// Default per-collection republish cadence floor: a churning folder cannot publish (and therefore
@@ -256,6 +257,7 @@ pub(crate) fn evaluate_rescan(slug: &str, store: &DataStore) -> Result<RescanDec
 pub struct RelayPublishSink {
     pub store: DataStore,
     pub identity: SharedIdentity,
+    pub relay: SharedRelay,
 }
 
 #[async_trait::async_trait]
@@ -283,7 +285,7 @@ impl PublishSink for RelayPublishSink {
                     col.last_updated = chrono::Utc::now();
                     self.store.save_collection_draft(&col)?;
                 }
-                publish_collection_inner(slug, &self.store, &id, &browse_key)
+                publish_collection_inner(slug, &self.store, &id, &browse_key, &self.relay)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
                 Ok(true)

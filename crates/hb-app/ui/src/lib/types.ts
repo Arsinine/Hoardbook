@@ -103,6 +103,9 @@ export interface CachedPeer {
 	online: boolean;
 	last_fetched: string;
 	local_tags: string[];
+	/** §7 word+color impersonation fingerprint, derived from npub by Rust (shape matches
+	 *  identity-display.ts::Fingerprint). Absent for a pre-fingerprint stored contact until refreshed. */
+	fingerprint?: { words: string[]; colorHex: string };
 }
 
 export interface ScanOptions {

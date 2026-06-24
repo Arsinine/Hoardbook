@@ -1,12 +1,34 @@
 <script lang="ts">
-	import { pasteKey, follow, refreshContact, unfollowContact, setContactTags, groupsGet, contactUpdateGroups, groupsSetTrusted, browsePrivateCollections } from '$lib/api.js';
+	import { pasteKey, follow, refreshContact, unfollowContact, setContactTags, groupsGet, contactUpdateGroups, groupsSetTrusted, browsePrivateCollections, onlineCount, relayStatus, type OnlineCount, type RelayHealth } from '$lib/api.js';
 	import { contacts, identity, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
+	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
 	import type { CachedPeer, Collection, Group } from '$lib/types.js';
 	import { NOT_DRM_NOTE, isTrusted } from '$lib/private-collections-view.js';
-	import { onMount } from 'svelte';
+	import { onlineChipView } from '$lib/online-chip.js';
+	import { relayWhyHint } from '$lib/relay-health.js';
+	import { ONLINE_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
+	import { onMount, onDestroy } from 'svelte';
+
+	// ── "🟢 N hoarders online" chip (M9) — relay-derived, no telemetry. **Always shown** (the Settings
+	//    hide-toggle was removed); lives here on Contacts. Best-effort + cached on the backend; polled on
+	//    a slow tick (L4-budgeted); shows "–" while the count is unknown (m4).
+	let onlineData: OnlineCount | null = null;
+	let relayHealth: RelayHealth[] = [];
+	$: chip = onlineChipView(onlineData, true);
+	// M12 W1 Decision D: when the chip can't show a number, say *why* (which relays are unreachable).
+	$: whyHint = chip.unknown ? relayWhyHint(relayHealth) : '';
+	let onlinePollTimer: ReturnType<typeof setInterval> | undefined;
+	async function refreshOnline() {
+		// Decision B: don't poll the relays while the window is hidden (tray/minimized).
+		if (document.hidden) return;
+		try { onlineData = await onlineCount(); } catch { /* keep last value; chip shows "–" */ }
+		// Drive the "why" hint only when the count is unknown (cheap, status-only read).
+		try { relayHealth = await relayStatus(); } catch { /* leave last health */ }
+	}
+	onDestroy(() => { if (onlinePollTimer) clearInterval(onlinePollTimer); });
 
 
 	// Groups state
@@ -67,6 +89,8 @@
 	onMount(() => {
 		loadGroups();
 		loadPrivate();
+		refreshOnline();
+		onlinePollTimer = setInterval(refreshOnline, ONLINE_POLL_VISIBLE_MS);
 		// Refresh all contacts in parallel on page load (task 4)
 		$contacts.forEach(async (c) => {
 			try {
@@ -234,6 +258,12 @@
 			{$contacts.length} followed peer{$contacts.length !== 1 ? 's' : ''} · {$contacts.filter(c => c.online).length} online
 		</div>
 	</div>
+	{#if chip.show}
+		<span class="online-chip" class:online-chip-muted={chip.unknown} title={whyHint ? `Hoarders online now — ${whyHint}` : 'Hoarders online now'}>{chip.label}</span>
+		{#if whyHint}
+			<span class="online-why" title={whyHint}>({whyHint})</span>
+		{/if}
+	{/if}
 </div>
 
 <div class="body">
@@ -246,7 +276,7 @@
 				<input
 					class="search-input hb-mono"
 					type="text"
-					placeholder="hb1_…"
+					placeholder="npub1… or share code (hbk1…)"
 					bind:value={input}
 					on:keydown={handleKeydown}
 				/>
@@ -301,60 +331,34 @@
 							<p class="peer-bio">{result.profile.bio}</p>
 						{/if}
 
-						{#if result.profile?.location || result.profile?.email || (result.profile?.social_links?.length ?? 0) > 0}
-							<div class="contact-meta" style="margin-top: 4px">
-								{#if result.profile?.location}
-									<span class="meta-chip">{result.profile.location}</span>
-								{/if}
-								{#if result.profile?.email}
-									<a class="meta-chip meta-link" href="mailto:{result.profile.email}">{result.profile.email}</a>
-								{/if}
-								{#each (result.profile?.social_links ?? []) as link}
-									<span class="meta-chip meta-social">{link.platform}: {link.handle}</span>
-								{/each}
+						<!-- §7 impersonation fingerprint — your at-a-glance trust check for a stranger you
+						     just looked up (bound to the npub, not the display name). -->
+						{#if result.fingerprint}
+							<div class="fp-row">
+								<span class="fp-swatch" style="background:{result.fingerprint.colorHex}" />
+								<span class="fp-words hb-mono">{result.fingerprint.words.join(' ')} {result.fingerprint.colorHex}</span>
+								<FeatureTooltip key="fingerprint" />
 							</div>
 						{/if}
 
-						<div class="peer-metrics">
-							{#if result.profile?.est_size}
-								<div class="metric">
-									<div class="metric-label">Size</div>
-									<div class="metric-val">{result.profile.est_size}</div>
-								</div>
-								<div class="metric-divider" />
-							{/if}
-							{#if result.collections.length > 0}
-								<div class="metric">
-									<div class="metric-label">Collections</div>
-									<div class="metric-val">{result.collections.length}</div>
-								</div>
-							{/if}
-							{#if result.profile?.since}
-								<div class="metric-divider" />
-								<div class="metric">
-									<div class="metric-label">Since</div>
-									<div class="metric-val">{result.profile.since}</div>
-								</div>
-							{/if}
-							{#if result.profile?.languages?.length}
-								<div class="metric-divider" />
-								<div class="metric">
-									<div class="metric-label">Languages</div>
-									<div class="metric-val">{result.profile.languages.join(', ')}</div>
-								</div>
-							{/if}
-						</div>
+						<!-- Content types + tags are the only rich fields a public teaser carries, so they
+						     are what a lookup can actually show (§4/§5). -->
+						{#if (result.profile?.content_types?.length ?? 0) > 0}
+							<div class="badge-row-sm">
+								{#each result.profile?.content_types ?? [] as ct (ct)}
+									<span class="ct-badge">{ct}</span>
+								{/each}
+							</div>
+						{/if}
+						{#if (result.profile?.tags?.length ?? 0) > 0}
+							<div class="peer-tags">
+								{#each result.profile?.tags ?? [] as tag (tag)}
+									<span class="peer-tag">{tag}</span>
+								{/each}
+							</div>
+						{/if}
 					</div>
 				</div>
-
-				{#if result.collections.length > 0}
-					<div class="section-label">Public collections</div>
-					<div class="coll-list-sm">
-						{#each result.collections as col}
-							<CollectionPanel collection={col} />
-						{/each}
-					</div>
-				{/if}
 			</div>
 		{/if}
 	</div>
@@ -557,6 +561,9 @@
 	}
 	.topbar-title { font-size: 17px; font-weight: 600; letter-spacing: -0.3px; }
 	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
+	.online-chip { font-size: 12px; font-weight: 600; color: var(--fg-dim); white-space: nowrap; }
+	.online-chip-muted { opacity: 0.55; }
+	.online-why { font-size: 10.5px; color: var(--fg-dim); opacity: 0.7; white-space: nowrap; }
 
 	.body { padding: 24px; overflow-y: auto; flex: 1; max-width: 720px; display: flex; flex-direction: column; gap: 0; }
 
@@ -638,18 +645,27 @@
 
 	.peer-bio { font-size: 13px; color: var(--fg); line-height: 1.55; margin: 0; }
 
-	.peer-metrics { display: flex; gap: 14px; font-size: 12px; align-items: center; flex-wrap: wrap; }
-
-	.metric { display: flex; flex-direction: column; gap: 2px; }
-
-	.metric-label {
-		font-size: 10.5px; color: var(--fg-dim);
-		text-transform: uppercase; letter-spacing: 0.9px; font-weight: 600;
+	/* §7 fingerprint row on the lookup card */
+	.fp-row { display: flex; align-items: center; gap: 7px; margin-top: 2px; }
+	.fp-swatch {
+		width: 14px; height: 14px; border-radius: 4px;
+		border: 1px solid var(--border-strong); flex-shrink: 0;
 	}
+	.fp-words { font-size: 11.5px; color: var(--fg-muted); }
 
-	.metric-val { font-size: 14px; font-weight: 600; color: var(--fg); font-feature-settings: 'tnum'; }
-
-	.metric-divider { width: 1px; align-self: stretch; background: var(--divider); }
+	/* Content-type badges + profile tags — the rich public fields a teaser carries */
+	.badge-row-sm { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+	.ct-badge {
+		font-size: 10.5px; padding: 2px 8px; border-radius: 999px;
+		background: var(--bg-elev3); color: var(--fg-muted);
+		border: 1px solid var(--border);
+	}
+	.peer-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+	.peer-tag {
+		font-size: 10.5px; padding: 2px 8px; border-radius: 999px;
+		color: var(--accent);
+		background: color-mix(in oklch, var(--accent) 12%, transparent);
+	}
 
 	.section-label {
 		font-size: 10.5px; color: var(--fg-dim);
@@ -678,8 +694,6 @@
 	}
 	.not-drm-note { margin: 2px 0 0; font-size: 11px; line-height: 1.4; color: var(--fg-dim); }
 
-	.coll-list-sm { display: flex; flex-direction: column; gap: 8px; }
-
 	/* Divider */
 	.section-divider {
 		display: flex;
@@ -701,23 +715,6 @@
 		text-transform: uppercase; letter-spacing: 1.2px; font-weight: 600;
 		white-space: nowrap;
 	}
-
-	/* Recommended list */
-	.rec-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
-
-	.rec-card {
-		background: var(--bg-elev1);
-		border: 1px solid var(--border);
-		border-radius: 10px;
-		padding: 12px 14px;
-		display: flex;
-		gap: 12px;
-		align-items: center;
-	}
-
-	.rec-info { flex: 1; min-width: 0; }
-
-	.rec-location { font-size: 11px; color: var(--fg-dim); margin-top: 2px; display: block; }
 
 	/* Contacts list */
 	.empty { color: var(--fg-dim); font-size: 13px; padding: 16px 0; }
@@ -769,20 +766,6 @@
 	}
 	.modal-body { font-size: 13px; color: var(--fg-muted); line-height: 1.55; margin: 0 0 18px; }
 	.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
-
-	/* Discover (DHT) */
-	.discover-form { margin-bottom: 8px; display: flex; flex-direction: column; gap: 10px; }
-	.discover-inputs { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-	.disc-input {
-		flex: 1; min-width: 120px;
-		padding: 0 11px; height: 34px;
-		background: var(--bg-input); border: 1px solid var(--border); border-radius: 7px;
-		font-family: var(--font-ui); font-size: 13px; color: var(--fg); outline: none;
-	}
-	.disc-input::placeholder { color: var(--fg-dim); }
-	.disc-input:focus { border-color: var(--accent); }
-	.watch-save-row { display: flex; gap: 8px; align-items: center; }
-	.rec-bio { font-size: 11.5px; color: var(--fg-muted); line-height: 1.4; margin: 2px 0 0; }
 
 	/* Tag filter bar */
 	.tag-filter-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }

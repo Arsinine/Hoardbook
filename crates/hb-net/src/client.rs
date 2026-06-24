@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use hb_core::Identity;
 use nostr_sdk::prelude::*;
+use serde::Serialize;
 
 use crate::error::NetError;
 
@@ -28,6 +29,49 @@ pub struct PublishOutcome {
     pub accepted: Vec<String>,
     /// Relays that rejected it, with the reason string they returned.
     pub rejected: Vec<(String, String)>,
+}
+
+/// Live per-relay reachability on the data path (M12 W1, Decision D) — so a "–"/Offline read can
+/// say **why** (rate-limited vs unreachable vs connecting), not just fail identically. Serialized
+/// camelCase for the Settings relay list + the chip "why" hint.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayHealth {
+    pub url: String,
+    /// A stable lowercase status label (`connected` / `connecting` / `disconnected` / …).
+    pub status: String,
+    /// Whether the relay is currently connected (the green/grey dot).
+    pub connected: bool,
+    /// A human-readable last error, when the pool surfaces one (else `None` — the status label is
+    /// the primary signal; nostr-sdk's stats carry no error string in this version).
+    pub last_error: Option<String>,
+}
+
+/// A stable lowercase label for a [`RelayStatus`] (the wire contract for the Settings relay rows).
+fn status_label(s: RelayStatus) -> &'static str {
+    match s {
+        RelayStatus::Initialized => "initialized",
+        RelayStatus::Pending => "pending",
+        RelayStatus::Connecting => "connecting",
+        RelayStatus::Connected => "connected",
+        RelayStatus::Disconnected => "disconnected",
+        RelayStatus::Terminated => "terminated",
+        RelayStatus::Banned => "banned",
+        RelayStatus::Sleeping => "sleeping",
+    }
+}
+
+/// Whether a relay pool is still **live** (M12 W1, Decision A-recovery): live if it holds at least
+/// one relay that is **not** in a dead terminal state (`Terminated`/`Banned` — "no retry will
+/// occur"). `Disconnected` is transient (nostr-sdk auto-reconnects — "another attempt will occur
+/// soon"), so it counts as live. A fully-terminated pool (e.g. after `disconnect()` on exit, or
+/// every relay banned) is dead → `net::client` rebuilds it rather than returning a corpse. Pure, so
+/// the dead-pool classification is unit-tested without a relay.
+pub fn pool_is_live(statuses: &[RelayStatus]) -> bool {
+    !statuses.is_empty()
+        && statuses
+            .iter()
+            .any(|s| !matches!(s, RelayStatus::Terminated | RelayStatus::Banned))
 }
 
 impl RelayClient {
@@ -72,6 +116,60 @@ impl RelayClient {
             return Err(NetError::PublishRejected(format!("{:?}", outcome.rejected)));
         }
         Ok(outcome)
+    }
+
+    /// Publish a pre-signed event to a **targeted** subset of relays (M12 W2, Decision F). The
+    /// persistent shared client accretes relays over a session (peer outboxes from prior browses),
+    /// so a bare [`publish`](Self::publish) would broadcast a gift-wrap DM to **every** connected
+    /// relay — unnecessary metadata spread. Delivery targets `relays` only (the recipient's
+    /// read-relays ∪ your write/seed). The caller `ensure_relays`'s the set first so it is connected.
+    /// Errors only if **no** targeted relay accepted (mirrors [`publish`](Self::publish)).
+    pub async fn publish_to(&self, event: &Event, relays: &[String]) -> Result<PublishOutcome, NetError> {
+        if relays.is_empty() {
+            return Err(NetError::NoRelayConnected("no target relays for publish_to".into()));
+        }
+        let output = self
+            .client
+            .send_event_to(relays.iter().map(|s| s.as_str()), event)
+            .await
+            .map_err(|e| NetError::Client(format!("send_event_to(kind {}): {e}", event.kind.as_u16())))?;
+        let outcome = PublishOutcome {
+            accepted: output.success.iter().map(|u| u.to_string()).collect(),
+            rejected: output.failed.iter().map(|(u, why)| (u.to_string(), why.clone())).collect(),
+        };
+        if outcome.accepted.is_empty() {
+            return Err(NetError::PublishRejected(format!("{:?}", outcome.rejected)));
+        }
+        Ok(outcome)
+    }
+
+    /// Whether this client's pool is still **live** (M12 W1, Decision A-recovery): at least one relay
+    /// not in a dead terminal state. `net::client` rebuilds a dead client rather than returning a
+    /// corpse that fails every command silently.
+    pub async fn is_live(&self) -> bool {
+        let relays = self.client.relays().await;
+        let statuses: Vec<RelayStatus> = relays.values().map(|r| r.status()).collect();
+        pool_is_live(&statuses)
+    }
+
+    /// Live per-relay reachability for the **configured** relay set (M12 W1, Decision D) — one
+    /// [`RelayHealth`] per configured relay (peer-outbox relays added by `ensure_relays` are NOT
+    /// reported here; the Settings list shows the user's own set). A configured relay missing from
+    /// the live pool reports `disconnected`.
+    pub async fn relay_status(&self) -> Vec<RelayHealth> {
+        let live = self.client.relays().await;
+        self.relays
+            .iter()
+            .map(|url| {
+                let want = url.trim_end_matches('/');
+                let found = live.iter().find(|(u, _)| u.to_string().trim_end_matches('/') == want);
+                let (status, connected) = match found {
+                    Some((_, r)) => (status_label(r.status()).to_string(), r.is_connected()),
+                    None => ("disconnected".to_string(), false),
+                };
+                RelayHealth { url: url.clone(), status, connected, last_error: None }
+            })
+            .collect()
     }
 
     /// Fetch events by `filter`, **deduped by event id** across the relay set (a peer's event
@@ -196,5 +294,37 @@ mod tests {
     fn teaser_filter_constrains_kind_and_tags() {
         let f = teaser_search_filter(&["anime".into()], &["video".into()]).unwrap();
         assert!(!f.is_empty(), "a constrained filter is not empty");
+    }
+
+    #[test]
+    fn pool_live_when_any_relay_not_terminal() {
+        // M12 W1 Decision A-recovery: a pool is live if ANY relay is recoverable. Connected,
+        // Connecting, and even Disconnected (transient — nostr-sdk auto-reconnects) are all "live".
+        assert!(pool_is_live(&[RelayStatus::Connected]));
+        assert!(pool_is_live(&[RelayStatus::Connecting]));
+        assert!(pool_is_live(&[RelayStatus::Disconnected]), "Disconnected is transient, not dead");
+        assert!(pool_is_live(&[RelayStatus::Terminated, RelayStatus::Connected]), "one live relay keeps the pool live");
+    }
+
+    #[test]
+    fn pool_dead_when_all_terminal_or_empty() {
+        // A fully-terminated/banned pool (e.g. after disconnect() on exit) is dead → net::client
+        // rebuilds it rather than returning a corpse. An empty pool is dead too.
+        assert!(!pool_is_live(&[RelayStatus::Terminated]));
+        assert!(!pool_is_live(&[RelayStatus::Terminated, RelayStatus::Banned]));
+        assert!(!pool_is_live(&[]), "no relays = not live");
+    }
+
+    #[test]
+    fn relay_health_serializes_camelcase_for_the_settings_rows() {
+        let h = RelayHealth {
+            url: "wss://relay.example".into(),
+            status: "connecting".into(),
+            connected: false,
+            last_error: None,
+        };
+        let json = serde_json::to_string(&h).unwrap();
+        assert!(json.contains("\"lastError\":null"), "camelCase last_error: {json}");
+        assert!(json.contains("\"connected\":false"));
     }
 }

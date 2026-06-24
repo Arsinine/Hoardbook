@@ -38,14 +38,21 @@ pub async fn publish_topic(client: &RelayClient, events: &[Event]) -> Result<(),
     Ok(())
 }
 
+/// Top-N cap for activity-ranked topic discovery (M12 W4, Decision M) — mirrors the teaser/discovery
+/// cap, so a flood of junk paths can't make discovery or the client-side tree unbounded.
+pub const TOPIC_DISCOVERY_CAP: usize = 100;
+
 /// Discover public Topics by tag — a relay read of `KIND_TOPIC_ANNOUNCE` events `#t`-tagged with any
-/// of `tags`, parsed + verified through `hb-core`, deduped by `topic_id` keeping the newest announce.
-/// An empty `tags` is refused before any query (an unbounded discovery is never issued).
+/// of `tags`, parsed + verified through `hb-core`, deduped by `topic_id` keeping the newest announce,
+/// then **activity-ranked** (M12 W4, Decision M): each result is paired with its best-effort,
+/// **spoofable** `member_count` and the list is sorted by it **descending**, so popular shared paths
+/// surface and junk singletons sink. Returns at most [`TOPIC_DISCOVERY_CAP`] entries — a truncation is
+/// **logged honestly** (M9 style), never silent. An empty `tags` is refused before any query.
 pub async fn discover_public_topics(
     client: &RelayClient,
     tags: &[String],
     timeout: Duration,
-) -> Result<Vec<TopicMeta>, NetError> {
+) -> Result<Vec<(TopicMeta, usize)>, NetError> {
     if tags.is_empty() {
         return Err(NetError::EmptyFilter);
     }
@@ -64,9 +71,29 @@ pub async fn discover_public_topics(
             }
         }
     }
-    let mut out: Vec<TopicMeta> = best.into_values().map(|(_, m)| m).collect();
-    out.sort_by(|a, b| a.topic_id.cmp(&b.topic_id));
-    Ok(out)
+    // Activity-rank: pair each topic with its (spoofable) member count, sort desc, tiebreak on id.
+    let mut scored: Vec<(TopicMeta, usize)> = Vec::with_capacity(best.len());
+    for (_, (_, meta)) in best {
+        // A member-count fetch error scores the topic 0 (best-effort + spoofable anyway); log it so a
+        // relay-side failure that buries a popular topic is debuggable, not silent (chorus round-1).
+        let count = match member_count(client, &meta.topic_id, timeout).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!("topic discovery: member_count failed for {}: {e}", meta.topic_id);
+                0
+            }
+        };
+        scored.push((meta, count));
+    }
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.topic_id.cmp(&b.0.topic_id)));
+    let total = scored.len();
+    if total > TOPIC_DISCOVERY_CAP {
+        tracing::info!(
+            "topic discovery: showing the top {TOPIC_DISCOVERY_CAP} of {total} matches by member count (activity-ranked; junk singletons sink)"
+        );
+        scored.truncate(TOPIC_DISCOVERY_CAP);
+    }
+    Ok(scored)
 }
 
 /// The **best-effort, spoofable** pre-join member count = the number of distinct `KIND_TOPIC_MEMBER`

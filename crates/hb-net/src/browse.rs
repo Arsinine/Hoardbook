@@ -23,7 +23,7 @@ use nostr::prelude::*;
 use crate::client::{teaser_search_filter, RelayClient};
 use crate::discover::{ingest_teasers, select_newest_by_created_at, SearchHit};
 use crate::error::NetError;
-use crate::nip65::{bootstrap_order, parse_relay_list};
+use crate::nip65::{bootstrap_order, inbox_order, parse_relay_list};
 use crate::render::{render_listing, RenderedListing};
 use crate::split::split_listing;
 
@@ -93,6 +93,37 @@ pub async fn resolve_peer_relays(
         Err(_) => None,
     };
     bootstrap_order(seed, own, peer_list.as_ref())
+}
+
+/// Resolve a DM recipient's **read** relays (their inbox) for delivery (spec §9, M12 W2). The mirror
+/// of [`resolve_peer_relays`], read side: fetch the recipient's kind-10002, **pin it to their npub**
+/// (a lying relay can't substitute someone else's list), take the newest, and order via
+/// [`inbox_order`] — recipient read first, then your own + seed (best-effort fallback when no list).
+/// The returned set is what [`RelayClient::publish_to`] targets, so the wrap reaches the inbox and
+/// your own relays but **no unrelated accreted relay** (chorus #3).
+pub async fn resolve_recipient_relays(
+    client: &RelayClient,
+    recipient: &PublicKey,
+    seed: &[String],
+    own: &[String],
+    timeout: Duration,
+) -> Vec<String> {
+    let read_list = match client
+        .fetch(Filter::new().author(*recipient).kind(Kind::RelayList), timeout)
+        .await
+    {
+        Ok(events) => {
+            let pinned: Vec<Event> = events.into_iter().filter(|e| &e.pubkey == recipient).collect();
+            select_newest_by_created_at(pinned).and_then(|e| parse_relay_list(&e).ok())
+        }
+        // No NIP-65 found / fetch error → best-effort to own + seed (chorus round-1: log, don't fail
+        // silently — a DM may then not reach a recipient on a disjoint relay set).
+        Err(e) => {
+            tracing::debug!("DM delivery: could not resolve recipient read-relays ({e}); falling back to own/seed");
+            None
+        }
+    };
+    inbox_order(seed, own, read_list.as_ref())
 }
 
 /// Browse a share code as a pure relay read. Always returns the teaser when present; the listing is

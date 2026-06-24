@@ -9,7 +9,7 @@ use anyhow::{ensure, Result};
 use hb_core::event::{build_listing_event, build_teaser, parse_teaser, Teaser, KIND_LISTING, KIND_TEASER};
 use hb_core::Identity;
 use hb_net::{
-    bootstrap_order, build_relay_list, mine_pow, parse_relay_list, pow_difficulty,
+    bootstrap_order, build_relay_list, mine_pow, parse_relay_list, pow_difficulty, search_teasers,
     teaser_search_filter, RelayClient,
 };
 use nostr::prelude::*;
@@ -23,6 +23,7 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
         result("DISC2 NIP-65 resolution", disc2(ctx).await),
         result("DISC3 teaser-only", disc3(ctx).await),
         result("DISC4 invalid filter rejected", disc4().await),
+        result("DISC6 search_peers orchestration (dedup/cap/teaser-only)", disc6(ctx).await),
         disc5(ctx).await,
     ]
 }
@@ -159,6 +160,32 @@ async fn disc3(ctx: &Ctx) -> Result<()> {
 async fn disc4() -> Result<()> {
     // Empty tags AND empty content-types is refused before any relay query.
     ensure!(teaser_search_filter(&[], &[]).is_err(), "empty discovery filter was not rejected");
+    Ok(())
+}
+
+async fn disc6(ctx: &Ctx) -> Result<()> {
+    // W3 — the production `search_teasers` path the `search_peers` command wraps: publish two teasers
+    // (different tags) + the matching one twice (a relay returning a dup), plus a non-matching one,
+    // then assert the search surfaces the matching author exactly once (deduped by npub), capped, and
+    // that a SearchHit is the teaser only — there is no field for a listing/browse-key (DISC3).
+    let want = ctx.tag("w3match");
+    let other = ctx.tag("w3other");
+    let p1 = Identity::generate();
+    let p2 = Identity::generate();
+    let t1 = build_teaser(&p1, &teaser("match", vec![want.clone()], vec![ctx.tag("video")]))?;
+    let t2 = build_teaser(&p2, &teaser("other", vec![other.clone()], vec![ctx.tag("audio")]))?;
+
+    let client = ctx.connect(&p1).await?;
+    client.publish(&t1).await?;
+    client.publish(&t1).await?; // a relay re-serving the same author's teaser must dedup to one hit
+    client.publish(&t2).await?;
+    settle().await;
+
+    let hits = search_teasers(&client, &[want.clone()], &[], 100, FETCH_TIMEOUT).await?;
+    client.disconnect().await;
+    ensure!(hits.len() == 1, "expected exactly one deduped hit, got {}", hits.len());
+    ensure!(hits[0].npub == p1.npub(), "the matching author was not surfaced");
+    ensure!(hits[0].teaser.tags.contains(&want), "the hit carries the matching teaser tags");
     Ok(())
 }
 

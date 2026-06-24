@@ -11,6 +11,7 @@
 	import ScanDialog from '$lib/components/ScanDialog.svelte';
 	import ShareSettingsDialog from '$lib/components/ShareSettingsDialog.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
+	import HintMarker from '$lib/components/HintMarker.svelte';
 	import type { Collection, Profile, Visibility } from '$lib/types.js';
 
 	// Each language is shown in its own language (autonym).
@@ -156,7 +157,19 @@
 	let tagInput = '';
 	let willingInput = '';
 
-	const WILLING_OPTIONS = ['seed', 'trade', 'upload'];
+	const WILLING_OPTIONS = ['seed', 'trade', 'upload', 'meet up'];
+
+	// Per-collection content-type declaration (HOARDBOOK_SPEC §4). Coarse, fixed enum; stored values
+	// are lowercase, labels are display-only. At least one must be selected before a collection can be
+	// published (gate: prepare_listing → "At least one content type is required").
+	const CONTENT_TYPES: { value: string; label: string }[] = [
+		{ value: 'video', label: 'Video' },
+		{ value: 'audio', label: 'Audio' },
+		{ value: 'image', label: 'Image' },
+		{ value: 'text', label: 'Text' },
+		{ value: 'software', label: 'Software' },
+		{ value: 'other', label: 'Other' },
+	];
 
 	function addTag(raw: string) {
 		const t = raw.trim().replace(/,$/, '').toLowerCase();
@@ -346,6 +359,20 @@
 		try {
 			await updateCollectionMeta(slug, col.description, col.content_types, col.tags ?? [], newLangs, colSorted[slug] ?? false);
 			collections.update(cols => cols.map(c => c.slug === slug ? { ...c, languages: newLangs } : c));
+		} catch (e) { toast(String(e), 'error'); }
+	}
+
+	// Toggle a content type on a collection (§4 multi-select, OR logic). Persists via the same
+	// update_collection_meta seam, so the publish gate that reads content_types is now satisfiable.
+	async function toggleColContentType(col: Collection, value: string) {
+		const slug = col.slug;
+		const current = col.content_types ?? [];
+		const next = current.includes(value)
+			? current.filter(t => t !== value)
+			: [...current, value];
+		try {
+			await updateCollectionMeta(slug, col.description, next, col.tags ?? [], col.languages ?? [], colSorted[slug] ?? false);
+			collections.update(cols => cols.map(c => c.slug === slug ? { ...c, content_types: next } : c));
 		} catch (e) { toast(String(e), 'error'); }
 	}
 
@@ -666,7 +693,7 @@
 				</div>
 
 				<div class="field">
-					<label class="field-label">Region / City</label>
+					<label class="field-label">Region / City<HintMarker label="Region / City" text="Optional — fill this in if you're interested in local meetups." /></label>
 					<input class="hb-input" type="text" bind:value={form.location} />
 				</div>
 
@@ -776,6 +803,22 @@
 				{:else}
 					{#each $collections as col (col.slug)}
 						<CollectionPanel collection={col}>
+							<!-- Content types (§4): at least one required before publishing -->
+							<div class="coll-ct-row">
+								<span class="coll-ct-label">Content types<HintMarker label="Content types" text="Pick at least one before publishing. Coarse categories for directory filtering — a mixed archive can declare several." /></span>
+								<div class="ct-toggle-row">
+									{#each CONTENT_TYPES as ct (ct.value)}
+										<button
+											class="willing-btn"
+											class:willing-active={(col.content_types ?? []).includes(ct.value)}
+											on:click={() => toggleColContentType(col, ct.value)}
+										>{ct.label}</button>
+									{/each}
+								</div>
+								{#if (col.content_types ?? []).length === 0}
+									<div class="ct-warn">Select at least one content type to publish this collection.</div>
+								{/if}
+							</div>
 							<!-- Language tags -->
 							<div class="coll-lang-row">
 								{#each (col.languages ?? []) as lang (lang)}
@@ -1184,6 +1227,31 @@
 	}
 
 	.coll-list { display: flex; flex-direction: column; gap: 10px; }
+
+	.coll-ct-row {
+		padding: 6px 10px 4px;
+		border-top: 1px solid var(--divider);
+	}
+
+	.coll-ct-label {
+		display: inline-flex;
+		align-items: center;
+		font-size: 11px;
+		color: var(--fg-dim);
+		margin-bottom: 4px;
+	}
+
+	.ct-toggle-row {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+	}
+
+	.ct-warn {
+		font-size: 11px;
+		color: var(--error, #e05c5c);
+		margin-top: 4px;
+	}
 
 	.coll-lang-row {
 		display: flex;

@@ -2,16 +2,66 @@
 	import { onMount, tick } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { contacts, identity, inboxMessages, sentMessages, unreadCount, toast } from '$lib/stores.js';
-	import { getMessages, sendMessage, pasteKey } from '$lib/api.js';
+	import { getMessages, sendMessage, pasteKey, topicList, topicChannel, topicPost } from '$lib/api.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
-	import type { CachedPeer, ReceivedMessage } from '$lib/types.js';
+	import { DM_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
+	import type { CachedPeer, ReceivedMessage, TopicView, ChannelPost } from '$lib/types.js';
 
 	let loading = false;
 	let sending = false;
 	let selectedPeer: CachedPeer | null = null;
 	let draft = '';
 	let threadEl: HTMLElement;
+
+	// ── Topic channels (M11) — a Topic you've joined surfaces here as a persistent channel. The
+	//    channel ENTRY lasts as long as your membership (durable, §11), but its posts are 24h-ephemeral
+	//    (wiped server-side via NIP-40 + the local filter in `topic_channel`). Posting lives here now,
+	//    not on the Topics page (which keeps join/leave/roster/invite).
+	let topics: TopicView[] = [];
+	let selectedTopic: TopicView | null = null;
+	let channelPosts: ChannelPost[] = [];
+	let channelDraft = '';
+	let channelSending = false;
+
+	async function loadTopics() {
+		try { topics = await topicList(); } catch { /* relay unreachable */ }
+	}
+
+	async function loadChannel(topicId: string) {
+		try { channelPosts = await topicChannel(topicId); } catch { /* relay unreachable */ }
+	}
+
+	async function selectTopic(t: TopicView) {
+		selectedTopic = t;
+		selectedPeer = null;
+		channelPosts = [];
+		await loadChannel(t.topic_id);
+		await tick();
+		scrollToBottom();
+	}
+
+	async function sendChannelPost() {
+		if (!selectedTopic || !channelDraft.trim() || channelSending) return;
+		channelSending = true;
+		const body = channelDraft.trim();
+		channelDraft = '';
+		try {
+			await topicPost(selectedTopic.topic_id, body);
+			await loadChannel(selectedTopic.topic_id);
+			await tick();
+			scrollToBottom();
+		} catch (e) {
+			toast(String(e), 'error');
+			channelDraft = body;
+		} finally {
+			channelSending = false;
+		}
+	}
+
+	function channelKeydown(e: KeyboardEvent) {
+		if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChannelPost(); }
+	}
 
 	// Stable set of message keys we've already counted for badge purposes.
 	// Format: `${from}|${sent_at}` — prevents double-counting on relay inconsistencies.
@@ -86,12 +136,15 @@
 		// Clear unread badge when entering the chat page.
 		unreadCount.set(0);
 		refreshInbox();
+		loadTopics();
 
-		// Fast local poll — refreshes DMs every 4s while the chat page is open.
-		// The layout's 20s poll still runs for the nav badge; this one updates
-		// the thread in near-real-time when a conversation is active.
+		// Local DM poll while the chat page is open. M12 W1 Decision B: backed off from 4 s (the
+		// dominant connect source against the relays) and visibility-gated — paused while the window
+		// is hidden so it doesn't churn relay connections in the background; resumes on show.
 		const fastPoll = setInterval(async () => {
-			if (!$identity) return;
+			if (!$identity || document.hidden) return;
+			// Refresh the open Topic channel's 24h posts on the same tick.
+			if (selectedTopic) loadChannel(selectedTopic.topic_id);
 			try {
 				const msgs = await getMessages();
 				// Detect genuinely new messages for the selected peer and auto-scroll.
@@ -107,7 +160,7 @@
 				}
 				inboxMessages.set(msgs);
 			} catch { /* relay unreachable */ }
-		}, 4_000);
+		}, DM_POLL_VISIBLE_MS);
 
 		return () => {
 			clearInterval(fastPoll);
@@ -136,6 +189,7 @@
 
 	async function selectPeer(peer: CachedPeer) {
 		selectedPeer = peer;
+		selectedTopic = null;
 		seenCounts[peer.npub] = $inboxMessages.filter((m) => m.from === peer.npub).length;
 		await tick();
 		scrollToBottom();
@@ -222,6 +276,21 @@
 				</div>
 			</div>
 			<div class="convo-list">
+				{#if topics.length > 0}
+					<div class="convo-section-label">Channels</div>
+					{#each topics as t (t.topic_id)}
+						<button class="convo-item" class:convo-active={selectedTopic?.topic_id === t.topic_id} on:click={() => selectTopic(t)}>
+							<div class="channel-hash">#</div>
+							<div class="convo-info">
+								<div class="convo-row">
+									<span class="convo-name" class:convo-name-active={selectedTopic?.topic_id === t.topic_id}>{t.name}</span>
+									{#if t.private}<span class="convo-req-dot" title="Private topic" />{/if}
+								</div>
+							</div>
+						</button>
+					{/each}
+					<div class="convo-section-label">Direct messages</div>
+				{/if}
 				{#if allConversationPeers.length === 0}
 					<div class="convo-empty">Add contacts via Contacts to start chatting.</div>
 				{:else}
@@ -253,7 +322,55 @@
 
 		<!-- Conversation pane -->
 		<div class="convo-pane">
-			{#if !selectedPeer}
+			{#if selectedTopic}
+				<!-- Topic channel: a persistent entry (your durable membership, §11) whose posts are
+				     24h-ephemeral (server NIP-40 + the local filter in topic_channel). -->
+				<div class="pane-header">
+					<div class="channel-hash channel-hash-lg">#</div>
+					<div class="pane-peer-info">
+						<div class="pane-peer-row">
+							<span class="pane-peer-name">{selectedTopic.name}</span>
+							{#if selectedTopic.private}<span class="pill pill-offline">private</span>{/if}
+						</div>
+						<span class="channel-sub">Topic channel · posts wipe after 24h · manage in Topics</span>
+					</div>
+				</div>
+
+				<div class="thread" bind:this={threadEl}>
+					{#if channelPosts.length === 0}
+						<p class="thread-empty">No posts in the last 24h. Say something!</p>
+					{:else}
+						{#each channelPosts as p (p.author_npub + '|' + p.ts)}
+							{@const isMe = p.author_npub === myId}
+							<div class="bubble-wrap" class:bubble-me={isMe}>
+								<div class="bubble" class:bubble-sent={isMe} class:bubble-recv={!isMe}>
+									{#if !isMe}<span class="bubble-author">{senderName(p.author_npub)}</span>{/if}
+									<p class="bubble-text">{p.body}</p>
+									<span class="bubble-time">{formatTime(new Date(p.ts * 1000).toISOString())}</span>
+								</div>
+							</div>
+						{/each}
+					{/if}
+				</div>
+
+				<div class="composer">
+					<div class="compose-box">
+						<textarea
+							class="compose-input"
+							placeholder="Message #{selectedTopic.name}…"
+							bind:value={channelDraft}
+							on:keydown={channelKeydown}
+							disabled={channelSending}
+							rows="2"
+						></textarea>
+						<div class="compose-footer">
+							<button class="btn-primary btn-send" on:click={sendChannelPost} disabled={!channelDraft.trim() || channelSending}>
+								{channelSending ? '…' : 'Post'} <span>{@html icons.send}</span>
+							</button>
+						</div>
+					</div>
+				</div>
+			{:else if !selectedPeer}
 				<div class="convo-empty-state">
 					<p>Select a contact to view the conversation.</p>
 					<p class="privacy-note">
@@ -466,6 +583,27 @@
 		width: 6px; height: 6px; border-radius: 50%;
 		background: oklch(0.75 0.16 60); flex-shrink: 0;
 	}
+
+	/* Topic channels (M11) */
+	.convo-section-label {
+		padding: 10px 12px 4px;
+		font-size: 10px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 1px;
+		color: var(--fg-dim);
+	}
+	.channel-hash {
+		width: 34px; height: 34px; flex-shrink: 0;
+		display: flex; align-items: center; justify-content: center;
+		border-radius: 8px;
+		background: var(--bg-elev2);
+		color: var(--fg-muted);
+		font-size: 17px; font-weight: 700;
+	}
+	.channel-hash-lg { width: 36px; height: 36px; font-size: 18px; }
+	.channel-sub { font-family: var(--font-mono); font-size: 11px; color: var(--fg-dim); }
+	.bubble-author { display: block; font-size: 10.5px; font-weight: 600; color: var(--accent); margin-bottom: 2px; }
 
 	.convo-preview-row { display: flex; align-items: center; margin-top: 2px; gap: 4px; }
 

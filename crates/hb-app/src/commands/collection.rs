@@ -9,7 +9,7 @@ use tauri::State;
 use crate::{
     commands::profile::compute_content_types,
     error::{CmdResult, cmd_err},
-    net,
+    net::{self, SharedRelay},
     store::DataStore,
     SharedIdentity,
 };
@@ -340,6 +340,7 @@ pub(crate) async fn publish_collection_inner(
     store: &DataStore,
     identity: &Identity,
     browse_key: &BrowseKey,
+    relay: &SharedRelay,
 ) -> Result<(), String> {
     let listing_json = prepare_listing(slug, store)?;
 
@@ -351,14 +352,14 @@ pub(crate) async fn publish_collection_inner(
         .map(|c| c.visibility)
         .unwrap_or(Visibility::Public);
     if visibility == Visibility::Private {
-        return publish_private_collection_inner(slug, store, identity, &listing_json).await;
+        return publish_private_collection_inner(slug, store, identity, &listing_json, relay).await;
     }
 
-    let client = net::connect(identity, store).await.map_err(cmd_err)?;
+    let client = net::client(identity, store, relay).await.map_err(cmd_err)?;
     let published =
-        publish_listing(&client, identity, slug, browse_key, &listing_json, LISTING_MAX_BYTES).await;
-    client.disconnect().await;
-    let published = published.map_err(cmd_err)?;
+        publish_listing(&client, identity, slug, browse_key, &listing_json, LISTING_MAX_BYTES)
+            .await
+            .map_err(cmd_err)?;
 
     // Local published marker (the "published" badge + content_types union).
     let marker = serde_json::json!({ "parts": published.parts }).to_string();
@@ -383,9 +384,8 @@ pub(crate) async fn publish_collection_inner(
                 content_types: profile.content_types.clone(),
             };
             if let Ok(event) = hb_core::event::build_teaser(identity, &teaser) {
-                if let Ok(client) = net::connect(identity, store).await {
+                if let Ok(client) = net::client(identity, store, relay).await {
                     let _ = client.publish(&event).await;
-                    client.disconnect().await;
                     if let Ok(json) = serde_json::to_string(&event) {
                         let _ = store.save_published("profile", &json);
                     }
@@ -403,15 +403,14 @@ async fn publish_private_collection_inner(
     store: &DataStore,
     identity: &Identity,
     listing_json: &str,
+    relay: &SharedRelay,
 ) -> Result<(), String> {
     let recipients = private_recipients(store)?;
     let events = hb_core::seal_private_listing(identity, &recipients, listing_json, now_secs())
         .map_err(cmd_err)?;
 
-    let client = net::connect(identity, store).await.map_err(cmd_err)?;
-    let res = hb_net::publish_private_listing(&client, &events).await;
-    client.disconnect().await;
-    res.map_err(cmd_err)?;
+    let client = net::client(identity, store, relay).await.map_err(cmd_err)?;
+    hb_net::publish_private_listing(&client, &events).await.map_err(cmd_err)?;
 
     // Local published marker — records the *private* tier + the recipient count (the N× multiplier
     // INV-8 calls out), distinct from the public path's `parts`.
@@ -431,13 +430,14 @@ pub async fn publish_collection(
     slug: String,
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
+    relay: State<'_, SharedRelay>,
 ) -> CmdResult<()> {
     let (id_clone, browse_key) = {
         let guard = identity.read().await;
         let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
         (id.identity.clone(), id.browse_key)
     };
-    publish_collection_inner(&slug, &store, &id_clone, &browse_key).await
+    publish_collection_inner(&slug, &store, &id_clone, &browse_key, &relay).await
 }
 
 /// Set a collection's visibility (Public / Private). The selector default is Public; a collection

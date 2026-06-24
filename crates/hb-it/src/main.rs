@@ -28,6 +28,7 @@ mod suite_dm;
 mod suite_id;
 mod suite_n;
 mod suite_priv;
+mod suite_relay;
 mod suite_topic;
 mod survey;
 mod tap;
@@ -97,6 +98,8 @@ async fn main() -> Result<()> {
     results.extend(suite_topic::run(&ctx).await);
     eprintln!("-- Suite COUNT: relay-derived count + canary exclusion (M9) --");
     results.extend(suite_count::run(&ctx).await);
+    eprintln!("-- Suite RELAY: relay-set resilience + cross-client presence (M12 W1) --");
+    results.extend(suite_relay::run(&ctx).await);
     eprintln!("-- Suite CANARY: live-backbone probe cycle + cross-region + soak (M9) --");
     results.extend(suite_canary::run(&ctx).await);
 

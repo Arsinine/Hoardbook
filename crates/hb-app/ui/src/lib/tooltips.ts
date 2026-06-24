@@ -33,7 +33,7 @@ export const TOOLTIPS: Record<TooltipKey, TooltipContent> = {
 	},
 	'willing-to': {
 		title: 'Willing to',
-		body: 'How this hoarder prefers to arrange an off-platform exchange — seed (share via torrent), trade (swap), or upload (send a copy). Hoardbook moves no files, so these are hints, not buttons.',
+		body: 'How this hoarder prefers to arrange an off-platform exchange — seed (share via torrent), trade (swap), upload (send a copy), or meet up (hand off in person). Hoardbook moves no files, so these are hints, not buttons.',
 	},
 	// Spec verbatim: "you have their npub but not their share code."
 	'listings-locked': {

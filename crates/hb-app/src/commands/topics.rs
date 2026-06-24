@@ -19,13 +19,13 @@ use hb_core::topic::{build_announce, build_public_join, new_topic, seal_membersh
 use hb_core::Identity;
 use hb_net::{
     approve_join, discover_public_topics, fetch_channel, fetch_invite, fetch_roster, join_public,
-    join_topic, leave_topic, member_count, post_to_channel, publish_topic, request_join,
+    join_topic, leave_topic, post_to_channel, publish_topic, request_join,
 };
 
 use crate::{
     error::{cmd_err, CmdResult},
     identity_state::SharedIdentity,
-    net,
+    net::{self, SharedRelay},
     store::{CachedPeer, ContactSource, DataStore, StoredTopic},
 };
 
@@ -99,6 +99,8 @@ pub(crate) fn upsert_topic_contact(store: &DataStore, npub: &str) -> Result<(), 
         online: false,
         last_fetched: chrono::Utc::now(),
         local_tags: vec![],
+        // The §7 fingerprint is derivable from the npub alone (no listing access — INV-2 holds).
+        fingerprint: hb_core::identity::parse_npub(npub).ok().map(|pk| hb_core::fingerprint::fingerprint(&pk)),
     };
     store.save_contact(&hash, &peer).map_err(cmd_err)
 }
@@ -152,9 +154,12 @@ pub async fn topic_create(
     private: bool,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
 ) -> CmdResult<TopicView> {
     let me = me(&identity).await?;
-    let (meta, key) = new_topic(&name, &description, tags, private);
+    // W4: a public name is validated here (root ∈ category + depth cap — backend-authoritative); a
+    // private name stays freeform. A bad public path surfaces the clear hb-core error.
+    let (meta, key) = new_topic(&name, &description, tags, private).map_err(cmd_err)?;
     let t = now();
 
     let membership = seal_membership(&key, &meta.topic_id, &me, t).map_err(cmd_err)?;
@@ -163,10 +168,8 @@ pub async fn topic_create(
         events.push(build_announce(&me, &meta, t).map_err(cmd_err)?);
         events.push(build_public_join(&me, &meta, &key, t).map_err(cmd_err)?);
     }
-    let client = net::connect(&me, &store).await.map_err(cmd_err)?;
-    let pub_res = publish_topic(&client, &events).await;
-    client.disconnect().await;
-    pub_res.map_err(cmd_err)?;
+    let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
+    publish_topic(&client, &events).await.map_err(cmd_err)?;
 
     let stored = StoredTopic { meta: meta.clone(), key, joined_at: t, membership_json: Some(membership.as_json()) };
     store_topic(&store, stored.clone())?;
@@ -179,23 +182,23 @@ pub async fn topic_discover(
     tags: Vec<String>,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
 ) -> CmdResult<Vec<DiscoveredTopic>> {
     let me = me(&identity).await?;
-    let client = net::connect(&me, &store).await.map_err(cmd_err)?;
-    let metas = discover_public_topics(&client, &tags, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
-    let mut out = Vec::with_capacity(metas.len());
-    for m in metas {
-        let count = member_count(&client, &m.topic_id, net::RELAY_TIMEOUT).await.unwrap_or(0);
-        out.push(DiscoveredTopic {
+    let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
+    // W4: discovery is activity-ranked (member_count desc, top-N capped) inside hb-net; each entry
+    // already carries its spoofable count, so no second per-topic fetch is needed here.
+    let ranked = discover_public_topics(&client, &tags, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
+    Ok(ranked
+        .into_iter()
+        .map(|(m, count)| DiscoveredTopic {
             topic_id: m.topic_id,
             name: m.name,
             description: m.description,
             tags: m.tags,
             member_count_estimate: count,
-        });
-    }
-    client.disconnect().await;
-    Ok(out)
+        })
+        .collect())
 }
 
 /// Join a public Topic by name: obtain the key via the public-join credential, publish my membership,
@@ -205,9 +208,10 @@ pub async fn topic_join_public(
     name: String,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
 ) -> CmdResult<TopicView> {
     let me = me(&identity).await?;
-    let client = net::connect(&me, &store).await.map_err(cmd_err)?;
+    let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
     // The public-join credential is reusable (no expiry), so `seen` is not consumed; we still pass +
     // persist it so the single-use path shares one store. `&mut` lets redeem record atomically.
     let mut seen = store.load_topic_nonces().map_err(cmd_err)?;
@@ -216,13 +220,11 @@ pub async fn topic_join_public(
     let (meta, key) = match redeemed {
         Some(v) => v,
         None => {
-            client.disconnect().await;
             return Err("Could not find a public-join credential for that Topic — is the name right?".into());
         }
     };
     let membership = join_topic(&client, &key, &meta.topic_id, &me, t).await.map_err(cmd_err)?;
     let roster = fetch_roster(&client, &meta.topic_id, &key, net::RELAY_TIMEOUT).await.unwrap_or_default();
-    client.disconnect().await;
 
     store.save_topic_nonces(&seen).map_err(cmd_err)?;
     auto_add_roster(&store, &roster, &me.public_key())?;
@@ -236,9 +238,10 @@ pub async fn topic_join_public(
 pub async fn topic_redeem_invite(
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
 ) -> CmdResult<Option<TopicView>> {
     let me = me(&identity).await?;
-    let client = net::connect(&me, &store).await.map_err(cmd_err)?;
+    let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
     // `&mut seen`: redeem_invite atomically records a single-use invite's nonce on success (Decision E);
     // we persist the set afterward so a restart can't re-accept it.
     let mut seen = store.load_topic_nonces().map_err(cmd_err)?;
@@ -247,13 +250,11 @@ pub async fn topic_redeem_invite(
     let (meta, key) = match redeemed {
         Some(v) => v,
         None => {
-            client.disconnect().await;
             return Ok(None);
         }
     };
     let membership = join_topic(&client, &key, &meta.topic_id, &me, t).await.map_err(cmd_err)?;
     let roster = fetch_roster(&client, &meta.topic_id, &key, net::RELAY_TIMEOUT).await.unwrap_or_default();
-    client.disconnect().await;
 
     store.save_topic_nonces(&seen).map_err(cmd_err)?;
     auto_add_roster(&store, &roster, &me.public_key())?;
@@ -270,13 +271,12 @@ pub async fn topic_request_join(
     name: String,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
 ) -> CmdResult<()> {
     let me = me(&identity).await?;
     let member = hb_core::identity::parse_npub(&member_npub).map_err(cmd_err)?;
-    let client = net::connect(&me, &store).await.map_err(cmd_err)?;
-    let res = request_join(&client, &me, &member, &topic_id, &name).await;
-    client.disconnect().await;
-    res.map_err(cmd_err)
+    let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
+    request_join(&client, &me, &member, &topic_id, &name).await.map_err(cmd_err)
 }
 
 /// Invite a peer into a Topic I'm in (member-issued invite / approve a requester). **Any** member may
@@ -287,14 +287,13 @@ pub async fn topic_invite(
     invitee_npub: String,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
 ) -> CmdResult<()> {
     let me = me(&identity).await?;
     let invitee = hb_core::identity::parse_npub(&invitee_npub).map_err(cmd_err)?;
     let stored = load_stored(&store, &topic_id)?;
-    let client = net::connect(&me, &store).await.map_err(cmd_err)?;
-    let res = approve_join(&client, &me, &invitee, &stored.meta, &stored.key, now()).await;
-    client.disconnect().await;
-    res.map_err(cmd_err)
+    let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
+    approve_join(&client, &me, &invitee, &stored.meta, &stored.key, now()).await.map_err(cmd_err)
 }
 
 /// Leave a Topic: NIP-09-retract my membership and drop the local Topic record. **Auto-added topic
@@ -304,15 +303,14 @@ pub async fn topic_leave(
     topic_id: String,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
 ) -> CmdResult<()> {
     let me = me(&identity).await?;
     let stored = load_stored(&store, &topic_id)?;
     if let Some(json) = &stored.membership_json {
         let membership = Event::from_json(json).map_err(cmd_err)?;
-        let client = net::connect(&me, &store).await.map_err(cmd_err)?;
-        let res = leave_topic(&client, &stored.key, &me.public_key(), &membership, now()).await;
-        client.disconnect().await;
-        res.map_err(cmd_err)?;
+        let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
+        leave_topic(&client, &stored.key, &me.public_key(), &membership, now()).await.map_err(cmd_err)?;
     }
     let topics: Vec<StoredTopic> =
         store.load_topics().map_err(cmd_err)?.into_iter().filter(|t| t.meta.topic_id != topic_id).collect();
@@ -325,12 +323,12 @@ pub async fn topic_roster(
     topic_id: String,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
 ) -> CmdResult<Vec<String>> {
     let me = me(&identity).await?;
     let stored = load_stored(&store, &topic_id)?;
-    let client = net::connect(&me, &store).await.map_err(cmd_err)?;
+    let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
     let roster = fetch_roster(&client, &topic_id, &stored.key, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
-    client.disconnect().await;
     auto_add_roster(&store, &roster, &me.public_key())?;
     roster.iter().map(|p| p.to_bech32().map_err(cmd_err)).collect()
 }
@@ -349,12 +347,12 @@ pub async fn topic_channel(
     topic_id: String,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
 ) -> CmdResult<Vec<ChannelPost>> {
     let me = me(&identity).await?;
     let stored = load_stored(&store, &topic_id)?;
-    let client = net::connect(&me, &store).await.map_err(cmd_err)?;
+    let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
     let posts = fetch_channel(&client, &topic_id, &stored.key, now(), net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
-    client.disconnect().await;
     posts
         .into_iter()
         .map(|p| Ok(ChannelPost { author_npub: p.author.to_bech32().map_err(cmd_err)?, body: p.body, ts: p.ts }))
@@ -368,13 +366,12 @@ pub async fn topic_post(
     body: String,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
 ) -> CmdResult<()> {
     let me = me(&identity).await?;
     let stored = load_stored(&store, &topic_id)?;
-    let client = net::connect(&me, &store).await.map_err(cmd_err)?;
-    let res = post_to_channel(&client, &stored.key, &topic_id, &me, &body, now()).await;
-    client.disconnect().await;
-    res.map(|_| ()).map_err(cmd_err)
+    let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
+    post_to_channel(&client, &stored.key, &topic_id, &me, &body, now()).await.map(|_| ()).map_err(cmd_err)
 }
 
 #[cfg(test)]
@@ -389,7 +386,7 @@ mod tests {
     fn topic_store_round_trips_incl_meta_and_key() {
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
-        let (meta, key) = new_topic("films", "criterion", vec!["video".into()], false);
+        let (meta, key) = new_topic("video/films", "criterion", vec!["video".into()], false).unwrap();
         let t = StoredTopic { meta: meta.clone(), key, joined_at: 42, membership_json: Some("{}".into()) };
         store.save_topics(&[t]).unwrap();
         let back = store.load_topics().unwrap();
@@ -441,6 +438,7 @@ mod tests {
             online: false,
             last_fetched: chrono::Utc::now(),
             local_tags: vec![],
+            fingerprint: None,
         };
         store.save_contact(&CachedPeer::pubkey_hash(&npub), &manual).unwrap();
         upsert_topic_contact(&store, &npub).unwrap();

@@ -2,7 +2,7 @@
 
 use anyhow::{ensure, Result};
 use hb_core::Identity;
-use hb_net::{unwrap_dm, wrap_dm};
+use hb_net::{build_relay_list, resolve_recipient_relays, unwrap_dm, wrap_dm};
 use nostr::prelude::*;
 
 use crate::harness::{result, settle, Ctx, FETCH_TIMEOUT};
@@ -14,6 +14,8 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
         result("DM2 sender hidden", dm2(ctx).await),
         result("DM3 wrong recipient", dm3(ctx).await),
         dm4(ctx).await,
+        dm5(ctx).await,
+        dm6(ctx).await,
     ]
 }
 
@@ -115,5 +117,99 @@ async fn dm4_inner(ctx: &Ctx) -> Result<()> {
     let got = bc.fetch(inbox(&bob), FETCH_TIMEOUT).await?;
     bc.disconnect().await;
     ensure!(got.len() == 1, "same DM from {} relays did not dedup to 1, got {}", ctx.relays.len(), got.len());
+    Ok(())
+}
+
+async fn dm5(ctx: &Ctx) -> TestResult {
+    let name = "DM5 delivered to recipient read-relay (disjoint sets)";
+    if !ctx.multi() {
+        return TestResult::skip(name, "needs a 2nd --relay");
+    }
+    result(name, dm5_inner(ctx).await)
+}
+
+/// W2 / spec §9 — the case that fails against pre-M12 code: Alice and Bob are on **disjoint** relays.
+/// Bob advertises relay B as his NIP-65 **read** relay; Alice (on relay A) resolves it and targets
+/// the wrap there, so Bob (on relay B) fetches the DM even though Alice never reads/writes B otherwise.
+async fn dm5_inner(ctx: &Ctx) -> Result<()> {
+    let relay_a = ctx.relays[0].clone();
+    let relay_b = ctx.relays[1].clone();
+    let alice = Identity::generate();
+    let bob = Identity::generate();
+
+    // Bob advertises relay B as his read-relay, published where Alice can discover it (relay A — the
+    // overlapping bootstrap relay for the kind-10002 lookup).
+    let bob_on_a = ctx.connect_one(&bob, 0).await?;
+    bob_on_a.publish(&build_relay_list(&bob, &[relay_b.clone()], &[relay_b.clone()])?).await?;
+    bob_on_a.disconnect().await;
+    settle().await;
+
+    // Alice (on relay A only) sends — resolve Bob's read-relays, ensure them, target the publish.
+    let own = vec![relay_a.clone()];
+    let ac = ctx.connect_one(&alice, 0).await?;
+    let wrap = wrap_dm(&alice, &bob.public_key(), "see you on B").await?;
+    let targets = resolve_recipient_relays(&ac, &bob.public_key(), &own, &own, FETCH_TIMEOUT).await;
+    ensure!(targets.iter().any(|r| r == &relay_b), "Bob's read-relay was not resolved into the target set: {targets:?}");
+    ac.ensure_relays(&targets, FETCH_TIMEOUT).await?;
+    ac.publish_to(&wrap, &targets).await?;
+    ac.disconnect().await;
+    settle().await;
+
+    // Bob, who only reads relay B, fetches the DM.
+    let bc = ctx.connect_one(&bob, 1).await?;
+    let got = bc.fetch(inbox(&bob), FETCH_TIMEOUT).await?;
+    bc.disconnect().await;
+    ensure!(!got.is_empty(), "Bob's read-relay (B) never received the DM — read-relay delivery failed");
+    let dm = unwrap_dm(&bob, &got[0]).await?;
+    ensure!(dm.content == "see you on B", "plaintext mismatch: {}", dm.content);
+    Ok(())
+}
+
+async fn dm6(ctx: &Ctx) -> TestResult {
+    let name = "DM6 targeted publish excludes unrelated relays";
+    if !ctx.multi() {
+        return TestResult::skip(name, "needs a 2nd --relay");
+    }
+    result(name, dm6_inner(ctx).await)
+}
+
+/// chorus #3 negative — the wrap must NOT be blasted to a connected-but-unrelated relay. Alice's pool
+/// includes relay B (accreted from a prior browse), but the recipient's inbox + Alice's own are relay
+/// A only → `publish_to` targets A alone, and the wrap is **absent** from relay B.
+async fn dm6_inner(ctx: &Ctx) -> Result<()> {
+    let relay_a = ctx.relays[0].clone();
+    let relay_b = ctx.relays[1].clone();
+    let alice = Identity::generate();
+    let bob = Identity::generate();
+
+    // Bob's read-relay is A (published to A for discovery).
+    let bob_on_a = ctx.connect_one(&bob, 0).await?;
+    bob_on_a.publish(&build_relay_list(&bob, &[relay_a.clone()], &[relay_a.clone()])?).await?;
+    bob_on_a.disconnect().await;
+    settle().await;
+
+    // Alice connects to A, then accretes relay B (as a prior browse of some other peer would).
+    let own = vec![relay_a.clone()];
+    let ac = ctx.connect_one(&alice, 0).await?;
+    ac.ensure_relays(&[relay_b.clone()], FETCH_TIMEOUT).await?; // B is now in Alice's pool but unrelated
+
+    let wrap = wrap_dm(&alice, &bob.public_key(), "A only").await?;
+    let targets = resolve_recipient_relays(&ac, &bob.public_key(), &own, &own, FETCH_TIMEOUT).await;
+    ensure!(!targets.iter().any(|r| r == &relay_b), "relay B leaked into the DM target set: {targets:?}");
+    ac.ensure_relays(&targets, FETCH_TIMEOUT).await?;
+    ac.publish_to(&wrap, &targets).await?;
+    ac.disconnect().await;
+    settle().await;
+
+    // The wrap is on A (intended) but ABSENT from B (the accreted, unrelated relay).
+    let on_a = ctx.connect_one(&bob, 0).await?;
+    let from_a = on_a.fetch(inbox(&bob), FETCH_TIMEOUT).await?;
+    on_a.disconnect().await;
+    let on_b = ctx.connect_one(&bob, 1).await?;
+    let from_b = on_b.fetch(inbox(&bob), FETCH_TIMEOUT).await?;
+    on_b.disconnect().await;
+
+    ensure!(!from_a.is_empty(), "the wrap should be on relay A (the targeted relay)");
+    ensure!(from_b.is_empty(), "the wrap leaked to relay B (an unrelated connected relay) — targeting failed");
     Ok(())
 }

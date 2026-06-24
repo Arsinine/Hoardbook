@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { generateKeypair, getShareCode, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, watchesGet, watchesDelete } from '$lib/api.js';
+	import { onMount, onDestroy } from 'svelte';
+	import { generateKeypair, getShareCode, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, relayStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, watchesGet, watchesDelete } from '$lib/api.js';
 	import type { Settings, UpdateInfo } from '$lib/api.js';
 	import type { Watch } from '$lib/types.js';
 	import { keyView } from '$lib/key-view.js';
@@ -186,6 +186,26 @@
 		relayStatuses = relayStatuses;
 	}
 
+	// M12 W1 Decision D: overlay the **live data-path** status (what the persistent shared client
+	// actually sees per relay) onto the rows — not just the on-demand handshake probe. So a relay
+	// that the client is rate-limited on / can't keep open reads as Unreachable here, explaining a
+	// "–" online chip.
+	let liveStatusTimer: ReturnType<typeof setInterval> | undefined;
+	async function refreshLiveRelayStatus() {
+		try {
+			const health = await relayStatus();
+			for (const h of health) {
+				relayStatuses[h.url] = h.connected
+					? 'ok'
+					: ['connecting', 'pending', 'initialized'].includes(h.status)
+						? 'checking'
+						: 'error';
+			}
+			relayStatuses = relayStatuses;
+		} catch { /* keep the probe results */ }
+	}
+	onDestroy(() => { if (liveStatusTimer) clearInterval(liveStatusTimer); });
+
 	$: allowDms = settings.allow_dms;
 
 	let wipeConfirm = false;
@@ -200,6 +220,10 @@
 			// falls back to the same set). The user can edit or remove them.
 			relayUrls = settings.relay_urls.length ? settings.relay_urls : [...DEFAULT_RELAYS];
 			relayUrls.forEach(probeRelay);
+			// Overlay the live data-path status once the persistent client has had a moment to dial,
+			// then keep it current on a slow tick while the page is open.
+			refreshLiveRelayStatus();
+			liveStatusTimer = setInterval(refreshLiveRelayStatus, 12_000);
 		} catch { /* proceed with defaults if settings load fails */ }
 		// Visible-after "now running vX.Y" notice — fires once per version change.
 		try {
@@ -257,14 +281,13 @@
 		}
 	}
 
-	// M9 reactive mirrors of the snapshot/online toggles (preserved through full-object saves).
+	// M9 reactive mirrors of the snapshot toggles (preserved through full-object saves).
 	$: snapshotAutoUpdate = settings.snapshot_auto_update;
 	$: snapshotReconcilePoll = settings.snapshot_reconcile_poll;
-	$: showOnlineCount = settings.show_online_count;
 
 	// Toggle one boolean field and persist the whole object (never drop another field — the M5
 	// fullSettings() gotcha).
-	async function toggleSetting(field: 'snapshot_auto_update' | 'snapshot_reconcile_poll' | 'show_online_count') {
+	async function toggleSetting(field: 'snapshot_auto_update' | 'snapshot_reconcile_poll') {
 		settings = { ...settings, [field]: !settings[field] };
 		try {
 			await saveSettings(fullSettings());
@@ -583,16 +606,6 @@
 				<span class="toggle-thumb" />
 			</button>
 		</div>
-
-		<div class="toggle-row">
-			<div class="toggle-text">
-				<div class="toggle-label">Show "🟢 N online" indicator</div>
-				<div class="toggle-sub">Relay-derived; no telemetry is sent. The count is read from public relay events, never reported by your client.</div>
-			</div>
-			<button class="toggle" class:toggle-on={showOnlineCount} on:click={() => toggleSetting('show_online_count')}>
-				<span class="toggle-thumb" />
-			</button>
-		</div>
 	</div>
 
 
@@ -843,7 +856,6 @@
 	.hb-input:focus { border-color: var(--accent); }
 	.hb-mono { font-family: var(--font-mono); }
 
-	.surface-divider { height: 1px; background: var(--divider); margin: 4px 0; }
 
 	/* Toggles */
 	.toggle-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }

@@ -8,6 +8,11 @@ import {
 	PUBLIC_JOIN_CONSENT,
 	PRIVATE_JOIN_CONSENT,
 	NO_UNLOCK_NOTE,
+	TOPIC_ROOTS,
+	composeTopicPath,
+	splitTopicPath,
+	subPathLabel,
+	groupTopicsByRoot,
 } from './topics-view.js';
 
 describe('topics-view (M11)', () => {
@@ -46,5 +51,35 @@ describe('topics-view (M11)', () => {
 	it('the no-unlock note states INV-2 plainly', () => {
 		expect(NO_UNLOCK_NOTE.toLowerCase()).toContain('does not unlock');
 		expect(NO_UNLOCK_NOTE.toLowerCase()).toContain('share code');
+	});
+});
+
+describe('topics-view — W4 public Topic paths', () => {
+	it('offers the six fixed-root categories (a bad root is unrepresentable in the picker)', () => {
+		expect([...TOPIC_ROOTS]).toEqual(['video', 'audio', 'image', 'text', 'software', 'other']);
+	});
+
+	it('composes root + freeform sub-path, dropping slash junk', () => {
+		expect(composeTopicPath('video', 'animation/anime')).toBe('video/animation/anime');
+		expect(composeTopicPath('video', '  /animation//anime/ ')).toBe('video/animation/anime');
+		expect(composeTopicPath('audio', '')).toBe('audio'); // a bare category is valid
+	});
+
+	it('splits a path + extracts the sub-path label', () => {
+		expect(splitTopicPath('video/animation/anime')).toEqual(['video', 'animation', 'anime']);
+		expect(subPathLabel('video/animation/anime')).toBe('animation/anime');
+		expect(subPathLabel('video')).toBe('');
+	});
+
+	it('groups discovery results into a tree by root category (ordered by TOPIC_ROOTS)', () => {
+		const topics = [
+			{ name: 'audio/lossless' },
+			{ name: 'video/animation/anime' },
+			{ name: 'video/films' },
+		];
+		const tree = groupTopicsByRoot(topics);
+		expect(tree.map((g) => g.root)).toEqual(['video', 'audio']); // video before audio (root order)
+		expect(tree[0].topics.map((t) => t.name)).toEqual(['video/animation/anime', 'video/films']);
+		expect(tree[1].topics.map((t) => t.name)).toEqual(['audio/lossless']);
 	});
 });

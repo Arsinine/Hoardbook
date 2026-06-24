@@ -571,6 +571,11 @@ pub struct CachedPeer {
     /// User-defined tags for organizing contacts locally. Never shared.
     #[serde(default)]
     pub local_tags: Vec<String>,
+    /// The §7 word+color impersonation-fingerprint, derived deterministically from `npub`. Populated
+    /// when a peer is resolved (lookup/follow); `#[serde(default)]` ⇒ a pre-fingerprint stored contact
+    /// loads as `None` until its next refresh. The UI renders it verbatim (never re-derives — M3 #7).
+    #[serde(default)]
+    pub fingerprint: Option<hb_core::fingerprint::Fingerprint>,
 }
 
 impl CachedPeer {

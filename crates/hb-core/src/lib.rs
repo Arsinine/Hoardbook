@@ -40,8 +40,9 @@ pub use sharecode::ShareCode;
 pub use topic::{
     build_announce, build_public_join, member_sign_keys, mint_invite, new_topic, open_membership,
     open_post, parse_announce, public_join_identity, public_join_keys, redeem_invite, roster,
-    seal_membership, seal_post, topic_id_for_name, Membership, NonceSet, Post, TopicKey, TopicMeta,
-    KIND_TOPIC_ANNOUNCE, KIND_TOPIC_INVITE, KIND_TOPIC_MEMBER, KIND_TOPIC_POST, POST_TTL_SECS,
+    seal_membership, seal_post, topic_id_for_name, topic_root, validate_public_name, Membership,
+    NonceSet, Post, TopicKey, TopicMeta, KIND_TOPIC_ANNOUNCE, KIND_TOPIC_INVITE, KIND_TOPIC_MEMBER,
+    KIND_TOPIC_POST, MAX_TOPIC_DEPTH, POST_TTL_SECS, TOPIC_ROOTS,
 };
 pub use snapshot::{snapshot_fingerprint, unchanged_since, SnapshotFingerprint};
 pub use version::SCHEMA_V;

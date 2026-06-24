@@ -9,6 +9,7 @@
 	import { navIcons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import { getVersion } from '@tauri-apps/api/app';
+	import { NAV_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
 
 	let appVersion = '';
 
@@ -55,9 +56,11 @@
 			if (!onChat) unreadCount.update(n => n + 1);
 		}).then(fn => { unlistenDm = fn; });
 
-		// Background poll: keeps inboxMessages fresh and drives the nav badge.
+		// Background poll: keeps inboxMessages fresh and drives the nav badge. M12 W1 Decision B:
+		// skip the relay read while the window is hidden (tray/minimized) — no reconnect storm
+		// against a window nobody is looking at; it resumes automatically when shown.
 		const poll = setInterval(async () => {
-			if (!get(identity)) return;
+			if (!get(identity) || document.hidden) return;
 			try {
 				const msgs = await getMessages();
 				const onChat = get(page).url.pathname === '/chat';
@@ -72,7 +75,7 @@
 				inboxMessages.set(msgs);
 				if (newCount > 0) unreadCount.update(n => n + newCount);
 			} catch { }
-		}, 20_000);
+		}, NAV_POLL_VISIBLE_MS);
 
 		return () => {
 			clearInterval(poll);

@@ -22,7 +22,7 @@ use hb_net::{unwrap_dm, wrap_dm, RelayClient};
 use crate::{
     error::{cmd_err, CmdResult},
     identity_state::SharedIdentity,
-    net,
+    net::{self, SharedRelay},
     store::DataStore,
 };
 
@@ -71,15 +71,25 @@ pub(crate) async fn build_dm(
     wrap_dm(identity, recipient, content).await
 }
 
-/// Send a DM: build the gift wrap and publish it to the connected relays. Returns the wrap.
+/// Send a DM: build the gift wrap and deliver it to the **recipient's NIP-65 read-relays** (their
+/// inbox) ∪ your own/seed (spec §9, M12 W2). Resolves the recipient's read relays, `ensure_relays`
+/// them onto the shared pool, then **targets** the publish (`publish_to`) so the wrap reaches the
+/// inbox + your own relays but **not** every accreted relay (the metadata-spread guard, chorus #3).
+/// **Honest limit:** if the recipient never published a NIP-65 list, delivery falls back to own/seed
+/// (best-effort — works when the two parties' sets overlap). Returns the wrap.
 pub(crate) async fn send_dm_inner(
     client: &RelayClient,
     identity: &hb_core::Identity,
     recipient: &PublicKey,
     content: &str,
+    own_relays: &[String],
+    timeout: std::time::Duration,
 ) -> Result<Event, hb_net::NetError> {
     let wrap = build_dm(identity, recipient, content).await?;
-    client.publish(&wrap).await?;
+    let targets =
+        hb_net::resolve_recipient_relays(client, recipient, own_relays, own_relays, timeout).await;
+    client.ensure_relays(&targets, timeout).await?;
+    client.publish_to(&wrap, &targets).await?;
     Ok(wrap)
 }
 
@@ -146,6 +156,7 @@ pub async fn send_message(
     content: String,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
 ) -> CmdResult<ReceivedMessage> {
     let trimmed = content.trim().to_string();
     if trimmed.is_empty() {
@@ -163,10 +174,11 @@ pub async fn send_message(
         (id.npub(), id.identity.clone())
     };
 
-    let client = net::connect(&id_clone, &store).await.map_err(cmd_err)?;
-    let result = send_dm_inner(&client, &id_clone, &recipient, &trimmed).await;
-    client.disconnect().await;
-    result.map_err(cmd_err)?;
+    let own = net::relay_urls(&store);
+    let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
+    send_dm_inner(&client, &id_clone, &recipient, &trimmed, &own, net::RELAY_TIMEOUT)
+        .await
+        .map_err(cmd_err)?;
 
     Ok(ReceivedMessage {
         from,
@@ -181,6 +193,7 @@ pub async fn send_message(
 pub async fn get_messages(
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
 ) -> CmdResult<Vec<ReceivedMessage>> {
     let (own_npub, id_clone) = {
         let guard = identity.read().await;
@@ -195,12 +208,10 @@ pub async fn get_messages(
         Some(store.list_contacts().map_err(cmd_err)?.into_iter().map(|c| c.npub).collect())
     };
 
-    let client = net::connect(&id_clone, &store).await.map_err(cmd_err)?;
-    let result =
-        fetch_dms_inner(&client, &id_clone, &own_npub, contact_npubs.as_ref(), net::RELAY_TIMEOUT)
-            .await;
-    client.disconnect().await;
-    result.map_err(cmd_err)
+    let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
+    fetch_dms_inner(&client, &id_clone, &own_npub, contact_npubs.as_ref(), net::RELAY_TIMEOUT)
+        .await
+        .map_err(cmd_err)
 }
 
 // ---------------------------------------------------------------------------

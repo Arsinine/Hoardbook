@@ -93,6 +93,22 @@ pub fn bootstrap_order(seed: &[String], own: &[String], peer: Option<&RelayList>
     out
 }
 
+/// The DM **delivery** target order (spec §9, M12 W2): publish a gift-wrap to the recipient's
+/// advertised **read** relays (their inbox) **first**, then your own + seed so a copy lands where you
+/// can refetch it (and, with NIP-65 absent, best-effort to seed still works when sets overlap).
+/// Order-preserving dedup. The returned set is exactly what `publish_to` targets — a relay outside
+/// it (e.g. a peer outbox accreted from a prior browse) receives **nothing** (the metadata-spread
+/// guard, chorus #3).
+pub fn inbox_order(seed: &[String], own: &[String], peer: Option<&RelayList>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(peer) = peer {
+        extend_unique(&mut out, &peer.read);
+    }
+    extend_unique(&mut out, own);
+    extend_unique(&mut out, seed);
+    out
+}
+
 /// Append `relays` to `out`, skipping any already present (order-preserving dedup).
 fn extend_unique(out: &mut Vec<String>, relays: &[String]) {
     for r in relays {
@@ -132,6 +148,35 @@ mod tests {
         assert_eq!(order.first().unwrap(), "wss://peer-outbox", "advertised relays lead");
         // Seeds remain present as a fallback tail.
         assert!(order.contains(&"wss://seed".to_string()));
+    }
+
+    #[test]
+    fn inbox_order_targets_recipient_read_then_own_seed() {
+        // W2 / spec §9: a DM targets the recipient's READ relays (their inbox) first, then your own
+        // + seed so a copy lands where you can refetch it.
+        let peer = RelayList { read: s(&["wss://bob-inbox"]), write: s(&["wss://bob-outbox"]) };
+        let order = inbox_order(&s(&["wss://seed"]), &s(&["wss://my-write"]), Some(&peer));
+        assert_eq!(order.first().unwrap(), "wss://bob-inbox", "recipient read-relay leads the DM target set");
+        assert!(order.contains(&"wss://my-write".to_string()), "own write included (refetch your sent copy)");
+        // bob's OUTBOX (write) is NOT a delivery target — only his read/inbox.
+        assert!(!order.contains(&"wss://bob-outbox".to_string()), "do not deliver a DM to the recipient's outbox");
+    }
+
+    #[test]
+    fn inbox_order_targeted_publish_excludes_unrelated_relays() {
+        // The targeted-publish negative (chorus #3): a relay outside (recipient.read ∪ own ∪ seed) —
+        // e.g. a peer outbox accreted from a prior browse — is NOT in the DM target set, so the wrap
+        // is never blasted to it.
+        let peer = RelayList { read: s(&["wss://bob-inbox"]), write: vec![] };
+        let order = inbox_order(&s(&["wss://seed"]), &s(&["wss://my-write"]), Some(&peer));
+        assert!(!order.contains(&"wss://stranger-relay".to_string()), "an unrelated relay is never a DM target");
+    }
+
+    #[test]
+    fn inbox_order_falls_back_to_own_seed_without_nip65() {
+        // No NIP-65 list for the recipient → best-effort to own + seed (works when sets overlap).
+        let order = inbox_order(&s(&["wss://seed"]), &s(&["wss://my-write"]), None);
+        assert_eq!(order, s(&["wss://my-write", "wss://seed"]), "own then seed when no recipient list");
     }
 
     #[test]
