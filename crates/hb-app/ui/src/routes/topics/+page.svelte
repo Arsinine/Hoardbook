@@ -246,7 +246,7 @@
 			<!-- W4: results render as a tree split on '/' (root category → sub-paths), activity-ranked
 			     within each root by the backend. -->
 			{#if discoveredTree.length === 0}
-				<p class="muted empty">Enter one or more tags and Discover to find public Topics.</p>
+				<p class="muted empty">Enter one or more tags, then press Discover to find public Topics.</p>
 			{:else}
 				{#each discoveredTree as group (group.root)}
 					<div class="tree-root">{group.root}</div>
@@ -261,7 +261,7 @@
 					{/each}
 				{/each}
 			{/if}
-			<button class="link" disabled={busy} on:click={redeemInvite}>Redeem a private invite addressed to me</button>
+			<button class="link" disabled={busy} on:click={redeemInvite}>Redeem a private Topic invite</button>
 		</section>
 	{/if}
 </div>

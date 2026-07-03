@@ -522,7 +522,7 @@
 					</button>
 				{:else}
 					<div class="ob-card-title">Your identity is ready</div>
-					<div class="ob-card-sub">This is your <strong>share code</strong> — hand it to people you want browsing your collections, and keep it private (it unlocks your listings).</div>
+					<div class="ob-card-sub">This is your <strong>share code</strong>. Give it only to people you want browsing your collections — anyone holding it can decrypt your listings.</div>
 					<div class="ob-hbid-row">
 						<span class="ob-hbid mono">{$identity?.share_code ?? ''}</span>
 						<button class="btn-ghost btn-sm" on:click={() => { navigator.clipboard.writeText($identity?.share_code ?? ''); toast('Copied', 'success'); }}>Copy</button>
@@ -544,7 +544,7 @@
 				{/if}
 			{:else if obStep === 2}
 				<div class="ob-card-title">Name yourself</div>
-				<div class="ob-card-sub">Pick a display name. All fields are optional — you can fill them in later from the profile page.</div>
+				<div class="ob-card-sub">Pick a display name — optional. You can change it and fill in the rest of your profile later from Home.</div>
 				<div class="field" style="margin-bottom:16px">
 					<label class="field-label" for="ob-name">Display name</label>
 					<input id="ob-name" class="hb-input" type="text" placeholder="e.g. DataHoarder_42"
@@ -686,8 +686,8 @@
 				</div>
 
 				<div class="field">
-					<label class="field-label">Contact email</label>
-					<input class="hb-input hb-input-mono" type="email" placeholder="you@example.com" bind:value={form.contact_hint} />
+					<label class="field-label">Contact hint<HintMarker label="Contact hint" text="How people can reach you outside Hoardbook — a Reddit/Discord handle or an email. It is kept out of your public profile, and it's how followers re-find you if you ever lose your key." /></label>
+					<input class="hb-input hb-input-mono" type="text" placeholder="u/you on Reddit · you@example.com" bind:value={form.contact_hint} />
 				</div>
 
 				<div class="field">
@@ -772,7 +772,7 @@
 			<div class="coll-head">
 				<div>
 					<div class="coll-title">Collections</div>
-					<div class="coll-sub">{$collections.length} published · {totalItems.toLocaleString()} items</div>
+					<div class="coll-sub">{$collections.filter(c => c.published).length} of {$collections.length} published · {totalItems.toLocaleString()} items</div>
 				</div>
 				<button class="btn-add" on:click={openAddScan}>
 					<span>{@html icons.plus}</span>Add collection
@@ -797,13 +797,13 @@
 
 			<div class="coll-list">
 				{#if $collections.length === 0}
-					<div class="empty">No collections yet. Click "Add collection" to scan a directory.</div>
+					<div class="empty">No collections yet. Click "Add collection" to scan a folder.</div>
 				{:else}
 					{#each $collections as col (col.slug)}
 						<CollectionPanel collection={col}>
 							<!-- Content types (§4): at least one required before publishing -->
 							<div class="coll-ct-row">
-								<span class="coll-ct-label">Content types<HintMarker label="Content types" text="Pick at least one before publishing. Coarse categories for directory filtering — a mixed archive can declare several." /></span>
+								<span class="coll-ct-label">Content types<HintMarker label="Content types" text="Broad categories used in search filters. Pick at least one to publish; a mixed archive can declare several." /></span>
 								<div class="ct-toggle-row">
 									{#each CONTENT_TYPES as ct (ct.value)}
 										<button
@@ -857,7 +857,7 @@
 											bind:checked={colSorted[col.slug]}
 											on:change={() => saveColMeta(col)}
 										/>
-										Sorted<HintMarker label="Sorted" text="Tells browsers your files are organised and easy to identify and filter — leave it off if this is a raw, unsorted dump. Shown publicly on your listing." />
+										Sorted<HintMarker label="Sorted" text="Marks this collection as organised and curated rather than a raw dump. Shown as a badge to people browsing your listing." />
 									</label>
 									<label class="sorted-label">
 										<input
@@ -866,7 +866,7 @@
 											checked={(colVisibility[col.slug] ?? 'Public') === 'Private'}
 											on:change={(e) => setColVisibility(col.slug, e.currentTarget.checked ? 'Private' : 'Public')}
 										/>
-										Private<HintMarker label="Private" text="Seal this collection to your trusted contact groups only (gift-wrapped per recipient) instead of anyone with your share code. Not DRM — a trusted recipient can still re-share what they decrypt." />
+										Private<HintMarker label="Private" text="Only contacts in your trusted groups can open this collection — it is encrypted to each of them personally, so your share code alone won't open it. Not DRM: a trusted contact can still copy what they decrypt." />
 									</label>
 								</div>
 							</div>

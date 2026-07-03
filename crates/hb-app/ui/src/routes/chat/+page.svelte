@@ -292,7 +292,7 @@
 					<div class="convo-section-label">Direct messages</div>
 				{/if}
 				{#if allConversationPeers.length === 0}
-					<div class="convo-empty">Add contacts via Contacts to start chatting.</div>
+					<div class="convo-empty">No conversations yet — follow someone in Contacts to start one.</div>
 				{:else}
 					{#each allConversationPeers as peer}
 						{@const name = senderName(peer.npub)}
@@ -374,7 +374,7 @@
 				<div class="convo-empty-state">
 					<p>Select a contact to view the conversation.</p>
 					<p class="privacy-note">
-						{@html icons.shield} Messages are stored unencrypted on relay servers and are publicly readable.
+						{@html icons.shield} Messages are end-to-end encrypted — relays never see who sent them or what they say.
 					</p>
 				</div>
 			{:else}
@@ -399,17 +399,17 @@
 					<button class="btn-ghost btn-sm" on:click={() => { if (selectedPeer) viewProfile(selectedPeer); }}>View profile</button>
 				</div>
 
-				<!-- Privacy banner -->
+				<!-- Privacy banner (§9: NIP-17 gift-wrap — E2E encrypted, sender hidden from relays) -->
 				<div class="privacy-banner">
 					<span class="privacy-icon">{@html icons.shield}</span>
-					<span>Messages are unencrypted and publicly readable on relays. Don't share secrets.</span>
+					<span>End-to-end encrypted. Relays see only that someone messaged this person — never the content or the sender.</span>
 				</div>
 
 				<!-- Offline notice -->
 				{#if !selectedPeer.online}
 					<div class="offline-banner">
 						<span class="offline-dot" />
-						<span>{selectedPeer.profile?.display_name ?? shortId(selectedPeer.npub)} is offline — your message will be delivered when they come online.</span>
+						<span>{selectedPeer.profile?.display_name ?? shortId(selectedPeer.npub)} is offline — they'll see your message the next time they open Hoardbook.</span>
 					</div>
 				{/if}
 
