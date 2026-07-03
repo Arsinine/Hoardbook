@@ -173,7 +173,7 @@
 						{:else if treeError}
 							<div class="tree-hint tree-error">{treeError}</div>
 						{:else if !path}
-							<div class="tree-hint">Choose a directory to pick folders.</div>
+							<div class="tree-hint">Choose a directory above, then pick which folders to include.</div>
 						{:else if topLevel === null}
 							<div class="tree-hint">
 								<button class="link-btn" type="button" on:click={() => loadTopLevel(path)}>
@@ -212,7 +212,7 @@
 
 			<!-- Footer -->
 			<div class="modal-footer">
-				<span class="footer-hint">Initial scan: ~2 minutes</span>
+				<span class="footer-hint">Large folders can take a few minutes to scan</span>
 				<div class="footer-actions">
 					<button class="btn-ghost btn-sm" on:click={close}>Cancel</button>
 					<button

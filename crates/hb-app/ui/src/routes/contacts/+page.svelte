@@ -413,7 +413,7 @@
 		</button>
 		{#if discoverOpen}
 			<div class="discover-body">
-				<div class="discover-sub">Search public profiles by tag &amp; content type — nobody parses your encrypted listings.</div>
+				<div class="discover-sub">Search public profiles by tag &amp; content type. Only what people chose to announce is searchable — everyone's listings stay encrypted.</div>
 				<div class="ct-row">
 					{#each DISCOVER_CONTENT_TYPES as ct (ct.value)}
 						<button type="button" class="ct-chip" class:ct-on={discoverTypes.includes(ct.value)}
@@ -451,7 +451,7 @@
 								</div>
 								{#if hit.bio}<div class="hit-bio">{hit.bio}</div>{/if}
 								{#if hit.fingerprint}
-									<div class="hit-fp" title="§7 identity fingerprint — check it before trusting a stranger">
+									<div class="hit-fp" title="Identity fingerprint — check it before trusting a stranger">
 										<span class="hit-fp-swatch" style="background:{hit.fingerprint.colorHex}"></span>
 										{renderFingerprint(hit.fingerprint)}
 									</div>

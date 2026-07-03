@@ -647,7 +647,7 @@
 
 	<div class="surface">
 		{#if watches.length === 0}
-			<div class="watches-empty">No saved watches. Create one from the Discover tab in Contacts.</div>
+			<div class="watches-empty">No saved watches. A watch is a saved tag search that flags new matching hoarders as they appear.</div>
 		{:else}
 			<div class="watch-list">
 				{#each watches as w (w.name)}
