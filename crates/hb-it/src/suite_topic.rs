@@ -59,7 +59,7 @@ fn mk_private(ctx: &Ctx, suffix: &str) -> (TopicMeta, TopicKey) {
 async fn create_public(ctx: &Ctx, creator: &Identity, meta: &TopicMeta, key: &TopicKey) -> Result<Event> {
     let announce = build_announce(creator, meta, now())?;
     let public_join = build_public_join(creator, meta, key, now())?;
-    let membership = seal_membership(key, &meta.topic_id, &creator, now())?;
+    let membership = seal_membership(key, &meta.topic_id, creator, now())?;
     let cc = ctx.connect(creator).await?;
     publish_topic(&cc, &[announce, public_join, membership.clone()]).await?;
     cc.disconnect().await;
@@ -431,7 +431,7 @@ async fn topic10(ctx: &Ctx) -> Result<()> {
     settle().await;
 
     let dc = ctx.connect(&a).await?;
-    let ranked = discover_public_topics(&dc, &[tag.clone()], FETCH_TIMEOUT).await?;
+    let ranked = discover_public_topics(&dc, std::slice::from_ref(&tag), FETCH_TIMEOUT).await?;
     dc.disconnect().await;
     let pos_pop = ranked.iter().position(|(m, _)| m.topic_id == meta_a.topic_id);
     let pos_junk = ranked.iter().position(|(m, _)| m.topic_id == meta_junk.topic_id);

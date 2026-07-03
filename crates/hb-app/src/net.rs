@@ -20,7 +20,7 @@
 //! unit-tested with a counting fake — the riskiest code in M12 is the most-tested.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -37,8 +37,13 @@ pub const RELAY_TIMEOUT: Duration = Duration::from_secs(10);
 /// public Nostr relays — there is **no Hoardbook-run SPOF** (spec §Relay Model) — chosen from the
 /// set the launch survey (`RELAY_DEPLOY.md` §2) verified accept the Hoardbook kinds + brand-new
 /// `npub`s + retention with no PoW. The user can remove/replace any of them in Settings; clearing
-/// them all simply falls back here again, so the app is never left with zero relays.
-pub const DEFAULT_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"];
+/// them all simply falls back here again, so the app is never left with zero relays. The list itself
+/// lives in `ui/src/lib/default_relays.json` — the **single source of truth** shared with
+/// `ui/src/lib/relays.ts` (audit I-2: one config file, no hand-mirrored Rust/TS constants).
+pub static DEFAULT_RELAYS: LazyLock<Vec<String>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../ui/src/lib/default_relays.json"))
+        .expect("default_relays.json is a JSON array of relay URL strings")
+});
 
 /// Managed state: the one persistent shared client, or `None` before first network use. An
 /// `Arc<RelayClient>` is handed out per call; the outer `Arc<RwLock<…>>` is cloned into background
@@ -50,16 +55,22 @@ pub fn new_shared() -> SharedRelay {
     Arc::new(RwLock::new(None))
 }
 
-/// The effective relay set (seed + write). A **fresh install** (no settings file yet) rides
-/// [`DEFAULT_RELAYS`] so it works out of the box; a **configured** set is honoured **verbatim**,
-/// including a deliberately-empty list — a privacy user who cleared their relays to go dark stays
-/// dark, and [`client`] surfaces the actionable no-relays error rather than silently reconnecting
-/// them to third-party defaults. (Distinguishing unset from explicitly-empty is the chorus finding.)
+/// The effective relay set (seed + write). An **empty** persisted set falls back to
+/// [`DEFAULT_RELAYS`] so the app is never stranded with zero relays — this is reached two ways and
+/// neither must brick it: a **fresh install** (no settings file) OR a settings file created by a
+/// **non-relay path** (`acknowledge_privacy_notice`, the update marker) that persisted
+/// `Settings::default()`, whose `relay_urls` is `[]`. The Settings UI *shows* `DEFAULT_RELAYS`
+/// (reachable, green) but only *persists* them when the user explicitly saves the Relays section, so
+/// before the devtest-2026-06-25 #1 fix any other first write left `relay_urls = []` and every
+/// command then failed "No relays configured" even with relays connected. A **configured** non-empty
+/// set is honoured verbatim. (Supersedes the M12 "honour a deliberately-empty set" behaviour: going
+/// dark by clearing every relay is not a Hoardbook feature — INV-5 says spread relays, never zero.)
 pub fn relay_urls(store: &DataStore) -> Vec<String> {
-    match store.load_settings().ok().flatten() {
-        None => DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
-        Some(settings) => settings.relay_urls,
+    let configured = store.load_settings().ok().flatten().map(|s| s.relay_urls).unwrap_or_default();
+    if configured.is_empty() {
+        return DEFAULT_RELAYS.clone();
     }
+    configured
 }
 
 /// The seam over *building + introspecting* a relay pool, so the shared-client concurrency logic
@@ -194,17 +205,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
         // No settings file at all (fresh install) → the public defaults, so the app can reach relays.
-        assert_eq!(relay_urls(&store), DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(relay_urls(&store), *DEFAULT_RELAYS);
     }
 
     #[test]
-    fn relay_urls_honours_a_deliberately_empty_set() {
+    fn relay_urls_falls_back_to_defaults_when_empty() {
+        // Devtest 2026-06-25 #1: a persisted EMPTY relay set is treated as "unconfigured", not
+        // "deliberately dark" — it falls back to the curated defaults so the app is never stranded
+        // with zero relays. (Supersedes the M12 "honour a deliberately-empty set" behaviour, which
+        // bricked every action the moment a non-relay settings write persisted Settings::default().)
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
-        // Settings saved with an empty list = the user chose zero relays → stays empty (NOT defaults);
-        // client() then surfaces the actionable no-relays error (chorus: don't override intent).
         store.save_settings(&Settings { relay_urls: vec![], ..Default::default() }).unwrap();
-        assert!(relay_urls(&store).is_empty());
+        assert_eq!(relay_urls(&store), *DEFAULT_RELAYS);
+    }
+
+    #[test]
+    fn default_relays_meet_the_inv5_floor() {
+        // Audit I-2: the defaults parse from `ui/src/lib/default_relays.json` (the single source of
+        // truth shared with relays.ts). Floor asserts: never collapse to ONE relay (INV-5 — spread
+        // relays, no SPOF) and never ship a plaintext `ws://` default. Editing the JSON below this
+        // floor fails here AND in relays.test.ts.
+        assert!(!DEFAULT_RELAYS.is_empty(), "defaults must be non-empty");
+        let distinct: std::collections::HashSet<&String> = DEFAULT_RELAYS.iter().collect();
+        assert!(distinct.len() >= 2, "INV-5: at least two DISTINCT default relays, never one");
+        for r in DEFAULT_RELAYS.iter() {
+            assert!(r.starts_with("wss://"), "default relay {r} must be wss:// (no plaintext ws defaults)");
+        }
+    }
+
+    #[test]
+    fn a_non_relay_settings_write_does_not_strand_the_app() {
+        // Regression (devtest 2026-06-25 #1): the FIRST settings write through a NON-relay path —
+        // acknowledge_privacy_notice / the update marker, i.e. load-default-modify-save with no
+        // prior file — persists relay_urls=[]. The app must still resolve working relays afterwards
+        // rather than erroring "No relays configured" on every action even with relays connected.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let mut s = store.load_settings().unwrap().unwrap_or_default(); // None ⇒ default (relay_urls=[])
+        s.privacy_notice_acknowledged = true;
+        store.save_settings(&s).unwrap();
+        assert!(
+            !relay_urls(&store).is_empty(),
+            "a settings file created by a non-relay path must not leave the app with zero relays"
+        );
     }
 
     #[test]

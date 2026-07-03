@@ -26,8 +26,8 @@ pub const KIND_PRESENCE: u16 = 11_111;
 /// blast radius of a misconfigured or mistakenly-published binding.
 pub const MAX_BINDING_TTL_SECS: u64 = 24 * 60 * 60;
 
-const TAG_EXPIRES: &str = "hb-expires"; // explicit expiry, unix seconds
-const TAG_SCHEMA: &str = "hb-v"; // payload schema version
+pub(crate) const TAG_EXPIRES: &str = "hb-expires"; // explicit expiry, unix seconds
+pub(crate) const TAG_SCHEMA: &str = "hb-v"; // payload schema version
 /// Tolerance for a `created_at` slightly ahead of our clock (matches the ±300 s skew window).
 const FUTURE_SKEW_SECS: u64 = 300;
 

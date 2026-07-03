@@ -27,8 +27,8 @@ pub type BrowseKey = [u8; 32];
 /// a CEK-sealed body even if the byte values coincided.
 pub type ContentKey = [u8; 32];
 
-const HKDF_SALT: &[u8] = b"hoardbook/browse-key";
-const HKDF_SALT_CEK: &[u8] = b"hoardbook/cek";
+pub(crate) const HKDF_SALT: &[u8] = b"hoardbook/browse-key";
+pub(crate) const HKDF_SALT_CEK: &[u8] = b"hoardbook/cek";
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 /// Derive the NIP-44 conversation key from the browse-key for a given crypto version.

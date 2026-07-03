@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { DEFAULT_RELAYS, validateRelayUrl } from './relays';
+import defaultRelaysJson from './default_relays.json';
 
 // Regression for the pre-pivot relay-wiring bugs (the settings UI was built for the retired
 // http://…:3000 custom relay). Each test FAILS on the buggy code and PASSES on the fix.
@@ -36,6 +37,14 @@ describe('DEFAULT_RELAYS — real wss seeds, not the dead bootstrap', () => {
 
 	it('are all wss:// public relays', () => {
 		for (const r of DEFAULT_RELAYS) expect(r.startsWith('wss://')).toBe(true);
+	});
+
+	it('has at least two DISTINCT relays (INV-5 floor: never collapse to one relay)', () => {
+		expect(new Set(DEFAULT_RELAYS).size).toBeGreaterThanOrEqual(2);
+	});
+
+	it('is exactly the shared default_relays.json (audit I-2: single source of truth, also parsed by net.rs)', () => {
+		expect(DEFAULT_RELAYS).toEqual(defaultRelaysJson);
 	});
 
 	it('does NOT include the retired pre-pivot bootstrap relay', () => {

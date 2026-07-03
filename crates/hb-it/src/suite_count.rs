@@ -128,7 +128,7 @@ async fn count3(ctx: &Ctx) -> Result<()> {
     cc.publish(&with_canary_marker(&canary, &build_listing_event(&canary, "hbd-canary", &[5u8; 32], r#"{"entries":[]}"#)?)?).await?;
     cc.disconnect().await;
     settle().await;
-    let hits = hb_net::search_teasers(&client, &[uniq.clone()], &[], 100, FETCH_TIMEOUT).await?;
+    let hits = hb_net::search_teasers(&client, std::slice::from_ref(&uniq), &[], 100, FETCH_TIMEOUT).await?;
     ensure!(hits.is_empty(), "DISC tag search surfaced the canary teaser ({} hits)", hits.len());
 
     let real = Identity::generate();

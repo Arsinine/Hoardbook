@@ -178,7 +178,7 @@ pub fn watch_plan(
         let debounced = now.saturating_duration_since(dirty) >= cfg.debounce;
         let floor_ok = st
             .last_republish
-            .map_or(true, |lr| now.saturating_duration_since(lr) >= cfg.min_republish_interval);
+            .is_none_or(|lr| now.saturating_duration_since(lr) >= cfg.min_republish_interval);
         if debounced && floor_ok {
             actions.push(RepublishAction { slug: slug.clone() });
             st.last_republish = Some(now);
@@ -671,12 +671,13 @@ mod tests {
                 tags: vec![],
                 languages: vec![],
                 visibility: hb_core::types::Visibility::Public,
+                sorted: false,
                 last_updated: chrono::Utc::now(),
                 listing: vec![],
             };
             store.save_collection_draft(&col).unwrap();
             store.save_published(slug, "{}").unwrap();
-            store.save_scan_spec(slug, &crate::store::ScanSpec { root: dir.path().to_string_lossy().into(), include: vec![], exclude: vec![] }).unwrap();
+            store.save_scan_spec(slug, &crate::store::ScanSpec { root: dir.path().to_string_lossy().into(), include: vec![], exclude: vec![], ..Default::default() }).unwrap();
         }
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::new(CountingSink { calls: Arc::clone(&calls) });
@@ -814,13 +815,14 @@ mod tests {
             tags: vec![],
             languages: vec![],
             visibility: hb_core::types::Visibility::Public,
+            sorted: false,
             last_updated: chrono::Utc::now(),
             listing: listing.clone(),
         };
         store.save_collection_draft(&col).unwrap();
         store.save_published(slug, "{}").unwrap();
         store
-            .save_scan_spec(slug, &crate::store::ScanSpec { root: root.to_string_lossy().into(), include: vec![], exclude: vec![] })
+            .save_scan_spec(slug, &crate::store::ScanSpec { root: root.to_string_lossy().into(), include: vec![], exclude: vec![], ..Default::default() })
             .unwrap();
         store.save_snapshot_fingerprint(slug, &hb_core::snapshot_fingerprint(&listing)).unwrap();
     }

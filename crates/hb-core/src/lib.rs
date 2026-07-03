@@ -23,6 +23,13 @@ mod tag_util;
 pub mod topic;
 pub mod version;
 
+// --- Crate-wide invariant guards (INVARIANT_AUDIT.md): the I-3 wire-format freeze and the
+//     I-5 INV-2 no-browse-key-broadcast sweep. Test-only modules; no runtime surface. ---
+#[cfg(test)]
+mod inv2_sweep;
+#[cfg(test)]
+mod wire_freeze;
+
 pub use error::HbError;
 pub use types::{Collection, DirectoryItem, ItemType, Profile, SocialLink, Visibility};
 

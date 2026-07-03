@@ -16,8 +16,8 @@ pub const KIND_TEASER: u16 = 30_117;
 /// Collection-listing kind — parameterized-replaceable (30xxx), `d` = slug.
 pub const KIND_LISTING: u16 = 31_111;
 
-const TAG_SCHEMA: &str = "hb-v";
-const TAG_CRYPTO: &str = "hb-cv";
+pub(crate) const TAG_SCHEMA: &str = "hb-v";
+pub(crate) const TAG_CRYPTO: &str = "hb-cv";
 const TEASER_D: &str = "hoardbook-teaser";
 
 /// The public teaser — pseudonymous profile fields. There is **no `contact_hint`**: that

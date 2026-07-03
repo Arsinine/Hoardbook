@@ -103,6 +103,24 @@ pub fn split_listing(
             json: content_part_json(&chunk, i, n)?,
         });
     }
+
+    // Devtest 2026-06-25 #3 (interim guard): the chunker only splits the **top-level breadth** of
+    // `entries`. A single top-level entry that is itself larger than the budget (the real hoard
+    // shape — e.g. 113k items under one root folder) "can't be split further at this level", so it
+    // becomes an oversized part the relay rejects downstream with the opaque "message too long".
+    // Surface a clear, actionable error early instead. The real fix — recursively splitting a deep
+    // folder — is a dedicated milestone (see HANDOVER); until then a single dominant folder can't be
+    // published as one listing.
+    if let Some(big) = parts.iter().find(|p| p.json.len() > max_bytes) {
+        return Err(NetError::Split(format!(
+            "this collection is too large to publish: part '{}' is {} bytes, over the {}-byte \
+             per-listing limit, and a single folder this large can't yet be split. Narrow the scan \
+             (exclude sub-folders) or split it into smaller collections.",
+            big.d_tag,
+            big.json.len(),
+            max_bytes
+        )));
+    }
     Ok(parts)
 }
 
@@ -247,6 +265,52 @@ mod tests {
             Err(NetError::Split(m)) => assert!(m.contains(" of "), "expected 'K of N', got: {m}"),
             other => panic!("expected a missing-part error, got {other:?}"),
         }
+    }
+
+    /// One top-level folder whose own subtree exceeds any small budget — the "single deep folder"
+    /// shape (e.g. 113k items under one root) the breadth-only chunker cannot split (devtest #3).
+    fn single_huge_entry() -> String {
+        let children: Vec<Value> = (0..200)
+            .map(|i| serde_json::json!({ "name": format!("file-{i:05}.bin"), "size": 1234 }))
+            .collect();
+        serde_json::json!({
+            "slug": "hoard",
+            "content_types": ["video"],
+            "entries": [ { "name": "Movies", "children": children } ],
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn single_oversize_entry_errors_clearly_instead_of_emitting_an_oversized_part() {
+        // Devtest 2026-06-25 #3 (interim contract): until recursive split lands, a single dominant
+        // folder that can't fit one part must surface a clear, actionable error early — not an
+        // oversized part the relay rejects downstream with the opaque "message too long".
+        match split_listing("hoard", &single_huge_entry(), 512) {
+            Err(NetError::Split(m)) => assert!(m.contains("too large"), "expected oversize error, got: {m}"),
+            other => panic!("expected a clear oversize error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "RED — devtest 2026-06-25 #3: the split chunks only top-level breadth, so a single \
+                deep folder (e.g. 113k items under one root) can't be split and a large real \
+                collection can't be published. The fix is RECURSIVE split (a milestone); when it \
+                lands, delete `single_oversize_entry_errors_clearly...` and un-ignore this."]
+    fn deep_single_root_folder_splits_under_budget() {
+        // The real hoard shape: everything under one folder. Every published part MUST fit the
+        // budget, and the parts MUST restitch to the original tree.
+        let parts = split_listing("hoard", &single_huge_entry(), 512).unwrap();
+        for p in &parts[1..] {
+            assert!(
+                p.json.len() <= 512,
+                "part {} is oversized: {} bytes — deep tree not recursively split",
+                p.d_tag,
+                p.json.len()
+            );
+        }
+        let payloads: Vec<String> = parts.iter().map(|p| p.json.clone()).collect();
+        assert_eq!(restitch_listing(&payloads).unwrap(), normalize(&single_huge_entry()).unwrap());
     }
 
     #[test]

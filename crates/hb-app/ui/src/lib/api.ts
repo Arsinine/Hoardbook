@@ -199,13 +199,11 @@ export interface PeerSearchHit {
 export const searchPeers = (tags: string[], contentTypes: string[]) =>
 	invoke<PeerSearchHit[]>('search_peers', { tags, contentTypes });
 
-// ── Sharing ───────────────────────────────────────────────────────────────────
+// ── Collection root path ────────────────────────────────────────────────────────
 
+/** The persisted on-disk root of a collection (used to pre-fill the re-scan dialog). */
 export const getShareSettings = (slug: string) =>
 	invoke<ShareSettings>('get_share_settings', { slug });
-
-export const saveShareSettings = (slug: string, settings: ShareSettings) =>
-	invoke<void>('save_share_settings', { slug, settings });
 
 
 // ── Chat ──────────────────────────────────────────────────────────────────────

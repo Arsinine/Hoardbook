@@ -1,6 +1,9 @@
-//! File-sharing settings. The download path (`request_download` / `cancel_download`) was removed
-//! when file transfer moved to the Mascara companion (Hoardbook INV-4 — moves no files); only the
-//! collection owner's per-collection share settings live here now.
+//! Per-collection persisted root path. The whole download path (`request_download` /
+//! `cancel_download`) and the download-config UI ("Share settings" dialog) were removed when file
+//! transfer moved to the Mascara companion (Hoardbook INV-4 — moves no files). What remains is a
+//! single read: the collection's on-disk root, used to pre-fill the re-scan dialog. The root is
+//! *written* by the scan/prepare path (`commands::collection`), never by the UI, so there is no
+//! `save_share_settings` command.
 
 use tauri::State;
 
@@ -16,15 +19,3 @@ pub async fn get_share_settings(
 ) -> CmdResult<ShareSettings> {
     Ok(store.load_share_settings(&slug).map_err(cmd_err)?.unwrap_or_default())
 }
-
-#[tauri::command]
-pub async fn save_share_settings(
-    slug: String,
-    settings: ShareSettings,
-    store: State<'_, DataStore>,
-) -> CmdResult<()> {
-    store.save_share_settings(&slug, &settings).map_err(cmd_err)
-}
-
-// The download path (`peer_browse_key` / `request_download` / `cancel_download`) moved to the
-// Mascara companion with file transfer (Hoardbook INV-4). Hoardbook keeps only the share settings.
