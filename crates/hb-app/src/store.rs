@@ -626,7 +626,7 @@ impl DataStore {
         let mut groups = read_json_lenient::<Vec<Group>>(&self.groups_path())
             .context("loading groups")?
             .unwrap_or_default();
-        groups.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+        groups.sort_by_key(|g| std::cmp::Reverse(g.modified_at));
         Ok(groups)
     }
 

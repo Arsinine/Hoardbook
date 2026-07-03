@@ -755,7 +755,7 @@ pub(crate) fn list_subdirs_core(path: &str) -> anyhow::Result<Vec<SubdirEntry>> 
             path: child_path.to_string_lossy().into_owned(),
         });
     }
-    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    entries.sort_by_key(|e| e.name.to_lowercase());
     Ok(entries)
 }
 
