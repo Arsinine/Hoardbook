@@ -204,7 +204,7 @@ pub async fn fetch_channel(
             posts.push(p);
         }
     }
-    posts.sort_by(|a, b| b.ts.cmp(&a.ts));
+    posts.sort_by_key(|p| std::cmp::Reverse(p.ts));
     Ok(posts)
 }
 
