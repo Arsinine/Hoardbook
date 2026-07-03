@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { saveProfile, publishProfile, publishCollection, deleteCollection, updateCollectionMeta, updateCollectionVisibility, exportCollection, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec } from '$lib/api.js';
-	import VisibilitySelector from '$lib/components/VisibilitySelector.svelte';
 	import { visibilityOf } from '$lib/private-collections-view.js';
+	import { toggleContentType } from '$lib/content-types.js';
+	import { get } from 'svelte/store';
 	import { passphraseStrength } from '$lib/backup-export.js';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { profile, collections, identity, toast, appReady, homeDraft, identityLoadError } from '$lib/stores.js';
@@ -9,7 +10,6 @@
 	import { icons, socialIcons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
 	import ScanDialog from '$lib/components/ScanDialog.svelte';
-	import ShareSettingsDialog from '$lib/components/ShareSettingsDialog.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import HintMarker from '$lib/components/HintMarker.svelte';
 	import type { Collection, Profile, Visibility } from '$lib/types.js';
@@ -151,8 +151,6 @@
 	let scanInitialAlias = '';
 	let saving = false;
 	let publishing = false;
-	let shareSlug = '';
-	let shareOpen = false;
 	let langInput = '';
 	let tagInput = '';
 	let willingInput = '';
@@ -364,16 +362,21 @@
 
 	// Toggle a content type on a collection (§4 multi-select, OR logic). Persists via the same
 	// update_collection_meta seam, so the publish gate that reads content_types is now satisfiable.
+	// devtest 2026-06-25 #4: read the FRESHEST set from the store (not the stale per-row `col`) and
+	// update optimistically BEFORE awaiting the backend, so rapid multi-select no longer drops all
+	// but the last click (each click otherwise recomputed from the pre-click set and overwrote it).
 	async function toggleColContentType(col: Collection, value: string) {
 		const slug = col.slug;
-		const current = col.content_types ?? [];
-		const next = current.includes(value)
-			? current.filter(t => t !== value)
-			: [...current, value];
+		const fresh = get(collections).find(c => c.slug === slug) ?? col;
+		const prev = fresh.content_types ?? [];
+		const next = toggleContentType(prev, value);
+		collections.update(cols => cols.map(c => c.slug === slug ? { ...c, content_types: next } : c));
 		try {
-			await updateCollectionMeta(slug, col.description, next, col.tags ?? [], col.languages ?? [], colSorted[slug] ?? false);
-			collections.update(cols => cols.map(c => c.slug === slug ? { ...c, content_types: next } : c));
-		} catch (e) { toast(String(e), 'error'); }
+			await updateCollectionMeta(slug, fresh.description, next, fresh.tags ?? [], fresh.languages ?? [], colSorted[slug] ?? false);
+		} catch (e) {
+			toast(String(e), 'error');
+			collections.update(cols => cols.map(c => c.slug === slug ? { ...c, content_types: prev } : c));
+		}
 	}
 
 	async function handleDeleteCollection(slug: string) {
@@ -398,11 +401,6 @@
 			return [...cols, col];
 		});
 		toast(`Scanned "${col.path_alias}" — ${col.item_count} items`);
-	}
-
-	function openShare(slug: string) {
-		shareSlug = slug;
-		shareOpen = true;
 	}
 
 	function openAddScan() {
@@ -840,14 +838,9 @@
 									}}
 								/>
 							</div>
-							<!-- Visibility (Public / Private) — M10 -->
-							<div class="coll-visibility-row">
-								<VisibilitySelector
-									visibility={colVisibility[col.slug] ?? 'Public'}
-									on:change={(e) => setColVisibility(col.slug, e.detail)}
-								/>
-							</div>
-							<!-- Notes + sorted -->
+							<!-- Notes + sorted + visibility. Visibility (M10) and Sorted (#7) are compact
+							     checkboxes here to cut clutter (devtest 2026-06-25 #8) — the old Visibility
+							     dropdown is gone; the "what Private means" copy moved to the tooltip. -->
 							<div class="coll-notes-row">
 								<textarea
 									class="coll-notes-input"
@@ -856,15 +849,26 @@
 									bind:value={colNotes[col.slug]}
 									on:blur={() => saveColMeta(col)}
 								></textarea>
-								<label class="sorted-label">
-									<input
-										type="checkbox"
-										class="sorted-check"
-										bind:checked={colSorted[col.slug]}
-										on:change={() => saveColMeta(col)}
-									/>
-									Sorted
-								</label>
+								<div class="coll-toggles">
+									<label class="sorted-label">
+										<input
+											type="checkbox"
+											class="sorted-check"
+											bind:checked={colSorted[col.slug]}
+											on:change={() => saveColMeta(col)}
+										/>
+										Sorted<HintMarker label="Sorted" text="Tells browsers your files are organised and easy to identify and filter — leave it off if this is a raw, unsorted dump. Shown publicly on your listing." />
+									</label>
+									<label class="sorted-label">
+										<input
+											type="checkbox"
+											class="sorted-check"
+											checked={(colVisibility[col.slug] ?? 'Public') === 'Private'}
+											on:change={(e) => setColVisibility(col.slug, e.currentTarget.checked ? 'Private' : 'Public')}
+										/>
+										Private<HintMarker label="Private" text="Seal this collection to your trusted contact groups only (gift-wrapped per recipient) instead of anyone with your share code. Not DRM — a trusted recipient can still re-share what they decrypt." />
+									</label>
+								</div>
 							</div>
 							<div class="coll-actions">
 								{#if !col.published}
@@ -880,7 +884,6 @@
 										</div>
 									{/if}
 								</div>
-								<button class="btn-ghost btn-sm" on:click={() => openShare(col.slug)}>Share</button>
 								<button class="btn-ghost btn-sm" on:click={() => handlePublishCollection(col.slug)}>Publish</button>
 								<button class="btn-ghost btn-sm btn-danger-ghost" on:click={() => handleDeleteCollection(col.slug)}>Remove</button>
 							</div>
@@ -892,7 +895,6 @@
 	</div>
 
 	<ScanDialog bind:open={scanOpen} title={scanTitle} initialPath={scanInitialPath} initialAlias={scanInitialAlias} on:scanned={onScanned} />
-	<ShareSettingsDialog bind:open={shareOpen} slug={shareSlug} />
 {/if}
 
 <style>
@@ -1269,17 +1271,19 @@
 		min-width: 80px;
 	}
 
-	.coll-visibility-row {
-		padding: 6px 10px;
-		border-top: 1px solid var(--divider);
-	}
-
 	.coll-notes-row {
 		display: flex;
 		gap: 8px;
 		padding: 6px 10px;
 		border-top: 1px solid var(--divider);
 		align-items: flex-start;
+	}
+
+	.coll-toggles {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		flex-shrink: 0;
 	}
 
 	.coll-notes-input {

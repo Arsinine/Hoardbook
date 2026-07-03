@@ -322,7 +322,6 @@ pub fn run() {
             commands::chat::send_message,
             commands::chat::get_messages,
             commands::sharing::get_share_settings,
-            commands::sharing::save_share_settings,
             commands::groups::groups_get,
             commands::groups::groups_create,
             commands::groups::groups_rename,

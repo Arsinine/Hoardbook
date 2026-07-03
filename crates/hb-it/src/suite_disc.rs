@@ -181,7 +181,7 @@ async fn disc6(ctx: &Ctx) -> Result<()> {
     client.publish(&t2).await?;
     settle().await;
 
-    let hits = search_teasers(&client, &[want.clone()], &[], 100, FETCH_TIMEOUT).await?;
+    let hits = search_teasers(&client, std::slice::from_ref(&want), &[], 100, FETCH_TIMEOUT).await?;
     client.disconnect().await;
     ensure!(hits.len() == 1, "expected exactly one deduped hit, got {}", hits.len());
     ensure!(hits[0].npub == p1.npub(), "the matching author was not surfaced");

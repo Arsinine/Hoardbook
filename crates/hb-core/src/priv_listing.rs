@@ -41,8 +41,8 @@ use crate::version::{check_crypto, check_schema, CRYPTO_V, SCHEMA_V};
 /// recognisable discriminant. The **outer** wrap is the standard NIP-59 gift-wrap, kind **1059**.
 pub const KIND_PRIV_LISTING: u16 = 31_113;
 
-const TAG_SCHEMA: &str = "hb-v";
-const TAG_CRYPTO: &str = "hb-cv";
+pub(crate) const TAG_SCHEMA: &str = "hb-v";
+pub(crate) const TAG_CRYPTO: &str = "hb-cv";
 
 /// The opened private listing: the decrypted listing JSON, the **inner** author (the real signer,
 /// recovered from inside the *verified* seal — NOT the ephemeral outer-wrap author), and the inner

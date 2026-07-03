@@ -174,6 +174,7 @@ mod tests {
             tags: vec![],
             languages: vec![],
             visibility,
+            sorted: false,
             last_updated: chrono::Utc::now(),
             listing: vec![],
         };
@@ -202,7 +203,7 @@ mod tests {
         let unpublished = Collection {
             slug: "drafts".into(), path_alias: "drafts".into(), description: None,
             item_count: 0, est_size: None, content_types: vec!["software".into()],
-            tags: vec![], languages: vec![], visibility: Visibility::Public,
+            tags: vec![], languages: vec![], visibility: Visibility::Public, sorted: false,
             last_updated: chrono::Utc::now(), listing: vec![],
         };
         store.save_collection_draft(&unpublished).unwrap();

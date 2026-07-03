@@ -73,15 +73,40 @@ jobs:
           sweep "the DownloadQueue component is back" 'DownloadQueue' crates/hb-app/ui/src
           if [ "$fail" -ne 0 ]; then echo "::error::Hoardbook moves no files (INV-4) — the above belongs in Mascara."; exit 1; fi
           echo "INV-4 sweep clean — no file-transfer plane in Hoardbook."
+          # DISC3/INV-2: the discovery surface is structurally browse-key-free (audit I-5).
+          if out=$(grep -rnE 'browse_key|BrowseKey' crates/hb-net/src/discover.rs 2>/dev/null); then
+            echo "::error::INV-2 regression — the browse-key reached the discovery surface:"; echo "$out"; exit 1
+          fi
+          echo "DISC3/INV-2 probe clean — discover.rs is browse-key-free."
+          # Tracked-files guard (audit I-9b): internal planning docs are gitignored (code-only
+          # commits); a tracked one is a leak, not a doc.
+          if tracked=$(git ls-files | grep -E '^(HOARDBOOK_SPEC|MASCARA_SPEC|PROMPT|HANDOVER|TEST_PLAN|REGRESSION|RELAY_DEPLOY|PROCESS_ENGINEERING|SEEDING|INVARIANT_AUDIT|SEMANTICS|MILESTONE1|CLAUDE)\.md$|^planning/'); then
+            echo "::error::internal doc tracked in git — planning docs are gitignored; a tracked one is a leak, not a doc:"; echo "$tracked"; exit 1
+          fi
+          echo "Tracked-files guard clean — no internal docs in the git index."
 
-      # Clippy runs across the workspace for signal, but is NON-BLOCKING: the
-      # harness/app crates carry pre-existing clippy debt under current stable
-      # clippy (e.g. hb-it unused import, hb-relay redundant-pattern-matching,
-      # hb-app/commands/watches.rs ptr_arg + from_ref). Cleaning that is a
-      # separate follow-up; it must not gate these regression tests. The hard
-      # gates here are `cargo test --workspace` (every OS) + svelte-check + vitest.
-      - name: cargo clippy --workspace (non-blocking)
-        continue-on-error: true
+      # release.yml overwrites both versions from the tag at build time; this pins dev-build
+      # getVersion() honesty (audit I-8): tauri.conf.json must match the hb-app package version.
+      - name: Version consistency — tauri.conf.json matches Cargo.toml
+        if: matrix.platform == 'ubuntu-latest'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, re, sys
+          cargo = open('crates/hb-app/Cargo.toml').read()
+          m = re.search(r'\[package\][^\[]*?\nversion\s*=\s*"([^"]+)"', cargo, flags=re.S)
+          if not m:
+              sys.exit('::error::no version found in crates/hb-app/Cargo.toml [package]')
+          cargo_v = m.group(1)
+          with open('crates/hb-app/tauri.conf.json') as f:
+              tauri_v = json.load(f)['version']
+          if cargo_v != tauri_v:
+              sys.exit(f'::error::version drift (audit I-8) — Cargo.toml={cargo_v} vs tauri.conf.json={tauri_v}')
+          print(f'versions in sync: {cargo_v}')
+          PY
+
+      # Clippy debt burned down 2026-07-03 (audit I-7) — clippy is now a blocking gate.
+      - name: cargo clippy --workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   # L2 — the appraisal-requested "integration in CI" leg, now possible because Nostr relays are
@@ -220,3 +245,36 @@ jobs:
       # F2 — the count tally must complete under its wall-clock budget (hb-core only, no frontend).
       - name: F2 count-tally wall-clock budget
         run: cargo test -p hb-core --locked count_tally_over_500_events_is_under_budget_f2
+
+  # Supply-chain scanners — added by audit I-4. NON-BLOCKING (every scanner step carries
+  # continue-on-error) until the baseline is triaged, then flip. Policy lives in deny.toml.
+  supply-chain:
+    name: supply chain (cargo-audit + cargo-deny + npm audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: cargo audit (RustSec advisories over Cargo.lock)
+        continue-on-error: true
+        run: cargo audit
+
+      - name: cargo deny (advisories + bans + sources)
+        continue-on-error: true
+        run: cargo deny check advisories bans sources
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: npm audit (frontend, high and above)
+        continue-on-error: true
+        working-directory: crates/hb-app/ui
+        run: |
+          npm ci
+          npm audit --audit-level=high

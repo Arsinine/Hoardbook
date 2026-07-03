@@ -1,0 +1,17 @@
+# cargo-deny policy — added by audit I-4 alongside the non-blocking `supply-chain` CI job.
+# Minimal baseline: advisories + bans on their defaults, sources kept permissive (crates.io
+# is the only registry; workspace path deps are inherent). The [licenses] section is
+# deliberately omitted for now — license policy is a later triage; when it lands, flip the
+# CI job to blocking.
+
+[advisories]
+# RustSec advisory DB on defaults (vulnerabilities fail the check; unmaintained/unsound warn).
+
+[bans]
+# Defaults: duplicate crate versions warn; no explicit deny list yet.
+
+[sources]
+# Permissive while the job is non-blocking: crates.io is allowed by default; anything
+# unknown warns instead of failing.
+unknown-registry = "warn"
+unknown-git = "warn"

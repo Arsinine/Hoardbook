@@ -95,6 +95,12 @@ pub struct Collection {
     /// pre-M10 stored collection loads as `Public`.
     #[serde(default)]
     pub visibility: Visibility,
+    /// Whether the listing is organised/curated (vs a raw, hard-to-filter dump). A **public** browse
+    /// signal (owner devtest 2026-06-25 #7) so a browser can tell at a glance whether what they're
+    /// seeing is in an identifiable, filterable form. Serialized into the published listing.
+    /// `#[serde(default)]` ⇒ a pre-#7 stored/published collection loads as `false`.
+    #[serde(default)]
+    pub sorted: bool,
     pub last_updated: DateTime<Utc>,
     pub listing: Vec<DirectoryItem>,
 }
@@ -269,17 +275,22 @@ mod tests {
             tags: vec![],
             languages: vec![],
             visibility: Visibility::Public,
+            sorted: false,
             last_updated: chrono::Utc::now(),
             listing: vec![],
         };
         let json = serde_json::to_string(&col).unwrap();
+        // `total_bytes` stays internal — exact byte counts must not leak into the published listing.
         assert!(
             !json.contains("total_bytes"),
             "Collection must not expose total_bytes in serialized form"
         );
+        // `sorted` is now a deliberate PUBLIC browse signal (owner devtest 2026-06-25 #7) — it MUST
+        // be in the listing so a browser can tell an organised hoard from a raw dump. (Reverses the
+        // pre-#7 "must not expose sorted" rule — stop-and-justify.)
         assert!(
-            !json.contains("\"sorted\""),
-            "Collection must not expose sorted in serialized form"
+            json.contains("\"sorted\""),
+            "Collection must expose `sorted` as a public browse signal, got: {json}"
         );
     }
 
@@ -313,6 +324,7 @@ mod tests {
             tags: vec![],
             languages: vec![],
             visibility: Visibility::Private,
+            sorted: false,
             last_updated: chrono::Utc::now(),
             listing: vec![],
         };
@@ -320,6 +332,32 @@ mod tests {
         assert!(json.contains("\"visibility\":\"Private\""), "got: {json}");
         let back: Collection = serde_json::from_str(&json).unwrap();
         assert_eq!(back.visibility, Visibility::Private);
+    }
+
+    #[test]
+    fn sorted_is_a_public_signal_that_round_trips_and_defaults_false() {
+        // Devtest 2026-06-25 #7: `sorted` is a PUBLIC browse signal — it must serialize into the
+        // listing and survive a round-trip, and a pre-#7 collection (no `sorted` key) loads false.
+        let col = Collection {
+            slug: "dump".into(),
+            path_alias: "Dump".into(),
+            description: None,
+            item_count: 0,
+            est_size: None,
+            content_types: vec!["video".into()],
+            tags: vec![],
+            languages: vec![],
+            visibility: Visibility::Public,
+            sorted: true,
+            last_updated: chrono::Utc::now(),
+            listing: vec![],
+        };
+        let json = serde_json::to_string(&col).unwrap();
+        assert!(json.contains("\"sorted\":true"), "sorted must be published, got: {json}");
+        assert!(serde_json::from_str::<Collection>(&json).unwrap().sorted);
+        // Pre-#7 listing with no `sorted` key ⇒ false (never a spurious "sorted" badge).
+        let legacy = r#"{"slug":"x","path_alias":"X","item_count":0,"last_updated":"2026-04-01T00:00:00Z","listing":[]}"#;
+        assert!(!serde_json::from_str::<Collection>(legacy).unwrap().sorted, "missing sorted ⇒ false");
     }
 
     #[test]

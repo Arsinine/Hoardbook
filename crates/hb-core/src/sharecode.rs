@@ -17,7 +17,7 @@ use crate::error::HbError;
 use crate::version::CRYPTO_V;
 
 /// bech32 HRP for a full share code. NB: the *prefix* is `hbk`; the rendered string is `hbk1…`.
-const HRP_STR: &str = "hbk";
+pub(crate) const HRP_STR: &str = "hbk";
 /// Version byte carried at the head of the `hbk` payload. Tied to the crypto version.
 pub const SHARECODE_VERSION: u8 = CRYPTO_V;
 

@@ -140,7 +140,9 @@ async fn dm5_inner(ctx: &Ctx) -> Result<()> {
     // Bob advertises relay B as his read-relay, published where Alice can discover it (relay A — the
     // overlapping bootstrap relay for the kind-10002 lookup).
     let bob_on_a = ctx.connect_one(&bob, 0).await?;
-    bob_on_a.publish(&build_relay_list(&bob, &[relay_b.clone()], &[relay_b.clone()])?).await?;
+    bob_on_a
+        .publish(&build_relay_list(&bob, std::slice::from_ref(&relay_b), std::slice::from_ref(&relay_b))?)
+        .await?;
     bob_on_a.disconnect().await;
     settle().await;
 
@@ -184,14 +186,16 @@ async fn dm6_inner(ctx: &Ctx) -> Result<()> {
 
     // Bob's read-relay is A (published to A for discovery).
     let bob_on_a = ctx.connect_one(&bob, 0).await?;
-    bob_on_a.publish(&build_relay_list(&bob, &[relay_a.clone()], &[relay_a.clone()])?).await?;
+    bob_on_a
+        .publish(&build_relay_list(&bob, std::slice::from_ref(&relay_a), std::slice::from_ref(&relay_a))?)
+        .await?;
     bob_on_a.disconnect().await;
     settle().await;
 
     // Alice connects to A, then accretes relay B (as a prior browse of some other peer would).
     let own = vec![relay_a.clone()];
     let ac = ctx.connect_one(&alice, 0).await?;
-    ac.ensure_relays(&[relay_b.clone()], FETCH_TIMEOUT).await?; // B is now in Alice's pool but unrelated
+    ac.ensure_relays(std::slice::from_ref(&relay_b), FETCH_TIMEOUT).await?; // B is now in Alice's pool but unrelated
 
     let wrap = wrap_dm(&alice, &bob.public_key(), "A only").await?;
     let targets = resolve_recipient_relays(&ac, &bob.public_key(), &own, &own, FETCH_TIMEOUT).await;

@@ -25,6 +25,12 @@ pub struct CollectionEntry {
     pub collection: Collection,
     /// True if this collection has been signed and published.
     pub published: bool,
+    /// Total bytes on disk (devtest 2026-06-25 #5). Carried on the UI wrapper — **not** on the
+    /// published `Collection` (which deliberately omits exact bytes; see the hb-core invariant test)
+    /// — so the home "Total Size" / "Disk size (auto)" aggregate works without leaking byte counts
+    /// into the relay listing. Sourced from the per-slug `ScanSpec` sidecar.
+    #[serde(default)]
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,8 +60,17 @@ pub struct SubdirEntry {
 pub async fn scan_directory(
     opts: ScanOptions,
     store: State<'_, DataStore>,
-) -> CmdResult<Collection> {
-    scan_directory_inner(opts, store.inner()).await
+) -> CmdResult<CollectionEntry> {
+    let collection = scan_directory_inner(opts, store.inner()).await?;
+    // Surface the scanned byte total to the freshly-added collection immediately (devtest #5) — read
+    // it back from the sidecar scan_directory_inner just persisted, so size shows pre-reload too.
+    let total_bytes = store
+        .load_scan_spec(&collection.slug)
+        .ok()
+        .flatten()
+        .map(|s| s.total_bytes)
+        .unwrap_or(0);
+    Ok(CollectionEntry { collection, published: false, total_bytes })
 }
 
 /// List the immediate child directories of `path` for the folder-tree picker. Lazy (called once per
@@ -142,24 +157,28 @@ async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult
         languages: vec![],
         // A freshly-scanned collection is Public by default; the user opts a collection into
         // Private explicitly via the visibility selector (M10). A rescan preserves the prior
-        // visibility below (alongside notes).
+        // visibility below (alongside notes + the sorted flag).
         visibility: Visibility::Public,
+        // The `sorted` browse signal (#7) is a user declaration, not derived from the scan — default
+        // false on a fresh scan; a rescan preserves the prior value below.
+        sorted: false,
         last_updated: chrono::Utc::now(),
         listing,
     };
 
-    // Preserve per-item notes AND the prior visibility from the existing draft (rescan scenario) —
-    // a rescan must never silently flip a Private collection back to Public (that would re-publish
-    // privately-marked data on the public path next publish).
+    // Preserve per-item notes AND the prior visibility + sorted flag from the existing draft (rescan
+    // scenario) — a rescan must never silently flip a Private collection back to Public (that would
+    // re-publish privately-marked data on the public path next publish) nor drop the sorted signal.
     if let Ok(Some(prev)) = store.load_collection_draft(&collection.slug) {
         let notes = collect_notes(&prev.listing, "");
         collection.listing = apply_notes(collection.listing, &notes, "");
         collection.visibility = prev.visibility;
+        collection.sorted = prev.sorted;
     }
 
     store.save_collection_draft(&collection).map_err(cmd_err)?;
 
-    // Persist the root path so the transfer server can find files on disk.
+    // Persist the collection's on-disk root so the snapshot re-scan can find the tree again.
     let mut share = store
         .load_share_settings(&collection.slug)
         .map_err(cmd_err)?
@@ -176,6 +195,9 @@ async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult
                 root: opts.path.clone(),
                 include: opts.include.clone(),
                 exclude: opts.exclude.clone(),
+                // Persisted here (never published) so get_collections can surface the aggregate
+                // "Total Size" the home view reads from `total_bytes` (devtest 2026-06-25 #5).
+                total_bytes,
             },
         )
         .map_err(cmd_err)?;
@@ -233,7 +255,11 @@ pub async fn get_collections(store: State<'_, DataStore>) -> CmdResult<Vec<Colle
     for slug in store.list_collection_slugs().map_err(cmd_err)? {
         if let Ok(Some(col)) = store.load_collection_draft(&slug) {
             let published = store.is_published(&slug);
-            entries.push(CollectionEntry { collection: col, published });
+            // Byte total from the per-slug sidecar (devtest 2026-06-25 #5) — 0 if never scanned with
+            // the field (pre-existing spec) so the UI shows "—" rather than a wrong number.
+            let total_bytes =
+                store.load_scan_spec(&slug).ok().flatten().map(|s| s.total_bytes).unwrap_or(0);
+            entries.push(CollectionEntry { collection: col, published, total_bytes });
         }
     }
     entries.sort_by(|a, b| a.collection.path_alias.cmp(&b.collection.path_alias));
@@ -248,6 +274,9 @@ pub async fn update_collection_meta(
     content_types: Vec<String>,
     tags: Vec<String>,
     languages: Vec<String>,
+    // The `sorted` browse signal (#7). The frontend already sent this in every call; it was silently
+    // dropped until the command accepted it (there was no parameter to bind to).
+    sorted: bool,
     store: State<'_, DataStore>,
 ) -> CmdResult<()> {
     let safe_slug = is_valid_slug(&slug)
@@ -264,6 +293,7 @@ pub async fn update_collection_meta(
     col.content_types = content_types;
     col.tags = tags;
     col.languages = languages;
+    col.sorted = sorted;
     store.save_collection_draft(&col).map_err(cmd_err)
 }
 
@@ -1143,6 +1173,33 @@ mod tests {
         assert!(draft.is_some(), "empty-folder scan must still save a draft");
     }
 
+    /// Regression (devtest 2026-06-25 #5): the home "Total Size" / "Disk size (auto)" aggregate
+    /// reads `total_bytes`, but the published `Collection` deliberately omits exact bytes (hb-core
+    /// privacy invariant). The scanned byte total must therefore be persisted in the per-slug
+    /// `ScanSpec` sidecar so `get_collections` can surface it on `CollectionEntry` — before the fix
+    /// it was computed at scan time and dropped, so the aggregate always read "—".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_persists_total_bytes_for_the_size_aggregate() {
+        use tempfile::TempDir;
+        let work = TempDir::new().unwrap();
+        std::fs::write(work.path().join("a.bin"), vec![0u8; 1000]).unwrap();
+        std::fs::write(work.path().join("b.bin"), vec![0u8; 2048]).unwrap();
+        let data = TempDir::new().unwrap();
+        let store = DataStore::new(data.path().to_path_buf());
+        let opts = ScanOptions {
+            path: work.path().to_string_lossy().into_owned(),
+            path_alias: "Sized".into(),
+            include: vec![], // root-level loose files are always included
+            exclude: vec![],
+        };
+        let collection = scan_directory_inner(opts, &store).await.unwrap();
+        let spec = store.load_scan_spec(&collection.slug).unwrap().expect("scan persists a spec");
+        assert_eq!(spec.total_bytes, 3048, "the byte total must be persisted for the UI size aggregate");
+        // And the published Collection must STILL NOT carry total_bytes (privacy invariant unchanged).
+        let json = serde_json::to_string(&collection).unwrap();
+        assert!(!json.contains("total_bytes"), "the published Collection must not expose total_bytes");
+    }
+
     /// Regression: a path containing spaces with a trailing separator (mimicking
     /// a Windows path such as `C:\Users\Flux T\Downloads\`) plus a display name
     /// with spaces must scan successfully — not hang, and not fail slug validation.
@@ -1277,6 +1334,7 @@ mod tests {
             tags: vec![],
             languages: vec![],
             visibility: Visibility::Public,
+            sorted: false,
             last_updated: chrono::Utc::now(),
             listing: vec![],
         };
@@ -1297,6 +1355,7 @@ mod tests {
             tags: vec![],
             languages: vec![],
             visibility: Visibility::Public,
+            sorted: false,
             last_updated: chrono::Utc::now(),
             listing: vec![DirectoryItem {
                 name: "Ran (1985)".into(),

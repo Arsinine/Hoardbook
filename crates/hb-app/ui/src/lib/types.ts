@@ -126,13 +126,11 @@ export interface SubdirEntry {
 	has_children: boolean;
 }
 
+/** Per-collection persisted state. The transfer-era fields (enabled/allowed_paths/speed_cap/
+ *  download_limit/require_follow) were removed with the download UI — Hoardbook moves no files
+ *  (INV-4). Only the on-disk root survives, used to pre-fill the re-scan dialog. */
 export interface ShareSettings {
-	enabled: boolean;
 	root_path?: string;
-	allowed_paths: string[];
-	speed_cap_kbps?: number;
-	download_limit?: number;
-	require_follow: boolean;
 }
 
 export interface Group {

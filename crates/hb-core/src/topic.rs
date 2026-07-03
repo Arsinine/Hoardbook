@@ -108,8 +108,8 @@ pub const KIND_TOPIC_INVITE: u16 = 31_119;
 /// real member without leaking the npub on the wire (chorus-1). **Provisional.**
 pub const KIND_TOPIC_PROOF: u16 = 31_120;
 
-const TAG_SCHEMA: &str = "hb-v";
-const TAG_CRYPTO: &str = "hb-cv";
+pub(crate) const TAG_SCHEMA: &str = "hb-v";
+pub(crate) const TAG_CRYPTO: &str = "hb-cv";
 
 /// Domain byte distinguishing a membership ciphertext from a channel-post ciphertext (F17) — the two
 /// share the topic conversation key, so the first plaintext byte pins which event type it is.
@@ -415,19 +415,25 @@ pub fn member_sign_keys(key: &TopicKey, member: &PublicKey) -> Result<Keys, HbEr
 
 // ── proof-of-participation (chorus-1: real-key authorization, carried in ciphertext) ─────────────
 
+/// The `hbm:` proof domain prefixes — **launch-frozen wire discriminants** (they live inside signed
+/// proof events that persist in members' rosters), extracted as consts so the wire-freeze test can
+/// pin them (INVARIANT_AUDIT.md I-3).
+pub(crate) const PROOF_JOIN_PREFIX: &str = "hbm:join:";
+pub(crate) const PROOF_POST_PREFIX: &str = "hbm:post:";
+
 /// The canonical statement a member's REAL key signs to authorize joining `topic_id`. The `hbm:`
 /// prefix is a **Hoardbook-specific domain separator** (chorus-2): without it, a `KIND_TOPIC_PROOF`
 /// event Alice ever signs for *any other* app with content `join:x` could be replayed as a Hoardbook
 /// membership proof. The prefix binds the proof to this protocol.
 fn membership_statement(topic_id: &str) -> String {
-    format!("hbm:join:{topic_id}")
+    format!("{PROOF_JOIN_PREFIX}{topic_id}")
 }
 
 /// The canonical statement an author's REAL key signs to authorize a post (binds the body so a
 /// key-holder cannot reattach the proof to a different message). Domain-separated like the membership
 /// statement (chorus-2).
 fn post_statement(topic_id: &str, body: &str) -> String {
-    format!("hbm:post:{topic_id}:{}", hex::encode(Sha256::digest(body.as_bytes())))
+    format!("{PROOF_POST_PREFIX}{topic_id}:{}", hex::encode(Sha256::digest(body.as_bytes())))
 }
 
 /// Build a proof event signed by the member's **real** key over `statement` at `at`. It is never
@@ -875,9 +881,9 @@ mod tests {
     #[test]
     fn public_name_exceeding_depth_cap_is_rejected() {
         // MAX_TOPIC_DEPTH segments is OK; one deeper is rejected (junk can't make the tree unbounded).
-        let at_cap = std::iter::once("video").chain(std::iter::repeat("x").take(MAX_TOPIC_DEPTH - 1)).collect::<Vec<_>>().join("/");
+        let at_cap = std::iter::once("video").chain(std::iter::repeat_n("x", MAX_TOPIC_DEPTH - 1)).collect::<Vec<_>>().join("/");
         assert!(new_topic(&at_cap, "", vec![], false).is_ok(), "a path at the depth cap is accepted");
-        let too_deep = std::iter::once("video").chain(std::iter::repeat("x").take(MAX_TOPIC_DEPTH)).collect::<Vec<_>>().join("/");
+        let too_deep = std::iter::once("video").chain(std::iter::repeat_n("x", MAX_TOPIC_DEPTH)).collect::<Vec<_>>().join("/");
         assert!(new_topic(&too_deep, "", vec![], false).is_err(), "a path past the depth cap is rejected");
     }
 

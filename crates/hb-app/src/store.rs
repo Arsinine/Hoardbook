@@ -73,17 +73,18 @@ impl Default for Settings {
 }
 
 // ---------------------------------------------------------------------------
-// ShareSettings — per-collection P2P sharing config
+// ShareSettings — per-collection persisted on-disk root
 // ---------------------------------------------------------------------------
 
+/// Per-collection persisted state. The transfer-era fields (`enabled`, `allowed_paths`,
+/// `speed_cap_kbps`, `download_limit`, `require_follow`) were removed with the download UI —
+/// Hoardbook moves no files (INV-4). Only `root_path` survives: the collection's on-disk root,
+/// persisted so the snapshot re-scan can find the tree again. (Overlaps `ScanSpec.root`; kept
+/// separate for now — de-dup is a later cleanup.) Old JSON with the removed fields still loads
+/// (serde ignores unknown fields).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ShareSettings {
-    pub enabled: bool,
     pub root_path: Option<String>,
-    pub allowed_paths: Vec<String>,
-    pub speed_cap_kbps: Option<u32>,
-    pub download_limit: Option<u32>,
-    pub require_follow: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -103,6 +104,12 @@ pub struct ScanSpec {
     /// Exclude globs.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Total bytes on disk from the last scan. Lives here (a per-slug local sidecar, never
+    /// published) rather than on `Collection` so the UI can show an aggregate "Total Size" while the
+    /// published listing still **omits** exact bytes (the hb-core `Collection` privacy invariant —
+    /// devtest 2026-06-25 #5). `#[serde(default)]` so a pre-existing spec without it loads as 0.
+    #[serde(default)]
+    pub total_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -847,11 +854,13 @@ mod tests {
             root: "/mnt/share/films".into(),
             include: vec!["criterion".into()],
             exclude: vec!["*.nfo".into()],
+            total_bytes: 4096,
         };
         store.save_scan_spec("films", &spec).unwrap();
         let loaded = store.load_scan_spec("films").unwrap().unwrap();
         assert_eq!(loaded.root, "/mnt/share/films");
         assert_eq!(loaded.include, vec!["criterion".to_string()]);
+        assert_eq!(loaded.total_bytes, 4096, "total_bytes round-trips through the scan spec");
     }
 
     #[test]
@@ -868,6 +877,7 @@ mod tests {
                 tags: vec![],
                 languages: vec![],
                 visibility: hb_core::types::Visibility::Public,
+                sorted: false,
                 last_updated: chrono::Utc::now(),
                 listing: vec![],
             };

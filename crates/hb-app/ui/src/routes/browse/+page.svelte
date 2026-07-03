@@ -1,11 +1,8 @@
 <script lang="ts">
-	import { contacts, toast } from '$lib/stores.js';
+	import { contacts } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
-	import { searchPeers, follow, getContacts, type PeerSearchHit } from '$lib/api.js';
-	import { renderFingerprint } from '$lib/identity-display.js';
-	import { DISCOVER_CONTENT_TYPES, parseTagInput, canSearch, toggleContentType } from '$lib/discover-view.js';
 	import type { CachedPeer, Collection, DirectoryItem } from '$lib/types.js';
 
 	type BcItem =
@@ -18,43 +15,8 @@
 	let selectedCollection: Collection | null = null;
 	let folderStack: { name: string; items: DirectoryItem[] }[] = [];
 
-	// ── §6 Discovery (M12 W3) — search public teasers across the relays ───────────
-	let discoverTags = '';
-	let discoverTypes: string[] = [];
-	let discoverResults: PeerSearchHit[] = [];
-	let discovering = false;
-	let discoverError = '';
-	let discovered = false; // a search has run at least once (drives the empty-vs-no-results copy)
-	$: parsedDiscoverTags = parseTagInput(discoverTags);
-	$: canDiscover = canSearch(parsedDiscoverTags, discoverTypes);
-	$: followedNpubs = new Set($contacts.map((c) => c.npub));
-
-	async function runDiscover() {
-		if (!canDiscover) {
-			discoverError = 'Enter at least one tag or content type to search.';
-			return;
-		}
-		discovering = true;
-		discoverError = '';
-		try {
-			discoverResults = await searchPeers(parsedDiscoverTags, discoverTypes);
-			discovered = true;
-		} catch (e) {
-			discoverError = String(e);
-		} finally {
-			discovering = false;
-		}
-	}
-
-	async function followHit(hit: PeerSearchHit) {
-		try {
-			await follow(hit.npub); // follow-only (bare npub): grants awareness, NOT a browse-key (INV-2)
-			toast(`Following ${hit.display_name || hit.npub.slice(0, 12)}…`, 'success');
-			try { contacts.set(await getContacts()); } catch { /* non-fatal */ }
-		} catch (e) {
-			toast(String(e), 'error');
-		}
-	}
+	// §6 Discovery moved to Contacts (devtest 2026-06-25 #6). Browse is now purely "browse a contact's
+	// collections" — pick someone from the People list on the left.
 
 	$: filteredContacts = $contacts
 		.filter(p => {
@@ -198,79 +160,14 @@
 	<!-- Right: browser -->
 	<div class="right-panel">
 		{#if !selectedPeer}
-			<!-- §6 Discovery: find peers by tag / content-type across the relays. Results are the opt-in
-			     public teaser only — each peer's listings stay 🔒 browse-key-locked (DISC3). -->
-			<div class="discover">
-				<div class="discover-head">
-					<span class="discover-title">Discover hoarders</span>
-					<span class="discover-sub">Search public profiles by tag &amp; content type — without anyone parsing your encrypted listings</span>
-				</div>
-				<div class="discover-filters">
-					<div class="ct-row">
-						{#each DISCOVER_CONTENT_TYPES as ct (ct.value)}
-							<button
-								type="button"
-								class="ct-chip"
-								class:ct-on={discoverTypes.includes(ct.value)}
-								on:click={() => (discoverTypes = toggleContentType(discoverTypes, ct.value))}
-							>{ct.label}</button>
-						{/each}
-					</div>
-					<form class="tag-row" on:submit|preventDefault={runDiscover}>
-						<input class="tag-input" placeholder="tags (e.g. anime, vhs)" bind:value={discoverTags} />
-						<button class="search-btn" type="submit" disabled={!canDiscover || discovering}>
-							{discovering ? 'Searching…' : 'Search'}
-						</button>
-					</form>
-					{#if discoverError}<div class="discover-error">{discoverError}</div>{/if}
-				</div>
-
-				<div class="discover-results">
-					{#if discovering}
-						<div class="discover-empty">Searching the relays…</div>
-					{:else if discovered && discoverResults.length === 0}
-						<div class="discover-empty">No hoarders matched those filters.</div>
-					{:else if !discovered}
-						<div class="discover-empty">Pick a content type or enter a tag, then Search.</div>
-					{:else}
-						{#each discoverResults as hit (hit.npub)}
-							{@const letter = (hit.display_name?.[0] ?? hit.npub[0]).toUpperCase()}
-							{@const isContact = followedNpubs.has(hit.npub)}
-							<div class="hit-card">
-								<div class="hit-top">
-									<Avatar {letter} size={30} hue={avatarHue(letter)} />
-									<div class="hit-id">
-										<span class="hit-name">{hit.display_name || hit.npub.slice(0, 12) + '…'}</span>
-										{#if !isContact}
-											<span class="hit-stranger" title="Verify the fingerprint before trusting a stranger">unverified — not in your contacts</span>
-										{/if}
-									</div>
-									{#if isContact}
-										<span class="hit-following">Following</span>
-									{:else}
-										<button class="hit-follow" on:click={() => followHit(hit)}>Follow</button>
-									{/if}
-								</div>
-								{#if hit.bio}<div class="hit-bio">{hit.bio}</div>{/if}
-								{#if hit.fingerprint}
-									<div class="hit-fp" title="§7 identity fingerprint — check it before trusting a stranger">
-										<span class="hit-fp-swatch" style="background:{hit.fingerprint.colorHex}"></span>
-										{renderFingerprint(hit.fingerprint)}
-									</div>
-								{/if}
-								{#if hit.content_types.length > 0 || hit.tags.length > 0}
-									<div class="hit-tags">
-										{#each hit.content_types as ct}<span class="tag tag-ct">{ct}</span>{/each}
-										{#each hit.tags.slice(0, 6) as t}<span class="tag">#{t}</span>{/each}
-									</div>
-								{/if}
-								<div class="hit-locked">
-									🔒 Listings locked<FeatureTooltip key="listings-locked" />
-								</div>
-							</div>
-						{/each}
-					{/if}
-				</div>
+			<!-- Browse = view a contact's collections. Finding/adding people (lookup + Discover
+			     hoarders) now lives on Contacts (devtest 2026-06-25 #6). -->
+			<div class="empty-state">
+				<div class="empty-icon">{@html icons.folder}</div>
+				<div class="empty-label">Select a contact to browse their collections</div>
+				{#if $contacts.length === 0}
+					<a class="empty-cta" href="/contacts">Find hoarders in Contacts →</a>
+				{/if}
 			</div>
 		{:else}
 			<!-- Breadcrumb -->
@@ -555,6 +452,14 @@
 
 	.empty-label { font-size: 12.5px; display: inline-flex; align-items: center; }
 
+	.empty-cta {
+		font-size: 12px;
+		color: var(--accent);
+		text-decoration: none;
+		margin-top: 4px;
+	}
+	.empty-cta:hover { text-decoration: underline; }
+
 	/* Willing-to hints bar */
 	.willing-bar {
 		display: flex;
@@ -814,157 +719,6 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
-
-	/* ── §6 Discovery panel ──────────────────────────────────────── */
-
-	.discover {
-		flex: 1;
-		display: flex;
-		flex-direction: column;
-		overflow: hidden;
-		min-width: 0;
-	}
-
-	.discover-head {
-		padding: 16px 18px 10px;
-		border-bottom: 1px solid var(--divider);
-		flex-shrink: 0;
-	}
-
-	.discover-title { font-size: 14px; font-weight: 700; color: var(--fg); }
-	.discover-sub { display: block; font-size: 11.5px; color: var(--fg-dim); margin-top: 3px; }
-
-	.discover-filters {
-		padding: 12px 18px;
-		border-bottom: 1px solid var(--divider);
-		display: flex;
-		flex-direction: column;
-		gap: 10px;
-		flex-shrink: 0;
-	}
-
-	.ct-row { display: flex; flex-wrap: wrap; gap: 6px; }
-
-	.ct-chip {
-		font-size: 11.5px;
-		padding: 4px 11px;
-		border-radius: 999px;
-		background: var(--bg-elev1);
-		color: var(--fg-muted);
-		border: 1px solid var(--border);
-		cursor: pointer;
-		font-family: var(--font-ui);
-		transition: background 0.1s, color 0.1s, border-color 0.1s;
-	}
-
-	.ct-chip:hover { background: var(--bg-elev2); }
-
-	.ct-on {
-		background: var(--accent-soft);
-		color: var(--accent);
-		border-color: color-mix(in oklch, var(--accent) 35%, transparent);
-		font-weight: 600;
-	}
-
-	.tag-row { display: flex; gap: 8px; }
-
-	.tag-input {
-		flex: 1;
-		background: var(--bg-elev1);
-		border: 1px solid var(--border);
-		border-radius: 7px;
-		padding: 7px 10px;
-		font-size: 12.5px;
-		color: var(--fg);
-		font-family: var(--font-ui);
-		outline: none;
-	}
-
-	.tag-input::placeholder { color: var(--fg-dim); }
-	.tag-input:focus { border-color: var(--accent); }
-
-	.search-btn {
-		padding: 7px 16px;
-		border-radius: 7px;
-		background: var(--accent);
-		color: var(--accent-text);
-		border: none;
-		font-size: 12.5px;
-		font-weight: 600;
-		cursor: pointer;
-		font-family: var(--font-ui);
-	}
-
-	.search-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-
-	.discover-error { font-size: 11.5px; color: oklch(0.75 0.15 25); }
-
-	.discover-results {
-		flex: 1;
-		overflow-y: auto;
-		padding: 14px 18px;
-		display: grid;
-		grid-template-columns: repeat(auto-fill, minmax(248px, 1fr));
-		gap: 12px;
-		align-content: start;
-	}
-
-	.discover-empty {
-		grid-column: 1 / -1;
-		text-align: center;
-		color: var(--fg-dim);
-		font-size: 12.5px;
-		padding: 28px 0;
-	}
-
-	.hit-card {
-		display: flex;
-		flex-direction: column;
-		gap: 7px;
-		padding: 13px;
-		background: var(--bg-elev1);
-		border: 1px solid var(--border);
-		border-radius: 9px;
-	}
-
-	.hit-top { display: flex; align-items: center; gap: 9px; }
-	.hit-id { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 1px; }
-	.hit-name { font-size: 13px; font-weight: 600; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-	.hit-stranger { font-size: 9.5px; color: oklch(0.72 0.13 70); }
-
-	.hit-follow {
-		padding: 4px 12px;
-		border-radius: 6px;
-		background: var(--accent);
-		color: var(--accent-text);
-		border: none;
-		font-size: 11.5px;
-		font-weight: 600;
-		cursor: pointer;
-		font-family: var(--font-ui);
-		flex-shrink: 0;
-	}
-
-	.hit-following { font-size: 11px; color: var(--fg-dim); flex-shrink: 0; }
-
-	.hit-bio { font-size: 11.5px; color: var(--fg-muted); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; }
-
-	.hit-fp {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		font-size: 10px;
-		color: var(--fg-dim);
-		font-family: var(--font-mono);
-	}
-
-	.hit-fp-swatch { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
-
-	.hit-tags { display: flex; flex-wrap: wrap; gap: 4px; }
-
-	.tag-ct { background: var(--accent-soft); color: var(--accent); border-color: color-mix(in oklch, var(--accent) 30%, transparent); }
-
-	.hit-locked { display: inline-flex; align-items: center; font-size: 11px; color: var(--fg-dim); margin-top: 2px; }
 
 	/* ── Context menu ────────────────────────────────────────────── */
 

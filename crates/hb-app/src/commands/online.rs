@@ -52,7 +52,7 @@ pub type SharedOnlineCache = Arc<RwLock<OnlineCache>>;
 /// Whether the cache is stale enough to attempt a refresh. Pure (no clock capture beyond the passed
 /// reference) so the slow-tick throttle is unit-testable.
 fn is_stale(last_attempt: Option<Instant>, now: Instant, interval: Duration) -> bool {
-    last_attempt.map_or(true, |t| now.saturating_duration_since(t) >= interval)
+    last_attempt.is_none_or(|t| now.saturating_duration_since(t) >= interval)
 }
 
 /// Apply a refresh outcome to the cache (Decision C — **no sticky "–"**). A success replaces the
