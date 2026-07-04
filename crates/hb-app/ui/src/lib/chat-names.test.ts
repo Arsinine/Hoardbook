@@ -22,6 +22,11 @@ function shortId(hb_id: string) {
 
 // ── Issue: senderName resolution ─────────────────────────────────────────────
 // Mirrors the senderName function as it was before the fix (contacts only).
+//
+// M13 Part B (Q7): a stranger row no longer feeds the CONVERSATION list at all — strangers are
+// quarantined into the Request inbox. The fetched-profile-cache path below still exists and is
+// still needed, but it now names senders in the REQUEST pane (fetchNonContactNames is fed from
+// $dmRequests, not from the removed inboxOnlyPeers merge).
 
 function senderNameBuggy(
 	hb_id: string,
@@ -68,7 +73,7 @@ describe('chat senderName — unfollowed user shown as hb_id (bug)', () => {
 	});
 });
 
-describe('chat senderName — fixed with profile cache', () => {
+describe('chat senderName — fixed with profile cache (Q7: serves the Request pane)', () => {
 	const myId = 'hb1_me00000000';
 	const contacts = [makePeer('hb1_alice', 'AliceHoarder')];
 
@@ -80,13 +85,13 @@ describe('chat senderName — fixed with profile cache', () => {
 		expect(senderNameFixed(myId, myId, contacts, {})).toBe('You');
 	});
 
-	it('uses fetched profile cache for unfollowed sender', () => {
+	it('uses fetched profile cache for a Request-bucket sender (strangers render in the Request pane, not the conversation list)', () => {
 		const cache = { 'hb1_stranger000ABCD': 'Stranger Name' };
 		const name = senderNameFixed('hb1_stranger000ABCD', myId, contacts, cache);
 		expect(name).toBe('Stranger Name');
 	});
 
-	it('falls back to shortId when cache is empty for unknown sender', () => {
+	it('falls back to shortId when cache is empty for an unknown Request sender', () => {
 		const name = senderNameFixed('hb1_stranger000ABCD', myId, contacts, {});
 		expect(name).toBe(shortId('hb1_stranger000ABCD'));
 	});

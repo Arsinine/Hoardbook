@@ -23,6 +23,8 @@ import type {
 	TopicView,
 	DiscoveredTopic,
 	ChannelPost,
+	ChannelView,
+	DmRequestView,
 } from './types.js';
 
 // ── Identity ─────────────────────────────────────────────────────────────────
@@ -95,6 +97,12 @@ export const deleteCollection = (slug: string) => invoke<void>('delete_collectio
 
 export const publishCollection = (slug: string) =>
 	invoke<void>('publish_collection', { slug });
+
+/** Unpublish a collection (spec §4): NIP-09-deletes its listing events (Public only — a Private
+ *  collection's gift-wrapped events are ephemeral-keyed and cannot be deleted by this identity),
+ *  drops the local published marker (stops auto-republish), and refreshes the profile teaser. */
+export const unpublishCollection = (slug: string) =>
+	invoke<void>('unpublish_collection', { slug });
 
 export const updateCollectionMeta = (slug: string, description: string | undefined, contentTypes: string[], tags: string[], languages: string[], sorted: boolean) =>
 	invoke<void>('update_collection_meta', { slug, description, contentTypes, tags, languages, sorted });
@@ -169,8 +177,10 @@ export const onlineCount = () => invoke<OnlineCount>('online_count');
 /** `code` is a pasted share code (bare npub or full `hbk…`). */
 export const pasteKey = (code: string) => invoke<CachedPeer>('paste_key', { code });
 
-export const follow = (code: string, groupName?: string) =>
-	invoke<void>('follow', { code, groupName: groupName ?? null });
+/** `petname` is the M13 W5 seam — an optional user-supplied nickname set at follow-time, overriding
+ *  the auto-derived one. Pass undefined/omit to keep the auto-derived petname. */
+export const follow = (code: string, groupName?: string, petname?: string) =>
+	invoke<void>('follow', { code, groupName: groupName ?? null, petname: petname ?? null });
 
 export const getContacts = () => invoke<CachedPeer[]>('get_contacts');
 
@@ -180,6 +190,10 @@ export const refreshContact = (npub: string) => invoke<CachedPeer>('refresh_cont
 
 export const setContactTags = (npub: string, tags: string[]) =>
 	invoke<void>('set_contact_tags', { npub, tags });
+
+/** Set a contact's local, user-editable petname (M13 W5) — bound to the npub, never shared. */
+export const setContactPetname = (npub: string, petname: string) =>
+	invoke<void>('set_contact_petname', { npub, petname });
 
 // ── Discovery (§6) — M12 W3 ─────────────────────────────────────────────────────
 
@@ -213,6 +227,27 @@ export const sendMessage = (to: string, content: string) =>
 
 export const getMessages = () => invoke<ReceivedMessage[]>('get_messages');
 
+// ── Q7 — the stranger-DM Request inbox (M13 Part B) ──────────────────────────
+
+/** List the quarantined Request buckets — a pure local read, no relay I/O. */
+export const dmRequests = () => invoke<DmRequestView[]>('dm_requests');
+
+/** Accept a stranger's Request bucket: adds them as a contact (no browse-key) and returns the
+ *  drained messages to seed straight into the conversation. `petname` is the W5 seam (pass null for
+ *  now — the petname-on-accept dialog is a follow-up UI workstream). */
+export const dmRequestAccept = (npub: string, petname?: string | null) =>
+	invoke<ReceivedMessage[]>('dm_request_accept', { npub, petname: petname ?? null });
+
+/** Decline a Request bucket — remembered permanently until the sender becomes a contact normally. */
+export const dmRequestDecline = (npub: string) => invoke<void>('dm_request_decline', { npub });
+
+/** Block a sender: deletes any Request bucket/decline record and adds them to the local blocklist. */
+export const dmBlock = (npub: string) => invoke<void>('dm_block', { npub });
+
+export const dmUnblock = (npub: string) => invoke<void>('dm_unblock', { npub });
+
+export const dmBlockedList = () => invoke<string[]>('dm_blocked_list');
+
 // ── Updates ───────────────────────────────────────────────────────────────────
 
 export interface UpdateInfo { version: string; body?: string; }
@@ -229,7 +264,9 @@ export const takeUpdateNotice = () => invoke<UpdateNotice | null>('take_update_n
 // ── Groups ────────────────────────────────────────────────────────────────────
 
 export const groupsGet    = () => invoke<Group[]>('groups_get');
-export const groupsCreate = (name: string) => invoke<Group>('groups_create', { name });
+/** `color` (M13 W5) is an optional CSS hex string for the group chip. */
+export const groupsCreate = (name: string, color?: string) =>
+	invoke<Group>('groups_create', { name, color: color ?? null });
 export const groupsRename = (oldName: string, newName: string) =>
 	invoke<void>('groups_rename', { oldName, newName });
 export const groupsDelete   = (name: string) => invoke<void>('groups_delete', { name });
@@ -286,8 +323,17 @@ export const topicLeave = (topicId: string) => invoke<void>('topic_leave', { top
 
 export const topicRoster = (topicId: string) => invoke<string[]>('topic_roster', { topicId });
 
+/** The 24h channel: posts + announcements, both newest-first (M13 Part A app wiring). */
 export const topicChannel = (topicId: string) =>
-	invoke<ChannelPost[]>('topic_channel', { topicId });
+	invoke<ChannelView>('topic_channel', { topicId });
 
 export const topicPost = (topicId: string, body: string) =>
 	invoke<void>('topic_post', { topicId, body });
+
+/** Broadcast an announce to a Topic's channel — rate-limited to one per topic per 60 min (Q1). */
+export const topicAnnounce = (topicId: string, body: string) =>
+	invoke<void>('topic_announce', { topicId, body });
+
+/** Remaining announce cooldown for `topicId`, in seconds (0 = ready) — drives the button state. */
+export const topicAnnounceStatus = (topicId: string) =>
+	invoke<number>('topic_announce_status', { topicId });

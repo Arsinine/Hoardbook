@@ -2,6 +2,7 @@
 
 mod backup;
 mod commands;
+mod dm_quarantine;
 mod error;
 mod identity_state;
 mod net;
@@ -251,6 +252,8 @@ pub fn run() {
             app.manage(Arc::clone(&watch_cancel));
             app.manage(Arc::clone(&staged_update));
             app.manage(Arc::clone(&online_cache));
+            // M13 Part A: serializes the announce cooldown's check-and-record step.
+            app.manage(commands::topics::AnnounceGate(std::sync::Mutex::new(())));
 
             build_system_tray(app)?;
 
@@ -302,6 +305,7 @@ pub fn run() {
             commands::collection::get_collections,
             commands::collection::delete_collection,
             commands::collection::publish_collection,
+            commands::collection::unpublish_collection,
             commands::collection::update_collection_meta,
             commands::collection::update_collection_visibility,
             commands::collection::export_collection,
@@ -312,6 +316,7 @@ pub fn run() {
             commands::browse::unfollow_contact,
             commands::browse::refresh_contact,
             commands::browse::set_contact_tags,
+            commands::browse::set_contact_petname,
             commands::browse::search_peers,
             commands::settings::get_settings,
             commands::settings::save_settings,
@@ -321,6 +326,12 @@ pub fn run() {
             commands::online::online_count,
             commands::chat::send_message,
             commands::chat::get_messages,
+            commands::chat::dm_requests,
+            commands::chat::dm_request_accept,
+            commands::chat::dm_request_decline,
+            commands::chat::dm_block,
+            commands::chat::dm_unblock,
+            commands::chat::dm_blocked_list,
             commands::sharing::get_share_settings,
             commands::groups::groups_get,
             commands::groups::groups_create,
@@ -345,6 +356,8 @@ pub fn run() {
             commands::topics::topic_roster,
             commands::topics::topic_channel,
             commands::topics::topic_post,
+            commands::topics::topic_announce,
+            commands::topics::topic_announce_status,
             commands::update::check_update,
             commands::update::download_update,
             commands::update::apply_staged_update,

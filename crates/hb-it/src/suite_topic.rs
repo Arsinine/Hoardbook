@@ -9,13 +9,13 @@
 use anyhow::{anyhow, ensure, Result};
 use hb_core::topic::{
     build_announce, build_public_join, roster, seal_membership, topic_id_for_name, NonceSet,
-    TopicKey, TopicMeta, KIND_TOPIC_MEMBER, POST_TTL_SECS,
+    TopicKey, TopicMeta, KIND_TOPIC_MEMBER, KIND_TOPIC_POST, POST_TTL_SECS,
 };
 use hb_core::{new_topic, Identity};
 use hb_net::{
-    approve_join, discover_public_topics, fetch_channel, fetch_invite, fetch_join_requests,
-    fetch_membership_events, fetch_roster, join_public, join_topic, leave_topic, member_count,
-    post_to_channel, publish_topic, request_join,
+    announce_to_topic, approve_join, discover_public_topics, fetch_channel, fetch_channel_full,
+    fetch_invite, fetch_join_requests, fetch_membership_events, fetch_roster, join_public,
+    join_topic, leave_topic, member_count, post_to_channel, publish_topic, request_join,
 };
 use nostr::prelude::*;
 
@@ -34,6 +34,11 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
         result("TOPIC8 leave retracts (roster shrinks); last leave ⇒ dissolved (empty roster)", topic8(ctx).await),
         result("TOPIC9 channel: NIP-40 expiry tag present + the client filters >24h locally", topic9(ctx).await),
         result("TOPIC10 W4: same path (case/space variant) converges + activity-ranked discovery", topic10(ctx).await),
+        result(
+            "TOPIC11 announce: member broadcasts, member reads distinct-from-posts, non-member sees ciphertext, no npub leak, NIP-40 expiration tag present",
+            topic11(ctx).await,
+        ),
+        result("TOPIC12 announce 24h local filter regardless of relay", topic12(ctx).await),
     ]
 }
 
@@ -440,5 +445,75 @@ async fn topic10(ctx: &Ctx) -> Result<()> {
         pos_junk.ok_or_else(|| anyhow!("the junk singleton was not discovered"))?,
     );
     ensure!(pop < jnk, "activity ranking: the 2-member path ({pop}) must rank above the 1-member singleton ({jnk})");
+    Ok(())
+}
+
+// ── TOPIC11 (M13 Part A: announce broadcast) ────────────────────────────────────────────────────
+
+async fn topic11(ctx: &Ctx) -> Result<()> {
+    let creator = Identity::generate();
+    let (meta, key) = mk_public(ctx, "announce");
+    create_public(ctx, &creator, &meta, &key).await?;
+
+    let cc = ctx.connect(&creator).await?;
+    post_to_channel(&cc, &key, &meta.topic_id, &creator, "an ordinary post", now()).await?;
+    let announce = announce_to_topic(&cc, &key, &meta.topic_id, &creator, "hear ye, hear ye", now()).await?;
+    cc.disconnect().await;
+    settle().await;
+
+    // The announce carries a NIP-40 expiration tag — the same 24h lifecycle as a post.
+    let exp = announce.tags.find(TagKind::Expiration).and_then(|t| t.content()).and_then(|s| s.parse::<u64>().ok());
+    ensure!(exp.is_some(), "the announce carries a NIP-40 expiration tag");
+
+    // A joiner (member) reads the full channel: one post, one announce, correctly partitioned.
+    let joiner = Identity::generate();
+    let jc = ctx.connect(&joiner).await?;
+    join_topic(&jc, &key, &meta.topic_id, &joiner, now()).await?;
+    settle().await;
+    let read = fetch_channel_full(&jc, &meta.topic_id, &key, now(), FETCH_TIMEOUT).await?;
+    jc.disconnect().await;
+    ensure!(read.posts.iter().any(|p| p.body == "an ordinary post"), "the joiner reads the post");
+    ensure!(
+        read.announcements.iter().any(|a| a.body == "hear ye, hear ye"),
+        "the joiner reads the announce, distinct from posts"
+    );
+    ensure!(!read.posts.iter().any(|p| p.body == "hear ye, hear ye"), "the announce must not also surface as a post");
+
+    // A non-member's raw relay fetch of kind 1117 sees ciphertext only: pubkeys are pseudonyms, no
+    // participant real npub leaks on the wire (m6/B2, restated for the broadcast).
+    let observer = Identity::generate();
+    let oc = ctx.connect(&observer).await?;
+    let raw = oc.fetch(Filter::new().kind(Kind::from_u16(KIND_TOPIC_POST)).identifier(meta.topic_id.clone()), FETCH_TIMEOUT).await?;
+    oc.disconnect().await;
+    ensure!(raw.len() >= 2, "expected both the post and the announce on the relay, got {}", raw.len());
+    for e in &raw {
+        ensure!(e.pubkey != creator.public_key(), "a channel event pubkey leaked the creator's real npub");
+    }
+    Ok(())
+}
+
+// ── TOPIC12 (M13 Part A: announce 24h local filter) ─────────────────────────────────────────────
+
+async fn topic12(ctx: &Ctx) -> Result<()> {
+    let creator = Identity::generate();
+    let (meta, key) = mk_public(ctx, "announce-ttl");
+    create_public(ctx, &creator, &meta, &key).await?;
+
+    let cc = ctx.connect(&creator).await?;
+    announce_to_topic(&cc, &key, &meta.topic_id, &creator, "fresh announce", now()).await?;
+    cc.disconnect().await;
+    settle().await;
+
+    let rc = ctx.connect(&creator).await?;
+    // Fetched now: the fresh announce is present.
+    let fresh = fetch_channel_full(&rc, &meta.topic_id, &key, now(), FETCH_TIMEOUT).await?;
+    ensure!(fresh.announcements.iter().any(|a| a.body == "fresh announce"), "a fresh announce is in the channel");
+    // Fetched as if 24h+ later: the local filter drops it even though the relay still serves it.
+    let later = fetch_channel_full(&rc, &meta.topic_id, &key, now() + POST_TTL_SECS + 60, FETCH_TIMEOUT).await?;
+    rc.disconnect().await;
+    ensure!(
+        !later.announcements.iter().any(|a| a.body == "fresh announce"),
+        "the client filters a >24h announce locally regardless of the relay"
+    );
     Ok(())
 }

@@ -9,6 +9,7 @@
 //! on that contact has no browse-key to use (wire layer). Joining grants awareness + npub + teaser
 //! only.
 
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nostr::prelude::*;
@@ -16,10 +17,10 @@ use serde::Serialize;
 use tauri::State;
 
 use hb_core::topic::{build_announce, build_public_join, new_topic, seal_membership};
-use hb_core::Identity;
+use hb_core::{announce_cooldown_remaining, Identity};
 use hb_net::{
-    approve_join, discover_public_topics, fetch_channel, fetch_invite, fetch_roster, join_public,
-    join_topic, leave_topic, post_to_channel, publish_topic, request_join,
+    announce_to_topic, approve_join, discover_public_topics, fetch_channel_full, fetch_invite,
+    fetch_roster, join_public, join_topic, leave_topic, post_to_channel, publish_topic, request_join,
 };
 
 use crate::{
@@ -68,6 +69,64 @@ pub struct DiscoveredTopic {
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// M13 Part A — announce app wiring (Q1 owner ruling): the cooldown gate + length cap.
+// ---------------------------------------------------------------------------
+
+/// Serializes an announce's check-and-record step. A plain `std::sync::Mutex` is enough — the
+/// guarded section is the synchronous cooldown check + persisted timestamp write, never held across
+/// the network publish (an `.await`), so it can't deadlock a Tokio worker.
+pub struct AnnounceGate(pub std::sync::Mutex<()>);
+
+/// Hard cap on a broadcast's length, checked before the cooldown gate or any relay I/O.
+const ANNOUNCE_MAX_CHARS: usize = 1024;
+
+/// Reject an announce body over [`ANNOUNCE_MAX_CHARS`] with a clear, actionable error.
+pub(crate) fn validate_announce_body(body: &str) -> Result<(), String> {
+    let len = body.chars().count();
+    if len > ANNOUNCE_MAX_CHARS {
+        return Err(format!("Announcement is too long ({len} chars, max {ANNOUNCE_MAX_CHARS})"));
+    }
+    Ok(())
+}
+
+/// The pure check-and-record half of the announce cooldown burn: `Err` (naming the ready-again minute
+/// count) if `topic_id` is still cooling down, else records `now` and returns the PRIOR timestamp (if
+/// any) so a failed publish can restore it. Split out from [`topic_announce`] so it is directly
+/// testable without a live relay client, and so [`restore_announce_cooldown`] (the undo half) can be
+/// exercised on its own.
+pub(crate) fn burn_announce_cooldown(
+    times: &mut HashMap<String, u64>,
+    topic_id: &str,
+    now: u64,
+) -> Result<Option<u64>, String> {
+    let previous = times.get(topic_id).copied();
+    let remaining = announce_cooldown_remaining(previous, now);
+    if remaining > 0 {
+        let mins = remaining.div_ceil(60);
+        return Err(format!(
+            "Announcements are limited to one per topic per 60 min — ready again in {mins} min."
+        ));
+    }
+    times.insert(topic_id.to_string(), now);
+    Ok(previous)
+}
+
+/// Undo a cooldown burn after the publish turned out to be a TOTAL failure (every relay rejected it)
+/// — restores the prior timestamp, or removes the key entirely if there was none, so the failed
+/// attempt does not cost the user their next announce. A partial success (at least one relay
+/// accepted) is NOT run through this — the announce genuinely went out, so the burn stands.
+pub(crate) fn restore_announce_cooldown(times: &mut HashMap<String, u64>, topic_id: &str, previous: Option<u64>) {
+    match previous {
+        Some(p) => {
+            times.insert(topic_id.to_string(), p);
+        }
+        None => {
+            times.remove(topic_id);
+        }
+    }
 }
 
 async fn me(identity: &SharedIdentity) -> Result<Identity, String> {
@@ -341,22 +400,98 @@ pub struct ChannelPost {
     pub ts: u64,
 }
 
-/// Read the 24h channel of a Topic I'm in (locally filtered to the last 24h).
+/// A decrypted member broadcast, for the UI (M13 Part A app wiring).
+#[derive(Debug, Clone, Serialize)]
+pub struct AnnouncementView {
+    pub author_npub: String,
+    pub body: String,
+    pub ts: u64,
+}
+
+/// The full channel read the UI renders: posts + announcements, both **newest-first** — one relay
+/// fetch serves both (`hb_net::fetch_channel_full`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ChannelView {
+    pub posts: Vec<ChannelPost>,
+    pub announcements: Vec<AnnouncementView>,
+}
+
+/// Read a Topic's 24h channel — posts AND announcements (M13 Part A app wiring), both locally
+/// filtered to the last 24h, both newest-first.
 #[tauri::command]
 pub async fn topic_channel(
     topic_id: String,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
     relay: State<'_, SharedRelay>,
-) -> CmdResult<Vec<ChannelPost>> {
+) -> CmdResult<ChannelView> {
     let me = me(&identity).await?;
     let stored = load_stored(&store, &topic_id)?;
     let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
-    let posts = fetch_channel(&client, &topic_id, &stored.key, now(), net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
-    posts
+    let read = fetch_channel_full(&client, &topic_id, &stored.key, now(), net::RELAY_TIMEOUT)
+        .await
+        .map_err(cmd_err)?;
+    let posts = read
+        .posts
         .into_iter()
         .map(|p| Ok(ChannelPost { author_npub: p.author.to_bech32().map_err(cmd_err)?, body: p.body, ts: p.ts }))
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    let announcements = read
+        .announcements
+        .into_iter()
+        .map(|a| Ok(AnnouncementView { author_npub: a.author.to_bech32().map_err(cmd_err)?, body: a.body, ts: a.ts }))
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(ChannelView { posts, announcements })
+}
+
+/// Broadcast an announce to a Topic's channel (M13 Part A app wiring; owner ruling Q1) — rate-limited
+/// to one per topic per 60 min. The cooldown is checked-and-burned BEFORE the relay publish (never
+/// held across the `.await`, so the gate can't deadlock), and restored if the publish is a TOTAL
+/// failure (every relay rejected it, including a failure to even connect) — a partial success keeps
+/// the burn (the announce genuinely went out).
+#[tauri::command]
+pub async fn topic_announce(
+    topic_id: String,
+    body: String,
+    identity: State<'_, SharedIdentity>,
+    store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
+    gate: State<'_, AnnounceGate>,
+) -> CmdResult<()> {
+    validate_announce_body(&body)?;
+    let me = me(&identity).await?;
+    let stored = load_stored(&store, &topic_id)?;
+    let t = now();
+
+    let previous = {
+        let _guard = gate.0.lock().map_err(|_| "announce gate poisoned".to_string())?;
+        let mut times = store.load_announce_times().map_err(cmd_err)?;
+        let previous = burn_announce_cooldown(&mut times, &topic_id, t)?;
+        store.save_announce_times(&times, t).map_err(cmd_err)?;
+        previous
+    };
+
+    let publish_result = match net::client(&me, &store, &relay).await {
+        Ok(client) => announce_to_topic(&client, &stored.key, &topic_id, &me, &body, t).await.map_err(cmd_err),
+        Err(e) => Err(cmd_err(e)),
+    };
+
+    if let Err(e) = publish_result {
+        let _guard = gate.0.lock().map_err(|_| "announce gate poisoned".to_string())?;
+        let mut times = store.load_announce_times().map_err(cmd_err)?;
+        restore_announce_cooldown(&mut times, &topic_id, previous);
+        store.save_announce_times(&times, t).map_err(cmd_err)?;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Remaining announce cooldown for `topic_id`, in seconds (0 = ready) — drives the button state. Pure
+/// local read, no relay I/O.
+#[tauri::command]
+pub async fn topic_announce_status(topic_id: String, store: State<'_, DataStore>) -> CmdResult<u64> {
+    let times = store.load_announce_times().map_err(cmd_err)?;
+    Ok(announce_cooldown_remaining(times.get(&topic_id).copied(), now()))
 }
 
 /// Post to a Topic's 24h channel.
@@ -453,5 +588,100 @@ mod tests {
         let json = r#"{"npub":"npub1xyz","browse_key_hex":null,"profile":null,"collections":[],"online":false,"last_fetched":"2026-06-23T00:00:00Z"}"#;
         let c: CachedPeer = serde_json::from_str(json).unwrap();
         assert_eq!(c.source, ContactSource::Manual);
+    }
+
+    // ── M13 Part A — announce app wiring (Q1) ──────────────────────────────────────────────────
+
+    #[test]
+    fn announce_body_over_cap_rejected() {
+        let ok = "x".repeat(ANNOUNCE_MAX_CHARS);
+        assert!(validate_announce_body(&ok).is_ok(), "exactly at the cap is fine");
+        let over = "x".repeat(ANNOUNCE_MAX_CHARS + 1);
+        let err = validate_announce_body(&over).unwrap_err();
+        assert!(err.contains("too long"), "got: {err}");
+    }
+
+    #[test]
+    fn second_announce_inside_window_rejected_with_cooldown_error() {
+        let mut times = HashMap::new();
+        let t0 = 1_000;
+        burn_announce_cooldown(&mut times, "films", t0).unwrap();
+        let err = burn_announce_cooldown(&mut times, "films", t0 + 60).unwrap_err();
+        assert!(err.contains("60 min"), "the cooldown error names the window, got: {err}");
+    }
+
+    #[test]
+    fn announce_cooldown_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let t0 = 1_000;
+        let mut times = store.load_announce_times().unwrap();
+        burn_announce_cooldown(&mut times, "films", t0).unwrap();
+        store.save_announce_times(&times, t0).unwrap();
+
+        // A fresh DataStore over the SAME dir simulates a restart.
+        let restarted = DataStore::new(dir.path().to_path_buf());
+        let mut reloaded = restarted.load_announce_times().unwrap();
+        let err = burn_announce_cooldown(&mut reloaded, "films", t0 + 60).unwrap_err();
+        assert!(err.contains("60 min"), "the cooldown survives a restart, got: {err}");
+    }
+
+    #[test]
+    fn topic_leave_does_not_reset_announce_cooldown() {
+        // `topic_announce` and `topic_leave` persist to two DISTINCT files (`announce_times.json` vs
+        // `topics.json`) — leaving a topic can't touch the cooldown store because it never opens it.
+        // (`topic_leave` itself needs a live relay client to invoke end-to-end when a membership_json
+        // exists, so this asserts the effect its non-relay tail — `store.save_topics(..)` — has on the
+        // SEPARATE announce store: none.)
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let mut times = HashMap::new();
+        times.insert("films".to_string(), 1_000u64);
+        store.save_announce_times(&times, 1_000).unwrap();
+
+        let (meta, key) = new_topic("films", "", vec![], true).unwrap();
+        store
+            .save_topics(&[StoredTopic { meta: meta.clone(), key, joined_at: 0, membership_json: None }])
+            .unwrap();
+        let remaining: Vec<StoredTopic> =
+            store.load_topics().unwrap().into_iter().filter(|t| t.meta.topic_id != meta.topic_id).collect();
+        store.save_topics(&remaining).unwrap(); // topic_leave's on-disk tail
+
+        let reloaded = store.load_announce_times().unwrap();
+        assert_eq!(reloaded.get("films"), Some(&1_000), "leaving a topic must not touch the announce cooldown");
+    }
+
+    #[test]
+    fn failed_publish_restores_cooldown() {
+        // `topic_announce`'s network publish can't be faked without a live relay client (the wire is
+        // proven in hb-it Suite Topic), so the record/restore state machine it wraps around that I/O
+        // is factored into pure fns (`burn_announce_cooldown` / `restore_announce_cooldown`) and
+        // exercised directly here.
+        let mut times: HashMap<String, u64> = HashMap::new();
+        let t = 1_000;
+        let previous = burn_announce_cooldown(&mut times, "films", t).unwrap();
+        assert_eq!(previous, None, "no prior announce for a fresh topic");
+        assert_eq!(
+            announce_cooldown_remaining(times.get("films").copied(), t),
+            hb_core::ANNOUNCE_MIN_INTERVAL_SECS,
+            "the cooldown is burned"
+        );
+
+        restore_announce_cooldown(&mut times, "films", previous);
+        assert_eq!(
+            announce_cooldown_remaining(times.get("films").copied(), t),
+            0,
+            "a failed (TOTAL) publish restores readiness — the burn is undone"
+        );
+        assert!(!times.contains_key("films"), "no prior entry existed, so restore removes the key entirely");
+
+        // A SECOND announce (a prior successful one exists) that then fails restores the PRIOR
+        // timestamp, not just an absence.
+        times.insert("films".to_string(), 500);
+        let t2 = 500 + hb_core::ANNOUNCE_MIN_INTERVAL_SECS;
+        let previous2 = burn_announce_cooldown(&mut times, "films", t2).unwrap();
+        assert_eq!(previous2, Some(500));
+        restore_announce_cooldown(&mut times, "films", previous2);
+        assert_eq!(times.get("films"), Some(&500), "restore reinstates the PRIOR timestamp");
     }
 }

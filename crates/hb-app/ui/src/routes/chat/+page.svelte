@@ -1,18 +1,42 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { contacts, identity, inboxMessages, sentMessages, unreadCount, toast } from '$lib/stores.js';
-	import { getMessages, sendMessage, pasteKey, topicList, topicChannel, topicPost } from '$lib/api.js';
+	import { page } from '$app/stores';
+	import { contacts, identity, inboxMessages, sentMessages, unreadCount, toast, dmRequests } from '$lib/stores.js';
+	import {
+		getMessages,
+		sendMessage,
+		pasteKey,
+		topicList,
+		topicChannel,
+		topicPost,
+		getContacts,
+		dmRequests as fetchDmRequests,
+		dmRequestAccept,
+		dmRequestDecline,
+		dmBlock,
+		groupsGet,
+		groupsCreate,
+		groupsSetTrusted,
+		contactUpdateGroups,
+	} from '$lib/api.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
+	import AddContactDialog from '$lib/components/AddContactDialog.svelte';
+	import CreateGroupDialog from '$lib/components/CreateGroupDialog.svelte';
 	import { DM_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
-	import type { CachedPeer, ReceivedMessage, TopicView, ChannelPost } from '$lib/types.js';
+	import { renderFingerprint } from '$lib/identity-display.js';
+	import { contactDisplayName } from '$lib/contact-display.js';
+	import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER } from '$lib/request-inbox.js';
+	import { filterConversations, filterTopics, composeRecipientKind } from '$lib/chat-filter.js';
+	import type { CachedPeer, ReceivedMessage, TopicView, ChannelPost, AnnouncementView, DmRequestView, Group } from '$lib/types.js';
 
 	let loading = false;
 	let sending = false;
 	let selectedPeer: CachedPeer | null = null;
 	let draft = '';
 	let threadEl: HTMLElement;
+	let searchQuery = '';
 
 	// ── Topic channels (M11) — a Topic you've joined surfaces here as a persistent channel. The
 	//    channel ENTRY lasts as long as your membership (durable, §11), but its posts are 24h-ephemeral
@@ -21,24 +45,151 @@
 	let topics: TopicView[] = [];
 	let selectedTopic: TopicView | null = null;
 	let channelPosts: ChannelPost[] = [];
+	let channelAnnouncements: AnnouncementView[] = []; // M13 Part A: rendered above the posts, read-only
 	let channelDraft = '';
 	let channelSending = false;
+
+	// ── Q7 Request inbox (M13 Part B) — a stranger's DM is quarantined here, never merged into the
+	//    conversation list. `viewingRequests` selects the Requests section in the right pane;
+	//    `selectedRequest` (once set) drills into one sender's bucket.
+	let viewingRequests = false;
+	let selectedRequest: DmRequestView | null = null;
+
+	$: sortedRequests = sortRequests($dmRequests);
+	$: requestCount = requestBadge($dmRequests);
+
+	// ── Compose-to-npub (spec §9 first-contact deep link from Discovery) ─────────────────────────
+	let composeOpen = false;
+	let composeTo = '';
+	let composeBody = '';
+	let composeSending = false;
 
 	async function loadTopics() {
 		try { topics = await topicList(); } catch { /* relay unreachable */ }
 	}
 
+	async function loadRequests() {
+		try { dmRequests.set(await fetchDmRequests()); } catch { /* relay/store unreachable */ }
+	}
+
 	async function loadChannel(topicId: string) {
-		try { channelPosts = await topicChannel(topicId); } catch { /* relay unreachable */ }
+		try {
+			const view = await topicChannel(topicId);
+			channelPosts = view.posts;
+			channelAnnouncements = view.announcements;
+		} catch { /* relay unreachable */ }
 	}
 
 	async function selectTopic(t: TopicView) {
 		selectedTopic = t;
 		selectedPeer = null;
+		viewingRequests = false;
+		selectedRequest = null;
 		channelPosts = [];
+		channelAnnouncements = [];
 		await loadChannel(t.topic_id);
 		await tick();
 		scrollToBottom();
+	}
+
+	function openRequests() {
+		viewingRequests = true;
+		selectedRequest = null;
+		selectedPeer = null;
+		selectedTopic = null;
+	}
+
+	function openRequest(r: DmRequestView) {
+		selectedRequest = r;
+	}
+
+	// Petname-dialog wiring (M13 W5 Slice 2): accepting a Request now asks for an optional petname +
+	// group first, via the same shared AddContactDialog used on Contacts, instead of always passing
+	// `null` straight through to `dmRequestAccept`.
+	let acceptDialogOpen = false;
+	let acceptTarget: DmRequestView | null = null;
+	let createGroupOpen = false;
+	let groups: Group[] = [];
+
+	async function loadGroups() {
+		try { groups = await groupsGet(); } catch { /* non-fatal */ }
+	}
+
+	function openAcceptDialog(r: DmRequestView) {
+		acceptTarget = r;
+		acceptDialogOpen = true;
+	}
+
+	async function handleCreateGroup(e: CustomEvent<{ name: string; color: string; trusted: boolean }>) {
+		const { name, color, trusted } = e.detail;
+		try {
+			await groupsCreate(name, color);
+			if (trusted) await groupsSetTrusted(name, true);
+			await loadGroups();
+		} catch (e) { toast(String(e), 'error'); }
+	}
+
+	async function completeAccept(r: DmRequestView, petname: string | null, group: string | null) {
+		try {
+			const drained = await dmRequestAccept(r.npub, petname);
+			inboxMessages.update((prev) => {
+				const seenKeys = new Set(prev.map((m) => `${m.from}|${m.sent_at}`));
+				const fresh = drained.filter((m) => !seenKeys.has(`${m.from}|${m.sent_at}`));
+				return [...prev, ...fresh];
+			});
+			dmRequests.update((prev) => prev.filter((x) => x.npub !== r.npub));
+			try { contacts.set(await getContacts()); } catch { /* non-fatal */ }
+			if (group) {
+				try {
+					await contactUpdateGroups(r.npub, [group]);
+					contacts.set(await getContacts());
+				} catch { /* non-fatal */ }
+			}
+			viewingRequests = false;
+			selectedRequest = null;
+			const peer = $contacts.find((c) => c.npub === r.npub);
+			if (peer) await selectPeer(peer);
+			toast('Contact added', 'success');
+		} catch (e) {
+			toast(String(e), 'error');
+		}
+	}
+
+	async function handleAcceptSave(e: CustomEvent<{ petname: string; group: string | null }>) {
+		if (!acceptTarget) return;
+		const r = acceptTarget;
+		acceptDialogOpen = false;
+		acceptTarget = null;
+		await completeAccept(r, e.detail.petname, e.detail.group);
+	}
+
+	async function handleAcceptSkip() {
+		if (!acceptTarget) return;
+		const r = acceptTarget;
+		acceptDialogOpen = false;
+		acceptTarget = null;
+		await completeAccept(r, null, null);
+	}
+
+	async function handleDecline(r: DmRequestView) {
+		try {
+			await dmRequestDecline(r.npub);
+			dmRequests.update((prev) => prev.filter((x) => x.npub !== r.npub));
+			selectedRequest = null;
+		} catch (e) {
+			toast(String(e), 'error');
+		}
+	}
+
+	async function handleBlock(r: DmRequestView) {
+		try {
+			await dmBlock(r.npub);
+			dmRequests.update((prev) => prev.filter((x) => x.npub !== r.npub));
+			selectedRequest = null;
+			toast('Blocked', 'success');
+		} catch (e) {
+			toast(String(e), 'error');
+		}
 	}
 
 	async function sendChannelPost() {
@@ -72,20 +223,15 @@
 
 	$: myId = $identity?.npub ?? '';
 
-	// Merge inbox senders who aren't contacts into a unified conversation list.
-	// This lets recipients see DMs from people who haven't followed them back.
-	$: inboxSenderIds = [...new Set($inboxMessages.map(m => m.from))];
-	$: inboxOnlyPeers = inboxSenderIds
-		.filter(id => id !== myId && !$contacts.some(c => c.npub === id))
-		.map(id => ({ npub: id, browse_key_hex: undefined, petname: undefined, profile: undefined, collections: [], online: false, last_fetched: '', local_tags: [] } satisfies CachedPeer));
-
+	// M13 Part B (Q7): the conversation list is contacts ONLY — a stranger's DM no longer merges in
+	// here at all (the request pane, above, replaces the old inboxOnlyPeers merge).
 	function latestMessageTime(hb_id: string): string {
 		const msgs = $inboxMessages.filter(m => m.from === hb_id || m.to === hb_id);
 		if (msgs.length === 0) return '';
 		return msgs.reduce((latest, m) => m.sent_at > latest ? m.sent_at : latest, '');
 	}
 
-	$: allConversationPeers = [...$contacts, ...inboxOnlyPeers].sort((a, b) => {
+	$: allConversationPeers = [...$contacts].sort((a, b) => {
 		const aT = latestMessageTime(a.npub);
 		const bT = latestMessageTime(b.npub);
 		if (!aT && !bT) return 0;
@@ -94,6 +240,11 @@
 		return bT.localeCompare(aT); // newest first
 	});
 
+	// Wires the search box (devtest copy audit — it was dead): filters the visible rows only, never
+	// the underlying stores.
+	$: visiblePeers = filterConversations(allConversationPeers, searchQuery, senderName);
+	$: visibleTopics = filterTopics(topics, searchQuery);
+
 	$: conversation = selectedPeer
 		? [
 				...$inboxMessages.filter((m) => m.from === selectedPeer!.npub),
@@ -101,33 +252,33 @@
 			].sort((a, b) => a.sent_at.localeCompare(b.sent_at))
 		: [];
 
-	// Cache of display_name for senders who aren't in $contacts (message requests).
-	// Populated lazily by fetchNonContactNames(); never causes re-triggers because
-	// we only write when a key is absent.
+	// Cache of display_name for npubs not in $contacts (Request-bucket senders). Populated lazily by
+	// fetchNonContactNames(); never causes re-triggers because we only write when a key is absent.
 	let peerNameCache: Record<string, string> = {};
 	const fetchingNames = new Set<string>(); // prevents duplicate in-flight fetches
 
-	async function fetchNonContactNames(peers: CachedPeer[]) {
-		for (const peer of peers) {
-			if (fetchingNames.has(peer.npub) || peerNameCache[peer.npub]) continue;
-			fetchingNames.add(peer.npub);
+	async function fetchNonContactNames(npubs: string[]) {
+		for (const npub of npubs) {
+			if (fetchingNames.has(npub) || peerNameCache[npub]) continue;
+			fetchingNames.add(npub);
 			try {
-				const fetched = await pasteKey(peer.npub);
+				const fetched = await pasteKey(npub);
 				if (fetched.profile?.display_name) {
-					peerNameCache = { ...peerNameCache, [peer.npub]: fetched.profile.display_name };
+					peerNameCache = { ...peerNameCache, [npub]: fetched.profile.display_name };
 				}
 			} catch { /* relay unreachable or peer has no profile — fall back to shortId */ }
 		}
 	}
 
-	// Eagerly fetch names for senders in message requests whenever the list changes.
-	$: fetchNonContactNames(inboxOnlyPeers);
+	// Eagerly fetch names for Request-bucket senders whenever the list changes.
+	$: fetchNonContactNames($dmRequests.map((r) => r.npub));
 
 	// Resolve display name for a sender hb_id — contacts first, then fetched cache.
 	function senderName(hb_id: string): string {
 		if (hb_id === myId) return 'You';
 		const contact = $contacts.find(c => c.npub === hb_id);
-		if (contact?.profile?.display_name) return contact.profile.display_name;
+		// Petname-first via the shared helper (M13 W5); cache/shortId fallbacks unchanged.
+		if (contact && (contact.petname?.trim() || contact.profile?.display_name)) return contactDisplayName(contact);
 		if (peerNameCache[hb_id]) return peerNameCache[hb_id];
 		return shortId(hb_id);
 	}
@@ -137,6 +288,15 @@
 		unreadCount.set(0);
 		refreshInbox();
 		loadTopics();
+		loadGroups();
+
+		// Discovery first-contact deep link (spec §9): `/chat?compose=<npub-or-sharecode>` prefills
+		// and opens the compose modal.
+		const composeParam = $page.url.searchParams.get('compose');
+		if (composeParam) {
+			composeTo = composeParam;
+			composeOpen = true;
+		}
 
 		// Local DM poll while the chat page is open. M12 W1 Decision B: backed off from 4 s (the
 		// dominant connect source against the relays) and visibility-gated — paused while the window
@@ -160,6 +320,8 @@
 				}
 				inboxMessages.set(msgs);
 			} catch { /* relay unreachable */ }
+			// Q7: refresh the Request inbox right after the main inbox poll.
+			loadRequests();
 		}, DM_POLL_VISIBLE_MS);
 
 		return () => {
@@ -185,11 +347,14 @@
 		} finally {
 			loading = false;
 		}
+		loadRequests();
 	}
 
 	async function selectPeer(peer: CachedPeer) {
 		selectedPeer = peer;
 		selectedTopic = null;
+		viewingRequests = false;
+		selectedRequest = null;
 		seenCounts[peer.npub] = $inboxMessages.filter((m) => m.from === peer.npub).length;
 		await tick();
 		scrollToBottom();
@@ -212,6 +377,33 @@
 			draft = content;
 		} finally {
 			sending = false;
+		}
+	}
+
+	// Compose-to-npub modal (spec §9): send() rebuilds a CachedPeer stub if the recipient wasn't
+	// already a contact, so the composer can select straight into the new conversation.
+	async function handleComposeSend() {
+		const to = composeTo.trim();
+		const content = composeBody.trim();
+		if (!to || !content || composeSending) return;
+		composeSending = true;
+		try {
+			const sent = await sendMessage(to, content);
+			seenMessageKeys.add(`${sent.from}|${sent.sent_at}`);
+			sentMessages.update((prev) => [...prev, sent]);
+			composeOpen = false;
+			composeTo = '';
+			composeBody = '';
+			try { contacts.set(await getContacts()); } catch { /* non-fatal */ }
+			const peer = $contacts.find((c) => c.npub === sent.to) ?? ({
+				npub: sent.to, browse_key_hex: undefined, petname: undefined, profile: undefined,
+				collections: [], online: false, last_fetched: '', local_tags: [],
+			} satisfies CachedPeer);
+			await selectPeer(peer);
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			composeSending = false;
 		}
 	}
 
@@ -265,20 +457,25 @@
 		<div class="convo-sidebar">
 			<div class="convo-header">
 				<span class="convo-title">Conversations</span>
-				<button class="icon-btn" on:click={refreshInbox} disabled={loading} title="Refresh inbox">
-					{@html icons.refresh}
-				</button>
+				<div class="header-icons">
+					<button class="icon-btn" on:click={() => (composeOpen = true)} title="New message">
+						{@html icons.plus}
+					</button>
+					<button class="icon-btn" on:click={refreshInbox} disabled={loading} title="Refresh inbox">
+						{@html icons.refresh}
+					</button>
+				</div>
 			</div>
 			<div class="convo-search">
 				<div class="search-wrap">
 					<span class="search-icon-sm">{@html icons.search}</span>
-					<input class="search-bare" type="text" placeholder="Search…" />
+					<input class="search-bare" type="text" placeholder="Search…" bind:value={searchQuery} />
 				</div>
 			</div>
 			<div class="convo-list">
-				{#if topics.length > 0}
+				{#if visibleTopics.length > 0}
 					<div class="convo-section-label">Channels</div>
-					{#each topics as t (t.topic_id)}
+					{#each visibleTopics as t (t.topic_id)}
 						<button class="convo-item" class:convo-active={selectedTopic?.topic_id === t.topic_id} on:click={() => selectTopic(t)}>
 							<div class="channel-hash">#</div>
 							<div class="convo-info">
@@ -289,24 +486,36 @@
 							</div>
 						</button>
 					{/each}
-					<div class="convo-section-label">Direct messages</div>
 				{/if}
-				{#if allConversationPeers.length === 0}
-					<div class="convo-empty">No conversations yet — follow someone in Contacts to start one.</div>
+				{#if $dmRequests.length > 0}
+					<div class="convo-section-label">Requests</div>
+					<button class="convo-item" class:convo-active={viewingRequests} on:click={openRequests}>
+						<div class="channel-hash">🔔</div>
+						<div class="convo-info">
+							<div class="convo-row">
+								<span class="convo-name" class:convo-name-active={viewingRequests}>Message requests</span>
+								<span class="unread-badge">{requestCount}</span>
+							</div>
+						</div>
+					</button>
+				{/if}
+				<div class="convo-section-label">Direct messages</div>
+				{#if visiblePeers.length === 0}
+					<div class="convo-empty">
+						{allConversationPeers.length === 0 ? 'No conversations yet — add someone in Contacts to start one.' : 'No matches.'}
+					</div>
 				{:else}
-					{#each allConversationPeers as peer}
+					{#each visiblePeers as peer}
 						{@const name = senderName(peer.npub)}
 						{@const initial = name[0]?.toUpperCase() ?? '?'}
 						{@const hue = avatarHue(initial)}
 						{@const unread = unreadCounts[peer.npub] ?? 0}
 						{@const active = selectedPeer?.npub === peer.npub}
-						{@const isContact = $contacts.some(c => c.npub === peer.npub)}
 						<button class="convo-item" class:convo-active={active} on:click={() => selectPeer(peer)}>
 							<Avatar letter={initial} size={34} {hue} />
 							<div class="convo-info">
 								<div class="convo-row">
 									<span class="convo-name" class:convo-name-active={active}>{name}</span>
-									{#if !isContact}<span class="convo-req-dot" title="Message request" />{/if}
 								</div>
 								<div class="convo-preview-row">
 									{#if unread > 0}
@@ -337,6 +546,16 @@
 				</div>
 
 				<div class="thread" bind:this={threadEl}>
+					{#each channelAnnouncements as a (a.author_npub + '|' + a.ts)}
+						<div class="announce-banner">
+							<span class="announce-icon">📣</span>
+							<div class="announce-body">
+								<span class="announce-author">{senderName(a.author_npub)}</span>
+								<p class="announce-text">{a.body}</p>
+								<span class="announce-time">{formatTime(new Date(a.ts * 1000).toISOString())}</span>
+							</div>
+						</div>
+					{/each}
 					{#if channelPosts.length === 0}
 						<p class="thread-empty">No posts in the last 24h. Say something!</p>
 					{:else}
@@ -370,6 +589,75 @@
 						</div>
 					</div>
 				</div>
+			{:else if viewingRequests}
+				{#if !selectedRequest}
+					<!-- Requests list: sorted newest-activity-first (Q7 — never merged into the main list). -->
+					<div class="pane-header">
+						<div class="channel-hash channel-hash-lg">🔔</div>
+						<div class="pane-peer-info">
+							<div class="pane-peer-row"><span class="pane-peer-name">Message requests</span></div>
+							<span class="channel-sub">Quarantined until you accept, decline, or block</span>
+						</div>
+					</div>
+					<div class="requests-explainer">{REQUEST_EXPLAINER}</div>
+					<div class="thread">
+						{#if sortedRequests.length === 0}
+							<p class="thread-empty">No message requests.</p>
+						{:else}
+							{#each sortedRequests as r (r.npub)}
+								{@const name = senderName(r.npub)}
+								{@const initial = name[0]?.toUpperCase() ?? '?'}
+								<button class="request-row" on:click={() => openRequest(r)}>
+									<Avatar letter={initial} size={34} hue={avatarHue(initial)} />
+									<div class="convo-info">
+										<div class="convo-row">
+											<span class="convo-name">{name}</span>
+											<span class="unread-badge">{r.message_count}</span>
+										</div>
+										<div class="request-preview">{requestPreview(r)}</div>
+										{#if r.fingerprint}
+											<div class="request-fp" title="Identity fingerprint — check it before accepting a stranger">
+												<span class="request-fp-swatch" style="background:{r.fingerprint.colorHex}"></span>
+												{renderFingerprint(r.fingerprint)}
+											</div>
+										{/if}
+									</div>
+								</button>
+							{/each}
+						{/if}
+					</div>
+				{:else}
+					{@const req = selectedRequest}
+					{@const reqName = senderName(req.npub)}
+					{@const isRequestContact = $contacts.some((c) => c.npub === req.npub)}
+					<!-- Opened request: read-only messages + Accept/Decline/Block (no reply until accepted). -->
+					<div class="pane-header">
+						<Avatar letter={reqName[0]?.toUpperCase() ?? '?'} size={36} hue={avatarHue(reqName[0] ?? '?')} />
+						<div class="pane-peer-info">
+							<div class="pane-peer-row"><span class="pane-peer-name">{reqName}</span></div>
+							<span class="mono">{shortId(req.npub)}</span>
+						</div>
+						<button class="btn-ghost btn-sm" on:click={() => (selectedRequest = null)}>← Back</button>
+					</div>
+					<div class="requests-explainer">{REQUEST_EXPLAINER}</div>
+					<div class="thread">
+						{#each req.messages as msg}
+							<div class="bubble-wrap">
+								<div class="bubble bubble-recv">
+									<p class="bubble-text">{msg.content}</p>
+									<span class="bubble-time">{formatTime(msg.sent_at)}</span>
+								</div>
+							</div>
+						{/each}
+					</div>
+					{#if !canReply(isRequestContact)}
+						<div class="composer request-actions">
+							<button class="btn-primary" on:click={() => openAcceptDialog(req)}>Accept</button>
+							<button class="btn-ghost" on:click={() => handleDecline(req)}>Decline</button>
+							<button class="btn-ghost btn-danger" on:click={() => handleBlock(req)}>Block</button>
+						</div>
+					{/if}
+				{/if}
 			{:else if !selectedPeer}
 				<div class="convo-empty-state">
 					<p>Select a contact to view the conversation.</p>
@@ -416,7 +704,7 @@
 				<!-- Notice for message requests (sender not in recipient's contacts) -->
 				{#if !selectedIsContact}
 					<div class="request-banner">
-						<span>This person may not have followed you back — their privacy settings may filter your messages.</span>
+						<span>This person may not have added you back — their privacy settings may filter your messages.</span>
 					</div>
 				{/if}
 
@@ -473,6 +761,39 @@
 	</div>
 {/if}
 
+<!-- Petname + group dialog shown before accepting a Request (M13 W5 Slice 2). -->
+<AddContactDialog
+	bind:open={acceptDialogOpen}
+	displayName={acceptTarget ? senderName(acceptTarget.npub) : ''}
+	{groups}
+	on:save={handleAcceptSave}
+	on:skip={handleAcceptSkip}
+	on:newGroup={() => (createGroupOpen = true)}
+	on:cancel={() => { acceptDialogOpen = false; acceptTarget = null; }}
+/>
+<CreateGroupDialog bind:open={createGroupOpen} on:create={handleCreateGroup} on:cancel={() => (createGroupOpen = false)} />
+
+<!-- Compose-to-npub (spec §9 first-contact deep link) — a + icon-btn beside refresh opens this. -->
+{#if composeOpen}
+	<!-- svelte-ignore a11y-no-static-element-interactions a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
+	<div class="modal-backdrop" role="dialog" aria-modal="true" aria-label="New message" on:click={(e) => { if (e.target === e.currentTarget) composeOpen = false; }}>
+		<div class="modal">
+			<h2>New message</h2>
+			<input placeholder="npub or hbk share code…" bind:value={composeTo} />
+			{#if composeTo.trim() && composeRecipientKind(composeTo) === 'invalid'}
+				<div class="compose-hint">Doesn't look like an npub or share code — sending will reject it if it's wrong.</div>
+			{/if}
+			<textarea class="compose-modal-input" placeholder="Message…" bind:value={composeBody} rows="3"></textarea>
+			<div class="modal-actions">
+				<button class="ghost" on:click={() => (composeOpen = false)}>Cancel</button>
+				<button class="btn-primary" disabled={!composeTo.trim() || !composeBody.trim() || composeSending} on:click={handleComposeSend}>
+					{composeSending ? '…' : 'Send'}
+				</button>
+			</div>
+		</div>
+	</div>
+{/if}
+
 <style>
 	.no-identity {
 		display: flex;
@@ -505,6 +826,8 @@
 	}
 
 	.convo-title { font-size: 14px; font-weight: 600; }
+
+	.header-icons { display: flex; gap: 4px; align-items: center; }
 
 	.icon-btn {
 		background: transparent;
@@ -816,4 +1139,93 @@
 	}
 	.btn-sm { padding: 5px 11px; font-size: 12px; }
 	.btn-icon { gap: 5px; }
+	.btn-danger { color: oklch(0.7 0.18 25); }
+	.btn-danger:hover { color: oklch(0.75 0.2 25); }
+
+	/* Topic announcements (M13 Part A) — a highlighted, read-only broadcast above the ordinary posts. */
+	.announce-banner {
+		display: flex;
+		gap: 10px;
+		padding: 10px 14px;
+		margin-bottom: 10px;
+		background: var(--accent-soft);
+		border: 1px solid var(--border);
+		border-radius: 9px;
+	}
+	.announce-icon { font-size: 15px; line-height: 1; }
+	.announce-body { flex: 1; min-width: 0; }
+	.announce-author { display: block; font-size: 10.5px; font-weight: 600; color: var(--accent); margin-bottom: 2px; }
+	.announce-text { font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; margin: 0; }
+	.announce-time { font-size: 10px; color: var(--fg-dim); display: block; margin-top: 3px; }
+
+	/* Q7 Request inbox */
+	.requests-explainer {
+		padding: 8px 18px;
+		background: var(--accent-soft);
+		border-bottom: 1px solid var(--border);
+		font-size: 11.5px;
+		color: var(--fg-muted);
+	}
+	.request-row {
+		width: 100%;
+		display: flex;
+		gap: 10px;
+		align-items: flex-start;
+		padding: 10px;
+		background: transparent;
+		border: none;
+		border-bottom: 1px solid var(--divider);
+		border-radius: 7px;
+		cursor: pointer;
+		color: inherit;
+		font-family: inherit;
+		text-align: left;
+	}
+	.request-row:hover { background: var(--bg-elev1); }
+	.request-preview { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
+	.request-fp {
+		display: flex; align-items: center; gap: 5px;
+		font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dim);
+		margin-top: 4px;
+	}
+	.request-fp-swatch { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+	.request-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
+	/* Compose-to-npub modal */
+	.compose-hint { font-size: 11px; color: var(--fg-dim); }
+	.compose-modal-input {
+		width: 100%;
+		padding: 8px 10px;
+		font-family: var(--font-ui);
+		font-size: 13px;
+		color: var(--fg);
+		background: var(--bg-elev2);
+		border: 1px solid var(--border);
+		border-radius: 7px;
+		resize: none;
+		box-sizing: border-box;
+	}
+	.modal-backdrop {
+		position: fixed; inset: 0; z-index: 9998;
+		background: oklch(0 0 0 / 0.45);
+		display: flex; align-items: center; justify-content: center;
+	}
+	.modal {
+		background: var(--bg-elev1);
+		border: 1px solid var(--border-strong);
+		border-radius: 12px;
+		padding: 18px;
+		width: min(440px, 90vw);
+		display: flex; flex-direction: column; gap: 8px;
+	}
+	.modal h2 { font-size: 14px; font-weight: 700; margin: 0 0 6px; }
+	.modal input {
+		padding: 6px 9px; background: var(--bg-elev2); color: var(--fg);
+		border: 1px solid var(--border); border-radius: 6px; font: inherit;
+	}
+	.modal .ghost {
+		padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
+		background: transparent; color: var(--fg); font: inherit; cursor: pointer;
+	}
+	.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
 </style>

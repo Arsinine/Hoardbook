@@ -1,5 +1,5 @@
 import { writable } from 'svelte/store';
-import type { CachedPeer, Collection, IdentityInfo, Profile, ReceivedMessage } from './types.js';
+import type { CachedPeer, Collection, IdentityInfo, Profile, ReceivedMessage, DmRequestView } from './types.js';
 
 export const identity = writable<IdentityInfo | null>(null);
 export const profile = writable<Profile | null>(null);
@@ -14,6 +14,10 @@ export const inboxMessages = writable<ReceivedMessage[]>([]);
 
 /** Messages sent this session (in-memory; cleared on restart). */
 export const sentMessages = writable<ReceivedMessage[]>([]);
+
+/** Quarantined stranger-DM Request buckets (Q7 — the message-requests pattern), refreshed alongside
+ *  `inboxMessages` on the chat page's poll. */
+export const dmRequests = writable<DmRequestView[]>([]);
 
 export const toastMessage = writable<{ text: string; kind: 'success' | 'error' } | null>(null);
 
