@@ -77,6 +77,11 @@ export interface Collection {
 	listing: DirectoryItem[];
 	/** True if this collection has been signed and published to the relay. */
 	published?: boolean;
+	/** K-of-N part counts when browsed from a peer with a full share code (M13 HANDOVER gap #5).
+	 *  Absent for a local draft or a pre-M13 cached peer collection — see
+	 *  `browse-view.ts::collectionAvailability` (never render a badge from missing data). */
+	parts_total?: number;
+	parts_present?: number;
 }
 
 /** A trusted peer's decrypted Private collections, grouped by author npub (M10 browse). */
@@ -139,6 +144,9 @@ export interface Group {
 	/** Marks the group trusted (M10): its members receive a sealed copy of every Private
 	 *  collection. Absent ⇒ untrusted (a pre-M10 group). */
 	trusted?: boolean;
+	/** Optional user-chosen colour (CSS hex, e.g. "#ff00aa") for the group chip (M13 W5). Absent ⇒
+	 *  no colour (a pre-existing group). */
+	color?: string;
 }
 
 export interface Watch {
@@ -181,6 +189,33 @@ export interface ChannelPost {
 	author_npub: string;
 	body: string;
 	ts: number;
+}
+
+/** A decrypted member broadcast (M13 Part A app wiring; spec §11/Q1). */
+export interface AnnouncementView {
+	author_npub: string;
+	body: string;
+	ts: number;
+}
+
+/** The full channel read: posts + announcements, both newest-first (one relay fetch serves both). */
+export interface ChannelView {
+	posts: ChannelPost[];
+	announcements: AnnouncementView[];
+}
+
+// ── Q7 — the stranger-DM Request inbox (M13 Part B) ──────────────────────────
+
+/** A stranger's quarantined Request bucket (message-requests pattern) — seen only when the user
+ *  opens the Request pane. Until accepted, no reply is possible. */
+export interface DmRequestView {
+	npub: string;
+	first_seen: number;
+	last_message_at: number;
+	message_count: number;
+	messages: ReceivedMessage[];
+	/** §7 word+color impersonation fingerprint, derived from the npub. */
+	fingerprint?: { words: string[]; colorHex: string };
 }
 
 // (DownloadItem removed — file transfer moved to the Mascara companion.)

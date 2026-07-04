@@ -268,7 +268,7 @@ impl PublishSink for RelayPublishSink {
             let app = guard
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("no identity loaded; skipping snapshot republish"))?;
-            (app.identity.clone(), app.browse_key)
+            (app.identity.clone(), app.browse_key.clone())
         };
         match evaluate_rescan(slug, &self.store).map_err(|e| anyhow::anyhow!(e))? {
             RescanDecision::Unchanged => Ok(false),
@@ -285,7 +285,7 @@ impl PublishSink for RelayPublishSink {
                     col.last_updated = chrono::Utc::now();
                     self.store.save_collection_draft(&col)?;
                 }
-                publish_collection_inner(slug, &self.store, &id, &browse_key, &self.relay)
+                publish_collection_inner(slug, &self.store, &id, browse_key.bytes(), &self.relay)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
                 Ok(true)

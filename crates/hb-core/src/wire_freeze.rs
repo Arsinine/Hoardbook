@@ -84,4 +84,17 @@ fn hkdf_salts_are_frozen() {
 fn proof_domain_prefixes_are_frozen() {
     assert_eq!(topic::PROOF_JOIN_PREFIX, "hbm:join:", "topic::PROOF_JOIN_PREFIX — {FREEZE}");
     assert_eq!(topic::PROOF_POST_PREFIX, "hbm:post:", "topic::PROOF_POST_PREFIX — {FREEZE}");
+    assert_eq!(topic::PROOF_ANNOUNCE_PREFIX, "hbm:announce:", "topic::PROOF_ANNOUNCE_PREFIX — {FREEZE}");
+}
+
+/// The topic ciphertext DOMAIN BYTES (F17) — the first plaintext byte inside every topic_key
+/// ciphertext, telling membership/post/broadcast apart. These are wire discriminants living INSIDE
+/// signed, durable ciphertext (a membership/post/broadcast event already on a relay), so a renumber
+/// silently reinterprets every such event under the new meaning. Previously unpinned; M13 Part A
+/// (the broadcast domain byte) closes that gap.
+#[test]
+fn topic_domain_bytes_are_frozen() {
+    assert_eq!(topic::MEMBERSHIP_DOMAIN, 0x01, "topic::MEMBERSHIP_DOMAIN — {FREEZE}");
+    assert_eq!(topic::POST_DOMAIN, 0x02, "topic::POST_DOMAIN — {FREEZE}");
+    assert_eq!(topic::ANNOUNCE_DOMAIN, 0x03, "topic::ANNOUNCE_DOMAIN — {FREEZE}");
 }

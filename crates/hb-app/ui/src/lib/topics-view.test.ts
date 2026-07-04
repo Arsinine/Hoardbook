@@ -5,6 +5,7 @@ import {
 	contactBadge,
 	memberCountLabel,
 	isDissolved,
+	rosterLabel,
 	PUBLIC_JOIN_CONSENT,
 	PRIVATE_JOIN_CONSENT,
 	NO_UNLOCK_NOTE,
@@ -14,6 +15,7 @@ import {
 	subPathLabel,
 	groupTopicsByRoot,
 } from './topics-view.js';
+import type { CachedPeer } from './types.js';
 
 describe('topics-view (M11)', () => {
 	it('shows the public consent copy for a public Topic, the durable-record copy for a private one', () => {
@@ -51,6 +53,26 @@ describe('topics-view (M11)', () => {
 	it('the no-unlock note states INV-2 plainly', () => {
 		expect(NO_UNLOCK_NOTE.toLowerCase()).toContain('does not unlock');
 		expect(NO_UNLOCK_NOTE.toLowerCase()).toContain('share code');
+	});
+
+	it('rosterLabel_maps_known_npub_to_petname', () => {
+		const contacts: CachedPeer[] = [
+			{
+				npub: 'npub1alice',
+				petname: 'Al',
+				profile: { display_name: 'Alice', bio: undefined, tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '' },
+				collections: [],
+				online: false,
+				last_fetched: '',
+				local_tags: [],
+			},
+		];
+		expect(rosterLabel('npub1alice', contacts)).toBe('Al');
+	});
+
+	it('rosterLabel_falls_back_to_short_npub_when_unknown', () => {
+		const npub = 'npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqabcd';
+		expect(rosterLabel(npub, [])).toBe(`${npub.slice(0, 8)}…${npub.slice(-4)}`);
 	});
 });
 

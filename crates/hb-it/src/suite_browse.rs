@@ -22,6 +22,7 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
         result("PUB1 publish→browse round-trip", pub1(ctx).await),
         result("PUB2 oversize split → browse full tree", pub2(ctx).await),
         result("PUB3 re-publish replaces (one current listing)", pub3(ctx).await),
+        result("PUB4 deep single-root split → browse full tree", pub4(ctx).await),
         result("BR1 non-holder key → teaser, listing locked", br1(ctx).await),
         result("BR2 withheld part → K of N rendered", br2(ctx).await),
         result("BR3 browse resolves via relay fetch only", br3(ctx).await),
@@ -68,6 +69,19 @@ fn big_listing(slug: &str, n: usize) -> String {
         .map(|i| serde_json::json!({ "name": format!("title-{i:05}-padding-padding-padding-xx") }))
         .collect();
     serde_json::json!({ "slug": slug, "content_types": ["video"], "entries": entries }).to_string()
+}
+
+/// The real hoard shape (devtest #3 / M13): ONE root folder with `n` padded leaf files under it —
+/// v1's breadth-only chunker could never split this; the depth-recursive v2 packer must.
+fn deep_listing(slug: &str, n: usize) -> String {
+    let children: Vec<Value> = (0..n)
+        .map(|i| serde_json::json!({ "name": format!("file-{i:05}-padding-padding-padding-xx.bin") }))
+        .collect();
+    serde_json::json!({
+        "slug": slug, "content_types": ["video"],
+        "entries": [ { "name": "Movies", "children": children } ],
+    })
+    .to_string()
 }
 
 fn full_code(id: &Identity, browse_key: [u8; 32]) -> ShareCode {
@@ -140,6 +154,41 @@ async fn pub3(ctx: &Ctx) -> Result<()> {
         listing.entries.len()
     );
     Ok(())
+}
+
+async fn pub4(ctx: &Ctx) -> Result<()> {
+    // M13 depth-recursive split end-to-end: the whole hoard under ONE root folder (the shape v1's
+    // breadth-only chunker refused as "too large") must publish as a v2 multi-part family and
+    // browse back as the complete, correctly-grafted tree.
+    let id = Identity::generate();
+    let key = bk(7);
+    let slug = "deephoard";
+    let n = 3000;
+    let json = deep_listing(slug, n);
+
+    let client = ctx.connect(&id).await?;
+    let published = publish_listing(&client, &id, slug, &key, &json, 40_000).await?;
+    ensure!(published.parts > 2, "deep single-root listing must split, got {} part(s)", published.parts);
+    settle().await;
+
+    let res = browse_share_code(&client, &full_code(&id, key), slug, &ctx.relays, &ctx.relays, FETCH_TIMEOUT).await?;
+    client.disconnect().await;
+
+    let listing = res.listing.ok_or_else(|| anyhow::anyhow!("deep split listing did not browse"))?;
+    ensure!(listing.complete(), "all parts present → complete tree");
+    ensure!(listing.entries.len() == 1, "one root folder expected, got {}", listing.entries.len());
+    let leaves = leaf_count(&listing.entries[0]);
+    ensure!(leaves == n, "restitched {leaves} of {n} leaf files under the root folder");
+    Ok(())
+}
+
+/// Recursive leaf count of a rendered entry: a node with no (or empty) `children` is one leaf; a
+/// folder contributes the leaves beneath it.
+fn leaf_count(node: &Value) -> usize {
+    match node.get("children").and_then(Value::as_array) {
+        Some(kids) if !kids.is_empty() => kids.iter().map(leaf_count).sum(),
+        _ => 1,
+    }
 }
 
 async fn br1(ctx: &Ctx) -> Result<()> {

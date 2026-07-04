@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { toast } from '$lib/stores.js';
+	import { onMount, onDestroy } from 'svelte';
+	import { toast, contacts } from '$lib/stores.js';
 	import {
 		topicList,
 		topicCreate,
@@ -10,10 +10,15 @@
 		topicLeave,
 		topicInvite,
 		topicRoster,
+		topicAnnounce,
+		topicAnnounceStatus,
 	} from '$lib/api.js';
 	import type { TopicView, DiscoveredTopic } from '$lib/types.js';
-	import { memberCountLabel, TOPIC_ROOTS, composeTopicPath, subPathLabel, groupTopicsByRoot } from '$lib/topics-view.js';
+	import { memberCountLabel, rosterLabel, TOPIC_ROOTS, composeTopicPath, subPathLabel, groupTopicsByRoot } from '$lib/topics-view.js';
+	import { canAnnounce, cooldownLabel, ANNOUNCE_EXPLAINER } from '$lib/announce-view.js';
 	import TopicJoinConsent from '$lib/components/TopicJoinConsent.svelte';
+	import HintMarker from '$lib/components/HintMarker.svelte';
+	import ConfirmButton from '$lib/components/ConfirmButton.svelte';
 
 	// Redesign (devtest 2026-06-25 #9): master–detail (My Topics list ↔ selected-topic detail),
 	// Create as a modal + Discover as a tab (forms are no longer always-on stacked cards), and the
@@ -48,6 +53,37 @@
 	let openTopic: TopicView | null = null;
 	let roster: string[] = [];
 	let inviteNpub = '';
+
+	// M13 Part A (Q1) — this page only SENDS an announce; the announce list itself renders in the Chat
+	// topic thread. `announceRemaining` seeds from the backend on open() and ticks down locally every
+	// 60s (a coarse local countdown only — a rejection re-syncs it from the authoritative backend).
+	let announceBody = '';
+	let announceRemaining = 0;
+	let announcing = false;
+	let announceTicker: ReturnType<typeof setInterval> | undefined;
+
+	onDestroy(() => { if (announceTicker) clearInterval(announceTicker); });
+
+	async function sendAnnounce() {
+		if (!openTopic || !announceBody.trim() || !canAnnounce(announceRemaining) || announcing) return;
+		announcing = true;
+		const body = announceBody.trim();
+		try {
+			await topicAnnounce(openTopic.topic_id, body);
+			announceBody = '';
+			toast('Announcement sent', 'success');
+			announceRemaining = await topicAnnounceStatus(openTopic.topic_id);
+		} catch (e) {
+			toast(String(e), 'error');
+			// The backend is authoritative on rejection (e.g. still cooling down) — re-sync, don't trust
+			// the locally-ticked value.
+			if (openTopic) {
+				try { announceRemaining = await topicAnnounceStatus(openTopic.topic_id); } catch { /* keep last */ }
+			}
+		} finally {
+			announcing = false;
+		}
+	}
 
 	function splitTags(s: string): string[] {
 		return s.split(',').map((t) => t.trim()).filter(Boolean);
@@ -145,7 +181,10 @@
 		busy = true;
 		try {
 			await topicLeave(t.topic_id);
-			if (openTopic?.topic_id === t.topic_id) openTopic = null;
+			if (openTopic?.topic_id === t.topic_id) {
+				openTopic = null;
+				if (announceTicker) clearInterval(announceTicker);
+			}
 			await loadMine();
 			toast('Left Topic', 'success');
 		} catch (e) {
@@ -158,11 +197,21 @@
 	async function open(t: TopicView) {
 		openTopic = t;
 		roster = [];
+		announceBody = '';
+		if (announceTicker) clearInterval(announceTicker);
 		try {
 			roster = await topicRoster(t.topic_id);
 		} catch (e) {
 			toast(String(e), 'error');
 		}
+		try {
+			announceRemaining = await topicAnnounceStatus(t.topic_id);
+		} catch {
+			announceRemaining = 0;
+		}
+		announceTicker = setInterval(() => {
+			announceRemaining = Math.max(0, announceRemaining - 60);
+		}, 60_000);
 	}
 
 	async function invite() {
@@ -215,19 +264,43 @@
 							<div class="detail-title">{openTopic.name} {#if openTopic.private}<span class="tag">private</span>{/if}</div>
 							{#if openTopic.description}<div class="muted">{openTopic.description}</div>{/if}
 						</div>
-						<button class="ghost" on:click={() => openTopic && leave(openTopic)}>Leave</button>
+						<ConfirmButton label="Leave" confirmText="Leave this Topic?" on:confirm={() => openTopic && leave(openTopic)} />
 					</div>
 
 					<div class="detail-section">
 						<div class="section-label">Roster ({roster.length})</div>
 						<ul class="roster">
-							{#each roster as npub (npub)}<li>{npub.slice(0, 12)}…{npub.slice(-4)}</li>{/each}
+							{#each roster as npub (npub)}<li>{rosterLabel(npub, $contacts)}</li>{/each}
 						</ul>
 					</div>
 
 					<div class="invite">
 						<input placeholder="invite an npub…" bind:value={inviteNpub} />
 						<button on:click={invite}>Invite</button>
+					</div>
+
+					<!-- M13 Part A (Q1) — sends only; the announce itself renders in the Chat topic thread. -->
+					<div class="detail-section">
+						<div class="section-label">
+							Announce to members
+							<HintMarker text={ANNOUNCE_EXPLAINER} label="announce to members" />
+						</div>
+						<div class="announce-row">
+							<input
+								class="grow"
+								placeholder="a highlighted notice for all members…"
+								bind:value={announceBody}
+								on:keydown={(e) => e.key === 'Enter' && sendAnnounce()}
+								disabled={!canAnnounce(announceRemaining) || announcing}
+							/>
+							<button
+								class="btn-primary"
+								disabled={!announceBody.trim() || !canAnnounce(announceRemaining) || announcing}
+								on:click={sendAnnounce}
+							>
+								{announcing ? '…' : cooldownLabel(announceRemaining)}
+							</button>
+						</div>
 					</div>
 
 					<a class="channel-link" href="/chat">💬 Open this Topic’s channel in Chat →</a>
@@ -394,6 +467,8 @@
 	.roster li { padding: 3px 0; }
 	.invite { display: flex; gap: 6px; }
 	.invite input { flex: 1; }
+	.announce-row { display: flex; gap: 6px; margin-top: 2px; }
+	.announce-row input { flex: 1; }
 	.channel-link { display: inline-block; margin-top: 4px; font-size: 12px; color: var(--accent); text-decoration: none; }
 	.channel-link:hover { text-decoration: underline; }
 	.modal-backdrop {

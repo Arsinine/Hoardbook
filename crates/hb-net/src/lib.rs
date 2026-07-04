@@ -30,8 +30,8 @@ pub mod split;
 pub mod topic;
 
 pub use browse::{
-    browse_share_code, parse_share_code, publish_listing, resolve_peer_relays,
-    resolve_recipient_relays, search_teasers, BrowseResult, PublishedListing,
+    browse_peer_listings, browse_share_code, parse_share_code, publish_listing,
+    resolve_peer_relays, resolve_recipient_relays, search_teasers, BrowseResult, PublishedListing,
 };
 pub use cache::{cache_decision, CacheDecision, CachedListing, CACHE_FRESH_SECS};
 pub use client::{
@@ -48,8 +48,8 @@ pub use pow::{leading_zero_bits, mine_pow, pow_difficulty};
 pub use render::{render_listing, RenderedListing, MAX_LISTING_PARTS};
 pub use split::{restitch_listing, split_listing, ListingPart};
 pub use topic::{
-    approve_join, discover_public_topics, fetch_channel, fetch_invite, fetch_join_requests,
-    fetch_membership_events, fetch_roster, join_public, join_request_message, join_topic,
-    leave_topic, member_count, parse_join_request, post_to_channel, publish_topic, request_join,
-    JoinRequest, INVITE_TTL_SECS, TOPIC_DISCOVERY_CAP,
+    announce_to_topic, approve_join, discover_public_topics, fetch_channel, fetch_channel_full,
+    fetch_invite, fetch_join_requests, fetch_membership_events, fetch_roster, join_public,
+    join_request_message, join_topic, leave_topic, member_count, parse_join_request, post_to_channel,
+    publish_topic, request_join, ChannelRead, JoinRequest, INVITE_TTL_SECS, TOPIC_DISCOVERY_CAP,
 };

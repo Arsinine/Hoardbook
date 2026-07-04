@@ -64,6 +64,22 @@ export function availabilityBadge(listing: RenderedListing): string | null {
 	return `${listing.partsPresent} of ${listing.partsTotal} folders available`;
 }
 
+/**
+ * The "K of N folders available" badge for a peer `Collection` carrying K-of-N part counts (M13
+ * HANDOVER gap #5) — the browsed-peer sibling of `availabilityBadge`, which reads a raw
+ * `hb_net::RenderedListing`. `null` when either count is absent (a pre-M13 cached peer collection
+ * must never show a fabricated badge) or when the collection is complete.
+ */
+export function collectionAvailability(col: { parts_total?: number; parts_present?: number }): string | null {
+	if (col.parts_total === undefined || col.parts_present === undefined) {
+		return null;
+	}
+	if (col.parts_present >= col.parts_total) {
+		return null;
+	}
+	return `${col.parts_present} of ${col.parts_total} folders available`;
+}
+
 /** Dedup search hits by npub (keep first), then cap to `limit` — mirrors the client-side guard. */
 export function dedupAndCap(hits: SearchHit[], limit: number): SearchHit[] {
 	const seen = new Set<string>();

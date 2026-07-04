@@ -576,7 +576,7 @@
 		<div class="toggle-row">
 			<div class="toggle-text">
 				<div class="toggle-label">Allow incoming messages from anyone</div>
-				<div class="toggle-sub">Off means only people you follow can DM you</div>
+				<div class="toggle-sub">Off means only your contacts can DM you</div>
 			</div>
 			<button class="toggle" class:toggle-on={allowDms} on:click={toggleAllowDms}>
 				<span class="toggle-thumb" />
@@ -587,7 +587,7 @@
 			<div class="toggle-text">
 				<div class="toggle-label">Auto-update snapshots on change</div>
 				<div class="toggle-sub">
-					Re-publish a shared listing when its folder changes (filesystem-watch). Off = manual
+					Re-publish a published listing when its folder changes (filesystem-watch). Off = manual
 					"Regenerate" only. Note: a watch sees your local edits, not server-side changes another
 					host makes on an SMB share — those reconcile on launch.
 				</div>
@@ -599,8 +599,8 @@
 
 		<div class="toggle-row">
 			<div class="toggle-text">
-				<div class="toggle-label">Reconcile poll for remotely-edited shares</div>
-				<div class="toggle-sub">Low-frequency re-check for shares you edit from another host (SMB). Off by default.</div>
+				<div class="toggle-label">Reconcile poll for remotely-edited collections</div>
+				<div class="toggle-sub">Low-frequency re-check for collections you edit from another host (SMB). Off by default.</div>
 			</div>
 			<button class="toggle" class:toggle-on={snapshotReconcilePoll} on:click={() => toggleSetting('snapshot_reconcile_poll')}>
 				<span class="toggle-thumb" />
