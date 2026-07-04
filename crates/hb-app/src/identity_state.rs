@@ -12,22 +12,42 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use hb_core::{BrowseKey, Identity, ShareCode};
+use hb_core::{Identity, ShareCode};
 use nostr::prelude::ToBech32;
 use nostr::PublicKey;
 use tokio::sync::RwLock;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::store::StoredIdentity;
 
 /// Schema version of the on-disk identity record.
 pub const IDENTITY_VERSION: u8 = 1;
 
+/// The in-memory session copy of the account browse-key (AR6 completion). Wraps the raw
+/// `[u8; 32]` in a `ZeroizeOnDrop` newtype so every in-memory copy — the session-held one, and
+/// each clone taken at a call site — is wiped on drop, mirroring `StoredIdentity`'s at-rest
+/// zeroizing (audit I-11). Deliberately **not** `Copy`: a `Copy` key can't be zeroized on the
+/// copy's own drop (there's no drop to hook), so call sites must `.clone()` explicitly — each
+/// clone then zeroizes independently.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct SessionBrowseKey([u8; 32]);
+
+impl SessionBrowseKey {
+    pub fn new(b: [u8; 32]) -> Self {
+        Self(b)
+    }
+
+    pub fn bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 /// The loaded session identity (both keys live in memory for the session).
 pub struct AppIdentity {
     /// secp256k1 / `npub` — signs events + DMs.
     pub identity: Identity,
     /// Account browse-key (the "club pass").
-    pub browse_key: BrowseKey,
+    pub browse_key: SessionBrowseKey,
 }
 
 impl AppIdentity {
@@ -35,7 +55,7 @@ impl AppIdentity {
     pub fn generate() -> Self {
         Self {
             identity: Identity::generate(),
-            browse_key: rand::random(),
+            browse_key: SessionBrowseKey::new(rand::random()),
         }
     }
 
@@ -47,7 +67,7 @@ impl AppIdentity {
         let identity = Identity::from_secret(nsec)
             .map_err(|e| anyhow!(e.to_string()))
             .context("parsing the imported Nostr secret key")?;
-        Ok(Self { identity, browse_key: rand::random() })
+        Ok(Self { identity, browse_key: SessionBrowseKey::new(rand::random()) })
     }
 
     /// Reconstruct from the on-disk record.
@@ -59,7 +79,7 @@ impl AppIdentity {
             .context("decoding browse key")?
             .try_into()
             .map_err(|_| anyhow!("browse key must be exactly 32 bytes"))?;
-        Ok(Self { identity, browse_key })
+        Ok(Self { identity, browse_key: SessionBrowseKey::new(browse_key) })
     }
 
     /// Serialize to the on-disk record.
@@ -73,7 +93,7 @@ impl AppIdentity {
         Ok(StoredIdentity {
             version: IDENTITY_VERSION,
             nsec,
-            browse_key_hex: hex::encode(self.browse_key),
+            browse_key_hex: hex::encode(self.browse_key.bytes()),
         })
     }
 
@@ -89,7 +109,7 @@ impl AppIdentity {
 
     /// The full `hbk…` share code (npub + account browse-key) — the "club pass".
     pub fn share_code(&self) -> Result<String> {
-        ShareCode::Full { pubkey: self.identity.public_key(), browse_key: self.browse_key }
+        ShareCode::Full { pubkey: self.identity.public_key(), browse_key: *self.browse_key.bytes() }
             .encode()
             .map_err(|e| anyhow!(e.to_string()))
     }
@@ -106,13 +126,13 @@ mod tests {
     fn generate_then_roundtrip_through_stored() {
         let id = AppIdentity::generate();
         let npub = id.npub();
-        let browse = id.browse_key;
+        let browse = id.browse_key.clone();
 
         let stored = id.to_stored().unwrap();
         let back = AppIdentity::from_stored(&stored).unwrap();
 
         assert_eq!(back.npub(), npub, "npub survives the storage roundtrip");
-        assert_eq!(back.browse_key, browse, "account browse-key survives");
+        assert_eq!(back.browse_key.bytes(), browse.bytes(), "account browse-key survives");
     }
 
     #[test]
@@ -122,7 +142,7 @@ mod tests {
         assert!(code.starts_with("hbk1"), "share code must be a full hbk code, got {code}");
         let parsed = ShareCode::parse(&code).unwrap();
         assert_eq!(parsed.pubkey(), id.public_key());
-        assert_eq!(parsed.browse_key(), Some(id.browse_key));
+        assert_eq!(parsed.browse_key(), Some(*id.browse_key.bytes()));
     }
 
     #[test]
@@ -130,7 +150,18 @@ mod tests {
         let a = AppIdentity::generate();
         let b = AppIdentity::generate();
         assert_ne!(a.npub(), b.npub());
-        assert_ne!(a.browse_key, b.browse_key);
+        assert_ne!(a.browse_key.bytes(), b.browse_key.bytes());
+    }
+
+    fn _assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
+    /// Type-level (mirrors the hb-core `DerivedKey` pattern / `StoredIdentity::stored_identity_
+    /// zeroizes_secrets_on_drop`): assert the compile-time bound rather than inspecting freed
+    /// memory. Every in-memory copy of the session browse-key — the session-held one and each
+    /// clone taken at a call site — is wiped on drop.
+    #[test]
+    fn session_browse_key_zeroizes_on_drop() {
+        _assert_zeroize_on_drop::<SessionBrowseKey>();
     }
 
     /// M7 / v0.9.6: an existing **pre-cut 3-key** `keys.json` carried a third `iroh_secret_hex`
@@ -159,7 +190,7 @@ mod tests {
         let parsed: StoredIdentity = serde_json::from_str(&legacy_json).unwrap();
         let back = AppIdentity::from_stored(&parsed).unwrap();
         assert_eq!(back.npub(), id.npub(), "npub survives the 3-key→2-key migration");
-        assert_eq!(back.browse_key, id.browse_key, "browse-key survives the migration");
+        assert_eq!(back.browse_key.bytes(), id.browse_key.bytes(), "browse-key survives the migration");
 
         // Write side: re-serializing the loaded identity must not carry the dropped field back (a
         // future re-add of the field — or a stray `deny_unknown_fields` — would surface here).

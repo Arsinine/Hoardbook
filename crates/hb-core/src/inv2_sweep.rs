@@ -19,7 +19,8 @@ use crate::listing::BrowseKey;
 use crate::priv_listing::seal_private_listing;
 use crate::sharecode::ShareCode;
 use crate::topic::{
-    build_announce, build_public_join, mint_invite, new_topic, seal_membership, seal_post,
+    build_announce, build_public_join, mint_invite, new_topic, seal_announce, seal_membership,
+    seal_post,
 };
 
 const NOW: u64 = 1_700_000_000;
@@ -70,7 +71,7 @@ fn no_public_event_broadcasts_the_browse_key_in_any_encoding() {
     // Presence beacon (freshness-only since v0.9.6 — no address, no node key, and no key here).
     events.push(("binding::build_binding", build_binding(&me, NOW, 30 * 60).expect("binding builds")));
 
-    // Topics (M11/M12): announce + membership + 24h post + invite + public-join credential.
+    // Topics (M11/M12/M13): announce + membership + 24h post + broadcast + invite + public-join.
     let (meta, topic_key) =
         new_topic("video/80s-anime", "VHS rips & fansubs", vec!["anime".into()], false)
             .expect("public topic mints");
@@ -82,6 +83,10 @@ fn no_public_event_broadcasts_the_browse_key_in_any_encoding() {
     events.push((
         "topic::seal_post",
         seal_post(&topic_key, &meta.topic_id, &me, "hello room", NOW).expect("post seals"),
+    ));
+    events.push((
+        "topic::seal_announce",
+        seal_announce(&topic_key, &meta.topic_id, &me, "hello room broadcast", NOW).expect("announce seals"),
     ));
     events.push((
         "topic::mint_invite",

@@ -1,12 +1,16 @@
 <script lang="ts">
-	import { pasteKey, follow, refreshContact, unfollowContact, setContactTags, groupsGet, contactUpdateGroups, groupsSetTrusted, browsePrivateCollections, onlineCount, relayStatus, searchPeers, getContacts, type OnlineCount, type RelayHealth, type PeerSearchHit } from '$lib/api.js';
+	import { pasteKey, follow, refreshContact, unfollowContact, setContactTags, groupsGet, groupsCreate, contactUpdateGroups, groupsSetTrusted, browsePrivateCollections, onlineCount, relayStatus, searchPeers, getContacts, type OnlineCount, type RelayHealth, type PeerSearchHit } from '$lib/api.js';
 	import { contacts, identity, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
+	import ConfirmButton from '$lib/components/ConfirmButton.svelte';
+	import CreateGroupDialog from '$lib/components/CreateGroupDialog.svelte';
+	import AddContactDialog from '$lib/components/AddContactDialog.svelte';
 	import type { CachedPeer, Collection, Group } from '$lib/types.js';
 	import { renderFingerprint } from '$lib/identity-display.js';
+	import { contactDisplayName } from '$lib/contact-display.js';
 	import { DISCOVER_CONTENT_TYPES, parseTagInput, canSearch, toggleContentType } from '$lib/discover-view.js';
 	import { NOT_DRM_NOTE, isTrusted } from '$lib/private-collections-view.js';
 	import { onlineChipView } from '$lib/online-chip.js';
@@ -62,6 +66,22 @@
 		} catch (e) { toast(String(e), 'error'); }
 	}
 
+	// "+ New group" (M13 W5) — renders regardless of how many groups already exist, so a trusted
+	// group (the on-ramp to M10 Private collections) is always reachable, not just from an existing
+	// contact's group picker.
+	let createGroupOpen = false;
+
+	async function handleCreateGroup(e: CustomEvent<{ name: string; color: string; trusted: boolean }>) {
+		const { name, color, trusted } = e.detail;
+		try {
+			await groupsCreate(name, color);
+			if (trusted) await groupsSetTrusted(name, true);
+			await loadGroups();
+			createGroupOpen = false;
+			toast(`Group "${name}" created`);
+		} catch (e) { toast(String(e), 'error'); }
+	}
+
 	// Stale: last_fetched more than 7 days ago.
 	function isStale(peer: CachedPeer): boolean {
 		if (!peer.last_fetched) return false;
@@ -72,9 +92,6 @@
 	function contactGroups(hb_id: string): string[] {
 		return groups.filter(g => g.pubkeys.includes(hb_id)).map(g => g.name);
 	}
-
-	// Group picker for the follow flow.
-	let followGroupName = '';
 
 	// Per-contact group-change select: hb_id → selected group name or '' for Ungrouped.
 	let contactGroupEditing: Record<string, boolean> = {};
@@ -139,14 +156,51 @@
 		}
 	}
 
-	async function followHit(hit: PeerSearchHit) {
+	// Add-contact dialog (M13 W5 Slice 2): both the lookup card and a discovery hit open the same
+	// petname + group picker before actually adding — `addContactTarget` is whichever npub is pending.
+	let addContactOpen = false;
+	let addContactDisplayName = '';
+	let addContactTarget: string | null = null;
+
+	function openAddContact(npub: string, displayName: string) {
+		addContactTarget = npub;
+		addContactDisplayName = displayName;
+		addContactOpen = true;
+	}
+
+	function followHit(hit: PeerSearchHit) {
+		// bare npub only: awareness, NOT a browse-key (INV-2) — the dialog's Skip path preserves that.
+		openAddContact(hit.npub, hit.display_name);
+	}
+
+	async function completeFollow(npub: string, group: string | null, petname: string | undefined) {
+		following = true;
 		try {
-			await follow(hit.npub); // follow-only (bare npub): awareness, NOT a browse-key (INV-2)
-			toast(`Following ${hit.display_name || hit.npub.slice(0, 12)}…`, 'success');
+			await follow(npub, group ?? undefined, petname);
 			try { contacts.set(await getContacts()); } catch { /* non-fatal */ }
+			await loadGroups();
+			toast(`Added ${petname || addContactDisplayName || npub.slice(0, 12) + '…'}`, 'success');
 		} catch (e) {
 			toast(String(e), 'error');
+		} finally {
+			following = false;
 		}
+	}
+
+	async function handleAddContactSave(e: CustomEvent<{ petname: string; group: string | null }>) {
+		if (!addContactTarget) return;
+		const npub = addContactTarget;
+		addContactOpen = false;
+		addContactTarget = null;
+		await completeFollow(npub, e.detail.group, e.detail.petname);
+	}
+
+	async function handleAddContactSkip() {
+		if (!addContactTarget) return;
+		const npub = addContactTarget;
+		addContactOpen = false;
+		addContactTarget = null;
+		await completeFollow(npub, null, undefined);
 	}
 
 	async function handleLookup() {
@@ -167,23 +221,9 @@
 		}
 	}
 
-	async function handleFollow() {
+	function handleFollow() {
 		if (!result) return;
-		following = true;
-		try {
-			await follow(result.npub, followGroupName || undefined);
-			contacts.update((cs) => {
-				if (cs.find((c) => c.npub === result!.npub)) return cs;
-				return [...cs, result!];
-			});
-			await loadGroups();
-			toast(`Following ${result.profile?.display_name ?? result.npub}`);
-			followGroupName = '';
-		} catch (e) {
-			toast(String(e), 'error');
-		} finally {
-			following = false;
-		}
+		openAddContact(result.npub, result.profile?.display_name ?? '');
 	}
 
 	// Contacts list state
@@ -296,7 +336,7 @@
 	<div>
 		<div class="topbar-title">Contacts</div>
 		<div class="topbar-sub">
-			{$contacts.length} followed peer{$contacts.length !== 1 ? 's' : ''} · {$contacts.filter(c => c.online).length} online
+			{$contacts.length} contact{$contacts.length !== 1 ? 's' : ''} · {$contacts.filter(c => c.online).length} online
 		</div>
 	</div>
 	{#if chip.show}
@@ -350,20 +390,12 @@
 								<span class="mono">{result.npub.slice(0, 18)}…{result.npub.slice(-4)}</span>
 							</div>
 							<div class="profile-actions">
-								{#if !alreadyFollowed && groups.length > 0}
-									<select class="group-select" bind:value={followGroupName}>
-										<option value="">Ungrouped</option>
-										{#each groups as g (g.name)}
-											<option value={g.name}>{g.name}</option>
-										{/each}
-									</select>
-								{/if}
 								<button
 									class="btn-primary btn-sm"
 									on:click={handleFollow}
 									disabled={alreadyFollowed || following}
 								>
-									{alreadyFollowed ? 'Following' : following ? '…' : 'Follow'}
+									{alreadyFollowed ? 'Added' : following ? '…' : 'Add contact'}
 								</button>
 							</div>
 						</div>
@@ -444,9 +476,9 @@
 										{#if !isContact}<span class="hit-stranger" title="Verify the fingerprint before trusting a stranger">unverified — not in your contacts</span>{/if}
 									</div>
 									{#if isContact}
-										<span class="hit-following">Following</span>
+										<span class="hit-following">Added</span>
 									{:else}
-										<button class="hit-follow" on:click={() => followHit(hit)}>Follow</button>
+										<button class="hit-follow" on:click={() => followHit(hit)}>Add contact</button>
 									{/if}
 								</div>
 								{#if hit.bio}<div class="hit-bio">{hit.bio}</div>{/if}
@@ -476,7 +508,7 @@
 	<!-- Divider + tag filter -->
 	<div class="section-divider">
 		<div class="divider-line" />
-		<span class="divider-label">Following ({$contacts.length})</span>
+		<span class="divider-label">Contacts ({$contacts.length})</span>
 		<div class="divider-line" />
 	</div>
 
@@ -489,30 +521,31 @@
 		</div>
 	{/if}
 
-	<!-- Trusted groups (M10): mark a group trusted to seal Private collections to its members -->
-	{#if groups.length > 0}
-		<div class="trusted-groups">
-			<div class="trusted-label">Trusted groups <span class="trusted-hint">— receive your Private collections</span></div>
-			<div class="trusted-chips">
-				{#each groups as g (g.name)}
-					<label class="trusted-chip" class:is-trusted={isTrusted(g)}>
-						<input type="checkbox" checked={isTrusted(g)} on:change={() => toggleTrusted(g)} />
-						{g.name}
-					</label>
-				{/each}
-			</div>
+	<!-- Trusted groups (M10): mark a group trusted to seal Private collections to its members. Always
+	     rendered — even with zero groups — so "+ New group" (the on-ramp to a trusted group) is never
+	     an unreachable dead path. -->
+	<div class="trusted-groups">
+		<div class="trusted-label">Trusted groups <span class="trusted-hint">— receive your Private collections</span></div>
+		<div class="trusted-chips">
+			{#each groups as g (g.name)}
+				<label class="trusted-chip" class:is-trusted={isTrusted(g)}>
+					<input type="checkbox" checked={isTrusted(g)} on:change={() => toggleTrusted(g)} />
+					{g.name}
+				</label>
+			{/each}
+			<button type="button" class="trusted-chip trusted-chip-add" on:click={() => (createGroupOpen = true)}>+ New group</button>
 		</div>
-	{/if}
+	</div>
 
 	<!-- Contacts list -->
 	{#if $contacts.length === 0}
-		<div class="empty">No contacts yet. Look up a peer above and follow them.</div>
+		<div class="empty">No contacts yet. Look up a peer above and add them.</div>
 	{:else if filteredContacts.length === 0}
 		<div class="empty">No contacts with tag "{filterTag}".</div>
 	{:else}
 		<div class="contact-list">
 			{#each filteredContacts as peer}
-				{@const name = peer.profile?.display_name ?? 'Unknown'}
+				{@const name = contactDisplayName(peer)}
 				{@const initial = name[0]?.toUpperCase() ?? '?'}
 				{@const hue = avatarHue(initial)}
 				{@const peerGroups = contactGroups(peer.npub)}
@@ -540,9 +573,11 @@
 								>
 									<span>{@html icons.refresh}</span>
 								</button>
-								<button class="btn-ghost btn-xs btn-danger" on:click={() => handleUnfollow(peer.npub)} title="Unfollow">
-									Unfollow
-								</button>
+								<ConfirmButton
+									label="Remove contact"
+									confirmText="Remove this contact?"
+									on:confirm={() => handleUnfollow(peer.npub)}
+								/>
 								<button class="btn-default btn-xs" on:click={() => handleExpand(peer)}>
 									{expanded === peer.npub ? 'Hide' : 'Browse'}
 								</button>
@@ -644,6 +679,17 @@
 </div>
 </div>
 </div>
+
+<CreateGroupDialog bind:open={createGroupOpen} on:create={handleCreateGroup} on:cancel={() => (createGroupOpen = false)} />
+<AddContactDialog
+	bind:open={addContactOpen}
+	displayName={addContactDisplayName}
+	{groups}
+	on:save={handleAddContactSave}
+	on:skip={handleAddContactSkip}
+	on:newGroup={() => (createGroupOpen = true)}
+	on:cancel={() => { addContactOpen = false; addContactTarget = null; }}
+/>
 
 <style>
 	.contacts-shell {
@@ -797,6 +843,13 @@
 		color: var(--accent);
 		background: color-mix(in oklch, var(--accent) 12%, transparent);
 	}
+	.trusted-chip-add {
+		background: transparent;
+		border-style: dashed;
+		font-family: var(--font-ui);
+		color: var(--fg-dim);
+	}
+	.trusted-chip-add:hover { border-color: var(--accent); color: var(--accent); }
 	.private-section { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
 	.private-badge {
 		font-size: 9.5px; padding: 1px 6px; border-radius: 999px; letter-spacing: 0.5px;
@@ -984,8 +1037,6 @@
 	.btn-sm { padding: 5px 11px; font-size: 12px; }
 	.btn-xs { padding: 3px 8px; font-size: 11px; height: 24px; }
 	.btn-icon { gap: 4px; }
-	.btn-danger { color: var(--red, #e05c5c); }
-	.btn-danger:hover { background: color-mix(in oklch, var(--red, #e05c5c) 10%, transparent); }
 
 	/* ── §6 Discover hoarders (moved from Browse — devtest 2026-06-25 #6) ──────────────────────── */
 	.discover-section {

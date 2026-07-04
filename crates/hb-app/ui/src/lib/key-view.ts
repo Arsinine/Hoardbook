@@ -37,14 +37,14 @@ export function keyView(id: IdentityInfo): KeyView {
 				label: 'Share code',
 				value: id.share_code,
 				sensitive: true,
-				hint: 'Private — give it to people you want browsing your collections. It also lets them find, follow, and DM you. Keep it off public threads.',
+				hint: 'Private — give it to people you want browsing your collections. It also lets them find, add, and DM you. Keep it off public threads.',
 			},
 			// The npub stays: it is the SAFE-to-post-publicly handle (no browse-key), unlike the share code.
 			{
 				label: 'Your npub',
 				value: id.npub,
 				sensitive: false,
-				hint: 'Public — post it anywhere so people can find, follow, and DM you. It does not unlock browsing.',
+				hint: 'Public — post it anywhere so people can find, add, and DM you. It does not unlock browsing.',
 			},
 		],
 		storageLabel: plainFile ? 'Protected file (0600)' : 'Encrypted by your OS',

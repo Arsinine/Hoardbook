@@ -12,12 +12,16 @@ pub async fn groups_get(store: State<'_, DataStore>) -> CmdResult<Vec<Group>> {
 }
 
 #[tauri::command]
-pub async fn groups_create(name: String, store: State<'_, DataStore>) -> CmdResult<Group> {
+pub async fn groups_create(
+    name: String,
+    color: Option<String>,
+    store: State<'_, DataStore>,
+) -> CmdResult<Group> {
     let mut groups = store.load_groups().map_err(cmd_err)?;
     if groups.iter().any(|g| g.name == name) {
         return Err(format!("Group '{name}' already exists"));
     }
-    let group = Group { name, pubkeys: vec![], modified_at: Utc::now(), trusted: false };
+    let group = Group { name, pubkeys: vec![], modified_at: Utc::now(), trusted: false, color };
     groups.push(group.clone());
     store.save_groups(&groups).map_err(cmd_err)?;
     Ok(group)
@@ -185,8 +189,8 @@ mod tests {
 
         store
             .save_groups(&[
-                Group { name: "A".into(), pubkeys: vec![npub.clone()], modified_at: now, trusted: false },
-                Group { name: "B".into(), pubkeys: vec![npub.clone()], modified_at: now, trusted: false },
+                Group { name: "A".into(), pubkeys: vec![npub.clone()], modified_at: now, trusted: false, color: None },
+                Group { name: "B".into(), pubkeys: vec![npub.clone()], modified_at: now, trusted: false, color: None },
             ])
             .unwrap();
 
@@ -210,6 +214,7 @@ mod tests {
                 pubkeys: vec![npub.clone()],
                 modified_at: chrono::Utc::now(),
                 trusted: false,
+                color: None,
             }])
             .unwrap();
 
@@ -249,6 +254,7 @@ mod tests {
             pubkeys: vec!["hb1_abc".into()],
             modified_at: chrono::Utc::now(),
             trusted: false,
+            color: None,
         };
         let json = serde_json::to_string(&group).unwrap();
         assert!(!json.contains("relay"), "group JSON must not contain 'relay'");
@@ -281,9 +287,9 @@ mod tests {
 
         store
             .save_groups(&[
-                Group { name: "A".into(), pubkeys: vec![npub.clone()], modified_at: now, trusted: false },
-                Group { name: "B".into(), pubkeys: vec![], modified_at: now, trusted: false },
-                Group { name: "C".into(), pubkeys: vec![npub.clone()], modified_at: now, trusted: false },
+                Group { name: "A".into(), pubkeys: vec![npub.clone()], modified_at: now, trusted: false, color: None },
+                Group { name: "B".into(), pubkeys: vec![], modified_at: now, trusted: false, color: None },
+                Group { name: "C".into(), pubkeys: vec![npub.clone()], modified_at: now, trusted: false, color: None },
             ])
             .unwrap();
 
@@ -328,10 +334,40 @@ mod tests {
                 pubkeys: vec!["npubx".into()],
                 modified_at: now,
                 trusted: true,
+                color: None,
             }])
             .unwrap();
         let back = store.load_groups().unwrap();
         assert!(back.iter().find(|g| g.name == "vault").unwrap().trusted, "trusted must persist");
+    }
+
+    /// M13 W5 item 3: `color` defaults to `None` for a pre-existing group (no `color` field) and
+    /// round-trips through the store once set. Mirrors `group_trusted_flag_defaults_false_and_round_trips`.
+    #[test]
+    fn group_color_defaults_none_and_round_trips() {
+        let (_dir, store) = make_store();
+        // A groups.json written before this feature has no `color` field → must load as None.
+        let legacy = r#"[{"name":"old","pubkeys":[],"modified_at":"2026-04-01T00:00:00Z"}]"#;
+        std::fs::write(store.groups_path(), legacy).unwrap();
+        let loaded = store.load_groups().unwrap();
+        assert!(loaded[0].color.is_none(), "a pre-color group must load with color=None");
+
+        // Setting a color persists.
+        store
+            .save_groups(&[Group {
+                name: "vibrant".into(),
+                pubkeys: vec![],
+                modified_at: chrono::Utc::now(),
+                trusted: false,
+                color: Some("#ff00aa".into()),
+            }])
+            .unwrap();
+        let back = store.load_groups().unwrap();
+        assert_eq!(
+            back.iter().find(|g| g.name == "vibrant").unwrap().color.as_deref(),
+            Some("#ff00aa"),
+            "color must persist"
+        );
     }
 
     /// Groups are returned most-recently-modified first.
@@ -344,9 +380,9 @@ mod tests {
 
         store
             .save_groups(&[
-                Group { name: "old".into(), pubkeys: vec![], modified_at: t1, trusted: false },
-                Group { name: "recent".into(), pubkeys: vec![], modified_at: t3, trusted: false },
-                Group { name: "middle".into(), pubkeys: vec![], modified_at: t2, trusted: false },
+                Group { name: "old".into(), pubkeys: vec![], modified_at: t1, trusted: false, color: None },
+                Group { name: "recent".into(), pubkeys: vec![], modified_at: t3, trusted: false, color: None },
+                Group { name: "middle".into(), pubkeys: vec![], modified_at: t2, trusted: false, color: None },
             ])
             .unwrap();
 

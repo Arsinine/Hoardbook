@@ -2,7 +2,8 @@
 //! join gate (F12), the topic-contact badge, the spoofable member-count display, and the "joining
 //! unlocks no listings" note. No Svelte, no DOM, no Tauri → unit-testable in the node env.
 
-import type { ContactSource } from './types.js';
+import type { CachedPeer, ContactSource } from './types.js';
+import { contactDisplayName } from './contact-display.js';
 
 /** Public-join consent: the visibility is the deal. Anyone who joins can see you are a member. */
 export const PUBLIC_JOIN_CONSENT =
@@ -48,6 +49,13 @@ export function memberCountLabel(estimate: number): string {
 /** Dissolution is derived: a Topic with an empty roster has dissolved (the name frees up). */
 export function isDissolved(rosterSize: number): boolean {
 	return rosterSize <= 0;
+}
+
+/** The roster row label for a member npub — their petname/display-name when they're already a known
+ *  contact, else a short npub (M13 W5 — replaces the bare-npub-only roster render). */
+export function rosterLabel(npub: string, contacts: readonly CachedPeer[]): string {
+	const contact = contacts.find((c) => c.npub === npub);
+	return contactDisplayName(contact ?? { npub });
 }
 
 // ── W4: public Topic paths (fixed-root category + freeform sub-path) ──────────────────────────────

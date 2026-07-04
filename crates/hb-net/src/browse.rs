@@ -10,7 +10,7 @@
 //! the listing: a follow-only share code (bare `npub`) yields the teaser only; a wrong browse-key
 //! yields the teaser with the listing locked (decrypt fails cleanly, not a hard browse error).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use hb_core::event::{
@@ -196,6 +196,55 @@ async fn fetch_listing(
         }
     }
     render_listing(&payloads)
+}
+
+/// Fetch, decrypt, and render EVERY listing family a peer has published (grouped by root slug).
+///
+/// The multi-collection generalisation of [`fetch_listing`] (M13): one `KIND_LISTING` fetch by
+/// author, grouped into families by **root slug** (the `d` up to `#part`), newest event per `d`
+/// (so a non-compliant relay's stale replaceable duplicate can't win — N3/AB8), then decrypt +
+/// render each family independently. A family that fails to decrypt or render is **skipped** —
+/// locked ≠ error, mirroring BR1 — so one re-keyed or corrupt collection can't hide the rest.
+/// Families come back sorted by root slug (deterministic across fetches).
+pub async fn browse_peer_listings(
+    client: &RelayClient,
+    peer: &PublicKey,
+    browse_key: &BrowseKey,
+    timeout: Duration,
+) -> Result<Vec<(String, RenderedListing)>, NetError> {
+    let events =
+        client.fetch(Filter::new().author(*peer).kind(Kind::from_u16(KIND_LISTING)), timeout).await?;
+
+    // Group by root slug, keeping every event per full `d` so the newest per replaceable
+    // identifier wins below (BTreeMap ⇒ output sorted by root slug).
+    let mut families: BTreeMap<String, HashMap<String, Vec<Event>>> = BTreeMap::new();
+    for ev in events {
+        if let Some(d) = ev.tags.identifier() {
+            let root = match d.find("#part") {
+                Some(i) => &d[..i],
+                None => d,
+            };
+            families.entry(root.to_string()).or_default().entry(d.to_string()).or_default().push(ev);
+        }
+    }
+
+    let mut out = Vec::new();
+    'family: for (root, by_d) in families {
+        let mut payloads: Vec<String> = Vec::new();
+        for (_d, group) in by_d {
+            if let Some(ev) = select_newest_by_created_at(group) {
+                match parse_listing_event(&ev, browse_key) {
+                    Ok((_slug, json)) => payloads.push(json),
+                    // Wrong browse-key (locked) or malformed event → skip the whole family.
+                    Err(_) => continue 'family,
+                }
+            }
+        }
+        if let Ok(rendered) = render_listing(&payloads) {
+            out.push((root, rendered));
+        }
+    }
+    Ok(out)
 }
 
 /// Discover peers by tag-search over public teasers: build the filter (empty∧empty → `Err`,

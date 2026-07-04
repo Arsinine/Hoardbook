@@ -119,8 +119,9 @@ pub struct ScanSpec {
 /// On-disk identity: the irreplaceable secp256k1 secret (`nsec`), the bound iroh transport
 /// key (regenerable), and the account browse-key (the "club pass" carried in the `hbk` share
 /// code). On Windows this whole struct is DPAPI-encrypted at rest; on Linux/macOS it is a
-/// 0600 plaintext file until the Phase-2 keyring lands.
-#[derive(Clone, Serialize, Deserialize)]
+/// 0600 plaintext file until the Phase-2 keyring lands. `ZeroizeOnDrop` (audit I-11): the nsec +
+/// browse-key hex are wiped from memory whenever a loaded/saved/backup copy drops.
+#[derive(Clone, Serialize, Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct StoredIdentity {
     pub version: u8,
     /// secp256k1 secret key as bech32 `nsec…` — the one irreplaceable secret.
@@ -143,13 +144,39 @@ impl std::fmt::Debug for StoredIdentity {
 // Generic helpers
 // ---------------------------------------------------------------------------
 
-fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
+/// The sibling temp path an atomic write stages into: `<name>.tmp.<pid>.<seq>`. Same directory as
+/// the target so the rename never crosses a filesystem. The per-call sequence keeps same-process
+/// concurrent writers to one target from sharing a stage file (chorus M13 #1: with a shared name,
+/// writer A could rename writer B's staged bytes into place as its own); the pid isolates
+/// processes. A stage file orphaned by a crash is inert — never read, removed by wipe().
+fn tmp_path(path: &Path) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
+    name.push(format!(".tmp.{}.{seq}", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Crash-safe write (audit I-11): stage the bytes in a temp file beside the target, then rename
+/// over it — a crash mid-write leaves the old content intact, never a truncated/half-written file.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let tmp = tmp_path(path);
+    let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(written?)
+}
+
+// `pub(crate)`: the M13 Part B quarantine store (`dm_quarantine.rs`) is a sibling module that mirrors
+// this exact Group/Watch/StoredTopic persistence pattern, so it reuses these helpers (atomicity for
+// free) rather than re-implementing them.
+pub(crate) fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
     let json = serde_json::to_string_pretty(value)?;
-    std::fs::write(path, json)?;
-    Ok(())
+    write_atomic(path, json.as_bytes())
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
@@ -163,7 +190,7 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 /// Like read_json but returns Ok(None) instead of propagating a parse error.
 /// Used for settings and contacts so that a version mismatch (new app loading
 /// old config) silently falls back to defaults rather than crashing.
-fn read_json_lenient<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+pub(crate) fn read_json_lenient<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -424,11 +451,8 @@ impl DataStore {
 
     /// Persist a published nostr Event (opaque JSON) under `key` (a slug, or "profile").
     pub fn save_published(&self, key: &str, event_json: &str) -> Result<()> {
-        let path = self.published_path(key);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, event_json).context("saving published event")
+        write_atomic(&self.published_path(key), event_json.as_bytes())
+            .context("saving published event")
     }
 
     /// Load a published event's JSON, if it exists.
@@ -475,22 +499,23 @@ impl DataStore {
     // -- Wipe ----------------------------------------------------------------
 
     /// Delete all persisted data. In-memory state must be cleared by the caller.
+    ///
+    /// Removes **every** entry under the base dir rather than an enumerated file list (audit
+    /// I-11: the old list had drifted from what the store writes). The base dir is app-owned —
+    /// restore already treats *any* entry as "occupied" — so a future store addition is wiped
+    /// automatically instead of surviving as an orphan that then blocks restore.
     pub fn wipe(&self) -> Result<()> {
-        for subdir in &["identity", "collections", "published", "contacts", "sharing"] {
-            let path = self.base.join(subdir);
-            if path.exists() {
-                std::fs::remove_dir_all(&path)?;
-            }
-        }
-        for file in &[
-            self.settings_path(),
-            self.groups_path(),
-            self.watches_path(),
-            self.topics_path(),
-            self.topic_nonces_path(),
-        ] {
-            if file.exists() {
-                std::fs::remove_file(file)?;
+        let entries = match std::fs::read_dir(&self.base) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(entry.path())?;
+            } else {
+                std::fs::remove_file(entry.path())?;
             }
         }
         Ok(())
@@ -538,6 +563,7 @@ impl DataStore {
 // CachedPeer — one file per followed peer in contacts/
 // ---------------------------------------------------------------------------
 
+use crate::commands::browse::PeerCollection;
 use hb_core::types::{Collection, Profile};
 
 /// How a contact entered your local contact list (M11). **`Manual`** = you added them by hand (a
@@ -572,7 +598,11 @@ pub struct CachedPeer {
     #[serde(default)]
     pub petname: Option<String>,
     pub profile: Option<Profile>,
-    pub collections: Vec<Collection>,
+    /// The peer's collections as browsed with a full share code (M13 HANDOVER gap #5): each carries
+    /// the `Collection` plus the K-of-N part counts, when known. `#[serde(flatten)]` +
+    /// `#[serde(default)]` on `PeerCollection`'s parts fields keep a pre-M13 cache (plain `Collection`
+    /// objects, no parts info) loading with `parts_total`/`parts_present` as `None`.
+    pub collections: Vec<PeerCollection>,
     pub online: bool,
     pub last_fetched: chrono::DateTime<chrono::Utc>,
     /// User-defined tags for organizing contacts locally. Never shared.
@@ -587,10 +617,11 @@ pub struct CachedPeer {
 
 impl CachedPeer {
     pub fn pubkey_hash(npub: &str) -> String {
-        // Use first 16 hex chars of SHA256 of the npub as a stable filename.
+        // First 16 bytes (32 hex chars) of SHA256 of the npub as a stable filename (audit I-11:
+        // widened from 8 bytes; pre-launch, so old cache filenames simply orphan).
         use sha2::{Digest, Sha256};
         let hash = Sha256::digest(npub.as_bytes());
-        hex::encode(&hash[..8])
+        hex::encode(&hash[..16])
     }
 }
 
@@ -615,6 +646,11 @@ pub struct Group {
     /// untrusted (false), so trust is never silently granted on upgrade. Local-only, never shared.
     #[serde(default)]
     pub trusted: bool,
+    /// Optional user-chosen colour (CSS hex, e.g. `"#ff00aa"`) for the group chip in the UI (M13
+    /// W5, item 3). `#[serde(default)]` ⇒ a pre-existing group with no `color` field loads as
+    /// `None` (no colour). Local-only, never shared.
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 impl DataStore {
@@ -903,6 +939,209 @@ mod tests {
         // Reload: it stays acknowledged, so it never shows again.
         let reloaded = store.load_settings().unwrap().unwrap();
         assert!(reloaded.privacy_notice_acknowledged, "acknowledgement persists across reload");
+    }
+
+    fn _assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+
+    #[test]
+    fn stored_identity_zeroizes_secrets_on_drop() {
+        // Type-level, mirroring hb-core's DerivedKey pattern: assert the compile-time bound
+        // rather than UB memory inspection — the nsec + browse-key hex strings are wiped when
+        // any in-memory copy (load/save/backup) drops.
+        _assert_zeroize_on_drop::<StoredIdentity>();
+    }
+
+    #[test]
+    fn write_json_replaces_via_rename_and_leaves_no_tmp_residue() {
+        // Contract (revised by chorus M13 #1): a write's OWN stage file never persists. A stage
+        // file left by a *crashed* earlier write is inert — never read (read_json opens the exact
+        // target path), removed by wipe() — and deliberately NOT consumed by later writes: the
+        // old shared-name consumption was exactly the same-process collision the finding flagged.
+        let (_dir, store) = test_store();
+        store.save_settings(&Settings::default()).unwrap();
+
+        let s = Settings { last_seen_version: "0.11.0".into(), ..Default::default() };
+        store.save_settings(&s).unwrap();
+
+        let reloaded = store.load_settings().unwrap().unwrap();
+        assert_eq!(reloaded.last_seen_version, "0.11.0", "content is entirely the new write");
+        let residue: Vec<String> = std::fs::read_dir(store.base_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(residue.is_empty(), "no temp files may persist after a write, found: {residue:?}");
+    }
+
+    #[test]
+    fn tmp_paths_are_unique_per_call_so_same_process_writers_cannot_collide() {
+        // Chorus M13 finding #1: `<name>.tmp.<pid>` alone is shared by every writer in this
+        // process — two concurrent tasks staging the same target could interleave through ONE
+        // temp file (A stages, B re-stages, A renames B's bytes into place as its own). Each
+        // stage must be private to its call.
+        let target = Path::new("settings.json");
+        assert_ne!(
+            tmp_path(target),
+            tmp_path(target),
+            "two stages of the same target must not share a temp file"
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_to_one_target_all_succeed_and_leave_one_complete_file() {
+        let (_dir, store) = test_store();
+        let path = std::sync::Arc::new(store.base_dir().join("contended.json"));
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = std::sync::Arc::clone(&path);
+                std::thread::spawn(move || {
+                    for j in 0..25 {
+                        write_json(&path, &serde_json::json!({ "writer": i, "iter": j })).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&*path).unwrap()).unwrap();
+        assert!(v.get("writer").is_some(), "the surviving file is one complete write, got {v}");
+        let residue: Vec<String> = std::fs::read_dir(store.base_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(residue.is_empty(), "no temp residue after contended writes: {residue:?}");
+    }
+
+    #[test]
+    fn pubkey_hash_is_16_bytes_32_hex_chars() {
+        let h = CachedPeer::pubkey_hash("npub1exampleexampleexample");
+        assert_eq!(h.len(), 32, "16 bytes of SHA-256 → 32 hex chars");
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()), "hex only, got {h}");
+        assert_eq!(h, CachedPeer::pubkey_hash("npub1exampleexampleexample"), "stable for the same npub");
+        assert_ne!(h, CachedPeer::pubkey_hash("npub1other"));
+    }
+
+    /// M13 HANDOVER gap #5: a pre-M13 cached contact stored `collections` as plain `Collection`
+    /// objects — the K-of-N parts fields didn't exist yet. `PeerCollection`'s `#[serde(flatten)]` +
+    /// `#[serde(default)]` on `parts_total`/`parts_present` must still load such a file, with those
+    /// fields defaulting to `None` (never fabricate a "K of N" badge from stale cache data).
+    #[test]
+    fn pre_m13_cached_contact_still_loads() {
+        let (_dir, store) = test_store();
+        let hash = CachedPeer::pubkey_hash("npub1exampleexampleexample");
+        let legacy_json = r#"{
+            "npub": "npub1exampleexampleexample",
+            "source": "Manual",
+            "browse_key_hex": null,
+            "petname": null,
+            "profile": null,
+            "collections": [{
+                "slug": "films",
+                "path_alias": "Films",
+                "item_count": 3,
+                "content_types": ["video"],
+                "tags": [],
+                "languages": [],
+                "visibility": "Public",
+                "sorted": false,
+                "last_updated": "2026-01-01T00:00:00Z",
+                "listing": []
+            }],
+            "online": false,
+            "last_fetched": "2026-01-01T00:00:00Z",
+            "local_tags": [],
+            "fingerprint": null
+        }"#;
+        std::fs::create_dir_all(store.contact_path(&hash).parent().unwrap()).unwrap();
+        std::fs::write(store.contact_path(&hash), legacy_json).unwrap();
+
+        let loaded = store.load_contact(&hash).unwrap().expect("a pre-M13 cached contact must still load");
+        assert_eq!(loaded.collections.len(), 1);
+        assert_eq!(loaded.collections[0].collection.slug, "films");
+        assert_eq!(loaded.collections[0].parts_total, None, "an old cache entry carries no parts info");
+        assert_eq!(loaded.collections[0].parts_present, None);
+    }
+
+    #[test]
+    fn wipe_clears_everything_the_store_writes() {
+        use std::collections::HashSet;
+        let (_dir, store) = test_store();
+        // Exercise every write path the store has today.
+        store.save_identity(&sample_identity()).unwrap();
+        let profile: Profile =
+            serde_json::from_str(r#"{"display_name":"h","updated":"2026-01-01T00:00:00Z"}"#).unwrap();
+        store.save_profile_draft(&profile).unwrap();
+        let col = Collection {
+            slug: "films".into(),
+            path_alias: "films".into(),
+            description: None,
+            item_count: 0,
+            est_size: None,
+            content_types: vec![],
+            tags: vec![],
+            languages: vec![],
+            visibility: hb_core::types::Visibility::Public,
+            sorted: false,
+            last_updated: chrono::Utc::now(),
+            listing: vec![],
+        };
+        store.save_collection_draft(&col).unwrap();
+        store.save_scan_spec("films", &ScanSpec::default()).unwrap();
+        store
+            .save_snapshot_fingerprint("films", &hb_core::SnapshotFingerprint("fp".into()))
+            .unwrap();
+        store.save_published("films", "{}").unwrap();
+        store.save_share_settings("films", &ShareSettings::default()).unwrap();
+        store.save_settings(&Settings::default()).unwrap();
+        let peer = CachedPeer {
+            npub: "npub1x".into(),
+            source: ContactSource::Manual,
+            browse_key_hex: None,
+            petname: None,
+            profile: None,
+            collections: vec![],
+            online: false,
+            last_fetched: chrono::Utc::now(),
+            local_tags: vec![],
+            fingerprint: None,
+        };
+        store.save_contact(&CachedPeer::pubkey_hash("npub1x"), &peer).unwrap();
+        store
+            .save_groups(&[Group {
+                name: "g".into(),
+                pubkeys: vec![],
+                modified_at: chrono::Utc::now(),
+                trusted: false,
+                color: None,
+            }])
+            .unwrap();
+        store
+            .save_watches(&[Watch {
+                name: "w".into(),
+                tags: vec![],
+                content_types: vec![],
+                last_fired: None,
+                seen_pubkeys: vec![],
+            }])
+            .unwrap();
+        let (meta, key) = hb_core::new_topic("private room", "", vec![], true).unwrap();
+        store
+            .save_topics(&[StoredTopic { meta, key, joined_at: 0, membership_json: None }])
+            .unwrap();
+        store.save_topic_nonces(&HashSet::from(["n1".to_string()])).unwrap();
+        // A file the store does not know about yet — a future workstream's addition (chat
+        // requests, topic announce timestamps, …) must be wiped too, never survive as an orphan.
+        std::fs::write(store.base_dir().join("future_addition.json"), b"{}").unwrap();
+
+        store.wipe().unwrap();
+
+        let leftovers: Vec<String> = std::fs::read_dir(store.base_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(leftovers.is_empty(), "wipe must leave the profile dir empty, found: {leftovers:?}");
     }
 
     #[test]

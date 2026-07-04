@@ -44,6 +44,19 @@
 //!       signed under the same per-member derived key. Wiped at 24h (relay-honoured, best-effort) AND
 //!       filtered locally on the authenticated inner `ts` so a non-compliant relay can't resurrect it.
 //!
+//!   BROADCAST (M13 Part A — a member's announce to the whole roster; NOT the discovery ANNOUNCE
+//!   above — same English word, two different wire artifacts, disambiguated by type: `Announcement`/
+//!   `seal_announce`/`open_announce` here vs `TopicMeta`/`build_announce`/`parse_announce` above):
+//!       Rides the SAME kind as CHANNEL (KIND_TOPIC_POST) and the SAME 24h NIP-40/local-filter
+//!       lifecycle — only the ciphertext's domain byte tells the two apart:
+//!       content = TOPIC_ENC(topic_key, 0x03 ‖ {author_npub, body, ts})       // 0x03 = domain byte (F17)
+//!       *** the proof is DOMAIN-SEPARATE from a post's (`hbm:announce:` vs `hbm:post:`), MANDATORY
+//!       not optional ***: without its own prefix, a topic-key holder could decrypt a member's ordinary
+//!       post and re-wrap the identical plaintext under the announce domain — "promoting" a post the
+//!       member never broadcast into one that verifies. The channel POST stays UNTHROTTLED; a BROADCAST
+//!       is rate-limited (a timer, enforced in hb-app against `ANNOUNCE_MIN_INTERVAL_SECS`/
+//!       `announce_cooldown_remaining` — this crate supplies only the arithmetic, never a clock).
+//!
 //!   INVITE CREDENTIAL (private admission path 1 + public-join, sealed, the SAME NIP-59 seal the M10
 //!   private listing uses — never re-derived):
 //!       seal-to-invitee( {meta, topic_key, nonce, expires_at} )  — gift-wrap (1059) of a seal of a
@@ -67,10 +80,12 @@
 //! leaked key retrospectively deanonymizes every pseudonym + decrypts every past post in-window. The
 //! pseudonyms are deterministic + linkable per topic. Inherent to symmetric-key group messaging.
 //!
-//! **Negatives this enforces (tested first, hardest):** an announce never carries the topic_key (B1);
-//! a membership event's Nostr `pubkey` is the derived pseudonym, the real npub only in ciphertext (B2);
-//! a non-member (no key) cannot open a membership or post (`Err`); a membership ciphertext fed to
-//! `open_post` (and vice-versa) is rejected on the domain byte (F17); no topic event carries the
+//! **Negatives this enforces (tested first, hardest):** the discovery announce never carries the
+//! topic_key (B1); a membership event's Nostr `pubkey` is the derived pseudonym, the real npub only in
+//! ciphertext (B2); a non-member (no key) cannot open a membership, post, or broadcast (`Err`); a
+//! membership/post/broadcast ciphertext fed to the wrong opener is rejected on the domain byte (F17,
+//! now three-way: 0x01/0x02/0x03); a post's real-key proof cannot be promoted into a passing broadcast
+//! proof, nor vice-versa (M13 Part A — the distinct `hbm:announce:` prefix); no topic event carries the
 //! author's browse-key/share-code (F13); `redeem_invite` rejects an invite not sealed to me / expired /
 //! replayed (E); every malformed/tampered/foreign input is a reasoned `Err`, never a panic.
 
@@ -113,8 +128,15 @@ pub(crate) const TAG_CRYPTO: &str = "hb-cv";
 
 /// Domain byte distinguishing a membership ciphertext from a channel-post ciphertext (F17) — the two
 /// share the topic conversation key, so the first plaintext byte pins which event type it is.
-const MEMBERSHIP_DOMAIN: u8 = 0x01;
-const POST_DOMAIN: u8 = 0x02;
+/// `pub(crate)`: the wire-freeze test (INVARIANT_AUDIT.md I-3) pins these as launch-frozen wire
+/// discriminants — they live inside signed ciphertext already durable on relays.
+pub(crate) const MEMBERSHIP_DOMAIN: u8 = 0x01;
+pub(crate) const POST_DOMAIN: u8 = 0x02;
+/// M13 Part A — a member BROADCAST rides the SAME kind as a post (1117) under the SAME topic key;
+/// this third domain byte is the only thing that tells the two apart (F17, extended). **Not** to be
+/// confused with the plaintext discovery ANNOUNCE (`KIND_TOPIC_ANNOUNCE`) above — that event carries
+/// no domain byte at all (it isn't topic-key-encrypted).
+pub(crate) const ANNOUNCE_DOMAIN: u8 = 0x03;
 
 /// Channel posts expire 24h after their authenticated `ts` (spec §11; Decision D — relay-honoured
 /// **and** locally filtered).
@@ -202,6 +224,16 @@ pub struct Post {
     pub ts: u64,
 }
 
+/// One decrypted member broadcast (M13 Part A) — same field shape as `Post` (a broadcast IS a channel
+/// item, just domain-tagged differently), kept as its own type so a reader can't accidentally treat an
+/// announcement as an ordinary post, or vice-versa, at the type level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Announcement {
+    pub author: PublicKey,
+    pub body: String,
+    pub ts: u64,
+}
+
 /// The seen-nonce set: redeemed invites, keyed `(topic_id, invitee)`. Persisted by the app store so a
 /// restart can't re-accept an old invite (Decision E). **Honest limit:** device-local — a
 /// factory-reset / restore-to-new-device user loses it and could re-redeem an unexpired old invite.
@@ -232,6 +264,20 @@ struct PostPayload {
     ts: u64,
     /// chorus-1: a NIP-01 proof event signed by the author's REAL key, binding the post's
     /// `post:{topic_id}:{sha256(body)}` at `ts` (so a key-holder cannot impersonate another member).
+    proof: String,
+}
+
+/// M13 Part A — the payload inside a member BROADCAST ciphertext. Identical shape to `PostPayload`
+/// (same fields, same types); the two are still distinct Rust types so a broadcast can never be
+/// silently deserialized as a post (or vice-versa) even if a caller fumbled the domain byte.
+#[derive(Serialize, Deserialize)]
+struct AnnounceMsgPayload {
+    author_npub: String,
+    body: String,
+    ts: u64,
+    /// Same shape as `PostPayload.proof`, but bound to the DISTINCT `hbm:announce:` statement
+    /// (`announce_statement`), never the post statement — so a post's proof cannot be replayed to
+    /// forge a broadcast (see the negative test `a_posts_proof_cannot_be_promoted_to_an_announce`).
     proof: String,
 }
 
@@ -378,22 +424,32 @@ fn topic_encrypt(key: &TopicKey, domain: u8, plaintext_json: &str) -> Result<Str
     Ok(B64.encode(bytes))
 }
 
-/// Decrypt a topic ciphertext, enforcing the expected domain byte. `crypto_v` is the signed `hb-cv`;
-/// an unknown version is refused before any decryption (forward-compat); a wrong domain byte is an
-/// `Err` (F17), never silently mis-interpreted as the other event type.
-fn topic_decrypt(key: &TopicKey, domain_expected: u8, crypto_v: u8, content_b64: &str) -> Result<Vec<u8>, HbError> {
+/// Decrypt a topic ciphertext without assuming which domain it is — returns the domain byte + the
+/// remaining plaintext. `topic_decrypt` (the strict single-domain caller) and `open_channel_item` (the
+/// multi-domain caller) both delegate here, so there is exactly ONE place that turns ciphertext bytes
+/// into `(domain, plaintext)` — the discipline that keeps F17 sound as domains multiply (M13 Part A
+/// added the third, 0x03).
+fn topic_decrypt_any(key: &TopicKey, crypto_v: u8, content_b64: &str) -> Result<(u8, Vec<u8>), HbError> {
     check_crypto(crypto_v)?;
     let ck = topic_conversation_key(key, crypto_v);
     let raw = B64.decode(content_b64.as_bytes()).map_err(|_| HbError::InvalidEncryptedMessage)?;
     let pt = decrypt_to_bytes(&ck, &raw).map_err(|_| HbError::DecryptionFailed)?;
     let (domain, rest) = pt.split_first().ok_or(HbError::DecryptionFailed)?;
-    if *domain != domain_expected {
+    Ok((*domain, rest.to_vec()))
+}
+
+/// Decrypt a topic ciphertext, enforcing the expected domain byte. `crypto_v` is the signed `hb-cv`;
+/// an unknown version is refused before any decryption (forward-compat); a wrong domain byte is an
+/// `Err` (F17), never silently mis-interpreted as the other event type. Delegates to
+/// `topic_decrypt_any` — unchanged signature/behavior, so every existing F17 negative stays green.
+fn topic_decrypt(key: &TopicKey, domain_expected: u8, crypto_v: u8, content_b64: &str) -> Result<Vec<u8>, HbError> {
+    let (domain, rest) = topic_decrypt_any(key, crypto_v, content_b64)?;
+    if domain != domain_expected {
         return Err(HbError::InvalidEvent(format!(
-            "topic domain byte mismatch: expected 0x{domain_expected:02x}, got 0x{:02x}",
-            domain
+            "topic domain byte mismatch: expected 0x{domain_expected:02x}, got 0x{domain:02x}"
         )));
     }
-    Ok(rest.to_vec())
+    Ok(rest)
 }
 
 // ── B2 — the per-member derived signer (topic-scoped pseudonym) ──────────────────────────────────
@@ -420,6 +476,13 @@ pub fn member_sign_keys(key: &TopicKey, member: &PublicKey) -> Result<Keys, HbEr
 /// pin them (INVARIANT_AUDIT.md I-3).
 pub(crate) const PROOF_JOIN_PREFIX: &str = "hbm:join:";
 pub(crate) const PROOF_POST_PREFIX: &str = "hbm:post:";
+/// M13 Part A — the broadcast-announce proof prefix. MANDATORY and distinct from `PROOF_POST_PREFIX`:
+/// without its own prefix, a topic-key holder could decrypt a member's ordinary post (proof binds
+/// `hbm:post:{topic}:{sha256(body)}`), re-encrypt the SAME plaintext under the announce domain byte,
+/// and re-sign with the same (derivable) pseudonym — "promoting" a post the member sent into an
+/// announcement they never broadcast, with a proof that still verifies. The distinct prefix makes
+/// `verify_proof` reject that promotion (see `a_posts_proof_cannot_be_promoted_to_an_announce`).
+pub(crate) const PROOF_ANNOUNCE_PREFIX: &str = "hbm:announce:";
 
 /// The canonical statement a member's REAL key signs to authorize joining `topic_id`. The `hbm:`
 /// prefix is a **Hoardbook-specific domain separator** (chorus-2): without it, a `KIND_TOPIC_PROOF`
@@ -434,6 +497,14 @@ fn membership_statement(topic_id: &str) -> String {
 /// statement (chorus-2).
 fn post_statement(topic_id: &str, body: &str) -> String {
     format!("{PROOF_POST_PREFIX}{topic_id}:{}", hex::encode(Sha256::digest(body.as_bytes())))
+}
+
+/// The canonical statement an author's REAL key signs to authorize a broadcast announce (M13 Part A).
+/// Domain-separated from `post_statement` by its OWN `hbm:` prefix — not merely a different literal,
+/// but the property that makes a post's proof unusable as a broadcast's proof (see
+/// `PROOF_ANNOUNCE_PREFIX`).
+fn announce_statement(topic_id: &str, body: &str) -> String {
+    format!("{PROOF_ANNOUNCE_PREFIX}{topic_id}:{}", hex::encode(Sha256::digest(body.as_bytes())))
 }
 
 /// Build a proof event signed by the member's **real** key over `statement` at `at`. It is never
@@ -572,7 +643,7 @@ pub fn roster(key: &TopicKey, memberships: &[Event]) -> Vec<PublicKey> {
     out
 }
 
-// ── CHANNEL (ephemeral 24h posts) ────────────────────────────────────────────────────────────────
+// ── CHANNEL (ephemeral 24h posts + member broadcasts, M13 Part A) ──────────────────────────────────
 
 /// Seal a channel post (with the author's own `Identity`, to sign the real-key proof) — encrypted
 /// under the topic key (domain 0x02), signed on the wire by the derived pseudonym, carrying a NIP-40
@@ -630,6 +701,145 @@ pub fn open_post(key: &TopicKey, event: &Event, now: u64) -> Result<Option<Post>
         return Ok(None);
     }
     Ok(Some(Post { author, body: payload.body, ts: payload.ts }))
+}
+
+/// Seal a member BROADCAST (M13 Part A) — same shape as `seal_post`: encrypted under the topic key but
+/// domain 0x03, signed by the derived pseudonym, same NIP-40 24h expiry, same real-key proof — just
+/// bound to the DISTINCT `hbm:announce:` statement so it can never be confused with (or forged from) an
+/// ordinary post's proof. The rate limit between two broadcasts (`ANNOUNCE_MIN_INTERVAL_SECS` /
+/// `announce_cooldown_remaining`) is enforced by the CALLER (hb-app owns the clock + the persisted
+/// `last_announce_at`) — this function does not check it, so misuse here is a caller bug, not a crypto
+/// hole.
+pub fn seal_announce(key: &TopicKey, topic_id: &str, author: &Identity, body: &str, now: u64) -> Result<Event, HbError> {
+    let author_pk = author.public_key();
+    let signer = member_sign_keys(key, &author_pk)?;
+    let proof = build_proof(author, &announce_statement(topic_id, body), now)?;
+    let payload = serde_json::to_string(&AnnounceMsgPayload {
+        author_npub: author_pk.to_bech32().map_err(|e| HbError::Nostr(e.to_string()))?,
+        body: body.to_string(),
+        ts: now,
+        proof: proof.as_json(),
+    })?;
+    let content = topic_encrypt(key, ANNOUNCE_DOMAIN, &payload)?;
+    EventBuilder::new(Kind::from_u16(KIND_TOPIC_POST), content)
+        .tags([
+            Tag::identifier(topic_id.to_string()),
+            Tag::custom(TagKind::custom(TAG_SCHEMA), [SCHEMA_V.to_string()]),
+            Tag::custom(TagKind::custom(TAG_CRYPTO), [CRYPTO_V.to_string()]),
+            Tag::expiration(Timestamp::from(now + POST_TTL_SECS)),
+        ])
+        .custom_created_at(Timestamp::from(now))
+        .sign_with_keys(&signer)
+        .map_err(|e| HbError::Nostr(e.to_string()))
+}
+
+/// Open a member broadcast → `Some(Announcement)` if fresh, `None` if older than 24h (same local filter
+/// as `open_post`). Same kind + signature + B2-binding checks as `open_post`, but gated on the 0x03
+/// domain byte and verified against the announce statement — so an ordinary post ciphertext (and
+/// vice-versa) is rejected here on the domain byte, and a post's proof cannot be promoted into a
+/// passing announce proof (the mandatory negative this closes).
+pub fn open_announce(key: &TopicKey, event: &Event, now: u64) -> Result<Option<Announcement>, HbError> {
+    if event.kind != Kind::from_u16(KIND_TOPIC_POST) {
+        return Err(HbError::InvalidEvent("not a topic channel event".into()));
+    }
+    verify_event(event)?;
+    let crypto_v = crypto_v_of(event)?;
+    let plain = topic_decrypt(key, ANNOUNCE_DOMAIN, crypto_v, &event.content)?;
+    let payload: AnnounceMsgPayload = serde_json::from_slice(&plain)?;
+    let author = parse_npub(&payload.author_npub)?;
+    let expected = member_sign_keys(key, &author)?.public_key();
+    if event.pubkey != expected {
+        return Err(HbError::InvalidEvent(
+            "announce pubkey does not bind to the claimed author (B2 forgery guard)".into(),
+        ));
+    }
+    // chorus-1-shaped: the real-key proof binds the topic + the body UNDER THE ANNOUNCE STATEMENT, so
+    // a key-holder cannot impersonate another member NOR promote that member's own post proof.
+    verify_proof(&payload.proof, &author, &announce_statement(&topic_id_of(event)?, &payload.body), payload.ts)?;
+    if payload.ts > now.saturating_add(MAX_FUTURE_SKEW_SECS) {
+        return Ok(None);
+    }
+    if now.saturating_sub(payload.ts) > POST_TTL_SECS {
+        return Ok(None);
+    }
+    Ok(Some(Announcement { author, body: payload.body, ts: payload.ts }))
+}
+
+/// The two kinds sharing the channel (kind 1117), as recovered by a single decrypt in
+/// [`open_channel_item`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelItem {
+    Post(Post),
+    Announce(Announcement),
+}
+
+/// Open a channel event without knowing in advance whether it is a post or a broadcast: decrypt
+/// **once** ([`topic_decrypt_any`]), then branch on the recovered domain byte into the same
+/// B2-binding + proof-verify + future-skew/24h enforcement as `open_post`/`open_announce`
+/// respectively. An unrecognised domain byte is a forward-compat `Err` — a future channel-item kind
+/// must be recognised by this reader before it is trusted, never silently mis-typed as whichever
+/// variant happens to parse.
+pub fn open_channel_item(key: &TopicKey, event: &Event, now: u64) -> Result<Option<ChannelItem>, HbError> {
+    if event.kind != Kind::from_u16(KIND_TOPIC_POST) {
+        return Err(HbError::InvalidEvent("not a topic channel event".into()));
+    }
+    verify_event(event)?;
+    let crypto_v = crypto_v_of(event)?;
+    let (domain, plain) = topic_decrypt_any(key, crypto_v, &event.content)?;
+    match domain {
+        POST_DOMAIN => {
+            let payload: PostPayload = serde_json::from_slice(&plain)?;
+            let author = parse_npub(&payload.author_npub)?;
+            let expected = member_sign_keys(key, &author)?.public_key();
+            if event.pubkey != expected {
+                return Err(HbError::InvalidEvent(
+                    "post pubkey does not bind to the claimed author (B2 forgery guard)".into(),
+                ));
+            }
+            verify_proof(&payload.proof, &author, &post_statement(&topic_id_of(event)?, &payload.body), payload.ts)?;
+            if payload.ts > now.saturating_add(MAX_FUTURE_SKEW_SECS) || now.saturating_sub(payload.ts) > POST_TTL_SECS {
+                return Ok(None);
+            }
+            Ok(Some(ChannelItem::Post(Post { author, body: payload.body, ts: payload.ts })))
+        }
+        ANNOUNCE_DOMAIN => {
+            let payload: AnnounceMsgPayload = serde_json::from_slice(&plain)?;
+            let author = parse_npub(&payload.author_npub)?;
+            let expected = member_sign_keys(key, &author)?.public_key();
+            if event.pubkey != expected {
+                return Err(HbError::InvalidEvent(
+                    "announce pubkey does not bind to the claimed author (B2 forgery guard)".into(),
+                ));
+            }
+            verify_proof(&payload.proof, &author, &announce_statement(&topic_id_of(event)?, &payload.body), payload.ts)?;
+            if payload.ts > now.saturating_add(MAX_FUTURE_SKEW_SECS) || now.saturating_sub(payload.ts) > POST_TTL_SECS {
+                return Ok(None);
+            }
+            Ok(Some(ChannelItem::Announce(Announcement { author, body: payload.body, ts: payload.ts })))
+        }
+        _ => Err(HbError::InvalidEvent(format!("unknown channel domain byte 0x{domain:02x} (forward-compat refusal)"))),
+    }
+}
+
+// ── ANNOUNCE RATE LIMIT (pure arithmetic; the timer + persistence live in hb-app) ────────────────────
+
+/// The minimum spacing between two broadcasts from the same member. **OWNER-RATIFICATION DEFAULT**
+/// (2026-07-03 ruling): the ruling fixes that a cooldown MUST exist and MUST NOT be optional — the
+/// *value* below has not itself been ratified and may change before ship. This crate only supplies the
+/// arithmetic + the constant; hb-app owns the clock and persists `last_announce_at` per member.
+pub const ANNOUNCE_MIN_INTERVAL_SECS: u64 = 3_600;
+
+/// Seconds remaining before a member may broadcast again, given their `last_announce_at` (`None` =
+/// never broadcast ⇒ no cooldown). **Saturating, both ends:** `saturating_add` so a `last_announce_at`
+/// near `u64::MAX` can't overflow into a bogus small number, and `saturating_sub` so a clock ROLLBACK
+/// (`now` before `last_announce_at`) reads as a LARGER remaining cooldown, never underflows into a
+/// huge/negative value a caller could misread as "go ahead" — a rollback can only ever look *more*
+/// throttled, never less.
+pub fn announce_cooldown_remaining(last_announce_at: Option<u64>, now: u64) -> u64 {
+    match last_announce_at {
+        None => 0,
+        Some(last) => last.saturating_add(ANNOUNCE_MIN_INTERVAL_SECS).saturating_sub(now),
+    }
 }
 
 // ── INVITE CREDENTIAL (sealed, single-use) + public-join ─────────────────────────────────────────
@@ -1434,5 +1644,190 @@ mod tests {
         let back: TopicKey = serde_json::from_str(&json).unwrap();
         assert_eq!(back.0, key.0);
         assert!(format!("{key:?}").contains("REDACTED"), "Debug must not leak the key");
+    }
+
+    // ───────────────────────── M13 Part A: ANNOUNCE (member broadcast) ─────────────────────────
+    // Not the discovery ANNOUNCE (`TopicMeta`/`build_announce`/plaintext, kind 31117) — this is a
+    // member's broadcast to the roster, riding the SAME channel kind (1117) as an ordinary post,
+    // distinguished only by the ciphertext domain byte (0x03). Negatives first, per convention.
+
+    #[test]
+    fn post_ciphertext_rejected_by_open_announce_and_vice_versa() {
+        // A post and a broadcast share the SAME kind (1117); only the ciphertext's domain byte (0x02
+        // vs 0x03) tells them apart. Feeding one opener the other's event must fail on the domain
+        // byte (F17, extended) — even with the RIGHT key, even though the kind check passes for both.
+        let (meta, key) = public_topic();
+        let author = Identity::generate();
+        let post = seal_post(&key, &meta.topic_id, &author, "hi", NOW).unwrap();
+        let announce = seal_announce(&key, &meta.topic_id, &author, "hear ye", NOW).unwrap();
+        assert!(matches!(open_announce(&key, &post, NOW), Err(HbError::InvalidEvent(_))), "a post ciphertext is not an announce");
+        assert!(matches!(open_post(&key, &announce, NOW), Err(HbError::InvalidEvent(_))), "an announce ciphertext is not a post");
+    }
+
+    #[test]
+    fn a_posts_proof_cannot_be_promoted_to_an_announce() {
+        // THE mandatory negative: a topic-key holder decrypts a member's ordinary post, re-encrypts the
+        // SAME plaintext (author/body/ts/proof unchanged) under the ANNOUNCE domain byte, and re-signs
+        // with the same derivable pseudonym — trying to "promote" a post into an announce the member
+        // never broadcast. The proof binds `hbm:post:{topic}:{sha256(body)}`; `open_announce` checks it
+        // against `hbm:announce:{topic}:{sha256(body)}` — a DIFFERENT statement — so verification fails.
+        // A shared proof prefix would NOT catch this forgery; the distinct prefix does.
+        let (meta, key) = public_topic();
+        let author = Identity::generate();
+        let real_post = seal_post(&key, &meta.topic_id, &author, "just a normal post", NOW).unwrap();
+        let plain = topic_decrypt(&key, POST_DOMAIN, CRYPTO_V, &real_post.content).unwrap();
+        let payload: PostPayload = serde_json::from_slice(&plain).unwrap();
+        let signer = member_sign_keys(&key, &author.public_key()).unwrap();
+        let promoted_payload = serde_json::to_string(&AnnounceMsgPayload {
+            author_npub: payload.author_npub,
+            body: payload.body,
+            ts: payload.ts,
+            proof: payload.proof, // the POST proof, unchanged — the forgery attempt
+        })
+        .unwrap();
+        let promoted = EventBuilder::new(Kind::from_u16(KIND_TOPIC_POST), topic_encrypt(&key, ANNOUNCE_DOMAIN, &promoted_payload).unwrap())
+            .tags([
+                Tag::identifier(meta.topic_id.clone()),
+                Tag::custom(TagKind::custom(TAG_CRYPTO), [CRYPTO_V.to_string()]),
+                Tag::expiration(Timestamp::from(NOW + POST_TTL_SECS)),
+            ])
+            .custom_created_at(Timestamp::from(NOW))
+            .sign_with_keys(&signer)
+            .unwrap();
+        assert!(
+            open_announce(&key, &promoted, NOW).is_err(),
+            "a post's proof must not verify as an announce proof — the distinct hbm:announce: prefix stops the promotion"
+        );
+    }
+
+    #[test]
+    fn announce_pubkey_is_pseudonym_no_real_npub_in_raw_event() {
+        // B2, restated for the broadcast: event.pubkey is the derived pseudonym; the real npub is
+        // ONLY inside the topic_key-encrypted content.
+        let (meta, key) = public_topic();
+        let author = Identity::generate();
+        let ev = seal_announce(&key, &meta.topic_id, &author, "attention room", NOW).unwrap();
+        let expected_pseudonym = member_sign_keys(&key, &author.public_key()).unwrap().public_key();
+        assert_eq!(ev.pubkey, expected_pseudonym, "event.pubkey is the derived pseudonym");
+        assert_ne!(ev.pubkey, author.public_key(), "event.pubkey is NOT the real npub");
+        let json = ev.as_json();
+        assert!(!json.contains(&author.public_key().to_hex()), "real npub hex must not leak in the raw event");
+        assert!(!json.contains(&author.npub()), "real npub bech32 must not leak in the raw event");
+    }
+
+    #[test]
+    fn non_member_cannot_open_announce() {
+        // No key → ciphertext only → Err. (The wrong-key holder stands in for a non-member.)
+        let (meta, key) = public_topic();
+        let author = Identity::generate();
+        let ev = seal_announce(&key, &meta.topic_id, &author, "hi", NOW).unwrap();
+        let (_other_meta, wrong_key) = new_topic("other/unrelated-announce", "", vec![], false).unwrap();
+        assert!(matches!(open_announce(&wrong_key, &ev, NOW), Err(HbError::DecryptionFailed)));
+    }
+
+    #[test]
+    fn keyholder_cannot_forge_announce_as_another_member() {
+        // Mirrors insider_cannot_impersonate_another_in_the_channel: a key-holder cannot broadcast as
+        // another member — the announce's real-key proof binds the author + body.
+        let (meta, key) = public_topic();
+        let victim = Identity::generate();
+        let signer = member_sign_keys(&key, &victim.public_key()).unwrap();
+        let payload = serde_json::to_string(&AnnounceMsgPayload {
+            author_npub: victim.npub(),
+            body: "I never said this".into(),
+            ts: NOW,
+            proof: String::new(),
+        })
+        .unwrap();
+        let forged = EventBuilder::new(Kind::from_u16(KIND_TOPIC_POST), topic_encrypt(&key, ANNOUNCE_DOMAIN, &payload).unwrap())
+            .tags([Tag::identifier(meta.topic_id.clone()), Tag::custom(TagKind::custom(TAG_CRYPTO), [CRYPTO_V.to_string()])])
+            .custom_created_at(Timestamp::from(NOW))
+            .sign_with_keys(&signer)
+            .unwrap();
+        assert!(open_announce(&key, &forged, NOW).is_err(), "a key-holder cannot forge an announce as another member");
+    }
+
+    #[test]
+    fn future_dated_announce_is_dropped() {
+        // Mirrors future_dated_post_is_dropped_not_pinned_forever, for the broadcast.
+        let (meta, key) = public_topic();
+        let author = Identity::generate();
+        let future = NOW + 10 * POST_TTL_SECS;
+        let ev = seal_announce(&key, &meta.topic_id, &author, "pinned?", future).unwrap();
+        assert!(open_announce(&key, &ev, NOW).unwrap().is_none(), "a wildly future-dated announce is dropped");
+    }
+
+    #[test]
+    fn announce_older_than_24h_filtered_locally() {
+        let (meta, key) = public_topic();
+        let author = Identity::generate();
+        let ev = seal_announce(&key, &meta.topic_id, &author, "stale announce", NOW).unwrap();
+        let later = NOW + POST_TTL_SECS + 1;
+        assert!(open_announce(&key, &ev, later).unwrap().is_none(), "a >24h announce is filtered to None");
+        assert!(open_announce(&key, &ev, NOW + POST_TTL_SECS).unwrap().is_some(), "an announce at the 24h boundary still opens");
+    }
+
+    #[test]
+    fn announce_carries_nip40_expiration_at_now_plus_ttl() {
+        let (meta, key) = public_topic();
+        let author = Identity::generate();
+        let ev = seal_announce(&key, &meta.topic_id, &author, "criterion sale!", NOW).unwrap();
+        let exp = ev.tags.find(TagKind::Expiration).and_then(|t| t.content()).and_then(|s| s.parse::<u64>().ok());
+        assert_eq!(exp, Some(NOW + POST_TTL_SECS), "the announce carries a NIP-40 expiration at +24h, same as a post");
+    }
+
+    #[test]
+    fn announce_roundtrip_recovers_author_body_ts() {
+        let (meta, key) = public_topic();
+        let author = Identity::generate();
+        let ev = seal_announce(&key, &meta.topic_id, &author, "criterion sale!", NOW).unwrap();
+        let opened = open_announce(&key, &ev, NOW).unwrap().unwrap();
+        assert_eq!(opened.author, author.public_key());
+        assert_eq!(opened.body, "criterion sale!");
+        assert_eq!(opened.ts, NOW);
+    }
+
+    #[test]
+    fn open_channel_item_partitions_post_and_announce() {
+        let (meta, key) = public_topic();
+        let author = Identity::generate();
+        let post = seal_post(&key, &meta.topic_id, &author, "a post", NOW).unwrap();
+        let announce = seal_announce(&key, &meta.topic_id, &author, "an announce", NOW).unwrap();
+        match open_channel_item(&key, &post, NOW).unwrap() {
+            Some(ChannelItem::Post(p)) => assert_eq!(p.body, "a post"),
+            other => panic!("expected a Post variant, got {other:?}"),
+        }
+        match open_channel_item(&key, &announce, NOW).unwrap() {
+            Some(ChannelItem::Announce(a)) => assert_eq!(a.body, "an announce"),
+            other => panic!("expected an Announce variant, got {other:?}"),
+        }
+        // Junk / unknown domain content → Err (forward-compat refusal), never silently mis-typed.
+        let signer = member_sign_keys(&key, &author.public_key()).unwrap();
+        let junk = EventBuilder::new(Kind::from_u16(KIND_TOPIC_POST), topic_encrypt(&key, 0x7f, "{}").unwrap())
+            .tags([Tag::identifier(meta.topic_id.clone()), Tag::custom(TagKind::custom(TAG_CRYPTO), [CRYPTO_V.to_string()])])
+            .custom_created_at(Timestamp::from(NOW))
+            .sign_with_keys(&signer)
+            .unwrap();
+        assert!(open_channel_item(&key, &junk, NOW).is_err(), "an unrecognised domain byte is a forward-compat Err");
+    }
+
+    #[test]
+    fn announce_cooldown_remaining_boundaries() {
+        // None ⇒ never announced ⇒ no cooldown.
+        assert_eq!(announce_cooldown_remaining(None, NOW), 0);
+        // Just under the interval: 1s left.
+        assert_eq!(announce_cooldown_remaining(Some(NOW), NOW + ANNOUNCE_MIN_INTERVAL_SECS - 1), 1);
+        // Exactly at the interval: cooldown over.
+        assert_eq!(announce_cooldown_remaining(Some(NOW), NOW + ANNOUNCE_MIN_INTERVAL_SECS), 0);
+        // Past the interval: still 0 (not negative/wrapped).
+        assert_eq!(announce_cooldown_remaining(Some(NOW), NOW + ANNOUNCE_MIN_INTERVAL_SECS + 100), 0);
+        // Clock rollback: `now` before `last_announce_at` reads as MORE cooldown remaining, never a
+        // bypass (saturating arithmetic, not a wrap to a huge/negative number misread as "go ahead").
+        let rolled_back_now = NOW - 1_000;
+        assert_eq!(
+            announce_cooldown_remaining(Some(NOW), rolled_back_now),
+            ANNOUNCE_MIN_INTERVAL_SECS + 1_000,
+            "a clock rollback reads as still cooling down, never a bypass"
+        );
     }
 }

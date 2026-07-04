@@ -3,6 +3,7 @@
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
+	import { collectionAvailability } from '$lib/browse-view.js';
 	import type { CachedPeer, Collection, DirectoryItem } from '$lib/types.js';
 
 	type BcItem =
@@ -272,6 +273,12 @@
 							{/each}
 						</div>
 					{/if}
+					{#if collectionAvailability(selectedCollection)}
+						<div class="kofn-note">
+							<span>{collectionAvailability(selectedCollection)}</span>
+							<FeatureTooltip key="k-of-n-folders" />
+						</div>
+					{/if}
 					<!-- The listing is metadata only — Hoardbook moves no files (H4/INV-4). -->
 					<div class="no-download-note">
 						<span>Metadata only — Hoardbook moves no files.</span>
@@ -488,6 +495,18 @@
 		background: var(--accent-soft);
 		color: var(--accent);
 		border: 1px solid color-mix(in oklch, var(--accent) 30%, transparent);
+	}
+
+	/* K-of-N availability note (M13 HANDOVER gap #5) */
+	.kofn-note {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+		padding: 10px 16px;
+		border-top: 1px solid var(--divider);
+		font-size: 11.5px;
+		color: var(--fg-dim);
+		flex-shrink: 0;
 	}
 
 	/* No-download footer note */

@@ -73,6 +73,77 @@ pub fn relay_urls(store: &DataStore) -> Vec<String> {
     configured
 }
 
+/// SSRF guard on **user-supplied** relay URLs (audit I-11): reject any scheme other than
+/// `ws://`/`wss://`, and any host that is loopback (127.0.0.0/8, ::1, localhost), private
+/// (10/8, 172.16/12, 192.168/16, fc00::/7), link-local (169.254/16, fe80::/10), or another
+/// non-global class (chorus M13 #2: CGNAT 100.64/10, benchmarking 198.18/15, multicast,
+/// broadcast, documentation, unspecified) — including IPv4-mapped/-compatible IPv6
+/// (`::ffff:127.0.0.1`, `::10.0.0.5`) and bracketed hosts with ports. Hostnames are checked
+/// **literally only** (`localhost`, `*.localhost`, mDNS `*.local`) — there is deliberately NO DNS
+/// resolution here, so a public name that rebinds to a private IP is an accepted residual
+/// (prosumer tier; resolving would add a blocking lookup + TOCTOU without closing the hole).
+/// Guards the Settings input paths only — hb-net itself stays unguarded (the hb-it L2 harness
+/// legitimately dials a `ws://localhost` strfry).
+pub fn validate_relay_url(url: &str) -> Result<(), String> {
+    let parsed = nostr::Url::parse(url.trim()).map_err(|e| format!("Not a valid relay URL: {e}"))?;
+    match parsed.scheme() {
+        "ws" | "wss" => {}
+        other => return Err(format!("Relay URLs must start with ws:// or wss:// (got {other}://).")),
+    }
+    const PRIVATE: &str =
+        "This relay address points at a private/loopback network — enter a public relay URL.";
+    let host = parsed.host_str().ok_or_else(|| "The relay URL has no host.".to_string())?;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(v4) = bare.parse::<std::net::Ipv4Addr>() {
+        if ipv4_non_global(v4) {
+            return Err(PRIVATE.into());
+        }
+    } else if let Ok(v6) = bare.parse::<std::net::Ipv6Addr>() {
+        if ipv6_non_global(v6) {
+            return Err(PRIVATE.into());
+        }
+    } else {
+        let name = bare.trim_end_matches('.').to_ascii_lowercase();
+        if name == "localhost" || name.ends_with(".localhost") || name.ends_with(".local") {
+            return Err(PRIVATE.into());
+        }
+    }
+    Ok(())
+}
+
+fn ipv4_non_global(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation()
+        || (o[0] == 100 && (o[1] & 0xC0) == 64) // CGNAT 100.64.0.0/10 (chorus M13 #2)
+        || (o[0] == 198 && (o[1] & 0xFE) == 18) // benchmarking 198.18.0.0/15
+}
+
+fn ipv6_non_global(ip: std::net::Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return ipv4_non_global(v4);
+    }
+    let seg = ip.segments();
+    // Deprecated IPv4-compatible `::a.b.c.d` (::/96): judge the embedded v4 by its own class,
+    // exactly like the mapped form above (`::` and `::1` fall through to the checks below).
+    if seg[..6] == [0, 0, 0, 0, 0, 0] && !ip.is_loopback() && !ip.is_unspecified() {
+        if let Some(v4) = ip.to_ipv4() {
+            return ipv4_non_global(v4);
+        }
+    }
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_unique_local()
+        || ip.is_unicast_link_local()
+        || ip.is_multicast()
+        || (seg[0] == 0x2001 && seg[1] == 0xdb8) // documentation 2001:db8::/32
+}
+
 /// The seam over *building + introspecting* a relay pool, so the shared-client concurrency logic
 /// ([`get_or_connect`]) is unit-testable with a counting fake. Futures are `+ Send` (RPITIT) so
 /// `get_or_connect` stays `Send` inside Tauri command futures.
@@ -259,6 +330,102 @@ mod tests {
             .save_settings(&Settings { relay_urls: vec!["wss://my.relay".into()], ..Default::default() })
             .unwrap();
         assert_eq!(relay_urls(&store), vec!["wss://my.relay".to_string()]);
+    }
+
+    // ── The SSRF guard on user-supplied relay URLs (audit I-11) ─────────────────────────────────
+
+    #[test]
+    fn relay_url_guard_rejects_non_ws_schemes() {
+        for url in ["http://relay.damus.io", "https://relay.damus.io", "file:///etc/passwd", "ftp://1.2.3.4"] {
+            assert!(validate_relay_url(url).is_err(), "{url} must be rejected (not ws/wss)");
+        }
+        assert!(validate_relay_url("not a url at all").is_err(), "garbage must be rejected");
+    }
+
+    #[test]
+    fn relay_url_guard_rejects_loopback_and_localhost() {
+        for url in [
+            "ws://127.0.0.1:7777",
+            "ws://127.8.9.10",
+            "wss://localhost",
+            "ws://LOCALHOST:7777",
+            "ws://foo.localhost",
+            "ws://printer.local:7777",
+            "ws://0.0.0.0:7777",
+        ] {
+            let res = validate_relay_url(url);
+            assert!(res.is_err(), "{url} must be rejected");
+            let err = res.unwrap_err();
+            assert!(err.contains("private/loopback"), "error must be actionable, got: {err}");
+        }
+    }
+
+    #[test]
+    fn relay_url_guard_rejects_private_and_link_local_ranges() {
+        for url in [
+            "ws://10.0.0.5:7777",
+            "ws://172.16.0.1",
+            "ws://172.31.255.255:7777",
+            "ws://192.168.1.20:7777",
+            "ws://169.254.1.1",
+        ] {
+            assert!(validate_relay_url(url).is_err(), "{url} must be rejected (private/link-local)");
+        }
+        // The 172.16/12 boundary: outside the block is public.
+        assert!(validate_relay_url("ws://172.15.255.255:7777").is_ok());
+        assert!(validate_relay_url("ws://172.32.0.1:7777").is_ok());
+    }
+
+    #[test]
+    fn relay_url_guard_rejects_ipv6_forms() {
+        for url in [
+            "ws://[::1]:7777",
+            "wss://[::1]",
+            "ws://[fe80::1]:7777",
+            "ws://[fc00::1]",
+            "ws://[fd12:3456::1]:7777",
+            "ws://[::ffff:127.0.0.1]:7777",
+            "ws://[::ffff:10.0.0.5]",
+            "ws://[::]:7777",
+        ] {
+            assert!(validate_relay_url(url).is_err(), "{url} must be rejected (IPv6 non-global)");
+        }
+        assert!(validate_relay_url("wss://[2606:4700::6810:84e5]:443").is_ok(), "public IPv6 is fine");
+    }
+
+    #[test]
+    fn relay_url_guard_accepts_public_relays() {
+        for url in ["wss://relay.damus.io", "ws://8.8.8.8:7777", "wss://nos.lol/", "  wss://relay.primal.net  "] {
+            assert!(validate_relay_url(url).is_ok(), "{url} must pass the guard");
+        }
+    }
+
+    #[test]
+    fn relay_url_guard_rejects_the_chorus_flagged_edge_ranges() {
+        // Chorus M13 finding #2: non-global ranges beyond the audit's loopback/private/link-local
+        // wording. The guard's promise is "no non-public network", so cover the lot.
+        for url in [
+            "ws://100.64.1.5:7777",      // CGNAT 100.64.0.0/10
+            "ws://198.18.0.1:7777",      // benchmarking 198.18.0.0/15
+            "ws://224.0.0.1:7777",       // IPv4 multicast
+            "ws://255.255.255.255:7777", // broadcast
+            "ws://192.0.2.10:7777",      // documentation TEST-NET-1
+            "ws://[::10.0.0.5]:7777",    // deprecated IPv4-compatible embedding a private v4
+            "ws://[ff02::1]:7777",       // IPv6 multicast
+            "ws://[2001:db8::1]:7777",   // IPv6 documentation
+        ] {
+            assert!(validate_relay_url(url).is_err(), "{url} must be rejected");
+        }
+        // /10 boundary: 100.128.0.0 sits OUTSIDE CGNAT and is plain public space.
+        assert!(validate_relay_url("ws://100.128.0.1:7777").is_ok(), "just past the CGNAT /10 is public");
+    }
+
+    #[test]
+    fn default_relays_all_pass_the_ssrf_guard() {
+        // The guard must never brick the curated defaults — a fresh install rides these.
+        for r in DEFAULT_RELAYS.iter() {
+            assert!(validate_relay_url(r).is_ok(), "default relay {r} must pass the SSRF guard");
+        }
     }
 
     // ── The shared-client concurrency seam (chorus round-1: the riskiest code) ──────────────────

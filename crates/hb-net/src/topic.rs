@@ -6,7 +6,8 @@
 //!   is a relay read of announces (no registry).
 //! - **Membership** — replaceable per (topic_id, member-pseudonym); join = publish, leave = NIP-09
 //!   retract **signed under the derived pseudonym key** (B2), dissolution = empty roster (derived).
-//! - **Channel** — regular stored posts with a NIP-40 expiration; the read side filters >24h locally.
+//! - **Channel** — regular stored posts (+ M13 Part A member broadcasts, same kind, same 24h shape)
+//!   with a NIP-40 expiration; the read side filters >24h locally.
 //! - **Admission** — `member_count` is the **spoofable** tagged count (no key); `fetch_roster` /
 //!   `fetch_channel` need the key (members-only); private admission rides an invite (public-join is the
 //!   same seal to a name-derived keypair) or a request→approve NIP-17 DM.
@@ -15,8 +16,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use hb_core::topic::{
-    member_sign_keys, mint_invite, open_post, parse_announce, public_join_identity, redeem_invite,
-    roster, seal_membership, seal_post, NonceSet, Post, TopicKey, TopicMeta, KIND_TOPIC_ANNOUNCE,
+    member_sign_keys, mint_invite, open_channel_item, open_post, parse_announce,
+    public_join_identity, redeem_invite, roster, seal_announce, seal_membership, seal_post,
+    Announcement, ChannelItem, NonceSet, Post, TopicKey, TopicMeta, KIND_TOPIC_ANNOUNCE,
     KIND_TOPIC_MEMBER, KIND_TOPIC_POST,
 };
 use hb_core::Identity;
@@ -186,6 +188,25 @@ pub async fn post_to_channel(
     Ok(ev)
 }
 
+/// Broadcast an announce to the channel (M13 Part A): publish a sealed announce (signed on the wire
+/// under the derived pseudonym, carrying the author's real-key proof + a NIP-40 expiry) — the SAME
+/// kind + relay path as [`post_to_channel`], distinguished only by the ciphertext domain byte. The
+/// cooldown between two announces from the same member is pure arithmetic in `hb_core`
+/// (`announce_cooldown_remaining`); this crate does not enforce it — the timer + persisted
+/// `last_announce_at` live in hb-app (the crypto/relay seam stays a dumb pipe).
+pub async fn announce_to_topic(
+    client: &RelayClient,
+    key: &TopicKey,
+    topic_id: &str,
+    author: &Identity,
+    body: &str,
+    now: u64,
+) -> Result<Event, NetError> {
+    let ev = seal_announce(key, topic_id, author, body, now)?;
+    client.publish(&ev).await?;
+    Ok(ev)
+}
+
 /// Fetch the channel — `KIND_TOPIC_POST` for `topic_id`, opened with the key and **locally filtered to
 /// the last 24h** (Decision D: a non-compliant relay can't resurrect an expired post in the UI),
 /// newest first.
@@ -206,6 +227,54 @@ pub async fn fetch_channel(
     }
     posts.sort_by_key(|p| std::cmp::Reverse(p.ts));
     Ok(posts)
+}
+
+/// The channel read, split by item kind — both lists **newest-first**. Pure (no relay I/O), so it is
+/// directly L1-testable against a hand-built event list; [`fetch_channel_full`] is the relay-fetching
+/// wrapper around it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelRead {
+    pub posts: Vec<Post>,
+    pub announcements: Vec<Announcement>,
+}
+
+/// Partition a raw kind-1117 fetch into posts + announcements — one [`hb_core::open_channel_item`]
+/// per event (a single decrypt each), sorted newest-first. An event that doesn't open (wrong key,
+/// foreign junk, an unrecognised domain byte, or a >24h/future-skewed item) is silently excluded —
+/// the same "a reader ignores what it can't verify" posture as [`fetch_channel`], **not** an error (a
+/// channel is a best-effort stream, not a strict-parse feed).
+pub fn partition_channel_events(key: &TopicKey, events: &[Event], now: u64) -> ChannelRead {
+    let mut posts: Vec<Post> = Vec::new();
+    let mut announcements: Vec<Announcement> = Vec::new();
+    for ev in events {
+        if let Ok(Some(item)) = open_channel_item(key, ev, now) {
+            match item {
+                ChannelItem::Post(p) => posts.push(p),
+                ChannelItem::Announce(a) => announcements.push(a),
+            }
+        }
+    }
+    posts.sort_by_key(|p| std::cmp::Reverse(p.ts));
+    announcements.sort_by_key(|a| std::cmp::Reverse(a.ts));
+    ChannelRead { posts, announcements }
+}
+
+/// Fetch the full channel — one kind-1117 relay read, partitioned into posts + announcements via
+/// [`partition_channel_events`] (both **newest-first**, each locally filtered to the last 24h, same as
+/// [`fetch_channel`]). [`fetch_channel`] is kept exactly as-is for its existing callers: it silently
+/// skips an announce event (an announce ciphertext fails `open_post` on the domain byte), so an old
+/// reader stays blind to broadcasts rather than mis-rendering one as a post — that back-compat property
+/// still holds (M13 Part A introduces no new fetch path for `fetch_channel`'s existing callers).
+pub async fn fetch_channel_full(
+    client: &RelayClient,
+    topic_id: &str,
+    key: &TopicKey,
+    now: u64,
+    timeout: Duration,
+) -> Result<ChannelRead, NetError> {
+    let filter = Filter::new().kind(Kind::from_u16(KIND_TOPIC_POST)).identifier(topic_id.to_string());
+    let events = client.fetch(filter, timeout).await?;
+    Ok(partition_channel_events(key, &events, now))
 }
 
 // ── private admission: request → approve (NIP-17 DM) ─────────────────────────────────────────────
@@ -328,6 +397,7 @@ pub async fn join_public(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hb_core::new_topic;
 
     #[test]
     fn join_request_round_trips_through_the_dm_body() {
@@ -341,5 +411,43 @@ mod tests {
     fn a_plain_dm_is_not_a_join_request() {
         assert!(parse_join_request("hey, want to trade?").is_none());
         assert!(parse_join_request(r#"{"something_else":1}"#).is_none());
+    }
+
+    // ───────────────────────── M13 Part A: channel partition (pure, no relay) ─────────────────────
+
+    #[test]
+    fn fetch_channel_full_partitions_are_disjoint() {
+        let (meta, key) = new_topic("video/hbnet-announce-test", "", vec![], false).unwrap();
+        let author = Identity::generate();
+        let now = 1_700_000_000u64;
+        let post = seal_post(&key, &meta.topic_id, &author, "a post", now).unwrap();
+        let announce = seal_announce(&key, &meta.topic_id, &author, "an announce", now).unwrap();
+        let read = partition_channel_events(&key, &[post, announce], now);
+        assert_eq!(read.posts.len(), 1, "exactly one post");
+        assert_eq!(read.announcements.len(), 1, "exactly one announcement");
+        assert_eq!(read.posts[0].body, "a post");
+        assert_eq!(read.announcements[0].body, "an announce");
+    }
+
+    #[test]
+    fn channel_read_lists_sorted_newest_first() {
+        let (meta, key) = new_topic("video/hbnet-announce-sort", "", vec![], false).unwrap();
+        let author = Identity::generate();
+        let now = 1_700_000_000u64;
+        let p1 = seal_post(&key, &meta.topic_id, &author, "older post", now).unwrap();
+        let p2 = seal_post(&key, &meta.topic_id, &author, "newer post", now + 10).unwrap();
+        let a1 = seal_announce(&key, &meta.topic_id, &author, "older announce", now).unwrap();
+        let a2 = seal_announce(&key, &meta.topic_id, &author, "newer announce", now + 10).unwrap();
+        let read = partition_channel_events(&key, &[p1, a1, p2, a2], now + 10);
+        assert_eq!(
+            read.posts.iter().map(|p| p.body.as_str()).collect::<Vec<_>>(),
+            vec!["newer post", "older post"],
+            "posts are newest-first"
+        );
+        assert_eq!(
+            read.announcements.iter().map(|a| a.body.as_str()).collect::<Vec<_>>(),
+            vec!["newer announce", "older announce"],
+            "announcements are newest-first"
+        );
     }
 }

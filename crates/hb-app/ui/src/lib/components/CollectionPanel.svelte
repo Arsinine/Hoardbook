@@ -4,35 +4,40 @@
 	import { icons } from '$lib/icons.js';
 
 	export let collection: Collection;
-
-	let expanded = false;
+	/** Set false to suppress the built-in clickable header — used by CollectionRow (M13 W5), which
+	 *  renders its own compact header and just wants the listing tree underneath. */
+	export let header = true;
+	/** When `header` is false, the caller controls expansion directly via this prop. */
+	export let expanded = false;
 
 	$: fmt = collection.content_types?.[0] ?? '';
 </script>
 
 <div class="panel">
-	<button class="panel-header" on:click={() => (expanded = !expanded)}>
-		<div class="panel-left">
-			<div class="folder-icon">{@html icons.folder}</div>
-			<div class="panel-info">
-				<div class="panel-name">{collection.path_alias}</div>
-				<div class="panel-meta">
-					<span class="tnum">{collection.item_count.toLocaleString()} items</span>
-					{#if collection.est_size}
-						<span class="dot">·</span>
-						<span class="tnum">{collection.est_size}</span>
-					{/if}
-					{#if fmt}
-						<span class="dot">·</span>
-						<span class="mono-sm">{fmt}</span>
-					{/if}
+	{#if header}
+		<button class="panel-header" on:click={() => (expanded = !expanded)}>
+			<div class="panel-left">
+				<div class="folder-icon">{@html icons.folder}</div>
+				<div class="panel-info">
+					<div class="panel-name">{collection.path_alias}</div>
+					<div class="panel-meta">
+						<span class="tnum">{collection.item_count.toLocaleString()} items</span>
+						{#if collection.est_size}
+							<span class="dot">·</span>
+							<span class="tnum">{collection.est_size}</span>
+						{/if}
+						{#if fmt}
+							<span class="dot">·</span>
+							<span class="mono-sm">{fmt}</span>
+						{/if}
+					</div>
 				</div>
 			</div>
-		</div>
-		<div class="panel-right">
-			<span class="chevron" class:chevron-open={expanded}>{@html icons.chevronDown}</span>
-		</div>
-	</button>
+			<div class="panel-right">
+				<span class="chevron" class:chevron-open={expanded}>{@html icons.chevronDown}</span>
+			</div>
+		</button>
+	{/if}
 
 	{#if expanded}
 		<div class="panel-body">

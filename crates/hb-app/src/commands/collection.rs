@@ -3,11 +3,12 @@ use globset::{Glob, GlobSetBuilder};
 use hb_core::types::{Collection, DirectoryItem, ItemType, Visibility};
 use hb_core::{BrowseKey, Identity};
 use hb_net::publish_listing;
+use nostr::{Filter, Kind};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::{
-    commands::profile::compute_content_types,
+    commands::profile::{compute_content_types, teaser_from_profile},
     error::{CmdResult, cmd_err},
     net::{self, SharedRelay},
     store::DataStore,
@@ -402,24 +403,34 @@ pub(crate) async fn publish_collection_inner(
         let _ = store.save_snapshot_fingerprint(slug, &fp);
     }
 
-    // Keep a published teaser's content_types current.
-    if store.is_published("profile") {
-        if let Some(mut profile) = store.load_profile_draft().map_err(cmd_err)? {
-            profile.content_types = compute_content_types(store);
-            store.save_profile_draft(&profile).map_err(cmd_err)?;
-            let teaser = hb_core::event::Teaser {
-                display_name: profile.display_name.clone(),
-                bio: profile.bio.clone().unwrap_or_default(),
-                tags: profile.tags.clone(),
-                content_types: profile.content_types.clone(),
-            };
-            if let Ok(event) = hb_core::event::build_teaser(identity, &teaser) {
-                if let Ok(client) = net::client(identity, store, relay).await {
-                    let _ = client.publish(&event).await;
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        let _ = store.save_published("profile", &json);
-                    }
-                }
+    // Keep a published teaser's content_types/tags aggregation current (M13 W5 item 2 folds tags
+    // into the union too — see `refresh_published_teaser`).
+    refresh_published_teaser(store, identity, relay).await
+}
+
+/// If a profile teaser is currently published, recompute its content_types/tags aggregation and
+/// republish it. Shared by [`publish_collection_inner`] (a newly-published collection may add to
+/// the union) and `unpublish_collection_inner` (a departing collection may remove from it) — a
+/// no-op when no profile teaser is published.
+async fn refresh_published_teaser(
+    store: &DataStore,
+    identity: &Identity,
+    relay: &SharedRelay,
+) -> Result<(), String> {
+    if !store.is_published("profile") {
+        return Ok(());
+    }
+    let Some(mut profile) = store.load_profile_draft().map_err(cmd_err)? else {
+        return Ok(());
+    };
+    profile.content_types = compute_content_types(store);
+    store.save_profile_draft(&profile).map_err(cmd_err)?;
+    let teaser = teaser_from_profile(store, &profile);
+    if let Ok(event) = hb_core::event::build_teaser(identity, &teaser) {
+        if let Ok(client) = net::client(identity, store, relay).await {
+            let _ = client.publish(&event).await;
+            if let Ok(json) = serde_json::to_string(&event) {
+                let _ = store.save_published("profile", &json);
             }
         }
     }
@@ -465,9 +476,96 @@ pub async fn publish_collection(
     let (id_clone, browse_key) = {
         let guard = identity.read().await;
         let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
-        (id.identity.clone(), id.browse_key)
+        (id.identity.clone(), id.browse_key.clone())
     };
-    publish_collection_inner(&slug, &store, &id_clone, &browse_key, &relay).await
+    publish_collection_inner(&slug, &store, &id_clone, browse_key.bytes(), &relay).await
+}
+
+/// True iff a listing event's `d`-tag belongs to `slug`'s family — the index itself, or one of its
+/// split parts (`hb_net::split::split_listing`'s `slug#part{i}` convention: the tail after `#part`
+/// is a non-empty digit run, checked so a future `slug#part…`-rooted sidecar d-tag can't be swept
+/// into unpublish — chorus M13 #3). Pins the M13 W5 unpublish deletion-targeting choice (see
+/// `unpublish_collection_inner`'s doc comment): matched by `d`-tag at unpublish time rather than by
+/// a persisted event-id list.
+fn listing_dtag_belongs_to_slug(d: &str, slug: &str) -> bool {
+    if d == slug {
+        return true;
+    }
+    d.strip_prefix(slug)
+        .and_then(|rest| rest.strip_prefix("#part"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Unpublish a collection (spec §4 Unpublish): NIP-09 delete every relay event for a **Public**
+/// collection (best-effort — the index + every split part), drop the local published marker (which
+/// alone stops the watch's auto-republish: `evaluate_rescan` returns `Skipped("not published")`
+/// once `is_published` is false — `watch.rs` needs no change), and refresh the profile teaser when
+/// one is published (a departing collection must drop its content_types/tags from the union — M13
+/// W5 item 2, via [`refresh_published_teaser`]).
+///
+/// **Deletion-targeting design:** rather than changing the published marker to carry event ids
+/// (which would require `hb_net::browse::PublishedListing` to expose the signed events it builds —
+/// an `hb-net` API change outside this workstream's file ownership; today the marker carries only a
+/// part *count*), this queries the author's own `KIND_LISTING` events at unpublish time and matches
+/// them by `d`-tag ([`listing_dtag_belongs_to_slug`]), mirroring the exact family-grouping
+/// `hb_net::browse::fetch_listing` already does on the read side. This needs no `hb-net` change, and
+/// it also finds a listing published before this feature existed (no marker-format migration).
+///
+/// **Private collections**: a gift-wrapped (1059) event is authored by a fresh **ephemeral** key
+/// per recipient (M10) — this identity cannot produce a valid NIP-09 for it (a deletion request
+/// must be signed by the target event's own author). The private path is therefore local-only
+/// (marker drop only): an honest limit, not a bug.
+pub(crate) async fn unpublish_collection_inner(
+    slug: &str,
+    store: &DataStore,
+    identity: &Identity,
+    relay: &SharedRelay,
+) -> Result<(), String> {
+    let safe_slug = is_valid_slug(slug).then_some(slug).ok_or("Invalid collection slug")?;
+
+    let visibility = store
+        .load_collection_draft(safe_slug)
+        .map_err(cmd_err)?
+        .map(|c| c.visibility)
+        .unwrap_or(Visibility::Public);
+
+    if visibility == Visibility::Public {
+        if let Ok(client) = net::client(identity, store, relay).await {
+            let filter =
+                Filter::new().author(identity.public_key()).kind(Kind::from_u16(hb_core::event::KIND_LISTING));
+            if let Ok(events) = client.fetch(filter, net::RELAY_TIMEOUT).await {
+                for ev in events {
+                    let belongs = ev
+                        .tags
+                        .identifier()
+                        .map(|d| listing_dtag_belongs_to_slug(d, safe_slug))
+                        .unwrap_or(false);
+                    if belongs {
+                        if let Ok(deletion) = hb_net::build_deletion(identity, &ev) {
+                            let _ = client.publish(&deletion).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    store.delete_published(safe_slug).map_err(cmd_err)?;
+    refresh_published_teaser(store, identity, relay).await
+}
+
+#[tauri::command]
+pub async fn unpublish_collection(
+    slug: String,
+    store: State<'_, DataStore>,
+    identity: State<'_, SharedIdentity>,
+    relay: State<'_, SharedRelay>,
+) -> CmdResult<()> {
+    let id_clone = {
+        let guard = identity.read().await;
+        guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?.identity.clone()
+    };
+    unpublish_collection_inner(&slug, &store, &id_clone, &relay).await
 }
 
 /// Set a collection's visibility (Public / Private). The selector default is Public; a collection
@@ -1404,6 +1502,81 @@ mod tests {
         assert!(store.is_published("films"), "marker presence => published");
     }
 
+    // ── M13 W5 item 1: unpublish_collection ───────────────────────────────────────
+
+    /// Pins the deletion-targeting design choice documented on `unpublish_collection_inner`: a
+    /// listing family is matched by `d`-tag (the index itself, or a `slug#part{i}` split part), not
+    /// by a persisted event-id list. A different slug that merely shares a prefix must never match.
+    #[test]
+    fn unpublish_matches_listing_dtags_by_slug_and_part_prefix() {
+        assert!(listing_dtag_belongs_to_slug("films", "films"), "the index d-tag matches");
+        assert!(listing_dtag_belongs_to_slug("films#part0", "films"), "a split part matches");
+        assert!(listing_dtag_belongs_to_slug("films#part12", "films"));
+        assert!(!listing_dtag_belongs_to_slug("films-extra", "films"), "a different slug must not match");
+        assert!(!listing_dtag_belongs_to_slug("other", "films"));
+        // Chorus M13 finding #3: only a digits tail after `#part` is a split part — a raw prefix
+        // match would sweep any future `slug#part…`-rooted sidecar d-tag into unpublish.
+        assert!(!listing_dtag_belongs_to_slug("films#partition", "films"));
+        assert!(!listing_dtag_belongs_to_slug("films#part", "films"), "no bare #part");
+        assert!(!listing_dtag_belongs_to_slug("films#part1x", "films"));
+    }
+
+    /// A published **Public** collection: unpublishing must drop the local marker, which alone stops
+    /// the watch's auto-republish (`evaluate_rescan` skips once `is_published` is false — no
+    /// watch.rs change). The relay is configured to an unroutable local address so the best-effort
+    /// NIP-09 deletion attempt fails fast without touching a real relay — the wire side (whether a
+    /// compliant relay actually honours the deletion) is `hb-it` Suite BROWSE's job, same as
+    /// `publish_collection_inner` today; this test asserts the local effects only.
+    #[tokio::test]
+    async fn unpublish_public_collection_drops_marker_and_stops_republish() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        store
+            .save_settings(&crate::store::Settings {
+                relay_urls: vec!["ws://127.0.0.1:1".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        make_collection_draft(&store, "films", vec!["video".into()]);
+        store.save_published("films", r#"{"parts":1}"#).unwrap();
+        assert!(store.is_published("films"));
+
+        let identity = Identity::generate();
+        let relay = crate::net::new_shared();
+        unpublish_collection_inner("films", &store, &identity, &relay).await.unwrap();
+
+        assert!(!store.is_published("films"), "the published marker must be gone");
+        match crate::watch::evaluate_rescan("films", &store).unwrap() {
+            crate::watch::RescanDecision::Skipped(reason) => {
+                assert_eq!(reason, "not published", "the watch's gate gains nothing from watch.rs")
+            }
+            other => panic!("expected Skipped(\"not published\"), got {other:?}"),
+        }
+    }
+
+    /// A published **Private** collection: unpublishing must drop the local marker without ever
+    /// reaching `net::client` (gift-wrapped events are authored by ephemeral keys this identity
+    /// cannot NIP-09). No relay is configured — if the private path attempted a network deletion it
+    /// would fall back to the real `DEFAULT_RELAYS` and this test would attempt a live connection;
+    /// completing instantly with no such attempt is exactly what proves the "no network deletion"
+    /// contract.
+    #[tokio::test]
+    async fn unpublish_private_collection_drops_marker_without_network_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        make_collection_draft(&store, "vault", vec!["forbidden".into()]);
+        let mut col = store.load_collection_draft("vault").unwrap().unwrap();
+        col.visibility = Visibility::Private;
+        store.save_collection_draft(&col).unwrap();
+        store.save_published("vault", r#"{"private":true,"recipients":1}"#).unwrap();
+
+        let identity = Identity::generate();
+        let relay = crate::net::new_shared();
+        unpublish_collection_inner("vault", &store, &identity, &relay).await.unwrap();
+
+        assert!(!store.is_published("vault"), "the published marker must be gone");
+    }
+
     // ── M10: visibility + private-recipient gathering ────────────────────────────────
 
     #[test]
@@ -1441,6 +1614,7 @@ mod tests {
                 pubkeys: vec![a],
                 modified_at: chrono::Utc::now(),
                 trusted: false,
+                color: None,
             }])
             .unwrap();
         assert!(private_recipients(&store).is_err(), "an untrusted group is not a recipient set");
@@ -1460,12 +1634,14 @@ mod tests {
                     pubkeys: vec![a.npub(), b.npub(), "hb1_legacy_junk".into()],
                     modified_at: chrono::Utc::now(),
                     trusted: true,
+                    color: None,
                 },
                 crate::store::Group {
                     name: "also".into(),
                     pubkeys: vec![a.npub()], // duplicate of `a` across groups → collapsed
                     modified_at: chrono::Utc::now(),
                     trusted: true,
+                    color: None,
                 },
             ])
             .unwrap();

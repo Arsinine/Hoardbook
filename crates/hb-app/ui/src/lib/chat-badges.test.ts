@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { ReceivedMessage } from './types.js';
+import { requestBadge } from './request-inbox.js';
+import type { DmRequestView, ReceivedMessage } from './types.js';
 
 function makeMsg(from: string, sent_at: string): ReceivedMessage {
 	return { from, to: 'me', content: 'hello', sent_at };
@@ -59,5 +60,49 @@ describe('chat per-peer unread badge after remount', () => {
 		const unread = computeUnreadFixed(messages, ['hb1_alice', 'hb1_bob']);
 		expect(unread['hb1_alice']).toBe(0);
 		expect(unread['hb1_bob']).toBe(0);
+	});
+});
+
+// ── M13 Part B (Q7): strangers feed the Request model, never the conversation list ─────────────
+// Mirrors the page's new derivations: `allConversationPeers = [...$contacts]` (the old
+// inboxOnlyPeers stranger-merge is REMOVED — the backend's contact-only inbox means a stranger's
+// message can't even reach $inboxMessages), and the sidebar Requests row badge is
+// requestBadge($dmRequests).
+
+function conversationPeerIds(contacts: string[]): string[] {
+	// The page's contacts-only conversation list — no stranger merge path exists anymore.
+	return [...contacts];
+}
+
+function makeRequestBucket(npub: string): DmRequestView {
+	return {
+		npub,
+		first_seen: 0,
+		last_message_at: 0,
+		message_count: 1,
+		messages: [{ from: npub, to: 'me', content: 'hi', sent_at: '2026-01-01T10:00:00Z' }],
+	};
+}
+
+describe('chat conversation list vs Request inbox (Q7)', () => {
+	it('a stranger sender never produces a conversation-list row', () => {
+		const contacts = ['hb1_alice'];
+		const peers = conversationPeerIds(contacts);
+		expect(peers).not.toContain('hb1_stranger');
+		expect(peers).toEqual(['hb1_alice']);
+	});
+
+	it('a stranger sender surfaces as a Request badge instead', () => {
+		const requests = [makeRequestBucket('hb1_stranger')];
+		expect(requestBadge(requests)).toBe(1);
+	});
+
+	it('a stranger therefore never contributes an unread badge to the conversation list', () => {
+		// The stranger's messages live in the request bucket, not $inboxMessages — the unread
+		// derivation over the contacts-only peer list simply has no row to badge.
+		const contacts = ['hb1_alice'];
+		const contactMessages = [makeMsg('hb1_alice', '2026-01-01T10:00:00Z')];
+		const unread = computeUnreadFixed(contactMessages, conversationPeerIds(contacts));
+		expect(unread['hb1_stranger']).toBeUndefined();
 	});
 });

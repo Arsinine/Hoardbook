@@ -1,18 +1,16 @@
 <script lang="ts">
-	import { saveProfile, publishProfile, publishCollection, deleteCollection, updateCollectionMeta, updateCollectionVisibility, exportCollection, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec } from '$lib/api.js';
-	import { visibilityOf } from '$lib/private-collections-view.js';
-	import { toggleContentType } from '$lib/content-types.js';
-	import { get } from 'svelte/store';
+	import { saveProfile, publishProfile, publishCollection, unpublishCollection, deleteCollection, exportCollection, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec } from '$lib/api.js';
 	import { passphraseStrength } from '$lib/backup-export.js';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { profile, collections, identity, toast, appReady, homeDraft, identityLoadError } from '$lib/stores.js';
 	import { onMount } from 'svelte';
 	import { icons, socialIcons, avatarHue } from '$lib/icons.js';
-	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
 	import ScanDialog from '$lib/components/ScanDialog.svelte';
+	import AddCollectionModal from '$lib/components/AddCollectionModal.svelte';
+	import CollectionRow from '$lib/components/CollectionRow.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import HintMarker from '$lib/components/HintMarker.svelte';
-	import type { Collection, Profile, Visibility } from '$lib/types.js';
+	import type { Collection, Profile } from '$lib/types.js';
 
 	// Each language is shown in its own language (autonym).
 	const LANGUAGES = [
@@ -145,10 +143,15 @@
 	$: diskSize = totalBytes > 0 ? formatBytes(totalBytes) : '—';
 
 	// ── Regular state ────────────────────────────────────────────────────────────
+	// The Rescan flow reuses the plain ScanDialog directly (single step — the collection's details
+	// already exist). The Add-collection wizard (AddCollectionModal) owns the two-step Source→Details
+	// flow, and also reopens straight to Details for "Edit details".
 	let scanOpen = false;
-	let scanTitle = 'Add collection';
+	let scanTitle = 'Rescan collection';
 	let scanInitialPath = '';
 	let scanInitialAlias = '';
+	let addModalOpen = false;
+	let editTarget: Collection | null = null;
 	let saving = false;
 	let publishing = false;
 	let langInput = '';
@@ -156,18 +159,6 @@
 	let willingInput = '';
 
 	const WILLING_OPTIONS = ['seed', 'trade', 'upload', 'meet up'];
-
-	// Per-collection content-type declaration (HOARDBOOK_SPEC §4). Coarse, fixed enum; stored values
-	// are lowercase, labels are display-only. At least one must be selected before a collection can be
-	// published (gate: prepare_listing → "At least one content type is required").
-	const CONTENT_TYPES: { value: string; label: string }[] = [
-		{ value: 'video', label: 'Video' },
-		{ value: 'audio', label: 'Audio' },
-		{ value: 'image', label: 'Image' },
-		{ value: 'text', label: 'Text' },
-		{ value: 'software', label: 'Software' },
-		{ value: 'other', label: 'Other' },
-	];
 
 	function addTag(raw: string) {
 		const t = raw.trim().replace(/,$/, '').toLowerCase();
@@ -302,80 +293,13 @@
 		}
 	}
 
-	// ── Collection language / notes / sorted management ──────────────────────────
-	let colLangInputs: Record<string, string> = {};
-	let colNotes: Record<string, string> = {};
-	let colSorted: Record<string, boolean> = {};
-	let colVisibility: Record<string, Visibility> = {};
-	$: $collections.forEach(c => {
-		if (!(c.slug in colLangInputs)) colLangInputs[c.slug] = '';
-		if (!(c.slug in colNotes)) colNotes[c.slug] = c.description ?? '';
-		if (!(c.slug in colSorted)) colSorted[c.slug] = c.sorted ?? false;
-		if (!(c.slug in colVisibility)) colVisibility[c.slug] = visibilityOf(c);
-	});
-
-	// M10: switch a collection between Public (browse-key) and Private (per-trusted-npub sealed).
-	async function setColVisibility(slug: string, visibility: Visibility) {
-		colVisibility[slug] = visibility;
+	async function handleUnpublishCollection(slug: string) {
 		try {
-			await updateCollectionVisibility(slug, visibility);
-			collections.update(cols => cols.map(c => c.slug === slug ? { ...c, visibility } : c));
-		} catch (e) { toast(String(e), 'error'); }
-	}
-
-	async function saveColMeta(col: Collection) {
-		const slug = col.slug;
-		const desc = (colNotes[slug] ?? '').trim() || undefined;
-		const sorted = colSorted[slug] ?? false;
-		try {
-			await updateCollectionMeta(slug, desc, col.content_types, col.tags ?? [], col.languages ?? [], sorted);
-			collections.update(cols => cols.map(c =>
-				c.slug === slug ? { ...c, description: desc, sorted } : c
-			));
-		} catch (e) { toast(String(e), 'error'); }
-	}
-
-	async function addColLang(slug: string, langStr: string) {
-		const lang = langStr.trim();
-		if (!lang) return;
-		const col = $collections.find(c => c.slug === slug);
-		if (!col) return;
-		const langs = col.languages ?? [];
-		if (langs.includes(lang)) { colLangInputs[slug] = ''; return; }
-		const newLangs = [...langs, lang];
-		colLangInputs[slug] = '';
-		try {
-			await updateCollectionMeta(slug, col.description, col.content_types, col.tags ?? [], newLangs, colSorted[slug] ?? false);
-			collections.update(cols => cols.map(c => c.slug === slug ? { ...c, languages: newLangs } : c));
-		} catch (e) { toast(String(e), 'error'); }
-	}
-
-	async function removeColLang(slug: string, lang: string) {
-		const col = $collections.find(c => c.slug === slug);
-		if (!col) return;
-		const newLangs = (col.languages ?? []).filter(l => l !== lang);
-		try {
-			await updateCollectionMeta(slug, col.description, col.content_types, col.tags ?? [], newLangs, colSorted[slug] ?? false);
-			collections.update(cols => cols.map(c => c.slug === slug ? { ...c, languages: newLangs } : c));
-		} catch (e) { toast(String(e), 'error'); }
-	}
-
-	// Toggle a content type on a collection (§4 multi-select, OR logic). Persists via the same
-	// update_collection_meta seam, so the publish gate that reads content_types is now satisfiable.
-	// devtest 2026-06-25 #4: read the FRESHEST set from the store (not the stale per-row `col`) and
-	// update optimistically BEFORE awaiting the backend, so rapid multi-select no longer drops all
-	// but the last click (each click otherwise recomputed from the pre-click set and overwrote it).
-	async function toggleColContentType(col: Collection, value: string) {
-		const slug = col.slug;
-		const fresh = get(collections).find(c => c.slug === slug) ?? col;
-		const prev = fresh.content_types ?? [];
-		const next = toggleContentType(prev, value);
-		collections.update(cols => cols.map(c => c.slug === slug ? { ...c, content_types: next } : c));
-		try {
-			await updateCollectionMeta(slug, fresh.description, next, fresh.tags ?? [], fresh.languages ?? [], colSorted[slug] ?? false);
+			await unpublishCollection(slug);
+			collections.update(cols => cols.map(c => c.slug === slug ? { ...c, published: false } : c));
+			toast('Collection unpublished');
 		} catch (e) {
 			toast(String(e), 'error');
-			collections.update(cols => cols.map(c => c.slug === slug ? { ...c, content_types: prev } : c));
 		}
 	}
 
@@ -389,8 +313,9 @@
 		}
 	}
 
-	function onScanned(event: CustomEvent<Collection>) {
-		const col = event.detail;
+	// Add-or-update a collection in the store — shared by the scan result (Add/Rescan) and the
+	// wizard's Details step (Save draft / Publish), which each hand back a fresh Collection.
+	function mergeCollectionIntoStore(col: Collection) {
 		collections.update((cols) => {
 			const idx = cols.findIndex((c) => c.slug === col.slug);
 			if (idx >= 0) {
@@ -400,14 +325,29 @@
 			}
 			return [...cols, col];
 		});
-		toast(`Scanned "${col.path_alias}" — ${col.item_count} items`);
 	}
 
-	function openAddScan() {
-		scanTitle = 'Add collection';
-		scanInitialPath = '';
-		scanInitialAlias = '';
-		scanOpen = true;
+	function onScanned(event: CustomEvent<Collection>) {
+		mergeCollectionIntoStore(event.detail);
+		toast(`Scanned "${event.detail.path_alias}" — ${event.detail.item_count} items`);
+	}
+
+	// The Details step already toasts its own "saved"/"published" message — just sync the store.
+	function onWizardSaved(event: CustomEvent<Collection>) {
+		mergeCollectionIntoStore(event.detail);
+	}
+	function onWizardPublished(event: CustomEvent<Collection>) {
+		mergeCollectionIntoStore(event.detail);
+	}
+
+	function openAddModal() {
+		editTarget = null;
+		addModalOpen = true;
+	}
+
+	function openEditDetails(col: Collection) {
+		editTarget = col;
+		addModalOpen = true;
 	}
 
 	async function openRescan(col: Collection) {
@@ -451,10 +391,7 @@
 		form.languages = form.languages.filter((_, idx) => idx !== i);
 	}
 
-	let exportMenuSlug: string | null = null;
-
 	async function handleExport(slug: string, format: 'text' | 'markdown') {
-		exportMenuSlug = null;
 		try {
 			const text = await exportCollection(slug, format);
 			await navigator.clipboard.writeText(text);
@@ -560,7 +497,7 @@
 			{:else if obStep === 3}
 				<div class="ob-card-title">Add your first collection</div>
 				<div class="ob-card-sub">Point Hoardbook at a folder to catalog what you keep. You can scan more folders later from the home screen.</div>
-				<button class="btn-primary btn-full" on:click={() => { scanTitle = 'Add collection'; scanInitialPath = ''; scanInitialAlias = ''; scanOpen = true; obStep = 4; }}>
+				<button class="btn-primary btn-full" on:click={() => { openAddModal(); obStep = 4; }}>
 					{@html icons.folder} Scan a folder
 				</button>
 				<button class="btn-ghost btn-full ob-skip" on:click={() => obStep = 4}>
@@ -686,7 +623,7 @@
 				</div>
 
 				<div class="field">
-					<label class="field-label">Contact hint<HintMarker label="Contact hint" text="How people can reach you outside Hoardbook — a Reddit/Discord handle or an email. It is kept out of your public profile, and it's how followers re-find you if you ever lose your key." /></label>
+					<label class="field-label">Contact hint<HintMarker label="Contact hint" text="How people can reach you outside Hoardbook — a Reddit/Discord handle or an email. It is kept out of your public profile, and how your contacts re-find you if you ever lose your key." /></label>
 					<input class="hb-input hb-input-mono" type="text" placeholder="u/you on Reddit · you@example.com" bind:value={form.contact_hint} />
 				</div>
 
@@ -774,7 +711,7 @@
 					<div class="coll-title">Collections</div>
 					<div class="coll-sub">{$collections.filter(c => c.published).length} of {$collections.length} published · {totalItems.toLocaleString()} items</div>
 				</div>
-				<button class="btn-add" on:click={openAddScan}>
+				<button class="btn-add" on:click={openAddModal}>
 					<span>{@html icons.plus}</span>Add collection
 				</button>
 			</div>
@@ -800,94 +737,15 @@
 					<div class="empty">No collections yet. Click "Add collection" to scan a folder.</div>
 				{:else}
 					{#each $collections as col (col.slug)}
-						<CollectionPanel collection={col}>
-							<!-- Content types (§4): at least one required before publishing -->
-							<div class="coll-ct-row">
-								<span class="coll-ct-label">Content types<HintMarker label="Content types" text="Broad categories used in search filters. Pick at least one to publish; a mixed archive can declare several." /></span>
-								<div class="ct-toggle-row">
-									{#each CONTENT_TYPES as ct (ct.value)}
-										<button
-											class="willing-btn"
-											class:willing-active={(col.content_types ?? []).includes(ct.value)}
-											on:click={() => toggleColContentType(col, ct.value)}
-										>{ct.label}</button>
-									{/each}
-								</div>
-								{#if (col.content_types ?? []).length === 0}
-									<div class="ct-warn">Select at least one content type to publish this collection.</div>
-								{/if}
-							</div>
-							<!-- Language tags -->
-							<div class="coll-lang-row">
-								{#each (col.languages ?? []) as lang (lang)}
-									<span class="lang-tag">
-										{lang}
-										<button class="lang-x" on:click={() => removeColLang(col.slug, lang)} title="Remove">×</button>
-									</span>
-								{/each}
-								<input
-									class="lang-input lang-input-sm"
-									type="text"
-									placeholder="+ language"
-									bind:value={colLangInputs[col.slug]}
-									on:keydown={(e) => {
-										if (e.key === 'Enter' || e.key === ',') {
-											e.preventDefault();
-											addColLang(col.slug, colLangInputs[col.slug] ?? '');
-										}
-									}}
-								/>
-							</div>
-							<!-- Notes + sorted + visibility. Visibility (M10) and Sorted (#7) are compact
-							     checkboxes here to cut clutter (devtest 2026-06-25 #8) — the old Visibility
-							     dropdown is gone; the "what Private means" copy moved to the tooltip. -->
-							<div class="coll-notes-row">
-								<textarea
-									class="coll-notes-input"
-									rows="2"
-									placeholder="Add notes about this collection (visible to peers)…"
-									bind:value={colNotes[col.slug]}
-									on:blur={() => saveColMeta(col)}
-								></textarea>
-								<div class="coll-toggles">
-									<label class="sorted-label">
-										<input
-											type="checkbox"
-											class="sorted-check"
-											bind:checked={colSorted[col.slug]}
-											on:change={() => saveColMeta(col)}
-										/>
-										Sorted<HintMarker label="Sorted" text="Marks this collection as organised and curated rather than a raw dump. Shown as a badge to people browsing your listing." />
-									</label>
-									<label class="sorted-label">
-										<input
-											type="checkbox"
-											class="sorted-check"
-											checked={(colVisibility[col.slug] ?? 'Public') === 'Private'}
-											on:change={(e) => setColVisibility(col.slug, e.currentTarget.checked ? 'Private' : 'Public')}
-										/>
-										Private<HintMarker label="Private" text="Only contacts in your trusted groups can open this collection — it is encrypted to each of them personally, so your share code alone won't open it. Not DRM: a trusted contact can still copy what they decrypt." />
-									</label>
-								</div>
-							</div>
-							<div class="coll-actions">
-								{#if !col.published}
-									<span class="draft-badge">Draft</span>
-								{/if}
-								<button class="btn-ghost btn-sm" on:click={() => openRescan(col)}>Rescan</button>
-								<div class="export-wrap">
-									<button class="btn-ghost btn-sm" on:click={() => exportMenuSlug = exportMenuSlug === col.slug ? null : col.slug}>Export ▾</button>
-									{#if exportMenuSlug === col.slug}
-										<div class="export-menu">
-											<button class="export-item" on:click={() => handleExport(col.slug, 'text')}>Plain text</button>
-											<button class="export-item" on:click={() => handleExport(col.slug, 'markdown')}>Markdown checklist</button>
-										</div>
-									{/if}
-								</div>
-								<button class="btn-ghost btn-sm" on:click={() => handlePublishCollection(col.slug)}>Publish</button>
-								<button class="btn-ghost btn-sm btn-danger-ghost" on:click={() => handleDeleteCollection(col.slug)}>Remove</button>
-							</div>
-						</CollectionPanel>
+						<CollectionRow
+							collection={col}
+							on:rescan={() => openRescan(col)}
+							on:edit={() => openEditDetails(col)}
+							on:publish={() => handlePublishCollection(col.slug)}
+							on:unpublish={() => handleUnpublishCollection(col.slug)}
+							on:remove={() => handleDeleteCollection(col.slug)}
+							on:export={(e) => handleExport(e.detail.slug, e.detail.format)}
+						/>
 					{/each}
 				{/if}
 			</div>
@@ -895,6 +753,7 @@
 	</div>
 
 	<ScanDialog bind:open={scanOpen} title={scanTitle} initialPath={scanInitialPath} initialAlias={scanInitialAlias} on:scanned={onScanned} />
+	<AddCollectionModal bind:open={addModalOpen} editCollection={editTarget} on:scanned={onScanned} on:saved={onWizardSaved} on:published={onWizardPublished} />
 {/if}
 
 <style>
@@ -1230,138 +1089,6 @@
 
 	.coll-list { display: flex; flex-direction: column; gap: 10px; }
 
-	.coll-ct-row {
-		padding: 6px 10px 4px;
-		border-top: 1px solid var(--divider);
-	}
-
-	.coll-ct-label {
-		display: inline-flex;
-		align-items: center;
-		font-size: 11px;
-		color: var(--fg-dim);
-		margin-bottom: 4px;
-	}
-
-	.ct-toggle-row {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 6px;
-	}
-
-	.ct-warn {
-		font-size: 11px;
-		color: var(--error, #e05c5c);
-		margin-top: 4px;
-	}
-
-	.coll-lang-row {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 4px;
-		padding: 6px 10px 4px;
-		border-top: 1px solid var(--divider);
-		align-items: center;
-	}
-
-	.lang-input-sm {
-		height: 22px;
-		padding: 0 7px;
-		font-size: 11px;
-		min-width: 80px;
-	}
-
-	.coll-notes-row {
-		display: flex;
-		gap: 8px;
-		padding: 6px 10px;
-		border-top: 1px solid var(--divider);
-		align-items: flex-start;
-	}
-
-	.coll-toggles {
-		display: flex;
-		flex-direction: column;
-		gap: 6px;
-		flex-shrink: 0;
-	}
-
-	.coll-notes-input {
-		flex: 1;
-		background: transparent;
-		border: none;
-		outline: none;
-		font-family: var(--font-ui);
-		font-size: 11.5px;
-		color: var(--fg);
-		resize: none;
-		line-height: 1.5;
-		padding: 0;
-	}
-	.coll-notes-input::placeholder { color: var(--fg-dim); }
-
-	.sorted-label {
-		display: flex;
-		align-items: center;
-		gap: 5px;
-		font-size: 11px;
-		color: var(--fg-muted);
-		cursor: pointer;
-		flex-shrink: 0;
-		padding-top: 2px;
-		white-space: nowrap;
-	}
-
-	.sorted-check {
-		accent-color: var(--accent);
-		width: 13px;
-		height: 13px;
-		cursor: pointer;
-	}
-
-	.coll-actions {
-		display: flex;
-		gap: 4px;
-		padding: 8px 10px;
-		border-top: 1px solid var(--divider);
-		align-items: center;
-	}
-
-	.draft-badge {
-		font-size: 10px;
-		font-weight: 700;
-		text-transform: uppercase;
-		letter-spacing: 0.8px;
-		color: oklch(0.75 0.14 60);
-		background: oklch(0.25 0.06 60);
-		border: 1px solid oklch(0.45 0.10 60 / 0.4);
-		border-radius: 4px;
-		padding: 1px 6px;
-		flex-shrink: 0;
-	}
-
-	.export-wrap { position: relative; }
-
-	.export-menu {
-		position: absolute;
-		top: calc(100% + 4px);
-		left: 0;
-		background: var(--bg-elev2);
-		border: 1px solid var(--border);
-		border-radius: 7px;
-		overflow: hidden;
-		z-index: 50;
-		box-shadow: 0 8px 24px oklch(0 0 0 / 0.25);
-		min-width: 160px;
-	}
-
-	.export-item {
-		display: block; width: 100%; text-align: left;
-		padding: 7px 12px; font-size: 12.5px; font-family: var(--font-ui);
-		background: transparent; border: none; cursor: pointer; color: var(--fg);
-	}
-	.export-item:hover { background: var(--bg-elev3); }
-
 	.empty { color: var(--fg-dim); font-size: 12.5px; text-align: center; padding: 32px 0; }
 
 	/* Shared */
@@ -1570,9 +1297,6 @@
 	}
 
 	.btn-ghost:disabled { opacity: 0.5; cursor: not-allowed; }
-
-	.btn-danger-ghost { color: var(--error, #e05c5c); }
-	.btn-danger-ghost:hover { background: color-mix(in oklch, var(--error, #e05c5c) 10%, transparent); }
 
 	.btn-sm { padding: 5px 11px; font-size: 12px; height: 28px; }
 

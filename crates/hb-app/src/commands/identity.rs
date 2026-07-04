@@ -250,7 +250,7 @@ mod tests {
         assert!(info.npub.starts_with("npub1"));
         assert!(info.share_code.starts_with("hbk1"));
         // The browse-key is NOT exposed as raw bytes (only via the hbk share code).
-        assert!(!info.share_code.contains(&hex::encode(id.browse_key)),
+        assert!(!info.share_code.contains(&hex::encode(id.browse_key.bytes())),
             "raw browse-key bytes must never appear in the surfaced info");
     }
 
@@ -301,6 +301,6 @@ mod tests {
         let nsec = nsec_of(&source);
         let imported = AppIdentity::from_nsec(&nsec).unwrap();
         assert_eq!(imported.npub(), source.npub());
-        assert_ne!(imported.browse_key, source.browse_key, "fresh browse-key");
+        assert_ne!(imported.browse_key.bytes(), source.browse_key.bytes(), "fresh browse-key");
     }
 }

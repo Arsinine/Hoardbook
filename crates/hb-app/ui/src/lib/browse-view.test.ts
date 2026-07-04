@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
 	availabilityBadge,
+	collectionAvailability,
 	dedupAndCap,
 	flattenTree,
 	type RenderedListing,
@@ -32,6 +33,20 @@ describe('browse-view — K of N availability badge', () => {
 	it('reports "K of N folders available" when parts are missing', () => {
 		const partial: RenderedListing = { entries: [], partsTotal: 3, partsPresent: 2, missing: [2] };
 		expect(availabilityBadge(partial)).toBe('2 of 3 folders available');
+	});
+});
+
+describe('browse-view — collection K of N availability (M13 HANDOVER gap #5)', () => {
+	it('reports "K of N folders available" when a peer collection is partial', () => {
+		expect(collectionAvailability({ parts_total: 5, parts_present: 3 })).toBe('3 of 5 folders available');
+	});
+
+	it('returns null when a peer collection is complete', () => {
+		expect(collectionAvailability({ parts_total: 5, parts_present: 5 })).toBeNull();
+	});
+
+	it('returns null when parts info is absent (a pre-M13 cached collection)', () => {
+		expect(collectionAvailability({})).toBeNull();
 	});
 });
 
