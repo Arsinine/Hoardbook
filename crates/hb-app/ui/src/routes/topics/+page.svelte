@@ -23,43 +23,43 @@
 	// Redesign (devtest 2026-06-25 #9): master–detail (My Topics list ↔ selected-topic detail),
 	// Create as a modal + Discover as a tab (forms are no longer always-on stacked cards), and the
 	// chat channel is a deep-link (its content lives in Chat since M11). Owner-chosen layout.
-	let tab: 'mine' | 'discover' = 'mine';
-	let createOpen = false;
+	let tab: 'mine' | 'discover' = $state('mine');
+	let createOpen = $state(false);
 
-	let mine: TopicView[] = [];
-	let discovered: DiscoveredTopic[] = [];
-	let busy = false;
+	let mine: TopicView[] = $state([]);
+	let discovered: DiscoveredTopic[] = $state([]);
+	let busy = $state(false);
 
 	// Create form. W4: a PUBLIC Topic is a category root (picker — a bad root is unrepresentable) + a
 	// freeform sub-path (e.g. video / animation/anime). A PRIVATE Topic keeps a freeform name.
-	let newRoot: string = TOPIC_ROOTS[0];
-	let newSubPath = '';
-	let newName = ''; // private (freeform) name
-	let newDesc = '';
-	let newTags = '';
-	let newPrivate = false;
+	let newRoot: string = $state(TOPIC_ROOTS[0]);
+	let newSubPath = $state('');
+	let newName = $state(''); // private (freeform) name
+	let newDesc = $state('');
+	let newTags = $state('');
+	let newPrivate = $state(false);
 	// The composed public path, previewed under the inputs.
-	$: composedPublicName = composeTopicPath(newRoot, newSubPath);
-	$: discoveredTree = groupTopicsByRoot(discovered);
+	let composedPublicName = $derived(composeTopicPath(newRoot, newSubPath));
+	let discoveredTree = $derived(groupTopicsByRoot(discovered));
 
 	// Discover
-	let searchTags = '';
+	let searchTags = $state('');
 
 	// The consent gate: which Topic (public name + private flag) is pending a join.
-	let pendingJoin: { name: string; isPrivate: boolean } | null = null;
+	let pendingJoin: { name: string; isPrivate: boolean } | null = $state(null);
 
 	// Open Topic (roster + invite). The 24h channel now lives in Chat (a persistent channel entry per
 	// joined Topic); posting moved there, so this panel keeps only membership management.
-	let openTopic: TopicView | null = null;
-	let roster: string[] = [];
-	let inviteNpub = '';
+	let openTopic: TopicView | null = $state(null);
+	let roster: string[] = $state([]);
+	let inviteNpub = $state('');
 
 	// M13 Part A (Q1) — this page only SENDS an announce; the announce list itself renders in the Chat
 	// topic thread. `announceRemaining` seeds from the backend on open() and ticks down locally every
 	// 60s (a coarse local countdown only — a rejection re-syncs it from the authoritative backend).
-	let announceBody = '';
-	let announceRemaining = 0;
-	let announcing = false;
+	let announceBody = $state('');
+	let announceRemaining = $state(0);
+	let announcing = $state(false);
 	let announceTicker: ReturnType<typeof setInterval> | undefined;
 
 	onDestroy(() => { if (announceTicker) clearInterval(announceTicker); });
@@ -100,8 +100,8 @@
 	onMount(loadMine);
 
 	// The effective name to create: a freeform private name, or the composed category path for public.
-	$: createName = newPrivate ? newName.trim() : composedPublicName;
-	$: canCreate = newPrivate ? newName.trim().length > 0 : composedPublicName.length > 0;
+	let createName = $derived(newPrivate ? newName.trim() : composedPublicName);
+	let canCreate = $derived(newPrivate ? newName.trim().length > 0 : composedPublicName.length > 0);
 
 	async function create() {
 		if (!canCreate) return;
@@ -231,10 +231,10 @@
 		<h1>Topics</h1>
 		<div class="header-actions">
 			<div class="tabs">
-				<button class="tab" class:tab-active={tab === 'mine'} on:click={() => (tab = 'mine')}>My Topics</button>
-				<button class="tab" class:tab-active={tab === 'discover'} on:click={() => (tab = 'discover')}>Discover</button>
+				<button class="tab" class:tab-active={tab === 'mine'} onclick={() => (tab = 'mine')}>My Topics</button>
+				<button class="tab" class:tab-active={tab === 'discover'} onclick={() => (tab = 'discover')}>Discover</button>
 			</div>
-			<button class="btn-primary" on:click={() => (createOpen = true)}>+ New Topic</button>
+			<button class="btn-primary" onclick={() => (createOpen = true)}>+ New Topic</button>
 		</div>
 	</header>
 
@@ -246,7 +246,7 @@
 					<p class="muted empty">You haven’t joined any Topics yet. Create one, or switch to Discover.</p>
 				{:else}
 					{#each mine as t (t.topic_id)}
-						<button class="topic-row" class:topic-selected={openTopic?.topic_id === t.topic_id} on:click={() => open(t)}>
+						<button class="topic-row" class:topic-selected={openTopic?.topic_id === t.topic_id} onclick={() => open(t)}>
 							<div class="grow">
 								<div class="name">{t.name} {#if t.private}<span class="tag">private</span>{/if}</div>
 								{#if t.description}<div class="muted">{t.description}</div>{/if}
@@ -264,7 +264,7 @@
 							<div class="detail-title">{openTopic.name} {#if openTopic.private}<span class="tag">private</span>{/if}</div>
 							{#if openTopic.description}<div class="muted">{openTopic.description}</div>{/if}
 						</div>
-						<ConfirmButton label="Leave" confirmText="Leave this Topic?" on:confirm={() => openTopic && leave(openTopic)} />
+						<ConfirmButton label="Leave" confirmText="Leave this Topic?" onconfirm={() => openTopic && leave(openTopic)} />
 					</div>
 
 					<div class="detail-section">
@@ -276,7 +276,7 @@
 
 					<div class="invite">
 						<input placeholder="invite an npub…" bind:value={inviteNpub} />
-						<button on:click={invite}>Invite</button>
+						<button onclick={invite}>Invite</button>
 					</div>
 
 					<!-- M13 Part A (Q1) — sends only; the announce itself renders in the Chat topic thread. -->
@@ -290,13 +290,13 @@
 								class="grow"
 								placeholder="a highlighted notice for all members…"
 								bind:value={announceBody}
-								on:keydown={(e) => e.key === 'Enter' && sendAnnounce()}
+								onkeydown={(e) => e.key === 'Enter' && sendAnnounce()}
 								disabled={!canAnnounce(announceRemaining) || announcing}
 							/>
 							<button
 								class="btn-primary"
 								disabled={!announceBody.trim() || !canAnnounce(announceRemaining) || announcing}
-								on:click={sendAnnounce}
+								onclick={sendAnnounce}
 							>
 								{announcing ? '…' : cooldownLabel(announceRemaining)}
 							</button>
@@ -313,8 +313,8 @@
 		<!-- Discover tab -->
 		<section class="discover-tab">
 			<div class="discover-controls">
-				<input class="grow" placeholder="search tags, comma-separated" bind:value={searchTags} on:keydown={(e) => e.key === 'Enter' && discover()} />
-				<button class="btn-primary" disabled={busy} on:click={discover}>Discover</button>
+				<input class="grow" placeholder="search tags, comma-separated" bind:value={searchTags} onkeydown={(e) => e.key === 'Enter' && discover()} />
+				<button class="btn-primary" disabled={busy} onclick={discover}>Discover</button>
 			</div>
 			<!-- W4: results render as a tree split on '/' (root category → sub-paths), activity-ranked
 			     within each root by the backend. -->
@@ -329,20 +329,20 @@
 								<div class="name">{subPathLabel(d.name) || d.name}</div>
 								<div class="muted">{memberCountLabel(d.member_count_estimate)}</div>
 							</div>
-							<button on:click={() => askToJoin(d.name, false)}>Join</button>
+							<button onclick={() => askToJoin(d.name, false)}>Join</button>
 						</div>
 					{/each}
 				{/each}
 			{/if}
-			<button class="link" disabled={busy} on:click={redeemInvite}>Redeem a private Topic invite</button>
+			<button class="link" disabled={busy} onclick={redeemInvite}>Redeem a private Topic invite</button>
 		</section>
 	{/if}
 </div>
 
 <!-- Create-a-Topic modal (devtest #9: was an always-on card; now invoked from "+ New Topic"). -->
 {#if createOpen}
-	<!-- svelte-ignore a11y-no-static-element-interactions a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-	<div class="modal-backdrop" role="dialog" aria-modal="true" aria-label="Create a Topic" on:click={(e) => { if (e.target === e.currentTarget) createOpen = false; }}>
+	<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
+	<div class="modal-backdrop" role="dialog" aria-modal="true" aria-label="Create a Topic" tabindex="-1" onclick={(e) => { if (e.target === e.currentTarget) createOpen = false; }}>
 		<div class="modal">
 			<h2>New Topic</h2>
 			{#if newPrivate}
@@ -363,8 +363,8 @@
 			<input placeholder="tags, comma-separated" bind:value={newTags} />
 			<label class="check"><input type="checkbox" bind:checked={newPrivate} /> Private (unlisted)</label>
 			<div class="modal-actions">
-				<button class="ghost" on:click={() => (createOpen = false)}>Cancel</button>
-				<button class="btn-primary" disabled={busy || !canCreate} on:click={create}>Create</button>
+				<button class="ghost" onclick={() => (createOpen = false)}>Cancel</button>
+				<button class="btn-primary" disabled={busy || !canCreate} onclick={create}>Create</button>
 			</div>
 		</div>
 	</div>
@@ -372,21 +372,22 @@
 
 <!-- F12 consent gate: a join (public or private) fires only after explicit acknowledgment. -->
 {#if pendingJoin}
-	<!-- svelte-ignore a11y-no-static-element-interactions a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
+	<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
 	<div
 		class="modal-backdrop"
 		role="dialog"
 		aria-modal="true"
 		aria-label="Join Topic consent"
-		on:click={(e) => { if (e.target === e.currentTarget) pendingJoin = null; }}
+		tabindex="-1"
+		onclick={(e) => { if (e.target === e.currentTarget) pendingJoin = null; }}
 	>
 		<div class="modal">
 			<h2>Join “{pendingJoin.name}”</h2>
 			<TopicJoinConsent
 				isPrivate={pendingJoin.isPrivate}
 				disabled={busy}
-				on:join={confirmJoin}
-				on:cancel={() => (pendingJoin = null)}
+				onjoin={confirmJoin}
+				oncancel={() => (pendingJoin = null)}
 			/>
 		</div>
 	</div>

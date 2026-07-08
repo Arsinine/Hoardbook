@@ -10,8 +10,13 @@
 	import Avatar from '$lib/components/Avatar.svelte';
 	import { getVersion } from '@tauri-apps/api/app';
 	import { NAV_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
+	interface Props {
+		children?: import('svelte').Snippet;
+	}
 
-	let appVersion = '';
+	let { children }: Props = $props();
+
+	let appVersion = $state('');
 
 	// Module-level set: persists across page navigation (layout never remounts in SvelteKit).
 	const seenLayoutKeys = new Set<string>();
@@ -93,11 +98,11 @@
 		{ href: '/settings', label: 'Settings' },
 	];
 
-	$: currentPath = $page.url.pathname;
-	$: idName = $profile?.display_name ?? 'You';
-	$: idInitial = idName[0]?.toUpperCase() ?? 'Y';
-	$: idShort = $identity ? $identity.npub.slice(0, 8) + '…' + $identity.npub.slice(-4) : '';
-	$: idHue = avatarHue(idInitial);
+	let currentPath = $derived($page.url.pathname);
+	let idName = $derived($profile?.display_name ?? 'You');
+	let idInitial = $derived(idName[0]?.toUpperCase() ?? 'Y');
+	let idShort = $derived($identity ? $identity.npub.slice(0, 8) + '…' + $identity.npub.slice(-4) : '');
+	let idHue = $derived(avatarHue(idInitial));
 </script>
 
 <div class="frame">
@@ -126,7 +131,7 @@
 			</a>
 		{/each}
 
-		<div style="flex:1" />
+		<div style="flex:1"></div>
 
 		<!-- Identity card -->
 		{#if $identity}
@@ -146,7 +151,7 @@
 
 	<!-- Main -->
 	<div class="main">
-		<slot />
+		{@render children?.()}
 	</div>
 </div>
 

@@ -2,51 +2,55 @@
 	// Petname + group dialog shown at contact-add time (M13 W5 Slice 2) — wired into the Contacts
 	// lookup follow, Contacts discovery follow, and the Chat request-accept flow. `displayName` seeds
 	// the petname (editable); "Skip" adds the contact with the auto-derived petname and no group.
-	import { createEventDispatcher } from 'svelte';
 	import type { Group } from '../types.js';
 
-	export let open = false;
-	/** The peer's own announced display name — seeds the petname suggestion (editable). */
-	export let displayName = '';
-	export let groups: Group[] = [];
-
-	const dispatch = createEventDispatcher<{
-		save: { petname: string; group: string | null };
-		skip: void;
-		newGroup: void;
-		cancel: void;
-	}>();
-
-	let petname = '';
-	let groupName = '';
-
-	// Reseed whenever the dialog transitions closed→open, for whichever peer it's being shown for.
-	let wasOpen = false;
-	$: if (open && !wasOpen) {
-		wasOpen = true;
-		petname = displayName;
-		groupName = '';
-	} else if (!open && wasOpen) {
-		wasOpen = false;
+	interface Props {
+		open?: boolean;
+		/** The peer's own announced display name — seeds the petname suggestion (editable). */
+		displayName?: string;
+		groups?: Group[];
+		onsave?: (detail: { petname: string; group: string | null }) => void;
+		onskip?: () => void;
+		onnewGroup?: () => void;
+		oncancel?: () => void;
 	}
 
+	let { open = false, displayName = '', groups = [], onsave, onskip, onnewGroup, oncancel }: Props = $props();
+
+	let petname = $state('');
+	let groupName = $state('');
+
+	// Reseed whenever the dialog transitions closed→open, for whichever peer it's being shown for.
+	// Not reactive on purpose — a plain transition-edge flag, never read by the template, so it
+	// mustn't be part of the effect's own dependency tracking (avoids a self-triggering effect).
+	let wasOpen = false;
+	$effect(() => {
+		if (open && !wasOpen) {
+			wasOpen = true;
+			petname = displayName;
+			groupName = '';
+		} else if (!open && wasOpen) {
+			wasOpen = false;
+		}
+	});
+
 	function save() {
-		dispatch('save', { petname: petname.trim() || displayName, group: groupName || null });
+		onsave?.({ petname: petname.trim() || displayName, group: groupName || null });
 	}
 
 	function skip() {
-		dispatch('skip');
+		onskip?.();
 	}
 </script>
 
 {#if open}
-	<!-- svelte-ignore a11y-no-static-element-interactions a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-	<div class="modal-backdrop" role="dialog" aria-modal="true" aria-label="Add contact" on:click={(e) => { if (e.target === e.currentTarget) dispatch('cancel'); }}>
+	<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
+	<div class="modal-backdrop" role="dialog" aria-modal="true" aria-label="Add contact" tabindex="-1" onclick={(e) => { if (e.target === e.currentTarget) oncancel?.(); }}>
 		<div class="modal">
 			<h2>Add contact</h2>
 			<div class="field">
 				<label for="acd-petname">Petname</label>
-				<input id="acd-petname" type="text" bind:value={petname} placeholder="A nickname only you see" on:keydown={(e) => e.key === 'Enter' && save()} />
+				<input id="acd-petname" type="text" bind:value={petname} placeholder="A nickname only you see" onkeydown={(e) => e.key === 'Enter' && save()} />
 			</div>
 			<div class="group-row">
 				<span class="group-label">Add to group:</span>
@@ -56,11 +60,11 @@
 						<option value={g.name}>{g.name}</option>
 					{/each}
 				</select>
-				<button type="button" class="link" on:click={() => dispatch('newGroup')}>+ New group</button>
+				<button type="button" class="link" onclick={() => onnewGroup?.()}>+ New group</button>
 			</div>
 			<div class="modal-actions">
-				<button type="button" class="ghost" on:click={skip}>Skip</button>
-				<button type="button" class="btn-primary" on:click={save}>Add contact</button>
+				<button type="button" class="ghost" onclick={skip}>Skip</button>
+				<button type="button" class="btn-primary" onclick={save}>Add contact</button>
 			</div>
 		</div>
 	</div>

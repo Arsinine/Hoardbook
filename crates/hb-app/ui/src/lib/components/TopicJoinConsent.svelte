@@ -1,25 +1,29 @@
 <script lang="ts">
-	import { createEventDispatcher } from 'svelte';
 	import { joinConsentCopy, NO_UNLOCK_NOTE } from '../topics-view.js';
 
-	/** Whether the Topic being joined is private (durable members-only record) or public. */
-	export let isPrivate = false;
-	/** Disable while a join is in flight. */
-	export let disabled = false;
+	interface Props {
+		/** Whether the Topic being joined is private (durable members-only record) or public. */
+		isPrivate?: boolean;
+		/** Disable while a join is in flight. */
+		disabled?: boolean;
+		onjoin?: () => void;
+		oncancel?: () => void;
+	}
+
+	let { isPrivate = false, disabled = false, onjoin, oncancel }: Props = $props();
 
 	/** F12 — the explicit acknowledgment. The Join button stays disabled until this is checked. */
-	let acknowledged = false;
+	let acknowledged = $state(false);
 
-	const dispatch = createEventDispatcher<{ join: void; cancel: void }>();
 	const ackId = `topic-ack-${Math.random().toString(36).slice(2, 9)}`;
 
-	$: copy = joinConsentCopy(isPrivate);
+	let copy = $derived(joinConsentCopy(isPrivate));
 
 	/** F12 — the join is a real logical gate, not just a disabled attribute: it cannot fire without the
 	 *  explicit acknowledgment, even if a synthetic click reaches the (visually disabled) button. */
 	function tryJoin() {
 		if (disabled || !acknowledged) return;
-		dispatch('join');
+		onjoin?.();
 	}
 </script>
 
@@ -33,12 +37,12 @@
 	</label>
 
 	<div class="actions">
-		<button type="button" class="cancel" on:click={() => dispatch('cancel')}>Cancel</button>
+		<button type="button" class="cancel" onclick={() => oncancel?.()}>Cancel</button>
 		<button
 			type="button"
 			class="join"
 			disabled={disabled || !acknowledged}
-			on:click={tryJoin}
+			onclick={tryJoin}
 		>
 			Join Topic
 		</button>

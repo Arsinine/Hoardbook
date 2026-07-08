@@ -3,19 +3,31 @@
 	import DirItem from './DirItem.svelte';
 	import { icons } from '$lib/icons.js';
 
-	export let collection: Collection;
-	/** Set false to suppress the built-in clickable header — used by CollectionRow (M13 W5), which
+	
+	
+	interface Props {
+		collection: Collection;
+		/** Set false to suppress the built-in clickable header — used by CollectionRow (M13 W5), which
 	 *  renders its own compact header and just wants the listing tree underneath. */
-	export let header = true;
-	/** When `header` is false, the caller controls expansion directly via this prop. */
-	export let expanded = false;
+		header?: boolean;
+		/** When `header` is false, the caller controls expansion directly via this prop. */
+		expanded?: boolean;
+		children?: import('svelte').Snippet;
+	}
 
-	$: fmt = collection.content_types?.[0] ?? '';
+	let {
+		collection,
+		header = true,
+		expanded = $bindable(false),
+		children
+	}: Props = $props();
+
+	let fmt = $derived(collection.content_types?.[0] ?? '');
 </script>
 
 <div class="panel">
 	{#if header}
-		<button class="panel-header" on:click={() => (expanded = !expanded)}>
+		<button class="panel-header" onclick={() => (expanded = !expanded)}>
 			<div class="panel-left">
 				<div class="folder-icon">{@html icons.folder}</div>
 				<div class="panel-info">
@@ -53,7 +65,7 @@
 		</div>
 	{/if}
 
-	<slot />
+	{@render children?.()}
 </div>
 
 <style>

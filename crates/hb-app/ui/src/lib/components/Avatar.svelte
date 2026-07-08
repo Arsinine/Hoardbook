@@ -1,14 +1,18 @@
 <script lang="ts">
 	import { avatarHue } from '$lib/icons.js';
 
-	export let letter: string = '?';
-	export let size: number = 36;
-	export let hue: number | undefined = undefined;
+	interface Props {
+		letter?: string;
+		size?: number;
+		hue?: number | undefined;
+	}
 
-	$: h = hue ?? avatarHue(letter);
-	$: grad = `linear-gradient(135deg, oklch(0.55 0.10 ${h}) 0%, oklch(0.40 0.08 ${h + 40}) 100%)`;
-	$: br = size > 28 ? '8px' : '6px';
-	$: fs = `${(size * 0.42).toFixed(1)}px`;
+	let { letter = '?', size = 36, hue = undefined }: Props = $props();
+
+	let h = $derived(hue ?? avatarHue(letter));
+	let grad = $derived(`linear-gradient(135deg, oklch(0.55 0.10 ${h}) 0%, oklch(0.40 0.08 ${h + 40}) 100%)`);
+	let br = $derived(size > 28 ? '8px' : '6px');
+	let fs = $derived(`${(size * 0.42).toFixed(1)}px`);
 </script>
 
 <div style="

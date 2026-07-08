@@ -21,11 +21,11 @@
 	// ── "🟢 N hoarders online" chip (M9) — relay-derived, no telemetry. **Always shown** (the Settings
 	//    hide-toggle was removed); lives here on Contacts. Best-effort + cached on the backend; polled on
 	//    a slow tick (L4-budgeted); shows "–" while the count is unknown (m4).
-	let onlineData: OnlineCount | null = null;
-	let relayHealth: RelayHealth[] = [];
-	$: chip = onlineChipView(onlineData, true);
+	let onlineData: OnlineCount | null = $state(null);
+	let relayHealth: RelayHealth[] = $state([]);
+	let chip = $derived(onlineChipView(onlineData, true));
 	// M12 W1 Decision D: when the chip can't show a number, say *why* (which relays are unreachable).
-	$: whyHint = chip.unknown ? relayWhyHint(relayHealth) : '';
+	let whyHint = $derived(chip.unknown ? relayWhyHint(relayHealth) : '');
 	let onlinePollTimer: ReturnType<typeof setInterval> | undefined;
 	async function refreshOnline() {
 		// Decision B: don't poll the relays while the window is hidden (tray/minimized).
@@ -38,7 +38,7 @@
 
 
 	// Groups state
-	let groups: Group[] = [];
+	let groups: Group[] = $state([]);
 
 	async function loadGroups() {
 		try { groups = await groupsGet(); } catch { /* non-fatal */ }
@@ -46,7 +46,7 @@
 
 	// M10: Private collections trusted peers have sealed to me, keyed by author npub. A non-trusted
 	// viewer simply has no entry — there is no locked-teaser hint.
-	let privateByAuthor: Record<string, Collection[]> = {};
+	let privateByAuthor: Record<string, Collection[]> = $state({});
 
 	async function loadPrivate() {
 		try {
@@ -69,10 +69,10 @@
 	// "+ New group" (M13 W5) — renders regardless of how many groups already exist, so a trusted
 	// group (the on-ramp to M10 Private collections) is always reachable, not just from an existing
 	// contact's group picker.
-	let createGroupOpen = false;
+	let createGroupOpen = $state(false);
 
-	async function handleCreateGroup(e: CustomEvent<{ name: string; color: string; trusted: boolean }>) {
-		const { name, color, trusted } = e.detail;
+	async function handleCreateGroup(detail: { name: string; color: string; trusted: boolean }) {
+		const { name, color, trusted } = detail;
 		try {
 			await groupsCreate(name, color);
 			if (trusted) await groupsSetTrusted(name, true);
@@ -94,7 +94,7 @@
 	}
 
 	// Per-contact group-change select: hb_id → selected group name or '' for Ungrouped.
-	let contactGroupEditing: Record<string, boolean> = {};
+	let contactGroupEditing: Record<string, boolean> = $state({});
 
 	async function handleMoveGroup(hb_id: string, newGroupName: string) {
 		const groupNames = newGroupName ? [newGroupName] : [];
@@ -120,27 +120,27 @@
 	});
 
 	// Lookup state
-	let input = '';
-	let loading = false;
-	let following = false;
-	let result: CachedPeer | null = null;
+	let input = $state('');
+	let loading = $state(false);
+	let following = $state(false);
+	let result: CachedPeer | null = $state(null);
 
-	$: alreadyFollowed = $contacts.some((c) => c.npub === result?.npub);
+	let alreadyFollowed = $derived($contacts.some((c) => c.npub === result?.npub));
 
 	// ── §6 Discovery (moved from Browse — devtest 2026-06-25 #6) ─────────────────────────────────
 	// Search public teasers by tag / content-type across the relays. Results are the opt-in public
 	// teaser ONLY — each peer's listings stay 🔒 browse-key-locked (DISC3). Collapsed by default so it
 	// doesn't add clutter; "find people" now lives entirely on Contacts (lookup-by-id + discovery).
-	let discoverOpen = false;
-	let discoverTags = '';
-	let discoverTypes: string[] = [];
-	let discoverResults: PeerSearchHit[] = [];
-	let discovering = false;
-	let discoverError = '';
-	let discovered = false; // a search has run at least once (drives the empty-vs-no-results copy)
-	$: parsedDiscoverTags = parseTagInput(discoverTags);
-	$: canDiscover = canSearch(parsedDiscoverTags, discoverTypes);
-	$: followedNpubs = new Set($contacts.map((c) => c.npub));
+	let discoverOpen = $state(false);
+	let discoverTags = $state('');
+	let discoverTypes: string[] = $state([]);
+	let discoverResults: PeerSearchHit[] = $state([]);
+	let discovering = $state(false);
+	let discoverError = $state('');
+	let discovered = $state(false); // a search has run at least once (drives the empty-vs-no-results copy)
+	let parsedDiscoverTags = $derived(parseTagInput(discoverTags));
+	let canDiscover = $derived(canSearch(parsedDiscoverTags, discoverTypes));
+	let followedNpubs = $derived(new Set($contacts.map((c) => c.npub)));
 
 	async function runDiscover() {
 		if (!canDiscover) { discoverError = 'Enter at least one tag or content type to search.'; return; }
@@ -158,9 +158,9 @@
 
 	// Add-contact dialog (M13 W5 Slice 2): both the lookup card and a discovery hit open the same
 	// petname + group picker before actually adding — `addContactTarget` is whichever npub is pending.
-	let addContactOpen = false;
-	let addContactDisplayName = '';
-	let addContactTarget: string | null = null;
+	let addContactOpen = $state(false);
+	let addContactDisplayName = $state('');
+	let addContactTarget: string | null = $state(null);
 
 	function openAddContact(npub: string, displayName: string) {
 		addContactTarget = npub;
@@ -187,12 +187,12 @@
 		}
 	}
 
-	async function handleAddContactSave(e: CustomEvent<{ petname: string; group: string | null }>) {
+	async function handleAddContactSave(detail: { petname: string; group: string | null }) {
 		if (!addContactTarget) return;
 		const npub = addContactTarget;
 		addContactOpen = false;
 		addContactTarget = null;
-		await completeFollow(npub, e.detail.group, e.detail.petname);
+		await completeFollow(npub, detail.group, detail.petname);
 	}
 
 	async function handleAddContactSkip() {
@@ -227,9 +227,9 @@
 	}
 
 	// Contacts list state
-	let expanded: string | null = null;
-	let refreshing: string | null = null;
-	let autoRefreshing: string | null = null;
+	let expanded: string | null = $state(null);
+	let refreshing: string | null = $state(null);
+	let autoRefreshing: string | null = $state(null);
 
 	async function handleExpand(peer: CachedPeer) {
 		const id = peer.npub;
@@ -298,8 +298,8 @@
 	}
 
 	// Tag editing state
-	let editingTagsFor: string | null = null;
-	let tagInput = '';
+	let editingTagsFor: string | null = $state(null);
+	let tagInput = $state('');
 
 	async function handleAddTag(hb_id: string, current_tags: string[]) {
 		const tag = tagInput.trim();
@@ -321,12 +321,12 @@
 	}
 
 	// Filter by tag
-	let filterTag = '';
-	$: filteredContacts = filterTag
+	let filterTag = $state('');
+	let filteredContacts = $derived(filterTag
 		? $contacts.filter(c => c.local_tags?.includes(filterTag))
-		: $contacts;
+		: $contacts);
 
-	$: allTags = [...new Set($contacts.flatMap(c => c.local_tags ?? []))].sort();
+	let allTags = $derived([...new Set($contacts.flatMap(c => c.local_tags ?? []))].sort());
 </script>
 
 <div class="contacts-shell">
@@ -359,10 +359,10 @@
 					type="text"
 					placeholder="npub1… or share code (hbk1…)"
 					bind:value={input}
-					on:keydown={handleKeydown}
+					onkeydown={handleKeydown}
 				/>
 			</div>
-			<button class="btn-primary" on:click={handleLookup} disabled={!input.trim() || loading}>
+			<button class="btn-primary" onclick={handleLookup} disabled={!input.trim() || loading}>
 				{loading ? 'Looking up…' : 'Lookup'}
 			</button>
 		</div>
@@ -370,7 +370,7 @@
 		{#if result}
 			<div class="result">
 				<div class="profile-card">
-					<div class="profile-banner" />
+					<div class="profile-banner"></div>
 					<div class="profile-inner">
 						<div class="profile-top">
 							<Avatar
@@ -382,7 +382,7 @@
 								<div class="name-row">
 									<span class="peer-name">{result.profile?.display_name ?? 'Unknown'}</span>
 									{#if result.online}
-										<span class="pill pill-online"><span class="pill-dot" /> Online</span>
+										<span class="pill pill-online"><span class="pill-dot"></span> Online</span>
 									{:else}
 										<span class="pill pill-offline">Offline</span>
 									{/if}
@@ -392,7 +392,7 @@
 							<div class="profile-actions">
 								<button
 									class="btn-primary btn-sm"
-									on:click={handleFollow}
+									onclick={handleFollow}
 									disabled={alreadyFollowed || following}
 								>
 									{alreadyFollowed ? 'Added' : following ? '…' : 'Add contact'}
@@ -408,7 +408,7 @@
 						     just looked up (bound to the npub, not the display name). -->
 						{#if result.fingerprint}
 							<div class="fp-row">
-								<span class="fp-swatch" style="background:{result.fingerprint.colorHex}" />
+								<span class="fp-swatch" style="background:{result.fingerprint.colorHex}"></span>
 								<span class="fp-words hb-mono">{result.fingerprint.words.join(' ')} {result.fingerprint.colorHex}</span>
 								<FeatureTooltip key="fingerprint" />
 							</div>
@@ -439,7 +439,7 @@
 	<!-- §6 Discover hoarders (moved from Browse — devtest 2026-06-25 #6). Collapsible so it doesn't
 	     clutter Contacts; results are the opt-in public teaser only (listings stay 🔒 locked). -->
 	<div class="discover-section">
-		<button class="discover-toggle" on:click={() => (discoverOpen = !discoverOpen)} aria-expanded={discoverOpen}>
+		<button class="discover-toggle" onclick={() => (discoverOpen = !discoverOpen)} aria-expanded={discoverOpen}>
 			<span class="discover-toggle-label">{@html icons.search} Discover hoarders</span>
 			<span class="discover-chevron" class:open={discoverOpen}>{@html icons.chevronDown}</span>
 		</button>
@@ -449,10 +449,10 @@
 				<div class="ct-row">
 					{#each DISCOVER_CONTENT_TYPES as ct (ct.value)}
 						<button type="button" class="ct-chip" class:ct-on={discoverTypes.includes(ct.value)}
-							on:click={() => (discoverTypes = toggleContentType(discoverTypes, ct.value))}>{ct.label}</button>
+							onclick={() => (discoverTypes = toggleContentType(discoverTypes, ct.value))}>{ct.label}</button>
 					{/each}
 				</div>
-				<form class="disc-tag-row" on:submit|preventDefault={runDiscover}>
+				<form class="disc-tag-row" onsubmit={(e) => { e.preventDefault(); runDiscover(); }}>
 					<input class="disc-tag-input" placeholder="tags (e.g. anime, vhs)" bind:value={discoverTags} />
 					<button class="btn-primary btn-sm" type="submit" disabled={!canDiscover || discovering}>
 						{discovering ? 'Searching…' : 'Search'}
@@ -478,7 +478,7 @@
 									{#if isContact}
 										<span class="hit-following">Added</span>
 									{:else}
-										<button class="hit-follow" on:click={() => followHit(hit)}>Add contact</button>
+										<button class="hit-follow" onclick={() => followHit(hit)}>Add contact</button>
 									{/if}
 								</div>
 								{#if hit.bio}<div class="hit-bio">{hit.bio}</div>{/if}
@@ -507,16 +507,16 @@
 
 	<!-- Divider + tag filter -->
 	<div class="section-divider">
-		<div class="divider-line" />
+		<div class="divider-line"></div>
 		<span class="divider-label">Contacts ({$contacts.length})</span>
-		<div class="divider-line" />
+		<div class="divider-line"></div>
 	</div>
 
 	{#if allTags.length > 0}
 		<div class="tag-filter-row">
-			<button class="filter-tag" class:filter-tag-active={!filterTag} on:click={() => filterTag = ''}>All</button>
+			<button class="filter-tag" class:filter-tag-active={!filterTag} onclick={() => filterTag = ''}>All</button>
 			{#each allTags as tag}
-				<button class="filter-tag" class:filter-tag-active={filterTag === tag} on:click={() => filterTag = filterTag === tag ? '' : tag}>{tag}</button>
+				<button class="filter-tag" class:filter-tag-active={filterTag === tag} onclick={() => filterTag = filterTag === tag ? '' : tag}>{tag}</button>
 			{/each}
 		</div>
 	{/if}
@@ -529,11 +529,11 @@
 		<div class="trusted-chips">
 			{#each groups as g (g.name)}
 				<label class="trusted-chip" class:is-trusted={isTrusted(g)}>
-					<input type="checkbox" checked={isTrusted(g)} on:change={() => toggleTrusted(g)} />
+					<input type="checkbox" checked={isTrusted(g)} onchange={() => toggleTrusted(g)} />
 					{g.name}
 				</label>
 			{/each}
-			<button type="button" class="trusted-chip trusted-chip-add" on:click={() => (createGroupOpen = true)}>+ New group</button>
+			<button type="button" class="trusted-chip trusted-chip-add" onclick={() => (createGroupOpen = true)}>+ New group</button>
 		</div>
 	</div>
 
@@ -557,17 +557,17 @@
 							<div class="name-row">
 								<span class="peer-name">{name}</span>
 								{#if peer.online}
-									<span class="pill pill-online"><span class="pill-dot" /></span>
+									<span class="pill pill-online"><span class="pill-dot"></span></span>
 								{:else if stale}
 									<span class="pill pill-stale" title="Last fetched {new Date(peer.last_fetched).toLocaleDateString()}">Stale</span>
 								{:else}
 									<span class="pill pill-offline">Offline</span>
 								{/if}
 								<span class="last-seen">seen {lastSeenLabel(peer)}</span>
-								<div style="flex:1" />
+								<div style="flex:1"></div>
 								<button
 									class="btn-ghost btn-xs btn-icon"
-									on:click={() => handleRefresh(peer.npub)}
+									onclick={() => handleRefresh(peer.npub)}
 									disabled={refreshing === peer.npub}
 									title="Refresh"
 								>
@@ -576,9 +576,9 @@
 								<ConfirmButton
 									label="Remove contact"
 									confirmText="Remove this contact?"
-									on:confirm={() => handleUnfollow(peer.npub)}
+									onconfirm={() => handleUnfollow(peer.npub)}
 								/>
-								<button class="btn-default btn-xs" on:click={() => handleExpand(peer)}>
+								<button class="btn-default btn-xs" onclick={() => handleExpand(peer)}>
 									{expanded === peer.npub ? 'Hide' : 'Browse'}
 								</button>
 							</div>
@@ -597,23 +597,23 @@
 									{#if contactGroupEditing[peer.npub]}
 										<select
 											class="group-select group-select-inline"
-											on:change={(e) => handleMoveGroup(peer.npub, e.currentTarget.value)}
+											onchange={(e) => handleMoveGroup(peer.npub, e.currentTarget.value)}
 										>
 											<option value="">Ungrouped</option>
 											{#each groups as g (g.name)}
 												<option value={g.name} selected={peerGroups.includes(g.name)}>{g.name}</option>
 											{/each}
 										</select>
-										<button class="tag-x" on:click={() => { contactGroupEditing = { ...contactGroupEditing, [peer.npub]: false }; }}>×</button>
+										<button class="tag-x" onclick={() => { contactGroupEditing = { ...contactGroupEditing, [peer.npub]: false }; }}>×</button>
 									{:else if groups.length > 0}
-										<button class="tag-add-btn" on:click={() => { contactGroupEditing = { ...contactGroupEditing, [peer.npub]: true }; }}>
+										<button class="tag-add-btn" onclick={() => { contactGroupEditing = { ...contactGroupEditing, [peer.npub]: true }; }}>
 											{peerGroups.length > 0 ? '✎' : '+ group'}
 										</button>
 									{/if}
 								</div>
 							{:else if groups.length > 0}
 								<div class="group-row">
-									<button class="tag-add-btn" on:click={() => { contactGroupEditing = { ...contactGroupEditing, [peer.npub]: true }; }}>+ group</button>
+									<button class="tag-add-btn" onclick={() => { contactGroupEditing = { ...contactGroupEditing, [peer.npub]: true }; }}>+ group</button>
 								</div>
 							{/if}
 
@@ -622,7 +622,7 @@
 								{#each (peer.local_tags ?? []) as tag}
 									<span class="local-tag">
 										{tag}
-										<button class="tag-x" on:click={() => handleRemoveTag(peer.npub, peer.local_tags ?? [], tag)}>×</button>
+										<button class="tag-x" onclick={() => handleRemoveTag(peer.npub, peer.local_tags ?? [], tag)}>×</button>
 									</span>
 								{/each}
 								{#if editingTagsFor === peer.npub}
@@ -631,14 +631,14 @@
 										type="text"
 										placeholder="tag…"
 										bind:value={tagInput}
-										on:keydown={(e) => {
+										onkeydown={(e) => {
 											if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); handleAddTag(peer.npub, peer.local_tags ?? []); }
 											if (e.key === 'Escape') { editingTagsFor = null; tagInput = ''; }
 										}}
-										on:blur={() => { editingTagsFor = null; tagInput = ''; }}
+										onblur={() => { editingTagsFor = null; tagInput = ''; }}
 									/>
 								{:else}
-									<button class="tag-add-btn" on:click={() => { editingTagsFor = peer.npub; tagInput = ''; }}>+ tag</button>
+									<button class="tag-add-btn" onclick={() => { editingTagsFor = peer.npub; tagInput = ''; }}>+ tag</button>
 								{/if}
 							</div>
 						</div>
@@ -680,15 +680,15 @@
 </div>
 </div>
 
-<CreateGroupDialog bind:open={createGroupOpen} on:create={handleCreateGroup} on:cancel={() => (createGroupOpen = false)} />
+<CreateGroupDialog open={createGroupOpen} oncreate={handleCreateGroup} oncancel={() => (createGroupOpen = false)} />
 <AddContactDialog
-	bind:open={addContactOpen}
+	open={addContactOpen}
 	displayName={addContactDisplayName}
 	{groups}
-	on:save={handleAddContactSave}
-	on:skip={handleAddContactSkip}
-	on:newGroup={() => (createGroupOpen = true)}
-	on:cancel={() => { addContactOpen = false; addContactTarget = null; }}
+	onsave={handleAddContactSave}
+	onskip={handleAddContactSkip}
+	onnewGroup={() => (createGroupOpen = true)}
+	oncancel={() => { addContactOpen = false; addContactTarget = null; }}
 />
 
 <style>

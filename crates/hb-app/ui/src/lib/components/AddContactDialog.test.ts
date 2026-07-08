@@ -21,33 +21,29 @@ describe('AddContactDialog (M13 W5 Slice 2)', () => {
 	});
 
 	it('save_emits_petname_and_group', async () => {
-		const { getByLabelText, getByRole, component } = render(AddContactDialog, {
-			props: { open: true, displayName: 'Alice', groups: GROUPS },
-		});
 		const saved = vi.fn();
-		component.$on('save', saved);
+		const { getByLabelText, getByRole } = render(AddContactDialog, {
+			props: { open: true, displayName: 'Alice', groups: GROUPS, onsave: saved },
+		});
 
 		await fireEvent.input(getByLabelText(/petname/i), { target: { value: 'Al' } });
 		await fireEvent.change(getByRole('combobox'), { target: { value: 'Inner Circle' } });
 		await fireEvent.click(getByRole('button', { name: /add contact/i }));
 
 		expect(saved).toHaveBeenCalledTimes(1);
-		expect(saved.mock.calls[0][0].detail).toEqual({ petname: 'Al', group: 'Inner Circle' });
+		expect(saved.mock.calls[0][0]).toEqual({ petname: 'Al', group: 'Inner Circle' });
 	});
 
 	it('skip_emits_skip_without_petname', async () => {
-		const { getByRole, component } = render(AddContactDialog, {
-			props: { open: true, displayName: 'Alice', groups: GROUPS },
-		});
 		const saved = vi.fn();
 		const skipped = vi.fn();
-		component.$on('save', saved);
-		component.$on('skip', skipped);
+		const { getByRole } = render(AddContactDialog, {
+			props: { open: true, displayName: 'Alice', groups: GROUPS, onsave: saved, onskip: skipped },
+		});
 
 		await fireEvent.click(getByRole('button', { name: /skip/i }));
 
 		expect(skipped).toHaveBeenCalledTimes(1);
-		expect(skipped.mock.calls[0][0].detail).toBeNull();
 		expect(saved).not.toHaveBeenCalled();
 	});
 });

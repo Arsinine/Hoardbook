@@ -1,7 +1,3 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-
 /* ── Design tokens ────────────────────────────────────────────────── */
 :root {
   --bg:            oklch(0.16 0.005 260);
@@ -36,6 +32,40 @@ html, body {
 }
 
 *, *::before, *::after { box-sizing: border-box; }
+
+/* ── Preflight replacement (Tailwind removed) ──────────────────────── */
+p, h1, h2, h3, h4, h5, h6, ul, ol, blockquote, hr, figure {
+  margin: 0;
+}
+
+ul, ol {
+  list-style: none;
+  padding: 0;
+}
+
+button, input, select, textarea {
+  font: inherit;
+  color: inherit;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  border: 0;
+}
+
+a {
+  color: inherit;
+  text-decoration: inherit;
+}
+
+img, svg {
+  display: block;
+  vertical-align: middle;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-size: inherit;
+  font-weight: inherit;
+}
 
 ::selection { background: oklch(0.78 0.14 70 / 0.3); }
 

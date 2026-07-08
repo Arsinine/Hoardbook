@@ -11,50 +11,10 @@
 		| { label: string; kind: 'collection' }
 		| { label: string; kind: 'folder'; index: number };
 
-	let search = '';
-	let selectedPeer: CachedPeer | null = null;
-	let selectedCollection: Collection | null = null;
-	let folderStack: { name: string; items: DirectoryItem[] }[] = [];
-
-	// §6 Discovery moved to Contacts (devtest 2026-06-25 #6). Browse is now purely "browse a contact's
-	// collections" — pick someone from the People list on the left.
-
-	$: filteredContacts = $contacts
-		.filter(p => {
-			if (!search) return true;
-			const q = search.toLowerCase();
-			return (
-				(p.profile?.display_name?.toLowerCase().includes(q) ?? false) ||
-				p.npub.toLowerCase().includes(q)
-			);
-		})
-		.sort((a, b) => {
-			if (a.online !== b.online) return a.online ? -1 : 1;
-			const na = a.profile?.display_name ?? a.npub;
-			const nb = b.profile?.display_name ?? b.npub;
-			return na.localeCompare(nb);
-		});
-
-	$: currentItems = folderStack.length > 0
-		? folderStack[folderStack.length - 1].items
-		: (selectedCollection?.listing ?? []);
-
-	$: sortedItems = [...currentItems].sort((a, b) => {
-		if (a.item_type !== b.item_type) return a.item_type === 'Folder' ? -1 : 1;
-		return a.name.localeCompare(b.name);
-	});
-
-	let breadcrumbs: BcItem[] = [];
-	$: breadcrumbs = [
-		...(selectedPeer ? [{ label: peerName(selectedPeer), kind: 'contact' as const }] : []),
-		...(selectedCollection ? [{ label: selectedCollection.path_alias, kind: 'collection' as const }] : []),
-		...folderStack.map((f, i) => ({ label: f.name, kind: 'folder' as const, index: i })),
-	];
-
-	// Feature-tooltip anchor data (HOARDBOOK_SPEC §8).
-	$: peerWillingTo = selectedPeer?.profile?.willing_to ?? [];
-	// A peer followed by bare npub (no share code) has sealed listings — they can't be decrypted.
-	$: listingsLocked = !!selectedPeer && !selectedPeer.browse_key_hex && selectedPeer.collections.length === 0;
+	let search = $state('');
+	let selectedPeer = $state<CachedPeer | null>(null);
+	let selectedCollection = $state<Collection | null>(null);
+	let folderStack: { name: string; items: DirectoryItem[] }[] = $state([]);
 
 	function peerName(peer: CachedPeer): string {
 		return peer.profile?.display_name ?? peer.npub.slice(0, 10) + '…';
@@ -103,7 +63,7 @@
 	}
 
 	// ── Context menu ────────────────────────────────────────────────────────────
-	let ctxMenu: { x: number; y: number; item: DirectoryItem } | null = null;
+	let ctxMenu: { x: number; y: number; item: DirectoryItem } | null = $state(null);
 
 	function openCtxMenu(e: MouseEvent, item: DirectoryItem) {
 		if (item.item_type !== 'File') return;
@@ -113,6 +73,40 @@
 
 	function closeCtxMenu() { ctxMenu = null; }
 
+	// §6 Discovery moved to Contacts (devtest 2026-06-25 #6). Browse is now purely "browse a contact's
+	// collections" — pick someone from the People list on the left.
+
+	let filteredContacts = $derived($contacts
+		.filter(p => {
+			if (!search) return true;
+			const q = search.toLowerCase();
+			return (
+				(p.profile?.display_name?.toLowerCase().includes(q) ?? false) ||
+				p.npub.toLowerCase().includes(q)
+			);
+		})
+		.sort((a, b) => {
+			if (a.online !== b.online) return a.online ? -1 : 1;
+			const na = a.profile?.display_name ?? a.npub;
+			const nb = b.profile?.display_name ?? b.npub;
+			return na.localeCompare(nb);
+		}));
+	let currentItems = $derived(folderStack.length > 0
+		? folderStack[folderStack.length - 1].items
+		: (selectedCollection?.listing ?? []));
+	let sortedItems = $derived([...currentItems].sort((a, b) => {
+		if (a.item_type !== b.item_type) return a.item_type === 'Folder' ? -1 : 1;
+		return a.name.localeCompare(b.name);
+	}));
+	let breadcrumbs = $derived<BcItem[]>([
+		...(selectedPeer ? [{ label: peerName(selectedPeer), kind: 'contact' as const }] : []),
+		...(selectedCollection ? [{ label: selectedCollection.path_alias, kind: 'collection' as const }] : []),
+		...folderStack.map((f, i) => ({ label: f.name, kind: 'folder' as const, index: i })),
+	]);
+	// Feature-tooltip anchor data (HOARDBOOK_SPEC §8).
+	let peerWillingTo = $derived(selectedPeer?.profile?.willing_to ?? []);
+	// A peer followed by bare npub (no share code) has sealed listings — they can't be decrypted.
+	let listingsLocked = $derived(!!selectedPeer && !selectedPeer.browse_key_hex && selectedPeer.collections.length === 0);
 </script>
 
 <div class="browse-shell">
@@ -138,12 +132,12 @@
 					<button
 						class="contact-row"
 						class:contact-selected={selectedPeer?.npub === peer.npub}
-						on:click={() => selectPeer(peer)}
+						onclick={() => selectPeer(peer)}
 					>
 						<div class="avatar-wrap">
 							<Avatar {letter} size={28} {hue} />
 							{#if peer.online}
-								<span class="online-dot" />
+								<span class="online-dot"></span>
 							{/if}
 						</div>
 						<div class="contact-info">
@@ -178,7 +172,7 @@
 						<span class="bc-sep">{@html icons.chevronRight}</span>
 					{/if}
 					{#if i < breadcrumbs.length - 1}
-						<button class="bc-btn" on:click={() => navigateBc(bc)}>{bc.label}</button>
+						<button class="bc-btn" onclick={() => navigateBc(bc)}>{bc.label}</button>
 					{:else}
 						<span class="bc-current">{bc.label}</span>
 					{/if}
@@ -214,7 +208,7 @@
 				{:else}
 					<div class="col-grid">
 						{#each selectedPeer.collections as col (col.slug)}
-							<button class="col-card" on:click={() => selectCollection(col)}>
+							<button class="col-card" onclick={() => selectCollection(col)}>
 								<div class="col-card-icon">{@html icons.folder}</div>
 								<div class="col-card-name">{col.path_alias}</div>
 								{#if col.description}
@@ -259,8 +253,8 @@
 									class="file-row"
 									class:file-folder={item.item_type === 'Folder'}
 									class:file-leaf={item.item_type === 'File'}
-									on:click={() => { if (item.item_type === 'Folder') enterFolder(item); }}
-									on:contextmenu={(e) => openCtxMenu(e, item)}
+									onclick={() => { if (item.item_type === 'Folder') enterFolder(item); }}
+									oncontextmenu={(e) => openCtxMenu(e, item)}
 									title={item.item_type === 'File' ? 'Right-click to copy path' : undefined}
 								>
 									<span class="file-icon">
@@ -292,10 +286,10 @@
 
 <!-- Context menu -->
 {#if ctxMenu}
-	<!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-	<div class="ctx-backdrop" on:click={closeCtxMenu} />
+	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+	<div class="ctx-backdrop" onclick={closeCtxMenu}></div>
 	<div class="ctx-menu" style="left:{ctxMenu.x}px;top:{ctxMenu.y}px">
-		<button class="ctx-item" on:click={() => {
+		<button class="ctx-item" onclick={() => {
 			if (ctxMenu) navigator.clipboard.writeText(itemPath(ctxMenu.item)).catch(() => {});
 			closeCtxMenu();
 		}}>

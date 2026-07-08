@@ -1,15 +1,21 @@
 <script lang="ts">
 	import { TOOLTIPS, type TooltipKey } from '../tooltips.js';
 
-	/** Which of the five spec'd feature-help anchors to render (HOARDBOOK_SPEC §8). */
-	export let key: TooltipKey;
+	
+	interface Props {
+		/** Which of the five spec'd feature-help anchors to render (HOARDBOOK_SPEC §8). */
+		key: TooltipKey;
+		children?: import('svelte').Snippet;
+	}
 
-	let expanded = false;
+	let { key, children }: Props = $props();
+
+	let expanded = $state(false);
 	// Unique-per-instance id so aria-describedby wires the trigger → its own copy, even with several
 	// FeatureTooltips on one screen.
 	const tipId = `ft-${key}-${Math.random().toString(36).slice(2, 9)}`;
 
-	$: content = TOOLTIPS[key];
+	let content = $derived(TOOLTIPS[key]);
 
 	function show() {
 		expanded = true;
@@ -30,18 +36,18 @@
 	<button
 		type="button"
 		class="ft-trigger"
-		class:has-label={$$slots.default}
+		class:has-label={children}
 		aria-describedby={tipId}
 		aria-expanded={expanded}
-		aria-label={$$slots.default ? undefined : `More information: ${content.title}`}
-		on:mouseenter={show}
-		on:mouseleave={hide}
-		on:focus={show}
-		on:blur={hide}
-		on:click={toggle}
-		on:keydown={onKeydown}
+		aria-label={children ? undefined : `More information: ${content.title}`}
+		onmouseenter={show}
+		onmouseleave={hide}
+		onfocus={show}
+		onblur={hide}
+		onclick={toggle}
+		onkeydown={onKeydown}
 	>
-		<slot><span class="ft-icon" aria-hidden="true">ⓘ</span></slot>
+		{#if children}{@render children()}{:else}<span class="ft-icon" aria-hidden="true">ⓘ</span>{/if}
 	</button>
 	<span class="ft-tip" id={tipId} role="tooltip" hidden={!expanded}>
 		<span class="ft-tip-title">{content.title}</span>

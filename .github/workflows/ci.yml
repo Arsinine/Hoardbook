@@ -72,6 +72,12 @@ jobs:
           sweep "a transfer/gate module declaration"  '^[[:space:]]*(#\[[^]]*\][[:space:]]*)*(pub(\([^)]*\))?[[:space:]]+)?mod[[:space:]]+(transfer|conn|p2p_it|gate)\b' crates
           sweep "the DownloadQueue component is back" 'DownloadQueue' crates/hb-app/ui/src
           if [ "$fail" -ne 0 ]; then echo "::error::Hoardbook moves no files (INV-4) — the above belongs in Mascara."; exit 1; fi
+          # M14: Skeleton/Tailwind were de-vendored (the UI is hand-rolled oklch + scoped CSS) — a
+          # CSS framework creeping back in is scope creep, not a feature.
+          if out=$(grep -rnE '@skeletonlabs|tailwind' crates/hb-app/ui/src crates/hb-app/ui/package.json 2>/dev/null); then
+            echo "::error::a CSS framework crept back in:"; echo "$out"; exit 1
+          fi
+          echo "CSS-framework sweep clean — no Skeleton/Tailwind in ui/src or package.json."
           echo "INV-4 sweep clean — no file-transfer plane in Hoardbook."
           # DISC3/INV-2: the discovery surface is structurally browse-key-free (audit I-5).
           if out=$(grep -rnE 'browse_key|BrowseKey' crates/hb-net/src/discover.rs 2>/dev/null); then

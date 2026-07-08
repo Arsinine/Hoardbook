@@ -49,11 +49,10 @@ describe('CollectionRow', () => {
 	});
 
 	it('export_menu_opens_from_overflow_menu', async () => {
-		const { container, findByRole, component } = render(CollectionRow, {
-			props: { collection: makeCollection() },
-		});
 		const exported = vi.fn();
-		component.$on('export', exported);
+		const { container, findByRole } = render(CollectionRow, {
+			props: { collection: makeCollection(), onexport: exported },
+		});
 
 		await openMenu(container);
 		await fireEvent.click(await findByRole('menuitem', { name: /^export$/i }));
@@ -62,15 +61,14 @@ describe('CollectionRow', () => {
 
 		await fireEvent.click(plainText);
 		expect(exported).toHaveBeenCalledTimes(1);
-		expect(exported.mock.calls[0][0].detail).toEqual({ slug: 'movies', format: 'text' });
+		expect(exported.mock.calls[0][0]).toEqual({ slug: 'movies', format: 'text' });
 	});
 
 	it('remove_requires_confirm', async () => {
-		const { container, getByRole, findByRole, component } = render(CollectionRow, {
-			props: { collection: makeCollection() },
-		});
 		const removed = vi.fn();
-		component.$on('remove', removed);
+		const { container, getByRole, findByRole } = render(CollectionRow, {
+			props: { collection: makeCollection(), onremove: removed },
+		});
 
 		await openMenu(container);
 		await fireEvent.click(await findByRole('menuitem', { name: /^remove$/i }));

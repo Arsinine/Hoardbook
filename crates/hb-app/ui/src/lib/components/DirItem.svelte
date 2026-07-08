@@ -3,18 +3,22 @@
 	import DirItem from './DirItem.svelte';
 	import { icons } from '$lib/icons.js';
 
-	export let item: DirectoryItem;
-	export let depth: number = 0;
-	export let pathPrefix: string = '';
+	interface Props {
+		item: DirectoryItem;
+		depth?: number;
+		pathPrefix?: string;
+	}
 
-	let open = false;
-	$: isFolder = item.item_type === 'Folder';
-	$: fullPath = pathPrefix ? `${pathPrefix}/${item.name}` : item.name;
+	let { item, depth = 0, pathPrefix = '' }: Props = $props();
+
+	let open = $state(false);
+	let isFolder = $derived(item.item_type === 'Folder');
+	let fullPath = $derived(pathPrefix ? `${pathPrefix}/${item.name}` : item.name);
 </script>
 
 <li class="dir-row" style="padding-left:{depth * 18}px">
 	{#if isFolder}
-		<button class="dir-folder" on:click={() => (open = !open)}>
+		<button class="dir-folder" onclick={() => (open = !open)}>
 			<span class="dir-folder-icon">{@html icons.folder}</span>
 			<span class="dir-folder-name">{item.name}</span>
 			{#if item.children.length > 0}
