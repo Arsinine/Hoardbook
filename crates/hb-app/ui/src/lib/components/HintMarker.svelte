@@ -5,12 +5,18 @@
 	// action. Accessibility mirrors FeatureTooltip: a real <button> trigger, aria-describedby → its own
 	// role=tooltip copy, hover/focus to show, Escape/blur to hide.
 
-	/** The hint text shown on hover/focus. */
-	export let text: string;
-	/** Accessible-name fragment for the icon-only trigger (e.g. the field label). */
-	export let label = 'field';
+	
+	
+	interface Props {
+		/** The hint text shown on hover/focus. */
+		text: string;
+		/** Accessible-name fragment for the icon-only trigger (e.g. the field label). */
+		label?: string;
+	}
 
-	let expanded = false;
+	let { text, label = 'field' }: Props = $props();
+
+	let expanded = $state(false);
 	const tipId = `hint-${Math.random().toString(36).slice(2, 9)}`;
 
 	function show() {
@@ -34,12 +40,12 @@
 		aria-describedby={tipId}
 		aria-expanded={expanded}
 		aria-label={`More information: ${label}`}
-		on:mouseenter={show}
-		on:mouseleave={hide}
-		on:focus={show}
-		on:blur={hide}
-		on:click={toggle}
-		on:keydown={onKeydown}
+		onmouseenter={show}
+		onmouseleave={hide}
+		onfocus={show}
+		onblur={hide}
+		onclick={toggle}
+		onkeydown={onKeydown}
 	>
 		<span class="hint-icon" aria-hidden="true">?</span>
 	</button>

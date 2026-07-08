@@ -69,12 +69,10 @@ describe('AddCollectionModal', () => {
 
 	it('save_draft_closes_without_publishing', async () => {
 		const col = makeCollection({ content_types: ['video'] });
-		const { getByRole, component } = render(AddCollectionModal, {
-			props: { open: true, editCollection: col },
-		});
-
 		const closed = vi.fn();
-		component.$on('close', closed);
+		const { getByRole } = render(AddCollectionModal, {
+			props: { open: true, editCollection: col, onclose: closed },
+		});
 
 		await fireEvent.click(getByRole('button', { name: /save draft/i }));
 		await waitFor(() => expect(closed).toHaveBeenCalled());

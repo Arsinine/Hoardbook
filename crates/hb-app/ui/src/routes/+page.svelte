@@ -24,28 +24,19 @@
 		'తెలుగు','ไทย','Türkçe','Українська','اردو','Oʻzbekcha','Tiếng Việt','Cymraeg',
 	];
 
-	$: langSuggestions = langInput.length > 0
-		? LANGUAGES.filter(l => l.toLowerCase().startsWith(langInput.toLowerCase()) && !form.languages.includes(l))
-		: [];
 
 	// ── Onboarding state ────────────────────────────────────────────────────────
 	// 0=loading, 1=keypair, 2=name, 3=collection (skippable), 4=done
-	let obStep = 0;
-	let obGenerating = false;
-	let obKeypairRevealed = false; // true after generation: show npub + share code + backup prompt
-	let importOverlayOpen = false; // linking-warning overlay before importing an existing nsec
-	let obImportNsec = '';
-	let obImportWarnAck = false;
-	let obImporting = false;
-	let obBackupPass = '';        // passphrase for the post-generate portable backup
-	let obBackingUp = false;
-	$: obBackupStrength = passphraseStrength(obBackupPass);
+	let obStep = $state(0);
+	let obGenerating = $state(false);
+	let obKeypairRevealed = $state(false); // true after generation: show npub + share code + backup prompt
+	let importOverlayOpen = $state(false); // linking-warning overlay before importing an existing nsec
+	let obImportNsec = $state('');
+	let obImportWarnAck = $state(false);
+	let obImporting = $state(false);
+	let obBackupPass = $state('');        // passphrase for the post-generate portable backup
+	let obBackingUp = $state(false);
 
-	$: if ($appReady && obStep === 0) {
-		if ($identity) obStep = 4;
-		else if (!$identityLoadError) obStep = 1;
-		// identityLoadError set: stay at 0; the error screen is shown in the template.
-	}
 
 	async function obGenerateKeypair() {
 		obGenerating = true;
@@ -111,7 +102,7 @@
 
 	// ── Publish-button dirty tracking ───────────────────────────────────────────
 	// Snapshot of the profile as it was last published (undefined = never published).
-	let publishedSnapshot: string | null = null;
+	let publishedSnapshot: string | null = $state(null);
 
 	onMount(async () => {
 		const wasPublished = await hasPublishedProfile().catch(() => false);
@@ -126,9 +117,6 @@
 		return JSON.stringify(rest);
 	}
 
-	$: profileDirty = publishedSnapshot === null || stableProfileJson(form) !== publishedSnapshot;
-	// Never-published is the critical case: the profile isn't searchable until it's pushed to a relay.
-	$: neverPublished = publishedSnapshot === null;
 
 	// ── Disk size computation ────────────────────────────────────────────────────
 	function formatBytes(b: number): string {
@@ -139,23 +127,21 @@
 		return b + ' B';
 	}
 
-	$: totalBytes = $collections.reduce((s, c) => s + (c.total_bytes ?? 0), 0);
-	$: diskSize = totalBytes > 0 ? formatBytes(totalBytes) : '—';
 
 	// ── Regular state ────────────────────────────────────────────────────────────
 	// The Rescan flow reuses the plain ScanDialog directly (single step — the collection's details
 	// already exist). The Add-collection wizard (AddCollectionModal) owns the two-step Source→Details
 	// flow, and also reopens straight to Details for "Edit details".
-	let scanOpen = false;
-	let scanTitle = 'Rescan collection';
-	let scanInitialPath = '';
-	let scanInitialAlias = '';
-	let addModalOpen = false;
-	let editTarget: Collection | null = null;
-	let saving = false;
-	let publishing = false;
-	let langInput = '';
-	let tagInput = '';
+	let scanOpen = $state(false);
+	let scanTitle = $state('Rescan collection');
+	let scanInitialPath = $state('');
+	let scanInitialAlias = $state('');
+	let addModalOpen = $state(false);
+	let editTarget: Collection | null = $state(null);
+	let saving = $state(false);
+	let publishing = $state(false);
+	let langInput = $state('');
+	let tagInput = $state('');
 	let willingInput = '';
 
 	const WILLING_OPTIONS = ['seed', 'trade', 'upload', 'meet up'];
@@ -196,9 +182,9 @@
 		{ value: 'other',    label: 'Other',    abbr: '···' },
 	];
 
-	let activeSocialPlatform: string | null = null;
+	let activeSocialPlatform: string | null = $state(null);
 
-	let form: Profile = {
+	let form: Profile = $state({
 		display_name: '',
 		bio: undefined,
 		tags: [],
@@ -212,7 +198,7 @@
 		willing_to: [],
 		content_types: [],
 		updated: new Date().toISOString(),
-	};
+	});
 
 	function toggleSocialPlatform(platform: string) {
 		activeSocialPlatform = activeSocialPlatform === platform ? null : platform;
@@ -238,16 +224,8 @@
 	}
 
 	// Persist form in store across navigation — load from homeDraft first, then $profile.
-	let profileLoaded = false;
-	$: if ($appReady && !profileLoaded) {
-		form = $homeDraft ?? ($profile ? { ...$profile } : form);
-		profileLoaded = true;
-	}
-	// Keep homeDraft in sync whenever form changes.
-	$: if (profileLoaded) homeDraft.set({ ...form });
+	let profileLoaded = $state(false);
 
-	$: nameInitial = form.display_name?.[0]?.toUpperCase() ?? 'Y';
-	$: nameHue = avatarHue(nameInitial);
 
 	async function handleSave() {
 		if (!form.display_name) return;
@@ -327,17 +305,17 @@
 		});
 	}
 
-	function onScanned(event: CustomEvent<Collection>) {
-		mergeCollectionIntoStore(event.detail);
-		toast(`Scanned "${event.detail.path_alias}" — ${event.detail.item_count} items`);
+	function handleScannedCollection(collection: Collection) {
+		mergeCollectionIntoStore(collection);
+		toast(`Scanned "${collection.path_alias}" — ${collection.item_count} items`);
 	}
 
 	// The Details step already toasts its own "saved"/"published" message — just sync the store.
-	function onWizardSaved(event: CustomEvent<Collection>) {
-		mergeCollectionIntoStore(event.detail);
+	function onWizardSaved(collection: Collection) {
+		mergeCollectionIntoStore(collection);
 	}
-	function onWizardPublished(event: CustomEvent<Collection>) {
-		mergeCollectionIntoStore(event.detail);
+	function onWizardPublished(collection: Collection) {
+		mergeCollectionIntoStore(collection);
 	}
 
 	function openAddModal() {
@@ -362,7 +340,6 @@
 		scanOpen = true;
 	}
 
-	$: totalItems = $collections.reduce((s, c) => s + c.item_count, 0);
 
 	function addLang(name: string) {
 		if (!form.languages.includes(name)) {
@@ -398,6 +375,35 @@
 			toast('Copied to clipboard');
 		} catch (e) { toast(String(e), 'error'); }
 	}
+	$effect(() => {
+		if ($appReady && !profileLoaded) {
+			form = $homeDraft ?? ($profile ? { ...$profile } : form);
+			profileLoaded = true;
+		}
+	});
+	let langSuggestions = $derived(langInput.length > 0
+		? LANGUAGES.filter(l => l.toLowerCase().startsWith(langInput.toLowerCase()) && !form.languages.includes(l))
+		: []);
+	let obBackupStrength = $derived(passphraseStrength(obBackupPass));
+	$effect(() => {
+		if ($appReady && obStep === 0) {
+			if ($identity) obStep = 4;
+			else if (!$identityLoadError) obStep = 1;
+			// identityLoadError set: stay at 0; the error screen is shown in the template.
+		}
+	});
+	let profileDirty = $derived(publishedSnapshot === null || stableProfileJson(form) !== publishedSnapshot);
+	// Never-published is the critical case: the profile isn't searchable until it's pushed to a relay.
+	let neverPublished = $derived(publishedSnapshot === null);
+	let totalBytes = $derived($collections.reduce((s, c) => s + (c.total_bytes ?? 0), 0));
+	let diskSize = $derived(totalBytes > 0 ? formatBytes(totalBytes) : '—');
+	// Keep homeDraft in sync whenever form changes.
+	$effect(() => {
+		if (profileLoaded) homeDraft.set({ ...form });
+	});
+	let nameInitial = $derived(form.display_name?.[0]?.toUpperCase() ?? 'Y');
+	let nameHue = $derived(avatarHue(nameInitial));
+	let totalItems = $derived($collections.reduce((s, c) => s + c.item_count, 0));
 </script>
 
 {#if obStep === 0}
@@ -437,9 +443,9 @@
 			<div class="ob-card-head">
 				<span class="sect-label">Step {obStep} of 3</span>
 				<div class="ob-dots">
-					<div class="ob-dot" class:ob-dot-active={obStep === 1} class:ob-dot-done={obStep > 1} />
-					<div class="ob-dot" class:ob-dot-active={obStep === 2} class:ob-dot-done={obStep > 2} />
-					<div class="ob-dot" class:ob-dot-active={obStep === 3} class:ob-dot-done={obStep > 3} />
+					<div class="ob-dot" class:ob-dot-active={obStep === 1} class:ob-dot-done={obStep > 1}></div>
+					<div class="ob-dot" class:ob-dot-active={obStep === 2} class:ob-dot-done={obStep > 2}></div>
+					<div class="ob-dot" class:ob-dot-active={obStep === 3} class:ob-dot-done={obStep > 3}></div>
 				</div>
 			</div>
 
@@ -451,10 +457,10 @@
 						<span class="ob-notice-icon">{@html icons.shield}</span>
 						<div class="ob-notice-text">Your key is stored locally and never transmitted. There is no recovery if you lose it — so you'll back it up next.</div>
 					</div>
-					<button class="btn-primary btn-full" on:click={obGenerateKeypair} disabled={obGenerating}>
+					<button class="btn-primary btn-full" onclick={obGenerateKeypair} disabled={obGenerating}>
 						{obGenerating ? 'Generating…' : 'Generate my Hoardbook identity'}
 					</button>
-					<button class="btn-ghost btn-full ob-skip" style="margin-top:8px" on:click={() => { importOverlayOpen = true; }}>
+					<button class="btn-ghost btn-full ob-skip" style="margin-top:8px" onclick={() => { importOverlayOpen = true; }}>
 						Already have a Nostr key? Import
 					</button>
 				{:else}
@@ -462,7 +468,7 @@
 					<div class="ob-card-sub">This is your <strong>share code</strong>. Give it only to people you want browsing your collections — anyone holding it can decrypt your listings.</div>
 					<div class="ob-hbid-row">
 						<span class="ob-hbid mono">{$identity?.share_code ?? ''}</span>
-						<button class="btn-ghost btn-sm" on:click={() => { navigator.clipboard.writeText($identity?.share_code ?? ''); toast('Copied', 'success'); }}>Copy</button>
+						<button class="btn-ghost btn-sm" onclick={() => { navigator.clipboard.writeText($identity?.share_code ?? ''); toast('Copied', 'success'); }}>Copy</button>
 					</div>
 					<div class="ob-notice" style="margin-top:12px">
 						<span class="ob-notice-icon">{@html icons.shield}</span>
@@ -472,10 +478,10 @@
 					{#if obBackupPass && !obBackupStrength.acceptable}
 						<div class="ob-card-sub" style="margin-top:4px">{obBackupStrength.reason ?? 'Choose a stronger passphrase.'}</div>
 					{/if}
-					<button class="btn-primary btn-full" style="margin-top:10px" on:click={obExportBackup} disabled={obBackingUp || !obBackupStrength.acceptable}>
+					<button class="btn-primary btn-full" style="margin-top:10px" onclick={obExportBackup} disabled={obBackingUp || !obBackupStrength.acceptable}>
 						{obBackingUp ? 'Exporting…' : 'Export backup file'}
 					</button>
-					<button class="btn-ghost btn-full ob-skip" on:click={() => obStep = 2}>
+					<button class="btn-ghost btn-full ob-skip" onclick={() => obStep = 2}>
 						I'll do it later
 					</button>
 				{/if}
@@ -486,21 +492,21 @@
 					<label class="field-label" for="ob-name">Display name</label>
 					<input id="ob-name" class="hb-input" type="text" placeholder="e.g. DataHoarder_42"
 						bind:value={form.display_name}
-						on:keydown={(e) => e.key === 'Enter' && obSaveName()} />
+						onkeydown={(e) => e.key === 'Enter' && obSaveName()} />
 				</div>
-				<button class="btn-primary btn-full" on:click={obSaveName} disabled={saving}>
+				<button class="btn-primary btn-full" onclick={obSaveName} disabled={saving}>
 					{saving ? 'Saving…' : form.display_name.trim() ? 'Continue →' : 'Skip'}
 				</button>
-				<button class="btn-ghost btn-full ob-skip" on:click={() => obStep = 3}>
+				<button class="btn-ghost btn-full ob-skip" onclick={() => obStep = 3}>
 					Skip
 				</button>
 			{:else if obStep === 3}
 				<div class="ob-card-title">Add your first collection</div>
 				<div class="ob-card-sub">Point Hoardbook at a folder to catalog what you keep. You can scan more folders later from the home screen.</div>
-				<button class="btn-primary btn-full" on:click={() => { openAddModal(); obStep = 4; }}>
+				<button class="btn-primary btn-full" onclick={() => { openAddModal(); obStep = 4; }}>
 					{@html icons.folder} Scan a folder
 				</button>
-				<button class="btn-ghost btn-full ob-skip" on:click={() => obStep = 4}>
+				<button class="btn-ghost btn-full ob-skip" onclick={() => obStep = 4}>
 					Skip for now
 				</button>
 			{/if}
@@ -508,7 +514,7 @@
 	</div>
 
 	{#if importOverlayOpen}
-		<div class="ob-overlay" on:click|self={() => importOverlayOpen = false}>
+		<div class="ob-overlay" onclick={(e) => { if (e.target === e.currentTarget) importOverlayOpen = false; }}>
 			<div class="ob-overlay-card">
 				<div class="ob-card-title">Import an existing Nostr key</div>
 				<div class="ob-card-sub" style="margin-bottom:16px">
@@ -524,10 +530,10 @@
 				</div>
 				<label class="ob-ack"><input type="checkbox" bind:checked={obImportWarnAck} /> I understand the linking implication.</label>
 				<input class="hb-input mono" style="margin-top:10px" type="password" placeholder="nsec1…" bind:value={obImportNsec} />
-				<button class="btn-primary btn-full" style="margin-top:10px" on:click={obImportExistingKey} disabled={!obImportWarnAck || !obImportNsec.trim() || obImporting}>
+				<button class="btn-primary btn-full" style="margin-top:10px" onclick={obImportExistingKey} disabled={!obImportWarnAck || !obImportNsec.trim() || obImporting}>
 					{obImporting ? 'Importing…' : 'Import key'}
 				</button>
-				<button class="btn-ghost btn-full ob-skip" on:click={() => { importOverlayOpen = false; obImportNsec = ''; obImportWarnAck = false; }}>
+				<button class="btn-ghost btn-full ob-skip" onclick={() => { importOverlayOpen = false; obImportNsec = ''; obImportWarnAck = false; }}>
 					Cancel
 				</button>
 			</div>
@@ -549,10 +555,10 @@
 			</div>
 		</div>
 		<div class="topbar-actions">
-			<button class="btn-ghost btn-sm" on:click={handleSave} disabled={!form.display_name || saving}>
+			<button class="btn-ghost btn-sm" onclick={handleSave} disabled={!form.display_name || saving}>
 				{saving ? 'Saving…' : 'Save draft'}
 			</button>
-			<button class="btn-primary btn-sm" class:publish-pulse={neverPublished && !publishing} on:click={handlePublish} disabled={publishing || !profileDirty} title={!profileDirty ? 'No changes since last publish' : undefined}>
+			<button class="btn-primary btn-sm" class:publish-pulse={neverPublished && !publishing} onclick={handlePublish} disabled={publishing || !profileDirty} title={!profileDirty ? 'No changes since last publish' : undefined}>
 				{publishing ? 'Publishing…' : profileDirty ? 'Publish profile' : 'Published ✓'}
 			</button>
 		</div>
@@ -593,14 +599,14 @@
 
 				<div class="field">
 					<label class="field-label">Languages</label>
-					<!-- svelte-ignore a11y-click-events-have-key-events -->
-					<!-- svelte-ignore a11y-no-static-element-interactions -->
+					<!-- svelte-ignore a11y_click_events_have_key_events -->
+					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div class="lang-wrap-outer">
-						<div class="tag-wrap" on:click={(e) => { if (e.target === e.currentTarget) e.currentTarget.querySelector('input')?.focus(); }}>
+						<div class="tag-wrap" onclick={(e) => { if (e.target === e.currentTarget) e.currentTarget.querySelector('input')?.focus(); }}>
 							{#each form.languages as lang, i (lang)}
 								<span class="lang-tag">
 									{lang}
-									<button class="lang-x" on:click={() => removeLang(i)} title="Remove">×</button>
+									<button class="lang-x" onclick={() => removeLang(i)} title="Remove">×</button>
 								</span>
 							{/each}
 							<input
@@ -608,14 +614,14 @@
 								type="text"
 								placeholder={form.languages.length === 0 ? 'English, 日本語…' : 'Add…'}
 								bind:value={langInput}
-								on:keydown={handleLangKey}
+								onkeydown={handleLangKey}
 							/>
 						</div>
 						{#if langSuggestions.length > 0}
 							<div class="lang-suggestions">
 								{#each langSuggestions.slice(0, 5) as s (s)}
-									<!-- svelte-ignore a11y-click-events-have-key-events -->
-									<div class="lang-suggestion" on:click={() => addLang(s)} role="option" aria-selected="false">{s}</div>
+									<!-- svelte-ignore a11y_click_events_have_key_events -->
+									<div class="lang-suggestion" onclick={() => addLang(s)} role="option" aria-selected="false">{s}</div>
 								{/each}
 							</div>
 						{/if}
@@ -641,10 +647,10 @@
 								class:social-icon-active={!!(link?.handle)}
 								class:social-icon-selected={activeSocialPlatform === p.value}
 								title={p.label + (link?.handle ? ': ' + link.handle : '')}
-								on:click={() => toggleSocialPlatform(p.value)}
+								onclick={() => toggleSocialPlatform(p.value)}
 							>
 								<span class="social-icon-abbr">{@html socialIcons[p.value] ?? p.abbr}</span>
-								{#if link?.handle}<span class="social-icon-dot" />{/if}
+								{#if link?.handle}<span class="social-icon-dot"></span>{/if}
 							</button>
 						{/each}
 					</div>
@@ -658,10 +664,10 @@
 								type="text"
 								placeholder="username or handle"
 								value={activeLink?.handle ?? ''}
-								on:input={(e) => { if (activeSocialPlatform) setSocialHandle(activeSocialPlatform, e.currentTarget.value); }}
+								oninput={(e) => { if (activeSocialPlatform) setSocialHandle(activeSocialPlatform, e.currentTarget.value); }}
 							/>
 							{#if activeLink?.handle}
-								<button class="social-remove" on:click={() => { if (activeSocialPlatform) removeSocialByPlatform(activeSocialPlatform); }} title="Remove">×</button>
+								<button class="social-remove" onclick={() => { if (activeSocialPlatform) removeSocialByPlatform(activeSocialPlatform); }} title="Remove">×</button>
 							{/if}
 						</div>
 					{/if}
@@ -671,10 +677,10 @@
 					<label class="field-label">Tags</label>
 					<div class="tag-wrap">
 						{#each form.tags as tag, i (tag)}
-							<span class="lang-tag">{tag}<button class="lang-x" on:click={() => removeTag(i)} title="Remove">×</button></span>
+							<span class="lang-tag">{tag}<button class="lang-x" onclick={() => removeTag(i)} title="Remove">×</button></span>
 						{/each}
 						<input class="lang-input" type="text" placeholder="anime, scifi, docs…"
-							bind:value={tagInput} on:keydown={handleTagKey} />
+							bind:value={tagInput} onkeydown={handleTagKey} />
 					</div>
 				</div>
 
@@ -683,7 +689,7 @@
 					<div class="willing-row">
 						{#each WILLING_OPTIONS as opt (opt)}
 							<button class="willing-btn" class:willing-active={form.willing_to.includes(opt)}
-								on:click={() => toggleWilling(opt)}>
+								onclick={() => toggleWilling(opt)}>
 								{opt}
 							</button>
 						{/each}
@@ -711,7 +717,7 @@
 					<div class="coll-title">Collections</div>
 					<div class="coll-sub">{$collections.filter(c => c.published).length} of {$collections.length} published · {totalItems.toLocaleString()} items</div>
 				</div>
-				<button class="btn-add" on:click={openAddModal}>
+				<button class="btn-add" onclick={openAddModal}>
 					<span>{@html icons.plus}</span>Add collection
 				</button>
 			</div>
@@ -739,12 +745,12 @@
 					{#each $collections as col (col.slug)}
 						<CollectionRow
 							collection={col}
-							on:rescan={() => openRescan(col)}
-							on:edit={() => openEditDetails(col)}
-							on:publish={() => handlePublishCollection(col.slug)}
-							on:unpublish={() => handleUnpublishCollection(col.slug)}
-							on:remove={() => handleDeleteCollection(col.slug)}
-							on:export={(e) => handleExport(e.detail.slug, e.detail.format)}
+							onrescan={() => openRescan(col)}
+							onedit={() => openEditDetails(col)}
+							onpublish={() => handlePublishCollection(col.slug)}
+							onunpublish={() => handleUnpublishCollection(col.slug)}
+							onremove={() => handleDeleteCollection(col.slug)}
+							onexport={(detail) => handleExport(detail.slug, detail.format)}
 						/>
 					{/each}
 				{/if}
@@ -752,8 +758,8 @@
 		</div>
 	</div>
 
-	<ScanDialog bind:open={scanOpen} title={scanTitle} initialPath={scanInitialPath} initialAlias={scanInitialAlias} on:scanned={onScanned} />
-	<AddCollectionModal bind:open={addModalOpen} editCollection={editTarget} on:scanned={onScanned} on:saved={onWizardSaved} on:published={onWizardPublished} />
+	<ScanDialog bind:open={scanOpen} title={scanTitle} initialPath={scanInitialPath} initialAlias={scanInitialAlias} onscanned={handleScannedCollection} />
+	<AddCollectionModal bind:open={addModalOpen} editCollection={editTarget} onscanned={handleScannedCollection} onsaved={onWizardSaved} onpublished={onWizardPublished} />
 {/if}
 
 <style>

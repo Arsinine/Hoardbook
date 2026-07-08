@@ -3,33 +3,33 @@
 	// editor. The [⋯] overflow menu is rendered `position: fixed`, anchored via getBoundingClientRect(),
 	// so no `overflow: hidden` ancestor can clip it (the original devtest #2 bug — it lived in a
 	// scrolling `.coll-list`/`.collections-pane`).
-	import { createEventDispatcher } from 'svelte';
 	import type { Collection } from '../types.js';
 	import { deriveRowChip, menuItems, badges, type RowMenuItem } from '../collection-row-view.js';
 	import CollectionPanel from './CollectionPanel.svelte';
 	import ConfirmButton from './ConfirmButton.svelte';
 	import { icons } from '../icons.js';
 
-	export let collection: Collection;
+	interface Props {
+		collection: Collection;
+		onrescan?: (collection: Collection) => void;
+		onedit?: (collection: Collection) => void;
+		onpublish?: (collection: Collection) => void;
+		onunpublish?: (collection: Collection) => void;
+		onremove?: (collection: Collection) => void;
+		onexport?: (detail: { slug: string; format: 'text' | 'markdown' }) => void;
+	}
 
-	const dispatch = createEventDispatcher<{
-		rescan: Collection;
-		edit: Collection;
-		publish: Collection;
-		unpublish: Collection;
-		remove: Collection;
-		export: { slug: string; format: 'text' | 'markdown' };
-	}>();
+	let { collection, onrescan, onedit, onpublish, onunpublish, onremove, onexport }: Props = $props();
 
-	let rowExpanded = false;
-	let menuOpen = false;
-	let exportOpen = false;
-	let menuBtnEl: HTMLButtonElement;
-	let menuPos = { top: 0, left: 0 };
+	let rowExpanded = $state(false);
+	let menuOpen = $state(false);
+	let exportOpen = $state(false);
+	let menuBtnEl: HTMLButtonElement | undefined = $state();
+	let menuPos = $state({ top: 0, left: 0 });
 
-	$: chip = deriveRowChip(collection);
-	$: items = menuItems(collection);
-	$: rowBadges = badges(collection);
+	let chip = $derived(deriveRowChip(collection));
+	let items = $derived(menuItems(collection));
+	let rowBadges = $derived(badges(collection));
 
 	function fmtBytes(b: number): string {
 		const GB = 1073741824, MB = 1048576, KB = 1024;
@@ -58,27 +58,27 @@
 			exportOpen = !exportOpen;
 			return;
 		}
-		if (item.key === 'rescan') dispatch('rescan', collection);
-		else if (item.key === 'edit') dispatch('edit', collection);
-		else if (item.key === 'publish') dispatch('publish', collection);
-		else if (item.key === 'unpublish') dispatch('unpublish', collection);
+		if (item.key === 'rescan') onrescan?.(collection);
+		else if (item.key === 'edit') onedit?.(collection);
+		else if (item.key === 'publish') onpublish?.(collection);
+		else if (item.key === 'unpublish') onunpublish?.(collection);
 		closeMenu();
 	}
 
 	function handleExportClick(format: 'text' | 'markdown') {
-		dispatch('export', { slug: collection.slug, format });
+		onexport?.({ slug: collection.slug, format });
 		closeMenu();
 	}
 
 	function handleRemoveConfirm() {
-		dispatch('remove', collection);
+		onremove?.(collection);
 		closeMenu();
 	}
 </script>
 
 <div class="row">
-	<!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-	<div class="row-head" on:click={() => (rowExpanded = !rowExpanded)}>
+	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+	<div class="row-head" onclick={() => (rowExpanded = !rowExpanded)}>
 		<span class="chevron" class:chevron-open={rowExpanded}>{@html icons.chevronDown}</span>
 		<div class="row-icon">{@html icons.folder}</div>
 		<div class="row-info">
@@ -98,8 +98,8 @@
 			{/each}
 			<span class="chip-status" class:chip-published={chip === 'Published'}>{chip}</span>
 		</div>
-		<!-- svelte-ignore a11y-click-events-have-key-events -->
-		<div class="row-menu-wrap" on:click|stopPropagation>
+		<!-- svelte-ignore a11y_click_events_have_key_events -->
+		<div class="row-menu-wrap" onclick={(e) => e.stopPropagation()}>
 			<button
 				type="button"
 				class="row-menu-btn"
@@ -107,7 +107,7 @@
 				aria-haspopup="true"
 				aria-expanded={menuOpen}
 				bind:this={menuBtnEl}
-				on:click={toggleMenu}
+				onclick={toggleMenu}
 			>⋯</button>
 		</div>
 	</div>
@@ -120,18 +120,18 @@
 </div>
 
 {#if menuOpen}
-	<!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-	<div class="menu-backdrop" on:click={closeMenu} />
+	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+	<div class="menu-backdrop" onclick={closeMenu}></div>
 	<div class="row-menu" role="menu" style="top:{menuPos.top}px; left:{menuPos.left}px">
 		{#each items as item (item.key)}
 			{#if item.key === 'export'}
-				<button type="button" role="menuitem" class="menu-item" on:click={() => handleItemClick(item)}>
+				<button type="button" role="menuitem" class="menu-item" onclick={() => handleItemClick(item)}>
 					{item.label}<span class="submenu-caret" aria-hidden="true">▸</span>
 				</button>
 				{#if exportOpen}
 					<div class="submenu">
 						{#each item.submenu as sub (sub.key)}
-							<button type="button" role="menuitem" class="menu-item menu-item-sub" on:click={() => handleExportClick(sub.key)}>
+							<button type="button" role="menuitem" class="menu-item menu-item-sub" onclick={() => handleExportClick(sub.key)}>
 								{sub.label}
 							</button>
 						{/each}
@@ -139,10 +139,10 @@
 				{/if}
 			{:else if item.key === 'remove'}
 				<div class="menu-item menu-item-confirm">
-					<ConfirmButton role="menuitem" label={item.label} on:confirm={handleRemoveConfirm} />
+					<ConfirmButton role="menuitem" label={item.label} onconfirm={handleRemoveConfirm} />
 				</div>
 			{:else}
-				<button type="button" role="menuitem" class="menu-item" on:click={() => handleItemClick(item)}>
+				<button type="button" role="menuitem" class="menu-item" onclick={() => handleItemClick(item)}>
 					{item.label}
 				</button>
 			{/if}

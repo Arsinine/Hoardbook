@@ -15,21 +15,21 @@
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
 
-	let generating = false;
-	let copied = false;
-	let appVersion = '';
+	let generating = $state(false);
+	let copied = $state(false);
+	let appVersion = $state('');
 
 	// Full settings object, preserved so saving one field never resets the others (the M5 fields
 	// privacy_notice_acknowledged / last_seen_version + the M9 snapshot/online toggles live here too).
-	let settings: Settings = {
+	let settings: Settings = $state({
 		relay_urls: [], allow_dms: true, privacy_notice_acknowledged: false,
 		last_seen_version: '',
 		snapshot_auto_update: true, snapshot_reconcile_poll: false, show_online_count: true,
-	};
+	});
 
 	// ── 3-key identity view + share-code QR ──────────────────────────────────────
-	$: kv = $identity ? keyView($identity) : null;
-	let shareQrSvg = '';
+	let kv = $derived($identity ? keyView($identity) : null);
+	let shareQrSvg = $state('');
 
 	async function showShareQr() {
 		try {
@@ -40,10 +40,10 @@
 
 	// ── Backup / restore ─────────────────────────────────────────────────────────
 	const backupModes = backupModeOptions();
-	let backupMode: BackupMode = 'passphrase';
-	let backupPass = '';
-	let backingUp = false;
-	$: backupStrength = passphraseStrength(backupPass);
+	let backupMode: BackupMode = $state('passphrase');
+	let backupPass = $state('');
+	let backingUp = $state(false);
+	let backupStrength = $derived(passphraseStrength(backupPass));
 
 	async function handleBackup() {
 		if (backupMode === 'passphrase' && !backupStrength.acceptable) {
@@ -72,10 +72,10 @@
 	}
 
 	// Restore: pick a file → peek (does it need a passphrase?) → confirm wipe → restore → relaunch.
-	let restoreNeedsPass = false;
-	let restorePass = '';
-	let restorePath: string | null = null;
-	let restoring = false;
+	let restoreNeedsPass = $state(false);
+	let restorePass = $state('');
+	let restorePath: string | null = $state(null);
+	let restoring = $state(false);
 
 	async function pickRestore() {
 		const path = await openFileDialog({
@@ -111,10 +111,10 @@
 	}
 
 	// ── Import a different Nostr key (always warns about linking) ─────────────────
-	let importOpen = false;
-	let importNsecValue = '';
-	let importWarnAck = false;
-	let importingNsec = false;
+	let importOpen = $state(false);
+	let importNsecValue = $state('');
+	let importWarnAck = $state(false);
+	let importingNsec = $state(false);
 
 	async function handleImportNsec() {
 		importingNsec = true;
@@ -128,12 +128,12 @@
 	}
 
 	// ── Updates (Obsidian deferred-install) ──────────────────────────────────────
-	let updateChecking = false;
-	let updateStaging = false;
-	let updateInfo: UpdateInfo | null = null;
-	let updateChecked = false;
-	let updateError = '';
-	let stagedVersion: string | null = null;
+	let updateChecking = $state(false);
+	let updateStaging = $state(false);
+	let updateInfo: UpdateInfo | null = $state(null);
+	let updateChecked = $state(false);
+	let updateError = $state('');
+	let stagedVersion: string | null = $state(null);
 
 	async function doCheckUpdate() {
 		updateChecking = true;
@@ -166,13 +166,13 @@
 		try { await applyStagedUpdate(); } catch (e) { toast(String(e), 'error'); }
 	}
 
-	let relayUrls: string[] = [];
-	let newRelay = '';
-	let savingRelays = false;
-	let addingRelay = false;
+	let relayUrls: string[] = $state([]);
+	let newRelay = $state('');
+	let savingRelays = $state(false);
+	let addingRelay = $state(false);
 
 	type RelayStatus = 'checking' | 'ok' | 'error';
-	let relayStatuses: Record<string, RelayStatus> = {};
+	let relayStatuses: Record<string, RelayStatus> = $state({});
 
 	async function probeRelay(url: string) {
 		relayStatuses[url] = 'checking';
@@ -206,10 +206,10 @@
 	}
 	onDestroy(() => { if (liveStatusTimer) clearInterval(liveStatusTimer); });
 
-	$: allowDms = settings.allow_dms;
+	let allowDms = $derived(settings.allow_dms);
 
-	let wipeConfirm = false;
-	let wiping = false;
+	let wipeConfirm = $state(false);
+	let wiping = $state(false);
 
 	onMount(async () => {
 		try { appVersion = await getVersion(); } catch { appVersion = ''; }
@@ -282,8 +282,8 @@
 	}
 
 	// M9 reactive mirrors of the snapshot toggles (preserved through full-object saves).
-	$: snapshotAutoUpdate = settings.snapshot_auto_update;
-	$: snapshotReconcilePoll = settings.snapshot_reconcile_poll;
+	let snapshotAutoUpdate = $derived(settings.snapshot_auto_update);
+	let snapshotReconcilePoll = $derived(settings.snapshot_reconcile_poll);
 
 	// Toggle one boolean field and persist the whole object (never drop another field — the M5
 	// fullSettings() gotcha).
@@ -349,7 +349,7 @@
 	}
 
 	// Watches
-	let watches: Watch[] = [];
+	let watches: Watch[] = $state([]);
 
 	async function loadWatches() {
 		try { watches = await watchesGet(); } catch { /* no watches */ }
@@ -368,9 +368,9 @@
 		return new Date(iso).toLocaleDateString();
 	}
 
-	$: idName = $profile?.display_name ?? 'You';
-	$: idInitial = idName[0]?.toUpperCase() ?? 'Y';
-	$: idHue = avatarHue(idInitial);
+	let idName = $derived($profile?.display_name ?? 'You');
+	let idInitial = $derived(idName[0]?.toUpperCase() ?? 'Y');
+	let idHue = $derived(avatarHue(idInitial));
 
 	function relayDotColor(status: RelayStatus | undefined) {
 		if (status === 'ok') return 'var(--online)';
@@ -406,7 +406,7 @@
 					<div class="identity-name">{idName}</div>
 					<div class="identity-created">Nostr identity (npub)</div>
 				</div>
-				<span class="pill pill-online"><span class="pill-dot" />Active</span>
+				<span class="pill pill-online"><span class="pill-dot"></span>Active</span>
 			</div>
 
 			<!-- The three keys: npub (irreplaceable), iroh node key (public), share code (carries the browse-key). -->
@@ -414,9 +414,9 @@
 				<div class="field-label" style="margin-bottom:4px">{row.label}{#if row.sensitive} <span class="key-secret">secret</span>{/if}</div>
 				<div class="id-display">
 					<span class="id-text">{row.value}</span>
-					<button class="icon-btn" on:click={() => handleCopy(row.value)} title={row.label === 'Share code' ? 'Copy share code' : 'Copy npub'}>{@html icons.copy}</button>
+					<button class="icon-btn" onclick={() => handleCopy(row.value)} title={row.label === 'Share code' ? 'Copy share code' : 'Copy npub'}>{@html icons.copy}</button>
 					{#if row.label === 'Share code'}
-						<button class="icon-btn" on:click={showShareQr} title="Show QR code">{@html icons.qr}</button>
+						<button class="icon-btn" onclick={showShareQr} title="Show QR code">{@html icons.qr}</button>
 					{/if}
 				</div>
 				{#if row.hint}<div class="id-hint" style="margin-bottom:12px">{row.hint}</div>{/if}
@@ -467,18 +467,18 @@
 				{/if}
 			{/if}
 			<div style="display:flex; gap:8px; flex-wrap:wrap;">
-				<button class="btn-primary btn-sm" on:click={handleBackup} disabled={backingUp || (backupMode === 'passphrase' && !backupStrength.acceptable)}>
+				<button class="btn-primary btn-sm" onclick={handleBackup} disabled={backingUp || (backupMode === 'passphrase' && !backupStrength.acceptable)}>
 					{backingUp ? 'Exporting…' : 'Export backup'}
 				</button>
-				<button class="btn-default btn-sm" on:click={pickRestore} disabled={restoring}>
+				<button class="btn-default btn-sm" onclick={pickRestore} disabled={restoring}>
 					{@html icons.key} {restoring ? 'Restoring…' : 'Restore from backup'}
 				</button>
 			</div>
 			{#if restoreNeedsPass && restorePath}
 				<div class="restore-pass">
 					<input class="hb-input" type="password" placeholder="Backup passphrase" bind:value={restorePass} />
-					<button class="btn-primary btn-sm" on:click={doRestore} disabled={!restorePass || restoring}>Restore</button>
-					<button class="btn-ghost btn-sm" on:click={() => { restorePath = null; restoreNeedsPass = false; }}>Cancel</button>
+					<button class="btn-primary btn-sm" onclick={doRestore} disabled={!restorePass || restoring}>Restore</button>
+					<button class="btn-ghost btn-sm" onclick={() => { restorePath = null; restoreNeedsPass = false; }}>Cancel</button>
 				</div>
 			{/if}
 		</div>
@@ -492,7 +492,7 @@
 						<div class="toggle-label">Import an existing Nostr key</div>
 						<div class="toggle-sub">Replaces this identity. Wipe data first if you already have one.</div>
 					</div>
-					<button class="btn-default btn-sm" on:click={() => (importOpen = true)}>Import nsec</button>
+					<button class="btn-default btn-sm" onclick={() => (importOpen = true)}>Import nsec</button>
 				</div>
 			{:else}
 				<div class="link-warn">
@@ -503,10 +503,10 @@
 				<label class="ack-row"><input type="checkbox" bind:checked={importWarnAck} /> I understand the linking implication.</label>
 				<input class="hb-input hb-mono" type="password" placeholder="nsec1…" bind:value={importNsecValue} />
 				<div style="display:flex; gap:8px;">
-					<button class="btn-primary btn-sm" on:click={handleImportNsec} disabled={!importWarnAck || !importNsecValue.trim() || importingNsec}>
+					<button class="btn-primary btn-sm" onclick={handleImportNsec} disabled={!importWarnAck || !importNsecValue.trim() || importingNsec}>
 						{importingNsec ? 'Importing…' : 'Import key'}
 					</button>
-					<button class="btn-ghost btn-sm" on:click={() => { importOpen = false; importNsecValue = ''; importWarnAck = false; }}>Cancel</button>
+					<button class="btn-ghost btn-sm" onclick={() => { importOpen = false; importNsecValue = ''; importWarnAck = false; }}>Cancel</button>
 				</div>
 			{/if}
 		</div>
@@ -514,18 +514,18 @@
 		<div class="surface">
 			<p class="no-id-text">No identity yet. Generate one, or restore from a backup.</p>
 			<div style="display:flex; gap:8px; flex-wrap:wrap;">
-				<button class="btn-primary" on:click={handleGenerate} disabled={generating}>
+				<button class="btn-primary" onclick={handleGenerate} disabled={generating}>
 					{generating ? 'Generating…' : 'Generate identity'}
 				</button>
-				<button class="btn-default" on:click={pickRestore} disabled={restoring}>
+				<button class="btn-default" onclick={pickRestore} disabled={restoring}>
 					{@html icons.key} {restoring ? 'Restoring…' : 'Restore from backup'}
 				</button>
 			</div>
 			{#if restoreNeedsPass && restorePath}
 				<div class="restore-pass">
 					<input class="hb-input" type="password" placeholder="Backup passphrase" bind:value={restorePass} />
-					<button class="btn-primary btn-sm" on:click={doRestore} disabled={!restorePass || restoring}>Restore</button>
-					<button class="btn-ghost btn-sm" on:click={() => { restorePath = null; restoreNeedsPass = false; }}>Cancel</button>
+					<button class="btn-primary btn-sm" onclick={doRestore} disabled={!restorePass || restoring}>Restore</button>
+					<button class="btn-ghost btn-sm" onclick={() => { restorePath = null; restoreNeedsPass = false; }}>Cancel</button>
 				</div>
 			{/if}
 		</div>
@@ -540,15 +540,15 @@
 		{#each relayUrls as url (url)}
 			{@const status = relayStatuses[url]}
 			<div class="relay-row">
-				<div class="relay-dot" style="background:{relayDotColor(status)}" class:relay-dot-pulse={status === 'checking'} />
+				<div class="relay-dot" style="background:{relayDotColor(status)}" class:relay-dot-pulse={status === 'checking'}></div>
 				<div class="relay-info">
 					<div class="relay-url">{url}</div>
 					<div class="relay-meta">
 						<span class:status-ok={status === 'ok'} class:status-err={status === 'error'}>{relayStatusLabel(status)}</span>
 					</div>
 				</div>
-				<button class="icon-btn" title="Re-check" on:click={() => probeRelay(url)}>{@html icons.refresh}</button>
-				<button class="icon-btn" on:click={() => removeRelay(url)}>{@html icons.close}</button>
+				<button class="icon-btn" title="Re-check" onclick={() => probeRelay(url)}>{@html icons.refresh}</button>
+				<button class="icon-btn" onclick={() => removeRelay(url)}>{@html icons.close}</button>
 			</div>
 		{/each}
 		<!-- Add relay row -->
@@ -558,12 +558,12 @@
 				type="text"
 				placeholder="wss://relay.example.com"
 				bind:value={newRelay}
-				on:keydown={(e) => e.key === 'Enter' && addRelay()}
+				onkeydown={(e) => e.key === 'Enter' && addRelay()}
 			/>
-			<button class="btn-default btn-sm" on:click={addRelay} disabled={!newRelay.trim() || addingRelay}>
+			<button class="btn-default btn-sm" onclick={addRelay} disabled={!newRelay.trim() || addingRelay}>
 				{addingRelay ? 'Checking…' : 'Add'}
 			</button>
-			<button class="btn-primary btn-sm" on:click={handleSaveRelays} disabled={savingRelays}>
+			<button class="btn-primary btn-sm" onclick={handleSaveRelays} disabled={savingRelays}>
 				{savingRelays ? 'Saving…' : 'Save'}
 			</button>
 		</div>
@@ -578,8 +578,8 @@
 				<div class="toggle-label">Allow incoming messages from anyone</div>
 				<div class="toggle-sub">Off means only your contacts can DM you</div>
 			</div>
-			<button class="toggle" class:toggle-on={allowDms} on:click={toggleAllowDms}>
-				<span class="toggle-thumb" />
+			<button class="toggle" class:toggle-on={allowDms} onclick={toggleAllowDms} aria-label="Allow incoming messages from anyone">
+				<span class="toggle-thumb"></span>
 			</button>
 		</div>
 
@@ -592,8 +592,8 @@
 					host makes on an SMB share — those reconcile on launch.
 				</div>
 			</div>
-			<button class="toggle" class:toggle-on={snapshotAutoUpdate} on:click={() => toggleSetting('snapshot_auto_update')}>
-				<span class="toggle-thumb" />
+			<button class="toggle" class:toggle-on={snapshotAutoUpdate} onclick={() => toggleSetting('snapshot_auto_update')} aria-label="Auto-update snapshots on change">
+				<span class="toggle-thumb"></span>
 			</button>
 		</div>
 
@@ -602,8 +602,8 @@
 				<div class="toggle-label">Reconcile poll for remotely-edited collections</div>
 				<div class="toggle-sub">Low-frequency re-check for collections you edit from another host (SMB). Off by default.</div>
 			</div>
-			<button class="toggle" class:toggle-on={snapshotReconcilePoll} on:click={() => toggleSetting('snapshot_reconcile_poll')}>
-				<span class="toggle-thumb" />
+			<button class="toggle" class:toggle-on={snapshotReconcilePoll} onclick={() => toggleSetting('snapshot_reconcile_poll')} aria-label="Reconcile poll for remotely-edited collections">
+				<span class="toggle-thumb"></span>
 			</button>
 		</div>
 	</div>
@@ -620,16 +620,16 @@
 			<div class="update-actions">
 				{#if stagedVersion}
 					<span class="update-available-text">v{stagedVersion} downloaded</span>
-					<button class="btn-primary btn-sm" on:click={doApplyUpdate}>Restart &amp; apply</button>
+					<button class="btn-primary btn-sm" onclick={doApplyUpdate}>Restart &amp; apply</button>
 				{:else if updateInfo}
 					<span class="update-available-text">v{updateInfo.version} available</span>
-					<button class="btn-primary btn-sm" on:click={doDownloadUpdate} disabled={updateStaging}>
+					<button class="btn-primary btn-sm" onclick={doDownloadUpdate} disabled={updateStaging}>
 						{updateStaging ? 'Downloading…' : 'Download update'}
 					</button>
 				{:else if updateChecked}
 					<span class="update-ok-text">Up to date</span>
 				{/if}
-				<button class="btn-default btn-sm" on:click={doCheckUpdate} disabled={updateChecking}>
+				<button class="btn-default btn-sm" onclick={doCheckUpdate} disabled={updateChecking}>
 					{updateChecking ? 'Checking…' : 'Check for updates'}
 				</button>
 			</div>
@@ -664,7 +664,7 @@
 								<span class="watch-fired">Last triggered: {formatWatchDate(w.last_fired)}</span>
 							</div>
 						</div>
-						<button class="btn-ghost btn-sm btn-danger-text" on:click={() => handleDeleteWatch(w.name)}>Delete</button>
+						<button class="btn-ghost btn-sm btn-danger-text" onclick={() => handleDeleteWatch(w.name)}>Delete</button>
 					</div>
 				{/each}
 			</div>
@@ -681,14 +681,14 @@
 				<div class="toggle-sub">Permanently removes your identity, profile, and app data from this device. Your actual files on disk are not touched — only Hoardbook's database is cleared.</div>
 			</div>
 			{#if !wipeConfirm}
-				<button class="btn-danger btn-sm" on:click={() => (wipeConfirm = true)}>Wipe data</button>
+				<button class="btn-danger btn-sm" onclick={() => (wipeConfirm = true)}>Wipe data</button>
 			{:else}
 				<div class="wipe-confirm">
 					<span class="wipe-warn">Are you sure? This is permanent.</span>
-					<button class="btn-danger btn-sm" on:click={handleWipe} disabled={wiping}>
+					<button class="btn-danger btn-sm" onclick={handleWipe} disabled={wiping}>
 						{wiping ? 'Wiping…' : 'Confirm wipe'}
 					</button>
-					<button class="btn-ghost btn-sm" on:click={() => (wipeConfirm = false)}>Cancel</button>
+					<button class="btn-ghost btn-sm" onclick={() => (wipeConfirm = false)}>Cancel</button>
 				</div>
 			{/if}
 		</div>

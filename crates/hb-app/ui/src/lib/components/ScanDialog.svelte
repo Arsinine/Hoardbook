@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { createEventDispatcher } from 'svelte';
 	import { open as openDialog } from '@tauri-apps/plugin-dialog';
 	import { scanDirectory, listSubdirs } from '../api.js';
 	import { toast } from '../stores.js';
@@ -8,42 +7,41 @@
 	import ScanTreeNode from './ScanTreeNode.svelte';
 	import type { Collection, SubdirEntry } from '../types.js';
 
-	const dispatch = createEventDispatcher<{ scanned: Collection; close: void }>();
+	interface Props {
+		open?: boolean;
+		initialPath?: string;
+		initialAlias?: string;
+		title?: string;
+		onscanned?: (collection: Collection) => void;
+		onclose?: () => void;
+	}
 
-	export let open = false;
-	export let initialPath = '';
-	export let initialAlias = '';
-	export let title = 'Add collection';
+	let {
+		open = $bindable(false),
+		initialPath = '',
+		initialAlias = '',
+		title = 'Add collection',
+		onscanned,
+		onclose
+	}: Props = $props();
 
-	let path = '';
-	let pathAlias = '';
-	let excludeRaw = '';
-	let scanning = false;
+	let path = $state('');
+	let pathAlias = $state('');
+	let excludeRaw = $state('');
+	let scanning = $state(false);
 
 	// Folder-tree picker state (M8 — replaces the scan-depth slider, HANDOVER §A2.1).
-	let topLevel: SubdirEntry[] | null = null;
-	let checked = new Set<string>();
-	let treeLoading = false;
-	let treeError = '';
+	let topLevel: SubdirEntry[] | null = $state(null);
+	let checked = $state(new Set<string>());
+	let treeLoading = $state(false);
+	let treeError = $state('');
 	let loadedPath = '';
+	// Not reactive on purpose — a plain transition-edge flag, never read by the template, so it
+	// mustn't be part of the effect's own dependency tracking (avoids a self-triggering effect).
 	let wasOpen = false;
 
-	$: if (open) {
-		path = initialPath;
-		pathAlias = initialAlias;
-	}
 
-	// Load the tree once per open transition when a path is already known (re-scan reopen).
-	$: {
-		if (open && !wasOpen) {
-			wasOpen = true;
-			if (initialPath) loadTopLevel(initialPath);
-		} else if (!open && wasOpen) {
-			wasOpen = false;
-		}
-	}
 
-	$: selectedCount = checked.size;
 
 	async function loadTopLevel(p: string) {
 		if (!p) return;
@@ -91,9 +89,9 @@
 			const exclude = excludeRaw.split(',').map((s) => s.trim()).filter(Boolean);
 			const include = serializeInclude(checked);
 			const collection = await scanDirectory({ path, path_alias: pathAlias, include, exclude });
-			// Only dispatch result if the dialog is still open (user didn't cancel mid-scan).
+			// Only report the result if the dialog is still open (user didn't cancel mid-scan).
 			if (open) {
-				dispatch('scanned', collection);
+				onscanned?.(collection);
 				close();
 			}
 		} catch (e) {
@@ -112,23 +110,39 @@
 		checked = new Set();
 		treeError = '';
 		loadedPath = '';
-		dispatch('close');
+		onclose?.();
 	}
+	$effect(() => {
+		if (open) {
+			path = initialPath;
+			pathAlias = initialAlias;
+		}
+	});
+	// Load the tree once per open transition when a path is already known (re-scan reopen).
+	$effect(() => {
+		if (open && !wasOpen) {
+			wasOpen = true;
+			if (initialPath) loadTopLevel(initialPath);
+		} else if (!open && wasOpen) {
+			wasOpen = false;
+		}
+	});
+	let selectedCount = $derived(checked.size);
 </script>
 
 {#if open}
-	<!-- svelte-ignore a11y-no-static-element-interactions -->
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div
 		class="backdrop"
-		on:click|self={close}
-		on:keydown={(e) => e.key === 'Escape' && close()}
+		onclick={(e) => { if (e.target === e.currentTarget) close(); }}
+		onkeydown={(e) => e.key === 'Escape' && close()}
 		role="presentation"
 	>
 		<div class="modal">
 			<!-- Header -->
 			<div class="modal-header">
 				<div class="modal-title">{title}</div>
-				<button class="close-btn" on:click={close}>{@html icons.close}</button>
+				<button class="close-btn" onclick={close}>{@html icons.close}</button>
 			</div>
 
 			<!-- Body -->
@@ -146,7 +160,7 @@
 								bind:value={path}
 							/>
 						</div>
-						<button class="btn-default btn-sm" on:click={browse}>Browse…</button>
+						<button class="btn-default btn-sm" onclick={browse}>Browse…</button>
 					</div>
 				</div>
 
@@ -162,8 +176,8 @@
 						<span class="field-label">Folders to include</span>
 						{#if topLevel && topLevel.length > 0}
 							<div class="tree-actions">
-								<button class="link-btn" type="button" on:click={selectAll}>Select all</button>
-								<button class="link-btn" type="button" on:click={clearAll}>Clear</button>
+								<button class="link-btn" type="button" onclick={selectAll}>Select all</button>
+								<button class="link-btn" type="button" onclick={clearAll}>Clear</button>
 							</div>
 						{/if}
 					</div>
@@ -176,7 +190,7 @@
 							<div class="tree-hint">Choose a directory above, then pick which folders to include.</div>
 						{:else if topLevel === null}
 							<div class="tree-hint">
-								<button class="link-btn" type="button" on:click={() => loadTopLevel(path)}>
+								<button class="link-btn" type="button" onclick={() => loadTopLevel(path)}>
 									List folders in this directory
 								</button>
 							</div>
@@ -214,10 +228,10 @@
 			<div class="modal-footer">
 				<span class="footer-hint">Large folders can take a few minutes to scan</span>
 				<div class="footer-actions">
-					<button class="btn-ghost btn-sm" on:click={close}>Cancel</button>
+					<button class="btn-ghost btn-sm" onclick={close}>Cancel</button>
 					<button
 						class="btn-primary btn-sm"
-						on:click={handleScan}
+						onclick={handleScan}
 						disabled={!path || !pathAlias || scanning}
 					>
 						{scanning ? 'Scanning…' : 'Start scan'}

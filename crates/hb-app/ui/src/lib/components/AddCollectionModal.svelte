@@ -2,45 +2,56 @@
 	// Two-step Add-collection wizard (M13 W5 Slice 1): Step 1 "Source" reuses ScanDialog to pick a
 	// folder; Step 2 "Details" is CollectionDetailsForm. Also doubles as the "Edit details" reopen
 	// (pass `editCollection` to jump straight to step 2 for an already-scanned collection).
-	import { createEventDispatcher } from 'svelte';
 	import ScanDialog from './ScanDialog.svelte';
 	import CollectionDetailsForm from './CollectionDetailsForm.svelte';
 	import type { Collection } from '../types.js';
 
-	export let open = false;
-	/** When set, the wizard skips the Source step and opens straight into Details for this collection. */
-	export let editCollection: Collection | null = null;
+	interface Props {
+		open?: boolean;
+		/** When set, the wizard skips the Source step and opens straight into Details for this collection. */
+		editCollection?: Collection | null;
+		onscanned?: (collection: Collection) => void;
+		onsaved?: (collection: Collection) => void;
+		onpublished?: (collection: Collection) => void;
+		onclose?: () => void;
+	}
 
-	const dispatch = createEventDispatcher<{
-		scanned: Collection;
-		saved: Collection;
-		published: Collection;
-		close: void;
-	}>();
+	let {
+		open = $bindable(false),
+		editCollection = null,
+		onscanned,
+		onsaved,
+		onpublished,
+		onclose
+	}: Props = $props();
 
-	let step: 1 | 2 = 1;
-	let collection: Collection | null = null;
+	let step: 1 | 2 = $state(1);
+	let collection: Collection | null = $state(null);
 
 	// Re-seed step/collection on every closed→open transition (mirrors ScanDialog's own `wasOpen`
 	// convention) so a stale collection never leaks into the next "Add collection" run.
+	// Not reactive on purpose — a plain transition-edge flag, never read by the template, so it
+	// mustn't be part of the effect's own dependency tracking (avoids a self-triggering effect).
 	let wasOpen = false;
-	$: if (open && !wasOpen) {
-		wasOpen = true;
-		if (editCollection) {
-			collection = editCollection;
-			step = 2;
-		} else {
-			collection = null;
-			step = 1;
+	$effect(() => {
+		if (open && !wasOpen) {
+			wasOpen = true;
+			if (editCollection) {
+				collection = editCollection;
+				step = 2;
+			} else {
+				collection = null;
+				step = 1;
+			}
+		} else if (!open && wasOpen) {
+			wasOpen = false;
 		}
-	} else if (!open && wasOpen) {
-		wasOpen = false;
-	}
+	});
 
-	function handleScanned(e: CustomEvent<Collection>) {
-		collection = e.detail;
+	function handleScanned(scanned: Collection) {
+		collection = scanned;
 		step = 2;
-		dispatch('scanned', e.detail);
+		onscanned?.(scanned);
 	}
 
 	function handleScanDialogClose() {
@@ -48,13 +59,13 @@
 		if (step === 1) close();
 	}
 
-	function handleSaved(e: CustomEvent<Collection>) {
-		dispatch('saved', e.detail);
+	function handleSaved(updated: Collection) {
+		onsaved?.(updated);
 		close();
 	}
 
-	function handlePublished(e: CustomEvent<Collection>) {
-		dispatch('published', e.detail);
+	function handlePublished(updated: Collection) {
+		onpublished?.(updated);
 		close();
 	}
 
@@ -62,18 +73,18 @@
 		open = false;
 		step = 1;
 		collection = null;
-		dispatch('close');
+		onclose?.();
 	}
 </script>
 
 {#if open}
 	{#if step === 1}
-		<ScanDialog open={true} title="Add collection" on:scanned={handleScanned} on:close={handleScanDialogClose} />
+		<ScanDialog open={true} title="Add collection" onscanned={handleScanned} onclose={handleScanDialogClose} />
 	{:else if step === 2 && collection}
-		<!-- svelte-ignore a11y-no-static-element-interactions -->
-		<div class="backdrop" on:click|self={close} on:keydown={(e) => e.key === 'Escape' && close()} role="presentation">
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div class="backdrop" onclick={(e) => { if (e.target === e.currentTarget) close(); }} onkeydown={(e) => e.key === 'Escape' && close()} role="presentation">
 			<div class="modal">
-				<CollectionDetailsForm {collection} on:saved={handleSaved} on:published={handlePublished} on:cancel={close} />
+				<CollectionDetailsForm {collection} onsaved={handleSaved} onpublished={handlePublished} oncancel={close} />
 			</div>
 		</div>
 	{/if}

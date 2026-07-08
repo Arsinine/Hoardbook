@@ -7,12 +7,10 @@ afterEach(cleanup);
 
 describe('ConfirmButton — inline two-step confirm (mirrors the Settings wipe-data pattern)', () => {
 	it('two_click_confirm_matches_wipe_pattern', async () => {
-		const { getByRole, component, queryByText } = render(ConfirmButton, {
-			props: { label: 'Remove' },
-		});
-
 		const confirms: number[] = [];
-		component.$on('confirm', () => confirms.push(1));
+		const { getByRole, queryByText } = render(ConfirmButton, {
+			props: { label: 'Remove', onconfirm: () => confirms.push(1) },
+		});
 
 		// First render: just the trigger, no "are you sure" prompt yet.
 		const trigger = getByRole('button', { name: 'Remove' });
@@ -30,11 +28,10 @@ describe('ConfirmButton — inline two-step confirm (mirrors the Settings wipe-d
 	});
 
 	it('cancel collapses the confirm prompt without firing', async () => {
-		const { getByRole, component, queryByText } = render(ConfirmButton, {
-			props: { label: 'Remove' },
-		});
 		const confirms: number[] = [];
-		component.$on('confirm', () => confirms.push(1));
+		const { getByRole, queryByText } = render(ConfirmButton, {
+			props: { label: 'Remove', onconfirm: () => confirms.push(1) },
+		});
 
 		await fireEvent.click(getByRole('button', { name: 'Remove' }));
 		expect(queryByText(/are you sure/i)).not.toBeNull();

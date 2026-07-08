@@ -2,21 +2,33 @@
 	// Shared inline two-step confirm (M13 W5) — mirrors the Settings "Wipe all data" pattern (a
 	// boolean reveal → "Are you sure? …" + Confirm/Cancel), now reusable for every destructive action
 	// (collection Remove, contact Remove, Topic Leave) instead of firing straight from a single click.
-	import { createEventDispatcher } from 'svelte';
 
-	/** The resting trigger's label (e.g. "Remove", "Leave"). */
-	export let label = 'Remove';
-	/** The revealed prompt text. */
-	export let confirmText = 'Are you sure?';
-	export let confirmLabel = 'Confirm';
-	export let cancelLabel = 'Cancel';
-	/** Styles the trigger + confirm button as destructive (red). */
-	export let danger = true;
-	export let disabled = false;
+	interface Props {
+		/** The resting trigger's label (e.g. "Remove", "Leave"). */
+		label?: string;
+		/** The revealed prompt text. */
+		confirmText?: string;
+		confirmLabel?: string;
+		cancelLabel?: string;
+		/** Styles the trigger + confirm button as destructive (red). */
+		danger?: boolean;
+		disabled?: boolean;
+		onconfirm?: () => void;
+		[key: string]: any
+	}
 
-	const dispatch = createEventDispatcher<{ confirm: void }>();
+	let {
+		label = 'Remove',
+		confirmText = 'Are you sure?',
+		confirmLabel = 'Confirm',
+		cancelLabel = 'Cancel',
+		danger = true,
+		disabled = false,
+		onconfirm,
+		...rest
+	}: Props = $props();
 
-	let revealed = false;
+	let revealed = $state(false);
 
 	function start() {
 		if (disabled) return;
@@ -27,19 +39,19 @@
 	}
 	function confirm() {
 		revealed = false;
-		dispatch('confirm');
+		onconfirm?.();
 	}
 </script>
 
 {#if !revealed}
-	<button type="button" class="cb-trigger" class:cb-danger={danger} on:click={start} {disabled} {...$$restProps}>
+	<button type="button" class="cb-trigger" class:cb-danger={danger} onclick={start} {disabled} {...rest}>
 		{label}
 	</button>
 {:else}
 	<span class="cb-confirm">
 		<span class="cb-confirm-text">{confirmText}</span>
-		<button type="button" class="cb-yes" class:cb-danger={danger} on:click={confirm}>{confirmLabel}</button>
-		<button type="button" class="cb-no" on:click={cancel}>{cancelLabel}</button>
+		<button type="button" class="cb-yes" class:cb-danger={danger} onclick={confirm}>{confirmLabel}</button>
+		<button type="button" class="cb-no" onclick={cancel}>{cancelLabel}</button>
 	</span>
 {/if}
 

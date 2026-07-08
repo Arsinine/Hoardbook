@@ -31,38 +31,36 @@
 	import { filterConversations, filterTopics, composeRecipientKind } from '$lib/chat-filter.js';
 	import type { CachedPeer, ReceivedMessage, TopicView, ChannelPost, AnnouncementView, DmRequestView, Group } from '$lib/types.js';
 
-	let loading = false;
-	let sending = false;
-	let selectedPeer: CachedPeer | null = null;
-	let draft = '';
-	let threadEl: HTMLElement;
-	let searchQuery = '';
+	let loading = $state(false);
+	let sending = $state(false);
+	let selectedPeer: CachedPeer | null = $state(null);
+	let draft = $state('');
+	let threadEl: HTMLElement | undefined = $state();
+	let searchQuery = $state('');
 
 	// ── Topic channels (M11) — a Topic you've joined surfaces here as a persistent channel. The
 	//    channel ENTRY lasts as long as your membership (durable, §11), but its posts are 24h-ephemeral
 	//    (wiped server-side via NIP-40 + the local filter in `topic_channel`). Posting lives here now,
 	//    not on the Topics page (which keeps join/leave/roster/invite).
-	let topics: TopicView[] = [];
-	let selectedTopic: TopicView | null = null;
-	let channelPosts: ChannelPost[] = [];
-	let channelAnnouncements: AnnouncementView[] = []; // M13 Part A: rendered above the posts, read-only
-	let channelDraft = '';
-	let channelSending = false;
+	let topics: TopicView[] = $state([]);
+	let selectedTopic: TopicView | null = $state(null);
+	let channelPosts: ChannelPost[] = $state([]);
+	let channelAnnouncements: AnnouncementView[] = $state([]); // M13 Part A: rendered above the posts, read-only
+	let channelDraft = $state('');
+	let channelSending = $state(false);
 
 	// ── Q7 Request inbox (M13 Part B) — a stranger's DM is quarantined here, never merged into the
 	//    conversation list. `viewingRequests` selects the Requests section in the right pane;
 	//    `selectedRequest` (once set) drills into one sender's bucket.
-	let viewingRequests = false;
-	let selectedRequest: DmRequestView | null = null;
+	let viewingRequests = $state(false);
+	let selectedRequest: DmRequestView | null = $state(null);
 
-	$: sortedRequests = sortRequests($dmRequests);
-	$: requestCount = requestBadge($dmRequests);
 
 	// ── Compose-to-npub (spec §9 first-contact deep link from Discovery) ─────────────────────────
-	let composeOpen = false;
-	let composeTo = '';
-	let composeBody = '';
-	let composeSending = false;
+	let composeOpen = $state(false);
+	let composeTo = $state('');
+	let composeBody = $state('');
+	let composeSending = $state(false);
 
 	async function loadTopics() {
 		try { topics = await topicList(); } catch { /* relay unreachable */ }
@@ -106,10 +104,10 @@
 	// Petname-dialog wiring (M13 W5 Slice 2): accepting a Request now asks for an optional petname +
 	// group first, via the same shared AddContactDialog used on Contacts, instead of always passing
 	// `null` straight through to `dmRequestAccept`.
-	let acceptDialogOpen = false;
-	let acceptTarget: DmRequestView | null = null;
-	let createGroupOpen = false;
-	let groups: Group[] = [];
+	let acceptDialogOpen = $state(false);
+	let acceptTarget: DmRequestView | null = $state(null);
+	let createGroupOpen = $state(false);
+	let groups: Group[] = $state([]);
 
 	async function loadGroups() {
 		try { groups = await groupsGet(); } catch { /* non-fatal */ }
@@ -120,8 +118,8 @@
 		acceptDialogOpen = true;
 	}
 
-	async function handleCreateGroup(e: CustomEvent<{ name: string; color: string; trusted: boolean }>) {
-		const { name, color, trusted } = e.detail;
+	async function handleCreateGroup(detail: { name: string; color: string; trusted: boolean }) {
+		const { name, color, trusted } = detail;
 		try {
 			await groupsCreate(name, color);
 			if (trusted) await groupsSetTrusted(name, true);
@@ -155,12 +153,12 @@
 		}
 	}
 
-	async function handleAcceptSave(e: CustomEvent<{ petname: string; group: string | null }>) {
+	async function handleAcceptSave(detail: { petname: string; group: string | null }) {
 		if (!acceptTarget) return;
 		const r = acceptTarget;
 		acceptDialogOpen = false;
 		acceptTarget = null;
-		await completeAccept(r, e.detail.petname, e.detail.group);
+		await completeAccept(r, detail.petname, detail.group);
 	}
 
 	async function handleAcceptSkip() {
@@ -219,9 +217,8 @@
 	let seenMessageKeys = new Set<string>();
 
 	// Per-peer "seen" snapshot: hb_id → inbox count at last view.
-	let seenCounts: Record<string, number> = {};
+	let seenCounts: Record<string, number> = $state({});
 
-	$: myId = $identity?.npub ?? '';
 
 	// M13 Part B (Q7): the conversation list is contacts ONLY — a stranger's DM no longer merges in
 	// here at all (the request pane, above, replaces the old inboxOnlyPeers merge).
@@ -231,26 +228,8 @@
 		return msgs.reduce((latest, m) => m.sent_at > latest ? m.sent_at : latest, '');
 	}
 
-	$: allConversationPeers = [...$contacts].sort((a, b) => {
-		const aT = latestMessageTime(a.npub);
-		const bT = latestMessageTime(b.npub);
-		if (!aT && !bT) return 0;
-		if (!aT) return 1;
-		if (!bT) return -1;
-		return bT.localeCompare(aT); // newest first
-	});
 
-	// Wires the search box (devtest copy audit — it was dead): filters the visible rows only, never
-	// the underlying stores.
-	$: visiblePeers = filterConversations(allConversationPeers, searchQuery, senderName);
-	$: visibleTopics = filterTopics(topics, searchQuery);
 
-	$: conversation = selectedPeer
-		? [
-				...$inboxMessages.filter((m) => m.from === selectedPeer!.npub),
-				...$sentMessages.filter((m) => m.to === selectedPeer!.npub)
-			].sort((a, b) => a.sent_at.localeCompare(b.sent_at))
-		: [];
 
 	// Cache of display_name for npubs not in $contacts (Request-bucket senders). Populated lazily by
 	// fetchNonContactNames(); never causes re-triggers because we only write when a key is absent.
@@ -270,8 +249,6 @@
 		}
 	}
 
-	// Eagerly fetch names for Request-bucket senders whenever the list changes.
-	$: fetchNonContactNames($dmRequests.map((r) => r.npub));
 
 	// Resolve display name for a sender hb_id — contacts first, then fetched cache.
 	function senderName(hb_id: string): string {
@@ -430,20 +407,45 @@
 		return new Date(iso).toLocaleDateString([], { month: 'short', day: 'numeric' });
 	}
 
-	$: unreadCounts = Object.fromEntries(
-		allConversationPeers.map((c) => {
-			const total = $inboxMessages.filter((m) => m.from === c.npub).length;
-			const seen = seenCounts[c.npub] ?? 0;
-			return [c.npub, Math.max(0, total - seen)];
-		})
-	);
 
 	function viewProfile(peer: CachedPeer) {
 		goto('/contacts');
 	}
 
+	let sortedRequests = $derived(sortRequests($dmRequests));
+	let requestCount = $derived(requestBadge($dmRequests));
+	let myId = $derived($identity?.npub ?? '');
+	let allConversationPeers = $derived([...$contacts].sort((a, b) => {
+		const aT = latestMessageTime(a.npub);
+		const bT = latestMessageTime(b.npub);
+		if (!aT && !bT) return 0;
+		if (!aT) return 1;
+		if (!bT) return -1;
+		return bT.localeCompare(aT); // newest first
+	}));
+	// Wires the search box (devtest copy audit — it was dead): filters the visible rows only, never
+	// the underlying stores.
+	let visiblePeers = $derived(filterConversations(allConversationPeers, searchQuery, senderName));
+	let visibleTopics = $derived(filterTopics(topics, searchQuery));
+	let conversation = $derived(selectedPeer
+		? [
+				...$inboxMessages.filter((m) => m.from === selectedPeer!.npub),
+				...$sentMessages.filter((m) => m.to === selectedPeer!.npub)
+			].sort((a, b) => a.sent_at.localeCompare(b.sent_at))
+		: []);
+	// Eagerly fetch names for Request-bucket senders whenever the list changes.
+	$effect(() => {
+		fetchNonContactNames($dmRequests.map((r) => r.npub));
+	});
+	let unreadCounts = $derived(Object.fromEntries(
+		allConversationPeers.map((c) => {
+			const total = $inboxMessages.filter((m) => m.from === c.npub).length;
+			const seen = seenCounts[c.npub] ?? 0;
+			return [c.npub, Math.max(0, total - seen)];
+		})
+	));
 	// Show a privacy notice if the selected peer is not in contacts (may have DMs restricted).
-	$: selectedIsContact = selectedPeer ? $contacts.some(c => c.npub === selectedPeer!.npub) : false;
+	let selectedIsContact = $derived(selectedPeer ? $contacts.some(c => c.npub === selectedPeer!.npub) : false);
 </script>
 
 {#if !$identity}
@@ -458,10 +460,10 @@
 			<div class="convo-header">
 				<span class="convo-title">Conversations</span>
 				<div class="header-icons">
-					<button class="icon-btn" on:click={() => (composeOpen = true)} title="New message">
+					<button class="icon-btn" onclick={() => (composeOpen = true)} title="New message">
 						{@html icons.plus}
 					</button>
-					<button class="icon-btn" on:click={refreshInbox} disabled={loading} title="Refresh inbox">
+					<button class="icon-btn" onclick={refreshInbox} disabled={loading} title="Refresh inbox">
 						{@html icons.refresh}
 					</button>
 				</div>
@@ -476,12 +478,12 @@
 				{#if visibleTopics.length > 0}
 					<div class="convo-section-label">Channels</div>
 					{#each visibleTopics as t (t.topic_id)}
-						<button class="convo-item" class:convo-active={selectedTopic?.topic_id === t.topic_id} on:click={() => selectTopic(t)}>
+						<button class="convo-item" class:convo-active={selectedTopic?.topic_id === t.topic_id} onclick={() => selectTopic(t)}>
 							<div class="channel-hash">#</div>
 							<div class="convo-info">
 								<div class="convo-row">
 									<span class="convo-name" class:convo-name-active={selectedTopic?.topic_id === t.topic_id}>{t.name}</span>
-									{#if t.private}<span class="convo-req-dot" title="Private topic" />{/if}
+									{#if t.private}<span class="convo-req-dot" title="Private topic"></span>{/if}
 								</div>
 							</div>
 						</button>
@@ -489,7 +491,7 @@
 				{/if}
 				{#if $dmRequests.length > 0}
 					<div class="convo-section-label">Requests</div>
-					<button class="convo-item" class:convo-active={viewingRequests} on:click={openRequests}>
+					<button class="convo-item" class:convo-active={viewingRequests} onclick={openRequests}>
 						<div class="channel-hash">🔔</div>
 						<div class="convo-info">
 							<div class="convo-row">
@@ -511,7 +513,7 @@
 						{@const hue = avatarHue(initial)}
 						{@const unread = unreadCounts[peer.npub] ?? 0}
 						{@const active = selectedPeer?.npub === peer.npub}
-						<button class="convo-item" class:convo-active={active} on:click={() => selectPeer(peer)}>
+						<button class="convo-item" class:convo-active={active} onclick={() => selectPeer(peer)}>
 							<Avatar letter={initial} size={34} {hue} />
 							<div class="convo-info">
 								<div class="convo-row">
@@ -578,12 +580,12 @@
 							class="compose-input"
 							placeholder="Message #{selectedTopic.name}…"
 							bind:value={channelDraft}
-							on:keydown={channelKeydown}
+							onkeydown={channelKeydown}
 							disabled={channelSending}
 							rows="2"
 						></textarea>
 						<div class="compose-footer">
-							<button class="btn-primary btn-send" on:click={sendChannelPost} disabled={!channelDraft.trim() || channelSending}>
+							<button class="btn-primary btn-send" onclick={sendChannelPost} disabled={!channelDraft.trim() || channelSending}>
 								{channelSending ? '…' : 'Post'} <span>{@html icons.send}</span>
 							</button>
 						</div>
@@ -607,7 +609,7 @@
 							{#each sortedRequests as r (r.npub)}
 								{@const name = senderName(r.npub)}
 								{@const initial = name[0]?.toUpperCase() ?? '?'}
-								<button class="request-row" on:click={() => openRequest(r)}>
+								<button class="request-row" onclick={() => openRequest(r)}>
 									<Avatar letter={initial} size={34} hue={avatarHue(initial)} />
 									<div class="convo-info">
 										<div class="convo-row">
@@ -637,7 +639,7 @@
 							<div class="pane-peer-row"><span class="pane-peer-name">{reqName}</span></div>
 							<span class="mono">{shortId(req.npub)}</span>
 						</div>
-						<button class="btn-ghost btn-sm" on:click={() => (selectedRequest = null)}>← Back</button>
+						<button class="btn-ghost btn-sm" onclick={() => (selectedRequest = null)}>← Back</button>
 					</div>
 					<div class="requests-explainer">{REQUEST_EXPLAINER}</div>
 					<div class="thread">
@@ -652,9 +654,9 @@
 					</div>
 					{#if !canReply(isRequestContact)}
 						<div class="composer request-actions">
-							<button class="btn-primary" on:click={() => openAcceptDialog(req)}>Accept</button>
-							<button class="btn-ghost" on:click={() => handleDecline(req)}>Decline</button>
-							<button class="btn-ghost btn-danger" on:click={() => handleBlock(req)}>Block</button>
+							<button class="btn-primary" onclick={() => openAcceptDialog(req)}>Accept</button>
+							<button class="btn-ghost" onclick={() => handleDecline(req)}>Decline</button>
+							<button class="btn-ghost btn-danger" onclick={() => handleBlock(req)}>Block</button>
 						</div>
 					{/if}
 				{/if}
@@ -677,14 +679,14 @@
 						<div class="pane-peer-row">
 							<span class="pane-peer-name">{selectedPeer.profile?.display_name ?? shortId(selectedPeer.npub)}</span>
 							{#if selectedPeer.online}
-								<span class="pill pill-online"><span class="pill-dot" /> Online</span>
+								<span class="pill pill-online"><span class="pill-dot"></span> Online</span>
 							{:else}
 								<span class="pill pill-offline">Offline</span>
 							{/if}
 						</div>
 						<span class="mono">{shortId(selectedPeer.npub)}</span>
 					</div>
-					<button class="btn-ghost btn-sm" on:click={() => { if (selectedPeer) viewProfile(selectedPeer); }}>View profile</button>
+					<button class="btn-ghost btn-sm" onclick={() => { if (selectedPeer) viewProfile(selectedPeer); }}>View profile</button>
 				</div>
 
 				<!-- Privacy banner (§9: NIP-17 gift-wrap — E2E encrypted, sender hidden from relays) -->
@@ -696,7 +698,7 @@
 				<!-- Offline notice -->
 				{#if !selectedPeer.online}
 					<div class="offline-banner">
-						<span class="offline-dot" />
+						<span class="offline-dot"></span>
 						<span>{selectedPeer.profile?.display_name ?? shortId(selectedPeer.npub)} is offline — they'll see your message the next time they open Hoardbook.</span>
 					</div>
 				{/if}
@@ -719,9 +721,9 @@
 							{@const showDate = !prevMsg || formatDate(msg.sent_at) !== formatDate(prevMsg.sent_at)}
 							{#if showDate}
 								<div class="day-marker">
-									<div class="day-line" />
+									<div class="day-line"></div>
 									<span class="day-label">{formatDate(msg.sent_at)}</span>
-									<div class="day-line" />
+									<div class="day-line"></div>
 								</div>
 							{/if}
 							<div class="bubble-wrap" class:bubble-me={isMe}>
@@ -741,14 +743,14 @@
 							class="compose-input"
 							placeholder="Type a message…"
 							bind:value={draft}
-							on:keydown={handleKeydown}
+							onkeydown={handleKeydown}
 							disabled={sending}
 							rows="2"
 						></textarea>
 						<div class="compose-footer">
 							<button
 								class="btn-primary btn-send"
-								on:click={handleSend}
+								onclick={handleSend}
 								disabled={!draft.trim() || sending}
 							>
 								{sending ? '…' : 'Send'} <span>{@html icons.send}</span>
@@ -763,20 +765,20 @@
 
 <!-- Petname + group dialog shown before accepting a Request (M13 W5 Slice 2). -->
 <AddContactDialog
-	bind:open={acceptDialogOpen}
+	open={acceptDialogOpen}
 	displayName={acceptTarget ? senderName(acceptTarget.npub) : ''}
 	{groups}
-	on:save={handleAcceptSave}
-	on:skip={handleAcceptSkip}
-	on:newGroup={() => (createGroupOpen = true)}
-	on:cancel={() => { acceptDialogOpen = false; acceptTarget = null; }}
+	onsave={handleAcceptSave}
+	onskip={handleAcceptSkip}
+	onnewGroup={() => (createGroupOpen = true)}
+	oncancel={() => { acceptDialogOpen = false; acceptTarget = null; }}
 />
-<CreateGroupDialog bind:open={createGroupOpen} on:create={handleCreateGroup} on:cancel={() => (createGroupOpen = false)} />
+<CreateGroupDialog open={createGroupOpen} oncreate={handleCreateGroup} oncancel={() => (createGroupOpen = false)} />
 
 <!-- Compose-to-npub (spec §9 first-contact deep link) — a + icon-btn beside refresh opens this. -->
 {#if composeOpen}
-	<!-- svelte-ignore a11y-no-static-element-interactions a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-	<div class="modal-backdrop" role="dialog" aria-modal="true" aria-label="New message" on:click={(e) => { if (e.target === e.currentTarget) composeOpen = false; }}>
+	<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
+	<div class="modal-backdrop" role="dialog" aria-modal="true" aria-label="New message" tabindex="-1" onclick={(e) => { if (e.target === e.currentTarget) composeOpen = false; }}>
 		<div class="modal">
 			<h2>New message</h2>
 			<input placeholder="npub or hbk share code…" bind:value={composeTo} />
@@ -785,8 +787,8 @@
 			{/if}
 			<textarea class="compose-modal-input" placeholder="Message…" bind:value={composeBody} rows="3"></textarea>
 			<div class="modal-actions">
-				<button class="ghost" on:click={() => (composeOpen = false)}>Cancel</button>
-				<button class="btn-primary" disabled={!composeTo.trim() || !composeBody.trim() || composeSending} on:click={handleComposeSend}>
+				<button class="ghost" onclick={() => (composeOpen = false)}>Cancel</button>
+				<button class="btn-primary" disabled={!composeTo.trim() || !composeBody.trim() || composeSending} onclick={handleComposeSend}>
 					{composeSending ? '…' : 'Send'}
 				</button>
 			</div>

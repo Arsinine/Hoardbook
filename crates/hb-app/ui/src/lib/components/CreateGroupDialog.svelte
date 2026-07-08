@@ -3,14 +3,13 @@
 	// every group picker on Contacts is gated behind `groups.length > 0`, which makes creating a
 	// trusted group (the on-ramp to M10 Private collections) an unreachable dead path for a first-time
 	// user. This is the "+ New group" entry point that always works.
-	import { createEventDispatcher } from 'svelte';
+	interface Props {
+		open?: boolean;
+		oncreate?: (detail: { name: string; color: string; trusted: boolean }) => void;
+		oncancel?: () => void;
+	}
 
-	export let open = false;
-
-	const dispatch = createEventDispatcher<{
-		create: { name: string; color: string; trusted: boolean };
-		cancel: void;
-	}>();
+	let { open = false, oncreate, oncancel }: Props = $props();
 
 	// A small fixed palette (8 hues) — simple swatch picker, no color-wheel input.
 	const PALETTE = [
@@ -18,11 +17,11 @@
 		'#3fb0a8', '#4d8fe0', '#7d6ce0', '#c15ec2',
 	];
 
-	let name = '';
-	let color = PALETTE[0];
-	let trusted = false;
+	let name = $state('');
+	let color = $state(PALETTE[0]);
+	let trusted = $state(false);
 
-	$: canCreate = name.trim().length > 0;
+	let canCreate = $derived(name.trim().length > 0);
 
 	function reset() {
 		name = '';
@@ -32,24 +31,24 @@
 
 	function create() {
 		if (!canCreate) return;
-		dispatch('create', { name: name.trim(), color, trusted });
+		oncreate?.({ name: name.trim(), color, trusted });
 		reset();
 	}
 
 	function cancel() {
 		reset();
-		dispatch('cancel');
+		oncancel?.();
 	}
 </script>
 
 {#if open}
-	<!-- svelte-ignore a11y-no-static-element-interactions a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-	<div class="modal-backdrop" role="dialog" aria-modal="true" aria-label="New group" on:click={(e) => { if (e.target === e.currentTarget) cancel(); }}>
+	<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
+	<div class="modal-backdrop" role="dialog" aria-modal="true" aria-label="New group" tabindex="-1" onclick={(e) => { if (e.target === e.currentTarget) cancel(); }}>
 		<div class="modal">
 			<h2>New group</h2>
 			<div class="field">
 				<label for="cgd-name">Name</label>
-				<input id="cgd-name" type="text" placeholder="e.g. Inner Circle" bind:value={name} on:keydown={(e) => e.key === 'Enter' && create()} />
+				<input id="cgd-name" type="text" placeholder="e.g. Inner Circle" bind:value={name} onkeydown={(e) => e.key === 'Enter' && create()} />
 			</div>
 			<div class="field">
 				<span class="field-label">Color</span>
@@ -62,8 +61,8 @@
 							style="background:{hex}"
 							aria-label={`Color ${hex}`}
 							aria-pressed={color === hex}
-							on:click={() => (color = hex)}
-						/>
+							onclick={() => (color = hex)}
+						></button>
 					{/each}
 				</div>
 			</div>
@@ -72,8 +71,8 @@
 				Trusted — receives your Private collections
 			</label>
 			<div class="modal-actions">
-				<button type="button" class="ghost" on:click={cancel}>Cancel</button>
-				<button type="button" class="btn-primary" disabled={!canCreate} on:click={create}>Create</button>
+				<button type="button" class="ghost" onclick={cancel}>Cancel</button>
+				<button type="button" class="btn-primary" disabled={!canCreate} onclick={create}>Create</button>
 			</div>
 		</div>
 	</div>

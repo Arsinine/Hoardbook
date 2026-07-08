@@ -2,17 +2,16 @@
 	// Chip tag editor for a collection's freeform tags (M13 W5 Slice 1) — mirrors the existing
 	// profile-tags chip pattern in routes/+page.svelte (Enter/comma adds, Backspace removes the last),
 	// componentized so the Add-collection wizard and Edit-details reopen can share it.
-	import { createEventDispatcher } from 'svelte';
+	interface Props {
+		tags?: string[];
+	}
 
-	export let tags: string[] = [];
+	let { tags = $bindable([]) }: Props = $props();
 
-	const dispatch = createEventDispatcher<{ change: string[] }>();
-
-	let input = '';
+	let input = $state('');
 
 	function commit(next: string[]) {
 		tags = next;
-		dispatch('change', next);
 	}
 
 	function addTag(raw: string) {
@@ -35,13 +34,13 @@
 	}
 </script>
 
-<!-- svelte-ignore a11y-click-events-have-key-events -->
-<!-- svelte-ignore a11y-no-static-element-interactions -->
-<div class="tag-wrap" on:click={(e) => { if (e.target === e.currentTarget) e.currentTarget.querySelector('input')?.focus(); }}>
+<!-- svelte-ignore a11y_click_events_have_key_events -->
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="tag-wrap" onclick={(e) => { if (e.target === e.currentTarget) e.currentTarget.querySelector('input')?.focus(); }}>
 	{#each tags as tag, i (tag)}
 		<span class="chip">
 			{tag}
-			<button type="button" class="chip-x" on:click={() => removeTag(i)} aria-label={`Remove ${tag}`}>×</button>
+			<button type="button" class="chip-x" onclick={() => removeTag(i)} aria-label={`Remove ${tag}`}>×</button>
 		</span>
 	{/each}
 	<input
@@ -49,7 +48,7 @@
 		type="text"
 		placeholder="+ add a tag"
 		bind:value={input}
-		on:keydown={handleKeydown}
+		onkeydown={handleKeydown}
 	/>
 </div>
 

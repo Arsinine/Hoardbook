@@ -7,8 +7,9 @@ afterEach(cleanup);
 
 describe('TopicJoinConsent (M11 — F12 consent gate)', () => {
 	it('private join: renders the durable-record consent copy and gates Join behind an explicit ack', async () => {
-		const { getByRole, getByLabelText, component } = render(TopicJoinConsent, {
-			props: { isPrivate: true },
+		const joins: number[] = [];
+		const { getByRole, getByLabelText } = render(TopicJoinConsent, {
+			props: { isPrivate: true, onjoin: () => joins.push(1) },
 		});
 		// The consent copy is present and names the durable members-only record.
 		const note = getByRole('note');
@@ -19,8 +20,6 @@ describe('TopicJoinConsent (M11 — F12 consent gate)', () => {
 		const join = getByRole('button', { name: /join topic/i }) as HTMLButtonElement;
 		expect(join.disabled).toBe(true);
 
-		const joins: number[] = [];
-		component.$on('join', () => joins.push(1));
 		await fireEvent.click(join); // a click while disabled must NOT fire join
 		expect(joins.length).toBe(0);
 

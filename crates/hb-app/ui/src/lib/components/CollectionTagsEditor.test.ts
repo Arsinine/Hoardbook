@@ -5,50 +5,52 @@ import CollectionTagsEditor from './CollectionTagsEditor.svelte';
 
 afterEach(cleanup);
 
+// `tags` is a $bindable prop with no separate change event (M14) — read the rendered chip list
+// back out of the DOM to assert the resulting array, since there's no `component.$on` in Svelte 5.
+function chipLabels(container: HTMLElement): string[] {
+	return Array.from(container.querySelectorAll('.chip')).map(
+		(chip) => chip.childNodes[0].textContent?.trim() ?? '',
+	);
+}
+
 describe('CollectionTagsEditor — chip tag input', () => {
 	it('enter_and_comma_add_tag_lowercased', async () => {
-		const { getByPlaceholderText, getByText, component } = render(CollectionTagsEditor, {
+		const { getByPlaceholderText, getByText, container } = render(CollectionTagsEditor, {
 			props: { tags: [] },
 		});
-		const changes: string[][] = [];
-		component.$on('change', (e: CustomEvent<string[]>) => changes.push(e.detail));
 
 		const input = getByPlaceholderText(/add a tag/i) as HTMLInputElement;
 		await fireEvent.input(input, { target: { value: 'ANIME' } });
 		await fireEvent.keyDown(input, { key: 'Enter' });
 		expect(getByText('anime')).toBeTruthy();
-		expect(changes.at(-1)).toEqual(['anime']);
+		expect(chipLabels(container)).toEqual(['anime']);
 
 		await fireEvent.input(input, { target: { value: 'SciFi,' } });
 		await fireEvent.keyDown(input, { key: ',' });
 		expect(getByText('scifi')).toBeTruthy();
-		expect(changes.at(-1)).toEqual(['anime', 'scifi']);
+		expect(chipLabels(container)).toEqual(['anime', 'scifi']);
 	});
 
 	it('backspace_removes_last', async () => {
-		const { getByPlaceholderText, queryByText, component } = render(CollectionTagsEditor, {
+		const { getByPlaceholderText, queryByText, container } = render(CollectionTagsEditor, {
 			props: { tags: ['anime', 'scifi'] },
 		});
-		const changes: string[][] = [];
-		component.$on('change', (e: CustomEvent<string[]>) => changes.push(e.detail));
 
 		const input = getByPlaceholderText(/add a tag/i) as HTMLInputElement;
 		// Input is empty, so Backspace pops the last tag.
 		await fireEvent.keyDown(input, { key: 'Backspace' });
 		expect(queryByText('scifi')).toBeNull();
-		expect(changes.at(-1)).toEqual(['anime']);
+		expect(chipLabels(container)).toEqual(['anime']);
 	});
 
-	it('dispatches_change_with_tag_array', async () => {
-		const { getByText, component } = render(CollectionTagsEditor, {
+	it('removing_a_chip_leaves_the_rest', async () => {
+		const { getByText, container } = render(CollectionTagsEditor, {
 			props: { tags: ['anime', 'scifi'] },
 		});
-		const changes: string[][] = [];
-		component.$on('change', (e: CustomEvent<string[]>) => changes.push(e.detail));
 
-		// Removing a specific chip via its × also dispatches the full resulting array.
+		// Removing a specific chip via its × leaves the rest of the array intact.
 		const removeBtn = getByText('anime').querySelector('button') as HTMLButtonElement;
 		await fireEvent.click(removeBtn);
-		expect(changes.at(-1)).toEqual(['scifi']);
+		expect(chipLabels(container)).toEqual(['scifi']);
 	});
 });

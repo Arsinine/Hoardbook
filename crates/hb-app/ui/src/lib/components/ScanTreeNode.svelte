@@ -5,25 +5,31 @@
 	import type { SubdirEntry } from '../types.js';
 	import { icons } from '$lib/icons.js';
 
-	export let node: SubdirEntry;
-	/** This node's relative path within the scan root ("/"-separated). */
-	export let rel: string;
-	/** Shared checked-set; the dialog reassigns it on every toggle so tri-state stays reactive. */
-	export let checked: Set<string>;
-	/** Toggle the explicit-checked membership of `rel` (the dialog owns the set). */
-	export let onToggle: (rel: string) => void;
-	export let depth = 0;
+	interface Props {
+		node: SubdirEntry;
+		/** This node's relative path within the scan root ("/"-separated). */
+		rel: string;
+		/** Shared checked-set; the dialog reassigns it on every toggle so tri-state stays reactive. */
+		checked: Set<string>;
+		/** Toggle the explicit-checked membership of `rel` (the dialog owns the set). */
+		onToggle: (rel: string) => void;
+		depth?: number;
+	}
 
-	let open = false;
-	let children: SubdirEntry[] | null = null;
-	let loading = false;
-	let loadError = '';
-	let inputEl: HTMLInputElement;
+	let { node, rel, checked, onToggle, depth = 0 }: Props = $props();
 
-	$: state = triState(rel, checked);
-	$: locked = state === 'locked';
+	let open = $state(false);
+	let children: SubdirEntry[] | null = $state(null);
+	let loading = $state(false);
+	let loadError = $state('');
+	let inputEl: HTMLInputElement | undefined = $state();
+
+	let triStateValue = $derived(triState(rel, checked));
+	let locked = $derived(triStateValue === 'locked');
 	// `indeterminate` is a DOM property, not an attribute — set it imperatively so it stays in sync.
-	$: if (inputEl) inputEl.indeterminate = state === 'indeterminate';
+	$effect(() => {
+		if (inputEl) inputEl.indeterminate = triStateValue === 'indeterminate';
+	});
 
 	async function toggleExpand() {
 		open = !open;
@@ -55,21 +61,21 @@
 				class="expander"
 				class:open
 				type="button"
-				on:click={toggleExpand}
+				onclick={toggleExpand}
 				aria-label={open ? 'Collapse folder' : 'Expand folder'}
 			>
 				{@html icons.chevronRight}
 			</button>
 		{:else}
-			<span class="expander-spacer" />
+			<span class="expander-spacer"></span>
 		{/if}
 		<label class="node-label">
 			<input
 				bind:this={inputEl}
 				type="checkbox"
-				checked={state === 'checked' || state === 'locked'}
+				checked={triStateValue === 'checked' || triStateValue === 'locked'}
 				disabled={locked}
-				on:change={onCheckChange}
+				onchange={onCheckChange}
 			/>
 			<span class="node-icon">{@html icons.folder}</span>
 			<span class="node-name">{node.name}</span>
@@ -86,7 +92,7 @@
 			<div class="node-hint node-error" style="padding-left:{(depth + 1) * 15 + 18}px">{loadError}</div>
 		{:else if children}
 			{#each children as child (child.path)}
-				<svelte:self
+				<ScanTreeNode
 					node={child}
 					rel={`${rel}/${child.name}`}
 					{checked}

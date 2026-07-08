@@ -15,13 +15,10 @@ describe('CreateGroupDialog (M13 W5 Slice 2)', () => {
 	});
 
 	it('emits_create_with_name_color_trusted', async () => {
-		const { getByLabelText, getByRole, component } = render(CreateGroupDialog, {
-			props: { open: true },
-		});
 		const creates: { name: string; color: string; trusted: boolean }[] = [];
-		component.$on('create', (e: CustomEvent<{ name: string; color: string; trusted: boolean }>) =>
-			creates.push(e.detail),
-		);
+		const { getByLabelText, getByRole } = render(CreateGroupDialog, {
+			props: { open: true, oncreate: (detail) => creates.push(detail) },
+		});
 
 		await fireEvent.input(getByLabelText(/name/i), { target: { value: 'Inner Circle' } });
 		const swatches = document.querySelectorAll('.swatch');

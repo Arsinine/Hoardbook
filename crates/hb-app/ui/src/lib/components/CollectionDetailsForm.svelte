@@ -3,7 +3,6 @@
 	// a CollectionRow's "Edit details" menu action. Content types, tags, languages, notes, Sorted and
 	// Private. Publish is gated on ≥1 content type here (a collection is otherwise publish-ready the
 	// moment it exists — this replaces the old always-on per-row warning).
-	import { createEventDispatcher } from 'svelte';
 	import type { Collection, Visibility } from '../types.js';
 	import { toggleContentType } from '../content-types.js';
 	import { updateCollectionMeta, updateCollectionVisibility, publishCollection } from '../api.js';
@@ -11,9 +10,14 @@
 	import HintMarker from './HintMarker.svelte';
 	import CollectionTagsEditor from './CollectionTagsEditor.svelte';
 
-	export let collection: Collection;
+	interface Props {
+		collection: Collection;
+		onsaved?: (collection: Collection) => void;
+		onpublished?: (collection: Collection) => void;
+		oncancel?: () => void;
+	}
 
-	const dispatch = createEventDispatcher<{ saved: Collection; published: Collection; cancel: void }>();
+	let { collection, onsaved, onpublished, oncancel }: Props = $props();
 
 	// Same fixed six-value enum as the profile/discover pickers (HOARDBOOK_SPEC §4).
 	const CONTENT_TYPES: { value: string; label: string }[] = [
@@ -25,36 +29,34 @@
 		{ value: 'other', label: 'Other' },
 	];
 
-	let contentTypes: string[] = [];
-	let tags: string[] = [];
-	let languages: string[] = [];
-	let langInput = '';
-	let notes = '';
-	let sorted = false;
-	let isPrivate = false;
-	let saving = false;
-	let publishing = false;
+	let contentTypes: string[] = $state([]);
+	let tags: string[] = $state([]);
+	let languages: string[] = $state([]);
+	let langInput = $state('');
+	let notes = $state('');
+	let sorted = $state(false);
+	let isPrivate = $state(false);
+	let saving = $state(false);
+	let publishing = $state(false);
 
 	// Seed the editable fields whenever a different collection is handed in (fresh scan or reopen).
-	let loadedSlug = '';
-	$: if (collection.slug !== loadedSlug) {
-		loadedSlug = collection.slug;
-		contentTypes = [...(collection.content_types ?? [])];
-		tags = [...(collection.tags ?? [])];
-		languages = [...(collection.languages ?? [])];
-		notes = collection.description ?? '';
-		sorted = collection.sorted ?? false;
-		isPrivate = (collection.visibility ?? 'Public') === 'Private';
-	}
+	let loadedSlug = $state('');
+	$effect(() => {
+		if (collection.slug !== loadedSlug) {
+			loadedSlug = collection.slug;
+			contentTypes = [...(collection.content_types ?? [])];
+			tags = [...(collection.tags ?? [])];
+			languages = [...(collection.languages ?? [])];
+			notes = collection.description ?? '';
+			sorted = collection.sorted ?? false;
+			isPrivate = (collection.visibility ?? 'Public') === 'Private';
+		}
+	});
 
-	$: canPublish = contentTypes.length > 0;
+	let canPublish = $derived(contentTypes.length > 0);
 
 	function toggleCt(value: string) {
 		contentTypes = toggleContentType(contentTypes, value);
-	}
-
-	function onTagsChange(e: CustomEvent<string[]>) {
-		tags = e.detail;
 	}
 
 	function addLang() {
@@ -88,7 +90,7 @@
 		saving = true;
 		try {
 			const updated = await persist();
-			dispatch('saved', updated);
+			onsaved?.(updated);
 			toast('Collection saved');
 		} catch (e) {
 			toast(String(e), 'error');
@@ -103,7 +105,7 @@
 		try {
 			const updated = await persist();
 			await publishCollection(collection.slug);
-			dispatch('published', { ...updated, published: true });
+			onpublished?.({ ...updated, published: true });
 			toast('Collection published');
 		} catch (e) {
 			toast(String(e), 'error');
@@ -115,7 +117,7 @@
 
 <div class="modal-header">
 	<div class="modal-title">{collection.path_alias}</div>
-	<button type="button" class="close-btn" on:click={() => dispatch('cancel')}>×</button>
+	<button type="button" class="close-btn" onclick={() => oncancel?.()}>×</button>
 </div>
 
 <div class="modal-body">
@@ -125,7 +127,7 @@
 		</span>
 		<div class="ct-row">
 			{#each CONTENT_TYPES as ct (ct.value)}
-				<button type="button" class="ct-toggle" class:ct-on={contentTypes.includes(ct.value)} on:click={() => toggleCt(ct.value)}>
+				<button type="button" class="ct-toggle" class:ct-on={contentTypes.includes(ct.value)} onclick={() => toggleCt(ct.value)}>
 					{ct.label}
 				</button>
 			{/each}
@@ -134,16 +136,16 @@
 
 	<div class="field">
 		<span class="field-label">Tags</span>
-		<CollectionTagsEditor {tags} on:change={onTagsChange} />
+		<CollectionTagsEditor bind:tags />
 	</div>
 
 	<div class="field">
 		<span class="field-label">Languages</span>
 		<div class="lang-wrap">
 			{#each languages as lang, i (lang)}
-				<span class="chip">{lang}<button type="button" class="chip-x" on:click={() => removeLang(i)} aria-label={`Remove ${lang}`}>×</button></span>
+				<span class="chip">{lang}<button type="button" class="chip-x" onclick={() => removeLang(i)} aria-label={`Remove ${lang}`}>×</button></span>
 			{/each}
-			<input class="lang-input" type="text" placeholder="+ language" bind:value={langInput} on:keydown={langKeydown} />
+			<input class="lang-input" type="text" placeholder="+ language" bind:value={langInput} onkeydown={langKeydown} />
 		</div>
 	</div>
 
@@ -165,12 +167,12 @@
 </div>
 
 <div class="modal-footer">
-	<button type="button" class="btn-ghost" on:click={() => dispatch('cancel')}>Cancel</button>
+	<button type="button" class="btn-ghost" onclick={() => oncancel?.()}>Cancel</button>
 	<div class="footer-actions">
-		<button type="button" class="btn-ghost" on:click={handleSaveDraft} disabled={saving}>
+		<button type="button" class="btn-ghost" onclick={handleSaveDraft} disabled={saving}>
 			{saving ? 'Saving…' : 'Save draft'}
 		</button>
-		<button type="button" class="btn-primary" on:click={handlePublish} disabled={!canPublish || publishing}>
+		<button type="button" class="btn-primary" onclick={handlePublish} disabled={!canPublish || publishing}>
 			{publishing ? 'Publishing…' : 'Publish'}
 		</button>
 	</div>
