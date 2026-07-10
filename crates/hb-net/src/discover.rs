@@ -94,11 +94,12 @@ mod tests {
             bio: "hoards".into(),
             tags: tags.iter().map(|s| s.to_string()).collect(),
             content_types: cts.iter().map(|s| s.to_string()).collect(),
+            picture: None,
         }
     }
 
     fn ev(id: &Identity, t: &Teaser) -> Event {
-        hb_core::event::build_teaser(id, t).unwrap()
+        hb_core::event::build_teaser(id, t, true).unwrap()
     }
 
     #[test]
@@ -135,7 +136,7 @@ mod tests {
         let mut new = teaser_with(&["anime"], &["video"]);
         new.display_name = "new".into();
         let build_at = |t: &Teaser, ts: u64| {
-            let base = hb_core::event::build_teaser(&id, t).unwrap();
+            let base = hb_core::event::build_teaser(&id, t, true).unwrap();
             let tags: Vec<Tag> = base.tags.iter().cloned().collect();
             id.sign(
                 EventBuilder::new(base.kind, base.content)

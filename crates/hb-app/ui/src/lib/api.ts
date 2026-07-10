@@ -22,6 +22,7 @@ import type {
 	WatchHit,
 	TopicView,
 	DiscoveredTopic,
+	TopicLookup,
 	ChannelPost,
 	ChannelView,
 	DmRequestView,
@@ -133,6 +134,10 @@ export interface Settings {
 	snapshot_reconcile_poll: boolean;
 	/** M9: show the optional "🟢 N online" indicator (relay-derived; no telemetry). */
 	show_online_count: boolean;
+	/** devtest #5: opt into tag/content-type discoverability. Default **false** — off means people
+	 *  can't find you by tag or content-type search; they can still reach you with your npub or
+	 *  share code, and your contacts are unaffected. */
+	discoverable: boolean;
 }
 
 export const getSettings = () => invoke<Settings>('get_settings');
@@ -153,6 +158,29 @@ export interface RelayHealth {
 
 /** Live status of the persistent shared client's configured relays. Best-effort. */
 export const relayStatus = () => invoke<RelayHealth[]>('relay_status');
+
+/** Per-relay outcome of the most recent presence-beacon publish (devtest #9 same-NAT diagnosis) —
+ *  the beacon rides the same write path as every outbound publish (DMs/discovery), so a per-relay
+ *  reject here is evidence for those too, not presence-only. */
+export interface BeaconRelayOutcome {
+	url: string;
+	/** `"accepted"` or `"rejected"`. */
+	outcome: string;
+	reason: string | null;
+}
+
+/** Rolling beacon-health snapshot. */
+export interface BeaconReport {
+	/** Unix seconds of the most recent attempt (0 = never attempted). */
+	lastAttemptAt: number;
+	/** Unix seconds of the most recent attempt that reached a relay. */
+	lastSuccessAt: number;
+	relays: BeaconRelayOutcome[];
+	lastError: string | null;
+}
+
+/** Live beacon-publish health. Best-effort. */
+export const beaconStatus = () => invoke<BeaconReport>('beacon_status');
 
 /** Record that the one-time pre-first-download IP-exposure notice was acknowledged. */
 export const acknowledgePrivacyNotice = () => invoke<void>('acknowledge_privacy_notice');
@@ -205,6 +233,7 @@ export interface PeerSearchHit {
 	bio: string | null;
 	tags: string[];
 	content_types: string[];
+	picture: string | null;
 	fingerprint: { words: string[]; colorHex: string } | null;
 }
 
@@ -226,6 +255,16 @@ export const sendMessage = (to: string, content: string) =>
 	invoke<ReceivedMessage>('send_message', { to, content });
 
 export const getMessages = () => invoke<ReceivedMessage[]>('get_messages');
+
+// ── Unified read state (devtest #16) ────────────────────────────────────────────
+
+/** The per-peer last-read watermark (npub → RFC3339 timestamp of the newest message seen in that
+ *  conversation) — a pure local read, no relay I/O. The single source the unread badge derives from. */
+export const getReadState = () => invoke<Record<string, string>>('get_read_state');
+
+/** Advance `npub`'s read watermark to `sentAt` (never rewinds — see the Rust `advance_read_watermark`). */
+export const advanceReadWatermark = (npub: string, sentAt: string) =>
+	invoke<void>('advance_read_watermark', { npub, sentAt });
 
 // ── Q7 — the stranger-DM Request inbox (M13 Part B) ──────────────────────────
 
@@ -305,6 +344,10 @@ export const topicCreate = (
 
 export const topicDiscover = (tags: string[]) =>
 	invoke<DiscoveredTopic[]>('topic_discover', { tags });
+
+/** Join-first lookup (devtest #11): does this public Topic name already have a room? Never call for
+ *  a private Topic (no announce to find). */
+export const topicLookup = (name: string) => invoke<TopicLookup>('topic_lookup', { name });
 
 export const topicJoinPublic = (name: string) =>
 	invoke<TopicView>('topic_join_public', { name });

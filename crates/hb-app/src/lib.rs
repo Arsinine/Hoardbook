@@ -106,6 +106,7 @@ fn spawn_background_tasks(
     presence_cancel_rx: tokio::sync::watch::Receiver<bool>,
     store: DataStore,
     app: tauri::AppHandle,
+    beacon: presence::SharedBeaconState,
 ) {
     // The wakeup counter is the L4 idle-guard hook; in prod it is written-and-ignored.
     tauri::async_runtime::spawn(presence::run_presence_loop(
@@ -114,6 +115,7 @@ fn spawn_background_tasks(
         relay,
         presence_cancel_rx,
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        beacon,
     ));
 
     tauri::async_runtime::spawn(async move {
@@ -238,6 +240,7 @@ pub fn run() {
             let relay: net::SharedRelay = net::new_shared();
             let staged_update: commands::update::SharedStagedUpdate = Arc::default();
             let online_cache: commands::online::SharedOnlineCache = Arc::default();
+            let beacon: presence::SharedBeaconState = Arc::default();
 
             let (presence_cancel_tx, presence_cancel_rx) = tokio::sync::watch::channel(false);
             let presence_cancel: SharedCancelPresence = Arc::new(presence_cancel_tx);
@@ -252,6 +255,7 @@ pub fn run() {
             app.manage(Arc::clone(&watch_cancel));
             app.manage(Arc::clone(&staged_update));
             app.manage(Arc::clone(&online_cache));
+            app.manage(Arc::clone(&beacon));
             // M13 Part A: serializes the announce cooldown's check-and-record step.
             app.manage(commands::topics::AnnounceGate(std::sync::Mutex::new(())));
 
@@ -267,6 +271,7 @@ pub fn run() {
                 presence_cancel_rx,
                 store.clone(),
                 app_handle.clone(),
+                Arc::clone(&beacon),
             );
 
             // M9: the snapshot-watch sibling task (single watcher per app — single-instance, M8).
@@ -322,6 +327,7 @@ pub fn run() {
             commands::settings::save_settings,
             commands::settings::check_relay,
             commands::settings::relay_status,
+            commands::settings::beacon_status,
             commands::settings::acknowledge_privacy_notice,
             commands::online::online_count,
             commands::chat::send_message,
@@ -332,6 +338,8 @@ pub fn run() {
             commands::chat::dm_block,
             commands::chat::dm_unblock,
             commands::chat::dm_blocked_list,
+            commands::chat::get_read_state,
+            commands::chat::advance_read_watermark,
             commands::sharing::get_share_settings,
             commands::groups::groups_get,
             commands::groups::groups_create,
@@ -348,6 +356,7 @@ pub fn run() {
             commands::topics::topic_list,
             commands::topics::topic_create,
             commands::topics::topic_discover,
+            commands::topics::topic_lookup,
             commands::topics::topic_join_public,
             commands::topics::topic_redeem_invite,
             commands::topics::topic_request_join,

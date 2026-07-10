@@ -228,7 +228,9 @@
 
 
 	async function handleSave() {
-		if (!form.display_name) return;
+		// R1 (display name required to publish) does not apply to a draft — a blank name stays a
+		// legal, unpublished draft. Trim before persisting so whitespace-only never sticks around.
+		form.display_name = form.display_name.trim();
 		saving = true;
 		try {
 			form.updated = new Date().toISOString();
@@ -244,7 +246,10 @@
 	}
 
 	async function handlePublish() {
-		if (!form.display_name) return;
+		if (!form.display_name.trim()) {
+			toast('Enter a display name before publishing.', 'error');
+			return;
+		}
 		publishing = true;
 		try {
 			form.updated = new Date().toISOString();
@@ -555,10 +560,10 @@
 			</div>
 		</div>
 		<div class="topbar-actions">
-			<button class="btn-ghost btn-sm" onclick={handleSave} disabled={!form.display_name || saving}>
+			<button class="btn-ghost btn-sm" onclick={handleSave} disabled={saving}>
 				{saving ? 'Saving…' : 'Save draft'}
 			</button>
-			<button class="btn-primary btn-sm" class:publish-pulse={neverPublished && !publishing} onclick={handlePublish} disabled={publishing || !profileDirty} title={!profileDirty ? 'No changes since last publish' : undefined}>
+			<button class="btn-primary btn-sm" class:publish-pulse={neverPublished && !publishing} onclick={handlePublish} disabled={publishing || !profileDirty || !form.display_name.trim()} title={!form.display_name.trim() ? 'Enter a display name before publishing' : !profileDirty ? 'No changes since last publish' : undefined}>
 				{publishing ? 'Publishing…' : profileDirty ? 'Publish profile' : 'Published ✓'}
 			</button>
 		</div>
@@ -568,7 +573,7 @@
 		<!-- Left: Profile editor -->
 		<div class="profile-pane">
 			<div class="profile-header">
-				<Avatar letter={nameInitial} size={48} hue={nameHue} />
+				<Avatar letter={nameInitial} size={48} hue={nameHue} picture={$profile?.picture} />
 				<div class="profile-header-info">
 					<div class="profile-name">{form.display_name || 'DataHoarder'}</div>
 					<span class="mono">{$identity?.npub_short ?? ''}</span>

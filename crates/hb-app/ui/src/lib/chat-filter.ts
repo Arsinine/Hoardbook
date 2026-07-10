@@ -16,11 +16,13 @@ export function filterConversations(
 	return peers.filter((p) => nameOf(p.npub).toLowerCase().includes(q) || p.npub.toLowerCase().includes(q));
 }
 
-/** Case-insensitive match against a Topic's name. Empty query = every Topic, unchanged (identity). */
+/** Case-insensitive match against a Topic's name OR description (devtest #17/#18 sticky search
+ *  widening — a Topic's roster petnames aren't part of `TopicView`, so name+description is the full
+ *  searchable surface here). Empty query = every Topic, unchanged (identity). */
 export function filterTopics(topics: TopicView[], query: string): TopicView[] {
 	const q = query.trim().toLowerCase();
 	if (!q) return topics;
-	return topics.filter((t) => t.name.toLowerCase().includes(q));
+	return topics.filter((t) => t.name.toLowerCase().includes(q) || t.description.toLowerCase().includes(q));
 }
 
 /** What kind of recipient a pasted compose-to string looks like — a PREFIX check only, for immediate
@@ -32,4 +34,13 @@ export function composeRecipientKind(input: string): RecipientKind {
 	if (s.startsWith('npub1')) return 'npub';
 	if (s.startsWith('hbk1')) return 'sharecode';
 	return 'invalid';
+}
+
+/** devtest #14 — a pasted-in npub or full share code that is unmistakably **your own** (an exact
+ *  match; a partial/prefix paste still reaches the authoritative backend check on send, which
+ *  decodes any share code). Drives the composer's disabled-Send + hint UX. */
+export function isComposeToSelf(input: string, myNpub: string, myShareCode: string): boolean {
+	const s = input.trim();
+	if (!s) return false;
+	return s === myNpub || s === myShareCode;
 }

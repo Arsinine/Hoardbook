@@ -25,12 +25,13 @@ fn teaser() -> Teaser {
         bio: String::new(),
         tags: vec!["hbid".into()],
         content_types: vec!["video".into()],
+        picture: None,
     }
 }
 
 async fn id1(ctx: &Ctx) -> Result<()> {
     let id = Identity::generate();
-    let ev = build_teaser(&id, &teaser())?;
+    let ev = build_teaser(&id, &teaser(), true)?;
     let client = ctx.connect(&id).await?;
     client.publish(&ev).await?;
     settle().await;
@@ -116,7 +117,7 @@ async fn id4(ctx: &Ctx) -> TestResult {
 
 async fn id4_inner(ctx: &Ctx) -> Result<()> {
     let a = Identity::generate();
-    let ev = build_teaser(&a, &teaser())?;
+    let ev = build_teaser(&a, &teaser(), true)?;
 
     // Multi-publish lands the *same* signed event on both relays.
     let pubc = ctx.connect(&a).await?;

@@ -56,6 +56,13 @@ pub struct Settings {
     /// off hides the chip.
     #[serde(default = "default_true")]
     pub show_online_count: bool,
+    /// devtest #5: opt into tag/content-type discoverability — when true, the published teaser's
+    /// `tags`/`content_types` also surface as `t` hashtags (relay-searchable). **Default false**: a
+    /// pre-existing `settings.json` with no such key loads as `false` (bool serde default), which is
+    /// the intended silent de-list — no migration. npub lookup and share-code browse are unaffected
+    /// either way (they read the teaser body, not the hashtags).
+    #[serde(default)]
+    pub discoverable: bool,
 }
 
 impl Default for Settings {
@@ -68,6 +75,7 @@ impl Default for Settings {
             snapshot_auto_update: true,
             snapshot_reconcile_poll: false,
             show_online_count: true,
+            discoverable: false,
         }
     }
 }
@@ -687,6 +695,57 @@ pub struct Watch {
     pub seen_pubkeys: Vec<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Read state — per-peer persisted last-read watermark (devtest #16: unifies the three
+// unsynchronized unread-badge mechanisms into one persisted signal)
+// ---------------------------------------------------------------------------
+
+impl DataStore {
+    pub fn read_state_path(&self) -> PathBuf {
+        self.base.join("read_state.json")
+    }
+
+    /// The per-peer last-read watermark: npub → RFC3339 `sent_at` of the newest message the user has
+    /// seen in that conversation. Lenient + defaults empty, like the other small local-state files —
+    /// a version mismatch or absent file just means "nothing read yet".
+    pub fn load_read_state(&self) -> Result<std::collections::HashMap<String, String>> {
+        Ok(
+            read_json_lenient::<std::collections::HashMap<String, String>>(&self.read_state_path())
+                .context("loading read state")?
+                .unwrap_or_default(),
+        )
+    }
+
+    pub fn save_read_state(&self, m: &std::collections::HashMap<String, String>) -> Result<()> {
+        write_json(&self.read_state_path(), m).context("saving read state")
+    }
+
+    /// Advance `npub`'s watermark to `ts`, never rewinding it. `sent_at` is RFC3339 UTC everywhere in
+    /// this codebase, so a plain string compare is a valid chronological compare.
+    ///
+    /// The load→max→save sequence is a read-modify-write over the single `read_state.json` file, so
+    /// two overlapping calls (e.g. two DM-poll ticks racing) could otherwise interleave: both load the
+    /// same old map, both compute their own max, and whichever save lands second wins — even if it
+    /// carries the OLDER of the two timestamps, rewinding the watermark and resurrecting a phantom
+    /// unread badge. `READ_STATE_LOCK` serializes the whole load+max+save so the RMW is atomic
+    /// process-wide; the guarded section is a couple of small synchronous file ops, never held across
+    /// an `.await`.
+    pub fn advance_read_watermark(&self, npub: &str, ts: &str) -> Result<()> {
+        static READ_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = READ_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut m = self.load_read_state()?;
+        let advance = match m.get(npub) {
+            Some(existing) => ts > existing.as_str(),
+            None => true,
+        };
+        if advance {
+            m.insert(npub.to_string(), ts.to_string());
+            self.save_read_state(&m)?;
+        }
+        Ok(())
+    }
+}
+
 impl DataStore {
     pub fn watches_path(&self) -> PathBuf {
         self.base.join("watches.json")
@@ -851,6 +910,9 @@ mod tests {
         assert!(s.snapshot_auto_update, "snapshot auto-update defaults ON");
         assert!(!s.snapshot_reconcile_poll, "reconcile poll defaults OFF");
         assert!(s.show_online_count, "online-count chip defaults ON");
+        // devtest #5: a pre-existing settings.json with no `discoverable` key loads as false — the
+        // intended silent de-list, no migration.
+        assert!(!s.discoverable, "discoverable defaults OFF on an old file");
     }
 
     #[test]
@@ -866,6 +928,7 @@ mod tests {
             snapshot_auto_update: false,
             snapshot_reconcile_poll: true,
             show_online_count: false,
+            discoverable: true,
         };
         store.save_settings(&s).unwrap();
         let r = store.load_settings().unwrap().unwrap();
@@ -876,6 +939,7 @@ mod tests {
         assert!(!r.snapshot_auto_update, "auto-update toggle preserved");
         assert!(r.snapshot_reconcile_poll, "reconcile toggle preserved");
         assert!(!r.show_online_count, "online-count toggle preserved");
+        assert!(r.discoverable, "discoverable toggle preserved");
     }
 
     #[test]
@@ -1153,5 +1217,85 @@ mod tests {
         assert_eq!(store.load_published("films").unwrap().as_deref(), Some(r#"{"id":"abc"}"#));
         store.delete_published("films").unwrap();
         assert!(!store.is_published("films"));
+    }
+
+    // ── Read state (devtest #16) ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn read_state_defaults_empty_and_roundtrips() {
+        let (_dir, store) = test_store();
+        assert!(store.load_read_state().unwrap().is_empty(), "no read state yet defaults to empty");
+
+        let mut m = std::collections::HashMap::new();
+        m.insert("npub1a".to_string(), "2026-01-01T00:00:00Z".to_string());
+        store.save_read_state(&m).unwrap();
+
+        let loaded = store.load_read_state().unwrap();
+        assert_eq!(loaded.get("npub1a").map(String::as_str), Some("2026-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn advance_read_watermark_takes_max_never_rewinds() {
+        let (_dir, store) = test_store();
+        store.advance_read_watermark("npub1a", "2026-01-05T00:00:00Z").unwrap();
+        // An older timestamp must not rewind an already-advanced watermark.
+        store.advance_read_watermark("npub1a", "2026-01-03T00:00:00Z").unwrap();
+        let loaded = store.load_read_state().unwrap();
+        assert_eq!(
+            loaded.get("npub1a").map(String::as_str),
+            Some("2026-01-05T00:00:00Z"),
+            "an older ts must not rewind the watermark"
+        );
+
+        // A newer timestamp does advance it.
+        store.advance_read_watermark("npub1a", "2026-01-09T00:00:00Z").unwrap();
+        let loaded = store.load_read_state().unwrap();
+        assert_eq!(loaded.get("npub1a").map(String::as_str), Some("2026-01-09T00:00:00Z"));
+    }
+
+    #[test]
+    fn concurrent_advances_never_rewind_the_watermark() {
+        // Regression: a non-atomic load→max→save let an older-timestamp writer's save land last and
+        // rewind the watermark (phantom unread badge). 8 threads race distinct, shuffled timestamps
+        // for the SAME peer; the stored watermark must end up at the maximum regardless of interleaving.
+        let (_dir, store) = test_store();
+        let store = std::sync::Arc::new(store);
+        let mut timestamps: Vec<String> =
+            (0..8).map(|i| format!("2026-01-{:02}T00:00:00Z", i + 1)).collect();
+        // Shuffle deterministically (no external rand dep needed) so threads don't race in order.
+        timestamps.swap(0, 7);
+        timestamps.swap(1, 5);
+        timestamps.swap(2, 6);
+        let max_ts = timestamps.iter().max().cloned().unwrap();
+
+        let handles: Vec<_> = timestamps
+            .into_iter()
+            .map(|ts| {
+                let store = std::sync::Arc::clone(&store);
+                std::thread::spawn(move || {
+                    store.advance_read_watermark("npub1contended", &ts).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let loaded = store.load_read_state().unwrap();
+        assert_eq!(
+            loaded.get("npub1contended").map(String::as_str),
+            Some(max_ts.as_str()),
+            "the watermark must land on the maximum timestamp regardless of thread interleaving"
+        );
+    }
+
+    #[test]
+    fn read_state_is_wiped_with_the_rest_of_the_profile() {
+        let (_dir, store) = test_store();
+        store.advance_read_watermark("npub1a", "2026-01-01T00:00:00Z").unwrap();
+        assert!(store.read_state_path().exists());
+
+        store.wipe().unwrap();
+        assert!(!store.read_state_path().exists(), "read_state.json must be removed by wipe()");
     }
 }

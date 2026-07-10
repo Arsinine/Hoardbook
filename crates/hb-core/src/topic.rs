@@ -374,6 +374,15 @@ pub fn topic_id_for_name(name: &str) -> String {
     hex::encode(h.finalize())
 }
 
+/// The public seam onto [`normalize_name`] (private in this module): validate `name` as a **public**
+/// Topic path, then return its canonical normalized form — the same string [`topic_id_for_name`]
+/// hashes, so a caller can agree with it (devtest #11 — a join-first lookup normalizes the same way
+/// a create would, so the same room is found before a new one is minted).
+pub fn normalized_public_name(name: &str) -> Result<String, HbError> {
+    validate_public_name(name)?;
+    Ok(normalize_name(name))
+}
+
 /// Mint a new Topic: a fresh random `topic_key` + its `TopicMeta`. A **public** Topic is
 /// **validated** (root ∈ category + depth cap — Decision K) and gets a name-derived `topic_id` over
 /// its **normalized path** (shared room); its stored `name` is the canonical path. A **private**
@@ -1095,6 +1104,40 @@ mod tests {
         assert!(new_topic(&at_cap, "", vec![], false).is_ok(), "a path at the depth cap is accepted");
         let too_deep = std::iter::once("video").chain(std::iter::repeat_n("x", MAX_TOPIC_DEPTH)).collect::<Vec<_>>().join("/");
         assert!(new_topic(&too_deep, "", vec![], false).is_err(), "a path past the depth cap is rejected");
+    }
+
+    #[test]
+    fn normalized_public_name_agrees_with_topic_id_for_name_across_variants() {
+        // devtest #11: the join-first lookup normalizes exactly like a create would, so the same
+        // name (any case/space/extra-slash/NFKC variant) resolves to the SAME topic_id.
+        let canonical = normalized_public_name("video/animation/anime").unwrap();
+        assert_eq!(canonical, "video/animation/anime");
+        for variant in [
+            "Video / Animation / Anime",
+            "  video/animation/anime  ",
+            "video//animation///anime",
+            "/video/animation/anime/",
+            "VIDEO/Animation/ANIME",
+            "ＶＩＤＥＯ/animation/anime",
+        ] {
+            let normalized = normalized_public_name(variant).unwrap();
+            assert_eq!(
+                topic_id_for_name(&normalized),
+                topic_id_for_name(variant),
+                "variant {variant:?} must still hash to the same id via topic_id_for_name"
+            );
+            assert_eq!(
+                topic_id_for_name(&normalized),
+                topic_id_for_name(&canonical),
+                "variant {variant:?} must converge to the canonical id"
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_public_name_errors_on_a_non_category_root() {
+        assert!(normalized_public_name("blah/test/video").is_err());
+        assert!(normalized_public_name("anime").is_err());
     }
 
     #[test]

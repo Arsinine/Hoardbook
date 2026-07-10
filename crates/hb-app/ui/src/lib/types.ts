@@ -33,6 +33,8 @@ export interface Profile {
 	willing_to: string[];
 	/** Aggregate content types across all published collections (auto-computed). */
 	content_types: string[];
+	/** Optional avatar as a `data:` URI (M13 item #13) — never an http(s) URL. */
+	picture?: string;
 	updated: string; // ISO datetime
 }
 
@@ -181,6 +183,14 @@ export interface DiscoveredTopic {
 	name: string;
 	description: string;
 	tags: string[];
+	member_count_estimate: number;
+}
+
+/** The join-first lookup result (devtest #11) — does this public Topic name already have a room? */
+export interface TopicLookup {
+	topic_id: string;
+	name: string;
+	exists: boolean;
 	member_count_estimate: number;
 }
 

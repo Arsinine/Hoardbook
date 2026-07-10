@@ -8,14 +8,16 @@
 
 use anyhow::{anyhow, ensure, Result};
 use hb_core::topic::{
-    build_announce, build_public_join, roster, seal_membership, topic_id_for_name, NonceSet,
-    TopicKey, TopicMeta, KIND_TOPIC_MEMBER, KIND_TOPIC_POST, POST_TTL_SECS,
+    build_announce, build_public_join, normalized_public_name, roster, seal_membership,
+    topic_id_for_name, NonceSet, TopicKey, TopicMeta, KIND_TOPIC_MEMBER, KIND_TOPIC_POST,
+    POST_TTL_SECS,
 };
 use hb_core::{new_topic, Identity};
 use hb_net::{
-    announce_to_topic, approve_join, discover_public_topics, fetch_channel, fetch_channel_full,
-    fetch_invite, fetch_join_requests, fetch_membership_events, fetch_roster, join_public,
-    join_topic, leave_topic, member_count, post_to_channel, publish_topic, request_join,
+    announce_to_topic, approve_join, discover_public_topics, fetch_announce, fetch_channel,
+    fetch_channel_full, fetch_invite, fetch_join_requests, fetch_membership_events, fetch_roster,
+    join_public, join_topic, leave_topic, member_count, post_to_channel, publish_topic,
+    request_join,
 };
 use nostr::prelude::*;
 
@@ -39,6 +41,10 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
             topic11(ctx).await,
         ),
         result("TOPIC12 announce 24h local filter regardless of relay", topic12(ctx).await),
+        result(
+            "TOPIC13 same-name create is join-first: B lands in A's roster (devtest #11)",
+            topic13(ctx).await,
+        ),
     ]
 }
 
@@ -515,5 +521,70 @@ async fn topic12(ctx: &Ctx) -> Result<()> {
         !later.announcements.iter().any(|a| a.body == "fresh announce"),
         "the client filters a >24h announce locally regardless of the relay"
     );
+    Ok(())
+}
+
+// ── TOPIC13 (devtest #11: same-name create is join-first) ──────────────────────────────────────
+
+/// TOPIC13 (devtest #11): A creates a public Topic under one casing/spacing of a name; B, given the
+/// SAME name typed differently, runs the `topic_lookup` path (`normalized_public_name` →
+/// `topic_id_for_name` → `fetch_announce`), finds A's announce, and joins the **existing** room via
+/// the keyless public-join credential instead of minting a fork (Decision C — same `topic_id`, same
+/// `topic_key`, not a fresh key). Proves B lands in A's roster (member_count == 2) and can decrypt a
+/// channel post A published under the shared key.
+async fn topic13(ctx: &Ctx) -> Result<()> {
+    // A run-scoped name (so re-runs don't collide with a stale announce) typed one way by A...
+    let canonical = format!("video/hbit-topic13-{}/Anime Classics", ctx.run_id);
+    // ...and the SAME name typed another way by B (case + whitespace variant) — must normalize to
+    // the identical topic_id.
+    let variant = format!("video/hbit-topic13-{}/anime classics", ctx.run_id).to_lowercase();
+
+    // A creates the topic the same way `topic_create` does: mint + announce + public-join + own
+    // membership, all published to the relay set.
+    let a = Identity::generate();
+    let (meta_a, key_a) = new_topic(&canonical, "a subject group", vec![ctx.tag("topic13")], false).unwrap();
+    create_public(ctx, &a, &meta_a, &key_a).await?;
+
+    // A posts to the channel so B's later read proves it holds the REAL shared key, not just a room.
+    let ac = ctx.connect(&a).await?;
+    post_to_channel(&ac, &key_a, &meta_a.topic_id, &a, "welcome to anime classics", now()).await?;
+    ac.disconnect().await;
+    settle().await;
+
+    // B runs the join-first lookup exactly like the `topic_lookup` command: normalize the name it
+    // typed, derive the topic_id the same way `new_topic`/`topic_create` would, and check for an
+    // existing announce BEFORE minting anything.
+    let b = Identity::generate();
+    let bc = ctx.connect(&b).await?;
+    let normalized = normalized_public_name(&variant)?;
+    let topic_id = topic_id_for_name(&normalized);
+    ensure!(topic_id == meta_a.topic_id, "the case/space variant must derive A's topic_id");
+
+    let found = fetch_announce(&bc, &topic_id, FETCH_TIMEOUT)
+        .await?
+        .ok_or_else(|| anyhow!("B's join-first lookup found no announce — would have forked a new topic"))?;
+    ensure!(found.topic_id == meta_a.topic_id, "the found announce must be A's room");
+
+    // B takes the keyless public-join path (join-first, not create): redeem the public-join
+    // credential derived from the SAME name, obtaining A's real topic_key (no fresh mint).
+    let mut seen = NonceSet::new();
+    let (jmeta, jkey) = join_public(&bc, &variant, &mut seen, now(), FETCH_TIMEOUT)
+        .await?
+        .ok_or_else(|| anyhow!("B found no public-join credential for A's room"))?;
+    ensure!(jmeta.topic_id == meta_a.topic_id, "B's join targets A's existing room, not a fork");
+    ensure!(jkey.as_bytes() == key_a.as_bytes(), "B obtains A's REAL topic key, not a fresh one (Decision C)");
+    join_topic(&bc, &jkey, &jmeta.topic_id, &b, now()).await?;
+    settle().await;
+
+    // B lands in A's roster (member_count == 2: A + B, same room, same key).
+    let count = member_count(&bc, &meta_a.topic_id, FETCH_TIMEOUT).await?;
+    ensure!(count == 2, "join-first: A + B share one roster, got member_count {count}");
+    let ros = fetch_roster(&bc, &meta_a.topic_id, &jkey, FETCH_TIMEOUT).await?;
+    ensure!(ros.contains(&a.public_key()) && ros.contains(&b.public_key()), "both A and B are on the shared roster: {ros:?}");
+
+    // B can decrypt A's channel post under the shared key — the cryptographic proof of a shared room.
+    let chan = fetch_channel(&bc, &meta_a.topic_id, &jkey, now(), FETCH_TIMEOUT).await?;
+    bc.disconnect().await;
+    ensure!(chan.iter().any(|p| p.body == "welcome to anime classics"), "B reads A's channel post under the shared key");
     Ok(())
 }

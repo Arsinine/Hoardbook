@@ -52,6 +52,10 @@ pub struct Profile {
     /// Computed as union of all published collections; never edited directly.
     #[serde(default)]
     pub content_types: Vec<String>,
+    /// Optional avatar as a `data:` URI — mirrors `event::Teaser::picture` (M13 item #13); see that
+    /// field's doc for the privacy rails (never http(s), 16 KB cap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
     pub updated: DateTime<Utc>,
 }
 
@@ -211,6 +215,7 @@ mod tests {
             social_links: vec![],
             willing_to: vec![],
             content_types: vec![],
+            picture: None,
             updated: chrono::Utc::now(),
         };
         let json = serde_json::to_string(&profile).unwrap();

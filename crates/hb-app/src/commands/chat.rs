@@ -63,6 +63,13 @@ fn parse_recipient(s: &str) -> Result<PublicKey, String> {
         .map_err(|e| format!("Invalid recipient: {e}"))
 }
 
+/// devtest #14: a self-send is never valid — `send_message` rejects it before any network I/O.
+/// `classify_dms`'s `from == own_npub` inbox routing stays; it exists for the legitimate sent-echo
+/// of a message you already sent, not to allow creating a self-conversation from scratch.
+fn is_self_send(recipient: &PublicKey, me: &PublicKey) -> bool {
+    recipient == me
+}
+
 fn npub_of(pk: &PublicKey) -> String {
     pk.to_bech32().unwrap_or_else(|_| pk.to_hex())
 }
@@ -400,6 +407,10 @@ pub async fn send_message(
         (id.npub(), id.identity.clone())
     };
 
+    if is_self_send(&recipient, &id_clone.public_key()) {
+        return Err("You can't send a message to yourself.".into());
+    }
+
     let own = net::relay_urls(&store);
     let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
     send_dm_inner(&client, &id_clone, &recipient, &trimmed, &own, net::RELAY_TIMEOUT)
@@ -496,6 +507,29 @@ pub async fn dm_blocked_list(store: State<'_, DataStore>) -> CmdResult<Vec<Strin
 }
 
 // ---------------------------------------------------------------------------
+// Read state (devtest #16) — the unified per-peer last-read watermark
+// ---------------------------------------------------------------------------
+
+/// The per-peer last-read watermark (npub → RFC3339 `sent_at` of the newest seen message) — a pure
+/// local read, no relay I/O.
+#[tauri::command]
+pub async fn get_read_state(
+    store: State<'_, DataStore>,
+) -> CmdResult<std::collections::HashMap<String, String>> {
+    store.load_read_state().map_err(cmd_err)
+}
+
+/// Advance `npub`'s read watermark to `sent_at` (never rewinds — see `DataStore::advance_read_watermark`).
+#[tauri::command]
+pub async fn advance_read_watermark(
+    npub: String,
+    sent_at: String,
+    store: State<'_, DataStore>,
+) -> CmdResult<()> {
+    store.advance_read_watermark(&npub, &sent_at).map_err(cmd_err)
+}
+
+// ---------------------------------------------------------------------------
 // Tests — the DM seam (L1, no relay; the wire is proven by hb-it Suite DM)
 // ---------------------------------------------------------------------------
 
@@ -504,6 +538,14 @@ mod tests {
     use super::*;
     use crate::dm_quarantine::DmRequestBucket;
     use hb_core::Identity;
+
+    #[test]
+    fn is_self_send_rejects_own_pubkey_devtest_14() {
+        let me = Identity::generate();
+        let stranger = Identity::generate();
+        assert!(is_self_send(&me.public_key(), &me.public_key()));
+        assert!(!is_self_send(&stranger.public_key(), &me.public_key()));
+    }
 
     #[tokio::test]
     async fn send_dm_inner_produces_a_nip17_giftwrap() {

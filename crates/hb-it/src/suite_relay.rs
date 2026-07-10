@@ -29,6 +29,7 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
         result("RELAY1 degraded-relay tolerance", relay1(ctx).await),
         result("RELAY2 cross-client presence is mutually visible", relay2(ctx).await),
         result("RELAY3 count recovers — no sticky –", relay3(ctx).await),
+        result("RELAY4 same-IP two identities each count online (+2)", relay4(ctx).await),
     ]
 }
 
@@ -124,4 +125,12 @@ async fn relay3(ctx: &Ctx) -> Result<()> {
     client.disconnect().await;
     ensure!(n >= 1, "after a recovery the count must surface a number (got {n})");
     Ok(())
+}
+
+/// CI-runnable differential twin of the devtest #9 `--same-nat` diagnostic — shares its body
+/// (`same_nat::same_nat1`) against `ctx.relays` (the ephemeral CI strfry). CI strfry has no per-IP
+/// cap, so green here proves the plumbing, not the absence of the bug; the live diagnostic is
+/// `--same-nat` against the production relays.
+async fn relay4(ctx: &Ctx) -> Result<()> {
+    crate::same_nat::same_nat1(ctx).await
 }

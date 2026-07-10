@@ -16,11 +16,15 @@ use nostr::prelude::*;
 use serde::Serialize;
 use tauri::State;
 
-use hb_core::topic::{build_announce, build_public_join, new_topic, seal_membership};
+use hb_core::topic::{
+    build_announce, build_public_join, new_topic, normalized_public_name, seal_membership,
+    topic_id_for_name,
+};
 use hb_core::{announce_cooldown_remaining, Identity};
 use hb_net::{
-    announce_to_topic, approve_join, discover_public_topics, fetch_channel_full, fetch_invite,
-    fetch_roster, join_public, join_topic, leave_topic, post_to_channel, publish_topic, request_join,
+    announce_to_topic, approve_join, discover_public_topics, fetch_announce, fetch_channel_full,
+    fetch_invite, fetch_roster, join_public, join_topic, leave_topic, member_count, post_to_channel,
+    publish_topic, request_join,
 };
 
 use crate::{
@@ -64,6 +68,21 @@ pub struct DiscoveredTopic {
     pub tags: Vec<String>,
     /// Best-effort, **spoofable** count (Decision: anyone can publish a fake membership) — present it
     /// as approximate in the UI, never authoritative.
+    pub member_count_estimate: usize,
+}
+
+/// The result of the join-first lookup (devtest #11): does this public Topic name already have a
+/// room? `exists: false` means no announce was found — the name is free to create. `exists: true`
+/// means the Create modal should offer to **join** instead of forking a same-named-but-different room
+/// (same `topic_id`, but a fresh `TopicKey::generate()` — Decision C — so a fork is cryptographically
+/// real, not cosmetic).
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicLookup {
+    pub topic_id: String,
+    pub name: String,
+    pub exists: bool,
+    /// Best-effort, **spoofable** count — same caveat as [`DiscoveredTopic::member_count_estimate`].
+    /// `0` when `exists` is false.
     pub member_count_estimate: usize,
 }
 
@@ -221,13 +240,31 @@ pub async fn topic_create(
     let (meta, key) = new_topic(&name, &description, tags, private).map_err(cmd_err)?;
     let t = now();
 
+    let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
+
+    // devtest #11 follow-up: `topic_lookup` is only a UI *preflight* — a client can look up, see
+    // nothing, and still race another client that does the same before either publishes. Recheck for
+    // an existing announce right before minting/publishing (same normalized seam `topic_lookup` uses)
+    // so a same-name PUBLIC create started after another one already landed joins instead of forking a
+    // second, cryptographically distinct room (same `topic_id`, fresh key — Decision C). This narrows
+    // but cannot close the race: two clients that both check and both see nothing can still both
+    // create — relays are eventually consistent, so no single check-then-act is airtight without a
+    // registry. The residual is accepted (Decision C's newest-announce-wins dedup is the existing
+    // fallback: `topic_lookup`/discovery converge on one announce once relays propagate).
+    if !private {
+        if let Some(_existing) =
+            fetch_announce(&client, &meta.topic_id, net::RELAY_TIMEOUT).await.map_err(cmd_err)?
+        {
+            return Err("That topic already exists — joining it instead of creating a duplicate.".into());
+        }
+    }
+
     let membership = seal_membership(&key, &meta.topic_id, &me, t).map_err(cmd_err)?;
     let mut events = vec![membership.clone()];
     if !private {
         events.push(build_announce(&me, &meta, t).map_err(cmd_err)?);
         events.push(build_public_join(&me, &meta, &key, t).map_err(cmd_err)?);
     }
-    let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
     publish_topic(&client, &events).await.map_err(cmd_err)?;
 
     let stored = StoredTopic { meta: meta.clone(), key, joined_at: t, membership_json: Some(membership.as_json()) };
@@ -258,6 +295,30 @@ pub async fn topic_discover(
             member_count_estimate: count,
         })
         .collect())
+}
+
+/// Join-first lookup (devtest #11): before minting a new **public** Topic, check whether its
+/// composed name already has an announce — if so, the caller should join the existing room instead
+/// of forking it (Create stays mint-only; the UI branches to `topic_join_public` on `exists`). Never
+/// called for a private Topic (no announce to find).
+#[tauri::command]
+pub async fn topic_lookup(
+    name: String,
+    identity: State<'_, SharedIdentity>,
+    store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
+) -> CmdResult<TopicLookup> {
+    let me = me(&identity).await?;
+    let normalized = normalized_public_name(&name).map_err(cmd_err)?;
+    let topic_id = topic_id_for_name(&normalized);
+    let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
+    match fetch_announce(&client, &topic_id, net::RELAY_TIMEOUT).await.map_err(cmd_err)? {
+        Some(meta) => {
+            let count = member_count(&client, &topic_id, net::RELAY_TIMEOUT).await.unwrap_or(0);
+            Ok(TopicLookup { topic_id, name: meta.name, exists: true, member_count_estimate: count })
+        }
+        None => Ok(TopicLookup { topic_id, name: normalized, exists: false, member_count_estimate: 0 }),
+    }
 }
 
 /// Join a public Topic by name: obtain the key via the public-join credential, publish my membership,

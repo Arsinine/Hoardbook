@@ -39,12 +39,11 @@ describe('backup export — modes', () => {
 	});
 });
 
-describe('backup export — share code (text + QR)', () => {
-	it('share_code_export_renders_text_and_qr', () => {
+describe('backup export — share code (text)', () => {
+	it('share_code_export_renders_text', () => {
 		const code = 'hbk1examplecode';
-		const out = shareCodeExport(code, (s) => `<svg>${s}</svg>`);
+		const out = shareCodeExport(code);
 		expect(out.text).toBe(code);
-		expect(out.qr).toBe(`<svg>${code}</svg>`); // QR derived from the code
 		expect(out.warned).toBe(true); // carries the browse-key → secret
 	});
 });

@@ -27,6 +27,15 @@ describe('contact-display', () => {
 		);
 	});
 
+	it('treats a literal empty-string display_name as absent (legacy/adversarial teasers can carry one)', () => {
+		// R1 only guards *publish* (hb-core::event::build_teaser) — parse_teaser still accepts a
+		// pre-existing or adversarial teaser with display_name: "". A bare `??` wouldn't catch this
+		// (empty string is neither null nor undefined); contactDisplayName must fall through anyway.
+		expect(contactDisplayName({ npub: NPUB, petname: '', profile: { display_name: '' } })).toBe(
+			shortNpub(NPUB),
+		);
+	});
+
 	it('shortNpub truncates long npubs and leaves short ones alone', () => {
 		expect(shortNpub(NPUB)).toBe(`${NPUB.slice(0, 8)}…${NPUB.slice(-4)}`);
 		expect(shortNpub('npub1x')).toBe('npub1x');

@@ -33,6 +33,7 @@ fn teaser() -> Teaser {
         bio: "90s anime, VHS rips".into(),
         tags: vec!["anime".into(), "vhs".into()],
         content_types: vec!["video".into()],
+        picture: None,
     }
 }
 
@@ -42,7 +43,7 @@ fn bk(seed: u8) -> [u8; 32] {
 
 async fn n1(ctx: &Ctx) -> Result<()> {
     let id = Identity::generate();
-    let ev = build_teaser(&id, &teaser())?;
+    let ev = build_teaser(&id, &teaser(), true)?;
     let client = ctx.connect(&id).await?;
     client.publish(&ev).await?;
     settle().await;
@@ -98,10 +99,10 @@ async fn n3(ctx: &Ctx) -> Result<()> {
     v2.display_name = "v2".into();
 
     let client = ctx.connect(&id).await?;
-    client.publish(&build_teaser(&id, &v1)?).await?;
+    client.publish(&build_teaser(&id, &v1, true)?).await?;
     // The teaser is a replaceable event keyed on created_at; a 1s gap makes v2 strictly newer.
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    client.publish(&build_teaser(&id, &v2)?).await?;
+    client.publish(&build_teaser(&id, &v2, true)?).await?;
     settle().await;
     let got = client
         .fetch(Filter::new().author(id.public_key()).kind(Kind::from_u16(KIND_TEASER)), FETCH_TIMEOUT)
@@ -159,7 +160,7 @@ async fn n4(ctx: &Ctx) -> Result<()> {
 
 async fn n5(ctx: &Ctx) -> Result<()> {
     let id = Identity::generate();
-    let ev = build_teaser(&id, &teaser())?;
+    let ev = build_teaser(&id, &teaser(), true)?;
     let client = ctx.connect(&id).await?;
     client.publish(&ev).await?;
     settle().await;

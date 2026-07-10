@@ -189,7 +189,8 @@ mod tests {
         let b = Identity::generate();
         let teaser = build_teaser(
             &a,
-            &Teaser { display_name: "a".into(), bio: String::new(), tags: vec![], content_types: vec![] },
+            &Teaser { display_name: "a".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None },
+            true,
         )
         .unwrap();
         let evs = vec![presence_at(&a, NOW), teaser, presence_at(&b, NOW)];

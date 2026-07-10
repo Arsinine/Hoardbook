@@ -57,8 +57,9 @@ fn no_public_event_broadcasts_the_browse_key_in_any_encoding() {
         bio: "90s anime, VHS rips".into(),
         tags: vec!["anime".into(), "vhs".into()],
         content_types: vec!["video".into()],
+        picture: None,
     };
-    events.push(("event::build_teaser", build_teaser(&me, &teaser).expect("teaser builds")));
+    events.push(("event::build_teaser", build_teaser(&me, &teaser, true).expect("teaser builds")));
 
     // Public listing — encrypted UNDER the fixed browse-key (the headline surface: the key is the
     // encryption input right here, so this is where an implementation slip would leak it).

@@ -32,6 +32,34 @@ pub struct Teaser {
     pub tags: Vec<String>,
     #[serde(default)]
     pub content_types: Vec<String>,
+    /// Optional avatar as a `data:` URI (M13 item #13) — never an `http(s)` URL (that would make
+    /// the public teaser trigger a fetch). Capped at [`TEASER_PICTURE_MAX_BYTES`]; see
+    /// [`validate_picture`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+}
+
+/// Hard cap on [`Teaser::picture`]'s encoded size (the whole `data:` URI string, in bytes) — keeps
+/// the picture well inside the teaser body's existing size budget with no new wire surface.
+pub const TEASER_PICTURE_MAX_BYTES: usize = 16 * 1024;
+
+/// Validate a teaser picture before it is ever signed/broadcast: must be a `data:` URI (never
+/// `http://`/`https://` — a public teaser must never cause a fetch, spec §The Profile) and no
+/// larger than [`TEASER_PICTURE_MAX_BYTES`].
+pub fn validate_picture(pic: &str) -> Result<(), HbError> {
+    if pic.len() > TEASER_PICTURE_MAX_BYTES {
+        return Err(HbError::InvalidEvent(format!(
+            "teaser picture exceeds the {TEASER_PICTURE_MAX_BYTES}-byte cap"
+        )));
+    }
+    let lower = pic.get(..8).unwrap_or(pic).to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Err(HbError::InvalidEvent("teaser picture must not be an http(s) URL".into()));
+    }
+    if !pic.starts_with("data:") {
+        return Err(HbError::InvalidEvent("teaser picture must be a data: URI".into()));
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -41,21 +69,39 @@ struct Versioned<T> {
     inner: T,
 }
 
-/// Build a signed public teaser. `tags` + `content_types` are also emitted as `t` tags so
-/// the teaser is discoverable by tag search without exposing any listing.
-pub fn build_teaser(identity: &Identity, teaser: &Teaser) -> Result<Event, HbError> {
+/// Build a signed public teaser. When `discoverable` is true, `tags` + `content_types` are also
+/// emitted as `t` hashtags so the teaser is discoverable by tag search; when false, no hashtags are
+/// emitted at all (devtest #5 — the opt-out de-lists from tag/content-type search while npub lookup
+/// and share-code browse keep working, since those read the teaser BODY, unaffected either way). A
+/// present [`Teaser::picture`] is validated (never http(s), never over-cap) — publish-side hard
+/// reject, never silently dropped.
+pub fn build_teaser(identity: &Identity, teaser: &Teaser, discoverable: bool) -> Result<Event, HbError> {
+    // R1: a display name is required to publish (devtest #17/#18) — a peer with no teaser cannot
+    // be added downstream (R2, see hb-app::commands::browse), so a blank name here would create a
+    // published-but-unaddable profile.
+    if teaser.display_name.trim().is_empty() {
+        return Err(HbError::InvalidEvent("a display name is required to publish".into()));
+    }
+    if let Some(pic) = &teaser.picture {
+        validate_picture(pic)?;
+    }
     let content = serde_json::to_string(&Versioned { v: SCHEMA_V, inner: teaser.clone() })?;
     let mut tags = vec![
         Tag::identifier(TEASER_D),
         Tag::custom(TagKind::custom(TAG_SCHEMA), [SCHEMA_V.to_string()]),
     ];
-    for t in teaser.tags.iter().chain(teaser.content_types.iter()) {
-        tags.push(Tag::hashtag(t));
+    if discoverable {
+        for t in teaser.tags.iter().chain(teaser.content_types.iter()) {
+            tags.push(Tag::hashtag(t));
+        }
     }
     identity.sign(EventBuilder::new(Kind::from_u16(KIND_TEASER), content).tags(tags))
 }
 
-/// Verify + parse a teaser. Rejects the wrong kind and a missing/unknown schema version.
+/// Verify + parse a teaser. Rejects the wrong kind and a missing/unknown schema version. A present
+/// `picture` that fails [`validate_picture`] (e.g. an old client's since-tightened rule, or a
+/// tampered relay copy) is **sanitized to `None`** rather than rejecting the whole teaser — the rest
+/// of the profile is still good data (devtest #13).
 pub fn parse_teaser(event: &Event) -> Result<Teaser, HbError> {
     verify_event(event)?;
     if event.kind != Kind::from_u16(KIND_TEASER) {
@@ -66,7 +112,15 @@ pub fn parse_teaser(event: &Event) -> Result<Teaser, HbError> {
     }
     let payload: Versioned<Teaser> = serde_json::from_str(&event.content)?;
     check_schema(payload.v)?;
-    Ok(payload.inner)
+    let mut teaser = payload.inner;
+    // hb-core has no logging dependency (kept a pure crypto/wire crate) — the sanitize is silent,
+    // same posture as the rest of this parser's tag-level defaults.
+    if let Some(pic) = &teaser.picture {
+        if validate_picture(pic).is_err() {
+            teaser.picture = None;
+        }
+    }
+    Ok(teaser)
 }
 
 /// Build a signed, encrypted collection-listing event (kind 31111, `d` = slug).
@@ -128,13 +182,14 @@ mod tests {
             bio: "90s anime, VHS rips".into(),
             tags: vec!["anime".into(), "vhs".into()],
             content_types: vec!["video".into()],
+            picture: None,
         }
     }
 
     #[test]
-    fn teaser_roundtrips_and_carries_hashtags() {
+    fn teaser_roundtrips_and_carries_hashtags_when_discoverable() {
         let id = Identity::generate();
-        let ev = build_teaser(&id, &teaser()).unwrap();
+        let ev = build_teaser(&id, &teaser(), true).unwrap();
         assert_eq!(parse_teaser(&ev).unwrap(), teaser());
         // Discovery: tags + content_types surface as `t` tags.
         let hashtags = ev.tags.hashtags().collect::<Vec<_>>();
@@ -142,10 +197,22 @@ mod tests {
     }
 
     #[test]
+    fn teaser_without_discoverable_emits_no_hashtags() {
+        // devtest #5: discoverable=false de-lists from tag search — zero `t` hashtags — while the
+        // teaser BODY still carries tags/content_types (npub lookup + share-code browse read the
+        // body, unaffected) and the round-trip is unchanged.
+        let id = Identity::generate();
+        let ev = build_teaser(&id, &teaser(), false).unwrap();
+        assert_eq!(ev.tags.hashtags().count(), 0, "no hashtags when not discoverable");
+        assert!(ev.content.contains("anime") && ev.content.contains("video"), "body still carries the tags");
+        assert_eq!(parse_teaser(&ev).unwrap(), teaser(), "round-trips equal regardless of discoverable");
+    }
+
+    #[test]
     fn teaser_omits_contact_hint() {
         // The public teaser event must never carry the deanonymizing contact_hint (N1/AB10).
         let id = Identity::generate();
-        let ev = build_teaser(&id, &teaser()).unwrap();
+        let ev = build_teaser(&id, &teaser(), true).unwrap();
         assert!(!ev.content.contains("contact_hint"));
         // And the struct has no such field to leak through.
         assert!(!serde_json::to_string(&teaser()).unwrap().contains("contact_hint"));
@@ -154,9 +221,85 @@ mod tests {
     #[test]
     fn builder_inserts_schema_v() {
         let id = Identity::generate();
-        let ev = build_teaser(&id, &teaser()).unwrap();
+        let ev = build_teaser(&id, &teaser(), true).unwrap();
         assert!(ev.content.contains(&format!("\"v\":{SCHEMA_V}")));
         assert_eq!(tag_val(&ev, TAG_SCHEMA).as_deref(), Some(SCHEMA_V.to_string().as_str()));
+    }
+
+    #[test]
+    fn teaser_roundtrips_with_picture() {
+        let id = Identity::generate();
+        let mut t = teaser();
+        t.picture = Some(format!("data:image/webp;base64,{}", "A".repeat(100)));
+        let ev = build_teaser(&id, &t, true).unwrap();
+        assert_eq!(parse_teaser(&ev).unwrap(), t);
+    }
+
+    #[test]
+    fn teaser_roundtrips_without_picture() {
+        let id = Identity::generate();
+        let t = teaser();
+        let ev = build_teaser(&id, &t, true).unwrap();
+        assert!(!ev.content.contains("picture"), "no picture key on the wire when None");
+        assert_eq!(parse_teaser(&ev).unwrap().picture, None);
+    }
+
+    #[test]
+    fn build_teaser_rejects_http_picture() {
+        let id = Identity::generate();
+        let mut t = teaser();
+        t.picture = Some("http://evil.example/track.png".into());
+        assert!(build_teaser(&id, &t, true).is_err());
+        t.picture = Some("HTTPS://evil.example/track.png".into());
+        assert!(build_teaser(&id, &t, true).is_err());
+    }
+
+    #[test]
+    fn build_teaser_rejects_oversize_picture() {
+        let id = Identity::generate();
+        let mut t = teaser();
+        t.picture = Some(format!("data:image/webp;base64,{}", "A".repeat(TEASER_PICTURE_MAX_BYTES)));
+        assert!(build_teaser(&id, &t, true).is_err());
+    }
+
+    #[test]
+    fn build_teaser_rejects_blank_display_name() {
+        // R1: a display name is required to publish — an empty or whitespace-only name is a hard
+        // publish-side reject, same posture as the picture guards above.
+        let id = Identity::generate();
+        let mut t = teaser();
+        t.display_name = "".into();
+        assert!(build_teaser(&id, &t, true).is_err());
+        t.display_name = "   ".into();
+        assert!(build_teaser(&id, &t, true).is_err());
+    }
+
+    #[test]
+    fn parse_teaser_strips_http_picture() {
+        // Hand-build + sign a teaser whose JSON carries an http(s) picture (an old/tampered
+        // event) — parse must sanitize it to None, not reject the whole teaser.
+        let id = Identity::generate();
+        let mut t = teaser();
+        t.picture = Some("http://evil.example/track.png".into());
+        let content = serde_json::to_string(&Versioned { v: SCHEMA_V, inner: t }).unwrap();
+        let ev = id
+            .sign(EventBuilder::new(Kind::from_u16(KIND_TEASER), content).tag(Tag::identifier(TEASER_D)))
+            .unwrap();
+        let parsed = parse_teaser(&ev).unwrap();
+        assert_eq!(parsed.picture, None);
+        assert_eq!(parsed.display_name, "archivebox_prime", "the rest of the teaser survives");
+    }
+
+    #[test]
+    fn parse_teaser_strips_oversize_picture() {
+        let id = Identity::generate();
+        let mut t = teaser();
+        t.picture = Some(format!("data:image/webp;base64,{}", "A".repeat(TEASER_PICTURE_MAX_BYTES)));
+        let content = serde_json::to_string(&Versioned { v: SCHEMA_V, inner: t }).unwrap();
+        let ev = id
+            .sign(EventBuilder::new(Kind::from_u16(KIND_TEASER), content).tag(Tag::identifier(TEASER_D)))
+            .unwrap();
+        assert_eq!(parse_teaser(&ev).unwrap().picture, None);
     }
 
     #[test]

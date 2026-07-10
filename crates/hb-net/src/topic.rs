@@ -64,6 +64,14 @@ pub async fn discover_public_topics(
     let mut best: HashMap<String, (u64, TopicMeta)> = HashMap::new();
     for ev in events {
         if let Ok(meta) = parse_announce(&ev) {
+            // A validly-signed announce is only a valid CANDIDATE for the topic its own `d` tag
+            // (identifier) names — a signature proves who signed it, not that the signer's claimed
+            // `meta.topic_id` matches the identifier they published it under. Without this check, an
+            // announce whose `d` tag names one topic but whose payload carries a different
+            // `meta.topic_id` could poison discovery under a d-tag it never legitimately owns.
+            if event_identifier(&ev) != Some(meta.topic_id.as_str()) {
+                continue;
+            }
             let ts = ev.created_at.as_u64();
             match best.get(&meta.topic_id) {
                 Some((prev, _)) if *prev >= ts => {}
@@ -96,6 +104,53 @@ pub async fn discover_public_topics(
         scored.truncate(TOPIC_DISCOVERY_CAP);
     }
     Ok(scored)
+}
+
+/// An event's own signed `d` (identifier) tag — the tag-level claim of which topic it belongs to.
+fn event_identifier(ev: &Event) -> Option<&str> {
+    ev.tags.identifier()
+}
+
+/// Pick the newest, verifiably-parsed announce **for `expected_topic_id`** out of a raw event batch —
+/// the pure half of [`fetch_announce`], directly unit-testable against hand-built events with no
+/// relay. Mirrors the newest-by-`created_at` dedup [`discover_public_topics`] does across many topics,
+/// restricted here to (at most) one result for one topic. An event is dropped, never just deprioritized,
+/// if it fails to parse (foreign junk, wrong kind, bad signature — the same "ignore what doesn't
+/// verify" posture as the rest of this module), **or** if its parsed `meta.topic_id` does not equal
+/// `expected_topic_id`: a validly-signed announce whose payload names a different topic than the one
+/// being looked up must never satisfy the lookup, however recent it is — otherwise a relay (malicious,
+/// buggy, or merely returning a broader result than the filter asked for) could make an unrelated,
+/// attacker-controlled announce shadow the real one for a queried `topic_id`.
+fn newest_announce(events: Vec<Event>, expected_topic_id: &str) -> Option<TopicMeta> {
+    let mut best: Option<(u64, TopicMeta)> = None;
+    for ev in events {
+        if let Ok(meta) = parse_announce(&ev) {
+            if meta.topic_id != expected_topic_id {
+                continue;
+            }
+            let ts = ev.created_at.as_u64();
+            match &best {
+                Some((prev, _)) if *prev >= ts => {}
+                _ => best = Some((ts, meta)),
+            }
+        }
+    }
+    best.map(|(_, meta)| meta)
+}
+
+/// The join-first lookup (devtest #11): fetch the announce for a specific `topic_id`, if one exists,
+/// so a caller can check "does this public name already have a room?" **before** minting a new Topic
+/// — otherwise two people who independently pick the same name fork into two cryptographically
+/// distinct rooms (same `topic_id`, different `topic_key`, Decision C). `None` means no announce was
+/// found (the name is free), never an error.
+pub async fn fetch_announce(
+    client: &RelayClient,
+    topic_id: &str,
+    timeout: Duration,
+) -> Result<Option<TopicMeta>, NetError> {
+    let filter = Filter::new().kind(Kind::from_u16(KIND_TOPIC_ANNOUNCE)).identifier(topic_id.to_string());
+    let events = client.fetch(filter, timeout).await?;
+    Ok(newest_announce(events, topic_id))
 }
 
 /// The **best-effort, spoofable** pre-join member count = the number of distinct `KIND_TOPIC_MEMBER`
@@ -449,5 +504,110 @@ mod tests {
             vec!["newer announce", "older announce"],
             "announcements are newest-first"
         );
+    }
+
+    // ───────────────────────── devtest #11: join-first lookup (pure `newest_announce`) ────────────
+
+    #[test]
+    fn newest_announce_is_none_for_an_empty_batch() {
+        assert_eq!(newest_announce(vec![], "some-topic-id"), None);
+    }
+
+    #[test]
+    fn newest_announce_picks_the_latest_by_created_at() {
+        use hb_core::topic::build_announce;
+        let (meta, _key) = new_topic("video/hbnet-lookup-test", "old desc", vec![], false).unwrap();
+        let author = Identity::generate();
+        let old = build_announce(&author, &meta, 1_700_000_000).unwrap();
+        let mut newer_meta = meta.clone();
+        newer_meta.description = "new desc".into();
+        let new = build_announce(&author, &newer_meta, 1_700_000_100).unwrap();
+        let picked = newest_announce(vec![old, new], &meta.topic_id).unwrap();
+        assert_eq!(picked.description, "new desc", "the newest (by created_at) announce wins");
+        assert_eq!(picked.topic_id, meta.topic_id);
+    }
+
+    #[test]
+    fn newest_announce_skips_unparseable_junk() {
+        use hb_core::topic::build_announce;
+        let (meta, _key) = new_topic("video/hbnet-lookup-junk", "", vec![], false).unwrap();
+        let author = Identity::generate();
+        let good = build_announce(&author, &meta, 1_700_000_000).unwrap();
+        // A foreign teaser event (wrong kind) mixed into the batch must be silently skipped, not error.
+        let junk = hb_core::event::build_teaser(
+            &author,
+            &hb_core::event::Teaser {
+                display_name: "junk".into(),
+                bio: String::new(),
+                tags: vec![],
+                content_types: vec![],
+                picture: None,
+            },
+            true,
+        )
+        .unwrap();
+        let picked = newest_announce(vec![junk, good], &meta.topic_id).unwrap();
+        assert_eq!(picked.topic_id, meta.topic_id);
+    }
+
+    /// A validly-signed announce whose `d` tag names the topic being looked up, but whose plaintext
+    /// payload claims a different `meta.topic_id`, must never satisfy the lookup: hand-built directly
+    /// (bypassing `build_announce`'s automatic d-tag/payload consistency) to reproduce exactly the
+    /// vulnerable shape a malicious signer (any pubkey — announces are unpermissioned) could publish.
+    fn build_mismatched_announce(
+        author: &Identity,
+        d_tag_topic_id: &str,
+        embedded_meta: &TopicMeta,
+        now: u64,
+    ) -> Event {
+        let payload = serde_json::json!({
+            "v": hb_core::SCHEMA_V,
+            "topic_id": embedded_meta.topic_id,
+            "name": embedded_meta.name,
+            "description": embedded_meta.description,
+            "tags": embedded_meta.tags,
+            "private": embedded_meta.private,
+        })
+        .to_string();
+        let tags = vec![
+            Tag::identifier(d_tag_topic_id.to_string()),
+            Tag::custom(TagKind::custom("hb-v"), [hb_core::SCHEMA_V.to_string()]),
+        ];
+        author
+            .sign(
+                EventBuilder::new(Kind::from_u16(KIND_TOPIC_ANNOUNCE), payload)
+                    .tags(tags)
+                    .custom_created_at(Timestamp::from(now)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn newest_announce_rejects_a_d_tag_payload_topic_id_mismatch() {
+        let (victim_meta, _key) = new_topic("video/hbnet-mismatch-victim", "victim", vec![], false).unwrap();
+        let (attacker_meta, _key2) =
+            new_topic("video/hbnet-mismatch-attacker", "unrelated metadata", vec![], false).unwrap();
+        let author = Identity::generate();
+        // `d` = the victim's topic_id, but the signed payload names the attacker's own, unrelated topic.
+        let mismatched =
+            build_mismatched_announce(&author, &victim_meta.topic_id, &attacker_meta, 1_700_000_000);
+        let picked = newest_announce(vec![mismatched], &victim_meta.topic_id);
+        assert_eq!(picked, None, "a d-tag/payload topic_id mismatch must never satisfy the lookup");
+    }
+
+    #[test]
+    fn newest_announce_returns_the_matching_candidate_when_a_mismatch_is_also_present() {
+        use hb_core::topic::build_announce;
+        let (victim_meta, _key) = new_topic("video/hbnet-mismatch-both", "real", vec![], false).unwrap();
+        let (attacker_meta, _key2) =
+            new_topic("video/hbnet-mismatch-both-attacker", "unrelated", vec![], false).unwrap();
+        let author = Identity::generate();
+        let genuine = build_announce(&author, &victim_meta, 1_700_000_000).unwrap();
+        // Newer (by created_at) than the genuine one, but a mismatch — must still lose.
+        let mismatched =
+            build_mismatched_announce(&author, &victim_meta.topic_id, &attacker_meta, 1_700_000_999);
+        let picked = newest_announce(vec![mismatched, genuine], &victim_meta.topic_id).unwrap();
+        assert_eq!(picked.topic_id, victim_meta.topic_id);
+        assert_eq!(picked.description, "real", "only the matching candidate wins, regardless of recency");
     }
 }

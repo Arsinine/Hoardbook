@@ -5,6 +5,7 @@
 		topicList,
 		topicCreate,
 		topicDiscover,
+		topicLookup,
 		topicJoinPublic,
 		topicRedeemInvite,
 		topicLeave,
@@ -13,8 +14,8 @@
 		topicAnnounce,
 		topicAnnounceStatus,
 	} from '$lib/api.js';
-	import type { TopicView, DiscoveredTopic } from '$lib/types.js';
-	import { memberCountLabel, rosterLabel, TOPIC_ROOTS, composeTopicPath, subPathLabel, groupTopicsByRoot } from '$lib/topics-view.js';
+	import type { TopicView, DiscoveredTopic, TopicLookup } from '$lib/types.js';
+	import { memberCountLabel, rosterLabel, TOPIC_ROOTS, composeTopicPath, subPathLabel, groupTopicsByRoot, createPrimaryAction } from '$lib/topics-view.js';
 	import { canAnnounce, cooldownLabel, ANNOUNCE_EXPLAINER } from '$lib/announce-view.js';
 	import TopicJoinConsent from '$lib/components/TopicJoinConsent.svelte';
 	import HintMarker from '$lib/components/HintMarker.svelte';
@@ -103,6 +104,56 @@
 	let createName = $derived(newPrivate ? newName.trim() : composedPublicName);
 	let canCreate = $derived(newPrivate ? newName.trim().length > 0 : composedPublicName.length > 0);
 
+	// devtest #11 — join-first: before minting a new PUBLIC Topic, check (debounced) whether its
+	// composed name already has a room. A private Topic never looks up (no announce exists to find).
+	let topicNameLookup: TopicLookup | null = $state(null);
+	let lookupTimer: ReturnType<typeof setTimeout> | undefined;
+	// Request-generation guard: a stale response landing after a newer one (or after the name changed
+	// again) must not overwrite the fresher result — e.g. typing "existing name" then a fresh name
+	// could otherwise let the older "exists: true" response land last, leaving a Join button that
+	// fails. Bumped every time a lookup is (re)scheduled; a resolving lookup applies its result only
+	// if its captured generation still matches.
+	let lookupGeneration = 0;
+
+	$effect(() => {
+		const name = composedPublicName;
+		// Clear immediately on any input change — pending state defaults to Create, never a stale
+		// Join carried over from a previous name.
+		topicNameLookup = null;
+		lookupGeneration += 1;
+		const generation = lookupGeneration;
+		if (newPrivate || !name) {
+			return;
+		}
+		clearTimeout(lookupTimer);
+		lookupTimer = setTimeout(async () => {
+			let result: TopicLookup | null;
+			try {
+				result = await topicLookup(name);
+			} catch {
+				result = null; // best-effort — a failed lookup just falls back to Create
+			}
+			if (generation === lookupGeneration) {
+				topicNameLookup = result;
+			}
+		}, 300);
+	});
+	onDestroy(() => clearTimeout(lookupTimer));
+
+	// The Create modal's primary action: Create by default, or Join when the composed public name
+	// already has a room (a same-name public Topic must not fork into a second, distinct room).
+	let primaryAction = $derived(createPrimaryAction(topicNameLookup));
+
+	async function handlePrimary() {
+		if (!canCreate) return;
+		if (primaryAction.mode === 'join') {
+			createOpen = false;
+			askToJoin(createName, false);
+			return;
+		}
+		await create();
+	}
+
 	async function create() {
 		if (!canCreate) return;
 		busy = true;
@@ -116,7 +167,19 @@
 			await loadMine();
 			toast('Topic created', 'success');
 		} catch (e) {
-			toast(String(e), 'error');
+			const msg = String(e);
+			toast(msg, 'error');
+			// The backend rechecks for an existing announce immediately before publish (the UI's
+			// join-first lookup above is only a preflight, not airtight against a race between two
+			// clients). Re-run the lookup so the primary action flips to Join — never auto-join, the
+			// consent gate (F12) still requires an explicit click.
+			if (!newPrivate && msg.includes('already exists')) {
+				try {
+					topicNameLookup = await topicLookup(composedPublicName);
+				} catch {
+					topicNameLookup = null;
+				}
+			}
 		} finally {
 			busy = false;
 		}
@@ -303,7 +366,7 @@
 						</div>
 					</div>
 
-					<a class="channel-link" href="/chat">💬 Open this Topic’s channel in Chat →</a>
+					<a class="channel-link" href="/chat?topic={openTopic.topic_id}">💬 Open this Topic’s channel in Chat →</a>
 				{:else}
 					<div class="detail-empty">Select a Topic to see its roster, invite members, and open its chat channel.</div>
 				{/if}
@@ -364,7 +427,7 @@
 			<label class="check"><input type="checkbox" bind:checked={newPrivate} /> Private (unlisted)</label>
 			<div class="modal-actions">
 				<button class="ghost" onclick={() => (createOpen = false)}>Cancel</button>
-				<button class="btn-primary" disabled={busy || !canCreate} onclick={create}>Create</button>
+				<button class="btn-primary" disabled={busy || !canCreate} onclick={handlePrimary}>{primaryAction.label}</button>
 			</div>
 		</div>
 	</div>

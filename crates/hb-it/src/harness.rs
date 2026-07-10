@@ -30,6 +30,9 @@ pub struct Ctx {
     /// `--interval <secs>`: in canary mode, loop forever on this cadence (the daemon form); `None`
     /// runs one cycle and exits with its code (the oneshot/timer form).
     pub interval: Option<u64>,
+    /// Same-NAT mode (`--same-nat`, devtest #9): run the live same-source-IP presence diagnosis
+    /// instead of the cooperative L2 suites.
+    pub same_nat: bool,
 }
 
 impl Ctx {
