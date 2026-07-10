@@ -425,8 +425,11 @@ async fn refresh_published_teaser(
     };
     profile.content_types = compute_content_types(store);
     store.save_profile_draft(&profile).map_err(cmd_err)?;
+    // devtest #5: keep the opt-out honored across a collection-triggered republish too — never
+    // silently re-add hashtags a user turned off.
+    let discoverable = store.load_settings().map_err(cmd_err)?.unwrap_or_default().discoverable;
     let teaser = teaser_from_profile(store, &profile);
-    if let Ok(event) = hb_core::event::build_teaser(identity, &teaser) {
+    if let Ok(event) = hb_core::event::build_teaser(identity, &teaser, discoverable) {
         if let Ok(client) = net::client(identity, store, relay).await {
             let _ = client.publish(&event).await;
             if let Ok(json) = serde_json::to_string(&event) {

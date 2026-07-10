@@ -3,8 +3,9 @@
 	import { onMount } from 'svelte';
 	import { get } from 'svelte/store';
 	import { page } from '$app/stores';
-	import { getIdentity, getProfile, getCollections, getContacts, getMessages } from '$lib/api.js';
-	import { identity, profile, collections, contacts, inboxMessages, toastMessage, appReady, unreadCount, toast, identityLoadError } from '$lib/stores.js';
+	import { getIdentity, getProfile, getCollections, getContacts, getMessages, getReadState } from '$lib/api.js';
+	import { identity, profile, collections, contacts, inboxMessages, readWatermarks, toastMessage, appReady, toast, identityLoadError } from '$lib/stores.js';
+	import { totalUnread, unreadByPeer } from '$lib/unread-view.js';
 	import { listen } from '@tauri-apps/api/event';
 	import { navIcons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
@@ -17,9 +18,6 @@
 	let { children }: Props = $props();
 
 	let appVersion = $state('');
-
-	// Module-level set: persists across page navigation (layout never remounts in SvelteKit).
-	const seenLayoutKeys = new Set<string>();
 
 	onMount(() => {
 		// Async init (IIFE so onMount can return a sync cleanup function).
@@ -38,12 +36,11 @@
 			try { contacts.set(await getContacts()); } catch { }
 			try { appVersion = await getVersion(); } catch { appVersion = '0.4.2'; }
 
-			// Seed initial message keys without showing a badge (they're not "new").
-			try {
-				const initial = await getMessages();
-				for (const m of initial) seenLayoutKeys.add(`${m.from}|${m.sent_at}`);
-				inboxMessages.set(initial);
-			} catch { }
+			// Load the persisted per-peer read watermark BEFORE seeding the inbox (devtest #16) — the
+			// nav badge derives from both together, so this order avoids a first-paint flash of a
+			// stale "everything unread" count.
+			try { readWatermarks.set(await getReadState()); } catch { }
+			try { inboxMessages.set(await getMessages()); } catch { }
 
 			appReady.set(true);
 		})();
@@ -54,31 +51,22 @@
 			toast(`Update v${event.payload} available — check Settings to install`, 'success');
 		}).then(fn => { unlistenUpdate = fn; });
 
-		// Direct DM received via iroh — increment unread badge if not on the chat page.
+		// Direct DM received via iroh — refresh the inbox; the nav badge (derived from
+		// readWatermarks) picks up the new message on its own (devtest #16).
 		let unlistenDm: (() => void) | undefined;
 		listen<number>('dm-received', () => {
-			const onChat = window.location.pathname === '/chat';
-			if (!onChat) unreadCount.update(n => n + 1);
+			getMessages().then((msgs) => inboxMessages.set(msgs)).catch(() => { });
 		}).then(fn => { unlistenDm = fn; });
 
-		// Background poll: keeps inboxMessages fresh and drives the nav badge. M12 W1 Decision B:
-		// skip the relay read while the window is hidden (tray/minimized) — no reconnect storm
-		// against a window nobody is looking at; it resumes automatically when shown.
+		// Background poll: keeps inboxMessages fresh. M12 W1 Decision B: skip the relay read while
+		// the window is hidden (tray/minimized) — no reconnect storm against a window nobody is
+		// looking at; it resumes automatically when shown. The nav badge re-derives itself from the
+		// store on every inboxMessages update — no separate counting here (devtest #16).
 		const poll = setInterval(async () => {
 			if (!get(identity) || document.hidden) return;
 			try {
 				const msgs = await getMessages();
-				const onChat = get(page).url.pathname === '/chat';
-				let newCount = 0;
-				for (const m of msgs) {
-					const key = `${m.from}|${m.sent_at}`;
-					if (!seenLayoutKeys.has(key)) {
-						seenLayoutKeys.add(key);
-						if (!onChat) newCount++;
-					}
-				}
 				inboxMessages.set(msgs);
-				if (newCount > 0) unreadCount.update(n => n + newCount);
 			} catch { }
 		}, NAV_POLL_VISIBLE_MS);
 
@@ -103,6 +91,9 @@
 	let idInitial = $derived(idName[0]?.toUpperCase() ?? 'Y');
 	let idShort = $derived($identity ? $identity.npub.slice(0, 8) + '…' + $identity.npub.slice(-4) : '');
 	let idHue = $derived(avatarHue(idInitial));
+	// devtest #16: the nav badge derives straight from the persisted per-peer watermark — it clears
+	// per-conversation as each is opened in Chat, not merely by landing on the /chat route.
+	let navUnreadCount = $derived(totalUnread(unreadByPeer($inboxMessages, $readWatermarks, $identity?.npub ?? '')));
 </script>
 
 <div class="frame">
@@ -125,8 +116,8 @@
 			<a href={item.href} class="nav-item" class:nav-active={active}>
 				<span class="nav-icon" class:nav-icon-active={active}>{@html navIcons[item.label]}</span>
 				{item.label}
-				{#if item.label === 'Chat' && $unreadCount > 0}
-					<span class="nav-badge">{$unreadCount > 99 ? '99+' : $unreadCount}</span>
+				{#if item.label === 'Chat' && navUnreadCount > 0}
+					<span class="nav-badge">{navUnreadCount > 99 ? '99+' : navUnreadCount}</span>
 				{/if}
 			</a>
 		{/each}
@@ -136,7 +127,7 @@
 		<!-- Identity card -->
 		{#if $identity}
 			<div class="id-card">
-				<Avatar letter={idInitial} size={28} hue={idHue} />
+				<Avatar letter={idInitial} size={28} hue={idHue} picture={$profile?.picture} />
 				<div class="id-info">
 					<div class="id-name">{idName}</div>
 					<div class="id-key">{idShort}</div>

@@ -80,7 +80,9 @@
 
 <style>
 	.modal-backdrop {
-		position: fixed; inset: 0; z-index: 9998;
+		/* Always the inner dialog (opened from AddContactDialog's "+ New group") — one above its
+		   z-index: 9998 so it isn't buried behind it regardless of DOM order. */
+		position: fixed; inset: 0; z-index: 9999;
 		background: oklch(0 0 0 / 0.45);
 		display: flex; align-items: center; justify-content: center;
 	}

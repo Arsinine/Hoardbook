@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { filterConversations, filterTopics, composeRecipientKind } from './chat-filter.js';
+import { filterConversations, filterTopics, composeRecipientKind, isComposeToSelf } from './chat-filter.js';
 import type { CachedPeer, TopicView } from './types.js';
 
 function makePeer(npub: string): CachedPeer {
@@ -54,6 +54,14 @@ describe('chat-filter view-model', () => {
 		expect(filterTopics(topics, 'ANIME').map((t) => t.topic_id)).toEqual(['video/anime']);
 	});
 
+	it('filters topics by description', () => {
+		const topics = [
+			{ ...makeTopic('video/anime'), description: '90s VHS rips' },
+			{ ...makeTopic('audio/vinyl'), description: 'lossless FLAC' },
+		];
+		expect(filterTopics(topics, 'flac').map((t) => t.topic_id)).toEqual(['audio/vinyl']);
+	});
+
 	it('composeRecipientKind recognises a bare npub', () => {
 		expect(composeRecipientKind('npub1abc')).toBe('npub');
 	});
@@ -69,5 +77,13 @@ describe('chat-filter view-model', () => {
 
 	it('composeRecipientKind trims surrounding whitespace before the prefix check', () => {
 		expect(composeRecipientKind('  npub1abc  ')).toBe('npub');
+	});
+
+	it('isComposeToSelf recognises your own npub or share code (devtest #14)', () => {
+		expect(isComposeToSelf('npub1me', 'npub1me', 'hbk1memine')).toBe(true);
+		expect(isComposeToSelf('  npub1me  ', 'npub1me', 'hbk1memine')).toBe(true); // trims whitespace
+		expect(isComposeToSelf('hbk1memine', 'npub1me', 'hbk1memine')).toBe(true);
+		expect(isComposeToSelf('npub1someoneelse', 'npub1me', 'hbk1memine')).toBe(false);
+		expect(isComposeToSelf('', 'npub1me', 'hbk1memine')).toBe(false);
 	});
 });

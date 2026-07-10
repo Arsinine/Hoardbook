@@ -92,3 +92,66 @@ export function dedupAndCap(hits: SearchHit[], limit: number): SearchHit[] {
 	}
 	return out;
 }
+
+/** A contact row's at-a-glance browse-key status (devtest #1) — whether their listings can actually
+ *  be decrypted, surfaced on the row itself instead of only after selecting them. */
+export interface PeerAccessBadge {
+	locked: boolean;
+	icon: string;
+	label: string;
+	hint: string;
+}
+
+/** Keyed off `browse_key_hex` alone — **never** collection count. A bare contact whose cache still
+ *  carries stale collections (e.g. from before the key was lost) must still read as locked. */
+export function peerAccessBadge(peer: { browse_key_hex?: string }): PeerAccessBadge {
+	if (peer.browse_key_hex) {
+		return { locked: false, icon: '🔓', label: 'browseable', hint: '' };
+	}
+	return {
+		locked: true,
+		icon: '🔒',
+		label: 'key needed',
+		hint: 'Ask them for their share code to browse their collections.',
+	};
+}
+
+/** Byte-size units, largest first, for `parseEstSize`/`summarizeCollectionsSize` (devtest #7). */
+const SIZE_UNITS: Array<[string, number]> = [
+	['TB', 1024 ** 4],
+	['GB', 1024 ** 3],
+	['MB', 1024 ** 2],
+	['KB', 1024],
+	['B', 1],
+];
+
+/** Parse a formatted size string (e.g. "14.2 GB", "~12 TB") into bytes. Tolerant of a missing space
+ *  and a leading "~"; an absent or unparseable string yields `0` (never fabricate a size). */
+export function parseEstSize(s: string | undefined): number {
+	if (!s) return 0;
+	const m = /^\s*~?\s*([\d.]+)\s*(B|KB|MB|GB|TB)\b/i.exec(s);
+	if (!m) return 0;
+	const value = parseFloat(m[1]);
+	if (Number.isNaN(value)) return 0;
+	const unit = SIZE_UNITS.find(([name]) => name === m[2].toUpperCase());
+	return unit ? value * unit[1] : 0;
+}
+
+/** Format a byte count in its largest whole unit (1 decimal place), e.g. `536870912` → `"512.0 MB"`. */
+function fmtLargestUnit(bytes: number): string {
+	for (const [unit, size] of SIZE_UNITS) {
+		if (bytes >= size) return `${(bytes / size).toFixed(1)} ${unit}`;
+	}
+	return `${bytes.toFixed(1)} B`;
+}
+
+/** The "~X across N collections" summary for a keyed peer's collections (devtest #7) — sums each
+ *  collection's self-declared `est_size` (never fabricates from anything else; the wire carries no
+ *  teaser scale field). `M` counts every collection passed in, even an unparseable one; `null` when
+ *  the total is zero (nothing parseable — never render a fabricated "0 B"). */
+export function summarizeCollectionsSize(cols: { est_size?: string }[]): string | null {
+	const totalBytes = cols.reduce((sum, c) => sum + parseEstSize(c.est_size), 0);
+	if (totalBytes <= 0) return null;
+	const m = cols.length;
+	return `~${fmtLargestUnit(totalBytes)} across ${m} collection${m !== 1 ? 's' : ''}`;
+}

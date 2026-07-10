@@ -122,6 +122,7 @@ h1, h2, h3, h4, h5, h6 {
 .hb-icon-globe,
 .hb-icon-user,
 .hb-icon-chat,
+.hb-icon-topics,
 .hb-icon-home,
 .hb-icon-refresh,
 .hb-icon-download,
@@ -167,6 +168,11 @@ h1, h2, h3, h4, h5, h6 {
 
 /* Chat: pulse */
 .nav-item:hover .hb-icon-chat {
+  animation: hb-pulse-scale 0.35s ease-out;
+}
+
+/* Topics: folder-dots pulse */
+.nav-item:hover .hb-icon-topics {
   animation: hb-pulse-scale 0.35s ease-out;
 }
 

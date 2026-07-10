@@ -52,6 +52,7 @@ fn teaser(name: &str, tags: Vec<String>) -> Teaser {
         bio: "hoards".into(),
         tags,
         content_types: vec!["video".into()],
+        picture: None,
     }
 }
 
@@ -95,7 +96,7 @@ async fn pub1(ctx: &Ctx) -> Result<()> {
     let json = listing(slug, 5);
 
     let client = ctx.connect(&id).await?;
-    client.publish(&build_teaser(&id, &teaser("archivebox", vec!["anime".into()]))?).await?;
+    client.publish(&build_teaser(&id, &teaser("archivebox", vec!["anime".into()]), true)?).await?;
     let published = publish_listing(&client, &id, slug, &key, &json, 40_000).await?;
     ensure!(published.parts == 1, "a small listing publishes as one part, got {}", published.parts);
     settle().await;
@@ -196,7 +197,7 @@ async fn br1(ctx: &Ctx) -> Result<()> {
     let slug = "private";
 
     let client = ctx.connect(&id).await?;
-    client.publish(&build_teaser(&id, &teaser("archivebox", vec!["anime".into()]))?).await?;
+    client.publish(&build_teaser(&id, &teaser("archivebox", vec!["anime".into()]), true)?).await?;
     publish_listing(&client, &id, slug, &bk(1), &listing(slug, 3), 40_000).await?;
     settle().await;
 
@@ -307,10 +308,10 @@ async fn sr1(ctx: &Ctx) -> Result<()> {
     let a = Identity::generate();
     let b = Identity::generate();
     let client_a = ctx.connect(&a).await?;
-    client_a.publish(&build_teaser(&a, &teaser("a", vec![anime.clone(), vhs.clone()]))?).await?;
+    client_a.publish(&build_teaser(&a, &teaser("a", vec![anime.clone(), vhs.clone()]), true)?).await?;
     client_a.disconnect().await;
     let client_b = ctx.connect(&b).await?;
-    client_b.publish(&build_teaser(&b, &teaser("b", vec![anime.clone()]))?).await?;
+    client_b.publish(&build_teaser(&b, &teaser("b", vec![anime.clone()]), true)?).await?;
     client_b.disconnect().await;
     settle().await;
 
@@ -331,7 +332,7 @@ async fn sr2(ctx: &Ctx) -> Result<()> {
     let tag = ctx.tag("br-solo");
     let id = Identity::generate();
     let client = ctx.connect(&id).await?;
-    client.publish(&build_teaser(&id, &teaser("solo", vec![tag.clone()]))?).await?;
+    client.publish(&build_teaser(&id, &teaser("solo", vec![tag.clone()]), true)?).await?;
     // Also publish a listing for this author; search must NOT surface it.
     publish_listing(&client, &id, "secret", &bk(1), &listing("secret", 3), 40_000).await?;
     settle().await;
@@ -353,10 +354,10 @@ async fn sr3(ctx: &Ctx) -> Result<()> {
     for i in 0..6 {
         let id = Identity::generate();
         let client = ctx.connect(&id).await?;
-        client.publish(&build_teaser(&id, &teaser(&format!("f{i}"), vec![tag.clone()]))?).await?;
+        client.publish(&build_teaser(&id, &teaser(&format!("f{i}"), vec![tag.clone()]), true)?).await?;
         if i == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-            client.publish(&build_teaser(&id, &teaser("f0-again", vec![tag.clone()]))?).await?;
+            client.publish(&build_teaser(&id, &teaser("f0-again", vec![tag.clone()]), true)?).await?;
         }
         client.disconnect().await;
         authors.push(id);

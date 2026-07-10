@@ -3,7 +3,7 @@
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
-	import { collectionAvailability } from '$lib/browse-view.js';
+	import { collectionAvailability, peerAccessBadge } from '$lib/browse-view.js';
 	import type { CachedPeer, Collection, DirectoryItem } from '$lib/types.js';
 
 	type BcItem =
@@ -17,7 +17,9 @@
 	let folderStack: { name: string; items: DirectoryItem[] }[] = $state([]);
 
 	function peerName(peer: CachedPeer): string {
-		return peer.profile?.display_name ?? peer.npub.slice(0, 10) + '…';
+		// A legacy/adversarial teaser can carry display_name: "" (R1 only guards publish) — `??` would
+		// not fall back to a literal empty string, showing a blank name; `||` does.
+		return peer.profile?.display_name || peer.npub.slice(0, 10) + '…';
 	}
 
 	function peerInitial(peer: CachedPeer): string {
@@ -129,13 +131,14 @@
 				{#each filteredContacts as peer (peer.npub)}
 					{@const letter = peerInitial(peer)}
 					{@const hue = avatarHue(letter)}
+					{@const badge = peerAccessBadge(peer)}
 					<button
 						class="contact-row"
 						class:contact-selected={selectedPeer?.npub === peer.npub}
 						onclick={() => selectPeer(peer)}
 					>
 						<div class="avatar-wrap">
-							<Avatar {letter} size={28} {hue} />
+							<Avatar {letter} size={28} {hue} picture={peer.profile?.picture} />
 							{#if peer.online}
 								<span class="online-dot"></span>
 							{/if}
@@ -145,6 +148,7 @@
 							<span class="contact-meta">
 								{peer.collections.length} collection{peer.collections.length !== 1 ? 's' : ''}
 							</span>
+							<span class="access-badge" class:locked={badge.locked} title={badge.hint || undefined}>{badge.icon} {badge.label}</span>
 						</div>
 					</button>
 				{/each}
@@ -422,6 +426,18 @@
 		font-size: 10.5px;
 		color: var(--fg-dim);
 		margin-top: 1px;
+	}
+
+	/* Browse-key access badge (devtest #1) — surfaces keyed-vs-bare on the row, not just post-selection. */
+	.access-badge {
+		display: block;
+		font-size: 10px;
+		color: var(--fg-dim);
+		margin-top: 1px;
+	}
+
+	.access-badge.locked {
+		color: oklch(0.72 0.13 70);
 	}
 
 	/* ── Right panel ─────────────────────────────────────────────── */

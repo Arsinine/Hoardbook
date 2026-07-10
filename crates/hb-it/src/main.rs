@@ -19,6 +19,7 @@ use harness::Ctx;
 
 mod canary;
 mod harness;
+mod same_nat;
 mod suite_ab;
 mod suite_browse;
 mod suite_canary;
@@ -50,6 +51,19 @@ async fn main() -> Result<()> {
         let results = survey::run(&ctx.relays).await;
         tap::print_results(&results);
         return Ok(()); // informational — a rejection is a finding, not a build failure
+    }
+
+    // Same-NAT mode (devtest #9, 2026-07-10): diagnosis-only — run against the LIVE relays to prove
+    // (or disprove) that two identities publishing presence from one source IP both count as online.
+    // No fix lives behind this flag; a shortfall just names which relay rejected which identity.
+    if ctx.same_nat {
+        eprintln!("\n-- Same-NAT: same-source-IP presence diagnosis (devtest #9) --");
+        let results = same_nat::run(&ctx).await;
+        tap::print_results(&results);
+        if results.iter().any(|r| !r.passed) {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     // Canary mode (HANDOVER §A2.2): the live-backbone probe. With --interval it loops forever (the
@@ -116,6 +130,7 @@ fn parse_args(args: &[String]) -> Result<Ctx> {
     let mut pow: u8 = 0;
     let mut survey = false;
     let mut canary = false;
+    let mut same_nat = false;
     let mut interval: Option<u64> = None;
     let mut i = 0;
     while i < args.len() {
@@ -138,6 +153,7 @@ fn parse_args(args: &[String]) -> Result<Ctx> {
             }
             "--survey" => survey = true,
             "--canary" => canary = true,
+            "--same-nat" => same_nat = true,
             "--interval" => {
                 i += 1;
                 interval = Some(
@@ -148,7 +164,7 @@ fn parse_args(args: &[String]) -> Result<Ctx> {
                 );
             }
             other => bail!(
-                "unknown argument: {other}\nusage: hb-it --relay <ws-url> [--relay <2nd>] [--pow <bits>] [--survey] [--canary [--interval <secs>]]"
+                "unknown argument: {other}\nusage: hb-it --relay <ws-url> [--relay <2nd>] [--pow <bits>] [--survey] [--canary [--interval <secs>]] [--same-nat]"
             ),
         }
         i += 1;
@@ -158,5 +174,5 @@ fn parse_args(args: &[String]) -> Result<Ctx> {
     }
     // A fresh key's hex is a convenient per-run-unique token for namespacing discovery tags.
     let run_id = hb_core::Identity::generate().public_key().to_hex()[..16].to_string();
-    Ok(Ctx { relays, pow, run_id, survey, canary, interval })
+    Ok(Ctx { relays, pow, run_id, survey, canary, interval, same_nat })
 }

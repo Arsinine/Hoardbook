@@ -2,7 +2,7 @@
 	import { onMount, tick } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
-	import { contacts, identity, inboxMessages, sentMessages, unreadCount, toast, dmRequests } from '$lib/stores.js';
+	import { contacts, identity, inboxMessages, sentMessages, readWatermarks, toast, dmRequests } from '$lib/stores.js';
 	import {
 		getMessages,
 		sendMessage,
@@ -19,6 +19,7 @@
 		groupsCreate,
 		groupsSetTrusted,
 		contactUpdateGroups,
+		advanceReadWatermark,
 	} from '$lib/api.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
@@ -28,7 +29,9 @@
 	import { renderFingerprint } from '$lib/identity-display.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
 	import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER } from '$lib/request-inbox.js';
-	import { filterConversations, filterTopics, composeRecipientKind } from '$lib/chat-filter.js';
+	import { filterConversations, filterTopics, composeRecipientKind, isComposeToSelf } from '$lib/chat-filter.js';
+	import { sortChannelPostsAscending, resolveTopicParam } from '$lib/topics-view.js';
+	import { latestFromPeer, unreadByPeer } from '$lib/unread-view.js';
 	import type { CachedPeer, ReceivedMessage, TopicView, ChannelPost, AnnouncementView, DmRequestView, Group } from '$lib/types.js';
 
 	let loading = $state(false);
@@ -73,7 +76,7 @@
 	async function loadChannel(topicId: string) {
 		try {
 			const view = await topicChannel(topicId);
-			channelPosts = view.posts;
+			channelPosts = sortChannelPostsAscending(view.posts);
 			channelAnnouncements = view.announcements;
 		} catch { /* relay unreachable */ }
 	}
@@ -212,14 +215,6 @@
 		if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChannelPost(); }
 	}
 
-	// Stable set of message keys we've already counted for badge purposes.
-	// Format: `${from}|${sent_at}` — prevents double-counting on relay inconsistencies.
-	let seenMessageKeys = new Set<string>();
-
-	// Per-peer "seen" snapshot: hb_id → inbox count at last view.
-	let seenCounts: Record<string, number> = $state({});
-
-
 	// M13 Part B (Q7): the conversation list is contacts ONLY — a stranger's DM no longer merges in
 	// here at all (the request pane, above, replaces the old inboxOnlyPeers merge).
 	function latestMessageTime(hb_id: string): string {
@@ -261,10 +256,7 @@
 	}
 
 	onMount(() => {
-		// Clear unread badge when entering the chat page.
-		unreadCount.set(0);
 		refreshInbox();
-		loadTopics();
 		loadGroups();
 
 		// Discovery first-contact deep link (spec §9): `/chat?compose=<npub-or-sharecode>` prefills
@@ -274,6 +266,16 @@
 			composeTo = composeParam;
 			composeOpen = true;
 		}
+
+		// Topic channel deep link (devtest #15): `/chat?topic=<topic_id>` from the Topics page's
+		// "Open this Topic's channel in Chat" link selects the channel directly, no second click.
+		const topicParam = $page.url.searchParams.get('topic');
+		loadTopics().then(() => {
+			if (!topicParam) return;
+			const t = resolveTopicParam(topicParam, topics);
+			if (t) selectTopic(t);
+			else toast("That Topic channel isn't available — you may have left it.", 'error');
+		});
 
 		// Local DM poll while the chat page is open. M12 W1 Decision B: backed off from 4 s (the
 		// dominant connect source against the relays) and visibility-gated — paused while the window
@@ -290,6 +292,13 @@
 					const nextCount = msgs.filter(m => m.from === selectedPeer!.npub).length;
 					if (nextCount > prevCount) {
 						inboxMessages.set(msgs);
+						// The open conversation just got new messages — re-advance its watermark too,
+						// so an open thread never accumulates a phantom unread count (devtest #16).
+						const latest = latestFromPeer(msgs, selectedPeer.npub);
+						if (latest) {
+							readWatermarks.update((w) => ({ ...w, [selectedPeer!.npub]: latest }));
+							advanceReadWatermark(selectedPeer.npub, latest).catch(() => { });
+						}
 						await tick();
 						scrollToBottom();
 						return;
@@ -311,14 +320,7 @@
 		loading = true;
 		try {
 			const msgs = await getMessages();
-			// Seed seen keys so layout poll doesn't double-badge already-fetched messages.
-			for (const m of msgs) seenMessageKeys.add(`${m.from}|${m.sent_at}`);
 			inboxMessages.set(msgs);
-			unreadCount.set(0);
-			// Seed per-peer seen counts from current inbox so remounting shows no false unread.
-			for (const m of msgs) {
-				seenCounts[m.from] = msgs.filter(x => x.from === m.from).length;
-			}
 		} catch (e) {
 			toast(String(e), 'error');
 		} finally {
@@ -332,7 +334,14 @@
 		selectedTopic = null;
 		viewingRequests = false;
 		selectedRequest = null;
-		seenCounts[peer.npub] = $inboxMessages.filter((m) => m.from === peer.npub).length;
+		// Opening a conversation reads it: advance the peer's watermark to the newest message we
+		// have from them (devtest #16 — the badge clears per-conversation, not on merely landing on
+		// /chat). Optimistic local update + best-effort persist.
+		const latest = latestFromPeer($inboxMessages, peer.npub);
+		if (latest) {
+			readWatermarks.update((w) => ({ ...w, [peer.npub]: latest }));
+			advanceReadWatermark(peer.npub, latest).catch(() => { });
+		}
 		await tick();
 		scrollToBottom();
 	}
@@ -344,8 +353,6 @@
 		draft = '';
 		try {
 			const sent = await sendMessage(selectedPeer.npub, content);
-			// Track sent message so poll doesn't re-badge it.
-			seenMessageKeys.add(`${sent.from}|${sent.sent_at}`);
 			sentMessages.update((prev) => [...prev, sent]);
 			await tick();
 			scrollToBottom();
@@ -366,7 +373,6 @@
 		composeSending = true;
 		try {
 			const sent = await sendMessage(to, content);
-			seenMessageKeys.add(`${sent.from}|${sent.sent_at}`);
 			sentMessages.update((prev) => [...prev, sent]);
 			composeOpen = false;
 			composeTo = '';
@@ -437,13 +443,9 @@
 	$effect(() => {
 		fetchNonContactNames($dmRequests.map((r) => r.npub));
 	});
-	let unreadCounts = $derived(Object.fromEntries(
-		allConversationPeers.map((c) => {
-			const total = $inboxMessages.filter((m) => m.from === c.npub).length;
-			const seen = seenCounts[c.npub] ?? 0;
-			return [c.npub, Math.max(0, total - seen)];
-		})
-	));
+	// devtest #16: derived straight from the persisted per-peer watermark, replacing the old
+	// seenCounts in-memory snapshot (which reset to "no unread" on every remount).
+	let unreadCounts = $derived(unreadByPeer($inboxMessages, $readWatermarks, myId));
 	// Show a privacy notice if the selected peer is not in contacts (may have DMs restricted).
 	let selectedIsContact = $derived(selectedPeer ? $contacts.some(c => c.npub === selectedPeer!.npub) : false);
 </script>
@@ -514,7 +516,7 @@
 						{@const unread = unreadCounts[peer.npub] ?? 0}
 						{@const active = selectedPeer?.npub === peer.npub}
 						<button class="convo-item" class:convo-active={active} onclick={() => selectPeer(peer)}>
-							<Avatar letter={initial} size={34} {hue} />
+							<Avatar letter={initial} size={34} {hue} picture={peer.profile?.picture} />
 							<div class="convo-info">
 								<div class="convo-row">
 									<span class="convo-name" class:convo-name-active={active}>{name}</span>
@@ -671,13 +673,14 @@
 				<!-- Header -->
 				<div class="pane-header">
 					<Avatar
-						letter={(selectedPeer.profile?.display_name ?? selectedPeer.npub)[0].toUpperCase()}
+						letter={(selectedPeer.profile?.display_name || selectedPeer.npub)[0].toUpperCase()}
 						size={36}
-						hue={avatarHue((selectedPeer.profile?.display_name ?? selectedPeer.npub)[0])}
+						hue={avatarHue((selectedPeer.profile?.display_name || selectedPeer.npub)[0])}
+						picture={selectedPeer.profile?.picture}
 					/>
 					<div class="pane-peer-info">
 						<div class="pane-peer-row">
-							<span class="pane-peer-name">{selectedPeer.profile?.display_name ?? shortId(selectedPeer.npub)}</span>
+							<span class="pane-peer-name">{selectedPeer.profile?.display_name || shortId(selectedPeer.npub)}</span>
 							{#if selectedPeer.online}
 								<span class="pill pill-online"><span class="pill-dot"></span> Online</span>
 							{:else}
@@ -699,7 +702,7 @@
 				{#if !selectedPeer.online}
 					<div class="offline-banner">
 						<span class="offline-dot"></span>
-						<span>{selectedPeer.profile?.display_name ?? shortId(selectedPeer.npub)} is offline — they'll see your message the next time they open Hoardbook.</span>
+						<span>{selectedPeer.profile?.display_name || shortId(selectedPeer.npub)} is offline — they'll see your message the next time they open Hoardbook.</span>
 					</div>
 				{/if}
 
@@ -782,13 +785,15 @@
 		<div class="modal">
 			<h2>New message</h2>
 			<input placeholder="npub or hbk share code…" bind:value={composeTo} />
-			{#if composeTo.trim() && composeRecipientKind(composeTo) === 'invalid'}
+			{#if composeTo.trim() && isComposeToSelf(composeTo, $identity?.npub ?? '', $identity?.share_code ?? '')}
+				<div class="compose-hint">That's your own ID.</div>
+			{:else if composeTo.trim() && composeRecipientKind(composeTo) === 'invalid'}
 				<div class="compose-hint">Doesn't look like an npub or share code — sending will reject it if it's wrong.</div>
 			{/if}
 			<textarea class="compose-modal-input" placeholder="Message…" bind:value={composeBody} rows="3"></textarea>
 			<div class="modal-actions">
 				<button class="ghost" onclick={() => (composeOpen = false)}>Cancel</button>
-				<button class="btn-primary" disabled={!composeTo.trim() || !composeBody.trim() || composeSending} onclick={handleComposeSend}>
+				<button class="btn-primary" disabled={!composeTo.trim() || !composeBody.trim() || composeSending || isComposeToSelf(composeTo, $identity?.npub ?? '', $identity?.share_code ?? '')} onclick={handleComposeSend}>
 					{composeSending ? '…' : 'Send'}
 				</button>
 			</div>

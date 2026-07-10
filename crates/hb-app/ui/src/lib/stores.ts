@@ -27,8 +27,10 @@ export const appReady = writable(false);
 /** Set when the identity file exists but cannot be decrypted (e.g. DPAPI failure). */
 export const identityLoadError = writable<string | null>(null);
 
-/** Count of messages received since the chat page was last opened. */
-export const unreadCount = writable(0);
+/** Per-peer persisted last-read watermark (npub → RFC3339 timestamp), mirroring the backend
+ *  `read_state.json` — the single source of truth the unread badge derives from (devtest #16:
+ *  replaces the three unsynchronized mechanisms this used to be spread across). */
+export const readWatermarks = writable<Record<string, string>>({});
 
 export function toast(text: string, kind: 'success' | 'error' = 'success') {
 	toastMessage.set({ text, kind });

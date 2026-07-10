@@ -2,7 +2,7 @@
 //! join gate (F12), the topic-contact badge, the spoofable member-count display, and the "joining
 //! unlocks no listings" note. No Svelte, no DOM, no Tauri → unit-testable in the node env.
 
-import type { CachedPeer, ContactSource } from './types.js';
+import type { CachedPeer, ContactSource, ChannelPost, TopicLookup } from './types.js';
 import { contactDisplayName } from './contact-display.js';
 
 /** Public-join consent: the visibility is the deal. Anyone who joins can see you are a member. */
@@ -44,6 +44,41 @@ export function contactBadge(source: ContactSource | undefined): string | null {
 export function memberCountLabel(estimate: number): string {
 	const n = Math.max(0, Math.floor(estimate));
 	return `~${n} member${n === 1 ? '' : 's'} (estimate)`;
+}
+
+/** The Create-modal's primary action (devtest #11 — join-first): a same-name public Topic must not
+ *  fork into a second, cryptographically distinct room. `lookup.exists` (an announce was found for
+ *  the composed name) switches the action to **join** the existing room; `null` (no lookup yet, a
+ *  private Topic, or an empty name) or `exists: false` keeps the default **create**. */
+export interface PrimaryAction {
+	label: string;
+	mode: 'create' | 'join';
+}
+
+export function createPrimaryAction(lookup: TopicLookup | null): PrimaryAction {
+	if (lookup?.exists) {
+		return { label: `Join existing topic (${memberCountLabel(lookup.member_count_estimate)})`, mode: 'join' };
+	}
+	return { label: 'Create', mode: 'create' };
+}
+
+/** `topic_channel` returns posts newest-first (devtest #12; also feeds the Topics-page preview and
+ *  discover ranking, which want newest-first — hb-net's contract stays as-is). Chat renders a
+ *  channel like any other conversation, oldest at the top / newest at the bottom, so the render
+ *  path sorts ascending here. Stable on ties (equal `ts`) — does not reorder same-second posts. */
+export function sortChannelPostsAscending(posts: readonly ChannelPost[]): ChannelPost[] {
+	return [...posts].sort((a, b) => a.ts - b.ts);
+}
+
+/** devtest #15 — resolve a `?topic=<id>` deep-link param (from the Topics-page "Open in Chat" link)
+ *  against the loaded Topics list. `null` for an absent param or an id that isn't a joined Topic —
+ *  the caller stays on the conversation list and can surface the not-joined/unknown case. */
+export function resolveTopicParam<T extends { topic_id: string }>(
+	topicId: string | null,
+	topics: readonly T[],
+): T | null {
+	if (!topicId) return null;
+	return topics.find((t) => t.topic_id === topicId) ?? null;
 }
 
 /** Dissolution is derived: a Topic with an empty roster has dissolved (the name frees up). */

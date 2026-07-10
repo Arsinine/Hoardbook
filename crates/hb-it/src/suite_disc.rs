@@ -29,7 +29,7 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
 }
 
 fn teaser(name: &str, tags: Vec<String>, cts: Vec<String>) -> Teaser {
-    Teaser { display_name: name.into(), bio: String::new(), tags, content_types: cts }
+    Teaser { display_name: name.into(), bio: String::new(), tags, content_types: cts, picture: None }
 }
 
 /// Fetch + verify teasers matching a tag-search filter, returning (author, parsed teaser).
@@ -62,9 +62,9 @@ async fn disc1(ctx: &Ctx) -> Result<()> {
     let (anime, vhs, doc) = (ctx.tag("anime"), ctx.tag("vhs"), ctx.tag("doc"));
     let (video, audio) = (ctx.tag("video"), ctx.tag("audio"));
     let (p1, p2, p3) = (Identity::generate(), Identity::generate(), Identity::generate());
-    let t1 = build_teaser(&p1, &teaser("P1", vec![anime.clone(), vhs.clone()], vec![video.clone()]))?;
-    let t2 = build_teaser(&p2, &teaser("P2", vec![anime.clone()], vec![audio.clone()]))?;
-    let t3 = build_teaser(&p3, &teaser("P3", vec![doc.clone()], vec![video.clone()]))?;
+    let t1 = build_teaser(&p1, &teaser("P1", vec![anime.clone(), vhs.clone()], vec![video.clone()]), true)?;
+    let t2 = build_teaser(&p2, &teaser("P2", vec![anime.clone()], vec![audio.clone()]), true)?;
+    let t3 = build_teaser(&p3, &teaser("P3", vec![doc.clone()], vec![video.clone()]), true)?;
 
     let client = ctx.connect(&p1).await?;
     for ev in [&t1, &t2, &t3] {
@@ -104,7 +104,7 @@ async fn disc2(ctx: &Ctx) -> Result<()> {
     let a = Identity::generate();
     let advertised = vec![ctx.relays[0].clone()];
     let relay_list = build_relay_list(&a, &advertised, &advertised)?;
-    let tea = build_teaser(&a, &teaser("nip65-peer", vec![ctx.tag("nip65")], vec![ctx.tag("video")]))?;
+    let tea = build_teaser(&a, &teaser("nip65-peer", vec![ctx.tag("nip65")], vec![ctx.tag("video")]), true)?;
 
     let pubc = ctx.connect(&a).await?;
     pubc.publish(&relay_list).await?;
@@ -135,7 +135,7 @@ async fn disc3(ctx: &Ctx) -> Result<()> {
     // A tag-search hit yields the teaser but never the (encrypted) listing.
     let a = Identity::generate();
     let only = ctx.tag("only");
-    let tea = build_teaser(&a, &teaser("teaser-only", vec![only.clone()], vec![ctx.tag("video")]))?;
+    let tea = build_teaser(&a, &teaser("teaser-only", vec![only.clone()], vec![ctx.tag("video")]), true)?;
     let listing = build_listing_event(&a, "hbd-coll", &[3u8; 32], r#"{"slug":"hbd-coll","entries":[]}"#)?;
 
     let client = ctx.connect(&a).await?;
@@ -172,8 +172,8 @@ async fn disc6(ctx: &Ctx) -> Result<()> {
     let other = ctx.tag("w3other");
     let p1 = Identity::generate();
     let p2 = Identity::generate();
-    let t1 = build_teaser(&p1, &teaser("match", vec![want.clone()], vec![ctx.tag("video")]))?;
-    let t2 = build_teaser(&p2, &teaser("other", vec![other.clone()], vec![ctx.tag("audio")]))?;
+    let t1 = build_teaser(&p1, &teaser("match", vec![want.clone()], vec![ctx.tag("video")]), true)?;
+    let t2 = build_teaser(&p2, &teaser("other", vec![other.clone()], vec![ctx.tag("audio")]), true)?;
 
     let client = ctx.connect(&p1).await?;
     client.publish(&t1).await?;
@@ -199,7 +199,7 @@ async fn disc5(ctx: &Ctx) -> TestResult {
 
 async fn disc5_inner(ctx: &Ctx) -> Result<()> {
     let id = Identity::generate();
-    let ev = build_teaser(&id, &teaser("pow", vec![ctx.tag("pow")], vec![ctx.tag("video")]))?;
+    let ev = build_teaser(&id, &teaser("pow", vec![ctx.tag("pow")], vec![ctx.tag("video")]), true)?;
     let mined = mine_pow(&id, &ev, ctx.pow)?;
     ensure!(pow_difficulty(&mined) >= ctx.pow, "mined event below target difficulty");
 

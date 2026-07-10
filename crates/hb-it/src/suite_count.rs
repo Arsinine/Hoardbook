@@ -24,7 +24,7 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
 }
 
 fn teaser(name: &str, tags: Vec<String>, cts: Vec<String>) -> Teaser {
-    Teaser { display_name: name.into(), bio: String::new(), tags, content_types: cts }
+    Teaser { display_name: name.into(), bio: String::new(), tags, content_types: cts, picture: None }
 }
 
 /// COUNT1: a fresh non-canary npub published to **every** relay raises `count_online` by exactly one
@@ -71,7 +71,7 @@ async fn count2(ctx: &Ctx) -> Result<()> {
 
     let a = Identity::generate();
     let ac = ctx.connect(&a).await?;
-    ac.publish(&build_teaser(&a, &teaser("a", vec![ctx.tag("cnt")], vec![ctx.tag("video")]))?).await?;
+    ac.publish(&build_teaser(&a, &teaser("a", vec![ctx.tag("cnt")], vec![ctx.tag("video")]), true)?).await?;
     ac.publish(&build_binding(&a, now(), TTL)?).await?;
     ac.disconnect().await;
     settle().await;
@@ -83,7 +83,7 @@ async fn count2(ctx: &Ctx) -> Result<()> {
 
     let canary = Identity::generate();
     let cc = ctx.connect(&canary).await?;
-    cc.publish(&with_canary_marker(&canary, &build_teaser(&canary, &teaser("c", vec![ctx.tag("cnt")], vec![ctx.tag("video")]))?)?).await?;
+    cc.publish(&with_canary_marker(&canary, &build_teaser(&canary, &teaser("c", vec![ctx.tag("cnt")], vec![ctx.tag("video")]), true)?)?).await?;
     cc.publish(&with_canary_marker(&canary, &build_binding(&canary, now(), TTL)?)?).await?;
     cc.disconnect().await;
     settle().await;
@@ -120,7 +120,7 @@ async fn count3(ctx: &Ctx) -> Result<()> {
     let canary = Identity::generate();
     let canary_teaser = with_canary_marker(
         &canary,
-        &build_teaser(&canary, &teaser("disc-canary", vec![uniq.clone()], vec![ctx.tag("video")]))?,
+        &build_teaser(&canary, &teaser("disc-canary", vec![uniq.clone()], vec![ctx.tag("video")]), true)?,
     )?;
     let cc = ctx.connect(&canary).await?;
     cc.publish(&canary_teaser).await?;
@@ -133,7 +133,7 @@ async fn count3(ctx: &Ctx) -> Result<()> {
 
     let real = Identity::generate();
     let rc = ctx.connect(&real).await?;
-    rc.publish(&build_teaser(&real, &teaser("disc-real", vec![uniq.clone()], vec![ctx.tag("video")]))?).await?;
+    rc.publish(&build_teaser(&real, &teaser("disc-real", vec![uniq.clone()], vec![ctx.tag("video")]), true)?).await?;
     rc.disconnect().await;
     settle().await;
     let hits2 = hb_net::search_teasers(&client, &[uniq], &[], 100, FETCH_TIMEOUT).await?;

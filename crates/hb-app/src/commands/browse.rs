@@ -39,6 +39,8 @@ pub struct PeerSearchHit {
     pub bio: Option<String>,
     pub tags: Vec<String>,
     pub content_types: Vec<String>,
+    /// Optional data-URI avatar from the teaser (validated/sanitized at parse — never a remote URL).
+    pub picture: Option<String>,
     /// The §7 word+color fingerprint, derived from the npub alone (no listing access).
     pub fingerprint: Option<Fingerprint>,
 }
@@ -60,6 +62,13 @@ fn normalize_search_filters(
     Ok((tags, content_types))
 }
 
+/// Drop discovery hits that are the searcher's own npub (devtest #4) or an already-added contact
+/// (devtest #6) — Discover should only ever surface strangers, never yourself or someone already on
+/// the roster. Pure and unit-testable without a relay.
+fn filter_hits(hits: Vec<SearchHit>, me_npub: &str, contact_npubs: &[String]) -> Vec<SearchHit> {
+    hits.into_iter().filter(|h| h.npub != me_npub && !contact_npubs.contains(&h.npub)).collect()
+}
+
 /// Map a verified discovery `SearchHit` → a teaser card, deriving the §7 fingerprint from the npub.
 /// **No listing / browse-key is carried** (DISC3) — the card type structurally cannot hold one.
 fn hit_to_card(hit: SearchHit) -> PeerSearchHit {
@@ -71,6 +80,7 @@ fn hit_to_card(hit: SearchHit) -> PeerSearchHit {
         bio: if hit.teaser.bio.is_empty() { None } else { Some(hit.teaser.bio) },
         tags: hit.teaser.tags,
         content_types: hit.teaser.content_types,
+        picture: hit.teaser.picture,
         fingerprint,
     }
 }
@@ -82,6 +92,7 @@ fn teaser_to_profile(t: Teaser) -> hb_core::types::Profile {
         bio: if t.bio.is_empty() { None } else { Some(t.bio) },
         tags: t.tags,
         content_types: t.content_types,
+        picture: t.picture,
         since: None,
         est_size: None,
         languages: vec![],
@@ -209,6 +220,21 @@ async fn identity_clone(identity: &SharedIdentity) -> Result<Identity, String> {
         .ok_or_else(|| "No identity loaded. Generate a keypair first.".to_string())
 }
 
+/// R2: a peer with no published teaser cannot be added — unconditional reject at the trust
+/// boundary (devtest #17/#18), regardless of online status. Pure and unit-testable without a
+/// relay. The one deliberate exception is Q7 chat request-accept (`chat.rs
+/// dm_request_accept_inner`), which builds its own local peer stub with `profile: None` — that
+/// seam does not call this gate.
+fn reject_profileless(peer: &CachedPeer) -> Result<(), String> {
+    if peer.profile.is_none() {
+        return Err(
+            "This person hasn't published a profile yet, so there's nothing to add here. Ask them to publish a profile first."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn paste_key(
     code: String,
@@ -222,9 +248,7 @@ pub async fn paste_key(
         return Err("You cannot look up your own code".into());
     }
     let peer = resolve_peer(&share_code, &me, &store, &relay).await?;
-    if peer.profile.is_none() && peer.online {
-        return Err("This peer has not published a profile yet".into());
-    }
+    reject_profileless(&peer)?;
     Ok(peer)
 }
 
@@ -252,6 +276,9 @@ pub async fn follow(
     let share_code = ShareCode::parse(&code).map_err(|e| format!("Invalid share code: {e}"))?;
     let me = identity_clone(&identity).await?;
     let mut peer = resolve_peer(&share_code, &me, &store, &relay).await?;
+    // Defense-in-depth (R2): closes the AddContactDialog Skip path for a profileless peer even if
+    // the caller bypassed the paste_key/lookup gate.
+    reject_profileless(&peer)?;
     apply_follow_petname(&mut peer, petname);
     let npub = peer.npub.clone();
     store.save_contact(&CachedPeer::pubkey_hash(&npub), &peer).map_err(cmd_err)?;
@@ -367,6 +394,9 @@ pub async fn search_peers(
     let hits = search_teasers(&client, &tags, &content_types, SEARCH_CAP, net::RELAY_TIMEOUT)
         .await
         .map_err(cmd_err)?;
+    let contact_npubs: Vec<String> =
+        store.list_contacts().map_err(cmd_err)?.into_iter().map(|c| c.npub).collect();
+    let hits = filter_hits(hits, &me.npub(), &contact_npubs);
     Ok(hits.into_iter().map(hit_to_card).collect())
 }
 
@@ -397,11 +427,13 @@ mod tests {
                 bio: "90s anime".into(),
                 tags: vec!["anime".into()],
                 content_types: vec!["video".into()],
+                picture: Some("data:image/webp;base64,AA==".into()),
             },
         };
         let card = hit_to_card(hit);
         assert!(card.fingerprint.is_some(), "the §7 fingerprint is derived from the npub");
         assert_eq!(card.bio.as_deref(), Some("90s anime"));
+        assert_eq!(card.picture.as_deref(), Some("data:image/webp;base64,AA=="), "teaser avatar rides the hit card");
         let json = serde_json::to_string(&card).unwrap();
         assert!(!json.contains("browse_key") && !json.contains("browseKey"), "no browse-key on a hit");
         assert!(!json.contains("listing"), "no listing on a hit (DISC3)");
@@ -412,9 +444,46 @@ mod tests {
         let id = Identity::generate();
         let hit = SearchHit {
             npub: id.npub(),
-            teaser: Teaser { display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![] },
+            teaser: Teaser { display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None },
         };
         assert_eq!(hit_to_card(hit).bio, None, "a blank bio renders as None, not an empty string");
+    }
+
+    fn hit_for(npub: String) -> SearchHit {
+        SearchHit {
+            npub,
+            teaser: Teaser { display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None },
+        }
+    }
+
+    #[test]
+    fn filter_hits_drops_own_npub_devtest_4() {
+        let me = Identity::generate();
+        let stranger = Identity::generate();
+        let hits = vec![hit_for(me.npub()), hit_for(stranger.npub())];
+        let kept = filter_hits(hits, &me.npub(), &[]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].npub, stranger.npub());
+    }
+
+    #[test]
+    fn filter_hits_drops_existing_contacts_devtest_6() {
+        let me = Identity::generate();
+        let contact = Identity::generate();
+        let stranger = Identity::generate();
+        let hits = vec![hit_for(contact.npub()), hit_for(stranger.npub())];
+        let kept = filter_hits(hits, &me.npub(), &[contact.npub()]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].npub, stranger.npub());
+    }
+
+    #[test]
+    fn filter_hits_keeps_strangers() {
+        let me = Identity::generate();
+        let stranger = Identity::generate();
+        let hits = vec![hit_for(stranger.npub())];
+        let kept = filter_hits(hits, &me.npub(), &[]);
+        assert_eq!(kept.len(), 1);
     }
 
     fn valid_meta(slug: &str) -> serde_json::Map<String, serde_json::Value> {
@@ -494,6 +563,27 @@ mod tests {
             local_tags: vec![],
             fingerprint: None,
         }
+    }
+
+    // ── R2: profileless peers cannot be added ─────────────────────────────────────
+
+    #[test]
+    fn reject_profileless_errs_when_peer_has_no_profile() {
+        let peer = stub_peer("hb1_test", None);
+        assert!(reject_profileless(&peer).is_err());
+    }
+
+    #[test]
+    fn reject_profileless_ok_when_peer_has_profile() {
+        let mut peer = stub_peer("hb1_test", None);
+        peer.profile = Some(teaser_to_profile(Teaser {
+            display_name: "archivebox".into(),
+            bio: String::new(),
+            tags: vec![],
+            content_types: vec![],
+            picture: None,
+        }));
+        assert!(reject_profileless(&peer).is_ok());
     }
 
     #[test]

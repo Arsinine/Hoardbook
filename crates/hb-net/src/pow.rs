@@ -66,8 +66,9 @@ mod tests {
             bio: String::new(),
             tags: vec!["anime".into()],
             content_types: vec!["video".into()],
+            picture: None,
         };
-        let ev = build_teaser(&id, &teaser).unwrap();
+        let ev = build_teaser(&id, &teaser, true).unwrap();
         (id, ev)
     }
 

@@ -98,3 +98,11 @@ fn topic_domain_bytes_are_frozen() {
     assert_eq!(topic::POST_DOMAIN, 0x02, "topic::POST_DOMAIN — {FREEZE}");
     assert_eq!(topic::ANNOUNCE_DOMAIN, 0x03, "topic::ANNOUNCE_DOMAIN — {FREEZE}");
 }
+
+/// The teaser-picture size cap (M13 item #13, additive under SCHEMA_V=1) — a raise/lower changes
+/// what a signed teaser already in the wild is allowed to carry; pinned so it is a deliberate call,
+/// not a drift.
+#[test]
+fn teaser_picture_cap_is_frozen() {
+    assert_eq!(event::TEASER_PICTURE_MAX_BYTES, 16 * 1024, "event::TEASER_PICTURE_MAX_BYTES — {FREEZE}");
+}

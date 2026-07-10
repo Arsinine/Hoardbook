@@ -1,6 +1,6 @@
 // Backup-export view-model (spec §Backup & Durability): the passphrase strength meter, the two
 // export modes (passphrase-encrypted default vs plaintext-behind-a-warning), and the share-code
-// export (text + QR). The crypto lives in the Rust core; this is UI logic only.
+// export. The crypto lives in the Rust core; this is UI logic only.
 
 /** The passphrase floor, mirrored from `hb_core::backup::MIN_PASSPHRASE_LEN`. Measured on the
  *  NFKC-normalized form at BOTH layers so a passphrase can't pass the UI gate and fail the core. */
@@ -67,14 +67,11 @@ export function backupModeOptions(): BackupModeOption[] {
 
 export interface ShareCodeExport {
 	text: string;
-	/** The rendered QR (e.g. an SVG string). Derived from the share code via the injected encoder. */
-	qr: string;
 	/** The share code carries the browse-key, so it is secret — the UI warns on export. */
 	warned: boolean;
 }
 
-/** Bundle the share code as text + QR. The encoder is injected so tests can stub it and the Svelte
- *  component supplies the real `qrcode` renderer. */
-export function shareCodeExport(code: string, qrEncode: (s: string) => string): ShareCodeExport {
-	return { text: code, qr: qrEncode(code), warned: true };
+/** Bundle the share code as text (no mobile app to scan a QR into — devtest #10). */
+export function shareCodeExport(code: string): ShareCodeExport {
+	return { text: code, warned: true };
 }

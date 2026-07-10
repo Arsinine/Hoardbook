@@ -35,6 +35,7 @@ fn teaser(name: &str, tags: &[String]) -> Teaser {
         bio: String::new(),
         tags: tags.to_vec(),
         content_types: vec!["video".into()],
+        picture: None,
     }
 }
 
@@ -44,7 +45,7 @@ async fn ab1(ctx: &Ctx) -> Result<()> {
     let bad = Identity::generate();
     let block_tag = ctx.tag("block");
     let client = ctx.connect(&me).await?;
-    client.publish(&build_teaser(&bad, &teaser("spammer", std::slice::from_ref(&block_tag)))?).await?;
+    client.publish(&build_teaser(&bad, &teaser("spammer", std::slice::from_ref(&block_tag)), true)?).await?;
     settle().await;
 
     let hits = client
@@ -94,7 +95,7 @@ async fn ab3(ctx: &Ctx) -> Result<()> {
     let ids: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
     let client = ctx.connect(&ids[0]).await?;
     for id in &ids {
-        client.publish(&build_teaser(id, &teaser("real", std::slice::from_ref(&junk_tag)))?).await?;
+        client.publish(&build_teaser(id, &teaser("real", std::slice::from_ref(&junk_tag)), true)?).await?;
     }
     settle().await;
     let mut hits = client
@@ -124,7 +125,7 @@ async fn ab8(ctx: &Ctx) -> Result<()> {
     let a = Identity::generate();
 
     // Seed a teaser, a listing, and a presence for the hostile-action checks.
-    let tea = build_teaser(&a, &teaser("victim", &[ctx.tag("ab8")]))?;
+    let tea = build_teaser(&a, &teaser("victim", &[ctx.tag("ab8")]), true)?;
     let listing = build_listing_event(&a, "ab8", &[8u8; 32], r#"{"slug":"ab8","entries":[]}"#)?;
     let presence = build_binding(&a, now, 30 * 60)?;
     let client = ctx.connect(&a).await?;
@@ -160,7 +161,7 @@ async fn ab8(ctx: &Ctx) -> Result<()> {
     // (2) A WITHHELD event is still found via another relay (multi-relay only).
     if ctx.multi() {
         let w = Identity::generate();
-        let only_on_1 = build_teaser(&w, &teaser("withheld", &[ctx.tag("ab8w")]))?;
+        let only_on_1 = build_teaser(&w, &teaser("withheld", &[ctx.tag("ab8w")]), true)?;
         // Publish to relay[1] only — relay[0] is the "withholding" relay that never gets it.
         let pubc = ctx.connect_one(&w, 1).await?;
         pubc.publish(&only_on_1).await?;
@@ -218,7 +219,7 @@ async fn ab10(ctx: &Ctx) -> Result<()> {
     // (b) The public teaser omits contact_hint (ties to regression scenario 9).
     let a = Identity::generate();
     let key = [10u8; 32];
-    let tea = build_teaser(&a, &teaser("bounded", &[ctx.tag("ab10")]))?;
+    let tea = build_teaser(&a, &teaser("bounded", &[ctx.tag("ab10")]), true)?;
     let listing = build_listing_event(&a, "ab10", &key, r#"{"slug":"ab10","entries":[{"name":"f"}]}"#)?;
 
     let client = ctx.connect(&a).await?;

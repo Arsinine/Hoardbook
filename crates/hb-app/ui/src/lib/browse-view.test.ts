@@ -4,6 +4,9 @@ import {
 	collectionAvailability,
 	dedupAndCap,
 	flattenTree,
+	parseEstSize,
+	peerAccessBadge,
+	summarizeCollectionsSize,
 	type RenderedListing,
 	type SearchHit,
 	type TreeNode,
@@ -76,5 +79,89 @@ describe('browse-view — flattenTree handles deep nesting without recursion', (
 		const rows = flattenTree([node]);
 		expect(rows).toHaveLength(5001);
 		expect(rows[rows.length - 1]).toEqual({ name: 'leaf', depth: 5000 });
+	});
+});
+
+describe('browse-view — peerAccessBadge (devtest #1)', () => {
+	it('a keyed peer (non-empty browse_key_hex) reads as browseable', () => {
+		expect(peerAccessBadge({ browse_key_hex: 'deadbeef' })).toEqual({
+			locked: false,
+			icon: '🔓',
+			label: 'browseable',
+			hint: '',
+		});
+	});
+
+	it('a bare peer (absent browse_key_hex) reads as locked with a remedy hint', () => {
+		const badge = peerAccessBadge({});
+		expect(badge.locked).toBe(true);
+		expect(badge.icon).toBe('🔒');
+		expect(badge.label).toBe('key needed');
+		expect(badge.hint.length).toBeGreaterThan(0);
+	});
+
+	it('an empty-string browse_key_hex reads as bare, not keyed', () => {
+		expect(peerAccessBadge({ browse_key_hex: '' }).locked).toBe(true);
+	});
+
+	it('stays locked even when a bare peer carries cached collections — keys off browse_key_hex only', () => {
+		const badge = peerAccessBadge({ browse_key_hex: undefined });
+		expect(badge.locked).toBe(true);
+	});
+});
+
+describe('browse-view — parseEstSize (devtest #7)', () => {
+	it('parses "14.2 GB"', () => {
+		expect(parseEstSize('14.2 GB')).toBeCloseTo(14.2 * 1024 ** 3, 0);
+	});
+
+	it('parses "14.2GB" (no space)', () => {
+		expect(parseEstSize('14.2GB')).toBeCloseTo(14.2 * 1024 ** 3, 0);
+	});
+
+	it('parses "~12 TB" (leading tilde)', () => {
+		expect(parseEstSize('~12 TB')).toBeCloseTo(12 * 1024 ** 4, 0);
+	});
+
+	it('parses "512 MB"', () => {
+		expect(parseEstSize('512 MB')).toBeCloseTo(512 * 1024 ** 2, 0);
+	});
+
+	it('is 0 for undefined', () => {
+		expect(parseEstSize(undefined)).toBe(0);
+	});
+
+	it('is 0 for an empty string', () => {
+		expect(parseEstSize('')).toBe(0);
+	});
+
+	it('is 0 for an unparseable string', () => {
+		expect(parseEstSize('lots')).toBe(0);
+	});
+});
+
+describe('browse-view — summarizeCollectionsSize (devtest #7)', () => {
+	it('sums parseable collections and pluralizes the count', () => {
+		expect(summarizeCollectionsSize([{ est_size: '1.0 GB' }, { est_size: '1.0 GB' }])).toBe(
+			'~2.0 GB across 2 collections',
+		);
+	});
+
+	it('keeps "collection" singular for exactly one', () => {
+		expect(summarizeCollectionsSize([{ est_size: '512 MB' }])).toBe('~512.0 MB across 1 collection');
+	});
+
+	it('is null for an empty list', () => {
+		expect(summarizeCollectionsSize([])).toBeNull();
+	});
+
+	it('is null when every entry is unparseable (never fabricates a "0 B" summary)', () => {
+		expect(summarizeCollectionsSize([{ est_size: 'lots' }, { est_size: undefined }])).toBeNull();
+	});
+
+	it('sums only the parseable entries but counts every collection in M', () => {
+		expect(summarizeCollectionsSize([{ est_size: '1.0 GB' }, { est_size: 'lots' }])).toBe(
+			'~1.0 GB across 2 collections',
+		);
 	});
 });

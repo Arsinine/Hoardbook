@@ -8,6 +8,7 @@ use crate::{
     error::{cmd_err, CmdResult},
     identity_state::SharedIdentity,
     net::{self, SharedRelay},
+    presence::{BeaconReport, SharedBeaconState},
     store::{DataStore, Settings},
 };
 
@@ -59,6 +60,14 @@ pub async fn relay_status(
         Ok(client) => Ok(client.relay_status().await),
         Err(_) => Ok(disconnected()),
     }
+}
+
+/// Per-relay outcome of the most recent presence-beacon publish (devtest #9 same-NAT diagnosis) —
+/// the beacon rides the same write path as every outbound publish (DMs/discovery), so a per-relay
+/// reject here is evidence for those too, not presence-only.
+#[tauri::command]
+pub async fn beacon_status(beacon: State<'_, SharedBeaconState>) -> CmdResult<BeaconReport> {
+    Ok(beacon.read().await.clone())
 }
 
 #[tauri::command]

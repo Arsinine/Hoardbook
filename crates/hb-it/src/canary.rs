@@ -129,7 +129,9 @@ pub fn build_canary_events(id: &Identity, bk: &BrowseKey, run_tag: &str) -> Resu
             bio: "synthetic backbone probe".into(),
             tags: vec![run_tag.to_string()],
             content_types: vec!["canary".into()],
+            picture: None,
         },
+        true,
     )?;
     let listing = build_listing_event(id, "hb-canary-coll", bk, CANARY_LISTING_JSON)?;
     let presence = build_binding(id, now(), PRESENCE_TTL)?;

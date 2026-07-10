@@ -1,19 +1,20 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { generateKeypair, getShareCode, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, relayStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, watchesGet, watchesDelete } from '$lib/api.js';
-	import type { Settings, UpdateInfo } from '$lib/api.js';
+	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, watchesGet, watchesDelete, saveProfile, hasPublishedProfile, publishProfile } from '$lib/api.js';
+	import type { Settings, UpdateInfo, BeaconReport } from '$lib/api.js';
 	import type { Watch } from '$lib/types.js';
 	import { keyView } from '$lib/key-view.js';
 	import { passphraseStrength, backupModeOptions, type BackupMode } from '$lib/backup-export.js';
 	import { updateNoticeVM } from '$lib/update-ux.js';
+	import { beaconLine } from '$lib/beacon-view.js';
 	import { DEFAULT_RELAYS, validateRelayUrl } from '$lib/relays.js';
-	import QRCode from 'qrcode';
 	import { relaunch } from '@tauri-apps/plugin-process';
 	import { open as openFileDialog, save as saveFileDialog, confirm } from '@tauri-apps/plugin-dialog';
 	import { getVersion } from '@tauri-apps/api/app';
 	import { identity, profile, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
+	import { compressToDataUri } from '$lib/image-compress.js';
 
 	let generating = $state(false);
 	let copied = $state(false);
@@ -25,18 +26,11 @@
 		relay_urls: [], allow_dms: true, privacy_notice_acknowledged: false,
 		last_seen_version: '',
 		snapshot_auto_update: true, snapshot_reconcile_poll: false, show_online_count: true,
+		discoverable: false,
 	});
 
-	// ── 3-key identity view + share-code QR ──────────────────────────────────────
+	// ── 3-key identity view ───────────────────────────────────────────────────────
 	let kv = $derived($identity ? keyView($identity) : null);
-	let shareQrSvg = $state('');
-
-	async function showShareQr() {
-		try {
-			const code = await getShareCode();
-			shareQrSvg = shareQrSvg ? '' : await QRCode.toString(code, { type: 'svg', margin: 1 });
-		} catch (e) { toast(String(e), 'error'); }
-	}
 
 	// ── Backup / restore ─────────────────────────────────────────────────────────
 	const backupModes = backupModeOptions();
@@ -173,6 +167,8 @@
 
 	type RelayStatus = 'checking' | 'ok' | 'error';
 	let relayStatuses: Record<string, RelayStatus> = $state({});
+	// devtest #9: per-relay beacon-publish evidence, so a same-NAT reject isn't invisible below debug.
+	let beaconReport: BeaconReport | null = $state(null);
 
 	async function probeRelay(url: string) {
 		relayStatuses[url] = 'checking';
@@ -203,6 +199,9 @@
 			}
 			relayStatuses = relayStatuses;
 		} catch { /* keep the probe results */ }
+		try {
+			beaconReport = await beaconStatus();
+		} catch { /* keep the last-known report */ }
 	}
 	onDestroy(() => { if (liveStatusTimer) clearInterval(liveStatusTimer); });
 
@@ -296,6 +295,19 @@
 		}
 	}
 
+	// devtest #5: the discoverability opt-out. Flip + persist like the other toggles, then — only if
+	// a teaser is already published — republish it so the change (add/drop hashtags) takes effect
+	// immediately instead of waiting for the next unrelated publish.
+	async function toggleDiscoverable() {
+		settings = { ...settings, discoverable: !settings.discoverable };
+		try {
+			await saveSettings(fullSettings());
+			if (await hasPublishedProfile()) await publishProfile();
+		} catch (e) {
+			toast(String(e), 'error');
+		}
+	}
+
 	async function handleWipe() {
 		wiping = true;
 		try {
@@ -372,6 +384,49 @@
 	let idInitial = $derived(idName[0]?.toUpperCase() ?? 'Y');
 	let idHue = $derived(avatarHue(idInitial));
 
+	// ── Profile picture (M13 item #13) ─────────────────────────────────────────────
+	let pictureInput: HTMLInputElement | undefined = $state();
+	let pictureBusy = $state(false);
+
+	async function handlePictureFile(e: Event) {
+		const file = (e.target as HTMLInputElement).files?.[0];
+		if (pictureInput) pictureInput.value = ''; // allow re-picking the same file later
+		if (!file) return;
+		if (!$profile) {
+			toast('Save a profile first', 'error');
+			return;
+		}
+		pictureBusy = true;
+		try {
+			const dataUri = await compressToDataUri(file);
+			const updated = { ...$profile, picture: dataUri };
+			await saveProfile(updated);
+			profile.set(updated);
+			if (await hasPublishedProfile()) await publishProfile();
+			toast('Picture updated', 'success');
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			pictureBusy = false;
+		}
+	}
+
+	async function handleRemovePicture() {
+		if (!$profile) return;
+		pictureBusy = true;
+		try {
+			const updated = { ...$profile, picture: undefined };
+			await saveProfile(updated);
+			profile.set(updated);
+			if (await hasPublishedProfile()) await publishProfile();
+			toast('Picture removed', 'success');
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			pictureBusy = false;
+		}
+	}
+
 	function relayDotColor(status: RelayStatus | undefined) {
 		if (status === 'ok') return 'var(--online)';
 		if (status === 'error') return 'var(--error)';
@@ -401,10 +456,25 @@
 	{#if $identity && kv}
 		<div class="surface">
 			<div class="identity-top">
-				<Avatar letter={idInitial} size={56} hue={idHue} />
+				<Avatar letter={idInitial} size={56} hue={idHue} picture={$profile?.picture} />
 				<div class="identity-info">
 					<div class="identity-name">{idName}</div>
 					<div class="identity-created">Nostr identity (npub)</div>
+					<div class="picture-actions">
+						<button class="btn-default btn-sm" onclick={() => pictureInput?.click()} disabled={pictureBusy}>
+							{pictureBusy ? 'Working…' : 'Change picture'}
+						</button>
+						{#if $profile?.picture}
+							<button class="btn-ghost btn-sm" onclick={handleRemovePicture} disabled={pictureBusy}>Remove picture</button>
+						{/if}
+					</div>
+					<input
+						bind:this={pictureInput}
+						type="file"
+						accept="image/png,image/jpeg,image/webp"
+						style="display:none"
+						onchange={handlePictureFile}
+					/>
 				</div>
 				<span class="pill pill-online"><span class="pill-dot"></span>Active</span>
 			</div>
@@ -415,17 +485,10 @@
 				<div class="id-display">
 					<span class="id-text">{row.value}</span>
 					<button class="icon-btn" onclick={() => handleCopy(row.value)} title={row.label === 'Share code' ? 'Copy share code' : 'Copy npub'}>{@html icons.copy}</button>
-					{#if row.label === 'Share code'}
-						<button class="icon-btn" onclick={showShareQr} title="Show QR code">{@html icons.qr}</button>
-					{/if}
 				</div>
 				{#if row.hint}<div class="id-hint" style="margin-bottom:12px">{row.hint}</div>{/if}
 			{/each}
 
-			{#if shareQrSvg}
-				<div class="qr-box">{@html shareQrSvg}</div>
-				<div class="id-hint">Scan to import your share code on another device. Treat it as secret — it unlocks your listings.</div>
-			{/if}
 			{#if copied}
 				<div class="id-actions"><span class="id-hint">Copied!</span></div>
 			{/if}
@@ -539,12 +602,14 @@
 	<div class="surface surface-nop">
 		{#each relayUrls as url (url)}
 			{@const status = relayStatuses[url]}
+			{@const bv = beaconLine(beaconReport, url, Date.now() / 1000)}
 			<div class="relay-row">
 				<div class="relay-dot" style="background:{relayDotColor(status)}" class:relay-dot-pulse={status === 'checking'}></div>
 				<div class="relay-info">
 					<div class="relay-url">{url}</div>
 					<div class="relay-meta">
 						<span class:status-ok={status === 'ok'} class:status-err={status === 'error'}>{relayStatusLabel(status)}</span>
+						<span class="beacon-line" class:status-ok={bv.tone === 'ok'} class:status-err={bv.tone === 'bad'} class:status-warn={bv.tone === 'warn'}>{bv.text}</span>
 					</div>
 				</div>
 				<button class="icon-btn" title="Re-check" onclick={() => probeRelay(url)}>{@html icons.refresh}</button>
@@ -603,6 +668,19 @@
 				<div class="toggle-sub">Low-frequency re-check for collections you edit from another host (SMB). Off by default.</div>
 			</div>
 			<button class="toggle" class:toggle-on={snapshotReconcilePoll} onclick={() => toggleSetting('snapshot_reconcile_poll')} aria-label="Reconcile poll for remotely-edited collections">
+				<span class="toggle-thumb"></span>
+			</button>
+		</div>
+
+		<div class="toggle-row">
+			<div class="toggle-text">
+				<div class="toggle-label">Show up in Discover Hoarders</div>
+				<div class="toggle-sub">
+					Off means people can't find you by tag or content-type search. They can still reach you
+					with your npub or share code, and your contacts are unaffected.
+				</div>
+			</div>
+			<button class="toggle" class:toggle-on={settings.discoverable} onclick={toggleDiscoverable} aria-label="Show up in Discover Hoarders">
 				<span class="toggle-thumb"></span>
 			</button>
 		</div>
@@ -745,6 +823,8 @@
 
 	.identity-created { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
 
+	.picture-actions { display: flex; gap: 8px; margin-top: 8px; }
+
 	.key-storage-warn {
 		margin-top: 12px;
 		padding: 10px 12px;
@@ -824,6 +904,7 @@
 
 	.status-ok  { color: var(--online); }
 	.status-err { color: var(--error); }
+	.status-warn { color: var(--fg-muted); }
 
 	@keyframes pulse {
 		0%, 100% { opacity: 1; }
@@ -1018,11 +1099,6 @@
 		font-size: 11.5px; color: var(--fg-muted); line-height: 1.5;
 		display: flex; gap: 8px; align-items: flex-start;
 	}
-	.qr-box {
-		display: flex; justify-content: center; padding: 12px;
-		background: oklch(0.98 0 0); border-radius: 8px; margin-top: 8px;
-	}
-	.qr-box :global(svg) { width: 180px; height: 180px; }
 	.backup-modes { display: flex; flex-direction: column; gap: 8px; }
 	.backup-mode {
 		display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px;

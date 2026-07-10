@@ -14,8 +14,11 @@ import {
 	splitTopicPath,
 	subPathLabel,
 	groupTopicsByRoot,
+	sortChannelPostsAscending,
+	resolveTopicParam,
+	createPrimaryAction,
 } from './topics-view.js';
-import type { CachedPeer } from './types.js';
+import type { CachedPeer, ChannelPost, TopicLookup } from './types.js';
 
 describe('topics-view (M11)', () => {
 	it('shows the public consent copy for a public Topic, the durable-record copy for a private one', () => {
@@ -103,5 +106,69 @@ describe('topics-view — W4 public Topic paths', () => {
 		expect(tree.map((g) => g.root)).toEqual(['video', 'audio']); // video before audio (root order)
 		expect(tree[0].topics.map((t) => t.name)).toEqual(['video/animation/anime', 'video/films']);
 		expect(tree[1].topics.map((t) => t.name)).toEqual(['audio/lossless']);
+	});
+});
+
+describe('topics-view — devtest #12 channel post order', () => {
+	function post(author_npub: string, ts: number): ChannelPost {
+		return { author_npub, body: author_npub, ts };
+	}
+
+	it('sorts newest-first backend posts into oldest-to-newest for rendering', () => {
+		const newestFirst = [post('c', 300), post('b', 200), post('a', 100)];
+		expect(sortChannelPostsAscending(newestFirst).map((p) => p.author_npub)).toEqual(['a', 'b', 'c']);
+	});
+
+	it('does not mutate the input array', () => {
+		const newestFirst = [post('b', 200), post('a', 100)];
+		sortChannelPostsAscending(newestFirst);
+		expect(newestFirst.map((p) => p.author_npub)).toEqual(['b', 'a']);
+	});
+
+	it('is stable on ties (equal ts)', () => {
+		const withTie = [post('later', 200), post('first', 100), post('second', 100)];
+		expect(sortChannelPostsAscending(withTie).map((p) => p.author_npub)).toEqual(['first', 'second', 'later']);
+	});
+});
+
+describe('topics-view — devtest #15 topic deep-link resolver', () => {
+	const topics = [
+		{ topic_id: 'abc123', name: 'video/anime' },
+		{ topic_id: 'def456', name: 'audio/vinyl' },
+	];
+
+	it('resolves a joined topic_id to its TopicView', () => {
+		expect(resolveTopicParam('def456', topics)?.name).toBe('audio/vinyl');
+	});
+
+	it('returns null for an absent param', () => {
+		expect(resolveTopicParam(null, topics)).toBeNull();
+	});
+
+	it('returns null for an id that is not in the joined list (not-joined/unknown)', () => {
+		expect(resolveTopicParam('nonexistent', topics)).toBeNull();
+	});
+});
+
+describe('topics-view — devtest #11 join-first primary action', () => {
+	const lookup = (exists: boolean, count = 0): TopicLookup => ({
+		topic_id: 'abc123',
+		name: 'video/anime',
+		exists,
+		member_count_estimate: count,
+	});
+
+	it('defaults to Create when there is no lookup yet', () => {
+		expect(createPrimaryAction(null)).toEqual({ label: 'Create', mode: 'create' });
+	});
+
+	it('defaults to Create when the name is free (exists: false)', () => {
+		expect(createPrimaryAction(lookup(false))).toEqual({ label: 'Create', mode: 'create' });
+	});
+
+	it('switches to Join, with the member estimate, when the name already has a room', () => {
+		const action = createPrimaryAction(lookup(true, 7));
+		expect(action.mode).toBe('join');
+		expect(action.label).toContain(memberCountLabel(7));
 	});
 });

@@ -49,6 +49,7 @@ pub(crate) fn teaser_from_profile(store: &DataStore, profile: &Profile) -> Tease
         bio: profile.bio.clone().unwrap_or_default(),
         tags,
         content_types: profile.content_types.clone(),
+        picture: profile.picture.clone(),
     }
 }
 
@@ -72,8 +73,10 @@ pub async fn publish_profile(
     profile.content_types = compute_content_types(&store);
     store.save_profile_draft(&profile).map_err(cmd_err)?;
 
+    // devtest #5: discoverability is opt-in, default off (a failed settings load is treated as off).
+    let discoverable = store.load_settings().map_err(cmd_err)?.unwrap_or_default().discoverable;
     let teaser = teaser_from_profile(&store, &profile);
-    let event = build_teaser(&id_clone, &teaser).map_err(cmd_err)?;
+    let event = build_teaser(&id_clone, &teaser, discoverable).map_err(cmd_err)?;
 
     let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
     client.publish(&event).await.map_err(cmd_err)?;
@@ -178,6 +181,7 @@ mod tests {
             social_links: vec![],
             willing_to: vec![],
             content_types,
+            picture: None,
             updated: chrono::Utc::now(),
         }
     }
@@ -221,6 +225,33 @@ mod tests {
         assert!(!json.contains("secret@example.com"));
         assert_eq!(teaser.display_name, "Tester");
         assert_eq!(teaser.tags, vec!["anime".to_string()]);
+    }
+
+    #[test]
+    fn teaser_from_profile_not_discoverable_emits_no_hashtags_and_still_omits_private_fields() {
+        // devtest #5: build_teaser(.., false) at the teaser_from_profile seam — no `t` hashtags, and
+        // the private-field omission (contact_hint / email / location) still holds regardless.
+        let (_dir, store) = test_store();
+        let profile = make_profile("Tester", vec!["video".into()]);
+        let teaser = teaser_from_profile(&store, &profile);
+        let id = hb_core::Identity::generate();
+        let event = build_teaser(&id, &teaser, false).unwrap();
+        assert_eq!(event.tags.hashtags().count(), 0, "no hashtags when not discoverable");
+        assert!(!event.content.contains("contact_hint"));
+        assert!(!event.content.contains("secret@example.com"));
+    }
+
+    #[test]
+    fn teaser_from_profile_carries_picture_through() {
+        let (_dir, store) = test_store();
+        let mut profile = make_profile("Tester", vec!["video".into()]);
+        profile.picture = Some("data:image/webp;base64,AAAA".into());
+        let teaser = teaser_from_profile(&store, &profile);
+        assert_eq!(teaser.picture.as_deref(), Some("data:image/webp;base64,AAAA"));
+        let id = hb_core::Identity::generate();
+        let event = build_teaser(&id, &teaser, true).unwrap();
+        let parsed = hb_core::event::parse_teaser(&event).unwrap();
+        assert_eq!(parsed.picture.as_deref(), Some("data:image/webp;base64,AAAA"));
     }
 
     fn published_collection_tags(
@@ -295,7 +326,7 @@ mod tests {
         assert!(!teaser.tags.contains(&"forbidden".to_string()));
 
         let id = hb_core::Identity::generate();
-        let event = build_teaser(&id, &teaser).unwrap();
+        let event = build_teaser(&id, &teaser, true).unwrap();
         let hashtags: Vec<&str> = event.tags.iter().filter_map(|t| t.content()).collect();
         assert!(
             !hashtags.contains(&"forbidden"),
