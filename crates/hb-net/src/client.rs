@@ -8,18 +8,42 @@
 //! silent drop or an explicit `OK: false` is observable (AB8), never swallowed.
 
 use std::collections::HashSet;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-use hb_core::Identity;
+use hb_core::{Identity, RelayRateLimiter};
 use nostr_sdk::prelude::*;
 use serde::Serialize;
 
 use crate::error::NetError;
 
+/// Ceiling on any single throttle sleep, so the sleep-and-retry loop always re-checks the bucket
+/// promptly (with the production refill a real wait is under a second; this is a floor against a
+/// mis-set constant asking for an implausibly long single sleep — [`RelayRateLimiter::new`] already
+/// clamps the config, so this is belt-and-suspenders).
+const MAX_THROTTLE_SLEEP: Duration = Duration::from_secs(2);
+
 /// A connected multi-relay client.
 pub struct RelayClient {
     client: Client,
     relays: Vec<String>,
+    /// Ban-avoidance pacing for the write path (spec §Relay Model;
+    /// [[large_collection_intent_2026-07-11]]). A token bucket, NOT the announce min-interval —
+    /// ordinary writes clear the burst instantly, only a large-collection flood is paced. Behind a
+    /// `std::sync::Mutex` because [`publish`](Self::publish) takes `&self` on the shared `Arc` and
+    /// the critical section is pure arithmetic held **only** across `try_acquire` (never across the
+    /// sleep or the network send), so it needs no async lock.
+    ///
+    /// **Per-client, by design (accepted residual — Chorus).** A fresh full burst is minted on every
+    /// `RelayClient::connect`; a rebuild (Settings relay-set change, or a dead-pool reconnect) resets
+    /// the bucket. Rebuilds are rare, and the one edge — a huge publish interrupted mid-stream by a
+    /// drop then resumed on a fresh burst — is low-risk (a relay would have to track rate across the
+    /// reconnect). Not worth a session-lifetime singleton; the un-bypassable per-write chokepoint is
+    /// the property that matters.
+    limiter: Mutex<RelayRateLimiter>,
+    /// Monotonic anchor: `start.elapsed()` is the `now` fed to the limiter, so a wall-clock jump
+    /// cannot skew pacing.
+    start: Instant,
 }
 
 /// Per-relay accept/reject split for a single publish.
@@ -97,12 +121,40 @@ impl RelayClient {
         if conn.success.is_empty() {
             return Err(NetError::NoRelayConnected(format!("{:?}", conn.failed)));
         }
-        Ok(Self { client, relays: relays.to_vec() })
+        Ok(Self {
+            client,
+            relays: relays.to_vec(),
+            limiter: Mutex::new(RelayRateLimiter::relay_writes()),
+            start: Instant::now(),
+        })
+    }
+
+    /// Block until the write governor grants a token, then return so the caller may send. A token
+    /// bucket, so a full burst returns immediately (no interactive write is paced — owner ruling
+    /// 2026-07-12); only a sustained flood sleeps, and it always *sends* (never rejects). Each
+    /// iteration takes the lock **only** for the pure decision (via [`throttle_step`], dropped before
+    /// the `.await`) so it holds no lock across the sleep.
+    async fn throttle(&self) {
+        let mut paced = false;
+        while let Some(sleep) = throttle_step(&self.limiter, self.start.elapsed().as_secs_f64()) {
+            if !paced {
+                // Observability (Chorus gemini/opencode): a large paced publish must not stall
+                // silently. Logged once per publish that actually waits — the common burst path never
+                // reaches here, so no cost on ordinary interactive writes. debug ⇒ off by default.
+                tracing::debug!(
+                    sleep_ms = sleep.as_millis() as u64,
+                    "relay-write governor engaged (burst spent) — pacing this publish to stay under relay rate limits"
+                );
+                paced = true;
+            }
+            tokio::time::sleep(sleep).await;
+        }
     }
 
     /// Publish a pre-signed hb-core event to every write-relay, returning the per-relay
     /// accept/reject split. Errors only if **no** relay accepted (an all-reject / all-drop).
     pub async fn publish(&self, event: &Event) -> Result<PublishOutcome, NetError> {
+        self.throttle().await;
         let output = self
             .client
             .send_event(event)
@@ -128,6 +180,7 @@ impl RelayClient {
         if relays.is_empty() {
             return Err(NetError::NoRelayConnected("no target relays for publish_to".into()));
         }
+        self.throttle().await;
         let output = self
             .client
             .send_event_to(relays.iter().map(|s| s.as_str()), event)
@@ -215,6 +268,24 @@ impl RelayClient {
     /// Close all relay connections.
     pub async fn disconnect(self) {
         self.client.disconnect().await;
+    }
+}
+
+/// One iteration of [`RelayClient::throttle`], factored out so the lock / sleep-cap / fail-open
+/// logic is unit-tested without a live relay. Returns `Some(sleep)` (already clamped to
+/// [`MAX_THROTTLE_SLEEP`]) to wait then retry, or `None` when a token was granted / the lock is
+/// poisoned (fail open — pacing must never wedge a publish). The `now` is monotonic seconds.
+///
+/// The wait is clamped **as an `f64` before** constructing the `Duration`: `try_acquire` is pure
+/// math (hb-net owns bounding the sleep, per the crate split) and can legitimately return an
+/// astronomically large wait for a degenerate limiter config — and `Duration::from_secs_f64`
+/// *panics* above ~1.8e19s. Clamping post-construction (Chorus codex + gemini) would never run.
+fn throttle_step(limiter: &Mutex<RelayRateLimiter>, now: f64) -> Option<Duration> {
+    match limiter.lock() {
+        Ok(mut lim) => lim
+            .try_acquire(now)
+            .map(|secs| Duration::from_secs_f64(secs.clamp(0.0, MAX_THROTTLE_SLEEP.as_secs_f64()))),
+        Err(_) => None,
     }
 }
 
@@ -315,6 +386,42 @@ mod tests {
         assert!(!pool_is_live(&[RelayStatus::Terminated]));
         assert!(!pool_is_live(&[RelayStatus::Terminated, RelayStatus::Banned]));
         assert!(!pool_is_live(&[]), "no relays = not live");
+    }
+
+    // ── The write governor wired into publish/publish_to (ban-avoidance pacing) ────────────────
+
+    #[test]
+    fn throttle_step_never_paces_a_full_burst() {
+        // The usability floor: an ordinary interactive write (and a small listing's handful of
+        // part events) drains the burst with zero sleep — throttle() returns without ever awaiting.
+        let lim = Mutex::new(RelayRateLimiter::new(hb_core::RELAY_WRITE_BURST, hb_core::RELAY_WRITE_REFILL_PER_SEC));
+        for i in 0..(hb_core::RELAY_WRITE_BURST as usize) {
+            assert!(throttle_step(&lim, 0.0).is_none(), "burst write {i} must not sleep");
+        }
+        // Only once the burst is spent does the loop ask for a sleep (a large-collection flood).
+        assert!(throttle_step(&lim, 0.0).is_some(), "past the burst, pacing engages");
+    }
+
+    #[test]
+    fn throttle_step_caps_a_pathological_wait() {
+        // A tiny refill would ask for a 10s single wait; the loop caps each sleep so it re-checks the
+        // bucket promptly rather than sleeping an implausibly long time on one iteration.
+        let lim = Mutex::new(RelayRateLimiter::new(1.0, 0.1));
+        assert!(throttle_step(&lim, 0.0).is_none(), "the one burst token passes");
+        let sleep = throttle_step(&lim, 0.0).expect("now empty → must pace");
+        assert!(sleep <= MAX_THROTTLE_SLEEP, "each sleep is clamped to the cap, got {sleep:?}");
+    }
+
+    #[test]
+    fn throttle_step_does_not_panic_on_an_astronomical_wait() {
+        // Chorus (codex + gemini): a degenerate config makes `try_acquire` return a wait far past
+        // `Duration::from_secs_f64`'s ~1.8e19s panic threshold (here ~1/f64::MIN_POSITIVE ≈ 4.5e307).
+        // Clamping the f64 *before* constructing the Duration must keep this a bounded sleep, not a
+        // panic. (Pre-fix this line panicked.)
+        let lim = Mutex::new(RelayRateLimiter::new(1.0, f64::MIN_POSITIVE));
+        assert!(throttle_step(&lim, 0.0).is_none(), "the one burst token passes");
+        let sleep = throttle_step(&lim, 0.0).expect("now empty → must pace");
+        assert_eq!(sleep, MAX_THROTTLE_SLEEP, "an astronomical wait clamps to the cap, no panic");
     }
 
     #[test]
