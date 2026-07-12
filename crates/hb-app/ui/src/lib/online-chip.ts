@@ -24,7 +24,8 @@ export function onlineChipView(count: OnlineCount | null, showSetting: boolean):
 	}
 	if (!count || count.online === null || count.online === undefined) {
 		// m4: unknown — a dash, not a fake zero.
-		return { show: true, label: '🟢 – online', unknown: true };
+		return { show: true, label: '🟢 – on network', unknown: true };
 	}
-	return { show: true, label: `🟢 ${count.online} online`, unknown: false };
+	// M15 W7: "on network" (not "online") so it reads distinctly from the contacts-online count.
+	return { show: true, label: `🟢 ${count.online} on network`, unknown: false };
 }

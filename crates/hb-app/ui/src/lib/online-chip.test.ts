@@ -26,7 +26,7 @@ describe('online chip — relay-derived count (M9)', () => {
 		expect(v.show).toBe(true);
 		expect(v.unknown).toBe(true);
 		expect(v.label).toContain('–');
-		expect(v.label).not.toContain('0 online');
+		expect(v.label).not.toContain('0 on network');
 	});
 
 	it('m4 — a missing count object also falls back to the dash', () => {
@@ -39,6 +39,6 @@ describe('online chip — relay-derived count (M9)', () => {
 	it('a genuine zero count renders 0 honestly (not the unknown dash)', () => {
 		const v = onlineChipView(count(0), true);
 		expect(v.unknown).toBe(false);
-		expect(v.label).toContain('0 online');
+		expect(v.label).toContain('0 on network');
 	});
 });

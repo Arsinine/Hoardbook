@@ -70,10 +70,18 @@
 			} catch { }
 		}, NAV_POLL_VISIBLE_MS);
 
+		// devtest #2: suppress the default webview right-click menu (Reload / Inspect Element etc.) —
+		// this is a desktop app, not a web page. The app's own custom menus (e.g. the Browse file
+		// row menu) call preventDefault + draw their own UI, so they keep working; this only kills the
+		// native fallback. Paste still works via Ctrl+V.
+		const suppressContextMenu = (e: MouseEvent) => e.preventDefault();
+		document.addEventListener('contextmenu', suppressContextMenu);
+
 		return () => {
 			clearInterval(poll);
 			unlistenUpdate?.();
 			unlistenDm?.();
+			document.removeEventListener('contextmenu', suppressContextMenu);
 		};
 	});
 
@@ -300,7 +308,7 @@
 		position: fixed;
 		bottom: 16px;
 		right: 16px;
-		z-index: 9999;
+		z-index: var(--z-toast);
 		padding: 8px 14px;
 		border-radius: 8px;
 		font-size: 12.5px;

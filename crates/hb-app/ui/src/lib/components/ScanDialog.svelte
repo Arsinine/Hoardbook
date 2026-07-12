@@ -5,6 +5,7 @@
 	import { icons } from '$lib/icons.js';
 	import { serializeInclude, selectAllTopLevel } from '../scan-tree.js';
 	import ScanTreeNode from './ScanTreeNode.svelte';
+	import Modal from './Modal.svelte';
 	import type { Collection, SubdirEntry } from '../types.js';
 
 	interface Props {
@@ -130,15 +131,8 @@
 	let selectedCount = $derived(checked.size);
 </script>
 
-{#if open}
-	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div
-		class="backdrop"
-		onclick={(e) => { if (e.target === e.currentTarget) close(); }}
-		onkeydown={(e) => e.key === 'Escape' && close()}
-		role="presentation"
-	>
-		<div class="modal">
+<Modal open={open} width="440px" padding="0" onclose={close}>
+	<div class="scan-frame">
 			<!-- Header -->
 			<div class="modal-header">
 				<div class="modal-title">{title}</div>
@@ -238,31 +232,13 @@
 					</button>
 				</div>
 			</div>
-		</div>
 	</div>
-{/if}
+</Modal>
 
 <style>
-	.backdrop {
-		position: fixed;
-		inset: 0;
-		background: oklch(0.10 0.005 260 / 0.7);
-		backdrop-filter: blur(4px);
-		z-index: 100;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		padding: 30px;
-	}
-
-	.modal {
-		width: 440px;
-		background: var(--bg-elev2);
-		border: 1px solid var(--border);
-		border-radius: 10px;
-		box-shadow: 0 30px 80px -20px oklch(0 0 0 / 0.7), 0 0 0 1px oklch(1 0 0 / 0.06);
-		overflow: hidden;
-	}
+	/* M15 W2: backdrop/card come from Modal.svelte (padding=0); this frame keeps the header/body/
+	   footer chrome with the rounded, clipped corners the header border relies on. */
+	.scan-frame { border-radius: 10px; overflow: hidden; }
 
 	.modal-header {
 		padding: 16px 20px;
@@ -396,31 +372,5 @@
 	.tree-error { color: var(--danger, #e5484d); }
 
 	/* Buttons */
-	.btn-primary {
-		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-		padding: 8px 14px; font-family: var(--font-ui); font-size: 13px; font-weight: 600;
-		color: var(--accent-text); background: var(--accent);
-		border: 1px solid var(--accent); border-radius: 7px;
-		cursor: pointer; white-space: nowrap; user-select: none; line-height: 1;
-	}
-
-	.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
-
-	.btn-default {
-		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-		padding: 8px 14px; font-family: var(--font-ui); font-size: 13px; font-weight: 500;
-		color: var(--fg); background: transparent;
-		border: 1px solid var(--border-strong); border-radius: 7px;
-		cursor: pointer; white-space: nowrap; user-select: none; line-height: 1;
-	}
-
-	.btn-ghost {
-		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-		padding: 8px 14px; font-family: var(--font-ui); font-size: 13px; font-weight: 500;
-		color: var(--fg-muted); background: transparent;
-		border: 1px solid transparent; border-radius: 7px;
-		cursor: pointer; white-space: nowrap; user-select: none; line-height: 1;
-	}
-
-	.btn-sm { padding: 5px 11px; font-size: 12px; }
+	/* M15 W1: buttons unified on the app.css .btn system (local copies removed). */
 </style>

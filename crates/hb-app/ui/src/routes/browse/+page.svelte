@@ -1,9 +1,11 @@
 <script lang="ts">
 	import { contacts } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
+	import { refreshContact } from '$lib/api.js';
+	import { page } from '$app/stores';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
-	import { collectionAvailability, peerAccessBadge } from '$lib/browse-view.js';
+	import { collectionAvailability, peerAccessBadge, peerFromQuery } from '$lib/browse-view.js';
 	import type { CachedPeer, Collection, DirectoryItem } from '$lib/types.js';
 
 	type BcItem =
@@ -15,6 +17,9 @@
 	let selectedPeer = $state<CachedPeer | null>(null);
 	let selectedCollection = $state<Collection | null>(null);
 	let folderStack: { name: string; items: DirectoryItem[] }[] = $state([]);
+	// devtest #3/#4: a keyed contact's collections are cached at add-time; a flaky fetch then leaves
+	// them empty forever, so browsing shows nothing. Re-pull live when the peer is selected.
+	let loadingListings = $state(false);
 
 	function peerName(peer: CachedPeer): string {
 		// A legacy/adversarial teaser can carry display_name: "" (R1 only guards publish) — `??` would
@@ -26,11 +31,41 @@
 		return (peer.profile?.display_name?.[0] ?? peer.npub[0]).toUpperCase();
 	}
 
-	function selectPeer(peer: CachedPeer) {
+	async function selectPeer(peer: CachedPeer) {
 		selectedPeer = peer;
 		selectedCollection = null;
 		folderStack = [];
+		// devtest #3/#4: for a keyed contact, re-fetch listings live so a browse-key that arrived
+		// after (or a listing fetch that hiccuped at) add-time actually surfaces their collections.
+		// Bare (keyless) contacts have nothing to fetch — skip. Cached view stays if the fetch fails.
+		if (!peer.browse_key_hex) return;
+		loadingListings = true;
+		try {
+			const updated = await refreshContact(peer.npub);
+			contacts.update(cs => cs.map(c => c.npub === updated.npub ? { ...updated, local_tags: c.local_tags } : c));
+			// Only replace the view if the user hasn't navigated to a different peer meanwhile.
+			if (selectedPeer?.npub === updated.npub) selectedPeer = updated;
+		} catch {
+			/* keep the cached view — offline / relay hiccup shouldn't blank the panel */
+		} finally {
+			loadingListings = false;
+		}
 	}
+
+	// M15 W4: resolve a `/browse?peer=<npub>` deep-link (from the Contacts "Browse" button) THROUGH
+	// selectPeer, so the keyed-contact live-refetch (devtest #3/#4) fires by construction. Guarded so
+	// it runs once per distinct param (and waits for contacts to load — peerFromQuery returns null
+	// until the match exists).
+	let lastDeepLinked = '';
+	$effect(() => {
+		const npub = $page.url.searchParams.get('peer') ?? '';
+		if (!npub || npub === lastDeepLinked) return;
+		const peer = peerFromQuery($page.url.searchParams, $contacts);
+		if (peer) {
+			lastDeepLinked = npub;
+			selectPeer(peer);
+		}
+	});
 
 	function selectCollection(col: Collection) {
 		selectedCollection = col;
@@ -197,7 +232,12 @@
 
 			<!-- Collections grid -->
 			{#if !selectedCollection}
-				{#if listingsLocked}
+				{#if loadingListings && selectedPeer.collections.length === 0}
+					<div class="empty-state">
+						<div class="empty-icon">{@html icons.folder}</div>
+						<div class="empty-label">Loading collections…</div>
+					</div>
+				{:else if listingsLocked}
 					<div class="empty-state">
 						<div class="empty-icon">{@html icons.folder}</div>
 						<div class="empty-label">
@@ -754,12 +794,12 @@
 	.ctx-backdrop {
 		position: fixed;
 		inset: 0;
-		z-index: 999;
+		z-index: var(--z-menu);
 	}
 
 	.ctx-menu {
 		position: fixed;
-		z-index: 1000;
+		z-index: var(--z-menu);
 		min-width: 160px;
 		background: var(--bg-elev3);
 		border: 1px solid var(--border-strong);

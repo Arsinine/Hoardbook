@@ -6,6 +6,7 @@ import {
 	flattenTree,
 	parseEstSize,
 	peerAccessBadge,
+	peerFromQuery,
 	summarizeCollectionsSize,
 	type RenderedListing,
 	type SearchHit,
@@ -163,5 +164,22 @@ describe('browse-view — summarizeCollectionsSize (devtest #7)', () => {
 		expect(summarizeCollectionsSize([{ est_size: '1.0 GB' }, { est_size: 'lots' }])).toBe(
 			'~1.0 GB across 2 collections',
 		);
+	});
+});
+
+describe('peerFromQuery — M15 W4 browse deep-link', () => {
+	const contacts = [{ npub: 'npub_a' }, { npub: 'npub_b' }];
+
+	it('resolves a ?peer= param to the matching contact', () => {
+		const p = peerFromQuery(new URLSearchParams('peer=npub_b'), contacts);
+		expect(p?.npub).toBe('npub_b');
+	});
+
+	it('is null for an absent param', () => {
+		expect(peerFromQuery(new URLSearchParams(''), contacts)).toBeNull();
+	});
+
+	it('is null for an unknown npub (degrades to the empty state)', () => {
+		expect(peerFromQuery(new URLSearchParams('peer=npub_z'), contacts)).toBeNull();
 	});
 });

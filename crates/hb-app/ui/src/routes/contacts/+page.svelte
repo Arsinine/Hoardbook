@@ -3,6 +3,7 @@
 	import { contacts, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
+	import OverflowMenu from '$lib/components/OverflowMenu.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import ConfirmButton from '$lib/components/ConfirmButton.svelte';
 	import CreateGroupDialog from '$lib/components/CreateGroupDialog.svelte';
@@ -137,16 +138,20 @@
 	let addContactOpen = $state(false);
 	let addContactDisplayName = $state('');
 	let addContactTarget: string | null = $state(null);
+	// The share code `follow` must re-resolve (full `hbk1…` for a lookup, npub for a discovery hit).
+	// Kept alongside the npub target so the browse-key isn't dropped in the funnel (devtest #3).
+	let addContactCode: string | null = $state(null);
 
-	function openAddContact(npub: string, displayName: string) {
+	function openAddContact(code: string, npub: string, displayName: string) {
+		addContactCode = code;
 		addContactTarget = npub;
 		addContactDisplayName = displayName;
 		addContactOpen = true;
 	}
 
-	async function completeFollow(npub: string, group: string | null, petname: string | undefined) {
+	async function completeFollow(code: string, npub: string, group: string | null, petname: string | undefined) {
 		try {
-			await follow(npub, group ?? undefined, petname);
+			await follow(code, group ?? undefined, petname);
 			try { contacts.set(await getContacts()); } catch { /* non-fatal */ }
 			await loadGroups();
 			toast(`Added ${petname || addContactDisplayName || npub.slice(0, 12) + '…'}`, 'success');
@@ -156,19 +161,23 @@
 	}
 
 	async function handleAddContactSave(detail: { petname: string; group: string | null }) {
-		if (!addContactTarget) return;
+		if (!addContactTarget || addContactCode === null) return;
 		const npub = addContactTarget;
+		const code = addContactCode;
 		addContactOpen = false;
 		addContactTarget = null;
-		await completeFollow(npub, detail.group, detail.petname);
+		addContactCode = null;
+		await completeFollow(code, npub, detail.group, detail.petname);
 	}
 
 	async function handleAddContactSkip() {
-		if (!addContactTarget) return;
+		if (!addContactTarget || addContactCode === null) return;
 		const npub = addContactTarget;
+		const code = addContactCode;
 		addContactOpen = false;
 		addContactTarget = null;
-		await completeFollow(npub, null, undefined);
+		addContactCode = null;
+		await completeFollow(code, npub, null, undefined);
 	}
 
 	// "+ Add contact" (devtest #17/#18 redesign) — the lookup-by-ID + §6 Discover surfaces now live
@@ -176,27 +185,20 @@
 	// points call back through `openAddContact`, same funnel as before.
 	let addContactPanelOpen = $state(false);
 
-	// Contacts list state
-	let expanded: string | null = $state(null);
+	// Contacts list state (M15 W5: chevron toggles the light-detail area; browsing a peer's
+	// collections moved to the Browse tab via the `/browse?peer=` deep-link — no inline expansion).
+	let detailExpanded: string | null = $state(null);
 	let refreshing: string | null = $state(null);
-	let autoRefreshing: string | null = $state(null);
+	let menuOpenFor: string | null = $state(null);
+	let menuAnchor: HTMLElement | undefined = $state();
 
-	async function handleExpand(peer: CachedPeer) {
-		const id = peer.npub;
-		if (expanded === id) {
-			expanded = null;
-			return;
-		}
-		expanded = id;
-		// Auto-refresh if the contact has no collections (might be stale cache).
-		if (peer.collections.length === 0 && autoRefreshing !== id) {
-			autoRefreshing = id;
-			try {
-				const updated = await refreshContact(id);
-				contacts.update(cs => cs.map(c => c.npub === id ? { ...c, ...updated, local_tags: c.local_tags } : c));
-			} catch { /* silent — don't nag if relay is unreachable */ }
-			finally { autoRefreshing = null; }
-		}
+	function toggleDetail(npub: string) {
+		detailExpanded = detailExpanded === npub ? null : npub;
+	}
+
+	function openRowMenu(npub: string, anchor: HTMLElement) {
+		menuAnchor = anchor;
+		menuOpenFor = npub;
 	}
 
 	async function handleRefresh(hb_id: string) {
@@ -341,8 +343,13 @@
 	{@const stale = isStale(peer) && !peer.online}
 	{@const badge = peerAccessBadge(peer)}
 	{@const sizeSummary = !badge.locked ? summarizeCollectionsSize(peer.collections) : null}
+	{@const isOpen = detailExpanded === peer.npub}
 	<div class="contact-block">
 		<div class="contact-card">
+			<!-- svelte-ignore a11y_click_events_have_key_events -->
+			<button class="chevron-btn" onclick={() => toggleDetail(peer.npub)} aria-expanded={isOpen} aria-label="Toggle details">
+				<span class="chevron" class:chevron-open={isOpen}>{@html icons.chevronDown}</span>
+			</button>
 			<Avatar letter={initial} size={34} {hue} picture={peer.profile?.picture} />
 			<div class="contact-info">
 				<div class="name-row">
@@ -356,22 +363,14 @@
 					{/if}
 					<span class="last-seen">seen {lastSeenLabel(peer)}</span>
 					<div style="flex:1"></div>
+					<a class="btn-default btn-xs" href="/browse?peer={peer.npub}">Browse</a>
 					<button
-						class="btn-ghost btn-xs btn-icon"
-						onclick={() => handleRefresh(peer.npub)}
-						disabled={refreshing === peer.npub}
-						title="Refresh"
-					>
-						<span>{@html icons.refresh}</span>
-					</button>
-					<ConfirmButton
-						label="Remove contact"
-						confirmText="Remove this contact?"
-						onconfirm={() => handleUnfollow(peer.npub)}
-					/>
-					<button class="btn-default btn-xs" onclick={() => handleExpand(peer)}>
-						{expanded === peer.npub ? 'Hide' : 'Browse'}
-					</button>
+						class="row-menu-btn"
+						aria-label="Contact actions"
+						aria-haspopup="true"
+						aria-expanded={menuOpenFor === peer.npub}
+						onclick={(e) => openRowMenu(peer.npub, e.currentTarget)}
+					>⋯</button>
 				</div>
 				<div class="contact-sub-row">
 					<div class="mono">{shortId(peer.npub)}</div>
@@ -386,7 +385,11 @@
 				{#if badge.locked}
 					<div class="access-hint">{badge.hint}</div>
 				{/if}
+			</div>
+		</div>
 
+		{#if isOpen}
+			<div class="contact-detail">
 				{#if peer.profile?.bio}
 					<p class="card-bio">{peer.profile.bio}</p>
 				{/if}
@@ -458,26 +461,9 @@
 						<button class="tag-add-btn" onclick={() => { editingTagsFor = peer.npub; tagInput = ''; }}>+ tag</button>
 					{/if}
 				</div>
-			</div>
-		</div>
 
-		{#if expanded === peer.npub}
-			<div class="collections-indent">
-				{#if peer.profile?.bio}
-					<p class="contact-bio">{peer.profile.bio}</p>
-				{/if}
-				{#if autoRefreshing === peer.npub}
-					<p class="no-coll">Checking for collections…</p>
-				{:else if peer.collections.length === 0}
-					<p class="no-coll">No collections published.</p>
-				{:else}
-					{#each peer.collections as col}
-						<CollectionPanel collection={col} />
-					{/each}
-				{/if}
-
-				<!-- Private collections this peer has sealed to me (M10). Absent (not
-				     "locked") for a non-trusted viewer — nothing to show, no hint. -->
+				<!-- Private collections sealed to me (M10) — not served by the Browse deep-link, so
+				     they stay here in the detail area. Absent (not "locked") for a non-trusted viewer. -->
 				{#if (privateByAuthor[peer.npub] ?? []).length > 0}
 					<div class="private-section">
 						<div class="section-label">Private collections <span class="private-badge">trusted</span></div>
@@ -490,12 +476,24 @@
 			</div>
 		{/if}
 	</div>
+
+	<!-- M15 W5: per-row overflow menu (only one open at a time via menuOpenFor). -->
+	<OverflowMenu open={menuOpenFor === peer.npub} anchor={menuAnchor} onclose={() => (menuOpenFor = null)}>
+		<button class="menu-item" onclick={() => { handleRefresh(peer.npub); menuOpenFor = null; }} disabled={refreshing === peer.npub}>
+			{refreshing === peer.npub ? 'Refreshing…' : 'Refresh'}
+		</button>
+		<button class="menu-item" onclick={() => { detailExpanded = peer.npub; contactGroupEditing = { ...contactGroupEditing, [peer.npub]: true }; menuOpenFor = null; }}>Edit groups…</button>
+		<button class="menu-item" onclick={() => { detailExpanded = peer.npub; editingTagsFor = peer.npub; tagInput = ''; menuOpenFor = null; }}>Edit tags…</button>
+		<div class="menu-item menu-item-confirm">
+			<ConfirmButton label="Remove contact" confirmText="Remove this contact?" onconfirm={() => { handleUnfollow(peer.npub); menuOpenFor = null; }} />
+		</div>
+	</OverflowMenu>
 {/snippet}
 
 <div class="phonebook">
 	<div class="phonebook-scroll">
 		{#if $contacts.length === 0}
-			<div class="empty">No contacts yet. Look up a peer above and add them.</div>
+			<div class="empty">No contacts yet. Use “+ Add contact” to find someone by ID or discover hoarders.</div>
 		{:else}
 			{#if view === 'groups'}
 				<!-- Trusted groups (M10): mark a group trusted to seal Private collections to its members.
@@ -739,6 +737,29 @@
 		align-items: flex-start;
 	}
 
+	/* M15 W5: chevron toggles the light-detail area; ⋯ opens the row menu. */
+	.chevron-btn {
+		background: transparent; border: none; cursor: pointer; padding: 2px;
+		display: flex; align-items: center; color: var(--fg-muted); flex-shrink: 0; margin-top: 5px;
+	}
+	.chevron { display: flex; transition: transform 0.15s; }
+	.chevron-open { transform: rotate(180deg); }
+	.row-menu-btn {
+		width: 26px; height: 26px; flex-shrink: 0;
+		display: flex; align-items: center; justify-content: center;
+		background: transparent; border: 1px solid transparent; border-radius: 6px;
+		color: var(--fg-muted); font-size: 15px; line-height: 1; cursor: pointer;
+	}
+	.row-menu-btn:hover { background: var(--bg-elev3); border-color: var(--border); color: var(--fg); }
+	.menu-item {
+		display: flex; align-items: center; width: 100%; text-align: left;
+		padding: 7px 10px; font-family: var(--font-ui); font-size: 12.5px; color: var(--fg);
+		background: transparent; border: none; border-radius: 5px; cursor: pointer;
+	}
+	.menu-item:hover:not(:disabled) { background: var(--bg-elev3); }
+	.menu-item:disabled { opacity: 0.6; cursor: default; }
+	.menu-item-confirm { padding: 3px 6px; }
+
 	.contact-info { flex: 1; min-width: 0; }
 
 	.name-row { display: flex; gap: 8px; align-items: center; margin-bottom: 3px; flex-wrap: wrap; }
@@ -780,28 +801,7 @@
 		background: color-mix(in oklch, var(--accent) 12%, transparent);
 	}
 
-	/* Modal */
-	.modal-overlay {
-		position: fixed; inset: 0;
-		background: oklch(0 0 0 / 0.6);
-		display: flex; align-items: center; justify-content: center;
-		z-index: 9000;
-	}
-	.modal {
-		background: var(--bg-elev2);
-		border: 1px solid var(--border-strong);
-		border-radius: 12px;
-		padding: 22px;
-		max-width: 400px;
-		width: calc(100vw - 48px);
-		box-shadow: 0 20px 60px oklch(0 0 0 / 0.5);
-	}
-	.modal-title {
-		font-size: 15px; font-weight: 600; color: var(--fg);
-		margin-bottom: 10px; display: flex; gap: 8px; align-items: center;
-	}
-	.modal-body { font-size: 13px; color: var(--fg-muted); line-height: 1.55; margin: 0 0 18px; }
-	.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+	/* M15 W7: removed the dead .modal-* block (unreferenced — grep-confirmed). */
 
 	/* Tag filter bar */
 	.tag-filter-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; padding: 0 24px; }
@@ -837,11 +837,7 @@
 		min-width: 60px; font-family: var(--font-ui);
 	}
 
-	.collections-indent { padding-left: 56px; display: flex; flex-direction: column; gap: 8px; }
-
-	.no-coll { font-size: 12px; color: var(--fg-dim); }
-
-	.contact-bio { font-size: 12.5px; color: var(--fg-muted); line-height: 1.55; margin: 0 0 6px; }
+	.contact-detail { padding-left: 56px; padding-bottom: 4px; display: flex; flex-direction: column; gap: 8px; }
 
 	/* Pills */
 	.pill {
@@ -883,31 +879,5 @@
 	}
 	.group-select-inline { height: 22px; font-size: 11px; }
 
-	/* Buttons */
-	.btn-primary {
-		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-		padding: 8px 14px; font-family: var(--font-ui); font-size: 13px; font-weight: 600;
-		color: var(--accent-text); background: var(--accent);
-		border: 1px solid var(--accent); border-radius: 7px;
-		cursor: pointer; white-space: nowrap; user-select: none; line-height: 1;
-	}
-	.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
-	.btn-default {
-		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-		padding: 8px 14px; font-family: var(--font-ui); font-size: 13px; font-weight: 500;
-		color: var(--fg); background: transparent;
-		border: 1px solid var(--border-strong); border-radius: 7px;
-		cursor: pointer; white-space: nowrap; user-select: none; line-height: 1;
-	}
-	.btn-ghost {
-		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-		padding: 8px 14px; font-family: var(--font-ui); font-size: 13px; font-weight: 500;
-		color: var(--fg-muted); background: transparent;
-		border: 1px solid transparent; border-radius: 7px;
-		cursor: pointer; white-space: nowrap; user-select: none; line-height: 1;
-	}
-	.btn-ghost:disabled { opacity: 0.5; cursor: not-allowed; }
-	.btn-sm { padding: 5px 11px; font-size: 12px; }
-	.btn-xs { padding: 3px 8px; font-size: 11px; height: 24px; }
-	.btn-icon { gap: 4px; }
+	/* M15 W1: buttons unified on the app.css .btn system (local copies removed). */
 </style>

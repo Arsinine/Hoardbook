@@ -25,12 +25,14 @@
 	import Avatar from '$lib/components/Avatar.svelte';
 	import AddContactDialog from '$lib/components/AddContactDialog.svelte';
 	import CreateGroupDialog from '$lib/components/CreateGroupDialog.svelte';
+	import Modal from '$lib/components/Modal.svelte';
 	import { DM_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
 	import { renderFingerprint } from '$lib/identity-display.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
 	import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER } from '$lib/request-inbox.js';
 	import { filterConversations, filterTopics, composeRecipientKind, isComposeToSelf } from '$lib/chat-filter.js';
-	import { sortChannelPostsAscending, resolveTopicParam } from '$lib/topics-view.js';
+	import { peerPreview, peersWithHistory, relativeTime } from '$lib/chat-preview.js';
+	import { sortChannelPostsAscending, resolveTopicParam, interleaveChannel } from '$lib/topics-view.js';
 	import { latestFromPeer, unreadByPeer } from '$lib/unread-view.js';
 	import type { CachedPeer, ReceivedMessage, TopicView, ChannelPost, AnnouncementView, DmRequestView, Group } from '$lib/types.js';
 
@@ -48,7 +50,9 @@
 	let topics: TopicView[] = $state([]);
 	let selectedTopic: TopicView | null = $state(null);
 	let channelPosts: ChannelPost[] = $state([]);
-	let channelAnnouncements: AnnouncementView[] = $state([]); // M13 Part A: rendered above the posts, read-only
+	let channelAnnouncements: AnnouncementView[] = $state([]); // M13 Part A: read-only member broadcasts
+	// devtest #6: announcements are interleaved with posts by timestamp (not pinned above).
+	let channelItems = $derived(interleaveChannel(channelPosts, channelAnnouncements));
 	let channelDraft = $state('');
 	let channelSending = $state(false);
 
@@ -216,14 +220,8 @@
 	}
 
 	// M13 Part B (Q7): the conversation list is contacts ONLY — a stranger's DM no longer merges in
-	// here at all (the request pane, above, replaces the old inboxOnlyPeers merge).
-	function latestMessageTime(hb_id: string): string {
-		const msgs = $inboxMessages.filter(m => m.from === hb_id || m.to === hb_id);
-		if (msgs.length === 0) return '';
-		return msgs.reduce((latest, m) => m.sent_at > latest ? m.sent_at : latest, '');
-	}
-
-
+	// here at all (the request pane, above, replaces the old inboxOnlyPeers merge). M15 W6 replaced
+	// the inline latestMessageTime with chat-preview.ts's peerPreview (time + text in one pass).
 
 
 	// Cache of display_name for npubs not in $contacts (Request-bucket senders). Populated lazily by
@@ -421,14 +419,19 @@
 	let sortedRequests = $derived(sortRequests($dmRequests));
 	let requestCount = $derived(requestBadge($dmRequests));
 	let myId = $derived($identity?.npub ?? '');
-	let allConversationPeers = $derived([...$contacts].sort((a, b) => {
-		const aT = latestMessageTime(a.npub);
-		const bT = latestMessageTime(b.npub);
-		if (!aT && !bT) return 0;
-		if (!aT) return 1;
-		if (!bT) return -1;
-		return bT.localeCompare(aT); // newest first
-	}));
+	// M15 W6: only contacts with actual DM history appear in the list (messageless contacts are
+	// reachable via compose + the Contacts tab; the pane still renders from selectedPeer, and a new
+	// thread's row appears after the first send). Sorted newest-first by the latest message's ISO time.
+	let historyPeers = $derived(peersWithHistory($inboxMessages, $sentMessages));
+	let allConversationPeers = $derived([...$contacts]
+		.filter((c) => historyPeers.has(c.npub))
+		.sort((a, b) => {
+			// Sort by parsed ms (not string compare) so a non-UTC-offset timestamp can't misorder the
+			// list (chorus catch — removes the "backend always emits UTC-Z" assumption).
+			const aT = new Date(peerPreview($inboxMessages, $sentMessages, a.npub)?.time ?? 0).getTime();
+			const bT = new Date(peerPreview($inboxMessages, $sentMessages, b.npub)?.time ?? 0).getTime();
+			return bT - aT; // newest first
+		}));
 	// Wires the search box (devtest copy audit — it was dead): filters the visible rows only, never
 	// the underlying stores.
 	let visiblePeers = $derived(filterConversations(allConversationPeers, searchQuery, senderName));
@@ -515,13 +518,16 @@
 						{@const hue = avatarHue(initial)}
 						{@const unread = unreadCounts[peer.npub] ?? 0}
 						{@const active = selectedPeer?.npub === peer.npub}
+						{@const preview = peerPreview($inboxMessages, $sentMessages, peer.npub)}
 						<button class="convo-item" class:convo-active={active} onclick={() => selectPeer(peer)}>
 							<Avatar letter={initial} size={34} {hue} picture={peer.profile?.picture} />
 							<div class="convo-info">
 								<div class="convo-row">
 									<span class="convo-name" class:convo-name-active={active}>{name}</span>
+									{#if preview}<span class="convo-time">{relativeTime(preview.time, new Date())}</span>{/if}
 								</div>
 								<div class="convo-preview-row">
+									{#if preview}<span class="convo-preview-text">{preview.text}</span>{/if}
 									{#if unread > 0}
 										<span class="unread-badge">{unread}</span>
 									{/if}
@@ -550,28 +556,29 @@
 				</div>
 
 				<div class="thread" bind:this={threadEl}>
-					{#each channelAnnouncements as a (a.author_npub + '|' + a.ts)}
-						<div class="announce-banner">
-							<span class="announce-icon">📣</span>
-							<div class="announce-body">
-								<span class="announce-author">{senderName(a.author_npub)}</span>
-								<p class="announce-text">{a.body}</p>
-								<span class="announce-time">{formatTime(new Date(a.ts * 1000).toISOString())}</span>
-							</div>
-						</div>
-					{/each}
-					{#if channelPosts.length === 0}
+					{#if channelItems.length === 0}
 						<p class="thread-empty">No posts in the last 24h. Say something!</p>
 					{:else}
-						{#each channelPosts as p (p.author_npub + '|' + p.ts)}
-							{@const isMe = p.author_npub === myId}
-							<div class="bubble-wrap" class:bubble-me={isMe}>
-								<div class="bubble" class:bubble-sent={isMe} class:bubble-recv={!isMe}>
-									{#if !isMe}<span class="bubble-author">{senderName(p.author_npub)}</span>{/if}
-									<p class="bubble-text">{p.body}</p>
-									<span class="bubble-time">{formatTime(new Date(p.ts * 1000).toISOString())}</span>
+						{#each channelItems as item (item.kind + '|' + (item.kind === 'post' ? item.post.author_npub + '|' + item.post.ts : item.announce.author_npub + '|' + item.announce.ts))}
+							{#if item.kind === 'announce'}
+								<div class="announce-banner">
+									<span class="announce-icon">📣</span>
+									<div class="announce-body">
+										<span class="announce-author">{senderName(item.announce.author_npub)}</span>
+										<p class="announce-text">{item.announce.body}</p>
+										<span class="announce-time">{formatTime(new Date(item.announce.ts * 1000).toISOString())}</span>
+									</div>
 								</div>
-							</div>
+							{:else}
+								{@const isMe = item.post.author_npub === myId}
+								<div class="bubble-wrap" class:bubble-me={isMe}>
+									<div class="bubble" class:bubble-sent={isMe} class:bubble-recv={!isMe}>
+										{#if !isMe}<span class="bubble-author">{senderName(item.post.author_npub)}</span>{/if}
+										<p class="bubble-text">{item.post.body}</p>
+										<span class="bubble-time">{formatTime(new Date(item.post.ts * 1000).toISOString())}</span>
+									</div>
+								</div>
+							{/if}
 						{/each}
 					{/if}
 				</div>
@@ -689,13 +696,10 @@
 						</div>
 						<span class="mono">{shortId(selectedPeer.npub)}</span>
 					</div>
+					<!-- M15 W6: the always-on E2E banner is consolidated into this header shield (hover) +
+					     the empty-thread note; the offline/not-a-contact banners stay (contextual). -->
+					<span class="e2e-shield" title="End-to-end encrypted — relays see only that someone messaged this person, never the content or the sender.">{@html icons.shield}</span>
 					<button class="btn-ghost btn-sm" onclick={() => { if (selectedPeer) viewProfile(selectedPeer); }}>View profile</button>
-				</div>
-
-				<!-- Privacy banner (§9: NIP-17 gift-wrap — E2E encrypted, sender hidden from relays) -->
-				<div class="privacy-banner">
-					<span class="privacy-icon">{@html icons.shield}</span>
-					<span>End-to-end encrypted. Relays see only that someone messaged this person — never the content or the sender.</span>
 				</div>
 
 				<!-- Offline notice -->
@@ -779,27 +783,23 @@
 <CreateGroupDialog open={createGroupOpen} oncreate={handleCreateGroup} oncancel={() => (createGroupOpen = false)} />
 
 <!-- Compose-to-npub (spec §9 first-contact deep link) — a + icon-btn beside refresh opens this. -->
-{#if composeOpen}
-	<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
-	<div class="modal-backdrop" role="dialog" aria-modal="true" aria-label="New message" tabindex="-1" onclick={(e) => { if (e.target === e.currentTarget) composeOpen = false; }}>
-		<div class="modal">
-			<h2>New message</h2>
-			<input placeholder="npub or hbk share code…" bind:value={composeTo} />
-			{#if composeTo.trim() && isComposeToSelf(composeTo, $identity?.npub ?? '', $identity?.share_code ?? '')}
-				<div class="compose-hint">That's your own ID.</div>
-			{:else if composeTo.trim() && composeRecipientKind(composeTo) === 'invalid'}
-				<div class="compose-hint">Doesn't look like an npub or share code — sending will reject it if it's wrong.</div>
-			{/if}
-			<textarea class="compose-modal-input" placeholder="Message…" bind:value={composeBody} rows="3"></textarea>
-			<div class="modal-actions">
-				<button class="ghost" onclick={() => (composeOpen = false)}>Cancel</button>
-				<button class="btn-primary" disabled={!composeTo.trim() || !composeBody.trim() || composeSending || isComposeToSelf(composeTo, $identity?.npub ?? '', $identity?.share_code ?? '')} onclick={handleComposeSend}>
-					{composeSending ? '…' : 'Send'}
-				</button>
-			</div>
-		</div>
+<Modal open={composeOpen} title="New message" onclose={() => (composeOpen = false)}>
+	<div class="compose-fields">
+		<input placeholder="npub or hbk share code…" bind:value={composeTo} />
+		{#if composeTo.trim() && isComposeToSelf(composeTo, $identity?.npub ?? '', $identity?.share_code ?? '')}
+			<div class="compose-hint">That's your own ID.</div>
+		{:else if composeTo.trim() && composeRecipientKind(composeTo) === 'invalid'}
+			<div class="compose-hint">Doesn't look like an npub or share code — sending will reject it if it's wrong.</div>
+		{/if}
+		<textarea class="compose-modal-input" placeholder="Message…" bind:value={composeBody} rows="3"></textarea>
 	</div>
-{/if}
+	{#snippet actions()}
+		<button class="btn-ghost" onclick={() => (composeOpen = false)}>Cancel</button>
+		<button class="btn-primary" disabled={!composeTo.trim() || !composeBody.trim() || composeSending || isComposeToSelf(composeTo, $identity?.npub ?? '', $identity?.share_code ?? '')} onclick={handleComposeSend}>
+			{composeSending ? '…' : 'Send'}
+		</button>
+	{/snippet}
+</Modal>
 
 <style>
 	.no-identity {
@@ -875,14 +875,7 @@
 
 	.convo-empty { padding: 12px; font-size: 12px; color: var(--fg-dim); }
 
-	.convo-divider {
-		padding: 10px 12px 4px;
-		font-size: 10px;
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 1px;
-		color: var(--fg-dim);
-	}
+	/* M15 W7: removed the dead .convo-divider rule (unreferenced). */
 
 	.convo-item {
 		width: 100%;
@@ -936,6 +929,9 @@
 	.bubble-author { display: block; font-size: 10.5px; font-weight: 600; color: var(--accent); margin-bottom: 2px; }
 
 	.convo-preview-row { display: flex; align-items: center; margin-top: 2px; gap: 4px; }
+	/* M15 W6: last-message preview + relative time in the conversation list. */
+	.convo-time { font-size: 10.5px; color: var(--fg-dim); flex-shrink: 0; font-feature-settings: 'tnum'; }
+	.convo-preview-text { font-size: 11.5px; color: var(--fg-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 
 	.unread-badge {
 		font-size: 10px;
@@ -988,18 +984,9 @@
 
 	.mono { font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); }
 
-	.privacy-banner {
-		padding: 8px 18px;
-		background: var(--accent-soft);
-		border-bottom: 1px solid var(--border);
-		font-size: 11.5px;
-		color: var(--fg);
-		display: flex;
-		gap: 8px;
-		align-items: center;
-	}
-
-	.privacy-icon { color: var(--accent); display: flex; }
+	/* M15 W6: always-on privacy banner replaced by this subtle header shield (hover) + empty-thread note. */
+	.e2e-shield { color: var(--accent); display: flex; margin-left: 4px; cursor: help; flex-shrink: 0; }
+	.e2e-shield :global(svg) { width: 15px; height: 15px; }
 
 	.offline-banner {
 		padding: 7px 18px;
@@ -1128,26 +1115,8 @@
 		border: 1px solid color-mix(in oklch, var(--fg-muted) 20%, transparent);
 	}
 
-	/* Buttons */
-	.btn-primary {
-		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-		padding: 8px 14px; font-family: var(--font-ui); font-size: 13px; font-weight: 600;
-		color: var(--accent-text); background: var(--accent);
-		border: 1px solid var(--accent); border-radius: 7px;
-		cursor: pointer; white-space: nowrap; user-select: none; line-height: 1;
-	}
-	.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
-	.btn-ghost {
-		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-		padding: 8px 14px; font-family: var(--font-ui); font-size: 13px; font-weight: 500;
-		color: var(--fg-muted); background: transparent;
-		border: 1px solid transparent; border-radius: 7px;
-		cursor: pointer; white-space: nowrap; user-select: none; line-height: 1;
-	}
-	.btn-sm { padding: 5px 11px; font-size: 12px; }
-	.btn-icon { gap: 5px; }
-	.btn-danger { color: oklch(0.7 0.18 25); }
-	.btn-danger:hover { color: oklch(0.75 0.2 25); }
+	/* M15 W1: buttons unified on the app.css .btn system (local copies removed; .btn-send stays,
+	   it's a chat-specific composer button not in the shared vocabulary). */
 
 	/* Topic announcements (M13 Part A) — a highlighted, read-only broadcast above the ordinary posts. */
 	.announce-banner {
@@ -1212,27 +1181,10 @@
 		resize: none;
 		box-sizing: border-box;
 	}
-	.modal-backdrop {
-		position: fixed; inset: 0; z-index: 9998;
-		background: oklch(0 0 0 / 0.45);
-		display: flex; align-items: center; justify-content: center;
-	}
-	.modal {
-		background: var(--bg-elev1);
-		border: 1px solid var(--border-strong);
-		border-radius: 12px;
-		padding: 18px;
-		width: min(440px, 90vw);
-		display: flex; flex-direction: column; gap: 8px;
-	}
-	.modal h2 { font-size: 14px; font-weight: 700; margin: 0 0 6px; }
-	.modal input {
+	/* M15 W2: compose modal now uses Modal.svelte; only the field layout + input styling are local. */
+	.compose-fields { display: flex; flex-direction: column; gap: 8px; }
+	.compose-fields input {
 		padding: 6px 9px; background: var(--bg-elev2); color: var(--fg);
 		border: 1px solid var(--border); border-radius: 6px; font: inherit;
 	}
-	.modal .ghost {
-		padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
-		background: transparent; color: var(--fg); font: inherit; cursor: pointer;
-	}
-	.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
 </style>
