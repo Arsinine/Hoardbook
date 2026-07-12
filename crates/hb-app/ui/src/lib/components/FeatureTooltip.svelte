@@ -94,7 +94,7 @@
 		position: absolute;
 		bottom: calc(100% + 6px);
 		left: 0;
-		z-index: 200;
+		z-index: var(--z-overlay);
 		width: max-content;
 		max-width: 280px;
 		display: flex;

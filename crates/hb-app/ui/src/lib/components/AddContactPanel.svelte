@@ -9,13 +9,17 @@
 	import { icons, avatarHue } from '../icons.js';
 	import Avatar from './Avatar.svelte';
 	import FeatureTooltip from './FeatureTooltip.svelte';
+	import Modal from './Modal.svelte';
 	import type { CachedPeer } from '../types.js';
 	import { renderFingerprint } from '../identity-display.js';
 	import { DISCOVER_CONTENT_TYPES, parseTagInput, canSearch, toggleContentType } from '../discover-view.js';
 
 	interface Props {
 		open?: boolean;
-		onadd?: (npub: string, displayName: string) => void;
+		// `code` is what `follow` must re-resolve — the full `hbk1…` share code (carrying the
+		// browse-key) for a lookup, or the bare npub for a discovery hit. Passing only the npub
+		// (as before) silently dropped the key and made every added contact keyless (devtest #3).
+		onadd?: (code: string, npub: string, displayName: string) => void;
 		onclose?: () => void;
 	}
 
@@ -24,9 +28,17 @@
 	// Lookup state
 	let input = $state('');
 	let loading = $state(false);
-	let result: CachedPeer | null = $state(null);
+	let result = $state<CachedPeer | null>(null);
+	// The exact string that produced `result` — threaded to `follow` so the browse-key survives the
+	// add (devtest #3). Captured at lookup time so a later edit to `input` can't desync it.
+	let lookedUpCode = $state('');
 
-	let alreadyFollowed = $derived($contacts.some((c) => c.npub === result?.npub));
+	let existingContact = $derived($contacts.find((c) => c.npub === result?.npub));
+	let alreadyFollowed = $derived(!!existingContact);
+	// devtest #4: a contact added by npub/discovery is keyless. Pasting their FULL share code later
+	// must be allowed to attach the browse-key (re-adding overwrites the stored contact) — otherwise
+	// the "Added"/disabled button dead-ends the upgrade and they stay permanently unbrowseable.
+	let canUnlock = $derived(!!result?.browse_key_hex && !!existingContact && !existingContact.browse_key_hex);
 
 	async function handleLookup() {
 		const id = input.trim();
@@ -40,6 +52,7 @@
 		result = null;
 		try {
 			result = await pasteKey(id);
+			lookedUpCode = id;
 		} catch (e) {
 			toast(String(e), 'error');
 		} finally {
@@ -49,7 +62,7 @@
 
 	function handleFollow() {
 		if (!result) return;
-		onadd?.(result.npub, result.profile?.display_name ?? '');
+		onadd?.(lookedUpCode, result.npub, result.profile?.display_name ?? '');
 	}
 
 	function handleKeydown(e: KeyboardEvent) {
@@ -83,7 +96,8 @@
 
 	function followHit(hit: PeerSearchHit) {
 		// bare npub only: awareness, NOT a browse-key (INV-2) — the dialog's Skip path preserves that.
-		onadd?.(hit.npub, hit.display_name);
+		// Discovery hits are teaser-only (DISC3) — no browse-key exists, so the code IS the npub.
+		onadd?.(hit.npub, hit.npub, hit.display_name);
 	}
 
 	function close() {
@@ -91,15 +105,13 @@
 	}
 </script>
 
-{#if open}
-	<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
-	<div class="acp-backdrop" role="dialog" aria-modal="true" aria-label="Add contact" tabindex="-1" onclick={(e) => { if (e.target === e.currentTarget) close(); }}>
-		<div class="acp-modal">
-			<div class="acp-modal-head">
-				<h2>Add contact</h2>
-				<button type="button" class="acp-close" aria-label="Close" onclick={close}>{@html icons.close}</button>
-			</div>
-			<div class="acp-body">
+<Modal open={open} width="520px" padding="0" onclose={close}>
+	<div class="acp-frame">
+		<div class="acp-modal-head">
+			<h2>Add contact</h2>
+			<button type="button" class="acp-close" aria-label="Close" onclick={close}>{@html icons.close}</button>
+		</div>
+		<div class="acp-body">
 				<!-- Lookup section -->
 				<div class="lookup-section">
 					<div class="lookup-label">Look up a peer by ID</div>
@@ -146,9 +158,9 @@
 											<button
 												class="btn-primary btn-sm"
 												onclick={handleFollow}
-												disabled={alreadyFollowed}
+												disabled={alreadyFollowed && !canUnlock}
 											>
-												{alreadyFollowed ? 'Added' : 'Add contact'}
+												{canUnlock ? 'Unlock browsing' : alreadyFollowed ? 'Added' : 'Add contact'}
 											</button>
 										</div>
 									</div>
@@ -254,26 +266,15 @@
 				</div>
 			</div>
 		</div>
-	</div>
-{/if}
+</Modal>
+<!-- /M15 W2: AddContactPanel now wraps its head+body in Modal.svelte -->
 
 <style>
-	/* Below AddContactDialog (9998) / CreateGroupDialog (9999) so both still stack above this panel
-	   when opened from within it. */
-	.acp-backdrop {
-		position: fixed; inset: 0; z-index: 9000;
-		background: oklch(0 0 0 / 0.55);
-		display: flex; align-items: center; justify-content: center;
-		padding: 24px;
-	}
-	.acp-modal {
-		background: var(--bg-elev1);
-		border: 1px solid var(--border-strong);
-		border-radius: 12px;
-		width: min(520px, 100%);
-		max-height: min(680px, 100%);
+	/* M15 W2: backdrop/card now come from Modal.svelte (base level; the petname + New-group dialogs
+	   are `stacked`, so they still sit above this panel). This frame just lays out head + body. */
+	.acp-frame {
 		display: flex; flex-direction: column;
-		box-shadow: 0 20px 60px oklch(0 0 0 / 0.5);
+		max-height: min(680px, calc(100vh - 60px));
 	}
 	.acp-modal-head {
 		display: flex; align-items: center; justify-content: space-between;
@@ -408,15 +409,7 @@
 	}
 
 	/* Buttons */
-	.btn-primary {
-		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-		padding: 8px 14px; font-family: var(--font-ui); font-size: 13px; font-weight: 600;
-		color: var(--accent-text); background: var(--accent);
-		border: 1px solid var(--accent); border-radius: 7px;
-		cursor: pointer; white-space: nowrap; user-select: none; line-height: 1;
-	}
-	.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
-	.btn-sm { padding: 5px 11px; font-size: 12px; }
+	/* M15 W1: buttons unified on the app.css .btn system (local copies removed). */
 
 	/* ── §6 Discover hoarders ───────────────────────────────────────────────────────────────── */
 	.discover-section {

@@ -2,7 +2,7 @@
 //! join gate (F12), the topic-contact badge, the spoofable member-count display, and the "joining
 //! unlocks no listings" note. No Svelte, no DOM, no Tauri → unit-testable in the node env.
 
-import type { CachedPeer, ContactSource, ChannelPost, TopicLookup } from './types.js';
+import type { CachedPeer, ContactSource, ChannelPost, AnnouncementView, TopicLookup } from './types.js';
 import { contactDisplayName } from './contact-display.js';
 
 /** Public-join consent: the visibility is the deal. Anyone who joins can see you are a member. */
@@ -68,6 +68,27 @@ export function createPrimaryAction(lookup: TopicLookup | null): PrimaryAction {
  *  path sorts ascending here. Stable on ties (equal `ts`) — does not reorder same-second posts. */
 export function sortChannelPostsAscending(posts: readonly ChannelPost[]): ChannelPost[] {
 	return [...posts].sort((a, b) => a.ts - b.ts);
+}
+
+/** A single row in the rendered channel: either an ordinary post or a 📣 announcement. */
+export type ChannelItem =
+	| { kind: 'post'; ts: number; post: ChannelPost }
+	| { kind: 'announce'; ts: number; announce: AnnouncementView };
+
+/** devtest #6 — merge announcements into the ordinary post stream ordered by timestamp (ascending),
+ *  instead of pinning them all above the posts. Announcements stay visually distinct at render (the
+ *  📣 banner); only their position changes, so a broadcast now sits where it happened in the
+ *  conversation. Stable: on an equal `ts` an announcement renders just before a post of the same
+ *  second (announcements are listed first, and Array.sort is stable). */
+export function interleaveChannel(
+	posts: readonly ChannelPost[],
+	announcements: readonly AnnouncementView[],
+): ChannelItem[] {
+	const items: ChannelItem[] = [
+		...announcements.map((a): ChannelItem => ({ kind: 'announce', ts: a.ts, announce: a })),
+		...posts.map((p): ChannelItem => ({ kind: 'post', ts: p.ts, post: p })),
+	];
+	return items.sort((a, b) => a.ts - b.ts);
 }
 
 /** devtest #15 — resolve a `?topic=<id>` deep-link param (from the Topics-page "Open in Chat" link)

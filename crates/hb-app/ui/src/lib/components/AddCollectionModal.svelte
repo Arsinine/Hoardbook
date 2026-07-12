@@ -4,6 +4,7 @@
 	// (pass `editCollection` to jump straight to step 2 for an already-scanned collection).
 	import ScanDialog from './ScanDialog.svelte';
 	import CollectionDetailsForm from './CollectionDetailsForm.svelte';
+	import Modal from './Modal.svelte';
 	import type { Collection } from '../types.js';
 
 	interface Props {
@@ -81,35 +82,9 @@
 	{#if step === 1}
 		<ScanDialog open={true} title="Add collection" onscanned={handleScanned} onclose={handleScanDialogClose} />
 	{:else if step === 2 && collection}
-		<!-- svelte-ignore a11y_no_static_element_interactions -->
-		<div class="backdrop" onclick={(e) => { if (e.target === e.currentTarget) close(); }} onkeydown={(e) => e.key === 'Escape' && close()} role="presentation">
-			<div class="modal">
-				<CollectionDetailsForm {collection} onsaved={handleSaved} onpublished={handlePublished} oncancel={close} />
-			</div>
-		</div>
+		<Modal open={true} width="460px" padding="0" onclose={close}>
+			<CollectionDetailsForm {collection} onsaved={handleSaved} onpublished={handlePublished} oncancel={close} />
+		</Modal>
 	{/if}
 {/if}
-
-<style>
-	.backdrop {
-		position: fixed;
-		inset: 0;
-		background: oklch(0.10 0.005 260 / 0.7);
-		backdrop-filter: blur(4px);
-		z-index: 100;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		padding: 30px;
-	}
-
-	.modal {
-		width: 460px;
-		max-width: calc(100vw - 40px);
-		background: var(--bg-elev2);
-		border: 1px solid var(--border);
-		border-radius: 10px;
-		box-shadow: 0 30px 80px -20px oklch(0 0 0 / 0.7), 0 0 0 1px oklch(1 0 0 / 0.06);
-		overflow: hidden;
-	}
-</style>
+<!-- M15 W2: step-1 uses ScanDialog (itself on Modal); step-2 wraps the details form in Modal. -->

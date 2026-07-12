@@ -192,6 +192,15 @@ async fn resolve_peer(
         if let Some(mut stale) = store.load_contact(&CachedPeer::pubkey_hash(&npub)).map_err(cmd_err)? {
             stale.online = online;
             stale.fingerprint = fingerprint;
+            // A full share code just handed us a browse-key — merge it even though the teaser fetch
+            // flaked (devtest #4: add-by-npub then paste the full code must not lose the key, or the
+            // contact stays permanently unbrowseable).
+            merge_browse_key(&mut stale, share_code);
+            // If the keyed listings fetch above still succeeded, prefer the fresh listings over the
+            // stale cache (devtest #3: a hiccup at add-time must not cache "empty" forever).
+            if !collections.is_empty() {
+                stale.collections = collections;
+            }
             return Ok(stale);
         }
     }
@@ -250,6 +259,17 @@ pub async fn paste_key(
     let peer = resolve_peer(&share_code, &me, &store, &relay).await?;
     reject_profileless(&peer)?;
     Ok(peer)
+}
+
+/// Merge a freshly-resolved share code's browse-key onto a stale cached contact (devtest #4): when
+/// the teaser fetch yields nothing we fall back to the cache, but a full share code just handed us a
+/// browse-key — dropping it would leave an npub-added contact permanently unbrowseable even after the
+/// user pastes the full code. A `FollowOnly`/bare code carries no key and leaves the field untouched.
+/// Pure — unit-tested without a relay.
+fn merge_browse_key(stale: &mut CachedPeer, share_code: &ShareCode) {
+    if let Some(bk) = share_code.browse_key() {
+        stale.browse_key_hex = Some(hex::encode(bk));
+    }
 }
 
 /// Apply an optional follow-time petname edit onto a resolved peer (M13 W5 item 4): a `Some`
@@ -602,6 +622,39 @@ mod tests {
         // An empty-string petname is treated the same as "no edit", not "clear it".
         apply_follow_petname(&mut peer2, Some(String::new()));
         assert_eq!(peer2.petname.as_deref(), Some("AutoName2"), "an empty-string petname is a no-op");
+    }
+
+    // ── devtest #4: a pasted full share code's browse-key survives the stale-teaser fallback ────
+
+    #[test]
+    fn merge_browse_key_sets_key_from_full_code() {
+        // Add-by-npub leaves the contact keyless; pasting the full code later must attach the key
+        // even when the teaser fetch flakes and we fall back to the stale cache.
+        let pubkey = Identity::generate().public_key();
+        let mut stale = stub_peer("hb1_test", None);
+        assert!(stale.browse_key_hex.is_none(), "starts keyless (npub-added)");
+
+        merge_browse_key(&mut stale, &ShareCode::Full { pubkey, browse_key: [7u8; 32] });
+        assert_eq!(
+            stale.browse_key_hex.as_deref(),
+            Some(hex::encode([7u8; 32]).as_str()),
+            "the full code's browse-key is merged onto the stale contact"
+        );
+    }
+
+    #[test]
+    fn merge_browse_key_followonly_leaves_key_untouched() {
+        // A bare/FollowOnly code carries no key — it must not clobber an already-keyed contact.
+        let pubkey = Identity::generate().public_key();
+        let mut keyed = stub_peer("hb1_test", None);
+        keyed.browse_key_hex = Some(hex::encode([9u8; 32]));
+
+        merge_browse_key(&mut keyed, &ShareCode::FollowOnly { pubkey });
+        assert_eq!(
+            keyed.browse_key_hex.as_deref(),
+            Some(hex::encode([9u8; 32]).as_str()),
+            "a keyless code is a no-op, never a downgrade"
+        );
     }
 
     /// Mirrors `set_contact_petname`'s core logic at the store level (load → set → reload) — the

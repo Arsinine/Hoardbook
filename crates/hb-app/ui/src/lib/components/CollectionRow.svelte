@@ -7,6 +7,7 @@
 	import { deriveRowChip, menuItems, badges, type RowMenuItem } from '../collection-row-view.js';
 	import CollectionPanel from './CollectionPanel.svelte';
 	import ConfirmButton from './ConfirmButton.svelte';
+	import OverflowMenu from './OverflowMenu.svelte';
 	import { icons } from '../icons.js';
 
 	interface Props {
@@ -25,7 +26,6 @@
 	let menuOpen = $state(false);
 	let exportOpen = $state(false);
 	let menuBtnEl: HTMLButtonElement | undefined = $state();
-	let menuPos = $state({ top: 0, left: 0 });
 
 	let chip = $derived(deriveRowChip(collection));
 	let items = $derived(menuItems(collection));
@@ -40,11 +40,7 @@
 	}
 
 	function toggleMenu() {
-		if (!menuOpen && menuBtnEl) {
-			const r = menuBtnEl.getBoundingClientRect();
-			menuPos = { top: r.bottom + 4, left: Math.max(8, r.right - 200) };
-		}
-		menuOpen = !menuOpen;
+		menuOpen = !menuOpen; // OverflowMenu computes its own placement from the anchor
 		exportOpen = false;
 	}
 
@@ -119,36 +115,32 @@
 	{/if}
 </div>
 
-{#if menuOpen}
-	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-	<div class="menu-backdrop" onclick={closeMenu}></div>
-	<div class="row-menu" role="menu" style="top:{menuPos.top}px; left:{menuPos.left}px">
-		{#each items as item (item.key)}
-			{#if item.key === 'export'}
-				<button type="button" role="menuitem" class="menu-item" onclick={() => handleItemClick(item)}>
-					{item.label}<span class="submenu-caret" aria-hidden="true">▸</span>
-				</button>
-				{#if exportOpen}
-					<div class="submenu">
-						{#each item.submenu as sub (sub.key)}
-							<button type="button" role="menuitem" class="menu-item menu-item-sub" onclick={() => handleExportClick(sub.key)}>
-								{sub.label}
-							</button>
-						{/each}
-					</div>
-				{/if}
-			{:else if item.key === 'remove'}
-				<div class="menu-item menu-item-confirm">
-					<ConfirmButton role="menuitem" label={item.label} onconfirm={handleRemoveConfirm} />
+<OverflowMenu open={menuOpen} anchor={menuBtnEl} onclose={closeMenu}>
+	{#each items as item (item.key)}
+		{#if item.key === 'export'}
+			<button type="button" role="menuitem" class="menu-item" onclick={() => handleItemClick(item)}>
+				{item.label}<span class="submenu-caret" aria-hidden="true">▸</span>
+			</button>
+			{#if exportOpen}
+				<div class="submenu">
+					{#each item.submenu as sub (sub.key)}
+						<button type="button" role="menuitem" class="menu-item menu-item-sub" onclick={() => handleExportClick(sub.key)}>
+							{sub.label}
+						</button>
+					{/each}
 				</div>
-			{:else}
-				<button type="button" role="menuitem" class="menu-item" onclick={() => handleItemClick(item)}>
-					{item.label}
-				</button>
 			{/if}
-		{/each}
-	</div>
-{/if}
+		{:else if item.key === 'remove'}
+			<div class="menu-item menu-item-confirm">
+				<ConfirmButton role="menuitem" label={item.label} onconfirm={handleRemoveConfirm} />
+			</div>
+		{:else}
+			<button type="button" role="menuitem" class="menu-item" onclick={() => handleItemClick(item)}>
+				{item.label}
+			</button>
+		{/if}
+	{/each}
+</OverflowMenu>
 
 <style>
 	.row {
@@ -237,20 +229,7 @@
 
 	.row-body { border-top: 1px solid var(--divider); }
 
-	/* Overflow menu — position:fixed so no ancestor's overflow:hidden clips it. */
-	.menu-backdrop { position: fixed; inset: 0; z-index: 999; }
-
-	.row-menu {
-		position: fixed;
-		z-index: 1000;
-		min-width: 190px;
-		background: var(--bg-elev2);
-		border: 1px solid var(--border);
-		border-radius: 8px;
-		padding: 4px;
-		box-shadow: 0 8px 24px oklch(0 0 0 / 0.3);
-	}
-
+	/* M15 W3: backdrop + fixed-position shell moved to OverflowMenu.svelte; these style its contents. */
 	.menu-item {
 		display: flex;
 		align-items: center;

@@ -155,3 +155,16 @@ export function summarizeCollectionsSize(cols: { est_size?: string }[]): string 
 	const m = cols.length;
 	return `~${fmtLargestUnit(totalBytes)} across ${m} collection${m !== 1 ? 's' : ''}`;
 }
+
+/** M15 W4 — resolve a `/browse?peer=<npub>` deep-link param against the loaded contacts. Returns the
+ *  matching contact, or null for an absent/unknown param (caller stays on the empty state). The
+ *  caller feeds the result through Browse's own `selectPeer`, so the keyed-contact live-refetch
+ *  (devtest #3/#4) is preserved by construction. */
+export function peerFromQuery<P extends { npub: string }>(
+	searchParams: URLSearchParams,
+	contacts: readonly P[],
+): P | null {
+	const npub = searchParams.get('peer');
+	if (!npub) return null;
+	return contacts.find((c) => c.npub === npub) ?? null;
+}

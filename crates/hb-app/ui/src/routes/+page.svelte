@@ -10,6 +10,8 @@
 	import CollectionRow from '$lib/components/CollectionRow.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import HintMarker from '$lib/components/HintMarker.svelte';
+	import Modal from '$lib/components/Modal.svelte';
+	import { applyProfilePicture, removeProfilePicture } from '$lib/profile-picture.js';
 	import type { Collection, Profile } from '$lib/types.js';
 
 	// Each language is shown in its own language (autonym).
@@ -98,6 +100,23 @@
 			obStep = 3;
 		} catch (e) { toast(String(e), 'error'); }
 		finally { saving = false; }
+	}
+
+	// ── Profile picture (devtest #1: surfaced on Home, where people actually look) ──────
+	let pictureInput: HTMLInputElement | undefined = $state();
+	let pictureBusy = $state(false);
+
+	async function handlePictureFile(e: Event) {
+		const file = (e.target as HTMLInputElement).files?.[0];
+		if (pictureInput) pictureInput.value = ''; // allow re-picking the same file
+		if (!file) return;
+		pictureBusy = true;
+		try { await applyProfilePicture(file); } finally { pictureBusy = false; }
+	}
+
+	async function handleRemovePicture() {
+		pictureBusy = true;
+		try { await removeProfilePicture(); } finally { pictureBusy = false; }
 	}
 
 	// ── Publish-button dirty tracking ───────────────────────────────────────────
@@ -519,9 +538,8 @@
 	</div>
 
 	{#if importOverlayOpen}
-		<div class="ob-overlay" onclick={(e) => { if (e.target === e.currentTarget) importOverlayOpen = false; }}>
-			<div class="ob-overlay-card">
-				<div class="ob-card-title">Import an existing Nostr key</div>
+		<Modal open={true} title="Import an existing Nostr key" onclose={() => { importOverlayOpen = false; }}>
+			<div class="ob-import-body">
 				<div class="ob-card-sub" style="margin-bottom:16px">
 					Paste your <span class="mono">nsec</span>. Hoardbook keeps the matching <span class="mono">npub</span>
 					as your identity and mints a fresh transport key + browse-key. Your secret key is stored
@@ -542,7 +560,7 @@
 					Cancel
 				</button>
 			</div>
-		</div>
+		</Modal>
 	{/if}
 {:else}
 	<!-- TopBar -->
@@ -573,11 +591,33 @@
 		<!-- Left: Profile editor -->
 		<div class="profile-pane">
 			<div class="profile-header">
-				<Avatar letter={nameInitial} size={48} hue={nameHue} picture={$profile?.picture} />
+				<button
+					type="button"
+					class="avatar-picker"
+					onclick={() => pictureInput?.click()}
+					disabled={pictureBusy}
+					title="Change profile picture"
+					aria-label="Change profile picture"
+				>
+					<Avatar letter={nameInitial} size={48} hue={nameHue} picture={$profile?.picture} />
+					<span class="avatar-picker-badge">{pictureBusy ? '…' : '📷'}</span>
+				</button>
 				<div class="profile-header-info">
 					<div class="profile-name">{form.display_name || 'DataHoarder'}</div>
 					<span class="mono">{$identity?.npub_short ?? ''}</span>
+					{#if $profile?.picture}
+						<button type="button" class="picture-remove-link" onclick={handleRemovePicture} disabled={pictureBusy}>
+							Remove picture
+						</button>
+					{/if}
 				</div>
+				<input
+					bind:this={pictureInput}
+					type="file"
+					accept="image/png,image/jpeg,image/webp"
+					style="display:none"
+					onchange={handlePictureFile}
+				/>
 			</div>
 
 			<div class="fields">
@@ -888,27 +928,8 @@
 		line-height: 1.5;
 	}
 
-	/* Qurator import privacy overlay */
-	.ob-overlay {
-		position: fixed;
-		inset: 0;
-		background: oklch(0 0 0 / 0.55);
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		z-index: 200;
-		backdrop-filter: blur(3px);
-	}
-
-	.ob-overlay-card {
-		width: 400px;
-		max-width: calc(100vw - 40px);
-		background: var(--bg-elev1);
-		border: 1px solid var(--border);
-		border-radius: 10px;
-		padding: 22px;
-		box-shadow: 0 24px 60px oklch(0 0 0 / 0.4);
-	}
+	/* M15 W2: Qurator import overlay now uses Modal.svelte; body is a plain content column. */
+	.ob-import-body { display: flex; flex-direction: column; }
 
 	/* Social links — icon row */
 	.social-icons-row {
@@ -989,10 +1010,11 @@
 	.pub-ok { color: var(--fg-dim); }
 
 	.publish-pulse { animation: publish-pulse 1.8s ease-out infinite; }
+	/* M15 W7: pulse uses the amber accent, not a stray blue. */
 	@keyframes publish-pulse {
-		0%   { box-shadow: 0 0 0 0 oklch(0.62 0.19 255 / 0.55); }
-		70%  { box-shadow: 0 0 0 7px oklch(0.62 0.19 255 / 0); }
-		100% { box-shadow: 0 0 0 0 oklch(0.62 0.19 255 / 0); }
+		0%   { box-shadow: 0 0 0 0 oklch(0.78 0.14 70 / 0.55); }
+		70%  { box-shadow: 0 0 0 7px oklch(0.78 0.14 70 / 0); }
+		100% { box-shadow: 0 0 0 0 oklch(0.78 0.14 70 / 0); }
 	}
 	@media (prefers-reduced-motion: reduce) { .publish-pulse { animation: none; } }
 
@@ -1023,6 +1045,47 @@
 	.profile-header-info { flex: 1; min-width: 0; }
 
 	.profile-name { font-size: 14px; font-weight: 600; color: var(--fg); }
+
+	/* devtest #1: the avatar itself is the picture-picker on Home (the discoverable spot). */
+	.avatar-picker {
+		position: relative;
+		padding: 0;
+		border: none;
+		background: none;
+		cursor: pointer;
+		border-radius: 50%;
+		line-height: 0;
+		flex-shrink: 0;
+	}
+	.avatar-picker:disabled { cursor: default; opacity: 0.7; }
+	.avatar-picker-badge {
+		position: absolute;
+		right: -2px;
+		bottom: -2px;
+		width: 18px;
+		height: 18px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 10px;
+		background: var(--bg-elev2);
+		border: 1px solid var(--border);
+		border-radius: 50%;
+		box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+	}
+	.avatar-picker:hover:not(:disabled) .avatar-picker-badge { border-color: var(--accent); }
+	.picture-remove-link {
+		margin-top: 2px;
+		padding: 0;
+		border: none;
+		background: none;
+		font-size: 11px;
+		color: var(--fg-muted);
+		cursor: pointer;
+		text-decoration: underline;
+	}
+	.picture-remove-link:hover:not(:disabled) { color: var(--fg); }
+	.picture-remove-link:disabled { cursor: default; opacity: 0.6; }
 
 	.fields { display: flex; flex-direction: column; gap: 12px; }
 
@@ -1286,31 +1349,8 @@
 		flex-shrink: 0;
 	}
 
-	/* Buttons */
-	.btn-primary {
-		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-		padding: 5px 11px; font-family: var(--font-ui); font-size: 13px; font-weight: 600;
-		color: var(--accent-text); background: var(--accent);
-		border: 1px solid var(--accent); border-radius: 7px;
-		cursor: pointer; letter-spacing: -0.1px; white-space: nowrap; user-select: none;
-		line-height: 1; height: 28px; flex-shrink: 0; text-decoration: none;
-	}
-
-	.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
-
-	.btn-ghost {
-		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-		padding: 5px 11px; font-family: var(--font-ui); font-size: 12px; font-weight: 500;
-		color: var(--fg-muted); background: transparent;
-		border: 1px solid transparent; border-radius: 7px;
-		cursor: pointer; white-space: nowrap; user-select: none;
-		line-height: 1; height: 28px; flex-shrink: 0;
-	}
-
-	.btn-ghost:disabled { opacity: 0.5; cursor: not-allowed; }
-
-	.btn-sm { padding: 5px 11px; font-size: 12px; height: 28px; }
-
-	.btn-full { width: 100%; height: auto; padding: 10px 14px; }
+	/* M15 W1: core buttons unified on the app.css .btn system (local copies removed). `.btn-add`
+	   (compact publish button) and `.btn-full`'s taller onboarding CTA sizing stay local. */
+	.btn-full { height: auto; padding: 10px 14px; } /* taller onboarding CTA (width comes from app.css) */
 	.ob-skip { margin-top: 4px; font-size: 12px; }
 </style>

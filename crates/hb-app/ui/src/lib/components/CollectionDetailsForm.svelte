@@ -296,21 +296,5 @@
 		cursor: pointer;
 	}
 
-	.btn-primary {
-		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-		padding: 7px 14px; font-family: var(--font-ui); font-size: 13px; font-weight: 600;
-		color: var(--accent-text); background: var(--accent);
-		border: 1px solid var(--accent); border-radius: 7px;
-		cursor: pointer; white-space: nowrap; line-height: 1;
-	}
-	.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
-
-	.btn-ghost {
-		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-		padding: 7px 14px; font-family: var(--font-ui); font-size: 13px; font-weight: 500;
-		color: var(--fg-muted); background: transparent;
-		border: 1px solid transparent; border-radius: 7px;
-		cursor: pointer; white-space: nowrap; line-height: 1;
-	}
-	.btn-ghost:disabled { opacity: 0.5; cursor: not-allowed; }
+	/* M15 W1: buttons unified on the app.css .btn system (local copies removed). */
 </style>

@@ -18,6 +18,7 @@
 	import { memberCountLabel, rosterLabel, TOPIC_ROOTS, composeTopicPath, subPathLabel, groupTopicsByRoot, createPrimaryAction } from '$lib/topics-view.js';
 	import { canAnnounce, cooldownLabel, ANNOUNCE_EXPLAINER } from '$lib/announce-view.js';
 	import TopicJoinConsent from '$lib/components/TopicJoinConsent.svelte';
+	import Modal from '$lib/components/Modal.svelte';
 	import HintMarker from '$lib/components/HintMarker.svelte';
 	import ConfirmButton from '$lib/components/ConfirmButton.svelte';
 
@@ -339,7 +340,7 @@
 
 					<div class="invite">
 						<input placeholder="invite an npub…" bind:value={inviteNpub} />
-						<button onclick={invite}>Invite</button>
+						<button class="btn-default" onclick={invite}>Invite</button>
 					</div>
 
 					<!-- M13 Part A (Q1) — sends only; the announce itself renders in the Chat topic thread. -->
@@ -392,7 +393,7 @@
 								<div class="name">{subPathLabel(d.name) || d.name}</div>
 								<div class="muted">{memberCountLabel(d.member_count_estimate)}</div>
 							</div>
-							<button onclick={() => askToJoin(d.name, false)}>Join</button>
+							<button class="btn-default" onclick={() => askToJoin(d.name, false)}>Join</button>
 						</div>
 					{/each}
 				{/each}
@@ -403,57 +404,42 @@
 </div>
 
 <!-- Create-a-Topic modal (devtest #9: was an always-on card; now invoked from "+ New Topic"). -->
-{#if createOpen}
-	<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
-	<div class="modal-backdrop" role="dialog" aria-modal="true" aria-label="Create a Topic" tabindex="-1" onclick={(e) => { if (e.target === e.currentTarget) createOpen = false; }}>
-		<div class="modal">
-			<h2>New Topic</h2>
-			{#if newPrivate}
-				<input placeholder="name (freeform, e.g. back room)" bind:value={newName} />
-			{:else}
-				<!-- W4: a public Topic is a category root (picker) + freeform sub-path. The root picker
-				     makes a non-category root unrepresentable; the backend re-validates authoritatively. -->
-				<div class="path-row">
-					<select class="root-pick" bind:value={newRoot}>
-						{#each TOPIC_ROOTS as r}<option value={r}>{r}</option>{/each}
-					</select>
-					<span class="path-sep">/</span>
-					<input class="grow" placeholder="sub-path (e.g. animation/anime) — optional" bind:value={newSubPath} />
-				</div>
-				<div class="muted path-preview">Topic path: <code>{composedPublicName}</code></div>
-			{/if}
-			<input placeholder="description" bind:value={newDesc} />
-			<input placeholder="tags, comma-separated" bind:value={newTags} />
-			<label class="check"><input type="checkbox" bind:checked={newPrivate} /> Private (unlisted)</label>
-			<div class="modal-actions">
-				<button class="ghost" onclick={() => (createOpen = false)}>Cancel</button>
-				<button class="btn-primary" disabled={busy || !canCreate} onclick={handlePrimary}>{primaryAction.label}</button>
+<Modal open={createOpen} title="New Topic" onclose={() => (createOpen = false)}>
+	<div class="create-fields">
+		{#if newPrivate}
+			<input placeholder="name (freeform, e.g. back room)" bind:value={newName} />
+		{:else}
+			<!-- W4: a public Topic is a category root (picker) + freeform sub-path. The root picker
+			     makes a non-category root unrepresentable; the backend re-validates authoritatively. -->
+			<div class="path-row">
+				<select class="root-pick" bind:value={newRoot}>
+					{#each TOPIC_ROOTS as r}<option value={r}>{r}</option>{/each}
+				</select>
+				<span class="path-sep">/</span>
+				<input class="grow" placeholder="sub-path (e.g. animation/anime) — optional" bind:value={newSubPath} />
 			</div>
-		</div>
+			<div class="muted path-preview">Topic path: <code>{composedPublicName}</code></div>
+		{/if}
+		<input placeholder="description" bind:value={newDesc} />
+		<input placeholder="tags, comma-separated" bind:value={newTags} />
+		<label class="check"><input type="checkbox" bind:checked={newPrivate} /> Private (unlisted)</label>
 	</div>
-{/if}
+	{#snippet actions()}
+		<button class="btn-ghost" onclick={() => (createOpen = false)}>Cancel</button>
+		<button class="btn-primary" disabled={busy || !canCreate} onclick={handlePrimary}>{primaryAction.label}</button>
+	{/snippet}
+</Modal>
 
 <!-- F12 consent gate: a join (public or private) fires only after explicit acknowledgment. -->
 {#if pendingJoin}
-	<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
-	<div
-		class="modal-backdrop"
-		role="dialog"
-		aria-modal="true"
-		aria-label="Join Topic consent"
-		tabindex="-1"
-		onclick={(e) => { if (e.target === e.currentTarget) pendingJoin = null; }}
-	>
-		<div class="modal">
-			<h2>Join “{pendingJoin.name}”</h2>
-			<TopicJoinConsent
-				isPrivate={pendingJoin.isPrivate}
-				disabled={busy}
-				onjoin={confirmJoin}
-				oncancel={() => (pendingJoin = null)}
-			/>
-		</div>
-	</div>
+	<Modal open={true} title={`Join “${pendingJoin.name}”`} onclose={() => (pendingJoin = null)}>
+		<TopicJoinConsent
+			isPrivate={pendingJoin.isPrivate}
+			disabled={busy}
+			onjoin={confirmJoin}
+			oncancel={() => (pendingJoin = null)}
+		/>
+	</Modal>
 {/if}
 
 <style>
@@ -506,14 +492,10 @@
 		padding: 6px 9px; background: var(--bg-elev2); color: var(--fg);
 		border: 1px solid var(--border); border-radius: 6px; font: inherit;
 	}
-	button {
-		padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
-		background: var(--bg-elev2); color: var(--fg); font: inherit; cursor: pointer;
-	}
+	/* M15 W1: buttons unified on the app.css .btn system. `.link` stays a local text-link (no boxed
+	   equivalent in the shared system); `button:disabled` keeps the .tab/.link dim state. */
 	button:disabled { opacity: 0.5; cursor: not-allowed; }
-	.btn-primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
-	button.ghost, button.link { background: transparent; }
-	button.link { border: none; color: var(--accent); text-align: left; padding: 4px 0; margin-top: 4px; }
+	button.link { background: transparent; border: none; color: var(--accent); text-align: left; padding: 4px 0; margin-top: 4px; cursor: pointer; }
 	.check { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--fg-muted); }
 	.grow { flex: 1; min-width: 0; }
 	.row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid var(--divider); }
@@ -535,19 +517,6 @@
 	.announce-row input { flex: 1; }
 	.channel-link { display: inline-block; margin-top: 4px; font-size: 12px; color: var(--accent); text-decoration: none; }
 	.channel-link:hover { text-decoration: underline; }
-	.modal-backdrop {
-		position: fixed; inset: 0; z-index: 9998;
-		background: oklch(0 0 0 / 0.45);
-		display: flex; align-items: center; justify-content: center;
-	}
-	.modal {
-		background: var(--bg-elev1);
-		border: 1px solid var(--border-strong);
-		border-radius: 12px;
-		padding: 18px;
-		width: min(440px, 90vw);
-		display: flex; flex-direction: column; gap: 8px;
-	}
-	.modal h2 { font-size: 14px; font-weight: 700; margin: 0 0 6px; }
-	.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+	/* M15 W2: the two Topic modals now use Modal.svelte; only the create form's field spacing is local. */
+	.create-fields { display: flex; flex-direction: column; gap: 8px; }
 </style>

@@ -15,10 +15,11 @@ import {
 	subPathLabel,
 	groupTopicsByRoot,
 	sortChannelPostsAscending,
+	interleaveChannel,
 	resolveTopicParam,
 	createPrimaryAction,
 } from './topics-view.js';
-import type { CachedPeer, ChannelPost, TopicLookup } from './types.js';
+import type { CachedPeer, ChannelPost, AnnouncementView, TopicLookup } from './types.js';
 
 describe('topics-view (M11)', () => {
 	it('shows the public consent copy for a public Topic, the durable-record copy for a private one', () => {
@@ -128,6 +129,31 @@ describe('topics-view — devtest #12 channel post order', () => {
 	it('is stable on ties (equal ts)', () => {
 		const withTie = [post('later', 200), post('first', 100), post('second', 100)];
 		expect(sortChannelPostsAscending(withTie).map((p) => p.author_npub)).toEqual(['first', 'second', 'later']);
+	});
+});
+
+describe('topics-view — devtest #6 announcement interleave', () => {
+	const post = (author_npub: string, ts: number): ChannelPost => ({ author_npub, body: author_npub, ts });
+	const ann = (author_npub: string, ts: number): AnnouncementView => ({ author_npub, body: author_npub, ts });
+
+	it('merges announcements and posts into one timestamp-ascending stream', () => {
+		const items = interleaveChannel(
+			[post('p1', 100), post('p2', 300)],
+			[ann('a1', 200)],
+		);
+		expect(items.map((i) => (i.kind === 'post' ? i.post.author_npub : i.announce.author_npub))).toEqual(['p1', 'a1', 'p2']);
+		expect(items.map((i) => i.kind)).toEqual(['post', 'announce', 'post']);
+	});
+
+	it('places an announcement just before a post of the same second (stable)', () => {
+		const items = interleaveChannel([post('p', 100)], [ann('a', 100)]);
+		expect(items.map((i) => i.kind)).toEqual(['announce', 'post']);
+	});
+
+	it('handles announcements-only and posts-only', () => {
+		expect(interleaveChannel([], [ann('a', 5)]).map((i) => i.kind)).toEqual(['announce']);
+		expect(interleaveChannel([post('p', 5)], []).map((i) => i.kind)).toEqual(['post']);
+		expect(interleaveChannel([], [])).toEqual([]);
 	});
 });
 

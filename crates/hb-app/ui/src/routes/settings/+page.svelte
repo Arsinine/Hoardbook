@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, watchesGet, watchesDelete, saveProfile, hasPublishedProfile, publishProfile } from '$lib/api.js';
+	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, watchesGet, watchesDelete, hasPublishedProfile, publishProfile } from '$lib/api.js';
 	import type { Settings, UpdateInfo, BeaconReport } from '$lib/api.js';
 	import type { Watch } from '$lib/types.js';
 	import { keyView } from '$lib/key-view.js';
@@ -14,7 +14,7 @@
 	import { identity, profile, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
-	import { compressToDataUri } from '$lib/image-compress.js';
+	import { applyProfilePicture, removeProfilePicture } from '$lib/profile-picture.js';
 
 	let generating = $state(false);
 	let copied = $state(false);
@@ -392,39 +392,13 @@
 		const file = (e.target as HTMLInputElement).files?.[0];
 		if (pictureInput) pictureInput.value = ''; // allow re-picking the same file later
 		if (!file) return;
-		if (!$profile) {
-			toast('Save a profile first', 'error');
-			return;
-		}
 		pictureBusy = true;
-		try {
-			const dataUri = await compressToDataUri(file);
-			const updated = { ...$profile, picture: dataUri };
-			await saveProfile(updated);
-			profile.set(updated);
-			if (await hasPublishedProfile()) await publishProfile();
-			toast('Picture updated', 'success');
-		} catch (e) {
-			toast(String(e), 'error');
-		} finally {
-			pictureBusy = false;
-		}
+		try { await applyProfilePicture(file); } finally { pictureBusy = false; }
 	}
 
 	async function handleRemovePicture() {
-		if (!$profile) return;
 		pictureBusy = true;
-		try {
-			const updated = { ...$profile, picture: undefined };
-			await saveProfile(updated);
-			profile.set(updated);
-			if (await hasPublishedProfile()) await publishProfile();
-			toast('Picture removed', 'success');
-		} catch (e) {
-			toast(String(e), 'error');
-		} finally {
-			pictureBusy = false;
-		}
+		try { await removeProfilePicture(); } finally { pictureBusy = false; }
 	}
 
 	function relayDotColor(status: RelayStatus | undefined) {
@@ -476,8 +450,7 @@
 						onchange={handlePictureFile}
 					/>
 				</div>
-				<span class="pill pill-online"><span class="pill-dot"></span>Active</span>
-			</div>
+				</div>
 
 			<!-- The three keys: npub (irreplaceable), iroh node key (public), share code (carries the browse-key). -->
 			{#each kv.rows as row (row.label)}
@@ -1051,40 +1024,8 @@
 	}
 
 	/* Buttons */
-	.btn-primary {
-		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-		padding: 8px 14px; font-family: var(--font-ui); font-size: 13px; font-weight: 600;
-		color: var(--accent-text); background: var(--accent);
-		border: 1px solid var(--accent); border-radius: 7px;
-		cursor: pointer; white-space: nowrap; user-select: none; line-height: 1;
-	}
-	.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
-	.btn-default {
-		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-		padding: 8px 14px; font-family: var(--font-ui); font-size: 13px; font-weight: 500;
-		color: var(--fg); background: var(--bg-elev2);
-		border: 1px solid var(--border-strong); border-radius: 7px;
-		cursor: pointer; white-space: nowrap; user-select: none; line-height: 1;
-		flex-shrink: 0; min-width: max-content;
-	}
-	.btn-default:hover { background: var(--bg-elev3); }
-	.btn-default:disabled { opacity: 0.5; cursor: not-allowed; }
-	.btn-ghost {
-		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-		padding: 8px 14px; font-family: var(--font-ui); font-size: 13px; font-weight: 500;
-		color: var(--fg-muted); background: transparent;
-		border: 1px solid transparent; border-radius: 7px;
-		cursor: pointer; white-space: nowrap; user-select: none; line-height: 1;
-	}
-	.btn-danger {
-		display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-		padding: 8px 14px; font-family: var(--font-ui); font-size: 13px; font-weight: 600;
-		color: oklch(0.97 0 0); background: var(--error);
-		border: 1px solid var(--error); border-radius: 7px;
-		cursor: pointer; white-space: nowrap; user-select: none; line-height: 1;
-	}
-	.btn-danger:disabled { opacity: 0.5; cursor: not-allowed; }
-	.btn-sm { padding: 5px 11px; font-size: 12px; height: 28px; }
+	/* M15 W1: buttons unified on the app.css .btn system (local copies removed). */
+	.btn-default { flex-shrink: 0; min-width: max-content; } /* keep settings-row layout guards only */
 
 	/* M5: 3-key view, backup/restore, import-nsec, share QR */
 	.key-secret {

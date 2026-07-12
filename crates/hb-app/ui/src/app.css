@@ -18,6 +18,13 @@
   --error:         oklch(0.65 0.18 25);
   --font-ui:       'Inter', system-ui, -apple-system, sans-serif;
   --font-mono:     'JetBrains Mono', ui-monospace, 'SF Mono', monospace;
+  /* M15 W1: one stacking scale, replacing the twelve ad-hoc z-index literals scattered across
+     routes/components. menu < overlay < modal < modal-stacked < toast. */
+  --z-menu:          1000;
+  --z-overlay:       2000;
+  --z-modal:         3000;
+  --z-modal-stacked: 3100;
+  --z-toast:         4000;
 }
 
 html, body {
@@ -68,6 +75,58 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 ::selection { background: oklch(0.78 0.14 70 / 0.3); }
+
+/* ── Keyboard focus (M15 W1) ──────────────────────────────────────── */
+/* Visible only for keyboard/AT users; mouse users see no change. Was absent app-wide. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ── Canonical buttons (M15 W1) ───────────────────────────────────── */
+/* One source of truth, replacing the per-route .btn-* copies that had drifted on height/padding.
+   Height-based metric (adopted from Home/Settings). Call sites keep `class="btn-primary btn-sm"`. */
+.btn,
+.btn-primary,
+.btn-ghost,
+.btn-default,
+.btn-danger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 7px;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  border: 1px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+  text-decoration: none; /* so `<a class="btn-primary">` (Home id-error link) never underlines */
+}
+.btn:disabled,
+.btn-primary:disabled,
+.btn-ghost:disabled,
+.btn-default:disabled,
+.btn-danger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.btn-primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+.btn-ghost   { background: transparent; color: var(--fg-muted); }
+.btn-ghost:hover:not(:disabled) { background: var(--bg-elev2); }
+.btn-default { background: var(--bg-elev2); color: var(--fg); border-color: var(--border-strong); }
+.btn-default:hover:not(:disabled) { background: var(--bg-elev3); }
+.btn-danger  { background: transparent; color: var(--error); border-color: color-mix(in oklch, var(--error) 30%, transparent); }
+.btn-danger:hover:not(:disabled) { background: color-mix(in oklch, var(--error) 12%, transparent); }
+/* Size + shape modifiers (compose with a variant). */
+.btn-sm   { height: 28px; padding: 0 11px; font-size: 12px; }
+.btn-xs   { height: 24px; padding: 0 8px;  font-size: 11px; }
+.btn-full { width: 100%; }
+.btn-icon { width: 28px; padding: 0; }
 
 /* ── Icon animation keyframes ─────────────────────────────────────── */
 @keyframes hb-spin {
@@ -177,12 +236,16 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 /* ── Utility icon hover animations ─────────────────────────────────── */
-.hb-icon-refresh:hover  { animation: hb-spin 0.5s ease-in-out; }
-.hb-icon-download:hover { animation: hb-dl 0.4s ease-out; }
-.hb-icon-send:hover     { animation: hb-send 0.35s ease-out; }
-.hb-icon-trash:hover    { animation: hb-shake 0.4s ease-in-out; }
-.hb-icon-close:hover    { animation: hb-spin 0.3s ease-in-out; }
-.hb-icon-chevdown:hover  { animation: hb-bounce-down 0.3s ease-out; }
-.hb-icon-chevright:hover { animation: hb-bounce-right 0.3s ease-out; }
-.hb-icon-plus:hover     { animation: hb-pulse-scale 0.25s ease-out; }
-.hb-icon-search:hover   { animation: hb-pulse-scale 0.25s ease-out; }
+/* M15 W1: motion-guarded (matches the .publish-pulse precedent) — no hover spin/shake for users
+   who ask for reduced motion. */
+@media (prefers-reduced-motion: no-preference) {
+  .hb-icon-refresh:hover  { animation: hb-spin 0.5s ease-in-out; }
+  .hb-icon-download:hover { animation: hb-dl 0.4s ease-out; }
+  .hb-icon-send:hover     { animation: hb-send 0.35s ease-out; }
+  .hb-icon-trash:hover    { animation: hb-shake 0.4s ease-in-out; }
+  .hb-icon-close:hover    { animation: hb-spin 0.3s ease-in-out; }
+  .hb-icon-chevdown:hover  { animation: hb-bounce-down 0.3s ease-out; }
+  .hb-icon-chevright:hover { animation: hb-bounce-right 0.3s ease-out; }
+  .hb-icon-plus:hover     { animation: hb-pulse-scale 0.25s ease-out; }
+  .hb-icon-search:hover   { animation: hb-pulse-scale 0.25s ease-out; }
+}
