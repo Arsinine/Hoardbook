@@ -24,6 +24,6 @@ thiserror  = { workspace = true }
 tracing    = { workspace = true }
 # Bounded, deterministic dedup-key fallback for a slug-less private listing (M10 chorus fix).
 sha2       = "0.10"
-
-[dev-dependencies]
-tokio = { workspace = true }
+# The async runtime: `tokio::time::sleep` backs the relay-write governor's pacing (client.rs), and
+# `#[tokio::test]` drives the async unit tests. A regular dep (not dev-only) since the lib now uses it.
+tokio      = { workspace = true }
