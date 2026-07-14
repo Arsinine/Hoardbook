@@ -315,6 +315,111 @@ pub fn split_listing(
     Ok(parts)
 }
 
+// ── truncate (devtest #7 — paywall teaser instead of split) ─────────────────────────────────────
+
+/// A listing truncated to a byte budget: the JSON to publish (a single event), whether it was
+/// actually truncated, and how many item nodes are shown vs exist in the full tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TruncatedListing {
+    pub json: String,
+    pub truncated: bool,
+    /// Item nodes (files + folders, recursively) kept in `json`.
+    pub shown_items: usize,
+    /// Item nodes in the ORIGINAL full listing.
+    pub total_items: usize,
+}
+
+/// Count item nodes (each file/folder, recursively through `children`) in an `entries` array.
+fn count_nodes(entries: &[Value]) -> usize {
+    entries
+        .iter()
+        .map(|e| 1 + e.get("children").and_then(Value::as_array).map_or(0, |c| count_nodes(c)))
+        .sum()
+}
+
+/// Greedily keep a structure-preserving PREFIX of `entries` whose serialized bytes fit within
+/// `budget`. A folder that won't fit whole is kept with a recursively-truncated child list; once the
+/// budget is spent, the remaining siblings are dropped. Returns the kept entries + their node count.
+/// Byte accounting is deliberately conservative (a `+1` per element for the separating comma), so the
+/// caller's `budget` — `max_bytes` minus the metadata overhead — keeps the final event within bounds.
+fn truncate_tree(entries: &[Value], budget: usize) -> (Vec<Value>, usize) {
+    let mut kept: Vec<Value> = Vec::new();
+    let mut used: usize = 2; // the enclosing `[]`
+    let mut count: usize = 0;
+    for entry in entries {
+        let whole = serde_json::to_string(entry).map(|s| s.len() + 1).unwrap_or(usize::MAX);
+        if used + whole <= budget {
+            used += whole;
+            count += 1 + entry.get("children").and_then(Value::as_array).map_or(0, |c| count_nodes(c));
+            kept.push(entry.clone());
+            continue;
+        }
+        // Doesn't fit whole. If it's a non-empty folder, keep it with truncated children.
+        let has_children = entry.get("children").and_then(Value::as_array).is_some_and(|c| !c.is_empty());
+        if has_children {
+            let mut wrapper = entry.clone();
+            if let Some(o) = wrapper.as_object_mut() {
+                o.insert("children".into(), Value::Array(Vec::new()));
+            }
+            let wrapper_len = serde_json::to_string(&wrapper).map(|s| s.len() + 1).unwrap_or(usize::MAX);
+            if used + wrapper_len <= budget {
+                let children = entry.get("children").and_then(Value::as_array).unwrap();
+                let (kept_children, child_count) = truncate_tree(children, budget - used - wrapper_len);
+                if !kept_children.is_empty() {
+                    let mut trunc = entry.clone();
+                    if let Some(o) = trunc.as_object_mut() {
+                        o.insert("children".into(), Value::Array(kept_children));
+                    }
+                    count += 1 + child_count;
+                    kept.push(trunc);
+                }
+            }
+        }
+        break; // budget exhausted
+    }
+    (kept, count)
+}
+
+/// devtest #7 — truncate a listing to a SINGLE event of at most `max_bytes` instead of splitting it
+/// across many part events. A payload that fits is returned unchanged (`truncated: false`). An
+/// oversize one keeps a byte-bounded prefix of its `entries` tree and tags the index with
+/// `truncated: true` + `total_items` (the full node count) so a browser can render the kept items
+/// followed by a paywall-style "N more hidden" fade. The dropped items are simply not published —
+/// the browse side never learns their names (this is a preview, not a lossy split).
+pub fn truncate_listing(listing_json: &str, max_bytes: usize) -> Result<TruncatedListing, NetError> {
+    let normalized = normalize(listing_json)?;
+    let value: Value = serde_json::from_str(&normalized).map_err(|e| NetError::Split(e.to_string()))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| NetError::Split("listing payload is not a JSON object".into()))?;
+    let entries = obj.get("entries").and_then(Value::as_array).cloned().unwrap_or_default();
+    let total_items = count_nodes(&entries);
+
+    if normalized.len() <= max_bytes {
+        return Ok(TruncatedListing { json: normalized, truncated: false, shown_items: total_items, total_items });
+    }
+
+    let mut meta: Map<String, Value> = obj.clone();
+    meta.remove("entries");
+    // Measure the fixed overhead: the metadata + the markers we add + an empty `entries` array. The
+    // entries themselves then get whatever budget is left.
+    let mut probe = meta.clone();
+    probe.insert("truncated".into(), Value::Bool(true));
+    probe.insert("total_items".into(), Value::from(total_items as u64));
+    probe.insert("entries".into(), Value::Array(Vec::new()));
+    let overhead = serde_json::to_string(&Value::Object(probe)).map(|s| s.len()).unwrap_or(max_bytes);
+    let entries_budget = max_bytes.saturating_sub(overhead);
+
+    let (kept, shown_items) = truncate_tree(&entries, entries_budget);
+
+    let mut out = meta;
+    out.insert("truncated".into(), Value::Bool(true));
+    out.insert("total_items".into(), Value::from(total_items as u64));
+    out.insert("entries".into(), Value::Array(kept));
+    let json = serde_json::to_string(&Value::Object(out)).map_err(|e| NetError::Split(e.to_string()))?;
+    Ok(TruncatedListing { json, truncated: true, shown_items, total_items })
+}
+
 /// Build one v2 content part's JSON: `entries` + `mount` + `part` + `parts_v`. Used both for the
 /// final emitted part (real `part` index) and, with `part = usize::MAX`, as a worst-case-width
 /// measurement during packing (so a tight chunk can't exceed budget once the real, possibly
@@ -600,6 +705,62 @@ mod tests {
         let parts = split_listing("criterion", &original, 1000).unwrap();
         let restitched = restitch_listing(&payloads(&parts)).unwrap();
         assert_eq!(restitched, normalize(&original).unwrap(), "restitch must reproduce the full tree");
+    }
+
+    // ── devtest #7: truncate_listing (paywall teaser instead of split) ────────────────────────────
+
+    #[test]
+    fn truncate_listing_leaves_a_fitting_listing_whole() {
+        let t = truncate_listing(&listing(2), 65_536).unwrap();
+        assert!(!t.truncated, "a listing under budget is not truncated");
+        assert_eq!(t.shown_items, 2);
+        assert_eq!(t.total_items, 2);
+        assert!(!t.json.contains("\"truncated\""), "no paywall marker on a whole listing");
+        assert_eq!(t.json, normalize(&listing(2)).unwrap());
+    }
+
+    #[test]
+    fn truncate_listing_keeps_a_bounded_prefix_and_marks_it() {
+        let budget = 800;
+        let t = truncate_listing(&listing(40), budget).unwrap();
+        assert!(t.truncated, "an oversize listing is truncated");
+        assert!(t.json.len() <= budget, "truncated json ({} bytes) must fit the budget", t.json.len());
+        assert_eq!(t.total_items, 40, "total_items is the FULL node count");
+        assert!(t.shown_items > 0 && t.shown_items < 40, "a strict prefix is shown, got {}", t.shown_items);
+        // The paywall markers are on the wire so a browser can render the fade.
+        let v: Value = serde_json::from_str(&t.json).unwrap();
+        assert_eq!(v.get("truncated"), Some(&Value::Bool(true)));
+        assert_eq!(v.get("total_items").and_then(Value::as_u64), Some(40));
+        assert_eq!(v.get("entries").and_then(Value::as_array).map(|a| a.len()), Some(t.shown_items));
+        // Metadata is preserved.
+        assert_eq!(v.get("slug").and_then(Value::as_str), Some("criterion"));
+    }
+
+    #[test]
+    fn truncate_listing_recurses_into_a_single_oversize_folder() {
+        // One top-level folder holding many children — top-level truncation alone would show nothing,
+        // so the folder is kept with a truncated child list (the common "one root folder" collection).
+        let children: Vec<Value> = (0..60)
+            .map(|i| serde_json::json!({ "name": format!("file-{i:03}.mkv"), "size": 1_000_000 + i }))
+            .collect();
+        let json = serde_json::json!({
+            "slug": "vault",
+            "content_types": ["video"],
+            "entries": [ { "name": "everything", "children": children } ],
+        })
+        .to_string();
+
+        let t = truncate_listing(&json, 700).unwrap();
+        assert!(t.truncated);
+        assert!(t.json.len() <= 700);
+        assert_eq!(t.total_items, 61, "1 folder + 60 files");
+        assert!(t.shown_items >= 2, "the folder plus at least one child is shown, got {}", t.shown_items);
+        assert!(t.shown_items < 61, "not everything fits");
+        // The kept folder carries a strict prefix of its children.
+        let v: Value = serde_json::from_str(&t.json).unwrap();
+        let folder = &v["entries"][0];
+        let kept_children = folder["children"].as_array().unwrap().len();
+        assert!((1..60).contains(&kept_children), "partial children, got {kept_children}");
     }
 
     #[test]

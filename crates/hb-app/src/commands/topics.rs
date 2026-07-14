@@ -555,6 +555,71 @@ pub async fn topic_announce_status(topic_id: String, store: State<'_, DataStore>
     Ok(announce_cooldown_remaining(times.get(&topic_id).copied(), now()))
 }
 
+/// One joined Topic's newest member-broadcast, for the background alert poll (devtest #2). `latest_ts`
+/// is the newest announcement's unix-second timestamp; the UI badges/toasts it when it's past the
+/// per-topic seen watermark. Topics with no announcement in the 24h window are omitted.
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicAnnounceSummary {
+    pub topic_id: String,
+    pub topic_name: String,
+    pub latest_ts: u64,
+}
+
+/// devtest #2 — the background announcement poll. For every joined Topic, read its 24h channel and
+/// return the newest announcement (if any) so the Topics nav badge + toast can flag the ones the user
+/// hasn't seen. **Best-effort per topic**: a relay failure on one topic is skipped, never fails the
+/// whole sweep (a stale badge is better than a poll that always errors). Reads only — no writes, so
+/// this never burns the relay-write rate limiter.
+#[tauri::command]
+pub async fn topic_announcements(
+    identity: State<'_, SharedIdentity>,
+    store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
+) -> CmdResult<Vec<TopicAnnounceSummary>> {
+    let topics = store.load_topics().map_err(cmd_err)?;
+    if topics.is_empty() {
+        return Ok(Vec::new());
+    }
+    let me = me(&identity).await?;
+    let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
+    let t = now();
+    let mut out = Vec::new();
+    for topic in &topics {
+        let read = match fetch_channel_full(&client, &topic.meta.topic_id, &topic.key, t, net::RELAY_TIMEOUT).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if let Some(newest) = read.announcements.iter().max_by_key(|a| a.ts) {
+            out.push(TopicAnnounceSummary {
+                topic_id: topic.meta.topic_id.clone(),
+                topic_name: topic.meta.name.clone(),
+                latest_ts: newest.ts,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// devtest #2 — the persisted per-topic announcement-seen watermarks (topic_id → newest seen ts). Pure
+/// local read; seeds the nav badge on startup so an announcement that arrived while closed still shows.
+#[tauri::command]
+pub async fn topic_announce_seen(
+    store: State<'_, DataStore>,
+) -> CmdResult<std::collections::HashMap<String, u64>> {
+    store.load_announce_seen().map_err(cmd_err)
+}
+
+/// devtest #2 — mark a Topic's announcements read up to `ts` (advances the watermark, never rewinds).
+/// Called when the user opens the Topic's channel in Chat, clearing that topic from the nav badge.
+#[tauri::command]
+pub async fn topic_announce_mark_seen(
+    topic_id: String,
+    ts: u64,
+    store: State<'_, DataStore>,
+) -> CmdResult<()> {
+    store.advance_announce_seen(&topic_id, ts).map_err(cmd_err)
+}
+
 /// Post to a Topic's 24h channel.
 #[tauri::command]
 pub async fn topic_post(

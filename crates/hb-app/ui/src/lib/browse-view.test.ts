@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
 	availabilityBadge,
 	collectionAvailability,
+	countListingItems,
 	dedupAndCap,
 	flattenTree,
 	parseEstSize,
@@ -181,5 +182,20 @@ describe('peerFromQuery — M15 W4 browse deep-link', () => {
 
 	it('is null for an unknown npub (degrades to the empty state)', () => {
 		expect(peerFromQuery(new URLSearchParams('peer=npub_z'), contacts)).toBeNull();
+	});
+});
+
+describe('countListingItems (devtest #7 paywall)', () => {
+	it('counts every node recursively (files + folders)', () => {
+		const tree = [
+			{ name: 'a', children: [] },
+			{ name: 'b', children: [{ name: 'b1', children: [] }, { name: 'b2', children: [{ name: 'b2a', children: [] }] }] },
+		];
+		expect(countListingItems(tree)).toBe(5); // a, b, b1, b2, b2a
+	});
+
+	it('is 0 for an empty listing and tolerates a missing children field', () => {
+		expect(countListingItems([])).toBe(0);
+		expect(countListingItems([{ name: 'x' }])).toBe(1);
 	});
 });

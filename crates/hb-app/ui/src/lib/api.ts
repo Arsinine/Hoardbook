@@ -25,6 +25,7 @@ import type {
 	TopicLookup,
 	ChannelPost,
 	ChannelView,
+	TopicAnnounceSummary,
 	DmRequestView,
 } from './types.js';
 
@@ -96,8 +97,16 @@ export const getCollections = () => invoke<Collection[]>('get_collections');
 
 export const deleteCollection = (slug: string) => invoke<void>('delete_collection', { slug });
 
+/** The outcome of publishing a Public collection (devtest #7) — `truncated` when the listing was too
+ *  large and only a paywall teaser (`shown_items` of `total_items`) was published. */
+export interface PublishSummary {
+	truncated: boolean;
+	shown_items: number;
+	total_items: number;
+}
+
 export const publishCollection = (slug: string) =>
-	invoke<void>('publish_collection', { slug });
+	invoke<PublishSummary>('publish_collection', { slug });
 
 /** Unpublish a collection (spec §4): NIP-09-deletes its listing events (Public only — a Private
  *  collection's gift-wrapped events are ephemeral-keyed and cannot be deleted by this identity),
@@ -380,3 +389,15 @@ export const topicAnnounce = (topicId: string, body: string) =>
 /** Remaining announce cooldown for `topicId`, in seconds (0 = ready) — drives the button state. */
 export const topicAnnounceStatus = (topicId: string) =>
 	invoke<number>('topic_announce_status', { topicId });
+
+/** devtest #2 — newest announcement per joined Topic, for the nav-badge/toast alert poll. Reads only. */
+export const topicAnnouncements = () =>
+	invoke<TopicAnnounceSummary[]>('topic_announcements');
+
+/** devtest #2 — persisted per-topic announcement-seen watermarks (topic_id → newest seen ts). */
+export const topicAnnounceSeen = () =>
+	invoke<Record<string, number>>('topic_announce_seen');
+
+/** devtest #2 — mark a Topic's announcements read up to `ts` (advances the watermark, never rewinds). */
+export const topicAnnounceMarkSeen = (topicId: string, ts: number) =>
+	invoke<void>('topic_announce_mark_seen', { topicId, ts });

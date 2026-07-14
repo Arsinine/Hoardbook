@@ -62,11 +62,38 @@ pub fn render_listing(payloads: &[String]) -> Result<RenderedListing, NetError> 
     if payloads.is_empty() {
         return Err(NetError::Split("no listing payloads to render".into()));
     }
+    // devtest #7: a plain unsplit listing (metadata + `entries`, no split/part/parts_v markers) is the
+    // authoritative whole listing for its d-tag — a truncated paywall teaser, or an unsplit collection.
+    // When it arrives ALONGSIDE stray `#partN` payloads (orphans a relay still serves after a
+    // previously-split collection was republished as one event), those parts are stale: render the
+    // single and ignore the rest, rather than routing to the split reader and finding no valid index.
+    if payloads.len() > 1 {
+        if let Some(single) = payloads.iter().find(|p| is_plain_unsplit(p)) {
+            return render_v1(std::slice::from_ref(single));
+        }
+    }
     match parts_version(payloads)? {
         None | Some(1) => render_v1(payloads),
         Some(2) => render_v2(payloads),
         Some(v) => Err(NetError::Split(format!("unknown parts version {v}"))),
     }
+}
+
+/// True iff `json` is a plain, unsplit listing payload: a JSON object carrying `entries` and NONE of
+/// the split/part markers (`split`, `part`, `parts_v`). A content part always carries `part`/`parts_v`
+/// and an index carries `split`, so only a whole-listing event matches — making it the authoritative
+/// render source when stale orphan parts share its family (devtest #7).
+fn is_plain_unsplit(json: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(json) else {
+        return false;
+    };
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
+    obj.contains_key("entries")
+        && !obj.contains_key("split")
+        && !obj.contains_key("part")
+        && !obj.contains_key("parts_v")
 }
 
 /// v1 render (shipped, live on relays — absence of `parts_v`, or `parts_v: 1`): extracted verbatim
@@ -365,6 +392,27 @@ mod tests {
             Err(NetError::Split(m)) => assert!(m.contains("part claims"), "got: {m}"),
             other => panic!("expected a wrong-total rejection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn plain_single_wins_over_orphan_split_parts() {
+        // devtest #7: a collection republished as ONE (truncated or whole) event supersedes its old
+        // `d=slug` index but leaves stale `#partN` orphans on the relay. Those orphans carry `parts_v`,
+        // so a naive render would route to v2 and skip the family for want of an index. The plain
+        // unsplit listing must win — the orphans are ignored.
+        let single = serde_json::json!({
+            "slug": "vault", "content_types": ["video"], "truncated": true, "total_items": 900,
+            "entries": [{"name": "a.mkv", "item_type": "File", "children": []}]
+        })
+        .to_string();
+        let orphan0 = serde_json::json!({ "entries": [{"name":"stale0"}], "mount": [], "part": 0, "parts_v": 2 }).to_string();
+        let orphan1 = serde_json::json!({ "entries": [{"name":"stale1"}], "mount": [], "part": 1, "parts_v": 2 }).to_string();
+
+        let r = render_listing(&[single, orphan0, orphan1]).unwrap();
+        assert_eq!(r.entries.len(), 1, "only the authoritative single listing's entries render");
+        assert_eq!(r.entries[0]["name"], serde_json::json!("a.mkv"), "the orphan parts are ignored");
+        assert_eq!(r.meta.get("truncated"), Some(&Value::Bool(true)), "the paywall markers survive in meta");
+        assert_eq!(r.meta.get("total_items").and_then(Value::as_u64), Some(900));
     }
 
     #[test]

@@ -14,7 +14,6 @@
 	import { identity, profile, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
-	import { applyProfilePicture, removeProfilePicture } from '$lib/profile-picture.js';
 
 	let generating = $state(false);
 	let copied = $state(false);
@@ -384,22 +383,7 @@
 	let idInitial = $derived(idName[0]?.toUpperCase() ?? 'Y');
 	let idHue = $derived(avatarHue(idInitial));
 
-	// ── Profile picture (M13 item #13) ─────────────────────────────────────────────
-	let pictureInput: HTMLInputElement | undefined = $state();
-	let pictureBusy = $state(false);
-
-	async function handlePictureFile(e: Event) {
-		const file = (e.target as HTMLInputElement).files?.[0];
-		if (pictureInput) pictureInput.value = ''; // allow re-picking the same file later
-		if (!file) return;
-		pictureBusy = true;
-		try { await applyProfilePicture(file); } finally { pictureBusy = false; }
-	}
-
-	async function handleRemovePicture() {
-		pictureBusy = true;
-		try { await removeProfilePicture(); } finally { pictureBusy = false; }
-	}
+	// Profile picture changing lives on Home (devtest #5) — Settings only displays the avatar.
 
 	function relayDotColor(status: RelayStatus | undefined) {
 		if (status === 'ok') return 'var(--online)';
@@ -434,21 +418,6 @@
 				<div class="identity-info">
 					<div class="identity-name">{idName}</div>
 					<div class="identity-created">Nostr identity (npub)</div>
-					<div class="picture-actions">
-						<button class="btn-default btn-sm" onclick={() => pictureInput?.click()} disabled={pictureBusy}>
-							{pictureBusy ? 'Working…' : 'Change picture'}
-						</button>
-						{#if $profile?.picture}
-							<button class="btn-ghost btn-sm" onclick={handleRemovePicture} disabled={pictureBusy}>Remove picture</button>
-						{/if}
-					</div>
-					<input
-						bind:this={pictureInput}
-						type="file"
-						accept="image/png,image/jpeg,image/webp"
-						style="display:none"
-						onchange={handlePictureFile}
-					/>
 				</div>
 				</div>
 
@@ -795,8 +764,6 @@
 	.identity-name { font-size: 14px; font-weight: 600; }
 
 	.identity-created { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
-
-	.picture-actions { display: flex; gap: 8px; margin-top: 8px; }
 
 	.key-storage-warn {
 		margin-top: 12px;

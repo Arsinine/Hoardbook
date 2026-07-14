@@ -25,7 +25,7 @@ use crate::discover::{ingest_teasers, select_newest_by_created_at, SearchHit};
 use crate::error::NetError;
 use crate::nip65::{bootstrap_order, inbox_order, parse_relay_list};
 use crate::render::{render_listing, RenderedListing};
-use crate::split::split_listing;
+use crate::split::{split_listing, truncate_listing};
 
 /// Parse a pasted share code, surfacing `hb-core`'s codec rejection as a `NetError`. A bare `npub`
 /// is follow-only (no browse-key); a full `hbk1…` carries the browse-key; anything malformed
@@ -34,11 +34,16 @@ pub fn parse_share_code(s: &str) -> Result<ShareCode, NetError> {
     Ok(ShareCode::parse(s)?)
 }
 
-/// The outcome of publishing a (possibly split) listing.
+/// The outcome of publishing a listing.
 #[derive(Debug, Clone)]
 pub struct PublishedListing {
-    /// How many parts were published (1 = unsplit; >1 = index + content parts).
+    /// How many parts were published (1 = unsplit/truncated; >1 = split index + content parts).
     pub parts: usize,
+    /// devtest #7 — whether the listing was truncated to fit a single event (a paywall teaser).
+    pub truncated: bool,
+    /// Item nodes shown vs total (only meaningful when `truncated`); `shown == total` otherwise.
+    pub shown_items: usize,
+    pub total_items: usize,
 }
 
 /// Publish a collection listing: encrypt under `browse_key`, split per-folder when it exceeds
@@ -58,7 +63,33 @@ pub async fn publish_listing(
         let event = build_listing_event(identity, &part.d_tag, browse_key, &part.json)?;
         client.publish(&event).await?;
     }
-    Ok(PublishedListing { parts: parts.len() })
+    Ok(PublishedListing { parts: parts.len(), truncated: false, shown_items: 0, total_items: 0 })
+}
+
+/// Publish a collection listing as a SINGLE event, truncating it (paywall-style) to `max_bytes`
+/// instead of splitting an oversize listing across many part events (devtest #7). A listing that fits
+/// publishes whole; an oversize one publishes a byte-bounded prefix of its tree tagged `truncated` +
+/// `total_items` so a browser renders the kept items behind a "N more hidden" fade. One write, so the
+/// relay-write rate limiter never sees a part flood — the whole reason the owner chose truncation
+/// over the M13 split for large collections. Same parameterized-replaceable `d = slug` as the unsplit
+/// fast path (re-publishing supersedes — N3).
+pub async fn publish_listing_capped(
+    client: &RelayClient,
+    identity: &Identity,
+    slug: &str,
+    browse_key: &BrowseKey,
+    listing_json: &str,
+    max_bytes: usize,
+) -> Result<PublishedListing, NetError> {
+    let t = truncate_listing(listing_json, max_bytes)?;
+    let event = build_listing_event(identity, slug, browse_key, &t.json)?;
+    client.publish(&event).await?;
+    Ok(PublishedListing {
+        parts: 1,
+        truncated: t.truncated,
+        shown_items: t.shown_items,
+        total_items: t.total_items,
+    })
 }
 
 /// The result of browsing a share code: the peer's public teaser (if any), the decrypted listing

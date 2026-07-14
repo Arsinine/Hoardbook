@@ -18,6 +18,10 @@ import {
 	interleaveChannel,
 	resolveTopicParam,
 	createPrimaryAction,
+	unseenTopicAnnouncements,
+	unseenAnnouncementCount,
+	newlyArrivedAnnouncements,
+	announcementBaseline,
 } from './topics-view.js';
 import type { CachedPeer, ChannelPost, AnnouncementView, TopicLookup } from './types.js';
 
@@ -77,6 +81,56 @@ describe('topics-view (M11)', () => {
 	it('rosterLabel_falls_back_to_short_npub_when_unknown', () => {
 		const npub = 'npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqabcd';
 		expect(rosterLabel(npub, [])).toBe(`${npub.slice(0, 8)}…${npub.slice(-4)}`);
+	});
+
+	// devtest #3: the viewer is never in their own contacts, so their own roster row must resolve via
+	// `self` to their published display_name — "Name (you)" — instead of a bare npub.
+	it('rosterLabel_labels_the_self_entry_with_display_name_and_you', () => {
+		const self = { npub: 'npub1me', display_name: 'Me' };
+		expect(rosterLabel('npub1me', [], self)).toBe('Me (you)');
+	});
+
+	it('rosterLabel_self_with_blank_name_reads_You', () => {
+		expect(rosterLabel('npub1me', [], { npub: 'npub1me', display_name: '  ' })).toBe('You');
+		expect(rosterLabel('npub1me', [], { npub: 'npub1me' })).toBe('You');
+	});
+
+	it('rosterLabel_self_only_matches_the_own_npub', () => {
+		const npub = 'npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqabcd';
+		expect(rosterLabel(npub, [], { npub: 'npub1me', display_name: 'Me' })).toBe(`${npub.slice(0, 8)}…${npub.slice(-4)}`);
+	});
+});
+
+describe('topics-view — devtest #2 announcement alert', () => {
+	const s = (topic_id: string, latest_ts: number) => ({ topic_id, topic_name: topic_id, latest_ts });
+
+	it('unseenTopicAnnouncements keeps only topics past their seen watermark', () => {
+		const summaries = [s('a', 100), s('b', 200), s('c', 300)];
+		const seen = { a: 100, b: 150 }; // a: exactly seen (not unseen), b: behind, c: never seen
+		expect(unseenTopicAnnouncements(summaries, seen).map((x) => x.topic_id)).toEqual(['b', 'c']);
+		expect(unseenAnnouncementCount(summaries, seen)).toBe(2);
+	});
+
+	it('an absent watermark counts any announcement as unseen', () => {
+		expect(unseenAnnouncementCount([s('a', 1)], {})).toBe(1);
+	});
+
+	it('newlyArrivedAnnouncements only toasts topics newer than the baseline AND unseen', () => {
+		const summaries = [s('a', 200), s('b', 200), s('c', 200)];
+		const seen = { a: 0, b: 250, c: 0 }; // b is already seen past 200 → never toast
+		const baseline = { a: 100, b: 100, c: 200 }; // c unchanged since last poll → not "newly arrived"
+		expect(newlyArrivedAnnouncements(summaries, seen, baseline).map((x) => x.topic_id)).toEqual(['a']);
+	});
+
+	it('the first poll (empty baseline) toasts nothing — the backlog only badges', () => {
+		const summaries = [s('a', 200), s('b', 300)];
+		expect(newlyArrivedAnnouncements(summaries, {}, {})).toEqual([]);
+		// …but it is still unseen for the badge.
+		expect(unseenAnnouncementCount(summaries, {})).toBe(2);
+	});
+
+	it('announcementBaseline maps topic_id → latest_ts', () => {
+		expect(announcementBaseline([s('a', 10), s('b', 20)])).toEqual({ a: 10, b: 20 });
 	});
 });
 

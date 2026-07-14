@@ -2,7 +2,7 @@
 	import { onMount, tick } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
-	import { contacts, identity, inboxMessages, sentMessages, readWatermarks, toast, dmRequests } from '$lib/stores.js';
+	import { contacts, identity, inboxMessages, sentMessages, readWatermarks, toast, dmRequests, announceSeen } from '$lib/stores.js';
 	import {
 		getMessages,
 		sendMessage,
@@ -20,6 +20,7 @@
 		groupsSetTrusted,
 		contactUpdateGroups,
 		advanceReadWatermark,
+		topicAnnounceMarkSeen,
 	} from '$lib/api.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
@@ -82,6 +83,13 @@
 			const view = await topicChannel(topicId);
 			channelPosts = sortChannelPostsAscending(view.posts);
 			channelAnnouncements = view.announcements;
+			// devtest #2: reading the channel clears its Topics nav badge — advance the seen watermark to
+			// the newest announcement and mirror it into the store so the badge updates without a refetch.
+			const newest = view.announcements.reduce((m, a) => Math.max(m, a.ts), 0);
+			if (newest > 0) {
+				announceSeen.update((s) => (newest > (s[topicId] ?? 0) ? { ...s, [topicId]: newest } : s));
+				topicAnnounceMarkSeen(topicId, newest).catch(() => { /* non-fatal — reseeds next launch */ });
+			}
 		} catch { /* relay unreachable */ }
 	}
 

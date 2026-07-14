@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { toast, contacts } from '$lib/stores.js';
+	import { toast, contacts, identity, profile } from '$lib/stores.js';
 	import {
 		topicList,
 		topicCreate,
@@ -334,7 +334,7 @@
 					<div class="detail-section">
 						<div class="section-label">Roster ({roster.length})</div>
 						<ul class="roster">
-							{#each roster as npub (npub)}<li>{rosterLabel(npub, $contacts)}</li>{/each}
+							{#each roster as npub (npub)}<li>{rosterLabel(npub, $contacts, $identity ? { npub: $identity.npub, display_name: $profile?.display_name } : null)}</li>{/each}
 						</ul>
 					</div>
 

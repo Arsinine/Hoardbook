@@ -14,6 +14,9 @@ export const DM_POLL_VISIBLE_MS = 15_000;
 export const NAV_POLL_VISIBLE_MS = 20_000;
 /** Online-count chip poll cadence while visible. */
 export const ONLINE_POLL_VISIBLE_MS = 60_000;
+/** Topic-announcement alert poll cadence (devtest #2) — announcements are rate-limited to 1/topic/hr,
+ *  and this reads every joined topic's channel, so it runs slower than the DM/nav polls. */
+export const ANNOUNCE_POLL_VISIBLE_MS = 90_000;
 
 export interface PollState {
 	/** Whether the poll should run in this visibility state. */

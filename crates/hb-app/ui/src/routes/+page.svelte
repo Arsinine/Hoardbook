@@ -111,12 +111,16 @@
 		if (pictureInput) pictureInput.value = ''; // allow re-picking the same file
 		if (!file) return;
 		pictureBusy = true;
-		try { await applyProfilePicture(file); } finally { pictureBusy = false; }
+		try {
+			// devtest #4: the picture lives on the shared profile store, but the editor `form` is what
+			// Save/Publish persist. Sync it back or the next publish rewrites `form` and reverts the image.
+			if (await applyProfilePicture(file)) form.picture = $profile?.picture;
+		} finally { pictureBusy = false; }
 	}
 
 	async function handleRemovePicture() {
 		pictureBusy = true;
-		try { await removeProfilePicture(); } finally { pictureBusy = false; }
+		try { await removeProfilePicture(); form.picture = $profile?.picture; } finally { pictureBusy = false; }
 	}
 
 	// ── Publish-button dirty tracking ───────────────────────────────────────────
@@ -287,9 +291,16 @@
 
 	async function handlePublishCollection(slug: string) {
 		try {
-			await publishCollection(slug);
+			const summary = await publishCollection(slug);
 			collections.update(cols => cols.map(c => c.slug === slug ? { ...c, published: true } : c));
-			toast('Collection published');
+			// devtest #7: a too-large collection publishes only a truncated paywall teaser — tell the user
+			// their browsers see a preview, not the whole thing.
+			if (summary.truncated) {
+				const hidden = Math.max(0, summary.total_items - summary.shown_items);
+				toast(`Published a preview — this collection is too large to publish in full, so ${hidden.toLocaleString()} of ${summary.total_items.toLocaleString()} items are hidden from browsers.`);
+			} else {
+				toast('Collection published');
+			}
 		} catch (e) {
 			toast(String(e), 'error');
 		}
