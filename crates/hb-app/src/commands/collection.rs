@@ -2,7 +2,7 @@ use std::path::Path;
 use globset::{Glob, GlobSetBuilder};
 use hb_core::types::{Collection, DirectoryItem, ItemType, Visibility};
 use hb_core::{BrowseKey, Identity};
-use hb_net::publish_listing;
+use hb_net::publish_listing_capped;
 use nostr::{Filter, Kind};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -18,6 +18,23 @@ use crate::{
 /// NIP-44 listing split budget (NIP-44 caps plaintext, the relay caps the event ~64 KiB; ≤40 KB
 /// keeps a single part well under both). Larger listings split per-folder (hb-net::split_listing).
 const LISTING_MAX_BYTES: usize = 40_000;
+
+/// The result of publishing a Public collection (devtest #7) — whether it was truncated to a paywall
+/// teaser, and how many item nodes browsers can see vs how many the full collection holds. The
+/// frontend uses this to tell the user their large collection is showing a preview.
+#[derive(Debug, Clone, Serialize)]
+pub struct PublishSummary {
+    pub truncated: bool,
+    pub shown_items: usize,
+    pub total_items: usize,
+}
+
+impl PublishSummary {
+    /// A non-truncated publish (fits whole, or a Private collection — never truncated).
+    fn whole() -> Self {
+        Self { truncated: false, shown_items: 0, total_items: 0 }
+    }
+}
 
 /// Collection with publication status, returned to the frontend.
 #[derive(Debug, Clone, Serialize)]
@@ -38,23 +55,30 @@ pub struct CollectionEntry {
 pub struct ScanOptions {
     pub path: String,
     pub path_alias: String,
-    /// Relative, "/"-separated directory paths the user checked in the folder-tree picker. Each
-    /// checked folder (and everything under it) is walked in full; root-level loose files are always
-    /// included. Replaces the former `depth` slider (M8, HANDOVER §A2.1).
+    /// Relative, "/"-separated paths the user checked in the picker. A checked *folder* (and
+    /// everything under it) is walked in full; a checked *file* is force-included even when its parent
+    /// folder is not checked (devtest #10); root-level loose files are always included. Replaces the
+    /// former `depth` slider (M8, HANDOVER §A2.1).
     #[serde(default)]
     pub include: Vec<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
 }
 
-/// An immediate child directory of a scanned path — drives one node of the folder-tree picker.
+/// An immediate child of a scanned path — one node of the folder-tree picker. Both directories and
+/// files are listed (devtest #10 — individual files are selectable, not just whole folders).
 #[derive(Debug, Clone, Serialize)]
 pub struct SubdirEntry {
     pub name: String,
     /// Absolute path on disk (handed back so the frontend can lazily expand this node).
     pub path: String,
-    /// True if this directory itself contains at least one sub-directory (drives the ▶ expander).
+    /// True if this node has expandable children (a sub-directory OR loose files). A file is always
+    /// `false`; a directory is `true` iff it contains at least one child (drives the ▶ expander).
     pub has_children: bool,
+    /// True for a file leaf, false for a directory (devtest #10 — the picker renders + selects them
+    /// differently: a checked file is force-included even when its parent folder is not checked).
+    #[serde(default)]
+    pub is_file: bool,
 }
 
 #[tauri::command]
@@ -242,10 +266,23 @@ pub(crate) fn rescan_listing(slug: &str, store: &DataStore) -> Result<Option<Vec
 pub async fn delete_collection(
     slug: String,
     store: State<'_, DataStore>,
+    identity: State<'_, SharedIdentity>,
+    relay: State<'_, SharedRelay>,
 ) -> CmdResult<()> {
     let safe_slug = is_valid_slug(&slug)
         .then_some(slug.as_str())
         .ok_or("Invalid collection slug")?;
+    // devtest #11: a published collection contributes to the profile teaser's content_types union and
+    // still has listing events on relays. Unpublish it first (NIP-09 delete + teaser content_types/tags
+    // recompute, both best-effort offline) so removal drops it from the public teaser AND from relays,
+    // then delete the local draft/marker.
+    if store.is_published(safe_slug) {
+        let id_clone = {
+            let guard = identity.read().await;
+            guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?.identity.clone()
+        };
+        unpublish_collection_inner(safe_slug, &store, &id_clone, &relay).await?;
+    }
     store.delete_collection(safe_slug).map_err(cmd_err)
 }
 
@@ -372,28 +409,38 @@ pub(crate) async fn publish_collection_inner(
     identity: &Identity,
     browse_key: &BrowseKey,
     relay: &SharedRelay,
-) -> Result<(), String> {
+) -> Result<PublishSummary, String> {
     let listing_json = prepare_listing(slug, store)?;
 
     // Visibility gate: a Private collection takes the sealed, per-recipient path and never touches
-    // the browse-key or the public teaser.
+    // the browse-key or the public teaser (and is never truncated — trusted recipients get it all).
     let visibility = store
         .load_collection_draft(slug)
         .map_err(cmd_err)?
         .map(|c| c.visibility)
         .unwrap_or(Visibility::Public);
     if visibility == Visibility::Private {
-        return publish_private_collection_inner(slug, store, identity, &listing_json, relay).await;
+        publish_private_collection_inner(slug, store, identity, &listing_json, relay).await?;
+        return Ok(PublishSummary::whole());
     }
 
     let client = net::client(identity, store, relay).await.map_err(cmd_err)?;
+    // devtest #7: publish a single event, truncated (paywall teaser) when the listing is too large,
+    // instead of splitting it across many part events.
     let published =
-        publish_listing(&client, identity, slug, browse_key, &listing_json, LISTING_MAX_BYTES)
+        publish_listing_capped(&client, identity, slug, browse_key, &listing_json, LISTING_MAX_BYTES)
             .await
             .map_err(cmd_err)?;
 
-    // Local published marker (the "published" badge + content_types union).
-    let marker = serde_json::json!({ "parts": published.parts }).to_string();
+    // Local published marker (the "published" badge + content_types union), now also recording the
+    // truncation state for reference.
+    let marker = serde_json::json!({
+        "parts": published.parts,
+        "truncated": published.truncated,
+        "shown_items": published.shown_items,
+        "total_items": published.total_items,
+    })
+    .to_string();
     store.save_published(slug, &marker).map_err(cmd_err)?;
 
     // M9: record the snapshot fingerprint of what we just published, so a later watch re-scan that
@@ -405,7 +452,12 @@ pub(crate) async fn publish_collection_inner(
 
     // Keep a published teaser's content_types/tags aggregation current (M13 W5 item 2 folds tags
     // into the union too — see `refresh_published_teaser`).
-    refresh_published_teaser(store, identity, relay).await
+    refresh_published_teaser(store, identity, relay).await?;
+    Ok(PublishSummary {
+        truncated: published.truncated,
+        shown_items: published.shown_items,
+        total_items: published.total_items,
+    })
 }
 
 /// If a profile teaser is currently published, recompute its content_types/tags aggregation and
@@ -475,7 +527,7 @@ pub async fn publish_collection(
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
     relay: State<'_, SharedRelay>,
-) -> CmdResult<()> {
+) -> CmdResult<PublishSummary> {
     let (id_clone, browse_key) = {
         let guard = identity.read().await;
         let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
@@ -813,7 +865,12 @@ fn scan_selective_walk(
                 note: None,
                 children,
             });
-        } else if meta.is_file() && list_loose_files {
+        } else if meta.is_file() && (list_loose_files || include.is_included(&rel_path)) {
+            // devtest #10: a file is included when it lives in the root/an included directory (the
+            // existing folder rule) OR when it is *itself* checked — so the user can pick individual
+            // files inside a directory they did not select wholesale. `has_descendant_under` already
+            // keeps this file's ancestor directories traversable above (they're withheld as loose
+            // files but recursed to reach the checked file).
             total_bytes += meta.len();
             items.push(DirectoryItem {
                 name: name.clone(),
@@ -838,36 +895,46 @@ fn scan_selective_walk(
     Ok((items, total_bytes))
 }
 
-/// Enumerate the immediate child *directories* of `path` (sorted), each tagged with whether it has
-/// sub-directories of its own (drives the picker's ▶ expander). Pure core behind `list_subdirs`.
+/// Enumerate the immediate children of `path` — sub-directories AND files (devtest #10), sorted
+/// directories-first then alphabetical. A directory is tagged with whether it has children of its own
+/// (drives the picker's ▶ expander); a file is a leaf. Pure core behind `list_subdirs`.
 pub(crate) fn list_subdirs_core(path: &str) -> anyhow::Result<Vec<SubdirEntry>> {
     let root = Path::new(path);
     anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
     let mut entries: Vec<SubdirEntry> = vec![];
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
-        if !entry.metadata()?.is_dir() {
+        let meta = entry.metadata()?;
+        let is_dir = meta.is_dir();
+        // Skip anything that is neither a plain directory nor a file (sockets, fifos, …).
+        if !is_dir && !meta.is_file() {
             continue;
         }
         let child_path = entry.path();
         entries.push(SubdirEntry {
             name: entry.file_name().to_string_lossy().into_owned(),
-            has_children: dir_has_subdir(&child_path),
+            has_children: is_dir && dir_has_children(&child_path),
             path: child_path.to_string_lossy().into_owned(),
+            is_file: !is_dir,
         });
     }
-    entries.sort_by_key(|e| e.name.to_lowercase());
+    // Directories first, then files; each group alphabetical (matches `scan_selective_walk`'s order).
+    entries.sort_by(|a, b| match (a.is_file, b.is_file) {
+        (false, true) => std::cmp::Ordering::Less,
+        (true, false) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    });
     Ok(entries)
 }
 
-/// Cheap "does this directory contain at least one sub-directory?" probe (stops at the first hit).
+/// Cheap "does this directory contain at least one child (sub-directory or file)?" probe (stops at
+/// the first hit) — drives the picker's ▶ expander now that files are selectable too (devtest #10).
 /// An unreadable directory reports `false` rather than erroring — the expander simply won't show.
-fn dir_has_subdir(dir: &Path) -> bool {
-    let Ok(rd) = std::fs::read_dir(dir) else {
+fn dir_has_children(dir: &Path) -> bool {
+    let Ok(mut rd) = std::fs::read_dir(dir) else {
         return false;
     };
-    rd.filter_map(|e| e.ok())
-        .any(|e| e.metadata().map(|m| m.is_dir()).unwrap_or(false))
+    rd.next().is_some()
 }
 
 fn build_glob_set(patterns: &[String]) -> globset::GlobSet {
@@ -1160,19 +1227,40 @@ mod tests {
     // ── list_subdirs (lazy child enumeration for the picker) ──────────────────
 
     #[test]
-    fn list_subdirs_returns_sorted_immediate_children_with_has_children() {
+    fn list_subdirs_returns_dirs_then_files_with_has_children() {
         let dir = tempfile::tempdir().unwrap();
         make_selective_tree(dir.path());
 
         let entries = list_subdirs_core(&dir.path().to_string_lossy()).unwrap();
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        // immediate child DIRECTORIES only, sorted; loose files excluded.
-        assert_eq!(names, vec!["a", "x"], "immediate child dirs, sorted, no files");
+        // devtest #10: immediate children now include FILES — directories first (sorted), then files.
+        assert_eq!(names, vec!["a", "x", "root.txt"], "dirs first, then files, each sorted");
         let a = entries.iter().find(|e| e.name == "a").unwrap();
-        assert!(a.has_children, "a has subdir b → expander shown");
-        // a leaf dir reports no children.
+        assert!(!a.is_file && a.has_children, "a is a dir with children → expander shown");
+        let root_file = entries.iter().find(|e| e.name == "root.txt").unwrap();
+        assert!(root_file.is_file && !root_file.has_children, "a file is a leaf, never expandable");
+        // A directory that holds only files is still expandable (so its files can be picked).
         let leaf = list_subdirs_core(&dir.path().join("a").join("b").join("c").to_string_lossy()).unwrap();
-        assert!(leaf.is_empty(), "c has no subdirs");
+        assert_eq!(leaf.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), vec!["c_file.txt"]);
+        assert!(leaf[0].is_file, "c holds a file leaf");
+    }
+
+    /// devtest #10: an explicitly-checked FILE deep inside otherwise-unselected directories is
+    /// included — without pulling in its siblings — so the user can curate individual files.
+    #[test]
+    fn scan_selective_includes_an_individually_checked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        make_selective_tree(dir.path());
+
+        let (items, _) = scan_selective(dir.path(), &include(&["a/b/c/c_file.txt"]), &empty_globs()).unwrap();
+        let json = serde_json::to_string(&items).unwrap();
+        // The checked file is present...
+        assert!(json.contains("c_file.txt"), "the individually-checked file is included");
+        // ...but its unchecked siblings (a's + b's loose files) are NOT pulled in wholesale.
+        assert!(!json.contains("a_loose.txt"), "an ancestor's loose files stay withheld");
+        assert!(!json.contains("b_file.txt"), "a sibling file in an ancestor dir is not included");
+        // and the unrelated `x` subtree is untouched.
+        assert!(!json.contains("x_loose.txt"));
     }
 
     #[test]
@@ -1578,6 +1666,61 @@ mod tests {
         unpublish_collection_inner("vault", &store, &identity, &relay).await.unwrap();
 
         assert!(!store.is_published("vault"), "the published marker must be gone");
+    }
+
+    /// devtest #11: deleting a *published* collection must drop its content_types from the published
+    /// profile teaser's union. The delete path routes a published collection through
+    /// `unpublish_collection_inner` (which recomputes + persists the teaser) before removing the local
+    /// draft. Unroutable relay so the best-effort NIP-09 attempt fails fast — local effects only.
+    #[tokio::test]
+    async fn deleting_a_published_collection_drops_its_content_types_from_the_teaser() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        store
+            .save_settings(&crate::store::Settings {
+                relay_urls: vec!["ws://127.0.0.1:1".into()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        // A published profile teaser + two published public collections.
+        let profile = hb_core::types::Profile {
+            display_name: "Me".into(),
+            bio: None,
+            tags: vec![],
+            since: None,
+            est_size: None,
+            languages: vec![],
+            contact_hint: None,
+            email: None,
+            location: None,
+            social_links: vec![],
+            willing_to: vec![],
+            content_types: vec![],
+            picture: None,
+            updated: chrono::Utc::now(),
+        };
+        store.save_profile_draft(&profile).unwrap();
+        store.save_published("profile", "{}").unwrap();
+        make_collection_draft(&store, "films", vec!["video".into()]);
+        store.save_published("films", r#"{"parts":1}"#).unwrap();
+        make_collection_draft(&store, "music", vec!["audio".into()]);
+        store.save_published("music", r#"{"parts":1}"#).unwrap();
+        assert_eq!(compute_content_types(&store), vec!["audio".to_string(), "video".to_string()]);
+
+        // Delete "films" exactly as `delete_collection` does for a published collection.
+        let identity = Identity::generate();
+        let relay = crate::net::new_shared();
+        unpublish_collection_inner("films", &store, &identity, &relay).await.unwrap();
+        store.delete_collection("films").unwrap();
+
+        // The union — and the persisted teaser draft — no longer carry the deleted collection's type.
+        assert_eq!(compute_content_types(&store), vec!["audio".to_string()]);
+        assert_eq!(
+            store.load_profile_draft().unwrap().unwrap().content_types,
+            vec!["audio".to_string()],
+            "the published teaser draft dropped the deleted collection's content_type"
+        );
     }
 
     // ── M10: visibility + private-recipient gathering ────────────────────────────────

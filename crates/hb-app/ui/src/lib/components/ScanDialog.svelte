@@ -76,7 +76,9 @@
 	}
 
 	function selectAll() {
-		if (topLevel) checked = selectAllTopLevel(topLevel.map((n) => n.name));
+		// devtest #10: "Select all" checks the top-level folders only — root-level files are always
+		// included anyway, so adding them to the set would be redundant noise.
+		if (topLevel) checked = selectAllTopLevel(topLevel.filter((n) => !n.is_file).map((n) => n.name));
 	}
 
 	function clearAll() {
@@ -167,7 +169,7 @@
 				<!-- Folder selection tree -->
 				<div class="field">
 					<div class="field-label-row">
-						<span class="field-label">Folders to include</span>
+						<span class="field-label">Files &amp; folders to include</span>
 						{#if topLevel && topLevel.length > 0}
 							<div class="tree-actions">
 								<button class="link-btn" type="button" onclick={selectAll}>Select all</button>
@@ -181,7 +183,7 @@
 						{:else if treeError}
 							<div class="tree-hint tree-error">{treeError}</div>
 						{:else if !path}
-							<div class="tree-hint">Choose a directory above, then pick which folders to include.</div>
+							<div class="tree-hint">Choose a directory above, then pick which files and folders to include.</div>
 						{:else if topLevel === null}
 							<div class="tree-hint">
 								<button class="link-btn" type="button" onclick={() => loadTopLevel(path)}>
@@ -189,7 +191,7 @@
 								</button>
 							</div>
 						{:else if topLevel.length === 0}
-							<div class="tree-hint">No sub-folders — root-level files will be included.</div>
+							<div class="tree-hint">This directory is empty.</div>
 						{:else}
 							{#each topLevel as node (node.path)}
 								<ScanTreeNode {node} rel={node.name} {checked} onToggle={toggleCheck} />
@@ -197,8 +199,8 @@
 						{/if}
 					</div>
 					<span class="field-hint">
-						Checked folders are scanned in full; root-level files are always included.{#if selectedCount > 0}
-							· {selectedCount} folder{selectedCount !== 1 ? 's' : ''} selected{/if}
+						Checked folders are scanned in full; check individual files to include just those. Root-level files are always included.{#if selectedCount > 0}
+							· {selectedCount} selected{/if}
 					</span>
 				</div>
 

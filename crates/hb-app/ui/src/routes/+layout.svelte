@@ -3,14 +3,15 @@
 	import { onMount } from 'svelte';
 	import { get } from 'svelte/store';
 	import { page } from '$app/stores';
-	import { getIdentity, getProfile, getCollections, getContacts, getMessages, getReadState } from '$lib/api.js';
-	import { identity, profile, collections, contacts, inboxMessages, readWatermarks, toastMessage, appReady, toast, identityLoadError } from '$lib/stores.js';
+	import { getIdentity, getProfile, getCollections, getContacts, getMessages, getReadState, topicAnnouncements, topicAnnounceSeen } from '$lib/api.js';
+	import { identity, profile, collections, contacts, inboxMessages, readWatermarks, toastMessage, appReady, toast, identityLoadError, topicAnnounceSummaries, announceSeen } from '$lib/stores.js';
 	import { totalUnread, unreadByPeer } from '$lib/unread-view.js';
+	import { unseenAnnouncementCount, newlyArrivedAnnouncements, announcementBaseline } from '$lib/topics-view.js';
 	import { listen } from '@tauri-apps/api/event';
 	import { navIcons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import { getVersion } from '@tauri-apps/api/app';
-	import { NAV_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
+	import { NAV_POLL_VISIBLE_MS, ANNOUNCE_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
 	interface Props {
 		children?: import('svelte').Snippet;
 	}
@@ -42,6 +43,11 @@
 			try { readWatermarks.set(await getReadState()); } catch { }
 			try { inboxMessages.set(await getMessages()); } catch { }
 
+			// devtest #2: seed the persisted per-topic announcement-seen watermarks BEFORE the first
+			// alert poll, so an announcement that landed while the app was closed badges without also
+			// toasting a backlog (the baseline stays empty until the first poll).
+			try { announceSeen.set(await topicAnnounceSeen()); } catch { }
+
 			appReady.set(true);
 		})();
 
@@ -70,6 +76,23 @@
 			} catch { }
 		}, NAV_POLL_VISIBLE_MS);
 
+		// devtest #2: topic-announcement alert poll. Reads every joined topic's channel (writes-free, so
+		// no rate-limiter cost), badges the Topics nav item for unseen announcements, and toasts the ones
+		// that arrive live. `announceBaseline` (previous tick's newest ts per topic) gates the toast so
+		// the first poll never toasts the existing backlog — those still badge from the seen watermark.
+		let announceBaseline: Record<string, number> = {};
+		const announcePoll = setInterval(async () => {
+			if (!get(identity) || document.hidden) return;
+			try {
+				const summaries = await topicAnnouncements();
+				for (const s of newlyArrivedAnnouncements(summaries, get(announceSeen), announceBaseline)) {
+					toast(`📣 New announcement in ${s.topic_name}`);
+				}
+				announceBaseline = announcementBaseline(summaries);
+				topicAnnounceSummaries.set(summaries);
+			} catch { }
+		}, ANNOUNCE_POLL_VISIBLE_MS);
+
 		// devtest #2: suppress the default webview right-click menu (Reload / Inspect Element etc.) —
 		// this is a desktop app, not a web page. The app's own custom menus (e.g. the Browse file
 		// row menu) call preventDefault + draw their own UI, so they keep working; this only kills the
@@ -79,6 +102,7 @@
 
 		return () => {
 			clearInterval(poll);
+			clearInterval(announcePoll);
 			unlistenUpdate?.();
 			unlistenDm?.();
 			document.removeEventListener('contextmenu', suppressContextMenu);
@@ -102,6 +126,8 @@
 	// devtest #16: the nav badge derives straight from the persisted per-peer watermark — it clears
 	// per-conversation as each is opened in Chat, not merely by landing on the /chat route.
 	let navUnreadCount = $derived(totalUnread(unreadByPeer($inboxMessages, $readWatermarks, $identity?.npub ?? '')));
+	// devtest #2: the Topics nav badge — joined topics with an announcement past their seen watermark.
+	let navAnnounceCount = $derived(unseenAnnouncementCount($topicAnnounceSummaries, $announceSeen));
 </script>
 
 <div class="frame">
@@ -126,6 +152,8 @@
 				{item.label}
 				{#if item.label === 'Chat' && navUnreadCount > 0}
 					<span class="nav-badge">{navUnreadCount > 99 ? '99+' : navUnreadCount}</span>
+				{:else if item.label === 'Topics' && navAnnounceCount > 0}
+					<span class="nav-badge" title="Unseen topic announcements">{navAnnounceCount > 99 ? '99+' : navAnnounceCount}</span>
 				{/if}
 			</a>
 		{/each}

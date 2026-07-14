@@ -116,6 +116,18 @@ export function peerAccessBadge(peer: { browse_key_hex?: string }): PeerAccessBa
 	};
 }
 
+/** Count every node (file + folder, recursively) in a listing tree. devtest #7 — used to show how
+ *  many items a truncated paywall teaser is hiding: `total_items − countListingItems(listing)`. */
+export function countListingItems(items: readonly unknown[]): number {
+	let n = 0;
+	for (const it of items) {
+		n += 1;
+		const kids = (it as { children?: readonly unknown[] }).children;
+		if (Array.isArray(kids)) n += countListingItems(kids);
+	}
+	return n;
+}
+
 /** Byte-size units, largest first, for `parseEstSize`/`summarizeCollectionsSize` (devtest #7). */
 const SIZE_UNITS: Array<[string, number]> = [
 	['TB', 1024 ** 4],

@@ -744,6 +744,44 @@ impl DataStore {
         }
         Ok(())
     }
+
+    // ── Per-topic announcement-seen watermark (devtest #2) — the Topics nav badge's persisted signal,
+    //    the topic-channel analogue of `read_state.json`: topic_id → newest announcement `ts` the user
+    //    has seen (opened the channel past). Announcement ts is a unix second, so a numeric max is the
+    //    chronological compare (unlike read_state's RFC3339 strings).
+    pub fn announce_seen_path(&self) -> PathBuf {
+        self.base.join("announce_seen.json")
+    }
+
+    pub fn load_announce_seen(&self) -> Result<std::collections::HashMap<String, u64>> {
+        Ok(
+            read_json_lenient::<std::collections::HashMap<String, u64>>(&self.announce_seen_path())
+                .context("loading announce-seen state")?
+                .unwrap_or_default(),
+        )
+    }
+
+    pub fn save_announce_seen(&self, m: &std::collections::HashMap<String, u64>) -> Result<()> {
+        write_json(&self.announce_seen_path(), m).context("saving announce-seen state")
+    }
+
+    /// Advance `topic_id`'s announcement watermark to `ts`, never rewinding. Serialized like
+    /// [`advance_read_watermark`] so two overlapping poll ticks can't interleave the read-modify-write
+    /// and rewind the watermark (resurrecting a phantom badge).
+    pub fn advance_announce_seen(&self, topic_id: &str, ts: u64) -> Result<()> {
+        static ANNOUNCE_SEEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ANNOUNCE_SEEN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut m = self.load_announce_seen()?;
+        let advance = match m.get(topic_id) {
+            Some(existing) => ts > *existing,
+            None => true,
+        };
+        if advance {
+            m.insert(topic_id.to_string(), ts);
+            self.save_announce_seen(&m)?;
+        }
+        Ok(())
+    }
 }
 
 impl DataStore {
@@ -1217,6 +1255,32 @@ mod tests {
         assert_eq!(store.load_published("films").unwrap().as_deref(), Some(r#"{"id":"abc"}"#));
         store.delete_published("films").unwrap();
         assert!(!store.is_published("films"));
+    }
+
+    // ── Announcement-seen watermark (devtest #2) ────────────────────────────────────────────────
+
+    #[test]
+    fn announce_seen_defaults_empty_and_advances_by_max() {
+        let (_dir, store) = test_store();
+        assert!(store.load_announce_seen().unwrap().is_empty(), "no announce-seen state defaults to empty");
+
+        store.advance_announce_seen("topic1", 500).unwrap();
+        // An older ts must not rewind the watermark (would resurrect a phantom badge).
+        store.advance_announce_seen("topic1", 300).unwrap();
+        assert_eq!(store.load_announce_seen().unwrap().get("topic1").copied(), Some(500));
+
+        // A newer ts advances it.
+        store.advance_announce_seen("topic1", 900).unwrap();
+        assert_eq!(store.load_announce_seen().unwrap().get("topic1").copied(), Some(900));
+    }
+
+    #[test]
+    fn announce_seen_is_wiped_with_the_rest_of_the_profile() {
+        let (_dir, store) = test_store();
+        store.advance_announce_seen("topic1", 1).unwrap();
+        assert!(store.announce_seen_path().exists());
+        store.wipe().unwrap();
+        assert!(!store.announce_seen_path().exists(), "announce_seen.json must be removed by wipe()");
     }
 
     // ── Read state (devtest #16) ────────────────────────────────────────────────────────────────

@@ -120,6 +120,13 @@ pub struct PeerCollection {
     /// Parts actually present. `None` alongside `parts_total` for a pre-M13 cached entry.
     #[serde(default)]
     pub parts_present: Option<usize>,
+    /// devtest #7 — true when the author published only a truncated paywall teaser of this collection
+    /// (too large to publish whole). `total_items` is the full item count; the browser shows the kept
+    /// entries followed by a "N more hidden" fade. `None` for a listing without the marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_items: Option<usize>,
 }
 
 /// Map a `RenderedListing` (meta + entries, from `hb_net::browse_peer_listings`) back into a
@@ -128,12 +135,18 @@ pub struct PeerCollection {
 /// Unparseable meta (a family that doesn't decode as a `Collection`) → `None`, never a hard error.
 pub(crate) fn rendered_to_peer_collection(r: &RenderedListing) -> Option<PeerCollection> {
     let mut map = r.meta.clone();
+    // devtest #7: pull the paywall-teaser markers out of the meta before it's decoded as a Collection
+    // (which has no such fields) — they become PeerCollection browse-time signals, like the K-of-N counts.
+    let truncated = map.remove("truncated").and_then(|v| v.as_bool());
+    let total_items = map.remove("total_items").and_then(|v| v.as_u64()).map(|n| n as usize);
     map.insert("listing".into(), serde_json::Value::Array(r.entries.clone()));
     let collection: Collection = serde_json::from_value(serde_json::Value::Object(map)).ok()?;
     Some(PeerCollection {
         collection,
         parts_total: Some(r.parts_total),
         parts_present: Some(r.parts_present),
+        truncated,
+        total_items,
     })
 }
 
@@ -541,6 +554,28 @@ mod tests {
             missing: vec![],
         };
         assert!(rendered_to_peer_collection(&malformed).is_none(), "unparseable meta must convert to None");
+    }
+
+    #[test]
+    fn rendered_listing_carries_the_paywall_truncation_markers() {
+        // devtest #7: a browsed truncated teaser's `truncated`/`total_items` markers ride in the meta
+        // and surface on the PeerCollection (they are NOT Collection fields, so they must be pulled
+        // out before the meta is decoded as a Collection — otherwise a stricter Collection would reject
+        // the unknown keys).
+        let mut meta = valid_meta("bigvault");
+        meta.insert("truncated".into(), serde_json::json!(true));
+        meta.insert("total_items".into(), serde_json::json!(9000));
+        let rendered = RenderedListing {
+            meta,
+            entries: vec![serde_json::json!({"name": "a.mkv", "item_type": "File", "tags": [], "children": []})],
+            parts_total: 1,
+            parts_present: 1,
+            missing: vec![],
+        };
+        let peer_col = rendered_to_peer_collection(&rendered).expect("markers must not break the decode");
+        assert_eq!(peer_col.truncated, Some(true));
+        assert_eq!(peer_col.total_items, Some(9000));
+        assert_eq!(peer_col.collection.slug, "bigvault");
     }
 
     #[test]

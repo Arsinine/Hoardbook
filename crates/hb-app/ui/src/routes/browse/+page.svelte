@@ -5,7 +5,7 @@
 	import { page } from '$app/stores';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
-	import { collectionAvailability, peerAccessBadge, peerFromQuery } from '$lib/browse-view.js';
+	import { collectionAvailability, peerAccessBadge, peerFromQuery, countListingItems } from '$lib/browse-view.js';
 	import type { CachedPeer, Collection, DirectoryItem } from '$lib/types.js';
 
 	type BcItem =
@@ -95,20 +95,8 @@
 	}
 
 	// Build the relative path for a file within the collection.
-	function itemPath(item: DirectoryItem): string {
-		return [...folderStack.map(f => f.name), item.name].join('/');
-	}
-
-	// ── Context menu ────────────────────────────────────────────────────────────
-	let ctxMenu: { x: number; y: number; item: DirectoryItem } | null = $state(null);
-
-	function openCtxMenu(e: MouseEvent, item: DirectoryItem) {
-		if (item.item_type !== 'File') return;
-		e.preventDefault();
-		ctxMenu = { x: e.clientX, y: e.clientY, item };
-	}
-
-	function closeCtxMenu() { ctxMenu = null; }
+	// devtest #9: no right-click "Copy path" — Hoardbook shows metadata only and moves no files, so
+	// there's nothing to copy a usable path to; the context menu is removed entirely.
 
 	// §6 Discovery moved to Contacts (devtest 2026-06-25 #6). Browse is now purely "browse a contact's
 	// collections" — pick someone from the People list on the left.
@@ -135,6 +123,15 @@
 		if (a.item_type !== b.item_type) return a.item_type === 'Folder' ? -1 : 1;
 		return a.name.localeCompare(b.name);
 	}));
+	// devtest #7: a peer's collection published as a truncated paywall teaser (too large to publish
+	// whole). Shown at the collection root, where the dropped tail entries make the fade honest.
+	let paywall = $derived.by(() => {
+		const c = selectedCollection;
+		if (!c?.truncated || !c.total_items || folderStack.length > 0) return null;
+		const shown = countListingItems(c.listing);
+		const hidden = Math.max(0, c.total_items - shown);
+		return hidden > 0 ? { shown, hidden, total: c.total_items } : null;
+	});
 	let breadcrumbs = $derived<BcItem[]>([
 		...(selectedPeer ? [{ label: peerName(selectedPeer), kind: 'contact' as const }] : []),
 		...(selectedCollection ? [{ label: selectedCollection.path_alias, kind: 'collection' as const }] : []),
@@ -298,8 +295,6 @@
 									class:file-folder={item.item_type === 'Folder'}
 									class:file-leaf={item.item_type === 'File'}
 									onclick={() => { if (item.item_type === 'Folder') enterFolder(item); }}
-									oncontextmenu={(e) => openCtxMenu(e, item)}
-									title={item.item_type === 'File' ? 'Right-click to copy path' : undefined}
 								>
 									<span class="file-icon">
 										{@html item.item_type === 'Folder' ? icons.folder : icons.file}
@@ -309,6 +304,19 @@
 									<span class="file-type">{item.format ?? ''}</span>
 								</button>
 							{/each}
+						</div>
+					{/if}
+					{#if paywall}
+						<!-- devtest #7: paywall fade — the owner published only a preview of a too-large collection. -->
+						<div class="paywall">
+							<div class="paywall-fade"></div>
+							<div class="paywall-note">
+								<span class="paywall-lock">🔒</span>
+								<div>
+									<div class="paywall-title">{paywall.hidden.toLocaleString()} more item{paywall.hidden !== 1 ? 's' : ''} hidden</div>
+									<div class="paywall-sub">Showing {paywall.shown.toLocaleString()} of {paywall.total.toLocaleString()} — this collection is too large to publish in full.</div>
+								</div>
+							</div>
 						</div>
 					{/if}
 					{#if collectionAvailability(selectedCollection)}
@@ -327,21 +335,6 @@
 		{/if}
 	</div>
 </div>
-
-<!-- Context menu -->
-{#if ctxMenu}
-	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-	<div class="ctx-backdrop" onclick={closeCtxMenu}></div>
-	<div class="ctx-menu" style="left:{ctxMenu.x}px;top:{ctxMenu.y}px">
-		<button class="ctx-item" onclick={() => {
-			if (ctxMenu) navigator.clipboard.writeText(itemPath(ctxMenu.item)).catch(() => {});
-			closeCtxMenu();
-		}}>
-			<span class="ctx-icon">{@html icons.copy}</span>
-			Copy path
-		</button>
-	</div>
-{/if}
 
 <style>
 	.browse-shell {
@@ -558,6 +551,25 @@
 		color: var(--fg-dim);
 		flex-shrink: 0;
 	}
+
+	/* devtest #7: paywall teaser — a gradient fade over the last rows + a "N more hidden" note. */
+	.paywall { position: relative; flex-shrink: 0; }
+	.paywall-fade {
+		height: 56px;
+		margin-top: -56px;
+		pointer-events: none;
+		background: linear-gradient(to bottom, transparent, var(--bg) 92%);
+	}
+	.paywall-note {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 12px 16px 16px;
+		color: var(--fg-muted);
+	}
+	.paywall-lock { font-size: 16px; flex-shrink: 0; }
+	.paywall-title { font-size: 12.5px; font-weight: 600; color: var(--fg); }
+	.paywall-sub { font-size: 11.5px; color: var(--fg-dim); margin-top: 1px; }
 
 	/* No-download footer note */
 	.no-download-note {
@@ -789,42 +801,4 @@
 		white-space: nowrap;
 	}
 
-	/* ── Context menu ────────────────────────────────────────────── */
-
-	.ctx-backdrop {
-		position: fixed;
-		inset: 0;
-		z-index: var(--z-menu);
-	}
-
-	.ctx-menu {
-		position: fixed;
-		z-index: var(--z-menu);
-		min-width: 160px;
-		background: var(--bg-elev3);
-		border: 1px solid var(--border-strong);
-		border-radius: 8px;
-		padding: 4px;
-		box-shadow: 0 8px 24px oklch(0 0 0 / 0.4);
-	}
-
-	.ctx-item {
-		display: flex;
-		align-items: center;
-		gap: 9px;
-		width: 100%;
-		padding: 7px 10px;
-		background: transparent;
-		border: none;
-		border-radius: 5px;
-		font-family: var(--font-ui);
-		font-size: 12.5px;
-		color: var(--fg);
-		cursor: pointer;
-		text-align: left;
-	}
-
-	.ctx-item:hover { background: var(--bg-elev2); }
-
-	.ctx-icon { color: var(--fg-dim); display: flex; flex-shrink: 0; }
 </style>

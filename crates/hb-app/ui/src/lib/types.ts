@@ -84,6 +84,11 @@ export interface Collection {
 	 *  `browse-view.ts::collectionAvailability` (never render a badge from missing data). */
 	parts_total?: number;
 	parts_present?: number;
+	/** devtest #7 — set when browsing a peer who published only a truncated paywall teaser (collection
+	 *  too large to publish whole): the listing carries the first items and `total_items` is the full
+	 *  count, so the browser shows the shown items behind a "N more hidden" fade. Absent when whole. */
+	truncated?: boolean;
+	total_items?: number;
 }
 
 /** A trusted peer's decrypted Private collections, grouped by author npub (M10 browse). */
@@ -129,8 +134,11 @@ export interface SubdirEntry {
 	name: string;
 	/** Absolute path on disk, used to lazily expand this node's own children. */
 	path: string;
-	/** True if this directory has sub-directories of its own (drives the ▶ expander). */
+	/** True if this node has expandable children — a sub-directory or loose files (drives the ▶
+	 *  expander). Always false for a file leaf. */
 	has_children: boolean;
+	/** True for a file leaf, false for a directory (devtest #10 — files are individually selectable). */
+	is_file?: boolean;
 }
 
 /** Per-collection persisted state. The transfer-era fields (enabled/allowed_paths/speed_cap/
@@ -212,6 +220,14 @@ export interface AnnouncementView {
 export interface ChannelView {
 	posts: ChannelPost[];
 	announcements: AnnouncementView[];
+}
+
+/** One joined Topic's newest member-broadcast (devtest #2) — the background alert poll's per-topic
+ *  row: the Topics nav badge + toast flag it when `latest_ts` is past the seen watermark. */
+export interface TopicAnnounceSummary {
+	topic_id: string;
+	topic_name: string;
+	latest_ts: number;
 }
 
 // ── Q7 — the stranger-DM Request inbox (M13 Part B) ──────────────────────────

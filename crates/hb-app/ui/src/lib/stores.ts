@@ -1,5 +1,5 @@
 import { writable } from 'svelte/store';
-import type { CachedPeer, Collection, IdentityInfo, Profile, ReceivedMessage, DmRequestView } from './types.js';
+import type { CachedPeer, Collection, IdentityInfo, Profile, ReceivedMessage, DmRequestView, TopicAnnounceSummary } from './types.js';
 
 export const identity = writable<IdentityInfo | null>(null);
 export const profile = writable<Profile | null>(null);
@@ -31,6 +31,12 @@ export const identityLoadError = writable<string | null>(null);
  *  `read_state.json` — the single source of truth the unread badge derives from (devtest #16:
  *  replaces the three unsynchronized mechanisms this used to be spread across). */
 export const readWatermarks = writable<Record<string, string>>({});
+
+/** devtest #2 — the background announcement poll's latest per-topic summaries, and the persisted
+ *  per-topic seen watermarks (topic_id → newest seen ts) mirroring `announce_seen.json`. The Topics
+ *  nav badge derives from both together (a topic is "unseen" when its latest_ts is past its watermark). */
+export const topicAnnounceSummaries = writable<TopicAnnounceSummary[]>([]);
+export const announceSeen = writable<Record<string, number>>({});
 
 export function toast(text: string, kind: 'success' | 'error' = 'success') {
 	toastMessage.set({ text, kind });

@@ -104,9 +104,15 @@
 		publishing = true;
 		try {
 			const updated = await persist();
-			await publishCollection(collection.slug);
+			const summary = await publishCollection(collection.slug);
 			onpublished?.({ ...updated, published: true });
-			toast('Collection published');
+			// devtest #7: a too-large collection publishes only a truncated paywall teaser.
+			if (summary?.truncated) {
+				const hidden = Math.max(0, summary.total_items - summary.shown_items);
+				toast(`Published a preview — too large to publish in full, so ${hidden.toLocaleString()} of ${summary.total_items.toLocaleString()} items are hidden from browsers.`);
+			} else {
+				toast('Collection published');
+			}
 		} catch (e) {
 			toast(String(e), 'error');
 		} finally {

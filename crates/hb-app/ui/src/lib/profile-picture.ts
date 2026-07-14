@@ -1,7 +1,8 @@
-//! Shared profile-picture apply/remove flow (devtest #1) — used by both the Home profile header (the
-//! discoverable spot) and Settings. Compress a picked image → save it onto the local Profile →
-//! republish the teaser if one is already public. Extracted so the two entry points can't drift on
-//! the cap, the publish-on-change rule, or the toasts.
+//! Profile-picture apply/remove flow (devtest #1) — used by the Home profile header (the one
+//! discoverable spot; Settings no longer changes the picture, devtest #5). Compress a picked image →
+//! save it onto the local Profile → republish the teaser if one is already public. The Home caller
+//! must sync its editor `form.picture` from the store afterwards (devtest #4) or the next profile
+//! publish rewrites `form` and reverts the image.
 
 import { get } from 'svelte/store';
 import { saveProfile, hasPublishedProfile, publishProfile } from './api.js';

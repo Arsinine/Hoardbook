@@ -95,8 +95,9 @@ export function groupByGroups(peers: CachedPeer[], groups: Group[]): PhonebookSe
 	return sections;
 }
 
-/** The pinned "● Online now" bucket — every online peer, sorted, additive (they also still appear in
- *  their A-Z/group section). `[]` when nobody is online. */
+/** The pinned "● Online now" bucket — every online peer, sorted. `[]` when nobody is online. In the
+ *  Name view an online peer is shown here *instead of* its A-Z section (devtest #1 — the page filters
+ *  them out of `groupByLetter`); the Groups view drops this bucket entirely (devtest #8). */
 export function onlineBucket(peers: CachedPeer[]): CachedPeer[] {
 	return sortPeers(peers.filter((p) => p.online === true));
 }

@@ -2,7 +2,7 @@
 //! join gate (F12), the topic-contact badge, the spoofable member-count display, and the "joining
 //! unlocks no listings" note. No Svelte, no DOM, no Tauri → unit-testable in the node env.
 
-import type { CachedPeer, ContactSource, ChannelPost, AnnouncementView, TopicLookup } from './types.js';
+import type { CachedPeer, ContactSource, ChannelPost, AnnouncementView, TopicLookup, TopicAnnounceSummary } from './types.js';
 import { contactDisplayName } from './contact-display.js';
 
 /** Public-join consent: the visibility is the deal. Anyone who joins can see you are a member. */
@@ -108,10 +108,61 @@ export function isDissolved(rosterSize: number): boolean {
 }
 
 /** The roster row label for a member npub — their petname/display-name when they're already a known
- *  contact, else a short npub (M13 W5 — replaces the bare-npub-only roster render). */
-export function rosterLabel(npub: string, contacts: readonly CachedPeer[]): string {
+ *  contact, else a short npub (M13 W5 — replaces the bare-npub-only roster render). devtest #3: the
+ *  viewer is not in their own contacts, so a `self` (their own npub + published display_name) is
+ *  matched first and rendered as "Name (you)" — never their bare npub. */
+export function rosterLabel(
+	npub: string,
+	contacts: readonly CachedPeer[],
+	self?: { npub: string; display_name?: string } | null,
+): string {
+	if (self && npub === self.npub) {
+		const name = self.display_name?.trim();
+		return name ? `${name} (you)` : 'You';
+	}
 	const contact = contacts.find((c) => c.npub === npub);
 	return contactDisplayName(contact ?? { npub });
+}
+
+// ── devtest #2: topic-announcement alert (nav badge + toast) ──────────────────────────────────────
+
+/** The joined Topics whose newest announcement is past the seen watermark — one entry per topic (an
+ *  absent watermark counts as 0, so any announcement is unseen). Drives the Topics nav badge. */
+export function unseenTopicAnnouncements(
+	summaries: readonly TopicAnnounceSummary[],
+	seen: Readonly<Record<string, number>>,
+): TopicAnnounceSummary[] {
+	return summaries.filter((s) => s.latest_ts > (seen[s.topic_id] ?? 0));
+}
+
+/** The Topics nav-badge count: how many joined Topics have an unseen announcement (topics, not messages). */
+export function unseenAnnouncementCount(
+	summaries: readonly TopicAnnounceSummary[],
+	seen: Readonly<Record<string, number>>,
+): number {
+	return unseenTopicAnnouncements(summaries, seen).length;
+}
+
+/** Toast targets for one alert-poll tick: topics whose newest announcement is BOTH unseen AND newer
+ *  than the previous poll's `baseline` (`topic_id → latest_ts`). Gating on the baseline means the
+ *  first poll after launch (empty baseline) never toasts a backlog — those still badge via the seen
+ *  watermark — and a steady announcement re-toasts only when a genuinely newer one lands. */
+export function newlyArrivedAnnouncements(
+	summaries: readonly TopicAnnounceSummary[],
+	seen: Readonly<Record<string, number>>,
+	baseline: Readonly<Record<string, number>>,
+): TopicAnnounceSummary[] {
+	return summaries.filter(
+		(s) => s.topic_id in baseline && s.latest_ts > baseline[s.topic_id] && s.latest_ts > (seen[s.topic_id] ?? 0),
+	);
+}
+
+/** The next poll's baseline (`topic_id → latest_ts`) from the current summaries — fed back into the
+ *  next [`newlyArrivedAnnouncements`] call so only genuinely newer announcements re-toast. */
+export function announcementBaseline(summaries: readonly TopicAnnounceSummary[]): Record<string, number> {
+	const out: Record<string, number> = {};
+	for (const s of summaries) out[s.topic_id] = s.latest_ts;
+	return out;
 }
 
 // ── W4: public Topic paths (fixed-root category + freeform sub-path) ──────────────────────────────

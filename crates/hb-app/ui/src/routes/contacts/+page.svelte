@@ -281,8 +281,13 @@
 	let visible = $derived(
 		$contacts.filter(c => matchesQuery(c, searchQuery)).filter(c => !filterTag || (c.local_tags ?? []).includes(filterTag))
 	);
-	let online = $derived(onlineBucket(visible));
-	let sections = $derived(view === 'name' ? groupByLetter(visible) : groupByGroups(visible, groups));
+	// #1: an online peer moves OUT of its A-Z section INTO the pinned "Online now" bucket (never both),
+	//     and moves back when it goes offline. #8: the Groups view is for organizing, so it has no
+	//     Online-now bucket and every group lists all its members (online included).
+	let online = $derived(view === 'name' ? onlineBucket(visible) : []);
+	let sections = $derived(
+		view === 'name' ? groupByLetter(visible.filter((c) => !c.online)) : groupByGroups(visible, groups)
+	);
 	let railTargets = $derived(
 		ALPHABET.map(l => ({ label: l, anchorId: l === '#' ? 'sec-hash' : `sec-${l}`, enabled: presentSectionKeys(sections).has(l) }))
 	);
@@ -350,7 +355,12 @@
 			<button class="chevron-btn" onclick={() => toggleDetail(peer.npub)} aria-expanded={isOpen} aria-label="Toggle details">
 				<span class="chevron" class:chevron-open={isOpen}>{@html icons.chevronDown}</span>
 			</button>
-			<Avatar letter={initial} size={34} {hue} picture={peer.profile?.picture} />
+			<div class="avatar-wrap">
+				<Avatar letter={initial} size={34} {hue} picture={peer.profile?.picture} />
+				{#if badge.locked}
+					<span class="lock-overlay" title={badge.hint}>🔒</span>
+				{/if}
+			</div>
 			<div class="contact-info">
 				<div class="name-row">
 					<span class="peer-name">{name}</span>
@@ -374,8 +384,6 @@
 				</div>
 				<div class="contact-sub-row">
 					<div class="mono">{shortId(peer.npub)}</div>
-					<span class="sub-dot">·</span>
-					<span class="access-badge" class:locked={badge.locked} title={badge.hint || undefined}>{badge.icon} {badge.label}</span>
 					{#if peer.collections.length > 0}<span class="sub-dot">·</span><span class="sub-meta">{peer.collections.length} collection{peer.collections.length !== 1 ? 's' : ''}</span>{/if}
 					{#if !badge.locked}
 						{#if sizeSummary}<span class="sub-dot">·</span><span class="sub-meta">{sizeSummary}</span>
@@ -775,9 +783,16 @@
 	.sub-dot { color: var(--fg-dim); }
 	.sub-meta { color: var(--fg-muted); font-feature-settings: 'tnum'; }
 
-	/* Browse-key access badge (devtest #1) — keyed-vs-bare, right on the row. */
-	.access-badge { font-size: 11px; color: var(--fg-muted); }
-	.access-badge.locked { color: oklch(0.72 0.13 70); }
+	/* Browse-key access (devtest #1/#6) — a 🔒 overlay on the avatar for a keyless (locked) contact
+	   replaces the old inline "key needed"/"browseable" text badge; keyed contacts get no marker. */
+	.avatar-wrap { position: relative; flex-shrink: 0; margin-top: 2px; }
+	.lock-overlay {
+		position: absolute; right: -4px; bottom: -4px;
+		font-size: 10px; line-height: 1;
+		padding: 2px; border-radius: 999px;
+		background: var(--bg-elev1);
+		box-shadow: 0 0 0 1px var(--border);
+	}
 	.access-hint { font-size: 10.5px; color: var(--fg-dim); margin-top: 2px; }
 
 	/* Contact-card bio (devtest #7) — render-only, clamped to 2 lines. */

@@ -25,7 +25,16 @@
 	let inputEl: HTMLInputElement | undefined = $state();
 
 	let triStateValue = $derived(triState(rel, checked));
-	let locked = $derived(triStateValue === 'locked');
+	// devtest #10: a root-level (depth 0) file is always included by the scan (loose root files), so
+	// show it locked+checked — honest, and consistent with a file pulled in by a checked parent folder.
+	let rootFileLocked = $derived(node.is_file === true && depth === 0);
+	let locked = $derived(rootFileLocked || triStateValue === 'locked');
+	let isChecked = $derived(rootFileLocked || triStateValue === 'checked' || triStateValue === 'locked');
+	let lockHint = $derived(
+		rootFileLocked
+			? 'Root-level files are always included'
+			: 'Included via a checked parent — uncheck the parent to refine'
+	);
 	// `indeterminate` is a DOM property, not an attribute — set it imperatively so it stays in sync.
 	$effect(() => {
 		if (inputEl) inputEl.indeterminate = triStateValue === 'indeterminate';
@@ -73,14 +82,14 @@
 			<input
 				bind:this={inputEl}
 				type="checkbox"
-				checked={triStateValue === 'checked' || triStateValue === 'locked'}
+				checked={isChecked}
 				disabled={locked}
 				onchange={onCheckChange}
 			/>
-			<span class="node-icon">{@html icons.folder}</span>
+			<span class="node-icon" class:file-icon={node.is_file}>{@html node.is_file ? icons.file : icons.folder}</span>
 			<span class="node-name">{node.name}</span>
 			{#if locked}
-				<span class="lock-badge" title="Included via a checked parent — uncheck the parent to refine">🔒</span>
+				<span class="lock-badge" title={lockHint}>🔒</span>
 			{/if}
 		</label>
 	</div>
@@ -144,6 +153,7 @@
 	.node-label input:disabled { cursor: default; }
 
 	.node-icon { color: var(--accent); display: flex; flex-shrink: 0; }
+	.node-icon.file-icon { color: var(--fg-dim); }
 
 	.node-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 

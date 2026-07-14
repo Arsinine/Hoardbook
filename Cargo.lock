@@ -1726,7 +1726,7 @@ checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
 
 [[package]]
 name = "hb-app"
-version = "0.11.3"
+version = "0.11.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1758,7 +1758,7 @@ dependencies = [
 
 [[package]]
 name = "hb-core"
-version = "0.11.3"
+version = "0.11.4"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -1780,7 +1780,7 @@ dependencies = [
 
 [[package]]
 name = "hb-dpapi"
-version = "0.11.3"
+version = "0.11.4"
 dependencies = [
  "anyhow",
  "windows-sys 0.59.0",
@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "hb-it"
-version = "0.11.3"
+version = "0.11.4"
 dependencies = [
  "anyhow",
  "hb-core",
@@ -1801,7 +1801,7 @@ dependencies = [
 
 [[package]]
 name = "hb-net"
-version = "0.11.3"
+version = "0.11.4"
 dependencies = [
  "hb-core",
  "nostr",
