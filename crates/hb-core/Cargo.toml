@@ -17,6 +17,12 @@ hex        = { workspace = true }
 nostr             = { version = "=0.43.1", features = ["nip44", "nip59"] }
 bech32            = "0.11"
 
+# --- M16 W1 manifest envelope: a raw BIP-340 Schnorr signature over the full-listing manifest, so
+#     an exported `.hbmanifest` file is as trustworthy as a relay listing without an event wrapper.
+#     Pinned to nostr's own transitive secp256k1 (=0.29.1) so the tree holds a single copy; the
+#     `global-context` feature nostr already enables gives us the static `SECP256K1` context. ---
+secp256k1         = { version = "=0.29.1", features = ["global-context"] }
+
 # --- M5 portable backup crypto: Argon2id (KDF) → XChaCha20-Poly1305 (AEAD). `zeroize`
 #     wipes the derived key; `unicode-normalization` NFKC-normalizes the passphrase so a backup
 #     made on one OS decrypts on another. XChaCha20-Poly1305 ships in `chacha20poly1305` 0.10 with

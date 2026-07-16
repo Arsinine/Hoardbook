@@ -30,9 +30,10 @@ pub mod split;
 pub mod topic;
 
 pub use browse::{
-    browse_peer_listings, browse_share_code, parse_share_code, publish_listing,
-    publish_listing_capped, resolve_peer_relays, resolve_recipient_relays, search_teasers,
-    BrowseResult, PublishedListing,
+    browse_peer_listings, browse_share_code, fetch_full_listing_from, fetch_full_listing_if_current,
+    listing_snapshot_fingerprint, parse_share_code, publish_listing, publish_listing_capped,
+    publish_listing_to, resolve_peer_relays, resolve_recipient_relays, search_teasers, BrowseResult,
+    PublishedListing,
 };
 pub use cache::{cache_decision, CacheDecision, CachedListing, CACHE_FRESH_SECS};
 pub use client::{

@@ -205,10 +205,32 @@ async fn fetch_listing(
     // `MAX_LISTING_PARTS` cap bounds the worst case regardless).
     let events =
         client.fetch(Filter::new().author(*peer).kind(Kind::from_u16(KIND_LISTING)), timeout).await?;
+    render_slug_family(events, peer, slug, browse_key)
+}
 
+/// Group fetched `KIND_LISTING` events into one slug's family (the `d=slug` index/single + its
+/// `d=slug#partN` content parts), take the **newest event per `d`** (a non-compliant relay's stale
+/// replaceable duplicate can't win — N3/AB8), decrypt each with the browse-key (which re-verifies the
+/// Schnorr signature), and render into a possibly-partial tree. Shared by the pool-wide
+/// [`fetch_listing`] and the big-relay-targeted [`fetch_full_listing_from`] (M16 W2) so both read the
+/// exact same family-assembly logic.
+fn render_slug_family(
+    events: Vec<Event>,
+    peer: &PublicKey,
+    slug: &str,
+    browse_key: &BrowseKey,
+) -> Result<RenderedListing, NetError> {
     let part_prefix = format!("{slug}#part");
     let mut by_d: HashMap<String, Vec<Event>> = HashMap::new();
     for ev in events {
+        // Author pin (Codex review, M16 W2): the relay-side `author(peer)` filter is not enough — a
+        // lying relay can return a *validly-signed* listing from another key (a share-code holder can
+        // encrypt a family under the shared browse-key and sign it themselves), and nostr-sdk does not
+        // verify that fetched events match the requested filter. Drop anything not authored by the
+        // browsed peer before it can win the newest-per-`d` selection or be decrypted + rendered.
+        if ev.pubkey != *peer {
+            continue;
+        }
         if let Some(d) = ev.tags.identifier() {
             if d == slug || d.starts_with(&part_prefix) {
                 by_d.entry(d.to_string()).or_default().push(ev);
@@ -227,6 +249,102 @@ async fn fetch_listing(
         }
     }
     render_listing(&payloads)
+}
+
+/// Publish a collection listing's FULL family to a **targeted** relay set only (M16 W2 — the
+/// big-relay carrier). Identical per-folder splitting to [`publish_listing`], but every part event is
+/// delivered via [`RelayClient::publish_to`] to `relays` (the owner's own big relay) — never the
+/// whole connected pool. So the full family lands on the big relay while public relays keep only the
+/// truncated paywall teaser (INV-5: the big-relay family never broadcasts to public relays). The
+/// caller must have `relays` connected (as with [`RelayClient::publish_to`]).
+///
+/// `max_bytes` is the **same** per-part budget as the normal path (owner ruling 2026-07-16: the big
+/// relay reuses it — its advantage is being owner-run with no ban risk and accepting the whole
+/// family, not carrying bigger events; a part is a NIP-44-encrypted event, capped at the 65_408-byte
+/// plaintext limit regardless of any relay's `maxEventSize`).
+pub async fn publish_listing_to(
+    client: &RelayClient,
+    identity: &Identity,
+    slug: &str,
+    browse_key: &BrowseKey,
+    listing_json: &str,
+    max_bytes: usize,
+    relays: &[String],
+) -> Result<PublishedListing, NetError> {
+    let parts = split_listing(slug, listing_json, max_bytes)?;
+    for part in &parts {
+        let event = build_listing_event(identity, &part.d_tag, browse_key, &part.json)?;
+        client.publish_to(&event, relays).await?;
+    }
+    Ok(PublishedListing { parts: parts.len(), truncated: false, shown_items: 0, total_items: 0 })
+}
+
+/// Fetch a slug's FULL listing family from a **targeted** relay set (the big relay) and render it —
+/// the read-side counterpart of [`publish_listing_to`] (M16 W2). Reads `relays` **exclusively** (via
+/// [`RelayClient::fetch_from`]) so the big-relay split family is not collided with the `d=slug`
+/// truncated teaser living on the public relays. Assembles + renders exactly like [`fetch_listing`].
+pub async fn fetch_full_listing_from(
+    client: &RelayClient,
+    peer: &PublicKey,
+    slug: &str,
+    browse_key: &BrowseKey,
+    relays: &[String],
+    timeout: Duration,
+) -> Result<RenderedListing, NetError> {
+    let events = client
+        .fetch_from(relays, Filter::new().author(*peer).kind(Kind::from_u16(KIND_LISTING)), timeout)
+        .await?;
+    render_slug_family(events, peer, slug, browse_key)
+}
+
+/// The full-tree **snapshot fingerprint** a rendered listing carries in its metadata (M16). The
+/// hoarder writes it into the listing JSON at publish time (W3); it rides through split/restitch into
+/// `RenderedListing.meta` for free (top-level metadata is preserved). `None` for a pre-M16 listing
+/// that predates the field.
+pub fn listing_snapshot_fingerprint(rendered: &RenderedListing) -> Option<&str> {
+    rendered.meta.get("snapshot_fingerprint").and_then(serde_json::Value::as_str)
+}
+
+/// The M16 staleness gate: a fetched full family supersedes the paywall teaser **only** if it is
+/// **complete** AND its snapshot fingerprint matches the teaser's. Completeness is load-bearing
+/// (Codex review, W2): a big relay can serve the signed index but withhold content parts —
+/// `render_listing` yields a *partial* tree that still carries the matching fingerprint in its meta,
+/// and silently replacing the paywall with a partial tree presented as the full list would be a
+/// downgrade. An incomplete, unfingerprinted (pre-M16), or mismatched (stale) family does not
+/// supersede — keep the teaser and surface "ask again".
+fn full_supersedes(rendered: &RenderedListing, expected_fingerprint: &str) -> bool {
+    rendered.complete() && listing_snapshot_fingerprint(rendered) == Some(expected_fingerprint)
+}
+
+/// Fetch the big-relay full family **only if it is current** — its snapshot fingerprint matches
+/// `expected_fingerprint` (the truncated teaser's). A mismatch (the big relay holds a stale older
+/// snapshot), an absent family, or any fetch failure yields `Ok(None)`, so the caller keeps the
+/// paywall teaser rather than serving stale or un-gated data (M16 headline failure mode #1). Only a
+/// current, verified full tree returns `Ok(Some(_))`.
+pub async fn fetch_full_listing_if_current(
+    client: &RelayClient,
+    peer: &PublicKey,
+    slug: &str,
+    browse_key: &BrowseKey,
+    relays: &[String],
+    expected_fingerprint: &str,
+    timeout: Duration,
+) -> Result<Option<RenderedListing>, NetError> {
+    let rendered = match fetch_full_listing_from(client, peer, slug, browse_key, relays, timeout).await
+    {
+        Ok(r) => r,
+        // Absent / locked / unreadable big-relay family → keep the teaser (never a hard browse error).
+        Err(e) => {
+            tracing::debug!("big-relay full listing for '{slug}' unavailable ({e}); keeping the teaser");
+            return Ok(None);
+        }
+    };
+    if full_supersedes(&rendered, expected_fingerprint) {
+        Ok(Some(rendered))
+    } else {
+        tracing::debug!("big-relay full listing for '{slug}' is a stale/unfingerprinted snapshot; keeping the teaser");
+        Ok(None)
+    }
 }
 
 /// Fetch, decrypt, and render EVERY listing family a peer has published (grouped by root slug).
@@ -334,5 +452,93 @@ mod tests {
                 Ok(_) => panic!("{s:?} should not parse as a valid share code"),
             }
         }
+    }
+
+    // ── M16 W2: the snapshot-fingerprint staleness gate (pure) ──────────────────────────────────
+
+    const FP: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+    /// A listing big enough to split under a 40 KiB budget, carrying a top-level
+    /// `snapshot_fingerprint` (what the hoarder writes at publish time, W3).
+    fn big_listing_with_fp(slug: &str, n: usize, fp: &str) -> String {
+        let entries: Vec<serde_json::Value> = (0..n)
+            .map(|i| serde_json::json!({ "name": format!("title-{i:05}-padding-padding-padding-xx") }))
+            .collect();
+        serde_json::json!({
+            "slug": slug, "content_types": ["video"],
+            "snapshot_fingerprint": fp, "entries": entries,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn snapshot_fingerprint_rides_through_the_big_relay_split() {
+        // The W2 gate's premise: a full listing carrying `snapshot_fingerprint` survives the split
+        // (the big-relay carrier reuses the 40 KiB budget) + restitch, so the fingerprint is readable
+        // from the rendered family's meta and the gate can compare it.
+        let json = big_listing_with_fp("vault", 1300, FP);
+        let parts = split_listing("vault", &json, 40_000).unwrap();
+        assert!(parts.len() > 2, "the listing must actually split, got {} part(s)", parts.len());
+        let payloads: Vec<String> = parts.iter().map(|p| p.json.clone()).collect();
+        let rendered = render_listing(&payloads).unwrap();
+        assert!(rendered.complete(), "all parts present → complete tree");
+        assert_eq!(rendered.entries.len(), 1300);
+        assert_eq!(
+            listing_snapshot_fingerprint(&rendered),
+            Some(FP),
+            "the fingerprint must survive the split into meta"
+        );
+        assert!(full_supersedes(&rendered, FP), "a matching fingerprint supersedes the teaser");
+        assert!(!full_supersedes(&rendered, "deadbeef"), "a mismatched fingerprint does not supersede");
+    }
+
+    #[test]
+    fn incomplete_family_never_supersedes_even_with_matching_fingerprint() {
+        // Codex review (W2): a big relay can serve the signed index but WITHHOLD a content part. The
+        // rendered tree is partial yet still carries the matching `snapshot_fingerprint` in its meta —
+        // it must NOT replace the paywall (that would present a partial tree as the full list).
+        let json = big_listing_with_fp("vault", 1300, FP);
+        let parts = split_listing("vault", &json, 40_000).unwrap();
+        assert!(parts.len() > 2, "the listing must split, got {} part(s)", parts.len());
+        let mut payloads: Vec<String> = parts.iter().map(|p| p.json.clone()).collect();
+        payloads.pop(); // withhold the last content part → an incomplete family
+        let rendered = render_listing(&payloads).unwrap();
+        assert!(!rendered.complete(), "a withheld part must render incomplete");
+        assert_eq!(
+            listing_snapshot_fingerprint(&rendered),
+            Some(FP),
+            "the fingerprint still rides in meta even when parts are missing"
+        );
+        assert!(
+            !full_supersedes(&rendered, FP),
+            "an incomplete family must keep the teaser despite the matching fingerprint"
+        );
+    }
+
+    #[test]
+    fn truncated_teaser_and_full_family_share_one_fingerprint() {
+        // The crux of the gate: the paywall teaser (a single truncated event) and the big-relay full
+        // family both derive from the same source tree, so they carry the *same*
+        // `snapshot_fingerprint` — that is what lets the browse side confirm the family is the full
+        // version of exactly what the teaser previews. `truncate_listing` preserves top-level meta.
+        let json = big_listing_with_fp("vault", 2000, FP);
+        let t = truncate_listing(&json, 40_000).unwrap();
+        assert!(t.truncated, "this listing must truncate");
+        let teaser = render_listing(&[t.json]).unwrap();
+        assert_eq!(
+            listing_snapshot_fingerprint(&teaser),
+            Some(FP),
+            "the truncated teaser keeps the full-tree fingerprint the family also carries"
+        );
+    }
+
+    #[test]
+    fn unfingerprinted_listing_never_supersedes() {
+        // A pre-M16 listing (no `snapshot_fingerprint`) must not be trusted as "current" — the gate
+        // keeps the teaser rather than serving an un-gated full tree.
+        let json = serde_json::json!({ "slug": "old", "entries": [{ "name": "a" }] }).to_string();
+        let rendered = render_listing(&[json]).unwrap();
+        assert_eq!(listing_snapshot_fingerprint(&rendered), None);
+        assert!(!full_supersedes(&rendered, "anything"));
     }
 }

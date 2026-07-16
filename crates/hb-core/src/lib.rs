@@ -16,6 +16,7 @@ pub mod event;
 pub mod fingerprint;
 pub mod identity;
 pub mod listing;
+pub mod manifest;
 pub mod priv_listing;
 pub mod ratelimit;
 pub mod sharecode;
@@ -43,6 +44,7 @@ pub use count::{count_distinct_online, count_distinct_userbase, is_canary, CANAR
 pub use fingerprint::{fingerprint, Fingerprint};
 pub use identity::Identity;
 pub use listing::{decrypt_listing, encrypt_listing, BrowseKey, ContentKey};
+pub use manifest::{build_manifest_envelope, ManifestEnvelope, MANIFEST_V};
 pub use priv_listing::{open_private_listing, seal_private_listing, OpenedPrivate, KIND_PRIV_LISTING};
 pub use ratelimit::{RelayRateLimiter, RELAY_WRITE_BURST, RELAY_WRITE_REFILL_PER_SEC};
 pub use sharecode::ShareCode;
