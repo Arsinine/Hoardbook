@@ -344,6 +344,14 @@ pub(crate) fn collection_to_listing_json(col: &Collection) -> Result<String, Str
         if let Some(listing) = map.remove("listing") {
             map.insert("entries".into(), listing);
         }
+        // M16 W3: stamp the full-tree snapshot fingerprint into the listing metadata so it rides —
+        // through `truncate_listing` (the paywall teaser) and `split_listing` (the big-relay full
+        // family, W2) — into `RenderedListing.meta`, where the browse-side staleness gate reads it.
+        // An order-independent content hash of the whole tree: the teaser and the family carry the
+        // *same* value, which is exactly what lets a browser confirm the family is the full version
+        // of what the teaser previews.
+        let fp = hb_core::snapshot_fingerprint(&col.listing);
+        map.insert("snapshot_fingerprint".into(), serde_json::Value::String(fp.0));
     }
     serde_json::to_string(&v).map_err(cmd_err)
 }
@@ -1564,6 +1572,13 @@ mod tests {
         assert!(rendered.complete());
         assert_eq!(rendered.entries.len(), 1);
         assert_eq!(rendered.meta.get("slug").and_then(|v| v.as_str()), Some("criterion"));
+        // M16 W3: the full-tree snapshot fingerprint rides into meta (the browse-side staleness gate,
+        // W2, reads it) and equals the standalone `snapshot_fingerprint` of the same tree.
+        assert_eq!(
+            rendered.meta.get("snapshot_fingerprint").and_then(|v| v.as_str()),
+            Some(hb_core::snapshot_fingerprint(&col.listing).0.as_str()),
+            "the listing JSON must carry the full-tree fingerprint the teaser + big-relay family share",
+        );
     }
 
     #[test]
