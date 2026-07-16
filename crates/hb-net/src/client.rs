@@ -240,6 +240,32 @@ impl RelayClient {
         Ok(dedup_by_id(events))
     }
 
+    /// Fetch events by `filter` from a **targeted** subset of relays only (M16 W2 — the big-relay
+    /// carrier). The full-listing family the owner publishes to their big relay shares its `d=slug`
+    /// with the truncated paywall teaser on the public relays; a pool-wide [`fetch`](Self::fetch)
+    /// would pull both and the renderer would prefer the plain-unsplit teaser (its `is_plain_unsplit`
+    /// guard). Reading the big relay exclusively keeps the split family intact. Deduped by id; an
+    /// empty relay set or a constraint-free filter is refused before the query.
+    pub async fn fetch_from(
+        &self,
+        relays: &[String],
+        filter: Filter,
+        timeout: Duration,
+    ) -> Result<Vec<Event>, NetError> {
+        if relays.is_empty() {
+            return Err(NetError::NoRelayConnected("no target relays for fetch_from".into()));
+        }
+        if filter.is_empty() {
+            return Err(NetError::EmptyFilter);
+        }
+        let events = self
+            .client
+            .fetch_events_from(relays.iter().map(|s| s.as_str()), filter, timeout)
+            .await
+            .map_err(|e| NetError::Client(e.to_string()))?;
+        Ok(dedup_by_id(events))
+    }
+
     /// The relay set passed to `connect`. (Relays added later via `ensure_relays` are connected on
     /// the underlying client but not recorded here — this getter reports the initial configured set.)
     pub fn relays(&self) -> &[String] {

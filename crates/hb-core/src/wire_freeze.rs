@@ -8,6 +8,7 @@ use crate::backup::BACKUP_FORMAT_VER;
 use crate::binding;
 use crate::event;
 use crate::listing::{HKDF_SALT, HKDF_SALT_CEK};
+use crate::manifest::{MANIFEST_V, SIG_DOMAIN};
 use crate::priv_listing;
 use crate::sharecode;
 use crate::topic;
@@ -37,6 +38,15 @@ fn version_discriminants_are_frozen_at_v1() {
     assert_eq!(SCHEMA_V, 1, "SCHEMA_V — {FREEZE}");
     assert_eq!(CRYPTO_V, 1, "CRYPTO_V — {FREEZE}");
     assert_eq!(BACKUP_FORMAT_VER, 1, "BACKUP_FORMAT_VER — {FREEZE}");
+    assert_eq!(MANIFEST_V, 1, "MANIFEST_V (M16 manifest envelope) — {FREEZE}");
+}
+
+/// The manifest envelope's `author_sig` pre-image domain tag (M16 W1). It is hashed into every
+/// signature over an exported `.hbmanifest`; a change silently invalidates every manifest already
+/// signed, so it is pinned here as a wire constant.
+#[test]
+fn manifest_sig_domain_is_frozen() {
+    assert_eq!(SIG_DOMAIN, b"hoardbook/manifest-envelope/v1".as_slice(), "manifest::SIG_DOMAIN — {FREEZE}");
 }
 
 /// The `hbk` share code: bech32 HRP + leading version byte (spec §The Key). Every code already
