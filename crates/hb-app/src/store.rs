@@ -63,6 +63,14 @@ pub struct Settings {
     /// either way (they read the teaser body, not the hashtags).
     #[serde(default)]
     pub discoverable: bool,
+    /// M16 W3 — the owner's dedicated **big relay** for the full-manifest (Layer 3) path. When a
+    /// Public collection is too large to publish whole (truncated to a paywall teaser), the full
+    /// split family is *also* published here (only), so a browser holding the share code can fetch
+    /// the complete listing. **Empty = the feature is off** (only the truncated teaser is published,
+    /// today's behaviour). A pre-M16 `settings.json` with no such key loads empty (serde default) —
+    /// no migration.
+    #[serde(default)]
+    pub big_relay_url: String,
 }
 
 impl Default for Settings {
@@ -76,6 +84,7 @@ impl Default for Settings {
             snapshot_reconcile_poll: false,
             show_online_count: true,
             discoverable: false,
+            big_relay_url: String::new(),
         }
     }
 }
@@ -951,6 +960,9 @@ mod tests {
         // devtest #5: a pre-existing settings.json with no `discoverable` key loads as false — the
         // intended silent de-list, no migration.
         assert!(!s.discoverable, "discoverable defaults OFF on an old file");
+        // M16 W3: a pre-M16 file with no `big_relay_url` loads empty — the full-manifest feature is
+        // off until the owner configures a big relay.
+        assert_eq!(s.big_relay_url, "", "big_relay_url defaults empty (feature off) on an old file");
     }
 
     #[test]
@@ -967,6 +979,7 @@ mod tests {
             snapshot_reconcile_poll: true,
             show_online_count: false,
             discoverable: true,
+            big_relay_url: "ws://big.example:7777".into(),
         };
         store.save_settings(&s).unwrap();
         let r = store.load_settings().unwrap().unwrap();
@@ -978,6 +991,7 @@ mod tests {
         assert!(r.snapshot_reconcile_poll, "reconcile toggle preserved");
         assert!(!r.show_online_count, "online-count toggle preserved");
         assert!(r.discoverable, "discoverable toggle preserved");
+        assert_eq!(r.big_relay_url, "ws://big.example:7777", "big_relay_url preserved");
     }
 
     #[test]

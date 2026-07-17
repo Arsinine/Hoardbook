@@ -84,6 +84,10 @@ pub async fn save_settings(
     for url in &settings.relay_urls {
         net::validate_relay_url(url)?;
     }
+    // M16 W3: the optional big relay is a normal relay URL — validate it when set (empty = feature off).
+    if !settings.big_relay_url.trim().is_empty() {
+        net::validate_relay_url(settings.big_relay_url.trim())?;
+    }
     store.save_settings(&settings).map_err(cmd_err)?;
     // M12 W1: a relay-set change is an atomic build-and-swap — drop the shared client so the next
     // network use rebuilds it against the new set (the removed relay is then no longer dialed). A

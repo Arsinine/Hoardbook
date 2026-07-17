@@ -2,7 +2,7 @@ use std::path::Path;
 use globset::{Glob, GlobSetBuilder};
 use hb_core::types::{Collection, DirectoryItem, ItemType, Visibility};
 use hb_core::{BrowseKey, Identity};
-use hb_net::publish_listing_capped;
+use hb_net::{publish_listing_capped, publish_listing_to};
 use nostr::{Filter, Kind};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -27,13 +27,28 @@ pub struct PublishSummary {
     pub truncated: bool,
     pub shown_items: usize,
     pub total_items: usize,
+    /// M16 W3 (Layer 3) — how many full-manifest part events were published to the big relay. `0`
+    /// when the listing fit whole (not truncated) or no big relay is configured (feature off). A
+    /// non-zero value means the full listing family is available on the big relay behind the teaser.
+    #[serde(default)]
+    pub big_relay_parts: usize,
 }
 
 impl PublishSummary {
     /// A non-truncated publish (fits whole, or a Private collection — never truncated).
     fn whole() -> Self {
-        Self { truncated: false, shown_items: 0, total_items: 0 }
+        Self { truncated: false, shown_items: 0, total_items: 0, big_relay_parts: 0 }
     }
+}
+
+/// M16 W3 classifier — the big relay to *also* publish the full manifest family to, or `None`.
+/// Returns `Some(url)` iff the listing was truncated to a paywall teaser AND a big relay is
+/// configured (a non-empty, non-whitespace URL). A listing that fit whole, or an unset/blank
+/// setting, yields `None`: no big-relay write, and the shipped small-collection publish stays
+/// byte-identical (M16 headline failure mode #2). The returned slice is the trimmed URL.
+fn big_relay_target(truncated: bool, big_relay_url: &str) -> Option<&str> {
+    let url = big_relay_url.trim();
+    (truncated && !url.is_empty()).then_some(url)
 }
 
 /// Collection with publication status, returned to the frontend.
@@ -440,13 +455,46 @@ pub(crate) async fn publish_collection_inner(
             .await
             .map_err(cmd_err)?;
 
+    // M16 W3 classifier (Layer 3, purely additive): when this Public listing was truncated to a
+    // paywall teaser AND a big relay is configured, ALSO publish the full split family to the big
+    // relay only (`publish_listing_to` → `publish_to`, INV-5 — never the public pool, which keeps
+    // just the teaser). A listing that fit whole, or an unset big relay, takes no big-relay write:
+    // the shipped small-collection path is byte-identical. **Best-effort** — the teaser already went
+    // out above, so a big-relay hiccup must not fail the whole publish; the browse side falls back
+    // to the teaser (fingerprint-gated) and the owner can re-publish.
+    let big_relay_url = store.load_settings().map_err(cmd_err)?.unwrap_or_default().big_relay_url;
+    let big_relay_parts = match big_relay_target(published.truncated, &big_relay_url) {
+        Some(big) => {
+            let relays = [big.to_string()];
+            match client.ensure_relays(&relays, net::RELAY_TIMEOUT).await {
+                Ok(()) => match publish_listing_to(
+                    &client, identity, slug, browse_key, &listing_json, LISTING_MAX_BYTES, &relays,
+                )
+                .await
+                {
+                    Ok(family) => family.parts,
+                    Err(e) => {
+                        tracing::warn!("big-relay publish for '{slug}' failed ({e}); the teaser stands");
+                        0
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("big relay '{big}' unreachable ({e}); the teaser stands");
+                    0
+                }
+            }
+        }
+        None => 0,
+    };
+
     // Local published marker (the "published" badge + content_types union), now also recording the
-    // truncation state for reference.
+    // truncation state + big-relay part count for reference.
     let marker = serde_json::json!({
         "parts": published.parts,
         "truncated": published.truncated,
         "shown_items": published.shown_items,
         "total_items": published.total_items,
+        "big_relay_parts": big_relay_parts,
     })
     .to_string();
     store.save_published(slug, &marker).map_err(cmd_err)?;
@@ -465,6 +513,7 @@ pub(crate) async fn publish_collection_inner(
         truncated: published.truncated,
         shown_items: published.shown_items,
         total_items: published.total_items,
+        big_relay_parts,
     })
 }
 
@@ -1578,6 +1627,39 @@ mod tests {
             rendered.meta.get("snapshot_fingerprint").and_then(|v| v.as_str()),
             Some(hb_core::snapshot_fingerprint(&col.listing).0.as_str()),
             "the listing JSON must carry the full-tree fingerprint the teaser + big-relay family share",
+        );
+    }
+
+    // ── M16 W3: big-relay classifier (Layer 3 routing) ───────────────────────────
+    // The routing decision is a pure function; the actual big-relay wire (family → big relay only,
+    // no leak to public) is proven by hb-it Suite BIG1/BIG2 against a live strfry, same split as the
+    // publish-path tests above.
+
+    #[test]
+    fn big_relay_target_routes_only_truncated_with_a_configured_relay() {
+        // Truncated (too large for one event) + a configured big relay → the full family also goes there.
+        assert_eq!(
+            big_relay_target(true, "ws://big.example:7777"),
+            Some("ws://big.example:7777"),
+        );
+        // Fit whole (small collection) → NO big-relay write, even with a big relay set. This is the
+        // golden guard against failure mode #2 (the classifier must not regress small collections):
+        // a non-truncated publish never enters the big-relay branch, so its teaser bytes are unchanged.
+        assert_eq!(big_relay_target(false, "ws://big.example:7777"), None);
+        // Truncated but no big relay configured → feature off, keep only the teaser.
+        assert_eq!(big_relay_target(true, ""), None);
+        // A whitespace-only setting is "unset" (guards a stray space saved into settings.json).
+        assert_eq!(big_relay_target(true, "   "), None);
+        // Both off.
+        assert_eq!(big_relay_target(false, ""), None);
+    }
+
+    #[test]
+    fn big_relay_target_trims_the_configured_url() {
+        // The returned target is trimmed so `ensure_relays`/`publish_to` get a clean URL.
+        assert_eq!(
+            big_relay_target(true, "  ws://big.example:7777  "),
+            Some("ws://big.example:7777"),
         );
     }
 
