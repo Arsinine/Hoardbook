@@ -26,6 +26,7 @@
 		last_seen_version: '',
 		snapshot_auto_update: true, snapshot_reconcile_poll: false, show_online_count: true,
 		discoverable: false,
+		big_relay_url: '',
 	});
 
 	// ── 3-key identity view ───────────────────────────────────────────────────────
@@ -268,6 +269,22 @@
 	// Merge live relay edits into the preserved settings object so save never drops a field.
 	function fullSettings(): Settings {
 		return { ...settings, relay_urls: relayUrls };
+	}
+
+	// M16 W3: persist the optional big relay (empty = feature off). Trimmed on save so a stray space
+	// isn't stored (mirrors the backend's trim in save_settings).
+	let savingBigRelay = $state(false);
+	async function handleSaveBigRelay() {
+		savingBigRelay = true;
+		try {
+			settings = { ...settings, big_relay_url: settings.big_relay_url.trim() };
+			await saveSettings(fullSettings());
+			toast('Big relay saved', 'success');
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			savingBigRelay = false;
+		}
 	}
 
 	async function toggleAllowDms() {
@@ -576,6 +593,28 @@
 		</div>
 	</div>
 
+	<!-- M16 W3: optional big relay for large-collection full manifests -->
+	<div class="section-label">Big relay (large collections)</div>
+	<div class="surface surface-nop">
+		<div class="relay-add-row">
+			<input
+				class="hb-input hb-mono"
+				type="text"
+				placeholder="ws://your-big-relay.example:7777 (optional)"
+				bind:value={settings.big_relay_url}
+				onkeydown={(e) => e.key === 'Enter' && handleSaveBigRelay()}
+			/>
+			<button class="btn-primary btn-sm" onclick={handleSaveBigRelay} disabled={savingBigRelay}>
+				{savingBigRelay ? 'Saving…' : 'Save'}
+			</button>
+		</div>
+		<div class="relay-hint">
+			A higher-capacity relay you run for collections too large to publish whole. When set,
+			publishing a large collection also sends its full listing here; people with your share code
+			fetch the rest from it. Leave empty to publish only the preview.
+		</div>
+	</div>
+
 	<!-- Preferences -->
 	<div class="section-label">Preferences</div>
 
@@ -857,6 +896,14 @@
 		display: flex;
 		gap: 8px;
 		align-items: center;
+	}
+
+	/* M16 W3: help text under the big-relay input (surface-nop has no padding of its own). */
+	.relay-hint {
+		padding: 0 16px 12px;
+		font-size: 11px;
+		color: var(--fg-dim);
+		line-height: 1.4;
 	}
 
 	.hb-input {

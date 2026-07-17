@@ -147,6 +147,11 @@ export interface Settings {
 	 *  can't find you by tag or content-type search; they can still reach you with your npub or
 	 *  share code, and your contacts are unaffected. */
 	discoverable: boolean;
+	/** M16 W3: the owner's dedicated higher-capacity **big relay** for collections too large to
+	 *  publish whole. When set, publishing a large collection also sends its full listing here (only),
+	 *  so a browser with the share code can fetch the rest. **Empty = off** (only the preview teaser
+	 *  is published — today's behaviour). */
+	big_relay_url: string;
 }
 
 export const getSettings = () => invoke<Settings>('get_settings');

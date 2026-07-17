@@ -6,6 +6,7 @@ import {
 	dedupAndCap,
 	flattenTree,
 	parseEstSize,
+	paywallTeaser,
 	peerAccessBadge,
 	peerFromQuery,
 	summarizeCollectionsSize,
@@ -197,5 +198,31 @@ describe('countListingItems (devtest #7 paywall)', () => {
 	it('is 0 for an empty listing and tolerates a missing children field', () => {
 		expect(countListingItems([])).toBe(0);
 		expect(countListingItems([{ name: 'x' }])).toBe(1);
+	});
+});
+
+describe('paywallTeaser (M16 W3 — resolves to full tree when upgraded)', () => {
+	it('shows the teaser for a truncated collection with hidden items', () => {
+		const col = { truncated: true, total_items: 100, listing: [{ name: 'a' }, { name: 'b' }] };
+		expect(paywallTeaser(col)).toEqual({ shown: 2, hidden: 98, total: 100 });
+	});
+
+	it('returns null for a non-truncated collection so the FULL tree renders', () => {
+		// Never-truncated (published whole).
+		expect(paywallTeaser({ truncated: false, total_items: 100, listing: [{ name: 'a' }] })).toBeNull();
+		// M16 W3: a big-relay upgrade CLEARS `truncated`, so a once-truncated collection now renders
+		// whole — this is the "paywall resolves to the full tree when a family is present" case.
+		expect(paywallTeaser({ total_items: 100, listing: [{ name: 'a' }] })).toBeNull();
+	});
+
+	it('returns null when nothing is actually hidden (shown >= total)', () => {
+		expect(
+			paywallTeaser({ truncated: true, total_items: 2, listing: [{ name: 'a' }, { name: 'b' }] }),
+		).toBeNull();
+	});
+
+	it('returns null for an absent collection', () => {
+		expect(paywallTeaser(null)).toBeNull();
+		expect(paywallTeaser(undefined)).toBeNull();
 	});
 });
