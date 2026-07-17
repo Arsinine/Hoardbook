@@ -128,6 +128,23 @@ export function countListingItems(items: readonly unknown[]): number {
 	return n;
 }
 
+/**
+ * The paywall-teaser summary for a browsed collection, or `null` when there is no teaser to show
+ * (devtest #7 / M16 W3). `null` for a **non-truncated** collection — one published whole, OR a
+ * truncated one the browser upgraded to the full tree from a big relay (M16 W3 clears `truncated`
+ * on a successful upgrade); either way the full tree renders with no fade. Also `null` when nothing
+ * is actually hidden (`shown >= total`). Pure — the Svelte component ANDs the top-level-view guard
+ * (no paywall while drilled into a subfolder, where the dropped tail wouldn't make the fade honest).
+ */
+export function paywallTeaser(
+	col: { truncated?: boolean; total_items?: number; listing?: readonly unknown[] } | null | undefined,
+): { shown: number; hidden: number; total: number } | null {
+	if (!col?.truncated || !col.total_items) return null;
+	const shown = countListingItems(col.listing ?? []);
+	const hidden = Math.max(0, col.total_items - shown);
+	return hidden > 0 ? { shown, hidden, total: col.total_items } : null;
+}
+
 /** Byte-size units, largest first, for `parseEstSize`/`summarizeCollectionsSize` (devtest #7). */
 const SIZE_UNITS: Array<[string, number]> = [
 	['TB', 1024 ** 4],

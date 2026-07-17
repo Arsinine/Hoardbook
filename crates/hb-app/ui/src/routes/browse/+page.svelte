@@ -5,7 +5,7 @@
 	import { page } from '$app/stores';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
-	import { collectionAvailability, peerAccessBadge, peerFromQuery, countListingItems } from '$lib/browse-view.js';
+	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser } from '$lib/browse-view.js';
 	import type { CachedPeer, Collection, DirectoryItem } from '$lib/types.js';
 
 	type BcItem =
@@ -123,15 +123,11 @@
 		if (a.item_type !== b.item_type) return a.item_type === 'Folder' ? -1 : 1;
 		return a.name.localeCompare(b.name);
 	}));
-	// devtest #7: a peer's collection published as a truncated paywall teaser (too large to publish
-	// whole). Shown at the collection root, where the dropped tail entries make the fade honest.
-	let paywall = $derived.by(() => {
-		const c = selectedCollection;
-		if (!c?.truncated || !c.total_items || folderStack.length > 0) return null;
-		const shown = countListingItems(c.listing);
-		const hidden = Math.max(0, c.total_items - shown);
-		return hidden > 0 ? { shown, hidden, total: c.total_items } : null;
-	});
+	// devtest #7 / M16 W3: a peer's collection published as a truncated paywall teaser (too large to
+	// publish whole). Shown only at the collection root, where the dropped tail makes the fade honest;
+	// a collection the browser upgraded to the full tree from a big relay has `truncated` cleared, so
+	// `paywallTeaser` returns null and the full tree renders (no fade).
+	let paywall = $derived(folderStack.length > 0 ? null : paywallTeaser(selectedCollection));
 	let breadcrumbs = $derived<BcItem[]>([
 		...(selectedPeer ? [{ label: peerName(selectedPeer), kind: 'contact' as const }] : []),
 		...(selectedCollection ? [{ label: selectedCollection.path_alias, kind: 'collection' as const }] : []),
