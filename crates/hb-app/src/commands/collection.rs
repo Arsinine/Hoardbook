@@ -51,6 +51,25 @@ fn big_relay_target(truncated: bool, big_relay_url: &str) -> Option<&str> {
     (truncated && !url.is_empty()).then_some(url)
 }
 
+/// Stamp the owner's big relay URL into a listing JSON's top-level metadata (M16 W3, browse-side
+/// **option b**): it rides through `truncate_listing` into the paywall teaser, so a browser holding
+/// the share code can discover *this hoarder's* big relay and fetch the full family from it even when
+/// its own big-relay setting points elsewhere. The teaser is browse-key-*encrypted*, so the URL
+/// reaches only share-code holders — never the public (INV-2 untouched: a relay URL is not the
+/// browse-key). A blank setting is a no-op returning the input **unchanged** (feature off ⇒ the
+/// small-collection teaser stays byte-identical). Pure — unit-tested without a relay.
+fn stamp_big_relay_url(listing_json: &str, big_relay_url: &str) -> Result<String, String> {
+    let url = big_relay_url.trim();
+    if url.is_empty() {
+        return Ok(listing_json.to_string());
+    }
+    let mut v: serde_json::Value = serde_json::from_str(listing_json).map_err(cmd_err)?;
+    if let serde_json::Value::Object(ref mut map) = v {
+        map.insert("big_relay_url".into(), serde_json::Value::String(url.to_string()));
+    }
+    serde_json::to_string(&v).map_err(cmd_err)
+}
+
 /// Collection with publication status, returned to the frontend.
 #[derive(Debug, Clone, Serialize)]
 pub struct CollectionEntry {
@@ -447,6 +466,13 @@ pub(crate) async fn publish_collection_inner(
         return Ok(PublishSummary::whole());
     }
 
+    // M16 W3 — the big relay setting drives BOTH browse-side discovery (option b) and the Layer-3
+    // publish below. Load it once (empty = feature off) and stamp it into the listing meta so it
+    // rides through `truncate_listing` into the paywall teaser (see `stamp_big_relay_url`). A blank
+    // setting leaves the listing byte-identical.
+    let big_relay_url = store.load_settings().map_err(cmd_err)?.unwrap_or_default().big_relay_url;
+    let listing_json = stamp_big_relay_url(&listing_json, &big_relay_url)?;
+
     let client = net::client(identity, store, relay).await.map_err(cmd_err)?;
     // devtest #7: publish a single event, truncated (paywall teaser) when the listing is too large,
     // instead of splitting it across many part events.
@@ -462,7 +488,6 @@ pub(crate) async fn publish_collection_inner(
     // the shipped small-collection path is byte-identical. **Best-effort** — the teaser already went
     // out above, so a big-relay hiccup must not fail the whole publish; the browse side falls back
     // to the teaser (fingerprint-gated) and the owner can re-publish.
-    let big_relay_url = store.load_settings().map_err(cmd_err)?.unwrap_or_default().big_relay_url;
     let big_relay_parts = match big_relay_target(published.truncated, &big_relay_url) {
         Some(big) => {
             let relays = [big.to_string()];
@@ -1660,6 +1685,53 @@ mod tests {
         assert_eq!(
             big_relay_target(true, "  ws://big.example:7777  "),
             Some("ws://big.example:7777"),
+        );
+    }
+
+    #[test]
+    fn stamp_big_relay_url_rides_into_meta_and_is_a_noop_when_blank() {
+        let col = Collection {
+            slug: "bigvault".into(),
+            path_alias: "Big Vault".into(),
+            description: None,
+            item_count: 1,
+            est_size: None,
+            content_types: vec!["video".into()],
+            tags: vec![],
+            languages: vec![],
+            visibility: Visibility::Public,
+            sorted: false,
+            last_updated: chrono::Utc::now(),
+            listing: vec![DirectoryItem {
+                name: "a.mkv".into(),
+                item_type: ItemType::File,
+                size: None,
+                format: None,
+                year: None,
+                tags: vec![],
+                note: None,
+                children: vec![],
+            }],
+        };
+        let base = collection_to_listing_json(&col).unwrap();
+
+        // Feature off (blank / whitespace) ⇒ byte-identical: the small-collection teaser is unchanged.
+        assert_eq!(stamp_big_relay_url(&base, "").unwrap(), base);
+        assert_eq!(stamp_big_relay_url(&base, "   ").unwrap(), base);
+
+        // Set ⇒ the (trimmed) URL rides in the top-level meta and survives the render path the browse
+        // side reads (option b: the browser discovers the peer's big relay from this teaser meta).
+        let stamped = stamp_big_relay_url(&base, "  ws://big.example:7777  ").unwrap();
+        let rendered = hb_net::render_listing(&[stamped]).unwrap();
+        assert_eq!(
+            rendered.meta.get("big_relay_url").and_then(|v| v.as_str()),
+            Some("ws://big.example:7777"),
+            "the owner's big relay must ride into the teaser meta for browse-side discovery",
+        );
+        // ...without disturbing the W3 (1/n) fingerprint already stamped there.
+        assert!(
+            rendered.meta.get("snapshot_fingerprint").is_some(),
+            "stamping the big relay must not drop the snapshot fingerprint",
         );
     }
 

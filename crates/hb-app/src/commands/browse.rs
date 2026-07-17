@@ -14,7 +14,10 @@ use hb_core::event::Teaser;
 use hb_core::fingerprint::Fingerprint;
 use hb_core::types::Collection;
 use hb_core::{ShareCode, Identity};
-use hb_net::{browse_peer_listings, browse_share_code, search_teasers, RenderedListing, SearchHit};
+use hb_net::{
+    browse_peer_listings, browse_share_code, fetch_full_listing_if_current,
+    listing_snapshot_fingerprint, search_teasers, RelayClient, RenderedListing, SearchHit,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -150,6 +153,61 @@ pub(crate) fn rendered_to_peer_collection(r: &RenderedListing) -> Option<PeerCol
     })
 }
 
+/// Ordered, de-duplicated big-relay candidates for browse-side full-manifest resolution (M16 W3),
+/// per the owner ruling **(a) then (b)**: (a) the browser's OWN configured big relay first, then
+/// (b) the peer's big relay advertised in the (browse-key-encrypted) teaser meta. Blank entries are
+/// dropped and a peer relay identical to our own is not retried (the shared-community case, where the
+/// hoarder's advertised relay equals ours). Pure — unit-tested without a relay.
+fn big_relay_fetch_order<'a>(own_big: &'a str, peer_big: &'a str) -> Vec<&'a str> {
+    let mut out: Vec<&str> = Vec::new();
+    for candidate in [own_big.trim(), peer_big.trim()] {
+        if !candidate.is_empty() && !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+/// For a browsed collection that came back as a truncated paywall teaser, try to upgrade it to the
+/// FULL listing by fetching the big-relay family (M16 W3). Tries the big relays in
+/// [`big_relay_fetch_order`] order — the browser's own (a), then the peer's advertised one (b) —
+/// gating each on [`fetch_full_listing_if_current`] (fingerprint matches the teaser AND the tree is
+/// complete). Returns the full `RenderedListing` on the first success, or `None` when the teaser is
+/// not truncated, carries no fingerprint to gate on, or no big relay yields a current full tree — in
+/// which case the caller keeps the teaser. Never a hard error: a big-relay hiccup just keeps the
+/// teaser (the pre-M16 behaviour).
+async fn resolve_full_if_truncated(
+    client: &RelayClient,
+    peer: &nostr::PublicKey,
+    slug: &str,
+    browse_key: &[u8; 32],
+    teaser: &RenderedListing,
+    own_big: &str,
+) -> Option<RenderedListing> {
+    // Only a truncated teaser has a hidden remainder worth fetching.
+    if teaser.meta.get("truncated").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    // Without the teaser's snapshot fingerprint there is nothing to gate staleness on — keep the teaser.
+    let fingerprint = listing_snapshot_fingerprint(teaser)?;
+    let peer_big = teaser.meta.get("big_relay_url").and_then(|v| v.as_str()).unwrap_or("");
+    for candidate in big_relay_fetch_order(own_big, peer_big) {
+        let relays = [candidate.to_string()];
+        // Targeted connect (mirrors `publish_to`); a relay we can't reach just falls through to the next.
+        if client.ensure_relays(&relays, net::RELAY_TIMEOUT).await.is_err() {
+            continue;
+        }
+        if let Ok(Some(full)) = fetch_full_listing_if_current(
+            client, peer, slug, browse_key, &relays, fingerprint, net::RELAY_TIMEOUT,
+        )
+        .await
+        {
+            return Some(full);
+        }
+    }
+    None
+}
+
 /// Resolve a share code to a `CachedPeer`: fetch the public teaser + the presence binding (online
 /// status), as a pure relay read. Falls back to the local cache (stale, offline) when the relays
 /// yield nothing.
@@ -191,12 +249,23 @@ async fn resolve_peer(
     // `browse_peer_listings` (BR1) — best-effort here too, mirroring the teaser fetch above:
     // unreadable listings must never fail the whole resolve.
     let collections = match share_code.browse_key() {
-        Some(bk) => browse_peer_listings(&client, &peer, &bk, net::RELAY_TIMEOUT)
-            .await
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|(_root, rendered)| rendered_to_peer_collection(rendered))
-            .collect(),
+        Some(bk) => {
+            // The browser's OWN big relay (option a) — tried before the peer's advertised one (b).
+            let own_big = store.load_settings().map_err(cmd_err)?.unwrap_or_default().big_relay_url;
+            let families = browse_peer_listings(&client, &peer, &bk, net::RELAY_TIMEOUT)
+                .await
+                .unwrap_or_default();
+            let mut out = Vec::with_capacity(families.len());
+            for (root, teaser) in &families {
+                // M16 W3: a truncated teaser may have its full listing on a big relay — try to upgrade
+                // it (a → b); on success browse the full tree, otherwise the teaser as-is (unchanged).
+                let full = resolve_full_if_truncated(&client, &peer, root, &bk, teaser, &own_big).await;
+                if let Some(pc) = rendered_to_peer_collection(full.as_ref().unwrap_or(teaser)) {
+                    out.push(pc);
+                }
+            }
+            out
+        }
         None => vec![],
     };
 
@@ -576,6 +645,29 @@ mod tests {
         assert_eq!(peer_col.truncated, Some(true));
         assert_eq!(peer_col.total_items, Some(9000));
         assert_eq!(peer_col.collection.slug, "bigvault");
+    }
+
+    // ── M16 W3: browse-side big-relay resolution order (a → b) ────────────────────
+    // The candidate ordering is pure; the actual fetch/merge round-trip (truncated teaser → full
+    // tree) is proven by hb-it Suite BIG1/BIG2, same split as the publish-path tests.
+
+    #[test]
+    fn big_relay_fetch_order_tries_own_then_peer_deduped() {
+        // (a) own first, then (b) the peer's advertised relay.
+        assert_eq!(
+            big_relay_fetch_order("ws://own:7777", "ws://peer:7777"),
+            vec!["ws://own:7777", "ws://peer:7777"],
+        );
+        // No own setting ⇒ just the peer's advertised relay (option b alone).
+        assert_eq!(big_relay_fetch_order("", "ws://peer:7777"), vec!["ws://peer:7777"]);
+        // Own set, peer advertises none ⇒ just our own (option a alone).
+        assert_eq!(big_relay_fetch_order("ws://own:7777", ""), vec!["ws://own:7777"]);
+        // Shared-community case: the peer's advertised relay equals ours ⇒ tried once, not twice.
+        assert_eq!(big_relay_fetch_order("ws://one:7777", "ws://one:7777"), vec!["ws://one:7777"]);
+        // Trimmed; a blank peer entry is dropped.
+        assert_eq!(big_relay_fetch_order("  ws://own:7777  ", "   "), vec!["ws://own:7777"]);
+        // Both blank ⇒ nothing to try (keep the teaser).
+        assert!(big_relay_fetch_order("", "").is_empty());
     }
 
     #[test]
