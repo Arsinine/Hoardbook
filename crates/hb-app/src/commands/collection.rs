@@ -467,11 +467,19 @@ pub(crate) async fn publish_collection_inner(
     }
 
     // M16 W3 — the big relay setting drives BOTH browse-side discovery (option b) and the Layer-3
-    // publish below. Load it once (empty = feature off) and stamp it into the listing meta so it
-    // rides through `truncate_listing` into the paywall teaser (see `stamp_big_relay_url`). A blank
-    // setting leaves the listing byte-identical.
+    // publish below. Load it once (empty = feature off). Stamp it into the listing meta ONLY when the
+    // listing will actually truncate (decided on the UNSTAMPED bytes): a whole listing needs no
+    // big-relay discovery (its teaser IS the full tree), and stamping its ~40-byte URL could otherwise
+    // tip a near-limit collection over the cap into an unnecessary teaser (Codex finding 3). A whole
+    // listing is therefore left byte-identical.
     let big_relay_url = store.load_settings().map_err(cmd_err)?.unwrap_or_default().big_relay_url;
-    let listing_json = stamp_big_relay_url(&listing_json, &big_relay_url)?;
+    let will_truncate =
+        hb_net::truncate_listing(&listing_json, LISTING_MAX_BYTES).map_err(cmd_err)?.truncated;
+    let listing_json = if will_truncate {
+        stamp_big_relay_url(&listing_json, &big_relay_url)?
+    } else {
+        listing_json
+    };
 
     let client = net::client(identity, store, relay).await.map_err(cmd_err)?;
     // devtest #7: publish a single event, truncated (paywall teaser) when the listing is too large,
@@ -484,25 +492,39 @@ pub(crate) async fn publish_collection_inner(
     // M16 W3 classifier (Layer 3, purely additive): when this Public listing was truncated to a
     // paywall teaser AND a big relay is configured, ALSO publish the full split family to the big
     // relay only (`publish_listing_to` → `publish_to`, INV-5 — never the public pool, which keeps
-    // just the teaser). A listing that fit whole, or an unset big relay, takes no big-relay write:
-    // the shipped small-collection path is byte-identical. **Best-effort** — the teaser already went
-    // out above, so a big-relay hiccup must not fail the whole publish; the browse side falls back
-    // to the teaser (fingerprint-gated) and the owner can re-publish.
-    let big_relay_parts = match big_relay_target(published.truncated, &big_relay_url) {
+    // just the teaser). The family goes through a **dedicated client connected only to the big relay**,
+    // NOT `ensure_relays` on the shared pool (Codex finding 1: a big relay left in the shared pool
+    // would let a later untargeted browse mix its family with public teasers and bypass the browse-side
+    // completeness/fingerprint gate). A listing that fit whole, or an unset big relay, takes no
+    // big-relay write. **Best-effort** — the teaser already went out above, so a big-relay hiccup must
+    // not fail the whole publish; the browse side falls back to the teaser and the owner can re-publish.
+    // The big relay actually targeted (trimmed), captured so it can be recorded in the marker below —
+    // unpublish deletes from the relay the family WENT to, not merely the then-current setting.
+    let big_target = big_relay_target(published.truncated, &big_relay_url).map(str::to_string);
+    let big_relay_parts = match big_target.as_deref() {
         Some(big) => {
             let relays = [big.to_string()];
-            match client.ensure_relays(&relays, net::RELAY_TIMEOUT).await {
-                Ok(()) => match publish_listing_to(
-                    &client, identity, slug, browse_key, &listing_json, LISTING_MAX_BYTES, &relays,
-                )
-                .await
-                {
-                    Ok(family) => family.parts,
-                    Err(e) => {
-                        tracing::warn!("big-relay publish for '{slug}' failed ({e}); the teaser stands");
-                        0
-                    }
-                },
+            // A FRESH client per publish means a fresh write-rate bucket (its first 24 writes unpaced).
+            // That's acceptable here on purpose: the big relay is OWNER-RUN (no ban risk — the token
+            // bucket exists to avoid bans on relays we don't control), and its `strfry-bigrelay.conf`
+            // sets generous server-side limits. Sharing the pool's limiter would re-introduce the
+            // finding-1 pool pollution, so the dedicated client wins.
+            match hb_net::RelayClient::connect(identity, &relays, net::RELAY_TIMEOUT).await {
+                Ok(big_client) => {
+                    let parts = match publish_listing_to(
+                        &big_client, identity, slug, browse_key, &listing_json, LISTING_MAX_BYTES, &relays,
+                    )
+                    .await
+                    {
+                        Ok(family) => family.parts,
+                        Err(e) => {
+                            tracing::warn!("big-relay publish for '{slug}' failed ({e}); the teaser stands");
+                            0
+                        }
+                    };
+                    big_client.disconnect().await;
+                    parts
+                }
                 Err(e) => {
                     tracing::warn!("big relay '{big}' unreachable ({e}); the teaser stands");
                     0
@@ -513,13 +535,19 @@ pub(crate) async fn publish_collection_inner(
     };
 
     // Local published marker (the "published" badge + content_types union), now also recording the
-    // truncation state + big-relay part count for reference.
+    // truncation state + big-relay part count + the big relay the family was published to (Codex
+    // re-review HIGH: unpublish reads this to delete from the ORIGINAL relay even if the setting later
+    // changed). `big_relay_url` is empty when no family was published.
     let marker = serde_json::json!({
         "parts": published.parts,
         "truncated": published.truncated,
         "shown_items": published.shown_items,
         "total_items": published.total_items,
         "big_relay_parts": big_relay_parts,
+        // Record the big relay whenever one was TARGETED (Codex round-3 HIGH), not only on full success:
+        // a partial-family failure still leaves some parts on that relay, so unpublish must know where
+        // to clean them up even if the setting later changes. Empty only when no big relay was targeted.
+        "big_relay_url": big_target.as_deref().unwrap_or(""),
     })
     .to_string();
     store.save_published(slug, &marker).map_err(cmd_err)?;
@@ -683,6 +711,58 @@ pub(crate) async fn unpublish_collection_inner(
                         }
                     }
                 }
+            }
+        }
+
+        // Codex finding 2: the big-relay full family (published to the big relay ONLY, W3) is invisible
+        // to the shared pool above — delete it from the big relay too, through a dedicated client, so an
+        // unpublished collection isn't left readable there by share-code holders who know the URL. The
+        // family events are authored by THIS identity, so this identity can NIP-09 them. Best-effort.
+        //
+        // Codex re-review HIGH: delete from the relay the family was ACTUALLY published to — recorded in
+        // the marker at publish time — NOT merely the current setting, which the owner may have changed
+        // or cleared since. Fall back to the current setting for a listing published before the marker
+        // carried the URL.
+        let recorded_big = store
+            .load_published(safe_slug)
+            .ok()
+            .flatten()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+            .and_then(|v| v.get("big_relay_url").and_then(|u| u.as_str()).map(str::to_string))
+            .filter(|s| !s.trim().is_empty());
+        let big = match recorded_big {
+            Some(url) => url.trim().to_string(),
+            None => store
+                .load_settings()
+                .map_err(cmd_err)?
+                .unwrap_or_default()
+                .big_relay_url
+                .trim()
+                .to_string(),
+        };
+        if !big.is_empty() {
+            let relays = [big];
+            if let Ok(big_client) =
+                hb_net::RelayClient::connect(identity, &relays, net::RELAY_TIMEOUT).await
+            {
+                let filter = Filter::new()
+                    .author(identity.public_key())
+                    .kind(Kind::from_u16(hb_core::event::KIND_LISTING));
+                if let Ok(events) = big_client.fetch_from(&relays, filter, net::RELAY_TIMEOUT).await {
+                    for ev in events {
+                        let belongs = ev
+                            .tags
+                            .identifier()
+                            .map(|d| listing_dtag_belongs_to_slug(d, safe_slug))
+                            .unwrap_or(false);
+                        if belongs {
+                            if let Ok(deletion) = hb_net::build_deletion(identity, &ev) {
+                                let _ = big_client.publish_to(&deletion, &relays).await;
+                            }
+                        }
+                    }
+                }
+                big_client.disconnect().await;
             }
         }
     }
@@ -1681,7 +1761,7 @@ mod tests {
 
     #[test]
     fn big_relay_target_trims_the_configured_url() {
-        // The returned target is trimmed so `ensure_relays`/`publish_to` get a clean URL.
+        // The returned target is trimmed so the dedicated big-relay client gets a clean URL.
         assert_eq!(
             big_relay_target(true, "  ws://big.example:7777  "),
             Some("ws://big.example:7777"),

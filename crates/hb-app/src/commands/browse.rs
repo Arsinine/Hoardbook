@@ -177,7 +177,6 @@ fn big_relay_fetch_order<'a>(own_big: &'a str, peer_big: &'a str) -> Vec<&'a str
 /// which case the caller keeps the teaser. Never a hard error: a big-relay hiccup just keeps the
 /// teaser (the pre-M16 behaviour).
 async fn resolve_full_if_truncated(
-    client: &RelayClient,
     peer: &nostr::PublicKey,
     slug: &str,
     browse_key: &[u8; 32],
@@ -193,15 +192,23 @@ async fn resolve_full_if_truncated(
     let peer_big = teaser.meta.get("big_relay_url").and_then(|v| v.as_str()).unwrap_or("");
     for candidate in big_relay_fetch_order(own_big, peer_big) {
         let relays = [candidate.to_string()];
-        // Targeted connect (mirrors `publish_to`); a relay we can't reach just falls through to the next.
-        if client.ensure_relays(&relays, net::RELAY_TIMEOUT).await.is_err() {
-            continue;
-        }
-        if let Ok(Some(full)) = fetch_full_listing_if_current(
-            client, peer, slug, browse_key, &relays, fingerprint, net::RELAY_TIMEOUT,
+        // Codex finding 1: read the big relay through a DEDICATED, EPHEMERAL client connected only to
+        // it — never `ensure_relays` onto the shared pool. A big relay left in the shared pool would let
+        // a later untargeted `browse_peer_listings` mix its split family with public teasers and bypass
+        // this very completeness/fingerprint gate. The ephemeral identity also keeps our real npub off a
+        // peer-advertised relay (the option-b privacy note). Best-effort: any connect/fetch miss just
+        // tries the next candidate, else the caller keeps the teaser.
+        let ephemeral = Identity::generate();
+        let big_client = match RelayClient::connect(&ephemeral, &relays, net::RELAY_TIMEOUT).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let result = fetch_full_listing_if_current(
+            &big_client, peer, slug, browse_key, &relays, fingerprint, net::RELAY_TIMEOUT,
         )
-        .await
-        {
+        .await;
+        big_client.disconnect().await;
+        if let Ok(Some(full)) = result {
             return Some(full);
         }
     }
@@ -259,7 +266,7 @@ async fn resolve_peer(
             for (root, teaser) in &families {
                 // M16 W3: a truncated teaser may have its full listing on a big relay — try to upgrade
                 // it (a → b); on success browse the full tree, otherwise the teaser as-is (unchanged).
-                let full = resolve_full_if_truncated(&client, &peer, root, &bk, teaser, &own_big).await;
+                let full = resolve_full_if_truncated(&peer, root, &bk, teaser, &own_big).await;
                 if let Some(pc) = rendered_to_peer_collection(full.as_ref().unwrap_or(teaser)) {
                     out.push(pc);
                 }
