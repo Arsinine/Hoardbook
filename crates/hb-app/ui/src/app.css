@@ -249,3 +249,22 @@ h1, h2, h3, h4, h5, h6 {
   .hb-icon-plus:hover     { animation: hb-pulse-scale 0.25s ease-out; }
   .hb-icon-search:hover   { animation: hb-pulse-scale 0.25s ease-out; }
 }
+
+/* ── Scrollbars (devtest v0.12.1 #1) ──────────────────────────────── */
+/* The webview's default scrollbars render as a light track + dark-grey thumb, which stands out hard
+   against the dark theme. Restyle every scrollable pane to the dark tokens — WebKit/Chromium via the
+   pseudo-elements, Firefox via the standard `scrollbar-*` properties. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--bg-elev3) transparent;
+}
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--bg-elev3);
+  border-radius: 999px;
+  border: 2px solid var(--bg);      /* inset so the thumb reads as a slim pill, not a full bar */
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--fg-dim); }
+::-webkit-scrollbar-corner { background: transparent; }

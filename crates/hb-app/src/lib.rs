@@ -359,6 +359,7 @@ pub fn run() {
             commands::watches::watches_evaluate,
             commands::topics::topic_list,
             commands::topics::topic_create,
+            commands::topics::topic_update_meta,
             commands::topics::topic_discover,
             commands::topics::topic_lookup,
             commands::topics::topic_join_public,

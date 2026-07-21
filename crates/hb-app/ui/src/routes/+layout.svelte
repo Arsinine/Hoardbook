@@ -126,8 +126,12 @@
 	// devtest #16: the nav badge derives straight from the persisted per-peer watermark — it clears
 	// per-conversation as each is opened in Chat, not merely by landing on the /chat route.
 	let navUnreadCount = $derived(totalUnread(unreadByPeer($inboxMessages, $readWatermarks, $identity?.npub ?? '')));
-	// devtest #2: the Topics nav badge — joined topics with an announcement past their seen watermark.
+	// devtest #2: joined topics with an announcement past their seen watermark.
 	let navAnnounceCount = $derived(unseenAnnouncementCount($topicAnnounceSummaries, $announceSeen));
+	// devtest v0.12.1 #2: topic announcements now render in the Chat topic thread, so their unseen
+	// count folds into the Chat nav badge (unread DMs + unseen announcements) — the Topics item no
+	// longer badges. Opening a topic channel advances its seen watermark, clearing its share here.
+	let navChatCount = $derived(navUnreadCount + navAnnounceCount);
 </script>
 
 <div class="frame">
@@ -150,10 +154,8 @@
 			<a href={item.href} class="nav-item" class:nav-active={active}>
 				<span class="nav-icon" class:nav-icon-active={active}>{@html navIcons[item.label]}</span>
 				{item.label}
-				{#if item.label === 'Chat' && navUnreadCount > 0}
-					<span class="nav-badge">{navUnreadCount > 99 ? '99+' : navUnreadCount}</span>
-				{:else if item.label === 'Topics' && navAnnounceCount > 0}
-					<span class="nav-badge" title="Unseen topic announcements">{navAnnounceCount > 99 ? '99+' : navAnnounceCount}</span>
+				{#if item.label === 'Chat' && navChatCount > 0}
+					<span class="nav-badge" title="Unread messages and topic announcements">{navChatCount > 99 ? '99+' : navChatCount}</span>
 				{/if}
 			</a>
 		{/each}

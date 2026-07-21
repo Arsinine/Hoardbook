@@ -4,6 +4,7 @@
 	import {
 		topicList,
 		topicCreate,
+		topicUpdateMeta,
 		topicDiscover,
 		topicLookup,
 		topicJoinPublic,
@@ -15,8 +16,9 @@
 		topicAnnounceStatus,
 	} from '$lib/api.js';
 	import type { TopicView, DiscoveredTopic, TopicLookup } from '$lib/types.js';
-	import { memberCountLabel, rosterLabel, TOPIC_ROOTS, composeTopicPath, subPathLabel, groupTopicsByRoot, createPrimaryAction } from '$lib/topics-view.js';
+	import { memberCountLabel, rosterLabel, TOPIC_ROOTS, composeTopicPath, subPathLabel, createPrimaryAction } from '$lib/topics-view.js';
 	import { canAnnounce, cooldownLabel, ANNOUNCE_EXPLAINER } from '$lib/announce-view.js';
+	import { icons } from '$lib/icons.js';
 	import TopicJoinConsent from '$lib/components/TopicJoinConsent.svelte';
 	import Modal from '$lib/components/Modal.svelte';
 	import HintMarker from '$lib/components/HintMarker.svelte';
@@ -29,7 +31,6 @@
 	let createOpen = $state(false);
 
 	let mine: TopicView[] = $state([]);
-	let discovered: DiscoveredTopic[] = $state([]);
 	let busy = $state(false);
 
 	// Create form. W4: a PUBLIC Topic is a category root (picker — a bad root is unrepresentable) + a
@@ -38,14 +39,15 @@
 	let newSubPath = $state('');
 	let newName = $state(''); // private (freeform) name
 	let newDesc = $state('');
-	let newTags = $state('');
 	let newPrivate = $state(false);
 	// The composed public path, previewed under the inputs.
 	let composedPublicName = $derived(composeTopicPath(newRoot, newSubPath));
-	let discoveredTree = $derived(groupTopicsByRoot(discovered));
 
-	// Discover
-	let searchTags = $state('');
+	// devtest v0.12.1 #7: Discover-by-primitive — the six root categories, each expandable to every
+	// public Topic under it (no tag search). Results are fetched lazily on first expand + cached.
+	let expandedRoot: string | null = $state(null);
+	let rootTopics: Record<string, DiscoveredTopic[]> = $state({});
+	let loadingRoot: string | null = $state(null);
 
 	// The consent gate: which Topic (public name + private flag) is pending a join.
 	let pendingJoin: { name: string; isPrivate: boolean } | null = $state(null);
@@ -55,6 +57,11 @@
 	let openTopic: TopicView | null = $state(null);
 	let roster: string[] = $state([]);
 	let inviteNpub = $state('');
+
+	// devtest v0.12.1 #8: a Topic's description is editable after creation (the name is immutable).
+	let editingDesc = $state(false);
+	let descDraft = $state('');
+	let savingDesc = $state(false);
 
 	// M13 Part A (Q1) — this page only SENDS an announce; the announce list itself renders in the Chat
 	// topic thread. `announceRemaining` seeds from the backend on open() and ticks down locally every
@@ -85,10 +92,6 @@
 		} finally {
 			announcing = false;
 		}
-	}
-
-	function splitTags(s: string): string[] {
-		return s.split(',').map((t) => t.trim()).filter(Boolean);
 	}
 
 	async function loadMine() {
@@ -159,8 +162,8 @@
 		if (!canCreate) return;
 		busy = true;
 		try {
-			await topicCreate(createName, newDesc.trim(), splitTags(newTags), newPrivate);
-			newName = newSubPath = newDesc = newTags = '';
+			await topicCreate(createName, newDesc.trim(), newPrivate);
+			newName = newSubPath = newDesc = '';
 			newRoot = TOPIC_ROOTS[0];
 			newPrivate = false;
 			createOpen = false;
@@ -186,19 +189,46 @@
 		}
 	}
 
-	async function discover() {
-		const tags = splitTags(searchTags);
-		if (tags.length === 0) {
-			toast('Enter at least one tag to discover Topics', 'error');
+	// devtest v0.12.1 #7: expand a primitive (root category) to list every public Topic under it. The
+	// per-root fetch is lazy (first expand) + cached; the backend activity-ranks and caps the results.
+	async function toggleRoot(root: string) {
+		if (expandedRoot === root) {
+			expandedRoot = null;
 			return;
 		}
-		busy = true;
+		expandedRoot = root;
+		if (rootTopics[root]) return; // already fetched
+		loadingRoot = root;
 		try {
-			discovered = await topicDiscover(tags);
+			rootTopics = { ...rootTopics, [root]: await topicDiscover([root]) };
+		} catch (e) {
+			toast(String(e), 'error');
+			expandedRoot = null;
+		} finally {
+			loadingRoot = null;
+		}
+	}
+
+	// devtest v0.12.1 #8: edit the open Topic's description (name stays fixed — it derives the room id).
+	function startEditDesc() {
+		if (!openTopic) return;
+		descDraft = openTopic.description;
+		editingDesc = true;
+	}
+
+	async function saveDesc() {
+		if (!openTopic || savingDesc) return;
+		savingDesc = true;
+		try {
+			const updated = await topicUpdateMeta(openTopic.topic_id, descDraft.trim());
+			openTopic = updated;
+			mine = mine.map((t) => (t.topic_id === updated.topic_id ? updated : t));
+			editingDesc = false;
+			toast('Topic updated', 'success');
 		} catch (e) {
 			toast(String(e), 'error');
 		} finally {
-			busy = false;
+			savingDesc = false;
 		}
 	}
 
@@ -262,6 +292,7 @@
 		openTopic = t;
 		roster = [];
 		announceBody = '';
+		editingDesc = false;
 		if (announceTicker) clearInterval(announceTicker);
 		try {
 			roster = await topicRoster(t.topic_id);
@@ -326,7 +357,19 @@
 					<div class="detail-head">
 						<div class="grow">
 							<div class="detail-title">{openTopic.name} {#if openTopic.private}<span class="tag">private</span>{/if}</div>
-							{#if openTopic.description}<div class="muted">{openTopic.description}</div>{/if}
+							<!-- devtest v0.12.1 #8: description is editable after creation (the name is not). -->
+							{#if editingDesc}
+								<div class="desc-edit">
+									<input class="grow" bind:value={descDraft} placeholder="description" onkeydown={(e) => e.key === 'Enter' && saveDesc()} />
+									<button class="btn-primary btn-sm" disabled={savingDesc} onclick={saveDesc}>{savingDesc ? '…' : 'Save'}</button>
+									<button class="btn-ghost btn-sm" disabled={savingDesc} onclick={() => (editingDesc = false)}>Cancel</button>
+								</div>
+							{:else}
+								<div class="desc-row">
+									{#if openTopic.description}<span class="muted">{openTopic.description}</span>{:else}<span class="muted desc-empty">No description</span>{/if}
+									<button class="desc-edit-btn" onclick={startEditDesc}>Edit</button>
+								</div>
+							{/if}
 						</div>
 						<ConfirmButton label="Leave" confirmText="Leave this Topic?" onconfirm={() => openTopic && leave(openTopic)} />
 					</div>
@@ -374,30 +417,36 @@
 			</div>
 		</section>
 	{:else}
-		<!-- Discover tab -->
+		<!-- Discover tab — devtest v0.12.1 #7: browse public Topics by primitive (root category). No tag
+		     search; expand a category to fetch every public Topic under it (backend activity-ranked). -->
 		<section class="discover-tab">
-			<div class="discover-controls">
-				<input class="grow" placeholder="search tags, comma-separated" bind:value={searchTags} onkeydown={(e) => e.key === 'Enter' && discover()} />
-				<button class="btn-primary" disabled={busy} onclick={discover}>Discover</button>
-			</div>
-			<!-- W4: results render as a tree split on '/' (root category → sub-paths), activity-ranked
-			     within each root by the backend. -->
-			{#if discoveredTree.length === 0}
-				<p class="muted empty">Enter one or more tags, then press Discover to find public Topics.</p>
-			{:else}
-				{#each discoveredTree as group (group.root)}
-					<div class="tree-root">{group.root}</div>
-					{#each group.topics as d (d.topic_id)}
-						<div class="row tree-child">
-							<div class="grow">
-								<div class="name">{subPathLabel(d.name) || d.name}</div>
-								<div class="muted">{memberCountLabel(d.member_count_estimate)}</div>
-							</div>
-							<button class="btn-default" onclick={() => askToJoin(d.name, false)}>Join</button>
-						</div>
-					{/each}
-				{/each}
-			{/if}
+			<p class="muted discover-hint">Browse public Topics by category. Expand one to see every public Topic under it.</p>
+			{#each TOPIC_ROOTS as root (root)}
+				<div class="root-group">
+					<button class="root-header" onclick={() => toggleRoot(root)} aria-expanded={expandedRoot === root}>
+						<span class="root-chevron" class:open={expandedRoot === root}>{@html icons.chevronRight}</span>
+						<span class="root-name">{root}</span>
+					</button>
+					{#if expandedRoot === root}
+						{#if loadingRoot === root}
+							<div class="root-status muted">Loading…</div>
+						{:else if (rootTopics[root] ?? []).length === 0}
+							<div class="root-status muted">No public Topics under “{root}” yet.</div>
+						{:else}
+							{#each rootTopics[root] as d (d.topic_id)}
+								<div class="row tree-child">
+									<div class="grow">
+										<div class="name">{subPathLabel(d.name) || d.name}</div>
+										{#if d.description}<div class="muted">{d.description}</div>{/if}
+										<div class="muted">{memberCountLabel(d.member_count_estimate)}</div>
+									</div>
+									<button class="btn-default" onclick={() => askToJoin(d.name, false)}>Join</button>
+								</div>
+							{/each}
+						{/if}
+					{/if}
+				</div>
+			{/each}
 			<button class="link" disabled={busy} onclick={redeemInvite}>Redeem a private Topic invite</button>
 		</section>
 	{/if}
@@ -421,7 +470,6 @@
 			<div class="muted path-preview">Topic path: <code>{composedPublicName}</code></div>
 		{/if}
 		<input placeholder="description" bind:value={newDesc} />
-		<input placeholder="tags, comma-separated" bind:value={newTags} />
 		<label class="check"><input type="checkbox" bind:checked={newPrivate} /> Private (unlisted)</label>
 	</div>
 	{#snippet actions()}
@@ -477,13 +525,24 @@
 	.section-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; color: var(--fg-dim); }
 	.detail-empty { color: var(--fg-dim); font-size: 12.5px; margin: auto; text-align: center; max-width: 280px; }
 
-	/* Discover tab */
+	/* Discover tab — devtest v0.12.1 #7: primitive (root category) accordion. */
 	.discover-tab {
 		flex: 1; min-height: 0; overflow-y: auto;
 		background: var(--bg-elev1); border: 1px solid var(--border); border-radius: 10px; padding: 16px;
-		display: flex; flex-direction: column; gap: 8px;
+		display: flex; flex-direction: column; gap: 4px;
 	}
-	.discover-controls { display: flex; gap: 8px; }
+	.discover-hint { margin-bottom: 6px; }
+	.root-group { border-top: 1px solid var(--divider); }
+	.root-group:first-of-type { border-top: none; }
+	.root-header {
+		display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+		padding: 9px 4px; background: transparent; border: none; cursor: pointer; color: var(--fg);
+		font: inherit; font-size: 13px; font-weight: 600; text-transform: capitalize;
+	}
+	.root-header:hover { color: var(--accent); }
+	.root-chevron { display: flex; transition: transform 0.15s; color: var(--fg-dim); }
+	.root-chevron.open { transform: rotate(90deg); }
+	.root-status { padding: 6px 0 6px 22px; }
 
 	.empty { padding: 16px 8px; }
 
@@ -507,8 +566,17 @@
 	.path-sep { color: var(--fg-dim); }
 	.path-preview { font-size: 11px; }
 	.path-preview code { font-family: var(--font-mono); color: var(--fg-muted); }
-	.tree-root { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; color: var(--fg-dim); margin-top: 8px; }
-	.tree-child { padding-left: 12px; }
+	.tree-child { padding-left: 22px; }
+	/* devtest v0.12.1 #8: inline description edit in the detail head. */
+	.desc-row { display: flex; align-items: baseline; gap: 8px; }
+	.desc-empty { font-style: italic; }
+	.desc-edit-btn {
+		background: transparent; border: none; cursor: pointer; color: var(--accent);
+		font: inherit; font-size: 11px; padding: 0; flex-shrink: 0;
+	}
+	.desc-edit-btn:hover { text-decoration: underline; }
+	.desc-edit { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
+	.desc-edit input { flex: 1; }
 	.roster { list-style: none; margin: 0; padding: 0; font-size: 12px; max-height: 200px; overflow-y: auto; }
 	.roster li { padding: 3px 0; }
 	.invite { display: flex; gap: 6px; }

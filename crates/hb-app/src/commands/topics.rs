@@ -214,6 +214,19 @@ fn load_stored(store: &DataStore, topic_id: &str) -> Result<StoredTopic, String>
         .ok_or_else(|| format!("You are not in topic {topic_id}"))
 }
 
+/// The discovery `#t` tags an announce carries (devtest v0.12.1 #6/#7). Topics no longer carry **user
+/// tags** — a public Topic's name is descriptive enough — so a public Topic's sole discovery tag is
+/// its **root category** (the first path segment, e.g. `video`); that lets Discover-by-primitive
+/// (`topic_discover([root])`) enumerate every public Topic under a category with no tag search. A
+/// private Topic is unlisted, so it carries none. Pure, so the "root-only, no user tags" rule is
+/// unit-tested without a relay.
+pub(crate) fn discovery_tags(name: &str, private: bool) -> Vec<String> {
+    if private {
+        return Vec::new();
+    }
+    hb_core::topic::topic_root(name).map(|r| vec![r.to_string()]).unwrap_or_default()
+}
+
 // ── commands ─────────────────────────────────────────────────────────────────────────────────────
 
 /// List the Topics I'm in.
@@ -224,11 +237,14 @@ pub async fn topic_list(store: State<'_, DataStore>) -> CmdResult<Vec<TopicView>
 
 /// Create a Topic. A **public** Topic publishes an announce + a public-join credential + my membership;
 /// a **private** Topic publishes only my membership (unlisted). I become its sole member.
+///
+/// devtest v0.12.1 #6: a Topic carries **no user tags** — the name is descriptive enough. A public
+/// Topic's **root category** is stamped as its sole discovery tag ([`discovery_tags`]) so
+/// Discover-by-primitive (#7) can list every public Topic under a category.
 #[tauri::command]
 pub async fn topic_create(
     name: String,
     description: String,
-    tags: Vec<String>,
     private: bool,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
@@ -237,7 +253,9 @@ pub async fn topic_create(
     let me = me(&identity).await?;
     // W4: a public name is validated here (root ∈ category + depth cap — backend-authoritative); a
     // private name stays freeform. A bad public path surfaces the clear hb-core error.
-    let (meta, key) = new_topic(&name, &description, tags, private).map_err(cmd_err)?;
+    let (mut meta, key) = new_topic(&name, &description, Vec::new(), private).map_err(cmd_err)?;
+    // #6/#7: root category is the only discovery tag (new_topic already validated the public root).
+    meta.tags = discovery_tags(&meta.name, private);
     let t = now();
 
     let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
@@ -268,6 +286,32 @@ pub async fn topic_create(
     publish_topic(&client, &events).await.map_err(cmd_err)?;
 
     let stored = StoredTopic { meta: meta.clone(), key, joined_at: t, membership_json: Some(membership.as_json()) };
+    store_topic(&store, stored.clone())?;
+    Ok(TopicView::from(&stored))
+}
+
+/// Edit a Topic's description after it has been created (devtest v0.12.1 #8). The **name is immutable**
+/// — a public Topic's `topic_id` is derived from its name, so renaming would fork the room; only the
+/// description is editable. A **public** Topic re-announces (same `topic_id`, newest-announce-wins) so
+/// discovery reflects the new blurb; a **private** Topic just updates its local record (nothing is
+/// published). The root discovery tag is re-derived, never dropped.
+#[tauri::command]
+pub async fn topic_update_meta(
+    topic_id: String,
+    description: String,
+    identity: State<'_, SharedIdentity>,
+    store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
+) -> CmdResult<TopicView> {
+    let me = me(&identity).await?;
+    let mut stored = load_stored(&store, &topic_id)?;
+    stored.meta.description = description;
+    stored.meta.tags = discovery_tags(&stored.meta.name, stored.meta.private);
+    if !stored.meta.private {
+        let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
+        let announce = build_announce(&me, &stored.meta, now()).map_err(cmd_err)?;
+        publish_topic(&client, &[announce]).await.map_err(cmd_err)?;
+    }
     store_topic(&store, stored.clone())?;
     Ok(TopicView::from(&stored))
 }
@@ -706,6 +750,15 @@ mod tests {
         let c = store.load_contact(&CachedPeer::pubkey_hash(&npub)).unwrap().unwrap();
         assert_eq!(c.source, ContactSource::Manual, "an existing manual contact keeps its badge");
         assert!(c.browse_key_hex.is_some(), "and keeps its browse-key");
+    }
+
+    #[test]
+    fn public_topic_is_tagged_by_root_only_no_user_tags() {
+        // devtest v0.12.1 #6/#7: a public Topic carries exactly one discovery tag — its root category
+        // (so Discover-by-primitive finds it); a private Topic carries none. No user tags either way.
+        assert_eq!(discovery_tags("video/films/criterion", false), vec!["video".to_string()]);
+        assert_eq!(discovery_tags("audio", false), vec!["audio".to_string()]);
+        assert!(discovery_tags("back room", true).is_empty(), "a private Topic carries no discovery tag");
     }
 
     #[test]

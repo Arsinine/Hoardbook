@@ -43,6 +43,9 @@
 	let draft = $state('');
 	let threadEl: HTMLElement | undefined = $state();
 	let searchQuery = $state('');
+	// devtest v0.12.1 #4: a `/chat?peer=<npub>` deep-link (from double-clicking a contact) opens that
+	// conversation. Guarded so it fires once per distinct param, and re-evaluates as `$contacts` loads.
+	let peerDeepLinked = $state('');
 
 	// ── Topic channels (M11) — a Topic you've joined surfaces here as a persistent channel. The
 	//    channel ENTRY lasts as long as your membership (durable, §11), but its posts are 24h-ephemeral
@@ -454,6 +457,18 @@
 	$effect(() => {
 		fetchNonContactNames($dmRequests.map((r) => r.npub));
 	});
+	// devtest v0.12.1 #4: resolve the `?peer=<npub>` deep-link through selectPeer once the contact is
+	// loaded. Re-runs when $contacts settles; a contact double-clicked in Contacts is always present,
+	// so it opens their conversation pane (empty-thread until the first message, then it joins the list).
+	$effect(() => {
+		const npub = $page.url.searchParams.get('peer') ?? '';
+		if (!npub || npub === peerDeepLinked) return;
+		const peer = $contacts.find((c) => c.npub === npub);
+		if (peer) {
+			peerDeepLinked = npub;
+			selectPeer(peer);
+		}
+	});
 	// devtest #16: derived straight from the persisted per-peer watermark, replacing the old
 	// seenCounts in-memory snapshot (which reset to "no unread" on every remount).
 	let unreadCounts = $derived(unreadByPeer($inboxMessages, $readWatermarks, myId));
@@ -496,7 +511,7 @@
 							<div class="convo-info">
 								<div class="convo-row">
 									<span class="convo-name" class:convo-name-active={selectedTopic?.topic_id === t.topic_id}>{t.name}</span>
-									{#if t.private}<span class="convo-req-dot" title="Private topic"></span>{/if}
+									{#if t.private}<span class="convo-lock" title="Private topic">🔒</span>{/if}
 								</div>
 							</div>
 						</button>
@@ -910,10 +925,9 @@
 	.convo-name { font-size: 13px; font-weight: 500; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 	.convo-name-active { font-weight: 600; }
 
-	.convo-req-dot {
-		width: 6px; height: 6px; border-radius: 50%;
-		background: oklch(0.75 0.16 60); flex-shrink: 0;
-	}
+	/* devtest v0.12.1 #5: a private-topic marker reads as a lock, not a filled dot (the old amber dot
+	   looked like a permanent unread/notification bubble). */
+	.convo-lock { font-size: 10px; line-height: 1; flex-shrink: 0; opacity: 0.6; }
 
 	/* Topic channels (M11) */
 	.convo-section-label {
