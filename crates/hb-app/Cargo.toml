@@ -48,6 +48,15 @@ tauri-plugin-dialog = "2"
 sha2    = "0.10"
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
+# Portable self-updater (Windows): fetch the signed portable binary and swap the running exe in place.
+# Verification reuses the SAME minisign key + `minisign-verify` crate as the NSIS updater (byte-identical
+# to tauri-plugin-updater's `verify_signature`), so no new trust root. `reqwest`/`semver`/`minisign-verify`
+# are already in the lock (pinned to those versions) — only `self_replace` is a new package.
+reqwest         = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs"] }
+semver          = "1"
+minisign-verify = "0.2"
+self-replace    = "1"
+tempfile        = "3"
 globset = "0.4"
 # M9 snapshot auto-update: cross-platform filesystem watcher (inotify / FSEvents /
 # ReadDirectoryChangesW). Kept behind a thin wrapper (`spawn_fs_watcher`) so the OS watcher is never

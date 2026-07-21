@@ -140,17 +140,32 @@ jobs:
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
 
-      - name: Upload portable exe and zip
+      - name: Sign + publish the portable self-updater artifacts (Windows)
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          $exe = "Hoardbook_${{ github.ref_name }}.exe"
-          $zip = "Hoardbook_${{ github.ref_name }}_windows_x64_portable.zip"
+          # devtest v0.12.1 follow-up: the portable build self-updates in place. Publish a STABLE-named
+          # exe (no version in the filename — the version lives inside the binary) so
+          # `releases/latest/download/Hoardbook.exe` is a fixed URL the in-app updater fetches, plus its
+          # minisign signature (SAME key as the NSIS updater) and a `portable.json` manifest.
+          $exe = "Hoardbook.exe"
           Copy-Item "target/release/hb-app.exe" $exe
-          Compress-Archive -Path $exe -DestinationPath $zip
-          gh release upload '${{ github.ref_name }}' $exe $zip --repo ${{ github.repository }}
+          # Sign with the Tauri signer → `$exe.sig` (base64 minisign signature, the exact format
+          # tauri-plugin-updater — and our portable verifier — expect). Key comes from env (masked).
+          npx --yes @tauri-apps/cli@2 signer sign --private-key "$env:TAURI_SIGNING_PRIVATE_KEY" --password "$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD" $exe
+          $sig = (Get-Content "$exe.sig" -Raw).Trim()
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          $url = "https://github.com/${{ github.repository }}/releases/latest/download/Hoardbook.exe"
+          $manifest = [ordered]@{
+            version   = $version
+            platforms = [ordered]@{ "windows-x86_64" = [ordered]@{ url = $url; signature = $sig } }
+          } | ConvertTo-Json -Depth 5
+          Set-Content -Path "portable.json" -Value $manifest -NoNewline
+          gh release upload '${{ github.ref_name }}' $exe "$exe.sig" portable.json --repo ${{ github.repository }}
 
   publish-release:
     needs: [create-release, build-tauri]
