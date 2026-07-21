@@ -310,6 +310,7 @@ pub fn run() {
             commands::collection::scan_directory,
             commands::collection::list_subdirs,
             commands::collection::get_collections,
+            commands::collection::collection_source_accessible,
             commands::collection::delete_collection,
             commands::collection::publish_collection,
             commands::collection::unpublish_collection,

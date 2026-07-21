@@ -33,22 +33,27 @@
 				identityLoadError.set(String(e));
 			}
 			try { profile.set(await getProfile()); } catch { }
-			try { collections.set(await getCollections()); } catch { }
-			try { contacts.set(await getContacts()); } catch { }
-			try { appVersion = await getVersion(); } catch { appVersion = '0.4.2'; }
 
-			// Load the persisted per-peer read watermark BEFORE seeding the inbox (devtest #16) — the
-			// nav badge derives from both together, so this order avoids a first-paint flash of a
-			// stale "everything unread" count.
-			try { readWatermarks.set(await getReadState()); } catch { }
-			try { inboxMessages.set(await getMessages()); } catch { }
-
-			// devtest #2: seed the persisted per-topic announcement-seen watermarks BEFORE the first
-			// alert poll, so an announcement that landed while the app was closed badges without also
-			// toasting a backlog (the baseline stays empty until the first poll).
-			try { announceSeen.set(await topicAnnounceSeen()); } catch { }
-
+			// Home's first render needs ONLY identity (onboarding vs profile view) + profile (the editable
+			// form) — both fast, LOCAL reads. Flip `appReady` NOW, so a slow or frozen resource downstream
+			// (an SMB collection root, an unreachable relay, a pending Windows Firewall decision) can never
+			// leave Home stuck on the loading spinner while every other page works. Everything else loads
+			// below, OFF the critical path — each store updates the UI reactively as it resolves, so the
+			// collections / contacts / inbox "fill in" once their (possibly slow) source responds.
 			appReady.set(true);
+
+			getCollections().then((c) => collections.set(c)).catch(() => { });
+			getContacts().then((c) => contacts.set(c)).catch(() => { });
+			getVersion().then((v) => { appVersion = v; }).catch(() => { appVersion = '0.4.2'; });
+			// devtest #16: read the LOCAL per-peer watermark, THEN seed the inbox (relay), so the nav
+			// badge never flashes a stale "everything unread" count if the relay happens to resolve
+			// first (codex review). Both are off the critical path — `appReady` already fired above.
+			getReadState()
+				.then((w) => readWatermarks.set(w))
+				.catch(() => { })
+				.finally(() => { getMessages().then((m) => inboxMessages.set(m)).catch(() => { }); });
+			// devtest #2: the announce-seen watermarks (local) — baselines the first alert poll.
+			topicAnnounceSeen().then((s) => announceSeen.set(s)).catch(() => { });
 		})();
 
 		// Update-available event from the backend background check.

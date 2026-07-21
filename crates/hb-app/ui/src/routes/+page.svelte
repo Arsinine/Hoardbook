@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { saveProfile, publishProfile, publishCollection, unpublishCollection, deleteCollection, exportCollection, exportManifest, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec } from '$lib/api.js';
+	import { saveProfile, publishProfile, publishCollection, unpublishCollection, deleteCollection, exportCollection, exportManifest, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec, collectionSourceAccessible } from '$lib/api.js';
 	import { passphraseStrength } from '$lib/backup-export.js';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { profile, collections, identity, toast, appReady, homeDraft, identityLoadError } from '$lib/stores.js';
@@ -451,6 +451,53 @@
 	let nameInitial = $derived(form.display_name?.[0]?.toUpperCase() ?? 'Y');
 	let nameHue = $derived(avatarHue(nameInitial));
 	let totalItems = $derived($collections.reduce((s, c) => s + c.item_count, 0));
+
+	// ── Collection source-accessibility (greyed → fills in) ──────────────────────────────────────
+	// A slow or offline source root (e.g. an SMB share that's down) must never freeze anything: the
+	// backend check is timeout-bounded and Home already renders without waiting on it. Each collection
+	// starts greyed (`undefined`) and fills in when its source responds (`true`), or stays greyed if it's
+	// offline (`false`). Offline ones are re-checked on a slow tick so a mount coming back online fills
+	// back in automatically.
+	let collectionAccess: Record<string, boolean | undefined> = $state({});
+	const accessChecking = new Set<string>();
+	const accessKicked = new Set<string>();
+
+	async function checkAccess(slug: string) {
+		if (accessChecking.has(slug)) return; // never two checks in flight for the same collection
+		accessChecking.add(slug);
+		try {
+			// Mutate the `$state` proxy in place (reactive in Svelte 5) — a `{ ...collectionAccess }`
+			// spread would snapshot the map BEFORE the await, so concurrent checks would clobber each
+			// other's results (codex review HIGH). A single-key write can't lose a sibling's result.
+			const ok = await collectionSourceAccessible(slug);
+			collectionAccess[slug] = ok;
+		} catch {
+			collectionAccess[slug] = false;
+		} finally {
+			accessChecking.delete(slug);
+		}
+	}
+
+	// Kick off a first check for each collection once (depends only on $collections).
+	$effect(() => {
+		for (const col of $collections) {
+			if (!accessKicked.has(col.slug)) {
+				accessKicked.add(col.slug);
+				checkAccess(col.slug);
+			}
+		}
+	});
+
+	// Re-check ALL collections on a slow tick — a source that RETURNS fills back in, and one that
+	// DROPS while Home is open greys out too (codex review: don't only retry the already-offline ones).
+	// `accessChecking` guards against overlap, and the backend dedups an in-flight stat per root, so a
+	// dead mount can't pile up blocking threads.
+	onMount(() => {
+		const t = setInterval(() => {
+			for (const col of $collections) checkAccess(col.slug);
+		}, 30_000);
+		return () => clearInterval(t);
+	});
 </script>
 
 {#if obStep === 0}
@@ -813,6 +860,7 @@
 					{#each $collections as col (col.slug)}
 						<CollectionRow
 							collection={col}
+							accessible={collectionAccess[col.slug]}
 							onrescan={() => openRescan(col)}
 							onedit={() => openEditDetails(col)}
 							onpublish={() => handlePublishCollection(col.slug)}

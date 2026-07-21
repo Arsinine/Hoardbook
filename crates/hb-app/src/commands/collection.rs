@@ -338,6 +338,54 @@ pub async fn get_collections(store: State<'_, DataStore>) -> CmdResult<Vec<Colle
     Ok(entries)
 }
 
+/// Roots with an accessibility stat currently in flight — dedups concurrent/repeated checks for the
+/// same source root so a dead mount (whose `metadata()` blocks past our timeout and keeps running
+/// detached) can't pile up blocking threads across the frontend's periodic re-checks (codex review).
+fn inflight_access_stats() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Whether a collection's **source root** is currently reachable — a **timeout-bounded** metadata stat,
+/// so an unreachable or slow SMB / removable mount can't hang the caller (the freeze this fixes). `true`
+/// = reachable; `false` = unreachable, slow past the timeout, a stat already in flight, or the check
+/// couldn't run. A collection with no recorded scan root reports `true` (nothing to gate on). The Home
+/// list greys a collection until this returns `true`, and re-checks on a slow tick so a mount coming
+/// back online fills back in.
+#[tauri::command]
+pub async fn collection_source_accessible(slug: String, store: State<'_, DataStore>) -> CmdResult<bool> {
+    let Some(spec) = store.load_scan_spec(&slug).map_err(cmd_err)? else {
+        return Ok(true);
+    };
+    if spec.root.is_empty() {
+        return Ok(true);
+    }
+    let root = spec.root;
+    // Dedup: if a stat for this root is already running (e.g. a prior dead-mount check still blocked in
+    // the OS), don't launch another — report "not reachable (yet)" so detached blocking stats can never
+    // accumulate. The running task removes the key when the OS finally returns.
+    {
+        let mut set = inflight_access_stats().lock().unwrap_or_else(|e| e.into_inner());
+        if !set.insert(root.clone()) {
+            return Ok(false);
+        }
+    }
+    let root_for_task = root;
+    let handle = tokio::task::spawn_blocking(move || {
+        let reachable = std::path::Path::new(&root_for_task).metadata().is_ok();
+        inflight_access_stats().lock().unwrap_or_else(|e| e.into_inner()).remove(&root_for_task);
+        reachable
+    });
+    // The stat is bounded by a timeout — a dead mount blocks the OS call, but we stop waiting and report
+    // "not reachable (yet)". Even on our timeout the detached task runs to completion and self-removes
+    // from the in-flight set, so at most ONE blocking stat per root exists at a time.
+    match tokio::time::timeout(std::time::Duration::from_secs(6), handle).await {
+        Ok(Ok(reachable)) => Ok(reachable),
+        _ => Ok(false),
+    }
+}
+
 /// Update the editable metadata fields of a collection draft.
 #[tauri::command]
 pub async fn update_collection_meta(
