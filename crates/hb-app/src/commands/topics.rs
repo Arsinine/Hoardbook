@@ -309,7 +309,12 @@ pub async fn topic_update_meta(
     stored.meta.tags = discovery_tags(&stored.meta.name, stored.meta.private);
     if !stored.meta.private {
         let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
-        let announce = build_announce(&me, &stored.meta, now()).map_err(cmd_err)?;
+        // Stamp the re-announce strictly newer than any prior announce for this topic, so newest-wins
+        // dedup (`prev >= ts` keeps the existing on a tie) actually supersedes even on a same-second
+        // edit right after create (codex review). `joined_at` is this topic's create second; `+1`
+        // guarantees a later stamp. (`created_at` is second-resolution on the wire.)
+        let t = now().max(stored.joined_at + 1);
+        let announce = build_announce(&me, &stored.meta, t).map_err(cmd_err)?;
         publish_topic(&client, &[announce]).await.map_err(cmd_err)?;
     }
     store_topic(&store, stored.clone())?;
@@ -381,12 +386,20 @@ pub async fn topic_join_public(
     let mut seen = store.load_topic_nonces().map_err(cmd_err)?;
     let t = now();
     let redeemed = join_public(&client, &name, &mut seen, t, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
-    let (meta, key) = match redeemed {
+    let (mut meta, key) = match redeemed {
         Some(v) => v,
         None => {
             return Err("Could not find a public-join credential for that Topic — is the name right?".into());
         }
     };
+    // The reusable public-join credential embeds the meta captured when the Topic was created; a later
+    // description edit (`topic_update_meta`) re-announces but does NOT rewrite that credential — and
+    // `join_public` returns the FIRST redeemable credential, not the newest. So take the CURRENT
+    // description from the authoritative newest announce (replaceable, newest-wins) rather than the
+    // possibly-stale credential (codex review HIGH). Best-effort: a fetch miss keeps the credential's.
+    if let Ok(Some(current)) = fetch_announce(&client, &meta.topic_id, net::RELAY_TIMEOUT).await {
+        meta.description = current.description;
+    }
     let membership = join_topic(&client, &key, &meta.topic_id, &me, t).await.map_err(cmd_err)?;
     let roster = fetch_roster(&client, &meta.topic_id, &key, net::RELAY_TIMEOUT).await.unwrap_or_default();
 

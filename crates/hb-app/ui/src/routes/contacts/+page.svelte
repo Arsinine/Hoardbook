@@ -354,7 +354,9 @@
 		<!-- devtest v0.12.1 #4: double-click a contact to open the conversation in Chat. The chevron,
 		     Browse, and ⋯ controls keep their own single-click actions. -->
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
-		<div class="contact-card" ondblclick={() => goto('/chat?peer=' + peer.npub)} title="Double-click to message in Chat">
+		<!-- Ignore double-clicks that land on an inner control (chevron, Browse, ⋯ menu) so they keep
+		     their own single-click action instead of also navigating to Chat (codex review). -->
+		<div class="contact-card" ondblclick={(e) => { if ((e.target as HTMLElement).closest('button, a')) return; goto('/chat?peer=' + peer.npub); }} title="Double-click to message in Chat">
 			<!-- svelte-ignore a11y_click_events_have_key_events -->
 			<button class="chevron-btn" onclick={() => toggleDetail(peer.npub)} aria-expanded={isOpen} aria-label="Toggle details">
 				<span class="chevron" class:chevron-open={isOpen}>{@html icons.chevronDown}</span>
