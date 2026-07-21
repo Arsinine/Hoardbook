@@ -89,6 +89,15 @@ export interface Collection {
 	 *  count, so the browser shows the shown items behind a "N more hidden" fade. Absent when whole. */
 	truncated?: boolean;
 	total_items?: number;
+	/** M16 W4 — the full-tree snapshot fingerprint (both the teaser and the full manifest carry it);
+	 *  passed to `import_manifest` to gate an imported manifest for staleness. Absent when unmarked. */
+	snapshot_fingerprint?: string;
+	/** M16 W4 — unix secs of a `.hbmanifest` imported to upgrade this truncated teaser to the full
+	 *  tree. Set only after an import; the UI tags "Full manifest imported · <date>" and the fade lifts. */
+	manifest_imported_at?: number;
+	/** M16 W4 — the id of the teaser (index) event this collection was browsed from, so an "ask the
+	 *  owner for the full list" DM can name the exact event. Absent for a cached/pre-M16 collection. */
+	teaser_event_id?: string;
 }
 
 /** A trusted peer's decrypted Private collections, grouped by author npub (M10 browse). */

@@ -5,6 +5,7 @@ import {
 	countListingItems,
 	dedupAndCap,
 	flattenTree,
+	importedManifestNote,
 	parseEstSize,
 	paywallTeaser,
 	peerAccessBadge,
@@ -224,5 +225,25 @@ describe('paywallTeaser (M16 W3 — resolves to full tree when upgraded)', () =>
 	it('returns null for an absent collection', () => {
 		expect(paywallTeaser(null)).toBeNull();
 		expect(paywallTeaser(undefined)).toBeNull();
+	});
+});
+
+describe('importedManifestNote (M16 W4 — imported full manifest tag)', () => {
+	it('returns a dated note once a manifest has been imported', () => {
+		const note = importedManifestNote({ manifest_imported_at: 1_700_000_000 });
+		expect(note).toMatch(/^Full manifest imported · /);
+	});
+
+	it('returns null for a normally-browsed collection', () => {
+		expect(importedManifestNote({})).toBeNull();
+		expect(importedManifestNote(null)).toBeNull();
+		expect(importedManifestNote(undefined)).toBeNull();
+	});
+
+	it('the imported (full) collection no longer shows a paywall fade', () => {
+		// After import the backend clears `truncated`; the fade lifts and the note takes its place.
+		const imported = { total_items: 100, listing: [{ name: 'a' }], manifest_imported_at: 1_700_000_000 };
+		expect(paywallTeaser(imported)).toBeNull();
+		expect(importedManifestNote(imported)).not.toBeNull();
 	});
 });

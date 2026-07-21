@@ -1,6 +1,6 @@
 [package]
 name    = "hb-net"
-version = "0.12.0"
+version = "0.12.1"
 edition = "2021"
 
 # M2 — the Nostr relay client. Turns hb-core's offline primitives into a working signaling

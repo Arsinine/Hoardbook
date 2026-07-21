@@ -354,13 +354,15 @@ pub async fn fetch_full_listing_if_current(
 /// (so a non-compliant relay's stale replaceable duplicate can't win — N3/AB8), then decrypt +
 /// render each family independently. A family that fails to decrypt or render is **skipped** —
 /// locked ≠ error, mirroring BR1 — so one re-keyed or corrupt collection can't hide the rest.
-/// Families come back sorted by root slug (deterministic across fetches).
+/// Families come back sorted by root slug (deterministic across fetches). The third tuple element is
+/// the **index (teaser) event id** — the id of the `d = root` event the browser sees — so a manifest
+/// request (M16 W4) can name the exact teaser event; `None` if that event had no recoverable id.
 pub async fn browse_peer_listings(
     client: &RelayClient,
     peer: &PublicKey,
     browse_key: &BrowseKey,
     timeout: Duration,
-) -> Result<Vec<(String, RenderedListing)>, NetError> {
+) -> Result<Vec<(String, RenderedListing, Option<String>)>, NetError> {
     let events =
         client.fetch(Filter::new().author(*peer).kind(Kind::from_u16(KIND_LISTING)), timeout).await?;
 
@@ -380,8 +382,14 @@ pub async fn browse_peer_listings(
     let mut out = Vec::new();
     'family: for (root, by_d) in families {
         let mut payloads: Vec<String> = Vec::new();
-        for (_d, group) in by_d {
+        let mut teaser_event_id: Option<String> = None;
+        for (d, group) in by_d {
             if let Some(ev) = select_newest_by_created_at(group) {
+                // The index/single event (`d == root`) IS the teaser the browser renders; capture its
+                // id so a manifest request can name the exact teaser event (M16 W4).
+                if d == root {
+                    teaser_event_id = Some(ev.id.to_hex());
+                }
                 match parse_listing_event(&ev, browse_key) {
                     Ok((_slug, json)) => payloads.push(json),
                     // Wrong browse-key (locked) or malformed event → skip the whole family.
@@ -390,7 +398,7 @@ pub async fn browse_peer_listings(
             }
         }
         if let Ok(rendered) = render_listing(&payloads) {
-            out.push((root, rendered));
+            out.push((root, rendered, teaser_event_id));
         }
     }
     Ok(out)

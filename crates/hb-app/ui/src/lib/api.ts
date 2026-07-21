@@ -128,6 +128,11 @@ export const browsePrivateCollections = () =>
 export const exportCollection = (slug: string, format: 'text' | 'markdown') =>
 	invoke<string>('export_collection', { slug, format });
 
+/** M16 W4: serialize a collection's full-listing manifest envelope to a user-picked `.hbmanifest`
+ *  file. `path` comes from the save dialog; Hoardbook writes the file and moves no bytes (INV-4). */
+export const exportManifest = (slug: string, path: string) =>
+	invoke<void>('export_manifest', { slug, path });
+
 // ── Settings ──────────────────────────────────────────────────────────────────
 
 export interface Settings {
@@ -230,6 +235,32 @@ export const unfollowContact = (npub: string) => invoke<void>('unfollow_contact'
 
 export const refreshContact = (npub: string) => invoke<CachedPeer>('refresh_contact', { npub });
 
+/** M16 W4 — the result of importing a `.hbmanifest`: the full-tree collection (fade lifted), and
+ *  `stale` when the manifest predates the teaser the browser is showing (imported anyway, with a warn). */
+export interface ImportedManifest {
+	slug: string;
+	collection: Collection;
+	created_at: number;
+	stale: boolean;
+}
+
+/** M16 W4 — import a full-listing manifest the user received (a picked file path OR pasted text/base64),
+ *  upgrading a truncated teaser to the whole tree. The backend pins the manifest author to `npub` and
+ *  verifies the signature before decrypting; `newestFingerprint` (the teaser's) drives the stale warn. */
+export const importManifest = (
+	npub: string,
+	expectedSlug: string,
+	source: { path?: string; pasted?: string },
+	newestFingerprint?: string,
+) =>
+	invoke<ImportedManifest>('import_manifest', {
+		npub,
+		expectedSlug,
+		path: source.path ?? null,
+		pasted: source.pasted ?? null,
+		newestFingerprint: newestFingerprint ?? null,
+	});
+
 export const setContactTags = (npub: string, tags: string[]) =>
 	invoke<void>('set_contact_tags', { npub, tags });
 
@@ -267,6 +298,23 @@ export const getShareSettings = (slug: string) =>
 
 export const sendMessage = (to: string, content: string) =>
 	invoke<ReceivedMessage>('send_message', { to, content });
+
+/** M16 W4 — DM the owner a structured request for a truncated collection's full manifest (the blessed
+ *  "ask by DM" seam). One relay write; the owner decides whether to export + ticket it (no auto-produce). */
+export const requestManifest = (
+	npub: string,
+	slug: string,
+	fingerprintSeen: string,
+	teaserEventId?: string,
+	mascaraPubkey?: string,
+) =>
+	invoke<void>('request_manifest', {
+		npub,
+		slug,
+		fingerprintSeen,
+		teaserEventId: teaserEventId ?? null,
+		mascaraPubkey: mascaraPubkey ?? null,
+	});
 
 export const getMessages = () => invoke<ReceivedMessage[]>('get_messages');
 

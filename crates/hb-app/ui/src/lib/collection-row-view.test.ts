@@ -37,6 +37,14 @@ describe('collection-row-view', () => {
 		expect(draftKeys).toEqual(expect.arrayContaining(['rescan', 'edit', 'export', 'remove']));
 	});
 
+	it('export_submenu_offers_the_manifest_file_alongside_the_checklists', () => {
+		// M16 W4: the `.hbmanifest` full-listing envelope is a third export format, next to the two
+		// human-readable checklists.
+		const exportItem = menuItems(col()).find((i) => i.key === 'export');
+		const subKeys = exportItem && 'submenu' in exportItem ? exportItem.submenu.map((s) => s.key) : [];
+		expect(subKeys).toEqual(['text', 'markdown', 'manifest']);
+	});
+
 	it('badges_include_sorted_and_private_when_set', () => {
 		expect(badges(col({ sorted: false, visibility: 'Public' }))).toEqual([]);
 		expect(badges(col({ sorted: true, visibility: 'Public' }))).toEqual([

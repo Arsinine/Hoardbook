@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { saveProfile, publishProfile, publishCollection, unpublishCollection, deleteCollection, exportCollection, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec } from '$lib/api.js';
+	import { saveProfile, publishProfile, publishCollection, unpublishCollection, deleteCollection, exportCollection, exportManifest, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec } from '$lib/api.js';
 	import { passphraseStrength } from '$lib/backup-export.js';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { profile, collections, identity, toast, appReady, homeDraft, identityLoadError } from '$lib/stores.js';
@@ -403,8 +403,20 @@
 		form.languages = form.languages.filter((_, idx) => idx !== i);
 	}
 
-	async function handleExport(slug: string, format: 'text' | 'markdown') {
+	async function handleExport(slug: string, format: 'text' | 'markdown' | 'manifest') {
 		try {
+			if (format === 'manifest') {
+				// M16 W4: the full-listing manifest envelope → a user-picked `.hbmanifest` file. The
+				// hoarder then tickets it in Mascara; Hoardbook writes the file and moves no bytes (INV-4).
+				const path = await saveDialog({
+					defaultPath: `${slug}.hbmanifest`,
+					filters: [{ name: 'Hoardbook manifest', extensions: ['hbmanifest'] }],
+				});
+				if (!path) return;
+				await exportManifest(slug, path);
+				toast('Manifest exported — send it with Mascara');
+				return;
+			}
 			const text = await exportCollection(slug, format);
 			await navigator.clipboard.writeText(text);
 			toast('Copied to clipboard');

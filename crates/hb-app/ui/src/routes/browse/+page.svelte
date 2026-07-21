@@ -1,11 +1,12 @@
 <script lang="ts">
-	import { contacts } from '$lib/stores.js';
+	import { contacts, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
-	import { refreshContact } from '$lib/api.js';
+	import { refreshContact, importManifest, requestManifest } from '$lib/api.js';
+	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 	import { page } from '$app/stores';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
-	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser } from '$lib/browse-view.js';
+	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote } from '$lib/browse-view.js';
 	import type { CachedPeer, Collection, DirectoryItem } from '$lib/types.js';
 
 	type BcItem =
@@ -70,6 +71,66 @@
 	function selectCollection(col: Collection) {
 		selectedCollection = col;
 		folderStack = [];
+	}
+
+	// M16 W4: import a full-listing manifest the user received out of band, upgrading a truncated
+	// paywall teaser to the whole tree. The backend verifies the manifest author against this peer's
+	// npub before decrypting; on success the fade lifts (`truncated` cleared ⇒ `paywallTeaser` → null).
+	let importingManifest = $state(false);
+	let pasteOpen = $state(false);
+	let pasteText = $state('');
+	let askingOwner = $state(false);
+
+	// M16 W4: the primary "get the rest" affordance — DM the owner asking for the full list. The owner
+	// decides whether to export + ticket a manifest (Hoardbook never auto-produces one; MASCARA_SPEC Q1).
+	async function handleAskOwner() {
+		if (!selectedPeer || !selectedCollection) return;
+		askingOwner = true;
+		try {
+			await requestManifest(selectedPeer.npub, selectedCollection.slug, selectedCollection.snapshot_fingerprint ?? '', selectedCollection.teaser_event_id);
+			toast('Asked the owner for the full list');
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			askingOwner = false;
+		}
+	}
+
+	async function handleImportManifest(source: { path?: string; pasted?: string }) {
+		if (!selectedPeer || !selectedCollection) return;
+		const targetNpub = selectedPeer.npub;
+		const targetSlug = selectedCollection.slug;
+		importingManifest = true;
+		try {
+			const result = await importManifest(targetNpub, targetSlug, source, selectedCollection.snapshot_fingerprint);
+			const full = result.collection;
+			// Swap the truncated collection for the full tree, in the view and the in-memory contact.
+			selectedPeer = {
+				...selectedPeer,
+				collections: selectedPeer.collections.map((c) => (c.slug === result.slug ? full : c)),
+			};
+			selectedCollection = full;
+			folderStack = [];
+			if (result.stale) {
+				toast('Imported an older version of this list — ask the owner for a fresh manifest.', 'error');
+			} else {
+				toast('Full manifest imported');
+			}
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			importingManifest = false;
+			pasteOpen = false;
+			pasteText = '';
+		}
+	}
+
+	async function pickManifestFile() {
+		const path = await openFileDialog({
+			multiple: false,
+			filters: [{ name: 'Hoardbook manifest', extensions: ['hbmanifest'] }],
+		});
+		if (typeof path === 'string') await handleImportManifest({ path });
 	}
 
 	function enterFolder(item: DirectoryItem) {
@@ -311,9 +372,23 @@
 								<div>
 									<div class="paywall-title">{paywall.hidden.toLocaleString()} more item{paywall.hidden !== 1 ? 's' : ''} hidden</div>
 									<div class="paywall-sub">Showing {paywall.shown.toLocaleString()} of {paywall.total.toLocaleString()} — this collection is too large to publish in full.</div>
+									<!-- M16 W4: the "get the rest" affordance — import a manifest file the owner handed over
+									     (out of band, via Mascara). No Download button (MAS-INV-5): Hoardbook moves no files. -->
+									<div class="paywall-actions">
+										<button class="btn-primary btn-sm" onclick={handleAskOwner} disabled={askingOwner}>Ask the owner for the full list</button>
+										<button class="btn-ghost btn-sm" onclick={pickManifestFile} disabled={importingManifest}>Import a manifest file you received</button>
+										<button class="btn-ghost btn-sm" onclick={() => (pasteOpen = !pasteOpen)}>or paste it</button>
+									</div>
+									{#if pasteOpen}
+										<textarea class="hb-input hb-mono paywall-paste" bind:value={pasteText} placeholder="Paste the .hbmanifest text or its base64 here"></textarea>
+										<button class="btn-primary btn-sm" disabled={importingManifest || !pasteText.trim()} onclick={() => handleImportManifest({ pasted: pasteText })}>Import from text</button>
+									{/if}
 								</div>
 							</div>
 						</div>
+					{/if}
+					{#if folderStack.length === 0 && importedManifestNote(selectedCollection)}
+						<div class="imported-note"><span>{importedManifestNote(selectedCollection)}</span></div>
 					{/if}
 					{#if collectionAvailability(selectedCollection)}
 						<div class="kofn-note">
@@ -566,6 +641,18 @@
 	.paywall-lock { font-size: 16px; flex-shrink: 0; }
 	.paywall-title { font-size: 12.5px; font-weight: 600; color: var(--fg); }
 	.paywall-sub { font-size: 11.5px; color: var(--fg-dim); margin-top: 1px; }
+
+	/* M16 W4: the "get the rest" affordances inside the paywall note. */
+	.paywall-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+	.paywall-paste { display: block; width: 100%; margin-top: 6px; min-height: 52px; resize: vertical; }
+	.imported-note {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 8px 16px;
+		font-size: 11.5px;
+		color: var(--online);
+	}
 
 	/* No-download footer note */
 	.no-download-note {
