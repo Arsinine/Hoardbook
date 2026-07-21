@@ -400,10 +400,16 @@ export const topicList = () => invoke<TopicView[]>('topic_list');
 export const topicCreate = (
 	name: string,
 	description: string,
-	tags: string[],
 	isPrivate: boolean,
-) => invoke<TopicView>('topic_create', { name, description, tags, private: isPrivate });
+) => invoke<TopicView>('topic_create', { name, description, private: isPrivate });
 
+/** Edit a Topic's description after creation (devtest v0.12.1 #8). The name is immutable; a public
+ *  Topic re-announces so discovery reflects the new blurb. */
+export const topicUpdateMeta = (topicId: string, description: string) =>
+	invoke<TopicView>('topic_update_meta', { topicId, description });
+
+/** Discover all public Topics under a root category/primitive (devtest v0.12.1 #7) — pass a single
+ *  root (e.g. `['video']`); the backend returns every public Topic beneath it, activity-ranked. */
 export const topicDiscover = (tags: string[]) =>
 	invoke<DiscoveredTopic[]>('topic_discover', { tags });
 

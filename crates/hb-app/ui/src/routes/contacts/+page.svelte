@@ -19,6 +19,7 @@
 	import { ONLINE_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
 	import { ALPHABET, groupByLetter, groupByGroups, onlineBucket, matchesQuery, presentSectionKeys } from '$lib/contacts-view.js';
 	import { onMount, onDestroy } from 'svelte';
+	import { goto } from '$app/navigation';
 
 	// ── "🟢 N hoarders online" chip (M9) — relay-derived, no telemetry. **Always shown** (the Settings
 	//    hide-toggle was removed); lives here on Contacts. Best-effort + cached on the backend; polled on
@@ -350,7 +351,10 @@
 	{@const sizeSummary = !badge.locked ? summarizeCollectionsSize(peer.collections) : null}
 	{@const isOpen = detailExpanded === peer.npub}
 	<div class="contact-block">
-		<div class="contact-card">
+		<!-- devtest v0.12.1 #4: double-click a contact to open the conversation in Chat. The chevron,
+		     Browse, and ⋯ controls keep their own single-click actions. -->
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div class="contact-card" ondblclick={() => goto('/chat?peer=' + peer.npub)} title="Double-click to message in Chat">
 			<!-- svelte-ignore a11y_click_events_have_key_events -->
 			<button class="chevron-btn" onclick={() => toggleDetail(peer.npub)} aria-expanded={isOpen} aria-label="Toggle details">
 				<span class="chevron" class:chevron-open={isOpen}>{@html icons.chevronDown}</span>

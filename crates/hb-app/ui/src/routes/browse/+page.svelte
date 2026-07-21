@@ -228,6 +228,9 @@
 					>
 						<div class="avatar-wrap">
 							<Avatar {letter} size={28} {hue} picture={peer.profile?.picture} />
+							<!-- devtest v0.12.1 #3: the browse-key lock/unlock icon overlays the avatar's top-right
+							     (the online dot owns the bottom-right); the inline text badge is gone. -->
+							<span class="access-lock" class:locked={badge.locked} title={badge.hint || badge.label}>{badge.icon}</span>
 							{#if peer.online}
 								<span class="online-dot"></span>
 							{/if}
@@ -237,7 +240,6 @@
 							<span class="contact-meta">
 								{peer.collections.length} collection{peer.collections.length !== 1 ? 's' : ''}
 							</span>
-							<span class="access-badge" class:locked={badge.locked} title={badge.hint || undefined}>{badge.icon} {badge.label}</span>
 						</div>
 					</button>
 				{/each}
@@ -510,6 +512,20 @@
 		border: 1.5px solid var(--bg);
 	}
 
+	/* devtest v0.12.1 #3: browse-key lock/unlock badge, overlapping the avatar's top-right corner
+	   (mirrors the bottom-right online dot). Shown for both states (🔓 browseable / 🔒 key needed). */
+	.access-lock {
+		position: absolute;
+		top: -4px;
+		right: -4px;
+		font-size: 9px;
+		line-height: 1;
+		padding: 1px;
+		border-radius: 999px;
+		background: var(--bg);
+		box-shadow: 0 0 0 1px var(--border);
+	}
+
 	.contact-info {
 		min-width: 0;
 		flex: 1;
@@ -530,18 +546,6 @@
 		font-size: 10.5px;
 		color: var(--fg-dim);
 		margin-top: 1px;
-	}
-
-	/* Browse-key access badge (devtest #1) — surfaces keyed-vs-bare on the row, not just post-selection. */
-	.access-badge {
-		display: block;
-		font-size: 10px;
-		color: var(--fg-dim);
-		margin-top: 1px;
-	}
-
-	.access-badge.locked {
-		color: oklch(0.72 0.13 70);
 	}
 
 	/* ── Right panel ─────────────────────────────────────────────── */
