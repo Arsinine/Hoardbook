@@ -12,6 +12,10 @@
 
 	interface Props {
 		collection: Collection;
+		/** Source-root reachability: `undefined` = still checking, `true` = available, `false` = source
+		 *  offline. Anything other than `true` renders the row greyed; it "fills in" once the source
+		 *  responds (an offline SMB/removable mount can't hang the app — the check is timeout-bounded). */
+		accessible?: boolean;
 		onrescan?: (collection: Collection) => void;
 		onedit?: (collection: Collection) => void;
 		onpublish?: (collection: Collection) => void;
@@ -20,7 +24,7 @@
 		onexport?: (detail: { slug: string; format: ExportFormat }) => void;
 	}
 
-	let { collection, onrescan, onedit, onpublish, onunpublish, onremove, onexport }: Props = $props();
+	let { collection, accessible, onrescan, onedit, onpublish, onunpublish, onremove, onexport }: Props = $props();
 
 	let rowExpanded = $state(false);
 	let menuOpen = $state(false);
@@ -72,7 +76,7 @@
 	}
 </script>
 
-<div class="row">
+<div class="row" class:row-dim={accessible !== true}>
 	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
 	<div class="row-head" onclick={() => (rowExpanded = !rowExpanded)}>
 		<span class="chevron" class:chevron-open={rowExpanded}>{@html icons.chevronDown}</span>
@@ -86,6 +90,9 @@
 			</div>
 		</div>
 		<div class="row-badges">
+			{#if accessible === false}
+				<span class="row-badge row-badge-offline" title="Source folder is unreachable right now (e.g. an offline network share). It fills back in when the source is available.">source offline</span>
+			{/if}
 			{#each collection.content_types ?? [] as ct (ct)}
 				<span class="ct-badge">{ct}</span>
 			{/each}
@@ -148,7 +155,11 @@
 		border: 1px solid var(--border);
 		border-radius: 10px;
 		overflow: hidden;
+		transition: opacity 0.2s;
 	}
+	/* Greyed while the source root is still being checked (undefined) or is offline (false); it "fills
+	   in" to full opacity once the source responds. */
+	.row-dim { opacity: 0.5; }
 
 	.row-head {
 		display: flex;
@@ -193,6 +204,11 @@
 		background: var(--bg-elev3); color: var(--fg-muted); border: 1px solid var(--border);
 	}
 	.row-badge-private { color: var(--accent); border-color: color-mix(in oklch, var(--accent) 30%, transparent); }
+	.row-badge-offline {
+		color: oklch(0.78 0.13 60);
+		background: oklch(0.28 0.06 60 / 0.5);
+		border-color: oklch(0.5 0.1 60 / 0.4);
+	}
 
 	.chip-status {
 		font-size: 10px;

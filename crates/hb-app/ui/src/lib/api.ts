@@ -95,6 +95,12 @@ export const listSubdirs = (path: string) =>
 
 export const getCollections = () => invoke<Collection[]>('get_collections');
 
+/** Whether a collection's source root is currently reachable (timeout-bounded — a dead/slow SMB or
+ *  removable mount can't hang). The Home list greys a collection until this returns true, and re-checks
+ *  on a slow tick so a mount coming back online fills it back in. */
+export const collectionSourceAccessible = (slug: string) =>
+	invoke<boolean>('collection_source_accessible', { slug });
+
 export const deleteCollection = (slug: string) => invoke<void>('delete_collection', { slug });
 
 /** The outcome of publishing a Public collection (devtest #7) — `truncated` when the listing was too
