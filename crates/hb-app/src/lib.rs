@@ -7,6 +7,7 @@ mod error;
 mod identity_state;
 mod manifest_cache;
 mod net;
+mod portable_update_logic;
 mod presence;
 mod single_instance;
 mod store;
@@ -379,6 +380,9 @@ pub fn run() {
             commands::update::download_update,
             commands::update::apply_staged_update,
             commands::update::take_update_notice,
+            commands::portable_update::updater_is_portable,
+            commands::portable_update::check_portable_update,
+            commands::portable_update::apply_portable_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while running Hoardbook")

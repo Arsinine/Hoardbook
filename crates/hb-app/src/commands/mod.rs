@@ -4,6 +4,7 @@ pub mod collection;
 pub mod groups;
 pub mod identity;
 pub mod online;
+pub mod portable_update;
 pub mod private;
 pub mod profile;
 pub mod settings;

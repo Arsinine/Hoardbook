@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, watchesGet, watchesDelete, hasPublishedProfile, publishProfile } from '$lib/api.js';
-	import type { Settings, UpdateInfo, BeaconReport } from '$lib/api.js';
+	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, watchesGet, watchesDelete, hasPublishedProfile, publishProfile } from '$lib/api.js';
+	import type { Settings, UpdateInfo, PortableUpdateInfo, BeaconReport } from '$lib/api.js';
 	import type { Watch } from '$lib/types.js';
 	import { keyView } from '$lib/key-view.js';
 	import { passphraseStrength, backupModeOptions, type BackupMode } from '$lib/backup-export.js';
@@ -128,19 +128,42 @@
 	let updateChecked = $state(false);
 	let updateError = $state('');
 	let stagedVersion: string | null = $state(null);
+	// Portable self-updater: the loose-exe build routes here instead of the NSIS staged flow. Detected
+	// once in onMount; a portable update is a single download→verify→swap→restart (no deferred install).
+	let isPortable = $state(false);
+	let portableInfo: PortableUpdateInfo | null = $state(null);
+	let portableApplying = $state(false);
 
 	async function doCheckUpdate() {
 		updateChecking = true;
 		updateError = '';
 		updateInfo = null;
+		portableInfo = null;
 		updateChecked = false;
 		try {
-			updateInfo = await checkUpdate();
+			if (isPortable) {
+				portableInfo = await checkPortableUpdate();
+			} else {
+				updateInfo = await checkUpdate();
+			}
 			updateChecked = true;
 		} catch (e) {
 			updateError = String(e).replace(/^Error: /, '');
 		} finally {
 			updateChecking = false;
+		}
+	}
+
+	// Portable apply: download + minisign-verify + self-replace the running exe, then relaunch (so on
+	// success control never returns here). A failure — bad signature, network, no artifact — toasts.
+	async function doApplyPortable() {
+		portableApplying = true;
+		try {
+			await applyPortableUpdate();
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			portableApplying = false;
 		}
 	}
 
@@ -224,6 +247,9 @@
 			refreshLiveRelayStatus();
 			liveStatusTimer = setInterval(refreshLiveRelayStatus, 12_000);
 		} catch { /* proceed with defaults if settings load fails */ }
+		// Route the updater UI: the portable (loose-exe) build self-replaces; an NSIS install uses the
+		// staged/deferred flow. Best-effort — a detection failure falls back to the NSIS path.
+		try { isPortable = await updaterIsPortable(); } catch { isPortable = false; }
 		// Visible-after "now running vX.Y" notice — fires once per version change.
 		try {
 			const notice = updateNoticeVM(await takeUpdateNotice());
@@ -677,7 +703,17 @@
 				<div class="toggle-sub">Currently running v{appVersion || '…'}</div>
 			</div>
 			<div class="update-actions">
-				{#if stagedVersion}
+				{#if isPortable}
+					<!-- Portable build: one-step download → verify → self-replace → restart. -->
+					{#if portableInfo}
+						<span class="update-available-text">v{portableInfo.version} available</span>
+						<button class="btn-primary btn-sm" onclick={doApplyPortable} disabled={portableApplying}>
+							{portableApplying ? 'Updating…' : 'Update & restart'}
+						</button>
+					{:else if updateChecked}
+						<span class="update-ok-text">Up to date</span>
+					{/if}
+				{:else if stagedVersion}
 					<span class="update-available-text">v{stagedVersion} downloaded</span>
 					<button class="btn-primary btn-sm" onclick={doApplyUpdate}>Restart &amp; apply</button>
 				{:else if updateInfo}
@@ -693,7 +729,9 @@
 				</button>
 			</div>
 		</div>
-		{#if stagedVersion}
+		{#if isPortable && portableInfo}
+			<div class="toggle-sub">Downloads, verifies (minisign), and replaces this portable app in place, then restarts.</div>
+		{:else if stagedVersion}
 			<div class="toggle-sub">Downloaded and verified. It installs automatically when you quit Hoardbook (or click "Restart &amp; apply").</div>
 		{/if}
 		{#if updateError}

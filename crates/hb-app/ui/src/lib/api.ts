@@ -362,6 +362,19 @@ export const applyStagedUpdate = () => invoke<void>('apply_staged_update');
 /** The once-per-version "now running vX.Y" notice (visible-after); returns null if no version change. */
 export const takeUpdateNotice = () => invoke<UpdateNotice | null>('take_update_notice');
 
+// ── Portable self-updater (Windows loose exe) ──────────────────────────────────
+// The portable build isn't an NSIS install, so the NSIS updater can't touch it. This path fetches the
+// signed portable binary, verifies it under the SAME minisign key, and swaps the running exe in place.
+
+export interface PortableUpdateInfo { version: string; notes?: string; }
+/** True if this build is the portable (loose-exe) build — the UI routes to the portable updater when so,
+ *  else to the NSIS updater above (the regression path). */
+export const updaterIsPortable = () => invoke<boolean>('updater_is_portable');
+/** Check for a newer portable release (reads the signed portable.json manifest). Null if up to date. */
+export const checkPortableUpdate = () => invoke<PortableUpdateInfo | null>('check_portable_update');
+/** Download + verify the newer portable binary, swap the running exe in place, and relaunch. */
+export const applyPortableUpdate = () => invoke<void>('apply_portable_update');
+
 // ── Groups ────────────────────────────────────────────────────────────────────
 
 export const groupsGet    = () => invoke<Group[]>('groups_get');
