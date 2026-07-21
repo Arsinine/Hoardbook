@@ -145,6 +145,17 @@ export function paywallTeaser(
 	return hidden > 0 ? { shown, hidden, total: col.total_items } : null;
 }
 
+/** M16 W4 — the "Full manifest imported · <date>" tag shown once the user has imported the full-listing
+ *  manifest of a truncated collection (its fade lifts, `paywallTeaser` goes `null`). `null` for a
+ *  normally-browsed collection. Pure. */
+export function importedManifestNote(
+	col: { manifest_imported_at?: number } | null | undefined,
+): string | null {
+	if (!col?.manifest_imported_at) return null;
+	const when = new Date(col.manifest_imported_at * 1000).toLocaleDateString();
+	return `Full manifest imported · ${when}`;
+}
+
 /** Byte-size units, largest first, for `parseEstSize`/`summarizeCollectionsSize` (devtest #7). */
 const SIZE_UNITS: Array<[string, number]> = [
 	['TB', 1024 ** 4],

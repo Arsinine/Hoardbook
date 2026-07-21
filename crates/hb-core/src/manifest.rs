@@ -3,11 +3,12 @@
 //!
 //! **The manifest is not a new format.** The envelope's *plaintext* is the canonical normalized full
 //! listing JSON — the exact bytes `hb_net::truncate_listing` received before it cropped a 40 KB
-//! teaser. This module adds only a thin, self-describing wrapper so the *same* ciphertext can serve
-//! **two carriers**: a chunked family on a higher-cap relay (M16 W2, `split_listing`) and an opaque
-//! file couriered peer-to-peer by Mascara (M16 W4). The crypto is the existing browse-key path
-//! (`encrypt_listing`/`decrypt_listing`, NIP-44 v2 under a versioned HKDF); the trust is the existing
-//! secp256k1 identity.
+//! teaser. This module adds only a thin, self-describing wrapper so the *same* `split_listing` parts
+//! can serve **two carriers**: a chunked family on a higher-cap relay (M16 W2) and an opaque file
+//! couriered peer-to-peer by Mascara (M16 W4) — the file holds the encrypted parts inline
+//! (`ciphertexts`), so it is bounded by the number of parts, not by one NIP-44 event's plaintext cap.
+//! The crypto is the existing browse-key path (`encrypt_listing`/`decrypt_listing`, NIP-44 v2 under a
+//! versioned HKDF); the trust is the existing secp256k1 identity.
 //!
 //! **Why a raw BIP-340 signature (`author_sig`) rather than a wrapping Nostr event.** A relay listing
 //! is trusted because it is an author-signed `KIND_LISTING` event. The envelope, however, must be
@@ -47,8 +48,10 @@ use crate::version::{check_crypto, CRYPTO_V};
 
 /// Manifest-envelope schema version. Frozen at launch (see `wire_freeze`): an unknown value is
 /// *recognised and refused*, never mis-decoded — the same forward-compat contract `SCHEMA_V` /
-/// `CRYPTO_V` uphold.
-pub const MANIFEST_V: u8 = 1;
+/// `CRYPTO_V` uphold. **v2** (M16 W4 residual) carries a *chunked* body (`ciphertexts`, split at the
+/// per-part budget) so a `.hbmanifest` can hold a listing larger than one NIP-44 event; **v1** was the
+/// pre-release single-`ciphertext` shape, superseded before any producer shipped (export landed at v2).
+pub const MANIFEST_V: u8 = 2;
 
 /// The domain tag prefixed onto the `author_sig` pre-image. The BIP-340 message is the SHA-256 of
 /// `SIG_DOMAIN ‖ manifest_v ‖ created_at(8 LE) ‖ len(slug)‖slug ‖ len(fp)‖fp ‖ len(sha)‖sha` — a
@@ -74,17 +77,28 @@ pub struct ManifestEnvelope {
     pub snapshot_fingerprint: String,
     /// Unix seconds the manifest was built.
     pub created_at: u64,
-    /// Lowercase-hex SHA-256 over the `ciphertext` bytes → also the Mascara ticket `file_ref.sha256`.
+    /// Lowercase-hex SHA-256 over the ordered `ciphertexts` (length-prefixed concat — see
+    /// [`sha256_parts`]); binds every part + their order into the signature.
     pub manifest_sha256: String,
     /// Lowercase-hex BIP-340 Schnorr signature over the canonical signing digest (see `SIG_DOMAIN`).
     pub author_sig: String,
-    /// `encrypt_listing(browse_key, manifest_plaintext)` — the existing browse-key NIP-44 path.
-    pub ciphertext: String,
+    /// The browse-key-encrypted listing body, one `encrypt_listing(browse_key, part)` per
+    /// `hb-net::split_listing` part (index + content parts; a single element when the listing fits one
+    /// NIP-44 event). Restitched by the reader (`render_listing`) after decrypting every part.
+    pub ciphertexts: Vec<String>,
 }
 
-/// Lowercase-hex SHA-256 of `bytes`.
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+/// Lowercase-hex SHA-256 over the ordered `ciphertexts`, length-prefixed so the digest binds the
+/// exact number of parts AND their order — reordering, dropping, or injecting a part changes the hash
+/// (and so fails the signature that covers it). The part count is prefixed for the same reason.
+fn sha256_parts(ciphertexts: &[String]) -> String {
+    let mut h = Sha256::new();
+    h.update((ciphertexts.len() as u64).to_le_bytes());
+    for ct in ciphertexts {
+        h.update((ct.len() as u64).to_le_bytes());
+        h.update(ct.as_bytes());
+    }
+    hex::encode(h.finalize())
 }
 
 /// The 32-byte BIP-340 message the author signs: a length-prefixed, domain-separated hash of the
@@ -112,21 +126,28 @@ fn signing_digest(
     h.finalize().into()
 }
 
-/// Build a manifest envelope: seal `manifest_plaintext` under `browse_key`, hash the ciphertext, and
-/// sign the canonical digest with `identity`. `manifest_plaintext` is the caller's canonical full
-/// listing JSON (this module treats it opaquely); `snapshot_fingerprint` is its already-computed
-/// tree fingerprint. Signing is deterministic (BIP-340 no-aux-rand), so an envelope re-serializes to
-/// stable bytes.
+/// Build a manifest envelope: seal each of `plaintext_parts` under `browse_key`, hash the ordered
+/// ciphertexts, and sign the canonical digest with `identity`. `plaintext_parts` are the caller's
+/// `hb-net::split_listing` output for the canonical full listing JSON (index + content parts, or a
+/// single element when it fits one event); this module treats them opaquely. `snapshot_fingerprint`
+/// is the tree's already-computed fingerprint. Signing is deterministic (BIP-340 no-aux-rand), so an
+/// envelope re-serializes to stable bytes. Errs on an empty `plaintext_parts` (nothing to seal).
 pub fn build_manifest_envelope(
     identity: &Identity,
     slug: &str,
     browse_key: &BrowseKey,
     snapshot_fingerprint: &str,
     created_at: u64,
-    manifest_plaintext: &str,
+    plaintext_parts: &[String],
 ) -> Result<ManifestEnvelope, HbError> {
-    let ciphertext = encrypt_listing(browse_key, manifest_plaintext)?;
-    let manifest_sha256 = sha256_hex(ciphertext.as_bytes());
+    if plaintext_parts.is_empty() {
+        return Err(HbError::InvalidEncryptedMessage);
+    }
+    let ciphertexts = plaintext_parts
+        .iter()
+        .map(|part| encrypt_listing(browse_key, part))
+        .collect::<Result<Vec<String>, HbError>>()?;
+    let manifest_sha256 = sha256_parts(&ciphertexts);
     let digest = signing_digest(MANIFEST_V, created_at, slug, snapshot_fingerprint, &manifest_sha256);
     let msg = Message::from_digest(digest);
     // nostr's `SecretKey` derefs to `secp256k1::SecretKey`; sign on the same global context nostr
@@ -143,20 +164,23 @@ pub fn build_manifest_envelope(
         created_at,
         manifest_sha256,
         author_sig: hex::encode(sig.serialize()),
-        ciphertext,
+        ciphertexts,
     })
 }
 
 impl ManifestEnvelope {
-    /// Self-consistency, no author/key needed: the versions are recognised and the declared
-    /// `manifest_sha256` matches the ciphertext (a tampered ciphertext flips the hash and is
-    /// refused here, before any signature or decrypt).
+    /// Self-consistency, no author/key needed: the versions are recognised, the body is non-empty, and
+    /// the declared `manifest_sha256` matches the ordered ciphertexts (a tampered, reordered, dropped,
+    /// or injected part flips the hash and is refused here, before any signature or decrypt).
     pub fn verify_integrity(&self) -> Result<(), HbError> {
         if self.manifest_v == 0 || self.manifest_v > MANIFEST_V {
             return Err(HbError::UnsupportedVersion(self.manifest_v));
         }
         check_crypto(self.crypto_v)?;
-        if sha256_hex(self.ciphertext.as_bytes()) != self.manifest_sha256 {
+        if self.ciphertexts.is_empty() {
+            return Err(HbError::InvalidEncryptedMessage);
+        }
+        if sha256_parts(&self.ciphertexts) != self.manifest_sha256 {
             return Err(HbError::InvalidEncryptedMessage);
         }
         Ok(())
@@ -187,15 +211,24 @@ impl ManifestEnvelope {
         SECP256K1.verify_schnorr(&sig, &msg, &xonly).map_err(|_| HbError::InvalidSignature)
     }
 
-    /// Decrypt the manifest plaintext (the canonical full listing JSON). This needs only the
-    /// browse-key; callers must [`verify_author`](Self::verify_author) first — [`open`](Self::open)
-    /// does both in the ratified order.
-    pub fn decrypt(&self, browse_key: &BrowseKey) -> Result<String, HbError> {
-        decrypt_listing(browse_key, self.crypto_v, &self.ciphertext)
+    /// Decrypt the manifest body into its listing **parts** (the `hb-net::split_listing` output:
+    /// index + content parts, or a single element). The caller restitches them with
+    /// `hb-net::render_listing`. Needs only the browse-key; callers must
+    /// [`verify_author`](Self::verify_author) first — [`open`](Self::open) does both in the ratified
+    /// order.
+    pub fn decrypt(&self, browse_key: &BrowseKey) -> Result<Vec<String>, HbError> {
+        self.ciphertexts
+            .iter()
+            .map(|ct| decrypt_listing(browse_key, self.crypto_v, ct))
+            .collect()
     }
 
-    /// Verify against the browsed author, then decrypt — the one-call import path.
-    pub fn open(&self, browse_key: &BrowseKey, expected_author: &PublicKey) -> Result<String, HbError> {
+    /// Verify against the browsed author, then decrypt into listing parts — the one-call import path.
+    pub fn open(
+        &self,
+        browse_key: &BrowseKey,
+        expected_author: &PublicKey,
+    ) -> Result<Vec<String>, HbError> {
         self.verify_author(expected_author)?;
         self.decrypt(browse_key)
     }
@@ -231,15 +264,53 @@ mod tests {
     fn built() -> (Identity, BrowseKey, ManifestEnvelope) {
         let id = Identity::generate();
         let bk: BrowseKey = rand::random();
-        let env =
-            build_manifest_envelope(&id, "criterion", &bk, FP, 1_700_000_000, PLAINTEXT).unwrap();
+        // A listing that fits one event → a single-part manifest (the common small-collection case).
+        let env = build_manifest_envelope(&id, "criterion", &bk, FP, 1_700_000_000, &[PLAINTEXT.into()])
+            .unwrap();
         (id, bk, env)
     }
 
     #[test]
-    fn build_then_open_roundtrips_to_plaintext() {
+    fn build_then_open_roundtrips_to_the_parts() {
         let (id, bk, env) = built();
-        assert_eq!(env.open(&bk, &id.public_key()).unwrap(), PLAINTEXT);
+        assert_eq!(env.ciphertexts.len(), 1);
+        assert_eq!(env.open(&bk, &id.public_key()).unwrap(), vec![PLAINTEXT.to_string()]);
+    }
+
+    #[test]
+    fn build_then_open_roundtrips_a_multi_part_body() {
+        // A chunked manifest: several split parts (an index + content parts, opaque here) round-trip in
+        // order through build → open, and the sha binds the whole ordered set.
+        let id = Identity::generate();
+        let bk: BrowseKey = rand::random();
+        let parts: Vec<String> = (0..4).map(|i| format!(r#"{{"part":{i},"entries":[]}}"#)).collect();
+        let env = build_manifest_envelope(&id, "vault", &bk, FP, 1, &parts).unwrap();
+        assert_eq!(env.ciphertexts.len(), 4);
+        assert_eq!(env.open(&bk, &id.public_key()).unwrap(), parts);
+        assert_eq!(env.manifest_sha256, sha256_parts(&env.ciphertexts));
+    }
+
+    #[test]
+    fn reordering_parts_fails_integrity() {
+        // The sha binds part ORDER, so a swapped pair is refused before decrypt (and so fails the sig).
+        let id = Identity::generate();
+        let bk: BrowseKey = rand::random();
+        let parts: Vec<String> = (0..3).map(|i| format!(r#"{{"part":{i},"entries":[]}}"#)).collect();
+        let mut env = build_manifest_envelope(&id, "vault", &bk, FP, 1, &parts).unwrap();
+        env.ciphertexts.swap(0, 2);
+        assert!(matches!(env.verify_integrity(), Err(HbError::InvalidEncryptedMessage)));
+        assert!(env.verify_author(&id.public_key()).is_err());
+    }
+
+    #[test]
+    fn empty_body_is_refused() {
+        let id = Identity::generate();
+        let bk: BrowseKey = rand::random();
+        assert!(build_manifest_envelope(&id, "vault", &bk, FP, 1, &[]).is_err());
+        let (_id, _bk, mut env) = built();
+        env.ciphertexts.clear();
+        env.manifest_sha256 = sha256_parts(&env.ciphertexts);
+        assert!(matches!(env.verify_integrity(), Err(HbError::InvalidEncryptedMessage)));
     }
 
     #[test]
@@ -251,17 +322,17 @@ mod tests {
         assert_eq!(env.author_npub, id.npub());
         assert_eq!(env.snapshot_fingerprint, FP);
         assert_eq!(env.created_at, 1_700_000_000);
-        // manifest_sha256 is the hash of the ciphertext, and author_sig is 64 bytes of hex.
-        assert_eq!(env.manifest_sha256, sha256_hex(env.ciphertext.as_bytes()));
+        // manifest_sha256 is the hash over the ordered ciphertexts, and author_sig is 64 bytes of hex.
+        assert_eq!(env.manifest_sha256, sha256_parts(&env.ciphertexts));
         assert_eq!(env.author_sig.len(), 128);
         env.verify_author(&id.public_key()).unwrap();
     }
 
     #[test]
     fn tampered_ciphertext_flips_sha_and_is_refused() {
-        // Mutate the ciphertext without updating the hash: caught by the integrity check.
+        // Mutate a ciphertext without updating the hash: caught by the integrity check.
         let (id, _bk, mut env) = built();
-        env.ciphertext.push_str("AA");
+        env.ciphertexts[0].push_str("AA");
         assert!(matches!(env.verify_integrity(), Err(HbError::InvalidEncryptedMessage)));
         assert!(env.verify_author(&id.public_key()).is_err());
     }
@@ -272,8 +343,8 @@ mod tests {
         // signature (which covers the old hash) must still reject it. Proves the sig binds the body.
         let (id, bk, mut env) = built();
         let other_ct = encrypt_listing(&bk, r#"{"slug":"criterion","entries":[]}"#).unwrap();
-        env.ciphertext = other_ct;
-        env.manifest_sha256 = sha256_hex(env.ciphertext.as_bytes());
+        env.ciphertexts = vec![other_ct];
+        env.manifest_sha256 = sha256_parts(&env.ciphertexts);
         env.verify_integrity().unwrap(); // self-consistent now …
         assert!(matches!(env.verify_author(&id.public_key()), Err(HbError::InvalidSignature))); // … but unsigned
     }
@@ -358,7 +429,7 @@ mod tests {
         let json = env.to_json().unwrap();
         let back = ManifestEnvelope::from_json(&json).unwrap();
         assert_eq!(back, env);
-        assert_eq!(back.open(&bk, &id.public_key()).unwrap(), PLAINTEXT);
+        assert_eq!(back.open(&bk, &id.public_key()).unwrap(), vec![PLAINTEXT.to_string()]);
     }
 
     #[test]

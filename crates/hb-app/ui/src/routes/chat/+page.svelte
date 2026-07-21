@@ -30,7 +30,7 @@
 	import { DM_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
 	import { renderFingerprint } from '$lib/identity-display.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
-	import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER } from '$lib/request-inbox.js';
+	import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER, manifestRequestHint } from '$lib/request-inbox.js';
 	import { filterConversations, filterTopics, composeRecipientKind, isComposeToSelf } from '$lib/chat-filter.js';
 	import { peerPreview, peersWithHistory, relativeTime } from '$lib/chat-preview.js';
 	import { sortChannelPostsAscending, resolveTopicParam, interleaveChannel } from '$lib/topics-view.js';
@@ -663,7 +663,7 @@
 						{#each req.messages as msg}
 							<div class="bubble-wrap">
 								<div class="bubble bubble-recv">
-									<p class="bubble-text">{msg.content}</p>
+									<p class="bubble-text">{manifestRequestHint(msg.content) ?? msg.content}</p>
 									<span class="bubble-time">{formatTime(msg.sent_at)}</span>
 								</div>
 							</div>
@@ -743,7 +743,7 @@
 							{/if}
 							<div class="bubble-wrap" class:bubble-me={isMe}>
 								<div class="bubble" class:bubble-sent={isMe} class:bubble-recv={!isMe}>
-									<p class="bubble-text">{msg.content}</p>
+									<p class="bubble-text">{manifestRequestHint(msg.content) ?? msg.content}</p>
 									<span class="bubble-time">{formatTime(msg.sent_at)}</span>
 								</div>
 							</div>

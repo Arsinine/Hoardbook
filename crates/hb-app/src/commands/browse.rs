@@ -22,10 +22,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{CmdResult, cmd_err},
+    manifest_cache,
     net::{self, SharedRelay},
     store::{CachedPeer, DataStore},
     identity_state::SharedIdentity,
 };
+
+/// Current unix time in seconds (manifest-cache access stamps). A clock before 1970 reads as 0.
+fn now_secs() -> u64 {
+    Utc::now().timestamp().max(0) as u64
+}
 
 /// Discovery result cap — mirrors the teaser/discovery cap; a flood of teasers can't make the result
 /// set unbounded.
@@ -130,6 +136,22 @@ pub struct PeerCollection {
     pub truncated: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_items: Option<usize>,
+    /// M16 W4 — the full-tree snapshot fingerprint carried in the listing meta (both the teaser and
+    /// the full manifest carry the same value). Surfaced as a browse-time signal so the import path
+    /// can gate a manifest for staleness against the teaser the browser is currently showing. `None`
+    /// for a listing without the marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_fingerprint: Option<String>,
+    /// M16 W4 — unix-secs `created_at` of a manifest file the user imported to upgrade this truncated
+    /// teaser to the full tree; the UI tags "full manifest imported · <created_at>". `None` on a
+    /// normally-browsed collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_imported_at: Option<u64>,
+    /// M16 W4 — the id of the teaser (index) event this collection was browsed from, so an "ask the
+    /// owner for the full list" request can name the exact teaser event. Set by `resolve_peer`; `None`
+    /// for a cached / pre-M16 collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teaser_event_id: Option<String>,
 }
 
 /// Map a `RenderedListing` (meta + entries, from `hb_net::browse_peer_listings`) back into a
@@ -142,6 +164,10 @@ pub(crate) fn rendered_to_peer_collection(r: &RenderedListing) -> Option<PeerCol
     // (which has no such fields) — they become PeerCollection browse-time signals, like the K-of-N counts.
     let truncated = map.remove("truncated").and_then(|v| v.as_bool());
     let total_items = map.remove("total_items").and_then(|v| v.as_u64()).map(|n| n as usize);
+    // M16 W4: the full-tree fingerprint rides in the meta (W3) — pull it out as a browse-time signal
+    // (like the K-of-N counts) so the import path can gate staleness against the teaser being shown.
+    let snapshot_fingerprint =
+        map.remove("snapshot_fingerprint").and_then(|v| v.as_str().map(String::from));
     map.insert("listing".into(), serde_json::Value::Array(r.entries.clone()));
     let collection: Collection = serde_json::from_value(serde_json::Value::Object(map)).ok()?;
     Some(PeerCollection {
@@ -150,6 +176,10 @@ pub(crate) fn rendered_to_peer_collection(r: &RenderedListing) -> Option<PeerCol
         parts_present: Some(r.parts_present),
         truncated,
         total_items,
+        snapshot_fingerprint,
+        manifest_imported_at: None,
+        // Set by `resolve_peer` (which holds the fetched event ids); a bare render carries none.
+        teaser_event_id: None,
     })
 }
 
@@ -262,12 +292,20 @@ async fn resolve_peer(
             let families = browse_peer_listings(&client, &peer, &bk, net::RELAY_TIMEOUT)
                 .await
                 .unwrap_or_default();
+            let cache_dir = store.manifest_cache_dir();
+            let now = now_secs();
             let mut out = Vec::with_capacity(families.len());
-            for (root, teaser) in &families {
-                // M16 W3: a truncated teaser may have its full listing on a big relay — try to upgrade
-                // it (a → b); on success browse the full tree, otherwise the teaser as-is (unchanged).
-                let full = resolve_full_if_truncated(&peer, root, &bk, teaser, &own_big).await;
-                if let Some(pc) = rendered_to_peer_collection(full.as_ref().unwrap_or(teaser)) {
+            for (root, teaser, teaser_event_id) in &families {
+                // M16 resolution order for a truncated teaser: (W4) the local manifest cache first —
+                // an offline, once-imported full tree — then (W3) the big relay (a → b); on either
+                // success browse the full tree, otherwise the teaser as-is (unchanged).
+                let full = match resolve_from_cache(&cache_dir, &peer, &npub, root, &bk, teaser, now) {
+                    Some(r) => Some(r),
+                    None => resolve_full_if_truncated(&peer, root, &bk, teaser, &own_big).await,
+                };
+                if let Some(mut pc) = rendered_to_peer_collection(full.as_ref().unwrap_or(teaser)) {
+                    // Carry the teaser event id so an "ask the owner" request can name the exact event.
+                    pc.teaser_event_id = teaser_event_id.clone();
                     out.push(pc);
                 }
             }
@@ -450,6 +488,186 @@ pub async fn refresh_contact(
     updated.petname = existing.petname.or(updated.petname);
     store.save_contact(&hash, &updated).map_err(cmd_err)?;
     Ok(updated)
+}
+
+/// The result of importing a `.hbmanifest` file (M16 W4): the slug it upgrades, the full-tree
+/// `PeerCollection` (its `truncated`/`total_items` cleared — the fade lifts), and whether the
+/// manifest is older than the teaser the browser is showing (`stale` ⇒ "ask again", still imported).
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportedManifest {
+    pub slug: String,
+    pub collection: PeerCollection,
+    pub created_at: u64,
+    pub stale: bool,
+}
+
+/// Upper bound on a manifest file / paste we will read before parsing. A single-ciphertext envelope
+/// is NIP-44-bounded (~64 KB plaintext → ~90 KB base64 + JSON framing); 1 MB is a generous ceiling
+/// that still refuses a multi-GB file a user was tricked into importing (a self-inflicted OOM guard).
+const MANIFEST_FILE_MAX_BYTES: u64 = 1_000_000;
+
+/// Parse a `.hbmanifest` from either its raw JSON text (the file the export writes) or a base64
+/// encoding of that JSON (the paste fallback — safe against copy/paste mangling of the JSON). Tries
+/// JSON first, then base64 → utf-8 → JSON. Nothing here trusts the contents; the caller verifies.
+fn parse_manifest_source(raw: &str) -> Result<hb_core::manifest::ManifestEnvelope, String> {
+    let trimmed = raw.trim();
+    if let Ok(env) = hb_core::manifest::ManifestEnvelope::from_json(trimmed) {
+        return Ok(env);
+    }
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(trimmed.as_bytes())
+        .map_err(|_| "Not a valid manifest — expected .hbmanifest JSON or its base64.".to_string())?;
+    let text = String::from_utf8(decoded)
+        .map_err(|_| "The pasted manifest did not decode to text.".to_string())?;
+    hb_core::manifest::ManifestEnvelope::from_json(text.trim()).map_err(cmd_err)
+}
+
+/// Import a full-listing **manifest** the user received out of band (M16 W4), upgrading a truncated
+/// paywall teaser to the whole tree. The manifest author is pinned to the **browsed peer** and the
+/// signature verified *before* any decrypt or merge (headline failure mode #3: a manifest for peer A
+/// must not import while browsing peer B, and a tampered body is refused before it is trusted). The
+/// browse-key that opens the body is the one captured from that peer's share code at add-time.
+/// Read-only w.r.t. the relay and the store — the result is returned for the session; a durable
+/// local cache is M16 W4 slice 4.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn import_manifest(
+    npub: String,
+    expected_slug: Option<String>,
+    path: Option<String>,
+    pasted: Option<String>,
+    newest_fingerprint: Option<String>,
+    store: State<'_, DataStore>,
+) -> CmdResult<ImportedManifest> {
+    // Recover the browsed peer's pubkey (author to pin) + browse-key (to decrypt) from the saved
+    // contact — you can only see a truncated teaser worth upgrading if you hold their share code.
+    let contact = store
+        .load_contact(&CachedPeer::pubkey_hash(&npub))
+        .map_err(cmd_err)?
+        .ok_or("Add this peer as a contact with their share code before importing a manifest.")?;
+    let share_code = contact_share_code(&contact)?;
+    let peer = share_code.pubkey();
+    let browse_key = share_code
+        .browse_key()
+        .ok_or("This contact has no browse key — re-add them with a full share code.")?;
+
+    // The manifest bytes come from the picked file or the pasted text (never both required). Both are
+    // size-capped before parsing so a huge file/paste can't OOM the app (MANIFEST_FILE_MAX_BYTES).
+    let raw = match (path, pasted) {
+        (Some(p), _) => {
+            let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            if len > MANIFEST_FILE_MAX_BYTES {
+                return Err("That file is too large to be a manifest.".into());
+            }
+            std::fs::read_to_string(&p).map_err(|e| format!("Could not read manifest file: {e}"))?
+        }
+        (None, Some(t)) => {
+            if t.len() as u64 > MANIFEST_FILE_MAX_BYTES {
+                return Err("That pasted text is too large to be a manifest.".into());
+            }
+            t
+        }
+        (None, None) => return Err("No manifest file or text provided.".into()),
+    };
+    let envelope = parse_manifest_source(&raw)?;
+    let result =
+        open_manifest(&envelope, &peer, expected_slug.as_deref(), &browse_key, newest_fingerprint.as_deref())?;
+
+    // Cache the verified envelope for offline re-browse, keyed (npub, slug, fingerprint) with LRU +
+    // size-cap. Best-effort — a cache-write hiccup never fails the import the user just performed.
+    if let Ok(json) = envelope.to_json() {
+        let _ = manifest_cache::put(
+            &store.manifest_cache_dir(),
+            &npub,
+            &envelope.slug,
+            &envelope.snapshot_fingerprint,
+            &json,
+            now_secs(),
+            manifest_cache::DEFAULT_MANIFEST_CACHE_BYTES,
+        );
+    }
+    Ok(result)
+}
+
+/// M16 W4 — try to upgrade a truncated teaser from the LOCAL manifest cache, before any relay (the
+/// browse resolution order is: cache → big relay → keep the teaser). A once-imported manifest for
+/// `(peer, slug, fingerprint)` is re-verified + re-decrypted + rendered offline. `None` when the
+/// teaser isn't truncated, carries no fingerprint to gate on, the cache misses, or the cached envelope
+/// no longer verifies (fails closed like a fresh import). Sync — no relay, no store write.
+fn resolve_from_cache(
+    dir: &std::path::Path,
+    peer: &nostr::PublicKey,
+    npub: &str,
+    slug: &str,
+    browse_key: &[u8; 32],
+    teaser: &RenderedListing,
+    now: u64,
+) -> Option<RenderedListing> {
+    if teaser.meta.get("truncated").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    let fingerprint = listing_snapshot_fingerprint(teaser)?;
+    let json = manifest_cache::get(dir, npub, slug, fingerprint, now)?;
+    let envelope = hb_core::manifest::ManifestEnvelope::from_json(&json).ok()?;
+    envelope.verify_author(peer).ok()?;
+    // Bind the AUTHOR-SIGNED fingerprint to the teaser's (the cache filename/key is unsigned local
+    // metadata): only serve a cached manifest whose signed snapshot matches the teaser being shown, so
+    // a stale-but-authentic manifest can never shadow a newer teaser.
+    if envelope.snapshot_fingerprint != fingerprint {
+        return None;
+    }
+    let parts = envelope.decrypt(browse_key).ok()?;
+    let rendered = hb_net::render_listing(&parts).ok()?;
+    if !rendered.complete() {
+        return None; // never upgrade a teaser to a partial cached tree
+    }
+    Some(rendered)
+}
+
+/// The pure verify→decrypt→render→convert core the [`import_manifest`] command wraps (extracted so the
+/// security-relevant ordering is unit-testable without Tauri `State`). Verifies the envelope
+/// (version → sha → author-pin → signature) BEFORE decrypting, author pinned to `peer`; renders the
+/// full plaintext the same way the browse path renders a fetched listing; converts back to a
+/// `PeerCollection` (a full tree carries no truncated/total_items meta, so the fade lifts); and flags
+/// staleness (surfaced, never blocking — an older manifest still imports).
+fn open_manifest(
+    envelope: &hb_core::manifest::ManifestEnvelope,
+    peer: &nostr::PublicKey,
+    expected_slug: Option<&str>,
+    browse_key: &[u8; 32],
+    newest_fingerprint: Option<&str>,
+) -> Result<ImportedManifest, String> {
+    envelope.verify_author(peer).map_err(cmd_err)?;
+    // Bind the import to the collection whose paywall was clicked (when a target is given): the slug is
+    // authenticated by the signature, so a same-author manifest for a DIFFERENT collection cannot
+    // silently swap the viewed tree.
+    if let Some(want) = expected_slug {
+        if envelope.slug != want {
+            return Err(format!(
+                "This manifest is for “{}”, not the collection you're viewing (“{}”).",
+                envelope.slug, want
+            ));
+        }
+    }
+    let parts = envelope.decrypt(browse_key).map_err(cmd_err)?;
+    let rendered = hb_net::render_listing(&parts).map_err(cmd_err)?;
+    // A crafted (but validly-signed) manifest could decrypt to a bare split index with no content
+    // parts, which renders an EMPTY tree; require completeness so a partial family can't masquerade as
+    // the full list (mirrors the big-relay gate `fetch_full_listing_if_current`).
+    if !rendered.complete() {
+        return Err("The manifest is incomplete — it does not contain the full listing.".into());
+    }
+    let mut collection = rendered_to_peer_collection(&rendered)
+        .ok_or("The manifest did not decode as a collection listing.")?;
+    collection.manifest_imported_at = Some(envelope.created_at);
+    let stale = newest_fingerprint.map(|fp| !envelope.matches_fingerprint(fp)).unwrap_or(false);
+    Ok(ImportedManifest {
+        slug: envelope.slug.clone(),
+        collection,
+        created_at: envelope.created_at,
+        stale,
+    })
 }
 
 /// Set user-defined local tags on a contact. Tags are stored locally and never shared.
@@ -652,6 +870,183 @@ mod tests {
         assert_eq!(peer_col.truncated, Some(true));
         assert_eq!(peer_col.total_items, Some(9000));
         assert_eq!(peer_col.collection.slug, "bigvault");
+    }
+
+    // ── M16 W4: manifest import (verify → decrypt → merge) ─────────────────────────
+    // `open_manifest` is the pure core the `import_manifest` command wraps around a contact lookup;
+    // the wire (relay) is untouched — an imported manifest is a local file consume.
+
+    const IMPORT_FP: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+    fn full_listing_plaintext(slug: &str, fp: &str) -> String {
+        // The canonical full listing JSON the export produces: metadata + the fingerprint + `entries`
+        // (what `render_listing` consumes — a plain, unsplit listing).
+        let mut meta = valid_meta(slug);
+        meta.insert("snapshot_fingerprint".into(), serde_json::json!(fp));
+        meta.insert(
+            "entries".into(),
+            serde_json::json!([{"name": "Ran.mkv", "item_type": "File", "tags": [], "children": []}]),
+        );
+        serde_json::to_string(&serde_json::Value::Object(meta)).unwrap()
+    }
+
+    fn a_manifest(slug: &str, fp: &str) -> (Identity, [u8; 32], hb_core::manifest::ManifestEnvelope) {
+        let id = Identity::generate();
+        let bk: [u8; 32] = [9u8; 32];
+        let plaintext = full_listing_plaintext(slug, fp);
+        let env =
+            hb_core::manifest::build_manifest_envelope(&id, slug, &bk, fp, 1_700_000_000, &[plaintext])
+                .unwrap();
+        (id, bk, env)
+    }
+
+    #[test]
+    fn open_manifest_upgrades_the_teaser_to_the_full_tree() {
+        let (id, bk, env) = a_manifest("criterion", IMPORT_FP);
+        let imported = open_manifest(&env, &id.public_key(), Some("criterion"), &bk, Some(IMPORT_FP)).unwrap();
+        assert_eq!(imported.slug, "criterion");
+        assert_eq!(imported.collection.collection.listing.len(), 1, "the full entries become the tree");
+        // A full tree carries no truncation markers, so the paywall fade lifts.
+        assert_eq!(imported.collection.truncated, None);
+        assert_eq!(imported.collection.total_items, None);
+        assert_eq!(imported.collection.manifest_imported_at, Some(1_700_000_000));
+        assert!(!imported.stale, "matching fingerprint is not stale");
+    }
+
+    #[test]
+    fn open_manifest_rejects_a_manifest_authored_by_another_peer() {
+        // Headline failure mode #3: a manifest for peer A must not import while browsing peer B — the
+        // author-pin rejects it before any decrypt or merge.
+        let (_id, bk, env) = a_manifest("criterion", IMPORT_FP);
+        let other = Identity::generate();
+        assert!(open_manifest(&env, &other.public_key(), None, &bk, None).is_err());
+    }
+
+    #[test]
+    fn open_manifest_rejects_a_tampered_body() {
+        let (id, bk, env) = a_manifest("criterion", IMPORT_FP);
+        let mut tampered = env.clone();
+        tampered.ciphertexts[0].push_str("AA"); // flips the sha, refused before decrypt
+        assert!(open_manifest(&tampered, &id.public_key(), None, &bk, None).is_err());
+    }
+
+    #[test]
+    fn open_manifest_needs_the_right_browse_key() {
+        // The signature verifies (author is right) but the wrong browse-key can't open the body.
+        let (id, _bk, env) = a_manifest("criterion", IMPORT_FP);
+        let wrong: [u8; 32] = [1u8; 32];
+        assert!(open_manifest(&env, &id.public_key(), None, &wrong, None).is_err());
+    }
+
+    #[test]
+    fn open_manifest_flags_a_stale_manifest_but_still_imports() {
+        // Staleness is surfaced, never blocking (M16 UX rule): an older manifest still merges its tree.
+        let (id, bk, env) = a_manifest("criterion", IMPORT_FP);
+        let imported = open_manifest(&env, &id.public_key(), None, &bk, Some("00ff00ff")).unwrap();
+        assert!(imported.stale, "a fingerprint mismatch is flagged");
+        assert_eq!(imported.collection.collection.listing.len(), 1, "…yet the full tree still imports");
+    }
+
+    #[test]
+    fn open_manifest_rejects_a_manifest_for_a_different_collection() {
+        // A validly-signed manifest for another collection (same author) must not swap the viewed
+        // collection when an expected slug is given — the slug is authenticated, so this is caught.
+        let (id, bk, env) = a_manifest("criterion", IMPORT_FP);
+        let err = open_manifest(&env, &id.public_key(), Some("something-else"), &bk, None).unwrap_err();
+        assert!(err.contains("something-else"), "got: {err}");
+    }
+
+    #[test]
+    fn open_manifest_rejects_an_incomplete_manifest() {
+        // A validly-signed envelope whose plaintext is a bare split INDEX (no content parts) renders an
+        // empty tree; the completeness gate refuses it so a partial family can't pose as the full list.
+        let id = Identity::generate();
+        let bk: [u8; 32] = [9u8; 32];
+        // A well-formed v1 split INDEX (parts=3) with no content parts alongside → render_listing
+        // returns Ok but with K=0 of 3 present, so `complete()` is false and the gate refuses it.
+        let index_only = r#"{"slug":"criterion","split":true,"parts":3}"#.to_string();
+        let env = hb_core::manifest::build_manifest_envelope(&id, "criterion", &bk, IMPORT_FP, 1, &[index_only])
+            .unwrap();
+        let err = open_manifest(&env, &id.public_key(), None, &bk, None).unwrap_err();
+        assert!(err.to_lowercase().contains("incomplete"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_from_cache_upgrades_a_truncated_teaser_and_gates_on_the_signed_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (id, bk, env) = a_manifest("criterion", IMPORT_FP);
+        let npub = id.npub();
+        manifest_cache::put(
+            dir.path(), &npub, "criterion", IMPORT_FP, &env.to_json().unwrap(), 1,
+            manifest_cache::DEFAULT_MANIFEST_CACHE_BYTES,
+        )
+        .unwrap();
+
+        // A truncated teaser carrying the SAME fingerprint → the cache upgrades it to the full tree.
+        let mut meta = valid_meta("criterion");
+        meta.insert("truncated".into(), serde_json::json!(true));
+        meta.insert("snapshot_fingerprint".into(), serde_json::json!(IMPORT_FP));
+        let teaser = RenderedListing {
+            meta: meta.clone(),
+            entries: vec![],
+            parts_total: 1,
+            parts_present: 1,
+            missing: vec![],
+        };
+        let full = resolve_from_cache(dir.path(), &id.public_key(), &npub, "criterion", &bk, &teaser, 2);
+        assert!(full.is_some(), "matching fingerprint upgrades from cache");
+
+        // A teaser advertising a DIFFERENT fingerprint must NOT be served the stale cached manifest.
+        let mut stale_meta = valid_meta("criterion");
+        stale_meta.insert("truncated".into(), serde_json::json!(true));
+        stale_meta.insert("snapshot_fingerprint".into(), serde_json::json!("00ff00ff"));
+        let newer_teaser = RenderedListing { meta: stale_meta, ..teaser.clone() };
+        assert!(
+            resolve_from_cache(dir.path(), &id.public_key(), &npub, "criterion", &bk, &newer_teaser, 3).is_none(),
+            "a newer teaser (different fingerprint) never hits the old cache entry",
+        );
+    }
+
+    #[test]
+    fn parse_manifest_source_accepts_json_and_base64_and_rejects_garbage() {
+        let (_id, _bk, env) = a_manifest("criterion", IMPORT_FP);
+        let json = env.to_json().unwrap();
+        assert_eq!(parse_manifest_source(&json).unwrap(), env, "the file the export writes");
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+        assert_eq!(parse_manifest_source(&b64).unwrap(), env, "the base64 paste fallback");
+        assert!(parse_manifest_source("not a manifest at all").is_err());
+    }
+
+    #[test]
+    fn open_manifest_restitches_a_large_multi_part_family() {
+        // The W4 residual: a listing too large for one NIP-44 event splits into a family (index +
+        // content parts), the envelope carries the encrypted parts inline, and open_manifest decrypts +
+        // restitches every part into the complete tree — the file carrier now serves large collections.
+        let id = Identity::generate();
+        let bk: [u8; 32] = [9u8; 32];
+        let entries: Vec<serde_json::Value> = (0..2000)
+            .map(|i| serde_json::json!({"name": format!("file-{i:05}.mkv"), "item_type": "File", "tags": [], "children": []}))
+            .collect();
+        let listing_json = serde_json::json!({
+            "slug": "vault", "path_alias": "vault", "item_count": entries.len(),
+            "content_types": ["video"], "last_updated": Utc::now().to_rfc3339(),
+            "snapshot_fingerprint": IMPORT_FP, "entries": entries,
+        })
+        .to_string();
+        let parts: Vec<String> = hb_net::split_listing("vault", &listing_json, 40_000)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.json)
+            .collect();
+        assert!(parts.len() > 1, "the listing must actually split for this test to mean anything");
+        let env = hb_core::manifest::build_manifest_envelope(&id, "vault", &bk, IMPORT_FP, 1, &parts)
+            .unwrap();
+        assert_eq!(env.ciphertexts.len(), parts.len(), "every split part is sealed into the envelope");
+
+        let imported = open_manifest(&env, &id.public_key(), Some("vault"), &bk, Some(IMPORT_FP)).unwrap();
+        assert_eq!(imported.collection.collection.listing.len(), 2000, "the full tree restitches");
+        assert_eq!(imported.collection.truncated, None, "a full tree lifts the paywall fade");
     }
 
     // ── M16 W3: browse-side big-relay resolution order (a → b) ────────────────────

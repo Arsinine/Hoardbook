@@ -4,7 +4,7 @@
 	// so no `overflow: hidden` ancestor can clip it (the original devtest #2 bug — it lived in a
 	// scrolling `.coll-list`/`.collections-pane`).
 	import type { Collection } from '../types.js';
-	import { deriveRowChip, menuItems, badges, type RowMenuItem } from '../collection-row-view.js';
+	import { deriveRowChip, menuItems, badges, type RowMenuItem, type ExportFormat } from '../collection-row-view.js';
 	import CollectionPanel from './CollectionPanel.svelte';
 	import ConfirmButton from './ConfirmButton.svelte';
 	import OverflowMenu from './OverflowMenu.svelte';
@@ -17,7 +17,7 @@
 		onpublish?: (collection: Collection) => void;
 		onunpublish?: (collection: Collection) => void;
 		onremove?: (collection: Collection) => void;
-		onexport?: (detail: { slug: string; format: 'text' | 'markdown' }) => void;
+		onexport?: (detail: { slug: string; format: ExportFormat }) => void;
 	}
 
 	let { collection, onrescan, onedit, onpublish, onunpublish, onremove, onexport }: Props = $props();
@@ -61,7 +61,7 @@
 		closeMenu();
 	}
 
-	function handleExportClick(format: 'text' | 'markdown') {
+	function handleExportClick(format: ExportFormat) {
 		onexport?.({ slug: collection.slug, format });
 		closeMenu();
 	}

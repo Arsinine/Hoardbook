@@ -11,9 +11,13 @@ export function deriveRowChip(col: Pick<Collection, 'published'>): RowChip {
 	return col.published ? 'Published' : 'Draft';
 }
 
+/** Export sub-actions: the two human-readable checklists, plus the M16 W4 `.hbmanifest` envelope
+ *  (the full-listing file a hoarder hands over via Mascara for a large truncated collection). */
+export type ExportFormat = 'text' | 'markdown' | 'manifest';
+
 export type RowMenuItem =
 	| { key: 'rescan' | 'edit' | 'publish' | 'unpublish' | 'remove'; label: string }
-	| { key: 'export'; label: string; submenu: { key: 'text' | 'markdown'; label: string }[] };
+	| { key: 'export'; label: string; submenu: { key: ExportFormat; label: string }[] };
 
 /** The overflow-menu items for a row, in display order. Publish/Unpublish is mutually exclusive by
  *  published state. */
@@ -27,6 +31,7 @@ export function menuItems(col: Pick<Collection, 'published'>): RowMenuItem[] {
 			submenu: [
 				{ key: 'text', label: 'Plain text' },
 				{ key: 'markdown', label: 'Markdown checklist' },
+				{ key: 'manifest', label: 'Manifest file (.hbmanifest)' },
 			],
 		},
 		col.published ? { key: 'unpublish', label: 'Unpublish' } : { key: 'publish', label: 'Publish' },

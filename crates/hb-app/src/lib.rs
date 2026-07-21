@@ -5,6 +5,7 @@ mod commands;
 mod dm_quarantine;
 mod error;
 mod identity_state;
+mod manifest_cache;
 mod net;
 mod presence;
 mod single_instance;
@@ -314,6 +315,8 @@ pub fn run() {
             commands::collection::update_collection_meta,
             commands::collection::update_collection_visibility,
             commands::collection::export_collection,
+            commands::collection::export_manifest,
+            commands::browse::import_manifest,
             commands::private::browse_private_collections,
             commands::browse::paste_key,
             commands::browse::follow,
@@ -331,6 +334,7 @@ pub fn run() {
             commands::settings::acknowledge_privacy_notice,
             commands::online::online_count,
             commands::chat::send_message,
+            commands::chat::request_manifest,
             commands::chat::get_messages,
             commands::chat::dm_requests,
             commands::chat::dm_request_accept,

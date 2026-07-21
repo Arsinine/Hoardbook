@@ -16,11 +16,49 @@ export function sortRequests(requests: DmRequestView[]): DmRequestView[] {
 	return [...requests].sort((a, b) => b.last_message_at - a.last_message_at);
 }
 
-/** The bucket's LAST message, truncated for the row preview (an ellipsis marks truncation). */
+/** The bucket's LAST message, truncated for the row preview (an ellipsis marks truncation). A
+ *  manifest-request DM shows its human hint instead of the raw JSON payload. */
 export function requestPreview(r: DmRequestView, max = 80): string {
 	const last = r.messages[r.messages.length - 1];
-	const text = last?.content ?? '';
+	const text = manifestRequestHint(last?.content ?? '') ?? last?.content ?? '';
 	return text.length > max ? text.slice(0, max - 1) + '…' : text;
+}
+
+/** M16 W4 — the structured "get the rest" request a browser DMs to ask for a large collection's full
+ *  manifest. Hoardbook neither auto-produces a manifest nor a ticket from this — a human decides. */
+export interface ManifestRequest {
+	slug: string;
+	fingerprintSeen: string;
+	teaserEventId?: string;
+	/** Opaque to Hoardbook (neither minted nor validated) — the requester's Mascara pubkey, if any. */
+	mascaraPubkey?: string;
+}
+
+/** Detect the `{hb:"manifest_request",...}` JSON a browser sends as a DM. Returns the parsed request,
+ *  or null for an ordinary chat message (any non-JSON / wrong-tag content). Pure. */
+export function parseManifestRequest(content: string): ManifestRequest | null {
+	let v: unknown;
+	try {
+		v = JSON.parse(content);
+	} catch {
+		return null;
+	}
+	if (typeof v !== 'object' || v === null) return null;
+	const o = v as Record<string, unknown>;
+	if (o.hb !== 'manifest_request' || typeof o.slug !== 'string') return null;
+	return {
+		slug: o.slug,
+		fingerprintSeen: typeof o.fingerprint_seen === 'string' ? o.fingerprint_seen : '',
+		teaserEventId: typeof o.teaser_event_id === 'string' ? o.teaser_event_id : undefined,
+		mascaraPubkey: typeof o.mascara_pubkey === 'string' ? o.mascara_pubkey : undefined,
+	};
+}
+
+/** The light, human hint a manifest-request DM renders as ("Asking for the full list of …"), or null
+ *  for an ordinary message. The hoarder then exports the manifest and tickets it in Mascara by hand. */
+export function manifestRequestHint(content: string): string | null {
+	const req = parseManifestRequest(content);
+	return req ? `Asking for the full list of “${req.slug}”` : null;
 }
 
 /** No reply is possible until the sender becomes a contact (accepting the request adds them). */

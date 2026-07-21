@@ -276,6 +276,11 @@ impl DataStore {
         self.base.join("settings.json")
     }
 
+    /// The M16 W4 manifest LRU cache directory (`<base>/manifests/`). Covered by `wipe` for free.
+    pub fn manifest_cache_dir(&self) -> PathBuf {
+        crate::manifest_cache::cache_dir(&self.base)
+    }
+
     // -- Identity ------------------------------------------------------------
 
     pub fn save_identity(&self, id: &StoredIdentity) -> Result<()> {
@@ -1247,6 +1252,17 @@ mod tests {
             .save_topics(&[StoredTopic { meta, key, joined_at: 0, membership_json: None }])
             .unwrap();
         store.save_topic_nonces(&HashSet::from(["n1".to_string()])).unwrap();
+        // M16 W4: the imported-manifest LRU cache lives under base/manifests/ — wipe must clear it too.
+        crate::manifest_cache::put(
+            &store.manifest_cache_dir(),
+            "npub1x",
+            "films",
+            "fp",
+            "ENV",
+            1,
+            crate::manifest_cache::DEFAULT_MANIFEST_CACHE_BYTES,
+        )
+        .unwrap();
         // A file the store does not know about yet — a future workstream's addition (chat
         // requests, topic announce timestamps, …) must be wiped too, never survive as an orphan.
         std::fs::write(store.base_dir().join("future_addition.json"), b"{}").unwrap();

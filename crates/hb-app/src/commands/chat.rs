@@ -425,6 +425,78 @@ pub async fn send_message(
     })
 }
 
+/// The constant tag identifying a DM as a manifest request (`content.hb`).
+const MANIFEST_REQUEST_TAG: &str = "manifest_request";
+
+/// M16 W4 — the structured "get the rest" request a browser DMs to the hoarder. Rides an ordinary
+/// NIP-17 DM as JSON `content` (one relay write); the hoarder's inbox renders it as a normal message
+/// with a light hint. Hoardbook never auto-produces a manifest or a ticket — a human decides (the
+/// blessed "ask by DM" seam; there is no Download button, MAS-INV-5).
+#[derive(Debug, Clone, Serialize)]
+struct ManifestRequest {
+    /// Always `MANIFEST_REQUEST_TAG` — how the hoarder-side inbox recognises the request.
+    hb: &'static str,
+    slug: String,
+    /// The snapshot fingerprint of the teaser the requester saw (lets the hoarder confirm the version).
+    fingerprint_seen: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    teaser_event_id: Option<String>,
+    /// The requester's Mascara pubkey, if any — opaque to Hoardbook (neither minted nor validated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mascara_pubkey: Option<String>,
+}
+
+/// Build the manifest-request DM body (canonical JSON). Pure — unit-tested without a relay.
+fn build_manifest_request(
+    slug: &str,
+    fingerprint_seen: &str,
+    teaser_event_id: Option<String>,
+    mascara_pubkey: Option<String>,
+) -> Result<String, String> {
+    let req = ManifestRequest {
+        hb: MANIFEST_REQUEST_TAG,
+        slug: slug.to_string(),
+        fingerprint_seen: fingerprint_seen.to_string(),
+        teaser_event_id,
+        mascara_pubkey,
+    };
+    serde_json::to_string(&req).map_err(cmd_err)
+}
+
+/// M16 W4 — DM the hoarder a structured request for the full manifest of a truncated collection (the
+/// blessed "ask by DM" seam, MASCARA_SPEC Q1). One relay write; the hoarder decides whether to export
+/// + ticket it — Hoardbook never auto-produces anything.
+// The 5 request fields + 3 injected Tauri `State` handles are all load-bearing (mirrors `send_message`).
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn request_manifest(
+    npub: String,
+    slug: String,
+    fingerprint_seen: String,
+    teaser_event_id: Option<String>,
+    mascara_pubkey: Option<String>,
+    identity: State<'_, SharedIdentity>,
+    store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
+) -> CmdResult<()> {
+    let recipient = parse_recipient(&npub)?;
+    let id_clone = {
+        let guard = identity.read().await;
+        let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
+        id.identity.clone()
+    };
+    if is_self_send(&recipient, &id_clone.public_key()) {
+        return Err("You can't request a manifest from yourself.".into());
+    }
+    let content = build_manifest_request(&slug, &fingerprint_seen, teaser_event_id, mascara_pubkey)?;
+    let own = net::relay_urls(&store);
+    let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
+    send_dm_inner(&client, &id_clone, &recipient, &content, &own, net::RELAY_TIMEOUT)
+        .await
+        .map_err(cmd_err)?;
+    Ok(())
+}
+
 /// Fetch + decrypt the NIP-17 inbox: contacts' messages only (Q7 — a stranger's DM never reaches the
 /// main inbox at all). As a side effect, persists any newly-seen stranger messages into the quarantined
 /// Request store (`dm_requests`); `allow_dms=false` preserves the stricter drop-everything behaviour.
@@ -545,6 +617,28 @@ mod tests {
         let stranger = Identity::generate();
         assert!(is_self_send(&me.public_key(), &me.public_key()));
         assert!(!is_self_send(&stranger.public_key(), &me.public_key()));
+    }
+
+    #[test]
+    fn manifest_request_json_is_tagged_and_omits_absent_options() {
+        // M16 W4: the DM body is `{hb:"manifest_request", slug, fingerprint_seen}` — the frontend
+        // detects the tag and renders a light hint. Absent optional fields are omitted (not null).
+        let json = build_manifest_request("criterion", "abc123", None, None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["hb"], MANIFEST_REQUEST_TAG);
+        assert_eq!(v["slug"], "criterion");
+        assert_eq!(v["fingerprint_seen"], "abc123");
+        assert!(v.get("teaser_event_id").is_none());
+        assert!(v.get("mascara_pubkey").is_none());
+    }
+
+    #[test]
+    fn manifest_request_json_carries_present_options() {
+        let json =
+            build_manifest_request("s", "fp", Some("evt1".into()), Some("mpub".into())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["teaser_event_id"], "evt1");
+        assert_eq!(v["mascara_pubkey"], "mpub");
     }
 
     #[tokio::test]

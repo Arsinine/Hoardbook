@@ -2,7 +2,7 @@ use std::path::Path;
 use globset::{Glob, GlobSetBuilder};
 use hb_core::types::{Collection, DirectoryItem, ItemType, Visibility};
 use hb_core::{BrowseKey, Identity};
-use hb_net::{publish_listing_capped, publish_listing_to};
+use hb_net::{publish_listing_capped, publish_listing_to, split_listing};
 use nostr::{Filter, Kind};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -644,6 +644,79 @@ pub async fn publish_collection(
         (id.identity.clone(), id.browse_key.clone())
     };
     publish_collection_inner(&slug, &store, &id_clone, browse_key.bytes(), &relay).await
+}
+
+/// Build the signed, browse-key-encrypted **manifest envelope** for a Public collection draft — the
+/// `.hbmanifest` artifact (M16 W4). Its plaintext is the SAME canonical full listing JSON the publish
+/// path feeds to `truncate_listing`, so an imported manifest's `snapshot_fingerprint` matches the
+/// teaser's exactly (the browse-side staleness gate). Private collections are refused: they never
+/// truncate (trusted recipients already receive the whole sealed listing) and are sealed per recipient,
+/// not under the browse-key this envelope uses. Pure w.r.t. the relay — L1-testable with a temp store.
+fn build_slug_manifest(
+    slug: &str,
+    store: &DataStore,
+    identity: &Identity,
+    browse_key: &BrowseKey,
+) -> Result<hb_core::manifest::ManifestEnvelope, String> {
+    let safe_slug = is_valid_slug(slug).then_some(slug).ok_or("Invalid collection slug")?;
+    let col = store
+        .load_collection_draft(safe_slug)
+        .map_err(cmd_err)?
+        .ok_or_else(|| format!("No draft found for collection '{safe_slug}'"))?;
+    if col.visibility == Visibility::Private {
+        return Err("Private collections are sealed per recipient, not exported as a shared manifest — \
+                    trusted contacts already receive the whole listing."
+            .into());
+    }
+    if col.content_types.is_empty() {
+        return Err(
+            "At least one content type is required before exporting a collection manifest.".into()
+        );
+    }
+    // Same bytes and fingerprint the publish path derives (parity with the teaser), no re-scan.
+    let plaintext = collection_to_listing_json(&col)?;
+    // Chunk the listing exactly like the big-relay carrier — split at the per-part NIP-44 budget, so a
+    // `.hbmanifest` can hold a collection of ANY size (the envelope stores the encrypted parts inline,
+    // bounded by part count, not by one event's plaintext cap). A listing that fits one event yields a
+    // single part (the small-collection case, unchanged).
+    let parts: Vec<String> = split_listing(safe_slug, &plaintext, LISTING_MAX_BYTES)
+        .map_err(cmd_err)?
+        .into_iter()
+        .map(|part| part.json)
+        .collect();
+    let fingerprint = hb_core::snapshot_fingerprint(&col.listing).0;
+    hb_core::manifest::build_manifest_envelope(
+        identity,
+        safe_slug,
+        browse_key,
+        &fingerprint,
+        now_secs(),
+        &parts,
+    )
+    .map_err(cmd_err)
+}
+
+/// Export a collection's full-listing **manifest** to a user-picked `<slug>.hbmanifest` file (M16 W4).
+/// The hoarder then tickets that file in Mascara and hands the sealed ticket over out of band — Hoardbook
+/// writes the file the user chose and moves no bytes itself (INV-4). The JS side picks `path` via the
+/// save dialog, exactly like `backup_data`.
+#[tauri::command]
+pub async fn export_manifest(
+    slug: String,
+    path: String,
+    store: State<'_, DataStore>,
+    identity: State<'_, SharedIdentity>,
+) -> CmdResult<()> {
+    let (id_clone, browse_key) = {
+        let guard = identity.read().await;
+        let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
+        (id.identity.clone(), id.browse_key.clone())
+    };
+    let envelope = build_slug_manifest(&slug, &store, &id_clone, browse_key.bytes())?;
+    let json = envelope.to_json().map_err(cmd_err)?;
+    std::fs::write(&path, json.as_bytes())
+        .map_err(|e| format!("Could not write manifest file: {e}"))?;
+    Ok(())
 }
 
 /// True iff a listing event's `d`-tag belongs to `slug`'s family — the index itself, or one of its
@@ -1733,6 +1806,120 @@ mod tests {
             Some(hb_core::snapshot_fingerprint(&col.listing).0.as_str()),
             "the listing JSON must carry the full-tree fingerprint the teaser + big-relay family share",
         );
+    }
+
+    // ── M16 W4: manifest export (the `.hbmanifest` envelope) ─────────────────────
+    // `build_slug_manifest` is the pure core the `export_manifest` command wraps around a file write;
+    // the export→import round-trip over the wire is proven by the import-path tests in browse.rs.
+
+    fn a_video_collection(slug: &str, visibility: Visibility) -> Collection {
+        Collection {
+            slug: slug.into(),
+            path_alias: slug.into(),
+            description: None,
+            item_count: 1,
+            est_size: None,
+            content_types: vec!["video".into()],
+            tags: vec![],
+            languages: vec![],
+            visibility,
+            sorted: false,
+            last_updated: chrono::Utc::now(),
+            listing: vec![DirectoryItem {
+                name: "Ran (1985)".into(),
+                item_type: ItemType::File,
+                size: Some("12GB".into()),
+                format: Some("MKV".into()),
+                year: Some(1985),
+                tags: vec![],
+                note: None,
+                children: vec![],
+            }],
+        }
+    }
+
+    #[test]
+    fn build_slug_manifest_roundtrips_and_matches_the_teaser_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let identity = Identity::generate();
+        let browse_key: BrowseKey = [7u8; 32];
+        let col = a_video_collection("criterion", Visibility::Public);
+        store.save_collection_draft(&col).unwrap();
+
+        let env = build_slug_manifest("criterion", &store, &identity, &browse_key).unwrap();
+        // Verifies under the browsed author + opens under the browse-key into the listing parts, which
+        // restitch into the complete original tree (a small collection is a single part).
+        let parts = env.open(&browse_key, &identity.public_key()).unwrap();
+        let rendered = hb_net::render_listing(&parts).unwrap();
+        assert!(rendered.complete());
+        assert_eq!(rendered.meta.get("slug").and_then(|v| v.as_str()), Some("criterion"));
+        assert_eq!(rendered.entries.len(), 1, "the one file round-trips through split → open → render");
+        // The envelope's fingerprint equals the teaser's (the browse-side staleness gate) and the slug
+        // is bound into the signature (an envelope for another collection can't masquerade as this one).
+        let fp = hb_core::snapshot_fingerprint(&col.listing).0;
+        assert_eq!(env.snapshot_fingerprint, fp);
+        assert!(env.matches_fingerprint(&fp));
+        assert_eq!(env.slug, "criterion");
+    }
+
+    #[test]
+    fn build_slug_manifest_refuses_a_private_collection() {
+        // A Private collection is sealed per recipient and never truncates — there is no browse-key
+        // manifest to export; the attempt is a reasoned error, not a wrong-crypto artifact.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let identity = Identity::generate();
+        let col = a_video_collection("secret", Visibility::Private);
+        store.save_collection_draft(&col).unwrap();
+        let err = build_slug_manifest("secret", &store, &identity, &[7u8; 32]).unwrap_err();
+        assert!(err.contains("Private"), "got: {err}");
+    }
+
+    #[test]
+    fn build_slug_manifest_refuses_an_unknown_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let identity = Identity::generate();
+        assert!(build_slug_manifest("nope", &store, &identity, &[7u8; 32]).is_err());
+    }
+
+    #[test]
+    fn build_slug_manifest_chunks_a_large_listing_into_multiple_parts() {
+        // A listing far over one NIP-44 event now SUCCEEDS (the W4 residual): it is split into parts
+        // stored inline in the envelope, so the file carrier is bounded by part count, not one event.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let identity = Identity::generate();
+        let listing: Vec<DirectoryItem> = (0..3000)
+            .map(|i| DirectoryItem {
+                name: format!("file-{i:06}-with-a-reasonably-long-name.mkv"),
+                item_type: ItemType::File,
+                size: Some("12GB".into()),
+                format: Some("MKV".into()),
+                year: Some(1985),
+                tags: vec![],
+                note: None,
+                children: vec![],
+            })
+            .collect();
+        let col = Collection {
+            slug: "huge".into(),
+            path_alias: "huge".into(),
+            description: None,
+            item_count: listing.len() as u64,
+            est_size: None,
+            content_types: vec!["video".into()],
+            tags: vec![],
+            languages: vec![],
+            visibility: Visibility::Public,
+            sorted: false,
+            last_updated: chrono::Utc::now(),
+            listing,
+        };
+        store.save_collection_draft(&col).unwrap();
+        let env = build_slug_manifest("huge", &store, &identity, &[7u8; 32]).unwrap();
+        assert!(env.ciphertexts.len() > 1, "a large listing chunks into multiple parts");
     }
 
     // ── M16 W3: big-relay classifier (Layer 3 routing) ───────────────────────────

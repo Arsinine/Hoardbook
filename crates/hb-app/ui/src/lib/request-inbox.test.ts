@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER } from './request-inbox.js';
+import {
+	requestBadge,
+	sortRequests,
+	requestPreview,
+	canReply,
+	REQUEST_EXPLAINER,
+	parseManifestRequest,
+	manifestRequestHint,
+} from './request-inbox.js';
 import type { DmRequestView, ReceivedMessage } from './types.js';
 
 function makeRequest(npub: string, lastMessageAt: number, contents: string[] = ['hi']): DmRequestView {
@@ -75,5 +83,46 @@ describe('request-inbox view-model', () => {
 	it('REQUEST_EXPLAINER names both the non-contact status and the accept action', () => {
 		expect(REQUEST_EXPLAINER).toContain('not in your contacts');
 		expect(REQUEST_EXPLAINER).toContain('Accepting adds the contact');
+	});
+});
+
+describe('parseManifestRequest / manifestRequestHint (M16 W4 — the "ask by DM" hint)', () => {
+	const req = JSON.stringify({ hb: 'manifest_request', slug: 'criterion', fingerprint_seen: 'fp1' });
+
+	it('parses a well-formed manifest request', () => {
+		expect(parseManifestRequest(req)).toEqual({ slug: 'criterion', fingerprintSeen: 'fp1' });
+	});
+
+	it('carries the optional teaser/mascara fields when present', () => {
+		const full = JSON.stringify({
+			hb: 'manifest_request',
+			slug: 's',
+			fingerprint_seen: 'fp',
+			teaser_event_id: 'evt',
+			mascara_pubkey: 'mp',
+		});
+		expect(parseManifestRequest(full)).toEqual({
+			slug: 's',
+			fingerprintSeen: 'fp',
+			teaserEventId: 'evt',
+			mascaraPubkey: 'mp',
+		});
+	});
+
+	it('returns null for an ordinary chat message or wrong-tag JSON', () => {
+		expect(parseManifestRequest('hey, got the movies?')).toBeNull();
+		expect(parseManifestRequest(JSON.stringify({ hb: 'something_else', slug: 'x' }))).toBeNull();
+		expect(parseManifestRequest(JSON.stringify({ hb: 'manifest_request' }))).toBeNull(); // no slug
+		expect(parseManifestRequest('{ not valid json')).toBeNull();
+	});
+
+	it('renders a light human hint, or null for a normal message', () => {
+		expect(manifestRequestHint(req)).toBe('Asking for the full list of “criterion”');
+		expect(manifestRequestHint('just a normal message')).toBeNull();
+	});
+
+	it('the request-row preview shows the hint, not the raw JSON payload', () => {
+		const r = makeRequest('npub1a', 1, [req]);
+		expect(requestPreview(r)).toBe('Asking for the full list of “criterion”');
 	});
 });

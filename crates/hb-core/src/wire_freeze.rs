@@ -34,16 +34,21 @@ fn event_kinds_are_frozen() {
 /// The version discriminants carried in signed content / headers. Bumping any of these is a
 /// deliberate flag-day (readers must *recognise and refuse* the new value first), never a drift.
 #[test]
-fn version_discriminants_are_frozen_at_v1() {
+fn version_discriminants_are_frozen() {
     assert_eq!(SCHEMA_V, 1, "SCHEMA_V — {FREEZE}");
     assert_eq!(CRYPTO_V, 1, "CRYPTO_V — {FREEZE}");
     assert_eq!(BACKUP_FORMAT_VER, 1, "BACKUP_FORMAT_VER — {FREEZE}");
-    assert_eq!(MANIFEST_V, 1, "MANIFEST_V (M16 manifest envelope) — {FREEZE}");
+    // MANIFEST_V bumped 1→2 (M16 W4 residual): v1 was the pre-release single-`ciphertext` shape,
+    // superseded before any producer shipped (export landed at v2 — the chunked `ciphertexts` body).
+    // v2 is the frozen launch value; a v1 envelope no longer even deserializes (its field is gone).
+    assert_eq!(MANIFEST_V, 2, "MANIFEST_V (M16 manifest envelope, chunked v2) — {FREEZE}");
 }
 
 /// The manifest envelope's `author_sig` pre-image domain tag (M16 W1). It is hashed into every
 /// signature over an exported `.hbmanifest`; a change silently invalidates every manifest already
-/// signed, so it is pinned here as a wire constant.
+/// signed, so it is pinned here as a wire constant. It is a fixed domain-separation tag, deliberately
+/// **independent of `MANIFEST_V`** — the envelope version is bound separately inside the signed digest
+/// (`signing_digest` hashes `manifest_v`), so the tag stays stable across format revisions.
 #[test]
 fn manifest_sig_domain_is_frozen() {
     assert_eq!(SIG_DOMAIN, b"hoardbook/manifest-envelope/v1".as_slice(), "manifest::SIG_DOMAIN — {FREEZE}");
