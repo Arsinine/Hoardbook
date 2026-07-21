@@ -200,12 +200,19 @@
 		if (rootTopics[root]) return; // already fetched
 		loadingRoot = root;
 		try {
-			rootTopics = { ...rootTopics, [root]: await topicDiscover([root]) };
+			const found = await topicDiscover([root]);
+			rootTopics = { ...rootTopics, [root]: found }; // cache regardless — keyed by root
 		} catch (e) {
-			toast(String(e), 'error');
-			expandedRoot = null;
+			// Only surface/collapse if this root is STILL the open one: a stale request for a category
+			// the user already switched away from must not error over or collapse the current one (codex).
+			if (expandedRoot === root) {
+				toast(String(e), 'error');
+				expandedRoot = null;
+			}
 		} finally {
-			loadingRoot = null;
+			// Only clear the spinner if it belongs to THIS request — a stale resolve must not clear a
+			// newer root's loading state (codex).
+			if (loadingRoot === root) loadingRoot = null;
 		}
 	}
 
