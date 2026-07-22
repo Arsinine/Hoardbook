@@ -208,3 +208,78 @@ export function peerFromQuery<P extends { npub: string }>(
 	if (!npub) return null;
 	return contacts.find((c) => c.npub === npub) ?? null;
 }
+
+// ── devtest v0.12.4 #4 — the collection file view controls (view mode · type filter · sort · search).
+//    Pure + vitest-covered so the Svelte component holds only toggle state + rendering. All operate on
+//    the flat list of the CURRENT folder's items (metadata only — INV-4: no open/download affordance).
+
+/** The minimal shape these helpers need from a `DirectoryItem` (structural, so the component passes
+ *  real `DirectoryItem[]` and gets the same concrete type back through the generic). */
+export interface ArrangeableItem {
+	name: string;
+	item_type: 'File' | 'Folder';
+	size?: string;
+	format?: string;
+}
+
+export type BrowseViewMode = 'details' | 'folders';
+export type BrowseSortKey = 'name' | 'size' | 'type';
+export type BrowseSortDir = 'asc' | 'desc';
+
+/** Distinct file formats (types) present among `items`, normalized (trimmed + lowercased) and sorted —
+ *  the source for the type-filter chips. Folders and format-less files contribute nothing, so an
+ *  all-folders view shows no chips. */
+export function fileTypesPresent(items: readonly ArrangeableItem[]): string[] {
+	const set = new Set<string>();
+	for (const it of items) {
+		if (it.item_type !== 'File') continue;
+		const f = it.format?.trim().toLowerCase();
+		if (f) set.add(f);
+	}
+	return [...set].sort();
+}
+
+/** Controls for {@link arrangeItems}. `types` empty ⇒ no type filter (show every item). */
+export interface ArrangeOptions {
+	search?: string;
+	types?: readonly string[];
+	sortKey?: BrowseSortKey;
+	sortDir?: BrowseSortDir;
+}
+
+/**
+ * Filter + sort a folder's items for display (pure — never mutates the input):
+ * - `search`: case-insensitive name substring, applied to BOTH files and folders;
+ * - `types`: when non-empty, keep only **File** items whose `format` ∈ `types`. **Folders are always
+ *   kept** so drill-down never breaks (a folder may hold matching files deeper);
+ * - sort: **folders always precede files** (the existing convention, independent of `sortDir`), then
+ *   by `sortKey`/`sortDir` within each group. `size` sorts by parsed bytes (`parseEstSize`), `type` by
+ *   `format`; both fall back to name so the order is stable and predictable.
+ */
+export function arrangeItems<T extends ArrangeableItem>(items: readonly T[], opts: ArrangeOptions = {}): T[] {
+	const search = (opts.search ?? '').trim().toLowerCase();
+	const types = opts.types ?? [];
+	const sortKey = opts.sortKey ?? 'name';
+	const dir = opts.sortDir === 'desc' ? -1 : 1;
+
+	const filtered = items.filter((it) => {
+		if (search && !it.name.toLowerCase().includes(search)) return false;
+		if (types.length > 0 && it.item_type === 'File') {
+			return types.includes(it.format?.trim().toLowerCase() ?? '');
+		}
+		return true;
+	});
+
+	return [...filtered].sort((a, b) => {
+		// Folders before files, ALWAYS — this grouping is not flipped by sortDir.
+		if (a.item_type !== b.item_type) return a.item_type === 'Folder' ? -1 : 1;
+		let primary: number;
+		if (sortKey === 'size') primary = parseEstSize(a.size) - parseEstSize(b.size);
+		// Compare type case-insensitively, matching the lowercased filter chips (fileTypesPresent).
+		else if (sortKey === 'type') primary = (a.format ?? '').toLowerCase().localeCompare((b.format ?? '').toLowerCase());
+		else primary = a.name.localeCompare(b.name);
+		if (primary !== 0) return primary * dir;
+		// Equal primary → a stable ASCENDING name tiebreak, never flipped by sortDir.
+		return a.name.localeCompare(b.name);
+	});
+}

@@ -6,7 +6,7 @@ Hoardbook is a small desktop app. You write a short profile, publish a catalog o
 
 It's the **phonebook** to [Qurator](#the-qurator-family)'s "club": Hoardbook finds and verifies people and shows what they have; the richer social layer lives in Qurator.
 
-> **Current release: v0.12.4.** Works standalone. Identity is a single key you also use across Qurator and the wider Nostr network. Hoardbook handles *introductions and catalogs only* — the actual file downloads happen in a separate companion app, [Mascara](#the-qurator-family).
+> **Current release: v0.12.5.** Works standalone. Identity is a single key you also use across Qurator and the wider Nostr network. Hoardbook handles *introductions and catalogs only* — the actual file downloads happen in a separate companion app, [Mascara](#the-qurator-family).
 
 ---
 

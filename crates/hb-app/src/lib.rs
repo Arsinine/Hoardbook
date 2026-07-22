@@ -2,6 +2,7 @@
 
 mod backup;
 mod commands;
+mod dm_cache_store;
 mod dm_quarantine;
 mod error;
 mod identity_state;

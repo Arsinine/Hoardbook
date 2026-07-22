@@ -27,7 +27,7 @@
 	import AddContactDialog from '$lib/components/AddContactDialog.svelte';
 	import CreateGroupDialog from '$lib/components/CreateGroupDialog.svelte';
 	import Modal from '$lib/components/Modal.svelte';
-	import { DM_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
+	import { DM_POLL_VISIBLE_MS, CHANNEL_REFRESH_EVERY_TICKS } from '$lib/poll-lifecycle.js';
 	import { renderFingerprint } from '$lib/identity-display.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
 	import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER, manifestRequestHint } from '$lib/request-inbox.js';
@@ -289,10 +289,13 @@
 		// Local DM poll while the chat page is open. M12 W1 Decision B: backed off from 4 s (the
 		// dominant connect source against the relays) and visibility-gated — paused while the window
 		// is hidden so it doesn't churn relay connections in the background; resumes on show.
+		let pollTick = 0;
 		const fastPoll = setInterval(async () => {
 			if (!$identity || document.hidden) return;
-			// Refresh the open Topic channel's 24h posts on the same tick.
-			if (selectedTopic) loadChannel(selectedTopic.topic_id);
+			// devtest v0.12.4 #1: DMs poll every 3s (cheap incremental fetch), but the open Topic
+			// channel's low-velocity 24h posts refresh on a slower cadence so we don't over-poll the relay.
+			pollTick++;
+			if (selectedTopic && pollTick % CHANNEL_REFRESH_EVERY_TICKS === 0) loadChannel(selectedTopic.topic_id);
 			try {
 				const msgs = await getMessages();
 				// Detect genuinely new messages for the selected peer and auto-scroll.

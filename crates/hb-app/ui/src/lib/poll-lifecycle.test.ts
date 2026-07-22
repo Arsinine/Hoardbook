@@ -17,10 +17,12 @@ describe('poll-lifecycle — visibility-gate + backoff (M12 W1, Decision B)', ()
 		expect(s.intervalMs).toBe(DM_POLL_VISIBLE_MS);
 	});
 
-	it('the DM cadence is backed off from the old 4 s (the dominant connect source)', () => {
-		// The whole point of Decision B: the DM poll no longer hammers relays every 4 s.
-		expect(DM_POLL_VISIBLE_MS).toBeGreaterThanOrEqual(10_000);
-		expect(DM_POLL_VISIBLE_MS).not.toBe(4_000);
+	it('the DM cadence hits the ≤2–3 s propagation target (devtest v0.12.4 #1)', () => {
+		// Supersedes the M12 15 s back-off: safe to tighten now that each poll is a `since`-bounded
+		// INCREMENTAL fetch on the persistent shared client + the local encrypted cache (v0.12.4 #2),
+		// not the whole-mailbox pull that made the old 4 s cadence the dominant connect source. Still
+		// visibility-gated (paused while hidden), so a fast cadence no longer hammers relays.
+		expect(DM_POLL_VISIBLE_MS).toBeLessThanOrEqual(3_000);
 	});
 
 	it('exposes the nav + online cadences', () => {

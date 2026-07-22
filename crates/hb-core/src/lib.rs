@@ -12,6 +12,7 @@ pub mod types;
 pub mod backup;
 pub mod binding;
 pub mod count;
+pub mod dm_cache;
 pub mod event;
 pub mod fingerprint;
 pub mod identity;
@@ -41,6 +42,7 @@ pub use backup::{
 };
 pub use binding::{build_binding, verify_binding, Binding};
 pub use count::{count_distinct_online, count_distinct_userbase, is_canary, CANARY_MARKER};
+pub use dm_cache::{open_dm_cache, seal_dm_cache};
 pub use fingerprint::{fingerprint, Fingerprint};
 pub use identity::Identity;
 pub use listing::{decrypt_listing, encrypt_listing, BrowseKey, ContentKey};
