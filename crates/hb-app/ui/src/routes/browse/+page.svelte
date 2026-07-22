@@ -6,7 +6,7 @@
 	import { page } from '$app/stores';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
-	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote } from '$lib/browse-view.js';
+	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote, arrangeItems, fileTypesPresent, type BrowseViewMode, type BrowseSortKey, type BrowseSortDir } from '$lib/browse-view.js';
 	import type { CachedPeer, Collection, DirectoryItem } from '$lib/types.js';
 
 	type BcItem =
@@ -22,6 +22,23 @@
 	// them empty forever, so browsing shows nothing. Re-pull live when the peer is selected.
 	let loadingListings = $state(false);
 
+	// devtest v0.12.4 #4: file-view controls. viewMode/sort are sticky preferences; the type filter +
+	// in-collection search reset on navigation (a stale filter would hide a folder's whole content).
+	let viewMode: BrowseViewMode = $state('details');
+	let sortKey: BrowseSortKey = $state('name');
+	let sortDir: BrowseSortDir = $state('asc');
+	let fileSearch = $state('');
+	let activeTypes: string[] = $state([]);
+
+	function resetFileFilters() {
+		fileSearch = '';
+		activeTypes = [];
+	}
+
+	function toggleType(t: string) {
+		activeTypes = activeTypes.includes(t) ? activeTypes.filter((x) => x !== t) : [...activeTypes, t];
+	}
+
 	function peerName(peer: CachedPeer): string {
 		// A legacy/adversarial teaser can carry display_name: "" (R1 only guards publish) — `??` would
 		// not fall back to a literal empty string, showing a blank name; `||` does.
@@ -36,6 +53,7 @@
 		selectedPeer = peer;
 		selectedCollection = null;
 		folderStack = [];
+		resetFileFilters();
 		// devtest #3/#4: for a keyed contact, re-fetch listings live so a browse-key that arrived
 		// after (or a listing fetch that hiccuped at) add-time actually surfaces their collections.
 		// Bare (keyless) contacts have nothing to fetch — skip. Cached view stays if the fetch fails.
@@ -71,6 +89,7 @@
 	function selectCollection(col: Collection) {
 		selectedCollection = col;
 		folderStack = [];
+		resetFileFilters();
 	}
 
 	// M16 W4: import a full-listing manifest the user received out of band, upgrading a truncated
@@ -135,6 +154,7 @@
 
 	function enterFolder(item: DirectoryItem) {
 		folderStack = [...folderStack, { name: item.name, items: item.children }];
+		resetFileFilters();
 	}
 
 	function navigateBc(bc: BcItem) {
@@ -146,6 +166,7 @@
 		} else {
 			folderStack = folderStack.slice(0, bc.index + 1);
 		}
+		resetFileFilters();
 	}
 
 	function fmtBytes(bytes: number): string {
@@ -180,10 +201,10 @@
 	let currentItems = $derived(folderStack.length > 0
 		? folderStack[folderStack.length - 1].items
 		: (selectedCollection?.listing ?? []));
-	let sortedItems = $derived([...currentItems].sort((a, b) => {
-		if (a.item_type !== b.item_type) return a.item_type === 'Folder' ? -1 : 1;
-		return a.name.localeCompare(b.name);
-	}));
+	// devtest v0.12.4 #4: the distinct file types in the current folder feed the filter chips; the
+	// arranged list applies search + type filter + sort (folders-first) — all in the tested seam.
+	let availableTypes = $derived(fileTypesPresent(currentItems));
+	let sortedItems = $derived(arrangeItems(currentItems, { search: fileSearch, types: activeTypes, sortKey, sortDir }));
 	// devtest #7 / M16 W3: a peer's collection published as a truncated paywall teaser (too large to
 	// publish whole). Shown only at the collection root, where the dropped tail makes the fade honest;
 	// a collection the browser upgraded to the full tree from a big relay has `truncated` cleared, so
@@ -336,12 +357,41 @@
 			<!-- File tree -->
 			{:else}
 				<div class="file-view">
+					<!-- devtest v0.12.4 #4: file-view controls — Details/Folders toggle · sort · type filter · search. -->
+					<div class="file-toolbar">
+						<div class="view-toggle" role="group" aria-label="View mode">
+							<button type="button" aria-pressed={viewMode === 'details'} onclick={() => (viewMode = 'details')}>Details</button>
+							<button type="button" aria-pressed={viewMode === 'folders'} onclick={() => (viewMode = 'folders')}>Folders</button>
+						</div>
+						<div class="sort-control">
+							<select class="sort-select" bind:value={sortKey} aria-label="Sort by">
+								<option value="name">Name</option>
+								<option value="size">Size</option>
+								<option value="type">Type</option>
+							</select>
+							<button type="button" class="sort-dir" onclick={() => (sortDir = sortDir === 'asc' ? 'desc' : 'asc')} title="Sort direction" aria-label="Toggle sort direction">
+								{sortDir === 'asc' ? '↑' : '↓'}
+							</button>
+						</div>
+						<div class="file-search">
+							<span class="search-icon">{@html icons.search}</span>
+							<input placeholder="Search this collection…" bind:value={fileSearch} aria-label="Search items" />
+						</div>
+					</div>
+					{#if availableTypes.length > 0}
+						<div class="type-filter">
+							<button type="button" class="type-chip" class:type-chip-active={activeTypes.length === 0} onclick={() => (activeTypes = [])}>All types</button>
+							{#each availableTypes as t (t)}
+								<button type="button" class="type-chip" class:type-chip-active={activeTypes.includes(t)} onclick={() => toggleType(t)}>{t}</button>
+							{/each}
+						</div>
+					{/if}
 					{#if sortedItems.length === 0}
 						<div class="empty-state">
 							<div class="empty-icon">{@html icons.folder}</div>
-							<div class="empty-label">Empty folder</div>
+							<div class="empty-label">{fileSearch.trim() || activeTypes.length > 0 ? 'No items match your filters' : 'Empty folder'}</div>
 						</div>
-					{:else}
+					{:else if viewMode === 'details'}
 						<div class="file-table">
 							<div class="file-header">
 								<span class="fh-name">Name</span>
@@ -361,6 +411,24 @@
 									<span class="file-name">{item.name}</span>
 									<span class="file-size">{item.size ?? ''}</span>
 									<span class="file-type">{item.format ?? ''}</span>
+								</button>
+							{/each}
+						</div>
+					{:else}
+						<!-- Folders (tile) view — the same metadata as Details, laid out as large icons. -->
+						<div class="item-grid">
+							{#each sortedItems as item (item.name)}
+								<button
+									class="item-tile"
+									class:file-folder={item.item_type === 'Folder'}
+									class:file-leaf={item.item_type === 'File'}
+									onclick={() => { if (item.item_type === 'Folder') enterFolder(item); }}
+								>
+									<div class="item-tile-icon">{@html item.item_type === 'Folder' ? icons.folder : icons.file}</div>
+									<div class="item-tile-name">{item.name}</div>
+									<div class="item-tile-meta">
+										{item.item_type === 'Folder' ? 'Folder' : (item.format ?? 'File')}{#if item.size} · {item.size}{/if}
+									</div>
 								</button>
 							{/each}
 						</div>
@@ -516,11 +584,11 @@
 	   (mirrors the bottom-right online dot). Shown for both states (🔓 browseable / 🔒 key needed). */
 	.access-lock {
 		position: absolute;
-		top: -4px;
-		right: -4px;
-		font-size: 9px;
+		top: -6px;
+		right: -6px;
+		font-size: 13px;
 		line-height: 1;
-		padding: 1px;
+		padding: 1px 2px;
 		border-radius: 999px;
 		background: var(--bg);
 		box-shadow: 0 0 0 1px var(--border);
@@ -804,6 +872,100 @@
 		display: flex;
 		flex-direction: column;
 	}
+
+	/* devtest v0.12.4 #4: file-view toolbar (Details/Folders · sort · search) + type-filter chips. */
+	.file-toolbar {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		flex-wrap: wrap;
+		padding: 10px 14px;
+		border-bottom: 1px solid var(--divider);
+		flex-shrink: 0;
+	}
+	.view-toggle {
+		display: flex;
+		border: 1px solid var(--border);
+		border-radius: 7px;
+		overflow: hidden;
+		flex-shrink: 0;
+	}
+	.view-toggle button {
+		padding: 5px 11px;
+		font-size: 12px;
+		font-weight: 600;
+		background: transparent;
+		border: none;
+		color: var(--fg-muted);
+		cursor: pointer;
+		font-family: var(--font-ui);
+	}
+	.view-toggle button[aria-pressed='true'] { background: var(--accent-soft); color: var(--accent); }
+
+	.sort-control { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+	.sort-select {
+		height: 28px; padding: 0 6px; border-radius: 6px; font-size: 12px;
+		background: var(--bg-input); border: 1px solid var(--border); color: var(--fg);
+		font-family: var(--font-ui); cursor: pointer;
+	}
+	.sort-dir {
+		width: 28px; height: 28px; flex-shrink: 0;
+		display: flex; align-items: center; justify-content: center;
+		background: var(--bg-input); border: 1px solid var(--border); border-radius: 6px;
+		color: var(--fg-muted); cursor: pointer; font-size: 13px; line-height: 1;
+	}
+	.sort-dir:hover { color: var(--fg); border-color: var(--border-strong); }
+
+	.file-search {
+		display: flex; align-items: center; gap: 6px;
+		flex: 1; min-width: 140px; max-width: 280px;
+		padding: 0 10px; height: 28px;
+		background: var(--bg-input); border: 1px solid var(--border); border-radius: 7px;
+	}
+	.file-search .search-icon { color: var(--fg-dim); display: flex; flex-shrink: 0; }
+	.file-search input {
+		flex: 1; min-width: 0; background: transparent; border: none; outline: none;
+		font-size: 12px; color: var(--fg); font-family: var(--font-ui);
+	}
+	.file-search input::placeholder { color: var(--fg-dim); }
+
+	.type-filter {
+		display: flex; flex-wrap: wrap; gap: 6px;
+		padding: 8px 14px; border-bottom: 1px solid var(--divider); flex-shrink: 0;
+	}
+	.type-chip {
+		padding: 2px 10px; font-size: 11px; font-weight: 500;
+		border: 1px solid var(--border); border-radius: 999px;
+		background: transparent; color: var(--fg-muted); cursor: pointer;
+		font-family: var(--font-ui);
+	}
+	.type-chip:hover { border-color: var(--accent); color: var(--accent); }
+	.type-chip-active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+
+	/* Folders (tile) view — the same metadata as Details, laid out as large icons. */
+	.item-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+		gap: 10px;
+		padding: 14px;
+		align-content: start;
+	}
+	.item-tile {
+		display: flex; flex-direction: column; align-items: center; gap: 4px;
+		padding: 14px 10px;
+		background: var(--bg-elev1); border: 1px solid var(--border); border-radius: 8px;
+		text-align: center; color: inherit; font-family: inherit;
+		cursor: default; min-width: 0;
+	}
+	.item-tile.file-folder { cursor: pointer; }
+	.item-tile:hover { background: var(--bg-elev2); border-color: var(--border-strong); }
+	.item-tile-icon { color: var(--fg-muted); display: flex; transform: scale(1.4); margin: 4px 0 8px; }
+	.item-tile.file-folder .item-tile-icon { color: var(--accent); }
+	.item-tile-name {
+		font-size: 12px; color: var(--fg); font-weight: 500;
+		overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
+	}
+	.item-tile-meta { font-size: 10px; color: var(--fg-dim); }
 
 	.file-table {
 		display: flex;

@@ -1,24 +1,19 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { ReceivedMessage } from './types.js';
+import { DM_POLL_VISIBLE_MS } from './poll-lifecycle.js';
 
 // ── Issue: chat doesn't update in real time ───────────────────────────────────
-// The layout poll runs every 20s — too slow for a chat page. The chat page
-// must install its own faster poll that clears when it unmounts.
+// The chat page installs its own DM poll (faster than the layout nav poll) that
+// clears when it unmounts. devtest v0.12.4 #1 tightened it to hit a ≤2–3s target.
 
 describe('chat real-time polling', () => {
 	beforeEach(() => { vi.useFakeTimers(); });
 	afterEach(() => { vi.useRealTimers(); });
 
-	it('layout poll interval is 20 000 ms (too slow for chat)', () => {
-		// This test documents the known layout interval so any future change
-		// to 20_000 that removes the fast chat poll is caught.
-		const LAYOUT_INTERVAL_MS = 20_000;
-		expect(LAYOUT_INTERVAL_MS).toBe(20_000);
-	});
-
-	it('fast chat poll must fire within 5 000 ms', () => {
-		const CHAT_POLL_MS = 4_000;
-		expect(CHAT_POLL_MS).toBeLessThanOrEqual(5_000);
+	it('the DM poll fires within the ≤2–3s propagation target (devtest v0.12.4 #1)', () => {
+		// Guards the REAL constant (not a local literal), so a regression back to the 15s cadence —
+		// or anything slower than the stated 3s target — reddens this test.
+		expect(DM_POLL_VISIBLE_MS).toBeLessThanOrEqual(3_000);
 	});
 
 	it('poll accumulates only genuinely new messages', () => {

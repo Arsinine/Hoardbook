@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
+	arrangeItems,
 	availabilityBadge,
 	collectionAvailability,
 	countListingItems,
 	dedupAndCap,
+	fileTypesPresent,
 	flattenTree,
 	importedManifestNote,
 	parseEstSize,
@@ -11,6 +13,7 @@ import {
 	peerAccessBadge,
 	peerFromQuery,
 	summarizeCollectionsSize,
+	type ArrangeableItem,
 	type RenderedListing,
 	type SearchHit,
 	type TreeNode,
@@ -245,5 +248,72 @@ describe('importedManifestNote (M16 W4 — imported full manifest tag)', () => {
 		const imported = { total_items: 100, listing: [{ name: 'a' }], manifest_imported_at: 1_700_000_000 };
 		expect(paywallTeaser(imported)).toBeNull();
 		expect(importedManifestNote(imported)).not.toBeNull();
+	});
+});
+
+describe('browse-view — file view controls (devtest v0.12.4 #4)', () => {
+	const F = (name: string, format?: string, size?: string): ArrangeableItem => ({ name, item_type: 'File', format, size });
+	const D = (name: string): ArrangeableItem => ({ name, item_type: 'Folder' });
+	const items: ArrangeableItem[] = [
+		F('zulu.mkv', 'mkv', '2 GB'),
+		D('Season 2'),
+		F('alpha.mp4', 'mp4', '700 MB'),
+		D('Extras'),
+		F('cover.jpg', 'jpg', '512 KB'),
+		F('bravo.mkv', 'MKV', '1.5 GB'),
+		F('readme', undefined, '2 KB'),
+	];
+
+	it('fileTypesPresent lists distinct normalized file formats, sorted; ignores folders + formatless', () => {
+		// "MKV" and "mkv" collapse to one; folders (Season 2/Extras) and the formatless `readme` drop out.
+		expect(fileTypesPresent(items)).toEqual(['jpg', 'mkv', 'mp4']);
+	});
+
+	it('folders always sort before files, and that grouping is NOT flipped by descending sort', () => {
+		const asc = arrangeItems(items, { sortKey: 'name', sortDir: 'asc' });
+		const desc = arrangeItems(items, { sortKey: 'name', sortDir: 'desc' });
+		expect(asc.slice(0, 2).every((i) => i.item_type === 'Folder')).toBe(true);
+		expect(desc.slice(0, 2).every((i) => i.item_type === 'Folder')).toBe(true);
+		// Folders themselves reverse within their group on desc; files follow after.
+		expect(asc.map((i) => i.name).slice(0, 2)).toEqual(['Extras', 'Season 2']);
+		expect(desc.map((i) => i.name).slice(0, 2)).toEqual(['Season 2', 'Extras']);
+	});
+
+	it('type filter keeps only matching files but ALWAYS keeps folders (navigation must not break)', () => {
+		const out = arrangeItems(items, { types: ['mkv'] });
+		const folders = out.filter((i) => i.item_type === 'Folder').map((i) => i.name);
+		const files = out.filter((i) => i.item_type === 'File').map((i) => i.name);
+		expect(folders).toEqual(['Extras', 'Season 2']); // both folders survive the filter
+		expect(files.sort()).toEqual(['bravo.mkv', 'zulu.mkv']); // case-insensitive format match
+	});
+
+	it('empty type set shows everything', () => {
+		expect(arrangeItems(items, { types: [] })).toHaveLength(items.length);
+	});
+
+	it('search matches file AND folder names, case-insensitively', () => {
+		expect(arrangeItems(items, { search: 'SEASON' }).map((i) => i.name)).toEqual(['Season 2']);
+		expect(arrangeItems(items, { search: 'mkv' }).map((i) => i.name).sort()).toEqual(['bravo.mkv', 'zulu.mkv']);
+	});
+
+	it('sort by size orders files by parsed bytes within the files group', () => {
+		const files = arrangeItems(items, { sortKey: 'size', sortDir: 'asc' }).filter((i) => i.item_type === 'File');
+		expect(files.map((i) => i.name)).toEqual(['readme', 'cover.jpg', 'alpha.mp4', 'bravo.mkv', 'zulu.mkv']);
+	});
+
+	it('equal-primary items keep an ASCENDING name tiebreak even in descending sort', () => {
+		// Two files of equal size: their name tiebreak must stay a→z regardless of sortDir (review #8).
+		const eq: ArrangeableItem[] = [
+			F('banana.txt', 'txt', '1 MB'),
+			F('apple.txt', 'txt', '1 MB'),
+		];
+		expect(arrangeItems(eq, { sortKey: 'size', sortDir: 'desc' }).map((i) => i.name)).toEqual(['apple.txt', 'banana.txt']);
+		expect(arrangeItems(eq, { sortKey: 'size', sortDir: 'asc' }).map((i) => i.name)).toEqual(['apple.txt', 'banana.txt']);
+	});
+
+	it('does not mutate the input array', () => {
+		const snapshot = items.map((i) => i.name);
+		arrangeItems(items, { sortKey: 'size', sortDir: 'desc', search: 'a', types: ['mp4'] });
+		expect(items.map((i) => i.name)).toEqual(snapshot);
 	});
 });

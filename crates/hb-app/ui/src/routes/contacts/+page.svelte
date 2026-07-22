@@ -350,7 +350,7 @@
 	{@const badge = peerAccessBadge(peer)}
 	{@const sizeSummary = !badge.locked ? summarizeCollectionsSize(peer.collections) : null}
 	{@const isOpen = detailExpanded === peer.npub}
-	<div class="contact-block">
+	<div class="contact-block" class:open={isOpen}>
 		<!-- devtest v0.12.1 #4: double-click a contact to open the conversation in Chat. The chevron,
 		     Browse, and ⋯ controls keep their own single-click actions. -->
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -740,6 +740,14 @@
 	.contact-list { display: flex; flex-direction: column; gap: 12px; padding-bottom: 16px; }
 
 	.contact-block { display: flex; flex-direction: column; gap: 8px; scroll-margin-top: 34px; }
+	/* devtest v0.12.4 #6: an expanded row reads as ONE connected card — the detail continues the card
+	   body (shared surface + border, squared seam) instead of floating as an unstyled block below it. */
+	.contact-block.open { gap: 0; }
+	.contact-block.open .contact-card {
+		border-bottom-left-radius: 0;
+		border-bottom-right-radius: 0;
+		border-bottom-color: transparent;
+	}
 
 	.contact-card {
 		background: var(--bg-elev1);
@@ -858,7 +866,16 @@
 		min-width: 60px; font-family: var(--font-ui);
 	}
 
-	.contact-detail { padding-left: 56px; padding-bottom: 4px; display: flex; flex-direction: column; gap: 8px; }
+	.contact-detail {
+		background: var(--bg-elev1);
+		border: 1px solid var(--border);
+		border-top: none;
+		border-radius: 0 0 10px 10px;
+		padding: 4px 14px 12px 56px;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
 
 	/* Pills */
 	.pill {

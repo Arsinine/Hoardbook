@@ -460,7 +460,6 @@
 				<Avatar letter={idInitial} size={56} hue={idHue} picture={$profile?.picture} />
 				<div class="identity-info">
 					<div class="identity-name">{idName}</div>
-					<div class="identity-created">Nostr identity (npub)</div>
 				</div>
 				</div>
 
@@ -839,8 +838,6 @@
 	.identity-info { flex: 1; }
 
 	.identity-name { font-size: 14px; font-weight: 600; }
-
-	.identity-created { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
 
 	.key-storage-warn {
 		margin-top: 12px;

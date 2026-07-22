@@ -11,13 +11,16 @@
 //! DM).
 //!
 //! **M13 Part B (Q7 owner ruling):** a stranger's DM no longer merges into the main inbox at all — it
-//! is quarantined into a separate Request bucket (`classify_dms`, backed by `dm_quarantine.rs`), seen
-//! only when the user opens the Request pane. `get_messages` keeps its signature but its semantics
-//! changed: it now returns the contacts-only inbox and, as a side effect, persists any newly-seen
-//! stranger messages into the Request store. `classify_dms` needs the gift-wrap event id (the
-//! Request-bucket dedup key), which `decode_dms`'s output doesn't carry, so it re-implements the
-//! unwrap loop rather than composing over `decode_dms`; `decode_dms` itself is kept — and still
-//! covered by its own conformance tests below — as the simpler contacts-only-filter seam.
+//! is quarantined into a separate Request bucket (backed by `dm_quarantine.rs`), seen only when the
+//! user opens the Request pane. `get_messages` returns the contacts-only inbox and, as a side effect,
+//! persists any newly-seen stranger messages into the Request store.
+//!
+//! **devtest v0.12.4 #2 (incremental at-rest cache):** `get_messages` no longer re-downloads + re-
+//! unwraps the whole gift-wrap mailbox every poll. Decoded contact messages are cached (sealed,
+//! `dm_cache_store`), and each poll fetches only NEW wraps (`since`-bounded, dedup by wrap id). Per-DM
+//! routing (blocked ▸ inbox ▸ declined ▸ request/drop) lives in `route_dm`, driven by
+//! `merge_wraps_into_cache`; the returned inbox is reclassified from the cache under the current
+//! contacts/blocked sets, so blocking/removing a contact still hides their cached messages.
 
 use std::collections::HashSet;
 
@@ -29,6 +32,7 @@ use tauri::State;
 use hb_net::{unwrap_dm, wrap_dm, RelayClient};
 
 use crate::{
+    dm_cache_store::{CachedDm, DmCache},
     dm_quarantine::{merge_into_requests, record_declined, RequestMessage},
     error::{cmd_err, CmdResult},
     identity_state::SharedIdentity,
@@ -64,7 +68,7 @@ fn parse_recipient(s: &str) -> Result<PublicKey, String> {
 }
 
 /// devtest #14: a self-send is never valid — `send_message` rejects it before any network I/O.
-/// `classify_dms`'s `from == own_npub` inbox routing stays; it exists for the legitimate sent-echo
+/// `route_dm`'s `from == own_npub` inbox routing stays; it exists for the legitimate sent-echo
 /// of a message you already sent, not to allow creating a self-conversation from scratch.
 fn is_self_send(recipient: &PublicKey, me: &PublicKey) -> bool {
     recipient == me
@@ -122,9 +126,10 @@ pub(crate) async fn send_dm_inner(
 /// `contact_npubs` is `Some`, messages from npubs outside the set are dropped (the `allow_dms` off
 /// case). Result is sorted oldest-first by send time.
 ///
-/// M13 Part B: `get_messages` now calls [`classify_dms`] instead (it needs the gift-wrap event id for
-/// the Request-bucket dedup key, which this simpler contacts-only filter doesn't track) — `decode_dms`
-/// has no remaining production caller, but is kept for its own NIP-17 conformance tests below.
+/// devtest v0.12.4 #2: `get_messages` now decodes via `merge_wraps_into_cache` (it needs the gift-wrap
+/// event id for both the cache dedup key and the Request bucket, which this simpler contacts-only
+/// filter doesn't track) — `decode_dms` has no remaining production caller, but is kept for its own
+/// NIP-17 conformance tests below.
 #[allow(dead_code)]
 pub(crate) async fn decode_dms(
     own_npub: &str,
@@ -165,16 +170,9 @@ pub(crate) async fn decode_dms(
 // Q7 — the total DM classifier (M13 Part B): inbox vs quarantined Request vs dropped
 // ---------------------------------------------------------------------------
 
-/// The two destinations a batch of gift wraps splits into: the contacts-only main inbox, and the
-/// stranger messages awaiting a Request-bucket merge (npub, message).
-pub(crate) struct ClassifiedDms {
-    pub inbox: Vec<ReceivedMessage>,
-    pub requests: Vec<(String, RequestMessage)>,
-}
-
-/// The local state `classify_dms` classifies against — bundled (rather than four+ loose params) both
-/// to keep the function's argument count sane and because these values always travel together (loaded
-/// once per `get_messages` call).
+/// The local state `route_dm` classifies each decoded DM against — bundled (rather than four+ loose
+/// params) both to keep call sites sane and because these values always travel together (loaded once
+/// per `get_messages` call).
 pub(crate) struct DmClassifyCtx<'a> {
     pub contacts: &'a HashSet<String>,
     pub blocked: &'a HashSet<String>,
@@ -183,77 +181,160 @@ pub(crate) struct DmClassifyCtx<'a> {
     pub allow_strangers: bool,
 }
 
-/// Classify a batch of gift-wrap events (Q7 owner ruling — the message-requests pattern). Each
-/// message is routed to **exactly one** destination, checked in this order:
+/// Where a decoded DM routes, in the Q7 order — the single source of truth for that ordering, used by
+/// [`merge_wraps_into_cache`] (the incremental cache path, v0.12.4 #2) that `get_messages` drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DmRoute {
+    /// Dropped — blocked, declined, or a stranger while `allow_dms` is off.
+    Drop,
+    /// The contacts-only main inbox (a contact, or your own sent echo).
+    Inbox,
+    /// A stranger's quarantined Request bucket.
+    Request,
+}
+
+/// Route one decoded sender per the Q7 ruling: **blocked** supersedes everything (even a contact);
+/// then **own npub / a contact** → inbox; then a **declined** stranger stays dropped; then a stranger
+/// → Request when `allow_dms` is on, else dropped (the stricter behaviour).
+pub(crate) fn route_dm(from: &str, own_npub: &str, ctx: &DmClassifyCtx<'_>) -> DmRoute {
+    if ctx.blocked.contains(from) {
+        return DmRoute::Drop;
+    }
+    if from == own_npub || ctx.contacts.contains(from) {
+        return DmRoute::Inbox;
+    }
+    if ctx.declined.contains(from) {
+        return DmRoute::Drop;
+    }
+    if ctx.allow_strangers {
+        DmRoute::Request
+    } else {
+        DmRoute::Drop
+    }
+}
+
+/// NIP-59 fuzzes a gift wrap's OUTER `created_at` up to 2 days into the past, so an incremental fetch
+/// must widen its `since` by this margin or it would silently miss a just-sent message whose outer
+/// stamp landed in the past. 48 h = the NIP-59 window, so any wrap newer than the last one we saw is
+/// always inside `[cursor − margin, now]` (proof: a message sent at real time T has outer ≥ T−48h;
+/// with `since = cursor−48h` and T ≥ cursor, its outer ≥ since).
+const DM_FETCH_MARGIN_SECS: u64 = 48 * 60 * 60;
+
+/// The inbox fetch filter: kind-1059 wraps addressed to us, bounded by `since = cursor − margin` once
+/// the cache has a cursor (an incremental read — most polls then return ~nothing), or unbounded on a
+/// cold cache (the one full initial pull). `since` is **bandwidth-only** — dedup + security are by
+/// wrap id and the persisted block/decline sets, never this attacker-fuzzable timestamp.
+fn dm_inbox_filter(me: PublicKey, newest_seen_outer: u64) -> Filter {
+    let f = Filter::new().kind(Kind::GiftWrap).pubkey(me);
+    if newest_seen_outer > 0 {
+        f.since(Timestamp::from(newest_seen_outer.saturating_sub(DM_FETCH_MARGIN_SECS)))
+    } else {
+        f
+    }
+}
+
+/// Incremental decode + cache merge (devtest v0.12.4 #2). For each fetched wrap NOT already in the
+/// cache's seen-ledger it unwraps (Schnorr-verified seal), records its id, and routes it via
+/// [`route_dm`] — a contact/self message is appended to the cache; a stranger's is returned for the
+/// caller to merge into the Q7 quarantine. A wrap that fails to unwrap is skipped with a log, never a
+/// panic. **Already-seen wraps are never re-unwrapped** — the whole point of the cache.
 ///
-/// 1. **blocked** sender → dropped, never creates a Request (blocked supersedes contact — even a
-///    blocked EXISTING contact's messages are dropped here);
-/// 2. **own npub or a contact** → the main inbox;
-/// 3. **declined** sender → dropped (a decline is remembered permanently — see `dm_request_decline`);
-/// 4. **stranger** → a Request-bucket entry when `ctx.allow_strangers` (the `allow_dms` setting), else
-///    dropped (the stricter `allow_dms=false` behaviour, preserved as-is).
-///
-/// A wrap that fails to unwrap (foreign/tampered/malformed) is skipped with a log, never a panic —
-/// the same posture as [`decode_dms`]. Deduped by the gift-wrap event id, same rationale as there.
-pub(crate) async fn classify_dms(
-    own_npub: &str,
+/// `now` (unix secs) is the wall clock, passed in for testability. The cursor advance is **clamped to
+/// `now`** and any persisted future cursor is healed down to `now` — so a foreign wrap bearing an
+/// attacker-chosen future `created_at` (NIP-59's outer stamp is arbitrary) can never push `since` past
+/// the present and silently stop all future DM delivery (the codebase's future-date discipline, cf.
+/// M9's count cap). Uses a `HashSet` for the seen lookup (O(1), not the old O(n) scan). Returns the
+/// stranger requests plus a `changed` flag: `true` iff it mutated the cache (so the caller persists a
+/// balanced push+prune the length tuple would miss).
+async fn merge_wraps_into_cache(
     identity: &hb_core::Identity,
-    gift_wraps: Vec<Event>,
+    own_npub: &str,
+    wraps: Vec<Event>,
     ctx: &DmClassifyCtx<'_>,
-) -> ClassifiedDms {
-    let mut inbox: Vec<ReceivedMessage> = Vec::new();
+    cache: &mut DmCache,
+    now: u64,
+) -> (Vec<(String, RequestMessage)>, bool) {
     let mut requests: Vec<(String, RequestMessage)> = Vec::new();
-    let mut seen: HashSet<EventId> = HashSet::new();
-    for wrap in gift_wraps {
-        if !seen.insert(wrap.id) {
-            continue;
+    let mut changed = false;
+    // Heal a poisoned/future cursor (from a prior poll before this clamp existed, or a foreign wrap):
+    // it must never exceed the present, or `since = cursor − 48h` could sit in the future and starve
+    // the inbox forever (the cursor only moves forward).
+    if cache.newest_seen_outer > now {
+        cache.newest_seen_outer = now;
+        changed = true;
+    }
+    // O(1) "already decoded?" lookups (was an O(n) linear scan → O(n²)/poll). The persisted `seen_wraps`
+    // Vec stays the source of truth; this set mirrors it plus this batch's ids.
+    let mut seen: HashSet<String> = cache.seen_wraps.iter().cloned().collect();
+    for wrap in wraps {
+        let outer = wrap.created_at.as_u64().min(now); // clamp: a future-dated wrap can't poison the cursor
+        if outer > cache.newest_seen_outer {
+            cache.newest_seen_outer = outer;
+            changed = true;
         }
         let wrap_id = wrap.id.to_hex();
+        if seen.contains(&wrap_id) {
+            continue; // already decoded (a prior poll, or the same wrap from two relays)
+        }
         match unwrap_dm(identity, &wrap).await {
             Ok(dm) => {
+                // Record the id only after a successful unwrap — an undecodable/foreign wrap is never
+                // remembered, so it can't fill the ledger (it may be re-tried next poll, bounded by the
+                // 48 h window).
+                seen.insert(wrap_id.clone());
+                cache.seen_wraps.push(wrap_id.clone());
+                changed = true;
                 let from = npub_of(&dm.sender);
-                if ctx.blocked.contains(&from) {
-                    continue; // blocked supersedes everything — never even reaches a request
-                }
-                if from == own_npub || ctx.contacts.contains(&from) {
-                    inbox.push(ReceivedMessage {
+                let sent_at = rfc3339_of(dm.created_at);
+                match route_dm(&from, own_npub, ctx) {
+                    DmRoute::Drop => {}
+                    DmRoute::Inbox => cache.messages.push(CachedDm {
+                        wrap_id,
                         from,
                         to: own_npub.to_string(),
                         content: dm.content,
-                        sent_at: rfc3339_of(dm.created_at),
-                    });
-                    continue;
+                        sent_at,
+                    }),
+                    DmRoute::Request => {
+                        requests.push((from, RequestMessage { wrap_id, content: dm.content, sent_at }));
+                    }
                 }
-                if ctx.declined.contains(&from) {
-                    continue; // permanently remembered — see dm_request_decline
-                }
-                if ctx.allow_strangers {
-                    requests.push((
-                        from,
-                        RequestMessage { wrap_id, content: dm.content, sent_at: rfc3339_of(dm.created_at) },
-                    ));
-                }
-                // else: allow_dms is off — a stranger's DM is fully dropped (the stricter behaviour).
             }
             Err(e) => tracing::debug!("skipping undecryptable/foreign gift wrap: {e}"),
         }
     }
-    inbox.sort_by(|a, b| a.sent_at.cmp(&b.sent_at));
-    ClassifiedDms { inbox, requests }
+    (requests, changed)
 }
 
-/// Fetch + classify the NIP-17 inbox in one relay read: the same filter/fetch shape [`send_dm_inner`]'s
-/// sibling used to have, now composed over [`classify_dms`] instead of [`decode_dms`].
-pub(crate) async fn classify_dms_inner(
-    client: &RelayClient,
-    identity: &hb_core::Identity,
+/// The received-contact inbox, re-derived from the cache under the CURRENT contacts/blocked sets
+/// (devtest v0.12.4 #2). Reclassifying at read time — never baking classification into the cache —
+/// keeps §8/Q7 authoritative in the security-critical direction: blocking or removing a contact
+/// **hides** their cached messages. It is deliberately one-way (it can hide, never surface): only
+/// contact/self messages are cached, so a message decoded while its sender was blocked/declined/a
+/// stranger stays out (consistent with drop semantics). The Q7 accept flow migrates a newly-accepted
+/// sender's history into the cache explicitly (see `dm_request_accept_inner`). Deduped by wrap id,
+/// sorted oldest-first by send time.
+fn cached_inbox(
+    cache: &DmCache,
     own_npub: &str,
-    ctx: &DmClassifyCtx<'_>,
-    timeout: std::time::Duration,
-) -> Result<ClassifiedDms, hb_net::NetError> {
-    let filter = Filter::new().kind(Kind::GiftWrap).pubkey(identity.public_key());
-    let wraps = client.fetch(filter, timeout).await?;
-    Ok(classify_dms(own_npub, identity, wraps, ctx).await)
+    contacts: &HashSet<String>,
+    blocked: &HashSet<String>,
+) -> Vec<ReceivedMessage> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out: Vec<ReceivedMessage> = cache
+        .messages
+        .iter()
+        .filter(|m| (m.from == own_npub || contacts.contains(&m.from)) && !blocked.contains(&m.from))
+        .filter(|m| seen.insert(m.wrap_id.as_str()))
+        .map(|m| ReceivedMessage {
+            from: m.from.clone(),
+            to: m.to.clone(),
+            content: m.content.clone(),
+            sent_at: m.sent_at.clone(),
+        })
+        .collect();
+    out.sort_by(|a, b| a.sent_at.cmp(&b.sent_at));
+    out
 }
 
 /// A stranger's quarantined Request bucket, for the UI (Q7) — a pure local read, no relay I/O (the
@@ -299,8 +380,14 @@ pub(crate) fn dm_requests_inner(store: &DataStore, own_npub: &str) -> Result<Vec
 /// code and isn't a relay-free path anyway), so **acceptance never depends on network reachability**.
 /// Deletes the bucket, un-declines the sender if they were previously declined, and returns the
 /// drained messages so the caller can seed them straight into the conversation.
+///
+/// devtest v0.12.4 #2 fix: the accepted messages are also **migrated into the DM cache** (their wraps
+/// are already in `seen_wraps` from when they were quarantined, so the incremental poll would never
+/// re-decode them into the now-contact's inbox — without this, the accepted history would flash for
+/// one poll then vanish). Needs `identity` to re-seal the cache.
 pub(crate) fn dm_request_accept_inner(
     store: &DataStore,
+    identity: &hb_core::Identity,
     own_npub: &str,
     npub: String,
     petname: Option<String>,
@@ -322,20 +409,39 @@ pub(crate) fn dm_request_accept_inner(
     store.save_contact(&hash, &peer).map_err(cmd_err)?;
 
     let mut buckets = store.load_dm_requests().map_err(cmd_err)?;
-    let drained = match buckets.iter().position(|b| b.npub == npub) {
-        Some(i) => buckets
-            .remove(i)
-            .messages
-            .iter()
-            .map(|m| request_message_to_received(&npub, own_npub, m))
-            .collect(),
-        None => Vec::new(),
+    let (drained, cache_adds) = match buckets.iter().position(|b| b.npub == npub) {
+        Some(i) => {
+            let bucket = buckets.remove(i);
+            let drained: Vec<ReceivedMessage> =
+                bucket.messages.iter().map(|m| request_message_to_received(&npub, own_npub, m)).collect();
+            let cache_adds: Vec<CachedDm> = bucket
+                .messages
+                .iter()
+                .map(|m| CachedDm {
+                    wrap_id: m.wrap_id.clone(),
+                    from: npub.clone(),
+                    to: own_npub.to_string(),
+                    content: m.content.clone(),
+                    sent_at: m.sent_at.clone(),
+                })
+                .collect();
+            (drained, cache_adds)
+        }
+        None => (Vec::new(), Vec::new()),
     };
     store.save_dm_requests(&buckets).map_err(cmd_err)?;
 
     let declined: Vec<(String, u64)> =
         store.load_dm_declined().map_err(cmd_err)?.into_iter().filter(|(n, _)| n != &npub).collect();
     store.save_dm_declined(&declined).map_err(cmd_err)?;
+
+    // Migrate the accepted history into the DM cache so it persists past the next poll (see doc above).
+    if !cache_adds.is_empty() {
+        let mut cache = store.load_dm_cache(identity).map_err(cmd_err)?;
+        cache.messages.extend(cache_adds);
+        cache.prune();
+        store.save_dm_cache(identity, &cache).map_err(cmd_err)?;
+    }
 
     Ok(drained)
 }
@@ -519,18 +625,40 @@ pub async fn get_messages(
         store.load_dm_declined().map_err(cmd_err)?.into_iter().map(|(n, _)| n).collect();
 
     let ctx = DmClassifyCtx { contacts: &contacts, blocked: &blocked, declined: &declined, allow_strangers: allow_dms };
-    let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
-    let classified = classify_dms_inner(&client, &id_clone, &own_npub, &ctx, net::RELAY_TIMEOUT)
-        .await
-        .map_err(cmd_err)?;
 
-    if !classified.requests.is_empty() {
+    // devtest v0.12.4 #2: load the at-rest cache and fetch only wraps newer than what we've already
+    // decoded — a `since`-bounded incremental read on the persistent shared client, not the old
+    // whole-mailbox pull + full re-decrypt every poll. Received contact messages come from the cache
+    // (instant); the relay is touched only for genuinely-new wraps.
+    let now = now_secs();
+    let mut cache = store.load_dm_cache(&id_clone).map_err(cmd_err)?;
+    // Heal a poisoned/future cursor before it drives the fetch window (a stale install may carry one).
+    let healed = cache.newest_seen_outer > now;
+    if healed {
+        cache.newest_seen_outer = now;
+    }
+    let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
+    let filter = dm_inbox_filter(id_clone.public_key(), cache.newest_seen_outer);
+    let wraps = client.fetch(filter, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
+
+    let (requests, merged) = merge_wraps_into_cache(&id_clone, &own_npub, wraps, &ctx, &mut cache, now).await;
+    let pruned = cache.prune();
+    // Only re-seal + write when something actually changed — an idle 3s poll (all wraps already seen)
+    // leaves the cache untouched, so it costs no disk write / re-encrypt. The explicit dirty flags
+    // catch a balanced push+prune the length tuple alone would miss.
+    if healed || merged || pruned {
+        store.save_dm_cache(&id_clone, &cache).map_err(cmd_err)?;
+    }
+
+    if !requests.is_empty() {
         let existing = store.load_dm_requests().map_err(cmd_err)?;
-        let merged = merge_into_requests(existing, classified.requests, now_secs());
+        let merged = merge_into_requests(existing, requests, now_secs());
         store.save_dm_requests(&merged).map_err(cmd_err)?;
     }
 
-    Ok(classified.inbox)
+    // Return the received-contact inbox from the cache, reclassified under the current contacts/blocked
+    // sets (so a since-blocked/removed contact's cached messages are hidden — §8/Q7 stays authoritative).
+    Ok(cached_inbox(&cache, &own_npub, &contacts, &blocked))
 }
 
 // ---------------------------------------------------------------------------
@@ -554,8 +682,12 @@ pub async fn dm_request_accept(
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
 ) -> CmdResult<Vec<ReceivedMessage>> {
-    let own_npub = identity.read().await.as_ref().map(|id| id.npub()).ok_or("No identity loaded.")?;
-    dm_request_accept_inner(&store, &own_npub, npub, petname)
+    let (own_npub, id_clone) = {
+        let guard = identity.read().await;
+        let id = guard.as_ref().ok_or("No identity loaded.")?;
+        (id.npub(), id.identity.clone())
+    };
+    dm_request_accept_inner(&store, &id_clone, &own_npub, npub, petname)
 }
 
 #[tauri::command]
@@ -742,7 +874,7 @@ mod tests {
         assert!(json.contains("\"from\":\"npub1from\""));
     }
 
-    // ── Q7 — classify_dms (M13 Part B) ─────────────────────────────────────────────────────────
+    // ── Q7 / v0.12.4 #2 — DM routing + the incremental at-rest cache ────────────────────────────
 
     /// Test-only builder for [`DmClassifyCtx`] — most tests only vary one or two of its four fields.
     fn ctx<'a>(
@@ -754,94 +886,128 @@ mod tests {
         DmClassifyCtx { contacts, blocked, declined, allow_strangers }
     }
 
-    #[tokio::test]
-    async fn blocked_sender_never_creates_a_request() {
-        let me = Identity::generate();
-        let blocked_id = Identity::generate();
-        let wrap = build_dm(&blocked_id, &me.public_key(), "spam").await.unwrap();
-        let blocked: HashSet<String> = [blocked_id.npub()].into_iter().collect();
-        let classified =
-            classify_dms(&me.npub(), &me, vec![wrap], &ctx(&HashSet::new(), &blocked, &HashSet::new(), true)).await;
-        assert!(classified.inbox.is_empty());
-        assert!(classified.requests.is_empty(), "a blocked sender must never create a request, even with allow_dms on");
+
+    #[test]
+    fn route_dm_follows_the_q7_order() {
+        let contacts: HashSet<String> = ["c".into()].into_iter().collect();
+        let blocked: HashSet<String> = ["b".into()].into_iter().collect();
+        let declined: HashSet<String> = ["d".into()].into_iter().collect();
+        let on = ctx(&contacts, &blocked, &declined, true);
+        assert_eq!(route_dm("b", "me", &on), DmRoute::Drop, "blocked supersedes all");
+        assert_eq!(route_dm("c", "me", &on), DmRoute::Inbox, "a contact → inbox");
+        assert_eq!(route_dm("me", "me", &on), DmRoute::Inbox, "own npub → inbox");
+        assert_eq!(route_dm("d", "me", &on), DmRoute::Drop, "declined → drop");
+        assert_eq!(route_dm("s", "me", &on), DmRoute::Request, "stranger → request when allow_dms on");
+        // A blocked CONTACT still drops (blocked supersedes contact).
+        let bc: HashSet<String> = ["x".into()].into_iter().collect();
+        let empty: HashSet<String> = HashSet::new();
+        let both = ctx(&bc, &bc, &empty, true);
+        assert_eq!(route_dm("x", "me", &both), DmRoute::Drop);
+        // allow_dms off → a stranger drops entirely.
+        let off = ctx(&contacts, &blocked, &declined, false);
+        assert_eq!(route_dm("s", "me", &off), DmRoute::Drop);
     }
 
     #[tokio::test]
-    async fn blocked_contact_is_dropped_from_inbox() {
-        // Blocked supersedes contact — a blocked CONTACT's messages are dropped too.
+    async fn merge_caches_contacts_quarantines_strangers_then_skips_seen_wraps() {
         let me = Identity::generate();
         let contact = Identity::generate();
-        let wrap = build_dm(&contact, &me.public_key(), "hi").await.unwrap();
-        let contacts: HashSet<String> = [contact.npub()].into_iter().collect();
-        let blocked: HashSet<String> = [contact.npub()].into_iter().collect();
-        let classified =
-            classify_dms(&me.npub(), &me, vec![wrap], &ctx(&contacts, &blocked, &HashSet::new(), true)).await;
-        assert!(classified.inbox.is_empty(), "blocked supersedes contact");
-        assert!(classified.requests.is_empty());
-    }
-
-    #[tokio::test]
-    async fn declined_sender_stays_dropped_across_reclassification() {
-        let me = Identity::generate();
         let stranger = Identity::generate();
-        let wrap = build_dm(&stranger, &me.public_key(), "hello again").await.unwrap();
-        let declined: HashSet<String> = [stranger.npub()].into_iter().collect();
-        let classified =
-            classify_dms(&me.npub(), &me, vec![wrap], &ctx(&HashSet::new(), &HashSet::new(), &declined, true)).await;
-        assert!(classified.inbox.is_empty());
-        assert!(classified.requests.is_empty(), "a declined sender is dropped even with allow_dms on");
-    }
-
-    #[tokio::test]
-    async fn stranger_lands_in_requests_never_inbox_when_allow_dms_on() {
-        let me = Identity::generate();
-        let stranger = Identity::generate();
-        let wrap = build_dm(&stranger, &me.public_key(), "first contact").await.unwrap();
-        let classified = classify_dms(
-            &me.npub(),
-            &me,
-            vec![wrap],
-            &ctx(&HashSet::new(), &HashSet::new(), &HashSet::new(), true),
-        )
-        .await;
-        assert!(classified.inbox.is_empty(), "a stranger never lands in the main inbox");
-        assert_eq!(classified.requests.len(), 1);
-        assert_eq!(classified.requests[0].0, stranger.npub());
-        assert_eq!(classified.requests[0].1.content, "first contact");
-    }
-
-    #[tokio::test]
-    async fn stranger_fully_dropped_when_allow_dms_off() {
-        let me = Identity::generate();
-        let stranger = Identity::generate();
-        let wrap = build_dm(&stranger, &me.public_key(), "spam").await.unwrap();
-        let classified = classify_dms(
-            &me.npub(),
-            &me,
-            vec![wrap],
-            &ctx(&HashSet::new(), &HashSet::new(), &HashSet::new(), false),
-        )
-        .await;
-        assert!(classified.inbox.is_empty());
-        assert!(classified.requests.is_empty(), "allow_dms off preserves the stricter drop-everything-non-contact behaviour");
-    }
-
-    #[tokio::test]
-    async fn contact_and_self_land_in_inbox_never_requests() {
-        let me = Identity::generate();
-        let contact = Identity::generate();
         let from_contact = build_dm(&contact, &me.public_key(), "hey").await.unwrap();
-        let from_self = build_dm(&me, &me.public_key(), "note to self").await.unwrap();
+        let from_stranger = build_dm(&stranger, &me.public_key(), "spam").await.unwrap();
         let contacts: HashSet<String> = [contact.npub()].into_iter().collect();
-        let classified = classify_dms(
-            &me.npub(),
+        let empty: HashSet<String> = HashSet::new();
+        let ctxv = ctx(&contacts, &empty, &empty, true);
+
+        let now = now_secs();
+        let mut cache = DmCache::default();
+        let (requests, changed) = merge_wraps_into_cache(
             &me,
-            vec![from_contact, from_self],
-            &ctx(&contacts, &HashSet::new(), &HashSet::new(), true),
+            &me.npub(),
+            vec![from_contact.clone(), from_stranger.clone()],
+            &ctxv,
+            &mut cache,
+            now,
         )
         .await;
-        assert_eq!(classified.inbox.len(), 2, "both the contact and my own npub land in the inbox");
-        assert!(classified.requests.is_empty());
+        assert!(changed, "decoding new wraps marks the cache dirty");
+        assert_eq!(cache.messages.len(), 1, "the contact's DM is cached");
+        assert_eq!(cache.messages[0].from, contact.npub());
+        assert_eq!(requests.len(), 1, "the stranger becomes a request, not a cache entry");
+        assert_eq!(requests[0].0, stranger.npub());
+        assert_eq!(cache.seen_wraps.len(), 2, "both wraps recorded in the seen ledger");
+        assert!(cache.newest_seen_outer > 0, "the cursor advanced from the outer timestamps");
+        assert!(cache.newest_seen_outer <= now, "the cursor never exceeds the present");
+
+        // Second pass with the SAME wraps: nothing is re-decoded — no duplicate cache entry, no new
+        // request, cache reports unchanged. This is the fix for #2 (the old path re-unwrapped the
+        // whole mailbox every poll).
+        let (requests2, changed2) =
+            merge_wraps_into_cache(&me, &me.npub(), vec![from_contact, from_stranger], &ctxv, &mut cache, now).await;
+        assert!(requests2.is_empty(), "already-seen wraps are never re-decoded");
+        assert!(!changed2, "an all-seen re-poll leaves the cache untouched (no needless re-seal/write)");
+        assert_eq!(cache.messages.len(), 1, "no duplicate cache entry on re-poll");
+        assert_eq!(cache.seen_wraps.len(), 2, "seen ledger unchanged");
+    }
+
+    #[tokio::test]
+    async fn future_dated_foreign_wrap_cannot_poison_the_since_cursor() {
+        // Review #2: a foreign kind-1059 with an attacker-chosen far-future outer created_at must NOT
+        // push the cursor past `now` (which would make since = cursor−48h sit in the future and starve
+        // the inbox forever). The clamp caps the advance to `now`; the garbage wrap fails unwrap anyway.
+        let me = Identity::generate();
+        let attacker = Identity::generate();
+        let now = now_secs();
+        // A wrap addressed to someone else (so it won't unwrap for `me`), stamped 10 days in the future.
+        let future = Timestamp::from(now + 10 * 24 * 60 * 60);
+        let poison = attacker
+            .sign(EventBuilder::new(Kind::GiftWrap, "junk").custom_created_at(future))
+            .unwrap();
+        let empty: HashSet<String> = HashSet::new();
+        let ctxv = ctx(&empty, &empty, &empty, true);
+        let mut cache = DmCache::default();
+        let (requests, _) = merge_wraps_into_cache(&me, &me.npub(), vec![poison], &ctxv, &mut cache, now).await;
+        assert!(requests.is_empty(), "a foreign wrap creates no request");
+        assert!(cache.newest_seen_outer <= now, "the cursor is clamped to now, not the future stamp");
+        // And a pre-existing poisoned cursor is healed downward on the next merge.
+        cache.newest_seen_outer = now + 999_999;
+        let (_, changed) = merge_wraps_into_cache(&me, &me.npub(), vec![], &ctxv, &mut cache, now).await;
+        assert!(changed, "healing the cursor marks the cache dirty (so it is persisted)");
+        assert_eq!(cache.newest_seen_outer, now, "a persisted future cursor heals down to now");
+    }
+
+    #[test]
+    fn cached_inbox_reclassifies_under_current_contacts_and_block() {
+        let own = "npub1me";
+        let mk = |id: &str, from: &str, at: &str| CachedDm {
+            wrap_id: id.into(),
+            from: from.into(),
+            to: own.into(),
+            content: "x".into(),
+            sent_at: at.into(),
+        };
+        let cache = DmCache {
+            messages: vec![
+                mk("w2", "npub1a", "2026-01-02T00:00:00Z"),
+                mk("w1", "npub1a", "2026-01-01T00:00:00Z"),
+                mk("w3", "npub1b", "2026-01-03T00:00:00Z"),
+            ],
+            ..Default::default()
+        };
+        let contacts: HashSet<String> = ["npub1a".into(), "npub1b".into()].into_iter().collect();
+        // No block: all shown, sorted oldest-first.
+        let inbox = cached_inbox(&cache, own, &contacts, &HashSet::new());
+        assert_eq!(
+            inbox.iter().map(|m| m.sent_at.as_str()).collect::<Vec<_>>(),
+            ["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z"]
+        );
+        // Block npub1a AFTER their messages were cached → they vanish from the returned inbox.
+        let blocked: HashSet<String> = ["npub1a".into()].into_iter().collect();
+        let inbox2 = cached_inbox(&cache, own, &contacts, &blocked);
+        assert_eq!(inbox2.len(), 1);
+        assert_eq!(inbox2[0].from, "npub1b");
+        // A non-contact's cached messages never surface (e.g. after removing them).
+        assert!(cached_inbox(&cache, own, &HashSet::new(), &HashSet::new()).is_empty());
     }
 
     // ── Q7 — the Request-inbox `_inner` fns (no Tauri State) ────────────────────────────────────
@@ -850,6 +1016,7 @@ mod tests {
     fn request_accept_adds_manual_contact_no_browse_key_and_drains_bucket() {
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
         let npub = "npub1stranger".to_string();
         store
             .save_dm_requests(&[DmRequestBucket {
@@ -865,7 +1032,7 @@ mod tests {
         // Seed a prior decline for this sender — accept must clear it (they're no longer declined).
         store.save_dm_declined(&[(npub.clone(), 1)]).unwrap();
 
-        let drained = dm_request_accept_inner(&store, "npub1me", npub.clone(), None).unwrap();
+        let drained = dm_request_accept_inner(&store, &me, "npub1me", npub.clone(), None).unwrap();
         assert_eq!(drained.len(), 2, "both messages are drained into the conversation");
         assert_eq!(drained[0].content, "hi");
 
@@ -879,12 +1046,20 @@ mod tests {
             "accept clears any prior decline for this sender"
         );
 
+        // devtest v0.12.4 #2 regression: the accepted history is migrated into the DM cache so it
+        // survives the next incremental poll (the wraps are already in seen_wraps and would never
+        // re-decode into the now-contact's inbox — without this the conversation flashes then vanishes).
+        let cache = store.load_dm_cache(&me).unwrap();
+        assert_eq!(cache.messages.len(), 2, "accepted messages are cached, not lost after one poll");
+        assert!(cache.messages.iter().all(|m| m.from == npub && m.to == "npub1me"));
+        assert!(cache.messages.iter().any(|m| m.wrap_id == "w1" && m.content == "hi"));
+
         // Some(petname) sets it.
         let npub2 = "npub1stranger2".to_string();
         store
             .save_dm_requests(&[DmRequestBucket { npub: npub2.clone(), first_seen: 1, last_message_at: 1, messages: vec![] }])
             .unwrap();
-        dm_request_accept_inner(&store, "npub1me", npub2.clone(), Some("Bob".into())).unwrap();
+        dm_request_accept_inner(&store, &me, "npub1me", npub2.clone(), Some("Bob".into())).unwrap();
         let contact2 = store.load_contact(&CachedPeer::pubkey_hash(&npub2)).unwrap().unwrap();
         assert_eq!(contact2.petname.as_deref(), Some("Bob"));
     }

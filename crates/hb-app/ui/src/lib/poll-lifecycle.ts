@@ -8,8 +8,16 @@
 //     is looking at.
 //   - visible window → the poll runs at its (backed-off) interval.
 
-/** Backed-off DM poll cadence while the chat page is visible — was 4 s, the dominant connect source. */
-export const DM_POLL_VISIBLE_MS = 15_000;
+/** DM poll cadence while the chat page is visible. devtest v0.12.4 #1: tightened 15 s → 3 s to hit the
+ *  ≤ 2–3 s propagation target. Safe now that each poll is a `since`-bounded INCREMENTAL fetch on the
+ *  persistent shared client + the local encrypted cache (`get_messages`, v0.12.4 #2) — most polls
+ *  return ~nothing and never re-decrypt seen wraps, so this is not the whole-mailbox pull that forced
+ *  the M12 back-off. Still visibility-gated (paused while the window is hidden). */
+export const DM_POLL_VISIBLE_MS = 3_000;
+/** How many DM ticks between topic-channel refreshes. The open channel's 24 h-ephemeral posts are
+ *  low-velocity, so refreshing it every DM tick would over-poll the relay — hold it near the old
+ *  ~15 s cadence (5 × 3 s) while DMs poll fast. */
+export const CHANNEL_REFRESH_EVERY_TICKS = 5;
 /** Layout nav-inbox poll cadence while visible. */
 export const NAV_POLL_VISIBLE_MS = 20_000;
 /** Online-count chip poll cadence while visible. */
