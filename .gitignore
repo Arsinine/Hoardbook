@@ -35,3 +35,6 @@ SEMANTICS.md
 DESIGN_SYSTEM.md
 planning/
 .graphifyignore
+
+# Claude Code local settings (contains LiteLLM key)
+.claude/settings.local.json
