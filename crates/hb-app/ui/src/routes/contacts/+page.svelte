@@ -162,8 +162,10 @@
 	}
 
 	// M17 W1: "Message" on a discovery hit-card (non-contact) → compose deep-link (chat ?compose=).
+	// M17 W2: discovery hits are keyless by design, so the Message action always carries the
+	// ask-access intent — first contact starts with the right words already in the box.
 	function messagePeer(npub: string) {
-		goto('/chat?compose=' + npub);
+		goto('/chat?compose=' + npub + '&intent=ask-access');
 	}
 
 	async function handleAddContactSave(detail: { petname: string; group: string | null }) {
@@ -403,7 +405,10 @@
 					{/if}
 				</div>
 				{#if badge.locked}
-					<div class="access-hint">{badge.hint}</div>
+					<div class="access-hint">
+						<span>{badge.hint}</span>
+						<button class="btn-default btn-xs ask-access-btn" onclick={() => goto('/chat?peer=' + peer.npub + '&intent=ask-access' + (peer.petname ? '&petname=' + encodeURIComponent(peer.petname) : ''))}>Ask for access</button>
+					</div>
 				{/if}
 			</div>
 		</div>
@@ -815,7 +820,10 @@
 		background: var(--bg-elev1);
 		box-shadow: 0 0 0 1px var(--border);
 	}
-	.access-hint { font-size: 10.5px; color: var(--fg-dim); margin-top: 2px; }
+	.access-hint { font-size: 10.5px; color: var(--fg-dim); margin-top: 2px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+	/* M17 W2: the locked contact card's "Ask for access" affordance turns the dead-end hint into a
+	   next step → the chat ask-access deep-link (no wire change, just a prefilled draft). */
+	.ask-access-btn { flex-shrink: 0; }
 
 	/* Contact-card bio (devtest #7) — render-only, clamped to 2 lines. */
 	.card-bio {

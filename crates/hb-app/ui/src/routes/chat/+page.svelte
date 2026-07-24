@@ -33,6 +33,9 @@
 	import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER, manifestRequestHint } from '$lib/request-inbox.js';
 	import { filterConversations, filterTopics, composeRecipientKind, isComposeToSelf } from '$lib/chat-filter.js';
 	import { peerPreview, peersWithHistory, relativeTime } from '$lib/chat-preview.js';
+	// M17 W2: the ask-access intent populates the composer draft from one pure copy source, without
+	// sending (no auto-send is structural — the helper only returns text, never publishes).
+	import { applyAskAccessIntent } from '$lib/ask-access.js';
 	import { sortChannelPostsAscending, resolveTopicParam, interleaveChannel } from '$lib/topics-view.js';
 	import { latestFromPeer, unreadByPeer } from '$lib/unread-view.js';
 	import type { CachedPeer, ReceivedMessage, TopicView, ChannelPost, AnnouncementView, DmRequestView, Group } from '$lib/types.js';
@@ -42,6 +45,10 @@
 	let selectedPeer: CachedPeer | null = $state(null);
 	let draft = $state('');
 	let threadEl: HTMLElement | undefined = $state();
+	// M17 W2: the ask-access intent focuses the composer (spec: an existing draft is not clobbered —
+	// "just focus the composer"); refs let the intent paths do that after the pane renders.
+	let draftEl: HTMLTextAreaElement | undefined = $state();
+	let composeBodyEl: HTMLTextAreaElement | undefined = $state();
 	let searchQuery = $state('');
 	// devtest v0.12.1 #4: a `/chat?peer=<npub>` deep-link (from double-clicking a contact) opens that
 	// conversation. Guarded so it fires once per distinct param, and re-evaluates as `$contacts` loads.
@@ -269,11 +276,20 @@
 		loadGroups();
 
 		// Discovery first-contact deep link (spec §9): `/chat?compose=<npub-or-sharecode>` prefills
-		// and opens the compose modal.
+		// and opens the compose modal. M17 W2: `&intent=ask-access` populates the modal body from
+		// `askAccessDraft` WITHOUT sending (a human always presses Send). An existing draft is never
+		// clobbered — the helper returns the untouched text when the user already typed something.
 		const composeParam = $page.url.searchParams.get('compose');
 		if (composeParam) {
 			composeTo = composeParam;
 			composeOpen = true;
+			const intent = $page.url.searchParams.get('intent');
+			if (intent) {
+				const petname = $page.url.searchParams.get('petname') ?? '';
+				const applied = applyAskAccessIntent(intent, composeBody, petname);
+				composeBody = applied.draft;
+				if (applied.focus) tick().then(() => composeBodyEl?.focus());
+			}
 		}
 
 		// Topic channel deep link (devtest #15): `/chat?topic=<topic_id>` from the Topics page's
@@ -463,6 +479,9 @@
 	// devtest v0.12.1 #4: resolve the `?peer=<npub>` deep-link through selectPeer once the contact is
 	// loaded. Re-runs when $contacts settles; a contact double-clicked in Contacts is always present,
 	// so it opens their conversation pane (empty-thread until the first message, then it joins the list).
+	// M17 W2: `&intent=ask-access` populates the composer draft from askAccessDraft WITHOUT sending.
+	// No-clobber: if the user already typed a draft, the helper returns the untouched text and we just
+	// focus the composer. The petname (carried via `&petname=`) personalises the greeting.
 	$effect(() => {
 		const npub = $page.url.searchParams.get('peer') ?? '';
 		if (!npub || npub === peerDeepLinked) return;
@@ -470,6 +489,13 @@
 		if (peer) {
 			peerDeepLinked = npub;
 			selectPeer(peer);
+			const intent = $page.url.searchParams.get('intent');
+			if (intent) {
+				const petname = $page.url.searchParams.get('petname') ?? peer.petname ?? '';
+				const applied = applyAskAccessIntent(intent, draft, petname);
+				draft = applied.draft;
+				if (applied.focus) tick().then(() => draftEl?.focus());
+			}
 		}
 	});
 	// devtest #16: derived straight from the persisted per-peer watermark, replacing the old
@@ -776,6 +802,7 @@
 							class="compose-input"
 							placeholder="Type a message…"
 							bind:value={draft}
+							bind:this={draftEl}
 							onkeydown={handleKeydown}
 							disabled={sending}
 							rows="2"
@@ -817,7 +844,7 @@
 		{:else if composeTo.trim() && composeRecipientKind(composeTo) === 'invalid'}
 			<div class="compose-hint">Doesn't look like an npub or share code — sending will reject it if it's wrong.</div>
 		{/if}
-		<textarea class="compose-modal-input" placeholder="Message…" bind:value={composeBody} rows="3"></textarea>
+		<textarea class="compose-modal-input" placeholder="Message…" bind:value={composeBody} bind:this={composeBodyEl} rows="3"></textarea>
 	</div>
 	{#snippet actions()}
 		<button class="btn-ghost" onclick={() => (composeOpen = false)}>Cancel</button>

@@ -4,6 +4,7 @@
 	import { refreshContact, importManifest, requestManifest } from '$lib/api.js';
 	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 	import { page } from '$app/stores';
+	import { goto } from '$app/navigation';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
 	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote, arrangeItems, fileTypesPresent, type BrowseViewMode, type BrowseSortKey, type BrowseSortDir } from '$lib/browse-view.js';
@@ -320,6 +321,11 @@
 						<div class="empty-label">
 							🔒 Listings locked<FeatureTooltip key="listings-locked" />
 						</div>
+						<!-- M17 W2: turn the locked dead-end into a next step → ask-access deep-link (a
+						     prefilled DM draft, no wire change). selectedPeer is a CachedPeer (has petname);
+						     guarded because the listingsLocked derivation's non-null narrowing doesn't reach
+						     this closure. -->
+						<button class="btn-default btn-sm ask-access-btn" onclick={() => { const p = selectedPeer; if (!p) return; goto('/chat?peer=' + p.npub + '&intent=ask-access' + (p.petname ? '&petname=' + encodeURIComponent(p.petname) : '')); }}>Ask for access</button>
 					</div>
 				{:else if selectedPeer.collections.length === 0}
 					<div class="empty-state">
