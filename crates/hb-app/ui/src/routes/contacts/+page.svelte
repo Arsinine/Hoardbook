@@ -161,6 +161,11 @@
 		}
 	}
 
+	// M17 W1: "Message" on a discovery hit-card (non-contact) → compose deep-link (chat ?compose=).
+	function messagePeer(npub: string) {
+		goto('/chat?compose=' + npub);
+	}
+
 	async function handleAddContactSave(detail: { petname: string; group: string | null }) {
 		if (!addContactTarget || addContactCode === null) return;
 		const npub = addContactTarget;
@@ -380,6 +385,7 @@
 					<span class="last-seen">seen {lastSeenLabel(peer)}</span>
 					<div style="flex:1"></div>
 					<a class="btn-default btn-xs" href="/browse?peer={peer.npub}">Browse</a>
+					<button class="btn-default btn-xs" onclick={() => goto('/chat?peer=' + peer.npub)}>Message</button>
 					<button
 						class="row-menu-btn"
 						aria-label="Contact actions"
@@ -493,6 +499,7 @@
 
 	<!-- M15 W5: per-row overflow menu (only one open at a time via menuOpenFor). -->
 	<OverflowMenu open={menuOpenFor === peer.npub} anchor={menuAnchor} onclose={() => (menuOpenFor = null)}>
+		<button class="menu-item" onclick={() => { goto('/chat?peer=' + peer.npub); menuOpenFor = null; }}>Message</button>
 		<button class="menu-item" onclick={() => { handleRefresh(peer.npub); menuOpenFor = null; }} disabled={refreshing === peer.npub}>
 			{refreshing === peer.npub ? 'Refreshing…' : 'Refresh'}
 		</button>
@@ -577,6 +584,7 @@
 <AddContactPanel
 	open={addContactPanelOpen}
 	onadd={openAddContact}
+	onmessage={messagePeer}
 	onclose={() => (addContactPanelOpen = false)}
 />
 <AddContactDialog
