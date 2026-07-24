@@ -20,10 +20,13 @@
 		// browse-key) for a lookup, or the bare npub for a discovery hit. Passing only the npub
 		// (as before) silently dropped the key and made every added contact keyless (devtest #3).
 		onadd?: (code: string, npub: string, displayName: string) => void;
+		// M17 W1: "Message" on a discovery hit-card → `/chat?compose=<npub>` (works for non-contacts).
+		// "Add contact" stays primary/first; Message comes after it.
+		onmessage?: (npub: string) => void;
 		onclose?: () => void;
 	}
 
-	let { open = false, onadd, onclose }: Props = $props();
+	let { open = false, onadd, onmessage, onclose }: Props = $props();
 
 	// Lookup state
 	let input = $state('');
@@ -240,6 +243,7 @@
 													<span class="hit-stranger" title="Verify the fingerprint before trusting a stranger">unverified — not in your contacts</span>
 												</div>
 												<button class="hit-follow" onclick={() => followHit(hit)}>Add contact</button>
+												<button class="hit-message" onclick={() => onmessage?.(hit.npub)}>Message</button>
 											</div>
 											{#if hit.bio}<div class="hit-bio">{hit.bio}</div>{/if}
 											{#if hit.fingerprint}
@@ -467,6 +471,12 @@
 		padding: 4px 12px; border-radius: 6px; background: var(--accent); color: var(--accent-text);
 		border: none; font-size: 11.5px; font-weight: 600; cursor: pointer; font-family: var(--font-ui); flex-shrink: 0;
 	}
+	/* M17 W1: secondary Message action — Add contact stays primary, this comes after it. */
+	.hit-message {
+		padding: 4px 12px; border-radius: 6px; background: transparent; color: var(--fg-muted);
+		border: 1px solid var(--border); font-size: 11.5px; font-weight: 600; cursor: pointer; font-family: var(--font-ui); flex-shrink: 0;
+	}
+	.hit-message:hover { background: var(--bg-elev3); color: var(--fg); }
 	.hit-bio { font-size: 11.5px; color: var(--fg-muted); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; }
 	.hit-fp { display: flex; align-items: center; gap: 6px; font-size: 10px; color: var(--fg-dim); font-family: var(--font-mono); }
 	.hit-fp-swatch { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
