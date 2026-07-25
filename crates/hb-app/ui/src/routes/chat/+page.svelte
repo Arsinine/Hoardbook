@@ -7,6 +7,9 @@
 		getMessages,
 		sendMessage,
 		pasteKey,
+		follow,
+		validateShareCode,
+		shareCodeInfo,
 		topicList,
 		topicChannel,
 		topicPost,
@@ -27,6 +30,7 @@
 	import AddContactDialog from '$lib/components/AddContactDialog.svelte';
 	import CreateGroupDialog from '$lib/components/CreateGroupDialog.svelte';
 	import Modal from '$lib/components/Modal.svelte';
+	import ShareCodeCard from '$lib/components/ShareCodeCard.svelte';
 	import { DM_POLL_VISIBLE_MS, CHANNEL_REFRESH_EVERY_TICKS } from '$lib/poll-lifecycle.js';
 	import { renderFingerprint } from '$lib/identity-display.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
@@ -36,6 +40,12 @@
 	// M17 W2: the ask-access intent populates the composer draft from one pure copy source, without
 	// sending (no auto-send is structural — the helper only returns text, never publishes).
 	import { applyAskAccessIntent } from '$lib/ask-access.js';
+	// M17 W3: received-share-code detection (consume leg). The card is produced by a LOCAL parse
+	// (regex candidate scan + validate_share_code + share_code_info, zero network) cached per message
+	// id; resolution (paste_key/follow) fires only on click. Detection helper is pure; the Tauri calls
+	// live here so the cache + zero-network-render invariant is pinned by the route test.
+	import { extractShareCodeCandidate } from '$lib/share-code-detect.js';
+	import type { ShareCodeInfo } from '$lib/api.js';
 	import { sortChannelPostsAscending, resolveTopicParam, interleaveChannel } from '$lib/topics-view.js';
 	import { latestFromPeer, unreadByPeer } from '$lib/unread-view.js';
 	import type { CachedPeer, ReceivedMessage, TopicView, ChannelPost, AnnouncementView, DmRequestView, Group } from '$lib/types.js';
@@ -72,6 +82,21 @@
 	//    `selectedRequest` (once set) drills into one sender's bucket.
 	let viewingRequests = $state(false);
 	let selectedRequest: DmRequestView | null = $state(null);
+
+	// ── M17 W3: received-share-code card (consume leg) ──────────────────────────────────────────
+	// Per-message-id cache of the detected share code (`shareCodeInfo`, parsed LOCALLY — zero network
+	// at render). A message id → { code, info }; `null` means "scanned, no valid code". Once detected,
+	// the card renders purely from cached local data; re-renders of the history are free. Resolution
+	// (paste_key/follow) fires only on the user's click — detection never touches the relay.
+	let detectedCodes: Record<string, { code: string; info: ShareCodeInfo } | null> = $state({});
+	// Session flag: a code the user has clicked Unlock on (flips the card to "Unlocked ✓"). Keyed by
+	// code so re-render after the contacts refresh still shows the unlocked state.
+	let unlockedCodes: Set<string> = $state(new Set());
+	// In-flight unlock (idempotency guard: a double-click Unlock is a no-op while one is resolving).
+	let unlockingCode: string | null = $state(null);
+	// Third-party forwarded code → AddContactDialog (petname + group; a NEW relationship, full ritual).
+	let addContactDialogOpen = $state(false);
+	let addContactTarget: { code: string; info: ShareCodeInfo } | null = $state(null);
 
 
 	// ── Compose-to-npub (spec §9 first-contact deep link from Discovery) ─────────────────────────
@@ -213,6 +238,99 @@
 		} catch (e) {
 			toast(String(e), 'error');
 		}
+	}
+
+	// ── M17 W3: received-share-code card (consume leg) ──────────────────────────────────────────
+	/** Detect a share code in a message ONCE per message id and cache the local-parse result. The
+	 *  card render path invokes only LOCAL Tauri commands (`validate_share_code` + `share_code_info`)
+	 *  — zero network. `paste_key`/`follow` never fire here; they fire in `handleUnlock` on click.
+	 *  Returns the cached info, or `null` when the message has no valid code (plain text). */
+	async function ensureDetected(messageId: string, text: string): Promise<{ code: string; info: ShareCodeInfo } | null> {
+		if (messageId in detectedCodes) return detectedCodes[messageId];
+		// The candidate regex is the same one the pure helper uses; gather tokens, validate each with
+		// the LOCAL codec check (no relay), then pick the first VALID via the pure selector. Bounded:
+		// a message has very few bech32 tokens, and validate_share_code is a cheap local checksum.
+		const tokens = text.match(/(?:hbk1|npub1)[0-9a-z]+/g) ?? [];
+		const verdicts = new Map<string, boolean>();
+		for (const t of tokens) {
+			if (verdicts.has(t)) continue;
+			try { verdicts.set(t, await validateShareCode(t)); }
+			catch { verdicts.set(t, false); }
+		}
+		const code = extractShareCodeCandidate(text, (c) => verdicts.get(c) ?? false);
+		if (!code) {
+			detectedCodes = { ...detectedCodes, [messageId]: null };
+			return null;
+		}
+		try {
+			const info = await shareCodeInfo(code);
+			const entry = { code, info };
+			detectedCodes = { ...detectedCodes, [messageId]: entry };
+			return entry;
+		} catch {
+			detectedCodes = { ...detectedCodes, [messageId]: null };
+			return null;
+		}
+	}
+
+	/** A derived view of detected codes for a message — safe for the template (returns null until the
+	 *  async detection settles, then reactivity picks up the cached value). */
+	function detectedFor(messageId: string): { code: string; info: ShareCodeInfo } | null {
+		return detectedCodes[messageId] ?? null;
+	}
+
+	/** Click on "Unlock browsing" — the ONE network surface on the card, behind an explicit click.
+	 *  `pasteKey` resolves the peer via relay, then `follow` re-adds with the full code (preserving
+	 *  the existing contact's petname/groups/local tags — the M15 bug is fixed at the Rust seam).
+	 *  Idempotent: a double-click while one is resolving is a no-op (`unlockingCode` guard). */
+	async function handleUnlock(code: string) {
+		if (unlockingCode === code || unlockedCodes.has(code)) return;
+		unlockingCode = code;
+		try {
+			// pasteKey networks (relay resolve); follow re-adds with the full code, preserving local
+			// state. The existing petname is kept because the user already named this contact.
+			await pasteKey(code);
+			await follow(code);
+			contacts.set(await getContacts());
+			unlockedCodes = new Set([...unlockedCodes, code]);
+			toast('Browsing unlocked', 'success');
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			unlockingCode = null;
+		}
+	}
+
+	/** Click on "Add contact" — a forwarded third-party code. Opens the standard AddContactDialog
+	 *  (petname + group — a NEW relationship, full ritual applies). Resolution happens on save. */
+	function handleAddContact(info: ShareCodeInfo) {
+		// The card passes only `info` (no code) — re-derive the code from the detected cache so the
+		// follow() call has the full share code. The card's info carries the npub; the code is the
+		// original candidate string. We look it up from detectedCodes by matching the embedded npub.
+		const entry = Object.values(detectedCodes).find((e) => e?.info.npub === info.npub);
+		if (!entry) return;
+		addContactTarget = entry;
+		addContactDialogOpen = true;
+	}
+
+	async function handleAddContactSave(detail: { petname: string; group: string | null }) {
+		if (!addContactTarget) return;
+		const target = addContactTarget;
+		addContactDialogOpen = false;
+		addContactTarget = null;
+		try {
+			await follow(target.code, detail.group ?? undefined, detail.petname || undefined);
+			contacts.set(await getContacts());
+			unlockedCodes = new Set([...unlockedCodes, target.code]);
+			toast('Contact added', 'success');
+		} catch (e) {
+			toast(String(e), 'error');
+		}
+	}
+
+	function handleAddContactSkip() {
+		addContactDialogOpen = false;
+		addContactTarget = null;
 	}
 
 	async function sendChannelPost() {
@@ -503,6 +621,22 @@
 	let unreadCounts = $derived(unreadByPeer($inboxMessages, $readWatermarks, myId));
 	// Show a privacy notice if the selected peer is not in contacts (may have DMs restricted).
 	let selectedIsContact = $derived(selectedPeer ? $contacts.some(c => c.npub === selectedPeer!.npub) : false);
+
+	// M17 W3: detect share codes in the currently-visible messages (conversation thread OR the open
+	// request bucket). Fires only LOCAL Tauri commands (validate + share_code_info) — zero network.
+	// A history full of codes costs zero relay round-trips; the result is cached per message id so
+	// re-renders are free. The message id key is `${from}|${sent_at}` (stable across polls).
+	$effect(() => {
+		const scan = (messages: { from: string; sent_at: string; content: string }[]) => {
+			for (const m of messages) {
+				const id = `${m.from}|${m.sent_at}`;
+				if (id in detectedCodes) continue;
+				ensureDetected(id, m.content);
+			}
+		};
+		if (selectedPeer) scan(conversation);
+		if (selectedRequest) scan(selectedRequest.messages);
+	});
 </script>
 
 {#if !$identity}
@@ -709,6 +843,23 @@
 								<div class="bubble bubble-recv">
 									<p class="bubble-text">{manifestRequestHint(msg.content) ?? msg.content}</p>
 									<span class="bubble-time">{formatTime(msg.sent_at)}</span>
+										{#if detectedFor(`${msg.from}|${msg.sent_at}`)}
+											{@const card = detectedFor(`${msg.from}|${msg.sent_at}`)!}
+											<!-- M17 W3 quarantine: the card renders for recognition, but ZERO action
+											     buttons - Accept comes first, always (hard constraint #3). The card
+											     itself shows the fingerprint so the user can recognise a known peer's
+											     code before deciding to accept. -->
+											<ShareCodeCard
+												info={card.info}
+												chatPeerNpub={null}
+												ownNpub={myId}
+												contacts={$contacts}
+												quarantined={true}
+												unlocked={false}
+												onunlock={() => {}}
+												onaddcontact={() => {}}
+											/>
+										{/if}
 								</div>
 							</div>
 						{/each}
@@ -789,6 +940,24 @@
 								<div class="bubble" class:bubble-sent={isMe} class:bubble-recv={!isMe}>
 									<p class="bubble-text">{manifestRequestHint(msg.content) ?? msg.content}</p>
 									<span class="bubble-time">{formatTime(msg.sent_at)}</span>
+									{#if detectedFor(`${msg.from}|${msg.sent_at}`)}
+										{@const card = detectedFor(`${msg.from}|${msg.sent_at}`)!}
+										<!-- M17 W3: the card is an ADDENDUM below the verbatim message text (never a
+										     replacement). Zero-network at render: the info was parsed locally (cached
+										     per message id); resolution (paste_key/add-contact) fires only on a click.
+										     A sent-bubble own-code flips to the inert "Your share code" state inside
+										     the card. -->
+										<ShareCodeCard
+											info={card.info}
+											chatPeerNpub={selectedPeer?.npub ?? null}
+											ownNpub={myId}
+											contacts={$contacts}
+											quarantined={false}
+											unlocked={unlockedCodes.has(card.code)}
+											onunlock={() => handleUnlock(card.code)}
+											onaddcontact={handleAddContact}
+										/>
+									{/if}
 								</div>
 							</div>
 						{/each}
@@ -833,6 +1002,18 @@
 	onnewGroup={() => (createGroupOpen = true)}
 	oncancel={() => { acceptDialogOpen = false; acceptTarget = null; }}
 />
+<!-- M17 W3: third-party forwarded share code → the standard add funnel (petname + group — a NEW
+     relationship, full ritual applies). Surfaces when a received code's embedded npub ≠ chat peer. -->
+<AddContactDialog
+	open={addContactDialogOpen}
+	displayName={addContactTarget?.info.npub ? shortId(addContactTarget.info.npub) : ''}
+	{groups}
+	onsave={handleAddContactSave}
+	onskip={handleAddContactSkip}
+	onnewGroup={() => (createGroupOpen = true)}
+	oncancel={handleAddContactSkip}
+/>
+
 <CreateGroupDialog open={createGroupOpen} oncreate={handleCreateGroup} oncancel={() => (createGroupOpen = false)} />
 
 <!-- Compose-to-npub (spec §9 first-contact deep link) — a + icon-btn beside refresh opens this. -->

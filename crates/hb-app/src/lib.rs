@@ -322,6 +322,7 @@ pub fn run() {
             commands::browse::import_manifest,
             commands::private::browse_private_collections,
             commands::browse::paste_key,
+            commands::browse::share_code_info,
             commands::browse::follow,
             commands::browse::get_contacts,
             commands::browse::unfollow_contact,
