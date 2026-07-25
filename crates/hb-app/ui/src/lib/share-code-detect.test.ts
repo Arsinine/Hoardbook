@@ -8,7 +8,7 @@
 //   - the card is an addendum — the helper never mutates the message text.
 
 import { describe, it, expect } from 'vitest';
-import { isShareCodeCandidate, extractShareCodeCandidate } from './share-code-detect.js';
+import { isShareCodeCandidate, extractShareCodeCandidate, shareCodeCandidates } from './share-code-detect.js';
 
 // Two golden npubs from fingerprint_vectors.json (real bech32, valid checksum) — 63 chars each.
 const GOLDEN_NPUB_A = 'npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d';
@@ -98,5 +98,39 @@ describe('extractShareCodeCandidate — first VALID candidate per message', () =
 		extractShareCodeCandidate('npub1 short fragment and ' + GOLDEN_NPUB_A, validate);
 		// Only the length-windowed candidate reached validate; the short "npub1 short…" did not.
 		expect(seen).toEqual([GOLDEN_NPUB_A]);
+	});
+});
+
+describe('shareCodeCandidates — over-long token slice recovery (two codes, no separator)', () => {
+	// Fix #7: two valid codes pasted with no separator are greedily consumed as ONE over-long token.
+	// `extractShareCodeCandidate` trims it back to a plausible-length prefix slice, but the route only
+	// pre-validates the RAW tokens — so the slice looks up absent/false and no card renders. The fix
+	// single-sources the candidate list: the route validates `shareCodeCandidates(text)` (raw tokens
+	// AND the prefix slices), so the recovery path has a verdict to consult.
+	it('includes an in-window prefix slice for an over-long token (two codes run together)', () => {
+		const twoCodes = GOLDEN_NPUB_A + GOLDEN_NPUB_B; // 63 + 63 = 126 chars (> MAX_CODE_LEN=120)
+		expect(twoCodes.length).toBeGreaterThan(120);
+		const candidates = shareCodeCandidates(twoCodes);
+		// The over-long token is not itself a candidate (> MAX); instead each plausible-length prefix
+		// slice (120..58) that passes the charset gate appears. Assert at least one in-window slice is
+		// present (the recovery path's inputs).
+		expect(candidates.length).toBeGreaterThan(0);
+		for (const c of candidates) {
+			expect(c.length).toBeGreaterThanOrEqual(58);
+			expect(c.length).toBeLessThanOrEqual(120);
+			expect(c.startsWith('npub1')).toBe(true);
+		}
+	});
+
+	it('extractShareCodeCandidate returns the first slice that validates (route pre-validates slices)', () => {
+		// Build the >120-char over-long token; the first valid-looking prefix slice (validated by the
+		// caller) is the code that renders. Before fix #7, the route validated only the raw over-long
+		// token (absent/false) and no card rendered.
+		const twoCodes = GOLDEN_NPUB_A + GOLDEN_NPUB_B;
+		// The 120-char prefix of (npubA + npubB) — accept exactly that slice as the "valid" one.
+		const validSlice = twoCodes.slice(0, 120);
+		expect(validSlice.length).toBe(120);
+		const validate = (c: string) => c === validSlice;
+		expect(extractShareCodeCandidate(twoCodes, validate)).toBe(validSlice);
 	});
 });

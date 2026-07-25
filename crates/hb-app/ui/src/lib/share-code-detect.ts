@@ -78,3 +78,23 @@ export function extractShareCodeCandidate(
 	}
 	return null;
 }
+
+/** Every candidate string `extractShareCodeCandidate` may checksum-test for `text`, in test order.
+ *  The route pre-validates exactly these (raw tokens AND the over-long-token prefix slices) so the
+ *  slice-recovery path in `extractShareCodeCandidate` actually has verdicts to consult. */
+export function shareCodeCandidates(text: string): string[] {
+	const matches = text.match(TOKEN_RE);
+	if (!matches) return [];
+	const out: string[] = [];
+	for (const raw of matches) {
+		if (raw.length <= MAX_CODE_LEN) {
+			if (isShareCodeCandidate(raw)) out.push(raw);
+			continue;
+		}
+		for (let len = MAX_CODE_LEN; len >= MIN_CODE_LEN; len--) {
+			const slice = raw.slice(0, len);
+			if (isShareCodeCandidate(slice)) out.push(slice);
+		}
+	}
+	return out;
+}

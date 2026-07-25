@@ -44,7 +44,7 @@
 	// (regex candidate scan + validate_share_code + share_code_info, zero network) cached per message
 	// id; resolution (paste_key/follow) fires only on click. Detection helper is pure; the Tauri calls
 	// live here so the cache + zero-network-render invariant is pinned by the route test.
-	import { extractShareCodeCandidate } from '$lib/share-code-detect.js';
+	import { extractShareCodeCandidate, shareCodeCandidates } from '$lib/share-code-detect.js';
 	import type { ShareCodeInfo } from '$lib/api.js';
 	import { sortChannelPostsAscending, resolveTopicParam, interleaveChannel } from '$lib/topics-view.js';
 	import { latestFromPeer, unreadByPeer } from '$lib/unread-view.js';
@@ -89,6 +89,11 @@
 	// the card renders purely from cached local data; re-renders of the history are free. Resolution
 	// (paste_key/follow) fires only on the user's click — detection never touches the relay.
 	let detectedCodes: Record<string, { code: string; info: ShareCodeInfo } | null> = $state({});
+	// In-flight detection guard (idempotency): mirrors the `fetchingNames` pattern. The cache write
+	// happens only AFTER the async validate/shareCodeInfo calls resolve; a re-render/poll in that
+	// window would otherwise start a duplicate parse. Local calls only — no network — but the guard
+	// keeps the cache + detectedCodes writes single-flight per message id.
+	const detectingIds = new Set<string>();
 	// Session flag: a code the user has clicked Unlock on (flips the card to "Unlocked ✓"). Keyed by
 	// code so re-render after the contacts refresh still shows the unlocked state.
 	let unlockedCodes: Set<string> = $state(new Set());
@@ -241,35 +246,47 @@
 	}
 
 	// ── M17 W3: received-share-code card (consume leg) ──────────────────────────────────────────
+	/** Stable per-message key for the detection cache. `ReceivedMessage` carries no unique id and
+	 *  `sent_at` is second-granular, so two same-second DMs from one sender would collide on
+	 *  from|sent_at alone — include the content to disambiguate distinct bubbles (identical content in
+	 *  the same second is genuinely the same card, so a collision there is harmless). */
+	const messageKey = (m: { from: string; sent_at: string; content: string }) =>
+		`${m.from}|${m.sent_at}|${m.content}`;
 	/** Detect a share code in a message ONCE per message id and cache the local-parse result. The
 	 *  card render path invokes only LOCAL Tauri commands (`validate_share_code` + `share_code_info`)
 	 *  — zero network. `paste_key`/`follow` never fire here; they fire in `handleUnlock` on click.
 	 *  Returns the cached info, or `null` when the message has no valid code (plain text). */
 	async function ensureDetected(messageId: string, text: string): Promise<{ code: string; info: ShareCodeInfo } | null> {
 		if (messageId in detectedCodes) return detectedCodes[messageId];
-		// The candidate regex is the same one the pure helper uses; gather tokens, validate each with
-		// the LOCAL codec check (no relay), then pick the first VALID via the pure selector. Bounded:
-		// a message has very few bech32 tokens, and validate_share_code is a cheap local checksum.
-		const tokens = text.match(/(?:hbk1|npub1)[0-9a-z]+/g) ?? [];
-		const verdicts = new Map<string, boolean>();
-		for (const t of tokens) {
-			if (verdicts.has(t)) continue;
-			try { verdicts.set(t, await validateShareCode(t)); }
-			catch { verdicts.set(t, false); }
-		}
-		const code = extractShareCodeCandidate(text, (c) => verdicts.get(c) ?? false);
-		if (!code) {
-			detectedCodes = { ...detectedCodes, [messageId]: null };
-			return null;
-		}
+		if (detectingIds.has(messageId)) return null; // an in-flight parse is already running
+		detectingIds.add(messageId);
 		try {
-			const info = await shareCodeInfo(code);
-			const entry = { code, info };
-			detectedCodes = { ...detectedCodes, [messageId]: entry };
-			return entry;
-		} catch {
-			detectedCodes = { ...detectedCodes, [messageId]: null };
-			return null;
+			// Validate EXACTLY the candidate strings `extractShareCodeCandidate` will test (raw tokens
+			// AND the over-long-token prefix slices), via the shared single-source helper — otherwise a
+			// two-codes-no-separator paste has verdicts only for the raw over-long token (absent/false)
+			// and the slice-recovery path never renders a card.
+			const verdicts = new Map<string, boolean>();
+			for (const c of shareCodeCandidates(text)) {
+				if (verdicts.has(c)) continue;
+				try { verdicts.set(c, await validateShareCode(c)); }
+				catch { verdicts.set(c, false); }
+			}
+			const code = extractShareCodeCandidate(text, (c) => verdicts.get(c) ?? false);
+			if (!code) {
+				detectedCodes = { ...detectedCodes, [messageId]: null };
+				return null;
+			}
+			try {
+				const info = await shareCodeInfo(code);
+				const entry = { code, info };
+				detectedCodes = { ...detectedCodes, [messageId]: entry };
+				return entry;
+			} catch {
+				detectedCodes = { ...detectedCodes, [messageId]: null };
+				return null;
+			}
+		} finally {
+			detectingIds.delete(messageId);
 		}
 	}
 
@@ -302,13 +319,11 @@
 	}
 
 	/** Click on "Add contact" — a forwarded third-party code. Opens the standard AddContactDialog
-	 *  (petname + group — a NEW relationship, full ritual applies). Resolution happens on save. */
-	function handleAddContact(info: ShareCodeInfo) {
-		// The card passes only `info` (no code) — re-derive the code from the detected cache so the
-		// follow() call has the full share code. The card's info carries the npub; the code is the
-		// original candidate string. We look it up from detectedCodes by matching the embedded npub.
-		const entry = Object.values(detectedCodes).find((e) => e?.info.npub === info.npub);
-		if (!entry) return;
+	 *  (petname + group — a NEW relationship, full ritual applies). Resolution happens on save.
+	 *  Takes the clicked card's detected entry DIRECTLY (the {code, info} the card rendered from) —
+	 *  a previous version re-looked it up from `detectedCodes` by npub and could bind the wrong code
+	 *  when two cards share an npub (a bare npub vs a full hbk card). */
+	function handleAddContact(entry: { code: string; info: ShareCodeInfo }) {
 		addContactTarget = entry;
 		addContactDialogOpen = true;
 	}
@@ -625,11 +640,12 @@
 	// M17 W3: detect share codes in the currently-visible messages (conversation thread OR the open
 	// request bucket). Fires only LOCAL Tauri commands (validate + share_code_info) — zero network.
 	// A history full of codes costs zero relay round-trips; the result is cached per message id so
-	// re-renders are free. The message id key is `${from}|${sent_at}` (stable across polls).
+	// re-renders are free. The message id key includes the content (see `messageKey`) so two
+	// same-second DMs from one sender get distinct cache entries.
 	$effect(() => {
 		const scan = (messages: { from: string; sent_at: string; content: string }[]) => {
 			for (const m of messages) {
-				const id = `${m.from}|${m.sent_at}`;
+				const id = messageKey(m);
 				if (id in detectedCodes) continue;
 				ensureDetected(id, m.content);
 			}
@@ -843,8 +859,8 @@
 								<div class="bubble bubble-recv">
 									<p class="bubble-text">{manifestRequestHint(msg.content) ?? msg.content}</p>
 									<span class="bubble-time">{formatTime(msg.sent_at)}</span>
-										{#if detectedFor(`${msg.from}|${msg.sent_at}`)}
-											{@const card = detectedFor(`${msg.from}|${msg.sent_at}`)!}
+										{#if detectedFor(messageKey(msg))}
+											{@const card = detectedFor(messageKey(msg))!}
 											<!-- M17 W3 quarantine: the card renders for recognition, but ZERO action
 											     buttons - Accept comes first, always (hard constraint #3). The card
 											     itself shows the fingerprint so the user can recognise a known peer's
@@ -940,8 +956,8 @@
 								<div class="bubble" class:bubble-sent={isMe} class:bubble-recv={!isMe}>
 									<p class="bubble-text">{manifestRequestHint(msg.content) ?? msg.content}</p>
 									<span class="bubble-time">{formatTime(msg.sent_at)}</span>
-									{#if detectedFor(`${msg.from}|${msg.sent_at}`)}
-										{@const card = detectedFor(`${msg.from}|${msg.sent_at}`)!}
+									{#if detectedFor(messageKey(msg))}
+										{@const card = detectedFor(messageKey(msg))!}
 										<!-- M17 W3: the card is an ADDENDUM below the verbatim message text (never a
 										     replacement). Zero-network at render: the info was parsed locally (cached
 										     per message id); resolution (paste_key/add-contact) fires only on a click.
@@ -955,7 +971,7 @@
 											quarantined={false}
 											unlocked={unlockedCodes.has(card.code)}
 											onunlock={() => handleUnlock(card.code)}
-											onaddcontact={handleAddContact}
+											onaddcontact={() => handleAddContact(card)}
 										/>
 									{/if}
 								</div>

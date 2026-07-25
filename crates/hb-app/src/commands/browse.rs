@@ -452,13 +452,16 @@ fn apply_follow_petname(peer: &mut CachedPeer, petname: Option<String>) {
 /// (typically: added keyless via `npub1`, now re-added with a full `hbk…` code from a received
 /// share-code card), `resolve_peer` may rebuild a fresh `CachedPeer` from the relay teaser and wipe
 /// the locally-bound petname, local tags, and `source`. Mirrors `refresh_contact`'s preservation
-/// semantics: the user's follow-time petname edit (already applied) wins, otherwise the existing
-/// local petname is kept; local tags and source always carry over (they are local-only, never
-/// re-derivable from a relay teaser). Pure — unit-tested without a relay.
-fn merge_local_state(peer: &mut CachedPeer, existing: &CachedPeer) {
-    // The user's follow-time petname (applied by `apply_follow_petname`) wins; otherwise keep the
-    // existing local petname rather than the freshly auto-derived one.
-    if peer.petname.is_none() {
+/// semantics: an explicit follow-time petname edit (already applied by `apply_follow_petname`) wins
+/// (signalled by `had_explicit_petname = true`); otherwise the freshly auto-derived teaser petname
+/// is discarded in favour of the existing local petname. Local tags and source always carry over
+/// (they are local-only, never re-derivable from a relay teaser). Pure — unit-tested without a relay.
+fn merge_local_state(peer: &mut CachedPeer, existing: &CachedPeer, had_explicit_petname: bool) {
+    // When the user supplied NO follow-time petname, `peer.petname` is resolve_peer's auto-derived
+    // teaser display_name — discard it in favour of the existing local petname (which may itself be
+    // None: a keyless npub-add with no nickname, where render falls back to the display_name). An
+    // explicit follow-time edit (already applied by `apply_follow_petname`) always wins.
+    if !had_explicit_petname {
         peer.petname = existing.petname.clone();
     }
     // Local tags + source are local-only — a relay teaser cannot re-derive them, so always carry over.
@@ -486,6 +489,12 @@ pub async fn follow(
     // Defense-in-depth (R2): closes the AddContactDialog Skip path for a profileless peer even if
     // the caller bypassed the paste_key/lookup gate.
     reject_profileless(&peer)?;
+    // Capture whether the caller supplied an explicit petname BEFORE `apply_follow_petname` consumes
+    // `petname`. `resolve_peer` auto-derives `peer.petname` from the teaser display_name (Some, not
+    // None), so `merge_local_state` cannot tell an auto-derived name from a user edit by inspecting
+    // `peer.petname` alone — the flag is the only reliable signal (the W3 regression: a contact
+    // locally named "Rae" was clobbered by the teaser name "Alice" on Unlock, which passes None).
+    let had_explicit_petname = petname.as_ref().is_some_and(|p| !p.is_empty());
     apply_follow_petname(&mut peer, petname);
     let npub = peer.npub.clone();
     // M17 W3: preserve local-only state (petname/local_tags/source) when re-following an existing
@@ -493,7 +502,7 @@ pub async fn follow(
     // rebuilds a fresh peer from the teaser it would wipe the locally-bound name. `merge_local_state`
     // mirrors `refresh_contact`'s preservation rule.
     if let Ok(Some(existing)) = store.load_contact(&CachedPeer::pubkey_hash(&npub)) {
-        merge_local_state(&mut peer, &existing);
+        merge_local_state(&mut peer, &existing, had_explicit_petname);
     }
     store.save_contact(&CachedPeer::pubkey_hash(&npub), &peer).map_err(cmd_err)?;
 
@@ -1321,16 +1330,19 @@ mod tests {
     // ── M17 W3: follow preserves local state on re-add (the M15 keyless-add bug) ──────────
 
     #[test]
-    fn merge_local_state_preserves_existing_petname_when_resolve_dropped_it() {
-        // The M15 bug: resolve_peer rebuilds a fresh peer from the relay teaser, wiping the locally-set
-        // petname. Re-following with a full code must keep the name the user chose.
+    fn merge_local_state_discards_auto_derived_petname_when_no_explicit_edit() {
+        // The W3 regression: `resolve_peer` sets `petname = profile.display_name` (Some, not None)
+        // whenever a teaser exists. Unlock passes no petname, so `had_explicit_petname = false` and
+        // the auto-derived teaser name ("Alice") MUST be discarded in favour of the existing local
+        // petname ("Rae"). The pre-fix code inspected `peer.petname.is_none()` (false here) and kept
+        // "Alice", clobbering the user's chosen name.
         let npub = "npub1_testpeer";
-        let mut fresh = stub_peer(npub, None); // resolve dropped the petname
-        fresh.petname = None;
-        let existing = stub_peer(npub, Some("ChosenName"));
+        let mut fresh = stub_peer(npub, None);
+        fresh.petname = Some("Alice".into()); // resolve_peer's auto-derived teaser display_name
+        let existing = stub_peer(npub, Some("Rae"));
 
-        merge_local_state(&mut fresh, &existing);
-        assert_eq!(fresh.petname.as_deref(), Some("ChosenName"), "the local petname survives");
+        merge_local_state(&mut fresh, &existing, false);
+        assert_eq!(fresh.petname.as_deref(), Some("Rae"), "the local petname survives");
     }
 
     #[test]
@@ -1342,7 +1354,7 @@ mod tests {
         fresh.petname = Some("NewEdit".into()); // user just typed this
         let existing = stub_peer(npub, Some("OldName"));
 
-        merge_local_state(&mut fresh, &existing);
+        merge_local_state(&mut fresh, &existing, true);
         assert_eq!(fresh.petname.as_deref(), Some("NewEdit"), "the follow-time edit wins");
     }
 
@@ -1355,7 +1367,7 @@ mod tests {
         existing.local_tags = vec!["trader".into(), "eu".into()];
         existing.source = crate::store::ContactSource::Topic;
 
-        merge_local_state(&mut fresh, &existing);
+        merge_local_state(&mut fresh, &existing, false);
         assert_eq!(fresh.local_tags, vec!["trader".to_string(), "eu".to_string()], "tags carry over");
         assert_eq!(fresh.source, crate::store::ContactSource::Topic, "a Topic source survives a re-follow");
     }
