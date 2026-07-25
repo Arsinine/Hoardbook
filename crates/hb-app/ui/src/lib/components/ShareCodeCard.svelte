@@ -93,7 +93,12 @@
 		     buttons — Accept comes first, always (hard constraint #3). -->
 		<div class="share-card-inert">Accept to unlock</div>
 	{:else if state === 'same'}
-		{#if unlocked || alreadyKeyed}
+		{#if !info.has_browse_key}
+			<!-- A same-peer bare npub (no browse key) has nothing to unlock — the actionable states
+			     below would otherwise offer an inert "Unlock browsing" that follows a keyless code,
+			     sets `unlocked`, and shows a false "Unlocked ✓ — Browse →". Rendered inert. -->
+			<div class="share-card-inert">Their npub</div>
+		{:else if unlocked || alreadyKeyed}
 			<div class="share-card-inert share-card-done">
 				Unlocked ✓
 				{#if unlocked}
