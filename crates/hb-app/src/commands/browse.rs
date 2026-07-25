@@ -388,6 +388,45 @@ pub async fn paste_key(
     Ok(peer)
 }
 
+/// M17 W3 — the purely-local share-code inspector. Parses a pasted `hbk…` / `npub1…` code and returns
+/// the embedded npub, its §7 word+color fingerprint (derived from the npub ALONE), and whether the
+/// code carries a browse-key — so a received-code card can render with the impersonation distinguisher
+/// **at render time with ZERO network**. This is the structural answer to the W3 design decision: the
+/// card never calls `paste_key` (which NETWORKS via `resolve_peer`) to draw itself; `paste_key` fires
+/// only on the user's click. `ShareCode::parse` is the same checksum-validating codec
+/// `validate_share_code` / `paste_key` use; `hb_core::fingerprint::fingerprint` is the single source
+/// of the fingerprint algorithm (M3 decision #7 — never re-derived in JS).
+#[derive(Debug, Clone, Serialize)]
+pub struct ShareCodeInfo {
+    pub npub: String,
+    pub fingerprint: Fingerprint,
+    /// A full `hbk…` code carries the account browse-key (unlocks listings); a bare `npub1` does not.
+    pub has_browse_key: bool,
+}
+
+/// M17 W3 — parse a share code locally and return its npub + fingerprint + browse-key flag. **No
+/// relay, no `resolve_peer`, no store read** — the card render path is zero-network by construction
+/// (the only Tauri commands it invokes at render are this and `validate_share_code`, both local).
+#[tauri::command]
+pub async fn share_code_info(code: String) -> CmdResult<ShareCodeInfo> {
+    share_code_info_inner(&code).map_err(cmd_err)
+}
+
+/// The pure core the [`share_code_info`] command wraps — extracted so the zero-network invariant +
+/// golden-fingerprint agreement are unit-testable without Tauri `State`. `ShareCode::parse` is the
+/// same checksum-validating codec `validate_share_code` / `paste_key` use; `fingerprint` is the
+/// single source of the word+color algorithm (M3 decision #7 — never re-derived in JS).
+pub(crate) fn share_code_info_inner(code: &str) -> Result<ShareCodeInfo, String> {
+    let share_code = ShareCode::parse(code).map_err(|e| format!("Invalid share code: {e}"))?;
+    let pubkey = share_code.pubkey();
+    let npub = pubkey.to_bech32().map_err(|e| e.to_string())?;
+    Ok(ShareCodeInfo {
+        npub,
+        fingerprint: hb_core::fingerprint::fingerprint(&pubkey),
+        has_browse_key: share_code.browse_key().is_some(),
+    })
+}
+
 /// Merge a freshly-resolved share code's browse-key onto a stale cached contact (devtest #4): when
 /// the teaser fetch yields nothing we fall back to the cache, but a full share code just handed us a
 /// browse-key — dropping it would leave an npub-added contact permanently unbrowseable even after the
@@ -406,6 +445,27 @@ fn apply_follow_petname(peer: &mut CachedPeer, petname: Option<String>) {
     if let Some(p) = petname.filter(|p| !p.is_empty()) {
         peer.petname = Some(p);
     }
+}
+
+/// M17 W3 — preserve local-only state when `follow` re-adds an existing contact (the M15 keyless-add
+/// bug lived in exactly this funnel). When a user follows a peer who is already in their contacts
+/// (typically: added keyless via `npub1`, now re-added with a full `hbk…` code from a received
+/// share-code card), `resolve_peer` may rebuild a fresh `CachedPeer` from the relay teaser and wipe
+/// the locally-bound petname, local tags, and `source`. Mirrors `refresh_contact`'s preservation
+/// semantics: the user's follow-time petname edit (already applied) wins, otherwise the existing
+/// local petname is kept; local tags and source always carry over (they are local-only, never
+/// re-derivable from a relay teaser). Pure — unit-tested without a relay.
+fn merge_local_state(peer: &mut CachedPeer, existing: &CachedPeer) {
+    // The user's follow-time petname (applied by `apply_follow_petname`) wins; otherwise keep the
+    // existing local petname rather than the freshly auto-derived one.
+    if peer.petname.is_none() {
+        peer.petname = existing.petname.clone();
+    }
+    // Local tags + source are local-only — a relay teaser cannot re-derive them, so always carry over.
+    peer.local_tags = existing.local_tags.clone();
+    // A fresh resolve always produces `Manual`; a pre-existing `Topic` source is local-only state
+    // (joining a Topic auto-added this peer) that a relay teaser cannot re-derive — preserve it.
+    peer.source = existing.source;
 }
 
 #[tauri::command]
@@ -428,6 +488,13 @@ pub async fn follow(
     reject_profileless(&peer)?;
     apply_follow_petname(&mut peer, petname);
     let npub = peer.npub.clone();
+    // M17 W3: preserve local-only state (petname/local_tags/source) when re-following an existing
+    // contact. `resolve_peer` already merges the browse-key onto a stale cache fallback, but when it
+    // rebuilds a fresh peer from the teaser it would wipe the locally-bound name. `merge_local_state`
+    // mirrors `refresh_contact`'s preservation rule.
+    if let Ok(Some(existing)) = store.load_contact(&CachedPeer::pubkey_hash(&npub)) {
+        merge_local_state(&mut peer, &existing);
+    }
     store.save_contact(&CachedPeer::pubkey_hash(&npub), &peer).map_err(cmd_err)?;
 
     if let Some(gname) = group_name {
@@ -1202,5 +1269,94 @@ mod tests {
 
         let loaded = store.load_contact(&hash).unwrap().unwrap();
         assert_eq!(loaded.petname.as_deref(), Some("Nickname"), "the new petname must persist");
+    }
+
+    // ── M17 W3: share_code_info — zero-network render-time parse + fingerprint ──────────
+    // The card render path MUST cost zero relay round-trips: `share_code_info_inner` is pure, touching
+    // only the local codec + the pure fingerprint derivation. The same fingerprint algorithm is pinned
+    // by `hb_core::fingerprint::tests::fingerprint_matches_golden_vectors` + the cross-language
+    // `fingerprint_vectors.json` fixture; the assertions below confirm THIS command agrees with them.
+
+    #[test]
+    fn share_code_info_full_code_has_browse_key_and_golden_fingerprint() {
+        // The npub whose fingerprint is the golden vector "jade fjord jade #dc025b" (secret …01).
+        // `share_code_info_inner` must reproduce it exactly — the card's fingerprint is single-sourced
+        // in hb-core, never re-derived in JS (M3 decision #7).
+        let id = Identity::from_secret(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        let npub = id.npub();
+        // Build a full `hbk…` code (npub + a browse-key) and confirm the parse round-trips.
+        let code = ShareCode::Full { pubkey: id.public_key(), browse_key: [7u8; 32] }
+            .encode()
+            .unwrap();
+        let info = share_code_info_inner(&code).unwrap();
+        assert_eq!(info.npub, npub, "the embedded npub is recovered");
+        assert_eq!(info.fingerprint.words, vec!["jade", "fjord", "jade"], "golden words");
+        assert_eq!(info.fingerprint.color_hex, "#dc025b", "golden color");
+        assert!(info.has_browse_key, "a full hbk code carries the browse-key");
+    }
+
+    #[test]
+    fn share_code_info_bare_npub_has_no_browse_key() {
+        let id = Identity::generate();
+        let info = share_code_info_inner(&id.npub()).unwrap();
+        assert_eq!(info.npub, id.npub());
+        assert!(!info.has_browse_key, "a bare npub carries no browse-key");
+        // The fingerprint is still derived — it is a function of the npub ALONE, so a keyless code
+        // still shows the impersonation distinguisher on the card.
+        assert_eq!(info.fingerprint.words.len(), 3);
+        assert!(info.fingerprint.color_hex.starts_with('#'));
+    }
+
+    #[test]
+    fn share_code_info_rejects_invalid_checksum() {
+        // A checksum-invalid lookalike must Err — the frontend treats Err as "no card, plain text".
+        assert!(share_code_info_inner("hbk1zzzzzzzz").is_err());
+        assert!(share_code_info_inner("not a code at all").is_err());
+        assert!(share_code_info_inner("").is_err());
+    }
+
+    // ── M17 W3: follow preserves local state on re-add (the M15 keyless-add bug) ──────────
+
+    #[test]
+    fn merge_local_state_preserves_existing_petname_when_resolve_dropped_it() {
+        // The M15 bug: resolve_peer rebuilds a fresh peer from the relay teaser, wiping the locally-set
+        // petname. Re-following with a full code must keep the name the user chose.
+        let npub = "npub1_testpeer";
+        let mut fresh = stub_peer(npub, None); // resolve dropped the petname
+        fresh.petname = None;
+        let existing = stub_peer(npub, Some("ChosenName"));
+
+        merge_local_state(&mut fresh, &existing);
+        assert_eq!(fresh.petname.as_deref(), Some("ChosenName"), "the local petname survives");
+    }
+
+    #[test]
+    fn merge_local_state_user_follow_time_petname_wins_over_existing() {
+        // The user's follow-time edit (already applied via apply_follow_petname) takes precedence;
+        // merge_local_state must NOT clobber it with the older existing petname.
+        let npub = "npub1_testpeer";
+        let mut fresh = stub_peer(npub, None);
+        fresh.petname = Some("NewEdit".into()); // user just typed this
+        let existing = stub_peer(npub, Some("OldName"));
+
+        merge_local_state(&mut fresh, &existing);
+        assert_eq!(fresh.petname.as_deref(), Some("NewEdit"), "the follow-time edit wins");
+    }
+
+    #[test]
+    fn merge_local_state_preserves_local_tags_and_topic_source() {
+        // Local tags + Topic source are local-only — a relay teaser cannot re-derive them.
+        let npub = "npub1_testpeer";
+        let mut fresh = stub_peer(npub, None);
+        let mut existing = stub_peer(npub, Some("Name"));
+        existing.local_tags = vec!["trader".into(), "eu".into()];
+        existing.source = crate::store::ContactSource::Topic;
+
+        merge_local_state(&mut fresh, &existing);
+        assert_eq!(fresh.local_tags, vec!["trader".to_string(), "eu".to_string()], "tags carry over");
+        assert_eq!(fresh.source, crate::store::ContactSource::Topic, "a Topic source survives a re-follow");
     }
 }

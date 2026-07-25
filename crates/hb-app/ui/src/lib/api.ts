@@ -41,6 +41,20 @@ export const getShareCode = () => invoke<string>('get_share_code');
 export const validateShareCode = (code: string) =>
 	invoke<boolean>('validate_share_code', { code });
 
+/** M17 W3 — the zero-network share-code inspector: parses the code LOCALLY (no relay, no
+ *  `resolve_peer`) and returns the embedded npub, its §7 fingerprint (single-sourced in hb-core), and
+ *  whether the code carries a browse-key. The card render path calls only this + `validateShareCode`
+ *  — both local — so a chat history full of codes costs ZERO relay round-trips. Resolution
+ *  (`pasteKey`/`follow`) fires only on the user's click. */
+export interface ShareCodeInfo {
+	npub: string;
+	fingerprint: { words: string[]; colorHex: string };
+	has_browse_key: boolean;
+}
+
+export const shareCodeInfo = (code: string) =>
+	invoke<ShareCodeInfo>('share_code_info', { code });
+
 /** Import an existing Nostr secret key (`nsec`/hex). The UI must show the linking-privacy warning
  *  first (there is no offline oracle to detect a public/Qurator npub). */
 export const importNsec = (nsec: string) => invoke<IdentityInfo>('import_nsec', { nsec });
