@@ -24,6 +24,7 @@
 		contactUpdateGroups,
 		advanceReadWatermark,
 		topicAnnounceMarkSeen,
+		getShareCode,
 	} from '$lib/api.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
@@ -31,6 +32,9 @@
 	import CreateGroupDialog from '$lib/components/CreateGroupDialog.svelte';
 	import Modal from '$lib/components/Modal.svelte';
 	import ShareCodeCard from '$lib/components/ShareCodeCard.svelte';
+	// M17 W4: HintMarker carries the pinned SHARE_MY_CODE_WARNING (free-text help, not a §8 anchor —
+	// the FeatureTooltip registry is drift-guarded to exactly five keys, so a sixth is not the tool).
+	import HintMarker from '$lib/components/HintMarker.svelte';
 	import { DM_POLL_VISIBLE_MS, CHANNEL_REFRESH_EVERY_TICKS } from '$lib/poll-lifecycle.js';
 	import { renderFingerprint } from '$lib/identity-display.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
@@ -40,6 +44,11 @@
 	// M17 W2: the ask-access intent populates the composer draft from one pure copy source, without
 	// sending (no auto-send is structural — the helper only returns text, never publishes).
 	import { applyAskAccessIntent } from '$lib/ask-access.js';
+	// M17 W4: "Share my code" grant leg — the composer affordance fetches get_share_code (LOCAL) and
+	// inserts the hbk1… string at the cursor via a pure splice helper. No confirm modal: insert-then-
+	// send is already two deliberate acts. The helper NEVER sends — it returns the spliced draft and
+	// the caret position to restore; the human presses Send.
+	import { SHARE_MY_CODE_WARNING, insertAtCursor } from '$lib/share-my-code.js';
 	// M17 W3: received-share-code detection (consume leg). The card is produced by a LOCAL parse
 	// (regex candidate scan + validate_share_code + share_code_info, zero network) cached per message
 	// id; resolution (paste_key/follow) fires only on click. Detection helper is pure; the Tauri calls
@@ -525,6 +534,26 @@
 		}
 	}
 
+	// M17 W4: "Share my code" grant leg. Fetches the LOCAL get_share_code (no network) and splices the
+	// hbk1… string into the draft at the cursor via the pure helper. Does NOT send — insert-then-send
+	// is already two deliberate acts, so there is no confirm modal (owner may override; we ship the
+	// no-modal default). The sent bubble then renders via W3's card logic as the own-code inert card.
+	async function handleShareMyCode() {
+		if (sending) return;
+		try {
+			const code = await getShareCode();
+			const start = draftEl?.selectionStart ?? draft.length;
+			const end = draftEl?.selectionEnd ?? draft.length;
+			const { value, cursor } = insertAtCursor(draft, code, start, end);
+			draft = value;
+			await tick();
+			draftEl?.focus();
+			draftEl?.setSelectionRange(cursor, cursor);
+		} catch (e) {
+			toast(String(e), 'error');
+		}
+	}
+
 	// Compose-to-npub modal (spec §9): send() rebuilds a CachedPeer stub if the recipient wasn't
 	// already a contact, so the composer can select straight into the new conversation.
 	async function handleComposeSend() {
@@ -993,6 +1022,21 @@
 							rows="2"
 						></textarea>
 						<div class="compose-footer">
+							<!-- M17 W4: "Share my code" grant leg — inserts the LOCAL get_share_code at the
+							     cursor; never sends (insert-then-send is two deliberate acts, so no confirm modal). -->
+							<div class="compose-footer-left">
+								<button
+									type="button"
+									class="icon-btn share-my-code-btn"
+									onclick={handleShareMyCode}
+									disabled={sending}
+									aria-label="Share my code"
+									title="Share my code"
+								>
+									{@html icons.key}
+								</button>
+								<HintMarker text={SHARE_MY_CODE_WARNING} label="Share my code" />
+							</div>
 							<button
 								class="btn-primary btn-send"
 								onclick={handleSend}
@@ -1333,6 +1377,12 @@
 	.compose-input::placeholder { color: var(--fg-dim); }
 
 	.compose-footer { display: flex; justify-content: flex-end; align-items: center; }
+
+	/* M17 W4: the "Share my code" affordance sits left of Send (Send stays the rightmost primary).
+	   margin-right:auto pushes it to the left edge under the parent's flex-end. */
+	.compose-footer-left { display: flex; align-items: center; gap: 2px; margin-right: auto; }
+	.share-my-code-btn { color: var(--fg-muted); }
+	.share-my-code-btn:hover { color: var(--fg); }
 
 	.btn-send {
 		display: inline-flex; align-items: center; justify-content: center; gap: 5px;
