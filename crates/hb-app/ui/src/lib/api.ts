@@ -234,6 +234,17 @@ export interface OnlineCount {
 	online: number | null;
 	fetched_at: string | null;
 	relay_set: string[];
+	/** M17 W5.2 — who, of the counted npubs, the poll just saw and when. Same single fetch the count
+	 *  comes from (`online === fresh.length`), so the contact list gets per-contact presence with no
+	 *  extra relay query. Empty while the count is unknown; absent on a pre-W5 cached payload. */
+	fresh?: PresenceSeen[];
+}
+
+/** One "saw this npub's presence beacon at this time" pair from the online poll. */
+export interface PresenceSeen {
+	npub: string;
+	/** RFC3339 — the beacon's `created_at`, i.e. THEIR presence, not our poll time. */
+	seen_at: string;
 }
 
 /** Best-effort, cached online count (relay-derived). Returns immediately; refreshes in the background. */

@@ -176,6 +176,7 @@ pub(crate) fn upsert_topic_contact(store: &DataStore, npub: &str) -> Result<(), 
         collections: vec![],
         online: false,
         last_fetched: chrono::Utc::now(),
+        last_presence: None, // W5.2: stamped by the online poll only
         local_tags: vec![],
         // The §7 fingerprint is derivable from the npub alone (no listing access — INV-2 holds).
         fingerprint: hb_core::identity::parse_npub(npub).ok().map(|pk| hb_core::fingerprint::fingerprint(&pk)),
@@ -755,6 +756,7 @@ mod tests {
             collections: vec![],
             online: false,
             last_fetched: chrono::Utc::now(),
+            last_presence: None,
             local_tags: vec![],
             fingerprint: None,
         };

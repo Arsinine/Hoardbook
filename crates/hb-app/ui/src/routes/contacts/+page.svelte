@@ -15,6 +15,8 @@
 	import { NOT_DRM_NOTE, isTrusted } from '$lib/private-collections-view.js';
 	import { peerAccessBadge, summarizeCollectionsSize } from '$lib/browse-view.js';
 	import { onlineChipView } from '$lib/online-chip.js';
+	// M17 W5 — presence honesty: "checked {t}" (our cache) vs "Last seen {t}" (their beacon).
+	import { checkedLabel, freshIndex, newestSeen, presenceView, type PresenceView } from '$lib/presence-view.js';
 	import { relayWhyHint } from '$lib/relay-health.js';
 	import { ONLINE_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
 	import { ALPHABET, groupByLetter, groupByGroups, onlineBucket, matchesQuery, presentSectionKeys } from '$lib/contacts-view.js';
@@ -237,20 +239,26 @@
 		return hb_id.length > 14 ? hb_id.slice(0, 8) + '…' + hb_id.slice(-4) : hb_id;
 	}
 
-	function formatLastSeen(iso: string): string {
-		const diff = Date.now() - new Date(iso).getTime();
-		const mins = Math.floor(diff / 60_000);
-		if (mins < 2) return 'just now';
-		if (mins < 60) return `${mins}m ago`;
-		const hrs = Math.floor(mins / 60);
-		if (hrs < 24) return `${hrs}h ago`;
-		return `${Math.floor(hrs / 24)}d ago`;
+	// M17 W5 — two clocks, two labels. `checkedLabel` is OUR cache age (last_fetched); `presenceView`
+	// is THEIR presence, from the newest beacon we hold: this poll's fresh set, else the persisted
+	// `last_presence`. The old single "seen {t}" line rendered last_fetched and so said "just now"
+	// about someone gone for a week (devtest 2026-07-23 item 2).
+	// (The cast restores the declared type: TS narrows a `$state(null)` to `null` at this position,
+	// since the only assignment is inside the poll closure.)
+	let freshSeen = $derived(freshIndex((onlineData as OnlineCount | null)?.fresh));
+
+	function presenceOf(peer: import('$lib/types.js').CachedPeer): PresenceView & { known: boolean } {
+		const seen = newestSeen(peer.npub, freshSeen, peer.last_presence);
+		return { ...presenceView(seen, Date.now()), known: seen !== null };
 	}
 
-	function lastSeenLabel(peer: import('$lib/types.js').CachedPeer): string {
-		const ts = peer.last_fetched;
-		if (!ts) return 'never';
-		return formatLastSeen(ts);
+	/** A real beacon outranks the stored `online` flag (which a browse stamped once and nobody ever
+	 *  clears). With no beacon at all we keep the stored flag rather than flipping a just-browsed
+	 *  contact to offline on no evidence. Applied before bucketing so the pill, the "Online now"
+	 *  bucket and the header count can never disagree. */
+	function withPresence(peer: import('$lib/types.js').CachedPeer): import('$lib/types.js').CachedPeer {
+		const p = presenceOf(peer);
+		return p.known ? { ...peer, online: p.online } : peer;
 	}
 
 	// Tag editing state
@@ -287,7 +295,7 @@
 	let view: 'name' | 'groups' = $state('name');
 
 	let visible = $derived(
-		$contacts.filter(c => matchesQuery(c, searchQuery)).filter(c => !filterTag || (c.local_tags ?? []).includes(filterTag))
+		$contacts.filter(c => matchesQuery(c, searchQuery)).filter(c => !filterTag || (c.local_tags ?? []).includes(filterTag)).map(withPresence)
 	);
 	// #1: an online peer moves OUT of its A-Z section INTO the pinned "Online now" bucket (never both),
 	//     and moves back when it goes offline. #8: the Groups view is for organizing, so it has no
@@ -384,7 +392,12 @@
 					{:else}
 						<span class="pill pill-offline">Offline</span>
 					{/if}
-					<span class="last-seen">seen {lastSeenLabel(peer)}</span>
+					<!-- W5: THEIR presence (only when offline — the pill already says "online"), then
+					     OUR cache age, labelled as the separate thing it is. -->
+					{#if !peer.online}
+						<span class="last-seen">{presenceOf(peer).lastSeen}</span>
+					{/if}
+					<span class="last-checked">{checkedLabel(peer.last_fetched, Date.now())}</span>
 					<div style="flex:1"></div>
 					<a class="btn-default btn-xs" href="/browse?peer={peer.npub}">Browse</a>
 					<button class="btn-default btn-xs" onclick={() => goto('/chat?peer=' + peer.npub)}>Message</button>
@@ -802,6 +815,8 @@
 	.mono { font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); }
 
 	.last-seen { font-size: 10.5px; color: var(--fg-dim); }
+	/* W5: our cache age sits one step quieter than their last-seen — it is about us, not them. */
+	.last-checked { font-size: 10.5px; color: var(--fg-dim); opacity: 0.72; }
 
 	.contact-sub-row {
 		display: flex; align-items: center; gap: 5px;

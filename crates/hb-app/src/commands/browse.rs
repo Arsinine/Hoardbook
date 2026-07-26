@@ -341,6 +341,9 @@ async fn resolve_peer(
         collections,
         online,
         last_fetched: Utc::now(),
+        // W5.2: presence age is stamped by the online poll, not by a browse (which proves nothing
+        // about whether they are around).
+        last_presence: None,
         local_tags: vec![],
         fingerprint,
     })
@@ -1185,6 +1188,7 @@ mod tests {
             collections: vec![],
             online: false,
             last_fetched: Utc::now(),
+            last_presence: None,
             local_tags: vec![],
             fingerprint: None,
         }

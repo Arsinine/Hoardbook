@@ -122,7 +122,12 @@ export interface CachedPeer {
 	profile?: Profile;
 	collections: Collection[];
 	online: boolean;
+	/** When WE last polled — our cache age. Rendered as "checked {t}", never "seen {t}" (M17 W5.1:
+	 *  the old label reported our poll and so claimed "just now" about a peer gone for a week). */
 	last_fetched: string;
+	/** When we last saw THEIR presence beacon (RFC3339), stamped by the 60s online poll and
+	 *  persisted so the age survives a restart. Absent ⇒ never observed → "Last seen — unknown". */
+	last_presence?: string;
 	local_tags: string[];
 	/** §7 word+color impersonation fingerprint, derived from npub by Rust (shape matches
 	 *  identity-display.ts::Fingerprint). Absent for a pre-fingerprint stored contact until refreshed. */

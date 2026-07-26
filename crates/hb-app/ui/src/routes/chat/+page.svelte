@@ -25,7 +25,10 @@
 		advanceReadWatermark,
 		topicAnnounceMarkSeen,
 		getShareCode,
+		relayStatus,
+		type RelayHealth,
 	} from '$lib/api.js';
+	import { relayWhyHint } from '$lib/relay-health.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import AddContactDialog from '$lib/components/AddContactDialog.svelte';
@@ -35,7 +38,7 @@
 	// M17 W4: HintMarker carries the pinned SHARE_MY_CODE_WARNING (free-text help, not a §8 anchor —
 	// the FeatureTooltip registry is drift-guarded to exactly five keys, so a sixth is not the tool).
 	import HintMarker from '$lib/components/HintMarker.svelte';
-	import { DM_POLL_VISIBLE_MS, CHANNEL_REFRESH_EVERY_TICKS } from '$lib/poll-lifecycle.js';
+	import { DM_POLL_VISIBLE_MS, CHANNEL_REFRESH_EVERY_TICKS, ONLINE_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
 	import { renderFingerprint } from '$lib/identity-display.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
 	import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER, manifestRequestHint } from '$lib/request-inbox.js';
@@ -66,6 +69,11 @@
 	// M17 W4 review: in-flight guard for the share-code fetch, and the binding of an inserted grant
 	// to the conversation it was raised in (the draft itself is global — see selectPeer).
 	let sharingCode = $state(false);
+	// M17 W5.3: relay reachability, read from the same store the Contacts topbar uses. Drives ONE
+	// muted line — the DM poll swallows its own errors, so this is the only place the user can learn
+	// that a quiet inbox is actually an unreachable one.
+	let relayHealth: RelayHealth[] = $state([]);
+	let relayHint = $derived(relayWhyHint(relayHealth));
 	let sharedCodeInDraft: { npub: string; code: string } | null = $state(null);
 	let threadEl: HTMLElement | undefined = $state();
 	// M17 W2: the ask-access intent focuses the composer (spec: an existing draft is not clobbered —
@@ -484,8 +492,17 @@
 			loadRequests();
 		}, DM_POLL_VISIBLE_MS);
 
+		// W5.3: relay health on the slow tick (not the 3s DM cadence — reachability changes slowly
+		// and this must not add churn against the relays).
+		const readRelayHealth = async () => {
+			try { relayHealth = await relayStatus(); } catch { /* keep last health */ }
+		};
+		readRelayHealth();
+		const healthPoll = setInterval(() => { if (!document.hidden) readRelayHealth(); }, ONLINE_POLL_VISIBLE_MS);
+
 		return () => {
 			clearInterval(fastPoll);
+			clearInterval(healthPoll);
 		};
 	});
 
@@ -727,6 +744,12 @@
 					</button>
 				</div>
 			</div>
+			<!-- W5.3: the DM poll's `catch {}` used to eat every relay failure, so a silently stale
+			     inbox looked exactly like a quiet one. One muted line, same relay-health store the
+			     Contacts topbar reads. No toast — this is chrome, not an event. -->
+			{#if relayHint}
+				<div class="relay-hint" title="Messages may be stale until a relay is reachable.">{relayHint} — inbox may be stale</div>
+			{/if}
 			<div class="convo-search">
 				<div class="search-wrap">
 					<span class="search-icon-sm">{@html icons.search}</span>
@@ -1164,6 +1187,14 @@
 	.icon-btn:disabled { opacity: 0.5; }
 
 	.convo-search { padding: 10px 12px; border-bottom: 1px solid var(--divider); }
+
+	/* W5.3 — muted chrome, not an alert: it states a fact about the relays, and gets out of the way. */
+	.relay-hint {
+		padding: 6px 12px;
+		font-size: 11px;
+		color: var(--fg-dim);
+		border-bottom: 1px solid var(--divider);
+	}
 
 	.search-wrap {
 		display: flex;

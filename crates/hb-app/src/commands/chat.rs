@@ -403,6 +403,7 @@ pub(crate) fn dm_request_accept_inner(
         collections: vec![],
         online: false,
         last_fetched: chrono::Utc::now(),
+        last_presence: None, // W5.2: stamped by the online poll only
         local_tags: vec![],
         fingerprint,
     };
