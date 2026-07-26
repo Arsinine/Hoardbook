@@ -7,7 +7,42 @@
 //   - `insertAtCursor(text, insert, start, end)` — the cursor-aware splice + caret result.
 
 import { describe, it, expect } from 'vitest';
-import { SHARE_MY_CODE_WARNING, insertAtCursor } from './share-my-code.js';
+import { SHARE_MY_CODE_WARNING, insertAtCursor, withdrawInsert } from './share-my-code.js';
+
+describe('withdrawInsert — the grant does not ride a conversation switch', () => {
+	const CODE = 'hbk1abcdefgh';
+
+	it('removes the inserted code and keeps the typed text', () => {
+		expect(withdrawInsert(`here you go ${CODE} enjoy`, CODE)).toBe('here you go enjoy');
+	});
+
+	it('empties a draft that was nothing but the code', () => {
+		expect(withdrawInsert(CODE, CODE)).toBe('');
+		expect(withdrawInsert(`  ${CODE}  `, CODE)).toBe('');
+	});
+
+	it('removes only the FIRST occurrence (one click, one grant)', () => {
+		const out = withdrawInsert(`${CODE} and ${CODE}`, CODE);
+		expect(out).toBe(`and ${CODE}`);
+	});
+
+	it('is a no-op when the code is not in the draft', () => {
+		expect(withdrawInsert('just a message', CODE)).toBe('just a message');
+		expect(withdrawInsert('', CODE)).toBe('');
+	});
+
+	it('round-trips insertAtCursor: insert then withdraw restores the original draft', () => {
+		for (const [text, pos] of [
+			['', 0],
+			['hello', 0],
+			['hello', 5],
+			['hello world', 6],
+		] as const) {
+			const { value } = insertAtCursor(text, CODE, pos, pos);
+			expect(withdrawInsert(value, CODE)).toBe(text);
+		}
+	});
+});
 
 describe('SHARE_MY_CODE_WARNING — single source of the tooltip copy', () => {
 	it('is pinned verbatim (owner may reword — this is the one place that changes)', () => {

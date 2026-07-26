@@ -31,3 +31,23 @@ export function insertAtCursor(
 	const value = text.slice(0, lo) + insert + text.slice(hi);
 	return { value, cursor: lo + insert.length };
 }
+
+/** Pure undo of one `insertAtCursor` grant. Removes the FIRST occurrence of `code` from `text` and
+ *  tidies the seam (a lone space left between two words collapses; leading/trailing whitespace on
+ *  an otherwise-empty draft goes). Returns `text` untouched when the code isn't there.
+ *
+ *  W4 review: the chat draft is ONE global `$state`, not per-conversation, so a code inserted for
+ *  Alice is still sitting in the composer after switching to Bob — and Send targets whoever is
+ *  selected now. The code grants browse access to our listings, so it must not ride a conversation
+ *  switch. The route withdraws it on switch; this helper is the pure half. */
+export function withdrawInsert(text: string, code: string): string {
+	const at = text.indexOf(code);
+	if (at === -1) return text;
+	const before = text.slice(0, at);
+	const after = text.slice(at + code.length);
+	const joined =
+		(before === '' || before.endsWith(' ')) && after.startsWith(' ')
+			? before + after.slice(1)
+			: before + after;
+	return joined.trim() === '' ? '' : joined;
+}
