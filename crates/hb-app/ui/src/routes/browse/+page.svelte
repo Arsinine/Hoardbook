@@ -686,7 +686,6 @@
 		border-radius: 999px;
 		background: var(--accent-soft);
 		color: var(--accent);
-		border: 1px solid color-mix(in oklch, var(--accent) 30%, transparent);
 	}
 
 	/* K-of-N availability note (M13 HANDOVER gap #5) */
@@ -816,7 +815,6 @@
 
 	.col-card:hover {
 		background: var(--bg-elev2);
-		border-color: var(--border-strong);
 	}
 
 	.col-card-icon {
@@ -861,7 +859,10 @@
 		border-radius: 999px;
 		background: var(--bg-elev3);
 		color: var(--fg-muted);
-		border: 1px solid var(--border);
+		/* W6: the plain chip's border is gone (fill + spacing separate it). The transparent base
+		   stays so `.tag-sorted` can still draw its accent ring — Sorted is a state signal, not
+		   chrome, and the same pattern keeps `.filter-tag-active` / `.type-chip-active` working. */
+		border: 1px solid transparent;
 	}
 
 	.tag-sorted {
@@ -941,7 +942,7 @@
 	}
 	.type-chip {
 		padding: 2px 10px; font-size: 11px; font-weight: 500;
-		border: 1px solid var(--border); border-radius: 999px;
+		border: 1px solid transparent; border-radius: 999px;
 		background: transparent; color: var(--fg-muted); cursor: pointer;
 		font-family: var(--font-ui);
 	}
@@ -964,7 +965,7 @@
 		cursor: default; min-width: 0;
 	}
 	.item-tile.file-folder { cursor: pointer; }
-	.item-tile:hover { background: var(--bg-elev2); border-color: var(--border-strong); }
+	.item-tile:hover { background: var(--bg-elev2); }
 	.item-tile-icon { color: var(--fg-muted); display: flex; transform: scale(1.4); margin: 4px 0 8px; }
 	.item-tile.file-folder .item-tile-icon { color: var(--accent); }
 	.item-tile-name {
