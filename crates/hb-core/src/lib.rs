@@ -41,7 +41,9 @@ pub use backup::{
     MIN_PASSPHRASE_LEN,
 };
 pub use binding::{build_binding, verify_binding, Binding};
-pub use count::{count_distinct_online, count_distinct_userbase, is_canary, CANARY_MARKER};
+pub use count::{
+    count_distinct_online, count_distinct_userbase, fresh_presence, is_canary, CANARY_MARKER,
+};
 pub use dm_cache::{open_dm_cache, seal_dm_cache};
 pub use fingerprint::{fingerprint, Fingerprint};
 pub use identity::Identity;

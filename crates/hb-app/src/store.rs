@@ -627,6 +627,14 @@ pub struct CachedPeer {
     pub collections: Vec<PeerCollection>,
     pub online: bool,
     pub last_fetched: chrono::DateTime<chrono::Utc>,
+    /// **When we last saw this peer's presence beacon** — real last-seen, as opposed to
+    /// `last_fetched`, which is when *we* last polled (M17 W5: the contact row used to render
+    /// `last_fetched` as "seen {t}" and so said "just now" about someone gone for a week).
+    /// Stamped by the 60s online poll from the fresh-presence map it already fetches; `None` means
+    /// "we have never observed a beacon", which the UI renders as unknown — never "never".
+    /// `#[serde(default)]` ⇒ a pre-W5 stored contact loads as `None`.
+    #[serde(default)]
+    pub last_presence: Option<chrono::DateTime<chrono::Utc>>,
     /// User-defined tags for organizing contacts locally. Never shared.
     #[serde(default)]
     pub local_tags: Vec<String>,
@@ -1225,6 +1233,7 @@ mod tests {
             collections: vec![],
             online: false,
             last_fetched: chrono::Utc::now(),
+            last_presence: None,
             local_tags: vec![],
             fingerprint: None,
         };

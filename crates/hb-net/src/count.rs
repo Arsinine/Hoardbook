@@ -11,11 +11,12 @@
 //! excludes `hb-canary` in SQL); the client uses this accurate fetch+distinct path so the in-app
 //! chip and the canary-no-pollution guarantee hold end-to-end.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use hb_core::binding::KIND_PRESENCE;
 use hb_core::event::{KIND_LISTING, KIND_TEASER};
-use hb_core::{count_distinct_online, count_distinct_userbase};
+use hb_core::{count_distinct_online, count_distinct_userbase, fresh_presence};
 use nostr::prelude::*;
 
 use crate::client::RelayClient;
@@ -60,6 +61,23 @@ pub async fn count_online(
     let now = unix_now();
     let events = client.fetch(presence_count_filter(now, window_secs), timeout).await?;
     Ok(count_distinct_online(&events, now, window_secs))
+}
+
+/// The same single query as [`count_online`], returning **who** was seen and **when** (author →
+/// newest accepted `created_at`) instead of just how many. Same filter, same admission rules, so
+/// the count is this map's length — M17 W5.2 reads the contact list's real last-seen off the poll
+/// that was already running, adding **no** relay query shape and no per-contact fan-out.
+///
+/// Also returns the `now` the freshness was judged against, so the caller stamps ages against the
+/// same reference the filter used.
+pub async fn fetch_online_presence(
+    client: &RelayClient,
+    window_secs: u64,
+    timeout: Duration,
+) -> Result<(HashMap<PublicKey, u64>, u64), NetError> {
+    let now = unix_now();
+    let events = client.fetch(presence_count_filter(now, window_secs), timeout).await?;
+    Ok((fresh_presence(&events, now, window_secs), now))
 }
 
 /// Count distinct **userbase** `npub`s: fetch the Hoardbook-kind events and tally distinct authors

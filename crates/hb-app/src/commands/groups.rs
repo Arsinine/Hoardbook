@@ -160,6 +160,7 @@ mod tests {
             collections: vec![],
             online: false,
             last_fetched: chrono::Utc::now(),
+            last_presence: None,
             local_tags: vec![],
             fingerprint: None,
         }

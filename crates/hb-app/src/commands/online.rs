@@ -38,6 +38,19 @@ pub struct OnlineCount {
     pub online: Option<usize>,
     pub fetched_at: Option<chrono::DateTime<chrono::Utc>>,
     pub relay_set: Vec<String>,
+    /// **M17 W5.2** — who, of the counted npubs, we just saw, and when. This is the *same* fetch the
+    /// count is derived from (`fresh` is the map, `online` is its length): the contact list reads
+    /// its per-contact pill and real last-seen off it, so there is **no** new relay query shape and
+    /// no per-contact fan-out. Empty on an unknown/never-succeeded count.
+    #[serde(default)]
+    pub fresh: Vec<PresenceSeen>,
+}
+
+/// One "we saw this npub's presence beacon at this time" pair from the online poll.
+#[derive(Debug, Clone, Serialize)]
+pub struct PresenceSeen {
+    pub npub: String,
+    pub seen_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Last-known count + when we last *attempted* a refresh (drives the slow-tick throttle).
@@ -62,14 +75,37 @@ fn is_stale(last_attempt: Option<Instant>, now: Instant, interval: Duration) -> 
 /// (unknown, not a misleading "0"). Pure, so RELAY3 is a differential unit test with no relay.
 fn apply_refresh(
     cache: &mut OnlineCache,
-    result: Result<usize, ()>,
+    result: Result<Vec<PresenceSeen>, ()>,
     relay_set: Vec<String>,
     now: chrono::DateTime<chrono::Utc>,
 ) {
-    if let Ok(n) = result {
-        cache.value = Some(OnlineCount { online: Some(n), fetched_at: Some(now), relay_set });
+    if let Ok(fresh) = result {
+        cache.value = Some(OnlineCount {
+            online: Some(fresh.len()),
+            fetched_at: Some(now),
+            relay_set,
+            fresh,
+        });
     }
     // On failure: keep cache.value as-is (last-known stays; never-fetched stays None).
+}
+
+/// Stamp `last_presence` on every stored contact we just saw a beacon from (W5.2). Local-only: the
+/// pairs come from the poll that already ran, so this adds no network work — it just makes the age
+/// survive a restart. A contact we did *not* see is left untouched: absence of a beacon in this
+/// window is not evidence about when they were last around, and overwriting would erase the very
+/// age we are trying to show. Best-effort — a store error is not worth failing a background poll.
+fn persist_presence(store: &DataStore, fresh: &[PresenceSeen]) {
+    for seen in fresh {
+        let hash = crate::store::CachedPeer::pubkey_hash(&seen.npub);
+        let Ok(Some(mut peer)) = store.load_contact(&hash) else { continue };
+        // Never move the stamp backwards (a late-arriving older beacon must not age them up).
+        if peer.last_presence.is_some_and(|prev| prev >= seen.seen_at) {
+            continue;
+        }
+        peer.last_presence = Some(seen.seen_at);
+        let _ = store.save_contact(&hash, &peer);
+    }
 }
 
 /// Refresh the cached count: query fresh presence off the **persistent shared** relay client and
@@ -89,15 +125,36 @@ async fn refresh_count(
     let Some(id) = snapshot else { return };
     let relay_set = net::relay_urls(store);
 
-    let result: Result<usize, ()> = match net::client(&id, store, relay).await {
-        Ok(client) => hb_net::count_online(&client, ONLINE_WINDOW_SECS, net::RELAY_TIMEOUT)
-            .await
-            .map_err(|_| ()),
+    // ONE query (the same presence filter the count always used), read two ways: the pairs feed the
+    // contact list's pill + real last-seen, and the count is their length.
+    let result: Result<Vec<PresenceSeen>, ()> = match net::client(&id, store, relay).await {
+        Ok(client) => {
+            hb_net::fetch_online_presence(&client, ONLINE_WINDOW_SECS, net::RELAY_TIMEOUT)
+                .await
+                .map(|(map, _now)| to_presence_seen(map))
+                .map_err(|_| ())
+        }
         Err(_) => Err(()),
     };
 
+    if let Ok(fresh) = &result {
+        persist_presence(store, fresh);
+    }
+
     let mut c = cache.write().await;
     apply_refresh(&mut c, result, relay_set, chrono::Utc::now());
+}
+
+/// Convert the pure tally's `PublicKey → created_at` map into the bech32-`npub` pairs the frontend
+/// keys contacts by. An un-encodable key (impossible in practice) is dropped rather than faked.
+fn to_presence_seen(map: std::collections::HashMap<nostr::PublicKey, u64>) -> Vec<PresenceSeen> {
+    map.into_iter()
+        .filter_map(|(pk, ts)| {
+            let npub = nostr::prelude::ToBech32::to_bech32(&pk).ok()?;
+            let seen_at = chrono::DateTime::from_timestamp(ts as i64, 0)?;
+            Some(PresenceSeen { npub, seen_at })
+        })
+        .collect()
 }
 
 /// Return the cached online count immediately; if the cache is stale, kick off an async refresh
@@ -136,7 +193,12 @@ pub async fn online_count(
     }
 
     // No cache yet → unknown (m4): online = None, chip shows "–" / hides.
-    Ok(cached.unwrap_or(OnlineCount { online: None, fetched_at: None, relay_set }))
+    Ok(cached.unwrap_or(OnlineCount {
+        online: None,
+        fetched_at: None,
+        relay_set,
+        fresh: vec![],
+    }))
 }
 
 #[cfg(test)]
@@ -161,7 +223,8 @@ mod tests {
     #[test]
     fn online_count_shape_supports_unknown_fallback() {
         // The m4 contract: `online` is an Option so the chip can render "–" instead of a fake "0".
-        let unknown = OnlineCount { online: None, fetched_at: None, relay_set: vec![] };
+        let unknown =
+            OnlineCount { online: None, fetched_at: None, relay_set: vec![], fresh: vec![] };
         let json = serde_json::to_string(&unknown).unwrap();
         assert!(json.contains("\"online\":null"), "unknown count serializes online=null: {json}");
     }
@@ -179,7 +242,7 @@ mod tests {
         assert!(cache.value.is_none(), "a first-ever failure stays unknown (–), not 0");
 
         // A success populates the count.
-        apply_refresh(&mut cache, Ok(5), relays.clone(), now);
+        apply_refresh(&mut cache, Ok(seen(5, now)), relays.clone(), now);
         assert_eq!(cache.value.as_ref().unwrap().online, Some(5));
 
         // A transient failure AFTER a success must NOT revert to "–" — it keeps the last count.
@@ -187,7 +250,36 @@ mod tests {
         assert_eq!(cache.value.as_ref().unwrap().online, Some(5), "no sticky –: last count survives a failed cycle");
 
         // A later success recovers/updates it.
-        apply_refresh(&mut cache, Ok(7), relays, now);
+        apply_refresh(&mut cache, Ok(seen(7, now)), relays, now);
         assert_eq!(cache.value.as_ref().unwrap().online, Some(7));
+    }
+
+    /// `n` synthetic fresh-presence pairs, all seen at `now`.
+    fn seen(n: usize, now: chrono::DateTime<chrono::Utc>) -> Vec<PresenceSeen> {
+        (0..n).map(|i| PresenceSeen { npub: format!("npub1test{i}"), seen_at: now }).collect()
+    }
+
+    #[test]
+    fn count_is_the_fresh_sets_length_and_rides_with_it() {
+        // W5.2: the pill/last-seen data and the chip's number come from ONE fetch, so they can
+        // never disagree — `online` is exactly `fresh.len()`.
+        let now = chrono::Utc::now();
+        let mut cache = OnlineCache::default();
+        apply_refresh(&mut cache, Ok(seen(3, now)), vec![], now);
+        let v = cache.value.as_ref().unwrap();
+        assert_eq!(v.online, Some(3));
+        assert_eq!(v.fresh.len(), 3, "the pairs ride along with the count");
+        assert_eq!(v.fresh[0].seen_at, now);
+    }
+
+    #[test]
+    fn a_failed_cycle_keeps_the_last_fresh_set_not_an_empty_one() {
+        // The "no sticky –" rule applies to the pairs too: one flaked poll must not blank every
+        // contact's pill to "unknown" — that would be the same lie in a new place.
+        let now = chrono::Utc::now();
+        let mut cache = OnlineCache::default();
+        apply_refresh(&mut cache, Ok(seen(2, now)), vec![], now);
+        apply_refresh(&mut cache, Err(()), vec![], now);
+        assert_eq!(cache.value.as_ref().unwrap().fresh.len(), 2, "last-known fresh set survives");
     }
 }

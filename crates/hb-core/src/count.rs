@@ -19,7 +19,7 @@
 //! event bearing it, so the canary's synthetic traffic never pollutes the online/userbase counts —
 //! the exclusion (not just the throwaway key) is what enforces "don't pollute real data."
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use nostr::prelude::*;
 
@@ -48,9 +48,21 @@ pub fn is_canary(event: &Event) -> bool {
 /// the contact-list `● Online` badge (Decision #12). Multi-relay dedup is implicit — the same
 /// author pulled from N relays collapses to one.
 pub fn count_distinct_online(events: &[Event], now: u64, window_secs: u64) -> usize {
+    fresh_presence(events, now, window_secs).len()
+}
+
+/// The same fresh-presence pass as [`count_distinct_online`], but keeping **who** and **when**:
+/// author → the newest accepted `created_at`. Identical admission rules (canary-excluded,
+/// signature-verified, stale-dropped, future-skew-capped), so the count is exactly this map's
+/// length — one tally, two readings.
+///
+/// M17 W5.2: the contact list needs a *real* last-seen. The 60s online poll already fetches these
+/// events for the aggregate chip, so returning the pairs costs **no** extra relay query and no
+/// per-contact fan-out — the caller matches its own contacts against the map.
+pub fn fresh_presence(events: &[Event], now: u64, window_secs: u64) -> HashMap<PublicKey, u64> {
     let floor = now.saturating_sub(window_secs);
     let ceiling = now.saturating_add(FUTURE_SKEW_SECS);
-    let mut seen: HashSet<PublicKey> = HashSet::new();
+    let mut seen: HashMap<PublicKey, u64> = HashMap::new();
     for ev in events {
         if is_canary(ev) {
             continue; // F-canary: synthetic presence never counts
@@ -62,9 +74,10 @@ pub fn count_distinct_online(events: &[Event], now: u64, window_secs: u64) -> us
         if verify_event(ev).is_err() {
             continue; // a forged/tampered presence cannot inflate the count
         }
-        seen.insert(ev.pubkey);
+        // Newest wins: a peer's replaceable beacon may arrive from several relays at once.
+        seen.entry(ev.pubkey).and_modify(|t| *t = (*t).max(created)).or_insert(created);
     }
-    seen.len()
+    seen
 }
 
 /// Count distinct **userbase** `npub`s from a set of Hoardbook-kind events (teaser / presence /
@@ -127,6 +140,39 @@ mod tests {
         let ids: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
         let evs: Vec<Event> = ids.iter().map(|id| presence_at(id, NOW)).collect();
         assert_eq!(count_distinct_online(&evs, NOW, WINDOW), 3);
+    }
+
+    #[test]
+    fn fresh_presence_keeps_who_and_when_and_matches_the_count() {
+        // W5.2: the map is the count's own pass, kept — same admission rules, same length. It is
+        // what gives an offline contact a real age instead of "seen just now" forever.
+        let online = Identity::generate();
+        let stale = Identity::generate();
+        let forged = Identity::generate();
+        let canary = Identity::generate();
+        let mut bad = presence_at(&forged, NOW - 30);
+        bad.content.push('x'); // breaks the signature
+        let evs = vec![
+            presence_at(&online, NOW - 30),
+            presence_at(&stale, NOW - WINDOW - 1),
+            bad,
+            canary_presence(&canary, NOW - 10),
+        ];
+        let map = fresh_presence(&evs, NOW, WINDOW);
+        assert_eq!(map.len(), 1, "only the fresh, verified, non-canary author survives");
+        assert_eq!(map.get(&online.public_key()), Some(&(NOW - 30)), "and we know WHEN");
+        assert!(!map.contains_key(&stale.public_key()));
+        assert_eq!(map.len(), count_distinct_online(&evs, NOW, WINDOW), "count == map length");
+    }
+
+    #[test]
+    fn fresh_presence_keeps_the_newest_beacon_per_author() {
+        // The same peer's replaceable beacon arriving from several relays: the newest ts wins, so
+        // the rendered age is the freshest thing we actually saw.
+        let id = Identity::generate();
+        let evs = vec![presence_at(&id, NOW - 300), presence_at(&id, NOW - 30), presence_at(&id, NOW - 120)];
+        let map = fresh_presence(&evs, NOW, WINDOW);
+        assert_eq!(map.get(&id.public_key()), Some(&(NOW - 30)));
     }
 
     #[test]
