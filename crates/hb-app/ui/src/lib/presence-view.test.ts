@@ -3,6 +3,7 @@
 
 import { describe, it, expect } from 'vitest';
 import {
+	PRESENCE_TICK_MS,
 	PRESENCE_WINDOW_MS,
 	checkedLabel,
 	formatAge,
@@ -58,6 +59,16 @@ describe('presenceView — real presence, honestly labelled', () => {
 		expect(t4h.lastSeen).toBe('Last seen 4h ago');
 		expect(t8d.lastSeen).toBe('Last seen 8d ago');
 		for (const v of [t20m, t4h, t8d]) expect(v.lastSeen).not.toContain('just now');
+	});
+
+	it('the clock tick is finer than the window, so Online flips promptly when it lapses', () => {
+		// The row re-reads the clock every PRESENCE_TICK_MS. If that were coarser than the presence
+		// window, a peer could sit "Online" well past their beacon's expiry.
+		expect(PRESENCE_TICK_MS).toBeLessThan(PRESENCE_WINDOW_MS);
+		// One tick after the window lapses, the state has already flipped — no poll required.
+		const beacon = iso(0);
+		expect(presenceView(beacon, NOW + PRESENCE_WINDOW_MS).online).toBe(true);
+		expect(presenceView(beacon, NOW + PRESENCE_WINDOW_MS + PRESENCE_TICK_MS).online).toBe(false);
 	});
 });
 

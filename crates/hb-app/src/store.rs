@@ -549,9 +549,23 @@ impl DataStore {
         read_json(&self.contact_path(npub_hash)).context("loading contact")
     }
 
+    /// Persist a contact. **`last_presence` is owned by the online poll and is never cleared here**
+    /// (W5 review): a writer that rebuilds a `CachedPeer` from a relay resolve — `refresh_contact`,
+    /// `follow`, `paste_key` — carries no presence stamp, and Contacts refreshes every contact on
+    /// mount, so without this the durable last-seen was wiped seconds after it was written and the
+    /// row fell back to "unknown" after every restart. An incoming `Some` still wins (the poll can
+    /// always move the stamp forward); only `None` defers to what is already on disk.
     pub fn save_contact(&self, npub_hash: &str, peer: &CachedPeer) -> Result<()> {
-        write_json(&self.contact_path(npub_hash), peer)
-            .context("saving contact")
+        let path = self.contact_path(npub_hash);
+        if peer.last_presence.is_none() {
+            if let Ok(Some(prev)) = read_json::<CachedPeer>(&path) {
+                if prev.last_presence.is_some() {
+                    let merged = CachedPeer { last_presence: prev.last_presence, ..peer.clone() };
+                    return write_json(&path, &merged).context("saving contact");
+                }
+            }
+        }
+        write_json(&path, peer).context("saving contact")
     }
 
     pub fn delete_contact(&self, npub_hash: &str) -> Result<()> {
@@ -898,6 +912,66 @@ mod tests {
             nsec,
             browse_key_hex: hex::encode([9u8; 32]),
         }
+    }
+
+    fn contact_fixture(npub: &str) -> CachedPeer {
+        CachedPeer {
+            npub: npub.into(),
+            source: ContactSource::Manual,
+            browse_key_hex: None,
+            petname: None,
+            profile: None,
+            collections: vec![],
+            online: false,
+            last_fetched: chrono::Utc::now(),
+            last_presence: None,
+            local_tags: vec![],
+            fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn a_resolve_rebuilt_contact_cannot_wipe_last_presence() {
+        // W5 review (HIGH): `refresh_contact` / `follow` / `paste_key` rebuild a CachedPeer from a
+        // relay resolve, which carries no presence stamp — and Contacts refreshes every contact on
+        // mount. Without the save-side guard the durable last-seen was erased seconds after the
+        // poll wrote it, and the row read "Last seen — unknown" after every restart.
+        let (_dir, store) = test_store();
+        let hash = CachedPeer::pubkey_hash("npub1a");
+        let seen = chrono::Utc::now() - chrono::Duration::hours(3);
+
+        let mut polled = contact_fixture("npub1a");
+        polled.last_presence = Some(seen);
+        store.save_contact(&hash, &polled).unwrap();
+
+        // A refresh saves a freshly resolved peer whose last_presence is None.
+        let mut resolved = contact_fixture("npub1a");
+        resolved.petname = Some("alice".into());
+        store.save_contact(&hash, &resolved).unwrap();
+
+        let loaded = store.load_contact(&hash).unwrap().unwrap();
+        assert_eq!(loaded.last_presence, Some(seen), "the presence stamp survives the rebuild");
+        assert_eq!(loaded.petname.as_deref(), Some("alice"), "and the resolve's own fields land");
+    }
+
+    #[test]
+    fn the_poll_can_still_move_the_presence_stamp_forward() {
+        // The guard defers to disk only for `None` — an incoming Some always wins, in both
+        // directions, so the poll stays the owner of the value.
+        let (_dir, store) = test_store();
+        let hash = CachedPeer::pubkey_hash("npub1b");
+        let old = chrono::Utc::now() - chrono::Duration::hours(5);
+        let new = chrono::Utc::now();
+
+        let mut first = contact_fixture("npub1b");
+        first.last_presence = Some(old);
+        store.save_contact(&hash, &first).unwrap();
+
+        let mut second = contact_fixture("npub1b");
+        second.last_presence = Some(new);
+        store.save_contact(&hash, &second).unwrap();
+
+        assert_eq!(store.load_contact(&hash).unwrap().unwrap().last_presence, Some(new));
     }
 
     // A 0-byte identity file (the on-disk symptom of a failed/partial write) must be treated

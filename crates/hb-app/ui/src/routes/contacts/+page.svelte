@@ -16,7 +16,7 @@
 	import { peerAccessBadge, summarizeCollectionsSize } from '$lib/browse-view.js';
 	import { onlineChipView } from '$lib/online-chip.js';
 	// M17 W5 — presence honesty: "checked {t}" (our cache) vs "Last seen {t}" (their beacon).
-	import { checkedLabel, freshIndex, newestSeen, presenceView, type PresenceView } from '$lib/presence-view.js';
+	import { PRESENCE_TICK_MS, checkedLabel, freshIndex, newestSeen, presenceView, type PresenceView } from '$lib/presence-view.js';
 	import { relayWhyHint } from '$lib/relay-health.js';
 	import { ONLINE_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
 	import { ALPHABET, groupByLetter, groupByGroups, onlineBucket, matchesQuery, presentSectionKeys } from '$lib/contacts-view.js';
@@ -39,7 +39,18 @@
 		// Drive the "why" hint only when the count is unknown (cheap, status-only read).
 		try { relayHealth = await relayStatus(); } catch { /* leave last health */ }
 	}
-	onDestroy(() => { if (onlinePollTimer) clearInterval(onlinePollTimer); });
+	// W5 review: the age needs its OWN reactive clock. Reading Date.now() inside a template helper
+	// makes the render depend on the 60s poll assigning `onlineData` — so a rejected poll, or a tab
+	// hidden past the window (the poll returns early while hidden), leaves a peer pinned "Online"
+	// and the age frozen. That is the bug W5 exists to kill, wearing a different hat. This tick is
+	// local-only: no relay traffic, and it keeps running while hidden so the first paint after a
+	// return is already correct.
+	let nowMs = $state(Date.now());
+	const clockTimer = setInterval(() => { nowMs = Date.now(); }, PRESENCE_TICK_MS);
+	onDestroy(() => {
+		if (onlinePollTimer) clearInterval(onlinePollTimer);
+		clearInterval(clockTimer);
+	});
 
 
 	// Groups state
@@ -249,7 +260,7 @@
 
 	function presenceOf(peer: import('$lib/types.js').CachedPeer): PresenceView & { known: boolean } {
 		const seen = newestSeen(peer.npub, freshSeen, peer.last_presence);
-		return { ...presenceView(seen, Date.now()), known: seen !== null };
+		return { ...presenceView(seen, nowMs), known: seen !== null };
 	}
 
 	/** A real beacon outranks the stored `online` flag (which a browse stamped once and nobody ever
@@ -294,8 +305,13 @@
 	let searchQuery = $state('');
 	let view: 'name' | 'groups' = $state('name');
 
+	// Presence is applied ONCE, to the whole roster, before any filtering — so the header count, the
+	// "Online now" bucket and each row's pill are all reading the same adjusted list (W5 review: the
+	// header used to count raw `$contacts.online` and could say "0 online" above an Online row).
+	let presenced = $derived($contacts.map(withPresence));
+	let onlineTotal = $derived(presenced.filter(c => c.online).length);
 	let visible = $derived(
-		$contacts.filter(c => matchesQuery(c, searchQuery)).filter(c => !filterTag || (c.local_tags ?? []).includes(filterTag)).map(withPresence)
+		presenced.filter(c => matchesQuery(c, searchQuery)).filter(c => !filterTag || (c.local_tags ?? []).includes(filterTag))
 	);
 	// #1: an online peer moves OUT of its A-Z section INTO the pinned "Online now" bucket (never both),
 	//     and moves back when it goes offline. #8: the Groups view is for organizing, so it has no
@@ -316,7 +332,7 @@
 	<div>
 		<div class="topbar-title">Contacts</div>
 		<div class="topbar-sub">
-			{$contacts.length} contact{$contacts.length !== 1 ? 's' : ''} · {$contacts.filter(c => c.online).length} online
+			{$contacts.length} contact{$contacts.length !== 1 ? 's' : ''} · {onlineTotal} online
 		</div>
 	</div>
 	{#if chip.show}
