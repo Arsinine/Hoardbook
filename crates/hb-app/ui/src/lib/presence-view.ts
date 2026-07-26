@@ -17,6 +17,11 @@
  *  A beacon inside it means "Online"; outside it, we render its age instead. */
 export const PRESENCE_WINDOW_MS = 600_000;
 
+/** How often the contact list re-reads the wall clock. The age must advance on its own — if it only
+ *  moved when the 60s relay poll assigned new data, a failed poll or a hidden tab would freeze it,
+ *  which is the original "seen just now forever" defect in a new form. Purely local: no network. */
+export const PRESENCE_TICK_MS = 30_000;
+
 export interface PresenceView {
 	/** True while the newest beacon is inside the window → the row shows the Online pill, no age. */
 	online: boolean;

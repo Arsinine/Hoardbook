@@ -23,6 +23,7 @@ use std::collections::{HashMap, HashSet};
 
 use nostr::prelude::*;
 
+use crate::binding::KIND_PRESENCE;
 use crate::identity::verify_event;
 
 /// The Hoardbook-internal `t` tag stamped on **every** canary-published event. `count_distinct_*`
@@ -64,6 +65,12 @@ pub fn fresh_presence(events: &[Event], now: u64, window_secs: u64) -> HashMap<P
     let ceiling = now.saturating_add(FUTURE_SKEW_SECS);
     let mut seen: HashMap<PublicKey, u64> = HashMap::new();
     for ev in events {
+        // A relay is not trusted to honour the filter it was sent: check the kind locally. Without
+        // this, a hostile relay answers the presence query with the author's own validly-signed
+        // teaser/listing — it passes the signature check and reads as "online" (W5 review).
+        if ev.kind.as_u16() != KIND_PRESENCE {
+            continue;
+        }
         if is_canary(ev) {
             continue; // F-canary: synthetic presence never counts
         }
@@ -74,8 +81,12 @@ pub fn fresh_presence(events: &[Event], now: u64, window_secs: u64) -> HashMap<P
         if verify_event(ev).is_err() {
             continue; // a forged/tampered presence cannot inflate the count
         }
+        // A `created_at` inside the future-skew tolerance is admitted, but never *recorded* as the
+        // future: clamping to `now` keeps a +5min stamp from rendering as age zero (and outliving a
+        // truthful one under the max below) for the skew's whole duration.
+        let stamp = created.min(now);
         // Newest wins: a peer's replaceable beacon may arrive from several relays at once.
-        seen.entry(ev.pubkey).and_modify(|t| *t = (*t).max(created)).or_insert(created);
+        seen.entry(ev.pubkey).and_modify(|t| *t = (*t).max(stamp)).or_insert(stamp);
     }
     seen
 }
@@ -163,6 +174,47 @@ mod tests {
         assert_eq!(map.get(&online.public_key()), Some(&(NOW - 30)), "and we know WHEN");
         assert!(!map.contains_key(&stale.public_key()));
         assert_eq!(map.len(), count_distinct_online(&evs, NOW, WINDOW), "count == map length");
+    }
+
+    #[test]
+    fn a_relay_cannot_answer_the_presence_query_with_another_kind() {
+        // W5 review (HIGH): the relay is not trusted to honour its own filter. Bob's validly-signed
+        // TEASER returned to a presence request must not read as "Bob is online" — it passes the
+        // signature check, so only the local kind check stops it.
+        let bob = Identity::generate();
+        let teaser = build_teaser(
+            &bob,
+            &Teaser {
+                display_name: "bob".into(),
+                bio: String::new(),
+                tags: vec![],
+                content_types: vec![],
+                picture: None,
+            },
+            true,
+        )
+        .unwrap();
+        assert!(verify_event(&teaser).is_ok(), "the substituted event is genuinely signed");
+        assert!(
+            fresh_presence(std::slice::from_ref(&teaser), NOW, WINDOW).is_empty(),
+            "wrong kind → not online"
+        );
+        assert_eq!(count_distinct_online(&[teaser], NOW, WINDOW), 0, "and it cannot inflate the chip");
+    }
+
+    #[test]
+    fn a_future_dated_beacon_within_skew_is_not_recorded_as_the_future() {
+        // Admitted (inside the ±300s tolerance) but clamped to `now`, so it renders as age ~0
+        // rather than staying "fresher than real" for the skew's whole duration — and so it cannot
+        // outrank a truthful later beacon under the newest-wins merge.
+        let id = Identity::generate();
+        let ahead = presence_at(&id, NOW + 200);
+        let map = fresh_presence(std::slice::from_ref(&ahead), NOW, WINDOW);
+        assert_eq!(map.get(&id.public_key()), Some(&NOW), "clamped to now, never above it");
+
+        let truthful = presence_at(&id, NOW - 10);
+        let both = fresh_presence(&[ahead, truthful], NOW, WINDOW);
+        assert_eq!(*both.get(&id.public_key()).unwrap(), NOW, "clamped value, not NOW + 200");
     }
 
     #[test]

@@ -45,9 +45,36 @@ describe('contacts W5 — no new relay load', () => {
 		expect(s).toMatch(/freshIndex\(\(?onlineData[^)]*\)?\?\.fresh\)/);
 		// No per-contact presence call was introduced (that would be a fan-out across the roster).
 		expect(s).not.toMatch(/presenceFor|fetchPresence|contactPresence/);
-		// Still exactly one poll interval on this page, at the slow cadence.
-		expect(s.match(/setInterval\(/g) ?? []).toHaveLength(1);
-		expect(s).toContain('ONLINE_POLL_VISIBLE_MS');
+		// Exactly one NETWORK poll on this page, at the slow cadence. (The second interval is the
+		// local clock tick — it touches no relay; asserted separately below.)
+		expect(s.match(/setInterval\(/g) ?? []).toHaveLength(2);
+		expect(s).toContain('setInterval(refreshOnline, ONLINE_POLL_VISIBLE_MS)');
+		expect(s).toContain('setInterval(() => { nowMs = Date.now(); }, PRESENCE_TICK_MS)');
+	});
+
+	it('the age has its own clock, so it cannot freeze when a poll fails', () => {
+		// Review MEDIUM: reading Date.now() in a template helper ties the age to the poll assigning
+		// onlineData — a rejected poll or a hidden tab would freeze it, which is the original defect
+		// in a new form. The row must read a reactive `nowMs`, never Date.now() directly.
+		const s = src();
+		const fn = s.slice(s.indexOf('function presenceOf'), s.indexOf('function withPresence'));
+		expect(fn).toContain('presenceView(seen, nowMs)');
+		expect(fn).not.toContain('Date.now()');
+		expect(s).toContain('let nowMs = $state(Date.now())');
+		// The tick is torn down with the page.
+		expect(s).toContain('clearInterval(clockTimer)');
+	});
+
+	it('the header count reads the presence-adjusted roster, like the rows do', () => {
+		// Review MEDIUM: the header counted raw `$contacts.online`, so it could say "0 online"
+		// directly above a row showing an Online pill.
+		const s = src();
+		expect(s).toContain('{onlineTotal} online');
+		expect(s).not.toContain('$contacts.filter(c => c.online).length');
+		// Presence is applied once, to the whole roster, upstream of both the count and the filters.
+		expect(s).toContain('let presenced = $derived($contacts.map(withPresence))');
+		expect(s).toContain('let onlineTotal = $derived(presenced.filter(c => c.online).length)');
+		expect(s).toMatch(/let visible = \$derived\(\s*presenced\./);
 	});
 
 	it('a real beacon outranks the stored online flag, but absence of one does not', () => {
