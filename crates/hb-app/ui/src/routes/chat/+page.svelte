@@ -2,7 +2,10 @@
 	import { onMount, tick } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
-	import { contacts, identity, inboxMessages, sentMessages, readWatermarks, toast, dmRequests, announceSeen } from '$lib/stores.js';
+	// M17 W7.1b: the manifest export path reuses the same save dialog as Home → ⋯ → Export (no new
+	// export logic — this is a second entry point to the shipped `export_manifest` Tauri command).
+	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
+	import { contacts, identity, inboxMessages, sentMessages, readWatermarks, toast, dmRequests, announceSeen, collections } from '$lib/stores.js';
 	import {
 		getMessages,
 		sendMessage,
@@ -27,6 +30,9 @@
 		getShareCode,
 		relayStatus,
 		type RelayHealth,
+		getCollections,
+		exportManifest,
+		getSettings,
 	} from '$lib/api.js';
 	import { relayWhyHint } from '$lib/relay-health.js';
 	import { icons, avatarHue } from '$lib/icons.js';
@@ -35,6 +41,7 @@
 	import CreateGroupDialog from '$lib/components/CreateGroupDialog.svelte';
 	import Modal from '$lib/components/Modal.svelte';
 	import ShareCodeCard from '$lib/components/ShareCodeCard.svelte';
+	import ManifestFulfilCard from '$lib/components/ManifestFulfilCard.svelte';
 	// M17 W4: HintMarker carries the pinned SHARE_MY_CODE_WARNING (free-text help, not a §8 anchor —
 	// the FeatureTooltip registry is drift-guarded to exactly five keys, so a sixth is not the tool).
 	import HintMarker from '$lib/components/HintMarker.svelte';
@@ -42,6 +49,10 @@
 	import { renderFingerprint } from '$lib/identity-display.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
 	import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER, manifestRequestHint } from '$lib/request-inbox.js';
+	// M17 W7.1b: the manifest-request fulfilment card. The capability (`export_manifest`) is fully
+	// wired on Home; this is its second entry point — surfaced where the request lands. The card's
+	// state is derived PURELY (zero network on render); the export Tauri call fires only on click.
+	import { manifestFulfilFor, MANIFEST_EXPORTED_TOAST } from '$lib/manifest-fulfil.js';
 	import { filterConversations, filterTopics, composeRecipientKind, isComposeToSelf } from '$lib/chat-filter.js';
 	import { peerPreview, peersWithHistory, relativeTime } from '$lib/chat-preview.js';
 	// M17 W2: the ask-access intent populates the composer draft from one pure copy source, without
@@ -123,6 +134,14 @@
 	// Third-party forwarded code → AddContactDialog (petname + group; a NEW relationship, full ritual).
 	let addContactDialogOpen = $state(false);
 	let addContactTarget: { code: string; info: ShareCodeInfo } | null = $state(null);
+
+	// ── M17 W7.1b: manifest-request fulfilment card ─────────────────────────────────────────────
+	// The owner's `big_relay_url` (Settings), read once on mount. When set, the fulfilment card's
+	// secondary line points the owner at the big relay ("they'll get the rest automatically"); when
+	// empty, a muted one-liner links to that Settings field instead. Honest about the last mile.
+	let bigRelayUrl = $state('');
+	// In-flight export guard (idempotency: a double-click Export is a no-op while one is resolving).
+	let exportingSlug: string | null = $state(null);
 
 
 	// ── Compose-to-npub (spec §9 first-contact deep link from Discovery) ─────────────────────────
@@ -369,6 +388,29 @@
 		addContactTarget = null;
 	}
 
+	// M17 W7.1b — the fulfil click: the exact `handleExport(slug,'manifest')` path from Home, with the
+	// honest post-export copy (Hoardbook writes the file and moves no bytes — send it yourself).
+	// No new export logic; this is the second entry point to the shipped `export_manifest` command.
+	// Idempotent: a double-click while one save dialog is resolving is a no-op (`exportingSlug` guard).
+	async function handleExportManifest(slug: string) {
+		if (exportingSlug === slug) return;
+		exportingSlug = slug;
+		try {
+			const path = await saveDialog({
+				defaultPath: `${slug}.hbmanifest`,
+				filters: [{ name: 'Hoardbook manifest', extensions: ['hbmanifest'] }],
+			});
+			if (!path) return;
+			await exportManifest(slug, path);
+			const filename = path.split(/[\\/]/).pop() ?? `${slug}.hbmanifest`;
+			toast(MANIFEST_EXPORTED_TOAST(filename), 'success');
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			exportingSlug = null;
+		}
+	}
+
 	async function sendChannelPost() {
 		if (!selectedTopic || !channelDraft.trim() || channelSending) return;
 		channelSending = true;
@@ -428,6 +470,14 @@
 	onMount(() => {
 		refreshInbox();
 		loadGroups();
+
+		// M17 W7.1b: the fulfilment card derives its state from the owner's own drafts (the request
+		// matches one of your Public collections → "Export manifest…"). Refresh once on mount so the
+		// card is honest without the owner having to visit Home. The settings read picks up the
+		// `big_relay_url` for the secondary hint (best-effort — never blocks on a relay/FS hiccup).
+		getCollections().then((cs) => collections.set(cs)).catch(() => { /* non-fatal */ });
+		getSettings().then((s) => { bigRelayUrl = s.big_relay_url ?? ''; }).catch(() => { /* non-fatal */ });
+
 
 		// Discovery first-contact deep link (spec §9): `/chat?compose=<npub-or-sharecode>` prefills
 		// and opens the compose modal. M17 W2: `&intent=ask-access` populates the modal body from
@@ -951,6 +1001,18 @@
 												onaddcontact={() => {}}
 											/>
 										{/if}
+										{#if manifestFulfilFor(msg.content, $collections, { quarantined: true })}
+											{@const mf = manifestFulfilFor(msg.content, $collections, { quarantined: true })!}
+											<!-- M17 W7.1b quarantine: the fulfilment card renders for recognition, but ZERO action
+														buttons (Accept first, always — same rule as W3's ShareCodeCard). The state is derived
+														PURELY so the owner can see what the request is about before deciding to accept. -->
+											<ManifestFulfilCard
+												state={mf.state}
+												fingerprintSeen={mf.request.fingerprintSeen}
+												hasBigRelay={bigRelayUrl !== ''}
+												onexport={() => {}}
+											/>
+										{/if}
 								</div>
 							</div>
 						{/each}
@@ -1047,6 +1109,18 @@
 											unlocked={unlockedCodes.has(card.code)}
 											onunlock={() => handleUnlock(card.code)}
 											onaddcontact={() => handleAddContact(card)}
+										/>
+									{/if}
+									{#if manifestFulfilFor(msg.content, $collections, { quarantined: false })}
+										{@const mf = manifestFulfilFor(msg.content, $collections, { quarantined: false })!}
+										<!-- M17 W7.1b: the fulfilment card is an ADDENDUM below the verbatim message
+													text (same rule as W3). Zero-network at render: state is derived PURELY from
+													(request, own drafts); the export save dialog fires only on click. -->
+										<ManifestFulfilCard
+											state={mf.state}
+											fingerprintSeen={mf.request.fingerprintSeen}
+											hasBigRelay={bigRelayUrl !== ''}
+											onexport={(slug) => handleExportManifest(slug)}
 										/>
 									{/if}
 								</div>
