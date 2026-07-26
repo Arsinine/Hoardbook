@@ -739,7 +739,7 @@
 	.trusted-chip-wrap { display: inline-flex; align-items: center; gap: 2px; }
 	.trusted-chip {
 		display: inline-flex; align-items: center; gap: 5px;
-		padding: 3px 9px; border: 1px solid var(--border); border-radius: 999px;
+		padding: 3px 9px; border: 1px solid transparent; border-radius: 999px;
 		font-size: 12px; cursor: pointer; color: var(--fg-muted);
 	}
 	.trusted-chip.is-trusted {
@@ -814,7 +814,7 @@
 		background: transparent; border: 1px solid transparent; border-radius: 6px;
 		color: var(--fg-muted); font-size: 15px; line-height: 1; cursor: pointer;
 	}
-	.row-menu-btn:hover { background: var(--bg-elev3); border-color: var(--border); color: var(--fg); }
+	.row-menu-btn:hover { background: var(--bg-elev3); color: var(--fg); }
 	.menu-item {
 		display: flex; align-items: center; width: 100%; text-align: left;
 		padding: 7px 10px; font-family: var(--font-ui); font-size: 12.5px; color: var(--fg);
@@ -868,7 +868,6 @@
 	.ct-badge {
 		font-size: 10.5px; padding: 2px 8px; border-radius: 999px;
 		background: var(--bg-elev3); color: var(--fg-muted);
-		border: 1px solid var(--border);
 	}
 	.peer-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
 	.peer-tag {
@@ -883,11 +882,11 @@
 	.tag-filter-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; padding: 0 24px; }
 	.filter-tag {
 		padding: 3px 10px; font-size: 11px; font-weight: 500;
-		border: 1px solid var(--border); border-radius: 999px;
+		border: 1px solid transparent; border-radius: 999px;
 		background: transparent; color: var(--fg-muted); cursor: pointer;
 		font-family: var(--font-ui);
 	}
-	.filter-tag:hover { border-color: var(--accent); color: var(--accent); }
+	.filter-tag:hover { color: var(--accent); }
 	.filter-tag-active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
 
 	/* Local tags on contact cards */
@@ -895,7 +894,7 @@
 	.local-tag {
 		display: inline-flex; align-items: center; gap: 3px;
 		padding: 1px 6px 1px 8px; border-radius: 4px; font-size: 11px; font-weight: 500;
-		background: var(--bg-elev2); border: 1px solid var(--border); color: var(--fg-muted);
+		background: var(--bg-elev2); color: var(--fg-muted);
 	}
 	.tag-x {
 		background: none; border: none; cursor: pointer; color: var(--fg-dim);
@@ -934,18 +933,15 @@
 	.pill-online {
 		color: var(--online);
 		background: color-mix(in oklch, var(--online) 12%, transparent);
-		border: 1px solid color-mix(in oklch, var(--online) 20%, transparent);
 	}
 	.pill-online .pill-dot { background: var(--online); }
 	.pill-offline {
 		color: var(--fg-muted);
 		background: color-mix(in oklch, var(--fg-muted) 12%, transparent);
-		border: 1px solid color-mix(in oklch, var(--fg-muted) 20%, transparent);
 	}
 	.pill-stale {
 		color: oklch(0.75 0.12 60);
 		background: oklch(0.22 0.06 60 / 0.4);
-		border: 1px solid oklch(0.50 0.10 60 / 0.3);
 	}
 
 	/* Group row on contact cards */
@@ -954,7 +950,6 @@
 		display: inline-flex; align-items: center;
 		padding: 1px 8px; border-radius: 4px; font-size: 11px; font-weight: 500;
 		background: color-mix(in oklch, var(--accent) 10%, transparent);
-		border: 1px solid color-mix(in oklch, var(--accent) 22%, transparent);
 		color: var(--accent);
 	}
 	.group-select {
