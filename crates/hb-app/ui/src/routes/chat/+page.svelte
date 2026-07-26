@@ -48,7 +48,7 @@
 	// inserts the hbk1… string at the cursor via a pure splice helper. No confirm modal: insert-then-
 	// send is already two deliberate acts. The helper NEVER sends — it returns the spliced draft and
 	// the caret position to restore; the human presses Send.
-	import { SHARE_MY_CODE_WARNING, insertAtCursor } from '$lib/share-my-code.js';
+	import { SHARE_MY_CODE_WARNING, insertAtCursor, withdrawInsert } from '$lib/share-my-code.js';
 	// M17 W3: received-share-code detection (consume leg). The card is produced by a LOCAL parse
 	// (regex candidate scan + validate_share_code + share_code_info, zero network) cached per message
 	// id; resolution (paste_key/follow) fires only on click. Detection helper is pure; the Tauri calls
@@ -63,6 +63,10 @@
 	let sending = $state(false);
 	let selectedPeer: CachedPeer | null = $state(null);
 	let draft = $state('');
+	// M17 W4 review: in-flight guard for the share-code fetch, and the binding of an inserted grant
+	// to the conversation it was raised in (the draft itself is global — see selectPeer).
+	let sharingCode = $state(false);
+	let sharedCodeInDraft: { npub: string; code: string } | null = $state(null);
 	let threadEl: HTMLElement | undefined = $state();
 	// M17 W2: the ask-access intent focuses the composer (spec: an existing draft is not clobbered —
 	// "just focus the composer"); refs let the intent paths do that after the pane renders.
@@ -500,6 +504,12 @@
 	}
 
 	async function selectPeer(peer: CachedPeer) {
+		// W4 review: a share code inserted for someone else does NOT follow the switch (the draft is
+		// global; Send targets whoever is selected now). Withdraw the grant, keep the typed text.
+		if (sharedCodeInDraft && sharedCodeInDraft.npub !== peer.npub) {
+			draft = withdrawInsert(draft, sharedCodeInDraft.code);
+			sharedCodeInDraft = null;
+		}
 		selectedPeer = peer;
 		selectedTopic = null;
 		viewingRequests = false;
@@ -523,6 +533,7 @@
 		draft = '';
 		try {
 			const sent = await sendMessage(selectedPeer.npub, content);
+			sharedCodeInDraft = null; // the grant left the composer
 			sentMessages.update((prev) => [...prev, sent]);
 			await tick();
 			scrollToBottom();
@@ -539,18 +550,30 @@
 	// is already two deliberate acts, so there is no confirm modal (owner may override; we ship the
 	// no-modal default). The sent bubble then renders via W3's card logic as the own-code inert card.
 	async function handleShareMyCode() {
-		if (sending) return;
+		if (sending || sharingCode || !selectedPeer) return;
+		// Bind the grant to the conversation it was raised in: the draft is ONE global $state, so
+		// without this the code follows a peer switch and Send hands our browse capability to
+		// whoever is selected THEN. `sharingCode` is the in-flight guard (a double-click otherwise
+		// splices two codes, and the second splice runs against a stale caret).
+		const forPeer = selectedPeer.npub;
+		sharingCode = true;
 		try {
 			const code = await getShareCode();
+			// Switched away, or a Send started mid-fetch (which rewrites the draft under us) — drop
+			// the insert rather than repopulating a composer the user just emptied.
+			if (selectedPeer?.npub !== forPeer || sending) return;
 			const start = draftEl?.selectionStart ?? draft.length;
 			const end = draftEl?.selectionEnd ?? draft.length;
 			const { value, cursor } = insertAtCursor(draft, code, start, end);
 			draft = value;
+			sharedCodeInDraft = { npub: forPeer, code };
 			await tick();
 			draftEl?.focus();
 			draftEl?.setSelectionRange(cursor, cursor);
 		} catch (e) {
 			toast(String(e), 'error');
+		} finally {
+			sharingCode = false;
 		}
 	}
 
@@ -1029,7 +1052,7 @@
 									type="button"
 									class="icon-btn share-my-code-btn"
 									onclick={handleShareMyCode}
-									disabled={sending}
+									disabled={sending || sharingCode}
 									aria-label="Share my code"
 									title="Share my code"
 								>

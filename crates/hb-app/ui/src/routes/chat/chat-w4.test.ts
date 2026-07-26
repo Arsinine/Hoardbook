@@ -84,7 +84,39 @@ describe('Chat page — M17 W4 "Share my code" composer affordance', () => {
 		const btnOpen = src.indexOf('share-my-code-btn');
 		const btnClose = src.indexOf('>', src.indexOf('<button', btnOpen - 40));
 		const btnTag = src.slice(btnOpen - 60, btnClose);
-		expect(btnTag).toMatch(/disabled=\{sending\}/);
+		// Review follow-up: `sharingCode` (the in-flight guard) joins the predicate, but `draft`
+		// still must not.
+		// The predicate is exactly `sending || sharingCode` — no `draft` term.
+		expect(btnTag).toMatch(/disabled=\{sending \|\| sharingCode\}/);
+	});
+
+	it('the grant is bound to the conversation it was raised in, and withdrawn on a peer switch', () => {
+		// Review HIGH: the chat draft is ONE global $state, so an inserted share code otherwise
+		// survives a peer switch and Send hands our browse capability to whoever is selected THEN.
+		const src = chatSrc();
+		const fnOpen = src.indexOf('async function handleShareMyCode');
+		const region = src.slice(fnOpen, src.indexOf('\n\t}', fnOpen));
+		// Captures the peer at click time and re-checks it after the await.
+		expect(region).toContain('const forPeer = selectedPeer.npub');
+		expect(region).toMatch(/selectedPeer\?\.npub !== forPeer/);
+		expect(region).toContain('sharedCodeInDraft = { npub: forPeer, code }');
+		// selectPeer withdraws a grant bound to a different peer.
+		const sel = src.indexOf('async function selectPeer');
+		const selRegion = src.slice(sel, src.indexOf('\n\t}', sel));
+		expect(selRegion).toContain('withdrawInsert(draft, sharedCodeInDraft.code)');
+		expect(selRegion).toContain('sharedCodeInDraft.npub !== peer.npub');
+	});
+
+	it('the share-code fetch is single-flight and yields to an in-flight send', () => {
+		// Review MEDIUM: a double-click otherwise splices two codes (the second against a stale
+		// caret), and a Send that lands mid-fetch otherwise gets its emptied draft repopulated.
+		const src = chatSrc();
+		const fnOpen = src.indexOf('async function handleShareMyCode');
+		const region = src.slice(fnOpen, src.indexOf('\n\t}', fnOpen));
+		expect(region).toMatch(/if \(sending \|\| sharingCode \|\| !selectedPeer\) return/);
+		expect(region).toContain('sharingCode = true');
+		expect(region).toContain('sharingCode = false');
+		expect(region).toMatch(/\|\| sending\) return/);
 	});
 
 	it('the affordance lives ONLY in the contact composer, not the channel composer', () => {
