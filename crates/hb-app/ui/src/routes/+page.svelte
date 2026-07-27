@@ -744,8 +744,8 @@
 				</div>
 
 				<div class="field">
-					<label class="field-label">Contact hint<HintMarker label="Contact hint" text="How people can reach you outside Hoardbook — a Reddit/Discord handle or an email. It is kept out of your public profile, and how your contacts re-find you if you ever lose your key." /></label>
-					<input class="hb-input hb-input-mono" type="text" placeholder="u/you on Reddit · you@example.com" bind:value={form.contact_hint} />
+					<label class="field-label">Contact hint<HintMarker label="Contact hint" text="How people can reach you outside Hoardbook — a Discord/Matrix handle or an email. It is kept out of your public profile, and how your contacts re-find you if you ever lose your key." /></label>
+					<input class="hb-input hb-input-mono" type="text" placeholder="you@example.com · @you:matrix.org" bind:value={form.contact_hint} />
 				</div>
 
 				<div class="field">
