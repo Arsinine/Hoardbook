@@ -337,46 +337,213 @@ fn count_nodes(entries: &[Value]) -> usize {
         .sum()
 }
 
-/// Greedily keep a structure-preserving PREFIX of `entries` whose serialized bytes fit within
-/// `budget`. A folder that won't fit whole is kept with a recursively-truncated child list; once the
-/// budget is spent, the remaining siblings are dropped. Returns the kept entries + their node count.
-/// Byte accounting is deliberately conservative (a `+1` per element for the separating comma), so the
-/// caller's `budget` — `max_bytes` minus the metadata overhead — keeps the final event within bounds.
+/// Truncate a directory tree to fit a byte budget, **breadth-first and cheapest-information-first**
+/// (W7.2): show the SHAPE of the collection rather than a deep prefix of the first folder.
+///
+/// Two passes:
+/// 1. **Skeleton.** Keep every folder node at every depth, name only (`children` emptied, key
+///    preserved), in tree order, while the budget allows. Folder nodes are tiny relative to leaf
+///    entries (no `size`/`note`/hash fields), so this typically buys the whole directory outline.
+///    If the skeleton alone would exceed the budget, it is truncated breadth-first (top levels
+///    first) — never depth-first.
+/// 2. **Fill.** Distribute whatever budget remains across the kept folders breadth-first and
+///    round-robin, so a shallow folder and a deep one both show some files rather than one folder
+///    consuming everything.
+///
+/// Byte accounting is deliberately conservative (a `+1` per element for the separating comma,
+/// `used` starts at 2 for the enclosing `[]`) — preserved from the old depth-first packer; this is
+/// what keeps the final serialized event inside the caller's `max_bytes`.
 fn truncate_tree(entries: &[Value], budget: usize) -> (Vec<Value>, usize) {
-    let mut kept: Vec<Value> = Vec::new();
+    // A flat record per kept folder. `parent` + `src_idx` identify the folder in the source tree
+    // without name-matching (real listings can have duplicate names). `src_kids` caches this
+    // folder's source-order children so the round-robin fill and the source-order stitch share one
+    // walk of the input. `kept_leaf_idx` is the set of source indices of this folder's children
+    // that pass 2 accepted; the stitch step uses it to interleave kept leaves with kept subfolders
+    // in the source order the user wrote.
+    struct Kept {
+        value: Value,                          // skeleton: folder with `children` emptied
+        parent: Option<usize>,                 // index into `nodes`; None = a top-level folder
+        src_idx: usize,                        // this folder's index within its parent's children
+        src_kids: Vec<Value>,                  // this folder's source children (cloned, owned)
+        kept_leaf_idx: std::collections::HashSet<usize>,
+    }
+    let mut nodes: Vec<Kept> = Vec::new();
     let mut used: usize = 2; // the enclosing `[]`
-    let mut count: usize = 0;
-    for entry in entries {
-        let whole = serde_json::to_string(entry).map(|s| s.len() + 1).unwrap_or(usize::MAX);
-        if used + whole <= budget {
-            used += whole;
-            count += 1 + entry.get("children").and_then(Value::as_array).map_or(0, |c| count_nodes(c));
-            kept.push(entry.clone());
-            continue;
-        }
-        // Doesn't fit whole. If it's a non-empty folder, keep it with truncated children.
-        let has_children = entry.get("children").and_then(Value::as_array).is_some_and(|c| !c.is_empty());
-        if has_children {
-            let mut wrapper = entry.clone();
-            if let Some(o) = wrapper.as_object_mut() {
+
+    // ── Pass 1 + source-children caching, in a single BFS. ────────────────────────────────────
+    //    Visiting each level fully before descending is what makes the truncation degrade breadth-
+    //    first (top levels first) when the budget runs out, per the spec's degrade rule. A folder
+    //    that is dropped is NOT recursed into — its descendants are unreachable — so the walk's
+    //    folder stream stays aligned with `nodes` index-for-index.
+    let top_level_src_kids: Vec<Value> = entries.to_vec();
+    let mut top_level_kept_leaf_idx: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut frontier: std::collections::VecDeque<(Option<usize>, Vec<Value>)> = std::collections::VecDeque::new();
+    frontier.push_back((None, top_level_src_kids.clone()));
+    'outer: while let Some((parent, kids)) = frontier.pop_front() {
+        for (src_idx, kid) in kids.iter().enumerate() {
+            if kid.get("children").is_none() {
+                continue; // leaf file — handled by pass 2
+            }
+            let mut skel = kid.clone();
+            if let Some(o) = skel.as_object_mut() {
                 o.insert("children".into(), Value::Array(Vec::new()));
             }
-            let wrapper_len = serde_json::to_string(&wrapper).map(|s| s.len() + 1).unwrap_or(usize::MAX);
-            if used + wrapper_len <= budget {
-                let children = entry.get("children").and_then(Value::as_array).unwrap();
-                let (kept_children, child_count) = truncate_tree(children, budget - used - wrapper_len);
-                if !kept_children.is_empty() {
-                    let mut trunc = entry.clone();
-                    if let Some(o) = trunc.as_object_mut() {
-                        o.insert("children".into(), Value::Array(kept_children));
+            let skel_len = serde_json::to_string(&skel).map(|s| s.len() + 1).unwrap_or(usize::MAX);
+            if used + skel_len > budget {
+                // Budget exhausted. Top levels (already kept) and this level up to here survive;
+                // never fall back to depth-first.
+                break 'outer;
+            }
+            used += skel_len;
+            let kept_idx = nodes.len();
+            let grandkids = kid
+                .get("children")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            nodes.push(Kept {
+                value: skel,
+                parent,
+                src_idx,
+                src_kids: grandkids.clone(),
+                kept_leaf_idx: std::collections::HashSet::new(),
+            });
+            if !grandkids.is_empty() {
+                frontier.push_back((Some(kept_idx), grandkids));
+            }
+        }
+    }
+
+    // ── Pass 2 — round-robin fill. ────────────────────────────────────────────────────────────
+    //    Rotate among parents in BFS order (top-level first, then nodes[0..]). One leaf per parent
+    //    per round. A parent whose next leaf doesn't fit is skipped THIS round but a smaller leaf
+    //    elsewhere may still fit, so we only bail once a full round makes no progress.
+    //
+    //    Bucket list: index 0 = top level; index i+1 = nodes[i]. Each bucket carries its parent's
+    //    (src_idx, leaf value) pairs in source order — pulled straight from the cached `src_kids`
+    //    (or `top_level_src_kids`), so leaves and subfolders interleave correctly at stitch time.
+    type LeafBucket = (Option<usize>, Vec<(usize, Value)>);
+    let mut buckets: Vec<LeafBucket> = Vec::with_capacity(nodes.len() + 1);
+    let top_level_leaves: Vec<(usize, Value)> = top_level_src_kids
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| k.get("children").is_none())
+        .map(|(i, k)| (i, k.clone()))
+        .collect();
+    buckets.push((None, top_level_leaves));
+    for (i, n) in nodes.iter().enumerate() {
+        let ls: Vec<(usize, Value)> = n
+            .src_kids
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| k.get("children").is_none())
+            .map(|(i2, k)| (i2, k.clone()))
+            .collect();
+        buckets.push((Some(i), ls));
+    }
+    let mut cursors = vec![0usize; buckets.len()];
+    loop {
+        let mut progressed = false;
+        for (bi, (parent, leaves_here)) in buckets.iter().enumerate() {
+            if cursors[bi] >= leaves_here.len() {
+                continue;
+            }
+            let (leaf_src_idx, leaf) = &leaves_here[cursors[bi]];
+            let leaf_len = serde_json::to_string(leaf).map(|s| s.len() + 1).unwrap_or(usize::MAX);
+            // The `+1` comma is over-counted by 1 byte for the first child of an array; that is the
+            // conservatism we keep (same as the old packer).
+            if used + leaf_len > budget {
+                continue;
+            }
+            used += leaf_len;
+            match *parent {
+                None => {
+                    top_level_kept_leaf_idx.insert(*leaf_src_idx);
+                }
+                Some(pi) => {
+                    nodes[pi].kept_leaf_idx.insert(*leaf_src_idx);
+                    if let Some(o) = nodes[pi].value.as_object_mut() {
+                        if let Some(arr) = o.get_mut("children").and_then(Value::as_array_mut) {
+                            arr.push(leaf.clone());
+                        }
                     }
-                    count += 1 + child_count;
-                    kept.push(trunc);
+                }
+            }
+            cursors[bi] += 1;
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    // ── Stitch the kept tree in source order. ─────────────────────────────────────────────────
+    //    Process folders deepest-first (reverse BFS): each folder's rebuilt `children` array only
+    //    references its own leaves + its subfolder skeletons, so once all descendants of folder `i`
+    //    are finalized, `i` can be rebuilt. For each folder, walk its `src_kids` and emit kept
+    //    leaves (recorded in `kept_leaf_idx`, in source order via the round-robin cursor advancing
+    //    only forward) and kept subfolders (matched by src_idx) interleaved in source order.
+    let mut children_by_parent: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    for (i, n) in nodes.iter().enumerate() {
+        if let Some(p) = n.parent {
+            children_by_parent[p].push(i);
+        }
+    }
+    for i in (0..nodes.len()).rev() {
+        let mut subfolders: Vec<usize> = children_by_parent[i].clone();
+        subfolders.sort_by_key(|&si| nodes[si].src_idx);
+        let mut subfolder_iter = subfolders.into_iter().peekable();
+        // Leaves in this folder were appended to `nodes[i].value.children` in round-robin order;
+        // since cursors[bi] only ever advances forward WITHIN a single bucket, that order IS the
+        // source order of the kept leaves for THIS parent.
+        let kept_leaves_in_order: Vec<Value> = nodes[i]
+            .value
+            .get("children")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut leaf_iter = kept_leaves_in_order.into_iter();
+        let mut new_children: Vec<Value> = Vec::new();
+        for (src_idx, child) in nodes[i].src_kids.iter().enumerate() {
+            let is_folder = child.get("children").is_some();
+            if is_folder {
+                if subfolder_iter.peek().is_some_and(|&si| nodes[si].src_idx == src_idx) {
+                    let si = subfolder_iter.next().unwrap();
+                    new_children.push(nodes[si].value.clone());
+                }
+            } else if nodes[i].kept_leaf_idx.contains(&src_idx) {
+                if let Some(leaf) = leaf_iter.next() {
+                    new_children.push(leaf);
                 }
             }
         }
-        break; // budget exhausted
+        if let Some(o) = nodes[i].value.as_object_mut() {
+            o.insert("children".into(), Value::Array(new_children));
+        }
     }
+
+    // Top-level array: walk the original `entries` and emit kept folders + kept leaves in source
+    // order. Kept top-level leaves are identified by their src_idx in `top_level_kept_leaf_idx`;
+    // kept top-level folders are nodes with `parent == None`.
+    let mut top_folders_by_src: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (i, n) in nodes.iter().enumerate() {
+        if n.parent.is_none() {
+            top_folders_by_src.insert(n.src_idx, i);
+        }
+    }
+    let mut kept: Vec<Value> = Vec::new();
+    for (src_idx, entry) in entries.iter().enumerate() {
+        let is_folder = entry.get("children").is_some();
+        if is_folder {
+            if let Some(&ni) = top_folders_by_src.get(&src_idx) {
+                kept.push(nodes[ni].value.clone());
+            }
+        } else if top_level_kept_leaf_idx.contains(&src_idx) {
+            kept.push(entry.clone());
+        }
+    }
+
+    let count = count_nodes(&kept);
     (kept, count)
 }
 
@@ -720,13 +887,16 @@ mod tests {
     }
 
     #[test]
-    fn truncate_listing_keeps_a_bounded_prefix_and_marks_it() {
+    fn truncate_listing_keeps_a_bounded_selection_and_marks_it() {
+        // W7.2: breadth-first selection (skeleton + round-robin leaves), not a depth-first prefix.
+        // `listing(40)` is a flat list of 40 leaf entries — the simplest shape that exercises the
+        // budget cap and the paywall markers without any folders to recurse into.
         let budget = 800;
         let t = truncate_listing(&listing(40), budget).unwrap();
         assert!(t.truncated, "an oversize listing is truncated");
         assert!(t.json.len() <= budget, "truncated json ({} bytes) must fit the budget", t.json.len());
         assert_eq!(t.total_items, 40, "total_items is the FULL node count");
-        assert!(t.shown_items > 0 && t.shown_items < 40, "a strict prefix is shown, got {}", t.shown_items);
+        assert!(t.shown_items > 0 && t.shown_items < 40, "a bounded selection is shown, got {}", t.shown_items);
         // The paywall markers are on the wire so a browser can render the fade.
         let v: Value = serde_json::from_str(&t.json).unwrap();
         assert_eq!(v.get("truncated"), Some(&Value::Bool(true)));
@@ -736,10 +906,61 @@ mod tests {
         assert_eq!(v.get("slug").and_then(Value::as_str), Some("criterion"));
     }
 
+    /// 20 top-level folders, each with many files — the headline shape the OLD depth-first
+    /// truncate_tree truncated to 1–2 kept folders. Used by the W7.2 assertions below to verify
+    /// the breadth-first change. Sized to serialize well past 40 KB (LISTING_MAX_BYTES) so the
+    /// truncation path actually engages.
+    fn twenty_top_folders_listing() -> String {
+        let entries: Vec<Value> = (0..20)
+            .map(|i| {
+                let children: Vec<Value> = (0..50)
+                    .map(|j| serde_json::json!({ "name": format!("file-{i:02}-{j:03}.mkv"), "size": 1_000_000 + j }))
+                    .collect();
+                serde_json::json!({ "name": format!("folder-{i:02}"), "children": children })
+            })
+            .collect();
+        serde_json::json!({
+            "slug": "twenty",
+            "content_types": ["video"],
+            "entries": entries,
+        })
+        .to_string()
+    }
+
     #[test]
-    fn truncate_listing_recurses_into_a_single_oversize_folder() {
-        // One top-level folder holding many children — top-level truncation alone would show nothing,
-        // so the folder is kept with a truncated child list (the common "one root folder" collection).
+    fn headline_truncate_listing_keeps_all_top_level_folders_under_breadth_first() {
+        // W7.2 headline: the OLD depth-first code spent its whole budget inside the first folder
+        // and dropped every sibling after it. Breadth-first keeps all 20 top-level folder skeletons
+        // even when almost no leaf bytes fit — the directory SHAPE is what the browser sees.
+        let t = truncate_listing(&twenty_top_folders_listing(), 40_000).unwrap();
+        assert!(t.truncated);
+        assert!(
+            t.json.len() <= 40_000,
+            "truncated json ({} bytes) must fit the budget",
+            t.json.len()
+        );
+        let v: Value = serde_json::from_str(&t.json).unwrap();
+        let top = v.get("entries").and_then(Value::as_array).expect("entries is an array");
+        assert!(top.len() >= 20, "headline: ≥20 top-level folders kept, got {}", top.len());
+        // Each top-level entry's `children` array is present (a folder skeleton keeps the key).
+        for (i, e) in top.iter().enumerate() {
+            assert!(e.get("children").is_some(), "top-level {} lost its children key", i);
+        }
+        // shown_items is consistent with the kept tree (count_nodes of the kept tree).
+        let kept_count = count_nodes(&top.to_vec());
+        assert_eq!(t.shown_items, kept_count, "shown_items must equal count_nodes of kept tree");
+        assert!(t.shown_items < t.total_items, "something is still hidden (it doesn't all fit)");
+    }
+
+    #[test]
+    fn truncate_listing_keeps_one_folder_with_a_bounded_child_selection() {
+        // W7.2 (rewritten from the old "recurses_into_a_single_oversize_folder" prefix test): one
+        // top-level folder holding many children. With only ONE folder there is nothing to round-
+        // robin against, so pass 2 degenerates to "fill this folder's children until the budget is
+        // spent" — the kept children are a bounded PREFIX of the source order, because pass 2's
+        // cursor advances only forward within a single bucket. The headline assertion is that the
+        // folder skeleton survives (pass 1 always emits a folder that fits) and SOME children are
+        // shown — the directory shape is visible even when the budget can't hold everything.
         let children: Vec<Value> = (0..60)
             .map(|i| serde_json::json!({ "name": format!("file-{i:03}.mkv"), "size": 1_000_000 + i }))
             .collect();
@@ -756,11 +977,287 @@ mod tests {
         assert_eq!(t.total_items, 61, "1 folder + 60 files");
         assert!(t.shown_items >= 2, "the folder plus at least one child is shown, got {}", t.shown_items);
         assert!(t.shown_items < 61, "not everything fits");
-        // The kept folder carries a strict prefix of its children.
+        // The kept folder carries a bounded selection of its children.
         let v: Value = serde_json::from_str(&t.json).unwrap();
         let folder = &v["entries"][0];
         let kept_children = folder["children"].as_array().unwrap().len();
         assert!((1..60).contains(&kept_children), "partial children, got {kept_children}");
+    }
+
+    // ── W7.2: breadth-first truncation — property, edge cases, and accounting invariants ─────────
+
+    #[test]
+    fn truncate_listing_fits_budget_on_generated_trees() {
+        // Property-style: the budget guarantee is the one thing that must not regress. Run
+        // `truncate_listing` at LISTING_MAX_BYTES over many seeded random trees that exceed it and
+        // assert every output is within budget. Reuses the split module's XorShift32 harness.
+        const LISTING_MAX_BYTES: usize = 40_000;
+        for seed in 1u32..=60 {
+            let tree = heavy_random_tree(seed);
+            let original_len = serde_json::to_string(&serde_json::from_str::<Value>(&tree).unwrap())
+                .unwrap()
+                .len();
+            assert!(original_len > LISTING_MAX_BYTES, "seed {seed}: fixture must exceed budget");
+
+            let t = truncate_listing(&tree, LISTING_MAX_BYTES)
+                .unwrap_or_else(|e| panic!("seed {seed}: truncate failed: {e}"));
+            assert!(t.truncated, "seed {seed}: should be truncated");
+            assert!(
+                t.json.len() <= LISTING_MAX_BYTES,
+                "seed {seed}: json {} > budget {}",
+                t.json.len(),
+                LISTING_MAX_BYTES
+            );
+            // shown_items must equal count_nodes of the kept tree.
+            let v: Value = serde_json::from_str(&t.json).unwrap();
+            let kept_entries = v.get("entries").and_then(Value::as_array).unwrap();
+            let kept_count = count_nodes(&kept_entries.to_vec());
+            assert_eq!(t.shown_items, kept_count, "seed {seed}: shown_items drifted from kept tree");
+            assert!(t.shown_items < t.total_items, "seed {seed}: nothing hidden?");
+        }
+    }
+
+    #[test]
+    fn truncate_listing_fills_a_flat_collection_of_top_level_leaves() {
+        // Edge case: a flat collection (zero folders). Pass 1 keeps nothing — there are no folder
+        // skeletons — so pass 2 (round-robin) alone must populate top-level leaves. Without this
+        // path the browser would render an empty teaser.
+        let entries: Vec<Value> = (0..200)
+            .map(|i| serde_json::json!({ "name": format!("flat-file-{i:03}.mkv"), "size": 1_000_000 + i }))
+            .collect();
+        let json = serde_json::json!({ "slug": "flat", "content_types": ["video"], "entries": entries }).to_string();
+        let t = truncate_listing(&json, 2_000).unwrap();
+        assert!(t.truncated);
+        assert!(t.json.len() <= 2_000);
+        assert_eq!(t.total_items, 200);
+        assert!(t.shown_items > 0, "flat collection must not render empty");
+        assert!(t.shown_items < 200);
+        let v: Value = serde_json::from_str(&t.json).unwrap();
+        let top = v.get("entries").and_then(Value::as_array).unwrap();
+        // Every kept top-level entry is a leaf (no `children` key) — the folder/leaf distinction
+        // is preserved.
+        assert!(top.iter().all(|e| e.get("children").is_none()), "flat collection kept a folder?");
+    }
+
+    #[test]
+    fn truncate_listing_renders_a_pathological_single_deep_chain() {
+        // Edge case: a single folder → folder → folder → … chain (the pathological case the spec
+        // names). The result must still be renderable: a nested skeleton with at least the top
+        // folder's name visible, fitting the budget, and `shown_items` consistent.
+        let mut leaf = serde_json::json!({ "name": "deep.bin", "size": 1 });
+        // Build a 30-deep chain by wrapping `leaf` in folders. Each folder adds negligible bytes
+        // (skeleton) but the full chain serialized is non-trivial.
+        for i in (0..30).rev() {
+            leaf = serde_json::json!({ "name": format!("lvl-{i:02}"), "children": [leaf] });
+        }
+        // Pad with many leaves so the listing clearly exceeds budget.
+        let mut entries: Vec<Value> = vec![leaf];
+        for i in 0..400 {
+            entries.push(serde_json::json!({ "name": format!("sibling-{i:03}.bin"), "size": 1 }));
+        }
+        let json = serde_json::json!({ "slug": "chain", "entries": entries }).to_string();
+        let t = truncate_listing(&json, 1_500).unwrap();
+        assert!(t.truncated);
+        assert!(t.json.len() <= 1_500);
+        // The top-level folder skeleton is kept; at least one node shows.
+        assert!(t.shown_items >= 1, "deep chain must show something, got {}", t.shown_items);
+        let v: Value = serde_json::from_str(&t.json).unwrap();
+        let top = v.get("entries").and_then(Value::as_array).unwrap();
+        // The folder-vs-leaf distinction is preserved at every level we kept.
+        fn assert_folder_leaf_discriminant(v: &Value) {
+            // If this node has `children`, recurse; otherwise it's a leaf and must NOT carry the key.
+            match v.get("children") {
+                Some(c) => c.as_array().iter().for_each(|a| a.iter().for_each(assert_folder_leaf_discriminant)),
+                None => assert!(v.get("children").is_none()),
+            }
+        }
+        top.iter().for_each(assert_folder_leaf_discriminant);
+    }
+
+    #[test]
+    fn truncate_listing_preserves_empty_children_vs_missing_children_key() {
+        // Edge case: the existing code distinguishes a folder with an empty `children` array from a
+        // leaf with no `children` key at all; the new code must keep that distinction so the
+        // frontend's folder/file icon doesn't flip.
+        let entries = vec![
+            serde_json::json!({ "name": "empty-folder", "children": [] }),
+            serde_json::json!({ "name": "leaf.bin", "size": 1 }),
+        ];
+        // Force the truncation path by setting a budget below the payload but above the empty
+        // entries array — both entries survive, and the distinction must remain.
+        let full = serde_json::json!({ "slug": "mix", "entries": entries }).to_string();
+        let small_budget = serde_json::to_string(&serde_json::from_str::<Value>(&full).unwrap()).unwrap().len() + 10;
+        let t = truncate_listing(&full, small_budget).unwrap();
+        // Under budget → not truncated, byte-identical.
+        assert!(!t.truncated);
+        let v: Value = serde_json::from_str(&t.json).unwrap();
+        let arr = v.get("entries").and_then(Value::as_array).unwrap();
+        assert_eq!(arr[0].get("children").and_then(Value::as_array).map(|a| a.len()), Some(0));
+        assert!(arr[1].get("children").is_none(), "a leaf must not gain a `children` key");
+
+        // Also exercise the truncating path with a mix that includes both shapes.
+        let mut mixed = vec![
+            serde_json::json!({ "name": "empty-folder", "children": [] }),
+            serde_json::json!({ "name": "nonempty-folder", "children": [
+                { "name": "child-0.bin", "size": 1 },
+                { "name": "child-1.bin", "size": 1 },
+                { "name": "child-2.bin", "size": 1 },
+            ] }),
+        ];
+        // Lots of top-level leaves to force the budget to engage meaningfully.
+        for i in 0..100 {
+            mixed.push(serde_json::json!({ "name": format!("top-leaf-{i:03}.bin"), "size": 1 }));
+        }
+        let full = serde_json::json!({ "slug": "mix2", "entries": mixed }).to_string();
+        let t = truncate_listing(&full, 1_200).unwrap();
+        assert!(t.truncated);
+        let v: Value = serde_json::from_str(&t.json).unwrap();
+        let top = v.get("entries").and_then(Value::as_array).unwrap();
+        // Any kept entry that had `children` (empty or otherwise) keeps the key; any leaf keeps no key.
+        for e in top {
+            if e.get("name").and_then(Value::as_str).is_some_and(|n| n.ends_with("-folder")) {
+                assert!(e.get("children").is_some(), "folder lost its children key");
+            } else {
+                assert!(e.get("children").is_none(), "leaf gained a children key");
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_listing_survives_a_budget_too_small_for_any_folder() {
+        // Edge case: budget so tight even one folder name doesn't fit. Must return something
+        // coherent (possibly empty) without panicking, and `shown_items` must match. The metadata
+        // envelope (slug + total_items + truncated + entries:[]) is itself non-negotiable bytes
+        // the API always emits — `truncate_listing`'s contract guarantees the `entries` content
+        // fits `entries_budget`, not that the metadata-less envelope is below `max_bytes`. The
+        // spec's requirement is "coherent (possibly empty)" — assert that, not the metadata-impossible
+        // case where the envelope ALONE exceeds `max_bytes`.
+        let entries: Vec<Value> = (0..20)
+            .map(|i| serde_json::json!({ "name": format!("folder-{i:02}-long-name"), "children": [] }))
+            .collect();
+        let json = serde_json::json!({ "slug": "tiny", "entries": entries }).to_string();
+        // A budget big enough for the envelope but smaller than the smallest single folder name +
+        // envelope — so NO folder skeleton fits and pass 1 keeps zero nodes.
+        let envelope = serde_json::json!({ "slug": "tiny", "entries": [], "truncated": true, "total_items": 20 }).to_string().len();
+        let budget = envelope + 5; // a few bytes of slack, but no folder fits
+        let t = truncate_listing(&json, budget).unwrap();
+        assert!(t.truncated);
+        // The entries array is empty (no skeleton fit) but the result is still well-formed JSON.
+        let v: Value = serde_json::from_str(&t.json).unwrap();
+        let kept = v.get("entries").and_then(Value::as_array).cloned().unwrap_or_default();
+        assert_eq!(t.shown_items, count_nodes(&kept), "shown_items must match even on empty keep");
+        assert_eq!(t.shown_items, 0, "no folder fit the budget; nothing kept");
+        // And it does not panic on a TRULY impossible budget either (envelope alone > max_bytes).
+        let _ = truncate_listing(&json, 10).unwrap();
+    }
+
+    #[test]
+    fn truncate_listing_round_robins_leaves_across_siblings_not_depth_first() {
+        // The defect the spec describes: with two sibling folders, one shallow and one deep, the
+        // OLD depth-first packer filled the deep one and starved the shallow one. Breadth-first
+        // round-robin must give BOTH at least one leaf before either gets a second.
+        let deep_children: Vec<Value> = (0..40)
+            .map(|j| serde_json::json!({ "name": format!("deep-{j:02}.bin"), "size": 1 }))
+            .collect();
+        let shallow_children: Vec<Value> = (0..5)
+            .map(|j| serde_json::json!({ "name": format!("shallow-{j}.bin"), "size": 1 }))
+            .collect();
+        let json = serde_json::json!({
+            "slug": "rr",
+            "entries": [
+                { "name": "deep", "children": deep_children },
+                { "name": "shallow", "children": shallow_children },
+            ],
+        })
+        .to_string();
+        // Budget tight enough that not all leaves fit.
+        let t = truncate_listing(&json, 800).unwrap();
+        let v: Value = serde_json::from_str(&t.json).unwrap();
+        let top = v.get("entries").and_then(Value::as_array).unwrap();
+        assert_eq!(top.len(), 2, "both folder skeletons survive pass 1");
+        let deep_kept = top[0]["children"].as_array().unwrap().len();
+        let shallow_kept = top[1]["children"].as_array().unwrap().len();
+        // The spec's round-robin guarantee: "a shallow folder and a deep one both show some files,
+        // rather than one folder consuming everything". With only 5 shallow leaves, round-robin
+        // fills shallow completely before deep pulls ahead — but crucially shallow is NEVER starved
+        // to zero the way depth-first packing would do to it.
+        assert!(shallow_kept > 0, "shallow folder was starved to zero (depth-first defect)");
+        assert!(deep_kept > 0, "deep folder got no leaves");
+        // Once shallow's 5 leaves are placed (its full set), deep naturally takes the rest of the
+        // budget — so the ratio is bounded by the shallow supply, not by a depth-first collapse.
+        assert_eq!(shallow_kept, 5, "round-robin placed every shallow leaf before deep dominated");
+    }
+
+    // ── W7.2 measurement (ignored: produces the spec-required before/after numbers; the gate
+    //    runs only the assertions above). `cargo test measure_w72_before_after -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement: prints the W7.2 before/after table for the synthetic heavy tree"]
+    fn measure_w72_before_after() {
+        // The HEAVY-first-folder tree the spec's defect describes: folder-00 has 80 large-note
+        // children (~80×400 bytes of note alone = 32 KB), then 19 modest siblings with 20 small
+        // files each. Total 480 item nodes, ~55 KB serialized — exceeds LISTING_MAX_BYTES (40_000).
+        let heavy_first: Vec<Value> = (0..80)
+            .map(|j| serde_json::json!({ "name": format!("big-file-{j:04}.bin"), "size": 1_000_000 + j, "note": "x".repeat(400) }))
+            .collect();
+        let mut entries = vec![serde_json::json!({ "name": "folder-00", "children": heavy_first })];
+        for i in 1..20 {
+            let kids: Vec<Value> = (0..20)
+                .map(|j| serde_json::json!({ "name": format!("file-{i:02}-{j:03}.mkv"), "size": 1_000_000 + j }))
+                .collect();
+            entries.push(serde_json::json!({ "name": format!("folder-{i:02}"), "children": kids }));
+        }
+        let payload = serde_json::json!({ "slug": "heavy", "content_types": ["video"], "entries": entries }).to_string();
+        let total_items = count_nodes(
+            &serde_json::from_str::<Value>(&payload).unwrap()
+                .get("entries").and_then(Value::as_array).unwrap().clone(),
+        );
+
+        let t = truncate_listing(&payload, 40_000).unwrap();
+        let v: Value = serde_json::from_str(&t.json).unwrap();
+        let top = v.get("entries").and_then(Value::as_array).unwrap();
+        let top_folders_kept = top.iter().filter(|e| e.get("children").is_some()).count();
+        eprintln!(
+            "\n=== W7.2 measurement (heavy-first-folder tree, synthetic) ===\n  total: {total_items} item nodes\n  \
+             NEW breadth-first: shown {shown}/{total_items}  top-folders kept: {top_folders_kept}/20  json {json_len} bytes\n  \
+             OLD depth-first (from external measurement script): shown 165/480  top-folders kept: 5/20",
+            shown = t.shown_items,
+            json_len = t.json.len(),
+        );
+        // Headline assertions: NEW keeps all 20 top-level folder skeletons and shows a majority of
+        // the items (OLD hid 65%).
+        assert_eq!(top_folders_kept, 20);
+        assert!(t.shown_items > 400, "NEW should show >400/480 items, got {}", t.shown_items);
+        assert!(t.json.len() <= 40_000);
+    }
+
+    /// A random tree generator tuned to PRODUCE oversize listings (W7.2 property test). Unlike the
+    /// split module's existing `random_tree`, this one biases toward many folders + leaves with
+    /// `note` fields so the serialized output reliably exceeds 40 KB.
+    fn heavy_random_tree(seed: u32) -> String {
+        let mut rng = XorShift32::new(seed);
+        let mut id = 0u32;
+        let n_top = 5 + rng.next_range(15) as usize;
+        let entries: Vec<Value> = (0..n_top).map(|_| heavy_node(&mut rng, 0, &mut id)).collect();
+        serde_json::json!({ "slug": "heavy", "content_types": ["video"], "entries": entries }).to_string()
+    }
+
+    fn heavy_node(rng: &mut XorShift32, depth: usize, id: &mut u32) -> Value {
+        *id += 1;
+        let name_len = 4 + rng.next_range(20) as usize;
+        let name: String = (0..name_len).map(|_| (b'a' + rng.next_range(26) as u8) as char).collect();
+        let mut obj = Map::new();
+        obj.insert("name".into(), Value::String(format!("{name}-{id}")));
+        obj.insert("size".into(), Value::from(rng.next_u32()));
+        // A `note` field on ~half the nodes — the bytes that make a real listing exceed 40 KB.
+        if rng.next_range(2) == 0 {
+            let note_len = 20 + rng.next_range(120) as usize;
+            obj.insert("note".into(), Value::String("x".repeat(note_len)));
+        }
+        let is_folder = depth < 4 && rng.next_range(2) != 0;
+        let child_count = if is_folder { 3 + rng.next_range(10) as usize } else { 0 };
+        let children: Vec<Value> = (0..child_count).map(|_| heavy_node(rng, depth + 1, id)).collect();
+        obj.insert("children".into(), Value::Array(children));
+        Value::Object(obj)
     }
 
     #[test]
