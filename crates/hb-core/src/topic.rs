@@ -1386,6 +1386,46 @@ mod tests {
         assert!(open_post(&key, &ev, NOW + POST_TTL_SECS).unwrap().is_some(), "a post at the 24h boundary still opens");
     }
 
+    #[test]
+    fn staggered_post_expiry_drops_only_the_post_older_than_24h() {
+        // W8.1 diagnosis (M17 devtest item 1): three posts stamped now-23h, now-25h, now-1h, read at
+        // a SINGLE `now`. The local filter runs PER POST on its authenticated `payload.ts`, so exactly
+        // the 23h and 1h posts survive — there is no day-aligned collective wipe and no scheduled
+        // boundary anywhere in the path. If this test is green, the owner's "posts wipe at a set time"
+        // mental model is a COPY defect (chat/+page.svelte), not an engine bug.
+        let (meta, key) = public_topic();
+        let author = Identity::generate();
+        let now = NOW;
+        let post_23h = seal_post(&key, &meta.topic_id, &author, "23h old", now - 23 * 60 * 60).unwrap();
+        let post_25h = seal_post(&key, &meta.topic_id, &author, "25h old", now - 25 * 60 * 60).unwrap();
+        let post_1h = seal_post(&key, &meta.topic_id, &author, "1h old", now - 60 * 60).unwrap();
+        let survivors: Vec<String> = [&post_23h, &post_25h, &post_1h]
+            .into_iter()
+            .filter_map(|ev| open_post(&key, ev, now).ok().flatten())
+            .map(|p| p.body)
+            .collect();
+        assert_eq!(
+            survivors,
+            vec!["23h old".to_string(), "1h old".to_string()],
+            "only the >24h post is dropped — expiry is per-message, not a collective wipe"
+        );
+        // The same per-event filter powers the multi-domain channel reader (`open_channel_item` at
+        // :791, the checks cited at :809/:824); confirm it agrees with `open_post`.
+        let channel_survivors: Vec<String> = [&post_23h, &post_25h, &post_1h]
+            .into_iter()
+            .filter_map(|ev| open_channel_item(&key, ev, now).ok().flatten())
+            .map(|item| match item {
+                ChannelItem::Post(p) => p.body,
+                ChannelItem::Announce(a) => a.body,
+            })
+            .collect();
+        assert_eq!(
+            channel_survivors,
+            vec!["23h old".to_string(), "1h old".to_string()],
+            "open_channel_item agrees — the per-event 24h filter is the one mechanism"
+        );
+    }
+
     // ───────────────────────── versioning / fuzz / adversarial ─────────────────────────
 
     #[test]

@@ -878,13 +878,13 @@
 							<span class="pane-peer-name">{selectedTopic.name}</span>
 							{#if selectedTopic.private}<span class="pill pill-offline">private</span>{/if}
 						</div>
-						<span class="channel-sub">Topic channel · posts wipe after 24h · manage in Topics</span>
+						<span class="channel-sub">Topic channel · each post disappears 24h after it's posted · manage in Topics</span>
 					</div>
 				</div>
 
 				<div class="thread" bind:this={threadEl}>
 					{#if channelItems.length === 0}
-						<p class="thread-empty">No posts in the last 24h. Say something!</p>
+						<p class="thread-empty">No posts in the last 24h — posts here expire 24h after they're sent. Say something!</p>
 					{:else}
 						{#each channelItems as item (item.kind + '|' + (item.kind === 'post' ? item.post.author_npub + '|' + item.post.ts : item.announce.author_npub + '|' + item.announce.ts))}
 							{#if item.kind === 'announce'}
