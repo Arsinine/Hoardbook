@@ -818,6 +818,70 @@ impl DataStore {
         }
         Ok(())
     }
+
+    // ── Manifest-request ask trace (M17 W7.1a) — the persisted "I already asked this peer for this
+    //    collection's full list" record. `send_dm_inner` (`chat.rs:108`) delivers a gift-wrap to the
+    //    recipient's inbox only — NO self-copy — so without this record the ask leaves zero local trace
+    //    and the button reads as dead. One entry per `(npub, slug)`, overwritten on re-ask. Keyed by
+    //    `"{npub}|{slug}"` so the same slug across two peers (or two slugs on one peer) stay distinct.
+    pub fn manifest_asks_path(&self) -> PathBuf {
+        self.base.join("manifest_asks.json")
+    }
+
+    pub fn load_manifest_asks(&self) -> Result<std::collections::HashMap<String, ManifestAsk>> {
+        Ok(read_json_lenient::<std::collections::HashMap<String, ManifestAsk>>(
+            &self.manifest_asks_path(),
+        )
+        .context("loading manifest asks")?
+        .unwrap_or_default())
+    }
+
+    pub fn save_manifest_asks(
+        &self,
+        m: &std::collections::HashMap<String, ManifestAsk>,
+    ) -> Result<()> {
+        write_json(&self.manifest_asks_path(), m).context("saving manifest asks")
+    }
+
+    /// Record that we asked `npub` for `slug`'s full manifest at `sent_at`, persisting `fingerprint_seen`
+    /// alongside it (the requester's view of the snapshot when they asked). Overwrites any prior entry for
+    /// the same `(npub, slug)` — a re-ask is a re-ask; the newest send wins. Serialized like
+    /// [`advance_read_watermark`] so two overlapping asks (a double-click, two windows) can't interleave
+    /// the load→modify→save and drop one another's entry.
+    pub fn record_manifest_ask(
+        &self,
+        npub: &str,
+        slug: &str,
+        fingerprint_seen: &str,
+        sent_at: &str,
+    ) -> Result<()> {
+        static MANIFEST_ASKS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = MANIFEST_ASKS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut m = self.load_manifest_asks()?;
+        m.insert(
+            manifest_ask_key(npub, slug),
+            ManifestAsk {
+                fingerprint_seen: fingerprint_seen.to_string(),
+                sent_at: sent_at.to_string(),
+            },
+        );
+        self.save_manifest_asks(&m)
+    }
+}
+
+/// The persisted ask trace: `fingerprint_seen` (the snapshot fingerprint the requester observed when
+/// they asked — for staleness notes on the fulfil side) + `sent_at` (RFC3339 UTC, as everywhere else
+/// here — the asked-state relative label and the re-ask cooldown both derive from it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestAsk {
+    pub fingerprint_seen: String,
+    pub sent_at: String,
+}
+
+/// The on-disk key for an ask trace: `"{npub}|{slug}"`. The pipe is unambiguous because npubs and
+/// slugs never contain `|` (bech32 / URL-safe slug charset).
+pub fn manifest_ask_key(npub: &str, slug: &str) -> String {
+    format!("{npub}|{slug}")
 }
 
 impl DataStore {
@@ -1474,5 +1538,73 @@ mod tests {
 
         store.wipe().unwrap();
         assert!(!store.read_state_path().exists(), "read_state.json must be removed by wipe()");
+    }
+
+    // ── Manifest-request ask trace (M17 W7.1a) ———————————————————————————————————————
+    // The ask leaves zero local trace without this record (send_dm_inner delivers to the recipient's
+    // inbox only, no self-copy). Pinned: round-trip, overwrite-on-re-ask, lenient-absent-file, and
+    // that the key disambiguates (npub, slug) pairs.
+
+    #[test]
+    fn manifest_asks_defaults_empty_on_absent_file() {
+        // Lenient load: a missing file ⇒ empty map (not an error). Matches load_read_state.
+        let (_dir, store) = test_store();
+        assert!(!store.manifest_asks_path().exists());
+        assert!(store.load_manifest_asks().unwrap().is_empty(), "absent file ⇒ empty map");
+    }
+
+    #[test]
+    fn manifest_ask_roundtrips_and_is_keyed_by_npub_and_slug() {
+        let (_dir, store) = test_store();
+        store
+            .record_manifest_ask("npub1a", "criterion", "fp-1", "2026-01-01T00:00:00Z")
+            .unwrap();
+        // Same slug, different peer ⇒ distinct entry (don't clobber).
+        store
+            .record_manifest_ask("npub1b", "criterion", "fp-2", "2026-01-02T00:00:00Z")
+            .unwrap();
+        // Same peer, different slug ⇒ distinct entry.
+        store
+            .record_manifest_ask("npub1a", "other", "fp-3", "2026-01-03T00:00:00Z")
+            .unwrap();
+        let m = store.load_manifest_asks().unwrap();
+        assert_eq!(m.len(), 3);
+        let key_a = manifest_ask_key("npub1a", "criterion");
+        assert_eq!(m[&key_a].fingerprint_seen, "fp-1");
+        assert_eq!(m[&key_a].sent_at, "2026-01-01T00:00:00Z");
+        assert_eq!(m[&manifest_ask_key("npub1b", "criterion")].sent_at, "2026-01-02T00:00:00Z");
+        assert_eq!(m[&manifest_ask_key("npub1a", "other")].sent_at, "2026-01-03T00:00:00Z");
+    }
+
+    #[test]
+    fn manifest_ask_overwrites_on_re_ask_for_same_pair() {
+        // A re-ask is a re-ask: the newest send wins. One entry per (npub, slug), not a history.
+        let (_dir, store) = test_store();
+        store
+            .record_manifest_ask("npub1a", "criterion", "fp-old", "2026-01-01T00:00:00Z")
+            .unwrap();
+        store
+            .record_manifest_ask("npub1a", "criterion", "fp-new", "2026-01-09T00:00:00Z")
+            .unwrap();
+        let m = store.load_manifest_asks().unwrap();
+        assert_eq!(m.len(), 1, "exactly one entry per (npub, slug)");
+        let entry = &m[&manifest_ask_key("npub1a", "criterion")];
+        assert_eq!(entry.fingerprint_seen, "fp-new");
+        assert_eq!(entry.sent_at, "2026-01-09T00:00:00Z");
+    }
+
+    #[test]
+    fn manifest_asks_is_wiped_with_the_rest_of_the_profile() {
+        let (_dir, store) = test_store();
+        store
+            .record_manifest_ask("npub1a", "criterion", "fp-1", "2026-01-01T00:00:00Z")
+            .unwrap();
+        assert!(store.manifest_asks_path().exists());
+
+        store.wipe().unwrap();
+        assert!(
+            !store.manifest_asks_path().exists(),
+            "manifest_asks.json must be removed by wipe()"
+        );
     }
 }

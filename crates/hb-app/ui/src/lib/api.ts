@@ -347,6 +347,16 @@ export const requestManifest = (
 		mascaraPubkey: mascaraPubkey ?? null,
 	});
 
+/** M17 W7.1a — the persisted ask-trace map (npub|slug → {fingerprint_seen, sent_at}), so the Browse
+ *  paywall can read back the asked-state across restarts. Pure local read, no relay I/O. The ask is
+ *  recorded INSIDE `request_manifest` after `send_dm_inner` resolves — a failed publish leaves no trace. */
+export interface ManifestAsk {
+	fingerprint_seen: string;
+	sent_at: string;
+}
+export const getManifestAsks = () =>
+	invoke<Record<string, ManifestAsk>>('get_manifest_asks');
+
 export const getMessages = () => invoke<ReceivedMessage[]>('get_messages');
 
 // ── Unified read state (devtest #16) ────────────────────────────────────────────

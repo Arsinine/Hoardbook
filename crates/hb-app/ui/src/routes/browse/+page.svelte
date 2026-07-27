@@ -1,13 +1,14 @@
 <script lang="ts">
 	import { contacts, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
-	import { refreshContact, importManifest, requestManifest } from '$lib/api.js';
+	import { refreshContact, importManifest, requestManifest, getManifestAsks, type ManifestAsk } from '$lib/api.js';
 	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
 	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote, arrangeItems, fileTypesPresent, type BrowseViewMode, type BrowseSortKey, type BrowseSortDir } from '$lib/browse-view.js';
+	import { deriveManifestAskState, ASK_TICK_MS, MANIFEST_ASKED_LINE, MANIFEST_ASK_AGAIN_LABEL, MANIFEST_ASK_AGAIN_COOLDOWN_TIP, MANIFEST_OPEN_CHAT_LABEL, MANIFEST_ASK_FAILED_LINE } from '$lib/manifest-ask.js';
 	import type { CachedPeer, Collection, DirectoryItem } from '$lib/types.js';
 
 	type BcItem =
@@ -101,20 +102,73 @@
 	let pasteText = $state('');
 	let askingOwner = $state(false);
 
+	// M17 W7.1a — the ask must leave a trace. `request_manifest` delivers to the recipient's inbox only
+	// (no self-copy), so without reading the persisted ask-trace map back the paywall block reads as
+	// unchanged and the button as dead. The asked-state is derived PURELY from this map + the clock,
+	// never from component-local state — so it survives a remount/restart. Re-read after every send
+	// (success OR failure) so a rejected publish leaves the un-asked state (the record is written only
+	// after `send_dm_inner` resolves; a failed ask must never render as "Asked").
+	let manifestAsks = $state<Record<string, ManifestAsk> | null>(null);
+	// A slow tick re-derives the cooldown countdown + the relative label so the tooltip and "Ask again"
+	// disabled state stay honest without a page reload. Idempotent + cheap (pure derivation).
+	let nowTick = $state(Date.now());
+	let askError = $state<string | null>(null);
+
+	async function refreshManifestAsks() {
+		try {
+			manifestAsks = await getManifestAsks();
+		} catch {
+			// A read failure must never blank a previously-rendered asked-state (the user DID ask). Keep
+			// the stale map; the paywall block still renders the last-known asked-state from it.
+		}
+	}
+
+	$effect(() => {
+		// Load the ask map on mount so the asked-state renders from the persisted record immediately.
+		refreshManifestAsks();
+		// Tick to refresh the cooldown countdown + relative label. Both are MINUTE-granular
+		// (`MANIFEST_ASK_AGAIN_COOLDOWN_TIP` ceils to minutes), so a 1s tick would wake the reactive
+		// graph 60× per displayable change; ASK_TICK_MS bounds the lag at half a minute for a
+		// fraction of the wakeups — same call W5 made for the contact-row clock (PRESENCE_TICK_MS).
+		// The effect does NOT re-run on `nowTick`: it writes that state, never reads it, so the
+		// interval is created once and torn down on unmount.
+		const id = setInterval(() => { nowTick = Date.now(); }, ASK_TICK_MS);
+		return () => clearInterval(id);
+	});
+
 	// M16 W4: the primary "get the rest" affordance — DM the owner asking for the full list. The owner
 	// decides whether to export + ticket a manifest (Hoardbook never auto-produces one; MASCARA_SPEC Q1).
 	async function handleAskOwner() {
 		if (!selectedPeer || !selectedCollection) return;
 		askingOwner = true;
+		askError = null;
 		try {
 			await requestManifest(selectedPeer.npub, selectedCollection.slug, selectedCollection.snapshot_fingerprint ?? '', selectedCollection.teaser_event_id);
 			toast('Asked the owner for the full list');
+			// Re-read the persisted record so the asked-state renders from the store, not from optimistic
+			// component state. The record is written server-side AFTER `send_dm_inner` resolves, so on
+			// success it is guaranteed present; the catch branch handles the failure case explicitly.
+			await refreshManifestAsks();
 		} catch (e) {
+			askError = String(e);
 			toast(String(e), 'error');
+			// "Failure is loud": leave the button in its un-asked state with the muted reason inline.
+			// Re-read in case the store carries a prior successful ask (the user may be re-asking after
+			// a cooldown and the previous asked-state should still show — not be hidden by this failure).
+			await refreshManifestAsks();
 		} finally {
 			askingOwner = false;
 		}
 	}
+
+	// Pure derivation of the paywall block's asked-state from (map, npub, slug, now). `nowTick` is the
+	// reactive clock that keeps the cooldown + relative label fresh; reading it here makes the $derived
+	// recompute every second.
+	let askState = $derived(
+		selectedPeer && selectedCollection
+			? deriveManifestAskState(manifestAsks, selectedPeer.npub, selectedCollection.slug, new Date(nowTick))
+			: { kind: 'unasked' as const },
+	);
 
 	async function handleImportManifest(source: { path?: string; pasted?: string }) {
 		if (!selectedPeer || !selectedCollection) return;
@@ -448,13 +502,34 @@
 								<div>
 									<div class="paywall-title">{paywall.hidden.toLocaleString()} more item{paywall.hidden !== 1 ? 's' : ''} hidden</div>
 									<div class="paywall-sub">Showing {paywall.shown.toLocaleString()} of {paywall.total.toLocaleString()} — this collection is too large to publish in full.</div>
-									<!-- M16 W4: the "get the rest" affordance — import a manifest file the owner handed over
-									     (out of band, via Mascara). No Download button (MAS-INV-5): Hoardbook moves no files. -->
+									<!-- M16 W4 + M17 W7.1a: the "get the rest" affordance. The primary "Ask the owner" button
+									     becomes the muted "Asked {relative} — waiting for their reply" state after a successful
+									     send, with a secondary "Ask again" (60-min cooldown, mirroring announce-cooldown) and an
+									     "Open chat" link to where the reply will arrive. Import stays alongside. No Download
+									     button (MAS-INV-5): Hoardbook moves no files. -->
 									<div class="paywall-actions">
-										<button class="btn-primary btn-sm" onclick={handleAskOwner} disabled={askingOwner}>Ask the owner for the full list</button>
+										{#if askState.kind === 'asked'}
+											<!-- Asked-state: read from the persisted record, not component-local state. The muted
+											     line + cooldown-gated "Ask again" + "Open chat" deep-link (W1) to where the reply lands. -->
+											<span class="asked-line">{MANIFEST_ASKED_LINE(askState.relative)}</span>
+											<button
+												class="btn-ghost btn-sm"
+												onclick={handleAskOwner}
+												disabled={askingOwner || !askState.cooldownOver}
+												title={askState.cooldownOver ? '' : MANIFEST_ASK_AGAIN_COOLDOWN_TIP(askState.cooldownRemaining)}
+											>{MANIFEST_ASK_AGAIN_LABEL}</button>
+											<a class="btn-ghost btn-sm open-chat-link" href={`/chat?peer=${selectedPeer?.npub ?? ''}`}>{MANIFEST_OPEN_CHAT_LABEL}</a>
+										{:else}
+											<button class="btn-primary btn-sm" onclick={handleAskOwner} disabled={askingOwner}>Ask the owner for the full list</button>
+										{/if}
 										<button class="btn-ghost btn-sm" onclick={pickManifestFile} disabled={importingManifest}>Import a manifest file you received</button>
 										<button class="btn-ghost btn-sm" onclick={() => (pasteOpen = !pasteOpen)}>or paste it</button>
 									</div>
+									{#if askError && askState.kind !== 'asked'}
+										<!-- Failure is loud (W7.1a): a rejected publish leaves the un-asked state AND shows the
+										     muted reason inline. A failed ask must never render as "Asked". -->
+										<div class="ask-failed-note">{MANIFEST_ASK_FAILED_LINE(askError)}</div>
+									{/if}
 									{#if pasteOpen}
 										<textarea class="hb-input hb-mono paywall-paste" bind:value={pasteText} placeholder="Paste the .hbmanifest text or its base64 here"></textarea>
 										<button class="btn-primary btn-sm" disabled={importingManifest || !pasteText.trim()} onclick={() => handleImportManifest({ pasted: pasteText })}>Import from text</button>
@@ -720,8 +795,11 @@
 	.paywall-sub { font-size: 11.5px; color: var(--fg-dim); margin-top: 1px; }
 
 	/* M16 W4: the "get the rest" affordances inside the paywall note. */
-	.paywall-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+	.paywall-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center; }
 	.paywall-paste { display: block; width: 100%; margin-top: 6px; min-height: 52px; resize: vertical; }
+	/* M17 W7.1a: the muted asked-state line + the inline failure reason. */
+	.asked-line { font-size: 11.5px; color: var(--fg-dim); }
+	.ask-failed-note { font-size: 11.5px; color: var(--error); margin-top: 6px; }
 	.imported-note {
 		display: flex;
 		align-items: center;
