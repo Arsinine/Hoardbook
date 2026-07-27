@@ -601,7 +601,25 @@ pub async fn request_manifest(
     send_dm_inner(&client, &id_clone, &recipient, &content, &own, net::RELAY_TIMEOUT)
         .await
         .map_err(cmd_err)?;
+    // M17 W7.1a — record the ask AFTER `send_dm_inner` resolves, so a failed publish never leaves a
+    // trace (a rejected/errored ask must never render as "Asked"). `send_dm_inner` delivers to the
+    // recipient's inbox only (no self-copy), so without this record the ask leaves zero local trace and
+    // the button reads as dead on the requester's side. One entry per `(npub, slug)`, overwritten on
+    // re-ask; the re-ask cooldown is derived client-side from `sent_at`.
+    let sent_at = chrono::Utc::now().to_rfc3339();
+    store
+        .record_manifest_ask(&npub, &slug, &fingerprint_seen, &sent_at)
+        .map_err(cmd_err)?;
     Ok(())
+}
+
+/// M17 W7.1a — the persisted ask-trace map (npub|slug → {fingerprint_seen, sent_at}), so the Browse
+/// paywall can read back the asked-state across restarts. A pure local read, no relay I/O.
+#[tauri::command]
+pub async fn get_manifest_asks(
+    store: State<'_, DataStore>,
+) -> CmdResult<std::collections::HashMap<String, crate::store::ManifestAsk>> {
+    store.load_manifest_asks().map_err(cmd_err)
 }
 
 /// Fetch + decrypt the NIP-17 inbox: contacts' messages only (Q7 — a stranger's DM never reaches the

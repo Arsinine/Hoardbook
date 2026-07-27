@@ -348,6 +348,7 @@ pub fn run() {
             commands::chat::dm_blocked_list,
             commands::chat::get_read_state,
             commands::chat::advance_read_watermark,
+            commands::chat::get_manifest_asks,
             commands::sharing::get_share_settings,
             commands::groups::groups_get,
             commands::groups::groups_create,
