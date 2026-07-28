@@ -4,9 +4,7 @@
 
 Hoardbook is a small desktop app. You write a short profile, publish a catalog of your collections, and hand your share code to the people you want browsing it. They add you as a contact, page through your catalog in a familiar two-pane file viewer, and message you directly. Everything runs over the public [Nostr](https://nostr.com) network, so there's no Hoardbook server that can go down, get seized, or quietly own your data.
 
-It's the **phonebook** to [Qurator](#the-qurator-family)'s "club": Hoardbook finds and verifies people and shows what they have; the richer social layer lives in Qurator.
-
-> **Current release: v0.12.5.** Works standalone. Identity is a single key you also use across Qurator and the wider Nostr network. Hoardbook handles *introductions and catalogs only* — the actual file downloads happen in a separate companion app, [Mascara](#the-qurator-family).
+> **Current release: v0.12.5.** Hoardbook handles *introductions and catalogs only*. It moves no files and has no download feature — once you've found each other, you arrange the transfer however you already do. Your identity is an ordinary Nostr key, so the same key works anywhere else on the network.
 
 ---
 
@@ -30,7 +28,7 @@ It's the **phonebook** to [Qurator](#the-qurator-family)'s "club": Hoardbook fin
 2. **Add your collections.** Point Hoardbook at the folders you want to share. It publishes an encrypted catalog (folder tree, item counts, sizes, tags, notes) — never the files themselves.
 3. **Hand out your share code.** Post your public key anywhere so people can follow you; give your share code to the people you actually want browsing your catalog.
 4. **Discover and connect.** Search by interest tags, browse catalogs, add contacts, and message them directly.
-5. **Download with Mascara.** When you want the actual files, the [Mascara](#the-qurator-family) companion takes over the transfer. Hoardbook itself moves no files — it ends at *"here's who has it and how to reach them."*
+5. **Arrange the transfer yourselves.** Hoardbook ends at *"here's who has it and how to reach them."* It moves no files and offers no download — when you want something, you and the other person work it out directly, with whatever you already use.
 
 ---
 
@@ -84,21 +82,14 @@ By default Hoardbook spreads across public Nostr relays (`relay.damus.io`, `nos.
 
 Want to run your own? Use any off-the-shelf Nostr relay — [strfry](https://github.com/hoytech/strfry) or [nostr-rs-relay](https://github.com/scsibug/nostr-rs-relay) — add its URL to your relay set, and you're done. There's no Hoardbook-specific relay software to maintain.
 
----
+**Before you change your relay set, know what it does and doesn't buy you:**
 
-## The Qurator family
+- **What you gain is metadata privacy, not secrecy.** Your catalog and messages are encrypted before they reach *any* relay, so no operator has ever been able to read them. What a relay does see is your public key, your IP, and which queries you run — and on your own relay, that's seen by you instead of by a stranger.
+- **Your own relay doesn't make you anonymous.** It still sees your key and your IP, because you're still connecting to it. If you want that hidden, route through Tor or a VPN.
+- **Publishing is not recallable.** Anything already sent to the public defaults stays on them regardless of what you switch to later.
+- **Replacing the defaults makes you undiscoverable to everyone still on them.** Hoardbook uses your configured relay set exactly as you set it — so if you drop the public relays and keep only your own, you can only be found by people who have also added it. Adding is safe; replacing is the move that costs you reach.
 
-Hoardbook is one of three companion apps that share a single identity:
-
-- **Hoardbook** — the phonebook. Find and verify people, browse their catalogs. *(this repo)*
-- **Qurator** — the club. Rooms, reputation, and the richer social layer.
-- **Mascara** — the courier. The one app that actually moves files, kept separate on purpose.
-
----
-
-## Contributing
-
-Issues and pull requests are welcome.
+Settings also has an optional **big relay** — a higher-capacity relay you run for collections too large to publish whole. It's your infrastructure: if it's down or unreachable, people holding your share code fall back to the preview listing until it returns.
 
 ## License
 
