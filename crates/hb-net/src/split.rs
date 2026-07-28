@@ -337,6 +337,26 @@ fn count_nodes(entries: &[Value]) -> usize {
         .sum()
 }
 
+/// Is this entry a FOLDER (a node the skeleton pass may empty and recurse into) or a LEAF (a node
+/// the fill pass round-robins)?
+///
+/// **A missing `children` key is NOT the leaf test.** `DirectoryItem::children` is
+/// `#[serde(default)] Vec<DirectoryItem>` with no `skip_serializing_if` (`hb-core/types.rs`), so a
+/// real published file always carries `"children":[]`. Classifying on key-presence alone made every
+/// production file look like a folder, which emptied the fill pass's leaf buckets entirely and let
+/// one heavy folder's files consume the budget in BFS level order — the exact collapse W7.2 set out
+/// to remove, invisible because the fixtures omitted the key.
+///
+/// `item_type` is therefore authoritative when present. The key-presence fallback is kept for
+/// entries that carry no `item_type` (older payloads and the tree-shape fixtures), where a present
+/// `children` key — even an empty one — is the only folder signal available.
+fn is_folder_entry(v: &Value) -> bool {
+    match v.get("item_type").and_then(Value::as_str) {
+        Some(t) => t.eq_ignore_ascii_case("folder"),
+        None => v.get("children").is_some(),
+    }
+}
+
 /// Truncate a directory tree to fit a byte budget, **breadth-first and cheapest-information-first**
 /// (W7.2): show the SHAPE of the collection rather than a deep prefix of the first folder.
 ///
@@ -381,7 +401,7 @@ fn truncate_tree(entries: &[Value], budget: usize) -> (Vec<Value>, usize) {
     frontier.push_back((None, top_level_src_kids.clone()));
     'outer: while let Some((parent, kids)) = frontier.pop_front() {
         for (src_idx, kid) in kids.iter().enumerate() {
-            if kid.get("children").is_none() {
+            if !is_folder_entry(kid) {
                 continue; // leaf file — handled by pass 2
             }
             let mut skel = kid.clone();
@@ -427,7 +447,7 @@ fn truncate_tree(entries: &[Value], budget: usize) -> (Vec<Value>, usize) {
     let top_level_leaves: Vec<(usize, Value)> = top_level_src_kids
         .iter()
         .enumerate()
-        .filter(|(_, k)| k.get("children").is_none())
+        .filter(|(_, k)| !is_folder_entry(k))
         .map(|(i, k)| (i, k.clone()))
         .collect();
     buckets.push((None, top_level_leaves));
@@ -436,7 +456,7 @@ fn truncate_tree(entries: &[Value], budget: usize) -> (Vec<Value>, usize) {
             .src_kids
             .iter()
             .enumerate()
-            .filter(|(_, k)| k.get("children").is_none())
+            .filter(|(_, k)| !is_folder_entry(k))
             .map(|(i2, k)| (i2, k.clone()))
             .collect();
         buckets.push((Some(i), ls));
@@ -505,7 +525,7 @@ fn truncate_tree(entries: &[Value], budget: usize) -> (Vec<Value>, usize) {
         let mut leaf_iter = kept_leaves_in_order.into_iter();
         let mut new_children: Vec<Value> = Vec::new();
         for (src_idx, child) in nodes[i].src_kids.iter().enumerate() {
-            let is_folder = child.get("children").is_some();
+            let is_folder = is_folder_entry(child);
             if is_folder {
                 if subfolder_iter.peek().is_some_and(|&si| nodes[si].src_idx == src_idx) {
                     let si = subfolder_iter.next().unwrap();
@@ -533,7 +553,7 @@ fn truncate_tree(entries: &[Value], budget: usize) -> (Vec<Value>, usize) {
     }
     let mut kept: Vec<Value> = Vec::new();
     for (src_idx, entry) in entries.iter().enumerate() {
-        let is_folder = entry.get("children").is_some();
+        let is_folder = is_folder_entry(entry);
         if is_folder {
             if let Some(&ni) = top_folders_by_src.get(&src_idx) {
                 kept.push(nodes[ni].value.clone());
@@ -1639,5 +1659,101 @@ mod tests {
         let names: Vec<&str> =
             v["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
         assert_eq!(names, vec!["first", "second"], "siblings at the same mount must graft in part order");
+    }
+
+    // ── W7.2 follow-up: leaf classification against the PRODUCTION serialization shape.
+    //
+    // `DirectoryItem::children` is `#[serde(default)] Vec<DirectoryItem>` with no
+    // `skip_serializing_if`, so every real published FILE carries `"children":[]` and every real
+    // entry carries `item_type`. The original W7.2 packer identified a leaf by the ABSENCE of the
+    // `children` key, which is true only of the hand-written fixtures — in production it classed
+    // every file as a folder, emptied the round-robin's leaf buckets, and let BFS level order hand
+    // one heavy folder the whole budget. These tests pin the production shape specifically.
+
+    /// A file exactly as `DirectoryItem` serializes one: `item_type` present, `children` an empty
+    /// array (NOT an absent key).
+    fn prod_file(name: &str, note_len: usize) -> Value {
+        let mut o = serde_json::json!({ "name": name, "item_type": "File", "size": "1.0 GB", "children": [] });
+        if note_len > 0 {
+            o.as_object_mut().unwrap().insert("note".into(), Value::String("x".repeat(note_len)));
+        }
+        o
+    }
+
+    fn prod_folder(name: &str, children: Vec<Value>) -> Value {
+        serde_json::json!({ "name": name, "item_type": "Folder", "children": children })
+    }
+
+    #[test]
+    fn production_shaped_files_are_leaves_not_folders() {
+        // The unit fact the whole regression turns on.
+        assert!(!is_folder_entry(&prod_file("a.mkv", 0)), "a serialized file is not a folder");
+        assert!(is_folder_entry(&prod_folder("f", vec![])), "an EMPTY folder is still a folder");
+        assert!(is_folder_entry(&prod_folder("f", vec![prod_file("a.mkv", 0)])));
+        // Fixture shape (no `item_type`) keeps the historical key-presence fallback, so every
+        // existing tree-shape test keeps its meaning.
+        assert!(is_folder_entry(&serde_json::json!({ "name": "f", "children": [] })));
+        assert!(!is_folder_entry(&serde_json::json!({ "name": "a.mkv", "size": 1 })));
+        // `item_type` wins over the fallback, and the lowercase serde alias is accepted.
+        assert!(is_folder_entry(&serde_json::json!({ "name": "f", "item_type": "folder" })));
+    }
+
+    #[test]
+    fn heavy_first_folder_does_not_starve_siblings_in_production_shape() {
+        // The headline W7.2 shape, rebuilt with production serialization: folder-00 is heavy
+        // enough to swallow the budget on its own; 19 modest siblings follow.
+        let heavy: Vec<Value> = (0..80).map(|j| prod_file(&format!("big-{j:04}.bin"), 400)).collect();
+        let mut entries = vec![prod_folder("folder-00", heavy)];
+        for i in 1..20 {
+            let kids: Vec<Value> =
+                (0..20).map(|j| prod_file(&format!("file-{i:02}-{j:03}.mkv"), 0)).collect();
+            entries.push(prod_folder(&format!("folder-{i:02}"), kids));
+        }
+        let payload =
+            serde_json::json!({ "slug": "heavy", "content_types": ["video"], "entries": entries })
+                .to_string();
+        assert!(payload.len() > 40_000, "fixture must actually exceed the cap");
+
+        let t = truncate_listing(&payload, 40_000).unwrap();
+        assert!(t.truncated);
+        assert!(t.json.len() <= 40_000, "budget guarantee: {} > 40000", t.json.len());
+
+        let v: Value = serde_json::from_str(&t.json).unwrap();
+        let top = v.get("entries").and_then(Value::as_array).unwrap();
+        assert_eq!(top.len(), 20, "every top-level folder skeleton survives pass 1");
+
+        // The regression this test exists for: with leaves misclassified, the fill pass had nothing
+        // to place, so folders after the heavy one came back EMPTY. Every sibling must show files.
+        let empty: Vec<&str> = top
+            .iter()
+            .filter(|e| e["children"].as_array().is_none_or(|c| c.is_empty()))
+            .map(|e| e["name"].as_str().unwrap_or("?"))
+            .collect();
+        assert!(empty.is_empty(), "folders starved of leaves by the heavy first folder: {empty:?}");
+
+        // And the accounting invariant still holds on this shape.
+        assert_eq!(t.shown_items, count_nodes(top), "shown_items must equal the kept node count");
+    }
+
+    #[test]
+    fn production_shape_round_robins_leaves_across_siblings() {
+        // Sibling fairness, production shape: a deep folder and a shallow one, budget too small for
+        // both in full. Neither may be starved to zero.
+        let deep: Vec<Value> = (0..40).map(|j| prod_file(&format!("deep-{j:02}.bin"), 0)).collect();
+        let shallow: Vec<Value> = (0..5).map(|j| prod_file(&format!("shallow-{j}.bin"), 0)).collect();
+        let payload = serde_json::json!({
+            "slug": "rr",
+            "entries": [prod_folder("deep", deep), prod_folder("shallow", shallow)],
+        })
+        .to_string();
+        let t = truncate_listing(&payload, 1_200).unwrap();
+        assert!(t.json.len() <= 1_200);
+        let v: Value = serde_json::from_str(&t.json).unwrap();
+        let top = v.get("entries").and_then(Value::as_array).unwrap();
+        assert_eq!(top.len(), 2);
+        let deep_kept = top[0]["children"].as_array().unwrap().len();
+        let shallow_kept = top[1]["children"].as_array().unwrap().len();
+        assert!(deep_kept > 0 && shallow_kept > 0, "deep {deep_kept}, shallow {shallow_kept}");
+        assert_eq!(t.shown_items, count_nodes(top));
     }
 }
