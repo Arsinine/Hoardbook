@@ -328,22 +328,28 @@
 	}
 </script>
 
-<div class="page">
-	<header>
-		<h1>Topics</h1>
-		<div class="header-actions">
-			<div class="tabs">
-				<button class="tab" class:tab-active={tab === 'mine'} onclick={() => (tab = 'mine')}>My Topics</button>
-				<button class="tab" class:tab-active={tab === 'discover'} onclick={() => (tab = 'discover')}>Discover</button>
-			</div>
-			<button class="btn-primary" onclick={() => (createOpen = true)}>+ New Topic</button>
+<!-- TopBar — the shared app shell (see routes/+page.svelte, contacts, settings). -->
+<div class="topbar">
+	<div>
+		<div class="topbar-title">Topics</div>
+		<div class="topbar-sub">
+			{mine.length} Topic{mine.length !== 1 ? 's' : ''} joined
 		</div>
-	</header>
+	</div>
+	<div class="topbar-actions">
+		<div class="tabs">
+			<button class="tab" class:tab-active={tab === 'mine'} onclick={() => (tab = 'mine')}>My Topics</button>
+			<button class="tab" class:tab-active={tab === 'discover'} onclick={() => (tab = 'discover')}>Discover</button>
+		</div>
+		<button class="btn-primary" onclick={() => (createOpen = true)}>+ New Topic</button>
+	</div>
+</div>
 
+<div class="body">
 	{#if tab === 'mine'}
 		<section class="master-detail">
 			<!-- Left: My Topics list -->
-			<div class="list-pane">
+			<div class="surface list-pane">
 				{#if mine.length === 0}
 					<p class="muted empty">You haven’t joined any Topics yet. Create one, or switch to Discover.</p>
 				{:else}
@@ -359,7 +365,7 @@
 			</div>
 
 			<!-- Right: detail (roster + invite + chat deep-link) -->
-			<div class="detail-pane">
+			<div class="surface detail-pane">
 				{#if openTopic}
 					<div class="detail-head">
 						<div class="grow">
@@ -426,7 +432,7 @@
 	{:else}
 		<!-- Discover tab — devtest v0.12.1 #7: browse public Topics by primitive (root category). No tag
 		     search; expand a category to fetch every public Topic under it (backend activity-ranked). -->
-		<section class="discover-tab">
+		<section class="surface discover-tab">
 			<p class="muted discover-hint">Browse public Topics by category. Expand one to see every public Topic under it.</p>
 			{#each TOPIC_ROOTS as root (root)}
 				<div class="root-group">
@@ -498,10 +504,31 @@
 {/if}
 
 <style>
-	.page { padding: 18px 22px; overflow-y: auto; height: 100%; box-sizing: border-box; display: flex; flex-direction: column; }
-	header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
-	header h1 { font-size: 18px; font-weight: 700; margin: 0; }
-	.header-actions { display: flex; align-items: center; gap: 10px; }
+	/* Shared app shell — same rules as routes/+page.svelte, contacts and settings. */
+	.topbar {
+		padding: 16px 24px;
+		border-bottom: 1px solid var(--border);
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: 16px;
+		background: var(--bg);
+		flex-shrink: 0;
+	}
+	.topbar-title { font-size: 17px; font-weight: 600; color: var(--fg); letter-spacing: -0.3px; }
+	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
+	.topbar-actions { display: flex; gap: 8px; align-items: center; }
+
+	.body { flex: 1; min-height: 0; padding: 18px 22px; box-sizing: border-box; display: flex; flex-direction: column; }
+
+	/* The card recipe the three panes shared verbatim — one declaration, padding per use.
+	   Same values as the settings page's `.surface`. */
+	.surface {
+		background: var(--bg-elev1);
+		border: 1px solid var(--border);
+		border-radius: 10px;
+	}
+
 	.tabs { display: inline-flex; background: var(--bg-elev1); border: 1px solid var(--border); border-radius: 8px; padding: 2px; }
 	.tab {
 		padding: 5px 12px; border: none; background: transparent; color: var(--fg-muted);
@@ -512,8 +539,7 @@
 	/* Master–detail */
 	.master-detail { display: flex; gap: 16px; align-items: stretch; flex: 1; min-height: 0; }
 	.list-pane {
-		width: 280px; flex-shrink: 0; overflow-y: auto;
-		background: var(--bg-elev1); border: 1px solid var(--border); border-radius: 10px; padding: 6px;
+		width: 280px; flex-shrink: 0; overflow-y: auto; padding: 6px;
 	}
 	.topic-row {
 		display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
@@ -522,20 +548,19 @@
 	.topic-row:hover { background: var(--bg-elev2); }
 	.topic-selected { background: var(--bg-elev3); }
 	.detail-pane {
-		flex: 1; min-width: 0; overflow-y: auto;
-		background: var(--bg-elev1); border: 1px solid var(--border); border-radius: 10px; padding: 16px;
+		flex: 1; min-width: 0; overflow-y: auto; padding: 16px;
 		display: flex; flex-direction: column; gap: 12px;
 	}
 	.detail-head { display: flex; align-items: flex-start; gap: 8px; }
 	.detail-title { font-size: 15px; font-weight: 700; }
 	.detail-section { display: flex; flex-direction: column; gap: 4px; }
-	.section-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; color: var(--fg-dim); }
+	/* Same ramp as contacts/settings `.section-label` (10.5px / 1.2px / 600). */
+	.section-label { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 1.2px; color: var(--fg-dim); }
 	.detail-empty { color: var(--fg-dim); font-size: 12.5px; margin: auto; text-align: center; max-width: 280px; }
 
 	/* Discover tab — devtest v0.12.1 #7: primitive (root category) accordion. */
 	.discover-tab {
-		flex: 1; min-height: 0; overflow-y: auto;
-		background: var(--bg-elev1); border: 1px solid var(--border); border-radius: 10px; padding: 16px;
+		flex: 1; min-height: 0; overflow-y: auto; padding: 16px;
 		display: flex; flex-direction: column; gap: 4px;
 	}
 	.discover-hint { margin-bottom: 6px; }
