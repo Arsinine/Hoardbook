@@ -9,7 +9,7 @@
 	import { toast } from '../stores.js';
 	import HintMarker from './HintMarker.svelte';
 	import CollectionTagsEditor from './CollectionTagsEditor.svelte';
-	import { MAX_DESCRIPTION_CHARS } from '../limits.js';
+	import { MAX_DESCRIPTION_CHARS, MAX_LANGUAGES, MAX_LIST_ITEM_CHARS } from '../limits.js';
 
 	interface Props {
 		collection: Collection;
@@ -60,9 +60,14 @@
 		contentTypes = toggleContentType(contentTypes, value);
 	}
 
+	// The backend clamps languages to MAX_LANGUAGES x MAX_LIST_ITEM_CHARS but returns nothing, and
+	// persist() keeps this optimistic array — so without refusing here the user is shown "Collection
+	// saved" for values that were silently discarded.
+	let langsAtLimit = $derived(languages.length >= MAX_LANGUAGES);
+
 	function addLang() {
-		const v = langInput.trim().replace(/,$/, '');
-		if (v && !languages.includes(v)) languages = [...languages, v];
+		const v = langInput.trim().replace(/,$/, '').slice(0, MAX_LIST_ITEM_CHARS);
+		if (v && !languages.includes(v) && !langsAtLimit) languages = [...languages, v];
 		langInput = '';
 	}
 	function langKeydown(e: KeyboardEvent) {
@@ -152,7 +157,15 @@
 			{#each languages as lang, i (lang)}
 				<span class="chip">{lang}<button type="button" class="chip-x" onclick={() => removeLang(i)} aria-label={`Remove ${lang}`}>×</button></span>
 			{/each}
-			<input class="lang-input" type="text" placeholder="+ language" bind:value={langInput} onkeydown={langKeydown} />
+			<input
+					class="lang-input"
+					type="text"
+					maxlength={MAX_LIST_ITEM_CHARS}
+					placeholder={langsAtLimit ? `${MAX_LANGUAGES} max` : '+ language'}
+					disabled={langsAtLimit}
+					bind:value={langInput}
+					onkeydown={langKeydown}
+				/>
 		</div>
 	</div>
 

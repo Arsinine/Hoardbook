@@ -35,9 +35,10 @@ mod wire_freeze;
 
 pub use error::HbError;
 pub use types::{Collection, DirectoryItem, ItemType, Profile, SocialLink, Visibility};
+pub use types::truncate_alias;
 pub use types::{
-    MAX_CONTENT_TYPES, MAX_DESCRIPTION_CHARS, MAX_EST_SIZE_CHARS, MAX_LANGUAGES,
-    FILESYSTEM_SLUG_CHARS, MAX_LIST_ITEM_CHARS, MAX_PATH_ALIAS_CHARS, MAX_TAGS, MAX_TAG_CHARS,
+    FILESYSTEM_SLUG_CHARS, MAX_CONTENT_TYPES, MAX_DESCRIPTION_CHARS, MAX_EST_SIZE_CHARS,
+    MAX_LANGUAGES, MAX_LIST_ITEM_CHARS, MAX_PATH_ALIAS_CHARS, MAX_TAGS, MAX_TAG_CHARS,
 };
 
 pub use backup::{
