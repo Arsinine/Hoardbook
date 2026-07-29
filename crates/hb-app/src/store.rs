@@ -383,8 +383,18 @@ impl DataStore {
     }
 
     /// Load a draft collection by slug.
+    ///
+    /// Clamps the metadata on the way out: a restored backup is untarred straight into the data
+    /// directory by `restore_data`, so a draft written by a pre-cap build reaches the app without
+    /// passing any command. Healing here means every reader — including the background rescan in
+    /// `watch.rs` — sees metadata that fits the publish budget.
     pub fn load_collection_draft(&self, slug: &str) -> Result<Option<Collection>> {
-        read_json(&self.collection_draft_path(slug)).context("loading collection draft")
+        let draft: Option<Collection> =
+            read_json(&self.collection_draft_path(slug)).context("loading collection draft")?;
+        Ok(draft.map(|mut c| {
+            c.clamp_metadata();
+            c
+        }))
     }
 
     /// List every collection draft's slug.

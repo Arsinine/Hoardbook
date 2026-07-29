@@ -235,6 +235,7 @@ async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult
         collection.sorted = prev.sorted;
     }
 
+    collection.clamp_metadata();
     store.save_collection_draft(&collection).map_err(cmd_err)?;
 
     // Persist the collection's on-disk root so the snapshot re-scan can find the tree again.
@@ -414,6 +415,9 @@ pub async fn update_collection_meta(
     col.tags = tags;
     col.languages = languages;
     col.sorted = sorted;
+    // The metadata and the directory tree share one 40 KB publish budget, and the envelope is
+    // measured first — uncapped metadata starves the tree (see `Collection::clamp_metadata`).
+    col.clamp_metadata();
     store.save_collection_draft(&col).map_err(cmd_err)
 }
 
@@ -1811,6 +1815,66 @@ mod tests {
             listing: vec![],
         };
         store.save_collection_draft(&col).unwrap();
+    }
+
+    #[test]
+    fn envelope_at_caps_leaves_the_tree_its_budget() {
+        // The metadata envelope and the directory tree share LISTING_MAX_BYTES: `truncate_listing`
+        // serializes the envelope, subtracts it, and gives `entries` the remainder — a subtraction
+        // that saturates to zero if the metadata alone is oversize, publishing a teaser with no
+        // entries at all. This pins the worst case the ceilings in hb-core actually permit.
+        //
+        // Every field is at its ceiling and every character is U+0001, which serde_json escapes to
+        // the six bytes `\u0001` — the most expensive encoding a single char has, worse than a
+        // 4-byte emoji. So this is an upper bound no real collection can exceed.
+        let worst = |n: usize| "\u{1}".repeat(n);
+        let mut col = Collection {
+            // The slug is not clamped by us — the filesystem bounds it, because it is the draft's
+            // filename. Sized here at that bound so the worst case stays honest.
+            slug: "s".repeat(hb_core::FILESYSTEM_SLUG_CHARS),
+            path_alias: worst(hb_core::MAX_PATH_ALIAS_CHARS),
+            description: Some(worst(hb_core::MAX_DESCRIPTION_CHARS)),
+            item_count: u64::MAX,
+            est_size: Some(worst(hb_core::MAX_EST_SIZE_CHARS)),
+            content_types: (0..hb_core::MAX_CONTENT_TYPES)
+                .map(|_| worst(hb_core::MAX_LIST_ITEM_CHARS))
+                .collect(),
+            tags: (0..hb_core::MAX_TAGS).map(|_| worst(hb_core::MAX_TAG_CHARS)).collect(),
+            languages: (0..hb_core::MAX_LANGUAGES)
+                .map(|_| worst(hb_core::MAX_LIST_ITEM_CHARS))
+                .collect(),
+            visibility: Visibility::Private,
+            sorted: true,
+            last_updated: chrono::Utc::now(),
+            listing: vec![],
+        };
+        // Already at the ceilings, so this is a no-op — asserted, because if clamp_metadata ever
+        // stopped covering a field this test would otherwise still pass on the clamped value.
+        let before = col.clone();
+        col.clamp_metadata();
+        assert_eq!(
+            serde_json::to_string(&col).unwrap().len(),
+            serde_json::to_string(&before).unwrap().len(),
+            "a field at its documented ceiling was clamped further — ceilings and clamp disagree"
+        );
+
+        let envelope = collection_to_listing_json(&col).unwrap();
+        // `truncate_listing` adds `truncated` + `total_items` on top of this before measuring.
+        let markers = r#","truncated":true,"total_items":18446744073709551615"#.len();
+        let overhead = envelope.len() + markers;
+
+        assert!(
+            overhead < LISTING_MAX_BYTES,
+            "worst-case metadata ({overhead} B) does not fit the publish budget ({LISTING_MAX_BYTES} B) \
+             — entries_budget would saturate to 0 and publish an empty teaser"
+        );
+        // Not merely "fits": the tree must keep effectively all of the budget.
+        let left_for_entries = LISTING_MAX_BYTES - overhead;
+        assert!(
+            left_for_entries >= 30_000,
+            "worst-case metadata leaves only {left_for_entries} B for the tree; \
+             tighten the ceilings in hb-core or raise LISTING_MAX_BYTES"
+        );
     }
 
     #[test]

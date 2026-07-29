@@ -567,12 +567,20 @@ fn truncate_tree(entries: &[Value], budget: usize) -> (Vec<Value>, usize) {
     (kept, count)
 }
 
-/// devtest #7 — truncate a listing to a SINGLE event of at most `max_bytes` instead of splitting it
-/// across many part events. A payload that fits is returned unchanged (`truncated: false`). An
-/// oversize one keeps a byte-bounded prefix of its `entries` tree and tags the index with
-/// `truncated: true` + `total_items` (the full node count) so a browser can render the kept items
-/// followed by a paywall-style "N more hidden" fade. The dropped items are simply not published —
-/// the browse side never learns their names (this is a preview, not a lossy split).
+/// devtest #7 — truncate a listing to a SINGLE event instead of splitting it across many part
+/// events. A payload that fits is returned unchanged (`truncated: false`). An oversize one keeps a
+/// byte-bounded selection of its `entries` tree and tags the index with `truncated: true` +
+/// `total_items` (the full node count) so a browser can render the kept items followed by a
+/// paywall-style "N more hidden" fade. The dropped items are simply not published — the browse side
+/// never learns their names (this is a preview, not a lossy split).
+///
+/// **What is bounded is `entries`, not the whole document.** The budget this function can spend is
+/// `max_bytes` minus the serialized metadata envelope, and it has no way to shrink that envelope —
+/// so an envelope that is itself over `max_bytes` yields a zero-length `entries` and a return value
+/// larger than `max_bytes`. That is not reachable in this app: `hb_core::Collection::clamp_metadata`
+/// caps every metadata field, and `envelope_at_caps_leaves_the_tree_its_budget` (hb-app) pins the
+/// worst case at ~8.5 KB against the 40 KB cap. **A caller that builds its own envelope owns that
+/// guarantee** — this function will not enforce it.
 pub fn truncate_listing(listing_json: &str, max_bytes: usize) -> Result<TruncatedListing, NetError> {
     let normalized = normalize(listing_json)?;
     let value: Value = serde_json::from_str(&normalized).map_err(|e| NetError::Split(e.to_string()))?;

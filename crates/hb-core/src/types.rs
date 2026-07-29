@@ -109,6 +109,63 @@ pub struct Collection {
     pub listing: Vec<DirectoryItem>,
 }
 
+// ---------------------------------------------------------------------------
+// Published-envelope metadata ceilings
+// ---------------------------------------------------------------------------
+
+/// Ceilings on the collection metadata that rides in every published listing, in **characters**
+/// (the unit the UI's `maxlength` counts, so the limit the user sees is the limit enforced).
+///
+/// These exist because the metadata and the directory tree share one byte budget.
+/// `hb_net::truncate_listing` measures the serialized envelope first and hands `entries` whatever
+/// is left (`split.rs:586`); with no ceiling, metadata alone could exceed `LISTING_MAX_BYTES` and
+/// the subtraction saturates to zero — publishing a teaser containing **no entries at all**, or,
+/// a little larger, an event the relay rejects outright. Capped, the envelope's worst case is a
+/// few KB against a 40 KB budget, so the tree keeps effectively all of it.
+///
+/// Worst case is measured, not assumed: `envelope_at_caps_leaves_the_tree_its_budget`
+/// (hb-app `collection.rs`) builds a Collection with every field at its ceiling and every
+/// character the most expensive one JSON can encode, then asserts the headroom.
+pub const MAX_DESCRIPTION_CHARS: usize = 255;
+/// How many tags a collection may carry. Tags are the discovery surface, so this is a product
+/// limit as much as a byte one — the budget would tolerate far more.
+pub const MAX_TAGS: usize = 8;
+pub const MAX_TAG_CHARS: usize = 32;
+pub const MAX_CONTENT_TYPES: usize = 10;
+pub const MAX_LANGUAGES: usize = 10;
+/// Shared ceiling for a single content-type or language entry.
+pub const MAX_LIST_ITEM_CHARS: usize = 32;
+pub const MAX_PATH_ALIAS_CHARS: usize = 128;
+/// **Not** a cap this code applies — the filesystem's, recorded so the envelope test can size its
+/// worst case. The slug is the draft's filename (`collections/<slug>.draft.json`) as well as the
+/// relay `d` tag, so a collection that exists on disk necessarily has a slug some filesystem
+/// accepted. Clamping it would be actively harmful: an existing collection whose alias slugifies
+/// longer than the cap would re-derive a *different* slug on its next rescan, miss its own draft,
+/// lose the notes/visibility/sorted carried across, and strand its published listing under the old
+/// `d` tag.
+pub const FILESYSTEM_SLUG_CHARS: usize = 255;
+/// `est_size` is written by `format_size` and never typed, but a restored or hand-edited draft can
+/// carry anything — so it is bounded like the rest rather than trusted.
+pub const MAX_EST_SIZE_CHARS: usize = 32;
+
+/// Truncate to at most `max` characters, always on a character boundary (slicing a `str` at an
+/// arbitrary byte index panics mid-codepoint).
+fn truncate_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((byte_idx, _)) => s[..byte_idx].to_string(),
+        None => s.to_string(),
+    }
+}
+
+fn clamp_list(v: &mut Vec<String>, max_items: usize, max_chars: usize) {
+    v.truncate(max_items);
+    for s in v.iter_mut() {
+        if s.chars().count() > max_chars {
+            *s = truncate_chars(s, max_chars);
+        }
+    }
+}
+
 impl Collection {
     /// Derive a URL-safe slug from a display name.
     /// "Criterion Collection" → "criterion-collection"
@@ -122,6 +179,28 @@ impl Collection {
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("-")
+    }
+
+    /// Clamp the metadata fields to the ceilings above.
+    ///
+    /// Applied where user input enters *and* on load, because the load path is the only one a
+    /// restored backup passes through: `restore_data` untars the archive straight into the data
+    /// directory, so a draft written by a pre-cap build never sees a command.
+    ///
+    /// `slug` is deliberately **not** clamped here. It is the relay `d` tag and the draft's
+    /// filename, so shortening an existing one would orphan the collection on disk and re-address
+    /// it on the relay; it is capped once, at derivation, in [`Collection::slug_from_alias`].
+    pub fn clamp_metadata(&mut self) {
+        self.path_alias = truncate_chars(&self.path_alias, MAX_PATH_ALIAS_CHARS);
+        if let Some(d) = &self.description {
+            self.description = Some(truncate_chars(d, MAX_DESCRIPTION_CHARS));
+        }
+        if let Some(e) = &self.est_size {
+            self.est_size = Some(truncate_chars(e, MAX_EST_SIZE_CHARS));
+        }
+        clamp_list(&mut self.tags, MAX_TAGS, MAX_TAG_CHARS);
+        clamp_list(&mut self.content_types, MAX_CONTENT_TYPES, MAX_LIST_ITEM_CHARS);
+        clamp_list(&mut self.languages, MAX_LANGUAGES, MAX_LIST_ITEM_CHARS);
     }
 }
 
@@ -363,6 +442,111 @@ mod tests {
         // Pre-#7 listing with no `sorted` key ⇒ false (never a spurious "sorted" badge).
         let legacy = r#"{"slug":"x","path_alias":"X","item_count":0,"last_updated":"2026-04-01T00:00:00Z","listing":[]}"#;
         assert!(!serde_json::from_str::<Collection>(legacy).unwrap().sorted, "missing sorted ⇒ false");
+    }
+
+    #[test]
+    fn clamp_metadata_holds_every_ceiling() {
+        let mut col = Collection {
+            slug: "keep-me".into(),
+            path_alias: "a".repeat(500),
+            description: Some("d".repeat(9_000)),
+            item_count: 0,
+            est_size: None,
+            content_types: (0..40).map(|i| format!("{i}{}", "c".repeat(80))).collect(),
+            tags: (0..40).map(|i| format!("{i}{}", "t".repeat(80))).collect(),
+            languages: (0..40).map(|i| format!("{i}{}", "l".repeat(80))).collect(),
+            visibility: Visibility::Public,
+            sorted: false,
+            last_updated: Utc::now(),
+            listing: vec![],
+        };
+        col.clamp_metadata();
+
+        assert_eq!(col.path_alias.chars().count(), MAX_PATH_ALIAS_CHARS);
+        assert_eq!(col.description.as_ref().unwrap().chars().count(), MAX_DESCRIPTION_CHARS);
+        assert_eq!(col.tags.len(), MAX_TAGS);
+        assert_eq!(col.content_types.len(), MAX_CONTENT_TYPES);
+        assert_eq!(col.languages.len(), MAX_LANGUAGES);
+        for t in &col.tags {
+            assert!(t.chars().count() <= MAX_TAG_CHARS, "tag over ceiling: {t}");
+        }
+        for v in col.content_types.iter().chain(col.languages.iter()) {
+            assert!(v.chars().count() <= MAX_LIST_ITEM_CHARS, "list item over ceiling: {v}");
+        }
+        // The slug is the relay `d` tag and the draft filename — clamping must never touch it.
+        assert_eq!(col.slug, "keep-me", "clamp_metadata must not re-address the collection");
+        // Truncation keeps the FIRST items, so what the user typed first survives.
+        assert!(col.tags[0].starts_with('0'), "clamp kept the wrong end of the list");
+    }
+
+    #[test]
+    fn clamp_metadata_truncates_on_character_boundaries() {
+        // Slicing a str at an arbitrary byte index panics mid-codepoint. Every field gets a
+        // multi-byte value whose ceiling falls inside a character.
+        let mut col = Collection {
+            slug: "s".into(),
+            path_alias: "é".repeat(MAX_PATH_ALIAS_CHARS + 40),
+            description: Some("🎬".repeat(MAX_DESCRIPTION_CHARS + 40)),
+            item_count: 0,
+            est_size: None,
+            content_types: vec![],
+            tags: vec!["日".repeat(MAX_TAG_CHARS + 10)],
+            languages: vec![],
+            visibility: Visibility::Public,
+            sorted: false,
+            last_updated: Utc::now(),
+            listing: vec![],
+        };
+        col.clamp_metadata(); // must not panic
+
+        assert_eq!(col.description.as_ref().unwrap().chars().count(), MAX_DESCRIPTION_CHARS);
+        assert_eq!(col.path_alias.chars().count(), MAX_PATH_ALIAS_CHARS);
+        assert_eq!(col.tags[0].chars().count(), MAX_TAG_CHARS);
+        // A 4-byte codepoint means the char ceiling is not the byte length — that is fine, and the
+        // envelope test in hb-app is what pins the resulting bytes.
+        assert_eq!(col.description.as_ref().unwrap().len(), MAX_DESCRIPTION_CHARS * 4);
+    }
+
+    #[test]
+    fn clamp_metadata_is_idempotent_and_leaves_short_values_alone() {
+        let mut col = Collection {
+            slug: "s".into(),
+            path_alias: "Shorts".into(),
+            description: Some("a tweet-sized note".into()),
+            item_count: 0,
+            est_size: None,
+            content_types: vec!["video".into()],
+            tags: vec!["anime".into(), "bluray".into()],
+            languages: vec!["en".into()],
+            visibility: Visibility::Public,
+            sorted: false,
+            last_updated: Utc::now(),
+            listing: vec![],
+        };
+        let before = col.clone();
+        col.clamp_metadata();
+        col.clamp_metadata();
+        assert_eq!(col.path_alias, before.path_alias);
+        assert_eq!(col.description, before.description);
+        assert_eq!(col.tags, before.tags);
+        assert_eq!(col.content_types, before.content_types);
+        assert_eq!(col.languages, before.languages);
+    }
+
+    #[test]
+    fn slug_from_alias_is_left_uncapped_on_purpose() {
+        // The slug is the draft's FILENAME and the relay `d` tag. Capping it here would change the
+        // slug an existing long-aliased collection re-derives on rescan — it would miss its own
+        // draft, lose the notes/visibility/sorted that get carried across, and strand its published
+        // listing under the old `d` tag. The filesystem is what bounds it, not this function.
+        let alias = "The ".to_string() + &"Very ".repeat(80) + "Long Collection";
+        let slug = Collection::slug_from_alias(&alias);
+        assert!(
+            slug.chars().count() > MAX_PATH_ALIAS_CHARS,
+            "a long alias must still produce its full slug — clamping it orphans collections"
+        );
+        assert_eq!(slug, Collection::slug_from_alias(&alias), "slug derivation is not stable");
+        assert_eq!(Collection::slug_from_alias("Criterion Collection"), "criterion-collection");
     }
 
     #[test]
