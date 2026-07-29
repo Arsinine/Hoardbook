@@ -6,17 +6,25 @@
 		tags?: string[];
 	}
 
+	import { MAX_TAGS, MAX_TAG_CHARS } from '../limits.js';
+
 	let { tags = $bindable([]) }: Props = $props();
 
 	let input = $state('');
+
+	// Tags ride in the published listing envelope, which shares one 40 KB budget with the folder
+	// tree — the backend clamps to these same ceilings on save, so refusing here is what keeps the
+	// user from typing something that silently disappears. MAX_TAGS is also a discovery choice:
+	// the byte budget would tolerate many more.
+	let atLimit = $derived(tags.length >= MAX_TAGS);
 
 	function commit(next: string[]) {
 		tags = next;
 	}
 
 	function addTag(raw: string) {
-		const t = raw.trim().replace(/,$/, '').toLowerCase();
-		if (t && !tags.includes(t)) commit([...tags, t]);
+		const t = raw.trim().replace(/,$/, '').toLowerCase().slice(0, MAX_TAG_CHARS);
+		if (t && !tags.includes(t) && !atLimit) commit([...tags, t]);
 		input = '';
 	}
 
@@ -46,7 +54,9 @@
 	<input
 		class="tag-input"
 		type="text"
-		placeholder="+ add a tag"
+		maxlength={MAX_TAG_CHARS}
+		placeholder={atLimit ? `${MAX_TAGS} tags max` : '+ add a tag'}
+		disabled={atLimit}
 		bind:value={input}
 		onkeydown={handleKeydown}
 	/>

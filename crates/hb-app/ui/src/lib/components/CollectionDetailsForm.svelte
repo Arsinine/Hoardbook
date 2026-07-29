@@ -9,6 +9,7 @@
 	import { toast } from '../stores.js';
 	import HintMarker from './HintMarker.svelte';
 	import CollectionTagsEditor from './CollectionTagsEditor.svelte';
+	import { MAX_DESCRIPTION_CHARS } from '../limits.js';
 
 	interface Props {
 		collection: Collection;
@@ -157,7 +158,19 @@
 
 	<div class="field">
 		<label class="field-label" for="cdf-notes">Notes</label>
-		<textarea id="cdf-notes" class="notes-input" rows="3" placeholder="Add notes about this collection (visible to peers)…" bind:value={notes}></textarea>
+		<textarea
+			id="cdf-notes"
+			class="notes-input"
+			rows="3"
+			maxlength={MAX_DESCRIPTION_CHARS}
+			placeholder="Add notes about this collection (visible to peers)…"
+			bind:value={notes}
+		></textarea>
+		<!-- The notes ride in every published listing, sharing one 40 KB budget with the folder
+		     tree — so the count is shown rather than letting the backend silently clamp. -->
+		<div class="char-count" class:near-limit={notes.length > MAX_DESCRIPTION_CHARS - 40}>
+			{notes.length}/{MAX_DESCRIPTION_CHARS}
+		</div>
 	</div>
 
 	<div class="field-row">
@@ -292,6 +305,15 @@
 		resize: vertical;
 	}
 	.notes-input::placeholder { color: var(--fg-dim); }
+
+	.char-count {
+		align-self: flex-end;
+		margin-top: 3px;
+		font-size: 11px;
+		color: var(--fg-dim);
+		font-variant-numeric: tabular-nums;
+	}
+	.char-count.near-limit { color: var(--fg-muted); }
 
 	.check-row {
 		display: flex;
