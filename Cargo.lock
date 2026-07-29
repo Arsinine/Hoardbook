@@ -1866,6 +1866,7 @@ name = "hb-it"
 version = "0.12.6"
 dependencies = [
  "anyhow",
+ "chrono",
  "hb-core",
  "hb-net",
  "nostr",

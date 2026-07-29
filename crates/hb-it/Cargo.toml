@@ -19,3 +19,6 @@ nostr      = { version = "=0.43.1", features = ["nip44", "nip59"] }
 tokio      = { workspace = true }
 anyhow     = { workspace = true }
 serde_json = { workspace = true }
+# Suite MAN builds its fixtures from real `hb_core::Collection` values rather than hand-written JSON
+# (Codex 2026-07-30), and `Collection::last_updated` is a `chrono::DateTime<Utc>`.
+chrono     = { workspace = true }
