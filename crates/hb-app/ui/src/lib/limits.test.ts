@@ -1,7 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { MAX_DESCRIPTION_CHARS, MAX_TAGS, MAX_TAG_CHARS } from './limits.js';
+import {
+	MAX_DESCRIPTION_CHARS,
+	MAX_TAGS,
+	MAX_TAG_CHARS,
+	MAX_LANGUAGES,
+	MAX_LIST_ITEM_CHARS,
+} from './limits.js';
 
 // The UI shows these limits; the backend enforces them. If the two drift, the user is told one
 // number and clamped to another — which looks exactly like the app eating their text. Parse the
@@ -19,6 +25,8 @@ describe('metadata ceilings mirror hb-core', () => {
 		expect(MAX_DESCRIPTION_CHARS).toBe(rustConst('MAX_DESCRIPTION_CHARS'));
 		expect(MAX_TAGS).toBe(rustConst('MAX_TAGS'));
 		expect(MAX_TAG_CHARS).toBe(rustConst('MAX_TAG_CHARS'));
+		expect(MAX_LANGUAGES).toBe(rustConst('MAX_LANGUAGES'));
+		expect(MAX_LIST_ITEM_CHARS).toBe(rustConst('MAX_LIST_ITEM_CHARS'));
 	});
 
 	it('keeps the description at a tweet-ish length', () => {

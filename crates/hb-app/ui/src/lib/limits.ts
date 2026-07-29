@@ -11,3 +11,5 @@
 export const MAX_DESCRIPTION_CHARS = 255;
 export const MAX_TAGS = 8;
 export const MAX_TAG_CHARS = 32;
+export const MAX_LANGUAGES = 10;
+export const MAX_LIST_ITEM_CHARS = 32;

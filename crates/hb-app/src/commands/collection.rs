@@ -164,7 +164,10 @@ pub async fn list_subdirs(path: String) -> CmdResult<Vec<SubdirEntry>> {
 async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult<Collection> {
     let root = std::path::PathBuf::from(&opts.path);
 
-    let slug = Collection::slug_from_alias(&opts.path_alias);
+    // Bound the alias here, before the slug is derived from it — this is the one place shortening
+    // it is safe, because no slug exists yet to be re-addressed (see `Collection::clamp_metadata`).
+    let path_alias = hb_core::truncate_alias(&opts.path_alias);
+    let slug = Collection::slug_from_alias(&path_alias);
     if !is_valid_slug(&slug) {
         return Err(format!(
             "'{}' produces an invalid collection slug — use only letters, numbers, hyphens, or Unicode characters; avoid spaces and symbols",
@@ -207,7 +210,7 @@ async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult
 
     let mut collection = Collection {
         slug,
-        path_alias: opts.path_alias,
+        path_alias,
         description: None,
         item_count,
         est_size,
@@ -424,8 +427,12 @@ pub async fn update_collection_meta(
 /// Map a `Collection` draft to the render-model listing JSON: the directory tree moves from
 /// `listing` to `entries` (what `hb-net::render_listing` consumes), the rest stays as metadata.
 /// Pure — unit-tested without a relay.
-pub(crate) fn collection_to_listing_json(col: &Collection) -> Result<String, String> {
-    let mut v = serde_json::to_value(col).map_err(cmd_err)?;
+pub(crate) fn collection_to_listing_json(mut col: Collection) -> Result<String, String> {
+    // The single choke point for every published envelope — public listings, per-recipient private
+    // ones, and `.hbmanifest` exports all arrive here — so it is where the metadata gets bounded.
+    // `col` is taken by value precisely so this cannot touch anything the caller keeps.
+    col.clamp_for_publish();
+    let mut v = serde_json::to_value(&col).map_err(cmd_err)?;
     if let serde_json::Value::Object(ref mut map) = v {
         if let Some(listing) = map.remove("listing") {
             map.insert("entries".into(), listing);
@@ -453,7 +460,7 @@ pub(crate) fn prepare_listing(slug: &str, store: &DataStore) -> Result<String, S
     if collection.content_types.is_empty() {
         return Err("At least one content type is required before publishing a collection.".into());
     }
-    collection_to_listing_json(&collection)
+    collection_to_listing_json(collection)
 }
 
 /// Current unix time in seconds (the seal/publish timestamp). A clock before 1970 reads as 0.
@@ -725,8 +732,10 @@ fn build_slug_manifest(
             "At least one content type is required before exporting a collection manifest.".into()
         );
     }
-    // Same bytes and fingerprint the publish path derives (parity with the teaser), no re-scan.
-    let plaintext = collection_to_listing_json(&col)?;
+    // Fingerprint the tree before the collection is consumed below; same bytes and fingerprint the
+    // publish path derives (parity with the teaser), no re-scan.
+    let fingerprint = hb_core::snapshot_fingerprint(&col.listing).0;
+    let plaintext = collection_to_listing_json(col)?;
     // Chunk the listing exactly like the big-relay carrier — split at the per-part NIP-44 budget, so a
     // `.hbmanifest` can hold a collection of ANY size (the envelope stores the encrypted parts inline,
     // bounded by part count, not by one event's plaintext cap). A listing that fits one event yields a
@@ -736,7 +745,6 @@ fn build_slug_manifest(
         .into_iter()
         .map(|part| part.json)
         .collect();
-    let fingerprint = hb_core::snapshot_fingerprint(&col.listing).0;
     hb_core::manifest::build_manifest_envelope(
         identity,
         safe_slug,
@@ -1858,7 +1866,7 @@ mod tests {
             "a field at its documented ceiling was clamped further — ceilings and clamp disagree"
         );
 
-        let envelope = collection_to_listing_json(&col).unwrap();
+        let envelope = collection_to_listing_json(col).unwrap();
         // `truncate_listing` adds `truncated` + `total_items` on top of this before measuring.
         let markers = r#","truncated":true,"total_items":18446744073709551615"#.len();
         let overhead = envelope.len() + markers;
@@ -1904,7 +1912,7 @@ mod tests {
                 children: vec![],
             }],
         };
-        let json = collection_to_listing_json(&col).unwrap();
+        let json = collection_to_listing_json(col.clone()).unwrap();
         assert!(json.contains("\"entries\""), "tree must be under `entries`");
         assert!(!json.contains("\"listing\""), "`listing` key must be renamed away");
         let rendered = hb_net::render_listing(&[json]).unwrap();
@@ -2092,7 +2100,7 @@ mod tests {
                 children: vec![],
             }],
         };
-        let base = collection_to_listing_json(&col).unwrap();
+        let base = collection_to_listing_json(col).unwrap();
 
         // Feature off (blank / whitespace) ⇒ byte-identical: the small-collection teaser is unchanged.
         assert_eq!(stamp_big_relay_url(&base, "").unwrap(), base);

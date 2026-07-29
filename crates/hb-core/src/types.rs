@@ -157,6 +157,13 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
+/// Bound a display alias at creation, before a slug is derived from it. Separate from
+/// [`Collection::clamp_metadata`] on purpose — see that method for why a *stored* alias must never
+/// be shortened after the fact.
+pub fn truncate_alias(alias: &str) -> String {
+    truncate_chars(alias, MAX_PATH_ALIAS_CHARS)
+}
+
 fn clamp_list(v: &mut Vec<String>, max_items: usize, max_chars: usize) {
     v.truncate(max_items);
     for s in v.iter_mut() {
@@ -181,17 +188,20 @@ impl Collection {
             .join("-")
     }
 
-    /// Clamp the metadata fields to the ceilings above.
+    /// Clamp the metadata that is **safe to persist**, for data the user just entered.
     ///
-    /// Applied where user input enters *and* on load, because the load path is the only one a
-    /// restored backup passes through: `restore_data` untars the archive straight into the data
-    /// directory, so a draft written by a pre-cap build never sees a command.
+    /// **`path_alias` is excluded, and that exclusion is the whole point.** The slug is derived
+    /// from the alias ([`Collection::slug_from_alias`]) and is both the relay `d` tag and the
+    /// draft's filename. Shortening a *stored* alias therefore re-addresses the collection: its
+    /// next rescan derives a different slug, misses its own draft, loses the notes/visibility/
+    /// sorted carried across, and forks a second draft that defaults to `Public` while the original
+    /// listing stays published under the old `d` tag — a Private collection can fork into a Public
+    /// one. Clamping the identity itself was rejected for this reason; clamping the value the
+    /// identity is *derived from* has the identical effect, which is easy to miss.
     ///
-    /// `slug` is deliberately **not** clamped here. It is the relay `d` tag and the draft's
-    /// filename, so shortening an existing one would orphan the collection on disk and re-address
-    /// it on the relay; it is capped once, at derivation, in [`Collection::slug_from_alias`].
+    /// Bound the alias only where it cannot re-address anything: at creation, before the slug is
+    /// derived from it, and on the throwaway copy in [`Collection::clamp_for_publish`].
     pub fn clamp_metadata(&mut self) {
-        self.path_alias = truncate_chars(&self.path_alias, MAX_PATH_ALIAS_CHARS);
         if let Some(d) = &self.description {
             self.description = Some(truncate_chars(d, MAX_DESCRIPTION_CHARS));
         }
@@ -201,6 +211,23 @@ impl Collection {
         clamp_list(&mut self.tags, MAX_TAGS, MAX_TAG_CHARS);
         clamp_list(&mut self.content_types, MAX_CONTENT_TYPES, MAX_LIST_ITEM_CHARS);
         clamp_list(&mut self.languages, MAX_LANGUAGES, MAX_LIST_ITEM_CHARS);
+    }
+
+    /// [`Collection::clamp_metadata`] plus `path_alias` — the full envelope bound.
+    ///
+    /// **Only ever call this on a copy that is about to be serialized into a published listing,
+    /// never on anything that gets saved.** This is what actually enforces the budget: the metadata
+    /// and the directory tree share `LISTING_MAX_BYTES`, and `truncate_listing` measures the
+    /// metadata first, so an unbounded envelope leaves the tree nothing and publishes a teaser with
+    /// no entries in it.
+    ///
+    /// Bounding here rather than on load is deliberate. Load-time clamping reached the *stored*
+    /// draft, which meant the background filesystem watcher re-saved a truncated copy and destroyed
+    /// a legacy description no one had asked it to touch. A published copy is a fine thing to
+    /// shorten; the user's own data is not.
+    pub fn clamp_for_publish(&mut self) {
+        self.clamp_metadata();
+        self.path_alias = truncate_chars(&self.path_alias, MAX_PATH_ALIAS_CHARS);
     }
 }
 
@@ -462,7 +489,7 @@ mod tests {
         };
         col.clamp_metadata();
 
-        assert_eq!(col.path_alias.chars().count(), MAX_PATH_ALIAS_CHARS);
+        assert_eq!(col.path_alias.chars().count(), 500, "clamp_metadata must leave the alias alone");
         assert_eq!(col.description.as_ref().unwrap().chars().count(), MAX_DESCRIPTION_CHARS);
         assert_eq!(col.tags.len(), MAX_TAGS);
         assert_eq!(col.content_types.len(), MAX_CONTENT_TYPES);
@@ -477,6 +504,70 @@ mod tests {
         assert_eq!(col.slug, "keep-me", "clamp_metadata must not re-address the collection");
         // Truncation keeps the FIRST items, so what the user typed first survives.
         assert!(col.tags[0].starts_with('0'), "clamp kept the wrong end of the list");
+    }
+
+    #[test]
+    fn clamp_metadata_never_touches_the_slugs_source() {
+        // The regression this exists for: `slug` is derived from `path_alias`, and is both the
+        // relay `d` tag and the draft filename. An earlier version clamped `path_alias` in
+        // `clamp_metadata`, which is applied to STORED data — so a collection whose alias exceeded
+        // the ceiling re-derived a different slug on its next rescan, missed its own draft, lost
+        // the notes/visibility/sorted carried across, and forked a second draft defaulting to
+        // Public while the original listing stayed published under the old `d` tag. A Private
+        // collection could fork into a Public one.
+        let long_alias = "A".repeat(MAX_PATH_ALIAS_CHARS + 40);
+        let mut col = Collection {
+            slug: Collection::slug_from_alias(&long_alias),
+            path_alias: long_alias.clone(),
+            description: Some("d".repeat(9_000)),
+            item_count: 0,
+            est_size: None,
+            content_types: vec![],
+            tags: vec![],
+            languages: vec![],
+            visibility: Visibility::Private,
+            sorted: false,
+            last_updated: Utc::now(),
+            listing: vec![],
+        };
+        let slug_before = col.slug.clone();
+        col.clamp_metadata();
+
+        assert_eq!(col.path_alias, long_alias, "clamp_metadata must not shorten a STORED alias");
+        assert_eq!(
+            Collection::slug_from_alias(&col.path_alias),
+            slug_before,
+            "the alias must still re-derive the SAME slug — otherwise a rescan forks the collection"
+        );
+        assert_eq!(col.visibility, Visibility::Private, "visibility must survive clamping");
+        // The fields it is responsible for are still bounded.
+        assert_eq!(col.description.as_ref().unwrap().chars().count(), MAX_DESCRIPTION_CHARS);
+    }
+
+    #[test]
+    fn clamp_for_publish_bounds_the_alias_on_the_outgoing_copy() {
+        // The alias still has to be bounded somewhere, or a legacy oversize one starves the tree.
+        // `clamp_for_publish` is that place: it runs on the throwaway copy that becomes the
+        // published envelope, never on anything saved.
+        let mut col = Collection {
+            slug: "keep".into(),
+            path_alias: "A".repeat(MAX_PATH_ALIAS_CHARS + 40),
+            description: Some("d".repeat(9_000)),
+            item_count: 0,
+            est_size: Some("x".repeat(400)),
+            content_types: vec![],
+            tags: vec![],
+            languages: vec![],
+            visibility: Visibility::Public,
+            sorted: false,
+            last_updated: Utc::now(),
+            listing: vec![],
+        };
+        col.clamp_for_publish();
+        assert_eq!(col.path_alias.chars().count(), MAX_PATH_ALIAS_CHARS);
+        assert_eq!(col.description.as_ref().unwrap().chars().count(), MAX_DESCRIPTION_CHARS);
+        assert_eq!(col.est_size.as_ref().unwrap().chars().count(), MAX_EST_SIZE_CHARS);
+        assert_eq!(col.slug, "keep", "even the publish copy must not re-address the collection");
     }
 
     #[test]
@@ -500,7 +591,6 @@ mod tests {
         col.clamp_metadata(); // must not panic
 
         assert_eq!(col.description.as_ref().unwrap().chars().count(), MAX_DESCRIPTION_CHARS);
-        assert_eq!(col.path_alias.chars().count(), MAX_PATH_ALIAS_CHARS);
         assert_eq!(col.tags[0].chars().count(), MAX_TAG_CHARS);
         // A 4-byte codepoint means the char ceiling is not the byte length — that is fine, and the
         // envelope test in hb-app is what pins the resulting bytes.

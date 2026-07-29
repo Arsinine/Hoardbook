@@ -171,7 +171,7 @@ mod tests {
                 children: vec![],
             }],
         };
-        let json = collection_to_listing_json(&col).unwrap();
+        let json = collection_to_listing_json(col).unwrap();
         assert!(json.contains("\"entries\""), "the sealed form uses `entries`");
         let back = private_listing_to_collection(&json).unwrap();
         assert_eq!(back.slug, "vault");

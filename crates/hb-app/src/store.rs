@@ -384,17 +384,14 @@ impl DataStore {
 
     /// Load a draft collection by slug.
     ///
-    /// Clamps the metadata on the way out: a restored backup is untarred straight into the data
-    /// directory by `restore_data`, so a draft written by a pre-cap build reaches the app without
-    /// passing any command. Healing here means every reader — including the background rescan in
-    /// `watch.rs` — sees metadata that fits the publish budget.
+    /// Deliberately does **not** clamp. An earlier version did, to bound legacy metadata from a
+    /// restored backup, and it was wrong twice over: the background watcher in `watch.rs` loads and
+    /// re-saves on any source-tree change, so the truncation became a silent, permanent edit to a
+    /// description the user never touched; and truncating `path_alias` here re-addressed the
+    /// collection on its next rescan (see `Collection::clamp_metadata`). The publish budget is
+    /// enforced on the outgoing copy instead — `collection_to_listing_json`.
     pub fn load_collection_draft(&self, slug: &str) -> Result<Option<Collection>> {
-        let draft: Option<Collection> =
-            read_json(&self.collection_draft_path(slug)).context("loading collection draft")?;
-        Ok(draft.map(|mut c| {
-            c.clamp_metadata();
-            c
-        }))
+        read_json(&self.collection_draft_path(slug)).context("loading collection draft")
     }
 
     /// List every collection draft's slug.
