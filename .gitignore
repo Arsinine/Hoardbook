@@ -2,6 +2,8 @@ HOARDBOOK_SPEC.md
 target/
 .claude/
 node_modules/
+# Vite writes these next to the config while running vitest and does not always clean them up.
+crates/hb-app/ui/vite.config.ts.timestamp-*.mjs
 CLAUDE.md
 graphify-out/
 *.db
