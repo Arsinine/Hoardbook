@@ -23,6 +23,7 @@ mod same_nat;
 mod suite_ab;
 mod suite_bigrelay;
 mod suite_browse;
+mod suite_cap;
 mod suite_canary;
 mod suite_count;
 mod suite_disc;
@@ -107,6 +108,8 @@ async fn main() -> Result<()> {
     results.extend(suite_ab::run(&ctx).await);
     eprintln!("-- Suite BROWSE: M3 value loop (publish / discover / browse / re-key) --");
     results.extend(suite_browse::run(&ctx).await);
+    eprintln!("-- Suite CAP: teaser envelope budget — metadata must not starve the tree --");
+    results.extend(suite_cap::run(&ctx).await);
     eprintln!("-- Suite BIGRELAY: M16 Layer 3 full-family big-relay carrier (publish / fetch / gate) --");
     results.extend(suite_bigrelay::run(&ctx).await);
     eprintln!("-- Suite PRIV: Private Collections (per-recipient gift-wrapped listings, M10) --");
