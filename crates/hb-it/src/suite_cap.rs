@@ -49,9 +49,9 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
 /// The publish budget the app uses. hb-it cannot depend on hb-app (the Tauri crate), so the value is
 /// restated — and pinned to hb-app's source, because a silently-restated constant is exactly how a
 /// budget change leaves this suite green while production behaviour moves.
-const LISTING_MAX_BYTES: usize = 40_000;
+pub(crate) const LISTING_MAX_BYTES: usize = 40_000;
 
-fn ensure_budget_matches_hb_app() -> Result<()> {
+pub(crate) fn ensure_budget_matches_hb_app() -> Result<()> {
     const SRC: &str = include_str!("../../hb-app/src/commands/collection.rs");
     const DECL: &str = "const LISTING_MAX_BYTES: usize = 40_000;";
     ensure!(

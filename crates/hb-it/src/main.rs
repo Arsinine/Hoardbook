@@ -29,6 +29,7 @@ mod suite_count;
 mod suite_disc;
 mod suite_dm;
 mod suite_id;
+mod suite_manifest;
 mod suite_n;
 mod suite_priv;
 mod suite_relay;
@@ -112,6 +113,8 @@ async fn main() -> Result<()> {
     results.extend(suite_cap::run(&ctx).await);
     eprintln!("-- Suite BIGRELAY: M16 Layer 3 full-family big-relay carrier (publish / fetch / gate) --");
     results.extend(suite_bigrelay::run(&ctx).await);
+    eprintln!("-- Suite MAN: M16 Layer 2 .hbmanifest file carrier (export / import / stale gate) --");
+    results.extend(suite_manifest::run(&ctx).await);
     eprintln!("-- Suite PRIV: Private Collections (per-recipient gift-wrapped listings, M10) --");
     results.extend(suite_priv::run(&ctx).await);
     eprintln!("-- Suite TOPIC: Topics (announce / membership / channel / invite, M11) --");
