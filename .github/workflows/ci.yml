@@ -53,32 +53,62 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace --locked
 
-      # INV-4 (v0.9.6): Hoardbook moves no files. The transfer plane — the iroh transport dep, the
-      # xfer/follower gate + the sealed presence address (hb-core), and the DownloadQueue UI — moved
-      # to the Mascara companion and must not creep back (the standing honeypot tripwire). Greps code
-      # CONSTRUCTS (dep lines, module decls, retired symbols, the component file), not prose, so the
-      # legitimate "moved to Mascara" doc comments don't trip it. Ubuntu-only — one grep pass suffices.
-      - name: INV-4 sweep — no file-transfer plane in Hoardbook
+      # INV-4′ (M18): **Hoardbook moves no COLLECTION FILES.** A transport plane exists (the manifest
+      # plane, `hb-app/src/transport.rs`) and is structurally limited to `ManifestPayload`.
+      #
+      # This sweep is INV-4′ enforcement mechanism 3, and it was REWRITTEN, not weakened, in the same
+      # commit that added the iroh dep. The retired probes grepped for the *dep itself* — correct
+      # while no plane existed, red by construction once one does — so deleting them without a
+      # replacement is exactly the failure mode INVARIANT_AUDIT §6b describes. The replacement greps
+      # for the constructs that would make the plane a FILE mover instead:
+      #   · a download queue / verb anywhere (the retired plane's orchestration),
+      #   · filesystem reads INSIDE the transport module (a plane that opens a file is moving files),
+      #   · the retired xfer crypto in hb-core (unchanged — that shape is still forbidden; addresses
+      #     ride a sealed ticket in a DM, never the public presence event).
+      # Greps code CONSTRUCTS, not prose: every hit on a COMMENT line is dropped, because describing
+      # a boundary is not crossing it and a module that documents what it refuses to do names those
+      # things. The retired sweep claimed this property but did not implement it — it matched a
+      # `seal_addrs` mention in `hb-core::ticket`'s doc comment, so it was latently red from W1 slice
+      # 1 and would have failed the first push. Comment-stripping is what makes the property real.
+      # Ubuntu-only — one grep pass suffices.
+      - name: INV-4′ sweep — the plane carries manifests, never collection files
         if: matrix.platform == 'ubuntu-latest'
         shell: bash
         run: |
           set -uo pipefail
           fail=0
-          sweep() { local desc="$1"; shift; if out=$(grep -rnE "$@" 2>/dev/null); then echo "::error::INV-4 regression — $desc:"; echo "$out"; fail=1; fi; }
-          sweep "iroh (or an iroh-* crate) is back in Cargo.lock" 'name = "iroh[-"]' Cargo.lock
-          sweep "iroh dep in a crate manifest"        'iroh' crates/*/Cargo.toml
+          # Drop `path:line:` hits whose content begins a comment (`//`, `///`, `//!`, `#`, `*`,
+          # `/*`, `<!--`). A commented-out construct is not a construct.
+          code_only() { grep -vE '^[^:]*:[0-9]+:[[:space:]]*(//|#|\*|/\*|<!--)'; }
+          sweep() { local desc="$1"; shift; if out=$(grep -rnE "$@" 2>/dev/null | code_only); then echo "::error::INV-4′ regression — $desc:"; echo "$out"; fail=1; fi; }
+          # The transport module is the whole surface allowed to hold a connection. Listed explicitly
+          # so a NEW transport file must be added here deliberately — an unlisted one is unswept.
+          TRANSPORT_FILES="crates/hb-app/src/transport.rs crates/hb-app/src/conn.rs"
           sweep "retired xfer crypto in hb-core"      'seal_addrs|unseal_addrs|resolve_node_key|verify_binding_token|follower_gate|SealedAddr|KIND_XFER' crates/hb-core/src
-          # Covers `mod x`, `pub mod x`, `pub(crate)/pub(super)/pub(in ..) mod x`, and a same-line `#[cfg(..)] mod x`.
-          sweep "a transfer/gate module declaration"  '^[[:space:]]*(#\[[^]]*\][[:space:]]*)*(pub(\([^)]*\))?[[:space:]]+)?mod[[:space:]]+(transfer|conn|p2p_it|gate)\b' crates
-          sweep "the DownloadQueue component is back" 'DownloadQueue' crates/hb-app/ui/src
-          if [ "$fail" -ne 0 ]; then echo "::error::Hoardbook moves no files (INV-4) — the above belongs in Mascara."; exit 1; fi
+          sweep "a transfer/gate module declaration"  '^[[:space:]]*(#\[[^]]*\][[:space:]]*)*(pub(\([^)]*\))?[[:space:]]+)?mod[[:space:]]+(transfer|gate)\b' crates
+          sweep "a download queue or download verb is back" 'DownloadQueue|request_download|cancel_download|DownloadRegistry' crates/hb-app/src crates/hb-app/ui/src crates/hb-core/src crates/hb-net/src
+          sweep "the transport module reads the filesystem — the plane is moving files" 'tokio::fs|std::fs::|File::open|PathBuf|std::path::Path' $TRANSPORT_FILES
+          sweep "the transport module takes a filesystem path" 'fn [a-z_]+\([^)]*(path|file_path|save_path): *&?(str|String|Path|PathBuf)' $TRANSPORT_FILES
+          # A content grep misses a file whose only tell is its NAME — an orphaned
+          # `DownloadQueue.svelte` referencing nothing has no matching text inside it. Verified by
+          # planting exactly that case: content-only probes stayed green.
+          # `mas-inv5-no-download.test.ts` is excluded by name: it is the guard that asserts no
+          # collection-file download affordance exists, and a probe that flags its own guard test is
+          # broken. (Caught by running this probe before trusting it.)
+          out=$(find crates/hb-app/src crates/hb-app/ui/src \
+                  \( -iname '*download*' -o -iname 'transfer.*' \) \
+                  ! -name 'mas-inv5-no-download.test.ts' 2>/dev/null)
+          if [ -n "$out" ]; then
+            echo "::error::INV-4′ regression — a download/transfer source file is back:"; echo "$out"; fail=1
+          fi
+          if [ "$fail" -ne 0 ]; then echo "::error::INV-4′ — Hoardbook moves no COLLECTION FILES. The above turns the manifest plane into a file mover."; exit 1; fi
+          echo "INV-4′ sweep clean — the transport module carries ManifestPayload and touches no files."
           # M14: Skeleton/Tailwind were de-vendored (the UI is hand-rolled oklch + scoped CSS) — a
           # CSS framework creeping back in is scope creep, not a feature.
           if out=$(grep -rnE '@skeletonlabs|tailwind' crates/hb-app/ui/src crates/hb-app/ui/package.json 2>/dev/null); then
             echo "::error::a CSS framework crept back in:"; echo "$out"; exit 1
           fi
           echo "CSS-framework sweep clean — no Skeleton/Tailwind in ui/src or package.json."
-          echo "INV-4 sweep clean — no file-transfer plane in Hoardbook."
           # DISC3/INV-2: the discovery surface is structurally browse-key-free (audit I-5).
           if out=$(grep -rnE 'browse_key|BrowseKey' crates/hb-net/src/discover.rs 2>/dev/null); then
             echo "::error::INV-2 regression — the browse-key reached the discovery surface:"; echo "$out"; exit 1
