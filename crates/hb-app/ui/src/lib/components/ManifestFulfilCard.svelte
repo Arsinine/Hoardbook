@@ -19,10 +19,18 @@
 		MANIFEST_BIG_RELAY_LINK,
 		type ManifestFulfilState,
 	} from '$lib/manifest-fulfil.js';
+	import { SEND_FULL_LIST_LABEL, SEND_FULL_LIST_FALLBACK } from '$lib/transport-ticket.js';
 
 	interface Props {
 		/** The pure-derived state for this request (from `deriveManifestFulfil`). Carries the slug. */
 		state: ManifestFulfilState;
+		/** Fired on "Send the full list" (M18 W4) — the parent invokes `send_full_list`, which builds
+		 *  the manifest, proves it fits the transport ceiling, mints a ticket for this one approval,
+		 *  and DMs it. **Always behind this explicit click**: the app never auto-sends (M17 #4). */
+		onsend: (slug: string) => void;
+		/** True while a send for this slug is in flight — the button disables rather than queueing a
+		 *  second approval for the same request. */
+		sending: boolean;
 		/** The snapshot fingerprint the asker saw (carried in the request as `fingerprint_seen`).
 		 *  Rendered so the owner can recognise which version of the tree the browser saw. Empty when
 		 *  the requester sent none. */
@@ -34,7 +42,7 @@
 		onexport: (slug: string) => void;
 	}
 
-	let { state, fingerprintSeen, hasBigRelay, onexport }: Props = $props();
+	let { state, fingerprintSeen, hasBigRelay, onexport, onsend, sending }: Props = $props();
 
 	let slug = $derived(state.slug);
 	let secondary = $derived(hasBigRelay ? MANIFEST_BIG_RELAY_HINT : MANIFEST_BIG_RELAY_LINK);
@@ -52,11 +60,24 @@
 		{#if state.stale}
 			<div class="mf-card-note" role="note">{MANIFEST_STALE_NOTE}</div>
 		{/if}
+		<!-- M18 W4: the fulfil verb is now the PRIMARY action — the request lands here and is answered
+		     here. Export is demoted to secondary but stays fully reachable, deliberately: the
+		     transport can fail (the asker offline, no route), and an owner left with a greyed-out
+		     button and no second route is exactly the dead end W7.1b was written to remove. -->
 		<div class="mf-card-actions">
-			<button type="button" class="btn-primary mf-card-action" onclick={() => onexport(slug)}>
+			<button
+				type="button"
+				class="btn-primary mf-card-action"
+				onclick={() => onsend(slug)}
+				disabled={sending}
+			>
+				{sending ? '…' : SEND_FULL_LIST_LABEL}
+			</button>
+			<button type="button" class="mf-card-action-secondary" onclick={() => onexport(slug)}>
 				Export manifest…
 			</button>
 		</div>
+		<div class="mf-card-secondary muted">{SEND_FULL_LIST_FALLBACK}</div>
 		<div class="mf-card-secondary" class:muted={!hasBigRelay}>{secondary}</div>
 	{:else if state.kind === 'private'}
 		<!-- No big-relay hint here: a Private collection is sealed per recipient, so publishing to a
@@ -145,6 +166,24 @@
 		line-height: 1;
 	}
 	.mf-card-action:hover { filter: brightness(1.05); }
+	.mf-card-action:disabled { opacity: 0.6; cursor: default; }
+
+	/* Export, demoted but present. Quieter than the primary and unmistakably still a real button —
+	   the fallback has to survive a transport failure, so it must not read as decoration. */
+	.mf-card-action-secondary {
+		align-self: flex-start;
+		padding: 5px 12px;
+		font-size: 11.5px;
+		font-weight: 600;
+		color: var(--fg);
+		background: var(--bg-elev1);
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		cursor: pointer;
+		white-space: nowrap;
+		line-height: 1;
+	}
+	.mf-card-action-secondary:hover { filter: brightness(1.08); }
 
 	.mf-card-secondary {
 		font-size: 11px;

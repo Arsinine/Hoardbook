@@ -3,6 +3,7 @@
 // Tauri — the backend (`dm_requests`) is the source of truth, this only renders it.
 
 import type { DmRequestView } from './types.js';
+import { transportTicketHint } from './transport-ticket.js';
 
 /** Shown beside the "Message requests" sidebar row — the number of quarantined stranger BUCKETS (not
  *  total messages: one badge count per distinct sender awaiting a decision). */
@@ -17,10 +18,13 @@ export function sortRequests(requests: DmRequestView[]): DmRequestView[] {
 }
 
 /** The bucket's LAST message, truncated for the row preview (an ellipsis marks truncation). A
- *  manifest-request DM shows its human hint instead of the raw JSON payload. */
+ *  manifest-request DM shows its human hint instead of the raw JSON payload — and so does a M18
+ *  transport ticket, which a stranger can send just as easily (it lands here, unredeemed, until its
+ *  sender is accepted). Any structured DM body must have a hint here, or the row shows raw JSON. */
 export function requestPreview(r: DmRequestView, max = 80): string {
 	const last = r.messages[r.messages.length - 1];
-	const text = manifestRequestHint(last?.content ?? '') ?? last?.content ?? '';
+	const content = last?.content ?? '';
+	const text = manifestRequestHint(content) ?? transportTicketHint(content) ?? content;
 	return text.length > max ? text.slice(0, max - 1) + '…' : text;
 }
 

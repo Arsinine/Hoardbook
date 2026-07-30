@@ -153,6 +153,32 @@ export const exportCollection = (slug: string, format: 'text' | 'markdown') =>
 export const exportManifest = (slug: string, path: string) =>
 	invoke<void>('export_manifest', { slug, path });
 
+/** M18 W4: **the fulfil verb.** Approve one asker's request for one collection — the backend builds
+ *  the manifest, proves it fits the 8 MiB transport ceiling *before* promising anything, mints a
+ *  ticket bound to that single approval, and DMs it. Fires only from an explicit click; Hoardbook
+ *  never auto-sends (M17 ruling #4). Still moves no collection files (INV-4′) — a manifest is a
+ *  listing, not a file. */
+export const sendFullList = (npub: string, slug: string) =>
+	invoke<void>('send_full_list', { npub, slug });
+
+/** M18 W4: redeem a transport ticket that arrived by DM — dial, fetch, and consume through the
+ *  unchanged M16 W4 gates (author pinned to the peer, slug bound to the ticket, signature verified
+ *  before decrypt, completeness required).
+ *
+ *  **Called on arrival, never behind a "redeem later" button.** Redemption is immediate by owner
+ *  ruling (2026-07-30), and the backend has no deferred entry point to bind one to. A failure does
+ *  not spend the ticket, so retrying is safe. */
+export const redeemManifestTicket = (
+	npub: string,
+	ticketJson: string,
+	newestFingerprint?: string,
+) =>
+	invoke<ImportedManifest>('redeem_manifest_ticket', {
+		npub,
+		ticketJson,
+		newestFingerprint: newestFingerprint ?? null,
+	});
+
 // ── Settings ──────────────────────────────────────────────────────────────────
 
 export interface Settings {
