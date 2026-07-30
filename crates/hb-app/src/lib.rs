@@ -2,27 +2,24 @@
 
 mod backup;
 mod commands;
-// M18 W1 — the manifest plane and its connection helpers. The `allow` is temporary and belongs to
-// this slice only: the plane is complete and tested over real QUIC, but nothing *calls* it until W4
-// adds the "Send the full list" verb. Deliberately an allow rather than a fake call site — a stub
-// caller would hide the wiring W4 owes. **W4 removes both attributes**; if they are still here after
-// W4 lands, the verb was not actually wired up.
-#[allow(dead_code)]
+// M18 W1 — the manifest plane's connection helpers. W4 wired the verb, so the `dead_code` allow that
+// marked the plane as built-but-uncalled is gone: `commands::fulfil` calls it.
 mod conn;
 mod dm_cache_store;
 mod dm_quarantine;
 mod error;
 mod identity_state;
 mod manifest_cache;
+mod manifest_source;
 mod net;
 mod portable_update_logic;
 mod presence;
 mod single_instance;
 mod store;
 // M18 W1 — the manifest plane (INV-4′: a transport exists, structurally limited to manifests).
-// See the note on `mod conn` above for why `dead_code` is allowed until W4.
-#[allow(dead_code)]
 mod transport;
+// M18 W4 — the plane's session lifecycle: one endpoint, one bounded accept loop, bound lazily.
+mod transport_state;
 mod update_logic;
 mod watch;
 
@@ -255,6 +252,10 @@ pub fn run() {
             let staged_update: commands::update::SharedStagedUpdate = Arc::default();
             let online_cache: commands::online::SharedOnlineCache = Arc::default();
             let beacon: presence::SharedBeaconState = Arc::default();
+            // M18 W4: the manifest plane's endpoint. `None` until something needs it — a user who
+            // never sends a full list never binds a QUIC endpoint.
+            let manifest_endpoint: transport_state::SharedEndpoint =
+                transport_state::new_shared_endpoint();
 
             let (presence_cancel_tx, presence_cancel_rx) = tokio::sync::watch::channel(false);
             let presence_cancel: SharedCancelPresence = Arc::new(presence_cancel_tx);
@@ -270,6 +271,7 @@ pub fn run() {
             app.manage(Arc::clone(&staged_update));
             app.manage(Arc::clone(&online_cache));
             app.manage(Arc::clone(&beacon));
+            app.manage(Arc::clone(&manifest_endpoint));
             // M13 Part A: serializes the announce cooldown's check-and-record step.
             app.manage(commands::topics::AnnounceGate(std::sync::Mutex::new(())));
 
@@ -278,6 +280,40 @@ pub fn run() {
             let app_handle = app.handle().clone();
 
             restore_identity(store.clone(), Arc::clone(&identity));
+
+            // M18 W4: a ticket is valid until redeemed, so an approval given last session must still
+            // be dialable this one. `restore_identity` populates synchronously above, so the transport
+            // key is available here. Binds ONLY if an unspent ticket is on the books — see
+            // `transport_state::rebind_if_tickets_outstanding` for why that asymmetry is deliberate.
+            {
+                let endpoint = Arc::clone(&manifest_endpoint);
+                let identity = Arc::clone(&identity);
+                let store = store.clone();
+                tauri::async_runtime::spawn(async move {
+                    let keys = {
+                        let guard = identity.read().await;
+                        guard.as_ref().map(|id| {
+                            (
+                                id.identity.clone(),
+                                id.browse_key.clone(),
+                                id.transport_key.clone(),
+                                id.npub(),
+                            )
+                        })
+                    };
+                    let Some((id, browse_key, transport_key, npub)) = keys else { return };
+                    let source: Arc<dyn transport::ManifestSource> =
+                        manifest_source::StoreManifestSource::new(store.clone(), id, browse_key);
+                    transport_state::rebind_if_tickets_outstanding(
+                        &endpoint,
+                        &npub,
+                        &transport_key,
+                        source,
+                        &store,
+                    )
+                    .await;
+                });
+            }
 
             spawn_background_tasks(
                 Arc::clone(&identity),
@@ -331,6 +367,9 @@ pub fn run() {
             commands::collection::export_collection,
             commands::collection::export_manifest,
             commands::browse::import_manifest,
+            // M18 W4 — the fulfil verb, both halves.
+            commands::fulfil::send_full_list,
+            commands::fulfil::redeem_manifest_ticket,
             commands::private::browse_private_collections,
             commands::browse::paste_key,
             commands::browse::share_code_info,

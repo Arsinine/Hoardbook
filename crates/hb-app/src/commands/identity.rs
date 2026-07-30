@@ -208,9 +208,15 @@ pub async fn restore_data(
 pub async fn wipe_data(
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
+    endpoint: State<'_, crate::transport_state::SharedEndpoint>,
 ) -> CmdResult<bool> {
     store.wipe().map_err(cmd_err)?;
     *identity.write().await = None;
+    // M18 W4: the manifest plane must not outlive the identity it serves from. Its accept loop holds
+    // a snapshot of the signing key and browse-key (`ManifestSource` is synchronous and cannot read a
+    // live handle), so without this it would keep answering redemptions with manifests signed by the
+    // key the user just wiped.
+    crate::transport_state::close_plane(&endpoint).await;
     Ok(true)
 }
 

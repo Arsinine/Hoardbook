@@ -900,6 +900,114 @@ impl DataStore {
         );
         self.save_manifest_asks(&m)
     }
+
+    // ── Issued transport tickets (M18 W4) — the owner side's record of what it actually issued, so a
+    //    redemption arriving minutes or a restart later can be authorized against it. This is the
+    //    durable half of `ManifestSource::issued`/`record_consumed`; the plane's in-flight set covers
+    //    only the same-process race, and a ticket is valid until redeemed, so the *spent* bit has to
+    //    survive a restart or a replay after relaunch would be served a second manifest.
+    //
+    //    Keyed by `request_id` (a fresh 128-bit value per approval), which is also the ticket's
+    //    binding — one ticket per request, so one record per request.
+    pub fn issued_tickets_path(&self) -> PathBuf {
+        self.base.join("issued_tickets.json")
+    }
+
+    pub fn load_issued_tickets(&self) -> Result<std::collections::HashMap<String, IssuedTicketRecord>> {
+        Ok(read_json_lenient::<std::collections::HashMap<String, IssuedTicketRecord>>(
+            &self.issued_tickets_path(),
+        )
+        .context("loading issued tickets")?
+        .unwrap_or_default())
+    }
+
+    pub fn save_issued_tickets(
+        &self,
+        m: &std::collections::HashMap<String, IssuedTicketRecord>,
+    ) -> Result<()> {
+        write_json(&self.issued_tickets_path(), m).context("saving issued tickets")
+    }
+
+    pub fn load_issued_ticket(&self, request_id: &str) -> Result<Option<IssuedTicketRecord>> {
+        Ok(self.load_issued_tickets()?.remove(request_id))
+    }
+
+    /// Persist a freshly-minted ticket. Called **before** the ticket is DM'd: the reverse order would
+    /// hand a peer a ticket this node cannot authorize, which is indistinguishable from a forgery. An
+    /// orphaned record (the DM then failed) is harmless — nobody holds the ticket that matches it.
+    ///
+    /// LRU-evicts the stalest **consumed** record when over [`ISSUED_TICKET_CAP`], never an unspent
+    /// one: evicting an unspent ticket would silently revoke an approval a human already gave, and
+    /// the asker would see the refusal reserved for a forgery.
+    pub fn record_issued_ticket(&self, record: &IssuedTicketRecord) -> Result<()> {
+        static ISSUED_TICKETS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ISSUED_TICKETS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut m = self.load_issued_tickets()?;
+        m.insert(record.ticket.request_id.clone(), record.clone());
+        prune_issued_tickets(&mut m);
+        self.save_issued_tickets(&m)
+    }
+
+    /// Record the receipt for `request_id`. Idempotent, and deliberately a no-op for an unknown id —
+    /// the plane hands us a `ConsumedTicket` it could only have obtained from a `RedemptionGrant`,
+    /// but this layer is not the place to turn a bookkeeping surprise into a failed delivery the peer
+    /// has already received.
+    pub fn mark_ticket_consumed(
+        &self,
+        request_id: &str,
+        delivered_bytes: usize,
+        now: u64,
+    ) -> Result<()> {
+        static ISSUED_TICKETS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ISSUED_TICKETS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut m = self.load_issued_tickets()?;
+        if let Some(rec) = m.get_mut(request_id) {
+            rec.consumed_at = Some(now);
+            rec.delivered_bytes = Some(delivered_bytes);
+            self.save_issued_tickets(&m)?;
+        }
+        Ok(())
+    }
+}
+
+/// How many issued-ticket records to keep. Only **consumed** records are eligible for eviction, so
+/// this bounds the audit tail rather than the set of live approvals.
+pub const ISSUED_TICKET_CAP: usize = 512;
+
+/// The persisted record of one approval: the ticket verbatim (so redemption compares against the
+/// exact bytes issued, not a reconstruction), who it was addressed to, and whether it has been spent.
+///
+/// **`redeemer_npub` is stored rather than the standing** — standing is re-read at redeem time by
+/// owner ruling (2026-07-30), so freezing it here would defeat revocability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssuedTicketRecord {
+    pub ticket: hb_core::TransportTicket,
+    /// The npub this ticket was DM'd to — whose live standing gates the redemption.
+    pub redeemer_npub: String,
+    /// Unix seconds the asker's receipt landed; `None` while the ticket is unspent.
+    pub consumed_at: Option<u64>,
+    /// Payload size the receipt attested to. Provenance only.
+    pub delivered_bytes: Option<usize>,
+}
+
+/// Drop the stalest consumed records until the map is within [`ISSUED_TICKET_CAP`]. Unspent tickets
+/// are never candidates — see [`DataStore::record_issued_ticket`].
+pub(crate) fn prune_issued_tickets(m: &mut std::collections::HashMap<String, IssuedTicketRecord>) {
+    if m.len() <= ISSUED_TICKET_CAP {
+        return;
+    }
+    let mut spent: Vec<(String, u64)> = m
+        .iter()
+        .filter(|(_, r)| r.consumed_at.is_some())
+        .map(|(k, r)| (k.clone(), r.ticket.issued_at))
+        .collect();
+    spent.sort_by_key(|(_, issued_at)| *issued_at);
+    for (key, _) in spent {
+        if m.len() <= ISSUED_TICKET_CAP {
+            break;
+        }
+        m.remove(&key);
+    }
 }
 
 /// The persisted ask trace: `fingerprint_seen` (the snapshot fingerprint the requester observed when

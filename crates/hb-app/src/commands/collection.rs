@@ -711,7 +711,7 @@ pub async fn publish_collection(
 /// teaser's exactly (the browse-side staleness gate). Private collections are refused: they never
 /// truncate (trusted recipients already receive the whole sealed listing) and are sealed per recipient,
 /// not under the browse-key this envelope uses. Pure w.r.t. the relay — L1-testable with a temp store.
-fn build_slug_manifest(
+pub(crate) fn build_slug_manifest(
     slug: &str,
     store: &DataStore,
     identity: &Identity,

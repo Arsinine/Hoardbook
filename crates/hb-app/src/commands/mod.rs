@@ -1,6 +1,7 @@
 pub mod browse;
 pub mod chat;
 pub mod collection;
+pub mod fulfil;
 pub mod groups;
 pub mod identity;
 pub mod online;
