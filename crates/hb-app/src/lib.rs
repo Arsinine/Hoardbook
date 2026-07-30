@@ -2,6 +2,13 @@
 
 mod backup;
 mod commands;
+// M18 W1 — the manifest plane and its connection helpers. The `allow` is temporary and belongs to
+// this slice only: the plane is complete and tested over real QUIC, but nothing *calls* it until W4
+// adds the "Send the full list" verb. Deliberately an allow rather than a fake call site — a stub
+// caller would hide the wiring W4 owes. **W4 removes both attributes**; if they are still here after
+// W4 lands, the verb was not actually wired up.
+#[allow(dead_code)]
+mod conn;
 mod dm_cache_store;
 mod dm_quarantine;
 mod error;
@@ -12,6 +19,10 @@ mod portable_update_logic;
 mod presence;
 mod single_instance;
 mod store;
+// M18 W1 — the manifest plane (INV-4′: a transport exists, structurally limited to manifests).
+// See the note on `mod conn` above for why `dead_code` is allowed until W4.
+#[allow(dead_code)]
+mod transport;
 mod update_logic;
 mod watch;
 

@@ -58,6 +58,12 @@ minisign-verify = "0.2"
 self-replace    = "1"
 tempfile        = "3"
 globset = "0.4"
+# M18 W1 — the manifest plane. Returns under INV-4′ ("Hoardbook moves no COLLECTION FILES"), which
+# replaced the retired v0.9.6 "moves no bytes" rule; the plane is limited to `ManifestPayload` by the
+# four mechanisms in `transport_payload.rs` + the rewritten CI sweep, not by this dep's absence.
+# `default-features = false` + `tls-ring`: no metrics, no portmapper — the same minimal surface the
+# retired plane pinned.
+iroh    = { version = "1.0", default-features = false, features = ["tls-ring"] }
 # M9 snapshot auto-update: cross-platform filesystem watcher (inotify / FSEvents /
 # ReadDirectoryChangesW). Kept behind a thin wrapper (`spawn_fs_watcher`) so the OS watcher is never
 # in a unit test — the pure `watch_plan` is fake-clock tested. `async-trait` gives the injectable
