@@ -4,8 +4,9 @@
 //! **The manifest is not a new format.** The envelope's *plaintext* is the canonical normalized full
 //! listing JSON — the exact bytes `hb_net::truncate_listing` received before it cropped a 40 KB
 //! teaser. This module adds only a thin, self-describing wrapper so the *same* `split_listing` parts
-//! can serve **two carriers**: a chunked family on a higher-cap relay (M16 W2) and an opaque file
-//! couriered peer-to-peer by Mascara (M16 W4) — the file holds the encrypted parts inline
+//! can serve **three carriers**: a chunked family on a higher-cap relay (M16 W2), an exported
+//! `.hbmanifest` file the owner hands over themselves (M16 W4), and Hoardbook's own manifest plane
+//! (M18 W4, INV-4′). The file holds the encrypted parts inline
 //! (`ciphertexts`), so it is bounded by the number of parts, not by one NIP-44 event's plaintext cap.
 //! The crypto is the existing browse-key path (`encrypt_listing`/`decrypt_listing`, NIP-44 v2 under a
 //! versioned HKDF); the trust is the existing secp256k1 identity.
@@ -15,8 +16,8 @@
 //! verifiable as a *standalone file* — with no relay, no event, no `kind` framing to rebuild. So the
 //! author signs a canonical, domain-separated digest of its own listing directly
 //! (`schnorr(npub) over manifest_v‖created_at‖slug‖fingerprint‖manifest_sha256`), exactly as every
-//! `KIND_LISTING` is signed by the Hoardbook npub over its own content. This touches **no Mascara
-//! identity** (MAS-INV-1 unimplicated) — it is the hoarder attesting to their own listing.
+//! `KIND_LISTING` is signed by the Hoardbook npub over its own content. **No second identity is
+//! involved** — it is the hoarder attesting to their own listing, under their own npub.
 //!
 //! **Author binding = pubkey pinning.** The signature verifies only under the *browsed* author's
 //! x-only key, so a valid envelope for peer A cannot be replayed while browsing peer B; and the

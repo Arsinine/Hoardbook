@@ -757,9 +757,10 @@ pub(crate) fn build_slug_manifest(
 }
 
 /// Export a collection's full-listing **manifest** to a user-picked `<slug>.hbmanifest` file (M16 W4).
-/// The hoarder then tickets that file in Mascara and hands the sealed ticket over out of band — Hoardbook
-/// writes the file the user chose and moves no bytes itself (INV-4). The JS side picks `path` via the
-/// save dialog, exactly like `backup_data`.
+/// **No longer the only route** (M18 W4): the fulfil verb sends the same manifest over the transport
+/// plane, and this is its fallback for when that cannot connect. The hoarder hands the file over
+/// however they like — Hoardbook writes the file the user chose and moves no *collection files*
+/// (INV-4′). The JS side picks `path` via the save dialog, exactly like `backup_data`.
 #[tauri::command]
 pub async fn export_manifest(
     slug: String,

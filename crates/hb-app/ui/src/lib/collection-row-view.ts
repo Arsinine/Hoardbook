@@ -12,7 +12,8 @@ export function deriveRowChip(col: Pick<Collection, 'published'>): RowChip {
 }
 
 /** Export sub-actions: the two human-readable checklists, plus the M16 W4 `.hbmanifest` envelope
- *  (the full-listing file a hoarder hands over via Mascara for a large truncated collection). */
+ *  (the full-listing file a hoarder hands over themselves for a large truncated collection — the
+ *  fallback route since M18 W4 gave Chat a "Send the full list" verb over the transport plane). */
 export type ExportFormat = 'text' | 'markdown' | 'manifest';
 
 export type RowMenuItem =

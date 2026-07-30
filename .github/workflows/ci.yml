@@ -135,6 +135,65 @@ jobs:
           fi
           if [ "$fail" -ne 0 ]; then echo "::error::INV-4′ — Hoardbook moves no COLLECTION FILES. The above turns the manifest plane into a file mover."; exit 1; fi
           echo "INV-4′ sweep clean — the transport module carries ManifestPayload and touches no files."
+
+      # M18 W5 — the retired MASCARA-COURIER framing must not creep back into code.
+      #
+      # Mascara is a separate Buddy Backup/Sync platform (2026-07-26 ruling). It is NOT Hoardbook's
+      # courier, does not ticket files for it, and is not where "transfer lives". Every sentence in
+      # this repo that said otherwise was false the day the ruling landed.
+      #
+      # **This probe exists because the cleanup list was wrong three times running, each time in the
+      # same way — it named a layer and missed the ones below it:**
+      #   · 2026-07-26 listed only SPEC surfaces and missed every code site;
+      #   · 2026-07-30 listed 6 hb-app sites and missed hb-core, hb-net and hb-it entirely;
+      #   · both missed the FRONTEND, where the damage was worst — a shipped Home toast literally read
+      #     "Manifest exported — send it with Mascara", and the `no-download` tooltip pointed users at
+      #     "the Mascara companion" as a transfer route.
+      # A hand-written list of sites cannot fix a hand-written list of sites. So the allowlist is
+      # inverted: it enumerates the mentions that are ALLOWED to survive, and anything else fails.
+      # This is INVARIANT_AUDIT §6b applied properly — an unrecorded legitimate exception fails
+      # exactly like an unrecorded violation, so the legitimate ones are recorded.
+      #
+      # The six survivors are all history or tombstones: they say the courier role is DEAD. That is
+      # the only sense in which the word may appear.
+      - name: Mascara-courier framing stays retired
+        if: matrix.platform == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -uo pipefail
+          # path:count — every file allowed to mention Mascara, and how many times.
+          ALLOWED="crates/hb-app/src/identity_state.rs:1
+          crates/hb-app/src/commands/chat.rs:2
+          crates/hb-core/src/ticket.rs:1
+          crates/hb-app/ui/src/lib/request-inbox.ts:1
+          crates/hb-app/ui/src/routes/+page.svelte:1"
+          fail=0
+          actual=$(grep -rlI 'Mascara' crates/*/src crates/hb-app/ui/src 2>/dev/null | sort -u)
+          expected=$(printf '%s\n' "$ALLOWED" | sed 's/^ *//; s/:[0-9]*$//' | sort -u)
+          if newcomers=$(comm -23 <(echo "$actual") <(echo "$expected")) && [ -n "$newcomers" ]; then
+            echo "::error::The retired Mascara-courier framing appeared in files that are not allowed to mention it:"
+            echo "$newcomers"
+            echo "::error::Mascara is a separate Buddy Backup/Sync platform, NOT Hoardbook's courier."
+            fail=1
+          fi
+          # Counts are checked too: a NEW sentence in an already-listed file is exactly how this crept
+          # back the first time, and a file-level allowlist would wave it through.
+          printf '%s\n' "$ALLOWED" | sed 's/^ *//' | while IFS=: read -r f want; do
+            [ -n "$f" ] || continue
+            if [ ! -f "$f" ]; then
+              echo "::error::Mascara allowlist is stale — it lists $f, which does not exist. A renamed or"
+              echo "::error::deleted file silently shrinks this guard. Update the list."
+              exit 1
+            fi
+            got=$(grep -cI 'Mascara' "$f" || true)
+            if [ "$got" != "$want" ]; then
+              echo "::error::$f mentions Mascara $got time(s), allowlist says $want."
+              echo "::error::If the new mention says the courier role is DEAD, bump the count. If it revives it, delete it."
+              exit 1
+            fi
+          done || fail=1
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "Mascara-courier framing clean — every surviving mention is a tombstone."
           # M14: Skeleton/Tailwind were de-vendored (the UI is hand-rolled oklch + scoped CSS) — a
           # CSS framework creeping back in is scope creep, not a feature.
           if out=$(grep -rnE '@skeletonlabs|tailwind' crates/hb-app/ui/src crates/hb-app/ui/package.json 2>/dev/null); then

@@ -1,5 +1,8 @@
 <script lang="ts">
 	import { saveProfile, publishProfile, publishCollection, unpublishCollection, deleteCollection, exportCollection, exportManifest, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec, collectionSourceAccessible } from '$lib/api.js';
+	// M18 W5: Home and Chat are two entry points to ONE export — they read the same toast
+	// constant so they cannot drift into saying different things about what just happened.
+	import { MANIFEST_EXPORTED_TOAST } from '$lib/manifest-fulfil.js';
 	import { passphraseStrength } from '$lib/backup-export.js';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { profile, collections, identity, toast, appReady, homeDraft, identityLoadError } from '$lib/stores.js';
@@ -406,15 +409,21 @@
 	async function handleExport(slug: string, format: 'text' | 'markdown' | 'manifest') {
 		try {
 			if (format === 'manifest') {
-				// M16 W4: the full-listing manifest envelope → a user-picked `.hbmanifest` file. The
-				// hoarder then tickets it in Mascara; Hoardbook writes the file and moves no bytes (INV-4).
+				// M16 W4: the full-listing manifest envelope → a user-picked `.hbmanifest` file.
+				// Hoardbook writes the file the user chose and moves no collection files (INV-4′). Since
+				// M18 W4 this is the FALLBACK, not the only route — the fulfil verb in Chat sends the
+				// same manifest over the transport plane when the asker can be reached.
 				const path = await saveDialog({
 					defaultPath: `${slug}.hbmanifest`,
 					filters: [{ name: 'Hoardbook manifest', extensions: ['hbmanifest'] }],
 				});
 				if (!path) return;
 				await exportManifest(slug, path);
-				toast('Manifest exported — send it with Mascara');
+				// Was `'Manifest exported — send it with Mascara'` — user-facing copy naming a product
+				// that no longer has that role (courier framing retired 2026-07-26). Home and Chat are
+				// two entry points to ONE export; they now say the same thing because they read the
+				// same constant.
+				toast(MANIFEST_EXPORTED_TOAST(path.split(/[\\/]/).pop() ?? `${slug}.hbmanifest`));
 				return;
 			}
 			const text = await exportCollection(slug, format);

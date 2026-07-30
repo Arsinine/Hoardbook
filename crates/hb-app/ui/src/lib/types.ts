@@ -258,4 +258,5 @@ export interface DmRequestView {
 	fingerprint?: { words: string[]; colorHex: string };
 }
 
-// (DownloadItem removed — file transfer moved to the Mascara companion.)
+// (DownloadItem removed in v0.9.6. Still gone after M18: the transport plane carries manifests, not
+// collection files (INV-4′), so there is no download item to model.)

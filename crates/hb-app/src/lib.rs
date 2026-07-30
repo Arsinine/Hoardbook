@@ -88,8 +88,13 @@ fn build_system_tray(app: &mut tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
-/// If an identity is on disk, populate `identity` for the session. (No transport to start —
-/// Hoardbook moves no files; file transfer lives in the Mascara companion.)
+/// If an identity is on disk, populate `identity` for the session.
+///
+/// **No transport is started here, and that is now a choice rather than an absence** (M18): the
+/// manifest plane binds lazily, so a user who never sends a full list never opens a QUIC endpoint.
+/// The one exception is handled by the caller — `transport_state::rebind_if_tickets_outstanding`
+/// binds when an unspent ticket is on the books, because a ticket outlives the session that issued
+/// it.
 fn restore_identity(store: DataStore, identity: SharedIdentity) {
     let stored = match store.load_identity() {
         Ok(Some(s)) => s,

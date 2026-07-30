@@ -192,7 +192,8 @@ async fn n6(ctx: &Ctx) -> Result<()> {
     let now = now();
 
     // A freshly-refreshed presence reads online and carries a verifiable npub freshness binding
-    // (v0.9.6: presence is status-only — no node key, no address; transport lives in Mascara).
+    // (presence is status-only — no node key, no address. Still true after M18 added a transport
+    // plane: an address rides a sealed ticket in a DM, never a broadcast beacon.)
     let id = Identity::generate();
     let fresh = build_binding(&id, now, 30 * 60)?;
     let client = ctx.connect(&id).await?;

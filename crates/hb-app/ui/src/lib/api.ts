@@ -149,7 +149,9 @@ export const exportCollection = (slug: string, format: 'text' | 'markdown') =>
 	invoke<string>('export_collection', { slug, format });
 
 /** M16 W4: serialize a collection's full-listing manifest envelope to a user-picked `.hbmanifest`
- *  file. `path` comes from the save dialog; Hoardbook writes the file and moves no bytes (INV-4). */
+ *  file. `path` comes from the save dialog; Hoardbook writes the file and moves no collection files
+ *  (INV-4′). Since M18 W4 this is the FALLBACK for when the transport can't connect — see
+ *  [`sendFullList`]. */
 export const exportManifest = (slug: string, path: string) =>
 	invoke<void>('export_manifest', { slug, path });
 

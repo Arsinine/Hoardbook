@@ -7,8 +7,9 @@ pub mod types;
 // --- v0.9 Nostr core: secp256k1 identity, NIP-01 events, NIP-44 listings,
 //     the presence freshness binding, the hbk share code. (The legacy Ed25519
 //     identity / JCS / signed-envelope core was removed with its hb-app consumer in M4; the
-//     npub→iroh-node binding + xfer gate moved to the Mascara companion with file transfer in
-//     v0.9.6 — Hoardbook moves no files.) ---
+//     npub→iroh-node binding + xfer gate were removed in v0.9.6 and did NOT return with M18's
+//     manifest plane — that plane needs no public node map, because an address rides a sealed
+//     ticket. Hoardbook moves no *collection files* (INV-4′).) ---
 pub mod backup;
 pub mod binding;
 pub mod count;
