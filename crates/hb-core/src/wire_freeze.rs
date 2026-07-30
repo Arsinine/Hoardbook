@@ -9,6 +9,7 @@ use crate::binding;
 use crate::event;
 use crate::listing::{HKDF_SALT, HKDF_SALT_CEK};
 use crate::manifest::{MANIFEST_V, SIG_DOMAIN};
+use crate::transport_payload::MANIFEST_MAX_TRANSPORT_BYTES;
 use crate::priv_listing;
 use crate::sharecode;
 use crate::topic;
@@ -42,6 +43,23 @@ fn version_discriminants_are_frozen() {
     // superseded before any producer shipped (export landed at v2 — the chunked `ciphertexts` body).
     // v2 is the frozen launch value; a v1 envelope no longer even deserializes (its field is gone).
     assert_eq!(MANIFEST_V, 2, "MANIFEST_V (M16 manifest envelope, chunked v2) — {FREEZE}");
+}
+
+/// **INV-4′ mechanism 2 — the manifest transport ceiling (M18).** Frozen because it is a
+/// *negotiation-free* protocol constant: two peers that disagree about what is deliverable would
+/// disagree about whether a transfer failed or was refused. Owner ruling 2026-07-30 fixed it rather
+/// than version-negotiating it, on the reasoning that the binding constraint is human
+/// browseability (~10k files), which does not grow the way bandwidth does — see
+/// `transport_payload::MANIFEST_MAX_TRANSPORT_BYTES` for the full derivation. Raising it later is a
+/// version negotiation plus an INV-4′ re-audit (is the plane still structurally *not* a file
+/// mover?), never an edit.
+#[test]
+fn manifest_transport_ceiling_is_frozen() {
+    assert_eq!(
+        MANIFEST_MAX_TRANSPORT_BYTES,
+        8 * 1024 * 1024,
+        "MANIFEST_MAX_TRANSPORT_BYTES (M18 INV-4′ mechanism 2) — {FREEZE}"
+    );
 }
 
 /// The manifest envelope's `author_sig` pre-image domain tag (M16 W1). It is hashed into every

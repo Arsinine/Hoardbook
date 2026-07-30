@@ -93,4 +93,12 @@ pub enum HbError {
     /// Rejected *before* Argon2id runs so a hostile archive can't OOM / thread-exhaust restore.
     #[error("backup KDF parameter out of range: {0}")]
     BackupParamsOutOfRange(String),
+
+    // --- M18: the manifest transport plane (INV-4′) ---
+    /// The payload is over [`crate::MANIFEST_MAX_TRANSPORT_BYTES`] — INV-4′ mechanism 2. **The
+    /// message names export deliberately**: past the browseable limit the full tree isn't the
+    /// useful artifact anyway, so the plane declining to carry it is the honest answer rather than
+    /// a capacity failure, and the user needs the route out in the same breath as the refusal.
+    #[error("this listing is {declared} bytes — over the {max}-byte transport limit. Export it to a .hbmanifest file and send that instead")]
+    PayloadTooLarge { declared: usize, max: usize },
 }
