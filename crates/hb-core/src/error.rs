@@ -81,4 +81,19 @@ pub enum HbError {
     /// a capacity failure, and the user needs the route out in the same breath as the refusal.
     #[error("this listing is {declared} bytes — over the {max}-byte transport limit. Export it to a .hbmanifest file and send that instead")]
     PayloadTooLarge { declared: usize, max: usize },
+
+    /// A transport ticket is malformed, or is bound to a different request than the one being
+    /// redeemed (M18 W1 — one ticket per request).
+    #[error("invalid transport ticket: {0}")]
+    InvalidTicket(String),
+
+    /// The ticket was already spent on a completed transfer. Consumed on SUCCESS, so this is a
+    /// genuine replay, never a retry after a dropped connection.
+    #[error("this transport ticket has already been redeemed — ask again for a new one")]
+    TicketAlreadyRedeemed,
+
+    /// The redeemer is no longer a contact in good standing (blocked, declined, or unknown). The
+    /// redeem-time standing check is what keeps a valid-until-redeemed ticket revocable.
+    #[error("the requester is no longer an approved contact")]
+    TicketRedeemerNotInGoodStanding,
 }

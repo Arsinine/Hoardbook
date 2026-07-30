@@ -12,6 +12,7 @@ use crate::manifest::{MANIFEST_V, SIG_DOMAIN};
 use crate::transport_payload::MANIFEST_MAX_TRANSPORT_BYTES;
 use crate::priv_listing;
 use crate::sharecode;
+use crate::ticket;
 use crate::topic;
 use crate::version::{CRYPTO_V, SCHEMA_V};
 
@@ -60,6 +61,16 @@ fn manifest_transport_ceiling_is_frozen() {
         8 * 1024 * 1024,
         "MANIFEST_MAX_TRANSPORT_BYTES (M18 INV-4′ mechanism 2) — {FREEZE}"
     );
+}
+
+/// The transport ticket's version + DM discriminator (M18 W1). A ticket rides a NIP-17 DM, which a
+/// relay stores like any other wrap, so one already sitting in an asker's inbox must stay readable —
+/// and the discriminator is how that inbox tells a ticket from a `manifest_request` going the other
+/// way. Renaming either silently turns a delivered approval into an unrecognised message.
+#[test]
+fn ticket_version_and_tag_are_frozen() {
+    assert_eq!(ticket::TICKET_V, 1, "ticket::TICKET_V — {FREEZE}");
+    assert_eq!(ticket::TICKET_TAG, "transport_ticket", "ticket::TICKET_TAG — {FREEZE}");
 }
 
 /// The manifest envelope's `author_sig` pre-image domain tag (M16 W1). It is hashed into every
