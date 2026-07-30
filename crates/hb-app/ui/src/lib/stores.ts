@@ -43,4 +43,5 @@ export function toast(text: string, kind: 'success' | 'error' = 'success') {
 	setTimeout(() => toastMessage.set(null), 3500);
 }
 
-// (The downloads store + applyDownloadEvent reducer were removed — file transfer moved to Mascara.)
+// (The downloads store + applyDownloadEvent reducer were removed in v0.9.6 and did NOT come back with
+// M18's transport plane — that plane carries manifests only, INV-4′, so there is no download to track.)

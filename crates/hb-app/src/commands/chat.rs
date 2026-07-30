@@ -581,8 +581,10 @@ fn build_manifest_request(
 }
 
 /// M16 W4 — DM the hoarder a structured request for the full manifest of a truncated collection (the
-/// blessed "ask by DM" seam, MASCARA_SPEC Q1). One relay write; the hoarder decides whether to export
-/// + ticket it — Hoardbook never auto-produces anything.
+/// blessed "ask by DM" seam). One relay write; the hoarder then decides — **the ruling that a human
+/// decides survives, but the mechanism it named is dead.** This used to end in "export + ticket it in
+/// Mascara"; since M18 W4 the hoarder clicks *Send the full list* and the manifest crosses Hoardbook's
+/// own plane, with export as the fallback. Hoardbook still never auto-produces anything.
 // The 5 request fields + 3 injected Tauri `State` handles are all load-bearing (mirrors `send_message`).
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]

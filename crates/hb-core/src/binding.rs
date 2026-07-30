@@ -6,11 +6,15 @@
 //! the validity window; `verify_binding` additionally pins the author to the **expected** `npub`,
 //! so a lying relay cannot pass off a valid-but-different identity's presence as yours.
 //!
-//! **v0.9.6 — Hoardbook moves no files (INV-4).** The transport plane (download/sync) lives in the
-//! Mascara companion, so presence carries **no dialable address and no node key** — it is purely a
-//! freshness signal for online status. The former `npub`→iroh-node binding, the sealed address, and
-//! the node-key resolution all moved to Mascara with file transfer; what remains here is the
-//! signature- + author- + freshness-checked online beacon.
+//! **Presence carries no dialable address and no node key** — it is purely a freshness signal for
+//! online status. The former `npub`→iroh-node binding, the sealed address, and the node-key
+//! resolution were all removed in v0.9.6.
+//!
+//! **They did not return with M18's manifest plane, and the reason changed.** The rule used to follow
+//! from Hoardbook having no transport at all; now one exists (INV-4′ — manifests only), so the rule
+//! stands on its own original ground: a public, always-on `npub`→endpoint map is an IP-harvesting
+//! surface. An address reaches exactly one peer, through a sealed ticket in a DM, per approved
+//! request. What remains here is the signature- + author- + freshness-checked online beacon.
 
 use nostr::prelude::*;
 
@@ -40,8 +44,9 @@ pub struct Binding {
 }
 
 /// Build a signed presence beacon for `identity`, valid for `ttl_secs` from `now`. Carries only a
-/// schema version + expiry — **no node key, no address** (Hoardbook moves no files; transport lives
-/// in Mascara). The signature covers the validity window; freshness = `created_at` recency.
+/// schema version + expiry — **no node key, no address** (an address rides a sealed ticket, never a
+/// broadcast beacon — see the module header). The signature covers the validity window; freshness =
+/// `created_at` recency.
 pub fn build_binding(identity: &Identity, now: u64, ttl_secs: u64) -> Result<Event, HbError> {
     if ttl_secs > MAX_BINDING_TTL_SECS {
         return Err(HbError::InvalidEvent(format!(
@@ -136,9 +141,14 @@ mod tests {
         assert_eq!(b.expires_at, now + TTL);
     }
 
-    /// INV-4 (v0.9.6): the presence beacon carries **no node key and no address** — Hoardbook moves
-    /// no files, so a presence event must not advertise any dialable transport endpoint. This is the
-    /// behavioural guard that the seal/node-key surface stays gone.
+    /// The presence beacon carries **no node key and no address**: a presence event must not
+    /// advertise any dialable transport endpoint. The behavioural guard that the seal/node-key
+    /// surface stays gone.
+    ///
+    /// **This test matters MORE since M18, not less.** When it was written there was no transport, so
+    /// a leaked address would have been useless. There is one now (INV-4′), and this node has a
+    /// stable QUIC identity — so an address in a public beacon would be immediately dialable by
+    /// anyone. Do not relax it because "the plane only carries manifests"; the harvest is the IP.
     #[test]
     fn presence_carries_no_address_or_node_key() {
         let (_id, ev, _now) = fresh();

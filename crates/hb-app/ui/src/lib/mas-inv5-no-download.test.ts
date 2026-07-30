@@ -12,7 +12,7 @@ import {
 } from './transport-ticket.js';
 
 // MAS-INV-5 (Hoardbook stays neutral in the transfer): the paywall / browse surface must offer NO
-// "Download" affordance — Hoardbook moves no files (INV-4). The "get the rest" path is "Ask the owner
+// "Download" affordance — Hoardbook moves no collection files (INV-4′). The "get the rest" path is "Ask the owner
 // for the full list" (a DM) + "Import a manifest file you received" (a local file consume), never a
 // download button. This guard scans the browse page's USER-FACING copy (copy-audit strips class=,
 // comments, imports, <style>) and forbids the word "download" — except the allowed *negative* sense,

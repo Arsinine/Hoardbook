@@ -1,6 +1,14 @@
-//! Presence: a status-only online beacon. Hoardbook moves no files (transfer lives in the Mascara
-//! companion — INV-4), so presence carries **no dialable address and no node key** — it is purely a
-//! freshness signal so peers can see you're recently online.
+//! Presence: a status-only online beacon. It carries **no dialable address and no node key** — it is
+//! purely a freshness signal so peers can see you're recently online.
+//!
+//! **That rule survived M18 and got MORE load-bearing, not less** (2026-07-26 ruling). It used to
+//! follow from "Hoardbook has no transport at all". It no longer does: a manifest plane exists
+//! (INV-4′), and this node has a stable, dialable QUIC identity. The reason presence still carries no
+//! address is now the original one, standing on its own — **a public, always-on `npub`→endpoint map
+//! is an IP-harvesting surface** (the H4/MT2 hole). An address reaches a peer through a *sealed
+//! ticket in a DM*, issued per approved request, and never through a broadcast event.
+//!
+//! `presence_carries_no_address_or_node_key` is the behavioural guard, and it stays green.
 //!
 //! Republished to the configured relays on a ~5-minute cadence as a signed, kind-11111 event
 //! (`build_binding`); `verify_binding` on the reader side checks signature + author-pin +
@@ -95,8 +103,9 @@ fn record_outcome(prev: &BeaconReport, result: Result<&PublishOutcome, &str>, no
 }
 
 /// Build + publish a status-only presence beacon: a signed kind-11111 event carrying only
-/// freshness/expiry — no node key, no dialable address (transfer moved to Mascara). The reader only
-/// checks signature + author-pin + freshness for online status. Returns the per-relay
+/// freshness/expiry — no node key, no dialable address (an address rides a sealed ticket, never a
+/// broadcast beacon — see the module header). The reader only checks signature + author-pin +
+/// freshness for online status. Returns the per-relay
 /// [`PublishOutcome`] so the caller can surface beacon health (devtest #9).
 pub(crate) async fn publish_presence(client: &RelayClient, identity: &Identity) -> Result<PublishOutcome> {
     let event = build_binding(identity, unix_now(), PRESENCE_TTL_SECS)

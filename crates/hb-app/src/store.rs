@@ -95,7 +95,8 @@ impl Default for Settings {
 
 /// Per-collection persisted state. The transfer-era fields (`enabled`, `allowed_paths`,
 /// `speed_cap_kbps`, `download_limit`, `require_follow`) were removed with the download UI —
-/// Hoardbook moves no files (INV-4). Only `root_path` survives: the collection's on-disk root,
+/// Hoardbook moves no *collection files* (INV-4′; M18's plane carries manifests only, so none of
+/// these came back). Only `root_path` survives: the collection's on-disk root,
 /// persisted so the snapshot re-scan can find the tree again. (Overlaps `ScanSpec.root`; kept
 /// separate for now — de-dup is a later cleanup.) Old JSON with the removed fields still loads
 /// (serde ignores unknown fields).

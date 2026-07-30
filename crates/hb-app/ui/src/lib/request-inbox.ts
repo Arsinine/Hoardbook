@@ -34,7 +34,10 @@ export interface ManifestRequest {
 	slug: string;
 	fingerprintSeen: string;
 	teaserEventId?: string;
-	/** Opaque to Hoardbook (neither minted nor validated) — the requester's Mascara pubkey, if any. */
+	/** **VESTIGIAL** — mirrors the Rust field of the same name (`chat.rs`). It carried the requester's
+	 *  Mascara pubkey when a courier was going to move the file; that role is retired (2026-07-26) and
+	 *  nothing writes or reads this. Kept because the request body is `wire_freeze`-pinned and the
+	 *  field is already omitted from the wire in practice (owner ruling 2026-07-31, option b). */
 	mascaraPubkey?: string;
 }
 
@@ -59,7 +62,8 @@ export function parseManifestRequest(content: string): ManifestRequest | null {
 }
 
 /** The light, human hint a manifest-request DM renders as ("Asking for the full list of …"), or null
- *  for an ordinary message. The hoarder then exports the manifest and tickets it in Mascara by hand. */
+ *  for an ordinary message. The hoarder answers it from the fulfil card in Chat — "Send the full
+ *  list" over the transport plane (M18 W4), or the manifest export as the fallback. */
 export function manifestRequestHint(content: string): string | null {
 	const req = parseManifestRequest(content);
 	return req ? `Asking for the full list of “${req.slug}”` : null;

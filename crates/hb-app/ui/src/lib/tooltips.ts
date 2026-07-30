@@ -26,10 +26,11 @@ export interface TooltipContent {
 }
 
 export const TOOLTIPS: Record<TooltipKey, TooltipContent> = {
-	// Lifts the spec's verbatim no-download copy (H4/INV-4).
+	// Lifts the spec's verbatim no-download copy (H4/INV-4′). Still true after M18: the transport
+	// plane carries manifests (listings), never a user's collection files.
 	'no-download': {
 		title: 'No downloads here',
-		body: 'Hoardbook moves no files; it finds people and shows what they have. Arrange the transfer off-platform (DM / contact_hint) or via the Mascara companion.',
+		body: 'Hoardbook moves no files; it finds people and shows what they have. Arrange the transfer off-platform — a DM, their contact hint, or whatever the two of you already use.',
 	},
 	'willing-to': {
 		title: 'Willing to',
