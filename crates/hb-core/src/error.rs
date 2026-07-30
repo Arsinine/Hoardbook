@@ -82,6 +82,13 @@ pub enum HbError {
     #[error("this listing is {declared} bytes — over the {max}-byte transport limit. Export it to a .hbmanifest file and send that instead")]
     PayloadTooLarge { declared: usize, max: usize },
 
+    /// An inbound manifest is structurally unacceptable to the transport for a reason the byte
+    /// ceiling does not cover — today, declaring more parts than the producer can ever build. Kept
+    /// separate from [`Self::PayloadTooLarge`] because the route out is not export: no export
+    /// produces this either, so it means a hostile or broken peer.
+    #[error("manifest refused by the transport: {0}")]
+    InvalidManifest(String),
+
     /// A transport ticket is malformed, or is bound to a different request than the one being
     /// redeemed (M18 W1 — one ticket per request).
     #[error("invalid transport ticket: {0}")]

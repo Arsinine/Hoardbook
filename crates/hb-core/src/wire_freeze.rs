@@ -9,7 +9,7 @@ use crate::binding;
 use crate::event;
 use crate::listing::{HKDF_SALT, HKDF_SALT_CEK};
 use crate::manifest::{MANIFEST_V, SIG_DOMAIN};
-use crate::transport_payload::MANIFEST_MAX_TRANSPORT_BYTES;
+use crate::transport_payload::{MANIFEST_MAX_TRANSPORT_BYTES, MANIFEST_MAX_TRANSPORT_PARTS};
 use crate::priv_listing;
 use crate::sharecode;
 use crate::ticket;
@@ -61,6 +61,23 @@ fn manifest_transport_ceiling_is_frozen() {
         8 * 1024 * 1024,
         "MANIFEST_MAX_TRANSPORT_BYTES (M18 INV-4′ mechanism 2) — {FREEZE}"
     );
+}
+
+/// The companion part cap, and the reason it is **4096 and not a taste**: it must equal
+/// `hb-net::MAX_LISTING_PARTS`, the producer's own limit. hb-core cannot import it (no hb-net dep),
+/// so the number is duplicated — and a duplicated constant drifts unless something compares them.
+/// Too low and the transport refuses manifests this very app builds; too high and the cap stops
+/// bounding the work an 8 MiB frame can demand (millions of empty parts, hash honestly matching).
+#[test]
+fn manifest_transport_part_cap_matches_the_producer_cap() {
+    assert_eq!(
+        MANIFEST_MAX_TRANSPORT_PARTS, 4096,
+        "MANIFEST_MAX_TRANSPORT_PARTS must equal hb-net::MAX_LISTING_PARTS (4096) — a manifest this \
+         app can legitimately build must never be refused by its own transport. {FREEZE}"
+    );
+    // Both directions of the coupling stated where a reader will see it: the producer's cap lives in
+    // `hb-net::split::MAX_LISTING_PARTS`. If that moves, this must move with it, and `hb-it` Suite MAN
+    // is what exercises a real multi-part manifest end to end.
 }
 
 /// The transport ticket's version + DM discriminator (M18 W1). A ticket rides a NIP-17 DM, which a
