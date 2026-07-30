@@ -4,7 +4,7 @@
 //! ```text
 //! <app_data_dir>/
 //!   identity/
-//!     identity.json           StoredIdentity (nsec + iroh key + account browse-key)
+//!     identity.json           StoredIdentity (nsec + account browse-key + transport secret)
 //!   collections/
 //!     <slug>.draft.json       Collection (the scanned tree + metadata)
 //!   published/
@@ -133,11 +133,11 @@ pub struct ScanSpec {
 // StoredIdentity — the three keys, on disk (v0.9 Nostr model)
 // ---------------------------------------------------------------------------
 
-/// On-disk identity: the irreplaceable secp256k1 secret (`nsec`), the bound iroh transport
-/// key (regenerable), and the account browse-key (the "club pass" carried in the `hbk` share
-/// code). On Windows this whole struct is DPAPI-encrypted at rest; on Linux/macOS it is a
-/// 0600 plaintext file until the Phase-2 keyring lands. `ZeroizeOnDrop` (audit I-11): the nsec +
-/// browse-key hex are wiped from memory whenever a loaded/saved/backup copy drops.
+/// On-disk identity: the irreplaceable secp256k1 secret (`nsec`), the account browse-key (the
+/// "club pass" carried in the `hbk` share code), and the regenerable transport secret (M18 W2 —
+/// the manifest plane's node key). On Windows this whole struct is DPAPI-encrypted at rest; on
+/// Linux/macOS it is a 0600 plaintext file until the Phase-2 keyring lands. `ZeroizeOnDrop`
+/// (audit I-11): every secret hex is wiped from memory whenever a loaded/saved/backup copy drops.
 #[derive(Clone, Serialize, Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct StoredIdentity {
     pub version: u8,
@@ -145,6 +145,12 @@ pub struct StoredIdentity {
     pub nsec: String,
     /// Hex-encoded 32-byte account browse-key.
     pub browse_key_hex: String,
+    /// Hex-encoded 32-byte transport secret (M18 W2). Deliberately **not** named for iroh: the
+    /// plane's choice of transport is W1's business, not the file format's. `serde(default)` so a
+    /// 2-key record from v0.9.6–v0.12.x loads; [`DataStore::load_identity`] mints and persists one
+    /// when it is empty, so the migration needs no user action.
+    #[serde(default)]
+    pub transport_secret_hex: String,
 }
 
 impl std::fmt::Debug for StoredIdentity {
@@ -153,6 +159,7 @@ impl std::fmt::Debug for StoredIdentity {
             .field("version", &self.version)
             .field("nsec", &"[REDACTED]")
             .field("browse_key_hex", &"[REDACTED]")
+            .field("transport_secret_hex", &"[REDACTED]")
             .finish()
     }
 }
@@ -362,7 +369,26 @@ impl DataStore {
         #[cfg(not(target_os = "windows"))]
         let json_bytes = bytes;
 
-        Ok(Some(serde_json::from_slice(&json_bytes).context("parsing identity")?))
+        let mut stored: StoredIdentity =
+            serde_json::from_slice(&json_bytes).context("parsing identity")?;
+
+        // M18 W2 migration — a 2-key record (v0.9.6 … v0.12.x) has no transport secret. Mint one
+        // here, the single choke point every load path goes through, so the upgrade needs no user
+        // action and the node key is STABLE across restarts (minting per-load would hand a peer a
+        // different node identity every launch).
+        //
+        // This ADDS a missing field; it never rewrites one that is present — a background actor
+        // must not silently destroy stored data (the v0.12.6 `path_alias` lesson). And a failed
+        // write must not fail the load: an identity that reads fine on a read-only data dir keeps
+        // working, it just re-mints next launch.
+        if stored.transport_secret_hex.is_empty() {
+            stored.transport_secret_hex = hex::encode(rand::random::<[u8; 32]>());
+            if let Err(e) = self.save_identity(&stored) {
+                tracing::warn!("could not persist the minted transport key: {e:#}");
+            }
+        }
+
+        Ok(Some(stored))
     }
 
     // -- Profile draft -------------------------------------------------------
@@ -982,7 +1008,51 @@ mod tests {
             version: 1,
             nsec,
             browse_key_hex: hex::encode([9u8; 32]),
+            transport_secret_hex: hex::encode([7u8; 32]),
         }
+    }
+
+    /// **M18 W2 — the migration PERSISTS, and is stable across loads.**
+    ///
+    /// `load_identity` is the single choke point every load path goes through, so it is where a
+    /// 2-key record gains its transport secret. Two properties, and the second is the one that
+    /// matters: minting per-load would hand a peer a different node identity every launch.
+    #[test]
+    fn load_identity_mints_a_transport_key_once_and_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+
+        // Write a genuine 2-key record: save a full one, then strip the field back out on disk.
+        let mut legacy = sample_identity();
+        legacy.transport_secret_hex = String::new();
+        store.save_identity(&legacy).unwrap();
+
+        let first = store.load_identity().unwrap().unwrap();
+        assert_eq!(first.transport_secret_hex.len(), 64, "the load mints a transport key");
+        assert_eq!(first.browse_key_hex, legacy.browse_key_hex, "the browse-key is untouched");
+        assert_eq!(first.nsec, legacy.nsec, "the nsec is untouched");
+
+        let second = store.load_identity().unwrap().unwrap();
+        assert_eq!(
+            second.transport_secret_hex, first.transport_secret_hex,
+            "the minted key was PERSISTED — a second load reads it back rather than re-minting"
+        );
+    }
+
+    /// The other half of the same rule: a record that already has a transport secret keeps it.
+    /// A background actor must not silently rewrite stored data (the v0.12.6 `path_alias` lesson).
+    #[test]
+    fn load_identity_never_rewrites_an_existing_transport_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let id = sample_identity();
+        store.save_identity(&id).unwrap();
+
+        let loaded = store.load_identity().unwrap().unwrap();
+        assert_eq!(
+            loaded.transport_secret_hex, id.transport_secret_hex,
+            "an existing transport secret survives the load untouched"
+        );
     }
 
     fn contact_fixture(npub: &str) -> CachedPeer {
