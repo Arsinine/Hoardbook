@@ -32,6 +32,8 @@
 		type RelayHealth,
 		getCollections,
 		exportManifest,
+		sendFullList,
+		redeemManifestTicket,
 		getSettings,
 	} from '$lib/api.js';
 	import { relayWhyHint } from '$lib/relay-health.js';
@@ -53,6 +55,16 @@
 	// wired on Home; this is its second entry point — surfaced where the request lands. The card's
 	// state is derived PURELY (zero network on render); the export Tauri call fires only on click.
 	import { manifestFulfilFor, MANIFEST_EXPORTED_TOAST } from '$lib/manifest-fulfil.js';
+	// M18 W4: the fulfil verb's two halves. The owner's "Send the full list" mints a ticket and DMs
+	// it; the asker's side recognises that ticket and redeems it ON ARRIVAL — there is deliberately no
+	// deferred redemption entry point in the backend to bind a button to (owner ruling 2026-07-30).
+	import {
+		parseTransportTicket,
+		transportTicketHint,
+		RedemptionLedger,
+		SEND_FULL_LIST_TOAST,
+	} from '$lib/transport-ticket.js';
+	import TransportTicketCard from '$lib/components/TransportTicketCard.svelte';
 	import { filterConversations, filterTopics, composeRecipientKind, isComposeToSelf } from '$lib/chat-filter.js';
 	import { peerPreview, peersWithHistory, relativeTime } from '$lib/chat-preview.js';
 	// M17 W2: the ask-access intent populates the composer draft from one pure copy source, without
@@ -409,6 +421,65 @@
 		} finally {
 			exportingSlug = null;
 		}
+	}
+
+	// M18 W4 — the fulfil verb. The whole of the owner's decision is this click: `send_full_list`
+	// builds the manifest, refuses it up front if it exceeds the transport ceiling (naming export in
+	// the error), mints a ticket bound to this one approval, records it, and DMs it. Nothing auto-fires
+	// (M17 ruling #4), and export stays on the card beside it for when the transport can't connect.
+	// Guarded per slug so a double-click cannot mint two approvals for one request.
+	let sendingFullList: string | null = $state(null);
+	async function handleSendFullList(slug: string) {
+		if (sendingFullList === slug) return;
+		const npub = selectedPeer?.npub;
+		if (!npub) return;
+		sendingFullList = slug;
+		try {
+			await sendFullList(npub, slug);
+			toast(SEND_FULL_LIST_TOAST(slug), 'success');
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			sendingFullList = null;
+		}
+	}
+
+	// M18 W4 — the asker's half. A ticket DM is redeemed the first time it is SEEN, not on a click:
+	// redemption is immediate by owner ruling, and the backend exposes no "redeem later" path. The
+	// ledger is keyed by `request_id` so the same DM re-rendered on every 3s poll (and re-read from
+	// the encrypted cache across restarts) fires exactly once — without it, a successfully-received
+	// manifest would show its owner a stream of "already redeemed" errors.
+	//
+	// The redeemed tree is NOT plumbed across tabs: the redemption caches the verified envelope
+	// through the same path a file import uses, so Browse's existing cache resolution upgrades the
+	// truncated teaser on its own. One hand-off, not two.
+	const redemptions = new RedemptionLedger();
+	let redemptionTick = $state(0); // bumped to re-render the cards; the ledger itself is not reactive
+	async function redeem(npub: string, requestId: string, ticketJson: string) {
+		try {
+			await redeemManifestTicket(npub, ticketJson);
+			redemptions.succeed(requestId);
+		} catch (e) {
+			redemptions.fail(requestId, String(e));
+		} finally {
+			redemptionTick += 1;
+		}
+	}
+
+	/** Fire the first redemption for a ticket we have just rendered. Returns the current state so the
+	 *  card can render it in the same pass. Safe to call on every render — the ledger claims once. */
+	function redemptionFor(npub: string | null, ticketJson: string, requestId: string) {
+		void redemptionTick; // read so this re-evaluates when a redemption settles
+		if (npub && redemptions.claim(requestId)) {
+			void redeem(npub, requestId, ticketJson);
+		}
+		return redemptions.get(requestId);
+	}
+
+	function retryRedemption(npub: string | null, ticketJson: string, requestId: string) {
+		if (!npub || !redemptions.claimRetry(requestId)) return;
+		redemptionTick += 1;
+		void redeem(npub, requestId, ticketJson);
 	}
 
 	async function sendChannelPost() {
@@ -982,7 +1053,7 @@
 						{#each req.messages as msg}
 							<div class="bubble-wrap">
 								<div class="bubble bubble-recv">
-									<p class="bubble-text">{manifestRequestHint(msg.content) ?? msg.content}</p>
+									<p class="bubble-text">{manifestRequestHint(msg.content) ?? transportTicketHint(msg.content) ?? msg.content}</p>
 									<span class="bubble-time">{formatTime(msg.sent_at)}</span>
 										{#if detectedFor(messageKey(msg))}
 											{@const card = detectedFor(messageKey(msg))!}
@@ -1011,6 +1082,21 @@
 												fingerprintSeen={mf.request.fingerprintSeen}
 												hasBigRelay={bigRelayUrl !== ''}
 												onexport={() => {}}
+												onsend={() => {}}
+												sending={false}
+											/>
+										{/if}
+										{#if parseTransportTicket(msg.content)}
+											{@const tk = parseTransportTicket(msg.content)!}
+											<!-- M18 W4, quarantine: recognition only, and — the part that matters — NO
+											     redemption fires. `redemptionFor` is not called here, so a stranger's
+											     ticket cannot make this node dial them before its sender has been
+											     accepted. Accept first, always (same rule as W3 and W7.1b). -->
+											<TransportTicketCard
+												slug={tk.slug}
+												state={undefined}
+												quarantined={true}
+												onretry={() => {}}
 											/>
 										{/if}
 								</div>
@@ -1091,7 +1177,7 @@
 							{/if}
 							<div class="bubble-wrap" class:bubble-me={isMe}>
 								<div class="bubble" class:bubble-sent={isMe} class:bubble-recv={!isMe}>
-									<p class="bubble-text">{manifestRequestHint(msg.content) ?? msg.content}</p>
+									<p class="bubble-text">{manifestRequestHint(msg.content) ?? transportTicketHint(msg.content) ?? msg.content}</p>
 									<span class="bubble-time">{formatTime(msg.sent_at)}</span>
 									{#if detectedFor(messageKey(msg))}
 										{@const card = detectedFor(messageKey(msg))!}
@@ -1121,6 +1207,22 @@
 											fingerprintSeen={mf.request.fingerprintSeen}
 											hasBigRelay={bigRelayUrl !== ''}
 											onexport={(slug) => handleExportManifest(slug)}
+											onsend={(slug) => handleSendFullList(slug)}
+											sending={sendingFullList === mf.state.slug}
+										/>
+									{/if}
+									{#if parseTransportTicket(msg.content)}
+										{@const tk = parseTransportTicket(msg.content)!}
+										<!-- M18 W4: the ticket card. Unlike the two cards above it, this one fires its
+										     action on RENDER rather than on a click — the asker already asked, the owner
+										     has already decided, and the backend has no deferred redemption path. The
+										     ledger keyed by request_id is what makes "on render" fire exactly once. -->
+										<TransportTicketCard
+											slug={tk.slug}
+											state={redemptionFor(selectedPeer?.npub ?? null, msg.content, tk.requestId)}
+											quarantined={false}
+											onretry={() =>
+												retryRedemption(selectedPeer?.npub ?? null, msg.content, tk.requestId)}
 										/>
 									{/if}
 								</div>
