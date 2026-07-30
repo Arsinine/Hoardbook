@@ -1,0 +1,389 @@
+//! The **transport ticket** (M18 W1) — the authorization to connect and fetch one manifest.
+//!
+//! A ticket is what the hoarder hands back when they approve a manifest request: an opaque node
+//! address plus the binding that says *which request* it answers. It rides a **NIP-17 DM to one
+//! recipient** — the DM provides the seal, so this module deliberately adds no crypto of its own.
+//!
+//! **It does NOT ride the presence event.** The retired plane sealed addresses into the public
+//! presence event (`seal_addrs`/`SealedAddr`), which is the H4/MT2 IP-harvest hole; presence stays
+//! freshness-only and `binding::presence_carries_no_address_or_node_key` stays green. A ticket goes
+//! to exactly one asker, for exactly one request.
+//!
+//! **What a ticket grants, precisely.** The ability to *connect and fetch* — **not** the ability to
+//! read. The manifest stays browse-key encrypted, so a ticket-holder without the share code gets
+//! ciphertext. This is the distinction `SEMANTICS.md` reserves: a **share code** (`hbk1…`,
+//! permanent) grants *read*; a **transport ticket** (until redeemed) grants *connect and fetch*.
+//! (A third concept, the Mascara download ticket, was retired 2026-07-26 and is *dead* — deleted
+//! from the vocabulary, not merely unused.)
+//!
+//! ## Lifecycle — owner ruling 2026-07-30. Do not re-open the time-box option.
+//!
+//! > **One ticket per request. Consumed on SUCCESS, not on attempt. Redeemed immediately. Not
+//! > time-boxed — valid until redeemed.**
+//!
+//! Each property answers a failure the alternatives cause, and each is enforced here rather than
+//! documented:
+//!
+//! 1. **Consumed on success, not attempt.** Hole-punching succeeds ~90% of the time and the
+//!    `drain_connection` teardown truncation is a known recurring bug, so a strictly one-attempt
+//!    ticket would put a **human back in the loop after a dropped connection** — for a transfer
+//!    both humans already agreed to. That is the launch embarrassment relocated, not fixed. **A
+//!    failed connection must cost nothing.** Enforced by [`RedemptionGrant`]: the only way to reach
+//!    a [`ConsumedTicket`] is [`RedemptionGrant::into_consumed`], which **requires the delivered
+//!    payload as proof**. There is no code path that consumes a ticket without the goods in hand,
+//!    and dropping a grant does nothing.
+//! 2. **Redeemed immediately, with no affordance to defer.** *"There is no way of strategically
+//!    keeping a ticket to cash in later"* (owner) — which is what makes property 3 safe. This is an
+//!    **implementation constraint, not a nicety: do not add a "redeem later" button.**
+//! 3. **Not time-boxed.** Deliberately **no `expires_at` field** — see
+//!    [`a_ticket_has_no_expiry_by_design`]. A window would silently discard an approval *both
+//!    humans already gave*, whenever the asker happens to be offline when the owner clicks. The
+//!    owner approves; the asker's client redeems whenever it next comes online. Time-boxing
+//!    optimizes the wrong failure.
+//!
+//! **Redeem-time contact standing is REQUIRED** (owner ruling 2026-07-30). Valid-until-redeemed
+//! means the ticket alone cannot be the whole authorization: an asker later blocked or declined
+//! must not be able to redeem an older ticket. So [`authorize_redemption`] checks **live standing
+//! at redeem time**, not just ticket validity. It costs nothing — the owner's node is the one
+//! accepting the connection — and it restores revocability without touching the ticket design.
+//! Property 2 makes this defence-in-depth (an adversarial asker deliberately extracting a ticket
+//! from its DM and withholding redemption) rather than routine, but it is the whole difference
+//! between "cannot un-approve" and "can".
+//!
+//! **Why reuse is not offered.** There is no scenario needing repeated fetches: collection updates
+//! are already handled — `snapshot_fingerprint` + the stale flag let a peer *detect* staleness and
+//! re-ask, which is a **new request and a new ticket** (exactly what `hb-it` Suite MAN's MAN2 pins).
+//! Reuse would solve a problem that does not exist.
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::HbError;
+use crate::transport_payload::ManifestPayload;
+
+/// Ticket schema version. Pinned in `wire_freeze`: a ticket rides a durable NIP-17 DM, so one
+/// already sitting in a relay-stored wrap must stay readable.
+pub const TICKET_V: u8 = 1;
+
+/// The `content.hb` discriminator marking a DM body as a transport ticket — the owner→asker
+/// direction, distinct from `manifest_request`'s asker→owner. Frozen for the same reason.
+pub const TICKET_TAG: &str = "transport_ticket";
+
+/// Where a redeemer stands with the issuer **right now**, read at redeem time rather than trusted
+/// from the ticket. `Unknown` is deliberately its own case and deliberately refused: a redeemer the
+/// issuer can no longer identify is not "probably fine".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactStanding {
+    /// A saved contact in good standing.
+    Good,
+    /// Explicitly blocked since the ticket was issued.
+    Blocked,
+    /// Their request was declined since the ticket was issued.
+    Declined,
+    /// Not a known contact (removed, or never saved).
+    Unknown,
+}
+
+impl ContactStanding {
+    fn may_redeem(self) -> bool {
+        matches!(self, ContactStanding::Good)
+    }
+}
+
+/// A transport ticket: the address to dial plus the binding that says which request it answers.
+///
+/// **Note what is absent: there is no expiry field.** That is the owner's ruling made structural —
+/// a ticket cannot be time-boxed by a later well-meaning "consistency" change without changing this
+/// type, which [`a_ticket_has_no_expiry_by_design`] will notice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportTicket {
+    /// Always [`TICKET_TAG`] — how the asker's inbox recognises the DM.
+    pub hb: String,
+    pub ticket_v: u8,
+    /// The request this ticket answers. **One ticket per request**: the binding that stops a ticket
+    /// issued for one request being spent on another.
+    pub request_id: String,
+    /// The collection the request was about, so a redeemer cannot silently fetch a different one.
+    pub slug: String,
+    /// The issuer's dialable node address, **opaque to hb-core** — this crate has no iroh
+    /// dependency and deliberately does not parse it. The transport layer (hb-app) interprets it.
+    pub node_addr: String,
+    /// Unix seconds the ticket was issued. Provenance and display only — **not an expiry input.**
+    pub issued_at: u64,
+}
+
+impl TransportTicket {
+    /// Mint a ticket for one request. `node_addr` is passed through untouched.
+    pub fn issue(request_id: &str, slug: &str, node_addr: &str, issued_at: u64) -> Self {
+        Self {
+            hb: TICKET_TAG.to_string(),
+            ticket_v: TICKET_V,
+            request_id: request_id.to_string(),
+            slug: slug.to_string(),
+            node_addr: node_addr.to_string(),
+            issued_at,
+        }
+    }
+
+    /// Structural self-check: the discriminator and version are recognised and the bindings are
+    /// present. An unknown version is *recognised and refused*, never mis-read — the same
+    /// forward-compat contract `MANIFEST_V` upholds.
+    pub fn verify_shape(&self) -> Result<(), HbError> {
+        if self.hb != TICKET_TAG {
+            return Err(HbError::InvalidTicket("not a transport ticket".into()));
+        }
+        if self.ticket_v == 0 || self.ticket_v > TICKET_V {
+            return Err(HbError::UnsupportedVersion(self.ticket_v));
+        }
+        if self.request_id.is_empty() || self.slug.is_empty() || self.node_addr.is_empty() {
+            return Err(HbError::InvalidTicket("ticket is missing a required binding".into()));
+        }
+        Ok(())
+    }
+}
+
+/// Permission to attempt **one** redemption — and the only route to a [`ConsumedTicket`].
+///
+/// `#[must_use]` because ignoring one silently discards an authorization the user granted. Dropping
+/// it *without* calling [`Self::into_consumed`] is the failed-connection path and is deliberately a
+/// no-op: **the ticket stays unspent and a retry works.**
+///
+/// "Consumed on success, not on attempt" is a **compile-time** property, not a tested one — a
+/// caller cannot assert success, only demonstrate it. This must not compile:
+///
+/// ```compile_fail
+/// # use hb_core::ticket::{authorize_redemption, ContactStanding, TransportTicket};
+/// let t = TransportTicket::issue("req-1", "slug", "addr", 0);
+/// let grant = authorize_redemption(&t, "req-1", false, ContactStanding::Good).unwrap();
+/// // A dropped connection has no ManifestPayload to hand over, so there is no way to reach
+/// // ConsumedTicket from here. Calling it with nothing is a type error, by design.
+/// let _receipt = grant.into_consumed();
+/// ```
+#[must_use = "a grant that is neither redeemed nor deliberately dropped means the approval was lost"]
+#[derive(Debug)]
+pub struct RedemptionGrant {
+    request_id: String,
+    slug: String,
+}
+
+impl RedemptionGrant {
+    /// Spend the ticket — **only reachable with the delivered payload in hand.**
+    ///
+    /// This signature *is* the enforcement of "consumed on success, not on attempt": there is no
+    /// way to call it after a dropped connection, because a dropped connection has no
+    /// [`ManifestPayload`] to pass. (Taking the payload by reference and returning a receipt, rather
+    /// than taking a bool, is the same discipline as INV-4′ mechanism 1 — the caller cannot assert
+    /// success, only demonstrate it.)
+    pub fn into_consumed(self, delivered: &ManifestPayload) -> ConsumedTicket {
+        ConsumedTicket {
+            request_id: self.request_id,
+            slug: self.slug,
+            delivered_bytes: delivered.len(),
+        }
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+}
+
+/// Proof that a ticket was spent on a completed transfer. The caller records this so a replay of
+/// the same ticket is refused (see [`authorize_redemption`]'s `already_consumed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumedTicket {
+    pub request_id: String,
+    pub slug: String,
+    /// Size of what was actually delivered — the receipt's evidence, and useful for a log line.
+    pub delivered_bytes: usize,
+}
+
+/// The redeem-time gate, run by the **issuer's** node as it accepts a connection.
+///
+/// Four checks, in this order, each of which a real failure mode motivates:
+///
+/// 1. the ticket is structurally a ticket of a version we speak;
+/// 2. it answers **this** request (one ticket per request — no spending A's ticket on B);
+/// 3. it has not already been consumed (replay of a completed transfer);
+/// 4. the redeemer is **still** a contact in good standing (revocability — the property
+///    valid-until-redeemed would otherwise cost).
+///
+/// Deliberately absent: any expiry comparison. There is no clock input, so this function
+/// *cannot* time-box a ticket even by accident.
+pub fn authorize_redemption(
+    ticket: &TransportTicket,
+    for_request_id: &str,
+    already_consumed: bool,
+    standing: ContactStanding,
+) -> Result<RedemptionGrant, HbError> {
+    ticket.verify_shape()?;
+    if ticket.request_id != for_request_id {
+        return Err(HbError::InvalidTicket("ticket was issued for a different request".into()));
+    }
+    if already_consumed {
+        return Err(HbError::TicketAlreadyRedeemed);
+    }
+    if !standing.may_redeem() {
+        return Err(HbError::TicketRedeemerNotInGoodStanding);
+    }
+    Ok(RedemptionGrant { request_id: ticket.request_id.clone(), slug: ticket.slug.clone() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Identity;
+    use crate::manifest::build_manifest_envelope;
+
+    fn ticket() -> TransportTicket {
+        TransportTicket::issue("req-1", "my-slug", "node-addr-opaque", 1_700_000_000)
+    }
+
+    fn delivered() -> ManifestPayload {
+        let id = Identity::generate();
+        let env = build_manifest_envelope(
+            &id,
+            "my-slug",
+            &[3u8; 32],
+            "fp-abc",
+            1_700_000_000,
+            &[r#"{"part":0,"entries":[]}"#.to_string()],
+        )
+        .unwrap();
+        ManifestPayload::seal(&env).unwrap()
+    }
+
+    #[test]
+    fn a_valid_ticket_for_this_request_is_authorized() {
+        let grant =
+            authorize_redemption(&ticket(), "req-1", false, ContactStanding::Good).unwrap();
+        assert_eq!(grant.request_id(), "req-1");
+    }
+
+    #[test]
+    fn ticket_round_trips_through_a_dm_body() {
+        let t = ticket();
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(json.contains(TICKET_TAG), "the DM body carries its discriminator");
+        let back: TransportTicket = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, t);
+        back.verify_shape().unwrap();
+    }
+
+    /// **Property 1 — a failed connection costs nothing.** The grant is dropped without
+    /// `into_consumed`, the ticket is still not consumed, and the retry authorizes again.
+    #[test]
+    fn a_failed_attempt_does_not_consume_the_ticket_and_a_retry_succeeds() {
+        let t = ticket();
+        let mut consumed = false;
+
+        // Attempt 1: authorized, then the connection dies. Nothing calls `into_consumed`.
+        let grant = authorize_redemption(&t, "req-1", consumed, ContactStanding::Good).unwrap();
+        drop(grant);
+        assert!(!consumed, "a dropped grant cannot have consumed anything — there is no path");
+
+        // Attempt 2: the same ticket still works.
+        let grant = authorize_redemption(&t, "req-1", consumed, ContactStanding::Good)
+            .expect("a retry after a failed connection must be authorized");
+        let receipt = grant.into_consumed(&delivered());
+        consumed = true;
+        assert_eq!(receipt.request_id, "req-1");
+        assert!(receipt.delivered_bytes > 0, "the receipt records what actually arrived");
+
+        // Attempt 3: now that it succeeded, a replay is refused.
+        assert!(
+            matches!(
+                authorize_redemption(&t, "req-1", consumed, ContactStanding::Good),
+                Err(HbError::TicketAlreadyRedeemed)
+            ),
+            "a completed transfer consumes the ticket and a replay is refused"
+        );
+    }
+
+    /// **Property 3 — not time-boxed.** An approval issued while the asker was offline is still
+    /// redeemable when they return, however long that took.
+    #[test]
+    fn an_approval_given_while_the_asker_was_offline_is_still_redeemable() {
+        // Issued a year ago. There is no clock argument to `authorize_redemption` at all, so this
+        // cannot depend on elapsed time — which is the point.
+        let ancient = TransportTicket::issue("req-1", "my-slug", "node-addr-opaque", 1);
+        let grant = authorize_redemption(&ancient, "req-1", false, ContactStanding::Good)
+            .expect("a ticket is valid until redeemed, never expired");
+        assert_eq!(grant.request_id(), "req-1");
+    }
+
+    /// **Property 3, structurally.** The absence of an expiry field is a ruling, not an oversight —
+    /// a later "consistency" change that time-boxes tickets must trip this, not slip through. The
+    /// serialized body is the durable artifact, so that is what is checked.
+    #[test]
+    fn a_ticket_has_no_expiry_by_design() {
+        let json = serde_json::to_string(&ticket()).unwrap();
+        for forbidden in ["expires", "expiry", "ttl", "valid_until", "not_after"] {
+            assert!(
+                !json.contains(forbidden),
+                "a transport ticket must not carry `{forbidden}` — it is valid until redeemed \
+                 (owner ruling 2026-07-30: a time box discards approvals both humans already gave)"
+            );
+        }
+    }
+
+    /// **The revocation test** — the property that valid-until-redeemed would otherwise cost.
+    #[test]
+    fn a_redeemer_blocked_or_declined_after_approval_is_refused() {
+        let t = ticket();
+        for standing in [ContactStanding::Blocked, ContactStanding::Declined, ContactStanding::Unknown] {
+            assert!(
+                matches!(
+                    authorize_redemption(&t, "req-1", false, standing),
+                    Err(HbError::TicketRedeemerNotInGoodStanding)
+                ),
+                "{standing:?} must not be able to redeem an already-issued ticket"
+            );
+        }
+        // And the ticket itself is untouched — revoking standing is not the same as burning it, so
+        // restoring the contact restores the approval rather than requiring a fresh request.
+        let restored = authorize_redemption(&t, "req-1", false, ContactStanding::Good).unwrap();
+        assert_eq!(restored.request_id(), "req-1");
+    }
+
+    /// **One ticket per request** — a ticket cannot be spent on a different request or collection.
+    #[test]
+    fn a_ticket_is_bound_to_its_own_request() {
+        let t = ticket();
+        assert!(
+            matches!(
+                authorize_redemption(&t, "req-2", false, ContactStanding::Good),
+                Err(HbError::InvalidTicket(_))
+            ),
+            "a ticket issued for req-1 must not redeem req-2"
+        );
+    }
+
+    #[test]
+    fn malformed_and_unknown_version_tickets_are_refused() {
+        let mut wrong_tag = ticket();
+        wrong_tag.hb = "manifest_request".into();
+        assert!(
+            matches!(wrong_tag.verify_shape(), Err(HbError::InvalidTicket(_))),
+            "another DM body type is not a ticket"
+        );
+
+        let mut future = ticket();
+        future.ticket_v = TICKET_V + 1;
+        assert!(
+            matches!(future.verify_shape(), Err(HbError::UnsupportedVersion(v)) if v == TICKET_V + 1),
+            "an unknown version is recognised and refused, never mis-read"
+        );
+
+        for blank in ["request_id", "slug", "node_addr"] {
+            let mut t = ticket();
+            match blank {
+                "request_id" => t.request_id.clear(),
+                "slug" => t.slug.clear(),
+                _ => t.node_addr.clear(),
+            }
+            assert!(
+                matches!(t.verify_shape(), Err(HbError::InvalidTicket(_))),
+                "a ticket with an empty {blank} is refused"
+            );
+        }
+    }
+}
