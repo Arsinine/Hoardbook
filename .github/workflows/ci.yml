@@ -81,13 +81,41 @@ jobs:
           # `/*`, `<!--`). A commented-out construct is not a construct.
           code_only() { grep -vE '^[^:]*:[0-9]+:[[:space:]]*(//|#|\*|/\*|<!--)'; }
           sweep() { local desc="$1"; shift; if out=$(grep -rnE "$@" 2>/dev/null | code_only); then echo "::error::INV-4′ regression — $desc:"; echo "$out"; fail=1; fi; }
-          # The transport module is the whole surface allowed to hold a connection. Listed explicitly
-          # so a NEW transport file must be added here deliberately — an unlisted one is unswept.
+          # The transport module is the whole surface allowed to hold a connection.
           TRANSPORT_FILES="crates/hb-app/src/transport.rs crates/hb-app/src/conn.rs"
+          # A hand-maintained list fails two ways, both confirmed by trying them:
+          #   · rename or delete a listed file and `grep` exits 2, which makes the `if` FALSE — the
+          #     probe goes SILENTLY GREEN on the very file it exists to watch;
+          #   · add a new transport module and it is simply unswept.
+          # So the list is verified rather than trusted: every listed file must exist, and every file
+          # that touches iroh must be listed. Nothing can hold a QUIC connection without naming iroh,
+          # which makes that the honest definition of "the transport surface".
+          for f in $TRANSPORT_FILES; do
+            if [ ! -f "$f" ]; then
+              echo "::error::INV-4′ sweep is stale — it lists $f, which does not exist. A renamed or"
+              echo "::error::deleted transport file makes every probe below silently pass. Update the list."
+              exit 1
+            fi
+          done
+          iroh_users=$(grep -rlE '(^|[^a-zA-Z_])iroh::' crates/*/src | sort)
+          listed=$(printf '%s\n' $TRANSPORT_FILES | sort)
+          if unlisted=$(comm -23 <(echo "$iroh_users") <(echo "$listed")) && [ -n "$unlisted" ]; then
+            echo "::error::INV-4′ regression — these files use iroh but are not in the swept transport surface:"
+            echo "$unlisted"
+            echo "::error::Add them to TRANSPORT_FILES (and satisfy the probes), or move the transport code back."
+            fail=1
+          fi
           sweep "retired xfer crypto in hb-core"      'seal_addrs|unseal_addrs|resolve_node_key|verify_binding_token|follower_gate|SealedAddr|KIND_XFER' crates/hb-core/src
           sweep "a transfer/gate module declaration"  '^[[:space:]]*(#\[[^]]*\][[:space:]]*)*(pub(\([^)]*\))?[[:space:]]+)?mod[[:space:]]+(transfer|gate)\b' crates
           sweep "a download queue or download verb is back" 'DownloadQueue|request_download|cancel_download|DownloadRegistry' crates/hb-app/src crates/hb-app/ui/src crates/hb-core/src crates/hb-net/src
           sweep "the transport module reads the filesystem — the plane is moving files" 'tokio::fs|std::fs::|File::open|PathBuf|std::path::Path' $TRANSPORT_FILES
+          # INV-4′ mechanism 1 is only real while `ManifestPayload`'s ONLY constructors validate. A
+          # serde derive is an unvalidated public constructor: `from_str::<ManifestPayload>("[137,80]")`
+          # yields a payload of PNG bytes, skipping seal/from_wire/verify_integrity AND the 8 MiB
+          # ceiling. The type shipped with that derive and every test stayed green, because no test
+          # tried the bypass — so the guard is a grep, not a test.
+          sweep "ManifestPayload gained a serde derive — that is an unvalidated public constructor, bypassing seal/from_wire and the byte ceiling" \
+                'derive\([^)]*(Serialize|Deserialize)' crates/hb-core/src/transport_payload.rs
           sweep "the transport module takes a filesystem path" 'fn [a-z_]+\([^)]*(path|file_path|save_path): *&?(str|String|Path|PathBuf)' $TRANSPORT_FILES
           # A content grep misses a file whose only tell is its NAME — an orphaned
           # `DownloadQueue.svelte` referencing nothing has no matching text inside it. Verified by

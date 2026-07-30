@@ -30,8 +30,6 @@
 //! `verify_integrity`. Author verification stays with the caller ([`ManifestEnvelope::verify_author`]),
 //! which needs the expected author's key and so cannot live at this layer.
 
-use serde::{Deserialize, Serialize};
-
 use crate::error::HbError;
 use crate::manifest::ManifestEnvelope;
 
@@ -59,6 +57,26 @@ use crate::manifest::ManifestEnvelope;
 /// Above the ceiling the route is export — say so, in the error and in the UI.
 pub const MANIFEST_MAX_TRANSPORT_BYTES: usize = 8 * 1024 * 1024;
 
+/// **Companion cap to the byte ceiling: the most parts an inbound envelope may declare.**
+///
+/// The byte ceiling alone bounds the *frame*, not the *work*. A legal 8 MiB envelope can be almost
+/// entirely `"",""...` — millions of empty `ciphertexts` entries with a `manifest_sha256` that
+/// honestly matches them. Each costs ~3 bytes of JSON but a `String` is 24 bytes plus its
+/// allocation, so peak memory is a multiple of the frame it arrived in. `verify_integrity` does not
+/// bound the count (it only requires non-empty), so nothing else catches this.
+///
+/// 4096 is not a new number: it is `hb-net::MAX_LISTING_PARTS`, the cap the **producer** already
+/// enforces, so no manifest Hoardbook can legitimately build is refused here. Duplicated as a
+/// literal rather than imported because hb-core does not depend on hb-net; `parts_cap_matches_the_
+/// producer_cap` in `wire_freeze` is what keeps the two honest.
+///
+/// **What this does and does not fix:** the check runs *after* `serde_json` has parsed, so it caps
+/// the payload a caller can go on to hold, not the transient parse allocation. That transient is
+/// still bounded — by the 8 MiB frame ceiling times serde's expansion factor — so this closes the
+/// unbounded case, not every amplification. A streaming parser would be the complete fix and is not
+/// worth it at this size.
+pub const MANIFEST_MAX_TRANSPORT_PARTS: usize = 4096;
+
 /// The **only** payload Hoardbook's transport plane will carry: the serialized bytes of a
 /// [`ManifestEnvelope`] that has passed `verify_integrity` and is within
 /// [`MANIFEST_MAX_TRANSPORT_BYTES`].
@@ -66,8 +84,30 @@ pub const MANIFEST_MAX_TRANSPORT_BYTES: usize = 8 * 1024 * 1024;
 /// Deliberately opaque — the inner `Vec<u8>` is private and there is no constructor that accepts
 /// arbitrary bytes without validating them. See the module docs for why this is mechanism 1 of
 /// INV-4′ rather than a convenience wrapper.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **⚠ THIS TYPE MUST NEVER DERIVE `Serialize`/`Deserialize`, AND THE ORIGINAL SHIPPED VERSION DID.**
+/// A derived `Deserialize` is a **public constructor**: a private tuple field does not stop
+/// `serde_json::from_str::<ManifestPayload>("[137,80,78,71]")` from handing you a payload of PNG
+/// bytes, which bypasses `seal`, `from_wire`, `verify_integrity` **and** the byte ceiling in one
+/// step. Confirmed by execution, not inspection — an 8 MiB + 1 byte payload was constructed that
+/// way. That single derive defeated mechanisms 1 and 2 simultaneously while every test stayed green,
+/// because no test tried the bypass.
+///
+/// Nothing ever needed the derives: the plane writes [`Self::as_bytes`] onto the wire and reads
+/// bytes back through [`Self::from_wire`], so the type is never itself a serde field. The lesson is
+/// general — **on a newtype whose whole purpose is that its constructors validate, a serde derive is
+/// an unvalidated constructor.** The CI sweep now greps for their return (mechanism 3).
+#[derive(Clone, PartialEq, Eq)]
 pub struct ManifestPayload(Vec<u8>);
+
+/// Hand-written so a payload logs as its size, not its contents. A derived `Debug` prints every
+/// byte, which for this type means **up to 8 MiB of remote-supplied data into a log line or a test
+/// failure** — the derive turned one assertion message into 848 KB of decimal byte values.
+impl std::fmt::Debug for ManifestPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ManifestPayload({} bytes)", self.0.len())
+    }
+}
 
 impl ManifestPayload {
     /// **Send side.** Serialize an envelope and bound it. Errs with [`HbError::PayloadTooLarge`]
@@ -93,8 +133,25 @@ impl ManifestPayload {
         // zip, a JPEG — anything that is not a structurally valid, self-consistent envelope — is
         // refused here, so no caller can obtain a `ManifestPayload` that isn't one.
         let envelope: ManifestEnvelope = serde_json::from_slice(&bytes)?;
+        if envelope.ciphertexts.len() > MANIFEST_MAX_TRANSPORT_PARTS {
+            return Err(HbError::InvalidManifest(format!(
+                "manifest declares {} parts, over the {MANIFEST_MAX_TRANSPORT_PARTS}-part transport \
+                 cap — no manifest this app can build has that many",
+                envelope.ciphertexts.len()
+            )));
+        }
         envelope.verify_integrity()?;
         Ok(Self(bytes))
+    }
+
+    /// The slug the envelope inside claims to describe.
+    ///
+    /// Exposed so the transport can bind the payload to the **ticket** that authorized it: without
+    /// this check `ManifestSource::payload(slug)` is a naming convention, and a source that answers
+    /// with the wrong collection is served and accepted as self-consistent. A ticket names one
+    /// collection; the bytes must agree.
+    pub fn declared_slug(&self) -> Result<String, HbError> {
+        Ok(self.envelope()?.slug)
     }
 
     /// The wire bytes. Read-only: there is no `as_mut`, so a payload cannot be edited into
@@ -212,6 +269,33 @@ mod tests {
         );
     }
 
+    /// **The part cap bounds the work an in-budget frame can demand.** A manifest well under 8 MiB
+    /// can still declare a colossal number of parts — each `String` costs far more in memory than in
+    /// JSON — and `verify_integrity` only requires the vector to be non-empty. The envelope here is
+    /// **honestly self-consistent**: built by the real constructor, so its `manifest_sha256` genuinely
+    /// matches its parts. It is refused on the count alone, which is the point.
+    #[test]
+    fn an_envelope_declaring_more_parts_than_the_producer_can_build_is_refused() {
+        let id = Identity::generate();
+        let parts: Vec<String> =
+            (0..=MANIFEST_MAX_TRANSPORT_PARTS).map(|i| format!(r#"{{"p":{i}}}"#)).collect();
+        let env =
+            build_manifest_envelope(&id, "slug", &[3u8; 32], "fp", 1_700_000_000, &parts).unwrap();
+        let bytes = serde_json::to_vec(&env).unwrap();
+        assert!(
+            bytes.len() < MANIFEST_MAX_TRANSPORT_BYTES,
+            "the fixture must be UNDER the byte ceiling, or it would be refused for the wrong \
+             reason — got {} bytes",
+            bytes.len()
+        );
+        match ManifestPayload::from_wire(bytes) {
+            Err(HbError::InvalidManifest(msg)) => {
+                assert!(msg.contains("parts"), "the refusal names the part count, got: {msg}");
+            }
+            other => panic!("expected InvalidManifest, got {other:?}"),
+        }
+    }
+
     /// **Exactly at the ceiling is allowed; one byte over is not.** An off-by-one here is the
     /// difference between a documented cliff and an arbitrary one, and `wire_freeze` makes it
     /// unfixable without a fork — so pin the boundary itself, not just "big is refused".
@@ -227,3 +311,4 @@ mod tests {
         );
     }
 }
+

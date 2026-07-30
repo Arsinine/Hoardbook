@@ -24,12 +24,19 @@
 //! owner → asker   [u8 status: 0 = ok, 1 = refused]
 //!   ok      → [u32-LE payload-len][ManifestEnvelope JSON bytes]
 //!   refused → [u32-LE msg-len][UTF-8 reason]
+//! asker → owner   [u8 0]   ← the RECEIPT: sent only after from_wire + the slug check both pass
 //! ```
 //!
 //! **Both length prefixes are bounded before a byte is allocated** ([`read_framed`]). That is the
 //! framing-layer check W3 deliberately left to W1: `ManifestPayload::from_wire` is the *second*
 //! ceiling check, and by the time bytes reach it they are already in memory. A hostile peer
 //! declaring 500 MB is refused on the declared length, not after the allocation.
+//!
+//! **The trailing receipt frame is not a courtesy.** Writing bytes proves only that the *sender* had
+//! them; the ACK is the asker asserting that a manifest it could actually parse, verify and match to
+//! its ticket is now in hand. Everything about "consumed on success" rests on it — see
+//! [`serve_manifest_stream`]. Every step also carries a deadline, so a peer cannot hold a handler
+//! open by connecting and going quiet.
 //!
 //! ## Authorization — the capability is the ticket, not the address
 //!
@@ -45,12 +52,19 @@
 //! reserves between a share code (grants *read*) and a transport ticket (grants *connect and
 //! fetch*).
 //!
-//! **Consumed on success is enforced by the type system, not by this module's care.** The owner
-//! side holds a `RedemptionGrant`, and the only route to a `ConsumedTicket` is
-//! `into_consumed(&ManifestPayload)`. A connection that dies mid-write drops the grant, which is a
-//! no-op: the ticket stays unspent and the retry works. That is why the consume call sits *after*
-//! [`drain_connection`](crate::conn::drain_connection) — the drain is what makes "the peer read it"
-//! observable, and without it a fast link can close ahead of the last chunk.
+//! **Consumed on success needs both halves: the type system AND the receipt.** The owner side holds
+//! a `RedemptionGrant`, and the only route to a `ConsumedTicket` is `into_consumed(&ManifestPayload)`
+//! — so no code path burns a ticket without the goods. But that signature proves only that *we* had
+//! the payload, which is why the grant is spent only after the asker's ACK: a peer that read half the
+//! payload and died would otherwise still burn the ticket, which is precisely the "human back in the
+//! loop after a dropped connection" failure the owner's ruling exists to prevent. A connection that
+//! dies mid-write drops the grant, which is a no-op: the ticket stays unspent and the retry works.
+//! [`drain_connection`](crate::conn::drain_connection) still precedes it — without the drain a fast
+//! link can close ahead of the last chunk.
+//!
+//! **One ticket, one delivery.** [`ManifestPlane`] holds an in-flight set keyed by `request_id`,
+//! because the read of `already_consumed` and the write of the receipt are far apart and two
+//! concurrent connections would otherwise both pass the gate.
 
 use std::sync::Arc;
 
@@ -78,6 +92,35 @@ const STATUS_REFUSED: u8 = 1;
 
 /// Ceiling on a refusal message, so an error path cannot become an unbounded allocation either.
 const REFUSAL_MAX_FRAME: usize = 4 * 1024;
+
+/// The single refusal for "no approved request matches this ticket". A **constant** rather than two
+/// identical string literals, because the property that an unknown request id and a forged ticket
+/// are indistinguishable is only as good as the two messages staying byte-identical — and two
+/// literals drift the first time someone improves one of them.
+const REFUSAL_NO_MATCH: &str = "no approved manifest request matches this ticket";
+
+/// How long the owner's side waits for a peer to open a stream and finish its request frame.
+///
+/// Without this a peer could connect and send nothing — or dribble an 8 KiB request one byte at a
+/// time — and hold a handler forever. `read_exact` has no deadline of its own, so the only bound was
+/// the peer's goodwill.
+const HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the owner's side waits for the asker's acknowledgement after writing the payload.
+/// Generous: the asker has to read up to 8 MiB, parse it, and verify its integrity before it can
+/// honestly ACK. A timeout is **not** a success — the ticket stays unspent.
+const ACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Apply a deadline to one step, turning a stall into a stated error instead of a wedged task.
+async fn with_deadline<T>(
+    limit: std::time::Duration,
+    what: &str,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    tokio::time::timeout(limit, fut)
+        .await
+        .map_err(|_| anyhow!("{what} (waited {}s)", limit.as_secs()))
+}
 
 /// The asker's opening frame: which request this is, and the ticket that authorizes it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,17 +211,22 @@ async fn refuse(mut send: impl tokio::io::AsyncWrite + Unpin, reason: &str) -> R
 // Owner side — serve one manifest for one ticket
 // ---------------------------------------------------------------------------
 
-/// Serve one request over an already-accepted bi-stream. Returns the receipt when a manifest was
-/// delivered, `Ok(None)` when the request was refused for a stated reason.
+/// Serve one request over an already-accepted bi-stream. Returns the receipt when the asker
+/// **acknowledged** a valid manifest, `Ok(None)` when the request was refused for a stated reason.
 ///
 /// Generic over the streams so the framing and the gate are testable without QUIC; the real caller
-/// is [`serve_manifest_connection`].
+/// is [`ManifestPlane::serve`].
 pub(crate) async fn serve_manifest_stream(
     mut send: impl tokio::io::AsyncWrite + Unpin,
-    recv: impl tokio::io::AsyncRead + Unpin,
+    mut recv: impl tokio::io::AsyncRead + Unpin,
     source: &dyn ManifestSource,
 ) -> Result<Option<(ConsumedTicket, ManifestPayload)>> {
-    let frame = read_framed(recv, FETCH_REQUEST_MAX_FRAME).await?;
+    let frame = with_deadline(
+        HANDSHAKE_DEADLINE,
+        "the asker never finished sending its request",
+        read_framed(&mut recv, FETCH_REQUEST_MAX_FRAME),
+    )
+    .await??;
     let req: FetchRequest = match serde_json::from_slice(&frame) {
         Ok(r) => r,
         Err(e) => {
@@ -190,14 +238,14 @@ pub(crate) async fn serve_manifest_stream(
     let Some(issued) = source.issued(&req.request_id) else {
         // Deliberately not "no such request" — an unknown id and a wrong ticket get the same
         // answer, so a prober learns nothing about which requests exist.
-        refuse(&mut send, "no approved manifest request matches this ticket").await?;
+        refuse(&mut send, REFUSAL_NO_MATCH).await?;
         return Ok(None);
     };
 
     // The ticket presented must be the ticket issued. This — not the node address, and not the
     // request id — is the capability: it rode a sealed DM to one recipient.
     if req.ticket != issued.ticket {
-        refuse(&mut send, "no approved manifest request matches this ticket").await?;
+        refuse(&mut send, REFUSAL_NO_MATCH).await?;
         return Ok(None);
     }
 
@@ -224,34 +272,209 @@ pub(crate) async fn serve_manifest_stream(
         }
     };
 
+    // **Bind the bytes to the ticket.** `ManifestSource::payload(slug)` is a naming convention, and
+    // a convention is not enforcement: a source that answers with collection B for a ticket naming
+    // collection A would otherwise be served, and the asker would accept it as self-consistent
+    // (it *is* — it is a perfectly valid envelope for the wrong collection). A ticket names one
+    // collection; the bytes must agree. Checked on both sides — see `fetch_over_connection`.
+    match payload.declared_slug() {
+        Ok(declared) if declared == issued.ticket.slug => {}
+        Ok(declared) => {
+            refuse(
+                &mut send,
+                &format!(
+                    "refusing to serve: the manifest describes '{declared}' but this ticket is for \
+                     '{}'",
+                    issued.ticket.slug
+                ),
+            )
+            .await?;
+            return Ok(None);
+        }
+        Err(e) => {
+            refuse(&mut send, &format!("could not read the manifest's own slug: {e}")).await?;
+            return Ok(None);
+        }
+    }
+
     send.write_u8(STATUS_OK).await.context("write ok status")?;
     write_framed(&mut send, payload.as_bytes()).await?;
     send.shutdown().await.context("shutdown send")?;
 
-    // Consumed on SUCCESS: only reachable with the payload in hand, and only after it was written.
-    Ok(Some((grant.into_consumed(&payload), payload)))
+    // ── The receipt frame: what turns "we wrote it" into "they have it" ──
+    //
+    // Writing the bytes proves only that WE had them. The asker acknowledges only after
+    // `ManifestPayload::from_wire` and the slug check have both passed on its side, so an ACK means
+    // a validated manifest is in the asker's hands. **Without this, a peer that read half the
+    // payload and died would still burn the ticket** — the connection closes, the drain returns, and
+    // the receipt is recorded for a transfer that never landed. That is exactly the "human back in
+    // the loop after a dropped connection" failure the owner's ruling exists to prevent.
+    //
+    // A timeout here is NOT a success: the grant is dropped, the ticket stays unspent, the retry
+    // works.
+    match with_deadline(
+        ACK_DEADLINE,
+        "the asker never acknowledged the manifest — treating it as undelivered",
+        recv.read_u8(),
+    )
+    .await
+    {
+        Ok(Ok(STATUS_OK)) => Ok(Some((grant.into_consumed(&payload), payload))),
+        Ok(Ok(other)) => Err(anyhow!("asker sent {other} instead of an acknowledgement")),
+        Ok(Err(e)) => Err(anyhow!("asker closed before acknowledging: {e}")),
+        Err(e) => Err(e),
+    }
 }
 
-/// Accept one connection on the manifest plane and serve it.
+/// The manifest plane's accept side: a [`ManifestSource`] plus the **in-flight set** that makes one
+/// ticket one delivery.
 ///
-/// The [`drain_connection`] call is load-bearing and its position is deliberate: it holds the
-/// connection open until the asker closes it, so the last chunk is not raced by a
-/// `CONNECTION_CLOSE` on a fast link. The receipt is recorded **after** the drain — a transfer the
-/// peer never finished reading has not succeeded, and must not burn the ticket.
-pub async fn serve_manifest_connection(
-    conn: iroh::endpoint::Connection,
+/// The set is the fix for a real race, not a defensive flourish. `ManifestSource::issued` reads
+/// `already_consumed` and `record_consumed` writes it much later — after the payload, after the
+/// drain, after the ACK. Two connections presenting the same valid ticket could therefore both read
+/// `already_consumed == false`, both serve the manifest, and both record afterwards: **one ticket,
+/// two deliveries.** No test caught it because the tests serialize their accept loop and only replay
+/// after the first receipt has landed.
+///
+/// Holding the `request_id` for the whole lifetime of a redemption closes it at the only layer that
+/// can see both ends of the window. It is per-process, which is the right scope: a ticket names one
+/// issuer, and the issuer is one node.
+pub struct ManifestPlane {
     source: Arc<dyn ManifestSource>,
-) -> Result<()> {
-    let (send, recv) = conn.accept_bi().await.context("accept_bi")?;
-    let served = serve_manifest_stream(send, recv, source.as_ref()).await;
-    drain_connection(&conn).await;
-    match served {
-        Ok(Some((receipt, _payload))) => {
-            source.record_consumed(&receipt);
-            Ok(())
+    in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+/// Removes its `request_id` from the in-flight set on drop, so a panic or an early return cannot
+/// wedge a ticket permanently un-redeemable.
+struct InFlightGuard<'a> {
+    plane: &'a ManifestPlane,
+    request_id: String,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.plane.in_flight.lock() {
+            set.remove(&self.request_id);
         }
-        Ok(None) => Ok(()),
-        Err(e) => Err(e),
+    }
+}
+
+impl ManifestPlane {
+    pub fn new(source: Arc<dyn ManifestSource>) -> Arc<Self> {
+        Arc::new(Self { source, in_flight: std::sync::Mutex::new(std::collections::HashSet::new()) })
+    }
+
+    /// Claim `request_id` for this redemption, or `None` if one is already running.
+    fn claim(&self, request_id: &str) -> Option<InFlightGuard<'_>> {
+        let mut set = self.in_flight.lock().ok()?;
+        if !set.insert(request_id.to_string()) {
+            return None;
+        }
+        Some(InFlightGuard { plane: self, request_id: request_id.to_string() })
+    }
+
+    /// Accept one connection on the manifest plane and serve it.
+    ///
+    /// The [`drain_connection`] call is load-bearing and its position is deliberate: it holds the
+    /// connection open until the asker closes it, so the last chunk is not raced by a
+    /// `CONNECTION_CLOSE` on a fast link. The receipt is recorded **after** the drain, and only when
+    /// the asker acknowledged — a transfer the peer never finished reading has not succeeded and
+    /// must not burn the ticket.
+    pub async fn serve(&self, conn: iroh::endpoint::Connection) -> Result<()> {
+        let (send, mut recv) = with_deadline(
+            HANDSHAKE_DEADLINE,
+            "peer connected but never opened a stream",
+            conn.accept_bi(),
+        )
+        .await?
+        .context("accept_bi")?;
+
+        // Peek the request before claiming, because the claim is keyed by request_id. Re-framing the
+        // already-read bytes back into `serve_manifest_stream` keeps that function the single
+        // implementation of the protocol rather than duplicating the gate here.
+        let frame = with_deadline(
+            HANDSHAKE_DEADLINE,
+            "the asker never finished sending its request",
+            read_framed(&mut recv, FETCH_REQUEST_MAX_FRAME),
+        )
+        .await??;
+
+        let claim_key = serde_json::from_slice::<FetchRequest>(&frame)
+            .map(|r| r.request_id)
+            .unwrap_or_default();
+        let _guard = match self.claim(&claim_key) {
+            Some(g) => g,
+            None => {
+                let mut send = send;
+                // Concurrent redemption of the same ticket: refuse the second, do not serve it.
+                refuse(&mut send, "this ticket is already being redeemed on another connection")
+                    .await?;
+                drain_connection(&conn).await;
+                return Ok(());
+            }
+        };
+
+        let replayed = Framed::new(frame, recv);
+        let served = serve_manifest_stream(send, replayed, self.source.as_ref()).await;
+
+        // **Which side closes, and why the drain is only on one path.**
+        //
+        // The ACK is strictly stronger evidence than "the peer closed": it says a validated manifest
+        // arrived. So on the delivered path we do not drain — we record and close, and the asker
+        // waits for *our* close. That ordering matters, and its absence was a live bug: with the
+        // asker closing immediately after writing the ACK, `CONNECTION_CLOSE` outran the ACK on
+        // loopback and the owner never saw it. **That is the `drain_connection` truncation race
+        // exactly, in the opposite direction** — the HANDOVER note said it would recur, and adding a
+        // trailing frame made it recur the same day. Whoever writes last must not be the one to close.
+        //
+        // On the refusal path there is no ACK, so "the peer closed" is the only evidence the tiny
+        // response landed — the drain stays, and `conn::a_refusal_response_survives_connection_close`
+        // is what holds it there.
+        match served {
+            Ok(Some((receipt, _payload))) => {
+                self.source.record_consumed(&receipt);
+                conn.close(0u32.into(), b"delivered");
+                Ok(())
+            }
+            Ok(None) => {
+                drain_connection(&conn).await;
+                Ok(())
+            }
+            Err(e) => {
+                drain_connection(&conn).await;
+                Err(e)
+            }
+        }
+    }
+}
+
+/// A reader that yields one already-read frame (length prefix re-synthesized) and then continues
+/// from the live stream. Lets `ManifestPlane::serve` inspect the request id for its in-flight claim
+/// without `serve_manifest_stream` needing a second, subtly-different code path.
+struct Framed<R> {
+    prefix: std::io::Cursor<Vec<u8>>,
+    rest: R,
+}
+
+impl<R> Framed<R> {
+    fn new(frame: Vec<u8>, rest: R) -> Self {
+        let mut buf = Vec::with_capacity(frame.len() + 4);
+        buf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&frame);
+        Self { prefix: std::io::Cursor::new(buf), rest }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Framed<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if (self.prefix.position() as usize) < self.prefix.get_ref().len() {
+            return std::pin::Pin::new(&mut self.prefix).poll_read(cx, buf);
+        }
+        std::pin::Pin::new(&mut self.rest).poll_read(cx, buf)
     }
 }
 
@@ -286,14 +509,41 @@ async fn fetch_over_connection(
     let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?;
     let req = FetchRequest { request_id: ticket.request_id.clone(), ticket: ticket.clone() };
     write_framed(&mut send, &serde_json::to_vec(&req)?).await?;
-    send.shutdown().await.context("shutdown request stream")?;
+    // **Deliberately not shut down here.** The send half stays open to carry the acknowledgement —
+    // that frame is what lets the owner distinguish "delivered" from "written at". Closing early
+    // would put us back to the owner burning tickets on transfers that never landed.
 
     match recv.read_u8().await.context("read status byte")? {
         STATUS_OK => {
             // Bounded on the declared length first (the framing check), then again by `from_wire`.
             let bytes = read_framed(&mut recv, MANIFEST_MAX_TRANSPORT_BYTES).await?;
-            ManifestPayload::from_wire(bytes)
-                .map_err(|e| anyhow!("the peer's manifest was refused: {e}"))
+            let payload = ManifestPayload::from_wire(bytes)
+                .map_err(|e| anyhow!("the peer's manifest was refused: {e}"))?;
+
+            // The asker's half of the slug binding. The owner checks it too, but a peer is not a
+            // trusted validator of what it sends us: a manifest for a collection we did not ask
+            // about must not be accepted just because it is internally consistent.
+            let declared = payload
+                .declared_slug()
+                .map_err(|e| anyhow!("the peer's manifest has no readable slug: {e}"))?;
+            if declared != ticket.slug {
+                return Err(anyhow!(
+                    "refusing the peer's manifest: it describes '{declared}' but we asked for '{}'",
+                    ticket.slug
+                ));
+            }
+
+            // Acknowledge only now — after the bytes parsed, verified, and matched the ticket. This
+            // is the asker's assertion that a usable manifest arrived, and the owner consumes the
+            // ticket on the strength of it.
+            send.write_u8(STATUS_OK).await.context("write acknowledgement")?;
+            send.shutdown().await.context("shutdown after acknowledgement")?;
+            // Wait (bounded) for the owner to close, rather than closing ourselves. `shutdown` only
+            // queues the FIN; closing straight after lets `CONNECTION_CLOSE` overtake the ACK, and
+            // the owner then treats a delivered manifest as undelivered. Same failure as the original
+            // teardown truncation race, mirrored — so the same remedy, on this side.
+            drain_connection(conn).await;
+            Ok(payload)
         }
         STATUS_REFUSED => {
             let msg = read_framed(&mut recv, REFUSAL_MAX_FRAME).await?;
@@ -413,6 +663,12 @@ pub(crate) mod tests {
     /// W7.2 blind spot Suite MAN was added to close, and a transport test fed hand-built parts
     /// would prove nothing about what production actually puts on the wire.
     pub(crate) fn real_payload(entries: usize) -> ManifestPayload {
+        real_payload_for("big", entries)
+    }
+
+    /// Same production-shaped fixture, for a named collection — so a test can build a manifest that
+    /// is entirely valid but describes the WRONG collection (the slug-binding case).
+    pub(crate) fn real_payload_for(slug: &str, entries: usize) -> ManifestPayload {
         let id = Identity::generate();
         let items: Vec<String> = (0..entries)
             .map(|i| {
@@ -424,14 +680,14 @@ pub(crate) mod tests {
             })
             .collect();
         let listing = format!(
-            r#"{{"schema_v":1,"slug":"big","name":"Big","entries":[{}]}}"#,
+            r#"{{"schema_v":1,"slug":"{slug}","name":"Fixture","entries":[{}]}}"#,
             items.join(",")
         );
-        let parts = split_listing("big", &listing, 40_000).expect("split the listing");
+        let parts = split_listing(slug, &listing, 40_000).expect("split the listing");
         let plaintexts: Vec<String> = parts.into_iter().map(|p| p.json).collect();
         let env = build_manifest_envelope(
             &id,
-            "big",
+            slug,
             &[7u8; 32],
             "fp-real",
             1_700_000_000,
@@ -447,6 +703,42 @@ pub(crate) mod tests {
         pub standing: Mutex<ContactStanding>,
         pub consumed: Mutex<Vec<ConsumedTicket>>,
         pub payload: ManifestPayload,
+        /// Rig the source to answer with this payload regardless of the slug asked for — the
+        /// "lookup fell through to the wrong collection" bug, which no honest implementation would
+        /// write on purpose and which the slug binding exists to catch.
+        pub serve_instead: Mutex<Option<ManifestPayload>>,
+        /// Rendezvous used only by the concurrency test — see [`Self::rendezvous`].
+        rendezvous: Option<Rendezvous>,
+    }
+
+    /// Makes two redemptions **provably** overlap instead of hopefully overlapping.
+    ///
+    /// The first caller into `issued()` waits here for a second; if none comes it proceeds after a
+    /// short grace period. That asymmetry is deliberate. A plain 2-party barrier would deadlock the
+    /// *fixed* code, because with the in-flight guard in place the second connection is refused
+    /// before it ever reaches `issued()` — so the barrier would wait forever for a party that is
+    /// never coming.
+    ///
+    /// Why bother: without this the test was **timing-dependent**. Bypassing the guard and running
+    /// the test alone failed it every time, but the same bypass under full-suite load passed — the
+    /// second connection simply arrived after the first had recorded its receipt. A regression test
+    /// that reds only on an idle machine is not a regression test.
+    struct Rendezvous {
+        seen: std::sync::Mutex<usize>,
+        arrived: std::sync::Condvar,
+        grace: std::time::Duration,
+    }
+
+    impl Rendezvous {
+        fn wait_for_a_second_caller(&self) {
+            let mut seen = self.seen.lock().unwrap();
+            *seen += 1;
+            if *seen >= 2 {
+                self.arrived.notify_all();
+                return;
+            }
+            let _ = self.arrived.wait_timeout(seen, self.grace);
+        }
     }
 
     impl TestSource {
@@ -456,12 +748,31 @@ pub(crate) mod tests {
                 standing: Mutex::new(ContactStanding::Good),
                 consumed: Mutex::new(Vec::new()),
                 payload,
+                serve_instead: Mutex::new(None),
+                rendezvous: None,
             })
+        }
+    }
+
+    impl TestSource {
+        /// Turn on the rendezvous: every call into `issued` waits (briefly) for a second caller, so
+        /// two simultaneous redemptions are guaranteed to be inside the gate together.
+        pub(crate) fn with_rendezvous(mut self: Arc<Self>) -> Arc<Self> {
+            let inner = Arc::get_mut(&mut self).expect("no other handles yet");
+            inner.rendezvous = Some(Rendezvous {
+                seen: std::sync::Mutex::new(0),
+                arrived: std::sync::Condvar::new(),
+                grace: std::time::Duration::from_millis(750),
+            });
+            self
         }
     }
 
     impl ManifestSource for TestSource {
         fn issued(&self, request_id: &str) -> Option<IssuedTicket> {
+            if let Some(r) = &self.rendezvous {
+                r.wait_for_a_second_caller();
+            }
             if request_id != self.ticket.request_id {
                 return None;
             }
@@ -473,6 +784,9 @@ pub(crate) mod tests {
         }
 
         fn payload(&self, slug: &str) -> Result<ManifestPayload> {
+            if let Some(rigged) = self.serve_instead.lock().unwrap().clone() {
+                return Ok(rigged);
+            }
             if slug != self.ticket.slug {
                 return Err(anyhow!("unknown collection {slug}"));
             }
@@ -487,23 +801,48 @@ pub(crate) mod tests {
     /// Spawn the production accept loop for `source` on a fresh loopback endpoint, and return the
     /// endpoint plus a ticket addressed at it.
     async fn spawn_plane(
-        payload: ManifestPayload,
+        entries: usize,
         slug: &str,
     ) -> (iroh::Endpoint, Arc<TestSource>, TransportTicket) {
+        // Built FOR this slug: the payload and the ticket must agree, or a test would be exercising
+        // the slug-binding refusal instead of the path it means to test. (Every test was — the
+        // fixture said "big" while the tickets said "small", and the new binding check found it.)
+        spawn_plane_inner(entries, slug, false).await
+    }
+
+    /// As `spawn_plane`, but every `issued()` call waits briefly for a second — so a concurrency test
+    /// cannot silently stop testing concurrency.
+    async fn spawn_plane_with_rendezvous(
+        entries: usize,
+        slug: &str,
+    ) -> (iroh::Endpoint, Arc<TestSource>, TransportTicket) {
+        spawn_plane_inner(entries, slug, true).await
+    }
+
+    async fn spawn_plane_inner(
+        entries: usize,
+        slug: &str,
+        rendezvous: bool,
+    ) -> (iroh::Endpoint, Arc<TestSource>, TransportTicket) {
+        let payload = real_payload_for(slug, entries);
         let server = bind_local_endpoint(&rand::random(), vec![MANIFEST_ALPN.to_vec()]).await;
         // The ticket carries the LOOPBACK address, not `endpoint.addr()` — a wildcard bound socket
         // is not dialable, and `ticket_node_addr` is exercised separately.
         let addr = serde_json::to_string(&loopback_addr(&server)).unwrap();
         let ticket = TransportTicket::issue("req-1", slug, &addr, 1_700_000_000);
         let source = TestSource::new(ticket.clone(), payload);
+        let source = if rendezvous { source.with_rendezvous() } else { source };
 
         let accept_ep = server.clone();
-        let accept_source: Arc<dyn ManifestSource> = source.clone();
+        let plane = ManifestPlane::new(source.clone());
         tokio::spawn(async move {
             while let Some(incoming) = accept_ep.accept().await {
                 let Ok(accepting) = incoming.accept() else { continue };
                 let Ok(conn) = accepting.await else { continue };
-                let _ = serve_manifest_connection(conn, accept_source.clone()).await;
+                // Spawned, not awaited — a serial loop cannot exhibit the concurrent-redeem race the
+                // in-flight set exists to stop, and a test that cannot exhibit it proves nothing.
+                let plane = plane.clone();
+                tokio::spawn(async move { let _ = plane.serve(conn).await; });
             }
         });
         (server, source, ticket)
@@ -518,18 +857,26 @@ pub(crate) mod tests {
     /// mismatch here refuses a *live connection*, which is a clean failure a user can retry. It
     /// does not orphan anything already published. So this pins against an accidental rename, not
     /// against an unfixable fork — the ALPN carries its own `/1` for the deliberate case.
-    #[test]
-    fn the_planes_framing_is_pinned() {
+    #[tokio::test]
+    async fn the_planes_framing_is_pinned() {
         assert_eq!(MANIFEST_ALPN, b"/hoardbook/manifest/1", "the plane's ALPN is a wire contract");
         assert_eq!(STATUS_OK, 0, "the ok status byte is a wire contract");
         assert_eq!(STATUS_REFUSED, 1, "the refused status byte is a wire contract");
-        assert_eq!(
-            std::mem::size_of::<u32>(),
-            4,
-            "the length prefix is u32-LE — a width change is a protocol change"
-        );
         // Distinct from the retired file plane, so a peer still speaking it finds nothing listening.
         assert_ne!(MANIFEST_ALPN, b"/hoardbook/xfer/1");
+
+        // The prefix pinned by its ACTUAL BYTES, not by `size_of::<u32>() == 4` — which is a fact
+        // about Rust, true no matter what this module does, and so proved nothing about the wire.
+        let mut wire = Vec::new();
+        write_framed(&mut wire, b"hi").await.unwrap();
+        assert_eq!(
+            wire,
+            vec![2, 0, 0, 0, b'h', b'i'],
+            "the length prefix is 4 bytes little-endian, then the body — a width or endianness \
+             change is a protocol change"
+        );
+        // And it reads back as the same frame it wrote (the encode/decode pair, not just encode).
+        assert_eq!(read_framed(std::io::Cursor::new(wire), 16).await.unwrap(), b"hi");
     }
 
     /// Wait (bounded) for the owner's side to record its receipt.
@@ -563,14 +910,14 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_multi_megabyte_manifest_crosses_a_real_connection() {
         tokio::time::timeout(MULTI_MB_TIMEOUT, async {
-            let payload = real_payload(10_000);
+            let (server, source, ticket) = spawn_plane(10_000, "big").await;
+            let payload = source.payload.clone();
             assert!(
                 payload.len() > 2 * 1024 * 1024,
                 "the fixture must actually be multi-MB, got {} bytes",
                 payload.len()
             );
             let expected = payload.envelope().unwrap();
-            let (server, source, ticket) = spawn_plane(payload.clone(), "big").await;
 
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
             let got = fetch_manifest(&client, &ticket).await.expect("fetch the manifest");
@@ -583,7 +930,7 @@ pub(crate) mod tests {
             );
 
             let receipt = await_receipt(&source).await;
-            assert_eq!(receipt.delivered_bytes, payload.len(), "the receipt records what arrived");
+            assert_eq!(receipt.delivered_bytes(), payload.len(), "the receipt records what arrived");
             assert_eq!(
                 source.consumed.lock().unwrap().len(),
                 1,
@@ -602,7 +949,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_spent_ticket_is_refused_on_a_second_connection() {
         tokio::time::timeout(TEST_TIMEOUT, async {
-            let (server, source, ticket) = spawn_plane(real_payload(50), "small").await;
+            let (server, source, ticket) = spawn_plane(50, "small").await;
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
 
             fetch_manifest(&client, &ticket).await.expect("the first redemption succeeds");
@@ -631,7 +978,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_redeemer_blocked_after_approval_is_refused_then_restored() {
         tokio::time::timeout(TEST_TIMEOUT, async {
-            let (server, source, ticket) = spawn_plane(real_payload(50), "small").await;
+            let (server, source, ticket) = spawn_plane(50, "small").await;
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
 
             *source.standing.lock().unwrap() = ContactStanding::Blocked;
@@ -664,7 +1011,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_unknown_request_and_a_forged_ticket_are_indistinguishable() {
         tokio::time::timeout(TEST_TIMEOUT, async {
-            let (server, source, ticket) = spawn_plane(real_payload(50), "small").await;
+            let (server, source, ticket) = spawn_plane(50, "small").await;
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
 
             let mut invented = ticket.clone();
@@ -690,12 +1037,36 @@ pub(crate) mod tests {
         .expect("test timed out");
     }
 
+    /// A reader that yields exactly the bytes it was given and then **panics** if read again.
+    ///
+    /// This is what makes the ordering test real. A `Cursor` hits EOF instead, so a check that ran
+    /// *after* the body read would still return an error — the right outcome for the wrong reason,
+    /// and the test would pass either way (Codex's point, and correct). Panicking on the read that
+    /// must never happen turns "was the body read?" into an observable fact.
+    struct PanicAfter(std::io::Cursor<Vec<u8>>);
+
+    impl tokio::io::AsyncRead for PanicAfter {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let exhausted = self.0.position() as usize >= self.0.get_ref().len();
+            assert!(
+                !exhausted,
+                "read_framed read past the length prefix — the ceiling was checked AFTER the body, \
+                 which is the ordering this test exists to forbid"
+            );
+            std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
     /// **The framing-layer ceiling check** — the piece W3 explicitly left to W1.
     ///
-    /// The declared length is refused on the four bytes that declared it. Proven by sending *only*
-    /// the prefix and no body at all: if the check ran after the read, this would block waiting for
-    /// 8 MiB that never arrives rather than returning an error. And the reason must point at export,
-    /// because a manifest over the ceiling is a "too big, export it", not a corruption.
+    /// The declared length is refused on the four bytes that declared it, proven two ways: the reader
+    /// panics if anything reads past the prefix, and the whole call is bounded so a block also fails.
+    /// The reason must point at export, because a manifest over the ceiling is a "too big, export
+    /// it", not a corruption.
     #[tokio::test]
     async fn the_framing_refuses_an_over_cap_declared_length_before_reading_the_body() {
         let mut wire = Vec::new();
@@ -704,7 +1075,7 @@ pub(crate) mod tests {
 
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            read_framed(std::io::Cursor::new(wire), MANIFEST_MAX_TRANSPORT_BYTES),
+            read_framed(PanicAfter(std::io::Cursor::new(wire)), MANIFEST_MAX_TRANSPORT_BYTES),
         )
         .await
         .expect("the ceiling must be checked on the declared length, not after reading the body")
@@ -726,6 +1097,191 @@ pub(crate) mod tests {
             !err.to_string().contains("over the"),
             "a declared length exactly at the ceiling must be accepted, got: {err}"
         );
+    }
+
+    /// **Codex finding 2 — one ticket, one delivery, under real concurrency.**
+    ///
+    /// Two connections present the same valid ticket at the same moment. Before the in-flight set
+    /// both could read `already_consumed == false`, both serve the manifest, and both record
+    /// afterwards. The old tests could not catch this: they awaited the accept loop serially and only
+    /// replayed after the first receipt landed, so the window never existed.
+    // multi_thread: the rendezvous blocks a worker thread on a condvar, which would stall a
+    // single-threaded runtime rather than let the second connection through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_simultaneous_redemptions_deliver_the_manifest_once() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let (server, source, ticket) = spawn_plane_with_rendezvous(400, "small").await;
+            let client = bind_local_endpoint(&rand::random(), vec![]).await;
+
+            // Fired together, on separate connections, with no ordering between them. The
+            // rendezvous inside `issued()` is what makes the overlap a fact rather than a hope.
+            let (a, b) = tokio::join!(
+                fetch_manifest(&client, &ticket),
+                fetch_manifest(&client, &ticket)
+            );
+
+            let winners = [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count();
+            assert_eq!(
+                winners, 1,
+                "exactly one of two simultaneous redemptions may succeed — got {winners}. \
+                 a={a:?} b={b:?}"
+            );
+            await_receipt(&source).await;
+            assert_eq!(
+                source.consumed.lock().unwrap().len(),
+                1,
+                "and the ticket is consumed exactly once"
+            );
+
+            client.close().await;
+            server.close().await;
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// **Codex finding 4 — the payload must match the ticket's collection.**
+    ///
+    /// A source that answers with the wrong collection is the realistic bug here (a slug lookup that
+    /// falls through to a default, say), and the wrong manifest is perfectly *self-consistent*, so
+    /// nothing downstream would notice. Both sides check; this exercises the owner's side, and the
+    /// refusal names both slugs so the operator can see what happened.
+    #[tokio::test]
+    async fn a_manifest_for_the_wrong_collection_is_refused_and_costs_nothing() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            // The ticket says "small"; the source is rigged to hand back a manifest for "big".
+            let (server, source, ticket) = spawn_plane(50, "small").await;
+            *source.serve_instead.lock().unwrap() = Some(real_payload_for("big", 50));
+            let client = bind_local_endpoint(&rand::random(), vec![]).await;
+
+            let err = fetch_manifest(&client, &ticket)
+                .await
+                .expect_err("a manifest for another collection must be refused");
+            let msg = err.to_string();
+            // **Asserting the OWNER's wording, not just "some refusal".** Both sides check, so a test
+            // that accepted either message would stay green with the owner's check deleted — the
+            // asker's would catch it and the test could not tell the difference. "refusing to serve"
+            // is only ever the owner's.
+            assert!(
+                msg.contains("refusing to serve"),
+                "the OWNER must refuse before sending, got: {msg}"
+            );
+            assert!(
+                msg.contains("big") && msg.contains("small"),
+                "the refusal must name both the manifest's slug and the ticket's, got: {msg}"
+            );
+            assert!(
+                source.consumed.lock().unwrap().is_empty(),
+                "a refused delivery must not consume the ticket"
+            );
+
+            client.close().await;
+            server.close().await;
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// **The other direction of the slug binding: a LYING peer.**
+    ///
+    /// The owner's check protects against its own lookup bug; this one protects against a peer that
+    /// is simply hostile, which is the direction that actually matters — we do not get to assume the
+    /// remote validated anything. A hand-rolled server sends a perfectly valid, correctly signed
+    /// envelope for a collection we did not ask about. Nothing about the bytes is malformed, so only
+    /// the ticket binding can reject them.
+    #[tokio::test]
+    async fn a_lying_peer_cannot_hand_us_a_manifest_for_another_collection() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let liar = bind_local_endpoint(&rand::random(), vec![MANIFEST_ALPN.to_vec()]).await;
+            let addr = serde_json::to_string(&loopback_addr(&liar)).unwrap();
+            // We hold a ticket for "mine"; the peer will answer with a valid manifest for "theirs".
+            let ticket = TransportTicket::issue("req-1", "mine", &addr, 1_700_000_000);
+            let wrong = real_payload_for("theirs", 40);
+
+            let accept_ep = liar.clone();
+            tokio::spawn(async move {
+                while let Some(incoming) = accept_ep.accept().await {
+                    let Ok(accepting) = incoming.accept() else { continue };
+                    let Ok(conn) = accepting.await else { continue };
+                    let wrong = wrong.clone();
+                    tokio::spawn(async move {
+                        let Ok((mut send, mut recv)) = conn.accept_bi().await else { return };
+                        let _ = read_framed(&mut recv, FETCH_REQUEST_MAX_FRAME).await;
+                        let _ = send.write_u8(STATUS_OK).await;
+                        let _ = write_framed(&mut send, wrong.as_bytes()).await;
+                        let _ = send.shutdown().await;
+                        drain_connection(&conn).await;
+                    });
+                }
+            });
+
+            let client = bind_local_endpoint(&rand::random(), vec![]).await;
+            let err = fetch_manifest(&client, &ticket)
+                .await
+                .expect_err("a manifest for a collection we did not ask about must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("refusing the peer's manifest"),
+                "the ASKER must refuse it, got: {msg}"
+            );
+            assert!(
+                msg.contains("theirs") && msg.contains("mine"),
+                "and name what it got versus what it asked for, got: {msg}"
+            );
+
+            client.close().await;
+            liar.close().await;
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// **Codex finding 3 — a peer that never acknowledges does not burn the ticket.**
+    ///
+    /// The asker here speaks the protocol by hand: it sends a valid request, reads the whole payload,
+    /// and then walks away without acknowledging — the shape of a client that crashed mid-parse, or
+    /// read half the bytes and died. Before the receipt frame the owner recorded the ticket as
+    /// consumed anyway (write + drain + timeout = "success"), so the asker's retry was refused as a
+    /// replay for a transfer that never landed.
+    #[tokio::test]
+    async fn a_peer_that_never_acknowledges_leaves_the_ticket_unspent() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let (server, source, ticket) = spawn_plane(50, "small").await;
+            let client = bind_local_endpoint(&rand::random(), vec![]).await;
+
+            {
+                let conn = client
+                    .connect(parse_node_addr(&ticket.node_addr).unwrap(), MANIFEST_ALPN)
+                    .await
+                    .expect("dial");
+                let (mut send, mut recv) = conn.open_bi().await.unwrap();
+                let req =
+                    FetchRequest { request_id: ticket.request_id.clone(), ticket: ticket.clone() };
+                write_framed(&mut send, &serde_json::to_vec(&req).unwrap()).await.unwrap();
+                assert_eq!(recv.read_u8().await.unwrap(), STATUS_OK, "the owner serves it");
+                let bytes = read_framed(&mut recv, MANIFEST_MAX_TRANSPORT_BYTES).await.unwrap();
+                assert!(!bytes.is_empty(), "the whole payload was read");
+                // ...and now vanish, without acknowledging.
+                conn.close(0u32.into(), b"gone");
+            }
+
+            // Give the owner's side room to (wrongly) record a receipt.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            assert!(
+                source.consumed.lock().unwrap().is_empty(),
+                "an unacknowledged transfer must not consume the ticket — a failed delivery costs \
+                 nothing, which is the whole point of consumed-on-success"
+            );
+
+            // And the honest retry works, which is what the owner's ruling actually asked for.
+            fetch_manifest(&client, &ticket).await.expect("the retry must succeed");
+            await_receipt(&source).await;
+
+            client.close().await;
+            server.close().await;
+        })
+        .await
+        .expect("test timed out");
     }
 
     /// `ticket_node_addr` and `parse_node_addr` are one format, not two: the ticket's opaque string

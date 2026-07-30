@@ -188,12 +188,31 @@ impl RedemptionGrant {
 
 /// Proof that a ticket was spent on a completed transfer. The caller records this so a replay of
 /// the same ticket is refused (see [`authorize_redemption`]'s `already_consumed`).
+///
+/// **The fields are private on purpose.** A receipt is evidence, and public fields made it
+/// *constructible* — anything could mint a `ConsumedTicket { .. }` and burn a ticket that was never
+/// delivered, which is the same class of hole as a serde derive on [`ManifestPayload`]. The only
+/// way to obtain one is [`RedemptionGrant::into_consumed`], with the payload in hand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumedTicket {
-    pub request_id: String,
-    pub slug: String,
+    request_id: String,
+    slug: String,
+    delivered_bytes: usize,
+}
+
+impl ConsumedTicket {
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn slug(&self) -> &str {
+        &self.slug
+    }
+
     /// Size of what was actually delivered — the receipt's evidence, and useful for a log line.
-    pub delivered_bytes: usize,
+    pub fn delivered_bytes(&self) -> usize {
+        self.delivered_bytes
+    }
 }
 
 /// The redeem-time gate, run by the **issuer's** node as it accepts a connection.
@@ -285,8 +304,8 @@ mod tests {
             .expect("a retry after a failed connection must be authorized");
         let receipt = grant.into_consumed(&delivered());
         consumed = true;
-        assert_eq!(receipt.request_id, "req-1");
-        assert!(receipt.delivered_bytes > 0, "the receipt records what actually arrived");
+        assert_eq!(receipt.request_id(), "req-1");
+        assert!(receipt.delivered_bytes() > 0, "the receipt records what actually arrived");
 
         // Attempt 3: now that it succeeded, a replay is refused.
         assert!(

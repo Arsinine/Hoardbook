@@ -28,14 +28,10 @@ pub(crate) async fn drain_connection(conn: &iroh::endpoint::Connection) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use hb_core::ticket::ContactStanding;
 
-    use crate::transport::tests::{bind_local_endpoint, loopback_addr, real_payload, TestSource};
-    use crate::transport::{
-        fetch_manifest, serve_manifest_connection, ManifestSource, MANIFEST_ALPN,
-    };
+    use crate::transport::tests::{bind_local_endpoint, loopback_addr, real_payload_for, TestSource};
+    use crate::transport::{fetch_manifest, ManifestPlane, MANIFEST_ALPN};
     use hb_core::ticket::TransportTicket;
 
     const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -47,18 +43,19 @@ mod tests {
                 bind_local_endpoint(&rand::random(), vec![MANIFEST_ALPN.to_vec()]).await;
             let addr = serde_json::to_string(&loopback_addr(&server)).unwrap();
             let ticket = TransportTicket::issue("req-1", "small", &addr, 1_700_000_000);
-            let source = TestSource::new(ticket.clone(), real_payload(10));
+            let source = TestSource::new(ticket.clone(), real_payload_for("small", 10));
             // Blocked standing ⇒ every round takes the refusal path, the smallest response the
             // plane writes and the documented deterministic loss without the drain.
             *source.standing.lock().unwrap() = ContactStanding::Blocked;
 
             let accept_ep = server.clone();
-            let accept_source: Arc<dyn ManifestSource> = source.clone();
+            let plane = ManifestPlane::new(source.clone());
             tokio::spawn(async move {
                 while let Some(incoming) = accept_ep.accept().await {
                     let Ok(accepting) = incoming.accept() else { continue };
                     let Ok(conn) = accepting.await else { continue };
-                    let _ = serve_manifest_connection(conn, accept_source.clone()).await;
+                    let plane = plane.clone();
+                    tokio::spawn(async move { let _ = plane.serve(conn).await; });
                 }
             });
 
