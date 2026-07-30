@@ -82,7 +82,11 @@ jobs:
           code_only() { grep -vE '^[^:]*:[0-9]+:[[:space:]]*(//|#|\*|/\*|<!--)'; }
           sweep() { local desc="$1"; shift; if out=$(grep -rnE "$@" 2>/dev/null | code_only); then echo "::error::INV-4′ regression — $desc:"; echo "$out"; fail=1; fi; }
           # The transport module is the whole surface allowed to hold a connection.
-          TRANSPORT_FILES="crates/hb-app/src/transport.rs crates/hb-app/src/conn.rs"
+          # `transport_state.rs` joined the surface in W4 — it names `iroh::Endpoint`, so the
+          # unlisted-iroh-users check below flagged it the moment it was written. That is the guard
+          # working: a new transport module is unswept until someone says so out loud, and being
+          # listed means it must satisfy every probe (no fs, no path arguments) too.
+          TRANSPORT_FILES="crates/hb-app/src/transport.rs crates/hb-app/src/conn.rs crates/hb-app/src/transport_state.rs"
           # A hand-maintained list fails two ways, both confirmed by trying them:
           #   · rename or delete a listed file and `grep` exits 2, which makes the `if` FALSE — the
           #     probe goes SILENTLY GREEN on the very file it exists to watch;

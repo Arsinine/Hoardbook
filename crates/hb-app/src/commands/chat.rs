@@ -61,7 +61,7 @@ pub struct ReceivedMessage {
 }
 
 /// Parse a DM recipient from a pasted npub or full `hbk` share code → its public key.
-fn parse_recipient(s: &str) -> Result<PublicKey, String> {
+pub(crate) fn parse_recipient(s: &str) -> Result<PublicKey, String> {
     hb_core::ShareCode::parse(s)
         .map(|sc| sc.pubkey())
         .map_err(|e| format!("Invalid recipient: {e}"))
@@ -70,7 +70,7 @@ fn parse_recipient(s: &str) -> Result<PublicKey, String> {
 /// devtest #14: a self-send is never valid — `send_message` rejects it before any network I/O.
 /// `route_dm`'s `from == own_npub` inbox routing stays; it exists for the legitimate sent-echo
 /// of a message you already sent, not to allow creating a self-conversation from scratch.
-fn is_self_send(recipient: &PublicKey, me: &PublicKey) -> bool {
+pub(crate) fn is_self_send(recipient: &PublicKey, me: &PublicKey) -> bool {
     recipient == me
 }
 
@@ -548,7 +548,17 @@ struct ManifestRequest {
     fingerprint_seen: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     teaser_event_id: Option<String>,
-    /// The requester's Mascara pubkey, if any — opaque to Hoardbook (neither minted nor validated).
+    /// **VESTIGIAL — kept deliberately, ruled on 2026-07-31 (owner: option (b)).** This carried the
+    /// requester's Mascara pubkey so a hoarder knew which Mascara identity to ticket a file to. That
+    /// role died with the courier framing (2026-07-26 ruling): M18's transport ticket flows
+    /// owner→asker over the manifest plane and needs nothing from the asker's side of the wire.
+    ///
+    /// Nothing writes it and nothing reads it. It stays because it is part of a shipped,
+    /// `wire_freeze`-pinned body and `skip_serializing_if` already keeps it off the wire in practice,
+    /// so removing it would buy a `wire_freeze` amendment for an observably identical result.
+    /// **Repurposing it was rejected on sight** — the request is asker→owner and the ticket is
+    /// owner→asker, so the direction is wrong, and overloading one field across two meanings is
+    /// exactly what `wire_freeze` exists to prevent.
     #[serde(skip_serializing_if = "Option::is_none")]
     mascara_pubkey: Option<String>,
 }

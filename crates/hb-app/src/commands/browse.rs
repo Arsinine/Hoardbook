@@ -619,18 +619,6 @@ pub async fn import_manifest(
     newest_fingerprint: Option<String>,
     store: State<'_, DataStore>,
 ) -> CmdResult<ImportedManifest> {
-    // Recover the browsed peer's pubkey (author to pin) + browse-key (to decrypt) from the saved
-    // contact — you can only see a truncated teaser worth upgrading if you hold their share code.
-    let contact = store
-        .load_contact(&CachedPeer::pubkey_hash(&npub))
-        .map_err(cmd_err)?
-        .ok_or("Add this peer as a contact with their share code before importing a manifest.")?;
-    let share_code = contact_share_code(&contact)?;
-    let peer = share_code.pubkey();
-    let browse_key = share_code
-        .browse_key()
-        .ok_or("This contact has no browse key — re-add them with a full share code.")?;
-
     // The manifest bytes come from the picked file or the pasted text (never both required). Both are
     // size-capped before parsing so a huge file/paste can't OOM the app (MANIFEST_FILE_MAX_BYTES).
     let raw = match (path, pasted) {
@@ -649,16 +637,47 @@ pub async fn import_manifest(
         }
         (None, None) => return Err("No manifest file or text provided.".into()),
     };
-    let envelope = parse_manifest_source(&raw)?;
-    let result =
-        open_manifest(&envelope, &peer, expected_slug.as_deref(), &browse_key, newest_fingerprint.as_deref())?;
+    accept_manifest_bytes(&npub, expected_slug.as_deref(), &raw, newest_fingerprint.as_deref(), &store)
+}
+
+/// The verify→gate→render→cache tail shared by every way a manifest can arrive: the file/paste import
+/// above, and the transport redemption (M18 W4).
+///
+/// **Extracted rather than reimplemented, deliberately.** W4's acceptance is that the transport
+/// consumes a manifest with the M16 W4 gates *unchanged* — author pinned to the browsed peer,
+/// `expected_slug` bound, signature verified before decrypt, completeness required. A second call
+/// site that merely looked equivalent would satisfy that on the day it was written and drift by the
+/// first change to either. There is one path, so there is nothing to drift.
+///
+/// `raw` is envelope JSON (or base64 of it — [`parse_manifest_source`] accepts both). The size cap is
+/// applied by the *caller*, which is where the source's own ceiling lives: `MANIFEST_FILE_MAX_BYTES`
+/// for a picked file, `MANIFEST_MAX_TRANSPORT_BYTES` for the wire.
+pub(crate) fn accept_manifest_bytes(
+    npub: &str,
+    expected_slug: Option<&str>,
+    raw: &str,
+    newest_fingerprint: Option<&str>,
+    store: &DataStore,
+) -> CmdResult<ImportedManifest> {
+    let contact = store
+        .load_contact(&CachedPeer::pubkey_hash(npub))
+        .map_err(cmd_err)?
+        .ok_or("Add this peer as a contact with their share code before importing a manifest.")?;
+    let share_code = contact_share_code(&contact)?;
+    let peer = share_code.pubkey();
+    let browse_key = share_code
+        .browse_key()
+        .ok_or("This contact has no browse key — re-add them with a full share code.")?;
+
+    let envelope = parse_manifest_source(raw)?;
+    let result = open_manifest(&envelope, &peer, expected_slug, &browse_key, newest_fingerprint)?;
 
     // Cache the verified envelope for offline re-browse, keyed (npub, slug, fingerprint) with LRU +
     // size-cap. Best-effort — a cache-write hiccup never fails the import the user just performed.
     if let Ok(json) = envelope.to_json() {
         let _ = manifest_cache::put(
             &store.manifest_cache_dir(),
-            &npub,
+            npub,
             &envelope.slug,
             &envelope.snapshot_fingerprint,
             &json,

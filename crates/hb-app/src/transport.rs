@@ -659,15 +659,15 @@ pub(crate) mod tests {
     }
 
     /// A manifest built the way production builds one: a real listing JSON through
-    /// `split_listing` → `build_manifest_envelope`. **Not a hand-written fixture** — that is the
-    /// W7.2 blind spot Suite MAN was added to close, and a transport test fed hand-built parts
-    /// would prove nothing about what production actually puts on the wire.
-    pub(crate) fn real_payload(entries: usize) -> ManifestPayload {
-        real_payload_for("big", entries)
-    }
-
-    /// Same production-shaped fixture, for a named collection — so a test can build a manifest that
-    /// is entirely valid but describes the WRONG collection (the slug-binding case).
+    /// `split_listing` → `build_manifest_envelope`, for a named collection — so a test can build a
+    /// manifest that is entirely valid but describes the WRONG collection (the slug-binding case).
+    /// **Not a hand-written fixture** — that is the W7.2 blind spot Suite MAN was added to close, and
+    /// a transport test fed hand-built parts would prove nothing about what production puts on the
+    /// wire.
+    ///
+    /// (The `real_payload(entries)` wrapper that defaulted the slug to `"big"` was removed when W4
+    /// dropped `mod transport`'s `#[allow(dead_code)]` — the allow was the only thing making an
+    /// uncalled helper look used.)
     pub(crate) fn real_payload_for(slug: &str, entries: usize) -> ManifestPayload {
         let id = Identity::generate();
         let items: Vec<String> = (0..entries)
