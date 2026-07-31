@@ -160,8 +160,8 @@ export const exportManifest = (slug: string, path: string) =>
  *  ticket bound to that single approval, and DMs it. Fires only from an explicit click; Hoardbook
  *  never auto-sends (M17 ruling #4). Still moves no collection files (INV-4′) — a manifest is a
  *  listing, not a file. */
-export const sendFullList = (npub: string, slug: string) =>
-	invoke<void>('send_full_list', { npub, slug });
+export const sendFullList = (npub: string, slug: string, askNonce?: string) =>
+	invoke<void>('send_full_list', { npub, slug, askNonce: askNonce ?? null });
 
 /** M18 W4: redeem a transport ticket that arrived by DM — dial, fetch, and consume through the
  *  unchanged M16 W4 gates (author pinned to the peer, slug bound to the ticket, signature verified
@@ -381,6 +381,10 @@ export const requestManifest = (
 export interface ManifestAsk {
 	fingerprint_seen: string;
 	sent_at: string;
+	/** The nonce minted for this ask (owner ruling ①). A ticket auto-redeems only if it echoes this
+	 *  exact value. Empty for a trace written before the ruling — and an empty nonce never matches,
+	 *  so those asks simply stop auto-dialling until the user asks again. */
+	nonce?: string;
 }
 export const getManifestAsks = () =>
 	invoke<Record<string, ManifestAsk>>('get_manifest_asks');

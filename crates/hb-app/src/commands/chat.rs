@@ -532,6 +532,13 @@ pub async fn send_message(
     })
 }
 
+/// Mint an ask nonce: 128 bits of randomness, hex. Unguessable by the peer being asked, which is
+/// the whole point — it is the asker's proof that a ticket answers *this* ask.
+fn new_ask_nonce() -> String {
+    let bytes: [u8; 16] = rand::random();
+    hex::encode(bytes)
+}
+
 /// The constant tag identifying a DM as a manifest request (`content.hb`).
 const MANIFEST_REQUEST_TAG: &str = "manifest_request";
 
@@ -548,6 +555,15 @@ struct ManifestRequest {
     fingerprint_seen: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     teaser_event_id: Option<String>,
+    /// **The asker's nonce for this ask** (owner ruling ① 2026-07-31). The hoarder echoes it into
+    /// the ticket; the asker then auto-dials only for a ticket carrying the nonce it stored. Without
+    /// it the redeem-side gate can only ask "did I ever ask this peer for this slug?", which is a
+    /// standing authorization to make our client dial on demand.
+    ///
+    /// `Option` for wire compatibility: an old client omits it, the hoarder echoes `None`, and the
+    /// asker refuses to auto-dial — fail closed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ask_nonce: Option<String>,
     /// **VESTIGIAL — kept deliberately, ruled on 2026-07-31 (owner: option (b)).** This carried the
     /// requester's Mascara pubkey so a hoarder knew which Mascara identity to ticket a file to. That
     /// role died with the courier framing (2026-07-26 ruling): M18's transport ticket flows
@@ -569,12 +585,14 @@ fn build_manifest_request(
     fingerprint_seen: &str,
     teaser_event_id: Option<String>,
     mascara_pubkey: Option<String>,
+    ask_nonce: Option<String>,
 ) -> Result<String, String> {
     let req = ManifestRequest {
         hb: MANIFEST_REQUEST_TAG,
         slug: slug.to_string(),
         fingerprint_seen: fingerprint_seen.to_string(),
         teaser_event_id,
+        ask_nonce,
         mascara_pubkey,
     };
     serde_json::to_string(&req).map_err(cmd_err)
@@ -607,7 +625,16 @@ pub async fn request_manifest(
     if is_self_send(&recipient, &id_clone.public_key()) {
         return Err("You can't request a manifest from yourself.".into());
     }
-    let content = build_manifest_request(&slug, &fingerprint_seen, teaser_event_id, mascara_pubkey)?;
+    // Mint the nonce HERE, not in the UI: it must be the same value that reaches both the wire and
+    // the local trace, and a caller that could supply it could also replay one.
+    let ask_nonce = new_ask_nonce();
+    let content = build_manifest_request(
+        &slug,
+        &fingerprint_seen,
+        teaser_event_id,
+        mascara_pubkey,
+        Some(ask_nonce.clone()),
+    )?;
     let own = net::relay_urls(&store);
     let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
     send_dm_inner(&client, &id_clone, &recipient, &content, &own, net::RELAY_TIMEOUT)
@@ -620,7 +647,7 @@ pub async fn request_manifest(
     // re-ask; the re-ask cooldown is derived client-side from `sent_at`.
     let sent_at = chrono::Utc::now().to_rfc3339();
     store
-        .record_manifest_ask(&npub, &slug, &fingerprint_seen, &sent_at)
+        .record_manifest_ask(&npub, &slug, &fingerprint_seen, &sent_at, &ask_nonce)
         .map_err(cmd_err)?;
     Ok(())
 }
@@ -786,7 +813,7 @@ mod tests {
     fn manifest_request_json_is_tagged_and_omits_absent_options() {
         // M16 W4: the DM body is `{hb:"manifest_request", slug, fingerprint_seen}` — the frontend
         // detects the tag and renders a light hint. Absent optional fields are omitted (not null).
-        let json = build_manifest_request("criterion", "abc123", None, None).unwrap();
+        let json = build_manifest_request("criterion", "abc123", None, None, None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["hb"], MANIFEST_REQUEST_TAG);
         assert_eq!(v["slug"], "criterion");
@@ -798,7 +825,7 @@ mod tests {
     #[test]
     fn manifest_request_json_carries_present_options() {
         let json =
-            build_manifest_request("s", "fp", Some("evt1".into()), Some("mpub".into())).unwrap();
+            build_manifest_request("s", "fp", Some("evt1".into()), Some("mpub".into()), Some("n1".into())).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["teaser_event_id"], "evt1");
         assert_eq!(v["mascara_pubkey"], "mpub");

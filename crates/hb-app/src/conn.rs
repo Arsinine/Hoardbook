@@ -42,7 +42,7 @@ mod tests {
             let server =
                 bind_local_endpoint(&rand::random(), vec![MANIFEST_ALPN.to_vec()]).await;
             let addr = serde_json::to_string(&loopback_addr(&server)).unwrap();
-            let ticket = TransportTicket::issue("req-1", "small", &addr, 1_700_000_000);
+            let ticket = TransportTicket::issue("req-1", "small", &addr, 1_700_000_000, Some("nonce-1"));
             let source = TestSource::new(ticket.clone(), real_payload_for("small", 10));
             // Blocked standing ⇒ every round takes the refusal path, the smallest response the
             // plane writes and the documented deterministic loss without the drain.

@@ -888,6 +888,7 @@ impl DataStore {
         slug: &str,
         fingerprint_seen: &str,
         sent_at: &str,
+        nonce: &str,
     ) -> Result<()> {
         static MANIFEST_ASKS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = MANIFEST_ASKS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -897,9 +898,25 @@ impl DataStore {
             ManifestAsk {
                 fingerprint_seen: fingerprint_seen.to_string(),
                 sent_at: sent_at.to_string(),
+                nonce: nonce.to_string(),
             },
         );
         self.save_manifest_asks(&m)
+    }
+
+    /// Consume the ask for `(npub, slug)` — called after a redemption **succeeds**, so the
+    /// authorization it represents is spent (owner ruling ①: one ask, one auto-dial).
+    ///
+    /// Deliberately not called on a failed attempt: a dial that never connected has cost nothing and
+    /// must remain retryable, exactly as the ticket itself does.
+    pub fn consume_manifest_ask(&self, npub: &str, slug: &str) -> Result<()> {
+        static MANIFEST_ASKS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = MANIFEST_ASKS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut m = self.load_manifest_asks()?;
+        if m.remove(&manifest_ask_key(npub, slug)).is_some() {
+            self.save_manifest_asks(&m)?;
+        }
+        Ok(())
     }
 
     // ── Issued transport tickets (M18 W4) — the owner side's record of what it actually issued, so a
@@ -1018,6 +1035,15 @@ pub(crate) fn prune_issued_tickets(m: &mut std::collections::HashMap<String, Iss
 pub struct ManifestAsk {
     pub fingerprint_seen: String,
     pub sent_at: String,
+    /// **The nonce we minted for THIS ask** (owner ruling ① 2026-07-31). A ticket auto-redeems only
+    /// if it echoes this exact value, which is what turns "I asked this peer once" from a standing
+    /// reusable authorization into a one-ask one-dial permission.
+    ///
+    /// `serde(default)` so a trace written before the ruling still loads — it deserializes empty,
+    /// and an empty stored nonce **never matches**, so those asks simply stop auto-dialling until
+    /// the user asks again. Fail closed by construction rather than by a branch.
+    #[serde(default)]
+    pub nonce: String,
 }
 
 /// The on-disk key for an ask trace: `"{npub}|{slug}"`. The pipe is unambiguous because npubs and
@@ -1743,15 +1769,15 @@ mod tests {
     fn manifest_ask_roundtrips_and_is_keyed_by_npub_and_slug() {
         let (_dir, store) = test_store();
         store
-            .record_manifest_ask("npub1a", "criterion", "fp-1", "2026-01-01T00:00:00Z")
+            .record_manifest_ask("npub1a", "criterion", "fp-1", "2026-01-01T00:00:00Z", "nonce-1")
             .unwrap();
         // Same slug, different peer ⇒ distinct entry (don't clobber).
         store
-            .record_manifest_ask("npub1b", "criterion", "fp-2", "2026-01-02T00:00:00Z")
+            .record_manifest_ask("npub1b", "criterion", "fp-2", "2026-01-02T00:00:00Z", "nonce-x")
             .unwrap();
         // Same peer, different slug ⇒ distinct entry.
         store
-            .record_manifest_ask("npub1a", "other", "fp-3", "2026-01-03T00:00:00Z")
+            .record_manifest_ask("npub1a", "other", "fp-3", "2026-01-03T00:00:00Z", "nonce-x")
             .unwrap();
         let m = store.load_manifest_asks().unwrap();
         assert_eq!(m.len(), 3);
@@ -1767,10 +1793,10 @@ mod tests {
         // A re-ask is a re-ask: the newest send wins. One entry per (npub, slug), not a history.
         let (_dir, store) = test_store();
         store
-            .record_manifest_ask("npub1a", "criterion", "fp-old", "2026-01-01T00:00:00Z")
+            .record_manifest_ask("npub1a", "criterion", "fp-old", "2026-01-01T00:00:00Z", "nonce-x")
             .unwrap();
         store
-            .record_manifest_ask("npub1a", "criterion", "fp-new", "2026-01-09T00:00:00Z")
+            .record_manifest_ask("npub1a", "criterion", "fp-new", "2026-01-09T00:00:00Z", "nonce-x")
             .unwrap();
         let m = store.load_manifest_asks().unwrap();
         assert_eq!(m.len(), 1, "exactly one entry per (npub, slug)");
@@ -1783,7 +1809,7 @@ mod tests {
     fn manifest_asks_is_wiped_with_the_rest_of_the_profile() {
         let (_dir, store) = test_store();
         store
-            .record_manifest_ask("npub1a", "criterion", "fp-1", "2026-01-01T00:00:00Z")
+            .record_manifest_ask("npub1a", "criterion", "fp-1", "2026-01-01T00:00:00Z", "nonce-1")
             .unwrap();
         assert!(store.manifest_asks_path().exists());
 
