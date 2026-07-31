@@ -74,7 +74,7 @@ pub(crate) fn is_self_send(recipient: &PublicKey, me: &PublicKey) -> bool {
     recipient == me
 }
 
-fn npub_of(pk: &PublicKey) -> String {
+pub(crate) fn npub_of(pk: &PublicKey) -> String {
     pk.to_bech32().unwrap_or_else(|_| pk.to_hex())
 }
 

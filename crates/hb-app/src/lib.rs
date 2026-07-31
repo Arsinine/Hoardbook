@@ -90,11 +90,21 @@ fn build_system_tray(app: &mut tauri::App) -> tauri::Result<()> {
 
 /// If an identity is on disk, populate `identity` for the session.
 ///
-/// **No transport is started here, and that is now a choice rather than an absence** (M18): the
-/// manifest plane binds lazily, so a user who never sends a full list never opens a QUIC endpoint.
-/// The one exception is handled by the caller — `transport_state::rebind_if_tickets_outstanding`
-/// binds when an unspent ticket is on the books, because a ticket outlives the session that issued
-/// it.
+/// **No transport is started here, and that is a choice rather than an absence** (M18): the manifest
+/// plane binds lazily.
+///
+/// **Binding happens in three places, not one** — an earlier version of this comment named only the
+/// first and was therefore misleading about when a QUIC endpoint and its accept loop come up:
+///   1. `transport_state::rebind_if_tickets_outstanding` at startup, when an unspent ticket is on
+///      the books (a ticket outlives the session that issued it);
+///   2. `send_full_list`, when the owner approves a request;
+///   3. **`redeem_manifest_ticket`** — the ASKER binds too, in order to dial. Today that also starts
+///      the accept loop, because `ensure_endpoint` does both. A redeemer does not need to listen, so
+///      a client-only endpoint would be a genuine privacy improvement; it is recorded as open work
+///      rather than implied away here.
+///
+/// So the honest statement is: a user who never sends *and never receives* a full list never opens
+/// a QUIC endpoint.
 fn restore_identity(store: DataStore, identity: SharedIdentity) {
     let stored = match store.load_identity() {
         Ok(Some(s)) => s,

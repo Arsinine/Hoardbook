@@ -468,11 +468,35 @@
 		}
 	}
 
-	// M18 W4 — the local ask trace (`npub|slug` → when we asked). Loaded once per session; the gate
-	// below fails CLOSED while it is null, so a slow load can never open an auto-dial window.
+	// M18 W4 — the local ask trace (`npub|slug` → when we asked). The gate below fails CLOSED while it
+	// is null, so a slow load can never open an auto-dial window.
+	//
+	// **The retry is not optional.** A single swallowed rejection used to leave `manifestAsks` null
+	// forever: the effect had no other reactive dependency to re-run it, so every legitimate ticket
+	// rendered as "unsolicited" with no action, and automatic delivery could not recover for the rest
+	// of the session. Fail-closed must stay *recoverable*, or a transient local read error becomes a
+	// permanent feature outage that also blames the sender.
 	let manifestAsks = $state<Record<string, unknown> | null>(null);
+	let asksLoading = false;
+	let asksAttempt = $state(0);
 	$effect(() => {
-		if (manifestAsks === null) void getManifestAsks().then((a) => (manifestAsks = a)).catch(() => {});
+		void asksAttempt; // re-runs when a retry is scheduled
+		if (manifestAsks !== null || asksLoading) return;
+		asksLoading = true;
+		void getManifestAsks()
+			.then((a) => {
+				manifestAsks = a;
+			})
+			.catch(() => {
+				// Bounded backoff, capped — a persistently failing read must not spin.
+				const delay = Math.min(30_000, 2_000 * 2 ** Math.min(asksAttempt, 4));
+				setTimeout(() => {
+					asksAttempt += 1;
+				}, delay);
+			})
+			.finally(() => {
+				asksLoading = false;
+			});
 	});
 
 	/** Fire the first redemption for a ticket we have just rendered. Returns the current state so the
@@ -490,6 +514,10 @@
 		requestId: string,
 	) {
 		void redemptionTick; // read so this re-evaluates when a redemption settles
+		// Trace not loaded yet (or its read failed): we cannot tell solicited from unsolicited, so we
+		// dial nothing AND say so honestly rather than accusing the sender. Recoverable — the loader
+		// above retries, and this re-evaluates when it lands.
+		if (manifestAsks === null) return { kind: 'unverified' } as const;
 		if (!npub || !wasAsked(manifestAsks, npub, slug)) {
 			return { kind: 'unsolicited' } as const;
 		}

@@ -109,10 +109,16 @@ pub async fn send_full_list(
     let ticket = issue_ticket(&ep, &request_id, &slug, now_secs()).map_err(cmd_err)?;
 
     // (2) Record before the DM, so a redeemer always presents a ticket we can recognise.
+    // **Canonicalize the recipient before storing it.** `parse_recipient` also accepts a full `hbk`
+    // share code, but contacts are keyed by canonical npub and `contact_standing` hashes whatever is
+    // stored here. Persisting the raw input meant an `hbk` caller stored a share code, the later
+    // lookup missed, standing came back `Unknown`, and a ticket this node had legitimately issued and
+    // delivered was refused at redemption.
+    let redeemer_npub = crate::commands::chat::npub_of(&recipient);
     store
         .record_issued_ticket(&IssuedTicketRecord {
             ticket: ticket.clone(),
-            redeemer_npub: npub.clone(),
+            redeemer_npub,
             consumed_at: None,
             delivered_bytes: None,
         })
@@ -186,6 +192,9 @@ pub async fn redeem_manifest_ticket(
                 raw,
                 newest_fingerprint.as_deref(),
                 &store,
+                // The cache IS the delivery on this path — Chat discards the tree and Browse reads it
+                // back. A dropped write must fail the gate, so no ACK is sent and the ticket survives.
+                true,
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?,
         );

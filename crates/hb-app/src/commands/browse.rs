@@ -637,7 +637,9 @@ pub async fn import_manifest(
         }
         (None, None) => return Err("No manifest file or text provided.".into()),
     };
-    accept_manifest_bytes(&npub, expected_slug.as_deref(), &raw, newest_fingerprint.as_deref(), &store)
+    // Best-effort cache: this path returns the tree to the UI, so a cache miss costs only an offline
+    // re-browse (unchanged behaviour).
+    accept_manifest_bytes(&npub, expected_slug.as_deref(), &raw, newest_fingerprint.as_deref(), &store, false)
 }
 
 /// The verify→gate→render→cache tail shared by every way a manifest can arrive: the file/paste import
@@ -658,6 +660,7 @@ pub(crate) fn accept_manifest_bytes(
     raw: &str,
     newest_fingerprint: Option<&str>,
     store: &DataStore,
+    cache_required: bool,
 ) -> CmdResult<ImportedManifest> {
     let contact = store
         .load_contact(&CachedPeer::pubkey_hash(npub))
@@ -673,9 +676,20 @@ pub(crate) fn accept_manifest_bytes(
     let result = open_manifest(&envelope, &peer, expected_slug, &browse_key, newest_fingerprint)?;
 
     // Cache the verified envelope for offline re-browse, keyed (npub, slug, fingerprint) with LRU +
-    // size-cap. Best-effort — a cache-write hiccup never fails the import the user just performed.
-    if let Ok(json) = envelope.to_json() {
-        let _ = manifest_cache::put(
+    // size-cap.
+    //
+    // **`cache_required` exists because the two callers differ in what the cache MEANS to them.**
+    // For a file/paste import the cache is a convenience: the tree is returned to the UI and rendered
+    // immediately, so a write hiccup costs an offline re-browse and nothing else — best-effort is
+    // right, and that is the historical behaviour, unchanged.
+    //
+    // For a TRANSPORT redemption the cache is the delivery. Chat discards the returned tree and
+    // Browse picks the manifest up from the cache; and the owner spends the ticket on our
+    // acknowledgement. So a silently-dropped write there means the ticket is burned and the user has
+    // nothing — the acceptance gate would have said "accepted" about a manifest that never landed.
+    // Failing here is what keeps the ACK honest, because this runs *before* it.
+    let cached = envelope.to_json().ok().and_then(|json| {
+        manifest_cache::put(
             &store.manifest_cache_dir(),
             npub,
             &envelope.slug,
@@ -683,6 +697,14 @@ pub(crate) fn accept_manifest_bytes(
             &json,
             now_secs(),
             manifest_cache::DEFAULT_MANIFEST_CACHE_BYTES,
+        )
+        .ok()
+    });
+    if cache_required && cached.is_none() {
+        return Err(
+            "The full list arrived but could not be saved locally, so it was not accepted. \
+             Check free disk space and ask again."
+                .into(),
         );
     }
     Ok(result)

@@ -78,7 +78,11 @@ export type RedemptionState =
 	| { kind: 'redeeming' }
 	| { kind: 'done' }
 	| { kind: 'failed'; message: string }
-	| { kind: 'unsolicited' };
+	| { kind: 'unsolicited' }
+	/** The local ask trace has not loaded (or its read failed), so we cannot yet tell a solicited
+	 *  ticket from an unsolicited one. Distinct from `unsolicited` on purpose: it is recoverable, it
+	 *  says so, and it must not accuse the sender of something they did not do. */
+	| { kind: 'unverified' };
 
 /** Did we actually ask `npub` for `slug`? Read from the local ask trace (`get_manifest_asks`,
  *  recorded by `request_manifest` only after its DM publish resolves).
@@ -178,5 +182,10 @@ export const REDEEM_RETRY_LABEL = 'Try again';
 
 /** Asker-side, for a ticket we have no record of asking for. Says what it is and what was NOT done —
  *  the sender learns nothing, and we did not connect to them. */
+/** Shown while the local ask trace is unavailable. Fail-closed like `unsolicited` — nothing is
+ *  fetched — but recoverable and honestly labelled: the problem is on this side. */
+export const UNVERIFIED_LINE =
+	"Couldn't check your sent requests just now, so this wasn't fetched. It will retry shortly.";
+
 export const UNSOLICITED_LINE =
 	"They sent a link to a full list you didn't ask for. Nothing was fetched. Ask from their collection in Browse if you want it.";

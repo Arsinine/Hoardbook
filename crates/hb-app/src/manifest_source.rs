@@ -80,22 +80,17 @@ impl ManifestSource for StoreManifestSource {
         ManifestPayload::seal(&envelope).map_err(|e| anyhow!("{e}"))
     }
 
-    /// Persist the receipt. Best-effort by signature (the trait returns nothing) but not by
-    /// consequence: a lost write means a replay of this ticket would be served again, so the failure
-    /// is logged loudly rather than swallowed.
-    fn record_consumed(&self, receipt: &hb_core::ticket::ConsumedTicket) {
+    /// Persist the receipt, and **report failure** rather than logging past it. A lost write leaves
+    /// the ticket unspent on disk, so the plane needs to know in order to fail closed — it poisons
+    /// the request for the rest of the session instead of allowing a second delivery.
+    fn record_consumed(&self, receipt: &hb_core::ticket::ConsumedTicket) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        if let Err(e) =
-            self.store.mark_ticket_consumed(receipt.request_id(), receipt.delivered_bytes(), now)
-        {
-            tracing::error!(
-                request_id = receipt.request_id(),
-                "failed to persist a manifest receipt — this ticket could be redeemed twice: {e}"
-            );
-        }
+        self.store
+            .mark_ticket_consumed(receipt.request_id(), receipt.delivered_bytes(), now)
+            .map_err(|e| anyhow!("persist the manifest receipt: {e}"))
     }
 }
 

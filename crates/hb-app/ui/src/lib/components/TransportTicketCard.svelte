@@ -18,6 +18,7 @@
 		REDEEM_FAILED_LINE,
 		REDEEM_RETRY_LABEL,
 		UNSOLICITED_LINE,
+		UNVERIFIED_LINE,
 		type RedemptionState,
 	} from '$lib/transport-ticket.js';
 
@@ -44,6 +45,11 @@
 		<!-- Quarantine: recognition only. Accepting the sender comes first, exactly as for a share
 		     code or a manifest request — the ticket keeps until then, because it has no expiry. -->
 		<div class="tt-card-inert">Accept first to act on this.</div>
+	{:else if kind === 'unverified'}
+		<!-- The ask trace could not be read, so solicited/unsolicited is unknown. Fail closed (nothing
+		     dialled) but say it is our side and that it retries — accusing the sender here would be
+		     wrong, and leaving it looking permanent would hide a recoverable local failure. -->
+		<div class="tt-card-inert">{UNVERIFIED_LINE}</div>
 	{:else if kind === 'unsolicited'}
 		<!-- We have no local record of asking this peer for this collection, so nothing was dialled.
 		     Redeeming reveals our address to the owner; doing that unprompted would let any contact
