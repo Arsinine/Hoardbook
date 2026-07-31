@@ -4,6 +4,7 @@ import {
 	transportTicketHint,
 	RedemptionLedger,
 	ticketAnswersOurAsk,
+	askIdentity,
 	TICKET_TAG,
 	REDEEM_FAILED_LINE,
 	SEND_FULL_LIST_LABEL,
@@ -81,56 +82,83 @@ describe('parseTransportTicket', () => {
 });
 
 describe('RedemptionLedger', () => {
-	/** The whole reason the ledger exists: the same ticket DM is re-rendered on every 3s poll and
-	 *  re-read from the encrypted cache across restarts. Without a once-only claim, a manifest the
-	 *  user successfully received would dial the owner in a loop and show a stream of
+	const ASK = askIdentity('npub1owner', 'criterion', 'n-abc');
+
+	/** Render-idempotence: the same DM re-renders on every 3 s poll and is re-read from cache across
+	 *  restarts. Without a once-only claim a *successful* redemption would dial in a loop and show
 	 *  "already redeemed" errors for a success. */
 	it('claims a request id exactly once, however many times it is rendered', () => {
 		const l = new RedemptionLedger();
-		expect(l.claim('req-1')).toBe(true);
-		expect(l.claim('req-1')).toBe(false);
-		expect(l.claim('req-1')).toBe(false);
+		expect(l.claim('req-1', ASK)).toBe(true);
+		expect(l.claim('req-1', ASK)).toBe(false);
 		expect(l.get('req-1')).toEqual({ kind: 'redeeming' });
 	});
 
-	it('keys per request, so two tickets redeem independently', () => {
+	/** **The exploit this scoping exists to stop.** A peer that has seen one valid nonce can mint N
+	 *  tickets, each with a different OWNER-chosen `request_id` and a different node address, all
+	 *  echoing that one nonce. Claiming per request id let every one of them dial before any
+	 *  completed — one ask became arbitrary concurrent dials to endpoints of the peer's choosing. */
+	it('admits ONE in-flight redemption per ask, however many request ids a peer invents', () => {
 		const l = new RedemptionLedger();
-		expect(l.claim('req-1')).toBe(true);
-		expect(l.claim('req-2')).toBe(true);
+		expect(l.claim('peer-chosen-1', ASK)).toBe(true);
+		expect(l.claim('peer-chosen-2', ASK)).toBe(false);
+		expect(l.claim('peer-chosen-3', ASK)).toBe(false);
 	});
 
-	it('a settled redemption is never re-claimed by a render', () => {
+	it('keys per ask, so two genuine asks redeem independently', () => {
 		const l = new RedemptionLedger();
-		l.claim('req-1');
-		l.succeed('req-1');
-		expect(l.get('req-1')).toEqual({ kind: 'done' });
-		expect(l.claim('req-1')).toBe(false);
+		const other = askIdentity('npub1owner', 'other', 'n-xyz');
+		expect(l.claim('req-1', ASK)).toBe(true);
+		expect(l.claim('req-2', other)).toBe(true);
 	});
 
-	/** Retry is bounded to the failed state ON PURPOSE. That boundary is what keeps it from becoming a
-	 *  general "redeem whenever you like" affordance — redemption is immediate by owner ruling
-	 *  (2026-07-30), and the backend has no deferred entry point at all. A retry after a failure is the
-	 *  same immediate redemption re-attempted, which is safe because a failed attempt does not spend
-	 *  the ticket. */
-	it('permits a retry only from a failure — never from in-flight or success', () => {
+	/** Once an ask is answered it is spent for the session — including for a *different* ticket
+	 *  echoing the same nonce, which is how a peer would otherwise get a second delivery. */
+	it('spends the ask on success, refusing any later ticket for it', () => {
 		const l = new RedemptionLedger();
-		l.claim('req-1');
-		expect(l.claimRetry('req-1')).toBe(false); // in flight
-		l.succeed('req-1');
-		expect(l.claimRetry('req-1')).toBe(false); // already delivered
-		l.fail('req-1', 'dial failed');
-		expect(l.claimRetry('req-1')).toBe(true);
-		expect(l.get('req-1')).toEqual({ kind: 'redeeming' });
+		l.claim('req-1', ASK);
+		l.succeed('req-1', ASK);
+		expect(l.isSpent(ASK)).toBe(true);
+		expect(l.claim('req-2', ASK)).toBe(false);
+	});
+
+	/** **Independent of the durable consume on purpose.** If the backend's delete fails (disk full,
+	 *  permissions) the reusable authorization would otherwise come straight back; this holds it
+	 *  closed until a restart, and a restart needs a fresh ask to re-authorize. */
+	it('the spent marker does not depend on the backend delete succeeding', () => {
+		const l = new RedemptionLedger();
+		l.claim('req-1', ASK);
+		l.succeed('req-1', ASK); // no backend involved here at all
+		expect(l.claim('req-9', ASK)).toBe(false);
+	});
+
+	/** A failure RELEASES the ask rather than spending it — a dial that never connected cost nothing
+	 *  and must stay retryable, exactly as the ticket itself does. */
+	it('releases the ask on failure so a retry is possible', () => {
+		const l = new RedemptionLedger();
+		l.claim('req-1', ASK);
+		l.fail('req-1', ASK, 'dial failed');
+		expect(l.isSpent(ASK)).toBe(false);
+		expect(l.claimRetry('req-1', ASK)).toBe(true);
+	});
+
+	/** Retry stays bounded to the failed state, and cannot become a second concurrent dial. */
+	it('permits a retry only from a failure, and never while the ask is in flight or spent', () => {
+		const l = new RedemptionLedger();
+		l.claim('req-1', ASK);
+		expect(l.claimRetry('req-1', ASK)).toBe(false); // in flight
+		l.succeed('req-1', ASK);
+		expect(l.claimRetry('req-1', ASK)).toBe(false); // spent
 	});
 
 	it('never retries a ticket it has not seen', () => {
-		expect(new RedemptionLedger().claimRetry('never-seen')).toBe(false);
+		expect(new RedemptionLedger().claimRetry('never-seen', ASK)).toBe(false);
 	});
 
 	it('surfaces the failure message for the card', () => {
 		const l = new RedemptionLedger();
-		l.claim('req-1');
-		l.fail('req-1', 'dial the manifest plane: timed out');
+		l.claim('req-1', ASK);
+		l.fail('req-1', ASK, 'dial the manifest plane: timed out');
 		expect(l.get('req-1')).toEqual({
 			kind: 'failed',
 			message: 'dial the manifest plane: timed out',

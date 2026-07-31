@@ -65,6 +65,7 @@
 		RedemptionLedger,
 		SEND_FULL_LIST_TOAST,
 		ticketAnswersOurAsk,
+		askIdentity,
 	} from '$lib/transport-ticket.js';
 	import TransportTicketCard from '$lib/components/TransportTicketCard.svelte';
 	import { filterConversations, filterTopics, composeRecipientKind, isComposeToSelf } from '$lib/chat-filter.js';
@@ -457,17 +458,17 @@
 	// truncated teaser on its own. One hand-off, not two.
 	const redemptions = new RedemptionLedger();
 	let redemptionTick = $state(0); // bumped to re-render the cards; the ledger itself is not reactive
-	async function redeem(npub: string, requestId: string, ticketJson: string) {
+	async function redeem(npub: string, requestId: string, ask: string, ticketJson: string) {
 		try {
 			await redeemManifestTicket(npub, ticketJson);
-			redemptions.succeed(requestId);
+			redemptions.succeed(requestId, ask);
 			// The backend consumed the ask, so our copy is stale — re-read it. Without this the
 			// in-memory trace would still authorize a second ticket for the rest of the session,
 			// which is exactly the standing authorization the nonce removes.
 			manifestAsks = null;
 			asksAttempt += 1;
 		} catch (e) {
-			redemptions.fail(requestId, String(e));
+			redemptions.fail(requestId, ask, String(e));
 		} finally {
 			redemptionTick += 1;
 		}
@@ -523,13 +524,16 @@
 		// dial nothing AND say so honestly rather than accusing the sender. Recoverable — the loader
 		// above retries, and this re-evaluates when it lands.
 		if (manifestAsks === null) return { kind: 'unverified' } as const;
-		if (!npub || !ticketAnswersOurAsk(manifestAsks, npub, slug, ticketNonce)) {
+		if (!npub || !ticketNonce || !ticketAnswersOurAsk(manifestAsks, npub, slug, ticketNonce)) {
 			return { kind: 'unsolicited' } as const;
 		}
-		if (redemptions.claim(requestId)) {
-			void redeem(npub, requestId, ticketJson);
+		// Scope the claim to the ASK, not the ticket: one nonce must not authorize N concurrent dials
+		// to N peer-chosen addresses.
+		const ask = askIdentity(npub, slug, ticketNonce);
+		if (redemptions.claim(requestId, ask)) {
+			void redeem(npub, requestId, ask, ticketJson);
 		}
-		return redemptions.get(requestId);
+		return redemptions.get(requestId) ?? ({ kind: 'unsolicited' } as const);
 	}
 
 	/** Retry after a failure. **The gate is re-checked here even though an unsolicited ticket can
@@ -545,10 +549,11 @@
 		ticketJson: string,
 		requestId: string,
 	) {
-		if (!npub || !ticketAnswersOurAsk(manifestAsks, npub, slug, ticketNonce)) return;
-		if (!redemptions.claimRetry(requestId)) return;
+		if (!npub || !ticketNonce || !ticketAnswersOurAsk(manifestAsks, npub, slug, ticketNonce)) return;
+		const ask = askIdentity(npub, slug, ticketNonce);
+		if (!redemptions.claimRetry(requestId, ask)) return;
 		redemptionTick += 1;
-		void redeem(npub, requestId, ticketJson);
+		void redeem(npub, requestId, ask, ticketJson);
 	}
 
 	async function sendChannelPost() {

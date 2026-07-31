@@ -801,6 +801,34 @@ mod tests {
     use crate::dm_quarantine::DmRequestBucket;
     use hb_core::Identity;
 
+    /// **The `ManifestRequest` half of the M18 wire contract, pinned here** because `wire_freeze`
+    /// lives in hb-core and cannot see this type. Without it the ticket half was frozen and this half
+    /// was not: dropping or renaming `ask_nonce` would make owners emit nonce-less tickets and make
+    /// every current requester silently fail closed — a total outage of automatic delivery, with a
+    /// green suite.
+    #[test]
+    fn manifest_request_ask_nonce_is_wire_frozen() {
+        const FREEZE: &str = "FROZEN WIRE FIELD — changing this breaks in-flight requests";
+
+        let json = build_manifest_request("s", "fp", None, None, Some("n0nce".into())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["ask_nonce"], "n0nce", "ManifestRequest.ask_nonce field name — {FREEZE}");
+
+        // Absent, not null, when there is none — so a client that predates the field parses a new
+        // request exactly as it always did.
+        let json = build_manifest_request("s", "fp", None, None, None).unwrap();
+        assert!(
+            !json.contains("ask_nonce"),
+            "an absent ask nonce is omitted, not null — {FREEZE}"
+        );
+
+        // And a legacy body with no nonce at all is still a recognisable request.
+        let legacy = r#"{"hb":"manifest_request","slug":"s","fingerprint_seen":"fp"}"#;
+        let v: serde_json::Value = serde_json::from_str(legacy).unwrap();
+        assert_eq!(v["hb"], MANIFEST_REQUEST_TAG, "a pre-nonce request still reads as a request");
+        assert!(v.get("ask_nonce").is_none());
+    }
+
     #[test]
     fn is_self_send_rejects_own_pubkey_devtest_14() {
         let me = Identity::generate();

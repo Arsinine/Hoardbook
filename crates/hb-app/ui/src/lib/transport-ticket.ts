@@ -124,44 +124,81 @@ export function ticketAnswersOurAsk(
 	return stored === ticketNonce;
 }
 
-/** The per-ticket redemption ledger, keyed by `request_id`.
+/** The identity of one ASK — the unit an authorization is actually scoped to.
  *
- *  **Keyed by request id, not by message identity**, because the same DM is re-rendered on every
- *  poll and re-read from the encrypted cache across restarts. Keying on anything derived from the
- *  render would re-fire the redemption on each pass — and while a replay is refused by the backend
- *  (the ticket is spent), firing it repeatedly would dial the owner in a loop and show the user a
- *  "already redeemed" error for a manifest they successfully received.
+ *  Not the `request_id`: the OWNER mints that, so a peer can produce as many distinct ones as it
+ *  likes. Keyed on what *we* control.
+ */
+export function askIdentity(npub: string, slug: string, nonce: string): string {
+	return `${npub}|${slug}|${nonce}`;
+}
+
+/** The redemption ledger.
+ *
+ *  Two levels of key, and the difference is the whole point:
+ *
+ *  - **per `request_id`** — the render-idempotence problem. The same DM re-renders on every 3 s poll
+ *    and is re-read from cache across restarts; without a once-only claim a *successful* redemption
+ *    would dial in a loop and show "already redeemed" errors for a success.
+ *  - **per ASK** — the authorization problem. **Claiming only per request id was exploitable:** a peer
+ *    that has seen one valid nonce can mint N tickets, each with a different owner-chosen
+ *    `request_id` *and a different node address*, all echoing that one nonce. Each passes the nonce
+ *    gate, each takes its own request-id slot, and all N dial before any of them completes — one ask
+ *    turned into arbitrary concurrent dials to endpoints of the peer's choosing. So an ask admits
+ *    **one in-flight redemption**, and once one succeeds the ask is **spent for the session**.
+ *
+ *  `#asksSpent` is deliberately independent of the backend's durable consume. If that write fails
+ *  (disk full, permissions) the reusable authorization would otherwise come straight back; this
+ *  keeps it closed until at least a restart, and a restart requires a fresh ask to re-authorize.
  */
 export class RedemptionLedger {
 	#states = new Map<string, RedemptionState>();
+	#asksInFlight = new Set<string>();
+	#asksSpent = new Set<string>();
 
-	/** Claim `requestId` for a first attempt. Returns false when one is already running or finished —
-	 *  the caller must not invoke the backend in that case. A `failed` entry is NOT claimable, so a
-	 *  failure is surfaced and left for an explicit Retry rather than silently re-dialled. */
-	claim(requestId: string): boolean {
+	/** Claim `requestId` for a first attempt against `ask`. False when this ticket is already known,
+	 *  when another ticket for the same ask is already redeeming, or when the ask is spent. */
+	claim(requestId: string, ask: string): boolean {
 		if (this.#states.has(requestId)) return false;
+		if (this.#asksSpent.has(ask)) return false;
+		if (this.#asksInFlight.has(ask)) return false;
+		this.#asksInFlight.add(ask);
 		this.#states.set(requestId, { kind: 'redeeming' });
 		return true;
 	}
 
-	/** Claim for a retry after a failure. Only a `failed` ticket may be retried — this is what keeps
-	 *  Retry from becoming a general "redeem whenever you like" affordance. */
-	claimRetry(requestId: string): boolean {
+	/** Claim for a retry after a failure. Only a `failed` ticket may be retried, and only while its
+	 *  ask is neither spent nor otherwise in flight — so retry cannot become a second concurrent dial
+	 *  any more than a first claim can. */
+	claimRetry(requestId: string, ask: string): boolean {
 		if (this.#states.get(requestId)?.kind !== 'failed') return false;
+		if (this.#asksSpent.has(ask)) return false;
+		if (this.#asksInFlight.has(ask)) return false;
+		this.#asksInFlight.add(ask);
 		this.#states.set(requestId, { kind: 'redeeming' });
 		return true;
 	}
 
-	succeed(requestId: string): void {
+	succeed(requestId: string, ask: string): void {
+		this.#asksInFlight.delete(ask);
+		// Spent for the session — one ask, one delivery, regardless of what the durable trace does.
+		this.#asksSpent.add(ask);
 		this.#states.set(requestId, { kind: 'done' });
 	}
 
-	fail(requestId: string, message: string): void {
+	fail(requestId: string, ask: string, message: string): void {
+		// Released, not spent: a dial that failed cost nothing and stays retryable.
+		this.#asksInFlight.delete(ask);
 		this.#states.set(requestId, { kind: 'failed', message });
 	}
 
 	get(requestId: string): RedemptionState | undefined {
 		return this.#states.get(requestId);
+	}
+
+	/** Whether this ask has already been answered in this session. */
+	isSpent(ask: string): boolean {
+		return this.#asksSpent.has(ask);
 	}
 }
 

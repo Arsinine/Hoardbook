@@ -890,7 +890,6 @@ impl DataStore {
         sent_at: &str,
         nonce: &str,
     ) -> Result<()> {
-        static MANIFEST_ASKS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = MANIFEST_ASKS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut m = self.load_manifest_asks()?;
         m.insert(
@@ -909,11 +908,18 @@ impl DataStore {
     ///
     /// Deliberately not called on a failed attempt: a dial that never connected has cost nothing and
     /// must remain retryable, exactly as the ticket itself does.
-    pub fn consume_manifest_ask(&self, npub: &str, slug: &str) -> Result<()> {
-        static MANIFEST_ASKS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// **Conditional on `expected_nonce`.** Removing unconditionally loses a *newer* ask: if ticket A
+    /// is in flight, the user re-asks (minting nonce B, which overwrites the single `(npub, slug)`
+    /// entry), and A then completes, an unconditional delete throws away B — and the legitimate
+    /// answer to the new ask afterwards reads as unsolicited. Only the ask that was actually answered
+    /// is consumed.
+    pub fn consume_manifest_ask(&self, npub: &str, slug: &str, expected_nonce: &str) -> Result<()> {
         let _guard = MANIFEST_ASKS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut m = self.load_manifest_asks()?;
-        if m.remove(&manifest_ask_key(npub, slug)).is_some() {
+        let key = manifest_ask_key(npub, slug);
+        let matches = m.get(&key).is_some_and(|a| a.nonce == expected_nonce);
+        if matches {
+            m.remove(&key);
             self.save_manifest_asks(&m)?;
         }
         Ok(())
@@ -987,6 +993,14 @@ impl DataStore {
         Ok(())
     }
 }
+
+/// Serializes every load-modify-save of the ask trace.
+///
+/// **One shared static, not one per function.** A `static` declared inside a function body is its own
+/// distinct item, so the two locks this replaced never serialized against *each other* — a
+/// `record_manifest_ask` and a `consume_manifest_ask` overlapping could interleave their
+/// load→modify→save and lose the newer write entirely.
+static MANIFEST_ASKS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// How many issued-ticket records to keep. Only **consumed** records are eligible for eviction, so
 /// this bounds the audit tail rather than the set of live approvals.
