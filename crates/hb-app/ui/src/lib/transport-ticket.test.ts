@@ -3,6 +3,7 @@ import {
 	parseTransportTicket,
 	transportTicketHint,
 	RedemptionLedger,
+	wasAsked,
 	TICKET_TAG,
 	REDEEM_FAILED_LINE,
 	SEND_FULL_LIST_LABEL,
@@ -134,6 +135,39 @@ describe('RedemptionLedger', () => {
 			kind: 'failed',
 			message: 'dial the manifest plane: timed out',
 		});
+	});
+});
+
+describe('wasAsked — the unsolicited-ticket gate', () => {
+	/** **This is an IP-exposure control, not tidiness.** Redemption dials the owner, and the card
+	 *  fires on render — so without this gate any contact could drop a ticket for a collection we
+	 *  never asked about into our inbox and make us connect to them on sight, handing over our
+	 *  address. That is the H4/MT2 harvest arriving through a different door than the one presence was
+	 *  hardened against. */
+	it('is true only for a peer+collection we actually asked', () => {
+		const asks = { 'npub1owner|criterion': { sent_at: 'x' } };
+		expect(wasAsked(asks, 'npub1owner', 'criterion')).toBe(true);
+		// Right peer, collection we never asked about.
+		expect(wasAsked(asks, 'npub1owner', 'other')).toBe(false);
+		// Right collection, a peer we never asked — the impersonation case.
+		expect(wasAsked(asks, 'npub1stranger', 'criterion')).toBe(false);
+	});
+
+	/** Fails CLOSED while the trace is loading. A `null` that read as "asked" would make every launch
+	 *  a window in which an unsolicited ticket auto-dials. */
+	it('is false when the ask trace has not loaded yet', () => {
+		expect(wasAsked(null, 'npub1owner', 'criterion')).toBe(false);
+	});
+
+	it('is false against an empty trace', () => {
+		expect(wasAsked({}, 'npub1owner', 'criterion')).toBe(false);
+	});
+
+	/** The lookup must not be satisfied by inherited Object properties — `asks['constructor']` is
+	 *  truthy on a plain object, so a slug of "constructor" would otherwise read as asked. */
+	it('is not fooled by inherited Object properties', () => {
+		expect(wasAsked({}, 'npub1owner', 'constructor')).toBe(false);
+		expect(wasAsked({}, 'toString', 'constructor')).toBe(false);
 	});
 });
 

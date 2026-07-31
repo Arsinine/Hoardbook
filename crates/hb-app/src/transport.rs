@@ -24,7 +24,8 @@
 //! owner → asker   [u8 status: 0 = ok, 1 = refused]
 //!   ok      → [u32-LE payload-len][ManifestEnvelope JSON bytes]
 //!   refused → [u32-LE msg-len][UTF-8 reason]
-//! asker → owner   [u8 0]   ← the RECEIPT: sent only after from_wire + the slug check both pass
+//! asker → owner   [u8 0]   ← the RECEIPT: sent only after from_wire, the slug check, AND the
+//!                              caller's acceptance gate all pass
 //! ```
 //!
 //! **Both length prefixes are bounded before a byte is allocated** ([`read_framed`]). That is the
@@ -33,8 +34,9 @@
 //! declaring 500 MB is refused on the declared length, not after the allocation.
 //!
 //! **The trailing receipt frame is not a courtesy.** Writing bytes proves only that the *sender* had
-//! them; the ACK is the asker asserting that a manifest it could actually parse, verify and match to
-//! its ticket is now in hand. Everything about "consumed on success" rests on it — see
+//! them; the ACK is the asker asserting that a manifest it could actually parse, verify, match to its
+//! ticket **and accept** is now in hand — the acceptance gate is the caller's, and it runs before the
+//! ACK precisely so the owner never spends a ticket on a manifest the asker then rejects. Everything about "consumed on success" rests on it — see
 //! [`serve_manifest_stream`]. Every step also carries a deadline, so a peer cannot hold a handler
 //! open by connecting and going quiet.
 //!
@@ -487,9 +489,29 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Framed<R> {
 /// **Redemption is immediate and has no defer affordance** (owner ruling 2026-07-30) — this function
 /// is the whole redemption path, it is called as soon as a ticket arrives, and there is deliberately
 /// no "redeem later" entry point for a UI to bind a button to.
+///
+/// ## `accept` — why the caller's gate runs *inside* this function
+///
+/// The owner spends the ticket on our acknowledgement, so the ACK must mean **"a manifest we can
+/// actually use arrived"**. `from_wire` does not prove that: it proves the bytes are a structurally
+/// self-consistent envelope, under the ceilings, declaring the ticket's slug. It cannot prove the
+/// envelope is signed by *the peer we are browsing*, that the body decrypts under *our* browse-key,
+/// or that the tree is complete — those need the contact store, which this layer deliberately does
+/// not have.
+///
+/// Running that gate *after* `fetch_manifest` returned would ACK first and reject second: the asker
+/// ends up with nothing usable and the ticket is **already spent**, so the human has to ask again and
+/// the owner has to approve again. That is the `6691377` defect — "consumed on success" quietly
+/// meaning "consumed on written" — recurring one layer up, with the boundary moved from *we wrote
+/// it* to *they parsed it* when what matters is *they can use it*.
+///
+/// So the caller passes its gate in, it runs before the ACK, and a rejection returns without
+/// acknowledging. The layering is intact — the closure comes from the caller that owns the store;
+/// this module still holds no store handle.
 pub async fn fetch_manifest(
     endpoint: &iroh::Endpoint,
     ticket: &TransportTicket,
+    accept: impl FnOnce(&ManifestPayload) -> Result<()>,
 ) -> Result<ManifestPayload> {
     ticket.verify_shape().map_err(|e| anyhow!("ticket refused before dialling: {e}"))?;
     let addr = parse_node_addr(&ticket.node_addr)?;
@@ -497,7 +519,7 @@ pub async fn fetch_manifest(
         .connect(addr, MANIFEST_ALPN)
         .await
         .with_context(|| format!("dial the manifest plane for {}", ticket.slug))?;
-    let result = fetch_over_connection(&conn, ticket).await;
+    let result = fetch_over_connection(&conn, ticket, accept).await;
     conn.close(0u32.into(), b"");
     result
 }
@@ -505,6 +527,7 @@ pub async fn fetch_manifest(
 async fn fetch_over_connection(
     conn: &iroh::endpoint::Connection,
     ticket: &TransportTicket,
+    accept: impl FnOnce(&ManifestPayload) -> Result<()>,
 ) -> Result<ManifestPayload> {
     let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?;
     let req = FetchRequest { request_id: ticket.request_id.clone(), ticket: ticket.clone() };
@@ -533,9 +556,15 @@ async fn fetch_over_connection(
                 ));
             }
 
-            // Acknowledge only now — after the bytes parsed, verified, and matched the ticket. This
-            // is the asker's assertion that a usable manifest arrived, and the owner consumes the
-            // ticket on the strength of it.
+            // The caller's gate — the author pin, the browse-key decrypt, the completeness check.
+            // **Before the ACK, deliberately** (see `fetch_manifest`): the owner spends the ticket on
+            // that ACK, so anything that can make this manifest unusable has to have run already.
+            // Returning here leaves the ticket unspent and the retry re-authorizes.
+            accept(&payload).map_err(|e| anyhow!("the manifest arrived but was not accepted: {e}"))?;
+
+            // Acknowledge only now — after the bytes parsed, verified, matched the ticket, AND passed
+            // the caller's gate. This is the asker's assertion that a *usable* manifest arrived, and
+            // the owner consumes the ticket on the strength of it.
             send.write_u8(STATUS_OK).await.context("write acknowledgement")?;
             send.shutdown().await.context("shutdown after acknowledgement")?;
             // Wait (bounded) for the owner to close, rather than closing ourselves. `shutdown` only
@@ -920,7 +949,7 @@ pub(crate) mod tests {
             let expected = payload.envelope().unwrap();
 
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
-            let got = fetch_manifest(&client, &ticket).await.expect("fetch the manifest");
+            let got = fetch_manifest(&client, &ticket, |_| Ok(())).await.expect("fetch the manifest");
 
             assert_eq!(got.len(), payload.len(), "the whole payload arrived");
             assert_eq!(
@@ -952,11 +981,11 @@ pub(crate) mod tests {
             let (server, source, ticket) = spawn_plane(50, "small").await;
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
 
-            fetch_manifest(&client, &ticket).await.expect("the first redemption succeeds");
+            fetch_manifest(&client, &ticket, |_| Ok(())).await.expect("the first redemption succeeds");
             // Wait for the receipt before replaying: without it this test races the owner's
             // post-drain bookkeeping and would pass or fail on timing rather than on the rule.
             await_receipt(&source).await;
-            let err = fetch_manifest(&client, &ticket)
+            let err = fetch_manifest(&client, &ticket, |_| Ok(()))
                 .await
                 .expect_err("a replay of a consumed ticket must be refused");
             let msg = err.to_string().to_lowercase();
@@ -982,7 +1011,7 @@ pub(crate) mod tests {
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
 
             *source.standing.lock().unwrap() = ContactStanding::Blocked;
-            let err = fetch_manifest(&client, &ticket)
+            let err = fetch_manifest(&client, &ticket, |_| Ok(()))
                 .await
                 .expect_err("a blocked redeemer must be refused");
             assert!(
@@ -995,7 +1024,7 @@ pub(crate) mod tests {
             );
 
             *source.standing.lock().unwrap() = ContactStanding::Good;
-            fetch_manifest(&client, &ticket)
+            fetch_manifest(&client, &ticket, |_| Ok(()))
                 .await
                 .expect("restoring the contact restores the approval — the ticket was not burned");
 
@@ -1016,12 +1045,12 @@ pub(crate) mod tests {
 
             let mut invented = ticket.clone();
             invented.request_id = "req-never-approved".into();
-            let unknown = fetch_manifest(&client, &invented).await.expect_err("unknown request");
+            let unknown = fetch_manifest(&client, &invented, |_| Ok(())).await.expect_err("unknown request");
 
             // Same request id, but a ticket body this node did not issue (a different slug bound in).
             let mut forged = ticket.clone();
             forged.slug = "some-other-collection".into();
-            let mismatch = fetch_manifest(&client, &forged).await.expect_err("forged ticket");
+            let mismatch = fetch_manifest(&client, &forged, |_| Ok(())).await.expect_err("forged ticket");
 
             assert_eq!(
                 unknown.to_string(),
@@ -1116,8 +1145,8 @@ pub(crate) mod tests {
             // Fired together, on separate connections, with no ordering between them. The
             // rendezvous inside `issued()` is what makes the overlap a fact rather than a hope.
             let (a, b) = tokio::join!(
-                fetch_manifest(&client, &ticket),
-                fetch_manifest(&client, &ticket)
+                fetch_manifest(&client, &ticket, |_| Ok(())),
+                fetch_manifest(&client, &ticket, |_| Ok(()))
             );
 
             let winners = [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count();
@@ -1154,7 +1183,7 @@ pub(crate) mod tests {
             *source.serve_instead.lock().unwrap() = Some(real_payload_for("big", 50));
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
 
-            let err = fetch_manifest(&client, &ticket)
+            let err = fetch_manifest(&client, &ticket, |_| Ok(()))
                 .await
                 .expect_err("a manifest for another collection must be refused");
             let msg = err.to_string();
@@ -1216,7 +1245,7 @@ pub(crate) mod tests {
             });
 
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
-            let err = fetch_manifest(&client, &ticket)
+            let err = fetch_manifest(&client, &ticket, |_| Ok(()))
                 .await
                 .expect_err("a manifest for a collection we did not ask about must be refused");
             let msg = err.to_string();
@@ -1274,7 +1303,66 @@ pub(crate) mod tests {
             );
 
             // And the honest retry works, which is what the owner's ruling actually asked for.
-            fetch_manifest(&client, &ticket).await.expect("the retry must succeed");
+            fetch_manifest(&client, &ticket, |_| Ok(())).await.expect("the retry must succeed");
+            await_receipt(&source).await;
+
+            client.close().await;
+            server.close().await;
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// **The acceptance gate runs BEFORE the acknowledgement — a manifest the caller rejects must not
+    /// burn the ticket.**
+    ///
+    /// The sibling of `a_peer_that_never_acknowledges_leaves_the_ticket_unspent`, one layer up. That
+    /// one covers a peer that never answers; this one covers a peer that answers *correctly at the
+    /// wire level* and is still rejected by the app: `from_wire` proves the envelope is
+    /// self-consistent, under the ceilings, and declares the ticket's slug — it cannot prove the
+    /// signature is the browsed peer's, that the body decrypts under our browse-key, or that the tree
+    /// is complete. Those checks live in `commands::browse::open_manifest`, behind the contact store.
+    ///
+    /// Run the gate after `fetch_manifest` returns and the ACK is already gone: the asker has nothing
+    /// usable, the ticket is spent, and the human has to ask again while the owner approves again.
+    /// That is `6691377`'s "consumed on written" defect recurring with the boundary moved from *we
+    /// wrote it* to *they parsed it*, when what the ruling means is *they can use it*.
+    ///
+    /// **⚠ RED-verifying this needs the FAITHFUL pre-fix ordering, and the obvious probe is not it.**
+    /// Moving the gate to just after the ACK but *before* `drain_connection` leaves this test GREEN:
+    /// the early return skips the drain, so `CONNECTION_CLOSE` outruns the ACK and the owner never
+    /// sees it — the teardown race accidentally does the fix's job. Only placing the gate after the
+    /// drain (where a caller running it *after* `fetch_manifest` returns effectively puts it) reddens
+    /// this. The lesson generalises: **when a probe passes, check whether some unrelated mechanism is
+    /// masking the defect rather than concluding the guard holds.**
+    #[tokio::test]
+    async fn a_manifest_the_caller_rejects_leaves_the_ticket_unspent() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let (server, source, ticket) = spawn_plane(50, "small").await;
+            let client = bind_local_endpoint(&rand::random(), vec![]).await;
+
+            // A gate that refuses everything — standing in for a failed author pin, a browse-key that
+            // does not decrypt, or an incomplete tree. The wire exchange itself is entirely valid.
+            let err = fetch_manifest(&client, &ticket, |_| Err(anyhow!("author pin failed")))
+                .await
+                .expect_err("a rejected manifest is not a successful redemption");
+            assert!(
+                err.to_string().contains("author pin failed"),
+                "the caller's reason must survive to the user, got: {err}"
+            );
+
+            // Room for the owner to (wrongly) record a receipt if the ACK leaked out.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            assert!(
+                source.consumed.lock().unwrap().is_empty(),
+                "a manifest the asker could not accept must not consume the ticket — the ACK is the \
+                 assertion that a USABLE manifest arrived, not merely a parseable one"
+            );
+
+            // And the approval survives, so a fixed client (or a re-added contact) can still redeem.
+            fetch_manifest(&client, &ticket, |_| Ok(()))
+                .await
+                .expect("the ticket is still good after a rejection");
             await_receipt(&source).await;
 
             client.close().await;

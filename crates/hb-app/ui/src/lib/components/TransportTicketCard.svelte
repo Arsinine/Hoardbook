@@ -17,6 +17,7 @@
 		REDEEMED_LINE,
 		REDEEM_FAILED_LINE,
 		REDEEM_RETRY_LABEL,
+		UNSOLICITED_LINE,
 		type RedemptionState,
 	} from '$lib/transport-ticket.js';
 
@@ -43,6 +44,11 @@
 		<!-- Quarantine: recognition only. Accepting the sender comes first, exactly as for a share
 		     code or a manifest request — the ticket keeps until then, because it has no expiry. -->
 		<div class="tt-card-inert">Accept first to act on this.</div>
+	{:else if kind === 'unsolicited'}
+		<!-- We have no local record of asking this peer for this collection, so nothing was dialled.
+		     Redeeming reveals our address to the owner; doing that unprompted would let any contact
+		     harvest it by dropping a ticket in our inbox. See `wasAsked`. -->
+		<div class="tt-card-inert">{UNSOLICITED_LINE}</div>
 	{:else if kind === 'redeeming'}
 		<div class="tt-card-inert">{REDEEMING_LINE(slug)}</div>
 	{:else if kind === 'done'}
