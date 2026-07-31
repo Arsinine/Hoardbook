@@ -161,9 +161,12 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          # path:count — every file allowed to mention Mascara, and how many times.
+          # path:count — every file allowed to mention Mascara, and how many OCCURRENCES.
+          # Occurrences, not matching LINES: `grep -c` counts lines, so a second mention appended
+          # to an existing line would not move the number and would sail straight through.
+          # (`chat.rs` is the live example — 2 matching lines, 3 mentions.)
           ALLOWED="crates/hb-app/src/identity_state.rs:1
-          crates/hb-app/src/commands/chat.rs:2
+          crates/hb-app/src/commands/chat.rs:3
           crates/hb-core/src/ticket.rs:1
           crates/hb-app/ui/src/lib/request-inbox.ts:1
           crates/hb-app/ui/src/routes/+page.svelte:1"
@@ -185,7 +188,7 @@ jobs:
               echo "::error::deleted file silently shrinks this guard. Update the list."
               exit 1
             fi
-            got=$(grep -cI 'Mascara' "$f" || true)
+            got=$(grep -oI 'Mascara' "$f" | wc -l | tr -d ' ')
             if [ "$got" != "$want" ]; then
               echo "::error::$f mentions Mascara $got time(s), allowlist says $want."
               echo "::error::If the new mention says the courier role is DEAD, bump the count. If it revives it, delete it."
