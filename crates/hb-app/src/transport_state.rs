@@ -9,6 +9,14 @@
 //! list never binds a QUIC endpoint or talks to a relay server, which is the right default for a
 //! directory app.
 //!
+//! **An upgrade closes the old binding, and may abort an in-flight redemption — deliberately.** A
+//! lease/drain protocol was tried and removed: admission and draining could not be made atomic
+//! without a full binding-state machine (a lease could be taken just after the drain observed zero),
+//! and its 30 s deadline was shorter than the protocol's own 120 s ACK window, so it *still* aborted
+//! slow transfers while adding racy machinery. The consequence of an abort is bounded and already
+//! handled: the ticket stays unspent, so the asker retries. Simpler and honest beats a lease that
+//! only looks safe.
+//!
 //! **Two kinds of binding, not one** ([`Role`], owner ruling ③ 2026-07-31). Fulfilling must LISTEN.
 //! Redeeming only needs to DIAL, and binding a listening endpoint for it would leave the redeemer
 //! answering anyone who holds its permanently-stable node id — see [`crate::transport::bind_client_endpoint`].
@@ -66,10 +74,6 @@ pub struct PlaneState {
 /// A bound endpoint and the identity it belongs to.
 pub struct BoundPlane {
     pub endpoint: iroh::Endpoint,
-    /// Redemptions currently dialing on this binding. An upgrade must not yank the socket out from
-    /// under one — `Endpoint::close` closes live connections, and `fetch_manifest` has no
-    /// lifecycle-aware retry, so a transfer would simply die mid-flight.
-    pub dials: Arc<std::sync::atomic::AtomicUsize>,
     /// The npub whose keys the running accept loop serves from.
     pub owner_npub: String,
     /// Whether this binding **listens** (advertises the ALPN and runs an accept loop) or is
@@ -92,17 +96,6 @@ pub fn new_shared_endpoint() -> SharedEndpoint {
     Arc::new(RwLock::new(PlaneState::default()))
 }
 
-/// How long an upgrade waits for in-flight redemptions to finish before taking the socket.
-const UPGRADE_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Hold while dialing, so an upgrade defers instead of killing the transfer.
-pub struct DialLease(Arc<std::sync::atomic::AtomicUsize>);
-
-impl Drop for DialLease {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
 
 /// Bind the endpoint and spawn its accept loop if this session has not already, then return a handle.
 ///
@@ -114,6 +107,7 @@ impl Drop for DialLease {
 pub async fn ensure_endpoint(
     shared: &SharedEndpoint,
     owner_npub: &str,
+    live_npub: &crate::identity_state::SharedIdentity,
     transport_key: &SessionTransportKey,
     source: Arc<dyn ManifestSource>,
     need: Role,
@@ -136,20 +130,6 @@ pub async fn ensure_endpoint(
         st.generation
     };
 
-    // Wait (bounded) for in-flight dials before taking the socket, so a fulfil does not abort a
-    // redemption mid-transfer. Done BEFORE the write lock so a dialer can still finish.
-    if let Some(dials) = {
-        let st = shared.read().await;
-        st.bound.as_ref().filter(|b| !satisfies(b)).map(|b| b.dials.clone())
-    } {
-        let deadline = tokio::time::Instant::now() + UPGRADE_DRAIN_DEADLINE;
-        while dials.load(std::sync::atomic::Ordering::SeqCst) > 0
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
     let mut st = shared.write().await;
     // Re-check: another task may have bound while we waited for the write lock.
     if let Some(bound) = st.bound.as_ref() {
@@ -157,10 +137,21 @@ pub async fn ensure_endpoint(
             return Ok(bound.endpoint.clone());
         }
     }
-    // The session was wiped (or otherwise torn down) while we queued. Publishing now would recreate
-    // a listening endpoint under credentials that no longer exist.
+    // **Two fences, because one is not enough.**
+    //
+    // The generation catches a call that started BEFORE a `close_plane` — it captured the old value
+    // and must not publish. But a caller snapshots the identity before invoking us, so a *stale
+    // fulfil* can enter afterwards, capture the NEW generation, and pass this check. So the second
+    // fence re-reads the LIVE identity here, under the lock, and refuses if the npub we were asked to
+    // bind for is no longer the session's. A wiped session has no identity at all, which fails it.
     if st.generation != generation {
         return Err(anyhow::anyhow!("the transport was shut down while binding"));
+    }
+    let live = live_npub.read().await.as_ref().map(|id| id.npub());
+    if live.as_deref() != Some(owner_npub) {
+        return Err(anyhow::anyhow!(
+            "the identity changed while binding the transport; refusing to publish a plane for a              session that is no longer current"
+        ));
     }
     // Take the old binding OUT before closing it: if the bind below fails, the state must be empty,
     // not holding a closed endpoint that the satisfaction check would hand to the next caller.
@@ -177,19 +168,10 @@ pub async fn ensure_endpoint(
     };
     st.bound = Some(BoundPlane {
         endpoint: endpoint.clone(),
-        dials: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         owner_npub: owner_npub.to_string(),
         listening,
     });
     Ok(endpoint)
-}
-
-/// Register an in-flight dial on the current binding, so an upgrade waits for it.
-pub async fn lease_dial(shared: &SharedEndpoint) -> Option<DialLease> {
-    let st = shared.read().await;
-    let dials = st.bound.as_ref()?.dials.clone();
-    dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    Some(DialLease(dials))
 }
 
 /// Shut the plane down and forget it. Called when the session stops having an identity (sign-out /
@@ -246,6 +228,7 @@ fn spawn_accept_loop(endpoint: iroh::Endpoint, plane: Arc<ManifestPlane>) {
 pub async fn rebind_if_tickets_outstanding(
     shared: &SharedEndpoint,
     owner_npub: &str,
+    live_npub: &crate::identity_state::SharedIdentity,
     transport_key: &SessionTransportKey,
     source: Arc<dyn ManifestSource>,
     store: &crate::store::DataStore,
@@ -257,7 +240,9 @@ pub async fn rebind_if_tickets_outstanding(
     if !outstanding {
         return;
     }
-    if let Err(e) = ensure_endpoint(shared, owner_npub, transport_key, source, Role::Listen).await {
+    if let Err(e) =
+        ensure_endpoint(shared, owner_npub, live_npub, transport_key, source, Role::Listen).await
+    {
         tracing::warn!("manifest plane: could not rebind for an outstanding ticket: {e}");
     }
 }

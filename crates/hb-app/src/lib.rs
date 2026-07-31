@@ -321,6 +321,7 @@ pub fn run() {
                     transport_state::rebind_if_tickets_outstanding(
                         &endpoint,
                         &npub,
+                        &identity,
                         &transport_key,
                         source,
                         &store,

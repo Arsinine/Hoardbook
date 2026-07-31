@@ -142,12 +142,98 @@ mod tests {
         assert_eq!(after.delivered_bytes, Some(4096));
     }
 
-    /// **A completing ticket must not consume a NEWER ask.** There is one trace entry per
-    /// `(npub, slug)`, so a re-ask overwrites it. If ticket A is in flight, the user re-asks (nonce
-    /// B), and A then completes, an unconditional delete throws away B — and the legitimate answer to
-    /// the new ask afterwards reads as unsolicited, with no way for the user to see why.
+    /// **One ask admits ONE ticket — the defect that survived two rounds of fixes.**
+    ///
+    /// Binding the ticket to a nonce was not enough, and neither was releasing the ask on failure.
+    /// The peer being asked is the party that *receives* the nonce, so it could send ticket A to an
+    /// address that times out, then B, C, D… each with a fresh owner-chosen `request_id` and a fresh
+    /// node address. Every failure released the ask and the next ticket claimed it — an automatic
+    /// dial per attempt, no user action, to any endpoint the peer chose.
+    ///
+    /// The claim is durable and taken BEFORE the dial, so a retry must be the same ticket and
+    /// anything else needs a fresh ask.
     #[test]
-    fn consuming_an_ask_is_conditional_on_the_nonce_that_was_answered() {
+    fn one_ask_admits_one_ticket_and_a_retry_must_be_that_same_ticket() {
+        use crate::store::AskClaim;
+        let (_dir, store) = store();
+        store
+            .record_manifest_ask("npub1a", "criterion", "fp", "2026-01-01T00:00:00Z", "n-1")
+            .unwrap();
+
+        assert_eq!(
+            store.claim_manifest_ask("npub1a", "criterion", "n-1", "req-A").unwrap(),
+            AskClaim::Granted
+        );
+        // The same ticket may retry after a failed dial — that costs nothing and must stay possible.
+        assert_eq!(
+            store.claim_manifest_ask("npub1a", "criterion", "n-1", "req-A").unwrap(),
+            AskClaim::Granted
+        );
+        // A DIFFERENT ticket echoing the same nonce is refused, however many the peer invents.
+        for invented in ["req-B", "req-C", "req-D"] {
+            assert_eq!(
+                store.claim_manifest_ask("npub1a", "criterion", "n-1", invented).unwrap(),
+                AskClaim::ClaimedByAnother,
+                "a peer must not turn one ask into a dial per ticket"
+            );
+        }
+
+        // Answered → spent, durably, so a restart cannot resurrect the authorization.
+        store.spend_manifest_ask("npub1a", "criterion", "n-1").unwrap();
+        assert_eq!(
+            store.claim_manifest_ask("npub1a", "criterion", "n-1", "req-A").unwrap(),
+            AskClaim::Spent
+        );
+
+        // A fresh ask is a fresh authorization: new nonce, claim and spent flags cleared.
+        store
+            .record_manifest_ask("npub1a", "criterion", "fp", "2026-01-02T00:00:00Z", "n-2")
+            .unwrap();
+        assert_eq!(
+            store.claim_manifest_ask("npub1a", "criterion", "n-2", "req-E").unwrap(),
+            AskClaim::Granted
+        );
+        // …and the OLD nonce is dead.
+        assert_eq!(
+            store.claim_manifest_ask("npub1a", "criterion", "n-1", "req-A").unwrap(),
+            AskClaim::Unsolicited
+        );
+    }
+
+    /// A wrong nonce, an unknown peer, and a pre-ruling ask (empty stored nonce) are all
+    /// `Unsolicited` — fail closed by construction rather than by a branch.
+    #[test]
+    fn a_ticket_that_answers_no_ask_of_ours_is_never_granted() {
+        use crate::store::AskClaim;
+        let (_dir, store) = store();
+        store
+            .record_manifest_ask("npub1a", "criterion", "fp", "2026-01-01T00:00:00Z", "n-1")
+            .unwrap();
+        assert_eq!(
+            store.claim_manifest_ask("npub1a", "criterion", "wrong", "r").unwrap(),
+            AskClaim::Unsolicited
+        );
+        assert_eq!(
+            store.claim_manifest_ask("npub1zzz", "criterion", "n-1", "r").unwrap(),
+            AskClaim::Unsolicited
+        );
+        assert_eq!(
+            store.claim_manifest_ask("npub1a", "other", "n-1", "r").unwrap(),
+            AskClaim::Unsolicited
+        );
+        // An empty nonce on either side never matches.
+        assert_eq!(
+            store.claim_manifest_ask("npub1a", "criterion", "", "r").unwrap(),
+            AskClaim::Unsolicited
+        );
+    }
+
+    /// **A completing ticket must not spend a NEWER ask.** There is one trace entry per
+    /// `(npub, slug)`, so a re-ask overwrites it. If ticket A is in flight, the user re-asks (nonce
+    /// B), and A then completes, an unconditional write marks B spent — and the legitimate answer to
+    /// the new ask afterwards is refused, with no way for the user to see why.
+    #[test]
+    fn spending_an_ask_is_conditional_on_the_nonce_that_was_answered() {
         let (_dir, store) = store();
         store
             .record_manifest_ask("npub1a", "criterion", "fp", "2026-01-01T00:00:00Z", "nonce-A")
@@ -157,16 +243,17 @@ mod tests {
             .record_manifest_ask("npub1a", "criterion", "fp", "2026-01-01T00:05:00Z", "nonce-B")
             .unwrap();
 
-        // Ticket A now completes. It must NOT consume B's ask.
-        store.consume_manifest_ask("npub1a", "criterion", "nonce-A").unwrap();
+        // Ticket A now completes. It must NOT spend B's ask.
+        store.spend_manifest_ask("npub1a", "criterion", "nonce-A").unwrap();
         let asks = store.load_manifest_asks().unwrap();
-        let kept = asks.get("npub1a|criterion").expect("the newer ask survives an older completion");
+        let kept = asks.get("npub1a|criterion").expect("the newer ask is still there");
         assert_eq!(kept.nonce, "nonce-B");
+        assert!(!kept.spent, "an older completion must not spend the newer ask");
 
-        // And the ask that IS answered is consumed.
-        store.consume_manifest_ask("npub1a", "criterion", "nonce-B").unwrap();
+        // And the ask that IS answered is spent.
+        store.spend_manifest_ask("npub1a", "criterion", "nonce-B").unwrap();
         assert!(
-            !store.load_manifest_asks().unwrap().contains_key("npub1a|criterion"),
+            store.load_manifest_asks().unwrap()["npub1a|criterion"].spent,
             "one ask, one auto-dial — the answered ask is spent"
         );
     }
