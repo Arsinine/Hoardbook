@@ -898,6 +898,10 @@ impl DataStore {
                 fingerprint_seen: fingerprint_seen.to_string(),
                 sent_at: sent_at.to_string(),
                 nonce: nonce.to_string(),
+                // A re-ask is a fresh authorization: new nonce, so any prior claim or spent flag
+                // must be cleared with it.
+                claimed_by: None,
+                spent: false,
             },
         );
         self.save_manifest_asks(&m)
@@ -908,19 +912,59 @@ impl DataStore {
     ///
     /// Deliberately not called on a failed attempt: a dial that never connected has cost nothing and
     /// must remain retryable, exactly as the ticket itself does.
-    /// **Conditional on `expected_nonce`.** Removing unconditionally loses a *newer* ask: if ticket A
-    /// is in flight, the user re-asks (minting nonce B, which overwrites the single `(npub, slug)`
-    /// entry), and A then completes, an unconditional delete throws away B — and the legitimate
-    /// answer to the new ask afterwards reads as unsolicited. Only the ask that was actually answered
-    /// is consumed.
-    pub fn consume_manifest_ask(&self, npub: &str, slug: &str, expected_nonce: &str) -> Result<()> {
+    /// **Atomically claim this ask for one ticket, before any dial.**
+    ///
+    /// The whole check-and-claim happens under [`MANIFEST_ASKS_LOCK`], which is what makes it a gate
+    /// rather than a suggestion. Validating and *then* dialing was a TOCTOU: two concurrent invokes
+    /// carrying different peer-crafted tickets with the same valid nonce both passed and both
+    /// connected. **Validation that is not a claim is not a gate.**
+    ///
+    /// Re-claiming with the *same* `request_id` is granted, so a failed dial can be retried; a
+    /// different one is refused until the user makes a fresh ask. That is what stops a peer sending
+    /// ticket after ticket — each with a new `request_id` and a new node address — and collecting an
+    /// automatic dial per attempt.
+    pub fn claim_manifest_ask(
+        &self,
+        npub: &str,
+        slug: &str,
+        nonce: &str,
+        request_id: &str,
+    ) -> Result<AskClaim> {
         let _guard = MANIFEST_ASKS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut m = self.load_manifest_asks()?;
         let key = manifest_ask_key(npub, slug);
-        let matches = m.get(&key).is_some_and(|a| a.nonce == expected_nonce);
-        if matches {
-            m.remove(&key);
-            self.save_manifest_asks(&m)?;
+        let Some(ask) = m.get_mut(&key) else { return Ok(AskClaim::Unsolicited) };
+        // An empty nonce on either side never matches — a pre-ruling ask fails closed by
+        // construction rather than by a branch.
+        if ask.nonce.is_empty() || nonce.is_empty() || ask.nonce != nonce {
+            return Ok(AskClaim::Unsolicited);
+        }
+        if ask.spent {
+            return Ok(AskClaim::Spent);
+        }
+        match ask.claimed_by.as_deref() {
+            Some(owner) if owner != request_id => return Ok(AskClaim::ClaimedByAnother),
+            Some(_) => return Ok(AskClaim::Granted),
+            None => {}
+        }
+        ask.claimed_by = Some(request_id.to_string());
+        self.save_manifest_asks(&m)?;
+        Ok(AskClaim::Granted)
+    }
+
+    /// Mark the ask answered — **durably**, so a restart cannot re-authorize it. The in-memory
+    /// marker this replaces died with the page.
+    ///
+    /// Conditional on `expected_nonce`: a re-ask made while an older ticket was in flight must not be
+    /// marked spent by that older ticket's completion.
+    pub fn spend_manifest_ask(&self, npub: &str, slug: &str, expected_nonce: &str) -> Result<()> {
+        let _guard = MANIFEST_ASKS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut m = self.load_manifest_asks()?;
+        if let Some(ask) = m.get_mut(&manifest_ask_key(npub, slug)) {
+            if ask.nonce == expected_nonce {
+                ask.spent = true;
+                self.save_manifest_asks(&m)?;
+            }
         }
         Ok(())
     }
@@ -998,7 +1042,7 @@ impl DataStore {
 ///
 /// **One shared static, not one per function.** A `static` declared inside a function body is its own
 /// distinct item, so the two locks this replaced never serialized against *each other* — a
-/// `record_manifest_ask` and a `consume_manifest_ask` overlapping could interleave their
+/// `record_manifest_ask` and a `claim_manifest_ask` overlapping could interleave their
 /// load→modify→save and lose the newer write entirely.
 static MANIFEST_ASKS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1058,6 +1102,30 @@ pub struct ManifestAsk {
     /// the user asks again. Fail closed by construction rather than by a branch.
     #[serde(default)]
     pub nonce: String,
+    /// The **one** ticket allowed to answer this ask — its `request_id`, recorded durably the first
+    /// time a redemption claims it.
+    ///
+    /// Binding the ticket to a nonce was not enough. A failed dial released the ask, and the peer
+    /// (which *receives* the nonce, being the party asked) could then send a fresh ticket with a new
+    /// `request_id` and **a new node address**, which claimed it again.
+    #[serde(default)]
+    pub claimed_by: Option<String>,
+    /// Answered. Durable, so a restart cannot resurrect the authorization.
+    #[serde(default)]
+    pub spent: bool,
+}
+
+/// Why a redemption may not proceed. Anything but [`AskClaim::Granted`] must not dial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskClaim {
+    /// This ticket owns the ask — dial.
+    Granted,
+    /// No ask, or the nonce does not match: we never asked for this.
+    Unsolicited,
+    /// Already answered.
+    Spent,
+    /// A different ticket already claimed this ask.
+    ClaimedByAnother,
 }
 
 /// The on-disk key for an ask trace: `"{npub}|{slug}"`. The pipe is unambiguous because npubs and

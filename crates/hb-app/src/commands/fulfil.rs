@@ -28,7 +28,7 @@ use crate::manifest_source::StoreManifestSource;
 use crate::net::SharedRelay;
 use crate::store::{DataStore, IssuedTicketRecord};
 use crate::transport::{fetch_manifest, issue_ticket};
-use crate::transport_state::{ensure_endpoint, lease_dial, Role, SharedEndpoint};
+use crate::transport_state::{ensure_endpoint, Role, SharedEndpoint};
 
 fn cmd_err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
@@ -114,7 +114,7 @@ pub async fn send_full_list(
         browse_key.clone(),
     );
     // Fulfilling must LISTEN — the asker dials us.
-    let ep = ensure_endpoint(&endpoint, &own_npub, &transport_key, source, Role::Listen)
+    let ep = ensure_endpoint(&endpoint, &own_npub, &identity, &transport_key, source, Role::Listen)
         .await
         .map_err(|e| {
             format!("Could not start the transport ({e}). Export the list instead: Home → ⋯ → Export.")
@@ -195,28 +195,41 @@ pub async fn redeem_manifest_ticket(
     // binding for this identity; in the `DialOnly` path it is simply never served from.
     let source: Arc<dyn crate::transport::ManifestSource> =
         StoreManifestSource::new((*store).clone(), id_clone, browse_key);
-    // **The nonce gate, enforced HERE and not only in the UI.** The render-time check in Chat is a
-    // usability affordance; this is the boundary. A UI bug, a replayed invoke, or anything else that
-    // reaches this command must not be able to make us dial an address we were not invited to — and
-    // "dial" is the whole exposure, because it hands the peer our IP.
+    // **The gate is a durable ATOMIC CLAIM, taken before any dial — not a validation.**
     //
-    // The stored ask is the only thing the peer cannot forge: it was written locally, after OUR
-    // request published successfully.
-    let asks = store.load_manifest_asks().map_err(cmd_err)?;
-    let ticket_nonce = ticket.ask_nonce.as_deref().unwrap_or_default();
-    let solicited = asks
-        .get(&crate::store::manifest_ask_key(&npub, &ticket.slug))
-        .is_some_and(|a| !a.nonce.is_empty() && a.nonce == ticket_nonce);
-    if !solicited {
-        return Err("That link doesn't answer a request you sent, so nothing was fetched.".into());
+    // Validating and then dialing was a TOCTOU: two concurrent invokes carrying different
+    // peer-crafted tickets with the same valid nonce both passed and both connected. And releasing
+    // the ask on failure let a peer send ticket after ticket — each with a fresh `request_id` and a
+    // fresh node address — getting an automatic dial per attempt with no user action.
+    //
+    // `claim_manifest_ask` does the whole check-and-claim under one lock and records the winning
+    // `request_id` **durably**, so: one ask admits one ticket, a retry must be that same ticket, and
+    // a restart cannot resurrect the authorization. This is the security boundary; the ledger in the
+    // Chat page is only render-idempotence.
+    let claim = store
+        .claim_manifest_ask(
+            &npub,
+            &ticket.slug,
+            ticket.ask_nonce.as_deref().unwrap_or_default(),
+            &ticket.request_id,
+        )
+        .map_err(cmd_err)?;
+    match claim {
+        crate::store::AskClaim::Granted => {}
+        crate::store::AskClaim::Unsolicited => {
+            return Err("That link doesn't answer a request you sent, so nothing was fetched.".into())
+        }
+        crate::store::AskClaim::Spent => {
+            return Err("You've already received this list. Ask again if you want a fresh copy.".into())
+        }
+        crate::store::AskClaim::ClaimedByAnother => {
+            return Err("Another link is already answering that request, so nothing was fetched.".into())
+        }
     }
 
-    let ep = ensure_endpoint(&endpoint, &own_npub, &transport_key, source, Role::DialOnly)
+    let ep = ensure_endpoint(&endpoint, &own_npub, &identity, &transport_key, source, Role::DialOnly)
         .await
         .map_err(cmd_err)?;
-    // Held for the whole dial so a concurrent fulfil upgrading this endpoint waits instead of
-    // closing the socket mid-transfer.
-    let _lease = lease_dial(&endpoint).await;
 
     // The gate runs INSIDE `fetch_manifest`, before the acknowledgement — see its doc comment. If it
     // ran out here the ACK would already have been sent, and a manifest we reject (wrong author,
@@ -261,12 +274,18 @@ pub async fn redeem_manifest_ticket(
     // otherwise re-open the reusable authorization this whole ruling removes. Logged loudly; the
     // manifest is already in hand, so failing the command would report a delivery the user received
     // as failed.
-    if let Err(e) =
-        store.consume_manifest_ask(&npub, &ticket.slug, ticket.ask_nonce.as_deref().unwrap_or(""))
-    {
+    // Mark it answered. The durable CLAIM already bounds the damage if this write fails — the ask
+    // stays bound to this one `request_id`, so no *new* ticket can take it even across a restart. The
+    // residual is a replay of this same ticket dialing the same address once more, which is why the
+    // failure is loud rather than silent.
+    if let Err(e) = store.spend_manifest_ask(
+        &npub,
+        &ticket.slug,
+        ticket.ask_nonce.as_deref().unwrap_or_default(),
+    ) {
         tracing::error!(
-            "could not consume the manifest ask after redemption; the in-session spent-marker is \
-             the only thing preventing re-authorization until restart: {e}"
+            "could not mark the manifest ask spent after redemption; it stays bound to this ticket, \
+             but a replay of this exact ticket could dial once more: {e}"
         );
     }
     Ok(imported)
