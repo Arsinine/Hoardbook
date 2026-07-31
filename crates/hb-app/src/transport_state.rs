@@ -5,8 +5,13 @@
 //!
 //! **Why lazy rather than at startup.** A node address is only obtainable from a bound endpoint, so
 //! the owner cannot issue a ticket without one — binding on the first fulfil is therefore not a
-//! shortcut, it is the earliest honest moment. A user who never shares a full list never binds a QUIC
-//! endpoint or talks to a relay server, which is the right default for a directory app.
+//! shortcut, it is the earliest honest moment. A user who never sends *and never receives* a full
+//! list never binds a QUIC endpoint or talks to a relay server, which is the right default for a
+//! directory app.
+//!
+//! **Two kinds of binding, not one** ([`Role`], owner ruling ③ 2026-07-31). Fulfilling must LISTEN.
+//! Redeeming only needs to DIAL, and binding a listening endpoint for it would leave the redeemer
+//! answering anyone who holds its permanently-stable node id — see [`crate::transport::bind_client_endpoint`].
 //!
 //! **But an unspent ticket outlives the session that issued it** (tickets are valid until redeemed,
 //! by owner ruling), and the transport secret is persisted precisely so the address in an old ticket
@@ -20,7 +25,20 @@ use anyhow::Result;
 use tokio::sync::RwLock;
 
 use crate::identity_state::SessionTransportKey;
-use crate::transport::{bind_endpoint, ManifestPlane, ManifestSource};
+use crate::transport::{bind_client_endpoint, bind_endpoint, ManifestPlane, ManifestSource};
+
+/// What a caller needs the endpoint FOR (owner ruling ③, 2026-07-31).
+///
+/// A redeemer only dials, and a listening endpoint would leave it answering anyone holding its
+/// (permanently stable) node id for the rest of the session — see [`bind_client_endpoint`] for why
+/// that matters. Only fulfilling needs to serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Redeeming a ticket: dial out, advertise nothing, accept nothing.
+    DialOnly,
+    /// Fulfilling a request, or honouring an outstanding ticket after a restart.
+    Listen,
+}
 
 /// The session's endpoint plus the npub that bound it. `None` until something needs it.
 ///
@@ -37,6 +55,10 @@ pub struct BoundPlane {
     pub endpoint: iroh::Endpoint,
     /// The npub whose keys the running accept loop serves from.
     pub owner_npub: String,
+    /// Whether this binding **listens** (advertises the ALPN and runs an accept loop) or is
+    /// dial-only. A redeemer needs only to dial (owner ruling ③), and a client-only binding must be
+    /// upgraded before it can serve.
+    pub listening: bool,
 }
 
 /// How many redemptions may be served concurrently.
@@ -65,25 +87,44 @@ pub async fn ensure_endpoint(
     owner_npub: &str,
     transport_key: &SessionTransportKey,
     source: Arc<dyn ManifestSource>,
+    need: Role,
 ) -> Result<iroh::Endpoint> {
+    // A listening binding satisfies a redeemer too; a client-only one does not satisfy a fulfiller.
+    let satisfies = |b: &BoundPlane| {
+        b.owner_npub == owner_npub && (b.listening || need == Role::DialOnly)
+    };
     if let Some(bound) = shared.read().await.as_ref() {
-        if bound.owner_npub == owner_npub {
+        if satisfies(bound) {
             return Ok(bound.endpoint.clone());
         }
     }
     let mut guard = shared.write().await;
     // Re-check: another task may have bound while we waited for the write lock.
     if let Some(bound) = guard.as_ref() {
-        if bound.owner_npub == owner_npub {
+        if satisfies(bound) {
             return Ok(bound.endpoint.clone());
         }
-        // A stale binding from a previous identity. Closing the endpoint ends its accept loop (the
-        // `while let Some(..) = endpoint.accept()` returns `None`), which drops the old source.
+        // Either a stale identity, or a client-only binding that now has to serve. Both need the
+        // socket released first — **two endpoints cannot share one secret**. Closing also ends any
+        // accept loop (`endpoint.accept()` returns `None`), dropping the old source.
+        //
+        // The node identity is derived from the same persisted secret, so an outstanding ticket
+        // still resolves across this rebind.
         bound.endpoint.close().await;
     }
-    let endpoint = bind_endpoint(transport_key.bytes()).await?;
-    spawn_accept_loop(endpoint.clone(), ManifestPlane::new(source));
-    *guard = Some(BoundPlane { endpoint: endpoint.clone(), owner_npub: owner_npub.to_string() });
+    let listening = need == Role::Listen;
+    let endpoint = if listening {
+        let ep = bind_endpoint(transport_key.bytes()).await?;
+        spawn_accept_loop(ep.clone(), ManifestPlane::new(source));
+        ep
+    } else {
+        bind_client_endpoint(transport_key.bytes()).await?
+    };
+    *guard = Some(BoundPlane {
+        endpoint: endpoint.clone(),
+        owner_npub: owner_npub.to_string(),
+        listening,
+    });
     Ok(endpoint)
 }
 
@@ -148,7 +189,7 @@ pub async fn rebind_if_tickets_outstanding(
     if !outstanding {
         return;
     }
-    if let Err(e) = ensure_endpoint(shared, owner_npub, transport_key, source).await {
+    if let Err(e) = ensure_endpoint(shared, owner_npub, transport_key, source, Role::Listen).await {
         tracing::warn!("manifest plane: could not rebind for an outstanding ticket: {e}");
     }
 }

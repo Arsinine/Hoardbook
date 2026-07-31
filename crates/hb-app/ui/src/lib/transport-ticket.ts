@@ -176,6 +176,12 @@ export const SEND_FULL_LIST_LABEL = 'Send the full list';
 export const SEND_FULL_LIST_TOAST = (slug: string) =>
 	`Sent the full list of “${slug}”. They get the listing — your files stay where they are.`;
 
+/** Shown on the fulfil card next to the send button. Says the thing owner ruling ② made explicit:
+ *  what crosses is the collection **as it stands when they fetch it**, not a frozen copy of what you
+ *  are looking at now. Tickets do not expire, so that can be later than you expect. */
+export const SEND_FULL_LIST_CURRENT_TREE =
+	"They'll get the list as it stands when they fetch it, not a copy of it right now.";
+
 /** Owner-side: export is the standing fallback, and stays reachable whether or not the transport
  *  works. Shown beside the send button, not instead of it. */
 export const SEND_FULL_LIST_FALLBACK = 'Or export the file and hand it over yourself.';

@@ -71,6 +71,10 @@ impl ManifestSource for StoreManifestSource {
 
     /// Build the manifest for an authorized request, from the same pure core `export_manifest`
     /// wraps — so the transport can never serve a tree the export would have described differently.
+    ///
+    /// **Built from the collection as it is NOW, not as it was at approval** (owner ruling ②,
+    /// 2026-07-31). Tickets do not expire, so this can deliver a newer list than the owner reviewed.
+    /// Ratified as intended: see `send_full_list`'s note for why freezing it would be worse.
     /// Sealing is what applies the 8 MiB ceiling; an over-cap collection is refused here, before a
     /// byte moves, by [`ManifestPayload::seal`].
     fn payload(&self, slug: &str) -> Result<ManifestPayload> {
