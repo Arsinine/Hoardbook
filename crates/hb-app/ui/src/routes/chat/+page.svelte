@@ -499,8 +499,20 @@
 		return redemptions.get(requestId);
 	}
 
-	function retryRedemption(npub: string | null, ticketJson: string, requestId: string) {
-		if (!npub || !redemptions.claimRetry(requestId)) return;
+	/** Retry after a failure. **`wasAsked` is re-checked here even though an unsolicited ticket can
+	 *  never reach the `failed` state** (it never touches the ledger, so `claimRetry` refuses it).
+	 *  Relying on that is a transitive argument through the ledger's state machine; the invariant
+	 *  "we dial only in reply to something we sent" is worth stating at *every* site that can dial, so
+	 *  a future change to the ledger cannot quietly open one. Same discipline as the slug binding,
+	 *  which is checked on both sides for two different reasons. */
+	function retryRedemption(
+		npub: string | null,
+		slug: string,
+		ticketJson: string,
+		requestId: string,
+	) {
+		if (!npub || !wasAsked(manifestAsks, npub, slug)) return;
+		if (!redemptions.claimRetry(requestId)) return;
 		redemptionTick += 1;
 		void redeem(npub, requestId, ticketJson);
 	}
@@ -1250,7 +1262,12 @@
 											)}
 											quarantined={false}
 											onretry={() =>
-												retryRedemption(selectedPeer?.npub ?? null, msg.content, tk.requestId)}
+												retryRedemption(
+													selectedPeer?.npub ?? null,
+													tk.slug,
+													msg.content,
+													tk.requestId,
+												)}
 										/>
 									{/if}
 								</div>
