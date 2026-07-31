@@ -48,8 +48,14 @@
 //! refuses a redeemer whose contact standing has changed since approval (the revocation property
 //! that "valid until redeemed" would otherwise cost).
 //!
-//! The ticket rode a **sealed NIP-17 DM to exactly one recipient**, so presenting it back is what
-//! proves receipt. Note what the capability is *not*: read access. The payload stays browse-key
+//! The ticket rode a **sealed NIP-17 DM to one recipient**, so presenting it back is evidence of
+//! receipt — but note precisely what it is: a **BEARER capability**. The owner verifies the ticket
+//! and the *stored recipient's* live standing; it does not authenticate the connecting peer as that
+//! recipient, and it cannot, because this design deliberately has no `npub`→node-key map to check
+//! against. A recipient who forwards the ticket JSON lets someone else dial and spend it. What that
+//! costs is the OWNER's address plus one ciphertext delivery — binding a ticket to the asker's
+//! transport identity would need the asker's node key on the wire, which is an owner-level protocol
+//! decision, not a local fix. Note also what the capability is *not*: read access. The payload stays browse-key
 //! encrypted, so a ticket without the share code buys ciphertext — the distinction `SEMANTICS.md`
 //! reserves between a share code (grants *read*) and a transport ticket (grants *connect and
 //! fetch*).
@@ -158,7 +164,11 @@ pub trait ManifestSource: Send + Sync + 'static {
     fn payload(&self, slug: &str) -> Result<ManifestPayload>;
 
     /// Record the receipt, so a replay of the same ticket is refused by the next `issued` call.
-    fn record_consumed(&self, receipt: &ConsumedTicket);
+    ///
+    /// **Fallible on purpose.** A lost write leaves the ticket unspent on disk, so a replay would be
+    /// served a second manifest — the one-ticket-one-delivery property is only as durable as this
+    /// call. Returning `Err` lets [`ManifestPlane`] fail closed instead of merely logging.
+    fn record_consumed(&self, receipt: &ConsumedTicket) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +354,13 @@ pub(crate) async fn serve_manifest_stream(
 pub struct ManifestPlane {
     source: Arc<dyn ManifestSource>,
     in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Requests whose receipt could NOT be persisted. Held for the process lifetime and refused by
+    /// [`ManifestPlane::claim`], so a durable-write failure cannot become a second delivery.
+    ///
+    /// **Honest limit, stated rather than implied:** this is per-process. A receipt write that fails
+    /// and is followed by a restart leaves the ticket redeemable again — closing that needs a durable
+    /// spent-marker written before the ACK, which is a protocol change, not a local fix.
+    poisoned: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Removes its `request_id` from the in-flight set on drop, so a panic or an early return cannot
@@ -363,11 +380,19 @@ impl Drop for InFlightGuard<'_> {
 
 impl ManifestPlane {
     pub fn new(source: Arc<dyn ManifestSource>) -> Arc<Self> {
-        Arc::new(Self { source, in_flight: std::sync::Mutex::new(std::collections::HashSet::new()) })
+        Arc::new(Self {
+            source,
+            in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            poisoned: std::sync::Mutex::new(std::collections::HashSet::new()),
+        })
     }
 
     /// Claim `request_id` for this redemption, or `None` if one is already running.
     fn claim(&self, request_id: &str) -> Option<InFlightGuard<'_>> {
+        // A request whose receipt we failed to persist is never served again this process.
+        if self.poisoned.lock().map(|p| p.contains(request_id)).unwrap_or(true) {
+            return None;
+        }
         let mut set = self.in_flight.lock().ok()?;
         if !set.insert(request_id.to_string()) {
             return None;
@@ -434,7 +459,20 @@ impl ManifestPlane {
         // is what holds it there.
         match served {
             Ok(Some((receipt, _payload))) => {
-                self.source.record_consumed(&receipt);
+                // Fail CLOSED on a persistence failure: the asker HAS the manifest (they ACKed), so
+                // we must not let the ticket look unspent. Poisoning refuses any replay for the rest
+                // of this process. Previously this was logged and moved on — a hole documented in a
+                // comment instead of being closed.
+                if let Err(e) = self.source.record_consumed(&receipt) {
+                    if let Ok(mut p) = self.poisoned.lock() {
+                        p.insert(receipt.request_id().to_string());
+                    }
+                    tracing::error!(
+                        request_id = receipt.request_id(),
+                        "could not persist a manifest receipt; refusing further redemptions of this \
+                         ticket for the rest of this session: {e}"
+                    );
+                }
                 conn.close(0u32.into(), b"delivered");
                 Ok(())
             }
@@ -736,6 +774,9 @@ pub(crate) mod tests {
         /// "lookup fell through to the wrong collection" bug, which no honest implementation would
         /// write on purpose and which the slug binding exists to catch.
         pub serve_instead: Mutex<Option<ManifestPayload>>,
+        /// Make `record_consumed` fail, standing in for a full disk or a permission error — the case
+        /// that used to be logged and stepped over, leaving the ticket replayable.
+        pub fail_receipt: Mutex<bool>,
         /// Rendezvous used only by the concurrency test — see [`Self::rendezvous`].
         rendezvous: Option<Rendezvous>,
     }
@@ -778,6 +819,7 @@ pub(crate) mod tests {
                 consumed: Mutex::new(Vec::new()),
                 payload,
                 serve_instead: Mutex::new(None),
+                fail_receipt: Mutex::new(false),
                 rendezvous: None,
             })
         }
@@ -822,8 +864,14 @@ pub(crate) mod tests {
             Ok(self.payload.clone())
         }
 
-        fn record_consumed(&self, receipt: &ConsumedTicket) {
+        fn record_consumed(&self, receipt: &ConsumedTicket) -> Result<()> {
+            // A test source can be told to fail its receipt write, which is how the fail-closed
+            // poisoning is exercised without a real disk error.
+            if *self.fail_receipt.lock().unwrap() {
+                return Err(anyhow!("simulated receipt-write failure"));
+            }
             self.consumed.lock().unwrap().push(receipt.clone());
+            Ok(())
         }
     }
 
@@ -1364,6 +1412,53 @@ pub(crate) mod tests {
                 .await
                 .expect("the ticket is still good after a rejection");
             await_receipt(&source).await;
+
+            client.close().await;
+            server.close().await;
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// **A receipt that could not be persisted must not leave the ticket replayable.**
+    ///
+    /// The asker has ACKed, so it *has* the manifest. If the durable write then fails, the ticket
+    /// still reads unspent on disk and a second connection would be served a second delivery —
+    /// breaking one-ticket-one-delivery at exactly the moment the evidence says it was delivered.
+    /// This was previously logged and stepped over: the hole was described in a comment instead of
+    /// being closed, which is the same shape as the guard that asserted a property it never
+    /// implemented.
+    ///
+    /// The fix is per-process poisoning, and its limit is stated rather than implied: a restart
+    /// after a failed write does make the ticket redeemable again. Closing *that* needs a durable
+    /// spent-marker written before the ACK, which is a protocol change.
+    #[tokio::test]
+    async fn a_failed_receipt_write_poisons_the_ticket_instead_of_allowing_a_replay() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let (server, source, ticket) = spawn_plane(50, "small").await;
+            let client = bind_local_endpoint(&rand::random(), vec![]).await;
+
+            *source.fail_receipt.lock().unwrap() = true;
+
+            // The delivery itself succeeds — the asker gets the manifest and acknowledges it.
+            fetch_manifest(&client, &ticket, |_| Ok(()))
+                .await
+                .expect("the manifest is delivered; only the RECEIPT write fails");
+            assert!(
+                source.consumed.lock().unwrap().is_empty(),
+                "the receipt write failed, so nothing was recorded — this is the setup, not the claim"
+            );
+
+            // The claim: a replay is refused anyway, because the plane poisoned the request.
+            let replay = fetch_manifest(&client, &ticket, |_| Ok(()))
+                .await
+                .expect_err("a ticket whose receipt could not be persisted must not be served again");
+            assert!(
+                replay.to_string().contains(REFUSAL_NO_MATCH)
+                    || replay.to_string().contains("already being redeemed")
+                    || replay.to_string().contains("ticket refused"),
+                "the replay is refused, got: {replay}"
+            );
 
             client.close().await;
             server.close().await;

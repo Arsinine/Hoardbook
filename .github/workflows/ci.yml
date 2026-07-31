@@ -171,7 +171,17 @@ jobs:
           crates/hb-app/ui/src/lib/request-inbox.ts:1
           crates/hb-app/ui/src/routes/+page.svelte:1"
           fail=0
-          actual=$(grep -rlI 'Mascara' crates/*/src crates/hb-app/ui/src 2>/dev/null | sort -u)
+          # Scans every TRACKED file, not just the two src roots. Scanning `crates/*/src` +
+          # `crates/hb-app/ui/src` left `build.rs`, the Cargo manifests, the vite/svelte configs and
+          # anything under `crates/*/tests/` unwatched — a mention there would have stayed green,
+          # which is the same "the list named a layer and missed the ones under it" failure this
+          # probe exists to end. `git grep` also means a new top-level directory is covered the day
+          # it appears, with no list to update.
+          #
+          # One deliberate, documented exclusion: this workflow file itself. A guard has to name the
+          # thing it forbids. (Same reasoning as excluding `mas-inv5-no-download.test.ts` from the
+          # filename probe above — a probe that flags its own guard is broken.)
+          actual=$(git grep -lI 'Mascara' -- . ':!.github/workflows/ci.yml' | sort -u)
           expected=$(printf '%s\n' "$ALLOWED" | sed 's/^ *//; s/:[0-9]*$//' | sort -u)
           if newcomers=$(comm -23 <(echo "$actual") <(echo "$expected")) && [ -n "$newcomers" ]; then
             echo "::error::The retired Mascara-courier framing appeared in files that are not allowed to mention it:"
