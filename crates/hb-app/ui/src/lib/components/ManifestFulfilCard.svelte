@@ -19,7 +19,11 @@
 		MANIFEST_BIG_RELAY_LINK,
 		type ManifestFulfilState,
 	} from '$lib/manifest-fulfil.js';
-	import { SEND_FULL_LIST_LABEL, SEND_FULL_LIST_FALLBACK } from '$lib/transport-ticket.js';
+	import {
+		SEND_FULL_LIST_LABEL,
+		SEND_FULL_LIST_FALLBACK,
+		SEND_FULL_LIST_CURRENT_TREE,
+	} from '$lib/transport-ticket.js';
 
 	interface Props {
 		/** The pure-derived state for this request (from `deriveManifestFulfil`). Carries the slug. */
@@ -77,6 +81,9 @@
 				Export manifest…
 			</button>
 		</div>
+		<!-- Owner ruling ②: approval authorizes the COLLECTION, not a snapshot. Said out loud here so
+		     the hoarder is not surprised by a later fetch returning a newer tree than they reviewed. -->
+		<div class="mf-card-secondary muted">{SEND_FULL_LIST_CURRENT_TREE}</div>
 		<div class="mf-card-secondary muted">{SEND_FULL_LIST_FALLBACK}</div>
 		<div class="mf-card-secondary" class:muted={!hasBigRelay}>{secondary}</div>
 	{:else if state.kind === 'private'}

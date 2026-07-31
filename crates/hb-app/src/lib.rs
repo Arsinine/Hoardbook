@@ -98,10 +98,9 @@ fn build_system_tray(app: &mut tauri::App) -> tauri::Result<()> {
 ///   1. `transport_state::rebind_if_tickets_outstanding` at startup, when an unspent ticket is on
 ///      the books (a ticket outlives the session that issued it);
 ///   2. `send_full_list`, when the owner approves a request;
-///   3. **`redeem_manifest_ticket`** — the ASKER binds too, in order to dial. Today that also starts
-///      the accept loop, because `ensure_endpoint` does both. A redeemer does not need to listen, so
-///      a client-only endpoint would be a genuine privacy improvement; it is recorded as open work
-///      rather than implied away here.
+///   3. **`redeem_manifest_ticket`** — the ASKER binds too, in order to dial. Since owner ruling ③
+///      that binding is **dial-only** (`Role::DialOnly`): no advertised ALPN and no accept loop, so
+///      redeeming does not leave this node answering anyone who holds its node id.
 ///
 /// So the honest statement is: a user who never sends *and never receives* a full list never opens
 /// a QUIC endpoint.

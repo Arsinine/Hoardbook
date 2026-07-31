@@ -28,7 +28,7 @@ use crate::manifest_source::StoreManifestSource;
 use crate::net::SharedRelay;
 use crate::store::{DataStore, IssuedTicketRecord};
 use crate::transport::{fetch_manifest, issue_ticket};
-use crate::transport_state::{ensure_endpoint, SharedEndpoint};
+use crate::transport_state::{ensure_endpoint, Role, SharedEndpoint};
 
 fn cmd_err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
@@ -68,9 +68,17 @@ fn new_request_id() -> String {
 /// check it, and that check is what stops a peer minting tickets we would auto-dial. `None` when the
 /// request predates the field; the asker then refuses to auto-dial, which is the intended outcome.
 ///
-/// 3. **The payload built here is discarded.** It exists to prove the manifest is producible and
-///    within the ceiling; the plane rebuilds it at redeem time, from the same pure core, so the asker
-///    gets the tree as it is *then* rather than a snapshot frozen at approval.
+/// 3. **The payload built here is discarded — approval authorizes THE COLLECTION, not a snapshot.**
+///    **Owner ruling ② (2026-07-31), ratified explicitly** after a review flagged the consequence:
+///    tickets never expire, so an approval given today can deliver a materially newer list months
+///    later, including files added since. That is intended. The envelope built here exists only to
+///    prove the manifest is producible and within the ceiling; the plane rebuilds it at redeem time
+///    from the same pure core, so the asker gets the tree as it is *then*.
+///
+///    **Do not "fix" this into a snapshot.** Freezing the payload at approval would make an unredeemed
+///    ticket serve a stale list forever, which is the failure the staleness gates exist to prevent.
+///    If the consent concern is ever revisited, the answer is re-approval on change, not a frozen
+///    artifact — and that is an owner ruling, not a refactor.
 #[tauri::command]
 pub async fn send_full_list(
     npub: String,
@@ -105,11 +113,12 @@ pub async fn send_full_list(
         id_clone.clone(),
         browse_key.clone(),
     );
-    let ep = ensure_endpoint(&endpoint, &own_npub, &transport_key, source).await.map_err(|e| {
-        format!(
-            "Could not start the transport ({e}). Export the list instead: Home → ⋯ → Export."
-        )
-    })?;
+    // Fulfilling must LISTEN — the asker dials us.
+    let ep = ensure_endpoint(&endpoint, &own_npub, &transport_key, source, Role::Listen)
+        .await
+        .map_err(|e| {
+            format!("Could not start the transport ({e}). Export the list instead: Home → ⋯ → Export.")
+        })?;
 
     let request_id = new_request_id();
     let ticket =
@@ -177,12 +186,18 @@ pub async fn redeem_manifest_ticket(
         (id.identity.clone(), id.browse_key.clone(), id.transport_key.clone(), id.npub())
     };
 
-    // The asker needs an endpoint to dial *from*. `ensure_endpoint` also arms the accept loop, which
-    // is correct rather than incidental: redeeming and fulfilling are the same node's two roles, and
-    // the source it serves from is this node's own collections either way.
+    // **Dial-only** (owner ruling ③): the asker needs to connect, not to be connectable. Binding a
+    // listening endpoint here used to leave this node answering anyone holding its permanently-stable
+    // node id — a probeable liveness oracle for every owner it had ever redeemed from, which is
+    // exactly what presence carrying no address exists to prevent.
+    //
+    // The source is still constructed because `ensure_endpoint` may find (or need) a listening
+    // binding for this identity; in the `DialOnly` path it is simply never served from.
     let source: Arc<dyn crate::transport::ManifestSource> =
         StoreManifestSource::new((*store).clone(), id_clone, browse_key);
-    let ep = ensure_endpoint(&endpoint, &own_npub, &transport_key, source).await.map_err(cmd_err)?;
+    let ep = ensure_endpoint(&endpoint, &own_npub, &transport_key, source, Role::DialOnly)
+        .await
+        .map_err(cmd_err)?;
 
     // The gate runs INSIDE `fetch_manifest`, before the acknowledgement — see its doc comment. If it
     // ran out here the ACK would already have been sent, and a manifest we reject (wrong author,

@@ -638,6 +638,32 @@ pub async fn bind_endpoint(transport_secret: &[u8; 32]) -> Result<iroh::Endpoint
         .map_err(|e| anyhow!("bind the manifest transport endpoint: {e}"))
 }
 
+/// Bind an endpoint that can **dial but not be dialled** — no advertised ALPN, and the caller starts
+/// no accept loop (owner ruling ③, 2026-07-31).
+///
+/// **Why a redeemer should not listen.** Redeeming reveals our node id and IP to the owner; that much
+/// is unavoidable, because we dial them. What a *listening* endpoint adds is durable: the transport
+/// secret is persisted, so that node identity is stable forever, and an accept loop answers anyone
+/// who has it. They get no data — `issued()` returns `None` and they get the standard refusal — but
+/// they get **liveness**, on demand, for as long as the app runs.
+///
+/// That makes every asker a probeable presence oracle for every owner they have ever redeemed from,
+/// which contradicts the design elsewhere: presence is a **signed beacon with a TTL that you
+/// publish**, never something a third party can poll. `presence_carries_no_address_or_node_key` keeps
+/// that true for the beacon; this keeps it true for the transport.
+///
+/// **This is hardening, not a wall.** An owner mid-redemption still sees us, and someone holding our
+/// node id can still learn something from how a dial fails. It removes the standing, always-on answer.
+pub async fn bind_client_endpoint(transport_secret: &[u8; 32]) -> Result<iroh::Endpoint> {
+    iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(iroh::SecretKey::from_bytes(transport_secret))
+        // No `.alpns(..)`: we advertise nothing, so there is no protocol to accept. Connecting needs
+        // no advertised ALPN — every client in this module's tests binds exactly this way.
+        .bind()
+        .await
+        .map_err(|e| anyhow!("bind the manifest transport client endpoint: {e}"))
+}
+
 /// The local endpoint's dialable address, in the form a ticket carries it.
 ///
 /// `hb-core` treats `TransportTicket::node_addr` as an **opaque string** and has no iroh dependency,
