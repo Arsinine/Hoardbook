@@ -61,7 +61,7 @@ mod tests {
 
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
             for round in 0..3 {
-                let err = fetch_manifest(&client, &ticket)
+                let err = fetch_manifest(&client, &ticket, |_| Ok(()))
                     .await
                     .expect_err("a blocked redeemer must be refused");
                 let msg = err.to_string();

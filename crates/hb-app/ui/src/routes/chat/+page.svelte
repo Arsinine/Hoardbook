@@ -34,6 +34,7 @@
 		exportManifest,
 		sendFullList,
 		redeemManifestTicket,
+		getManifestAsks,
 		getSettings,
 	} from '$lib/api.js';
 	import { relayWhyHint } from '$lib/relay-health.js';
@@ -63,6 +64,7 @@
 		transportTicketHint,
 		RedemptionLedger,
 		SEND_FULL_LIST_TOAST,
+		wasAsked,
 	} from '$lib/transport-ticket.js';
 	import TransportTicketCard from '$lib/components/TransportTicketCard.svelte';
 	import { filterConversations, filterTopics, composeRecipientKind, isComposeToSelf } from '$lib/chat-filter.js';
@@ -466,11 +468,32 @@
 		}
 	}
 
+	// M18 W4 — the local ask trace (`npub|slug` → when we asked). Loaded once per session; the gate
+	// below fails CLOSED while it is null, so a slow load can never open an auto-dial window.
+	let manifestAsks = $state<Record<string, unknown> | null>(null);
+	$effect(() => {
+		if (manifestAsks === null) void getManifestAsks().then((a) => (manifestAsks = a)).catch(() => {});
+	});
+
 	/** Fire the first redemption for a ticket we have just rendered. Returns the current state so the
-	 *  card can render it in the same pass. Safe to call on every render — the ledger claims once. */
-	function redemptionFor(npub: string | null, ticketJson: string, requestId: string) {
+	 *  card can render it in the same pass. Safe to call on every render — the ledger claims once.
+	 *
+	 *  **The `wasAsked` gate is an IP-exposure control.** Redeeming DIALS the owner, so it hands them
+	 *  our address. Because this fires on render, without the gate any contact could drop a ticket for
+	 *  a collection we never asked about into our inbox and make us connect to them on sight — the
+	 *  H4/MT2 harvest, through a different door than the one presence was hardened against. We dial
+	 *  only in reply to something we sent. */
+	function redemptionFor(
+		npub: string | null,
+		slug: string,
+		ticketJson: string,
+		requestId: string,
+	) {
 		void redemptionTick; // read so this re-evaluates when a redemption settles
-		if (npub && redemptions.claim(requestId)) {
+		if (!npub || !wasAsked(manifestAsks, npub, slug)) {
+			return { kind: 'unsolicited' } as const;
+		}
+		if (redemptions.claim(requestId)) {
 			void redeem(npub, requestId, ticketJson);
 		}
 		return redemptions.get(requestId);
@@ -1219,7 +1242,12 @@
 										     ledger keyed by request_id is what makes "on render" fire exactly once. -->
 										<TransportTicketCard
 											slug={tk.slug}
-											state={redemptionFor(selectedPeer?.npub ?? null, msg.content, tk.requestId)}
+											state={redemptionFor(
+												selectedPeer?.npub ?? null,
+												tk.slug,
+												msg.content,
+												tk.requestId,
+											)}
 											quarantined={false}
 											onretry={() =>
 												retryRedemption(selectedPeer?.npub ?? null, msg.content, tk.requestId)}

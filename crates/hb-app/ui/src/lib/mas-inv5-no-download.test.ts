@@ -9,6 +9,7 @@ import {
 	REDEEMED_LINE,
 	REDEEM_FAILED_LINE,
 	REDEEM_RETRY_LABEL,
+	UNSOLICITED_LINE,
 } from './transport-ticket.js';
 
 // MAS-INV-5 (Hoardbook stays neutral in the transfer): the paywall / browse surface must offer NO
@@ -82,6 +83,7 @@ describe('MAS-INV-5 — the M18 fulfil surfaces move listings, never files', () 
 		REDEEMED_LINE('criterion'),
 		REDEEM_FAILED_LINE,
 		REDEEM_RETRY_LABEL,
+		UNSOLICITED_LINE,
 	];
 
 	/** Every exported copy constant must be covered by `COPY`. Without this, adding a

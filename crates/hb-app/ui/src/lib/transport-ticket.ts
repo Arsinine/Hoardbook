@@ -70,12 +70,40 @@ export function transportTicketHint(content: string): string | null {
 	return t ? `Sent you the full list of “${t.slug}”` : null;
 }
 
-/** The redemption's lifecycle, as the card renders it. There is no `idle` — a ticket that has been
- *  seen is a ticket being redeemed. */
+/** The redemption's lifecycle, as the card renders it.
+ *
+ *  `unsolicited` is the state a ticket lands in when we have **no local record of asking** that peer
+ *  for that collection — see [`wasAsked`]. It is inert and dials nothing. */
 export type RedemptionState =
 	| { kind: 'redeeming' }
 	| { kind: 'done' }
-	| { kind: 'failed'; message: string };
+	| { kind: 'failed'; message: string }
+	| { kind: 'unsolicited' };
+
+/** Did we actually ask `npub` for `slug`? Read from the local ask trace (`get_manifest_asks`,
+ *  recorded by `request_manifest` only after its DM publish resolves).
+ *
+ *  **This is an IP-exposure gate, not tidiness.** Redeeming *dials the owner*, so redeeming reveals
+ *  our address to them. The card fires on render, so without this check any contact could put a
+ *  ticket in our inbox — for a collection we never asked about — and make us connect to them on
+ *  sight. That is the H4/MT2 IP-harvest shape arriving through a different door than the one presence
+ *  was hardened against: the whole reason a Hoardbook node advertises no address is that reaching a
+ *  peer's endpoint should require *their* deliberate act, and auto-dialling an unsolicited ticket
+ *  hands it over for free.
+ *
+ *  So the rule is: **we dial only in reply to something we sent.** A ticket we did not ask for renders
+ *  as `unsolicited` and stays inert. The trace is local-only and written after a successful publish,
+ *  so it cannot be forged by the sender. */
+export function wasAsked(
+	asks: Record<string, unknown> | null,
+	npub: string,
+	slug: string,
+): boolean {
+	// `null` = the trace has not loaded yet. Fail CLOSED: not-yet-known must not read as "we asked",
+	// or a slow load becomes an open auto-dial window on every launch.
+	if (!asks) return false;
+	return Object.prototype.hasOwnProperty.call(asks, `${npub}|${slug}`);
+}
 
 /** The per-ticket redemption ledger, keyed by `request_id`.
  *
@@ -147,3 +175,8 @@ export const REDEEM_FAILED_LINE = 'Could not fetch it — the sender may be offl
 
 /** The retry button. Not a "redeem later" affordance: it appears only after a failure. */
 export const REDEEM_RETRY_LABEL = 'Try again';
+
+/** Asker-side, for a ticket we have no record of asking for. Says what it is and what was NOT done —
+ *  the sender learns nothing, and we did not connect to them. */
+export const UNSOLICITED_LINE =
+	"They sent a link to a full list you didn't ask for. Nothing was fetched. Ask from their collection in Browse if you want it.";

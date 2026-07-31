@@ -171,16 +171,31 @@ pub async fn redeem_manifest_ticket(
         StoreManifestSource::new((*store).clone(), id_clone, browse_key);
     let ep = ensure_endpoint(&endpoint, &own_npub, &transport_key, source).await.map_err(cmd_err)?;
 
-    let payload = fetch_manifest(&ep, &ticket).await.map_err(cmd_err)?;
-    let raw = std::str::from_utf8(payload.as_bytes())
-        .map_err(|_| "The manifest that arrived was not text.".to_string())?;
-    accept_manifest_bytes(
-        &npub,
-        Some(&ticket.slug),
-        raw,
-        newest_fingerprint.as_deref(),
-        &store,
-    )
+    // The gate runs INSIDE `fetch_manifest`, before the acknowledgement — see its doc comment. If it
+    // ran out here the ACK would already have been sent, and a manifest we reject (wrong author,
+    // undecryptable, incomplete) would still have burned the ticket, forcing the human to ask again
+    // and the owner to approve again.
+    let mut imported: Option<crate::commands::browse::ImportedManifest> = None;
+    fetch_manifest(&ep, &ticket, |payload| {
+        let raw = std::str::from_utf8(payload.as_bytes())
+            .map_err(|_| anyhow::anyhow!("the manifest that arrived was not text"))?;
+        imported = Some(
+            accept_manifest_bytes(
+                &npub,
+                Some(&ticket.slug),
+                raw,
+                newest_fingerprint.as_deref(),
+                &store,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        );
+        Ok(())
+    })
+    .await
+    .map_err(cmd_err)?;
+    // Unreachable unless the gate returned `Ok` without setting this — a `fetch_manifest` that
+    // acknowledged without running the gate. Stated rather than unwrapped.
+    imported.ok_or_else(|| "The manifest was acknowledged but never accepted.".to_string())
 }
 
 #[cfg(test)]
