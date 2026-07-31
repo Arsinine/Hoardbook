@@ -26,6 +26,9 @@
 export interface TransportTicket {
 	requestId: string;
 	slug: string;
+	/** The asker's own nonce, echoed by the owner (owner ruling ①). Absent on a ticket minted before
+	 *  the field existed — and absent never matches, so such a ticket will not auto-dial. */
+	askNonce?: string;
 	/** Unix seconds. Provenance and display only — **never an expiry input.** A ticket has no expiry
 	 *  by design, and `hb_core::ticket` has a test that reds if one is added. */
 	issuedAt: number;
@@ -59,6 +62,7 @@ export function parseTransportTicket(content: string): TransportTicket | null {
 		requestId: o.request_id,
 		slug: o.slug,
 		issuedAt: typeof o.issued_at === 'number' ? o.issued_at : 0,
+		askNonce: typeof o.ask_nonce === 'string' && o.ask_nonce !== '' ? o.ask_nonce : undefined,
 	};
 }
 
@@ -84,29 +88,40 @@ export type RedemptionState =
 	 *  says so, and it must not accuse the sender of something they did not do. */
 	| { kind: 'unverified' };
 
-/** Did we actually ask `npub` for `slug`? Read from the local ask trace (`get_manifest_asks`,
- *  recorded by `request_manifest` only after its DM publish resolves).
+/** Does this ticket answer an ask **we** made? Compares the ticket's echoed nonce against the one
+ *  stored in the local ask trace for `(npub, slug)`.
  *
- *  **This is an IP-exposure gate, not tidiness.** Redeeming *dials the owner*, so redeeming reveals
- *  our address to them. The card fires on render, so without this check any contact could put a
- *  ticket in our inbox — for a collection we never asked about — and make us connect to them on
- *  sight. That is the H4/MT2 IP-harvest shape arriving through a different door than the one presence
- *  was hardened against: the whole reason a Hoardbook node advertises no address is that reaching a
- *  peer's endpoint should require *their* deliberate act, and auto-dialling an unsolicited ticket
- *  hands it over for free.
+ *  **This is an IP-exposure control, and the nonce is what makes it one** (owner ruling ①,
+ *  2026-07-31). Redeeming *dials the peer*, so it reveals our address; the card fires on render.
+ *  The earlier version of this gate asked only "did I ever ask this peer for this collection?" —
+ *  which the peer can satisfy once and then exploit forever, minting fresh tickets with any
+ *  `request_id` and **any node address of their choosing** and having us dial each one. `request_id`
+ *  cannot close that: the OWNER mints it, so it proves nothing to us. Only a value we generated can.
  *
- *  So the rule is: **we dial only in reply to something we sent.** A ticket we did not ask for renders
- *  as `unsolicited` and stays inert. The trace is local-only and written after a successful publish,
- *  so it cannot be forged by the sender. */
-export function wasAsked(
-	asks: Record<string, unknown> | null,
+ *  Fails closed on every ambiguity — trace not loaded, no stored nonce (a pre-ruling ask), no nonce
+ *  on the ticket (a pre-ruling owner), or a mismatch. The cost of failing closed is one re-ask; the
+ *  cost of failing open is on-demand IP disclosure.
+ */
+export function ticketAnswersOurAsk(
+	asks: Record<string, { nonce?: string }> | null,
 	npub: string,
 	slug: string,
+	ticketNonce: string | undefined,
 ): boolean {
-	// `null` = the trace has not loaded yet. Fail CLOSED: not-yet-known must not read as "we asked",
-	// or a slow load becomes an open auto-dial window on every launch.
+	// Not loaded yet, or its read failed. Never read as "we asked" — a slow load must not become an
+	// open auto-dial window.
 	if (!asks) return false;
-	return Object.prototype.hasOwnProperty.call(asks, `${npub}|${slug}`);
+	// Redundant with the equality below (`'n-abc' === undefined` is already false) and kept
+	// deliberately: it states the fail-closed intent at the boundary, and it holds if `stored` is ever
+	// loosened. Deleting it does NOT redden the suite — verified — so do not read its presence as the
+	// thing enforcing this case.
+	if (!ticketNonce) return false;
+	const entry = Object.prototype.hasOwnProperty.call(asks, `${npub}|${slug}`)
+		? asks[`${npub}|${slug}`]
+		: undefined;
+	const stored = entry?.nonce;
+	if (!stored) return false; // a pre-ruling ask carries no nonce and can no longer auto-dial
+	return stored === ticketNonce;
 }
 
 /** The per-ticket redemption ledger, keyed by `request_id`.

@@ -662,8 +662,10 @@ pub fn issue_ticket(
     request_id: &str,
     slug: &str,
     issued_at: u64,
+    ask_nonce: Option<&str>,
 ) -> Result<TransportTicket> {
-    let ticket = TransportTicket::issue(request_id, slug, &ticket_node_addr(endpoint)?, issued_at);
+    let ticket =
+        TransportTicket::issue(request_id, slug, &ticket_node_addr(endpoint)?, issued_at, ask_nonce);
     debug_assert_eq!(ticket.hb, TICKET_TAG);
     ticket.verify_shape().map_err(|e| anyhow!("refusing to issue a malformed ticket: {e}"))?;
     Ok(ticket)
@@ -906,7 +908,7 @@ pub(crate) mod tests {
         // The ticket carries the LOOPBACK address, not `endpoint.addr()` — a wildcard bound socket
         // is not dialable, and `ticket_node_addr` is exercised separately.
         let addr = serde_json::to_string(&loopback_addr(&server)).unwrap();
-        let ticket = TransportTicket::issue("req-1", slug, &addr, 1_700_000_000);
+        let ticket = TransportTicket::issue("req-1", slug, &addr, 1_700_000_000, Some("nonce-1"));
         let source = TestSource::new(ticket.clone(), payload);
         let source = if rendezvous { source.with_rendezvous() } else { source };
 
@@ -1272,7 +1274,7 @@ pub(crate) mod tests {
             let liar = bind_local_endpoint(&rand::random(), vec![MANIFEST_ALPN.to_vec()]).await;
             let addr = serde_json::to_string(&loopback_addr(&liar)).unwrap();
             // We hold a ticket for "mine"; the peer will answer with a valid manifest for "theirs".
-            let ticket = TransportTicket::issue("req-1", "mine", &addr, 1_700_000_000);
+            let ticket = TransportTicket::issue("req-1", "mine", &addr, 1_700_000_000, Some("nonce-1"));
             let wrong = real_payload_for("theirs", 40);
 
             let accept_ep = liar.clone();
@@ -1473,7 +1475,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_tickets_opaque_node_addr_round_trips_to_a_dialable_address() {
         let ep = bind_local_endpoint(&rand::random(), vec![MANIFEST_ALPN.to_vec()]).await;
-        let ticket = issue_ticket(&ep, "req-1", "slug", 1_700_000_000).unwrap();
+        let ticket = issue_ticket(&ep, "req-1", "slug", 1_700_000_000, None).unwrap();
         let parsed = parse_node_addr(&ticket.node_addr).expect("the ticket address parses back");
         assert_eq!(parsed.id, ep.id(), "the address names this endpoint");
         assert_eq!(parsed, ep.addr(), "the round trip is lossless");

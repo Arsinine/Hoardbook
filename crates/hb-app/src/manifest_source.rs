@@ -119,7 +119,7 @@ mod tests {
         let (_dir, store) = store();
         let id = Identity::generate();
         let npub = npub_of(&id);
-        let ticket = TransportTicket::issue("req-a", "slug-a", "addr", 1_700_000_000);
+        let ticket = TransportTicket::issue("req-a", "slug-a", "addr", 1_700_000_000, Some("n1"));
         store
             .record_issued_ticket(&IssuedTicketRecord {
                 ticket,
@@ -186,7 +186,7 @@ mod tests {
             m.insert(
                 id.clone(),
                 IssuedTicketRecord {
-                    ticket: TransportTicket::issue(&id, "slug", "addr", i as u64),
+                    ticket: TransportTicket::issue(&id, "slug", "addr", i as u64, None),
                     redeemer_npub: "npub-x".into(),
                     consumed_at: None,
                     delivered_bytes: None,

@@ -88,6 +88,23 @@ fn manifest_transport_part_cap_matches_the_producer_cap() {
 fn ticket_version_and_tag_are_frozen() {
     assert_eq!(ticket::TICKET_V, 1, "ticket::TICKET_V — {FREEZE}");
     assert_eq!(ticket::TICKET_TAG, "transport_ticket", "ticket::TICKET_TAG — {FREEZE}");
+
+    // **Amendment 2026-07-31 (owner ruling ①): `ask_nonce` joined the ticket.** `TICKET_V` did NOT
+    // bump, deliberately — the field is `Option` + `skip_serializing_if`, so a v1 ticket without it
+    // still parses and an old client still reads a new ticket. What makes that safe is the REDEEM
+    // side failing closed on `None`, not the wire being permissive.
+    //
+    // Pinned by serialized shape rather than by a version number: the name is the contract, and a
+    // rename would silently stop every gate matching while every test kept passing.
+    let with = ticket::TransportTicket::issue("r", "s", "addr", 1, Some("n0nce"));
+    let json = serde_json::to_string(&with).expect("a ticket serializes");
+    assert!(json.contains("\"ask_nonce\":\"n0nce\""), "ticket ask_nonce field name — {FREEZE}");
+
+    // Absent, not null, when there is no nonce — so an old client's parser sees exactly what it saw
+    // before this field existed.
+    let without = ticket::TransportTicket::issue("r", "s", "addr", 1, None);
+    let json = serde_json::to_string(&without).expect("a ticket serializes");
+    assert!(!json.contains("ask_nonce"), "an absent ask nonce is omitted, not null — {FREEZE}");
 }
 
 /// The manifest envelope's `author_sig` pre-image domain tag (M16 W1). It is hashed into every

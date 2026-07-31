@@ -64,7 +64,7 @@
 		transportTicketHint,
 		RedemptionLedger,
 		SEND_FULL_LIST_TOAST,
-		wasAsked,
+		ticketAnswersOurAsk,
 	} from '$lib/transport-ticket.js';
 	import TransportTicketCard from '$lib/components/TransportTicketCard.svelte';
 	import { filterConversations, filterTopics, composeRecipientKind, isComposeToSelf } from '$lib/chat-filter.js';
@@ -431,13 +431,13 @@
 	// (M17 ruling #4), and export stays on the card beside it for when the transport can't connect.
 	// Guarded per slug so a double-click cannot mint two approvals for one request.
 	let sendingFullList: string | null = $state(null);
-	async function handleSendFullList(slug: string) {
+	async function handleSendFullList(slug: string, askNonce?: string) {
 		if (sendingFullList === slug) return;
 		const npub = selectedPeer?.npub;
 		if (!npub) return;
 		sendingFullList = slug;
 		try {
-			await sendFullList(npub, slug);
+			await sendFullList(npub, slug, askNonce);
 			toast(SEND_FULL_LIST_TOAST(slug), 'success');
 		} catch (e) {
 			toast(String(e), 'error');
@@ -461,6 +461,11 @@
 		try {
 			await redeemManifestTicket(npub, ticketJson);
 			redemptions.succeed(requestId);
+			// The backend consumed the ask, so our copy is stale — re-read it. Without this the
+			// in-memory trace would still authorize a second ticket for the rest of the session,
+			// which is exactly the standing authorization the nonce removes.
+			manifestAsks = null;
+			asksAttempt += 1;
 		} catch (e) {
 			redemptions.fail(requestId, String(e));
 		} finally {
@@ -476,7 +481,7 @@
 	// rendered as "unsolicited" with no action, and automatic delivery could not recover for the rest
 	// of the session. Fail-closed must stay *recoverable*, or a transient local read error becomes a
 	// permanent feature outage that also blames the sender.
-	let manifestAsks = $state<Record<string, unknown> | null>(null);
+	let manifestAsks = $state<Record<string, { nonce?: string }> | null>(null);
 	let asksLoading = false;
 	let asksAttempt = $state(0);
 	$effect(() => {
@@ -502,14 +507,14 @@
 	/** Fire the first redemption for a ticket we have just rendered. Returns the current state so the
 	 *  card can render it in the same pass. Safe to call on every render — the ledger claims once.
 	 *
-	 *  **The `wasAsked` gate is an IP-exposure control.** Redeeming DIALS the owner, so it hands them
-	 *  our address. Because this fires on render, without the gate any contact could drop a ticket for
-	 *  a collection we never asked about into our inbox and make us connect to them on sight — the
-	 *  H4/MT2 harvest, through a different door than the one presence was hardened against. We dial
-	 *  only in reply to something we sent. */
+	 *  **The gate is an IP-exposure control.** Redeeming DIALS the peer, so it hands them our address,
+	 *  and this fires on render. The ticket must echo the nonce we minted for *this* ask (owner ruling
+	 *  ①): matching on peer+slug alone was a standing authorization — satisfied once, then exploitable
+	 *  forever with any node address the peer chose. We dial only in reply to a specific thing we sent. */
 	function redemptionFor(
 		npub: string | null,
 		slug: string,
+		ticketNonce: string | undefined,
 		ticketJson: string,
 		requestId: string,
 	) {
@@ -518,7 +523,7 @@
 		// dial nothing AND say so honestly rather than accusing the sender. Recoverable — the loader
 		// above retries, and this re-evaluates when it lands.
 		if (manifestAsks === null) return { kind: 'unverified' } as const;
-		if (!npub || !wasAsked(manifestAsks, npub, slug)) {
+		if (!npub || !ticketAnswersOurAsk(manifestAsks, npub, slug, ticketNonce)) {
 			return { kind: 'unsolicited' } as const;
 		}
 		if (redemptions.claim(requestId)) {
@@ -527,7 +532,7 @@
 		return redemptions.get(requestId);
 	}
 
-	/** Retry after a failure. **`wasAsked` is re-checked here even though an unsolicited ticket can
+	/** Retry after a failure. **The gate is re-checked here even though an unsolicited ticket can
 	 *  never reach the `failed` state** (it never touches the ledger, so `claimRetry` refuses it).
 	 *  Relying on that is a transitive argument through the ledger's state machine; the invariant
 	 *  "we dial only in reply to something we sent" is worth stating at *every* site that can dial, so
@@ -536,10 +541,11 @@
 	function retryRedemption(
 		npub: string | null,
 		slug: string,
+		ticketNonce: string | undefined,
 		ticketJson: string,
 		requestId: string,
 	) {
-		if (!npub || !wasAsked(manifestAsks, npub, slug)) return;
+		if (!npub || !ticketAnswersOurAsk(manifestAsks, npub, slug, ticketNonce)) return;
 		if (!redemptions.claimRetry(requestId)) return;
 		redemptionTick += 1;
 		void redeem(npub, requestId, ticketJson);
@@ -1270,7 +1276,7 @@
 											fingerprintSeen={mf.request.fingerprintSeen}
 											hasBigRelay={bigRelayUrl !== ''}
 											onexport={(slug) => handleExportManifest(slug)}
-											onsend={(slug) => handleSendFullList(slug)}
+											onsend={(slug) => handleSendFullList(slug, mf.request.askNonce)}
 											sending={sendingFullList === mf.state.slug}
 										/>
 									{/if}
@@ -1285,6 +1291,7 @@
 											state={redemptionFor(
 												selectedPeer?.npub ?? null,
 												tk.slug,
+												tk.askNonce,
 												msg.content,
 												tk.requestId,
 											)}
@@ -1293,6 +1300,7 @@
 												retryRedemption(
 													selectedPeer?.npub ?? null,
 													tk.slug,
+													tk.askNonce,
 													msg.content,
 													tk.requestId,
 												)}

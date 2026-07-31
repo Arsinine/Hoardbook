@@ -34,6 +34,11 @@ export interface ManifestRequest {
 	slug: string;
 	fingerprintSeen: string;
 	teaserEventId?: string;
+	/** The asker's nonce for this ask (owner ruling ①). The hoarder echoes it into the ticket; the
+	 *  asker auto-dials only for a ticket carrying the nonce it stored. Absent from a request sent by
+	 *  a client that predates the field — the resulting ticket then carries none and will not
+	 *  auto-redeem, which is the intended fail-closed outcome. */
+	askNonce?: string;
 	/** **VESTIGIAL** — mirrors the Rust field of the same name (`chat.rs`). It carried the requester's
 	 *  Mascara pubkey when a courier was going to move the file; that role is retired (2026-07-26) and
 	 *  nothing writes or reads this. Kept because the request body is `wire_freeze`-pinned and the
@@ -57,6 +62,8 @@ export function parseManifestRequest(content: string): ManifestRequest | null {
 		slug: o.slug,
 		fingerprintSeen: typeof o.fingerprint_seen === 'string' ? o.fingerprint_seen : '',
 		teaserEventId: typeof o.teaser_event_id === 'string' ? o.teaser_event_id : undefined,
+		askNonce:
+			typeof o.ask_nonce === 'string' && o.ask_nonce !== '' ? o.ask_nonce : undefined,
 		mascaraPubkey: typeof o.mascara_pubkey === 'string' ? o.mascara_pubkey : undefined,
 	};
 }

@@ -109,11 +109,30 @@ pub struct TransportTicket {
     pub node_addr: String,
     /// Unix seconds the ticket was issued. Provenance and display only — **not an expiry input.**
     pub issued_at: u64,
+    /// **The asker's own nonce, echoed back** (M18 post-review ruling ①, owner 2026-07-31).
+    ///
+    /// `request_id` is minted by the OWNER, so it proves nothing to the asker: a peer can mint one
+    /// freely. Without an asker-generated value the redeem-side gate could only ask "did I ever ask
+    /// this peer for this collection?", which is a **standing, reusable authorization** — the peer
+    /// could make our client dial an address of their choosing, unprompted, forever. Echoing the
+    /// nonce binds the ticket to **one specific ask**.
+    ///
+    /// `Option` for wire compatibility only: a ticket minted before this field existed deserializes
+    /// with `None`, and the asker's gate **refuses to auto-dial on `None`** (fail closed — the
+    /// alternative re-opens the hole to anyone who claims to be an old client).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_nonce: Option<String>,
 }
 
 impl TransportTicket {
     /// Mint a ticket for one request. `node_addr` is passed through untouched.
-    pub fn issue(request_id: &str, slug: &str, node_addr: &str, issued_at: u64) -> Self {
+    pub fn issue(
+        request_id: &str,
+        slug: &str,
+        node_addr: &str,
+        issued_at: u64,
+        ask_nonce: Option<&str>,
+    ) -> Self {
         Self {
             hb: TICKET_TAG.to_string(),
             ticket_v: TICKET_V,
@@ -121,6 +140,9 @@ impl TransportTicket {
             slug: slug.to_string(),
             node_addr: node_addr.to_string(),
             issued_at,
+            // Empty is normalized to absent so "present but blank" cannot masquerade as a real
+            // nonce at the gate.
+            ask_nonce: ask_nonce.filter(|n| !n.is_empty()).map(str::to_string),
         }
     }
 
@@ -137,6 +159,11 @@ impl TransportTicket {
         if self.request_id.is_empty() || self.slug.is_empty() || self.node_addr.is_empty() {
             return Err(HbError::InvalidTicket("ticket is missing a required binding".into()));
         }
+        // Present-but-blank is a malformed ticket, not an old one. Absent is the only legal way to
+        // say "no nonce", so the asker's gate can treat `None` as one unambiguous case.
+        if self.ask_nonce.as_deref().is_some_and(str::is_empty) {
+            return Err(HbError::InvalidTicket("ticket carries an empty ask nonce".into()));
+        }
         Ok(())
     }
 }
@@ -152,7 +179,7 @@ impl TransportTicket {
 ///
 /// ```compile_fail
 /// # use hb_core::ticket::{authorize_redemption, ContactStanding, TransportTicket};
-/// let t = TransportTicket::issue("req-1", "slug", "addr", 0);
+/// let t = TransportTicket::issue("req-1", "slug", "addr", 0, None);
 /// let grant = authorize_redemption(&t, "req-1", false, ContactStanding::Good).unwrap();
 /// // A dropped connection has no ManifestPayload to hand over, so there is no way to reach
 /// // ConsumedTicket from here. Calling it with nothing is a type error, by design.
@@ -253,7 +280,7 @@ mod tests {
     use crate::manifest::build_manifest_envelope;
 
     fn ticket() -> TransportTicket {
-        TransportTicket::issue("req-1", "my-slug", "node-addr-opaque", 1_700_000_000)
+        TransportTicket::issue("req-1", "my-slug", "node-addr-opaque", 1_700_000_000, Some("nonce-1"))
     }
 
     fn delivered() -> ManifestPayload {
@@ -275,6 +302,46 @@ mod tests {
         let grant =
             authorize_redemption(&ticket(), "req-1", false, ContactStanding::Good).unwrap();
         assert_eq!(grant.request_id(), "req-1");
+    }
+
+    /// **The nonce is what makes an approval answer ONE ask** (owner ruling ① 2026-07-31). It
+    /// survives the DM body verbatim, because the asker compares it against what it stored locally.
+    #[test]
+    fn the_ask_nonce_round_trips_through_a_dm_body() {
+        let t = ticket();
+        assert_eq!(t.ask_nonce.as_deref(), Some("nonce-1"));
+        let back: TransportTicket = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(back.ask_nonce.as_deref(), Some("nonce-1"), "the asker must see its own nonce");
+        back.verify_shape().unwrap();
+    }
+
+    /// A pre-ruling ticket has no nonce and must still PARSE — `TICKET_V` did not bump, so an
+    /// already-sent ticket sitting in a relay-stored wrap stays readable. Safety comes from the
+    /// asker refusing to auto-dial on `None`, not from the wire rejecting it.
+    #[test]
+    fn a_ticket_without_a_nonce_still_parses_and_is_shape_valid() {
+        let json = r#"{"hb":"transport_ticket","ticket_v":1,"request_id":"r","slug":"s",
+                       "node_addr":"a","issued_at":1}"#;
+        let t: TransportTicket = serde_json::from_str(json).expect("a v1 ticket still parses");
+        assert_eq!(t.ask_nonce, None);
+        t.verify_shape().expect("absent is legal; the redeem-side gate is what refuses it");
+    }
+
+    /// **Present-but-blank is malformed, not "old".** Collapsing the two would let a peer send
+    /// `"ask_nonce":""` and have it treated as the compatibility case, which is the hole the ruling
+    /// closes. `issue` normalizes an empty nonce to absent so this can only arrive from the wire.
+    #[test]
+    fn an_empty_ask_nonce_is_refused_rather_than_read_as_absent() {
+        let json = r#"{"hb":"transport_ticket","ticket_v":1,"request_id":"r","slug":"s",
+                       "node_addr":"a","issued_at":1,"ask_nonce":""}"#;
+        let t: TransportTicket = serde_json::from_str(json).unwrap();
+        assert!(t.verify_shape().is_err(), "an empty nonce is a malformed ticket");
+
+        assert_eq!(
+            TransportTicket::issue("r", "s", "a", 1, Some("")).ask_nonce,
+            None,
+            "issue normalizes empty to absent, so we never mint the ambiguous shape"
+        );
     }
 
     #[test]
@@ -323,7 +390,7 @@ mod tests {
     fn an_approval_given_while_the_asker_was_offline_is_still_redeemable() {
         // Issued a year ago. There is no clock argument to `authorize_redemption` at all, so this
         // cannot depend on elapsed time — which is the point.
-        let ancient = TransportTicket::issue("req-1", "my-slug", "node-addr-opaque", 1);
+        let ancient = TransportTicket::issue("req-1", "my-slug", "node-addr-opaque", 1, None);
         let grant = authorize_redemption(&ancient, "req-1", false, ContactStanding::Good)
             .expect("a ticket is valid until redeemed, never expired");
         assert_eq!(grant.request_id(), "req-1");

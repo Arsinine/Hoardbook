@@ -3,7 +3,7 @@ import {
 	parseTransportTicket,
 	transportTicketHint,
 	RedemptionLedger,
-	wasAsked,
+	ticketAnswersOurAsk,
 	TICKET_TAG,
 	REDEEM_FAILED_LINE,
 	SEND_FULL_LIST_LABEL,
@@ -138,36 +138,50 @@ describe('RedemptionLedger', () => {
 	});
 });
 
-describe('wasAsked — the unsolicited-ticket gate', () => {
-	/** **This is an IP-exposure control, not tidiness.** Redemption dials the owner, and the card
-	 *  fires on render — so without this gate any contact could drop a ticket for a collection we
-	 *  never asked about into our inbox and make us connect to them on sight, handing over our
-	 *  address. That is the H4/MT2 harvest arriving through a different door than the one presence was
-	 *  hardened against. */
-	it('is true only for a peer+collection we actually asked', () => {
-		const asks = { 'npub1owner|criterion': { sent_at: 'x' } };
-		expect(wasAsked(asks, 'npub1owner', 'criterion')).toBe(true);
-		// Right peer, collection we never asked about.
-		expect(wasAsked(asks, 'npub1owner', 'other')).toBe(false);
-		// Right collection, a peer we never asked — the impersonation case.
-		expect(wasAsked(asks, 'npub1stranger', 'criterion')).toBe(false);
+describe('ticketAnswersOurAsk — the unsolicited-dial gate', () => {
+	const asks = { 'npub1owner|criterion': { nonce: 'n-abc' } };
+
+	/** **An IP-exposure control.** Redemption dials the peer and the card fires on render, so a
+	 *  ticket we did not provoke must never dial. */
+	it('accepts only a ticket echoing the nonce we minted for this exact ask', () => {
+		expect(ticketAnswersOurAsk(asks, 'npub1owner', 'criterion', 'n-abc')).toBe(true);
 	});
 
-	/** Fails CLOSED while the trace is loading. A `null` that read as "asked" would make every launch
-	 *  a window in which an unsolicited ticket auto-dials. */
-	it('is false when the ask trace has not loaded yet', () => {
-		expect(wasAsked(null, 'npub1owner', 'criterion')).toBe(false);
+	/** **The reason the nonce exists.** Matching on peer+slug alone is a STANDING authorization: the
+	 *  peer satisfies it once, then mints unlimited fresh tickets — any request_id, and any node
+	 *  address they choose — and we dial every one. `request_id` cannot fix it because the OWNER
+	 *  mints that; only a value we generated can. */
+	it('refuses a fresh ticket from a peer we HAVE asked, when the nonce does not match', () => {
+		expect(ticketAnswersOurAsk(asks, 'npub1owner', 'criterion', 'attacker-chosen')).toBe(false);
 	});
 
-	it('is false against an empty trace', () => {
-		expect(wasAsked({}, 'npub1owner', 'criterion')).toBe(false);
+	it('refuses the wrong collection and the wrong peer', () => {
+		expect(ticketAnswersOurAsk(asks, 'npub1owner', 'other', 'n-abc')).toBe(false);
+		expect(ticketAnswersOurAsk(asks, 'npub1stranger', 'criterion', 'n-abc')).toBe(false);
+	});
+
+	/** Fails closed on every ambiguity. The cost of failing closed is one re-ask; the cost of failing
+	 *  open is on-demand IP disclosure. */
+	/** ⚠ The no-nonce-on-the-ticket case is enforced by the nonce EQUALITY, not by the explicit
+	 *  `if (!ticketNonce)` guard above it — deleting that guard leaves this green. Noted so nobody
+	 *  reads its presence as the enforcement. */
+	it('refuses when the trace has not loaded, the ask predates the ruling, or the ticket carries no nonce', () => {
+		expect(ticketAnswersOurAsk(null, 'npub1owner', 'criterion', 'n-abc')).toBe(false);
+		expect(ticketAnswersOurAsk({}, 'npub1owner', 'criterion', 'n-abc')).toBe(false);
+		// A pre-ruling ask has no stored nonce — it can no longer auto-dial.
+		expect(
+			ticketAnswersOurAsk({ 'npub1owner|criterion': {} }, 'npub1owner', 'criterion', 'n-abc'),
+		).toBe(false);
+		// A pre-ruling owner echoes nothing.
+		expect(ticketAnswersOurAsk(asks, 'npub1owner', 'criterion', undefined)).toBe(false);
+		expect(ticketAnswersOurAsk(asks, 'npub1owner', 'criterion', '')).toBe(false);
 	});
 
 	/** The lookup must not be satisfied by inherited Object properties — `asks['constructor']` is
-	 *  truthy on a plain object, so a slug of "constructor" would otherwise read as asked. */
+	 *  truthy on a plain object. */
 	it('is not fooled by inherited Object properties', () => {
-		expect(wasAsked({}, 'npub1owner', 'constructor')).toBe(false);
-		expect(wasAsked({}, 'toString', 'constructor')).toBe(false);
+		expect(ticketAnswersOurAsk({}, 'npub1owner', 'constructor', 'n-abc')).toBe(false);
+		expect(ticketAnswersOurAsk({}, 'toString', 'constructor', 'n-abc')).toBe(false);
 	});
 });
 

@@ -63,6 +63,11 @@ fn new_request_id() -> String {
 /// 2. **The record is persisted before the DM.** The reverse order hands a peer a ticket this node
 ///    cannot authorize, which is indistinguishable from a forgery. An orphaned record — the DM then
 ///    failed — is inert, because nobody holds the matching ticket.
+/// `ask_nonce` is the asker's own value, taken from the request being answered (owner ruling ①,
+/// 2026-07-31). It is echoed into the ticket **verbatim and never interpreted** — only the asker can
+/// check it, and that check is what stops a peer minting tickets we would auto-dial. `None` when the
+/// request predates the field; the asker then refuses to auto-dial, which is the intended outcome.
+///
 /// 3. **The payload built here is discarded.** It exists to prove the manifest is producible and
 ///    within the ceiling; the plane rebuilds it at redeem time, from the same pure core, so the asker
 ///    gets the tree as it is *then* rather than a snapshot frozen at approval.
@@ -70,6 +75,7 @@ fn new_request_id() -> String {
 pub async fn send_full_list(
     npub: String,
     slug: String,
+    ask_nonce: Option<String>,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
     relay: State<'_, SharedRelay>,
@@ -106,7 +112,8 @@ pub async fn send_full_list(
     })?;
 
     let request_id = new_request_id();
-    let ticket = issue_ticket(&ep, &request_id, &slug, now_secs()).map_err(cmd_err)?;
+    let ticket =
+        issue_ticket(&ep, &request_id, &slug, now_secs(), ask_nonce.as_deref()).map_err(cmd_err)?;
 
     // (2) Record before the DM, so a redeemer always presents a ticket we can recognise.
     // **Canonicalize the recipient before storing it.** `parse_recipient` also accepts a full `hbk`
@@ -202,9 +209,20 @@ pub async fn redeem_manifest_ticket(
     })
     .await
     .map_err(cmd_err)?;
-    // Unreachable unless the gate returned `Ok` without setting this — a `fetch_manifest` that
-    // acknowledged without running the gate. Stated rather than unwrapped.
-    imported.ok_or_else(|| "The manifest was acknowledged but never accepted.".to_string())
+    let imported =
+        imported.ok_or_else(|| "The manifest was acknowledged but never accepted.".to_string())?;
+
+    // **Consume the ask now that it has been answered** (owner ruling ①). One ask, one auto-dial:
+    // leaving it would restore the standing authorization the nonce exists to remove, since a peer
+    // could then send further tickets echoing the same still-stored nonce.
+    //
+    // AFTER success, never on an attempt — a dial that failed has cost nothing and must stay
+    // retryable, exactly like the ticket itself. Best-effort: the manifest is already in hand, and
+    // failing the command here would tell the user a delivery they received had failed.
+    if let Err(e) = store.consume_manifest_ask(&npub, &ticket.slug) {
+        tracing::warn!("could not consume the manifest ask after redemption: {e}");
+    }
+    Ok(imported)
 }
 
 #[cfg(test)]
