@@ -48,11 +48,28 @@ pub enum Role {
 /// bare `Option<Endpoint>` would therefore keep serving manifests signed by the identity the user just
 /// switched away from, on a node key that identity minted. Keying the binding to its npub is what
 /// makes [`ensure_endpoint`] notice and rebind.
-pub type SharedEndpoint = Arc<RwLock<Option<BoundPlane>>>;
+pub type SharedEndpoint = Arc<RwLock<PlaneState>>;
+
+/// The session's plane plus a **generation counter**.
+///
+/// The counter closes a race the lock alone does not: `wipe_data` sets the identity to `None` and
+/// calls [`close_plane`], but a fulfil task that read the *old* identity and is still queued for the
+/// write lock would then bind a fresh listening endpoint **after** the wipe — resurrecting the
+/// liveness surface the close exists to remove, under credentials the user just destroyed.
+/// [`ensure_endpoint`] captures the generation on entry and refuses to publish if it moved.
+#[derive(Default)]
+pub struct PlaneState {
+    pub bound: Option<BoundPlane>,
+    pub generation: u64,
+}
 
 /// A bound endpoint and the identity it belongs to.
 pub struct BoundPlane {
     pub endpoint: iroh::Endpoint,
+    /// Redemptions currently dialing on this binding. An upgrade must not yank the socket out from
+    /// under one — `Endpoint::close` closes live connections, and `fetch_manifest` has no
+    /// lifecycle-aware retry, so a transfer would simply die mid-flight.
+    pub dials: Arc<std::sync::atomic::AtomicUsize>,
     /// The npub whose keys the running accept loop serves from.
     pub owner_npub: String,
     /// Whether this binding **listens** (advertises the ALPN and runs an accept loop) or is
@@ -72,7 +89,19 @@ pub struct BoundPlane {
 pub const MAX_CONCURRENT_REDEMPTIONS: usize = 8;
 
 pub fn new_shared_endpoint() -> SharedEndpoint {
-    Arc::new(RwLock::new(None))
+    Arc::new(RwLock::new(PlaneState::default()))
+}
+
+/// How long an upgrade waits for in-flight redemptions to finish before taking the socket.
+const UPGRADE_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hold while dialing, so an upgrade defers instead of killing the transfer.
+pub struct DialLease(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for DialLease {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Bind the endpoint and spawn its accept loop if this session has not already, then return a handle.
@@ -90,27 +119,53 @@ pub async fn ensure_endpoint(
     need: Role,
 ) -> Result<iroh::Endpoint> {
     // A listening binding satisfies a redeemer too; a client-only one does not satisfy a fulfiller.
+    // A binding that has been closed is never reusable, however well it otherwise matches — a failed
+    // rebind used to leave exactly that in place and hand it to the next caller.
     let satisfies = |b: &BoundPlane| {
-        b.owner_npub == owner_npub && (b.listening || need == Role::DialOnly)
+        b.owner_npub == owner_npub
+            && (b.listening || need == Role::DialOnly)
+            && !b.endpoint.is_closed()
     };
-    if let Some(bound) = shared.read().await.as_ref() {
+    let generation = {
+        let st = shared.read().await;
+        if let Some(bound) = st.bound.as_ref() {
+            if satisfies(bound) {
+                return Ok(bound.endpoint.clone());
+            }
+        }
+        st.generation
+    };
+
+    // Wait (bounded) for in-flight dials before taking the socket, so a fulfil does not abort a
+    // redemption mid-transfer. Done BEFORE the write lock so a dialer can still finish.
+    if let Some(dials) = {
+        let st = shared.read().await;
+        st.bound.as_ref().filter(|b| !satisfies(b)).map(|b| b.dials.clone())
+    } {
+        let deadline = tokio::time::Instant::now() + UPGRADE_DRAIN_DEADLINE;
+        while dials.load(std::sync::atomic::Ordering::SeqCst) > 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    let mut st = shared.write().await;
+    // Re-check: another task may have bound while we waited for the write lock.
+    if let Some(bound) = st.bound.as_ref() {
         if satisfies(bound) {
             return Ok(bound.endpoint.clone());
         }
     }
-    let mut guard = shared.write().await;
-    // Re-check: another task may have bound while we waited for the write lock.
-    if let Some(bound) = guard.as_ref() {
-        if satisfies(bound) {
-            return Ok(bound.endpoint.clone());
-        }
-        // Either a stale identity, or a client-only binding that now has to serve. Both need the
-        // socket released first — **two endpoints cannot share one secret**. Closing also ends any
-        // accept loop (`endpoint.accept()` returns `None`), dropping the old source.
-        //
-        // The node identity is derived from the same persisted secret, so an outstanding ticket
-        // still resolves across this rebind.
-        bound.endpoint.close().await;
+    // The session was wiped (or otherwise torn down) while we queued. Publishing now would recreate
+    // a listening endpoint under credentials that no longer exist.
+    if st.generation != generation {
+        return Err(anyhow::anyhow!("the transport was shut down while binding"));
+    }
+    // Take the old binding OUT before closing it: if the bind below fails, the state must be empty,
+    // not holding a closed endpoint that the satisfaction check would hand to the next caller.
+    if let Some(old) = st.bound.take() {
+        old.endpoint.close().await;
     }
     let listening = need == Role::Listen;
     let endpoint = if listening {
@@ -120,19 +175,32 @@ pub async fn ensure_endpoint(
     } else {
         bind_client_endpoint(transport_key.bytes()).await?
     };
-    *guard = Some(BoundPlane {
+    st.bound = Some(BoundPlane {
         endpoint: endpoint.clone(),
+        dials: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         owner_npub: owner_npub.to_string(),
         listening,
     });
     Ok(endpoint)
 }
 
+/// Register an in-flight dial on the current binding, so an upgrade waits for it.
+pub async fn lease_dial(shared: &SharedEndpoint) -> Option<DialLease> {
+    let st = shared.read().await;
+    let dials = st.bound.as_ref()?.dials.clone();
+    dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Some(DialLease(dials))
+}
+
 /// Shut the plane down and forget it. Called when the session stops having an identity (sign-out /
 /// wipe): a plane that outlives its identity is a node still answering redemptions with manifests
 /// signed by a key the user just walked away from.
 pub async fn close_plane(shared: &SharedEndpoint) {
-    if let Some(bound) = shared.write().await.take() {
+    let mut st = shared.write().await;
+    // Bump FIRST: any `ensure_endpoint` already queued for this lock captured the old generation and
+    // must refuse to publish rather than resurrect the plane after a wipe.
+    st.generation = st.generation.wrapping_add(1);
+    if let Some(bound) = st.bound.take() {
         bound.endpoint.close().await;
     }
 }

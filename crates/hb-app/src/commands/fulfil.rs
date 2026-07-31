@@ -28,7 +28,7 @@ use crate::manifest_source::StoreManifestSource;
 use crate::net::SharedRelay;
 use crate::store::{DataStore, IssuedTicketRecord};
 use crate::transport::{fetch_manifest, issue_ticket};
-use crate::transport_state::{ensure_endpoint, Role, SharedEndpoint};
+use crate::transport_state::{ensure_endpoint, lease_dial, Role, SharedEndpoint};
 
 fn cmd_err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
@@ -195,9 +195,28 @@ pub async fn redeem_manifest_ticket(
     // binding for this identity; in the `DialOnly` path it is simply never served from.
     let source: Arc<dyn crate::transport::ManifestSource> =
         StoreManifestSource::new((*store).clone(), id_clone, browse_key);
+    // **The nonce gate, enforced HERE and not only in the UI.** The render-time check in Chat is a
+    // usability affordance; this is the boundary. A UI bug, a replayed invoke, or anything else that
+    // reaches this command must not be able to make us dial an address we were not invited to — and
+    // "dial" is the whole exposure, because it hands the peer our IP.
+    //
+    // The stored ask is the only thing the peer cannot forge: it was written locally, after OUR
+    // request published successfully.
+    let asks = store.load_manifest_asks().map_err(cmd_err)?;
+    let ticket_nonce = ticket.ask_nonce.as_deref().unwrap_or_default();
+    let solicited = asks
+        .get(&crate::store::manifest_ask_key(&npub, &ticket.slug))
+        .is_some_and(|a| !a.nonce.is_empty() && a.nonce == ticket_nonce);
+    if !solicited {
+        return Err("That link doesn't answer a request you sent, so nothing was fetched.".into());
+    }
+
     let ep = ensure_endpoint(&endpoint, &own_npub, &transport_key, source, Role::DialOnly)
         .await
         .map_err(cmd_err)?;
+    // Held for the whole dial so a concurrent fulfil upgrading this endpoint waits instead of
+    // closing the socket mid-transfer.
+    let _lease = lease_dial(&endpoint).await;
 
     // The gate runs INSIDE `fetch_manifest`, before the acknowledgement — see its doc comment. If it
     // ran out here the ACK would already have been sent, and a manifest we reject (wrong author,
@@ -234,8 +253,21 @@ pub async fn redeem_manifest_ticket(
     // AFTER success, never on an attempt — a dial that failed has cost nothing and must stay
     // retryable, exactly like the ticket itself. Best-effort: the manifest is already in hand, and
     // failing the command here would tell the user a delivery they received had failed.
-    if let Err(e) = store.consume_manifest_ask(&npub, &ticket.slug) {
-        tracing::warn!("could not consume the manifest ask after redemption: {e}");
+    // Conditional on the nonce this ticket carried, so a re-ask made while this was in flight is not
+    // thrown away by our completion.
+    //
+    // **A failure here does NOT restore the authorization** — the UI holds an in-session spent-marker
+    // for the ask, keyed independently of this write, precisely because a disk-full here would
+    // otherwise re-open the reusable authorization this whole ruling removes. Logged loudly; the
+    // manifest is already in hand, so failing the command would report a delivery the user received
+    // as failed.
+    if let Err(e) =
+        store.consume_manifest_ask(&npub, &ticket.slug, ticket.ask_nonce.as_deref().unwrap_or(""))
+    {
+        tracing::error!(
+            "could not consume the manifest ask after redemption; the in-session spent-marker is \
+             the only thing preventing re-authorization until restart: {e}"
+        );
     }
     Ok(imported)
 }

@@ -142,6 +142,35 @@ mod tests {
         assert_eq!(after.delivered_bytes, Some(4096));
     }
 
+    /// **A completing ticket must not consume a NEWER ask.** There is one trace entry per
+    /// `(npub, slug)`, so a re-ask overwrites it. If ticket A is in flight, the user re-asks (nonce
+    /// B), and A then completes, an unconditional delete throws away B — and the legitimate answer to
+    /// the new ask afterwards reads as unsolicited, with no way for the user to see why.
+    #[test]
+    fn consuming_an_ask_is_conditional_on_the_nonce_that_was_answered() {
+        let (_dir, store) = store();
+        store
+            .record_manifest_ask("npub1a", "criterion", "fp", "2026-01-01T00:00:00Z", "nonce-A")
+            .unwrap();
+        // The user re-asks while ticket A is still in flight — same key, new nonce.
+        store
+            .record_manifest_ask("npub1a", "criterion", "fp", "2026-01-01T00:05:00Z", "nonce-B")
+            .unwrap();
+
+        // Ticket A now completes. It must NOT consume B's ask.
+        store.consume_manifest_ask("npub1a", "criterion", "nonce-A").unwrap();
+        let asks = store.load_manifest_asks().unwrap();
+        let kept = asks.get("npub1a|criterion").expect("the newer ask survives an older completion");
+        assert_eq!(kept.nonce, "nonce-B");
+
+        // And the ask that IS answered is consumed.
+        store.consume_manifest_ask("npub1a", "criterion", "nonce-B").unwrap();
+        assert!(
+            !store.load_manifest_asks().unwrap().contains_key("npub1a|criterion"),
+            "one ask, one auto-dial — the answered ask is spent"
+        );
+    }
+
     /// An invented request id must be indistinguishable from a forged ticket — the source reports
     /// nothing, and `transport.rs`'s single refusal constant says the same thing either way.
     #[test]
