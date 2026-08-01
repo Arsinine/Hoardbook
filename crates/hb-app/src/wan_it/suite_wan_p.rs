@@ -479,3 +479,10 @@ async fn verify_peer_online(client: &RelayClient, peer: &Identity) -> Result<(),
         .map_err(|e| format!("verify_binding failed: {e}"))?;
     Ok(())
 }
+
+/// The canary's P2 reuse point: publish a beacon and record EACH relay's accept/reject. This is the
+/// standalone form of the P2 row body (the canary does not run the full WAN-P suite — it runs this one
+/// row). Returns Ok when at least one relay accepted, Err with per-relay evidence otherwise.
+pub async fn canary_beacon_acceptance(relays: &[String]) -> Result<(), String> {
+    p2_per_relay_acceptance(relays).await
+}

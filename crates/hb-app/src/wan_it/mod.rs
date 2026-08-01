@@ -5,7 +5,7 @@
 //! contact-row pill reads). This is the pattern the retired `hb-p2p-it` harness proved (in-crate
 //! bin, serve/probe roles, TAP 13); the payload here drives current modules, not deleted ones.
 //!
-//! Two roles + one stub:
+//! Two roles + one daemon:
 //!
 //!   hb-wan-it serve --data-dir <dir> --relay <url>...
 //!     Real identity seeded from <dir> (load-or-create), publishes the presence beacon via the REAL
@@ -17,19 +17,22 @@
 //!                  [--flood-relay <url>... --flood-count <n>]
 //!     Runs the WAN-P rows (P1–P5) against a live serve, TAP 13 out. `--flood-relay` arms P3.
 //!
-//!   hb-wan-it canary [--interval <secs>]
-//!     Parse the args, print "not yet implemented", exit nonzero. Stub only (the canary daemon is a
-//!     later slice — M20 W6 §W6 cadence, not this task).
+//!   hb-wan-it canary [--interval <secs>] [--once]
+//!     The thin continuous slice: one pass = M4 (n0 reachable) + R2 (default-relay policy) + P2
+//!     (beacon acceptance) + C1 (DM round-trip). Loop every --interval (default 600 s); --once runs
+//!     a single pass (the smoke form).
 //!
-//! **Not in CI.** Manual pre-release gate + the canary daemon (later slice). The suite's exit code
-//! is nonzero when rows fail; that is correct and intended for the pre-W1 state (P1 on public
-//! relays, P4 are expected red).
+//! **Not in CI.** Manual pre-release gate + the canary daemon. The suite's exit code is nonzero
+//! when rows fail; that is correct and intended for the pre-W1 state (P1 on public relays, P4 are
+//! expected red).
 
 mod args;
 mod suite_wan_c;
+mod suite_wan_d;
 mod suite_wan_e2e;
 mod suite_wan_m;
 mod suite_wan_p;
+mod suite_wan_r;
 mod suite_wan_t;
 mod suite_wan_u;
 mod tap;
@@ -75,7 +78,13 @@ pub(crate) async fn run() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some("canary") => run_canary(&args[1..]),
+        Some("canary") => match run_canary(&args[1..]).await {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("[canary] error: {e:#}");
+                ExitCode::FAILURE
+            }
+        },
         _ => {
             eprintln!("{}", usage());
             ExitCode::FAILURE
@@ -89,7 +98,7 @@ fn usage() -> &'static str {
      \n\
      WAN integration harness (M20 W6). Drives the REAL production paths (presence + manifest plane)\n\
      between live endpoints. Not in CI — run as a manual pre-release gate (probe from NAT-A against\n\
-     serve on NAT-B and the VPSes) or via the canary daemon (later slice).\n\
+     serve on NAT-B and the VPSes) or via the canary daemon.\n\
      \n\
      serve  --data-dir <dir> --relay <ws-url>...\n\
             [--seed-dir <dir> --asker-npub <npub>]\n\
@@ -112,6 +121,9 @@ fn usage() -> &'static str {
             [--suite wan-u]\n\
             [--suite wan-c]\n\
             [--suite wan-t]\n\
+            [--suite wan-d [--flood-relay <ws-url>... --flood-count <n>]]\n\
+            [--suite wan-r]\n\
+            [--suite wan-m4]\n\
             Runs WAN-P rows P1–P5 against a live serve by default. --flood-relay arms P3\n\
             (VPS strfry only: ws://141.98.199.138:7777, ws://45.129.8.225:7777).\n\
             --ticket-json + --suite wan-m runs the WAN-M rows (M1 + M9) instead, redeeming the\n\
@@ -124,9 +136,18 @@ fn usage() -> &'static str {
             offline catch-up, disjoint relay sets, cursor discipline, blocked drop).\n\
             --suite wan-t runs the WAN-T rows (T1–T5): topics between real clients (public join,\n\
             channel pseudonymity, private invite, leave retract, announce + local filter).\n\
+            --suite wan-d runs the WAN-D rows (D1–D4): discovery against real relays (cross-region\n\
+            visibility, NIP-65, search-eviction VPS-only, BIGRELAY). --flood-relay arms D3.\n\
+            --suite wan-r runs the WAN-R rows (R1–R2): relay-set resilience + the default-relay\n\
+            policy watch (the canary row). R2 touches the public defaults — that is its job.\n\
+            --suite wan-m4 runs the M4 row standalone (n0 canary core — bind_endpoint obtains a\n\
+            home relay and the endpoint is reachable through it). Probe-plays-both — no serve needed.\n\
      \n\
-     canary [--interval <secs>]\n\
-            Stub — parses args, prints 'not yet implemented', exits nonzero."
+     canary [--interval <secs>] [--once]\n\
+            The thin continuous slice: one pass = M4 (n0 reachable) + R2 (default-relay policy) +\n\
+            P2 (beacon acceptance) + C1 (DM round-trip). Loop every --interval (default 600 s), each\n\
+            pass printing a timestamped one-line summary; any row failure prints [ALERT] to stderr.\n\
+            --once: a single pass (the smoke uses this); exit nonzero if any row failed."
 }
 
 // ---------------------------------------------------------------------------
@@ -809,11 +830,6 @@ fn parse_peer(peer: &str) -> Result<nostr::PublicKey> {
 }
 
 async fn run_probe(args: &[String]) -> Result<ExitCode> {
-    let relays = args::collect_relays(args);
-    if relays.is_empty() {
-        bail!("probe requires at least one --relay");
-    }
-
     // Suite selection: --suite wan-m runs the WAN-M rows (M1 + M9) against --ticket-json; --suite
     // wan-e2e runs the WAN-E2E rows (E1 + E2, the full DM-coordinated pipeline); --suite wan-u runs
     // the WAN-U rows (U1–U7, the user-surface live twins of the hb-it L2 browse/publish/private
@@ -821,7 +837,18 @@ async fn run_probe(args: &[String]) -> Result<ExitCode> {
     // for targeted iroh isolation runs (the E2E suite rides the full DM leg).
     let suite = args::flag_value(args, "--suite").unwrap_or("wan-p");
 
-    // WAN-U / WAN-C / WAN-T are probe-plays-both: every row constructs its own throwaway
+    // WAN-M4 (n0 canary core) needs no relays — it uses presets::N0 directly. Dispatch before the
+    // relay-set check so `probe --suite wan-m4` works without --relay.
+    if suite == "wan-m4" {
+        return run_probe_wan_m4(args).await;
+    }
+
+    let relays = args::collect_relays(args);
+    if relays.is_empty() {
+        bail!("probe requires at least one --relay");
+    }
+
+    // WAN-U / WAN-C / WAN-T / WAN-D / WAN-R are probe-plays-both: every row constructs its own throwaway
     // identities, so they need no --peer. All other suites (wan-p/m/e2e) drive a live serve and
     // require --peer.
     if suite == "wan-u" {
@@ -832,6 +859,12 @@ async fn run_probe(args: &[String]) -> Result<ExitCode> {
     }
     if suite == "wan-t" {
         return run_probe_wan_t(args).await;
+    }
+    if suite == "wan-d" {
+        return run_probe_wan_d(args).await;
+    }
+    if suite == "wan-r" {
+        return run_probe_wan_r(args).await;
     }
 
     let peer_str = args::flag_value(args, "--peer")
@@ -1092,19 +1125,192 @@ async fn run_probe_wan_t(args: &[String]) -> Result<ExitCode> {
 }
 
 // ---------------------------------------------------------------------------
-// canary — stub
+// probe — WAN-D (D1–D4 — discovery against real relays)
 // ---------------------------------------------------------------------------
 
-fn run_canary(args: &[String]) -> ExitCode {
-    // Parse the args so we can confirm the shape; the canary daemon is a later slice (M20 W6 §W6
-    // cadence, not this task). Documenting the intended flags here so the eventual implementation
-    // has the surface pinned.
-    let _interval = args::flag_value(args, "--interval");
-    let _relays = args::collect_relays(args);
-    eprintln!("hb-wan-it canary: not yet implemented (M20 W6 canary daemon — a later slice).");
-    eprintln!("  Intended: the thin continuous slice (M4 n0-reachable, R2 default-relay policy,");
-    eprintln!("  P2 beacon acceptance, C1 DM round-trip) every ~10 min with [ALERT] on failure.");
-    ExitCode::FAILURE
+/// Run the WAN-D rows against the live relay set. Probe-plays-both: every row constructs its own
+/// throwaway identities against the live relays. D3 is opt-in via --flood-relay (relay citizenship:
+/// flood-shaped rows never run against public relays).
+async fn run_probe_wan_d(args: &[String]) -> Result<ExitCode> {
+    let relays = args::collect_relays(args);
+    if relays.is_empty() {
+        bail!("probe requires at least one --relay");
+    }
+
+    // D3 arming: --flood-relay (and optionally --flood-count). Absent ⇒ D3 is skipped-with-diagnostic.
+    let flood_relays = args::collect_flood_relays(args);
+    let flood_count = args::flag_value(args, "--flood-count")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(60);
+    let flood_ctx = if flood_relays.is_empty() {
+        None
+    } else {
+        Some(suite_wan_d::FloodCtx {
+            flood_relays,
+            read_relays: relays.clone(),
+            flood_count,
+        })
+    };
+
+    let input = suite_wan_d::build_probe_input(relays.clone(), flood_ctx).await?;
+
+    println!("# WAN-D probe (probe-plays-both against the live relay set)");
+    println!("# relay set: {}", relays.join(", "));
+    if input.flood_ctx.is_some() {
+        println!("# D3 armed (flood-count={flood_count})");
+    }
+
+    let mut tap = tap::Tap::new();
+    suite_wan_d::run(&mut tap, &input).await;
+    Ok(tap.finish())
+}
+
+// ---------------------------------------------------------------------------
+// probe — WAN-R (R1–R2 — relay-set behavior + the default-relay policy watch)
+// ---------------------------------------------------------------------------
+
+/// Run the WAN-R rows. R1 uses the live VPS relay set; R2 (the canary row) touches the public
+/// defaults — that is its job (one event per kind per relay per run). Probe-plays-both.
+async fn run_probe_wan_r(args: &[String]) -> Result<ExitCode> {
+    let relays = args::collect_relays(args);
+    if relays.is_empty() {
+        bail!("probe requires at least one --relay (the VPS strfry set for R1)");
+    }
+
+    let input = suite_wan_r::build_probe_input(relays.clone()).await?;
+
+    println!("# WAN-R probe (R1: degraded set against the live relay set; R2: public-default policy watch)");
+    println!("# relay set (R1): {}", relays.join(", "));
+
+    let mut tap = tap::Tap::new();
+    suite_wan_r::run(&mut tap, &input).await;
+    Ok(tap.finish())
+}
+
+// ---------------------------------------------------------------------------
+// probe — WAN-M4 (n0 canary core — standalone)
+// ---------------------------------------------------------------------------
+
+/// Run the M4 row standalone (n0 canary core). Binds a listening endpoint via the production path
+/// (presets::N0), waits for a home relay, then dials it through the relay path. Probe-plays-both.
+async fn run_probe_wan_m4(_args: &[String]) -> Result<ExitCode> {
+    println!("# WAN-M4 probe (n0 canary core — bind_endpoint + home-relay reachability)");
+
+    let mut tap = tap::Tap::new();
+    tap.check(
+        "M4: bind_endpoint obtains a home relay (presets::N0) and the endpoint is reachable through it",
+        suite_wan_m::m4_n0_canary().await,
+    );
+    Ok(tap.finish())
+}
+
+// ---------------------------------------------------------------------------
+// canary — the thin continuous slice (M20 W6 §W6 cadence)
+//
+// One pass = M4 (n0 reachable) + R2 (default-relay policy) + P2 (beacon acceptance) + C1 (DM
+// round-trip). Loop every --interval (default ~600 s), each pass printing a timestamped one-line
+// summary; any row failure prints [ALERT] <row>: <reason> to stderr. --once: a single pass (the smoke
+// uses this); exit nonzero if any row failed. Loop mode runs until killed.
+// ---------------------------------------------------------------------------
+
+/// The default canary interval (the §W6 recommended cadence, ~10 min).
+const CANARY_DEFAULT_INTERVAL: Duration = Duration::from_secs(600);
+
+async fn run_canary(args: &[String]) -> Result<ExitCode> {
+    let once = args::flag_value(args, "--once").is_some();
+    let interval = args::flag_value(args, "--interval")
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(CANARY_DEFAULT_INTERVAL);
+
+    if once {
+        let failed = canary_pass().await;
+        // Force-exit: the iroh endpoints spawned by M4 leave background tasks (relay keepalives)
+        // that keep the tokio runtime alive after the summary prints. --once is the smoke form; a
+        // prompt process exit is the contract. Loop mode runs until killed (SIGTERM handles it).
+        std::process::exit(if failed { 1 } else { 0 });
+    }
+
+    // Loop mode: run forever, sleep `interval` between passes. Each pass prints a timestamped
+    // one-line summary; failures print [ALERT] to stderr. Runs until killed.
+    loop {
+        canary_pass().await;
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Run one canary pass. Returns true if any row failed (for --once exit code). Each row runs with its
+/// own short timeout; a failure prints `[ALERT] <row>: <reason>` to stderr and the pass summary prints
+/// the row-by-row outcome. The summary is timestamped (the §W6 cadence mandate).
+async fn canary_pass() -> bool {
+    let now = unix_now();
+    let ts = rfc3339_now();
+    let mut failures: Vec<(&'static str, String)> = Vec::new();
+
+    // M4 — n0 canary core. The first row because it is the one that catches an n0 fleet outage
+    // (production's silent dependency). A long-ish timeout is built into the row (HOME_RELAY_WAIT +
+    // M4_DIAL_TIMEOUT = 60 + 90 = 150s); the outer 200s has headroom.
+    match tokio::time::timeout(Duration::from_secs(200), suite_wan_m::m4_n0_canary()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => failures.push(("M4", e)),
+        Err(_) => failures.push(("M4", "timed out at 150s".to_string())),
+    }
+
+    // R2 — default-relay policy watch. The evidence table is printed to stderr by the row; the row
+    // fails only on connect failures (a relay down for everyone).
+    match tokio::time::timeout(Duration::from_secs(120), suite_wan_r::r2_default_relay_policy_watch()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => failures.push(("R2", e)),
+        Err(_) => failures.push(("R2", "timed out at 120s".to_string())),
+    }
+
+    // P2 — beacon acceptance. Reuse the WAN-P P2 body (publish a beacon, record per-relay
+    // accept/reject). Needs a relay set; the canary uses the VPS strfry backbone.
+    let beacon_relays = canary_beacon_relays();
+    match tokio::time::timeout(
+        Duration::from_secs(45),
+        suite_wan_p::canary_beacon_acceptance(&beacon_relays),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => failures.push(("P2", e)),
+        Err(_) => failures.push(("P2", "timed out at 45s".to_string())),
+    }
+
+    // C1 — DM round-trip. Reuse the WAN-C C1 body (send + fetch+unwrap). Needs the relay set.
+    match tokio::time::timeout(
+        Duration::from_secs(60),
+        suite_wan_c::canary_dm_round_trip(&beacon_relays),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => failures.push(("C1", e)),
+        Err(_) => failures.push(("C1", "timed out at 60s".to_string())),
+    }
+
+    // The [ALERT] lines (stderr) — one per failure.
+    for (row, reason) in &failures {
+        eprintln!("[ALERT] {row}: {reason}");
+    }
+
+    // The timestamped one-line summary (stdout). "ok" when all four rows passed; otherwise the failing
+    // rows named.
+    let status = if failures.is_empty() {
+        "ok".to_string()
+    } else {
+        format!("FAIL: {}", failures.iter().map(|(r, _)| r.to_string()).collect::<Vec<_>>().join(","))
+    };
+    let failed = !failures.is_empty();
+    println!("[canary {ts}] {status} (M4+R2+P2+C1) unix={now}");
+    failed
+}
+
+/// The VPS strfry backbone the canary uses for P2 + C1 (the M5 launch relays, the fallback for the
+/// M20 W1 discriminator). Hardcoded: the canary is a daemon, not a probe that takes --relay.
+fn canary_beacon_relays() -> Vec<String> {
+    vec!["ws://141.98.199.138:7777".to_string(), "ws://45.129.8.225:7777".to_string()]
 }
 
 // ---------------------------------------------------------------------------

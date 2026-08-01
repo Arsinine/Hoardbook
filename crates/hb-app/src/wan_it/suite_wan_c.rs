@@ -110,6 +110,17 @@ pub async fn run(tap: &mut Tap, probe: &ProbeInput) {
     eprintln!("   WAN-C total wall-clock for 5 rows: {:.2}s", wall.elapsed().as_secs_f64());
 }
 
+/// The canary's C1 reuse point: a single DM A→B round-trip (send + fetch+unwrap). This is the
+/// standalone form of the C1 row body (the canary does not run the full WAN-C suite — it runs this
+/// one row). Returns Ok when the DM landed and unwrapped, Err with a diagnostic otherwise.
+pub async fn canary_dm_round_trip(relays: &[String]) -> Result<(), String> {
+    let probe = ProbeInput {
+        relays: relays.to_vec(),
+        store: DataStore::new(std::env::temp_dir().join(format!("hb-wan-it-canary-{}", body_token()))),
+    };
+    c1_delivery_latency(&probe).await
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers shared across rows (adapted from WAN-U / hb-it/harness.rs)
 // ---------------------------------------------------------------------------

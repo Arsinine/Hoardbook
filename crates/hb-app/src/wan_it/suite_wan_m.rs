@@ -514,6 +514,134 @@ pub async fn build_probe_input(
 }
 
 // ---------------------------------------------------------------------------
+// M4 — n0 canary core (ruling 2): bind_endpoint obtains a home relay and the endpoint is reachable
+//
+// This is the canary daemon's core row (ruling 2: "n0 infrastructure: canary it first"). Production
+// silently depends on n0's public relay/discovery fleet — `bind_endpoint` binds with `presets::N0`,
+// which acquires a home relay. This row proves that dependency holds: bind a listening endpoint via
+// the production path, wait for it to acquire a home relay (an addr carrying a relay URL), then dial
+// it from a SEPARATE dial-only endpoint via the relay path and complete the ALPN handshake. A failure
+// here is the early warning that n0 is down or unreachable — the class of breakage that happens
+// BETWEEN releases with no code change on our side.
+//
+// Standalone (probe-plays-both): no serve, no ticket, no manifest. The row binds TWO endpoints — a
+// listener (the production `bind_endpoint`, with the manifest ALPN) and a dialer (the production
+// `bind_client_endpoint`, dial-only). The dialer connects to the listener's relay-routable addr; the
+// ALPN handshake completing is the reachability proof.
+// ---------------------------------------------------------------------------
+
+/// How long to wait for the listener to acquire a home relay (n0 discovery). The endpoint polls its
+/// own addr; once the addr carries a relay URL, the home relay is up. Generous: n0 discovery on a
+/// cold path can take tens of seconds.
+const HOME_RELAY_WAIT: Duration = Duration::from_secs(60);
+
+/// The dial deadline for the reachability leg. A relay-routed dial can take tens of seconds on a
+/// cold path (iroh discovers the route, then the relay proxies the QUIC handshake). Generous so a
+/// slow-but-working relay path is not read as a failure; a timeout means the home relay is up but
+/// genuinely not routing.
+const M4_DIAL_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Run the M4 n0 canary row standalone. Binds a listening endpoint via the production `bind_endpoint`
+/// (`presets::N0`), waits for a home relay, then dials it from a dial-only endpoint and completes the
+/// ALPN handshake. Returns Ok on reachability, Err with a diagnostic on failure.
+pub async fn m4_n0_canary() -> Result<(), String> {
+    use crate::transport::{bind_client_endpoint, bind_endpoint, MANIFEST_ALPN};
+    use iroh::Watcher;
+
+    // (1) Bind a listening endpoint via the production path. bind_endpoint uses presets::N0 + the
+    //     manifest ALPN — the same binding serve uses. A fresh transport secret per run is fine (M4
+    //     asserts reachability, not stable identity).
+    let server_secret: [u8; 32] = rand::random();
+    let server = bind_endpoint(&server_secret)
+        .await
+        .map_err(|e| format!("M4 bind_endpoint (presets::N0 listener) failed: {e}"))?;
+    eprintln!("   M4 listener bound via presets::N0; waiting for a home relay");
+
+    // (2) Wait for the listener to acquire a home relay. The addr watcher yields EndpointAddrs; once
+    //     one carries a relay URL (a TransportAddr::Relay), the home relay is up and the endpoint is
+    //     dialable through it. Poll the watcher until a relay addr appears or the deadline fires.
+    let deadline = std::time::Instant::now() + HOME_RELAY_WAIT;
+    let mut relay_url: Option<String> = None;
+    while std::time::Instant::now() < deadline {
+        let addr = server.watch_addr().get();
+        // Look for a relay transport addr in the set. The addr's addrs are a BTreeSet; a Relay variant
+        // means the endpoint registered with a home relay.
+        let found = serde_json::to_string(&addr).unwrap_or_default();
+        if found.contains("Relay") || found.contains("relay") {
+            // Extract the relay URL from the addr for the diagnostic. The EndpointAddr's Display/Debug
+            // names the relay; the JSON serialization carries it. This is best-effort — the assertion
+            // is "a relay addr exists", not "we parsed the URL".
+            relay_url = Some(found);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let relay_info = match relay_url {
+        Some(r) => {
+            eprintln!("   M4 listener acquired a home relay (addr carries a Relay transport)");
+            r
+        }
+        None => {
+            server.close().await;
+            return Err(format!(
+                "M4 the listener did NOT acquire a home relay within {HOME_RELAY_WAIT:?}. n0's relay \
+                 fleet is unreachable — this is ruling 2's canary failure (production silently depends \
+                 on n0). Check n0 status / network egress."
+            ));
+        }
+    };
+    let _ = relay_info; // informational; the handshake below is the real assertion.
+
+    // (3) Dial the listener from a fresh dial-only endpoint via the relay path. bind_client_endpoint
+    //     is the production dial-only binding (no advertised ALPN). The dial uses the listener's addr
+    //     (which now carries the relay URL), so the connection routes through the home relay. The
+    //     ALPN handshake completing (connect returns Ok) is the reachability proof.
+    let client_secret: [u8; 32] = rand::random();
+    let client = bind_client_endpoint(&client_secret)
+        .await
+        .map_err(|e| format!("M4 bind_client_endpoint (dial-only) failed: {e}"))?;
+
+    // The listener's addr (with the relay URL) — the dial target. watch_addr().get() snapshots it.
+    let target = server.watch_addr().get();
+
+    let dial_result = tokio::time::timeout(M4_DIAL_TIMEOUT, async {
+        client.connect(target, MANIFEST_ALPN).await
+    })
+    .await;
+
+    let conn = match dial_result {
+        Ok(Ok(conn)) => {
+            eprintln!("   M4 dial-only endpoint reached the listener through the n0 home relay (ALPN ok)");
+            conn
+        }
+        Ok(Err(e)) => {
+            // Bounded close: iroh's close().await can hang on a wedged relay path. Drop the endpoints
+            // (background cleanup) rather than awaiting close — the canary force-exits via
+            // std::process::exit in --once mode, and the OS reclaims sockets on exit.
+            drop(server);
+            drop(client);
+            return Err(format!(
+                "M4 the dial through the home relay FAILED (the home relay is up but not routing — a \
+                 partial n0 outage): {e}"
+            ));
+        }
+        Err(_) => {
+            drop(server);
+            drop(client);
+            return Err(format!(
+                "M4 the dial through the home relay TIMED OUT at {M4_DIAL_TIMEOUT:?} — the home relay \
+                 is up but the connection did not complete (a relay-routing failure or a stale addr)"
+            ));
+        }
+    };
+
+    // A clean close proves the connection was real (not a half-open that the runtime tear-down masks).
+    conn.close(0u32.into(), b"M4 canary complete");
+    drop(server);
+    drop(client);
+    Ok(())
+}
+// ---------------------------------------------------------------------------
 // Unit tests — pure parts (no network, no iroh endpoint)
 // ---------------------------------------------------------------------------
 
