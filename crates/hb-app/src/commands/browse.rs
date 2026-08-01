@@ -262,7 +262,12 @@ async fn resolve_full_if_truncated(
 /// Resolve a share code to a `CachedPeer`: fetch the public teaser + the presence binding (online
 /// status), as a pure relay read. Falls back to the local cache (stale, offline) when the relays
 /// yield nothing.
-async fn resolve_peer(
+///
+/// `pub(crate)` (M20 W6.4): the WAN-U suite (`wan_it::suite_wan_u::u1_profile_resolve_funnel`)
+/// drives this fn directly to exercise the production add-contact funnel over a live relay — the
+/// same path `paste_key` calls. Promoted from private to `pub(crate)` so the in-crate harness can
+/// reach it without widening to full `pub`; no new external surface is exposed.
+pub(crate) async fn resolve_peer(
     share_code: &ShareCode,
     me: &Identity,
     store: &DataStore,
@@ -493,7 +498,13 @@ fn merge_local_state(peer: &mut CachedPeer, existing: &CachedPeer, had_explicit_
 /// "don't resolve twice" fix can hand a pre-resolved peer straight here, skipping `resolve_peer`.
 /// Never calls the relay; only the local store. `had_explicit_petname` is computed by the caller
 /// (before `apply_follow_petname` consumes the `petname` arg) — see `follow` for why the flag exists.
-fn save_followed_peer(
+///
+/// `pub(crate)` (M20 W6.4): the WAN-U suite drives this fn directly to assert the W2 contract over a
+/// live relay — one `resolve_peer` (the lookup) then this save-tail (0 resolves). The structural
+/// proof the relay is never dialed on the commit path lives in the unit test; the WAN-U row exercises
+/// the same path end-to-end. Promoted from private to `pub(crate)` (no full `pub`) for the in-crate
+/// harness only.
+pub(crate) fn save_followed_peer(
     store: &DataStore,
     mut peer: CachedPeer,
     petname: Option<String>,
