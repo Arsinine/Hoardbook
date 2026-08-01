@@ -121,11 +121,31 @@
 		return groups.filter(g => g.pubkeys.includes(hb_id)).map(g => g.name);
 	}
 
-	// Per-contact group-change select: hb_id → selected group name or '' for Ungrouped.
+	// Per-contact group membership editor (M20 W5, data-loss half). The data model and renderer are
+	// many-to-many; this editor is too — checkboxes over ALL groups, pre-checked with the contact's
+	// CURRENT memberships, and on Apply the full checked set is sent to contact_update_groups (which
+	// diffs the complete set). The old single-select sent `[newGroupName]` and silently dropped every
+	// other membership; that live data loss is what this replaces.
 	let contactGroupEditing: Record<string, boolean> = $state({});
+	// Working checkbox state per contact being edited: hb_id → set of checked group names. Seeded from
+	// `contactGroups(hb_id)` when the editor opens so the pre-check never loses existing memberships.
+	let contactGroupDraft: Record<string, Set<string>> = $state({});
 
-	async function handleMoveGroup(hb_id: string, newGroupName: string) {
-		const groupNames = newGroupName ? [newGroupName] : [];
+	function beginGroupEdit(hb_id: string) {
+		contactGroupDraft = { ...contactGroupDraft, [hb_id]: new Set(contactGroups(hb_id)) };
+		contactGroupEditing = { ...contactGroupEditing, [hb_id]: true };
+	}
+
+	function toggleDraftGroup(hb_id: string, name: string, checked: boolean) {
+		const next = new Set(contactGroupDraft[hb_id] ?? []);
+		if (checked) next.add(name); else next.delete(name);
+		// Mutate-in-place then reassign so Svelte 5 sees the change (state[k] = v, not state={...}).
+		contactGroupDraft[hb_id] = next;
+		contactGroupDraft = { ...contactGroupDraft };
+	}
+
+	async function handleSaveGroups(hb_id: string) {
+		const groupNames = [...(contactGroupDraft[hb_id] ?? [])];
 		try {
 			await contactUpdateGroups(hb_id, groupNames);
 			await loadGroups();
@@ -493,29 +513,42 @@
 				<!-- Groups -->
 				{#if peerGroups.length > 0 || contactGroupEditing[peer.npub]}
 					<div class="group-row">
-						{#each peerGroups as gname}
-							<span class="group-pill">{gname}</span>
-						{/each}
 						{#if contactGroupEditing[peer.npub]}
-							<select
-								class="group-select group-select-inline"
-								onchange={(e) => handleMoveGroup(peer.npub, e.currentTarget.value)}
-							>
-								<option value="">Ungrouped</option>
+							<!-- M20 W5: multi-select checkbox editor. Every group is listed with a checkbox
+							     pre-checked to its current membership; on Apply the full checked set is sent to
+							     contact_update_groups. This replaces the single-select that silently dropped all
+							     other memberships (live data loss). -->
+							<div class="group-edit-list">
 								{#each groups as g (g.name)}
-									<option value={g.name} selected={peerGroups.includes(g.name)}>{g.name}</option>
+									<label class="group-check">
+										<input
+											type="checkbox"
+											checked={peerGroups.includes(g.name)}
+											onchange={(e) => toggleDraftGroup(peer.npub, g.name, e.currentTarget.checked)}
+										/>
+										{g.name}
+									</label>
 								{/each}
-							</select>
+								{#if groups.length === 0}
+									<span class="group-edit-empty">No groups yet.</span>
+								{/if}
+							</div>
 							<button class="tag-x" onclick={() => { contactGroupEditing = { ...contactGroupEditing, [peer.npub]: false }; }}>×</button>
-						{:else if groups.length > 0}
-							<button class="tag-add-btn" onclick={() => { contactGroupEditing = { ...contactGroupEditing, [peer.npub]: true }; }}>
-								{peerGroups.length > 0 ? '✎' : '+ group'}
-							</button>
+							<button class="btn-primary btn-xs" onclick={() => handleSaveGroups(peer.npub)}>Apply</button>
+						{:else}
+							{#each peerGroups as gname}
+								<span class="group-pill">{gname}</span>
+							{/each}
+							{#if groups.length > 0}
+								<button class="tag-add-btn" onclick={() => beginGroupEdit(peer.npub)}>
+									{peerGroups.length > 0 ? '✎' : '+ group'}
+								</button>
+							{/if}
 						{/if}
 					</div>
 				{:else if groups.length > 0}
 					<div class="group-row">
-						<button class="tag-add-btn" onclick={() => { contactGroupEditing = { ...contactGroupEditing, [peer.npub]: true }; }}>+ group</button>
+						<button class="tag-add-btn" onclick={() => beginGroupEdit(peer.npub)}>+ group</button>
 					</div>
 				{/if}
 
@@ -565,7 +598,7 @@
 		<button class="menu-item" onclick={() => { handleRefresh(peer.npub); menuOpenFor = null; }} disabled={refreshing === peer.npub}>
 			{refreshing === peer.npub ? 'Refreshing…' : 'Refresh'}
 		</button>
-		<button class="menu-item" onclick={() => { detailExpanded = peer.npub; contactGroupEditing = { ...contactGroupEditing, [peer.npub]: true }; menuOpenFor = null; }}>Edit groups…</button>
+		<button class="menu-item" onclick={() => { detailExpanded = peer.npub; beginGroupEdit(peer.npub); menuOpenFor = null; }}>Edit groups…</button>
 		<button class="menu-item" onclick={() => { detailExpanded = peer.npub; editingTagsFor = peer.npub; tagInput = ''; menuOpenFor = null; }}>Edit tags…</button>
 		<div class="menu-item menu-item-confirm">
 			<ConfirmButton label="Remove contact" confirmText="Remove this contact?" onconfirm={() => { handleUnfollow(peer.npub); menuOpenFor = null; }} />
@@ -980,12 +1013,16 @@
 		background: color-mix(in oklch, var(--accent) 10%, transparent);
 		color: var(--accent);
 	}
-	.group-select {
-		height: 26px; padding: 0 6px; border-radius: 5px; font-size: 11.5px;
-		background: var(--bg-input); border: 1px solid var(--border); color: var(--fg);
-		font-family: var(--font-ui); cursor: pointer;
+	/* M20 W5: inline multi-select group membership editor (replaces the single-select that dropped
+	   every other membership). Checkboxes over all groups + an Apply button, matching the inline-edit
+	   pattern the tag row already uses in this detail area. */
+	.group-edit-list { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; }
+	.group-check {
+		display: inline-flex; align-items: center; gap: 4px;
+		font-size: 11.5px; color: var(--fg-muted); cursor: pointer;
 	}
-	.group-select-inline { height: 22px; font-size: 11px; }
+	.group-check input { margin: 0; cursor: pointer; }
+	.group-edit-empty { font-size: 11px; color: var(--fg-dim); }
 
 	/* M15 W1: buttons unified on the app.css .btn system (local copies removed). */
 </style>
