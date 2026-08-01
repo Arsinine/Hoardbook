@@ -586,7 +586,7 @@ mod tests {
         let newer_created_at = victim_event.created_at + 100;
         let rebuilt = EventBuilder::new(Kind::from_u16(KIND_LISTING), attacker_event.content.clone())
             .tags(attacker_event.tags.clone())
-            .custom_created_at(Timestamp::from(newer_created_at));
+            .custom_created_at(newer_created_at);
         attacker_event = attacker.sign(rebuilt).unwrap();
         assert_ne!(attacker_event.pubkey, peer, "attacker must differ from victim");
         assert!(
