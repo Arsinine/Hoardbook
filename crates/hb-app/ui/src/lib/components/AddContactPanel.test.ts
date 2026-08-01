@@ -35,11 +35,16 @@ function makeHit(overrides: Partial<PeerSearchHit> = {}): PeerSearchHit {
 	};
 }
 
+/** Wrap hits in the M20 W3 result envelope `{ hits, capped }` (the shape `search_peers` returns). */
+function resultEnvelope(hits: PeerSearchHit[], capped = false) {
+	return { hits, capped };
+}
+
 /** Open the Discover section and run a search so the hit-cards render. Returns scoped query
  *  helpers bound to the rendered panel. */
-async function discoverHits(hits: PeerSearchHit[], props: Record<string, unknown> = {}) {
-	(searchPeers as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(hits);
-	const { getByRole, getAllByRole, findByRole, getByPlaceholderText } = render(AddContactPanel, {
+async function discoverHits(hits: PeerSearchHit[], props: Record<string, unknown> = {}, capped = false) {
+	(searchPeers as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(resultEnvelope(hits, capped));
+	const { getByRole, getAllByRole, findByRole, findByText, queryByText, getByPlaceholderText } = render(AddContactPanel, {
 		props: { open: true, ...props },
 	});
 	await fireEvent.click(getByRole('button', { name: /discover hoarders/i }));
@@ -48,7 +53,7 @@ async function discoverHits(hits: PeerSearchHit[], props: Record<string, unknown
 	// Wait for the hit-card's Add-contact button (class hit-follow) to appear — that means searchPeers
 	// resolved and the results rendered.
 	const addBtn = await findByRole('button', { name: 'Add contact' });
-	return { addBtn, getAllByRole, findByRole };
+	return { addBtn, getAllByRole, findByRole, findByText, queryByText };
 }
 
 describe('AddContactPanel — M17 W1 discovery Message action', () => {
@@ -73,3 +78,22 @@ describe('AddContactPanel — M17 W1 discovery Message action', () => {
 		expect(onadd).not.toHaveBeenCalled();
 	});
 });
+
+describe('AddContactPanel — M20 W3 truncation affordance', () => {
+	it('shows "showing first N" when the result is capped', async () => {
+		// One hit returned, but the backend flagged more candidates existed (capped=true). The UI
+		// must surface the truncation rather than silently presenting the slice as everyone. (Hit
+		// count is independent of the cap flag — one hit + capped=true still means "there are more".)
+		const { findByText } = await discoverHits([makeHit()], {}, true);
+		const affordance = await findByText(/showing first 1/i);
+		expect(affordance).toBeTruthy();
+		expect(affordance.getAttribute('role')).toBe('status');
+	});
+
+	it('hides the affordance when the result is not capped', async () => {
+		// capped=false → no affordance. The same hit must NOT show "showing first".
+		const { queryByText } = await discoverHits([makeHit()], {}, false);
+		expect(queryByText(/showing first/i)).toBeNull();
+	});
+});
+

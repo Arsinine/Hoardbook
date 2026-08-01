@@ -21,7 +21,7 @@ use hb_core::{Identity, ShareCode};
 use nostr::prelude::*;
 
 use crate::client::{teaser_search_filter, RelayClient};
-use crate::discover::{ingest_teasers, select_newest_by_created_at, SearchHit};
+use crate::discover::{ingest_teasers_capped, select_newest_by_created_at, SearchHit};
 use crate::error::NetError;
 use crate::nip65::{bootstrap_order, inbox_order, parse_relay_list};
 use crate::render::{render_listing, RenderedListing};
@@ -417,9 +417,23 @@ pub async fn search_teasers(
     cap: usize,
     timeout: Duration,
 ) -> Result<Vec<SearchHit>, NetError> {
+    Ok(search_teasers_capped(client, tags, content_types, cap, timeout).await?.0)
+}
+
+/// Same as [`search_teasers`] but also returns whether the cap truncated the ranked set (M20 W3 —
+/// the Discover UI surfaces a "showing first N" affordance when `capped` is `true`). The truncation
+/// signal is authoritative: it comes from [`ingest_teasers_capped`], the only layer that sees both
+/// the full deduped set and the cap.
+pub async fn search_teasers_capped(
+    client: &RelayClient,
+    tags: &[String],
+    content_types: &[String],
+    cap: usize,
+    timeout: Duration,
+) -> Result<(Vec<SearchHit>, bool), NetError> {
     let filter = teaser_search_filter(tags, content_types)?;
     let events = client.fetch(filter, timeout).await?;
-    Ok(ingest_teasers(events, tags, content_types, cap))
+    Ok(ingest_teasers_capped(events, tags, content_types, cap))
 }
 
 #[cfg(test)]

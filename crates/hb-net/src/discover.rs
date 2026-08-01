@@ -15,11 +15,17 @@ use nostr::prelude::*;
 /// teaser bodies can't exhaust memory. (Generous vs a real teaser; teasers are name+bio+tags.)
 pub const MAX_TEASER_BYTES: usize = 8192;
 
-/// A trustworthy discovery hit: a verified teaser and the `npub` that signed it.
+/// A trustworthy discovery hit: a verified teaser, the `npub` that signed it, and the teaser's
+/// `created_at` (for the recency tiebreak in [`rank_hits`]). This is an **internal** type — it never
+/// crosses the wire; the serialized card is `PeerSearchHit` in hb-app, which deliberately omits
+/// `created_at` (the card shows the teaser, not the relay's event clock).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchHit {
     pub npub: String,
     pub teaser: Teaser,
+    /// The teaser event's `created_at`, carried so the recency tiebreak survives ingest. This is the
+    /// *signing* time of the latest teaser for this npub (dedup keeps the newest), not "last seen".
+    pub created_at: Timestamp,
 }
 
 /// Whether a teaser satisfies a query: **tags AND-intersect** (every requested tag must be
@@ -35,13 +41,35 @@ pub fn teaser_matches(teaser: &Teaser, tags: &[String], content_types: &[String]
 
 /// Turn raw fetched teaser events into ranked, trustworthy hits:
 /// bound size → verify+parse (discard bad-sig / wrong-schema) → match the query → dedup by `npub`
-/// → cap. Each stage is independently observable in the tests (AB3a/b/c + DISC1).
+/// → rank → cap. Each stage is independently observable in the tests (AB3a/b/c + DISC1).
+///
+/// The newest-first presort exists **only so the per-`npub` dedup keeps the latest teaser** — a
+/// non-compliant relay returning old+new can't hide an update. The *user-visible* order is then set
+/// by [`rank_hits`], a separate pure function (M20 W3 — previously the visible order was the dedup
+/// sort's accidental by-product, "whoever republished most recently"). The cap bounds the count *of
+/// the ranked output*; fetching above the cap is the caller's job (see `TEASER_SEARCH_FETCH_LIMIT`).
+///
+/// Returns only the hits. Use [`ingest_teasers_capped`] when you also need to know whether the cap
+/// truncated the result (e.g. the Discover UI's "showing first N" affordance).
 pub fn ingest_teasers(
     events: Vec<Event>,
     tags: &[String],
     content_types: &[String],
     cap: usize,
 ) -> Vec<SearchHit> {
+    ingest_teasers_capped(events, tags, content_types, cap).0
+}
+
+/// Same as [`ingest_teasers`] but also returns whether the cap truncated the ranked set (`true` =
+/// more candidates existed than the cap kept; the UI should surface a "showing first N" affordance).
+/// This is the authoritative truncation signal — the only layer that sees both the full deduped set
+/// and the cap is the ingest function (M20 W3).
+pub fn ingest_teasers_capped(
+    events: Vec<Event>,
+    tags: &[String],
+    content_types: &[String],
+    cap: usize,
+) -> (Vec<SearchHit>, bool) {
     // Sort newest-first so the per-`npub` dedup keeps the **latest** teaser — a non-compliant relay
     // that returns an author's old + new teaser (or serves the stale one first) can't hide the
     // update. Ties break on the higher event id (deterministic).
@@ -64,13 +92,48 @@ pub fn ingest_teasers(
         }
         let npub = ev.pubkey.to_bech32().unwrap_or_else(|_| ev.pubkey.to_hex());
         if seen.insert(npub.clone()) {
-            hits.push(SearchHit { npub, teaser });
-        }
-        if hits.len() >= cap {
-            break;
+            hits.push(SearchHit { npub, teaser, created_at: ev.created_at });
         }
     }
-    hits
+    // Rank the full deduped set, then cap — so the cap keeps the TOP-ranked hits, not whichever
+    // happened to sort first under the dedup presort (the old bug: cap applied before ranking).
+    hits = rank_hits(hits, tags, content_types);
+    let capped = hits.len() > cap;
+    hits.truncate(cap);
+    (hits, capped)
+}
+
+/// The M20 default ranking for discovery hits. **This function is the single swap point** — change
+/// the order here when the owner rules on it (the prompt records an explicit owner decision pending;
+/// see M20_PROMPT.md §W3 decision 2).
+///
+/// Documented order, descending:
+/// 1. **AND-match strength** — the number of query terms (tags + content-types) present on the
+///    teaser. Tags are AND-intersected by [`teaser_matches`] (every query tag must be present for a
+///    hit to survive ingest, so every passing teaser matches `tags.len()` tags — that axis is
+///    constant across hits); content-types are OR-unioned, so a teaser carrying MORE of the queried
+///    content-types is a stronger match and ranks above one carrying fewer. With no content-types in
+///    the query, match strength is constant and recency alone orders the tied hits.
+/// 2. **Recency** (`created_at`, newest first) as a tiebreak — stable and deterministic.
+///
+/// **Deferred per the surgical-changes rule + DISC3:** the prompt's suggested order also names
+/// *collection count* as a ranking input. That input does not exist on the teaser today — DISC3
+/// keeps all listing/collection data off the public teaser (a hit surfaces the advertisement, never
+/// the hoard), so wiring collection count requires a teaser-schema change in hb-core that is beyond
+/// W3's scope. When the owner rules and that field lands, it slots in here as a second tier (between
+/// match strength and recency); this function is the only place that changes.
+pub fn rank_hits(hits: Vec<SearchHit>, tags: &[String], content_types: &[String]) -> Vec<SearchHit> {
+    let mut ranked = hits;
+    ranked.sort_by(|a, b| {
+        let strength_a = tags.iter().filter(|t| a.teaser.tags.contains(t)).count()
+            + content_types.iter().filter(|c| a.teaser.content_types.contains(c)).count();
+        let strength_b = tags.iter().filter(|t| b.teaser.tags.contains(t)).count()
+            + content_types.iter().filter(|c| b.teaser.content_types.contains(c)).count();
+        // Descending match strength, then descending recency. Equal on both → preserve prior order
+        // (sort_by is stable; the ingest presort already put equal hits newest-first by npub id).
+        strength_b.cmp(&strength_a).then(b.created_at.cmp(&a.created_at))
+    });
+    ranked
 }
 
 /// Collapse a set of events for one replaceable address to the **newest by `created_at`**. A
@@ -210,5 +273,150 @@ mod tests {
             .unwrap();
         let winner = select_newest_by_created_at(vec![old_ev, new_ev.clone()]).unwrap();
         assert_eq!(winner.id, new_ev.id, "the newer event is selected");
+    }
+
+    // ── M20 W3: deliberate ranking (was: the dedup sort's accidental by-product) ───────────────
+    //
+    // Build a teaser event at a specific created_at with a specific tag set, so ranking tests can
+    // control both the match-strength and recency axes independently. (Mirrors the `build_at`
+    // closure in `dedup_keeps_newest_teaser_per_npub` above, generalized to an arbitrary teaser.)
+    fn ev_at(id: &Identity, t: &Teaser, ts: u64) -> Event {
+        let base = hb_core::event::build_teaser(id, t, true).unwrap();
+        let tags: Vec<Tag> = base.tags.iter().cloned().collect();
+        id.sign(
+            EventBuilder::new(base.kind, base.content)
+                .tags(tags)
+                .custom_created_at(Timestamp::from(ts)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rank_orders_by_match_strength_then_recency() {
+        // Match strength = # query terms present (tags AND-matched + content-types OR-matched). All
+        // three teasers pass the AND-tag filter (query tag "anime" present on each) AND the content-
+        // type OR filter (each carries ≥1 of the queried CTs); they differ in how many queried CTs
+        // they carry, which is the varying strength axis.
+        //
+        // Query content-types = [video, audio, image].
+        //  - "three-cts" carries all 3  (strength 1 tag + 3 cts = 4), created_at 100 (oldest)
+        //  - "two-cts"   carries 2      (strength 1 tag + 2 cts = 3), created_at 300 (newest)
+        //  - "one-ct"    carries 1      (strength 1 tag + 1 ct  = 2), created_at 200 (middle)
+        //
+        // Expected order: three-cts (4) → two-cts (3) → one-ct (2). Recency is only the tiebreak, so
+        // the OLDEST hit ranks FIRST because it has the strongest match — the exact inversion of the
+        // old "whoever republished most recently" order.
+        let three_cts = {
+            let id = Identity::generate();
+            let mut t = teaser_with(&["anime"], &["video", "audio", "image"]);
+            t.display_name = "three-cts".into();
+            ev_at(&id, &t, 100)
+        };
+        let two_cts = {
+            let id = Identity::generate();
+            let mut t = teaser_with(&["anime"], &["video", "audio"]);
+            t.display_name = "two-cts".into();
+            ev_at(&id, &t, 300)
+        };
+        let one_ct = {
+            let id = Identity::generate();
+            let mut t = teaser_with(&["anime"], &["video"]);
+            t.display_name = "one-ct".into();
+            ev_at(&id, &t, 200)
+        };
+        let hits = ingest_teasers(
+            vec![two_cts.clone(), one_ct, three_cts.clone()],
+            &["anime".into()],
+            &["video".into(), "audio".into(), "image".into()],
+            100,
+        );
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].teaser.display_name, "three-cts", "strongest match ranks first despite being oldest");
+        assert_eq!(hits[1].teaser.display_name, "two-cts", "strength 3 next");
+        assert_eq!(hits[2].teaser.display_name, "one-ct", "strength 2 last");
+    }
+
+    #[test]
+    fn rank_recency_tiebreaks_equal_match_strength() {
+        // Two teasers with EQUAL match strength (both match the single query tag, no content-types
+        // queried). The newer one wins the tiebreak. This is the recency-as-tiebreak half of the
+        // order, and also the behavior when match strength is constant (tag-only queries).
+        let older = {
+            let id = Identity::generate();
+            let mut t = teaser_with(&["anime"], &["video"]);
+            t.display_name = "older".into();
+            ev_at(&id, &t, 1_000)
+        };
+        let newer = {
+            let id = Identity::generate();
+            let mut t = teaser_with(&["anime"], &["video"]);
+            t.display_name = "newer".into();
+            ev_at(&id, &t, 2_000)
+        };
+        // Feed older first so a stable sort that preserved input order would wrongly keep it first.
+        let hits = ingest_teasers(vec![older, newer], &["anime".into()], &[], 100);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].teaser.display_name, "newer", "equal strength → newer wins the tiebreak");
+        assert_eq!(hits[1].teaser.display_name, "older");
+    }
+
+    #[test]
+    fn rank_cap_keeps_top_ranked_not_first_seen() {
+        // The cap applies AFTER ranking, so the TOP-ranked hits survive, not whichever the dedup
+        // presort happened to put first. With a cap of 1 and two equal-strength hits, the newer one
+        // (recency tiebreak) is kept — the older is dropped even though dedup saw it.
+        let older = {
+            let id = Identity::generate();
+            let mut t = teaser_with(&["anime"], &["video"]);
+            t.display_name = "older".into();
+            ev_at(&id, &t, 1_000)
+        };
+        let newer = {
+            let id = Identity::generate();
+            let mut t = teaser_with(&["anime"], &["video"]);
+            t.display_name = "newer".into();
+            ev_at(&id, &t, 2_000)
+        };
+        let hits = ingest_teasers(vec![older, newer], &["anime".into()], &[], 1);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].teaser.display_name, "newer", "cap keeps the top-ranked hit, not the first-seen");
+    }
+
+    #[test]
+    fn full_and_match_survives_above_strict_cap_m20_w3_eviction_regression() {
+        // M20 W3 eviction regression (the prompt's verify clause). A teaser that is a STRONGER match
+        // but OLDER than many weaker matches must still surface — and rank FIRST. Pre-fix, the
+        // relay's response window filled with newer weaker matches and the stronger hit was evicted
+        // before the client filter ran (no explicit `.limit()`); even post-limit, the old recency-
+        // only ordering would have buried it. The fix is the explicit `.limit()` on the filter
+        // (tested in client.rs) AND ranking by match-strength. This test pins the ingest/rank half:
+        // one strong hit (matches both queried content-types) OLDEST, several weaker hits (match only
+        // one) newer — the strong hit ranks first despite being oldest.
+        let mut events: Vec<Event> = Vec::new();
+        // The strong hit: matches the queried tag + BOTH queried content-types (strength 1+2=3),
+        // OLDEST (ts = 1) — under the old recency-only order it ranked last.
+        let strong = {
+            let id = Identity::generate();
+            let mut t = teaser_with(&["anime"], &["video", "audio"]);
+            t.display_name = "strong".into();
+            ev_at(&id, &t, 1)
+        };
+        events.push(strong);
+        // 5 weaker hits: match the queried tag + only ONE queried content-type (strength 1+1=2), all
+        // NEWER. (The relay window in production is ~500; here 5 is enough — match-strength, not
+        // headroom, is what this test asserts.)
+        for i in 0..5 {
+            let id = Identity::generate();
+            let mut t = teaser_with(&["anime"], &["video"]);
+            t.display_name = format!("weak-{i}");
+            events.push(ev_at(&id, &t, 100 + i));
+        }
+        // Cap below the event count so we also prove the cap keeps the TOP-ranked hit.
+        let hits = ingest_teasers(events, &["anime".into()], &["video".into(), "audio".into()], 3);
+        assert_eq!(hits.len(), 3, "capped to 3");
+        assert_eq!(hits[0].teaser.display_name, "strong", "the older strong hit surfaces FIRST — not evicted by newer weaker matches");
+        // The remaining two slots are weak matches (strength 2), newest-first among themselves.
+        assert!(hits[1].teaser.display_name.starts_with("weak-"), "weak matches fill the rest");
+        assert!(hits[2].teaser.display_name.starts_with("weak-"));
     }
 }

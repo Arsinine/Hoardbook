@@ -16,7 +16,7 @@ use hb_core::types::Collection;
 use hb_core::{ShareCode, Identity};
 use hb_net::{
     browse_peer_listings, browse_share_code, fetch_full_listing_if_current,
-    listing_snapshot_fingerprint, search_teasers, RelayClient, RenderedListing, SearchHit,
+    listing_snapshot_fingerprint, search_teasers_capped, RelayClient, RenderedListing, SearchHit,
 };
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +52,15 @@ pub struct PeerSearchHit {
     pub picture: Option<String>,
     /// The §7 word+color fingerprint, derived from the npub alone (no listing access).
     pub fingerprint: Option<Fingerprint>,
+}
+
+/// The discovery result: the ranked hit cards + whether the cap truncated the set (M20 W3). When
+/// `capped` is `true`, more candidates existed than `SEARCH_CAP` kept, and the UI surfaces a
+/// "showing first N" affordance — silently presenting 100-of-many as "everyone" is the bug this fixes.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PeerSearchResult {
+    pub hits: Vec<PeerSearchHit>,
+    pub capped: bool,
 }
 
 /// Normalize + validate search filters (M12 W3, Decision I). Trims, lowercases tags, drops empties,
@@ -857,7 +866,8 @@ pub async fn set_contact_petname(
 /// §6 Discovery (M12 W3): search public teasers by tag (AND) / content-type (OR) across the relays
 /// and return teaser cards. **≥1 filter is required** (no unfiltered global peer list — §6). A hit
 /// carries only the opt-in public teaser + the §7 fingerprint, **never** a listing or browse-key
-/// (DISC3) — the stash stays 🔒 locked.
+/// (DISC3) — the stash stays 🔒 locked. The result carries a `capped` flag (M20 W3) set when the
+/// `SEARCH_CAP` truncated the ranked set, so the UI can surface a "showing first N" affordance.
 #[tauri::command]
 pub async fn search_peers(
     tags: Vec<String>,
@@ -865,17 +875,18 @@ pub async fn search_peers(
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
     relay: State<'_, SharedRelay>,
-) -> CmdResult<Vec<PeerSearchHit>> {
+) -> CmdResult<PeerSearchResult> {
     let (tags, content_types) = normalize_search_filters(tags, content_types)?;
     let me = identity_clone(&identity).await?;
     let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
-    let hits = search_teasers(&client, &tags, &content_types, SEARCH_CAP, net::RELAY_TIMEOUT)
-        .await
-        .map_err(cmd_err)?;
+    let (hits, capped) =
+        search_teasers_capped(&client, &tags, &content_types, SEARCH_CAP, net::RELAY_TIMEOUT)
+            .await
+            .map_err(cmd_err)?;
     let contact_npubs: Vec<String> =
         store.list_contacts().map_err(cmd_err)?.into_iter().map(|c| c.npub).collect();
     let hits = filter_hits(hits, &me.npub(), &contact_npubs);
-    Ok(hits.into_iter().map(hit_to_card).collect())
+    Ok(PeerSearchResult { hits: hits.into_iter().map(hit_to_card).collect(), capped })
 }
 
 #[cfg(test)]
@@ -907,6 +918,7 @@ mod tests {
                 content_types: vec!["video".into()],
                 picture: Some("data:image/webp;base64,AA==".into()),
             },
+            created_at: nostr::Timestamp::from(0),
         };
         let card = hit_to_card(hit);
         assert!(card.fingerprint.is_some(), "the §7 fingerprint is derived from the npub");
@@ -923,6 +935,7 @@ mod tests {
         let hit = SearchHit {
             npub: id.npub(),
             teaser: Teaser { display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None },
+            created_at: nostr::Timestamp::from(0),
         };
         assert_eq!(hit_to_card(hit).bio, None, "a blank bio renders as None, not an empty string");
     }
@@ -931,6 +944,7 @@ mod tests {
         SearchHit {
             npub,
             teaser: Teaser { display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None },
+            created_at: nostr::Timestamp::from(0),
         }
     }
 

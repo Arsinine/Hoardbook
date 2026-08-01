@@ -32,17 +32,21 @@ pub mod topic;
 pub use browse::{
     browse_peer_listings, browse_share_code, fetch_full_listing_from, fetch_full_listing_if_current,
     listing_snapshot_fingerprint, parse_share_code, publish_listing, publish_listing_capped,
-    publish_listing_to, resolve_peer_relays, resolve_recipient_relays, search_teasers, BrowseResult,
-    PublishedListing,
+    publish_listing_to, resolve_peer_relays, resolve_recipient_relays, search_teasers,
+    search_teasers_capped, BrowseResult, PublishedListing,
 };
 pub use cache::{cache_decision, CacheDecision, CachedListing, CACHE_FRESH_SECS};
 pub use client::{
     dedup_by_id, pool_is_live, teaser_search_filter, PublishOutcome, RelayClient, RelayHealth,
+    TEASER_SEARCH_FETCH_LIMIT,
 };
 pub use count::{
     count_online, count_userbase, fetch_online_presence, presence_count_filter, userbase_filter,
 };
-pub use discover::{ingest_teasers, select_newest_by_created_at, teaser_matches, SearchHit};
+pub use discover::{
+    ingest_teasers, ingest_teasers_capped, rank_hits, select_newest_by_created_at, teaser_matches,
+    SearchHit,
+};
 pub use dm::{unwrap_dm, wrap_dm, DirectMessage};
 pub use error::NetError;
 pub use nip09::build_deletion;

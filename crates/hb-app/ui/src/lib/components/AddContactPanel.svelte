@@ -4,7 +4,7 @@
 	// existing add entry points keep working unchanged: a lookup-card "Add contact" and a Discover-hit
 	// "Add contact" both call `onadd`, which the page routes into its existing `openAddContact` →
 	// AddContactDialog → completeFollow funnel (petname + group picker, then `follow`).
-	import { pasteKey, searchPeers, type PeerSearchHit } from '../api.js';
+	import { pasteKey, searchPeers, type PeerSearchHit, type PeerSearchResult } from '../api.js';
 	import { contacts, identity, toast } from '../stores.js';
 	import { icons, avatarHue } from '../icons.js';
 	import Avatar from './Avatar.svelte';
@@ -80,6 +80,7 @@
 	let discoverTags = $state('');
 	let discoverTypes: string[] = $state([]);
 	let discoverResults: PeerSearchHit[] = $state([]);
+	let discoverCapped = $state(false); // M20 W3: more candidates existed than the cap kept → "showing first N"
 	let discovering = $state(false);
 	let discoverError = $state('');
 	let discovered = $state(false); // a search has run at least once (drives the empty-vs-no-results copy)
@@ -91,7 +92,9 @@
 		discovering = true;
 		discoverError = '';
 		try {
-			discoverResults = await searchPeers(parsedDiscoverTags, discoverTypes);
+			const result: PeerSearchResult = await searchPeers(parsedDiscoverTags, discoverTypes);
+			discoverResults = result.hits;
+			discoverCapped = result.capped;
 			discovered = true;
 		} catch (e) {
 			discoverError = String(e);
@@ -266,6 +269,13 @@
 										</div>
 									{/each}
 								</div>
+								{#if discoverCapped}
+									<!-- M20 W3: the cap truncated the ranked set. Surface it — silently presenting a capped
+									     slice as "everyone" is the bug this fixes. `role=status` so it is queryable + announced. -->
+									<div class="discover-capped" role="status">
+										Showing first {discoverResults.length} — narrow your search to see more specific matches.
+									</div>
+								{/if}
 							{:else}
 								<div class="discover-empty">Pick a content type or enter a tag, then Search.</div>
 							{/if}
@@ -458,6 +468,7 @@
 	.disc-tag-input { flex: 1; }
 	.discover-error { font-size: 11.5px; color: oklch(0.75 0.15 25); }
 	.discover-results { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: 12px; }
+	.discover-capped { text-align: center; color: var(--fg-dim); font-size: 11.5px; padding: 10px 0 2px; }
 	.discover-empty { text-align: center; color: var(--fg-dim); font-size: 12.5px; padding: 18px 0; }
 	.hit-card {
 		display: flex; flex-direction: column; gap: 7px; padding: 13px;
