@@ -224,7 +224,11 @@ const DM_FETCH_MARGIN_SECS: u64 = 48 * 60 * 60;
 /// the cache has a cursor (an incremental read — most polls then return ~nothing), or unbounded on a
 /// cold cache (the one full initial pull). `since` is **bandwidth-only** — dedup + security are by
 /// wrap id and the persisted block/decline sets, never this attacker-fuzzable timestamp.
-fn dm_inbox_filter(me: PublicKey, newest_seen_outer: u64) -> Filter {
+///
+/// `pub(crate)` so the `hb-wan-it` WAN-C suite can drive the exact cursor/fetch path `get_messages`
+/// uses (the future-poison clamp + restart round-trip is a WAN-C row). No full `pub` — this is an
+/// internal seam, not a stable API.
+pub(crate) fn dm_inbox_filter(me: PublicKey, newest_seen_outer: u64) -> Filter {
     let f = Filter::new().kind(Kind::GiftWrap).pubkey(me);
     if newest_seen_outer > 0 {
         f.since(Timestamp::from(newest_seen_outer.saturating_sub(DM_FETCH_MARGIN_SECS)))
@@ -246,7 +250,7 @@ fn dm_inbox_filter(me: PublicKey, newest_seen_outer: u64) -> Filter {
 /// M9's count cap). Uses a `HashSet` for the seen lookup (O(1), not the old O(n) scan). Returns the
 /// stranger requests plus a `changed` flag: `true` iff it mutated the cache (so the caller persists a
 /// balanced push+prune the length tuple would miss).
-async fn merge_wraps_into_cache(
+pub(crate) async fn merge_wraps_into_cache(
     identity: &hb_core::Identity,
     own_npub: &str,
     wraps: Vec<Event>,
@@ -314,7 +318,9 @@ async fn merge_wraps_into_cache(
 /// stranger stays out (consistent with drop semantics). The Q7 accept flow migrates a newly-accepted
 /// sender's history into the cache explicitly (see `dm_request_accept_inner`). Deduped by wrap id,
 /// sorted oldest-first by send time.
-fn cached_inbox(
+/// `pub(crate)` so the `hb-wan-it` WAN-C suite can read the post-merge inbox (the same view
+/// `get_messages` returns) without duplicating the reclassify-under-current-sets logic.
+pub(crate) fn cached_inbox(
     cache: &DmCache,
     own_npub: &str,
     contacts: &HashSet<String>,
