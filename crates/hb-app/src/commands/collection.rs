@@ -17,7 +17,11 @@ use crate::{
 
 /// NIP-44 listing split budget (NIP-44 caps plaintext, the relay caps the event ~64 KiB; ≤40 KB
 /// keeps a single part well under both). Larger listings split per-folder (hb-net::split_listing).
-const LISTING_MAX_BYTES: usize = 40_000;
+///
+/// `pub(crate)` so the WAN-E2E harness (`crate::wan_it`) can use the exact production truncation
+/// threshold — a harness-private copy could drift from the real budget and make the truncating-seed
+/// assertion meaningless.
+pub(crate) const LISTING_MAX_BYTES: usize = 40_000;
 
 /// The result of publishing a Public collection (devtest #7) — whether it was truncated to a paywall
 /// teaser, and how many item nodes browsers can see vs how many the full collection holds. The
