@@ -242,10 +242,13 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          # Match a `${{ ... }}` expression naming an attacker-controllable context (github.ref_name,
-          # github.head_ref, or github.event.*.title/body). Then drop `path:line:  key: ${{` lines:
-          # those are YAML scalar values (env:/with: slots), the safe indirection pattern, not inline
-          # script text. What remains is an interpolation living inside a run:/script: body.
+          # Match an interpolation expression (the dollar-double-brace form) naming an attacker-
+          # controllable context (github.ref_name, github.head_ref, or github.event.*.title/body).
+          # Then drop `path:line:  key:` scalar-value lines: those are YAML scalar values (env:/with:
+          # slots), the safe indirection pattern, not inline script text. What remains is an
+          # interpolation living inside a run:/script: body.
+          # NOTE: these comments must never contain a literal dollar-double-brace — GitHub interpolates
+          # `run:` bodies (comments included) at startup, so a literal one fails the whole workflow.
           if out=$(grep -rnE '\$\{\{[^}]*github\.(ref_name|head_ref|event\.[^}]*(title|body))' .github/workflows 2>/dev/null \
                    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*[A-Za-z_][A-Za-z0-9_.-]*:[[:space:]]*\$\{\{'); then
             echo "::error::CWE-94 regression — an attacker-controllable context is interpolated inline in a workflow:"
