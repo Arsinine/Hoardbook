@@ -46,7 +46,7 @@
 <Modal open={open} title="New group" level="stacked" onclose={cancel}>
 	<div class="field">
 		<label for="cgd-name">Name</label>
-		<input id="cgd-name" type="text" placeholder="e.g. Inner Circle" bind:value={name} onkeydown={(e) => e.key === 'Enter' && create()} />
+		<input id="cgd-name" class="hb-input" type="text" placeholder="e.g. Inner Circle" bind:value={name} onkeydown={(e) => e.key === 'Enter' && create()} />
 	</div>
 	<div class="field field-spaced">
 		<span class="field-label">Color</span>
@@ -78,10 +78,7 @@
 	.field { display: flex; flex-direction: column; gap: 5px; }
 	.field-spaced { margin-top: 12px; }
 	.field label, .field-label { font-size: 11px; color: var(--fg-muted); font-weight: 500; }
-	.field input[type='text'] {
-		padding: 6px 9px; background: var(--bg-elev2); color: var(--fg);
-		border: 1px solid var(--border); border-radius: 6px; font: inherit;
-	}
+	/* M20 W4: the name input uses the global .hb-input contract (app.css). */
 	.swatch-row { display: flex; flex-wrap: wrap; gap: 8px; }
 	.swatch {
 		width: 24px; height: 24px; border-radius: 50%;

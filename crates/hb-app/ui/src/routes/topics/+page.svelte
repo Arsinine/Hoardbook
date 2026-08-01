@@ -412,7 +412,7 @@
 							<!-- devtest v0.12.1 #8: description is editable after creation (the name is not). -->
 							{#if editingDesc}
 								<div class="desc-edit">
-									<input class="grow" bind:value={descDraft} placeholder="description" onkeydown={(e) => e.key === 'Enter' && saveDesc()} />
+									<input class="hb-input grow" bind:value={descDraft} placeholder="description" onkeydown={(e) => e.key === 'Enter' && saveDesc()} />
 									<button class="btn-primary btn-sm" disabled={savingDesc} onclick={saveDesc}>{savingDesc ? '…' : 'Save'}</button>
 									<button class="btn-ghost btn-sm" disabled={savingDesc} onclick={() => (editingDesc = false)}>Cancel</button>
 								</div>
@@ -434,7 +434,7 @@
 					</div>
 
 					<div class="invite">
-						<input placeholder="invite an npub…" bind:value={inviteNpub} />
+						<input class="hb-input" placeholder="invite an npub…" bind:value={inviteNpub} />
 						<button class="btn-default" onclick={invite}>Invite</button>
 					</div>
 
@@ -446,7 +446,7 @@
 						</div>
 						<div class="announce-row">
 							<input
-								class="grow"
+								class="hb-input grow"
 								placeholder="a highlighted notice for all members…"
 								bind:value={announceBody}
 								onkeydown={(e) => e.key === 'Enter' && sendAnnounce()}
@@ -508,7 +508,7 @@
 <Modal open={createOpen} title="New Topic" onclose={() => (createOpen = false)}>
 	<div class="create-fields">
 		{#if newPrivate}
-			<input placeholder="name (freeform, e.g. back room)" bind:value={newName} />
+			<input class="hb-input" placeholder="name (freeform, e.g. back room)" bind:value={newName} />
 		{:else}
 			<!-- W4: a public Topic is a category root (picker) + freeform sub-path. The root picker
 			     makes a non-category root unrepresentable; the backend re-validates authoritatively. -->
@@ -517,11 +517,11 @@
 					{#each TOPIC_ROOTS as r}<option value={r}>{r}</option>{/each}
 				</select>
 				<span class="path-sep">/</span>
-				<input class="grow" placeholder="sub-path (e.g. animation/anime) — optional" bind:value={newSubPath} />
+				<input class="hb-input grow" placeholder="sub-path (e.g. animation/anime) — optional" bind:value={newSubPath} />
 			</div>
 			<div class="muted path-preview">Topic path: <code>{composedPublicName}</code></div>
 		{/if}
-		<input placeholder="description" bind:value={newDesc} />
+		<input class="hb-input" placeholder="description" bind:value={newDesc} />
 		<label class="check"><input type="checkbox" bind:checked={newPrivate} /> Private (unlisted)</label>
 	</div>
 	{#snippet actions()}
@@ -574,7 +574,9 @@
 		padding: 5px 12px; border: none; background: transparent; color: var(--fg-muted);
 		font: inherit; font-size: 12.5px; border-radius: 6px; cursor: pointer;
 	}
-	.tab-active { background: var(--bg-elev3); color: var(--fg); font-weight: 600; }
+	/* M20 W4: converged to the accent-soft form (DESIGN_SYSTEM §3 "Segmented toggle") — matches
+	   Contacts' Name|Groups toggle exactly, replacing the off-system elev3 fill. */
+	.tab-active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 
 	/* Master–detail */
 	.master-detail { display: flex; gap: 16px; align-items: stretch; flex: 1; min-height: 0; }
@@ -618,11 +620,8 @@
 
 	.empty { padding: 16px 8px; }
 
-	/* Shared controls */
-	input {
-		padding: 6px 9px; background: var(--bg-elev2); color: var(--fg);
-		border: 1px solid var(--border); border-radius: 6px; font: inherit;
-	}
+	/* Shared controls — M20 W4: inputs use the global .hb-input contract (app.css); the bare
+	   `input {}` element selector is gone (it filled --bg-elev2 and leaked onto modal fields). */
 	/* M15 W1: buttons unified on the app.css .btn system. `.link` stays a local text-link (no boxed
 	   equivalent in the shared system); `button:disabled` keeps the .tab/.link dim state. */
 	button:disabled { opacity: 0.5; cursor: not-allowed; }

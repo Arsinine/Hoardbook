@@ -1387,13 +1387,13 @@
 <!-- Compose-to-npub (spec §9 first-contact deep link) — a + icon-btn beside refresh opens this. -->
 <Modal open={composeOpen} title="New message" onclose={() => (composeOpen = false)}>
 	<div class="compose-fields">
-		<input placeholder="npub or hbk share code…" bind:value={composeTo} />
+		<input class="hb-input" placeholder="npub or hbk share code…" bind:value={composeTo} />
 		{#if composeTo.trim() && isComposeToSelf(composeTo, $identity?.npub ?? '', $identity?.share_code ?? '')}
 			<div class="compose-hint">That's your own ID.</div>
 		{:else if composeTo.trim() && composeRecipientKind(composeTo) === 'invalid'}
 			<div class="compose-hint">Doesn't look like an npub or share code — sending will reject it if it's wrong.</div>
 		{/if}
-		<textarea class="compose-modal-input" placeholder="Message…" bind:value={composeBody} bind:this={composeBodyEl} rows="3"></textarea>
+		<textarea class="hb-input hb-textarea compose-modal-input" placeholder="Message…" bind:value={composeBody} bind:this={composeBodyEl} rows="3"></textarea>
 	</div>
 	{#snippet actions()}
 		<button class="btn-ghost" onclick={() => (composeOpen = false)}>Cancel</button>
@@ -1784,22 +1784,9 @@
 
 	/* Compose-to-npub modal */
 	.compose-hint { font-size: 11px; color: var(--fg-dim); }
-	.compose-modal-input {
-		width: 100%;
-		padding: 8px 10px;
-		font-family: var(--font-ui);
-		font-size: 13px;
-		color: var(--fg);
-		background: var(--bg-elev2);
-		border: 1px solid var(--border);
-		border-radius: 7px;
-		resize: none;
-		box-sizing: border-box;
-	}
-	/* M15 W2: compose modal now uses Modal.svelte; only the field layout + input styling are local. */
+	/* M20 W4: the compose modal's textarea + npub input compose the global .hb-input contract
+	   (app.css); only the full-width + box-sizing layout stays here. */
+	.compose-modal-input { width: 100%; box-sizing: border-box; }
+	/* M15 W2: compose modal now uses Modal.svelte; only the field layout is local. */
 	.compose-fields { display: flex; flex-direction: column; gap: 8px; }
-	.compose-fields input {
-		padding: 6px 9px; background: var(--bg-elev2); color: var(--fg);
-		border: 1px solid var(--border); border-radius: 6px; font: inherit;
-	}
 </style>

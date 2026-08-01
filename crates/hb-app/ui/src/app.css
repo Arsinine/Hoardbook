@@ -128,6 +128,44 @@ h1, h2, h3, h4, h5, h6 {
 .btn-full { width: 100%; }
 .btn-icon { width: 28px; padding: 0; }
 
+/* ── Canonical text inputs (M20 W4) ───────────────────────────────── */
+/* One source of truth for the input shape, replacing three local .hb-input copies (Home, Settings,
+   ScanDialog) and the bare-element `input {}` rules that had drifted onto --bg-elev2 (Topics,
+   AddContact/CreateGroup dialogs, Chat compose). §3 of DESIGN_SYSTEM.md is the spec this matches;
+   where a local copy and §3 differed, §3 wins. Layout (width/flex/margin) stays local at call sites
+   — only the contract (height, fill, border, radius, font, focus) lives here. */
+.hb-input {
+	display: flex;
+	align-items: center;
+	height: 34px;
+	padding: 0 11px;
+	background: var(--bg-input);
+	border: 1px solid var(--border);
+	border-radius: 7px;
+	font-family: var(--font-ui);
+	font-size: 13px;
+	color: var(--fg);
+	outline: none;
+	transition: border-color 0.1s;
+}
+.hb-input::placeholder { color: var(--fg-dim); }
+.hb-input:focus { border-color: var(--accent); }
+
+/* Textarea variant: auto-height, min 64, vertical resize (§3). */
+.hb-textarea {
+	height: auto;
+	min-height: 64px;
+	align-items: flex-start;
+	padding: 9px 11px;
+	resize: vertical;
+}
+
+/* Mono modifier for keys/URLs/npubs (§3): composes with .hb-input. Both spellings are in the wild
+   (.hb-mono on ScanDialog/AddContactPanel/Settings/Browse, .hb-input-mono on Home/Settings), so both
+   are declared here and neither is re-declared locally. */
+.hb-mono,
+.hb-input-mono { font-family: var(--font-mono); }
+
 /* ── Icon animation keyframes ─────────────────────────────────────── */
 @keyframes hb-spin {
   from { transform: rotate(0deg); }

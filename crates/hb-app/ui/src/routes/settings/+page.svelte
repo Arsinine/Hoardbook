@@ -941,23 +941,10 @@
 		line-height: 1.4;
 	}
 
-	.hb-input {
-		display: flex;
-		align-items: center;
-		padding: 0 11px;
-		height: 34px;
-		background: var(--bg-input);
-		border: 1px solid var(--border);
-		border-radius: 7px;
-		font-family: var(--font-ui);
-		font-size: 13px;
-		color: var(--fg);
-		outline: none;
-		flex: 1;
-	}
-	.hb-input::placeholder { color: var(--fg-dim); }
-	.hb-input:focus { border-color: var(--accent); }
-	.hb-mono { font-family: var(--font-mono); }
+	/* M20 W4: input contract is global in app.css. Only the flex-grow LAYOUT stays, scoped to the
+	   two row containers where the input must grow — never re-declaring .hb-input itself. */
+	.relay-add-row > .hb-input,
+	.restore-pass > .hb-input { flex: 1; }
 
 
 	/* Toggles */

@@ -225,7 +225,7 @@
 								{/each}
 							</div>
 							<form class="disc-tag-row" onsubmit={(e) => { e.preventDefault(); runDiscover(); }}>
-								<input class="disc-tag-input" placeholder="tags (e.g. anime, vhs)" bind:value={discoverTags} />
+								<input class="hb-input disc-tag-input" placeholder="tags (e.g. anime, vhs)" bind:value={discoverTags} />
 								<button class="btn-primary btn-sm" type="submit" disabled={!canDiscover || discovering}>
 									{discovering ? 'Searching…' : 'Search'}
 								</button>
@@ -335,7 +335,6 @@
 		min-width: 0;
 	}
 	.search-input::placeholder { color: var(--fg-dim); }
-	.hb-mono { font-family: var(--font-mono); }
 
 	.result { display: flex; flex-direction: column; gap: 12px; }
 
@@ -454,12 +453,9 @@
 	.ct-chip:hover { background: var(--bg-elev3); }
 	.ct-on { background: var(--accent-soft); color: var(--accent); border-color: color-mix(in oklch, var(--accent) 35%, transparent); font-weight: 600; }
 	.disc-tag-row { display: flex; gap: 8px; }
-	.disc-tag-input {
-		flex: 1; background: var(--bg-elev2); border: 1px solid var(--border); border-radius: 7px;
-		padding: 7px 10px; font-size: 12.5px; color: var(--fg); font-family: var(--font-ui); outline: none;
-	}
-	.disc-tag-input::placeholder { color: var(--fg-dim); }
-	.disc-tag-input:focus { border-color: var(--accent); }
+	/* M20 W4: the tag input composes the global .hb-input contract; only the flex-grow layout
+	   stays local (the contract is flex:auto so this row input grows to fill the discover row). */
+	.disc-tag-input { flex: 1; }
 	.discover-error { font-size: 11.5px; color: oklch(0.75 0.15 25); }
 	.discover-results { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: 12px; }
 	.discover-empty { text-align: center; color: var(--fg-dim); font-size: 12.5px; padding: 18px 0; }
