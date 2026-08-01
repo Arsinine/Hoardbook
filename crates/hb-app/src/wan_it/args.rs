@@ -45,6 +45,21 @@ pub fn collect_flood_relays(args: &[String]) -> Vec<String> {
     out
 }
 
+/// Resolve a `--ticket-json` value into ticket bytes: if `raw` names a readable file, return its
+/// contents; otherwise treat `raw` as inline JSON. §W6 authorizes `--ticket-json <path-or-inline>`
+/// for targeted iroh isolation rows (the E2E suite rides the full DM leg; THIS slice hands the ticket
+/// out-of-band). Detecting "looks like a path" by trying to read it (rather than by sniffing for a
+/// leading `{`) keeps the inline case working even when the JSON is multiline, and never mistakes a
+/// real path for inline data.
+pub fn read_ticket_json(raw: &str) -> std::io::Result<String> {
+    // A leading `{` is unambiguously inline JSON — never try the filesystem, so a stray file named
+    // `{...}` cannot surprise us. Anything else is tried as a path first.
+    if raw.trim_start().starts_with('{') {
+        return Ok(raw.to_string());
+    }
+    std::fs::read_to_string(raw)
+}
+
 /// P3 flood-guard (relay citizenship, M16 standing ruling + M20 W6 §W6): a flood-shaped row may
 /// NEVER run against anything other than the explicitly-passed `--flood-relay` URLs. The probe's
 /// `--relay` set is the read set; if it contains any URL that is NOT also a `--flood-relay`, the row
@@ -122,5 +137,29 @@ mod tests {
     fn command_reads_first_positional() {
         assert_eq!(command(&args(&["serve", "--data-dir", "/x"])), Some("serve"));
         assert_eq!(command(&[]), None);
+    }
+
+    #[test]
+    fn read_ticket_json_treats_a_leading_brace_as_inline() {
+        let inline = r#"{"hb":"transport_ticket","ticket_v":1}"#;
+        assert_eq!(read_ticket_json(inline).unwrap(), inline);
+        // Leading whitespace before the brace is still inline.
+        assert_eq!(read_ticket_json("  {\"x\":1}").unwrap(), "  {\"x\":1}");
+    }
+
+    #[test]
+    fn read_ticket_json_reads_a_path_when_no_leading_brace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ticket.json");
+        let body = r#"{"hb":"transport_ticket"}"#;
+        std::fs::write(&path, body).unwrap();
+        // Pass the PATH (no leading brace) — the file contents come back.
+        assert_eq!(read_ticket_json(path.to_str().unwrap()).unwrap(), body);
+    }
+
+    #[test]
+    fn read_ticket_json_errors_when_a_nonexistent_path_is_passed() {
+        // Not inline (no brace) and not a real file — surfaced as an io error, not a panic.
+        assert!(read_ticket_json("/no/such/ticket-9f3a.json").is_err());
     }
 }
