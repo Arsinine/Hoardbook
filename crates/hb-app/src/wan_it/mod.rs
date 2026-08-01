@@ -26,9 +26,11 @@
 //! relays, P4 are expected red).
 
 mod args;
+mod suite_wan_c;
 mod suite_wan_e2e;
 mod suite_wan_m;
 mod suite_wan_p;
+mod suite_wan_t;
 mod suite_wan_u;
 mod tap;
 
@@ -108,6 +110,8 @@ fn usage() -> &'static str {
             [--ticket-json <path|inline> --suite wan-m]\n\
             [--suite wan-e2e]\n\
             [--suite wan-u]\n\
+            [--suite wan-c]\n\
+            [--suite wan-t]\n\
             Runs WAN-P rows P1–P5 against a live serve by default. --flood-relay arms P3\n\
             (VPS strfry only: ws://198.51.100.1:7777, ws://198.51.100.2:7777).\n\
             --ticket-json + --suite wan-m runs the WAN-M rows (M1 + M9) instead, redeeming the\n\
@@ -116,6 +120,10 @@ fn usage() -> &'static str {
             --suite wan-e2e runs the WAN-E2E rows (E1 + E2): the full DM-coordinated pipeline.\n\
             --suite wan-u runs the WAN-U rows (U1–U7): the user-surface live twins (profile,\n\
             collections, add-contact, re-key, private). Probe-plays-both — no serve needed.\n\
+            --suite wan-c runs the WAN-C rows (C1–C5): chat over real relays (delivery latency,\n\
+            offline catch-up, disjoint relay sets, cursor discipline, blocked drop).\n\
+            --suite wan-t runs the WAN-T rows (T1–T5): topics between real clients (public join,\n\
+            channel pseudonymity, private invite, leave retract, announce + local filter).\n\
      \n\
      canary [--interval <secs>]\n\
             Stub — parses args, prints 'not yet implemented', exits nonzero."
@@ -813,10 +821,17 @@ async fn run_probe(args: &[String]) -> Result<ExitCode> {
     // for targeted iroh isolation runs (the E2E suite rides the full DM leg).
     let suite = args::flag_value(args, "--suite").unwrap_or("wan-p");
 
-    // WAN-U is probe-plays-both: every row constructs its own throwaway identities, so it needs no
-    // --peer. All other suites (wan-p/m/e2e) drive a live serve and require --peer.
+    // WAN-U / WAN-C / WAN-T are probe-plays-both: every row constructs its own throwaway
+    // identities, so they need no --peer. All other suites (wan-p/m/e2e) drive a live serve and
+    // require --peer.
     if suite == "wan-u" {
         return run_probe_wan_u(args).await;
+    }
+    if suite == "wan-c" {
+        return run_probe_wan_c(args).await;
+    }
+    if suite == "wan-t" {
+        return run_probe_wan_t(args).await;
     }
 
     let peer_str = args::flag_value(args, "--peer")
@@ -1009,6 +1024,70 @@ async fn run_probe_wan_u(args: &[String]) -> Result<ExitCode> {
 
     let mut tap = tap::Tap::new();
     suite_wan_u::run(&mut tap, &input).await;
+    Ok(tap.finish())
+}
+
+// ---------------------------------------------------------------------------
+// probe — WAN-C (C1–C5 — chat over real relays)
+// ---------------------------------------------------------------------------
+
+/// Run the WAN-C rows against the live relay set. Probe-plays-both: every row constructs two (or
+/// three) in-process identities against the live relays, the same shape `hb-it` L2 bodies use. No
+/// `serve` is needed. The probe uses a throwaway data dir for the C4/C5 rows that persist the DM
+/// cache / blocklist; the relay set is persisted to Settings for parity with the other suites.
+async fn run_probe_wan_c(args: &[String]) -> Result<ExitCode> {
+    let data_dir = PathBuf::from(
+        args::flag_value(args, "--data-dir").unwrap_or("./hb-wan-it-probe-data").to_string(),
+    );
+
+    let store = DataStore::new(data_dir.clone());
+    let relays = args::collect_relays(args);
+    if relays.is_empty() {
+        bail!("probe requires at least one --relay");
+    }
+    // Persist the relay set (parity with the other suites — net::relay_urls reads Settings).
+    store.save_settings(&Settings { relay_urls: relays.clone(), ..Default::default() })?;
+
+    let input = suite_wan_c::build_probe_input(store, relays.clone()).await?;
+
+    println!("# WAN-C probe (probe-plays-both against the live relay set)");
+    println!("# relay set: {}", relays.join(", "));
+
+    let mut tap = tap::Tap::new();
+    suite_wan_c::run(&mut tap, &input).await;
+    Ok(tap.finish())
+}
+
+// ---------------------------------------------------------------------------
+// probe — WAN-T (T1–T5 — topics between real clients)
+// ---------------------------------------------------------------------------
+
+/// Run the WAN-T rows against the live relay set. Probe-plays-both: every row constructs two (or
+/// three) in-process identities against the live relays, the same shape `hb-it` L2 bodies use. No
+/// `serve` is needed.
+async fn run_probe_wan_t(args: &[String]) -> Result<ExitCode> {
+    let data_dir = PathBuf::from(
+        args::flag_value(args, "--data-dir").unwrap_or("./hb-wan-it-probe-data").to_string(),
+    );
+
+    let store = DataStore::new(data_dir.clone());
+    let relays = args::collect_relays(args);
+    if relays.is_empty() {
+        bail!("probe requires at least one --relay");
+    }
+    store.save_settings(&Settings { relay_urls: relays.clone(), ..Default::default() })?;
+    // The T3 redeem path persists topic nonces; an identity is needed for the store_topic path the
+    // production redeem drives. Load-or-create one (the rows build their own throwaway identities for
+    // the relay ops; this identity owns the data dir for nonce persistence parity).
+    let app_id = load_or_create_identity(&store)?;
+
+    let input = suite_wan_t::build_probe_input(app_id, store, relays.clone()).await?;
+
+    println!("# WAN-T probe (probe-plays-both against the live relay set)");
+    println!("# relay set: {}", relays.join(", "));
+
+    let mut tap = tap::Tap::new();
+    suite_wan_t::run(&mut tap, &input).await;
     Ok(tap.finish())
 }
 
