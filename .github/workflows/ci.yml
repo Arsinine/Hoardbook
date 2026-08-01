@@ -225,6 +225,36 @@ jobs:
           fi
           echo "Tracked-files guard clean — no internal docs in the git index."
 
+      # CWE-94 injection guard for workflow files. A git tag name (github.ref_name), a PR branch
+      # name (github.head_ref), or a PR title/body (github.event.*) is attacker-controllable, and
+      # splicing it into a `run:`/`script:` body with `${{ ... }}` lets the attacker run arbitrary
+      # code in the job — in release.yml that job holds TAURI_SIGNING_PRIVATE_KEY, so this chains
+      # to signing-key theft and fleet-wide RCE. The fix is indirection: interpolate into an `env:`
+      # block (or read the auto-populated GITHUB_REF_NAME) so the value never becomes script text.
+      # This sweep fails the build if any of those contexts is interpolated INLINE in a script body.
+      # The legitimate fix interpolates them as a YAML scalar value (`key: ${{ ... }}` under env:/
+      # with:), which is safe — the value enters the runner environment, never a shell parser — so
+      # those scalar-value lines are dropped before the fail check. github.repository is owner-
+      # controlled and never attacker-controllable, so it is not in the pattern. Ubuntu-only, like
+      # the guards above; one grep pass over every workflow file suffices.
+      - name: Workflow injection sweep — no attacker-context interpolation in script bodies
+        if: matrix.platform == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Match a `${{ ... }}` expression naming an attacker-controllable context (github.ref_name,
+          # github.head_ref, or github.event.*.title/body). Then drop `path:line:  key: ${{` lines:
+          # those are YAML scalar values (env:/with: slots), the safe indirection pattern, not inline
+          # script text. What remains is an interpolation living inside a run:/script: body.
+          if out=$(grep -rnE '\$\{\{[^}]*github\.(ref_name|head_ref|event\.[^}]*(title|body))' .github/workflows 2>/dev/null \
+                   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*[A-Za-z_][A-Za-z0-9_.-]*:[[:space:]]*\$\{\{'); then
+            echo "::error::CWE-94 regression — an attacker-controllable context is interpolated inline in a workflow:"
+            echo "$out"
+            echo "::error::Route it through an env: block (or GITHUB_REF_NAME) as a YAML value, never inline as script text."
+            exit 1
+          fi
+          echo "Workflow injection sweep clean — no github.ref_name/head_ref/event.* inline in script bodies."
+
       # release.yml overwrites both versions from the tag at build time; this pins dev-build
       # getVersion() honesty (audit I-8): tauri.conf.json must match the hb-app package version.
       - name: Version consistency — tauri.conf.json matches Cargo.toml
