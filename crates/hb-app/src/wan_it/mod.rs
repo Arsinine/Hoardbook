@@ -29,6 +29,7 @@ mod args;
 mod suite_wan_e2e;
 mod suite_wan_m;
 mod suite_wan_p;
+mod suite_wan_u;
 mod tap;
 
 use std::path::{Path, PathBuf};
@@ -106,12 +107,15 @@ fn usage() -> &'static str {
             [--flood-relay <ws-url>... --flood-count <n>]\n\
             [--ticket-json <path|inline> --suite wan-m]\n\
             [--suite wan-e2e]\n\
+            [--suite wan-u]\n\
             Runs WAN-P rows P1–P5 against a live serve by default. --flood-relay arms P3\n\
             (VPS strfry only: ws://141.98.199.138:7777, ws://45.129.8.225:7777).\n\
             --ticket-json + --suite wan-m runs the WAN-M rows (M1 + M9) instead, redeeming the\n\
             ticket the serve printed (§W6 authorizes --ticket-json for targeted iroh isolation runs;\n\
             the E2E suite rides the full DM leg).\n\
             --suite wan-e2e runs the WAN-E2E rows (E1 + E2): the full DM-coordinated pipeline.\n\
+            --suite wan-u runs the WAN-U rows (U1–U7): the user-surface live twins (profile,\n\
+            collections, add-contact, re-key, private). Probe-plays-both — no serve needed.\n\
      \n\
      canary [--interval <secs>]\n\
             Stub — parses args, prints 'not yet implemented', exits nonzero."
@@ -797,18 +801,26 @@ fn parse_peer(peer: &str) -> Result<nostr::PublicKey> {
 }
 
 async fn run_probe(args: &[String]) -> Result<ExitCode> {
-    let peer_str = args::flag_value(args, "--peer")
-        .ok_or_else(|| anyhow!("probe requires --peer <npub or hbk… share-code>"))?;
     let relays = args::collect_relays(args);
     if relays.is_empty() {
         bail!("probe requires at least one --relay");
     }
 
     // Suite selection: --suite wan-m runs the WAN-M rows (M1 + M9) against --ticket-json; --suite
-    // wan-e2e runs the WAN-E2E rows (E1 + E2, the full DM-coordinated pipeline); the default is WAN-P
-    // (the presence suite W6.1 shipped). §W6 authorizes --ticket-json for targeted iroh isolation runs
-    // (the E2E suite rides the full DM leg).
+    // wan-e2e runs the WAN-E2E rows (E1 + E2, the full DM-coordinated pipeline); --suite wan-u runs
+    // the WAN-U rows (U1–U7, the user-surface live twins of the hb-it L2 browse/publish/private
+    // suites); the default is WAN-P (the presence suite W6.1 shipped). §W6 authorizes --ticket-json
+    // for targeted iroh isolation runs (the E2E suite rides the full DM leg).
     let suite = args::flag_value(args, "--suite").unwrap_or("wan-p");
+
+    // WAN-U is probe-plays-both: every row constructs its own throwaway identities, so it needs no
+    // --peer. All other suites (wan-p/m/e2e) drive a live serve and require --peer.
+    if suite == "wan-u" {
+        return run_probe_wan_u(args).await;
+    }
+
+    let peer_str = args::flag_value(args, "--peer")
+        .ok_or_else(|| anyhow!("probe requires --peer <npub or hbk… share-code>"))?;
     if suite == "wan-m" {
         return run_probe_wan_m(args, peer_str).await;
     }
@@ -960,6 +972,43 @@ async fn run_probe_wan_e2e(args: &[String], peer_str: &str) -> Result<ExitCode> 
 
     let mut tap = tap::Tap::new();
     suite_wan_e2e::run(&mut tap, &input, serve_store.as_ref()).await;
+    Ok(tap.finish())
+}
+
+// ---------------------------------------------------------------------------
+// probe — WAN-U (U1–U7 — the user-surface live twins)
+// ---------------------------------------------------------------------------
+
+/// Run the WAN-U rows against the live relay set. Probe-plays-both: every row constructs two
+/// in-process identities (publisher + browser/resolver) against the live relays, the same shape
+/// `hb-it` L2 bodies use. No `serve` is needed — the rows that need serve-side state changes (U4
+/// republish, U5 unpublish, U6 re-key) run probe-driven with the probe's own throwaway identity as
+/// the publisher (§W6 authorizes this shape; it is how the hb-it L2 bodies already work).
+///
+/// The probe seeds its own identity + store from --data-dir (U1's add-contact funnel persists the
+/// resolved contact here, so the relay set is persisted to Settings for `net::relay_urls` to return).
+async fn run_probe_wan_u(args: &[String]) -> Result<ExitCode> {
+    let data_dir = PathBuf::from(
+        args::flag_value(args, "--data-dir").unwrap_or("./hb-wan-it-probe-data").to_string(),
+    );
+
+    let store = DataStore::new(data_dir.clone());
+    // Persist the relay set (parity with the other suites — net::relay_urls reads Settings, and U1's
+    // resolve_peer reads the relay set from the store via net::relay_urls).
+    let relays = args::collect_relays(args);
+    if relays.is_empty() {
+        bail!("probe requires at least one --relay");
+    }
+    store.save_settings(&Settings { relay_urls: relays.clone(), ..Default::default() })?;
+    let app_id = load_or_create_identity(&store)?;
+
+    let input = suite_wan_u::build_probe_input(app_id, store, relays.clone()).await?;
+
+    println!("# WAN-U probe (probe-plays-both against the live relay set)");
+    println!("# relay set: {}", relays.join(", "));
+
+    let mut tap = tap::Tap::new();
+    suite_wan_u::run(&mut tap, &input).await;
     Ok(tap.finish())
 }
 
