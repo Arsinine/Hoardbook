@@ -1,16 +1,20 @@
 <script lang="ts">
 	import { joinConsentCopy, NO_UNLOCK_NOTE } from '../topics-view.js';
+	import { shortNpub } from '../contact-display.js';
 
 	interface Props {
 		/** Whether the Topic being joined is private (durable members-only record) or public. */
 		isPrivate?: boolean;
+		/** The invite issuer's npub (private redeem only) — surfaced so the user sees who is vouching
+		 *  before consenting. Omitted/empty for public joins (no authoritative issuer). */
+		issuerNpub?: string;
 		/** Disable while a join is in flight. */
 		disabled?: boolean;
 		onjoin?: () => void;
 		oncancel?: () => void;
 	}
 
-	let { isPrivate = false, disabled = false, onjoin, oncancel }: Props = $props();
+	let { isPrivate = false, issuerNpub = '', disabled = false, onjoin, oncancel }: Props = $props();
 
 	/** F12 — the explicit acknowledgment. The Join button stays disabled until this is checked. */
 	let acknowledged = $state(false);
@@ -28,6 +32,9 @@
 </script>
 
 <div class="join-consent">
+	{#if issuerNpub}
+		<p class="issuer">Invite from: <span class="mono">{shortNpub(issuerNpub)}</span></p>
+	{/if}
 	<p class="consent" role="note">{copy}</p>
 	<p class="no-unlock">{NO_UNLOCK_NOTE}</p>
 
@@ -61,6 +68,18 @@
 		font-size: 12.5px;
 		line-height: 1.45;
 		color: var(--fg);
+	}
+
+	.issuer {
+		margin: 0;
+		font-size: 12.5px;
+		line-height: 1.45;
+		color: var(--fg);
+	}
+
+	.issuer .mono {
+		font-family: var(--mono, monospace);
+		font-size: 11.5px;
 	}
 
 	.no-unlock {

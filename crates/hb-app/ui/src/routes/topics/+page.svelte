@@ -9,6 +9,7 @@
 		topicLookup,
 		topicJoinPublic,
 		topicRedeemInvite,
+		topicPreviewInvite,
 		topicLeave,
 		topicInvite,
 		topicRoster,
@@ -49,8 +50,13 @@
 	let rootTopics: Record<string, DiscoveredTopic[]> = $state({});
 	let loadingRoot: string | null = $state(null);
 
-	// The consent gate: which Topic (public name + private flag) is pending a join.
-	let pendingJoin: { name: string; isPrivate: boolean } | null = $state(null);
+	// The consent gate: which Topic (public name + private flag) is pending a join. For a private
+	// redeem, `issuerNpub` carries who vouches (surfaced in the consent modal); `mode: 'redeem'` routes
+	// the confirm button to `confirmRedeem` (the commit) instead of `confirmJoin` (the public path).
+	let pendingJoin:
+		| { name: string; isPrivate: boolean; mode: 'join'; issuerNpub?: string }
+		| { name: string; isPrivate: boolean; mode: 'redeem'; issuerNpub: string }
+		| null = $state(null);
 
 	// Open Topic (roster + invite). The 24h channel now lives in Chat (a persistent channel entry per
 	// joined Topic); posting moved there, so this panel keeps only membership management.
@@ -241,7 +247,7 @@
 
 	// Join is always gated behind the consent component (F12) — even for public Topics.
 	function askToJoin(name: string, isPrivate: boolean) {
-		pendingJoin = { name, isPrivate };
+		pendingJoin = { name, isPrivate, mode: 'join' };
 	}
 
 	async function confirmJoin() {
@@ -260,15 +266,42 @@
 		}
 	}
 
+	// W8: redeem is consent-gated like the public join. The preview reveals the invite issuer + topic
+	// name WITHOUT committing; the follow-up `confirmRedeem` calls the commit only after the ack.
 	async function redeemInvite() {
+		busy = true;
+		try {
+			const preview = await topicPreviewInvite();
+			if (!preview) {
+				toast('No pending invite found', 'success');
+				return;
+			}
+			// Open the consent modal carrying the issuer npub + topic name — do NOT commit yet.
+			pendingJoin = {
+				name: preview.name,
+				isPrivate: true,
+				mode: 'redeem',
+				issuerNpub: preview.issuer_npub
+			};
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			busy = false;
+		}
+	}
+
+	async function confirmRedeem() {
+		if (!pendingJoin) return;
 		busy = true;
 		try {
 			const joined = await topicRedeemInvite();
 			if (joined) {
+				pendingJoin = null;
 				tab = 'mine';
 				await loadMine();
 				toast(`Joined private Topic “${joined.name}”`, 'success');
 			} else {
+				pendingJoin = null;
 				toast('No pending invite found', 'success');
 			}
 		} catch (e) {
@@ -491,13 +524,14 @@
 	{/snippet}
 </Modal>
 
-<!-- F12 consent gate: a join (public or private) fires only after explicit acknowledgment. -->
+<!-- F12 consent gate: a join (public or private) or a redeem fires only after explicit acknowledgment. -->
 {#if pendingJoin}
 	<Modal open={true} title={`Join “${pendingJoin.name}”`} onclose={() => (pendingJoin = null)}>
 		<TopicJoinConsent
 			isPrivate={pendingJoin.isPrivate}
+			issuerNpub={pendingJoin.mode === 'redeem' ? pendingJoin.issuerNpub : ''}
 			disabled={busy}
-			onjoin={confirmJoin}
+			onjoin={pendingJoin.mode === 'redeem' ? confirmRedeem : confirmJoin}
 			oncancel={() => (pendingJoin = null)}
 		/>
 	</Modal>

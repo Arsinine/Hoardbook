@@ -127,7 +127,7 @@ async fn topic2(ctx: &Ctx) -> Result<()> {
     // (b) A joiner obtains the key via the public-join credential, joins, reads the roster, posts.
     let joiner = Identity::generate();
     let jc = ctx.connect(&joiner).await?;
-    let (jmeta, jkey) = join_public(&jc, &meta.name, &mut NonceSet::new(), now(), FETCH_TIMEOUT)
+    let (jmeta, jkey, _issuer) = join_public(&jc, &meta.name, &mut NonceSet::new(), now(), FETCH_TIMEOUT)
         .await?
         .ok_or_else(|| anyhow!("a joiner found no public-join credential"))?;
     ensure!(jkey.as_bytes() == key.as_bytes(), "the joiner obtains the real topic key");
@@ -231,7 +231,7 @@ async fn topic5(ctx: &Ctx) -> Result<()> {
 
     // The invitee redeems the invite, joins, and reads the roster.
     let ic = ctx.connect(&invitee).await?;
-    let (imeta, ikey) = fetch_invite(&ic, &invitee, &mut NonceSet::new(), now(), FETCH_TIMEOUT)
+    let (imeta, ikey, _issuer) = fetch_invite(&ic, &invitee, &mut NonceSet::new(), now(), FETCH_TIMEOUT, None)
         .await?
         .ok_or_else(|| anyhow!("the invitee found no invite"))?;
     ensure!(ikey.as_bytes() == key.as_bytes(), "the invite carries the real topic key");
@@ -278,7 +278,7 @@ async fn topic6(ctx: &Ctx) -> Result<()> {
 
     // The requester redeems the approval + joins.
     let rc = ctx.connect(&requester).await?;
-    let (imeta, ikey) = fetch_invite(&rc, &requester, &mut NonceSet::new(), now(), FETCH_TIMEOUT)
+    let (imeta, ikey, _issuer) = fetch_invite(&rc, &requester, &mut NonceSet::new(), now(), FETCH_TIMEOUT, None)
         .await?
         .ok_or_else(|| anyhow!("the requester found no approval invite"))?;
     join_topic(&rc, &ikey, &imeta.topic_id, &requester, now()).await?;
@@ -310,7 +310,7 @@ async fn topic7(ctx: &Ctx) -> Result<()> {
 
     // member_a redeems, joins, then — as a non-creator member — invites the newcomer (M3).
     let ac = ctx.connect(&member_a).await?;
-    let (ameta, akey) = fetch_invite(&ac, &member_a, &mut NonceSet::new(), now(), FETCH_TIMEOUT)
+    let (ameta, akey, _issuer) = fetch_invite(&ac, &member_a, &mut NonceSet::new(), now(), FETCH_TIMEOUT, None)
         .await?
         .ok_or_else(|| anyhow!("member_a found no invite"))?;
     join_topic(&ac, &akey, &ameta.topic_id, &member_a, now()).await?;
@@ -320,7 +320,7 @@ async fn topic7(ctx: &Ctx) -> Result<()> {
 
     // The newcomer redeems member_a's invite + joins.
     let nc = ctx.connect(&newcomer).await?;
-    let (nmeta, nkey) = fetch_invite(&nc, &newcomer, &mut NonceSet::new(), now(), FETCH_TIMEOUT)
+    let (nmeta, nkey, _issuer) = fetch_invite(&nc, &newcomer, &mut NonceSet::new(), now(), FETCH_TIMEOUT, None)
         .await?
         .ok_or_else(|| anyhow!("the newcomer found no invite from member_a"))?;
     join_topic(&nc, &nkey, &nmeta.topic_id, &newcomer, now()).await?;
@@ -424,7 +424,7 @@ async fn topic10(ctx: &Ctx) -> Result<()> {
     let b = Identity::generate();
     let bc = ctx.connect(&b).await?;
     let mut seen = NonceSet::new();
-    let (rmeta, rkey) = join_public(&bc, &variant, &mut seen, now(), FETCH_TIMEOUT)
+    let (rmeta, rkey, _issuer) = join_public(&bc, &variant, &mut seen, now(), FETCH_TIMEOUT)
         .await?
         .ok_or_else(|| anyhow!("B could not join via the path variant — public-join derivation diverged"))?;
     ensure!(rmeta.topic_id == topic_id_for_name(&canonical), "the variant did not converge to the canonical topic_id");
@@ -568,7 +568,7 @@ async fn topic13(ctx: &Ctx) -> Result<()> {
     // B takes the keyless public-join path (join-first, not create): redeem the public-join
     // credential derived from the SAME name, obtaining A's real topic_key (no fresh mint).
     let mut seen = NonceSet::new();
-    let (jmeta, jkey) = join_public(&bc, &variant, &mut seen, now(), FETCH_TIMEOUT)
+    let (jmeta, jkey, _issuer) = join_public(&bc, &variant, &mut seen, now(), FETCH_TIMEOUT)
         .await?
         .ok_or_else(|| anyhow!("B found no public-join credential for A's room"))?;
     ensure!(jmeta.topic_id == meta_a.topic_id, "B's join targets A's existing room, not a fork");
