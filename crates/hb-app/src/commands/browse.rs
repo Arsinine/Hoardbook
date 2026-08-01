@@ -191,7 +191,12 @@ pub(crate) fn rendered_to_peer_collection(r: &RenderedListing) -> Option<PeerCol
 fn big_relay_fetch_order<'a>(own_big: &'a str, peer_big: &'a str) -> Vec<&'a str> {
     let mut out: Vec<&str> = Vec::new();
     for candidate in [own_big.trim(), peer_big.trim()] {
-        if !candidate.is_empty() && !out.contains(&candidate) {
+        // SSRF guard: the peer's `big_relay_url` is attacker-authored — drop any candidate that
+        // points at loopback/private/link-local (the own relay was already validated on save).
+        if !candidate.is_empty()
+            && !out.contains(&candidate)
+            && net::validate_relay_url(candidate).is_ok()
+        {
             out.push(candidate);
         }
     }
@@ -1190,6 +1195,34 @@ mod tests {
         assert_eq!(big_relay_fetch_order("  ws://own:7777  ", "   "), vec!["ws://own:7777"]);
         // Both blank ⇒ nothing to try (keep the teaser).
         assert!(big_relay_fetch_order("", "").is_empty());
+    }
+
+    #[test]
+    fn big_relay_fetch_order_drops_ssrf_peer_candidates() {
+        // M19 W7: the peer's advertised `big_relay_url` is attacker-controlled; the SSRF guard must
+        // reject loopback/private/link-local hosts before anything dials them. The own big relay is
+        // validated on save so it survives; only the peer candidate gets filtered.
+        // Own valid + peer malicious ⇒ only the own relay remains.
+        for bad in [
+            "ws://127.0.0.1:7777",
+            "ws://169.254.169.254",
+            "ws://10.0.0.5",
+            "ws://172.16.0.1",
+            "ws://192.168.1.1",
+        ] {
+            assert_eq!(
+                big_relay_fetch_order("wss://big.example.com", bad),
+                vec!["wss://big.example.com"],
+                "peer SSRF candidate {bad} should be dropped",
+            );
+            // Own empty + peer malicious ⇒ nothing left to dial (keep the teaser).
+            assert!(big_relay_fetch_order("", bad).is_empty(), "peer SSRF candidate {bad} with no own relay should yield nothing");
+        }
+        // A valid public peer relay is still kept (regression guard against over-filtering).
+        assert_eq!(
+            big_relay_fetch_order("wss://big.example.com", "wss://peer.example.com"),
+            vec!["wss://big.example.com", "wss://peer.example.com"],
+        );
     }
 
     #[test]
