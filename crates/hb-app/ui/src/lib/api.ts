@@ -285,9 +285,24 @@ export const onlineCount = () => invoke<OnlineCount>('online_count');
 export const pasteKey = (code: string) => invoke<CachedPeer>('paste_key', { code });
 
 /** `petname` is the M13 W5 seam — an optional user-supplied nickname set at follow-time, overriding
- *  the auto-derived one. Pass undefined/omit to keep the auto-derived petname. */
-export const follow = (code: string, groupName?: string, petname?: string) =>
-	invoke<void>('follow', { code, groupName: groupName ?? null, petname: petname ?? null });
+ *  the auto-derived one. Pass undefined/omit to keep the auto-derived petname.
+ *
+ *  M20 W2: `resolvedPeer` is the peer the lookup already resolved (`pasteKey`'s result). Passing it
+ *  lets the Rust `follow` skip a SECOND `resolve_peer` after the user commits — the fix for the
+ *  "add is slow / resolves twice" defect. Omit (e.g. chat Unlock, which has no pre-resolved peer) to
+ *  fall back to resolving from `code` as before. */
+export const follow = (
+	code: string,
+	groupName?: string | null,
+	petname?: string,
+	resolvedPeer?: CachedPeer,
+) =>
+	invoke<void>('follow', {
+		code,
+		groupName: groupName ?? null,
+		petname: petname ?? null,
+		resolvedPeer: resolvedPeer ?? null,
+	});
 
 export const getContacts = () => invoke<CachedPeer[]>('get_contacts');
 
