@@ -423,9 +423,13 @@ pub async fn topic_join_public(
     Ok(TopicView::from(&stored))
 }
 
-/// Join a private Topic by redeeming an invite addressed to me (admission path 1, redeem side).
+/// Join a private Topic by redeeming an invite addressed to me (admission path 1, redeem side). The
+/// `expected_topic_id` binds the redeem to the topic the user consented to in the W8 preview
+/// (`topic_preview_invite`): a relay that swaps in a different valid invite at redeem is rejected by
+/// `fetch_invite`'s existing topic_id check (reusing the public-join W4 substitution guard).
 #[tauri::command]
 pub async fn topic_redeem_invite(
+    expected_topic_id: String,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
     relay: State<'_, SharedRelay>,
@@ -436,7 +440,7 @@ pub async fn topic_redeem_invite(
     // we persist the set afterward so a restart can't re-accept it.
     let mut seen = store.load_topic_nonces().map_err(cmd_err)?;
     let t = now();
-    let redeemed = fetch_invite(&client, &me, &mut seen, t, net::RELAY_TIMEOUT, None)
+    let redeemed = fetch_invite(&client, &me, &mut seen, t, net::RELAY_TIMEOUT, Some(&expected_topic_id))
         .await
         .map_err(cmd_err)?;
     let (meta, key, _) = match redeemed {
