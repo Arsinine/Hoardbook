@@ -19,6 +19,9 @@ Hoardbook_*.deb
 # Multi-agent review scratch state
 .work/
 
+# Security-scan output (VVAH SAST reports — local, not shipped)
+security-scan/
+
 # Local regression-test authoring prompt (not shipped)
 REGRESSION.md
 
