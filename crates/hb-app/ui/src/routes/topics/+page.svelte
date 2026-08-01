@@ -55,7 +55,7 @@
 	// the confirm button to `confirmRedeem` (the commit) instead of `confirmJoin` (the public path).
 	let pendingJoin:
 		| { name: string; isPrivate: boolean; mode: 'join'; issuerNpub?: string }
-		| { name: string; isPrivate: boolean; mode: 'redeem'; issuerNpub: string }
+		| { name: string; isPrivate: boolean; mode: 'redeem'; issuerNpub: string; topicId: string }
 		| null = $state(null);
 
 	// Open Topic (roster + invite). The 24h channel now lives in Chat (a persistent channel entry per
@@ -276,12 +276,15 @@
 				toast('No pending invite found', 'success');
 				return;
 			}
-			// Open the consent modal carrying the issuer npub + topic name — do NOT commit yet.
+			// Open the consent modal carrying the issuer npub + topic name — do NOT commit yet. The
+			// previewed topic_id is carried onto pendingJoin so confirmRedeem can bind the redeem to it
+			// (W8 substitution guard): a relay that serves a different valid invite at redeem is rejected.
 			pendingJoin = {
 				name: preview.name,
 				isPrivate: true,
 				mode: 'redeem',
-				issuerNpub: preview.issuer_npub
+				issuerNpub: preview.issuer_npub,
+				topicId: preview.topic_id
 			};
 		} catch (e) {
 			toast(String(e), 'error');
@@ -292,9 +295,12 @@
 
 	async function confirmRedeem() {
 		if (!pendingJoin) return;
+		// Only reached in 'redeem' mode (the consent modal routes here, not to confirmJoin), so
+		// pendingJoin.topicId is present — narrow with the mode check to keep svelte-check happy.
+		if (pendingJoin.mode !== 'redeem') return;
 		busy = true;
 		try {
-			const joined = await topicRedeemInvite();
+			const joined = await topicRedeemInvite(pendingJoin.topicId);
 			if (joined) {
 				pendingJoin = null;
 				tab = 'mine';
