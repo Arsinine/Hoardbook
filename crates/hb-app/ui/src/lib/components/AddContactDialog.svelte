@@ -47,7 +47,7 @@
 <Modal open={open} title="Add contact" level="stacked" onclose={() => oncancel?.()}>
 	<div class="field">
 		<label for="acd-petname">Petname</label>
-		<input id="acd-petname" type="text" bind:value={petname} placeholder="A nickname only you see" onkeydown={(e) => e.key === 'Enter' && save()} />
+		<input id="acd-petname" class="hb-input" type="text" bind:value={petname} placeholder="A nickname only you see" onkeydown={(e) => e.key === 'Enter' && save()} />
 	</div>
 	<div class="group-row">
 		<span class="group-label">Add to group:</span>
@@ -68,10 +68,7 @@
 <style>
 	.field { display: flex; flex-direction: column; gap: 5px; }
 	.field label { font-size: 11px; color: var(--fg-muted); font-weight: 500; }
-	.field input[type='text'] {
-		padding: 6px 9px; background: var(--bg-elev2); color: var(--fg);
-		border: 1px solid var(--border); border-radius: 6px; font: inherit;
-	}
+	/* M20 W4: the petname input uses the global .hb-input contract (app.css). */
 	.group-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
 	.group-label { font-size: 11.5px; color: var(--fg-muted); white-space: nowrap; }
 	.group-row select {

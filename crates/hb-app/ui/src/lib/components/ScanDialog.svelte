@@ -324,26 +324,8 @@
 
 	.hb-input-bare::placeholder { color: var(--fg-dim); }
 
-	.hb-input {
-		display: flex;
-		align-items: center;
-		padding: 0 11px;
-		height: 34px;
-		background: var(--bg-input);
-		border: 1px solid var(--border);
-		border-radius: 7px;
-		font-family: var(--font-ui);
-		font-size: 13px;
-		color: var(--fg);
-		outline: none;
-		width: 100%;
-	}
-
-	.hb-input::placeholder { color: var(--fg-dim); }
-
-	.hb-input:focus { border-color: var(--accent); }
-
-	.hb-mono { font-family: var(--font-mono); }
+	/* M20 W4: input contract is global in app.css. The .hb-input fields sit in `.field` (flex-column)
+	   and stretch to full width without a local rule. */
 
 	/* Folder-tree picker */
 	.tree-actions { display: flex; gap: 10px; }

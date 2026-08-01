@@ -1269,27 +1269,8 @@
 
 	.accent-dot { color: var(--accent); margin-left: 3px; }
 
-	.hb-input {
-		display: flex;
-		align-items: center;
-		padding: 0 11px;
-		height: 34px;
-		background: var(--bg-input);
-		border: 1px solid var(--border);
-		border-radius: 7px;
-		font-family: var(--font-ui);
-		font-size: 13px;
-		color: var(--fg);
-		outline: none;
-		width: 100%;
-		transition: border-color 0.1s;
-	}
-
-	.hb-input:focus { border-color: var(--accent); }
-
-	.hb-input::placeholder { color: var(--fg-dim); }
-
-	.hb-input-mono { font-family: var(--font-mono); }
+	/* M20 W4: the input contract (height/fill/border/radius/focus) is global in app.css. Inputs sit
+	   in `.field` (flex-column), so they stretch to full width without a local width rule. */
 
 	/* Language tag input */
 	.tag-wrap {
@@ -1363,14 +1344,6 @@
 		cursor: pointer;
 	}
 	.lang-suggestion:hover { background: var(--bg-elev3); }
-
-	.hb-textarea {
-		height: auto;
-		min-height: 64px;
-		align-items: flex-start;
-		padding: 9px 11px;
-		resize: vertical;
-	}
 
 	.willing-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
 
