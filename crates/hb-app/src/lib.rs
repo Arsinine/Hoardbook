@@ -22,6 +22,10 @@ mod transport;
 mod transport_state;
 mod update_logic;
 mod watch;
+// M20 W6 — the headless WAN integration harness (Suite WAN-P). In-crate so it can reach
+// `pub(crate)` production internals (presence.rs, hb-net::fetch_online_presence). Never starts the
+// Tauri/webkit runtime — the thin `bin/hb-wan-it.rs` wrapper calls `run_wan_it`.
+mod wan_it;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -217,6 +221,17 @@ fn spawn_watch_task(
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
     ));
     watcher
+}
+
+// ---------------------------------------------------------------------------
+// WAN harness entry point
+// ---------------------------------------------------------------------------
+
+/// Entry point for the `hb-wan-it` headless WAN integration harness binary (M20 W6). Thin wrapper
+/// around `wan_it::run`; the binary lives at `src/bin/hb-wan-it.rs` and calls this so the harness
+/// reaches `pub(crate)` production code without starting the Tauri/webkit runtime.
+pub async fn run_wan_it() -> std::process::ExitCode {
+    wan_it::run().await
 }
 
 // ---------------------------------------------------------------------------
