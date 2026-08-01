@@ -2205,6 +2205,7 @@ dependencies = [
  "notify",
  "rand 0.8.5",
  "reqwest",
+ "rustls",
  "self-replace",
  "semver",
  "serde",
