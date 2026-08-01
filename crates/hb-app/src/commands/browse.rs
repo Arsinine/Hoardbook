@@ -479,36 +479,21 @@ fn merge_local_state(peer: &mut CachedPeer, existing: &CachedPeer, had_explicit_
     peer.source = existing.source;
 }
 
-#[tauri::command]
-pub async fn follow(
-    code: String,
-    group_name: Option<String>,
-    // M13 W5 item 4: an optional user-supplied petname, set at follow-time. Trailing `Option` keeps
-    // existing callers (which pass fewer invoke args) working — a missing/`null` arg is simply "no
-    // petname edit", falling back to the auto-derived one `resolve_peer` already set.
+/// The pure save-tail of [`follow`]: petname apply → R2 gate → local-state merge → store write →
+/// optional group add. Extracted (M20 W2) so the follow path is testable without a relay, AND so the
+/// "don't resolve twice" fix can hand a pre-resolved peer straight here, skipping `resolve_peer`.
+/// Never calls the relay; only the local store. `had_explicit_petname` is computed by the caller
+/// (before `apply_follow_petname` consumes the `petname` arg) — see `follow` for why the flag exists.
+fn save_followed_peer(
+    store: &DataStore,
+    mut peer: CachedPeer,
     petname: Option<String>,
-    identity: State<'_, SharedIdentity>,
-    store: State<'_, DataStore>,
-    relay: State<'_, SharedRelay>,
-) -> CmdResult<()> {
-    let share_code = ShareCode::parse(&code).map_err(|e| format!("Invalid share code: {e}"))?;
-    let me = identity_clone(&identity).await?;
-    let mut peer = resolve_peer(&share_code, &me, &store, &relay).await?;
-    // Defense-in-depth (R2): closes the AddContactDialog Skip path for a profileless peer even if
-    // the caller bypassed the paste_key/lookup gate.
+    group_name: Option<String>,
+    had_explicit_petname: bool,
+) -> Result<(), String> {
     reject_profileless(&peer)?;
-    // Capture whether the caller supplied an explicit petname BEFORE `apply_follow_petname` consumes
-    // `petname`. `resolve_peer` auto-derives `peer.petname` from the teaser display_name (Some, not
-    // None), so `merge_local_state` cannot tell an auto-derived name from a user edit by inspecting
-    // `peer.petname` alone — the flag is the only reliable signal (the W3 regression: a contact
-    // locally named "Rae" was clobbered by the teaser name "Alice" on Unlock, which passes None).
-    let had_explicit_petname = petname.as_ref().is_some_and(|p| !p.is_empty());
     apply_follow_petname(&mut peer, petname);
     let npub = peer.npub.clone();
-    // M17 W3: preserve local-only state (petname/local_tags/source) when re-following an existing
-    // contact. `resolve_peer` already merges the browse-key onto a stale cache fallback, but when it
-    // rebuilds a fresh peer from the teaser it would wipe the locally-bound name. `merge_local_state`
-    // mirrors `refresh_contact`'s preservation rule.
     if let Ok(Some(existing)) = store.load_contact(&CachedPeer::pubkey_hash(&npub)) {
         merge_local_state(&mut peer, &existing, had_explicit_petname);
     }
@@ -525,6 +510,47 @@ pub async fn follow(
         }
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn follow(
+    code: String,
+    group_name: Option<String>,
+    // M13 W5 item 4: an optional user-supplied petname, set at follow-time. Trailing `Option` keeps
+    // existing callers (which pass fewer invoke args) working — a missing/`null` arg is simply "no
+    // petname edit", falling back to the auto-derived one `resolve_peer` already set.
+    petname: Option<String>,
+    // M20 W2: an optional pre-resolved peer. The AddContact funnel already resolved the peer via
+    // `paste_key` (the lookup); passing that result here lets `follow` skip a SECOND `resolve_peer`
+    // round-trip after the user commits (the perceived-latency fix). `None` (legacy callers — chat
+    // Unlock, topic invite) falls back to resolving from `code` as before. The caller MUST pass a peer
+    // whose npub matches the code's pubkey — enforced below.
+    resolved_peer: Option<CachedPeer>,
+    identity: State<'_, SharedIdentity>,
+    store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
+) -> CmdResult<()> {
+    let had_explicit_petname = petname.as_ref().is_some_and(|p| !p.is_empty());
+    let share_code = ShareCode::parse(&code).map_err(|e| format!("Invalid share code: {e}"))?;
+
+    // The "don't resolve twice" fix: when the caller hands us the peer the lookup already resolved,
+    // skip `resolve_peer` entirely. The npub is bound to the code's pubkey so a mismatched/crafted
+    // peer (a stale lookup result for a DIFFERENT peer) is refused before it is trusted — the whole
+    // point of `paste_key` resolving from the share code, not from the UI's say-so.
+    let peer = if let Some(pre) = resolved_peer {
+        let code_npub = share_code.pubkey().to_bech32().map_err(cmd_err)?;
+        if pre.npub != code_npub {
+            return Err(
+                "The resolved peer does not match the share code. Re-look the peer up and try again."
+                    .into(),
+            );
+        }
+        pre
+    } else {
+        let me = identity_clone(&identity).await?;
+        resolve_peer(&share_code, &me, &store, &relay).await?
+    };
+    save_followed_peer(&store, peer, petname, group_name, had_explicit_petname)
 }
 
 #[tauri::command]
@@ -1448,5 +1474,107 @@ mod tests {
         merge_local_state(&mut fresh, &existing, false);
         assert_eq!(fresh.local_tags, vec!["trader".to_string(), "eu".to_string()], "tags carry over");
         assert_eq!(fresh.source, crate::store::ContactSource::Topic, "a Topic source survives a re-follow");
+    }
+
+    // ── M20 W2: a single add issues ONE resolve_peer ──────────────────────────────────
+    // The fix: `follow` accepts an optional pre-resolved peer (the lookup's result) and hands it
+    // straight to `save_followed_peer`, skipping the second `resolve_peer`. The tail extracted out
+    // behind a pure helper is what makes that provable WITHOUT a relay: `save_followed_peer` touches
+    // only the store, so a unit test exercising it is, by construction, asserting the relay was never
+    // dialed in the pre-resolved path.
+
+    fn stub_peer_with_profile(npub: &str, display_name: &str) -> CachedPeer {
+        let mut peer = stub_peer(npub, Some(display_name));
+        peer.profile = Some(teaser_to_profile(Teaser {
+            display_name: display_name.into(),
+            bio: String::new(),
+            tags: vec![],
+            content_types: vec![],
+            picture: None,
+        }));
+        peer
+    }
+
+    #[test]
+    fn save_followed_peer_persists_a_pre_resolved_peer_without_a_relay() {
+        // The "don't resolve twice" fix in miniature: the lookup already produced a CachedPeer, and
+        // the follow leg persists it via `save_followed_peer` alone — no `resolve_peer` call, no relay.
+        // A store round-trip is the proof the peer landed; that the function signature takes no
+        // `SharedRelay`/`Identity` (only `&DataStore`) is the structural proof the relay was not dialed.
+        let (_dir, store) = test_store();
+        let npub = "npub1_w2_resolve";
+        let peer = stub_peer_with_profile(npub, "W2Peer");
+
+        save_followed_peer(&store, peer.clone(), None, None, false).unwrap();
+
+        let loaded = store
+            .load_contact(&CachedPeer::pubkey_hash(npub))
+            .unwrap()
+            .expect("the pre-resolved peer is persisted");
+        assert_eq!(loaded.npub, npub);
+        assert_eq!(loaded.petname.as_deref(), Some("W2Peer"), "the auto-derived petname survives");
+    }
+
+    #[test]
+    fn save_followed_peer_applies_an_explicit_petname() {
+        // The user's follow-time petname edit rides the pre-resolved path too (the dialog sits between
+        // lookup and follow). Guards the W3 regression on this new code path.
+        let (_dir, store) = test_store();
+        let npub = "npub1_w2_petname";
+        let peer = stub_peer_with_profile(npub, "AutoName");
+
+        save_followed_peer(&store, peer, Some("MyNick".into()), None, true).unwrap();
+
+        let loaded = store.load_contact(&CachedPeer::pubkey_hash(npub)).unwrap().unwrap();
+        assert_eq!(loaded.petname.as_deref(), Some("MyNick"), "the explicit petname wins");
+    }
+
+    #[test]
+    fn save_followed_peer_adds_to_a_group() {
+        // The group add also rides the pre-resolved path — nothing about the resolve is needed for a
+        // local group membership write.
+        let (_dir, store) = test_store();
+        let npub = "npub1_w2_group";
+        // Seed an empty group the follow will add into.
+        let groups = vec![crate::store::Group {
+            name: "Pals".into(),
+            pubkeys: vec![],
+            modified_at: Utc::now(),
+            color: None,
+            trusted: false,
+        }];
+        store.save_groups(&groups).unwrap();
+
+        save_followed_peer(&store, stub_peer_with_profile(npub, "G"), None, Some("Pals".into()), false)
+            .unwrap();
+
+        let reloaded = store.load_groups().unwrap();
+        let group = reloaded.iter().find(|g| g.name == "Pals").unwrap();
+        assert!(
+            group.pubkeys.iter().any(|p| p == npub),
+            "the pre-resolved peer is added to the group: {:?}",
+            group.pubkeys
+        );
+    }
+
+    #[test]
+    fn save_followed_peer_preserves_local_state_on_re_add() {
+        // The W3 merge also rides the pre-resolved path — a pre-existing contact's local petname/tags
+        // survive a re-follow that skips the resolve.
+        let (_dir, store) = test_store();
+        let npub = "npub1_w2_readd";
+        let hash = CachedPeer::pubkey_hash(npub);
+        let mut existing = stub_peer_with_profile(npub, "Cached");
+        existing.local_tags = vec!["vip".into()];
+        store.save_contact(&hash, &existing).unwrap();
+
+        // A second add with no explicit petname: the auto-derived name ("Fresh") must be discarded in
+        // favour of the existing cached petname ("Cached").
+        let fresh = stub_peer_with_profile(npub, "Fresh");
+        save_followed_peer(&store, fresh, None, None, false).unwrap();
+
+        let loaded = store.load_contact(&hash).unwrap().unwrap();
+        assert_eq!(loaded.petname.as_deref(), Some("Cached"), "the local petname survives re-add");
+        assert_eq!(loaded.local_tags, vec!["vip".to_string()], "local tags survive re-add");
     }
 }

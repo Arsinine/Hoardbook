@@ -19,7 +19,9 @@
 		// `code` is what `follow` must re-resolve — the full `hbk1…` share code (carrying the
 		// browse-key) for a lookup, or the bare npub for a discovery hit. Passing only the npub
 		// (as before) silently dropped the key and made every added contact keyless (devtest #3).
-		onadd?: (code: string, npub: string, displayName: string) => void;
+		// M20 W2: `resolved` is the CachedPeer the lookup already produced — carried through so the
+		// follow leg skips a SECOND resolve. A discovery hit carries `null` (no pre-resolved peer).
+		onadd?: (code: string, npub: string, displayName: string, resolved: CachedPeer | null) => void;
 		// M17 W1: "Message" on a discovery hit-card → `/chat?compose=<npub>` (works for non-contacts).
 		// "Add contact" stays primary/first; Message comes after it.
 		onmessage?: (npub: string) => void;
@@ -65,7 +67,8 @@
 
 	function handleFollow() {
 		if (!result) return;
-		onadd?.(lookedUpCode, result.npub, result.profile?.display_name ?? '');
+		// M20 W2: carry the lookup's resolved peer through to the follow leg so it isn't resolved twice.
+		onadd?.(lookedUpCode, result.npub, result.profile?.display_name ?? '', result);
 	}
 
 	function handleKeydown(e: KeyboardEvent) {
@@ -100,7 +103,8 @@
 	function followHit(hit: PeerSearchHit) {
 		// bare npub only: awareness, NOT a browse-key (INV-2) — the dialog's Skip path preserves that.
 		// Discovery hits are teaser-only (DISC3) — no browse-key exists, so the code IS the npub.
-		onadd?.(hit.npub, hit.npub, hit.display_name);
+		// M20 W2: null resolved peer — a discovery hit was never resolved, so follow resolves it.
+		onadd?.(hit.npub, hit.npub, hit.display_name, null);
 	}
 
 	function close() {

@@ -133,18 +133,37 @@
 		contactGroupEditing = { ...contactGroupEditing, [hb_id]: false };
 	}
 
+	// M20 W2: the mount fan-out used to fire one full `refreshContact` (= one `resolve_peer`) per
+	// contact, ALL in parallel, on EVERY page visit — unbounded. Now capped at REFRESH_CONCURRENCY at
+	// a time, and a contact refreshed within the last REFRESH_FRESHNESS_MS is skipped (no resolve at
+	// all). A full resolve per contact per page visit is not a refresh policy.
+	const REFRESH_CONCURRENCY = 4;
+	const REFRESH_FRESHNESS_MS = 10 * 60 * 1000; // 10 min
+
 	onMount(() => {
 		loadGroups();
 		loadPrivate();
 		refreshOnline();
 		onlinePollTimer = setInterval(refreshOnline, ONLINE_POLL_VISIBLE_MS);
-		// Refresh all contacts in parallel on page load (task 4)
-		$contacts.forEach(async (c) => {
-			try {
-				const updated = await refreshContact(c.npub);
-				contacts.update(cs => cs.map(x => x.npub === c.npub ? { ...x, ...updated, local_tags: x.local_tags } : x));
-			} catch { /* silent — relay may be unreachable */ }
+		// Refresh contacts on page load, but bounded: skip freshly-refreshed contacts and cap how many
+		// resolves run at once (task 4 + M20 W2). The pool drains at REFRESH_CONCURRENCY at a time.
+		const now = Date.now();
+		const stale = $contacts.filter((c) => {
+			const fetched = c.last_fetched ? new Date(c.last_fetched).getTime() : 0;
+			return now - fetched > REFRESH_FRESHNESS_MS;
 		});
+		let cursor = 0;
+		async function worker() {
+			while (cursor < stale.length) {
+				const c = stale[cursor++];
+				try {
+					const updated = await refreshContact(c.npub);
+					contacts.update(cs => cs.map(x => x.npub === c.npub ? { ...x, ...updated, local_tags: x.local_tags } : x));
+				} catch { /* silent — relay may be unreachable */ }
+			}
+		}
+		const workers = Array.from({ length: Math.min(REFRESH_CONCURRENCY, stale.length) }, worker);
+		void Promise.all(workers);
 	});
 
 	// Add-contact dialog (M13 W5 Slice 2): both the lookup card and a discovery hit open the same
@@ -155,17 +174,22 @@
 	// The share code `follow` must re-resolve (full `hbk1…` for a lookup, npub for a discovery hit).
 	// Kept alongside the npub target so the browse-key isn't dropped in the funnel (devtest #3).
 	let addContactCode: string | null = $state(null);
+	// M20 W2: the peer the lookup already resolved (`pasteKey`'s result). Held through the dialog and
+	// handed to `follow` so it skips a SECOND `resolve_peer` — the fix for "add resolves twice". A
+	// discovery hit (lookup = null) carries no pre-resolved peer, so the follow leg resolves as before.
+	let addContactResolved: CachedPeer | null = $state(null);
 
-	function openAddContact(code: string, npub: string, displayName: string) {
+	function openAddContact(code: string, npub: string, displayName: string, resolved: CachedPeer | null) {
 		addContactCode = code;
 		addContactTarget = npub;
 		addContactDisplayName = displayName;
+		addContactResolved = resolved;
 		addContactOpen = true;
 	}
 
-	async function completeFollow(code: string, npub: string, group: string | null, petname: string | undefined) {
+	async function completeFollow(code: string, npub: string, group: string | null, petname: string | undefined, resolved: CachedPeer | null) {
 		try {
-			await follow(code, group ?? undefined, petname);
+			await follow(code, group ?? undefined, petname, resolved ?? undefined);
 			try { contacts.set(await getContacts()); } catch { /* non-fatal */ }
 			await loadGroups();
 			toast(`Added ${petname || addContactDisplayName || npub.slice(0, 12) + '…'}`, 'success');
@@ -185,20 +209,24 @@
 		if (!addContactTarget || addContactCode === null) return;
 		const npub = addContactTarget;
 		const code = addContactCode;
+		const resolved = addContactResolved;
 		addContactOpen = false;
 		addContactTarget = null;
 		addContactCode = null;
-		await completeFollow(code, npub, detail.group, detail.petname);
+		addContactResolved = null;
+		await completeFollow(code, npub, detail.group, detail.petname, resolved);
 	}
 
 	async function handleAddContactSkip() {
 		if (!addContactTarget || addContactCode === null) return;
 		const npub = addContactTarget;
 		const code = addContactCode;
+		const resolved = addContactResolved;
 		addContactOpen = false;
 		addContactTarget = null;
 		addContactCode = null;
-		await completeFollow(code, npub, null, undefined);
+		addContactResolved = null;
+		await completeFollow(code, npub, null, undefined, resolved);
 	}
 
 	// "+ Add contact" (devtest #17/#18 redesign) — the lookup-by-ID + §6 Discover surfaces now live
@@ -628,7 +656,7 @@
 	onsave={handleAddContactSave}
 	onskip={handleAddContactSkip}
 	onnewGroup={() => (createGroupOpen = true)}
-	oncancel={() => { addContactOpen = false; addContactTarget = null; }}
+	oncancel={() => { addContactOpen = false; addContactTarget = null; addContactResolved = null; }}
 />
 
 <style>
