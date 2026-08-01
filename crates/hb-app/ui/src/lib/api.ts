@@ -357,10 +357,18 @@ export interface PeerSearchHit {
 	fingerprint: { words: string[]; colorHex: string } | null;
 }
 
+/** The §6 Discovery result: ranked hit cards + whether the cap truncated the set (M20 W3). When
+ *  `capped` is `true`, more candidates existed than the client cap kept, and the UI surfaces a
+ *  "showing first N" affordance rather than silently presenting a capped slice as everyone. */
+export interface PeerSearchResult {
+	hits: PeerSearchHit[];
+	capped: boolean;
+}
+
 /** Search public teasers by tag (AND) / content-type (OR). ≥1 filter is required (the backend
  *  rejects an empty search — no unfiltered global peer list). */
 export const searchPeers = (tags: string[], contentTypes: string[]) =>
-	invoke<PeerSearchHit[]>('search_peers', { tags, contentTypes });
+	invoke<PeerSearchResult>('search_peers', { tags, contentTypes });
 
 // ── Collection root path ────────────────────────────────────────────────────────
 

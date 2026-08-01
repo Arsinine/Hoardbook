@@ -326,9 +326,22 @@ where
     events.into_iter().filter(|e| seen.insert(e.id)).collect()
 }
 
+/// Relay-fetch headroom over the client-side `SEARCH_CAP` (M20 W3). The relay filter is an **OR**
+/// over `tags ∪ content_types`; the strict AND-tag match runs client-side (`teaser_matches`), so the
+/// relay's response window is mostly loose single-tag matches that get discarded. This explicit
+/// `.limit()` makes the fetch budget **ours**, not the relay's internal default (strfry
+/// `maxFilterLimit` defaults to 500 — without a declared limit that cap silently decided which teasers
+/// came back, and a full-AND-match teaser older than 500 loose hits was evicted before the client
+/// filter ever saw it). Sized at 10× the visible cap so even after the AND filter discards the bulk of
+/// loose matches, the strict survivors comfortably exceed `SEARCH_CAP`. A relay that clamps below this
+/// simply returns fewer (the "showing first N" affordance surfaces that).
+pub const TEASER_SEARCH_FETCH_LIMIT: usize = 1000;
+
 /// Build a teaser tag-search filter. Refused before any query (DISC4) when it constrains
 /// nothing — empty tags **and** empty content-types. The relay returns the OR-union of all
-/// `#t` terms; the caller intersects tags / unions content-types client-side (DISC1).
+/// `#t` terms; the caller intersects tags / unions content-types client-side (DISC1). An explicit
+/// `.limit()` ([`TEASER_SEARCH_FETCH_LIMIT`]) declares the fetch budget so the relay's own response
+/// cap can't silently evict strict-AND matches (M20 W3 — the eviction regression).
 pub fn teaser_search_filter(
     tags: &[String],
     content_types: &[String],
@@ -339,7 +352,8 @@ pub fn teaser_search_filter(
     let all: Vec<String> = tags.iter().chain(content_types).cloned().collect();
     Ok(Filter::new()
         .kind(Kind::from_u16(hb_core::event::KIND_TEASER))
-        .hashtags(all))
+        .hashtags(all)
+        .limit(TEASER_SEARCH_FETCH_LIMIT))
 }
 
 #[cfg(test)]
@@ -393,6 +407,16 @@ mod tests {
     fn teaser_filter_constrains_kind_and_tags() {
         let f = teaser_search_filter(&["anime".into()], &["video".into()]).unwrap();
         assert!(!f.is_empty(), "a constrained filter is not empty");
+    }
+
+    #[test]
+    fn teaser_filter_declares_an_explicit_limit_m20_w3() {
+        // M20 W3 eviction regression: without an explicit `.limit()` the relay's own response cap
+        // (strfry default 500) decided which teasers came back, so a full-AND-match teaser older than
+        // 500 loose single-tag matches was dropped before the client-side AND filter ever saw it. The
+        // filter must now declare the budget — it is ours, not the relay's.
+        let f = teaser_search_filter(&["anime".into()], &["video".into()]).unwrap();
+        assert_eq!(f.limit, Some(TEASER_SEARCH_FETCH_LIMIT), "fetch budget is declared explicitly");
     }
 
     #[test]
