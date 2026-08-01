@@ -178,13 +178,30 @@
 		try {
 			const result = await importManifest(targetNpub, targetSlug, source, selectedCollection.snapshot_fingerprint);
 			const full = result.collection;
-			// Swap the truncated collection for the full tree, in the view and the in-memory contact.
-			selectedPeer = {
-				...selectedPeer,
-				collections: selectedPeer.collections.map((c) => (c.slug === result.slug ? full : c)),
-			};
-			selectedCollection = full;
-			folderStack = [];
+			// M19 W10: the await may have resolved after the user switched peers/collections. Only swap
+			// the live view if they are still looking at the peer+collection the import was started
+			// for — otherwise the result lands under a different peer's identity chrome (content
+			// misattribution). Mirrors `selectPeer`'s `if (selectedPeer?.npub === updated.npub)` guard.
+			if (selectedPeer?.npub === targetNpub && selectedCollection?.slug === targetSlug) {
+				// Swap the truncated collection for the full tree, in the view and the in-memory contact.
+				selectedPeer = {
+					...selectedPeer,
+					collections: selectedPeer.collections.map((c) => (c.slug === result.slug ? full : c)),
+				};
+				selectedCollection = full;
+				folderStack = [];
+			} else {
+				// Stale result — fold the full tree into the background `contacts` store only, so a
+				// later return to that peer shows the upgraded listing without clobbering whoever the
+				// user is currently viewing.
+				contacts.update((cs) =>
+					cs.map((c) =>
+						c.npub === targetNpub
+							? { ...c, collections: c.collections.map((x) => (x.slug === result.slug ? full : x)) }
+							: c,
+					),
+				);
+			}
 			if (result.stale) {
 				toast('Imported an older version of this list — ask the owner for a fresh manifest.', 'error');
 			} else {
