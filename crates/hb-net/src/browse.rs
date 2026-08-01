@@ -208,6 +208,17 @@ async fn fetch_listing(
     render_slug_family(events, peer, slug, browse_key)
 }
 
+/// Drop any event not authored by `peer` (CWE-346 / Codex review, M16 W2 + M19 W3). The relay-side
+/// `author(peer)` filter is **not** enough — nostr-sdk does not verify that fetched events match the
+/// requested `author()` filter, so a lying relay can return a *validly-self-signed* listing event from
+/// a different key (a share-code holder can encrypt a family under the shared browse-key and sign it
+/// themselves). Without this pin such a foreign event can win the newest-per-`d` selection and splice
+/// spoofed content into the rendered tree, or hide a real collection. Used by both
+/// [`render_slug_family`] and [`browse_peer_listings`] so the two can't drift apart again.
+fn authored_by(events: Vec<Event>, peer: &PublicKey) -> Vec<Event> {
+    events.into_iter().filter(|e| &e.pubkey == peer).collect()
+}
+
 /// Group fetched `KIND_LISTING` events into one slug's family (the `d=slug` index/single + its
 /// `d=slug#partN` content parts), take the **newest event per `d`** (a non-compliant relay's stale
 /// replaceable duplicate can't win — N3/AB8), decrypt each with the browse-key (which re-verifies the
@@ -222,15 +233,7 @@ fn render_slug_family(
 ) -> Result<RenderedListing, NetError> {
     let part_prefix = format!("{slug}#part");
     let mut by_d: HashMap<String, Vec<Event>> = HashMap::new();
-    for ev in events {
-        // Author pin (Codex review, M16 W2): the relay-side `author(peer)` filter is not enough — a
-        // lying relay can return a *validly-signed* listing from another key (a share-code holder can
-        // encrypt a family under the shared browse-key and sign it themselves), and nostr-sdk does not
-        // verify that fetched events match the requested filter. Drop anything not authored by the
-        // browsed peer before it can win the newest-per-`d` selection or be decrypted + rendered.
-        if ev.pubkey != *peer {
-            continue;
-        }
+    for ev in authored_by(events, peer) {
         if let Some(d) = ev.tags.identifier() {
             if d == slug || d.starts_with(&part_prefix) {
                 by_d.entry(d.to_string()).or_default().push(ev);
@@ -369,7 +372,7 @@ pub async fn browse_peer_listings(
     // Group by root slug, keeping every event per full `d` so the newest per replaceable
     // identifier wins below (BTreeMap ⇒ output sorted by root slug).
     let mut families: BTreeMap<String, HashMap<String, Vec<Event>>> = BTreeMap::new();
-    for ev in events {
+    for ev in authored_by(events, peer) {
         if let Some(d) = ev.tags.identifier() {
             let root = match d.find("#part") {
                 Some(i) => &d[..i],
@@ -548,5 +551,75 @@ mod tests {
         let rendered = render_listing(&[json]).unwrap();
         assert_eq!(listing_snapshot_fingerprint(&rendered), None);
         assert!(!full_supersedes(&rendered, "anything"));
+    }
+
+    // ── M19 W3: the author-pin (CWE-346) — a foreign-author event must never reach selection ──────
+
+    /// A relay in the victim's pool can return a *validly-self-signed* listing event from a different
+    /// key with a matching `d`-tag and a newer `created_at`. Without the author-pin in
+    /// [`render_slug_family`] (shared with [`browse_peer_listings`] via [`authored_by`]),
+    /// `select_newest_by_created_at` would pick the attacker's event and splice spoofed content into the
+    /// rendered tree (or hide the real collection). This test asserts the foreign event is dropped
+    /// before it can win — and that the victim's real (older) event is what renders.
+    #[test]
+    fn foreign_author_event_with_matching_d_tag_is_dropped() {
+        let victim = Identity::generate();
+        let attacker = Identity::generate();
+        let peer = victim.public_key();
+        let browse_key: BrowseKey = [7; 32];
+
+        // The victim's real listing for `vault` (small enough to be a single unsplit event).
+        let victim_json =
+            serde_json::json!({ "slug": "vault", "entries": [{ "name": "real-file" }] }).to_string();
+        let victim_event =
+            build_listing_event(&victim, "vault", &browse_key, &victim_json).unwrap();
+
+        // The attacker's spoofed listing: SAME `d=vault`, NEWER `created_at`, sealed under the SAME
+        // browse-key (a share-code holder can do this) but signed by a DIFFERENT key. Its content is
+        // distinct so we can tell which one rendered.
+        let attacker_json =
+            serde_json::json!({ "slug": "vault", "entries": [{ "name": "SPOOFED" }] }).to_string();
+        let mut attacker_event =
+            build_listing_event(&attacker, "vault", &browse_key, &attacker_json).unwrap();
+        // Force a strictly-newer `created_at` than the victim's, so without the pin the attacker would
+        // win `select_newest_by_created_at`. (build_listing_event uses wall-clock now; bump to be safe.)
+        let newer_created_at = victim_event.created_at + 100;
+        let rebuilt = EventBuilder::new(Kind::from_u16(KIND_LISTING), attacker_event.content.clone())
+            .tags(attacker_event.tags.clone())
+            .custom_created_at(Timestamp::from(newer_created_at));
+        attacker_event = attacker.sign(rebuilt).unwrap();
+        assert_ne!(attacker_event.pubkey, peer, "attacker must differ from victim");
+        assert!(
+            attacker_event.created_at > victim_event.created_at,
+            "attacker must be newer so it would win without the pin"
+        );
+
+        // Feed BOTH into render_slug_family with `peer` pinned to the victim — the exact path
+        // browse_peer_listings shares via authored_by. Attacker first to make a "first-seen wins" bug
+        // would also surface here.
+        let rendered = render_slug_family(
+            vec![attacker_event.clone(), victim_event.clone()],
+            &peer,
+            "vault",
+            &browse_key,
+        )
+        .expect("the victim's real family must still render");
+
+        // The attacker's content must NOT have won — the real collection renders.
+        let rendered_str = serde_json::to_string(&rendered.entries).unwrap_or_default();
+        assert!(
+            rendered_str.contains("real-file") && !rendered_str.contains("SPOOFED"),
+            "foreign-author event must be dropped before selection; got: {rendered_str}"
+        );
+        assert!(
+            rendered.complete(),
+            "the victim's single-event family must render complete"
+        );
+
+        // Directly prove the shared helper is the seam: the foreign event is filtered out, the victim's
+        // is kept (order-independent).
+        let kept = authored_by(vec![attacker_event, victim_event], &peer);
+        assert_eq!(kept.len(), 1, "only the victim's event survives the pin");
+        assert_eq!(kept[0].pubkey, peer);
     }
 }
