@@ -1008,7 +1008,6 @@ impl DataStore {
     /// one: evicting an unspent ticket would silently revoke an approval a human already gave, and
     /// the asker would see the refusal reserved for a forgery.
     pub fn record_issued_ticket(&self, record: &IssuedTicketRecord) -> Result<()> {
-        static ISSUED_TICKETS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ISSUED_TICKETS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut m = self.load_issued_tickets()?;
         m.insert(record.ticket.request_id.clone(), record.clone());
@@ -1026,7 +1025,6 @@ impl DataStore {
         delivered_bytes: usize,
         now: u64,
     ) -> Result<()> {
-        static ISSUED_TICKETS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ISSUED_TICKETS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut m = self.load_issued_tickets()?;
         if let Some(rec) = m.get_mut(request_id) {
@@ -1037,6 +1035,15 @@ impl DataStore {
         Ok(())
     }
 }
+
+/// Serializes every load-modify-save of the issued-ticket map.
+///
+/// **One shared static, not one per function.** A `static` declared inside a function body is its own
+/// distinct item, so a per-function `ISSUED_TICKETS_LOCK` in `record_issued_ticket` and another in
+/// `mark_ticket_consumed` never serialized against *each other* — a concurrent approval and consume
+/// could interleave their load→modify→save and revert `consumed_at` back to `None`, letting an
+/// already-delivered ticket be redeemed again. Same defect `MANIFEST_ASKS_LOCK` already fixed once.
+static ISSUED_TICKETS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Serializes every load-modify-save of the ask trace.
 ///
@@ -1821,6 +1828,117 @@ mod tests {
             loaded.get("npub1contended").map(String::as_str),
             Some(max_ts.as_str()),
             "the watermark must land on the maximum timestamp regardless of thread interleaving"
+        );
+    }
+
+    #[test]
+    fn consume_then_concurrent_record_does_not_revert_the_consumption() {
+        // M19 W9 regression: `record_issued_ticket` and `mark_ticket_consumed` each used to declare
+        // their OWN `static ISSUED_TICKETS_LOCK` inside the function body — and a `static` inside a
+        // function is its own distinct item, so the two never serialized against each other. Both do a
+        // load→modify→save over the SAME `issued_tickets.json` map, so an interleaved approval (which
+        // inserts a fresh record for its OWN request_id and prunes) and a redemption receipt (which
+        // sets `consumed_at` on a DIFFERENT request_id) could each load the same stale map, apply
+        // their own edit, and the save that lands second clobbers the other — reverting a just-written
+        // `consumed_at` back to `None` (or dropping the newly-issued record). The hoisted module-level
+        // `ISSUED_TICKETS_LOCK` makes the two RMWs serialize. This is the same defect class
+        // `MANIFEST_ASKS_LOCK` already fixed for the ask-trace map.
+        //
+        // The serialization is FORCED, not hoped for. The main thread holds the shared lock, then
+        // spawns a consume (for req-A) and an approval (for a DIFFERENT req-B); both must queue on
+        // that lock. A shared `AtomicBool` proves the consume is actually blocked (it flips the flag
+        // on entry, before blocking): under the fix the flag is set but the consume cannot finish
+        // while the lock is held; under the old per-function statics the consume held a DIFFERENT
+        // lock, never blocked, and finished before the main thread released. This is the asymmetric
+        // rendezvous the M18 lesson demands: a concurrency test not forced to overlap is
+        // timing-dependent. (The approval targets its own request_id, as in production where each
+        // fulfilment mints a fresh id — so neither RMW overwrites the other's key; the only way an
+        // edit is lost is the unserialized load→modify→save the lock now prevents.)
+        use hb_core::TransportTicket;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_dir, store) = test_store();
+        let store = std::sync::Arc::new(store);
+
+        // Pre-seed an unspent ticket (req-A) that the consume will mark spent.
+        let ticket_a = TransportTicket::issue("req-A", "slug-a", "addr", 1_700_000_000, Some("n1"));
+        store
+            .record_issued_ticket(&IssuedTicketRecord {
+                ticket: ticket_a.clone(),
+                redeemer_npub: "npub1race".into(),
+                consumed_at: None,
+                delivered_bytes: None,
+            })
+            .unwrap();
+
+        // Acquire the real shared lock on the main thread and hold it.
+        let real_guard = ISSUED_TICKETS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let consume_started = std::sync::Arc::new(AtomicBool::new(false));
+        let store_consume = std::sync::Arc::clone(&store);
+        let started_clone = std::sync::Arc::clone(&consume_started);
+        let consume = std::thread::spawn(move || {
+            // Signal we are running, THEN block on the lock `mark_ticket_consumed` needs.
+            started_clone.store(true, Ordering::SeqCst);
+            store_consume
+                .mark_ticket_consumed("req-A", 4096, 1_700_000_100)
+                .unwrap();
+        });
+
+        // The approval issues a DIFFERENT ticket (req-B) — as production does (new_request_id() each
+        // fulfilment). Its edit touches a different key in the same map, so under the shared lock it
+        // cannot lose the consume's write to req-A.
+        let ticket_b = TransportTicket::issue("req-B", "slug-b", "addr", 1_700_000_000, Some("n2"));
+        let store_record = std::sync::Arc::clone(&store);
+        let record = std::thread::spawn(move || {
+            store_record
+                .record_issued_ticket(&IssuedTicketRecord {
+                    ticket: ticket_b,
+                    redeemer_npub: "npub1other".into(),
+                    consumed_at: None,
+                    delivered_bytes: None,
+                })
+                .unwrap();
+        });
+
+        // Wait for the consume thread to have started, then assert neither spawned thread could finish
+        // while we hold the lock. Under the old per-function statics the consume ran to completion
+        // immediately (it held a different lock) and this assertion would red.
+        while !consume_started.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Brief grace so a blocked thread is definitely parked, not just unscheduled.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !consume.is_finished(),
+            "mark_ticket_consumed must block on the shared ISSUED_TICKETS_LOCK while the main thread \
+             holds it — if it finished, the two functions do not share a lock (M19 W9)"
+        );
+        assert!(
+            !record.is_finished(),
+            "record_issued_ticket must block on the same shared lock (M19 W9)"
+        );
+
+        // Release the lock: both queued threads proceed SERIALLY. Each loads the current map (with the
+        // other's edit already applied, because they no longer interleave), applies its own edit, and
+        // saves — so BOTH edits survive. Under the old per-function statics both could load the same
+        // stale map and the save landing second would drop the other's edit (reverting consumed_at).
+        drop(real_guard);
+
+        record.join().unwrap();
+        consume.join().unwrap();
+
+        // Both edits must survive: req-A is consumed, req-B is present and unspent.
+        let a = store.load_issued_ticket("req-A").unwrap().unwrap();
+        assert_eq!(
+            a.consumed_at,
+            Some(1_700_000_100),
+            "a concurrent approval must not revert a ticket's consumption (M19 W9)"
+        );
+        assert_eq!(a.delivered_bytes, Some(4096));
+        let b = store.load_issued_ticket("req-B").unwrap().unwrap();
+        assert_eq!(
+            b.consumed_at, None,
+            "the concurrently-issued ticket must also survive the serialized RMW"
         );
     }
 
