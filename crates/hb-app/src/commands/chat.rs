@@ -580,7 +580,11 @@ struct ManifestRequest {
 }
 
 /// Build the manifest-request DM body (canonical JSON). Pure — unit-tested without a relay.
-fn build_manifest_request(
+///
+/// `pub(crate)` so the WAN-E2E harness (`crate::wan_it::suite_wan_e2e`) can build the EXACT production
+/// wire format when it drives the "Ask owner" leg over a real link. The harness must not reimplement
+/// the wire body (drift risk against a `wire_freeze`-pinned contract); this is the single source.
+pub(crate) fn build_manifest_request(
     slug: &str,
     fingerprint_seen: &str,
     teaser_event_id: Option<String>,

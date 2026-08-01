@@ -26,6 +26,7 @@
 //! relays, P4 are expected red).
 
 mod args;
+mod suite_wan_e2e;
 mod suite_wan_m;
 mod suite_wan_p;
 mod tap;
@@ -36,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
-use nostr::prelude::ToBech32;
+use nostr::prelude::*;
 
 use crate::commands::collection::{build_slug_manifest, count_items, is_valid_slug, scan_selective};
 use crate::identity_state::AppIdentity;
@@ -89,21 +90,28 @@ fn usage() -> &'static str {
      \n\
      serve  --data-dir <dir> --relay <ws-url>...\n\
             [--seed-dir <dir> --asker-npub <npub>]\n\
+            [--auto-approve --e2e-seed-dir <dir> [--republish]]\n\
             Seeds/loads an identity from <dir>, publishes the presence beacon via the production\n\
             path (presence::publish_presence) on the real cadence. Prints npub + share-code.\n\
             With --seed-dir + --asker-npub: also seeds a collection from <dir>, binds the manifest\n\
             endpoint via the production path (ensure_endpoint, presets::N0), and mints a ticket the\n\
             probe redeems — the launch-gate WAN-M path. Prints ticket=<json> for the operator to\n\
             hand to the probe (--ticket-json).\n\
+            With --auto-approve + --e2e-seed-dir: seeds a TRUNCATING collection (large enough to\n\
+            exceed the 40 KB teaser budget), publishes the teaser, and runs the auto-approve loop:\n\
+            polls the DM inbox for request-DMs and answers each by driving the production approval\n\
+            body. This is the serve side of WAN-E2E. --republish rewrites the seed tree mid-run (E2).\n\
      \n\
      probe  --peer <npub|hbk…> --relay <ws-url>...\n\
             [--flood-relay <ws-url>... --flood-count <n>]\n\
             [--ticket-json <path|inline> --suite wan-m]\n\
+            [--suite wan-e2e]\n\
             Runs WAN-P rows P1–P5 against a live serve by default. --flood-relay arms P3\n\
             (VPS strfry only: ws://198.51.100.1:7777, ws://198.51.100.2:7777).\n\
             --ticket-json + --suite wan-m runs the WAN-M rows (M1 + M9) instead, redeeming the\n\
             ticket the serve printed (§W6 authorizes --ticket-json for targeted iroh isolation runs;\n\
             the E2E suite rides the full DM leg).\n\
+            --suite wan-e2e runs the WAN-E2E rows (E1 + E2): the full DM-coordinated pipeline.\n\
      \n\
      canary [--interval <secs>]\n\
             Stub — parses args, prints 'not yet implemented', exits nonzero."
@@ -157,6 +165,50 @@ async fn run_serve(args: &[String]) -> Result<()> {
         setup_manifest_plane(&store, &live_npub, seed_dir, asker_npub).await?;
     }
 
+    // WAN-E2E serve side: when --auto-approve + --e2e-seed-dir are passed, seed a TRUNCATING collection,
+    // publish the teaser, and run the auto-approve loop (poll the DM inbox for request-DMs and answer
+    // each by driving the production approval body). The loop runs concurrently with the beacon below
+    // via tokio::select!.
+    let auto_approve = args::flag_value(args, "--auto-approve").is_some();
+    let e2e_seed_dir = args::flag_value(args, "--e2e-seed-dir").map(String::from);
+    if auto_approve {
+        let dir = e2e_seed_dir
+            .ok_or_else(|| anyhow!("--auto-approve requires --e2e-seed-dir <dir> (the seed tree to serve)"))?;
+        let app_id_for_plane = load_or_create_identity(&store)?;
+        let live_npub: crate::identity_state::SharedIdentity =
+            std::sync::Arc::new(tokio::sync::RwLock::new(Some(app_id_for_plane)));
+        // Seed the truncating collection + publish the teaser.
+        setup_e2e_serve(&store, &live_npub, &dir).await?;
+        // If --republish was passed, rewrite the seed tree NOW (before the loop starts) so E2's
+        // changed-fingerprint leg is primed. The probe re-browses after this and sees the new fp.
+        if args::flag_value(args, "--republish").is_some() {
+            eprintln!("[serve] --republish: rewriting the seed tree for E2 (fingerprint will change)");
+            republish_e2e_seed(&store, &live_npub, &dir).await?;
+        }
+        // Spawn the auto-approve loop. It runs alongside the beacon loop (both selected below).
+        let store_for_approve = store.clone();
+        let shared_relay_approve = net::new_shared();
+        let live_npub_approve = live_npub.clone();
+        let relays_approve = relays.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_auto_approve_loop(
+                &store_for_approve,
+                &live_npub_approve,
+                &shared_relay_approve,
+                &relays_approve,
+            )
+            .await
+            {
+                eprintln!("[serve] auto-approve loop exited: {e:#}");
+            }
+        });
+        // The beacon loop continues in the foreground; the auto-approve loop runs in the spawned task.
+        // Both publish to the same relay set via the production path. The beacon keeps presence fresh
+        // while the approve loop answers request-DMs.
+    }
+
+    // Publish on the real cadence via the production path (presence::publish_presence). This is
+
     // Publish on the real cadence via the production path (presence::publish_presence). This is
     // the same function run_presence_loop calls; the harness drives it directly because the loop
     // is shaped for the Tauri-managed background task (AppHandle, watch channels).
@@ -189,6 +241,369 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// WAN-E2E serve — truncating seed, teaser publish, auto-approve loop
+//
+// All production paths: scan_selective + save_collection_draft (the add-collection scan), the
+// production teaser publish (publish_listing_capped), the production DM inbox poll (fetch gift-wraps
+// → decode_dms), and the production approval body (the same fns send_full_list drives: build_slug_manifest
+// → ManifestPayload::seal → ensure_endpoint → issue_ticket → record_issued_ticket → send_dm_inner).
+// ---------------------------------------------------------------------------
+
+/// The fixed slug the E2E serve seeds (matches the probe's `SEED_SLUG`).
+const E2E_SLUG: &str = "wan-e2e";
+
+/// How many small files to generate for the truncating seed tree. Each file entry serializes to ~120
+/// bytes of JSON (`{"name":"file-NNNN.bin","item_type":"File","tags":[],"children":[]}`), so 600 files
+/// is ~72 KB of entries alone — comfortably over the 40 KB truncation budget. The harness generates
+/// these into a temp dir at serve startup.
+const E2E_SEED_FILE_COUNT: usize = 600;
+
+/// Seed a truncating collection from `e2e_seed_dir`, generate enough small files to exceed the 40 KB
+/// teaser budget, and publish the teaser via the production path (`publish_listing_capped`). Then bind
+/// the manifest endpoint (the accept loop serves the full manifest when a ticket is redeemed).
+async fn setup_e2e_serve(
+    store: &DataStore,
+    live_npub: &crate::identity_state::SharedIdentity,
+    e2e_seed_dir: &str,
+) -> Result<()> {
+    // (1) Generate the seed tree into e2e_seed_dir. If the dir already has the files (a prior run),
+    // leave them — the scan reads whatever is there. The --republish flag rewrites them.
+    generate_seed_tree(Path::new(e2e_seed_dir), E2E_SEED_FILE_COUNT, 0)?;
+    eprintln!(
+        "[serve] E2E seed tree: {} files in {e2e_seed_dir}",
+        E2E_SEED_FILE_COUNT
+    );
+
+    // (2) Scan + save the collection draft (the production add-collection path).
+    let (identity, browse_key, transport_key, own_npub) = {
+        let guard = live_npub.read().await;
+        let id = guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("no identity loaded for the E2E serve"))?;
+        (
+            id.identity.clone(),
+            id.browse_key.clone(),
+            id.transport_key.clone(),
+            id.npub(),
+        )
+    };
+    seed_collection(store, &identity, &browse_key, e2e_seed_dir, E2E_SLUG)?;
+    eprintln!("[serve] E2E collection '{E2E_SLUG}' seeded");
+
+    // (3) Publish the teaser via the production path (publish_listing_capped). This is the same path
+    // commands::collection::publish_collection drives: stamp the snapshot fingerprint, build the listing
+    // JSON, truncate if over budget, publish the single event.
+    publish_e2e_teaser(store, &identity, &browse_key).await?;
+    eprintln!("[serve] E2E teaser published (truncated)");
+
+    // (4) Bind the manifest endpoint via the production path (ensure_endpoint, Role::Listen). This is
+    // the real accept loop + the in-flight set — the same binding send_full_list establishes.
+    let source: Arc<dyn ManifestSource> =
+        crate::manifest_source::StoreManifestSource::new(store.clone(), identity.clone(), browse_key.clone());
+    let shared = new_shared_endpoint();
+    let endpoint = ensure_endpoint(&shared, &own_npub, live_npub, &transport_key, source, Role::Listen)
+        .await
+        .map_err(|e| anyhow!("bind E2E manifest endpoint: {e}"))?;
+    eprintln!("[serve] E2E manifest endpoint bound (presets::N0); accept loop running");
+    // The endpoint lives for the process lifetime; the accept loop serves manifests for every approved
+    // ticket. Keeping a handle so it is not dropped.
+    std::mem::forget(endpoint);
+    Ok(())
+}
+
+/// Publish (or re-publish) the E2E teaser via the production path. This is the same sequence
+/// `commands::collection::publish_collection` drives: prepare the listing JSON (which stamps the
+/// snapshot fingerprint), and call `publish_listing_capped` (which truncates if over budget).
+async fn publish_e2e_teaser(
+    store: &DataStore,
+    identity: &hb_core::Identity,
+    browse_key: &crate::identity_state::SessionBrowseKey,
+) -> Result<()> {
+    use crate::commands::collection::{prepare_listing, LISTING_MAX_BYTES};
+    use hb_net::publish_listing_capped;
+
+    // Build the listing JSON with the snapshot fingerprint stamped (the production path).
+    let listing_json = prepare_listing(E2E_SLUG, store).map_err(|e| anyhow!(e))?;
+    // Publish the teaser via the production path. publish_listing_capped truncates if the listing
+    // exceeds LISTING_MAX_BYTES (40 KB), producing a single paywall-teaser event tagged `truncated`.
+    let shared_relay = net::new_shared();
+    let client = net::client(identity, store, &shared_relay).await?;
+    let relays = net::relay_urls(store);
+    let published = publish_listing_capped(
+        &client,
+        identity,
+        E2E_SLUG,
+        browse_key.bytes(),
+        &listing_json,
+        LISTING_MAX_BYTES,
+    )
+    .await
+    .map_err(|e| anyhow!("publish E2E teaser: {e}"))?;
+    eprintln!(
+        "[serve] E2E teaser published: {} part(s), truncated={}, to {} relay(s)",
+        published.parts,
+        published.truncated,
+        relays.len()
+    );
+    Ok(())
+}
+
+/// Rewrite the seed tree with a DIFFERENT file count (adds/removes files), so the snapshot fingerprint
+/// changes. Then re-scan + re-save + re-publish the teaser. This is the E2 "changed fingerprint" leg:
+/// the probe re-browses and sees a different fingerprint than it recorded from E1.
+async fn republish_e2e_seed(
+    store: &DataStore,
+    live_npub: &crate::identity_state::SharedIdentity,
+    e2e_seed_dir: &str,
+) -> Result<()> {
+    // Generate a DIFFERENT number of files than the original (E2E_SEED_FILE_COUNT + 200). This changes
+    // the listing → changes the snapshot fingerprint → the probe's staleness gate fires.
+    let new_count = E2E_SEED_FILE_COUNT + 200;
+    generate_seed_tree(Path::new(e2e_seed_dir), new_count, 1)?;
+    eprintln!("[serve] E2E republish: rewrote seed tree to {new_count} files");
+
+    let (identity, browse_key, _transport_key, _own_npub) = {
+        let guard = live_npub.read().await;
+        let id = guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("no identity loaded for E2E republish"))?;
+        (
+            id.identity.clone(),
+            id.browse_key.clone(),
+            id.transport_key.clone(),
+            id.npub(),
+        )
+    };
+    // Re-scan + re-save the collection draft (overwrites the prior draft — same slug).
+    seed_collection(store, &identity, &browse_key, e2e_seed_dir, E2E_SLUG)?;
+    // Re-publish the teaser with the NEW fingerprint.
+    publish_e2e_teaser(store, &identity, &browse_key).await?;
+    eprintln!("[serve] E2E republish complete: teaser carries a new fingerprint");
+    Ok(())
+}
+
+/// Generate `count` small files in `dir`, each named `file-NNNN.bin`. If `offset` > 0, the files are
+/// numbered from `offset` so a republish produces a distinct tree (different names → different
+/// fingerprint). The files are tiny (a few bytes each) — only the ENTRY COUNT matters for exceeding
+/// the truncation budget, not the file sizes.
+fn generate_seed_tree(dir: &Path, count: usize, offset: usize) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| anyhow!("create seed dir {dir:?}: {e}"))?;
+    for i in 0..count {
+        let name = format!("file-{:04}.bin", offset + i);
+        let path = dir.join(&name);
+        // A few bytes each — the content does not matter, only the entry count (the listing JSON
+        // includes name/type/tags/children per entry, which is what exceeds the 40 KB budget).
+        std::fs::write(&path, b"x").map_err(|e| anyhow!("write seed file {path:?}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// The auto-approve loop: poll the DM inbox for request-DMs, and for each one drive the production
+/// approval body (the same fns `send_full_list` drives: build manifest → bind endpoint → mint ticket →
+/// record → DM the ticket). Runs forever; every approval is logged to stderr.
+///
+/// The loop is the serve side of WAN-E2E: it replaces the human "Send the full list" click with a
+/// harness policy (auto-approve every request-DM from any asker). This is the ONLY deviation from the
+/// production path, and it exists because a headless harness cannot click a button — every fn the loop
+/// drives IS the production code.
+async fn run_auto_approve_loop(
+    store: &DataStore,
+    live_npub: &crate::identity_state::SharedIdentity,
+    shared_relay: &net::SharedRelay,
+    relays: &[String],
+) -> Result<()> {
+    use crate::commands::chat::decode_dms;
+    use hb_net::RelayClient;
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    let poll_interval = Duration::from_secs(5);
+    let timeout = Duration::from_secs(15);
+    let mut seen_request_ids: HashSet<String> = HashSet::new();
+
+    // The identity fields the approval body needs (snapshot once under the lock; AppIdentity is not Clone).
+    let (identity, browse_key, transport_key, own_npub) = {
+        let guard = live_npub.read().await;
+        let id = guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("no identity loaded for the auto-approve loop"))?;
+        (
+            id.identity.clone(),
+            id.browse_key.clone(),
+            id.transport_key.clone(),
+            id.npub(),
+        )
+    };
+
+    eprintln!("[serve] auto-approve loop started (polling DM inbox every {poll_interval:?})");
+    loop {
+        // Fetch gift-wrap events addressed to us (kind 1059, pubkey = ours).
+        let client = match RelayClient::connect(&identity, relays, timeout).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[serve] auto-approve connect failed: {e}");
+                tokio::time::sleep(poll_interval).await;
+                continue;
+            }
+        };
+        let wraps = match client
+            .fetch(
+                Filter::new().kind(Kind::GiftWrap).pubkey(identity.public_key()),
+                timeout,
+            )
+            .await
+        {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("[serve] auto-approve fetch failed: {e}");
+                client.disconnect().await;
+                tokio::time::sleep(poll_interval).await;
+                continue;
+            }
+        };
+        client.disconnect().await;
+
+        if wraps.is_empty() {
+            tokio::time::sleep(poll_interval).await;
+            continue;
+        }
+
+        // Decode all gift-wraps (no contact filter — the harness auto-approves anyone). decode_dms
+        // recovers the real sender from the NIP-17 seal.
+        let msgs = decode_dms(&own_npub, &identity, wraps, None).await;
+        for msg in msgs {
+            // Try to parse the DM as a manifest request (the "Ask owner" wire). The body is JSON tagged
+            // `manifest_request`. If it doesn't parse, skip — it's a regular chat DM.
+            let trimmed = msg.content.trim();
+            if !trimmed.starts_with('{') {
+                continue;
+            }
+            let v: serde_json::Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if v.get("hb").and_then(|h| h.as_str()) != Some("manifest_request") {
+                continue;
+            }
+            let slug = v.get("slug").and_then(|s| s.as_str()).unwrap_or("");
+            let ask_nonce = v.get("ask_nonce").and_then(|n| n.as_str());
+            // Dedup by (sender, slug, nonce) so a re-delivered request-DM doesn't trigger a second
+            // approval (the production inbox would show it once).
+            let dedup_key = format!("{}|{slug}|{}", msg.from, ask_nonce.unwrap_or(""));
+            if !seen_request_ids.insert(dedup_key) {
+                continue;
+            }
+            eprintln!(
+                "[serve] auto-approve: request-DM from {} for slug '{slug}' (nonce={:?})",
+                msg.from,
+                ask_nonce
+            );
+
+            // Drive the production approval body (the same fns send_full_list drives). If it fails,
+            // log and continue — the loop stays alive for the next request.
+            if let Err(e) = approve_request(
+                store,
+                &identity,
+                &browse_key,
+                &transport_key,
+                &own_npub,
+                live_npub,
+                shared_relay,
+                &msg.from,
+                slug,
+                ask_nonce,
+            )
+            .await
+            {
+                eprintln!("[serve] auto-approve failed for {slug}: {e:#}");
+            }
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Drive the production approval body for one request-DM: build the manifest, bind the endpoint, mint
+/// the ticket, record it, and DM it to the asker. This is the body of `send_full_list` (fulfil.rs),
+/// driven directly (the Tauri `State` wrapper is the only thing skipped — every fn called IS
+/// production).
+#[allow(clippy::too_many_arguments)]
+async fn approve_request(
+    store: &DataStore,
+    identity: &hb_core::Identity,
+    browse_key: &crate::identity_state::SessionBrowseKey,
+    transport_key: &crate::identity_state::SessionTransportKey,
+    own_npub: &str,
+    live_npub: &crate::identity_state::SharedIdentity,
+    shared_relay: &net::SharedRelay,
+    asker_npub: &str,
+    slug: &str,
+    ask_nonce: Option<&str>,
+) -> Result<()> {
+    use crate::commands::collection::build_slug_manifest;
+    use hb_core::ManifestPayload;
+
+    // (1) Prove the manifest exists and fits (seal = the 8 MiB ceiling). Same check send_full_list
+    // runs before promising anything.
+    let envelope =
+        build_slug_manifest(slug, store, identity, browse_key.bytes()).map_err(|e| anyhow!("{e}"))?;
+    ManifestPayload::seal(&envelope)
+        .map_err(|e| anyhow!("the E2E collection's manifest is over the transport ceiling: {e}"))?;
+
+    // (2) Save the asker as a contact in good standing (contact_standing returns Good, which
+    // authorize_redemption requires). The auto-approve policy trusts any asker — a real human reviews.
+    save_asker_contact(store, asker_npub)?;
+
+    // (3) Record a manifest ask the probe's claim gate expects — same nonce the ticket will echo.
+    // The harness owns both sides, so the nonce is the one from the request-DM.
+    let nonce = ask_nonce.unwrap_or("");
+    let fp = envelope.snapshot_fingerprint.clone();
+    store.record_manifest_ask(asker_npub, slug, &fp, &rfc3339_now(), nonce)?;
+
+    // (4) Bind the endpoint via the production path (ensure_endpoint, Role::Listen). The accept loop
+    // serves manifests for approved tickets.
+    let source: Arc<dyn ManifestSource> =
+        crate::manifest_source::StoreManifestSource::new(store.clone(), identity.clone(), browse_key.clone());
+    let shared_ep = new_shared_endpoint();
+    let endpoint = ensure_endpoint(&shared_ep, own_npub, live_npub, transport_key, source, Role::Listen)
+        .await
+        .map_err(|e| anyhow!("bind endpoint for approval: {e}"))?;
+
+    // (5) Mint the ticket via the production path + persist it (record before the DM, same ordering
+    // as send_full_list: a redeemer always presents a ticket we can recognise).
+    let request_id = new_request_id();
+    let ticket = issue_ticket(&endpoint, &request_id, slug, unix_now(), ask_nonce)?;
+    store.record_issued_ticket(&IssuedTicketRecord {
+        ticket: ticket.clone(),
+        redeemer_npub: asker_npub.to_string(),
+        consumed_at: None,
+        delivered_bytes: None,
+    })?;
+
+    // (6) DM the ticket to the asker via the production NIP-17 path (send_dm_inner). This is the
+    // ticket-DM leg the E2E probe polls for.
+    let body = serde_json::to_string(&ticket)?;
+    let client = net::client(identity, store, shared_relay).await?;
+    let recipient = crate::commands::chat::parse_recipient(asker_npub)
+        .map_err(|e| anyhow!("parse asker npub for ticket-DM: {e}"))?;
+    let own_relays = net::relay_urls(store);
+    crate::commands::chat::send_dm_inner(
+        &client,
+        identity,
+        &recipient,
+        &body,
+        &own_relays,
+        net::RELAY_TIMEOUT,
+    )
+    .await?;
+    eprintln!(
+        "[serve] auto-approve: ticket minted + DM'd for request {request_id} (slug '{slug}', nonce '{nonce}')"
+    );
+    // The endpoint lives for the process; forget it so the accept loop keeps running.
+    std::mem::forget(endpoint);
+    Ok(())
 }
 
 fn load_or_create_identity(store: &DataStore) -> Result<AppIdentity> {
@@ -389,12 +804,16 @@ async fn run_probe(args: &[String]) -> Result<ExitCode> {
         bail!("probe requires at least one --relay");
     }
 
-    // Suite selection: --suite wan-m runs the WAN-M rows (M1 + M9) against --ticket-json; the
-    // default is WAN-P (the presence suite W6.1 shipped). §W6 authorizes --ticket-json for targeted
-    // iroh isolation runs (the E2E suite rides the full DM leg).
+    // Suite selection: --suite wan-m runs the WAN-M rows (M1 + M9) against --ticket-json; --suite
+    // wan-e2e runs the WAN-E2E rows (E1 + E2, the full DM-coordinated pipeline); the default is WAN-P
+    // (the presence suite W6.1 shipped). §W6 authorizes --ticket-json for targeted iroh isolation runs
+    // (the E2E suite rides the full DM leg).
     let suite = args::flag_value(args, "--suite").unwrap_or("wan-p");
     if suite == "wan-m" {
         return run_probe_wan_m(args, peer_str).await;
+    }
+    if suite == "wan-e2e" {
+        return run_probe_wan_e2e(args, peer_str).await;
     }
 
     let peer_npub = parse_peer(peer_str)?;
@@ -506,6 +925,42 @@ async fn make_dead_endpoint_addr() -> String {
     json = json.replace("127.0.0.1", "192.0.2.1");
     json = json.replace("::1", "192.0.2.1");
     json
+}
+
+// ---------------------------------------------------------------------------
+// probe — WAN-E2E (E1 + E2 — the full DM-coordinated pipeline)
+// ---------------------------------------------------------------------------
+
+/// Run the WAN-E2E rows against a live serve. Requires the serve's FULL share code (--peer hbk…) —
+/// `accept_manifest_bytes` needs the browse-key to decrypt, and `browse_share_code` needs the full code.
+/// The probe seeds its own identity + store from --data-dir. The serve must be running with
+/// `--auto-approve` (the auto-approve loop polls the DM inbox and answers request-DMs by driving the
+/// production approval body).
+async fn run_probe_wan_e2e(args: &[String], peer_str: &str) -> Result<ExitCode> {
+    let data_dir = PathBuf::from(
+        args::flag_value(args, "--data-dir").unwrap_or("./hb-wan-it-probe-data").to_string(),
+    );
+
+    let store = DataStore::new(data_dir.clone());
+    // Persist the relay set (parity with serve — net::relay_urls reads Settings).
+    let relays = args::collect_relays(args);
+    store.save_settings(&Settings { relay_urls: relays.clone(), ..Default::default() })?;
+    let app_id = load_or_create_identity(&store)?;
+
+    // The serve's share code is the full hbk… code (npub + browse-key).
+    let input = suite_wan_e2e::build_probe_input(app_id, store, peer_str.to_string()).await?;
+
+    println!("# WAN-E2E probe against serve {}", input.serve_npub);
+    println!("# relay set: {}", relays.join(", "));
+
+    // When --serve-data-dir points at the serve's data dir (single-machine smoke), the probe can read
+    // the serve's store to confirm the ticket was consumed — the owner-side half of E1.
+    let serve_store =
+        args::flag_value(args, "--serve-data-dir").map(|d| DataStore::new(PathBuf::from(d)));
+
+    let mut tap = tap::Tap::new();
+    suite_wan_e2e::run(&mut tap, &input, serve_store.as_ref()).await;
+    Ok(tap.finish())
 }
 
 // ---------------------------------------------------------------------------
