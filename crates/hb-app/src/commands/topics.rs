@@ -86,6 +86,18 @@ pub struct TopicLookup {
     pub member_count_estimate: usize,
 }
 
+/// A **side-effect-free** preview of a pending private-Topic invite, for the consent gate (W8): the UI
+/// shows who is vouching (`issuer_npub`) + the topic name BEFORE committing the redeem/join. The
+/// follow-up `topic_redeem_invite` re-fetches and redeems the same invite (no nonce is burned here).
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicInvitePreview {
+    pub topic_id: String,
+    pub name: String,
+    pub description: String,
+    /// The invite ISSUER's npub (bech32) — whose key sealed the invite = who is vouching for the join.
+    pub issuer_npub: String,
+}
+
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -387,7 +399,7 @@ pub async fn topic_join_public(
     let mut seen = store.load_topic_nonces().map_err(cmd_err)?;
     let t = now();
     let redeemed = join_public(&client, &name, &mut seen, t, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
-    let (mut meta, key) = match redeemed {
+    let (mut meta, key, _issuer) = match redeemed {
         Some(v) => v,
         None => {
             return Err("Could not find a public-join credential for that Topic — is the name right?".into());
@@ -424,8 +436,10 @@ pub async fn topic_redeem_invite(
     // we persist the set afterward so a restart can't re-accept it.
     let mut seen = store.load_topic_nonces().map_err(cmd_err)?;
     let t = now();
-    let redeemed = fetch_invite(&client, &me, &mut seen, t, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
-    let (meta, key) = match redeemed {
+    let redeemed = fetch_invite(&client, &me, &mut seen, t, net::RELAY_TIMEOUT, None)
+        .await
+        .map_err(cmd_err)?;
+    let (meta, key, _) = match redeemed {
         Some(v) => v,
         None => {
             return Ok(None);
@@ -439,6 +453,40 @@ pub async fn topic_redeem_invite(
     let stored = StoredTopic { meta: meta.clone(), key, joined_at: t, membership_json: Some(membership.as_json()) };
     store_topic(&store, stored.clone())?;
     Ok(Some(TopicView::from(&stored)))
+}
+
+/// Preview a pending private-Topic invite **without committing** (W8 consent gate). Reveals the topic
+/// name/description + the invite ISSUER's npub so the UI can ask for explicit acknowledgment BEFORE the
+/// redeem/join/auto-add-roster. Crucially side-effect-free: it loads `seen` into a LOCAL throwaway,
+/// never calls `save_topic_nonces`, never joins, never auto-adds, never stores — so the follow-up
+/// [`topic_redeem_invite`] can re-fetch and redeem the same invite. Returns `None` if no valid invite.
+#[tauri::command]
+pub async fn topic_preview_invite(
+    identity: State<'_, SharedIdentity>,
+    store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
+) -> CmdResult<Option<TopicInvitePreview>> {
+    let me = me(&identity).await?;
+    let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
+    // LOCAL throwaway seen-set: the preview must NOT burn the single-use invite's nonce, else the
+    // follow-up redeem would be rejected as a replay. Never persisted.
+    let mut seen = store.load_topic_nonces().map_err(cmd_err)?;
+    let t = now();
+    let redeemed = fetch_invite(&client, &me, &mut seen, t, net::RELAY_TIMEOUT, None)
+        .await
+        .map_err(cmd_err)?;
+    match redeemed {
+        Some((meta, _key, issuer)) => {
+            let issuer_npub = issuer.to_bech32().map_err(cmd_err)?;
+            Ok(Some(TopicInvitePreview {
+                topic_id: meta.topic_id,
+                name: meta.name,
+                description: meta.description,
+                issuer_npub,
+            }))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Request to join a private Topic, sending a join-request DM to a known member.

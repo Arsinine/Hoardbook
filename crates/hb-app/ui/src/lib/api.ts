@@ -23,6 +23,7 @@ import type {
 	TopicView,
 	DiscoveredTopic,
 	TopicLookup,
+	TopicInvitePreview,
 	ChannelPost,
 	ChannelView,
 	TopicAnnounceSummary,
@@ -508,6 +509,11 @@ export const topicJoinPublic = (name: string) =>
 
 /** Redeem a private-Topic invite addressed to me (returns the joined Topic, or null if none found). */
 export const topicRedeemInvite = () => invoke<TopicView | null>('topic_redeem_invite');
+
+/** Preview a pending private-Topic invite WITHOUT committing (W8 consent gate): reveals the topic
+ *  name/description + the invite issuer's npub so the UI can ask for explicit acknowledgment first.
+ *  The follow-up `topicRedeemInvite` re-fetches and redeems the same invite. */
+export const topicPreviewInvite = () => invoke<TopicInvitePreview | null>('topic_preview_invite');
 
 export const topicRequestJoin = (memberNpub: string, topicId: string, name: string) =>
 	invoke<void>('topic_request_join', { memberNpub, topicId, name });

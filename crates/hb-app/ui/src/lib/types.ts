@@ -216,6 +216,16 @@ export interface TopicLookup {
 	member_count_estimate: number;
 }
 
+/** A side-effect-free preview of a pending private-Topic invite (W8 consent gate) — the UI shows who
+ *  is vouching (`issuer_npub`) + the topic name BEFORE committing the redeem. */
+export interface TopicInvitePreview {
+	topic_id: string;
+	name: string;
+	description: string;
+	/** The invite ISSUER's npub (bech32) — whose key sealed the invite = who is vouching for the join. */
+	issuer_npub: string;
+}
+
 /** A decrypted 24h channel post. */
 export interface ChannelPost {
 	author_npub: string;

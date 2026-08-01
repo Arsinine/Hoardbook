@@ -414,22 +414,25 @@ pub async fn approve_join(
 
 /// Fetch + redeem the **first valid** invite addressed to `me` (private admission path 1 — redeem
 /// side). The relay filter is `{kinds:[1059], #p:[me]}`; redemption is post-decrypt. A foreign/junk/
-/// expired/replayed wrap is skipped. Returns the redeemed `(meta, key)` and the invite event id (so the
-/// caller can persist the seen-nonce), or `None` if no valid invite is found.
+/// expired/replayed wrap is skipped. Returns the redeemed `(meta, key, issuer)` and the invite event id
+/// (so the caller can persist the seen-nonce), or `None` if no valid invite is found. When
+/// `expected_topic_id` is `Some`, an invite whose payload names a different topic is skipped (W4 — see
+/// [`redeem_invite`]'s topic_id binding).
 pub async fn fetch_invite(
     client: &RelayClient,
     me: &Identity,
     seen: &mut NonceSet,
     now: u64,
     timeout: Duration,
-) -> Result<Option<(TopicMeta, TopicKey)>, NetError> {
+    expected_topic_id: Option<&str>,
+) -> Result<Option<(TopicMeta, TopicKey, PublicKey)>, NetError> {
     let filter = Filter::new().kind(Kind::GiftWrap).pubkey(me.public_key());
     let wraps = client.fetch(filter, timeout).await?;
     for w in wraps {
         // `redeem_invite` atomically records a single-use invite's seen-nonce into `seen` on success
         // (the public-join credential is exempt); the caller persists `seen` after this returns.
-        if let Ok((meta, key)) = redeem_invite(me, &w, seen, now) {
-            return Ok(Some((meta, key)));
+        if let Ok((meta, key, issuer)) = redeem_invite(me, &w, seen, now, expected_topic_id) {
+            return Ok(Some((meta, key, issuer)));
         }
     }
     Ok(None)
@@ -437,16 +440,19 @@ pub async fn fetch_invite(
 
 /// Join a **public** Topic by name: derive the public-join keypair, fetch the public-join credential
 /// (a gift-wrap `#p`-tagged to the name-derived pubkey), and redeem it → the topic key. This is the
-/// participation bar (Decision A) — any joiner who knows the name can do it.
+/// participation bar (Decision A) — any joiner who knows the name can do it. The expected `topic_id`
+/// is derived from the name the SAME way the topic was created, and bound into the redeem (W4: a
+/// forged public-join invite naming a different topic can no longer redirect the joiner).
 pub async fn join_public(
     client: &RelayClient,
     name: &str,
     seen: &mut NonceSet,
     now: u64,
     timeout: Duration,
-) -> Result<Option<(TopicMeta, TopicKey)>, NetError> {
+) -> Result<Option<(TopicMeta, TopicKey, PublicKey)>, NetError> {
     let pj = public_join_identity(name)?;
-    fetch_invite(client, &pj, seen, now, timeout).await
+    let expected = hb_core::topic::topic_id_for_name(&hb_core::topic::normalized_public_name(name)?);
+    fetch_invite(client, &pj, seen, now, timeout, Some(&expected)).await
 }
 
 #[cfg(test)]

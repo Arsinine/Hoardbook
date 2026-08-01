@@ -434,6 +434,7 @@ pub fn run() {
             commands::topics::topic_lookup,
             commands::topics::topic_join_public,
             commands::topics::topic_redeem_invite,
+            commands::topics::topic_preview_invite,
             commands::topics::topic_request_join,
             commands::topics::topic_invite,
             commands::topics::topic_leave,
