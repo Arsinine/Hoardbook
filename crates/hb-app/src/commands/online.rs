@@ -14,6 +14,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use nostr::prelude::FromBech32;
 use serde::Serialize;
 use tauri::State;
 use tokio::sync::RwLock;
@@ -38,10 +39,11 @@ pub struct OnlineCount {
     pub online: Option<usize>,
     pub fetched_at: Option<chrono::DateTime<chrono::Utc>>,
     pub relay_set: Vec<String>,
-    /// **M17 W5.2** — who, of the counted npubs, we just saw, and when. This is the *same* fetch the
-    /// count is derived from (`fresh` is the map, `online` is its length): the contact list reads
-    /// its per-contact pill and real last-seen off it, so there is **no** new relay query shape and
-    /// no per-contact fan-out. Empty on an unknown/never-succeeded count.
+    /// **W1 (2026-08-02)** — who, of our stored contacts, we just saw, and when. This comes from an
+    /// **author-filtered** read (`hb_net::fetch_presence_for_authors`) over the contact list, NOT
+    /// from the chip's global aggregate: a contact's beacon can never be displaced by the relay's
+    /// global response cap. `online` is the global count; `fresh` is the contacts-only map — they
+    /// are independent. Empty when the read failed or there are no contacts.
     #[serde(default)]
     pub fresh: Vec<PresenceSeen>,
 }
@@ -75,13 +77,13 @@ fn is_stale(last_attempt: Option<Instant>, now: Instant, interval: Duration) -> 
 /// (unknown, not a misleading "0"). Pure, so RELAY3 is a differential unit test with no relay.
 fn apply_refresh(
     cache: &mut OnlineCache,
-    result: Result<Vec<PresenceSeen>, ()>,
+    result: Result<(usize, Vec<PresenceSeen>), ()>,
     relay_set: Vec<String>,
     now: chrono::DateTime<chrono::Utc>,
 ) {
-    if let Ok(fresh) = result {
+    if let Ok((count, fresh)) = result {
         cache.value = Some(OnlineCount {
-            online: Some(fresh.len()),
+            online: Some(count),
             fetched_at: Some(now),
             relay_set,
             fresh,
@@ -125,19 +127,35 @@ async fn refresh_count(
     let Some(id) = snapshot else { return };
     let relay_set = net::relay_urls(store);
 
-    // ONE query (the same presence filter the count always used), read two ways: the pairs feed the
-    // contact list's pill + real last-seen, and the count is their length.
-    let result: Result<Vec<PresenceSeen>, ()> = match net::client(&id, store, relay).await {
+    // W1: the per-contact pills come from an author-filtered read over the STORED contacts, immune
+    // to the global relay cap. The chip's `online` stays the global count (an approximate userbase
+    // metric). Two reads, two questions — decoupled.
+    let contact_authors: Vec<nostr::PublicKey> = store
+        .list_contacts()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| nostr::PublicKey::from_bech32(&c.npub).ok())
+        .collect();
+
+    let result: Result<(usize, Vec<PresenceSeen>), ()> = match net::client(&id, store, relay).await {
         Ok(client) => {
-            hb_net::fetch_online_presence(&client, ONLINE_WINDOW_SECS, net::RELAY_TIMEOUT)
-                .await
-                .map(|(map, _now)| to_presence_seen(map))
-                .map_err(|_| ())
+            let count = hb_net::count_online(&client, ONLINE_WINDOW_SECS, net::RELAY_TIMEOUT).await;
+            let pills = hb_net::fetch_presence_for_authors(
+                &client,
+                &contact_authors,
+                ONLINE_WINDOW_SECS,
+                net::RELAY_TIMEOUT,
+            )
+            .await;
+            match (count, pills) {
+                (Ok(n), Ok((map, _now))) => Ok((n, to_presence_seen(map))),
+                _ => Err(()),
+            }
         }
         Err(_) => Err(()),
     };
 
-    if let Ok(fresh) = &result {
+    if let Ok((_n, fresh)) = &result {
         persist_presence(store, fresh);
     }
 
@@ -242,7 +260,7 @@ mod tests {
         assert!(cache.value.is_none(), "a first-ever failure stays unknown (–), not 0");
 
         // A success populates the count.
-        apply_refresh(&mut cache, Ok(seen(5, now)), relays.clone(), now);
+        apply_refresh(&mut cache, Ok((5, seen(5, now))), relays.clone(), now);
         assert_eq!(cache.value.as_ref().unwrap().online, Some(5));
 
         // A transient failure AFTER a success must NOT revert to "–" — it keeps the last count.
@@ -250,7 +268,7 @@ mod tests {
         assert_eq!(cache.value.as_ref().unwrap().online, Some(5), "no sticky –: last count survives a failed cycle");
 
         // A later success recovers/updates it.
-        apply_refresh(&mut cache, Ok(seen(7, now)), relays, now);
+        apply_refresh(&mut cache, Ok((7, seen(7, now))), relays, now);
         assert_eq!(cache.value.as_ref().unwrap().online, Some(7));
     }
 
@@ -260,16 +278,16 @@ mod tests {
     }
 
     #[test]
-    fn count_is_the_fresh_sets_length_and_rides_with_it() {
-        // W5.2: the pill/last-seen data and the chip's number come from ONE fetch, so they can
-        // never disagree — `online` is exactly `fresh.len()`.
+    fn count_is_global_and_pills_are_author_filtered_decoupled() {
+        // W1: the chip's `online` is the GLOBAL count; `fresh` is the author-filtered contacts-only
+        // map. They are independent now (pre-W1 they were the same vector's length). Prove it: a
+        // global count of 42 with only 3 contact pills seen.
         let now = chrono::Utc::now();
         let mut cache = OnlineCache::default();
-        apply_refresh(&mut cache, Ok(seen(3, now)), vec![], now);
+        apply_refresh(&mut cache, Ok((42, seen(3, now))), vec![], now);
         let v = cache.value.as_ref().unwrap();
-        assert_eq!(v.online, Some(3));
-        assert_eq!(v.fresh.len(), 3, "the pairs ride along with the count");
-        assert_eq!(v.fresh[0].seen_at, now);
+        assert_eq!(v.online, Some(42), "chip = global count");
+        assert_eq!(v.fresh.len(), 3, "pills = author-filtered contacts, independent of the count");
     }
 
     #[test]
@@ -278,7 +296,7 @@ mod tests {
         // contact's pill to "unknown" — that would be the same lie in a new place.
         let now = chrono::Utc::now();
         let mut cache = OnlineCache::default();
-        apply_refresh(&mut cache, Ok(seen(2, now)), vec![], now);
+        apply_refresh(&mut cache, Ok((2, seen(2, now))), vec![], now);
         apply_refresh(&mut cache, Err(()), vec![], now);
         assert_eq!(cache.value.as_ref().unwrap().fresh.len(), 2, "last-known fresh set survives");
     }

@@ -41,7 +41,8 @@ pub use client::{
     TEASER_SEARCH_FETCH_LIMIT,
 };
 pub use count::{
-    count_online, count_userbase, fetch_online_presence, presence_count_filter, userbase_filter,
+    count_online, count_userbase, fetch_online_presence, fetch_presence_for_authors,
+    presence_authors_filter, presence_count_filter, userbase_filter,
 };
 pub use discover::{
     ingest_teasers, ingest_teasers_capped, rank_hits, select_newest_by_created_at, teaser_matches,

@@ -80,6 +80,36 @@ pub async fn fetch_online_presence(
     Ok((fresh_presence(&events, now, window_secs), now))
 }
 
+/// The presence filter for a SPECIFIC set of authors (W1, 2026-08-02). Unlike
+/// [`presence_count_filter`]'s unbounded global aggregate, this asks the relay only for THESE
+/// authors' beacons, so a contact's presence can never be displaced by the relay's global response
+/// cap. kind-11111 is replaceable, so the relay keeps one beacon per author; `.limit(authors.len())`
+/// declares that budget as ours, not the relay's default cap.
+pub fn presence_authors_filter(authors: &[PublicKey], now: u64, window_secs: u64) -> Filter {
+    Filter::new()
+        .kind(Kind::from_u16(KIND_PRESENCE))
+        .authors(authors.iter().copied())
+        .since(Timestamp::from(now.saturating_sub(window_secs)))
+        .limit(authors.len().max(1))
+}
+
+/// Author-filtered per-contact presence read (W1): fresh presence for a KNOWN set of authors,
+/// immune to the global relay cap that [`fetch_online_presence`] is subject to. Returns the same
+/// `(author → newest created_at, now)` shape. An empty author set short-circuits (no query).
+pub async fn fetch_presence_for_authors(
+    client: &RelayClient,
+    authors: &[PublicKey],
+    window_secs: u64,
+    timeout: Duration,
+) -> Result<(HashMap<PublicKey, u64>, u64), NetError> {
+    let now = unix_now();
+    if authors.is_empty() {
+        return Ok((HashMap::new(), now));
+    }
+    let events = client.fetch(presence_authors_filter(authors, now, window_secs), timeout).await?;
+    Ok((fresh_presence(&events, now, window_secs), now))
+}
+
 /// Count distinct **userbase** `npub`s: fetch the Hoardbook-kind events and tally distinct authors
 /// (sig-verified, canary-excluded). Operator-side surface (the in-app default is online-now only —
 /// Open Q#6); the cheap NIP-45/SQL alternative lives in `RELAY_DEPLOY.md`.
@@ -118,5 +148,19 @@ mod tests {
         for k in ["30117", "11111", "31111"] {
             assert!(json.contains(k), "userbase filter must include kind {k}: {json}");
         }
+    }
+
+    #[test]
+    fn presence_authors_filter_constrains_authors_kind_and_since() {
+        let pk = nostr::Keys::generate().public_key();
+        let f = presence_authors_filter(&[pk], 1_700_000_000, 600);
+        assert!(!f.is_empty(), "an authors+kind+since filter is constrained");
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("authors"), "authors present in the filter: {json}");
+        assert!(json.contains("11111"), "presence kind present in the filter: {json}");
+        assert!(
+            json.contains(&(1_700_000_000u64 - 600).to_string()),
+            "since floor present: {json}"
+        );
     }
 }

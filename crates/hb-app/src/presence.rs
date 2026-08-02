@@ -36,6 +36,23 @@ pub const PRESENCE_REFRESH_SECS: u64 = 5 * 60;
 /// First publish fires shortly after launch (the endpoint needs a moment to bind).
 const PRESENCE_FIRST_DELAY_SECS: u64 = 15;
 
+/// The retry backoff schedule for a FAILED beacon cycle (W1, 2026-08-02). A successful cycle waits
+/// the normal `PRESENCE_REFRESH_SECS` (300 s) cadence; a failed cycle retries fast — inside the 600 s
+/// online window instead of after the full 300 s — with a bounded, increasing backoff so a transient
+/// relay flap self-heals before two missed windows read as "offline". `retry_idx` is the count of
+/// consecutive prior failures (0 = first failure this streak).
+const RETRY_BACKOFF_SECS: [u64; 4] = [15, 30, 60, 120];
+
+/// Pure delay selector — testable without a relay. Success → normal cadence; failure → the backoff
+/// step for this streak position, clamped to the last (longest) step once the schedule is exhausted.
+pub(crate) fn next_delay(succeeded: bool, retry_idx: u32) -> Duration {
+    if succeeded {
+        return Duration::from_secs(PRESENCE_REFRESH_SECS);
+    }
+    let idx = (retry_idx as usize).min(RETRY_BACKOFF_SECS.len() - 1);
+    Duration::from_secs(RETRY_BACKOFF_SECS[idx])
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -141,6 +158,7 @@ pub(crate) async fn run_presence_loop(
     beacon: SharedBeaconState,
 ) {
     let mut delay = Duration::from_secs(PRESENCE_FIRST_DELAY_SECS);
+    let mut retry_idx: u32 = 0;
     loop {
         wakeups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::select! {
@@ -152,7 +170,6 @@ pub(crate) async fn run_presence_loop(
                 }
             }
         }
-        delay = Duration::from_secs(PRESENCE_REFRESH_SECS);
 
         // Snapshot the identity (clone the secp256k1 key) without holding the lock across the
         // network call.
@@ -160,21 +177,27 @@ pub(crate) async fn run_presence_loop(
             let guard = identity.read().await;
             guard.as_ref().map(|id| id.identity.clone())
         };
-        let Some(id) = snapshot else { continue };
+        let Some(id) = snapshot else {
+            delay = Duration::from_secs(PRESENCE_REFRESH_SECS);
+            retry_idx = 0;
+            continue;
+        };
 
         // M12 W1: ride the persistent shared client (one cheap publish, not a reconnect). Never
         // disconnect — the client lives for the session.
         let now = unix_now();
-        match crate::net::client(&id, &store, &relay).await {
+        let succeeded = match crate::net::client(&id, &store, &relay).await {
             Ok(client) => match publish_presence(&client, &id).await {
                 Ok(outcome) => {
                     let prev = beacon.read().await.clone();
                     *beacon.write().await = record_outcome(&prev, Ok(&outcome), now);
+                    true
                 }
                 Err(e) => {
                     tracing::debug!("presence publish failed: {e}");
                     let prev = beacon.read().await.clone();
                     *beacon.write().await = record_outcome(&prev, Err(&e.to_string()), now);
+                    false
                 }
             },
             Err(e) => {
@@ -182,8 +205,14 @@ pub(crate) async fn run_presence_loop(
                 let prev = beacon.read().await.clone();
                 *beacon.write().await =
                     record_outcome(&prev, Err(&format!("no relay this cycle: {e}")), now);
+                false
             }
-        }
+        };
+
+        // W1: a failed cycle retries fast (backoff inside the 600s window); a success resets to the
+        // normal 300s cadence.
+        delay = next_delay(succeeded, retry_idx);
+        retry_idx = if succeeded { 0 } else { retry_idx.saturating_add(1) };
     }
 }
 
@@ -282,5 +311,30 @@ mod tests {
         assert_eq!(got.last_success_at, 10);
         assert_eq!(got.relays, prev.relays);
         assert_eq!(got.last_error.as_deref(), Some("no relay this cycle: pool empty"));
+    }
+
+    #[test]
+    fn next_delay_success_is_normal_cadence() {
+        assert_eq!(next_delay(true, 0), Duration::from_secs(PRESENCE_REFRESH_SECS));
+        assert_eq!(next_delay(true, 5), Duration::from_secs(PRESENCE_REFRESH_SECS));
+    }
+
+    #[test]
+    fn next_delay_first_failure_retries_inside_the_window() {
+        // The P4 property: a failed cycle does NOT wait the full 300s cadence.
+        let d = next_delay(false, 0);
+        assert!(d < Duration::from_secs(PRESENCE_REFRESH_SECS), "first retry must beat the 300s cadence");
+        assert!(d > Duration::from_secs(0));
+        assert!(d < Duration::from_secs(600), "and land inside the 600s online window");
+    }
+
+    #[test]
+    fn next_delay_backoff_is_monotonic_and_clamped() {
+        let d0 = next_delay(false, 0);
+        let d1 = next_delay(false, 1);
+        let d2 = next_delay(false, 2);
+        assert!(d0 <= d1 && d1 <= d2, "backoff increases");
+        // Exhausted schedule clamps to the last step, never grows unbounded.
+        assert_eq!(next_delay(false, 99), next_delay(false, 3));
     }
 }
