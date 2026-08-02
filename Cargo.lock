@@ -2188,7 +2188,7 @@ dependencies = [
 
 [[package]]
 name = "hb-app"
-version = "0.12.8"
+version = "0.12.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2227,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "hb-core"
-version = "0.12.8"
+version = "0.12.9"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -2250,7 +2250,7 @@ dependencies = [
 
 [[package]]
 name = "hb-dpapi"
-version = "0.12.8"
+version = "0.12.9"
 dependencies = [
  "anyhow",
  "windows-sys 0.59.0",
@@ -2258,7 +2258,7 @@ dependencies = [
 
 [[package]]
 name = "hb-it"
-version = "0.12.8"
+version = "0.12.9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2272,7 +2272,7 @@ dependencies = [
 
 [[package]]
 name = "hb-net"
-version = "0.12.8"
+version = "0.12.9"
 dependencies = [
  "hb-core",
  "nostr",
