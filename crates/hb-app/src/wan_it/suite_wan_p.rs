@@ -1,16 +1,15 @@
 //! WAN-P — presence between real clients (M20 W6 §W6, build FIRST). Five rows drive the **real
 //! production presence path** against a live `hb-wan-it serve` peer: the per-contact pill's
-//! `refresh_count` → `hb_net::fetch_online_presence` global aggregate → `fresh` map (P1), the
-//! per-relay accept/reject audit (P2), the cap-displacement discriminator against VPS strfry (P3),
-//! the publish-retry regression (P4), and the same-NAT +2 body folded in from `hb-it/same_nat.rs`
-//! (P5).
+//! `refresh_count` → `hb_net::fetch_presence_for_authors` author-filtered read → `fresh` map (P1),
+//! the per-relay accept/reject audit (P2), the cap-displacement discriminator against VPS strfry
+//! (P3), the publish-retry regression (P4), and the same-NAT author-filtered resolution body folded
+//! in from `hb-it/same_nat.rs` (P5).
 //!
-//! **Honest red.** P1 on busy public relays and P4 are expected `not ok` today (the W1 global-
-//! aggregate scavenge with no `.authors()`; the absent retry in `run_presence_loop`). They stay
-//! honest TAP failures with diagnostics — never `# TODO`/skip — so the suite's nonzero exit code is
-//! the correct pre-W1 signal. Each fixes to green when its W1 work lands; the rows are structured to
-//! exercise that path (P1 calls the same `fetch_online_presence` the fix retargets; P4 asserts
-//! against the real publish function's observable behavior).
+//! **Honest red, no skips.** P1 and P4 were `not ok` pre-W1 (the global-aggregate scavenge with no
+//! `.authors()`; the absent retry in `run_presence_loop`). W1 (2026-08-02) fixed both — P1 now drives
+//! the author-filtered read (`fetch_presence_for_authors`), P4 asserts the shipped `next_delay`
+//! retry selector — so the suite is green post-W1. The philosophy is unchanged: every row exercises
+//! real shipped code with diagnostics on failure, never `# TODO`/skip.
 //!
 //! **Flake policy (P3b precedent):** long-haul rows retry ×3; every failure is a recorded data
 //! point (a `# diagnostic` line in the TAP block), never discarded. A failing row dumps per-relay
@@ -19,7 +18,7 @@
 use std::time::Duration;
 
 use hb_core::{build_binding, verify_binding, Identity};
-use hb_net::{fetch_online_presence, select_newest_by_created_at, RelayClient};
+use hb_net::{fetch_presence_for_authors, select_newest_by_created_at, RelayClient};
 use nostr::prelude::*;
 
 use super::tap::Tap;
@@ -53,9 +52,9 @@ pub async fn run(
     relays: &[String],
     flood_ctx: Option<&FloodCtx>,
 ) {
-    // P1 — the W1 regression row. Expected red on public relays today.
+    // P1 — the W1 fix row: author-filtered read resolves the served peer regardless of the global cap.
     tap.check(
-        "P1: resolve served peer via the production presence path (fetch_online_presence) within 600s",
+        "P1: resolve served peer via the production presence path (fetch_presence_for_authors) within 600s",
         p1_resolve_via_production_path(peer_npub, relays).await,
     );
 
@@ -71,15 +70,15 @@ pub async fn run(
         p3_cap_displacement(peer_npub, relays, flood_ctx).await,
     );
 
-    // P4 — retry regression. Expected red today (no retry exists in run_presence_loop).
+    // P4 — retry regression. W1 shipped the retry: a failed cycle backs off inside the 600s window.
     tap.check(
         "P4: a failed publish cycle retries inside the 600s window (not the full 300s cadence)",
         p4_retry_within_window(relays).await,
     );
 
-    // P5 — same-NAT +2 (SAMENAT1 body folded in, pointed at the live relay set).
+    // P5 — same-NAT author-filtered resolution (SAMENAT1 body folded in, pointed at the live relay set).
     tap.check(
-        "P5: same-NAT +2 — two identities from one IP each count online (+2)",
+        "P5: same-NAT — two identities from one IP each resolve via the author-filtered read",
         p5_same_nat_plus_two(relays).await,
     );
 }
@@ -89,16 +88,14 @@ pub async fn run(
 // ---------------------------------------------------------------------------
 
 /// Resolve the served peer through the **same production path the contact-row pill uses**:
-/// `commands::online::refresh_count` → `hb_net::fetch_online_presence` (the global aggregate) → the
-/// `fresh` map. The harness drives real shipped code — it does not reimplement the query. Asserts
-/// the peer's npub appears in the fresh map within the 600 s window.
+/// `commands::online::refresh_count` → `hb_net::fetch_presence_for_authors` (the author-filtered
+/// read) → the `fresh` map. The harness drives real shipped code — it does not reimplement the
+/// query. Asserts the peer's npub appears in the fresh map within the 600 s window.
 ///
-/// **Expected RED on busy public relays today:** `fetch_online_presence` builds an *unbounded*
-/// global kind-11111 filter (`presence_count_filter`: kind + since, NO `.authors()`, NO `.limit()`),
-/// so the relay's own cap decides which beacons surface — on damus/nos.lol/primal a busy relay
-/// displaces the served beacon with foreign traffic, and the peer does not appear fresh. This row is
-/// the regression net: when W1 adds an author-filtered read, this row exercises that path (the
-/// function under test IS the one the fix retargets).
+/// **W1 (2026-08-02):** the read is now author-filtered (`.authors([peer_npub])` +
+/// `.limit(1)`), so the relay's global response cap cannot displace the served beacon — the peer
+/// resolves regardless of ambient network volume. Pre-W1 this row drove the global aggregate and was
+/// red on busy public relays; the fix retargets the read, and this row exercises that fixed path.
 ///
 /// Retries ×3 with a settle between attempts (flake policy); a persistent failure is an honest
 /// `not ok` with the observed counts as the diagnostic.
@@ -113,12 +110,12 @@ async fn p1_resolve_via_production_path(peer_npub: &PublicKey, relays: &[String]
                 continue;
             }
         };
-        // THE production read the contact pill uses (hb-net::fetch_online_presence →
-        // hb-net::count::presence_count_filter: global kind-11111 + since, no .authors()/.limit()).
-        let (fresh, now) = match fetch_online_presence(&client, ONLINE_WINDOW_SECS, RELAY_TIMEOUT).await {
+        // THE production read the contact pill uses (hb-net::fetch_presence_for_authors →
+        // hb-net::count::presence_authors_filter: author-filtered kind-11111, W1 fix).
+        let (fresh, now) = match fetch_presence_for_authors(&client, &[*peer_npub], ONLINE_WINDOW_SECS, RELAY_TIMEOUT).await {
             Ok(v) => v,
             Err(e) => {
-                last_diag = format!("attempt {attempt}: fetch_online_presence failed: {e}");
+                last_diag = format!("attempt {attempt}: fetch_presence_for_authors failed: {e}");
                 client.disconnect().await;
                 continue;
             }
@@ -135,12 +132,12 @@ async fn p1_resolve_via_production_path(peer_npub: &PublicKey, relays: &[String]
                     return Ok(());
                 }
                 last_diag = format!(
-                    "attempt {attempt}: peer seen but stale (created_at={ts}, age={age}s > {ONLINE_WINDOW_SECS}s window); {total_online} npubs online in the global aggregate"
+                    "attempt {attempt}: peer seen but stale (created_at={ts}, age={age}s > {ONLINE_WINDOW_SECS}s window); {total_online} npubs in the author-filtered map"
                 );
             }
             None => {
                 last_diag = format!(
-                    "attempt {attempt}: peer NOT in the fresh map (global aggregate returned {total_online} npubs — the W1 scavenge symptom: the relay's cap displaced the served beacon)"
+                    "attempt {attempt}: peer NOT in the author-filtered fresh map ({total_online} npubs returned — the served beacon did not resolve)"
                 );
             }
         }
@@ -218,8 +215,9 @@ pub struct FloodCtx {
 }
 
 /// Publish N > cap foreign kind-11111 events from throwaway keys, then assert the served contact's
-/// presence still resolves via the production read. Fails with today's global read (the flood
-/// displaces the served beacon in the unbounded aggregate); passes author-filtered (W1).
+/// presence still resolves via the **author-filtered** production read — the W1 red→green
+/// discriminator. The author-filtered read (`fetch_presence_for_authors`) survives the flood
+/// (cap-immune); the pre-W1 global read did not.
 ///
 /// **Relay citizenship guard (standing, M16):** flood-shaped rows NEVER run against public relays.
 /// `flood_guard_violations` returns any `read_relay` not in the flood allowlist; if non-empty, the
@@ -276,15 +274,15 @@ async fn p3_cap_displacement(
 
     tokio::time::sleep(SETTLE).await;
 
-    // Now read the served peer through the production path (same as P1). With the global read, the
-    // flood has displaced the served beacon; with W1's author-filtered read, it survives.
+    // Now read the served peer through the author-filtered production path (same as P1, W1 fix). The
+    // author-filtered read survives the flood (cap-immune) — the real red→green discriminator.
     let observer = Identity::generate();
     let client = RelayClient::connect(&observer, relays, RELAY_TIMEOUT)
         .await
         .map_err(|e| format!("post-flood connect: {e}"))?;
-    let (fresh, now) = fetch_online_presence(&client, ONLINE_WINDOW_SECS, RELAY_TIMEOUT)
+    let (fresh, now) = fetch_presence_for_authors(&client, &[*peer_npub], ONLINE_WINDOW_SECS, RELAY_TIMEOUT)
         .await
-        .map_err(|e| format!("post-flood fetch_online_presence: {e}"))?;
+        .map_err(|e| format!("post-flood fetch_presence_for_authors: {e}"))?;
     client.disconnect().await;
 
     let observed = fresh.get(peer_npub).copied();
@@ -296,12 +294,12 @@ async fn p3_cap_displacement(
                 Ok(())
             } else {
                 Err(format!(
-                    "peer displaced: seen but stale (age={age}s); {total} npubs in the global aggregate after the flood (passes author-filtered, fails global — the W1 mechanical discriminator)"
+                    "peer seen but stale (age={age}s); {total} npubs in the author-filtered map after the flood"
                 ))
             }
         }
         None => Err(format!(
-            "peer displaced: NOT in the fresh map after the flood ({total} npubs in the aggregate) — the W1 symptom. Passes author-filtered."
+            "peer NOT in the author-filtered fresh map after the flood ({total} npubs returned) — the author-filtered read should have survived the flood (cap-immune)"
         )),
     }
 }
@@ -313,18 +311,11 @@ async fn p3_cap_displacement(
 /// Assert that a failed publish cycle does not yield a permanent offline (a retry lands inside the
 /// 600 s window rather than waiting the full 300 s cadence).
 ///
-/// **Expected RED today:** `presence.rs::run_presence_loop` skips a failed cycle (logs at debug,
-/// waits the full `PRESENCE_REFRESH_SECS` = 300 s) — there is no fast retry. Driving the real loop is
-/// impractical for a red demonstration (it needs a controllable relay-flap mid-cycle and a >300 s
-/// observation window), so this row asserts against the real publish function's observable behavior:
-/// a beacon published to an unreachable relay fails, then a beacon published to a reachable relay
-/// succeeds, and the row records whether the production code path provides any retry shorter than the
-/// 300 s cadence. The diagnostic states exactly what the row measures.
-///
-/// The mechanism: induce a failed publish (an unreachable relay URL), confirm it fails, then confirm
-/// the production `publish_presence` path succeeds against a good relay. The row is red because the
-/// *loop* between those two observations does not exist — `run_presence_loop` has no retry — and the
-/// diagnostic names that. When W1 ships a retry, this row exercises it (replace the assertion).
+/// **W1 (2026-08-02) shipped the retry:** `presence.rs::next_delay` selects a fast backoff
+/// (15/30/60/120 s) on failure instead of the full 300 s cadence. Legs (1)-(3) collect the live
+/// publish evidence (a failed cycle against an unreachable relay, then a good-leg publish that
+/// succeeds and verifies); leg (4) asserts the shipped `next_delay` selector directly — the pure,
+/// deterministic proxy the loop uses (driving the real >300 s loop is impractical).
 async fn p4_retry_within_window(relays: &[String]) -> Result<(), String> {
     use crate::presence::{fetch_peer_presence, publish_presence};
 
@@ -372,24 +363,23 @@ async fn p4_retry_within_window(relays: &[String]) -> Result<(), String> {
         return Err("verify-leg: binding did not verify".to_string());
     }
 
-    // (4) The retry assertion. This is the row that is RED today: the production loop
-    //     (run_presence_loop) does NOT retry a failed cycle inside the window — it sleeps the full
-    //     PRESENCE_REFRESH_SECS (300 s). The harness cannot observe a retry that does not exist, so
-    //     the row records the structural finding: between the failed leg (1) and the good leg (2),
-    //     no retry was attempted by the production loop. When W1 ships a retry, replace this
-    //     assertion with one that observes the retry landing < 300 s after a failure.
-    //
-    //     We assert the *absence* honestly: a production retry mechanism would shorten the gap below
-    //     300 s; none exists, so this row fails with the diagnostic stating what was measured.
-    Err(
-        "RED (expected pre-W1): run_presence_loop skips the failed cycle and waits the full 300s cadence — \
-         no retry lands inside the window. The harness induced a failed publish (unreachable relay), \
-         then confirmed publish_presence succeeds against a good relay, but the loop between them does \
-         not exist in production. Row measures: (a) failed-cycle publish fails, (b) good-leg publish \
-         succeeds, (c) NO retry path in run_presence_loop shortens the gap below 300s. \
-         When W1's retry ships, replace this assertion to observe the retry landing."
-            .to_string(),
-    )
+    // (4) W1 shipped the retry: a failed cycle now backs off fast (inside the 600s window) instead
+    //     of waiting the full 300s cadence. Assert the production selector directly (driving the real
+    //     >300s loop is impractical; next_delay is the pure, deterministic proxy the loop uses).
+    use crate::presence::{next_delay, PRESENCE_REFRESH_SECS};
+    let first_retry = next_delay(false, 0);
+    if first_retry >= Duration::from_secs(PRESENCE_REFRESH_SECS) {
+        return Err(format!(
+            "no fast retry: a failed cycle's delay is {first_retry:?} >= the 300s cadence"
+        ));
+    }
+    if first_retry >= Duration::from_secs(ONLINE_WINDOW_SECS) {
+        return Err(format!(
+            "retry does not land inside the 600s window: {first_retry:?}"
+        ));
+    }
+    eprintln!("   P4 retry lands in {first_retry:?} (< 300s cadence, inside the 600s window)");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -397,18 +387,16 @@ async fn p4_retry_within_window(relays: &[String]) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// Two identities, both connected from **this process** (one source IP), each publish a presence
-/// beacon; the observer's online count must rise by exactly 2. This is the `SAMENAT1` body from
-/// `hb-it/src/same_nat.rs` adapted into the WAN harness and pointed at the live relay set instead of
-/// ephemeral CI strfry. Every per-relay `PublishOutcome` is dumped to stderr — the evidence a
-/// same-NAT reject would otherwise leave invisible.
+/// beacon; the observer must resolve BOTH via the **author-filtered** read (W1), regardless of the
+/// global relay cap. This is the `SAMENAT1` body from `hb-it/src/same_nat.rs` adapted into the WAN
+/// harness and pointed at the live relay set instead of ephemeral CI strfry. Every per-relay
+/// `PublishOutcome` is dumped to stderr — the evidence a same-NAT reject would otherwise leave
+/// invisible.
 async fn p5_same_nat_plus_two(relays: &[String]) -> Result<(), String> {
     let observer = Identity::generate();
     let oc = RelayClient::connect(&observer, relays, RELAY_TIMEOUT)
         .await
         .map_err(|e| format!("observer connect: {e}"))?;
-    let before = hb_net::count_online(&oc, ONLINE_WINDOW_SECS, RELAY_TIMEOUT)
-        .await
-        .map_err(|e| format!("observer count_online (before): {e}"))?;
 
     let alice = Identity::generate();
     let bob = Identity::generate();
@@ -439,19 +427,30 @@ async fn p5_same_nat_plus_two(relays: &[String]) -> Result<(), String> {
 
     verify_peer_online(&oc, &alice).await?;
     verify_peer_online(&oc, &bob).await?;
-    let after = hb_net::count_online(&oc, ONLINE_WINDOW_SECS, RELAY_TIMEOUT)
-        .await
-        .map_err(|e| format!("observer count_online (after): {e}"))?;
+
+    // W1: assert both same-NAT identities resolve via the AUTHOR-FILTERED read (cap-immune), the
+    // property the fix delivers — not the global count's +2, which stays subject to the relay cap.
+    let (fresh, now) = fetch_presence_for_authors(
+        &oc,
+        &[alice.public_key(), bob.public_key()],
+        ONLINE_WINDOW_SECS,
+        RELAY_TIMEOUT,
+    )
+    .await
+    .map_err(|e| format!("author-filtered read: {e}"))?;
 
     ac.disconnect().await;
     bc.disconnect().await;
     oc.disconnect().await;
 
-    if after == before + 2 {
+    let a_fresh = fresh.get(&alice.public_key()).map(|ts| now.saturating_sub(*ts) <= ONLINE_WINDOW_SECS).unwrap_or(false);
+    let b_fresh = fresh.get(&bob.public_key()).map(|ts| now.saturating_sub(*ts) <= ONLINE_WINDOW_SECS).unwrap_or(false);
+    if a_fresh && b_fresh {
         Ok(())
     } else {
         Err(format!(
-            "same-NAT presence shortfall: before={before} after={after} (expected +2 — \
+            "same-NAT author-filtered shortfall: alice_fresh={a_fresh} bob_fresh={b_fresh} \
+             (both should resolve via the author-filtered read regardless of global cap — \
              a shortfall names a per-IP relay reject in the P5 publish diagnostics above)"
         ))
     }
