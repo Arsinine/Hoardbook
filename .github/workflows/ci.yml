@@ -101,7 +101,15 @@ jobs:
               exit 1
             fi
           done
-          iroh_users=$(grep -rlE '(^|[^a-zA-Z_])iroh::' crates/*/src | sort)
+          # The `hb-wan-it` headless WAN harness (crates/hb-app/src/wan_it/, its own `hb-wan-it` bin —
+          # NOT the Tauri app) DRIVES the production transport as a measuring client: it opens an
+          # `iroh::Endpoint` to dial the real plane and time it, exactly as the retired `hb-p2p-it` did.
+          # It is not a transport MODULE and cannot join TRANSPORT_FILES — it legitimately creates a
+          # temp data-dir (`std::fs::create_dir_all`), which the no-fs probe below forbids for the plane
+          # itself. So the harness dir is subtracted from the iroh-surface scan HERE, and only here:
+          # every other probe still scans it, and this filter fails CLOSED — rename the dir and its
+          # files reappear in the scan, turning CI red until the filter is corrected.
+          iroh_users=$(grep -rlE '(^|[^a-zA-Z_])iroh::' crates/*/src | grep -v '/wan_it/' | sort)
           listed=$(printf '%s\n' $TRANSPORT_FILES | sort)
           if unlisted=$(comm -23 <(echo "$iroh_users") <(echo "$listed")) && [ -n "$unlisted" ]; then
             echo "::error::INV-4′ regression — these files use iroh but are not in the swept transport surface:"
