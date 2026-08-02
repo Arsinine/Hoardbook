@@ -70,26 +70,40 @@ fn is_stale(last_attempt: Option<Instant>, now: Instant, interval: Duration) -> 
     last_attempt.is_none_or(|t| now.saturating_duration_since(t) >= interval)
 }
 
-/// Apply a refresh outcome to the cache (Decision C — **no sticky "–"**). A success replaces the
-/// value (count + `fetched_at`); a **failure leaves the last-known value untouched** — it never
-/// reverts a known count to `None` ("–") after one transient relay error, and a later success
-/// recovers it. A first-ever failure (no prior value) stays `None` → the chip honestly shows "–"
-/// (unknown, not a misleading "0"). Pure, so RELAY3 is a differential unit test with no relay.
+/// Apply a refresh outcome to the cache (Decision C — **no sticky "–"**). The chip (`count`) and the
+/// per-contact pills (`pills`) are refreshed **independently**: each is `Some` only when *its own*
+/// read succeeded this cycle, and a failed half keeps its last-known value. So a transient chip-query
+/// failure never discards freshly-read pills, and a pills-read failure (e.g. a store error reading
+/// the contact list) never blanks the chip — nor, crucially, blanks every pill to a false "offline"
+/// (the W1 bug class). A cycle in which **both** halves failed leaves the cache untouched; a
+/// first-ever all-failure stays `None` → the chip honestly shows "–" (unknown, not a misleading
+/// "0"). Pure, so RELAY3 is a differential unit test with no relay.
 fn apply_refresh(
     cache: &mut OnlineCache,
-    result: Result<(usize, Vec<PresenceSeen>), ()>,
+    count: Option<usize>,
+    pills: Option<Vec<PresenceSeen>>,
     relay_set: Vec<String>,
     now: chrono::DateTime<chrono::Utc>,
 ) {
-    if let Ok((count, fresh)) = result {
-        cache.value = Some(OnlineCount {
-            online: Some(count),
-            fetched_at: Some(now),
-            relay_set,
-            fresh,
-        });
+    // Both halves failed → keep the cache as-is (last-known stays; never-fetched stays None).
+    if count.is_none() && pills.is_none() {
+        return;
     }
-    // On failure: keep cache.value as-is (last-known stays; never-fetched stays None).
+    // At least one half is fresh. Carry the last-known halves forward and overwrite only the ones
+    // that succeeded this cycle — the chip and the pills degrade independently.
+    let (prev_online, prev_fresh) = match cache.value.take() {
+        Some(v) => (v.online, v.fresh),
+        None => (None, Vec::new()),
+    };
+    cache.value = Some(OnlineCount {
+        online: match count {
+            Some(n) => Some(n),
+            None => prev_online,
+        },
+        fetched_at: Some(now),
+        relay_set,
+        fresh: pills.unwrap_or(prev_fresh),
+    });
 }
 
 /// Stamp `last_presence` on every stored contact we just saw a beacon from (W5.2). Local-only: the
@@ -129,38 +143,52 @@ async fn refresh_count(
 
     // W1: the per-contact pills come from an author-filtered read over the STORED contacts, immune
     // to the global relay cap. The chip's `online` stays the global count (an approximate userbase
-    // metric). Two reads, two questions — decoupled.
-    let contact_authors: Vec<nostr::PublicKey> = store
-        .list_contacts()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|c| nostr::PublicKey::from_bech32(&c.npub).ok())
-        .collect();
+    // metric). Two reads, two questions — decoupled, and they degrade independently below.
+    //
+    // A store error reading the contact list must NOT be read as "zero contacts": querying an empty
+    // author set would return an empty map and blank every pill to a false "offline" — the exact W1
+    // bug in a new place. On such an error we leave the pills half `None` (keep last-known) rather
+    // than trust an empty list. (Known bound: a single author-filtered REQ is still subject to the
+    // relay's own response cap, so a contact list larger than that cap — far past this phonebook's
+    // scale — could omit the overflow; documented as a follow-up, not batched here.)
+    let contacts = store.list_contacts();
 
-    let result: Result<(usize, Vec<PresenceSeen>), ()> = match net::client(&id, store, relay).await {
-        Ok(client) => {
-            let count = hb_net::count_online(&client, ONLINE_WINDOW_SECS, net::RELAY_TIMEOUT).await;
-            let pills = hb_net::fetch_presence_for_authors(
-                &client,
-                &contact_authors,
-                ONLINE_WINDOW_SECS,
-                net::RELAY_TIMEOUT,
-            )
-            .await;
-            match (count, pills) {
-                (Ok(n), Ok((map, _now))) => Ok((n, to_presence_seen(map))),
-                _ => Err(()),
+    let (count_opt, pills_opt): (Option<usize>, Option<Vec<PresenceSeen>>) =
+        match net::client(&id, store, relay).await {
+            Ok(client) => {
+                let count = hb_net::count_online(&client, ONLINE_WINDOW_SECS, net::RELAY_TIMEOUT)
+                    .await
+                    .ok();
+                let pills = match &contacts {
+                    Ok(cs) => {
+                        let authors: Vec<nostr::PublicKey> = cs
+                            .iter()
+                            .filter_map(|c| nostr::PublicKey::from_bech32(&c.npub).ok())
+                            .collect();
+                        hb_net::fetch_presence_for_authors(
+                            &client,
+                            &authors,
+                            ONLINE_WINDOW_SECS,
+                            net::RELAY_TIMEOUT,
+                        )
+                        .await
+                        .ok()
+                        .map(|(map, _now)| to_presence_seen(map))
+                    }
+                    // Store error → keep last-known pills, never blank them to a false offline.
+                    Err(_) => None,
+                };
+                (count, pills)
             }
-        }
-        Err(_) => Err(()),
-    };
+            Err(_) => (None, None),
+        };
 
-    if let Ok((_n, fresh)) = &result {
+    if let Some(fresh) = &pills_opt {
         persist_presence(store, fresh);
     }
 
     let mut c = cache.write().await;
-    apply_refresh(&mut c, result, relay_set, chrono::Utc::now());
+    apply_refresh(&mut c, count_opt, pills_opt, relay_set, chrono::Utc::now());
 }
 
 /// Convert the pure tally's `PublicKey → created_at` map into the bech32-`npub` pairs the frontend
@@ -256,19 +284,19 @@ mod tests {
         let mut cache = OnlineCache::default();
 
         // First-ever failure → still unknown (None → chip shows "–", honest, not a fake "0").
-        apply_refresh(&mut cache, Err(()), relays.clone(), now);
+        apply_refresh(&mut cache, None, None, relays.clone(), now);
         assert!(cache.value.is_none(), "a first-ever failure stays unknown (–), not 0");
 
         // A success populates the count.
-        apply_refresh(&mut cache, Ok((5, seen(5, now))), relays.clone(), now);
+        apply_refresh(&mut cache, Some(5), Some(seen(5, now)), relays.clone(), now);
         assert_eq!(cache.value.as_ref().unwrap().online, Some(5));
 
         // A transient failure AFTER a success must NOT revert to "–" — it keeps the last count.
-        apply_refresh(&mut cache, Err(()), relays.clone(), now);
+        apply_refresh(&mut cache, None, None, relays.clone(), now);
         assert_eq!(cache.value.as_ref().unwrap().online, Some(5), "no sticky –: last count survives a failed cycle");
 
         // A later success recovers/updates it.
-        apply_refresh(&mut cache, Ok((7, seen(7, now))), relays, now);
+        apply_refresh(&mut cache, Some(7), Some(seen(7, now)), relays, now);
         assert_eq!(cache.value.as_ref().unwrap().online, Some(7));
     }
 
@@ -284,7 +312,7 @@ mod tests {
         // global count of 42 with only 3 contact pills seen.
         let now = chrono::Utc::now();
         let mut cache = OnlineCache::default();
-        apply_refresh(&mut cache, Ok((42, seen(3, now))), vec![], now);
+        apply_refresh(&mut cache, Some(42), Some(seen(3, now)), vec![], now);
         let v = cache.value.as_ref().unwrap();
         assert_eq!(v.online, Some(42), "chip = global count");
         assert_eq!(v.fresh.len(), 3, "pills = author-filtered contacts, independent of the count");
@@ -296,8 +324,30 @@ mod tests {
         // contact's pill to "unknown" — that would be the same lie in a new place.
         let now = chrono::Utc::now();
         let mut cache = OnlineCache::default();
-        apply_refresh(&mut cache, Ok((2, seen(2, now))), vec![], now);
-        apply_refresh(&mut cache, Err(()), vec![], now);
+        apply_refresh(&mut cache, Some(2), Some(seen(2, now)), vec![], now);
+        apply_refresh(&mut cache, None, None, vec![], now);
         assert_eq!(cache.value.as_ref().unwrap().fresh.len(), 2, "last-known fresh set survives");
+    }
+
+    #[test]
+    fn chip_and_pills_degrade_independently() {
+        // W1 codex-review fix (findings 1+2): the chip and the pills refresh on their own. A failed
+        // chip query must not discard freshly-read pills, and a failed pills read (e.g. a store error
+        // reading the contact list) must not blank the pills to a false "offline" nor disturb the chip.
+        let now = chrono::Utc::now();
+        let mut cache = OnlineCache::default();
+        apply_refresh(&mut cache, Some(10), Some(seen(3, now)), vec![], now);
+
+        // Chip query fails, pills succeed with a NEW (larger) set → chip holds at 10, pills update.
+        apply_refresh(&mut cache, None, Some(seen(5, now)), vec![], now);
+        let v = cache.value.as_ref().unwrap();
+        assert_eq!(v.online, Some(10), "chip failure keeps the last count");
+        assert_eq!(v.fresh.len(), 5, "pills updated independently of the failed chip");
+
+        // Pills read fails (store error), chip succeeds → pills hold at 5, chip updates to 20.
+        apply_refresh(&mut cache, Some(20), None, vec![], now);
+        let v = cache.value.as_ref().unwrap();
+        assert_eq!(v.online, Some(20), "chip updated independently of the failed pills");
+        assert_eq!(v.fresh.len(), 5, "pills failure keeps the last set — never a false offline");
     }
 }
