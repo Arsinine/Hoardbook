@@ -177,7 +177,16 @@ pub(crate) async fn run_presence_loop(
             let guard = identity.read().await;
             guard.as_ref().map(|id| id.identity.clone())
         };
+        let now = unix_now();
         let Some(id) = snapshot else {
+            // Record the skip (2026-08-02). This branch used to `continue` silently, leaving the
+            // report at its `Default` — indistinguishable from "the loop never ran at all", which is
+            // the one state the panel cannot diagnose its way out of. The cadence is deliberately
+            // unchanged: no identity is not a relay failure, so it waits the normal 300 s rather
+            // than entering the failure backoff.
+            let prev = beacon.read().await.clone();
+            *beacon.write().await =
+                record_outcome(&prev, Err("no identity loaded — nothing to publish"), now);
             delay = Duration::from_secs(PRESENCE_REFRESH_SECS);
             retry_idx = 0;
             continue;
@@ -185,7 +194,6 @@ pub(crate) async fn run_presence_loop(
 
         // M12 W1: ride the persistent shared client (one cheap publish, not a reconnect). Never
         // disconnect — the client lives for the session.
-        let now = unix_now();
         let succeeded = match crate::net::client(&id, &store, &relay).await {
             Ok(client) => match publish_presence(&client, &id).await {
                 Ok(outcome) => {
@@ -250,6 +258,43 @@ mod tests {
 
         let woke = wakeups.load(Ordering::Relaxed);
         assert!(woke < 100, "idle presence loop woke {woke} times in 300ms — busy-spinning?");
+    }
+
+    /// A cycle with no identity must RECORD the skip, not `continue` silently (2026-08-02). Left
+    /// unrecorded, the report stays at `Default` — byte-identical to "the loop never ran", so the
+    /// Settings panel showed "not sent yet" for two unrelated faults and the app ships with no log
+    /// subscriber to tell them apart. Time is paused, so the 15 s first-delay costs no wall clock.
+    #[tokio::test(start_paused = true)]
+    async fn presence_loop_records_a_skipped_cycle_when_no_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let identity: SharedIdentity = Arc::new(RwLock::new(None));
+        let relay = crate::net::new_shared();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let beacon: SharedBeaconState = Arc::default();
+
+        let handle = tokio::spawn(run_presence_loop(
+            identity,
+            store,
+            relay,
+            cancel_rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&beacon),
+        ));
+        // Past the first delay, so exactly one cycle has run.
+        tokio::time::sleep(Duration::from_secs(PRESENCE_FIRST_DELAY_SECS + 5)).await;
+        let report = beacon.read().await.clone();
+        let _ = cancel_tx.send(true);
+        let _ = handle.await;
+
+        assert_ne!(report.last_attempt_at, 0, "a skipped cycle must still count as an attempt");
+        assert!(
+            report.last_error.as_deref().is_some_and(|e| e.contains("no identity")),
+            "the skip must name itself, got {:?}",
+            report.last_error
+        );
+        // Nothing was published, so the success clock must NOT move.
+        assert_eq!(report.last_success_at, 0, "a skip is not a success");
     }
 
     /// Default report reads as "never attempted" (devtest #9: the panel must not claim a beacon
