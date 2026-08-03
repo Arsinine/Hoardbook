@@ -53,6 +53,21 @@ pub(crate) fn next_delay(succeeded: bool, retry_idx: u32) -> Duration {
     Duration::from_secs(RETRY_BACKOFF_SECS[idx])
 }
 
+/// Test-only, one-shot panic injection into the publish cycle — the fixture for the 2026-08-03
+/// root cause (a panic inside `RelayClient::connect` during the cold-launch relay flap killed the
+/// whole loop silently). One-shot (swap) so only the arming test is affected; no other presence
+/// test loads an identity, so no other test's loop can reach the injection point.
+#[cfg(test)]
+pub(crate) mod test_panic_injection {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    pub(crate) static ARMED: AtomicBool = AtomicBool::new(false);
+    pub(crate) fn fire() {
+        if ARMED.swap(false, Ordering::SeqCst) {
+            panic!("injected cycle panic (cold-launch connect panic class)");
+        }
+    }
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -180,6 +195,63 @@ async fn set_stage(beacon: &SharedBeaconState, wakeups: &std::sync::atomic::Atom
     guard.loop_wakeups = w;
 }
 
+/// One publish cycle: acquire the shared client, publish the beacon, record the outcome. Runs in
+/// its own task (spawned by the loop) so a panic anywhere inside — client connect included — is
+/// contained to the cycle. Owns its arguments for the `'static` spawn bound; the Arcs/DataStore
+/// are cheap clones of the loop's handles.
+async fn publish_cycle(
+    id: Identity,
+    store: DataStore,
+    relay: SharedRelay,
+    beacon: SharedBeaconState,
+    wakeups: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    now: u64,
+) -> bool {
+    #[cfg(test)]
+    test_panic_injection::fire();
+    match crate::net::client(&id, &store, &relay).await {
+        Ok(client) => {
+            set_stage(&beacon, &wakeups, "publishing").await;
+            match publish_presence(&client, &id).await {
+                Ok(outcome) => {
+                    let prev = beacon.read().await.clone();
+                    *beacon.write().await = record_outcome(&prev, Ok(&outcome), now);
+                    true
+                }
+                Err(e) => {
+                    tracing::debug!("presence publish failed: {e}");
+                    let prev = beacon.read().await.clone();
+                    *beacon.write().await = record_outcome(&prev, Err(&e.to_string()), now);
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            tracing::debug!("presence: no relay this cycle ({e})");
+            let prev = beacon.read().await.clone();
+            *beacon.write().await =
+                record_outcome(&prev, Err(&format!("no relay this cycle: {e}")), now);
+            false
+        }
+    }
+}
+
+/// Render a `JoinError`'s panic payload for the beacon report. Cancellation can't happen here —
+/// the cycle handle is awaited, never aborted — but is rendered rather than unwrapped.
+fn panic_message(e: tokio::task::JoinError) -> String {
+    if !e.is_panic() {
+        return "cycle task cancelled".into();
+    }
+    let payload = e.into_panic();
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".into()
+    }
+}
+
 /// Background loop: republish presence on a fixed cadence while an identity + bound endpoint exist.
 /// Replaces the legacy keepalive task. Best-effort — a missing relay/endpoint just skips the
 /// cycle. `false` on the cancel channel wakes it early; `true` shuts it down. `wakeups` counts loop
@@ -241,28 +313,28 @@ pub(crate) async fn run_presence_loop(
         // M12 W1: ride the persistent shared client (one cheap publish, not a reconnect). Never
         // disconnect — the client lives for the session.
         set_stage(&beacon, &wakeups, "acquiring-client").await;
-        let succeeded = match crate::net::client(&id, &store, &relay).await {
-            Ok(client) => {
-                set_stage(&beacon, &wakeups, "publishing").await;
-                match publish_presence(&client, &id).await {
-                    Ok(outcome) => {
-                        let prev = beacon.read().await.clone();
-                        *beacon.write().await = record_outcome(&prev, Ok(&outcome), now);
-                        true
-                    }
-                    Err(e) => {
-                        tracing::debug!("presence publish failed: {e}");
-                        let prev = beacon.read().await.clone();
-                        *beacon.write().await = record_outcome(&prev, Err(&e.to_string()), now);
-                        false
-                    }
-                }
-            }
+        // v0.12.11 (fifth presence report, root-caused 2026-08-03): the cycle body runs in its OWN
+        // task so a panic inside it — observed live inside `RelayClient::connect` during the
+        // cold-launch relay flap — kills the cycle, not the loop. Pre-fix, the whole detached loop
+        // task died silently (no console, panics bypass tracing) and presence was dead for the
+        // session with the panel frozen at "acquiring-client". Now the panic is recorded like any
+        // other failed cycle and the backoff retry self-heals once the flap clears.
+        let cycle = tokio::spawn(publish_cycle(
+            id,
+            store.clone(),
+            relay.clone(),
+            Arc::clone(&beacon),
+            Arc::clone(&wakeups),
+            now,
+        ));
+        let succeeded = match cycle.await {
+            Ok(succeeded) => succeeded,
             Err(e) => {
-                tracing::debug!("presence: no relay this cycle ({e})");
+                let msg = panic_message(e);
+                tracing::error!("presence cycle aborted: {msg}");
                 let prev = beacon.read().await.clone();
                 *beacon.write().await =
-                    record_outcome(&prev, Err(&format!("no relay this cycle: {e}")), now);
+                    record_outcome(&prev, Err(&format!("cycle panicked: {msg}")), now);
                 false
             }
         };
@@ -559,6 +631,77 @@ mod tests {
             "loop_wakeups must be surfaced into the report after a cycle; got 0 — \
              set_stage never ran (the diagnostic instrument itself failed to fire)"
         );
+    }
+
+    /// 2026-08-03, fifth presence report, root-caused from the v0.12.10 log + panel: a panic inside
+    /// the cycle body (observed live inside `RelayClient::connect` during the cold-launch relay
+    /// flap) must kill the CYCLE, not the loop. The panicking cycle records "cycle panicked: …" in
+    /// the report and the loop keeps running — the backoff retry lands after the flap and
+    /// self-heals. Red on the pre-fix code: the detached loop task dies, nothing is recorded, and
+    /// presence is silently dead for the whole session (panel frozen at "acquiring-client").
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_cycle_is_recorded_and_the_loop_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let identity: SharedIdentity = Arc::new(RwLock::new(Some(
+            crate::identity_state::AppIdentity::generate(),
+        )));
+        let relay = crate::net::new_shared();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let beacon: SharedBeaconState = Arc::default();
+
+        test_panic_injection::ARMED.store(true, Ordering::SeqCst);
+        let handle = tokio::spawn(run_presence_loop(
+            identity,
+            store,
+            relay,
+            cancel_rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&beacon),
+        ));
+        // Past the first delay: cycle 1 fires, hits the injected panic. The loop must record it
+        // and wrap into iteration 2 (parked on the backoff timer) — it must NOT die. The test
+        // reads the report BEFORE the backoff expires, so cycle 2 never runs and no real network
+        // is ever touched.
+        tokio::time::sleep(Duration::from_secs(PRESENCE_FIRST_DELAY_SECS + 5)).await;
+        let report = beacon.read().await.clone();
+        let _ = cancel_tx.send(true);
+        let _ = handle.await;
+
+        let err = report.last_error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("cycle panicked"),
+            "a panicking cycle must be recorded in the report; got last_error={err:?} \
+             (empty means the loop task died with the cycle — the pre-fix behavior)"
+        );
+        assert_eq!(
+            report.stage, "sleeping",
+            "the loop must survive the panicking cycle and park on the retry timer; \
+             stage {:?} means it never wrapped into the next iteration",
+            report.stage
+        );
+        assert_eq!(
+            report.loop_wakeups, 2,
+            "iteration 2 must have started after the panicked cycle 1"
+        );
+    }
+
+    /// `panic_message` must extract both payload shapes a Rust panic carries (`&str` from
+    /// `panic!("literal")`, `String` from `panic!("{x}")`) — the report string is the only place
+    /// the packaged app surfaces the panic, so "non-string panic payload" on a common shape would
+    /// re-blind the panel.
+    #[tokio::test]
+    async fn panic_message_extracts_both_payload_shapes() {
+        let e = tokio::spawn(async { panic!("plain literal") }).await.unwrap_err();
+        assert_eq!(panic_message(e), "plain literal");
+
+        let e = tokio::spawn(async {
+            let detail = "formatted";
+            panic!("with {detail}")
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(panic_message(e), "with formatted");
     }
 
     /// `record_outcome` must carry the diagnostic fields (stage, loop_wakeups) forward from `prev`
