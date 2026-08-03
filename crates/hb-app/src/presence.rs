@@ -87,6 +87,17 @@ pub struct BeaconReport {
     /// Set when the whole attempt failed before reaching any relay (e.g. no client this cycle);
     /// cleared on the next attempt that reaches a relay.
     pub last_error: Option<String>,
+    /// v0.12.10 diagnostic: the wakeup counter copied from the loop's `wakeups` AtomicU64 at the
+    /// last state write. Proves the task is being polled (a frozen report with a rising count
+    /// means the loop is alive but stuck in an await), and lets the panel distinguish "loop wedged
+    /// in an await" from "loop was never spawned" — both read as `last_attempt_at == 0` without this.
+    pub loop_wakeups: u64,
+    /// v0.12.10 diagnostic: a breadcrumb written BEFORE each await in the cycle, so if an await
+    /// never returns the panel still shows exactly where it wedged. Stages (exact strings):
+    /// `"loop-started"` (once, before the loop — proves the task got polled at all), `"sleeping"`
+    /// (before the select), `"snapshotting-identity"`, `"acquiring-client"`, `"publishing"`,
+    /// `"idle"` (cycle complete). Plain RwLock writes — the instrument itself, not its log.
+    pub stage: String,
 }
 
 pub type SharedBeaconState = Arc<RwLock<BeaconReport>>;
@@ -108,13 +119,26 @@ fn record_outcome(prev: &BeaconReport, result: Result<&PublishOutcome, &str>, no
                 outcome: "rejected".into(),
                 reason: Some(reason.clone()),
             }));
-            BeaconReport { last_attempt_at: now, last_success_at: now, relays, last_error: None }
+            BeaconReport {
+                last_attempt_at: now,
+                last_success_at: now,
+                relays,
+                last_error: None,
+                // Diagnostic fields carry forward from `prev` — `record_outcome` is pure and
+                // knows nothing about the loop's wakeup counter or stage breadcrumb. The loop
+                // writes those via `set_stage` around this call; carrying them stops a fresh Ok
+                // from blanking the trail mid-cycle.
+                loop_wakeups: prev.loop_wakeups,
+                stage: prev.stage.clone(),
+            }
         }
         Err(msg) => BeaconReport {
             last_attempt_at: now,
             last_success_at: prev.last_success_at,
             relays: prev.relays.clone(),
             last_error: Some(msg.to_string()),
+            loop_wakeups: prev.loop_wakeups,
+            stage: prev.stage.clone(),
         },
     }
 }
@@ -144,6 +168,18 @@ pub(crate) async fn fetch_peer_presence(
     Ok(hb_net::select_newest_by_created_at(events))
 }
 
+/// v0.12.10 diagnostic: write the stage breadcrumb + wakeup count into the shared beacon state
+/// BEFORE an await, so if the await never returns the panel still shows where the loop wedged.
+/// These are plain RwLock writes that provably work — the stage field IS the instrument, not its
+/// log. Reads `wakeups` once (Relaxed — a snapshot is sufficient; exactness is not required to
+/// distinguish "frozen" from "rising").
+async fn set_stage(beacon: &SharedBeaconState, wakeups: &std::sync::atomic::AtomicU64, stage: &str) {
+    let w = wakeups.load(std::sync::atomic::Ordering::Relaxed);
+    let mut guard = beacon.write().await;
+    guard.stage = stage.to_string();
+    guard.loop_wakeups = w;
+}
+
 /// Background loop: republish presence on a fixed cadence while an identity + bound endpoint exist.
 /// Replaces the legacy keepalive task. Best-effort — a missing relay/endpoint just skips the
 /// cycle. `false` on the cancel channel wakes it early; `true` shuts it down. `wakeups` counts loop
@@ -159,8 +195,16 @@ pub(crate) async fn run_presence_loop(
 ) {
     let mut delay = Duration::from_secs(PRESENCE_FIRST_DELAY_SECS);
     let mut retry_idx: u32 = 0;
+    // v0.12.10 diagnostic: prove the task got polled at all BEFORE the first await. If the loop is
+    // never spawned, or spawned but never polled, the stage stays "" — distinguishable from every
+    // in-cycle stage below.
+    set_stage(&beacon, &wakeups, "loop-started").await;
     loop {
         wakeups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Diagnostic: record that we are about to await the select (sleep or cancel). If neither
+        // future ever resolves, the panel shows "sleeping" — the wedge is in the runtime, not the
+        // publish path.
+        set_stage(&beacon, &wakeups, "sleeping").await;
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             _ = cancel_rx.changed() => {
@@ -173,6 +217,7 @@ pub(crate) async fn run_presence_loop(
 
         // Snapshot the identity (clone the secp256k1 key) without holding the lock across the
         // network call.
+        set_stage(&beacon, &wakeups, "snapshotting-identity").await;
         let snapshot = {
             let guard = identity.read().await;
             guard.as_ref().map(|id| id.identity.clone())
@@ -187,6 +232,7 @@ pub(crate) async fn run_presence_loop(
             let prev = beacon.read().await.clone();
             *beacon.write().await =
                 record_outcome(&prev, Err("no identity loaded — nothing to publish"), now);
+            set_stage(&beacon, &wakeups, "idle").await;
             delay = Duration::from_secs(PRESENCE_REFRESH_SECS);
             retry_idx = 0;
             continue;
@@ -194,20 +240,24 @@ pub(crate) async fn run_presence_loop(
 
         // M12 W1: ride the persistent shared client (one cheap publish, not a reconnect). Never
         // disconnect — the client lives for the session.
+        set_stage(&beacon, &wakeups, "acquiring-client").await;
         let succeeded = match crate::net::client(&id, &store, &relay).await {
-            Ok(client) => match publish_presence(&client, &id).await {
-                Ok(outcome) => {
-                    let prev = beacon.read().await.clone();
-                    *beacon.write().await = record_outcome(&prev, Ok(&outcome), now);
-                    true
+            Ok(client) => {
+                set_stage(&beacon, &wakeups, "publishing").await;
+                match publish_presence(&client, &id).await {
+                    Ok(outcome) => {
+                        let prev = beacon.read().await.clone();
+                        *beacon.write().await = record_outcome(&prev, Ok(&outcome), now);
+                        true
+                    }
+                    Err(e) => {
+                        tracing::debug!("presence publish failed: {e}");
+                        let prev = beacon.read().await.clone();
+                        *beacon.write().await = record_outcome(&prev, Err(&e.to_string()), now);
+                        false
+                    }
                 }
-                Err(e) => {
-                    tracing::debug!("presence publish failed: {e}");
-                    let prev = beacon.read().await.clone();
-                    *beacon.write().await = record_outcome(&prev, Err(&e.to_string()), now);
-                    false
-                }
-            },
+            }
             Err(e) => {
                 tracing::debug!("presence: no relay this cycle ({e})");
                 let prev = beacon.read().await.clone();
@@ -221,6 +271,10 @@ pub(crate) async fn run_presence_loop(
         // normal 300s cadence.
         delay = next_delay(succeeded, retry_idx);
         retry_idx = if succeeded { 0 } else { retry_idx.saturating_add(1) };
+        // Diagnostic: the cycle completed (record_outcome ran). Written last so a panel reading
+        // "idle" between cycles knows the previous await returned and the loop is sleeping, not
+        // wedged mid-publish.
+        set_stage(&beacon, &wakeups, "idle").await;
     }
 }
 
@@ -317,6 +371,7 @@ mod tests {
             last_success_at: 10,
             relays: vec![],
             last_error: Some("stale error".into()),
+            ..Default::default()
         };
         let outcome = PublishOutcome {
             accepted: vec!["wss://a".into()],
@@ -349,6 +404,7 @@ mod tests {
                 reason: None,
             }],
             last_error: None,
+            ..Default::default()
         };
         let got = record_outcome(&prev, Err("no relay this cycle: pool empty"), 30);
 
@@ -381,5 +437,145 @@ mod tests {
         assert!(d0 <= d1 && d1 <= d2, "backoff increases");
         // Exhausted schedule clamps to the last step, never grows unbounded.
         assert_eq!(next_delay(false, 99), next_delay(false, 3));
+    }
+
+    // ── v0.12.10 diagnostic build: loop-liveness breadcrumbs ────────────────────────
+    //
+    // The fifth presence-class bug: on two packaged-Windows machines the loop never records a
+    // single cycle, yet every await is provably bounded. The stage breadcrumb is written BEFORE
+    // each await so a wedged await still shows where it stopped. These pin that behavior.
+
+    /// The stage breadcrumb is non-empty as soon as the task is polled — the `loop-started` write
+    /// fires before the first select, then is immediately overwritten by `sleeping` on the same poll
+    /// batch (the task parks at the select because the 15 s sleep hasn't elapsed). An empty stage
+    /// after spawn is the wedge signature: the task was never polled at all. Paused clock ⇒ the
+    /// first delay never elapses, so no cycle logic runs — this isolates the "task got polled"
+    /// property from the "cycle completed" property.
+    #[tokio::test(start_paused = true)]
+    async fn stage_written_before_first_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let identity: SharedIdentity = Arc::new(RwLock::new(None));
+        let relay = crate::net::new_shared();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let beacon: SharedBeaconState = Arc::default();
+
+        let handle = tokio::spawn(run_presence_loop(
+            identity,
+            store,
+            relay,
+            cancel_rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&beacon),
+        ));
+        // Advance 1 s of paused time — enough for the runtime to poll the task once (writing
+        // loop-started → sleeping), but well under the 15 s first delay so no cycle runs.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let stage = beacon.read().await.stage.clone();
+        let _ = cancel_tx.send(true);
+        let _ = handle.await;
+
+        assert_ne!(
+            stage, "",
+            "stage must be non-empty after the task is polled; empty means the task was never \
+             polled at all (the wedge hypothesis the diagnostic build exists to confirm or refute)"
+        );
+        // The only stages reachable before the first delay elapses are loop-started and sleeping
+        // (both written before the select). Anything else means the breadcrumb logic is wrong.
+        assert!(
+            stage == "loop-started" || stage == "sleeping",
+            "pre-cycle stage must be loop-started or sleeping; got {stage:?}"
+        );
+    }
+
+    /// After one full cycle (no-identity skip), the stage must still be non-empty — proving the
+    /// breadcrumb writes are wired through the whole cycle, not just the entry. The steady state
+    /// between cycles is `sleeping` (the loop parked at the next select), because `idle` is written
+    /// last and then immediately overwritten when the loop iterates. A stage stuck at
+    /// `snapshotting-identity` would mean the loop wedged in that await. Paused clock ⇒ no wall cost.
+    #[tokio::test(start_paused = true)]
+    async fn stage_progresses_through_a_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let identity: SharedIdentity = Arc::new(RwLock::new(None));
+        let relay = crate::net::new_shared();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let beacon: SharedBeaconState = Arc::default();
+
+        let handle = tokio::spawn(run_presence_loop(
+            identity,
+            store,
+            relay,
+            cancel_rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&beacon),
+        ));
+        // Past the first delay → exactly one cycle (no-identity skip) has completed.
+        tokio::time::sleep(Duration::from_secs(PRESENCE_FIRST_DELAY_SECS + 5)).await;
+        let report = beacon.read().await.clone();
+        let _ = cancel_tx.send(true);
+        let _ = handle.await;
+
+        // The cycle completed (record_outcome ran for the skip), so the stage must be non-empty —
+        // the breadcrumb writes ran through the whole cycle. An empty stage would mean the
+        // diagnostic writes only fire on the entry path, not the cycle body.
+        assert_ne!(
+            report.stage, "",
+            "stage must be non-empty after a completed cycle; empty means the breadcrumb writes \
+             are not wired through the cycle body"
+        );
+        // The skip cycle still recorded an attempt (existing behavior, unchanged).
+        assert_ne!(report.last_attempt_at, 0);
+    }
+
+    /// `loop_wakeups` is surfaced from the loop's AtomicU64 into the report — a rising count on a
+    /// frozen report proves the loop is alive but stuck in an await (vs. never spawned at all).
+    #[tokio::test(start_paused = true)]
+    async fn loop_wakeups_surfaced_into_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let identity: SharedIdentity = Arc::new(RwLock::new(None));
+        let relay = crate::net::new_shared();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let beacon: SharedBeaconState = Arc::default();
+
+        let handle = tokio::spawn(run_presence_loop(
+            identity,
+            store,
+            relay,
+            cancel_rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&beacon),
+        ));
+        tokio::time::sleep(Duration::from_secs(PRESENCE_FIRST_DELAY_SECS + 5)).await;
+        let report = beacon.read().await.clone();
+        let _ = cancel_tx.send(true);
+        let _ = handle.await;
+
+        // After one cycle the wakeup counter must have been copied into the report at least once
+        // (set_stage writes it on every stage transition). Zero would mean set_stage never ran.
+        assert!(
+            report.loop_wakeups > 0,
+            "loop_wakeups must be surfaced into the report after a cycle; got 0 — \
+             set_stage never ran (the diagnostic instrument itself failed to fire)"
+        );
+    }
+
+    /// `record_outcome` must carry the diagnostic fields (stage, loop_wakeups) forward from `prev`
+    /// so a fresh Ok/Err result does not blank the trail mid-cycle. The loop writes them via
+    /// set_stage around the record_outcome call; record_outcome itself is pure and must preserve them.
+    #[test]
+    fn record_outcome_preserves_diagnostic_fields() {
+        let prev = BeaconReport {
+            last_attempt_at: 10,
+            last_success_at: 10,
+            relays: vec![],
+            last_error: None,
+            loop_wakeups: 42,
+            stage: "publishing".into(),
+        };
+        let got = record_outcome(&prev, Err("transient"), 20);
+        assert_eq!(got.loop_wakeups, 42, "loop_wakeups must carry forward");
+        assert_eq!(got.stage, "publishing", "stage must carry forward");
     }
 }

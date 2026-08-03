@@ -245,6 +245,12 @@ export interface BeaconReport {
 	lastSuccessAt: number;
 	relays: BeaconRelayOutcome[];
 	lastError: string | null;
+	/** v0.12.10 diagnostic: the loop's wakeup counter at the last state write — a rising count on
+	 *  a frozen report proves the loop is alive but stuck in an await (vs. never spawned at all). */
+	loopWakeups: number;
+	/** v0.12.10 diagnostic: a breadcrumb written before each await in the cycle, so if an await
+	 *  never returns the panel still shows where it wedged. */
+	stage: string;
 }
 
 /** Live beacon-publish health. Best-effort. */

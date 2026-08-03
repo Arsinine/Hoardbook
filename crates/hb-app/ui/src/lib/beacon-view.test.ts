@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { beaconLine, relativeAgo } from './beacon-view.js';
+import { beaconLine, loopLine, relativeAgo } from './beacon-view.js';
 import type { BeaconReport } from './api';
 
 const report = (over: Partial<BeaconReport> = {}): BeaconReport => ({
@@ -7,6 +7,8 @@ const report = (over: Partial<BeaconReport> = {}): BeaconReport => ({
 	lastSuccessAt: 0,
 	relays: [],
 	lastError: null,
+	loopWakeups: 0,
+	stage: '',
 	...over,
 });
 
@@ -97,6 +99,8 @@ describe('beacon-view — relay URLs match the way the rest of the codebase matc
 		lastSuccessAt: 880,
 		relays: [{ url: relayUrl, outcome: 'accepted', reason: null }],
 		lastError: null,
+		loopWakeups: 1,
+		stage: 'idle',
 	});
 
 	it('pool URL has a trailing slash, configured URL does not ⇒ still "sent"', () => {
@@ -121,6 +125,8 @@ describe('beacon-view — relay URLs match the way the rest of the codebase matc
 			lastSuccessAt: 1000,
 			relays: [{ url: 'wss://relay.damus.io/', outcome: 'rejected', reason: 'rate-limited' }],
 			lastError: null,
+			loopWakeups: 1,
+			stage: 'idle',
 		};
 		const v = beaconLine(r, 'wss://relay.damus.io', 1000);
 		expect(v.tone).toBe('bad');
@@ -130,5 +136,30 @@ describe('beacon-view — relay URLs match the way the rest of the codebase matc
 	it('a genuinely different relay still does NOT match', () => {
 		const v = beaconLine(sent('wss://nos.lol'), 'wss://relay.damus.io', 1000);
 		expect(v.text).toBe('beacon: no ack from this relay');
+	});
+});
+
+// v0.12.10 diagnostic build: the loop-liveness breadcrumb line. One line rendered once near the
+// relay rows, showing the current stage + wakeup count. The shipped Windows build has no log
+// subscriber and no devtools, so this line is the only on-screen evidence that the presence task is
+// being polled at all.
+describe('beacon-view — loopLine (v0.12.10 diagnostic)', () => {
+	it('null report ⇒ "loop: no report"', () => {
+		expect(loopLine(null)).toBe('loop: no report');
+	});
+
+	it('a live idle loop shows the stage + wakeup count', () => {
+		const r = report({ stage: 'idle', loopWakeups: 42 });
+		expect(loopLine(r)).toBe('loop: idle · wakeups 42');
+	});
+
+	it('a wedged-in-sleep loop shows "sleeping" — the breadcrumb that locates the wedge', () => {
+		const r = report({ stage: 'sleeping', loopWakeups: 7 });
+		expect(loopLine(r)).toBe('loop: sleeping · wakeups 7');
+	});
+
+	it('empty stage (loop never polled) shows an em-dash placeholder', () => {
+		const r = report({ stage: '', loopWakeups: 0 });
+		expect(loopLine(r)).toBe('loop: — · wakeups 0');
 	});
 });

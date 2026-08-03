@@ -12,7 +12,13 @@ thiserror   = "1"
 anyhow      = "1"
 chrono      = { version = "0.4", features = ["serde"] }
 tokio       = { version = "1", features = ["full"] }
-tracing     = "0.1"
+tracing            = "0.1"
+# v0.12.10 diagnostic build: a file-based tracing subscriber so the beacon loop's wedge is
+# diagnosable in the shipped (no-devtools) Windows build. tracing-subscriber is already a
+# transitive dep in the lock (0.3.x); tracing-appender is new and pinned to match the
+# subscriber's minor (the builder().max_log_files() API landed in 0.2.3).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender   = "0.2"
 hex         = "0.4"
 zeroize     = { version = "1", features = ["derive"] }
 
