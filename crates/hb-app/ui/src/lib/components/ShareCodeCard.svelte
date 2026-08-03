@@ -29,6 +29,9 @@
 		/** Fired on "Unlock browsing" click — the parent runs `pasteKey` → `follow` (the only network
 		 *  surface, behind an explicit click). */
 		onunlock: () => void;
+		/** True while the parent's unlock is in flight (relay resolve is multi-second) — the button
+		 *  disables and reads "Unlocking…" so the click is visibly acknowledged. */
+		unlocking: boolean;
 		/** Fired on "Add contact" click for a forwarded third-party code — the parent opens the
 		 *  standard AddContactDialog (petname + group; a NEW relationship, full ritual applies). */
 		onaddcontact: (info: ShareCodeInfo) => void;
@@ -42,6 +45,7 @@
 		quarantined,
 		unlocked,
 		onunlock,
+		unlocking,
 		onaddcontact,
 	}: Props = $props();
 
@@ -106,7 +110,7 @@
 				{/if}
 			</div>
 		{:else}
-			<button type="button" class="btn-primary share-card-action" onclick={onunlock}>Unlock browsing</button>
+			<button type="button" class="btn-primary share-card-action" onclick={onunlock} disabled={unlocking}>{unlocking ? 'Unlocking…' : 'Unlock browsing'}</button>
 		{/if}
 	{:else if state === 'third'}
 		<button type="button" class="btn-primary share-card-action" onclick={() => onaddcontact(info)}>Add contact</button>
