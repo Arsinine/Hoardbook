@@ -9,6 +9,8 @@ mod dm_cache_store;
 mod dm_quarantine;
 mod error;
 mod identity_state;
+// v0.12.10 diagnostic build — file-based tracing subscriber for the beacon-loop wedge.
+mod logging;
 mod manifest_cache;
 mod manifest_source;
 mod net;
@@ -272,6 +274,12 @@ pub fn run() {
                 .expect("could not resolve app data dir");
 
             create_app_data_dir(&data_dir);
+
+            // v0.12.10 diagnostic build: install the file-based tracing subscriber BEFORE the
+            // background tasks spawn, so the presence loop's debug! lines land in the log. Non-fatal —
+            // see `logging::install`. `data_dir` is the resolved app-data dir (same one `DataStore`
+            // uses), and it now exists.
+            logging::install(&data_dir);
 
             let store = DataStore::new(data_dir);
 

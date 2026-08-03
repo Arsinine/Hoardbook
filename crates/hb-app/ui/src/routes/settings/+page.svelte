@@ -6,7 +6,7 @@
 	import { keyView } from '$lib/key-view.js';
 	import { passphraseStrength, backupModeOptions, type BackupMode } from '$lib/backup-export.js';
 	import { updateNoticeVM } from '$lib/update-ux.js';
-	import { beaconLine } from '$lib/beacon-view.js';
+	import { beaconLine, loopLine } from '$lib/beacon-view.js';
 	import { DEFAULT_RELAYS, validateRelayUrl } from '$lib/relays.js';
 	import { relaunch } from '@tauri-apps/plugin-process';
 	import { open as openFileDialog, save as saveFileDialog, confirm } from '@tauri-apps/plugin-dialog';
@@ -600,6 +600,10 @@
 				<button class="icon-btn" onclick={() => removeRelay(url)}>{@html icons.close}</button>
 			</div>
 		{/each}
+		<!-- v0.12.10 diagnostic: loop-liveness breadcrumb (rendered once, not per-relay) — the
+		     shipped Windows build has no log subscriber, so this line is the on-screen evidence the
+		     presence task is being polled at all. -->
+		<div class="relay-loop-line">{loopLine(beaconReport)}</div>
 		<!-- Add relay row -->
 		<div class="relay-add-row">
 			<input
@@ -939,6 +943,14 @@
 		font-size: 11px;
 		color: var(--fg-dim);
 		line-height: 1.4;
+	}
+
+	/* v0.12.10 diagnostic: the loop-liveness breadcrumb, once under the relay rows. */
+	.relay-loop-line {
+		padding: 0 16px 8px;
+		font-size: 11px;
+		color: var(--fg-muted);
+		font-family: var(--mono, monospace);
 	}
 
 	/* M20 W4: input contract is global in app.css. Only the flex-grow LAYOUT stays, scoped to the

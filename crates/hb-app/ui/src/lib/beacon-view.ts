@@ -32,6 +32,14 @@ function sameRelay(a: string, b: string): boolean {
 	return norm(a) === norm(b);
 }
 
+/** The loop-liveness breadcrumb line (v0.12.10 diagnostic). One line, rendered once near the relay
+ *  rows: shows the current stage + wakeup count so a frozen report is distinguishable from a
+ *  never-spawned loop. Pure — no tone logic, just a read-back of the backend's diagnostic fields. */
+export function loopLine(report: BeaconReport | null): string {
+	if (!report) return 'loop: no report';
+	return `loop: ${report.stage || '—'} · wakeups ${report.loopWakeups}`;
+}
+
 /** The beacon status line for one relay row.
  *
  *  These states were one shared "not sent yet" string until 2026-08-02, which made the panel
