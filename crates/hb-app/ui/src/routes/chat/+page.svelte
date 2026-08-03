@@ -1143,6 +1143,7 @@
 												quarantined={true}
 												unlocked={false}
 												onunlock={() => {}}
+												unlocking={false}
 												onaddcontact={() => {}}
 											/>
 										{/if}
@@ -1268,6 +1269,7 @@
 											quarantined={false}
 											unlocked={unlockedCodes.has(card.code)}
 											onunlock={() => handleUnlock(card.code)}
+											unlocking={unlockingCode === card.code}
 											onaddcontact={() => handleAddContact(card)}
 										/>
 									{/if}
