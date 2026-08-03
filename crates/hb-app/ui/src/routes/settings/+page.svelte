@@ -1,8 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, watchesGet, watchesDelete, hasPublishedProfile, publishProfile } from '$lib/api.js';
+	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, hasPublishedProfile, publishProfile } from '$lib/api.js';
 	import type { Settings, UpdateInfo, PortableUpdateInfo, BeaconReport } from '$lib/api.js';
-	import type { Watch } from '$lib/types.js';
 	import { keyView } from '$lib/key-view.js';
 	import { passphraseStrength, backupModeOptions, type BackupMode } from '$lib/backup-export.js';
 	import { updateNoticeVM } from '$lib/update-ux.js';
@@ -235,7 +234,6 @@
 
 	onMount(async () => {
 		try { appVersion = await getVersion(); } catch { appVersion = ''; }
-		loadWatches();
 		try {
 			settings = await getSettings();
 			// Fresh install has no saved relays — show the curated public defaults (the backend
@@ -400,26 +398,6 @@
 		} finally {
 			savingRelays = false;
 		}
-	}
-
-	// Watches
-	let watches: Watch[] = $state([]);
-
-	async function loadWatches() {
-		try { watches = await watchesGet(); } catch { /* no watches */ }
-	}
-
-	async function handleDeleteWatch(name: string) {
-		try {
-			await watchesDelete(name);
-			watches = watches.filter(w => w.name !== name);
-			toast(`Watch "${name}" deleted`);
-		} catch (e) { toast(String(e), 'error'); }
-	}
-
-	function formatWatchDate(iso: string | undefined): string {
-		if (!iso) return 'Never';
-		return new Date(iso).toLocaleDateString();
 	}
 
 	let idName = $derived($profile?.display_name ?? 'You');
@@ -742,34 +720,9 @@
 		{/if}
 	</div>
 
-	<!-- Watches -->
-	<div class="section-label">Watches</div>
-
-	<div class="surface">
-		{#if watches.length === 0}
-			<div class="watches-empty">No saved watches. A watch is a saved tag search that flags new matching hoarders as they appear.</div>
-		{:else}
-			<div class="watch-list">
-				{#each watches as w (w.name)}
-					<div class="watch-row-item">
-						<div class="watch-info">
-							<div class="watch-name">{w.name}</div>
-							<div class="watch-detail">
-								{#if w.content_types.length > 0}
-									<span class="watch-chip">{w.content_types.join(', ')}</span>
-								{/if}
-								{#if w.tags.length > 0}
-									<span class="watch-chip tags">#{w.tags.join(', #')}</span>
-								{/if}
-								<span class="watch-fired">Last triggered: {formatWatchDate(w.last_fired)}</span>
-							</div>
-						</div>
-						<button class="btn-ghost btn-sm btn-danger-text" onclick={() => handleDeleteWatch(w.name)}>Delete</button>
-					</div>
-				{/each}
-			</div>
-		{/if}
-	</div>
+	<!-- Watches section removed 2026-08-03: the backend (watches_get/create/delete/evaluate) exists
+	     but no UI ever creates a watch — the save-search affordance in Discover was never built, so
+	     the section was a permanently-empty list. Restore it when Discover grows "save this search". -->
 
 	<!-- Danger Zone -->
 	<div class="section-label danger-label">Danger zone</div>
@@ -989,36 +942,6 @@
 		transition: left 0.15s, background 0.15s;
 	}
 	.toggle-on .toggle-thumb { left: 14px; background: var(--accent-text); }
-
-	/* Watches */
-	.watches-empty { font-size: 12.5px; color: var(--fg-dim); padding: 4px 0; }
-
-	.watch-list { display: flex; flex-direction: column; gap: 1px; }
-
-	.watch-row-item {
-		display: flex; align-items: center; gap: 10px;
-		padding: 10px 0;
-		border-bottom: 1px solid var(--divider);
-	}
-	.watch-row-item:last-child { border-bottom: none; }
-
-	.watch-info { flex: 1; min-width: 0; }
-
-	.watch-name { font-size: 13px; font-weight: 500; color: var(--fg); }
-
-	.watch-detail { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 3px; align-items: center; }
-
-	.watch-chip {
-		font-size: 10.5px; padding: 1px 7px; border-radius: 4px;
-		background: color-mix(in oklch, var(--accent) 12%, transparent);
-		color: var(--accent);
-		border: 1px solid color-mix(in oklch, var(--accent) 20%, transparent);
-	}
-	.watch-chip.tags { background: var(--bg-elev3); color: var(--fg-muted); border-color: var(--border); }
-
-	.watch-fired { font-size: 10.5px; color: var(--fg-dim); }
-
-	.btn-danger-text { color: var(--red, #e05c5c); }
 
 	/* Danger zone */
 	.danger-row {
