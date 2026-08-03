@@ -22,6 +22,21 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 /// Install the file-based subscriber writing under `<app_data_dir>/logs/`. Never panics — a
 /// failure returns silently (stderr gets a best-effort line) so the app starts regardless.
 pub(crate) fn install(data_dir: &Path) {
+    // v0.12.11: route panics through tracing into the log file. The 2026-08-03 root-cause hunt
+    // established that a panicking background task is INVISIBLE in the packaged app — no console
+    // for stderr, and panics bypass tracing — so the presence loop died silently inside
+    // `RelayClient::connect` across five reports. The default stderr hook still runs after ours.
+    // Installed even if the subscriber below fails: tracing::error! is then a no-op and the
+    // stderr hook alone remains (the pre-v0.12.10 state). NB: a panic that aborts the process
+    // may lose this line (the non-blocking appender flushes asynchronously); an unwinding task
+    // panic — the observed class — flushes fine because the process lives on.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!("PANIC: {info}\n{backtrace}");
+        prev_hook(info);
+    }));
+
     let filter = EnvFilter::try_from_env("HB_LOG")
         .unwrap_or_else(|_| EnvFilter::new("hb_app=debug,hb_net=debug,info"));
 
