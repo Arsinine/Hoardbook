@@ -1566,7 +1566,6 @@ mod tests {
             pubkeys: vec![],
             modified_at: Utc::now(),
             color: None,
-            trusted: false,
         }];
         store.save_groups(&groups).unwrap();
 

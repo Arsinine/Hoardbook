@@ -1,21 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import type { Group } from './types.js';
 import {
 	DEFAULT_VISIBILITY,
 	NOT_DRM_NOTE,
 	visibilityOf,
-	isTrusted,
-	trustedRecipients,
-	contactIsTrusted,
+	audienceRecipients,
+	receivesPrivate,
 } from './private-collections-view.js';
 
-const grp = (name: string, pubkeys: string[], trusted?: boolean): Group => ({
-	name,
-	pubkeys,
-	...(trusted === undefined ? {} : { trusted }),
-});
-
-describe('Private Collections view-model (M10)', () => {
+describe('Private Collections view-model (M21 W5)', () => {
 	it('defaults visibility to Public, never silently Private', () => {
 		expect(DEFAULT_VISIBILITY).toBe('Public');
 		expect(visibilityOf({ visibility: undefined })).toBe('Public'); // pre-M10 collection
@@ -30,26 +22,16 @@ describe('Private Collections view-model (M10)', () => {
 		expect(NOT_DRM_NOTE.toLowerCase()).toContain('future republishes');
 	});
 
-	it('isTrusted defaults to false for a pre-M10 group', () => {
-		expect(isTrusted({ trusted: undefined })).toBe(false);
-		expect(isTrusted({ trusted: false })).toBe(false);
-		expect(isTrusted({ trusted: true })).toBe(true);
+	it('audienceRecipients dedups the explicit audience list', () => {
+		// M21 W5: the audience is a plain list of npubs — no group affiliation involved.
+		const audience = ['npub_a', 'npub_b', 'npub_a', 'npub_c'];
+		expect(audienceRecipients(audience).sort()).toEqual(['npub_a', 'npub_b', 'npub_c']);
 	});
 
-	it('trustedRecipients unions + dedups trusted groups and ignores untrusted ones', () => {
-		const groups = [
-			grp('inner', ['npub_a', 'npub_b'], true),
-			grp('also', ['npub_a', 'npub_c'], true), // npub_a duplicated across trusted groups
-			grp('acquaintances', ['npub_x'], false), // untrusted → excluded
-			grp('legacy', ['npub_y']), // no `trusted` field ⇒ untrusted
-		];
-		expect(trustedRecipients(groups).sort()).toEqual(['npub_a', 'npub_b', 'npub_c']);
-	});
-
-	it('contactIsTrusted is true only for members of a trusted group', () => {
-		const groups = [grp('inner', ['npub_a'], true), grp('friends', ['npub_b'], false)];
-		expect(contactIsTrusted('npub_a', groups)).toBe(true);
-		expect(contactIsTrusted('npub_b', groups)).toBe(false); // in an untrusted group
-		expect(contactIsTrusted('npub_z', groups)).toBe(false); // in no group
+	it('receivesPrivate is true only for npubs explicitly in the audience', () => {
+		const audience = ['npub_a', 'npub_b'];
+		expect(receivesPrivate('npub_a', audience)).toBe(true);
+		expect(receivesPrivate('npub_b', audience)).toBe(true);
+		expect(receivesPrivate('npub_z', audience)).toBe(false); // not in the audience
 	});
 });

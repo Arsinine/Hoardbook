@@ -6,7 +6,7 @@ import type { Group } from '../types.js';
 
 afterEach(cleanup);
 
-const GROUPS: Group[] = [{ name: 'Inner Circle', pubkeys: [], trusted: true }];
+const GROUPS: Group[] = [{ name: 'Inner Circle', pubkeys: [] }];
 
 describe('AddContactDialog (M13 W5 Slice 2)', () => {
 	it('petname_prefilled_with_display_name_and_editable', async () => {

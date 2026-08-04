@@ -1,8 +1,8 @@
 //! Pure view-model for Private Collections (M10) — visibility defaults, the honest "not DRM" copy,
-//! and the trusted-recipient computation the collection manager + contacts UI share. No Svelte, no
-//! DOM, no Tauri → unit-testable in the node env.
+//! and the audience computation the collection manager + contacts UI share. No Svelte, no DOM, no
+//! Tauri → unit-testable in the node env.
 
-import type { Collection, Group, Visibility } from './types.js';
+import type { Collection, Visibility } from './types.js';
 
 /** Default visibility for a new / untouched collection — **Public**, never silently Private. */
 export const DEFAULT_VISIBILITY: Visibility = 'Public';
@@ -20,20 +20,15 @@ export function visibilityOf(c: Pick<Collection, 'visibility'>): Visibility {
 	return c.visibility ?? DEFAULT_VISIBILITY;
 }
 
-/** Whether a group is trusted (absent ⇒ false — trust is never granted by default). */
-export function isTrusted(g: Pick<Group, 'trusted'>): boolean {
-	return g.trusted === true;
-}
-
-/** The npubs that will receive a Private collection: the de-duplicated union of every trusted
- *  group's members. Empty ⇒ publishing a Private collection has no audience (the UI warns). */
-export function trustedRecipients(groups: Group[]): string[] {
+/** M21 W5: the Private audience is an explicit list of npubs (decoupled from contact groups by
+ *  owner ruling 2026-08-04). The list is the de-duplicated audience. */
+export function audienceRecipients(audience: string[]): string[] {
 	const set = new Set<string>();
-	for (const g of groups) if (isTrusted(g)) for (const p of g.pubkeys) set.add(p);
+	for (const npub of audience) set.add(npub);
 	return [...set];
 }
 
-/** Whether a contact (by npub) is in any trusted group — i.e. receives Private collections. */
-export function contactIsTrusted(npub: string, groups: Group[]): boolean {
-	return groups.some((g) => isTrusted(g) && g.pubkeys.includes(npub));
+/** Whether a contact (by npub) is in the Private audience — i.e. receives Private collections. */
+export function receivesPrivate(npub: string, audience: string[]): boolean {
+	return audience.includes(npub);
 }

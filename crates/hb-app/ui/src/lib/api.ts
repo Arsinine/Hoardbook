@@ -492,13 +492,19 @@ export const groupsAssign   = (npub: string, groupName: string) =>
 export const groupsUnassign = (npub: string, groupName: string) =>
 	invoke<void>('groups_unassign', { npub, groupName });
 
-/** Mark a contact group trusted/untrusted for Private collections (M10). */
-export const groupsSetTrusted = (name: string, trusted: boolean) =>
-	invoke<void>('groups_set_trusted', { name, trusted });
-
 /** Atomically replace all group memberships for a contact. Pass [] for Ungrouped. */
 export const contactUpdateGroups = (npub: string, groupNames: string[]) =>
 	invoke<void>('contact_update_groups', { npub, groupNames });
+
+// ── Private-collection audience (M21 W5) ──────────────────────────────────────
+// Decoupled from contact groups by owner ruling (2026-08-04): joining a group or topic never
+// enrols anyone here. Only the explicit per-contact toggle does.
+
+/** List the npubs who receive every Private collection you publish. */
+export const privateAudienceList = () => invoke<string[]>('private_audience_list');
+/** Add (`receives = true`) or remove (`receives = false`) a single npub from the Private audience. */
+export const privateAudienceSet = (npub: string, receives: boolean) =>
+	invoke<void>('private_audience_set', { npub, receives });
 
 // ── Watches ───────────────────────────────────────────────────────────────────
 

@@ -193,7 +193,7 @@
 		</label>
 		<label class="check-row">
 			<input type="checkbox" bind:checked={isPrivate} />
-			Private<HintMarker label="Private" text="Only contacts in your trusted groups can open this collection — it is encrypted to each of them personally, so your share code alone won't open it. Not DRM: a trusted contact can still copy what they decrypt." />
+			Private<HintMarker label="Private" text="Only contacts in your Private audience can open this collection — it is encrypted to each of them personally, so your share code alone won't open it. Not DRM: a recipient can still copy what they decrypt." />
 		</label>
 	</div>
 </div>

@@ -165,9 +165,6 @@ export interface ShareSettings {
 export interface Group {
 	name: string;
 	pubkeys: string[];
-	/** Marks the group trusted (M10): its members receive a sealed copy of every Private
-	 *  collection. Absent ⇒ untrusted (a pre-M10 group). */
-	trusted?: boolean;
 	/** Optional user-chosen colour (CSS hex, e.g. "#ff00aa") for the group chip (M13 W5). Absent ⇒
 	 *  no colour (a pre-existing group). */
 	color?: string;

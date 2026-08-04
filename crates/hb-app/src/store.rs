@@ -719,11 +719,6 @@ pub struct Group {
     /// Last modification time — used to order groups most-recently-modified first.
     #[serde(default = "default_group_modified_at")]
     pub modified_at: chrono::DateTime<chrono::Utc>,
-    /// Marks this group as **trusted** (M10): its members' `npub`s receive a per-recipient
-    /// sealed copy of every Private collection. `#[serde(default)]` ⇒ a pre-M10 group loads as
-    /// untrusted (false), so trust is never silently granted on upgrade. Local-only, never shared.
-    #[serde(default)]
-    pub trusted: bool,
     /// Optional user-chosen colour (CSS hex, e.g. `"#ff00aa"`) for the group chip in the UI (M13
     /// W5, item 3). `#[serde(default)]` ⇒ a pre-existing group with no `color` field loads as
     /// `None` (no colour). Local-only, never shared.
@@ -746,6 +741,24 @@ impl DataStore {
 
     pub fn save_groups(&self, groups: &[Group]) -> Result<()> {
         write_json(&self.groups_path(), groups).context("saving groups")
+    }
+
+    // M21 W5: the Private-collection audience is decoupled from groups. `private_audience.json`
+    // holds an explicit `Vec<String>` of npubs who receive every Private collection. Groups are
+    // purely a shorthand for commonality of interests (owner ruling 2026-08-04) — membership never
+    // grants access to Private collections. Migration = start empty; an absent file ⇒ empty vec.
+    pub fn private_audience_path(&self) -> PathBuf {
+        self.base.join("private_audience.json")
+    }
+
+    pub fn load_private_audience(&self) -> Result<Vec<String>> {
+        Ok(read_json_lenient::<Vec<String>>(&self.private_audience_path())
+            .context("loading private_audience")?
+            .unwrap_or_default())
+    }
+
+    pub fn save_private_audience(&self, audience: &[String]) -> Result<()> {
+        write_json(&self.private_audience_path(), audience).context("saving private_audience")
     }
 }
 
@@ -1682,7 +1695,6 @@ mod tests {
                 name: "g".into(),
                 pubkeys: vec![],
                 modified_at: chrono::Utc::now(),
-                trusted: false,
                 color: None,
             }])
             .unwrap();

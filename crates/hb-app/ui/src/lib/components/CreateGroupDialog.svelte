@@ -1,11 +1,15 @@
 <script lang="ts">
 	// New-group dialog (M13 W5 Slice 2). Renders regardless of how many groups already exist — today
 	// every group picker on Contacts is gated behind `groups.length > 0`, which makes creating a
-	// trusted group (the on-ramp to M10 Private collections) an unreachable dead path for a first-time
-	// user. This is the "+ New group" entry point that always works.
+	// group an unreachable dead path for a first-time user. This is the "+ New group" entry point
+	// that always works.
+	//
+	// M21 W5: the "Trusted — receives your Private collections" checkbox is gone. Group membership
+	// no longer grants Private-collection access (owner ruling 2026-08-04); the Private audience is
+	// a separate, per-contact toggle on the contact detail.
 	interface Props {
 		open?: boolean;
-		oncreate?: (detail: { name: string; color: string; trusted: boolean }) => void;
+		oncreate?: (detail: { name: string; color: string }) => void;
 		oncancel?: () => void;
 	}
 
@@ -21,19 +25,17 @@
 
 	let name = $state('');
 	let color = $state(PALETTE[0]);
-	let trusted = $state(false);
 
 	let canCreate = $derived(name.trim().length > 0);
 
 	function reset() {
 		name = '';
 		color = PALETTE[0];
-		trusted = false;
 	}
 
 	function create() {
 		if (!canCreate) return;
-		oncreate?.({ name: name.trim(), color, trusted });
+		oncreate?.({ name: name.trim(), color });
 		reset();
 	}
 
@@ -64,10 +66,6 @@
 			{/each}
 		</div>
 	</div>
-	<label class="check field-spaced">
-		<input type="checkbox" bind:checked={trusted} />
-		Trusted — receives your Private collections
-	</label>
 	{#snippet actions()}
 		<button type="button" class="btn-ghost" onclick={cancel}>Cancel</button>
 		<button type="button" class="btn-primary" disabled={!canCreate} onclick={create}>Create</button>
@@ -87,6 +85,5 @@
 		padding: 0;
 	}
 	.swatch-selected { border-color: var(--fg); box-shadow: 0 0 0 2px var(--bg-elev1); }
-	.check { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--fg-muted); }
 	/* M15 W1/W2: buttons + modal shell unified (app.css .btn system + Modal.svelte). */
 </style>

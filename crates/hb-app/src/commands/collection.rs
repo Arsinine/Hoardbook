@@ -475,28 +475,31 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Collect the recipient pubkeys a **Private** collection must be sealed to: every `npub` in a
-/// group marked `trusted`, parsed + deduped. Errs if there is no trusted audience (publishing a
-/// Private collection to nobody is a mistake, not a silent no-op). An unparseable id (e.g. a legacy
-/// non-Nostr contact) is skipped. Pure — unit-tested without a relay.
+/// Collect the recipient pubkeys a **Private** collection must be sealed to: every `npub` in the
+/// explicit Private audience (`private_audience.json`), parsed + deduped. Errs if the audience is
+/// empty (publishing a Private collection to nobody is a mistake, not a silent no-op). An
+/// unparseable id (e.g. a legacy non-Nostr contact) is skipped. Pure — unit-tested without a relay.
+///
+/// **M21 W5:** the audience is decoupled from contact groups (owner ruling 2026-08-04). Joining a
+/// group or topic never enrols anyone here — only the explicit per-contact "Receives my Private
+/// collections" toggle does. This closed the defect where filing a contact under a trusted group
+/// silently made them a Private recipient.
 pub(crate) fn private_recipients(store: &DataStore) -> Result<Vec<nostr::PublicKey>, String> {
     use std::collections::BTreeSet;
-    let groups = store.load_groups().map_err(cmd_err)?;
+    let audience = store.load_private_audience().map_err(cmd_err)?;
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut out: Vec<nostr::PublicKey> = Vec::new();
-    for g in groups.iter().filter(|g| g.trusted) {
-        for npub in &g.pubkeys {
-            if seen.insert(npub.clone()) {
-                if let Ok(pk) = hb_core::identity::parse_npub(npub) {
-                    out.push(pk);
-                }
+    for npub in &audience {
+        if seen.insert(npub.clone()) {
+            if let Ok(pk) = hb_core::identity::parse_npub(npub) {
+                out.push(pk);
             }
         }
     }
     if out.is_empty() {
         return Err(
-            "This collection is Private, but you have no trusted contacts. Mark a contact group as \
-             trusted (and add members) before publishing a Private collection."
+            "This collection is Private, but you haven't chosen anyone to receive it. Open a \
+             contact and turn on 'Receives my Private collections' before publishing."
                 .into(),
         );
     }
@@ -504,9 +507,10 @@ pub(crate) fn private_recipients(store: &DataStore) -> Result<Vec<nostr::PublicK
 }
 
 /// Publish a collection's listing. **Branches on visibility (M10):** a *Public* collection is
-/// encrypted once under the account browse-key (M3); a *Private* collection is sealed per trusted
-/// `npub` and gift-wrapped — the browse-key is **not** used and the public teaser is **not** touched
-/// (no private holding leaks). Marks it published locally and (public only) keeps a published
+/// encrypted once under the account browse-key (M3); a *Private* collection is sealed per recipient
+/// in the Private audience (M21 W5) and gift-wrapped — the browse-key is **not** used and the public
+/// teaser is **not** touched (no private holding leaks). Marks it published locally and (public only)
+/// keeps a published
 /// teaser's content_types current.
 pub(crate) async fn publish_collection_inner(
     slug: &str,
@@ -713,8 +717,9 @@ pub async fn publish_collection(
 /// `.hbmanifest` artifact (M16 W4). Its plaintext is the SAME canonical full listing JSON the publish
 /// path feeds to `truncate_listing`, so an imported manifest's `snapshot_fingerprint` matches the
 /// teaser's exactly (the browse-side staleness gate). Private collections are refused: they never
-/// truncate (trusted recipients already receive the whole sealed listing) and are sealed per recipient,
-/// not under the browse-key this envelope uses. Pure w.r.t. the relay — L1-testable with a temp store.
+/// truncate (Private-audience recipients already receive the whole sealed listing) and are sealed per
+/// recipient, not under the browse-key this envelope uses. Pure w.r.t. the relay — L1-testable with a
+/// temp store.
 pub(crate) fn build_slug_manifest(
     slug: &str,
     store: &DataStore,
@@ -2308,53 +2313,67 @@ mod tests {
     }
 
     #[test]
-    fn private_recipients_requires_an_explicit_trusted_group() {
+    fn private_recipients_requires_an_explicit_audience() {
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
-        // No groups → Err (a Private collection with no audience is a mistake).
+        // No audience file → Err (a Private collection with no audience is a mistake).
         assert!(private_recipients(&store).is_err());
-        // An UN-trusted group with members is still not an audience — trust is explicit.
+        // A group with members is still not an audience — the audience is a separate, explicit list.
         let a = hb_core::Identity::generate().npub();
         store
             .save_groups(&[crate::store::Group {
                 name: "friends".into(),
                 pubkeys: vec![a],
                 modified_at: chrono::Utc::now(),
-                trusted: false,
                 color: None,
             }])
             .unwrap();
-        assert!(private_recipients(&store).is_err(), "an untrusted group is not a recipient set");
+        assert!(private_recipients(&store).is_err(), "a group is not a recipient set (M21 W5)");
     }
 
     #[test]
-    fn private_recipients_collects_trusted_deduped_skips_junk() {
+    fn private_recipients_collects_audience_deduped_skips_junk() {
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
         let a = hb_core::Identity::generate();
         let b = hb_core::Identity::generate();
+        // The audience is an explicit list of npubs (M21 W5) — no group affiliation involved.
+        // a, b, and a legacy non-Nostr id that must be skipped (not crash); a duplicated → collapsed.
         store
-            .save_groups(&[
-                crate::store::Group {
-                    name: "inner".into(),
-                    // a, b, and a legacy non-Nostr id that must be skipped (not crash).
-                    pubkeys: vec![a.npub(), b.npub(), "hb1_legacy_junk".into()],
-                    modified_at: chrono::Utc::now(),
-                    trusted: true,
-                    color: None,
-                },
-                crate::store::Group {
-                    name: "also".into(),
-                    pubkeys: vec![a.npub()], // duplicate of `a` across groups → collapsed
-                    modified_at: chrono::Utc::now(),
-                    trusted: true,
-                    color: None,
-                },
-            ])
+            .save_private_audience(&[a.npub(), b.npub(), "hb1_legacy_junk".into(), a.npub()])
             .unwrap();
         let recips = private_recipients(&store).unwrap();
         assert_eq!(recips.len(), 2, "two distinct valid npubs (junk skipped, dup collapsed)");
         assert!(recips.contains(&a.public_key()) && recips.contains(&b.public_key()));
+    }
+
+    /// M21 W5 key regression: adding a contact to a group (the data mutation `groups_assign` and
+    /// `contact_update_groups` perform) does NOT change `private_recipients`. Before W5 this would
+    /// have failed — the recipients were a live query over trusted groups, so filing a contact
+    /// silently enrolled them as a Private recipient.
+    #[test]
+    fn private_recipients_unaffected_by_group_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let a = hb_core::Identity::generate();
+        let b = hb_core::Identity::generate();
+        // Seed the audience with `a` only.
+        store.save_private_audience(&[a.npub()]).unwrap();
+        // Add `b` to a group (the `groups_assign` mutation).
+        let now = chrono::Utc::now();
+        store
+            .save_groups(&[crate::store::Group {
+                name: "friends".into(),
+                pubkeys: vec![b.npub()],
+                modified_at: now,
+                color: None,
+            }])
+            .unwrap();
+        // Audience is still just `a` — `b` is in a group, not the recipient set.
+        let recips = private_recipients(&store).unwrap();
+        assert_eq!(recips.len(), 1, "group membership must not add recipients (M21 W5)");
+        assert!(recips.contains(&a.public_key()));
+        assert!(!recips.contains(&b.public_key()), "b is in a group but NOT in the audience");
     }
 
     #[test]
