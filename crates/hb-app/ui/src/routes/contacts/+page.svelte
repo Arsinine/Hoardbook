@@ -15,6 +15,11 @@
 	import { NOT_DRM_NOTE, receivesPrivate } from '$lib/private-collections-view.js';
 	import { peerAccessBadge, summarizeCollectionsSize } from '$lib/browse-view.js';
 	import { onlineChipView } from '$lib/online-chip.js';
+	// M21 W4 — the petnameFor collision warning is the card-face security control (the coloured
+	// fingerprint is only ~36 bits and grindable; this badge is what actually flags impersonation).
+	import { petnameFor } from '$lib/identity-display.js';
+	// M21 W4 — fixed word→hue table for the coloured fingerprint (rendering-only; Rust picks the word).
+	import { fingerprintWordColor } from '$lib/fingerprint-colors.js';
 	// M17 W5 — presence honesty: "checked {t}" (our cache) vs "Last seen {t}" (their beacon).
 	import { PRESENCE_TICK_MS, checkedLabel, freshIndex, newestSeen, presenceView, type PresenceView } from '$lib/presence-view.js';
 	import { relayWhyHint } from '$lib/relay-health.js';
@@ -266,9 +271,34 @@
 	let refreshing: string | null = $state(null);
 	let menuOpenFor: string | null = $state(null);
 	let menuAnchor: HTMLElement | undefined = $state();
+	// M21 W4 — bio "more ⌄" expansion on the card face. Per-npub so each card expands independently.
+	// Cleared when the card is opened via `›` (the detail's full bio replaces the clamp; two controls
+	// revealing the same text would be redundant).
+	let bioExpanded: Record<string, boolean> = $state({});
+
+	function toggleBio(npub: string) {
+		bioExpanded[npub] = !bioExpanded[npub];
+		bioExpanded = { ...bioExpanded };
+	}
 
 	function toggleDetail(npub: string) {
-		detailExpanded = detailExpanded === npub ? null : npub;
+		const opening = detailExpanded !== npub;
+		detailExpanded = opening ? npub : null;
+		// M21 W4 — opening the detail reveals the full bio there, so the face's `more ⌄` control
+		// must collapse (the two controls would otherwise reveal the same text). Reset only on open;
+		// closing the detail leaves the bio as-is.
+		if (opening && bioExpanded[npub]) {
+			bioExpanded[npub] = false;
+			bioExpanded = { ...bioExpanded };
+		}
+	}
+
+	// M21 W4 — the npub came off the card face (behaviour 1); "Copy npub" is its surviving home.
+	async function copyNpub(npub: string) {
+		try {
+			await navigator.clipboard.writeText(npub);
+			toast('npub copied');
+		} catch (e) { toast(String(e), 'error'); }
 	}
 
 	function openRowMenu(npub: string, anchor: HTMLElement) {
@@ -297,11 +327,6 @@
 		} catch (e) {
 			toast(String(e), 'error');
 		}
-	}
-
-
-	function shortId(hb_id: string) {
-		return hb_id.length > 14 ? hb_id.slice(0, 8) + '…' + hb_id.slice(-4) : hb_id;
 	}
 
 	// M17 W5 — two clocks, two labels. `checkedLabel` is OUR cache age (last_fetched); `presenceView`
@@ -431,9 +456,23 @@
 	{@const initial = name[0]?.toUpperCase() ?? '?'}
 	{@const hue = avatarHue(initial)}
 	{@const peerGroups = contactGroups(peer.npub)}
-	{@const stale = isStale(peer) && !peer.online}
 	{@const badge = peerAccessBadge(peer)}
-	{@const sizeSummary = !badge.locked ? summarizeCollectionsSize(peer.collections) : null}
+	{@const fp = peer.fingerprint}
+	<!-- M21 W4 behaviour 2: presence + cache-age are INDEPENDENT. The pill always answers "are they
+	     online" (Stale no longer replaces Offline — it stops reporting presence). The cold-cache marker
+	     (isStale && !online) renders in the meta line as an amber "checked {t} ↻" control, not a verdict. -->
+	{@const coldCache = isStale(peer) && !peer.online}
+	<!-- M21 W4 behaviour 6: public collections only — the popover list AND the face count read the same
+	     filtered set so the number and the list can never disagree (a disclosure boundary, not cosmetic). -->
+	{@const publicCollections = peer.collections.filter(c => c.visibility !== 'Private')}
+	{@const pubCount = publicCollections.length}
+	{@const sizeSummary = !badge.locked ? summarizeCollectionsSize(publicCollections) : null}
+	<!-- M21 W4 behaviour 5: the petnameFor collision warning goes on the card face. The fingerprint is
+	     ~36 bits and grindable, so this red-outlined badge is the actual security control. -->
+	{@const contactsForLabel = $contacts.map(c => ({ npub: c.npub, petname: c.petname ?? c.profile?.display_name ?? '' }))}
+	{@const collision = petnameFor(peer.npub, name, contactsForLabel).warning}
+	{@const bio = peer.profile?.bio?.trim()}
+	{@const bioOpen = bioExpanded[peer.npub] ?? false}
 	{@const isOpen = detailExpanded === peer.npub}
 	<div class="contact-block" class:open={isOpen}>
 		<!-- devtest v0.12.1 #4: double-click a contact to open the conversation in Chat. The chevron,
@@ -446,30 +485,36 @@
 			<button class="chevron-btn" onclick={() => toggleDetail(peer.npub)} aria-expanded={isOpen} aria-label="Toggle details">
 				<span class="chevron" class:chevron-open={isOpen}>{@html icons.chevronDown}</span>
 			</button>
-			<div class="avatar-wrap">
+			<div class="avatar-wrap" style={fp ? `box-shadow: 0 0 0 2px var(--bg-elev1), 0 0 0 4px ${fp.colorHex}` : undefined}>
 				<Avatar letter={initial} size={34} {hue} picture={peer.profile?.picture} />
 				{#if badge.locked}
 					<span class="lock-overlay" title={badge.hint}>🔒</span>
 				{/if}
 			</div>
 			<div class="contact-info">
+				<!-- Row 1: name · presence pill · (offline) seen · spacer · actions.
+				     M21 W4 behaviour 1: the npub is OFF the face (the pill takes its slot). The npub
+				     survives in the ⋯ menu ("Copy npub") and in the expanded detail. -->
 				<div class="name-row">
 					<span class="peer-name">{name}</span>
+					{#if collision}
+						<span class="collision-badge" title={collision}>⚠ {collision}</span>
+					{/if}
 					{#if peer.online}
 						<span class="pill pill-online"><span class="pill-dot"></span></span>
-					{:else if stale}
-						<span class="pill pill-stale" title="Last fetched {new Date(peer.last_fetched).toLocaleDateString()}">Stale</span>
 					{:else}
 						<span class="pill pill-offline">Offline</span>
 					{/if}
-					<!-- W5: THEIR presence (only when offline — the pill already says "online"), then
-					     OUR cache age, labelled as the separate thing it is. -->
+					<!-- W5: THEIR presence (only when offline — the pill already says "online"). -->
 					{#if !peer.online}
 						<span class="last-seen">{presenceOf(peer).lastSeen}</span>
 					{/if}
-					<span class="last-checked">{checkedLabel(peer.last_fetched, Date.now())}</span>
 					<div style="flex:1"></div>
-					<a class="btn-default btn-xs" href="/browse?peer={peer.npub}">Browse</a>
+					{#if badge.locked}
+						<button class="btn-default btn-xs ask-access-btn" onclick={() => goto('/chat?peer=' + peer.npub + '&intent=ask-access' + (peer.petname ? '&petname=' + encodeURIComponent(peer.petname) : ''))}>Ask for access</button>
+					{:else}
+						<a class="btn-default btn-xs" href="/browse?peer={peer.npub}">Browse</a>
+					{/if}
 					<button class="btn-default btn-xs" onclick={() => goto('/chat?peer=' + peer.npub)}>Message</button>
 					<button
 						class="row-menu-btn"
@@ -479,28 +524,71 @@
 						onclick={(e) => openRowMenu(peer.npub, e.currentTarget)}
 					>⋯</button>
 				</div>
+				<!-- Row 2: coloured fingerprint (behaviour 3). Absent for a pre-fingerprint stored
+				     contact (behaviour 4: no ring, no word row, card otherwise unchanged). -->
+				{#if fp}
+					<div class="fp-row">
+						{#each fp.words as w, i}
+							{#if i > 0}<span class="fp-sep">·</span>{/if}
+							<span class="fp-word" style={fingerprintWordColor(w) ? `color:${fingerprintWordColor(w)}` : undefined}>{w}</span>
+						{/each}
+					</div>
+				{/if}
+				<!-- Row 3: bio, clamped to 2 lines with a `more ⌄` control (behaviour 7: the detail's
+				     duplicate bio paragraph is gone, so this clamp is the only place the bio previews). -->
+				{#if bio}
+					<div class="bio-row" class:bio-expanded={bioOpen || isOpen}>
+						<p class="card-bio">{bio}</p>
+						{#if !bioOpen && !isOpen}
+							<button class="bio-more" onclick={() => toggleBio(peer.npub)}>more ⌄</button>
+						{/if}
+					</div>
+				{:else}
+					<div class="bio-row bio-empty"><span class="no-bio">No bio published.</span></div>
+				{/if}
+				<!-- Row 4: group chips · N collections (hoverable, public only) · size · cold-cache. -->
 				<div class="contact-sub-row">
-					<div class="mono">{shortId(peer.npub)}</div>
-					{#if peer.collections.length > 0}<span class="sub-dot">·</span><span class="sub-meta">{peer.collections.length} collection{peer.collections.length !== 1 ? 's' : ''}</span>{/if}
+					{#each peerGroups as gname}
+						<span class="group-pill">{gname}</span>
+					{/each}
+					{#if peerGroups.length > 0}<span class="sub-dot">·</span>{/if}
+					{#if pubCount > 0}
+						<span class="sub-dot">·</span>
+						<!-- M21 W4 behaviour 6: `▼` caret signals hoverable; :focus-within makes it
+						     keyboard-reachable too; public collections ONLY (private ones live in the
+						     detail, never in this popover or this count). -->
+						<span class="collections-popover-wrap" tabindex="0" role="button" aria-label="Show public collections">
+							<span class="sub-meta collections-trigger">{pubCount} collection{pubCount !== 1 ? 's' : ''} ▼</span>
+							<div class="collections-popover" role="dialog">
+								{#each publicCollections as col (col.slug)}
+									<div class="cpop-row" title={col.description ?? ''}>
+										<span class="cpop-alias">{col.path_alias}</span>
+										<span class="cpop-size">{col.est_size ?? '—'}</span>
+										<span class="cpop-desc">{col.description ?? 'No description'}</span>
+									</div>
+								{/each}
+								<div class="cpop-footer">public collections only — private ones live in the detail</div>
+							</div>
+						</span>
+					{/if}
 					{#if !badge.locked}
 						{#if sizeSummary}<span class="sub-dot">·</span><span class="sub-meta">{sizeSummary}</span>
 						{:else if peer.profile?.est_size}<span class="sub-dot">·</span><span class="sub-meta">~{peer.profile.est_size}</span>{/if}
 					{/if}
+					<!-- Cold cache: an amber "checked {t} ↻" CONTROL (clickable to refresh), only when
+					     isStale && !online. When the cache is warm this element is absent from the card. -->
+					{#if coldCache}
+						<span class="sub-dot">·</span>
+						<button class="cold-cache" onclick={() => handleRefresh(peer.npub)} disabled={refreshing === peer.npub} title="Refetch this contact">{checkedLabel(peer.last_fetched, nowMs)} ↻</button>
+					{/if}
 				</div>
-				{#if badge.locked}
-					<div class="access-hint">
-						<span>{badge.hint}</span>
-						<button class="btn-default btn-xs ask-access-btn" onclick={() => goto('/chat?peer=' + peer.npub + '&intent=ask-access' + (peer.petname ? '&petname=' + encodeURIComponent(peer.petname) : ''))}>Ask for access</button>
-					</div>
-				{/if}
 			</div>
 		</div>
 
 		{#if isOpen}
 			<div class="contact-detail">
-				{#if peer.profile?.bio}
-					<p class="card-bio">{peer.profile.bio}</p>
-				{/if}
+				<!-- M21 W4 behaviour 7: the detail's OWN bio paragraph is GONE (the clamped face bio
+				     replaced it — keeping both would duplicate the same text behind two controls). -->
 				{#if (peer.profile?.content_types?.length ?? 0) > 0}
 					<div class="badge-row-sm">
 						{#each peer.profile?.content_types ?? [] as ct (ct)}
@@ -615,6 +703,7 @@
 	<!-- M15 W5: per-row overflow menu (only one open at a time via menuOpenFor). -->
 	<OverflowMenu open={menuOpenFor === peer.npub} anchor={menuAnchor} onclose={() => (menuOpenFor = null)}>
 		<button class="menu-item" onclick={() => { goto('/chat?peer=' + peer.npub); menuOpenFor = null; }}>Message</button>
+		<button class="menu-item" onclick={() => { copyNpub(peer.npub); menuOpenFor = null; }}>Copy npub</button>
 		<button class="menu-item" onclick={() => { handleRefresh(peer.npub); menuOpenFor = null; }} disabled={refreshing === peer.npub}>
 			{refreshing === peer.npub ? 'Refreshing…' : 'Refresh'}
 		</button>
@@ -906,11 +995,8 @@
 
 	.name-row { display: flex; gap: 8px; align-items: center; margin-bottom: 3px; flex-wrap: wrap; }
 	.peer-name { font-weight: 600; font-size: 15px; letter-spacing: -0.2px; }
-	.mono { font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); }
 
 	.last-seen { font-size: 10.5px; color: var(--fg-dim); }
-	/* W5: our cache age sits one step quieter than their last-seen — it is about us, not them. */
-	.last-checked { font-size: 10.5px; color: var(--fg-dim); opacity: 0.72; }
 
 	.contact-sub-row {
 		display: flex; align-items: center; gap: 5px;
@@ -929,7 +1015,6 @@
 		background: var(--bg-elev1);
 		box-shadow: 0 0 0 1px var(--border);
 	}
-	.access-hint { font-size: 10.5px; color: var(--fg-dim); margin-top: 2px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 	/* M17 W2: the locked contact card's "Ask for access" affordance turns the dead-end hint into a
 	   next step → the chat ask-access deep-link (no wire change, just a prefilled draft). */
 	.ask-access-btn { flex-shrink: 0; }
@@ -940,6 +1025,59 @@
 		margin: 4px 0 0;
 		overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical;
 	}
+
+	/* M21 W4 — fingerprint word row + collision badge + bio clamp control + collections popover.
+	   The .card-bio above keeps its 2-line clamp; `.bio-expanded .card-bio` lifts the clamp so the
+	   `more ⌄` control reveals the full text in place. */
+	.fp-row { display: flex; gap: 4px; align-items: baseline; margin-top: 2px; flex-wrap: wrap; }
+	.fp-word { font-family: var(--font-mono); font-size: 11px; font-weight: 600; }
+	.fp-sep { color: var(--fg-dim); font-size: 11px; }
+	.collision-badge {
+		font-size: 10px; padding: 1px 6px; border-radius: 4px;
+		border: 1px solid color-mix(in oklch, var(--error) 60%, transparent);
+		color: var(--error); font-weight: 500;
+	}
+	.bio-row { display: flex; gap: 6px; align-items: flex-end; margin-top: 2px; }
+	.bio-row .card-bio { margin: 0; }
+	.bio-expanded .card-bio { -webkit-line-clamp: unset; line-clamp: unset; overflow: visible; }
+	.bio-more {
+		background: transparent; border: none; cursor: pointer; flex-shrink: 0;
+		font-size: 10.5px; color: var(--fg-dim); padding: 0 0 2px 0; font-family: var(--font-ui);
+		white-space: nowrap;
+	}
+	.bio-more:hover { color: var(--fg-muted); }
+	.bio-empty { font-size: 12px; }
+	.no-bio { color: var(--fg-dim); font-style: italic; font-size: 11.5px; }
+
+	/* M21 W4 behaviour 6 — `N collections` hoverable. ▼ caret signals it; :focus-within makes it
+	   keyboard-reachable. Public collections ONLY (disclosure boundary). */
+	.collections-popover-wrap { position: relative; display: inline-flex; }
+	.collections-trigger { cursor: default; }
+	.collections-popover {
+		display: none; position: absolute; top: 100%; left: 0; z-index: var(--z-menu);
+		min-width: 220px; margin-top: 6px;
+		background: var(--bg-elev2); border: 1px solid var(--border); border-radius: 8px;
+		padding: 6px; box-shadow: 0 8px 24px oklch(0 0 0 / 0.3);
+	}
+	.collections-popover-wrap:hover .collections-popover,
+	.collections-popover-wrap:focus-within .collections-popover { display: block; }
+	.cpop-row { display: flex; flex-direction: column; gap: 1px; padding: 4px 6px; border-radius: 5px; }
+	.cpop-row:hover { background: var(--bg-elev3); }
+	.cpop-alias { font-size: 12px; font-weight: 500; color: var(--fg); }
+	.cpop-size { font-size: 10.5px; color: var(--fg-muted); font-feature-settings: 'tnum'; }
+	.cpop-desc { font-size: 11px; color: var(--fg-muted); }
+	.cpop-row:hover .cpop-desc { color: var(--fg); }
+	.cpop-footer { font-size: 10px; color: var(--fg-dim); padding: 4px 6px 2px; border-top: 1px solid var(--divider); margin-top: 4px; }
+
+	/* M21 W4 behaviour 2 — cold-cache amber control (clickable to refresh, not a verdict pill). */
+	.cold-cache {
+		font-family: var(--font-ui); font-size: 10.5px; cursor: pointer;
+		background: transparent; border: none; padding: 0;
+		color: oklch(0.75 0.12 60);
+	}
+	.cold-cache:hover:not(:disabled) { color: oklch(0.82 0.14 60); text-decoration: underline; }
+	.cold-cache:disabled { opacity: 0.6; cursor: default; }
+
 
 	/* Content-type badges + profile tags */
 	.badge-row-sm { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
@@ -1016,10 +1154,6 @@
 	.pill-offline {
 		color: var(--fg-muted);
 		background: color-mix(in oklch, var(--fg-muted) 12%, transparent);
-	}
-	.pill-stale {
-		color: oklch(0.75 0.12 60);
-		background: oklch(0.22 0.06 60 / 0.4);
 	}
 
 	/* Group row on contact cards */
