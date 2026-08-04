@@ -281,6 +281,26 @@ pub fn run() {
             // uses), and it now exists.
             logging::install(&data_dir);
 
+            // M21 W1 — install the process-level rustls CryptoProvider before any network task
+            // can run. The lock resolves rustls with BOTH providers compiled in (`ring` via
+            // nostr-sdk/tungstenite, `aws-lc-rs` via iroh/quinn), so rustls cannot auto-pick a
+            // default and any provider-less TLS use panics at
+            // `rustls-0.23.38/src/crypto/mod.rs:249` (the `.expect()` inside
+            // `get_default_or_install_from_crate_features`, which fires when neither
+            // auto-selection nor a pre-installed default yields exactly one provider). The
+            // v0.12.11 log named this as the launch storm: 12 panics in 32 s, then a race winner
+            // installed a default and every subsequent connect succeeded. Installing `ring`
+            // deterministically removes that race.
+            //
+            // `ring` (not `aws-lc-rs`) because iroh configures its TLS explicitly via its
+            // `tls-ring` feature and is unaffected by the process default; nostr-sdk/tungstenite
+            // is the path that consumes it. This runs before `spawn_background_tasks` and before
+            // the ticket-outstanding iroh bind below, so no task in this process can TLS-handshake
+            // without a provider installed. `install_default` returns `Err` when a provider is
+            // already installed — not a failure for us, hence `let _ =`. Same idiom as
+            // `wan_it::run`.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+
             let store = DataStore::new(data_dir);
 
             let identity: SharedIdentity = Arc::new(RwLock::new(None));

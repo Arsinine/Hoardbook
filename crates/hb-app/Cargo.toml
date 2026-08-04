@@ -82,10 +82,15 @@ iroh    = { version = "1.0", default-features = false, features = ["tls-ring"] }
 # RelayClient).
 notify      = "6"
 async-trait = "0.1"
-# M20 W6 — hb-wan-it only. The lock resolves rustls with BOTH providers enabled (iroh `tls-ring` +
-# reqwest `rustls`/aws-lc-rs), so rustls cannot auto-pick a process default; the production app gets
-# one installed as a side effect of binding the iroh endpoint at startup. The harness never binds
-# iroh, so it must install ring explicitly before any `wss://` relay connect (wan_it::run).
+# rustls is an UNCONDITIONAL dependency: both the production app (lib.rs setup closure) and the
+# hb-wan-it harness (wan_it::run) call `rustls::crypto::ring::default_provider().install_default()`
+# at startup. The lock resolves rustls with BOTH providers compiled in (iroh `tls-ring` brings
+# `ring`, reqwest `rustls` brings `aws-lc-rs`), so rustls cannot auto-pick a process default and
+# any provider-less TLS use panics (rustls 0.23 `crypto/mod.rs` CryptoProvider resolution). The
+# 2026-08-04 v0.12.11 log falsified the earlier claim that the production app got a provider as a
+# side effect of binding the iroh endpoint — that was a RACE the app lost 12 times in 32 s at
+# launch. The explicit install in lib.rs is load-bearing for production, not redundant; do not
+# remove it on the assumption that iroh installs one.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
