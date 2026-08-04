@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { follow, refreshContact, unfollowContact, setContactTags, groupsGet, groupsCreate, groupsDelete, contactUpdateGroups, groupsSetTrusted, browsePrivateCollections, onlineCount, relayStatus, getContacts, type OnlineCount, type RelayHealth } from '$lib/api.js';
+	import { follow, refreshContact, unfollowContact, setContactTags, groupsGet, groupsCreate, groupsDelete, contactUpdateGroups, browsePrivateCollections, onlineCount, relayStatus, getContacts, privateAudienceList, privateAudienceSet, type OnlineCount, type RelayHealth } from '$lib/api.js';
 	import { contacts, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
@@ -12,7 +12,7 @@
 	import AZRail from '$lib/components/AZRail.svelte';
 	import type { CachedPeer, Collection, Group } from '$lib/types.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
-	import { NOT_DRM_NOTE, isTrusted } from '$lib/private-collections-view.js';
+	import { NOT_DRM_NOTE, receivesPrivate } from '$lib/private-collections-view.js';
 	import { peerAccessBadge, summarizeCollectionsSize } from '$lib/browse-view.js';
 	import { onlineChipView } from '$lib/online-chip.js';
 	// M17 W5 — presence honesty: "checked {t}" (our cache) vs "Last seen {t}" (their beacon).
@@ -73,37 +73,42 @@
 		} catch { /* non-fatal — relays may be unreachable */ }
 	}
 
-	// Mark a contact group trusted/untrusted (M10). Trusted groups receive every Private collection
-	// on the next publish; un-trusting revokes on the next republish only (not retroactively).
-	async function toggleTrusted(g: Group) {
+	// M21 W5: the Private-collection audience — an explicit per-contact list, decoupled from groups
+	// (owner ruling 2026-08-04). Each npub here receives a sealed copy of every Private collection.
+	let privateAudience: string[] = $state([]);
+
+	async function loadPrivateAudience() {
+		try { privateAudience = await privateAudienceList(); } catch { /* non-fatal */ }
+	}
+
+	// Toggle whether a contact receives Private collections (M21 W5). Idempotent on the backend;
+	// a removed recipient stops receiving on the *next* republish only (not retroactively — the
+	// honest "not DRM" caveat, surfaced via NOT_DRM_NOTE).
+	async function toggleReceivesPrivate(npub: string) {
+		const next = !receivesPrivate(npub, privateAudience);
 		try {
-			await groupsSetTrusted(g.name, !isTrusted(g));
-			await loadGroups();
+			await privateAudienceSet(npub, next);
+			await loadPrivateAudience();
 		} catch (e) { toast(String(e), 'error'); }
 	}
 
-	// Delete a group (devtest #2) — the backend (groups_delete) moves members to Ungrouped; a
-	// trusted group additionally stops sealing them Private collections on the next publish, so both
-	// the groups strip and the Private-collections recipient view need a refresh.
+	// Delete a group (devtest #2) — the backend (groups_delete) moves members to Ungrouped.
 	async function handleDeleteGroup(g: Group) {
 		try {
 			await groupsDelete(g.name);
 			await loadGroups();
-			await loadPrivate();
 			toast(`Group "${g.name}" deleted`);
 		} catch (e) { toast(String(e), 'error'); }
 	}
 
-	// "+ New group" (M13 W5) — renders regardless of how many groups already exist, so a trusted
-	// group (the on-ramp to M10 Private collections) is always reachable, not just from an existing
-	// contact's group picker.
+	// "+ New group" (M13 W5) — renders regardless of how many groups already exist, so a group is
+	// always creatable, not just from an existing contact's group picker.
 	let createGroupOpen = $state(false);
 
-	async function handleCreateGroup(detail: { name: string; color: string; trusted: boolean }) {
-		const { name, color, trusted } = detail;
+	async function handleCreateGroup(detail: { name: string; color: string }) {
+		const { name, color } = detail;
 		try {
 			await groupsCreate(name, color);
-			if (trusted) await groupsSetTrusted(name, true);
 			await loadGroups();
 			createGroupOpen = false;
 			toast(`Group "${name}" created`);
@@ -163,6 +168,7 @@
 	onMount(() => {
 		loadGroups();
 		loadPrivate();
+		loadPrivateAudience();
 		refreshOnline();
 		onlinePollTimer = setInterval(refreshOnline, ONLINE_POLL_VISIBLE_MS);
 		// Refresh contacts on page load, but bounded: skip freshly-refreshed contacts and cap how many
@@ -577,6 +583,20 @@
 					{/if}
 				</div>
 
+				<!-- M21 W5: the Private-collection audience is a per-contact toggle, decoupled from
+				     groups (owner ruling 2026-08-04). Ticking it seals every Private collection to
+				     this contact on the next publish; unticking revokes on the next republish only. -->
+				<div class="group-row">
+					<label class="audience-check">
+						<input
+							type="checkbox"
+							checked={receivesPrivate(peer.npub, privateAudience)}
+							onchange={() => toggleReceivesPrivate(peer.npub)}
+						/>
+						Receives my Private collections
+					</label>
+				</div>
+
 				<!-- Private collections sealed to me (M10) — not served by the Browse deep-link, so
 				     they stay here in the detail area. Absent (not "locked") for a non-trusted viewer. -->
 				{#if (privateByAuthor[peer.npub] ?? []).length > 0}
@@ -612,28 +632,26 @@
 			<div class="empty">No contacts yet. Use “+ Add contact” to find someone by ID or discover hoarders.</div>
 		{:else}
 			{#if view === 'groups'}
-				<!-- Trusted groups (M10): mark a group trusted to seal Private collections to its members.
-				     Groups-view-only — this strip is the group-management surface, so it belongs beside the
-				     view it organizes; the Name view has no use for it. -->
-				<div class="trusted-groups">
-					<div class="trusted-label">Trusted groups <span class="trusted-hint">— receive your Private collections</span></div>
-					<div class="trusted-chips">
+				<!-- Groups-view management strip (M21 W5): organisational only — colour is the sole
+				     marker, no trust checkbox (decoupled from Private collections by owner ruling
+				     2026-08-04). Delete moves members to Ungrouped; "+ New group" stays reachable
+				     here so the groups view is self-sufficient, not just from a contact's picker. -->
+				<div class="group-strip">
+					<div class="group-strip-label">Groups</div>
+					<div class="group-strip-chips">
 						{#each groups as g (g.name)}
-							<span class="trusted-chip-wrap">
-								<label class="trusted-chip" class:is-trusted={isTrusted(g)}>
-									<input type="checkbox" checked={isTrusted(g)} onchange={() => toggleTrusted(g)} />
+							<span class="group-chip-wrap">
+								<span class="group-chip" style={g.color ? `border-color:${g.color}; color:${g.color}` : ''}>
 									{g.name}
-								</label>
+								</span>
 								<ConfirmButton
 									label="×"
-									confirmText={isTrusted(g)
-										? `Delete "${g.name}"? Its members stop receiving your Private collections on your next publish.`
-										: `Delete "${g.name}"? Members fall back to Ungrouped.`}
+									confirmText={`Delete "${g.name}"? Members fall back to Ungrouped.`}
 									onconfirm={() => handleDeleteGroup(g)}
 								/>
 							</span>
 						{/each}
-						<button type="button" class="trusted-chip trusted-chip-add" onclick={() => (createGroupOpen = true)}>+ New group</button>
+						<button type="button" class="group-chip group-chip-add" onclick={() => (createGroupOpen = true)}>+ New group</button>
 					</div>
 				</div>
 			{/if}
@@ -792,29 +810,28 @@
 		text-transform: uppercase; letter-spacing: 1.2px; font-weight: 600;
 	}
 
-	/* M10 — trusted-groups strip + private-collection display */
-	.trusted-groups { padding: 8px 0 16px; display: flex; flex-direction: column; gap: 6px; }
-	.trusted-label { font-size: 11.5px; font-weight: 600; color: var(--fg-muted); }
-	.trusted-hint { font-weight: 400; color: var(--fg-dim); }
-	.trusted-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-	.trusted-chip-wrap { display: inline-flex; align-items: center; gap: 2px; }
-	.trusted-chip {
+	/* M21 W5 — groups-view management strip (organisational, no trust) + per-contact
+	   Private-audience toggle + private-collection display. The strip CSS is the old trusted-strip
+	   CSS renamed off the `trusted-` prefix, minus `.is-trusted` (trust is gone). */
+	.group-strip { padding: 8px 0 16px; display: flex; flex-direction: column; gap: 6px; }
+	.group-strip-label { font-size: 11.5px; font-weight: 600; color: var(--fg-muted); }
+	.group-strip-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+	.group-chip-wrap { display: inline-flex; align-items: center; gap: 2px; }
+	.group-chip {
 		display: inline-flex; align-items: center; gap: 5px;
 		padding: 3px 9px; border: 1px solid transparent; border-radius: 999px;
-		font-size: 12px; cursor: pointer; color: var(--fg-muted);
+		font-size: 12px; color: var(--fg-muted);
 	}
-	.trusted-chip.is-trusted {
-		border-color: var(--accent);
-		color: var(--accent);
-		background: color-mix(in oklch, var(--accent) 12%, transparent);
+	.group-chip-add {
+		background: transparent; border-style: dashed; cursor: pointer;
+		font-family: var(--font-ui); color: var(--fg-dim);
 	}
-	.trusted-chip-add {
-		background: transparent;
-		border-style: dashed;
-		font-family: var(--font-ui);
-		color: var(--fg-dim);
+	.group-chip-add:hover { border-color: var(--accent); color: var(--accent); }
+	.audience-check {
+		display: inline-flex; align-items: center; gap: 4px;
+		font-size: 11.5px; color: var(--fg-muted); cursor: pointer;
 	}
-	.trusted-chip-add:hover { border-color: var(--accent); color: var(--accent); }
+	.audience-check input { margin: 0; cursor: pointer; }
 	.private-section { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
 	.private-badge {
 		font-size: 9.5px; padding: 1px 6px; border-radius: 999px; letter-spacing: 0.5px;

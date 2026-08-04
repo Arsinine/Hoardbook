@@ -51,11 +51,11 @@ pub(crate) fn private_listing_to_collection(listing_json: &str) -> Result<Collec
 /// them by hand.
 ///
 /// **Intentional send/receive asymmetry (chorus M10).** *Sending* a Private collection seals it to
-/// the members of your **trusted groups**; *receiving* one accepts only hand-added contacts. These
-/// are deliberately different sets: the receive side is an anti-unsolicited-content gate, so a peer
-/// who marks *you* trusted but whom *you* have not added is **silently dropped** — to read A's
-/// Private collection, add A. This errs toward rejection (never a security risk), and the
-/// asymmetry is the point, not a bug.
+/// the npubs in your **Private audience** (`private_audience.json`, toggled per-contact — M21 W5);
+/// *receiving* one accepts only hand-added contacts. These are deliberately different sets: the
+/// receive side is an anti-unsolicited-content gate, so a peer who marks *you* as a recipient but
+/// whom *you* have not added is **silently dropped** — to read A's Private collection, add A. This
+/// errs toward rejection (never a security risk), and the asymmetry is the point, not a bug.
 pub(crate) fn contact_author_allowlist(store: &DataStore) -> Vec<nostr::PublicKey> {
     store
         .list_contacts()

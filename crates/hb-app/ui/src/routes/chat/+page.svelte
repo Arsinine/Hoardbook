@@ -23,7 +23,6 @@
 		dmBlock,
 		groupsGet,
 		groupsCreate,
-		groupsSetTrusted,
 		contactUpdateGroups,
 		advanceReadWatermark,
 		topicAnnounceMarkSeen,
@@ -232,11 +231,10 @@
 		acceptDialogOpen = true;
 	}
 
-	async function handleCreateGroup(detail: { name: string; color: string; trusted: boolean }) {
-		const { name, color, trusted } = detail;
+	async function handleCreateGroup(detail: { name: string; color: string }) {
+		const { name, color } = detail;
 		try {
 			await groupsCreate(name, color);
-			if (trusted) await groupsSetTrusted(name, true);
 			await loadGroups();
 		} catch (e) { toast(String(e), 'error'); }
 	}

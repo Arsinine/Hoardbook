@@ -930,4 +930,34 @@ mod tests {
         restore_announce_cooldown(&mut times, "films", previous2);
         assert_eq!(times.get("films"), Some(&500), "restore reinstates the PRIOR timestamp");
     }
+
+    /// M21 W5 property pin: topics.rs has zero references to groups or the Private audience today —
+    /// it is compliant with the owner ruling ("joining a topic must never make Private collections
+    /// visible") only by accident. This pins that property. The join path (`topic_join_public` →
+    /// `auto_add_roster` → `upsert_topic_contact`) writes to the contact store only; it must NOT
+    /// touch `private_audience.json`. Run with the exact data mutation `upsert_topic_contact`
+    /// performs so a future refactor that wires topics into the audience can't pass silently.
+    #[test]
+    fn joining_a_topic_does_not_enrol_anyone_in_the_private_audience() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        // Seed an empty audience (absent file ⇒ empty; verify both states).
+        assert!(store.load_private_audience().unwrap().is_empty());
+
+        // Simulate the join path's data effect: auto-add a co-member as a Topic contact.
+        let member = Identity::generate();
+        let npub = npub_of(&member);
+        upsert_topic_contact(&store, &npub).unwrap();
+
+        // The co-member is now a contact (source = Topic)…
+        let c = store.load_contact(&CachedPeer::pubkey_hash(&npub)).unwrap().unwrap();
+        assert_eq!(c.source, ContactSource::Topic, "join added the co-member as a Topic contact");
+        // …but is NOT in the Private audience — topic membership ≠ Private recipient (owner ruling).
+        let audience = store.load_private_audience().unwrap();
+        assert!(
+            !audience.contains(&npub),
+            "joining a topic must never enrol anyone as a Private recipient (M21 W5)"
+        );
+        assert!(audience.is_empty(), "the audience file is untouched by the topic-join path");
+    }
 }

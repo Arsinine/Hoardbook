@@ -37,7 +37,7 @@ describe('contacts M20-W5 — group editor is multi-select (no silent membership
 		// The old single `<select>` had `selected={peerGroups.includes(g.name)}` on an <option>; the
 		// fix moves that same membership test onto a checkbox `checked`. Assert a checkbox whose
 		// checked state is driven by `peerGroups.includes(g.name)` — that shape only exists in the
-		// editor, so it can't be satisfied today by the trusted-groups strip or the old select.
+		// editor, so it can't be satisfied today by the old select.
 		const s = contactsSrc();
 		expect(s).toMatch(/type="checkbox"[^>]*checked=\{peerGroups\.includes\(g\.name\)\}|checked=\{peerGroups\.includes\(g\.name\)\}[^>]*type="checkbox"/);
 	});
