@@ -24,6 +24,7 @@
 	import Modal from '$lib/components/Modal.svelte';
 	import HintMarker from '$lib/components/HintMarker.svelte';
 	import ConfirmButton from '$lib/components/ConfirmButton.svelte';
+	import ContactPicker from '$lib/components/ContactPicker.svelte';
 
 	// Redesign (devtest 2026-06-25 #9): master–detail (My Topics list ↔ selected-topic detail),
 	// Create as a modal + Discover as a tab (forms are no longer always-on stacked cards), and the
@@ -62,7 +63,9 @@
 	// joined Topic); posting moved there, so this panel keeps only membership management.
 	let openTopic: TopicView | null = $state(null);
 	let roster: string[] = $state([]);
-	let inviteNpub = $state('');
+	// M21 W3: Invite opens the ContactPicker modal (select a contact OR type a new npub) instead of a
+	// bare inline text field.
+	let invitePickerOpen = $state(false);
 
 	// devtest v0.12.1 #8: a Topic's description is editable after creation (the name is immutable).
 	let editingDesc = $state(false);
@@ -355,11 +358,13 @@
 		}, 60_000);
 	}
 
-	async function invite() {
-		if (!openTopic || !inviteNpub.trim()) return;
+	// M21 W3: ContactPicker emits the chosen npub (a selected contact OR a typed new one); this routes
+	// straight through the same `topicInvite` command as the old inline field.
+	async function inviteChosen(npub: string) {
+		if (!openTopic || !npub) return;
+		invitePickerOpen = false;
 		try {
-			await topicInvite(openTopic.topic_id, inviteNpub.trim());
-			inviteNpub = '';
+			await topicInvite(openTopic.topic_id, npub);
 			toast('Invite sent', 'success');
 		} catch (e) {
 			toast(String(e), 'error');
@@ -434,8 +439,7 @@
 					</div>
 
 					<div class="invite">
-						<input class="hb-input" placeholder="invite an npub…" bind:value={inviteNpub} />
-						<button class="btn-default" onclick={invite}>Invite</button>
+						<button class="btn-default" onclick={() => (invitePickerOpen = true)}>Invite</button>
 					</div>
 
 					<!-- M13 Part A (Q1) — sends only; the announce itself renders in the Chat topic thread. -->
@@ -542,6 +546,18 @@
 		/>
 	</Modal>
 {/if}
+
+<!-- M21 W3 — Invite opens a ContactPicker (pick a contact OR type a new npub). Stacked above the
+     detail pane; single-select because topicInvite takes exactly one npub per call (api.ts). -->
+<ContactPicker
+	open={invitePickerOpen}
+	title="Invite to Topic"
+	confirmLabel="Invite"
+	contacts={$contacts}
+	myNpub={$identity?.npub ?? ''}
+	onselect={inviteChosen}
+	onclose={() => (invitePickerOpen = false)}
+/>
 
 <style>
 	/* Shared app shell — same rules as routes/+page.svelte, contacts and settings. */
@@ -651,7 +667,6 @@
 	.roster { list-style: none; margin: 0; padding: 0; font-size: 12px; max-height: 200px; overflow-y: auto; }
 	.roster li { padding: 3px 0; }
 	.invite { display: flex; gap: 6px; }
-	.invite input { flex: 1; }
 	.announce-row { display: flex; gap: 6px; margin-top: 2px; }
 	.announce-row input { flex: 1; }
 	.channel-link { display: inline-block; margin-top: 4px; font-size: 12px; color: var(--accent); text-decoration: none; }

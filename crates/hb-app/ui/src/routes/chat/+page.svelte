@@ -68,6 +68,7 @@
 		askIdentity,
 	} from '$lib/transport-ticket.js';
 	import TransportTicketCard from '$lib/components/TransportTicketCard.svelte';
+	import ContactPicker from '$lib/components/ContactPicker.svelte';
 	import { filterConversations, filterTopics, composeRecipientKind, isComposeToSelf } from '$lib/chat-filter.js';
 	import { peerPreview, peersWithHistory, relativeTime } from '$lib/chat-preview.js';
 	// M17 W2: the ask-access intent populates the composer draft from one pure copy source, without
@@ -164,6 +165,9 @@
 	let composeTo = $state('');
 	let composeBody = $state('');
 	let composeSending = $state(false);
+	// M21 W3: the compose modal's "+" affordance opens a ContactPicker. Selecting a contact sets
+	// `composeTo` to their npub, which then flows through the SAME validation + send path as typing.
+	let composePickerOpen = $state(false);
 
 	async function loadTopics() {
 		try { topics = await topicList(); } catch { /* relay unreachable */ }
@@ -1389,7 +1393,13 @@
 <!-- Compose-to-npub (spec §9 first-contact deep link) — a + icon-btn beside refresh opens this. -->
 <Modal open={composeOpen} title="New message" onclose={() => (composeOpen = false)}>
 	<div class="compose-fields">
-		<input class="hb-input" placeholder="npub or hbk share code…" bind:value={composeTo} />
+		<!-- M21 W3: the free-text recipient stays (owner: "in addition to its current form"); a
+		     "Contacts" button next to it opens the ContactPicker, which sets composeTo to a chosen
+		     contact's npub. That value then flows through the SAME validation + send path as typing. -->
+		<div class="recipient-row">
+			<input class="hb-input" placeholder="npub or hbk share code…" bind:value={composeTo} />
+			<button type="button" class="link" onclick={() => (composePickerOpen = true)}>Contacts</button>
+		</div>
 		{#if composeTo.trim() && isComposeToSelf(composeTo, $identity?.npub ?? '', $identity?.share_code ?? '')}
 			<div class="compose-hint">That's your own ID.</div>
 		{:else if composeTo.trim() && composeRecipientKind(composeTo) === 'invalid'}
@@ -1404,6 +1414,18 @@
 		</button>
 	{/snippet}
 </Modal>
+
+<!-- M21 W3 — compose "+": pick a contact to prefill composeTo (single-select; chat sends to one
+     recipient). Stacked above the compose modal. The chosen npub reuses the same validation path. -->
+<ContactPicker
+	open={composePickerOpen}
+	title="Message a contact"
+	confirmLabel="Select"
+	contacts={$contacts}
+	myNpub={$identity?.npub ?? ''}
+	onselect={(npub) => { composeTo = npub; composePickerOpen = false; }}
+	onclose={() => (composePickerOpen = false)}
+/>
 
 <style>
 	.no-identity {
@@ -1791,4 +1813,13 @@
 	.compose-modal-input { width: 100%; box-sizing: border-box; }
 	/* M15 W2: compose modal now uses Modal.svelte; only the field layout is local. */
 	.compose-fields { display: flex; flex-direction: column; gap: 8px; }
+	/* M21 W3: the recipient input + the "Contacts" affordance sit on one row. The input itself uses
+	   the global .hb-input contract — only the row layout is local. */
+	.recipient-row { display: flex; align-items: center; gap: 8px; }
+	.recipient-row .hb-input { flex: 1; }
+	.recipient-row .link {
+		background: transparent; border: none; cursor: pointer; color: var(--accent);
+		font: inherit; font-size: 11.5px; padding: 0; white-space: nowrap;
+	}
+	.recipient-row .link:hover { text-decoration: underline; }
 </style>
