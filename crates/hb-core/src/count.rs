@@ -8,6 +8,14 @@
 //! relays counts once. The number is honestly an *estimate per relay-set*, never an authoritative
 //! global figure.
 //!
+//! **Online vs userbase admission (W2).** Kind 11111 is not exclusively Hoardbook's — a foreign
+//! protocol reuses it with validly-signed events that carry none of our binding tags
+//! (probe-confirmed 2026-08-04). The online tally therefore admits a presence event on more than
+//! a signature: `fresh_presence` requires `verify_binding` (signature + kind pin + author pin +
+//! schema/expiry tags), so foreign kind-11111 traffic cannot inflate the chip. The userbase tally
+//! is a different count over teaser/listing/presence kinds where bindings do not apply; it remains
+//! signature-only.
+//!
 //! **Known limits (not regressions, stated for honesty):** dedup-by-`npub` is **not** Sybil-proof —
 //! a flood of cheap, validly-signed fresh keypairs inflates the count; and the `hb-canary` exclusion
 //! is a *deflation*-only griefing surface (anyone can tag their own events `hb-canary` to exclude
@@ -23,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 
 use nostr::prelude::*;
 
-use crate::binding::KIND_PRESENCE;
+use crate::binding::{verify_binding, KIND_PRESENCE};
 use crate::identity::verify_event;
 
 /// The Hoardbook-internal `t` tag stamped on **every** canary-published event. `count_distinct_*`
@@ -43,7 +51,8 @@ pub fn is_canary(event: &Event) -> bool {
     event.tags.hashtags().any(|t| t == CANARY_MARKER)
 }
 
-/// Count distinct **online-now** `npub`s from a set of presence events: drop bad-signature events,
+/// Count distinct **online-now** `npub`s from a set of presence events: drop events without a
+/// valid Hoardbook binding (`verify_binding` — signature + kind pin + author pin + schema/expiry),
 /// drop canary-tagged events, drop stale events (older than the freshness `window_secs`), then
 /// dedup by author. Freshness is inclusive at the boundary (`created_at >= now - window`), matching
 /// the contact-list `● Online` badge (Decision #12). Multi-relay dedup is implicit — the same
@@ -54,7 +63,7 @@ pub fn count_distinct_online(events: &[Event], now: u64, window_secs: u64) -> us
 
 /// The same fresh-presence pass as [`count_distinct_online`], but keeping **who** and **when**:
 /// author → the newest accepted `created_at`. Identical admission rules (canary-excluded,
-/// signature-verified, stale-dropped, future-skew-capped), so the count is exactly this map's
+/// binding-verified, stale-dropped, future-skew-capped), so the count is exactly this map's
 /// length — one tally, two readings.
 ///
 /// M17 W5.2: the contact list needs a *real* last-seen. The 60s online poll already fetches these
@@ -78,8 +87,17 @@ pub fn fresh_presence(events: &[Event], now: u64, window_secs: u64) -> HashMap<P
         if created < floor || created > ceiling {
             continue; // stale → offline; future-dated beyond skew → don't trust the relay's clock
         }
-        if verify_event(ev).is_err() {
-            continue; // a forged/tampered presence cannot inflate the count
+        // W2: kind 11111 is not exclusively ours — a foreign protocol reuses it with validly-signed
+        // events that carry none of our binding tags (probe-confirmed 2026-08-04: the owner's chip
+        // read "3 users" = 2 real machines + 1 such foreign npub). `verify_event` is signature-only
+        // and admits them; `verify_binding` additionally requires a well-formed Hoardbook presence
+        // binding (our schema tag + explicit expiry + author pin). For a global tally there is no
+        // external "expected" author — the beacon is self-authored — so `expected = ev.pubkey`. This
+        // is not circular: verify_binding still meaningfully re-checks the signature, pins the kind,
+        // pins author==pubkey (a relay can't substitute a *different* valid event for this one), and
+        // demands the schema/expiry tags that a foreign kind-11111 event does not carry.
+        if verify_binding(ev, &ev.pubkey, now).is_err() {
+            continue; // a forged/tampered/unbound presence cannot inflate the count
         }
         // A `created_at` inside the future-skew tolerance is admitted, but never *recorded* as the
         // future: clamping to `now` keeps a +5min stamp from rendering as age zero (and outliving a
@@ -278,6 +296,40 @@ mod tests {
         let canary = Identity::generate();
         let evs = vec![presence_at(&real, NOW), canary_presence(&canary, NOW)];
         assert_eq!(count_distinct_online(&evs, NOW, WINDOW), 1, "the canary npub must not be counted");
+    }
+
+    /// W2 — the probe-confirmed bug: a validly-signed kind-11111 event with **no Hoardbook binding**
+    /// (no `hb-v` schema tag, no `hb-expires`) is the exact shape of the foreign kind-11111 traffic
+    /// that was inflating the owner's chip — a different protocol reusing kind 11111. It passes
+    /// `verify_event` (the signature is real), is fresh, non-canary, and the right kind, yet it must
+    /// not count. A real Hoardbook beacon from a distinct npub is included alongside so the test
+    /// cannot pass by rejecting everything (count is exactly 1, not 0 and not 2).
+    #[test]
+    fn online_rejects_validly_signed_but_unbound_kind_11111() {
+        // Foreign-protocol kind-11111 traffic: validly signed, right kind, fresh — but it carries
+        // none of our binding tags, so verify_binding must reject it on the missing schema version.
+        let foreign = Identity::generate();
+        let unbound = foreign
+            .sign(
+                EventBuilder::new(Kind::from_u16(KIND_PRESENCE), "")
+                    .custom_created_at(Timestamp::from(NOW)),
+            )
+            .unwrap();
+        // Sanity: this is genuinely a validly-signed presence event — the pre-change admission gate
+        // (verify_event) accepts it. That is precisely why the chip inflated.
+        assert!(verify_event(&unbound).is_ok(), "the foreign event is genuinely validly signed");
+        assert_eq!(unbound.kind.as_u16(), KIND_PRESENCE, "and it is the right kind");
+
+        // A real Hoardbook beacon — must still count, so the assertion below cannot pass vacuously.
+        let real = Identity::generate();
+        let valid = presence_at(&real, NOW);
+
+        let evs = vec![unbound, valid];
+        assert_eq!(
+            count_distinct_online(&evs, NOW, WINDOW),
+            1,
+            "validly-signed-but-unbound kind-11111 must not inflate the online count"
+        );
     }
 
     #[test]
