@@ -484,6 +484,9 @@ export const groupsGet    = () => invoke<Group[]>('groups_get');
 /** `color` (M13 W5) is an optional CSS hex string for the group chip. */
 export const groupsCreate = (name: string, color?: string) =>
 	invoke<Group>('groups_create', { name, color: color ?? null });
+/** Create a group pre-populated with members (M22 W1). `npubs` are de-duplicated; `[]` ≡ `groupsCreate`. */
+export const groupsCreateWithMembers = (name: string, npubs: string[], color?: string) =>
+	invoke<Group>('groups_create_with_members', { name, npubs, color: color ?? null });
 export const groupsRename = (oldName: string, newName: string) =>
 	invoke<void>('groups_rename', { oldName, newName });
 export const groupsDelete   = (name: string) => invoke<void>('groups_delete', { name });

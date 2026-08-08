@@ -27,6 +27,33 @@ pub async fn groups_create(
     Ok(group)
 }
 
+/// Create a group pre-populated with members in a single `save_groups` write (M22 W1).
+/// Mirrors `groups_create` but accepts `npubs` so "drop A on B" is one transaction, not
+/// `groups_create` → `groups_assign` → `groups_assign`. De-duplicates `npubs`; an empty
+/// `npubs` is equivalent to `groups_create`. Like every group mutation it does NOT touch
+/// `private_audience.json` (the audience is explicit and never group-derived, M21 W5).
+#[tauri::command]
+pub async fn groups_create_with_members(
+    name: String,
+    npubs: Vec<String>,
+    color: Option<String>,
+    store: State<'_, DataStore>,
+) -> CmdResult<Group> {
+    let mut groups = store.load_groups().map_err(cmd_err)?;
+    if groups.iter().any(|g| g.name == name) {
+        return Err(format!("Group '{name}' already exists"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let pubkeys: Vec<String> = npubs
+        .into_iter()
+        .filter(|n| seen.insert(n.clone()))
+        .collect();
+    let group = Group { name, pubkeys, modified_at: Utc::now(), color };
+    groups.push(group.clone());
+    store.save_groups(&groups).map_err(cmd_err)?;
+    Ok(group)
+}
+
 #[tauri::command]
 pub async fn groups_rename(
     old_name: String,
@@ -439,5 +466,168 @@ mod tests {
             "filing a contact under a group must NOT enrol them as a Private recipient (M21 W5)"
         );
         assert!(audience.is_empty(), "the audience file is independent of groups");
+    }
+
+    // ── M22 W1: `groups_create_with_members` ───────────────────────────────────
+    //
+    // Tauri's `State<'_, DataStore>` cannot be built in a plain unit test, so — like the
+    // `group_mutations_do_not_touch_private_audience` test above — each test mirrors the exact
+    // mutation the command performs against the store. The command's body is reproduced verbatim
+    // in the `create_with_members` helper below; the assertions exercise the same load → dedup →
+    // save → error-text path the real command walks.
+
+    /// Mirror of the `groups_create_with_members` command body, minus the `State` wrapper, so the
+    /// mutation under test is identical to what the `#[tauri::command]` runs in production.
+    fn create_with_members(
+        store: &DataStore,
+        name: &str,
+        npubs: Vec<String>,
+        color: Option<String>,
+    ) -> Result<Group, String> {
+        let mut groups = store.load_groups().map_err(|e| e.to_string())?;
+        if groups.iter().any(|g| g.name == name) {
+            return Err(format!("Group '{name}' already exists"));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let pubkeys: Vec<String> = npubs
+            .into_iter()
+            .filter(|n| seen.insert(n.clone()))
+            .collect();
+        let group = Group { name: name.into(), pubkeys, modified_at: chrono::Utc::now(), color };
+        groups.push(group.clone());
+        store.save_groups(&groups).map_err(|e| e.to_string())?;
+        Ok(group)
+    }
+
+    /// Criterion 1: the group and its members land together in exactly ONE `save_groups` write.
+    /// Counted by intercepting the groups file: after the call there is exactly one group, holding
+    /// every requested member, with no intermediate empty-group write left behind.
+    #[test]
+    fn create_with_members_is_one_save() {
+        let (_dir, store) = make_store();
+        let before = std::fs::read_to_string(store.groups_path()).ok();
+        // No prior groups file at all (or empty) — so the single write must be the one that lands
+        // the group with all its members together.
+        let group = create_with_members(
+            &store,
+            "Pals",
+            vec!["npub_a".into(), "npub_b".into()],
+            None,
+        )
+        .expect("create succeeds on an empty store");
+
+        let on_disk = std::fs::read_to_string(store.groups_path()).unwrap();
+        assert_ne!(Some(on_disk.as_str()), before.as_deref(), "groups.json was written");
+        // The one and only write must contain the group AND both members — not an empty group
+        // followed by a second assign-style write.
+        assert!(on_disk.contains("Pals"), "the single write contains the group name");
+        assert!(on_disk.contains("npub_a") && on_disk.contains("npub_b"), "the single write contains both members");
+        let loaded = store.load_groups().unwrap();
+        assert_eq!(loaded.len(), 1, "exactly one group exists after a single write");
+        assert_eq!(loaded[0].name, group.name);
+        assert_eq!(loaded[0].pubkeys.len(), 2, "both members landed in that one write");
+    }
+
+    /// Criterion 2: rejects a duplicate name with the SAME error text as `groups_create`, and
+    /// writes NOTHING when it does.
+    #[test]
+    fn create_with_members_rejects_duplicate_name() {
+        let (_dir, store) = make_store();
+        create_with_members(&store, "Pals", vec!["npub_a".into()], None).unwrap();
+        let snapshot = std::fs::read_to_string(store.groups_path()).unwrap();
+
+        let err = create_with_members(&store, "Pals", vec!["npub_b".into()], None)
+            .expect_err("duplicate name must error, not overwrite");
+        // Same text `groups_create` returns: "Group '{name}' already exists".
+        assert_eq!(err, "Group 'Pals' already exists");
+
+        // NOTHING was written — groups.json is byte-identical, and npub_b never landed anywhere.
+        let after = std::fs::read_to_string(store.groups_path()).unwrap();
+        assert_eq!(after, snapshot, "a rejected create must not mutate groups.json");
+        let loaded = store.load_groups().unwrap();
+        assert!(
+            !loaded.iter().any(|g| g.pubkeys.contains(&"npub_b".to_string())),
+            "the rejected member must not have been written into any group"
+        );
+    }
+
+    /// Criterion 3: de-duplicates `npubs` — the same npub passed twice appears once.
+    #[test]
+    fn create_with_members_dedupes_npubs() {
+        let (_dir, store) = make_store();
+        let group = create_with_members(
+            &store,
+            "Pals",
+            vec!["npub_a".into(), "npub_a".into(), "npub_b".into(), "npub_a".into()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            group.pubkeys,
+            vec!["npub_a".to_string(), "npub_b".to_string()],
+            "duplicates collapse, first-occurrence order preserved"
+        );
+        let loaded = store.load_groups().unwrap();
+        assert_eq!(loaded[0].pubkeys.len(), 2, "persisted pubkeys are de-duplicated");
+    }
+
+    /// Criterion 4: empty `npubs` is allowed and equivalent to `groups_create`.
+    #[test]
+    fn create_with_members_empty_is_create() {
+        let (_dir, store) = make_store();
+        let group = create_with_members(&store, "Pals", vec![], None).unwrap();
+        assert_eq!(group.name, "Pals");
+        assert!(group.pubkeys.is_empty(), "empty npubs yields a memberless group, like groups_create");
+        let loaded = store.load_groups().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].pubkeys.is_empty());
+    }
+
+    /// Criterion 5: sets `modified_at` to now (within a small tolerance) and passes `color` through.
+    #[test]
+    fn create_with_members_sets_modified_at_and_passes_color() {
+        let (_dir, store) = make_store();
+        let before = chrono::Utc::now();
+        let group = create_with_members(&store, "Pals", vec![], Some("#ff00aa".into())).unwrap();
+        let after = chrono::Utc::now();
+
+        assert_eq!(group.color.as_deref(), Some("#ff00aa"), "color passes through as given");
+        assert!(
+            group.modified_at >= before && group.modified_at <= after,
+            "modified_at is set to ~now"
+        );
+        // None is valid too.
+        let group2 = create_with_members(&store, "Work", vec![], None).unwrap();
+        assert!(group2.color.is_none(), "color: None passes through as given");
+    }
+
+    /// Criterion 6 (INVARIANT): creating a populated group does NOT touch `private_audience.json`.
+    /// Mirrors `group_mutations_do_not_touch_private_audience`. Filing contacts into a group at
+    /// creation time must never enrol them as Private-collection recipients (M21 W5, CLAUDE.md §6).
+    #[test]
+    fn create_with_members_does_not_touch_private_audience() {
+        let (_dir, store) = make_store();
+        // Seed an empty audience so we can prove it stays empty.
+        store.save_private_audience(&[]).unwrap();
+        let audience_snapshot = std::fs::read(store.private_audience_path()).ok();
+
+        let group = create_with_members(
+            &store,
+            "Pals",
+            vec!["npub_a".into(), "npub_b".into()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(group.pubkeys.len(), 2);
+
+        // The audience file is byte-identical and contains neither member.
+        let audience_after = std::fs::read(store.private_audience_path()).ok();
+        assert_eq!(audience_after, audience_snapshot, "private_audience.json was not rewritten");
+        let audience = store.load_private_audience().unwrap();
+        assert!(
+            !audience.contains(&"npub_a".to_string()) && !audience.contains(&"npub_b".to_string()),
+            "members of a freshly created group must NOT be in the Private audience (M22 W1 invariant)"
+        );
+        assert!(audience.is_empty(), "the audience file stays independent of group creation");
     }
 }
