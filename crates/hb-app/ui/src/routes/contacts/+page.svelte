@@ -131,6 +131,12 @@
 		return groups.filter(g => g.pubkeys.includes(hb_id)).map(g => g.name);
 	}
 
+	// M21 W5b: a group's colour, looked up by name. Returns undefined for a group with no colour (or
+	// an unknown name) — the chip renders with no dot in that case, never a broken/invisible chip.
+	function groupColor(name: string): string | undefined {
+		return groups.find(g => g.name === name)?.color;
+	}
+
 	// Per-contact group membership editor (M20 W5, data-loss half). The data model and renderer are
 	// many-to-many; this editor is too — checkboxes over ALL groups, pre-checked with the contact's
 	// CURRENT memberships, and on Apply the full checked set is sent to contact_update_groups (which
@@ -161,6 +167,39 @@
 			await loadGroups();
 		} catch (e) { toast(String(e), 'error'); }
 		contactGroupEditing = { ...contactGroupEditing, [hb_id]: false };
+	}
+
+	// M21 W5b: the `+` on the collapsed card face opens a popover anchored to the chip row, so group
+	// membership is reachable without expanding the detail. Same full-set semantics as the expanded
+	// editor — Apply sends the complete checked set to contactUpdateGroups, which diffs it. Cancel
+	// discards. No confirmation step (safe only because the Private audience moved out in W5a).
+	let groupPopoverFor: string | null = $state(null);
+	let groupPopoverAnchor: HTMLElement | undefined = $state();
+	let groupPopoverDraft: Record<string, Set<string>> = $state({});
+
+	function openGroupPopover(npub: string, anchor: HTMLElement) {
+		// Seed the draft from CURRENT memberships so the pre-check never loses existing memberships
+		// (the same data-loss guard the expanded editor enforces — single-select silently dropped the
+		// rest, see contacts-w5-dataloss).
+		groupPopoverDraft = { ...groupPopoverDraft, [npub]: new Set(contactGroups(npub)) };
+		groupPopoverAnchor = anchor;
+		groupPopoverFor = npub;
+	}
+
+	function togglePopoverGroup(npub: string, name: string, checked: boolean) {
+		const next = new Set(groupPopoverDraft[npub] ?? []);
+		if (checked) next.add(name); else next.delete(name);
+		groupPopoverDraft[npub] = next;
+		groupPopoverDraft = { ...groupPopoverDraft };
+	}
+
+	async function applyGroupPopover(npub: string) {
+		const names = [...(groupPopoverDraft[npub] ?? [])];
+		groupPopoverFor = null;
+		try {
+			await contactUpdateGroups(npub, names);
+			await loadGroups();
+		} catch (e) { toast(String(e), 'error'); }
 	}
 
 	// M20 W2: the mount fan-out used to fire one full `refreshContact` (= one `resolve_peer`) per
@@ -548,10 +587,25 @@
 				{/if}
 				<!-- Row 4: group chips · N collections (hoverable, public only) · size · cold-cache. -->
 				<div class="contact-sub-row">
-					{#each peerGroups as gname}
-						<span class="group-pill">{gname}</span>
+					{#each peerGroups as gname (gname)}
+						{@const gcolor = groupColor(gname)}
+						<span class="group-pill">
+							{#if gcolor}<span class="group-dot" style={`background:${gcolor}`}></span>{/if}
+							{gname}
+						</span>
 					{/each}
-					{#if peerGroups.length > 0}<span class="sub-dot">·</span>{/if}
+					<!-- M21 W5b: `+` opens a membership popover anchored to this row (no detail expand
+					     needed). Full-set Apply — the same command the expanded editor uses. -->
+					{#if groups.length > 0}
+						<button
+							class="group-add-btn"
+							aria-label="Edit {name}'s groups"
+							aria-haspopup="true"
+							aria-expanded={groupPopoverFor === peer.npub}
+							onclick={(e) => openGroupPopover(peer.npub, e.currentTarget)}
+						>+</button>
+					{/if}
+					{#if peerGroups.length > 0 || groups.length > 0}<span class="sub-dot">·</span>{/if}
 					{#if pubCount > 0}
 						<span class="sub-dot">·</span>
 						<!-- M21 W4 behaviour 6: `▼` caret signals hoverable; :focus-within makes it
@@ -620,6 +674,7 @@
 											checked={peerGroups.includes(g.name)}
 											onchange={(e) => toggleDraftGroup(peer.npub, g.name, e.currentTarget.checked)}
 										/>
+										{#if g.color}<span class="group-dot" style={`background:${g.color}`}></span>{/if}
 										{g.name}
 									</label>
 								{/each}
@@ -630,8 +685,12 @@
 							<button class="tag-x" onclick={() => { contactGroupEditing = { ...contactGroupEditing, [peer.npub]: false }; }}>×</button>
 							<button class="btn-primary btn-xs" onclick={() => handleSaveGroups(peer.npub)}>Apply</button>
 						{:else}
-							{#each peerGroups as gname}
-								<span class="group-pill">{gname}</span>
+							{#each peerGroups as gname (gname)}
+								{@const gcolor = groupColor(gname)}
+								<span class="group-pill">
+									{#if gcolor}<span class="group-dot" style={`background:${gcolor}`}></span>{/if}
+									{gname}
+								</span>
 							{/each}
 							{#if groups.length > 0}
 								<button class="tag-add-btn" onclick={() => beginGroupEdit(peer.npub)}>
@@ -711,6 +770,34 @@
 		<button class="menu-item" onclick={() => { detailExpanded = peer.npub; editingTagsFor = peer.npub; tagInput = ''; menuOpenFor = null; }}>Edit tags…</button>
 		<div class="menu-item menu-item-confirm">
 			<ConfirmButton label="Remove contact" confirmText="Remove this contact?" onconfirm={() => { handleUnfollow(peer.npub); menuOpenFor = null; }} />
+		</div>
+	</OverflowMenu>
+
+	<!-- M21 W5b: group-membership popover anchored to the face chip row. Reuses OverflowMenu's
+	     positioning + Escape/close shell; the contents are the membership editor. Full-set Apply —
+	     the same command the expanded editor uses (no confirmation; safe post-W5a). -->
+	<OverflowMenu open={groupPopoverFor === peer.npub} anchor={groupPopoverAnchor} onclose={() => (groupPopoverFor = null)} minWidth="240px">
+		<div class="gp-title">{name}'s groups</div>
+		<div class="gp-list">
+			{#each groups as g (g.name)}
+				<label class="gp-row">
+					<input
+						type="checkbox"
+						checked={(groupPopoverDraft[peer.npub] ?? new Set()).has(g.name)}
+						onchange={(e) => togglePopoverGroup(peer.npub, g.name, e.currentTarget.checked)}
+					/>
+					{#if g.color}<span class="group-dot" style={`background:${g.color}`}></span>{/if}
+					{g.name}
+				</label>
+			{/each}
+			{#if groups.length === 0}
+				<span class="gp-empty">No groups yet.</span>
+			{/if}
+			<button type="button" class="gp-new" onclick={() => (createGroupOpen = true)}>+ New group…</button>
+		</div>
+		<div class="gp-footer">
+			<button type="button" class="btn-ghost btn-xs" onclick={() => (groupPopoverFor = null)}>Cancel</button>
+			<button type="button" class="btn-primary btn-xs" onclick={() => applyGroupPopover(peer.npub)}>Apply</button>
 		</div>
 	</OverflowMenu>
 {/snippet}
@@ -1159,11 +1246,21 @@
 	/* Group row on contact cards */
 	.group-row { display: flex; flex-wrap: wrap; gap: 4px; margin: 3px 0 2px; align-items: center; min-height: 20px; }
 	.group-pill {
-		display: inline-flex; align-items: center;
+		display: inline-flex; align-items: center; gap: 4px;
 		padding: 1px 8px; border-radius: 4px; font-size: 11px; font-weight: 500;
 		background: color-mix(in oklch, var(--accent) 10%, transparent);
 		color: var(--accent);
 	}
+	/* M21 W5b: the group's colour dot inside a chip/editor row. Absent for a group with no colour. */
+	.group-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; display: inline-block; }
+	/* M21 W5b: `+` beside the chip row opens the membership popover. Styled like .tag-add-btn so the
+	   face's group affordance reads as the same kind of control. */
+	.group-add-btn {
+		font-size: 11px; line-height: 1; color: var(--fg-dim); background: transparent;
+		border: 1px dashed var(--border); border-radius: 4px; padding: 0 5px; cursor: pointer;
+		font-family: var(--font-ui); display: inline-flex; align-items: center;
+	}
+	.group-add-btn:hover { border-color: var(--accent); color: var(--accent); }
 	/* M20 W5: inline multi-select group membership editor (replaces the single-select that dropped
 	   every other membership). Checkboxes over all groups + an Apply button, matching the inline-edit
 	   pattern the tag row already uses in this detail area. */
@@ -1174,6 +1271,24 @@
 	}
 	.group-check input { margin: 0; cursor: pointer; }
 	.group-edit-empty { font-size: 11px; color: var(--fg-dim); }
+
+	/* M21 W5b — group-membership popover (OverflowMenu shell, membership-editor contents). */
+	.gp-title { font-size: 11px; font-weight: 600; color: var(--fg-muted); padding: 4px 8px 6px; }
+	.gp-list { display: flex; flex-direction: column; gap: 1px; }
+	.gp-row {
+		display: inline-flex; align-items: center; gap: 6px;
+		font-size: 12px; color: var(--fg); cursor: pointer; padding: 4px 8px; border-radius: 5px;
+	}
+	.gp-row:hover { background: var(--bg-elev3); }
+	.gp-row input { margin: 0; cursor: pointer; }
+	.gp-empty { font-size: 11px; color: var(--fg-dim); padding: 4px 8px; }
+	.gp-new {
+		text-align: left; background: transparent; border: none; cursor: pointer;
+		font-family: var(--font-ui); font-size: 11.5px; color: var(--fg-dim);
+		padding: 5px 8px; border-radius: 5px; margin-top: 2px;
+	}
+	.gp-new:hover { background: var(--bg-elev3); color: var(--fg-muted); }
+	.gp-footer { display: flex; justify-content: flex-end; gap: 6px; padding: 6px 8px 2px; border-top: 1px solid var(--divider); margin-top: 4px; }
 
 	/* M15 W1: buttons unified on the app.css .btn system (local copies removed). */
 </style>

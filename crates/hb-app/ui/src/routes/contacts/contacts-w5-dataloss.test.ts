@@ -53,4 +53,19 @@ describe('contacts M20-W5 — group editor is multi-select (no silent membership
 		expect(fn).toMatch(/\[\.\.\.\(contactGroupDraft\[hb_id\] \?\? \[\]\)\]/);
 		expect(fn).toMatch(/contactUpdateGroups\(hb_id, groupNames\)/);
 	});
+
+	// M21 W5b: the collapsed-card `+` popover is a SECOND route to the same command. It must inherit
+	// the same full-set semantics — single-select via the popover would reintroduce the exact data-loss
+	// this test exists to pin. The popover's apply handler builds the set from its OWN draft
+	// (groupPopoverDraft), seeded from current memberships, and spreads the whole set into the call.
+	it('the popover Apply path (applyGroupPopover) also sends the full checked set, not one name', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('async function applyGroupPopover'), s.indexOf('// M20 W2:'));
+		expect(fn).toMatch(/\[\.\.\.\(groupPopoverDraft\[npub\] \?\? \[\]\)\]/);
+		expect(fn).toMatch(/contactUpdateGroups\(npub, names\)/);
+		// The popover draft is seeded from CURRENT memberships, not empty — so the pre-check cannot
+		// drop existing memberships the way single-select did.
+		const openFn = s.slice(s.indexOf('function openGroupPopover'), s.indexOf('function togglePopoverGroup'));
+		expect(openFn).toMatch(/new Set\(contactGroups\(npub\)\)/);
+	});
 });
