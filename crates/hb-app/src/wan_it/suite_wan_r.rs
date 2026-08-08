@@ -5,7 +5,7 @@
 //!   live VPS relay. Reads stay bounded (no half-open drag), publishes succeed via the live relay.
 //!   Adapts `hb-it/suite_relay::relay1` to the live VPS backbone.
 //! - **R2** — **default-relay policy watch** (the canary row, LIGHT-TOUCH): for each public default
-//!   (damus / nos.lol / primal), publish ONE event of each our-kinds class (teaser / kind-11111
+//!   (the current `DEFAULT_RELAYS` set — nos.lol / relay.primal.net), publish ONE event of each our-kinds class (teaser / kind-11111
 //!   presence / a gift-wrap 1059 / a 1117 announce) from a throwaway identity and record accept/reject
 //!   PER RELAY PER KIND as the evidence table. This is the early-warning row for policy changes that
 //!   would otherwise present as Hoardbook bugs. Low-rate: one event per kind per relay per run, no
@@ -149,12 +149,13 @@ async fn r1_degraded_set(probe: &ProbeInput) -> Result<(), String> {
 // (no retries beyond the outcome relay publish returns).
 // ---------------------------------------------------------------------------
 
-/// The public default relays R2 watches (the production DEFAULT_RELAYS set).
-const DEFAULTS: &[&str] = &[
-    "wss://relay.damus.io",
-    "wss://nos.lol",
-    "wss://relay.primal.net",
-];
+/// The public default relays R2 watches, read from the production single source of truth
+/// (`crate::net::DEFAULT_RELAYS`, which parses `ui/src/lib/default_relays.json`). A prior
+/// hand-mirrored `&[&str]` duplicate had drifted (audit I-2 miss); the regression test in
+/// `mod tests` below pins this to the live set so a future re-fork fails loudly.
+static DEFAULTS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    crate::net::DEFAULT_RELAYS.clone()
+});
 
 /// The per-kind policy entry: relay × kind → accept/reject.
 #[derive(Debug, Clone)]
@@ -173,7 +174,7 @@ pub(crate) async fn r2_default_relay_policy_watch() -> Result<(), String> {
     let mut table: Vec<PolicyEntry> = Vec::new();
     let mut connect_failures: Vec<String> = Vec::new();
 
-    for relay_url in DEFAULTS {
+    for relay_url in DEFAULTS.iter() {
         let relay = relay_url.to_string();
         let author = Identity::generate();
         let one = std::slice::from_ref(&relay);
@@ -387,6 +388,22 @@ fn token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r2_watch_list_matches_the_production_defaults() {
+        // Regression (audit I-2 miss): the R2 DEFAULTS used to be a hand-mirrored `&[&str]` copy of
+        // the production default relay set, which drifted from `default_relays.json` unnoticed.
+        // Now DEFAULTS reads `crate::net::DEFAULT_RELAYS` directly, so this should be trivially true
+        // — its job is to fail if someone re-forks the list later.
+        let watch: std::collections::HashSet<&str> =
+            DEFAULTS.iter().map(|s| s.as_str()).collect();
+        let prod: std::collections::HashSet<&str> =
+            crate::net::DEFAULT_RELAYS.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            watch, prod,
+            "R2 DEFAULTS must stay in lockstep with crate::net::DEFAULT_RELAYS (single source)"
+        );
+    }
 
     #[test]
     fn record_outcome_records_an_accept() {

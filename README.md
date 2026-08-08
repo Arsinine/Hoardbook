@@ -78,7 +78,7 @@ Hoardbook talks to public Nostr relays out of the box — there's no relay of it
 
 ## Relays
 
-By default Hoardbook spreads across public Nostr relays (`relay.damus.io`, `nos.lol`, `relay.primal.net`). You can add or swap relays in **Settings → Relays** (only `wss://` is accepted).
+By default Hoardbook spreads across public Nostr relays (`nos.lol`, `relay.primal.net`). You can add or swap relays in **Settings → Relays** (only `wss://` is accepted).
 
 Want to run your own? Use any off-the-shelf Nostr relay — [strfry](https://github.com/hoytech/strfry) or [nostr-rs-relay](https://github.com/scsibug/nostr-rs-relay) — add its URL to your relay set, and you're done. There's no Hoardbook-specific relay software to maintain.
 

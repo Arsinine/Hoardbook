@@ -306,6 +306,20 @@ mod tests {
     }
 
     #[test]
+    fn default_relays_do_not_include_damus() {
+        // Owner ruling 2026-08-08: damus (`relay.damus.io`) was removed from the default set for
+        // unreliability — three timeout/503 incidents in one night (2026-08-01 devtest) and it was
+        // the first relay in the launch flap that fed the v0.12.11 rustls investigation. Keep this
+        // assertion: the relay is fine as a user-added choice, just not a shipped default.
+        for r in DEFAULT_RELAYS.iter() {
+            assert!(
+                !r.contains("relay.damus.io"),
+                "damus must not be a shipped default (owner ruling 2026-08-08): found {r}"
+            );
+        }
+    }
+
+    #[test]
     fn a_non_relay_settings_write_does_not_strand_the_app() {
         // Regression (devtest 2026-06-25 #1): the FIRST settings write through a NON-relay path —
         // acknowledge_privacy_notice / the update marker, i.e. load-default-modify-save with no
