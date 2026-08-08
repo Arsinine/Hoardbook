@@ -460,6 +460,7 @@ pub fn run() {
             commands::sharing::get_share_settings,
             commands::groups::groups_get,
             commands::groups::groups_create,
+            commands::groups::groups_create_with_members,
             commands::groups::groups_rename,
             commands::groups::groups_delete,
             commands::groups::groups_assign,
