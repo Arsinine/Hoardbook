@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { follow, refreshContact, unfollowContact, setContactTags, groupsGet, groupsCreate, groupsDelete, contactUpdateGroups, browsePrivateCollections, onlineCount, relayStatus, getContacts, privateAudienceList, privateAudienceSet, type OnlineCount, type RelayHealth } from '$lib/api.js';
+	import { follow, refreshContact, unfollowContact, setContactTags, groupsGet, groupsCreate, groupsDelete, groupsCreateWithMembers, contactUpdateGroups, browsePrivateCollections, onlineCount, relayStatus, getContacts, privateAudienceList, privateAudienceSet, type OnlineCount, type RelayHealth } from '$lib/api.js';
 	import { contacts, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
@@ -25,6 +25,9 @@
 	import { relayWhyHint } from '$lib/relay-health.js';
 	import { ONLINE_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
 	import { ALPHABET, groupByLetter, groupByGroups, onlineBucket, matchesQuery, presentSectionKeys } from '$lib/contacts-view.js';
+	// M22 W3 — drag-to-group gesture primitives (shared with Browse). Create is ALWAYS ADDITIVE
+	// (Reading B): both peers keep every group they were already in and both gain the new one.
+	import { writeDragPayload, readDragPayload, isValidDropTarget, isSelfDrop, groupSuggestions, commitCreateGroup } from '$lib/drag-group.js';
 	import { onMount, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
 
@@ -118,6 +121,116 @@
 			createGroupOpen = false;
 			toast(`Group "${name}" created`);
 		} catch (e) { toast(String(e), 'error'); }
+	}
+
+	// M22 W3 — drag-to-group gesture ("drag one user onto another creates an ad hoc group").
+	// Three moments: Lift (source dims in place), Aim (target lights + states outcome in words),
+	// Name (popover with focused text field + up to 3 suggestion chips). Esc cancels the whole
+	// gesture — no group created, nothing written. Create is ALWAYS ADDITIVE: both peers keep
+	// every group they were already in and both gain the new one.
+	let dragSourceNpub = $state<string | null>(null);     // the lifted row, or null when idle
+	let dragOverNpub = $state<string | null>(null);       // the row currently under the cursor
+	let dragPopoverFor = $state<{ source: string; target: string } | null>(null);
+	let dragPopoverAnchor: HTMLElement | undefined = $state();
+	let dragNameInput = $state('');
+	let dragSuggestions = $state<string[]>([]);
+	let dragNameFocused = $state(false);
+
+	function onDragStart(e: DragEvent, npub: string) {
+		if (!e.dataTransfer) return;
+		writeDragPayload(e.dataTransfer, npub);
+		dragSourceNpub = npub;
+	}
+
+	function onDragOver(e: DragEvent, npub: string) {
+		if (!dragSourceNpub) return;
+		e.preventDefault(); // allow drop
+		if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+		dragOverNpub = npub;
+	}
+
+	function onDragLeave(npub: string) {
+		if (dragOverNpub === npub) dragOverNpub = null;
+	}
+
+	function onDragEnd() {
+		// Fires on the source after a drop OR a cancel (Esc-away). Clears the lift visuals. The
+		// naming popover (if opened) stays open until Enter or Esc closes IT — the drag has ended
+		// but the create gesture continues at the naming step.
+		dragSourceNpub = null;
+		dragOverNpub = null;
+	}
+
+	function onDrop(e: DragEvent, targetNpub: string) {
+		e.preventDefault();
+		const sourceNpub = readDragPayload(e.dataTransfer);
+		// Self-drop is a no-op, not a one-member group.
+		if (!sourceNpub || isSelfDrop(sourceNpub, targetNpub)) {
+			dragSourceNpub = null;
+			dragOverNpub = null;
+			return;
+		}
+		if (!isValidDropTarget(sourceNpub, targetNpub)) return;
+		// Open the naming popover anchored at the drop point. The name field is NOT pre-filled.
+		const source = $contacts.find((c) => c.npub === sourceNpub);
+		const target = $contacts.find((c) => c.npub === targetNpub);
+		if (!source || !target) return;
+		dragSuggestions = groupSuggestions(source, target);
+		dragNameInput = '';
+		dragPopoverAnchor = e.currentTarget as HTMLElement;
+		dragPopoverFor = { source: sourceNpub, target: targetNpub };
+		dragNameFocused = true;
+		// Clear the drag-over highlight; the source dims until the popover closes.
+		dragOverNpub = null;
+	}
+
+	function pickSuggestion(name: string) {
+		dragNameInput = name;
+	}
+
+	function closeDragPopover() {
+		dragPopoverFor = null;
+		dragNameInput = '';
+		dragSuggestions = [];
+		dragNameFocused = false;
+	}
+
+	// Esc on the naming field cancels the whole gesture (owner ruling 2026-08-09) — no group
+	// created, nothing written. Enter commits via commitDragCreate.
+	async function onDragNameKey(e: KeyboardEvent) {
+		if (e.key === 'Enter') {
+			e.preventDefault();
+			await commitDragCreate();
+		} else if (e.key === 'Escape') {
+			e.preventDefault();
+			e.stopPropagation();
+			closeDragPopover();
+		}
+	}
+
+	async function commitDragCreate() {
+		if (!dragPopoverFor) return;
+		const { source, target } = dragPopoverFor;
+		const name = dragNameInput;
+		// Close the popover first so a double-Enter can't fire two creates.
+		dragPopoverFor = null;
+		try {
+			await commitCreateGroup(
+				{ groupsCreateWithMembers },
+				name,
+				source,
+				target,
+				groups,
+			);
+			await loadGroups(); // refresh so the new chip appears on both cards without a reload
+			toast(`Group "${name.trim()}" created`);
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			dragNameInput = '';
+			dragSuggestions = [];
+			dragNameFocused = false;
+		}
 	}
 
 	// Stale: last_fetched more than 7 days ago.
@@ -516,10 +629,26 @@
 	<div class="contact-block" class:open={isOpen}>
 		<!-- devtest v0.12.1 #4: double-click a contact to open the conversation in Chat. The chevron,
 		     Browse, and ⋯ controls keep their own single-click actions. -->
+		<!-- M22 W3: the contact-card is also a drag source AND a drop target for drag-to-group.
+		     dragstart writes the source npub; dragover lights the target + states the outcome;
+		     drop opens the naming popover. -->
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
 		<!-- Ignore double-clicks that land on an inner control (chevron, Browse, ⋯ menu) so they keep
 		     their own single-click action instead of also navigating to Chat (codex review). -->
-		<div class="contact-card" ondblclick={(e) => { if ((e.target as HTMLElement).closest('button, a')) return; goto('/chat?peer=' + peer.npub); }} title="Double-click to message in Chat">
+		<div
+			class="contact-card"
+			class:drag-source={dragSourceNpub === peer.npub}
+			class:drag-target={dragSourceNpub !== null && dragOverNpub === peer.npub && dragSourceNpub !== peer.npub}
+			class:drag-recede={dragSourceNpub !== null && dragOverNpub !== null && dragSourceNpub !== peer.npub && dragOverNpub !== peer.npub}
+			draggable="true"
+			ondragstart={(e) => onDragStart(e, peer.npub)}
+			ondragover={(e) => onDragOver(e, peer.npub)}
+			ondragleave={() => onDragLeave(peer.npub)}
+			ondrop={(e) => onDrop(e, peer.npub)}
+			ondragend={onDragEnd}
+			ondblclick={(e) => { if ((e.target as HTMLElement).closest('button, a')) return; goto('/chat?peer=' + peer.npub); }}
+			title="Double-click to message in Chat"
+		>
 			<!-- svelte-ignore a11y_click_events_have_key_events -->
 			<button class="chevron-btn" onclick={() => toggleDetail(peer.npub)} aria-expanded={isOpen} aria-label="Toggle details">
 				<span class="chevron" class:chevron-open={isOpen}>{@html icons.chevronDown}</span>
@@ -563,6 +692,11 @@
 						onclick={(e) => openRowMenu(peer.npub, e.currentTarget)}
 					>⋯</button>
 				</div>
+				<!-- M22 W3 — the Aim moment: when this row is the active drop target, state the outcome in
+				     words (not an icon). Other rows recede (handled by .drag-recede on the card). -->
+				{#if dragSourceNpub !== null && dragOverNpub === peer.npub && dragSourceNpub !== peer.npub}
+					<div class="drag-outcome">group these two</div>
+				{/if}
 				<!-- Row 2: coloured fingerprint (behaviour 3). Absent for a pre-fingerprint stored
 				     contact (behaviour 4: no ring, no word row, card otherwise unchanged). -->
 				{#if fp}
@@ -885,6 +1019,51 @@
 	onnewGroup={() => (createGroupOpen = true)}
 	oncancel={() => { addContactOpen = false; addContactTarget = null; addContactResolved = null; }}
 />
+
+<!-- M22 W3 — the Name moment: a popover anchored at the drop point with the two avatars
+     overlapping, a focused text field ("Name this group"), and up to 3 suggestion chips.
+     Esc cancels the whole gesture (no group created). Enter commits (additive — both peers
+     keep every group they were already in and both gain the new one). -->
+{#if dragPopoverFor}
+	{@const dragSourcePeer = $contacts.find((c) => c.npub === dragPopoverFor!.source)}
+	{@const dragTargetPeer = $contacts.find((c) => c.npub === dragPopoverFor!.target)}
+	<OverflowMenu open={dragPopoverFor !== null} anchor={dragPopoverAnchor} onclose={closeDragPopover} minWidth="260px">
+		<div class="dg-header">
+			<div class="dg-avatars">
+				{#if dragSourcePeer}
+					{@const dgInitial = (contactDisplayName(dragSourcePeer)[0] ?? '?').toUpperCase()}
+					<span class="dg-avatar dg-avatar-a" style={`--dg-hue:${avatarHue(dgInitial)}`}>
+						{dgInitial}
+					</span>
+				{/if}
+				{#if dragTargetPeer}
+					{@const dgInitial = (contactDisplayName(dragTargetPeer)[0] ?? '?').toUpperCase()}
+					<span class="dg-avatar dg-avatar-b" style={`--dg-hue:${avatarHue(dgInitial)}`}>
+						{dgInitial}
+					</span>
+				{/if}
+			</div>
+			<input
+				class="dg-input"
+				type="text"
+				placeholder="Name this group"
+				bind:value={dragNameInput}
+				onkeydown={onDragNameKey}
+			/>
+		</div>
+		{#if dragSuggestions.length > 0}
+			<div class="dg-suggestions">
+				{#each dragSuggestions as s (s)}
+					<button type="button" class="dg-chip" onclick={() => pickSuggestion(s)}>{s}</button>
+				{/each}
+			</div>
+		{/if}
+		<div class="dg-footer">
+			<button type="button" class="btn-ghost btn-xs" onclick={closeDragPopover}>Cancel</button>
+			<button type="button" class="btn-primary btn-xs" disabled={dragNameInput.trim().length === 0} onclick={commitDragCreate}>Create</button>
+		</div>
+	</OverflowMenu>
+{/if}
 
 <style>
 	.contacts-shell {
@@ -1291,4 +1470,46 @@
 	.gp-footer { display: flex; justify-content: flex-end; gap: 6px; padding: 6px 8px 2px; border-top: 1px solid var(--divider); margin-top: 4px; }
 
 	/* M15 W1: buttons unified on the app.css .btn system (local copies removed). */
+
+	/* M22 W3 — drag-to-group gesture visuals.
+	   Lift: the source dims in place (opacity ~0.35) and stays put.
+	   Aim: only the row under the cursor lights (accent border + soft fill) + outcome label;
+	   other rows recede. */
+	.contact-card.drag-source { opacity: 0.35; }
+	.contact-card.drag-target {
+		border-color: var(--accent);
+		background: color-mix(in oklch, var(--accent) 8%, var(--bg-elev1));
+	}
+	.contact-card.drag-recede { opacity: 0.5; }
+	.drag-outcome {
+		font-size: 11px; font-weight: 600; color: var(--accent);
+		padding: 2px 0 4px;
+	}
+
+	/* M22 W3 — naming popover (OverflowMenu shell). Two overlapping avatars + focused input. */
+	.dg-header { display: flex; align-items: center; gap: 10px; padding: 6px 8px; }
+	.dg-avatars { display: flex; position: relative; width: 44px; height: 30px; flex-shrink: 0; }
+	.dg-avatar {
+		width: 30px; height: 30px; border-radius: 50%;
+		display: flex; align-items: center; justify-content: center;
+		font-size: 12px; font-weight: 600; color: white;
+		background: oklch(0.55 0.15 var(--dg-hue));
+		border: 2px solid var(--bg-elev2);
+	}
+	.dg-avatar-b { margin-left: -14px; }
+	.dg-input {
+		flex: 1; font-size: 13px; background: var(--bg-input); border: 1px solid var(--border);
+		border-radius: 6px; padding: 4px 8px; outline: none; color: var(--fg);
+		font-family: var(--font-ui); min-width: 0;
+	}
+	.dg-input:focus { border-color: var(--accent); }
+	.dg-input::placeholder { color: var(--fg-dim); }
+	.dg-suggestions { display: flex; flex-wrap: wrap; gap: 5px; padding: 0 8px 4px; }
+	.dg-chip {
+		font-size: 11px; padding: 2px 8px; border-radius: 999px;
+		background: var(--bg-elev3); border: 1px solid transparent; color: var(--fg-muted);
+		cursor: pointer; font-family: var(--font-ui);
+	}
+	.dg-chip:hover { border-color: var(--accent); color: var(--accent); }
+	.dg-footer { display: flex; justify-content: flex-end; gap: 6px; padding: 6px 8px 2px; border-top: 1px solid var(--divider); margin-top: 4px; }
 </style>

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { contacts, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
-	import { refreshContact, importManifest, requestManifest, getManifestAsks, groupsGet, type ManifestAsk } from '$lib/api.js';
+	import { refreshContact, importManifest, requestManifest, getManifestAsks, groupsGet, groupsCreateWithMembers, type ManifestAsk } from '$lib/api.js';
 	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
@@ -11,6 +11,9 @@
 	import { deriveManifestAskState, ASK_TICK_MS, MANIFEST_ASKED_LINE, MANIFEST_ASK_AGAIN_LABEL, MANIFEST_ASK_AGAIN_COOLDOWN_TIP, MANIFEST_OPEN_CHAT_LABEL, MANIFEST_ASK_FAILED_LINE } from '$lib/manifest-ask.js';
 	import type { CachedPeer, Collection, DirectoryItem, Group } from '$lib/types.js';
 	import { groupByGroups, matchesQuery } from '$lib/contacts-view.js';
+	// M22 W3 — drag-to-group gesture primitives (shared with Contacts). Create is ALWAYS ADDITIVE.
+	import { writeDragPayload, readDragPayload, isValidDropTarget, isSelfDrop, groupSuggestions, commitCreateGroup } from '$lib/drag-group.js';
+	import { contactDisplayName } from '$lib/contact-display.js';
 
 	type BcItem =
 		| { label: string; kind: 'contact' }
@@ -289,6 +292,93 @@
 	let peerWillingTo = $derived(selectedPeer?.profile?.willing_to ?? []);
 	// A peer followed by bare npub (no share code) has sealed listings — they can't be decrypted.
 	let listingsLocked = $derived(!!selectedPeer && !selectedPeer.browse_key_hex && selectedPeer.collections.length === 0);
+
+	// M22 W3 — drag-to-group gesture on the People list. Same shared primitives as Contacts;
+	// create is ALWAYS ADDITIVE. Esc cancels. The naming popover is a simple inline panel here
+	// (Browse's People list is compact, so a full OverflowMenu is overkill).
+	let dragSourceNpub = $state<string | null>(null);
+	let dragOverNpub = $state<string | null>(null);
+	let dragPopoverFor = $state<{ source: string; target: string } | null>(null);
+	let dragNameInput = $state('');
+	let dragSuggestions = $state<string[]>([]);
+
+	async function loadGroupsInto() {
+		try { groups = await groupsGet(); } catch { /* non-fatal */ }
+	}
+
+	function onDragStart(e: DragEvent, npub: string) {
+		if (!e.dataTransfer) return;
+		writeDragPayload(e.dataTransfer, npub);
+		dragSourceNpub = npub;
+	}
+
+	function onDragOver(e: DragEvent, npub: string) {
+		if (!dragSourceNpub) return;
+		e.preventDefault();
+		if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+		dragOverNpub = npub;
+	}
+
+	function onDragLeave(npub: string) {
+		if (dragOverNpub === npub) dragOverNpub = null;
+	}
+
+	function onDragEnd() {
+		dragSourceNpub = null;
+		dragOverNpub = null;
+	}
+
+	function onDrop(e: DragEvent, targetNpub: string) {
+		e.preventDefault();
+		const sourceNpub = readDragPayload(e.dataTransfer);
+		if (!sourceNpub || isSelfDrop(sourceNpub, targetNpub)) {
+			dragSourceNpub = null;
+			dragOverNpub = null;
+			return;
+		}
+		if (!isValidDropTarget(sourceNpub, targetNpub)) return;
+		const source = $contacts.find((c) => c.npub === sourceNpub);
+		const target = $contacts.find((c) => c.npub === targetNpub);
+		if (!source || !target) return;
+		dragSuggestions = groupSuggestions(source, target);
+		dragNameInput = '';
+		dragPopoverFor = { source: sourceNpub, target: targetNpub };
+		dragOverNpub = null;
+	}
+
+	function closeDragPopover() {
+		dragPopoverFor = null;
+		dragNameInput = '';
+		dragSuggestions = [];
+	}
+
+	async function onDragNameKey(e: KeyboardEvent) {
+		if (e.key === 'Enter') {
+			e.preventDefault();
+			await commitDragCreate();
+		} else if (e.key === 'Escape') {
+			e.preventDefault();
+			e.stopPropagation();
+			closeDragPopover();
+		}
+	}
+
+	async function commitDragCreate() {
+		if (!dragPopoverFor) return;
+		const { source, target } = dragPopoverFor;
+		const name = dragNameInput;
+		dragPopoverFor = null;
+		try {
+			await commitCreateGroup({ groupsCreateWithMembers }, name, source, target, groups);
+			await loadGroupsInto();
+			toast(`Group "${name.trim()}" created`);
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			dragNameInput = '';
+			dragSuggestions = [];
+		}
+	}
 </script>
 
 <div class="browse-shell">
@@ -322,10 +412,23 @@
 							{@const letter = peerInitial(peer)}
 							{@const hue = avatarHue(letter)}
 							{@const badge = peerAccessBadge(peer)}
-							<button
+							<!-- M22 W3: each People row is a drag source AND drop target for drag-to-group. -->
+							<!-- svelte-ignore a11y_no_static_element_interactions -->
+							<div
 								class="contact-row"
 								class:contact-selected={selectedPeer?.npub === peer.npub}
+								class:drag-source={dragSourceNpub === peer.npub}
+								class:drag-target={dragSourceNpub !== null && dragOverNpub === peer.npub && dragSourceNpub !== peer.npub}
+								draggable="true"
+								ondragstart={(e) => onDragStart(e, peer.npub)}
+								ondragover={(e) => onDragOver(e, peer.npub)}
+								ondragleave={() => onDragLeave(peer.npub)}
+								ondrop={(e) => onDrop(e, peer.npub)}
+								ondragend={onDragEnd}
 								onclick={() => selectPeer(peer)}
+								onkeydown={(e) => e.key === 'Enter' && selectPeer(peer)}
+								role="button"
+								tabindex="0"
 							>
 								<div class="avatar-wrap">
 									<Avatar {letter} size={28} {hue} picture={peer.profile?.picture} />
@@ -341,8 +444,11 @@
 									<span class="contact-meta">
 										{peer.collections.length} collection{peer.collections.length !== 1 ? 's' : ''}
 									</span>
+									{#if dragSourceNpub !== null && dragOverNpub === peer.npub && dragSourceNpub !== peer.npub}
+										<span class="drag-outcome-browse">group these two</span>
+									{/if}
 								</div>
-							</button>
+							</div>
 						{/each}
 					</div>
 				{/each}
@@ -584,6 +690,41 @@
 		{/if}
 	</div>
 </div>
+
+<!-- M22 W3 — the Name moment for Browse's People list. Esc cancels (no write); Enter commits
+     (additive — both peers keep every group they were already in and both gain the new one). -->
+{#if dragPopoverFor}
+	<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+	<div class="dg-backdrop" onclick={closeDragPopover} onkeydown={(e) => e.key === 'Escape' && closeDragPopover()} role="presentation"></div>
+	{@const dgSource = $contacts.find((c) => c.npub === dragPopoverFor!.source)}
+	{@const dgTarget = $contacts.find((c) => c.npub === dragPopoverFor!.target)}
+	<div class="dg-panel" role="dialog" aria-modal="true" aria-label="Name this group">
+		<div class="dg-header">
+			<div class="dg-avatars">
+				{#if dgSource}
+					{@const dgI = (contactDisplayName(dgSource)[0] ?? '?').toUpperCase()}
+					<span class="dg-avatar dg-avatar-a" style={`--dg-hue:${avatarHue(dgI)}`}>{dgI}</span>
+				{/if}
+				{#if dgTarget}
+					{@const dgI = (contactDisplayName(dgTarget)[0] ?? '?').toUpperCase()}
+					<span class="dg-avatar dg-avatar-b" style={`--dg-hue:${avatarHue(dgI)}`}>{dgI}</span>
+				{/if}
+			</div>
+			<input class="dg-input" type="text" placeholder="Name this group" bind:value={dragNameInput} onkeydown={onDragNameKey} />
+		</div>
+		{#if dragSuggestions.length > 0}
+			<div class="dg-suggestions">
+				{#each dragSuggestions as s (s)}
+					<button type="button" class="dg-chip" onclick={() => (dragNameInput = s)}>{s}</button>
+				{/each}
+			</div>
+		{/if}
+		<div class="dg-footer">
+			<button type="button" class="btn-ghost btn-xs" onclick={closeDragPopover}>Cancel</button>
+			<button type="button" class="btn-primary btn-xs" disabled={dragNameInput.trim().length === 0} onclick={commitDragCreate}>Create</button>
+		</div>
+	</div>
+{/if}
 
 <style>
 	.browse-shell {
@@ -1176,5 +1317,53 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
+
+	/* M22 W3 — drag-to-group gesture on the People list. */
+	.contact-row.drag-source { opacity: 0.35; }
+	.contact-row.drag-target {
+		border-color: var(--accent) !important;
+		background: color-mix(in oklch, var(--accent) 8%, var(--bg-elev1));
+	}
+	.drag-outcome-browse {
+		display: block; font-size: 10.5px; font-weight: 600; color: var(--accent); margin-top: 2px;
+	}
+
+	/* M22 W3 — naming popover (inline panel for Browse's compact People list). */
+	.dg-backdrop { position: fixed; inset: 0; z-index: var(--z-menu); }
+	.dg-panel {
+		position: fixed; z-index: var(--z-menu); top: 50%; left: 50%;
+		transform: translate(-50%, -50%);
+		min-width: 280px;
+		background: var(--bg-elev2);
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		padding: 4px;
+		box-shadow: 0 8px 24px oklch(0 0 0 / 0.3);
+	}
+	.dg-header { display: flex; align-items: center; gap: 10px; padding: 6px 8px; }
+	.dg-avatars { display: flex; position: relative; width: 44px; height: 30px; flex-shrink: 0; }
+	.dg-avatar {
+		width: 30px; height: 30px; border-radius: 50%;
+		display: flex; align-items: center; justify-content: center;
+		font-size: 12px; font-weight: 600; color: white;
+		background: oklch(0.55 0.15 var(--dg-hue));
+		border: 2px solid var(--bg-elev2);
+	}
+	.dg-avatar-b { margin-left: -14px; }
+	.dg-input {
+		flex: 1; font-size: 13px; background: var(--bg-input); border: 1px solid var(--border);
+		border-radius: 6px; padding: 4px 8px; outline: none; color: var(--fg);
+		font-family: var(--font-ui); min-width: 0;
+	}
+	.dg-input:focus { border-color: var(--accent); }
+	.dg-input::placeholder { color: var(--fg-dim); }
+	.dg-suggestions { display: flex; flex-wrap: wrap; gap: 5px; padding: 0 8px 4px; }
+	.dg-chip {
+		font-size: 11px; padding: 2px 8px; border-radius: 999px;
+		background: var(--bg-elev3); border: 1px solid transparent; color: var(--fg-muted);
+		cursor: pointer; font-family: var(--font-ui);
+	}
+	.dg-chip:hover { border-color: var(--accent); color: var(--accent); }
+	.dg-footer { display: flex; justify-content: flex-end; gap: 6px; padding: 6px 8px 2px; border-top: 1px solid var(--divider); margin-top: 4px; }
 
 </style>
