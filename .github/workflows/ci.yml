@@ -255,16 +255,64 @@ jobs:
           # Then drop `path:line:  key:` scalar-value lines: those are YAML scalar values (env:/with:
           # slots), the safe indirection pattern, not inline script text. What remains is an
           # interpolation living inside a run:/script: body.
+          # The scalar exemption uses a negative lookahead (?!(?:run|script):): `run` and `script`
+          # are themselves valid matches for the generic `[A-Za-z_]` key pattern, but they introduce
+          # a script BODY, not a scalar value. Without the lookahead a line like `run: <interpolation>`
+          # is exempted as if it were a safe env: slot — the guard would silence the exact form it
+          # exists to catch (QURATOR-48). The script-bearing keys are `run` (shell) and `script`
+          # (the actions/github-script input); `uses:` is an action reference, not a script body.
+          # The trailing colon inside the lookahead is load-bearing: it anchors the match to the
+          # WHOLE key. Without it, (?!run|script) also refuses to exempt any key merely STARTING
+          # with those letters — `run_id:`, `scripts_dir:` — turning legitimate env:/with: slots
+          # into build-reding false positives. The fixture pins both directions.
+          # PCRE (-P) is available because this step is ubuntu-only (if guard above). ERE has no
+          # negative lookahead, and a two-stage "re-include" filter is unreadable in a run: body.
           # NOTE: these comments must never contain a literal dollar-double-brace — GitHub interpolates
           # `run:` bodies (comments included) at startup, so a literal one fails the whole workflow.
           if out=$(grep -rnE '\$\{\{[^}]*github\.(ref_name|head_ref|event\.[^}]*(title|body))' .github/workflows 2>/dev/null \
-                   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*[A-Za-z_][A-Za-z0-9_.-]*:[[:space:]]*\$\{\{'); then
+                   | grep -vP '^[^:]+:[0-9]+:[[:space:]]*(?!(?:run|script):)[A-Za-z_][A-Za-z0-9_.-]*:[[:space:]]*\$\{\{'); then
             echo "::error::CWE-94 regression — an attacker-controllable context is interpolated inline in a workflow:"
             echo "$out"
             echo "::error::Route it through an env: block (or GITHUB_REF_NAME) as a YAML value, never inline as script text."
             exit 1
           fi
           echo "Workflow injection sweep clean — no github.ref_name/head_ref/event.* inline in script bodies."
+
+      # Positive control for the guard above (QURATOR-48). The guard is a security gate, so it
+      # must have a test proving it is not vacuous: a fixture file holds deliberately-dangerous
+      # run:/script: interpolations of attacker-controllable contexts, and this step runs the
+      # SAME grep logic against it and asserts it REDS. If the guard ever silently passes on
+      # the fixture, the gate is broken and this step fails the build. The fixture lives under
+      # ci-fixtures/ (NOT .github/workflows/) so GitHub does not parse it as a workflow; the
+      # production sweep above scans only .github/workflows, so the fixture never trips it.
+      - name: Injection-sweep guard self-test — must red on the positive fixture
+        if: matrix.platform == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -uo pipefail
+          # This step runs the SAME grep pipeline as the guard above against a positive fixture
+          # and asserts it REDS, proving the guard is not vacuous. The regex uses the backslash-
+          # escaped form below; that form does NOT contain the literal dollar-double-brace (the
+          # backslashes break the sequence apart), so it is safe to write in a run: body — the
+          # guard step above uses the identical escaped form, and has since before this change.
+          hits=$(grep -rnE '\$\{\{[^}]*github\.(ref_name|head_ref|event\.[^}]*(title|body))' ci-fixtures/injection-positive.yml 2>/dev/null \
+                 | grep -vP '^[^:]+:[0-9]+:[[:space:]]*(?!(?:run|script):)[A-Za-z_][A-Za-z0-9_.-]*:[[:space:]]*\$\{\{')
+          if [ -z "$hits" ]; then
+            echo "::error::The injection-sweep guard is VACUOUS — it passed on ci-fixtures/injection-positive.yml, which holds deliberately-dangerous run:/script: interpolations. The guard must catch these (QURATOR-48)."
+            exit 1
+          fi
+          n=$(printf '%s\n' "$hits" | grep -c .)
+          # Negative half: the fixture also holds SAFE env: keys whose names merely start with a
+          # script-bearing name (run_id, scripts_dir, RUNNER_TAG). Those must be exempted. If they
+          # show up in the hit set, the exemption lookahead has lost its key anchor and every
+          # workflow using such a key would red the build on a false positive.
+          if fp=$(printf '%s\n' "$hits" | grep -E 'run_id:|scripts_dir:|RUNNER_TAG:'); then
+            echo "::error::FALSE POSITIVE — the guard flagged a safe env: key whose name merely starts with a script-bearing name. Anchor the exemption lookahead to the whole key, i.e. (?!(?:run|script):) not (?!run|script):"
+            echo "$fp"
+            exit 1
+          fi
+          echo "Guard self-test OK — caught $n dangerous interpolation(s), and exempted every safe env: key:"
+          printf '%s\n' "$hits" | sed 's/^/  /'
 
       # release.yml overwrites both versions from the tag at build time; this pins dev-build
       # getVersion() honesty (audit I-8): tauri.conf.json must match the hb-app package version.
