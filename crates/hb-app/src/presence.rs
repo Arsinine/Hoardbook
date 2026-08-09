@@ -34,7 +34,7 @@ pub const PRESENCE_TTL_SECS: u64 = 30 * 60;
 /// Republish cadence.
 pub const PRESENCE_REFRESH_SECS: u64 = 5 * 60;
 /// First publish fires shortly after launch (the endpoint needs a moment to bind).
-const PRESENCE_FIRST_DELAY_SECS: u64 = 15;
+pub(crate) const PRESENCE_FIRST_DELAY_SECS: u64 = 15;
 
 /// The retry backoff schedule for a FAILED beacon cycle (W1, 2026-08-02). A successful cycle waits
 /// the normal `PRESENCE_REFRESH_SECS` (300 s) cadence; a failed cycle retries fast — inside the 600 s
@@ -267,6 +267,10 @@ pub(crate) async fn run_presence_loop(
 ) {
     let mut delay = Duration::from_secs(PRESENCE_FIRST_DELAY_SECS);
     let mut retry_idx: u32 = 0;
+    // QURATOR-66: one INFO line on spawn so a log shows the loop was created at all. The fifth
+    // presence report root-caused a loop that died silently in a detached task — a bare "loop
+    // started" line is the cheapest possible proof-of-life in the log a user pastes.
+    tracing::info!(first_delay_secs = PRESENCE_FIRST_DELAY_SECS, "presence loop: started");
     // v0.12.10 diagnostic: prove the task got polled at all BEFORE the first await. If the loop is
     // never spawned, or spawned but never polled, the stage stays "" — distinguishable from every
     // in-cycle stage below.
@@ -281,7 +285,7 @@ pub(crate) async fn run_presence_loop(
             _ = tokio::time::sleep(delay) => {}
             _ = cancel_rx.changed() => {
                 if *cancel_rx.borrow() {
-                    tracing::debug!("presence loop cancelled");
+                    tracing::info!("presence loop: cancelled (shutdown)");
                     break;
                 }
             }
@@ -319,6 +323,7 @@ pub(crate) async fn run_presence_loop(
         // task died silently (no console, panics bypass tracing) and presence was dead for the
         // session with the panel frozen at "acquiring-client". Now the panic is recorded like any
         // other failed cycle and the backoff retry self-heals once the flap clears.
+        let npub_disp = crate::logging::trunc_npub(&id.npub());
         let cycle = tokio::spawn(publish_cycle(
             id,
             store.clone(),
@@ -331,6 +336,9 @@ pub(crate) async fn run_presence_loop(
             Ok(succeeded) => succeeded,
             Err(e) => {
                 let msg = panic_message(e);
+                // QURATOR-66: the panic-and-restart signal. This loop died silently in a detached
+                // task for four releases; ERROR here (with the panic payload) is the one line a log
+                // MUST show to explain "presence went dead then came back".
                 tracing::error!("presence cycle aborted: {msg}");
                 let prev = beacon.read().await.clone();
                 *beacon.write().await =
@@ -338,6 +346,21 @@ pub(crate) async fn run_presence_loop(
                 false
             }
         };
+
+        // QURATOR-66: the cycle outcome at DEBUG. A success is once per ~5 min (not a hot loop),
+        // so this is a handful of lines per session — readable at the default level. The truncated
+        // npub identifies which identity published without leaking the full npub (INV-2).
+        if succeeded {
+            tracing::debug!(
+                npub = %npub_disp,
+                "presence cycle: beacon published"
+            );
+        } else {
+            tracing::debug!(
+                npub = %npub_disp,
+                "presence cycle: failed (will retry with backoff)"
+            );
+        }
 
         // W1: a failed cycle retries fast (backoff inside the 600s window); a success resets to the
         // normal 300s cadence.

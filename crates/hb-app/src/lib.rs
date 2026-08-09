@@ -280,6 +280,12 @@ pub fn run() {
             // see `logging::install`. `data_dir` is the resolved app-data dir (same one `DataStore`
             // uses), and it now exists.
             logging::install(&data_dir);
+            // QURATOR-66: one INFO line per subsystem as it initialises, so a truncated log still
+            // shows how far boot got. Each line is cheap (one format! at startup, not per-iteration)
+            // and lands BEFORE the subsystem's own debug! lines, so the boot sequence is a readable
+            // header in the log a user pastes.
+            tracing::info!("startup: logging subscriber installed");
+            tracing::info!("startup: app data dir resolved");
 
             // M21 W1 — install the process-level rustls CryptoProvider before any network task
             // can run. The lock resolves rustls with BOTH providers compiled in (`ring` via
@@ -300,6 +306,7 @@ pub fn run() {
             // already installed — not a failure for us, hence `let _ =`. Same idiom as
             // `wan_it::run`.
             let _ = rustls::crypto::ring::default_provider().install_default();
+            tracing::info!("startup: rustls CryptoProvider installed");
 
             let store = DataStore::new(data_dir);
 
@@ -337,6 +344,16 @@ pub fn run() {
             let app_handle = app.handle().clone();
 
             restore_identity(store.clone(), Arc::clone(&identity));
+            // QURATOR-66: report whether an identity was restored. The truncated npub is enough to
+            // confirm "this is the right account" without leaking it (INV-2). Empty = first launch.
+            {
+                let npub = identity
+                    .blocking_read()
+                    .as_ref()
+                    .map(|id| logging::trunc_npub(&id.npub()))
+                    .unwrap_or_default();
+                tracing::info!(npub = %npub, "startup: identity restored from disk");
+            }
 
             // QURATOR-65: write the diagnostics header as the first lines of the current log file.
             // `restore_identity` ran above so the npub (if any) is in the shared identity; the relay
@@ -353,6 +370,7 @@ pub fn run() {
                     .unwrap_or_default();
                 logging::write_startup_header(&version, &relays, &npub);
             }
+            tracing::info!("startup: diagnostics header written");
 
             // M18 W4: a ticket is valid until redeemed, so an approval given last session must still
             // be dialable this one. `restore_identity` populates synchronously above, so the transport
@@ -386,8 +404,11 @@ pub fn run() {
                         &store,
                     )
                     .await;
+                    tracing::info!("startup: manifest-plane rebind check complete");
                 });
             }
+            tracing::info!("startup: presence loop + update check spawning");
+            tracing::info!("startup: snapshot watch task spawning");
 
             spawn_background_tasks(
                 Arc::clone(&identity),

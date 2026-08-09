@@ -113,11 +113,32 @@ pub(crate) async fn send_dm_inner(
     own_relays: &[String],
     timeout: std::time::Duration,
 ) -> Result<Event, hb_net::NetError> {
+    // QURATOR-66: DM send lifecycle — enqueued/sealed/published. The recipient npub is TRUNCATED
+    // (INV-2: no full npub in a log the user pastes). The plaintext is NEVER logged — only the
+    // content length, which is enough to distinguish an empty/oversize failure from a real one.
+    tracing::debug!(
+        recipient = %crate::logging::trunc_npub(&npub_of(recipient)),
+        content_len = content.len(),
+        "dm: building NIP-17 gift wrap"
+    );
     let wrap = build_dm(identity, recipient, content).await?;
+    tracing::debug!(
+        recipient = %crate::logging::trunc_npub(&npub_of(recipient)),
+        "dm: sealed — resolving recipient read-relays"
+    );
     let targets =
         hb_net::resolve_recipient_relays(client, recipient, own_relays, own_relays, timeout).await;
+    tracing::debug!(
+        recipient = %crate::logging::trunc_npub(&npub_of(recipient)),
+        target_relays = targets.len(),
+        "dm: publishing gift wrap to recipient inbox ∪ own relays"
+    );
     client.ensure_relays(&targets, timeout).await?;
     client.publish_to(&wrap, &targets).await?;
+    tracing::info!(
+        recipient = %crate::logging::trunc_npub(&npub_of(recipient)),
+        "dm: delivered"
+    );
     Ok(wrap)
 }
 
@@ -159,7 +180,10 @@ pub(crate) async fn decode_dms(
                     sent_at: rfc3339_of(dm.created_at),
                 });
             }
-            Err(e) => tracing::debug!("skipping undecryptable/foreign gift wrap: {e}"),
+            Err(e) => tracing::debug!(
+                wrap_id = %wrap.id.to_hex(),
+                "dm inbox: skipping undecryptable/foreign gift wrap: {e}"
+            ),
         }
     }
     out.sort_by(|a, b| a.sent_at.cmp(&b.sent_at));
@@ -304,7 +328,10 @@ pub(crate) async fn merge_wraps_into_cache(
                     }
                 }
             }
-            Err(e) => tracing::debug!("skipping undecryptable/foreign gift wrap: {e}"),
+            Err(e) => tracing::debug!(
+                wrap_id = %wrap.id.to_hex(),
+                "dm inbox: skipping undecryptable/foreign gift wrap: {e}"
+            ),
         }
     }
     (requests, changed)
