@@ -338,6 +338,22 @@ pub fn run() {
 
             restore_identity(store.clone(), Arc::clone(&identity));
 
+            // QURATOR-65: write the diagnostics header as the first lines of the current log file.
+            // `restore_identity` ran above so the npub (if any) is in the shared identity; the relay
+            // set is the effective configured-or-default set. Emits via `tracing::info!`, so it is a
+            // no-op if the subscriber failed to install (never-fail contract). Best-effort on the npub
+            // read — `blocking_read` is safe here because this is the synchronous `setup` closure.
+            {
+                let version = app.package_info().version.to_string();
+                let relays = net::relay_urls(&store);
+                let npub = identity
+                    .blocking_read()
+                    .as_ref()
+                    .map(|id| id.npub())
+                    .unwrap_or_default();
+                logging::write_startup_header(&version, &relays, &npub);
+            }
+
             // M18 W4: a ticket is valid until redeemed, so an approval given last session must still
             // be dialable this one. `restore_identity` populates synchronously above, so the transport
             // key is available here. Binds ONLY if an unspent ticket is on the books — see
@@ -424,6 +440,8 @@ pub fn run() {
             commands::collection::update_collection_visibility,
             commands::collection::export_collection,
             commands::collection::export_manifest,
+            commands::diagnostics::reveal_log_folder,
+            commands::diagnostics::copy_diagnostics,
             commands::browse::import_manifest,
             // M18 W4 — the fulfil verb, both halves.
             commands::fulfil::send_full_list,

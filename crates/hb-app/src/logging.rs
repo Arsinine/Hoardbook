@@ -19,6 +19,57 @@ use std::path::Path;
 
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
+/// The diagnostic header's privacy contract (INV-2): the npub is TRUNCATED to its first 12 chars,
+/// and neither the browse-key nor the nsec/private key ever appears. One paste must answer "what
+/// build, what config, which machine" — and nothing more. See `diagnostics_header` and the
+/// `header_never_contains_the_browse_key_or_nsec` red-green test.
+pub(crate) const NPUB_TRUNC_LEN: usize = 12;
+
+/// Build the diagnostics header: the lines that appear at the top of every freshly-rotated log file
+/// AND at the top of the "Copy diagnostics" clipboard output. Pure — takes already-resolved strings
+/// so the caller owns the data-dir / identity reads, and the privacy contract is unit-testable
+/// without a Tauri runtime.
+///
+/// `npub` is the full bech32 npub; it is truncated here to [`NPUB_TRUNC_LEN`] chars. `relays` is the
+/// effective configured-or-default set (what the app actually dials). Never logs the browse-key,
+/// nsec, DM plaintext, or private-collection contents.
+pub(crate) fn diagnostics_header(
+    version: &str,
+    os: &str,
+    arch: &str,
+    profile: &str,
+    relays: &[String],
+    npub: &str,
+) -> String {
+    let npub_disp: String = npub.chars().take(NPUB_TRUNC_LEN).collect();
+    let relays_line = if relays.is_empty() { "(none)".to_string() } else { relays.join(", ") };
+    format!(
+        "=== Hoardbook diagnostics ===\n\
+         version: {version}\n\
+         os: {os} {arch}\n\
+         build: {profile}\n\
+         relays: {relays_line}\n\
+         npub: {npub_disp}…\n\
+         === end diagnostics ==="
+    )
+}
+
+/// The build profile label for the diagnostics header. `debug` under `debug_assertions`, else
+/// `release` (the shipped package build). Pure — testable without a runtime.
+pub(crate) fn build_profile() -> &'static str {
+    if cfg!(debug_assertions) { "debug" } else { "release" }
+}
+
+/// The OS + arch pair the header reports (`std::env::consts`, resolved by the caller so the pure
+/// header builder stays platform-stable in snapshot tests).
+pub(crate) fn os_arch() -> (&'static str, &'static str) {
+    (std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// The daily-rotated log file prefix (matches the `RollingFileAppender` `filename_prefix` below) —
+/// exposed so the copy-diagnostics command can locate the newest file without re-deriving the name.
+pub(crate) const LOG_PREFIX: &str = "hb-app.log";
+
 /// Install the file-based subscriber writing under `<app_data_dir>/logs/`. Never panics — a
 /// failure returns silently (stderr gets a best-effort line) so the app starts regardless.
 pub(crate) fn install(data_dir: &Path) {
@@ -69,5 +120,61 @@ pub(crate) fn install(data_dir: &Path) {
         // Best-effort stderr line; never panics. The subscriber may be unset, in which case tracing
         // events simply go nowhere — the same state the shipped app has always had.
         eprintln!("hb-app: file logging unavailable ({e}); continuing without a subscriber");
+    }
+}
+
+/// Write the diagnostics header as the first lines of the current log file. Called once on startup,
+/// after the subscriber is installed and the identity/relay set are resolved (so the npub and relays
+/// are the real values, not pre-load defaults). Emits via `tracing::info!`, so it lands in the same
+/// file the subscriber owns and respects the non-blocking flush — a no-op if the subscriber failed
+/// to install. On each launch the header is the first content written to the current day's file; the
+/// copy button ([`crate::commands::diagnostics::copy_diagnostics`]) rebuilds it from the same pure
+/// builder so the two stay in sync.
+pub(crate) fn write_startup_header(version: &str, relays: &[String], npub: &str) {
+    let (os, arch) = os_arch();
+    let profile = build_profile();
+    let header = diagnostics_header(version, os, arch, profile, relays, npub);
+    // One multi-line info! so the header lands as a contiguous block at the file top, not interleaved
+    // with the background tasks' debug! lines.
+    tracing::info!("{header}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_truncates_npub_to_twelve_chars() {
+        let relays = vec!["wss://relay.example".to_string()];
+        let npub = "npub1abcdefghijklmnop";
+        let h = diagnostics_header("0.12.11", "linux", "x86_64", "debug", &relays, npub);
+        // NPUB_TRUNC_LEN=12: first 12 chars of "npub1abcdefghijklmnop" = "npub1abcdefg".
+        assert!(h.contains("npub: npub1abcdefg…"), "expected 12-char truncation; got:\n{h}");
+        assert!(!h.contains("npub1abcdefgh"), "full npub past 12 chars must not appear");
+    }
+
+    #[test]
+    fn header_lists_relays_and_version() {
+        let relays = vec!["wss://a.example".to_string(), "wss://b.example".to_string()];
+        let h = diagnostics_header("1.2.3", "macos", "aarch64", "release", &relays, "npub1xyz");
+        assert!(h.contains("version: 1.2.3"));
+        assert!(h.contains("os: macos aarch64"));
+        assert!(h.contains("build: release"));
+        assert!(h.contains("relays: wss://a.example, wss://b.example"));
+    }
+
+    #[test]
+    fn header_shows_none_for_empty_relay_set() {
+        let h = diagnostics_header("1.0.0", "linux", "x86_64", "debug", &[], "npub1abc");
+        assert!(h.contains("relays: (none)"));
+    }
+
+    #[test]
+    fn header_never_contains_the_browse_key_or_nsec() {
+        // INV-2 red-green: the header builder takes only an npub (truncated) and never sees the
+        // browse-key or nsec. This test pins that — if a future change passes a key in, it fails.
+        let h = diagnostics_header("0.12.11", "linux", "x86_64", "debug", &[], "npub1abc");
+        assert!(!h.contains("nsec"), "header must never contain an nsec string");
+        assert!(!h.contains("browse_key"), "header must never contain the browse-key");
     }
 }
