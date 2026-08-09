@@ -509,6 +509,17 @@ export const privateAudienceList = () => invoke<string[]>('private_audience_list
 export const privateAudienceSet = (npub: string, receives: boolean) =>
 	invoke<void>('private_audience_set', { npub, receives });
 
+// ── Diagnostics (QURATOR-65) ───────────────────────────────────────────────────
+// The log/diagnostics surface that makes bug reports diagnosable. `copyDiagnostics` returns the
+// header + capped log tail as a string; the UI owns the clipboard write. `revealLogFolder` opens
+// the OS file manager at <app_data_dir>/logs.
+
+/** The diagnostics text: header + capped tail of the current log file. Ready to paste. */
+export const copyDiagnostics = () => invoke<string>('copy_diagnostics');
+
+/** Open the OS file manager at the log directory. Creates it if missing (first launch). */
+export const revealLogFolder = () => invoke<void>('reveal_log_folder');
+
 // ── Watches ───────────────────────────────────────────────────────────────────
 
 export const watchesGet    = () => invoke<Watch[]>('watches_get');

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, hasPublishedProfile, publishProfile } from '$lib/api.js';
+	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, hasPublishedProfile, publishProfile, copyDiagnostics, revealLogFolder } from '$lib/api.js';
 	import type { Settings, UpdateInfo, PortableUpdateInfo, BeaconReport } from '$lib/api.js';
 	import { keyView } from '$lib/key-view.js';
 	import { passphraseStrength, backupModeOptions, type BackupMode } from '$lib/backup-export.js';
@@ -180,6 +180,31 @@
 
 	async function doApplyUpdate() {
 		try { await applyStagedUpdate(); } catch (e) { toast(String(e), 'error'); }
+	}
+
+	// ── Diagnostics (QURATOR-65) ─────────────────────────────────────────────────
+	// The "help me file a bug" block: copy a version+config header + the log tail (capped), or
+	// reveal the log folder in the OS file manager. Both must not panic on a first launch with no
+	// log dir — the backend creates/handles that.
+	let copyingDiagnostics = $state(false);
+	let revealingLogs = $state(false);
+
+	async function handleCopyDiagnostics() {
+		copyingDiagnostics = true;
+		try {
+			const text = await copyDiagnostics();
+			await handleCopy(text);
+			toast('Diagnostics copied — paste it in your bug report', 'success');
+		} catch (e) { toast(String(e), 'error'); }
+		finally { copyingDiagnostics = false; }
+	}
+
+	async function handleRevealLogs() {
+		revealingLogs = true;
+		try {
+			await revealLogFolder();
+		} catch (e) { toast(String(e), 'error'); }
+		finally { revealingLogs = false; }
 	}
 
 	let relayUrls: string[] = $state([]);
@@ -718,6 +743,33 @@
 		{#if updateError}
 			<div class="update-error-text">{updateError}</div>
 		{/if}
+	</div>
+
+	<!-- Diagnostics (QURATOR-65): the "help me file a bug" block. Copy a version+config header +
+	     capped log tail, or reveal the log folder. -->
+	<div class="section-label">Diagnostics</div>
+	<div class="surface">
+		<div class="toggle-row">
+			<div class="toggle-text">
+				<div class="toggle-label">Copy diagnostics to clipboard</div>
+				<div class="toggle-sub">
+					A version/config header (npub truncated, no keys) plus the tail of the current log — ready
+					to paste in a bug report or Reddit comment. Capped to ~2000 lines / ~256 KB.
+				</div>
+			</div>
+			<button class="btn-default btn-sm" onclick={handleCopyDiagnostics} disabled={copyingDiagnostics}>
+				{copyingDiagnostics ? 'Copying…' : 'Copy diagnostics'}
+			</button>
+		</div>
+		<div class="toggle-row">
+			<div class="toggle-text">
+				<div class="toggle-label">Reveal log folder</div>
+				<div class="toggle-sub">Open the OS file manager at the daily-rotated log files.</div>
+			</div>
+			<button class="btn-default btn-sm" onclick={handleRevealLogs} disabled={revealingLogs}>
+				{@html icons.folder} {revealingLogs ? 'Opening…' : 'Reveal logs'}
+			</button>
+		</div>
 	</div>
 
 	<!-- Watches section removed 2026-08-03: the backend (watches_get/create/delete/evaluate) exists
