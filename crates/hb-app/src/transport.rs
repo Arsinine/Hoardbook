@@ -553,10 +553,12 @@ pub async fn fetch_manifest(
 ) -> Result<ManifestPayload> {
     ticket.verify_shape().map_err(|e| anyhow!("ticket refused before dialling: {e}"))?;
     let addr = parse_node_addr(&ticket.node_addr)?;
+    tracing::debug!(slug = %ticket.slug, "iroh: dialing the manifest plane");
     let conn = endpoint
         .connect(addr, MANIFEST_ALPN)
         .await
         .with_context(|| format!("dial the manifest plane for {}", ticket.slug))?;
+    tracing::debug!(slug = %ticket.slug, "iroh: connected — fetching manifest");
     let result = fetch_over_connection(&conn, ticket, accept).await;
     conn.close(0u32.into(), b"");
     result

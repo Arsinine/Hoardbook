@@ -160,11 +160,28 @@ pub async fn ensure_endpoint(
     }
     let listening = need == Role::Listen;
     let endpoint = if listening {
+        tracing::info!(
+            owner = %crate::logging::trunc_npub(owner_npub),
+            "iroh: binding a LISTENING manifest endpoint (serving role)"
+        );
         let ep = bind_endpoint(transport_key.bytes()).await?;
+        tracing::info!(
+            owner = %crate::logging::trunc_npub(owner_npub),
+            "iroh: manifest endpoint bound — accept loop running"
+        );
         spawn_accept_loop(ep.clone(), ManifestPlane::new(source));
         ep
     } else {
-        bind_client_endpoint(transport_key.bytes()).await?
+        tracing::info!(
+            owner = %crate::logging::trunc_npub(owner_npub),
+            "iroh: binding a DIAL-ONLY manifest endpoint (redeeming role — no accept loop)"
+        );
+        let ep = bind_client_endpoint(transport_key.bytes()).await?;
+        tracing::info!(
+            owner = %crate::logging::trunc_npub(owner_npub),
+            "iroh: dial-only endpoint bound"
+        );
+        ep
     };
     st.bound = Some(BoundPlane {
         endpoint: endpoint.clone(),

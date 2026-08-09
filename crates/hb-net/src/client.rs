@@ -85,6 +85,50 @@ fn status_label(s: RelayStatus) -> &'static str {
     }
 }
 
+/// Canonical form of a relay URL for logging + equality: lowercase, trailing slash stripped.
+///
+/// QURATOR-66: the v0.12.9 bug was a raw `===` on relay URLs — `wss://a/` and `wss://a` compared
+/// unequal and a presence beacon published to one was read from the other as "not sent". Logging
+/// the canonical form alongside the raw one (as every connect/publish site now does) makes a
+/// normalization mismatch visible in a log the user pastes. This is NOT used for relay-pool
+/// equality (that is order-insensitive set comparison in `hb-app::net`); it is a logging aid.
+fn canonical_relay_url(url: &str) -> String {
+    let lower = url.to_ascii_lowercase();
+    lower.trim_end_matches('/').to_string()
+}
+
+/// Log the per-relay outcome of a publish (QURATOR-66). strfry rejects future-dated and NIP-40-
+/// expired events at the **write** boundary, and that rejection was previously invisible — the
+/// caller saw `PublishOutcome.rejected` only as an error string when ALL relays rejected. Logging
+/// each relay's accept/reject at DEBUG (accept) / WARN (reject) with the relay's own reason makes a
+/// partial failure (one relay accepted, one rejected the future-dated event) visible in the log.
+///
+/// Per-iteration of a hot loop this is bounded: a publish touches a fixed relay set, not every
+/// event in a large collection (the split publish goes through one `publish`/`publish_to` call per
+/// part, but the relay set is the same each time, so this is one INFO/WARN line per relay per call —
+/// readable at the default level for an ordinary session).
+fn log_publish_outcome(kind: u64, outcome: &PublishOutcome) {
+    let accepted = outcome.accepted.len();
+    let rejected = outcome.rejected.len();
+    if rejected == 0 {
+        tracing::debug!(kind, accepted, "publish accepted by all relays");
+    } else if accepted == 0 {
+        // All-reject is an error path (the caller returns Err); log at WARN with the reasons.
+        tracing::warn!(kind, rejected, "publish rejected by every relay");
+        for (url, why) in &outcome.rejected {
+            tracing::warn!(relay = %canonical_relay_url(url), reason = %why, "publish rejected");
+        }
+    } else {
+        // Partial: some accepted, some rejected. This is the strfry-write-boundary case the ticket
+        // names — log the rejects so a future-dated/expired event that one relay refuses while
+        // others accept is not silently swallowed.
+        tracing::info!(kind, accepted, rejected, "publish: partial accept across relays");
+        for (url, why) in &outcome.rejected {
+            tracing::warn!(relay = %canonical_relay_url(url), reason = %why, "publish rejected by this relay");
+        }
+    }
+}
+
 /// Whether a relay pool is still **live** (M12 W1, Decision A-recovery): live if it holds at least
 /// one relay that is **not** in a dead terminal state (`Terminated`/`Banned` — "no retry will
 /// occur"). `Disconnected` is transient (nostr-sdk auto-reconnects — "another attempt will occur
@@ -110,15 +154,36 @@ impl RelayClient {
         if relays.is_empty() {
             return Err(NetError::NoRelayConnected("no relays configured".into()));
         }
+        tracing::info!(relay_count = relays.len(), timeout_ms = timeout.as_millis() as u64, "relay client: connecting");
         let client = Client::builder().signer(identity.keys().clone()).build();
         for r in relays {
+            // QURATOR-66: log the canonical form alongside the raw URL. The v0.12.9 bug was a raw
+            // `===` comparison on relay URLs (trailing slash, etc.) that made two "same" relays
+            // compare unequal, and the diagnostics panel could not show it. Logging both makes a
+            // URL-normalization mismatch visible in the log a user pastes.
+            let canon = canonical_relay_url(r);
+            tracing::debug!(raw_url = %r, canonical_url = %canon, "relay client: add_relay");
             client
                 .add_relay(r.as_str())
                 .await
                 .map_err(|e| NetError::Client(format!("add_relay({r}): {e}")))?;
         }
         let conn = client.try_connect(timeout).await;
+        // Log the per-relay connect outcome: which relays came up vs failed. The failed set carries a
+        // reason string per relay — currently surfaced only in the error path; logging it here means a
+        // partial connect (some relays up, some down) is visible without a full failure.
+        for url in &conn.success {
+            tracing::info!(relay = %canonical_relay_url(&url.to_string()), "relay client: connected");
+        }
+        for (url, why) in &conn.failed {
+            tracing::warn!(relay = %canonical_relay_url(&url.to_string()), reason = %why, "relay client: connect failed");
+        }
         if conn.success.is_empty() {
+            tracing::error!(
+                tried = relays.len(),
+                failed = conn.failed.len(),
+                "relay client: no relay completed the handshake"
+            );
             return Err(NetError::NoRelayConnected(format!("{:?}", conn.failed)));
         }
         Ok(Self {
@@ -155,6 +220,7 @@ impl RelayClient {
     /// accept/reject split. Errors only if **no** relay accepted (an all-reject / all-drop).
     pub async fn publish(&self, event: &Event) -> Result<PublishOutcome, NetError> {
         self.throttle().await;
+        let kind = event.kind.as_u16() as u64;
         let output = self
             .client
             .send_event(event)
@@ -164,6 +230,7 @@ impl RelayClient {
             accepted: output.success.iter().map(|u| u.to_string()).collect(),
             rejected: output.failed.iter().map(|(u, why)| (u.to_string(), why.clone())).collect(),
         };
+        log_publish_outcome(kind, &outcome);
         if outcome.accepted.is_empty() {
             return Err(NetError::PublishRejected(format!("{:?}", outcome.rejected)));
         }
@@ -181,6 +248,7 @@ impl RelayClient {
             return Err(NetError::NoRelayConnected("no target relays for publish_to".into()));
         }
         self.throttle().await;
+        let kind = event.kind.as_u16() as u64;
         let output = self
             .client
             .send_event_to(relays.iter().map(|s| s.as_str()), event)
@@ -190,6 +258,7 @@ impl RelayClient {
             accepted: output.success.iter().map(|u| u.to_string()).collect(),
             rejected: output.failed.iter().map(|(u, why)| (u.to_string(), why.clone())).collect(),
         };
+        log_publish_outcome(kind, &outcome);
         if outcome.accepted.is_empty() {
             return Err(NetError::PublishRejected(format!("{:?}", outcome.rejected)));
         }
@@ -217,7 +286,25 @@ impl RelayClient {
                 let want = url.trim_end_matches('/');
                 let found = live.iter().find(|(u, _)| u.to_string().trim_end_matches('/') == want);
                 let (status, connected) = match found {
-                    Some((_, r)) => (status_label(r.status()).to_string(), r.is_connected()),
+                    Some((_, r)) => {
+                        let s = r.status();
+                        // QURATOR-66: a relay dropping to a dead terminal state (Terminated/Banned)
+                        // is the SPOF signal — log it at WARN so a user report shows which relay died
+                        // and when. The transient Disconnected is DEBUG (nostr-sdk auto-reconnects).
+                        if matches!(s, RelayStatus::Terminated | RelayStatus::Banned) {
+                            tracing::warn!(
+                                relay = %canonical_relay_url(url),
+                                status = status_label(s),
+                                "relay reached a dead terminal state — it will not auto-reconnect"
+                            );
+                        } else if s == RelayStatus::Disconnected {
+                            tracing::debug!(
+                                relay = %canonical_relay_url(url),
+                                "relay disconnected (transient — nostr-sdk will reconnect)"
+                            );
+                        }
+                        (status_label(s).to_string(), r.is_connected())
+                    }
                     None => ("disconnected".to_string(), false),
                 };
                 RelayHealth { url: url.clone(), status, connected, last_error: None }
@@ -281,6 +368,7 @@ impl RelayClient {
         let mut added = false;
         for r in relays {
             if !self.relays.contains(r) && self.client.add_relay(r.as_str()).await.is_ok() {
+                tracing::debug!(relay = %canonical_relay_url(r), "ensure_relays: added peer relay to the pool");
                 added = true;
             }
         }
@@ -293,6 +381,7 @@ impl RelayClient {
 
     /// Close all relay connections.
     pub async fn disconnect(self) {
+        tracing::info!("relay client: disconnecting (session end)");
         self.client.disconnect().await;
     }
 }
