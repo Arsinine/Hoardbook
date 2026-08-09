@@ -1,0 +1,62 @@
+# Positive control fixture for the workflow-injection sweep guard in
+# .github/workflows/ci.yml (step "Workflow injection sweep — no attacker-context
+# interpolation in script bodies"). This file is NOT a workflow — it lives under
+# ci-fixtures/, and GitHub only parses .github/workflows/*.yml as workflows, so
+# this file is inert data the runner never executes. The self-test step in ci.yml
+# greps this file directly to prove the guard is not vacuous: it MUST red on every
+# interpolation line below.
+#
+# Each dangerous line interpolates an attacker-controllable context (a PR title,
+# body, branch name, or tag name) directly into a script-bearing key. The
+# "adjacent" run:/script: forms below are the EXACT shape of the QURATOR-48 bug:
+# the interpolation sits immediately after the key, so the pre-fix scalar
+# exemption matched the key and silenced the line. The "echo" form has a command
+# between the key and the token and was already caught; it is included for
+# defence-in-depth. The safe indirection pattern is deliberately NOT here — that
+# form is the legitimate pattern and would be (correctly) exempted, so it has no
+# place in a positive control.
+#
+# IMPORTANT: keep literal interpolation tokens OUT of comment lines in this file.
+# A comment containing a live token is legitimately suspicious and the guard
+# correctly refuses to exempt it; leaving one in would pollute the hit set and
+# muddy the positive control. Tokens belong only on the run:/script: data lines.
+
+name: injection-positive-fixture-NOT-A-WORKFLOW
+on: [push]
+jobs:
+  fixture-only-never-runs:
+    runs-on: ubuntu-latest
+    steps:
+      # Adjacent run: form (the QURATOR-48 bug shape) — token immediately after
+      # the key, matching the generic scalar-key pattern that the old exemption
+      # wrongly applied to. Guard MUST catch.
+      - name: bad-run-title-adjacent
+        run: ${{ github.event.pull_request.title }}
+
+      - name: bad-run-ref-name-adjacent
+        run: ${{ github.ref_name }}
+
+      # Non-adjacent run: form — a command sits between the key and the token.
+      # Already caught by the old guard (the command breaks scalar adjacency);
+      # included for defence-in-depth so the guard is tested on this shape too.
+      - name: bad-run-body-echo
+        run: echo "${{ github.event.pull_request.body }}"
+
+      # Adjacent script: form (actions/github-script input) — the other
+      # script-bearing key. Same bug shape as run:, same fix.
+      - name: bad-script-title-adjacent
+        uses: actions/github-script@v7
+        with:
+          script: ${{ github.event.pull_request.title }}
+
+      # --- NEGATIVE CONTROL: these are SAFE and the guard must NOT flag them. ---
+      # The exemption's lookahead must be anchored to the whole key. An unanchored
+      # (?!run|script) also refuses to exempt keys that merely START with those
+      # letters, turning ordinary env: slots into false positives that red the
+      # build. The self-test asserts none of these keys appears in the hit set.
+      - name: safe-env-keys-that-start-with-script-bearing-names
+        env:
+          run_id: ${{ github.ref_name }}
+          scripts_dir: ${{ github.ref_name }}
+          RUNNER_TAG: ${{ github.ref_name }}
+        run: echo "safe indirection — values arrive via the environment, never as script text"
