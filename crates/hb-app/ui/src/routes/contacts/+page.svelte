@@ -27,7 +27,9 @@
 	import { ALPHABET, groupByLetter, groupByGroups, onlineBucket, matchesQuery, presentSectionKeys } from '$lib/contacts-view.js';
 	// M22 W3 — drag-to-group gesture primitives (shared with Browse). Create is ALWAYS ADDITIVE
 	// (Reading B): both peers keep every group they were already in and both gain the new one.
-	import { writeDragPayload, readDragPayload, isValidDropTarget, isSelfDrop, groupSuggestions, commitCreateGroup } from '$lib/drag-group.js';
+	// M22 W4 — drop onto an existing group: plain drop MOVES, Shift-drop ADDS (owner ruling
+	// 2026-08-09 inverted the earlier inferred rule). Refused before release; Ungrouped clears all.
+	import { writeDragPayload, readDragPayload, isValidDropTarget, isSelfDrop, groupSuggestions, commitCreateGroup, computeDropOutcome, commitDropOnGroup, UNGROUPED_TARGET, type DropOutcome } from '$lib/drag-group.js';
 	import { onMount, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
 
@@ -159,6 +161,10 @@
 		// but the create gesture continues at the naming step.
 		dragSourceNpub = null;
 		dragOverNpub = null;
+		// M22 W4: also clear the group-heading drop affordance state so a cancelled drag doesn't
+		// leave a section heading lit.
+		dropOverTarget = null;
+		dropOutcome = null;
 	}
 
 	function onDrop(e: DragEvent, targetNpub: string) {
@@ -230,6 +236,65 @@
 			dragNameInput = '';
 			dragSuggestions = [];
 			dragNameFocused = false;
+		}
+	}
+
+	// ── M22 W4 — drop onto an existing group (heading, chip, or Ungrouped) ───────────────
+	// Owner ruling 2026-08-09 (inverted from the inferred rule): a plain drop MOVES the contact
+	// into the target; holding Shift ADDS (preserves existing memberships). The refuse state
+	// ("already in Film") is computed on dragover so the cursor shows it is not allowed BEFORE the
+	// drop. Ungrouped writes immediately and irreversibly: NO confirm, NO undo (owner: "This isn't
+	// a word doc."). Nothing on this path reads or writes the private audience.
+	let dropOverTarget: string | null = $state(null);     // group name or UNGROUPED_TARGET under the cursor
+	let dropOutcome: DropOutcome | null = $state(null);   // computed on dragover, shown as the affordance
+
+	function onGroupDragOver(e: DragEvent, targetName: string) {
+		const sourceNpub = readDragPayload(e.dataTransfer);
+		// No payload = wrong drag type (e.g. a file drag) — don't claim the drop.
+		if (!sourceNpub) return;
+		e.preventDefault(); // allow drop
+		const sourceGroups = contactGroups(sourceNpub);
+		const outcome = computeDropOutcome(sourceNpub, targetName, sourceGroups, e.shiftKey);
+		dropOverTarget = targetName;
+		dropOutcome = outcome;
+		// The cursor must show the refuse state on dragover, not on drop.
+		if (e.dataTransfer) {
+			e.dataTransfer.dropEffect = (outcome.kind === 'refused' || outcome.kind === 'noop') ? 'none' : (e.shiftKey ? 'copy' : 'move');
+		}
+	}
+
+	function onGroupDragLeave(targetName: string) {
+		if (dropOverTarget === targetName) {
+			dropOverTarget = null;
+			dropOutcome = null;
+		}
+	}
+
+	async function onGroupDrop(e: DragEvent, targetName: string) {
+		const sourceNpub = readDragPayload(e.dataTransfer);
+		if (!sourceNpub) return;
+		e.preventDefault();
+		const outcome = dropOutcome ?? computeDropOutcome(sourceNpub, targetName, contactGroups(sourceNpub), e.shiftKey);
+		// Refused / noop: no write, no toast. The affordance already said why.
+		if (outcome.kind === 'refused' || outcome.kind === 'noop') {
+			dropOverTarget = null;
+			dropOutcome = null;
+			return;
+		}
+		dropOverTarget = null;
+		dropOutcome = null;
+		try {
+			const committed = await commitDropOnGroup(
+				{ groupsAssign, contactUpdateGroups },
+				sourceNpub,
+				outcome,
+			);
+			await loadGroups(); // refresh so the chip appears/disappears without a reload
+			if (committed.kind === 'add') toast(`Added to ${committed.target}`);
+			else if (committed.kind === 'move') toast(`Moved to ${committed.target}`);
+			else toast('Moved to Ungrouped');
+		} catch (e) {
+			toast(String(e), 'error');
 		}
 	}
 
@@ -719,11 +784,20 @@
 				{:else}
 					<div class="bio-row bio-empty"><span class="no-bio">No bio published.</span></div>
 				{/if}
-				<!-- Row 4: group chips · N collections (hoverable, public only) · size · cold-cache. -->
+				<!-- Row 4: group chips · N collections (hoverable, public only) · size · cold-cache.
+				     M22 W4: each chip is ALSO a drop target (nearer than the section heading).
+				     stopPropagation on dragover/drop so the card's W3 create-gesture doesn't also fire. -->
 				<div class="contact-sub-row">
 					{#each peerGroups as gname (gname)}
 						{@const gcolor = groupColor(gname)}
-						<span class="group-pill">
+						<span
+							class="group-pill"
+							class:group-drop-active={dropOverTarget === gname && dropOutcome && dropOutcome.kind !== 'refused' && dropOutcome.kind !== 'noop'}
+							class:group-drop-refused={dropOverTarget === gname && dropOutcome && (dropOutcome.kind === 'refused' || dropOutcome.kind === 'noop')}
+							ondragover={(e) => { e.stopPropagation(); onGroupDragOver(e, gname); }}
+							ondragleave={(e) => { e.stopPropagation(); onGroupDragLeave(gname); }}
+							ondrop={(e) => { e.stopPropagation(); onGroupDrop(e, gname); }}
+						>
 							{#if gcolor}<span class="group-dot" style={`background:${gcolor}`}></span>{/if}
 							{gname}
 						</span>
@@ -984,8 +1058,24 @@
 					</div>
 				{/if}
 				{#each sections as section (section.key)}
+					{@const dropTargetName = section.key === 'ungrouped' ? UNGROUPED_TARGET : section.key}
 					<div class="phonebook-section">
-						<div id={section.anchorId} class="section-header">{section.label}</div>
+						<div
+							id={section.anchorId}
+							class="section-header"
+							class:group-drop-active={dropOverTarget === dropTargetName && dropOutcome && dropOutcome.kind !== 'refused' && dropOutcome.kind !== 'noop'}
+							class:group-drop-refused={dropOverTarget === dropTargetName && dropOutcome && (dropOutcome.kind === 'refused' || dropOutcome.kind === 'noop')}
+							ondragover={(e) => onGroupDragOver(e, dropTargetName)}
+							ondragleave={() => onGroupDragLeave(dropTargetName)}
+							ondrop={(e) => onGroupDrop(e, dropTargetName)}
+							role={view === 'groups' ? 'group' : undefined}
+							aria-label={view === 'groups' ? section.label : undefined}
+						>
+							{section.label}
+							{#if view === 'groups' && dropOverTarget === dropTargetName && dropOutcome}
+								<span class="drop-hint">{#if dropOutcome.kind === 'refused'}{dropOutcome.reason}{:else if dropOutcome.kind === 'noop'}already ungrouped{:else if dropOutcome.kind === 'add'}add to {section.label}{:else if dropOutcome.kind === 'move'}move to {section.label}{:else}remove all groups{/if}</span>
+							{/if}
+						</div>
 						<div class="contact-list">
 							{#each section.peers as peer (peer.npub)}
 								{@render contactRow(peer)}
@@ -1512,4 +1602,25 @@
 	}
 	.dg-chip:hover { border-color: var(--accent); color: var(--accent); }
 	.dg-footer { display: flex; justify-content: flex-end; gap: 6px; padding: 6px 8px 2px; border-top: 1px solid var(--divider); margin-top: 4px; }
+
+	/* M22 W4 — drop-onto-existing-group affordances.
+	   Active: accent border + soft fill, applied to a section heading or chip that accepts the drop.
+	   Refused: muted strike-through styling; the cursor already shows 'none' from the dragover.
+	   The .drop-hint states the outcome in words (move/add/already in X) so a plain drop reads as a
+	   relocate, not a mystery. */
+	.section-header.group-drop-active {
+		color: var(--accent);
+		background: color-mix(in oklch, var(--accent) 6%, var(--bg));
+	}
+	.section-header.group-drop-refused { opacity: 0.5; }
+	.group-pill.group-drop-active {
+		border: 1px solid var(--accent);
+		background: color-mix(in oklch, var(--accent) 14%, transparent);
+	}
+	.group-pill.group-drop-refused { opacity: 0.45; }
+	.drop-hint {
+		margin-left: 6px; font-size: 10px; font-weight: 500; color: var(--accent);
+		text-transform: none; letter-spacing: 0;
+	}
+	.section-header.group-drop-refused .drop-hint { color: var(--fg-dim); }
 </style>

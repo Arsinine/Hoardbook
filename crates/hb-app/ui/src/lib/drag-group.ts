@@ -93,3 +93,101 @@ export async function commitCreateGroup(
 	await api.groupsCreateWithMembers(trimmed, [sourceNpub, targetNpub], color);
 	return color;
 }
+
+// ── M22 W4 — drop onto an existing group (heading, chip, or Ungrouped) ──────────────────────────
+//
+// The governing rule was INVERTED by the owner on 2026-08-09. A plain drop MOVES the contact into
+// the target (relocates them out of their current groups); holding Shift makes it an ADD (preserves
+// existing memberships). This applies ONLY to drops onto a group that already exists — W3's
+// drop-to-create gesture is always additive and has no Shift handling.
+//
+// The four targets (identical in Contacts and Browse):
+//   → a group heading       — plain move / Shift-add. Add = groupsAssign; move = contactUpdateGroups([target]).
+//   → a group chip on a card — same outcome, nearer target.
+//   → somewhere they already are — REFUSED before release ("already in Film"); no write, no toast.
+//   → "Ungrouped"            — clears every membership via contactUpdateGroups([]). No confirm, no undo.
+
+/** The sentinel target name that means "clear all memberships". This is NOT a real group name; it is
+ *  recognised by computeDropOutcome + commitDropOnGroup, and never passed to the backend as a group. */
+export const UNGROUPED_TARGET = '__ungrouped__';
+
+/** The minimal API surface commitDropOnGroup needs. Passed in (not imported) so the test can inject
+ *  a spy, and so the function CAN'T call anything outside this interface — the strongest possible
+ *  guarantee that it never touches the private audience. groupsAssign (add-one) and
+ *  contactUpdateGroups (full-set-replace) are the only two membership mutations on this path. */
+export interface DropOnGroupApi {
+	groupsAssign(npub: string, groupName: string): Promise<unknown>;
+	contactUpdateGroups(npub: string, groupNames: string[]): Promise<unknown>;
+}
+
+/** The kind of drop the user is about to make, computed on dragover so the affordance can show it
+ *  before the drop fires. `refused` carries a human reason ("already in Film"); `noop` means the
+ *  drop would change nothing (e.g. Ungrouped when they have no groups) and must short-circuit with
+ *  no write and no toast. */
+export type DropOutcome =
+	| { kind: 'move'; target: string }
+	| { kind: 'add'; target: string }
+	| { kind: 'ungrouped' }
+	| { kind: 'refused'; target: string; reason: string }
+	| { kind: 'noop' };
+
+/** Compute the outcome of dropping sourceNpub onto targetGroupName (a real group name, or
+ *  UNGROUPED_TARGET). Pure: no writes, no I/O. Used on dragover to light the affordance and on
+ *  drop to decide what to commit.
+ *
+ *  - shiftKey + a real group they are NOT already in → add (groupsAssign).
+ *  - shiftKey + a real group they ARE already in     → refused ("already in {target}").
+ *  - plain + a real group                             → move (contactUpdateGroups([target])).
+ *    A plain move INTO a group they are already in is a valid move ONLY if they are also in other
+ *    groups (it removes them from the others); if it is their ONLY group, it is a noop (the set
+ *    would not change), so it is refused as "already in {target}" to keep the affordance honest.
+ *  - plain + UNGROUPED + they have groups             → ungrouped (contactUpdateGroups([])).
+ *  - plain + UNGROUPED + they have no groups          → noop (nothing to clear).
+ *  - shiftKey + UNGROUPED                              → refused (Shift on Ungrouped is meaningless).
+ */
+export function computeDropOutcome(
+	sourceNpub: string | null,
+	targetGroupName: string,
+	sourceGroups: string[],
+	shiftKey: boolean,
+): DropOutcome {
+	// A null source is an invalid drag (no payload) — refuse rather than write.
+	if (sourceNpub === null) return { kind: 'refused', target: targetGroupName, reason: 'invalid drag' };
+	// Ungrouped is special-cased before any membership reasoning.
+	if (targetGroupName === UNGROUPED_TARGET) {
+		if (shiftKey) return { kind: 'refused', target: targetGroupName, reason: 'Shift on Ungrouped is meaningless' };
+		if (sourceGroups.length === 0) return { kind: 'noop' };
+		return { kind: 'ungrouped' };
+	}
+	const already = sourceGroups.includes(targetGroupName);
+	if (shiftKey) {
+		// Shift-add into a group they are already in is a refused no-op (nothing would change).
+		if (already) return { kind: 'refused', target: targetGroupName, reason: `already in ${targetGroupName}` };
+		return { kind: 'add', target: targetGroupName };
+	}
+	// Plain move into a group they are already in: only meaningful if they have OTHER groups to lose.
+	if (already && sourceGroups.length <= 1) return { kind: 'refused', target: targetGroupName, reason: `already in ${targetGroupName}` };
+	return { kind: 'move', target: targetGroupName };
+}
+
+/** Commit the drop. Calls the backend exactly once: groupsAssign for an add,
+ *  contactUpdateGroups for a move or ungrouped. Never calls the audience API. Returns the outcome
+ *  that was committed (so the caller can toast the right verb), or throws if the backend rejects.
+ *
+ *  noop / refused outcomes call the backend ZERO times — the caller must gate the call on
+ *  outcome.kind being one of the write kinds (this function enforces it too). */
+export async function commitDropOnGroup(
+	api: DropOnGroupApi,
+	sourceNpub: string,
+	outcome: Exclude<DropOutcome, { kind: 'refused' } | { kind: 'noop' }>,
+): Promise<DropOutcome> {
+	if (outcome.kind === 'add') {
+		await api.groupsAssign(sourceNpub, outcome.target);
+	} else if (outcome.kind === 'move') {
+		await api.contactUpdateGroups(sourceNpub, [outcome.target]);
+	} else {
+		// ungrouped — clear every membership.
+		await api.contactUpdateGroups(sourceNpub, []);
+	}
+	return outcome;
+}
