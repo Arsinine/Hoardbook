@@ -532,8 +532,13 @@ describe('M22 W7 — applyKeyToSelection (shared primitive, same behaviour as Co
 	});
 
 	it('clamps at both ends (no wraparound)', () => {
+		// ArrowDown at the bottom must clamp, NOT wrap to the top. A wraparound mutation returns
+		// ordered[0] ('npub1a') here — this reds.
 		const r = applyKeyToSelection(['npub1d'], 'npub1d', ordered, 'npub1d', 'ArrowDown', false);
 		expect(r.focused).toBe('npub1d');
+		// The mirror clamp: ArrowUp at the top stays put.
+		const r2 = applyKeyToSelection(['npub1a'], 'npub1a', ordered, 'npub1a', 'ArrowUp', false);
+		expect(r2.focused).toBe('npub1a');
 	});
 });
 
@@ -541,7 +546,12 @@ describe('M22 W7 — applyKeyToSelection (shared primitive, same behaviour as Co
 
 describe('M22 W7 — Browse page keyboard wiring (source-scan)', () => {
 	it('imports applyKeyToSelection from $lib/drag-group.js', () => {
-		expect(browseSrc()).toMatch(/applyKeyToSelection/);
+		// Slice the import STATEMENT. A whole-page /applyKeyToSelection/ scan is satisfied by the
+		// call site itself (the W4 import-drift defect shape). Removing the symbol from the import
+		// line must red this.
+		const s = browseSrc();
+		const importLine = s.slice(s.indexOf("import { writeDragPayload"), s.indexOf("from '$lib/drag-group.js'"));
+		expect(importLine).toMatch(/applyKeyToSelection/);
 	});
 
 	it('declares a focusedNpub state variable', () => {
@@ -551,7 +561,9 @@ describe('M22 W7 — Browse page keyboard wiring (source-scan)', () => {
 	it('the onWindowKeyDown handler routes ArrowUp/ArrowDown to applyKeyToSelection', () => {
 		const s = browseSrc();
 		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('async function loadGroupsInto'));
-		expect(fn).toMatch(/ArrowUp|ArrowDown/);
+		// Assert the BRANCH CONDITION, not just that the symbol appears somewhere. Replacing the
+		// arrow branch with a Home/End branch that still calls applyKeyToSelection must red this.
+		expect(fn).toMatch(/e\.key === 'ArrowUp' \|\| e\.key === 'ArrowDown'/);
 		expect(fn).toMatch(/applyKeyToSelection/);
 	});
 
@@ -624,8 +636,10 @@ describe('M22 W7 — Browse page keyboard wiring (source-scan)', () => {
 
 	it('a sr-only aria-live region mirrors the drop affordance (refuse state non-visual)', () => {
 		const s = browseSrc();
-		expect(s).toMatch(/class="sr-only"/);
-		expect(s).toMatch(/aria-live="polite"/);
+		// Assert the CONTENT, not just the wrapper. Deleting the region's content while keeping an
+		// empty sr-only div must red this.
+		expect(s).toMatch(/class="sr-only" role="status" aria-live="polite"/);
+		expect(s).toMatch(/\{#if dropOverTarget && dropOutcome\}/);
 	});
 
 	it('prefers-reduced-motion media query exists', () => {
@@ -635,27 +649,27 @@ describe('M22 W7 — Browse page keyboard wiring (source-scan)', () => {
 	it('closeDragPopover restores focus to the row that opened the namer', () => {
 		const s = browseSrc();
 		const fn = s.slice(s.indexOf('function closeDragPopover'), s.indexOf('async function onDragNameKey'));
-		expect(fn).toMatch(/dragPopoverReturnFocus/);
-		expect(fn).toMatch(/\.focus/);
+		// Assert the SPECIFIC restore call. Replacing `dragPopoverReturnFocus.focus()` with
+		// `document.body.focus()` leaves ".focus" present and must red this.
+		expect(fn).toMatch(/dragPopoverReturnFocus\.focus\(\)/);
+		expect(fn).toMatch(/dragPopoverReturnFocus\?\.isConnected/);
 	});
 });
 
 // ── THE TABLE-DRIVEN TEST: every drop kind has a keyboard route (Browse mirror) ─
 
 describe('M22 W7 acceptance — every drop kind has a keyboard route (Browse, table-driven)', () => {
-	const cases: { kind: string; route: string }[] = [
-		{ kind: 'create (W3 pair)',   route: 'G → namer' },
-		{ kind: 'create (W5 multi)',  route: 'G → namer' },
-		// ⚠ Browse has group drop targets (people-section-head ondrop) but NO membership editor —
-		// the W5b popover lives on Contacts only. So on THIS page add/move/ungrouped are currently
-		// drag-only, which W7's own criterion ("nothing may be reachable by drag alone") forbids.
-		// Owner ruling: close it by extracting the W5b popover into a shared component. Until that
-		// lands these rows state the gap rather than naming a route this page does not have.
-		{ kind: 'add',                route: 'GAP — no keyboard route on Browse yet' },
-		{ kind: 'move',               route: 'GAP — no keyboard route on Browse yet' },
-		{ kind: 'ungrouped',          route: 'GAP — no keyboard route on Browse yet' },
-		{ kind: 'refused',            route: 'nothing (no write)' },
-		{ kind: 'noop',               route: 'nothing (no write)' },
+	// M22 W8 — the three GAP rows are now REAL routes: E opens the ONE shared GroupMembershipPopover
+	// (the same component Contacts uses), whose Apply writes via contactUpdateGroups. Same surface,
+	// same write, so Browse's add/move/ungrouped can no longer drift from Contacts'.
+	const cases: { kind: string; route: string; probe: string }[] = [
+		{ kind: 'create (W3 pair)',   route: 'G → namer',                 probe: 'dragPopoverFor = [...selectedNpubs]' },
+		{ kind: 'create (W5 multi)',  route: 'G → namer',                 probe: 'dragPopoverFor = [...selectedNpubs]' },
+		{ kind: 'add',                route: 'E → group popover',         probe: 'openGroupPopover(focusedNpub)' },
+		{ kind: 'move',               route: 'E → group popover',         probe: 'openGroupPopover(focusedNpub)' },
+		{ kind: 'ungrouped',          route: 'E → group popover',         probe: 'openGroupPopover(focusedNpub)' },
+		{ kind: 'refused',            route: 'nothing (no write)',        probe: '' },
+		{ kind: 'noop',               route: 'nothing (no write)',        probe: '' },
 	];
 
 	/** The DropOutcome kinds read from drag-group.ts SOURCE, not re-typed here. A hand-written list
@@ -671,7 +685,16 @@ describe('M22 W7 acceptance — every drop kind has a keyboard route (Browse, ta
 		return [...union.matchAll(/kind: '([a-z-]+)'/g)].map((m) => m[1]);
 	}
 
-	it('the table covers every DropOutcome kind IN SOURCE (no kind without a keyboard route)', () => {
+	/** The DropOutcomeMulti kinds read from drag-group.ts SOURCE — the W5 multi path is a distinct
+	 *  union and must be covered by the same table (M22 W8 coverage fix). */
+	function dropOutcomeMultiKindsFromSource(): string[] {
+		const src = readFileSync(new URL('../../lib/drag-group.ts', import.meta.url), 'utf8');
+		const start = src.indexOf('export type DropOutcomeMulti =');
+		const union = src.slice(start, src.indexOf('\n\n', start));
+		return [...union.matchAll(/kind: '([a-z-]+)'/g)].map((m) => m[1]);
+	}
+
+	it('the table covers every DropOutcome + DropOutcomeMulti kind IN SOURCE (no kind without a keyboard route)', () => {
 		const kinds = dropOutcomeKindsFromSource();
 		// Sanity: the parse actually found the union (a broken parse must not pass vacuously).
 		expect(kinds).toContain('move');
@@ -679,12 +702,47 @@ describe('M22 W7 acceptance — every drop kind has a keyboard route (Browse, ta
 		for (const outcomeKind of kinds) {
 			expect(cases.some((c) => c.kind === outcomeKind || c.kind.startsWith(outcomeKind + ' '))).toBe(true);
 		}
+		// The W5 multi union mirrors the single union (plus npubs on the write kinds). A new multi
+		// kind with no table row must also fail loudly.
+		const multiKinds = dropOutcomeMultiKindsFromSource();
+		expect(multiKinds).toContain('move');
+		for (const outcomeKind of multiKinds) {
+			expect(cases.some((c) => c.kind === outcomeKind || c.kind.startsWith(outcomeKind + ' '))).toBe(true);
+		}
 	});
 
+	// REAL-ROUTE assertions (M22 W8 coverage fix): each write-kind row must name a route that
+	// actually EXISTS in the page source — not just a non-empty string. Removing the popover wiring
+	// from the page must red these. The `probe` is the shared component + the E-branch + the write.
+	const s = browseSrc();
 	for (const c of cases) {
-		it(`${c.kind} → ${c.route}`, () => {
-			expect(c.route.length).toBeGreaterThan(0);
-		});
+		if (c.probe) {
+			it(`${c.kind} → ${c.route}: the route exists in the page source (${c.probe})`, () => {
+				expect(s).toContain(c.probe);
+			});
+		}
 	}
+
+	// The structural pin: Browse's E route opens the SHARED component and its apply handler writes
+	// via contactUpdateGroups — the same full-set command Contacts uses, so the two surfaces cannot
+	// drift. Removing either the component wiring or the write path reds this.
+	it('the E → group popover route converges on contactUpdateGroups (no parallel write)', () => {
+		const s = browseSrc();
+		// The E branch exists and opens the shared editor. Slice to the END of onWindowKeyDown (the
+		// function close `}` after the E branch), NOT to loadGroupsInto — the popover apply handler
+		// (which legitimately calls contactUpdateGroups) sits between the two.
+		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('async function loadGroupsInto'));
+		const eStart = fn.indexOf("e.key === 'e'");
+		expect(eStart).toBeGreaterThan(-1);
+		const eBranch = fn.slice(eStart, fn.indexOf('\n\t}\n', eStart));
+		const stripped = eBranch.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+		expect(stripped).toMatch(/openGroupPopover\(focusedNpub\)/);
+		expect(stripped).not.toMatch(/contactUpdateGroups/); // the branch opens the editor; it does not write directly
+		// The apply handler is the single write path and uses the full-set command.
+		const apply = s.slice(s.indexOf('async function applyGroupPopover'), s.indexOf('async function loadGroupsInto'));
+		expect(apply).toMatch(/contactUpdateGroups\(npub, names\)/);
+		// The shared component is actually rendered (not just imported).
+		expect(s).toMatch(/<GroupMembershipPopover/);
+	});
 });
 

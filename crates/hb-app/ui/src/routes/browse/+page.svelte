@@ -1,12 +1,16 @@
 <script lang="ts">
 	import { contacts, toast, toastWithAction } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
-	import { refreshContact, importManifest, requestManifest, getManifestAsks, groupsGet, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, type ManifestAsk } from '$lib/api.js';
+	import { refreshContact, importManifest, requestManifest, getManifestAsks, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, type ManifestAsk } from '$lib/api.js';
 	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
+	// M22 W8 — ONE shared group-membership editor (the same component Contacts uses). Browse's
+	// keyboard route for add/move/ungrouped opens this instead of a parallel, drifting copy.
+	import GroupMembershipPopover from '$lib/components/GroupMembershipPopover.svelte';
+	import CreateGroupDialog from '$lib/components/CreateGroupDialog.svelte';
 	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote, arrangeItems, fileTypesPresent, type BrowseViewMode, type BrowseSortKey, type BrowseSortDir } from '$lib/browse-view.js';
 	import { deriveManifestAskState, ASK_TICK_MS, MANIFEST_ASKED_LINE, MANIFEST_ASK_AGAIN_LABEL, MANIFEST_ASK_AGAIN_COOLDOWN_TIP, MANIFEST_OPEN_CHAT_LABEL, MANIFEST_ASK_FAILED_LINE } from '$lib/manifest-ask.js';
 	import type { CachedPeer, Collection, DirectoryItem, Group } from '$lib/types.js';
@@ -377,6 +381,10 @@
 	function onWindowKeyDown(e: KeyboardEvent) {
 		// The namer handles its own keys; don't compete.
 		if (dragPopoverFor) return;
+		// M22 W8 — when the SHARED group-membership editor is open, it owns the keyboard (its
+		// checkboxes take arrows/tab natively; OverflowMenu owns Escape). Don't move the list
+		// selection underneath an open editor.
+		if (groupPopoverFor) return;
 		// A7: only handle/preventDefault arrows when the list actually has focus, so they still
 		// scroll the page when the user is elsewhere.
 		if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && !isTypingTarget(e) && listHasFocus()) {
@@ -408,6 +416,15 @@
 			dragPopoverFor = [...selectedNpubs];
 			focusNamer();
 		}
+		// M22 W8 — E opens the SHARED group-membership editor for the focused row: the keyboard
+		// route for add/move/ungrouped. Same component + same contactUpdateGroups full-set write as
+		// Contacts, so the two surfaces cannot drift. The editor is never reachable while typing.
+		if ((e.key === 'e' || e.key === 'E') && !isTypingTarget(e) && !e.ctrlKey && !e.metaKey && !e.altKey && focusedNpub) {
+			e.preventDefault();
+			// MUST be set before openGroupPopover so the success/cancel path can restore it.
+			dragPopoverReturnFocus = document.activeElement as HTMLElement | undefined;
+			openGroupPopover(focusedNpub);
+		}
 	}
 
 	let dragSourceNpub = $state<string | null>(null);
@@ -424,6 +441,44 @@
 	let dragSuggestions = $state<string[]>([]);
 	// M22 W7 — the row that had focus before the namer opened, so focus returns to it on close.
 	let dragPopoverReturnFocus: HTMLElement | undefined = $state();
+
+	// M22 W8 — the SHARED group-membership editor. Browse's keyboard route for add/move/ungrouped.
+	// Same component + same full-set write (contactUpdateGroups) as Contacts, so the two surfaces
+	// cannot drift. Never touches the private audience.
+	let groupPopoverFor: string | null = $state(null);
+	let groupPopoverAnchor: HTMLElement | undefined = $state();
+	let createGroupOpen = $state(false);
+	// The contact the editor is showing (derived from the focused npub; absent only while closed).
+	let gmpPeer = $derived(groupPopoverFor ? $contacts.find((c) => c.npub === groupPopoverFor) : undefined);
+	let gmpContactName = $derived(gmpPeer ? contactDisplayName(gmpPeer) : (groupPopoverFor ? shortNpub(groupPopoverFor) : ''));
+	let gmpMemberships = $derived(groupPopoverFor ? peerGroupsOf(groupPopoverFor) : []);
+
+	async function handleCreateGroup(detail: { name: string; color: string }) {
+		const { name, color } = detail;
+		try {
+			await groupsCreate(name, color);
+			await loadGroupsInto();
+			createGroupOpen = false;
+			toast(`Group "${name}" created`);
+		} catch (e) { toast(String(e), 'error'); }
+	}
+
+	// Open the shared editor anchored to the focused row (the keyboard route) — same full-set
+	// semantics as Contacts: the draft is seeded from current memberships, Apply sends the whole
+	// checked set through contactUpdateGroups.
+	function openGroupPopover(npub: string) {
+		const row = document.getElementById(rowId(ROW_ID_PREFIX, npub));
+		groupPopoverAnchor = row ?? undefined;
+		groupPopoverFor = npub;
+	}
+
+	async function applyGroupPopover(npub: string, names: string[]) {
+		groupPopoverFor = null;
+		try {
+			await contactUpdateGroups(npub, names);
+			await loadGroupsInto();
+		} catch (e) { toast(String(e), 'error'); }
+	}
 
 	async function loadGroupsInto() {
 		try { groups = await groupsGet(); } catch { /* non-fatal */ }
@@ -1114,6 +1169,30 @@
 		</div>
 	</div>
 {/if}
+
+<!-- M22 W8 — the ONE group-membership editor (the keyboard route for add/move/ungrouped). Same
+     component + same full-set contactUpdateGroups write as Contacts, so the two surfaces cannot
+     drift. Always rendered (not {#if}-wrapped) so the component's open/close effects run: seeding the
+     draft + focusing in on open, and returning focus to the row on close. -->
+<GroupMembershipPopover
+	open={groupPopoverFor !== null}
+	anchor={groupPopoverAnchor}
+	contactName={gmpContactName}
+	groups={groups}
+	memberships={gmpMemberships}
+	onapply={(names) => groupPopoverFor && applyGroupPopover(groupPopoverFor, names)}
+	onclose={() => (groupPopoverFor = null)}
+	onnewgroup={() => (createGroupOpen = true)}
+	returnFocusTo={() => {
+		// Return focus to the row that opened the editor (or the first rendered row if it was
+		// filtered away — A9: .focus() on a detached node is a silent no-op).
+		if (!groupPopoverFor) return undefined;
+		const el = document.getElementById(rowId(ROW_ID_PREFIX, groupPopoverFor));
+		if (el?.isConnected) return el;
+		return document.getElementById(rowId(ROW_ID_PREFIX, contactOrder[0])) ?? undefined;
+	}}
+/>
+<CreateGroupDialog open={createGroupOpen} oncreate={handleCreateGroup} oncancel={() => (createGroupOpen = false)} />
 
 <style>
 	.browse-shell {
