@@ -29,6 +29,17 @@ import {
 
 const browseSrc = () => readFileSync(new URL('./+page.svelte', import.meta.url), 'utf8');
 
+/** Page source with every comment removed (template `<!-- -->`, block, and line). The no-undo scan
+ *  needs it: the page documents the "NO confirm, NO undo" ruling in prose, so a raw scan for
+ *  /undo/ would fail forever on correct code. Kept local rather than shared with the Contacts
+ *  suite — two small copies beat coupling two test files together. */
+function stripComments(src: string): string {
+	return src
+		.replace(/<!--[\s\S]*?-->/g, '')
+		.replace(/\/\*[\s\S]*?\*\//g, '')
+		.replace(/^[ \t]*\/\/.*$/gm, '');
+}
+
 /** A spy DropOnGroupApi: records groupsAssign + contactUpdateGroups calls. The absence of any
  *  other method (audience, create, unassign) is itself the guarantee that commitDropOnGroup
  *  CAN'T reach them. */
@@ -222,6 +233,19 @@ describe('M22 W4 — Browse Ungrouped drop offers NO confirm and NO undo', () =>
 		expect(fn).toMatch(/commitDropOnGroup/);
 		expect(fn).not.toMatch(/ConfirmButton/);
 		expect(fn).not.toMatch(/confirm/);
+	});
+
+	// This block was named "NO confirm and NO undo" but only ever tested the confirm half — an Undo
+	// button added to Browse would have gone unnoticed while a green test claimed to cover it.
+	// Scans the WHOLE page (an affordance lives in the template, not in onGroupDrop's body) with
+	// comments stripped, because the page documents this ruling in prose and the scan must not red
+	// on its own documentation.
+	it('the Browse page offers no undo affordance anywhere — script OR template', () => {
+		const src = stripComments(browseSrc());
+		expect(src.length).toBeGreaterThan(0);
+		expect(src).not.toMatch(/\bundo\b/i);
+		expect(src).not.toMatch(/\brevert\b/i);
+		expect(src).not.toMatch(/\brestore\b/i);
 	});
 });
 
