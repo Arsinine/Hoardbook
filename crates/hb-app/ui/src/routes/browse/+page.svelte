@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { contacts, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
-	import { refreshContact, importManifest, requestManifest, getManifestAsks, groupsGet, groupsCreateWithMembers, type ManifestAsk } from '$lib/api.js';
+	import { refreshContact, importManifest, requestManifest, getManifestAsks, groupsGet, groupsCreateWithMembers, groupsAssign, contactUpdateGroups, type ManifestAsk } from '$lib/api.js';
 	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
@@ -12,7 +12,9 @@
 	import type { CachedPeer, Collection, DirectoryItem, Group } from '$lib/types.js';
 	import { groupByGroups, matchesQuery } from '$lib/contacts-view.js';
 	// M22 W3 — drag-to-group gesture primitives (shared with Contacts). Create is ALWAYS ADDITIVE.
-	import { writeDragPayload, readDragPayload, isValidDropTarget, isSelfDrop, groupSuggestions, commitCreateGroup } from '$lib/drag-group.js';
+	// M22 W4 — drop onto an existing group heading: plain drop MOVES, Shift-drop ADDS (owner ruling
+	// 2026-08-09). Ungrouped clears all. One implementation, two consumers (this + Contacts).
+	import { writeDragPayload, readDragPayload, isValidDropTarget, isSelfDrop, groupSuggestions, commitCreateGroup, computeDropOutcome, commitDropOnGroup, UNGROUPED_TARGET, type DropOutcome } from '$lib/drag-group.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
 
 	type BcItem =
@@ -326,6 +328,9 @@
 	function onDragEnd() {
 		dragSourceNpub = null;
 		dragOverNpub = null;
+		// M22 W4: clear the group-heading drop affordance state too.
+		dropOverTarget = null;
+		dropOutcome = null;
 	}
 
 	function onDrop(e: DragEvent, targetNpub: string) {
@@ -379,6 +384,63 @@
 			dragSuggestions = [];
 		}
 	}
+
+	// M22 W4 — drop onto an existing group heading (mirrors Contacts' onGroupDragOver/Leave/Drop;
+	// one implementation, two consumers). Plain drop MOVES; Shift-drop ADDS (owner ruling
+	// 2026-08-09). Refused before release. Ungrouped clears all — no confirm, no undo. This path
+	// never touches the private audience.
+	let dropOverTarget: string | null = $state(null);
+	let dropOutcome: DropOutcome | null = $state(null);
+
+	function peerGroupsOf(npub: string): string[] {
+		return groups.filter(g => g.pubkeys.includes(npub)).map(g => g.name);
+	}
+
+	function onGroupDragOver(e: DragEvent, targetName: string) {
+		const sourceNpub = readDragPayload(e.dataTransfer);
+		if (!sourceNpub) return;
+		e.preventDefault();
+		const outcome = computeDropOutcome(sourceNpub, targetName, peerGroupsOf(sourceNpub), e.shiftKey);
+		dropOverTarget = targetName;
+		dropOutcome = outcome;
+		if (e.dataTransfer) {
+			e.dataTransfer.dropEffect = (outcome.kind === 'refused' || outcome.kind === 'noop') ? 'none' : (e.shiftKey ? 'copy' : 'move');
+		}
+	}
+
+	function onGroupDragLeave(targetName: string) {
+		if (dropOverTarget === targetName) {
+			dropOverTarget = null;
+			dropOutcome = null;
+		}
+	}
+
+	async function onGroupDrop(e: DragEvent, targetName: string) {
+		const sourceNpub = readDragPayload(e.dataTransfer);
+		if (!sourceNpub) return;
+		e.preventDefault();
+		const outcome = dropOutcome ?? computeDropOutcome(sourceNpub, targetName, peerGroupsOf(sourceNpub), e.shiftKey);
+		if (outcome.kind === 'refused' || outcome.kind === 'noop') {
+			dropOverTarget = null;
+			dropOutcome = null;
+			return;
+		}
+		dropOverTarget = null;
+		dropOutcome = null;
+		try {
+			const committed = await commitDropOnGroup(
+				{ groupsAssign, contactUpdateGroups },
+				sourceNpub,
+				outcome,
+			);
+			await loadGroupsInto();
+			if (committed.kind === 'add') toast(`Added to ${committed.target}`);
+			else if (committed.kind === 'move') toast(`Moved to ${committed.target}`);
+			else toast('Moved to Ungrouped');
+		} catch (e) {
+			toast(String(e), 'error');
+		}
+	}
 </script>
 
 <div class="browse-shell">
@@ -400,13 +462,28 @@
 			{:else}
 				{#each peopleSections as section (section.key)}
 					{@const secGroup = section.key === 'ungrouped' ? null : groups.find(g => g.name === section.key)}
+					{@const dropTargetName = section.key === 'ungrouped' ? UNGROUPED_TARGET : section.key}
 					<div class="people-section">
-						<div class="people-section-head">
+						<!-- M22 W4: the section head is a drop target (plain move / Shift add / Ungrouped clears). -->
+						<!-- svelte-ignore a11y_no_static_element_interactions -->
+						<div
+							class="people-section-head"
+							class:group-drop-active={dropOverTarget === dropTargetName && dropOutcome && dropOutcome.kind !== 'refused' && dropOutcome.kind !== 'noop'}
+							class:group-drop-refused={dropOverTarget === dropTargetName && dropOutcome && (dropOutcome.kind === 'refused' || dropOutcome.kind === 'noop')}
+							ondragover={(e) => onGroupDragOver(e, dropTargetName)}
+							ondragleave={() => onGroupDragLeave(dropTargetName)}
+							ondrop={(e) => onGroupDrop(e, dropTargetName)}
+							role="group"
+							aria-label={section.label}
+						>
 							{#if secGroup?.color}
 								<span class="people-group-dot" style={`background:${secGroup.color}`}></span>
 							{/if}
 							<span class="people-section-title">{section.label}</span>
 							<span class="people-section-count">{section.peers.length}</span>
+							{#if dropOverTarget === dropTargetName && dropOutcome}
+								<span class="drop-hint-browse">{#if dropOutcome.kind === 'refused'}{dropOutcome.reason}{:else if dropOutcome.kind === 'noop'}already ungrouped{:else if dropOutcome.kind === 'add'}⇧ add{:else if dropOutcome.kind === 'move'}move{:else}clear all{/if}</span>
+							{/if}
 						</div>
 						{#each section.peers as peer (peer.npub)}
 							{@const letter = peerInitial(peer)}
@@ -1365,5 +1442,16 @@
 	}
 	.dg-chip:hover { border-color: var(--accent); color: var(--accent); }
 	.dg-footer { display: flex; justify-content: flex-end; gap: 6px; padding: 6px 8px 2px; border-top: 1px solid var(--divider); margin-top: 4px; }
+
+	/* M22 W4 — drop-onto-group affordances on the People section heads. Mirrors Contacts. */
+	.people-section-head.group-drop-active {
+		background: color-mix(in oklch, var(--accent) 8%, transparent);
+	}
+	.people-section-head.group-drop-active .people-section-title { color: var(--accent); }
+	.people-section-head.group-drop-refused { opacity: 0.5; }
+	.drop-hint-browse {
+		font-size: 9px; font-weight: 600; color: var(--accent); text-transform: none; letter-spacing: 0;
+	}
+	.people-section-head.group-drop-refused .drop-hint-browse { color: var(--fg-dim); }
 
 </style>

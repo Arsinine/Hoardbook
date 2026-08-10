@@ -27,7 +27,12 @@ import {
 	pickGroupColor,
 	groupSuggestions,
 	commitCreateGroup,
+	computeDropOutcome,
+	commitDropOnGroup,
+	UNGROUPED_TARGET,
 	type DragGroupApi,
+	type DropOnGroupApi,
+	type DropOutcome,
 } from '$lib/drag-group.js';
 import type { CachedPeer, Profile } from '$lib/types.js';
 
@@ -368,5 +373,283 @@ describe('M22 W3 acceptance — drop path never touches the private audience', (
 		const touched = api.calls.filter((c) =>
 			c.method === 'privateAudienceSet' || c.method === 'privateAudienceList');
 		expect(touched.length).toBe(0);
+	});
+});
+
+// ════════════════════════════════════════════════════════════════════════════════
+// M22 W4 — drop onto an existing group (heading, chip, Ungrouped).
+//
+// Owner ruling 2026-08-09 (INVERTED from the inferred rule): a plain drop MOVES the contact into
+// the target; holding Shift ADDS (preserves existing memberships). Refused before release.
+// Ungrouped clears every membership: NO confirm, NO undo (owner: "This isn't a word doc.").
+// Nothing on this path reads or writes the private audience.
+// ════════════════════════════════════════════════════════════════════════════════
+
+/** A spy DropOnGroupApi: records groupsAssign + contactUpdateGroups calls. The absence of any
+ *  other method (audience, create, unassign) is itself the guarantee that commitDropOnGroup
+ *  CAN'T reach them. */
+function spyDropApi(): DropOnGroupApi & { calls: { method: string; args: unknown[] }[] } {
+	const calls: { method: string; args: unknown[] }[] = [];
+	return {
+		calls,
+		groupsAssign: vi.fn(async (npub: string, groupName: string) => {
+			calls.push({ method: 'groupsAssign', args: [npub, groupName] });
+		}),
+		contactUpdateGroups: vi.fn(async (npub: string, groupNames: string[]) => {
+			calls.push({ method: 'contactUpdateGroups', args: [npub, groupNames] });
+		}),
+	} as unknown as DropOnGroupApi & { calls: { method: string; args: unknown[] }[] };
+}
+
+// ── computeDropOutcome: the dragover affordance (pure, before any write) ──────
+
+describe('M22 W4 — computeDropOutcome: plain drop MOVES, Shift-drop ADDS', () => {
+	it('plain drop into a group the contact is NOT in → move', () => {
+		const o = computeDropOutcome('npub1a', 'Film', ['Anime'], false);
+		expect(o.kind).toBe('move');
+		expect(o).toHaveProperty('target', 'Film');
+	});
+
+	it('plain drop into a group the contact is NOT in (has other groups) → move', () => {
+		const o = computeDropOutcome('npub1a', 'Film', ['Anime', 'Music'], false);
+		expect(o.kind).toBe('move');
+	});
+
+	it('Shift-drop into a group the contact is NOT in → add', () => {
+		const o = computeDropOutcome('npub1a', 'Film', ['Anime'], true);
+		expect(o.kind).toBe('add');
+		expect(o).toHaveProperty('target', 'Film');
+	});
+});
+
+describe('M22 W4 — computeDropOutcome: already-in refuse state', () => {
+	it('Shift-drop into the ONLY group they are in → refused ("already in Film")', () => {
+		const o = computeDropOutcome('npub1a', 'Film', ['Film'], true);
+		expect(o.kind).toBe('refused');
+		expect(o).toHaveProperty('target', 'Film');
+		expect((o as { reason: string }).reason).toBe('already in Film');
+	});
+
+	it('Shift-drop into one of several groups → refused', () => {
+		const o = computeDropOutcome('npub1a', 'Film', ['Film', 'Anime'], true);
+		expect(o.kind).toBe('refused');
+	});
+
+	// Plain move into the ONLY group they are in would change nothing → refused, not a silent noop.
+	it('plain drop into the ONLY group they are in → refused (the set would not change)', () => {
+		const o = computeDropOutcome('npub1a', 'Film', ['Film'], false);
+		expect(o.kind).toBe('refused');
+		expect((o as { reason: string }).reason).toBe('already in Film');
+	});
+
+	// Plain move into one of several IS a valid move: it removes them from the others (the relocated
+	// semantics the owner ruled in). This is the case the refuse rule must NOT catch.
+	it('plain drop into one of several groups → move (removes from the others)', () => {
+		const o = computeDropOutcome('npub1a', 'Film', ['Film', 'Anime'], false);
+		expect(o.kind).toBe('move');
+	});
+});
+
+describe('M22 W4 — computeDropOutcome: Ungrouped target', () => {
+	it('plain drop on Ungrouped with groups → ungrouped (clears all)', () => {
+		const o = computeDropOutcome('npub1a', UNGROUPED_TARGET, ['Film', 'Anime'], false);
+		expect(o.kind).toBe('ungrouped');
+	});
+
+	it('plain drop on Ungrouped with NO groups → noop (nothing to clear)', () => {
+		const o = computeDropOutcome('npub1a', UNGROUPED_TARGET, [], false);
+		expect(o.kind).toBe('noop');
+	});
+
+	it('Shift-drop on Ungrouped → refused (Shift on Ungrouped is meaningless)', () => {
+		const o = computeDropOutcome('npub1a', UNGROUPED_TARGET, ['Film'], true);
+		expect(o.kind).toBe('refused');
+	});
+});
+
+describe('M22 W4 — computeDropOutcome: invalid drag', () => {
+	it('a null source is refused (no payload to drop)', () => {
+		const o = computeDropOutcome(null, 'Film', [], false);
+		expect(o.kind).toBe('refused');
+	});
+});
+
+// ── commitDropOnGroup: the write path (behavioural, spy on the mocked api) ────
+
+describe('M22 W4 acceptance — add calls groupsAssign exactly once', () => {
+	it('Shift-drop add → groupsAssign(source, target), nothing else', async () => {
+		const api = spyDropApi();
+		await commitDropOnGroup(api, 'npub1a', { kind: 'add', target: 'Film' });
+		expect(api.calls.length).toBe(1);
+		expect(api.calls[0].method).toBe('groupsAssign');
+		expect(api.calls[0].args).toEqual(['npub1a', 'Film']);
+	});
+});
+
+describe('M22 W4 acceptance — move calls contactUpdateGroups with [target] only', () => {
+	it('plain move → contactUpdateGroups(source, [target]), removes from all others', async () => {
+		const api = spyDropApi();
+		await commitDropOnGroup(api, 'npub1a', { kind: 'move', target: 'Film' });
+		expect(api.calls.length).toBe(1);
+		expect(api.calls[0].method).toBe('contactUpdateGroups');
+		expect(api.calls[0].args).toEqual(['npub1a', ['Film']]);
+	});
+});
+
+describe('M22 W4 acceptance — Ungrouped calls contactUpdateGroups with []', () => {
+	it('drop on Ungrouped → contactUpdateGroups(source, [])', async () => {
+		const api = spyDropApi();
+		await commitDropOnGroup(api, 'npub1a', { kind: 'ungrouped' });
+		expect(api.calls.length).toBe(1);
+		expect(api.calls[0].method).toBe('contactUpdateGroups');
+		expect(api.calls[0].args).toEqual(['npub1a', []]);
+	});
+});
+
+// ── Acceptance gate: never touches the private audience (W4) ──────────────────
+
+describe('M22 W4 acceptance — drop-onto-group never touches the private audience', () => {
+	it('add path calls no audience API', async () => {
+		const api = spyDropApi();
+		await commitDropOnGroup(api, 'npub1a', { kind: 'add', target: 'Film' });
+		const touched = api.calls.filter((c) =>
+			c.method === 'privateAudienceSet' || c.method === 'privateAudienceList');
+		expect(touched.length).toBe(0);
+	});
+
+	it('move path calls no audience API', async () => {
+		const api = spyDropApi();
+		await commitDropOnGroup(api, 'npub1a', { kind: 'move', target: 'Film' });
+		const touched = api.calls.filter((c) =>
+			c.method === 'privateAudienceSet' || c.method === 'privateAudienceList');
+		expect(touched.length).toBe(0);
+	});
+
+	it('ungrouped path calls no audience API', async () => {
+		const api = spyDropApi();
+		await commitDropOnGroup(api, 'npub1a', { kind: 'ungrouped' });
+		const touched = api.calls.filter((c) =>
+			c.method === 'privateAudienceSet' || c.method === 'privateAudienceList');
+		expect(touched.length).toBe(0);
+	});
+
+	it('DropOnGroupApi exposes ONLY groupsAssign + contactUpdateGroups', () => {
+		const api = spyDropApi() as unknown as Record<string, unknown>;
+		expect(typeof api.groupsAssign).toBe('function');
+		expect(typeof api.contactUpdateGroups).toBe('function');
+		expect(api.groupsCreateWithMembers).toBeUndefined();
+		expect(api.groupsUnassign).toBeUndefined();
+		expect(api.privateAudienceSet).toBeUndefined();
+		expect(api.privateAudienceList).toBeUndefined();
+	});
+});
+
+// ── Acceptance gate: Ungrouped is immediate, NO confirm, NO undo ─────────────
+// Owner ruling 2026-08-09, verbatim: "No undo at all. This isn't a word doc." INV-8 was overruled.
+// This test pins the decision so a future session does not add a confirm/undo/soft-delete "for
+// safety" and mistake the absence for a gap.
+
+describe('M22 W4 acceptance — Ungrouped drop offers NO confirm and NO undo', () => {
+	it('the Ungrouped commit path calls contactUpdateGroups directly (no confirm gate)', () => {
+		const src = contactsSrc();
+		const start = src.indexOf('async function onGroupDrop');
+		const end = src.indexOf('// Stale: last_fetched');
+		const fn = src.slice(start, end);
+		// The Ungrouped branch routes straight to commitDropOnGroup with no ConfirmButton / dialog.
+		expect(fn).toMatch(/commitDropOnGroup/);
+		expect(fn).not.toMatch(/ConfirmButton/);
+		expect(fn).not.toMatch(/confirm/);
+	});
+
+	// NOTE: asserting that a test-constructed spy lacks an `undo` method would be a TAUTOLOGY — the
+	// test builds the spy, so of course it has no such method, and it would stay green if the page
+	// grew a full confirm-and-undo flow. The real risk is an undo AFFORDANCE appearing in the page,
+	// so scan the page for one. (The behavioural proof that the write is one-shot lives above, where
+	// commitDropOnGroup is actually invoked with an `ungrouped` outcome.)
+	it('the page offers no undo affordance anywhere in the group-drop path', () => {
+		const src = contactsSrc();
+		const start = src.indexOf('async function onGroupDrop');
+		const fn = src.slice(start, src.indexOf('// Stale: last_fetched'));
+		expect(start).toBeGreaterThan(-1);
+		// No undo/revert/restore affordance, and no toast carrying one.
+		expect(fn).not.toMatch(/\bundo\b/i);
+		expect(fn).not.toMatch(/\brevert\b/i);
+		expect(fn).not.toMatch(/\brestore\b/i);
+	});
+});
+
+// ── Contacts page wiring (source-scan): the four targets are wired ───────────
+// The route page can't be mounted (onMount + $app/navigation), so source-scan pins the DOM wiring
+// that has no behavioural equivalent (the CSS classes + handler attributes). The behavioural proof
+// (which api method is called, how many times) lives in the spy suites above.
+
+describe('M22 W4 — contacts page wiring (source-scan, no behavioural equivalent)', () => {
+	it('imports computeDropOutcome, commitDropOnGroup, UNGROUPED_TARGET from $lib/drag-group.js', () => {
+		const s = contactsSrc();
+		expect(s).toMatch(/computeDropOutcome/);
+		expect(s).toMatch(/commitDropOnGroup/);
+		expect(s).toMatch(/UNGROUPED_TARGET/);
+	});
+
+	it('imports groupsAssign + contactUpdateGroups from api.ts (the W4 write surface)', () => {
+		const s = contactsSrc();
+		expect(s).toMatch(/groupsAssign/);
+		expect(s).toMatch(/contactUpdateGroups/);
+	});
+
+	it('section headers are drop targets (ondragover/ondrop → onGroupDragOver/onGroupDrop)', () => {
+		const s = contactsSrc();
+		expect(s).toMatch(/ondragover=\{\(e\) => onGroupDragOver\(e, dropTargetName\)\}/);
+		expect(s).toMatch(/ondrop=\{\(e\) => onGroupDrop\(e, dropTargetName\)\}/);
+		expect(s).toMatch(/ondragleave=\{\(\) => onGroupDragLeave\(dropTargetName\)\}/);
+	});
+
+	it('the Ungrouped section maps to UNGROUPED_TARGET (not passed as a real group name)', () => {
+		const s = contactsSrc();
+		expect(s).toMatch(/section\.key === 'ungrouped' \? UNGROUPED_TARGET : section\.key/);
+	});
+
+	it('group chips on the card face are ALSO drop targets with stopPropagation', () => {
+		const s = contactsSrc();
+		const sub = s.slice(s.indexOf('class="contact-sub-row"'), s.indexOf('group-add-btn'));
+		expect(sub).toMatch(/ondragover=\{\(e\) => \{ e\.stopPropagation\(\); onGroupDragOver\(e, gname\); \}\}/);
+		expect(sub).toMatch(/ondrop=\{\(e\) => \{ e\.stopPropagation\(\); onGroupDrop\(e, gname\); \}\}/);
+	});
+
+	it('the refuse state is computed on dragover (dropOutcome set before drop)', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('function onGroupDragOver'), s.indexOf('function onGroupDragLeave'));
+		expect(fn).toMatch(/computeDropOutcome/);
+		expect(fn).toMatch(/dropOutcome = outcome/);
+	});
+
+	it('the drop handler refuses noop/refused outcomes (no write, no toast)', () => {
+		const s = contactsSrc();
+		const start = s.indexOf('async function onGroupDrop');
+		const end = s.indexOf('// Stale: last_fetched');
+		const fn = s.slice(start, end);
+		// The early-return gate: refused/noop short-circuit before any commit.
+		expect(fn).toMatch(/outcome\.kind === 'refused' \|\| outcome\.kind === 'noop'/);
+		expect(fn).toMatch(/return/);
+	});
+
+	it('dropEffect reflects the refuse state on dragover (none for refused/noop)', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('function onGroupDragOver'), s.indexOf('function onGroupDragLeave'));
+		expect(fn).toMatch(/dropEffect/);
+		expect(fn).toMatch(/'none'/);
+		expect(fn).toMatch(/e\.shiftKey \? 'copy' : 'move'/);
+	});
+
+	it('the drop affordance CSS classes exist (group-drop-active / group-drop-refused)', () => {
+		const s = contactsSrc();
+		expect(s).toMatch(/class:group-drop-active/);
+		expect(s).toMatch(/class:group-drop-refused/);
+	});
+
+	it('the drop-hint text states the outcome (move/add/already in X)', () => {
+		const s = contactsSrc();
+		expect(s).toMatch(/class="drop-hint"/);
+		expect(s).toMatch(/already in/);
 	});
 });
