@@ -184,3 +184,28 @@ fn topic_domain_bytes_are_frozen() {
 fn teaser_picture_cap_is_frozen() {
     assert_eq!(event::TEASER_PICTURE_MAX_BYTES, 16 * 1024, "event::TEASER_PICTURE_MAX_BYTES — {FREEZE}");
 }
+
+/// The future-skew tolerance (`FUTURE_SKEW_SECS = 300`) used to be defined in BOTH `binding.rs` and
+/// `count.rs`, and nothing compared them — a one-sided edit would silently split the two freshness
+/// windows (a beacon the binding admits but the online tally drops, or vice versa). It is now
+/// defined exactly once, in `binding`, and `count` imports it. A value asserted twice through the
+/// same definition proves nothing, so this scans the two files that used to carry the duplicate and
+/// pins the definition count to one.
+#[test]
+fn future_skew_is_defined_exactly_once_and_both_freshness_paths_agree() {
+    let binding_src = include_str!("binding.rs");
+    let count_src = include_str!("count.rs");
+    let definitions = binding_src.matches("const FUTURE_SKEW_SECS").count()
+        + count_src.matches("const FUTURE_SKEW_SECS").count();
+    assert_eq!(
+        definitions, 1,
+        "FUTURE_SKEW_SECS must be defined in exactly one module — a second `const FUTURE_SKEW_SECS` \
+         would let the two freshness windows drift apart"
+    );
+
+    // The value through the public paths: the binding module's constant and the crate-root
+    // re-export agree on 300. The value is pinned here deliberately — it participates in
+    // freshness/binding validation, so changing it is a wire-visible behaviour change, not an edit.
+    assert_eq!(binding::FUTURE_SKEW_SECS, 300, "binding::FUTURE_SKEW_SECS");
+    assert_eq!(crate::FUTURE_SKEW_SECS, 300, "crate::FUTURE_SKEW_SECS (re-export)");
+}

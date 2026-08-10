@@ -82,6 +82,28 @@ pub struct BoundPlane {
     pub listening: bool,
 }
 
+/// The rebind decision: whether a bound plane belongs to a **different** identity than the one being
+/// bound for now.
+///
+/// The accept loop's [`ManifestSource`] carries a *snapshot* of the signing key — it is a
+/// synchronous trait and cannot await a live handle — so a binding must be keyed to the npub whose
+/// keys it snapshotted. Identity can change mid-session (generate, import, restore from backup,
+/// wipe), and a binding that outlives its identity would keep serving manifests signed by a key the
+/// user walked away from. This is the comparison that makes [`ensure_endpoint`] close and replace
+/// such a binding instead of reusing it. `true` ⇒ the existing binding must be closed and rebound;
+/// `false` ⇒ it still belongs to this identity and may be reused.
+///
+/// This is **not** a race guard — identity change is serialized by a wipe-first discipline (all
+/// other write sites hard-refuse an existing identity, and `wipe_data` is the only caller of
+/// `close_plane`, wiping the store before clearing the identity). But "not a race" is not
+/// "covered", which is why the decision is extracted and pinned here.
+pub(crate) fn should_rebind_for_owner(
+    bound_owner_npub: &str,
+    current_owner_npub: &str,
+) -> bool {
+    bound_owner_npub != current_owner_npub
+}
+
 /// How many redemptions may be served concurrently.
 ///
 /// The plane's in-flight set stops one *ticket* being served twice; it does not stop N distinct
@@ -116,7 +138,7 @@ pub async fn ensure_endpoint(
     // A binding that has been closed is never reusable, however well it otherwise matches — a failed
     // rebind used to leave exactly that in place and hand it to the next caller.
     let satisfies = |b: &BoundPlane| {
-        b.owner_npub == owner_npub
+        !should_rebind_for_owner(&b.owner_npub, owner_npub)
             && (b.listening || need == Role::DialOnly)
             && !b.endpoint.is_closed()
     };
@@ -261,5 +283,30 @@ pub async fn rebind_if_tickets_outstanding(
         ensure_endpoint(shared, owner_npub, live_npub, transport_key, source, Role::Listen).await
     {
         tracing::warn!("manifest plane: could not rebind for an outstanding ticket: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rebind decision is the untested core of the manifest plane's identity lifecycle: the
+    /// accept loop serves from a *snapshot* of the signing key, so a binding keyed to a DIFFERENT
+    /// npub than the session's current one must be closed and rebuilt — otherwise it keeps serving
+    /// manifests signed by a key the user switched away from. `ensure_endpoint`'s satisfaction
+    /// check delegates to [`should_rebind_for_owner`], so this is the comparison that actually runs
+    /// on every fulfil/rebind. Inverting it (rebind when the npubs MATCH) must red here.
+    #[test]
+    fn a_binding_for_a_different_npub_rebinds_and_an_unchanged_one_is_reused() {
+        // Same npub — the snapshot still belongs to the current identity: reuse, do not rebind.
+        assert!(
+            !should_rebind_for_owner("npub-snapshot-a", "npub-snapshot-a"),
+            "an unchanged identity must keep its binding"
+        );
+        // Different npub — the snapshot is stale: close and rebuild.
+        assert!(
+            should_rebind_for_owner("npub-snapshot-a", "npub-snapshot-b"),
+            "a changed identity must close and rebuild the binding"
+        );
     }
 }
