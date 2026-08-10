@@ -263,6 +263,65 @@ export function applyClickToSelection(
 	return { selection: [clickedNpub], anchor: clickedNpub };
 }
 
+/** Apply an arrow-key press to the selection model and return the new selection, anchor, AND the
+ *  newly-focused row. Pure: no DOM, no Svelte. Mirrors `applyClickToSelection`'s range/union
+ *  semantics so the keyboard and mouse selection models cannot drift:
+ *  - plain ArrowUp/ArrowDown → move focus by one (does NOT change the selection or the anchor).
+ *    If there is no focused row yet, the first press enters the list from the nearest end
+ *    (ArrowDown → first row, ArrowUp → last row), so it is never a no-op.
+ *  - Shift+ArrowUp/ArrowDown → extend the selection by one in the moved direction, exactly as a
+ *    Shift-click on the new row would (union with the existing selection; anchor unchanged).
+ *
+ *  Clamps at both ends (no wraparound). `focused` may be null on the first call; the function picks
+ *  the nearest end so the first arrow key always moves. */
+export function applyKeyToSelection(
+	current: string[],
+	anchor: string | null,
+	orderedNpubs: string[],
+	focused: string | null,
+	key: 'ArrowUp' | 'ArrowDown',
+	shiftKey: boolean,
+): { selection: string[]; anchor: string | null; focused: string; focusedIdx: number } {
+	// Empty list: nothing to move to. Return focused unchanged (fall back to empty string so the
+	// type is non-null — the caller guards against an empty list before calling).
+	if (orderedNpubs.length === 0) return { selection: current, anchor, focused: focused ?? '', focusedIdx: -1 };
+	// Resolve the starting index. On the very first arrow key (focused === null) begin at the
+	// opposite end so the first press always moves INTO the list, not off it.
+	const startIdx = focused === null
+		? (key === 'ArrowDown' ? -1 : orderedNpubs.length)
+		: orderedNpubs.indexOf(focused);
+	// A stale focused row (no longer rendered) — reset to the same fallback as the first press.
+	const effectiveStart = startIdx === -1
+		? (key === 'ArrowDown' ? -1 : orderedNpubs.length)
+		: startIdx;
+	const nextIdx = key === 'ArrowDown'
+		? Math.min(effectiveStart + 1, orderedNpubs.length - 1)
+		: Math.max(effectiveStart - 1, 0);
+	const nextNpub = orderedNpubs[nextIdx];
+	if (!shiftKey) {
+		// Plain arrow: move focus only. Selection and anchor are untouched, but the selection is
+		// PROJECTED through orderedNpubs so hidden/filtered rows are dropped (matches every branch
+		// of applyClickToSelection). Without this, Arrow after filtering keeps stale hidden
+		// selections and a subsequent G groups people the user cannot see (A1).
+		return { selection: orderedNpubs.filter((n) => current.includes(n)), anchor, focused: nextNpub, focusedIdx: nextIdx };
+	}
+	// Shift+arrow: extend the selection by one, mirroring Shift-click's union semantics. The
+	// anchor is the range origin; if no anchor is set yet, the focused row becomes the anchor and
+	// is also selected (so the first Shift+arrow selects two rows: the anchor + the next one).
+	const rangeAnchor = anchor ?? nextNpub;
+	const aIdx = orderedNpubs.indexOf(rangeAnchor);
+	if (aIdx === -1) {
+		// Stale anchor — seed a fresh range at the focused row.
+		return { selection: [nextNpub], anchor: nextNpub, focused: nextNpub, focusedIdx: nextIdx };
+	}
+	const lo = Math.min(aIdx, nextIdx);
+	const hi = Math.max(aIdx, nextIdx);
+	const range = orderedNpubs.slice(lo, hi + 1);
+	const merged = new Set([...current, ...range]);
+	const selection = orderedNpubs.filter((n) => merged.has(n));
+	return { selection, anchor: rangeAnchor, focused: nextNpub, focusedIdx: nextIdx };
+}
+
 /** Write the WHOLE selection (a JSON array of npubs) into the DataTransfer. Called on dragstart
  *  when the dragged row is part of a multi-selection. De-dupes and preserves the order given. */
 export function writeDragPayloadMulti(dt: DataTransfer, npubs: string[]): void {
@@ -527,3 +586,52 @@ export async function commitInverseMulti(api: UndoApi, inverses: DropInverse[]):
 		await commitInverse(api, inv);
 	}
 }
+
+// ── M22 W7 — keyboard parity pure helpers ─────────────────────────────────────
+//
+// Decision logic extracted from the pages so it is unit-testable WITHOUT a DOM mount (the route
+// pages can't be mounted: onMount + $app/navigation). Each takes plain-data arguments.
+
+/** The tabbable index for a rendered row under a roving-tabindex model (A5/A6). Returns 0 for the
+ *  ONE row that owns the tab stop, -1 for the rest. Rules:
+ *  - If `focusedIdx` is a valid index into orderedNpubs, that row owns the tab stop.
+ *  - If focusedIdx is null/-1 (no focus, or the focused row was filtered out — A6), the FIRST
+ *    rendered row owns the tab stop so the list is never left with no tab stop at all.
+ *  `renderIdx` is the index of the row being rendered (its position in orderedNpubs). Pure: no DOM. */
+export function rovingTabindexForIdx(
+	focusedIdx: number | null,
+	renderIdx: number,
+	orderedLen: number,
+): 0 | -1 {
+	if (orderedLen === 0) return -1;
+	// A5/A6: when focusedIdx is stale/absent, fall back to the first rendered row.
+	const tabbableIdx = (focusedIdx === null || focusedIdx < 0 || focusedIdx >= orderedLen) ? 0 : focusedIdx;
+	return renderIdx === tabbableIdx ? 0 : -1;
+}
+
+/** A DOM-free typing-target guard (A8). Takes the tag-name + contentEditable flag of the event's
+ *  target (or its composed-path retarget, for Shadow DOM) and returns true if a `keydown` there
+ *  would be typing into a field — i.e. G / arrow handlers must NOT fire. Pure: no DOM.
+ *  `tagName` should be uppercased (as HTMLElement.tagName is). */
+export function isTypingTargetShape(tagName: string, isContentEditable: boolean): boolean {
+	if (tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT') return true;
+	return isContentEditable;
+}
+
+/** Should the list's window keydown handler handle arrow keys at all (A7)? The pure gate: the list
+ *  must have at least one row to navigate. The page additionally checks that focus is within the
+ *  list container (a DOM check that cannot live here) so arrows don't kill page scroll when the
+ *  user is elsewhere. Pure: no DOM. */
+export function shouldHandleArrowKey(orderedLen: number): boolean {
+	return orderedLen > 0;
+}
+
+/** A stable per-row DOM id for focus management (A2). The list container uses this to find the
+ *  newly-focused row and call `.focus()` on it after an arrow-key move. `prefix` distinguishes the
+ *  contacts list from the browse list (e.g. 'contact-row' / 'peer-row') so two lists on the same
+ *  page never collide. Pure: no DOM. */
+export function rowId(prefix: string, npub: string): string {
+	return `${prefix}-${npub}`;
+}
+
+

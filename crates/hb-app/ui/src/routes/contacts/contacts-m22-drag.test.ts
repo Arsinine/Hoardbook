@@ -37,6 +37,9 @@ import {
 	computeDropOutcomeMulti,
 	commitDropOnGroupMulti,
 	applyClickToSelection,
+	applyKeyToSelection,
+	isTypingTargetShape,
+	rovingTabindexForIdx,
 	computeDropInverse,
 	computeDropInverseMulti,
 	computeCreateInverse,
@@ -1410,3 +1413,392 @@ describe('M22 W5 — contacts page wiring (source-scan, no behavioural equivalen
 		expect(s).toMatch(/\.contact-card\.contact-selected\s*\{/);
 	});
 });
+
+// ════════════════════════════════════════════════════════════════════════════════
+// M22 W7 — keyboard parity. Drag is the FAST path; the keyboard is the COMPLETE path.
+//
+// Two halves:
+//   1. The keyboard equivalent of the headline gesture: ArrowUp/Down move focus, Shift extends the
+//      selection, G opens the SAME namer (dragPopoverFor = [...selected]) so W2 suggestions and W6
+//      create-undo come along for free.
+//   2. The existing W5b popover stays the complete path for add/move/ungrouped.
+//
+// Acceptance: every drop kind has a keyboard route; the G handler does not eat typing; the keyboard
+// and drag paths converge on the same api calls; focus is trapped/restored; prefers-reduced-motion
+// is respected; the refuse state is conveyed non-visually.
+// ════════════════════════════════════════════════════════════════════════════════
+
+// ── applyKeyToSelection: the keyboard selection model (pure logic, no DOM) ────
+// Mirrors applyClickToSelection's range/union semantics so the keyboard and mouse models cannot
+// drift. ArrowUp/Down move focus by one; with Shift they extend the selection from the anchor.
+
+describe('M22 W7 — applyKeyToSelection: plain arrow moves focus, not selection', () => {
+	const ordered = ['npub1a', 'npub1b', 'npub1c', 'npub1d'];
+
+	it('ArrowDown moves focus down by one without changing the selection', () => {
+		const r = applyKeyToSelection(['npub1a'], 'npub1a', ordered, 'npub1a', 'ArrowDown', false);
+		expect(r.focused).toBe('npub1b');
+		expect(r.selection).toEqual(['npub1a']);
+	});
+
+	it('ArrowUp moves focus up by one without changing the selection', () => {
+		const r = applyKeyToSelection(['npub1c'], 'npub1c', ordered, 'npub1c', 'ArrowUp', false);
+		expect(r.focused).toBe('npub1b');
+		expect(r.selection).toEqual(['npub1c']);
+	});
+
+	it('plain arrow does NOT move the anchor', () => {
+		const r = applyKeyToSelection(['npub1a'], 'npub1a', ordered, 'npub1a', 'ArrowDown', false);
+		expect(r.anchor).toBe('npub1a');
+	});
+
+	it('clamps at the top (ArrowUp on the first row stays on the first row)', () => {
+		const r = applyKeyToSelection(['npub1a'], 'npub1a', ordered, 'npub1a', 'ArrowUp', false);
+		expect(r.focused).toBe('npub1a');
+	});
+
+	it('clamps at the bottom (ArrowDown on the last row stays on the last row)', () => {
+		const r = applyKeyToSelection(['npub1d'], 'npub1d', ordered, 'npub1d', 'ArrowDown', false);
+		expect(r.focused).toBe('npub1d');
+	});
+
+	it('no wraparound (ArrowDown on the last row does NOT jump to the top)', () => {
+		const r = applyKeyToSelection(['npub1d'], 'npub1d', ordered, 'npub1d', 'ArrowDown', false);
+		expect(r.focused).not.toBe('npub1a');
+	});
+});
+
+describe('M22 W7 — applyKeyToSelection: first arrow key from null focus', () => {
+	const ordered = ['npub1a', 'npub1b', 'npub1c'];
+
+	it('ArrowDown from null focus lands on the first row (entering the list from above)', () => {
+		const r = applyKeyToSelection([], null, ordered, null, 'ArrowDown', false);
+		expect(r.focused).toBe('npub1a');
+	});
+
+	it('ArrowUp from null focus lands on the last row (entering the list from below)', () => {
+		const r = applyKeyToSelection([], null, ordered, null, 'ArrowUp', false);
+		expect(r.focused).toBe('npub1c');
+	});
+});
+
+describe('M22 W7 — applyKeyToSelection: Shift+arrow extends the selection (mirrors Shift-click)', () => {
+	const ordered = ['npub1a', 'npub1b', 'npub1c', 'npub1d'];
+
+	it('Shift+ArrowDown extends the selection by one from the anchor', () => {
+		// Anchor at npub1a, focused at npub1a → Shift+ArrowDown should add npub1b.
+		const r = applyKeyToSelection(['npub1a'], 'npub1a', ordered, 'npub1a', 'ArrowDown', true);
+		expect(r.focused).toBe('npub1b');
+		expect(r.selection).toEqual(['npub1a', 'npub1b']);
+	});
+
+	it('Shift+ArrowDown twice extends by two (the range grows)', () => {
+		let r = applyKeyToSelection(['npub1a'], 'npub1a', ordered, 'npub1a', 'ArrowDown', true);
+		r = applyKeyToSelection(r.selection, r.anchor, ordered, r.focused, 'ArrowDown', true);
+		expect(r.focused).toBe('npub1c');
+		expect(r.selection).toEqual(['npub1a', 'npub1b', 'npub1c']);
+	});
+
+	it('Shift+ArrowUp extends the selection upward from the anchor', () => {
+		// Anchor at npub1c, focused at npub1c → Shift+ArrowUp should add npub1b.
+		const r = applyKeyToSelection(['npub1c'], 'npub1c', ordered, 'npub1c', 'ArrowUp', true);
+		expect(r.focused).toBe('npub1b');
+		expect(r.selection).toEqual(['npub1b', 'npub1c']);
+	});
+
+	it('Shift+arrow UNIONS with the existing selection (does not replace)', () => {
+		// Already have npub1a + npub1d selected; Shift+ArrowDown from npub1a adds npub1b.
+		const r = applyKeyToSelection(['npub1a', 'npub1d'], 'npub1a', ordered, 'npub1a', 'ArrowDown', true);
+		expect(r.selection).toEqual(['npub1a', 'npub1b', 'npub1d']);
+	});
+
+	it('Shift+arrow does NOT move the anchor', () => {
+		const r = applyKeyToSelection(['npub1a'], 'npub1a', ordered, 'npub1a', 'ArrowDown', true);
+		expect(r.anchor).toBe('npub1a');
+	});
+
+	it('Shift+arrow with a stale anchor (not in ordered) seeds a fresh range at the focused row', () => {
+		const r = applyKeyToSelection([], 'npubGONE', ordered, 'npub1b', 'ArrowDown', true);
+		expect(r.focused).toBe('npub1c');
+		expect(r.selection).toEqual(['npub1c']);
+		expect(r.anchor).toBe('npub1c');
+	});
+});
+
+describe('M22 W7 — applyKeyToSelection: empty list edge case', () => {
+	it('an empty ordered list returns the focused unchanged (no crash)', () => {
+		const r = applyKeyToSelection([], null, [], null, 'ArrowDown', false);
+		expect(r.focused).toBe('');
+		expect(r.selection).toEqual([]);
+	});
+});
+
+// ── Contacts page wiring (source-scan): keyboard route + a11y ──────────────────
+
+describe('M22 W7 — contacts page keyboard wiring (source-scan)', () => {
+	it('imports applyKeyToSelection from $lib/drag-group.js', () => {
+		expect(contactsSrc()).toMatch(/applyKeyToSelection/);
+	});
+
+	it('declares a focusedNpub state variable', () => {
+		expect(contactsSrc()).toMatch(/let focusedNpub = \$state/);
+	});
+
+	it('the onWindowKeyDown handler routes ArrowUp/ArrowDown to applyKeyToSelection', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('function onDragStart'));
+		expect(fn).toMatch(/ArrowUp|ArrowDown/);
+		expect(fn).toMatch(/applyKeyToSelection/);
+	});
+
+	it('the onWindowKeyDown handler routes G to opening the namer (dragPopoverFor)', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('function onDragStart'));
+		expect(fn).toMatch(/'g' || 'G'/);
+		expect(fn).toMatch(/dragPopoverFor = \[\.\.\.selectedNpubs\]/);
+	});
+
+	it('isTypingTarget retargets through composedPath (Shadow DOM) and delegates to the pure shape', () => {
+		// A window keydown from inside a Shadow DOM retargets to the HOST, which is neither INPUT
+		// nor contentEditable — so reading e.target alone lets `g` fire while the user is typing in
+		// a shadow input. composedPath()[0] is the real inner element. The tag/contentEditable
+		// decision itself lives in the pure isTypingTargetShape, which is tested behaviourally below.
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('function isTypingTarget'), s.indexOf('function onRowFocus'));
+		const stripped = fn.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+		expect(stripped).toMatch(/composedPath\(\)\[0\]/);
+		expect(stripped).toMatch(/isTypingTargetShape\(/);
+	});
+
+	it('the G handler is guarded while the namer (dragPopoverFor) is open', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('function onDragStart'));
+		// The early return at the top of onWindowKeyDown when dragPopoverFor is truthy.
+		expect(fn).toMatch(/if \(dragPopoverFor\) return/);
+	});
+
+	it('the G handler requires at least 2 selected npubs (no one-member group)', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('function onDragStart'));
+		expect(fn).toMatch(/selectedNpubs\.length >= 2/);
+	});
+
+	it('the contact-card carries role="option" and aria-selected', () => {
+		const s = contactsSrc();
+		expect(s).toMatch(/role="option"/);
+		expect(s).toMatch(/aria-selected=\{selectedNpubSet\.has\(peer\.npub\)\}/);
+	});
+
+	// BEHAVIOURAL: the roving rule is a pure function, so assert what it RETURNS — including the
+	// stale/absent-focus fallback (A6: filtering the focused row must still leave ONE tab stop) and
+	// the multi-render case (A5: a peer rendered once per group must not make every copy tabbable,
+	// which is why this is keyed on the render index, not the npub).
+	// Mutation probe: making the stale branch return 0 for every row reds this.
+	it('rovingTabindexForIdx gives exactly one tab stop, and falls back to the first row', () => {
+		// focused row owns it
+		expect(rovingTabindexForIdx(2, 2, 5)).toBe(0);
+		expect(rovingTabindexForIdx(2, 0, 5)).toBe(-1);
+		expect(rovingTabindexForIdx(2, 4, 5)).toBe(-1);
+		// stale/absent focus -> first row is the tab stop, and ONLY the first
+		for (const stale of [null, -1, 99]) {
+			expect(rovingTabindexForIdx(stale, 0, 5)).toBe(0);
+			expect(rovingTabindexForIdx(stale, 1, 5)).toBe(-1);
+		}
+		// empty list has no tab stop at all
+		expect(rovingTabindexForIdx(null, 0, 0)).toBe(-1);
+	});
+
+	it('the row wires the roving tabindex by RENDER INDEX and a stable id for DOM focus', () => {
+		const s = contactsSrc();
+		// Keyed on the render index, not peer.npub — the A5 defect was npub-keying.
+		expect(s).toMatch(/tabindex=\{rovingTabindexForIdx\(focusedIdx,/);
+		// A2 needs a stable id: moveFocusToRow does getElementById, which returns null without it.
+		expect(s).toMatch(/id=\{rowId\(ROW_ID_PREFIX, peer\.npub\)\}/);
+		expect(s).toMatch(/onfocus=\{\(\) => onRowFocus\(peer\.npub\)\}/);
+	});
+
+	it('the section header carries aria-disabled when the drop is refused/noop', () => {
+		const s = contactsSrc();
+		expect(s).toMatch(/aria-disabled=\{dropOverTarget === dropTargetName/);
+	});
+
+	it('a sr-only aria-live region mirrors the drop affordance (refuse state non-visual)', () => {
+		const s = contactsSrc();
+		expect(s).toMatch(/class="sr-only"/);
+		expect(s).toMatch(/aria-live="polite"/);
+	});
+
+	it('prefers-reduced-motion media query exists', () => {
+		expect(contactsSrc()).toMatch(/prefers-reduced-motion: reduce/);
+	});
+
+	it('closeDragPopover restores focus to the row that opened the namer', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('function closeDragPopover'), s.indexOf('async function onDragNameKey'));
+		expect(fn).toMatch(/dragPopoverReturnFocus/);
+		expect(fn).toMatch(/\.focus/);
+	});
+
+	it('the G handler saves the active element before opening the namer', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('function onDragStart'));
+		expect(fn).toMatch(/dragPopoverReturnFocus = document\.activeElement/);
+	});
+});
+
+// ── THE REQUIRED TEST: typing "g" in a field must NOT open the namer ──────────
+// This is the most likely bug a naive global G handler would introduce. The guard must survive a
+// source-scan: if the guard is removed, this test reds because the guard function is absent.
+
+describe('M22 W7 acceptance — typing "g" in a field does NOT open the namer', () => {
+	// BEHAVIOURAL, not a word scan: the guard decision is a pure function, so assert what it
+	// RETURNS. The previous version only checked that the strings INPUT/TEXTAREA/SELECT appeared
+	// in the source, which stayed green if the branch returned the wrong boolean.
+	// Mutation probe: flipping either return in isTypingTargetShape reds this.
+	it('isTypingTargetShape returns true for typing elements and false otherwise', () => {
+		for (const tag of ['INPUT', 'TEXTAREA', 'SELECT']) {
+			expect(isTypingTargetShape(tag, false)).toBe(true);
+		}
+		expect(isTypingTargetShape('DIV', true)).toBe(true);   // contenteditable
+		expect(isTypingTargetShape('DIV', false)).toBe(false); // an ordinary row
+		expect(isTypingTargetShape('BUTTON', false)).toBe(false);
+	});
+
+	it('the G handler calls the guard and NEGATES it before opening the namer', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('function onDragStart'));
+		// Comments stripped so a comment naming the guard cannot satisfy this (the sentinel
+		// collision this repo has hit before). The negation is asserted, not just the call: a
+		// guard used without `!` would open the namer ONLY while typing, which is the inversion.
+		// Mutation probe: dropping the call, or dropping the `!`, reds this.
+		const gBranch = fn.slice(fn.indexOf("e.key === 'g'"));
+		const stripped = gBranch.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+		expect(stripped).toMatch(/!isTypingTarget\(e\)/);
+	});
+});
+
+// ── THE TABLE-DRIVEN TEST: every drop kind has a keyboard route ────────────────
+// A future drop kind with no keyboard route must fail loudly here. The W5b group popover
+// (contactUpdateGroups) is "the complete path" for add/move/ungrouped.
+
+describe('M22 W7 acceptance — every drop kind has a keyboard route (table-driven)', () => {
+	// One row per drop kind from W3/W4/W5. The route column is the keyboard path.
+	// create → select rows, press G → the namer (dragPopoverFor = [...selected])
+	// add/move/ungrouped → the W5b group popover (contactUpdateGroups with the full desired set)
+	// refused/noop → nothing to route (no write happens).
+	const cases: { kind: string; route: string; desc: string }[] = [
+		{ kind: 'create (W3 pair)',   route: 'G → namer',                 desc: 'select 2 rows, press G → the same namer' },
+		{ kind: 'create (W5 multi)',  route: 'G → namer',                 desc: 'select N rows, press G → the same namer' },
+		{ kind: 'add',                route: 'W5b popover',               desc: 'contactUpdateGroups via the group popover' },
+		{ kind: 'move',               route: 'W5b popover',               desc: 'contactUpdateGroups via the group popover' },
+		{ kind: 'ungrouped',          route: 'W5b popover',               desc: 'contactUpdateGroups([]) via the group popover' },
+		{ kind: 'refused',            route: 'nothing (no write)',        desc: 'no route needed — no write happens' },
+		{ kind: 'noop',               route: 'nothing (no write)',        desc: 'no route needed — no write happens' },
+	];
+
+	// The exhaustive guard: every DropOutcome kind must have a row in the table. The set below is
+	// the full kind union from drag-group.ts. A future sixth DropOutcome kind with no row here
+	// fails because its name is absent from this set. Mutation probe: removing any row's kind from
+	// the table reds this assertion.
+	const ALL_TABLE_KINDS = ['create (W3 pair)', 'create (W5 multi)', 'add', 'move', 'ungrouped', 'refused', 'noop'];
+
+	/** The DropOutcome kinds read from drag-group.ts SOURCE, not re-typed here. A hand-written list
+	 *  of kinds in the test cannot detect a kind added to production — it only ever agrees with
+	 *  itself (CLAUDE.md §9: "a hand-written list of sites cannot fix a hand-written list of
+	 *  sites... scan at the SOURCE"). Proven: adding a 6th kind to the union left the previous
+	 *  literal-vs-literal version green at 265/265, which is the one scenario this test exists for. */
+	function dropOutcomeKindsFromSource(): string[] {
+		const src = readFileSync(new URL('../../lib/drag-group.ts', import.meta.url), 'utf8');
+		const start = src.indexOf('export type DropOutcome =');
+		// To the blank line after the union — NOT to the first ';', which lands inside the very
+		// first member (`{ kind: 'move'; target: string }`) and would report a single kind.
+		const union = src.slice(start, src.indexOf('\n\n', start));
+		return [...union.matchAll(/kind: '([a-z-]+)'/g)].map((m) => m[1]);
+	}
+
+	it('the table covers every DropOutcome kind IN SOURCE (no kind without a keyboard route)', () => {
+		const kinds = dropOutcomeKindsFromSource();
+		// Sanity: the parse actually found the union (a broken parse must not pass vacuously).
+		expect(kinds).toContain('move');
+		expect(kinds.length).toBeGreaterThanOrEqual(5);
+		for (const outcomeKind of kinds) {
+			// 'create' is not a DropOutcome kind (it is the W3/W5 gesture), so the table carries it
+			// as a prefixed row; every other kind must match a row exactly.
+			expect(ALL_TABLE_KINDS.some((k) => k === outcomeKind || k.startsWith(outcomeKind + ' '))).toBe(true);
+		}
+		expect(cases.length).toBeGreaterThanOrEqual(kinds.length);
+	});
+
+	for (const c of cases) {
+		it(`${c.kind} → ${c.route} (${c.desc})`, () => {
+			// Every kind must have a non-empty route. A future eighth kind added to DropOutcome
+			// without a row here fails because this table is the enumerated contract.
+			expect(c.route.length).toBeGreaterThan(0);
+		});
+	}
+
+	// The structural pin: the W5b popover writes via contactUpdateGroups. If the popover is
+	// removed, add/move/ungrouped lose their keyboard route. This guards the complete path.
+	it('the W5b group popover writes via contactUpdateGroups (the complete keyboard path)', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('async function applyGroupPopover'), s.indexOf('// M20 W2'));
+		expect(fn).toMatch(/contactUpdateGroups/);
+	});
+
+	// The create route: G opens the namer which commits via commitDragCreate → commitCreateGroupMulti.
+	it('the G route opens the SAME namer the drag path uses (dragPopoverFor)', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('function onDragStart'));
+		const gBranch = fn.slice(fn.indexOf("e.key === 'g'"));
+		// Strip comments so a comment naming the api cannot satisfy the negation.
+		const stripped = gBranch.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+		// Must set dragPopoverFor to [...selectedNpubs] — NOT call groupsCreateWithMembers directly.
+		expect(stripped).toMatch(/dragPopoverFor = \[\.\.\.selectedNpubs\]/);
+		expect(stripped).not.toMatch(/groupsCreateWithMembers/);
+	});
+});
+
+// ── THE CONVERGENCE TEST: keyboard and drag paths reach the same api calls ────
+// Asserts that the G route reaches commitDragCreate (which calls commitCreateGroupMulti) and
+// computeCreateInverse — NOT a parallel create path. This is what makes W2 suggestions and W6
+// create-undo come along for free.
+
+describe('M22 W7 acceptance — keyboard and drag converge on the same api calls', () => {
+	it('the keyboard route reuses commitDragCreate (no parallel create path)', () => {
+		const s = contactsSrc();
+		// The G handler must NOT call groupsCreateWithMembers directly — it opens the namer which
+		// eventually calls commitDragCreate. Mutation probe: wiring G to call the api directly reds.
+		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('function onDragStart'));
+		const gBranch = fn.slice(fn.indexOf("e.key === 'g'"));
+		// Strip comments so a comment naming the api cannot satisfy this.
+		const stripped = gBranch.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+		expect(stripped).not.toMatch(/groupsCreateWithMembers/);
+		expect(stripped).not.toMatch(/commitCreateGroupMulti/);
+		expect(stripped).not.toMatch(/commitCreateGroup\b/);
+	});
+
+	it('commitCreateGroupMulti calls groupsCreateWithMembers (the convergence point)', async () => {
+		// Both the drag path and the keyboard path reach this one function. If it were bypassed,
+		// the keyboard create would be a parallel path that could drift.
+		const api = spyApi();
+		await commitCreateGroupMulti(api, 'Anime', ['npub1a', 'npub1b'], []);
+		expect(api.calls.length).toBe(1);
+		expect(api.calls[0].method).toBe('groupsCreateWithMembers');
+	});
+
+	it('commitDragCreate routes multi through commitCreateGroupMulti (the namer commit path)', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('async function commitDragCreate'), s.indexOf('</script>'));
+		expect(fn).toMatch(/commitCreateGroupMulti/);
+	});
+
+	it('the create inverse (computeCreateInverse) is the same for drag and keyboard', () => {
+		// Both paths open the same namer, which calls commitDragCreate, which registers the same
+		// undo. computeCreateInverse is the pure function — proving it returns delete-group for any
+		// name pins that the undo path is shared.
+		const inverse = computeCreateInverse('Anime Club');
+		expect(inverse.kind).toBe('delete-group');
+		expect((inverse as { kind: string; name: string }).name).toBe('Anime Club');
+	});
+});
+

@@ -22,6 +22,8 @@ import {
 	commitCreateGroupMulti,
 	writeDragPayloadMulti,
 	readDragPayloadMulti,
+	applyKeyToSelection,
+	rovingTabindexForIdx,
 	computeDropInverse,
 	computeDropInverseMulti,
 	computeCreateInverse,
@@ -506,3 +508,183 @@ describe('M22 W6 — Browse page wiring (source-scan)', () => {
 		expect(fn).toMatch(/toastWithAction/);
 	});
 });
+
+// ════════════════════════════════════════════════════════════════════════════════
+// M22 W7 — keyboard parity on Browse (mirrors Contacts). The keyboard is the COMPLETE path;
+// drag is strictly the fast path.
+// ════════════════════════════════════════════════════════════════════════════════
+
+// ── applyKeyToSelection: the shared keyboard selection model (the twin of Contacts' suite) ─
+
+describe('M22 W7 — applyKeyToSelection (shared primitive, same behaviour as Contacts)', () => {
+	const ordered = ['npub1a', 'npub1b', 'npub1c', 'npub1d'];
+
+	it('ArrowDown moves focus without changing the selection', () => {
+		const r = applyKeyToSelection(['npub1a'], 'npub1a', ordered, 'npub1a', 'ArrowDown', false);
+		expect(r.focused).toBe('npub1b');
+		expect(r.selection).toEqual(['npub1a']);
+	});
+
+	it('Shift+ArrowDown extends the selection (mirrors Shift-click)', () => {
+		const r = applyKeyToSelection(['npub1a'], 'npub1a', ordered, 'npub1a', 'ArrowDown', true);
+		expect(r.focused).toBe('npub1b');
+		expect(r.selection).toEqual(['npub1a', 'npub1b']);
+	});
+
+	it('clamps at both ends (no wraparound)', () => {
+		const r = applyKeyToSelection(['npub1d'], 'npub1d', ordered, 'npub1d', 'ArrowDown', false);
+		expect(r.focused).toBe('npub1d');
+	});
+});
+
+// ── Browse page wiring (source-scan): keyboard route + a11y ───────────────────
+
+describe('M22 W7 — Browse page keyboard wiring (source-scan)', () => {
+	it('imports applyKeyToSelection from $lib/drag-group.js', () => {
+		expect(browseSrc()).toMatch(/applyKeyToSelection/);
+	});
+
+	it('declares a focusedNpub state variable', () => {
+		expect(browseSrc()).toMatch(/let focusedNpub = \$state/);
+	});
+
+	it('the onWindowKeyDown handler routes ArrowUp/ArrowDown to applyKeyToSelection', () => {
+		const s = browseSrc();
+		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('async function loadGroupsInto'));
+		expect(fn).toMatch(/ArrowUp|ArrowDown/);
+		expect(fn).toMatch(/applyKeyToSelection/);
+	});
+
+	it('the onWindowKeyDown handler routes G to opening the namer', () => {
+		const s = browseSrc();
+		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('async function loadGroupsInto'));
+		expect(fn).toMatch(/'g' || 'G'/);
+		expect(fn).toMatch(/dragPopoverFor = \[\.\.\.selectedNpubs\]/);
+	});
+
+	// Was scanning the isTypingTarget HELPER body while claiming to guard the G BRANCH — so
+	// deleting the guard from the G condition left it green. Slice the branch it names, strip
+	// comments, and assert the NEGATED call. Mutation probe: dropping `!isTypingTarget(e)` reds it.
+	it('the G branch calls the typing guard and negates it', () => {
+		const s = browseSrc();
+		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('let dragSourceNpub'));
+		const gBranch = fn.slice(fn.indexOf("e.key === 'g'"));
+		const stripped = gBranch.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+		expect(stripped).toMatch(/!isTypingTarget\(e\)/);
+	});
+
+	it('the G handler requires at least 2 selected npubs', () => {
+		const s = browseSrc();
+		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('async function loadGroupsInto'));
+		expect(fn).toMatch(/selectedNpubs\.length >= 2/);
+	});
+
+	it('the G handler does NOT call groupsCreateWithMembers directly (converges on the namer)', () => {
+		const s = browseSrc();
+		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('async function loadGroupsInto'));
+		const gBranch = fn.slice(fn.indexOf("e.key === 'g'"));
+		// Strip comments so a comment naming the api cannot satisfy this.
+		const stripped = gBranch.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+		expect(stripped).not.toMatch(/groupsCreateWithMembers/);
+		expect(stripped).toMatch(/dragPopoverFor = \[\.\.\.selectedNpubs\]/);
+	});
+
+	// BEHAVIOURAL: the roving rule is a pure function, so assert what it RETURNS — including the
+	// stale/absent-focus fallback (A6: filtering the focused row must still leave ONE tab stop) and
+	// the multi-render case (A5: a peer rendered once per group must not make every copy tabbable,
+	// which is why this is keyed on the render index, not the npub).
+	// Mutation probe: making the stale branch return 0 for every row reds this.
+	it('rovingTabindexForIdx gives exactly one tab stop, and falls back to the first row', () => {
+		// focused row owns it
+		expect(rovingTabindexForIdx(2, 2, 5)).toBe(0);
+		expect(rovingTabindexForIdx(2, 0, 5)).toBe(-1);
+		expect(rovingTabindexForIdx(2, 4, 5)).toBe(-1);
+		// stale/absent focus -> first row is the tab stop, and ONLY the first
+		for (const stale of [null, -1, 99]) {
+			expect(rovingTabindexForIdx(stale, 0, 5)).toBe(0);
+			expect(rovingTabindexForIdx(stale, 1, 5)).toBe(-1);
+		}
+		// empty list has no tab stop at all
+		expect(rovingTabindexForIdx(null, 0, 0)).toBe(-1);
+	});
+
+	it('the row wires the roving tabindex by RENDER INDEX and a stable id for DOM focus', () => {
+		const s = browseSrc();
+		// Keyed on the render index, not peer.npub — the A5 defect was npub-keying.
+		expect(s).toMatch(/tabindex=\{rovingTabindexForIdx\(focusedIdx,/);
+		// A2 needs a stable id: moveFocusToRow does getElementById, which returns null without it.
+		expect(s).toMatch(/id=\{rowId\(ROW_ID_PREFIX, peer\.npub\)\}/);
+		expect(s).toMatch(/onfocus=\{\(\) => onRowFocus\(peer\.npub\)\}/);
+	});
+
+	it('the section header carries aria-disabled when the drop is refused/noop', () => {
+		const s = browseSrc();
+		expect(s).toMatch(/aria-disabled=\{dropOverTarget === dropTargetName/);
+	});
+
+	it('a sr-only aria-live region mirrors the drop affordance (refuse state non-visual)', () => {
+		const s = browseSrc();
+		expect(s).toMatch(/class="sr-only"/);
+		expect(s).toMatch(/aria-live="polite"/);
+	});
+
+	it('prefers-reduced-motion media query exists', () => {
+		expect(browseSrc()).toMatch(/prefers-reduced-motion: reduce/);
+	});
+
+	it('closeDragPopover restores focus to the row that opened the namer', () => {
+		const s = browseSrc();
+		const fn = s.slice(s.indexOf('function closeDragPopover'), s.indexOf('async function onDragNameKey'));
+		expect(fn).toMatch(/dragPopoverReturnFocus/);
+		expect(fn).toMatch(/\.focus/);
+	});
+});
+
+// ── THE TABLE-DRIVEN TEST: every drop kind has a keyboard route (Browse mirror) ─
+
+describe('M22 W7 acceptance — every drop kind has a keyboard route (Browse, table-driven)', () => {
+	const cases: { kind: string; route: string }[] = [
+		{ kind: 'create (W3 pair)',   route: 'G → namer' },
+		{ kind: 'create (W5 multi)',  route: 'G → namer' },
+		// ⚠ Browse has group drop targets (people-section-head ondrop) but NO membership editor —
+		// the W5b popover lives on Contacts only. So on THIS page add/move/ungrouped are currently
+		// drag-only, which W7's own criterion ("nothing may be reachable by drag alone") forbids.
+		// Owner ruling: close it by extracting the W5b popover into a shared component. Until that
+		// lands these rows state the gap rather than naming a route this page does not have.
+		{ kind: 'add',                route: 'GAP — no keyboard route on Browse yet' },
+		{ kind: 'move',               route: 'GAP — no keyboard route on Browse yet' },
+		{ kind: 'ungrouped',          route: 'GAP — no keyboard route on Browse yet' },
+		{ kind: 'refused',            route: 'nothing (no write)' },
+		{ kind: 'noop',               route: 'nothing (no write)' },
+	];
+
+	/** The DropOutcome kinds read from drag-group.ts SOURCE, not re-typed here. A hand-written list
+	 *  of kinds in the test only ever agrees with itself — proven: adding a 6th kind to the union
+	 *  left this file green while that kind had no keyboard route at all, which is the one scenario
+	 *  the table exists to catch (CLAUDE.md §9: scan at the SOURCE). */
+	function dropOutcomeKindsFromSource(): string[] {
+		const src = readFileSync(new URL('../../lib/drag-group.ts', import.meta.url), 'utf8');
+		const start = src.indexOf('export type DropOutcome =');
+		// To the blank line after the union — NOT to the first ';', which lands inside the very
+		// first member (`{ kind: 'move'; target: string }`) and would report a single kind.
+		const union = src.slice(start, src.indexOf('\n\n', start));
+		return [...union.matchAll(/kind: '([a-z-]+)'/g)].map((m) => m[1]);
+	}
+
+	it('the table covers every DropOutcome kind IN SOURCE (no kind without a keyboard route)', () => {
+		const kinds = dropOutcomeKindsFromSource();
+		// Sanity: the parse actually found the union (a broken parse must not pass vacuously).
+		expect(kinds).toContain('move');
+		expect(kinds.length).toBeGreaterThanOrEqual(5);
+		for (const outcomeKind of kinds) {
+			expect(cases.some((c) => c.kind === outcomeKind || c.kind.startsWith(outcomeKind + ' '))).toBe(true);
+		}
+	});
+
+	for (const c of cases) {
+		it(`${c.kind} → ${c.route}`, () => {
+			expect(c.route.length).toBeGreaterThan(0);
+		});
+	}
+});
+

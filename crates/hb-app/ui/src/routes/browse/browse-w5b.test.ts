@@ -31,7 +31,10 @@ describe('M21 W5b — Browse People panel is grouped by the user\'s groups', () 
 
 	it('the People panel renders peopleSections, not filteredContacts', () => {
 		const s = browseSrc();
-		expect(s).toMatch(/{#each peopleSections as section \(section\.key\)}/);
+		// M22 W7 added an index (`as section, secIdx`) so the roving tabindex can be keyed on the
+		// GLOBAL render position. The index is optional here; what this test pins is that the panel
+		// iterates peopleSections and keeps the (section.key) key — not the exact binding text.
+		expect(s).toMatch(/{#each peopleSections as section(?:, \w+)? \(section\.key\)}/);
 		// The old flat {#each filteredContacts as peer} is gone from the panel.
 		const panelStart = s.indexOf('class="contact-list"');
 		const panelEnd = s.indexOf('<!-- Right: browser');
