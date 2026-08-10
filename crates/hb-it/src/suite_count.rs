@@ -62,20 +62,26 @@ async fn count1(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// COUNT2: a real author publishing two kinds (teaser + presence) raises `count_userbase` by one
-/// (distinct across kinds); a canary author raises it by zero.
+/// COUNT2: a real author publishing two kinds (teaser + presence) raises `count_userbase_for` by one
+/// (distinct across kinds); a canary author raises it by zero. The reads are **scoped to the authors
+/// the test minted** via `count_userbase_for`, so the relay's global cap/window — which made the
+/// unbounded `count_userbase` read return different subsets on two successive calls (COUNT2 red since
+/// 2026-08-03) — can no longer move the figure. The tally itself is unchanged: it still runs through
+/// the production `count_distinct_userbase` (sig-verified, canary-excluded, distinct-by-author), so
+/// scoping the *fetch* does not change *what is counted*.
 async fn count2(ctx: &Ctx) -> Result<()> {
     let observer = Identity::generate();
     let client = ctx.connect(&observer).await?;
-    let before = hb_net::count_userbase(&client, FETCH_TIMEOUT).await?;
 
     let a = Identity::generate();
+    let before = hb_net::count_userbase_for(&client, &[a.public_key()], FETCH_TIMEOUT).await?;
+
     let ac = ctx.connect(&a).await?;
     ac.publish(&build_teaser(&a, &teaser("a", vec![ctx.tag("cnt")], vec![ctx.tag("video")]), true)?).await?;
     ac.publish(&build_binding(&a, now(), TTL)?).await?;
     ac.disconnect().await;
     settle().await;
-    let after_a = hb_net::count_userbase(&client, FETCH_TIMEOUT).await?;
+    let after_a = hb_net::count_userbase_for(&client, &[a.public_key()], FETCH_TIMEOUT).await?;
     ensure!(
         after_a == before + 1,
         "one new author across two kinds must count once: before={before} after={after_a}"
@@ -87,7 +93,8 @@ async fn count2(ctx: &Ctx) -> Result<()> {
     cc.publish(&with_canary_marker(&canary, &build_binding(&canary, now(), TTL)?)?).await?;
     cc.disconnect().await;
     settle().await;
-    let after_canary = hb_net::count_userbase(&client, FETCH_TIMEOUT).await?;
+    let after_canary =
+        hb_net::count_userbase_for(&client, &[a.public_key(), canary.public_key()], FETCH_TIMEOUT).await?;
     client.disconnect().await;
     ensure!(
         after_canary == after_a,
@@ -97,23 +104,47 @@ async fn count2(ctx: &Ctx) -> Result<()> {
 }
 
 /// COUNT3 — the end-to-end canary-no-pollution regression: run a full canary cycle, then prove (a)
-/// neither count moved, and (b) a canary teaser is invisible to a tag search while an identical
-/// non-canary teaser is found.
+/// the canary's own author is invisible to BOTH counts (online + userbase) even when you ask the
+/// relay specifically for its events, and (b) a canary teaser is invisible to a tag search while an
+/// identical non-canary teaser is found.
+///
+/// **Determinism (2026-08-10):** the reads are scoped to the canary's own author via
+/// `fetch_presence_for_authors` / `count_userbase_for`. The previous unbounded `count_online` /
+/// `count_userbase` reads were global across authors, so ambient presence/userbase traffic on the
+/// shared relay moved them between reads (COUNT3's online assertion failed `5 -> 0` on the SG relay
+/// even though `count_online` is `.since()`-bounded). Scoping to the canary's own author makes both
+/// halves deterministic while keeping the assertion exact: the canary's marked events must tally
+/// zero even when the fetch asks for that author by key — the marker, not query obscurity, is what
+/// excludes them.
 async fn count3(ctx: &Ctx) -> Result<()> {
     let observer = Identity::generate();
     let client = ctx.connect(&observer).await?;
-    let online_before = hb_net::count_online(&client, WINDOW, FETCH_TIMEOUT).await?;
-    let users_before = hb_net::count_userbase(&client, FETCH_TIMEOUT).await?;
 
     // A full canary cycle publishes a marked teaser+listing+presence (+ a DM, + cross-region).
     let run = crate::canary::run_canary(&ctx.relays).await;
     ensure!(run.all_passed(), "the canary cycle itself failed: {}", run.to_json());
     settle().await;
 
-    let online_after = hb_net::count_online(&client, WINDOW, FETCH_TIMEOUT).await?;
-    let users_after = hb_net::count_userbase(&client, FETCH_TIMEOUT).await?;
-    ensure!(online_after == online_before, "canary presence polluted the online count: {online_before} -> {online_after}");
-    ensure!(users_after == users_before, "canary events polluted the userbase count: {users_before} -> {users_after}");
+    // The canary's ephemeral key: recover the PublicKey from the run's npub to scope the reads.
+    let canary_pk = hb_core::identity::parse_npub(&run.npub)?;
+    let canary_authors = std::slice::from_ref(&canary_pk);
+
+    // (a) The canary's own author must be invisible to both counts. The cycle just published a
+    // marked teaser+listing+presence for this exact key, so a non-zero tally here would mean the
+    // marker exclusion regressed. `fetch_presence_for_authors` is the author-bounded read immune to
+    // the global relay cap (its map length IS the online count for these authors); the userbase
+    // count goes through the same production `count_distinct_userbase`.
+    let online_map = hb_net::fetch_presence_for_authors(&client, canary_authors, WINDOW, FETCH_TIMEOUT).await?;
+    let online_after = online_map.0.len();
+    ensure!(
+        online_after == 0,
+        "canary presence polluted the online count (author-scoped): {online_after} for the canary's own npub"
+    );
+    let users_after = hb_net::count_userbase_for(&client, canary_authors, FETCH_TIMEOUT).await?;
+    ensure!(
+        users_after == 0,
+        "canary events polluted the userbase count (author-scoped): {users_after} for the canary's own npub"
+    );
 
     // Discovery: a canary teaser under a unique tag must NOT surface; a real one with the same tag must.
     let uniq = ctx.tag("canarydisc");
