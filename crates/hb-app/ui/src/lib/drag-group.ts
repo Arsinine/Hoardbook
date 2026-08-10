@@ -191,3 +191,244 @@ export async function commitDropOnGroup(
 	}
 	return outcome;
 }
+
+// ── M22 W5 — multi-select drag ──────────────────────────────────────────────────────────────────
+//
+// Five people into a new group becomes ONE drag instead of ~20 interactions. The selection model is
+// the standard one: a plain click selects one and clears the rest; Shift-click extends a contiguous
+// run; Cmd/Ctrl-click toggles a single row. Dragging any selected row carries the WHOLE selection;
+// dragging an unselected row carries just that row and clears the selection first (matches every
+// file manager and email client the user has used).
+//
+// Design rule: the single-npub W3/W4 primitives and the single-npub DRAG_MIME payload are NEVER
+// changed — W3/W4 behaviour is pinned by existing tests and stays intact. W5 adds PARALLEL
+// multi-select primitives under a NEW MIME type carrying a JSON array. The page wiring reads the
+// multi payload first and falls back to the single payload so a W3 single-peer drag keeps working
+// unchanged.
+//
+// The refuse rule is aggregated over the selection: a target ALL selected contacts already belong
+// to refuses; a MIXED selection is allowed and adds/moves only the ones not already in the target.
+// Partial failure on commit MUST surface — the page never silently leaves a group half-populated.
+
+/** The MIME type the WHOLE selection (a JSON array of npubs) is carried under in the DataTransfer.
+ *  Distinct from DRAG_MIME so the single-npub W3/W4 path is untouched. */
+export const DRAG_MULTI_MIME = 'application/x-hoardbook-drag-npubs';
+
+/** Apply a click to the selection model and return the new selection (as a new array — the caller
+ *  reassigns). Pure: no DOM, no Svelte. Models the three standard modifiers:
+ *  - plain click   → selects ONLY this row (clears the rest). This is the default and the most
+ *                     common case; it is what happens when the user clicks without holding any key.
+ *  - shift-click   → extends a contiguous run from the anchor (last plain-clicked row) to this row.
+ *                     If no anchor is set yet, behaves like a plain click.
+ *  - cmd/ctrl-click → toggles this single row in the selection (add if absent, remove if present)
+ *                     WITHOUT moving the anchor, so the next Shift-click still extends from the old
+ *                     anchor. This matches Finder/Explorer/Gmail semantics.
+ *
+ *  `orderedNpubs` is the rendered row order (used to compute the contiguous range for Shift). It
+ *  MUST be the same order the user sees; the caller passes it in so this function stays pure. */
+export function applyClickToSelection(
+	current: string[],
+	anchor: string | null,
+	orderedNpubs: string[],
+	clickedNpub: string,
+	shiftKey: boolean,
+	metaKey: boolean,
+): { selection: string[]; anchor: string | null } {
+	if (shiftKey && anchor !== null) {
+		const start = orderedNpubs.indexOf(anchor);
+		const end = orderedNpubs.indexOf(clickedNpub);
+		if (start === -1 || end === -1) {
+			// Anchor or clicked row not in the rendered set (stale anchor) — fall back to plain click.
+			return { selection: [clickedNpub], anchor: clickedNpub };
+		}
+		const lo = Math.min(start, end);
+		const hi = Math.max(start, end);
+		const range = orderedNpubs.slice(lo, hi + 1);
+		// Union with the existing selection: Shift-click ADDS the run to what is already selected
+		// (so Shift-click into an existing selection extends it, matching file managers).
+		const merged = new Set([...current, ...range]);
+		// Preserve the rendered order in the result so the selection is deterministic.
+		const selection = orderedNpubs.filter((n) => merged.has(n));
+		return { selection, anchor };
+	}
+	if (metaKey) {
+		const set = new Set(current);
+		if (set.has(clickedNpub)) set.delete(clickedNpub);
+		else set.add(clickedNpub);
+		// Preserve rendered order; anchor is NOT moved (so the next Shift extends from the old one).
+		const selection = orderedNpubs.filter((n) => set.has(n));
+		return { selection, anchor };
+	}
+	// Plain click: select only this row, and it becomes the new anchor.
+	return { selection: [clickedNpub], anchor: clickedNpub };
+}
+
+/** Write the WHOLE selection (a JSON array of npubs) into the DataTransfer. Called on dragstart
+ *  when the dragged row is part of a multi-selection. De-dupes and preserves the order given. */
+export function writeDragPayloadMulti(dt: DataTransfer, npubs: string[]): void {
+	const unique = Array.from(new Set(npubs));
+	dt.setData(DRAG_MULTI_MIME, JSON.stringify(unique));
+	// Also write the single-npub payload under DRAG_MIME with the first selected npub, so a drop
+	// target that only reads the single payload (W3 drop-to-create) still gets a usable source.
+	// Drop targets that understand the multi payload read it instead and ignore the single fallback.
+	dt.setData(DRAG_MIME, unique[0] ?? '');
+	dt.effectAllowed = 'copy';
+}
+
+/** Read the whole selection back from the DataTransfer, or null if the multi payload is absent
+ *  (a single-peer W3 drag, or a foreign drag type). Called on drop / dragover. Always returns a
+ *  de-duped array when present; null means "no multi payload — fall back to single-npub read". */
+export function readDragPayloadMulti(dt: DataTransfer | null): string[] | null {
+	if (!dt) return null;
+	try {
+		const raw = dt.getData(DRAG_MULTI_MIME);
+		if (!raw) return null;
+		const parsed = JSON.parse(raw);
+		if (!Array.isArray(parsed)) return null;
+		const strs = parsed.filter((v): v is string => typeof v === 'string' && v.length > 0);
+		if (strs.length === 0) return null;
+		return Array.from(new Set(strs));
+	} catch {
+		return null;
+	}
+}
+
+/** Suggestions for the naming popover when N peers are dropped together. Just routes W2's
+ *  suggestGroupNames with the whole selection — it already takes an array, so multi-select needs no
+ *  new logic here. Kept as a named export so the page wiring is symmetrical with the W3 single-pair
+ *  groupSuggestions helper and so the test can pin the multi path independently. */
+export function groupSuggestionsMulti(peers: CachedPeer[]): string[] {
+	return suggestGroupNames(peers);
+}
+
+/** Commit: create the group with ALL selected peers, additive (Reading B). Calls
+ *  groupsCreateWithMembers exactly ONCE with the whole selection — never N times. Does NOT call
+ *  contactUpdateGroups, groupsUnassign, or any audience API. Returns the colour that was
+ *  auto-assigned. The selection MUST be de-duped by the caller (writeDragPayloadMulti already
+ *  de-dupes); this function de-dupes defensively one more time so a duplicate never reaches the
+ *  backend. */
+export async function commitCreateGroupMulti(
+	api: DragGroupApi,
+	name: string,
+	npubs: string[],
+	existingGroups: Pick<Group, 'color'>[],
+): Promise<string> {
+	const trimmed = name.trim();
+	if (!trimmed) throw new Error('Group name is empty');
+	const unique = Array.from(new Set(npubs));
+	if (unique.length === 0) throw new Error('No contacts selected');
+	const color = pickGroupColor(existingGroups);
+	await api.groupsCreateWithMembers(trimmed, unique, color);
+	return color;
+}
+
+/** The outcome of a multi-select drop onto an existing group, computed on dragover so the
+ *  affordance can show it before the drop fires. The refuse rule is aggregated over the selection:
+ *  - ALL selected already in target (and nothing would change) → refused.
+ *  - MIXED selection (some in, some out) → allowed; the commit applies only to the ones not already
+ *    in the target. This is the case the refuse rule must NOT catch.
+ *  - NONE in target → plain add/move like the single-source case.
+ *
+ *  `groupsByNpub` maps each selected npub to the list of group names it currently belongs to. */
+export type DropOutcomeMulti =
+	| { kind: 'move'; target: string; npubs: string[] }
+	| { kind: 'add'; target: string; npubs: string[] }
+	| { kind: 'ungrouped'; npubs: string[] }
+	| { kind: 'refused'; target: string; reason: string }
+	| { kind: 'noop' };
+
+/** Compute the outcome of dropping the whole selection onto targetGroupName (a real group name, or
+ *  UNGROUPED_TARGET). Pure: no writes, no I/O. Mirrors computeDropOutcome's refuse semantics but
+ *  aggregated across the selection — refused ONLY when EVERY selected contact is already in the
+ *  target (so a mixed selection is allowed and the commit applies only to the missing ones). The
+ *  `npubs` field on the write-kind outcomes carries ONLY the contacts the commit will actually
+ *  touch (the ones not already in the target for add; the full selection for move/ungrouped). */
+export function computeDropOutcomeMulti(
+	selectedNpubs: string[],
+	targetGroupName: string,
+	groupsByNpub: Map<string, string[]>,
+	shiftKey: boolean,
+): DropOutcomeMulti {
+	if (selectedNpubs.length === 0) {
+		return { kind: 'refused', target: targetGroupName, reason: 'invalid drag' };
+	}
+	// Ungrouped is special-cased before any membership reasoning, same as the single-source path.
+	if (targetGroupName === UNGROUPED_TARGET) {
+		if (shiftKey) return { kind: 'refused', target: targetGroupName, reason: 'Shift on Ungrouped is meaningless' };
+		// If EVERY selected contact already has no groups, the drop changes nothing → noop.
+		const anyWithGroups = selectedNpubs.some((n) => (groupsByNpub.get(n) ?? []).length > 0);
+		if (!anyWithGroups) return { kind: 'noop' };
+		return { kind: 'ungrouped', npubs: selectedNpubs };
+	}
+	// Partition the selection into already-in-target and not-in-target.
+	const alreadyIn = selectedNpubs.filter((n) => (groupsByNpub.get(n) ?? []).includes(targetGroupName));
+	const notIn = selectedNpubs.filter((n) => !(groupsByNpub.get(n) ?? []).includes(targetGroupName));
+	if (shiftKey) {
+		// Shift-add: refused ONLY when EVERY selected contact is already in the target (nothing to add).
+		if (notIn.length === 0) {
+			return { kind: 'refused', target: targetGroupName, reason: `already in ${targetGroupName}` };
+		}
+		return { kind: 'add', target: targetGroupName, npubs: notIn };
+	}
+	// Plain move: refused ONLY when EVERY selected contact is in the target AND the target is their
+	// ONLY group (the move would change nothing for any of them). A contact in the target who also
+	// has other groups WOULD lose them under a plain move, so the drop is allowed when any selected
+	// contact has other groups to lose OR any is not yet in the target.
+	if (alreadyIn.length === selectedNpubs.length) {
+		// Everyone is already in the target. Refuse only if NO one has other groups to lose.
+		const anyWithOthers = selectedNpubs.some((n) => {
+			const gs = groupsByNpub.get(n) ?? [];
+			return gs.length > 1;
+		});
+		if (!anyWithOthers) {
+			return { kind: 'refused', target: targetGroupName, reason: `already in ${targetGroupName}` };
+		}
+	}
+	return { kind: 'move', target: targetGroupName, npubs: selectedNpubs };
+}
+
+/** Commit a multi-select drop onto an existing group. Applies the write per selected contact that
+ *  the outcome actually touches (the `npubs` field), using the same single-write semantics as
+ *  commitDropOnGroup: groupsAssign for add, contactUpdateGroups for move/ungrouped. Never calls the
+ *  audience API.
+ *
+ *  PARTIAL FAILURE SURFACES: if any per-contact write rejects, the remaining writes still run (so
+ *  the group is not left half-populated by a single bad row) and the function resolves by throwing
+ *  an AggregateError-style Error carrying the npubs that failed and the count that succeeded. The
+ *  caller MUST surface this — never silently leave a partial result. A full success resolves with
+ *  the outcome (so the caller can toast the right verb). */
+export async function commitDropOnGroupMulti(
+	api: DropOnGroupApi,
+	outcome: Exclude<DropOutcomeMulti, { kind: 'refused' } | { kind: 'noop' }>,
+): Promise<DropOutcomeMulti> {
+	const targets = outcome.npubs;
+	// Build the per-npub write promise. Each touched contact makes exactly ONE backend call.
+	const writes: Promise<{ npub: string; ok: true } | { npub: string; ok: false; err: unknown }>[] =
+		targets.map(async (npub) => {
+			try {
+				if (outcome.kind === 'add') {
+					await api.groupsAssign(npub, outcome.target);
+				} else if (outcome.kind === 'move') {
+					await api.contactUpdateGroups(npub, [outcome.target]);
+				} else {
+					await api.contactUpdateGroups(npub, []);
+				}
+				return { npub, ok: true as const };
+			} catch (err) {
+				return { npub, ok: false as const, err };
+			}
+		});
+	const results = await Promise.all(writes);
+	const failed = results.filter((r): r is { npub: string; ok: false; err: unknown } => !r.ok);
+	if (failed.length > 0) {
+		const failedNpubs = failed.map((r) => r.npub);
+		const succeeded = results.length - failed.length;
+		const err = new Error(
+			`Drop partially failed: ${succeeded} succeeded, ${failed.length} failed: ${failedNpubs.join(', ')}`,
+		);
+		(err as Error & { failedNpubs: string[] }).failedNpubs = failedNpubs;
+		(err as Error & { succeeded: number }).succeeded = succeeded;
+		throw err;
+	}
+	return outcome;
+}

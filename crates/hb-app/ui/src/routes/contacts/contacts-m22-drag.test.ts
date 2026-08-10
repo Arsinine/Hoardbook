@@ -19,20 +19,29 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import {
 	DRAG_MIME,
+	DRAG_MULTI_MIME,
 	GROUP_PALETTE,
 	writeDragPayload,
 	readDragPayload,
+	writeDragPayloadMulti,
+	readDragPayloadMulti,
 	isSelfDrop,
 	isValidDropTarget,
 	pickGroupColor,
 	groupSuggestions,
+	groupSuggestionsMulti,
 	commitCreateGroup,
+	commitCreateGroupMulti,
 	computeDropOutcome,
 	commitDropOnGroup,
+	computeDropOutcomeMulti,
+	commitDropOnGroupMulti,
+	applyClickToSelection,
 	UNGROUPED_TARGET,
 	type DragGroupApi,
 	type DropOnGroupApi,
 	type DropOutcome,
+	type DropOutcomeMulti,
 } from '$lib/drag-group.js';
 import type { CachedPeer, Profile } from '$lib/types.js';
 
@@ -125,8 +134,10 @@ describe('M22 W3 — contacts page wiring (source-scan, no behavioural equivalen
 		expect(s).toMatch(/ondragleave=\{\(\) => onDragLeave\(peer\.npub\)\}/);
 	});
 
-	it('the Aim moment renders a text outcome "group these two" (not an icon)', () => {
-		expect(contactsSrc()).toMatch(/>group these two</);
+	it('the Aim moment renders a text outcome "group these two" for a single-pair drag (not an icon)', () => {
+		// M22 W5: the text is now conditional on dragCount, but the single-pair fallback must still
+		// say "group these two". The source must contain the literal so the W3 case is unchanged.
+		expect(contactsSrc()).toMatch(/'group these two'/);
 	});
 
 	it('the Lift moment dims the source in place (.drag-source { opacity: ~0.35 })', () => {
@@ -651,5 +662,477 @@ describe('M22 W4 — contacts page wiring (source-scan, no behavioural equivalen
 		const s = contactsSrc();
 		expect(s).toMatch(/class="drop-hint"/);
 		expect(s).toMatch(/already in/);
+	});
+});
+
+// ════════════════════════════════════════════════════════════════════════════════
+// M22 W5 — multi-select drag. Five people into a new group becomes ONE drag instead of ~20
+// interactions. The selection model: plain click selects one and clears the rest; Shift-click
+// extends a contiguous run; Cmd/Ctrl-click toggles one. Dragging any selected row carries the WHOLE
+// selection; dragging an unselected row carries just that row. The W3/W4 single-npub primitives and
+// the DRAG_MIME payload are NEVER changed — W5 adds PARALLEL multi primitives under a new MIME.
+// Refuse over selection: a target ALL selected already belong to refuses; MIXED allowed.
+// ════════════════════════════════════════════════════════════════════════════════
+
+// ── applyClickToSelection: the three modifiers (pure logic, no DOM) ──────────
+
+describe('M22 W5 — applyClickToSelection: plain click selects one, clears the rest', () => {
+	const ordered = ['npub1a', 'npub1b', 'npub1c', 'npub1d'];
+
+	it('plain click on a row selects ONLY that row', () => {
+		const r = applyClickToSelection(['npub1a', 'npub1b'], 'npub1a', ordered, 'npub1c', false, false);
+		expect(r.selection).toEqual(['npub1c']);
+	});
+
+	it('plain click moves the anchor to the clicked row (so the next Shift extends from it)', () => {
+		const r = applyClickToSelection([], null, ordered, 'npub1b', false, false);
+		expect(r.anchor).toBe('npub1b');
+	});
+});
+
+describe('M22 W5 — applyClickToSelection: Shift-click extends a contiguous run', () => {
+	const ordered = ['npub1a', 'npub1b', 'npub1c', 'npub1d'];
+
+	it('Shift-click extends from the anchor to the clicked row (forward range)', () => {
+		const r = applyClickToSelection(['npub1a'], 'npub1a', ordered, 'npub1c', true, false);
+		expect(r.selection).toEqual(['npub1a', 'npub1b', 'npub1c']);
+	});
+
+	it('Shift-click extends from the anchor to the clicked row (backward range)', () => {
+		const r = applyClickToSelection(['npub1d'], 'npub1d', ordered, 'npub1a', true, false);
+		expect(r.selection).toEqual(['npub1a', 'npub1b', 'npub1c', 'npub1d']);
+	});
+
+	it('Shift-click UNIONS with the existing selection (extends, does not replace)', () => {
+		const r = applyClickToSelection(['npub1a', 'npub1d'], 'npub1a', ordered, 'npub1b', true, false);
+		expect(r.selection).toEqual(['npub1a', 'npub1b', 'npub1d']);
+	});
+
+	it('Shift-click does NOT move the anchor (the next Shift still extends from the old one)', () => {
+		const r = applyClickToSelection([], 'npub1a', ordered, 'npub1c', true, false);
+		expect(r.anchor).toBe('npub1a');
+	});
+
+	it('Shift-click with no anchor falls back to a plain click', () => {
+		const r = applyClickToSelection(['npub1a'], null, ordered, 'npub1b', true, false);
+		expect(r.selection).toEqual(['npub1b']);
+		expect(r.anchor).toBe('npub1b');
+	});
+});
+
+describe('M22 W5 — applyClickToSelection: Cmd/Ctrl-click toggles one row', () => {
+	const ordered = ['npub1a', 'npub1b', 'npub1c'];
+
+	it('Cmd-click ADDS a row to the selection when absent', () => {
+		const r = applyClickToSelection(['npub1a'], 'npub1a', ordered, 'npub1b', false, true);
+		expect(r.selection).toEqual(['npub1a', 'npub1b']);
+	});
+
+	it('Cmd-click REMOVES a row from the selection when present', () => {
+		const r = applyClickToSelection(['npub1a', 'npub1b'], 'npub1a', ordered, 'npub1a', false, true);
+		expect(r.selection).toEqual(['npub1b']);
+	});
+
+	it('Cmd-click does NOT move the anchor', () => {
+		const r = applyClickToSelection(['npub1a'], 'npub1a', ordered, 'npub1b', false, true);
+		expect(r.anchor).toBe('npub1a');
+	});
+});
+
+// ── Multi DataTransfer payload round-trip ───────────────────────────────────
+
+describe('M22 W5 — multi DataTransfer payload', () => {
+	it('writeDragPayloadMulti + readDragPayloadMulti round-trip the selection', () => {
+		const dt = stubDataTransfer();
+		writeDragPayloadMulti(dt, ['npub1a', 'npub1b', 'npub1c']);
+		expect(readDragPayloadMulti(dt)).toEqual(['npub1a', 'npub1b', 'npub1c']);
+	});
+
+	it('uses a DISTINCT MIME type from the single-npub DRAG_MIME', () => {
+		expect(DRAG_MULTI_MIME).toMatch(/application\/x-hoardbook/);
+		expect(DRAG_MULTI_MIME).not.toBe(DRAG_MIME);
+	});
+
+	it('de-dupes the npubs before writing', () => {
+		const dt = stubDataTransfer();
+		writeDragPayloadMulti(dt, ['npub1a', 'npub1a', 'npub1b']);
+		expect(readDragPayloadMulti(dt)).toEqual(['npub1a', 'npub1b']);
+	});
+
+	it('also writes the single-npub fallback under DRAG_MIME (first selected npub)', () => {
+		const dt = stubDataTransfer();
+		writeDragPayloadMulti(dt, ['npub1a', 'npub1b']);
+		expect(readDragPayload(dt)).toBe('npub1a');
+	});
+
+	it('readDragPayloadMulti returns null for a null DataTransfer', () => {
+		expect(readDragPayloadMulti(null)).toBeNull();
+	});
+
+	it('readDragPayloadMulti returns null when the multi MIME is absent (single-npub W3 drag)', () => {
+		const dt = stubDataTransfer();
+		writeDragPayload(dt, 'npub1a');
+		expect(readDragPayloadMulti(dt)).toBeNull();
+	});
+});
+
+// ── groupSuggestionsMulti: routes all N peers through suggestGroupNames ─────
+
+describe('M22 W5 — groupSuggestionsMulti takes all selected peers', () => {
+	it('returns up to 3 suggestions derived from all peers', () => {
+		const peers = [
+			makePeer({ npub: 'npub1a', petname: 'Marisol', profile: makeProfile({ tags: ['anime'] }) }),
+			makePeer({ npub: 'npub1b', petname: 'Kestrel', profile: makeProfile({ tags: ['anime'] }) }),
+			makePeer({ npub: 'npub1c', petname: 'Rune', profile: makeProfile({ tags: ['anime'] }) }),
+		];
+		const result = groupSuggestionsMulti(peers);
+		expect(result.length).toBeLessThanOrEqual(3);
+		expect(result).toContain('anime');
+	});
+
+	it('the petname fallback for 3+ peers is "lead +N"', () => {
+		const peers = [
+			makePeer({ npub: 'npub1a', petname: 'Marisol' }),
+			makePeer({ npub: 'npub1b', petname: 'Kestrel' }),
+			makePeer({ npub: 'npub1c', petname: 'Rune' }),
+		];
+		const result = groupSuggestionsMulti(peers);
+		expect(result[result.length - 1]).toBe('Marisol +2');
+	});
+});
+
+// ── commitCreateGroupMulti: ONE call with all N npubs (acceptance gate) ──────
+
+describe('M22 W5 acceptance — create calls groupsCreateWithMembers exactly ONCE with all N npubs', () => {
+	it('commits all selected npubs in ONE call, not N', async () => {
+		const api = spyApi();
+		await commitCreateGroupMulti(api, 'Anime Club', ['npub1a', 'npub1b', 'npub1c', 'npub1d'], []);
+		expect(api.calls.length).toBe(1);
+		expect(api.calls[0].method).toBe('groupsCreateWithMembers');
+		expect(api.calls[0].args[0]).toBe('Anime Club');
+		expect(api.calls[0].args[1]).toEqual(['npub1a', 'npub1b', 'npub1c', 'npub1d']);
+	});
+
+	it('de-dupes npubs before committing (never sends a duplicate to the backend)', async () => {
+		const api = spyApi();
+		await commitCreateGroupMulti(api, 'G', ['npub1a', 'npub1a', 'npub1b'], []);
+		expect(api.calls[0].args[1]).toEqual(['npub1a', 'npub1b']);
+	});
+
+	it('passes an auto-assigned colour', async () => {
+		const api = spyApi();
+		await commitCreateGroupMulti(api, 'G', ['npub1a', 'npub1b'], []);
+		const color = api.calls[0].args[2];
+		expect(typeof color).toBe('string');
+		expect((GROUP_PALETTE as readonly string[]).includes(color as string)).toBe(true);
+	});
+
+	it('trims the name before committing', async () => {
+		const api = spyApi();
+		await commitCreateGroupMulti(api, '  Anime  ', ['npub1a', 'npub1b'], []);
+		expect(api.calls[0].args[0]).toBe('Anime');
+	});
+
+	it('throws on an empty name (never creates a nameless group)', async () => {
+		const api = spyApi();
+		await expect(commitCreateGroupMulti(api, '   ', ['npub1a', 'npub1b'], [])).rejects.toThrow();
+		expect(api.calls.length).toBe(0);
+	});
+
+	it('throws on an empty selection (never creates a zero-member group)', async () => {
+		const api = spyApi();
+		await expect(commitCreateGroupMulti(api, 'G', [], [])).rejects.toThrow();
+		expect(api.calls.length).toBe(0);
+	});
+});
+
+// ── commitCreateGroupMulti: never touches the private audience ──────────────
+
+describe('M22 W5 acceptance — multi create never touches the private audience', () => {
+	it('calls no audience API and exposes only groupsCreateWithMembers', async () => {
+		const api = spyApi();
+		await commitCreateGroupMulti(api, 'Anime', ['npub1a', 'npub1b', 'npub1c'], []);
+		const touched = api.calls.filter((c) =>
+			c.method === 'privateAudienceSet' || c.method === 'privateAudienceList');
+		expect(touched.length).toBe(0);
+	});
+});
+
+// ── computeDropOutcomeMulti: refuse over the SELECTION (the W5 rule) ────────
+
+describe('M22 W5 — computeDropOutcomeMulti: ALL-in-target refuses, MIXED allowed', () => {
+	function groupsMap(entries: Record<string, string[]>): Map<string, string[]> {
+		return new Map(Object.entries(entries));
+	}
+
+	it('Shift-drop when NONE are in the target → add, touches all', () => {
+		const o = computeDropOutcomeMulti(
+			['npub1a', 'npub1b', 'npub1c'], 'Film',
+			groupsMap({ npub1a: ['Anime'], npub1b: ['Music'], npub1c: [] }),
+			true,
+		);
+		expect(o.kind).toBe('add');
+		expect(o).toHaveProperty('target', 'Film');
+		expect((o as { npubs: string[] }).npubs).toEqual(['npub1a', 'npub1b', 'npub1c']);
+	});
+
+	it('Shift-drop when SOME are already in the target → add, touches only the missing ones', () => {
+		const o = computeDropOutcomeMulti(
+			['npub1a', 'npub1b', 'npub1c'], 'Film',
+			groupsMap({ npub1a: ['Film'], npub1b: ['Music'], npub1c: ['Film'] }),
+			true,
+		);
+		expect(o.kind).toBe('add');
+		// Only npub1b is not already in Film — the commit will touch ONLY that one.
+		expect((o as { npubs: string[] }).npubs).toEqual(['npub1b']);
+	});
+
+	it('Shift-drop when ALL are already in the target → refused', () => {
+		const o = computeDropOutcomeMulti(
+			['npub1a', 'npub1b'], 'Film',
+			groupsMap({ npub1a: ['Film'], npub1b: ['Film'] }),
+			true,
+		);
+		expect(o.kind).toBe('refused');
+		expect((o as { reason: string }).reason).toBe('already in Film');
+	});
+
+	it('plain move when NONE are in the target → move, touches all', () => {
+		const o = computeDropOutcomeMulti(
+			['npub1a', 'npub1b'], 'Film',
+			groupsMap({ npub1a: ['Anime'], npub1b: ['Music'] }),
+			false,
+		);
+		expect(o.kind).toBe('move');
+		expect((o as { npubs: string[] }).npubs).toEqual(['npub1a', 'npub1b']);
+	});
+
+	it('plain move when ALL are in the target AND all have other groups → move (they lose the others)', () => {
+		const o = computeDropOutcomeMulti(
+			['npub1a', 'npub1b'], 'Film',
+			groupsMap({ npub1a: ['Film', 'Anime'], npub1b: ['Film', 'Music'] }),
+			false,
+		);
+		expect(o.kind).toBe('move');
+	});
+
+	it('plain move when ALL are in the target as their ONLY group → refused (nothing would change)', () => {
+		const o = computeDropOutcomeMulti(
+			['npub1a', 'npub1b'], 'Film',
+			groupsMap({ npub1a: ['Film'], npub1b: ['Film'] }),
+			false,
+		);
+		expect(o.kind).toBe('refused');
+		expect((o as { reason: string }).reason).toBe('already in Film');
+	});
+});
+
+describe('M22 W5 — computeDropOutcomeMulti: Ungrouped target', () => {
+	function groupsMap(entries: Record<string, string[]>): Map<string, string[]> {
+		return new Map(Object.entries(entries));
+	}
+
+	it('plain drop on Ungrouped when at least one has groups → ungrouped', () => {
+		const o = computeDropOutcomeMulti(
+			['npub1a', 'npub1b'], UNGROUPED_TARGET,
+			groupsMap({ npub1a: ['Film'], npub1b: [] }),
+			false,
+		);
+		expect(o.kind).toBe('ungrouped');
+	});
+
+	it('plain drop on Ungrouped when NONE have groups → noop', () => {
+		const o = computeDropOutcomeMulti(
+			['npub1a', 'npub1b'], UNGROUPED_TARGET,
+			groupsMap({ npub1a: [], npub1b: [] }),
+			false,
+		);
+		expect(o.kind).toBe('noop');
+	});
+
+	it('Shift-drop on Ungrouped → refused', () => {
+		const o = computeDropOutcomeMulti(
+			['npub1a'], UNGROUPED_TARGET,
+			groupsMap({ npub1a: ['Film'] }),
+			true,
+		);
+		expect(o.kind).toBe('refused');
+	});
+});
+
+describe('M22 W5 — computeDropOutcomeMulti: invalid drag', () => {
+	it('an empty selection is refused', () => {
+		const o = computeDropOutcomeMulti([], 'Film', new Map(), false);
+		expect(o.kind).toBe('refused');
+	});
+});
+
+// ── commitDropOnGroupMulti: per-selected write, partial failure surfaces ────
+
+describe('M22 W5 acceptance — commitDropOnGroupMulti add touches only the missing npubs', () => {
+	it('Shift-drop add with 3 missing → groupsAssign called once per missing npub', async () => {
+		const api = spyDropApi();
+		await commitDropOnGroupMulti(api, { kind: 'add', target: 'Film', npubs: ['npub1a', 'npub1b', 'npub1c'] });
+		expect(api.calls.length).toBe(3);
+		expect(api.calls.map((c) => c.args)).toEqual([
+			['npub1a', 'Film'],
+			['npub1b', 'Film'],
+			['npub1c', 'Film'],
+		]);
+	});
+
+	it('add never calls contactUpdateGroups (only groupsAssign)', async () => {
+		const api = spyDropApi();
+		await commitDropOnGroupMulti(api, { kind: 'add', target: 'Film', npubs: ['npub1a', 'npub1b'] });
+		expect(api.calls.filter((c) => c.method === 'contactUpdateGroups').length).toBe(0);
+	});
+});
+
+describe('M22 W5 acceptance — commitDropOnGroupMulti move calls contactUpdateGroups([target])', () => {
+	it('plain move with 2 selected → contactUpdateGroups(npub, [target]) once each', async () => {
+		const api = spyDropApi();
+		await commitDropOnGroupMulti(api, { kind: 'move', target: 'Film', npubs: ['npub1a', 'npub1b'] });
+		expect(api.calls.length).toBe(2);
+		expect(api.calls.map((c) => c.args)).toEqual([
+			['npub1a', ['Film']],
+			['npub1b', ['Film']],
+		]);
+	});
+});
+
+describe('M22 W5 acceptance — commitDropOnGroupMulti ungrouped calls contactUpdateGroups([])', () => {
+	it('ungrouped with 2 selected → contactUpdateGroups(npub, []) once each', async () => {
+		const api = spyDropApi();
+		await commitDropOnGroupMulti(api, { kind: 'ungrouped', npubs: ['npub1a', 'npub1b'] });
+		expect(api.calls.length).toBe(2);
+		expect(api.calls.map((c) => c.args)).toEqual([
+			['npub1a', []],
+			['npub1b', []],
+		]);
+	});
+});
+
+describe('M22 W5 acceptance — partial failure SURFACES (no silent half-populated group)', () => {
+	it('a rejecting write throws an Error listing the failed npubs and the success count', async () => {
+		const api = spyDropApi();
+		// Make the second write reject.
+		(api.groupsAssign as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('relay down'));
+		await expect(
+			commitDropOnGroupMulti(api, { kind: 'add', target: 'Film', npubs: ['npub1a', 'npub1b', 'npub1c'] }),
+		).rejects.toThrow(/partially failed/);
+	});
+
+	it('the thrown Error carries failedNpubs and succeeded count', async () => {
+		const api = spyDropApi();
+		(api.groupsAssign as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('relay down'));
+		try {
+			await commitDropOnGroupMulti(api, { kind: 'add', target: 'Film', npubs: ['npub1a', 'npub1b'] });
+			expect.fail('should have thrown');
+		} catch (e) {
+			const err = e as Error & { failedNpubs?: string[]; succeeded?: number };
+			expect(err.failedNpubs).toEqual(['npub1a']);
+			expect(err.succeeded).toBe(1);
+		}
+	});
+
+	it('a full success resolves with the outcome (no throw)', async () => {
+		const api = spyDropApi();
+		const o = await commitDropOnGroupMulti(api, { kind: 'add', target: 'Film', npubs: ['npub1a', 'npub1b'] });
+		expect(o.kind).toBe('add');
+	});
+});
+
+describe('M22 W5 acceptance — multi drop never touches the private audience', () => {
+	it('add / move / ungrouped call no audience API', async () => {
+		const api = spyDropApi();
+		await commitDropOnGroupMulti(api, { kind: 'add', target: 'Film', npubs: ['npub1a', 'npub1b'] });
+		await commitDropOnGroupMulti(api, { kind: 'move', target: 'Film', npubs: ['npub1a'] });
+		await commitDropOnGroupMulti(api, { kind: 'ungrouped', npubs: ['npub1a'] });
+		const touched = api.calls.filter((c) =>
+			c.method === 'privateAudienceSet' || c.method === 'privateAudienceList');
+		expect(touched.length).toBe(0);
+	});
+});
+
+// ── Contacts page wiring (source-scan): W5 selection + ghost badge ──────────
+// The route page can't be mounted (onMount + $app/navigation), so source-scan pins the DOM wiring
+// that has no behavioural equivalent. The behavioural proof (which api method, how many times) lives
+// in the spy suites above.
+
+describe('M22 W5 — contacts page wiring (source-scan, no behavioural equivalent)', () => {
+	it('imports the multi-select primitives from $lib/drag-group.js', () => {
+		const s = contactsSrc();
+		expect(s).toMatch(/writeDragPayloadMulti/);
+		expect(s).toMatch(/readDragPayloadMulti/);
+		expect(s).toMatch(/commitCreateGroupMulti/);
+		expect(s).toMatch(/computeDropOutcomeMulti/);
+		expect(s).toMatch(/commitDropOnGroupMulti/);
+		expect(s).toMatch(/applyClickToSelection/);
+	});
+
+	it('the contact-card wires onmousedown for selection (plain/shift/cmd-click)', () => {
+		const s = contactsSrc();
+		expect(s).toMatch(/onmousedown=\{\(e\) => onContactMouseDown\(e, peer\.npub\)\}/);
+	});
+
+	it('the contact-card has a contact-selected class distinct from drag-source and drag-target', () => {
+		const s = contactsSrc();
+		expect(s).toMatch(/class:contact-selected=\{selectedNpubSet\.has\(peer\.npub\)\}/);
+	});
+
+	it('selectedNpubSet is a $derived Set derived from selectedNpubs', () => {
+		const s = contactsSrc();
+		expect(s).toMatch(/selectedNpubSet\s*=\s*\$derived/);
+		expect(s).toMatch(/new Set\(selectedNpubs\)/);
+	});
+
+	it('onDragStart writes the multi payload when the row is selected (carries the whole selection)', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('function onDragStart'), s.indexOf('function onDragOver'));
+		expect(fn).toMatch(/writeDragPayloadMulti/);
+		expect(fn).toMatch(/selectedNpubs/);
+	});
+
+	it('onDragStart clears the selection when dragging an UNSELECTED row (carries just that row)', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('function onDragStart'), s.indexOf('function onDragOver'));
+		expect(fn).toMatch(/selectedNpubs = \[/);
+	});
+
+	it('a window keydown Esc clears the selection (Escape handling)', () => {
+		const s = contactsSrc();
+		// Esc-to-clear is wired either as a svelte:window handler or inside an onkeydown.
+		expect(s).toMatch(/e\.key === 'Escape'/);
+		expect(s).toMatch(/selectedNpubs = \[\]/);
+	});
+
+	it('onDrop uses the multi payload when a multi-selection is in flight', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('function onDrop'), s.indexOf('function pickSuggestion'));
+		expect(fn).toMatch(/readDragPayloadMulti/);
+	});
+
+	it('onGroupDrop uses the multi outcome when a multi-selection is in flight', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('async function onGroupDrop'), s.indexOf('// Stale: last_fetched'));
+		expect(fn).toMatch(/computeDropOutcomeMulti/);
+		expect(fn).toMatch(/commitDropOnGroupMulti/);
+	});
+
+	it('the naming popover shows a count badge when a multi-selection is dropped (N peers, not 2 avatars)', () => {
+		const s = contactsSrc();
+		// The ghost shows a count badge instead of two avatars when selection > 1.
+		expect(s).toMatch(/dg-count/);
+	});
+
+	it('selection clears after a successful create', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('async function commitDragCreate'), s.indexOf('</script>'));
+		expect(fn).toMatch(/selectedNpubs = \[\]/);
+	});
+
+	it('the contact-selected CSS is visually distinct from hover and drag-source', () => {
+		const s = contactsSrc();
+		expect(s).toMatch(/\.contact-card\.contact-selected\s*\{/);
 	});
 });

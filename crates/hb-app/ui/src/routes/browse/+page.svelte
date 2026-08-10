@@ -14,7 +14,9 @@
 	// M22 W3 — drag-to-group gesture primitives (shared with Contacts). Create is ALWAYS ADDITIVE.
 	// M22 W4 — drop onto an existing group heading: plain drop MOVES, Shift-drop ADDS (owner ruling
 	// 2026-08-09). Ungrouped clears all. One implementation, two consumers (this + Contacts).
-	import { writeDragPayload, readDragPayload, isValidDropTarget, isSelfDrop, groupSuggestions, commitCreateGroup, computeDropOutcome, commitDropOnGroup, UNGROUPED_TARGET, type DropOutcome } from '$lib/drag-group.js';
+	// M22 W5 — multi-select drag primitives (shared with Contacts). Same selection model:
+	// plain click selects one, Shift-click extends a contiguous run, Cmd/Ctrl toggles one.
+	import { writeDragPayload, readDragPayload, writeDragPayloadMulti, readDragPayloadMulti, isValidDropTarget, isSelfDrop, groupSuggestions, groupSuggestionsMulti, commitCreateGroup, commitCreateGroupMulti, computeDropOutcome, commitDropOnGroup, computeDropOutcomeMulti, commitDropOnGroupMulti, applyClickToSelection, UNGROUPED_TARGET, type DropOutcome, type DropOutcomeMulti } from '$lib/drag-group.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
 
 	type BcItem =
@@ -298,9 +300,34 @@
 	// M22 W3 — drag-to-group gesture on the People list. Same shared primitives as Contacts;
 	// create is ALWAYS ADDITIVE. Esc cancels. The naming popover is a simple inline panel here
 	// (Browse's People list is compact, so a full OverflowMenu is overkill).
+	//
+	// M22 W5 — multi-select: same model as Contacts (plain/shift/cmd-click). Dragging a selected
+	// row carries the whole selection; dragging an unselected row carries just that row.
+	let selectedNpubs = $state<string[]>([]);
+	let selectionAnchor = $state<string | null>(null);
+	let selectedNpubSet = $derived(new Set(selectedNpubs));
+	let contactOrder = $derived(peopleSections.flatMap((s) => s.peers).map((p) => p.npub));
+
+	function onPeerMouseDown(e: MouseEvent, npub: string) {
+		// Ignore clicks on inner controls (avatar lock, etc.) so they keep their own action.
+		if ((e.target as HTMLElement).closest('button, a')) return;
+		const r = applyClickToSelection(selectedNpubs, selectionAnchor, contactOrder, npub, e.shiftKey, e.metaKey || e.ctrlKey);
+		selectedNpubs = r.selection;
+		selectionAnchor = r.anchor;
+	}
+
+	function onWindowKeyDown(e: KeyboardEvent) {
+		if (e.key === 'Escape' && selectedNpubs.length > 0 && !dragPopoverFor) {
+			selectedNpubs = [];
+			selectionAnchor = null;
+		}
+	}
+
 	let dragSourceNpub = $state<string | null>(null);
 	let dragOverNpub = $state<string | null>(null);
-	let dragPopoverFor = $state<{ source: string; target: string } | null>(null);
+	// M22 W5: how many contacts are being dragged (0 for single-pair W3, N-1 for multi of N).
+	let dragCount = $state(0);
+	let dragPopoverFor = $state<string[] | { source: string; target: string } | null>(null);
 	let dragNameInput = $state('');
 	let dragSuggestions = $state<string[]>([]);
 
@@ -310,7 +337,16 @@
 
 	function onDragStart(e: DragEvent, npub: string) {
 		if (!e.dataTransfer) return;
-		writeDragPayload(e.dataTransfer, npub);
+		// M22 W5: carry the whole selection when dragging a selected row; just this row otherwise.
+		if (selectedNpubSet.has(npub) && selectedNpubs.length > 1) {
+			writeDragPayloadMulti(e.dataTransfer, selectedNpubs);
+			dragCount = selectedNpubs.length;
+		} else {
+			selectedNpubs = [npub];
+			selectionAnchor = npub;
+			writeDragPayload(e.dataTransfer, npub);
+			dragCount = 0;
+		}
 		dragSourceNpub = npub;
 	}
 
@@ -328,13 +364,33 @@
 	function onDragEnd() {
 		dragSourceNpub = null;
 		dragOverNpub = null;
+		dragCount = 0;
 		// M22 W4: clear the group-heading drop affordance state too.
 		dropOverTarget = null;
 		dropOutcome = null;
+		dropOutcomeMulti = null;
 	}
 
 	function onDrop(e: DragEvent, targetNpub: string) {
 		e.preventDefault();
+		// M22 W5: multi-select drop — open naming popover with all selected peers + target.
+		const multiNpubs = readDragPayloadMulti(e.dataTransfer);
+		if (multiNpubs && multiNpubs.length > 1) {
+			if (multiNpubs.includes(targetNpub)) {
+				dragSourceNpub = null;
+				dragOverNpub = null;
+				return;
+			}
+			const peers = [...multiNpubs, targetNpub]
+				.map((n) => $contacts.find((c) => c.npub === n))
+				.filter((p): p is CachedPeer => !!p);
+			if (peers.length < 2) return;
+			dragSuggestions = groupSuggestionsMulti(peers);
+			dragNameInput = '';
+			dragPopoverFor = [...multiNpubs, targetNpub];
+			dragOverNpub = null;
+			return;
+		}
 		const sourceNpub = readDragPayload(e.dataTransfer);
 		if (!sourceNpub || isSelfDrop(sourceNpub, targetNpub)) {
 			dragSourceNpub = null;
@@ -370,13 +426,21 @@
 
 	async function commitDragCreate() {
 		if (!dragPopoverFor) return;
-		const { source, target } = dragPopoverFor;
+		const npubs = dragPopoverFor;
 		const name = dragNameInput;
 		dragPopoverFor = null;
 		try {
-			await commitCreateGroup({ groupsCreateWithMembers }, name, source, target, groups);
+			if (Array.isArray(npubs)) {
+				// M22 W5 multi-select create: ONE call with all N npubs.
+				await commitCreateGroupMulti({ groupsCreateWithMembers }, name, npubs, groups);
+			} else {
+				await commitCreateGroup({ groupsCreateWithMembers }, name, npubs.source, npubs.target, groups);
+			}
 			await loadGroupsInto();
 			toast(`Group "${name.trim()}" created`);
+			// M22 W5: clear the selection after a successful create.
+			selectedNpubs = [];
+			selectionAnchor = null;
 		} catch (e) {
 			toast(String(e), 'error');
 		} finally {
@@ -391,12 +455,27 @@
 	// never touches the private audience.
 	let dropOverTarget: string | null = $state(null);
 	let dropOutcome: DropOutcome | null = $state(null);
+	// M22 W5: the multi-select affordance (parallel to dropOutcome for the single-source case).
+	let dropOutcomeMulti: DropOutcomeMulti | null = $state(null);
 
 	function peerGroupsOf(npub: string): string[] {
 		return groups.filter(g => g.pubkeys.includes(npub)).map(g => g.name);
 	}
 
 	function onGroupDragOver(e: DragEvent, targetName: string) {
+		// M22 W5: read multi payload first; fall back to single-npub.
+		const multiNpubs = readDragPayloadMulti(e.dataTransfer);
+		if (multiNpubs && multiNpubs.length > 1) {
+			e.preventDefault();
+			const groupsByNpub = new Map(multiNpubs.map((n) => [n, peerGroupsOf(n)]));
+			const outcome = computeDropOutcomeMulti(multiNpubs, targetName, groupsByNpub, e.shiftKey);
+			dropOverTarget = targetName;
+			dropOutcomeMulti = outcome;
+			if (e.dataTransfer) {
+				e.dataTransfer.dropEffect = (outcome.kind === 'refused' || outcome.kind === 'noop') ? 'none' : (e.shiftKey ? 'copy' : 'move');
+			}
+			return;
+		}
 		const sourceNpub = readDragPayload(e.dataTransfer);
 		if (!sourceNpub) return;
 		e.preventDefault();
@@ -412,10 +491,42 @@
 		if (dropOverTarget === targetName) {
 			dropOverTarget = null;
 			dropOutcome = null;
+			dropOutcomeMulti = null;
 		}
 	}
 
 	async function onGroupDrop(e: DragEvent, targetName: string) {
+		// M22 W5: multi-select drop onto a group.
+		const multiNpubs = readDragPayloadMulti(e.dataTransfer);
+		if (multiNpubs && multiNpubs.length > 1) {
+			e.preventDefault();
+			const groupsByNpub = new Map(multiNpubs.map((n) => [n, peerGroupsOf(n)]));
+			const outcome = (dropOutcomeMulti ?? computeDropOutcomeMulti(multiNpubs, targetName, groupsByNpub, e.shiftKey));
+			if (outcome.kind === 'refused' || outcome.kind === 'noop') {
+				dropOverTarget = null;
+				dropOutcome = null;
+				dropOutcomeMulti = null;
+				return;
+			}
+			dropOverTarget = null;
+			dropOutcome = null;
+			dropOutcomeMulti = null;
+			try {
+				const committed = await commitDropOnGroupMulti(
+					{ groupsAssign, contactUpdateGroups },
+					outcome,
+				);
+				await loadGroupsInto();
+				if (committed.kind === 'add') toast(`Added ${committed.npubs.length} to ${committed.target}`);
+				else if (committed.kind === 'move') toast(`Moved ${committed.npubs.length} to ${committed.target}`);
+				else toast(`Moved ${committed.npubs.length} to Ungrouped`);
+				selectedNpubs = [];
+				selectionAnchor = null;
+			} catch (e) {
+				toast(String(e), 'error');
+			}
+			return;
+		}
 		const sourceNpub = readDragPayload(e.dataTransfer);
 		if (!sourceNpub) return;
 		e.preventDefault();
@@ -442,6 +553,9 @@
 		}
 	}
 </script>
+
+<!-- M22 W5 — Esc clears the multi-selection when the naming popover is not open. -->
+<svelte:window onkeydown={onWindowKeyDown} />
 
 <div class="browse-shell">
 	<!-- Left: contact list -->
@@ -490,13 +604,17 @@
 							{@const hue = avatarHue(letter)}
 							{@const badge = peerAccessBadge(peer)}
 							<!-- M22 W3: each People row is a drag source AND drop target for drag-to-group. -->
+							<!-- M22 W5: peer-selected marks the multi-drag selection (distinct from
+							     contact-selected which means "shown in the right panel"). -->
 							<!-- svelte-ignore a11y_no_static_element_interactions -->
 							<div
 								class="contact-row"
 								class:contact-selected={selectedPeer?.npub === peer.npub}
+								class:peer-selected={selectedNpubSet.has(peer.npub)}
 								class:drag-source={dragSourceNpub === peer.npub}
 								class:drag-target={dragSourceNpub !== null && dragOverNpub === peer.npub && dragSourceNpub !== peer.npub}
 								draggable="true"
+								onmousedown={(e) => onPeerMouseDown(e, peer.npub)}
 								ondragstart={(e) => onDragStart(e, peer.npub)}
 								ondragover={(e) => onDragOver(e, peer.npub)}
 								ondragleave={() => onDragLeave(peer.npub)}
@@ -522,7 +640,7 @@
 										{peer.collections.length} collection{peer.collections.length !== 1 ? 's' : ''}
 									</span>
 									{#if dragSourceNpub !== null && dragOverNpub === peer.npub && dragSourceNpub !== peer.npub}
-										<span class="drag-outcome-browse">group these two</span>
+										<span class="drag-outcome-browse">{dragCount > 0 ? `group ${dragCount + 1} contacts` : 'group these two'}</span>
 									{/if}
 								</div>
 							</div>
@@ -769,22 +887,28 @@
 </div>
 
 <!-- M22 W3 — the Name moment for Browse's People list. Esc cancels (no write); Enter commits
-     (additive — both peers keep every group they were already in and both gain the new one). -->
+     (additive — both peers keep every group they were already in and both gain the new one).
+     M22 W5 — for a multi-select drop, the two avatars are replaced by a count badge ("N"). -->
 {#if dragPopoverFor}
+	{@const isMulti = Array.isArray(dragPopoverFor)}
 	<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
 	<div class="dg-backdrop" onclick={closeDragPopover} onkeydown={(e) => e.key === 'Escape' && closeDragPopover()} role="presentation"></div>
-	{@const dgSource = $contacts.find((c) => c.npub === dragPopoverFor!.source)}
-	{@const dgTarget = $contacts.find((c) => c.npub === dragPopoverFor!.target)}
+	{@const dgSource = !isMulti ? $contacts.find((c) => c.npub === (dragPopoverFor as { source: string; target: string })!.source) : undefined}
+	{@const dgTarget = !isMulti ? $contacts.find((c) => c.npub === (dragPopoverFor as { source: string; target: string })!.target) : undefined}
 	<div class="dg-panel" role="dialog" aria-modal="true" aria-label="Name this group">
 		<div class="dg-header">
 			<div class="dg-avatars">
-				{#if dgSource}
-					{@const dgI = (contactDisplayName(dgSource)[0] ?? '?').toUpperCase()}
-					<span class="dg-avatar dg-avatar-a" style={`--dg-hue:${avatarHue(dgI)}`}>{dgI}</span>
-				{/if}
-				{#if dgTarget}
-					{@const dgI = (contactDisplayName(dgTarget)[0] ?? '?').toUpperCase()}
-					<span class="dg-avatar dg-avatar-b" style={`--dg-hue:${avatarHue(dgI)}`}>{dgI}</span>
+				{#if isMulti}
+					<span class="dg-count" title={`${(dragPopoverFor as string[]).length} contacts`}>{(dragPopoverFor as string[]).length}</span>
+				{:else}
+					{#if dgSource}
+						{@const dgI = (contactDisplayName(dgSource)[0] ?? '?').toUpperCase()}
+						<span class="dg-avatar dg-avatar-a" style={`--dg-hue:${avatarHue(dgI)}`}>{dgI}</span>
+					{/if}
+					{#if dgTarget}
+						{@const dgI = (contactDisplayName(dgTarget)[0] ?? '?').toUpperCase()}
+						<span class="dg-avatar dg-avatar-b" style={`--dg-hue:${avatarHue(dgI)}`}>{dgI}</span>
+					{/if}
 				{/if}
 			</div>
 			<input class="dg-input" type="text" placeholder="Name this group" bind:value={dragNameInput} onkeydown={onDragNameKey} />
@@ -1395,7 +1519,13 @@
 		white-space: nowrap;
 	}
 
-	/* M22 W3 — drag-to-group gesture on the People list. */
+	/* M22 W3 — drag-to-group gesture on the People list.
+	   M22 W5 — .peer-selected marks the multi-drag selection (distinct from .contact-selected
+	   which means "shown in the right panel"). Soft accent fill + left border, persistent. */
+	.contact-row.peer-selected {
+		background: color-mix(in oklch, var(--accent) 10%, var(--bg-elev1));
+		box-shadow: inset 3px 0 0 var(--accent);
+	}
 	.contact-row.drag-source { opacity: 0.35; }
 	.contact-row.drag-target {
 		border-color: var(--accent) !important;
@@ -1427,6 +1557,14 @@
 		border: 2px solid var(--bg-elev2);
 	}
 	.dg-avatar-b { margin-left: -14px; }
+	/* M22 W5 — count badge replaces the two avatars for a multi-select drop. */
+	.dg-count {
+		width: 44px; height: 30px; border-radius: 15px;
+		display: flex; align-items: center; justify-content: center;
+		font-size: 13px; font-weight: 700; color: white;
+		background: var(--accent);
+		flex-shrink: 0;
+	}
 	.dg-input {
 		flex: 1; font-size: 13px; background: var(--bg-input); border: 1px solid var(--border);
 		border-radius: 6px; padding: 4px 8px; outline: none; color: var(--fg);
