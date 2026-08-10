@@ -140,8 +140,12 @@ function redeclaresContract(selector: string): string[] {
 		// contract re-declaration is the class ALONE as the whole compound (`.hb-input`), possibly
 		// with a pseudo (`:focus`, `::placeholder`). Split off ancestors and inspect the final step.
 		const steps = comp.split(/\s*[>+~]\s*/);
-		// A compound is "the whole selector" only if there is a single step — i.e. no combinator.
-		// `.field .hb-input` has two steps and is a descendant override, not a re-declaration.
+		// A single step means no CHILD/SIBLING combinator (`>`, `+`, `~`) — that is all this regex
+		// splits on. It does NOT split on descendant whitespace, so `.field .hb-input` is ONE step,
+		// not two. Descendant overrides are excluded by the compound check below instead: the
+		// compound `.field .hb-input` neither equals `.hb-input` nor starts with `.hb-input:`/`::`,
+		// so it is never counted as a re-declaration. (QURATOR-52 §6: the previous comment claimed
+		// the step count did that work. It does not — the anchor below does.)
 		if (steps.length > 1) continue;
 		const compound = steps[0];
 		for (const cls of CONTRACT_CLASSES) {
