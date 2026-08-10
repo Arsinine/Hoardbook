@@ -118,6 +118,47 @@ pub async fn count_userbase(client: &RelayClient, timeout: Duration) -> Result<u
     Ok(count_distinct_userbase(&events))
 }
 
+/// The userbase filter for a SPECIFIC set of authors (COUNT2/COUNT3 determinism, 2026-08-10). The
+/// sibling of [`presence_authors_filter`], covering all three Hoordbook kinds (teaser / presence /
+/// listing) but bounded by `.authors(...)` so the relay's answer is **only ever** these authors'
+/// events — immune to the global cap/window that makes [`userbase_filter`]'s unbounded read return
+/// different subsets on two successive calls (measured: `73→0`, `121→20`, `336→147`).
+///
+/// **No `.limit()` is set deliberately.** Unlike [`presence_authors_filter`], whose
+/// `.limit(authors.len())` is sound because kind-11111 is replaceable (one live event per author),
+/// the userbase span includes parameterized-replaceable kinds (30117 teaser, 31111 listing) where a
+/// single author can legitimately hold several events. A `limit` of `authors.len()` would silently
+/// truncate an author's events and produce wrong counts. The `.authors()` bound alone already makes
+/// the relay's response deterministic — that is what this filter exists to guarantee.
+pub fn userbase_authors_filter(authors: &[PublicKey]) -> Filter {
+    Filter::new()
+        .kinds([
+            Kind::from_u16(KIND_TEASER),
+            Kind::from_u16(KIND_PRESENCE),
+            Kind::from_u16(KIND_LISTING),
+        ])
+        .authors(authors.iter().copied())
+}
+
+/// Author-filtered userbase count (COUNT2/COUNT3 determinism): fetch only THESE authors'
+/// Hoordbook-kind events and tally distinct authors through the same production
+/// [`count_distinct_userbase`] (sig-verified, canary-excluded, deduped) — so scoping the *fetch*
+/// never changes *what is counted*. The test-scoped mirror of [`fetch_presence_for_authors`]:
+/// immune to the global relay cap that [`count_userbase`]'s unbounded read is subject to. An empty
+/// author set short-circuits to `Ok(0)` (no query) — so a test that has minted no real authors yet
+/// does not issue a global fetch against the shared relay.
+pub async fn count_userbase_for(
+    client: &RelayClient,
+    authors: &[PublicKey],
+    timeout: Duration,
+) -> Result<usize, NetError> {
+    if authors.is_empty() {
+        return Ok(0);
+    }
+    let events = client.fetch(userbase_authors_filter(authors), timeout).await?;
+    Ok(count_distinct_userbase(&events))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +202,33 @@ mod tests {
         assert!(
             json.contains(&(1_700_000_000u64 - 600).to_string()),
             "since floor present: {json}"
+        );
+    }
+
+    #[test]
+    fn userbase_authors_filter_carries_all_three_kinds_and_authors() {
+        let pk = nostr::Keys::generate().public_key();
+        let f = userbase_authors_filter(&[pk]);
+        assert!(!f.is_empty(), "an authors+kinds filter is constrained");
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("authors"), "authors present in the filter: {json}");
+        for k in ["30117", "11111", "31111"] {
+            assert!(json.contains(k), "userbase_authors_filter must include kind {k}: {json}");
+        }
+    }
+
+    #[test]
+    fn userbase_authors_filter_sets_no_limit_so_it_cannot_truncate() {
+        // The userbase span includes parameterized-replaceable kinds (30117, 31111) where one author
+        // can hold several events; a `.limit(authors.len())` would silently drop events and corrupt
+        // the count. `.authors()` alone is what makes the read deterministic — there must be NO
+        // `limit` key in the serialized filter.
+        let pk = nostr::Keys::generate().public_key();
+        let f = userbase_authors_filter(&[pk]);
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(
+            !json.contains("limit"),
+            "userbase_authors_filter must NOT carry a limit (it would truncate multi-event authors): {json}"
         );
     }
 }
