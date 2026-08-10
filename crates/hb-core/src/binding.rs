@@ -32,8 +32,12 @@ pub const MAX_BINDING_TTL_SECS: u64 = 24 * 60 * 60;
 
 pub(crate) const TAG_EXPIRES: &str = "hb-expires"; // explicit expiry, unix seconds
 pub(crate) const TAG_SCHEMA: &str = "hb-v"; // payload schema version
-/// Tolerance for a `created_at` slightly ahead of our clock (matches the ±300 s skew window).
-const FUTURE_SKEW_SECS: u64 = 300;
+/// Tolerance for a `created_at` slightly ahead of our clock (±300 s). The single definition shared
+/// by the presence binding's freshness gate and the relay-derived online tally
+/// (`count::fresh_presence`), so the two freshness windows cannot silently disagree. Changing this
+/// is a wire-visible behaviour change — a beacon published today is judged against it for the
+/// skew's whole duration.
+pub const FUTURE_SKEW_SECS: u64 = 300;
 
 /// A verified presence binding. All fields are read straight from the signed event.
 #[derive(Debug, Clone)]

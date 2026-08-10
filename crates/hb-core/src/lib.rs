@@ -48,7 +48,7 @@ pub use backup::{
     decrypt_backup, encrypt_backup, is_encrypted_backup, BackupMode, BACKUP_FORMAT_VER,
     MIN_PASSPHRASE_LEN,
 };
-pub use binding::{build_binding, verify_binding, Binding};
+pub use binding::{build_binding, verify_binding, Binding, FUTURE_SKEW_SECS};
 pub use count::{
     count_distinct_online, count_distinct_userbase, fresh_presence, is_canary, CANARY_MARKER,
 };

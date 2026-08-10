@@ -31,19 +31,13 @@ use std::collections::{HashMap, HashSet};
 
 use nostr::prelude::*;
 
-use crate::binding::{verify_binding, KIND_PRESENCE};
+use crate::binding::{verify_binding, FUTURE_SKEW_SECS, KIND_PRESENCE};
 use crate::identity::verify_event;
 
 /// The Hoardbook-internal `t` tag stamped on **every** canary-published event. `count_distinct_*`
 /// and discovery exclude events bearing it, keeping the canary's throwaway `npub`s out of the
 /// online/userbase counts and out of tag search.
 pub const CANARY_MARKER: &str = "hb-canary";
-
-/// Tolerance for a `created_at` slightly ahead of our clock (matches `binding::FUTURE_SKEW_SECS`).
-/// The online count does **not** trust the relay's clock: a validly-signed but *future*-dated
-/// presence would otherwise read as "online" indefinitely (it never falls below the moving floor),
-/// so a non-conforming/hostile relay could inflate the figure. Anything beyond this skew is dropped.
-const FUTURE_SKEW_SECS: u64 = 300;
 
 /// True iff the event carries the canary `t` tag — used to exclude synthetic canary traffic from
 /// every real-data tally and from discovery.
@@ -71,6 +65,10 @@ pub fn count_distinct_online(events: &[Event], now: u64, window_secs: u64) -> us
 /// per-contact fan-out — the caller matches its own contacts against the map.
 pub fn fresh_presence(events: &[Event], now: u64, window_secs: u64) -> HashMap<PublicKey, u64> {
     let floor = now.saturating_sub(window_secs);
+    // The online count does **not** trust the relay's clock: a validly-signed but *future*-dated
+    // presence would otherwise read as "online" indefinitely (it never falls below the moving
+    // floor), so a non-conforming/hostile relay could inflate the figure. Anything beyond the
+    // shared skew (`binding::FUTURE_SKEW_SECS`, imported above) is dropped.
     let ceiling = now.saturating_add(FUTURE_SKEW_SECS);
     let mut seen: HashMap<PublicKey, u64> = HashMap::new();
     for ev in events {
