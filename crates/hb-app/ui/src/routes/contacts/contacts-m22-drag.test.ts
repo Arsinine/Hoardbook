@@ -47,6 +47,16 @@ import type { CachedPeer, Profile } from '$lib/types.js';
 
 const contactsSrc = () => readFileSync(new URL('./+page.svelte', import.meta.url), 'utf8');
 
+/** Page source with every comment removed (template `<!-- -->`, block, and line). Used by the
+ *  no-undo scan: the page's own comments document the "NO confirm, NO undo" ruling in prose, so a
+ *  raw scan for /undo/ would fail forever on correct code and invite weakening the assertion. */
+function stripComments(src: string): string {
+	return src
+		.replace(/<!--[\s\S]*?-->/g, '')
+		.replace(/\/\*[\s\S]*?\*\//g, '')
+		.replace(/^[ \t]*\/\/.*$/gm, '');
+}
+
 // ── Test helpers ─────────────────────────────────────────────────────────────
 
 /** A minimal DataTransfer stub that supports getData/setData (jsdom's DataTransfer is missing
@@ -577,15 +587,19 @@ describe('M22 W4 acceptance — Ungrouped drop offers NO confirm and NO undo', (
 	// grew a full confirm-and-undo flow. The real risk is an undo AFFORDANCE appearing in the page,
 	// so scan the page for one. (The behavioural proof that the write is one-shot lives above, where
 	// commitDropOnGroup is actually invoked with an `ungrouped` outcome.)
-	it('the page offers no undo affordance anywhere in the group-drop path', () => {
-		const src = contactsSrc();
-		const start = src.indexOf('async function onGroupDrop');
-		const fn = src.slice(start, src.indexOf('// Stale: last_fetched'));
-		expect(start).toBeGreaterThan(-1);
-		// No undo/revert/restore affordance, and no toast carrying one.
-		expect(fn).not.toMatch(/\bundo\b/i);
-		expect(fn).not.toMatch(/\brevert\b/i);
-		expect(fn).not.toMatch(/\brestore\b/i);
+	it('the page offers no undo affordance anywhere — script OR template', () => {
+		// Scan the WHOLE page, not just onGroupDrop's body: an Undo button would live in the
+		// template, which a script-only slice cannot see.
+		//
+		// Comments are stripped first because the page documents this very ruling in prose ("NO
+		// confirm, NO undo"), and a raw scan would red on its own documentation — the sentinel must
+		// not collide with something the spec REQUIRES to be present. What must never appear is an
+		// undo AFFORDANCE, not the word.
+		const src = stripComments(contactsSrc());
+		expect(src.length).toBeGreaterThan(0);
+		expect(src).not.toMatch(/\bundo\b/i);
+		expect(src).not.toMatch(/\brevert\b/i);
+		expect(src).not.toMatch(/\brestore\b/i);
 	});
 });
 
