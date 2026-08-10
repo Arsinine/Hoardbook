@@ -37,25 +37,22 @@ import {
 	computeDropOutcomeMulti,
 	commitDropOnGroupMulti,
 	applyClickToSelection,
+	computeDropInverse,
+	computeDropInverseMulti,
+	computeCreateInverse,
+	commitInverse,
+	commitInverseMulti,
 	UNGROUPED_TARGET,
 	type DragGroupApi,
 	type DropOnGroupApi,
+	type UndoApi,
 	type DropOutcome,
 	type DropOutcomeMulti,
+	type DropInverse,
 } from '$lib/drag-group.js';
 import type { CachedPeer, Profile } from '$lib/types.js';
 
 const contactsSrc = () => readFileSync(new URL('./+page.svelte', import.meta.url), 'utf8');
-
-/** Page source with every comment removed (template `<!-- -->`, block, and line). Used by the
- *  no-undo scan: the page's own comments document the "NO confirm, NO undo" ruling in prose, so a
- *  raw scan for /undo/ would fail forever on correct code and invite weakening the assertion. */
-function stripComments(src: string): string {
-	return src
-		.replace(/<!--[\s\S]*?-->/g, '')
-		.replace(/\/\*[\s\S]*?\*\//g, '')
-		.replace(/^[ \t]*\/\/.*$/gm, '');
-}
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -567,10 +564,19 @@ describe('M22 W4 acceptance — drop-onto-group never touches the private audien
 
 // ── Acceptance gate: Ungrouped is immediate, NO confirm, NO undo ─────────────
 // Owner ruling 2026-08-09, verbatim: "No undo at all. This isn't a word doc." INV-8 was overruled.
-// This test pins the decision so a future session does not add a confirm/undo/soft-delete "for
-// safety" and mistake the absence for a gap.
+//
+// W6 adds undo to every drop kind EXCEPT Ungrouped. The old whole-page scan (8e1d555) asserted
+// /undo/ appears nowhere in the page — that held when NO kind had undo, but W6 legitimately adds it
+// to add/move/create. The scan's INTENT was always narrow (Ungrouped has no undo); its
+// IMPLEMENTATION was whole-page because that was the cheapest template-visible proxy at the time.
+// Replacing it with something STRICTLY STRONGER:
+//   1. Behavioural: computeDropInverse returns null for ungrouped (the pure function the page routes
+//      through). This is the actual gate — if the function returns an inverse, the page WILL render
+//      an Undo button for it.
+//   2. Structural: the layout's Undo button is conditional on the action field (retargeted scan that
+//      can still see a template), so an UNCONDITIONAL Undo button cannot ship.
 
-describe('M22 W4 acceptance — Ungrouped drop offers NO confirm and NO undo', () => {
+describe('M22 W4 acceptance — Ungrouped drop: no confirm gate', () => {
 	it('the Ungrouped commit path calls contactUpdateGroups directly (no confirm gate)', () => {
 		const src = contactsSrc();
 		const start = src.indexOf('async function onGroupDrop');
@@ -581,25 +587,279 @@ describe('M22 W4 acceptance — Ungrouped drop offers NO confirm and NO undo', (
 		expect(fn).not.toMatch(/ConfirmButton/);
 		expect(fn).not.toMatch(/confirm/);
 	});
+});
 
-	// NOTE: asserting that a test-constructed spy lacks an `undo` method would be a TAUTOLOGY — the
-	// test builds the spy, so of course it has no such method, and it would stay green if the page
-	// grew a full confirm-and-undo flow. The real risk is an undo AFFORDANCE appearing in the page,
-	// so scan the page for one. (The behavioural proof that the write is one-shot lives above, where
-	// commitDropOnGroup is actually invoked with an `ungrouped` outcome.)
-	it('the page offers no undo affordance anywhere — script OR template', () => {
-		// Scan the WHOLE page, not just onGroupDrop's body: an Undo button would live in the
-		// template, which a script-only slice cannot see.
-		//
-		// Comments are stripped first because the page documents this very ruling in prose ("NO
-		// confirm, NO undo"), and a raw scan would red on its own documentation — the sentinel must
-		// not collide with something the spec REQUIRES to be present. What must never appear is an
-		// undo AFFORDANCE, not the word.
-		const src = stripComments(contactsSrc());
-		expect(src.length).toBeGreaterThan(0);
-		expect(src).not.toMatch(/\bundo\b/i);
-		expect(src).not.toMatch(/\brevert\b/i);
-		expect(src).not.toMatch(/\brestore\b/i);
+describe('M22 W6 acceptance — Ungrouped has NO inverse (behavioural, not a whole-page word scan)', () => {
+	// Behavioural primary: the pure function the page routes through returns null for ungrouped.
+	// If this returned an inverse, the page would render an Undo button for it. This is STRICTLY
+	// STRONGER than the old whole-page /undo/ scan: it tests the actual decision point, not a proxy.
+	it('computeDropInverse returns null for an ungrouped outcome', () => {
+		const inverse = computeDropInverse('npub1a', { kind: 'ungrouped' }, ['Film', 'Anime']);
+		expect(inverse).toBeNull();
+	});
+
+	it('computeDropInverseMulti returns null for an ungrouped outcome (multi)', () => {
+		const prior = new Map([['npub1a', ['Film']], ['npub1b', ['Anime']]]);
+		const inverse = computeDropInverseMulti({ kind: 'ungrouped', npubs: ['npub1a', 'npub1b'] }, prior);
+		expect(inverse).toBeNull();
+	});
+
+	// The complement: proves the function CAN return non-null for kinds that DO have an inverse,
+	// so the null assertion above is not vacuously true.
+	it('computeDropInverse returns non-null for add and move (the complement)', () => {
+		expect(computeDropInverse('npub1a', { kind: 'add', target: 'Film' }, ['Anime'])).not.toBeNull();
+		expect(computeDropInverse('npub1a', { kind: 'move', target: 'Film' }, ['Anime'])).not.toBeNull();
+	});
+});
+
+// ── M22 W6 — undo: the inverse of each drop (table-driven) ────────────────────
+
+/** A spy UndoApi: records groupsDelete + groupsUnassign + contactUpdateGroups calls. The absence
+ *  of any other method (audience, create, assign) is itself the guarantee that the undo path
+ *  CAN'T reach them. */
+function spyUndoApi(): UndoApi & { calls: { method: string; args: unknown[] }[] } {
+	const calls: { method: string; args: unknown[] }[] = [];
+	return {
+		calls,
+		groupsDelete: vi.fn(async (name: string) => {
+			calls.push({ method: 'groupsDelete', args: [name] });
+		}),
+		groupsUnassign: vi.fn(async (npub: string, groupName: string) => {
+			calls.push({ method: 'groupsUnassign', args: [npub, groupName] });
+		}),
+		contactUpdateGroups: vi.fn(async (npub: string, groupNames: string[]) => {
+			calls.push({ method: 'contactUpdateGroups', args: [npub, groupNames] });
+		}),
+	} as unknown as UndoApi & { calls: { method: string; args: unknown[] }[] };
+}
+
+describe('M22 W6 — the inverse of each drop kind (table-driven)', () => {
+	// One table over ALL drop kinds. A future sixth kind with no entry must fail loudly here.
+	// Ungrouped is listed explicitly as "no inverse, by ruling" — not simply absent.
+	const cases: {
+		name: string;
+		outcome: DropOutcome;
+		priorGroups: string[];
+		expectedKind: DropInverse['kind'] | null; // null = no inverse
+		expectedDesc: string;
+	}[] = [
+		{ name: 'add',     outcome: { kind: 'add', target: 'Film' },                         priorGroups: ['Anime'],         expectedKind: 'unassign',      expectedDesc: 'unassign from Film' },
+		{ name: 'move',    outcome: { kind: 'move', target: 'Film' },                        priorGroups: ['Anime', 'Music'], expectedKind: 'restore-groups', expectedDesc: 'restore to [Anime, Music]' },
+		{ name: 'ungrouped', outcome: { kind: 'ungrouped' },                                  priorGroups: ['Film'],         expectedKind: null,             expectedDesc: 'no inverse, by ruling' },
+		{ name: 'refused', outcome: { kind: 'refused', target: 'Film', reason: 'already in' }, priorGroups: ['Film'],         expectedKind: null,             expectedDesc: 'nothing happened' },
+		{ name: 'noop',    outcome: { kind: 'noop' },                                        priorGroups: [],               expectedKind: null,             expectedDesc: 'nothing happened' },
+	];
+
+	for (const c of cases) {
+		it(`${c.name} → ${c.expectedDesc}`, () => {
+			const inverse = computeDropInverse('npub1a', c.outcome, c.priorGroups);
+			if (c.expectedKind === null) {
+				expect(inverse).toBeNull();
+			} else {
+				expect(inverse).not.toBeNull();
+				expect((inverse as DropInverse).kind).toBe(c.expectedKind);
+			}
+		});
+	}
+});
+
+describe('M22 W6 acceptance — add inverse calls groupsUnassign exactly once', () => {
+	it('add → groupsUnassign(source, target)', async () => {
+		const api = spyUndoApi();
+		const inverse = computeDropInverse('npub1a', { kind: 'add', target: 'Film' }, ['Anime']);
+		expect(inverse).not.toBeNull();
+		await commitInverse(api, inverse!);
+		expect(api.calls.length).toBe(1);
+		expect(api.calls[0].method).toBe('groupsUnassign');
+		expect(api.calls[0].args).toEqual(['npub1a', 'Film']);
+	});
+});
+
+describe('M22 W6 acceptance — move inverse restores the exact prior group set', () => {
+	it('move → contactUpdateGroups(source, priorGroups)', async () => {
+		const api = spyUndoApi();
+		const prior = ['Anime', 'Music', 'Film'];
+		const inverse = computeDropInverse('npub1a', { kind: 'move', target: 'Gaming' }, prior);
+		expect(inverse).not.toBeNull();
+		expect((inverse as DropInverse).kind).toBe('restore-groups');
+		await commitInverse(api, inverse!);
+		expect(api.calls.length).toBe(1);
+		expect(api.calls[0].method).toBe('contactUpdateGroups');
+		// The exact prior set is restored — not just the target, not a subset.
+		expect(api.calls[0].args).toEqual(['npub1a', ['Anime', 'Music', 'Film']]);
+	});
+
+	it('move inverse restores the EXACT prior set, not a re-read at undo time', () => {
+		// The race the capture-at-drag-start design exists to prevent: if priorGroups were re-read
+		// at undo time (or drop time), a write between dragstart and undo would poison the restore.
+		// The pure function takes priorGroups as a parameter, so the caller CANNOT get this wrong
+		// by re-reading — the value is fixed at capture time.
+		const priorAtDragStart = ['Anime', 'Music'];
+		const inverse = computeDropInverse('npub1a', { kind: 'move', target: 'Film' }, priorAtDragStart);
+		expect((inverse as DropInverse & { groupNames: string[] }).groupNames).toEqual(['Anime', 'Music']);
+		// Even if the live set were now ['Film'] (the move happened), the inverse still carries the
+		// drag-start snapshot — that is what makes it a correct undo.
+	});
+});
+
+describe('M22 W6 acceptance — create inverse calls groupsDelete', () => {
+	it('create (single) → groupsDelete(name)', async () => {
+		const api = spyUndoApi();
+		const inverse = computeCreateInverse('Anime Club');
+		expect(inverse.kind).toBe('delete-group');
+		await commitInverse(api, inverse);
+		expect(api.calls.length).toBe(1);
+		expect(api.calls[0].method).toBe('groupsDelete');
+		expect(api.calls[0].args).toEqual(['Anime Club']);
+	});
+
+	it('create (multi) → groupsDelete(name) — same inverse, the group was brand new', async () => {
+		const api = spyUndoApi();
+		const inverse = computeCreateInverse('Anime Club');
+		await commitInverse(api, inverse);
+		expect(api.calls[0].method).toBe('groupsDelete');
+	});
+});
+
+describe('M22 W6 acceptance — multi inverse: one entry per affected contact', () => {
+	it('add-multi with 3 affected → 3 unassign inverses', async () => {
+		const api = spyUndoApi();
+		const inverses = computeDropInverseMulti(
+			{ kind: 'add', target: 'Film', npubs: ['npub1a', 'npub1b', 'npub1c'] },
+			new Map(),
+		);
+		expect(inverses).not.toBeNull();
+		expect(inverses!.length).toBe(3);
+		await commitInverseMulti(api, inverses!);
+		expect(api.calls.length).toBe(3);
+		expect(api.calls.every((c) => c.method === 'groupsUnassign')).toBe(true);
+	});
+
+	it('move-multi with 2 affected → 2 restore-groups, each with their own prior set', async () => {
+		const api = spyUndoApi();
+		const prior = new Map([['npub1a', ['Anime']], ['npub1b', ['Music', 'Art']]]);
+		const inverses = computeDropInverseMulti(
+			{ kind: 'move', target: 'Film', npubs: ['npub1a', 'npub1b'] },
+			prior,
+		);
+		expect(inverses).not.toBeNull();
+		expect(inverses!.length).toBe(2);
+		await commitInverseMulti(api, inverses!);
+		expect(api.calls.length).toBe(2);
+		// Each contact gets their OWN prior set restored, not a shared one.
+		expect(api.calls[0].args).toEqual(['npub1a', ['Anime']]);
+		expect(api.calls[1].args).toEqual(['npub1b', ['Music', 'Art']]);
+	});
+});
+
+describe('M22 W6 acceptance — undo never touches the private audience', () => {
+	it('UndoApi exposes ONLY groupsDelete + groupsUnassign + contactUpdateGroups', () => {
+		const api = spyUndoApi() as unknown as Record<string, unknown>;
+		expect(typeof api.groupsDelete).toBe('function');
+		expect(typeof api.groupsUnassign).toBe('function');
+		expect(typeof api.contactUpdateGroups).toBe('function');
+		expect(api.groupsCreateWithMembers).toBeUndefined();
+		expect(api.groupsAssign).toBeUndefined();
+		expect(api.privateAudienceSet).toBeUndefined();
+		expect(api.privateAudienceList).toBeUndefined();
+	});
+
+	it('the undo path calls no audience API', async () => {
+		const api = spyUndoApi();
+		const inverse = computeDropInverse('npub1a', { kind: 'add', target: 'Film' }, ['Anime']);
+		await commitInverse(api, inverse!);
+		const touched = api.calls.filter((c) =>
+			c.method === 'privateAudienceSet' || c.method === 'privateAudienceList');
+		expect(touched.length).toBe(0);
+	});
+});
+
+// ── Structural: the Undo button is conditional on the action field (retargeted scan) ────
+// Replaces the old whole-page /undo/ scan. That scan could no longer hold once W6 adds undo to
+// add/move/create. The retargeted scan points at the thing that must stay true: the layout renders
+// the Undo button ONLY when an action is present — an unconditional Undo button cannot ship.
+
+describe('M22 W6 structural — the Undo button renders only when an action is present', () => {
+	/** Strip comments so the scan does not match on its own documentation (the comment names the
+	 *  very {#if} it tests for). Template `<!-- -->`, block, and line comments all removed. */
+	function stripLayoutComments(src: string): string {
+		return src
+			.replace(/<!--[\s\S]*?-->/g, '')
+			.replace(/\/\*[\s\S]*?\*\//g, '')
+			.replace(/^[ \t]*\/\/.*$/gm, '');
+	}
+
+	it('the layout toast renders the Undo button inside {#if $toastMessage.action}', () => {
+		const layoutSrc = stripLayoutComments(readFileSync(new URL('../+layout.svelte', import.meta.url), 'utf8'));
+		const toastStart = layoutSrc.indexOf('{$toastMessage.text}');
+		expect(toastStart).toBeGreaterThan(-1);
+		const toastBlock = layoutSrc.slice(toastStart, toastStart + 400);
+		// The Undo button is inside an {#if} conditional on the action field — NOT unconditional.
+		expect(toastBlock).toMatch(/\{#if \$toastMessage\.action\}/);
+		expect(toastBlock).toMatch(/toast-action/);
+		// An unconditional button (no {#if}) would fail this: the {#if} must gate it.
+		expect(toastBlock).not.toMatch(/^<button[^>]*>.*Undo<\/button>$/m);
+	});
+});
+
+// ── Structural: the page captures prior membership at drag START, not drop ─────────────────
+// Source-scan pins the capture point so a future edit cannot silently move it to drop time (the
+// race the CLAUDE.md brief warns about). The priorGroupsByNpub state is populated in onDragStart.
+
+describe('M22 W6 structural — prior membership captured at drag start (source-scan)', () => {
+	it('onDragStart ASSIGNS priorGroupsByNpub (the capture-at-start pin, not just a mention)', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('function onDragStart'), s.indexOf('function onDragOver'));
+		// Must match an ASSIGNMENT (priorGroupsByNpub = ...), not just a comment mentioning the name.
+		// This is the mutation probe: moving the capture to onGroupDrop reds this.
+		expect(fn).toMatch(/priorGroupsByNpub\s*=\s*/);
+	});
+
+	it('onDragEnd clears priorGroupsByNpub', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('function onDragEnd'), s.indexOf('function onDrop'));
+		expect(fn).toMatch(/priorGroupsByNpub\s*=\s*new Map/);
+	});
+
+	it('onGroupDrop reads priorGroupsByNpub for the move inverse', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('async function onGroupDrop'), s.indexOf('// Stale: last_fetched'));
+		expect(fn).toMatch(/priorGroupsByNpub/);
+		expect(fn).toMatch(/computeDropInverse/);
+	});
+
+	it('commitDragCreate registers a create inverse (undo delete)', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('async function commitDragCreate'), s.indexOf('let dropOverTarget'));
+		expect(fn).toMatch(/computeCreateInverse/);
+		expect(fn).toMatch(/toastWithAction/);
+	});
+
+	// REGRESSION (shipped in W4 400f850, found during W6): the page CALLED groupsAssign on the
+	// Shift-add path but never imported it — a ReferenceError the moment anyone Shift-dropped. It
+	// survived because the sibling scan only asserted /groupsAssign/ appears SOMEWHERE in the file,
+	// which the call site itself satisfies. Assert against the import STATEMENT, not the file.
+	// Mutation probe: dropping groupsAssign from the import line reds this.
+	it('every api symbol the drop paths call is actually in the $lib/api.js import', () => {
+		const s = contactsSrc();
+		const importLine = s.slice(s.indexOf("import {"), s.indexOf("from '$lib/api.js'"));
+		for (const sym of ['groupsAssign', 'groupsUnassign', 'groupsDelete', 'contactUpdateGroups', 'groupsCreateWithMembers']) {
+			expect(importLine).toContain(sym);
+		}
+	});
+
+	// W6 acceptance: "The toast names the group and the affected contacts, not just 'Done'." The
+	// group was already named; the CONTACT was not. Every single-drop label must interpolate a name,
+	// including the ungrouped one (which has no undo but still reports what happened).
+	// Mutation probe: reverting any label to `Added to ${...}` reds this.
+	it('every single-drop toast label names the affected contact, not just the group', () => {
+		const s = contactsSrc();
+		const fn = s.slice(s.indexOf('async function onGroupDrop'), s.indexOf('// Stale: last_fetched'));
+		expect(fn).toMatch(/Added \$\{dropName\(sourceNpub\)\} to \$\{committed\.target\}/);
+		expect(fn).toMatch(/Moved \$\{dropName\(sourceNpub\)\} to \$\{committed\.target\}/);
+		expect(fn).toMatch(/Moved \$\{dropName\(sourceNpub\)\} to Ungrouped/);
+		// No label may name a group without naming who moved.
+		expect(fn).not.toMatch(/`(Added|Moved) to /);
 	});
 });
 

@@ -1,7 +1,7 @@
 <script lang="ts">
-	import { contacts, toast } from '$lib/stores.js';
+	import { contacts, toast, toastWithAction } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
-	import { refreshContact, importManifest, requestManifest, getManifestAsks, groupsGet, groupsCreateWithMembers, groupsAssign, contactUpdateGroups, type ManifestAsk } from '$lib/api.js';
+	import { refreshContact, importManifest, requestManifest, getManifestAsks, groupsGet, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, type ManifestAsk } from '$lib/api.js';
 	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
@@ -16,8 +16,8 @@
 	// 2026-08-09). Ungrouped clears all. One implementation, two consumers (this + Contacts).
 	// M22 W5 — multi-select drag primitives (shared with Contacts). Same selection model:
 	// plain click selects one, Shift-click extends a contiguous run, Cmd/Ctrl toggles one.
-	import { writeDragPayload, readDragPayload, writeDragPayloadMulti, readDragPayloadMulti, isValidDropTarget, isSelfDrop, groupSuggestions, groupSuggestionsMulti, commitCreateGroup, commitCreateGroupMulti, computeDropOutcome, commitDropOnGroup, computeDropOutcomeMulti, commitDropOnGroupMulti, applyClickToSelection, UNGROUPED_TARGET, type DropOutcome, type DropOutcomeMulti } from '$lib/drag-group.js';
-	import { contactDisplayName } from '$lib/contact-display.js';
+	import { writeDragPayload, readDragPayload, writeDragPayloadMulti, readDragPayloadMulti, isValidDropTarget, isSelfDrop, groupSuggestions, groupSuggestionsMulti, commitCreateGroup, commitCreateGroupMulti, computeDropOutcome, commitDropOnGroup, computeDropOutcomeMulti, commitDropOnGroupMulti, applyClickToSelection, computeDropInverse, computeDropInverseMulti, computeCreateInverse, commitInverse, commitInverseMulti, UNGROUPED_TARGET, type DropOutcome, type DropOutcomeMulti } from '$lib/drag-group.js';
+	import { contactDisplayName, shortNpub } from '$lib/contact-display.js';
 
 	type BcItem =
 		| { label: string; kind: 'contact' }
@@ -327,6 +327,9 @@
 	let dragOverNpub = $state<string | null>(null);
 	// M22 W5: how many contacts are being dragged (0 for single-pair W3, N-1 for multi of N).
 	let dragCount = $state(0);
+	// M22 W6: prior group membership captured at drag START (not drop) so a slow write between
+	// start and drop can't race the inverse. Keyed by npub; emptied on dragend.
+	let priorGroupsByNpub = $state<Map<string, string[]>>(new Map());
 	let dragPopoverFor = $state<string[] | { source: string; target: string } | null>(null);
 	let dragNameInput = $state('');
 	let dragSuggestions = $state<string[]>([]);
@@ -337,17 +340,24 @@
 
 	function onDragStart(e: DragEvent, npub: string) {
 		if (!e.dataTransfer) return;
+		let carried: string[];
 		// M22 W5: carry the whole selection when dragging a selected row; just this row otherwise.
 		if (selectedNpubSet.has(npub) && selectedNpubs.length > 1) {
 			writeDragPayloadMulti(e.dataTransfer, selectedNpubs);
 			dragCount = selectedNpubs.length;
+			carried = [...selectedNpubs];
 		} else {
 			selectedNpubs = [npub];
 			selectionAnchor = npub;
 			writeDragPayload(e.dataTransfer, npub);
 			dragCount = 0;
+			carried = [npub];
 		}
 		dragSourceNpub = npub;
+		// M22 W6: capture prior membership at drag START for the move inverse.
+		const m = new Map<string, string[]>();
+		for (const n of carried) m.set(n, peerGroupsOf(n));
+		priorGroupsByNpub = m;
 	}
 
 	function onDragOver(e: DragEvent, npub: string) {
@@ -369,6 +379,7 @@
 		dropOverTarget = null;
 		dropOutcome = null;
 		dropOutcomeMulti = null;
+		priorGroupsByNpub = new Map();
 	}
 
 	function onDrop(e: DragEvent, targetNpub: string) {
@@ -437,7 +448,15 @@
 				await commitCreateGroup({ groupsCreateWithMembers }, name, npubs.source, npubs.target, groups);
 			}
 			await loadGroupsInto();
-			toast(`Group "${name.trim()}" created`);
+			// M22 W6: create's inverse is delete (the group was brand new, so safe).
+			toastWithAction(`Group "${name.trim()}" created`, {
+				label: 'Undo',
+				run: () => {
+					commitInverse({ groupsDelete, groupsUnassign, contactUpdateGroups }, computeCreateInverse(name.trim()))
+						.then(() => loadGroupsInto())
+						.catch((e) => toast(String(e), 'error'));
+				},
+			});
 			// M22 W5: clear the selection after a successful create.
 			selectedNpubs = [];
 			selectionAnchor = null;
@@ -457,6 +476,26 @@
 	let dropOutcome: DropOutcome | null = $state(null);
 	// M22 W5: the multi-select affordance (parallel to dropOutcome for the single-source case).
 	let dropOutcomeMulti: DropOutcomeMulti | null = $state(null);
+
+	// M22 W6: show a toast with an Undo button. Local-only — no relay traffic.
+	// M22 W6: the toast names the affected contact, not just the group. Delegates to the canonical
+	// contactDisplayName (petname → display_name → shortNpub) rather than re-deriving the fallback,
+	// so a toast can never name a contact differently from the row the user just dragged.
+	function dropName(npub: string): string {
+		const c = $contacts.find((p) => p.npub === npub);
+		return c ? contactDisplayName(c) : shortNpub(npub);
+	}
+
+	function registerUndo(label: string, inverses: import('$lib/drag-group.js').DropInverse[]) {
+		toastWithAction(label, {
+			label: 'Undo',
+			run: () => {
+				commitInverseMulti({ groupsDelete, groupsUnassign, contactUpdateGroups }, inverses)
+					.then(() => loadGroupsInto())
+					.catch((e) => toast(String(e), 'error'));
+			},
+		});
+	}
 
 	function peerGroupsOf(npub: string): string[] {
 		return groups.filter(g => g.pubkeys.includes(npub)).map(g => g.name);
@@ -517,9 +556,20 @@
 					outcome,
 				);
 				await loadGroupsInto();
-				if (committed.kind === 'add') toast(`Added ${committed.npubs.length} to ${committed.target}`);
-				else if (committed.kind === 'move') toast(`Moved ${committed.npubs.length} to ${committed.target}`);
-				else toast(`Moved ${committed.npubs.length} to Ungrouped`);
+				// M22 W6: register the inverse (null for ungrouped, by owner ruling).
+				const inverses = computeDropInverseMulti(committed, priorGroupsByNpub);
+				if (committed.kind === 'add') {
+					const label = `Added ${committed.npubs.length} to ${committed.target}`;
+					if (inverses) registerUndo(label, inverses);
+					else toast(label);
+				} else if (committed.kind === 'move') {
+					const label = `Moved ${committed.npubs.length} to ${committed.target}`;
+					if (inverses) registerUndo(label, inverses);
+					else toast(label);
+				} else {
+					// ungrouped: NO inverse, by owner ruling ("This isn't a word doc.").
+					toast(`Moved ${committed.npubs.length} to Ungrouped`);
+				}
 				selectedNpubs = [];
 				selectionAnchor = null;
 			} catch (e) {
@@ -545,9 +595,21 @@
 				outcome,
 			);
 			await loadGroupsInto();
-			if (committed.kind === 'add') toast(`Added to ${committed.target}`);
-			else if (committed.kind === 'move') toast(`Moved to ${committed.target}`);
-			else toast('Moved to Ungrouped');
+			// M22 W6: register the inverse (null for ungrouped, by owner ruling).
+			const prior = priorGroupsByNpub.get(sourceNpub) ?? [];
+			const inverse = computeDropInverse(sourceNpub, committed, prior);
+			if (committed.kind === 'add') {
+				const label = `Added ${dropName(sourceNpub)} to ${committed.target}`;
+				if (inverse) registerUndo(label, [inverse]);
+				else toast(label);
+			} else if (committed.kind === 'move') {
+				const label = `Moved ${dropName(sourceNpub)} to ${committed.target}`;
+				if (inverse) registerUndo(label, [inverse]);
+				else toast(label);
+			} else {
+				// ungrouped: NO inverse, by owner ruling ("This isn't a word doc.").
+				toast(`Moved ${dropName(sourceNpub)} to Ungrouped`);
+			}
 		} catch (e) {
 			toast(String(e), 'error');
 		}
