@@ -22,23 +22,20 @@ import {
 	commitCreateGroupMulti,
 	writeDragPayloadMulti,
 	readDragPayloadMulti,
+	computeDropInverse,
+	computeDropInverseMulti,
+	computeCreateInverse,
+	commitInverse,
+	commitInverseMulti,
 	UNGROUPED_TARGET,
 	type DropOnGroupApi,
 	type DragGroupApi,
+	type UndoApi,
+	type DropOutcome,
+	type DropInverse,
 } from '$lib/drag-group.js';
 
 const browseSrc = () => readFileSync(new URL('./+page.svelte', import.meta.url), 'utf8');
-
-/** Page source with every comment removed (template `<!-- -->`, block, and line). The no-undo scan
- *  needs it: the page documents the "NO confirm, NO undo" ruling in prose, so a raw scan for
- *  /undo/ would fail forever on correct code. Kept local rather than shared with the Contacts
- *  suite — two small copies beat coupling two test files together. */
-function stripComments(src: string): string {
-	return src
-		.replace(/<!--[\s\S]*?-->/g, '')
-		.replace(/\/\*[\s\S]*?\*\//g, '')
-		.replace(/^[ \t]*\/\/.*$/gm, '');
-}
 
 /** A spy DropOnGroupApi: records groupsAssign + contactUpdateGroups calls. The absence of any
  *  other method (audience, create, unassign) is itself the guarantee that commitDropOnGroup
@@ -141,10 +138,16 @@ describe('M22 W4 — Browse People section heads are drop targets (source-scan)'
 		expect(s).toMatch(/UNGROUPED_TARGET/);
 	});
 
-	it('imports groupsAssign + contactUpdateGroups from api.ts (the W4 write surface)', () => {
+	// Was: `expect(s).toMatch(/groupsAssign/)` over the WHOLE file — satisfied by the call site
+	// itself, so it stayed green on Contacts while that page never imported groupsAssign at all
+	// (a ReferenceError on every Shift-add, shipped in W4 400f850). Assert the import STATEMENT.
+	// Mutation probe: dropping a symbol from the import line reds this.
+	it('every api symbol the drop paths call is actually in the $lib/api.js import', () => {
 		const s = browseSrc();
-		expect(s).toMatch(/groupsAssign/);
-		expect(s).toMatch(/contactUpdateGroups/);
+		const importLine = s.slice(s.indexOf('import {'), s.indexOf("from '$lib/api.js'"));
+		for (const sym of ['groupsAssign', 'groupsUnassign', 'groupsDelete', 'contactUpdateGroups', 'groupsCreateWithMembers']) {
+			expect(importLine).toContain(sym);
+		}
 	});
 
 	it('the section head wires ondragover/ondragleave/ondrop → onGroupDragOver/Leave/Drop', () => {
@@ -194,6 +197,17 @@ describe('M22 W4 — Browse People section heads are drop targets (source-scan)'
 		expect(fn).toMatch(/dropOverTarget = null/);
 		expect(fn).toMatch(/dropOutcome = null/);
 	});
+
+	// W6 acceptance: the toast must name the group AND the affected contact. Browse's twin of the
+	// Contacts test — this is exactly the "one call site gets the fix, its twin doesn't" drift shape
+	// CLAUDE.md §9 names. Mutation probe: reverting a label to `Added to ${...}` reds this.
+	it('every single-drop toast label names the affected contact, not just the group', () => {
+		const s = browseSrc();
+		expect(s).toMatch(/Added \$\{dropName\(sourceNpub\)\} to \$\{committed\.target\}/);
+		expect(s).toMatch(/Moved \$\{dropName\(sourceNpub\)\} to \$\{committed\.target\}/);
+		expect(s).toMatch(/Moved \$\{dropName\(sourceNpub\)\} to Ungrouped/);
+		expect(s).not.toMatch(/`(Added|Moved) to /);
+	});
 });
 
 // ── W3 create gesture is untouched (regression guard) ─────────────────────────
@@ -223,8 +237,10 @@ describe('M22 W4 — W3 create gesture still wired on Browse (regression guard)'
 });
 
 // ── Ungrouped: NO confirm, NO undo (pin the owner ruling) ────────────────────
+// W6 adds undo to every drop kind EXCEPT Ungrouped. The old whole-page /undo/ scan is replaced
+// with a behavioural test (computeDropInverse returns null for ungrouped) — STRICTLY STRONGER.
 
-describe('M22 W4 — Browse Ungrouped drop offers NO confirm and NO undo', () => {
+describe('M22 W4 — Browse Ungrouped drop: no confirm gate', () => {
 	it('the Ungrouped commit path routes straight to commitDropOnGroup (no confirm gate)', () => {
 		const src = browseSrc();
 		const start = src.indexOf('async function onGroupDrop');
@@ -234,18 +250,18 @@ describe('M22 W4 — Browse Ungrouped drop offers NO confirm and NO undo', () =>
 		expect(fn).not.toMatch(/ConfirmButton/);
 		expect(fn).not.toMatch(/confirm/);
 	});
+});
 
-	// This block was named "NO confirm and NO undo" but only ever tested the confirm half — an Undo
-	// button added to Browse would have gone unnoticed while a green test claimed to cover it.
-	// Scans the WHOLE page (an affordance lives in the template, not in onGroupDrop's body) with
-	// comments stripped, because the page documents this ruling in prose and the scan must not red
-	// on its own documentation.
-	it('the Browse page offers no undo affordance anywhere — script OR template', () => {
-		const src = stripComments(browseSrc());
-		expect(src.length).toBeGreaterThan(0);
-		expect(src).not.toMatch(/\bundo\b/i);
-		expect(src).not.toMatch(/\brevert\b/i);
-		expect(src).not.toMatch(/\brestore\b/i);
+describe('M22 W6 — Browse Ungrouped has NO inverse (behavioural)', () => {
+	it('computeDropInverse returns null for an ungrouped outcome', () => {
+		const inverse = computeDropInverse('npub1a', { kind: 'ungrouped' }, ['Film']);
+		expect(inverse).toBeNull();
+	});
+
+	it('computeDropInverseMulti returns null for an ungrouped outcome (multi)', () => {
+		const prior = new Map([['npub1a', ['Film']]]);
+		const inverse = computeDropInverseMulti({ kind: 'ungrouped', npubs: ['npub1a'] }, prior);
+		expect(inverse).toBeNull();
 	});
 });
 
@@ -389,5 +405,104 @@ describe('M22 W5 — Browse page wiring (source-scan, no behavioural equivalent)
 		const s = browseSrc();
 		expect(s).toMatch(/e\.key === 'Escape'/);
 		expect(s).toMatch(/selectedNpubs = \[\]/);
+	});
+});
+
+// ════════════════════════════════════════════════════════════════════════════════
+// M22 W6 — undo. Same shared primitives as Contacts (one implementation, two consumers). Browse's
+// suite asserts the SAME inverse primitives are what Browse's handlers route through.
+// ════════════════════════════════════════════════════════════════════════════════
+
+/** A spy UndoApi: records groupsDelete + groupsUnassign + contactUpdateGroups. */
+function spyUndoApi(): UndoApi & { calls: { method: string; args: unknown[] }[] } {
+	const calls: { method: string; args: unknown[] }[] = [];
+	return {
+		calls,
+		groupsDelete: vi.fn(async (name: string) => {
+			calls.push({ method: 'groupsDelete', args: [name] });
+		}),
+		groupsUnassign: vi.fn(async (npub: string, groupName: string) => {
+			calls.push({ method: 'groupsUnassign', args: [npub, groupName] });
+		}),
+		contactUpdateGroups: vi.fn(async (npub: string, groupNames: string[]) => {
+			calls.push({ method: 'contactUpdateGroups', args: [npub, groupNames] });
+		}),
+	} as unknown as UndoApi & { calls: { method: string; args: unknown[] }[] };
+}
+
+describe('M22 W6 logic — the inverse of each drop kind (table-driven, shared primitives)', () => {
+	const cases: {
+		name: string;
+		outcome: DropOutcome;
+		priorGroups: string[];
+		expectedKind: DropInverse['kind'] | null;
+	}[] = [
+		{ name: 'add',       outcome: { kind: 'add', target: 'Film' },          priorGroups: ['Anime'],      expectedKind: 'unassign' },
+		{ name: 'move',      outcome: { kind: 'move', target: 'Film' },         priorGroups: ['Anime'],      expectedKind: 'restore-groups' },
+		{ name: 'ungrouped', outcome: { kind: 'ungrouped' },                    priorGroups: ['Film'],       expectedKind: null },
+		{ name: 'refused',   outcome: { kind: 'refused', target: 'Film', reason: 'x' }, priorGroups: ['Film'], expectedKind: null },
+		{ name: 'noop',      outcome: { kind: 'noop' },                         priorGroups: [],             expectedKind: null },
+	];
+
+	for (const c of cases) {
+		it(`${c.name} → ${c.expectedKind ?? 'no inverse'}`, () => {
+			const inverse = computeDropInverse('npub1a', c.outcome, c.priorGroups);
+			if (c.expectedKind === null) {
+				expect(inverse).toBeNull();
+			} else {
+				expect((inverse as DropInverse).kind).toBe(c.expectedKind);
+			}
+		});
+	}
+});
+
+describe('M22 W6 logic — commitInverse (shared primitives)', () => {
+	it('add inverse → groupsUnassign', async () => {
+		const api = spyUndoApi();
+		await commitInverse(api, { kind: 'unassign', npub: 'npub1a', groupName: 'Film' });
+		expect(api.calls[0].method).toBe('groupsUnassign');
+	});
+
+	it('move inverse → contactUpdateGroups(prior)', async () => {
+		const api = spyUndoApi();
+		await commitInverse(api, { kind: 'restore-groups', npub: 'npub1a', groupNames: ['Anime'] });
+		expect(api.calls[0].method).toBe('contactUpdateGroups');
+	});
+
+	it('create inverse → groupsDelete', async () => {
+		const api = spyUndoApi();
+		await commitInverse(api, computeCreateInverse('Anime'));
+		expect(api.calls[0].method).toBe('groupsDelete');
+	});
+});
+
+// ── Browse page wiring (source-scan): W6 undo wiring ─────────────────────────
+
+describe('M22 W6 — Browse page wiring (source-scan)', () => {
+	it('imports the undo primitives from $lib/drag-group.js', () => {
+		const s = browseSrc();
+		expect(s).toMatch(/computeDropInverse/);
+		expect(s).toMatch(/computeCreateInverse/);
+		expect(s).toMatch(/commitInverse/);
+	});
+
+	it('onDragStart ASSIGNS priorGroupsByNpub at drag start (not just a mention)', () => {
+		const s = browseSrc();
+		const fn = s.slice(s.indexOf('function onDragStart'), s.indexOf('function onDragOver'));
+		expect(fn).toMatch(/priorGroupsByNpub\s*=\s*/);
+	});
+
+	it('onGroupDrop reads priorGroupsByNpub for the move inverse', () => {
+		const s = browseSrc();
+		const fn = s.slice(s.indexOf('async function onGroupDrop'), s.indexOf('</script>'));
+		expect(fn).toMatch(/priorGroupsByNpub/);
+		expect(fn).toMatch(/computeDropInverse/);
+	});
+
+	it('commitDragCreate registers a create inverse', () => {
+		const s = browseSrc();
+		const fn = s.slice(s.indexOf('async function commitDragCreate'), s.indexOf('let dropOverTarget'));
+		expect(fn).toMatch(/computeCreateInverse/);
+		expect(fn).toMatch(/toastWithAction/);
 	});
 });

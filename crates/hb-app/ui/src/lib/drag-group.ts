@@ -400,7 +400,7 @@ export function computeDropOutcomeMulti(
 export async function commitDropOnGroupMulti(
 	api: DropOnGroupApi,
 	outcome: Exclude<DropOutcomeMulti, { kind: 'refused' } | { kind: 'noop' }>,
-): Promise<DropOutcomeMulti> {
+): Promise<Exclude<DropOutcomeMulti, { kind: 'refused' } | { kind: 'noop' }>> {
 	const targets = outcome.npubs;
 	// Build the per-npub write promise. Each touched contact makes exactly ONE backend call.
 	const writes: Promise<{ npub: string; ok: true } | { npub: string; ok: false; err: unknown }>[] =
@@ -431,4 +431,99 @@ export async function commitDropOnGroupMulti(
 		throw err;
 	}
 	return outcome;
+}
+
+// ── M22 W6 — undo: the inverse of each drop ───────────────────────────────────
+//
+// Owner ruling 2026-08-09 (verbatim): "No undo at all. This isn't a word doc." — that applies to the
+// Ungrouped drop ONLY. Every other drop kind that has an inverse gets one. The inverse is computed
+// PURELY from the outcome + the prior membership set, and executed through a SEPARATE narrow UndoApi
+// (not DropOnGroupApi / DragGroupApi) so the invariant-guarding narrowness of those interfaces is
+// preserved.
+//
+// Prior membership capture: the move inverse needs the group set the contact was in BEFORE the move.
+// It MUST be captured at drag START (not drop), or a slow write between start and drop can race it —
+// the contact's groups at drop time may already reflect an intermediate state. The pure functions
+// below take priorGroups as a parameter so the page (which owns the capture point) cannot get it
+// wrong by re-reading at drop time.
+
+/** The minimal API surface the undo path needs. Deliberately SEPARATE from DropOnGroupApi and
+ *  DragGroupApi so those invariant-guarding interfaces stay narrow — widening them to add
+ *  groupsDelete/groupsUnassign would erode the guarantee that commitDropOnGroup / commitCreateGroup
+ *  CAN'T reach a delete. Passed in (not imported) so the test injects a spy. Never includes the
+ *  private audience API. */
+export interface UndoApi {
+	groupsDelete(name: string): Promise<unknown>;
+	groupsUnassign(npub: string, groupName: string): Promise<unknown>;
+	contactUpdateGroups(npub: string, groupNames: string[]): Promise<unknown>;
+}
+
+/** The inverse of a drop — a descriptor the toast holds so the Undo button can replay it. `null`
+ *  means "no inverse" (ungrouped by owner ruling; refused / noop because nothing happened). */
+export type DropInverse =
+	| { kind: 'delete-group'; name: string }
+	| { kind: 'unassign'; npub: string; groupName: string }
+	| { kind: 'restore-groups'; npub: string; groupNames: string[] };
+
+/** Compute the inverse of a single-source drop outcome. Pure: no writes, no I/O.
+ *  - add (Shift-drop onto a group) → unassign the contact from that one group.
+ *  - move (plain drop onto a group) → restore the contact to their PRIOR group set.
+ *  - ungrouped → null (no inverse, by owner ruling — "This isn't a word doc.").
+ *  - refused / noop → null (nothing happened).
+ *
+ *  `priorGroups` is the contact's membership set captured at drag START (not drop). */
+export function computeDropInverse(
+	sourceNpub: string,
+	outcome: DropOutcome,
+	priorGroups: string[],
+): DropInverse | null {
+	if (outcome.kind === 'add') return { kind: 'unassign', npub: sourceNpub, groupName: outcome.target };
+	if (outcome.kind === 'move') return { kind: 'restore-groups', npub: sourceNpub, groupNames: priorGroups };
+	// ungrouped: no inverse, by owner ruling. refused / noop: nothing happened.
+	return null;
+}
+
+/** Compute the inverse of a multi-select drop. Returns one inverse per affected contact so each can
+ *  be undone independently. For move/ungrouped-multi the inverse is per-npub restore-groups (with
+ *  each contact's own prior set). Ungrouped returns null per the ruling — no entry at all. */
+export function computeDropInverseMulti(
+	outcome: Exclude<DropOutcomeMulti, { kind: 'refused' } | { kind: 'noop' }>,
+	priorGroupsByNpub: Map<string, string[]>,
+): DropInverse[] | null {
+	if (outcome.kind === 'ungrouped') return null; // no inverse, by owner ruling.
+	if (outcome.kind === 'add') {
+		return outcome.npubs.map((npub) => ({ kind: 'unassign' as const, npub, groupName: outcome.target }));
+	}
+	// move: restore each touched contact to their prior group set.
+	return outcome.npubs.map((npub) => ({
+		kind: 'restore-groups' as const,
+		npub,
+		groupNames: priorGroupsByNpub.get(npub) ?? [],
+	}));
+}
+
+/** Compute the inverse of a create-group gesture (W3 single-pair and W5 multi). The group was brand
+ *  new, so the inverse is safe: delete it. */
+export function computeCreateInverse(name: string): DropInverse {
+	return { kind: 'delete-group', name };
+}
+
+/** Execute an inverse via the UndoApi. One backend call per inverse entry. The caller passes a
+ *  spy UndoApi in tests. Never touches the private audience. */
+export async function commitInverse(api: UndoApi, inverse: DropInverse): Promise<void> {
+	if (inverse.kind === 'delete-group') {
+		await api.groupsDelete(inverse.name);
+	} else if (inverse.kind === 'unassign') {
+		await api.groupsUnassign(inverse.npub, inverse.groupName);
+	} else {
+		await api.contactUpdateGroups(inverse.npub, inverse.groupNames);
+	}
+}
+
+/** Execute N inverse entries (the multi-select undo). One backend call per entry. Partial failure
+ *  surfaces (throws). Never touches the private audience. */
+export async function commitInverseMulti(api: UndoApi, inverses: DropInverse[]): Promise<void> {
+	for (const inv of inverses) {
+		await commitInverse(api, inv);
+	}
 }

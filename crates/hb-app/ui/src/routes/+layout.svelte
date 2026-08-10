@@ -189,10 +189,13 @@
 	</div>
 </div>
 
-<!-- Toast -->
+<!-- Toast (M22 W6: the Undo button renders only when an action is present — conditional, never unconditional) -->
 {#if $toastMessage}
 	<div class="toast" class:toast-error={$toastMessage.kind === 'error'}>
 		{$toastMessage.text}
+		{#if $toastMessage.action}
+			<button type="button" class="toast-action" onclick={$toastMessage.action.run}>{$toastMessage.action.label}</button>
+		{/if}
 	</div>
 {/if}
 
@@ -358,5 +361,17 @@
 		background: oklch(0.25 0.06 25);
 		border-color: oklch(0.65 0.18 25 / 0.4);
 		color: oklch(0.85 0.12 25);
+	}
+
+	.toast-action {
+		margin-left: 10px;
+		padding: 2px 8px;
+		font-size: 12px;
+		font-weight: 600;
+		border: 1px solid var(--border-strong);
+		border-radius: 5px;
+		background: transparent;
+		color: var(--accent);
+		cursor: pointer;
 	}
 </style>

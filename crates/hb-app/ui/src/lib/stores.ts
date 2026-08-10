@@ -19,7 +19,14 @@ export const sentMessages = writable<ReceivedMessage[]>([]);
  *  `inboxMessages` on the chat page's poll. */
 export const dmRequests = writable<DmRequestView[]>([]);
 
-export const toastMessage = writable<{ text: string; kind: 'success' | 'error' } | null>(null);
+/** A toast action — an optional button rendered inside the toast (M22 W6 undo). `run` is invoked
+ *  once on click; the toast clears immediately after so a second click can't fire the handler twice. */
+export interface ToastAction {
+	label: string;
+	run: () => void;
+}
+
+export const toastMessage = writable<{ text: string; kind: 'success' | 'error'; action?: ToastAction } | null>(null);
 
 /** True once the layout's initial data fetch has completed. */
 export const appReady = writable(false);
@@ -38,9 +45,40 @@ export const readWatermarks = writable<Record<string, string>>({});
 export const topicAnnounceSummaries = writable<TopicAnnounceSummary[]>([]);
 export const announceSeen = writable<Record<string, number>>({});
 
+// M22 W6: the toast timer is tracked so a second toast REPLACES the live one (chosen over queueing —
+// a queue risks undoing the wrong operation, and a stale handler firing against changed state is the
+// exact failure the tracker rules out). A replace clears the first toast's timer so it can't kill the
+// second early. This is the single source of truth: both toast() and toastWithAction() route through it.
+let toastTimer: ReturnType<typeof setTimeout> | undefined;
+const TOAST_MS = 3500;
+const TOAST_ACTION_MS = 6000; // undo needs more time to be usable
+
+function clearToastTimer() {
+	if (toastTimer) { clearTimeout(toastTimer); toastTimer = undefined; }
+}
+
 export function toast(text: string, kind: 'success' | 'error' = 'success') {
+	clearToastTimer();
 	toastMessage.set({ text, kind });
-	setTimeout(() => toastMessage.set(null), 3500);
+	toastTimer = setTimeout(() => { toastMessage.set(null); toastTimer = undefined; }, TOAST_MS);
+}
+
+/** Toast with an optional action button (M22 W6 undo). When the action fires, the toast clears
+ *  immediately and the timer is cancelled so the handler can't fire twice. When the toast expires,
+ *  the action is discarded — no stale handler survives against changed state. A second toast (with or
+ *  without action) REPLACES the live one rather than queueing. */
+export function toastWithAction(
+	text: string,
+	action: { label: string; run: () => void },
+	kind: 'success' | 'error' = 'success',
+) {
+	clearToastTimer();
+	toastMessage.set({ text, kind, action: { label: action.label, run: () => {
+		clearToastTimer();
+		toastMessage.set(null);
+		action.run();
+	} } });
+	toastTimer = setTimeout(() => { toastMessage.set(null); toastTimer = undefined; }, TOAST_ACTION_MS);
 }
 
 // (The downloads store + applyDownloadEvent reducer were removed in v0.9.6 and did NOT come back with
