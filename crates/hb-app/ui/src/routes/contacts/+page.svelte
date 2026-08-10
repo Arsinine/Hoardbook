@@ -33,8 +33,8 @@
 	// plain click selects one. Dragging any selected row carries the WHOLE selection; dragging an
 	// unselected row carries just that row. Ghost shows a count badge. Refuse over selection: a
 	// target ALL selected already belong to refuses; MIXED allowed.
-	import { writeDragPayload, readDragPayload, writeDragPayloadMulti, readDragPayloadMulti, isValidDropTarget, isSelfDrop, groupSuggestions, groupSuggestionsMulti, commitCreateGroup, commitCreateGroupMulti, computeDropOutcome, commitDropOnGroup, computeDropOutcomeMulti, commitDropOnGroupMulti, applyClickToSelection, computeDropInverse, computeDropInverseMulti, computeCreateInverse, commitInverse, commitInverseMulti, UNGROUPED_TARGET, type DropOutcome, type DropOutcomeMulti } from '$lib/drag-group.js';
-	import { onMount, onDestroy } from 'svelte';
+	import { writeDragPayload, readDragPayload, writeDragPayloadMulti, readDragPayloadMulti, isValidDropTarget, isSelfDrop, groupSuggestions, groupSuggestionsMulti, commitCreateGroup, commitCreateGroupMulti, computeDropOutcome, commitDropOnGroup, computeDropOutcomeMulti, commitDropOnGroupMulti, applyClickToSelection, applyKeyToSelection, shouldHandleArrowKey, computeDropInverse, computeDropInverseMulti, computeCreateInverse, commitInverse, commitInverseMulti, rovingTabindexForIdx, isTypingTargetShape, rowId, UNGROUPED_TARGET, type DropOutcome, type DropOutcomeMulti } from '$lib/drag-group.js';
+	import { onMount, onDestroy, tick } from 'svelte';
 	import { goto } from '$app/navigation';
 
 	// ── "🟢 N hoarders online" chip (M9) — relay-derived, no telemetry. **Always shown** (the Settings
@@ -143,6 +143,17 @@
 	let selectedNpubs = $state<string[]>([]);             // the multi-selection (empty when idle)
 	let selectionAnchor = $state<string | null>(null);    // last plain-clicked row (for Shift range)
 	let selectedNpubSet = $derived(new Set(selectedNpubs));
+	// M22 W7 — the keyboard-focused row (roving tabindex). Arrow keys move it; with Shift they
+	// extend the selection. null until the user first arrows into the list; the first arrow picks
+	// the nearest end so the very first press is never a no-op.
+	let focusedNpub = $state<string | null>(null);
+	// The index of the focused row in contactOrder (or null when focusedNpub is null/filtered-out).
+	// Kept in sync so rovingTabindexForIdx is a pure function of (focusedIdx, renderIdx).
+	let focusedIdx = $state<number | null>(null);
+	// M22 W7 A2 — the list container, so we can check whether focus is within it (A7) and move real
+	// DOM focus to a row after an arrow-key move.
+	let listContainer: HTMLElement | undefined = $state();
+	const ROW_ID_PREFIX = 'contact-row';
 
 	// The three standard click modifiers applied to the multi-selection. onmousedown (not onclick)
 	// so the selection is updated BEFORE dragstart fires — dragstart reads the current selection to
@@ -154,13 +165,86 @@
 		const r = applyClickToSelection(selectedNpubs, selectionAnchor, contactOrder, npub, e.shiftKey, e.metaKey || e.ctrlKey);
 		selectedNpubs = r.selection;
 		selectionAnchor = r.anchor;
+		// M22 W7 — a mouse click also moves the roving-tabindex focus so a subsequent arrow key
+		// continues from the clicked row (matches every file manager).
+		focusedNpub = npub;
+		focusedIdx = contactOrder.indexOf(npub);
 	}
 
 	// Esc clears the selection (and the W3 naming popover handles its own Esc separately).
+	// M22 W7 — ArrowUp/ArrowDown move the roving-tabindex focus; with Shift they extend the
+	// selection. `G` opens the SAME namer the drag path uses (dragPopoverFor = [...selected]),
+	// so W2 suggestions and W6 create-undo come along for free — there is no parallel create path.
+	// The `G` handler is guarded against eating typing: it ignores keys from input/textarea/select/
+	// contenteditable targets, the namer's own field, the W5b popover, and any modifier held.
+	function isTypingTarget(e: KeyboardEvent): boolean {
+		// A8: a window keydown retargets to the shadow host for events from inside a Shadow DOM;
+		// composedPath()[0] is the actual inner element. Combined with the pure isTypingTargetShape
+		// so the guard logic is unit-testable without a DOM.
+		const t = (e.composedPath()[0] ?? e.target) as HTMLElement | null;
+		if (!(t instanceof HTMLElement)) return false;
+		return isTypingTargetShape(t.tagName, t.isContentEditable);
+	}
+
+	// M22 W7 A2 — when a row receives focus (by Tab or click), record it so Tab-then-Arrow does
+	// not restart from the nearest end.
+	function onRowFocus(npub: string) {
+		if (focusedNpub !== npub) {
+			focusedNpub = npub;
+			focusedIdx = contactOrder.indexOf(npub);
+		}
+	}
+
+	// M22 W7 A7 — true when focus is within the list container (so arrow keys should be handled
+	// and preventDefault'd) OR a row is explicitly focused.
+	function listHasFocus(): boolean {
+		if (focusedNpub !== null) return true;
+		if (listContainer && document.activeElement && listContainer.contains(document.activeElement)) return true;
+		return false;
+	}
+
+	async function moveFocusToRow(npub: string) {
+		// A2: move real DOM focus to the newly-focused row after the DOM has updated.
+		await tick();
+		document.getElementById(rowId(ROW_ID_PREFIX, npub))?.focus();
+	}
+
 	function onWindowKeyDown(e: KeyboardEvent) {
-		if (e.key === 'Escape' && selectedNpubs.length > 0 && !dragPopoverFor) {
+		// The namer's own name field handles its own Enter/Esc; don't compete with it.
+		if (dragPopoverFor) return;
+		// ArrowUp/ArrowDown move focus / extend selection. A7: only handle/preventDefault when the
+		// list actually has focus, so arrows still scroll the page when the user is elsewhere.
+		if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && !isTypingTarget(e) && listHasFocus()) {
+			if (!shouldHandleArrowKey(contactOrder.length)) return;
+			e.preventDefault();
+			const r = applyKeyToSelection(selectedNpubs, selectionAnchor, contactOrder, focusedNpub, e.key, e.shiftKey);
+			selectedNpubs = r.selection;
+			selectionAnchor = r.anchor;
+			focusedNpub = r.focused;
+			focusedIdx = r.focusedIdx;
+			void moveFocusToRow(r.focused);
+			return;
+		}
+		if (e.key === 'Escape' && selectedNpubs.length > 0) {
 			selectedNpubs = [];
 			selectionAnchor = null;
+			return;
+		}
+		// G opens the namer for the current selection — the keyboard equivalent of the W3/W5
+		// create gesture. Guarded so it never fires while typing or with a modifier held.
+		if ((e.key === 'g' || e.key === 'G') && !isTypingTarget(e) && !e.ctrlKey && !e.metaKey && !e.altKey && !groupPopoverFor && selectedNpubs.length >= 2) {
+			e.preventDefault();
+			const peers = selectedNpubs
+				.map((n) => $contacts.find((c) => c.npub === n))
+				.filter((p): p is CachedPeer => !!p);
+			if (peers.length < 2) return;
+			// M22 W7 — remember the focused row so the namer can return focus on close (MUST be
+			// before dragPopoverFor is set, so the success path can restore it).
+			dragPopoverReturnFocus = document.activeElement as HTMLElement | undefined;
+			dragSuggestions = groupSuggestionsMulti(peers);
+			dragNameInput = '';
+			dragPopoverFor = [...selectedNpubs];
+			focusNamer();
 		}
 	}
 
@@ -176,7 +260,11 @@
 	let dragPopoverAnchor: HTMLElement | undefined = $state();
 	let dragNameInput = $state('');
 	let dragSuggestions = $state<string[]>([]);
-	let dragNameFocused = $state(false);
+	// M22 W7 A3 — the namer's input element, bound so we can focus it when the namer opens.
+	let dragNameEl: HTMLInputElement | undefined = $state();
+	// M22 W7 — the row that had focus before the namer opened, so focus returns to it on close
+	// (the keyboard route must not strand the user at the top of the page after naming a group).
+	let dragPopoverReturnFocus: HTMLElement | undefined = $state();
 
 	function onDragStart(e: DragEvent, npub: string) {
 		if (!e.dataTransfer) return;
@@ -251,7 +339,7 @@
 			dragNameInput = '';
 			dragPopoverAnchor = e.currentTarget as HTMLElement;
 			dragPopoverFor = [...multiNpubs, targetNpub];
-			dragNameFocused = true;
+			focusNamer();
 			dragOverNpub = null;
 			return;
 		}
@@ -272,7 +360,7 @@
 		dragNameInput = '';
 		dragPopoverAnchor = e.currentTarget as HTMLElement;
 		dragPopoverFor = { source: sourceNpub, target: targetNpub };
-		dragNameFocused = true;
+		focusNamer();
 		// Clear the drag-over highlight; the source dims until the popover closes.
 		dragOverNpub = null;
 	}
@@ -281,11 +369,27 @@
 		dragNameInput = name;
 	}
 
+	// M22 W7 A3 — focus the namer's field once it has rendered. Without this the popover opens and
+	// typing goes nowhere: the window handler ignores keys while the namer is open, so the gesture
+	// dead-ends. Awaits tick() because the input does not exist until the {#if} block renders.
+	async function focusNamer() {
+		await tick();
+		dragNameEl?.focus();
+	}
+
 	function closeDragPopover() {
 		dragPopoverFor = null;
 		dragNameInput = '';
 		dragSuggestions = [];
-		dragNameFocused = false;
+		// M22 W7 A9 — return focus to the row that opened the namer, but only if it is still
+		// connected to the DOM (a detached element's .focus() is a silent no-op). Fall back to the
+		// first rendered row so focus is never stranded.
+		if (dragPopoverReturnFocus?.isConnected) {
+			dragPopoverReturnFocus.focus();
+		} else if (contactOrder.length > 0) {
+			document.getElementById(rowId(ROW_ID_PREFIX, contactOrder[0]))?.focus();
+		}
+		dragPopoverReturnFocus = undefined;
 	}
 
 	// Esc on the naming field cancels the whole gesture (owner ruling 2026-08-09) — no group
@@ -305,8 +409,9 @@
 		if (!dragPopoverFor) return;
 		const npubs = dragPopoverFor;
 		const name = dragNameInput;
-		// Close the popover first so a double-Enter can't fire two creates.
-		dragPopoverFor = null;
+		// Close the popover first so a double-Enter can't fire two creates. A4: route through
+		// closeDragPopover so focus is restored on the SUCCESS path too (not just cancel).
+		closeDragPopover();
 		try {
 			if (Array.isArray(npubs)) {
 				// M22 W5 multi-select create: ONE call with all N npubs.
@@ -336,10 +441,6 @@
 			selectionAnchor = null;
 		} catch (e) {
 			toast(String(e), 'error');
-		} finally {
-			dragNameInput = '';
-			dragSuggestions = [];
-			dragNameFocused = false;
 		}
 	}
 
@@ -817,13 +918,29 @@
 	let contactOrder = $derived(
 		[...online, ...sections.flatMap((s) => s.peers)].map((p) => p.npub),
 	);
+	// M22 W7 A5 — the GLOBAL render index each section starts at. groupByGroups renders a peer once
+	// per group, so a roving tabindex keyed on npub alone would mark every copy tabbable; the render
+	// index disambiguates them. online[] is rendered first in name view, hence the initial offset.
+	let sectionStart = $derived((() => {
+		const out: number[] = [];
+		let n = online.length;
+		for (const sec of sections) { out.push(n); n += sec.peers.length; }
+		return out;
+	})());
 	let railTargets = $derived(
 		ALPHABET.map(l => ({ label: l, anchorId: l === '#' ? 'sec-hash' : `sec-${l}`, enabled: presentSectionKeys(sections).has(l) }))
 	);
 </script>
 
 <!-- M22 W5 — Esc clears the multi-selection when the naming popover is not open. -->
+<!-- M22 W7 — the live region mirrors the drag affordance text so the refuse state (W4) is
+     conveyed non-visually, not just by withholding the accent highlight. -->
 <svelte:window onkeydown={onWindowKeyDown} />
+<div class="sr-only" role="status" aria-live="polite">
+	{#if dropOverTarget && dropOutcome}
+		{#if dropOutcome.kind === 'refused'}{dropOutcome.reason}{:else if dropOutcome.kind === 'noop'}already ungrouped{:else if dropOutcome.kind === 'add'}add to {dropOverTarget}{:else if dropOutcome.kind === 'move'}move to {dropOverTarget}{:else}remove all groups{/if}
+	{/if}
+</div>
 
 <div class="contacts-shell">
 <div class="contacts-main">
@@ -872,7 +989,7 @@
 	</div>
 {/if}
 
-{#snippet contactRow(peer: CachedPeer)}
+{#snippet contactRow(peer: CachedPeer, renderIdx: number)}
 	{@const name = contactDisplayName(peer)}
 	{@const initial = name[0]?.toUpperCase() ?? '?'}
 	{@const hue = avatarHue(initial)}
@@ -904,6 +1021,9 @@
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
 		<!-- Ignore double-clicks that land on an inner control (chevron, Browse, ⋯ menu) so they keep
 		     their own single-click action instead of also navigating to Chat (codex review). -->
+		<!-- M22 W7 — role/aria + roving tabindex: one row in the list owns tabindex=0 (the focused
+		     one, or the first when none is focused yet); the rest carry -1 so arrow keys move a
+		     single tab stop through the list rather than tabbing through every row. -->
 		<div
 			class="contact-card"
 			class:contact-selected={selectedNpubSet.has(peer.npub)}
@@ -911,6 +1031,12 @@
 			class:drag-target={dragSourceNpub !== null && dragOverNpub === peer.npub && dragSourceNpub !== peer.npub}
 			class:drag-recede={dragSourceNpub !== null && dragOverNpub !== null && dragSourceNpub !== peer.npub && dragOverNpub !== peer.npub}
 			draggable="true"
+			role="option"
+			aria-selected={selectedNpubSet.has(peer.npub)}
+			aria-label={`${name}${peerGroups.length > 0 ? ', groups: ' + peerGroups.join(', ') : ''}${selectedNpubSet.has(peer.npub) ? ', selected' : ''}`}
+			id={rowId(ROW_ID_PREFIX, peer.npub)}
+			tabindex={rovingTabindexForIdx(focusedIdx, renderIdx, contactOrder.length)}
+			onfocus={() => onRowFocus(peer.npub)}
 			onmousedown={(e) => onContactMouseDown(e, peer.npub)}
 			ondragstart={(e) => onDragStart(e, peer.npub)}
 			ondragover={(e) => onDragOver(e, peer.npub)}
@@ -1218,7 +1344,7 @@
 	</OverflowMenu>
 {/snippet}
 
-<div class="phonebook">
+<div class="phonebook" bind:this={listContainer}>
 	<div class="phonebook-scroll">
 		{#if $contacts.length === 0}
 			<div class="empty">No contacts yet. Use “+ Add contact” to find someone by ID or discover hoarders.</div>
@@ -1259,13 +1385,13 @@
 					<div class="phonebook-section">
 						<div id="sec-online" class="section-header">● Online now</div>
 						<div class="contact-list">
-							{#each online as peer (peer.npub)}
-								{@render contactRow(peer)}
+							{#each online as peer, i (peer.npub)}
+								{@render contactRow(peer, i)}
 							{/each}
 						</div>
 					</div>
 				{/if}
-				{#each sections as section (section.key)}
+				{#each sections as section, secIdx (section.key)}
 					{@const dropTargetName = section.key === 'ungrouped' ? UNGROUPED_TARGET : section.key}
 					<div class="phonebook-section">
 						<div
@@ -1278,6 +1404,7 @@
 							ondrop={(e) => onGroupDrop(e, dropTargetName)}
 							role={view === 'groups' ? 'group' : undefined}
 							aria-label={view === 'groups' ? section.label : undefined}
+							aria-disabled={dropOverTarget === dropTargetName && dropOutcome !== null && (dropOutcome.kind === 'refused' || dropOutcome.kind === 'noop')}
 						>
 							{section.label}
 							{#if view === 'groups' && dropOverTarget === dropTargetName && dropOutcome}
@@ -1285,8 +1412,8 @@
 							{/if}
 						</div>
 						<div class="contact-list">
-							{#each section.peers as peer (peer.npub)}
-								{@render contactRow(peer)}
+							{#each section.peers as peer, i (peer.npub)}
+								{@render contactRow(peer, sectionStart[secIdx] + i)}
 							{/each}
 						</div>
 					</div>
@@ -1351,6 +1478,7 @@
 				class="dg-input"
 				type="text"
 				placeholder="Name this group"
+				bind:this={dragNameEl}
 				bind:value={dragNameInput}
 				onkeydown={onDragNameKey}
 			/>
@@ -1853,4 +1981,15 @@
 		text-transform: none; letter-spacing: 0;
 	}
 	.section-header.group-drop-refused .drop-hint { color: var(--fg-dim); }
+
+	/* M22 W7 — screen-reader-only live region (the refuse-state mirror). */
+	.sr-only {
+		position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+		overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+	}
+
+	/* M22 W7 — respect prefers-reduced-motion: disable the drag/chevron transitions. */
+	@media (prefers-reduced-motion: reduce) {
+		.chevron, .tagfilter-chevron { transition: none; }
+	}
 </style>
