@@ -4,6 +4,10 @@
 	import { icons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
 	import OverflowMenu from '$lib/components/OverflowMenu.svelte';
+	// M22 W8 — ONE shared group-membership editor (extracted from the W5b inline popover) used by
+	// BOTH Contacts and Browse. The draft, checkboxes, Apply/contactUpdateGroups, "+ New group…" and
+	// focus-return all live in the component; this page supplies the anchor + callbacks.
+	import GroupMembershipPopover from '$lib/components/GroupMembershipPopover.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import ConfirmButton from '$lib/components/ConfirmButton.svelte';
 	import CreateGroupDialog from '$lib/components/CreateGroupDialog.svelte';
@@ -212,6 +216,10 @@
 	function onWindowKeyDown(e: KeyboardEvent) {
 		// The namer's own name field handles its own Enter/Esc; don't compete with it.
 		if (dragPopoverFor) return;
+		// M22 W8 — when the SHARED group-membership editor is open, it owns the keyboard (its
+		// checkboxes take arrows/tab natively; OverflowMenu owns Escape). Don't move the list
+		// selection underneath an open editor.
+		if (groupPopoverFor) return;
 		// ArrowUp/ArrowDown move focus / extend selection. A7: only handle/preventDefault when the
 		// list actually has focus, so arrows still scroll the page when the user is elsewhere.
 		if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && !isTypingTarget(e) && listHasFocus()) {
@@ -644,32 +652,23 @@
 		contactGroupEditing = { ...contactGroupEditing, [hb_id]: false };
 	}
 
-	// M21 W5b: the `+` on the collapsed card face opens a popover anchored to the chip row, so group
-	// membership is reachable without expanding the detail. Same full-set semantics as the expanded
-	// editor — Apply sends the complete checked set to contactUpdateGroups, which diffs it. Cancel
-	// discards. No confirmation step (safe only because the Private audience moved out in W5a).
+	// M21 W5b / M22 W8: the `+` on the collapsed card face opens a popover anchored to the chip row,
+	// so group membership is reachable without expanding the detail. Same full-set semantics as the
+	// expanded editor — Apply sends the complete checked set to contactUpdateGroups, which diffs it.
+	// Cancel discards. No confirmation step (safe only because the Private audience moved out in
+	// W5a). The popover's draft + checkboxes + focus-return live in the SHARED GroupMembershipPopover
+	// component; this page keeps only the open/close state + the full-set write.
 	let groupPopoverFor: string | null = $state(null);
 	let groupPopoverAnchor: HTMLElement | undefined = $state();
-	let groupPopoverDraft: Record<string, Set<string>> = $state({});
 
 	function openGroupPopover(npub: string, anchor: HTMLElement) {
-		// Seed the draft from CURRENT memberships so the pre-check never loses existing memberships
-		// (the same data-loss guard the expanded editor enforces — single-select silently dropped the
-		// rest, see contacts-w5-dataloss).
-		groupPopoverDraft = { ...groupPopoverDraft, [npub]: new Set(contactGroups(npub)) };
+		// The draft is seeded from CURRENT memberships inside the component (so the pre-check never
+		// loses existing memberships — the same data-loss guard the expanded editor enforces).
 		groupPopoverAnchor = anchor;
 		groupPopoverFor = npub;
 	}
 
-	function togglePopoverGroup(npub: string, name: string, checked: boolean) {
-		const next = new Set(groupPopoverDraft[npub] ?? []);
-		if (checked) next.add(name); else next.delete(name);
-		groupPopoverDraft[npub] = next;
-		groupPopoverDraft = { ...groupPopoverDraft };
-	}
-
-	async function applyGroupPopover(npub: string) {
-		const names = [...(groupPopoverDraft[npub] ?? [])];
+	async function applyGroupPopover(npub: string, names: string[]) {
 		groupPopoverFor = null;
 		try {
 			await contactUpdateGroups(npub, names);
@@ -1315,33 +1314,24 @@
 		</div>
 	</OverflowMenu>
 
-	<!-- M21 W5b: group-membership popover anchored to the face chip row. Reuses OverflowMenu's
-	     positioning + Escape/close shell; the contents are the membership editor. Full-set Apply —
-	     the same command the expanded editor uses (no confirmation; safe post-W5a). -->
-	<OverflowMenu open={groupPopoverFor === peer.npub} anchor={groupPopoverAnchor} onclose={() => (groupPopoverFor = null)} minWidth="240px">
-		<div class="gp-title">{name}'s groups</div>
-		<div class="gp-list">
-			{#each groups as g (g.name)}
-				<label class="gp-row">
-					<input
-						type="checkbox"
-						checked={(groupPopoverDraft[peer.npub] ?? new Set()).has(g.name)}
-						onchange={(e) => togglePopoverGroup(peer.npub, g.name, e.currentTarget.checked)}
-					/>
-					{#if g.color}<span class="group-dot" style={`background:${g.color}`}></span>{/if}
-					{g.name}
-				</label>
-			{/each}
-			{#if groups.length === 0}
-				<span class="gp-empty">No groups yet.</span>
-			{/if}
-			<button type="button" class="gp-new" onclick={() => (createGroupOpen = true)}>+ New group…</button>
-		</div>
-		<div class="gp-footer">
-			<button type="button" class="btn-ghost btn-xs" onclick={() => (groupPopoverFor = null)}>Cancel</button>
-			<button type="button" class="btn-primary btn-xs" onclick={() => applyGroupPopover(peer.npub)}>Apply</button>
-		</div>
-	</OverflowMenu>
+	<!-- M21 W5b / M22 W8: group-membership popover anchored to the face chip row. The editor is the
+	     ONE GroupMembershipPopover component (used by Browse too) — OverflowMenu positioning +
+	     Escape, seeded draft, full-set Apply via contactUpdateGroups, "+ New group…", and focus-return
+	     to the invoking row all live there. This page supplies only the anchor + callbacks. -->
+	<GroupMembershipPopover
+		open={groupPopoverFor === peer.npub}
+		anchor={groupPopoverAnchor}
+		contactName={name}
+		groups={groups}
+		memberships={contactGroups(peer.npub)}
+		onapply={(names) => applyGroupPopover(peer.npub, names)}
+		onclose={() => (groupPopoverFor = null)}
+		onnewgroup={() => (createGroupOpen = true)}
+		returnFocusTo={() => {
+			const el = document.getElementById(rowId(ROW_ID_PREFIX, peer.npub));
+			return el?.isConnected ? el : undefined;
+		}}
+	/>
 {/snippet}
 
 <div class="phonebook" bind:this={listContainer}>
@@ -1882,24 +1872,6 @@
 	}
 	.group-check input { margin: 0; cursor: pointer; }
 	.group-edit-empty { font-size: 11px; color: var(--fg-dim); }
-
-	/* M21 W5b — group-membership popover (OverflowMenu shell, membership-editor contents). */
-	.gp-title { font-size: 11px; font-weight: 600; color: var(--fg-muted); padding: 4px 8px 6px; }
-	.gp-list { display: flex; flex-direction: column; gap: 1px; }
-	.gp-row {
-		display: inline-flex; align-items: center; gap: 6px;
-		font-size: 12px; color: var(--fg); cursor: pointer; padding: 4px 8px; border-radius: 5px;
-	}
-	.gp-row:hover { background: var(--bg-elev3); }
-	.gp-row input { margin: 0; cursor: pointer; }
-	.gp-empty { font-size: 11px; color: var(--fg-dim); padding: 4px 8px; }
-	.gp-new {
-		text-align: left; background: transparent; border: none; cursor: pointer;
-		font-family: var(--font-ui); font-size: 11.5px; color: var(--fg-dim);
-		padding: 5px 8px; border-radius: 5px; margin-top: 2px;
-	}
-	.gp-new:hover { background: var(--bg-elev3); color: var(--fg-muted); }
-	.gp-footer { display: flex; justify-content: flex-end; gap: 6px; padding: 6px 8px 2px; border-top: 1px solid var(--divider); margin-top: 4px; }
 
 	/* M15 W1: buttons unified on the app.css .btn system (local copies removed). */
 

@@ -1537,7 +1537,13 @@ describe('M22 W7 — applyKeyToSelection: empty list edge case', () => {
 
 describe('M22 W7 — contacts page keyboard wiring (source-scan)', () => {
 	it('imports applyKeyToSelection from $lib/drag-group.js', () => {
-		expect(contactsSrc()).toMatch(/applyKeyToSelection/);
+		// Slice the import STATEMENT. A whole-page /applyKeyToSelection/ scan is satisfied by the
+		// call site itself (the W4 import-drift defect shape: the page called groupsAssign without
+		// importing it and stayed green for six days). Removing the symbol from the import line must
+		// red this.
+		const s = contactsSrc();
+		const importLine = s.slice(s.indexOf("import { writeDragPayload"), s.indexOf("from '$lib/drag-group.js'"));
+		expect(importLine).toMatch(/applyKeyToSelection/);
 	});
 
 	it('declares a focusedNpub state variable', () => {
@@ -1547,7 +1553,9 @@ describe('M22 W7 — contacts page keyboard wiring (source-scan)', () => {
 	it('the onWindowKeyDown handler routes ArrowUp/ArrowDown to applyKeyToSelection', () => {
 		const s = contactsSrc();
 		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('function onDragStart'));
-		expect(fn).toMatch(/ArrowUp|ArrowDown/);
+		// Assert the BRANCH CONDITION, not just that the symbol appears somewhere. Replacing the
+		// arrow branch with a Home/End branch that still calls applyKeyToSelection must red this.
+		expect(fn).toMatch(/e\.key === 'ArrowUp' \|\| e\.key === 'ArrowDown'/);
 		expect(fn).toMatch(/applyKeyToSelection/);
 	});
 
@@ -1624,8 +1632,10 @@ describe('M22 W7 — contacts page keyboard wiring (source-scan)', () => {
 
 	it('a sr-only aria-live region mirrors the drop affordance (refuse state non-visual)', () => {
 		const s = contactsSrc();
-		expect(s).toMatch(/class="sr-only"/);
-		expect(s).toMatch(/aria-live="polite"/);
+		// Assert the CONTENT, not just the wrapper. Deleting the region's content while keeping an
+		// empty sr-only div must red this (an empty live region mirrors nothing).
+		expect(s).toMatch(/class="sr-only" role="status" aria-live="polite"/);
+		expect(s).toMatch(/\{#if dropOverTarget && dropOutcome\}/);
 	});
 
 	it('prefers-reduced-motion media query exists', () => {
@@ -1635,14 +1645,24 @@ describe('M22 W7 — contacts page keyboard wiring (source-scan)', () => {
 	it('closeDragPopover restores focus to the row that opened the namer', () => {
 		const s = contactsSrc();
 		const fn = s.slice(s.indexOf('function closeDragPopover'), s.indexOf('async function onDragNameKey'));
-		expect(fn).toMatch(/dragPopoverReturnFocus/);
-		expect(fn).toMatch(/\.focus/);
+		// Assert the SPECIFIC restore call, not just that ".focus" appears somewhere. Replacing
+		// `dragPopoverReturnFocus.focus()` with `document.body.focus()` leaves ".focus" present and
+		// must red this.
+		expect(fn).toMatch(/dragPopoverReturnFocus\.focus\(\)/);
+		expect(fn).toMatch(/dragPopoverReturnFocus\?\.isConnected/);
 	});
 
 	it('the G handler saves the active element before opening the namer', () => {
 		const s = contactsSrc();
 		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('function onDragStart'));
-		expect(fn).toMatch(/dragPopoverReturnFocus = document\.activeElement/);
+		// Assert ORDER: the active element MUST be captured BEFORE dragPopoverFor is set, or the
+		// success path cannot restore it. Moving the assignment after `dragPopoverFor = [...]` must
+		// red this (the string alone appearing anywhere would not).
+		const saveIdx = fn.indexOf('dragPopoverReturnFocus = document.activeElement');
+		const openIdx = fn.indexOf('dragPopoverFor = [...selectedNpubs]');
+		expect(saveIdx).toBeGreaterThan(-1);
+		expect(openIdx).toBeGreaterThan(-1);
+		expect(saveIdx).toBeLessThan(openIdx);
 	});
 });
 
@@ -1686,14 +1706,19 @@ describe('M22 W7 acceptance — every drop kind has a keyboard route (table-driv
 	// create → select rows, press G → the namer (dragPopoverFor = [...selected])
 	// add/move/ungrouped → the W5b group popover (contactUpdateGroups with the full desired set)
 	// refused/noop → nothing to route (no write happens).
-	const cases: { kind: string; route: string; desc: string }[] = [
-		{ kind: 'create (W3 pair)',   route: 'G → namer',                 desc: 'select 2 rows, press G → the same namer' },
-		{ kind: 'create (W5 multi)',  route: 'G → namer',                 desc: 'select N rows, press G → the same namer' },
-		{ kind: 'add',                route: 'W5b popover',               desc: 'contactUpdateGroups via the group popover' },
-		{ kind: 'move',               route: 'W5b popover',               desc: 'contactUpdateGroups via the group popover' },
-		{ kind: 'ungrouped',          route: 'W5b popover',               desc: 'contactUpdateGroups([]) via the group popover' },
-		{ kind: 'refused',            route: 'nothing (no write)',        desc: 'no route needed — no write happens' },
-		{ kind: 'noop',               route: 'nothing (no write)',        desc: 'no route needed — no write happens' },
+	// M22 W8 — add/move/ungrouped route through the ONE shared GroupMembershipPopover component
+	// (extracted from the W5b inline popover). On Contacts the route is the `+` click opening the
+	// popover (E is Browse's keyboard route; Contacts' W5b surface is the click). The route column
+	// names the real handler in the page source; the "probe" column is what must RED if the route is
+	// severed (mutation-tested below).
+	const cases: { kind: string; route: string; probe: string }[] = [
+		{ kind: 'create (W3 pair)',   route: 'G → namer',                 probe: 'dragPopoverFor = [...selectedNpubs]' },
+		{ kind: 'create (W5 multi)',  route: 'G → namer',                 probe: 'dragPopoverFor = [...selectedNpubs]' },
+		{ kind: 'add',                route: '+ → group popover',         probe: 'openGroupPopover(peer.npub, e.currentTarget)' },
+		{ kind: 'move',               route: '+ → group popover',         probe: 'openGroupPopover(peer.npub, e.currentTarget)' },
+		{ kind: 'ungrouped',          route: '+ → group popover',         probe: 'openGroupPopover(peer.npub, e.currentTarget)' },
+		{ kind: 'refused',            route: 'nothing (no write)',        probe: '' },
+		{ kind: 'noop',               route: 'nothing (no write)',        probe: '' },
 	];
 
 	// The exhaustive guard: every DropOutcome kind must have a row in the table. The set below is
@@ -1716,7 +1741,16 @@ describe('M22 W7 acceptance — every drop kind has a keyboard route (table-driv
 		return [...union.matchAll(/kind: '([a-z-]+)'/g)].map((m) => m[1]);
 	}
 
-	it('the table covers every DropOutcome kind IN SOURCE (no kind without a keyboard route)', () => {
+	/** The DropOutcomeMulti kinds read from drag-group.ts SOURCE — the W5 multi path is a distinct
+	 *  union and must be covered by the same table (M22 W8 coverage fix). */
+	function dropOutcomeMultiKindsFromSource(): string[] {
+		const src = readFileSync(new URL('../../lib/drag-group.ts', import.meta.url), 'utf8');
+		const start = src.indexOf('export type DropOutcomeMulti =');
+		const union = src.slice(start, src.indexOf('\n\n', start));
+		return [...union.matchAll(/kind: '([a-z-]+)'/g)].map((m) => m[1]);
+	}
+
+	it('the table covers every DropOutcome + DropOutcomeMulti kind IN SOURCE (no kind without a keyboard route)', () => {
 		const kinds = dropOutcomeKindsFromSource();
 		// Sanity: the parse actually found the union (a broken parse must not pass vacuously).
 		expect(kinds).toContain('move');
@@ -1726,18 +1760,29 @@ describe('M22 W7 acceptance — every drop kind has a keyboard route (table-driv
 			// as a prefixed row; every other kind must match a row exactly.
 			expect(ALL_TABLE_KINDS.some((k) => k === outcomeKind || k.startsWith(outcomeKind + ' '))).toBe(true);
 		}
+		// The W5 multi union mirrors the single union (plus npubs on the write kinds). A new multi
+		// kind with no table row must also fail loudly.
+		const multiKinds = dropOutcomeMultiKindsFromSource();
+		expect(multiKinds).toContain('move');
+		for (const outcomeKind of multiKinds) {
+			expect(ALL_TABLE_KINDS.some((k) => k === outcomeKind || k.startsWith(outcomeKind + ' '))).toBe(true);
+		}
 		expect(cases.length).toBeGreaterThanOrEqual(kinds.length);
 	});
 
+	// REAL-ROUTE assertions (M22 W8 coverage fix): each write-kind row must name a route that
+	// actually EXISTS in the page source — not just a non-empty string. Removing the popover wiring
+	// from the page (the mutation the GAP rows used to hide) must red these.
+	const s = contactsSrc();
 	for (const c of cases) {
-		it(`${c.kind} → ${c.route} (${c.desc})`, () => {
-			// Every kind must have a non-empty route. A future eighth kind added to DropOutcome
-			// without a row here fails because this table is the enumerated contract.
-			expect(c.route.length).toBeGreaterThan(0);
-		});
+		if (c.probe) {
+			it(`${c.kind} → ${c.route}: the route exists in the page source (${c.probe})`, () => {
+				expect(s).toContain(c.probe);
+			});
+		}
 	}
 
-	// The structural pin: the W5b popover writes via contactUpdateGroups. If the popover is
+	// The structural pin: the W5b group popover writes via contactUpdateGroups. If the popover is
 	// removed, add/move/ungrouped lose their keyboard route. This guards the complete path.
 	it('the W5b group popover writes via contactUpdateGroups (the complete keyboard path)', () => {
 		const s = contactsSrc();
@@ -1769,9 +1814,14 @@ describe('M22 W7 acceptance — keyboard and drag converge on the same api calls
 		// The G handler must NOT call groupsCreateWithMembers directly — it opens the namer which
 		// eventually calls commitDragCreate. Mutation probe: wiring G to call the api directly reds.
 		const fn = s.slice(s.indexOf('function onWindowKeyDown'), s.indexOf('function onDragStart'));
-		const gBranch = fn.slice(fn.indexOf("e.key === 'g'"));
+		const gStart = fn.indexOf("e.key === 'g'");
+		// A negative-only scan is vacuous: deleting the WHOLE G branch would leave every negative
+		// assertion green. Assert the branch EXISTS and opens the namer first.
+		expect(gStart).toBeGreaterThan(-1);
+		const gBranch = fn.slice(gStart);
 		// Strip comments so a comment naming the api cannot satisfy this.
 		const stripped = gBranch.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+		expect(stripped).toMatch(/dragPopoverFor = \[\.\.\.selectedNpubs\]/);
 		expect(stripped).not.toMatch(/groupsCreateWithMembers/);
 		expect(stripped).not.toMatch(/commitCreateGroupMulti/);
 		expect(stripped).not.toMatch(/commitCreateGroup\b/);

@@ -16,6 +16,8 @@ import { readFileSync } from 'node:fs';
 
 const contactsSrc = () =>
 	readFileSync(new URL('./+page.svelte', import.meta.url), 'utf8');
+const popoverSrc = () =>
+	readFileSync(new URL('../../lib/components/GroupMembershipPopover.svelte', import.meta.url), 'utf8');
 
 describe('contacts M20-W5 — group editor is multi-select (no silent membership drop)', () => {
 	it('does NOT send a single-group array as the full membership set', () => {
@@ -54,18 +56,24 @@ describe('contacts M20-W5 — group editor is multi-select (no silent membership
 		expect(fn).toMatch(/contactUpdateGroups\(hb_id, groupNames\)/);
 	});
 
-	// M21 W5b: the collapsed-card `+` popover is a SECOND route to the same command. It must inherit
-	// the same full-set semantics — single-select via the popover would reintroduce the exact data-loss
-	// this test exists to pin. The popover's apply handler builds the set from its OWN draft
-	// (groupPopoverDraft), seeded from current memberships, and spreads the whole set into the call.
+	// M21 W5b / M22 W8: the collapsed-card `+` popover is a SECOND route to the same command. It must
+	// inherit the same full-set semantics — single-select via the popover would reintroduce the exact
+	// data-loss this test exists to pin. The popover is now the ONE shared GroupMembershipPopover
+	// component: its commit() builds the set from its OWN draft (seeded from current memberships) and
+	// spreads the WHOLE set through onapply; the route's apply handler forwards that set verbatim to
+	// contactUpdateGroups. Neither half may build a single-element array.
 	it('the popover Apply path (applyGroupPopover) also sends the full checked set, not one name', () => {
+		const p = popoverSrc();
+		// The component seeds the draft from the CURRENT memberships prop and spreads the WHOLE set.
+		expect(p).toMatch(/draft = new Set\(memberships\)/);
+		expect(p).toMatch(/onapply\(\[\.\.\.draft\]\)/);
+		// The route feeds the component the current memberships and forwards the set to the command.
 		const s = contactsSrc();
+		expect(s).toMatch(/memberships=\{contactGroups\(peer\.npub\)\}/);
 		const fn = s.slice(s.indexOf('async function applyGroupPopover'), s.indexOf('// M20 W2:'));
-		expect(fn).toMatch(/\[\.\.\.\(groupPopoverDraft\[npub\] \?\? \[\]\)\]/);
 		expect(fn).toMatch(/contactUpdateGroups\(npub, names\)/);
-		// The popover draft is seeded from CURRENT memberships, not empty — so the pre-check cannot
-		// drop existing memberships the way single-select did.
-		const openFn = s.slice(s.indexOf('function openGroupPopover'), s.indexOf('function togglePopoverGroup'));
-		expect(openFn).toMatch(/new Set\(contactGroups\(npub\)\)/);
+		// No single-element-set derivation may survive anywhere in the popover path.
+		expect(fn).not.toMatch(/\[newGroupName\]/);
+		expect(p).not.toMatch(/\[newGroupName\]/);
 	});
 });
