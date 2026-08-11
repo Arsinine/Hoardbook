@@ -1803,7 +1803,7 @@
 	   which means "shown in the right panel"). Soft accent fill + left border, persistent. */
 	.contact-row.peer-selected {
 		background: color-mix(in oklch, var(--accent) 10%, var(--bg-elev1));
-		box-shadow: inset 3px 0 0 var(--accent);
+		box-shadow: inset 0 0 0 2px var(--accent);
 	}
 	.contact-row.drag-source { opacity: 0.35; }
 	.contact-row.drag-target {

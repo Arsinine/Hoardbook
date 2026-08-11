@@ -24,6 +24,9 @@
 	import { petnameFor } from '$lib/identity-display.js';
 	// M21 W4 — fixed word→hue table for the coloured fingerprint (rendering-only; Rust picks the word).
 	import { fingerprintWordColor } from '$lib/fingerprint-colors.js';
+	// M23 W6 — pure overflow predicate for the bio `more ⌄` control (the DOM read lives in the
+	// `bioMeasure` action below; this seam is what the unit test pins).
+	import { bioOverflows } from '$lib/bio-overflow.js';
 	// M17 W5 — presence honesty: "checked {t}" (our cache) vs "Last seen {t}" (their beacon).
 	import { PRESENCE_TICK_MS, checkedLabel, freshIndex, newestSeen, presenceView, type PresenceView } from '$lib/presence-view.js';
 	import { relayWhyHint } from '$lib/relay-health.js';
@@ -810,6 +813,25 @@
 		}
 	}
 
+	// M23 W6 — bio "more ⌄" overflow detection. The clamp is 2 VISUAL lines; whether a string wraps
+	// depends on card width, font and zoom, so this is a MEASUREMENT (scrollHeight > clientHeight on
+	// the clamped `.card-bio`), not a character count. Re-evaluated on resize via ResizeObserver so a
+	// window-width change that un-wraps the bio drops the control. Per CLAUDE.md §7, mutate
+	// bioOverflowMap[npub] directly rather than reassigning a spread object (concurrent updates from
+	// multiple cards would otherwise lose entries).
+	let bioOverflowMap: Record<string, boolean> = $state({});
+	function bioMeasure(row: HTMLElement, npub: string) {
+		const bio = row.querySelector<HTMLElement>('.card-bio');
+		const measure = () => {
+			if (!bio) return;
+			bioOverflowMap[npub] = bioOverflows(bio.scrollHeight, bio.clientHeight);
+		};
+		measure();
+		const ro = new ResizeObserver(measure);
+		if (bio) ro.observe(bio);
+		return { destroy: () => ro.disconnect() };
+	}
+
 	// M21 W4 — the npub came off the card face (behaviour 1); "Copy npub" is its surviving home.
 	async function copyNpub(npub: string) {
 		try {
@@ -1112,9 +1134,9 @@
 				<!-- Row 3: bio, clamped to 2 lines with a `more ⌄` control (behaviour 7: the detail's
 				     duplicate bio paragraph is gone, so this clamp is the only place the bio previews). -->
 				{#if bio}
-					<div class="bio-row" class:bio-expanded={bioOpen || isOpen}>
+					<div class="bio-row" class:bio-expanded={bioOpen || isOpen} use:bioMeasure={peer.npub}>
 						<p class="card-bio">{bio}</p>
-						{#if !bioOpen && !isOpen}
+						{#if !bioOpen && !isOpen && bioOverflowMap[peer.npub]}
 							<button class="bio-more" onclick={() => toggleBio(peer.npub)}>more ⌄</button>
 						{/if}
 					</div>
@@ -1697,7 +1719,7 @@
 
 	.contact-sub-row {
 		display: flex; align-items: center; gap: 5px;
-		margin-top: 2px; font-size: 11px; color: var(--fg-muted);
+		margin-top: 6px; font-size: 11px; color: var(--fg-muted);
 	}
 	.sub-dot { color: var(--fg-dim); }
 	.sub-meta { color: var(--fg-muted); font-feature-settings: 'tnum'; }
@@ -1894,7 +1916,7 @@
 	.contact-card.contact-selected {
 		background: color-mix(in oklch, var(--accent) 10%, var(--bg-elev1));
 		border-color: var(--accent);
-		box-shadow: inset 3px 0 0 var(--accent);
+		box-shadow: inset 0 0 0 2px var(--accent);
 	}
 	.contact-card.drag-source { opacity: 0.35; }
 	.contact-card.drag-target {
