@@ -177,7 +177,30 @@ describe('M21 W4 behaviour 7 — the detail loses ONLY its bio paragraph', () =>
 		// The clamp lifts when EITHER the user clicked `more ⌄` OR the detail is open — so the face
 		// bio shows in full as the detail's replacement, and the two controls never double-reveal.
 		expect(s).toMatch(/class:bio-expanded=\{bioOpen \|\| isOpen\}/);
-		expect(s).toMatch(/\{#if !bioOpen && !isOpen\}/);
+		// The control hides when the detail is open. (M23 W6 also ANDs the measured-overflow map onto
+		// this same {#if}; that condition is pinned in the dedicated W6 test below.)
+		expect(s).toMatch(/\{#if !bioOpen && !isOpen && bioOverflowMap/);
+	});
+
+	// M23 W6 — the `more ⌄` control must only appear when the bio ACTUALLY overflows the 2-line clamp,
+	// not for every bio. This is a real layout measurement (scrollHeight > clientHeight), re-evaluated
+	// on resize — a length heuristic is wrong and was explicitly rejected. The DOM measurement itself
+	// lives in the `bioMeasure` action and cannot be exercised in jsdom (scrollHeight is 0 there); the
+	// pure comparison seam is pinned in lib/bio-overflow.test.ts. Here we guard the WIRING: that the
+	// control's {#if} carries the overflow condition, and that the measurement is real (not a count).
+	it('the `more ⌄` control is gated on a measured overflow, not just a bio existing', () => {
+		const s = contactsSrc();
+		// The control's {#if} must reference the per-npub overflow map — without it a one-line bio
+		// would still render `more ⌄` and expand to the identical text.
+		expect(s).toMatch(/\{#if !bioOpen && !isOpen && bioOverflowMap\[peer\.npub\]\}/);
+		// The measurement reads scrollHeight/clientHeight (real layout), not .length or a char count.
+		expect(s).toMatch(/scrollHeight/);
+		expect(s).toMatch(/clientHeight/);
+		expect(s).not.toMatch(/bio.*\.length\s*[<>]/);
+		// The measurement re-evaluates on resize so a width change that un-wraps the bio drops it.
+		expect(s).toMatch(/ResizeObserver/);
+		// The pure comparison seam is imported (the testable half of the split).
+		expect(s).toMatch(/import \{ bioOverflows \} from '\$lib\/bio-overflow\.js'/);
 	});
 
 	it('the private-collections section STILL lives in the detail (the load-bearing reason chevron survives)', () => {
