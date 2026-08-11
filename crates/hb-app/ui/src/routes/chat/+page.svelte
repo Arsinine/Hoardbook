@@ -432,7 +432,12 @@
 	// builds the manifest, refuses it up front if it exceeds the transport ceiling (naming export in
 	// the error), mints a ticket bound to this one approval, records it, and DMs it. Nothing auto-fires
 	// (M17 ruling #4), and export stays on the card beside it for when the transport can't connect.
-	// Guarded per slug so a double-click cannot mint two approvals for one request.
+	// Guarded per slug so a double-click cannot mint two approvals for one request. The guard
+	// releases in `finally` on BOTH success and failure, so a failed attempt (including a bind
+	// timeout surfaced from the backend) clears the way for a retry — it only blocks CONCURRENT
+	// clicks while one attempt for this slug is in flight. The button is also `disabled` while
+	// `sending` is true, so a double-click lands on a disabled control and never reaches this guard
+	// in practice.
 	let sendingFullList: string | null = $state(null);
 	async function handleSendFullList(slug: string, askNonce?: string) {
 		if (sendingFullList === slug) return;

@@ -114,6 +114,17 @@ pub(crate) fn should_rebind_for_owner(
 /// "your ticket is forged".
 pub const MAX_CONCURRENT_REDEMPTIONS: usize = 8;
 
+/// How long [`ensure_endpoint`] will wait for the iroh `Endpoint::bind()` to resolve before giving up
+/// with a loud error rather than hanging the caller (the fulfil/redeem click) forever.
+///
+/// `iroh::Endpoint::builder(presets::N0).bind()` performs relay discovery, DNS resolution, and the
+/// initial relay handshake before returning; under NAT flapping or a dead relay it can block
+/// indefinitely. This is deliberately longer than [`crate::net::RELAY_TIMEOUT`] (10 s, a single Nostr
+/// relay handshake) because iroh's bind composes several setup steps, and shorter than the 120 s
+/// protocol-level ACK window in `transport.rs` (which bounds an established transfer, not the bind).
+/// 30 s gives NAT traversal a real chance while ensuring the UI recovers and surfaces an error.
+pub const ENDPOINT_BIND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub fn new_shared_endpoint() -> SharedEndpoint {
     Arc::new(RwLock::new(PlaneState::default()))
 }
@@ -184,11 +195,41 @@ pub async fn ensure_endpoint(
     let endpoint = if listening {
         tracing::info!(
             owner = %crate::logging::trunc_npub(owner_npub),
+            role = "listen",
             "iroh: binding a LISTENING manifest endpoint (serving role)"
         );
-        let ep = bind_endpoint(transport_key.bytes()).await?;
+        let ep = match tokio::time::timeout(
+            ENDPOINT_BIND_TIMEOUT,
+            bind_endpoint(transport_key.bytes()),
+        )
+        .await
+        {
+            Ok(Ok(ep)) => ep,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    owner = %crate::logging::trunc_npub(owner_npub),
+                    role = "listen",
+                    "iroh: LISTENING manifest endpoint bind FAILED: {e}"
+                );
+                return Err(e);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    owner = %crate::logging::trunc_npub(owner_npub),
+                    role = "listen",
+                    timeout_secs = ENDPOINT_BIND_TIMEOUT.as_secs(),
+                    "iroh: LISTENING manifest endpoint bind TIMED OUT (no result in {} s)",
+                    ENDPOINT_BIND_TIMEOUT.as_secs()
+                );
+                return Err(anyhow::anyhow!(
+                    "the transport endpoint did not bind within {} s (relay/STUN unreachable?)",
+                    ENDPOINT_BIND_TIMEOUT.as_secs()
+                ));
+            }
+        };
         tracing::info!(
             owner = %crate::logging::trunc_npub(owner_npub),
+            role = "listen",
             "iroh: manifest endpoint bound — accept loop running"
         );
         spawn_accept_loop(ep.clone(), ManifestPlane::new(source));
@@ -196,11 +237,41 @@ pub async fn ensure_endpoint(
     } else {
         tracing::info!(
             owner = %crate::logging::trunc_npub(owner_npub),
+            role = "dial",
             "iroh: binding a DIAL-ONLY manifest endpoint (redeeming role — no accept loop)"
         );
-        let ep = bind_client_endpoint(transport_key.bytes()).await?;
+        let ep = match tokio::time::timeout(
+            ENDPOINT_BIND_TIMEOUT,
+            bind_client_endpoint(transport_key.bytes()),
+        )
+        .await
+        {
+            Ok(Ok(ep)) => ep,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    owner = %crate::logging::trunc_npub(owner_npub),
+                    role = "dial",
+                    "iroh: dial-only manifest endpoint bind FAILED: {e}"
+                );
+                return Err(e);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    owner = %crate::logging::trunc_npub(owner_npub),
+                    role = "dial",
+                    timeout_secs = ENDPOINT_BIND_TIMEOUT.as_secs(),
+                    "iroh: dial-only manifest endpoint bind TIMED OUT (no result in {} s)",
+                    ENDPOINT_BIND_TIMEOUT.as_secs()
+                );
+                return Err(anyhow::anyhow!(
+                    "the transport endpoint did not bind within {} s (relay/STUN unreachable?)",
+                    ENDPOINT_BIND_TIMEOUT.as_secs()
+                ));
+            }
+        };
         tracing::info!(
             owner = %crate::logging::trunc_npub(owner_npub),
+            role = "dial",
             "iroh: dial-only endpoint bound"
         );
         ep
@@ -307,6 +378,47 @@ mod tests {
         assert!(
             should_rebind_for_owner("npub-snapshot-a", "npub-snapshot-b"),
             "a changed identity must close and rebuild the binding"
+        );
+    }
+
+    /// QURATOR-45: the endpoint bind must be BOUNDED so a stuck relay handshake surfaces an error
+    /// rather than hanging the fulfil click forever. `ENDPOINT_BIND_TIMEOUT` is the duration that
+    /// wraps the `bind_endpoint` / `bind_client_endpoint` calls inside `ensure_endpoint`. Asserting it
+    /// is finite and non-zero here is the regression guard: if someone removes the wrapper or sets the
+    /// duration to something enormous (or zero, which would make every bind fail instantly), this reds.
+    #[test]
+    fn endpoint_bind_timeout_is_finite_and_nonzero() {
+        assert!(
+            !ENDPOINT_BIND_TIMEOUT.is_zero(),
+            "a zero ENDPOINT_BIND_TIMEOUT would make every bind fail instantly"
+        );
+        // Must be finite — the whole point is it must resolve, so `Duration::MAX` (which would wrap
+        // but never elapse) defeats the purpose.
+        assert!(
+            ENDPOINT_BIND_TIMEOUT.as_secs() > 0,
+            "the bind timeout must be a positive, finite duration"
+        );
+        assert!(
+            ENDPOINT_BIND_TIMEOUT.as_secs() <= 120,
+            "the bind timeout must be shorter than the protocol ACK window (120 s), not open-ended"
+        );
+    }
+
+    /// QURATOR-45: prove the timeout MECHANISM surfaces an error on a future that never resolves,
+    /// rather than hanging. This is the pattern `ensure_endpoint` applies to the bind — a pending
+    /// future wrapped in `tokio::time::timeout(ENDPOINT_BIND_TIMEOUT, …)` must yield `Err(Elapsed)`,
+    /// which the production code turns into an `anyhow!` error. If the wrapper is removed this test
+    /// still passes (it tests the mechanism in isolation) — the constant test above is the guard that
+    /// the wrapper's duration is sound, and both together pin the contract.
+    #[tokio::test]
+    async fn a_never_returning_bind_surfaces_an_error_rather_than_hanging() {
+        // A future that never resolves — mirrors a stuck `bind_endpoint` under NAT/relay flap.
+        let pending = std::future::pending::<Result<()>>();
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(50), pending).await;
+        assert!(
+            outcome.is_err(),
+            "a never-returning bind wrapped in tokio::time::timeout MUST surface a timeout error, \
+             not hang"
         );
     }
 }

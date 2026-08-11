@@ -151,4 +151,40 @@ describe('Chat page — M17 W7.1b manifest-request fulfilment card wiring', () =
 		const block = src.slice(exportOpen, afterExport === -1 ? src.length : afterExport);
 		expect(block).toMatch(/exportingSlug === slug/);
 	});
+
+	// QURATOR-45: the "Send the full list" click guard must not permanently swallow retries after a
+	// failed or hung first attempt. The guard blocks CONCURRENT double-clicks (so two approvals are
+	// never minted for one request), but the `finally` block MUST clear `sendingFullList` on BOTH
+	// success and failure — otherwise a bind that hangs or fails leaves the button permanently
+	// disabled and every subsequent click silently discarded. Source-scan guards (route-page idiom):
+	//   1. The guard sets sendingFullList = slug (blocking concurrent clicks).
+	//   2. The finally block resets sendingFullList = null (releasing the guard for retries).
+	//   3. The catch block surfaces the error (so a failed send is visible, not silent).
+	it('the send-full-list guard releases on failure so retries are not permanently swallowed', () => {
+		const src = chatSrc();
+		const sendOpen = src.indexOf('async function handleSendFullList');
+		expect(sendOpen).toBeGreaterThan(-1);
+		const afterSend = src.indexOf('\tasync function', sendOpen + 1);
+		const block = src.slice(sendOpen, afterSend === -1 ? src.length : afterSend);
+		// Guard blocks concurrent clicks (prevents double-approval).
+		expect(block).toMatch(/sendingFullList === slug/);
+		expect(block).toMatch(/sendingFullList = slug/);
+		// The finally block MUST clear the guard — without this, a hung/failed first attempt
+		// permanently swallows every subsequent click (the QURATOR-45 defect).
+		expect(block).toMatch(/finally\s*\{[\s\S]*sendingFullList = null/);
+		// The catch block surfaces the error as a toast (not silent) — a hung bind that returns an
+		// Err now reaches this catch and is visible.
+		expect(block).toMatch(/catch\s*\(e\)\s*\{[\s\S]*toast\(String\(e\),\s*['"]error['"]\)/);
+	});
+
+	it('the send-full-list handler has a catch AND finally (both are required for recovery)', () => {
+		// If the catch or finally were removed, a failed send would either swallow the error
+		// (no catch) or leave the guard stuck (no finally). Both must be present.
+		const src = chatSrc();
+		const sendOpen = src.indexOf('async function handleSendFullList');
+		const afterSend = src.indexOf('\tasync function', sendOpen + 1);
+		const block = src.slice(sendOpen, afterSend === -1 ? src.length : afterSend);
+		expect(block).toMatch(/catch\s*\(e\)/);
+		expect(block).toMatch(/finally\s*\{/);
+	});
 });
