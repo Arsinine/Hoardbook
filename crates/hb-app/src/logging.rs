@@ -98,6 +98,20 @@ pub(crate) fn os_arch() -> (&'static str, &'static str) {
 /// exposed so the copy-diagnostics command can locate the newest file without re-deriving the name.
 pub(crate) const LOG_PREFIX: &str = "hb-app.log";
 
+/// Build the fmt layer shared between production [`install`] and the test subscriber, so the
+/// ANSI-OFF decision lives in exactly ONE place. `fmt::layer()` defaults ANSI ON, emitting
+/// `ESC[2m`/`ESC[33m`/… on every line — the log file the user pastes into a support thread must
+/// be plain text (QURATOR-73 Part A). A test that built its own `fmt::layer()` could pass while
+/// production shipped escapes; routing both paths through here is what makes the
+/// `log_emission_contains_no_ansi_escape` test honest rather than vacuous.
+fn fmt_layer<S, W>(make_writer: W) -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + 'static,
+{
+    fmt::layer().with_writer(make_writer).with_ansi(false)
+}
+
 /// Install the file-based subscriber writing under `<app_data_dir>/logs/`. Never panics — a
 /// failure returns silently (stderr gets a best-effort line) so the app starts regardless.
 pub(crate) fn install(data_dir: &Path) {
@@ -136,7 +150,7 @@ pub(crate) fn install(data_dir: &Path) {
 
         let subscriber = tracing_subscriber::registry()
             .with(filter)
-            .with(fmt::layer().with_writer(non_blocking));
+            .with(fmt_layer(non_blocking));
         // try_init, not init: init() panics if a global subscriber is already set (e.g. a second
         // install() call, or a test harness that set one), which would violate the never-fail
         // contract above.
@@ -253,7 +267,7 @@ mod tests {
         let shared = std::sync::Arc::new(std::sync::Mutex::new(file));
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::EnvFilter::new("trace"))
-            .with(tracing_subscriber::fmt::layer().with_writer(FileMaker(shared.clone())));
+            .with(fmt_layer(FileMaker(shared.clone())));
         // set_default: per-thread dispatcher. Returns a guard whose drop resets the dispatcher.
         // Takes the subscriber BY VALUE (it converts into a Dispatch internally); passing a
         // reference to the Layered stack does not compile.
@@ -415,6 +429,94 @@ mod tests {
             !output_contains_no_secret(&emitted),
             "RED HALF: the guard MUST catch a deliberately-logged nsec/browse_key; if this passes \
              the guard is vacuous and the GREEN half proves nothing"
+        );
+    }
+
+    /// QURATOR-73 Part A — the log file the user pastes into a support thread must be plain text,
+    /// not ANSI-escape-laden. The `fmt::layer()` default is ANSI ON, so every line ships with
+    /// `ESC[2m`/`ESC[33m`/… sequences. The fix is `.with_ansi(false)` in [`fmt_layer`], which is
+    /// the ONE shared layer-construction site for both production `install` and this test's
+    /// subscriber — a test that built its own `fmt::layer()` would be vacuous (it could pass while
+    /// production stayed broken), which is the exact failure mode this repo has shipped several
+    /// times. Driving the shared `fmt_layer` here is what makes this test honest.
+    ///
+    /// RED-GREEN: GREEN half — a real event through a real subscriber (the same
+    /// `install_test_subscriber` the INV-2 control uses) into a real file, read back as BYTES, and
+    /// asserted to contain no `0x1b` (ESC). RED half (`_reddens_when_ansi_is_enabled`) — force the
+    /// layer ANSI-on and confirm the assertion reddens, proving it is not vacuous.
+    #[tokio::test]
+    async fn log_emission_contains_no_ansi_escape() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("hb-ansi.log");
+        {
+            let (_guard, file_handle) = install_test_subscriber(&log_path);
+            // Emit a real WARN line through the shared fmt_layer (ANSI OFF by the fix).
+            tracing::warn!("qurator-73-probe: an event whose formatting would carry SGR codes under default ANSI");
+            let _ = file_handle.lock().map(|mut f| f.flush());
+        }
+        let emitted = std::fs::read(&log_path).unwrap_or_default();
+        assert!(
+            !emitted.is_empty(),
+            "the test subscriber must have produced a log; an empty log means no event was written"
+        );
+        assert!(
+            !emitted.contains(&0x1b),
+            "ANSI ESC (0x1b) byte found in the produced log — the log file ships colour escapes. \
+             First 200 bytes:\n{:?}",
+            std::str::from_utf8(&emitted[..200.min(emitted.len())]).unwrap_or("<non-utf8>")
+        );
+    }
+
+    /// RED-GREEN, RED half for [`log_emission_contains_no_ansi_escape`]: force the layer ANSI ON
+    /// and confirm the GREEN-half assertion reddens. Without this the GREEN half could be passing
+    /// for any reason (e.g. the writer swallowed the bytes); proving the assertion catches an
+    /// ANSI-on layer is the only evidence the control is real. Reuses `install_test_subscriber`'s
+    /// `FileMaker` (inlined here so the ANSI-on layer can swap in WITHOUT touching the shared
+    /// `fmt_layer` — the shared site stays the production source of truth).
+    #[tokio::test]
+    async fn log_emission_reddens_when_ansi_is_enabled() {
+        use std::io::Write as _;
+        use tracing_subscriber::fmt::MakeWriter;
+        // Inline a minimal ANSI-ON writer mirroring install_test_subscriber's FileMaker, so the
+        // RED half deliberately bypasses the shared fmt_layer (which is ANSI-OFF) — otherwise the
+        // red probe would be testing the fix instead of breaking it.
+        struct RedFileMaker(std::sync::Arc<std::sync::Mutex<std::fs::File>>);
+        impl<'a> MakeWriter<'a> for RedFileMaker {
+            type Writer = RedFileWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                RedFileWriter(self.0.clone())
+            }
+        }
+        struct RedFileWriter(std::sync::Arc<std::sync::Mutex<std::fs::File>>);
+        impl std::io::Write for RedFileWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().map_err(|_| std::io::Error::other("poisoned"))?.write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0.lock().map_err(|_| std::io::Error::other("poisoned"))?.flush()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("hb-ansi-red.log");
+        let file = std::fs::File::create(&log_path).expect("create red-half log file");
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(file));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("trace"))
+            // ANSI deliberately ON — simulates the pre-fix production default.
+            .with(tracing_subscriber::fmt::layer().with_writer(RedFileMaker(shared.clone())));
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            tracing::warn!("qurator-73-red-probe: must carry ESC[33m under ANSI-on");
+            let _ = shared.lock().map(|mut f| f.flush());
+        }
+        let emitted = std::fs::read(&log_path).unwrap_or_default();
+        assert!(!emitted.is_empty(), "the red-half subscriber must have produced a log");
+        assert!(
+            emitted.contains(&0x1b),
+            "RED HALF: an ANSI-on layer MUST emit ESC (0x1b) bytes; if it does not, the GREEN \
+             half's assertion is vacuous (proves nothing). This probe must REDDEN the GREEN \
+             assertion — if you see this message, the GREEN test is no longer a real control."
         );
     }
 
