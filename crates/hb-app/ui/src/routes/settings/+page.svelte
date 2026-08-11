@@ -13,6 +13,7 @@
 	import { identity, profile, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
+	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
 
 	let generating = $state(false);
 	let copied = $state(false);
@@ -583,7 +584,7 @@
 
 	<!-- Relays -->
 	<div class="section-row">
-		<div class="section-label">Relays</div>
+		<div class="section-label">Relays<FeatureTooltip key="custom-relays" /></div>
 	</div>
 
 	<div class="surface surface-nop">

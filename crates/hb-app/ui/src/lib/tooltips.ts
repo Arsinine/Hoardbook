@@ -1,6 +1,6 @@
 // Feature tooltips (hover-to-learn) content registry (M8, HOARDBOOK_SPEC §8). Pure, typed copy so
 // the registry is unit-tested and the <FeatureTooltip> component stays thin. These are EXPLANATORY
-// ONLY — a tooltip never gates an action (spec). Five anchors, no more: a drift guard test pins the
+// ONLY — a tooltip never gates an action (spec). Six anchors, no more: a drift guard test pins the
 // count so nobody silently sprinkles feature-help app-wide. Distinct from per-item *notes*, which
 // are content, not feature help.
 
@@ -9,7 +9,8 @@ export type TooltipKey =
 	| 'willing-to'
 	| 'listings-locked'
 	| 'k-of-n-folders'
-	| 'fingerprint';
+	| 'fingerprint'
+	| 'custom-relays';
 
 /** The canonical key list — single source of truth for iteration + the registry-completeness test. */
 export const TOOLTIP_KEYS: TooltipKey[] = [
@@ -18,6 +19,7 @@ export const TOOLTIP_KEYS: TooltipKey[] = [
 	'listings-locked',
 	'k-of-n-folders',
 	'fingerprint',
+	'custom-relays',
 ];
 
 export interface TooltipContent {
@@ -48,5 +50,11 @@ export const TOOLTIPS: Record<TooltipKey, TooltipContent> = {
 	'fingerprint': {
 		title: 'Identity fingerprint',
 		body: 'A word-and-color fingerprint of this person’s key — your impersonation defense. It is bound to the npub, not the display name, so a copycat reusing the same name shows a different fingerprint.',
+	},
+	// M23 W4 (QURATOR-75): corrects the "more relays = more reach" misconception. A relay nobody
+	// else dials is a private room, not a megaphone — the defaults are where strangers see you.
+	'custom-relays': {
+		title: 'Custom relays',
+		body: 'Add a relay to build a private community — you and the people you tell will meet there. It does not make you easier to find: nobody else is connected to your relay by default, so adding more does not widen your reach. The defaults are where strangers will see you.',
 	},
 };
