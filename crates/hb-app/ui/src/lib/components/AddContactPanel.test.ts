@@ -48,7 +48,12 @@ async function discoverHits(hits: PeerSearchHit[], props: Record<string, unknown
 		props: { open: true, ...props },
 	});
 	await fireEvent.click(getByRole('button', { name: /discover hoarders/i }));
-	await fireEvent.input(getByPlaceholderText(/tags/i), { target: { value: 'anime' } });
+	// QURATOR-44 broadened this placeholder from "tags (e.g. …)" to "name, bio, or tag (e.g. …)",
+	// so the old /tags/i locator (plural) no longer matched and every test driving this flow failed
+	// on the lookup rather than on its own assertion. Matched on the singular stem, which holds
+	// across both wordings. The placeholder's exact copy is pinned in discover-view.test.ts — this
+	// is only a locator, so it deliberately does NOT re-assert the copy here.
+	await fireEvent.input(getByPlaceholderText(/tag/i), { target: { value: 'anime' } });
 	await fireEvent.click(getByRole('button', { name: /^search$/i }));
 	// Wait for the hit-card's Add-contact button (class hit-follow) to appear — that means searchPeers
 	// resolved and the results rendered.
@@ -80,20 +85,25 @@ describe('AddContactPanel — M17 W1 discovery Message action', () => {
 });
 
 describe('AddContactPanel — M20 W3 truncation affordance', () => {
-	it('shows "showing first N" when the result is capped', async () => {
-		// One hit returned, but the backend flagged more candidates existed (capped=true). The UI
-		// must surface the truncation rather than silently presenting the slice as everyone. (Hit
-		// count is independent of the cap flag — one hit + capped=true still means "there are more".)
+	// QURATOR-44 replaced the "showing first N" wording with pagination plus a cap notice, because
+	// "showing first N" was the never-ending-list symptom the owner asked to remove. The AFFORDANCE
+	// must survive that copy change: a capped result still has to tell the user more matches exist
+	// rather than presenting the slice as everyone. These two tests were re-pointed at the new
+	// wording, NOT deleted — and note the negative case had silently become vacuous, since the old
+	// /showing first/ string is absent whether or not the result is capped.
+	it('tells the user more matches exist when the result is capped', async () => {
+		// One hit returned, but the backend flagged more candidates existed (capped=true). Hit count
+		// is independent of the cap flag — one hit + capped=true still means "there are more".
 		const { findByText } = await discoverHits([makeHit()], {}, true);
-		const affordance = await findByText(/showing first 1/i);
+		const affordance = await findByText(/more matches exist/i);
 		expect(affordance).toBeTruthy();
 		expect(affordance.getAttribute('role')).toBe('status');
 	});
 
-	it('hides the affordance when the result is not capped', async () => {
-		// capped=false → no affordance. The same hit must NOT show "showing first".
+	it('shows no cap notice when the result is not capped', async () => {
+		// capped=false → no notice. Mutation probe: rendering the notice unconditionally reds this.
 		const { queryByText } = await discoverHits([makeHit()], {}, false);
-		expect(queryByText(/showing first/i)).toBeNull();
+		expect(queryByText(/more matches exist/i)).toBeNull();
 	});
 });
 

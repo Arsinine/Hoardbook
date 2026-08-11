@@ -32,3 +32,18 @@ export function canSearch(tags: string[], contentTypes: string[]): boolean {
 export function toggleContentType(selected: string[], value: string): string[] {
 	return selected.includes(value) ? selected.filter((v) => v !== value) : [...selected, value];
 }
+
+/** QURATOR-44: page size for Discover result pagination (replaces the old "showing first N"). */
+export const DISCOVER_PAGE_SIZE = 10;
+
+/** QURATOR-44: slice a ranked result set into pages of DISCOVER_PAGE_SIZE. Pure so the pagination
+ *  math is unit-tested without a DOM. Page numbers are 1-based. */
+export function pageItems<T>(items: T[], page: number): T[] {
+	const start = (Math.max(1, page) - 1) * DISCOVER_PAGE_SIZE;
+	return items.slice(start, start + DISCOVER_PAGE_SIZE);
+}
+
+/** The total page count for a result set (at least 1 so the control never shows "page 1 of 0"). */
+export function pageCount(total: number): number {
+	return Math.max(1, Math.ceil(total / DISCOVER_PAGE_SIZE));
+}
