@@ -137,7 +137,12 @@ pub fn rank_hits(hits: Vec<SearchHit>, query: &str, seed: u64) -> Vec<SearchHit>
         // Type-toggle browse: deterministic shuffle so pagination is coherent across pages.
         shuffle_stable(hits, seed)
     } else {
-        let qtri = trigrams(query);
+        let qlower = query.to_lowercase();
+        // A query of 1-2 CHARS cannot produce a trigram a normal haystack also produces, so it would
+        // score 0 for everyone ("tv", "cd", and every single-glyph CJK/emoji query). Those fall back
+        // to substring counting, which is what a user typing two characters actually expects.
+        let q_short = qlower.chars().count() < 3;
+        let qtri = if q_short { std::collections::HashMap::new() } else { trigram_counts(&qlower) };
         let mut scored: Vec<(i64, SearchHit)> = hits
             .into_iter()
             .map(|h| {
@@ -148,7 +153,11 @@ pub fn rank_hits(hits: Vec<SearchHit>, query: &str, seed: u64) -> Vec<SearchHit>
                     + &h.teaser.tags.join(" ").to_lowercase()
                     + " "
                     + &h.teaser.content_types.join(" ").to_lowercase();
-                let score = overlap_score(&qtri, &trigrams(&hay));
+                let score = if q_short {
+                    substring_count(&hay, &qlower)
+                } else {
+                    overlap_score(&qtri, &trigram_counts(&hay))
+                };
                 (score, h)
             })
             .collect();
@@ -159,33 +168,64 @@ pub fn rank_hits(hits: Vec<SearchHit>, query: &str, seed: u64) -> Vec<SearchHit>
     }
 }
 
-/// Lowercase trigram set for `s` (substrings of length 3). Strings shorter than 3 chars contribute
-/// themselves as a single token so short queries still match. Empty input → empty set.
-fn trigrams(s: &str) -> Vec<String> {
-    let s = s.trim().to_lowercase();
-    if s.len() < 3 {
-        return if s.is_empty() { vec![] } else { vec![s] };
+/// Trigram → occurrence-count map for `s`, keyed on a `(char, char, char)` tuple so nothing is
+/// allocated per trigram. The previous version built a `String` per trigram and compared them
+/// pairwise: a 3,000-char bio produced ~3,000 allocations per hit, and scoring was quadratic in
+/// (query trigrams x haystack trigrams). Teasers arrive from public relays, so that was
+/// attacker-influenced work. Counting into a map makes scoring linear.
+///
+/// Inputs shorter than 3 CHARS yield an EMPTY map — deliberately. They are handled by
+/// [`substring_count`] instead; emitting a pseudo-token here is what made short queries score 0
+/// against every haystack. Note the old guard tested `s.len()` (BYTES), so a single 3-byte CJK glyph
+/// slipped past it into the window loop and produced no tokens at all.
+fn trigram_counts(s: &str) -> std::collections::HashMap<(char, char, char), u32> {
+    let lower = s.trim().to_lowercase();
+    let chars: Vec<char> = lower.chars().collect();
+    let mut out = std::collections::HashMap::new();
+    if chars.len() < 3 {
+        return out;
     }
-    let chars: Vec<char> = s.chars().collect();
-    let mut out: Vec<String> = Vec::with_capacity(chars.len().saturating_sub(2));
-    let mut i = 0;
-    while i + 3 <= chars.len() {
-        out.push(chars[i..i + 3].iter().collect());
-        i += 1;
+    for w in chars.windows(3) {
+        *out.entry((w[0], w[1], w[2])).or_insert(0u32) += 1;
     }
     out
+}
+
+/// Count occurrences of `needle` in `hay` (both already lowercased), allowing overlaps. Used for
+/// queries of 1-2 chars, which cannot form a trigram. Advances by one CHAR per match so it can
+/// never split a multi-byte codepoint.
+fn substring_count(hay: &str, needle: &str) -> i64 {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut n: i64 = 0;
+    let mut start = 0usize;
+    while start < hay.len() {
+        match hay[start..].find(needle) {
+            Some(pos) => {
+                n += 1;
+                let abs = start + pos;
+                let step = hay[abs..].chars().next().map(char::len_utf8).unwrap_or(1);
+                start = abs + step;
+            }
+            None => break,
+        }
+    }
+    n
 }
 
 /// Overlap score: the total count of query-trigram occurrences in the haystack (with multiplicity).
 /// A teaser that mentions the keyword in BOTH its bio AND its tags outscores one that carries it
 /// only as a tag, because the trigram appears more times. Catches partial-word and typo matches
 /// (the fuzzy requirement) without an embedding model.
-fn overlap_score(query: &[String], hay: &[String]) -> i64 {
-    let mut score: i64 = 0;
-    for qt in query {
-        score += hay.iter().filter(|ht| ht == &qt).count() as i64;
-    }
-    score
+fn overlap_score(
+    query: &std::collections::HashMap<(char, char, char), u32>,
+    hay: &std::collections::HashMap<(char, char, char), u32>,
+) -> i64 {
+    query
+        .iter()
+        .map(|(k, qn)| i64::from(*hay.get(k).unwrap_or(&0)) * i64::from(*qn))
+        .sum()
 }
 
 /// A deterministic shuffle keyed on `seed`. Uses a simple xorshift PRNG (no new dependency) so the
@@ -195,11 +235,19 @@ fn shuffle_stable(mut hits: Vec<SearchHit>, seed: u64) -> Vec<SearchHit> {
     let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15); // splitmix64 offset — nonzero for seed 0
     let n = hits.len();
     for i in (1..n).rev() {
-        // xorshift64
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        let j = (state % (i as u64 + 1)) as usize;
+        // Unbiased index in 0..=i. Plain `state % (i+1)` over-weights the low indices whenever
+        // (i+1) is not a power of two, so draws are rejected above the largest exact multiple.
+        let bound = i as u64 + 1;
+        let zone = u64::MAX - (u64::MAX % bound);
+        let j = loop {
+            // xorshift64
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            if state < zone {
+                break (state % bound) as usize;
+            }
+        };
         hits.swap(i, j);
     }
     hits
@@ -210,14 +258,21 @@ fn shuffle_stable(mut hits: Vec<SearchHit>, seed: u64) -> Vec<SearchHit> {
 /// coherent (the same query re-derives the same seed and reproduces the same order).
 fn hash_seed(tags: &[String], content_types: &[String]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for t in tags {
+    // Terms are sorted before hashing: ["video","audio"] and ["audio","video"] are the same query,
+    // so they must seed the same shuffle. Hashing in argument order made page order depend on the
+    // order the user happened to click the toggles in.
+    let mut t_sorted: Vec<&str> = tags.iter().map(String::as_str).collect();
+    t_sorted.sort_unstable();
+    let mut c_sorted: Vec<&str> = content_types.iter().map(String::as_str).collect();
+    c_sorted.sort_unstable();
+    for t in &t_sorted {
         for b in t.as_bytes() {
             h ^= *b as u64;
             h = h.wrapping_mul(0x100_0000_01b3);
         }
     }
     h ^= 0x2f; // '/' separator between the two axes
-    for c in content_types {
+    for c in &c_sorted {
         for b in c.as_bytes() {
             h ^= *b as u64;
             h = h.wrapping_mul(0x100_0000_01b3);
@@ -613,5 +668,68 @@ mod tests {
         let ranked = rank_hits(hits, "anime collector", 0);
         assert_eq!(ranked[0].teaser.display_name, "a-first", "fuzzy overlap beats recency");
         assert_eq!(ranked[1].teaser.display_name, "z-last");
+    }
+
+    /// Builder for the short-query regressions: a hit whose BIO carries `bio`, nothing else notable.
+    fn hit_with_bio(name: &str, bio: &str, ts: u64) -> SearchHit {
+        SearchHit {
+            npub: format!("npub1{name}"),
+            teaser: Teaser {
+                display_name: name.into(),
+                bio: bio.into(),
+                tags: vec![],
+                content_types: vec![],
+                picture: None,
+            },
+            created_at: Timestamp::from(ts),
+        }
+    }
+
+    /// A 1-2 CHARACTER query must still rank. It cannot form a trigram, so the old implementation
+    /// emitted the whole query as a single pseudo-token which no >=3-char haystack could ever
+    /// produce — every hit scored 0 and recency silently decided the order. Codex review 2026-08-11.
+    /// Mutation probe: route short queries back through trigram scoring and this reds.
+    #[test]
+    fn short_ascii_query_still_ranks_a_real_match_above_an_irrelevant_one() {
+        let hits = vec![
+            // Newest, but irrelevant — it would win on recency alone.
+            hit_with_bio("newer-irrelevant", "collects porcelain", 9_000),
+            hit_with_bio("older-match", "tv broadcasts and tv rips", 1_000),
+        ];
+        let ranked = rank_hits(hits, "tv", 0);
+        assert_eq!(
+            ranked[0].teaser.display_name, "older-match",
+            "a 2-char query must match on substance, not fall through to recency"
+        );
+    }
+
+    /// The old short-input guard tested `s.len()` — BYTES. A single CJK glyph is 3 bytes, so it slipped
+    /// past the guard into the char-window loop, which needs >=3 CHARS and therefore emitted NOTHING:
+    /// the query scored 0 against every haystack. Codex review 2026-08-11.
+    #[test]
+    fn single_multibyte_glyph_query_still_ranks() {
+        for q in ["\u{732b}", "\u{1f600}"] {
+            let hits = vec![
+                hit_with_bio("newer-irrelevant", "unrelated text", 9_000),
+                hit_with_bio("older-match", &format!("i collect {q} things"), 1_000),
+            ];
+            let ranked = rank_hits(hits, q, 0);
+            assert_eq!(
+                ranked[0].teaser.display_name, "older-match",
+                "a single-glyph query ({q}) must match, not score zero everywhere"
+            );
+        }
+    }
+
+    /// The type-toggle shuffle seed must depend on WHICH terms were chosen, not the order they were
+    /// clicked in: ["video","audio"] and ["audio","video"] are the same query and must paginate
+    /// identically. Codex review 2026-08-11. Mutation probe: hash the terms unsorted and this reds.
+    #[test]
+    fn shuffle_seed_ignores_term_order() {
+        let a = hash_seed(&["b".into(), "a".into()], &["video".into(), "audio".into()]);
+        let b = hash_seed(&["a".into(), "b".into()], &["audio".into(), "video".into()]);
+        assert_eq!(a, b, "same terms in a different order must seed the same shuffle");
+        let different = hash_seed(&["a".into()], &["audio".into()]);
+        assert_ne!(a, different, "a genuinely different query must seed differently");
     }
 }

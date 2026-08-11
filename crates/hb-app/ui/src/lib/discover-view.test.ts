@@ -77,20 +77,29 @@ describe('discover-view — QURATOR-44 pagination (page size 10)', () => {
 });
 
 // QURATOR-44: pin the broadened search-box copy so reverting to tags-only wording reds this test.
-// The old placeholder was "tags (e.g. anime, vhs)" which implied tags-only search; the ruling
-// broadened it to name/bio/tags/types. Svelte source-scan (the route page cannot be mounted).
+// The copy must claim only what the FILTER does. It was briefly broadened to name/bio/tags/types,
+// but teaser_matches filters on exact TAGS only — see the test body. Svelte source-scan (the route
+// page cannot be mounted).
 describe('discover-view — QURATOR-44 search-box copy', () => {
 	const here = path.dirname(fileURLToPath(import.meta.url));
 	const panelPath = path.resolve(here, 'components', 'AddContactPanel.svelte');
 
-	it('AddContactPanel placeholder reads broadly (name/bio/tag), not tags-only', () => {
-		const src = fs.readFileSync(panelPath, 'utf-8');
-		expect(src).toContain('name, bio, or tag');
-		expect(src).not.toContain('placeholder="tags (e.g. anime, vhs)"');
-	});
-
-	it('AddContactPanel subtitle mentions name/bio/tags/content type', () => {
-		const src = fs.readFileSync(panelPath, 'utf-8');
-		expect(src).toContain('name, bio, tags, or content type');
+	it('the Discover copy claims only what the FILTER actually does (tags + content types)', () => {
+		const src = fs.readFileSync(panelPath, 'utf8');
+		// QURATOR-44 briefly broadened this copy to "name, bio, or tag". A Codex review caught that the
+		// FILTER never widened: teaser_matches requires every typed term to be an exact TAG
+		// (discover.rs `tags.iter().all(|q| teaser.tags.contains(q))`), so a peer whose bio mentions the
+		// word but who carries no such tag is discarded BEFORE rank_hits ever runs. rank_hits does score
+		// name/bio — but only to ORDER an already tag-filtered set. Promising bio search while filtering
+		// on tags reads to a user as the app being broken, so the copy was reverted to the truth.
+		//
+		// Widening the filter is its own workstream: teaser_matches is public API, hb-it's DISC1 keeps an
+		// independent oracle of the AND-tag/OR-content-type rule, and WAN-D relies on it discarding a
+		// teaser for a missing tag. Changing it needs both live suites re-run.
+		expect(src).toContain('by tag &amp; content type');
+		expect(src).toContain('placeholder="tags (e.g. anime, vhs)"');
+		// And it must NOT claim the unimplemented axes.
+		expect(src).not.toContain('name, bio, or tag');
+		expect(src).not.toContain('name, bio, tags, or content type');
 	});
 });

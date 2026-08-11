@@ -228,7 +228,7 @@
 					</button>
 					{#if discoverOpen}
 						<div class="discover-body">
-							<div class="discover-sub">Search public profiles by name, bio, tags, or content type. Only what people chose to announce is searchable — everyone's listings stay encrypted.</div>
+							<div class="discover-sub">Search public profiles by tag &amp; content type. Only what people chose to announce is searchable — everyone's listings stay encrypted.</div>
 							<div class="ct-row">
 								{#each DISCOVER_CONTENT_TYPES as ct (ct.value)}
 									<button type="button" class="ct-chip" class:ct-on={discoverTypes.includes(ct.value)}
@@ -236,7 +236,7 @@
 								{/each}
 							</div>
 							<form class="disc-tag-row" onsubmit={(e) => { e.preventDefault(); runDiscover(); }}>
-								<input class="hb-input disc-tag-input" placeholder="name, bio, or tag (e.g. anime, vhs)" bind:value={discoverTags} />
+								<input class="hb-input disc-tag-input" placeholder="tags (e.g. anime, vhs)" bind:value={discoverTags} />
 								<button class="btn-primary btn-sm" type="submit" disabled={!canDiscover || discovering}>
 									{discovering ? 'Searching…' : 'Search'}
 								</button>
@@ -295,7 +295,7 @@
 									</div>
 								{/if}
 							{:else}
-								<div class="discover-empty">Pick a content type or enter a keyword, then Search.</div>
+								<div class="discover-empty">Pick a content type or enter a tag, then Search.</div>
 							{/if}
 						</div>
 					{/if}
