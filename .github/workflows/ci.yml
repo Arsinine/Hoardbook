@@ -269,7 +269,7 @@ jobs:
           # negative lookahead, and a two-stage "re-include" filter is unreadable in a run: body.
           # NOTE: these comments must never contain a literal dollar-double-brace — GitHub interpolates
           # `run:` bodies (comments included) at startup, so a literal one fails the whole workflow.
-          if out=$(grep -rnE '\$\{\{[^}]*github\.(ref_name|head_ref|event\.[^}]*(title|body))' .github/workflows 2>/dev/null \
+          if out=$(grep -rHnE '\$\{\{[^}]*github\.(ref_name|head_ref|event\.[^}]*(title|body))' .github/workflows 2>/dev/null \
                    | grep -vP '^[^:]+:[0-9]+:[[:space:]]*(?!(?:run|script):)[A-Za-z_][A-Za-z0-9_.-]*:[[:space:]]*\$\{\{'); then
             echo "::error::CWE-94 regression — an attacker-controllable context is interpolated inline in a workflow:"
             echo "$out"
@@ -290,12 +290,20 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+          # -H is LOAD-BEARING. The exemption regex below anchors on a `file:line:` prefix, but
+          # `grep -rn` on a SINGLE EXPLICIT FILE omits the filename under GNU grep (it prefixes only
+          # for a directory or multiple files). The production sweep above scans a DIRECTORY so it
+          # always got the prefix; this self-test names one file, so on CI the stream was `line:...`,
+          # the exemption never matched, and every safe env: key became a false positive. It passed
+          # locally because the dev box's `grep` is ugrep, which DOES prefix a single file — the
+          # environment masked it until CI ran. -H makes both greps behave identically everywhere.
+          #
           # This step runs the SAME grep pipeline as the guard above against a positive fixture
           # and asserts it REDS, proving the guard is not vacuous. The regex uses the backslash-
           # escaped form below; that form does NOT contain the literal dollar-double-brace (the
           # backslashes break the sequence apart), so it is safe to write in a run: body — the
           # guard step above uses the identical escaped form, and has since before this change.
-          hits=$(grep -rnE '\$\{\{[^}]*github\.(ref_name|head_ref|event\.[^}]*(title|body))' ci-fixtures/injection-positive.yml 2>/dev/null \
+          hits=$(grep -rHnE '\$\{\{[^}]*github\.(ref_name|head_ref|event\.[^}]*(title|body))' ci-fixtures/injection-positive.yml 2>/dev/null \
                  | grep -vP '^[^:]+:[0-9]+:[[:space:]]*(?!(?:run|script):)[A-Za-z_][A-Za-z0-9_.-]*:[[:space:]]*\$\{\{')
           if [ -z "$hits" ]; then
             echo "::error::The injection-sweep guard is VACUOUS — it passed on ci-fixtures/injection-positive.yml, which holds deliberately-dangerous run:/script: interpolations. The guard must catch these (QURATOR-48)."
