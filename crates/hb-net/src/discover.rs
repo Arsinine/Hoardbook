@@ -97,43 +97,133 @@ pub fn ingest_teasers_capped(
     }
     // Rank the full deduped set, then cap — so the cap keeps the TOP-ranked hits, not whichever
     // happened to sort first under the dedup presort (the old bug: cap applied before ranking).
-    hits = rank_hits(hits, tags, content_types);
+    //
+    // QURATOR-44: the query keyword for fuzzy ranking is the joined tag terms (the tag input IS the
+    // keyword the user typed); when only content-types are selected (no tags), the query is empty and
+    // rank_hits falls back to a deterministic seeded shuffle. The seed is derived from the filter
+    // terms so it is stable for the lifetime of one query — coherent pagination across pages.
+    let query = tags.join(" ");
+    let seed = hash_seed(tags, content_types);
+    hits = rank_hits(hits, &query, seed);
     let capped = hits.len() > cap;
     hits.truncate(cap);
     (hits, capped)
 }
 
-/// The M20 default ranking for discovery hits. **This function is the single swap point** — change
-/// the order here when the owner rules on it (the prompt records an explicit owner decision pending;
-/// see M20_PROMPT.md §W3 decision 2).
+/// The discovery ranking (QURATOR-44, owner ruling 2026-08-10). **This function is the single swap
+/// point** for discovery order.
 ///
-/// Documented order, descending:
-/// 1. **AND-match strength** — the number of query terms (tags + content-types) present on the
-///    teaser. Tags are AND-intersected by [`teaser_matches`] (every query tag must be present for a
-///    hit to survive ingest, so every passing teaser matches `tags.len()` tags — that axis is
-///    constant across hits); content-types are OR-unioned, so a teaser carrying MORE of the queried
-///    content-types is a stronger match and ranks above one carrying fewer. With no content-types in
-///    the query, match strength is constant and recency alone orders the tied hits.
-/// 2. **Recency** (`created_at`, newest first) as a tiebreak — stable and deterministic.
+/// Two modes, selected by whether a typed `query` keyword is present:
 ///
-/// **Deferred per the surgical-changes rule + DISC3:** the prompt's suggested order also names
-/// *collection count* as a ranking input. That input does not exist on the teaser today — DISC3
-/// keeps all listing/collection data off the public teaser (a hit surfaces the advertisement, never
-/// the hoard), so wiring collection count requires a teaser-schema change in hb-core that is beyond
-/// W3's scope. When the owner rules and that field lands, it slots in here as a second tier (between
-/// match strength and recency); this function is the only place that changes.
-pub fn rank_hits(hits: Vec<SearchHit>, tags: &[String], content_types: &[String]) -> Vec<SearchHit> {
-    let mut ranked = hits;
-    ranked.sort_by(|a, b| {
-        let strength_a = tags.iter().filter(|t| a.teaser.tags.contains(t)).count()
-            + content_types.iter().filter(|c| a.teaser.content_types.contains(c)).count();
-        let strength_b = tags.iter().filter(|t| b.teaser.tags.contains(t)).count()
-            + content_types.iter().filter(|c| b.teaser.content_types.contains(c)).count();
-        // Descending match strength, then descending recency. Equal on both → preserve prior order
-        // (sort_by is stable; the ingest presort already put equal hits newest-first by npub id).
-        strength_b.cmp(&strength_a).then(b.created_at.cmp(&a.created_at))
-    });
-    ranked
+/// 1. **Keyword search** (`query` non-empty) — fuzzy rank by trigram overlap between the query and
+///    exactly the fields the teaser publishes about the person: `display_name` + `bio` + `tags` +
+///    `content_types`. Fuzzy, NOT semantic: semantic search would need either a large local
+///    embedding model in the installer or a remote API call that leaks the user's search terms —
+///    both unacceptable here. Trigram overlap is local, small, dependency-free, and catches typos
+///    and partial-word matches (e.g. "ani" matches "anime"). Recency (`created_at`, newest first) is
+///    the stable tiebreak.
+///
+/// 2. **Type-toggle browse** (`query` empty, content-types only) — deterministic shuffle keyed on
+///    `seed`. A fresh RNG per render would make pagination incoherent (page 2 reshuffles page 1), so
+///    the seed MUST be stable for the lifetime of a query; the caller derives it from the query terms.
+///
+/// **Rank inputs are EXACTLY the teaser's published fields** — `display_name`, `bio`, `tags`,
+/// `content_types`. Collection names, descriptions, and file/folder names are hoard contents sealed
+/// under a browse-key and fenced by `scan_selective` (M8 F1); a searchable index IS a disclosure, so
+/// they are deliberately absent (owner ruling 2026-08-10).
+pub fn rank_hits(hits: Vec<SearchHit>, query: &str, seed: u64) -> Vec<SearchHit> {
+    let query = query.trim();
+    if query.is_empty() {
+        // Type-toggle browse: deterministic shuffle so pagination is coherent across pages.
+        shuffle_stable(hits, seed)
+    } else {
+        let qtri = trigrams(query);
+        let mut scored: Vec<(i64, SearchHit)> = hits
+            .into_iter()
+            .map(|h| {
+                let hay = h.teaser.display_name.to_lowercase()
+                    + " "
+                    + &h.teaser.bio.to_lowercase()
+                    + " "
+                    + &h.teaser.tags.join(" ").to_lowercase()
+                    + " "
+                    + &h.teaser.content_types.join(" ").to_lowercase();
+                let score = overlap_score(&qtri, &trigrams(&hay));
+                (score, h)
+            })
+            .collect();
+        // Descending fuzzy score, then descending recency. sort_by is stable, so equal-score,
+        // equal-recency hits preserve the ingest presort's newest-first-by-npub order.
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.created_at.cmp(&a.1.created_at)));
+        scored.into_iter().map(|(_, h)| h).collect()
+    }
+}
+
+/// Lowercase trigram set for `s` (substrings of length 3). Strings shorter than 3 chars contribute
+/// themselves as a single token so short queries still match. Empty input → empty set.
+fn trigrams(s: &str) -> Vec<String> {
+    let s = s.trim().to_lowercase();
+    if s.len() < 3 {
+        return if s.is_empty() { vec![] } else { vec![s] };
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut out: Vec<String> = Vec::with_capacity(chars.len().saturating_sub(2));
+    let mut i = 0;
+    while i + 3 <= chars.len() {
+        out.push(chars[i..i + 3].iter().collect());
+        i += 1;
+    }
+    out
+}
+
+/// Overlap score: the total count of query-trigram occurrences in the haystack (with multiplicity).
+/// A teaser that mentions the keyword in BOTH its bio AND its tags outscores one that carries it
+/// only as a tag, because the trigram appears more times. Catches partial-word and typo matches
+/// (the fuzzy requirement) without an embedding model.
+fn overlap_score(query: &[String], hay: &[String]) -> i64 {
+    let mut score: i64 = 0;
+    for qt in query {
+        score += hay.iter().filter(|ht| ht == &qt).count() as i64;
+    }
+    score
+}
+
+/// A deterministic shuffle keyed on `seed`. Uses a simple xorshift PRNG (no new dependency) so the
+/// same seed always produces the same order — which is what makes pagination coherent (page 2 never
+/// reshuffles a page-1 item into view, or skips one). The Fisher-Yates walk is stable for equal keys.
+fn shuffle_stable(mut hits: Vec<SearchHit>, seed: u64) -> Vec<SearchHit> {
+    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15); // splitmix64 offset — nonzero for seed 0
+    let n = hits.len();
+    for i in (1..n).rev() {
+        // xorshift64
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let j = (state % (i as u64 + 1)) as usize;
+        hits.swap(i, j);
+    }
+    hits
+}
+
+/// FNV-1a hash of the filter terms → a u64 seed. Stable for the same query, different across
+/// different queries — so each search's shuffle is its own, but pagination within one search is
+/// coherent (the same query re-derives the same seed and reproduces the same order).
+fn hash_seed(tags: &[String], content_types: &[String]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for t in tags {
+        for b in t.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h ^= 0x2f; // '/' separator between the two axes
+    for c in content_types {
+        for b in c.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
 }
 
 /// Collapse a set of events for one replaceable address to the **newest by `created_at`**. A
@@ -275,10 +365,10 @@ mod tests {
         assert_eq!(winner.id, new_ev.id, "the newer event is selected");
     }
 
-    // ── M20 W3: deliberate ranking (was: the dedup sort's accidental by-product) ───────────────
+    // ── QURATOR-44: fuzzy keyword ranking + seeded shuffle for type-toggle browse ─────────────
     //
     // Build a teaser event at a specific created_at with a specific tag set, so ranking tests can
-    // control both the match-strength and recency axes independently. (Mirrors the `build_at`
+    // control both the fuzzy-overlap and recency axes independently. (Mirrors the `build_at`
     // closure in `dedup_keeps_newest_teaser_per_npub` above, generalized to an arbitrary teaser.)
     fn ev_at(id: &Identity, t: &Teaser, ts: u64) -> Event {
         let base = hb_core::event::build_teaser(id, t, true).unwrap();
@@ -292,55 +382,45 @@ mod tests {
     }
 
     #[test]
-    fn rank_orders_by_match_strength_then_recency() {
-        // Match strength = # query terms present (tags AND-matched + content-types OR-matched). All
-        // three teasers pass the AND-tag filter (query tag "anime" present on each) AND the content-
-        // type OR filter (each carries ≥1 of the queried CTs); they differ in how many queried CTs
-        // they carry, which is the varying strength axis.
-        //
-        // Query content-types = [video, audio, image].
-        //  - "three-cts" carries all 3  (strength 1 tag + 3 cts = 4), created_at 100 (oldest)
-        //  - "two-cts"   carries 2      (strength 1 tag + 2 cts = 3), created_at 300 (newest)
-        //  - "one-ct"    carries 1      (strength 1 tag + 1 ct  = 2), created_at 200 (middle)
-        //
-        // Expected order: three-cts (4) → two-cts (3) → one-ct (2). Recency is only the tiebreak, so
-        // the OLDEST hit ranks FIRST because it has the strongest match — the exact inversion of the
-        // old "whoever republished most recently" order.
-        let three_cts = {
+    fn rank_fuzzy_keyword_orders_by_overlap_then_recency() {
+        // QURATOR-44: the query keyword drives fuzzy trigram overlap (with multiplicity) against each
+        // teaser's published text (name + bio + tags + content_types). All three teasers pass the
+        // AND-tag filter (tag "vhs" present on each). They differ in how MANY TIMES "vhs" trigrams
+        // appear across name+bio+tags: the trigram "vhs" appears once per occurrence of the word.
+        //  - "vhs-vhs"  → name "vhs-vhs" has "vhs" twice in the name → more occurrences → higher score
+        //  - "vhs-once" → name has "vhs" once → middling score
+        //  - "bluray"   → name has no "vhs"; only the tag carries it → lowest score
+        // "bluray" is NEWEST so recency alone would rank it first; the fuzzy overlap inverts that.
+        let strong = {
             let id = Identity::generate();
-            let mut t = teaser_with(&["anime"], &["video", "audio", "image"]);
-            t.display_name = "three-cts".into();
-            ev_at(&id, &t, 100)
+            let mut t = teaser_with(&["vhs"], &["video"]);
+            t.display_name = "vhs-vhs".into(); // "vhs" appears twice in the name
+            t.bio = "vhs tapes".into();        // and again in bio
+            ev_at(&id, &t, 100) // OLDEST
         };
-        let two_cts = {
+        let mid = {
             let id = Identity::generate();
-            let mut t = teaser_with(&["anime"], &["video", "audio"]);
-            t.display_name = "two-cts".into();
-            ev_at(&id, &t, 300)
-        };
-        let one_ct = {
-            let id = Identity::generate();
-            let mut t = teaser_with(&["anime"], &["video"]);
-            t.display_name = "one-ct".into();
+            let mut t = teaser_with(&["vhs"], &["video"]);
+            t.display_name = "vhs-once".into();
             ev_at(&id, &t, 200)
         };
-        let hits = ingest_teasers(
-            vec![two_cts.clone(), one_ct, three_cts.clone()],
-            &["anime".into()],
-            &["video".into(), "audio".into(), "image".into()],
-            100,
-        );
+        let weak = {
+            let id = Identity::generate();
+            let mut t = teaser_with(&["vhs"], &["video"]);
+            t.display_name = "bluray".into(); // only the tag carries "vhs"
+            ev_at(&id, &t, 300) // NEWEST
+        };
+        let hits = ingest_teasers(vec![weak, mid, strong.clone()], &["vhs".into()], &[], 100);
         assert_eq!(hits.len(), 3);
-        assert_eq!(hits[0].teaser.display_name, "three-cts", "strongest match ranks first despite being oldest");
-        assert_eq!(hits[1].teaser.display_name, "two-cts", "strength 3 next");
-        assert_eq!(hits[2].teaser.display_name, "one-ct", "strength 2 last");
+        assert_eq!(hits[0].teaser.display_name, "vhs-vhs", "highest trigram multiplicity ranks first despite being oldest");
+        assert_eq!(hits[2].teaser.display_name, "bluray", "lowest multiplicity last despite being newest");
     }
 
     #[test]
-    fn rank_recency_tiebreaks_equal_match_strength() {
-        // Two teasers with EQUAL match strength (both match the single query tag, no content-types
-        // queried). The newer one wins the tiebreak. This is the recency-as-tiebreak half of the
-        // order, and also the behavior when match strength is constant (tag-only queries).
+    fn rank_recency_tiebreaks_equal_fuzzy_score() {
+        // Two teasers with EQUAL fuzzy overlap (both carry the "anime" tag, query "anime"). The
+        // newer one wins the tiebreak. This is the recency-as-tiebreak half of the order, and the
+        // behavior when fuzzy score is constant.
         let older = {
             let id = Identity::generate();
             let mut t = teaser_with(&["anime"], &["video"]);
@@ -356,14 +436,14 @@ mod tests {
         // Feed older first so a stable sort that preserved input order would wrongly keep it first.
         let hits = ingest_teasers(vec![older, newer], &["anime".into()], &[], 100);
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].teaser.display_name, "newer", "equal strength → newer wins the tiebreak");
+        assert_eq!(hits[0].teaser.display_name, "newer", "equal score → newer wins the tiebreak");
         assert_eq!(hits[1].teaser.display_name, "older");
     }
 
     #[test]
     fn rank_cap_keeps_top_ranked_not_first_seen() {
         // The cap applies AFTER ranking, so the TOP-ranked hits survive, not whichever the dedup
-        // presort happened to put first. With a cap of 1 and two equal-strength hits, the newer one
+        // presort happened to put first. With a cap of 1 and two equal-score hits, the newer one
         // (recency tiebreak) is kept — the older is dropped even though dedup saw it.
         let older = {
             let id = Identity::generate();
@@ -384,39 +464,154 @@ mod tests {
 
     #[test]
     fn full_and_match_survives_above_strict_cap_m20_w3_eviction_regression() {
-        // M20 W3 eviction regression (the prompt's verify clause). A teaser that is a STRONGER match
-        // but OLDER than many weaker matches must still surface — and rank FIRST. Pre-fix, the
-        // relay's response window filled with newer weaker matches and the stronger hit was evicted
-        // before the client filter ran (no explicit `.limit()`); even post-limit, the old recency-
-        // only ordering would have buried it. The fix is the explicit `.limit()` on the filter
-        // (tested in client.rs) AND ranking by match-strength. This test pins the ingest/rank half:
-        // one strong hit (matches both queried content-types) OLDEST, several weaker hits (match only
-        // one) newer — the strong hit ranks first despite being oldest.
+        // M20 W3 eviction regression. A teaser that is a STRONGER fuzzy match but OLDER than many
+        // weaker matches must still surface — and rank FIRST. The strong hit's BIO repeats the query
+        // keyword ("vhs") giving it strictly more trigram occurrences than the weak hits (whose bios
+        // do not mention it), OLDEST; the 5 weaker hits all pass the tag filter but have lower
+        // multiplicity, all NEWER. The strong hit ranks first despite being oldest.
         let mut events: Vec<Event> = Vec::new();
-        // The strong hit: matches the queried tag + BOTH queried content-types (strength 1+2=3),
-        // OLDEST (ts = 1) — under the old recency-only order it ranked last.
         let strong = {
             let id = Identity::generate();
-            let mut t = teaser_with(&["anime"], &["video", "audio"]);
+            let mut t = teaser_with(&["vhs"], &["video", "audio"]);
             t.display_name = "strong".into();
+            t.bio = "vhs tapes vhs archive vhs".into(); // "vhs" repeated in bio
             ev_at(&id, &t, 1)
         };
         events.push(strong);
-        // 5 weaker hits: match the queried tag + only ONE queried content-type (strength 1+1=2), all
-        // NEWER. (The relay window in production is ~500; here 5 is enough — match-strength, not
-        // headroom, is what this test asserts.)
         for i in 0..5 {
             let id = Identity::generate();
-            let mut t = teaser_with(&["anime"], &["video"]);
+            let mut t = teaser_with(&["vhs"], &["video"]);
             t.display_name = format!("weak-{i}");
+            t.bio = "just a hoarder".into(); // no "vhs" bio mention; only the tag carries it
             events.push(ev_at(&id, &t, 100 + i));
         }
-        // Cap below the event count so we also prove the cap keeps the TOP-ranked hit.
-        let hits = ingest_teasers(events, &["anime".into()], &["video".into(), "audio".into()], 3);
+        let hits = ingest_teasers(events, &["vhs".into()], &["video".into(), "audio".into()], 3);
         assert_eq!(hits.len(), 3, "capped to 3");
         assert_eq!(hits[0].teaser.display_name, "strong", "the older strong hit surfaces FIRST — not evicted by newer weaker matches");
-        // The remaining two slots are weak matches (strength 2), newest-first among themselves.
         assert!(hits[1].teaser.display_name.starts_with("weak-"), "weak matches fill the rest");
         assert!(hits[2].teaser.display_name.starts_with("weak-"));
+    }
+
+    #[test]
+    fn rank_fuzzy_matches_bio_not_just_tags() {
+        // QURATOR-44 mutation guard: the fuzzy rank inputs are display_name + bio + tags +
+        // content_types — NOT tags alone. Both teasers pass the AND-tag filter (query tag "vhs"
+        // present on each as a tag) and share the SAME neutral display_name, so name+tag overlap is
+        // equal. They differ ONLY in BIO: one bio mentions "vhs" (adding trigram occurrences), the
+        // other does not. The bio-mention teaser must rank above the other despite being OLDER. This
+        // is the test that REDS when the ranker ignores bio (mutation probe 1).
+        let bio_vhs = {
+            let id = Identity::generate();
+            let mut t = teaser_with(&["vhs"], &["video"]);
+            t.display_name = "hoarder".into(); // neutral — no "vhs" in the name
+            t.bio = "vhs tapes archive".into(); // "vhs" appears in the bio → extra trigram occurrences
+            ev_at(&id, &t, 100) // OLDEST
+        };
+        let bio_none = {
+            let id = Identity::generate();
+            let mut t = teaser_with(&["vhs"], &["video"]);
+            t.display_name = "hoarder".into(); // same neutral name
+            t.bio = "bluray only".into(); // no "vhs" in bio; only the tag carries it
+            ev_at(&id, &t, 300) // NEWEST — recency alone would rank it first
+        };
+        let hits = ingest_teasers(vec![bio_none, bio_vhs.clone()], &["vhs".into()], &[], 100);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].teaser.bio, "vhs tapes archive", "bio mention of 'vhs' ranks it above a newer hit without it");
+    }
+
+    // ── QURATOR-44: type-toggle browse uses a deterministic seeded shuffle ────────────────────
+
+    /// Build N teaser events that all pass the content-type OR filter (each carries the "video"
+    /// content-type), for testing the type-toggle shuffle path. Each gets a distinct name + npub.
+    fn events_for_shuffle(n: usize) -> Vec<Event> {
+        (0..n)
+            .map(|i| {
+                let id = Identity::generate();
+                let mut t = teaser_with(&[], &["video"]);
+                t.display_name = format!("hit-{i}");
+                ev_at(&id, &t, 100 + i as u64)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn type_toggle_shuffle_is_deterministic_for_same_query() {
+        // Same filter terms → same seed → same order. Two identical searches must produce identical
+        // rankings, or pagination is incoherent.
+        let events = events_for_shuffle(20);
+        let a = ingest_teasers(events.clone(), &[], &["video".into()], 100);
+        let b = ingest_teasers(events, &[], &["video".into()], 100);
+        assert_eq!(a.len(), b.len());
+        let names_a: Vec<&str> = a.iter().map(|h| h.teaser.display_name.as_str()).collect();
+        let names_b: Vec<&str> = b.iter().map(|h| h.teaser.display_name.as_str()).collect();
+        assert_eq!(names_a, names_b, "same query → identical shuffle order");
+    }
+
+    #[test]
+    fn type_toggle_pagination_is_coherent_no_dupes_no_skips() {
+        // QURATOR-44 pagination coherence: the seed is stable per query, so slicing the ranked set
+        // into pages of 10 never repeats an item across pages and never skips one. Paginating twice
+        // produces the same partition. This is the test the ruling demands.
+        let events = events_for_shuffle(25);
+        let ranked = ingest_teasers(events, &[], &["video".into()], 100);
+        assert_eq!(ranked.len(), 25, "all 25 survive the content-type filter");
+
+        // Page 1 (0..10) and page 2 (10..20) from the SAME ranked vector.
+        let page1: Vec<&str> = ranked.iter().take(10).map(|h| h.teaser.display_name.as_str()).collect();
+        let page2: Vec<&str> = ranked.iter().skip(10).take(10).map(|h| h.teaser.display_name.as_str()).collect();
+        let page3: Vec<&str> = ranked.iter().skip(20).take(10).map(|h| h.teaser.display_name.as_str()).collect();
+
+        // No item appears on two pages.
+        let all: Vec<&str> = page1.iter().chain(page2.iter()).chain(page3.iter()).copied().collect();
+        let mut seen = std::collections::HashSet::new();
+        for name in &all {
+            assert!(seen.insert(*name), "{name:?} appeared on more than one page — pagination is incoherent");
+        }
+        // No item is skipped: the union of pages covers all 25 ranked hits, in order.
+        let ranked_names: Vec<&str> = ranked.iter().map(|h| h.teaser.display_name.as_str()).collect();
+        assert_eq!(all, ranked_names, "pages must partition the ranked set without reordering or skipping");
+        // Re-running the same search reproduces the same partition (seed stability).
+        let events2 = events_for_shuffle(25);
+        let ranked2 = ingest_teasers(events2, &[], &["video".into()], 100);
+        let names2: Vec<&str> = ranked2.iter().map(|h| h.teaser.display_name.as_str()).collect();
+        assert_eq!(ranked_names, names2, "re-running the search reproduces the same order");
+    }
+
+    #[test]
+    fn type_toggle_shuffle_differs_from_natural_order() {
+        // The shuffle must actually shuffle — if the output equals the ingest presort order for a
+        // non-trivial input, the shuffler is a no-op. With 20 items in ascending created_at order,
+        // at least one item must move from its original position. Compare ranked names against the
+        // original `hit-0`..`hit-19` sequence.
+        let events = events_for_shuffle(20);
+        let ranked = ingest_teasers(events, &[], &["video".into()], 100);
+        let names: Vec<String> = ranked.iter().map(|h| h.teaser.display_name.clone()).collect();
+        let original: Vec<String> = (0..20).map(|i| format!("hit-{i}")).collect();
+        let moved = names.iter().zip(original.iter()).filter(|(a, b)| a != b).count();
+        assert!(moved > 0, "shuffle must differ from natural order; got identical order for 20 items");
+    }
+
+    #[test]
+    fn rank_hits_pure_function_no_network() {
+        // rank_hits is a pure function — table-driven testable with no relay. Construct hits in
+        // memory, rank by a keyword, assert order. (No network, no Identity, no Event.)
+        let mk = |name: &str, bio: &str, ts: u64| SearchHit {
+            npub: format!("npub-{name}"),
+            teaser: Teaser {
+                display_name: name.into(),
+                bio: bio.into(),
+                tags: vec!["anime".into()],
+                content_types: vec!["video".into()],
+                picture: None,
+            },
+            created_at: Timestamp::from(ts),
+        };
+        let hits = vec![
+            mk("z-last", "nothing relevant", 9_000),
+            mk("a-first", "anime collector", 1_000),
+        ];
+        let ranked = rank_hits(hits, "anime collector", 0);
+        assert_eq!(ranked[0].teaser.display_name, "a-first", "fuzzy overlap beats recency");
+        assert_eq!(ranked[1].teaser.display_name, "z-last");
     }
 }

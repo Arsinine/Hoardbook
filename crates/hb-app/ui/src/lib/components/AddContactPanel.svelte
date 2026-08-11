@@ -12,7 +12,7 @@
 	import Modal from './Modal.svelte';
 	import type { CachedPeer } from '../types.js';
 	import { renderFingerprint } from '../identity-display.js';
-	import { DISCOVER_CONTENT_TYPES, parseTagInput, canSearch, toggleContentType } from '../discover-view.js';
+	import { DISCOVER_CONTENT_TYPES, parseTagInput, canSearch, toggleContentType, DISCOVER_PAGE_SIZE, pageItems, pageCount } from '../discover-view.js';
 
 	interface Props {
 		open?: boolean;
@@ -80,12 +80,19 @@
 	let discoverTags = $state('');
 	let discoverTypes: string[] = $state([]);
 	let discoverResults: PeerSearchHit[] = $state([]);
-	let discoverCapped = $state(false); // M20 W3: more candidates existed than the cap kept → "showing first N"
+	let discoverCapped = $state(false); // M20 W3: more candidates existed than the cap kept
 	let discovering = $state(false);
 	let discoverError = $state('');
 	let discovered = $state(false); // a search has run at least once (drives the empty-vs-no-results copy)
+	// QURATOR-44: pagination replaces the old "Showing first N — narrow your search" affordance.
+	let discoverPage = $state(1);
 	let parsedDiscoverTags = $derived(parseTagInput(discoverTags));
 	let canDiscover = $derived(canSearch(parsedDiscoverTags, discoverTypes));
+	// QURATOR-44: only DISCOVER_PAGE_SIZE (10) hits show per page; the ranked set is stable per
+	// search (the Rust ranker derives a deterministic seed from the filter terms), so pages never
+	// dup or skip.
+	let discoverPageItems = $derived(pageItems(discoverResults, discoverPage));
+	let discoverPageCount = $derived(pageCount(discoverResults.length));
 
 	async function runDiscover() {
 		if (!canDiscover) { discoverError = 'Enter at least one tag or content type to search.'; return; }
@@ -95,6 +102,7 @@
 			const result: PeerSearchResult = await searchPeers(parsedDiscoverTags, discoverTypes);
 			discoverResults = result.hits;
 			discoverCapped = result.capped;
+			discoverPage = 1; // QURATOR-44: reset to page 1 on each new search.
 			discovered = true;
 		} catch (e) {
 			discoverError = String(e);
@@ -220,7 +228,7 @@
 					</button>
 					{#if discoverOpen}
 						<div class="discover-body">
-							<div class="discover-sub">Search public profiles by tag &amp; content type. Only what people chose to announce is searchable — everyone's listings stay encrypted.</div>
+							<div class="discover-sub">Search public profiles by name, bio, tags, or content type. Only what people chose to announce is searchable — everyone's listings stay encrypted.</div>
 							<div class="ct-row">
 								{#each DISCOVER_CONTENT_TYPES as ct (ct.value)}
 									<button type="button" class="ct-chip" class:ct-on={discoverTypes.includes(ct.value)}
@@ -228,7 +236,7 @@
 								{/each}
 							</div>
 							<form class="disc-tag-row" onsubmit={(e) => { e.preventDefault(); runDiscover(); }}>
-								<input class="hb-input disc-tag-input" placeholder="tags (e.g. anime, vhs)" bind:value={discoverTags} />
+								<input class="hb-input disc-tag-input" placeholder="name, bio, or tag (e.g. anime, vhs)" bind:value={discoverTags} />
 								<button class="btn-primary btn-sm" type="submit" disabled={!canDiscover || discovering}>
 									{discovering ? 'Searching…' : 'Search'}
 								</button>
@@ -240,7 +248,7 @@
 								<div class="discover-empty">No hoarders matched those filters.</div>
 							{:else if discovered}
 								<div class="discover-results">
-									{#each discoverResults as hit (hit.npub)}
+									{#each discoverPageItems as hit (hit.npub)}
 										{@const letter = (hit.display_name?.[0] ?? hit.npub[0]).toUpperCase()}
 										<div class="hit-card">
 											<div class="hit-top">
@@ -269,15 +277,25 @@
 										</div>
 									{/each}
 								</div>
+								{#if discoverPageCount > 1}
+									<!-- QURATOR-44: pagination replaces the old "Showing first N — narrow your search"
+									     (hoarder #101). Page size 10; the ranked set is stable per search so pages partition
+									     without dupes or skips. -->
+									<div class="discover-pager">
+										<button type="button" class="pager-btn" disabled={discoverPage <= 1} onclick={() => (discoverPage = Math.max(1, discoverPage - 1))}>Prev</button>
+										<span class="pager-info">Page {discoverPage} of {discoverPageCount}</span>
+										<button type="button" class="pager-btn" disabled={discoverPage >= discoverPageCount} onclick={() => (discoverPage = Math.min(discoverPageCount, discoverPage + 1))}>Next</button>
+									</div>
+								{/if}
 								{#if discoverCapped}
-									<!-- M20 W3: the cap truncated the ranked set. Surface it — silently presenting a capped
-									     slice as "everyone" is the bug this fixes. `role=status` so it is queryable + announced. -->
+									<!-- M20 W3: the cap truncated the ranked set (more existed than SEARCH_CAP kept). Shown
+									     below the pager so the user knows there may be more matches beyond the cap. -->
 									<div class="discover-capped" role="status">
-										Showing first {discoverResults.length} — narrow your search to see more specific matches.
+										More matches exist — refine your search to narrow the results.
 									</div>
 								{/if}
 							{:else}
-								<div class="discover-empty">Pick a content type or enter a tag, then Search.</div>
+								<div class="discover-empty">Pick a content type or enter a keyword, then Search.</div>
 							{/if}
 						</div>
 					{/if}
@@ -469,6 +487,19 @@
 	.discover-error { font-size: 11.5px; color: oklch(0.75 0.15 25); }
 	.discover-results { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: 12px; }
 	.discover-capped { text-align: center; color: var(--fg-dim); font-size: 11.5px; padding: 10px 0 2px; }
+	/* QURATOR-44: pagination control (page size 10, replaces the old "showing first N" line). */
+	.discover-pager {
+		display: flex; align-items: center; justify-content: center; gap: 10px;
+		padding: 10px 0 2px;
+	}
+	.pager-btn {
+		padding: 3px 12px; border-radius: 6px; font-size: 11.5px; font-weight: 600;
+		background: var(--bg-elev2); color: var(--fg-muted);
+		border: 1px solid var(--border); cursor: pointer; font-family: var(--font-ui);
+	}
+	.pager-btn:hover:not(:disabled) { background: var(--bg-elev3); color: var(--fg); }
+	.pager-btn:disabled { opacity: 0.4; cursor: default; }
+	.pager-info { font-size: 11px; color: var(--fg-dim); font-feature-settings: 'tnum'; }
 	.discover-empty { text-align: center; color: var(--fg-dim); font-size: 12.5px; padding: 18px 0; }
 	.hit-card {
 		display: flex; flex-direction: column; gap: 7px; padding: 13px;
