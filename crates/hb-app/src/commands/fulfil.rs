@@ -99,30 +99,70 @@ pub async fn send_full_list(
         return Err("You can't send a full list to yourself.".into());
     }
 
+    // QURATOR-45: the fulfil click was silent and could hang — `send_full_list` had ZERO tracing
+    // calls and nothing bounded the endpoint bind, so a stuck bind left no log trace and swallowed
+    // every subsequent click. These milestones trace every step so a real run produces evidence, and
+    // the bind itself is bounded in `ensure_endpoint` (see `ENDPOINT_BIND_TIMEOUT`). npubs are
+    // truncated through `trunc_npub` (INV-2); the browse-key, nsec, DM plaintext, and peer/node
+    // addresses are NEVER logged. The slug is owner-public (it identifies a collection the peer
+    // already browsed and asked about).
+    let recipient_npub = crate::commands::chat::npub_of(&recipient);
+    tracing::debug!(
+        recipient = %crate::logging::trunc_npub(&recipient_npub),
+        slug = %slug,
+        ask_nonce_present = ask_nonce.is_some(),
+        "fulfil: send_full_list invoked — building + sealing the manifest"
+    );
+
     // (1) Prove the manifest exists and fits, before anything is promised. `seal` is the ceiling.
     let envelope = build_slug_manifest(&slug, &store, &id_clone, browse_key.bytes())?;
-    ManifestPayload::seal(&envelope).map_err(|e| {
+    let sealed = ManifestPayload::seal(&envelope).map_err(|e| {
         format!(
             "This collection's full list is too large to send over the connection ({e}). \
              Export it instead: Home → ⋯ → Export, then hand the file over."
         )
     })?;
+    tracing::debug!(
+        recipient = %crate::logging::trunc_npub(&recipient_npub),
+        slug = %slug,
+        sealed_bytes = sealed.as_bytes().len(),
+        "fulfil: manifest sealed within the transport ceiling"
+    );
 
     let source: Arc<dyn crate::transport::ManifestSource> = StoreManifestSource::new(
         (*store).clone(),
         id_clone.clone(),
         browse_key.clone(),
     );
-    // Fulfilling must LISTEN — the asker dials us.
+    // Fulfilling must LISTEN — the asker dials us. The bind is bounded inside `ensure_endpoint`
+    // (`ENDPOINT_BIND_TIMEOUT`); a stuck relay handshake now fails loudly instead of hanging.
+    tracing::debug!(
+        recipient = %crate::logging::trunc_npub(&recipient_npub),
+        slug = %slug,
+        role = "listen",
+        "fulfil: binding the transport endpoint"
+    );
     let ep = ensure_endpoint(&endpoint, &own_npub, &identity, &transport_key, source, Role::Listen)
         .await
         .map_err(|e| {
             format!("Could not start the transport ({e}). Export the list instead: Home → ⋯ → Export.")
         })?;
+    tracing::debug!(
+        recipient = %crate::logging::trunc_npub(&recipient_npub),
+        slug = %slug,
+        role = "listen",
+        "fulfil: transport endpoint bound — minting the ticket"
+    );
 
     let request_id = new_request_id();
     let ticket =
         issue_ticket(&ep, &request_id, &slug, now_secs(), ask_nonce.as_deref()).map_err(cmd_err)?;
+    tracing::debug!(
+        recipient = %crate::logging::trunc_npub(&recipient_npub),
+        slug = %slug,
+        request_id = %request_id,
+        "fulfil: ticket minted — persisting the issued-ticket record"
+    );
 
     // (2) Record before the DM, so a redeemer always presents a ticket we can recognise.
     // **Canonicalize the recipient before storing it.** `parse_recipient` also accepts a full `hbk`
@@ -139,6 +179,12 @@ pub async fn send_full_list(
             delivered_bytes: None,
         })
         .map_err(cmd_err)?;
+    tracing::debug!(
+        recipient = %crate::logging::trunc_npub(&recipient_npub),
+        slug = %slug,
+        request_id = %request_id,
+        "fulfil: issued-ticket record persisted — publishing the ticket DM"
+    );
 
     let body = serde_json::to_string(&ticket).map_err(cmd_err)?;
     let own = crate::net::relay_urls(&store);
@@ -153,6 +199,12 @@ pub async fn send_full_list(
     )
     .await
     .map_err(cmd_err)?;
+    tracing::info!(
+        recipient = %crate::logging::trunc_npub(&recipient_npub),
+        slug = %slug,
+        request_id = %request_id,
+        "fulfil: send_full_list complete — ticket DM delivered"
+    );
     Ok(())
 }
 
