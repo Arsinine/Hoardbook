@@ -878,7 +878,7 @@
 								onfocus={() => onRowFocus(peer.npub)}
 							>
 								<div class="avatar-wrap">
-									<Avatar {letter} size={28} {hue} picture={peer.profile?.picture} />
+									<Avatar {letter} size={24} {hue} picture={peer.profile?.picture} />
 									<!-- devtest v0.12.1 #3: the browse-key lock/unlock icon overlays the avatar's top-right
 									     (the online dot owns the bottom-right); the inline text badge is gone. -->
 									<span class="access-lock" class:locked={badge.locked} title={badge.hint || badge.label}>{badge.icon}</span>
@@ -886,15 +886,12 @@
 										<span class="online-dot"></span>
 									{/if}
 								</div>
-								<div class="contact-info">
-									<span class="contact-name">{peerName(peer)}</span>
-									<span class="contact-meta">
-										{peer.collections.length} collection{peer.collections.length !== 1 ? 's' : ''}
-									</span>
-									{#if dragSourceNpub !== null && dragOverNpub === peer.npub && dragSourceNpub !== peer.npub}
-										<span class="drag-outcome-browse">{dragCount > 0 ? `group ${dragCount + 1} contacts` : 'group these two'}</span>
-									{/if}
-								</div>
+								<span class="contact-name">{peerName(peer)}</span>
+								{#if dragSourceNpub !== null && dragOverNpub === peer.npub && dragSourceNpub !== peer.npub}
+									<span class="drag-outcome-browse">{dragCount > 0 ? `group ${dragCount + 1} contacts` : 'group these two'}</span>
+								{:else}
+									<span class="contact-meta">{peer.collections.length}</span>
+								{/if}
 							</div>
 						{/each}
 					</div>
@@ -1295,8 +1292,10 @@
 	.contact-row {
 		display: flex;
 		align-items: center;
-		gap: 9px;
-		padding: 8px 12px;
+		gap: 8px;
+		padding: 5px 4px;
+		border-radius: 5px;
+		font-size: 12px;
 		background: transparent;
 		border: none;
 		cursor: pointer;
@@ -1338,26 +1337,22 @@
 		box-shadow: 0 0 0 1px var(--border);
 	}
 
-	.contact-info {
-		min-width: 0;
-		flex: 1;
-	}
-
 	.contact-name {
-		display: block;
-		font-size: 12.5px;
+		font-size: 12px;
 		font-weight: 500;
 		color: var(--fg);
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+		min-width: 0;
 	}
 
 	.contact-meta {
-		display: block;
-		font-size: 10.5px;
+		font-size: 10px;
 		color: var(--fg-dim);
-		margin-top: 1px;
+		margin-left: auto;
+		flex-shrink: 0;
+		font-feature-settings: 'tnum';
 	}
 
 	/* ── Right panel ─────────────────────────────────────────────── */
@@ -1811,7 +1806,7 @@
 		background: color-mix(in oklch, var(--accent) 8%, var(--bg-elev1));
 	}
 	.drag-outcome-browse {
-		display: block; font-size: 10.5px; font-weight: 600; color: var(--accent); margin-top: 2px;
+		font-size: 10px; font-weight: 600; color: var(--accent); margin-left: auto; flex-shrink: 0;
 	}
 
 	/* M22 W3 — naming popover (inline panel for Browse's compact People list). */
