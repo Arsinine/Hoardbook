@@ -36,6 +36,7 @@ interface PopoverProps {
 	onclose: () => void;
 	onnewgroup: () => void;
 	returnFocusTo?: () => HTMLElement | undefined | null;
+	ready?: boolean;
 }
 
 interface PopoverMocks extends PopoverProps {
@@ -54,6 +55,9 @@ function makePopover(overrides: Partial<PopoverProps> = {}): PopoverMocks {
 		onapply: vi.fn(),
 		onclose: vi.fn(),
 		onnewgroup: vi.fn(),
+		// Default TRUE so the normal-path tests below exercise a loaded editor. The component's own
+		// default is FALSE — see the readiness-guard tests.
+		ready: true,
 		...overrides,
 	} as PopoverMocks;
 }
@@ -74,6 +78,47 @@ describe('GroupMembershipPopover (M22 W8) — behaviour', () => {
 		expect(boxes[1].checked).toBe(true);
 		await fireEvent.click(boxes[0]); // uncheck Film
 		expect(boxes[0].checked).toBe(false);
+	});
+
+	// ── Readiness guard (Codex review 2026-08-11) ────────────────────────────────
+	// Both route pages derive `memberships` by filtering an ASYNCHRONOUSLY loaded `groups` array that
+	// starts as []. An editor opened before groupsGet() resolves therefore seeds an EMPTY draft, and
+	// Apply — a FULL-SET replace — would send [] and wipe every group the contact was in. Same class
+	// of data loss as contacts-w5-dataloss, arriving through a different door.
+
+	it('Apply does NOT commit while the group data is still loading', async () => {
+		const p = makePopover({ ready: false, memberships: [] });
+		const { getByText } = render(GroupMembershipPopover, { props: p });
+		await fireEvent.click(getByText('Apply'));
+		expect(p.onapply).not.toHaveBeenCalled();
+	});
+
+	it('the Apply button is disabled while the group data is still loading', () => {
+		const { getByText } = render(GroupMembershipPopover, { props: makePopover({ ready: false }) });
+		expect((getByText('Apply') as HTMLButtonElement).disabled).toBe(true);
+	});
+
+	it('seeds the draft when the data arrives AFTER the editor opened', async () => {
+		// Opened not-ready (draft empty), then the load resolves: the draft must seed from the real
+		// memberships rather than staying empty.
+		const { getAllByRole, rerender } = render(GroupMembershipPopover, {
+			props: makePopover({ ready: false, memberships: ['Film'] }),
+		});
+		expect((getAllByRole('checkbox')[0] as HTMLInputElement).checked).toBe(false);
+		await rerender(makePopover({ ready: true, memberships: ['Film'] }));
+		expect((getAllByRole('checkbox')[0] as HTMLInputElement).checked).toBe(true);
+	});
+
+	it('does NOT discard in-progress edits when memberships recompute while open', async () => {
+		// "+ New group…" reloads the caller's groups, which recomputes `memberships`. The previous
+		// effect reseeded on every such change and silently threw away the user's checkbox edits.
+		const { getAllByRole, rerender } = render(GroupMembershipPopover, { props: makePopover() });
+		const boxes = getAllByRole('checkbox') as HTMLInputElement[];
+		await fireEvent.click(boxes[1]); // user checks Music
+		expect(boxes[1].checked).toBe(true);
+		// Same memberships value, recomputed as a NEW array identity (what a groups reload produces).
+		await rerender(makePopover({ memberships: ['Film'] }));
+		expect((getAllByRole('checkbox')[1] as HTMLInputElement).checked).toBe(true);
 	});
 
 	it('Apply emits the FULL checked set (not a single name — the data-loss guard)', async () => {

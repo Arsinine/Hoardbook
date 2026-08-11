@@ -40,9 +40,13 @@
 		onclose: () => void; // cancel / backdrop / Escape
 		onnewgroup: () => void; // "+ New group…" routed to the caller's CreateGroupDialog
 		returnFocusTo?: () => HTMLElement | undefined | null; // where focus returns on close
+		/** Have `groups`/`memberships` actually LOADED? See the data-loss note below. Defaults to
+		 *  FALSE deliberately: a consumer that forgets it gets a visibly disabled Apply, not a silent
+		 *  wipe. */
+		ready?: boolean;
 	}
 
-	let { open, anchor, contactName, groups, memberships, onapply, onclose, onnewgroup, returnFocusTo }: Props = $props();
+	let { open, anchor, contactName, groups, memberships, onapply, onclose, onnewgroup, returnFocusTo, ready = false }: Props = $props();
 
 	// The working checkbox state. Seeded from `memberships` each time the popover opens so the
 	// pre-check never loses an existing membership. Stored as a plain Set (Svelte 5: reassign the
@@ -63,6 +67,13 @@
 	}
 
 	function commit() {
+		// ⚠ DATA LOSS GUARD (Codex review 2026-08-11). Both pages derive `memberships` by filtering an
+		// ASYNCHRONOUSLY loaded `groups` array that starts as []. Opening the editor before
+		// groupsGet() resolves therefore seeds an EMPTY draft, and Apply would send [] — a full-set
+		// replace that wipes every group the contact was in. That is the same data loss
+		// contacts-w5-dataloss exists to prevent, arriving through a different door: not
+		// single-select, but empty-because-not-loaded-yet. Refuse to commit until the data is real.
+		if (!ready) return;
 		onapply([...draft]);
 		restoreFocus = true;
 	}
@@ -86,12 +97,20 @@
 		}
 	}
 
+	// Seeded on the open TRANSITION only — NOT on every `memberships` change. The previous version
+	// reseeded whenever memberships recomputed, so creating a group from "+ New group…" reloaded the
+	// caller's `groups`, recomputed memberships, and silently discarded the checkbox edits already
+	// made (Codex review 2026-08-11). `wasSeeded` also lets an editor opened BEFORE the data loaded
+	// seed correctly the moment it becomes ready.
+	let wasSeeded = false;
 	$effect(() => {
-		if (open) {
+		const canSeed = open && ready;
+		if (canSeed && !wasSeeded) {
 			draft = new Set(memberships);
 			restoreFocus = true;
 			void focusFirst();
 		}
+		wasSeeded = canSeed;
 	});
 
 	// Return focus to the invoking row when the popover closes. A2/A9: .focus() on a detached node
@@ -128,7 +147,7 @@
 		</div>
 		<div class="gmp-footer">
 			<button type="button" class="btn-ghost btn-xs" onclick={close}>Cancel</button>
-			<button type="button" class="btn-primary btn-xs gmp-apply" onclick={commit}>Apply</button>
+			<button type="button" class="btn-primary btn-xs gmp-apply" disabled={!ready} onclick={commit}>Apply</button>
 		</div>
 	</div>
 </OverflowMenu>

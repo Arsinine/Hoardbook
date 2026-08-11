@@ -73,9 +73,13 @@
 
 	// Groups state
 	let groups: Group[] = $state([]);
+	// Has the FIRST groupsGet() resolved? `contactGroups()` filters this array, so an editor opened
+	// before it loads would seed an EMPTY draft and Apply would wipe the contact's memberships
+	// (Codex review 2026-08-11). Passed to GroupMembershipPopover as `ready`.
+	let groupsLoaded = $state(false);
 
 	async function loadGroups() {
-		try { groups = await groupsGet(); } catch { /* non-fatal */ }
+		try { groups = await groupsGet(); groupsLoaded = true; } catch { /* non-fatal */ }
 	}
 
 	// M10: Private collections trusted peers have sealed to me, keyed by author npub. A non-trusted
@@ -1324,6 +1328,7 @@
 		contactName={name}
 		groups={groups}
 		memberships={contactGroups(peer.npub)}
+		ready={groupsLoaded}
 		onapply={(names) => applyGroupPopover(peer.npub, names)}
 		onclose={() => (groupPopoverFor = null)}
 		onnewgroup={() => (createGroupOpen = true)}

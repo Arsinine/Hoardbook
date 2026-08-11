@@ -273,10 +273,14 @@
 	// trailing section, never a bucket that hides anyone. The text filter now matches petname too
 	// (it previously matched only display_name + npub — Contacts already matched petname).
 	let groups: Group[] = $state([]);
+	// Has the FIRST groupsGet() resolved? The membership editor must not commit a full-set replace
+	// derived from an empty `groups` array — that would wipe the contact's memberships (Codex review
+	// 2026-08-11). Passed to GroupMembershipPopover as `ready`.
+	let groupsLoaded = $state(false);
 	$effect(() => {
 		// Load once on mount; group membership is mutated on the Contacts tab, and Browse re-reads
 		// on every navigate here (the $effect re-runs when `groups` is reassigned elsewhere too).
-		groupsGet().then((g) => { groups = g; }).catch(() => { /* non-fatal */ });
+		groupsGet().then((g) => { groups = g; groupsLoaded = true; }).catch(() => { /* non-fatal */ });
 	});
 	let filteredContacts = $derived($contacts.filter(p => matchesQuery(p, search)));
 	let peopleSections = $derived(groupByGroups(filteredContacts, groups));
@@ -466,10 +470,15 @@
 	// Open the shared editor anchored to the focused row (the keyboard route) — same full-set
 	// semantics as Contacts: the draft is seeded from current memberships, Apply sends the whole
 	// checked set through contactUpdateGroups.
+	// Captured at open and NOT cleared by onclose, so focus restoration still knows which row to go
+	// back to after groupPopoverFor has been nulled (Codex review 2026-08-11).
+	let gmpOpenedFor: string | null = $state(null);
+
 	function openGroupPopover(npub: string) {
 		const row = document.getElementById(rowId(ROW_ID_PREFIX, npub));
 		groupPopoverAnchor = row ?? undefined;
 		groupPopoverFor = npub;
+		gmpOpenedFor = npub;
 	}
 
 	async function applyGroupPopover(npub: string, names: string[]) {
@@ -481,7 +490,7 @@
 	}
 
 	async function loadGroupsInto() {
-		try { groups = await groupsGet(); } catch { /* non-fatal */ }
+		try { groups = await groupsGet(); groupsLoaded = true; } catch { /* non-fatal */ }
 	}
 
 	function onDragStart(e: DragEvent, npub: string) {
@@ -1180,14 +1189,17 @@
 	contactName={gmpContactName}
 	groups={groups}
 	memberships={gmpMemberships}
+	ready={groupsLoaded}
 	onapply={(names) => groupPopoverFor && applyGroupPopover(groupPopoverFor, names)}
 	onclose={() => (groupPopoverFor = null)}
 	onnewgroup={() => (createGroupOpen = true)}
 	returnFocusTo={() => {
 		// Return focus to the row that opened the editor (or the first rendered row if it was
 		// filtered away — A9: .focus() on a detached node is a silent no-op).
-		if (!groupPopoverFor) return undefined;
-		const el = document.getElementById(rowId(ROW_ID_PREFIX, groupPopoverFor));
+		// onclose sets groupPopoverFor = null BEFORE this runs, so reading it here returned undefined
+		// and focus was stranded on <body> (Codex review 2026-08-11). Use the npub captured at open.
+		if (!gmpOpenedFor) return undefined;
+		const el = document.getElementById(rowId(ROW_ID_PREFIX, gmpOpenedFor));
 		if (el?.isConnected) return el;
 		return document.getElementById(rowId(ROW_ID_PREFIX, contactOrder[0])) ?? undefined;
 	}}
