@@ -46,7 +46,7 @@
 	//    a slow tick (L4-budgeted); shows "–" while the count is unknown (m4).
 	let onlineData: OnlineCount | null = $state(null);
 	let relayHealth: RelayHealth[] = $state([]);
-	let chip = $derived(onlineChipView(onlineData, true));
+	let chip = $derived(onlineChipView(onlineData, true, relayHealth));
 	// M12 W1 Decision D: when the chip can't show a number, say *why* (which relays are unreachable).
 	let whyHint = $derived(chip.unknown ? relayWhyHint(relayHealth) : '');
 	let onlinePollTimer: ReturnType<typeof setInterval> | undefined;
@@ -952,7 +952,7 @@
 		</div>
 	</div>
 	{#if chip.show}
-		<span class="online-chip" class:online-chip-muted={chip.unknown} title={whyHint ? `Hoarders online now — ${whyHint}` : 'Hoarders online now'}>{chip.label}</span>
+		<span class="online-chip online-chip-{chip.state}" class:online-chip-muted={chip.unknown} title={whyHint ? `Hoarders online now — ${whyHint}` : 'Hoarders online now'}><span class="online-dot"></span>{chip.label}</span>
 		{#if whyHint}
 			<span class="online-why" title={whyHint}>({whyHint})</span>
 		{/if}
@@ -961,7 +961,7 @@
 
 <!-- Sticky sub-header: free-text search, Name|Groups view toggle, "+ Add contact" -->
 <div class="subheader">
-	<div class="subheader-search">
+	<div class="hb-input subheader-search">
 		<span class="search-icon">{@html icons.search}</span>
 		<input type="text" placeholder="Search name, bio, tags, collections…" bind:value={searchQuery} />
 	</div>
@@ -1256,7 +1256,7 @@
 					{/each}
 					{#if editingTagsFor === peer.npub}
 						<input
-							class="tag-input"
+							class="hb-input tag-input"
 							type="text"
 							placeholder="tag…"
 							bind:value={tagInput}
@@ -1465,7 +1465,7 @@
 				{/if}
 			</div>
 			<input
-				class="dg-input"
+				class="hb-input dg-input"
 				type="text"
 				placeholder="Name this group"
 				bind:this={dragNameEl}
@@ -1513,7 +1513,14 @@
 	}
 	.topbar-title { font-size: 17px; font-weight: 600; letter-spacing: -0.3px; }
 	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
-	.online-chip { font-size: 12px; font-weight: 600; color: var(--fg-dim); white-space: nowrap; }
+	.online-chip {
+		display: inline-flex; align-items: center; gap: 5px;
+		font-size: 12px; font-weight: 600; color: var(--fg-dim); white-space: nowrap;
+	}
+	.online-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; display: inline-block; }
+	.online-chip-red .online-dot { background: var(--error); }
+	.online-chip-amber .online-dot { background: oklch(0.78 0.15 75); }
+	.online-chip-green .online-dot { background: var(--online); }
 	.online-chip-muted { opacity: 0.55; }
 	.online-why { font-size: 10.5px; color: var(--fg-dim); opacity: 0.7; white-space: nowrap; }
 
@@ -1527,17 +1534,14 @@
 		background: var(--bg);
 		flex-shrink: 0;
 	}
+	/* QURATOR-52 §5 — on the .hb-input contract; only the search-specific layout (icon gap,
+	   max-width, padding for the icon prefix) is local. The inner input is transparent/borderless
+	   so the wrapper reads as one search field. */
 	.subheader-search {
 		flex: 1;
 		max-width: 380px;
-		display: flex;
-		align-items: center;
 		gap: 8px;
 		padding: 0 11px;
-		height: 34px;
-		background: var(--bg-input);
-		border: 1px solid var(--border);
-		border-radius: 7px;
 	}
 	.subheader-search .search-icon { color: var(--fg-dim); display: flex; flex-shrink: 0; }
 	.subheader-search input {
@@ -1810,10 +1814,11 @@
 		border-radius: 4px; padding: 1px 7px; cursor: pointer; font-family: var(--font-ui);
 	}
 	.tag-add-btn:hover { border-color: var(--accent); color: var(--accent); }
+	/* QURATOR-52 §5 — on the .hb-input contract; only the active-edit overrides are local
+	   (accent border to mark editing, smaller font/radius for the inline tag slot). */
 	.tag-input {
-		font-size: 11px; background: var(--bg-input); border: 1px solid var(--accent);
-		border-radius: 4px; padding: 1px 7px; outline: none; color: var(--fg);
-		min-width: 60px; font-family: var(--font-ui);
+		font-size: 11px; border-color: var(--accent);
+		border-radius: 4px; padding: 1px 7px; min-width: 60px;
 	}
 
 	.contact-detail {
@@ -1917,13 +1922,8 @@
 		background: var(--accent);
 		flex-shrink: 0;
 	}
-	.dg-input {
-		flex: 1; font-size: 13px; background: var(--bg-input); border: 1px solid var(--border);
-		border-radius: 6px; padding: 4px 8px; outline: none; color: var(--fg);
-		font-family: var(--font-ui); min-width: 0;
-	}
-	.dg-input:focus { border-color: var(--accent); }
-	.dg-input::placeholder { color: var(--fg-dim); }
+	/* QURATOR-52 §5 — on the .hb-input contract; only the layout (flex/padding) is local. */
+	.dg-input { flex: 1; padding: 4px 8px; min-width: 0; }
 	.dg-suggestions { display: flex; flex-wrap: wrap; gap: 5px; padding: 0 8px 4px; }
 	.dg-chip {
 		font-size: 11px; padding: 2px 8px; border-radius: 999px;
