@@ -113,6 +113,22 @@ where
 }
 
 /// Install the file-based subscriber writing under `<app_data_dir>/logs/`. Never panics — a
+/// The default tracing filter, used when `HB_LOG` is unset.
+///
+/// **`nostr_relay_pool` is pinned to WARN deliberately** (devtest 2026-08-11, owner ruling). A
+/// flapping relay drowns the file the user pastes into a support thread: in the reported session
+/// **87 of the log's 87 ERROR lines came from that one third-party crate** — 68 of them the same
+/// `Failed to stream events … relay not connected` retry against nos.lol — and **not one came from
+/// an `hb_*` crate**. The app was behaving correctly throughout; the noise was the whole problem.
+///
+/// WARN keeps a genuine relay failure visible (a real disconnect still logs) while dropping the
+/// per-retry chatter. `HB_LOG` still overrides this wholesale for a deep-dive session.
+///
+/// ⚠ This demotes VOLUME, not content. Relay URLs stay loggable — they are user-configured public
+/// infrastructure. Peer/node addresses are the H4/MT2 harvest shape and are never logged at any
+/// level.
+pub(crate) const DEFAULT_LOG_FILTER: &str = "hb_app=debug,hb_net=debug,nostr_relay_pool=warn,info";
+
 /// failure returns silently (stderr gets a best-effort line) so the app starts regardless.
 pub(crate) fn install(data_dir: &Path) {
     // v0.12.11: route panics through tracing into the log file. The 2026-08-03 root-cause hunt
@@ -131,7 +147,7 @@ pub(crate) fn install(data_dir: &Path) {
     }));
 
     let filter = EnvFilter::try_from_env("HB_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("hb_app=debug,hb_net=debug,info"));
+        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
 
     let log_dir = data_dir.join("logs");
     // The appender builder's `max_log_files(3)` caps retention to 3 rolled files; a failure here
@@ -273,6 +289,67 @@ mod tests {
         // reference to the Layered stack does not compile.
         let guard = tracing::subscriber::set_default(subscriber);
         (guard, shared)
+    }
+
+    /// M23 W2 Part B — the default filter must DEMOTE the third-party relay pool without silencing
+    /// it, and without touching our own crates' levels.
+    ///
+    /// Asserted behaviourally, by emitting at explicit targets through a subscriber built from
+    /// [`DEFAULT_LOG_FILTER`] and reading back what survived — NOT by string-matching the filter,
+    /// which would pass for a directive that parses and does nothing. The three cases are the whole
+    /// ruling: a relay ERROR still lands (a genuine failure stays visible), a relay INFO does not
+    /// (the 68-line retry chatter is what drowned the user's log), and `hb_app` DEBUG still lands
+    /// (demoting the noise must not cost us our own breadcrumbs).
+    #[test]
+    fn default_filter_demotes_the_relay_pool_but_keeps_our_own_debug() {
+        use std::io::Write as _;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct BufMaker(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for BufMaker {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().map_err(|_| std::io::Error::other("poisoned"))?.write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for BufMaker {
+            type Writer = BufMaker;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new(DEFAULT_LOG_FILTER))
+            .with(fmt_layer(BufMaker(buf.clone())));
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            // The shape that flooded the devtest log: a per-retry INFO/ERROR pair from the pool.
+            tracing::error!(target: "nostr_relay_pool::relay::inner", "RELAY_ERROR_MARKER");
+            tracing::info!(target: "nostr_relay_pool::pool", "RELAY_INFO_MARKER");
+            // Our own breadcrumb — the thing the noise was burying.
+            tracing::debug!(target: "hb_app::presence", "OUR_DEBUG_MARKER");
+        }
+
+        let out = String::from_utf8(buf.lock().unwrap().clone()).expect("utf8 log");
+        assert!(
+            out.contains("RELAY_ERROR_MARKER"),
+            "a genuine relay ERROR must still reach the log — demoting volume must not blind us:\n{out}"
+        );
+        assert!(
+            !out.contains("RELAY_INFO_MARKER"),
+            "relay-pool INFO must be filtered out; this is the 68-line retry chatter that drowned \
+             the user's diagnostics:\n{out}"
+        );
+        assert!(
+            out.contains("OUR_DEBUG_MARKER"),
+            "hb_app DEBUG must survive — demoting the third-party noise must not cost us our own \
+             breadcrumbs:\n{out}"
+        );
     }
 
     /// The RED-GREEN control, GREEN half: drive real production logging sites (relay connect failure,
