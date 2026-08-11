@@ -91,8 +91,8 @@ describe('FeatureTooltip — accessible hover/focus help (HOARDBOOK_SPEC §8)', 
 		expect(tip.hasAttribute('hidden')).toBe(false); // click toggled it open (show/hide only)
 	});
 
-	it('renders each of the five spec anchors accessibly', () => {
-		for (const key of ['no-download', 'willing-to', 'listings-locked', 'k-of-n-folders', 'fingerprint'] as const) {
+	it('renders each of the six spec anchors accessibly', () => {
+		for (const key of ['no-download', 'willing-to', 'listings-locked', 'k-of-n-folders', 'fingerprint', 'custom-relays'] as const) {
 			const { getByRole, unmount } = render(FeatureTooltip, { props: { key } });
 			const trigger = getByRole('button');
 			const tip = tipOf(trigger);
