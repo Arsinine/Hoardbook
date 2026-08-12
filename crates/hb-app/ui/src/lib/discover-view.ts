@@ -47,3 +47,17 @@ export function pageItems<T>(items: T[], page: number): T[] {
 export function pageCount(total: number): number {
 	return Math.max(1, Math.ceil(total / DISCOVER_PAGE_SIZE));
 }
+
+/** QURATOR-70 — the tag-autocomplete suggestion list. Pure so the filter math is unit-tested
+ *  without a DOM. Given the full set of observed tags, the already-selected tags, and what the user
+ *  has typed, returns the unselected observed tags whose lowercased form contains the typed stem
+ *  (case-insensitive substring, matching the Rust single-term fuzzy rule). Capped to keep the
+ *  dropdown short. */
+export function suggestTags(observed: string[], selected: string[], typed: string, cap = 8): string[] {
+	const stem = typed.trim().toLowerCase();
+	if (!stem) return [];
+	return observed
+		.filter((t) => !selected.includes(t))
+		.filter((t) => t.toLowerCase().includes(stem))
+		.slice(0, cap);
+}

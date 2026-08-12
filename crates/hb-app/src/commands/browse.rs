@@ -900,6 +900,41 @@ pub async fn search_peers(
     Ok(PeerSearchResult { hits: hits.into_iter().map(hit_to_card).collect(), capped })
 }
 
+/// QURATOR-70 — tag autocomplete: the set of tags this node has actually observed, for the Discover
+/// search box's chip/pill affordance. "Observed" = tags carried on ingested teasers — the cached
+/// contacts' `Profile.tags` (teasers we have already resolved) plus the identity's own profile tags.
+/// The owner ruled multi-term search stays strict AND-on-tags; the chip affordance is
+/// load-bearing for that ruling because it makes the second term a real tag picked from a list,
+/// rather than hopeful free text that silently switches the search's kind. Pure over the local
+/// cache — no relay read. Tags are lowercased, deduped, and sorted (alphabetical for determinism).
+#[tauri::command]
+pub async fn discover_observed_tags(
+    store: State<'_, DataStore>,
+) -> CmdResult<Vec<String>> {
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // The identity's own profile tags (the draft IS the published teaser source — see profile.rs).
+    if let Some(profile) = store.load_profile_draft().map_err(cmd_err)? {
+        for tag in &profile.tags {
+            let t = tag.trim().to_lowercase();
+            if !t.is_empty() {
+                seen.insert(t);
+            }
+        }
+    }
+    // Tags from every cached contact's resolved teaser (Profile.tags).
+    for peer in store.list_contacts().map_err(cmd_err)? {
+        if let Some(profile) = &peer.profile {
+            for tag in &profile.tags {
+                let t = tag.trim().to_lowercase();
+                if !t.is_empty() {
+                    seen.insert(t);
+                }
+            }
+        }
+    }
+    Ok(seen.into_iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

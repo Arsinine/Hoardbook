@@ -372,9 +372,17 @@ export interface PeerSearchResult {
 }
 
 /** Search public teasers by tag (AND) / content-type (OR). ≥1 filter is required (the backend
- *  rejects an empty search — no unfiltered global peer list). */
+ *  rejects an empty search — no unfiltered global peer list). QURATOR-70: a SINGLE tag term matches
+ *  name/bio/tags fuzzily; two+ tag terms are strict AND-on-tags (the chip affordance makes the
+ *  second term a real observed tag, so narrowing never silently switches search kind). */
 export const searchPeers = (tags: string[], contentTypes: string[]) =>
 	invoke<PeerSearchResult>('search_peers', { tags, contentTypes });
+
+/** QURATOR-70 — the set of tags this node has observed (contacts' teaser tags + own profile tags),
+ *  for the Discover tag-chip autocomplete. Pure local-cache read — no relay round-trip. Lowercased,
+ *  deduped, alphabetically sorted. */
+export const discoverObservedTags = () =>
+	invoke<string[]>('discover_observed_tags');
 
 // ── Collection root path ────────────────────────────────────────────────────────
 
