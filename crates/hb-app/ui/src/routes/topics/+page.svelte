@@ -50,6 +50,12 @@
 	let expandedRoot: string | null = $state(null);
 	let rootTopics: Record<string, DiscoveredTopic[]> = $state({});
 	let loadingRoot: string | null = $state(null);
+	// QURATOR-80: a fetch FAILURE must not render as the confident negative "No public Topics under X
+	// yet" — that string is indistinguishable from a genuine empty, a timeout, an empty relay set, or
+	// an untagged announce. Track which roots FAILED so the surface can say "we could not reach the
+	// relays" (retryable) vs "the relays answered, there are none" (not). An error is NOT cached: a
+	// re-expand retries, unlike a successful empty which is cached (rootTopics[root] = []).
+	let erroredRoots: Set<string> = $state(new Set());
 
 	// The consent gate: which Topic (public name + private flag) is pending a join. For a private
 	// redeem, `issuerNpub` carries who vouches (surfaced in the consent modal); `mode: 'redeem'` routes
@@ -206,17 +212,33 @@
 			return;
 		}
 		expandedRoot = root;
-		if (rootTopics[root]) return; // already fetched
+		// A successful fetch caches (incl. a genuine empty = `[]`). A FAILED fetch is NOT cached: it
+		// lands in `erroredRoots` instead, so a re-expand retries rather than replaying the error, and
+		// the surface can distinguish "could not ask" from "asked, none" (QURATOR-80).
+		if (rootTopics[root] !== undefined || erroredRoots.has(root)) {
+			if (erroredRoots.has(root)) {
+				// Re-expand on an errored root = explicit retry: clear the error and re-fetch.
+				const next = new Set(erroredRoots);
+				next.delete(root);
+				erroredRoots = next;
+			} else {
+				return; // cached successful result (incl. genuine empty)
+			}
+		}
 		loadingRoot = root;
 		try {
 			const found = await topicDiscover([root]);
 			rootTopics = { ...rootTopics, [root]: found }; // cache regardless — keyed by root
 		} catch (e) {
-			// Only surface/collapse if this root is STILL the open one: a stale request for a category
-			// the user already switched away from must not error over or collapse the current one (codex).
+			// Only surface if this root is STILL the open one: a stale request for a category the user
+			// already switched away from must not error over the current one (codex). Keep the section
+			// expanded with an error status (distinct from the genuine-empty message) so the user can
+			// retry by collapsing + re-expanding — do NOT collapse to a confident negative.
 			if (expandedRoot === root) {
 				toast(String(e), 'error');
-				expandedRoot = null;
+				const next = new Set(erroredRoots);
+				next.add(root);
+				erroredRoots = next;
 			}
 		} finally {
 			// Only clear the spinner if it belongs to THIS request — a stale resolve must not clear a
@@ -486,6 +508,14 @@
 					{#if expandedRoot === root}
 						{#if loadingRoot === root}
 							<div class="root-status muted">Loading…</div>
+						{:else if erroredRoots.has(root)}
+							<!-- QURATOR-80: a fetch failure is NOT the confident negative "No public Topics under X
+							     yet" — that string is indistinguishable from a genuine empty. This surface reads "we
+							     could not reach the relays" (retryable) so an unknown is never rendered as a confident
+							     negative. Collapsing + re-expanding retries (toggleRoot clears the error and re-fetches). -->
+							<div class="root-status root-error">
+								Couldn’t reach the relays for “{root}”. Collapse and re-expand to retry.
+							</div>
 						{:else if (rootTopics[root] ?? []).length === 0}
 							<div class="root-status muted">No public Topics under “{root}” yet.</div>
 						{:else}
@@ -633,6 +663,11 @@
 	.root-chevron { display: flex; transition: transform 0.15s; color: var(--fg-dim); }
 	.root-chevron.open { transform: rotate(90deg); }
 	.root-status { padding: 6px 0 6px 22px; }
+	/* QURATOR-80: the fetch-failure status is on the shared --error ramp (same token as .btn-danger),
+	   so an unknown reads visually distinct from the muted genuine-empty status, not as a confident
+	   negative. jsdom computes no layout — this colour is asserted in the source-scan test, not
+	   rendered by vitest. */
+	.root-error { color: var(--error); }
 
 	.empty { padding: 16px 8px; }
 

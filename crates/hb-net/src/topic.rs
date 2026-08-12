@@ -44,6 +44,30 @@ pub async fn publish_topic(client: &RelayClient, events: &[Event]) -> Result<(),
 /// cap, so a flood of junk paths can't make discovery or the client-side tree unbounded.
 pub const TOPIC_DISCOVERY_CAP: usize = 100;
 
+/// Relay-fetch headroom over the ranked [`TOPIC_DISCOVERY_CAP`] — the topic-discovery twin of
+/// [`crate::client::TEASER_SEARCH_FETCH_LIMIT`] (the hardened sibling; CLAUDE.md §9 — one call site
+/// got the fix, its twin didn't). Same lesson, same shape: the relay `#t` filter is an OR over the
+/// tag set, and without an explicit `.limit()` the relay's own internal cap (strfry
+/// `maxFilterLimit` defaults to 500) silently decided which announces came back. A Topic whose
+/// announce was older than 500 loose `#t`-matches was **evicted before the activity-rank ever saw
+/// it** — it reads as "not found" forever (H3, QURATOR-80). Sized at 10× the ranked cap so the
+/// member-count rank sees comfortably more than the visible window; a relay that clamps below this
+/// simply returns fewer.
+pub const TOPIC_DISCOVERY_FETCH_LIMIT: usize = 1000;
+
+/// Build the topic-discovery relay filter — pure (no I/O), so the fetch-budget `.limit()` is
+/// unit-testable without a relay (the same testability split as [`teaser_search_filter`]). Refused
+/// before any query when `tags` is empty.
+pub fn topic_discover_filter(tags: &[String]) -> Result<Filter, NetError> {
+    if tags.is_empty() {
+        return Err(NetError::EmptyFilter);
+    }
+    Ok(Filter::new()
+        .kind(Kind::from_u16(KIND_TOPIC_ANNOUNCE))
+        .hashtags(tags.iter().cloned())
+        .limit(TOPIC_DISCOVERY_FETCH_LIMIT))
+}
+
 /// Discover public Topics by tag — a relay read of `KIND_TOPIC_ANNOUNCE` events `#t`-tagged with any
 /// of `tags`, parsed + verified through `hb-core`, deduped by `topic_id` keeping the newest announce,
 /// then **activity-ranked** (M12 W4, Decision M): each result is paired with its best-effort,
@@ -55,10 +79,7 @@ pub async fn discover_public_topics(
     tags: &[String],
     timeout: Duration,
 ) -> Result<Vec<(TopicMeta, usize)>, NetError> {
-    if tags.is_empty() {
-        return Err(NetError::EmptyFilter);
-    }
-    let filter = Filter::new().kind(Kind::from_u16(KIND_TOPIC_ANNOUNCE)).hashtags(tags.iter().cloned());
+    let filter = topic_discover_filter(tags)?;
     let events = client.fetch(filter, timeout).await?;
     // Keep the newest announce per topic_id (a re-announce supersedes).
     let mut best: HashMap<String, (u64, TopicMeta)> = HashMap::new();
@@ -472,6 +493,43 @@ mod tests {
     fn a_plain_dm_is_not_a_join_request() {
         assert!(parse_join_request("hey, want to trade?").is_none());
         assert!(parse_join_request(r#"{"something_else":1}"#).is_none());
+    }
+
+    // ─────────────────── H3 (QURATOR-80): topic-discovery filter fetch budget ────────────────────
+    //
+    // The hardened-path / unhardened-sibling drift pair (CLAUDE.md §9): `teaser_search_filter`
+    // (client.rs) declares an explicit `.limit()` so the relay's own `maxFilterLimit` (strfry default
+    // 500) cannot silently evict a strict-AND match older than 500 loose `#t` hits. The topic path
+    // had the identical shape and none of the fix — a Topic announce older than 500 loose matches was
+    // dropped before `discover_public_topics` ever saw it, reading as "not found" forever.
+
+    #[test]
+    fn topic_discover_filter_declares_an_explicit_limit_h3() {
+        // Without `.limit()` the relay's internal response cap decided which announces came back, so
+        // the activity-rank never saw the full set. The budget must be ours, not the relay's default.
+        let f = topic_discover_filter(&["video".into()]).unwrap();
+        assert_eq!(f.limit, Some(TOPIC_DISCOVERY_FETCH_LIMIT), "fetch budget is declared explicitly");
+    }
+
+    #[test]
+    fn topic_discover_filter_targets_the_topic_announce_kind_and_tags() {
+        let f = topic_discover_filter(&["video".into(), "anime".into()]).unwrap();
+        // The kind set contains exactly the topic-announce kind.
+        let expected = Kind::from_u16(KIND_TOPIC_ANNOUNCE);
+        assert!(f.kinds.as_ref().map_or(false, |k| k.contains(&expected) && k.len() == 1));
+        // The tags ride on `#t` (hashtags) — assert against the SERIALIZED filter, i.e. the bytes the
+        // relay actually evaluates. An `is_empty()` check here would be vacuous (true of any filter
+        // carrying a kind), which is the "green test claiming coverage it never had" shape CLAUDE.md
+        // §9 catalogs; the OR-union membership has to be asserted directly or not claimed at all.
+        let wire = serde_json::to_value(&f).expect("filter serializes");
+        let t = wire.get("#t").and_then(|v| v.as_array()).expect("the filter carries a #t tag set");
+        let got: Vec<&str> = t.iter().filter_map(|v| v.as_str()).collect();
+        assert!(got.contains(&"video") && got.contains(&"anime"), "both tags ride #t, got {got:?}");
+    }
+
+    #[test]
+    fn topic_discover_filter_refuses_empty_tags_before_any_query() {
+        assert!(topic_discover_filter(&[]).is_err(), "an empty tag set must not be shipped to a relay");
     }
 
     // ───────────────────────── M13 Part A: channel partition (pure, no relay) ─────────────────────
