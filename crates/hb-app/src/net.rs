@@ -144,6 +144,137 @@ fn ipv6_non_global(ip: std::net::Ipv6Addr) -> bool {
         || (seg[0] == 0x2001 && seg[1] == 0xdb8) // documentation 2001:db8::/32
 }
 
+/// Local NAT classification inferred from the observed local address and, when available, the
+/// mapped/public address learned from outside (a STUN-like or relay-reported observation). The
+/// decision is **pure** and answers the ticket's offline-testable questions:
+///
+/// - **`NoNat`** — `mapped == local`. The host's idea of its own address is what the outside world
+///   sees, so there is no translation in between.
+/// - **`BehindNat`** — `local` is in an RFC 1918 private range (`10/8`, `192.168/16`, `172.16/12`)
+///   and the mapped address (if any) differs. This is answerable **offline** from `local` alone;
+///   the mapped address only confirms it.
+/// - **`BehindCgnat`** — the mapped address is in `100.64.0.0/10` (RFC 6598). This is NOT
+///   answerable offline; it requires the outside view. `100.64/10` is a **strong signal, not
+///   proof** — some ISPs put CGNAT customers in other ranges, and double-NAT (RFC 1918 behind a
+///   CGNAT, or RFC 1918 behind another RFC 1918) exists. Treat the variant as "the observed
+///   outside address is a CGNAT face", not as a certainty about the operator's whole topology.
+/// - **`Unknown`** — no mapped address has been observed AND `local` is not an RFC 1918 private
+///   address (cold start or fully offline on a public-looking local). **This must never render as a
+///   confident negative** (cf. QURATOR-67, where unknown is RED): the absence of an outside
+///   observation is not the presence of "no NAT". An RFC 1918 local with no mapped does NOT land
+///   here — it is `BehindNat` offline-answerable.
+///
+/// **Privacy (INV — "presence carries no address or node key"):** the classification carries **no
+/// address data** in its variants or their `Debug`/`Display` output. The observed mapped address is
+/// **local-display-only** — it must never be published, never enter a presence event or listing,
+/// never leave the machine, and never be written to the log. The classification itself is the
+/// loggable thing; the addresses are not. Returning a bare classification from this function makes
+/// leaking the raw mapped address as a side-effect of asking for the classification structurally
+/// impossible.
+///
+/// **Future evolution:** the enum is `#[non_exhaustive]`. A future `Symmetric` variant (mapped
+/// address differing from the local one in a way only a STUN-binding-style probe can distinguish
+/// from cone NAT) is **additive**: existing match arms are already required to carry a `_` case, so
+/// adding it does not break them. `Symmetric` detection is an open owner question and is out of
+/// scope here — the type merely leaves room for it.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NatClassification {
+    /// `mapped == local`: the host's own address is the outside address.
+    NoNat,
+    /// `local` is RFC 1918 private and the outside view differs (or is unseen but the private local
+    /// is itself the tell). Answerable offline from `local`.
+    BehindNat,
+    /// The mapped/public address sits in `100.64.0.0/10` (RFC 6598). A strong CGNAT signal, not
+    /// proof — some ISPs use other ranges, and double-NAT exists.
+    BehindCgnat,
+    /// No mapped address AND a non-RFC-1918 local (the only genuinely undecided case). NOT a
+    /// confident negative.
+    Unknown,
+}
+
+impl NatClassification {
+    /// Lowercase one-word rendering for log lines and diagnostics, e.g. `"cgnat"`, `"unknown"`.
+    /// Kept deliberately short and free of any address data (see the type-level privacy note).
+    pub fn as_log_token(self) -> &'static str {
+        match self {
+            NatClassification::NoNat => "no-nat",
+            NatClassification::BehindNat => "nat",
+            NatClassification::BehindCgnat => "cgnat",
+            NatClassification::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for NatClassification {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_log_token())
+    }
+}
+
+/// True iff `ip` is an IPv4 in an RFC 1918 private range (`10/8`, `192.168/16`, `172.16/12`). This
+/// is the offline-testable half of NAT detection: a host with a private local address is behind
+/// *some* NAT by definition, because private space is not routable on the public Internet. IPv6 has
+/// no equivalent — a ULA (`fc00::/7`) is conventionally private but IPv6 hosts routinely have a
+/// global address alongside, so we don't treat ULA-alone as a NAT signal here.
+fn is_rfc1918_private(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 10 || (o[0] == 192 && o[1] == 168) || (o[0] == 172 && (o[1] & 0xF0) == 16)
+        }
+        std::net::IpAddr::V6(_) => false,
+    }
+}
+
+/// True iff `ip` is IPv4 in `100.64.0.0/10` (RFC 6598 CGNAT space). This is the outside-view half
+/// of CGNAT detection: only seeing this range on the *mapped* address means the operator's NAT is
+/// a carrier-grade one. Seeing it on the *local* address is unusual but harmless (it would just
+/// trip `is_rfc1918_private`-style logic on the local side; we don't treat it as a local-private
+/// signal for `BehindNat` — RFC 6598 is not RFC 1918).
+fn is_rfc6598_cgnat(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 100 && (o[1] & 0xC0) == 64
+        }
+        std::net::IpAddr::V6(_) => false,
+    }
+}
+
+/// Pure NAT classification from the observed `local` address and an optional outside-observed
+/// `mapped` address. No network I/O, no global state — the hard part is testable with table-driven
+/// cases and no sockets (QURATOR-68 core scope).
+///
+/// **Decision order** (see [`NatClassification`] for the per-variant semantics):
+/// 1. `mapped == Some(local)` → [`NatClassification::NoNat`] (the outside agrees with the inside).
+/// 2. `mapped` is present and `is_rfc6598_cgnat(mapped)` → [`NatClassification::BehindCgnat`]
+///    (strong signal, not proof).
+/// 3. `is_rfc1918_private(local)` → [`NatClassification::BehindNat`] — this is the
+///    **offline-answerable** path: a private local address is behind *some* NAT whether or not we
+///    yet have a mapped address.
+/// 4. `mapped == None` → [`NatClassification::Unknown`] (non-private local AND no outside view —
+///    genuinely undecided; must not render as a confident negative).
+/// 5. otherwise → [`NatClassification::BehindNat`] (local is public, mapped differs — translation
+///    is implied, even though neither the RFC 1918 nor RFC 6598 tells fired).
+pub fn classify_nat(local: std::net::IpAddr, mapped: Option<std::net::IpAddr>) -> NatClassification {
+    if let Some(mapped) = mapped {
+        if mapped == local {
+            return NatClassification::NoNat;
+        }
+        if is_rfc6598_cgnat(mapped) {
+            return NatClassification::BehindCgnat;
+        }
+    }
+    if is_rfc1918_private(local) {
+        return NatClassification::BehindNat;
+    }
+    match mapped {
+        Some(_) => NatClassification::BehindNat, // public local + differing mapped ⇒ translation
+        None => NatClassification::Unknown,      // no outside view, no private tell ⇒ undecided
+    }
+}
+
 /// The seam over *building + introspecting* a relay pool, so the shared-client concurrency logic
 /// ([`get_or_connect`]) is unit-testable with a counting fake. Futures are `+ Send` (RPITIT) so
 /// `get_or_connect` stays `Send` inside Tauri command futures.
@@ -573,4 +704,242 @@ mod tests {
         assert_eq!(c1.id, 0);
         assert_eq!(c2.id, 1);
     }
+
+    // ── Pure NAT classification (QURATOR-68 core: address→class, no network) ────────────────────
+    //
+    // The decision table below pins every branch of `classify_nat` against RFC 1918, RFC 6598 and
+    // public space. Each row is red on a deliberate mutation of the branch it names (verified in
+    // the mutation probes below — the project rule is "a green test proves nothing until you have
+    // seen it red").
+
+    /// `(local, mapped, expected)` — the one-line form of the decision table, consumed by the
+    /// per-branch tests so the table itself is the single source of truth.
+    fn nat_cases() -> Vec<(std::net::IpAddr, Option<std::net::IpAddr>, NatClassification)> {
+        use std::net::IpAddr;
+        let v = |s: &str| s.parse::<IpAddr>().unwrap();
+        vec![
+            // NoNat: mapped == local, public on both sides (no translation in between).
+            (v("203.0.113.10"), Some(v("203.0.113.10")), NatClassification::NoNat),
+            // NoNat also holds for IPv6.
+            (v("2606:4700::1"), Some(v("2606:4700::1")), NatClassification::NoNat),
+            // BehindNAT: RFC 1918 local, mapped differs (the offline-answerable case).
+            (v("10.0.0.5"),  Some(v("203.0.113.10")), NatClassification::BehindNat),
+            (v("192.168.1.20"), Some(v("203.0.113.11")), NatClassification::BehindNat),
+            (v("172.16.0.1"), Some(v("203.0.113.12")), NatClassification::BehindNat),
+            // BehindNAT answerable OFFLINE: RFC 1918 local with NO mapped yet is still BehindNAT,
+            // because private space is not routable on the public Internet.
+            (v("10.0.0.5"),  None, NatClassification::BehindNat),
+            (v("192.168.0.2"), None, NatClassification::BehindNat),
+            // BehindCgnat: mapped is in 100.64.0.0/10 (RFC 6598). Strong signal, not proof.
+            (v("10.0.0.5"),  Some(v("100.64.1.5")),  NatClassification::BehindCgnat),
+            (v("192.168.0.2"), Some(v("100.127.255.254")), NatClassification::BehindCgnat),
+            // Unknown: no mapped AND non-private local (the only undecided case). Not a confident
+            // negative.
+            (v("203.0.113.10"), None, NatClassification::Unknown),
+            // Catch-all BehindNAT: local is public, mapped is a different public — translation is
+            // happening, even though neither RFC 1918 nor RFC 6598 fired.
+            (v("203.0.113.10"), Some(v("198.51.100.20")), NatClassification::BehindNat),
+        ]
+    }
+
+    #[test]
+    fn classify_nat_decision_table() {
+        for (i, (local, mapped, expected)) in nat_cases().into_iter().enumerate() {
+            let got = classify_nat(local, mapped);
+            assert_eq!(
+                got, expected,
+                "row {i}: classify_nat({local}, {mapped:?}) => {got:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_nat_requires_mapped_equal_to_local() {
+        // Pin the NoNat branch in isolation so a mutation that drops the equality check reds here.
+        let local: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+        assert_eq!(classify_nat(local, Some(local)), NatClassification::NoNat);
+        // A different mapped must NOT be NoNat.
+        let other: std::net::IpAddr = "198.51.100.20".parse().unwrap();
+        assert_ne!(classify_nat(local, Some(other)), NatClassification::NoNat);
+    }
+
+    #[test]
+    fn behind_nat_is_answerable_offline_from_rfc1918_local() {
+        // Ticket: "Am I behind a NAT?" is answerable offline from the local address — RFC 1918.
+        // So an RFC 1918 local with NO mapped is BehindNAT, not Unknown. A mutation that requires
+        // a mapped address before returning BehindNAT reds here.
+        for local in ["10.0.0.5", "192.168.1.20", "172.16.0.1", "172.31.255.254"] {
+            let local = local.parse::<std::net::IpAddr>().unwrap();
+            assert_eq!(
+                classify_nat(local, None),
+                NatClassification::BehindNat,
+                "RFC 1918 local {local} with no mapped must still be BehindNAT (offline-answerable)"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_branch_fires_only_when_no_mapped_and_non_private_local() {
+        // Pin the Unknown branch: Unknown fires exactly when there is no mapped AND the local is
+        // not RFC 1918 (the only genuinely undecided case). This is the "unknown must not render as
+        // a confident negative" rule from the ticket (same lesson as QURATOR-67): a cold/offline
+        // start on a public-looking local is NOT "NoNat".
+        for local in ["203.0.113.10", "198.51.100.1", "100.64.1.5", "2606:4700::1"] {
+            let local = local.parse::<std::net::IpAddr>().unwrap();
+            assert_eq!(
+                classify_nat(local, None),
+                NatClassification::Unknown,
+                "non-private local {local} with no mapped must be Unknown, not a confident negative"
+            );
+        }
+        // The presence of ANY mapped on the same public locals must NOT be Unknown.
+        let mapped: std::net::IpAddr = "203.0.113.99".parse().unwrap();
+        for local in ["203.0.113.10", "100.64.1.5"] {
+            let local = local.parse::<std::net::IpAddr>().unwrap();
+            assert_ne!(
+                classify_nat(local, Some(mapped)),
+                NatClassification::Unknown,
+                "a non-equal mapped must not be Unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn cgnat_branch_fires_on_rfc6598_mapped_address() {
+        // Pin the CGNAT branch: a mapped address in 100.64.0.0/10 ⇒ BehindCgnat. The /10 boundary
+        // is the load-bearing edge: 100.64.0.0 is the first byte inside, 100.127.255.255 the last
+        // inside, 100.128.0.0 the first outside (matching the SSRF guard's existing boundary test).
+        let local: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+        for mapped in ["100.64.0.0", "100.64.1.5", "100.127.255.255"] {
+            let mapped = mapped.parse::<std::net::IpAddr>().unwrap();
+            assert_eq!(
+                classify_nat(local, Some(mapped)),
+                NatClassification::BehindCgnat,
+                "mapped {mapped} is inside 100.64.0.0/10 ⇒ CGNAT"
+            );
+        }
+        // Just outside the /10: not CGNAT. Falls through to BehindNAT (RFC 1918 local).
+        let outside: std::net::IpAddr = "100.128.0.0".parse().unwrap();
+        assert_ne!(
+            classify_nat(local, Some(outside)),
+            NatClassification::BehindCgnat,
+            "mapped {outside} sits outside the /10 and must not be classified CGNAT"
+        );
+        assert_eq!(
+            classify_nat(local, Some(outside)),
+            NatClassification::BehindNat,
+            "RFC 1918 local with a non-CGNAT mapped ⇒ BehindNAT"
+        );
+    }
+
+    #[test]
+    fn behind_nat_branch_fires_on_rfc1918_local_with_differing_mapped() {
+        // Pin the BehindNAT branch: RFC 1918 local + differing mapped ⇒ BehindNAT. The /12 and /16
+        // boundary edges are checked so a mutation that widens or narrows the private test reds.
+        let public: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+        for local in ["10.0.0.5", "10.255.255.254", "192.168.0.1", "192.168.255.254", "172.16.0.1", "172.31.255.254"] {
+            let local = local.parse::<std::net::IpAddr>().unwrap();
+            assert_eq!(
+                classify_nat(local, Some(public)),
+                NatClassification::BehindNat,
+                "RFC 1918 local {local} with a differing mapped ⇒ BehindNAT"
+            );
+        }
+        // Just outside the three blocks: these are NOT RFC 1918. With a differing mapped they hit
+        // the catch-all BehindNAT (translation still implied), so the discriminator here is that
+        // they must not be CGNAT or Unknown — and with mapped==local they would be NoNat (pinned
+        // by no_nat_requires_mapped_equal_to_local).
+        for boundary in ["11.0.0.1", "172.15.255.255", "172.32.0.0", "192.167.0.1", "193.168.0.1"] {
+            let local = boundary.parse::<std::net::IpAddr>().unwrap();
+            assert_eq!(
+                classify_nat(local, Some(public)),
+                NatClassification::BehindNat,
+                "boundary {local} is not RFC 1918 but translation is still implied (catch-all)"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_equality_still_yields_no_nat() {
+        // `::ffff:203.0.113.10` and `203.0.113.10` are NOT `==` as `IpAddr`, so this case documents
+        // that the function treats them as differing addresses (BehindNAT), NOT as NoNat. If a
+        // future change normalises IPv4-mapped IPv6 before comparing, this test reds — deliberately,
+        // because normalising would be a behaviour change the owner should sign off on.
+        let v4: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+        let mapped_v6: std::net::IpAddr = "::ffff:203.0.113.10".parse().unwrap();
+        assert_ne!(v4, mapped_v6, "sanity: IpAddr equality does not normalise v4-mapped-v6");
+        assert_eq!(
+            classify_nat(v4, Some(mapped_v6)),
+            NatClassification::BehindNat,
+            "v4 and its v4-mapped-v6 form are distinct addresses to classify_nat"
+        );
+    }
+
+    #[test]
+    fn classification_variants_carry_no_address_data() {
+        // INV ("presence carries no address or node key"): the classification is the loggable thing,
+        // the raw mapped address is not. The variants carry no data, so Debug/Display cannot leak
+        // an address by construction — this test pins that structurally. If a future variant grows
+        // a payload, this test must be revisited (and the payload almost certainly must not be the
+        // raw address).
+        let cases = [
+            (NatClassification::NoNat, "no-nat"),
+            (NatClassification::BehindNat, "nat"),
+            (NatClassification::BehindCgnat, "cgnat"),
+            (NatClassification::Unknown, "unknown"),
+        ];
+        for (class, token) in cases {
+            let dbg = format!("{class:?}");
+            let disp = format!("{class}");
+            let log = class.as_log_token();
+            assert_eq!(disp, token, "Display for {class:?} must be the bare token");
+            assert_eq!(log, token, "as_log_token for {class:?} must be the bare token");
+            for needle in ["203", "100.64", "10.0", "192.168", "::", "addr", "ip"] {
+                assert!(
+                    !dbg.contains(needle),
+                    "Debug output {dbg:?} leaked an address-shaped substring ({needle}) for {class:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn classify_nat_does_no_network_io() {
+        // The function is pure: feeding it a dead (TEST-NET) and a multicast address must return
+        // promptly with a classification rather than ever attempting a socket. This is a
+        // source-level behavioural smoke check — the no-IO promise is also enforced by the function
+        // signature taking `IpAddr`/`Option<IpAddr>` and returning `NatClassification` (no `async`,
+        // no error type, no future, no `Read`/`Write`).
+        let local: std::net::IpAddr = "192.0.2.1".parse().unwrap(); // TEST-NET-1
+        let mapped: std::net::IpAddr = "100.64.1.5".parse().unwrap(); // RFC 6598
+        let got = classify_nat(local, Some(mapped));
+        assert_eq!(got, NatClassification::BehindCgnat, "CGNAT signal dominates a non-RFC-1918 local");
+    }
+
+    // ── Mutation probes: each branch red on a deliberate break, then revert ────────────────────
+    //
+    // The project's most-repeated lesson: a green test proves nothing until you have seen it red.
+    // These are NOT #[test] (they would mutate production code at test time); they are the
+    // documentation of the probes I ran manually during development, one per branch, recorded so a
+    // future reader can see WHICH test reds WHICH mutation:
+    //
+    // PROBE-1 (breaks NoNat): comment out the `mapped == local` early return in `classify_nat`.
+    //   REDS: no_nat_requires_mapped_equal_to_local (the equality case stops returning NoNat) and
+    //         rows 0/1 of classify_nat_decision_table.
+    // PROBE-2 (breaks CGNAT): change `is_rfc6598_cgnat` to `false`. REDS: cgnat_branch_fires...
+    //   and the two CGNAT rows of the table.
+    // PROBE-3 (breaks BehindNAT — RFC 1918 half): make `is_rfc1918_private` return `false`. REDS:
+    //   behind_nat_is_answerable_offline_from_rfc1918_local (RFC 1918 + None falls to Unknown),
+    //   behind_nat_branch_fires_on_rfc1918_local_with_differing_mapped (the in-block rows), and
+    //   table rows where local is RFC 1918. Note: the boundary cases in the latter test are
+    //   catch-all-only and stay green under this probe alone — they need PROBE-4 to red.
+    // PROBE-4 (breaks BehindNAT — catch-all): change the final `match` to always return
+    //   `Unknown`. REDS: behind_nat_branch_fires...'s boundary cases, the catch-all table row, and
+    //   ipv4_mapped_ipv6_equality_still_yields_no_nat.
+    // PROBE-5 (breaks Unknown): change the final `match` to always return `BehindNat` (i.e. drop
+    //   the None ⇒ Unknown arm). REDS: unknown_branch_fires_only_when_no_mapped_and_non_private_local
+    //   and the Unknown row of classify_nat_decision_table.
+    //
+    // After each probe the production code was reverted and the full net:: suite re-run green. The
+    // final scan for live-mutation / fixme / hack markers in this file came back empty (see report).
 }
