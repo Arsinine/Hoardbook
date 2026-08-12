@@ -46,11 +46,26 @@ async fn search(client: &RelayClient, tags: &[String], cts: &[String]) -> Result
     Ok(out)
 }
 
-/// DISC1 client-side refinement: require ALL `tags` (AND), allow ANY `cts` (OR).
+/// DISC1 client-side refinement — the INDEPENDENT ORACLE of the production `teaser_matches` rule.
+/// QURATOR-70 widened single-term matching to name+bio+tags substring (bio/name matching widens
+/// SINGLE-TERM searches only); multi-term stays strict AND-on-tags (the contract WAN-D D3 pins).
+/// This oracle must AGREE with production, so it mirrors the exact rule: 0-1 tag terms → exact tag
+/// OR case-insensitive substring of display_name+bio+tags+content_types; ≥2 terms → strict AND on
+/// exact tags. Content-types are always OR-union.
 fn refine(hits: &[(PublicKey, Teaser)], tags: &[String], cts: &[String]) -> Vec<PublicKey> {
     hits.iter()
         .filter(|(_, t)| {
-            let tags_ok = tags.iter().all(|rt| t.tags.contains(rt));
+            let tags_ok = if tags.len() <= 1 {
+                tags.iter().all(|q| {
+                    t.tags.contains(q)
+                        || t.display_name.to_lowercase().contains(&q.to_lowercase())
+                        || t.bio.to_lowercase().contains(&q.to_lowercase())
+                        || t.tags.iter().any(|x| x.to_lowercase().contains(&q.to_lowercase()))
+                        || t.content_types.iter().any(|x| x.to_lowercase().contains(&q.to_lowercase()))
+                })
+            } else {
+                tags.iter().all(|q| t.tags.contains(q))
+            };
             let cts_ok = cts.is_empty() || cts.iter().any(|rc| t.content_types.contains(rc));
             tags_ok && cts_ok
         })

@@ -4,7 +4,7 @@
 	// existing add entry points keep working unchanged: a lookup-card "Add contact" and a Discover-hit
 	// "Add contact" both call `onadd`, which the page routes into its existing `openAddContact` →
 	// AddContactDialog → completeFollow funnel (petname + group picker, then `follow`).
-	import { pasteKey, searchPeers, type PeerSearchHit, type PeerSearchResult } from '../api.js';
+	import { pasteKey, searchPeers, discoverObservedTags, type PeerSearchHit, type PeerSearchResult } from '../api.js';
 	import { contacts, identity, toast } from '../stores.js';
 	import { icons, avatarHue } from '../icons.js';
 	import Avatar from './Avatar.svelte';
@@ -12,7 +12,7 @@
 	import Modal from './Modal.svelte';
 	import type { CachedPeer } from '../types.js';
 	import { renderFingerprint } from '../identity-display.js';
-	import { DISCOVER_CONTENT_TYPES, parseTagInput, canSearch, toggleContentType, DISCOVER_PAGE_SIZE, pageItems, pageCount } from '../discover-view.js';
+	import { DISCOVER_CONTENT_TYPES, parseTagInput, canSearch, toggleContentType, DISCOVER_PAGE_SIZE, pageItems, pageCount, suggestTags } from '../discover-view.js';
 
 	interface Props {
 		open?: boolean;
@@ -94,6 +94,69 @@
 	let discoverPageItems = $derived(pageItems(discoverResults, discoverPage));
 	let discoverPageCount = $derived(pageCount(discoverResults.length));
 
+	// QURATOR-70 — tag autocomplete. Multi-term search is strict AND-on-tags (the contract DISC1/WAN-D
+	// pin); single-term widens to fuzzy name/bio. The chip affordance is LOAD-BEARING for that rule:
+	// it makes the second term a real observed tag picked from a list, rather than hopeful free text
+	// that silently switches search kind (fuzzy → strict AND) and makes a hit vanish.
+	let observedTags: string[] = $state([]);
+	let tagsLoaded = $state(false);
+
+	async function loadObservedTags() {
+		if (tagsLoaded) return;
+		try {
+			observedTags = await discoverObservedTags();
+			tagsLoaded = true;
+		} catch {
+			// Local-cache read; failures are non-fatal — autocomplete just stays empty.
+			tagsLoaded = true;
+		}
+	}
+
+	/** The last comma/space-separated token the user is currently typing (the partial stem the
+	 *  autocomplete filters on). This is the tail of the input after the last separator. */
+	let typedStem = $derived.by(() => {
+		const raw = discoverTags;
+		const lastSep = Math.max(raw.lastIndexOf(','), raw.lastIndexOf(' '));
+		return raw.slice(lastSep + 1).trim();
+	});
+
+	/** The COMMITTED tags: every parsed tag EXCEPT the one currently being typed (the tail stem).
+	 *  These are the chips already chosen; the autocomplete excludes them so a committed tag is never
+	 *  re-offered. The stem itself is NOT excluded — typing 'vhs' must still offer 'vhs'. */
+	let committedTags = $derived.by(() => {
+		const stem = typedStem;
+		return parsedDiscoverTags.filter((t) => t !== stem);
+	});
+
+	/** Tags from the observed set that the user has NOT yet committed, filtered by the current typed
+	 *  stem. Shown only when the stem is non-empty. Uses the shared pure `suggestTags` helper so the
+	 *  filter math is unit-tested in discover-view.test.ts. */
+	let autocompleteSuggestions = $derived(
+		typedStem.length > 0
+			? suggestTags(observedTags, committedTags, typedStem)
+			: []
+	);
+
+	function addTagChip(tag: string) {
+		// Append the chosen tag to the committed tag set, then clear the free-text input so the next
+		// pick starts fresh. The chips render the committed set (parsedDiscoverTags derives from
+		// discoverTags); clearing the input keeps the autocomplete from re-offering the just-chosen tag
+		// and makes the "pick another" flow obvious.
+		const normalized = tag.trim().toLowerCase();
+		if (!normalized || parsedDiscoverTags.includes(normalized)) {
+			discoverTags = '';
+			return;
+		}
+		discoverTags = [...parsedDiscoverTags, normalized].join(', ');
+		// Clear the typed stem by resetting the input to the committed set (chips render from this).
+		// The chips + this string are the same model: the committed tags, comma-separated.
+	}
+
+	function removeTagChip(tag: string) {
+		const remaining = parsedDiscoverTags.filter((t) => t !== tag);
+		discoverTags = remaining.join(', ');
+	}
+
 	async function runDiscover() {
 		if (!canDiscover) { discoverError = 'Enter at least one tag or content type to search.'; return; }
 		discovering = true;
@@ -109,6 +172,13 @@
 		} finally {
 			discovering = false;
 		}
+	}
+
+	function toggleDiscoverOpen() {
+		discoverOpen = !discoverOpen;
+		// QURATOR-70: load observed tags the first time the Discover section opens so the chip
+		// autocomplete is ready before the user starts typing.
+		if (discoverOpen) loadObservedTags();
 	}
 
 	function followHit(hit: PeerSearchHit) {
@@ -222,13 +292,13 @@
 				<!-- §6 Discover hoarders (moved from Browse — devtest 2026-06-25 #6). Collapsible so it doesn't
 				     clutter the panel; results are the opt-in public teaser only (listings stay 🔒 locked). -->
 				<div class="discover-section">
-					<button class="discover-toggle" onclick={() => (discoverOpen = !discoverOpen)} aria-expanded={discoverOpen}>
+					<button class="discover-toggle" onclick={toggleDiscoverOpen} aria-expanded={discoverOpen}>
 						<span class="discover-toggle-label">{@html icons.search} Discover hoarders</span>
 						<span class="discover-chevron" class:open={discoverOpen}>{@html icons.chevronDown}</span>
 					</button>
 					{#if discoverOpen}
 						<div class="discover-body">
-							<div class="discover-sub">Search public profiles by tag &amp; content type. Only what people chose to announce is searchable — everyone's listings stay encrypted.</div>
+							<div class="discover-sub">Search public profiles by name, bio, or tag. One term searches broadly; two or more tags narrow (pick tags from the list as you type). Only what people chose to announce is searchable — everyone's listings stay encrypted.</div>
 							<div class="ct-row">
 								{#each DISCOVER_CONTENT_TYPES as ct (ct.value)}
 									<button type="button" class="ct-chip" class:ct-on={discoverTypes.includes(ct.value)}
@@ -236,7 +306,38 @@
 								{/each}
 							</div>
 							<form class="disc-tag-row" onsubmit={(e) => { e.preventDefault(); runDiscover(); }}>
-								<input class="hb-input disc-tag-input" placeholder="tags (e.g. anime, vhs)" bind:value={discoverTags} />
+								<div class="disc-tag-input-wrap">
+									{#if committedTags.length > 0}
+										<div class="disc-chip-row">
+											{#each committedTags as tag (tag)}
+												<span class="disc-tag-chip">
+													#{tag}
+													<button type="button" class="disc-chip-x" aria-label="Remove tag {tag}" onclick={() => removeTagChip(tag)}>{@html icons.close}</button>
+												</span>
+											{/each}
+										</div>
+									{/if}
+									<input
+										class="hb-input disc-tag-input"
+										placeholder="name, bio, or tag (e.g. anime, vhs)"
+										bind:value={discoverTags}
+										onfocus={() => loadObservedTags()}
+									/>
+									{#if autocompleteSuggestions.length > 0}
+										<!-- QURATOR-70: tag autocomplete — picking a real observed tag makes multi-term
+										     narrowing tag-driven by construction (the contract strict-AND survives, and the
+										     user understands the second term is a tag, not hopeful free text). -->
+										<ul class="disc-autocomplete" role="listbox" aria-label="Suggested tags">
+											{#each autocompleteSuggestions as tag (tag)}
+												<li role="option" aria-selected="false">
+													<button type="button" class="disc-ac-item" onmousedown={(e) => e.preventDefault()} onclick={() => addTagChip(tag)}>
+														<span class="disc-ac-hash">#</span>{tag}
+													</button>
+												</li>
+											{/each}
+										</ul>
+									{/if}
+								</div>
 								<button class="btn-primary btn-sm" type="submit" disabled={!canDiscover || discovering}>
 									{discovering ? 'Searching…' : 'Search'}
 								</button>
@@ -481,6 +582,36 @@
 	.ct-chip:hover { background: var(--bg-elev3); }
 	.ct-on { background: var(--accent-soft); color: var(--accent); border-color: color-mix(in oklch, var(--accent) 35%, transparent); font-weight: 600; }
 	.disc-tag-row { display: flex; gap: 8px; }
+	/* QURATOR-70: the input wraps with the chip row + autocomplete dropdown so the whole control
+	   stays one unit in the discover row. */
+	.disc-tag-input-wrap { flex: 1; position: relative; display: flex; flex-direction: column; gap: 5px; }
+	.disc-chip-row { display: flex; flex-wrap: wrap; gap: 4px; }
+	.disc-tag-chip {
+		display: inline-flex; align-items: center; gap: 4px;
+		font-size: 10.5px; padding: 2px 6px 2px 7px; border-radius: 999px;
+		color: var(--accent);
+		background: color-mix(in oklch, var(--accent) 12%, transparent);
+		border: 1px solid color-mix(in oklch, var(--accent) 30%, transparent);
+	}
+	.disc-chip-x {
+		background: transparent; border: none; cursor: pointer; color: var(--fg-muted);
+		display: inline-flex; padding: 0; line-height: 1;
+	}
+	.disc-chip-x:hover { color: var(--fg); }
+	.disc-autocomplete {
+		position: absolute; top: 100%; left: 0; right: 0; z-index: 10;
+		margin: 2px 0 0; padding: 3px; list-style: none;
+		background: var(--bg-elev2); border: 1px solid var(--border); border-radius: 7px;
+		box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+		max-height: 220px; overflow-y: auto;
+	}
+	.disc-ac-item {
+		display: flex; align-items: center; width: 100%; text-align: left;
+		padding: 5px 8px; border: none; background: transparent; cursor: pointer;
+		font-size: 12px; color: var(--fg); border-radius: 5px; font-family: var(--font-ui);
+	}
+	.disc-ac-item:hover { background: var(--bg-elev3); }
+	.disc-ac-hash { color: var(--accent); margin-right: 2px; font-weight: 600; }
 	/* M20 W4: the tag input composes the global .hb-input contract; only the flex-grow layout
 	   stays local (the contract is flex:auto so this row input grows to fill the discover row). */
 	.disc-tag-input { flex: 1; }

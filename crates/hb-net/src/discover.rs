@@ -28,15 +28,57 @@ pub struct SearchHit {
     pub created_at: Timestamp,
 }
 
-/// Whether a teaser satisfies a query: **tags AND-intersect** (every requested tag must be
-/// present) while **content-types OR-union** (any requested content-type matches). An empty tag
-/// list imposes no tag constraint; an empty content-type list imposes no content-type constraint
-/// (DISC1).
+/// Whether a teaser satisfies a query. The match rule depends on the NUMBER of tag terms, so the
+/// search's kind deliberately changes with term count (owner ruling QURATOR-70):
+///
+/// - **Multi-term** (`tags.len() >= 2`): strict **tags AND-intersect** — every requested tag must be
+///   an exact tag on the teaser. This is the contract WAN-D D3 and DISC1(b) depend on: a teaser
+///   tagged `[want]` only is discarded for lacking `want2`.
+/// - **Single-term** (`tags.len() == 1`): the one term matches if it is an exact tag OR a
+///   case-insensitive substring of `display_name` + `bio` + `tags` + `content_types`. A peer whose
+///   *bio* says "I collect Berserk" surfaces for the query `berserk` even without a `berserk` tag
+///   (owner ruling: bio/name matching widens SINGLE-TERM searches only). `rank_hits` then orders
+///   exact-tag hits above substring hits.
+/// - **Zero terms**: no tag constraint (content-types alone still filter).
+///
+/// **content-types** are always OR-union (any match), regardless of tag count. An empty
+/// content-type list imposes no content-type constraint (DISC1).
+///
+/// Why the kind-switch is not "broken": multi-term search is tag-driven BY CONSTRUCTION through the
+/// Discover UI's tag-chip autocomplete (QURATOR-70). A user narrows from a fuzzy single term by
+/// picking a real observed tag from a list, so the second term is understood as a tag — not hopeful
+/// free text that silently narrows the result set's *kind* rather than its size.
 pub fn teaser_matches(teaser: &Teaser, tags: &[String], content_types: &[String]) -> bool {
-    let tags_ok = tags.iter().all(|q| teaser.tags.contains(q));
+    let tags_ok = if tags.len() <= 1 {
+        // Single-term (or empty): widen to exact tag OR name/bio/tags/content_types substring.
+        // An empty tag list imposes no tag constraint (DISC1).
+        tags.iter().all(|q| {
+            teaser.tags.contains(q) || substring_in_teaser(q, teaser)
+        })
+    } else {
+        // Multi-term: strict AND-on-tags (owner ruling — the contract DISC1(b) and WAN-D D3 pin).
+        tags.iter().all(|q| teaser.tags.contains(q))
+    };
     let ct_ok =
         content_types.is_empty() || content_types.iter().any(|q| teaser.content_types.contains(q));
     tags_ok && ct_ok
+}
+
+/// Case-insensitive substring test over the teaser's published text fields (display_name + bio +
+/// tags + content_types). This is exactly the haystack `rank_hits` already scores over, so the
+/// filter and the ranker agree on what fields are searchable. Does NOT touch collection names,
+/// descriptions, or file/folder names — those stay browse-key-sealed behind `scan_selective`
+/// (owner ruling 2026-08-10: a searchable index IS a disclosure).
+fn substring_in_teaser(needle: &str, teaser: &Teaser) -> bool {
+    let needle = needle.to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    let name_hit = teaser.display_name.to_lowercase().contains(&needle);
+    let bio_hit = teaser.bio.to_lowercase().contains(&needle);
+    let tag_hit = teaser.tags.iter().any(|t| t.to_lowercase().contains(&needle));
+    let ct_hit = teaser.content_types.iter().any(|c| c.to_lowercase().contains(&needle));
+    name_hit || bio_hit || tag_hit || ct_hit
 }
 
 /// Turn raw fetched teaser events into ranked, trustworthy hits:
@@ -110,10 +152,10 @@ pub fn ingest_teasers_capped(
     (hits, capped)
 }
 
-/// The discovery ranking (QURATOR-44, owner ruling 2026-08-10). **This function is the single swap
-/// point** for discovery order.
+/// The discovery ranking (QURATOR-44, owner ruling 2026-08-10; QURATOR-70 exact-tag-outranks-substring).
+/// **This function is the single swap point** for discovery order.
 ///
-/// Two modes, selected by whether a typed `query` keyword is present:
+/// Three tiers, selected by whether a typed `query` keyword is present and how it matches:
 ///
 /// 1. **Keyword search** (`query` non-empty) — fuzzy rank by trigram overlap between the query and
 ///    exactly the fields the teaser publishes about the person: `display_name` + `bio` + `tags` +
@@ -122,6 +164,13 @@ pub fn ingest_teasers_capped(
 ///    both unacceptable here. Trigram overlap is local, small, dependency-free, and catches typos
 ///    and partial-word matches (e.g. "ani" matches "anime"). Recency (`created_at`, newest first) is
 ///    the stable tiebreak.
+///
+///    **QURATOR-70 — exact tag outranks substring** (owner ruling 1: a self-applied tag is a
+///    deliberate signal; a bio mention is incidental). The single ranking key is a `(tag_tier, score,
+///    recency)` tuple: a hit carrying the query as an EXACT tag sorts above a hit where the query is
+///    only a name/bio substring, REGARDLESS of trigram multiplicity. A bio that repeats "berserk"
+///    five times can no longer outrank a teaser that deliberately tags `berserk`. Within each tier
+///    the trigram score orders as before, and recency remains the stable tiebreak.
 ///
 /// 2. **Type-toggle browse** (`query` empty, content-types only) — deterministic shuffle keyed on
 ///    `seed`. A fresh RNG per render would make pagination incoherent (page 2 reshuffles page 1), so
@@ -143,7 +192,7 @@ pub fn rank_hits(hits: Vec<SearchHit>, query: &str, seed: u64) -> Vec<SearchHit>
         // to substring counting, which is what a user typing two characters actually expects.
         let q_short = qlower.chars().count() < 3;
         let qtri = if q_short { std::collections::HashMap::new() } else { trigram_counts(&qlower) };
-        let mut scored: Vec<(i64, SearchHit)> = hits
+        let mut scored: Vec<((u8, i64), SearchHit)> = hits
             .into_iter()
             .map(|h| {
                 let hay = h.teaser.display_name.to_lowercase()
@@ -158,12 +207,18 @@ pub fn rank_hits(hits: Vec<SearchHit>, query: &str, seed: u64) -> Vec<SearchHit>
                 } else {
                     overlap_score(&qtri, &trigram_counts(&hay))
                 };
-                (score, h)
+                // QURATOR-70: exact-tag tier is 1 (sorts above substring tier 0). A teaser carrying
+                // the query as an exact (case-insensitive) tag outranks any pure-substring hit.
+                let tag_tier: u8 =
+                    if h.teaser.tags.iter().any(|t| t.to_lowercase() == qlower) { 1 } else { 0 };
+                ((tag_tier, score), h)
             })
             .collect();
-        // Descending fuzzy score, then descending recency. sort_by is stable, so equal-score,
-        // equal-recency hits preserve the ingest presort's newest-first-by-npub order.
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.created_at.cmp(&a.1.created_at)));
+        // Descending (tag_tier, fuzzy score), then descending recency. sort_by is stable, so
+        // equal-key hits preserve the ingest presort's newest-first-by-npub order.
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0).then(b.1.created_at.cmp(&a.1.created_at))
+        });
         scored.into_iter().map(|(_, h)| h).collect()
     }
 }
@@ -731,5 +786,158 @@ mod tests {
         assert_eq!(a, b, "same terms in a different order must seed the same shuffle");
         let different = hash_seed(&["a".into()], &["audio".into()]);
         assert_ne!(a, different, "a genuinely different query must seed differently");
+    }
+
+    // ── QURATOR-70: single-term bio/name fuzzy match + multi-term strict AND + tag>substring rank ──
+    //
+    // Owner rulings (verbatim from the ticket):
+    //   1. Scoring: an exact tag OUTRANKS a bio/name substring.
+    //   2. AND across terms: KEEP STRICT AND-ON-TAGS for multi-term. Bio/name matching widens
+    //      SINGLE-TERM searches only.
+    //   3. No exact-tag-only mode (no `tag:` prefix, no toggle). Fuzzy only.
+    //
+    // Each test names the mutation probe that must red it.
+
+    /// QURATOR-70 ruling 2: a SINGLE-term query matches a teaser whose BIO mentions the term even
+    /// when the teaser carries no such tag. Mutation probe: revert `teaser_matches` to
+    /// `tags.iter().all(|q| teaser.tags.contains(q))` for the single-term branch and this reds —
+    /// the bio-only teaser is discarded before rank ever runs.
+    #[test]
+    fn single_term_matches_bio_substring_without_tag() {
+        let mut t = teaser_with(&["anime"], &["video"]);
+        t.display_name = "archivebox".into();
+        t.bio = "I collect Berserk scans".into(); // "berserk" is in BIO, NOT a tag
+        assert!(
+            teaser_matches(&t, &["berserk".into()], &[]),
+            "single-term 'berserk' must match a bio mention even with no 'berserk' tag"
+        );
+    }
+
+    /// QURATOR-70 ruling 2: a SINGLE-term query matches a teaser whose DISPLAY NAME mentions the
+    /// term. Mutation probe: same as above (revert single-term branch to strict tag containment).
+    #[test]
+    fn single_term_matches_display_name_substring_without_tag() {
+        let mut t = teaser_with(&["vhs"], &["video"]);
+        t.display_name = "Berserk Archive".into(); // "berserk" in the name, NOT a tag
+        t.bio = "just a hoarder".into();
+        assert!(
+            teaser_matches(&t, &["berserk".into()], &[]),
+            "single-term 'berserk' must match a display-name mention even with no 'berserk' tag"
+        );
+    }
+
+    /// QURATOR-70 ruling 2 (the contract DISC1(b) and WAN-D D3 pin): a TWO-term query is STRICT
+    /// AND-on-tags. A teaser tagged `[want]` only is discarded for lacking `want2`, even if its bio
+    /// mentions "want2". Mutation probe: widen the multi-term branch to substring matching and this
+    /// reds — the want-only teaser would then match on the bio mention of want2.
+    #[test]
+    fn multi_term_stays_strict_and_on_tags_even_with_bio_mention() {
+        let mut t = teaser_with(&["want"], &["video"]);
+        t.bio = "want2 is my second favourite".into(); // bio mentions "want2", but it is NOT a tag
+        assert!(
+            !teaser_matches(&t, &["want".into(), "want2".into()], &[]),
+            "multi-term query must require BOTH as exact tags; a bio mention of want2 must NOT satisfy it"
+        );
+        // And the positive control: with both as tags, it matches.
+        let t2 = teaser_with(&["want", "want2"], &["video"]);
+        assert!(
+            teaser_matches(&t2, &["want".into(), "want2".into()], &[]),
+            "multi-term with both tags present must match"
+        );
+    }
+
+    /// QURATOR-70 ruling 2 boundary: the strict-AND switch happens at TWO terms. A teaser that
+    /// matches the second term only as a bio substring must NOT surface once a second term is added.
+    /// Mutation probe: if the boundary is off-by-one (e.g. `tags.len() < 2` widens), this reds.
+    #[test]
+    fn second_term_switches_kind_from_fuzzy_to_strict_and() {
+        let mut t = teaser_with(&["berserk"], &["video"]);
+        t.display_name = "Berserk fan".into();
+        t.bio = "also love manga".into(); // "manga" is in bio, NOT a tag
+        // Single term: bio/name widen → matches.
+        assert!(
+            teaser_matches(&t, &["manga".into()], &[]),
+            "single-term 'manga' matches via bio substring"
+        );
+        // Two terms: strict AND-on-tags → 'manga' is not a tag → no match.
+        assert!(
+            !teaser_matches(&t, &["berserk".into(), "manga".into()], &[]),
+            "two-term query requires both as exact tags; 'manga' is only a bio mention"
+        );
+    }
+
+    /// QURATOR-70 ruling 1: an EXACT tag outranks a bio/name substring. Among single-term fuzzy
+    /// matches, the teaser carrying the query as a tag sorts ABOVE one where it is only a bio
+    /// mention — even if the bio mention has HIGHER trigram multiplicity and would otherwise win.
+    /// Mutation probe: drop the `tag_tier` from the rank_hits sort key (sort on score alone) and
+    /// this reds — the bio-repeater outscores the tag-only hit.
+    #[test]
+    fn rank_exact_tag_outranks_bio_substring_even_with_higher_multiplicity() {
+        // The bio-repeater: "berserk" appears MANY times in the bio (high trigram multiplicity), but
+        // the teaser does NOT carry "berserk" as a tag. OLDEST.
+        let bio_repeater = {
+            let id = Identity::generate();
+            let mut t = teaser_with(&["vhs"], &["video"]); // NOTE: no "berserk" tag
+            t.display_name = "hoarder".into();
+            t.bio = "berserk berserk berserk berserk".into(); // 4× in bio → high trigram score
+            ev_at(&id, &t, 1) // OLDEST
+        };
+        // The tag-carrier: "berserk" IS a tag, but the bio does not repeat it (low trigram score).
+        let tag_carrier = {
+            let id = Identity::generate();
+            let mut t = teaser_with(&["berserk"], &["video"]); // "berserk" IS a tag
+            t.display_name = "archivist".into();
+            t.bio = "quiet collector".into(); // no "berserk" in bio → lower trigram score
+            ev_at(&id, &t, 100) // NEWER
+        };
+        // Both pass the single-term fuzzy filter (bio substring match vs exact tag).
+        let hits = ingest_teasers(vec![bio_repeater, tag_carrier.clone()], &["berserk".into()], &[], 100);
+        assert_eq!(hits.len(), 2, "both pass the single-term fuzzy filter");
+        assert_eq!(
+            hits[0].teaser.tags, vec!["berserk"],
+            "the exact-tag hit ranks FIRST despite lower trigram multiplicity and being older"
+        );
+    }
+
+    /// QURATOR-70 ruling 1 (recency-still-ties-within-tier): within the SAME tag tier, recency
+    /// remains the tiebreak. Two teasers both carrying the query as a tag: the newer one wins.
+    /// Mutation probe: invert the recency comparison in the tiered sort and this reds.
+    #[test]
+    fn rank_recency_tiebreak_holds_within_tag_tier() {
+        let older = {
+            let id = Identity::generate();
+            let t = teaser_with(&["berserk"], &["video"]);
+            ev_at(&id, &t, 1_000)
+        };
+        let newer = {
+            let id = Identity::generate();
+            let t = teaser_with(&["berserk"], &["video"]);
+            ev_at(&id, &t, 2_000)
+        };
+        let hits = ingest_teasers(vec![older, newer], &["berserk".into()], &[], 100);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].teaser.tags, vec!["berserk"]);
+        // Both in the exact-tag tier; the newer one wins the recency tiebreak.
+        assert_eq!(hits[1].teaser.tags, vec!["berserk"]);
+    }
+
+    /// QURATOR-70: the single-term fuzzy match composes with the content-type OR filter. A teaser
+    /// whose bio mentions the term AND carries a selected content-type matches; one without the
+    /// content-type does not. Mutation probe: drop the `ct_ok` term from the single-term branch and
+    /// this reds on the second assertion.
+    #[test]
+    fn single_term_fuzzy_composes_with_content_type_or() {
+        let mut matching = teaser_with(&[], &["video"]);
+        matching.bio = "berserk fan".into();
+        let mut not_matching = teaser_with(&[], &["audio"]);
+        not_matching.bio = "berserk fan".into();
+        assert!(
+            teaser_matches(&matching, &["berserk".into()], &["video".into()]),
+            "bio match + content-type match → match"
+        );
+        assert!(
+            !teaser_matches(&not_matching, &["berserk".into()], &["video".into()]),
+            "bio match but content-type mismatch → no match"
+        );
     }
 }

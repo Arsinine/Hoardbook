@@ -477,6 +477,7 @@ pub fn run() {
             commands::browse::set_contact_tags,
             commands::browse::set_contact_petname,
             commands::browse::search_peers,
+            commands::browse::discover_observed_tags,
             commands::settings::get_settings,
             commands::settings::save_settings,
             commands::settings::check_relay,
