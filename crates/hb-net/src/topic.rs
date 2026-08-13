@@ -574,7 +574,7 @@ mod tests {
         let f = topic_discover_filter(&["video".into(), "anime".into()]).unwrap();
         // The kind set contains exactly the topic-announce kind.
         let expected = Kind::from_u16(KIND_TOPIC_ANNOUNCE);
-        assert!(f.kinds.as_ref().map_or(false, |k| k.contains(&expected) && k.len() == 1));
+        assert!(f.kinds.as_ref().is_some_and(|k| k.contains(&expected) && k.len() == 1));
         // The tags ride on `#t` (hashtags) — assert against the SERIALIZED filter, i.e. the bytes the
         // relay actually evaluates. An `is_empty()` check here would be vacuous (true of any filter
         // carrying a kind), which is the "green test claiming coverage it never had" shape CLAUDE.md
@@ -846,6 +846,11 @@ mod tests {
     }
 
     #[test]
+    // Both assertions are over compile-time constants, and that is the entire point: this test
+    // exists to pin the relay-citizenship ruling to the CONSTANTS, so the pair cannot be edited
+    // apart without CI noticing. clippy::assertions_on_constants would have us delete exactly the
+    // check we want.
+    #[allow(clippy::assertions_on_constants)]
     fn topic_discovery_concurrency_is_modest_not_a_burst() {
         // The relay-citizenship ruling (M16 standing): discovery must NOT become a burst of
         // TOPIC_DISCOVERY_CAP simultaneous queries against a public relay. The bound must stay an

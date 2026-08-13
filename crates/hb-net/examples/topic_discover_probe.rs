@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(10);
 
     // ── Stage 1: the raw fetch, using production's own filter builder ────────────────────────────
-    let filter = topic_discover_filter(&[root.clone()])?;
+    let filter = topic_discover_filter(std::slice::from_ref(&root))?;
     println!("stage 1 — filter: {}", serde_json::to_string(&filter)?);
     let events = client.fetch(filter, timeout).await?;
     println!("stage 1 — RAW EVENTS RETURNED: {}\n", events.len());
@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Stage 3: the whole production function, member_count scoring included ────────────────────
     let started = std::time::Instant::now();
-    match discover_public_topics(&client, &[root.clone()], timeout).await {
+    match discover_public_topics(&client, std::slice::from_ref(&root), timeout).await {
         Ok(found) => {
             println!("stage 3 — discover_public_topics OK in {:?}: {} topic(s)", started.elapsed(), found.len());
             for (meta, count) in &found {
