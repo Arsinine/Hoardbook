@@ -37,7 +37,7 @@ use store::DataStore;
 use tauri::{
     Emitter, Manager,
     menu::{MenuBuilder, MenuItemBuilder},
-    tray::TrayIconBuilder,
+    tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
 };
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::RwLock;
@@ -73,6 +73,23 @@ fn create_app_data_dir(path: &std::path::Path) {
     std::fs::create_dir_all(path).expect("could not create app data dir");
 }
 
+/// Bring the main window back from the tray: unminimize, show, focus.
+///
+/// ONE implementation, called by both the tray menu's "Open Hoardbook" and the double-click handler
+/// below. Two copies would drift, and the drift would be invisible — the menu item is the path
+/// people fall back to precisely when the other one is broken, so a divergence hides itself.
+///
+/// `unminimize` matters and is not decoration: closing hides to tray, but a user can also minimise
+/// first, and `show()` alone leaves a minimised window minimised. Every error is swallowed on
+/// purpose — a stale window handle must not take the app down from a tray callback.
+fn reveal_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
 /// Build the system tray with "Open Hoardbook" and "Quit" items.
 fn build_system_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let show_item = MenuItemBuilder::with_id("show", "Open Hoardbook").build(app)?;
@@ -82,13 +99,27 @@ fn build_system_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .icon(app.default_window_icon().unwrap().clone())
         .menu(&tray_menu)
         .tooltip("Hoardbook")
+        // The menu must not be what a LEFT click does, or the double-click below can never arrive:
+        // the first click would open the menu and swallow the gesture. Right-click still opens it.
+        .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "quit" => app.exit(0),
-            "show" => {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
+            "show" => reveal_main_window(app),
+            _ => {}
+        })
+        // Owner report 2026-08-13: "Taskbar hoardbook double click doesnt bring it up, i need to
+        // manually right click and choose Open Hoardbook." There was no tray-event handler at all —
+        // only `on_menu_event` — so the double-click was never bound to anything. Double-click is
+        // the conventional Windows gesture for restoring a tray-resident app, and it was the first
+        // thing the owner reached for.
+        .on_tray_icon_event(|tray, event| match event {
+            TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => {
+                reveal_main_window(tray.app_handle());
+            }
+            // A single LEFT click also reveals — with `show_menu_on_left_click(false)` that gesture
+            // is otherwise dead, and a tray icon that does nothing on click reads as broken.
+            TrayIconEvent::Click { button: MouseButton::Left, button_state: tauri::tray::MouseButtonState::Up, .. } => {
+                reveal_main_window(tray.app_handle());
             }
             _ => {}
         })
