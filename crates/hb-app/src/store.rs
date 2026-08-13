@@ -620,13 +620,34 @@ impl DataStore {
             let entry = entry?;
             let path = entry.path();
             if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(Some(peer)) = read_json_lenient::<CachedPeer>(&path) {
+                if let Ok(Some(mut peer)) = read_json_lenient::<CachedPeer>(&path) {
+                    backfill_fingerprint(&mut peer);
                     results.push(peer);
                 }
             }
         }
         Ok(results)
     }
+}
+
+/// Derive the §7 word+colour fingerprint for a contact stored before it existed.
+///
+/// The fingerprint is a **pure function of the npub** — `resolve_peer` already says so — so a
+/// contact that predates the field is not missing data, it is missing a computation nobody ran.
+/// Until this existed, `list_contacts` returned it as `None` forever and the M21 W4 contact card
+/// silently fell back to its no-fingerprint rendering: no avatar ring, no word row. Every contact
+/// added before that release looked like the pre-redesign card, and the only escape was refreshing
+/// each one by hand — which is exactly what the owner reported as "the uplift was never done".
+///
+/// Read-time only: this does NOT rewrite the stored file. Nothing is migrated on disk, so the
+/// operation is idempotent, costs one hash, and cannot corrupt a contact record. An npub that
+/// fails to parse is left `None` rather than guessed at.
+fn backfill_fingerprint(peer: &mut CachedPeer) {
+    if peer.fingerprint.is_some() {
+        return;
+    }
+    peer.fingerprint =
+        hb_core::identity::parse_npub(&peer.npub).ok().map(|pk| hb_core::fingerprint::fingerprint(&pk));
 }
 
 // ---------------------------------------------------------------------------
@@ -1306,6 +1327,87 @@ mod tests {
             local_tags: vec![],
             fingerprint: None,
         }
+    }
+
+    #[test]
+    fn a_contact_stored_before_the_fingerprint_gets_one_on_read() {
+        // The owner's report, 2026-08-13: "Contacts/Browse/Topics UI uplift have not been done and
+        // look nothing like what the artifacts promised". They HAD been done — but `fingerprint` is
+        // only written when a peer is RESOLVED (follow / refresh / paste_key), and `list_contacts`
+        // was a straight disk read. So every contact saved before M21 W4 came back with `None`, the
+        // card took its documented no-fingerprint path (no avatar ring, no word row), and the whole
+        // redesign was invisible on real data until each contact was refreshed by hand.
+        //
+        // The fingerprint is a pure function of the npub, so the fix is to derive it on read.
+        let (_dir, store) = test_store();
+        let ident = hb_core::Identity::generate();
+        let npub = ident.npub();
+        let hash = CachedPeer::pubkey_hash(&npub);
+
+        // A record exactly as it sits on disk for a pre-M21-W4 contact.
+        let stored = contact_fixture(&npub);
+        assert!(stored.fingerprint.is_none(), "fixture must model the pre-fingerprint record");
+        store.save_contact(&hash, &stored).unwrap();
+
+        let listed = store.list_contacts().unwrap();
+        let got = listed.iter().find(|p| p.npub == npub).expect("contact must come back");
+        let fp = got.fingerprint.as_ref().expect("a stored contact with no fingerprint must get one on read");
+
+        // It must be the REAL derivation, not merely non-empty — a wrong-but-present fingerprint is
+        // worse than none, because the whole point is impersonation resistance.
+        let expected = hb_core::fingerprint::fingerprint(&ident.public_key());
+        assert_eq!(fp.words, expected.words, "backfilled words must match the npub's true fingerprint");
+        assert_eq!(fp.color_hex, expected.color_hex, "backfilled colour must match the npub's true fingerprint");
+
+        // Read-time only: the file on disk is NOT rewritten. Nothing is migrated, so this can never
+        // corrupt a contact record.
+        let raw = std::fs::read_to_string(store.base.join("contacts").join(format!("{hash}.json"))).unwrap();
+        let disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            disk.get("fingerprint").map(|v| v.is_null()).unwrap_or(true),
+            "backfill must not write to disk — it is a read-time derivation"
+        );
+    }
+
+    #[test]
+    fn a_stored_fingerprint_is_never_overwritten_by_the_backfill() {
+        // The backfill fills a HOLE; it must not fight a real resolve. If it recomputed
+        // unconditionally it would be indistinguishable from the derive-always case and would mask a
+        // genuine mismatch between a stored fingerprint and its npub.
+        let (_dir, store) = test_store();
+        let ident = hb_core::Identity::generate();
+        let npub = ident.npub();
+        let hash = CachedPeer::pubkey_hash(&npub);
+
+        let mut stored = contact_fixture(&npub);
+        let sentinel = hb_core::fingerprint::Fingerprint {
+            words: vec!["sentinel".into(), "sentinel".into(), "sentinel".into()],
+            color_hex: "#abcdef".into(),
+        };
+        stored.fingerprint = Some(sentinel.clone());
+        store.save_contact(&hash, &stored).unwrap();
+
+        let listed = store.list_contacts().unwrap();
+        let got = listed.iter().find(|p| p.npub == npub).unwrap();
+        assert_eq!(
+            got.fingerprint.as_ref().unwrap().words,
+            sentinel.words,
+            "an already-stored fingerprint must be returned untouched"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_npub_is_left_alone_rather_than_guessed_at() {
+        // `contact_fixture` uses "npub1a", which is not a decodable npub. The backfill must leave
+        // such a record as None — inventing a fingerprint for a key we cannot parse would attach an
+        // impersonation signal to an identity we never verified.
+        let (_dir, store) = test_store();
+        let hash = CachedPeer::pubkey_hash("npub1a");
+        store.save_contact(&hash, &contact_fixture("npub1a")).unwrap();
+
+        let listed = store.list_contacts().unwrap();
+        let got = listed.iter().find(|p| p.npub == "npub1a").unwrap();
+        assert!(got.fingerprint.is_none(), "an unparseable npub must not receive a fabricated fingerprint");
     }
 
     #[test]
