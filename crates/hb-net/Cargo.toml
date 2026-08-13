@@ -24,6 +24,11 @@ thiserror  = { workspace = true }
 tracing    = { workspace = true }
 # Bounded, deterministic dedup-key fallback for a slug-less private listing (M10 chorus fix).
 sha2       = "0.10"
+# QURATOR-82: bounded-concurrency `buffer_unordered` for activity-ranked topic discovery —
+# `futures` is already a transitive dep (via nostr-sdk/tokio); pinning the major here costs nothing
+# extra in the build. The crate has no full-featured tokio-only equivalent (`tokio::spawn` needs
+# `'static` futures, but `discover_public_topics` takes `&RelayClient` — a borrow, not `Arc`).
+futures    = "0.3"
 # The async runtime: `tokio::time::sleep` backs the relay-write governor's pacing (client.rs), and
 # `#[tokio::test]` drives the async unit tests. A regular dep (not dev-only) since the lib now uses it.
 tokio      = { workspace = true }

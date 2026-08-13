@@ -2276,6 +2276,7 @@ dependencies = [
 name = "hb-net"
 version = "0.13.0"
 dependencies = [
+ "futures",
  "hb-core",
  "nostr",
  "nostr-sdk",
