@@ -306,7 +306,6 @@ mod tests {
     /// (demoting the noise must not cost us our own breadcrumbs).
     #[test]
     fn default_filter_demotes_the_relay_pool_but_keeps_our_own_debug() {
-        use std::io::Write as _;
         use tracing_subscriber::fmt::MakeWriter;
 
         #[derive(Clone)]

@@ -109,7 +109,16 @@ jobs:
           # itself. So the harness dir is subtracted from the iroh-surface scan HERE, and only here:
           # every other probe still scans it, and this filter fails CLOSED — rename the dir and its
           # files reappear in the scan, turning CI red until the filter is corrected.
-          iroh_users=$(grep -rlE '(^|[^a-zA-Z_])iroh::' crates/*/src | grep -v '/wan_it/' | sort)
+          # `crates/hb-app/src/nat.rs` (QURATOR-68) is the second such case: it binds a DIAL-ONLY
+          # iroh endpoint — owner ruling ③ of 2026-07-31, never the listening endpoint — purely to
+          # read the relay-observed mapped address out of `net_report` and classify what kind of NAT
+          # the user is behind. It carries no payload of any kind, opens no stream, and touches no
+          # filesystem; it is a DIAGNOSTIC, not a transport module, so putting it in TRANSPORT_FILES
+          # would mislabel the surface this guard exists to name. Subtracted by EXACT path only, so
+          # it fails CLOSED exactly like the harness filter above: rename or move the file and it
+          # reappears in the scan, turning CI red until this line is corrected. If nat.rs ever grows
+          # a stream, a send, or an fs call, delete this exemption rather than widening it.
+          iroh_users=$(grep -rlE '(^|[^a-zA-Z_])iroh::' crates/*/src | grep -v '/wan_it/' | grep -vx 'crates/hb-app/src/nat\.rs' | sort)
           listed=$(printf '%s\n' $TRANSPORT_FILES | sort)
           if unlisted=$(comm -23 <(echo "$iroh_users") <(echo "$listed")) && [ -n "$unlisted" ]; then
             echo "::error::INV-4′ regression — these files use iroh but are not in the swept transport surface:"
