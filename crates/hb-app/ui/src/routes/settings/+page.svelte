@@ -487,7 +487,9 @@
 </script>
 
 <!-- TopBar -->
-<div class="topbar">
+<!-- QURATOR-81 follow-up — see contacts/+page.svelte: the topbar is the drag handle. The attribute
+     does not inherit, so the controls inside keep their clicks. -->
+<div class="topbar" data-tauri-drag-region>
 	<div>
 		<div class="topbar-title">Settings</div>
 		<div class="topbar-sub">Identity, relays, and preferences</div>

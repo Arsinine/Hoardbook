@@ -428,7 +428,9 @@
 </script>
 
 <!-- TopBar — the shared app shell (see routes/+page.svelte, contacts, settings). -->
-<div class="topbar">
+<!-- QURATOR-81 follow-up — see contacts/+page.svelte: the topbar is the drag handle. The attribute
+     does not inherit, so the tabs and "+ New Topic" inside keep their clicks. -->
+<div class="topbar" data-tauri-drag-region>
 	<div>
 		<div class="topbar-title">Topics</div>
 		<div class="topbar-sub">

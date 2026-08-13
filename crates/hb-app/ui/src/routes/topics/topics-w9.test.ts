@@ -13,9 +13,16 @@ const contactsSrc = () =>
 	readFileSync(new URL('../contacts/+page.svelte', import.meta.url), 'utf8');
 
 describe('Topics page — M17 W9 shared shell', () => {
+	// The opening tag is matched as a PATTERN, not an exact string: QURATOR-81 added
+	// `data-tauri-drag-region` to these topbars (the topbar is the window's drag handle), and an
+	// exact-string assertion cannot survive any attribute. `class="topbar"` is still required
+	// verbatim, so a rename to `.topbar-x` or a bespoke header still fails — the guarantee this test
+	// exists for is unchanged.
+	const TOPBAR_OPEN = /<div class="topbar"[^>]*>/;
+
 	it('opens_with_the_shared_topbar_not_a_bespoke_header', () => {
 		const src = topicsSrc();
-		expect(src).toContain('<div class="topbar">');
+		expect(src).toMatch(TOPBAR_OPEN);
 		expect(src).toContain('<div class="topbar-title">Topics</div>');
 		expect(src).toContain('class="topbar-sub"');
 		// The one-off header the owner saw as "a different app" is gone.
@@ -27,7 +34,11 @@ describe('Topics page — M17 W9 shared shell', () => {
 		// Same three-part structure Contacts uses, so the two read as one app.
 		const topics = topicsSrc();
 		const contacts = contactsSrc();
-		for (const marker of ['<div class="topbar">', 'class="topbar-title"', 'class="topbar-sub"']) {
+		// Both files must open a `.topbar` (pattern, per the note above) …
+		expect(contacts).toMatch(TOPBAR_OPEN);
+		expect(topics).toMatch(TOPBAR_OPEN);
+		// … and carry the same two inner parts, which are still exact strings.
+		for (const marker of ['class="topbar-title"', 'class="topbar-sub"']) {
 			expect(contacts).toContain(marker);
 			expect(topics).toContain(marker);
 		}

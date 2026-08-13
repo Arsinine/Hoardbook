@@ -970,7 +970,12 @@
 <div class="contacts-shell">
 <div class="contacts-main">
 <!-- TopBar -->
-<div class="topbar">
+<!-- QURATOR-81 follow-up: the topbar IS the title bar, so it is the drag handle. The 8px strip in
+     +layout.svelte was the only draggable surface and, on Windows, the top few pixels double as the
+     resize hotspot — which left almost nothing to grab and read as "dragging doesn't work" (owner,
+     2026-08-13). `data-tauri-drag-region` does NOT inherit to children, so every button and input
+     inside this bar keeps its clicks; only the bar's own background drags. -->
+<div class="topbar" data-tauri-drag-region>
 	<div>
 		<div class="topbar-title">Contacts</div>
 		<div class="topbar-sub">
