@@ -56,6 +56,13 @@
 	// relays" (retryable) vs "the relays answered, there are none" (not). An error is NOT cached: a
 	// re-expand retries. Nor is a successful EMPTY (QURATOR-83) — only a non-empty list is cached.
 	let erroredRoots: Set<string> = $state(new Set());
+	// Request-generation guard for Discover, same shape as `lookupGeneration` below. A fetch already
+	// IN FLIGHT when a Topic is created would otherwise resolve afterwards and cache its PRE-PUBLISH
+	// result: at eviction time the key is still `undefined`, so deleting it is a no-op, and the late
+	// resolve then writes a stale NON-EMPTY list — which `toggleRoot` treats as terminal, hiding the
+	// user's own new Topic until restart. That is QURATOR-83 again by another route (codex). Bumped
+	// on every public create; a resolving fetch applies its result only if its generation still holds.
+	let discoverGeneration = 0;
 
 	// The consent gate: which Topic (public name + private flag) is pending a join. For a private
 	// redeem, `issuerNpub` carries who vouches (surfaced in the consent modal); `mode: 'redeem'` routes
@@ -186,6 +193,9 @@
 			// new object explicitly — a cached empty for this root is the stale value being evicted here.
 			if (!createdPrivate) {
 				const root = createdName.split('/')[0];
+				// Bump FIRST and unconditionally: a fetch in flight right now has a key that is still
+				// `undefined`, so the deletion below cannot reach it — only the generation can.
+				discoverGeneration += 1;
 				if (root && rootTopics[root] !== undefined) {
 					const next: Record<string, DiscoveredTopic[]> = {};
 					for (const k in rootTopics) if (k !== root) next[k] = rootTopics[k];
@@ -243,9 +253,15 @@
 			}
 		}
 		loadingRoot = root;
+		const generation = discoverGeneration;
 		try {
 			const found = await topicDiscover([root]);
-			rootTopics = { ...rootTopics, [root]: found }; // cache regardless — keyed by root
+			// Drop the result if a Topic was published while this was in flight — it predates the
+			// publish, and caching it would re-hide the user's own Topic. The key stays absent, so the
+			// next expand re-fetches.
+			if (generation === discoverGeneration) {
+				rootTopics = { ...rootTopics, [root]: found }; // cache regardless — keyed by root
+			}
 		} catch (e) {
 			// Only surface if this root is STILL the open one: a stale request for a category the user
 			// already switched away from must not error over the current one (codex). Keep the section

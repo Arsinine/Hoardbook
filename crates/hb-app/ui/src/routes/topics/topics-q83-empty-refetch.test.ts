@@ -92,9 +92,14 @@ describe('QURATOR-83 — empty Discover cache is not terminal', () => {
 	});
 
 	it('expand -> empty -> publish -> expand again -> A SECOND FETCH HAPPENS', async () => {
-		// Step 1: first expand returns an empty list.
-		discoverMock.mockResolvedValueOnce([]);
-		const { getByRole, getByPlaceholderText, getAllByRole } = render(TopicsPage);
+		// Step 1: first expand returns an empty list. Every LATER call returns the newly published
+		// Topic — so this test can also assert the refreshed answer reaches the screen, not merely
+		// that a request went out. (Without a default the second call resolved `undefined`, and a
+		// call-count assertion alone would pass an implementation that re-fetched and then threw the
+		// result away, leaving the stale view up — codex.)
+		const published = { topic_id: 't-new', name: 'video/animation/anime', description: '', tags: ['video'], member_count_estimate: 1 };
+		discoverMock.mockResolvedValueOnce([]).mockResolvedValue([published]);
+		const { getByRole, getByPlaceholderText, getAllByRole, findByText } = render(TopicsPage);
 		// Let onMount's topicList resolve.
 		await waitFor(() => expect(discoverMock).not.toHaveBeenCalled());
 
@@ -138,6 +143,10 @@ describe('QURATOR-83 — empty Discover cache is not terminal', () => {
 		// the cached empty. On the broken code this stays at 1 (the stale `[]` short-circuits).
 		await waitFor(() => expect(discoverMock).toHaveBeenCalledTimes(2), { timeout: 2000 });
 		expect(discoverMock).toHaveBeenLastCalledWith(['video']);
+		// ...and the answer has to actually land on screen. This is what the user came for.
+		// The row renders `subPathLabel(name)`, i.e. the path with the root stripped — under the
+		// `video` heading it reads "animation/anime", never the full "video/animation/anime".
+		expect(await findByText('animation/anime')).toBeTruthy();
 	});
 
 	it('expand -> NON-EMPTY list -> collapse -> expand again -> NO second fetch', async () => {
@@ -203,6 +212,53 @@ describe('QURATOR-83 — empty Discover cache is not terminal', () => {
 
 		// The cached non-empty list is now stale by exactly one Topic — the user's own. Asking again
 		// must actually ask. On code without the eviction this stays at 1.
+		await waitFor(() => expect(discoverMock).toHaveBeenCalledTimes(2), { timeout: 2000 });
+	});
+
+	// The eviction alone does NOT close this (codex, 2026-08-13). While the FIRST fetch for a root is
+	// in flight the key is still `undefined`, so deleting it is a no-op — and the late resolve then
+	// caches a pre-publish, NON-EMPTY list, which toggleRoot treats as terminal. Net effect is the
+	// original bug by another route: the user's own Topic invisible until restart. Closed by the
+	// `discoverGeneration` guard, and this is the only test that can see it, because every other
+	// mock here resolves immediately and so can never order a resolve AFTER a publish.
+	it('a fetch in flight when a Topic is published must not cache its pre-publish result', async () => {
+		let resolveInFlight: (v: unknown) => void = () => {};
+		const inFlight = new Promise((r) => { resolveInFlight = r; });
+		const stale = { topic_id: 't-old', name: 'video/existing', description: '', tags: ['video'], member_count_estimate: 3 };
+		// Call 1 hangs until we release it; every later call resolves normally.
+		discoverMock.mockReturnValueOnce(inFlight).mockResolvedValue([stale]);
+
+		const { getByRole, getByPlaceholderText, getAllByRole } = render(TopicsPage);
+		await fireEvent.click(getByRole('button', { name: /discover/i }));
+		await tick();
+
+		// Expand video — fetch 1 starts and does NOT resolve. rootTopics.video is still undefined.
+		await clickRoot(getByRole, 'video');
+		await waitFor(() => expect(discoverMock).toHaveBeenCalledTimes(1));
+		await clickRoot(getByRole, 'video'); // collapse; the request is still outstanding
+		await tick();
+
+		// Publish while it is still in flight.
+		await fireEvent.click(getByRole('button', { name: /\+ new topic/i }));
+		await tick();
+		await fireEvent.input(getByPlaceholderText(/sub-path/i), { target: { value: 'animation/anime' } });
+		await tick();
+		const createBtn = getAllByRole('button').find(
+			(b) => (b.textContent ?? '').trim().toLowerCase() === 'create',
+		) as HTMLButtonElement;
+		await fireEvent.click(createBtn);
+		await waitFor(() => expect(getByRole('button', { name: /\+ new topic/i })).toBeTruthy());
+
+		// NOW let the stale, pre-publish answer land. It must be discarded, not cached.
+		resolveInFlight([stale]);
+		await tick();
+		await new Promise((r) => setTimeout(r, 20));
+
+		// Re-expand: the relay must be asked again. Without the generation guard the stale non-empty
+		// list is sitting in the cache and this stays at 1 for the rest of the session.
+		await fireEvent.click(getByRole('button', { name: /discover/i }));
+		await tick();
+		await clickRoot(getByRole, 'video');
 		await waitFor(() => expect(discoverMock).toHaveBeenCalledTimes(2), { timeout: 2000 });
 	});
 });
