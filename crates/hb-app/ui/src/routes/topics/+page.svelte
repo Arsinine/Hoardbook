@@ -54,7 +54,7 @@
 	// yet" — that string is indistinguishable from a genuine empty, a timeout, an empty relay set, or
 	// an untagged announce. Track which roots FAILED so the surface can say "we could not reach the
 	// relays" (retryable) vs "the relays answered, there are none" (not). An error is NOT cached: a
-	// re-expand retries, unlike a successful empty which is cached (rootTopics[root] = []).
+	// re-expand retries. Nor is a successful EMPTY (QURATOR-83) — only a non-empty list is cached.
 	let erroredRoots: Set<string> = $state(new Set());
 
 	// The consent gate: which Topic (public name + private flag) is pending a join. For a private
@@ -177,7 +177,21 @@
 		if (!canCreate) return;
 		busy = true;
 		try {
-			await topicCreate(createName, newDesc.trim(), newPrivate);
+			const createdName = createName;
+			const createdPrivate = newPrivate;
+			await topicCreate(createdName, newDesc.trim(), createdPrivate);
+			// QURATOR-83: a new public Topic in a root invalidates that root's cached Discover result so
+			// the next expand re-fetches (otherwise a previously-empty root stays empty until restart).
+			// A private Topic is unlisted, so no root is affected. Delete the single key by constructing a
+			// new object explicitly — a cached empty for this root is the stale value being evicted here.
+			if (!createdPrivate) {
+				const root = createdName.split('/')[0];
+				if (root && rootTopics[root] !== undefined) {
+					const next: Record<string, DiscoveredTopic[]> = {};
+					for (const k in rootTopics) if (k !== root) next[k] = rootTopics[k];
+					rootTopics = next;
+				}
+			}
 			newName = newSubPath = newDesc = '';
 			newRoot = TOPIC_ROOTS[0];
 			newPrivate = false;
@@ -212,17 +226,20 @@
 			return;
 		}
 		expandedRoot = root;
-		// A successful fetch caches (incl. a genuine empty = `[]`). A FAILED fetch is NOT cached: it
-		// lands in `erroredRoots` instead, so a re-expand retries rather than replaying the error, and
-		// the surface can distinguish "could not ask" from "asked, none" (QURATOR-80).
-		if (rootTopics[root] !== undefined || erroredRoots.has(root)) {
+		// A successful fetch caches NON-EMPTY results (the cache exists so switching roots isn't a
+		// relay round-trip each time). A cached genuine EMPTY (`[]`) is NOT terminal — QURATOR-83: an
+		// empty found before a Topic existed was cached forever, swallowing every later create in that
+		// root until restart. Now an empty is a miss: re-expand re-fetches. A FAILED fetch is NOT
+		// cached either: it lands in `erroredRoots` instead (QURATOR-80), so a re-expand retries.
+		const cached = rootTopics[root];
+		if ((cached !== undefined && cached.length > 0) || erroredRoots.has(root)) {
 			if (erroredRoots.has(root)) {
 				// Re-expand on an errored root = explicit retry: clear the error and re-fetch.
 				const next = new Set(erroredRoots);
 				next.delete(root);
 				erroredRoots = next;
 			} else {
-				return; // cached successful result (incl. genuine empty)
+				return; // cached non-empty result — a genuine empty falls through to re-fetch
 			}
 		}
 		loadingRoot = root;
