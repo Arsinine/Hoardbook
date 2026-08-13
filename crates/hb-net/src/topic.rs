@@ -13,8 +13,10 @@
 //!   same seal to a name-derived keypair) or a request→approve NIP-17 DM.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::time::Duration;
 
+use futures::stream::{self, StreamExt};
 use hb_core::topic::{
     member_sign_keys, mint_invite, open_channel_item, open_post, parse_announce,
     public_join_identity, redeem_invite, roster, seal_announce, seal_membership, seal_post,
@@ -68,6 +70,58 @@ pub fn topic_discover_filter(tags: &[String]) -> Result<Filter, NetError> {
         .limit(TOPIC_DISCOVERY_FETCH_LIMIT))
 }
 
+/// Concurrency bound for activity-ranked topic discovery (QURATOR-82). Each `member_count` is its
+/// own relay round-trip at the caller's full `timeout`; serialising them made discovery take up to
+/// [`TOPIC_DISCOVERY_CAP`] sequential round-trips — one slow relay stalled the whole list (an `hb-it`
+/// L2 run against the SG relay blew a 180s timeout on exactly this path).
+///
+/// The fix is bounded concurrency, and the bound is a **relay-citizenship** decision (the M16
+/// standing ruling: discovery must NOT turn into a burst of 100 simultaneous queries against a
+/// public relay). 8 keeps the worst-case per-relay simultaneous-query count an order of magnitude
+/// below the `TOPIC_DISCOVERY_CAP = 100` ceiling that a `join_all` would fire in one shot, while
+/// still turning a 100-sequential-round-trip stall into ~13 waves. A hostile/flooded relay can still
+/// see the query fan-out, but it is the same shape as 8 users discovering at once, not a scanner.
+pub const TOPIC_DISCOVERY_CONCURRENCY: usize = 8;
+
+/// Pair each topic with a best-effort score by running `score` concurrently, then sort **descending**
+/// by score with an **ascending `topic_id` tiebreak** — the activity-rank contract. Pure (no relay
+/// I/O): the caller supplies the scoring future, so this is directly unit-testable against an in-memory
+/// `score` closure that injects completion order (QURATOR-82 regression coverage — proves the output
+/// order is independent of completion order).
+///
+/// Concurrency is bounded at [`TOPIC_DISCOVERY_CONCURRENCY`] so the score phase can't become a burst
+/// of `len` simultaneous relay queries (the relay-citizenship ruling above). The `collect` then `sort`
+/// shape is load-bearing: a sort-free "append as each future resolves" would leak completion order
+/// into the result, breaking the deterministic tiebreak.
+///
+/// `score` takes the `topic_id` by owned `String` (not `&str`): the future it returns has to outlive
+/// the per-iteration borrow inside `buffer_unordered`, and an HRTB `for<'a> Fn(&'a str) -> impl
+/// Future + 'a` is significantly harder to express than a 24-byte clone of a topic id.
+async fn score_topics_with<F, Fut>(
+    topics: impl IntoIterator<Item = TopicMeta>,
+    score: F,
+) -> Vec<(TopicMeta, usize)>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = usize>,
+{
+    let topics: Vec<TopicMeta> = topics.into_iter().collect();
+    // Move each `TopicMeta` through the stream payload so the final pairs keep the full metadata.
+    // Completion order is unrelated to input order under bounded concurrency; only the explicit
+    // `sort_by` below determines the output.
+    let scored = stream::iter(topics)
+        .map(|meta| async {
+            let count = score(meta.topic_id.clone()).await;
+            (meta, count)
+        })
+        .buffer_unordered(TOPIC_DISCOVERY_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let mut scored = scored;
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.topic_id.cmp(&b.0.topic_id)));
+    scored
+}
+
 /// Discover public Topics by tag — a relay read of `KIND_TOPIC_ANNOUNCE` events `#t`-tagged with any
 /// of `tags`, parsed + verified through `hb-core`, deduped by `topic_id` keeping the newest announce,
 /// then **activity-ranked** (M12 W4, Decision M): each result is paired with its best-effort,
@@ -103,20 +157,23 @@ pub async fn discover_public_topics(
         }
     }
     // Activity-rank: pair each topic with its (spoofable) member count, sort desc, tiebreak on id.
-    let mut scored: Vec<(TopicMeta, usize)> = Vec::with_capacity(best.len());
-    for (_, (_, meta)) in best {
-        // A member-count fetch error scores the topic 0 (best-effort + spoofable anyway); log it so a
-        // relay-side failure that buries a popular topic is debuggable, not silent (chorus round-1).
-        let count = match member_count(client, &meta.topic_id, timeout).await {
+    // Each `member_count` is its own relay round-trip at the full `timeout`; serialising them inside
+    // the loop made discovery take up to `TOPIC_DISCOVERY_CAP` sequential round-trips before the user
+    // saw anything — one slow relay stalled the whole list (QURATOR-82: an `hb-it` L2 run against the
+    // SG relay blew a 180s timeout on exactly this path). Bound the concurrency instead.
+    let mut scored = score_topics_with(best.into_values().map(|(_, meta)| meta), |topic_id| async move {
+        match member_count(client, &topic_id, timeout).await {
             Ok(c) => c,
             Err(e) => {
-                tracing::debug!("topic discovery: member_count failed for {}: {e}", meta.topic_id);
+                // A member-count fetch error scores the topic 0 (best-effort + spoofable anyway); log
+                // it so a relay-side failure that buries a popular topic is debuggable, not silent
+                // (chorus round-1).
+                tracing::debug!("topic discovery: member_count failed for {}: {e}", topic_id);
                 0
             }
-        };
-        scored.push((meta, count));
-    }
-    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.topic_id.cmp(&b.0.topic_id)));
+        }
+    })
+    .await;
     let total = scored.len();
     if total > TOPIC_DISCOVERY_CAP {
         tracing::info!(
@@ -480,6 +537,7 @@ pub async fn join_public(
 mod tests {
     use super::*;
     use hb_core::new_topic;
+    use std::time::Instant;
 
     #[test]
     fn join_request_round_trips_through_the_dm_body() {
@@ -673,5 +731,130 @@ mod tests {
         let picked = newest_announce(vec![mismatched, genuine], &victim_meta.topic_id).unwrap();
         assert_eq!(picked.topic_id, victim_meta.topic_id);
         assert_eq!(picked.description, "real", "only the matching candidate wins, regardless of recency");
+    }
+
+    // ───────────────────────── QURATOR-82: bounded-concurrency scoring (pure helper) ───────────────
+    //
+    // The defect: `discover_public_topics` awaited `member_count` once per topic sequentially inside
+    // the loop, each at the full RELAY_TIMEOUT, after the announce fetch had already completed. With
+    // TOPIC_DISCOVERY_CAP = 100 that was up to 100 sequential round-trips before the user saw
+    // anything — a hang that reads as "Discover Topics finds nothing". The fix is bounded concurrency
+    // via `score_topics_with`; these tests pin the contracts that the refactor must NOT regress:
+    //
+    //   - per-topic error tolerance (a score of 0, i.e. a failed `member_count`, never fails the call
+    //     and never silently drops the topic; the topic scores 0);
+    //   - deterministic output order regardless of completion order — count desc, tiebreak topic_id
+    //     asc. Concurrency must not leak completion order into the result.
+    //
+    // A concurrency change's speedup is invisible to a unit test — jsdom-equivalent point: a green
+    // suite here says nothing about the stall being gone. The speedup is measured by the integration
+    // suite (`hb-it` L2 against the slower SG relay), not by these tests. These tests prove the
+    // refactor preserved the *contracts*, not that it went faster.
+
+    /// Helper: build a `TopicMeta` with a test-controlled `topic_id` (NOT derived from a name, so
+    /// the tiebreak test can assert a specific ascending order on the ids). The other fields are
+    /// trivial — only `topic_id` is load-bearing for `score_topics_with`.
+    fn scored_topic_meta(id: &str) -> TopicMeta {
+        TopicMeta {
+            topic_id: id.to_string(),
+            name: id.to_string(),
+            description: String::new(),
+            tags: vec![],
+            private: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn score_topics_with_tolerates_a_failed_score_by_keeping_the_topic_at_zero() {
+        // The per-topic error tolerance: a `member_count` failure scores the topic 0 and is never
+        // fatal, never silent (the production path wraps the fetch in a `match` that logs + returns
+        // 0; the helper itself sees only the `usize` so we model the failure as `0`).
+        let topics = vec![
+            scored_topic_meta("video/ok-topic"),
+            scored_topic_meta("video/failed-topic"),
+        ];
+        let scored = score_topics_with(topics, |tid| async move {
+            if tid.contains("failed") { 0 } else { 5 }
+        })
+        .await;
+        // Both topics are still present — a failed score does not drop the topic from discovery.
+        assert_eq!(scored.len(), 2, "a failed score keeps the topic in the list at rank 0");
+        // The failed topic is at the tail (rank 0 sorts last under count-desc).
+        assert_eq!(scored[1].1, 0, "the failed topic scored 0, not dropped");
+        assert_eq!(scored[1].0.topic_id, "video/failed-topic");
+    }
+
+    #[tokio::test]
+    async fn score_topics_with_output_order_is_count_desc_regardless_of_completion_order() {
+        // The deterministic-output contract: under bounded concurrency the futures resolve in
+        // arbitrary order, but the output must always be sorted count-desc with topic_id-asc as the
+        // tiebreaker. This test injects a deliberately adversarial completion order (high-count
+        // topics resolve LAST) by making the closure await longer for higher counts — if the helper
+        // ever let completion order leak through, this test would red.
+        let topics = vec![
+            scored_topic_meta("video/alpha"),   // will score 1
+            scored_topic_meta("video/beta"),    // will score 3 (highest)
+            scored_topic_meta("video/gamma"),   // will score 3 (tie, id after beta)
+            scored_topic_meta("video/delta"),   // will score 2
+        ];
+        let scored = score_topics_with(topics, |tid| async move {
+            // Lower count ⇒ shorter await: the LOW-count topics resolve FIRST. The required output
+            // order is count-DESC, so a completion-order-leaking implementation (no final sort) would
+            // emit alpha(1) → delta(2) → beta(3) → gamma(3) — the exact inverse of the contract.
+            let count = match tid.as_str() {
+                "video/alpha" => 1,
+                "video/beta" => 3,
+                "video/gamma" => 3,
+                "video/delta" => 2,
+                _ => 0,
+            };
+            // Sleep PROPORTIONAL to count so high-count topics resolve LAST under concurrency.
+            tokio::time::sleep(Duration::from_millis(count as u64 * 10)).await;
+            count
+        })
+        .await;
+        let ids: Vec<&str> = scored.iter().map(|(m, _)| m.topic_id.as_str()).collect();
+        let counts: Vec<usize> = scored.iter().map(|(_, c)| *c).collect();
+        assert_eq!(counts, vec![3, 3, 2, 1], "sorted count-desc");
+        // Tiebreak: among the two count=3 topics, `video/beta` < `video/gamma` ascending.
+        assert_eq!(ids, vec!["video/beta", "video/gamma", "video/delta", "video/alpha"]);
+    }
+
+    #[tokio::test]
+    async fn score_topics_with_runs_the_score_closure_concurrently_not_serially() {
+        // The point of the refactor: the futures must overlap. If they run serially the total
+        // wall-clock is the sum of per-topic sleeps; if they run concurrently it is ~max + a little.
+        // TOPIC_DISCOVERY_CONCURRENCY = 8, so with 8 topics each sleeping 50 ms, concurrent ≈ 50 ms
+        // and serial ≈ 400 ms. Assert the wall-clock is closer to one wave than N waves.
+        let topics: Vec<TopicMeta> = (0..8).map(|i| scored_topic_meta(&format!("video/t{i}"))).collect();
+        let start = Instant::now();
+        score_topics_with(topics, |_| async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            0
+        })
+        .await;
+        let elapsed = start.elapsed();
+        // 8 × 50 ms serial = 400 ms; concurrent in one wave ≈ 50 ms. Permit headroom (drvfs is slow),
+        // but the elapsed MUST be under half the serial bound — anything ≥ ~200 ms means they didn't
+        // overlap. This is the only test that even tries to observe the speedup, and it is the weakest
+        // of the three (timing on a shared CI box is noisy); the contract tests above are the real
+        // gate, the integration suite measures the actual relay-round-trip stall.
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "score_topics_with did not run concurrently: elapsed {elapsed:?} (serial would be ~400 ms)"
+        );
+    }
+
+    #[test]
+    fn topic_discovery_concurrency_is_modest_not_a_burst() {
+        // The relay-citizenship ruling (M16 standing): discovery must NOT become a burst of
+        // TOPIC_DISCOVERY_CAP simultaneous queries against a public relay. The bound must stay an
+        // order of magnitude below the cap so a hostile relay can't see a scanner-shaped fan-out.
+        assert!(
+            TOPIC_DISCOVERY_CONCURRENCY <= TOPIC_DISCOVERY_CAP / 10,
+            "TOPIC_DISCOVERY_CONCURRENCY must stay an order of magnitude below the cap; got {}",
+            TOPIC_DISCOVERY_CONCURRENCY
+        );
+        assert!(TOPIC_DISCOVERY_CONCURRENCY >= 4, "concurrency bound too low — stalls the slow-relay fix");
     }
 }
