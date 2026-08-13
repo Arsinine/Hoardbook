@@ -454,6 +454,19 @@ pub fn run() {
                 app.manage(WatcherHandle(std::sync::Mutex::new(watcher)));
             }
 
+            // QURATOR-81 — custom app chrome replaces the native title bar. Windows and Linux lose
+            // their OS decorations and the webview draws its own min/max/close (WindowControls.svelte
+            // in +layout.svelte); macOS keeps its native traffic lights, since a hand-drawn bar would
+            // look wrong there to fix a Windows-only complaint (TRAP 5). The `set_decorations` call is
+            // idempotent and cheap; gated per-platform so a macOS build is a no-op here. The close
+            // control routes through `getCurrentWindow().close()`, which emits `CloseRequested` — the
+            // handler below intercepts that to hide-to-tray, preserving the deliberate tray design
+            // (TRAP 1: `destroy()`/`exit()` would bypass it and silently convert hide into quit).
+            #[cfg(not(target_os = "macos"))]
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.set_decorations(false);
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
