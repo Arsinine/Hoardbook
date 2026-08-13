@@ -73,6 +73,22 @@ pub async fn reveal_log_folder(app: tauri::AppHandle) -> CmdResult<()> {
     open_in_file_manager(&log_dir)
 }
 
+/// QURATOR-68 — the NAT classification token for the Settings → Diagnostics UI. Returns one of the
+/// classification tokens (`"no-nat"`, `"nat"`, `"cgnat"`, `"unknown"`), or `"undetermined"` before
+/// the first probe has completed (the slot is `None`). The discovered mapped address is never
+/// returned — only the classification (INV: peer/self addresses are the H4/MT2 harvest shape and
+/// never leave the machine via this surface).
+#[tauri::command]
+pub async fn nat_classification(
+    slot: State<'_, crate::nat::SharedNatClassification>,
+) -> CmdResult<String> {
+    Ok(slot
+        .read()
+        .await
+        .map(|c| c.as_log_token().to_string())
+        .unwrap_or_else(|| "undetermined".to_string()))
+}
+
 /// Read the newest `LOG_PREFIX.*` file under `log_dir` and return its tail, capped at
 /// [`TAIL_MAX_LINES`] lines or [`TAIL_MAX_BYTES`] bytes, whichever is smaller. Returns `None` if the
 /// directory or no matching file exists. Pure (operates on the filesystem but takes no Tauri state)

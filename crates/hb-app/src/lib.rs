@@ -14,6 +14,8 @@ mod logging;
 mod manifest_cache;
 mod manifest_source;
 mod net;
+// QURATOR-68 — wires the pure NAT classifier (`net::classify_nat`) to a launch-time reading.
+mod nat;
 mod portable_update_logic;
 mod presence;
 mod single_instance;
@@ -320,6 +322,11 @@ pub fn run() {
             // never sends a full list never binds a QUIC endpoint.
             let manifest_endpoint: transport_state::SharedEndpoint =
                 transport_state::new_shared_endpoint();
+            // QURATOR-68: the NAT classification slot. Filled by a one-shot dial-only probe at
+            // startup, read by the Settings → Diagnostics UI and the `nat_classification` command.
+            // `None` until the first probe completes — the UI shows "not yet determined", never a
+            // confident "no NAT".
+            let nat_classification: nat::SharedNatClassification = nat::new_shared_classification();
 
             let (presence_cancel_tx, presence_cancel_rx) = tokio::sync::watch::channel(false);
             let presence_cancel: SharedCancelPresence = Arc::new(presence_cancel_tx);
@@ -336,6 +343,7 @@ pub fn run() {
             app.manage(Arc::clone(&online_cache));
             app.manage(Arc::clone(&beacon));
             app.manage(Arc::clone(&manifest_endpoint));
+            app.manage(Arc::clone(&nat_classification));
             // M13 Part A: serializes the announce cooldown's check-and-record step.
             app.manage(commands::topics::AnnounceGate(std::sync::Mutex::new(())));
 
@@ -376,10 +384,20 @@ pub fn run() {
             // be dialable this one. `restore_identity` populates synchronously above, so the transport
             // key is available here. Binds ONLY if an unspent ticket is on the books — see
             // `transport_state::rebind_if_tickets_outstanding` for why that asymmetry is deliberate.
+            //
+            // QURATOR-68: this same task also runs the NAT classification probe once the transport
+            // key is available. The probe is a one-shot `bind_client_endpoint` (owner ruling ③ —
+            // dial-only, never the listening variant), which reads iroh's net_report for the
+            // relay-observed mapped address + `mapping_varies_by_dest_ipv4`, classifies via
+            // `net::classify_nat`, stores the token, and writes ONE INFO line carrying the
+            // classification and never the address (INV — peer/self addresses are the H4/MT2
+            // harvest shape and are never logged). See `nat::probe_and_close`. It runs AFTER the
+            // manifest-plane rebind so a bound manifest endpoint can be reused if one exists.
             {
                 let endpoint = Arc::clone(&manifest_endpoint);
                 let identity = Arc::clone(&identity);
                 let store = store.clone();
+                let nat_slot = Arc::clone(&nat_classification);
                 tauri::async_runtime::spawn(async move {
                     let keys = {
                         let guard = identity.read().await;
@@ -405,6 +423,16 @@ pub fn run() {
                     )
                     .await;
                     tracing::info!("startup: manifest-plane rebind check complete");
+
+                    // QURATOR-68: NAT classification probe. If the manifest plane already bound an
+                    // endpoint (outstanding ticket ⇒ Listen, or any future always-bind path), reuse
+                    // its handle rather than binding a second one — the ruling-compliant reuse path.
+                    // Otherwise bind a fresh dial-only endpoint with the session's transport key,
+                    // classify, log, store, and close it.
+                    let existing = endpoint.read().await.bound.as_ref().map(|b| b.endpoint.clone());
+                    tracing::info!("startup: NAT classification probe spawning");
+                    nat::probe_and_close(transport_key.bytes(), &nat_slot, existing).await;
+                    tracing::info!("startup: NAT classification probe complete");
                 });
             }
             tracing::info!("startup: presence loop + update check spawning");
@@ -463,6 +491,8 @@ pub fn run() {
             commands::collection::export_manifest,
             commands::diagnostics::reveal_log_folder,
             commands::diagnostics::copy_diagnostics,
+            // QURATOR-68 — the NAT classification token for the Settings → Diagnostics UI.
+            commands::diagnostics::nat_classification,
             commands::browse::import_manifest,
             // M18 W4 — the fulfil verb, both halves.
             commands::fulfil::send_full_list,

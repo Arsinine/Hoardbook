@@ -528,6 +528,13 @@ export const copyDiagnostics = () => invoke<string>('copy_diagnostics');
 /** Open the OS file manager at the log directory. Creates it if missing (first launch). */
 export const revealLogFolder = () => invoke<void>('reveal_log_folder');
 
+// QURATOR-68 — the NAT classification token for the Settings → Diagnostics UI. One of
+// "no-nat" | "nat" | "cgnat" | "unknown" | "undetermined" (before the first probe completes).
+// The mapped address is never returned — only the classification (INV: peer/self addresses are
+// the H4/MT2 harvest shape and never leave the machine via this surface).
+export type NatClassification = 'no-nat' | 'nat' | 'cgnat' | 'unknown' | 'undetermined';
+export const natClassification = () => invoke<NatClassification>('nat_classification');
+
 // ── Watches ───────────────────────────────────────────────────────────────────
 
 export const watchesGet    = () => invoke<Watch[]>('watches_get');

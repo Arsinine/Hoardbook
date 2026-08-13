@@ -104,7 +104,11 @@ pub(crate) const LOG_PREFIX: &str = "hb-app.log";
 /// be plain text (QURATOR-73 Part A). A test that built its own `fmt::layer()` could pass while
 /// production shipped escapes; routing both paths through here is what makes the
 /// `log_emission_contains_no_ansi_escape` test honest rather than vacuous.
-fn fmt_layer<S, W>(make_writer: W) -> impl tracing_subscriber::Layer<S>
+///
+/// `pub(crate)` so QURATOR-68's NAT log-privacy tests in `nat::tests` route through the same
+/// shared layer-construction site — the same discipline (a test that built its own `fmt::layer()`
+/// could pass while production shipped escapes applies equally to the NAT log line).
+pub(crate) fn fmt_layer<S, W>(make_writer: W) -> impl tracing_subscriber::Layer<S>
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
     W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + 'static,

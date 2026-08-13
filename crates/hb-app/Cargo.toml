@@ -74,7 +74,13 @@ globset = "0.4"
 # four mechanisms in `transport_payload.rs` + the rewritten CI sweep, not by this dep's absence.
 # `default-features = false` + `tls-ring`: no metrics, no portmapper — the same minimal surface the
 # retired plane pinned.
-iroh    = { version = "1.0", default-features = false, features = ["tls-ring"] }
+# QURATOR-68: `unstable-net-report` is outside iroh's semver (they may break it in a patch). The owner
+# accepted that risk explicitly 2026-08-13: it is the one feature that lets us read the relay-observed
+# mapped address + `mapping_varies_by_dest_ipv4` from an endpoint the app already binds, so the NAT
+# classifier (`net::classify_nat`) gets real inputs instead of staying dead code. If iroh breaks it
+# under us, the symptom is a compile error in `nat.rs` (not a silent regression), and we pin a working
+# patch version.
+iroh    = { version = "1.0", default-features = false, features = ["tls-ring", "unstable-net-report"] }
 # M9 snapshot auto-update: cross-platform filesystem watcher (inotify / FSEvents /
 # ReadDirectoryChangesW). Kept behind a thin wrapper (`spawn_fs_watcher`) so the OS watcher is never
 # in a unit test — the pure `watch_plan` is fake-clock tested. `async-trait` gives the injectable
