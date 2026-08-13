@@ -10,6 +10,7 @@
 	import { listen } from '@tauri-apps/api/event';
 	import { navIcons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
+	import WindowControls from '$lib/components/WindowControls.svelte';
 	import { getVersion } from '@tauri-apps/api/app';
 	import { NAV_POLL_VISIBLE_MS, ANNOUNCE_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
 	interface Props {
@@ -185,6 +186,18 @@
 
 	<!-- Main -->
 	<div class="main">
+		<!-- QURATOR-81 — window controls overlay the route's top-right corner, absolute-positioned so
+		     they add zero vertical cost (the owner's ruling: merge into existing chrome, no new bar).
+		     One site covers all six routes — Browse and Chat have no .topbar, so per-route placement
+		     would leave them with no controls at all. The top drag strip is a thin full-width bar at
+		     the very top edge — route topbars start with 16px of padding, so this 8px strip overlaps
+		     only empty padding and never swallows a click on a route action. It gives the user an
+		     obvious grab point to drag the window. Route topbars reserve right-space for the controls
+		     via the :global(.topbar) padding rule below. -->
+		<div class="win-drag-top" data-tauri-drag-region aria-hidden="true"></div>
+		<div class="win-controls-host" data-tauri-drag-region>
+			<WindowControls />
+		</div>
 		{@render children?.()}
 	</div>
 </div>
@@ -340,6 +353,59 @@
 		flex-direction: column;
 		overflow: hidden;
 		min-width: 0;
+		/* QURATOR-81 — the custom window controls (minimize/maximize/close) are absolute-positioned
+		   in the top-right corner of .main (see .win-controls-host). They overlay each route's topbar
+		   (or panel header for Browse/Chat), matching the owner's "merge into existing chrome, no new
+		   bar" ruling: zero added vertical cost. Position:relative here anchors them. */
+		position: relative;
+	}
+
+	/* QURATOR-81 — thin full-width drag strip at the very top edge of .main. Route topbars begin
+	   with 16px of vertical padding before their content, so this 8px strip overlaps only that
+	   empty padding — it cannot swallow a click on any route button or input. `data-tauri-drag-region`
+	   is Tauri v2's drag trigger; the companion `app-region: drag` is Tauri's own documented rule
+	   (`*[data-tauri-drag-region] { app-region: drag }`) and is what adds touch + pen dragging on
+	   WINDOWS — do not delete it as an Electron-ism, it is prescribed by the Tauri v2 docs.
+	   ⚠ svelte-check reports `Unknown property: 'app-region'` for each use (3 total, here ×2 and in
+	   WindowControls.svelte) — that is the compiler's CSS dictionary being out of date, NOT a defect.
+	   It is why the warning baseline moved 14 → 17. Errors stay at 0, which is the actual gate. */
+	.win-drag-top {
+		position: absolute;
+		top: 0;
+		left: 0;
+		right: 0;
+		height: 8px;
+		z-index: 5;
+		app-region: drag;
+	}
+
+	/* QURATOR-81 — the three controls (minimize / maximize-restore / close), absolute top-right.
+	   The host is itself a drag region (data-tauri-drag-region), so the empty padding around the
+	   buttons is a drag handle too. ⚠ The buttons are safe from starting a drag because
+	   `data-tauri-drag-region` applies ONLY to the element it sits on and does NOT inherit to
+	   children (Tauri v2 docs — to extend it you must add the attribute to each child). That
+	   non-inheritance is the actual mechanism; the `app-region: no-drag` on .win-controls is belt
+	   and braces, NOT the thing protecting the clicks. So never put `data-tauri-drag-region` on a
+	   button expecting `no-drag` to save you — it will not. The left padding creates a visible gap between the
+	   drag handle and any route action button to the left (e.g. "Add contact"), so Close never sits
+	   flush against a primary action. */
+	.win-controls-host {
+		position: absolute;
+		top: 6px;
+		right: 8px;
+		z-index: 6;
+		display: flex;
+		align-items: center;
+		padding-left: 8px;
+		app-region: drag;
+	}
+
+	/* QURATOR-81 — reserve space in every route's topbar so action buttons never slide under the
+	   window controls. ONE global rule here (not six per-route edits) — Contacts/Browse are this
+	   project's standing drift pair, and four parallel topbar edits is exactly how that recurs. The
+	   120px matches three 30px-wide controls + the 8px right offset + gap. */
+	.main :global(.topbar) {
+		padding-right: 120px;
 	}
 
 	.toast {
