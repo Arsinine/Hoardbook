@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, hasPublishedProfile, publishProfile, copyDiagnostics, revealLogFolder } from '$lib/api.js';
-	import type { Settings, UpdateInfo, PortableUpdateInfo, BeaconReport } from '$lib/api.js';
+	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, hasPublishedProfile, publishProfile, copyDiagnostics, revealLogFolder, natClassification } from '$lib/api.js';
+	import type { Settings, UpdateInfo, PortableUpdateInfo, BeaconReport, NatClassification } from '$lib/api.js';
 	import { keyView } from '$lib/key-view.js';
 	import { passphraseStrength, backupModeOptions, type BackupMode } from '$lib/backup-export.js';
 	import { updateNoticeVM } from '$lib/update-ux.js';
@@ -190,6 +190,37 @@
 	let copyingDiagnostics = $state(false);
 	let revealingLogs = $state(false);
 
+	// QURATOR-68 — the NAT classification reading. 'undetermined' is the explicit "not yet
+	// determined" state (probe not yet complete / cold or offline start), NEVER a confident "no NAT"
+	// — the same rule as QURATOR-67 / QURATOR-80's empty-state fix: unknown must not render as a
+	// confident negative. CGNAT is "strong signal, not proof" — the copy must not overclaim.
+	let natClass = $state<NatClassification>('undetermined');
+	function natLabelFor(c: NatClassification): string {
+		switch (c) {
+			case 'cgnat': return 'CGNAT (carrier-grade NAT) detected';
+			case 'nat': return 'Behind NAT';
+			case 'no-nat': return 'No NAT';
+			case 'unknown': return 'Unknown — could not determine';
+			default: return 'Not yet determined';
+		}
+	}
+	function natSubFor(c: NatClassification): string {
+		switch (c) {
+			case 'cgnat':
+				return 'Your observed address is in 100.64.0.0/10. Strong signal, not proof — some ISPs use other ranges, and double-NAT exists.';
+			case 'nat':
+				return 'Your local address is RFC 1918 private, or your observed address differs from your local one.';
+			case 'no-nat':
+				return 'Your local address is what the outside world sees.';
+			case 'unknown':
+				return 'No mapped address was observed and your local address is not RFC 1918 private. This is NOT "no NAT" — it is undecided.';
+			default:
+				return 'The launch-time probe has not completed yet. Reload Settings to retry.';
+		}
+	}
+	let natLabel = $derived(natLabelFor(natClass));
+	let natSub = $derived(natSubFor(natClass));
+
 	async function handleCopyDiagnostics() {
 		copyingDiagnostics = true;
 		try {
@@ -279,6 +310,15 @@
 			const notice = updateNoticeVM(await takeUpdateNotice());
 			if (notice.show) toast(`Now running v${notice.version} — see the changelog for what's new`, 'success');
 		} catch { /* updater not configured */ }
+		// QURATOR-68: read the NAT classification the startup probe wrote. Best-effort — a failure
+		// leaves the explicit "Not yet determined" state, never a confident negative. Re-checked
+		// after a short delay so a slow probe (cold relay discovery) still surfaces a real reading.
+		try { natClass = await natClassification(); } catch { natClass = 'undetermined'; }
+		if (natClass === 'undetermined') {
+			setTimeout(async () => {
+				try { natClass = await natClassification(); } catch { /* keep undetermined */ }
+			}, 6_000);
+		}
 	});
 
 	async function handleGenerate() {
@@ -750,6 +790,23 @@
 	     capped log tail, or reveal the log folder. -->
 	<div class="section-label">Diagnostics</div>
 	<div class="surface">
+		<!-- QURATOR-68: the NAT classification row. One line + sub-label, no address data (INV).
+		     'undetermined' / 'unknown' are explicit not-yet-decided surfaces, never a confident
+		     "no NAT" — the same rule as QURATOR-67 / QURATOR-80's empty-state fix. CGNAT is
+		     "strong signal, not proof" and the copy must not overclaim. -->
+		<div class="nat-row" data-nat-class={natClass}>
+			<div class="toggle-text">
+				<div class="toggle-label">Network type</div>
+				<div class="toggle-sub">{natSub}</div>
+			</div>
+			<div
+				class="nat-pill"
+				class:nat-cgnat={natClass === 'cgnat'}
+				class:nat-nat={natClass === 'nat'}
+				class:nat-no={natClass === 'no-nat'}
+				class:nat-unknown={natClass === 'unknown' || natClass === 'undetermined'}
+			>{natLabel}</div>
+		</div>
 		<div class="toggle-row">
 			<div class="toggle-text">
 				<div class="toggle-label">Copy diagnostics to clipboard</div>
@@ -973,6 +1030,47 @@
 	.toggle-label { font-size: 12.5px; color: var(--fg); font-weight: 500; }
 
 	.toggle-sub { font-size: 11px; color: var(--fg-dim); margin-top: 1px; }
+
+	/* QURATOR-68 — the NAT classification row. Visually the same shape as a toggle-row but the
+	   right-hand slot is a coloured pill, not a button. `nat-unknown` covers both 'undetermined'
+	   and 'unknown' (the explicit not-yet-decided surfaces) and uses the muted tone so it reads
+	   visually distinct from a confident answer — never as a confident negative. */
+	.nat-row {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: 12px;
+	}
+
+	.nat-pill {
+		flex-shrink: 0;
+		font-size: 11px;
+		font-weight: 600;
+		padding: 4px 10px;
+		border-radius: 99px;
+		border: 1px solid var(--border);
+		background: var(--bg-elev2);
+		color: var(--fg-muted);
+		white-space: nowrap;
+	}
+	.nat-pill.nat-cgnat {
+		color: var(--accent);
+		border-color: color-mix(in oklch, var(--accent) 45%, transparent);
+		background: color-mix(in oklch, var(--accent) 12%, transparent);
+	}
+	.nat-pill.nat-nat {
+		color: var(--fg);
+		border-color: color-mix(in oklch, var(--fg) 30%, transparent);
+	}
+	.nat-pill.nat-no {
+		color: color-mix(in oklch, var(--accent) 75%, var(--fg) 25%);
+		border-color: color-mix(in oklch, var(--accent) 30%, transparent);
+	}
+	.nat-pill.nat-unknown {
+		color: var(--fg-dim);
+		font-style: italic;
+		font-weight: 500;
+	}
 
 	.toggle {
 		width: 30px; height: 17px;
