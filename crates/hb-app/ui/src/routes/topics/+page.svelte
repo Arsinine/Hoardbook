@@ -261,6 +261,15 @@
 			// next expand re-fetches.
 			if (generation === discoverGeneration) {
 				rootTopics = { ...rootTopics, [root]: found }; // cache regardless — keyed by root
+				// QURATOR-85: a successful fetch clears a stale error on this root — the relays just
+				// answered, so "we could not reach them" is no longer true. Without this, an overlapping
+				// FAILED request can leave erroredRoots set AFTER a SUCCESSFUL one caches real topics, and
+				// the template checks the error branch first, hiding the list.
+				if (erroredRoots.has(root)) {
+					const next = new Set(erroredRoots);
+					next.delete(root);
+					erroredRoots = next;
+				}
 			}
 		} catch (e) {
 			// Only surface if this root is STILL the open one: a stale request for a category the user
