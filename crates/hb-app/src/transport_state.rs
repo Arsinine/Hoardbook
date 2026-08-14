@@ -360,6 +360,13 @@ pub async fn rebind_if_tickets_outstanding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The lifecycle tests reuse the transport suite's loopback fixtures rather than growing a
+    // second copy of them here: `TestSource` is the hand-rollable `ManifestSource` and
+    // `real_payload_for` builds a real sealed envelope (a hand-written fixture would prove nothing
+    // about what production puts on the wire — see its own doc comment).
+    use crate::identity_state::AppIdentity;
+    use crate::transport::tests::{real_payload_for, TestSource};
+    use hb_core::ticket::TransportTicket;
 
     /// The rebind decision is the untested core of the manifest plane's identity lifecycle: the
     /// accept loop serves from a *snapshot* of the signing key, so a binding keyed to a DIFFERENT
@@ -420,5 +427,451 @@ mod tests {
             "a never-returning bind wrapped in tokio::time::timeout MUST surface a timeout error, \
              not hang"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // QURATOR-52 item 3 — the lifecycle itself, not its parts.
+    //
+    // The tests above pin the rebind DECISION (`should_rebind_for_owner`) and the bind timeout in
+    // isolation. Nothing drove the real state machine: bind a plane for identity A, close it the
+    // exact way `wipe_data` closes it, then bind for identity B — and the two fences that stop a
+    // call which raced the wipe from publishing a plane under the wiped key. The three below go
+    // through `ensure_endpoint` / `close_plane` themselves, so a hand-built `PlaneState` is never
+    // the thing under test.
+    //
+    // **On the bind these use.** `ensure_endpoint` calls the production `bind_endpoint` /
+    // `bind_client_endpoint` (`presets::N0`) — there is no injection seam, by design, so exercising
+    // the real state machine means binding the real thing. That stays loopback-safe: in iroh 1.0
+    // `Endpoint::bind()` returns once the local sockets are up, and the relay/DNS/pkarr work runs
+    // in spawned background tasks, so **no assertion below can depend on relay reachability**.
+    // Nothing dials and nothing is served; the plane is bound, closed, and bound again.
+    //
+    // The live identity handle is a REAL `AppIdentity` (not a placeholder npub string) because the
+    // second fence compares the live handle's npub against the requested owner — a fake string
+    // would be refused for the wrong reason and the test would prove nothing about fence 2.
+    // ---------------------------------------------------------------------------
+
+    /// A minimal ticket + payload for the `ManifestSource`: nothing dials or serves in these
+    /// tests, so the source only has to exist for the bind. `TestSource` is the transport suite's
+    /// hand-rollable source — reusing it here keeps one fixture, not two.
+    fn lifecycle_source() -> Arc<dyn ManifestSource> {
+        let ticket = TransportTicket::issue(
+            "req-lifecycle",
+            "lifecycle",
+            // Never read: the address is only consulted by a peer that dials, and none does.
+            "{}",
+            1_700_000_000,
+            None,
+        );
+        TestSource::new(ticket, real_payload_for("lifecycle", 1))
+    }
+
+    /// **The identity-wipe → plane-rebind path, end to end through the production calls.**
+    ///
+    /// `wipe_data`'s comment claims three things about `close_plane`: the binding is *forgotten*
+    /// (not merely closed), the endpoint is *closed* (a wiped key's node stops answering), and the
+    /// *generation* moves (so a call that raced the wipe cannot publish). This is the first test
+    /// that checks any of them against the real state machine rather than the pure helpers.
+    ///
+    /// Why the endpoint-identity comparison matters: `EndpointId` is the node key derived from the
+    /// transport secret, so `ep_b.id() != ep_a.id()` proves the rebind minted a NEW plane rather
+    /// than resurrecting the old handle — the satisfaction check must have refused the closed
+    /// binding, not handed it back.
+    #[tokio::test]
+    async fn a_wipe_closes_the_plane_and_the_next_identity_gets_a_new_plane() {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let shared = new_shared_endpoint();
+
+            // Identity A: npub and transport key extracted before the handle takes ownership
+            // (`AppIdentity` is deliberately not `Clone`).
+            let id_a = AppIdentity::generate();
+            let npub_a = id_a.npub();
+            let key_a = id_a.transport_key.clone();
+            let live: crate::identity_state::SharedIdentity = Arc::new(RwLock::new(Some(id_a)));
+
+            // DialOnly: no accept loop, no advertised ALPN — lighter, and it exercises exactly the
+            // same generation/rebind logic (the role only decides whether a loop spawns).
+            let ep_a = ensure_endpoint(
+                &shared,
+                &npub_a,
+                &live,
+                &key_a,
+                lifecycle_source(),
+                Role::DialOnly,
+            )
+            .await
+            .expect("the first bind succeeds");
+            {
+                let st = shared.read().await;
+                let b = st.bound.as_ref().expect("the plane is bound after the first call");
+                assert_eq!(b.owner_npub, npub_a, "the binding is keyed to the npub that bound it");
+                assert!(
+                    !b.listening,
+                    "a DialOnly bind must not advertise the listening role"
+                );
+                assert_eq!(st.generation, 0, "a plain bind does not move the generation counter");
+            }
+            assert!(!ep_a.is_closed(), "sanity: the freshly bound endpoint is open");
+
+            // The exact call `wipe_data` makes, in the same order (identity already cleared below
+            // would be closer still, but the identity half belongs to fence 2's test).
+            close_plane(&shared).await;
+            {
+                let st = shared.read().await;
+                assert!(
+                    st.bound.is_none(),
+                    "the wipe must FORGET the binding — a `Some(closed)` left behind is what a \
+                     failed rebind used to hand to the next caller"
+                );
+                assert_eq!(
+                    st.generation, 1,
+                    "the wipe bumps the generation exactly once — the counter is fence 1"
+                );
+            }
+            assert!(
+                ep_a.is_closed(),
+                "the wiped endpoint must be CLOSED, not just dropped from the state: the whole \
+                 point of close_plane is that the node key the wiped identity minted stops \
+                 answering redemptions"
+            );
+
+            // Identity B — a genuinely different key set, not a rename of A.
+            let id_b = AppIdentity::generate();
+            let npub_b = id_b.npub();
+            let key_b = id_b.transport_key.clone();
+            assert_ne!(npub_b, npub_a, "sanity: the two identities are distinct");
+            *live.write().await = Some(id_b);
+
+            let ep_b = ensure_endpoint(
+                &shared,
+                &npub_b,
+                &live,
+                &key_b,
+                lifecycle_source(),
+                Role::DialOnly,
+            )
+            .await
+            .expect("the new identity must be able to bind its own plane");
+            assert_ne!(
+                ep_b.id(),
+                ep_a.id(),
+                "the rebind must produce a NEW endpoint (different node key), not a resurrection \
+                 of the closed one"
+            );
+            assert!(!ep_b.is_closed(), "the new plane is live");
+            assert!(
+                ep_a.is_closed(),
+                "the wiped plane stays dead after the rebind — nothing resurrects it"
+            );
+            {
+                let st = shared.read().await;
+                assert_eq!(
+                    st.bound.as_ref().expect("identity B's plane is bound").owner_npub,
+                    npub_b,
+                    "the new binding is keyed to the NEW identity's npub"
+                );
+                assert_eq!(
+                    st.generation, 1,
+                    "a rebind is not a wipe: only close_plane moves the generation"
+                );
+            }
+
+            // Tidy: close B's plane too, so no relay-retry or accept task outlives the test.
+            close_plane(&shared).await;
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// **Fence 1 — a call that started BEFORE the wipe must not publish after it.**
+    ///
+    /// This is the race the generation counter exists for: a fulfil task reads the old identity,
+    /// then queues for the state lock; the wipe closes the plane underneath it; the queued task
+    /// must refuse to publish rather than resurrect the liveness surface the close removed.
+    ///
+    /// The interleave is FORCED, not hoped for. The test holds the write lock, so both tasks park
+    /// on it in the order they are spawned — tokio's `RwLock` is documented first-in-first-out —
+    /// and each `yield_now().await` lets the spawned task reach its park before the next line
+    /// runs. When the gate drops, permit arithmetic alone fixes the sequence: the stale caller is
+    /// granted its read (it sees the still-bound plane and captures generation 0), the wiper is
+    /// granted its write (identity cleared, generation bumped to 1, plane taken and closed), and
+    /// only then is the stale caller's write request — queued behind the wiper's — granted, where
+    /// the generation mismatch must stop it. If the ordering machinery ever broke, this test
+    /// fails LOUDLY (the stale call would bind and return `Ok`, or refuse via fence 2's different
+    /// message); it cannot pass vacuously.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_call_that_started_before_the_wipe_must_not_publish_after_it() {
+        // A DialOnly binding for identity A exists, and the stale caller wants to UPGRADE it to
+        // Listen — the real fulfil shape, and the one that gets past the read-stage satisfaction
+        // check (DialOnly does not satisfy Listen) and deep enough to reach the fences.
+        let shared = new_shared_endpoint();
+        let id_a = AppIdentity::generate();
+        let npub_a = id_a.npub();
+        let key_a = id_a.transport_key.clone();
+        let live: crate::identity_state::SharedIdentity = Arc::new(RwLock::new(Some(id_a)));
+        let ep_a = ensure_endpoint(
+            &shared,
+            &npub_a,
+            &live,
+            &key_a,
+            lifecycle_source(),
+            Role::DialOnly,
+        )
+        .await
+        .expect("setup: the pre-wipe bind succeeds");
+
+        // Freeze the state machine so both tasks below queue on the lock, in this order.
+        let gate = shared.write().await;
+
+        // (1) The STALE caller — queued FIRST. It parks acquiring the read lock, so it has not
+        //     yet captured the generation; when it finally runs, it will capture generation 0.
+        let stale = {
+            let shared = shared.clone();
+            let live = live.clone();
+            let npub = npub_a.clone();
+            let key = key_a.clone();
+            let source = lifecycle_source();
+            tokio::spawn(async move {
+                ensure_endpoint(&shared, &npub, &live, &key, source, Role::Listen).await
+            })
+        };
+        tokio::task::yield_now().await;
+
+        // (2) The WIPER — queued SECOND, so its generation bump lands between the stale caller's
+        //     read and its write. It performs `wipe_data`'s two state halves in production order:
+        //     clear the identity, then close the plane.
+        let wiper = {
+            let shared = shared.clone();
+            let live = live.clone();
+            tokio::spawn(async move {
+                *live.write().await = None;
+                close_plane(&shared).await;
+            })
+        };
+        tokio::task::yield_now().await;
+
+        // Release. The FIFO queue now executes: stale reads (generation 0) → wiper wipes
+        // (generation 1, plane closed) → stale writes and must hit fence 1.
+        drop(gate);
+
+        wiper.await.expect("the wipe completed");
+        let outcome = stale.await.expect("the stale call resolves rather than hanging");
+        let err = outcome
+            .expect_err("a call that captured the pre-wipe generation must not publish a plane");
+        assert!(
+            err.to_string().contains("the transport was shut down while binding"),
+            "the FIRST fence (generation) must be what refuses it — fence 2's message here would \
+             mean the generation check is not doing its job. got: {err}"
+        );
+
+        let st = shared.read().await;
+        assert!(
+            st.bound.is_none(),
+            "the refused call published nothing — the wiped plane was not resurrected"
+        );
+        assert_eq!(st.generation, 1, "only the wipe moved the generation");
+        drop(st);
+        assert!(ep_a.is_closed(), "the wipe closed the pre-wipe endpoint");
+    }
+
+    /// **Fence 2 — a call for the wiped identity is refused even with a CURRENT generation.**
+    ///
+    /// Fence 1 cannot catch a stale fulfil that *enters after* the wipe: it captures the new
+    /// generation and passes. The second fence re-reads the LIVE identity under the lock and
+    /// refuses when the npub it was asked to bind for is no longer the session's — which is why
+    /// this test's call must fail with fence 2's message specifically, not merely "some error".
+    #[tokio::test]
+    async fn a_call_for_the_wiped_identity_is_refused_even_with_a_current_generation() {
+        let shared = new_shared_endpoint();
+        let id_a = AppIdentity::generate();
+        let npub_a = id_a.npub();
+        let key_a = id_a.transport_key.clone();
+        let live: crate::identity_state::SharedIdentity = Arc::new(RwLock::new(Some(id_a)));
+
+        // The wipe, in `wipe_data`'s order: identity cleared, then the plane closed.
+        *live.write().await = None;
+        close_plane(&shared).await;
+
+        // This call enters AFTER the wipe, so it captures generation 1 — fence 1 passes by
+        // construction, and only the live-identity re-read can stop it.
+        let err = ensure_endpoint(
+            &shared,
+            &npub_a,
+            &live,
+            &key_a,
+            lifecycle_source(),
+            Role::Listen,
+        )
+        .await
+        .expect_err("a call for the wiped identity must not publish a plane");
+        assert!(
+            err.to_string().contains("the identity changed while binding"),
+            "the SECOND fence (live identity) must be what refuses it — this call passes fence 1 \
+             by construction. got: {err}"
+        );
+
+        let st = shared.read().await;
+        assert!(
+            st.bound.is_none(),
+            "no endpoint was bound under the wiped key's name"
+        );
+        assert_eq!(
+            st.generation, 1,
+            "the refused call neither published nor moved the generation"
+        );
+    }
+
+    /// **The signing-key comparison in the SATISFACTION CHECK — QURATOR-52's headline, and the
+    /// piece the wipe-lifecycle test structurally cannot cover.** After a wipe there is no binding
+    /// left to satisfy or refuse, so the next bind is fresh. But the owner-change-without-wipe
+    /// path (`restore_data`'s shape: `*identity.write().await = Some(..)`, no `close_plane`)
+    /// leaves the old plane BOUND, and [`ensure_endpoint`] must notice the owner moved and
+    /// close-and-rebind rather than hand back the previous identity's endpoint.
+    ///
+    /// **Identity A binds with `Listen` on purpose — it is what makes the npub comparison the
+    /// ONLY thing this test can fail on.** `satisfies` is a conjunction of three clauses (owner,
+    /// role, closed-ness); a `DialOnly` binding under a `Listen` ask fails the ROLE clause
+    /// regardless of the owner check, which is exactly how the first draft of this test stayed
+    /// green under a mutation that stubbed `should_rebind_for_owner` out of `satisfies`
+    /// entirely — the "suite pins attributes, mutation changes shape, everything stays green"
+    /// trap. A listening binding satisfies the role clause for ANY ask, so the owner mismatch is
+    /// the sole discriminator left.
+    #[tokio::test]
+    async fn a_bound_plane_for_a_previous_identity_is_rebound_not_reused() {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let shared = new_shared_endpoint();
+
+            let id_a = AppIdentity::generate();
+            let npub_a = id_a.npub();
+            let key_a = id_a.transport_key.clone();
+            let live: crate::identity_state::SharedIdentity = Arc::new(RwLock::new(Some(id_a)));
+            let ep_a = ensure_endpoint(
+                &shared,
+                &npub_a,
+                &live,
+                &key_a,
+                lifecycle_source(),
+                Role::Listen,
+            )
+            .await
+            .expect("identity A binds its plane");
+
+            // The identity changes WITHOUT a wipe. The old plane is still bound, still listening.
+            let id_b = AppIdentity::generate();
+            let npub_b = id_b.npub();
+            let key_b = id_b.transport_key.clone();
+            *live.write().await = Some(id_b);
+
+            let ep_b = ensure_endpoint(
+                &shared,
+                &npub_b,
+                &live,
+                &key_b,
+                lifecycle_source(),
+                Role::Listen,
+            )
+            .await
+            .expect("the new identity gets its own plane");
+
+            assert_ne!(
+                ep_b.id(), ep_a.id(),
+                "the previous identity's endpoint must NOT be handed to the new one — it is the \
+                 node key A minted, serving manifests A's keys signed"
+            );
+            assert!(
+                ep_a.is_closed(),
+                "the displaced binding is closed, not left listening under A's node key"
+            );
+            let st = shared.read().await;
+            let b = st.bound.as_ref().expect("a binding exists for identity B");
+            assert_eq!(b.owner_npub, npub_b, "the new binding is keyed to the new npub");
+            assert!(b.listening, "the rebind honoured the requested role");
+            assert_eq!(st.generation, 0, "an owner rebind is not a wipe: no generation bump");
+            drop(st);
+
+            close_plane(&shared).await;
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// **The third clause of the satisfaction check: a binding whose endpoint has died is never
+    /// handed back, however well it otherwise matches.** The comment on `satisfies` records this
+    /// as a fixed bug — "a failed rebind used to leave exactly that in place and hand it to the
+    /// next caller" — and the owner/role clauses above cannot cover it, because it fires when the
+    /// npub and the role BOTH still match. Only the closed-ness clause is left to catch it.
+    ///
+    /// The state is built without touching production internals: the endpoint is closed through
+    /// its own public handle, leaving `bound = Some(closed)` behind — exactly what a failed rebind
+    /// or an iroh-side teardown leaves. A same-owner, same-role ask must then bind a FRESH
+    /// endpoint; handing back the dead one would return `Ok` with an endpoint whose `connect`
+    /// can never succeed, i.e. a fulfil click that "works" and then always fails.
+    #[tokio::test]
+    async fn a_binding_whose_endpoint_died_is_rebound_even_when_the_owner_still_matches() {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let shared = new_shared_endpoint();
+            let id = AppIdentity::generate();
+            let npub = id.npub();
+            let key = id.transport_key.clone();
+            let live: crate::identity_state::SharedIdentity = Arc::new(RwLock::new(Some(id)));
+
+            let ep_a = ensure_endpoint(
+                &shared,
+                &npub,
+                &live,
+                &key,
+                lifecycle_source(),
+                Role::Listen,
+            )
+            .await
+            .expect("the initial bind succeeds");
+
+            // Kill the ENDPOINT, not the plane: the state still records the binding, and every
+            // clause of `satisfies` except closed-ness would pass for a same-owner, same-role ask.
+            ep_a.close().await;
+            assert!(ep_a.is_closed(), "sanity: the endpoint is dead but still recorded");
+            assert!(
+                shared.read().await.bound.is_some(),
+                "sanity: the closed binding is still in place — the state a failed rebind leaves"
+            );
+
+            let ep_b = ensure_endpoint(
+                &shared,
+                &npub,
+                &live,
+                &key,
+                lifecycle_source(),
+                Role::Listen,
+            )
+            .await
+            .expect("a same-owner ask must still get a USABLE endpoint");
+            // **Discriminated by closed-ness, not by `EndpointId` — and that is not a
+            // compromise.** The id IS the node key derived from the persisted transport secret,
+            // so binding under the SAME identity yields the SAME id *by design* (that stability
+            // is why the secret is persisted). What distinguishes a fresh endpoint instance from
+            // the dead handle is that the fresh one is open: had `satisfies` handed the closed
+            // binding back, `ep_b` would BE `ep_a`'s handle and report closed here.
+            assert!(
+                !ep_b.is_closed(),
+                "the dead binding was replaced, not handed back — returning it would be an Ok \
+                 whose every future connect fails"
+            );
+            {
+                let st = shared.read().await;
+                let b = st.bound.as_ref().expect("the replacement is recorded");
+                assert!(
+                    !b.endpoint.is_closed(),
+                    "the STATE records the live replacement, not the corpse"
+                );
+                assert_eq!(b.owner_npub, npub, "still keyed to the same, unchanged identity");
+                assert_eq!(st.generation, 0, "no wipe happened, so no generation bump");
+                // Released before `close_plane` below takes the WRITE lock — holding a read guard
+                // across it is a self-deadlock, and it cost this test its first three runs.
+            }
+
+            close_plane(&shared).await;
+        })
+        .await
+        .expect("test timed out");
     }
 }
