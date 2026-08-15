@@ -531,7 +531,7 @@
 	{#if tab === 'mine'}
 		<section class="master-detail">
 			<!-- Left: My Topics list -->
-			<div class="surface list-pane">
+			<div class="list-pane">
 				{#if mine.length === 0}
 					<p class="muted empty">You haven’t joined any Topics yet. Create one, or switch to Discover.</p>
 				{:else}
@@ -553,7 +553,7 @@
 			</div>
 
 			<!-- Right: detail (roster + invite + chat deep-link) -->
-			<div class="surface detail-pane">
+			<div class="detail-pane">
 				{#if openTopic}
 					<div class="detail-head">
 						<div class="grow">
@@ -626,7 +626,7 @@
 	{:else}
 		<!-- Discover tab — devtest v0.12.1 #7: browse public Topics by primitive (root category). No tag
 		     search; expand a category to fetch every public Topic under it (backend activity-ranked). -->
-		<section class="surface discover-tab">
+		<section class="discover-tab">
 			<p class="muted discover-hint">Browse public Topics by category. Expand one to see every public Topic under it.</p>
 			<!-- Hoardbook Topics draft r1 — search across the already-fetched roots only. No fetch-on-
 			     search: toggleRoot's fetch/cache/retry machine is pinned by the QURATOR-80/83/85
@@ -777,14 +777,6 @@
 
 	.body { flex: 1; min-height: 0; padding: 18px 22px; box-sizing: border-box; display: flex; flex-direction: column; }
 
-	/* The card recipe the three panes shared verbatim — one declaration, padding per use.
-	   Same values as the settings page's `.surface`. */
-	.surface {
-		background: var(--bg-elev1);
-		border: 1px solid var(--border);
-		border-radius: 10px;
-	}
-
 	.tabs { display: inline-flex; background: var(--bg-elev1); border: 1px solid var(--border); border-radius: 8px; padding: 2px; }
 	.tab {
 		padding: 5px 12px; border: none; background: transparent; color: var(--fg-muted);
@@ -794,10 +786,14 @@
 	   Contacts' Name|Groups toggle exactly, replacing the off-system elev3 fill. */
 	.tab-active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 
-	/* Master–detail */
-	.master-detail { display: flex; gap: 16px; align-items: stretch; flex: 1; min-height: 0; }
+	/* Master–detail — flat, matching Browse's .left-panel / Chat's .convo-sidebar: a divider, not a
+	   box. (Previously wrapped in a shared `.surface` card with a 16px gap between panes; that made
+	   Topics the only master-detail page boxed like Settings/Contacts instead of flat like its
+	   actual layout siblings — stripped 2026-08-15.) */
+	.master-detail { display: flex; gap: 0; align-items: stretch; flex: 1; min-height: 0; }
 	.list-pane {
 		width: 280px; flex-shrink: 0; overflow-y: auto; padding: 6px;
+		border-right: 1px solid var(--border);
 	}
 	.topic-row {
 		display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
