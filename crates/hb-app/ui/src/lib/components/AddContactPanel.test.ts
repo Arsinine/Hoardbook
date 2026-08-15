@@ -245,3 +245,122 @@ describe('AddContactPanel — QURATOR-70 autocomplete DOM render (ani stem)', ()
 	});
 });
 
+// Discover tag-cloud (owner sign-off 2026-08-15) — DOM-level coverage of the pristine-state cloud:
+// real render + real click → addTagChip, and the hide-on-first-keystroke/disappear-on-commit rules.
+// The uniform-size / no-fake-frequency rule is a design constraint, not behavior; it is pinned by
+// the source-scan suite above NOT carrying any per-tag size styling.
+describe('AddContactPanel — Discover tag-cloud (pristine observed tags)', () => {
+	/** Open the Discover section with the observed-tags mock resolved and the input left EMPTY.
+	 *  Returns body-scoped helpers (the cloud lives outside the results list). */
+	async function openDiscoverPristine(tags: string[]) {
+		mockObservedTags(tags);
+		(searchPeers as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(resultEnvelope([]));
+		const { getByRole, getByPlaceholderText, queryAllByRole } = render(AddContactPanel, {
+			props: { open: true },
+		});
+		await fireEvent.click(getByRole('button', { name: /discover hoarders/i }));
+		// loadObservedTags() fires on open; let the mocked promise resolve and Svelte flush.
+		await vi.waitFor(() => {
+			const n = document.body.querySelectorAll('button.disc-cloud-tag').length;
+			expect(n).toBeGreaterThan(0);
+		}, { timeout: 2000, interval: 20 });
+		return { getByRole, getByPlaceholderText, queryAllByRole };
+	}
+
+	function cloudTags(): string[] {
+		return Array.from(document.body.querySelectorAll('button.disc-cloud-tag')).map(
+			(b) => (b.textContent ?? '').trim(),
+		);
+	}
+
+	it('renders observed tags as a clickable cloud before anything is typed', async () => {
+		await openDiscoverPristine(['anime', 'manga', 'vhs']);
+		expect(cloudTags()).toEqual(['#anime', '#manga', '#vhs']);
+	});
+
+	it('clicking a cloud tag commits it via the same addTagChip path as the autocomplete', async () => {
+		const { getByRole, getByPlaceholderText } = await openDiscoverPristine(['anime', 'vhs']);
+		await fireEvent.click(getByRole('button', { name: '#anime' }));
+		await tick();
+		// addTagChip reused UNCHANGED (per the sign-off): from a pristine input it sets
+		// discoverTags='anime' — the tag is the input text, and the typed stem is by definition
+		// not-yet-committed, so the chip appears once a separator/second term lands, exactly like
+		// the autocomplete path. The cloud is gone either way (input no longer empty), and the
+		// parsed tag already arms the search.
+		expect((getByPlaceholderText(/name, bio, or tag/i) as HTMLInputElement).value).toBe('anime');
+		expect(document.body.querySelectorAll('button.disc-cloud-tag').length).toBe(0);
+		// Type a separator → the tag becomes a committed chip with its remove button.
+		await fireEvent.input(getByPlaceholderText(/name, bio, or tag/i), { target: { value: 'anime, ' } });
+		await tick();
+		expect(getByRole('button', { name: 'Remove tag anime' })).toBeTruthy();
+	});
+
+	it('hides the cloud the moment the input is non-empty', async () => {
+		const { getByPlaceholderText } = await openDiscoverPristine(['anime']);
+		await fireEvent.input(getByPlaceholderText(/name, bio, or tag/i), { target: { value: 'a' } });
+		await tick();
+		expect(document.body.querySelectorAll('button.disc-cloud-tag').length).toBe(0);
+		// And it comes back when the input is cleared again.
+		await fireEvent.input(getByPlaceholderText(/name, bio, or tag/i), { target: { value: '' } });
+		await tick();
+		expect(cloudTags()).toEqual(['#anime']);
+	});
+
+	it('renders nothing when no tags have been observed', async () => {
+		// Not openDiscoverPristine (its waitFor would never pass with zero cloud tags) — open,
+		// settle for the mocked promise, then assert the cloud is simply absent.
+		mockObservedTags([]);
+		(searchPeers as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(resultEnvelope([]));
+		const { getByRole } = render(AddContactPanel, { props: { open: true } });
+		await fireEvent.click(getByRole('button', { name: /discover hoarders/i }));
+		await new Promise((r) => setTimeout(r, 30));
+		await tick();
+		expect(document.body.querySelectorAll('button.disc-cloud-tag').length).toBe(0);
+	});
+});
+
+// Why-matched badge (owner sign-off 2026-08-15) — DOM-level coverage: the badge renders per hit
+// from the terms THAT search ran with, shows the matched axis, and is omitted when null.
+describe('AddContactPanel — why-matched badge', () => {
+	it('shows the matched axis per hit (tag / type / name / bio)', async () => {
+		// Two hits, one per axis, so a single search proves both badges render per-row.
+		(searchPeers as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+			resultEnvelope([
+				makeHit({ npub: 'npub1bytag', tags: ['anime'], content_types: ['video'] }),
+				makeHit({ npub: 'npub1byname', tags: ['manga'], display_name: 'Anime Fan' }),
+			]),
+		);
+		mockObservedTags();
+		const { getByRole, getByPlaceholderText, findAllByText } = render(AddContactPanel, { props: { open: true } });
+		await fireEvent.click(getByRole('button', { name: /discover hoarders/i }));
+		await fireEvent.input(getByPlaceholderText(/tag/i), { target: { value: 'anime' } });
+		await fireEvent.click(getByRole('button', { name: /^search$/i }));
+		// 'anime' (single term): hit 1 carries it as a tag → 'tag'; hit 2 carries it in the name → 'name'.
+		expect((await findAllByText('matched by tag')).length).toBe(1);
+		expect((await findAllByText('matched by name')).length).toBe(1);
+	});
+
+	it('renders the badge as "type" for a content-type-only search', async () => {
+		// Type-only search: commit a content type chip, no tags.
+		mockObservedTags();
+		(searchPeers as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+			resultEnvelope([makeHit({ npub: 'npub1bytype', tags: ['whatever'], content_types: ['video'] })]),
+		);
+		const { getByRole, getAllByRole, findByText } = render(AddContactPanel, { props: { open: true } });
+		await fireEvent.click(getByRole('button', { name: /discover hoarders/i }));
+		await fireEvent.click(getAllByRole('button', { name: 'Video' })[0]);
+		await fireEvent.click(getByRole('button', { name: /^search$/i }));
+		expect(await findByText('matched by type')).toBeTruthy();
+	});
+
+	it('omits the badge when no confident reason exists (no placeholder)', async () => {
+		// discoverHits searches 'anime'. A hit whose tags/name/bio/content_types don't carry it →
+		// null → no badge node at all (note makeHit() defaults to tags:['anime'], which WOULD badge).
+		const { addBtn } = await discoverHits([
+			makeHit({ npub: 'npub1nomatch', tags: ['manga'], display_name: 'Stranger' }),
+		]);
+		expect(addBtn).toBeTruthy();
+		expect(document.body.querySelectorAll('.hit-why').length).toBe(0);
+	});
+});
+
