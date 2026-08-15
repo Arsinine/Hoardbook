@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { toast, contacts, identity, profile } from '$lib/stores.js';
+	import { toast, contacts, identity, profile, topicAnnounceSummaries, announceSeen } from '$lib/stores.js';
 	import {
 		topicList,
 		topicCreate,
@@ -16,8 +16,8 @@
 		topicAnnounce,
 		topicAnnounceStatus,
 	} from '$lib/api.js';
-	import type { TopicView, DiscoveredTopic, TopicLookup } from '$lib/types.js';
-	import { memberCountLabel, rosterLabel, TOPIC_ROOTS, composeTopicPath, subPathLabel, createPrimaryAction } from '$lib/topics-view.js';
+	import type { TopicView, DiscoveredTopic, TopicLookup, CachedPeer } from '$lib/types.js';
+	import { memberCountLabel, rosterLabel, unseenTopicAnnouncements, TOPIC_ROOTS, composeTopicPath, subPathLabel, createPrimaryAction } from '$lib/topics-view.js';
 	import { canAnnounce, cooldownLabel, ANNOUNCE_EXPLAINER } from '$lib/announce-view.js';
 	import { icons } from '$lib/icons.js';
 	import TopicJoinConsent from '$lib/components/TopicJoinConsent.svelte';
@@ -25,6 +25,7 @@
 	import HintMarker from '$lib/components/HintMarker.svelte';
 	import ConfirmButton from '$lib/components/ConfirmButton.svelte';
 	import ContactPicker from '$lib/components/ContactPicker.svelte';
+	import PersonRow from '$lib/components/PersonRow.svelte';
 
 	// Redesign (devtest 2026-06-25 #9): master–detail (My Topics list ↔ selected-topic detail),
 	// Create as a modal + Discover as a tab (forms are no longer always-on stacked cards), and the
@@ -79,6 +80,20 @@
 	// M21 W3: Invite opens the ContactPicker modal (select a contact OR type a new npub) instead of a
 	// bare inline text field.
 	let invitePickerOpen = $state(false);
+
+	// Hoardbook Topics draft r1 — unread pill: the per-row twin of the Chat nav badge's announce
+	// share. The data is already polled app-wide (+layout.svelte); this is a pure render addition —
+	// no new fetch. A topic is "unseen" when its latest announcement is past its seen watermark; the
+	// watermark still advances only in Chat (topicAnnounceMarkSeen), which clears the pill here via
+	// the shared `announceSeen` store.
+	let unseenTopics = $derived(new Set(unseenTopicAnnouncements($topicAnnounceSummaries, $announceSeen).map((s) => s.topic_id)));
+
+	// Hoardbook Topics draft r1 — Discover search: filters ONLY across roots already expanded and
+	// successfully cached (pure client-side over already-fetched data). Deliberately NO fetch-on-
+	// search: `toggleRoot`'s fetch/cache/retry machine is pinned by three call-count tests
+	// (QURATOR-80/83/85), and an eager fetch here would break them. Coverage is therefore partial by
+	// design and says so (the hint below) rather than pretending to be full.
+	let searchQuery = $state('');
 
 	// devtest v0.12.1 #8: a Topic's description is editable after creation (the name is immutable).
 	let editingDesc = $state(false);
@@ -434,6 +449,63 @@
 			toast(String(e), 'error');
 		}
 	}
+
+	// Hoardbook Topics draft r1 — roster row resolution: the roster carries bare npubs, and the row's
+	// picture / fingerprint / presence come from the contacts store when the npub is a saved contact
+	// ("you" is implicitly online). A non-contact has none of these — PersonRow omits the fingerprint
+	// line and the presence dot rather than guessing a state (absent-gracefully, the M21 W4
+	// behaviour-4 precedent: "no ring, no word row"). The name stays `rosterLabel`'s (self → petname
+	// → short-npub), so nothing here re-derives a display name.
+	function rosterRowProps(npub: string): {
+		name: string;
+		letter: string;
+		picture?: string;
+		fingerprint?: CachedPeer['fingerprint'];
+		online: boolean;
+	} {
+		const self = $identity ? { npub: $identity.npub, display_name: $profile?.display_name } : null;
+		const isSelf = self !== null && npub === self.npub;
+		const contact = $contacts.find((c) => c.npub === npub);
+		const name = rosterLabel(npub, $contacts, self);
+		return {
+			name,
+			letter: name[0]?.toUpperCase() ?? '?',
+			picture: contact?.profile?.picture,
+			fingerprint: contact?.fingerprint,
+			online: isSelf || contact?.online === true,
+		};
+	}
+
+	// Hoardbook Topics draft r1 — Discover search corpus: every root that has been successfully
+	// fetched (a key in `rootTopics`), path-only per the draft's own choice (the name / sub-path
+	// label, never the description). Roots never expanded are simply not in the corpus, and the
+	// template says so instead of pretending full coverage. Pure array filtering — no fetches, no
+	// new state machine (`toggleRoot`'s cache/retry machine is pinned by the QURATOR-80/83/85
+	// call-count tests and stays untouched).
+	let searchResults = $derived.by(() => {
+		const q = searchQuery.trim().toLowerCase();
+		if (!q) return [] as DiscoveredTopic[];
+		// Codex review (2026-08-15): topic_discover is a TAG query (crates/hb-app/src/commands/
+		// topics.rs), not a strict name-prefix lookup, so the same topic_id can legitimately surface
+		// under more than one root's cache (e.g. a legacy/externally published announce carrying
+		// multiple root-category tags). Dedupe by topic_id — first-seen wins — or the `(d.topic_id)`
+		// keyed #each below renders duplicate keys.
+		const seen = new Map<string, DiscoveredTopic>();
+		for (const root of TOPIC_ROOTS) {
+			for (const d of rootTopics[root] ?? []) {
+				if (
+					!seen.has(d.topic_id) &&
+					(d.name.toLowerCase().includes(q) || subPathLabel(d.name).toLowerCase().includes(q))
+				) {
+					seen.set(d.topic_id, d);
+				}
+			}
+		}
+		return [...seen.values()];
+	});
+	// Partial-coverage hint: true while at least one root category has never been fetched, so the
+	// search can only speak for the expanded subset.
+	let searchCoveragePartial = $derived(TOPIC_ROOTS.some((root) => rootTopics[root] === undefined));
 </script>
 
 <!-- TopBar — the shared app shell (see routes/+page.svelte, contacts, settings). -->
@@ -469,6 +541,12 @@
 								<div class="name">{t.name} {#if t.private}<span class="tag">private</span>{/if}</div>
 								{#if t.description}<div class="muted">{t.description}</div>{/if}
 							</div>
+							<!-- Hoardbook Topics draft r1 — unread pill: this topic's announcement is past its
+							     seen watermark (boolean only; no per-topic count exists in this data shape).
+							     Mirrors the Chat nav-badge's visual language (+layout.svelte .nav-badge). -->
+							{#if unseenTopics.has(t.topic_id)}
+								<span class="unread" title="New announcement"></span>
+							{/if}
 						</button>
 					{/each}
 				{/if}
@@ -500,7 +578,10 @@
 					<div class="detail-section">
 						<div class="section-label">Roster ({roster.length})</div>
 						<ul class="roster">
-							{#each roster as npub (npub)}<li>{rosterLabel(npub, $contacts, $identity ? { npub: $identity.npub, display_name: $profile?.display_name } : null)}</li>{/each}
+							{#each roster as npub (npub)}
+								{@const row = rosterRowProps(npub)}
+								<li><PersonRow name={row.name} letter={row.letter} picture={row.picture} fingerprint={row.fingerprint} online={row.online} /></li>
+							{/each}
 						</ul>
 					</div>
 
@@ -530,6 +611,10 @@
 								{announcing ? '…' : cooldownLabel(announceRemaining)}
 							</button>
 						</div>
+						<!-- Hoardbook Topics draft r1 — the terms are visible without hovering: the 24h/one-per-
+						     hour limits shouldn't be hidden behind the HintMarker tooltip (kept for the "?"
+						     affordance). The constant itself is unchanged; announce-view.test.ts pins it. -->
+						<div class="announce-terms">{ANNOUNCE_EXPLAINER}</div>
 					</div>
 
 					<a class="channel-link" href="/chat?topic={openTopic.topic_id}">💬 Open this Topic’s channel in Chat →</a>
@@ -543,40 +628,81 @@
 		     search; expand a category to fetch every public Topic under it (backend activity-ranked). -->
 		<section class="surface discover-tab">
 			<p class="muted discover-hint">Browse public Topics by category. Expand one to see every public Topic under it.</p>
-			{#each TOPIC_ROOTS as root (root)}
-				<div class="root-group">
-					<button class="root-header" onclick={() => toggleRoot(root)} aria-expanded={expandedRoot === root}>
-						<span class="root-chevron" class:open={expandedRoot === root}>{@html icons.chevronRight}</span>
-						<span class="root-name">{root}</span>
-					</button>
-					{#if expandedRoot === root}
-						{#if loadingRoot === root}
-							<div class="root-status muted">Loading…</div>
-						{:else if erroredRoots.has(root)}
-							<!-- QURATOR-80: a fetch failure is NOT the confident negative "No public Topics under X
-							     yet" — that string is indistinguishable from a genuine empty. This surface reads "we
-							     could not reach the relays" (retryable) so an unknown is never rendered as a confident
-							     negative. Collapsing + re-expanding retries (toggleRoot clears the error and re-fetches). -->
-							<div class="root-status root-error">
-								Couldn’t reach the relays for “{root}”. Collapse and re-expand to retry.
-							</div>
-						{:else if (rootTopics[root] ?? []).length === 0}
-							<div class="root-status muted">No public Topics under “{root}” yet.</div>
-						{:else}
-							{#each rootTopics[root] as d (d.topic_id)}
-								<div class="row tree-child">
-									<div class="grow">
-										<div class="name">{subPathLabel(d.name) || d.name}</div>
-										{#if d.description}<div class="muted">{d.description}</div>{/if}
-										<div class="muted">{memberCountLabel(d.member_count_estimate)}</div>
-									</div>
-									<button class="btn-default" onclick={() => askToJoin(d.name, false)}>Join</button>
+			<!-- Hoardbook Topics draft r1 — search across the already-fetched roots only. No fetch-on-
+			     search: toggleRoot's fetch/cache/retry machine is pinned by the QURATOR-80/83/85
+			     call-count tests and stays untouched, so typing never fires topicDiscover. -->
+			<div class="discover-search">
+				<input
+					class="hb-input"
+					type="search"
+					placeholder="Search expanded categories…"
+					bind:value={searchQuery}
+					aria-label="Search expanded categories"
+				/>
+				{#if searchQuery.trim()}
+					{#if searchCoveragePartial}
+						<span class="search-hint muted">Expand a category to search it too</span>
+					{:else}
+						<span class="search-hint muted">{searchResults.length} match{searchResults.length === 1 ? '' : 'es'} across all categories</span>
+					{/if}
+				{/if}
+			</div>
+			{#if searchQuery.trim()}
+				<!-- Filtered results replace the accordion while a query is live (the categories are the
+				     corpus being searched). Path-only per the draft's own choice — descriptions are not
+				     searched. Rows reuse the accordion's own row markup + Join action. -->
+				<div class="search-results">
+					{#if searchResults.length === 0}
+						<div class="root-status muted">No public Topics matching “{searchQuery.trim()}” in the expanded categories.</div>
+					{:else}
+						{#each searchResults as d (d.topic_id)}
+							<div class="row tree-child">
+								<div class="grow">
+									<div class="name">{subPathLabel(d.name) || d.name}</div>
+									{#if d.description}<div class="muted">{d.description}</div>{/if}
+									<div class="muted">{memberCountLabel(d.member_count_estimate)}</div>
 								</div>
-							{/each}
-						{/if}
+								<button class="btn-default" onclick={() => askToJoin(d.name, false)}>Join</button>
+							</div>
+						{/each}
 					{/if}
 				</div>
-			{/each}
+			{:else}
+				{#each TOPIC_ROOTS as root (root)}
+					<div class="root-group">
+						<button class="root-header" onclick={() => toggleRoot(root)} aria-expanded={expandedRoot === root}>
+							<span class="root-chevron" class:open={expandedRoot === root}>{@html icons.chevronRight}</span>
+							<span class="root-name">{root}</span>
+						</button>
+						{#if expandedRoot === root}
+							{#if loadingRoot === root}
+								<div class="root-status muted">Loading…</div>
+							{:else if erroredRoots.has(root)}
+								<!-- QURATOR-80: a fetch failure is NOT the confident negative "No public Topics under X
+								     yet" — that string is indistinguishable from a genuine empty. This surface reads "we
+								     could not reach the relays" (retryable) so an unknown is never rendered as a confident
+								     negative. Collapsing + re-expanding retries (toggleRoot clears the error and re-fetches). -->
+								<div class="root-status root-error">
+									Couldn’t reach the relays for “{root}”. Collapse and re-expand to retry.
+								</div>
+							{:else if (rootTopics[root] ?? []).length === 0}
+								<div class="root-status muted">No public Topics under “{root}” yet.</div>
+							{:else}
+								{#each rootTopics[root] as d (d.topic_id)}
+									<div class="row tree-child">
+										<div class="grow">
+											<div class="name">{subPathLabel(d.name) || d.name}</div>
+											{#if d.description}<div class="muted">{d.description}</div>{/if}
+											<div class="muted">{memberCountLabel(d.member_count_estimate)}</div>
+										</div>
+										<button class="btn-default" onclick={() => askToJoin(d.name, false)}>Join</button>
+									</div>
+								{/each}
+							{/if}
+						{/if}
+					</div>
+				{/each}
+			{/if}
 			<button class="link" disabled={busy} onclick={redeemInvite}>Redeem a private Topic invite</button>
 		</section>
 	{/if}
@@ -748,6 +874,20 @@
 	.invite { display: flex; gap: 6px; }
 	.announce-row { display: flex; gap: 6px; margin-top: 2px; }
 	.announce-row input { flex: 1; }
+	/* Hoardbook Topics draft r1 — the announce terms as an always-visible caption (a .dest-style
+	   small line: same 11.5px / --fg-dim ramp the page's .muted captions use). */
+	.announce-terms { font-size: 11.5px; color: var(--fg-dim); margin-top: 4px; }
+	/* Hoardbook Topics draft r1 — unread pill: the per-row announce share, on the nav-badge's accent
+	   fill (boolean only — this data shape carries no per-topic count). */
+	.unread {
+		width: 8px; height: 8px; border-radius: 999px; flex-shrink: 0;
+		background: var(--accent); box-shadow: 0 0 0 1px var(--bg-elev1);
+	}
+	/* Hoardbook Topics draft r1 — Discover search (filters the already-fetched roots; never fetches). */
+	.discover-search { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+	.discover-search input { flex: 1; }
+	.search-hint { flex-shrink: 0; font-size: 11px; }
+	.search-results { display: flex; flex-direction: column; }
 	.channel-link { display: inline-block; margin-top: 4px; font-size: 12px; color: var(--accent); text-decoration: none; }
 	.channel-link:hover { text-decoration: underline; }
 	/* M15 W2: the two Topic modals now use Modal.svelte; only the create form's field spacing is local. */

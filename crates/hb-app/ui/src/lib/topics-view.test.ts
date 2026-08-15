@@ -46,11 +46,11 @@ describe('topics-view (M11)', () => {
 		expect(contactBadge(undefined)).toBeNull(); // a pre-M11 contact ⇒ Manual ⇒ no badge
 	});
 
-	it('renders the member count as an approximate estimate, never a hard number', () => {
-		expect(memberCountLabel(1)).toBe('~1 member (estimate)');
-		expect(memberCountLabel(5)).toBe('~5 members (estimate)');
-		expect(memberCountLabel(0)).toBe('~0 members (estimate)');
-		expect(memberCountLabel(-3)).toBe('~0 members (estimate)'); // clamps junk
+	it('renders the member count as claims, never a measured figure (draft r1: "N claimed")', () => {
+		expect(memberCountLabel(1)).toBe('1 claimed');
+		expect(memberCountLabel(5)).toBe('5 claimed');
+		expect(memberCountLabel(0)).toBe('0 claimed');
+		expect(memberCountLabel(-3)).toBe('0 claimed'); // clamps junk
 	});
 
 	it('derives dissolution from an empty roster', () => {

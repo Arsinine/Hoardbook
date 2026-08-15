@@ -39,11 +39,12 @@ export function contactBadge(source: ContactSource | undefined): string | null {
 	return source === 'Topic' ? 'Topic' : null;
 }
 
-/** The honest member-count display — approximate + spoofable, never authoritative (so it always reads
- *  as an estimate, never a hard number). */
+/** The honest member-count display — spoofable by design (anyone can announce), so it reports what
+ *  members have CLAIMED, never a measured figure (draft r1: "claimed" is honest without being
+ *  alarming — "estimate" wrongly implied measurement imprecision rather than someone inflating it). */
 export function memberCountLabel(estimate: number): string {
 	const n = Math.max(0, Math.floor(estimate));
-	return `~${n} member${n === 1 ? '' : 's'} (estimate)`;
+	return `${n} claimed`;
 }
 
 /** The Create-modal's primary action (devtest #11 — join-first): a same-name public Topic must not
