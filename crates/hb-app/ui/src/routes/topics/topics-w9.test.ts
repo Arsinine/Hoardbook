@@ -66,16 +66,25 @@ describe('Topics page — M17 W9 shared shell', () => {
 	});
 });
 
-describe('Topics page — M17 W9 card recipe', () => {
-	it('the_three_panes_share_one_surface_declaration', () => {
+describe('Topics page — flat layout, matching Browse/Chat (2026-08-15)', () => {
+	// The surface audit found Topics was the only master-detail page boxed like Settings/Contacts
+	// instead of flat like its actual layout siblings (Browse's .left-panel, Chat's .convo-sidebar —
+	// both a divider, no card). Stripped; this pins the replacement, not a re-fork of the old box.
+	it('no pane carries the old .surface card treatment', () => {
 		const src = topicsSrc();
-		for (const pane of ['list-pane', 'detail-pane', 'discover-tab']) {
-			expect(src).toContain(`surface ${pane}`);
-		}
-		// Exactly one place declares the card recipe; the three copies are gone.
+		expect(src).not.toContain('class="surface');
+		expect(src).not.toMatch(/\.surface \{/);
+		// The three-copy regression the old test guarded against is still impossible: there is no
+		// card recipe left to duplicate.
 		const bgDecls = src.match(/background: var\(--bg-elev1\); border: 1px solid var\(--border\); border-radius: 10px/g);
 		expect(bgDecls).toBeNull();
-		expect(src).toMatch(/\.surface \{[^}]*background: var\(--bg-elev1\)/);
+	});
+
+	it('the list pane uses a divider, not a box — same recipe as Browse/Chat', () => {
+		const src = topicsSrc();
+		expect(src).toMatch(/\.list-pane \{[^}]*border-right: 1px solid var\(--border\)/);
+		// No visible gap between the divider and the detail pane (Browse/Chat are gap: 0 too).
+		expect(src).toMatch(/\.master-detail \{[^}]*gap: 0/);
 	});
 
 	it('section_label_is_on_the_shared_type_ramp', () => {
