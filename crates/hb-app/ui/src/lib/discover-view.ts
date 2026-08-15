@@ -61,3 +61,38 @@ export function suggestTags(observed: string[], selected: string[], typed: strin
 		.filter((t) => t.toLowerCase().includes(stem))
 		.slice(0, cap);
 }
+
+/** Why-matched badge (owner sign-off 2026-08-15) — the axis a Discover hit surfaced on, inferred
+ *  client-side from the terms THAT SEARCH RAN WITH and the hit's own teaser fields (the Rust
+ *  `PeerSearchHit` carries no match-reason field). Mirrors `teaser_matches` (hb-net discover.rs):
+ *  tags are the strongest signal, content-types are an OR-union alongside any tag rule, and
+ *  name/bio fuzzy-matching is a SINGLE-term rule (two+ tag terms are strict AND-on-tags, so a
+ *  multi-term hit that matched did so on tags or not at all). `null` = no confident reason — the
+ *  caller omits the badge rather than guessing. */
+export type MatchReason = 'tag' | 'content-type' | 'name' | 'bio' | null;
+
+export function matchReason(
+	hit: { tags: string[]; content_types: string[]; display_name: string; bio: string | null },
+	tags: string[],
+	contentTypes: string[],
+): MatchReason {
+	const terms = tags.map((t) => t.trim().toLowerCase()).filter(Boolean);
+	const types = contentTypes.map((t) => t.trim().toLowerCase()).filter(Boolean);
+	// "Appears in" = case-insensitive substring, covering both the backend's exact-tag tier and
+	// the single-term fuzzy tier in one check.
+	const inAny = (haystacks: string[], needle: string) =>
+		haystacks.some((h) => h.toLowerCase().includes(needle));
+	if (terms.some((t) => inAny(hit.tags, t))) return 'tag';
+	// Codex review (2026-08-15): `substring_in_teaser` folds content_types into the SAME single-term
+	// haystack as name/bio/tags, so a lone typed term like "video" can match via content_types even
+	// when no type chip is selected — the selected-chip check above alone missed that axis.
+	const ctCandidates = terms.length === 1 ? [...types, ...terms] : types;
+	if (ctCandidates.some((t) => inAny(hit.content_types, t))) return 'content-type';
+	// Name/bio apply to single-term searches only, per the backend rule above.
+	if (terms.length === 1) {
+		const term = terms[0];
+		if (hit.display_name.toLowerCase().includes(term)) return 'name';
+		if ((hit.bio ?? '').toLowerCase().includes(term)) return 'bio';
+	}
+	return null;
+}

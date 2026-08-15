@@ -12,7 +12,7 @@
 	import Modal from './Modal.svelte';
 	import type { CachedPeer } from '../types.js';
 	import { renderFingerprint } from '../identity-display.js';
-	import { DISCOVER_CONTENT_TYPES, parseTagInput, canSearch, toggleContentType, DISCOVER_PAGE_SIZE, pageItems, pageCount, suggestTags } from '../discover-view.js';
+	import { DISCOVER_CONTENT_TYPES, parseTagInput, canSearch, toggleContentType, DISCOVER_PAGE_SIZE, pageItems, pageCount, suggestTags, matchReason } from '../discover-view.js';
 
 	interface Props {
 		open?: boolean;
@@ -137,6 +137,24 @@
 			: []
 	);
 
+	// Discover tag-cloud (owner sign-off 2026-08-15) — the default cloud of observed tags shown
+	// BEFORE anything is typed: same local `discoverObservedTags()` read the autocomplete uses, so
+	// no new trust boundary opens (the actual search still needs ≥1 committed filter, unchanged).
+	// Shown only while pristine: section open, no committed tags, input empty. `discoverObservedTags`
+	// returns a flat alphabetically-sorted Vec<String> with no counts, so the cloud renders at a
+	// UNIFORM size — size-by-frequency would need the Rust return type to become Vec<(String, usize)>
+	// and is out of scope here. Capped so a long observed set can't render an unbounded flex-wrap.
+	let cloudTags = $derived(
+		committedTags.length === 0 && discoverTags.trim() === ''
+			? observedTags.slice(0, 40)
+			: []
+	);
+
+	// The terms the LAST completed search ran with — the snapshot `matchReason` below is inferred
+	// from. Set in runDiscover once searchPeers resolves.
+	let lastSearchTags: string[] = $state([]);
+	let lastSearchTypes: string[] = $state([]);
+
 	function addTagChip(tag: string) {
 		// Append the chosen tag to the committed tag set, then clear the free-text input so the next
 		// pick starts fresh. The chips render the committed set (parsedDiscoverTags derives from
@@ -161,12 +179,21 @@
 		if (!canDiscover) { discoverError = 'Enter at least one tag or content type to search.'; return; }
 		discovering = true;
 		discoverError = '';
+		// Snapshot the terms THIS search runs with, before any await — the why-matched badge below
+		// must be inferred from what the relay actually matched against, not from a `committedTags`
+		// that keeps deriving while the search is in flight (and that excludes the typed stem — with
+		// exactly one term in the input that term IS the stem, so the live derivation would be empty
+		// at the moment a single-term search fires and every badge would collapse to null).
+		const searchTags = [...parsedDiscoverTags];
+		const searchTypes = [...discoverTypes];
 		try {
-			const result: PeerSearchResult = await searchPeers(parsedDiscoverTags, discoverTypes);
+			const result: PeerSearchResult = await searchPeers(searchTags, searchTypes);
 			discoverResults = result.hits;
 			discoverCapped = result.capped;
 			discoverPage = 1; // QURATOR-44: reset to page 1 on each new search.
 			discovered = true;
+			lastSearchTags = searchTags;
+			lastSearchTypes = searchTypes;
 		} catch (e) {
 			discoverError = String(e);
 		} finally {
@@ -305,6 +332,17 @@
 										onclick={() => (discoverTypes = toggleContentType(discoverTypes, ct.value))}>{ct.label}</button>
 								{/each}
 							</div>
+							{#if cloudTags.length > 0}
+								<!-- Discover tag-cloud (owner sign-off 2026-08-15) — the observed tags as a
+								     starting cloud, before anything is typed. Each click reuses addTagChip
+								     unchanged, so a cloud pick is exactly a typed term (the search itself still
+								     fires only with ≥1 committed filter). Uniform size: no frequency data exists. -->
+								<div class="disc-cloud" aria-label="Observed tags">
+									{#each cloudTags as tag (tag)}
+										<button type="button" class="disc-cloud-tag" onclick={() => addTagChip(tag)}>#{tag}</button>
+									{/each}
+								</div>
+							{/if}
 							<form class="disc-tag-row" onsubmit={(e) => { e.preventDefault(); runDiscover(); }}>
 								<div class="disc-tag-input-wrap">
 									{#if committedTags.length > 0}
@@ -351,6 +389,8 @@
 								<div class="discover-results">
 									{#each discoverPageItems as hit (hit.npub)}
 										{@const letter = (hit.display_name?.[0] ?? hit.npub[0]).toUpperCase()}
+										{@const reason = matchReason(hit, lastSearchTags, lastSearchTypes)}
+										{@const why = reason === 'content-type' ? 'type' : reason}
 										<div class="hit-card">
 											<div class="hit-top">
 												<Avatar {letter} size={30} hue={avatarHue(letter)} picture={hit.picture ?? undefined} />
@@ -361,6 +401,12 @@
 												<button class="hit-follow" onclick={() => followHit(hit)}>Add contact</button>
 												<button class="hit-message" onclick={() => onmessage?.(hit.npub)}>Message</button>
 											</div>
+											{#if reason}
+												<!-- Why-matched badge (owner sign-off 2026-08-15) — inferred client-side from the
+												     terms the search ran with; omitted entirely when there's no confident reason.
+												     'content-type' renders as the shorter "type". -->
+												<span class="hit-why" title="The field this result matched your search on">matched by {why}</span>
+											{/if}
 											{#if hit.bio}<div class="hit-bio">{hit.bio}</div>{/if}
 											{#if hit.fingerprint}
 												<div class="hit-fp" title="Identity fingerprint — check it before trusting a stranger">
@@ -598,6 +644,18 @@
 		display: inline-flex; padding: 0; line-height: 1;
 	}
 	.disc-chip-x:hover { color: var(--fg); }
+	/* Discover tag-cloud (owner sign-off 2026-08-15) — the pristine-state observed-tag cloud.
+	   Same pill visual language as .ct-chip/.disc-tag-chip (border, radius, app.css tokens);
+	   uniform size — discoverObservedTags() carries no frequency data to size by. */
+	.disc-cloud { display: flex; flex-wrap: wrap; gap: 5px; }
+	.disc-cloud-tag {
+		font-size: 10.5px; padding: 2px 8px; border-radius: 999px;
+		background: color-mix(in oklch, var(--accent) 8%, transparent);
+		color: var(--fg-muted);
+		border: 1px solid var(--border); cursor: pointer; font-family: var(--font-ui);
+		transition: background 0.1s, color 0.1s;
+	}
+	.disc-cloud-tag:hover { background: var(--bg-elev3); color: var(--fg); }
 	.disc-autocomplete {
 		position: absolute; top: 100%; left: 0; right: 0; z-index: 10;
 		margin: 2px 0 0; padding: 3px; list-style: none;
@@ -640,6 +698,13 @@
 	.hit-id { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 1px; }
 	.hit-name { font-size: 13px; font-weight: 600; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 	.hit-stranger { font-size: 9.5px; color: oklch(0.72 0.13 70); }
+	/* Why-matched badge (owner sign-off 2026-08-15) — pill in the same language as .hit-tag. */
+	.hit-why {
+		align-self: flex-start;
+		font-size: 9.5px; padding: 1px 7px; border-radius: 999px;
+		background: var(--bg-elev3); color: var(--fg-muted);
+		border: 1px solid var(--border);
+	}
 	.hit-follow {
 		padding: 4px 12px; border-radius: 6px; background: var(--accent); color: var(--accent-text);
 		border: none; font-size: 11.5px; font-weight: 600; cursor: pointer; font-family: var(--font-ui); flex-shrink: 0;

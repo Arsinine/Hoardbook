@@ -11,6 +11,7 @@ import {
 	pageItems,
 	pageCount,
 	suggestTags,
+	matchReason,
 } from './discover-view.js';
 
 describe('discover-view — §6 Browse filter bar (M12 W3)', () => {
@@ -112,6 +113,67 @@ describe('discover-view — QURATOR-70 tag autocomplete (suggestTags)', () => {
 	it('returns nothing when no observed tag contains the stem', () => {
 		const observed = ['anime', 'vhs'];
 		expect(suggestTags(observed, [], 'berserk')).toEqual([]);
+	});
+});
+
+// Why-matched badge (owner sign-off 2026-08-15). `matchReason` infers the axis a hit surfaced on
+// from the terms the search ran with, mirroring the backend `teaser_matches` rule (hb-net
+// discover.rs): tags first, content-types alongside, and name/bio fuzzy ONLY for a single term.
+describe('discover-view — matchReason (why-matched badge)', () => {
+	const hit = {
+		tags: ['anime', 'vhs'],
+		content_types: ['video'],
+		display_name: 'Berserk Collector',
+		bio: 'I collect Berserk manga',
+	};
+
+	it('tag outranks everything: an exact/substring tag match reports "tag" even when name and content-type also match', () => {
+		// The hit's name contains 'berserk', its bio contains 'berserk', its content_types contain
+		// 'video' — but the term 'vhs' is one of its tags, so the reason is 'tag'.
+		expect(matchReason(hit, ['vhs'], ['video'])).toBe('tag');
+	});
+
+	it('content-type applies when no search tag matched, including type-only searches', () => {
+		expect(matchReason(hit, [], ['video'])).toBe('content-type');
+		// The tag term 'manga' is nowhere in hit.tags → falls through to the content-type.
+		expect(matchReason(hit, ['manga'], ['video'])).toBe('content-type');
+	});
+
+	it('Codex review 2026-08-15: a single TYPED term also matches via content_types, with no type chip selected', () => {
+		// 'video' is nowhere in hit.tags/display_name/bio, but IS in hit.content_types — and the
+		// backend's substring_in_teaser folds content_types into the single-term haystack, so this
+		// must resolve to 'content-type' even though `contentTypes` (the selected chips) is empty.
+		expect(matchReason(hit, ['video'], [])).toBe('content-type');
+	});
+
+	it('single-term fuzzy: name and bio reasons apply when the term misses tags and content-types', () => {
+		expect(matchReason(hit, ['collector'], [])).toBe('name');
+		expect(matchReason(hit, ['manga'], [])).toBe('bio');
+		// A null bio must not crash the bio branch.
+		expect(matchReason({ ...hit, bio: null }, ['collector'], [])).toBe('name');
+	});
+
+	it('name outranks bio when a single term appears in both', () => {
+		// 'berserk' is in the display_name AND the bio — name wins by precedence.
+		expect(matchReason(hit, ['berserk'], [])).toBe('name');
+	});
+
+	it('two+ tag terms NEVER yield name/bio (multi-term is strict AND-on-tags server-side)', () => {
+		// The single-term fuzzy rule does not exist for multi-term searches, so 'collector'/'manga'
+		// can only be reported via a tag/content-type axis; neither applies here → null.
+		expect(matchReason(hit, ['collector', 'manga'], [])).toBeNull();
+	});
+
+	it('matching is case-insensitive on both sides', () => {
+		expect(matchReason({ ...hit, tags: ['Anime'] }, ['ANIME'], [])).toBe('tag');
+		expect(matchReason(hit, ['COLLECTOR'], [])).toBe('name');
+	});
+
+	it('returns null when nothing confidently matched (badge omitted, never a guess)', () => {
+		// Empty search terms is not a real client state (canSearch gates it), but the helper stays
+		// honest: no terms → no reason.
+		expect(matchReason(hit, [], [])).toBeNull();
+		expect(matchReason(hit, ['unrelated'], ['software'])).toBeNull();
 	});
 });
 // because the filter never widened. QURATOR-70 now widens SINGLE-TERM search to name/bio/tags fuzzy
