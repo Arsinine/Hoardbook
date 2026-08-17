@@ -16,33 +16,49 @@ export const contacts = writable<CachedPeer[]>([]);
 export const collectionsLoadError = writable(false);
 export const contactsLoadError = writable(false);
 
+// Concern-1: overlapping loads (retry + poll + mutation refresh) raced applying whichever result
+// landed LAST, not whichever was requested last — a slow retry could overwrite a fast poll's newer
+// success (or newer error) after the fact. A module-scope generation counter per helper fixes it: a
+// completing load applies its result (success OR error) only if no later call has started since.
+let collectionsGen = 0;
+let contactsGen = 0;
+
 /** Fetch `get_collections` into the store, setting/clearing the load-error flag by outcome.
  *  Returns whether the load succeeded (unused by callers today; kept for symmetry with
- *  loadContactsInto, which returns the fresh list). */
+ *  loadContactsInto, which returns the fresh list). A call superseded by a later `loadCollectionsInto`
+ *  before it settles applies nothing — neither its result nor its error — and returns false. */
 export async function loadCollectionsInto(
 	fetch: () => Promise<Collection[]>,
 ): Promise<boolean> {
+	const gen = ++collectionsGen;
 	try {
-		collections.set(await fetch());
+		const fresh = await fetch();
+		if (gen !== collectionsGen) return false; // superseded — a newer load already applied
+		collections.set(fresh);
 		collectionsLoadError.set(false);
 		return true;
 	} catch {
+		if (gen !== collectionsGen) return false; // superseded — don't clobber a newer success
 		collectionsLoadError.set(true);
 		return false;
 	}
 }
 
 /** Fetch `get_contacts` into the store, setting/clearing the load-error flag by outcome.
- *  Returns the fresh list, or null when the load failed (callers fall back to the stale store). */
+ *  Returns the fresh list, or null when the load failed (callers fall back to the stale store). A
+ *  call superseded by a later `loadContactsInto` before it settles applies nothing and returns null. */
 export async function loadContactsInto(
 	fetch: () => Promise<CachedPeer[]>,
 ): Promise<CachedPeer[] | null> {
+	const gen = ++contactsGen;
 	try {
 		const fresh = await fetch();
+		if (gen !== contactsGen) return null; // superseded — a newer load already applied
 		contacts.set(fresh);
 		contactsLoadError.set(false);
 		return fresh;
 	} catch {
+		if (gen !== contactsGen) return null; // superseded — don't clobber a newer success
 		contactsLoadError.set(true);
 		return null;
 	}
