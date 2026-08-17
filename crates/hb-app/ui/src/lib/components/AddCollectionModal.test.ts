@@ -80,4 +80,21 @@ describe('AddCollectionModal', () => {
 		expect(updateCollectionMeta).toHaveBeenCalled();
 		expect(publishCollection).not.toHaveBeenCalled();
 	});
+
+	// QURATOR-97 — the wizard's close() resets step/collection, so a stray backdrop click on the
+	// step-2 details modal silently discards the run. Backdrop must not close; Cancel stays.
+	it('q97_backdrop_click_does_not_close_the_details_step', async () => {
+		const col = makeCollection({ content_types: ['video'] });
+		const closed = vi.fn();
+		const { container, getByRole } = render(AddCollectionModal, {
+			props: { open: true, editCollection: col, onclose: closed },
+		});
+
+		const backdrop = container.querySelector('.modal-backdrop') as HTMLElement;
+		expect(backdrop).toBeTruthy();
+		await fireEvent.click(backdrop);
+
+		expect(closed).not.toHaveBeenCalled();
+		expect(getByRole('dialog')).toBeTruthy();
+	});
 });

@@ -133,7 +133,8 @@
 	let selectedCount = $derived(checked.size);
 </script>
 
-<Modal open={open} width="440px" padding="0" onclose={close}>
+<!-- QURATOR-97: close() wipes path/alias/tree, so the backdrop must not close — Cancel/Esc stay. -->
+<Modal open={open} width="440px" padding="0" closeOnBackdrop={false} onclose={close}>
 	<div class="scan-frame">
 			<!-- Header -->
 			<div class="modal-header">

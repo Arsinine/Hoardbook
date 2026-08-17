@@ -709,7 +709,7 @@
 </div>
 
 <!-- Create-a-Topic modal (devtest #9: was an always-on card; now invoked from "+ New Topic"). -->
-<Modal open={createOpen} title="New Topic" onclose={() => (createOpen = false)}>
+<Modal open={createOpen} title="New Topic" closeOnBackdrop={false} onclose={() => (createOpen = false)}>
 	<div class="create-fields">
 		{#if newPrivate}
 			<input class="hb-input" placeholder="name (freeform, e.g. back room)" bind:value={newName} />
