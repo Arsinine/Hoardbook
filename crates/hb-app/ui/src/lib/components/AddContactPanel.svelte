@@ -215,6 +215,16 @@
 		onadd?.(hit.npub, hit.npub, hit.display_name, null);
 	}
 
+	// QURATOR-104: a Discover hit can land on an npub ALREADY in the roster — the hit-card must not
+	// present that contact as a stranger with a live "Add contact". Same roster source as the lookup
+	// leg's `existingContact` ($contacts, nothing re-derived). A hit carries no browse-key of its own
+	// (followHit passes the bare npub), so there is NO canUnlock-style upgrade to offer here — a
+	// keyless contact hit is just "Added", and the real upgrade path stays the lookup leg (paste
+	// their full hbk… code above; the comment at the top of the lookup state explains that nuance).
+	function rosterEntry(npub: string): CachedPeer | undefined {
+		return $contacts.find((c) => c.npub === npub);
+	}
+
 	function close() {
 		onclose?.();
 	}
@@ -391,14 +401,26 @@
 										{@const letter = (hit.display_name?.[0] ?? hit.npub[0]).toUpperCase()}
 										{@const reason = matchReason(hit, lastSearchTags, lastSearchTypes)}
 										{@const why = reason === 'content-type' ? 'type' : reason}
+										{@const known = rosterEntry(hit.npub)}
 										<div class="hit-card">
 											<div class="hit-top">
 												<Avatar {letter} size={30} hue={avatarHue(letter)} picture={hit.picture ?? undefined} />
 												<div class="hit-id">
-													<span class="hit-name">{hit.display_name || hit.npub.slice(0, 12) + '…'}</span>
-													<span class="hit-stranger" title="Verify the fingerprint before trusting a stranger">unverified — not in your contacts</span>
+													<span class="hit-name">{known?.petname ?? (hit.display_name || hit.npub.slice(0, 12) + '…')}</span>
+													{#if known}
+														<!-- QURATOR-104: roster hit — they ARE a contact, so no stranger banner. -->
+														<span class="hit-known" title="Already in your contacts">in your contacts</span>
+													{:else}
+														<span class="hit-stranger" title="Verify the fingerprint before trusting a stranger">unverified — not in your contacts</span>
+													{/if}
 												</div>
-												<button class="hit-follow" onclick={() => followHit(hit)}>Add contact</button>
+												{#if known}
+													<!-- No live Add on a roster hit. Disabled (not removed) so the row keeps its
+													     shape; a click does nothing. Message stays actionable (M17 W1). -->
+													<button class="hit-follow" disabled title="Already in your contacts">Added ✓</button>
+												{:else}
+													<button class="hit-follow" onclick={() => followHit(hit)}>Add contact</button>
+												{/if}
 												<button class="hit-message" onclick={() => onmessage?.(hit.npub)}>Message</button>
 											</div>
 											{#if reason}
@@ -698,6 +720,8 @@
 	.hit-id { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 1px; }
 	.hit-name { font-size: 13px; font-weight: 600; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 	.hit-stranger { font-size: 9.5px; color: oklch(0.72 0.13 70); }
+	/* QURATOR-104: roster membership line replaces the stranger banner on a known-contact hit. */
+	.hit-known { font-size: 9.5px; color: var(--fg-muted); }
 	/* Why-matched badge (owner sign-off 2026-08-15) — pill in the same language as .hit-tag. */
 	.hit-why {
 		align-self: flex-start;
@@ -709,6 +733,8 @@
 		padding: 4px 12px; border-radius: 6px; background: var(--accent); color: var(--accent-text);
 		border: none; font-size: 11.5px; font-weight: 600; cursor: pointer; font-family: var(--font-ui); flex-shrink: 0;
 	}
+	/* QURATOR-104: the disabled "Added ✓" state on a roster hit — the app-wide disabled treatment. */
+	.hit-follow:disabled { opacity: 0.5; cursor: not-allowed; }
 	/* M17 W1: secondary Message action — Add contact stays primary, this comes after it. */
 	.hit-message {
 		padding: 4px 12px; border-radius: 6px; background: transparent; color: var(--fg-muted);
