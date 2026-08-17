@@ -21,6 +21,12 @@
 		open: boolean;
 		onclose: () => void;                 // Escape, backdrop click, or a close control
 		title?: string;                      // renders <h2>, wired to aria-labelledby
+		// QURATOR-93-minor-6 — a compact self-padded body (padding="0", e.g. Browse's drag-group
+		// namer) draws its own inline header and has no room for Modal's <h2>; passing `title` there
+		// would render a visible, unstyled-for-the-layout heading flush against the card edge. This
+		// gives such callers an accessible name WITHOUT a visible title. Ignored when `title` is set
+		// (aria-labelledby wins) so no dialog is ever double-labelled.
+		ariaLabel?: string;
 		level?: 'base' | 'stacked';          // z-scale: --z-modal | --z-modal-stacked
 		width?: string;                      // card width (default 460px) — modals vary
 		padding?: string;                    // card padding (default 18px); '0' for self-padded bodies
@@ -29,7 +35,7 @@
 		actions?: import('svelte').Snippet;  // optional footer row
 	}
 
-	let { open, onclose, title, level = 'base', width = '460px', padding = '18px', closeOnBackdrop = true, children, actions }: Props = $props();
+	let { open, onclose, title, ariaLabel, level = 'base', width = '460px', padding = '18px', closeOnBackdrop = true, children, actions }: Props = $props();
 
 	let cardEl: HTMLElement | undefined = $state();
 	const titleId = 'modal-title-' + Math.random().toString(36).slice(2, 9);
@@ -114,6 +120,7 @@
 			role="dialog"
 			aria-modal="true"
 			aria-labelledby={title ? titleId : undefined}
+			aria-label={!title && ariaLabel ? ariaLabel : undefined}
 			tabindex="-1"
 		>
 			{#if title}<h2 id={titleId} class="modal-title">{title}</h2>{/if}
