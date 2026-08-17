@@ -4,7 +4,7 @@
 	import { get } from 'svelte/store';
 	import { page } from '$app/stores';
 	import { getIdentity, getProfile, getCollections, getContacts, getMessages, getReadState, topicAnnouncements, topicAnnounceSeen } from '$lib/api.js';
-	import { identity, profile, collections, contacts, inboxMessages, readWatermarks, toastMessage, appReady, toast, identityLoadError, topicAnnounceSummaries, announceSeen } from '$lib/stores.js';
+	import { identity, profile, collections, contacts, inboxMessages, readWatermarks, toastMessage, appReady, toast, identityLoadError, topicAnnounceSummaries, announceSeen, seedSentFromFeed } from '$lib/stores.js';
 	import { totalUnread, unreadByPeer } from '$lib/unread-view.js';
 	import { unseenAnnouncementCount, newlyArrivedAnnouncements, announcementBaseline } from '$lib/topics-view.js';
 	import { listen } from '@tauri-apps/api/event';
@@ -52,7 +52,7 @@
 			getReadState()
 				.then((w) => readWatermarks.set(w))
 				.catch(() => { })
-				.finally(() => { getMessages().then((m) => inboxMessages.set(m)).catch(() => { }); });
+				.finally(() => { getMessages().then((m) => { inboxMessages.set(m); seedSentFromFeed(m, get(identity)?.npub ?? ''); }).catch(() => { }); });
 			// devtest #2: the announce-seen watermarks (local) — baselines the first alert poll.
 			topicAnnounceSeen().then((s) => announceSeen.set(s)).catch(() => { });
 		})();
@@ -67,7 +67,7 @@
 		// readWatermarks) picks up the new message on its own (devtest #16).
 		let unlistenDm: (() => void) | undefined;
 		listen<number>('dm-received', () => {
-			getMessages().then((msgs) => inboxMessages.set(msgs)).catch(() => { });
+			getMessages().then((msgs) => { inboxMessages.set(msgs); seedSentFromFeed(msgs, get(identity)?.npub ?? ''); }).catch(() => { });
 		}).then(fn => { unlistenDm = fn; });
 
 		// Background poll: keeps inboxMessages fresh. M12 W1 Decision B: skip the relay read while
@@ -79,6 +79,7 @@
 			try {
 				const msgs = await getMessages();
 				inboxMessages.set(msgs);
+				seedSentFromFeed(msgs, get(identity)?.npub ?? '');
 			} catch { }
 		}, NAV_POLL_VISIBLE_MS);
 

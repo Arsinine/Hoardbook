@@ -12,7 +12,10 @@ export const homeDraft = writable<Profile | null>(null);
 /** Messages received from the relay (inbox), fetched on the chat page. */
 export const inboxMessages = writable<ReceivedMessage[]>([]);
 
-/** Messages sent this session (in-memory; cleared on restart). */
+/** Messages sent this session. QURATOR-91: also seeded from the feed — `get_messages` now returns
+ *  OWN sends (persisted at-rest on the send path), so every `inboxMessages` write merges its
+ *  `from === myNpub` entries here. The thread renders inbox-from-peer UNION sent-to-peer, so an
+ *  own-npub entry that stayed only in `inboxMessages` would never render. */
 export const sentMessages = writable<ReceivedMessage[]>([]);
 
 /** Quarantined stranger-DM Request buckets (Q7 — the message-requests pattern), refreshed alongside
@@ -24,6 +27,22 @@ export const dmRequests = writable<DmRequestView[]>([]);
 export interface ToastAction {
 	label: string;
 	run: () => void;
+}
+
+/** QURATOR-91 — seed `sentMessages` from a fresh inbox feed. The backend now returns OWN sends
+ *  (persisted at-rest on the send path), but they arrive mixed into `inboxMessages`, which the
+ *  conversation thread only reads peer-side (`from === peer`); the sent side reads `sentMessages`
+ *  (`to === peer`). MERGE, never replace: handleSend appends the just-sent bubble directly, and a
+ *  replace-shaped seed would flash it out on the next 3s poll until the feed echo landed. Dedup key
+ *  is `from|sent_at|content` — the same message the feed returns and the session already holds is
+ *  one bubble, not two (own sends carry no client-visible wrap id). */
+export function seedSentFromFeed(feed: readonly ReceivedMessage[], myNpub: string) {
+	if (!myNpub) return;
+	sentMessages.update((prev) => {
+		const keys = new Set(prev.map((m) => `${m.from}|${m.sent_at}|${m.to}|${m.content}`));
+		const fresh = feed.filter((m) => m.from === myNpub && !keys.has(`${m.from}|${m.sent_at}|${m.to}|${m.content}`));
+		return fresh.length ? [...prev, ...fresh] : prev;
+	});
 }
 
 export const toastMessage = writable<{ text: string; kind: 'success' | 'error'; action?: ToastAction } | null>(null);

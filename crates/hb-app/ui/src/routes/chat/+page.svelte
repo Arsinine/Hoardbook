@@ -5,7 +5,7 @@
 	// M17 W7.1b: the manifest export path reuses the same save dialog as Home → ⋯ → Export (no new
 	// export logic — this is a second entry point to the shipped `export_manifest` Tauri command).
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
-	import { contacts, identity, inboxMessages, sentMessages, readWatermarks, toast, dmRequests, announceSeen, collections } from '$lib/stores.js';
+	import { contacts, identity, inboxMessages, sentMessages, readWatermarks, toast, dmRequests, announceSeen, collections, seedSentFromFeed } from '$lib/stores.js';
 	import {
 		getMessages,
 		sendMessage,
@@ -47,6 +47,7 @@
 	// M17 W4: HintMarker carries the pinned SHARE_MY_CODE_WARNING (free-text help, not a §8 anchor —
 	// the FeatureTooltip registry is drift-guarded to exactly five keys, so a sixth is not the tool).
 	import HintMarker from '$lib/components/HintMarker.svelte';
+	import ConfirmButton from '$lib/components/ConfirmButton.svelte';
 	import { DM_POLL_VISIBLE_MS, CHANNEL_REFRESH_EVERY_TICKS, ONLINE_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
 	import { renderFingerprint } from '$lib/identity-display.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
@@ -231,11 +232,15 @@
 		acceptDialogOpen = true;
 	}
 
+	// QURATOR-99: close + toast on success, exactly like the Contacts/Browse twins — this page was
+	// the only group-create entry that left the dialog standing open with no feedback.
 	async function handleCreateGroup(detail: { name: string; color: string }) {
 		const { name, color } = detail;
 		try {
 			await groupsCreate(name, color);
 			await loadGroups();
+			createGroupOpen = false;
+			toast(`Group "${name}" created`);
 		} catch (e) { toast(String(e), 'error'); }
 	}
 
@@ -247,6 +252,7 @@
 				const fresh = drained.filter((m) => !seenKeys.has(`${m.from}|${m.sent_at}`));
 				return [...prev, ...fresh];
 			});
+			seedSentFromFeed(drained, myId);
 			dmRequests.update((prev) => prev.filter((x) => x.npub !== r.npub));
 			try { contacts.set(await getContacts()); } catch { /* non-fatal */ }
 			if (group) {
@@ -676,6 +682,7 @@
 					const nextCount = msgs.filter(m => m.from === selectedPeer!.npub).length;
 					if (nextCount > prevCount) {
 						inboxMessages.set(msgs);
+						seedSentFromFeed(msgs, myId);
 						// The open conversation just got new messages — re-advance its watermark too,
 						// so an open thread never accumulates a phantom unread count (devtest #16).
 						const latest = latestFromPeer(msgs, selectedPeer.npub);
@@ -689,6 +696,7 @@
 					}
 				}
 				inboxMessages.set(msgs);
+				seedSentFromFeed(msgs, myId);
 			} catch { /* relay unreachable */ }
 			// Q7: refresh the Request inbox right after the main inbox poll.
 			loadRequests();
@@ -714,6 +722,7 @@
 		try {
 			const msgs = await getMessages();
 			inboxMessages.set(msgs);
+			seedSentFromFeed(msgs, myId);
 		} catch (e) {
 			toast(String(e), 'error');
 		} finally {
@@ -1189,7 +1198,14 @@
 						<div class="composer request-actions">
 							<button class="btn-primary" onclick={() => openAcceptDialog(req)}>Accept</button>
 							<button class="btn-ghost" onclick={() => handleDecline(req)}>Decline</button>
-							<button class="btn-ghost btn-danger" onclick={() => handleBlock(req)}>Block</button>
+							<!-- QURATOR-94: Block is irreversible + silent to the peer, so it takes the shared
+							     two-step inline confirm (same pattern as Remove contact) — a stray first click
+							     reveals the consequence instead of firing dm_block. -->
+							<ConfirmButton
+								label="Block"
+								confirmText="Block this person? They can't message you and you won't see future requests. You can unblock in Settings."
+								onconfirm={() => handleBlock(req)}
+							/>
 						</div>
 					{/if}
 				{/if}
@@ -1394,7 +1410,7 @@
 <CreateGroupDialog open={createGroupOpen} oncreate={handleCreateGroup} oncancel={() => (createGroupOpen = false)} />
 
 <!-- Compose-to-npub (spec §9 first-contact deep link) — a + icon-btn beside refresh opens this. -->
-<Modal open={composeOpen} title="New message" onclose={() => (composeOpen = false)}>
+<Modal open={composeOpen} title="New message" closeOnBackdrop={false} onclose={() => (composeOpen = false)}>
 	<div class="compose-fields">
 		<!-- M21 W3: the free-text recipient stays (owner: "in addition to its current form"); a
 		     "Contacts" button next to it opens the ContactPicker, which sets composeTo to a chosen
