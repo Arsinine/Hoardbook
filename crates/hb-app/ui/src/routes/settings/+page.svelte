@@ -14,6 +14,7 @@
 	import { identity, profile, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
+	import EmptyState from '$lib/components/EmptyState.svelte';
 	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
 
 	let generating = $state(false);
@@ -249,6 +250,32 @@
 	let relayStatuses: Record<string, RelayStatus> = $state({});
 	// devtest #9: per-relay beacon-publish evidence, so a same-NAT reject isn't invisible below debug.
 	let beaconReport: BeaconReport | null = $state(null);
+	// QURATOR-93: the settings load used to fail into "proceed with defaults", which rendered a
+	// DEFAULTS editor with a live Save — one click away from persisting a defaults-shaped settings
+	// object over the user's real one. `settingsLoaded` stays false until a load SUCCEEDS; the
+	// relay editor's Save is disabled until then, and an error + Retry surfaces instead.
+	let settingsLoadFailed = $state(false);
+	let settingsLoaded = $state(false);
+
+	/** Load (or re-load) settings. On success populates the editor, probes relays and starts the
+	 *  live-status overlay — exactly the onMount body, reused by the Retry affordance. */
+	async function loadSettings() {
+		settingsLoadFailed = false;
+		try {
+			settings = await getSettings();
+			// Fresh install has no saved relays — show the curated public defaults (the backend
+			// falls back to the same set). The user can edit or remove them.
+			relayUrls = settings.relay_urls.length ? settings.relay_urls : [...DEFAULT_RELAYS];
+			relayUrls.forEach(probeRelay);
+			// Overlay the live data-path status once the persistent client has had a moment to dial,
+			// then keep it current on a slow tick while the page is open.
+			refreshLiveRelayStatus();
+			if (!liveStatusTimer) liveStatusTimer = setInterval(refreshLiveRelayStatus, 12_000);
+			settingsLoaded = true;
+		} catch {
+			settingsLoadFailed = true;
+		}
+	}
 
 	async function probeRelay(url: string) {
 		relayStatuses[url] = 'checking';
@@ -313,17 +340,7 @@
 
 	onMount(async () => {
 		try { appVersion = await getVersion(); } catch { appVersion = ''; }
-		try {
-			settings = await getSettings();
-			// Fresh install has no saved relays — show the curated public defaults (the backend
-			// falls back to the same set). The user can edit or remove them.
-			relayUrls = settings.relay_urls.length ? settings.relay_urls : [...DEFAULT_RELAYS];
-			relayUrls.forEach(probeRelay);
-			// Overlay the live data-path status once the persistent client has had a moment to dial,
-			// then keep it current on a slow tick while the page is open.
-			refreshLiveRelayStatus();
-			liveStatusTimer = setInterval(refreshLiveRelayStatus, 12_000);
-		} catch { /* proceed with defaults if settings load fails */ }
+		loadSettings();
 		// Route the updater UI: the portable (loose-exe) build self-replaces; an NSIS install uses the
 		// staged/deferred flow. Best-effort — a detection failure falls back to the NSIS path.
 		try { isPortable = await updaterIsPortable(); } catch { isPortable = false; }
@@ -388,6 +405,8 @@
 	// isn't stored (mirrors the backend's trim in save_settings).
 	let savingBigRelay = $state(false);
 	async function handleSaveBigRelay() {
+		// QURATOR-93 twin of the relays guard (the hardened-path drift pair rule).
+		if (!settingsLoaded) return;
 		savingBigRelay = true;
 		try {
 			settings = { ...settings, big_relay_url: settings.big_relay_url.trim() };
@@ -477,6 +496,9 @@
 	}
 
 	async function handleSaveRelays() {
+		// QURATOR-93: the disabled attribute is the UI gate; this guard is the enforcement. A save
+		// from an unloaded editor persists a defaults-shaped object over the user's real settings.
+		if (!settingsLoaded) return;
 		savingRelays = true;
 		try {
 			settings = fullSettings();
@@ -653,6 +675,16 @@
 	</div>
 
 	<div class="surface surface-nop">
+		{#if settingsLoadFailed}
+			<!-- QURATOR-93: the failed settings load used to fall through to a DEFAULTS editor with a
+			     live Save — one click from persisting defaults over the user's real settings. Show the
+			     error + Retry instead, and keep Save disabled until a load succeeds (see below). -->
+			<EmptyState
+				error
+				message="Couldn't load your settings — Save stays disabled until a real load succeeds, so a failed load can't overwrite them."
+				onretry={loadSettings}
+			/>
+		{/if}
 		{#each relayUrls as url (url)}
 			{@const status = relayStatuses[url]}
 			{@const bv = beaconLine(beaconReport, url, Date.now() / 1000)}
@@ -685,7 +717,7 @@
 			<button class="btn-default btn-sm" onclick={addRelay} disabled={!newRelay.trim() || addingRelay}>
 				{addingRelay ? 'Checking…' : 'Add'}
 			</button>
-			<button class="btn-primary btn-sm" onclick={handleSaveRelays} disabled={savingRelays}>
+			<button class="btn-primary btn-sm" onclick={handleSaveRelays} disabled={savingRelays || !settingsLoaded}>
 				{savingRelays ? 'Saving…' : 'Save'}
 			</button>
 		</div>
@@ -702,7 +734,7 @@
 				bind:value={settings.big_relay_url}
 				onkeydown={(e) => e.key === 'Enter' && handleSaveBigRelay()}
 			/>
-			<button class="btn-primary btn-sm" onclick={handleSaveBigRelay} disabled={savingBigRelay}>
+			<button class="btn-primary btn-sm" onclick={handleSaveBigRelay} disabled={savingBigRelay || !settingsLoaded}>
 				{savingBigRelay ? 'Saving…' : 'Save'}
 			</button>
 		</div>
