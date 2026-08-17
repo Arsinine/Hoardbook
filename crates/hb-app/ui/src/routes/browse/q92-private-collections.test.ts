@@ -78,7 +78,7 @@ const PEER: CachedPeer = {
 	online: false,
 	last_fetched: '2026-08-01T00:00:00Z',
 	local_tags: [],
-	profile: { display_name: 'Sealed Peer' },
+	profile: { display_name: 'Sealed Peer', tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '2026-08-01T00:00:00Z' },
 };
 
 afterEach(() => {

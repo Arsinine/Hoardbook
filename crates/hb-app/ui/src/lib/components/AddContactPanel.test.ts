@@ -87,7 +87,7 @@ describe('AddContactPanel — M17 W1 discovery Message action', () => {
 		expect(msgBtns.length).toBe(1);
 		expect(addBtn).toBeTruthy();
 		// Add contact precedes Message in document order.
-		expect(addBtn.compareDocumentPosition(msgBtns[0]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+		expect(addBtn!.compareDocumentPosition(msgBtns[0]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 	});
 
 	it('Message_fires_onmessage_with_npub_not_onadd', async () => {
