@@ -212,6 +212,9 @@ h1, h2, h3, h4, h5, h6 {
 }
 .hb-input::placeholder { color: var(--fg-dim); }
 .hb-input:focus { border-color: var(--accent); }
+/* QURATOR-101: native <select> under the contract class — display:flex on a select is a
+ * cross-browser wildcard (fine in Chromium/WebView2, undefined elsewhere); pin the sane value. */
+select.hb-input { display: inline-block; }
 
 /* Textarea variant: auto-height, min 64, vertical resize (§3). */
 .hb-textarea {

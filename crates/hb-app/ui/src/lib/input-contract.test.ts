@@ -222,3 +222,135 @@ describe('input contract W4 — no bare-element input/textarea backgrounds, no -
 		expect(violations, 'inputs must use --bg-input, not --bg-elev2').toEqual([]);
 	});
 });
+
+describe('input contract QURATOR-101 — markup carries the contract class', () => {
+	// A CSS-declaration-level scan (above) cannot see whether an actual <input>/<textarea>/<select>
+	// element in a component's TEMPLATE was ever given the contract class — that is a markup-level
+	// question the rule-parser above never asks. This block reads each owned component's raw source,
+	// finds every native form-control tag, and asserts it carries `hb-input` (`hb-textarea` too, for
+	// <textarea>) UNLESS it is a checkbox/radio (categorically outside the contract's scope) or a
+	// bare input nested inside a wrapper div that itself carries `hb-input` (the sanctioned "wrap"
+	// pattern — see ScanDialog's `.hb-input-wrap`, matching the `.subheader-search` precedent in
+	// routes/contacts/+page.svelte). Per CLAUDE.md §9/§7: jsdom proves CLASSES here, not pixels — this
+	// guard cannot and does not claim anything about rendered layout, only that the markup wires the
+	// contract class onto the element. Per-file counts are printed so "0 violations" is distinguishable
+	// from "0 elements examined" (the ugrep/exit-127 lesson: a check that finds nothing to look at must
+	// not read the same as a check that looked and found it clean).
+	const COMPONENT_FILES = [
+		'src/lib/components/ScanDialog.svelte',
+		'src/lib/components/AddContactPanel.svelte',
+		'src/lib/components/CollectionDetailsForm.svelte',
+		'src/lib/components/CollectionTagsEditor.svelte',
+		'src/lib/components/AddContactDialog.svelte',
+		'src/lib/components/ConfirmButton.svelte',
+		'src/lib/components/ManifestFulfilCard.svelte',
+		'src/lib/components/TransportTicketCard.svelte',
+		'src/lib/components/ShareCodeCard.svelte',
+	];
+
+	// Justified exceptions: a bare nested input inside a wrapper DIV that itself carries `hb-input`
+	// (the contract's border/background/focus ring still applies, just one DOM level up). Keyed by
+	// file + the element's own exact class attribute, so a NEW un-wrapped bare input elsewhere in the
+	// same file is not silently covered by this entry.
+	const NESTED_WRAP_ALLOWLIST: Array<{ file: string; classAttr: string; reason: string }> = [
+		{
+			file: 'src/lib/components/ScanDialog.svelte',
+			classAttr: 'hb-input-bare hb-mono',
+			reason: 'nested inside <div class="hb-input hb-input-wrap">',
+		},
+		{
+			file: 'src/lib/components/AddContactPanel.svelte',
+			classAttr: 'search-input hb-mono',
+			reason: 'nested inside <div class="hb-input search-input-wrap">',
+		},
+		{
+			file: 'src/lib/components/CollectionDetailsForm.svelte',
+			classAttr: 'lang-input',
+			reason: 'nested inside <div class="hb-input lang-wrap">',
+		},
+		{
+			file: 'src/lib/components/CollectionTagsEditor.svelte',
+			classAttr: 'tag-input',
+			reason: 'nested inside <div class="hb-input tag-wrap">',
+		},
+	];
+
+	/** Strip <script>/<style> blocks, leaving only the template markup a form-control scan should
+	 *  look at (their attributes and TS-side logic are irrelevant to whether a class is on the tag). */
+	function templateOnly(source: string): string {
+		return source
+			.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+			.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+	}
+
+	interface FormControl {
+		tag: string;
+		classAttr: string;
+		typeAttr: string | null;
+	}
+
+	/** Find every native form-control OPENING tag in the template and pull its `class`/`type`
+	 *  attributes verbatim. All nine owned files write these as plain string literals — none binds
+	 *  `class`/`type` dynamically on an input/textarea/select — so a literal attribute regex is exact
+	 *  here, not an approximation. */
+	function formControls(template: string): FormControl[] {
+		const out: FormControl[] = [];
+		const re = /<(input|textarea|select)\b([^>]*)>/gi;
+		let m: RegExpExecArray | null;
+		while ((m = re.exec(template))) {
+			const tag = m[1].toLowerCase();
+			const attrs = m[2];
+			const classM = attrs.match(/class="([^"]*)"/);
+			const typeM = attrs.match(/type="([^"]*)"/);
+			out.push({ tag, classAttr: classM ? classM[1].trim() : '', typeAttr: typeM ? typeM[1] : null });
+		}
+		return out;
+	}
+
+	function hasClass(classAttr: string, cls: string): boolean {
+		return classAttr.split(/\s+/).includes(cls);
+	}
+
+	it('every owned component wires hb-input/hb-textarea onto its native form controls', () => {
+		const perFileCounts: Record<string, number> = {};
+		const violations: string[] = [];
+
+		for (const relFile of COMPONENT_FILES) {
+			const source = read(relFile);
+			const controls = formControls(templateOnly(source));
+			perFileCounts[relFile] = controls.length;
+
+			for (const c of controls) {
+				// Checkboxes/radios are categorically outside the .hb-input/.hb-textarea contract — a
+				// systematic exception by `type`, not a per-site allowlist entry.
+				if (c.tag === 'input' && (c.typeAttr === 'checkbox' || c.typeAttr === 'radio')) continue;
+
+				const allowed = NESTED_WRAP_ALLOWLIST.find(
+					(a) => a.file === relFile && a.classAttr === c.classAttr,
+				);
+				if (allowed) continue;
+
+				if (c.tag === 'textarea') {
+					if (!hasClass(c.classAttr, 'hb-input') || !hasClass(c.classAttr, 'hb-textarea')) {
+						violations.push(
+							`${relFile}: <textarea class="${c.classAttr}"> is missing hb-input and/or hb-textarea`,
+						);
+					}
+				} else if (!hasClass(c.classAttr, 'hb-input')) {
+					violations.push(`${relFile}: <${c.tag} class="${c.classAttr}"> is missing hb-input`);
+				}
+			}
+		}
+
+		// Diagnostic context: "0 violations" only means something once it's clear how many elements
+		// were actually examined per file — never silently 0-of-0.
+		console.log('input-contract markup scan — elements examined per file:', perFileCounts);
+		const totalExamined = Object.values(perFileCounts).reduce((a, b) => a + b, 0);
+		expect(totalExamined, 'the scan must find at least the known form controls, not 0').toBeGreaterThan(0);
+
+		expect(
+			violations,
+			'every non-checkbox/radio, non-wrapped-nested form control must carry the contract class',
+		).toEqual([]);
+	});
+});

@@ -72,7 +72,7 @@
 		white-space: nowrap;
 		line-height: 1;
 	}
-	.cb-trigger.cb-danger { color: var(--error, #e05c5c); }
+	.cb-trigger.cb-danger { color: var(--error); }
 	.cb-trigger:disabled { opacity: 0.5; cursor: not-allowed; }
 
 	.cb-confirm {
@@ -84,7 +84,7 @@
 
 	.cb-confirm-text {
 		font-size: 11.5px;
-		color: var(--error, #e05c5c);
+		color: var(--error);
 		white-space: nowrap;
 	}
 
@@ -108,9 +108,9 @@
 		border: 1px solid var(--accent);
 	}
 	.cb-yes.cb-danger {
-		color: oklch(0.97 0 0);
-		background: var(--error, #e05c5c);
-		border-color: var(--error, #e05c5c);
+		color: var(--fg);
+		background: var(--error);
+		border-color: var(--error);
 	}
 
 	.cb-no {

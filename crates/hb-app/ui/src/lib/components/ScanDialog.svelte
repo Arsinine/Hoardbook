@@ -148,7 +148,7 @@
 				<div class="field">
 					<div class="field-label">Directory path <span class="accent-dot">•</span></div>
 					<div class="path-row">
-						<div class="hb-input-wrap">
+						<div class="hb-input hb-input-wrap">
 							<span class="input-lead">{@html icons.folder}</span>
 							<input
 								class="hb-input-bare hb-mono"
@@ -298,16 +298,11 @@
 
 	.path-row { display: flex; gap: 8px; }
 
+	/* QURATOR-101 — on the .hb-input contract; only the icon-prefix layout (gap) is local. The
+	   inner input is transparent/borderless so the wrapper reads as one input field. */
 	.hb-input-wrap {
 		flex: 1;
-		display: flex;
-		align-items: center;
 		gap: 8px;
-		padding: 0 11px;
-		height: 34px;
-		background: var(--bg-input);
-		border: 1px solid var(--border);
-		border-radius: 7px;
 	}
 
 	.hb-input-wrap span { color: var(--fg-dim); display: flex; }
@@ -317,9 +312,6 @@
 		background: transparent;
 		border: none;
 		outline: none;
-		font-family: var(--font-ui);
-		font-size: 13px;
-		color: var(--fg);
 		min-width: 0;
 	}
 
@@ -354,7 +346,7 @@
 
 	.tree-hint { font-size: 12px; color: var(--fg-dim); padding: 4px 2px; }
 
-	.tree-error { color: var(--danger, #e5484d); }
+	.tree-error { color: var(--error); }
 
 	/* Buttons */
 	/* M15 W1: buttons unified on the app.css .btn system (local copies removed). */
