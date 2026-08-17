@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { follow, refreshContact, unfollowContact, setContactTags, groupsGet, groupsCreate, groupsDelete, groupsAssign, groupsUnassign, groupsCreateWithMembers, contactUpdateGroups, browsePrivateCollections, onlineCount, relayStatus, getContacts, privateAudienceList, privateAudienceSet, type OnlineCount, type RelayHealth } from '$lib/api.js';
-	import { contacts, toast, toastWithAction } from '$lib/stores.js';
+	import { contacts, toast, toastWithAction, contactsLoadError, loadContactsInto } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
 	import OverflowMenu from '$lib/components/OverflowMenu.svelte';
@@ -13,6 +13,7 @@
 	import CreateGroupDialog from '$lib/components/CreateGroupDialog.svelte';
 	import AddContactDialog from '$lib/components/AddContactDialog.svelte';
 	import AddContactPanel from '$lib/components/AddContactPanel.svelte';
+	import EmptyState from '$lib/components/EmptyState.svelte';
 	import AZRail from '$lib/components/AZRail.svelte';
 	import type { CachedPeer, Collection, Group } from '$lib/types.js';
 	import { contactDisplayName, shortNpub } from '$lib/contact-display.js';
@@ -741,7 +742,9 @@
 	async function completeFollow(code: string, npub: string, group: string | null, petname: string | undefined, resolved: CachedPeer | null) {
 		try {
 			await follow(code, group ?? undefined, petname, resolved ?? undefined);
-			try { contacts.set(await getContacts()); } catch { /* non-fatal */ }
+			// QURATOR-93: route through the flag-setting helper so a successful add-contact refresh
+			// also clears any stale load error (a stale error never hides a good list).
+			await loadContactsInto(getContacts);
 			await loadGroups();
 			toast(`Added ${petname || addContactDisplayName || npub.slice(0, 12) + '…'}`, 'success');
 		} catch (e) {
@@ -754,6 +757,12 @@
 	// ask-access intent — first contact starts with the right words already in the box.
 	function messagePeer(npub: string) {
 		goto('/chat?compose=' + npub + '&intent=ask-access');
+	}
+
+	// QURATOR-93: the Retry on the contacts load-error state. Re-runs the layout's exact fetch
+	// through the same flag-setting helper (success fills the list AND clears the error).
+	async function retryContactsLoad() {
+		await loadContactsInto(getContacts);
 	}
 
 	async function handleAddContactSave(detail: { petname: string; group: string | null }) {
@@ -1373,8 +1382,16 @@
 
 <div class="phonebook" bind:this={listContainer}>
 	<div class="phonebook-scroll">
-		{#if $contacts.length === 0}
-			<div class="empty">No contacts yet. Use “+ Add contact” to find someone by ID or discover hoarders.</div>
+		{#if $contactsLoadError}
+			<!-- QURATOR-93: a FAILED contacts load must not render as the confident "No contacts yet"
+			     negative — that string is indistinguishable from a genuine empty. -->
+			<EmptyState
+				error
+				message="Couldn't load contacts — the peer cache didn't answer."
+				onretry={retryContactsLoad}
+			/>
+		{:else if $contacts.length === 0}
+			<EmptyState message="No contacts yet. Use “+ Add contact” to find someone by ID or discover hoarders." />
 		{:else}
 			{#if view === 'groups'}
 				<!-- Groups-view management strip (M21 W5): organisational only — colour is the sole

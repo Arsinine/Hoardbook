@@ -6,6 +6,48 @@ export const profile = writable<Profile | null>(null);
 export const collections = writable<Collection[]>([]);
 export const contacts = writable<CachedPeer[]>([]);
 
+/** QURATOR-93 — load-error flags for the layout-seeded stores. The layout's silent
+ *  `.catch(() => {})` left a FAILED `get_collections`/`get_contacts` indistinguishable from an
+ *  empty list, so Home/Contacts rendered their confident "No … yet" empty states on data they
+ *  never got. True = the last load FAILED (render the error + Retry); a subsequent successful
+ *  fetch sets false (a stale error never hides a good list — the QURATOR-80/85 rule, both ways).
+ *  Pages that re-fetch (`getContacts` after add/unlock, etc.) set these through the same
+ *  `loadCollectionsInto`/`loadContactsInto` helpers so every success clears its flag. */
+export const collectionsLoadError = writable(false);
+export const contactsLoadError = writable(false);
+
+/** Fetch `get_collections` into the store, setting/clearing the load-error flag by outcome.
+ *  Returns whether the load succeeded (unused by callers today; kept for symmetry with
+ *  loadContactsInto, which returns the fresh list). */
+export async function loadCollectionsInto(
+	fetch: () => Promise<Collection[]>,
+): Promise<boolean> {
+	try {
+		collections.set(await fetch());
+		collectionsLoadError.set(false);
+		return true;
+	} catch {
+		collectionsLoadError.set(true);
+		return false;
+	}
+}
+
+/** Fetch `get_contacts` into the store, setting/clearing the load-error flag by outcome.
+ *  Returns the fresh list, or null when the load failed (callers fall back to the stale store). */
+export async function loadContactsInto(
+	fetch: () => Promise<CachedPeer[]>,
+): Promise<CachedPeer[] | null> {
+	try {
+		const fresh = await fetch();
+		contacts.set(fresh);
+		contactsLoadError.set(false);
+		return fresh;
+	} catch {
+		contactsLoadError.set(true);
+		return null;
+	}
+}
+
 /** Draft profile form that persists across navigation until saved/published or app closes. */
 export const homeDraft = writable<Profile | null>(null);
 

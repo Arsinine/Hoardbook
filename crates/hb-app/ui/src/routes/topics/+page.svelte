@@ -20,6 +20,7 @@
 	import { memberCountLabel, rosterLabel, unseenTopicAnnouncements, TOPIC_ROOTS, composeTopicPath, subPathLabel, createPrimaryAction } from '$lib/topics-view.js';
 	import { canAnnounce, cooldownLabel, ANNOUNCE_EXPLAINER } from '$lib/announce-view.js';
 	import { icons } from '$lib/icons.js';
+	import EmptyState from '$lib/components/EmptyState.svelte';
 	import TopicJoinConsent from '$lib/components/TopicJoinConsent.svelte';
 	import Modal from '$lib/components/Modal.svelte';
 	import HintMarker from '$lib/components/HintMarker.svelte';
@@ -35,6 +36,11 @@
 
 	let mine: TopicView[] = $state([]);
 	let busy = $state(false);
+	// QURATOR-93: loadMine used to toast its failure and then fall through to the template, whose
+	// `mine.length === 0` branch rendered the confident "You haven't joined any Topics yet" negative
+	// on data that never arrived. Same rule as Discover's erroredRoots: a FAILED load is a separate
+	// state; a later successful loadMine clears it (a stale error never hides a good list).
+	let mineLoadError = $state(false);
 
 	// Create form. W4: a PUBLIC Topic is a category root (picker — a bad root is unrepresentable) + a
 	// freeform sub-path (e.g. video / animation/anime). A PRIVATE Topic keeps a freeform name.
@@ -134,8 +140,10 @@
 	async function loadMine() {
 		try {
 			mine = await topicList();
+			mineLoadError = false;
 		} catch (e) {
 			toast(String(e), 'error');
+			mineLoadError = true;
 		}
 	}
 
@@ -532,8 +540,16 @@
 		<section class="master-detail">
 			<!-- Left: My Topics list -->
 			<div class="list-pane">
-				{#if mine.length === 0}
-					<p class="muted empty">You haven’t joined any Topics yet. Create one, or switch to Discover.</p>
+				{#if mineLoadError}
+					<!-- QURATOR-93: a FAILED loadMine is not the confident "You haven't joined any Topics
+					     yet" negative — same machine as Discover's erroredRoots one tab over. -->
+					<EmptyState
+						error
+						message="Couldn't load your Topics — the listing didn't answer."
+						onretry={loadMine}
+					/>
+				{:else if mine.length === 0}
+					<EmptyState message="You haven’t joined any Topics yet. Create one, or switch to Discover." />
 				{:else}
 					{#each mine as t (t.topic_id)}
 						<button class="topic-row" class:topic-selected={openTopic?.topic_id === t.topic_id} onclick={() => open(t)}>
@@ -834,8 +850,6 @@
 	   negative. jsdom computes no layout — this colour is asserted in the source-scan test, not
 	   rendered by vitest. */
 	.root-error { color: var(--error); }
-
-	.empty { padding: 16px 8px; }
 
 	/* Shared controls — M20 W4: inputs use the global .hb-input contract (app.css); the bare
 	   `input {}` element selector is gone (it filled --bg-elev2 and leaked onto modal fields). */

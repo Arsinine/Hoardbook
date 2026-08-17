@@ -1,11 +1,11 @@
 <script lang="ts">
-	import { saveProfile, publishProfile, publishCollection, unpublishCollection, deleteCollection, exportCollection, exportManifest, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec, collectionSourceAccessible } from '$lib/api.js';
+	import { saveProfile, publishProfile, publishCollection, unpublishCollection, deleteCollection, exportCollection, exportManifest, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec, collectionSourceAccessible, getCollections } from '$lib/api.js';
 	// M18 W5: Home and Chat are two entry points to ONE export — they read the same toast
 	// constant so they cannot drift into saying different things about what just happened.
 	import { MANIFEST_EXPORTED_TOAST } from '$lib/manifest-fulfil.js';
 	import { passphraseStrength } from '$lib/backup-export.js';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
-	import { profile, collections, identity, toast, appReady, homeDraft, identityLoadError } from '$lib/stores.js';
+	import { profile, collections, identity, toast, appReady, homeDraft, identityLoadError, collectionsLoadError, loadCollectionsInto } from '$lib/stores.js';
 	import { onMount } from 'svelte';
 	import { icons, socialIcons, avatarHue } from '$lib/icons.js';
 	import ScanDialog from '$lib/components/ScanDialog.svelte';
@@ -14,6 +14,7 @@
 	import Avatar from '$lib/components/Avatar.svelte';
 	import HintMarker from '$lib/components/HintMarker.svelte';
 	import Modal from '$lib/components/Modal.svelte';
+	import EmptyState from '$lib/components/EmptyState.svelte';
 	import { applyProfilePicture, removeProfilePicture } from '$lib/profile-picture.js';
 	import type { Collection, Profile } from '$lib/types.js';
 
@@ -373,6 +374,13 @@
 	function openAddModal() {
 		editTarget = null;
 		addModalOpen = true;
+	}
+
+	// QURATOR-93: the Retry on the collections load-error state. Re-runs the layout's exact fetch
+	// through the same flag-setting helper, so a success both fills the list AND clears the error
+	// (a stale error never hides a good list).
+	async function retryCollectionsLoad() {
+		await loadCollectionsInto(getCollections);
 	}
 
 	function openEditDetails(col: Collection) {
@@ -877,8 +885,16 @@
 			</div>
 
 			<div class="coll-list">
-				{#if $collections.length === 0}
-					<div class="empty">No collections yet. Click "Add collection" to scan a folder.</div>
+				{#if $collectionsLoadError}
+					<!-- QURATOR-93: a FAILED collections load must not render as the confident "No
+					     collections yet" negative. Same copy shape as Topics' Discover root machine. -->
+					<EmptyState
+						error
+						message="Couldn't load collections — the scan catalog didn't answer."
+						onretry={retryCollectionsLoad}
+					/>
+				{:else if $collections.length === 0}
+					<EmptyState message='No collections yet. Click "Add collection" to scan a folder.' />
 				{:else}
 					{#each $collections as col (col.slug)}
 						<CollectionRow
@@ -1256,8 +1272,6 @@
 	}
 
 	.coll-list { display: flex; flex-direction: column; gap: 10px; }
-
-	.empty { color: var(--fg-dim); font-size: 12.5px; text-align: center; padding: 32px 0; }
 
 	/* Shared */
 	.sect-label {

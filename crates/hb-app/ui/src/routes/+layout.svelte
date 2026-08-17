@@ -4,7 +4,7 @@
 	import { get } from 'svelte/store';
 	import { page } from '$app/stores';
 	import { getIdentity, getProfile, getCollections, getContacts, getMessages, getReadState, topicAnnouncements, topicAnnounceSeen } from '$lib/api.js';
-	import { identity, profile, collections, contacts, inboxMessages, readWatermarks, toastMessage, appReady, toast, identityLoadError, topicAnnounceSummaries, announceSeen, seedSentFromFeed } from '$lib/stores.js';
+	import { identity, profile, inboxMessages, readWatermarks, toastMessage, appReady, toast, identityLoadError, topicAnnounceSummaries, announceSeen, seedSentFromFeed, loadCollectionsInto, loadContactsInto } from '$lib/stores.js';
 	import { totalUnread, unreadByPeer } from '$lib/unread-view.js';
 	import { unseenAnnouncementCount, newlyArrivedAnnouncements, announcementBaseline } from '$lib/topics-view.js';
 	import { listen } from '@tauri-apps/api/event';
@@ -43,8 +43,12 @@
 			// collections / contacts / inbox "fill in" once their (possibly slow) source responds.
 			appReady.set(true);
 
-			getCollections().then((c) => collections.set(c)).catch(() => { });
-			getContacts().then((c) => contacts.set(c)).catch(() => { });
+			// QURATOR-93: these two used to `.catch(() => {})` silently, so a FAILED load left the
+			// store empty and Home/Contacts rendered their confident "No … yet" empty states on data
+			// that never arrived. The helpers set/clear the per-store load-error flags instead — the
+			// still-silent catch is deliberate (chrome, not an event; the flag is the surface).
+			void loadCollectionsInto(getCollections);
+			void loadContactsInto(getContacts);
 			getVersion().then((v) => { appVersion = v; }).catch(() => { appVersion = '0.4.2'; });
 			// devtest #16: read the LOCAL per-peer watermark, THEN seed the inbox (relay), so the nav
 			// badge never flashes a stale "everything unread" count if the relay happens to resolve

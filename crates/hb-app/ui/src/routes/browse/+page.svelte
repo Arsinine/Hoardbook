@@ -13,6 +13,7 @@
 	import CreateGroupDialog from '$lib/components/CreateGroupDialog.svelte';
 	// QURATOR-98 — the shared dialog shell (backdrop, Escape, Tab trap, focus restore).
 	import Modal from '$lib/components/Modal.svelte';
+	import EmptyState from '$lib/components/EmptyState.svelte';
 	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote, arrangeItems, fileTypesPresent, type BrowseViewMode, type BrowseSortKey, type BrowseSortDir } from '$lib/browse-view.js';
 	import { deriveManifestAskState, ASK_TICK_MS, MANIFEST_ASKED_LINE, MANIFEST_ASK_AGAIN_LABEL, MANIFEST_ASK_AGAIN_COOLDOWN_TIP, MANIFEST_OPEN_CHAT_LABEL, MANIFEST_ASK_FAILED_LINE } from '$lib/manifest-ask.js';
 	import type { CachedPeer, Collection, DirectoryItem, Group } from '$lib/types.js';
@@ -977,10 +978,13 @@
 						<button class="btn-default btn-sm ask-access-btn" onclick={() => { const p = selectedPeer; if (!p) return; goto('/chat?peer=' + p.npub + '&intent=ask-access' + (p.petname ? '&petname=' + encodeURIComponent(p.petname) : '')); }}>Ask for access</button>
 					</div>
 				{:else if selectedPeer.collections.length === 0}
-					<div class="empty-state">
-						<div class="empty-icon">{@html icons.folder}</div>
-						<div class="empty-label">No public collections</div>
-					</div>
+					{@const p = selectedPeer}
+					<EmptyState
+						centered
+						icon={icons.folder}
+						message="No public collections"
+						cta={{ label: 'Ask for access →', href: '/chat?peer=' + p.npub + '&intent=ask-access' + (p.petname ? '&petname=' + encodeURIComponent(p.petname) : '') }}
+					/>
 				{:else}
 					<div class="col-grid">
 						{#each selectedPeer.collections as col (col.slug)}

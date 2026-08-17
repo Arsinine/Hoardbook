@@ -69,6 +69,7 @@
 	} from '$lib/transport-ticket.js';
 	import TransportTicketCard from '$lib/components/TransportTicketCard.svelte';
 	import ContactPicker from '$lib/components/ContactPicker.svelte';
+	import EmptyState from '$lib/components/EmptyState.svelte';
 	import { filterConversations, filterTopics, composeRecipientKind, isComposeToSelf } from '$lib/chat-filter.js';
 	import { peerPreview, peersWithHistory, relativeTime } from '$lib/chat-preview.js';
 	// M17 W2: the ask-access intent populates the composer draft from one pure copy source, without
@@ -120,6 +121,12 @@
 	let selectedTopic: TopicView | null = $state(null);
 	let channelPosts: ChannelPost[] = $state([]);
 	let channelAnnouncements: AnnouncementView[] = $state([]); // M13 Part A: read-only member broadcasts
+	// QURATOR-93: both loads used to swallow failures — a failed loadTopics silently dropped the
+	// whole CHANNELS section (indistinguishable from "you joined no topics"), and a failed
+	// loadChannel fell through to the confident "No posts in the last 24h" negative. Track each so
+	// the surface can say "we couldn't reach the relays" (retryable) instead.
+	let topicsLoadError = $state(false);
+	let channelLoadError = $state(false);
 	// devtest #6: announcements are interleaved with posts by timestamp (not pinned above).
 	let channelItems = $derived(interleaveChannel(channelPosts, channelAnnouncements));
 	let channelDraft = $state('');
@@ -170,7 +177,12 @@
 	let composePickerOpen = $state(false);
 
 	async function loadTopics() {
-		try { topics = await topicList(); } catch { /* relay unreachable */ }
+		try {
+			topics = await topicList();
+			topicsLoadError = false;
+		} catch {
+			topicsLoadError = true; /* relay unreachable — QURATOR-93: surface, don't drop the section */
+		}
 	}
 
 	async function loadRequests() {
@@ -182,6 +194,7 @@
 			const view = await topicChannel(topicId);
 			channelPosts = sortChannelPostsAscending(view.posts);
 			channelAnnouncements = view.announcements;
+			channelLoadError = false;
 			// devtest #2: reading the channel clears its Topics nav badge — advance the seen watermark to
 			// the newest announcement and mirror it into the store so the badge updates without a refetch.
 			const newest = view.announcements.reduce((m, a) => Math.max(m, a.ts), 0);
@@ -189,7 +202,9 @@
 				announceSeen.update((s) => (newest > (s[topicId] ?? 0) ? { ...s, [topicId]: newest } : s));
 				topicAnnounceMarkSeen(topicId, newest).catch(() => { /* non-fatal — reseeds next launch */ });
 			}
-		} catch { /* relay unreachable */ }
+		} catch {
+			channelLoadError = true; /* relay unreachable — NOT the confident "No posts" negative */
+		}
 	}
 
 	async function selectTopic(t: TopicView) {
@@ -199,6 +214,7 @@
 		selectedRequest = null;
 		channelPosts = [];
 		channelAnnouncements = [];
+		channelLoadError = false; // a failed load for the PREVIOUS channel must not leak into this one
 		await loadChannel(t.topic_id);
 		await tick();
 		scrollToBottom();
@@ -968,7 +984,17 @@
 				</div>
 			</div>
 			<div class="convo-list">
-				{#if visibleTopics.length > 0}
+				{#if topicsLoadError}
+					<!-- QURATOR-93: a FAILED topicList silently removed the whole CHANNELS section —
+					     indistinguishable from "you joined no topics". Keep the section, name the
+					     failure, offer the retry. -->
+					<div class="convo-section-label">Channels</div>
+					<div class="convo-load-error">
+						<span>Couldn’t load channels.</span>
+						<button type="button" class="btn-default btn-xs" onclick={loadTopics}>Retry</button>
+					</div>
+				{/if}
+				{#if !topicsLoadError && visibleTopics.length > 0}
 					<div class="convo-section-label">Channels</div>
 					{#each visibleTopics as t (t.topic_id)}
 						<button class="convo-item" class:convo-active={selectedTopic?.topic_id === t.topic_id} onclick={() => selectTopic(t)}>
@@ -996,9 +1022,14 @@
 				{/if}
 				<div class="convo-section-label">Direct messages</div>
 				{#if visiblePeers.length === 0}
-					<div class="convo-empty">
-						{allConversationPeers.length === 0 ? 'No conversations yet — add someone in Contacts to start one.' : 'No matches.'}
-					</div>
+					{#if allConversationPeers.length === 0}
+						<EmptyState
+							message="No conversations yet — add someone in Contacts to start one."
+							cta={{ label: 'Find hoarders in Contacts →', href: '/contacts' }}
+						/>
+					{:else}
+						<div class="convo-empty">No matches.</div>
+					{/if}
 				{:else}
 					{#each visiblePeers as peer}
 						{@const name = senderName(peer.npub)}
@@ -1044,7 +1075,16 @@
 				</div>
 
 				<div class="thread" bind:this={threadEl}>
-					{#if channelItems.length === 0}
+					{#if channelLoadError}
+						<!-- QURATOR-93: a FAILED channel load must not render as the confident "No posts in
+						     the last 24h" negative. Retry re-runs loadChannel; a success clears the flag. -->
+						<EmptyState
+							centered
+							error
+							message="Couldn’t load this channel — the relay didn’t answer."
+							onretry={() => selectedTopic && loadChannel(selectedTopic.topic_id)}
+						/>
+					{:else if channelItems.length === 0}
 						<p class="thread-empty">No posts in the last 24h — posts here expire 24h after they're sent. Say something!</p>
 					{:else}
 						{#each channelItems as item (item.kind + '|' + (item.kind === 'post' ? item.post.author_npub + '|' + item.post.ts : item.announce.author_npub + '|' + item.announce.ts))}
@@ -1211,7 +1251,11 @@
 				{/if}
 			{:else if !selectedPeer}
 				<div class="convo-empty-state">
-					<p>Select a contact to view the conversation.</p>
+					<EmptyState
+						centered
+						message="Select a contact to view the conversation."
+						cta={{ label: 'Find hoarders in Contacts →', href: '/contacts' }}
+					/>
 					<p class="privacy-note">
 						{@html icons.shield} Messages are end-to-end encrypted — relays never see who sent them or what they say.
 					</p>
@@ -1527,6 +1571,16 @@
 	.convo-list { flex: 1; overflow-y: auto; padding: 6px 8px; }
 
 	.convo-empty { padding: 12px; font-size: 12px; color: var(--fg-dim); }
+	/* QURATOR-93: the channels load error — on the --error ramp (same token as Topics' .root-error)
+	   so a failure never reads as the confident "no channels" negative. */
+	.convo-load-error {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 8px 12px;
+		font-size: 12px;
+		color: var(--error);
+	}
 
 	/* M15 W7: removed the dead .convo-divider rule (unreferenced). */
 
