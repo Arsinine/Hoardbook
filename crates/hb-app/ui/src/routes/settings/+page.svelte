@@ -320,9 +320,21 @@
 	// ── QURATOR-94 — the blocklist surface (dm_unblock previously had NO UI anywhere) ──────────
 	let blocked: string[] = $state([]);
 	let unblockingNpub: string | null = $state(null);
+	// minor-5: a swallowed dmBlockedList() failure used to fall straight into the quiet "No blocked
+	// contacts" line, hiding an UNKNOWN blocklist (and every Unblock control) behind a confident
+	// negative. Mirror the QURATOR-93 settings-load shape: an explicit failed flag drives an error +
+	// Retry instead, and a success — first-try or retry — always clears it (both directions). The
+	// list itself is never cleared on failure, so a retry that fails after a prior success still
+	// shows the stale rows rather than reverting to the error/empty state.
+	let blockedLoadFailed = $state(false);
 
 	async function loadBlocked() {
-		try { blocked = await dmBlockedList(); } catch { /* local read; keep the last list */ }
+		try {
+			blocked = await dmBlockedList();
+			blockedLoadFailed = false;
+		} catch {
+			blockedLoadFailed = true;
+		}
 	}
 
 	async function handleUnblock(npub: string) {
@@ -420,6 +432,10 @@
 	}
 
 	async function toggleAllowDms() {
+		// QURATOR-93 twin (M1): the toggles bypassed the settingsLoaded gate — belt-and-suspenders
+		// with the disabled attribute below, since a click that lands before Svelte re-renders the
+		// disabled state must not be allowed to fire a save of the fallback object.
+		if (!settingsLoaded) return;
 		settings = { ...settings, allow_dms: !settings.allow_dms };
 		try {
 			await saveSettings(fullSettings());
@@ -435,6 +451,8 @@
 	// Toggle one boolean field and persist the whole object (never drop another field — the M5
 	// fullSettings() gotcha).
 	async function toggleSetting(field: 'snapshot_auto_update' | 'snapshot_reconcile_poll') {
+		// QURATOR-93 twin (M1): see toggleAllowDms.
+		if (!settingsLoaded) return;
 		settings = { ...settings, [field]: !settings[field] };
 		try {
 			await saveSettings(fullSettings());
@@ -447,6 +465,8 @@
 	// a teaser is already published — republish it so the change (add/drop hashtags) takes effect
 	// immediately instead of waiting for the next unrelated publish.
 	async function toggleDiscoverable() {
+		// QURATOR-93 twin (M1): see toggleAllowDms.
+		if (!settingsLoaded) return;
 		settings = { ...settings, discoverable: !settings.discoverable };
 		try {
 			await saveSettings(fullSettings());
@@ -754,7 +774,7 @@
 				<div class="toggle-label">Allow incoming messages from anyone</div>
 				<div class="toggle-sub">Off means only your contacts can DM you</div>
 			</div>
-			<button class="toggle" class:toggle-on={allowDms} onclick={toggleAllowDms} aria-label="Allow incoming messages from anyone">
+			<button class="toggle" class:toggle-on={allowDms} onclick={toggleAllowDms} disabled={!settingsLoaded} aria-label="Allow incoming messages from anyone">
 				<span class="toggle-thumb"></span>
 			</button>
 		</div>
@@ -768,7 +788,7 @@
 					host makes on an SMB share — those reconcile on launch.
 				</div>
 			</div>
-			<button class="toggle" class:toggle-on={snapshotAutoUpdate} onclick={() => toggleSetting('snapshot_auto_update')} aria-label="Auto-update snapshots on change">
+			<button class="toggle" class:toggle-on={snapshotAutoUpdate} onclick={() => toggleSetting('snapshot_auto_update')} disabled={!settingsLoaded} aria-label="Auto-update snapshots on change">
 				<span class="toggle-thumb"></span>
 			</button>
 		</div>
@@ -778,7 +798,7 @@
 				<div class="toggle-label">Reconcile poll for remotely-edited collections</div>
 				<div class="toggle-sub">Low-frequency re-check for collections you edit from another host (SMB). Off by default.</div>
 			</div>
-			<button class="toggle" class:toggle-on={snapshotReconcilePoll} onclick={() => toggleSetting('snapshot_reconcile_poll')} aria-label="Reconcile poll for remotely-edited collections">
+			<button class="toggle" class:toggle-on={snapshotReconcilePoll} onclick={() => toggleSetting('snapshot_reconcile_poll')} disabled={!settingsLoaded} aria-label="Reconcile poll for remotely-edited collections">
 				<span class="toggle-thumb"></span>
 			</button>
 		</div>
@@ -791,7 +811,7 @@
 					with your npub or share code, and your contacts are unaffected.
 				</div>
 			</div>
-			<button class="toggle" class:toggle-on={settings.discoverable} onclick={toggleDiscoverable} aria-label="Show up in Discover Hoarders">
+			<button class="toggle" class:toggle-on={settings.discoverable} onclick={toggleDiscoverable} disabled={!settingsLoaded} aria-label="Show up in Discover Hoarders">
 				<span class="toggle-thumb"></span>
 			</button>
 		</div>
@@ -800,7 +820,15 @@
 	<!-- Blocked contacts (QURATOR-94 — the unblock surface; previously unreachable from any UI) -->
 	<div class="section-label">Blocked contacts</div>
 	<div class="surface surface-nop">
-		{#if blocked.length === 0}
+		{#if blockedLoadFailed && blocked.length === 0}
+			<!-- minor-5: an unknown blocklist must not render as the confident "No blocked contacts"
+			     line — same rule as QURATOR-93/QURATOR-80/85. -->
+			<EmptyState
+				error
+				message="Couldn't load your blocked contacts — an unknown blocklist can't be shown as empty."
+				onretry={loadBlocked}
+			/>
+		{:else if blocked.length === 0}
 			<div class="blocked-empty">No blocked contacts.</div>
 		{:else}
 			{#each blocked as npub (npub)}
@@ -1176,6 +1204,9 @@
 		transition: background 0.15s, border-color 0.15s;
 	}
 	.toggle-on { background: var(--accent); border-color: var(--accent); }
+	/* M1 (settings-load review): the toggle is a custom control, not on the .btn contract, so
+	   disabled needs its own cue — same shape as .btn:disabled in app.css. */
+	.toggle:disabled { opacity: 0.5; cursor: not-allowed; }
 
 	.toggle-thumb {
 		position: absolute;
