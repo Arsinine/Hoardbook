@@ -1316,11 +1316,16 @@
 					</label>
 				</div>
 
-				<!-- Private collections sealed to me (M10) — not served by the Browse deep-link, so
-				     they stay here in the detail area. Absent (not "locked") for a non-trusted viewer. -->
+				<!-- Private collections sealed to me (M10). QURATOR-92: Browse now serves them in a
+				     badged Private section via the same `?peer=` deep-link the row's Browse button
+				     uses, so the label is a real link; the detail panels stay here. Absent (not
+				     "locked") for a non-trusted viewer. -->
 				{#if (privateByAuthor[peer.npub] ?? []).length > 0}
 					<div class="private-section">
-						<div class="section-label">Private collections <span class="private-badge">trusted</span></div>
+						<div class="section-label">
+							<a class="private-link" href="/browse?peer={peer.npub}">Private collections</a>
+							<span class="private-badge">trusted</span>
+						</div>
 						{#each privateByAuthor[peer.npub] as col}
 							<CollectionPanel collection={col} />
 						{/each}
@@ -1646,6 +1651,8 @@
 	}
 	.audience-check input { margin: 0; cursor: pointer; }
 	.private-section { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+	.private-link { color: inherit; text-decoration: none; }
+	.private-link:hover { color: var(--accent); text-decoration: underline; }
 	.private-badge {
 		font-size: 9.5px; padding: 1px 6px; border-radius: 999px; letter-spacing: 0.5px;
 		background: color-mix(in oklch, var(--accent) 16%, transparent); color: var(--accent);
