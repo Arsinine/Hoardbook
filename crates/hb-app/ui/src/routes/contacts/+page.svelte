@@ -1115,7 +1115,7 @@
 					{/if}
 					<div style="flex:1"></div>
 					{#if badge.locked}
-						<button class="btn-default btn-xs ask-access-btn" onclick={() => goto('/chat?peer=' + peer.npub + '&intent=ask-access' + (peer.petname ? '&petname=' + encodeURIComponent(peer.petname) : ''))}>Ask for access</button>
+						<button class="btn-default btn-sm ask-access-btn" onclick={() => goto('/chat?peer=' + peer.npub + '&intent=ask-access' + (peer.petname ? '&petname=' + encodeURIComponent(peer.petname) : ''))}>Ask for access</button>
 					{:else}
 						<a class="btn-default btn-xs" href="/browse?peer={peer.npub}">Browse</a>
 					{/if}

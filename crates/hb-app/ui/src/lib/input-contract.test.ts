@@ -236,6 +236,9 @@ describe('input contract QURATOR-101 — markup carries the contract class', () 
 	// contract class onto the element. Per-file counts are printed so "0 violations" is distinguishable
 	// from "0 elements examined" (the ugrep/exit-127 lesson: a check that finds nothing to look at must
 	// not read the same as a check that looked and found it clean).
+	//
+	// QURATOR-101 page half: the four heavily-pinned route pages join the scan alongside the nine
+	// components migrated in the component half (64aba00) — same rule, same allowlist mechanism.
 	const COMPONENT_FILES = [
 		'src/lib/components/ScanDialog.svelte',
 		'src/lib/components/AddContactPanel.svelte',
@@ -246,6 +249,10 @@ describe('input contract QURATOR-101 — markup carries the contract class', () 
 		'src/lib/components/ManifestFulfilCard.svelte',
 		'src/lib/components/TransportTicketCard.svelte',
 		'src/lib/components/ShareCodeCard.svelte',
+		'src/routes/browse/+page.svelte',
+		'src/routes/chat/+page.svelte',
+		'src/routes/topics/+page.svelte',
+		'src/routes/contacts/+page.svelte',
 	];
 
 	// Justified exceptions: a bare nested input inside a wrapper DIV that itself carries `hb-input`
@@ -273,6 +280,26 @@ describe('input contract QURATOR-101 — markup carries the contract class', () 
 			classAttr: 'tag-input',
 			reason: 'nested inside <div class="hb-input tag-wrap">',
 		},
+		{
+			file: 'src/routes/browse/+page.svelte',
+			classAttr: 'search-input',
+			reason: 'nested inside <div class="hb-input search-wrap">',
+		},
+		{
+			file: 'src/routes/browse/+page.svelte',
+			classAttr: '',
+			reason: 'nested inside <div class="hb-input file-search">',
+		},
+		{
+			file: 'src/routes/chat/+page.svelte',
+			classAttr: 'search-bare',
+			reason: 'nested inside <div class="hb-input search-wrap">',
+		},
+		{
+			file: 'src/routes/contacts/+page.svelte',
+			classAttr: '',
+			reason: 'nested inside <div class="hb-input subheader-search">',
+		},
 	];
 
 	/** Strip <script>/<style> blocks, leaving only the template markup a form-control scan should
@@ -290,9 +317,9 @@ describe('input contract QURATOR-101 — markup carries the contract class', () 
 	}
 
 	/** Find every native form-control OPENING tag in the template and pull its `class`/`type`
-	 *  attributes verbatim. All nine owned files write these as plain string literals — none binds
-	 *  `class`/`type` dynamically on an input/textarea/select — so a literal attribute regex is exact
-	 *  here, not an approximation. */
+	 *  attributes verbatim. All owned files (the nine components plus the four QURATOR-101 route
+	 *  pages) write these as plain string literals — none binds `class`/`type` dynamically on an
+	 *  input/textarea/select — so a literal attribute regex is exact here, not an approximation. */
 	function formControls(template: string): FormControl[] {
 		const out: FormControl[] = [];
 		const re = /<(input|textarea|select)\b([^>]*)>/gi;
@@ -311,7 +338,7 @@ describe('input contract QURATOR-101 — markup carries the contract class', () 
 		return classAttr.split(/\s+/).includes(cls);
 	}
 
-	it('every owned component wires hb-input/hb-textarea onto its native form controls', () => {
+	it('every owned component and route page wires hb-input/hb-textarea onto its native form controls', () => {
 		const perFileCounts: Record<string, number> = {};
 		const violations: string[] = [];
 

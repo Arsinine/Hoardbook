@@ -827,7 +827,7 @@
 		<div class="panel-top">
 			<span class="panel-title">People</span>
 		</div>
-		<div class="search-wrap">
+		<div class="hb-input search-wrap">
 			<span class="search-icon">{@html icons.search}</span>
 			<input class="search-input" placeholder="Filter contacts…" bind:value={search} />
 		</div>
@@ -1062,7 +1062,7 @@
 							<button type="button" aria-pressed={viewMode === 'folders'} onclick={() => (viewMode = 'folders')}>Folders</button>
 						</div>
 						<div class="sort-control">
-							<select class="sort-select" bind:value={sortKey} aria-label="Sort by">
+							<select class="hb-input sort-select" bind:value={sortKey} aria-label="Sort by">
 								<option value="name">Name</option>
 								<option value="size">Size</option>
 								<option value="type">Type</option>
@@ -1071,7 +1071,7 @@
 								{sortDir === 'asc' ? '↑' : '↓'}
 							</button>
 						</div>
-						<div class="file-search">
+						<div class="hb-input file-search">
 							<span class="search-icon">{@html icons.search}</span>
 							<input placeholder="Search this collection…" bind:value={fileSearch} aria-label="Search items" />
 						</div>
@@ -1169,7 +1169,7 @@
 										<div class="ask-failed-note">{MANIFEST_ASK_FAILED_LINE(askError)}</div>
 									{/if}
 									{#if pasteOpen}
-										<textarea class="hb-input hb-mono paywall-paste" bind:value={pasteText} placeholder="Paste the .hbmanifest text or its base64 here"></textarea>
+										<textarea class="hb-input hb-textarea hb-mono paywall-paste" bind:value={pasteText} placeholder="Paste the .hbmanifest text or its base64 here"></textarea>
 										<button class="btn-primary btn-sm" disabled={importingManifest || !pasteText.trim()} onclick={() => handleImportManifest({ pasted: pasteText })}>Import from text</button>
 									{/if}
 								</div>
@@ -1301,17 +1301,15 @@
 		color: var(--fg-dim);
 	}
 
+	/* QURATOR-101 — on the .hb-input contract; only the icon-prefix layout (gap, outer inset) is
+	   local. The inner input is transparent/borderless so the wrapper reads as one input field. */
 	.search-wrap {
-		display: flex;
-		align-items: center;
 		gap: 6px;
-		padding: 8px 10px;
-		border-bottom: 1px solid var(--divider);
-		color: var(--fg-dim);
+		margin: 8px 10px;
 		flex-shrink: 0;
 	}
 
-	.search-icon { display: flex; flex-shrink: 0; }
+	.search-icon { color: var(--fg-dim); display: flex; flex-shrink: 0; }
 
 	.search-input {
 		flex: 1;
@@ -1517,7 +1515,7 @@
 
 	/* M16 W4: the "get the rest" affordances inside the paywall note. */
 	.paywall-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center; }
-	.paywall-paste { display: block; width: 100%; margin-top: 6px; min-height: 52px; resize: vertical; }
+	.paywall-paste { display: block; width: 100%; margin-top: 6px; min-height: 52px; }
 	/* M17 W7.1a: the muted asked-state line + the inline failure reason. */
 	.asked-line { font-size: 11.5px; color: var(--fg-dim); }
 	.ask-failed-note { font-size: 11.5px; color: var(--error); margin-top: 6px; }
@@ -1727,11 +1725,8 @@
 	.view-toggle button[aria-pressed='true'] { background: var(--accent-soft); color: var(--accent); }
 
 	.sort-control { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
-	.sort-select {
-		height: 28px; padding: 0 6px; border-radius: 6px; font-size: 12px;
-		background: var(--bg-input); border: 1px solid var(--border); color: var(--fg);
-		font-family: var(--font-ui); cursor: pointer;
-	}
+	/* QURATOR-101 — on the .hb-input contract; only cursor is local. */
+	.sort-select { cursor: pointer; }
 	.sort-dir {
 		width: 28px; height: 28px; flex-shrink: 0;
 		display: flex; align-items: center; justify-content: center;
@@ -1740,11 +1735,10 @@
 	}
 	.sort-dir:hover { color: var(--fg); border-color: var(--border-strong); }
 
+	/* QURATOR-101 — on the .hb-input contract; only the flex-sizing layout is local. */
 	.file-search {
-		display: flex; align-items: center; gap: 6px;
+		gap: 6px;
 		flex: 1; min-width: 140px; max-width: 280px;
-		padding: 0 10px; height: 28px;
-		background: var(--bg-input); border: 1px solid var(--border); border-radius: 7px;
 	}
 	.file-search .search-icon { color: var(--fg-dim); display: flex; flex-shrink: 0; }
 	.file-search input {
