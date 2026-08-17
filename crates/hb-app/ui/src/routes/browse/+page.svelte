@@ -1,7 +1,7 @@
 <script lang="ts">
-	import { contacts, toast, toastWithAction } from '$lib/stores.js';
+	import { contacts, toast, toastWithAction, contactsLoadError, loadContactsInto } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
-	import { refreshContact, importManifest, requestManifest, getManifestAsks, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, browsePrivateCollections, type ManifestAsk } from '$lib/api.js';
+	import { refreshContact, importManifest, requestManifest, getManifestAsks, getContacts, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, browsePrivateCollections, type ManifestAsk } from '$lib/api.js';
 	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
@@ -292,14 +292,25 @@
 	// selectedPeer.collections: the public count/grid stays public-only (M21 W4).
 	let privateByAuthor: Record<string, Collection[]> = $state({});
 	let selectedPrivate = $derived(selectedPeer ? (privateByAuthor[selectedPeer.npub] ?? []) : []);
-	$effect(() => {
-		// Load once on mount, mirroring the groups load above; relays may be unreachable — the
-		// panel renders nothing rather than an error (same non-fatal stance as Contacts).
-		browsePrivateCollections().then((list) => {
+	// QURATOR-93 (Browse half) — a FAILED browsePrivateCollections load used to be swallowed by the
+	// bare `.catch(() => {})` below, so the Private section just never appeared: indistinguishable
+	// from a peer who genuinely has none. page-local (this fetch isn't keyed to one peer), cleared on
+	// a later success (both-directions rule, same as contactsLoadError/collectionsLoadError).
+	let privateLoadError = $state(false);
+	async function loadPrivateInto() {
+		try {
+			const list = await browsePrivateCollections();
 			const map: Record<string, Collection[]> = {};
 			for (const g of list) map[g.npub] = g.collections;
 			privateByAuthor = map;
-		}).catch(() => { /* non-fatal */ });
+			privateLoadError = false;
+		} catch {
+			privateLoadError = true;
+		}
+	}
+	$effect(() => {
+		// Load once on mount, mirroring the groups load above.
+		void loadPrivateInto();
 	});
 	let filteredContacts = $derived($contacts.filter(p => matchesQuery(p, search)));
 	let peopleSections = $derived(groupByGroups(filteredContacts, groups));
@@ -510,6 +521,13 @@
 
 	async function loadGroupsInto() {
 		try { groups = await groupsGet(); groupsLoaded = true; } catch { /* non-fatal */ }
+	}
+
+	// QURATOR-93 (Browse half) — the People rail's Retry affordance. Same helper + same store as
+	// Contacts (`loadContactsInto`), so a successful retry here also clears contactsLoadError for
+	// Contacts (both read the one shared store).
+	async function retryContactsLoad() {
+		await loadContactsInto(getContacts);
 	}
 
 	function onDragStart(e: DragEvent, npub: string) {
@@ -833,7 +851,15 @@
 		</div>
 
 		<div class="contact-list" bind:this={listContainer}>
-			{#if $contacts.length === 0}
+			{#if $contactsLoadError}
+				<!-- QURATOR-93 (Browse half): a FAILED contacts load must not render as the confident
+				     "No contacts yet" negative — that string is indistinguishable from a genuine empty. -->
+				<EmptyState
+					error
+					message="Couldn't load contacts — the peer cache didn't answer."
+					onretry={retryContactsLoad}
+				/>
+			{:else if $contacts.length === 0}
 				<div class="left-empty">No contacts yet</div>
 			{:else if filteredContacts.length === 0}
 				<div class="left-empty">No matches</div>
@@ -1016,39 +1042,48 @@
 				<!-- QURATOR-92 — collections the peer sealed TO US (M10), rendered through the same
 				     col-card machinery but badged Private and kept OUT of the public grid above (the
 				     M21 W4 boundary: private never inflates the public count or grid). Absent for a
-				     non-trusted viewer — no locked-teaser hint. -->
-				{#if !selectedCollection && selectedPrivate.length > 0}
+				     non-trusted viewer — no locked-teaser hint.
+				     QURATOR-93 (Browse half) — a FAILED load used to be silently swallowed (see
+				     loadPrivateInto above), so this section just never appeared: indistinguishable
+				     from a peer with none. It now also opens on privateLoadError, rendering a
+				     retryable error line instead of staying silently absent; genuine empties (no
+				     error, zero private collections) still render nothing, unchanged. -->
+				{#if !selectedCollection && (selectedPrivate.length > 0 || privateLoadError)}
 					<div class="private-collections">
 						<div class="private-collections-label">
 							Private collections
 							<span class="private-pill" title="Sealed to you by the owner — not visible to other viewers.">Private</span>
 						</div>
-						<div class="col-grid">
-							{#each selectedPrivate as col (col.slug)}
-								<button class="col-card" onclick={() => selectCollection(col)}>
-									<div class="col-card-icon">{@html icons.folder}</div>
-									<div class="col-card-name">{col.path_alias}</div>
-									{#if col.description}
-										<div class="col-card-desc">{col.description}</div>
-									{/if}
-									<div class="col-card-meta">
-										{col.item_count} item{col.item_count !== 1 ? 's' : ''}
-										{#if col.est_size}· {col.est_size}{:else if col.total_bytes}· {fmtBytes(col.total_bytes)}{/if}
-									</div>
-									{#if (col.content_types?.length ?? 0) > 0 || col.sorted}
-										<div class="col-tags">
-											{#each (col.content_types ?? []).slice(0, 3) as t}
-												<span class="tag">{t}</span>
-											{/each}
-											{#if col.sorted}
-												<span class="tag tag-sorted">sorted</span>
-											{/if}
+						{#if privateLoadError}
+							<EmptyState error message="Couldn't load private collections." onretry={loadPrivateInto} />
+						{:else}
+							<div class="col-grid">
+								{#each selectedPrivate as col (col.slug)}
+									<button class="col-card" onclick={() => selectCollection(col)}>
+										<div class="col-card-icon">{@html icons.folder}</div>
+										<div class="col-card-name">{col.path_alias}</div>
+										{#if col.description}
+											<div class="col-card-desc">{col.description}</div>
+										{/if}
+										<div class="col-card-meta">
+											{col.item_count} item{col.item_count !== 1 ? 's' : ''}
+											{#if col.est_size}· {col.est_size}{:else if col.total_bytes}· {fmtBytes(col.total_bytes)}{/if}
 										</div>
-									{/if}
-									<span class="private-pill" title="Sealed to you by the owner — not visible to other viewers.">Private</span>
-								</button>
-							{/each}
-						</div>
+										{#if (col.content_types?.length ?? 0) > 0 || col.sorted}
+											<div class="col-tags">
+												{#each (col.content_types ?? []).slice(0, 3) as t}
+													<span class="tag">{t}</span>
+												{/each}
+												{#if col.sorted}
+													<span class="tag tag-sorted">sorted</span>
+												{/if}
+											</div>
+										{/if}
+										<span class="private-pill" title="Sealed to you by the owner — not visible to other viewers.">Private</span>
+									</button>
+								{/each}
+							</div>
+						{/if}
 					</div>
 				{/if}
 
@@ -1202,12 +1237,16 @@
      QURATOR-98 — rendered through the shared Modal shell (backdrop, Escape, Tab trap, focus
      restore), replacing the hand-rolled .dg-backdrop/.dg-panel pair that sat at --z-menu, BELOW
      --z-modal. closeOnBackdrop={false}: the field holds a typed group name, and the app's
-     typed-content rule keeps a stray outside click from discarding it (Topics/Chat compose). -->
+     typed-content rule keeps a stray outside click from discarding it (Topics/Chat compose).
+     minor-6 — the migration dropped the old shell's `aria-label="Name this group"`; Modal only
+     wires aria-labelledby when a `title` is passed, and this panel's compact dg-header (padding="0")
+     draws its own inline avatars+input row with no room for Modal's visible <h2>. `ariaLabel` gives
+     the dialog its accessible name back WITHOUT a visible heading, so the layout stays byte-identical. -->
 {#if dragPopoverFor}
 	{@const isMulti = Array.isArray(dragPopoverFor)}
 	{@const dgSource = !isMulti ? $contacts.find((c) => c.npub === (dragPopoverFor as { source: string; target: string })!.source) : undefined}
 	{@const dgTarget = !isMulti ? $contacts.find((c) => c.npub === (dragPopoverFor as { source: string; target: string })!.target) : undefined}
-	<Modal open={true} width="300px" padding="0" closeOnBackdrop={false} onclose={closeDragPopover}>
+	<Modal open={true} width="300px" padding="0" closeOnBackdrop={false} onclose={closeDragPopover} ariaLabel="Name this group">
 		<div class="dg-header">
 			<div class="dg-avatars">
 				{#if isMulti}
