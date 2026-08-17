@@ -118,21 +118,35 @@
 			// devtest #4: the picture lives on the shared profile store, but the editor `form` is what
 			// Save/Publish persist. Sync it back or the next publish rewrites `form` and reverts the image.
 			if (await applyProfilePicture(file)) form.picture = $profile?.picture;
-		} finally { pictureBusy = false; }
+		} catch (e) { toast(String(e), 'error'); }
+		finally { pictureBusy = false; }
 	}
 
 	async function handleRemovePicture() {
 		pictureBusy = true;
-		try { await removeProfilePicture(); form.picture = $profile?.picture; } finally { pictureBusy = false; }
+		try { await removeProfilePicture(); form.picture = $profile?.picture; }
+		catch (e) { toast(String(e), 'error'); }
+		finally { pictureBusy = false; }
 	}
 
 	// ── Publish-button dirty tracking ───────────────────────────────────────────
-	// Snapshot of the profile as it was last published (undefined = never published).
+	// Snapshot of the profile as it was last published (null = never published).
 	let publishedSnapshot: string | null = $state(null);
+	// QURATOR-95: the published-check and the profile store hydrate on parallel chains, so the old
+	// one-shot onMount capture was lost whenever `$profile` was still null when the check resolved —
+	// an already-published profile then read "Not published yet" for the whole session. Store the
+	// resolved flag instead; the effect below joins BOTH conditions.
+	let profileWasPublished = $state(false);
 
 	onMount(async () => {
-		const wasPublished = await hasPublishedProfile().catch(() => false);
-		if (wasPublished && $profile) {
+		profileWasPublished = await hasPublishedProfile().catch(() => false);
+	});
+
+	// Capture the snapshot the moment BOTH the published-check has resolved true AND the profile
+	// store has hydrated — whichever lands second. The `=== null` guard makes it a one-shot, so
+	// later edits to `$profile` never overwrite the as-published snapshot.
+	$effect(() => {
+		if (profileWasPublished && $profile && publishedSnapshot === null) {
 			publishedSnapshot = stableProfileJson($profile);
 		}
 	});
