@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { contacts, toast, toastWithAction } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
-	import { refreshContact, importManifest, requestManifest, getManifestAsks, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, type ManifestAsk } from '$lib/api.js';
+	import { refreshContact, importManifest, requestManifest, getManifestAsks, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, browsePrivateCollections, type ManifestAsk } from '$lib/api.js';
 	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
@@ -11,6 +11,8 @@
 	// keyboard route for add/move/ungrouped opens this instead of a parallel, drifting copy.
 	import GroupMembershipPopover from '$lib/components/GroupMembershipPopover.svelte';
 	import CreateGroupDialog from '$lib/components/CreateGroupDialog.svelte';
+	// QURATOR-98 — the shared dialog shell (backdrop, Escape, Tab trap, focus restore).
+	import Modal from '$lib/components/Modal.svelte';
 	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote, arrangeItems, fileTypesPresent, type BrowseViewMode, type BrowseSortKey, type BrowseSortDir } from '$lib/browse-view.js';
 	import { deriveManifestAskState, ASK_TICK_MS, MANIFEST_ASKED_LINE, MANIFEST_ASK_AGAIN_LABEL, MANIFEST_ASK_AGAIN_COOLDOWN_TIP, MANIFEST_OPEN_CHAT_LABEL, MANIFEST_ASK_FAILED_LINE } from '$lib/manifest-ask.js';
 	import type { CachedPeer, Collection, DirectoryItem, Group } from '$lib/types.js';
@@ -281,6 +283,22 @@
 		// Load once on mount; group membership is mutated on the Contacts tab, and Browse re-reads
 		// on every navigate here (the $effect re-runs when `groups` is reassigned elsewhere too).
 		groupsGet().then((g) => { groups = g; groupsLoaded = true; }).catch(() => { /* non-fatal */ });
+	});
+	// QURATOR-92 — Private collections peers sealed TO US (M10), keyed by author npub. These are
+	// the same decrypted Collections Contacts' card detail lists (inertly); here they render in a
+	// badged Private section of the collections pane. A non-trusted viewer simply has no entry —
+	// nothing about OUR audience (that is private_audience_*, untouched). Not merged into
+	// selectedPeer.collections: the public count/grid stays public-only (M21 W4).
+	let privateByAuthor: Record<string, Collection[]> = $state({});
+	let selectedPrivate = $derived(selectedPeer ? (privateByAuthor[selectedPeer.npub] ?? []) : []);
+	$effect(() => {
+		// Load once on mount, mirroring the groups load above; relays may be unreachable — the
+		// panel renders nothing rather than an error (same non-fatal stance as Contacts).
+		browsePrivateCollections().then((list) => {
+			const map: Record<string, Collection[]> = {};
+			for (const g of list) map[g.npub] = g.collections;
+			privateByAuthor = map;
+		}).catch(() => { /* non-fatal */ });
 	});
 	let filteredContacts = $derived($contacts.filter(p => matchesQuery(p, search)));
 	let peopleSections = $derived(groupByGroups(filteredContacts, groups));
@@ -991,6 +1009,45 @@
 					</div>
 				{/if}
 
+				<!-- QURATOR-92 — collections the peer sealed TO US (M10), rendered through the same
+				     col-card machinery but badged Private and kept OUT of the public grid above (the
+				     M21 W4 boundary: private never inflates the public count or grid). Absent for a
+				     non-trusted viewer — no locked-teaser hint. -->
+				{#if !selectedCollection && selectedPrivate.length > 0}
+					<div class="private-collections">
+						<div class="private-collections-label">
+							Private collections
+							<span class="private-pill" title="Sealed to you by the owner — not visible to other viewers.">Private</span>
+						</div>
+						<div class="col-grid">
+							{#each selectedPrivate as col (col.slug)}
+								<button class="col-card" onclick={() => selectCollection(col)}>
+									<div class="col-card-icon">{@html icons.folder}</div>
+									<div class="col-card-name">{col.path_alias}</div>
+									{#if col.description}
+										<div class="col-card-desc">{col.description}</div>
+									{/if}
+									<div class="col-card-meta">
+										{col.item_count} item{col.item_count !== 1 ? 's' : ''}
+										{#if col.est_size}· {col.est_size}{:else if col.total_bytes}· {fmtBytes(col.total_bytes)}{/if}
+									</div>
+									{#if (col.content_types?.length ?? 0) > 0 || col.sorted}
+										<div class="col-tags">
+											{#each (col.content_types ?? []).slice(0, 3) as t}
+												<span class="tag">{t}</span>
+											{/each}
+											{#if col.sorted}
+												<span class="tag tag-sorted">sorted</span>
+											{/if}
+										</div>
+									{/if}
+									<span class="private-pill" title="Sealed to you by the owner — not visible to other viewers.">Private</span>
+								</button>
+							{/each}
+						</div>
+					</div>
+				{/if}
+
 			<!-- File tree -->
 			{:else}
 				<div class="file-view">
@@ -1137,14 +1194,16 @@
 
 <!-- M22 W3 — the Name moment for Browse's People list. Esc cancels (no write); Enter commits
      (additive — both peers keep every group they were already in and both gain the new one).
-     M22 W5 — for a multi-select drop, the two avatars are replaced by a count badge ("N"). -->
+     M22 W5 — for a multi-select drop, the two avatars are replaced by a count badge ("N").
+     QURATOR-98 — rendered through the shared Modal shell (backdrop, Escape, Tab trap, focus
+     restore), replacing the hand-rolled .dg-backdrop/.dg-panel pair that sat at --z-menu, BELOW
+     --z-modal. closeOnBackdrop={false}: the field holds a typed group name, and the app's
+     typed-content rule keeps a stray outside click from discarding it (Topics/Chat compose). -->
 {#if dragPopoverFor}
 	{@const isMulti = Array.isArray(dragPopoverFor)}
-	<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-	<div class="dg-backdrop" onclick={closeDragPopover} onkeydown={(e) => e.key === 'Escape' && closeDragPopover()} role="presentation"></div>
 	{@const dgSource = !isMulti ? $contacts.find((c) => c.npub === (dragPopoverFor as { source: string; target: string })!.source) : undefined}
 	{@const dgTarget = !isMulti ? $contacts.find((c) => c.npub === (dragPopoverFor as { source: string; target: string })!.target) : undefined}
-	<div class="dg-panel" role="dialog" aria-modal="true" aria-label="Name this group">
+	<Modal open={true} width="300px" padding="0" closeOnBackdrop={false} onclose={closeDragPopover}>
 		<div class="dg-header">
 			<div class="dg-avatars">
 				{#if isMulti}
@@ -1160,7 +1219,7 @@
 					{/if}
 				{/if}
 			</div>
-			<input class="dg-input" type="text" placeholder="Name this group" bind:this={dragNameEl} bind:value={dragNameInput} onkeydown={onDragNameKey} />
+			<input class="hb-input dg-input" type="text" placeholder="Name this group" bind:this={dragNameEl} bind:value={dragNameInput} onkeydown={onDragNameKey} />
 		</div>
 		{#if dragSuggestions.length > 0}
 			<div class="dg-suggestions">
@@ -1173,7 +1232,7 @@
 			<button type="button" class="btn-ghost btn-xs" onclick={closeDragPopover}>Cancel</button>
 			<button type="button" class="btn-primary btn-xs" disabled={dragNameInput.trim().length === 0} onclick={commitDragCreate}>Create</button>
 		</div>
-	</div>
+	</Modal>
 {/if}
 
 <!-- M22 W8 — the ONE group-membership editor (the keyboard route for add/move/ungrouped). Same
@@ -1536,6 +1595,24 @@
 		align-content: start;
 	}
 
+	/* QURATOR-92 — the Private section under the public grid. The pill matches CollectionRow's
+	   Home-page Private badge (accent text + 30%-mix accent border), so the affordance reads the
+	   same everywhere a collection's visibility is shown. */
+	.private-collections { display: flex; flex-direction: column; }
+	.private-collections .col-grid { border-top: 1px solid var(--divider); }
+	.private-collections-label {
+		display: flex; align-items: center; gap: 6px;
+		padding: 10px 16px 0;
+		font-size: 10.5px; color: var(--fg-dim);
+		text-transform: uppercase; letter-spacing: 1.2px; font-weight: 600;
+	}
+	.private-pill {
+		font-size: 9.5px; padding: 1px 6px; border-radius: 999px; letter-spacing: 0.5px;
+		border: 1px solid color-mix(in oklch, var(--accent) 30%, transparent);
+		background: color-mix(in oklch, var(--accent) 10%, transparent); color: var(--accent);
+		width: fit-content;
+	}
+
 	.col-card {
 		display: flex;
 		flex-direction: column;
@@ -1809,18 +1886,9 @@
 		font-size: 10px; font-weight: 600; color: var(--accent); margin-left: auto; flex-shrink: 0;
 	}
 
-	/* M22 W3 — naming popover (inline panel for Browse's compact People list). */
-	.dg-backdrop { position: fixed; inset: 0; z-index: var(--z-menu); }
-	.dg-panel {
-		position: fixed; z-index: var(--z-menu); top: 50%; left: 50%;
-		transform: translate(-50%, -50%);
-		min-width: 280px;
-		background: var(--bg-elev2);
-		border: 1px solid var(--border);
-		border-radius: 8px;
-		padding: 4px;
-		box-shadow: 0 8px 24px oklch(0 0 0 / 0.3);
-	}
+	/* M22 W3 — naming popover content (QURATOR-98: the shell is the shared Modal; only the
+	   namer-specific inner styles stay). The input's contract is the global .hb-input —
+	   .dg-input contributes layout only, matching Contacts' twin. */
 	.dg-header { display: flex; align-items: center; gap: 10px; padding: 6px 8px; }
 	.dg-avatars { display: flex; position: relative; width: 44px; height: 30px; flex-shrink: 0; }
 	.dg-avatar {
@@ -1839,13 +1907,7 @@
 		background: var(--accent);
 		flex-shrink: 0;
 	}
-	.dg-input {
-		flex: 1; font-size: 13px; background: var(--bg-input); border: 1px solid var(--border);
-		border-radius: 6px; padding: 4px 8px; outline: none; color: var(--fg);
-		font-family: var(--font-ui); min-width: 0;
-	}
-	.dg-input:focus { border-color: var(--accent); }
-	.dg-input::placeholder { color: var(--fg-dim); }
+	.dg-input { flex: 1; padding: 4px 8px; min-width: 0; }
 	.dg-suggestions { display: flex; flex-wrap: wrap; gap: 5px; padding: 0 8px 4px; }
 	.dg-chip {
 		font-size: 11px; padding: 2px 8px; border-radius: 999px;
