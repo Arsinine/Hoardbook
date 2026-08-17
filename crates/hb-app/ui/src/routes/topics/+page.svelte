@@ -733,7 +733,7 @@
 			<!-- W4: a public Topic is a category root (picker) + freeform sub-path. The root picker
 			     makes a non-category root unrepresentable; the backend re-validates authoritatively. -->
 			<div class="path-row">
-				<select class="root-pick" bind:value={newRoot}>
+				<select class="hb-input" bind:value={newRoot}>
 					{#each TOPIC_ROOTS as r}<option value={r}>{r}</option>{/each}
 				</select>
 				<span class="path-sep">/</span>
@@ -864,7 +864,6 @@
 	.muted { font-size: 11.5px; color: var(--fg-dim); }
 	.tag { font-size: 10px; color: var(--accent); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
 	.path-row { display: flex; align-items: center; gap: 6px; }
-	.root-pick { padding: 6px 9px; background: var(--bg-elev2); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; font: inherit; }
 	.path-sep { color: var(--fg-dim); }
 	.path-preview { font-size: 11px; }
 	.path-preview code { font-family: var(--font-mono); color: var(--fg-muted); }

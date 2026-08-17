@@ -978,7 +978,7 @@
 				<div class="relay-hint" title="Messages may be stale until a relay is reachable.">{relayHint} — inbox may be stale</div>
 			{/if}
 			<div class="convo-search">
-				<div class="search-wrap">
+				<div class="hb-input search-wrap">
 					<span class="search-icon-sm">{@html icons.search}</span>
 					<input class="search-bare" type="text" placeholder="Search…" bind:value={searchQuery} />
 				</div>
@@ -1114,7 +1114,7 @@
 				<div class="composer">
 					<div class="compose-box">
 						<textarea
-							class="compose-input"
+							class="hb-input hb-textarea compose-input"
 							placeholder="Message #{selectedTopic.name}…"
 							bind:value={channelDraft}
 							onkeydown={channelKeydown}
@@ -1390,7 +1390,7 @@
 				<div class="composer">
 					<div class="compose-box">
 						<textarea
-							class="compose-input"
+							class="hb-input hb-textarea compose-input"
 							placeholder="Type a message…"
 							bind:value={draft}
 							bind:this={draftEl}
@@ -1545,16 +1545,8 @@
 		border-bottom: 1px solid var(--divider);
 	}
 
-	.search-wrap {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		padding: 0 10px;
-		height: 30px;
-		background: var(--bg-input);
-		border: 1px solid var(--border);
-		border-radius: 7px;
-	}
+	/* QURATOR-101 — on the .hb-input contract; only the icon-prefix gap is local. */
+	.search-wrap { gap: 6px; }
 
 	.search-icon-sm { color: var(--fg-dim); display: flex; }
 
@@ -1766,11 +1758,9 @@
 		background: var(--bg);
 	}
 
+	/* QURATOR-101 — the boxed look moves onto the textarea itself (.hb-input contract); the box
+	   here is now a bare stacking layout for the textarea + the footer row below it. */
 	.compose-box {
-		background: var(--bg-elev2);
-		border: 1px solid var(--border);
-		border-radius: 9px;
-		padding: 10px 12px;
 		display: flex;
 		flex-direction: column;
 		gap: 8px;
@@ -1778,16 +1768,9 @@
 
 	.compose-input {
 		width: 100%;
-		background: transparent;
-		border: none;
-		outline: none;
-		font-family: var(--font-ui);
-		font-size: 13px;
-		color: var(--fg);
 		resize: none;
 		min-height: 36px;
 	}
-	.compose-input::placeholder { color: var(--fg-dim); }
 
 	.compose-footer { display: flex; justify-content: flex-end; align-items: center; }
 
