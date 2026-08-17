@@ -1,3 +1,15 @@
+<script module lang="ts">
+	// QURATOR-96 — registry of every OPEN modal, in open order (module scope: one list shared by
+	// all instances). Keydown is still caught on the backdrop via bubbling, but that path dies when
+	// focus escapes the dialog to <body> — a clicked element re-rendered away leaves nothing inside
+	// the modal to bubble from, so Esc went dead and Tab cycled the page BEHIND the modal. Each open
+	// modal also listens at the window, and only the TOPMOST entry reacts — which keeps the
+	// stacked-modal property ("only the modal holding focus reacts") by construction. The two paths
+	// cannot double-fire: a bubbling keydown is stopped at the backdrop before it reaches the
+	// window, and a body-focused keydown never passes through the backdrop.
+	const openModals: symbol[] = [];
+</script>
+
 <script lang="ts">
 	// M15 W2 — the one modal shell. Owns the backdrop, the accessible dialog card, Escape-to-close,
 	// a focus trap, and focus restore on close. Inner form markup + callbacks live in the caller's
@@ -22,6 +34,8 @@
 	let cardEl: HTMLElement | undefined = $state();
 	const titleId = 'modal-title-' + Math.random().toString(36).slice(2, 9);
 	let zIndex = $derived(level === 'stacked' ? 'var(--z-modal-stacked)' : 'var(--z-modal)');
+	// This instance's slot in the module-scope open-modals registry above.
+	const self = Symbol('modal');
 
 	// One effect keyed on `open`: capture the opener → focus into the dialog after render → on
 	// close/unmount, restore focus to whatever was focused before opening.
@@ -36,9 +50,21 @@
 		return () => opener?.focus?.();
 	});
 
+	// Register/unregister in the open order the topmost-check below depends on. Runs alongside the
+	// focus effect, keyed on the same `open` prop, so an unmounted or closed modal can never react.
+	$effect(() => {
+		if (!open) return;
+		openModals.push(self);
+		return () => {
+			const i = openModals.indexOf(self);
+			if (i !== -1) openModals.splice(i, 1);
+		};
+	});
+
 	// Keydown is caught on the backdrop via bubbling from the focused descendant — so with stacked
 	// modals only the one that actually holds focus reacts to Escape/Tab (no document listener that
-	// every modal would fire at once).
+	// every modal would fire at once). onWindowKey below is the QURATOR-96 supplement for the
+	// focus-escaped-to-<body> case that bubbling cannot reach.
 	function onKey(e: KeyboardEvent) {
 		if (e.key === 'Escape') {
 			e.preventDefault();
@@ -64,10 +90,19 @@
 		}
 	}
 
+	// Bubble-phase window listener: an OverflowMenu (document CAPTURE + stopPropagation) still
+	// consumes its Escape before this runs, so "topmost layer wins" keeps its meaning.
+	function onWindowKey(e: KeyboardEvent) {
+		if (openModals[openModals.length - 1] !== self) return; // only the topmost open modal reacts
+		onKey(e);
+	}
+
 	function onBackdrop(e: MouseEvent) {
 		if (closeOnBackdrop && e.target === e.currentTarget) onclose();
 	}
 </script>
+
+<svelte:window onkeydown={onWindowKey} />
 
 {#if open}
 	<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->

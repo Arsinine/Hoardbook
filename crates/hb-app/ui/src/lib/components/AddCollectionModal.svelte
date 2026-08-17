@@ -82,7 +82,8 @@
 	{#if step === 1}
 		<ScanDialog open={true} title="Add collection" onscanned={handleScanned} onclose={handleScanDialogClose} />
 	{:else if step === 2 && collection}
-		<Modal open={true} width="460px" padding="0" onclose={close}>
+		<!-- QURATOR-97: close() resets step/collection, so the backdrop must not close — Cancel/Esc stay. -->
+		<Modal open={true} width="460px" padding="0" closeOnBackdrop={false} onclose={close}>
 			<CollectionDetailsForm {collection} onsaved={handleSaved} onpublished={handlePublished} oncancel={close} />
 		</Modal>
 	{/if}
