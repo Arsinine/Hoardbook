@@ -191,6 +191,24 @@ pub(crate) async fn decode_dms(
 }
 
 // ---------------------------------------------------------------------------
+// DM_CACHE_LOCK (finding M2) — serializes every load→mutate→save transaction against
+// `dm_cache.json`. Three sites read-modify-write that one file: the sent-echo persist
+// (`persist_sent_dm`), the inbox poll's merge (`get_messages`), and the Request-accept history
+// migration (`dm_request_accept_inner`). Each used to load → mutate → save independently, so a 3 s
+// poll overlapping a send (or an accept) could last-write-wins away one side's update.
+//
+// A SINGLE static, hoisted to MODULE scope — not one declared inside each function. A lock declared
+// per-function is a *different* mutex at every site, so it only serializes repeat calls to that one
+// function against itself; it does nothing to stop two DIFFERENT functions' transactions from
+// interleaving, which is exactly the race this exists to close (the documented per-function-statics
+// trap). `tokio::sync::Mutex`, not `std` (house rule): the inbox-merge transaction awaits
+// `unwrap_dm` while the lock is held (crypto, not relay I/O), so the guard must survive an `.await`.
+//
+// Kept tight: relay I/O (the send itself, the inbox `client.fetch`) always happens OUTSIDE the lock;
+// only the disk load/mutate/save is guarded.
+static DM_CACHE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+// ---------------------------------------------------------------------------
 // Q7 — the total DM classifier (M13 Part B): inbox vs quarantined Request vs dropped
 // ---------------------------------------------------------------------------
 
@@ -418,7 +436,7 @@ pub(crate) fn dm_requests_inner(store: &DataStore, own_npub: &str) -> Result<Vec
 /// are already in `seen_wraps` from when they were quarantined, so the incremental poll would never
 /// re-decode them into the now-contact's inbox — without this, the accepted history would flash for
 /// one poll then vanish). Needs `identity` to re-seal the cache.
-pub(crate) fn dm_request_accept_inner(
+pub(crate) async fn dm_request_accept_inner(
     store: &DataStore,
     identity: &hb_core::Identity,
     own_npub: &str,
@@ -469,8 +487,12 @@ pub(crate) fn dm_request_accept_inner(
         store.load_dm_declined().map_err(cmd_err)?.into_iter().filter(|(n, _)| n != &npub).collect();
     store.save_dm_declined(&declined).map_err(cmd_err)?;
 
-    // Migrate the accepted history into the DM cache so it persists past the next poll (see doc above).
+    // Migrate the accepted history into the DM cache so it persists past the next poll (see doc
+    // above). Through DM_CACHE_LOCK (M2): this is a load→mutate→save transaction against the same
+    // file the send-persist and inbox-merge paths write, so it must serialize with them too, or an
+    // overlapping poll/send could last-write-wins away this migration (or vice versa).
     if !cache_adds.is_empty() {
+        let _guard = DM_CACHE_LOCK.lock().await;
         let mut cache = store.load_dm_cache(identity).map_err(cmd_err)?;
         cache.messages.extend(cache_adds);
         cache.prune();
@@ -502,18 +524,26 @@ pub(crate) fn dm_request_decline_inner(store: &DataStore, npub: String, now: u64
 /// the offline test drives the SAME persist wiring without a live relay. The persist is best-effort
 /// BY DESIGN: a cache-write failure must not fail an already-delivered send, so it logs a warning
 /// instead of returning the error.
+///
+/// Finding M3: the timestamp is captured ONCE, right here, and threaded into both the cache entry
+/// (`persist_sent_dm`) and the returned value — the caller (`send_message`) reuses it for the
+/// `ReceivedMessage` it hands back to the UI. Before this fix each side called `Utc::now()`
+/// independently, with encryption + disk I/O in between; the UI's feed-echo dedup key
+/// (`from|sent_at|to|content`) then saw two different `sent_at` strings for the same send and
+/// rendered a duplicate bubble once the feed echo arrived on the next poll.
 pub(crate) async fn send_dm_and_cache_inner(
     store: &DataStore,
     identity: &hb_core::Identity,
     recipient: &PublicKey,
     content: &str,
     send: impl std::future::Future<Output = Result<Event, hb_net::NetError>>,
-) -> Result<Event, hb_net::NetError> {
+) -> Result<(Event, String), hb_net::NetError> {
     let wrap = send.await?;
-    if let Err(e) = persist_sent_dm(store, identity, &wrap, recipient, content) {
+    let sent_at = Utc::now().to_rfc3339();
+    if let Err(e) = persist_sent_dm(store, identity, &wrap, recipient, content, &sent_at).await {
         tracing::warn!("dm: own-send cache persist failed (message was still delivered): {e}");
     }
-    Ok(wrap)
+    Ok((wrap, sent_at))
 }
 
 /// QURATOR-91: persist an OWN SENT DM into the at-rest cache after a successful publish. The inbox
@@ -524,13 +554,20 @@ pub(crate) async fn send_dm_and_cache_inner(
 /// PEER (the `ReceivedMessage` contract: "us for inbound, the peer for our sent echo"), and the
 /// entry routes to `Inbox` on read (`route_dm` admits `from == own_npub`), so no ledger change is
 /// needed beyond the cache's own dedup key.
-pub(crate) fn persist_sent_dm(
+///
+/// `sent_at` is captured ONCE by the caller (`send_dm_and_cache_inner`) and passed in rather than
+/// stamped here (finding M3) — see that function's doc for why a second, independently-captured
+/// `Utc::now()` produced a duplicate bubble. The load→mutate→save below runs behind `DM_CACHE_LOCK`
+/// (finding M2), serialized against the inbox-merge and request-accept transactions on the same file.
+pub(crate) async fn persist_sent_dm(
     store: &DataStore,
     identity: &hb_core::Identity,
     wrap: &Event,
     recipient: &PublicKey,
     content: &str,
+    sent_at: &str,
 ) -> Result<(), String> {
+    let _guard = DM_CACHE_LOCK.lock().await;
     let mut cache = store.load_dm_cache(identity).map_err(cmd_err)?;
     let wrap_id = wrap.id.to_hex();
     if cache.seen_wraps.iter().any(|id| id == &wrap_id) || cache.messages.iter().any(|m| m.wrap_id == wrap_id) {
@@ -541,7 +578,7 @@ pub(crate) fn persist_sent_dm(
         from: identity.npub(),
         to: npub_of(recipient),
         content: content.to_string(),
-        sent_at: Utc::now().to_rfc3339(),
+        sent_at: sent_at.to_string(),
     });
     cache.seen_wraps.push(wrap.id.to_hex());
     cache.prune();
@@ -607,7 +644,10 @@ pub async fn send_message(
 
     let own = net::relay_urls(&store);
     let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
-    send_dm_and_cache_inner(
+    // M3: `sent_at` comes back from the same seam that stamped the cache entry — one capture, both
+    // outputs — so the UI's feed-echo dedup (`from|sent_at|to|content`) can never see two different
+    // timestamps for the same send.
+    let (_wrap, sent_at) = send_dm_and_cache_inner(
         &store,
         &id_clone,
         &recipient,
@@ -617,12 +657,7 @@ pub async fn send_message(
     .await
     .map_err(cmd_err)?;
 
-    Ok(ReceivedMessage {
-        from,
-        to: npub_of(&recipient),
-        content: trimmed,
-        sent_at: Utc::now().to_rfc3339(),
-    })
+    Ok(ReceivedMessage { from, to: npub_of(&recipient), content: trimmed, sent_at })
 }
 
 /// Mint an ask nonce: 128 bits of randomness, hex. Unguessable by the peer being asked, which is
@@ -786,16 +821,27 @@ pub async fn get_messages(
     // whole-mailbox pull + full re-decrypt every poll. Received contact messages come from the cache
     // (instant); the relay is touched only for genuinely-new wraps.
     let now = now_secs();
+    let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
+    // Read the cursor for the fetch filter OUTSIDE the lock — `since` is bandwidth-only (see
+    // `dm_inbox_filter`'s doc), never a correctness boundary, so a cursor that's a moment stale here
+    // just costs one extra re-fetched wrap (deduped by wrap id below), never a lost message.
+    let cursor = store.load_dm_cache(&id_clone).map_err(cmd_err)?.newest_seen_outer.min(now);
+    let filter = dm_inbox_filter(id_clone.public_key(), cursor);
+    let wraps = client.fetch(filter, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
+
+    // M2: reload + merge + save is ONE atomic transaction behind `DM_CACHE_LOCK`, taken only after
+    // the (potentially slow) relay fetch returns — no relay I/O happens while the lock is held.
+    // Reloading here — rather than reusing a snapshot taken before the fetch — is what actually closes
+    // the race: a `persist_sent_dm`/request-accept transaction that ran while the fetch was in flight
+    // must not be clobbered by a save based on stale pre-fetch state.
+    let guard = DM_CACHE_LOCK.lock().await;
     let mut cache = store.load_dm_cache(&id_clone).map_err(cmd_err)?;
-    // Heal a poisoned/future cursor before it drives the fetch window (a stale install may carry one).
+    // Heal a poisoned/future cursor before it drives the next fetch window (a stale install may carry
+    // one).
     let healed = cache.newest_seen_outer > now;
     if healed {
         cache.newest_seen_outer = now;
     }
-    let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
-    let filter = dm_inbox_filter(id_clone.public_key(), cache.newest_seen_outer);
-    let wraps = client.fetch(filter, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
-
     let (requests, merged) = merge_wraps_into_cache(&id_clone, &own_npub, wraps, &ctx, &mut cache, now).await;
     let pruned = cache.prune();
     // Only re-seal + write when something actually changed — an idle 3s poll (all wraps already seen)
@@ -804,6 +850,7 @@ pub async fn get_messages(
     if healed || merged || pruned {
         store.save_dm_cache(&id_clone, &cache).map_err(cmd_err)?;
     }
+    drop(guard); // release before the (separate-file, unlocked) Request-bucket write below
 
     if !requests.is_empty() {
         let existing = store.load_dm_requests().map_err(cmd_err)?;
@@ -842,7 +889,7 @@ pub async fn dm_request_accept(
         let id = guard.as_ref().ok_or("No identity loaded.")?;
         (id.npub(), id.identity.clone())
     };
-    dm_request_accept_inner(&store, &id_clone, &own_npub, npub, petname)
+    dm_request_accept_inner(&store, &id_clone, &own_npub, npub, petname).await
 }
 
 #[tauri::command]
@@ -1195,8 +1242,8 @@ mod tests {
 
     // ── Q7 — the Request-inbox `_inner` fns (no Tauri State) ────────────────────────────────────
 
-    #[test]
-    fn request_accept_adds_manual_contact_no_browse_key_and_drains_bucket() {
+    #[tokio::test]
+    async fn request_accept_adds_manual_contact_no_browse_key_and_drains_bucket() {
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
         let me = Identity::generate();
@@ -1215,7 +1262,7 @@ mod tests {
         // Seed a prior decline for this sender — accept must clear it (they're no longer declined).
         store.save_dm_declined(&[(npub.clone(), 1)]).unwrap();
 
-        let drained = dm_request_accept_inner(&store, &me, "npub1me", npub.clone(), None).unwrap();
+        let drained = dm_request_accept_inner(&store, &me, "npub1me", npub.clone(), None).await.unwrap();
         assert_eq!(drained.len(), 2, "both messages are drained into the conversation");
         assert_eq!(drained[0].content, "hi");
 
@@ -1242,7 +1289,7 @@ mod tests {
         store
             .save_dm_requests(&[DmRequestBucket { npub: npub2.clone(), first_seen: 1, last_message_at: 1, messages: vec![] }])
             .unwrap();
-        dm_request_accept_inner(&store, &me, "npub1me", npub2.clone(), Some("Bob".into())).unwrap();
+        dm_request_accept_inner(&store, &me, "npub1me", npub2.clone(), Some("Bob".into())).await.unwrap();
         let contact2 = store.load_contact(&CachedPeer::pubkey_hash(&npub2)).unwrap().unwrap();
         assert_eq!(contact2.petname.as_deref(), Some("Bob"));
     }
@@ -1301,7 +1348,7 @@ mod tests {
         // wrap-producing half is the no-I/O `build_dm` — the offline stand-in for `send_dm_inner`'s
         // publish, which returns this same wrap.
         let built = build_dm(&me, &peer.public_key(), "my own sent line").await.unwrap();
-        send_dm_and_cache_inner(
+        let (_wrap, sent_at) = send_dm_and_cache_inner(
             &store,
             &me,
             &peer.public_key(),
@@ -1318,6 +1365,19 @@ mod tests {
         assert_eq!(inbox[0].from, me.npub(), "attributed to the sender (us)");
         assert_eq!(inbox[0].to, npub_of(&peer.public_key()), "addressed to the peer, not ourselves");
         assert_eq!(inbox[0].content, "my own sent line");
+
+        // QURATOR M3 regression: `send_message` builds its returned `ReceivedMessage.sent_at` from
+        // the SAME string this seam returns (it does not call `Utc::now()` again). Assert that
+        // returned string against the cached entry's `sent_at` directly, so this reds under the old
+        // two-`Utc::now()` code (one stamp in `persist_sent_dm`, a second, later one in the command)
+        // without needing to drive the full Tauri command.
+        assert_eq!(
+            inbox[0].sent_at, sent_at,
+            "M3: the cache entry and the command's returned timestamp are the SAME captured instant, \
+             not two independent Utc::now() calls — otherwise the feed echo re-arrives under a \
+             different sent_at than the session-appended bubble and the UI dedups on (from, sent_at, \
+             to, content) fail, duplicating the bubble"
+        );
 
         // Re-driving the seam with the SAME wrap id is a no-op — the cache entry keys on the wrap id,
         // so a retried/publish-acked resend can never double-insert the bubble. (A fresh build_dm
@@ -1338,6 +1398,90 @@ mod tests {
             cache2.messages.iter().filter(|m| m.from == me.npub()).count(),
             1,
             "re-persisting the same wrap is a no-op (dedup by wrap id)"
+        );
+    }
+
+    // ── M2 — DM_CACHE_LOCK serializes concurrent load→mutate→save transactions ──────────────────
+    //
+    // `persist_sent_dm` (the send-echo path) and `dm_request_accept_inner`'s cache migration are two
+    // INDEPENDENT, directly-callable production transactions that each load → mutate → save
+    // `dm_cache.json` (no Tauri State or live relay needed for either — both take a plain
+    // `&DataStore`). Hammering many of each concurrently, on a real multi-thread runtime so the two
+    // families of task can genuinely overlap on separate OS threads, is what gives the two writers a
+    // chance to race for real: `write_atomic` makes a single writer's file replace atomic (no torn
+    // JSON), but WITHOUT DM_CACHE_LOCK two overlapping transactions can each load before the other's
+    // save lands, and the later save then clobbers the earlier one outright (last-write-wins,
+    // classic lost update) — every entry from the loser's transaction disappears with no error, no
+    // corruption, nothing but a message count short of a Chat pane. With the lock, the two
+    // transactions' load→mutate→save spans cannot overlap AT ALL, so no interleaving can ever get one
+    // transaction's load in ahead of the other's save.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn dm_cache_lock_survives_concurrent_persist_and_accept_hammering() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
+        let peer = Identity::generate();
+
+        const N: usize = 25;
+
+        // Seed N distinct Request buckets up front — one per concurrent accept task.
+        let buckets: Vec<DmRequestBucket> = (0..N)
+            .map(|i| DmRequestBucket {
+                npub: format!("npub1stranger{i}"),
+                first_seen: 1,
+                last_message_at: 1,
+                messages: vec![RequestMessage {
+                    wrap_id: format!("req-wrap-{i}"),
+                    content: format!("hi {i}"),
+                    sent_at: "2026-01-01T00:00:00Z".into(),
+                }],
+            })
+            .collect();
+        store.save_dm_requests(&buckets).unwrap();
+
+        let mut handles = Vec::new();
+        for i in 0..N {
+            // build_dm mints a fresh, distinct wrap (its own event id) per iteration — a real
+            // production wrap, not a lookalike — so each persist_sent_dm call is a genuinely distinct
+            // cache-adding transaction, not N no-op retries of the same wrap id.
+            let wrap = build_dm(&me, &peer.public_key(), &format!("send {i}")).await.unwrap();
+
+            let store_a = store.clone();
+            let me_a = me.clone();
+            let peer_pk = peer.public_key();
+            let content = format!("send {i}");
+            let sent_at = format!("2026-01-02T00:00:{i:02}Z");
+            handles.push(tokio::spawn(async move {
+                persist_sent_dm(&store_a, &me_a, &wrap, &peer_pk, &content, &sent_at).await.unwrap();
+            }));
+
+            let store_b = store.clone();
+            let me_b = me.clone();
+            let npub_i = format!("npub1stranger{i}");
+            handles.push(tokio::spawn(async move {
+                dm_request_accept_inner(&store_b, &me_b, "npub1me", npub_i, None).await.unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let cache = store.load_dm_cache(&me).unwrap();
+        let sent_count = cache.messages.iter().filter(|m| m.content.starts_with("send ")).count();
+        let accepted_count = cache.messages.iter().filter(|m| m.wrap_id.starts_with("req-wrap-")).count();
+        assert_eq!(
+            sent_count, N,
+            "DM_CACHE_LOCK (M2): every concurrent send-persist transaction landed — none lost to a \
+             racing accept's save"
+        );
+        assert_eq!(
+            accepted_count, N,
+            "DM_CACHE_LOCK (M2): every concurrent request-accept migration landed — none lost to a \
+             racing send-persist's save"
+        );
+        assert!(
+            store.load_dm_requests().unwrap().is_empty(),
+            "all N buckets were drained — no accept silently no-op'd on a stale read"
         );
     }
 }
