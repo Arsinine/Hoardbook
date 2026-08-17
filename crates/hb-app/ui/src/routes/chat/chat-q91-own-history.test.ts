@@ -78,7 +78,7 @@ afterEach(() => {
 describe('QURATOR-91 — own sent history survives a restart in the thread', () => {
 	it('an own-npub entry returned by getMessages renders in the selected peer thread', async () => {
 		identity.set({ npub: ME, npub_short: ME, share_code: 'hbk1x', key_storage: 'plain-file' });
-		contacts.set([{ npub: PEER, collections: [], online: false }]);
+		contacts.set([{ npub: PEER, collections: [], online: false, last_fetched: '2026-08-01T00:00:00Z', local_tags: [] }]);
 
 		const { getByText } = render(ChatPage);
 
@@ -104,7 +104,7 @@ describe('QURATOR-91 — own sent history survives a restart in the thread', () 
 		const sessionSend = { from: ME, to: PEER, content: 'typed just now', sent_at: '2026-08-16T12:00:00Z' };
 		sentMessages.set([sessionSend]);
 		identity.set({ npub: ME, npub_short: ME, share_code: 'hbk1x', key_storage: 'plain-file' });
-		contacts.set([{ npub: PEER, collections: [], online: false }]);
+		contacts.set([{ npub: PEER, collections: [], online: false, last_fetched: '2026-08-01T00:00:00Z', local_tags: [] }]);
 
 		const { getByText } = render(ChatPage);
 		// The session send (12:00) is the newest, so it owns the row preview — proving the seeded

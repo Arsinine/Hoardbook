@@ -81,7 +81,7 @@ describe('QURATOR-94 — Settings blocked-contacts section', () => {
 	it('renders one row per blocked npub, shortened like shortNpub', async () => {
 		blockedListMock.mockResolvedValue([BLOCKED_A, BLOCKED_B]);
 		identity.set({ npub: ME, npub_short: ME, share_code: 'hbk1x', key_storage: 'plain-file' });
-		profile.set({ display_name: 'Me', tags: [], languages: [] });
+		profile.set({ display_name: 'Me', tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '2026-08-01T00:00:00Z' });
 
 		const { getByText, queryByText, getAllByText } = render(SettingsPage);
 
@@ -100,7 +100,7 @@ describe('QURATOR-94 — Settings blocked-contacts section', () => {
 	it('Unblock calls dm_unblock with the row npub and refreshes the list', async () => {
 		blockedListMock.mockResolvedValueOnce([BLOCKED_A]).mockResolvedValueOnce([]);
 		identity.set({ npub: ME, npub_short: ME, share_code: 'hbk1x', key_storage: 'plain-file' });
-		profile.set({ display_name: 'Me', tags: [], languages: [] });
+		profile.set({ display_name: 'Me', tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '2026-08-01T00:00:00Z' });
 
 		const { getByText, getAllByText } = render(SettingsPage);
 
@@ -119,7 +119,7 @@ describe('QURATOR-94 — Settings blocked-contacts section', () => {
 	it('an empty blocklist renders no section noise beyond the quiet empty line', async () => {
 		blockedListMock.mockResolvedValue([]);
 		identity.set({ npub: ME, npub_short: ME, share_code: 'hbk1x', key_storage: 'plain-file' });
-		profile.set({ display_name: 'Me', tags: [], languages: [] });
+		profile.set({ display_name: 'Me', tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '2026-08-01T00:00:00Z' });
 
 		const { getByText, queryByText } = render(SettingsPage);
 		// The section-label is present (stable layout) but shows the quiet empty line — no row, no error.
