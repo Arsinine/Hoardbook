@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, hasPublishedProfile, publishProfile, copyDiagnostics, revealLogFolder, natClassification } from '$lib/api.js';
+	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, hasPublishedProfile, publishProfile, copyDiagnostics, revealLogFolder, natClassification, dmBlockedList, dmUnblock } from '$lib/api.js';
 	import type { Settings, UpdateInfo, PortableUpdateInfo, BeaconReport, NatClassification } from '$lib/api.js';
 	import { keyView } from '$lib/key-view.js';
+	import { shortNpub } from '$lib/contact-display.js';
 	import { passphraseStrength, backupModeOptions, type BackupMode } from '$lib/backup-export.js';
 	import { updateNoticeVM } from '$lib/update-ux.js';
 	import { beaconLine, loopLine } from '$lib/beacon-view.js';
@@ -289,6 +290,27 @@
 	let wipeConfirm = $state(false);
 	let wiping = $state(false);
 
+	// ── QURATOR-94 — the blocklist surface (dm_unblock previously had NO UI anywhere) ──────────
+	let blocked: string[] = $state([]);
+	let unblockingNpub: string | null = $state(null);
+
+	async function loadBlocked() {
+		try { blocked = await dmBlockedList(); } catch { /* local read; keep the last list */ }
+	}
+
+	async function handleUnblock(npub: string) {
+		if (unblockingNpub) return;
+		unblockingNpub = npub;
+		try {
+			await dmUnblock(npub);
+			await loadBlocked();
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			unblockingNpub = null;
+		}
+	}
+
 	onMount(async () => {
 		try { appVersion = await getVersion(); } catch { appVersion = ''; }
 		try {
@@ -314,6 +336,7 @@
 		// leaves the explicit "Not yet determined" state, never a confident negative. Re-checked
 		// after a short delay so a slow probe (cold relay discovery) still surfaces a real reading.
 		try { natClass = await natClassification(); } catch { natClass = 'undetermined'; }
+		loadBlocked();
 		if (natClass === 'undetermined') {
 			setTimeout(async () => {
 				try { natClass = await natClassification(); } catch { /* keep undetermined */ }
@@ -742,6 +765,26 @@
 		</div>
 	</div>
 
+	<!-- Blocked contacts (QURATOR-94 — the unblock surface; previously unreachable from any UI) -->
+	<div class="section-label">Blocked contacts</div>
+	<div class="surface surface-nop">
+		{#if blocked.length === 0}
+			<div class="blocked-empty">No blocked contacts.</div>
+		{:else}
+			{#each blocked as npub (npub)}
+				<div class="blocked-row">
+					<div class="relay-info">
+						<div class="relay-url mono">{shortNpub(npub)}</div>
+						<div class="relay-meta"><span>Can't message you; their requests are dropped.</span></div>
+					</div>
+					<button class="btn-ghost btn-sm" disabled={unblockingNpub === npub} onclick={() => handleUnblock(npub)}>
+						{unblockingNpub === npub ? '…' : 'Unblock'}
+					</button>
+				</div>
+			{/each}
+		{/if}
+	</div>
+
 
 	<!-- Updates -->
 	<div class="section-label">Updates</div>
@@ -950,6 +993,22 @@
 	.no-id-text { font-size: 13px; color: var(--fg-muted); }
 
 	.field-label { font-size: 11px; color: var(--fg-muted); font-weight: 500; }
+
+	/* Blocked-contact rows (QURATOR-94) — same shape as the relay rows above */
+	.blocked-row {
+		padding: 12px 16px;
+		display: flex;
+		gap: 14px;
+		align-items: center;
+		justify-content: space-between;
+		border-bottom: 1px solid var(--divider);
+	}
+	.blocked-row:last-child { border-bottom: none; }
+	.blocked-empty {
+		padding: 12px 16px;
+		font-size: 12px;
+		color: var(--fg-muted);
+	}
 
 	/* Relay rows */
 	.relay-row {
