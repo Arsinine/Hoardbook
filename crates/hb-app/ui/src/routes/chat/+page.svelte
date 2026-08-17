@@ -5,7 +5,7 @@
 	// M17 W7.1b: the manifest export path reuses the same save dialog as Home → ⋯ → Export (no new
 	// export logic — this is a second entry point to the shipped `export_manifest` Tauri command).
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
-	import { contacts, identity, inboxMessages, sentMessages, readWatermarks, toast, dmRequests, announceSeen, collections, seedSentFromFeed } from '$lib/stores.js';
+	import { contacts, identity, inboxMessages, sentMessages, readWatermarks, toast, dmRequests, announceSeen, collections, seedSentFromFeed, loadContactsInto, loadCollectionsInto } from '$lib/stores.js';
 	import {
 		getMessages,
 		sendMessage,
@@ -127,6 +127,11 @@
 	// the surface can say "we couldn't reach the relays" (retryable) instead.
 	let topicsLoadError = $state(false);
 	let channelLoadError = $state(false);
+	// minor-4: same QURATOR-93 shape for the two surfaces that still swallowed a failure — a failed
+	// getMessages left the sidebar's "No conversations yet" rendering on data it never got, and a
+	// failed dmRequests fetch left "No message requests." rendering the same confident negative.
+	let conversationsLoadError = $state(false);
+	let requestsLoadError = $state(false);
 	// devtest #6: announcements are interleaved with posts by timestamp (not pinned above).
 	let channelItems = $derived(interleaveChannel(channelPosts, channelAnnouncements));
 	let channelDraft = $state('');
@@ -186,7 +191,12 @@
 	}
 
 	async function loadRequests() {
-		try { dmRequests.set(await fetchDmRequests()); } catch { /* relay/store unreachable */ }
+		try {
+			dmRequests.set(await fetchDmRequests());
+			requestsLoadError = false;
+		} catch {
+			requestsLoadError = true; /* relay/store unreachable — QURATOR-93-style: surface, don't drop it */
+		}
 	}
 
 	async function loadChannel(topicId: string) {
@@ -270,11 +280,13 @@
 			});
 			seedSentFromFeed(drained, myId);
 			dmRequests.update((prev) => prev.filter((x) => x.npub !== r.npub));
-			try { contacts.set(await getContacts()); } catch { /* non-fatal */ }
+			// minor-3: route every refresh through the helper — it sets the store AND clears a stale
+			// contactsLoadError on success, which a direct `contacts.set(...)` here left standing.
+			await loadContactsInto(getContacts);
 			if (group) {
 				try {
 					await contactUpdateGroups(r.npub, [group]);
-					contacts.set(await getContacts());
+					await loadContactsInto(getContacts);
 				} catch { /* non-fatal */ }
 			}
 			viewingRequests = false;
@@ -387,7 +399,7 @@
 			// state. The existing petname is kept because the user already named this contact.
 			await pasteKey(code);
 			await follow(code);
-			contacts.set(await getContacts());
+			await loadContactsInto(getContacts); // minor-3: clears a stale contactsLoadError on success
 			unlockedCodes = new Set([...unlockedCodes, code]);
 			toast('Browsing unlocked', 'success');
 		} catch (e) {
@@ -414,7 +426,7 @@
 		addContactTarget = null;
 		try {
 			await follow(target.code, detail.group ?? undefined, detail.petname || undefined);
-			contacts.set(await getContacts());
+			await loadContactsInto(getContacts); // minor-3: clears a stale contactsLoadError on success
 			unlockedCodes = new Set([...unlockedCodes, target.code]);
 			toast('Contact added', 'success');
 		} catch (e) {
@@ -649,7 +661,7 @@
 		// matches one of your Public collections → "Export manifest…"). Refresh once on mount so the
 		// card is honest without the owner having to visit Home. The settings read picks up the
 		// `big_relay_url` for the secondary hint (best-effort — never blocks on a relay/FS hiccup).
-		getCollections().then((cs) => collections.set(cs)).catch(() => { /* non-fatal */ });
+		loadCollectionsInto(getCollections); // minor-3: sets/clears collectionsLoadError, not just the store
 		getSettings().then((s) => { bigRelayUrl = s.big_relay_url ?? ''; }).catch(() => { /* non-fatal */ });
 
 
@@ -692,6 +704,7 @@
 			if (selectedTopic && pollTick % CHANNEL_REFRESH_EVERY_TICKS === 0) loadChannel(selectedTopic.topic_id);
 			try {
 				const msgs = await getMessages();
+				conversationsLoadError = false; // minor-4: a later poll success clears a stale error too
 				// Detect genuinely new messages for the selected peer and auto-scroll.
 				if (selectedPeer) {
 					const prevCount = $inboxMessages.filter(m => m.from === selectedPeer!.npub).length;
@@ -713,7 +726,9 @@
 				}
 				inboxMessages.set(msgs);
 				seedSentFromFeed(msgs, myId);
-			} catch { /* relay unreachable */ }
+			} catch {
+				conversationsLoadError = true; /* minor-4: this poll is the other DM-history load site */
+			}
 			// Q7: refresh the Request inbox right after the main inbox poll.
 			loadRequests();
 		}, DM_POLL_VISIBLE_MS);
@@ -739,7 +754,9 @@
 			const msgs = await getMessages();
 			inboxMessages.set(msgs);
 			seedSentFromFeed(msgs, myId);
+			conversationsLoadError = false;
 		} catch (e) {
+			conversationsLoadError = true; /* minor-4: don't let "No conversations yet" read as confident */
 			toast(String(e), 'error');
 		} finally {
 			loading = false;
@@ -834,7 +851,7 @@
 			composeOpen = false;
 			composeTo = '';
 			composeBody = '';
-			try { contacts.set(await getContacts()); } catch { /* non-fatal */ }
+			await loadContactsInto(getContacts); // minor-3: clears a stale contactsLoadError on success
 			const peer = $contacts.find((c) => c.npub === sent.to) ?? ({
 				npub: sent.to, browse_key_hex: undefined, petname: undefined, profile: undefined,
 				collections: [], online: false, last_fetched: '', local_tags: [],
@@ -1008,7 +1025,16 @@
 						</button>
 					{/each}
 				{/if}
-				{#if $dmRequests.length > 0}
+				{#if requestsLoadError}
+					<!-- minor-4: same QURATOR-93 shape as Channels above — a FAILED dmRequests fetch must
+					     not silently drop the section (indistinguishable from "no requests"). -->
+					<div class="convo-section-label">Requests</div>
+					<div class="convo-load-error">
+						<span>Couldn’t load requests.</span>
+						<button type="button" class="btn-default btn-xs" onclick={loadRequests}>Retry</button>
+					</div>
+				{/if}
+				{#if !requestsLoadError && $dmRequests.length > 0}
 					<div class="convo-section-label">Requests</div>
 					<button class="convo-item" class:convo-active={viewingRequests} onclick={openRequests}>
 						<div class="channel-hash">🔔</div>
@@ -1022,7 +1048,15 @@
 				{/if}
 				<div class="convo-section-label">Direct messages</div>
 				{#if visiblePeers.length === 0}
-					{#if allConversationPeers.length === 0}
+					{#if conversationsLoadError && allConversationPeers.length === 0}
+						<!-- minor-4: a FAILED getMessages must not render the confident "No conversations
+						     yet" negative — we genuinely don't know whether there are any. -->
+						<EmptyState
+							error
+							message="Couldn’t load your conversations — the relay didn’t answer."
+							onretry={refreshInbox}
+						/>
+					{:else if allConversationPeers.length === 0}
 						<EmptyState
 							message="No conversations yet — add someone in Contacts to start one."
 							cta={{ label: 'Find hoarders in Contacts →', href: '/contacts' }}
@@ -1140,7 +1174,15 @@
 					</div>
 					<div class="requests-explainer">{REQUEST_EXPLAINER}</div>
 					<div class="thread">
-						{#if sortedRequests.length === 0}
+						{#if requestsLoadError}
+							<!-- minor-4: a FAILED dmRequests fetch must not render as "No message requests." -->
+							<EmptyState
+								centered
+								error
+								message="Couldn’t load message requests — the relay didn’t answer."
+								onretry={loadRequests}
+							/>
+						{:else if sortedRequests.length === 0}
 							<p class="thread-empty">No message requests.</p>
 						{:else}
 							{#each sortedRequests as r (r.npub)}
