@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import AddContactPanel from './AddContactPanel.svelte';
 import { contacts } from '../stores.js';
 import type { PeerSearchHit } from '../api.js';
+import type { CachedPeer } from '../types.js';
 
 vi.mock('../api.js', () => ({
 	pasteKey: vi.fn(),
@@ -56,7 +57,7 @@ function resultEnvelope(hits: PeerSearchHit[], capped = false) {
 async function discoverHits(hits: PeerSearchHit[], props: Record<string, unknown> = {}, capped = false) {
 	(searchPeers as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(resultEnvelope(hits, capped));
 	mockObservedTags();
-	const { getByRole, getAllByRole, findByRole, findByText, queryByText, getByPlaceholderText } = render(AddContactPanel, {
+	const { getByRole, getAllByRole, findByRole, findByText, queryByText, queryAllByText, getByPlaceholderText } = render(AddContactPanel, {
 		props: { open: true, ...props },
 	});
 	await fireEvent.click(getByRole('button', { name: /discover hoarders/i }));
@@ -67,10 +68,15 @@ async function discoverHits(hits: PeerSearchHit[], props: Record<string, unknown
 	// is only a locator, so it deliberately does NOT re-assert the copy here.
 	await fireEvent.input(getByPlaceholderText(/tag/i), { target: { value: 'anime' } });
 	await fireEvent.click(getByRole('button', { name: /^search$/i }));
-	// Wait for the hit-card's Add-contact button (class hit-follow) to appear — that means searchPeers
-	// resolved and the results rendered.
-	const addBtn = await findByRole('button', { name: 'Add contact' });
-	return { addBtn, getAllByRole, findByRole, findByText, queryByText };
+	// Wait for the hit-card div to appear — that means searchPeers resolved and the results rendered.
+	// (QURATOR-104: a hit whose npub is already a contact renders a disabled "Added" button instead of
+	// "Add contact", so waiting on that button by name would time out for exactly the hits under test.)
+	await vi.waitFor(() => {
+		expect(document.body.querySelectorAll('.hit-card').length).toBeGreaterThan(0);
+	}, { timeout: 2000, interval: 20 });
+	// The Add button, when this is a stranger hit (null when every hit is a known contact).
+	const addBtn = document.body.querySelector('button.hit-follow:not([disabled])');
+	return { addBtn, getAllByRole, findByRole, findByText, queryByText, queryAllByText };
 }
 
 describe('AddContactPanel — M17 W1 discovery Message action', () => {
@@ -316,6 +322,85 @@ describe('AddContactPanel — Discover tag-cloud (pristine observed tags)', () =
 		await new Promise((r) => setTimeout(r, 30));
 		await tick();
 		expect(document.body.querySelectorAll('button.disc-cloud-tag').length).toBe(0);
+	});
+});
+
+// QURATOR-104 — a Discover hit whose npub is ALREADY a contact must not be presented as a stranger
+// with a live "Add contact" button. The lookup card in the same panel already dedups against the
+// roster (`alreadyFollowed`/`canUnlock`, AddContactPanel.svelte:41-46); the hit-cards rendered
+// unconditionally. Three states per hit, matching the lookup card's vocabulary:
+//   keyed contact   → no stranger banner (petname shown instead), no enabled Add button ("Added ✓")
+//   keyless contact → same, but "Added" only — a hit carries NO browse key (PeerSearchHit has no
+//                     key field; followHit passes the bare npub), so there is nothing to route
+//                     through the lookup's canUnlock/“Unlock browsing” upgrade. ShareCodeCard's
+//                     same-peer bare-npub precedent renders that case inert for exactly this reason.
+//   unknown npub    → unchanged: stranger banner + live Add contact.
+// Message stays in all three states (M17 W1).
+describe('AddContactPanel — QURATOR-104 hit-card roster dedup', () => {
+	const KEYED = 'npub1keyedcontact0000000000000000000000000000000000000000000000';
+	const KEYLESS = 'npub1keylesscontact00000000000000000000000000000000000000000000';
+	const UNKNOWN = 'npub1stranger0000000000000000000000000000000000000000000000000';
+
+	/** A roster entry: one keyed (browse_key_hex set) and one keyless (added by bare npub). */
+	function roster(): CachedPeer[] {
+		const base = {
+			npub_short: 'npub1…',
+			collections: [],
+			online: false,
+			last_fetched: '2026-08-16T00:00:00Z',
+			local_tags: [],
+		};
+		return [
+			{ ...base, npub: KEYED, petname: 'Keyed Pal', browse_key_hex: 'ab12' },
+			{ ...base, npub: KEYLESS, petname: 'Bare Pal' },
+		] as unknown as CachedPeer[];
+	}
+
+	it('keyed contact hit: no stranger banner, no enabled Add, petname shown, Message kept', async () => {
+		contacts.set(roster());
+		const onadd = vi.fn();
+		const { getAllByRole, queryAllByText, findByText } = await discoverHits(
+			[makeHit({ npub: KEYED, display_name: 'Online Persona' })],
+			{ onadd },
+		);
+		// No stranger banner on the hit.
+		expect(queryAllByText(/unverified — not in your contacts/i).length).toBe(0);
+		// The roster membership is shown (petname, distinct from the teaser display_name).
+		expect(await findByText('Keyed Pal')).toBeTruthy();
+		// No ENABLED "Add contact" button anywhere in the panel.
+		const enabledAdds = getAllByRole('button')
+			.filter((b) => (b.textContent ?? '').trim() === 'Add contact' && !(b as HTMLButtonElement).disabled);
+		expect(enabledAdds.length).toBe(0);
+		// Message survives (M17 W1).
+		expect(getAllByRole('button', { name: 'Message' }).length).toBe(1);
+	});
+
+	it('keyless contact hit: no stranger banner, no enabled Add, Message kept', async () => {
+		contacts.set(roster());
+		const onadd = vi.fn();
+		const { getAllByRole, queryAllByText, findByText } = await discoverHits(
+			[makeHit({ npub: KEYLESS, display_name: 'Online Persona' })],
+			{ onadd },
+		);
+		expect(queryAllByText(/unverified — not in your contacts/i).length).toBe(0);
+		expect(await findByText('Bare Pal')).toBeTruthy();
+		const enabledAdds = getAllByRole('button')
+			.filter((b) => (b.textContent ?? '').trim() === 'Add contact' && !(b as HTMLButtonElement).disabled);
+		expect(enabledAdds.length).toBe(0);
+		expect(getAllByRole('button', { name: 'Message' }).length).toBe(1);
+	});
+
+	it('unknown npub hit keeps the stranger banner and a live Add contact', async () => {
+		contacts.set(roster());
+		const onadd = vi.fn();
+		const { getAllByRole, findByText, addBtn } = await discoverHits(
+			[makeHit({ npub: UNKNOWN, display_name: 'Stranger' })],
+			{ onadd },
+		);
+		expect(await findByText(/unverified — not in your contacts/i)).toBeTruthy();
+		expect(addBtn).toBeTruthy();
+		expect((addBtn as HTMLButtonElement).disabled).toBe(false);
+		expect(getAllByRole('button', { name: 'Message' }).length).toBe(1);
 	});
 });
 
