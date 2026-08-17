@@ -30,6 +30,9 @@ function stripNonCopy(source: string): string {
 	let s = source;
 	s = s.replace(/<style[\s\S]*?<\/style>/gi, '');
 	s = s.replace(/\/\*[\s\S]*?\*\//g, '');
+	// HTML comments are template documentation, not user-facing copy — Svelte pages carry their
+	// design rationale in them (first tripped by a QURATOR-98 note saying "the shared Modal shell").
+	s = s.replace(/<!--[\s\S]*?-->/g, '');
 	s = s.replace(/class\s*=\s*"[^"]*"/g, '');
 	s = s.replace(/class\s*=\s*'[^']*'/g, '');
 	s = s
