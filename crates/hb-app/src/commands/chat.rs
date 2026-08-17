@@ -494,6 +494,60 @@ pub(crate) fn dm_request_decline_inner(store: &DataStore, npub: String, now: u64
     store.save_dm_declined(&record_declined(declined, npub, now)).map_err(cmd_err)
 }
 
+/// Send + persist-the-echo path (QURATOR-91): await the wrap-producing send (`send_dm_inner` in
+/// production), then the local-cache write that makes own history survive a restart. This is the ONE
+/// function both the production `send_message` command and the Q91 regression test drive, so the
+/// test cannot stay green when the persist half is removed (the lookalike-helper trap CLAUDE.md §9
+/// names: a test exercising its own copy of the emission). The send half is injected as a future so
+/// the offline test drives the SAME persist wiring without a live relay. The persist is best-effort
+/// BY DESIGN: a cache-write failure must not fail an already-delivered send, so it logs a warning
+/// instead of returning the error.
+pub(crate) async fn send_dm_and_cache_inner(
+    store: &DataStore,
+    identity: &hb_core::Identity,
+    recipient: &PublicKey,
+    content: &str,
+    send: impl std::future::Future<Output = Result<Event, hb_net::NetError>>,
+) -> Result<Event, hb_net::NetError> {
+    let wrap = send.await?;
+    if let Err(e) = persist_sent_dm(store, identity, &wrap, recipient, content) {
+        tracing::warn!("dm: own-send cache persist failed (message was still delivered): {e}");
+    }
+    Ok(wrap)
+}
+
+/// QURATOR-91: persist an OWN SENT DM into the at-rest cache after a successful publish. The inbox
+/// fetch (`dm_inbox_filter`) is the `#p` addressed-to-us filter, so our own wraps — addressed to the
+/// recipient — never enter the feed; without this write, own history vanishes on restart. A pure
+/// LOCAL cache write on the existing DM path: no wire format, sealing, or relay change. Deduped by
+/// the real gift-wrap id (a retried send that reuses the same wrap can't double-insert), `to` is the
+/// PEER (the `ReceivedMessage` contract: "us for inbound, the peer for our sent echo"), and the
+/// entry routes to `Inbox` on read (`route_dm` admits `from == own_npub`), so no ledger change is
+/// needed beyond the cache's own dedup key.
+pub(crate) fn persist_sent_dm(
+    store: &DataStore,
+    identity: &hb_core::Identity,
+    wrap: &Event,
+    recipient: &PublicKey,
+    content: &str,
+) -> Result<(), String> {
+    let mut cache = store.load_dm_cache(identity).map_err(cmd_err)?;
+    let wrap_id = wrap.id.to_hex();
+    if cache.seen_wraps.iter().any(|id| id == &wrap_id) || cache.messages.iter().any(|m| m.wrap_id == wrap_id) {
+        return Ok(()); // already persisted (a retry carrying the same wrap)
+    }
+    cache.messages.push(CachedDm {
+        wrap_id,
+        from: identity.npub(),
+        to: npub_of(recipient),
+        content: content.to_string(),
+        sent_at: Utc::now().to_rfc3339(),
+    });
+    cache.seen_wraps.push(wrap.id.to_hex());
+    cache.prune();
+    store.save_dm_cache(identity, &cache).map_err(cmd_err)
+}
+
 /// Add `npub` to the local blocklist (spec §Blocked keys — the canonical local blocklist, named for
 /// future Settings reuse). Deletes any Request bucket and any decline record — blocked supersedes both.
 pub(crate) fn dm_block_inner(store: &DataStore, npub: String) -> Result<(), String> {
@@ -553,9 +607,15 @@ pub async fn send_message(
 
     let own = net::relay_urls(&store);
     let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
-    send_dm_inner(&client, &id_clone, &recipient, &trimmed, &own, net::RELAY_TIMEOUT)
-        .await
-        .map_err(cmd_err)?;
+    send_dm_and_cache_inner(
+        &store,
+        &id_clone,
+        &recipient,
+        &trimmed,
+        send_dm_inner(&client, &id_clone, &recipient, &trimmed, &own, net::RELAY_TIMEOUT),
+    )
+    .await
+    .map_err(cmd_err)?;
 
     Ok(ReceivedMessage {
         from,
@@ -1217,5 +1277,67 @@ mod tests {
 
         dm_unblock_inner(&store, npub.clone()).unwrap();
         assert!(!store.load_dm_blocked().unwrap().contains(&npub));
+    }
+
+    // ── QURATOR-91 — own sent history survives a restart via the at-rest cache ──────────────────
+
+    /// The inbox fetch filter (`dm_inbox_filter`) is `Kind::GiftWrap` + `.pubkey(me)` — the `#p`
+    /// addressed-to-us filter — so our OWN sent wraps (addressed to the recipient) never enter the
+    /// feed. The ONLY way an own send survives a restart is `send_message` persisting it into the
+    /// cache itself. The read path is already own-send-ready (`route_dm` routes `from == own_npub`
+    /// to `Inbox`; `cached_inbox` admits `m.from == own_npub`), so the fix is a local-cache write on
+    /// the existing send path — no wire, sealing, or relay change. This test drives the exact persist
+    /// seam `send_message` calls, against a real `DataStore` tempdir, and asserts the round-trip a
+    /// restart performs.
+    #[tokio::test]
+    async fn send_message_persists_own_send_into_dm_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
+        let peer = Identity::generate();
+
+        // The EXACT send+persist seam `send_message` drives (the QURATOR-83 lesson: a test that
+        // exercises its own persist helper stays green when the production call site reverts). The
+        // wrap-producing half is the no-I/O `build_dm` — the offline stand-in for `send_dm_inner`'s
+        // publish, which returns this same wrap.
+        let built = build_dm(&me, &peer.public_key(), "my own sent line").await.unwrap();
+        send_dm_and_cache_inner(
+            &store,
+            &me,
+            &peer.public_key(),
+            "my own sent line",
+            std::future::ready(Ok(built.clone())),
+        )
+        .await
+        .unwrap();
+
+        // The restart round-trip: reload from disk, reclassify under the CURRENT sets.
+        let cache = store.load_dm_cache(&me).unwrap();
+        let inbox = cached_inbox(&cache, &me.npub(), &HashSet::new(), &HashSet::new());
+        assert_eq!(inbox.len(), 1, "the own send survives a restart via the at-rest cache");
+        assert_eq!(inbox[0].from, me.npub(), "attributed to the sender (us)");
+        assert_eq!(inbox[0].to, npub_of(&peer.public_key()), "addressed to the peer, not ourselves");
+        assert_eq!(inbox[0].content, "my own sent line");
+
+        // Re-driving the seam with the SAME wrap id is a no-op — the cache entry keys on the wrap id,
+        // so a retried/publish-acked resend can never double-insert the bubble. (A fresh build_dm
+        // would mint a fresh wrap; the dedup case needs the id the first call persisted.)
+        let same_wrap_id = store.load_dm_cache(&me).unwrap().messages[0].wrap_id.clone();
+        assert_eq!(same_wrap_id, built.id.to_hex(), "the cached entry keys on the real wrap id");
+        send_dm_and_cache_inner(
+            &store,
+            &me,
+            &peer.public_key(),
+            "my own sent line",
+            std::future::ready(Ok(built)),
+        )
+        .await
+        .unwrap();
+        let cache2 = store.load_dm_cache(&me).unwrap();
+        assert_eq!(
+            cache2.messages.iter().filter(|m| m.from == me.npub()).count(),
+            1,
+            "re-persisting the same wrap is a no-op (dedup by wrap id)"
+        );
     }
 }
