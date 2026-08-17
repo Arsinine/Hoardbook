@@ -65,7 +65,7 @@
 			<div class="tt-card-detail">{state.message}</div>
 		{/if}
 		<div class="tt-card-actions">
-			<button type="button" class="tt-card-action" onclick={onretry}>{REDEEM_RETRY_LABEL}</button>
+			<button type="button" class="btn-default btn-sm tt-card-action" onclick={onretry}>{REDEEM_RETRY_LABEL}</button>
 		</div>
 	{/if}
 </div>
@@ -108,18 +108,8 @@
 		gap: 8px;
 	}
 
-	.tt-card-action {
-		align-self: flex-start;
-		padding: 5px 12px;
-		font-size: 11.5px;
-		font-weight: 600;
-		color: var(--fg);
-		background: var(--bg-elev1);
-		border: 1px solid var(--border);
-		border-radius: 6px;
-		cursor: pointer;
-		white-space: nowrap;
-		line-height: 1;
-	}
+	/* QURATOR-101: role now comes from .btn-default btn-sm (app.css); this local class is the test
+	   hook + the role-preserving hover nuance that differs from the contract's default. */
+	.tt-card-action { align-self: flex-start; }
 	.tt-card-action:hover { filter: brightness(1.08); }
 </style>

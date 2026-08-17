@@ -51,7 +51,7 @@
 	</div>
 	<div class="group-row">
 		<span class="group-label">Add to group:</span>
-		<select bind:value={groupName}>
+		<select class="hb-input" bind:value={groupName}>
 			<option value="">Ungrouped</option>
 			{#each groups as g (g.name)}
 				<option value={g.name}>{g.name}</option>
@@ -71,10 +71,9 @@
 	/* M20 W4: the petname input uses the global .hb-input contract (app.css). */
 	.group-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
 	.group-label { font-size: 11.5px; color: var(--fg-muted); white-space: nowrap; }
+	/* QURATOR-101 — on the .hb-input contract; flex/min-width are the only local layout overrides. */
 	.group-row select {
 		flex: 1; min-width: 100px;
-		padding: 6px 9px; background: var(--bg-elev2); color: var(--fg);
-		border: 1px solid var(--border); border-radius: 6px; font: inherit;
 	}
 	.link {
 		background: transparent; border: none; cursor: pointer; color: var(--accent);

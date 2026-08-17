@@ -241,7 +241,7 @@
 				<div class="lookup-section">
 					<div class="lookup-label">Look up a peer by ID</div>
 					<div class="search-row">
-						<div class="search-input-wrap">
+						<div class="hb-input search-input-wrap">
 							<span class="search-icon">{@html icons.search}</span>
 							<input
 								class="search-input hb-mono"
@@ -417,11 +417,11 @@
 												{#if known}
 													<!-- No live Add on a roster hit. Disabled (not removed) so the row keeps its
 													     shape; a click does nothing. Message stays actionable (M17 W1). -->
-													<button class="hit-follow" disabled title="Already in your contacts">Added ✓</button>
+													<button class="btn-primary btn-sm hit-follow" disabled title="Already in your contacts">Added ✓</button>
 												{:else}
-													<button class="hit-follow" onclick={() => followHit(hit)}>Add contact</button>
+													<button class="btn-primary btn-sm hit-follow" onclick={() => followHit(hit)}>Add contact</button>
 												{/if}
-												<button class="hit-message" onclick={() => onmessage?.(hit.npub)}>Message</button>
+												<button class="btn-default btn-sm hit-message" onclick={() => onmessage?.(hit.npub)}>Message</button>
 											</div>
 											{#if reason}
 												<!-- Why-matched badge (owner sign-off 2026-08-15) — inferred client-side from the
@@ -508,16 +508,11 @@
 
 	.search-row { display: flex; gap: 8px; margin-bottom: 16px; }
 
+	/* QURATOR-101 — on the .hb-input contract; only the icon-prefix layout (gap) is local. The
+	   inner input is transparent/borderless so the wrapper reads as one input field. */
 	.search-input-wrap {
 		flex: 1;
-		display: flex;
-		align-items: center;
 		gap: 8px;
-		padding: 0 11px;
-		height: 34px;
-		background: var(--bg-input);
-		border: 1px solid var(--border);
-		border-radius: 7px;
 	}
 
 	.search-icon { color: var(--fg-dim); display: flex; flex-shrink: 0; }
@@ -527,8 +522,6 @@
 		background: transparent;
 		border: none;
 		outline: none;
-		font-size: 13px;
-		color: var(--fg);
 		min-width: 0;
 	}
 	.search-input::placeholder { color: var(--fg-dim); }
@@ -729,18 +722,13 @@
 		background: var(--bg-elev3); color: var(--fg-muted);
 		border: 1px solid var(--border);
 	}
-	.hit-follow {
-		padding: 4px 12px; border-radius: 6px; background: var(--accent); color: var(--accent-text);
-		border: none; font-size: 11.5px; font-weight: 600; cursor: pointer; font-family: var(--font-ui); flex-shrink: 0;
-	}
-	/* QURATOR-104: the disabled "Added ✓" state on a roster hit — the app-wide disabled treatment. */
-	.hit-follow:disabled { opacity: 0.5; cursor: not-allowed; }
+	/* QURATOR-101: role now comes from .btn-primary/.btn-default btn-sm (app.css); .hit-follow stays
+	   as the test hook + layout-only override. QURATOR-104's disabled "Added ✓" state is the app-wide
+	   .btn:disabled treatment — no local rule needed. */
+	.hit-follow { flex-shrink: 0; }
 	/* M17 W1: secondary Message action — Add contact stays primary, this comes after it. */
-	.hit-message {
-		padding: 4px 12px; border-radius: 6px; background: transparent; color: var(--fg-muted);
-		border: 1px solid var(--border); font-size: 11.5px; font-weight: 600; cursor: pointer; font-family: var(--font-ui); flex-shrink: 0;
-	}
-	.hit-message:hover { background: var(--bg-elev3); color: var(--fg); }
+	.hit-message { flex-shrink: 0; }
+	.hit-message:hover { color: var(--fg); }
 	.hit-bio { font-size: 11.5px; color: var(--fg-muted); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; }
 	.hit-fp { display: flex; align-items: center; gap: 6px; font-size: 10px; color: var(--fg-dim); font-family: var(--font-mono); }
 	.hit-fp-swatch { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }

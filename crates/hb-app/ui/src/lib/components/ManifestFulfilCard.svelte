@@ -71,13 +71,13 @@
 		<div class="mf-card-actions">
 			<button
 				type="button"
-				class="btn-primary mf-card-action"
+				class="btn-primary btn-sm mf-card-action"
 				onclick={() => onsend(slug)}
 				disabled={sending}
 			>
 				{sending ? '…' : SEND_FULL_LIST_LABEL}
 			</button>
-			<button type="button" class="mf-card-action-secondary" onclick={() => onexport(slug)}>
+			<button type="button" class="btn-default btn-sm mf-card-action-secondary" onclick={() => onexport(slug)}>
 				Export manifest…
 			</button>
 		</div>
@@ -159,37 +159,16 @@
 		gap: 8px;
 	}
 
-	.mf-card-action {
-		align-self: flex-start;
-		padding: 5px 12px;
-		font-size: 11.5px;
-		font-weight: 600;
-		color: var(--accent-text);
-		background: var(--accent);
-		border: 1px solid var(--accent);
-		border-radius: 6px;
-		cursor: pointer;
-		white-space: nowrap;
-		line-height: 1;
-	}
+	/* QURATOR-101: role now comes from .btn-primary/.btn-default btn-sm (app.css); these local
+	   classes are the test hooks + the role-preserving hover/disabled nuances that differ from the
+	   contract's defaults. */
+	.mf-card-action { align-self: flex-start; }
 	.mf-card-action:hover { filter: brightness(1.05); }
 	.mf-card-action:disabled { opacity: 0.6; cursor: default; }
 
 	/* Export, demoted but present. Quieter than the primary and unmistakably still a real button —
 	   the fallback has to survive a transport failure, so it must not read as decoration. */
-	.mf-card-action-secondary {
-		align-self: flex-start;
-		padding: 5px 12px;
-		font-size: 11.5px;
-		font-weight: 600;
-		color: var(--fg);
-		background: var(--bg-elev1);
-		border: 1px solid var(--border);
-		border-radius: 6px;
-		cursor: pointer;
-		white-space: nowrap;
-		line-height: 1;
-	}
+	.mf-card-action-secondary { align-self: flex-start; }
 	.mf-card-action-secondary:hover { filter: brightness(1.08); }
 
 	.mf-card-secondary {

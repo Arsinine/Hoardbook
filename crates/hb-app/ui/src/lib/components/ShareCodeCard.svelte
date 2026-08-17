@@ -110,10 +110,10 @@
 				{/if}
 			</div>
 		{:else}
-			<button type="button" class="btn-primary share-card-action" onclick={onunlock} disabled={unlocking}>{unlocking ? 'Unlocking…' : 'Unlock browsing'}</button>
+			<button type="button" class="btn-primary btn-sm share-card-action" onclick={onunlock} disabled={unlocking}>{unlocking ? 'Unlocking…' : 'Unlock browsing'}</button>
 		{/if}
 	{:else if state === 'third'}
-		<button type="button" class="btn-primary share-card-action" onclick={() => onaddcontact(info)}>Add contact</button>
+		<button type="button" class="btn-primary btn-sm share-card-action" onclick={() => onaddcontact(info)}>Add contact</button>
 	{/if}
 </div>
 
@@ -191,19 +191,8 @@
 	}
 	.share-card-link:hover { text-decoration: underline; }
 
-	.share-card-action {
-		align-self: flex-start;
-		padding: 5px 12px;
-		font-size: 11.5px;
-		font-weight: 600;
-		color: var(--accent-text);
-		background: var(--accent);
-		border: 1px solid var(--accent);
-		border-radius: 6px;
-		cursor: pointer;
-		white-space: nowrap;
-		line-height: 1;
-	}
+	/* QURATOR-101: role now comes from .btn-primary btn-sm (app.css); this local class is the test
+	   hook + layout-only override. The :disabled rule was identical to the contract's and is dropped. */
+	.share-card-action { align-self: flex-start; }
 	.share-card-action:hover { filter: brightness(1.05); }
-	.share-card-action:disabled { opacity: 0.5; cursor: not-allowed; }
 </style>

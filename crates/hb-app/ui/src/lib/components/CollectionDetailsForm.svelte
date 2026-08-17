@@ -153,7 +153,7 @@
 
 	<div class="field">
 		<span class="field-label">Languages</span>
-		<div class="lang-wrap">
+		<div class="hb-input lang-wrap">
 			{#each languages as lang, i (lang)}
 				<span class="chip">{lang}<button type="button" class="chip-x" onclick={() => removeLang(i)} aria-label={`Remove ${lang}`}>×</button></span>
 			{/each}
@@ -173,7 +173,7 @@
 		<label class="field-label" for="cdf-notes">Notes</label>
 		<textarea
 			id="cdf-notes"
-			class="notes-input"
+			class="hb-input hb-textarea notes-input"
 			rows="3"
 			maxlength={MAX_DESCRIPTION_CHARS}
 			placeholder="Add notes about this collection (visible to peers)…"
@@ -265,19 +265,20 @@
 		border-color: color-mix(in oklch, var(--accent) 30%, transparent);
 	}
 
-	.lang-wrap, .chip {
+	.chip {
 		display: flex;
 	}
+	/* QURATOR-101 — on the .hb-input contract; height is overridden to auto (like .hb-textarea) so
+	   the box can grow as chips wrap. :focus-within stands in for :focus since DOM focus lands on
+	   the nested .lang-input, not this wrapper (mirrors CollectionTagsEditor's .tag-wrap). */
 	.lang-wrap {
 		flex-wrap: wrap;
 		gap: 5px;
+		height: auto;
 		min-height: 34px;
 		padding: 5px 8px;
-		background: var(--bg-input);
-		border: 1px solid var(--border);
-		border-radius: 7px;
-		align-items: center;
 	}
+	.lang-wrap:focus-within { border-color: var(--accent); }
 	.chip {
 		align-items: center;
 		gap: 3px;
@@ -300,23 +301,12 @@
 		background: transparent;
 		border: none;
 		outline: none;
-		font-family: var(--font-ui);
-		font-size: 13px;
-		color: var(--fg);
 		padding: 0;
 	}
 	.lang-input::placeholder { color: var(--fg-dim); }
 
-	.notes-input {
-		background: var(--bg-input);
-		border: 1px solid var(--border);
-		border-radius: 7px;
-		padding: 9px 11px;
-		font-family: var(--font-ui);
-		font-size: 12.5px;
-		color: var(--fg);
-		resize: vertical;
-	}
+	/* QURATOR-101 — on the .hb-input/.hb-textarea contract; resize is the only local override. */
+	.notes-input { resize: vertical; }
 	.notes-input::placeholder { color: var(--fg-dim); }
 
 	.char-count {

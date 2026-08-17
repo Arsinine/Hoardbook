@@ -44,7 +44,7 @@
 
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="tag-wrap" onclick={(e) => { if (e.target === e.currentTarget) e.currentTarget.querySelector('input')?.focus(); }}>
+<div class="hb-input tag-wrap" onclick={(e) => { if (e.target === e.currentTarget) e.currentTarget.querySelector('input')?.focus(); }}>
 	{#each tags as tag, i (tag)}
 		<span class="chip">
 			{tag}
@@ -63,18 +63,16 @@
 </div>
 
 <style>
+	/* QURATOR-101 — on the .hb-input contract; height is overridden to auto (like .hb-textarea) so
+	   the box can grow as chips wrap. :focus-within stands in for :focus since DOM focus lands on
+	   the nested .tag-input, not this wrapper. */
 	.tag-wrap {
-		display: flex;
 		flex-wrap: wrap;
 		gap: 5px;
+		height: auto;
 		min-height: 34px;
 		padding: 5px 8px;
-		background: var(--bg-input);
-		border: 1px solid var(--border);
-		border-radius: 7px;
-		align-items: center;
 		cursor: text;
-		transition: border-color 0.1s;
 	}
 	.tag-wrap:focus-within { border-color: var(--accent); }
 
@@ -110,9 +108,6 @@
 		background: transparent;
 		border: none;
 		outline: none;
-		font-family: var(--font-ui);
-		font-size: 13px;
-		color: var(--fg);
 		padding: 0;
 	}
 	.tag-input::placeholder { color: var(--fg-dim); }
