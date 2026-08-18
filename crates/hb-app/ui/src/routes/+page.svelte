@@ -665,7 +665,9 @@
 	{/if}
 {:else}
 	<!-- TopBar -->
-	<div class="topbar">
+	<!-- QURATOR-81: data-tauri-drag-region matches Contacts/Topics/Settings — Home was the one
+	     .topbar missing it. Does not inherit to children, so the Save/Publish buttons stay clickable. -->
+	<div class="topbar" data-tauri-drag-region>
 		<div>
 			<div class="topbar-title">My Profile</div>
 			<div class="topbar-sub">
