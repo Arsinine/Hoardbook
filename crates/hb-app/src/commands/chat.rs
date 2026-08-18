@@ -209,6 +209,21 @@ pub(crate) async fn decode_dms(
 static DM_CACHE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ---------------------------------------------------------------------------
+// DM_REQUESTS_LOCK — serializes every load→mutate→save transaction against `dm_requests.json`
+// (the Request-inbox bucket file), the sibling of DM_CACHE_LOCK above and hit by the same race:
+// `dm_request_accept_inner`, `dm_request_decline_inner`, `dm_block_inner`, and the inbox poll's
+// merge in `get_messages` each load the full bucket list, mutate their one bucket, and save the
+// whole list back. Proven live by the `dm_cache_lock_survives_concurrent_persist_and_accept_hammering`
+// hammer test: DM_CACHE_LOCK only ever covered `dm_cache.json`, so 25 concurrent accepts raced
+// unguarded on this file and last-write-wins stranded buckets that should have drained.
+//
+// `std::sync::Mutex`, not `tokio` — none of the four guarded spans hold the lock across an
+// `.await` (decline/block are plain sync fns; accept's bucket span completes before its own
+// `DM_CACHE_LOCK` section starts), so a std mutex is correct and matches the house pattern used
+// for the same shape of race in `store.rs` (`READ_STATE_LOCK`, `ANNOUNCE_SEEN_LOCK`).
+static DM_REQUESTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// ---------------------------------------------------------------------------
 // Q7 — the total DM classifier (M13 Part B): inbox vs quarantined Request vs dropped
 // ---------------------------------------------------------------------------
 
@@ -460,28 +475,35 @@ pub(crate) async fn dm_request_accept_inner(
     };
     store.save_contact(&hash, &peer).map_err(cmd_err)?;
 
-    let mut buckets = store.load_dm_requests().map_err(cmd_err)?;
-    let (drained, cache_adds) = match buckets.iter().position(|b| b.npub == npub) {
-        Some(i) => {
-            let bucket = buckets.remove(i);
-            let drained: Vec<ReceivedMessage> =
-                bucket.messages.iter().map(|m| request_message_to_received(&npub, own_npub, m)).collect();
-            let cache_adds: Vec<CachedDm> = bucket
-                .messages
-                .iter()
-                .map(|m| CachedDm {
-                    wrap_id: m.wrap_id.clone(),
-                    from: npub.clone(),
-                    to: own_npub.to_string(),
-                    content: m.content.clone(),
-                    sent_at: m.sent_at.clone(),
-                })
-                .collect();
-            (drained, cache_adds)
-        }
-        None => (Vec::new(), Vec::new()),
+    // DM_REQUESTS_LOCK: this load→mutate→save transaction against `dm_requests.json` must serialize
+    // against the other three sites touching the same file (see the lock's doc above), or a
+    // concurrent accept/decline/block/inbox-merge can last-write-wins away this bucket's removal.
+    let (drained, cache_adds) = {
+        let _guard = DM_REQUESTS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut buckets = store.load_dm_requests().map_err(cmd_err)?;
+        let (drained, cache_adds) = match buckets.iter().position(|b| b.npub == npub) {
+            Some(i) => {
+                let bucket = buckets.remove(i);
+                let drained: Vec<ReceivedMessage> =
+                    bucket.messages.iter().map(|m| request_message_to_received(&npub, own_npub, m)).collect();
+                let cache_adds: Vec<CachedDm> = bucket
+                    .messages
+                    .iter()
+                    .map(|m| CachedDm {
+                        wrap_id: m.wrap_id.clone(),
+                        from: npub.clone(),
+                        to: own_npub.to_string(),
+                        content: m.content.clone(),
+                        sent_at: m.sent_at.clone(),
+                    })
+                    .collect();
+                (drained, cache_adds)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        store.save_dm_requests(&buckets).map_err(cmd_err)?;
+        (drained, cache_adds)
     };
-    store.save_dm_requests(&buckets).map_err(cmd_err)?;
 
     let declined: Vec<(String, u64)> =
         store.load_dm_declined().map_err(cmd_err)?.into_iter().filter(|(n, _)| n != &npub).collect();
@@ -508,9 +530,14 @@ pub(crate) async fn dm_request_accept_inner(
 /// "seen up to T" can't tell "already declined" apart from "arrived after I declined" — remembering
 /// the decline outright is the only reading of the ruling that stays stable across restarts/re-polls.
 pub(crate) fn dm_request_decline_inner(store: &DataStore, npub: String, now: u64) -> Result<(), String> {
-    let mut buckets = store.load_dm_requests().map_err(cmd_err)?;
-    buckets.retain(|b| b.npub != npub);
-    store.save_dm_requests(&buckets).map_err(cmd_err)?;
+    {
+        // DM_REQUESTS_LOCK: see the lock's doc — serializes against accept/block/inbox-merge on the
+        // same `dm_requests.json`.
+        let _guard = DM_REQUESTS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut buckets = store.load_dm_requests().map_err(cmd_err)?;
+        buckets.retain(|b| b.npub != npub);
+        store.save_dm_requests(&buckets).map_err(cmd_err)?;
+    }
 
     let declined = store.load_dm_declined().map_err(cmd_err)?;
     store.save_dm_declined(&record_declined(declined, npub, now)).map_err(cmd_err)
@@ -588,9 +615,14 @@ pub(crate) async fn persist_sent_dm(
 /// Add `npub` to the local blocklist (spec §Blocked keys — the canonical local blocklist, named for
 /// future Settings reuse). Deletes any Request bucket and any decline record — blocked supersedes both.
 pub(crate) fn dm_block_inner(store: &DataStore, npub: String) -> Result<(), String> {
-    let mut buckets = store.load_dm_requests().map_err(cmd_err)?;
-    buckets.retain(|b| b.npub != npub);
-    store.save_dm_requests(&buckets).map_err(cmd_err)?;
+    {
+        // DM_REQUESTS_LOCK: see the lock's doc — serializes against accept/decline/inbox-merge on the
+        // same `dm_requests.json`.
+        let _guard = DM_REQUESTS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut buckets = store.load_dm_requests().map_err(cmd_err)?;
+        buckets.retain(|b| b.npub != npub);
+        store.save_dm_requests(&buckets).map_err(cmd_err)?;
+    }
 
     let declined: Vec<(String, u64)> =
         store.load_dm_declined().map_err(cmd_err)?.into_iter().filter(|(n, _)| n != &npub).collect();
@@ -850,9 +882,12 @@ pub async fn get_messages(
     if healed || merged || pruned {
         store.save_dm_cache(&id_clone, &cache).map_err(cmd_err)?;
     }
-    drop(guard); // release before the (separate-file, unlocked) Request-bucket write below
+    drop(guard); // release before the separate-file Request-bucket write below (its own DM_REQUESTS_LOCK)
 
     if !requests.is_empty() {
+        // DM_REQUESTS_LOCK: see the lock's doc — serializes against accept/decline/block on the same
+        // `dm_requests.json`.
+        let _guard = DM_REQUESTS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let existing = store.load_dm_requests().map_err(cmd_err)?;
         let merged = merge_into_requests(existing, requests, now_secs());
         store.save_dm_requests(&merged).map_err(cmd_err)?;
