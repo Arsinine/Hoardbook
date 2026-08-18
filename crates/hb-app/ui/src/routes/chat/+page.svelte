@@ -1097,7 +1097,7 @@
 			{#if selectedTopic}
 				<!-- Topic channel: a persistent entry (your durable membership, §11) whose posts are
 				     24h-ephemeral (server NIP-40 + the local filter in topic_channel). -->
-				<div class="pane-header">
+				<div class="pane-header" data-tauri-drag-region>
 					<div class="channel-hash channel-hash-lg">#</div>
 					<div class="pane-peer-info">
 						<div class="pane-peer-row">
@@ -1165,7 +1165,7 @@
 			{:else if viewingRequests}
 				{#if !selectedRequest}
 					<!-- Requests list: sorted newest-activity-first (Q7 — never merged into the main list). -->
-					<div class="pane-header">
+					<div class="pane-header" data-tauri-drag-region>
 						<div class="channel-hash channel-hash-lg">🔔</div>
 						<div class="pane-peer-info">
 							<div class="pane-peer-row"><span class="pane-peer-name">Message requests</span></div>
@@ -1212,7 +1212,7 @@
 					{@const reqName = senderName(req.npub)}
 					{@const isRequestContact = $contacts.some((c) => c.npub === req.npub)}
 					<!-- Opened request: read-only messages + Accept/Decline/Block (no reply until accepted). -->
-					<div class="pane-header">
+					<div class="pane-header" data-tauri-drag-region>
 						<Avatar letter={reqName[0]?.toUpperCase() ?? '?'} size={36} hue={avatarHue(reqName[0] ?? '?')} />
 						<div class="pane-peer-info">
 							<div class="pane-peer-row"><span class="pane-peer-name">{reqName}</span></div>
@@ -1304,7 +1304,7 @@
 				</div>
 			{:else}
 				<!-- Header -->
-				<div class="pane-header">
+				<div class="pane-header" data-tauri-drag-region>
 					<Avatar
 						letter={(selectedPeer.profile?.display_name || selectedPeer.npub)[0].toUpperCase()}
 						size={36}
@@ -1707,8 +1707,14 @@
 
 	.privacy-note { font-size: 12px; color: var(--fg-dim); text-align: center; max-width: 320px; }
 
+	/* QURATOR-81: pane-header is Chat's only unconditional right-pane header (topic channel,
+	   requests list, opened request, and the selected-peer conversation all use it) and sits under
+	   the window controls, same as every route topbar — reserve the same 120px so trailing content
+	   (e.g. "View profile") never renders under them. data-tauri-drag-region on the div gives it a
+	   drag surface too; it does not inherit to the buttons inside. */
 	.pane-header {
 		padding: 12px 18px;
+		padding-right: 120px;
 		border-bottom: 1px solid var(--border);
 		display: flex;
 		gap: 12px;

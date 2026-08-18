@@ -842,7 +842,11 @@
 <div class="browse-shell">
 	<!-- Left: contact list -->
 	<div class="left-panel">
-		<div class="panel-top">
+		<!-- QURATOR-81: Browse has no unconditional right-panel header (its content is
+		     peer-selection-dependent), so panel-top is the one always-present bar that can carry a
+		     drag region. Left panel, clear of the window controls in the top-right — no padding
+		     reservation needed. -->
+		<div class="panel-top" data-tauri-drag-region>
 			<span class="panel-title">People</span>
 		</div>
 		<div class="hb-input search-wrap">
