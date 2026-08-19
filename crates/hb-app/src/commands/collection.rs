@@ -23,6 +23,12 @@ use crate::{
 /// assertion meaningless.
 pub(crate) const LISTING_MAX_BYTES: usize = 40_000;
 
+/// Split budget for the `.hbmanifest` / iroh manifest path, decoupled from [`LISTING_MAX_BYTES`].
+/// Nothing here publishes per-part to a relay — one signed envelope carries every part inline as a
+/// single framed iroh stream or one `.hbmanifest` file — so the anti-ban budget is irrelevant and
+/// the real ceiling is NIP-44's 65_408-byte plaintext cap (the value `hb-net`'s split tests pin).
+pub(crate) const MANIFEST_SPLIT_MAX_BYTES: usize = 65_408;
+
 /// The result of publishing a Public collection (devtest #7) — whether it was truncated to a paywall
 /// teaser, and how many item nodes browsers can see vs how many the full collection holds. The
 /// frontend uses this to tell the user their large collection is showing a preview.
@@ -749,7 +755,7 @@ pub(crate) fn build_slug_manifest(
     // `.hbmanifest` can hold a collection of ANY size (the envelope stores the encrypted parts inline,
     // bounded by part count, not by one event's plaintext cap). A listing that fits one event yields a
     // single part (the small-collection case, unchanged).
-    let parts: Vec<String> = split_listing(safe_slug, &plaintext, LISTING_MAX_BYTES)
+    let parts: Vec<String> = split_listing(safe_slug, &plaintext, MANIFEST_SPLIT_MAX_BYTES)
         .map_err(cmd_err)?
         .into_iter()
         .map(|part| part.json)
@@ -2049,6 +2055,62 @@ mod tests {
         };
         store.save_collection_draft(&col).unwrap();
         let env = build_slug_manifest("huge", &store, &identity, &[7u8; 32]).unwrap();
+        assert!(env.ciphertexts.len() > 1, "a large listing chunks into multiple parts");
+    }
+
+    #[test]
+    fn build_slug_manifest_accepts_an_index_over_40k_but_under_the_nip44_cap() {
+        // The manifest/iroh carrier publishes nothing per-part to a relay, so its split budget is
+        // NIP-44's 65_408-byte plaintext cap, not the 40_000-byte relay anti-ban budget. This pins
+        // the fix: a collection whose listing INDEX (metadata + one `sha256`/`part_d` row per part)
+        // lands between 40,001 and 65,408 bytes must still export — under the old 40 KB budget it
+        // hard-errored in `split_listing`'s `index_json.len() > max_bytes` check.
+        //
+        // The long slug inflates each index descriptor row (`slug#part{i}` + the sha256) to ~250 B
+        // vs ~100 B for a short slug, so the 40 KB+ index is reachable with ~200 parts instead of
+        // ~500 — far less data to split and hash. A ~4 KB note per leaf keeps the entry count low.
+        let slug = "a".repeat(160);
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let identity = Identity::generate();
+        let note = "x".repeat(4000);
+        let listing: Vec<DirectoryItem> = (0..3000)
+            .map(|i| DirectoryItem {
+                name: format!("file-{i:05}.mkv"),
+                item_type: ItemType::File,
+                size: Some("12GB".into()),
+                format: Some("MKV".into()),
+                year: Some(1985),
+                tags: vec![],
+                note: Some(note.clone()),
+                children: vec![],
+            })
+            .collect();
+        let col = Collection {
+            slug: slug.clone(),
+            path_alias: "huge".into(),
+            description: None,
+            item_count: listing.len() as u64,
+            est_size: None,
+            content_types: vec!["video".into()],
+            tags: vec![],
+            languages: vec![],
+            visibility: Visibility::Public,
+            sorted: false,
+            last_updated: chrono::Utc::now(),
+            listing,
+        };
+        store.save_collection_draft(&col).unwrap();
+        let env = build_slug_manifest(&slug, &store, &identity, &[7u8; 32]).unwrap();
+        // The index is the first decrypted part. Pin its size directly so this test can't silently
+        // drift out of the window it exists to prove (an index that fit 40 KB would green even
+        // against the old budget).
+        let parts = env.open(&[7u8; 32], &identity.public_key()).unwrap();
+        let index_len = parts[0].len();
+        assert!(
+            index_len > LISTING_MAX_BYTES && index_len <= MANIFEST_SPLIT_MAX_BYTES,
+            "index is {index_len} bytes, expected in ({LISTING_MAX_BYTES}, {MANIFEST_SPLIT_MAX_BYTES}]"
+        );
         assert!(env.ciphertexts.len() > 1, "a large listing chunks into multiple parts");
     }
 
