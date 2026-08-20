@@ -29,6 +29,24 @@ pub(crate) const LISTING_MAX_BYTES: usize = 40_000;
 /// the real ceiling is NIP-44's 65_408-byte plaintext cap (the value `hb-net`'s split tests pin).
 pub(crate) const MANIFEST_SPLIT_MAX_BYTES: usize = 65_408;
 
+/// Hard cap on items (files + folders, [`count_items`]'s definition) per collection — owner
+/// ruling 2026-08-19, paired with raising [`hb_core::MANIFEST_MAX_TRANSPORT_BYTES`] to 16 MiB.
+/// Enforced in [`scan_selective`], the single chokepoint every scan caller (the add/rescan
+/// command, the WAN-IT harness's `--seed-dir`) goes through, so nothing can bypass it by calling
+/// a different entry point.
+///
+/// This guards a DIFFERENT failure shape than the byte ceiling does. The byte ceiling bounds
+/// large-content-per-file (a media library with big per-entry metadata); this bounds
+/// many-tiny-files (a software/game library, where file count tracks disk contents rather than
+/// anything a person browses one entry at a time — see `MANIFEST_MAX_TRANSPORT_BYTES`'s doc
+/// comment for the full reasoning). The two decouple exactly for that shape: a collection can
+/// blow past one cap while sitting comfortably under the other, so both are needed.
+///
+/// Reject, not truncate — the byte ceiling's philosophy applies here too: an honest refusal at
+/// scan/add time (before the user invests effort organizing an unshareable collection) beats a
+/// silent partial listing.
+pub(crate) const MAX_COLLECTION_ITEMS: u64 = 100_000;
+
 /// The result of publishing a Public collection (devtest #7) — whether it was truncated to a paywall
 /// teaser, and how many item nodes browsers can see vs how many the full collection holds. The
 /// frontend uses this to tell the user their large collection is showing a preview.
@@ -1132,7 +1150,23 @@ pub(crate) fn scan_selective(
     for c in &include.checked {
         contained_under_root(root, c).map_err(|e| anyhow::anyhow!(e))?;
     }
-    scan_selective_walk(root, include, exclude, "")
+    let (items, total_bytes) = scan_selective_walk(root, include, exclude, "")?;
+    // MAX_COLLECTION_ITEMS: enforced once, here, on the final assembled tree — the single
+    // chokepoint every scan caller goes through, so no entry point can bypass it.
+    enforce_item_cap(count_items(&items)).map_err(|e| anyhow::anyhow!(e))?;
+    Ok((items, total_bytes))
+}
+
+/// Pure predicate behind the [`MAX_COLLECTION_ITEMS`] guard — no filesystem, so it's testable
+/// without materializing 100,000+ real files. `scan_selective` is the only caller.
+fn enforce_item_cap(item_count: u64) -> Result<(), String> {
+    if item_count > MAX_COLLECTION_ITEMS {
+        return Err(format!(
+            "this collection has {item_count} items, over the {MAX_COLLECTION_ITEMS}-item cap \
+             per collection. Split it into smaller collections, or narrow the selection."
+        ));
+    }
+    Ok(())
 }
 
 fn scan_selective_walk(
@@ -2118,6 +2152,20 @@ mod tests {
     // The routing decision is a pure function; the actual big-relay wire (family → big relay only,
     // no leak to public) is proven by hb-it Suite BIG1/BIG2 against a live strfry, same split as the
     // publish-path tests above.
+
+    #[test]
+    fn enforce_item_cap_is_inclusive_at_exactly_the_ceiling() {
+        // Mirrors transport_payload.rs's the_boundary_is_inclusive_at_exactly_the_ceiling — the
+        // cliff is documented, so an off-by-one here is a real regression, not a rounding nit.
+        assert!(
+            enforce_item_cap(MAX_COLLECTION_ITEMS).is_ok(),
+            "exactly the cap must be accepted"
+        );
+        let err = enforce_item_cap(MAX_COLLECTION_ITEMS + 1)
+            .expect_err("one item over the cap must be refused");
+        assert!(err.contains(&(MAX_COLLECTION_ITEMS + 1).to_string()), "error names the count");
+        assert!(err.contains(&MAX_COLLECTION_ITEMS.to_string()), "error names the cap");
+    }
 
     #[test]
     fn big_relay_target_routes_only_truncated_with_a_configured_relay() {
