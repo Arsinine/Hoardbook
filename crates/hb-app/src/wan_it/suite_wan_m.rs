@@ -38,7 +38,7 @@ use nostr::prelude::ToBech32;
 use crate::commands::browse::accept_manifest_bytes;
 use crate::identity_state::{AppIdentity, SharedIdentity};
 use crate::store::DataStore;
-use crate::transport::fetch_manifest;
+use crate::transport::{fetch_manifest, parse_node_addr};
 use crate::transport_state::{ensure_endpoint, new_shared_endpoint, Role};
 use crate::wan_it::tap::Tap;
 
@@ -206,6 +206,9 @@ async fn m1_live_redeem(probe: &ProbeInput) -> Result<(), String> {
         // Clone the endpoint per attempt — iroh::Endpoint is cheap to clone (an Arc internally), and
         // fetch_manifest borrows it by ref. A fresh clone per retry keeps the move semantics clean.
         let endpoint = endpoint.clone();
+        // A second clone, kept OUTSIDE the async move block below, so it survives past the await for
+        // the post-success connection-type diagnostic (the first clone is consumed by fetch_manifest).
+        let diag_endpoint = endpoint.clone();
         let result = tokio::time::timeout(LIVE_REDEEM_TIMEOUT, async move {
             // THE production redeem path: fetch_manifest runs the gate INSIDE (before the ACK), so a
             // manifest we reject does not burn the ticket. The closure is accept_manifest_bytes —
@@ -234,6 +237,7 @@ async fn m1_live_redeem(probe: &ProbeInput) -> Result<(), String> {
         match result {
             Ok(Ok(_payload)) => {
                 eprintln!("   M1-live redeem succeeded on attempt {attempt}");
+                log_redeem_connection_type(&diag_endpoint, &probe.live_ticket.node_addr).await;
                 // Spend the ask now that the redemption landed — the production command
                 // (redeem_manifest_ticket) does this after fetch_manifest returns Ok, so the harness
                 // mirrors it. Conditional on the nonce; a no-op if already spent.
@@ -260,6 +264,40 @@ async fn m1_live_redeem(probe: &ProbeInput) -> Result<(), String> {
         }
     }
     Err(last_err)
+}
+
+/// QURATOR-45/74: log whether the just-completed redeem actually hole-punched (a direct IP path is
+/// active) or fell back to iroh's relay — a successful `fetch_manifest` proves the pipeline works
+/// either way, but the two say very different things about hole-punch success rate. Diagnostic only
+/// (eprintln!, not a TAP assertion): a relay fallback is a legitimate, expected iroh behaviour, not a
+/// row failure — the whole point of `presets::N0`'s relay fallback is that the pipeline still works
+/// when hole-punching doesn't. Best-effort: `remote_info` can return `None`/no active addr in the
+/// narrow window right after a stream closes, which is not itself evidence of anything.
+async fn log_redeem_connection_type(endpoint: &iroh::Endpoint, ticket_node_addr: &str) {
+    let Ok(peer_addr) = parse_node_addr(ticket_node_addr) else {
+        eprintln!("   M1-live connection type: could not re-parse the ticket's node_addr to check");
+        return;
+    };
+    match endpoint.remote_info(peer_addr.id).await {
+        Some(info) => {
+            let active: Vec<_> = info
+                .addrs()
+                .filter(|a| matches!(a.usage(), iroh::endpoint::TransportAddrUsage::Active))
+                .collect();
+            if active.is_empty() {
+                eprintln!("   M1-live connection type: no active address recorded (inconclusive)");
+            } else {
+                let direct = active.iter().any(|a| !a.addr().is_relay());
+                let relay = active.iter().any(|a| a.addr().is_relay());
+                eprintln!(
+                    "   M1-live connection type: direct_path={direct} relay_path={relay} ({} active address(es)) \
+                     — direct=true means at least one non-relay path is active (hole-punch, not just relay fallback)",
+                    active.len()
+                );
+            }
+        }
+        None => eprintln!("   M1-live connection type: remote_info returned None (inconclusive)"),
+    }
 }
 
 /// The exactly-once assertion: a second redemption of the same ticket is refused. The refusal is

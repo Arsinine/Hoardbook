@@ -676,7 +676,7 @@ pub fn ticket_node_addr(endpoint: &iroh::Endpoint) -> Result<String> {
     serde_json::to_string(&addr).context("serialize the local endpoint address for a ticket")
 }
 
-fn parse_node_addr(raw: &str) -> Result<iroh::EndpointAddr> {
+pub(crate) fn parse_node_addr(raw: &str) -> Result<iroh::EndpointAddr> {
     serde_json::from_str(raw).context("the ticket's node address is not a dialable endpoint address")
 }
 

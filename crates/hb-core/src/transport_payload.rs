@@ -33,29 +33,45 @@
 use crate::error::HbError;
 use crate::manifest::ManifestEnvelope;
 
-/// **The transport ceiling — 8 MiB, fixed.** Frozen at launch (`wire_freeze`): a peer that refuses
-/// at 8 MiB and one that refuses at 16 would disagree about what is deliverable, so this is a
-/// fixed-now-or-never value and is pinned as a wire constant.
+/// **The transport ceiling — 16 MiB, fixed.** Frozen at launch (`wire_freeze`): a peer that
+/// refuses at 16 MiB and one that refuses at some other number would disagree about what is
+/// deliverable, so this is a fixed-now-or-never value and is pinned as a wire constant. Raised
+/// from the original 8 MiB (owner ruling 2026-07-30) to 16 MiB (owner ruling 2026-08-19) —
+/// **the cost of raising it is real, not free**: a peer still on the old build refuses (with an
+/// honest `PayloadTooLarge`, never a crash or corruption) a >8 MiB manifest an upgraded peer
+/// sends, until it upgrades too.
 ///
-/// **Derived, not picked** (owner ruling 2026-07-30). The ceiling is itself a size cap, so the
-/// launch objection that motivated M18 applies to it recursively: set it too low and the day-1
-/// embarrassment simply relocates one layer down. At ~70 bytes of entry JSON and NIP-44's measured
-/// **~1.56× bucket-padded** expansion (never extrapolate linearly), 10k files ≈ 1 MB and 100k ≈
-/// 11 MB. The owner's stated reasonable band is 1–5 MB, because the binding constraint is **human
-/// attention, not disk** — "at 10,000 files we are already reaching the human limit of what is
-/// considered browseable". That is why this needs no version negotiation: bandwidth gets cheaper,
-/// but nobody's ability to scan 100,000 filenames improves, so a ceiling pinned to a human limit is
-/// stable.
+/// **Derived, not picked.** The ceiling is itself a size cap, so the launch objection that
+/// motivated M18 applies to it recursively: set it too low and the day-1 embarrassment simply
+/// relocates one layer down. The original estimate (~70 bytes of entry JSON, NIP-44's measured
+/// ~1.56× bucket-padded expansion) put 100k files at ≈11 MB — **measured reality runs denser**:
+/// a real 108,045-file collection (a game library, `C:\Games`, 2026-08-19) sealed to
+/// **17,629,824 bytes** ciphertext, ≈16.3 MB scaled to exactly 100,000 files. Never extrapolate
+/// the padding factor linearly, and don't trust the back-of-envelope estimate over a measurement.
 ///
-/// 8 MiB sits above that band with headroom for deep nesting and long filenames (~75k files) and
-/// unambiguously below "file transfer". `MAX_LISTING_PARTS = 4096` would permit ~160 MB, and a
-/// ceiling near *that* would make this mechanism decoration rather than enforcement — 100 MB on the
-/// wire is indistinguishable from moving files.
+/// **The 2026-07-30 "human browseability" premise doesn't hold for every content type.** It's
+/// right for a media library (a person scans filenames to decide what to watch/read/hear) but
+/// wrong for software: a game install's files aren't independently meaningful browsable units —
+/// the collection *as a whole* is proof-by-stake (proof the software is real and complete, not
+/// an empty folder), never something scanned file-by-file. File count for this category tracks
+/// disk contents, not human attention, so the original band (1–5 MB, ~10k files) undersized
+/// exactly the content type most likely to be legitimately large. hb-app (a downstream crate,
+/// not reachable from here) pairs this raise with a companion **100,000-item cap per
+/// collection** (`MAX_COLLECTION_ITEMS`, enforced at scan time in `commands/collection.rs`) — a
+/// file-COUNT guard against a different failure shape (many-tiny-files: pathological scan/UI/
+/// part-count cost) than this byte ceiling guards against (large-content-per-file); the two
+/// decouple exactly for a game library's shape (many small files) and are meant to be read
+/// together.
 ///
-/// **The cliff is principled, not a capacity failure:** past the browseable limit the full tree is
-/// not the useful artifact anyway (search is), so declining to carry it is the honest answer.
+/// `MAX_LISTING_PARTS = 4096` would permit ~268 MB at the 65,408-byte-per-part split budget, and
+/// a ceiling that close to it would make this mechanism decoration rather than enforcement — a
+/// wire payload indistinguishable in scale from moving files defeats the point of INV-4′ even if
+/// every test asserting it stays green.
+///
+/// **The cliff is principled, not a capacity failure:** past the browseable limit the full tree
+/// is not the useful artifact anyway (search is), so declining to carry it is the honest answer.
 /// Above the ceiling the route is export — say so, in the error and in the UI.
-pub const MANIFEST_MAX_TRANSPORT_BYTES: usize = 8 * 1024 * 1024;
+pub const MANIFEST_MAX_TRANSPORT_BYTES: usize = 16 * 1024 * 1024;
 
 /// **Companion cap to the byte ceiling: the most parts an inbound envelope may declare.**
 ///
