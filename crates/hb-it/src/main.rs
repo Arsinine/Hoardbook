@@ -41,6 +41,19 @@ mod tap;
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let ctx = parse_args(&args)?;
+
+    // QURATOR-127: hb-net's browse lock tracing must actually be emitted — with no subscriber,
+    // every `tracing::warn!` is a no-op and a PUB4 failure is five indistinguishable modes of
+    // silence. Stderr (keeps stdout a clean TAP stream), `info` floor so the warn always lands,
+    // `HB_IT_LOG` overridable via EnvFilter's standard precedence.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("HB_IT_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+
     eprintln!(
         "hb-it L2 — relays: {:?}  multi-relay: {}  pow: {}",
         ctx.relays,

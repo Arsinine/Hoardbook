@@ -9,9 +9,10 @@
 //! author-scoped and need no run-id; cross-author discovery tags are namespaced via `ctx.tag()`.
 
 use anyhow::{ensure, Result};
-use hb_core::event::{build_listing_event, build_teaser, Teaser};
+use hb_core::event::{build_listing_event, build_teaser, Teaser, KIND_LISTING};
 use hb_core::{Identity, ShareCode};
 use hb_net::{browse_share_code, build_relay_list, publish_listing, search_teasers, split_listing};
+use nostr::prelude::*;
 use serde_json::Value;
 
 use crate::harness::{result, settle, Ctx, FETCH_TIMEOUT};
@@ -173,9 +174,27 @@ async fn pub4(ctx: &Ctx) -> Result<()> {
     settle().await;
 
     let res = browse_share_code(&client, &full_code(&id, key), slug, &ctx.relays, &ctx.relays, FETCH_TIMEOUT).await?;
+    // Keep `client` connected until the diagnostic path has had its count — the failure leg
+    // needs one more fetch (QURATOR-127), and `disconnect` consumes the client.
+    //
+    // Gate 2, attributed (QURATOR-127): name the inner error browse.rs captured instead of the
+    // bare "did not browse", and add the N4-style part count so a withheld/unserved part is
+    // distinguishable from a fetch that errored outright.
+    let listing = match res.listing {
+        Some(l) => l,
+        None => {
+            let reason = res.listing_error.as_deref().unwrap_or("no browse-key held");
+            let fetched = fetched_parts(&client, &id, slug).await;
+            client.disconnect().await;
+            anyhow::bail!(
+                "deep split listing did not browse — {reason} (fetched {fetched} parts, published {})",
+                published.parts
+            );
+        }
+    };
+    // Disconnect BEFORE the remaining gates, as this suite did before QURATOR-127: an `ensure!`
+    // returns early, so a gate-3/4/5 failure would otherwise leave the client connected.
     client.disconnect().await;
-
-    let listing = res.listing.ok_or_else(|| anyhow::anyhow!("deep split listing did not browse"))?;
     ensure!(listing.complete(), "all parts present → complete tree");
     ensure!(listing.entries.len() == 1, "one root folder expected, got {}", listing.entries.len());
     let leaves = leaf_count(&listing.entries[0]);
@@ -190,6 +209,31 @@ fn leaf_count(node: &Value) -> usize {
         Some(kids) if !kids.is_empty() => kids.iter().map(leaf_count).sum(),
         _ => 1,
     }
+}
+
+/// The N4-style diagnostic count for a locked deep family (QURATOR-127): how many listing events
+/// for this slug the relay actually serves right now — index + content parts, the same
+/// author+kind scope N4 counts over, with the slug's d-tags (`slug`, `slug#partN`) picked out of
+/// what comes back. Only reached on the failure path, where `client` is still connected.
+async fn fetched_parts(client: &hb_net::RelayClient, id: &Identity, slug: &str) -> usize {
+    let events = client
+        .fetch(
+            Filter::new()
+                .author(id.public_key())
+                .kind(Kind::from_u16(KIND_LISTING)),
+            FETCH_TIMEOUT,
+        )
+        .await
+        .unwrap_or_default();
+    events
+        .iter()
+        .filter(|e| {
+            e.tags
+                .iter()
+                .any(|t| t.kind() == nostr::TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::D))
+                    && t.content().is_some_and(|d| d == slug || d.starts_with(&format!("{slug}#part"))))
+        })
+        .count()
 }
 
 async fn br1(ctx: &Ctx) -> Result<()> {
@@ -208,6 +252,16 @@ async fn br1(ctx: &Ctx) -> Result<()> {
 
     ensure!(res.teaser.is_some(), "the public teaser must remain visible to a non-holder");
     ensure!(res.listing.is_none(), "a wrong browse-key must not decrypt the listing");
+    // QURATOR-127: the lock must be ATTRIBUTED end-to-end — the same wrong-key browse that pins
+    // BR1 leniency also pins that the reason reached the caller (the old `.ok()` discarded it,
+    // which is exactly why PUB4's five failure modes were indistinguishable). A decrypt failure
+    // must not read as "no listing found".
+    let reason = res.listing_error.as_deref().unwrap_or("");
+    ensure!(!reason.is_empty(), "a locked listing must carry its reason, not a bare None");
+    ensure!(
+        !reason.contains("no listing found"),
+        "a wrong-key decrypt failure must be distinguishable from an absent family, got: {reason}"
+    );
     Ok(())
 }
 
