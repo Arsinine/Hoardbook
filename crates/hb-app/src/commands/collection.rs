@@ -1228,7 +1228,7 @@ pub(crate) fn scan_selective(
     for c in &include.checked {
         contained_under_root(root, c).map_err(|e| anyhow::anyhow!(e))?;
     }
-    let (items, total_bytes) = scan_selective_walk(root, include, exclude, "", 0)?;
+    let (items, total_bytes) = scan_selective_walk(root, include, exclude)?;
     // MAX_COLLECTION_ITEMS: enforced once, here, on the final assembled tree — the single
     // chokepoint every scan caller goes through, so no entry point can bypass it.
     enforce_item_cap(count_items(&items)).map_err(|e| anyhow::anyhow!(e))?;
@@ -1249,92 +1249,171 @@ fn enforce_item_cap(item_count: u64) -> Result<(), String> {
 
 /// Maximum directory depth [`scan_selective_walk`] descends (the root is level 0). A directory at
 /// level [`MAX_SCAN_DEPTH`] that still has a subdirectory is rejected with an `Err` — loud, not
-/// silent — rather than recursing until the blocking scan thread's stack overflows and aborts the
-/// whole process (the 30 s deadline can't cancel a detached walker, and the item cap is checked only
-/// after it returns). 256 levels is far beyond any legitimate collection, so a normal scan is never
-/// affected; this only ever makes a scan return *less* (an error) on a pathological tree.
+/// silent — so a truncated scan can never masquerade as a complete one. 256 levels is far beyond
+/// any legitimate collection, so a normal scan is never affected; this only ever makes a scan
+/// return *less* (an error) on a pathological tree.
+///
+/// This is now a pure *policy* bound ("refuse absurd nesting"), NOT a stack budget: the walk is
+/// iterative (see [`scan_selective_walk`]), so its stack usage is O(1) in tree depth and this
+/// constant no longer approximates a platform-dependent stack size. The 2026-08-25 follow-up to
+/// audit #9: the recursive original consumed ~2–4 KB of scan-thread stack per level, so 256 levels
+/// needed ~0.8–1 MB on Linux (more on macOS) — the guard fired only *after* the stack was already
+/// exhausted, and macOS CI aborted (SIGABRT) in `scan_selective_rejects_pathologically_deep_tree`.
 const MAX_SCAN_DEPTH: usize = 256;
 
-fn scan_selective_walk(
-    dir: &Path,
-    include: &IncludeSet,
-    exclude: &globset::GlobSet,
-    rel_prefix: &str,
+/// One directory in the iterative walk's explicit work-stack. Frames live on the heap, so the
+/// deepest tree the policy bound admits costs a few pointers, not a few hundred stack frames.
+struct WalkFrame {
+    /// Display name of this directory; `None` for the collection root, whose result is the walk's
+    /// return value rather than a child of anything.
+    name: Option<String>,
+    /// Depth of this directory (root = 0) — what the recursive original's `depth` argument held.
     depth: usize,
-) -> anyhow::Result<(Vec<DirectoryItem>, u64)> {
-    let is_root = rel_prefix.is_empty();
-    // Loose files are listed at the root and inside any included directory; an ancestor-only
-    // directory withholds them.
-    let list_loose_files = is_root || include.is_included(rel_prefix);
+    /// This directory's items (files so far; finished subdirectories are appended as their frames
+    /// complete). Sorted when the frame finalises.
+    items: Vec<DirectoryItem>,
+    /// Bytes of every file in this subtree found so far (children roll up into it).
+    total_bytes: u64,
+    /// Subdirectories still to descend into: (absolute path, relative path, display name).
+    /// Order is immaterial — every level is sorted when its frame finalises, exactly as the
+    /// recursive original sorted each call's items before returning.
+    pending: Vec<(std::path::PathBuf, String, String)>,
+}
 
-    let mut items = vec![];
-    let mut total_bytes: u64 = 0;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let rel_path = if is_root { name.clone() } else { format!("{rel_prefix}/{name}") };
-        if exclude.is_match(&rel_path) {
-            continue;
-        }
-        let meta = entry.metadata()?;
-        let path = entry.path();
-        if meta.is_dir() {
-            let included = include.is_included(&rel_path);
-            // Recurse into a directory that is selected (full subtree) OR only an ancestor of a
-            // selection (to reach the checked descendant). Skip everything else entirely.
-            if !included && !include.has_descendant_under(&rel_path) {
+impl WalkFrame {
+    /// The listing pass: the body the recursive original ran *before* recursing. Loosely-coupled
+    /// files land in `items` now; subdirectories are queued in `pending` and descended into by the
+    /// driver loop below, which is what removes the recursion.
+    fn scan(
+        dir: &Path,
+        name: Option<String>,
+        rel_prefix: &str,
+        depth: usize,
+        include: &IncludeSet,
+        exclude: &globset::GlobSet,
+    ) -> anyhow::Result<WalkFrame> {
+        let is_root = rel_prefix.is_empty();
+        // Loose files are listed at the root and inside any included directory; an ancestor-only
+        // directory withholds them.
+        let list_loose_files = is_root || include.is_included(rel_prefix);
+
+        let mut frame =
+            WalkFrame { name, depth, items: vec![], total_bytes: 0, pending: vec![] };
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel_path = if is_root { name.clone() } else { format!("{rel_prefix}/{name}") };
+            if exclude.is_match(&rel_path) {
                 continue;
             }
-            // Depth bound (audit #9): a ~5,000-level nested tree (hostile archive / synced share)
-            // would overflow this blocking scan thread's stack and abort the process — so reject
-            // LOUDLY (an Err surfaces to the caller, not a truncated scan masquerading as complete)
-            // instead of quietly dropping the subtree.
-            if depth >= MAX_SCAN_DEPTH {
-                return Err(anyhow::anyhow!(
-                    "directory tree exceeds the {MAX_SCAN_DEPTH}-level depth limit at \
-                     '{rel_path}'; refusing to scan deeper (possible hostile nesting)"
-                ));
+            let meta = entry.metadata()?;
+            let path = entry.path();
+            if meta.is_dir() {
+                let included = include.is_included(&rel_path);
+                // Descend into a directory that is selected (full subtree) OR only an ancestor of
+                // a selection (to reach the checked descendant). Skip everything else entirely.
+                if !included && !include.has_descendant_under(&rel_path) {
+                    continue;
+                }
+                // Depth bound (audit #9): a pathologically nested tree (hostile archive / synced
+                // share) is rejected LOUDLY — an Err surfaces to the caller, never a truncated
+                // scan masquerading as complete. Checked at the same point the recursive original
+                // checked it (in the parent, before descending), with the same message naming the
+                // subdirectory being refused.
+                if depth >= MAX_SCAN_DEPTH {
+                    return Err(anyhow::anyhow!(
+                        "directory tree exceeds the {MAX_SCAN_DEPTH}-level depth limit at \
+                         '{rel_path}'; refusing to scan deeper (possible hostile nesting)"
+                    ));
+                }
+                frame.pending.push((path, rel_path, name));
+            } else if meta.is_file() && (list_loose_files || include.is_included(&rel_path)) {
+                // devtest #10: a file is included when it lives in the root/an included directory
+                // (the existing folder rule) OR when it is *itself* checked — so the user can pick
+                // individual files inside a directory they did not select wholesale.
+                // `has_descendant_under` already keeps this file's ancestor directories traversable
+                // (they're withheld as loose files but descended into to reach the checked file).
+                frame.total_bytes += meta.len();
+                frame.items.push(DirectoryItem {
+                    name: name.clone(),
+                    item_type: ItemType::File,
+                    size: Some(format_size(meta.len())),
+                    format: path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_uppercase()),
+                    year: None,
+                    tags: vec![],
+                    note: None,
+                    children: vec![],
+                });
             }
-            let (children, sub_bytes) = scan_selective_walk(&path, include, exclude, &rel_path, depth + 1)?;
-            total_bytes += sub_bytes;
-            items.push(DirectoryItem {
-                name,
-                item_type: ItemType::Folder,
-                size: None,
-                format: None,
-                year: None,
-                tags: vec![],
-                note: None,
-                children,
-            });
-        } else if meta.is_file() && (list_loose_files || include.is_included(&rel_path)) {
-            // devtest #10: a file is included when it lives in the root/an included directory (the
-            // existing folder rule) OR when it is *itself* checked — so the user can pick individual
-            // files inside a directory they did not select wholesale. `has_descendant_under` already
-            // keeps this file's ancestor directories traversable above (they're withheld as loose
-            // files but recursed to reach the checked file).
-            total_bytes += meta.len();
-            items.push(DirectoryItem {
-                name: name.clone(),
-                item_type: ItemType::File,
-                size: Some(format_size(meta.len())),
-                format: path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.to_uppercase()),
-                year: None,
-                tags: vec![],
-                note: None,
-                children: vec![],
-            });
+        }
+        Ok(frame)
+    }
+}
+
+/// Iterative, selection-aware walk (audit #9 follow-up, 2026-08-25). Depth-first over an explicit
+/// heap work-stack of [`WalkFrame`]s, so stack usage is O(1) in tree depth: the recursive original
+/// placed ~2–4 KB on the blocking scan thread's stack per level and could not survive its own
+/// `MAX_SCAN_DEPTH` bound on a ~2 MB thread (macOS CI aborted here). Semantics are those of the
+/// recursion it replaces, verbatim: same selection/ancestor/file rules, same exclude handling, same
+/// depth-guard message at the same depth, same per-level dirs-then-alphabetical ordering (each
+/// frame sorts exactly when the recursive call it replaces would have), and children's byte totals
+/// roll up into their parent frame exactly as the recursive `sub_bytes` accumulation did.
+fn scan_selective_walk(
+    root: &Path,
+    include: &IncludeSet,
+    exclude: &globset::GlobSet,
+) -> anyhow::Result<(Vec<DirectoryItem>, u64)> {
+    let mut stack: Vec<WalkFrame> =
+        vec![WalkFrame::scan(root, None, "", 0, include, exclude)?];
+    loop {
+        let next = stack
+            .last_mut()
+            .expect("walk stack is never empty inside the loop")
+            .pending
+            .pop();
+        match next {
+            Some((path, rel_path, name)) => {
+                let parent_depth = stack.last().expect("same frame").depth;
+                stack.push(WalkFrame::scan(
+                    &path,
+                    Some(name),
+                    &rel_path,
+                    parent_depth + 1,
+                    include,
+                    exclude,
+                )?);
+            }
+            None => {
+                // Frame complete: sort its items (the recursion sorted at the end of each call),
+                // then hand the finished subtree up to its parent — or, for the root, out.
+                let mut finished = stack.pop().expect("same frame");
+                finished.items.sort_by(|a, b| match (&a.item_type, &b.item_type) {
+                    (ItemType::Folder, ItemType::File) => std::cmp::Ordering::Less,
+                    (ItemType::File, ItemType::Folder) => std::cmp::Ordering::Greater,
+                    _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                });
+                match stack.last_mut() {
+                    Some(parent) => {
+                        parent.total_bytes += finished.total_bytes;
+                        parent.items.push(DirectoryItem {
+                            name: finished.name.expect("only the root is unnamed"),
+                            item_type: ItemType::Folder,
+                            size: None,
+                            format: None,
+                            year: None,
+                            tags: vec![],
+                            note: None,
+                            children: finished.items,
+                        });
+                    }
+                    None => return Ok((finished.items, finished.total_bytes)),
+                }
+            }
         }
     }
-    items.sort_by(|a, b| match (&a.item_type, &b.item_type) {
-        (ItemType::Folder, ItemType::File) => std::cmp::Ordering::Less,
-        (ItemType::File, ItemType::Folder) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
-    Ok((items, total_bytes))
 }
 
 /// Enumerate the immediate children of `path` — sub-directories AND files (devtest #10), sorted
@@ -1688,6 +1767,97 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("depth"), "deep tree is rejected with a loud, reasoned error: {err}");
+    }
+
+    /// Equivalence fixture: exercises every selection rule at once — root loose files with mixed
+    /// case (pins the dirs-first/case-insensitive sort), a fully-selected subtree with nesting and
+    /// varied file sizes (byte roll-up into ancestors), an ancestor-only selection (its own loose
+    /// files withheld), an individually-checked file inside an otherwise unselected directory
+    /// (devtest #10), an excluded glob, and a fully-skipped sibling.
+    fn make_equivalence_tree(root: &std::path::Path) {
+        let sel = root.join("Sel").join("nested").join("deeper");
+        std::fs::create_dir_all(&sel).unwrap();
+        std::fs::write(sel.join("z_deep.bin"), [0u8; 4096]).unwrap();
+        std::fs::write(root.join("Sel").join("nested").join("a_mid.txt"), b"mid").unwrap();
+        std::fs::write(root.join("Sel").join("m_loose.txt"), b"loose").unwrap();
+        let anc = root.join("anc").join("leaf");
+        std::fs::create_dir_all(&anc).unwrap();
+        std::fs::write(anc.join("l_file.txt"), b"l").unwrap();
+        std::fs::write(root.join("anc").join("withheld.txt"), b"w").unwrap();
+        let solo = root.join("solo");
+        std::fs::create_dir_all(&solo).unwrap();
+        std::fs::write(solo.join("picked.txt"), b"p").unwrap();
+        std::fs::write(solo.join("not_picked.txt"), b"n").unwrap();
+        std::fs::create_dir_all(root.join("skip")).unwrap();
+        std::fs::write(root.join("skip").join("never.txt"), b"x").unwrap();
+        std::fs::write(root.join("Apple.md"), b"a").unwrap();
+        std::fs::write(root.join("banana.TXT"), b"bb").unwrap();
+        std::fs::write(root.join("noise.skip"), b"s").unwrap();
+    }
+
+    /// Audit #9 follow-up (2026-08-25), equivalence pin: the iterative `scan_selective_walk` must
+    /// produce byte-identical output to the recursive implementation it replaced, on a fixture
+    /// exercising every selection rule at once (see `make_equivalence_tree`). The expected JSON
+    /// below is a verbatim capture from the RECURSIVE code, taken before the rewrite — not
+    /// re-derived afterwards, which would pin whatever the new code happens to emit.
+    #[test]
+    fn scan_selective_matches_recursive_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        make_equivalence_tree(dir.path());
+        let (items, total) = scan_selective(
+            dir.path(),
+            &include(&["Sel", "anc/leaf", "solo/picked.txt"]),
+            &build_glob_set(&["*.skip".to_string()]).unwrap(),
+        )
+        .unwrap();
+        let json = serde_json::to_string(&items).unwrap();
+        assert_eq!(
+            json,
+            r#"[{"name":"anc","item_type":"Folder","tags":[],"children":[{"name":"leaf","item_type":"Folder","tags":[],"children":[{"name":"l_file.txt","item_type":"File","size":"1 B","format":"TXT","tags":[],"children":[]}]}]},{"name":"Sel","item_type":"Folder","tags":[],"children":[{"name":"nested","item_type":"Folder","tags":[],"children":[{"name":"deeper","item_type":"Folder","tags":[],"children":[{"name":"z_deep.bin","item_type":"File","size":"4.0 KB","format":"BIN","tags":[],"children":[]}]},{"name":"a_mid.txt","item_type":"File","size":"3 B","format":"TXT","tags":[],"children":[]}]},{"name":"m_loose.txt","item_type":"File","size":"5 B","format":"TXT","tags":[],"children":[]}]},{"name":"solo","item_type":"Folder","tags":[],"children":[{"name":"picked.txt","item_type":"File","size":"1 B","format":"TXT","tags":[],"children":[]}]},{"name":"Apple.md","item_type":"File","size":"1 B","format":"MD","tags":[],"children":[]},{"name":"banana.TXT","item_type":"File","size":"2 B","format":"TXT","tags":[],"children":[]}]"#,
+            "iterative walk must be byte-identical to the recursive baseline"
+        );
+        // 4109 = every selected file's bytes, rolled up through ancestors to the root.
+        assert_eq!(total, 4109, "children's bytes must roll up into the root total");
+    }
+
+    /// Audit #9 follow-up (2026-08-25), THE DISCRIMINATOR: a deep tree scanned from a thread with
+    /// a deliberately tiny stack must yield the depth `Err`, not kill the process. The recursive
+    /// walk needed ~2–4 KB of stack per level, so 256 levels ≈ 0.8–1 MB on Linux: at this 512 KB
+    /// budget it provably overflowed and aborted (verified red against the recursive original,
+    /// which died with `thread ... has overflowed its stack` before the guard could fire), while
+    /// the iterative walk's stack usage is O(1) in depth and passes. Any refactor that quietly
+    /// reintroduces recursion reds here instead of taking down CI.
+    ///
+    /// 512 KiB is chosen because it is (a) comfortably above the ~32 KiB a plain test thread's
+    /// own frames need, and (b) provably below the recursive walk's ~0.8–1 MB footprint — the
+    /// tight window where only the iterative implementation survives. `RUST_MIN_STACK` cannot
+    /// substitute: it sizes *spawned* threads, not the harness's own main/test threads.
+    #[test]
+    fn scan_selective_deep_tree_survives_tiny_thread_stack() {
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                let dir = tempfile::tempdir().unwrap();
+                let mut path = dir.path().to_path_buf();
+                // One-char components keep the ~518-char path under macOS's 1024-byte PATH_MAX
+                // (see `scan_selective_rejects_pathologically_deep_tree`).
+                for _ in 0..(MAX_SCAN_DEPTH + 3) {
+                    path = path.join("d");
+                }
+                std::fs::create_dir_all(&path).unwrap();
+
+                // The loud depth Err — same shape, same depth, as the recursive original's.
+                let err = scan_selective(dir.path(), &include(&["d"]), &empty_globs())
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains("depth"),
+                    "deep tree is rejected with a loud, reasoned error: {err}"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     // ── IncludeSet truth table (mirrors the frontend scan-tree.ts) ────────────
