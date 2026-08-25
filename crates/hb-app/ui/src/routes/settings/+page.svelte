@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, hasPublishedProfile, publishProfile, copyDiagnostics, revealLogFolder, natClassification, dmBlockedList, dmUnblock } from '$lib/api.js';
+	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, validateBackup, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, hasPublishedProfile, publishProfile, copyDiagnostics, revealLogFolder, natClassification, dmBlockedList, dmUnblock } from '$lib/api.js';
 	import type { Settings, UpdateInfo, PortableUpdateInfo, BeaconReport, NatClassification } from '$lib/api.js';
 	import { keyView } from '$lib/key-view.js';
 	import { shortNpub } from '$lib/contact-display.js';
@@ -88,16 +88,30 @@
 	}
 
 	async function doRestore() {
+		// Re-entry guard, FIRST: two clicks (or the pickRestore auto-call racing a manual click)
+		// can both be parked in `confirm` before either sets `restoring`, starting two destructive
+		// flows. The button's `disabled={… || restoring}` cannot help there — `restoring` is still
+		// false while the dialog is open — so the guard has to live here.
+		if (restoring) return;
 		if (!restorePath) return;
+		// QURATOR-126 (INV-8): capture the inputs ONCE, before any await. Everything downstream —
+		// including the wipe — must be about the archive that gets validated, not whatever the
+		// still-mounted reactive fields happen to hold mid-flight; re-reading them after `wipeData`
+		// let a mid-await edit (or Cancel nulling `restorePath`) orphan a wiped device.
+		const pass = restoreNeedsPass ? restorePass : null;
+		const path = restorePath;
+		restoring = true;
 		const ok = await confirm(
 			'Restoring REPLACES all current data on this device with the backup, then restarts. Continue?',
 			{ title: 'Restore from backup', kind: 'warning' },
 		);
-		if (!ok) return;
-		restoring = true;
+		if (!ok) { restoring = false; return; }
 		try {
+			// QURATOR-126 (INV-8): prove the backup is restorable — KDF, decrypt, parse — BEFORE
+			// wiping. A typo'd passphrase used to destroy the local identity with no rollback.
+			await validateBackup(pass, path);
 			await wipeData();
-			const info = await restoreData(restoreNeedsPass ? restorePass : null, restorePath);
+			const info = await restoreData(pass, path);
 			identity.set(info);
 			restorePath = null; restorePass = ''; restoreNeedsPass = false;
 			toast('Backup restored — restarting…');
@@ -634,9 +648,9 @@
 			</div>
 			{#if restoreNeedsPass && restorePath}
 				<div class="restore-pass">
-					<input class="hb-input" type="password" placeholder="Backup passphrase" bind:value={restorePass} />
+					<input class="hb-input" type="password" placeholder="Backup passphrase" bind:value={restorePass} disabled={restoring} />
 					<button class="btn-primary btn-sm" onclick={doRestore} disabled={!restorePass || restoring}>Restore</button>
-					<button class="btn-ghost btn-sm" onclick={() => { restorePath = null; restoreNeedsPass = false; }}>Cancel</button>
+					<button class="btn-ghost btn-sm" onclick={() => { restorePath = null; restoreNeedsPass = false; }} disabled={restoring}>Cancel</button>
 				</div>
 			{/if}
 		</div>
@@ -681,9 +695,9 @@
 			</div>
 			{#if restoreNeedsPass && restorePath}
 				<div class="restore-pass">
-					<input class="hb-input" type="password" placeholder="Backup passphrase" bind:value={restorePass} />
+					<input class="hb-input" type="password" placeholder="Backup passphrase" bind:value={restorePass} disabled={restoring} />
 					<button class="btn-primary btn-sm" onclick={doRestore} disabled={!restorePass || restoring}>Restore</button>
-					<button class="btn-ghost btn-sm" onclick={() => { restorePath = null; restoreNeedsPass = false; }}>Cancel</button>
+					<button class="btn-ghost btn-sm" onclick={() => { restorePath = null; restoreNeedsPass = false; }} disabled={restoring}>Cancel</button>
 				</div>
 			{/if}
 		</div>

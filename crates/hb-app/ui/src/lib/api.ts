@@ -73,6 +73,12 @@ export const peekBackup = (path: string) => invoke<boolean>('peek_backup', { pat
 export const restoreData = (passphrase: string | null, path: string) =>
 	invoke<IdentityInfo>('restore_data', { passphrase, path });
 
+/** Full pre-flight of the backup at `path` before any destructive step: runs the real KDF,
+ *  decrypt, and parse so a wrong passphrase / truncated / oversized archive rejects HERE, while
+ *  the local identity is still on disk (QURATOR-126 — INV-8: no wipe before validation). */
+export const validateBackup = (passphrase: string | null, path: string) =>
+	invoke<void>('validate_backup', { passphrase, path });
+
 export const wipeData = () => invoke<void>('wipe_data');
 
 // ── Profile ───────────────────────────────────────────────────────────────────
