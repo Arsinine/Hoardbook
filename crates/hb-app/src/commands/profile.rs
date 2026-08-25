@@ -11,7 +11,7 @@ use crate::{
     error::{cmd_err, CmdResult},
     identity_state::SharedIdentity,
     net::{self, SharedRelay},
-    store::DataStore,
+    store::{DataStore, PublishedSave},
 };
 
 /// Key under which the published teaser event is stored locally (enables NIP-09 unpublish).
@@ -78,11 +78,39 @@ pub async fn publish_profile(
     let teaser = teaser_from_profile(&store, &profile);
     let event = build_teaser(&id_clone, &teaser, discoverable).map_err(cmd_err)?;
 
+    // Capture the revocation generation BEFORE the relay write (CWE-367): an Unpublish issued
+    // mid-publish bumps it, and the guarded marker save below refuses to re-create the marker.
+    let gen_at_start = store.published_generation(PROFILE_KEY);
+
     let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
     client.publish(&event).await.map_err(cmd_err)?;
 
-    // Store the published event so unpublish can issue a NIP-09 deletion.
-    store.save_published(PROFILE_KEY, &event.as_json()).map_err(cmd_err)?;
+    // Store the published event so unpublish can issue a NIP-09 deletion — guarded against a
+    // concurrent unpublish (INV-8: a deliberately-skipped save, reported — never silent success).
+    save_profile_marker_guarded(&store, &event.as_json(), gen_at_start)?;
+    Ok(())
+}
+
+/// The marker-save tail of [`publish_profile`] (CWE-367). The relay write happens before the
+/// marker save, so an Unpublish issued mid-publish would otherwise be silently undone by the save
+/// re-creating the marker. This captured-generation compare-and-save is extracted so the pinning
+/// test ends where production ends (P-6): on [`PublishedSave::Revoked`] it skips the write and
+/// reports the revocation instead of succeeding (INV-8).
+fn save_profile_marker_guarded(
+    store: &DataStore,
+    event_json: &str,
+    gen_at_start: u64,
+) -> CmdResult<()> {
+    if store
+        .save_published_guarded(PROFILE_KEY, event_json, gen_at_start)
+        .map_err(cmd_err)?
+        == PublishedSave::Revoked
+    {
+        return Err(
+            "profile was unpublished while its publish was in flight; not re-creating the published marker"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -391,6 +419,58 @@ mod tests {
         assert!(
             !types.contains(&"forbidden".to_string()),
             "a private-only content-type must NOT leak into the public teaser"
+        );
+    }
+
+    // ── CWE-367: the revocation-generation guard at the profile marker save ────────────
+    // `publish_profile` writes to the relay BEFORE it saves the published marker, so an Unpublish
+    // issued mid-publish can be silently undone: the relay write re-creates the marker and
+    // resurrects a revoked profile. `save_profile_marker_guarded` is the exact marker-save tail
+    // `publish_profile` runs at its save site (extracted so the test ends where production ends,
+    // P-6). It is driven directly here because the full `publish_profile` needs a live relay
+    // (`net::client` + `client.publish`); the guard itself is pure store I/O. This test is the
+    // production-boundary kind: it calls the SAME function `publish_profile` calls, so reverting
+    // production to unguarded `save_published` reds it.
+
+    #[test]
+    fn profile_marker_save_refuses_to_resurrect_after_mid_write_unpublish() {
+        let (_dir, store) = test_store();
+        let event_json = r#"{"kind":30078}"#;
+
+        // A published profile, as it stands when the publish begins.
+        store.save_published(PROFILE_KEY, event_json).unwrap();
+        let gen_at_start = store.published_generation(PROFILE_KEY);
+
+        // Mid-write Unpublish: `unpublish_profile` ends in `delete_published`, which removes the
+        // marker AND bumps the revocation generation.
+        store.delete_published(PROFILE_KEY).unwrap();
+        assert!(!store.is_published(PROFILE_KEY), "premise: the unpublish removed the marker");
+
+        // The marker-save tail of `publish_profile`, re-run after the relay write. It must detect
+        // the bump, refuse to re-create the marker, and report the revocation explicitly.
+        let outcome = save_profile_marker_guarded(&store, event_json, gen_at_start);
+        assert!(
+            outcome.is_err(),
+            "a mid-write unpublish must report revocation, not silently succeed"
+        );
+        assert!(
+            !store.is_published(PROFILE_KEY),
+            "the revoked marker must NOT be resurrected"
+        );
+    }
+
+    #[test]
+    fn profile_marker_save_succeeds_when_generation_is_stable() {
+        // A missing generation file reads as 0 (fresh install / first publish), and an un-bumped
+        // generation must save — the guard must not over-reject and lose a legitimate publish.
+        let (_dir, store) = test_store();
+        let event_json = r#"{"kind":30078}"#;
+        let gen_at_start = store.published_generation(PROFILE_KEY);
+        assert_eq!(gen_at_start, 0, "a missing generation file reads as 0");
+        save_profile_marker_guarded(&store, event_json, gen_at_start).unwrap();
+        assert!(
+            store.is_published(PROFILE_KEY),
+            "an un-bumped generation must save the marker"
         );
     }
 }

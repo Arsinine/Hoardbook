@@ -45,6 +45,10 @@
 		<div class="person-name">{name}</div>
 		{#if fingerprint}
 			<div class="fp-row">
+				<!-- The word→hue table is a bijection of the word text (zero marginal entropy); the
+				     `colorHex` swatch is where the remaining ~24 of the 36 bits surface — same treatment
+				     as the DM-request card (.request-fp-swatch) and ShareCodeCard (.share-card-swatch). -->
+				<span class="fp-swatch" style="background:{fingerprint.colorHex}" aria-hidden="true"></span>
 				{#each fingerprint.words as w, i}
 					{#if i > 0}<span class="fp-sep">·</span>{/if}
 					<span class="fp-word" style={fingerprintWordColor(w) ? `color:${fingerprintWordColor(w)}` : undefined}>{w}</span>
@@ -83,7 +87,8 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
-	.fp-row { display: flex; gap: 4px; align-items: baseline; flex-wrap: wrap; }
+	.fp-row { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+	.fp-swatch { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; box-shadow: inset 0 0 0 1px oklch(1 0 0 / 0.12); }
 	.fp-word { font-family: var(--font-mono); font-size: 11px; font-weight: 600; }
 	.fp-sep { color: var(--fg-dim); font-size: 11px; }
 </style>

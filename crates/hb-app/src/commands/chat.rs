@@ -22,7 +22,7 @@
 //! `merge_wraps_into_cache`; the returned inbox is reclassified from the cache under the current
 //! contacts/blocked sets, so blocking/removing a contact still hides their cached messages.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use chrono::{TimeZone, Utc};
 use nostr::prelude::*;
@@ -126,8 +126,10 @@ pub(crate) async fn send_dm_inner(
         recipient = %crate::logging::trunc_npub(&npub_of(recipient)),
         "dm: sealed — resolving recipient read-relays"
     );
-    let targets =
-        hb_net::resolve_recipient_relays(client, recipient, own_relays, own_relays, timeout).await;
+    let targets = dm_delivery_targets(
+        own_relays,
+        hb_net::resolve_recipient_relays(client, recipient, own_relays, own_relays, timeout).await,
+    );
     tracing::debug!(
         recipient = %crate::logging::trunc_npub(&npub_of(recipient)),
         target_relays = targets.len(),
@@ -140,6 +142,20 @@ pub(crate) async fn send_dm_inner(
         "dm: delivered"
     );
     Ok(wrap)
+}
+
+/// SSRF-filter the DM delivery targets (QURATOR-113 #21). `resolve_recipient_relays` merges the
+/// recipient's **peer-authored** NIP-65 read-relays with our own/seed; the peer-authored portion is
+/// attacker-controlled whenever the recipient is a stranger. Keep the caller's own relays (trusted —
+/// validated on save) unconditionally, and keep any other target only when it is a public `ws`/`wss`
+/// relay — the same `validate_relay_url` check `browse::big_relay_fetch_order` applies to the peer's
+/// big-relay URL. Address-class filtering, not scheme filtering: the plain-`ws://` VPS relays on
+/// public IPs keep working. Pure — unit-tested.
+fn dm_delivery_targets(own_relays: &[String], targets: Vec<String>) -> Vec<String> {
+    targets
+        .into_iter()
+        .filter(|t| own_relays.iter().any(|o| o == t) || net::validate_relay_url(t).is_ok())
+        .collect()
 }
 
 /// Decode a batch of gift-wrap events into sender-attributed messages (pure; no relay). A wrap not
@@ -224,6 +240,24 @@ static DM_CACHE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 static DM_REQUESTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ---------------------------------------------------------------------------
+// DM_DECLINED_LOCK / DM_BLOCKED_LOCK (finding #33) — the same load→mutate→save serialization as
+// DM_REQUESTS_LOCK above, for the two sibling files that were left unguarded: `dm_declined.json`
+// (`dm_request_accept_inner`/`dm_block_inner` remove an entry; `dm_request_decline_inner` adds one)
+// and `dm_blocked.json` (`dm_block_inner` adds; `dm_unblock_inner` removes). Two concurrent
+// block/decline clicks raced here exactly as accept/decline/block/inbox-merge did on
+// dm_requests.json before DM_REQUESTS_LOCK — last-write-wins silently dropped one entry.
+//
+// `std::sync::Mutex`, matching DM_REQUESTS_LOCK: none of the guarded spans hold the lock across an
+// `.await` (decline/block/unblock are sync fns; accept's declined span completes before its own
+// `DM_CACHE_LOCK` section starts). **`dm_block_inner` and `dm_request_decline_inner` hold BOTH locks
+// at once, in the single consistent order DM_DECLINED_LOCK before DM_BLOCKED_LOCK** (decline-before-
+// block, the order `dm_block_inner` already writes the two files) — no site ever takes them in the
+// opposite order, so there is no lock-ordering cycle and no deadlock (finding B). The DM_REQUESTS_LOCK
+// scope always closes before either relationship lock is taken.
+static DM_DECLINED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static DM_BLOCKED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// ---------------------------------------------------------------------------
 // Q7 — the total DM classifier (M13 Part B): inbox vs quarantined Request vs dropped
 // ---------------------------------------------------------------------------
 
@@ -277,6 +311,85 @@ pub(crate) fn route_dm(from: &str, own_npub: &str, ctx: &DmClassifyCtx<'_>) -> D
 /// with `since = cursor−48h` and T ≥ cursor, its outer ≥ since).
 const DM_FETCH_MARGIN_SECS: u64 = 48 * 60 * 60;
 
+/// Fetch budget for the inbox poll. Without an explicit `.limit()` the client leaves the response
+/// size to the relay's own default (strfry's `maxFilterLimit`) — a hostile or misconfigured relay
+/// could return an unbounded batch (CWE-400). 1000 is far above realistic DM volume in a 48 h window
+/// and matches the other fetch-budget constants (`TEASER_SEARCH_FETCH_LIMIT`,
+/// `TOPIC_DISCOVERY_FETCH_LIMIT`).
+const DM_INBOX_FETCH_LIMIT: usize = 1000;
+
+/// Cap on remembered failed-unwrap wrap ids (the negative cache). A wrap that fails to unwrap is
+/// remembered here so the ~15 s poll doesn't re-run the full unwrap (schnorr + ECDH + AES-GCM) on it
+/// for up to 48 h — one cheap signed event would otherwise buy ~57,600 redundant decryptions. Bounded
+/// and FIFO-evicted because it is fed by attacker-controlled ids; 4,096 ids ≈ 256 KiB, and a flood
+/// beyond that is bounded by the 48 h fetch window + relay bandwidth rather than our CPU. In-memory
+/// only (not persisted, not part of [`DmCache`]): it is a CPU-DoS backstop, not a correctness
+/// boundary — losing it across a restart merely re-attempts a wrap once, never loses a message.
+const MAX_FAILED_WRAPS: usize = 4_096;
+
+/// Bounded, FIFO negative cache of gift-wrap ids that failed to unwrap (`set` for O(1) membership,
+/// `order` for oldest-first eviction).
+struct FailedWrapCache {
+    order: VecDeque<String>,
+    set: HashSet<String>,
+}
+
+impl FailedWrapCache {
+    fn new() -> Self {
+        FailedWrapCache { order: VecDeque::new(), set: HashSet::new() }
+    }
+    fn contains(&self, id: &str) -> bool {
+        self.set.contains(id)
+    }
+    fn insert(&mut self, id: String) {
+        if self.set.insert(id.clone()) {
+            self.order.push_back(id);
+            if self.order.len() > MAX_FAILED_WRAPS {
+                if let Some(evicted) = self.order.pop_front() {
+                    self.set.remove(&evicted);
+                }
+            }
+        }
+    }
+}
+
+/// The failed-unwrap negative cache. Module-scope static (house rule: never a per-function static).
+/// `std::sync::Mutex`, not `tokio` — the check and the record are separate synchronous spans, so the
+/// lock is never held across the `unwrap_dm` `.await`. `LazyLock` because `HashSet::new()` is not
+/// `const`, so a plain `static … = Mutex::new(…)` initializer won't compile.
+///
+/// Keyed by **(recipient identity npub, wrap id)**, not wrap id alone. `unwrap_dm` is deterministic
+/// over `(identity keys, wrap)` — a wrap that fails under one identity may decode under another (a
+/// wrap addressed to identity B that a relay fed while A was active, or after a wipe/restore in
+/// `commands/identity.rs`). A wrap-id-only key would let A's failure poison the global cache and skip
+/// B's genuinely valid message — silent INV-8-adjacent message loss. Pinned by
+/// `negative_cache_does_not_cross_identity_boundaries`.
+static FAILED_WRAPS: std::sync::LazyLock<std::sync::Mutex<FailedWrapCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(FailedWrapCache::new()));
+
+/// Compose the negative-cache key: (identity npub, wrap id). `\x00` appears in neither bech32 (npub)
+/// nor hex (wrap id), so the join is collision-free.
+fn failed_wrap_key(identity_npub: &str, wrap_id: &str) -> String {
+    format!("{identity_npub}\u{0}{wrap_id}")
+}
+
+/// O(1) "already failed before for THIS identity?" lookup — checked before `unwrap_dm` so a
+/// previously-failed wrap is not re-unwrapped on every poll.
+fn failed_wrap_seen(identity_npub: &str, id: &str) -> bool {
+    FAILED_WRAPS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&failed_wrap_key(identity_npub, id))
+}
+
+/// Record a (identity, wrap id) that failed to unwrap (bounded, FIFO-evicted).
+fn record_failed_wrap(identity_npub: &str, id: String) {
+    FAILED_WRAPS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(failed_wrap_key(identity_npub, &id));
+}
+
 /// The inbox fetch filter: kind-1059 wraps addressed to us, bounded by `since = cursor − margin` once
 /// the cache has a cursor (an incremental read — most polls then return ~nothing), or unbounded on a
 /// cold cache (the one full initial pull). `since` is **bandwidth-only** — dedup + security are by
@@ -286,7 +399,7 @@ const DM_FETCH_MARGIN_SECS: u64 = 48 * 60 * 60;
 /// uses (the future-poison clamp + restart round-trip is a WAN-C row). No full `pub` — this is an
 /// internal seam, not a stable API.
 pub(crate) fn dm_inbox_filter(me: PublicKey, newest_seen_outer: u64) -> Filter {
-    let f = Filter::new().kind(Kind::GiftWrap).pubkey(me);
+    let f = Filter::new().kind(Kind::GiftWrap).pubkey(me).limit(DM_INBOX_FETCH_LIMIT);
     if newest_seen_outer > 0 {
         f.since(Timestamp::from(newest_seen_outer.saturating_sub(DM_FETCH_MARGIN_SECS)))
     } else {
@@ -337,11 +450,15 @@ pub(crate) async fn merge_wraps_into_cache(
         if seen.contains(&wrap_id) {
             continue; // already decoded (a prior poll, or the same wrap from two relays)
         }
+        if failed_wrap_seen(own_npub, &wrap_id) {
+            continue; // already failed to unwrap under THIS identity on a prior poll — skip the redundant re-decrypt
+        }
         match unwrap_dm(identity, &wrap).await {
             Ok(dm) => {
                 // Record the id only after a successful unwrap — an undecodable/foreign wrap is never
-                // remembered, so it can't fill the ledger (it may be re-tried next poll, bounded by the
-                // 48 h window).
+                // remembered in the success ledger (it may be re-tried next poll, bounded by the
+                // 48 h window); instead it lands in the bounded negative cache, so the poll does not
+                // re-run the unwrap on it.
                 seen.insert(wrap_id.clone());
                 cache.seen_wraps.push(wrap_id.clone());
                 changed = true;
@@ -361,10 +478,18 @@ pub(crate) async fn merge_wraps_into_cache(
                     }
                 }
             }
-            Err(e) => tracing::debug!(
-                wrap_id = %wrap.id.to_hex(),
-                "dm inbox: skipping undecryptable/foreign gift wrap: {e}"
-            ),
+            Err(e) => {
+                // audit #11: remember the failed id so the ~15 s poll doesn't re-run the full unwrap
+                // on it for up to 48 h. Bounded (attacker-controlled ids), so it can't become a
+                // memory DoS; unwrap is deterministic for a given identity+wrap, so a failure here is
+                // permanent for this identity and the cache never blacklists a message that could
+                // later succeed.
+                record_failed_wrap(own_npub, wrap_id.clone());
+                tracing::debug!(
+                    wrap_id = %wrap.id.to_hex(),
+                    "dm inbox: skipping undecryptable/foreign gift wrap: {e}"
+                );
+            }
         }
     }
     (requests, changed)
@@ -420,8 +545,8 @@ fn request_message_to_received(npub: &str, own_npub: &str, m: &RequestMessage) -
     ReceivedMessage { from: npub.to_string(), to: own_npub.to_string(), content: m.content.clone(), sent_at: m.sent_at.clone() }
 }
 
-pub(crate) fn dm_requests_inner(store: &DataStore, own_npub: &str) -> Result<Vec<DmRequestView>, String> {
-    let buckets = store.load_dm_requests().map_err(cmd_err)?;
+pub(crate) fn dm_requests_inner(store: &DataStore, identity: &hb_core::Identity, own_npub: &str) -> Result<Vec<DmRequestView>, String> {
+    let buckets = store.load_dm_requests(identity).map_err(cmd_err)?;
     Ok(buckets
         .into_iter()
         .map(|b| {
@@ -480,7 +605,7 @@ pub(crate) async fn dm_request_accept_inner(
     // concurrent accept/decline/block/inbox-merge can last-write-wins away this bucket's removal.
     let (drained, cache_adds) = {
         let _guard = DM_REQUESTS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let mut buckets = store.load_dm_requests().map_err(cmd_err)?;
+        let mut buckets = store.load_dm_requests(identity).map_err(cmd_err)?;
         let (drained, cache_adds) = match buckets.iter().position(|b| b.npub == npub) {
             Some(i) => {
                 let bucket = buckets.remove(i);
@@ -501,13 +626,18 @@ pub(crate) async fn dm_request_accept_inner(
             }
             None => (Vec::new(), Vec::new()),
         };
-        store.save_dm_requests(&buckets).map_err(cmd_err)?;
+        store.save_dm_requests(identity, &buckets).map_err(cmd_err)?;
         (drained, cache_adds)
     };
 
-    let declined: Vec<(String, u64)> =
-        store.load_dm_declined().map_err(cmd_err)?.into_iter().filter(|(n, _)| n != &npub).collect();
-    store.save_dm_declined(&declined).map_err(cmd_err)?;
+    {
+        // DM_DECLINED_LOCK: un-decline the sender (remove their entry) as one serialized
+        // load→mutate→save against `dm_declined.json` — see the lock's doc above.
+        let _guard = DM_DECLINED_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let declined: Vec<(String, u64)> =
+            store.load_dm_declined().map_err(cmd_err)?.into_iter().filter(|(n, _)| n != &npub).collect();
+        store.save_dm_declined(&declined).map_err(cmd_err)?;
+    }
 
     // Migrate the accepted history into the DM cache so it persists past the next poll (see doc
     // above). Through DM_CACHE_LOCK (M2): this is a load→mutate→save transaction against the same
@@ -529,18 +659,35 @@ pub(crate) async fn dm_request_accept_inner(
 /// history on every poll and the inner rumor timestamp is attacker-controlled, so a watermark-style
 /// "seen up to T" can't tell "already declined" apart from "arrived after I declined" — remembering
 /// the decline outright is the only reading of the ruling that stays stable across restarts/re-polls.
-pub(crate) fn dm_request_decline_inner(store: &DataStore, npub: String, now: u64) -> Result<(), String> {
+pub(crate) fn dm_request_decline_inner(
+    store: &DataStore,
+    identity: &hb_core::Identity,
+    npub: String,
+    now: u64,
+) -> Result<(), String> {
     {
         // DM_REQUESTS_LOCK: see the lock's doc — serializes against accept/block/inbox-merge on the
         // same `dm_requests.json`.
         let _guard = DM_REQUESTS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let mut buckets = store.load_dm_requests().map_err(cmd_err)?;
+        let mut buckets = store.load_dm_requests(identity).map_err(cmd_err)?;
         buckets.retain(|b| b.npub != npub);
-        store.save_dm_requests(&buckets).map_err(cmd_err)?;
+        store.save_dm_requests(identity, &buckets).map_err(cmd_err)?;
     }
 
-    let declined = store.load_dm_declined().map_err(cmd_err)?;
-    store.save_dm_declined(&record_declined(declined, npub, now)).map_err(cmd_err)
+    {
+        // BOTH relationship locks, in the documented DECLINED → BLOCKED order, so the add-decline is
+        // atomic against `dm_block_inner`'s clear-decline + add-block (finding B). The blocked set is
+        // consulted under the same critical section, and a decline for an already-blocked sender is
+        // skipped — blocked supersedes decline, so recording it would be the stale entry a later
+        // unblock reveals as a silent decline.
+        let _declined = DM_DECLINED_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _blocked = DM_BLOCKED_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        if store.load_dm_blocked().map_err(cmd_err)?.iter().any(|n| n == &npub) {
+            return Ok(()); // blocked supersedes decline — never record a decline for a blocked sender
+        }
+        let declined = store.load_dm_declined().map_err(cmd_err)?;
+        store.save_dm_declined(&record_declined(declined, npub, now)).map_err(cmd_err)
+    }
 }
 
 /// Send + persist-the-echo path (QURATOR-91): await the wrap-producing send (`send_dm_inner` in
@@ -614,28 +761,38 @@ pub(crate) async fn persist_sent_dm(
 
 /// Add `npub` to the local blocklist (spec §Blocked keys — the canonical local blocklist, named for
 /// future Settings reuse). Deletes any Request bucket and any decline record — blocked supersedes both.
-pub(crate) fn dm_block_inner(store: &DataStore, npub: String) -> Result<(), String> {
+pub(crate) fn dm_block_inner(store: &DataStore, identity: &hb_core::Identity, npub: String) -> Result<(), String> {
     {
         // DM_REQUESTS_LOCK: see the lock's doc — serializes against accept/decline/inbox-merge on the
         // same `dm_requests.json`.
         let _guard = DM_REQUESTS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let mut buckets = store.load_dm_requests().map_err(cmd_err)?;
+        let mut buckets = store.load_dm_requests(identity).map_err(cmd_err)?;
         buckets.retain(|b| b.npub != npub);
-        store.save_dm_requests(&buckets).map_err(cmd_err)?;
+        store.save_dm_requests(identity, &buckets).map_err(cmd_err)?;
     }
 
-    let declined: Vec<(String, u64)> =
-        store.load_dm_declined().map_err(cmd_err)?.into_iter().filter(|(n, _)| n != &npub).collect();
-    store.save_dm_declined(&declined).map_err(cmd_err)?;
-
-    let mut blocked = store.load_dm_blocked().map_err(cmd_err)?;
-    if !blocked.contains(&npub) {
-        blocked.push(npub);
+    {
+        // BOTH relationship locks, in the documented DECLINED → BLOCKED order, held together so the
+        // clear-decline + add-block transition is atomic against `dm_request_decline_inner`'s
+        // add-decline (finding B): a racing decline can no longer slip its decline in between the
+        // clear and the add. Clear any decline record (blocked supersedes), then add to the blocklist.
+        let _declined = DM_DECLINED_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _blocked = DM_BLOCKED_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let declined: Vec<(String, u64)> =
+            store.load_dm_declined().map_err(cmd_err)?.into_iter().filter(|(n, _)| n != &npub).collect();
+        store.save_dm_declined(&declined).map_err(cmd_err)?;
+        let mut blocked = store.load_dm_blocked().map_err(cmd_err)?;
+        if !blocked.contains(&npub) {
+            blocked.push(npub);
+        }
+        store.save_dm_blocked(&blocked).map_err(cmd_err)
     }
-    store.save_dm_blocked(&blocked).map_err(cmd_err)
 }
 
 pub(crate) fn dm_unblock_inner(store: &DataStore, npub: String) -> Result<(), String> {
+    // DM_BLOCKED_LOCK: remove the sender from the blocklist as one serialized load→mutate→save — the
+    // same lost-update class as `dm_block_inner`'s add, on the same `dm_blocked.json`.
+    let _guard = DM_BLOCKED_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let blocked: Vec<String> =
         store.load_dm_blocked().map_err(cmd_err)?.into_iter().filter(|n| n != &npub).collect();
     store.save_dm_blocked(&blocked).map_err(cmd_err)
@@ -888,9 +1045,9 @@ pub async fn get_messages(
         // DM_REQUESTS_LOCK: see the lock's doc — serializes against accept/decline/block on the same
         // `dm_requests.json`.
         let _guard = DM_REQUESTS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let existing = store.load_dm_requests().map_err(cmd_err)?;
+        let existing = store.load_dm_requests(&id_clone).map_err(cmd_err)?;
         let merged = merge_into_requests(existing, requests, now_secs());
-        store.save_dm_requests(&merged).map_err(cmd_err)?;
+        store.save_dm_requests(&id_clone, &merged).map_err(cmd_err)?;
     }
 
     // Return the received-contact inbox from the cache, reclassified under the current contacts/blocked
@@ -908,8 +1065,12 @@ pub async fn dm_requests(
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
 ) -> CmdResult<Vec<DmRequestView>> {
-    let own_npub = identity.read().await.as_ref().map(|id| id.npub()).ok_or("No identity loaded.")?;
-    dm_requests_inner(&store, &own_npub)
+    let (own_npub, id_clone) = {
+        let guard = identity.read().await;
+        let id = guard.as_ref().ok_or("No identity loaded.")?;
+        (id.npub(), id.identity.clone())
+    };
+    dm_requests_inner(&store, &id_clone, &own_npub)
 }
 
 #[tauri::command]
@@ -928,13 +1089,31 @@ pub async fn dm_request_accept(
 }
 
 #[tauri::command]
-pub async fn dm_request_decline(npub: String, store: State<'_, DataStore>) -> CmdResult<()> {
-    dm_request_decline_inner(&store, npub, now_secs())
+pub async fn dm_request_decline(
+    npub: String,
+    identity: State<'_, SharedIdentity>,
+    store: State<'_, DataStore>,
+) -> CmdResult<()> {
+    let id_clone = {
+        let guard = identity.read().await;
+        let id = guard.as_ref().ok_or("No identity loaded.")?;
+        id.identity.clone()
+    };
+    dm_request_decline_inner(&store, &id_clone, npub, now_secs())
 }
 
 #[tauri::command]
-pub async fn dm_block(npub: String, store: State<'_, DataStore>) -> CmdResult<()> {
-    dm_block_inner(&store, npub)
+pub async fn dm_block(
+    npub: String,
+    identity: State<'_, SharedIdentity>,
+    store: State<'_, DataStore>,
+) -> CmdResult<()> {
+    let id_clone = {
+        let guard = identity.read().await;
+        let id = guard.as_ref().ok_or("No identity loaded.")?;
+        id.identity.clone()
+    };
+    dm_block_inner(&store, &id_clone, npub)
 }
 
 #[tauri::command]
@@ -1014,6 +1193,43 @@ mod tests {
         let stranger = Identity::generate();
         assert!(is_self_send(&me.public_key(), &me.public_key()));
         assert!(!is_self_send(&stranger.public_key(), &me.public_key()));
+    }
+
+    #[test]
+    fn dm_delivery_targets_keeps_own_and_public_peer_relays() {
+        // Own relays are trusted (validated on save) and never filtered — even a local dev relay.
+        let own = vec!["wss://own.example".to_string(), "ws://localhost:7777".to_string()];
+        let targets = vec![
+            "ws://localhost:7777".to_string(),      // own, local — kept because it is ours
+            "wss://peer.example".to_string(),       // peer, public wss — kept
+            "ws://198.51.100.1:7777".to_string(), // peer, public plain-ws VPS relay — kept (address class, not scheme)
+        ];
+        let kept = dm_delivery_targets(&own, targets);
+        assert_eq!(kept.len(), 3, "own + public peer relays all survive, got {kept:?}");
+        assert!(kept.contains(&"ws://localhost:7777".to_string()), "own local relay is never filtered");
+        assert!(kept.contains(&"ws://198.51.100.1:7777".to_string()), "plain-ws public relay kept");
+    }
+
+    #[test]
+    fn dm_delivery_targets_drops_ssrf_peer_relays() {
+        // A stranger's NIP-65 read-list can name internal hosts; every such target must be dropped
+        // while the caller's own relays survive untouched.
+        let own = vec!["wss://own.example".to_string()];
+        let targets = vec![
+            "wss://own.example".to_string(),
+            "ws://127.0.0.1:7777".to_string(),   // loopback
+            "ws://10.0.0.5:7777".to_string(),    // RFC1918
+            "ws://169.254.1.1:7777".to_string(), // link-local
+            "ws://[::1]:7777".to_string(),       // IPv6 loopback
+            "wss://localhost".to_string(),       // literal hostname
+            "ws://100.64.0.1:7777".to_string(),  // CGNAT
+        ];
+        let kept = dm_delivery_targets(&own, targets);
+        assert_eq!(
+            kept,
+            vec!["wss://own.example".to_string()],
+            "every peer-authored internal target is dropped"
+        );
     }
 
     #[test]
@@ -1242,6 +1458,109 @@ mod tests {
     }
 
     #[test]
+    fn dm_inbox_filter_declares_an_explicit_limit() {
+        // audit #11: without `.limit()` the client left the fetch budget to the relay's own default;
+        // an explicit bound keeps the response size ours (CWE-400).
+        let me = Identity::generate();
+        let cold = dm_inbox_filter(me.public_key(), 0);
+        assert_eq!(cold.limit, Some(DM_INBOX_FETCH_LIMIT), "the cold-cache filter declares a budget");
+        let incremental = dm_inbox_filter(me.public_key(), now_secs());
+        assert_eq!(incremental.limit, Some(DM_INBOX_FETCH_LIMIT), "the incremental filter too");
+    }
+
+    #[tokio::test]
+    async fn failed_unwrap_is_recorded_apart_from_the_success_ledger() {
+        // audit #11: a wrap that fails to unwrap is remembered in the (bounded) negative cache so the
+        // next poll can skip it — while staying OUT of the success ledger (`seen_wraps`), which is
+        // exactly the gap the DoS exploited (only successes advanced the ledger, so a failed wrap was
+        // re-fetched and re-unwrapped every poll for 48 h).
+        let me = Identity::generate();
+        let attacker = Identity::generate();
+        let garbage = attacker.sign(EventBuilder::new(Kind::GiftWrap, "junk")).unwrap();
+        let garbage_id = garbage.id.to_hex();
+
+        let empty: HashSet<String> = HashSet::new();
+        let ctxv = ctx(&empty, &empty, &empty, true);
+        let mut cache = DmCache::default();
+        let (requests, _) =
+            merge_wraps_into_cache(&me, &me.npub(), vec![garbage], &ctxv, &mut cache, now_secs()).await;
+
+        assert!(requests.is_empty(), "a failed unwrap yields no request");
+        assert!(cache.seen_wraps.is_empty(), "a failed unwrap never enters the success ledger");
+        assert!(failed_wrap_seen(&me.npub(), &garbage_id), "…but IS remembered in the negative cache");
+    }
+
+    #[tokio::test]
+    async fn negative_cached_wrap_is_skipped_before_unwrap() {
+        // audit #11: an id already in the negative cache must short-circuit BEFORE `unwrap_dm` runs
+        // again. We seed the cache with the id of a wrap that WOULD decode, so the absence of the
+        // decoded message proves the unwrap never ran — the ~15 s poll no longer re-runs crypto on a
+        // hostile wrap for 48 h.
+        let me = Identity::generate();
+        let contact = Identity::generate();
+        let wrap = build_dm(&contact, &me.public_key(), "would decode").await.unwrap();
+        record_failed_wrap(&me.npub(), wrap.id.to_hex());
+
+        let contacts: HashSet<String> = [contact.npub()].into_iter().collect();
+        let empty: HashSet<String> = HashSet::new();
+        let ctxv = ctx(&contacts, &empty, &empty, true);
+        let mut cache = DmCache::default();
+        let (requests, _) =
+            merge_wraps_into_cache(&me, &me.npub(), vec![wrap], &ctxv, &mut cache, now_secs()).await;
+
+        assert!(cache.messages.is_empty(), "a negative-cached wrap is not re-unwrapped");
+        assert!(requests.is_empty(), "…and produces no request");
+        assert!(cache.seen_wraps.is_empty(), "…and is never recorded as a success");
+    }
+
+    #[tokio::test]
+    async fn negative_cache_does_not_cross_identity_boundaries() {
+        // audit #11 follow-up (finding A): the negative cache must key on the RECIPIENT identity, not
+        // the wrap id alone. `unwrap_dm` is deterministic over (identity, wrap) — a wrap addressed to
+        // identity B fails under identity A but decodes under B (a hostile relay feeding B's wrap
+        // while A is active, or a wipe/restore in `commands/identity.rs`). A wrap-id-only cache would
+        // let A's failure poison the GLOBAL cache and skip B's valid message — silent message loss.
+        let me_a = Identity::generate();
+        let me_b = Identity::generate();
+        let contact = Identity::generate();
+
+        // A wrap addressed to B: valid under B, undecryptable under A.
+        let wrap = build_dm(&contact, &me_b.public_key(), "for b").await.unwrap();
+        let wrap_id = wrap.id.to_hex();
+
+        // Simulate A polling it and failing: the failure is recorded in the (global) negative cache.
+        record_failed_wrap(&me_a.npub(), wrap_id.clone());
+
+        // Under B the SAME wrap must still be attempted and decoded — not skipped on A's failure.
+        let contacts: HashSet<String> = [contact.npub()].into_iter().collect();
+        let empty: HashSet<String> = HashSet::new();
+        let ctxv = ctx(&contacts, &empty, &empty, true);
+        let mut cache = DmCache::default();
+        let (requests, _) =
+            merge_wraps_into_cache(&me_b, &me_b.npub(), vec![wrap], &ctxv, &mut cache, now_secs()).await;
+
+        assert_eq!(cache.messages.len(), 1, "a wrap failed under A is still attempted (and decoded) under B");
+        assert_eq!(cache.messages[0].content, "for b", "…and the decoded content is B's message");
+        assert!(requests.is_empty(), "…routing to the contact's inbox, not a request");
+    }
+
+    #[test]
+    fn failed_wrap_cache_is_bounded_and_fifo_evicts() {
+        // audit #11: the negative cache is fed by attacker-controlled ids, so it must be a hard bound
+        // (an unbounded one just moves the DoS to memory). FIFO: oldest evicted first.
+        let mut c = FailedWrapCache::new();
+        for i in 0..MAX_FAILED_WRAPS {
+            c.insert(format!("id{i}"));
+        }
+        assert_eq!(c.set.len(), MAX_FAILED_WRAPS, "the cache holds exactly the cap");
+        assert!(c.contains("id0"), "the first-inserted id survives at exactly the cap");
+        c.insert("overflow".into());
+        assert_eq!(c.set.len(), MAX_FAILED_WRAPS, "the cap is a hard bound, never exceeded");
+        assert!(!c.contains("id0"), "FIFO: the oldest entry is evicted first");
+        assert!(c.contains("overflow"), "the newest entry is retained");
+    }
+
+    #[test]
     fn cached_inbox_reclassifies_under_current_contacts_and_block() {
         let own = "npub1me";
         let mk = |id: &str, from: &str, at: &str| CachedDm {
@@ -1284,7 +1603,7 @@ mod tests {
         let me = Identity::generate();
         let npub = "npub1stranger".to_string();
         store
-            .save_dm_requests(&[DmRequestBucket {
+            .save_dm_requests(&me, &[DmRequestBucket {
                 npub: npub.clone(),
                 first_seen: 1,
                 last_message_at: 5,
@@ -1305,7 +1624,7 @@ mod tests {
         assert_eq!(contact.source, ContactSource::Manual);
         assert!(contact.browse_key_hex.is_none(), "an accepted request contact carries no browse-key");
         assert!(contact.petname.is_none(), "petname=None leaves the default unset");
-        assert!(store.load_dm_requests().unwrap().is_empty(), "the bucket is gone after accept");
+        assert!(store.load_dm_requests(&me).unwrap().is_empty(), "the bucket is gone after accept");
         assert!(
             !store.load_dm_declined().unwrap().iter().any(|(n, _)| n == &npub),
             "accept clears any prior decline for this sender"
@@ -1322,7 +1641,7 @@ mod tests {
         // Some(petname) sets it.
         let npub2 = "npub1stranger2".to_string();
         store
-            .save_dm_requests(&[DmRequestBucket { npub: npub2.clone(), first_seen: 1, last_message_at: 1, messages: vec![] }])
+            .save_dm_requests(&me, &[DmRequestBucket { npub: npub2.clone(), first_seen: 1, last_message_at: 1, messages: vec![] }])
             .unwrap();
         dm_request_accept_inner(&store, &me, "npub1me", npub2.clone(), Some("Bob".into())).await.unwrap();
         let contact2 = store.load_contact(&CachedPeer::pubkey_hash(&npub2)).unwrap().unwrap();
@@ -1333,9 +1652,10 @@ mod tests {
     fn request_decline_persists_and_block_removes_bucket_and_declined() {
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
         let npub = "npub1stranger".to_string();
         store
-            .save_dm_requests(&[DmRequestBucket {
+            .save_dm_requests(&me, &[DmRequestBucket {
                 npub: npub.clone(),
                 first_seen: 1,
                 last_message_at: 1,
@@ -1343,17 +1663,17 @@ mod tests {
             }])
             .unwrap();
 
-        dm_request_decline_inner(&store, npub.clone(), 100).unwrap();
-        assert!(store.load_dm_requests().unwrap().is_empty(), "the bucket is gone after decline");
+        dm_request_decline_inner(&store, &me, npub.clone(), 100).unwrap();
+        assert!(store.load_dm_requests(&me).unwrap().is_empty(), "the bucket is gone after decline");
         let declined = store.load_dm_declined().unwrap();
         assert!(declined.iter().any(|(n, _)| n == &npub), "the decline is remembered");
 
         // Re-seed a bucket (as if the stranger messaged again) and block instead.
         store
-            .save_dm_requests(&[DmRequestBucket { npub: npub.clone(), first_seen: 2, last_message_at: 2, messages: vec![] }])
+            .save_dm_requests(&me, &[DmRequestBucket { npub: npub.clone(), first_seen: 2, last_message_at: 2, messages: vec![] }])
             .unwrap();
-        dm_block_inner(&store, npub.clone()).unwrap();
-        assert!(store.load_dm_requests().unwrap().is_empty(), "block removes any bucket");
+        dm_block_inner(&store, &me, npub.clone()).unwrap();
+        assert!(store.load_dm_requests(&me).unwrap().is_empty(), "block removes any bucket");
         assert!(store.load_dm_declined().unwrap().is_empty(), "block also clears the decline record (blocked supersedes)");
         assert!(store.load_dm_blocked().unwrap().contains(&npub));
 
@@ -1472,7 +1792,7 @@ mod tests {
                 }],
             })
             .collect();
-        store.save_dm_requests(&buckets).unwrap();
+        store.save_dm_requests(&me, &buckets).unwrap();
 
         let mut handles = Vec::new();
         for i in 0..N {
@@ -1515,8 +1835,121 @@ mod tests {
              racing send-persist's save"
         );
         assert!(
-            store.load_dm_requests().unwrap().is_empty(),
+            store.load_dm_requests(&me).unwrap().is_empty(),
             "all N buckets were drained — no accept silently no-op'd on a stale read"
+        );
+    }
+
+    // ── #33 — DM_DECLINED_LOCK / DM_BLOCKED_LOCK serialize concurrent block/decline saves ─────────
+    //
+    // `dm_block_inner` (blocked-add) and `dm_request_decline_inner` (decline-add) each load → mutate
+    // → save their own file. Without their respective locks, two concurrent blocks/declines would
+    // last-write-wins away one entry (the finding's "block two spammers back to back" scenario) — the
+    // exact class DM_REQUESTS_LOCK already closed for dm_requests.json. Hammer N of each on real OS
+    // threads (these are sync fns, unlike the async DM_CACHE_LOCK hammer above) and assert every
+    // entry landed.
+
+    #[test]
+    fn dm_blocked_lock_survives_concurrent_block_hammering() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
+        const N: usize = 25;
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let store = store.clone();
+            let me = me.clone();
+            let npub = format!("npub1block{i}");
+            handles.push(std::thread::spawn(move || {
+                dm_block_inner(&store, &me, npub).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let blocked = store.load_dm_blocked().unwrap();
+        assert_eq!(
+            blocked.len(),
+            N,
+            "DM_BLOCKED_LOCK (#33): every concurrent block landed — none lost to a racing block's save"
+        );
+    }
+
+    #[test]
+    fn dm_declined_lock_survives_concurrent_decline_hammering() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
+        const N: usize = 25;
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let store = store.clone();
+            let me = me.clone();
+            let npub = format!("npub1decline{i}");
+            handles.push(std::thread::spawn(move || {
+                dm_request_decline_inner(&store, &me, npub, 1_700_000_000 + i as u64).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let declined = store.load_dm_declined().unwrap();
+        assert_eq!(
+            declined.len(),
+            N,
+            "DM_DECLINED_LOCK (#33): every concurrent decline landed — none lost to a racing decline's save"
+        );
+    }
+
+    // ── finding B — block-vs-decline must not race into a stale decline ──────────────────────────
+    //
+    // `dm_block_inner` clears the decline under DM_DECLINED_LOCK and then adds the block under
+    // DM_BLOCKED_LOCK — two separate scopes. A concurrent `dm_request_decline_inner` (DM_DECLINED_LOCK)
+    // can re-add the decline in between, leaving the sender blocked AND declined; on a later unblock
+    // they surface as silently declined, a state the user never chose. Blocked must supersede decline
+    // at REST, not just at classification. Hammer one block + one decline per distinct npub on real OS
+    // threads; the invariant `blocked ⇒ not declined` must hold for every npub no matter the ordering.
+
+    #[test]
+    fn block_and_decline_do_not_race_into_a_stale_decline() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
+        const N: usize = 100;
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let npub = format!("npub1race{i}");
+            let store_b = store.clone();
+            let me_b = me.clone();
+            let npub_b = npub.clone();
+            handles.push(std::thread::spawn(move || {
+                dm_block_inner(&store_b, &me_b, npub_b).unwrap();
+            }));
+            let store_d = store.clone();
+            let me_d = me.clone();
+            handles.push(std::thread::spawn(move || {
+                dm_request_decline_inner(&store_d, &me_d, npub, 1_700_000_000 + i as u64).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let blocked = store.load_dm_blocked().unwrap();
+        let declined = store.load_dm_declined().unwrap();
+        assert_eq!(blocked.len(), N, "every concurrent block landed");
+        assert_eq!(
+            declined.len(),
+            0,
+            "blocked supersedes decline: no racing decline may leave a stale decline that a later \
+             unblock would reveal"
+        );
+        // The concrete user-visible bug: after unblocking, the sender is not silently declined.
+        dm_unblock_inner(&store, "npub1race0".to_string()).unwrap();
+        let declined_after = store.load_dm_declined().unwrap();
+        assert!(
+            !declined_after.iter().any(|(n, _)| n == "npub1race0"),
+            "unblocking a racing-declined sender must not reveal a silent decline"
         );
     }
 }

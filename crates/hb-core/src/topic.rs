@@ -990,6 +990,14 @@ pub fn redeem_invite(
             return Err(HbError::InvalidEvent("invite expired".into()));
         }
     }
+    // Decode + length-validate the 32-byte `topic_key` BEFORE the replay-nonce insert — a hand-crafted
+    // invite carrying a malformed key must fail here, not after burning the single-use seen-key (which
+    // would permanently poison the (topic_id, invitee) slot and reject the genuine invite). Mirrors the
+    // topic-mismatch check above, ordered the same way for the same reason.
+    let key_bytes: [u8; 32] = hex::decode(&payload.topic_key)
+        .map_err(|_| HbError::InvalidEncryptedMessage)?
+        .try_into()
+        .map_err(|_| HbError::InvalidEncryptedMessage)?;
     // Replay protection is keyed on the EXPLICIT `reusable` flag, not on `expires_at`. A single-use
     // invite (every private invite) is atomically checked-and-inserted (closing the caller TOCTOU); the
     // reusable public-join credential is exempt (every joiner derives the same name-scoped invitee, so a
@@ -1000,10 +1008,6 @@ pub fn redeem_invite(
             return Err(HbError::InvalidEvent("invite already redeemed (replay)".into()));
         }
     }
-    let key_bytes: [u8; 32] = hex::decode(&payload.topic_key)
-        .map_err(|_| HbError::InvalidEncryptedMessage)?
-        .try_into()
-        .map_err(|_| HbError::InvalidEncryptedMessage)?;
     Ok((payload.meta, TopicKey(key_bytes), issuer))
 }
 
@@ -1080,6 +1084,45 @@ mod tests {
 
     fn private_topic() -> (TopicMeta, TopicKey) {
         new_topic("back-room", "private", vec![], true).unwrap()
+    }
+
+    /// Test-only mirror of `mint_invite_with_policy` (single-use, `reusable = false`) that accepts a
+    /// raw `topic_key` string so a test can mint an invite carrying a malformed key — something the
+    /// production `mint_invite` (which hex-encodes a real `TopicKey`) can never produce.
+    fn mint_invite_with_raw_key(
+        issuer: &Identity,
+        invitee: &PublicKey,
+        meta: &TopicMeta,
+        topic_key: &str,
+        nonce: &str,
+        expires_at: Option<u64>,
+        now: u64,
+    ) -> Result<Event, HbError> {
+        let payload = serde_json::to_string(&InvitePayload {
+            meta: meta.clone(),
+            topic_key: topic_key.to_string(),
+            nonce: nonce.to_string(),
+            expires_at,
+            reusable: false,
+            schema_v: SCHEMA_V,
+            crypto_v: CRYPTO_V,
+        })?;
+        let issuer_sk = issuer.keys().secret_key();
+        let rumor: UnsignedEvent = EventBuilder::new(Kind::from_u16(KIND_TOPIC_INVITE), payload)
+            .tags([
+                Tag::custom(TagKind::custom(TAG_SCHEMA), [SCHEMA_V.to_string()]),
+                Tag::custom(TagKind::custom(TAG_CRYPTO), [CRYPTO_V.to_string()]),
+            ])
+            .custom_created_at(Timestamp::from(now))
+            .build(issuer.public_key());
+        let seal_content = nip44::encrypt(issuer_sk, invitee, rumor.as_json(), nip44::Version::V2)
+            .map_err(|e| HbError::Nostr(e.to_string()))?;
+        let seal = EventBuilder::new(Kind::Seal, seal_content)
+            .custom_created_at(Timestamp::from(now))
+            .sign_with_keys(issuer.keys())
+            .map_err(|e| HbError::Nostr(e.to_string()))?;
+        EventBuilder::gift_wrap_from_seal(invitee, &seal, [])
+            .map_err(|e| HbError::Nostr(e.to_string()))
     }
 
     // ───────────────────────── W4: path normalization + fixed-root rule ─────────────────────────
@@ -1367,6 +1410,47 @@ mod tests {
         // (c) expected = None (the blind private-redeem path) → Ok with a fresh seen-set.
         let inv2 = mint_invite(&issuer, &invitee.public_key(), &meta, &key, "n2", Some(NOW + 100), NOW).unwrap();
         assert!(redeem_invite(&invitee, &inv2, &mut NonceSet::new(), NOW, None).is_ok(), "blind redeem is unaffected");
+    }
+
+    #[test]
+    fn malformed_topic_key_does_not_burn_the_single_use_seen_key() {
+        // A hand-crafted single-use invite carrying a malformed `topic_key` passes every earlier check
+        // (schema/crypto/expiry/topic-match), so the key decode/length gate is the LAST validation
+        // before the replay-nonce insert. Ordered wrongly (insert-then-decode), the malformed invite
+        // would burn the (topic_id, invitee) seen-key and then fail, permanently poisoning the slot so
+        // the genuine invite is later rejected as "already redeemed". The decode must precede the insert.
+        let issuer = Identity::generate();
+        let invitee = Identity::generate();
+        let (meta, key) = private_topic();
+
+        // A malformed key (valid hex, wrong length) that sails past every earlier check.
+        let bad = mint_invite_with_raw_key(
+            &issuer,
+            &invitee.public_key(),
+            &meta,
+            "deadbeef", // decodes to 4 bytes, not 32 — fails the length gate
+            "n1",
+            Some(NOW + 100),
+            NOW,
+        )
+        .unwrap();
+
+        let mut seen = NonceSet::new();
+        assert!(
+            matches!(
+                redeem_invite(&invitee, &bad, &mut seen, NOW, None),
+                Err(HbError::InvalidEncryptedMessage)
+            ),
+            "a malformed topic_key is rejected at the decode/length gate"
+        );
+        assert!(seen.is_empty(), "a malformed-key invite must NOT burn the seen-key");
+
+        // The genuine invite for the SAME (topic_id, invitee) slot still redeems — the slot was not poisoned.
+        let good = mint_invite(&issuer, &invitee.public_key(), &meta, &key, "n2", Some(NOW + 100), NOW).unwrap();
+        assert!(
+            redeem_invite(&invitee, &good, &mut seen, NOW, None).is_ok(),
+            "the genuine invite redeems because the malformed one never claimed the seen-key"
+        );
     }
 
     #[test]

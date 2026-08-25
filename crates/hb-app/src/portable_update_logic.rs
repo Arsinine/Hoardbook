@@ -64,16 +64,23 @@ pub fn is_newer(current: &str, candidate: &str) -> bool {
 /// on a GitHub release host. Defense-in-depth *beside* the signature check (security review #3) — it
 /// removes the "a tampered manifest redirects the download to a foreign host / plain http" primitive
 /// even before verification, and defeats userinfo/lookalike-host tricks.
+///
+/// Parsing is WHATWG-compliant (via `reqwest::Url`, a re-export of the `url` crate) rather than
+/// hand-rolled string-splitting. Naive splitting diverges from WHATWG on a backslash-before-`@`
+/// authority terminator: `https://evil.com\@github.com/x` *looks* like host `github.com` to a
+/// string splitter but WHATWG (and reqwest itself) connect to `evil.com` (security review #27).
 pub fn is_trusted_artifact_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = authority.rsplit('@').next().unwrap_or(authority); // drop any userinfo
-    let host = host.split(':').next().unwrap_or(host); // drop any port
+    if parsed.scheme() != "https" {
+        return false;
+    }
     matches!(
-        host,
-        "github.com" | "objects.githubusercontent.com" | "release-assets.githubusercontent.com"
+        parsed.host_str(),
+        Some("github.com")
+            | Some("objects.githubusercontent.com")
+            | Some("release-assets.githubusercontent.com")
     )
 }
 
@@ -105,6 +112,73 @@ pub fn verify_signature(data: &[u8], signature: &str, pubkey: &str) -> Result<()
 fn base64_to_string(b64: &str) -> Result<String, String> {
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64).map_err(|e| e.to_string())?;
     String::from_utf8(bytes).map_err(|e| e.to_string())
+}
+
+/// Extract the `major.minor.patch` version embedded in a Windows PE's `VS_VERSION_INFO` resource,
+/// which `tauri-build` writes into every Windows binary (`FILEVERSION`/`PRODUCTVERSION` from
+/// `tauri.conf.json` — the same version the release manifest claims). This is the monotonicity half
+/// of the secure-update framework (security review #34): the minisign signature binds the bytes, and
+/// this binds the bytes' *own* version to the manifest's claimed version, so a manifest that lies
+/// about the version while pointing at a genuinely-signed old release is rejected.
+///
+/// The version is read from the fixed `VS_FIXEDFILEINFO` block (`dwFileVersionMS` = `(major<<16)|minor`,
+/// `dwFileVersionLS` = `(patch<<16)|build`), located by scanning for the resource's fixed `szKey`
+/// `"VS_VERSION_INFO"` (UTF-16LE) and validating `dwSignature == 0xFEEF_04BD`. Returns `None` when no
+/// well-formed version resource is found — callers fail closed.
+pub fn portable_exe_version(data: &[u8]) -> Option<String> {
+    let needle = utf16le("VS_VERSION_INFO\0");
+    let mut version: Option<(u16, u16, u16)> = None;
+    for (i, w) in data.windows(needle.len()).enumerate() {
+        if w != needle.as_slice() {
+            continue;
+        }
+        // `i` points at the `szKey`; the enclosing VS_VERSIONINFO starts 6 bytes earlier, and its
+        // VS_FIXEDFILEINFO begins at offset 40 (2 wLength + 2 wValueLength + 2 wType + 32 szKey +
+        // 2 pad). Fields: dwSignature @40, dwStrucVersion @44, dwFileVersionMS @48, dwFileVersionLS @52.
+        let Some(base) = i.checked_sub(6) else { continue };
+        let (Some(sig), Some(struc), Some(fvms), Some(fvls)) = (
+            read_u32_le(data, base + 40),
+            read_u32_le(data, base + 44),
+            read_u32_le(data, base + 48),
+            read_u32_le(data, base + 52),
+        ) else {
+            continue;
+        };
+        if sig != 0xFEEF_04BD || struc != 0x0001_0000 {
+            continue; // a lookalike marker without a valid fixed block — keep scanning
+        }
+        let candidate = ((fvms >> 16) as u16, (fvms & 0xFFFF) as u16, (fvls >> 16) as u16);
+        match version {
+            None => version = Some(candidate),
+            Some(prev) if prev != candidate => return None, // two resources disagree — refuse
+            Some(_) => {}
+        }
+    }
+    version.map(|(major, minor, patch)| format!("{major}.{minor}.{patch}"))
+}
+
+/// Does the (already signature-verified) binary's own embedded version equal the version the manifest
+/// claims? Fails closed — an unreadable, unparseable, or mismatched version is `false`, so the caller
+/// refuses to install. Closes the TUF-style rollback (security review #34): a manifest claiming a fake
+/// high version while pointing at a genuinely-signed *old* release is rejected because the old binary
+/// reports its real, lower version.
+pub fn binary_matches_claimed_version(data: &[u8], claimed: &str) -> bool {
+    let Some(embedded) = portable_exe_version(data) else {
+        return false;
+    };
+    match (semver::Version::parse(&embedded), semver::Version::parse(claimed)) {
+        (Ok(e), Ok(c)) => e == c,
+        _ => false,
+    }
+}
+
+fn utf16le(s: &str) -> Vec<u8> {
+    s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+}
+
+fn read_u32_le(data: &[u8], at: usize) -> Option<u32> {
+    let b = data.get(at..at + 4)?;
+    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 #[cfg(test)]
@@ -156,6 +230,65 @@ mod tests {
         assert!(!is_trusted_artifact_url("https://github.com.evil.com/x"), "lookalike host rejected");
         assert!(!is_trusted_artifact_url("https://github.com@evil.com/x"), "userinfo trick rejected");
         assert!(!is_trusted_artifact_url("ftp://github.com/x"), "non-https scheme rejected");
+    }
+
+    #[test]
+    fn trusted_artifact_url_rejects_backslash_userinfo_differential() {
+        // The exact parser-differential from security review #27: a naive splitter sees the host as
+        // `github.com` (the segment after the `@`), but WHATWG treats `\` as a path separator, so the
+        // real host is `evil.com`. reqwest follows WHATWG, so the allowlist must agree with WHATWG.
+        assert!(
+            !is_trusted_artifact_url("https://evil.com\\@github.com/x"),
+            "backslash-before-@ must NOT be accepted as github.com"
+        );
+        assert!(!is_trusted_artifact_url("https://evil.com\\@release-assets.githubusercontent.com/x"));
+        assert!(!is_trusted_artifact_url("https://evil.com\\@objects.githubusercontent.com/x"));
+    }
+
+    /// A minimal, spec-faithful VS_VERSIONINFO blob: a root header plus the fixed `VS_FIXEDFILEINFO`
+    /// block whose `dwFileVersionMS`/`LS` carry `(major,minor)`/`(patch,0)`. Mirrors the layout
+    /// `tauri-build`/`tauri-winres` emit (`FILEVERSION major, minor, patch, 0`).
+    fn fake_vs_versioninfo(major: u16, minor: u16, patch: u16) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&92u16.to_le_bytes()); // wLength (40-byte header + 52-byte fixed info)
+        v.extend_from_slice(&52u16.to_le_bytes()); // wValueLength (sizeof VS_FIXEDFILEINFO)
+        v.extend_from_slice(&0u16.to_le_bytes()); // wType (binary)
+        v.extend_from_slice(&utf16le("VS_VERSION_INFO\0")); // szKey (16 WCHARs)
+        v.extend_from_slice(&[0, 0]); // padding to DWORD alignment
+        v.extend_from_slice(&0xFEEF_04BDu32.to_le_bytes()); // dwSignature
+        v.extend_from_slice(&0x0001_0000u32.to_le_bytes()); // dwStrucVersion
+        v.extend_from_slice(&((u32::from(major) << 16) | u32::from(minor)).to_le_bytes()); // dwFileVersionMS
+        v.extend_from_slice(&(u32::from(patch) << 16).to_le_bytes()); // dwFileVersionLS (build=0)
+        v.extend_from_slice(&((u32::from(major) << 16) | u32::from(minor)).to_le_bytes()); // dwProductVersionMS
+        v.extend_from_slice(&(u32::from(patch) << 16).to_le_bytes()); // dwProductVersionLS
+        for _ in 0..7 {
+            v.extend_from_slice(&0u32.to_le_bytes()); // dwFileFlagsMask .. dwFileDateLS
+        }
+        assert_eq!(v.len(), 92);
+        v
+    }
+
+    #[test]
+    fn embedded_version_binds_to_the_manifest_claim() {
+        let exe = fake_vs_versioninfo(0, 16, 0);
+        assert_eq!(portable_exe_version(&exe).as_deref(), Some("0.16.0"));
+        assert!(binary_matches_claimed_version(&exe, "0.16.0"), "matching version binds");
+        assert!(
+            !binary_matches_claimed_version(&exe, "9.9.9"),
+            "a fake high version pointing at an old binary must be rejected (rollback)"
+        );
+        assert!(!binary_matches_claimed_version(&exe, "0.15.0"), "a lower real version is a downgrade");
+    }
+
+    #[test]
+    fn missing_or_garbled_embedded_version_fails_closed() {
+        assert_eq!(portable_exe_version(b"not a PE"), None);
+        assert!(!binary_matches_claimed_version(b"", "0.16.0"));
+        assert!(!binary_matches_claimed_version(b"garbage", "0.16.0"));
+        // A UTF-16LE "VS_VERSION_INFO" marker with a clobbered dwSignature must not be trusted.
+        let mut exe = fake_vs_versioninfo(0, 16, 0);
+        exe[40] = 0x00; // break dwSignature (0xFEEF_04BD -> 0xFEEF_0400)
+        assert_eq!(portable_exe_version(&exe), None);
     }
 
     #[test]

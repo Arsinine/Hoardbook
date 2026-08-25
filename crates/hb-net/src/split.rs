@@ -798,14 +798,27 @@ fn restitch_v1(parts: &[String]) -> Result<String, NetError> {
 /// trees is `render.rs`'s v2 render).
 fn restitch_v2(parts: &[String]) -> Result<String, NetError> {
     let mut index: Option<Map<String, Value>> = None;
-    let mut candidates: Vec<(&str, Value)> = Vec::new();
+    // Retain only the raw part strings here, not parsed `Value`s (the same fix `render_v2`
+    // received): parsing every candidate up front let a hostile batch (thousands of parts, matched
+    // or not) be fully materialised before the byte cap below could fire. Keeping `&str` and
+    // parsing a matched part on demand bounds retained memory to the cap on matched content.
+    let mut candidates: Vec<&str> = Vec::new();
     for json in parts {
         let v: Value = serde_json::from_str(json).map_err(|e| NetError::Split(e.to_string()))?;
         let obj = v.as_object().ok_or_else(|| NetError::Split("part is not an object".into()))?;
         if obj.get("split") == Some(&Value::Bool(true)) {
             index = Some(obj.clone());
         } else {
-            candidates.push((json.as_str(), v));
+            candidates.push(json.as_str());
+            // Bound the candidate count as it accrues: a compliant index names at most
+            // MAX_LISTING_PARTS parts, so a family ships at most that many content parts. More
+            // (a hostile peer inventing part payloads) is refused before retaining the batch.
+            if candidates.len() > MAX_LISTING_PARTS {
+                return Err(NetError::Split(format!(
+                    "restitch ships {} content parts, exceeds the {MAX_LISTING_PARTS}-part cap",
+                    candidates.len()
+                )));
+            }
         }
     }
     let index = index.ok_or_else(|| NetError::Split("no index part found".into()))?;
@@ -813,7 +826,7 @@ fn restitch_v2(parts: &[String]) -> Result<String, NetError> {
 
     let mut filled: Vec<Option<Value>> = vec![None; part_count];
     let mut matched_bytes: usize = 0;
-    for (raw, value) in &candidates {
+    for raw in &candidates {
         let slot = match slot_hashes.iter().position(|s| s == &sha256_hex(raw.as_bytes())) {
             Some(slot) => slot,
             None => continue, // sha256 matches no declared slot → stale/unreferenced, ignored
@@ -827,7 +840,10 @@ fn restitch_v2(parts: &[String]) -> Result<String, NetError> {
                 "restitched payload exceeds the {MAX_RESTITCHED_BYTES}-byte cap"
             )));
         }
-        filled[slot] = Some(value.clone());
+        // Parse only now — matched, unique, and within the byte cap. A stale/unmatched part is
+        // skipped above without being parsed, so it never counts toward the cap or retained memory.
+        let v: Value = serde_json::from_str(raw).map_err(|e| NetError::Split(e.to_string()))?;
+        filled[slot] = Some(v);
     }
 
     let present = filled.iter().filter(|s| s.is_some()).count();
@@ -1638,6 +1654,34 @@ mod tests {
         match restitch_listing(&family) {
             Err(NetError::Split(m)) => assert!(m.contains("cap"), "got: {m}"),
             other => panic!("expected a restitched-size-cap rejection, got {other:?}"),
+        }
+    }
+
+    /// Residual B (2026-08-24): `restitch_v2` shared `render_v2`'s old "materialise every candidate
+    /// before checking the cap" shape. The only *observable* part of the fix is this candidate-count
+    /// bound — the `&str`-not-`Value` retention and parse-on-demand are peak-memory-only and
+    /// invisible to a black-box test. A compliant index names at most MAX_LISTING_PARTS content
+    /// parts, so more candidates than that means a hostile peer injected extra (stale) payloads:
+    /// the fixed path refuses the count up front, while the unfixed path parses them all, matches
+    /// the one real part, ignores the MAX_LISTING_PARTS stale ones, and returns Ok.
+    #[test]
+    fn restitch_rejects_candidate_count_over_cap() {
+        // One real matched part, referenced by a compliant one-slot index.
+        let real = content_part(&[], 0, serde_json::json!([{"name":"x"}]));
+        let mut family = v2_family("hand", &[real]);
+        // MAX_LISTING_PARTS stale (unmatched) parts — never referenced by the index.
+        for i in 0..MAX_LISTING_PARTS {
+            family.push(
+                serde_json::json!({ "entries": [], "mount": [], "part": 10_000 + i, "parts_v": 2 })
+                    .to_string(),
+            );
+        }
+        // 1 matched + MAX_LISTING_PARTS stale = MAX_LISTING_PARTS + 1 candidates, one over the cap.
+        match restitch_listing(&family) {
+            Err(NetError::Split(m)) => {
+                assert!(m.contains("content parts"), "expected the candidate-count cap, got: {m}");
+            }
+            other => panic!("expected a candidate-count-cap rejection, got {other:?}"),
         }
     }
 

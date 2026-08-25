@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use hb_core::Identity;
+
 use crate::store::{read_json_lenient, write_json, DataStore};
 
 /// OWNER-RATIFICATION DEFAULT (Q7): the maximum number of distinct stranger senders held in the
@@ -112,14 +114,30 @@ impl DataStore {
         self.base_dir().join("dm_requests.json")
     }
 
-    pub fn load_dm_requests(&self) -> Result<Vec<DmRequestBucket>> {
-        Ok(read_json_lenient::<Vec<DmRequestBucket>>(&self.dm_requests_path())
-            .context("loading dm requests")?
-            .unwrap_or_default())
+    pub fn load_dm_requests(&self, identity: &Identity) -> Result<Vec<DmRequestBucket>> {
+        let path = self.dm_requests_path();
+        // Migration (INV-8 — durable data deletion is deliberate, never accidental): a file written
+        // by a pre-sealing version is plaintext JSON — the bucket array itself — and must still load
+        // (the next save re-writes it sealed) rather than crashing or silently reading as empty. A
+        // sealed file is a single JSON string (base64 ciphertext), which fails to parse as the array
+        // and falls through to the sealed read below.
+        if let Some(buckets) =
+            read_json_lenient::<Vec<DmRequestBucket>>(&path).context("loading dm requests")?
+        {
+            return Ok(buckets);
+        }
+        let sealed: Option<String> = read_json_lenient::<String>(&path).context("loading dm requests")?;
+        let Some(sealed) = sealed else { return Ok(Vec::new()) };
+        match hb_core::open_dm_cache(identity, &sealed) {
+            Ok(json) => Ok(serde_json::from_str(&json).unwrap_or_default()),
+            Err(_) => Ok(Vec::new()),
+        }
     }
 
-    pub fn save_dm_requests(&self, buckets: &[DmRequestBucket]) -> Result<()> {
-        write_json(&self.dm_requests_path(), buckets).context("saving dm requests")
+    pub fn save_dm_requests(&self, identity: &Identity, buckets: &[DmRequestBucket]) -> Result<()> {
+        let json = serde_json::to_string(buckets).context("serializing dm requests")?;
+        let sealed = hb_core::seal_dm_cache(identity, &json).context("sealing dm requests")?;
+        write_json(&self.dm_requests_path(), &sealed).context("saving dm requests")
     }
 
     pub fn dm_declined_path(&self) -> PathBuf {
@@ -230,11 +248,73 @@ mod tests {
     }
 
     #[test]
+    fn dm_requests_roundtrips_through_the_sealed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
+        let buckets = vec![DmRequestBucket {
+            npub: "npub1a".into(),
+            first_seen: 1,
+            last_message_at: 5,
+            messages: vec![msg("w1")],
+        }];
+        store.save_dm_requests(&me, &buckets).unwrap();
+        assert_eq!(store.load_dm_requests(&me).unwrap(), buckets);
+    }
+
+    #[test]
+    fn dm_requests_on_disk_bytes_are_ciphertext_never_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
+        // A recognisable plaintext (hyphen is not in the base64 alphabet) proves it isn't on disk —
+        // the same idiom the DM-cache ciphertext test uses.
+        let buckets = vec![DmRequestBucket {
+            npub: "npub1a".into(),
+            first_seen: 0,
+            last_message_at: 0,
+            messages: vec![RequestMessage {
+                wrap_id: "w1".into(),
+                content: "SECRET-BACKROOM".into(),
+                sent_at: "2026-01-01T00:00:00Z".into(),
+            }],
+        }];
+        store.save_dm_requests(&me, &buckets).unwrap();
+        let raw = std::fs::read_to_string(store.dm_requests_path()).unwrap();
+        assert!(!raw.contains("SECRET-BACKROOM"), "message plaintext must not appear on disk");
+        assert!(!raw.contains("npub1a"), "sender npub must not appear on disk");
+    }
+
+    #[test]
+    fn dm_requests_migrates_a_plaintext_file_to_sealed_without_dropping_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
+        let buckets = vec![DmRequestBucket {
+            npub: "npub1a".into(),
+            first_seen: 1,
+            last_message_at: 5,
+            messages: vec![msg("w1")],
+        }];
+        // Simulate a pre-sealing install: the old `save_dm_requests` wrote the plaintext array directly.
+        write_json(&store.dm_requests_path(), &buckets).unwrap();
+        // The migration load must return the pending requests (INV-8 — no silent vaporize)…
+        let loaded = store.load_dm_requests(&me).unwrap();
+        assert_eq!(loaded, buckets, "a pre-sealing plaintext file must still load its buckets");
+        // …and the next save seals them, leaving no plaintext on disk and round-tripping cleanly.
+        store.save_dm_requests(&me, &loaded).unwrap();
+        let raw = std::fs::read_to_string(store.dm_requests_path()).unwrap();
+        assert!(!raw.contains("npub1a"), "after migration the file is sealed, not plaintext");
+        assert_eq!(store.load_dm_requests(&me).unwrap(), buckets);
+    }
+
+    #[test]
     fn quarantine_and_announce_files_land_under_base_dir_and_are_wipe_covered() {
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
         store
-            .save_dm_requests(&[DmRequestBucket {
+            .save_dm_requests(&me, &[DmRequestBucket {
                 npub: "npub1x".into(),
                 first_seen: 0,
                 last_message_at: 0,

@@ -491,6 +491,17 @@ fn merge_local_state(peer: &mut CachedPeer, existing: &CachedPeer, had_explicit_
     // A fresh resolve always produces `Manual`; a pre-existing `Topic` source is local-only state
     // (joining a Topic auto-added this peer) that a relay teaser cannot re-derive — preserve it.
     peer.source = existing.source;
+    // QURATOR-119 #35: no-downgrade carry-over. A bare-npub (keyless) re-follow rebuilds the peer
+    // with `browse_key_hex: None` and empty `collections`; falling back to the stored key/cache keeps
+    // the contact browseable without re-sharing a full code. A full code carrying a *different,
+    // non-empty* key is `Some` here and must win (a legitimate key rotation), so only an absent key
+    // defers to storage — mirroring `merge_browse_key`'s absent-incoming-key rule.
+    if peer.browse_key_hex.is_none() {
+        peer.browse_key_hex = existing.browse_key_hex.clone();
+    }
+    if peer.collections.is_empty() {
+        peer.collections = existing.collections.clone();
+    }
 }
 
 /// The pure save-tail of [`follow`]: petname apply → R2 gate → local-state merge → store write →
@@ -612,11 +623,28 @@ pub async fn refresh_contact(
         .ok_or_else(|| format!("Contact {npub} not found"))?;
     let share_code = contact_share_code(&existing)?;
     let me = identity_clone(&identity).await?;
-    let mut updated = resolve_peer(&share_code, &me, &store, &relay).await?;
+    let updated = resolve_peer(&share_code, &me, &store, &relay).await?;
+    save_refreshed_contact(&store, &hash, &existing, updated)
+}
+
+/// The pure save-tail of [`refresh_contact`]: merge local-only state onto the freshly resolved peer
+/// then persist. Extracted (QURATOR-119 #12) so the refresh path's preservation is unit-testable
+/// without a relay, mirroring [`follow`]'s [`save_followed_peer`] extraction. Never calls the relay;
+/// only the local store. `source` is local-only (a relay teaser can only ever rebuild it as
+/// `Manual`), so a pre-existing `Topic` contact must keep its badge — otherwise the Contacts
+/// auto-refresh would silently promote a topic-sourced stranger into the private-listing trust gate
+/// (`contact_author_allowlist` admits exactly `Manual`).
+fn save_refreshed_contact(
+    store: &DataStore,
+    hash: &str,
+    existing: &CachedPeer,
+    mut updated: CachedPeer,
+) -> Result<CachedPeer, String> {
     // Preserve local-only state across refresh.
-    updated.local_tags = existing.local_tags;
-    updated.petname = existing.petname.or(updated.petname);
-    store.save_contact(&hash, &updated).map_err(cmd_err)?;
+    updated.local_tags = existing.local_tags.clone();
+    updated.petname = existing.petname.clone().or(updated.petname);
+    updated.source = existing.source;
+    store.save_contact(hash, &updated).map_err(cmd_err)?;
     Ok(updated)
 }
 
@@ -1635,5 +1663,121 @@ mod tests {
         let loaded = store.load_contact(&hash).unwrap().unwrap();
         assert_eq!(loaded.petname.as_deref(), Some("Cached"), "the local petname survives re-add");
         assert_eq!(loaded.local_tags, vec!["vip".to_string()], "local tags survive re-add");
+    }
+
+    // ── QURATOR-119 #12: refresh must not promote a Topic-sourced contact to Manual ──────────
+    // Contacts auto-refreshes every contact on mount; `refresh_contact` rebuilds each via
+    // `resolve_peer`, which hardcodes `source: Manual`. Without this guard a topic-sourced stranger
+    // (who joined a public Topic, zero interaction with the victim) would be durably flipped to
+    // `Manual` on the victim's next Contacts visit, silently admitting them to the private-listing
+    // trust gate (`contact_author_allowlist` admits exactly `Manual`). This drives
+    // `save_refreshed_contact` — the exact save-tail `refresh_contact` runs — through a store
+    // round-trip, NOT `merge_local_state` (follow's helper, which already carried the guard and so
+    // stayed green while this path broke).
+
+    #[test]
+    fn refresh_preserves_topic_source_through_refresh_contact_save_tail() {
+        let (_dir, store) = test_store();
+        let npub = "npub1_q119_refresh";
+        let hash = CachedPeer::pubkey_hash(npub);
+
+        // A topic-sourced contact, exactly as `upsert_topic_contact` leaves it.
+        let mut existing = stub_peer(npub, None);
+        existing.source = crate::store::ContactSource::Topic;
+        store.save_contact(&hash, &existing).unwrap();
+
+        // What `resolve_peer` hands `refresh_contact`: a fresh rebuild, hardcoded `Manual`, carrying a
+        // freshly-derived teaser petname and no local state.
+        let updated = stub_peer(npub, Some("FreshTeaserName"));
+        assert_eq!(
+            updated.source,
+            crate::store::ContactSource::Manual,
+            "resolve_peer rebuilds as Manual — this is the bug's premise"
+        );
+
+        let saved = save_refreshed_contact(&store, &hash, &existing, updated).unwrap();
+        assert_eq!(
+            saved.source,
+            crate::store::ContactSource::Topic,
+            "refresh must not promote a Topic contact to Manual"
+        );
+        let reloaded = store.load_contact(&hash).unwrap().unwrap();
+        assert_eq!(
+            reloaded.source,
+            crate::store::ContactSource::Topic,
+            "the durable record keeps the Topic badge"
+        );
+    }
+
+    // ── QURATOR-119 #35: re-follow must not drop a stored browse-key / collections ──────────
+    // Re-following an already-keyed contact via a bare-npub (keyless) share code rebuilds the peer
+    // keyless with empty collections. `merge_local_state` must fall back to the stored key/cache so
+    // the peer stays browseable, while a full code carrying a *different* key (a rotation) still wins.
+
+    fn cached_collection(slug: &str) -> PeerCollection {
+        PeerCollection {
+            collection: Collection {
+                slug: slug.into(),
+                path_alias: slug.into(),
+                description: None,
+                item_count: 1,
+                est_size: None,
+                content_types: vec![],
+                tags: vec![],
+                languages: vec![],
+                visibility: hb_core::types::Visibility::Public,
+                sorted: false,
+                last_updated: Utc::now(),
+                listing: vec![],
+            },
+            parts_total: None,
+            parts_present: None,
+            truncated: None,
+            total_items: None,
+            snapshot_fingerprint: None,
+            manifest_imported_at: None,
+            teaser_event_id: None,
+        }
+    }
+
+    #[test]
+    fn merge_local_state_carries_over_stored_browse_key_and_collections_when_fresh_are_empty() {
+        let npub = "npub1_q119_keyless";
+        let mut fresh = stub_peer(npub, None);
+        assert!(fresh.browse_key_hex.is_none(), "a bare-npub re-follow rebuilds keyless");
+        assert!(fresh.collections.is_empty(), "and without cached collections");
+
+        let mut existing = stub_peer(npub, Some("Cached"));
+        existing.browse_key_hex = Some(hex::encode([11u8; 32]));
+        existing.collections = vec![cached_collection("vault")];
+
+        merge_local_state(&mut fresh, &existing, false);
+        assert_eq!(
+            fresh.browse_key_hex.as_deref(),
+            Some(hex::encode([11u8; 32]).as_str()),
+            "the stored browse-key survives a keyless re-follow"
+        );
+        assert_eq!(fresh.collections.len(), 1, "cached collections survive a keyless re-follow");
+        assert_eq!(fresh.collections[0].collection.slug, "vault");
+    }
+
+    #[test]
+    fn merge_local_state_lets_a_rotated_browse_key_win_over_the_stored_key() {
+        // A full code carrying a DIFFERENT, non-empty key is a rotation and must win — only an
+        // absent key falls back to storage. This is what distinguishes #35's no-downgrade from a
+        // "never update the key" bug.
+        let npub = "npub1_q119_rotate";
+        let mut fresh = stub_peer(npub, None);
+        fresh.browse_key_hex = Some(hex::encode([22u8; 32])); // the rotated key from the new code
+
+        let mut existing = stub_peer(npub, Some("Cached"));
+        existing.browse_key_hex = Some(hex::encode([11u8; 32])); // the old key on disk
+
+        merge_local_state(&mut fresh, &existing, false);
+        assert_eq!(
+            fresh.browse_key_hex.as_deref(),
+            Some(hex::encode([22u8; 32]).as_str()),
+            "a non-empty incoming key (rotation) wins over the stored key"
+        );
     }
 }

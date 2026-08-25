@@ -144,6 +144,17 @@ fn ipv6_non_global(ip: std::net::Ipv6Addr) -> bool {
         || (seg[0] == 0x2001 && seg[1] == 0xdb8) // documentation 2001:db8::/32
 }
 
+/// Whether `ip` is non-globally-routable — the `IpAddr` dispatch wrapper over
+/// [`ipv4_non_global`]/[`ipv6_non_global`] for callers holding a bare address (e.g. a socket address
+/// from a peer-authored dial target, QURATOR-113 #20). No new classification: this only re-routes
+/// the two existing checks by address family.
+pub(crate) fn ip_non_global(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => ipv4_non_global(v4),
+        std::net::IpAddr::V6(v6) => ipv6_non_global(v6),
+    }
+}
+
 /// Local NAT classification inferred from the observed local address and, when available, the
 /// mapped/public address learned from outside (a STUN-like or relay-reported observation). The
 /// decision is **pure** and answers the ticket's offline-testable questions:

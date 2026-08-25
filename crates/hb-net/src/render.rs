@@ -23,7 +23,9 @@
 use serde_json::{Map, Value};
 
 use crate::error::NetError;
-use crate::split::{graft, index_slots, parse_content_part_v2, parts_version, sha256_hex};
+use crate::split::{
+    graft, index_slots, parse_content_part_v2, parts_version, sha256_hex, MAX_RESTITCHED_BYTES,
+};
 
 /// Read-side cap on the part count an index may claim. A hostile relay can serve an index
 /// asserting an enormous `parts`, so we refuse it before collecting/allocating.
@@ -191,14 +193,28 @@ fn render_v1(payloads: &[String]) -> Result<RenderedListing, NetError> {
 /// v2 render (M13 depth-recursive split, `parts_v: 2`) — see module docs for the leniency rules.
 fn render_v2(payloads: &[String]) -> Result<RenderedListing, NetError> {
     let mut index: Option<Map<String, Value>> = None;
-    let mut candidates: Vec<(&str, Value)> = Vec::new();
+    // Retain only the raw part strings here, not parsed `Value`s. Parsing every payload up front
+    // is exactly what let a hostile batch (thousands of large parts, matched or not) be fully
+    // materialised before the byte cap below could fire — that cap bounded what was *cloned into
+    // `filled`*, never peak allocation. Keeping `&str` (the caller already owns the bytes) and
+    // parsing matched parts on demand bounds retained memory to the cap on matched content.
+    let mut candidates: Vec<&str> = Vec::new();
     for json in payloads {
         let v: Value = serde_json::from_str(json).map_err(|e| NetError::Split(e.to_string()))?;
         let obj = v.as_object().ok_or_else(|| NetError::Split("part is not an object".into()))?;
         if obj.get("split") == Some(&Value::Bool(true)) {
             index = Some(obj.clone());
         } else {
-            candidates.push((json.as_str(), v));
+            candidates.push(json.as_str());
+            // Bound the candidate count as it accrues: a compliant index names at most
+            // MAX_LISTING_PARTS parts, so a family ships at most that many content parts. More
+            // than that (a hostile peer inventing part d-tags) is refused before retaining the batch.
+            if candidates.len() > MAX_LISTING_PARTS {
+                return Err(NetError::Split(format!(
+                    "listing ships {} content parts, exceeds the {MAX_LISTING_PARTS}-part cap",
+                    candidates.len()
+                )));
+            }
         }
     }
     let index = index.ok_or_else(|| NetError::Split("no index part found".into()))?;
@@ -207,7 +223,8 @@ fn render_v2(payloads: &[String]) -> Result<RenderedListing, NetError> {
     // Slot leniently: an unmatched hash is ignored (stale/unreferenced); a matched-but-already-
     // filled slot is still a hard error (a genuine duplicate is tampering, not loss).
     let mut filled: Vec<Option<Value>> = vec![None; part_count];
-    for (raw, value) in &candidates {
+    let mut matched_bytes: usize = 0;
+    for raw in &candidates {
         let slot = match slot_hashes.iter().position(|s| s == &sha256_hex(raw.as_bytes())) {
             Some(slot) => slot,
             None => continue,
@@ -215,7 +232,19 @@ fn render_v2(payloads: &[String]) -> Result<RenderedListing, NetError> {
         if filled[slot].is_some() {
             return Err(NetError::Split(format!("duplicate part {slot}")));
         }
-        filled[slot] = Some(value.clone());
+        // Total-byte accounting (the same guard `restitch_v2` carries): the 4096-part count cap
+        // alone permits ~250 MB–1.5 GB of retained JSON on one browse when a hostile index names
+        // many large duplicate-content parts. Bound the matched bytes before materialising the part.
+        matched_bytes += raw.len();
+        if matched_bytes > MAX_RESTITCHED_BYTES {
+            return Err(NetError::Split(format!(
+                "rendered payload exceeds the {MAX_RESTITCHED_BYTES}-byte cap"
+            )));
+        }
+        // Parse only now — matched, unique, and within the byte cap. A stale/unmatched part is
+        // skipped above without being parsed, so it never counts toward the cap or retained memory.
+        let v: Value = serde_json::from_str(raw).map_err(|e| NetError::Split(e.to_string()))?;
+        filled[slot] = Some(v);
     }
 
     let mut missing: Vec<usize> = Vec::new();
@@ -330,6 +359,90 @@ mod tests {
         match render_listing(&p) {
             Err(NetError::Split(m)) => assert!(m.contains("duplicate"), "got: {m}"),
             other => panic!("expected a duplicate-part rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_v2_rejects_matched_bytes_over_cap() {
+        // A hostile index names a content part whose raw JSON alone exceeds MAX_RESTITCHED_BYTES
+        // (64 MiB) — the "many large duplicate-content parts" scenario restitch_v2 already guards.
+        // The 4096-part count cap would let this through and retain it on one browse.
+        let padding = "z".repeat(MAX_RESTITCHED_BYTES + 1024);
+        let content = serde_json::json!({
+            "entries": [{"name": "x", "note": padding}], "mount": [], "part": 0, "parts_v": 2
+        })
+        .to_string();
+        let index = serde_json::json!({
+            "slug": "hand", "split": true, "parts_v": 2, "part_count": 1,
+            "parts": [{ "sha256": sha256_hex(content.as_bytes()) }],
+        })
+        .to_string();
+        match render_listing(&[index, content]) {
+            Err(NetError::Split(m)) => assert!(m.contains("cap"), "got: {m}"),
+            other => panic!("expected a rendered-size-cap rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_v2_rejects_candidate_count_over_cap() {
+        // A hostile peer ships more content parts than any compliant index can name (the write
+        // side refuses > MAX_LISTING_PARTS parts, so a family has at most that many content parts).
+        // The old code retained every one of them before any rejection — an unbounded batch. All
+        // but one part here is stale (unmatched): under the lenient stale-part rule each is still
+        // *ignored*, but their sheer count must be refused as it accrues, not retained first.
+        let matched = serde_json::json!({
+            "entries": [{"name": "real"}], "mount": [], "part": 0, "parts_v": 2
+        })
+        .to_string();
+        let index = serde_json::json!({
+            "slug": "hand", "split": true, "parts_v": 2, "part_count": 1,
+            "parts": [{ "sha256": sha256_hex(matched.as_bytes()) }],
+        })
+        .to_string();
+        let mut parts = Vec::with_capacity(MAX_LISTING_PARTS + 2);
+        parts.push(index);
+        // MAX_LISTING_PARTS stale (unmatched) parts, then the one matched part — 4097 candidates.
+        for i in 0..MAX_LISTING_PARTS {
+            parts.push(
+                serde_json::json!({
+                    "entries": [{"name": format!("stale-{i}")}], "mount": [], "part": 1, "parts_v": 2
+                })
+                .to_string(),
+            );
+        }
+        parts.push(matched);
+        match render_listing(&parts) {
+            Err(NetError::Split(m)) => assert!(m.contains("cap"), "got: {m}"),
+            other => panic!("expected a candidate-count rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_v2_rejects_aggregate_matched_bytes_over_cap() {
+        // The cap is on the *sum* of matched parts, not any single part: three parts, each under
+        // MAX_RESTITCHED_BYTES on its own but together over it, must be rejected. (The single
+        // oversized part is covered by `render_v2_rejects_matched_bytes_over_cap` above.)
+        let padding = "z".repeat(MAX_RESTITCHED_BYTES / 3 + 1);
+        let mk = |part: usize| {
+            serde_json::json!({
+                "entries": [{"name": format!("p{part}"), "note": padding}],
+                "mount": [], "part": part, "parts_v": 2
+            })
+            .to_string()
+        };
+        let (p0, p1, p2) = (mk(0), mk(1), mk(2));
+        let index = serde_json::json!({
+            "slug": "hand", "split": true, "parts_v": 2, "part_count": 3,
+            "parts": [
+                { "sha256": sha256_hex(p0.as_bytes()) },
+                { "sha256": sha256_hex(p1.as_bytes()) },
+                { "sha256": sha256_hex(p2.as_bytes()) },
+            ],
+        })
+        .to_string();
+        match render_listing(&[index, p0, p1, p2]) {
+            Err(NetError::Split(m)) => assert!(m.contains("cap"), "got: {m}"),
+            other => panic!("expected an aggregate rendered-size-cap rejection, got {other:?}"),
         }
     }
 

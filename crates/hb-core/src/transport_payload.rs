@@ -30,6 +30,9 @@
 //! `verify_integrity`. Author verification stays with the caller ([`ManifestEnvelope::verify_author`]),
 //! which needs the expected author's key and so cannot live at this layer.
 
+use serde::de::{Deserializer, SeqAccess, Visitor};
+use serde::Deserialize;
+
 use crate::error::HbError;
 use crate::manifest::ManifestEnvelope;
 
@@ -75,7 +78,7 @@ pub const MANIFEST_MAX_TRANSPORT_BYTES: usize = 16 * 1024 * 1024;
 
 /// **Companion cap to the byte ceiling: the most parts an inbound envelope may declare.**
 ///
-/// The byte ceiling alone bounds the *frame*, not the *work*. A legal 8 MiB envelope can be almost
+/// The byte ceiling alone bounds the *frame*, not the *work*. A legal 16 MiB envelope can be almost
 /// entirely `"",""...` — millions of empty `ciphertexts` entries with a `manifest_sha256` that
 /// honestly matches them. Each costs ~3 bytes of JSON but a `String` is 24 bytes plus its
 /// allocation, so peak memory is a multiple of the frame it arrived in. `verify_integrity` does not
@@ -86,12 +89,78 @@ pub const MANIFEST_MAX_TRANSPORT_BYTES: usize = 16 * 1024 * 1024;
 /// literal rather than imported because hb-core does not depend on hb-net; `parts_cap_matches_the_
 /// producer_cap` in `wire_freeze` is what keeps the two honest.
 ///
-/// **What this does and does not fix:** the check runs *after* `serde_json` has parsed, so it caps
-/// the payload a caller can go on to hold, not the transient parse allocation. That transient is
-/// still bounded — by the 8 MiB frame ceiling times serde's expansion factor — so this closes the
-/// unbounded case, not every amplification. A streaming parser would be the complete fix and is not
-/// worth it at this size.
+/// **What this does and does not fix:** the cap is enforced *during* deserialization, not after —
+/// `from_wire` parses through a [`WireEnvelope`] whose `ciphertexts` field is a [`BoundedParts`]
+/// `SeqAccess` walk that stops retaining elements past this count. So the transient parse
+/// allocation is bounded too, not just the payload a caller goes on to hold: a 16 MiB frame padded
+/// to ~5.59M empty parts is drained and refused without ever materialising that many `String`s.
 pub const MANIFEST_MAX_TRANSPORT_PARTS: usize = 4096;
+
+/// The bounded-deserialization gate [`ManifestPayload::from_wire`] parses through instead of
+/// straight into [`ManifestEnvelope`]. It mirrors the envelope's field list exactly (frozen by
+/// `wire_freeze`) so only the *parse* changes — the bytes on the wire are byte-for-byte identical.
+/// The one field that differs in *type* is `ciphertexts`: [`BoundedParts`] walks the array with a
+/// `SeqAccess` that stops retaining elements past [`MANIFEST_MAX_TRANSPORT_PARTS`], so a hostile
+/// frame padded to ~5.59M empty parts is drained and rejected without materialising that many
+/// `String`s. Keep this list in lockstep with `ManifestEnvelope`'s fields.
+#[derive(Deserialize)]
+struct WireEnvelope {
+    manifest_v: u8,
+    slug: String,
+    author_npub: String,
+    crypto_v: u8,
+    snapshot_fingerprint: String,
+    created_at: u64,
+    manifest_sha256: String,
+    author_sig: String,
+    ciphertexts: BoundedParts,
+}
+
+/// A `ciphertexts` array parsed with a bounded `SeqAccess`: retains at most
+/// [`MANIFEST_MAX_TRANSPORT_PARTS`] elements, draining (and discarding) any beyond that, and
+/// records whether the sequence overflowed in [`BoundedParts::over`]. Draining rather than bailing
+/// keeps the parse transient bounded — the element being read is the only one ever held.
+struct BoundedParts {
+    parts: Vec<String>,
+    over: bool,
+}
+
+impl<'de> Deserialize<'de> for BoundedParts {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PartsVisitor;
+
+        impl<'de> Visitor<'de> for PartsVisitor {
+            type Value = BoundedParts;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "a JSON array of manifest ciphertext strings")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut parts =
+                    Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MANIFEST_MAX_TRANSPORT_PARTS));
+                let mut over = false;
+                while let Some(s) = seq.next_element::<String>()? {
+                    if parts.len() < MANIFEST_MAX_TRANSPORT_PARTS {
+                        parts.push(s);
+                    } else {
+                        over = true;
+                        // Drain but discard: never retain more than the cap.
+                    }
+                }
+                Ok(BoundedParts { parts, over })
+            }
+        }
+
+        deserializer.deserialize_seq(PartsVisitor)
+    }
+}
 
 /// The **only** payload Hoardbook's transport plane will carry: the serialized bytes of a
 /// [`ManifestEnvelope`] that has passed `verify_integrity` and is within
@@ -125,6 +194,32 @@ impl std::fmt::Debug for ManifestPayload {
     }
 }
 
+/// Parse inbound bytes into a [`ManifestEnvelope`], bounding the part count *during*
+/// deserialization via [`WireEnvelope`]/[`BoundedParts`] so the transient parse allocation can't
+/// outgrow the frame by the `String` expansion factor. Only the *parse* differs from
+/// `serde_json::from_slice::<ManifestEnvelope>` — the wire shape is untouched.
+fn parse_envelope(bytes: &[u8]) -> Result<ManifestEnvelope, HbError> {
+    let wire: WireEnvelope = serde_json::from_slice(bytes)?;
+    let BoundedParts { parts, over } = wire.ciphertexts;
+    if over {
+        return Err(HbError::InvalidManifest(format!(
+            "manifest declares more than {MANIFEST_MAX_TRANSPORT_PARTS} parts — no manifest this \
+             app can build has that many"
+        )));
+    }
+    Ok(ManifestEnvelope {
+        manifest_v: wire.manifest_v,
+        slug: wire.slug,
+        author_npub: wire.author_npub,
+        crypto_v: wire.crypto_v,
+        snapshot_fingerprint: wire.snapshot_fingerprint,
+        created_at: wire.created_at,
+        manifest_sha256: wire.manifest_sha256,
+        author_sig: wire.author_sig,
+        ciphertexts: parts,
+    })
+}
+
 impl ManifestPayload {
     /// **Send side.** Serialize an envelope and bound it. Errs with [`HbError::PayloadTooLarge`]
     /// when the result is over the ceiling — a rejection, never a truncation: a truncated manifest
@@ -147,15 +242,10 @@ impl ManifestPayload {
         Self::bound(bytes.len())?;
         // Mechanism 1 on the receive side: arbitrary bytes are not a payload. A collection file, a
         // zip, a JPEG — anything that is not a structurally valid, self-consistent envelope — is
-        // refused here, so no caller can obtain a `ManifestPayload` that isn't one.
-        let envelope: ManifestEnvelope = serde_json::from_slice(&bytes)?;
-        if envelope.ciphertexts.len() > MANIFEST_MAX_TRANSPORT_PARTS {
-            return Err(HbError::InvalidManifest(format!(
-                "manifest declares {} parts, over the {MANIFEST_MAX_TRANSPORT_PARTS}-part transport \
-                 cap — no manifest this app can build has that many",
-                envelope.ciphertexts.len()
-            )));
-        }
+        // refused here, so no caller can obtain a `ManifestPayload` that isn't one. The envelope is
+        // parsed through [`WireEnvelope`], which bounds the part count *during* deserialization
+        // rather than after a full `Vec<String>` has been materialised.
+        let envelope = parse_envelope(&bytes)?;
         envelope.verify_integrity()?;
         Ok(Self(bytes))
     }
@@ -303,6 +393,51 @@ mod tests {
             "the fixture must be UNDER the byte ceiling, or it would be refused for the wrong \
              reason — got {} bytes",
             bytes.len()
+        );
+        match ManifestPayload::from_wire(bytes) {
+            Err(HbError::InvalidManifest(msg)) => {
+                assert!(msg.contains("parts"), "the refusal names the part count, got: {msg}");
+            }
+            other => panic!("expected InvalidManifest, got {other:?}"),
+        }
+    }
+
+    /// The bounded `SeqAccess` retains at most the cap and flags overflow, instead of materialising
+    /// the whole array and checking its length afterwards — that "check after the expensive parse"
+    /// shape is exactly CWE-770. This pins the mechanism directly: a sequence over the cap must come
+    /// back with only the cap retained and `over` set.
+    #[test]
+    fn bounded_parts_deserialize_retains_only_the_cap() {
+        let n = MANIFEST_MAX_TRANSPORT_PARTS + 3;
+        let json = format!("[{}]", "\"\",".repeat(n).trim_end_matches(','));
+        let parts: BoundedParts = serde_json::from_str(&json).unwrap();
+        assert!(parts.over, "a sequence over the cap must set the overflow flag");
+        assert_eq!(
+            parts.parts.len(),
+            MANIFEST_MAX_TRANSPORT_PARTS,
+            "only the cap is retained — the rest must be drained, not held"
+        );
+    }
+
+    /// End-to-end: a frame well under the byte ceiling but padded to hundreds of thousands of empty
+    /// `ciphertexts` entries is refused on the part count alone (never reaching `verify_integrity`),
+    /// and the rejection happens during deserialization rather than after a full `Vec<String>`.
+    #[test]
+    fn a_frame_padded_with_many_empty_parts_is_refused() {
+        let n = MANIFEST_MAX_TRANSPORT_PARTS * 100; // ~410k parts — a fraction of the ~5.59M max, so the fixture stays fast
+        let mut parts_json = String::with_capacity(n * 3);
+        for _ in 0..n {
+            parts_json.push_str("\"\",");
+        }
+        parts_json.pop(); // drop the trailing comma
+        let json = format!(
+            r#"{{"manifest_v":1,"slug":"s","author_npub":"n","crypto_v":1,"snapshot_fingerprint":"f","created_at":0,"manifest_sha256":"0","author_sig":"0","ciphertexts":[{}]}}"#,
+            parts_json
+        );
+        let bytes = json.into_bytes();
+        assert!(
+            bytes.len() < MANIFEST_MAX_TRANSPORT_BYTES,
+            "the fixture must be UNDER the byte ceiling, or it would be refused for the wrong reason"
         );
         match ManifestPayload::from_wire(bytes) {
             Err(HbError::InvalidManifest(msg)) => {

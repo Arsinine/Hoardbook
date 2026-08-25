@@ -165,8 +165,36 @@ pub async fn backup_data(
         None => BackupMode::Plaintext,
     };
     let archive = backup_inner(store.inner(), mode).map_err(cmd_err)?;
-    std::fs::write(&path, &archive).map_err(|e| format!("Could not write backup file: {e}"))?;
+    write_backup_file(&path, &archive).map_err(|e| format!("Could not write backup file: {e}"))?;
     Ok(())
+}
+
+/// Write the archive to `path`, creating it with mode 0600 *before* the secret bytes land. The
+/// plaintext export carries the same nsec/browse-key/transport-secret that is deliberately 0600 at
+/// rest — the archive must never be created world-readable (default 0644), and opening with the
+/// mode up front leaves no chmod-after window where the secret sits on disk world-readable.
+/// Windows has no Unix mode bits (and its at-rest secrets are DPAPI ciphertext), so the default
+/// write is unchanged there.
+#[cfg(unix)]
+fn write_backup_file(path: &str, archive: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // `.mode()` only governs the create path; an existing inode is reused with its old
+    // permissions. Set 0600 explicitly so the overwrite path can never leave a pre-existing 0644
+    // world-readable while the plaintext nsec/browse-key lands in it.
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(archive)
+}
+
+#[cfg(not(unix))]
+fn write_backup_file(path: &str, archive: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, archive)
 }
 
 /// Does the backup at `path` need a passphrase? Lets the UI decide whether to prompt (cheap — no
@@ -308,5 +336,32 @@ mod tests {
         let imported = AppIdentity::from_nsec(&nsec).unwrap();
         assert_eq!(imported.npub(), source.npub());
         assert_ne!(imported.browse_key.bytes(), source.browse_key.bytes(), "fresh browse-key");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn backup_file_created_with_0600_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.hb");
+        super::write_backup_file(path.to_str().unwrap(), b"secret archive bytes").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "backup export must not be group/world readable (mode {mode:#o})");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn backup_file_overwrite_is_forced_to_0600_not_left_world_readable() {
+        // Re-exporting over an existing filename must not inherit the old inode's 0644 — the
+        // plaintext nsec/browse-key would land world-readable. Pre-create the path as 0644, then
+        // export over it, then assert the result is 0600.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.hb");
+        std::fs::write(&path, b"old export").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        super::write_backup_file(path.to_str().unwrap(), b"secret archive bytes").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "overwrite must force 0600, not leave the pre-existing 0644 (mode {mode:#o})");
     }
 }

@@ -237,14 +237,33 @@ pub(crate) fn read_json_lenient<T: DeserializeOwned>(path: &Path) -> Result<Opti
 // DataStore
 // ---------------------------------------------------------------------------
 
+/// Result of [`DataStore::save_published_guarded`]: whether the marker was written, or a concurrent
+/// unpublish bumped the revocation generation and the save was deliberately skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishedSave {
+    Saved,
+    Revoked,
+}
+
 #[derive(Clone)]
 pub struct DataStore {
     pub(crate) base: PathBuf,
+    /// Per-key locks serializing a published-marker check-and-write against [`Self::delete_published`]'s
+    /// remove-and-bump, so the two cannot interleave between the generation re-read and the marker
+    /// write (CWE-367). Keyed by slug (or "profile"); shared across clones; single-instance app.
+    published_locks: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
+    >,
 }
 
 impl DataStore {
     pub fn new(base: PathBuf) -> Self {
-        Self { base }
+        Self {
+            base,
+            published_locks: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+        }
     }
 
     // -- Paths ---------------------------------------------------------------
@@ -506,6 +525,12 @@ impl DataStore {
     // -- Published events (NIP-09 enablement) --------------------------------
 
     /// Persist a published nostr Event (opaque JSON) under `key` (a slug, or "profile").
+    ///
+    /// This is the UNGUARDED primitive: every production publish now goes through
+    /// [`Self::save_published_guarded`], so a concurrent unpublish cannot be silently undone
+    /// (CWE-367). `save_published` remains only as test setup, hence the `#[allow(dead_code)]`
+    /// outside `test` (the same shape as `logging.rs`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn save_published(&self, key: &str, event_json: &str) -> Result<()> {
         write_atomic(&self.published_path(key), event_json.as_bytes())
             .context("saving published event")
@@ -521,15 +546,75 @@ impl DataStore {
     }
 
     pub fn delete_published(&self, key: &str) -> Result<()> {
+        let lock = self.published_key_lock(key);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let path = self.published_path(key);
         if path.exists() {
             std::fs::remove_file(&path)?;
         }
-        Ok(())
+        self.bump_published_generation(key)
+    }
+
+    /// Persist a published marker ONLY if `key` has not been unpublished since `expected_generation`
+    /// was read (CWE-367). The generation re-read + marker write run under the per-key lock, so an
+    /// interleaving [`Self::delete_published`] (which removes the marker and bumps the generation
+    /// under the same lock) cannot slip between the check and the write. `Revoked` means the save was
+    /// deliberately skipped — the caller must report it, never treat it as success.
+    pub fn save_published_guarded(
+        &self,
+        key: &str,
+        event_json: &str,
+        expected_generation: u64,
+    ) -> Result<PublishedSave> {
+        let lock = self.published_key_lock(key);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        if self.published_generation(key) != expected_generation {
+            return Ok(PublishedSave::Revoked);
+        }
+        write_atomic(&self.published_path(key), event_json.as_bytes())
+            .context("saving published event")?;
+        Ok(PublishedSave::Saved)
+    }
+
+    /// The revocation generation for `key` — a small counter bumped by [`Self::delete_published`] so
+    /// a publish already in flight can detect a concurrent unpublish. Missing or unparsable files read
+    /// as `0` (the counter self-heals on the next delete, which overwrites it with a fresh value).
+    pub fn published_generation(&self, key: &str) -> u64 {
+        match std::fs::read_to_string(self.published_generation_path(key)) {
+            Ok(s) => s.trim().parse::<u64>().unwrap_or(0),
+            Err(_) => 0,
+        }
     }
 
     pub fn is_published(&self, key: &str) -> bool {
         self.published_path(key).exists()
+    }
+
+    /// Path of the revocation-generation counter, beside the marker it guards.
+    fn published_generation_path(&self, key: &str) -> PathBuf {
+        self.base.join("published").join(format!("{key}.gen"))
+    }
+
+    /// The per-key lock guarding that key's marker check-and-write vs delete-and-bump. The `Arc` must
+    /// be held by the caller for as long as the returned guard is alive (it is a local in each use).
+    fn published_key_lock(&self, key: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+        let mut map = self
+            .published_locks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        map.entry(key.to_string())
+            .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Bump `key`'s revocation generation by one. Caller holds the per-key lock.
+    fn bump_published_generation(&self, key: &str) -> Result<()> {
+        let next = self.published_generation(key) + 1;
+        write_atomic(
+            &self.published_generation_path(key),
+            next.to_string().as_bytes(),
+        )
+        .context("bumping published generation")
     }
 
     // -- Settings ------------------------------------------------------------
@@ -799,6 +884,28 @@ pub struct Watch {
     pub seen_pubkeys: Vec<String>,
 }
 
+/// Parse a persisted `sent_at` (RFC3339, any offset) into a UTC instant. `None` on unparseable input.
+fn parse_watermark_ts(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.with_timezone(&chrono::Utc))
+}
+
+/// The future-skew ceiling a read watermark may not exceed: `now + FUTURE_SKEW_SECS`. A `sent_at`
+/// inside the skew is admitted (two machines' clocks may legitimately differ by a little); anything
+/// beyond it is a poison and is clamped/rejected. Shares the single `hb_core::FUTURE_SKEW_SECS` skew
+/// with the presence freshness gate so the two "clock slightly ahead" tolerances can't silently
+/// disagree.
+fn read_watermark_ceiling(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    now + chrono::Duration::seconds(hb_core::FUTURE_SKEW_SECS as i64)
+}
+
+/// Whether a parsed watermark sits past the future-skew ceiling — i.e. is poisoned (a peer stamped
+/// year 9999, or a pre-fix poisoned value persisted to disk). Such an entry reads as "absent".
+fn watermark_is_poisoned(ts: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> bool {
+    ts > read_watermark_ceiling(now)
+}
+
 // ---------------------------------------------------------------------------
 // Read state — per-peer persisted last-read watermark (devtest #16: unifies the three
 // unsynchronized unread-badge mechanisms into one persisted signal)
@@ -812,20 +919,35 @@ impl DataStore {
     /// The per-peer last-read watermark: npub → RFC3339 `sent_at` of the newest message the user has
     /// seen in that conversation. Lenient + defaults empty, like the other small local-state files —
     /// a version mismatch or absent file just means "nothing read yet".
+    ///
+    /// **Self-heals a poisoned watermark on read.** `sent_at` is peer-controlled (the inner NIP-17
+    /// rumor stamp), so a followed peer can stamp year 9999; a watermark past the future-skew ceiling
+    /// (or one that no longer parses) is dropped from the returned map, reading as "nothing read yet"
+    /// instead of "everything already read". The drop is in-memory — the next
+    /// `advance_read_watermark` re-saves the map and persists the heal to disk.
     pub fn load_read_state(&self) -> Result<std::collections::HashMap<String, String>> {
-        Ok(
-            read_json_lenient::<std::collections::HashMap<String, String>>(&self.read_state_path())
-                .context("loading read state")?
-                .unwrap_or_default(),
-        )
+        let mut m = read_json_lenient::<std::collections::HashMap<String, String>>(&self.read_state_path())
+            .context("loading read state")?
+            .unwrap_or_default();
+        let now = chrono::Utc::now();
+        m.retain(|_, ts| match parse_watermark_ts(ts) {
+            Some(parsed) => !watermark_is_poisoned(parsed, now),
+            None => false, // unparseable → treat as absent (self-heal)
+        });
+        Ok(m)
     }
 
     pub fn save_read_state(&self, m: &std::collections::HashMap<String, String>) -> Result<()> {
         write_json(&self.read_state_path(), m).context("saving read state")
     }
 
-    /// Advance `npub`'s watermark to `ts`, never rewinding it. `sent_at` is RFC3339 UTC everywhere in
-    /// this codebase, so a plain string compare is a valid chronological compare.
+    /// Advance `npub`'s watermark to `ts`, never rewinding it. `ts` is parsed to a canonical instant
+    /// (RFC3339) and **clamped to `now + FUTURE_SKEW_SECS`** before the compare/insert — `sent_at` is
+    /// the peer-controlled inner NIP-17 rumor stamp, so a followed peer can send one far-future stamp
+    /// (year 9999) and, under a raw string compare, permanently suppress every later unread badge.
+    /// Unparseable input is rejected. The compare is against the self-healed map from
+    /// `load_read_state`, so an already-poisoned watermark is overwritten on the next legitimate
+    /// advance (the self-heal).
     ///
     /// The load→max→save sequence is a read-modify-write over the single `read_state.json` file, so
     /// two overlapping calls (e.g. two DM-poll ticks racing) could otherwise interleave: both load the
@@ -837,13 +959,29 @@ impl DataStore {
     pub fn advance_read_watermark(&self, npub: &str, ts: &str) -> Result<()> {
         static READ_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = READ_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let mut m = self.load_read_state()?;
+
+        // Parse the peer-controlled ts to a canonical instant; reject unparseable — no ordering can
+        // be established, so the watermark must not move (and must not be poisoned) on garbage input.
+        let parsed = parse_watermark_ts(ts)
+            .ok_or_else(|| anyhow::anyhow!("unparseable read-watermark timestamp: {ts:?}"))?;
+        let ceiling = read_watermark_ceiling(chrono::Utc::now());
+        // Clamp a far-future stamp down to the future-skew ceiling before it can poison the compare.
+        let clamped = parsed.min(ceiling);
+        // Only the poison case changes what is persisted: a legitimate `ts` is stored verbatim (the
+        // pre-existing behaviour), while a clamped stamp is stored in the canonical RFC3339 the rest
+        // of the codebase emits (`to_rfc3339`).
+        let stored = if parsed > ceiling { clamped.to_rfc3339() } else { ts.to_string() };
+
+        let mut m = self.load_read_state()?; // already self-heals poisoned/corrupt entries
         let advance = match m.get(npub) {
-            Some(existing) => ts > existing.as_str(),
+            // `load_read_state` pre-filters to parseable, unpoisoned entries, so this parse succeeds;
+            // the `unwrap_or(true)` defaults to the "advance" direction (heal, never rewind) as a
+            // defensive fallback that should be unreachable.
+            Some(existing) => parse_watermark_ts(existing).map(|e| clamped > e).unwrap_or(true),
             None => true,
         };
         if advance {
-            m.insert(npub.to_string(), ts.to_string());
+            m.insert(npub.to_string(), stored);
             self.save_read_state(&m)?;
         }
         Ok(())
@@ -1907,6 +2045,54 @@ mod tests {
         store.advance_read_watermark("npub1a", "2026-01-09T00:00:00Z").unwrap();
         let loaded = store.load_read_state().unwrap();
         assert_eq!(loaded.get("npub1a").map(String::as_str), Some("2026-01-09T00:00:00Z"));
+    }
+
+    #[test]
+    fn year_9999_sent_at_is_clamped_not_poisoning_the_watermark() {
+        let (_dir, store) = test_store();
+        store.advance_read_watermark("npub1a", "9999-01-01T00:00:00Z").unwrap();
+        let loaded = store.load_read_state().unwrap();
+        let stored = loaded.get("npub1a").expect("a clamped watermark is stored, not dropped");
+        assert_ne!(stored, "9999-01-01T00:00:00Z", "the raw poison stamp must not be persisted");
+        let stored_secs = parse_watermark_ts(stored).expect("stored watermark parses").timestamp();
+        let ceiling_secs = read_watermark_ceiling(chrono::Utc::now()).timestamp();
+        assert!(
+            stored_secs <= ceiling_secs,
+            "a year-9999 sent_at must clamp to now+skew (stored {stored_secs} > ceiling {ceiling_secs})"
+        );
+    }
+
+    #[test]
+    fn already_poisoned_watermark_self_heals_on_read_and_advance() {
+        let (_dir, store) = test_store();
+        // Simulate the attack having landed before this fix: a year-9999 watermark already on disk.
+        let mut m = std::collections::HashMap::new();
+        m.insert("npub1a".to_string(), "9999-01-01T00:00:00Z".to_string());
+        store.save_read_state(&m).unwrap();
+
+        // Read heals: the poisoned entry is dropped (reads as absent), not served as "everything read".
+        let loaded = store.load_read_state().unwrap();
+        assert!(
+            !loaded.contains_key("npub1a"),
+            "a poisoned watermark must read as absent so the badge can recover"
+        );
+
+        // The next legitimate advance persists the heal.
+        store.advance_read_watermark("npub1a", "2026-01-05T00:00:00Z").unwrap();
+        let healed = store.load_read_state().unwrap();
+        assert_eq!(
+            healed.get("npub1a").map(String::as_str),
+            Some("2026-01-05T00:00:00Z"),
+            "the poisoned watermark is replaced by the legitimate one on the next advance"
+        );
+    }
+
+    #[test]
+    fn unparseable_sent_at_is_rejected_not_stored() {
+        let (_dir, store) = test_store();
+        let res = store.advance_read_watermark("npub1a", "not-a-timestamp");
+        assert!(res.is_err(), "an unparseable sent_at must be rejected, not stored");
+        assert!(store.load_read_state().unwrap().is_empty(), "nothing persisted for the rejected ts");
     }
 
     #[test]
