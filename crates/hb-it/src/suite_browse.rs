@@ -186,8 +186,12 @@ async fn pub4(ctx: &Ctx) -> Result<()> {
             let reason = res.listing_error.as_deref().unwrap_or("no browse-key held");
             let fetched = fetched_parts(&client, &id, slug).await;
             client.disconnect().await;
+            let fetched = match fetched {
+                Ok(n) => format!("fetched {n} parts"),
+                Err(e) => format!("diagnostic fetch failed: {e}"),
+            };
             anyhow::bail!(
-                "deep split listing did not browse — {reason} (fetched {fetched} parts, published {})",
+                "deep split listing did not browse — {reason} ({fetched}, published {})",
                 published.parts
             );
         }
@@ -214,8 +218,14 @@ fn leaf_count(node: &Value) -> usize {
 /// The N4-style diagnostic count for a locked deep family (QURATOR-127): how many listing events
 /// for this slug the relay actually serves right now — index + content parts, the same
 /// author+kind scope N4 counts over, with the slug's d-tags (`slug`, `slug#partN`) picked out of
-/// what comes back. Only reached on the failure path, where `client` is still connected.
-async fn fetched_parts(client: &hb_net::RelayClient, id: &Identity, slug: &str) -> usize {
+/// what comes back. Only reached on the failure path, where `client` is still connected. The
+/// count is `Ok` only when the fetch itself answered — an errored/timed-out fetch is `Err`, never
+/// a count of 0, so the two cannot be read as the same signal.
+async fn fetched_parts(
+    client: &hb_net::RelayClient,
+    id: &Identity,
+    slug: &str,
+) -> Result<usize, hb_net::NetError> {
     let events = client
         .fetch(
             Filter::new()
@@ -223,9 +233,8 @@ async fn fetched_parts(client: &hb_net::RelayClient, id: &Identity, slug: &str) 
                 .kind(Kind::from_u16(KIND_LISTING)),
             FETCH_TIMEOUT,
         )
-        .await
-        .unwrap_or_default();
-    events
+        .await?;
+    let count = events
         .iter()
         .filter(|e| {
             e.tags
@@ -233,7 +242,8 @@ async fn fetched_parts(client: &hb_net::RelayClient, id: &Identity, slug: &str) 
                 .any(|t| t.kind() == nostr::TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::D))
                     && t.content().is_some_and(|d| d == slug || d.starts_with(&format!("{slug}#part"))))
         })
-        .count()
+        .count();
+    Ok(count)
 }
 
 async fn br1(ctx: &Ctx) -> Result<()> {
