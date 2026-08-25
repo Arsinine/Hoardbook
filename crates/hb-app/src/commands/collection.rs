@@ -1673,13 +1673,18 @@ mod tests {
     fn scan_selective_rejects_pathologically_deep_tree() {
         let dir = tempfile::tempdir().unwrap();
         let mut path = dir.path().to_path_buf();
-        for i in 0..(MAX_SCAN_DEPTH + 3) {
-            path = path.join(format!("d{i}"));
+        // One-character components on purpose. `d0/d1/…/d258` is ~1,185 chars, which clears Linux's
+        // 4096-byte PATH_MAX but NOT macOS's 1024 — it failed there with ENAMETOOLONG while passing
+        // on ubuntu, so the tree, not the guard, was the platform-specific part. `d/d/…/d` is ~518:
+        // still far past Windows' ~260 MAX_PATH (so `#[cfg(unix)]` above remains right), still
+        // MAX_SCAN_DEPTH + 3 levels deep, and now actually buildable on every unix CI runner.
+        for _ in 0..(MAX_SCAN_DEPTH + 3) {
+            path = path.join("d");
         }
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join("leaf.txt"), b"x").unwrap();
 
-        let err = scan_selective(dir.path(), &include(&["d0"]), &empty_globs())
+        let err = scan_selective(dir.path(), &include(&["d"]), &empty_globs())
             .unwrap_err()
             .to_string();
         assert!(err.contains("depth"), "deep tree is rejected with a loud, reasoned error: {err}");

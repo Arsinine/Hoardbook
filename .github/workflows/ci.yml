@@ -142,11 +142,55 @@ jobs:
           sweep "the transport module reads the filesystem — the plane is moving files" 'tokio::fs|std::fs([^a-zA-Z_]|$)|(^|[^a-zA-Z_:])fs::|File::open|PathBuf|std::path::Path' $TRANSPORT_FILES
           # INV-4′ mechanism 1 is only real while `ManifestPayload`'s ONLY constructors validate. A
           # serde derive is an unvalidated public constructor: `from_str::<ManifestPayload>("[137,80]")`
-          # yields a payload of PNG bytes, skipping seal/from_wire/verify_integrity AND the 8 MiB
+          # yields a payload of PNG bytes, skipping seal/from_wire/verify_integrity AND the 16 MiB
           # ceiling. The type shipped with that derive and every test stayed green, because no test
           # tried the bypass — so the guard is a grep, not a test.
-          sweep "ManifestPayload gained a serde derive — that is an unvalidated public constructor, bypassing seal/from_wire and the byte ceiling" \
-                'derive\([^)]*(Serialize|Deserialize)' crates/hb-core/src/transport_payload.rs
+          # The retired pattern `derive\([^)]*(Serialize|Deserialize)` is file-scoped, not
+          # type-scoped: it fired on the WRONG hit (2026-08-24, run 32811426755) — commit 6997243
+          # (audit #19) added a `#[derive(Deserialize)]` to the PRIVATE `WireEnvelope` mirror that
+          # bounds part counts DURING deserialization, making the bounded-parse gate possible, and
+          # the probe red CI while naming `ManifestPayload`. A guard that misnames what it checks
+          # is treated here like a vacuous one. The replacement is TYPE-SCOPED, not permissive:
+          # it still fires on (a) any serde derive reaching `ManifestPayload` itself, (b) any
+          # `Serialize` derive anywhere in the file, (c) a `Deserialize` on any `pub` type, or any
+          # non-`WireEnvelope` type — while exempting exactly the private Deserialize-only mirror
+          # that from_wire parses through. ERE cannot bind a derive attribute to the type it
+          # annotates, so this is a small awk that pairs each derive with the next declared item
+          # and drops comment lines the way `code_only` does. Self-tested in the step below.
+          if out=$(awk '
+            function hit() { printf "%s:%d:%s\n", FILENAME, NR, $0; bad = 1 }
+            {
+              if (open_derive) {
+                if ($0 !~ /^[ \t]*(\/\/|\/\*|\*)/) { d_body = d_body " " $0; if ($0 ~ /\)/) open_derive = 0 }
+                next
+              }
+              if ($0 ~ /^[ \t]*(\/\/|\/\*|\*)/) next
+              if ($0 ~ /^#[ \t]*\[derive[ \t]*\(/) { d_body = d_body " " $0; if ($0 !~ /\)/) open_derive = 1; next }
+              if ($0 ~ /^#/) next
+              if ($0 ~ /^[ \t]*(pub([ \t]*\([^)]*\))?[ \t]+)?(struct|enum|union)[ \t]+[A-Za-z_0-9]+/) {
+                if (d_body != "") {
+                  d = d_body; sub(/[ \t]*\/\/.*$/, "", d)
+                  vis = ($0 ~ /^[ \t]*pub/) ? "pub" : "priv"
+                  name = $0
+                  sub(/^[ \t]*(pub([ \t]*\([^)]*\))?[ \t]+)?(struct|enum|union)[ \t]+/, "", name)
+                  sub(/[^A-Za-z_0-9].*$/, "", name)
+                  if (d ~ /Serialize/ || (d ~ /Deserialize/ && !(vis == "priv" && name == "WireEnvelope"))) hit()
+                }
+                d_body = ""
+                next
+              }
+              if ($0 ~ /[^ \t]/) d_body = ""
+            }
+            END { exit(bad ? 0 : 1) }
+          ' crates/hb-core/src/transport_payload.rs 2>/dev/null); then
+            echo "::error::INV-4′ regression — a serde derive reached a transport payload type, an unvalidated public constructor bypassing seal/from_wire/verify_integrity and the 16 MiB ceiling:"
+            echo "$out"
+            echo "::error::Only the private Deserialize-only WireEnvelope mirror (the bounded-parse gate from_wire parses through) may derive Deserialize. Anything else — a derive reaching ManifestPayload itself, any Serialize derive, or a Deserialize on a pub type — is the bypass this probe exists to catch."
+            fail=1
+          fi
+          # Lines-examined print, so a silent probe is distinguishable from a clean one (a wrong
+          # cwd or an absent file reads as clean otherwise — that trap has shipped here before).
+          printf 'serde-derive probe: %s lines examined in transport_payload.rs\n' "$(wc -l < crates/hb-core/src/transport_payload.rs)"
           sweep "the transport module takes a filesystem path" 'fn [a-z_]+\([^)]*(path|file_path|save_path): *&?(str|String|Path|PathBuf)' $TRANSPORT_FILES
           # A content grep misses a file whose only tell is its NAME — an orphaned
           # `DownloadQueue.svelte` referencing nothing has no matching text inside it. Verified by
