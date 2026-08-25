@@ -286,7 +286,7 @@ fn render_v2(payloads: &[String]) -> Result<RenderedListing, NetError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::split::split_listing;
+    use crate::split::{restitch_listing, split_listing};
 
     fn listing(n: usize) -> String {
         let entries: Vec<Value> = (0..n)
@@ -568,6 +568,325 @@ mod tests {
             "entries": [ { "name": "Movies", "children": children } ],
         })
         .to_string()
+    }
+
+    /// One hostile family, two siblings, one shared verdict — QURATOR-114's closing claim
+    /// ("the two siblings cannot diverge") pinned structurally. `render_listing` and
+    /// `restitch_listing` are the two production dispatchers; `render_v2`/`restitch_v2` are
+    /// private, so this drives the real v2 legs through the public entry points (both route a
+    /// `parts_v: 2` index to their v2 sibling). No copy of the guards is re-emitted here — the
+    /// family below is asserted against the production constants and the production functions.
+    fn v2_family(
+        part_count: usize,
+        padding: usize,
+    ) -> (Vec<String>, Vec<String>) {
+        // (index, parts): `part_count` content parts, each with `padding` bytes of note padding.
+        let mut parts = Vec::with_capacity(part_count + 1);
+        let mut hashes = Vec::with_capacity(part_count);
+        for i in 0..part_count {
+            let p = serde_json::json!({
+                "entries": [{"name": format!("p{i}"), "note": "z".repeat(padding)}],
+                "mount": [], "part": i, "parts_v": 2
+            })
+            .to_string();
+            hashes.push(sha256_hex(p.as_bytes()));
+            parts.push(p);
+        }
+        let index = serde_json::json!({
+            "slug": "hand", "split": true, "parts_v": 2, "part_count": part_count,
+            "parts": hashes.into_iter().map(|h| serde_json::json!({ "sha256": h })).collect::<Vec<_>>(),
+        })
+        .to_string();
+        let mut all = vec![index];
+        all.extend(parts.iter().cloned());
+        (all, parts)
+    }
+
+    /// Both siblings must refuse the SAME oversized-but-under-4096-part family: each part under
+    /// MAX_RESTITCHED_BYTES alone, the sum over it. If one sibling's byte bound drifts (a weaker
+    /// check, a different constant, or the check moved after parse/materialise), that sibling
+    /// accepts what the other refuses — this test reds on exactly that asymmetry.
+    #[test]
+    fn siblings_agree_on_v2_matched_byte_cap() {
+        let (family, _) = v2_family(3, MAX_RESTITCHED_BYTES / 3 + 1);
+        let rendered = render_listing(&family);
+        let restitched = restitch_listing(&family);
+        let r_err = match &rendered {
+            Err(NetError::Split(m)) => m.clone(),
+            other => panic!("render_v2 must refuse the over-cap family, got {other:?}"),
+        };
+        assert!(r_err.contains("cap"), "render_v2: {r_err}");
+        match &restitched {
+            Err(NetError::Split(m)) => assert!(m.contains("cap"), "restitch_v2: {m}"),
+            other => panic!(
+                "restitch_v2 must refuse the same family render_v2 refused ({r_err}), got {other:?}"
+            ),
+        }
+    }
+
+    /// Same pin for the count bound: a family with one real part plus MAX_LISTING_PARTS stale
+    /// parts exceeds the candidate cap in both siblings or in neither.
+    #[test]
+    fn siblings_agree_on_v2_candidate_count_cap() {
+        let matched = serde_json::json!({
+            "entries": [{"name": "real"}], "mount": [], "part": 0, "parts_v": 2
+        })
+        .to_string();
+        let index = serde_json::json!({
+            "slug": "hand", "split": true, "parts_v": 2, "part_count": 1,
+            "parts": [{ "sha256": sha256_hex(matched.as_bytes()) }],
+        })
+        .to_string();
+        let mut family = vec![index];
+        for i in 0..MAX_LISTING_PARTS {
+            family.push(
+                serde_json::json!({
+                    "entries": [{"name": format!("stale-{i}")}], "mount": [], "part": 1, "parts_v": 2
+                })
+                .to_string(),
+            );
+        }
+        family.push(matched);
+        let r_err = match render_listing(&family) {
+            Err(NetError::Split(m)) => m,
+            other => panic!("render_v2 must refuse the over-count family, got {other:?}"),
+        };
+        assert!(r_err.contains("cap"), "render_v2: {r_err}");
+        match restitch_listing(&family) {
+            Err(NetError::Split(m)) => assert!(m.contains("cap"), "restitch_v2: {m}"),
+            other => panic!(
+                "restitch_v2 must refuse the same family render_v2 refused ({r_err}), got {other:?}"
+            ),
+        }
+    }
+
+    /// The byte cap is enforced BEFORE the matched part is parsed/materialised — the defect the
+    /// 50d7bea fix removed (parse-everything-up-front, cap fires only after peak allocation).
+    /// Pinned per sibling: an over-cap part whose JSON *payload* is parseable only if the sibling
+    /// actually parsed it. A stale/unmatched part of identical size is the control: it must be
+    /// ignored, never counted, proving the cap tracks *matched* bytes in both.
+    /// The one thing the two dispatchers share shape-wise: pull the `NetError::Split` message out
+    /// of either sibling's result (their `Ok` types differ — `RenderedListing` vs `String` —
+    /// which is exactly why the drift risk is real: they cannot share a signature).
+    fn split_msg<T>(r: &Result<T, NetError>) -> Option<String> {
+        match r {
+            Err(NetError::Split(m)) => Some(m.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn siblings_enforce_byte_cap_before_parse_not_after() {
+        // 1 matched over-cap part + 1 unmatched part of the SAME size. If a sibling regained the
+        // parse-first shape, the over-cap part would be parsed into `filled` before the cap fires.
+        // Observable contract: refusal must mention the cap (not a parse error, which is the
+        // tell of a parse-first path), and the family must be refused at all.
+        let over = serde_json::json!({
+            "entries": [{"name": "big", "note": "z".repeat(MAX_RESTITCHED_BYTES + 1024)}],
+            "mount": [], "part": 0, "parts_v": 2
+        })
+        .to_string();
+        let stale = serde_json::json!({
+            "entries": [{"name": "stale", "note": "y".repeat(1024)}],
+            "mount": [], "part": 9, "parts_v": 2
+        })
+        .to_string();
+        let index = serde_json::json!({
+            "slug": "hand", "split": true, "parts_v": 2, "part_count": 1,
+            "parts": [{ "sha256": sha256_hex(over.as_bytes()) }],
+        })
+        .to_string();
+        let family = vec![index, over.clone(), stale];
+        let outcomes = [
+            ("render_v2", split_msg(&render_listing(&family))),
+            ("restitch_v2", split_msg(&restitch_listing(&family))),
+        ];
+        for (name, msg) in outcomes {
+            let Some(m) = msg else {
+                panic!(
+                    "{name} must refuse the over-cap family (got Ok — the byte cap has drifted \
+                     away from this sibling entirely)"
+                );
+            };
+            assert!(
+                m.contains("cap"),
+                "{name} must refuse with the byte-cap error (not a parse error, which is the \
+                 parse-first tell): {m}"
+            );
+        }
+        // Control: the SAME over-cap part, now the only content part and unmatched (index names a
+        // different slot) — both siblings must IGNORE it (stale), not refuse on bytes. Proves the
+        // byte bound tracks matched content only, identically in both.
+        let other_hash_part = serde_json::json!({
+            "entries": [{"name": "unmatched", "note": "z".repeat(MAX_RESTITCHED_BYTES + 1024)}],
+            "mount": [], "part": 1, "parts_v": 2
+        })
+        .to_string();
+        // The index names a slot whose hash matches nothing shipped (a real sha256, so the index
+        // itself is well-formed) — the 64 MiB part is therefore UNMATCHED and must be ignored.
+        let index_other = serde_json::json!({
+            "slug": "hand", "split": true, "parts_v": 2, "part_count": 1,
+            "parts": [{ "sha256": sha256_hex(b"unshipped decoy part") }],
+        })
+        .to_string();
+        let unmatched_family = vec![index_other, other_hash_part];
+        let controls = [
+            ("render_v2", split_msg(&render_listing(&unmatched_family))),
+            ("restitch_v2", split_msg(&restitch_listing(&unmatched_family))),
+        ];
+        for (name, msg) in controls {
+            // render_v2 is lenient (K-of-N, incomplete Ok); restitch_v2 is strict (all-or-nothing,
+            // errors "got 0 of 1 parts"). The pinned property is shared: NEITHER errors on the cap.
+            if let Some(m) = msg {
+                assert!(
+                    !m.contains("cap"),
+                    "{name} counted an UNMATCHED part's bytes toward the byte cap — the bound \
+                     drifted from matched-only: {m}"
+                );
+            }
+        }
+    }
+
+    /// Source-order scan of the two PRODUCTION siblings (read via `include_str!` of the real
+    /// sources, never a re-emitted copy). States exactly what it proves — and, just as
+    /// deliberately, what it does NOT, because its predecessor claimed "caps fire before
+    /// materialising" and that claim is FALSE for the count dimension:
+    ///
+    /// PROVEN (asserted below):
+    /// 1. The later, matched-`raw` parse (`serde_json::from_str(raw)`) sits AFTER the matched-byte
+    ///    cap (`matched_bytes > MAX_RESTITCHED_BYTES`) in both `render_v2` and `restitch_v2` — a
+    ///    matched part is parsed only once it is unique and inside the byte budget.
+    /// 2. The candidate COUNT cap sits inside the accrual loop, before the batch is retained and
+    ///    the index demanded — so what it bounds is the number of RETAINED `&str` candidates.
+    /// 3. Each sibling still parses every payload once transiently in that first loop
+    ///    (`serde_json::from_str(json)`, asserted present inside the accrual region) — recorded as
+    ///    a fact about the current shape, NOT endorsed as correct.
+    ///
+    /// NOT PROVEN: "caps before materialising". Every payload in the batch — matched or not, over
+    /// the count cap or not — is fully parsed into a transient `serde_json::Value` in the FIRST
+    /// loop, before any count cap can refuse the batch. No assertion here changes that, and none
+    /// could: the count cap bounds retention, not the transient per-iteration parse. What keeps
+    /// that transient parse from regressing finding #7's fix is that the `Value` is dropped at the
+    /// end of each iteration and only `&str` slices (borrowed from the caller-owned batch) are
+    /// retained — peak transient allocation per payload is bounded upstream, by `browse.rs`'s
+    /// family byte cap and NIP-44's per-event plaintext ceiling, not by anything in these two
+    /// functions and not by this test.
+    ///
+    /// Scan hygiene: line comments (`//`, `///`) are stripped before scanning — respecting string
+    /// literals — so a future edit cannot satisfy a needle from a comment. The span STARTS at the
+    /// first line whose comment-stripped, trimmed code begins with the signature (a comment
+    /// containing `fn render_v2(` cannot hijack the span), ENDS at the next column-0 `}`, and is
+    /// sanity-checked (non-empty, plausible length) with the span's first line printed on failure.
+    /// Per CLAUDE.md's vacuous-scan rule, every failure prints the per-needle found-count AND the
+    /// lines scanned, so "0 found" stays distinguishable from "scanned nothing".
+    #[test]
+    fn siblings_order_matched_parse_after_byte_cap_and_count_cap_during_accrual() {
+        // Strip a trailing `//` comment from one line without eating `//` inside a string literal
+        // (a URL in code would otherwise be truncated mid-token). `///` doc lines strip to empty.
+        fn code_only(line: &str) -> &str {
+            let b = line.as_bytes();
+            let mut in_str = false;
+            let mut i = 0;
+            while i < b.len() {
+                match b[i] {
+                    b'\\' if in_str => i += 1, // skip the escaped char too
+                    b'"' => in_str = !in_str,
+                    b'/' if !in_str && i + 1 < b.len() && b[i + 1] == b'/' => return &line[..i],
+                    _ => {}
+                }
+                i += 1;
+            }
+            line
+        }
+
+        let render_src = include_str!("render.rs");
+        let split_src = include_str!("split.rs");
+        for (file, src, sig) in [
+            ("render.rs", render_src, "fn render_v2("),
+            ("split.rs", split_src, "fn restitch_v2("),
+        ] {
+            let all_lines: Vec<&str> = src.lines().collect();
+            // Span start: first line whose CODE (comments stripped) begins with the signature.
+            // The test module's own needle literals never begin a code line with the signature,
+            // and a comment mentioning it strips to empty — so the span cannot be hijacked.
+            let start = all_lines
+                .iter()
+                .position(|l| code_only(l).trim_start().starts_with(sig))
+                .unwrap_or_else(|| {
+                    panic!("{file}: no code line starting with [{sig}] — span not found; scanned {} lines", all_lines.len())
+                });
+            let end = all_lines[start..]
+                .iter()
+                .position(|l| *l == "}")
+                .unwrap_or_else(|| panic!("{file}: no column-0 close brace after [{sig}] (span starts at line {})", start + 1));
+            let lines: Vec<&str> = all_lines[start..start + end].iter().map(|l| code_only(l)).collect();
+            assert!(
+                (20..=400).contains(&lines.len()),
+                "{file}::{sig} span looks wrong: {} code lines from line {} ({:?}…) — \
+                 boundary detection has drifted",
+                lines.len(),
+                start + 1,
+                all_lines[start].trim()
+            );
+            let line_of = |needle: &str| -> Option<usize> {
+                lines.iter().position(|l| l.contains(needle)).map(|i| i + 1)
+            };
+            // Each needle must be found EXACTLY ONCE in CODE inside the sibling — 0 means the scan
+            // went blind (fail loudly, never pass silently); >1 means it stopped discriminating.
+            let needles: [(&str, &str); 5] = [
+                ("matched_bytes > MAX_RESTITCHED_BYTES", "byte-cap check"),
+                ("serde_json::from_str(raw)", "matched-raw parse"),
+                ("candidates.len() > MAX_LISTING_PARTS", "count-cap check"),
+                ("let index = index.ok_or_else", "accrual loop ends"),
+                ("serde_json::from_str(json)", "first-loop transient parse"),
+            ];
+            let mut found: Vec<String> = Vec::new();
+            for (needle, label) in needles {
+                let n = lines.iter().filter(|l| l.contains(needle)).count();
+                found.push(format!("{label}={n}"));
+                assert_eq!(
+                    n, 1,
+                    "{file}::{sig} needle [{needle}] matched {n} code lines (need exactly 1) — \
+                     the scan is blind to this needle. Per-needle counts so far {found:?}; code \
+                     lines scanned in span (from line {}): {}",
+                    start + 1,
+                    lines.len()
+                );
+            }
+            let byte_cap = line_of("matched_bytes > MAX_RESTITCHED_BYTES").unwrap();
+            let parse = line_of("serde_json::from_str(raw)").unwrap();
+            let count_cap = line_of("candidates.len() > MAX_LISTING_PARTS").unwrap();
+            let accrual_end = line_of("let index = index.ok_or_else").unwrap();
+            let transient = line_of("serde_json::from_str(json)").unwrap();
+            assert!(
+                byte_cap < parse,
+                "{file}::{sig} byte cap (relative line {byte_cap}) must fire BEFORE the matched-raw \
+                 parse (relative line {parse}) — parse-first is the 50d7bea defect shape. Counts \
+                 {found:?}; code lines scanned in span (from line {}): {}",
+                start + 1,
+                lines.len()
+            );
+            assert!(
+                count_cap < accrual_end,
+                "{file}::{sig} count cap (relative line {count_cap}) must fire DURING accrual \
+                 (relative line {accrual_end}), bounding the RETAINED candidates before the index \
+                 is demanded. Counts {found:?}; code lines scanned in span (from line {}): {}",
+                start + 1,
+                lines.len()
+            );
+            // Recorded fact, not an endorsement: the transient first-loop parse exists inside the
+            // accrual region. It is NOT ordered against the count cap — every payload IS parsed
+            // transiently before any count cap can refuse the batch (see the doc comment above).
+            assert!(
+                transient < accrual_end,
+                "{file}::{sig} the first-loop transient parse (relative line {transient}) has \
+                 moved outside the accrual region (ends at relative line {accrual_end}) — the doc \
+                 comment's description of the shape is now stale, update it. Counts {found:?}; \
+                 code lines scanned in span (from line {}): {}",
+                start + 1,
+                lines.len()
+            );
+        }
     }
 
     #[test]
