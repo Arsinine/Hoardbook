@@ -1832,32 +1832,35 @@ mod tests {
     /// own frames need, and (b) provably below the recursive walk's ~0.8–1 MB footprint — the
     /// tight window where only the iterative implementation survives. `RUST_MIN_STACK` cannot
     /// substitute: it sizes *spawned* threads, not the harness's own main/test threads.
+    /// ⚠ Fixture setup AND teardown deliberately stay on the harness thread; ONLY the call under
+    /// test runs on the small stack. `TempDir`'s drop calls `std::fs::remove_dir_all`, which is
+    /// **itself recursive per directory level on Unix** — tearing down a 259-level tree inside
+    /// 512 KiB overflows on macOS no matter how `scan_selective` behaves, which is exactly how the
+    /// first version of this test failed CI (run 32821343962, `thread '<unknown>' has overflowed
+    /// its stack`). A discriminator has to bound the code under test and nothing else, or it
+    /// reports on its own scaffolding.
     #[test]
     fn scan_selective_deep_tree_survives_tiny_thread_stack() {
-        std::thread::Builder::new()
+        let dir = tempfile::tempdir().unwrap();
+        let mut path = dir.path().to_path_buf();
+        // One-char components keep the ~518-char path under macOS's 1024-byte PATH_MAX
+        // (see `scan_selective_rejects_pathologically_deep_tree`).
+        for _ in 0..(MAX_SCAN_DEPTH + 3) {
+            path = path.join("d");
+        }
+        std::fs::create_dir_all(&path).unwrap();
+
+        let root = dir.path().to_path_buf();
+        let err = std::thread::Builder::new()
             .stack_size(512 * 1024)
             .spawn(move || {
-                let dir = tempfile::tempdir().unwrap();
-                let mut path = dir.path().to_path_buf();
-                // One-char components keep the ~518-char path under macOS's 1024-byte PATH_MAX
-                // (see `scan_selective_rejects_pathologically_deep_tree`).
-                for _ in 0..(MAX_SCAN_DEPTH + 3) {
-                    path = path.join("d");
-                }
-                std::fs::create_dir_all(&path).unwrap();
-
                 // The loud depth Err — same shape, same depth, as the recursive original's.
-                let err = scan_selective(dir.path(), &include(&["d"]), &empty_globs())
-                    .unwrap_err()
-                    .to_string();
-                assert!(
-                    err.contains("depth"),
-                    "deep tree is rejected with a loud, reasoned error: {err}"
-                );
+                scan_selective(&root, &include(&["d"]), &empty_globs()).unwrap_err().to_string()
             })
             .unwrap()
             .join()
             .unwrap();
+        assert!(err.contains("depth"), "deep tree is rejected with a loud, reasoned error: {err}");
     }
 
     // ── IncludeSet truth table (mirrors the frontend scan-tree.ts) ────────────
