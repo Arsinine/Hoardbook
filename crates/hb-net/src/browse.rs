@@ -99,6 +99,12 @@ pub async fn publish_listing_capped(
 pub struct BrowseResult {
     pub teaser: Option<Teaser>,
     pub listing: Option<RenderedListing>,
+    /// Why `listing` is `None` when a browse-key was held (QURATOR-127): the inner error
+    /// `fetch_listing` returned, captured before BR1 leniency locks the listing — the old `.ok()`
+    /// discarded it, collapsing a client/timeout failure, a missing index, an incoherent family
+    /// and a decrypt failure into one indistinguishable `None`. `None` when the listing rendered
+    /// or the code was follow-only (no key held). Diagnostic only, never a failure in itself.
+    pub listing_error: Option<String>,
     pub resolved_relays: Vec<String>,
 }
 
@@ -180,13 +186,36 @@ pub async fn browse_share_code(
     let teaser = select_newest_teaser(teaser_events, &peer);
 
     // Listing (gated by the browse-key): a decrypt failure locks the listing without failing the
-    // whole browse — the teaser still shows (BR1).
-    let listing = match share_code.browse_key() {
-        Some(bk) => fetch_listing(client, &peer, slug, &bk, timeout).await.ok(),
-        None => None,
+    // whole browse — the teaser still shows (BR1). The reason rides on the result so the failure
+    // mode stays attributable (QURATOR-127).
+    let (listing, listing_error) = match share_code.browse_key() {
+        Some(bk) => {
+            listing_or_lock_reason(slug, fetch_listing(client, &peer, slug, &bk, timeout).await)
+        }
+        None => (None, None),
     };
 
-    Ok(BrowseResult { teaser, listing, resolved_relays })
+    Ok(BrowseResult { teaser, listing, listing_error, resolved_relays })
+}
+
+/// The BR1 fold, as ONE function both callers use (QURATOR-127): a listing failure locks the
+/// listing (`None`) without failing the browse, but the reason is kept — rendered into a
+/// `tracing::warn!` the harness's subscriber emits, and returned alongside so `hb-it` can name the
+/// actual failure mode in its TAP line instead of the bare "did not browse". A success carries no
+/// reason. `fetch_full_listing_from` (the big-relay twin) keeps its own silent `.ok()`-shaped
+/// leniency — its caller has no diagnostic channel and BR1 there is pinned by its own tests.
+pub fn listing_or_lock_reason(
+    slug: &str,
+    r: Result<RenderedListing, NetError>,
+) -> (Option<RenderedListing>, Option<String>) {
+    match r {
+        Ok(listing) => (Some(listing), None),
+        Err(e) => {
+            let reason = e.to_string();
+            tracing::warn!("browse: listing for '{slug}' locked (BR1) — {reason}");
+            (None, Some(reason))
+        }
+    }
 }
 
 /// Phase-1 fetch budget for a slug's **index** event (`d = slug`): one parameterized-replaceable
@@ -958,6 +987,68 @@ mod tests {
             ),
             other => panic!("a missing index must be the existing error, got {other:?}"),
         }
+    }
+
+    /// QURATOR-127 — BR1 leniency with an attributable reason, at the exact fold `browse_share_code`
+    /// performs. A failure (here: the missing-index error a dead/incomplete relay produces) must
+    /// yield `listing: None` **and** a non-empty reason distinguishing the mode; a follow-only code
+    /// has no key and so no reason; a rendered listing carries no reason. Ends where production
+    /// ends — the helper IS the site `browse_share_code` calls, not a re-emit of its shape.
+    #[tokio::test]
+    async fn br1_lock_yields_none_listing_and_names_the_inner_error() {
+        let victim = Identity::generate();
+        let peer = victim.public_key();
+        let browse_key: BrowseKey = [7; 32];
+
+        // Failure mode 2 (zero family events served): the empty-family error.
+        let fetch_none = |_filter: Filter| async { Ok(Vec::<Event>::new()) };
+        let r = fetch_slug_family(&peer, "gone", &browse_key, fetch_none).await;
+        let (listing, reason) = listing_or_lock_reason("gone", r);
+        assert!(listing.is_none(), "BR1: a failed fetch must lock, not error, the browse");
+        let reason = reason.expect("the lock reason must be captured, not discarded");
+        assert!(
+            reason.contains("no listing found for slug 'gone'"),
+            "the reason must name the actual inner error, got: {reason}"
+        );
+
+        // Failure mode 4 (decrypt failure on a served event): a real event under the WRONG key.
+        let ev = build_listing_event(
+            &victim,
+            "locked",
+            &browse_key,
+            &serde_json::json!({ "slug": "locked", "entries": [] }).to_string(),
+        )
+        .unwrap();
+        let fetch_wrong_key = move |_filter: Filter| {
+            let ev = ev.clone();
+            async move { Ok(vec![ev]) }
+        };
+        let wrong_key: BrowseKey = [99; 32];
+        let r = fetch_slug_family(&peer, "locked", &wrong_key, fetch_wrong_key).await;
+        let (listing, reason) = listing_or_lock_reason("locked", r);
+        assert!(listing.is_none(), "BR1: a locked listing must not fail the browse");
+        let reason = reason.expect("a decrypt failure must leave a reason");
+        assert!(
+            !reason.contains("no listing found"),
+            "a decrypt failure must be distinguishable from an absent family, got: {reason}"
+        );
+
+        // A compliant render: no reason rides along.
+        let ok_index = build_listing_event(
+            &victim,
+            "fine",
+            &browse_key,
+            &serde_json::json!({ "slug": "fine", "entries": [{ "name": "a" }] }).to_string(),
+        )
+        .unwrap();
+        let fetch_ok = move |_filter: Filter| {
+            let ok_index = ok_index.clone();
+            async move { Ok(vec![ok_index]) }
+        };
+        let r = fetch_slug_family(&peer, "fine", &browse_key, fetch_ok).await;
+        let (listing, reason) = listing_or_lock_reason("fine", r);
+        assert!(listing.is_some(), "a compliant listing must render");
+        assert!(reason.is_none(), "a rendered listing carries no lock reason");
     }
 
     /// `browse_peer_listings`'s count bound (the sibling gap two reviewers found): a family with
