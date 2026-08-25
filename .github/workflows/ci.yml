@@ -29,11 +29,16 @@ jobs:
         with:
           node-version: 20
 
-      - uses: dtolnay/rust-toolchain@stable
+      # QURATOR-111 #16: SHA-pinned (was @stable, a moving branch). Resolved via
+      # gh api repos/dtolnay/rust-toolchain/commits/stable. The action's `toolchain`
+      # input still defaults to `stable`, so this pin does not freeze the Rust version.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable (branch head 2026-08-05)
         with:
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      # QURATOR-111 #16: SHA-pinned (was @v2). Resolved via gh api
+      # repos/Swatinem/rust-cache/commits/v2.9.2 — the v2 branch head == the v2.9.2 tag.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-latest'
@@ -129,7 +134,12 @@ jobs:
           sweep "retired xfer crypto in hb-core"      'seal_addrs|unseal_addrs|resolve_node_key|verify_binding_token|follower_gate|SealedAddr|KIND_XFER' crates/hb-core/src
           sweep "a transfer/gate module declaration"  '^[[:space:]]*(#\[[^]]*\][[:space:]]*)*(pub(\([^)]*\))?[[:space:]]+)?mod[[:space:]]+(transfer|gate)\b' crates
           sweep "a download queue or download verb is back" 'DownloadQueue|request_download|cancel_download|DownloadRegistry' crates/hb-app/src crates/hb-app/ui/src crates/hb-core/src crates/hb-net/src
-          sweep "the transport module reads the filesystem — the plane is moving files" 'tokio::fs|std::fs::|File::open|PathBuf|std::path::Path' $TRANSPORT_FILES
+          # QURATOR-111 #5 (2026-08-23 scan): the retired pattern required `std::fs::` with
+          # trailing colons, so `use std::fs;` + a bare `fs::read_to_string(...)` tripped
+          # nothing. `std::fs([^a-zA-Z_]|$)` now flags the import line itself (incl. `as`/glob
+          # aliases), and the bare `fs::` rule flags any module access however `fs` came into
+          # scope. Self-tested against ci-fixtures/inv4-fs-positive.rs in the step below.
+          sweep "the transport module reads the filesystem — the plane is moving files" 'tokio::fs|std::fs([^a-zA-Z_]|$)|(^|[^a-zA-Z_:])fs::|File::open|PathBuf|std::path::Path' $TRANSPORT_FILES
           # INV-4′ mechanism 1 is only real while `ManifestPayload`'s ONLY constructors validate. A
           # serde derive is an unvalidated public constructor: `from_str::<ManifestPayload>("[137,80]")`
           # yields a payload of PNG bytes, skipping seal/from_wire/verify_integrity AND the 8 MiB
@@ -152,6 +162,42 @@ jobs:
           fi
           if [ "$fail" -ne 0 ]; then echo "::error::INV-4′ — Hoardbook moves no COLLECTION FILES. The above turns the manifest plane into a file mover."; exit 1; fi
           echo "INV-4′ sweep clean — the transport module carries ManifestPayload and touches no files."
+
+      # Positive control for the no-fs probe inside the INV-4′ sweep above (QURATOR-111 #5,
+      # 2026-08-23 scan). Its CWE-94 sibling has had one since QURATOR-48; this probe had none,
+      # and the scan found it was EVADABLE — `use std::fs;` plus a bare `fs::read_to_string(...)`
+      # contains none of the fully-qualified tokens the retired pattern required, so CI stayed
+      # green while the transport module gained real fs access. A guard that cannot be shown to
+      # red is indistinguishable from one that scans nothing — this repo has shipped both. The
+      # fixture holds exactly that evasion; this step runs the SAME pattern-and-filter pipeline
+      # as the sweep above against it and asserts it REDS. It lives under ci-fixtures/ (NOT
+      # crates/), so no production probe ever scans it.
+      - name: INV-4′ no-fs probe self-test — must red on the positive fixture
+        if: matrix.platform == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -uo pipefail
+          code_only() { grep -vE '^[^:]*:[0-9]+:[[:space:]]*(//|#|\*|/\*|<!--)'; }
+          pattern='tokio::fs|std::fs([^a-zA-Z_]|$)|(^|[^a-zA-Z_:])fs::|File::open|PathBuf|std::path::Path'
+          # -H is load-bearing exactly as in the injection self-test: grep on a SINGLE explicit
+          # file omits the `file:line:` prefix, and code_only anchors on that prefix.
+          hits=$(grep -HnE "$pattern" ci-fixtures/inv4-fs-positive.rs 2>/dev/null | code_only)
+          if [ -z "$hits" ]; then
+            echo "::error::The INV-4′ no-fs probe is VACUOUS — it passed on ci-fixtures/inv4-fs-positive.rs, which holds the exact aliased-import evasion the 2026-08-23 scan described (use std::fs; + bare fs::read_to_string). The probe must catch this (QURATOR-111 #5)."
+            exit 1
+          fi
+          n=$(printf '%s\n' "$hits" | grep -c .)
+          # Negative half: the fixture's doc comments name std::fs and tokio::fs::File::open
+          # deliberately — a module that documents what it refuses to do names those things. If
+          # they appear here, code_only lost its anchor and every doc comment in the real
+          # transport module (transport.rs lines 8/14 do exactly this) would red the build on prose.
+          if fp=$(printf '%s\n' "$hits" | grep -E ':[0-9]+:[[:space:]]*(//|#|\*|/\*|<!--)'); then
+            echo "::error::FALSE POSITIVE — the probe flagged a COMMENT line. code_only must keep dropping them."
+            echo "$fp"
+            exit 1
+          fi
+          echo "INV-4′ no-fs probe self-test OK — caught $n evasion(s), and exempted every comment line:"
+          printf '%s\n' "$hits" | sed 's/^/  /'
 
       # M18 W5 — the retired MASCARA-COURIER framing must not creep back into code.
       #
@@ -365,20 +411,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # QURATOR-111 #16: SHA-pinned (was @stable, a moving branch). Resolved via
+      # gh api repos/dtolnay/rust-toolchain/commits/stable. The action's `toolchain`
+      # input still defaults to `stable`, so this pin does not freeze the Rust version.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable (branch head 2026-08-05)
 
-      - uses: Swatinem/rust-cache@v2
+      # QURATOR-111 #16: SHA-pinned (was @v2). Resolved via gh api
+      # repos/Swatinem/rust-cache/commits/v2.9.2 — the v2 branch head == the v2.9.2 tag.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
       # GitHub `services:` containers start before checkout, so the vendored strfry.conf can't be
-      # volume-mounted into one — start strfry in a run: step after checkout instead (M2 brief §6).
+      # volume-mounted into one — start strfry in a run: step after checkout instead (QURATOR-111
+      # #30, 2026-08-23 scan): the image ref is pinned by digest — was the floating :latest,
+      # resolved at run time by a third party on every PR. Digest is the manifest-LIST digest
+      # (amd64 + arm64), resolved 2026-08-25 via `docker manifest inspect dockurr/strfry:latest`
+      # and cross-confirmed against the registry's Docker-Content-Digest header. Upgrades are
+      # now a deliberate digest bump, not whatever the registry serves that day.
       - name: Start two ephemeral strfry relays
         run: |
           docker run -d --name relay1 -p 7777:7777 \
             -v "$PWD/crates/hb-it/strfry.conf:/etc/strfry.conf:ro" \
-            -v strfrydb1:/app/strfry-db dockurr/strfry
+            -v strfrydb1:/app/strfry-db dockurr/strfry@sha256:7ae77f50cc0cf5dab53a50c2790681dfaa40d7d6df3e0d77df6bf0a84fff58bd  # was :latest, 2026-07-21 build
           docker run -d --name relay2 -p 7778:7777 \
             -v "$PWD/crates/hb-it/strfry.conf:/etc/strfry.conf:ro" \
-            -v strfrydb2:/app/strfry-db dockurr/strfry
+            -v strfrydb2:/app/strfry-db dockurr/strfry@sha256:7ae77f50cc0cf5dab53a50c2790681dfaa40d7d6df3e0d77df6bf0a84fff58bd  # was :latest, 2026-07-21 build
 
       - name: Wait for the relays to accept connections
         run: |
@@ -468,9 +524,14 @@ jobs:
         with:
           node-version: 20
 
-      - uses: dtolnay/rust-toolchain@stable
+      # QURATOR-111 #16: SHA-pinned (was @stable, a moving branch). Resolved via
+      # gh api repos/dtolnay/rust-toolchain/commits/stable. The action's `toolchain`
+      # input still defaults to `stable`, so this pin does not freeze the Rust version.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable (branch head 2026-08-05)
 
-      - uses: Swatinem/rust-cache@v2
+      # QURATOR-111 #16: SHA-pinned (was @v2). Resolved via gh api
+      # repos/Swatinem/rust-cache/commits/v2.9.2 — the v2 branch head == the v2.9.2 tag.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
       - name: Install frontend dependencies
         working-directory: crates/hb-app/ui
@@ -500,9 +561,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # QURATOR-111 #16: SHA-pinned (was @stable, a moving branch). Resolved via
+      # gh api repos/dtolnay/rust-toolchain/commits/stable. The action's `toolchain`
+      # input still defaults to `stable`, so this pin does not freeze the Rust version.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable (branch head 2026-08-05)
 
-      - uses: taiki-e/install-action@v2
+      # QURATOR-111 #16: SHA-pinned (was @v2). Resolved via gh api
+      # repos/taiki-e/install-action/commits/v2.86.7 — the v2 branch head == the v2.86.7 tag.
+      - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc  # v2.86.7
         with:
           tool: cargo-audit,cargo-deny
 
