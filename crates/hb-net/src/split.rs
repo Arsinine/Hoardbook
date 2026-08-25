@@ -574,6 +574,16 @@ fn truncate_tree(entries: &[Value], budget: usize) -> (Vec<Value>, usize) {
 /// paywall-style "N more hidden" fade. The dropped items are simply not published — the browse side
 /// never learns their names (this is a preview, not a lossy split).
 ///
+/// **The teaser's `snapshot_fingerprint` is re-derived over the VISIBLE entries + the elided count**
+/// (security audit #25 / QURATOR-123). The full-tree digest the hoarder stamps into listing meta is
+/// a digest of exactly the content truncation exists to hide — preserved verbatim into the teaser it
+/// was an offline confirm-or-deny oracle on the hidden portion. `truncate_listing` is the single
+/// choke point every truncated teaser passes through, so it re-stamps here: decode the kept entries
+/// back into `DirectoryItem`s and hash them with `hb_core::teaser_fingerprint`. An input with no
+/// `snapshot_fingerprint` (pre-M16, or a hand-built test fixture) keeps no fingerprint — the field
+/// is the hoarder's publish-time signal, not this function's to invent. The digest string length is
+/// unchanged (64 lowercase hex), so the byte budget accounting below is unaffected.
+///
 /// **What is bounded is `entries`, not the whole document.** The budget this function can spend is
 /// `max_bytes` minus the serialized metadata envelope, and it has no way to shrink that envelope —
 /// so an envelope that is itself over `max_bytes` yields a zero-length `entries` and a return value
@@ -610,7 +620,33 @@ pub fn truncate_listing(listing_json: &str, max_bytes: usize) -> Result<Truncate
     let mut out = meta;
     out.insert("truncated".into(), Value::Bool(true));
     out.insert("total_items".into(), Value::from(total_items as u64));
-    out.insert("entries".into(), Value::Array(kept));
+    out.insert("entries".into(), Value::Array(kept.clone()));
+    // Audit #25 / QURATOR-123 (owner ruling 2026-08-25): replace the preserved full-tree digest with
+    // one over the visible entries + elided count. See the function docs.
+    if let Some(Value::String(prev)) = out.get("snapshot_fingerprint") {
+        let prev = prev.clone();
+        match serde_json::from_value::<Vec<hb_core::types::DirectoryItem>>(Value::Array(kept)) {
+            Ok(visible) => {
+                let elided = total_items.saturating_sub(shown_items) as u64;
+                out.insert(
+                    "snapshot_fingerprint".into(),
+                    Value::String(hb_core::teaser_fingerprint(&visible, elided).0),
+                );
+            }
+            // The kept entries did not decode as the tree this app publishes (a foreign fixture).
+            // Dropping the stale full-tree digest fails closed: the browse-side staleness gates read
+            // `None` and keep the teaser rather than trusting a digest of content that is not present.
+            // No clamp, no partial digest — never a value an identifier is derived from.
+            Err(_) => {
+                out.remove("snapshot_fingerprint");
+                tracing::debug!(
+                    "truncated listing carried a snapshot_fingerprint ({prev}) but its kept entries \
+                     did not decode as a DirectoryItem tree; dropping the digest rather than \
+                     publishing a hash of the hidden content"
+                );
+            }
+        }
+    }
     let json = serde_json::to_string(&Value::Object(out)).map_err(|e| NetError::Split(e.to_string()))?;
     Ok(TruncatedListing { json, truncated: true, shown_items, total_items })
 }
@@ -922,6 +958,9 @@ mod tests {
 
     #[test]
     fn truncate_listing_leaves_a_fitting_listing_whole() {
+        // NOTE: an under-budget input is returned byte-identical, so its `snapshot_fingerprint`
+        // (if any) survives untouched — nothing is hidden, so nothing needs re-deriving. The
+        // re-stamp lives on the truncating path only; see the tests below it.
         let t = truncate_listing(&listing(2), 65_536).unwrap();
         assert!(!t.truncated, "a listing under budget is not truncated");
         assert_eq!(t.shown_items, 2);
@@ -929,6 +968,151 @@ mod tests {
         assert!(!t.json.contains("\"truncated\""), "no paywall marker on a whole listing");
         assert_eq!(t.json, normalize(&listing(2)).unwrap());
     }
+
+    // ── audit #25 / QURATOR-123: the truncated teaser must not carry the full-tree digest ────────
+
+    /// A listing whose `entries` decode as real `DirectoryItem`s — the shape
+    /// `collection_to_listing_json` emits — carrying the full-tree `snapshot_fingerprint` a hoarder
+    /// stamps at publish time.
+    fn fp_listing_with_real_tree(slug: &str, n: usize, fp: &str) -> String {
+        let entries: Vec<Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("title-{i:05}-padding-padding-padding-xx"),
+                    "item_type": "File",
+                    "tags": [],
+                    "children": [],
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "slug": slug, "content_types": ["video"],
+            "snapshot_fingerprint": fp, "entries": entries,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn truncate_listing_restamps_the_fingerprint_over_the_visible_entries() {
+        // The defect: `truncate_listing` preserved the full-tree digest, shipping a hash of exactly
+        // the content the truncation hides. The teaser must instead carry a digest of its VISIBLE
+        // entries + the elided count — derived here from the teaser's own kept entries, exactly as
+        // production derives it (no re-emitted lookalike: the digest below is decoded back out of
+        // the returned JSON, which is the artifact the relay would publish).
+        let full = fp_listing_with_real_tree("vault", 1300, &"0".repeat(64));
+        let full_fp = hb_core::snapshot_fingerprint(&decodable_tree("vault", 1300));
+        let full = full.replace(&"0".repeat(64), &full_fp.0);
+        let t = truncate_listing(&full, 40_000).unwrap();
+        assert!(t.truncated, "the fixture must truncate");
+        assert!(t.total_items > t.shown_items, "the fixture must hide something");
+        let v: Value = serde_json::from_str(&t.json).unwrap();
+        let teaser_fp = v.get("snapshot_fingerprint").and_then(Value::as_str).expect("a digest must remain");
+        assert_ne!(
+            teaser_fp, full_fp.0,
+            "the teaser must NOT carry the full-tree digest of the content it hides"
+        );
+        // END WHERE PRODUCTION ENDS: recompute the expected digest from the teaser's own kept
+        // entries (decoded out of the artifact, not from an internal), plus the elided count.
+        let visible: Vec<hb_core::types::DirectoryItem> =
+            serde_json::from_value(v.get("entries").cloned().unwrap()).unwrap();
+        let expected = hb_core::teaser_fingerprint(&visible, (t.total_items - t.shown_items) as u64);
+        assert_eq!(teaser_fp, expected.0, "the carried digest must be the visible-portion digest");
+    }
+
+    #[test]
+    fn teasers_that_differ_only_in_hidden_entries_share_one_digest() {
+        // AC-2, at the artifact level: two collections with the same visible prefix and the same
+        // elided count but entirely different hidden halves must produce byte-identical digests in
+        // their truncated teasers — the confirm-or-deny oracle on hidden content is gone.
+        let n = 1300;
+        let tree_one = decodable_tree("vault", n);
+        // Byte-identical for the first `same_prefix` entries (more than the budget can ever keep),
+        // differing only in the tail the truncation drops — so the two teasers' visible portions are
+        // the same entries, and the only difference between the artifacts is the hidden remainder.
+        let same_prefix = 1000;
+        let tree_two: Vec<hb_core::types::DirectoryItem> = decodable_tree("vault", n)
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut it)| {
+                if i >= same_prefix {
+                    it.name = format!("HIDDEN-{i:05}-DIFFERENT-CONTENT.mkv");
+                    it.size = Some("9 GB".to_string());
+                }
+                it
+            })
+            .collect();
+        assert_ne!(
+            hb_core::snapshot_fingerprint(&tree_one),
+            hb_core::snapshot_fingerprint(&tree_two),
+            "fixture sanity: the two full trees are genuinely different trees"
+        );
+        // Publish both the way production does: full-tree digest stamped in meta, then truncated at
+        // the same budget — the visible prefix (and therefore the elided count) is identical.
+        let mk = |tree: &[hb_core::types::DirectoryItem]| {
+            let entries: Vec<Value> = serde_json::to_value(tree).unwrap().as_array().unwrap().clone();
+            serde_json::json!({
+                "slug": "vault", "content_types": ["video"],
+                "snapshot_fingerprint": hb_core::snapshot_fingerprint(tree).0,
+                "entries": entries,
+            })
+            .to_string()
+        };
+        let a = truncate_listing(&mk(&tree_one), 40_000).unwrap();
+        let b = truncate_listing(&mk(&tree_two), 40_000).unwrap();
+        assert_eq!(a.shown_items, b.shown_items, "same visible prefix must keep the same item count");
+        assert_eq!(a.total_items, b.total_items);
+        let fp = |t: &TruncatedListing| {
+            serde_json::from_str::<Value>(&t.json)
+                .unwrap()
+                .get("snapshot_fingerprint")
+                .and_then(Value::as_str)
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            fp(&a), fp(&b),
+            "two teasers differing only in hidden entries must share one digest"
+        );
+    }
+
+    #[test]
+    fn truncate_listing_drops_a_fingerprint_it_cannot_rederive() {
+        // Failing closed: kept entries that do not decode as a `DirectoryItem` tree must NOT keep a
+        // digest of content that is not present — the field is removed so the browse-side gates read
+        // `None` and keep the teaser. A foreign fixture (no `item_type`, extra keys on entries) is
+        // the shape that fails the decode.
+        let entries: Vec<Value> = (0..40)
+            .map(|i| serde_json::json!({ "name": format!("title-{i:05}-padding-padding-padding-xx"), "size": 1_000_000 + i }))
+            .collect();
+        let json = serde_json::json!({
+            "slug": "vault", "content_types": ["video"],
+            "snapshot_fingerprint": "9".repeat(64), "entries": entries,
+        })
+        .to_string();
+        let t = truncate_listing(&json, 800).unwrap();
+        assert!(t.truncated);
+        assert!(
+            !t.json.contains("snapshot_fingerprint"),
+            "an underivable digest must be dropped, not preserved"
+        );
+    }
+
+    /// `n` plain file `DirectoryItem`s matching [`fp_listing_with_real_tree`]'s entries.
+    fn decodable_tree(_slug: &str, n: usize) -> Vec<hb_core::types::DirectoryItem> {
+        (0..n)
+            .map(|i| hb_core::types::DirectoryItem {
+                name: format!("title-{i:05}-padding-padding-padding-xx"),
+                item_type: hb_core::types::ItemType::File,
+                size: None,
+                format: Some(format!("MKV{}", i % 10)),
+                year: None,
+                tags: vec![],
+                note: None,
+                children: vec![],
+            })
+            .collect()
+    }
+
 
     #[test]
     fn truncate_listing_keeps_a_bounded_selection_and_marks_it() {

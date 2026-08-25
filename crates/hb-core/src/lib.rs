@@ -73,5 +73,5 @@ pub use topic::{
     KIND_TOPIC_INVITE, KIND_TOPIC_MEMBER, KIND_TOPIC_POST, MAX_TOPIC_DEPTH, POST_TTL_SECS,
     TOPIC_ROOTS,
 };
-pub use snapshot::{snapshot_fingerprint, unchanged_since, SnapshotFingerprint};
+pub use snapshot::{snapshot_fingerprint, teaser_fingerprint, unchanged_since, SnapshotFingerprint};
 pub use version::SCHEMA_V;
