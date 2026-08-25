@@ -31,6 +31,15 @@ const MIN_CODE_LEN = 58;
 /** Upper bound — anything past this is not a valid bech32 code (npub=63, hbk=90; allow margin to 120). */
 const MAX_CODE_LEN = 120;
 
+/** Upper bound on the MESSAGE TEXT this module will scan (security audit #22). A received DM's content
+ *  is peer-controlled with no upstream content-length cap (the Rust DM cache caps message COUNT), so a
+ *  hostile ~65 KB paste would otherwise reach the scan and the over-long-token slice recovery would
+ *  multiply it ~63× into tens of thousands of candidates — each one an awaited validate IPC call in the
+ *  chat route. 8,192 = 2× the 4,096-char acceptance message; a real code is ≤120 chars in prose, so no
+ *  legitimate text is lost. Over-long text is REJECTED (detects nothing, never throws, never truncated —
+ *  truncation could manufacture a code-shaped prefix an attacker positions at the cut). */
+const MAX_TEXT_LEN = 8192;
+
 /** The greedy token a candidate scan considers: an `hbk1`/`npub1` prefix + a run of bech32 chars. */
 const TOKEN_RE = /(?:hbk1|npub1)[0-9a-z]+/g;
 
@@ -57,6 +66,7 @@ export function extractShareCodeCandidate(
 	text: string,
 	validate: (code: string) => boolean,
 ): string | null {
+	if (text.length > MAX_TEXT_LEN) return null; // audit #22: reject, never truncate
 	const matches = text.match(TOKEN_RE);
 	if (!matches) return null;
 	// Walk candidates in order of appearance; return the first one that passes the length/charset
@@ -83,6 +93,7 @@ export function extractShareCodeCandidate(
  *  The route pre-validates exactly these (raw tokens AND the over-long-token prefix slices) so the
  *  slice-recovery path in `extractShareCodeCandidate` actually has verdicts to consult. */
 export function shareCodeCandidates(text: string): string[] {
+	if (text.length > MAX_TEXT_LEN) return []; // audit #22: reject, never truncate
 	const matches = text.match(TOKEN_RE);
 	if (!matches) return [];
 	const out: string[] = [];

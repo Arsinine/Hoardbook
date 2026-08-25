@@ -134,3 +134,31 @@ describe('shareCodeCandidates — over-long token slice recovery (two codes, no 
 		expect(extractShareCodeCandidate(twoCodes, validate)).toBe(validSlice);
 	});
 });
+
+describe('security audit #22 — the scan is bounded (attacker-length DM text rejected, never truncated)', () => {
+	// A received DM's content is peer-controlled and can reach ~65 KB (the NIP-44 plaintext cap is the
+	// ONLY upstream bound — the Rust DM cache caps message COUNT, not content length). The over-long-token
+	// slice recovery multiplies such text ~63×: each >120-char token emits 63 candidate slices, and the
+	// chat route awaits one validate_share_code IPC call per candidate. Unbounded, 65 KB of hostile text
+	// becomes ~34k awaited validations. The bound: text longer than 8,192 chars (2× the 4,096-char
+	// acceptance message; a real code is ≤120 chars in prose) is REJECTED — detect nothing, never throw.
+	it('rejects an over-long hostile message: no candidates, validate never called, no throw', () => {
+		// 200 run-together over-long tokens (each `npub1` + 116 a's + separator = 122 chars).
+		const hostile = ('npub1' + 'a'.repeat(116) + ' ').repeat(200);
+		expect(hostile.length).toBeGreaterThan(8192);
+		const seen: string[] = [];
+		const validate = (c: string) => { seen.push(c); return true; };
+		expect(extractShareCodeCandidate(hostile, validate)).toBeNull();
+		expect(shareCodeCandidates(hostile)).toEqual([]);
+		expect(seen).toEqual([]);
+	});
+	it('a message exactly at the bound still detects (the gate is >, and rejects rather than truncates)', () => {
+		// 8,192 chars whose tail carries a real code — under/at the cap, behaviour is unchanged. A code
+		// near the start is NOT preferred over one near the end: no truncation, whole-text scan.
+		const prose = 'x'.repeat(8192 - GOLDEN_NPUB_A.length - 1);
+		const msg = prose + ' ' + GOLDEN_NPUB_A;
+		expect(msg.length).toBe(8192);
+		expect(extractShareCodeCandidate(msg, () => true)).toBe(GOLDEN_NPUB_A);
+		expect(shareCodeCandidates(msg)).toEqual([GOLDEN_NPUB_A]);
+	});
+});
