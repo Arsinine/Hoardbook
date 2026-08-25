@@ -652,7 +652,7 @@ async fn c5_blocked_drop(probe: &ProbeInput) -> Result<(), String> {
 
     // (1) Bob blocks Alice FIRST (the production blocklist write). dm_block_inner adds alice to the
     //     blocklist and removes any existing Request bucket / decline record for her.
-    dm_block_inner(&probe.store, alice_npub.clone())
+    dm_block_inner(&probe.store, &bob, alice_npub.clone())
         .map_err(|e| format!("C5 dm_block_inner: {e}"))?;
 
     // (2) Alice sends a DM via the production send path.
@@ -706,7 +706,7 @@ async fn c5_blocked_drop(probe: &ProbeInput) -> Result<(), String> {
     // Also confirm via the production Request read (`dm_requests_inner`) — it reads the persisted
     // store. Since merge returned no request for alice and dm_block_inner cleared any prior bucket,
     // the persisted Request list must not contain alice.
-    let persisted_requests = dm_requests_inner(&probe.store, &bob_npub)
+    let persisted_requests = dm_requests_inner(&probe.store, &bob, &bob_npub)
         .map_err(|e| format!("C5 dm_requests_inner: {e}"))?;
     if persisted_requests.iter().any(|r| r.npub == alice_npub) {
         return Err("C5 the persisted Request inbox contains the blocked sender — dm_block_inner should have cleared it".to_string());

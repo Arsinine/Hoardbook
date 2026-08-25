@@ -11,7 +11,7 @@ use crate::{
     commands::profile::{compute_content_types, teaser_from_profile},
     error::{CmdResult, cmd_err},
     net::{self, SharedRelay},
-    store::DataStore,
+    store::{DataStore, PublishedSave},
     SharedIdentity,
 };
 
@@ -202,7 +202,7 @@ async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult
             opts.path_alias
         ));
     }
-    let globs = build_glob_set(&opts.exclude);
+    let globs = build_glob_set(&opts.exclude)?;
     let include = IncludeSet::new(opts.include.clone());
 
     // Walk the filesystem off the async runtime thread under a hard deadline.
@@ -306,7 +306,7 @@ pub(crate) fn rescan_listing(slug: &str, store: &DataStore) -> Result<Option<Vec
         return Ok(None);
     };
     let root = std::path::PathBuf::from(&spec.root);
-    let globs = build_glob_set(&spec.exclude);
+    let globs = build_glob_set(&spec.exclude)?;
     let include = IncludeSet::new(spec.include.clone());
     let scan = move || -> anyhow::Result<(Vec<DirectoryItem>, u64)> {
         anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
@@ -530,6 +530,37 @@ pub(crate) fn private_recipients(store: &DataStore) -> Result<Vec<nostr::PublicK
     Ok(out)
 }
 
+/// The explicit "revoked during publish" outcome (CWE-367): a concurrent Unpublish bumped the
+/// revocation generation while this publish was writing to the relay, so the published marker must
+/// NOT be re-created (INV-8: a deliberately-skipped save, reported — never a silent success).
+fn revoked_during_publish(slug: &str) -> String {
+    format!(
+        "collection '{slug}' was unpublished while its publish was in flight; not re-creating the published marker"
+    )
+}
+
+/// The marker-save tail shared by [`publish_collection_inner`] (public path) and
+/// [`publish_private_collection_inner`] (private path) — the CWE-367 guarded save. The relay write
+/// happens before the marker save, so an Unpublish issued mid-publish would otherwise be silently
+/// undone by the save re-creating the marker. Extracted so the pinning test ends where production
+/// ends (P-6): on [`PublishedSave::Revoked`] it reports the revocation instead of succeeding
+/// (INV-8: a deliberately-skipped save, reported — never a silent success).
+fn save_collection_marker_guarded(
+    store: &DataStore,
+    slug: &str,
+    marker: &str,
+    gen_at_start: u64,
+) -> Result<(), String> {
+    if store
+        .save_published_guarded(slug, marker, gen_at_start)
+        .map_err(cmd_err)?
+        == PublishedSave::Revoked
+    {
+        return Err(revoked_during_publish(slug));
+    }
+    Ok(())
+}
+
 /// Publish a collection's listing. **Branches on visibility (M10):** a *Public* collection is
 /// encrypted once under the account browse-key (M3); a *Private* collection is sealed per recipient
 /// in the Private audience (M21 W5) and gift-wrapped — the browse-key is **not** used and the public
@@ -542,6 +573,7 @@ pub(crate) async fn publish_collection_inner(
     identity: &Identity,
     browse_key: &BrowseKey,
     relay: &SharedRelay,
+    gen_at_start: u64,
 ) -> Result<PublishSummary, String> {
     let listing_json = prepare_listing(slug, store)?;
 
@@ -553,7 +585,7 @@ pub(crate) async fn publish_collection_inner(
         .map(|c| c.visibility)
         .unwrap_or(Visibility::Public);
     if visibility == Visibility::Private {
-        publish_private_collection_inner(slug, store, identity, &listing_json, relay).await?;
+        publish_private_collection_inner(slug, store, identity, &listing_json, relay, gen_at_start).await?;
         return Ok(PublishSummary::whole());
     }
 
@@ -641,7 +673,7 @@ pub(crate) async fn publish_collection_inner(
         "big_relay_url": big_target.as_deref().unwrap_or(""),
     })
     .to_string();
-    store.save_published(slug, &marker).map_err(cmd_err)?;
+    save_collection_marker_guarded(store, slug, &marker, gen_at_start)?;
 
     // M9: record the snapshot fingerprint of what we just published, so a later watch re-scan that
     // hashes equal is a no-op (the republish-storm guard) and a real change re-publishes exactly once.
@@ -673,6 +705,10 @@ async fn refresh_published_teaser(
     if !store.is_published("profile") {
         return Ok(());
     }
+    // Capture the profile's revocation generation BEFORE the relay write, so a profile Unpublish
+    // issued mid-refresh (`delete_published("profile")` bumps this generation) is detected at the
+    // marker save and not silently undone — the same CWE-367 race `publish_collection_inner` guards.
+    let gen_at_start = store.published_generation("profile");
     let Some(mut profile) = store.load_profile_draft().map_err(cmd_err)? else {
         return Ok(());
     };
@@ -686,7 +722,10 @@ async fn refresh_published_teaser(
         if let Ok(client) = net::client(identity, store, relay).await {
             let _ = client.publish(&event).await;
             if let Ok(json) = serde_json::to_string(&event) {
-                let _ = store.save_published("profile", &json);
+                // Guarded (CWE-367): `save_published_guarded` skips the write and returns `Revoked`
+                // if the profile was unpublished mid-refresh, so this best-effort refresh cannot
+                // silently resurrect a revoked marker.
+                let _ = store.save_published_guarded("profile", &json, gen_at_start);
             }
         }
     }
@@ -701,6 +740,7 @@ async fn publish_private_collection_inner(
     identity: &Identity,
     listing_json: &str,
     relay: &SharedRelay,
+    gen_at_start: u64,
 ) -> Result<(), String> {
     let recipients = private_recipients(store)?;
     let events = hb_core::seal_private_listing(identity, &recipients, listing_json, now_secs())
@@ -712,7 +752,7 @@ async fn publish_private_collection_inner(
     // Local published marker — records the *private* tier + the recipient count (the N× multiplier
     // INV-8 calls out), distinct from the public path's `parts`.
     let marker = serde_json::json!({ "private": true, "recipients": recipients.len() }).to_string();
-    store.save_published(slug, &marker).map_err(cmd_err)?;
+    save_collection_marker_guarded(store, slug, &marker, gen_at_start)?;
 
     // M9 storm-guard fingerprint, same as the public path.
     if let Ok(Some(col)) = store.load_collection_draft(slug) {
@@ -734,7 +774,8 @@ pub async fn publish_collection(
         let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
         (id.identity.clone(), id.browse_key.clone())
     };
-    publish_collection_inner(&slug, &store, &id_clone, browse_key.bytes(), &relay).await
+    let gen_at_start = store.published_generation(&slug);
+    publish_collection_inner(&slug, &store, &id_clone, browse_key.bytes(), &relay, gen_at_start).await
 }
 
 /// Build the signed, browse-key-encrypted **manifest envelope** for a Public collection draft — the
@@ -1009,7 +1050,7 @@ fn render_text(items: &[DirectoryItem], depth: usize) -> String {
             } else {
                 String::new()
             };
-            format!("{indent}{prefix}{}{size}{children}", item.name)
+            format!("{indent}{prefix}{}{size}{children}", strip_control(&item.name))
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1027,17 +1068,54 @@ fn render_markdown(items: &[DirectoryItem], depth: usize) -> String {
                 } else {
                     String::new()
                 };
-                format!("{indent}- **{}**{children}", item.name)
+                format!("{indent}- **{}**{children}", markdown_escape(&item.name))
             } else {
                 let mut meta = vec![];
-                if let Some(fmt) = &item.format { meta.push(fmt.clone()); }
-                if let Some(sz) = &item.size { meta.push(sz.clone()); }
+                if let Some(fmt) = &item.format { meta.push(code_span_escape(fmt)); }
+                if let Some(sz) = &item.size { meta.push(code_span_escape(sz)); }
                 let meta_str = if meta.is_empty() { String::new() } else { format!(" `{}`", meta.join(", ")) };
-                format!("{indent}- [ ] {}{meta_str}", item.name)
+                format!("{indent}- [ ] {}{meta_str}", markdown_escape(&item.name))
             }
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Strip control characters (newlines, tabs, and other C0/C1 controls) so an interpolated value
+/// cannot forge additional rows in a plain-text export (audit #18, CWE-74).
+fn strip_control(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Neutralize a value destined for a markdown *text* position: strip control characters (which
+/// cannot be escaped and could forge rows), then backslash-escape markdown punctuation so the value
+/// round-trips as literal text rather than being parsed as markup. `[2024] Album (FLAC)` still reads
+/// as `[2024] Album (FLAC)`, while `![cov](https://…)` cannot become an image (audit #18, CWE-74).
+fn markdown_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            continue;
+        }
+        match c {
+            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '<' | '>' | '(' | ')' | '#'
+            | '+' | '-' | '.' | '!' | '|' | '~' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Neutralize a value destined for an inline-code span (`` `…` ``): inside a code span only a
+/// backtick or a control character can break out, so strip those. Backslash-escapes are inert inside
+/// a code span and would render literally, mangling values like `14.2 GB` (audit #18, CWE-74).
+fn code_span_escape(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() && *c != '`')
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1150,7 +1228,7 @@ pub(crate) fn scan_selective(
     for c in &include.checked {
         contained_under_root(root, c).map_err(|e| anyhow::anyhow!(e))?;
     }
-    let (items, total_bytes) = scan_selective_walk(root, include, exclude, "")?;
+    let (items, total_bytes) = scan_selective_walk(root, include, exclude, "", 0)?;
     // MAX_COLLECTION_ITEMS: enforced once, here, on the final assembled tree — the single
     // chokepoint every scan caller goes through, so no entry point can bypass it.
     enforce_item_cap(count_items(&items)).map_err(|e| anyhow::anyhow!(e))?;
@@ -1169,11 +1247,20 @@ fn enforce_item_cap(item_count: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Maximum directory depth [`scan_selective_walk`] descends (the root is level 0). A directory at
+/// level [`MAX_SCAN_DEPTH`] that still has a subdirectory is rejected with an `Err` — loud, not
+/// silent — rather than recursing until the blocking scan thread's stack overflows and aborts the
+/// whole process (the 30 s deadline can't cancel a detached walker, and the item cap is checked only
+/// after it returns). 256 levels is far beyond any legitimate collection, so a normal scan is never
+/// affected; this only ever makes a scan return *less* (an error) on a pathological tree.
+const MAX_SCAN_DEPTH: usize = 256;
+
 fn scan_selective_walk(
     dir: &Path,
     include: &IncludeSet,
     exclude: &globset::GlobSet,
     rel_prefix: &str,
+    depth: usize,
 ) -> anyhow::Result<(Vec<DirectoryItem>, u64)> {
     let is_root = rel_prefix.is_empty();
     // Loose files are listed at the root and inside any included directory; an ancestor-only
@@ -1198,7 +1285,17 @@ fn scan_selective_walk(
             if !included && !include.has_descendant_under(&rel_path) {
                 continue;
             }
-            let (children, sub_bytes) = scan_selective_walk(&path, include, exclude, &rel_path)?;
+            // Depth bound (audit #9): a ~5,000-level nested tree (hostile archive / synced share)
+            // would overflow this blocking scan thread's stack and abort the process — so reject
+            // LOUDLY (an Err surfaces to the caller, not a truncated scan masquerading as complete)
+            // instead of quietly dropping the subtree.
+            if depth >= MAX_SCAN_DEPTH {
+                return Err(anyhow::anyhow!(
+                    "directory tree exceeds the {MAX_SCAN_DEPTH}-level depth limit at \
+                     '{rel_path}'; refusing to scan deeper (possible hostile nesting)"
+                ));
+            }
+            let (children, sub_bytes) = scan_selective_walk(&path, include, exclude, &rel_path, depth + 1)?;
             total_bytes += sub_bytes;
             items.push(DirectoryItem {
                 name,
@@ -1282,14 +1379,29 @@ fn dir_has_children(dir: &Path) -> bool {
     rd.next().is_some()
 }
 
-fn build_glob_set(patterns: &[String]) -> globset::GlobSet {
+fn build_glob_set(patterns: &[String]) -> Result<globset::GlobSet, String> {
     let mut builder = GlobSetBuilder::new();
+    let mut rejected: Vec<String> = Vec::new();
     for pat in patterns {
-        if let Ok(glob) = Glob::new(pat) {
-            builder.add(glob);
+        match Glob::new(pat) {
+            Ok(glob) => {
+                builder.add(glob);
+            }
+            Err(e) => rejected.push(format!("'{pat}': {e}")),
         }
     }
-    builder.build().unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap())
+    if !rejected.is_empty() {
+        // Fail closed (audit #31, CWE-636): never silently drop a user's exclusion — one bad
+        // pattern must abort the scan rather than fall back to "exclude nothing".
+        return Err(format!(
+            "invalid exclude pattern{}: {}",
+            if rejected.len() == 1 { "" } else { "s" },
+            rejected.join(", ")
+        ));
+    }
+    builder
+        .build()
+        .map_err(|e| format!("failed to build exclusion set: {e}"))
 }
 
 fn format_size(bytes: u64) -> String {
@@ -1405,7 +1517,7 @@ mod tests {
     }
 
     fn empty_globs() -> globset::GlobSet {
-        build_glob_set(&[])
+        build_glob_set(&[]).unwrap()
     }
 
     /// Build an `IncludeSet` from string slices (test ergonomics).
@@ -1550,6 +1662,29 @@ mod tests {
         assert!(!json.contains("secret.txt"), "no file outside the root is ever listed");
     }
 
+    /// audit #9: a pathologically deep nested tree (a hostile archive / synced share) must be
+    /// rejected LOUDLY at the depth bound — not recursed until the blocking scan thread's stack
+    /// overflows (the 30 s deadline can't cancel a detached walker and the item cap is checked only
+    /// after it returns). The bound is far beyond any real collection, so a normal scan is untouched.
+    /// `#[cfg(unix)]`: Windows `MAX_PATH` (~260 chars) makes a 257-level tree unbuildable there, and
+    /// the OS limit is itself what bounds nesting on that platform.
+    #[cfg(unix)]
+    #[test]
+    fn scan_selective_rejects_pathologically_deep_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut path = dir.path().to_path_buf();
+        for i in 0..(MAX_SCAN_DEPTH + 3) {
+            path = path.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("leaf.txt"), b"x").unwrap();
+
+        let err = scan_selective(dir.path(), &include(&["d0"]), &empty_globs())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("depth"), "deep tree is rejected with a loud, reasoned error: {err}");
+    }
+
     // ── IncludeSet truth table (mirrors the frontend scan-tree.ts) ────────────
 
     #[test]
@@ -1634,7 +1769,7 @@ mod tests {
         std::fs::write(dir.path().join("movie.nfo"), b"x").unwrap();
         std::fs::write(dir.path().join("readme.txt"), b"x").unwrap();
 
-        let globs = build_glob_set(&["*.nfo".to_string()]);
+        let globs = build_glob_set(&["*.nfo".to_string()]).unwrap();
         let (items, _) = scan_selective(dir.path(), &include(&[]), &globs).unwrap();
         let names: Vec<_> = items.iter().map(|i| i.name.as_str()).collect();
         assert!(names.contains(&"movie.mkv"));
@@ -1650,7 +1785,7 @@ mod tests {
         std::fs::write(sub.join("ep1.nfo"), b"x").unwrap();
         std::fs::write(sub.join("ep1.mkv"), b"x").unwrap();
 
-        let globs = build_glob_set(&["**/*.nfo".to_string()]);
+        let globs = build_glob_set(&["**/*.nfo".to_string()]).unwrap();
         let (items, _) = scan_selective(dir.path(), &include(&["Season 1"]), &globs).unwrap();
         let json = serde_json::to_string(&items).unwrap();
         assert!(!json.contains("ep1.nfo"), "nested *.nfo must be excluded by **/*.nfo glob");
@@ -2269,6 +2404,56 @@ mod tests {
         assert!(store.is_published("films"), "marker presence => published");
     }
 
+    // ── CWE-367: the revocation-generation guard at the marker save ────────────────────
+    // `publish_collection_inner` writes to the relay BEFORE it saves the published marker, so an
+    // Unpublish issued mid-publish can be silently undone: the relay write re-creates the marker and
+    // resurrects a revoked catalog for anyone holding the old share code. `save_collection_marker_guarded`
+    // is the exact marker-save tail both `publish_collection_inner` and `publish_private_collection_inner`
+    // run at their save sites (extracted so the test ends where production ends, P-6). It is driven
+    // directly here because the full `publish_collection_inner` needs a live relay (`net::client` +
+    // `publish_listing_capped`); the guard itself is pure store I/O. This test is the
+    // production-boundary kind: it calls the SAME function production calls, so reverting production
+    // to unguarded `save_published` reds it.
+
+    #[test]
+    fn publish_guard_refuses_to_resurrect_marker_after_mid_write_unpublish() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let marker = r#"{"parts":1}"#;
+
+        // A published collection, as it stands when the rescan republish begins.
+        store.save_published("films", marker).unwrap();
+        let gen_at_start = store.published_generation("films");
+
+        // Mid-write Unpublish: `unpublish_collection_inner` ends in `delete_published`, which removes
+        // the marker AND bumps the revocation generation.
+        store.delete_published("films").unwrap();
+        assert!(!store.is_published("films"), "premise: the unpublish removed the marker");
+
+        // The marker-save tail of `publish_collection_inner` — the exact function production runs at
+        // its save site — re-run after the relay writes. It must detect the bump and refuse to
+        // re-create the marker.
+        let outcome = save_collection_marker_guarded(&store, "films", marker, gen_at_start);
+        assert!(
+            outcome.is_err(),
+            "a mid-write unpublish must report revocation, not silently re-save"
+        );
+        assert!(!store.is_published("films"), "the revoked marker must NOT be resurrected");
+    }
+
+    #[test]
+    fn publish_guard_saves_when_generation_is_stable() {
+        // A missing generation file reads as 0 (fresh install / first publish), and an un-bumped
+        // generation must save — the guard must not over-reject and lose a legitimate publish.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let marker = r#"{"parts":1}"#;
+        let gen_at_start = store.published_generation("films");
+        assert_eq!(gen_at_start, 0, "a missing generation file reads as 0");
+        save_collection_marker_guarded(&store, "films", marker, gen_at_start).unwrap();
+        assert!(store.is_published("films"), "an un-bumped generation must save the marker");
+    }
+
     // ── M13 W5 item 1: unpublish_collection ───────────────────────────────────────
 
     /// Pins the deletion-targeting design choice documented on `unpublish_collection_inner`: a
@@ -2500,5 +2685,98 @@ mod tests {
         };
         let json = serde_json::to_string(&item).unwrap();
         assert!(!json.contains("sha256"), "DirectoryItem must not expose sha256: {json}");
+    }
+
+    // ── Audit #31 (QURATOR-123, CWE-636): build_glob_set fails closed ──────
+
+    #[test]
+    fn build_glob_set_rejects_unclosed_character_class() {
+        let err = build_glob_set(&["[".to_string()]).unwrap_err();
+        assert!(err.contains("invalid exclude pattern"), "names the failure: {err}");
+        assert!(err.contains("["), "names the offending pattern: {err}");
+    }
+
+    #[test]
+    fn build_glob_set_reports_every_rejected_pattern() {
+        let err = build_glob_set(&["[abc".to_string(), "{a,b".to_string()]).unwrap_err();
+        assert!(err.contains("[abc"), "first rejected pattern named: {err}");
+        assert!(err.contains("{a,b"), "second rejected pattern also named: {err}");
+    }
+
+    #[test]
+    fn build_glob_set_aborts_when_any_pattern_invalid() {
+        // One typo among valid patterns must not silently drop the valid ones too.
+        let err = build_glob_set(&["*.nfo".to_string(), "[".to_string()]).unwrap_err();
+        assert!(err.contains("invalid exclude pattern"), "scan must abort: {err}");
+    }
+
+    // ── Audit #18 (QURATOR-124, CWE-74): markdown/text export neutralizes filenames ──
+
+    #[test]
+    fn render_markdown_neutralizes_image_markup() {
+        let item = DirectoryItem {
+            name: "![cov](https://attacker.example/pixel.png)".into(),
+            item_type: ItemType::File,
+            size: None,
+            format: None,
+            year: None,
+            tags: vec![],
+            note: None,
+            children: vec![],
+        };
+        let md = render_markdown(&[item], 0);
+        assert!(!md.contains("![cov]("), "image markup must not survive: {md}");
+        assert!(!md.contains("https://attacker.example"), "link target must not be live: {md}");
+        assert!(md.contains("\\!\\[cov\\]\\("), "name must be backslash-escaped: {md}");
+    }
+
+    #[test]
+    fn render_markdown_round_trips_legitimate_brackets() {
+        let item = DirectoryItem {
+            name: "[2024] Album (FLAC)".into(),
+            item_type: ItemType::File,
+            size: None,
+            format: Some("FLAC".into()),
+            year: None,
+            tags: vec![],
+            note: None,
+            children: vec![],
+        };
+        let md = render_markdown(&[item], 0);
+        assert!(md.contains("\\[2024\\] Album \\(FLAC\\)"), "escaped, not markup: {md}");
+        assert!(!md.contains("[2024] Album (FLAC)"), "raw link-shaped text must be escaped: {md}");
+    }
+
+    #[test]
+    fn render_markdown_strips_newlines_and_size_stays_readable() {
+        let item = DirectoryItem {
+            name: "leak\n[forged](https://attacker.example/x)".into(),
+            item_type: ItemType::File,
+            size: Some("14.2 GB".into()),
+            format: Some("MKV".into()),
+            year: None,
+            tags: vec![],
+            note: None,
+            children: vec![],
+        };
+        let md = render_markdown(&[item], 0);
+        assert!(!md.contains('\n'), "filename newline must not forge a row: {md:?}");
+        assert!(md.contains("`MKV, 14.2 GB`"), "size/format must render un-mangled: {md}");
+    }
+
+    #[test]
+    fn render_text_strips_newlines_from_name() {
+        let item = DirectoryItem {
+            name: "real.txt\n  forged row".into(),
+            item_type: ItemType::File,
+            size: None,
+            format: None,
+            year: None,
+            tags: vec![],
+            note: None,
+            children: vec![],
+        };
+        let txt = render_text(&[item], 0);
+        assert!(!txt.contains('\n'), "filename newline must not forge a row: {txt:?}");
     }
 }

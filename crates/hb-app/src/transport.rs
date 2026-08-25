@@ -119,6 +119,20 @@ const HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3
 /// honestly ACK. A timeout is **not** a success — the ticket stays unspent.
 const ACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How long the owner's side waits to *write* the manifest (status byte, payload bytes, FIN) before
+/// treating the peer as stalled on flow control. Comparable to `ACK_DEADLINE`: a peer that is
+/// honestly reading has to receive the whole payload and then ACK, so the send and the
+/// acknowledgement are both bounded by the same peer-side work. A timeout is **not** a success — the
+/// grant is dropped and the ticket stays unspent.
+const SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long a *refused* connection is held open for its small response to flush. Deliberately far
+/// shorter than the 5s `drain_connection` window: a refusal is a status byte plus a short framed
+/// reason, and holding a redemption permit (or an in-flight claim) for a peer-controlled 5s on a
+/// refused connection is the QURATOR-110 DoS. 500ms is enough for the response to flush on any link
+/// that delivered the request.
+const REFUSAL_DRAIN: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Apply a deadline to one step, turning a stall into a stated error instead of a wedged task.
 async fn with_deadline<T>(
     limit: std::time::Duration,
@@ -209,14 +223,30 @@ async fn write_framed(mut send: impl tokio::io::AsyncWrite + Unpin, bytes: &[u8]
 }
 
 async fn refuse(mut send: impl tokio::io::AsyncWrite + Unpin, reason: &str) -> Result<()> {
-    send.write_u8(STATUS_REFUSED).await.context("write refused status")?;
-    let mut msg = reason.as_bytes();
-    if msg.len() > REFUSAL_MAX_FRAME {
-        msg = &msg[..REFUSAL_MAX_FRAME];
-    }
-    write_framed(&mut send, msg).await?;
-    send.shutdown().await.context("shutdown after refusal")?;
-    Ok(())
+    with_deadline(
+        SEND_DEADLINE,
+        "the peer stopped reading the refusal response",
+        async {
+            send.write_u8(STATUS_REFUSED).await.context("write refused status")?;
+            let mut msg = reason.as_bytes();
+            if msg.len() > REFUSAL_MAX_FRAME {
+                msg = &msg[..REFUSAL_MAX_FRAME];
+            }
+            write_framed(&mut send, msg).await?;
+            send.shutdown().await.context("shutdown after refusal")?;
+            Ok(())
+        },
+    )
+    .await?
+}
+
+/// Hold a *refused* connection open for a fixed, short interval so its small response flushes, then
+/// give up regardless of whether the peer closed. The full 5-second drain in `crate::conn` exists to
+/// protect a *delivered* manifest's last chunk from a CONNECTION_CLOSE race; a refusal is a status
+/// byte plus a short framed reason, and holding a redemption permit (or an in-flight claim) for a
+/// peer-controlled 5s on a refused connection is the QURATOR-110 DoS. See `REFUSAL_DRAIN`.
+async fn drain_refusal(conn: &iroh::endpoint::Connection) {
+    let _ = tokio::time::timeout(REFUSAL_DRAIN, conn.closed()).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -309,9 +339,17 @@ pub(crate) async fn serve_manifest_stream(
         }
     }
 
-    send.write_u8(STATUS_OK).await.context("write ok status")?;
-    write_framed(&mut send, payload.as_bytes()).await?;
-    send.shutdown().await.context("shutdown send")?;
+    with_deadline(
+        SEND_DEADLINE,
+        "the peer stopped reading the manifest — treating it as undelivered",
+        async {
+            send.write_u8(STATUS_OK).await.context("write ok status")?;
+            write_framed(&mut send, payload.as_bytes()).await?;
+            send.shutdown().await.context("shutdown send")?;
+            Ok::<(), anyhow::Error>(())
+        },
+    )
+    .await??;
 
     // ── The receipt frame: what turns "we wrote it" into "they have it" ──
     //
@@ -436,7 +474,7 @@ impl ManifestPlane {
                 // Concurrent redemption of the same ticket: refuse the second, do not serve it.
                 refuse(&mut send, "this ticket is already being redeemed on another connection")
                     .await?;
-                drain_connection(&conn).await;
+                drain_refusal(&conn).await;
                 return Ok(());
             }
         };
@@ -477,7 +515,7 @@ impl ManifestPlane {
                 Ok(())
             }
             Ok(None) => {
-                drain_connection(&conn).await;
+                drain_refusal(&conn).await;
                 Ok(())
             }
             Err(e) => {
@@ -569,17 +607,40 @@ async fn fetch_over_connection(
     ticket: &TransportTicket,
     accept: impl FnOnce(&ManifestPayload) -> Result<()>,
 ) -> Result<ManifestPayload> {
-    let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?;
+    let (mut send, mut recv) = with_deadline(
+        HANDSHAKE_DEADLINE,
+        "the peer never opened a stream",
+        conn.open_bi(),
+    )
+    .await?
+    .context("open_bi")?;
     let req = FetchRequest { request_id: ticket.request_id.clone(), ticket: ticket.clone() };
-    write_framed(&mut send, &serde_json::to_vec(&req)?).await?;
+    with_deadline(
+        SEND_DEADLINE,
+        "the peer stopped reading our request",
+        write_framed(&mut send, &serde_json::to_vec(&req)?),
+    )
+    .await??;
     // **Deliberately not shut down here.** The send half stays open to carry the acknowledgement —
     // that frame is what lets the owner distinguish "delivered" from "written at". Closing early
     // would put us back to the owner burning tickets on transfers that never landed.
 
-    match recv.read_u8().await.context("read status byte")? {
+    let status = with_deadline(
+        HANDSHAKE_DEADLINE,
+        "the peer never sent a status byte",
+        recv.read_u8(),
+    )
+    .await?
+    .context("read status byte")?;
+    match status {
         STATUS_OK => {
             // Bounded on the declared length first (the framing check), then again by `from_wire`.
-            let bytes = read_framed(&mut recv, MANIFEST_MAX_TRANSPORT_BYTES).await?;
+            let bytes = with_deadline(
+                ACK_DEADLINE,
+                "the peer never finished sending the manifest",
+                read_framed(&mut recv, MANIFEST_MAX_TRANSPORT_BYTES),
+            )
+            .await??;
             let payload = ManifestPayload::from_wire(bytes)
                 .map_err(|e| anyhow!("the peer's manifest was refused: {e}"))?;
 
@@ -605,8 +666,16 @@ async fn fetch_over_connection(
             // Acknowledge only now — after the bytes parsed, verified, matched the ticket, AND passed
             // the caller's gate. This is the asker's assertion that a *usable* manifest arrived, and
             // the owner consumes the ticket on the strength of it.
-            send.write_u8(STATUS_OK).await.context("write acknowledgement")?;
-            send.shutdown().await.context("shutdown after acknowledgement")?;
+            with_deadline(
+                SEND_DEADLINE,
+                "the peer stopped reading our acknowledgement",
+                async {
+                    send.write_u8(STATUS_OK).await.context("write acknowledgement")?;
+                    send.shutdown().await.context("shutdown after acknowledgement")?;
+                    Ok::<(), anyhow::Error>(())
+                },
+            )
+            .await??;
             // Wait (bounded) for the owner to close, rather than closing ourselves. `shutdown` only
             // queues the FIN; closing straight after lets `CONNECTION_CLOSE` overtake the ACK, and
             // the owner then treats a delivered manifest as undelivered. Same failure as the original
@@ -615,7 +684,12 @@ async fn fetch_over_connection(
             Ok(payload)
         }
         STATUS_REFUSED => {
-            let msg = read_framed(&mut recv, REFUSAL_MAX_FRAME).await?;
+            let msg = with_deadline(
+                HANDSHAKE_DEADLINE,
+                "the peer never finished sending the refusal",
+                read_framed(&mut recv, REFUSAL_MAX_FRAME),
+            )
+            .await??;
             Err(anyhow!("{}", String::from_utf8_lossy(&msg)))
         }
         other => Err(anyhow!("peer sent an unknown status byte {other}")),
@@ -678,6 +752,44 @@ pub fn ticket_node_addr(endpoint: &iroh::Endpoint) -> Result<String> {
 
 pub(crate) fn parse_node_addr(raw: &str) -> Result<iroh::EndpointAddr> {
     serde_json::from_str(raw).context("the ticket's node address is not a dialable endpoint address")
+}
+
+/// SSRF guard (QURATOR-113 #20): the ticket's `node_addr` is written by whoever answers a manifest
+/// ask, so every `TransportAddr` it carries is a dial target a stranger controls. Keep only
+/// globally-routable targets before the dial — `Ip` addresses are classified by
+/// [`crate::net::ip_non_global`] (the same loopback/private/link-local/CGNAT checks the Settings path
+/// applies), `Relay` URLs are kept only when their host is not an internal literal, and `Custom`
+/// transports (never registered here, opaque peer data) are dropped.
+fn retain_global_transport_addrs(addr: &mut iroh::EndpointAddr) {
+    addr.addrs.retain(|a| match a {
+        iroh::TransportAddr::Ip(sock) => !crate::net::ip_non_global(sock.ip()),
+        iroh::TransportAddr::Relay(url) => relay_host_is_global(url.host_str()),
+        _ => false,
+    });
+}
+
+/// Whether a relay URL's host is a safe dial target. Only an IP-literal host is classifiable by
+/// address class (reusing [`crate::net::ip_non_global`]); a DNS name is kept — the same no-resolution
+/// residual `validate_relay_url` documents (a public name that rebinds to a private IP is accepted),
+/// while a literal `localhost`/`*.local` is dropped.
+fn relay_host_is_global(host: Option<&str>) -> bool {
+    let Some(host) = host else { return false };
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return !crate::net::ip_non_global(ip);
+    }
+    let name = bare.trim_end_matches('.').to_ascii_lowercase();
+    !(name == "localhost" || name.ends_with(".localhost") || name.ends_with(".local"))
+}
+
+/// Parse a peer-authored ticket address and drop the non-global transport addresses, returning the
+/// sanitized string for the dial. The transport layer's `fetch_manifest` stays unguarded so its
+/// loopback QUIC harness keeps exercising the real dial; the command that owns the peer-trust
+/// boundary (`redeem_manifest_ticket`) calls this before handing the ticket down.
+pub(crate) fn sanitize_node_addr(raw: &str) -> Result<String> {
+    let mut addr = parse_node_addr(raw)?;
+    retain_global_transport_addrs(&mut addr);
+    serde_json::to_string(&addr).context("re-serialize the sanitized endpoint address")
 }
 
 /// Mint a ticket for one approved request, addressed at this endpoint.
@@ -753,6 +865,64 @@ pub(crate) mod tests {
             addrs.insert(iroh::TransportAddr::Ip(SocketAddr::new(ip, sock.port())));
         }
         iroh::EndpointAddr { id: server.id(), addrs }
+    }
+
+    /// QURATOR-113 #20 — the peer-authored ticket address is sanitized: only globally-routable
+    /// transport addresses survive, so a stranger who answers a manifest ask cannot make this node
+    /// dial an internal host. Pure (no endpoint bound): `sanitize_node_addr` runs the exact filter
+    /// the redeem command applies before the dial.
+    #[test]
+    fn sanitize_node_addr_drops_non_global_transport_addrs() {
+        let id = iroh::SecretKey::generate().public();
+        let addrs: BTreeSet<iroh::TransportAddr> = [
+            // Public — kept.
+            iroh::TransportAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 9999)),
+            iroh::TransportAddr::Relay("https://relay.example.com".parse().unwrap()),
+            // RFC1918 / loopback / link-local / CGNAT — dropped.
+            iroh::TransportAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 9999)),
+            iroh::TransportAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999)),
+            iroh::TransportAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)), 9999)),
+            iroh::TransportAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), 9999)),
+            // Internal relay hosts — dropped.
+            iroh::TransportAddr::Relay("https://127.0.0.1:443".parse().unwrap()),
+            iroh::TransportAddr::Relay("https://localhost:443".parse().unwrap()),
+        ]
+        .into_iter()
+        .collect();
+        let addr = iroh::EndpointAddr::from_parts(id, addrs);
+
+        let cleaned: iroh::EndpointAddr =
+            serde_json::from_str(&sanitize_node_addr(&serde_json::to_string(&addr).unwrap()).unwrap())
+                .unwrap();
+
+        let expected: BTreeSet<iroh::TransportAddr> = [
+            iroh::TransportAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 9999)),
+            iroh::TransportAddr::Relay("https://relay.example.com".parse().unwrap()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(cleaned.id, addr.id, "the endpoint id survives sanitizing");
+        assert_eq!(cleaned.addrs, expected, "only the globally-routable addresses survive");
+    }
+
+    /// The id is preserved even when every address is dropped — a ticket that names only internal
+    /// hosts sanitizes to "no dialable address", which the dial then fails on cleanly (no fallback to
+    /// the dropped addresses).
+    #[test]
+    fn sanitize_node_addr_keeps_the_id_when_every_address_is_dropped() {
+        let id = iroh::SecretKey::generate().public();
+        let addr = iroh::EndpointAddr::from_parts(
+            id,
+            [iroh::TransportAddr::Ip(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                9999,
+            ))],
+        );
+        let cleaned: iroh::EndpointAddr =
+            serde_json::from_str(&sanitize_node_addr(&serde_json::to_string(&addr).unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(cleaned.id, addr.id, "the id survives even when no address is dialable");
+        assert!(cleaned.addrs.is_empty(), "a loopback-only ticket leaves no dialable address");
     }
 
     /// A manifest built the way production builds one: a real listing JSON through
@@ -1508,6 +1678,138 @@ pub(crate) mod tests {
         assert_eq!(parsed.id, ep.id(), "the address names this endpoint");
         assert_eq!(parsed, ep.addr(), "the round trip is lossless");
         ep.close().await;
+    }
+
+    /// **QURATOR-112 #6 — a failed payload write drops the grant WITHOUT `into_consumed`.**
+    ///
+    /// The serve-path write now carries `SEND_DEADLINE`, and — the piece the ticket flags as worse
+    /// than the DoS itself — a write that fails must leave the ticket unspent so the peer can retry.
+    /// A deadline expiry and a hard write error take the *same* `?` out of `serve_manifest_stream`,
+    /// and neither may ever produce `Ok(Some(..))`: a receipt only exists after a validated
+    /// acknowledgement. The 120s deadline itself cannot be awaited in a unit test (no `tokio`
+    /// test-util in this workspace, and `SEND_DEADLINE` is a production constant, not a test knob),
+    /// so this drives that shared failure path with a writer that errors immediately instead of
+    /// stalling.
+    #[tokio::test]
+    async fn a_failed_payload_write_leaves_the_ticket_unspent_and_retryable() {
+        let ep = bind_local_endpoint(&rand::random(), vec![]).await;
+        let ticket = issue_ticket(&ep, "req-1", "small", 1_700_000_000, Some("nonce-1")).unwrap();
+        let payload = real_payload_for("small", 10);
+        let source = TestSource::new(ticket.clone(), payload);
+
+        let req = FetchRequest { request_id: ticket.request_id.clone(), ticket: ticket.clone() };
+        let mut frame = Vec::new();
+        write_framed(&mut frame, &serde_json::to_vec(&req).unwrap()).await.unwrap();
+
+        // The reader yields a valid request; the writer fails on the very first payload byte — the
+        // "peer vanished mid-manifest" shape, which a bounded write must treat as undelivered.
+        let err = serve_manifest_stream(FailingWriter, std::io::Cursor::new(frame), source.as_ref())
+            .await
+            .expect_err("a failed payload write must fail the redemption, never produce a receipt");
+        assert!(
+            err.to_string().contains("write ok status"),
+            "the error must name the failed write, got: {err}"
+        );
+
+        // And the ticket is untouched: the same request, to a healthy writer, still redeems.
+        let mut retry = Vec::new();
+        write_framed(&mut retry, &serde_json::to_vec(&req).unwrap()).await.unwrap();
+        retry.push(STATUS_OK); // the acknowledgement that follows the manifest
+        let served = serve_manifest_stream(
+            tokio::io::sink(),
+            std::io::Cursor::new(retry),
+            source.as_ref(),
+        )
+        .await
+        .expect("a healthy retry of the unspent ticket succeeds");
+        assert!(served.is_some(), "the retry produces a receipt — the ticket was not burned");
+
+        ep.close().await;
+    }
+
+    /// A writer whose very first write fails — the "peer stopped reading / zero flow-control window"
+    /// shape from QURATOR-112, minus the stall.
+    struct FailingWriter;
+
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "peer stopped reading",
+            )))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// **QURATOR-110 — a refused connection must not pin its in-flight claim for a peer-controlled
+    /// 5s.**
+    ///
+    /// The targeted form of the drain DoS: a peer who knows a legitimate ticket's `request_id` sends
+    /// a *valid-JSON* frame carrying that id and a WRONG ticket. The in-flight claim is keyed by
+    /// `request_id` and taken before the ticket is checked, so the refusal path then holds the claim
+    /// while it drains — and the peer controls that drain by reading the refusal and never closing.
+    /// On the old 5s `drain_connection` window, one such connection pins `request_id` for 5s and the
+    /// legitimate holder's retry inside that window is refused as "already being redeemed".
+    ///
+    /// This test drives the attack by hand: a raw client sends the forged request, reads the refusal,
+    /// deliberately does NOT close, then waits past the short refusal drain but well inside the old
+    /// 5s window. The honest redemption then succeeding proves the claim was released in
+    /// `REFUSAL_DRAIN` time, not a peer-controlled 5s.
+    #[tokio::test]
+    async fn a_refused_connection_releases_its_claim_within_the_short_drain() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let (server, source, ticket) = spawn_plane(50, "small").await;
+            let client = bind_local_endpoint(&rand::random(), vec![]).await;
+
+            // Same request id, wrong ticket: survives parsing and the `issued()` lookup, so the claim
+            // on `request_id` is taken, then refused for the ticket mismatch. The connection is held
+            // open (never closed) so the owner's drain is the only thing ending it.
+            let mut forged = ticket.clone();
+            forged.slug = "some-other-collection".into();
+            let conn = client
+                .connect(parse_node_addr(&ticket.node_addr).unwrap(), MANIFEST_ALPN)
+                .await
+                .expect("dial");
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            let req = FetchRequest { request_id: ticket.request_id.clone(), ticket: forged };
+            write_framed(&mut send, &serde_json::to_vec(&req).unwrap()).await.unwrap();
+            assert_eq!(
+                recv.read_u8().await.unwrap(),
+                STATUS_REFUSED,
+                "a wrong ticket for the right request id is refused"
+            );
+            let _ = read_framed(&mut recv, REFUSAL_MAX_FRAME).await.unwrap();
+            // `conn`, `send`, `recv` stay in scope and open through the sleep below.
+
+            // Wait past the short refusal drain, but well inside the old 5s window.
+            tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+
+            // The legitimate holder's claim is free again, and the ticket redeems.
+            fetch_manifest(&client, &ticket, |_| Ok(()))
+                .await
+                .expect("the claim was released by the short drain, so the honest redemption succeeds");
+            await_receipt(&source).await;
+
+            client.close().await;
+            server.close().await;
+        })
+        .await
+        .expect("test timed out");
     }
 }
 

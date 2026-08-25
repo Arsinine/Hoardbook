@@ -83,6 +83,12 @@
 	// joined Topic); posting moved there, so this panel keeps only membership management.
 	let openTopic: TopicView | null = $state(null);
 	let roster: string[] = $state([]);
+	// Finding #36 (CWE-362): request-generation guard for the open-Topic panel, same shape as
+	// `lookupGeneration`/`discoverGeneration` below. Clicking Topic A then Topic B leaves A's async
+	// roster (and announce status) in flight; without a guard the later resolve binds A's roster to
+	// B's open pane, over-disclosing to the wrong audience. Bumped on every open(); a resolving
+	// fetch applies its result only if its captured generation still holds.
+	let openGeneration = 0;
 	// M21 W3: Invite opens the ContactPicker modal (select a contact OR type a new npub) instead of a
 	// bare inline text field.
 	let invitePickerOpen = $state(false);
@@ -322,14 +328,20 @@
 	async function saveDesc() {
 		if (!openTopic || savingDesc) return;
 		savingDesc = true;
+		// Same open-generation guard as `open()` (finding #36): the save targets the open Topic, so a
+		// resolve landing after the user opened a different Topic must not clobber the new `openTopic`
+		// with the stale one (or toast over the new context).
+		const generation = openGeneration;
 		try {
 			const updated = await topicUpdateMeta(openTopic.topic_id, descDraft.trim());
-			openTopic = updated;
-			mine = mine.map((t) => (t.topic_id === updated.topic_id ? updated : t));
-			editingDesc = false;
-			toast('Topic updated', 'success');
+			if (generation === openGeneration) {
+				openTopic = updated;
+				mine = mine.map((t) => (t.topic_id === updated.topic_id ? updated : t));
+				editingDesc = false;
+				toast('Topic updated', 'success');
+			}
 		} catch (e) {
-			toast(String(e), 'error');
+			if (generation === openGeneration) toast(String(e), 'error');
 		} finally {
 			savingDesc = false;
 		}
@@ -430,19 +442,27 @@
 		announceBody = '';
 		editingDesc = false;
 		if (announceTicker) clearInterval(announceTicker);
+		// Finding #36 (CWE-362): bump + capture the open-generation token so a stale resolve from a
+		// previously-open Topic (its roster/status still in flight) cannot bind to this one.
+		openGeneration += 1;
+		const generation = openGeneration;
 		try {
-			roster = await topicRoster(t.topic_id);
+			const fetched = await topicRoster(t.topic_id);
+			if (generation === openGeneration) roster = fetched;
 		} catch (e) {
-			toast(String(e), 'error');
+			if (generation === openGeneration) toast(String(e), 'error');
 		}
 		try {
-			announceRemaining = await topicAnnounceStatus(t.topic_id);
+			const remaining = await topicAnnounceStatus(t.topic_id);
+			if (generation === openGeneration) announceRemaining = remaining;
 		} catch {
-			announceRemaining = 0;
+			if (generation === openGeneration) announceRemaining = 0;
 		}
-		announceTicker = setInterval(() => {
-			announceRemaining = Math.max(0, announceRemaining - 60);
-		}, 60_000);
+		if (generation === openGeneration) {
+			announceTicker = setInterval(() => {
+				announceRemaining = Math.max(0, announceRemaining - 60);
+			}, 60_000);
+		}
 	}
 
 	// M21 W3: ContactPicker emits the chosen npub (a selected contact OR a typed new one); this routes

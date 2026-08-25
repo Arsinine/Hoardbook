@@ -47,6 +47,33 @@ describe('PersonRow — Hoardbook Topics draft r1 roster row', () => {
 		expect(container.textContent).toContain('A');
 	});
 
+	it('renders fingerprint.colorHex as the swatch — identical words, different colorHex ⇒ different colour', () => {
+		// The word→hue table is a bijection of the word text (zero marginal entropy); the `colorHex`
+		// swatch is where the remaining ~24 of the 36 bits surface. Two rows with the SAME words but
+		// DIFFERENT colorHex must render visibly different colour — the thing the pre-fix test never
+		// asserted, and the bug (colorHex accepted in Props but never rendered) let through. jsdom
+		// computes no layout, but it does preserve inline styles/attributes — asserted on the swatch's
+		// `style`, which is what our fix sets.
+		const fpA = { words: ['amber', 'cedar', 'jade'], colorHex: '#f00' };
+		const fpB = { words: ['amber', 'cedar', 'jade'], colorHex: '#00f' };
+		const a = render(PersonRow, { props: { name: 'Alice', letter: 'A', fingerprint: fpA } });
+		const b = render(PersonRow, { props: { name: 'Alice', letter: 'A', fingerprint: fpB } });
+		const swatchA = a.container.querySelector('.fp-swatch');
+		const swatchB = b.container.querySelector('.fp-swatch');
+		// The swatch — the element that carries colorHex — must render when a fingerprint is present.
+		expect(swatchA, '.fp-swatch must render when a fingerprint is present').not.toBeNull();
+		expect(swatchB, '.fp-swatch must render when a fingerprint is present').not.toBeNull();
+		// Svelte 5 writes the swatch's inline style through the CSSOM, so jsdom normalizes `#f00` to
+		// `rgb(255, 0, 0)` when reading the attribute back (probed). Assert the swatch's background IS
+		// the colorHex — proving the colour is not silently ignored.
+		const styleA = swatchA!.getAttribute('style') ?? '';
+		const styleB = swatchB!.getAttribute('style') ?? '';
+		expect(styleA).toContain('rgb(255, 0, 0)');
+		expect(styleB).toContain('rgb(0, 0, 255)');
+		// Identical words, different colorHex ⇒ the rendered colour actually differs.
+		expect(styleA).not.toBe(styleB);
+	});
+
 	it('renders NO fingerprint row when the fingerprint is absent (non-contact / unresolved)', () => {
 		const { container, getByText } = render(PersonRow, {
 			props: { name: 'npub1abcd…wxyz', letter: 'N' },

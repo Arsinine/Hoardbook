@@ -112,18 +112,24 @@ pub fn restore_inner(
         .map_err(|e| BackupError::Archive(format!("corrupt tar: {e}")))?;
 
     let mut total: u64 = 0;
+    let mut read_total: u64 = 0;
     let mut count: usize = 0;
     let mut pending_identity: Option<StoredIdentity> = None;
 
     for entry in entries {
-        let mut entry = entry.map_err(|e| BackupError::Archive(format!("corrupt tar entry: {e}")))?;
+        let entry = entry.map_err(|e| BackupError::Archive(format!("corrupt tar entry: {e}")))?;
 
         // Links add only TOCTOU/escape surface — a metadata backup is regular files + dirs only.
         let etype = entry.header().entry_type();
         if etype.is_symlink() || etype.is_hard_link() {
             return Err(BackupError::Archive("symlink/hardlink entries are forbidden".into()));
         }
-
+        // A GNU sparse entry declares a small on-disk size while its read materializes the logical
+        // (attacker-chosen, up to hundreds of GB) size — the one entry type that can outsize its
+        // own header. Refused outright; a metadata backup is regular files + dirs only.
+        if etype.is_gnu_sparse() {
+            return Err(BackupError::Archive("sparse entries are forbidden".into()));
+        }
         let raw = entry
             .path()
             .map_err(|e| BackupError::Archive(format!("unreadable entry path: {e}")))?
@@ -146,10 +152,12 @@ pub fn restore_inner(
             continue;
         }
 
-        let mut buf = Vec::new();
-        entry
-            .read_to_end(&mut buf)
-            .map_err(|e| BackupError::Archive(format!("truncated entry: {e}")))?;
+        // Bound the *actual* read to the remaining budget — a size-lying entry must not OOM
+        // restore. `take(remaining + 1)` lets a >budget entry overflow by one byte so we detect
+        // the overrun instead of silently truncating (INV-8) or materializing an attacker size.
+        let remaining = MAX_TOTAL_BYTES.saturating_sub(read_total);
+        let buf = read_entry_bounded(entry, remaining)?;
+        read_total = read_total.saturating_add(buf.len() as u64);
 
         // The portable identity is re-wrapped via save_identity, never written verbatim — so the
         // portable plaintext never touches disk (on Windows it becomes DPAPI ciphertext).
@@ -182,6 +190,21 @@ pub fn restore_inner(
 }
 
 // --- Helpers --------------------------------------------------------------------------------
+
+/// Read one entry bounded by the remaining byte budget. `take(remaining + 1)` lets a >budget
+/// entry overflow by exactly one byte so we can detect the overrun and reject it — never silently
+/// truncating user data (INV-8) or materializing an attacker-chosen size (tar bomb).
+fn read_entry_bounded<R: Read>(entry: R, remaining: u64) -> Result<Vec<u8>, BackupError> {
+    let mut buf = Vec::new();
+    entry
+        .take(remaining.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| BackupError::Archive(format!("truncated entry: {e}")))?;
+    if buf.len() as u64 > remaining {
+        return Err(BackupError::Archive("archive exceeds the size cap (tar bomb?)".into()));
+    }
+    Ok(buf)
+}
 
 fn append_bytes(
     builder: &mut tar::Builder<Vec<u8>>,
@@ -515,5 +538,48 @@ mod tests {
         let (_d, dst) = empty_store();
         let err = restore_inner(&dst, &archive, None).unwrap_err();
         assert!(matches!(err, BackupError::Archive(_)), "too-many-entries must be refused, got {err:?}");
+    }
+
+    #[test]
+    fn restore_rejects_gnu_sparse_entries() {
+        // A GNU sparse entry declares a small on-disk size (64 B here) while `read_to_end`
+        // materializes its logical size — the one entry type that can outsize its own header and
+        // blow past the caps. Restore must refuse it outright, not extract it.
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::GNUSparse);
+        h.set_size(64);
+        h.set_mode(0o600);
+        h.set_path("sparse.bin").unwrap();
+        {
+            let gnu = h.as_gnu_mut().unwrap();
+            gnu.sparse[0].set_offset(0);
+            gnu.sparse[0].set_length(64);
+            gnu.set_real_size(64);
+        }
+        h.set_cksum();
+        b.append(&h, &[0xAAu8; 64][..]).unwrap();
+        let archive = encrypt_backup(BackupMode::Plaintext, &b.into_inner().unwrap()).unwrap();
+
+        let (_d, dst) = empty_store();
+        let err = restore_inner(&dst, &archive, None).unwrap_err();
+        assert!(matches!(err, BackupError::Archive(_)), "sparse entry must be refused, got {err:?}");
+    }
+
+    #[test]
+    fn read_entry_bounded_rejects_oversize_reader() {
+        // The cap must bound the *actual* read, not the declared size: a reader that lies (yields
+        // more bytes than the remaining budget) is rejected, not materialized.
+        let liar = std::io::Cursor::new(vec![0xAAu8; 100]);
+        let err = read_entry_bounded(liar, 10).unwrap_err();
+        assert!(matches!(err, BackupError::Archive(_)), "oversize reader must be refused, got {err:?}");
+    }
+
+    #[test]
+    fn read_entry_bounded_accepts_within_budget() {
+        // Positive control: a reader that fits the budget is read in full, not over-rejected.
+        let ok = std::io::Cursor::new(vec![0xAAu8; 8]);
+        let buf = read_entry_bounded(ok, 10).unwrap();
+        assert_eq!(buf.len(), 8);
     }
 }

@@ -24,8 +24,8 @@ use crate::client::{teaser_search_filter, RelayClient};
 use crate::discover::{ingest_teasers_capped, select_newest_by_created_at, SearchHit};
 use crate::error::NetError;
 use crate::nip65::{bootstrap_order, inbox_order, parse_relay_list};
-use crate::render::{render_listing, RenderedListing};
-use crate::split::{split_listing, truncate_listing};
+use crate::render::{render_listing, RenderedListing, MAX_LISTING_PARTS};
+use crate::split::{split_listing, truncate_listing, MAX_RESTITCHED_BYTES};
 
 /// Parse a pasted share code, surfacing `hb-core`'s codec rejection as a `NetError`. A bare `npub`
 /// is follow-only (no browse-key); a full `hbk1…` carries the browse-key; anything malformed
@@ -177,7 +177,7 @@ pub async fn browse_share_code(
     // Teaser (public): newest by created_at, then verify+parse.
     let teaser_events =
         client.fetch(Filter::new().author(peer).kind(Kind::from_u16(KIND_TEASER)), timeout).await?;
-    let teaser = select_newest_by_created_at(teaser_events).and_then(|e| parse_teaser(&e).ok());
+    let teaser = select_newest_teaser(teaser_events, &peer);
 
     // Listing (gated by the browse-key): a decrypt failure locks the listing without failing the
     // whole browse — the teaser still shows (BR1).
@@ -219,6 +219,14 @@ fn authored_by(events: Vec<Event>, peer: &PublicKey) -> Vec<Event> {
     events.into_iter().filter(|e| &e.pubkey == peer).collect()
 }
 
+/// Pick the browsed peer's newest teaser, pinning authorship (CWE-346) **before** the
+/// newest-by-`created_at` selection — a lying relay could otherwise substitute a validly-self-signed
+/// *foreign* teaser as the peer's identity, spoofing their name/bio/tags. Reuses [`authored_by`]
+/// exactly as the listing paths do, so the teaser and listing paths can't drift apart.
+fn select_newest_teaser(events: Vec<Event>, peer: &PublicKey) -> Option<Teaser> {
+    select_newest_by_created_at(authored_by(events, peer)).and_then(|e| parse_teaser(&e).ok())
+}
+
 /// Group fetched `KIND_LISTING` events into one slug's family (the `d=slug` index/single + its
 /// `d=slug#partN` content parts), take the **newest event per `d`** (a non-compliant relay's stale
 /// replaceable duplicate can't win — N3/AB8), decrypt each with the browse-key (which re-verifies the
@@ -243,11 +251,33 @@ fn render_slug_family(
     if by_d.is_empty() {
         return Err(NetError::Split(format!("no listing found for slug '{slug}'")));
     }
+    // Bound the family before decrypting it. A hostile peer can publish thousands of distinct part
+    // d-tags under one slug; the compliant ceiling is one index (`d = slug`) plus at most
+    // MAX_LISTING_PARTS content parts (`d = slug#partN`). Refusing the count up front (and the
+    // decrypted byte total as it accrues below) stops the whole batch being decrypted and
+    // materialised here first — which would defeat `render_listing`'s own cap, since that cap
+    // would fire only *after* the memory had already been taken.
+    if by_d.len() > MAX_LISTING_PARTS + 1 {
+        return Err(NetError::Split(format!(
+            "listing family ships {} distinct d-tags, exceeds the {MAX_LISTING_PARTS}-part cap",
+            by_d.len()
+        )));
+    }
 
     let mut payloads: Vec<String> = Vec::new();
+    let mut decrypted_bytes: usize = 0;
     for (_d, group) in by_d {
         if let Some(ev) = select_newest_by_created_at(group) {
             let (_slug, json) = parse_listing_event(&ev, browse_key)?;
+            // Total decrypted bytes across the family (index + parts), bounded as it accrues: a
+            // family of near-max parts could otherwise materialise hundreds of MB of plaintext
+            // before `render_listing`'s matched-bytes cap is consulted.
+            decrypted_bytes += json.len();
+            if decrypted_bytes > MAX_RESTITCHED_BYTES {
+                return Err(NetError::Split(format!(
+                    "decrypted listing family exceeds the {MAX_RESTITCHED_BYTES}-byte cap"
+                )));
+            }
             payloads.push(json);
         }
     }
@@ -439,6 +469,7 @@ pub async fn search_teasers_capped(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hb_core::event::build_teaser;
 
     // ShareCode deliberately has no Debug (it holds the secret browse-key), so unwrap its parse
     // through a match rather than `.unwrap()`.
@@ -635,5 +666,95 @@ mod tests {
         let kept = authored_by(vec![attacker_event, victim_event], &peer);
         assert_eq!(kept.len(), 1, "only the victim's event survives the pin");
         assert_eq!(kept[0].pubkey, peer);
+    }
+
+    /// Residual A (2026-08-24): a hostile peer publishing thousands of distinct part d-tags must
+    /// be refused at the family-collection boundary, BEFORE the events are decrypted into
+    /// `payloads`. The count check is what separates fixed from unfixed: the fixed path rejects on
+    /// the distinct-d-tag count, while the unfixed path proceeds to decrypt and fails on the first
+    /// undecryptable part (a different, later error). Every part here is validly signed by `peer`
+    /// (so `authored_by` keeps it) but carries garbage content with no schema/crypto tags, so any
+    /// decrypt attempt fails — proving the count bound fires without ever touching the ciphertext.
+    #[test]
+    fn slug_family_rejects_over_part_cap_before_decrypting() {
+        let victim = Identity::generate();
+        let peer = victim.public_key();
+        let browse_key: BrowseKey = [7; 32];
+
+        // One valid index event (`d = doom`) so the family has the canonical index-plus-parts shape.
+        let index_json = serde_json::json!({
+            "slug": "doom", "split": true, "parts_v": 2, "part_count": 0, "parts": [],
+        })
+        .to_string();
+        let mut events = vec![build_listing_event(&victim, "doom", &browse_key, &index_json).unwrap()];
+
+        // MAX_LISTING_PARTS + 1 content parts — distinct d-tags, validly signed by `peer`, garbage
+        // content. With the index, that is MAX_LISTING_PARTS + 2 distinct d-tags, one over the cap.
+        for i in 0..(MAX_LISTING_PARTS + 1) {
+            let garbage =
+                EventBuilder::new(Kind::from_u16(KIND_LISTING), format!("garbage-content-{i}"))
+                    .tags([Tag::identifier(format!("doom#part{i}"))]);
+            events.push(victim.sign(garbage).unwrap());
+        }
+
+        match render_slug_family(events, &peer, "doom", &browse_key) {
+            Err(NetError::Split(m)) => {
+                assert!(
+                    m.contains("distinct d-tags"),
+                    "expected the family-level count cap, got: {m}"
+                );
+            }
+            other => panic!("expected the family-level count-cap rejection, got {other:?}"),
+        }
+    }
+
+    /// The teaser fetch is the listing paths' unhardened sibling (CWE-346): a relay in the victim's
+    /// pool can return a *validly-self-signed* teaser from a different key with a newer `created_at`.
+    /// Without the author-pin in [`select_newest_teaser`], `select_newest_by_created_at` would pick the
+    /// attacker's event and spoof the browsed peer's name/bio/tags. This asserts the foreign teaser is
+    /// dropped before selection, so the victim's real (older) teaser is what renders.
+    #[test]
+    fn foreign_author_teaser_is_dropped_from_teaser_selection() {
+        let victim = Identity::generate();
+        let attacker = Identity::generate();
+        let peer = victim.public_key();
+
+        let victim_teaser = Teaser {
+            display_name: "victim".into(),
+            bio: String::new(),
+            tags: vec![],
+            content_types: vec![],
+            picture: None,
+        };
+        let attacker_teaser = Teaser {
+            display_name: "SPOOFED".into(),
+            bio: String::new(),
+            tags: vec![],
+            content_types: vec![],
+            picture: None,
+        };
+
+        let victim_event = build_teaser(&victim, &victim_teaser, false).unwrap();
+        let mut attacker_event = build_teaser(&attacker, &attacker_teaser, false).unwrap();
+        // Force a strictly-newer `created_at` so without the pin the attacker would win selection.
+        let newer_created_at = victim_event.created_at + 100;
+        let rebuilt = EventBuilder::new(Kind::from_u16(KIND_TEASER), attacker_event.content.clone())
+            .tags(attacker_event.tags.clone())
+            .custom_created_at(newer_created_at);
+        attacker_event = attacker.sign(rebuilt).unwrap();
+        assert_ne!(attacker_event.pubkey, peer, "attacker must differ from victim");
+        assert!(
+            attacker_event.created_at > victim_event.created_at,
+            "attacker must be newer so it would win without the pin"
+        );
+
+        // Attacker first so a "first-seen wins" bug would also surface here.
+        let selected = select_newest_teaser(vec![attacker_event, victim_event], &peer)
+            .expect("the victim's real teaser must still be selected");
+        assert_eq!(
+            selected.display_name, "victim",
+            "foreign-author teaser must be dropped before selection; got {:?}",
+            selected.display_name
+        );
     }
 }

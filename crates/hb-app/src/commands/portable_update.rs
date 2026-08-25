@@ -17,8 +17,8 @@ use serde::Serialize;
 
 use crate::error::{cmd_err, CmdResult};
 use crate::portable_update_logic::{
-    current_target_key, is_newer, is_portable_build, is_trusted_artifact_url, verify_signature,
-    PortableManifest,
+    binary_matches_claimed_version, current_target_key, is_newer, is_portable_build,
+    is_trusted_artifact_url, verify_signature, PortableManifest,
 };
 
 /// The minisign public key that signs releases — the SAME key as the NSIS updater
@@ -42,7 +42,21 @@ const MAX_MANIFEST_BYTES: u64 = 1 << 20; // 1 MiB
 const MAX_BINARY_BYTES: u64 = 512 << 20; // 512 MiB
 
 fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder().user_agent(USER_AGENT).timeout(REQUEST_TIMEOUT).build().map_err(cmd_err)
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(REQUEST_TIMEOUT)
+        // Security review #27: the default redirect policy follows up to 10 hops with no re-validation.
+        // Re-check every hop's host against the GitHub allowlist, so a trusted URL that 30x's to a
+        // foreign host (or to plain http) is refused before any bytes are fetched.
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if is_trusted_artifact_url(attempt.url().as_str()) {
+                attempt.follow()
+            } else {
+                attempt.error("redirect to an untrusted host")
+            }
+        }))
+        .build()
+        .map_err(cmd_err)
 }
 
 /// GET `url` with a hard size cap: a declared `Content-Length` over `max` is refused before the body
@@ -131,6 +145,18 @@ pub async fn apply_portable_update(app: tauri::AppHandle) -> CmdResult<()> {
 
     // Verify BEFORE anything touches the running exe — same trust root as the NSIS updater.
     verify_signature(&bytes, &artifact.signature, UPDATER_PUBKEY).map_err(cmd_err)?;
+
+    // Security review #34 (TUF rollback): the signature binds the bytes, but nothing yet binds the
+    // bytes' *own* embedded version to the manifest's claimed version. A manifest that lies about the
+    // version while pointing at a genuinely-signed old release would silently downgrade this client.
+    // The bytes are already authenticated here, so their embedded version is trustworthy — refuse if it
+    // disagrees with the claim, before anything touches the running exe.
+    if !binary_matches_claimed_version(&bytes, &manifest.version) {
+        return Err(format!(
+            "the downloaded binary reports a version other than {} — refusing to install a possible downgrade",
+            manifest.version
+        ));
+    }
 
     // Stage the verified bytes next to the current exe (same volume), then swap in place. `self_replace`
     // handles the Windows running-exe lock (rename-self dance); the in-memory process keeps running

@@ -27,7 +27,7 @@ use crate::identity_state::SharedIdentity;
 use crate::manifest_source::StoreManifestSource;
 use crate::net::SharedRelay;
 use crate::store::{DataStore, IssuedTicketRecord};
-use crate::transport::{fetch_manifest, issue_ticket};
+use crate::transport::{fetch_manifest, issue_ticket, sanitize_node_addr};
 use crate::transport_state::{ensure_endpoint, Role, SharedEndpoint};
 
 fn cmd_err<E: std::fmt::Display>(e: E) -> String {
@@ -228,9 +228,14 @@ pub async fn redeem_manifest_ticket(
     store: State<'_, DataStore>,
     endpoint: State<'_, SharedEndpoint>,
 ) -> CmdResult<crate::commands::browse::ImportedManifest> {
-    let ticket: TransportTicket = serde_json::from_str(&ticket_json)
+    let mut ticket: TransportTicket = serde_json::from_str(&ticket_json)
         .map_err(|_| "That message is not a readable transport ticket.".to_string())?;
     ticket.verify_shape().map_err(cmd_err)?;
+    // QURATOR-113 #20 — SSRF guard: the ticket's node_addr is peer-authored (a stranger who answers
+    // a manifest ask controls this dial target). Drop any transport address pointing at
+    // loopback/private/link-local before the dial; the transport layer's loopback QUIC harness stays
+    // unguarded so it keeps exercising the real dial.
+    ticket.node_addr = sanitize_node_addr(&ticket.node_addr).map_err(cmd_err)?;
 
     let (id_clone, browse_key, transport_key, own_npub) = {
         let guard = identity.read().await;

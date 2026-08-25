@@ -270,6 +270,12 @@ impl PublishSink for RelayPublishSink {
                 .ok_or_else(|| anyhow::anyhow!("no identity loaded; skipping snapshot republish"))?;
             (app.identity.clone(), app.browse_key.clone())
         };
+        // CWE-367: capture the revocation generation BEFORE the rescan walk. `evaluate_rescan`
+        // verifies `is_published` only at its *start*, then walks the tree for up to ~30s, so an
+        // Unpublish during that walk would be invisible to a check placed after it. The same value is
+        // threaded into `publish_collection_inner`, whose guarded marker save refuses to re-create the
+        // marker when the generation has since moved — covering both the walk and the relay writes.
+        let gen_at_start = self.store.published_generation(slug);
         match evaluate_rescan(slug, &self.store).map_err(|e| anyhow::anyhow!(e))? {
             RescanDecision::Unchanged => Ok(false),
             RescanDecision::Skipped(reason) => {
@@ -285,7 +291,7 @@ impl PublishSink for RelayPublishSink {
                     col.last_updated = chrono::Utc::now();
                     self.store.save_collection_draft(&col)?;
                 }
-                publish_collection_inner(slug, &self.store, &id, browse_key.bytes(), &self.relay)
+                publish_collection_inner(slug, &self.store, &id, browse_key.bytes(), &self.relay, gen_at_start)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
                 Ok(true)
@@ -864,4 +870,8 @@ mod tests {
             other => panic!("expected Skipped, got {other:?}"),
         }
     }
+
+    // (The vacuous `republish_still_published` re-check tests were removed with the re-check itself —
+    // the CWE-367 revocation guard now lives at the marker save in `publish_collection_inner`, and its
+    // pinning test lives in `collection.rs`.)
 }
