@@ -21,7 +21,7 @@
 	import { peerAccessBadge, summarizeCollectionsSize } from '$lib/browse-view.js';
 	import { onlineChipView } from '$lib/online-chip.js';
 	// M21 W4 — the petnameFor collision warning is the card-face security control (the coloured
-	// fingerprint is only ~36 bits and grindable; this badge is what actually flags impersonation).
+	// fingerprint is a widening-tier 67-bit grind; this badge is what actually flags impersonation).
 	import { petnameFor } from '$lib/identity-display.js';
 	// M21 W4 — fixed word→hue table for the coloured fingerprint (rendering-only; Rust picks the word).
 	import { fingerprintWordColor } from '$lib/fingerprint-colors.js';
@@ -1045,7 +1045,7 @@
 	{@const pubCount = publicCollections.length}
 	{@const sizeSummary = !badge.locked ? summarizeCollectionsSize(publicCollections) : null}
 	<!-- M21 W4 behaviour 5: the petnameFor collision warning goes on the card face. The fingerprint is
-	     ~36 bits and grindable, so this red-outlined badge is the actual security control. -->
+	     a 67-bit grind, so this red-outlined badge is the actual security control. -->
 	{@const contactsForLabel = $contacts.map(c => ({ npub: c.npub, petname: c.petname ?? c.profile?.display_name ?? '' }))}
 	{@const collision = petnameFor(peer.npub, name, contactsForLabel).warning}
 	{@const bio = peer.profile?.bio?.trim()}

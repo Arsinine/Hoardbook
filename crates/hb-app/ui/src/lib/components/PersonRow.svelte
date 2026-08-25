@@ -46,8 +46,8 @@
 		{#if fingerprint}
 			<div class="fp-row">
 				<!-- The word→hue table is a bijection of the word text (zero marginal entropy); the
-				     `colorHex` swatch is where the remaining ~24 of the 36 bits surface — same treatment
-				     as the DM-request card (.request-fp-swatch) and ShareCodeCard (.share-card-swatch). -->
+				     `colorHex` swatch is where 32 of the 67 bits surface — same treatment as the
+				     DM-request card (.request-fp-swatch) and ShareCodeCard (.share-card-swatch). -->
 				<span class="fp-swatch" style="background:{fingerprint.colorHex}" aria-hidden="true"></span>
 				{#each fingerprint.words as w, i}
 					{#if i > 0}<span class="fp-sep">·</span>{/if}

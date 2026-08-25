@@ -10,7 +10,7 @@ afterEach(cleanup);
 // and no saved contact holds one yet — the one state that renders "Unlock browsing".
 const info: ShareCodeInfo = {
 	npub: 'npub1peer',
-	fingerprint: { words: ['ember', 'quartz', 'lattice'], colorHex: '#5588aa' },
+	fingerprint: { words: ['ember', 'quartz', 'lattice', 'tarn', 'mint'], colorHex: '#5588aa' },
 	has_browse_key: true,
 };
 const base = {
