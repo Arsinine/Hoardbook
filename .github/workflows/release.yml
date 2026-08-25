@@ -13,9 +13,9 @@ jobs:
     outputs:
       release-id: ${{ steps.create.outputs.result }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: create
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           TAG: ${{ github.ref_name }}
         with:
@@ -50,13 +50,13 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch head, 2026-08-05
         with:
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
@@ -128,7 +128,7 @@ jobs:
         working-directory: crates/hb-app/ui
         run: npm install
 
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2 (v0 tag head)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -154,11 +154,89 @@ jobs:
           # exe (no version in the filename — the version lives inside the binary) so
           # `releases/latest/download/Hoardbook.exe` is a fixed URL the in-app updater fetches, plus its
           # minisign signature (SAME key as the NSIS updater) and a `portable.json` manifest.
+          #
+          # QURATOR-107 hardening: the signer CLI used to come from `npx --yes @tauri-apps/cli@2`,
+          # which resolved a floating 2.x off the npm registry at release time and received the
+          # signing key + password as argv. It is now installed from the integrity-pinned lockfile
+          # below (`npm ci` refuses any tarball whose sha512 differs) and invoked as that exact
+          # local file; the key travels env → temp file → `--private-key-path` and the password is
+          # read from TAURI_SIGNING_PRIVATE_KEY_PASSWORD, so neither secret is in argv. The temp
+          # key file is deleted in `finally` even when signing fails. The CLI is not a frontend
+          # dependency, so it gets this dedicated pin rather than floating inside crates/hb-app/ui.
           $exe = "Hoardbook.exe"
           Copy-Item "target/release/hb-app.exe" $exe
+          # Absolute path: the signer runs from the pinned-CLI directory below, so a
+          # relative $exe would point into that directory instead of at the artifact.
+          $exePath = Join-Path $env:GITHUB_WORKSPACE $exe
+
+          $cliDir = Join-Path $env:RUNNER_TEMP "tauri-cli-pin"
+          New-Item -ItemType Directory -Force -Path $cliDir | Out-Null
+          $pkgJson = @'
+          {
+            "name": "tauri-signer-pin",
+            "private": true,
+            "dependencies": { "@tauri-apps/cli": "2.11.4" }
+          }
+          '@
+          $pkgLock = @'
+          {
+            "name": "tauri-signer-pin",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+              "": {
+                "name": "tauri-signer-pin",
+                "version": "1.0.0",
+                "dependencies": { "@tauri-apps/cli": "2.11.4" }
+              },
+              "node_modules/@tauri-apps/cli": {
+                "version": "2.11.4",
+                "resolved": "https://registry.npmjs.org/@tauri-apps/cli/-/cli-2.11.4.tgz",
+                "integrity": "sha512-R8xGtMpwyetawSqm9kYOuMmEqkhUbvcUy8n0aNXIxollKBLESUu5f4Fx+64hgASYm1H+jSWq6jCW6zqTnH6hqQ==",
+                "bin": { "tauri": "tauri.js" },
+                "engines": { "node": ">= 10" },
+                "optionalDependencies": { "@tauri-apps/cli-win32-x64-msvc": "2.11.4" }
+              },
+              "node_modules/@tauri-apps/cli-win32-x64-msvc": {
+                "version": "2.11.4",
+                "resolved": "https://registry.npmjs.org/@tauri-apps/cli-win32-x64-msvc/-/cli-win32-x64-msvc-2.11.4.tgz",
+                "integrity": "sha512-+vDiqBIU5dMISg/wNvX3sF+ZHfgJGJ5T0AcO+EHNXV9GGAG+P5fzodlDXD3QdKCRgZxMoCm5PPvj3BqLNjBthw==",
+                "cpu": [ "x64" ],
+                "optional": true,
+                "os": [ "win32" ],
+                "engines": { "node": ">= 10" }
+              }
+            }
+          }
+          '@
+          # NoNewline: a trailing newline inside package.json is harmless, but the
+          # here-string's closing newline is dropped by assignment, so state it explicitly.
+          [IO.File]::WriteAllText((Join-Path $cliDir "package.json"), $pkgJson, [Text.UTF8Encoding]::new($false))
+          [IO.File]::WriteAllText((Join-Path $cliDir "package-lock.json"), $pkgLock, [Text.UTF8Encoding]::new($false))
+
           # Sign with the Tauri signer → `$exe.sig` (base64 minisign signature, the exact format
-          # tauri-plugin-updater — and our portable verifier — expect). Key comes from env (masked).
-          npx --yes @tauri-apps/cli@2 signer sign --private-key "$env:TAURI_SIGNING_PRIVATE_KEY" --password "$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD" $exe
+          # tauri-plugin-updater — and our portable verifier — expect).
+          Push-Location $cliDir
+          try {
+            npm ci --no-audit --no-fund
+            if ($LASTEXITCODE -ne 0) { throw "npm ci of the pinned signer CLI failed (exit $LASTEXITCODE)" }
+            $keyFile = Join-Path $env:RUNNER_TEMP "hb-updater-signing.key"
+            try {
+              # WriteAllText writes the exact string: no BOM, no trailing newline, no CRLF —
+              # all three corrupt the base64 key and make the CLI fail to decode it.
+              [IO.File]::WriteAllText($keyFile, $env:TAURI_SIGNING_PRIVATE_KEY, [Text.UTF8Encoding]::new($false))
+              # The CLI rejects --private-key-path while TAURI_SIGNING_PRIVATE_KEY is set, so drop
+              # it before invoking; the password comes from its own env var, not argv.
+              Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
+              & node (Join-Path $cliDir "node_modules\@tauri-apps\cli\tauri.js") signer sign --private-key-path "$keyFile" "$exePath"
+              if ($LASTEXITCODE -ne 0) { throw "tauri signer sign failed (exit $LASTEXITCODE)" }
+            } finally {
+              Remove-Item $keyFile -Force -ErrorAction SilentlyContinue
+            }
+          } finally {
+            Pop-Location
+          }
           $sig = (Get-Content "$exe.sig" -Raw).Trim()
           $version = $env:GITHUB_REF_NAME.TrimStart('v')
           $url = "https://github.com/${{ github.repository }}/releases/latest/download/Hoardbook.exe"
