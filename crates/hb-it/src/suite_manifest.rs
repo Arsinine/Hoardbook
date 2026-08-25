@@ -48,7 +48,10 @@ use hb_core::manifest::{build_manifest_envelope, ManifestEnvelope};
 use hb_core::{
     snapshot_fingerprint, Collection, DirectoryItem, Identity, ItemType, ShareCode, Visibility,
 };
-use hb_net::{browse_share_code, publish_listing_capped, render_listing, split_listing, RenderedListing};
+use hb_net::{
+    browse_share_code, publish_listing_capped, render_listing, split_listing, truncate_listing,
+    RenderedListing,
+};
 use serde_json::Value;
 
 use crate::harness::{now, result, settle, Ctx, FETCH_TIMEOUT};
@@ -130,7 +133,28 @@ fn listing_json(col: &Collection) -> Result<String> {
         "snapshot_fingerprint".into(),
         Value::String(snapshot_fingerprint(&col.listing).0),
     );
-    Ok(serde_json::to_string(&v)?)
+    // Audit #25 / QURATOR-123: production's next step stamps the **teaser digest** beside the
+    // full-tree one — the digest `truncate_listing` re-derives over the visible entries + elided
+    // count — so full carriers can still be gated against the teaser the browser is showing.
+    // Mirrored here through the same `truncate_listing` call (never re-implemented), for a listing
+    // that actually truncates; a listing that fits whole is left byte-identical.
+    let json = serde_json::to_string(&v)?;
+    let t = truncate_listing(&json, LISTING_MAX_BYTES)?;
+    if t.truncated {
+        let teaser_fp = serde_json::from_str::<Value>(&t.json)?
+            .get("snapshot_fingerprint")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(tf) = teaser_fp {
+            let mut stamped: Value = serde_json::from_str(&json)?;
+            stamped
+                .as_object_mut()
+                .expect("a listing is an object")
+                .insert("teaser_fingerprint".into(), Value::String(tf));
+            return Ok(serde_json::to_string(&stamped)?);
+        }
+    }
+    Ok(json)
 }
 
 /// `hb-app::rendered_to_peer_collection`'s decode step, reproduced: pull the browse-time signals out
@@ -155,7 +179,15 @@ fn rendered_to_collection(r: &RenderedListing) -> Result<Collection> {
 /// this suite exists to close.
 fn export_envelope(owner: &Identity, slug: &str, key: &[u8; 32], col: &Collection) -> Result<ManifestEnvelope> {
     let json = listing_json(col)?;
-    let fp = snapshot_fingerprint(&col.listing).0;
+    // Audit #25 / QURATOR-123: the envelope's digest is the TEASER digest (visible entries + elided
+    // count), derived exactly as `build_slug_manifest` now derives it — through the production
+    // truncation on the same bytes, read back off the artifact.
+    let t = truncate_listing(&json, LISTING_MAX_BYTES)?;
+    let fp = serde_json::from_str::<Value>(&t.json)?
+        .get("snapshot_fingerprint")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| snapshot_fingerprint(&col.listing).0);
     let parts: Vec<String> =
         split_listing(slug, &json, LISTING_MAX_BYTES)?.into_iter().map(|p| p.json).collect();
     Ok(build_manifest_envelope(owner, slug, key, &fp, now(), &parts)?)
@@ -273,17 +305,26 @@ async fn man1(ctx: &Ctx) -> Result<()> {
         back.listing.iter().all(|it| it.item_type == ItemType::File),
         "item_type did not survive the round trip — the browser would render the wrong node kind"
     );
-    // Recomputing the fingerprint over the DECODED tree reproduces what the relay teaser carried —
-    // i.e. the tree that survived the round trip is the tree the teaser was previewing.
+    // Recomputing the teaser digest over the DECODED tree's own publish artifact reproduces what the
+    // relay teaser carried — i.e. the tree that survived the round trip is the tree the teaser was
+    // previewing. Post audit #25 the teaser digest is derived through `truncate_listing` (never
+    // re-implemented here), over the decoded tree's VISIBLE entries + elided count.
     //
-    // Note this check is deliberately *self-consistent*: a `snapshot_fingerprint` stubbed to a
-    // constant would still satisfy it (verified — that probe leaves MAN1 green). Proving the
-    // fingerprint tracks *content* is MAN2's job, where two genuinely different trees must produce
-    // two different values. Stated here so the assertion isn't read as stronger than it is.
+    // Note this check is deliberately *self-consistent*: a digest stubbed to a constant would still
+    // satisfy it (verified — that probe leaves MAN1 green). Proving the digest tracks *content* is
+    // MAN2's job, where two genuinely different trees must produce two different values. Stated
+    // here so the assertion isn't read as stronger than it is.
+    let back_json = listing_json(&back)?;
+    let back_t = truncate_listing(&back_json, LISTING_MAX_BYTES)?;
     ensure!(
-        snapshot_fingerprint(&back.listing).0 == teaser_fp,
-        "the fingerprint recomputed from the imported tree does not match the teaser's — the tree \
-         that arrived is not the tree the teaser previewed"
+        serde_json::from_str::<Value>(&back_t.json)?
+            .get("snapshot_fingerprint")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default()
+            == teaser_fp,
+        "the digest recomputed from the imported tree does not match the teaser's — the tree that \
+         arrived is not the tree the teaser previewed"
     );
     Ok(())
 }
@@ -305,13 +346,24 @@ async fn man2(ctx: &Ctx) -> Result<()> {
     // content differs — which is the only version of this test that exercises the real signal.
     let old = collection(&slug, ENTRIES - 300, "archive");
     let current = collection(&slug, ENTRIES, "title");
-    let old_fp = snapshot_fingerprint(&old.listing).0;
-    let current_fp = snapshot_fingerprint(&current.listing).0;
+    // Audit #25 / QURATOR-123: these are TEASER digests now (visible entries + elided count),
+    // derived through the production truncation — the same value the envelope carries and the relay
+    // teaser shows. Still genuinely different because the trees differ.
+    let teaser_digest = |col: &Collection| -> Result<String> {
+        let t = truncate_listing(&listing_json(col)?, LISTING_MAX_BYTES)?;
+        Ok(serde_json::from_str::<Value>(&t.json)?
+            .get("snapshot_fingerprint")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default())
+    };
+    let old_fp = teaser_digest(&old)?;
+    let current_fp = teaser_digest(&current)?;
     ensure!(old_fp != current_fp, "the two fixtures must be genuinely different snapshots");
 
     // The relay holds the CURRENT snapshot; the file the recipient was handed is the older tree.
     let (_shown, teaser_fp) = publish_teaser_and_browse(ctx, &owner, &slug, key, &current).await?;
-    ensure!(teaser_fp == current_fp, "the teaser must carry the current tree's derived fingerprint");
+    ensure!(teaser_fp == current_fp, "the teaser must carry the current tree's derived digest");
     let imported = write_then_read(ctx, &slug, &export_envelope(&owner, &slug, &key, &old)?)?;
 
     ensure!(
@@ -330,8 +382,8 @@ async fn man2(ctx: &Ctx) -> Result<()> {
         back.listing.len()
     );
     ensure!(
-        snapshot_fingerprint(&back.listing).0 == old_fp,
-        "the imported stale tree does not reproduce the older fingerprint — it is not the tree that \
+        teaser_digest(&back)? == old_fp,
+        "the imported stale tree does not reproduce the older digest — it is not the tree that \
          was exported"
     );
     Ok(())

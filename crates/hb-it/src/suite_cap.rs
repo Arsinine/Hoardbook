@@ -72,8 +72,18 @@ fn bk(seed: u8) -> [u8; 32] {
 const WORST: &str = "\u{1}";
 
 fn entries(n: usize) -> Vec<Value> {
+    // `item_type`/`tags`/`children` are the keys a real `collection_to_listing_json` tree emits, so
+    // the truncated teaser's digest re-derivation (audit #25 / QURATOR-123) has a decodable
+    // `DirectoryItem` tree to hash — without them the teaser takes the "drop the digest" path and
+    // the fixture stops exercising the production shape. Cheap (~30 bytes/entry) relative to the
+    // padding that drives the budget.
     (0..n)
-        .map(|i| serde_json::json!({ "name": format!("title-{i:05}-padding-padding-padding-xx") }))
+        .map(|i| {
+            serde_json::json!({
+                "name": format!("title-{i:05}-padding-padding-padding-xx"),
+                "item_type": "File", "tags": [], "children": [],
+            })
+        })
         .collect()
 }
 
