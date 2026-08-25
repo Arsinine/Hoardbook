@@ -41,6 +41,12 @@ DESIGN_SYSTEM.md
 APPRAISAL-RESULTS.md
 planning/
 .graphifyignore
+# Orchestrator/agent rules — binding on this repo's workflow, but internal process
+# notes, deliberately NOT published (owner ruling 2026-08-25). Durability is Nextcloud
+# sync of this tree, not git; they were previously untracked-and-unignored, which read
+# as scratch and left them one `git clean -fd` from loss.
+docs/ORCHESTRATOR.md
+docs/RULE-PROVENANCE.md
 
 # Claude Code local settings (contains LiteLLM key)
 .claude/settings.local.json
