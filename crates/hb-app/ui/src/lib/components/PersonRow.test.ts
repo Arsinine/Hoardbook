@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-// Hoardbook Topics draft r1 — the roster row (PersonRow): avatar + name + coloured 3-word
+// Hoardbook Topics draft r1 — the roster row (PersonRow): avatar + name + coloured 5-word
 // fingerprint + presence dot. A BEHAVIOURAL test (real mount), not a source-scan — CLAUDE.md §7
 // says the components mount fine, and the interesting claims here (fingerprint words render in the
 // fingerprintWordColor hues, absence is graceful) are DOM claims.
@@ -20,15 +20,15 @@ afterEach(cleanup);
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-/** A resolved §7 fingerprint as Rust emits it (words from the fixed 16-word table + a swatch). */
-const fp = { words: ['amber', 'cedar', 'jade'], colorHex: '#f00' };
+/** A resolved §7 fingerprint as Rust emits it (5 words from the fixed 128-word table + a swatch). */
+const fp = { words: ['amber', 'cedar', 'jade', 'quartz', 'tarn'], colorHex: '#f00' };
 
 /** jsdom re-serializes inline styles and trims insignificant trailing zeros ("0.80" → "0.8"), so a
  *  colour comparison must normalize both sides the same way before comparing. */
 const normCss = (s: string) => s.replace(/(\d+\.\d*?)0+(?=\s|\)|$)/g, '$1');
 
 describe('PersonRow — Hoardbook Topics draft r1 roster row', () => {
-	it('renders the display name and the 3 fingerprint words when the fingerprint is available', () => {
+	it('renders the display name and the 5 fingerprint words when the fingerprint is available', () => {
 		const { container, getByText } = render(PersonRow, {
 			props: { name: 'Alice', letter: 'A', fingerprint: fp },
 		});
@@ -49,13 +49,13 @@ describe('PersonRow — Hoardbook Topics draft r1 roster row', () => {
 
 	it('renders fingerprint.colorHex as the swatch — identical words, different colorHex ⇒ different colour', () => {
 		// The word→hue table is a bijection of the word text (zero marginal entropy); the `colorHex`
-		// swatch is where the remaining ~24 of the 36 bits surface. Two rows with the SAME words but
+		// swatch is where 32 of the 67 bits surface (QURATOR-121 #24). Two rows with the SAME words but
 		// DIFFERENT colorHex must render visibly different colour — the thing the pre-fix test never
 		// asserted, and the bug (colorHex accepted in Props but never rendered) let through. jsdom
 		// computes no layout, but it does preserve inline styles/attributes — asserted on the swatch's
 		// `style`, which is what our fix sets.
-		const fpA = { words: ['amber', 'cedar', 'jade'], colorHex: '#f00' };
-		const fpB = { words: ['amber', 'cedar', 'jade'], colorHex: '#00f' };
+		const fpA = { words: ['amber', 'cedar', 'jade', 'quartz', 'tarn'], colorHex: '#f00' };
+		const fpB = { words: ['amber', 'cedar', 'jade', 'quartz', 'tarn'], colorHex: '#00f' };
 		const a = render(PersonRow, { props: { name: 'Alice', letter: 'A', fingerprint: fpA } });
 		const b = render(PersonRow, { props: { name: 'Alice', letter: 'A', fingerprint: fpB } });
 		const swatchA = a.container.querySelector('.fp-swatch');

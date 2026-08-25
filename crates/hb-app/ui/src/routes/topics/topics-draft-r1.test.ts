@@ -59,7 +59,7 @@ function makeContact(overrides: Partial<CachedPeer> = {}): CachedPeer {
 		online: true,
 		last_fetched: '',
 		local_tags: [],
-		fingerprint: { words: ['amber', 'cedar', 'jade'], colorHex: '#f00' },
+		fingerprint: { words: ['amber', 'cedar', 'jade', 'quartz', 'tarn'], colorHex: '#f00' },
 		...overrides,
 	};
 }
@@ -107,7 +107,7 @@ describe('Hoardbook Topics draft r1 — roster rows (PersonRow)', () => {
 
 		// The contact resolves via rosterLabel → petname "Carol", with the fingerprint words below.
 		expect(await findByText('Carol')).toBeTruthy();
-		for (const w of ['amber', 'cedar', 'jade']) expect(getByText(w)).toBeTruthy();
+		for (const w of ['amber', 'cedar', 'jade', 'quartz', 'tarn']) expect(getByText(w)).toBeTruthy();
 		// Presence is known online (CachedPeer.online) → the dot renders.
 		expect(container.querySelector('.online-dot')).not.toBeNull();
 	});

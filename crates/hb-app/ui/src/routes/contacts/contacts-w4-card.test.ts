@@ -71,12 +71,13 @@ describe('M21 W4 behaviour 2 — presence + cache-age are INDEPENDENT (no Stale 
 });
 
 describe('M21 W4 behaviour 3 — coloured fingerprint from the fixed word→hue table', () => {
-	it('the face renders the three words via fingerprintWordColor, not re-derived', () => {
+	it('the face renders the Rust-selected words via fingerprintWordColor, not re-derived', () => {
 		const s = contactsSrc();
 		expect(s).toMatch(/import \{ fingerprintWordColor \}/);
 		expect(s).toMatch(/fingerprintWordColor\(w\)/);
-		// Three words, not four — the {#each fp.words} loop is the Rust-selected set, unmodified.
-		expect(s).not.toMatch(/fp\.words\.slice\(0, 4\)|fp\.words\.concat/);
+		// The {#each fp.words} loop is the Rust-selected set, unmodified (5 words since QURATOR-121
+		// #24; no slicing/truncating back to the old width).
+		expect(s).not.toMatch(/fp\.words\.slice\(0, \d\)|fp\.words\.concat/);
 	});
 
 	it('the fixed table lives in a pure helper module, not in the component', () => {

@@ -23,7 +23,7 @@ function makeRequest(npub: string, lastMessageAt: number, contents: string[] = [
 		last_message_at: lastMessageAt,
 		message_count: messages.length,
 		messages,
-		fingerprint: { words: ['alpha', 'bravo', 'charlie'], colorHex: '#abcdef' },
+		fingerprint: { words: ['alpha', 'bravo', 'charlie', 'delta', 'echo'], colorHex: '#abcdef' },
 	};
 }
 
@@ -77,7 +77,7 @@ describe('request-inbox view-model', () => {
 
 	it('fingerprint is passed through verbatim (never re-derived)', () => {
 		const r = makeRequest('npub1a', 1);
-		expect(r.fingerprint).toEqual({ words: ['alpha', 'bravo', 'charlie'], colorHex: '#abcdef' });
+		expect(r.fingerprint).toEqual({ words: ['alpha', 'bravo', 'charlie', 'delta', 'echo'], colorHex: '#abcdef' });
 	});
 
 	it('REQUEST_EXPLAINER names both the non-contact status and the accept action', () => {

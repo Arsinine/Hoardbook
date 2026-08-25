@@ -1480,9 +1480,9 @@ mod tests {
 
     #[test]
     fn share_code_info_full_code_has_browse_key_and_golden_fingerprint() {
-        // The npub whose fingerprint is the golden vector "jade fjord jade #dc025b" (secret …01).
-        // `share_code_info_inner` must reproduce it exactly — the card's fingerprint is single-sourced
-        // in hb-core, never re-derived in JS (M3 decision #7).
+        // The npub whose fingerprint is the golden vector "thorn jetty luster trellis nacre
+        // #7ea007ce" (secret …01). `share_code_info_inner` must reproduce it exactly — the card's
+        // fingerprint is single-sourced in hb-core, never re-derived in JS (M3 decision #7).
         let id = Identity::from_secret(
             "0000000000000000000000000000000000000000000000000000000000000001",
         )
@@ -1494,8 +1494,12 @@ mod tests {
             .unwrap();
         let info = share_code_info_inner(&code).unwrap();
         assert_eq!(info.npub, npub, "the embedded npub is recovered");
-        assert_eq!(info.fingerprint.words, vec!["jade", "fjord", "jade"], "golden words");
-        assert_eq!(info.fingerprint.color_hex, "#dc025b", "golden color");
+        assert_eq!(
+            info.fingerprint.words,
+            vec!["thorn", "jetty", "luster", "trellis", "nacre"],
+            "golden words"
+        );
+        assert_eq!(info.fingerprint.color_hex, "#7ea007ce", "golden color");
         assert!(info.has_browse_key, "a full hbk code carries the browse-key");
     }
 
@@ -1507,7 +1511,7 @@ mod tests {
         assert!(!info.has_browse_key, "a bare npub carries no browse-key");
         // The fingerprint is still derived — it is a function of the npub ALONE, so a keyless code
         // still shows the impersonation distinguisher on the card.
-        assert_eq!(info.fingerprint.words.len(), 3);
+        assert_eq!(info.fingerprint.words.len(), 5);
         assert!(info.fingerprint.color_hex.starts_with('#'));
     }
 

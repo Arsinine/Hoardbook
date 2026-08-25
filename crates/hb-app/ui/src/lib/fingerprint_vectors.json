@@ -1,15 +1,27 @@
 {
-  "_comment": "Cross-language golden fixture for the impersonation-resistant fingerprint (M3 decision #7, AB4b). SOURCE OF TRUTH: crates/hb-core/src/fingerprint.rs::fingerprint. The Rust test `fingerprint_matches_golden_vectors` pins the algorithm to these values; the frontend identity-display.test.ts pins its RENDERING to them. Do NOT re-derive the fingerprint in TypeScript — the UI gets it over the Tauri boundary. Regenerate both sides together if the algorithm changes.",
+  "_comment": "Cross-language golden fixture for the impersonation-resistant fingerprint (M3 decision #7, AB4b). SOURCE OF TRUTH: crates/hb-core/src/fingerprint.rs::fingerprint. The Rust test `fingerprint_matches_golden_vectors` pins the algorithm to these values; the frontend identity-display.test.ts pins its RENDERING to them. Do NOT re-derive the fingerprint in TypeScript \u2014 the UI gets it over the Tauri boundary. Regenerate both sides together if the algorithm changes. Regenerated 2026-08-25 for QURATOR-121 #24: the derivation widened from 3\u00d74-bit words + #rrggbb (36 bits, one-time 2^36 grind) to 5\u00d77-bit words + #rrggbbaa (67 bits).",
   "vectors": [
     {
       "npub": "npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d",
-      "words": ["jade", "fjord", "jade"],
-      "colorHex": "#dc025b"
+      "words": [
+        "thorn",
+        "jetty",
+        "luster",
+        "trellis",
+        "nacre"
+      ],
+      "colorHex": "#7ea007ce"
     },
     {
       "npub": "npub1ccz8l9zpa47k6vz9gphftsrumpw80rjt3nhnefat4symjhrsnmjs38mnyd",
-      "words": ["garnet", "onyx", "harbor"],
-      "colorHex": "#ed5cb9"
+      "words": [
+        "larch",
+        "tulip",
+        "citrine",
+        "beacon",
+        "glacier"
+      ],
+      "colorHex": "#9445d8ef"
     }
   ]
 }

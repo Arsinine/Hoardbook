@@ -16,22 +16,49 @@
 //! candidate for extraction to an `hb-display`/`hb-app` home in M4. Do not let it justify accreting
 //! other UI helpers into `hb-core`.
 //!
-//! **Security caveat (not a cryptographic boundary):** a short, human-comparable fingerprint is
-//! *grindable* — ~36 bits here (3 words × 4 bits + a 24-bit colour), so a determined attacker could
-//! mine a key whose fingerprint matches a target's in feasible time. The fingerprint is therefore a
-//! usability distinguisher, **not** an anti-impersonation guarantee. The real defence is the
-//! **petname bound to the exact `npub`** (see `ui/src/lib/identity-display.ts::petnameFor`, which
-//! flags a name reused under a different key) — the fingerprint only makes two *un-grinded* keys
-//! distinguishable at a glance. Widening `WORDS` raises the grinding cost but never closes it.
+//! **Grinding cost (QURATOR-121 #24, CWE-290):** the fingerprint renders **67 bits** of the
+//! 256-bit key (5 words × 7 bits of selection + a 32-bit `#rrggbbaa` colour), so mining a key
+//! whose fingerprint matches a target's is a 2^67 preimage grind. Each trial costs a secp256k1
+//! key derivation (the scalar mult dominates; the byte masking is free): 2^67 ≈ 1.5×10^20
+//! derivations, i.e. **~470 years even at an absurd 10^10 derivations/s** and ~5,000 years at
+//! realistic GPU rates (10^8–10^9/s) — computationally infeasible for a one-time, reusable
+//! impersonation, which is the level the fix targets (the classic 2^64..2^80 impracticality
+//! band). That kills the old attack — a one-time ~2^36 grind reusable forever. The width matters
+//! exactly where the petname defence cannot reach: the petname bound to the `npub`
+//! (`ui/src/lib/identity-display.ts::petnameFor`) structurally does not exist for first contact
+//! — Topic rosters, DM requests, search hits — so at first contact the fingerprint is the only
+//! distinguisher and must itself be un-grindable. Honest caveat: a human comparing *at a glance*
+//! resolves the five words exactly (35 bits) but the swatch only perceptually (~a dozen
+//! distinguishable colours), so a glance-only comparison carries ~47 bits — hours-to-days for a
+//! glance-only victim on surfaces that omit the hex; the DM-request and share-code cards render
+//! the full hex, so comparing there demands all 67. The fingerprint is still a display
+//! affordance, not a cryptographic boundary; a bound petname remains the stronger defence.
 
 use nostr::prelude::PublicKey;
 use serde::{Deserialize, Serialize};
 
-/// 16 short, visually-distinct words (4 bits of selection each). Kept deliberately small so a
-/// human can compare two fingerprints at a glance.
-const WORDS: [&str; 16] = [
-    "amber", "basalt", "cedar", "delta", "ember", "fjord", "garnet", "harbor", "indigo", "jade",
-    "kelp", "lumen", "marble", "nimbus", "onyx", "pewter",
+/// 128 short, visually-distinct words (7 bits of selection each). Sized so 5 words + the colour
+/// render 67 bits of the key (QURATOR-121 #24). Constraints the list deliberately satisfies:
+/// every word is 3–7 lowercase letters, **no two share a 3-letter prefix** (so a word is identified
+/// by its first three characters — a mis-read word cannot silently become another word), and no
+/// 2-letter prefix has more than three members. All 16 words of the pre-widening list are retained.
+const WORDS: [&str; 128] = [
+    "acorn", "agate", "amber", "anchor", "anvil", "apple", "arbor", "arctic",
+    "arrow", "aspen", "atlas", "aurora", "bamboo", "basalt", "beacon", "birch",
+    "bismuth", "bramble", "bronze", "cedar", "chrome", "citrine", "clover", "cobalt",
+    "crimson", "dahlia", "delta", "dusk", "eagle", "elixir", "ember", "emerald",
+    "ether", "falcon", "fern", "fjord", "flint", "forge", "fresco", "frost",
+    "gale", "garnet", "gentian", "glacier", "globe", "granite", "grotto", "halcyon",
+    "harbor", "hazel", "helium", "heron", "hickory", "hollow", "hornet", "indigo",
+    "iris", "ivory", "jade", "jetty", "juniper", "jute", "kayak", "kelp",
+    "kestrel", "kiln", "krypton", "kudzu", "lagoon", "lapis", "larch", "ledge",
+    "lemon", "lilac", "linen", "lotus", "lumen", "lunar", "luster", "mantis",
+    "maple", "marble", "meadow", "mercury", "mint", "mirror", "moor", "moraine",
+    "moss", "nacre", "nebula", "nickel", "nimbus", "nomad", "north", "nougat",
+    "oaken", "ocean", "ochre", "onyx", "opal", "orbit", "pearl", "pepper",
+    "pigeon", "quartz", "quince", "raven", "reef", "ridge", "russet", "saffron",
+    "sage", "sandal", "sequoia", "slate", "spruce", "summit", "talon", "tarn",
+    "thicket", "thorn", "tinsel", "topaz", "trellis", "tulip", "tundra", "umber",
 ];
 
 /// A deterministic, at-a-glance fingerprint of an `npub`.
@@ -42,23 +69,29 @@ const WORDS: [&str; 16] = [
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Fingerprint {
-    /// Three words selected from well-separated key bytes.
+    /// Five words selected from well-separated key bytes.
     pub words: Vec<String>,
-    /// A `#rrggbb` swatch from three further key bytes.
+    /// An 8-hex-digit `#rrggbbaa` swatch from four further key bytes.
     pub color_hex: String,
 }
 
 /// Derive the fingerprint of a public key. The key bytes are already uniformly distributed (a
 /// secp256k1 x-only pubkey), so bytes are sampled directly — no extra hashing needed — from
-/// well-spread positions to maximise sensitivity to any key difference.
+/// well-spread positions (word bytes at stride 6, colour bytes interleaved at +3) so any
+/// single-byte key difference moves exactly one rendered element. Each word byte is masked to its
+/// low 7 bits to index the 128-word list, so matching all five words is a 2^35 constraint and
+/// matching the 4-byte colour another 2^32 — a **2^67** preimage grind in total (see the module
+/// docs).
 pub fn fingerprint(pk: &PublicKey) -> Fingerprint {
     let b = pk.to_bytes(); // [u8; 32]
     let words = vec![
-        WORDS[(b[0] % 16) as usize].to_string(),
-        WORDS[(b[11] % 16) as usize].to_string(),
-        WORDS[(b[23] % 16) as usize].to_string(),
+        WORDS[(b[0] & 0x7f) as usize].to_string(),
+        WORDS[(b[6] & 0x7f) as usize].to_string(),
+        WORDS[(b[12] & 0x7f) as usize].to_string(),
+        WORDS[(b[18] & 0x7f) as usize].to_string(),
+        WORDS[(b[24] & 0x7f) as usize].to_string(),
     ];
-    let color_hex = format!("#{:02x}{:02x}{:02x}", b[5], b[16], b[27]);
+    let color_hex = format!("#{:02x}{:02x}{:02x}{:02x}", b[3], b[9], b[15], b[21]);
     Fingerprint { words, color_hex }
 }
 
@@ -71,16 +104,16 @@ mod tests {
     /// shared with `ui/src/lib/fingerprint_vectors.json`: if the algorithm changes, this assertion
     /// fails first, and the JSON fixture (consumed by the frontend `identity-display` vitest) must
     /// be regenerated to match — that is how the Rust derivation and the TS rendering stay agreed.
-    const GOLDEN: &[(&str, [&str; 3], &str)] = &[
+    const GOLDEN: &[(&str, [&str; 5], &str)] = &[
         (
             "0000000000000000000000000000000000000000000000000000000000000001",
-            ["jade", "fjord", "jade"],
-            "#dc025b",
+            ["thorn", "jetty", "luster", "trellis", "nacre"],
+            "#7ea007ce",
         ),
         (
             "0000000000000000000000000000000000000000000000000000000000000002",
-            ["garnet", "onyx", "harbor"],
-            "#ed5cb9",
+            ["larch", "tulip", "citrine", "beacon", "glacier"],
+            "#9445d8ef",
         ),
     ];
 
@@ -95,7 +128,7 @@ mod tests {
     #[test]
     fn fingerprint_differs_for_two_distinct_keys() {
         // Two distinct keys must not collide on *both* words and color (the at-a-glance
-        // distinguisher must actually distinguish). Collision on the sampled bytes is ~2^-48.
+        // distinguisher must actually distinguish). Collision on the sampled bits is ~2^-67.
         let a = fingerprint(&Identity::generate().public_key());
         let b = fingerprint(&Identity::generate().public_key());
         assert_ne!(a, b, "two distinct keys produced an identical fingerprint");

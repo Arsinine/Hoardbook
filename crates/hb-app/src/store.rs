@@ -1519,8 +1519,14 @@ mod tests {
 
         let mut stored = contact_fixture(&npub);
         let sentinel = hb_core::fingerprint::Fingerprint {
-            words: vec!["sentinel".into(), "sentinel".into(), "sentinel".into()],
-            color_hex: "#abcdef".into(),
+            words: vec![
+                "sentinel".into(),
+                "sentinel".into(),
+                "sentinel".into(),
+                "sentinel".into(),
+                "sentinel".into(),
+            ],
+            color_hex: "#abcdef12".into(),
         };
         stored.fingerprint = Some(sentinel.clone());
         store.save_contact(&hash, &stored).unwrap();
