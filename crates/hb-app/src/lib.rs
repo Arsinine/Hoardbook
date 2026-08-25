@@ -515,6 +515,7 @@ pub fn run() {
             commands::identity::validate_share_code,
             commands::identity::backup_data,
             commands::identity::peek_backup,
+            commands::identity::validate_backup,
             commands::identity::restore_data,
             commands::identity::wipe_data,
             commands::profile::save_profile,

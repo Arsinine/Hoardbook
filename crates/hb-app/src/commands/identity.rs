@@ -205,6 +205,17 @@ pub async fn peek_backup(path: String) -> CmdResult<bool> {
     hb_core::is_encrypted_backup(&archive).map_err(cmd_err)
 }
 
+/// Fully validate a backup WITHOUT applying it (QURATOR-126 #15): derive the key (Argon2id),
+/// decrypt the AEAD, and parse every tar entry to completion — the exact production restore path,
+/// into a throwaway directory. `Ok(())` means a subsequent restore with the same passphrase into a
+/// wiped profile will succeed. Writes nothing to the datastore, so the UI can gate the
+/// irreversible wipe on this instead of the 72-byte header sniff `peek_backup` does.
+#[tauri::command]
+pub async fn validate_backup(passphrase: Option<String>, path: String) -> CmdResult<()> {
+    let archive = std::fs::read(&path).map_err(|e| format!("Could not read backup file: {e}"))?;
+    crate::backup::validate_inner(&archive, passphrase.as_deref()).map_err(cmd_err)
+}
+
 /// Restore a whole-directory backup, re-wrapping the secrets under the local at-rest scheme. The
 /// archive header is self-describing, so `passphrase` is optional (an encrypted archive + `None`
 /// is a reasoned error). Refuses a non-empty profile — the UI wipes first, then re-calls.

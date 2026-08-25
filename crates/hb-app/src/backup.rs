@@ -91,6 +91,12 @@ pub fn backup_inner(store: &DataStore, mode: BackupMode<'_>) -> Result<Vec<u8>, 
 /// Decrypt → sanitize → unpack an archive into `store`'s directory, re-wrapping the secrets under
 /// the local at-rest scheme. `passphrase` is `Option` because the archive header is self-describing
 /// (an encrypted archive + `None` is a reasoned `Err`). Refuses a non-empty target.
+///
+/// **Atomic (QURATOR-126 #15):** the archive is extracted *in full* into a staging directory
+/// beside the target; only a complete, error-free extraction is committed by renaming it into
+/// place. A failure at any entry — truncated tail, hostile path, oversize entry, invalid identity
+/// JSON — leaves the target exactly as it was, never a half-materialized store. INV-8: data lands
+/// deliberately or not at all.
 pub fn restore_inner(
     store: &DataStore,
     archive: &[u8],
@@ -99,6 +105,44 @@ pub fn restore_inner(
     if target_is_occupied(store) {
         return Err(BackupError::TargetNotEmpty);
     }
+    let base = store.base_dir().to_path_buf();
+
+    // Stage BESIDE the target so the commit is a same-filesystem rename, never EXDEV.
+    let parent = base.parent().ok_or_else(|| {
+        BackupError::Archive("profile dir has no parent to stage a restore beside".into())
+    })?;
+    let stage = tempfile::Builder::new()
+        .prefix(".hb-restore-stage-")
+        .tempdir_in(parent)?;
+    let stage_store = DataStore::new(stage.path().to_path_buf());
+
+    // Any extraction error discards staging (on drop) and returns before the target is touched.
+    extract_archive(&stage_store, archive, passphrase)?;
+    commit_stage(stage.path(), &base)
+}
+
+/// Fully validate an archive WITHOUT touching any datastore (QURATOR-126 #15): run the exact
+/// [`extract_archive`] production path — Argon2id KDF, AEAD decrypt, every-entry sanitize + tar-bomb
+/// caps, identity JSON parse + at-rest re-wrap — into a throwaway directory. `Ok(())` is the
+/// promise that restoring this file with this passphrase into a wiped profile will succeed; every
+/// failure a restore can hit is hit here first, at zero risk to live data. This replaces a 72-byte
+/// header sniff as the pre-wipe gate.
+pub fn validate_inner(archive: &[u8], passphrase: Option<&str>) -> Result<(), BackupError> {
+    let scratch = tempfile::tempdir()?;
+    let scratch_store = DataStore::new(scratch.path().to_path_buf());
+    extract_archive(&scratch_store, archive, passphrase)
+}
+
+/// The ONE decrypt-and-extract core, shared by [`restore_inner`] (into staging) and
+/// [`validate_inner`] (into a throwaway dir): decrypt, sanitize, and write every entry into
+/// `store`'s (empty) base dir, re-wrapping the identity under the local at-rest scheme. There is
+/// deliberately no second, validation-only parser — validation must fail exactly where restore
+/// would.
+fn extract_archive(
+    store: &DataStore,
+    archive: &[u8],
+    passphrase: Option<&str>,
+) -> Result<(), BackupError> {
     if !hb_core::backup::is_encrypted_backup(archive)? && passphrase.is_some() {
         tracing::debug!("plaintext backup: ignoring the supplied passphrase (header is authoritative)");
     }
@@ -188,6 +232,47 @@ pub fn restore_inner(
     }
     Ok(())
 }
+
+/// Move a fully-extracted staging dir into `base` — the commit step of atomic restore. The target
+/// was verified empty up front, but it may have acquired content since (or been materialized as a
+/// file); re-check and refuse rather than clobber. An existing-but-EMPTY dir is removed first
+/// (`rename` onto a directory is refused on Windows); it holds no data, so losing it costs
+/// nothing. The final `rename` is atomic on the same filesystem: the target is either untouched
+/// or the complete store — no intermediate state a crash can leave behind (INV-8).
+fn commit_stage(stage: &Path, base: &Path) -> Result<(), BackupError> {
+    if target_path_is_occupied(base) {
+        return Err(BackupError::TargetNotEmpty);
+    }
+    if base.exists() {
+        // Verified empty above; rmdir cannot lose data. Failure means it wasn't empty after all.
+        std::fs::remove_dir(base).map_err(|e| {
+            BackupError::Archive(format!("target '{}' is not empty: {e}", base.display()))
+        })?;
+    }
+    if let Err(e) = std::fs::rename(stage, base) {
+        return Err(BackupError::Archive(format!(
+            "cannot commit restore into '{}': {e}",
+            base.display()
+        )));
+    }
+    Ok(())
+}
+
+/// [`target_is_occupied`] for a bare path (staging uses a fresh `DataStore`, so the store-flavored
+/// helper can't be reused at commit time). Same semantics: a missing dir or an existing-but-EMPTY
+/// dir is free; anything else — entries, a file, a symlink — is occupied.
+fn target_path_is_occupied(base: &Path) -> bool {
+    match std::fs::symlink_metadata(base) {
+        Err(_) => false, // does not exist → free
+        Ok(md) if !md.is_dir() => true, // a file or symlink occupies the path
+        Ok(_) => match std::fs::read_dir(base) {
+            Ok(mut entries) => entries.next().is_some(),
+            Err(_) => true, // unreadable → treat as occupied, never clobber blind
+        },
+    }
+}
+
+// --- Helpers -------------------------------------------------------------------------------
 
 // --- Helpers --------------------------------------------------------------------------------
 
@@ -332,6 +417,113 @@ mod tests {
         (dir, store)
     }
 
+    // -- QURATOR-126 #15: pre-wipe validation + atomic restore ---------------------------------
+
+    #[test]
+    fn validate_inner_accepts_good_archive_without_touching_a_store() {
+        let (_d1, src, _npub) = store_with_fake_profile();
+        let archive = backup_inner(&src, BackupMode::Passphrase(PASS)).unwrap();
+
+        // A live store holding REAL data: validation must leave it byte-identical.
+        let (_d2, dst, _n2) = store_with_fake_profile();
+        let before: Vec<_> = std::fs::read(dst.identity_path()).unwrap();
+        let before_coll = std::fs::read(dst.base_dir().join("collections/films.draft.json")).unwrap();
+        validate_inner(&archive, Some(PASS)).unwrap();
+        assert_eq!(std::fs::read(dst.identity_path()).unwrap(), before);
+        assert_eq!(
+            std::fs::read(dst.base_dir().join("collections/films.draft.json")).unwrap(),
+            before_coll,
+            "validation wrote nothing to the datastore"
+        );
+    }
+
+    #[test]
+    fn validate_inner_rejects_wrong_passphrase() {
+        let (_d1, src, _npub) = store_with_fake_profile();
+        let archive = backup_inner(&src, BackupMode::Passphrase(PASS)).unwrap();
+        let err = validate_inner(&archive, Some("a-typo-in-the-passphrase")).unwrap_err();
+        assert!(matches!(err, BackupError::Crypto(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn validate_inner_rejects_truncated_archive() {
+        let (_d1, src, _npub) = store_with_fake_profile();
+        let archive = backup_inner(&src, BackupMode::Passphrase(PASS)).unwrap();
+        let cut = &archive[..archive.len() / 2];
+        let err = validate_inner(cut, Some(PASS)).unwrap_err();
+        assert!(!matches!(err, BackupError::TargetNotEmpty), "got {err:?}");
+    }
+
+    #[test]
+    fn validate_inner_goes_through_the_tar_guards() {
+        // The hostile-entry guards (traversal/link/bomb/sparse) live in the shared extraction core;
+        // validation must reject the same archives restore does, not a softer header sniff.
+        // (`tar_with_entry` already seals with Plaintext mode; the traversal one forges the name
+        // into the header bytes because the `tar` crate sanitizes `..` on write.)
+        for hostile in [
+            tar_with_forged_name(b"../escape.txt"),
+            tar_with_entry("lnk", tar::EntryType::Symlink, Some("target")),
+            tar_with_entry("hlk", tar::EntryType::Link, Some("target")),
+        ] {
+            assert!(validate_inner(&hostile, None).is_err(), "must reject hostile entry");
+        }
+    }
+
+    #[test]
+    fn validate_inner_rejects_invalid_identity_json() {
+        // A corrupt identity entry must fail VALIDATION (pre-wipe), not first at restore time.
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(9);
+        h.set_mode(0o600);
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_cksum();
+        b.append_data(&mut h, IDENTITY_ENTRY, &b"not{json"[..]).unwrap();
+        let tar_bytes = b.into_inner().unwrap();
+        let archive = encrypt_backup(BackupMode::Plaintext, &tar_bytes).unwrap();
+        assert!(validate_inner(&archive, None).is_err());
+    }
+
+    #[test]
+    fn restore_failure_mid_archive_leaves_target_untouched() {
+        // THE atomicity pin: entry #1 is fine, a LATER entry is hostile — the old code wrote entry
+        // #1 directly into the target before erroring on #2. After the fix the target must hold
+        // exactly its pre-restore state: empty (the UI wipes first), with entry #1 absent.
+        let (_d1, _src, _npub) = store_with_fake_profile();
+        let mut b = tar::Builder::new(Vec::new());
+        append_bytes(&mut b, "collections/first.json", b"{\"ok\":true}").unwrap();
+        // Entry #2 forges a traversal name straight into the header (the builder sanitizes `..`).
+        let mut h = tar::Header::new_gnu();
+        h.set_size(3);
+        h.set_mode(0o600);
+        h.set_entry_type(tar::EntryType::Regular);
+        {
+            let raw = h.as_mut_bytes();
+            let name = b"../escape";
+            raw[..name.len()].copy_from_slice(name);
+        }
+        h.set_cksum();
+        b.append(&h, &b"bad"[..]).unwrap();
+        let tar_bytes = b.into_inner().unwrap();
+        let archive = encrypt_backup(BackupMode::Plaintext, &tar_bytes).unwrap();
+
+        let (_d2, dst) = empty_store();
+        // A pre-existing file the failed restore must never touch: it sits in the parent (the
+        // target itself must be empty for restore to run at all).
+        let outside = dst.base_dir().parent().unwrap().join("outside.txt");
+        std::fs::write(&outside, b"pre-restore state").unwrap();
+        assert!(restore_inner(&dst, &archive, None).is_err());
+
+        let leftover: Vec<String> = std::fs::read_dir(dst.base_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(leftover.is_empty(),
+            "a mid-archive failure must not leave a half-materialized store: {leftover:?}");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"pre-restore state");
+    }
+
     #[test]
     fn backup_inner_then_restore_inner_roundtrips_whole_dir() {
         let (_d1, src, npub) = store_with_fake_profile();
@@ -469,6 +661,24 @@ mod tests {
         let (_d2, dst) = empty_store();
         let err = restore_inner(&dst, &archive, None).unwrap_err();
         assert!(matches!(err, BackupError::Archive(_)), "got {err:?}");
+    }
+
+    /// A sealed archive whose one entry carries `name` forged straight into the tar header — the
+    /// `tar` crate sanitizes `..` on *write*, so an attacker-crafted traversal name must be laid
+    /// into the raw header bytes (same trick as `restore_rejects_tar_path_traversal_entries`).
+    fn tar_with_forged_name(name: &[u8]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(0);
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o600);
+        {
+            let raw = h.as_mut_bytes();
+            raw[..name.len()].copy_from_slice(name);
+        }
+        h.set_cksum();
+        b.append(&h, std::io::empty()).unwrap();
+        encrypt_backup(BackupMode::Plaintext, &b.into_inner().unwrap()).unwrap()
     }
 
     fn tar_with_entry(name: &str, etype: tar::EntryType, link_target: Option<&str>) -> Vec<u8> {
