@@ -3,11 +3,12 @@
 //! `fetch_full_listing_from` / `fetch_full_listing_if_current`) against two real relays —
 //! `relay[0]` = a public relay, `relay[1]` = the big relay.
 //!
-//! Proves the three W2 properties end-to-end:
+//! Proves the three W2 properties end-to-end (post audit #25 / QURATOR-123, the gate compares the
+//! family's `teaser_fingerprint` — the teaser digest — against the teaser's own value):
 //!   BIG1 — the family publishes to the big relay **only** (never leaks to the public relay, INV-5),
 //!          fetches back exclusively from the big relay, and restitches the complete tree; a
-//!          fingerprint mismatch keeps the teaser.
-//!   BIG2 — a **stale** big-relay snapshot (older fingerprint than the teaser's) does NOT supersede
+//!          digest mismatch keeps the teaser.
+//!   BIG2 — a **stale** big-relay snapshot (older digest than the teaser's) does NOT supersede
 //!          the teaser (M16 headline failure mode #1).
 //!
 //! Needs a 2nd `--relay`; skipped with one relay.
@@ -44,13 +45,17 @@ fn bk(seed: u8) -> [u8; 32] {
 }
 
 /// A full listing of `n` padded entries carrying `snapshot_fingerprint = fp` — big enough to split
-/// into an index + several content parts under the 40 KiB per-part budget.
-fn full_listing(slug: &str, n: usize, fp: &str) -> String {
+/// into an index + several content parts under the 40 KiB per-part budget. Post audit #25
+/// (QURATOR-123) the full family additionally carries `teaser_fingerprint = tf` — the digest the
+/// truncated teaser of the same publish carries (visible entries + elided count) — which is the
+/// value the browse-side gate compares.
+fn full_listing(slug: &str, n: usize, fp: &str, tf: &str) -> String {
     let entries: Vec<Value> = (0..n)
         .map(|i| serde_json::json!({ "name": format!("title-{i:05}-padding-padding-padding-xx") }))
         .collect();
     serde_json::json!({
-        "slug": slug, "content_types": ["video"], "snapshot_fingerprint": fp, "entries": entries,
+        "slug": slug, "content_types": ["video"],
+        "snapshot_fingerprint": fp, "teaser_fingerprint": tf, "entries": entries,
     })
     .to_string()
 }
@@ -60,7 +65,7 @@ async fn big1(ctx: &Ctx) -> Result<()> {
     let key = bk(21);
     let slug = "vault";
     let n = 1300;
-    let full = full_listing(slug, n, FP);
+    let full = full_listing(slug, n, FP, FP);
     let big = ctx.relays[1].clone();
 
     // Full family → the big relay (relay[1]) ONLY, via publish_to targeting.
@@ -77,7 +82,8 @@ async fn big1(ctx: &Ctx) -> Result<()> {
     cpub.disconnect().await;
     settle().await;
 
-    // A holder browses: fetch the full family from the big relay, gated on the teaser's fingerprint.
+    // A holder browses: fetch the full family from the big relay, gated on the teaser's digest.
+    // Post audit #25 the gate reads `teaser_fingerprint`, which this fixture carries as FP.
     let browser = ctx.connect(&Identity::generate()).await?;
     let current = fetch_full_listing_if_current(
         &browser,
@@ -127,6 +133,8 @@ async fn big1(ctx: &Ctx) -> Result<()> {
 async fn big2(ctx: &Ctx) -> Result<()> {
     // Stale big relay: the family carries an OLDER fingerprint than the (newer) teaser the browser
     // knows. The gate must keep the teaser — never serve the stale full tree (M16 failure mode #1).
+    // Post audit #25 the compared value is the family's `teaser_fingerprint` (FP_OLD here) vs the
+    // teaser's (FP).
     let owner = Identity::generate();
     let key = bk(22);
     let slug = "restale";
@@ -138,7 +146,7 @@ async fn big2(ctx: &Ctx) -> Result<()> {
         &owner,
         slug,
         &key,
-        &full_listing(slug, 1300, FP_OLD),
+        &full_listing(slug, 1300, FP_OLD, FP_OLD),
         40_000,
         std::slice::from_ref(&big),
     )
