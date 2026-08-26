@@ -15,7 +15,9 @@ hb-core    = { path = "../hb-core" }
 nostr-sdk  = { workspace = true }
 # Direct `nostr` dep pinned to hb-core's version, with the protocol features this crate needs
 # (NIP-44 listing crypto, NIP-59/17 gift-wrap). Unifies with hb-core's nostr build.
-nostr      = { version = "=0.43.1", features = ["nip44", "nip59"] }
+nostr      = { version = "=0.44.8", features = ["nip44", "nip59"] }
+# nostr 0.44 dropped `hex` from its prelude re-exports; hb-net hashes listing slugs directly.
+hex        = { workspace = true }
 # M11 Topics: the join-request DM body is a small typed struct (derive Serialize/Deserialize).
 serde      = { workspace = true }
 serde_json = { workspace = true }

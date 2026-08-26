@@ -45,7 +45,7 @@ pub async fn unwrap_dm(identity: &Identity, gift_wrap: &Event) -> Result<DirectM
     Ok(DirectMessage {
         sender: unwrapped.sender,
         content: unwrapped.rumor.content,
-        created_at: unwrapped.rumor.created_at.as_u64(),
+        created_at: unwrapped.rumor.created_at.as_secs(),
     })
 }
 
@@ -84,10 +84,10 @@ mod tests {
         let wrap = wrap_dm(&alice, &bob.public_key(), "when?").await.unwrap();
         let dm = unwrap_dm(&bob, &wrap).await.unwrap();
         assert!(
-            dm.created_at >= wrap.created_at.as_u64(),
+            dm.created_at >= wrap.created_at.as_secs(),
             "inner send time {} must not predate the randomised-past wrap time {}",
             dm.created_at,
-            wrap.created_at.as_u64()
+            wrap.created_at.as_secs()
         );
     }
 

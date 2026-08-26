@@ -95,7 +95,7 @@ pub fn verify_binding(event: &Event, expected: &PublicKey, now: u64) -> Result<B
     check_schema(schema)?;
     // (5) Validity window — explicit expiry, bounded so a misconfigured caller can't mint a beacon
     //     that lives for years.
-    let created = event.created_at.as_u64();
+    let created = event.created_at.as_secs();
     if created > now.saturating_add(FUTURE_SKEW_SECS) {
         return Err(HbError::BindingNotYetValid);
     }

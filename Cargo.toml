@@ -30,5 +30,5 @@ unicode-normalization = "0.1"
 
 # --- v0.9 Nostr relay client (M2). nostr-sdk default features are EMPTY (no NIPs), so the
 #     NIP-44/NIP-59 features must be requested explicitly. Pinned to the M0-verified surface
-#     (=0.43.0) alongside hb-core's nostr =0.43.1 so a silent minor bump can't break interop. ---
-nostr-sdk   = { version = "=0.43.0", default-features = false, features = ["nip44", "nip59"] }
+#     (=0.44.1) alongside hb-core's nostr =0.44.8 so a silent minor bump can't break interop. ---
+nostr-sdk   = { version = "=0.44.1", default-features = false, features = ["nip44", "nip59"] }

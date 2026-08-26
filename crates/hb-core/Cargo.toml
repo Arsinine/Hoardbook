@@ -10,11 +10,11 @@ thiserror  = { workspace = true }
 chrono     = { workspace = true }
 hex        = { workspace = true }
 
-# --- v0.9 Nostr core (M1). Pinned to the M0-verified surface (=0.43.1) so a silent
+# --- v0.9 Nostr core (M1). Pinned to the M0-verified surface (=0.44.8) so a silent
 #     minor bump can't break the interop suite. bech32 0.11 = the `Hrp`/encode/decode API.
 #     nip44 = the symmetric listing/CEK crypto; nip59 = the NIP-17/59 seal + gift-wrap
 #     (kind 1059) the M10 private-collection seal reuses (never re-implemented). ---
-nostr             = { version = "=0.43.1", features = ["nip44", "nip59"] }
+nostr             = { version = "=0.44.8", features = ["nip44", "nip59"] }
 bech32            = "0.11"
 
 # --- M16 W1 manifest envelope: a raw BIP-340 Schnorr signature over the full-listing manifest, so

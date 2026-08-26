@@ -470,7 +470,7 @@ async fn verify_peer_online(client: &RelayClient, peer: &Identity) -> Result<(),
         .await
         .map_err(|e| format!("verify_peer_online fetch: {e}"))?;
     let newest = select_newest_by_created_at(events).ok_or_else(|| "no presence for peer".to_string())?;
-    let created = newest.created_at.as_u64();
+    let created = newest.created_at.as_secs();
     if unix_now().saturating_sub(created) > ONLINE_WINDOW_SECS {
         return Err(format!("peer's presence is not within the online window (age={}s)", unix_now().saturating_sub(created)));
     }

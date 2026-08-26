@@ -15,7 +15,7 @@ path = "src/main.rs"
 hb-core    = { path = "../hb-core" }
 hb-net     = { path = "../hb-net" }
 nostr-sdk  = { workspace = true }
-nostr      = { version = "=0.43.1", features = ["nip44", "nip59"] }
+nostr      = { version = "=0.44.8", features = ["nip44", "nip59"] }
 tokio      = { workspace = true }
 anyhow     = { workspace = true }
 serde_json = { workspace = true }

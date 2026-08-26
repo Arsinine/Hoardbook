@@ -205,7 +205,7 @@ async fn n6(ctx: &Ctx) -> Result<()> {
     client.disconnect().await;
     ensure!(got.len() == 1, "expected 1 presence event, got {}", got.len());
     verify_binding(&got[0], &id.public_key(), now)?; // signature + author-pin + window verify
-    ensure!(is_online(got[0].created_at.as_u64(), now), "fresh presence read as offline");
+    ensure!(is_online(got[0].created_at.as_secs(), now), "fresh presence read as offline");
 
     // A 15-minute-old presence (different peer, so it doesn't replace the fresh one) reads
     // offline, while its binding still verifies.
@@ -219,7 +219,7 @@ async fn n6(ctx: &Ctx) -> Result<()> {
         .await?;
     c2.disconnect().await;
     ensure!(got2.len() == 1, "expected 1 stale presence, got {}", got2.len());
-    ensure!(!is_online(got2[0].created_at.as_u64(), now), "15-min-old presence read as online");
+    ensure!(!is_online(got2[0].created_at.as_secs(), now), "15-min-old presence read as online");
     verify_binding(&got2[0], &id2.public_key(), now)?; // binding still valid, just stale
     Ok(())
 }

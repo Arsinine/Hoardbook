@@ -223,7 +223,7 @@ pub fn open_private_listing(me: &Identity, wrap: &Event) -> Result<OpenedPrivate
     // (8) Decrypt the body under the CEK at its declared version.
     let listing_json = decrypt_with_cek(&cek, cek_wrap.kdf_v, &parsed.body)?;
 
-    Ok(OpenedPrivate { listing_json, inner_author, created_at: rumor.created_at.as_u64() })
+    Ok(OpenedPrivate { listing_json, inner_author, created_at: rumor.created_at.as_secs() })
 }
 
 /// Read a custom named tag from a rumor's `Tags` as a `u8` (None if absent or malformed). The
