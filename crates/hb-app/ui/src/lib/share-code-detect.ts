@@ -40,6 +40,21 @@ const MAX_CODE_LEN = 120;
  *  truncation could manufacture a code-shaped prefix an attacker positions at the cut). */
 const MAX_TEXT_LEN = 8192;
 
+/** Upper bound on the TOTAL candidate strings ONE message may yield (security audit #22, residual
+ *  half). MAX_TEXT_LEN alone does not close the finding: an 8,192-char message still fits ~39
+ *  over-long bech32 tokens (each `npub1` + 200 chars + separator = 205), and every over-long token
+ *  runs the slice-recovery loop 63× (slices 120→58, each passing the cheap gate) — ~2,500
+ *  candidates, each an awaited `validate_share_code` IPC round-trip in the chat route. A real
+ *  message carries ONE share code (spec W3: first VALID candidate per message gets the card), so a
+ *  small cap costs nothing legitimate; 16 is the finding's own suggested figure and still leaves
+ *  room for a prose message with several codes. Hitting the cap DEGRADES BY REJECTING, never by
+ *  truncating into a guess — candidates past the cap are simply not considered (no card renders),
+ *  matching MAX_TEXT_LEN's stance: a cap that instead kept scanning with re-cut slices could
+ *  manufacture a code-shaped prefix an attacker positions at the cut. Accepted cost: an over-long
+ *  token whose valid slice sits deeper than the cap (e.g. two abutting codes whose back code is
+ *  the checksum-valid one) no longer recovers — it renders as plain text. */
+const MAX_CANDIDATES = 16;
+
 /** The greedy token a candidate scan considers: an `hbk1`/`npub1` prefix + a run of bech32 chars. */
 const TOKEN_RE = /(?:hbk1|npub1)[0-9a-z]+/g;
 
@@ -66,46 +81,53 @@ export function extractShareCodeCandidate(
 	text: string,
 	validate: (code: string) => boolean,
 ): string | null {
-	if (text.length > MAX_TEXT_LEN) return null; // audit #22: reject, never truncate
+	// Walk candidates in order of appearance; return the first one the caller's checksum validation
+	// accepts. A later invalid candidate never shadows an earlier valid one, and an earlier INVALID
+	// candidate is skipped (so "first VALID" holds, not "first"). The walk yields only strings that
+	// passed the cheap gate, so `validate` is never handed noise.
+	for (const raw of boundedCandidates(text)) {
+		if (validate(raw)) return raw;
+	}
+	return null;
+}
+
+/** Every candidate string `extractShareCodeCandidate` may checksum-test for `text`, in test order,
+ *  capped at MAX_CANDIDATES. The route pre-validates exactly these (raw tokens AND the
+ *  over-long-token prefix slices) so the slice-recovery path in `extractShareCodeCandidate` actually
+ *  has verdicts to consult — the two exports share one walk, so that set cannot drift. */
+export function shareCodeCandidates(text: string): string[] {
+	return [...boundedCandidates(text)];
+}
+
+/** The bounded candidate walk both exported scanners run (single-sourced — the route pre-validates
+ *  `shareCodeCandidates`' output and `extractShareCodeCandidate` consults those verdicts, so a
+ *  divergent pair would have the recovery path consulting verdicts that were never computed).
+ *  Yields only strings that passed the cheap length+charset gate, in the order the scanners test
+ *  them: in-window raw tokens as matched; an over-long token's plausible-length prefix slices,
+ *  longest first (trim trailing bech32 chars until the slice is within the window — a token
+ *  greedily consumed past a code's real end, e.g. two codes run together, is trimmed back before
+ *  the checksum decides). Over-long text yields NOTHING (audit #22: reject, never truncate), and
+ *  the walk STOPS at MAX_CANDIDATES — later candidates are dropped entire, not re-cut to fit. */
+function* boundedCandidates(text: string): Generator<string> {
+	if (text.length > MAX_TEXT_LEN) return; // audit #22: reject, never truncate
 	const matches = text.match(TOKEN_RE);
-	if (!matches) return null;
-	// Walk candidates in order of appearance; return the first one that passes the length/charset
-	// gate AND the caller's checksum validation. A later invalid candidate never shadows an earlier
-	// valid one, and an earlier INVALID candidate is skipped (so "first VALID" holds, not "first").
+	if (!matches) return;
+	let count = 0;
 	for (const raw of matches) {
-		// Trim trailing bech32-charset chars until the slice is within the length window — a token
-		// greedily consumed past a code's real end (e.g. two codes run together) is trimmed to its
-		// plausible window before the checksum decides. If no slice in the window validates, skip.
 		if (raw.length <= MAX_CODE_LEN) {
-			if (isShareCodeCandidate(raw) && validate(raw)) return raw;
+			if (isShareCodeCandidate(raw)) {
+				yield raw;
+				if (++count >= MAX_CANDIDATES) return;
+			}
 			continue;
 		}
 		// Over-long greedy token: try the plausible-length prefixes (rare; mainly two abutting codes).
 		for (let len = MAX_CODE_LEN; len >= MIN_CODE_LEN; len--) {
 			const slice = raw.slice(0, len);
-			if (isShareCodeCandidate(slice) && validate(slice)) return slice;
+			if (isShareCodeCandidate(slice)) {
+				yield slice;
+				if (++count >= MAX_CANDIDATES) return;
+			}
 		}
 	}
-	return null;
-}
-
-/** Every candidate string `extractShareCodeCandidate` may checksum-test for `text`, in test order.
- *  The route pre-validates exactly these (raw tokens AND the over-long-token prefix slices) so the
- *  slice-recovery path in `extractShareCodeCandidate` actually has verdicts to consult. */
-export function shareCodeCandidates(text: string): string[] {
-	if (text.length > MAX_TEXT_LEN) return []; // audit #22: reject, never truncate
-	const matches = text.match(TOKEN_RE);
-	if (!matches) return [];
-	const out: string[] = [];
-	for (const raw of matches) {
-		if (raw.length <= MAX_CODE_LEN) {
-			if (isShareCodeCandidate(raw)) out.push(raw);
-			continue;
-		}
-		for (let len = MAX_CODE_LEN; len >= MIN_CODE_LEN; len--) {
-			const slice = raw.slice(0, len);
-			if (isShareCodeCandidate(slice)) out.push(slice);
-		}
-	}
-	return out;
 }

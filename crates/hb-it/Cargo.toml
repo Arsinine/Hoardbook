@@ -22,3 +22,6 @@ serde_json = { workspace = true }
 # Suite MAN builds its fixtures from real `hb_core::Collection` values rather than hand-written JSON
 # (Codex 2026-07-30), and `Collection::last_updated` is a `chrono::DateTime<Utc>`.
 chrono     = { workspace = true }
+# QURATOR-127: without a subscriber, hb-net's browse-lock `tracing::warn!` is a no-op and a PUB4
+# failure is silent. This installs one on stderr (HB_IT_LOG overridable).
+tracing-subscriber = { workspace = true }
