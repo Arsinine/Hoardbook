@@ -101,6 +101,70 @@ describe('extractShareCodeCandidate — first VALID candidate per message', () =
 	});
 });
 
+describe('security audit #22 residual — the candidate cap (bounded set, both scanners agree)', () => {
+		const alwaysValid = (_: string) => true;
+		// MAX_TEXT_LEN alone does not close #22: an 8,192-char message still fits ~39 over-long
+		// bech32 tokens and each emits 63 slices — ~2,500 awaited validate IPC calls in the route.
+		// These pin the residual fix: a hard cap on total candidates per message, enforced on the
+		// ONE walk both scanners share, degrading by REJECTION (later candidates dropped entire,
+		// no card) — never by truncating a token into a code-shaped guess.
+		const hostileTokens = (n: number, tokenLen: number) =>
+			('npub1' + 'a'.repeat(tokenLen - 4) + ' ').repeat(n);
+
+		it('shareCodeCandidates caps total candidates for adversarial many-token input', () => {
+			// 20 over-long tokens × 63 slices each = 1,260 unbounded candidates, under MAX_TEXT_LEN.
+			const hostile = hostileTokens(20, 200);
+			expect(hostile.length).toBeLessThanOrEqual(8192);
+			const candidates = shareCodeCandidates(hostile);
+			expect(candidates.length).toBe(16);
+			// Every returned candidate is a whole, in-window slice — never a re-cut fragment.
+			for (const c of candidates) {
+				expect(c.length).toBeGreaterThanOrEqual(58);
+				expect(c.length).toBeLessThanOrEqual(120);
+				expect(c.startsWith('npub1')).toBe(true);
+			}
+		});
+
+		it('extractShareCodeCandidate checksum-tests EXACTLY the set shareCodeCandidates returned', () => {
+			// The route pre-validates `shareCodeCandidates(text)` and extract consults those verdicts —
+			// a candidate tested by one and not the other is the drift fault shape (verdicts consulted
+			// that were never computed, or computed and never consulted). Pin the equivalence on the
+			// adversarial input.
+			const hostile = hostileTokens(20, 200);
+			const expected = shareCodeCandidates(hostile);
+			const seen: string[] = [];
+			const validate = (c: string) => { seen.push(c); return false; };
+			expect(extractShareCodeCandidate(hostile, validate)).toBeNull();
+			expect(seen).toEqual(expected); // same strings, same order, same cap
+		});
+
+		it('validate is called at most MAX_CANDIDATES times for a single message (the IPC bound)', () => {
+			const hostile = hostileTokens(20, 200);
+			const seen: string[] = [];
+			const validate = (c: string) => { seen.push(c); return false; };
+			extractShareCodeCandidate(hostile, validate);
+			expect(seen.length).toBe(16);
+		});
+
+		it('a second over-long token past the cap is dropped ENTIRE, not sliced to fit the cap', () => {
+			// Reject-don't-truncate at token granularity: token 1 (63 slices) fills the cap at slice
+			// 16; token 2 contributes nothing. A hypothetical "keep scanning but re-cut" design would
+			// manufacture a shorter code-shaped prefix of token 2 — this pins that it does not.
+			const token1 = 'npub1' + 'a'.repeat(196); // 200 chars > MAX_CODE_LEN → 63 slices
+			const token2 = 'npub1' + 'q'.repeat(196);
+			const msg = `${token1} ${token2}`;
+			const candidates = shareCodeCandidates(msg);
+			expect(candidates.length).toBe(16);
+			for (const c of candidates) expect(c.startsWith('npub1a')).toBe(true); // all from token1
+		});
+
+		it('the happy path is untouched: one real code in prose still renders the card', () => {
+			const msg = `Here's my code: ${GOLDEN_NPUB_A} — ping me!`;
+			expect(extractShareCodeCandidate(msg, alwaysValid)).toBe(GOLDEN_NPUB_A);
+			expect(shareCodeCandidates(msg)).toEqual([GOLDEN_NPUB_A]);
+		});
+});
+
 describe('shareCodeCandidates — over-long token slice recovery (two codes, no separator)', () => {
 	// Fix #7: two valid codes pasted with no separator are greedily consumed as ONE over-long token.
 	// `extractShareCodeCandidate` trims it back to a plausible-length prefix slice, but the route only

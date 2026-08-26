@@ -98,6 +98,37 @@ fn stamp_big_relay_url(listing_json: &str, big_relay_url: &str) -> Result<String
     serde_json::to_string(&v).map_err(cmd_err)
 }
 
+/// Stamp the **teaser digest** (`teaser_fingerprint`) into a full listing's metadata (audit #25 /
+/// QURATOR-123): the digest the truncated teaser of this exact listing carries — over the VISIBLE
+/// entries + the elided count, as re-derived by `hb_net::truncate_listing` itself. This is the one
+/// value a full carrier (the big-relay family, the `.hbmanifest` plaintext) can still share with the
+/// teaser: the teaser may no longer carry a digest of the content truncation hides from it, so the
+/// carriers carry the teaser's digest instead of the reverse.
+///
+/// Derived by running the SAME `truncate_listing` call the teaser publish performs, on the SAME
+/// bytes, and reading the digest back out of the resulting artifact (not a re-implementation, so
+/// the two cannot drift). A listing that fits the budget whole is returned **unchanged** — nothing
+/// is hidden, the teaser carries the full-tree `snapshot_fingerprint`, and the byte-identical
+/// untruncated publish survives. Pure.
+fn stamp_teaser_fingerprint(listing_json: &str) -> Result<String, String> {
+    let t = hb_net::truncate_listing(listing_json, LISTING_MAX_BYTES).map_err(cmd_err)?;
+    if !t.truncated {
+        return Ok(listing_json.to_string());
+    }
+    let v: serde_json::Value = serde_json::from_str(&t.json).map_err(cmd_err)?;
+    let Some(fp) = v.get("snapshot_fingerprint").and_then(|f| f.as_str()) else {
+        // `truncate_listing` drops an underivable digest (its kept entries did not decode as a
+        // `DirectoryItem` tree) — there is no teaser digest to stamp, and none is needed: the
+        // browse-side gates read `None` and keep the teaser.
+        return Ok(listing_json.to_string());
+    };
+    let mut out: serde_json::Value = serde_json::from_str(listing_json).map_err(cmd_err)?;
+    if let serde_json::Value::Object(ref mut map) = out {
+        map.insert("teaser_fingerprint".into(), serde_json::Value::String(fp.to_string()));
+    }
+    serde_json::to_string(&out).map_err(cmd_err)
+}
+
 /// Collection with publication status, returned to the frontend.
 #[derive(Debug, Clone, Serialize)]
 pub struct CollectionEntry {
@@ -468,9 +499,16 @@ pub(crate) fn collection_to_listing_json(mut col: Collection) -> Result<String, 
         // M16 W3: stamp the full-tree snapshot fingerprint into the listing metadata so it rides —
         // through `truncate_listing` (the paywall teaser) and `split_listing` (the big-relay full
         // family, W2) — into `RenderedListing.meta`, where the browse-side staleness gate reads it.
-        // An order-independent content hash of the whole tree: the teaser and the family carry the
-        // *same* value, which is exactly what lets a browser confirm the family is the full version
-        // of what the teaser previews.
+        // An order-independent content hash of the whole tree.
+        //
+        // Audit #25 / QURATOR-123 (owner ruling 2026-08-25): the truncated teaser must NOT carry
+        // this value — a digest of the exact content the truncation hides is an offline
+        // confirm-or-deny oracle. `hb_net::truncate_listing` (the single choke point every truncated
+        // teaser passes through) re-stamps the field to `hb_core::teaser_fingerprint` (visible
+        // entries + elided count), so this stamp survives verbatim only where nothing is hidden: an
+        // untruncated listing (identical by construction — `teaser_fingerprint(_, 0)` equals this)
+        // and the full carriers (the big-relay family and the `.hbmanifest`, whose own gates use the
+        // `teaser_fingerprint` stamped below).
         let fp = hb_core::snapshot_fingerprint(&col.listing);
         map.insert("snapshot_fingerprint".into(), serde_json::Value::String(fp.0));
     }
@@ -599,7 +637,11 @@ pub(crate) async fn publish_collection_inner(
     let will_truncate =
         hb_net::truncate_listing(&listing_json, LISTING_MAX_BYTES).map_err(cmd_err)?.truncated;
     let listing_json = if will_truncate {
-        stamp_big_relay_url(&listing_json, &big_relay_url)?
+        // Order matters for the teaser digest: stamp the URL first, then derive `teaser_fingerprint`
+        // from the SAME final bytes the teaser publish will truncate (the URL adds meta bytes, which
+        // moves the entries budget and therefore what is visible). The teaser itself is re-stamped
+        // inside `truncate_listing` regardless.
+        stamp_teaser_fingerprint(&stamp_big_relay_url(&listing_json, &big_relay_url)?)?
     } else {
         listing_json
     };
@@ -806,10 +848,21 @@ pub(crate) fn build_slug_manifest(
             "At least one content type is required before exporting a collection manifest.".into()
         );
     }
-    // Fingerprint the tree before the collection is consumed below; same bytes and fingerprint the
-    // publish path derives (parity with the teaser), no re-scan.
-    let fingerprint = hb_core::snapshot_fingerprint(&col.listing).0;
-    let plaintext = collection_to_listing_json(col)?;
+    // Audit #25 / QURATOR-123: the envelope's digest must be the one the truncated teaser carries
+    // (visible entries + elided count), because the browse side gates staleness against the teaser
+    // the user is looking at. Derive it by running the SAME truncation the teaser publish performs
+    // on the SAME bytes, then reading the digest out of the artifact — not by re-implementing the
+    // derivation. A listing that fits the budget whole carries the full-tree digest (nothing is
+    // hidden), which is what the teaser carries then too, so parity holds on both branches.
+    let plaintext = collection_to_listing_json(col.clone())?;
+    let teaser = hb_net::truncate_listing(&plaintext, LISTING_MAX_BYTES).map_err(cmd_err)?;
+    let fingerprint = serde_json::from_str::<serde_json::Value>(&teaser.json)
+        .ok()
+        .and_then(|v| v.get("snapshot_fingerprint").and_then(|f| f.as_str()).map(str::to_string))
+        .unwrap_or_else(|| hb_core::snapshot_fingerprint(&col.listing).0);
+    // The sealed plaintext is the full tree with the teaser digest stamped beside it, so the
+    // imported family's meta carries the same value the envelope's signed digest names.
+    let plaintext = stamp_teaser_fingerprint(&plaintext)?;
     // Chunk the listing exactly like the big-relay carrier — split at the per-part NIP-44 budget, so a
     // `.hbmanifest` can hold a collection of ANY size (the envelope stores the encrypted parts inline,
     // bounded by part count, not by one event's plaintext cap). A listing that fits one event yields a
@@ -2289,6 +2342,110 @@ mod tests {
             Some(hb_core::snapshot_fingerprint(&col.listing).0.as_str()),
             "the listing JSON must carry the full-tree fingerprint the teaser + big-relay family share",
         );
+    }
+
+    // ── audit #25 / QURATOR-123: the truncated teaser's digest + the carriers' teaser digest ────
+
+    /// A collection big enough to truncate at the real `LISTING_MAX_BYTES` (40 KB).
+    fn a_big_collection(slug: &str) -> Collection {
+        let listing: Vec<DirectoryItem> = (0..1300)
+            .map(|i| DirectoryItem {
+                name: format!("title-{i:05}-padding-padding-padding-xx.mkv"),
+                item_type: ItemType::File,
+                size: None,
+                format: None,
+                year: None,
+                tags: vec![],
+                note: None,
+                children: vec![],
+            })
+            .collect();
+        Collection {
+            item_count: listing.len() as u64,
+            listing,
+            ..a_video_collection(slug, Visibility::Public)
+        }
+    }
+
+    #[test]
+    fn stamp_teaser_fingerprint_puts_the_teaser_digest_beside_the_full_tree_one() {
+        // The full-carrier stamp: the SAME digest `truncate_listing` re-derives for the teaser, read
+        // back out of the artifact (not re-implemented here), inserted as `teaser_fingerprint`.
+        let col = a_big_collection("vault");
+        let full = collection_to_listing_json(col).unwrap();
+        let stamped = stamp_teaser_fingerprint(&full).unwrap();
+        let t = hb_net::truncate_listing(&full, LISTING_MAX_BYTES).unwrap();
+        assert!(t.truncated, "the fixture must truncate");
+        let teaser_fp = serde_json::from_str::<serde_json::Value>(&t.json)
+            .unwrap()
+            .get("snapshot_fingerprint")
+            .and_then(|v| v.as_str())
+            .expect("the teaser carries a digest")
+            .to_string();
+        assert_ne!(
+            teaser_fp,
+            serde_json::from_str::<serde_json::Value>(&full)
+                .unwrap()
+                .get("snapshot_fingerprint")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            "the teaser digest must not be the full-tree digest (the #25 oracle)"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stamped)
+                .unwrap()
+                .get("teaser_fingerprint")
+                .and_then(|v| v.as_str()),
+            Some(teaser_fp.as_str()),
+            "the carrier's `teaser_fingerprint` must equal what the teaser actually carries"
+        );
+    }
+
+    #[test]
+    fn stamp_teaser_fingerprint_leaves_an_untruncated_listing_byte_identical() {
+        // The storm-guard-adjacent property: a collection that fits the budget whole must not be
+        // perturbed (its teaser carries the full-tree digest — nothing is hidden).
+        let col = a_video_collection("criterion", Visibility::Public);
+        let json = collection_to_listing_json(col).unwrap();
+        assert!(!hb_net::truncate_listing(&json, LISTING_MAX_BYTES).unwrap().truncated);
+        assert_eq!(stamp_teaser_fingerprint(&json).unwrap(), json);
+    }
+
+    #[test]
+    fn build_slug_manifest_gates_on_the_teaser_digest_not_the_full_tree_one() {
+        // The envelope's signed digest must be what the truncated teaser carries, so the browse
+        // side's `stale` comparison against the teaser it is showing still matches. This is the
+        // hb-app half of the gate coherence fix — without it every manifest would read stale.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let identity = Identity::generate();
+        let browse_key: BrowseKey = [7u8; 32];
+        let col = a_big_collection("vault");
+        store.save_collection_draft(&col).unwrap();
+        let env = build_slug_manifest("vault", &store, &identity, &browse_key).unwrap();
+        // The teaser the same publish produces, derived through the production truncation.
+        let full = collection_to_listing_json(col).unwrap();
+        let t = hb_net::truncate_listing(&full, LISTING_MAX_BYTES).unwrap();
+        assert!(t.truncated);
+        let teaser_fp = serde_json::from_str::<serde_json::Value>(&t.json)
+            .unwrap()
+            .get("snapshot_fingerprint")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let entries = serde_json::from_str::<serde_json::Value>(&full)
+            .unwrap()
+            .get("entries")
+            .cloned()
+            .unwrap();
+        let tree: Vec<DirectoryItem> = serde_json::from_value(entries).unwrap();
+        assert_ne!(
+            env.snapshot_fingerprint,
+            hb_core::snapshot_fingerprint(&tree).0,
+            "the envelope must not carry the full-tree digest of a truncated collection"
+        );
+        assert_eq!(env.snapshot_fingerprint, teaser_fp, "the envelope gates on the teaser digest");
+        assert!(env.matches_fingerprint(&teaser_fp), "the manifest is not stale against its teaser");
     }
 
     // ── M16 W4: manifest export (the `.hbmanifest` envelope) ─────────────────────

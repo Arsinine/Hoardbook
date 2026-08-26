@@ -99,6 +99,12 @@ pub async fn publish_listing_capped(
 pub struct BrowseResult {
     pub teaser: Option<Teaser>,
     pub listing: Option<RenderedListing>,
+    /// Why `listing` is `None` when a browse-key was held (QURATOR-127): the inner error
+    /// `fetch_listing` returned, captured before BR1 leniency locks the listing — the old `.ok()`
+    /// discarded it, collapsing a client/timeout failure, a missing index, an incoherent family
+    /// and a decrypt failure into one indistinguishable `None`. `None` when the listing rendered
+    /// or the code was follow-only (no key held). Diagnostic only, never a failure in itself.
+    pub listing_error: Option<String>,
     pub resolved_relays: Vec<String>,
 }
 
@@ -180,13 +186,36 @@ pub async fn browse_share_code(
     let teaser = select_newest_teaser(teaser_events, &peer);
 
     // Listing (gated by the browse-key): a decrypt failure locks the listing without failing the
-    // whole browse — the teaser still shows (BR1).
-    let listing = match share_code.browse_key() {
-        Some(bk) => fetch_listing(client, &peer, slug, &bk, timeout).await.ok(),
-        None => None,
+    // whole browse — the teaser still shows (BR1). The reason rides on the result so the failure
+    // mode stays attributable (QURATOR-127).
+    let (listing, listing_error) = match share_code.browse_key() {
+        Some(bk) => {
+            listing_or_lock_reason(slug, fetch_listing(client, &peer, slug, &bk, timeout).await)
+        }
+        None => (None, None),
     };
 
-    Ok(BrowseResult { teaser, listing, resolved_relays })
+    Ok(BrowseResult { teaser, listing, listing_error, resolved_relays })
+}
+
+/// The BR1 fold, as ONE function both callers use (QURATOR-127): a listing failure locks the
+/// listing (`None`) without failing the browse, but the reason is kept — rendered into a
+/// `tracing::warn!` the harness's subscriber emits, and returned alongside so `hb-it` can name the
+/// actual failure mode in its TAP line instead of the bare "did not browse". A success carries no
+/// reason. `fetch_full_listing_from` (the big-relay twin) keeps its own silent `.ok()`-shaped
+/// leniency — its caller has no diagnostic channel and BR1 there is pinned by its own tests.
+pub fn listing_or_lock_reason(
+    slug: &str,
+    r: Result<RenderedListing, NetError>,
+) -> (Option<RenderedListing>, Option<String>) {
+    match r {
+        Ok(listing) => (Some(listing), None),
+        Err(e) => {
+            let reason = e.to_string();
+            tracing::warn!("browse: listing for '{slug}' locked (BR1) — {reason}");
+            (None, Some(reason))
+        }
+    }
 }
 
 /// Phase-1 fetch budget for a slug's **index** event (`d = slug`): one parameterized-replaceable
@@ -475,15 +504,25 @@ pub fn listing_snapshot_fingerprint(rendered: &RenderedListing) -> Option<&str> 
     rendered.meta.get("snapshot_fingerprint").and_then(serde_json::Value::as_str)
 }
 
+/// The **teaser digest** a full carrier (big-relay family index, `.hbmanifest` plaintext) carries
+/// (audit #25 / QURATOR-123): the digest the truncated teaser of the SAME publish carries — over
+/// the teaser's visible entries + elided count (`hb_core::teaser_fingerprint`), stamped by the
+/// publish path beside the carrier's own full-tree `snapshot_fingerprint`. This is the only value a
+/// teaser and a full carrier can still share: the teaser may no longer carry a digest of the content
+/// truncation hides from it. `None` for a carrier that predates the field.
+pub fn family_teaser_fingerprint(rendered: &RenderedListing) -> Option<&str> {
+    rendered.meta.get("teaser_fingerprint").and_then(serde_json::Value::as_str)
+}
+
 /// The M16 staleness gate: a fetched full family supersedes the paywall teaser **only** if it is
-/// **complete** AND its snapshot fingerprint matches the teaser's. Completeness is load-bearing
+/// **complete** AND its teaser digest (`teaser_fingerprint`) matches the teaser's. Completeness is load-bearing
 /// (Codex review, W2): a big relay can serve the signed index but withhold content parts —
 /// `render_listing` yields a *partial* tree that still carries the matching fingerprint in its meta,
 /// and silently replacing the paywall with a partial tree presented as the full list would be a
-/// downgrade. An incomplete, unfingerprinted (pre-M16), or mismatched (stale) family does not
+/// downgrade. An incomplete, un-digested (pre-M16), or mismatched (stale) family does not
 /// supersede — keep the teaser and surface "ask again".
 fn full_supersedes(rendered: &RenderedListing, expected_fingerprint: &str) -> bool {
-    rendered.complete() && listing_snapshot_fingerprint(rendered) == Some(expected_fingerprint)
+    rendered.complete() && family_teaser_fingerprint(rendered) == Some(expected_fingerprint)
 }
 
 /// Fetch the big-relay full family **only if it is current** — its snapshot fingerprint matches
@@ -960,6 +999,68 @@ mod tests {
         }
     }
 
+    /// QURATOR-127 — BR1 leniency with an attributable reason, at the exact fold `browse_share_code`
+    /// performs. A failure (here: the missing-index error a dead/incomplete relay produces) must
+    /// yield `listing: None` **and** a non-empty reason distinguishing the mode; a follow-only code
+    /// has no key and so no reason; a rendered listing carries no reason. Ends where production
+    /// ends — the helper IS the site `browse_share_code` calls, not a re-emit of its shape.
+    #[tokio::test]
+    async fn br1_lock_yields_none_listing_and_names_the_inner_error() {
+        let victim = Identity::generate();
+        let peer = victim.public_key();
+        let browse_key: BrowseKey = [7; 32];
+
+        // Failure mode 2 (zero family events served): the empty-family error.
+        let fetch_none = |_filter: Filter| async { Ok(Vec::<Event>::new()) };
+        let r = fetch_slug_family(&peer, "gone", &browse_key, fetch_none).await;
+        let (listing, reason) = listing_or_lock_reason("gone", r);
+        assert!(listing.is_none(), "BR1: a failed fetch must lock, not error, the browse");
+        let reason = reason.expect("the lock reason must be captured, not discarded");
+        assert!(
+            reason.contains("no listing found for slug 'gone'"),
+            "the reason must name the actual inner error, got: {reason}"
+        );
+
+        // Failure mode 4 (decrypt failure on a served event): a real event under the WRONG key.
+        let ev = build_listing_event(
+            &victim,
+            "locked",
+            &browse_key,
+            &serde_json::json!({ "slug": "locked", "entries": [] }).to_string(),
+        )
+        .unwrap();
+        let fetch_wrong_key = move |_filter: Filter| {
+            let ev = ev.clone();
+            async move { Ok(vec![ev]) }
+        };
+        let wrong_key: BrowseKey = [99; 32];
+        let r = fetch_slug_family(&peer, "locked", &wrong_key, fetch_wrong_key).await;
+        let (listing, reason) = listing_or_lock_reason("locked", r);
+        assert!(listing.is_none(), "BR1: a locked listing must not fail the browse");
+        let reason = reason.expect("a decrypt failure must leave a reason");
+        assert!(
+            !reason.contains("no listing found"),
+            "a decrypt failure must be distinguishable from an absent family, got: {reason}"
+        );
+
+        // A compliant render: no reason rides along.
+        let ok_index = build_listing_event(
+            &victim,
+            "fine",
+            &browse_key,
+            &serde_json::json!({ "slug": "fine", "entries": [{ "name": "a" }] }).to_string(),
+        )
+        .unwrap();
+        let fetch_ok = move |_filter: Filter| {
+            let ok_index = ok_index.clone();
+            async move { Ok(vec![ok_index]) }
+        };
+        let r = fetch_slug_family(&peer, "fine", &browse_key, fetch_ok).await;
+        let (listing, reason) = listing_or_lock_reason("fine", r);
+        assert!(listing.is_some(), "a compliant listing must render");
+        assert!(reason.is_none(), "a rendered listing carries no lock reason");
+    }
+
     /// `browse_peer_listings`'s count bound (the sibling gap two reviewers found): a family with
     /// more distinct `d`-tags than the ceiling must be SKIPPED **before any of its events are
     /// decrypted into `payloads`**. Ends where production ends — this drives
@@ -1101,10 +1202,18 @@ mod tests {
     const FP: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
 
     /// A listing big enough to split under a 40 KiB budget, carrying a top-level
-    /// `snapshot_fingerprint` (what the hoarder writes at publish time, W3).
+    /// `snapshot_fingerprint` (what the hoarder writes at publish time, W3). Entries carry the
+    /// `item_type`/`tags`/`children` keys a real `collection_to_listing_json` tree emits, so the
+    /// truncated output's digest re-derivation (audit #25) has a decodable `DirectoryItem` tree to
+    /// hash — a fixture without them would take the "drop the fingerprint" path instead.
     fn big_listing_with_fp(slug: &str, n: usize, fp: &str) -> String {
         let entries: Vec<serde_json::Value> = (0..n)
-            .map(|i| serde_json::json!({ "name": format!("title-{i:05}-padding-padding-padding-xx") }))
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("title-{i:05}-padding-padding-padding-xx"),
+                    "item_type": "File", "tags": [], "children": [],
+                })
+            })
             .collect();
         serde_json::json!({
             "slug": slug, "content_types": ["video"],
@@ -1113,12 +1222,28 @@ mod tests {
         .to_string()
     }
 
+    /// The full-carrier shape the publish path emits post audit #25: the full-tree
+    /// `snapshot_fingerprint` (the family own) plus the `teaser_fingerprint` the truncated teaser
+    /// of the same publish carries (visible entries + elided count). `tf` is the teaser digest.
+    fn family_listing_with_fps(slug: &str, n: usize, tf: &str) -> String {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&big_listing_with_fp(slug, n, FP)).unwrap();
+        v.as_object_mut().unwrap().insert(
+            "teaser_fingerprint".into(),
+            serde_json::Value::String(tf.to_string()),
+        );
+        v.to_string()
+    }
+
     #[test]
     fn snapshot_fingerprint_rides_through_the_big_relay_split() {
-        // The W2 gate's premise: a full listing carrying `snapshot_fingerprint` survives the split
-        // (the big-relay carrier reuses the 40 KiB budget) + restitch, so the fingerprint is readable
-        // from the rendered family's meta and the gate can compare it.
-        let json = big_listing_with_fp("vault", 1300, FP);
+        // The W2 gate's premise, post audit #25 / QURATOR-123: a full listing carrying the
+        // **teaser digest** (`teaser_fingerprint` — what the publish path stamps beside the
+        // full-tree `snapshot_fingerprint`) survives the split (the big-relay carrier reuses the
+        // 40 KiB budget) + restitch, so the digest is readable from the rendered family's meta and
+        // the gate can compare it against the teaser's. The family still carries its own
+        // full-tree `snapshot_fingerprint` — it is the teaser that may not.
+        let json = family_listing_with_fps("vault", 1300, FP);
         let parts = split_listing("vault", &json, 40_000).unwrap();
         assert!(parts.len() > 2, "the listing must actually split, got {} part(s)", parts.len());
         let payloads: Vec<String> = parts.iter().map(|p| p.json.clone()).collect();
@@ -1126,12 +1251,12 @@ mod tests {
         assert!(rendered.complete(), "all parts present → complete tree");
         assert_eq!(rendered.entries.len(), 1300);
         assert_eq!(
-            listing_snapshot_fingerprint(&rendered),
+            family_teaser_fingerprint(&rendered),
             Some(FP),
-            "the fingerprint must survive the split into meta"
+            "the teaser digest must survive the split into meta"
         );
-        assert!(full_supersedes(&rendered, FP), "a matching fingerprint supersedes the teaser");
-        assert!(!full_supersedes(&rendered, "deadbeef"), "a mismatched fingerprint does not supersede");
+        assert!(full_supersedes(&rendered, FP), "a matching teaser digest supersedes the teaser");
+        assert!(!full_supersedes(&rendered, "deadbeef"), "a mismatched teaser digest does not supersede");
     }
 
     #[test]
@@ -1139,7 +1264,7 @@ mod tests {
         // Codex review (W2): a big relay can serve the signed index but WITHHOLD a content part. The
         // rendered tree is partial yet still carries the matching `snapshot_fingerprint` in its meta —
         // it must NOT replace the paywall (that would present a partial tree as the full list).
-        let json = big_listing_with_fp("vault", 1300, FP);
+        let json = family_listing_with_fps("vault", 1300, FP);
         let parts = split_listing("vault", &json, 40_000).unwrap();
         assert!(parts.len() > 2, "the listing must split, got {} part(s)", parts.len());
         let mut payloads: Vec<String> = parts.iter().map(|p| p.json.clone()).collect();
@@ -1147,9 +1272,9 @@ mod tests {
         let rendered = render_listing(&payloads).unwrap();
         assert!(!rendered.complete(), "a withheld part must render incomplete");
         assert_eq!(
-            listing_snapshot_fingerprint(&rendered),
+            family_teaser_fingerprint(&rendered),
             Some(FP),
-            "the fingerprint still rides in meta even when parts are missing"
+            "the teaser digest still rides in meta even when parts are missing"
         );
         assert!(
             !full_supersedes(&rendered, FP),
@@ -1159,18 +1284,32 @@ mod tests {
 
     #[test]
     fn truncated_teaser_and_full_family_share_one_fingerprint() {
-        // The crux of the gate: the paywall teaser (a single truncated event) and the big-relay full
-        // family both derive from the same source tree, so they carry the *same*
-        // `snapshot_fingerprint` — that is what lets the browse side confirm the family is the full
-        // version of exactly what the teaser previews. `truncate_listing` preserves top-level meta.
+        // Audit #25 / QURATOR-123 redefined what a truncated teaser's digest may be: the VISIBLE
+        // entries + elided count (`hb_core::teaser_fingerprint`), never the full-tree digest — the
+        // latter was an offline confirm-or-deny oracle on the hidden content. So the teaser and the
+        // big-relay full family no longer carry the same value by design; this test now pins both
+        // halves of that contract:
+        //   (a) the teaser's digest IS the visible-portion digest (not the full tree's);
+        //   (b) the teaser's digest is NOT derivable from the full tree, so the teaser cannot
+        //       confirm the family's hidden remainder.
         let json = big_listing_with_fp("vault", 2000, FP);
         let t = truncate_listing(&json, 40_000).unwrap();
         assert!(t.truncated, "this listing must truncate");
         let teaser = render_listing(&[t.json]).unwrap();
+        let teaser_fp = listing_snapshot_fingerprint(&teaser).expect("a digest remains");
+        assert_ne!(
+            teaser_fp,
+            FP,
+            "the truncated teaser must NOT carry the full-tree fingerprint the family carries"
+        );
+        // The visible-portion digest, recomputed from the teaser's own kept entries: the artifact's
+        // digest is what the re-stamp promises, derived from the artifact (not an internal).
+        let visible: Vec<hb_core::types::DirectoryItem> =
+            serde_json::from_value(serde_json::Value::Array(teaser.entries.clone())).unwrap();
         assert_eq!(
-            listing_snapshot_fingerprint(&teaser),
-            Some(FP),
-            "the truncated teaser keeps the full-tree fingerprint the family also carries"
+            teaser_fp,
+            hb_core::teaser_fingerprint(&visible, (t.total_items - t.shown_items) as u64).0,
+            "the teaser's digest must be the visible-portion + elided-count digest"
         );
     }
 
