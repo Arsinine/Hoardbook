@@ -12,8 +12,8 @@ export const DEFAULT_VISIBILITY: Visibility = 'Public';
  *  **future** republishes — it cannot recall an already-fetched copy (spec §Private Collections /
  *  "What this is not"). The copy must keep both halves so the UI never over-promises. */
 export const NOT_DRM_NOTE =
-	'This is not DRM. A trusted contact can copy, screenshot, or export what you share. ' +
-	'Removing trust only stops future republishes — it cannot un-send a copy they already fetched.';
+	'This is not DRM. A trusted contact can copy, screenshot, or export what they can see. ' +
+	'Removing trust only affects future publishes. It cannot take back a copy they already fetched.';
 
 /** A collection's effective visibility (absent ⇒ Public — a pre-M10 collection). */
 export function visibilityOf(c: Pick<Collection, 'visibility'>): Visibility {

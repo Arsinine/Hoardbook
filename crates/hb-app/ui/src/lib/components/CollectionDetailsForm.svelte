@@ -114,8 +114,7 @@
 			onpublished?.({ ...updated, published: true });
 			// devtest #7: a too-large collection publishes only a truncated paywall teaser.
 			if (summary?.truncated) {
-				const hidden = Math.max(0, summary.total_items - summary.shown_items);
-				toast(`Published a preview — too large to publish in full, so ${hidden.toLocaleString()} of ${summary.total_items.toLocaleString()} items are hidden from browsers.`);
+				toast(`Published a preview. Too large to publish in full, so people browsing it see ${summary.shown_items.toLocaleString()} of ${summary.total_items.toLocaleString()} items.`);
 			} else {
 				toast('Collection published');
 			}
@@ -193,7 +192,7 @@
 		</label>
 		<label class="check-row">
 			<input type="checkbox" bind:checked={isPrivate} />
-			Private<HintMarker label="Private" text="Only contacts in your Private audience can open this collection — it is encrypted to each of them personally, so your share code alone won't open it. Not DRM: a recipient can still copy what they decrypt." />
+			Private<HintMarker label="Private" text="Only contacts in your Private audience can open this collection. It is encrypted to each of them personally, so your share code alone won't open it. Not DRM: a recipient can still copy what they decrypt." />
 		</label>
 	</div>
 </div>

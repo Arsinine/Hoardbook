@@ -565,7 +565,7 @@
 					     yet" negative — same machine as Discover's erroredRoots one tab over. -->
 					<EmptyState
 						error
-						message="Couldn't load your Topics — the listing didn't answer."
+						message="Couldn't load your Topics."
 						onretry={loadMine}
 					/>
 				{:else if mine.length === 0}
@@ -720,7 +720,7 @@
 								     could not reach the relays" (retryable) so an unknown is never rendered as a confident
 								     negative. Collapsing + re-expanding retries (toggleRoot clears the error and re-fetches). -->
 								<div class="root-status root-error">
-									Couldn’t reach the relays for “{root}”. Collapse and re-expand to retry.
+									Couldn’t reach the relays. Reopen this category to retry.
 								</div>
 							{:else if (rootTopics[root] ?? []).length === 0}
 								<div class="root-status muted">No public Topics under “{root}” yet.</div>
@@ -758,7 +758,7 @@
 					{#each TOPIC_ROOTS as r}<option value={r}>{r}</option>{/each}
 				</select>
 				<span class="path-sep">/</span>
-				<input class="hb-input grow" placeholder="sub-path (e.g. animation/anime) — optional" bind:value={newSubPath} />
+				<input class="hb-input grow" placeholder="optional sub-path (e.g. animation/anime)" bind:value={newSubPath} />
 			</div>
 			<div class="muted path-preview">Topic path: <code>{composedPublicName}</code></div>
 		{/if}

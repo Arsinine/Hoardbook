@@ -13,29 +13,29 @@ import { askAccessDraft, applyAskAccessIntent } from './ask-access.js';
 
 describe('askAccessDraft — single source of the prefill copy', () => {
 	it('elides the petname at the Hi position when petname is empty', () => {
-		// The bare variant: "Hi — could I have your share code? I'd like to browse your collections."
+		// The bare variant: "Hi, could I have your share code? I'd like to browse your collections."
 		expect(askAccessDraft('')).toBe(
-			"Hi — could I have your share code? I'd like to browse your collections.",
+			"Hi, could I have your share code? I'd like to browse your collections.",
 		);
 	});
 
 	it('inserts a non-empty petname after Hi', () => {
-		// "Hi {petname} — could I have your share code? …"
+		// "Hi {petname}, could I have your share code? …"
 		expect(askAccessDraft('Mira')).toBe(
-			"Hi Mira — could I have your share code? I'd like to browse your collections.",
+			"Hi Mira, could I have your share code? I'd like to browse your collections.",
 		);
 	});
 
 	it('treats a whitespace-only petname as absent (bare variant)', () => {
 		// A whitespace petname is no petname — never render "Hi    —".
 		expect(askAccessDraft('   ')).toBe(
-			"Hi — could I have your share code? I'd like to browse your collections.",
+			"Hi, could I have your share code? I'd like to browse your collections.",
 		);
 	});
 
 	it('trims a petname with surrounding whitespace before insertion', () => {
 		expect(askAccessDraft('  Mira  ')).toBe(
-			"Hi Mira — could I have your share code? I'd like to browse your collections.",
+			"Hi Mira, could I have your share code? I'd like to browse your collections.",
 		);
 	});
 });
@@ -44,7 +44,7 @@ describe('applyAskAccessIntent — the intent→draft decision (no-clobber, no-s
 	it('populates an empty draft when intent is ask-access', () => {
 		const r = applyAskAccessIntent('ask-access', '', 'Mira');
 		expect(r.draft).toBe(
-			"Hi Mira — could I have your share code? I'd like to browse your collections.",
+			"Hi Mira, could I have your share code? I'd like to browse your collections.",
 		);
 		expect(r.focus).toBe(true);
 	});
@@ -62,7 +62,7 @@ describe('applyAskAccessIntent — the intent→draft decision (no-clobber, no-s
 		// intent DOES populate — this matches the "empty draft only" rule from the spec.
 		const r = applyAskAccessIntent('ask-access', '   ', 'Mira');
 		expect(r.draft).toBe(
-			"Hi Mira — could I have your share code? I'd like to browse your collections.",
+			"Hi Mira, could I have your share code? I'd like to browse your collections.",
 		);
 		expect(r.focus).toBe(true);
 	});
