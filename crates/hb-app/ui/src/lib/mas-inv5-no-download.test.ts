@@ -160,13 +160,28 @@ describe('MAS-INV-5 — the M18 fulfil surfaces move listings, never files', () 
 
 	/** Positive assertion, mirroring the browse one: the ratified M18 affordances are present, so a
 	 *  regression that removed the verb — or replaced it with something that moves files — is caught
-	 *  rather than silently passing a negative scan. */
-	it('the fulfil card offers "Send the full list" AND keeps export reachable', () => {
+	 *  rather than silently passing a negative scan.
+	 *
+	 *  This test USED to also assert `toContain('Export manifest…')`, guarding export as the fallback
+	 *  for when the transport cannot connect. That assertion was VACUOUS and is removed (owner ruling
+	 *  2026-08-27). Two separate things were wrong with it:
+	 *
+	 *  1. The button it guarded was removed by an owner ruling earlier the same day. The only
+	 *     surviving occurrence of the string in ManifestFulfilCard.svelte is inside a COMMENT saying
+	 *     the button is gone — and `toContain` is a substring scan over source text, so a comment
+	 *     satisfied it exactly as well as a button. It would have reported "the fallback is present"
+	 *     forever, over an absent fallback. CLAUDE.md §9 / P-10: a green test nobody has seen red.
+	 *  2. The premise was wrong anyway. Owner, 2026-08-27: "that fallback was never realistic in the
+	 *     first place. no user is going to manually copy their manifest to a third party site to share
+	 *     so some rando can see what files he has, because the friction inherent in such an action is
+	 *     just too high. id rather go with the big relay than do the export." So the second route is
+	 *     the big-relay carrier, not a manual export, and there is nothing here to guard.
+	 *
+	 *  Do not restore the assertion. If a fallback needs pinning, pin the big-relay path — and pin it
+	 *  by BEHAVIOUR, not by grepping the source for a label. */
+	it('the fulfil card offers "Send the full list"', () => {
 		const src = read('./components/ManifestFulfilCard.svelte');
 		expect(src).toContain('SEND_FULL_LIST_LABEL');
-		// Export is the fallback for when the transport cannot connect. If it ever disappears, the
-		// owner is left with one route that can fail and no second one — the dead end W7.1b removed.
-		expect(src).toContain('Export manifest…');
 	});
 
 	/** The asker's card fires its redemption on render. It must therefore never grow a button that
