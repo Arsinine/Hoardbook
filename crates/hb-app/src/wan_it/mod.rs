@@ -47,7 +47,8 @@ use nostr::prelude::*;
 
 use crate::commands::collection::{build_slug_manifest, count_items, is_valid_slug, scan_selective};
 use crate::identity_state::AppIdentity;
-use crate::manifest_source::StoreManifestSource;
+use crate::commands::fulfil::send_full_list_inner;
+use hb_core::ticket::TransportTicket;
 use crate::net;
 use crate::presence;
 use crate::store::{DataStore, IssuedTicketRecord, Settings};
@@ -105,10 +106,10 @@ fn usage() -> &'static str {
             [--auto-approve --e2e-seed-dir <dir> [--republish]]\n\
             Seeds/loads an identity from <dir>, publishes the presence beacon via the production\n\
             path (presence::publish_presence) on the real cadence. Prints npub + share-code.\n\
-            With --seed-dir + --asker-npub: also seeds a collection from <dir>, binds the manifest\n\
-            endpoint via the production path (ensure_endpoint, presets::N0), and mints a ticket the\n\
-            probe redeems — the launch-gate WAN-M path. Prints ticket=<json> for the operator to\n\
-            hand to the probe (--ticket-json).\n\
+            With --seed-dir + --asker-npub: also seeds a collection from <dir>, then\n\
+            approves through the production command body (send_full_list_inner): binds the endpoint,\n\
+            mints + records the ticket, and DMs it to --asker-npub. The probe reads it from its own\n\
+            inbox — the launch-gate WAN-M path, now unattended (no ticket=<json> copy-paste).\n\
             With --auto-approve + --e2e-seed-dir: seeds a TRUNCATING collection (large enough to\n\
             exceed the 40 KB teaser budget), publishes the teaser, and runs the auto-approve loop:\n\
             polls the DM inbox for request-DMs and answers each by driving the production approval\n\
@@ -116,7 +117,7 @@ fn usage() -> &'static str {
      \n\
      probe  --peer <npub|hbk…> --relay <ws-url>...\n\
             [--flood-relay <ws-url>... --flood-count <n>]\n\
-            [--ticket-json <path|inline> --suite wan-m]\n\
+            [--suite wan-m]                 ticket arrives by DM; --ticket-json only overrides it\n\
             [--suite wan-e2e]\n\
             [--suite wan-u]\n\
             [--suite wan-c]\n\
@@ -126,8 +127,8 @@ fn usage() -> &'static str {
             [--suite wan-m4]\n\
             Runs WAN-P rows P1–P5 against a live serve by default. --flood-relay arms P3\n\
             (VPS strfry only: ws://141.98.199.138:7777, ws://45.129.8.225:7777).\n\
-            --ticket-json + --suite wan-m runs the WAN-M rows (M1 + M9) instead, redeeming the\n\
-            ticket the serve printed (§W6 authorizes --ticket-json for targeted iroh isolation runs;\n\
+            --suite wan-m runs the WAN-M rows (M1 + M9) instead, redeeming the ticket the serve\n\
+            DM'd (§W6's --ticket-json remains for targeted iroh isolation runs;\n\
             the E2E suite rides the full DM leg).\n\
             --suite wan-e2e runs the WAN-E2E rows (E1 + E2): the full DM-coordinated pipeline.\n\
             --suite wan-u runs the WAN-U rows (U1–U7): the user-surface live twins (profile,\n\
@@ -182,11 +183,14 @@ async fn run_serve(args: &[String]) -> Result<()> {
         presence::PRESENCE_REFRESH_SECS
     );
 
-    // WAN-M: when --seed-dir + --asker-npub are passed, seed a collection, add the asker as a
-    // contact in good standing, bind the manifest endpoint via the production path
-    // (ensure_endpoint, presets::N0), and mint a ticket the probe redeems. The serve prints
-    // ticket=<json>; the operator hands it to the probe via --ticket-json (§W6 authorizes this for
-    // targeted iroh isolation runs; the E2E suite rides the full DM leg).
+    // WAN-M: when --seed-dir + --asker-npub are passed, seed a collection, add the asker as a contact
+    // in good standing, and APPROVE through the production command body (`send_full_list_inner`),
+    // which binds the endpoint, mints the ticket, records it, and DMs it to the asker.
+    //
+    // The serve no longer prints `ticket=<json>` for an operator to paste into `--ticket-json`. The
+    // ticket rides the DM it rides in production, and the probe reads it out of its own inbox — so
+    // the two halves are joined by the real channel rather than by a human, and WAN-M can run
+    // unattended (which is what makes a Linux-serve / Windows-probe CI leg possible at all).
     if let (Some(seed_dir), Some(asker_npub)) =
         (args::flag_value(args, "--seed-dir"), args::flag_value(args, "--asker-npub"))
     {
@@ -195,7 +199,9 @@ async fn run_serve(args: &[String]) -> Result<()> {
         let app_id_for_plane = load_or_create_identity(&store)?;
         let live_npub: crate::identity_state::SharedIdentity =
             std::sync::Arc::new(tokio::sync::RwLock::new(Some(app_id_for_plane)));
-        setup_manifest_plane(&store, &live_npub, seed_dir, asker_npub).await?;
+        let shared_relay_manifest = net::new_shared();
+        setup_manifest_plane(&store, &live_npub, seed_dir, asker_npub, &shared_relay_manifest)
+            .await?;
     }
 
     // WAN-E2E serve side: when --auto-approve + --e2e-seed-dir are passed, seed a TRUNCATING collection,
@@ -668,22 +674,22 @@ async fn setup_manifest_plane(
     live_npub: &crate::identity_state::SharedIdentity,
     seed_dir: &str,
     asker_npub: &str,
+    shared_relay: &net::SharedRelay,
 ) -> Result<()> {
     // Snapshot the identity fields the plane + the manifest build need. Read once under the lock;
     // these are owned copies (Identity is Clone; the keys are regenerable secrets held for the
     // session). The source carries its own snapshot because ManifestSource is sync and cannot await
     // a live handle — same reason transport_state keys the binding to the npub.
-    let (identity, browse_key, transport_key, own_npub) = {
+    // Only what SEEDING needs. The transport key and own npub used to be snapshotted here too,
+    // because this function bound the endpoint and minted the ticket by hand; `send_full_list_inner`
+    // reads them from the same SharedIdentity itself, so the harness no longer holds a second copy
+    // of the session's secrets.
+    let (identity, browse_key) = {
         let guard = live_npub.read().await;
         let id = guard
             .as_ref()
             .ok_or_else(|| anyhow!("no identity loaded for the manifest plane"))?;
-        (
-            id.identity.clone(),
-            id.browse_key.clone(),
-            id.transport_key.clone(),
-            id.npub(),
-        )
+        (id.identity.clone(), id.browse_key.clone())
     };
 
     // (1) Seed the collection — the production scan path (scan_selective + save_collection_draft).
@@ -704,33 +710,34 @@ async fn setup_manifest_plane(
     let nonce = "wan-it-nonce";
     store.record_manifest_ask(asker_npub, slug, "wan-it", &rfc3339_now(), nonce)?;
 
-    // (4) Bind the endpoint via the production path (ensure_endpoint, Role::Listen). This is the
-    // real accept loop + the in-flight set (one ticket, one delivery). StoreManifestSource is the
-    // production source over the real data directory.
-    let source: Arc<dyn ManifestSource> =
-        StoreManifestSource::new(store.clone(), identity.clone(), browse_key.clone());
-    let shared = new_shared_endpoint();
-    let endpoint = ensure_endpoint(&shared, &own_npub, live_npub, &transport_key, source, Role::Listen)
-        .await
-        .map_err(|e| anyhow!("bind manifest endpoint: {e}"))?;
-    eprintln!("[serve] manifest endpoint bound (presets::N0); accept loop running");
-
-    // (5) Mint the ticket via the production path + persist it (record before the probe can redeem,
-    // so a redeemer always presents a ticket we can recognise — the production ordering).
-    let request_id = new_request_id();
-    let ticket = issue_ticket(&endpoint, &request_id, slug, unix_now(), Some(nonce))?;
-    store.record_issued_ticket(&IssuedTicketRecord {
-        ticket: ticket.clone(),
-        redeemer_npub: asker_npub.to_string(),
-        consumed_at: None,
-        delivered_bytes: None,
-    })?;
-
-    let body = serde_json::to_string(&ticket)?;
-    println!("ticket={body}");
+    // (4) Approve, exactly as the owner's click does: `send_full_list_inner` IS the body of the
+    // `send_full_list` Tauri command (the command is a marshalling shim over it). One call now does
+    // what steps (4) and (5) used to do by hand — bind the listening endpoint via `ensure_endpoint`,
+    // seal the manifest and prove it fits the transport ceiling, mint the ticket, persist the
+    // issued-ticket record BEFORE the DM (the ordering that stops a peer holding a ticket this node
+    // cannot authorize), and DM the ticket to the asker.
+    //
+    // **This replaced a hand-copy, and that is the whole point.** The harness used to re-implement
+    // the approval sequence here and print `ticket=<json>` for an operator to paste into the probe's
+    // `--ticket-json`. That copy is how the 2026-08-27 defect stayed invisible: a step that exists
+    // only in production is a step no harness runs. The DM handoff is not a convenience — it is the
+    // production channel, and using it removes both the manual step and the divergence.
+    send_full_list_inner(
+        asker_npub.to_string(),
+        slug.to_string(),
+        Some(nonce.to_string()),
+        live_npub,
+        store,
+        shared_relay,
+        &new_shared_endpoint(),
+    )
+    .await
+    .map_err(|e| anyhow!("send_full_list_inner: {e}"))?;
     eprintln!(
-        "[serve] ticket minted for request {request_id} (slug '{slug}', nonce '{nonce}'); hand to probe via --ticket-json"
+        "[serve] approved via send_full_list_inner: manifest endpoint bound, ticket minted, \
+         recorded, and DM'd to {asker_npub} (slug '{slug}', nonce '{nonce}')"
     );
+    eprintln!("[serve] the probe picks the ticket up from its own inbox — no --ticket-json needed");
     Ok(())
 }
 
@@ -928,12 +935,85 @@ async fn run_probe(args: &[String]) -> Result<ExitCode> {
 // probe — WAN-M (M1 + M9)
 // ---------------------------------------------------------------------------
 
+/// How long the probe waits for the serve's ticket DM before giving up.
+///
+/// Generous on purpose: this is a real relay round trip across two machines (and, in a CI leg,
+/// across two clouds). The serve has to scan and seal a collection before it DMs anything, and the
+/// relay's own propagation is the rest. A timeout here is an honest failure — it means the DM never
+/// arrived, which is exactly what this leg exists to detect.
+const TICKET_DM_WAIT: Duration = Duration::from_secs(180);
+
+/// Poll interval while waiting. Matches the production DM cadence rather than hammering the relay.
+const TICKET_DM_POLL: Duration = Duration::from_secs(3);
+
+/// Wait for the serve's transport-ticket DM and return its body, using the SAME primitives the Chat
+/// page uses: the production gift-wrap inbox filter, and `decode_dms` (which Schnorr-verifies the
+/// seal and recovers the real sender from inside it, never trusting the wrap's author).
+///
+/// This is the handoff that used to be a human copying `ticket=<json>` out of the serve's stdout.
+/// Reading it off the relay instead is not merely more convenient — it means the DM leg is now
+/// COVERED by WAN-M rather than stubbed around, which is the same class of gap that let the
+/// 2026-08-27 sanitize defect ship.
+async fn await_ticket_dm(
+    app_id: &AppIdentity,
+    store: &DataStore,
+    relays: &[String],
+) -> Result<String> {
+    let shared_relay = net::new_shared();
+    let client = net::client(&app_id.identity, store, &shared_relay).await?;
+    let me = app_id.identity.public_key();
+    let own_npub = app_id.npub();
+
+    let deadline = tokio::time::Instant::now() + TICKET_DM_WAIT;
+    let mut last_err = String::from("no ticket DM seen");
+    let mut polls = 0u32;
+
+    while tokio::time::Instant::now() < deadline {
+        polls += 1;
+        // `since = 0`: take the whole inbox. The probe's store is fresh per run, and a ticket that
+        // arrived while we were still binding must not be missed by a narrow window.
+        match client.fetch(crate::commands::chat::dm_inbox_filter(me, 0), net::RELAY_TIMEOUT).await {
+            Ok(wraps) => {
+                let n = wraps.len();
+                // No contact filter: the serve is not yet in the probe's contact list on a fresh
+                // run, and the ticket's authenticity comes from the seal (decode_dms verifies it),
+                // not from an address book.
+                let msgs =
+                    crate::commands::chat::decode_dms(&own_npub, &app_id.identity, wraps, None).await;
+                for m in &msgs {
+                    if let Ok(t) = serde_json::from_str::<TransportTicket>(&m.content) {
+                        if t.verify_shape().is_ok() {
+                            eprintln!(
+                                "[probe] ticket DM received after {polls} poll(s): request_id={} slug={}",
+                                t.request_id, t.slug
+                            );
+                            return Ok(m.content.clone());
+                        }
+                    }
+                }
+                last_err = format!("{n} wrap(s) in the inbox, none carried a valid ticket");
+            }
+            Err(e) => last_err = format!("inbox fetch failed: {e}"),
+        }
+        tokio::time::sleep(TICKET_DM_POLL).await;
+    }
+    Err(anyhow!(
+        "no transport ticket arrived by DM within {}s ({last_err}). The serve must be running with \
+         --seed-dir + --asker-npub set to THIS probe's npub ({own_npub}), and both sides must share \
+         at least one relay: {relays:?}",
+        TICKET_DM_WAIT.as_secs()
+    ))
+}
+
 /// Run the WAN-M rows against a live serve. Requires the serve's FULL share code (--peer hbk…) — the
-/// acceptance gate (`accept_manifest_bytes`) needs the browse-key to decrypt — and `--ticket-json`
-/// (the ticket the serve printed). The probe seeds its own identity + store from --data-dir.
+/// acceptance gate (`accept_manifest_bytes`) needs the browse-key to decrypt.
+///
+/// **The ticket arrives by DM, the way it does in production.** `--ticket-json` is still accepted as
+/// an override for offline/isolation runs, but it is no longer required: with it absent the probe
+/// polls its own NIP-17 inbox for the ticket the serve's `send_full_list_inner` DM'd, exactly as the
+/// Chat page does. That is what removed the operator copy-paste from the middle of WAN-M and what
+/// makes an unattended cross-platform leg (Linux serve, Windows probe) possible.
 async fn run_probe_wan_m(args: &[String], peer_str: &str) -> Result<ExitCode> {
-    let ticket_json = args::flag_value(args, "--ticket-json")
-        .ok_or_else(|| anyhow!("--suite wan-m requires --ticket-json <path|inline> (the serve's printed ticket)"))?;
     let data_dir = PathBuf::from(
         args::flag_value(args, "--data-dir").unwrap_or("./hb-wan-it-probe-data").to_string(),
     );
@@ -944,11 +1024,27 @@ async fn run_probe_wan_m(args: &[String], peer_str: &str) -> Result<ExitCode> {
     store.save_settings(&Settings { relay_urls: relays.clone(), ..Default::default() })?;
     let app_id = load_or_create_identity(&store)?;
 
+    let ticket_json = match args::flag_value(args, "--ticket-json") {
+        Some(explicit) => {
+            eprintln!("[probe] --ticket-json supplied; skipping the inbox wait (isolation run)");
+            explicit.to_string()
+        }
+        None => {
+            eprintln!(
+                "[probe] waiting for the ticket DM from the serve (up to {}s) — this is the \
+                 production handoff, not a harness side-channel",
+                TICKET_DM_WAIT.as_secs()
+            );
+            await_ticket_dm(&app_id, &store, &relays).await?
+        }
+    };
+
     // The dead-endpoint address for M9: an unroutable iroh EndpointAddr JSON. The transport parses
     // this via serde_json; an id + a TEST-NET-1 (RFC 5737) socket is guaranteed to fail the dial.
     let dead_addr = make_dead_endpoint_addr().await;
 
-    let input = suite_wan_m::build_probe_input(app_id, store, peer_str, ticket_json, &dead_addr).await?;
+    let input =
+        suite_wan_m::build_probe_input(app_id, store, peer_str, &ticket_json, &dead_addr).await?;
 
     println!("# WAN-M probe against serve {}", input.serve_npub);
     println!("# ticket request_id={} slug={} nonce={:?}",
