@@ -79,6 +79,13 @@ fn new_request_id() -> String {
 ///    ticket serve a stale list forever, which is the failure the staleness gates exist to prevent.
 ///    If the consent concern is ever revisited, the answer is re-approval on change, not a frozen
 ///    artifact — and that is an owner ruling, not a refactor.
+///
+/// **This command is a marshalling shim and must stay one.** Every line of behaviour lives in
+/// [`send_full_list_inner`], which takes plain references instead of Tauri `State` so the WAN harness
+/// can drive the REAL body rather than a hand-copy of it. That split exists because of a shipped
+/// defect: the harness used to re-implement the asker's half step by step, the one step it did not
+/// copy was `sanitize_node_addr`, and the feature was broken end to end while 18 QUIC tests stayed
+/// green (owner devtest 2026-08-27). `fulfil_commands_stay_thin` pins the shim shape.
 #[tauri::command]
 pub async fn send_full_list(
     npub: String,
@@ -88,6 +95,19 @@ pub async fn send_full_list(
     store: State<'_, DataStore>,
     relay: State<'_, SharedRelay>,
     endpoint: State<'_, SharedEndpoint>,
+) -> CmdResult<()> {
+    send_full_list_inner(npub, slug, ask_nonce, &identity, &store, &relay, &endpoint).await
+}
+
+/// The whole of `send_full_list`'s behaviour, callable without a Tauri runtime.
+pub(crate) async fn send_full_list_inner(
+    npub: String,
+    slug: String,
+    ask_nonce: Option<String>,
+    identity: &SharedIdentity,
+    store: &DataStore,
+    relay: &SharedRelay,
+    endpoint: &SharedEndpoint,
 ) -> CmdResult<()> {
     let recipient = crate::commands::chat::parse_recipient(&npub)?;
     let (id_clone, browse_key, transport_key, own_npub) = {
@@ -115,7 +135,7 @@ pub async fn send_full_list(
     );
 
     // (1) Prove the manifest exists and fits, before anything is promised. `seal` is the ceiling.
-    let envelope = build_slug_manifest(&slug, &store, &id_clone, browse_key.bytes())?;
+    let envelope = build_slug_manifest(&slug, store, &id_clone, browse_key.bytes())?;
     let sealed = ManifestPayload::seal(&envelope).map_err(|e| {
         format!(
             "This collection's full list is too large to send over the connection ({e}). \
@@ -142,7 +162,7 @@ pub async fn send_full_list(
         role = "listen",
         "fulfil: binding the transport endpoint"
     );
-    let ep = ensure_endpoint(&endpoint, &own_npub, &identity, &transport_key, source, Role::Listen)
+    let ep = ensure_endpoint(endpoint, &own_npub, identity, &transport_key, source, Role::Listen)
         .await
         .map_err(|e| {
             format!("Could not start the transport ({e}). Export the list instead: Home → ⋯ → Export.")
@@ -187,8 +207,8 @@ pub async fn send_full_list(
     );
 
     let body = serde_json::to_string(&ticket).map_err(cmd_err)?;
-    let own = crate::net::relay_urls(&store);
-    let client = crate::net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
+    let own = crate::net::relay_urls(store);
+    let client = crate::net::client(&id_clone, store, relay).await.map_err(cmd_err)?;
     crate::commands::chat::send_dm_inner(
         &client,
         &id_clone,
@@ -219,6 +239,10 @@ pub async fn send_full_list(
 ///
 /// A failure here does **not** spend the ticket — the owner only records a receipt on the asker's
 /// acknowledgement, so a dial that never connects can simply be retried.
+///
+/// **A marshalling shim only** — see [`send_full_list`]'s note. The body is
+/// [`redeem_manifest_ticket_inner`], which the WAN harness calls directly, so the sanitize/claim/
+/// fetch/spend sequence the harness used to hand-copy is now the one the app runs.
 #[tauri::command]
 pub async fn redeem_manifest_ticket(
     npub: String,
@@ -227,6 +251,19 @@ pub async fn redeem_manifest_ticket(
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
     endpoint: State<'_, SharedEndpoint>,
+) -> CmdResult<crate::commands::browse::ImportedManifest> {
+    redeem_manifest_ticket_inner(npub, ticket_json, newest_fingerprint, &identity, &store, &endpoint)
+        .await
+}
+
+/// The whole of `redeem_manifest_ticket`'s behaviour, callable without a Tauri runtime.
+pub(crate) async fn redeem_manifest_ticket_inner(
+    npub: String,
+    ticket_json: String,
+    newest_fingerprint: Option<String>,
+    identity: &SharedIdentity,
+    store: &DataStore,
+    endpoint: &SharedEndpoint,
 ) -> CmdResult<crate::commands::browse::ImportedManifest> {
     let mut ticket: TransportTicket = serde_json::from_str(&ticket_json)
         .map_err(|_| "That message is not a readable transport ticket.".to_string())?;
@@ -284,7 +321,7 @@ pub async fn redeem_manifest_ticket(
         }
     }
 
-    let ep = ensure_endpoint(&endpoint, &own_npub, &identity, &transport_key, source, Role::DialOnly)
+    let ep = ensure_endpoint(endpoint, &own_npub, identity, &transport_key, source, Role::DialOnly)
         .await
         .map_err(cmd_err)?;
 
@@ -302,7 +339,7 @@ pub async fn redeem_manifest_ticket(
                 Some(&ticket.slug),
                 raw,
                 newest_fingerprint.as_deref(),
-                &store,
+                store,
                 // The cache IS the delivery on this path — Chat discards the tree and Browse reads it
                 // back. A dropped write must fail the gate, so no ACK is sent and the ticket survives.
                 true,
@@ -380,5 +417,64 @@ mod tests {
         });
         let t: TransportTicket = serde_json::from_value(wrong).unwrap();
         assert!(t.verify_shape().is_err(), "the discriminator is checked, not assumed");
+    }
+    /// **The structural repair for the 2026-08-27 devtest failure, pinned.**
+    ///
+    /// The bug itself was a byte comparison against a value production transforms. The reason it
+    /// SHIPPED was different and worse: the WAN harness re-implemented `redeem_manifest_ticket`'s
+    /// body step by step instead of calling it, and the one step it did not copy was the transform.
+    /// Both commands are now marshalling shims over `*_inner` functions the harness calls directly,
+    /// so no step can exist in production without also being on the tested path.
+    ///
+    /// This guard keeps them shims. If someone adds real logic to a `#[tauri::command]` body here,
+    /// the harness stops covering it and the blind spot returns — so the body must stay a single
+    /// delegating call. Scanned with comments stripped, so documenting the rule cannot satisfy it.
+    #[test]
+    fn fulfil_commands_stay_thin_so_the_harness_keeps_covering_them() {
+        let src = include_str!("fulfil.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for (cmd, inner) in
+            [("send_full_list", "send_full_list_inner"), ("redeem_manifest_ticket", "redeem_manifest_ticket_inner")]
+        {
+            let sig = format!("pub async fn {cmd}(");
+            let at = code.find(&sig).unwrap_or_else(|| panic!("{cmd} not found"));
+            let inner_sig = format!("async fn {inner}(");
+            let inner_at = code[at..]
+                .find(&inner_sig)
+                .map(|i| at + i)
+                .unwrap_or_else(|| panic!("{cmd}'s inner fn {inner} must follow it"));
+            // Everything between the command's signature and its inner fn: the parameter list plus
+            // the body. Only the body can contain statements, so counting `;` here is safe.
+            let region = &code[at..inner_at];
+            let brace = region
+                .find('{')
+                .unwrap_or_else(|| panic!("{cmd} has no body"));
+            let body = &region[brace..];
+
+            assert!(
+                body.contains(&format!("{inner}(")),
+                "{cmd} must delegate to {inner}"
+            );
+            // A shim marshals and calls. Anything else — a guard, a transform, an ordering rule —
+            // belongs in the inner fn where the harness will actually run it.
+            for banned in ["if ", "match ", "for ", "while ", "?;", ".await?"] {
+                assert!(
+                    !body.contains(banned),
+                    "{cmd} grew logic ({banned:?}) in its #[tauri::command] body. Move it into \
+                     {inner}: the WAN harness calls the inner fn, so anything here is untested — \
+                     which is exactly how the sanitize_node_addr defect shipped."
+                );
+            }
+            let stmts = body.matches(';').count();
+            assert!(
+                stmts <= 1,
+                "{cmd}'s command body should be one delegating call, found {stmts} statements"
+            );
+        }
     }
 }

@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 // M17 W5 — the devtest-item-2 regression, pinned. The headline case is the last test in the first
 // block: an offline contact's age must GROW with the clock and must never read "just now".
 
@@ -23,9 +24,65 @@ describe('presenceView — real presence, honestly labelled', () => {
 	});
 
 	it('the window boundary is inclusive (matches ONLINE_WINDOW_SECS)', () => {
-		expect(PRESENCE_WINDOW_MS).toBe(600_000);
 		expect(presenceView(iso(PRESENCE_WINDOW_MS), NOW).online).toBe(true);
 		expect(presenceView(iso(PRESENCE_WINDOW_MS + 1_000), NOW).online).toBe(false);
+	});
+
+	// DRIFT GUARD (chorus review 2026-08-27, finding 5). This used to be `expect(PRESENCE_WINDOW_MS)
+	// .toBe(600_000)` — a literal restating a Rust constant, which is the exact shape that lets half
+	// a change land: narrow ONLINE_WINDOW_SECS in Rust and the pill keeps calling a stale beacon
+	// "Online" for the old 10 minutes, with a green suite. The owner has an open decision on this
+	// window (devtest item 1: the beacon republishes every PRESENCE_REFRESH_SECS = 300 s, so the
+	// window cannot go below ~2x that without one late publish reading as offline), so it is
+	// specifically likely to move. Read the Rust source, not a second copy of the number.
+	it('PRESENCE_WINDOW_MS tracks Rust ONLINE_WINDOW_SECS instead of restating it', () => {
+		// '../../../' from src/lib/ lands on crates/hb-app/ — same idiom as poll-lifecycle.test.ts.
+		// '../../' resolves to ui/src/, which does not exist as a Rust path and made this guard
+		// throw ENOENT rather than compare anything.
+		const rust = readFileSync(new URL('../../../src/commands/online.rs', import.meta.url), 'utf8');
+		const m = rust.match(/pub const ONLINE_WINDOW_SECS: u64 = ([0-9_]+);/);
+		expect(m, 'ONLINE_WINDOW_SECS not found in hb-app/src/commands/online.rs').toBeTruthy();
+		expect(Number(m![1].replace(/_/g, '')) * 1_000).toBe(PRESENCE_WINDOW_MS);
+	});
+
+	// And the constraint the window has to satisfy, so a future narrowing cannot silently break it.
+	//
+	// The window is NOT free to shrink: we republish our own beacon every PRESENCE_REFRESH_SECS, so a
+	// window at (or near) that cadence has no slack and ONE late or failed publish flips a genuinely
+	// online peer to Offline. The slack has to cover the failed-cycle retry backoff long enough for a
+	// transient relay flap to self-heal. Both numbers are PARSED from presence.rs — an earlier draft
+	// of this guard hard-coded the rule as ">= 2x cadence", which was a number picked from the old
+	// 600 s window rather than from the mechanism, and it would have wrongly rejected the owner's
+	// 480 s ruling. Assert against the backoff schedule that actually does the healing.
+	it('the window leaves enough slack over the beacon cadence for the retry backoff to self-heal', () => {
+		const rust = readFileSync(new URL('../../../src/presence.rs', import.meta.url), 'utf8');
+
+		const cadence = rust.match(/pub const PRESENCE_REFRESH_SECS: u64 = ([0-9 *_]+);/);
+		expect(cadence, 'PRESENCE_REFRESH_SECS not found in hb-app/src/presence.rs').toBeTruthy();
+		const cadenceSecs = cadence![1]
+			.split('*')
+			.map((part) => Number(part.replace(/_/g, '').trim()))
+			.reduce((a, b) => a * b, 1);
+		expect(Number.isFinite(cadenceSecs) && cadenceSecs > 0).toBe(true);
+
+		const backoff = rust.match(/const RETRY_BACKOFF_SECS: \[u64; \d+\] = \[([0-9,\s_]+)\];/);
+		expect(backoff, 'RETRY_BACKOFF_SECS not found in hb-app/src/presence.rs').toBeTruthy();
+		const steps = backoff![1]
+			.split(',')
+			.map((n) => Number(n.replace(/_/g, '').trim()))
+			.filter((n) => Number.isFinite(n));
+		expect(steps.length).toBeGreaterThan(2);
+
+		// Three retries is the bar: enough for a flap to clear without demanding a window so wide that
+		// a peer who really left keeps reading Online. At 300 s cadence that is 15+30+60 = 105 s of
+		// slack, and the ruled 480 s window leaves 180 s.
+		const slackNeeded = steps.slice(0, 3).reduce((a, b) => a + b, 0);
+		const slackSecs = PRESENCE_WINDOW_MS / 1_000 - cadenceSecs;
+		expect(
+			slackSecs,
+			`window ${PRESENCE_WINDOW_MS / 1_000}s - cadence ${cadenceSecs}s = ${slackSecs}s of slack, ` +
+				`but three retry steps need ${slackNeeded}s`,
+		).toBeGreaterThanOrEqual(slackNeeded);
 	});
 
 	it('never-observed reads "unknown", never "never" and never "just now"', () => {

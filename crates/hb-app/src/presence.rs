@@ -37,7 +37,7 @@ pub const PRESENCE_REFRESH_SECS: u64 = 5 * 60;
 pub(crate) const PRESENCE_FIRST_DELAY_SECS: u64 = 15;
 
 /// The retry backoff schedule for a FAILED beacon cycle (W1, 2026-08-02). A successful cycle waits
-/// the normal `PRESENCE_REFRESH_SECS` (300 s) cadence; a failed cycle retries fast — inside the 600 s
+/// the normal `PRESENCE_REFRESH_SECS` (300 s) cadence; a failed cycle retries fast — inside the 480 s
 /// online window instead of after the full 300 s — with a bounded, increasing backoff so a transient
 /// relay flap self-heals before two missed windows read as "offline". `retry_idx` is the count of
 /// consecutive prior failures (0 = first failure this streak).
@@ -362,7 +362,7 @@ pub(crate) async fn run_presence_loop(
             );
         }
 
-        // W1: a failed cycle retries fast (backoff inside the 600s window); a success resets to the
+        // W1: a failed cycle retries fast (backoff inside the 480s window); a success resets to the
         // normal 300s cadence.
         delay = next_delay(succeeded, retry_idx);
         retry_idx = if succeeded { 0 } else { retry_idx.saturating_add(1) };
@@ -521,7 +521,12 @@ mod tests {
         let d = next_delay(false, 0);
         assert!(d < Duration::from_secs(PRESENCE_REFRESH_SECS), "first retry must beat the 300s cadence");
         assert!(d > Duration::from_secs(0));
-        assert!(d < Duration::from_secs(600), "and land inside the 600s online window");
+        // 480 s since the 2026-08-27 owner ruling. Read from the production constant rather
+        // than restated, so narrowing the window again cannot leave this assertion behind.
+        assert!(
+            d < Duration::from_secs(crate::commands::online::ONLINE_WINDOW_SECS),
+            "and land inside the online window"
+        );
     }
 
     #[test]

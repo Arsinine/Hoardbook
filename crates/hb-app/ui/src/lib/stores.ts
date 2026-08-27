@@ -1,4 +1,4 @@
-import { writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 import type { CachedPeer, Collection, IdentityInfo, Profile, ReceivedMessage, DmRequestView, TopicAnnounceSummary } from './types.js';
 
 export const identity = writable<IdentityInfo | null>(null);
@@ -127,16 +127,51 @@ export const announceSeen = writable<Record<string, number>>({});
 // exact failure the tracker rules out). A replace clears the first toast's timer so it can't kill the
 // second early. This is the single source of truth: both toast() and toastWithAction() route through it.
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
-const TOAST_MS = 3500;
-const TOAST_ACTION_MS = 6000; // undo needs more time to be usable
+// Devtest 2026-08-26 item 7 (owner follow-up): both success durations DOUBLED — 3500 and 6000 were
+// too short to finish reading. Errors don't use these at all any more; they are sticky.
+const TOAST_MS = 7000;
+const TOAST_ACTION_MS = 12000; // undo needs more time to be usable
 
 function clearToastTimer() {
 	if (toastTimer) { clearTimeout(toastTimer); toastTimer = undefined; }
 }
 
+/** Devtest 2026-08-26 item 7 — an ERROR toast never auto-expires. Errors are the messages the user
+ *  has to READ (the manifest-too-big one is three sentences and names a byte count and a menu path),
+ *  and 3.5s is not enough to read them; the owner reported the text "disappears too quickly to be
+ *  read". A sticky toast is dismissed by the ✕ the layout renders for it, via dismissToast(). Success
+ *  toasts are unchanged: still TOAST_MS. */
+export function isStickyToast(kind: 'success' | 'error'): boolean {
+	return kind === 'error';
+}
+
+/** Dismiss the live toast (the ✕ on a sticky error). Safe to call when nothing is showing. */
+export function dismissToast() {
+	clearToastTimer();
+	toastMessage.set(null);
+}
+
+/** A PLAIN success toast must not silently replace a sticky error the user hasn't dismissed — that
+ *  would reintroduce the exact "it vanished before I could read it" failure by another route. Errors
+ *  still replace errors (newest wins), matching the replace-not-queue rule above.
+ *
+ *  ⚠ This is consulted by `toast()` ONLY, never by `toastWithAction()`, and the asymmetry is the
+ *  whole point. An action-bearing toast is not feedback — it is the Undo affordance, and for a
+ *  drag-to-group move it is the ONLY undo path there is (registerUndo, contacts/+page.svelte and
+ *  browse/+page.svelte). Suppressing it would silently destroy the user's ability to reverse a
+ *  write they just made, which is a strictly worse outcome than an error toast being replaced —
+ *  they can re-trigger the failing action to see the error again, but they cannot re-summon an Undo
+ *  that never rendered. Text feedback yields to an unread error; an escape hatch does not. */
+function blockedByStickyError(kind: 'success' | 'error'): boolean {
+	if (kind === 'error') return false;
+	return get(toastMessage)?.kind === 'error';
+}
+
 export function toast(text: string, kind: 'success' | 'error' = 'success') {
+	if (blockedByStickyError(kind)) return;
 	clearToastTimer();
 	toastMessage.set({ text, kind });
+	if (isStickyToast(kind)) return; // no timer — the ✕ is the only way out
 	toastTimer = setTimeout(() => { toastMessage.set(null); toastTimer = undefined; }, TOAST_MS);
 }
 
@@ -149,12 +184,14 @@ export function toastWithAction(
 	action: { label: string; run: () => void },
 	kind: 'success' | 'error' = 'success',
 ) {
+	// No blockedByStickyError() here — see the note on that function. An Undo always renders.
 	clearToastTimer();
 	toastMessage.set({ text, kind, action: { label: action.label, run: () => {
 		clearToastTimer();
 		toastMessage.set(null);
 		action.run();
 	} } });
+	if (isStickyToast(kind)) return; // sticky: the action stays live until the ✕ or the action itself
 	toastTimer = setTimeout(() => { toastMessage.set(null); toastTimer = undefined; }, TOAST_ACTION_MS);
 }
 

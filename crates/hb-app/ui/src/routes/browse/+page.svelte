@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { contacts, toast, toastWithAction, contactsLoadError, loadContactsInto } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
+	import { sizeTier, sizeTierTooltip } from '$lib/collection-row-view.js';
 	import { refreshContact, importManifest, requestManifest, getManifestAsks, getContacts, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, browsePrivateCollections, type ManifestAsk } from '$lib/api.js';
 	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 	import { page } from '$app/stores';
@@ -23,7 +24,7 @@
 	// 2026-08-09). Ungrouped clears all. One implementation, two consumers (this + Contacts).
 	// M22 W5 — multi-select drag primitives (shared with Contacts). Same selection model:
 	// plain click selects one, Shift-click extends a contiguous run, Cmd/Ctrl toggles one.
-	import { writeDragPayload, readDragPayload, writeDragPayloadMulti, readDragPayloadMulti, isValidDropTarget, isSelfDrop, groupSuggestions, groupSuggestionsMulti, commitCreateGroup, commitCreateGroupMulti, computeDropOutcome, commitDropOnGroup, computeDropOutcomeMulti, commitDropOnGroupMulti, applyClickToSelection, applyKeyToSelection, isTypingTargetShape, rovingTabindexForIdx, shouldHandleArrowKey, rowId, computeDropInverse, computeDropInverseMulti, computeCreateInverse, commitInverse, commitInverseMulti, UNGROUPED_TARGET, type DropOutcome, type DropOutcomeMulti } from '$lib/drag-group.js';
+	import { writeDragPayload, readDragPayload, writeDragPayloadMulti, readDragPayloadMulti, isOurDrag, isValidDropTarget, isSelfDrop, groupSuggestions, groupSuggestionsMulti, commitCreateGroup, commitCreateGroupMulti, computeDropOutcome, commitDropOnGroup, computeDropOutcomeMulti, commitDropOnGroupMulti, applyClickToSelection, applyKeyToSelection, isTypingTargetShape, rovingTabindexForIdx, shouldHandleArrowKey, rowId, computeDropInverse, computeDropInverseMulti, computeCreateInverse, commitInverse, commitInverseMulti, UNGROUPED_TARGET, type DropOutcome, type DropOutcomeMulti } from '$lib/drag-group.js';
 	import { contactDisplayName, shortNpub } from '$lib/contact-display.js';
 	import { tick } from 'svelte';
 
@@ -462,6 +463,9 @@
 	}
 
 	let dragSourceNpub = $state<string | null>(null);
+	// The npubs this drag carries, captured at dragstart. dragover handlers read the payload
+	// from HERE, not from the DataTransfer — getData() is blanked during dragover (see isOurDrag).
+	let dragCarriedNpubs = $state<string[]>([]);
 	let dragOverNpub = $state<string | null>(null);
 	// M22 W5: how many contacts are being dragged (0 for single-pair W3, N-1 for multi of N).
 	let dragCount = $state(0);
@@ -546,6 +550,7 @@
 			carried = [npub];
 		}
 		dragSourceNpub = npub;
+		dragCarriedNpubs = carried;
 		// M22 W6: capture prior membership at drag START for the move inverse.
 		const m = new Map<string, string[]>();
 		for (const n of carried) m.set(n, peerGroupsOf(n));
@@ -565,6 +570,7 @@
 
 	function onDragEnd() {
 		dragSourceNpub = null;
+		dragCarriedNpubs = [];
 		dragOverNpub = null;
 		dragCount = 0;
 		// M22 W4: clear the group-heading drop affordance state too.
@@ -715,12 +721,18 @@
 	}
 
 	function onGroupDragOver(e: DragEvent, targetName: string) {
-		// M22 W5: read multi payload first; fall back to single-npub.
-		const multiNpubs = readDragPayloadMulti(e.dataTransfer);
-		if (multiNpubs && multiNpubs.length > 1) {
+		// Wrong drag type (e.g. a file drag) — don't claim the drop. Gate on the MIME TYPE, never
+		// on the payload: getData() returns "" during dragover, so reading it here refused every
+		// drop onto a group pill (owner report 2026-08-26). See isOurDrag.
+		if (!isOurDrag(e.dataTransfer)) return;
+		// The payload comes from our own drag state, captured at dragstart.
+		const carried = dragCarriedNpubs;
+		if (carried.length === 0) return;
+		// M22 W5: a multi-selection drag carries every selected npub.
+		if (carried.length > 1) {
 			e.preventDefault();
-			const groupsByNpub = new Map(multiNpubs.map((n) => [n, peerGroupsOf(n)]));
-			const outcome = computeDropOutcomeMulti(multiNpubs, targetName, groupsByNpub, e.shiftKey);
+			const groupsByNpub = new Map(carried.map((n) => [n, peerGroupsOf(n)]));
+			const outcome = computeDropOutcomeMulti(carried, targetName, groupsByNpub, e.shiftKey);
 			dropOverTarget = targetName;
 			dropOutcomeMulti = outcome;
 			if (e.dataTransfer) {
@@ -728,8 +740,7 @@
 			}
 			return;
 		}
-		const sourceNpub = readDragPayload(e.dataTransfer);
-		if (!sourceNpub) return;
+		const sourceNpub = carried[0];
 		e.preventDefault();
 		const outcome = computeDropOutcome(sourceNpub, targetName, peerGroupsOf(sourceNpub), e.shiftKey);
 		dropOverTarget = targetName;
@@ -837,6 +848,21 @@
 	{#if dropOverTarget && dropOutcome}
 		{#if dropOutcome.kind === 'refused'}{dropOutcome.reason}{:else if dropOutcome.kind === 'noop'}already ungrouped{:else if dropOutcome.kind === 'add'}add to {dropOverTarget}{:else if dropOutcome.kind === 'move'}move to {dropOverTarget}{:else}remove all groups{/if}
 	{/if}
+</div>
+
+<!-- Devtest 2026-08-26 item 5: Browse carried no full-width bar, so the only draggable surface was
+     the layout's 8px top strip — which on Windows doubles as the resize hotspot, leaving effectively
+     nothing to grab (owner: "cannot drag move the app"). This is the SAME .topbar every other route
+     carries, so it inherits the layout's :global(.topbar) 120px right reservation and reads as
+     existing chrome rather than a new bar (owner ruling: consistent with Home and Contacts, must not
+     stand out). It is unconditional — outside every {#if} — which is the point: .panel-top below is
+     inside the left panel and Chat's .pane-header is thread-dependent, so neither is a guaranteed
+     handle. -->
+<div class="topbar" data-tauri-drag-region>
+	<div>
+		<div class="topbar-title">Browse</div>
+		<div class="topbar-sub">Collections your contacts have published</div>
+	</div>
 </div>
 
 <div class="browse-shell">
@@ -1025,7 +1051,7 @@
 									<div class="col-card-desc">{col.description}</div>
 								{/if}
 								<div class="col-card-meta">
-									{col.item_count} item{col.item_count !== 1 ? 's' : ''}
+									<span class="size-{sizeTier(col.item_count)}" title={sizeTierTooltip(col.item_count) ?? undefined}>{col.item_count} item{col.item_count !== 1 ? 's' : ''}</span>
 									{#if col.est_size}· {col.est_size}{:else if col.total_bytes}· {fmtBytes(col.total_bytes)}{/if}
 								</div>
 								{#if (col.content_types?.length ?? 0) > 0 || col.sorted}
@@ -1070,7 +1096,7 @@
 											<div class="col-card-desc">{col.description}</div>
 										{/if}
 										<div class="col-card-meta">
-											{col.item_count} item{col.item_count !== 1 ? 's' : ''}
+											<span class="size-{sizeTier(col.item_count)}" title={sizeTierTooltip(col.item_count) ?? undefined}>{col.item_count} item{col.item_count !== 1 ? 's' : ''}</span>
 											{#if col.est_size}· {col.est_size}{:else if col.total_bytes}· {fmtBytes(col.total_bytes)}{/if}
 										</div>
 										{#if (col.content_types?.length ?? 0) > 0 || col.sorted}
@@ -1310,9 +1336,28 @@
 <CreateGroupDialog open={createGroupOpen} oncreate={handleCreateGroup} oncancel={() => (createGroupOpen = false)} />
 
 <style>
+	/* Devtest item 5 — copied verbatim from Contacts/Home so the bar is indistinguishable from
+	   theirs. Svelte styles are component-scoped, so this cannot be shared; the 120px right
+	   reservation still comes from the ONE global rule in +layout.svelte. */
+	.topbar {
+		padding: 16px 24px;
+		border-bottom: 1px solid var(--border);
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: 16px;
+		background: var(--bg);
+		flex-shrink: 0;
+	}
+	.topbar-title { font-size: 17px; font-weight: 600; color: var(--fg); letter-spacing: -0.3px; }
+	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
+
 	.browse-shell {
 		display: flex;
-		height: 100%;
+		/* was height: 100% — with the topbar above it, 100% would overflow .main by the bar's
+		   height. flex:1 lets it take whatever is left, whatever the bar ends up measuring. */
+		flex: 1;
+		min-height: 0;
 		overflow: hidden;
 	}
 
@@ -1703,6 +1748,11 @@
 		color: var(--fg-dim);
 		margin-top: 2px;
 	}
+
+	/* devtest item 6 — size tiers, same values as CollectionRow/CollectionPanel (a peer's over-cap
+	   collection is just as unshareable as your own). `normal` has no rule: it stays as is. */
+	.size-warn { color: oklch(0.78 0.13 60); }
+	.size-over { color: oklch(0.70 0.09 25); }
 
 	.col-tags {
 		display: flex;

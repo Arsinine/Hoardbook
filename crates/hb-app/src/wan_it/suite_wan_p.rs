@@ -23,8 +23,9 @@ use nostr::prelude::*;
 
 use super::tap::Tap;
 
-/// Online freshness window — matches `commands::online::ONLINE_WINDOW_SECS` (600 s).
-const ONLINE_WINDOW_SECS: u64 = 600;
+/// Online freshness window — matches `commands::online::ONLINE_WINDOW_SECS` (480 s since the owner
+/// ruling of 2026-08-27; was 600 s).
+const ONLINE_WINDOW_SECS: u64 = 480;
 /// A presence beacon TTL comfortably inside the freshness window.
 const PRESENCE_TTL_SECS: u64 = 30 * 60;
 /// Relay handshake/fetch timeout.
@@ -54,7 +55,7 @@ pub async fn run(
 ) {
     // P1 — the W1 fix row: author-filtered read resolves the served peer regardless of the global cap.
     tap.check(
-        "P1: resolve served peer via the production presence path (fetch_presence_for_authors) within 600s",
+        "P1: resolve served peer via the production presence path (fetch_presence_for_authors) within 480s",
         p1_resolve_via_production_path(peer_npub, relays).await,
     );
 
@@ -70,9 +71,9 @@ pub async fn run(
         p3_cap_displacement(peer_npub, relays, flood_ctx).await,
     );
 
-    // P4 — retry regression. W1 shipped the retry: a failed cycle backs off inside the 600s window.
+    // P4 — retry regression. W1 shipped the retry: a failed cycle backs off inside the 480s window.
     tap.check(
-        "P4: a failed publish cycle retries inside the 600s window (not the full 300s cadence)",
+        "P4: a failed publish cycle retries inside the 480s window (not the full 300s cadence)",
         p4_retry_within_window(relays).await,
     );
 
@@ -90,7 +91,7 @@ pub async fn run(
 /// Resolve the served peer through the **same production path the contact-row pill uses**:
 /// `commands::online::refresh_count` → `hb_net::fetch_presence_for_authors` (the author-filtered
 /// read) → the `fresh` map. The harness drives real shipped code — it does not reimplement the
-/// query. Asserts the peer's npub appears in the fresh map within the 600 s window.
+/// query. Asserts the peer's npub appears in the fresh map within the 480 s window.
 ///
 /// **W1 (2026-08-02):** the read is now author-filtered (`.authors([peer_npub])` +
 /// `.limit(1)`), so the relay's global response cap cannot displace the served beacon — the peer
@@ -363,7 +364,7 @@ async fn p4_retry_within_window(relays: &[String]) -> Result<(), String> {
         return Err("verify-leg: binding did not verify".to_string());
     }
 
-    // (4) W1 shipped the retry: a failed cycle now backs off fast (inside the 600s window) instead
+    // (4) W1 shipped the retry: a failed cycle now backs off fast (inside the 480s window) instead
     //     of waiting the full 300s cadence. Assert the production selector directly (driving the real
     //     >300s loop is impractical; next_delay is the pure, deterministic proxy the loop uses).
     use crate::presence::{next_delay, PRESENCE_REFRESH_SECS};
@@ -375,10 +376,10 @@ async fn p4_retry_within_window(relays: &[String]) -> Result<(), String> {
     }
     if first_retry >= Duration::from_secs(ONLINE_WINDOW_SECS) {
         return Err(format!(
-            "retry does not land inside the 600s window: {first_retry:?}"
+            "retry does not land inside the 480s window: {first_retry:?}"
         ));
     }
-    eprintln!("   P4 retry lands in {first_retry:?} (< 300s cadence, inside the 600s window)");
+    eprintln!("   P4 retry lands in {first_retry:?} (< 300s cadence, inside the 480s window)");
     Ok(())
 }
 

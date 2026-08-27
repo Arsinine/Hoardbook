@@ -166,6 +166,39 @@ impl TransportTicket {
         }
         Ok(())
     }
+
+    /// Does the ticket a redeemer presented match the one this node issued?
+    ///
+    /// **Every field except `node_addr`** — and that exclusion is the whole reason this method
+    /// exists rather than a `==`.
+    ///
+    /// The owner side used to compare the structs with `==`, which was wrong in a way that broke the
+    /// feature outright between two real machines (owner devtest 2026-08-27: "Send the full list"
+    /// returned the forged-ticket refusal with both peers online). The asker is *required* to rewrite
+    /// `node_addr` before redeeming: `redeem_manifest_ticket` runs it through `sanitize_node_addr`,
+    /// the QURATOR-113 #20 SSRF guard, which drops loopback/RFC1918/link-local/CGNAT transport
+    /// addresses and re-serializes what is left. Two machines on a LAN both advertise RFC1918
+    /// addresses, so the guard always changed the string, so the comparison could never succeed. Even
+    /// with nothing dropped, a parse-and-re-serialize round trip is not guaranteed byte-identical.
+    /// The loopback QUIC tests never caught it because they call `fetch_manifest` directly and so
+    /// never sanitize.
+    ///
+    /// **Excluding it costs nothing, because `node_addr` was never part of the capability.** It is
+    /// the ISSUER'S OWN address — a value this node generated and put in the ticket itself. Making
+    /// the asker echo it back byte-for-byte authenticates nobody: an attacker holding the ticket
+    /// holds the address too, and a redeemer that reached us self-evidently found a working address
+    /// already. The secret that rode a sealed one-recipient DM is the `request_id`/`ask_nonce`/`slug`
+    /// triple, and every one of those is still compared here. `authorize_redemption` then applies the
+    /// live standing and spent checks on top.
+    #[must_use]
+    pub fn matches_issued(&self, issued: &Self) -> bool {
+        self.hb == issued.hb
+            && self.ticket_v == issued.ticket_v
+            && self.request_id == issued.request_id
+            && self.slug == issued.slug
+            && self.issued_at == issued.issued_at
+            && self.ask_nonce == issued.ask_nonce
+    }
 }
 
 /// Permission to attempt **one** redemption — and the only route to a [`ConsumedTicket`].
@@ -471,5 +504,70 @@ mod tests {
                 "a ticket with an empty {blank} is refused"
             );
         }
+    }
+    /// **The devtest 2026-08-27 regression.** The owner clicked "Send the full list" with both dev
+    /// machines online and the asker got the refusal reserved for a forged ticket. Cause: the owner
+    /// side compared the two tickets with `==`, but the asker MUST rewrite `node_addr` first
+    /// (`sanitize_node_addr`, the QURATOR-113 #20 SSRF guard, drops RFC1918/loopback/link-local/CGNAT
+    /// addresses and re-serializes). Two machines on a LAN always trip that, so the check could never
+    /// pass. This is the red-green: it fails against a `==` comparison and passes against
+    /// `matches_issued`.
+    #[test]
+    fn a_redeemer_that_sanitized_the_node_addr_still_matches_the_issued_ticket() {
+        let issued = TransportTicket::issue(
+            "req-1",
+            "vhs",
+            r#"{"node_id":"abc","addrs":["192.168.1.20:41234","203.0.113.9:41234"]}"#,
+            1_700_000_000,
+            Some("nonce-1"),
+        );
+
+        // What the asker actually presents: same ticket, private address stripped by the SSRF guard.
+        let mut presented = issued.clone();
+        presented.node_addr = r#"{"node_id":"abc","addrs":["203.0.113.9:41234"]}"#.to_string();
+
+        assert_ne!(presented, issued, "the fixture must actually differ, or this proves nothing");
+        assert!(
+            presented.matches_issued(&issued),
+            "a redeemer that sanitized the address it was given must still be recognised"
+        );
+    }
+
+    /// The other half: everything that IS the capability still has to match, or the exclusion of
+    /// `node_addr` would have widened the gate instead of correcting it. Each field is mutated on its
+    /// own so a single over-broad `true` cannot pass this.
+    #[test]
+    fn matches_issued_still_refuses_every_capability_field_mismatch() {
+        let issued = TransportTicket::issue("req-1", "vhs", "addr-a", 1_700_000_000, Some("nonce-1"));
+
+        let mut wrong_request = issued.clone();
+        wrong_request.request_id = "req-2".into();
+        assert!(!wrong_request.matches_issued(&issued), "a different request id is refused");
+
+        let mut wrong_slug = issued.clone();
+        wrong_slug.slug = "betamax".into();
+        assert!(!wrong_slug.matches_issued(&issued), "a ticket redirected at another collection is refused");
+
+        let mut wrong_nonce = issued.clone();
+        wrong_nonce.ask_nonce = Some("nonce-2".into());
+        assert!(!wrong_nonce.matches_issued(&issued), "a different ask nonce is refused");
+
+        let mut no_nonce = issued.clone();
+        no_nonce.ask_nonce = None;
+        assert!(!no_nonce.matches_issued(&issued), "dropping the nonce entirely is refused");
+
+        let mut wrong_issued_at = issued.clone();
+        wrong_issued_at.issued_at += 1;
+        assert!(!wrong_issued_at.matches_issued(&issued), "a re-dated ticket is refused");
+
+        let mut wrong_v = issued.clone();
+        wrong_v.ticket_v = TICKET_V + 1;
+        assert!(!wrong_v.matches_issued(&issued), "a different ticket version is refused");
+
+        let mut wrong_tag = issued.clone();
+        wrong_tag.hb = "hb-something-else".into();
+        assert!(!wrong_tag.matches_issued(&issued), "a different discriminator is refused");
+
+        assert!(issued.matches_issued(&issued), "and the unmodified ticket still matches");
     }
 }
