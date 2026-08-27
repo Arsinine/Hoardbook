@@ -20,24 +20,32 @@ describe('Chat page — M17 W7.1b manifest-request fulfilment card wiring', () =
 		expect(src).toContain("from '$lib/components/ManifestFulfilCard.svelte'");
 		expect(src).toContain("from '$lib/manifest-fulfil.js'");
 		expect(src).toContain('manifestFulfilFor');
-		// The post-export toast copy is imported from the single source (not re-stringed in-route).
-		expect(src).toContain('MANIFEST_EXPORTED_TOAST');
 	});
 
-	it('reuses the existing export path — saveDialog + exportManifest, never a new Tauri command', () => {
-		// Hard constraint #3 (spec): "No new export logic; this is a second entry point to the shipped
-		// one." The route must import `save as saveDialog` + `exportManifest` and call them in the click
-		// handler — never a bespoke transfer/chunk command.
+	// INVERTED by the owner's 2026-08-27 ruling: "Remove the export manifest button - the entire
+	// purpose of this IS so you dont have to manually find a third party service to send your files".
+	// Chat had a whole second export entry point (saveDialog → exportManifest → toast) behind that
+	// button; button and path are both gone. This test used to pin the path's shape; it now pins its
+	// ABSENCE, so a future edit cannot quietly reintroduce a second export surface in Chat.
+	it('Chat carries NO export path at all — export lives on Home, not here', () => {
 		const src = chatSrc();
-		expect(src).toMatch(/import \{ save as saveDialog \} from '@tauri-apps\/plugin-dialog'/);
-		expect(src).toContain('exportManifest');
-		// The defaultPath mirrors Home → ⋯ → Export exactly (no rename, no different extension).
-		const exportOpen = src.indexOf('async function handleExportManifest');
-		expect(exportOpen).toBeGreaterThan(-1);
-		const afterExport = src.indexOf('\tasync function', exportOpen + 1);
-		const block = src.slice(exportOpen, afterExport === -1 ? src.length : afterExport);
-		expect(block).toContain('defaultPath: `${slug}.hbmanifest`');
-		expect(block).toContain('await exportManifest(slug, path)');
+		expect(src).not.toContain('handleExportManifest');
+		expect(src).not.toContain('saveDialog');
+		expect(src).not.toContain('exportManifest');
+		expect(src).not.toContain('MANIFEST_EXPORTED_TOAST');
+		expect(src).not.toContain('exportingSlug');
+		// The card itself must not grow one either. Comments stripped first: the deletion left a note
+		// naming the button and where Export still lives, and an absence assertion must not red on
+		// its own explanation (CLAUDE.md §9 — the affordance, not the word).
+		const card = readFileSync(
+			new URL('../../lib/components/ManifestFulfilCard.svelte', import.meta.url),
+			'utf8',
+		)
+			.replace(/<!--[\s\S]*?-->/g, '')
+			.replace(/\/\*[\s\S]*?\*\//g, '')
+			.replace(/^\s*\/\/.*$/gm, '');
+		expect(card).not.toMatch(/Export manifest/);
+		expect(card).not.toContain('onexport');
 	});
 
 	it('the Private state offers no big-relay advice (it cannot work for a sealed collection)', () => {
@@ -76,13 +84,17 @@ describe('Chat page — M17 W7.1b manifest-request fulfilment card wiring', () =
 		const reqBlockStart = src.lastIndexOf('{#if manifestFulfilFor', cardAfterReq);
 		const reqBlock = src.slice(reqBlockStart, cardAfterReq);
 		expect(reqBlock).toContain('quarantined: true');
-		// The quarantine card's onexport is an inert no-op (not wired to the handler).
-		expect(quarantinedCard).toContain('onexport={() => {}}');
+		// `onexport` is gone entirely (owner ruling 2026-08-27) — the no-op that used to stand in for
+		// "inert here" no longer exists, so what this pins now is that the quarantine card is handed
+		// an inert `onsend` and nothing else actionable.
+		expect(quarantinedCard).not.toContain('onexport');
+		expect(quarantinedCard).toContain('onsend={() => {}}');
 	});
 
-	it('the conversation-thread card IS wired to handleExportManifest', () => {
-		// The non-quarantine card (the normal conversation thread) calls the export handler. This is
-		// the one place the card surfaces the verb; the handler runs the existing export path.
+	// INVERTED with the button (owner ruling 2026-08-27). Was: "the conversation-thread card IS
+	// wired to handleExportManifest". The conversation card now has exactly one action — Send — so
+	// what needs pinning is that the send wiring survived the removal intact.
+	it('the conversation-thread card is wired to send, and to nothing else', () => {
 		const src = chatSrc();
 		const convEach = src.indexOf('{#each conversation as msg');
 		expect(convEach).toBeGreaterThan(-1);
@@ -94,7 +106,8 @@ describe('Chat page — M17 W7.1b manifest-request fulfilment card wiring', () =
 		const convBlockStart = src.lastIndexOf('{#if manifestFulfilFor', cardAfterConv);
 		const convBlock = src.slice(convBlockStart, cardAfterConv);
 		expect(convBlock).toContain('quarantined: false');
-		expect(convCard).toContain('onexport={(slug) => handleExportManifest(slug)}');
+		expect(convCard).toContain('onsend={(slug) => handleSendFullList(slug, mf.request.askNonce)}');
+		expect(convCard).not.toContain('onexport');
 	});
 
 	it('the card is an ADDENDUM — verbatim message text renders above it, never replaced', () => {
@@ -110,30 +123,20 @@ describe('Chat page — M17 W7.1b manifest-request fulfilment card wiring', () =
 		expect(bubbleText).toBeLessThan(mfCard);
 	});
 
-	it('post-export copy contains no "Download"/"Send" (MAS-INV-5 + INV-4 sweeps green)', () => {
-		// The toast is built from MANIFEST_EXPORTED_TOAST (single source); the route must NOT inline
-		// its own copy with a forbidden word. Scan the route's user-facing segments.
+	// REMOVED WITH THE HINT (owner ruling 2026-08-27): the card's big-relay line ("Add a big relay in
+	// Settings to publish the rest for them.") was one of the three lines the owner cut, so
+	// `hasBigRelay` is no longer a prop and there is no gate left to test. What remains worth pinning
+	// is that no card resurrects it.
+	it('no ManifestFulfilCard takes a big-relay prop any more', () => {
 		const src = chatSrc();
-		const exportOpen = src.indexOf('async function handleExportManifest');
-		const afterExport = src.indexOf('\tasync function', exportOpen + 1);
-		const block = src.slice(exportOpen, afterExport === -1 ? src.length : afterExport);
-		expect(block.toLowerCase()).not.toMatch(/\bdownload\b/);
-		// "send" is allowed only inside the imported toast constant (which the helper test pins).
-		// The handler body itself must not re-string a "Send" verb.
-		const blockWithoutImport = block.replace(/MANIFEST_EXPORTED_TOAST/g, '');
-		expect(blockWithoutImport.toLowerCase()).not.toMatch(/\bsend\b/);
-	});
-
-	it('the big-relay hint is gated on big_relay_url (read once on mount, not per-render)', () => {
-		// The big-relay hint must appear only when `big_relay_url` is set. The route reads it once on
-		// mount into `bigRelayUrl`, and passes `hasBigRelay={bigRelayUrl !== ''}` to both cards.
-		const src = chatSrc();
-		expect(src).toContain('getSettings');
-		expect(src).toMatch(/bigRelayUrl = \$state\(''\)/);
-		expect(src).toMatch(/bigRelayUrl = s\.big_relay_url/);
-		// Both ManifestFulfilCard instances must bind hasBigRelay to bigRelayUrl (not a literal true).
-		const countHasBigRelay = (src.match(/hasBigRelay=\{bigRelayUrl !== ''\}/g) || []).length;
-		expect(countHasBigRelay).toBe(2);
+		expect(src).not.toContain('hasBigRelay');
+		const card = readFileSync(
+			new URL('../../lib/components/ManifestFulfilCard.svelte', import.meta.url),
+			'utf8',
+		);
+		expect(card).not.toContain('hasBigRelay');
+		expect(card).not.toContain('MANIFEST_BIG_RELAY_LINK');
+		expect(card).not.toContain('MANIFEST_BIG_RELAY_HINT');
 	});
 
 	it('drafts are loaded on mount so the card is honest without a Home visit', () => {
@@ -141,15 +144,6 @@ describe('Chat page — M17 W7.1b manifest-request fulfilment card wiring', () =
 		// mount so a Public-draft match doesn't silently render as "missing" because the store was empty.
 		const src = chatSrc();
 		expect(src).toContain('getCollections');
-	});
-
-	it('export is idempotent — a double-click while the save dialog is resolving is a no-op', () => {
-		// Same idiom as W3's handleUnlock. The handler guards on `exportingSlug` (in-flight).
-		const src = chatSrc();
-		const exportOpen = src.indexOf('async function handleExportManifest');
-		const afterExport = src.indexOf('\tasync function', exportOpen + 1);
-		const block = src.slice(exportOpen, afterExport === -1 ? src.length : afterExport);
-		expect(block).toMatch(/exportingSlug === slug/);
 	});
 
 	// QURATOR-45: the "Send the full list" click guard must not permanently swallow retries after a

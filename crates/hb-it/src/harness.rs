@@ -10,7 +10,7 @@ use hb_net::RelayClient;
 use crate::tap::TestResult;
 
 /// Presence online window (spec / TEST_PLAN §7: "presence online window 10 min").
-pub const ONLINE_WINDOW_SECS: u64 = 600;
+pub const ONLINE_WINDOW_SECS: u64 = 480; // tracks hb-app commands::online::ONLINE_WINDOW_SECS
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 

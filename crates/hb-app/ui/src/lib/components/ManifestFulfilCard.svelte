@@ -15,15 +15,9 @@
 		MANIFEST_EMPTY_LINE,
 		MANIFEST_MISSING_LINE,
 		MANIFEST_STALE_NOTE,
-		MANIFEST_BIG_RELAY_HINT,
-		MANIFEST_BIG_RELAY_LINK,
 		type ManifestFulfilState,
 	} from '$lib/manifest-fulfil.js';
-	import {
-		SEND_FULL_LIST_LABEL,
-		SEND_FULL_LIST_FALLBACK,
-		SEND_FULL_LIST_CURRENT_TREE,
-	} from '$lib/transport-ticket.js';
+	import { SEND_FULL_LIST_LABEL } from '$lib/transport-ticket.js';
 
 	interface Props {
 		/** The pure-derived state for this request (from `deriveManifestFulfil`). Carries the slug. */
@@ -39,17 +33,11 @@
 		 *  Rendered so the owner can recognise which version of the tree the browser saw. Empty when
 		 *  the requester sent none. */
 		fingerprintSeen: string;
-		/** True when the owner has a `big_relay_url` configured → the big-relay secondary hint shows. */
-		hasBigRelay: boolean;
-		/** Fired on "Export manifest…" click (the parent runs the existing `handleExport(slug,'manifest')`
-		 *  path — save dialog → `exportManifest(slug, path)` → toast). No new export logic. */
-		onexport: (slug: string) => void;
 	}
 
-	let { state, fingerprintSeen, hasBigRelay, onexport, onsend, sending }: Props = $props();
+	let { state, fingerprintSeen, onsend, sending }: Props = $props();
 
 	let slug = $derived(state.slug);
-	let secondary = $derived(hasBigRelay ? MANIFEST_BIG_RELAY_HINT : MANIFEST_BIG_RELAY_LINK);
 </script>
 
 <div class="mf-card" data-state={state.kind} data-slug={slug}>
@@ -64,10 +52,14 @@
 		{#if state.stale}
 			<div class="mf-card-note" role="note">{MANIFEST_STALE_NOTE}</div>
 		{/if}
-		<!-- M18 W4: the fulfil verb is now the PRIMARY action — the request lands here and is answered
-		     here. Export is demoted to secondary but stays fully reachable, deliberately: the
-		     transport can fail (the asker offline, no route), and an owner left with a greyed-out
-		     button and no second route is exactly the dead end W7.1b was written to remove. -->
+		<!-- Devtest 2026-08-27, owner: the card was carrying one action and three lines of hedging
+		     under it. "Export manifest…" is gone, and so is the copy that pointed at it or at a big
+		     relay — the owner's reasoning: "the entire purpose of this IS so you dont have to
+		     manually find a third party service to send your files, but now we've put an artificial
+		     limit on it the export manifest button just looks ridiculous". The M18 W4 note this
+		     replaces argued export was a needed second route when the transport fails; that argument
+		     is now the owner's to overrule, and they have. Export still exists on Home → ⋯ → Export,
+		     which is where the over-the-ceiling error already sends people. -->
 		<div class="mf-card-actions">
 			<button
 				type="button"
@@ -77,15 +69,7 @@
 			>
 				{sending ? '…' : SEND_FULL_LIST_LABEL}
 			</button>
-			<button type="button" class="btn-default btn-sm mf-card-action-secondary" onclick={() => onexport(slug)}>
-				Export manifest…
-			</button>
 		</div>
-		<!-- Owner ruling ②: approval authorizes the COLLECTION, not a snapshot. Said out loud here so
-		     the hoarder is not surprised by a later fetch returning a newer tree than they reviewed. -->
-		<div class="mf-card-secondary muted">{SEND_FULL_LIST_CURRENT_TREE}</div>
-		<div class="mf-card-secondary muted">{SEND_FULL_LIST_FALLBACK}</div>
-		<div class="mf-card-secondary" class:muted={!hasBigRelay}>{secondary}</div>
 	{:else if state.kind === 'private'}
 		<!-- No big-relay hint here: a Private collection is sealed per recipient, so publishing to a
 		     big relay would not get this asker anything. Pointing them at Settings would be advice
@@ -166,17 +150,7 @@
 	.mf-card-action:hover { filter: brightness(1.05); }
 	.mf-card-action:disabled { opacity: 0.6; cursor: default; }
 
-	/* Export, demoted but present. Quieter than the primary and unmistakably still a real button —
-	   the fallback has to survive a transport failure, so it must not read as decoration. */
-	.mf-card-action-secondary { align-self: flex-start; }
-	.mf-card-action-secondary:hover { filter: brightness(1.08); }
-
-	.mf-card-secondary {
-		font-size: 11px;
-		color: var(--fg);
-	}
-	.mf-card-secondary.muted {
-		color: var(--fg-muted);
-		font-size: 10.5px;
-	}
+	/* `.mf-card-action-secondary` and `.mf-card-secondary` were deleted with the markup they styled
+	   (the Export button and the three hedging lines under it, removed on the owner's 2026-08-27
+	   ruling). Component-scoped CSS makes an orphaned rule a Svelte warning, so they go together. */
 </style>

@@ -40,14 +40,30 @@ describe('M21 W5b behaviour 1 — group chips carry their colour dot', () => {
 		expect(faceRegion).toMatch(/background:\$\{gcolor\}/);
 	});
 
-	it('the detail chip renders the same dot (face and detail agree)', () => {
+	// INVERTED by devtest 2026-08-26 item 3, ruling 01. This test was 'the detail chip renders the
+	// same dot (face and detail agree)'. Two chip rows agreeing was the DUPLICATION the owner
+	// reported ("right now its showing duplicated information") — the detail row is deleted and the
+	// face row is now the only one, so "they agree" is no longer a property that can hold or fail.
+	// What replaces it is the property that actually needs guarding: exactly ONE chip row exists.
+	// A future change that re-adds chips to the panel reds here, which is the regression this file
+	// should catch now.
+	it('the chip row lives on the face ONLY — the detail panel carries no second copy', () => {
 		const s = contactsSrc();
 		const detailStart = s.indexOf('class="contact-detail"');
+		expect(detailStart).toBeGreaterThan(-1);
 		const detailEnd = s.indexOf('OverflowMenu', detailStart);
-		const detail = s.slice(detailStart, detailEnd);
-		// The non-editing chip branch inside the detail also renders the dot from groupColor.
-		expect(detail).toMatch(/groupColor\(gname\)/);
-		expect(detail).toMatch(/class="group-dot"/);
+		const detail = s
+			.slice(detailStart, detailEnd)
+			// Comments only: the deletion left a tombstone naming what moved and why (CLAUDE.md §9 —
+			// what must not appear is the affordance, not the word).
+			.replace(/<!--[\s\S]*?-->/g, '')
+			.replace(/^\s*\/\/.*$/gm, '');
+		expect(detail).not.toMatch(/groupColor\(gname\)/);
+		expect(detail).not.toMatch(/class="group-dot"/);
+		// …and the face still has it, so this cannot pass by the chips having vanished entirely.
+		const faceRegion = s.slice(s.indexOf('class="contact-sub-row"'), detailStart);
+		expect(faceRegion).toMatch(/groupColor\(gname\)/);
+		expect(faceRegion).toMatch(/class="group-dot"/);
 	});
 
 	it('a group with no colour renders the chip with NO dot (guarded by {#if gcolor})', () => {
@@ -138,10 +154,29 @@ describe('M21 W5b behaviour 2 — `+` opens a membership popover on the collapse
 		expect(s).toMatch(/open=\{groupPopoverFor === peer\.npub\}/);
 	});
 
-	it('the expanded checkbox editor still works (an additional route, not a replacement)', () => {
-		// The existing beginGroupEdit/handleSaveGroups path is untouched.
+	it('the popover is now the ONLY group editor — the expanded panel no longer carries one', () => {
+		// INVERTED 2026-08-27 by devtest item 3, ruling 01. When W5b landed, the popover was added as
+		// "an additional route, not a replacement", and this test pinned the expanded panel's editor
+		// (beginGroupEdit / handleSaveGroups) as still present. The owner then reported the expanded
+		// panel as showing duplicated information — the panel's chip row duplicated the card face's,
+		// and its checkbox editor duplicated this popover. So the panel's editor became the thing that
+		// must NOT exist, and W5b's popover became the replacement it originally declined to be.
+		//
+		// This is an inversion, not a deletion: the full-set write semantics both editors shared are
+		// still pinned, in contacts-w5-dataloss.test.ts, now against the popover.
+		// Comments are stripped first: the deletion left tombstones NAMING these symbols so the next
+		// reader knows where the editor went, and an absence assertion must not red on its own
+		// explanation (CLAUDE.md §9 — the affordance, not the word).
 		const s = contactsSrc();
-		expect(s).toMatch(/function beginGroupEdit\(hb_id: string\)/);
-		expect(s).toMatch(/async function handleSaveGroups\(hb_id: string\)/);
+		const code = s
+			.replace(/<!--[\s\S]*?-->/g, '')
+			.replace(/\/\*[\s\S]*?\*\//g, '')
+			.replace(/^\s*\/\/.*$/gm, '');
+		expect(code).not.toMatch(/function beginGroupEdit\(/);
+		expect(code).not.toMatch(/async function handleSaveGroups\(/);
+		expect(code).not.toMatch(/contactGroupDraft\[/);
+		// The surviving editor's entry points, both of them, still exist.
+		expect(s).toMatch(/function openGroupPopover\(npub: string, anchor: HTMLElement\)/);
+		expect(s).toMatch(/async function applyGroupPopover\(npub: string, names: string\[\]\)/);
 	});
 });

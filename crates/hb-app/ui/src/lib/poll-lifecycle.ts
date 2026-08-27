@@ -20,8 +20,39 @@ export const DM_POLL_VISIBLE_MS = 3_000;
 export const CHANNEL_REFRESH_EVERY_TICKS = 5;
 /** Layout nav-inbox poll cadence while visible. */
 export const NAV_POLL_VISIBLE_MS = 20_000;
-/** Online-count chip poll cadence while visible. */
-export const ONLINE_POLL_VISIBLE_MS = 60_000;
+/** Online-count chip / presence-pill poll cadence while visible.
+ *
+ *  **devtest 2026-08-26 item 4 — "The online indicator and hoarders online count in Contacts do not
+ *  automatically update unless i switch pages and come back."** This was 60_000, and that was the
+ *  bug. `online_count` is a *cached read*: it returns the last completed refresh immediately and
+ *  only then spawns a new one, throttled server-side to one relay query per
+ *  `online.rs::REFRESH_INTERVAL` (60 s). Polling at exactly that same 60 s phase-locked the two —
+ *  every poll both triggered a refresh AND read the value from the previous poll's refresh, so the
+ *  screen was permanently one full cycle behind and displayed data 60–120 s old. Switching pages
+ *  re-mounted and re-read, which is why the owner saw it update only then.
+ *
+ *  The fix is to read faster than the backend refreshes, so a completed refresh reaches the screen
+ *  promptly instead of waiting out a whole cycle. **This does not add relay traffic**: the throttle
+ *  is entirely inside `online_count` (`is_stale(last_attempt, now, REFRESH_INTERVAL)`), so the relay
+ *  is still queried at most once per 60 s no matter how often the UI polls, and the other half of
+ *  the tick (`relay_status`) reads the persistent client's in-memory status map with no round trip.
+ *  Pinned by `poll-lifecycle.test.ts` → "the online poll reads FASTER than the backend refreshes",
+ *  which parses `REFRESH_INTERVAL` out of online.rs so the two cannot drift back into lockstep.
+ *
+ *  Worst-case display staleness: 120 s → ~80 s. The remaining ~60 s is `REFRESH_INTERVAL` itself,
+ *  which is a relay-cost decision, not a UI one. */
+export const ONLINE_POLL_VISIBLE_MS = 20_000;
+
+/** Relay-health poll cadence while visible — deliberately NOT `ONLINE_POLL_VISIBLE_MS`.
+ *
+ *  These two shared one constant until item 4, by coincidence rather than by design, and the item-4
+ *  speed-up must not ride along here (chorus review 2026-08-27, finding 4). `relay_status` looks
+ *  cheap but is not free: it re-reads and re-parses settings.json on every call, and when every
+ *  configured relay is in a dead terminal state `get_or_connect` attempts a RECONNECT on each call.
+ *  Tripling that rate would have changed reconnect pressure under failure — a behaviour change
+ *  nobody asked for, in the failure mode that can least afford it. Reachability changes slowly;
+ *  60 s is right for it, and 20 s is right for reading a cached count. */
+export const RELAY_HEALTH_POLL_VISIBLE_MS = 60_000;
 /** Topic-announcement alert poll cadence (devtest #2) — announcements are rate-limited to 1/topic/hr,
  *  and this reads every joined topic's channel, so it runs slower than the DM/nav polls. */
 export const ANNOUNCE_POLL_VISIBLE_MS = 90_000;

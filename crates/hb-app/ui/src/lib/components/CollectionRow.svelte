@@ -4,7 +4,7 @@
 	// so no `overflow: hidden` ancestor can clip it (the original devtest #2 bug — it lived in a
 	// scrolling `.coll-list`/`.collections-pane`).
 	import type { Collection } from '../types.js';
-	import { deriveRowChip, menuItems, badges, type RowMenuItem, type ExportFormat } from '../collection-row-view.js';
+	import { deriveRowChip, menuItems, badges, sizeTier, sizeTierTooltip, type RowMenuItem, type ExportFormat } from '../collection-row-view.js';
 	import CollectionPanel from './CollectionPanel.svelte';
 	import ConfirmButton from './ConfirmButton.svelte';
 	import OverflowMenu from './OverflowMenu.svelte';
@@ -84,7 +84,11 @@
 		<div class="row-info">
 			<div class="row-name">{collection.path_alias}</div>
 			<div class="row-meta">
-				<span class="tnum">{collection.item_count.toLocaleString()} items</span>
+				<!-- devtest item 6: the count is size-coded — amber from 80k, faint red at the 100k cap. -->
+				<span
+					class="tnum size-{sizeTier(collection.item_count)}"
+					title={sizeTierTooltip(collection.item_count) ?? undefined}
+				>{collection.item_count.toLocaleString()} items</span>
 				<span class="dot">·</span>
 				<span class="tnum">{fmtBytes(collection.total_bytes)}</span>
 			</div>
@@ -188,6 +192,13 @@
 	.row-meta { display: flex; gap: 6px; align-items: center; font-size: 11px; color: var(--fg-muted); margin-top: 1px; }
 	.dot { color: var(--fg-dim); }
 	.tnum { font-feature-settings: 'tnum'; }
+
+	/* devtest item 6 — size tiers. `normal` is deliberately absent: "under 80000 items remain as is",
+	   so it inherits .row-meta's colour and no rule fires. Amber matches .row-badge-offline's hue;
+	   the over-cap red is DESATURATED from --error (0.18 -> 0.09 chroma) because the owner asked for
+	   "faint red" — a full-strength error red on a count that is merely large reads as a failure. */
+	.size-warn { color: oklch(0.78 0.13 60); }
+	.size-over { color: oklch(0.70 0.09 25); }
 
 	.row-badges { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; margin-left: auto; }
 

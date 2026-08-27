@@ -45,10 +45,13 @@ describe('chat W5.3 — the unreachable-relay line appears and clears', () => {
 	});
 
 	it('polls relay health on the slow tick, not the 3s DM cadence', () => {
+		// The constant was ONLINE_POLL_VISIBLE_MS until devtest item 4 sped that one up to 20 s for the
+		// presence chip. Relay health kept the 60 s cadence under its own name — see the note on
+		// RELAY_HEALTH_POLL_VISIBLE_MS for why the two must not share a knob.
 		const s = src();
 		const idx = s.indexOf('const healthPoll = setInterval');
 		expect(idx).toBeGreaterThan(-1);
-		expect(s.slice(idx, s.indexOf('\n', idx))).toContain('ONLINE_POLL_VISIBLE_MS');
+		expect(s.slice(idx, s.indexOf('\n', idx))).toContain('RELAY_HEALTH_POLL_VISIBLE_MS');
 		// And it is torn down with the page.
 		expect(s).toContain('clearInterval(healthPoll)');
 	});
