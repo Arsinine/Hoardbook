@@ -25,9 +25,12 @@ describe('contacts W5 — the row stops calling our poll time "seen"', () => {
 	it('renders their last-seen from presence, and only while offline', () => {
 		const s = src();
 		// The age line is inside a `{#if !peer.online}` guard — an online contact needs no age.
-		const idx = s.indexOf('presenceOf(peer).lastSeen');
+		const idx = s.indexOf('presence.lastSeen');
 		expect(idx).toBeGreaterThan(-1);
-		expect(s.slice(idx - 120, idx)).toContain('{#if !peer.online}');
+		expect(s.slice(idx - 160, idx)).toContain('{#if !peer.online');
+		// QURATOR-135: the age line also requires a KNOWN verdict — an unknown row shows only the
+		// "Checking…" pill, never an age line either.
+		expect(s.slice(idx - 160, idx)).toContain('presence.online !== null');
 	});
 
 	it('presence comes from the beacon, never from last_fetched', () => {
@@ -79,8 +82,10 @@ describe('contacts W5 — no new relay load', () => {
 
 	it('a real beacon outranks the stored online flag, but absence of one does not', () => {
 		// Not seeing a beacon this window is not evidence they went offline — the stored flag stands.
+		// QURATOR-135: the branch condition is the view's own tri-state (`online === null` ⇒ never
+		// observed), so an unknown row keeps its stored flag and the PILL renders "Checking…".
 		const s = src();
 		const fn = s.slice(s.indexOf('function withPresence'), s.indexOf('// Tag editing state'));
-		expect(fn).toContain('p.known ? { ...peer, online: p.online } : peer');
+		expect(fn).toContain('p.online !== null ? { ...peer, online: p.online } : peer');
 	});
 });

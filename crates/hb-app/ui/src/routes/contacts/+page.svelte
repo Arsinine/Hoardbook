@@ -904,18 +904,20 @@
 	// since the only assignment is inside the poll closure.)
 	let freshSeen = $derived(freshIndex((onlineData as OnlineCount | null)?.fresh));
 
-	function presenceOf(peer: import('$lib/types.js').CachedPeer): PresenceView & { known: boolean } {
+	function presenceOf(peer: import('$lib/types.js').CachedPeer): PresenceView {
 		const seen = newestSeen(peer.npub, freshSeen, peer.last_presence);
-		return { ...presenceView(seen, nowMs), known: seen !== null };
+		return presenceView(seen, nowMs);
 	}
 
 	/** A real beacon outranks the stored `online` flag (which a browse stamped once and nobody ever
 	 *  clears). With no beacon at all we keep the stored flag rather than flipping a just-browsed
 	 *  contact to offline on no evidence. Applied before bucketing so the pill, the "Online now"
-	 *  bucket and the header count can never disagree. */
+	 *  bucket and the header count can never disagree. QURATOR-135: the branch is on the view's own
+	 *  tri-state (`online === null` ⇒ never observed), so "Offline" below can only come from a
+	 *  beacon that actually lapsed — never from absence-of-data. */
 	function withPresence(peer: import('$lib/types.js').CachedPeer): import('$lib/types.js').CachedPeer {
 		const p = presenceOf(peer);
-		return p.known ? { ...peer, online: p.online } : peer;
+		return p.online !== null ? { ...peer, online: p.online } : peer;
 	}
 
 	// Tag editing state
@@ -1123,14 +1125,21 @@
 					{#if collision}
 						<span class="collision-badge" title={collision}>⚠ {collision}</span>
 					{/if}
-					{#if peer.online}
-						<span class="pill pill-online"><span class="pill-dot"></span></span>
-					{:else}
-						<span class="pill pill-offline">Offline</span>
-					{/if}
-					<!-- W5: THEIR presence (only when offline — the pill already says "online"). -->
-					{#if !peer.online}
-						<span class="last-seen">{presenceOf(peer).lastSeen}</span>
+					{#if true}
+						<!-- QURATOR-135: `presence.online === null` means NO beacon observed yet — the
+						     row must say what is true ("Checking…"), never assert "Offline". -->
+						{@const presence = presenceOf(peer)}
+						{#if peer.online}
+							<span class="pill pill-online"><span class="pill-dot"></span></span>
+						{:else if presence.online === null}
+							<span class="pill pill-unknown" title="No presence beacon observed yet — checking.">Checking…</span>
+						{:else}
+							<span class="pill pill-offline">Offline</span>
+						{/if}
+						<!-- W5: THEIR presence (only when offline — the pill already says "online"). -->
+						{#if !peer.online && presence.online !== null}
+							<span class="last-seen">{presence.lastSeen}</span>
+						{/if}
 					{/if}
 					<div style="flex:1"></div>
 					{#if badge.locked}
@@ -1221,7 +1230,7 @@
 										<span class="cpop-desc">{col.description ?? 'No description'}</span>
 									</div>
 								{/each}
-								<div class="cpop-footer">public collections only — private ones live in the detail</div>
+								<div class="cpop-footer">Public collections only. Private ones show in the expanded card.</div>
 							</div>
 						</span>
 					{/if}
@@ -2022,6 +2031,14 @@
 	.pill-offline {
 		color: var(--fg-muted);
 		background: color-mix(in oklch, var(--fg-muted) 12%, transparent);
+	}
+	/* QURATOR-135 — the unknown pill: NOT the offline styling and NOT the online styling. It says
+	   what is true (we have not observed a beacon yet) instead of asserting they are offline. */
+	.pill-unknown {
+		color: var(--fg-dim);
+		background: transparent;
+		border: 1px dashed var(--border);
+		font-style: italic;
 	}
 
 	/* Group chips on contact cards. (.group-row went with the detail panel's own chip row in devtest
