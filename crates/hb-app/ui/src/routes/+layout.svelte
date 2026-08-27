@@ -65,7 +65,7 @@
 		// Update-available event from the backend background check.
 		let unlistenUpdate: (() => void) | undefined;
 		listen<string>('update-available', (event) => {
-			toast(`Update v${event.payload} available — check Settings to install`, 'success');
+			toast(`Update v${event.payload} is available. Install it from Settings.`, 'success');
 		}).then(fn => { unlistenUpdate = fn; });
 
 		// Direct DM received via iroh — refresh the inbox; the nav badge (derived from

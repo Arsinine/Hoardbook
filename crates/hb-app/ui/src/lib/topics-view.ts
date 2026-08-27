@@ -7,21 +7,20 @@ import { contactDisplayName } from './contact-display.js';
 
 /** Public-join consent: the visibility is the deal. Anyone who joins can see you are a member. */
 export const PUBLIC_JOIN_CONSENT =
-	'Joining is public: anyone who joins this Topic can see that you are a member (your npub is on ' +
-	'the members-only roster, which any joiner can read). Fine for a pseudonymous interest — the same ' +
-	'exposure class as your public teaser.';
+	'Joining is public. Anyone in this Topic can see you are a member, because your npub goes on a ' +
+	'roster every joiner can read. That is the same visibility as your public profile.';
 
 /** Private-join consent: a durable members-only membership record exists — the §11 threat note,
  *  lifted verbatim in spirit. The join MUST be gated behind an explicit acknowledgment (F12). */
 export const PRIVATE_JOIN_CONSENT =
-	'A durable, members-only membership record exists for this private Topic — it persists (encrypted) ' +
-	'on relays for as long as members keep it, scoped to the people you have been admitted alongside. ' +
-	'Weigh it before joining a private Topic around a sensitive subject.';
+	'Private Topics keep an encrypted, members-only record of who joined. It stays on relays for as ' +
+	'long as the Topic lives, visible to the people you were admitted alongside. Think twice before ' +
+	'joining one around a sensitive subject.';
 
 /** Joining unlocks no listings (INV-2) — surfaced wherever a Topic is joined/shown. */
 export const NO_UNLOCK_NOTE =
-	'Joining a Topic does not unlock anyone’s collections — you get each member’s npub + public teaser ' +
-	'only. Browsing their listings still needs their share code, exchanged one-to-one as normal.';
+	'Joining a Topic does not unlock anyone’s collections. You get each member’s npub and public ' +
+	'profile only. Browsing their listings still needs their share code, person to person.';
 
 /** The consent copy to show before joining — private vs public. */
 export function joinConsentCopy(isPrivate: boolean): string {

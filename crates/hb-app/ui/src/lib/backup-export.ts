@@ -60,7 +60,7 @@ export function backupModeOptions(): BackupModeOption[] {
 			label: 'Plaintext (advanced)',
 			warned: true,
 			description:
-				'This file IS your identity — anyone who obtains it becomes you. Store it like a master key.',
+				'This file is your identity. Anyone who has it becomes you. Store it like a master key.',
 		},
 	];
 }
