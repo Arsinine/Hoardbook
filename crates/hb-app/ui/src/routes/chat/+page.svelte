@@ -1309,6 +1309,8 @@
 							<span class="pane-peer-name">{selectedPeer.profile?.display_name || shortId(selectedPeer.npub)}</span>
 							{#if selectedPeer.online}
 								<span class="pill pill-online"><span class="pill-dot"></span> Online</span>
+							{:else if !selectedPeer.last_presence}
+								<span class="pill pill-unknown" title="No presence beacon observed yet — checking.">Checking…</span>
 							{:else}
 								<span class="pill pill-offline">Offline</span>
 							{/if}
@@ -1321,8 +1323,8 @@
 					<button class="btn-ghost btn-sm" onclick={() => { if (selectedPeer) viewProfile(selectedPeer); }}>View profile</button>
 				</div>
 
-				<!-- Offline notice -->
-				{#if !selectedPeer.online}
+				<!-- Offline notice (not shown while presence is still unknown — QURATOR-135). -->
+				{#if !selectedPeer.online && selectedPeer.last_presence}
 					<div class="offline-banner">
 						<span class="offline-dot"></span>
 						<span>{selectedPeer.profile?.display_name || shortId(selectedPeer.npub)} is offline — they'll see your message the next time they open Hoardbook.</span>
@@ -1864,6 +1866,13 @@
 		color: var(--fg-muted);
 		background: color-mix(in oklch, var(--fg-muted) 12%, transparent);
 		border: 1px solid color-mix(in oklch, var(--fg-muted) 20%, transparent);
+	}
+	/* QURATOR-135 — the unknown pill: neither the offline nor the online styling. */
+	.pill-unknown {
+		color: var(--fg-dim);
+		background: transparent;
+		border: 1px dashed var(--border);
+		font-style: italic;
 	}
 
 	/* M15 W1: buttons unified on the app.css .btn system (local copies removed; .btn-send stays,

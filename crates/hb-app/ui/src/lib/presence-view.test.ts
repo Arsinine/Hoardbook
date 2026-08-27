@@ -88,8 +88,10 @@ describe('presenceView — real presence, honestly labelled', () => {
 	it('never-observed reads "unknown", never "never" and never "just now"', () => {
 		for (const empty of [null, undefined, '', 'not-a-date']) {
 			const v = presenceView(empty, NOW);
-			expect(v.online).toBe(false);
-			expect(v.lastSeen).toBe('Last seen — unknown');
+			// QURATOR-135: no beacon is UNKNOWN (`null`), not a definite offline. This is the
+			// state the pill renders as "Checking…" — absence-of-data is never a verdict.
+			expect(v.online).toBeNull();
+			expect(v.lastSeen).toBe('Last seen: unknown');
 			expect(v.lastSeen).not.toMatch(/never|just now/);
 		}
 	});
