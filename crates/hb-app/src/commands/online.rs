@@ -24,9 +24,24 @@ use crate::identity_state::SharedIdentity;
 use crate::net::{self, SharedRelay};
 use crate::store::DataStore;
 
-/// Online freshness window (Decision #12 / Open Q#6 — the same 10 min the contact-list `● Online`
-/// badge uses; confirm at launch).
-pub const ONLINE_WINDOW_SECS: u64 = 600;
+/// Online freshness window — a beacon older than this stops counting as evidence of liveness.
+///
+/// **480 s, owner ruling 2026-08-27** (devtest 2026-08-26 item 1: "the online indicator takes too
+/// long to prune people who havent been on. It should only take heartbeat messages from the last
+/// 5-10 minutes as evidence of liveness"). It was 600 s — the top of that range.
+///
+/// This is NOT a free knob: it is bounded below by [`crate::presence::PRESENCE_REFRESH_SECS`]
+/// (300 s), the cadence at which we republish our own beacon. A window at or near the cadence has
+/// no slack, so ONE late or failed publish flips a genuinely-online peer to Offline. 480 s leaves
+/// 180 s of slack, which covers the first three steps of the failed-cycle retry backoff
+/// (`RETRY_BACKOFF_SECS = [15, 30, 60, 120]` — 15+30+60 = 105 s) with room to spare, so a transient
+/// relay flap still self-heals before the peer reads offline. Going lower means lowering the beacon
+/// cadence too, which doubles beacon writes against the relays.
+///
+/// Two copies track this value and must move with it — the UI's `PRESENCE_WINDOW_MS`
+/// (hb-app/ui/src/lib/presence-view.ts) and hb-it's harness constant. Both are pinned by tests that
+/// PARSE this line rather than restate the number, so a one-sided edit reds.
+pub const ONLINE_WINDOW_SECS: u64 = 480;
 
 /// The bounded slow tick: the relay is queried at most once per this interval no matter how often
 /// the chip polls the command (so the count can't become a drain — it is profiled by L4).

@@ -286,7 +286,14 @@ pub(crate) async fn serve_manifest_stream(
 
     // The ticket presented must be the ticket issued. This — not the node address, and not the
     // request id — is the capability: it rode a sealed DM to one recipient.
-    if req.ticket != issued.ticket {
+    //
+    // `matches_issued`, NOT `!=`. The comparison deliberately excludes `node_addr`, because the
+    // asker is REQUIRED to rewrite that field before redeeming (`redeem_manifest_ticket` runs it
+    // through `sanitize_node_addr`, the QURATOR-113 #20 SSRF guard). A `!=` here therefore refused
+    // every honest redemption between two machines on a LAN — see `matches_issued`'s doc comment for
+    // the full account and for why dropping that field from the comparison authenticates exactly as
+    // much as it did before.
+    if !req.ticket.matches_issued(&issued.ticket) {
         refuse(&mut send, REFUSAL_NO_MATCH).await?;
         return Ok(None);
     }
@@ -1275,6 +1282,65 @@ pub(crate) mod tests {
             fetch_manifest(&client, &ticket, |_| Ok(()))
                 .await
                 .expect("restoring the contact restores the approval — the ticket was not burned");
+
+            client.close().await;
+            server.close().await;
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// **The devtest 2026-08-27 end-to-end regression, over real QUIC.**
+    ///
+    /// The owner clicked "Send the full list" with both dev machines online and the asker got the
+    /// forged-ticket refusal. The whole reason the existing suite missed it is visible right here:
+    /// every other test in this file calls `fetch_manifest` with the ticket EXACTLY as issued, but
+    /// the production asker does not — `redeem_manifest_ticket` rewrites `node_addr` through
+    /// `sanitize_node_addr` first, and on a LAN that always changes the string. So this test does
+    /// what production does: sanitize, then redeem. Against the old `!=` comparison it fails with
+    /// REFUSAL_NO_MATCH.
+    ///
+    /// The dial still uses the endpoint's real address (loopback, which the sanitizer would strip),
+    /// so the ticket the SERVER compares is the sanitized one while the connection is the honest
+    /// one — exactly the production split, where the asker dials a surviving address and presents a
+    /// ticket whose address list it pruned.
+    #[tokio::test]
+    async fn a_redeemer_that_sanitized_the_node_addr_is_still_served() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let (server, source, ticket) = spawn_plane(50, "small").await;
+            let client = bind_local_endpoint(&rand::random(), vec![]).await;
+
+            // What production does to the ticket before presenting it.
+            let sanitized_addr = sanitize_node_addr(&ticket.node_addr)
+                .expect("the SSRF guard accepts a well-formed node address");
+            assert_ne!(
+                sanitized_addr, ticket.node_addr,
+                "the fixture must actually be rewritten by the guard, or this test proves nothing \
+                 (a loopback endpoint's addresses are exactly what it strips)"
+            );
+            let mut presented = ticket.clone();
+            presented.node_addr = sanitized_addr;
+
+            // Dial with the honest address, then run the REAL request/response body against the
+            // sanitized ticket. `fetch_over_connection` is the production function `fetch_manifest`
+            // delegates to — it builds the FetchRequest and evaluates the reply — so this ends where
+            // production ends. Only the dial is separated, because a loopback endpoint has no
+            // relay or discovery to reach through once the guard has stripped its 127.0.0.1
+            // address; on a real network the surviving public address is what production dials.
+            let conn = client
+                .connect(parse_node_addr(&ticket.node_addr).unwrap(), MANIFEST_ALPN)
+                .await
+                .expect("dial the plane on its honest address");
+            let mut got = None;
+            let out = fetch_over_connection(&conn, &presented, |p| {
+                got = Some(p.as_bytes().len());
+                Ok(())
+            })
+            .await;
+            conn.close(0u32.into(), b"");
+            out.expect("a redeemer that sanitized the address it was handed must still be served");
+            assert!(got.is_some_and(|n| n > 0), "the manifest actually arrived");
+            await_receipt(&source).await;
 
             client.close().await;
             server.close().await;

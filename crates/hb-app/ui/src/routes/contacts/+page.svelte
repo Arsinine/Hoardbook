@@ -15,7 +15,7 @@
 	import AddContactPanel from '$lib/components/AddContactPanel.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import AZRail from '$lib/components/AZRail.svelte';
-	import type { CachedPeer, Collection, Group } from '$lib/types.js';
+	import type { CachedPeer, Collection, Group, Profile } from '$lib/types.js';
 	import { contactDisplayName, shortNpub } from '$lib/contact-display.js';
 	import { NOT_DRM_NOTE, receivesPrivate } from '$lib/private-collections-view.js';
 	import { peerAccessBadge, summarizeCollectionsSize } from '$lib/browse-view.js';
@@ -41,7 +41,7 @@
 	// plain click selects one. Dragging any selected row carries the WHOLE selection; dragging an
 	// unselected row carries just that row. Ghost shows a count badge. Refuse over selection: a
 	// target ALL selected already belong to refuses; MIXED allowed.
-	import { writeDragPayload, readDragPayload, writeDragPayloadMulti, readDragPayloadMulti, isValidDropTarget, isSelfDrop, groupSuggestions, groupSuggestionsMulti, commitCreateGroup, commitCreateGroupMulti, computeDropOutcome, commitDropOnGroup, computeDropOutcomeMulti, commitDropOnGroupMulti, applyClickToSelection, applyKeyToSelection, shouldHandleArrowKey, computeDropInverse, computeDropInverseMulti, computeCreateInverse, commitInverse, commitInverseMulti, rovingTabindexForIdx, isTypingTargetShape, rowId, UNGROUPED_TARGET, type DropOutcome, type DropOutcomeMulti } from '$lib/drag-group.js';
+	import { writeDragPayload, readDragPayload, writeDragPayloadMulti, readDragPayloadMulti, isOurDrag, isValidDropTarget, isSelfDrop, groupSuggestions, groupSuggestionsMulti, commitCreateGroup, commitCreateGroupMulti, computeDropOutcome, commitDropOnGroup, computeDropOutcomeMulti, commitDropOnGroupMulti, applyClickToSelection, applyKeyToSelection, shouldHandleArrowKey, computeDropInverse, computeDropInverseMulti, computeCreateInverse, commitInverse, commitInverseMulti, rovingTabindexForIdx, isTypingTargetShape, rowId, UNGROUPED_TARGET, type DropOutcome, type DropOutcomeMulti } from '$lib/drag-group.js';
 	import { onMount, onDestroy, tick } from 'svelte';
 	import { goto } from '$app/navigation';
 
@@ -58,11 +58,18 @@
 		// Decision B: don't poll the relays while the window is hidden (tray/minimized).
 		if (document.hidden) return;
 		try { onlineData = await onlineCount(); } catch { /* keep last value; chip shows "–" */ }
-		// Drive the "why" hint only when the count is unknown (cheap, status-only read).
-		try { relayHealth = await relayStatus(); } catch { /* leave last health */ }
+		// `whyHint` above is derived ONLY when `chip.unknown`, so the health read is gated on the same
+		// condition. The comment here has always said "only when the count is unknown"; the call was
+		// unconditional, which was harmless at 60 s and is not at 20 s — `relay_status` re-parses
+		// settings.json each call, and against all-dead relays it attempts a reconnect each call
+		// (chorus review 2026-08-27, finding 4). Gating it means the healthy path costs nothing extra
+		// and the unhealthy path — the only one that renders the hint — still refreshes every tick.
+		if (chip.unknown) {
+			try { relayHealth = await relayStatus(); } catch { /* leave last health */ }
+		}
 	}
 	// W5 review: the age needs its OWN reactive clock. Reading Date.now() inside a template helper
-	// makes the render depend on the 60s poll assigning `onlineData` — so a rejected poll, or a tab
+	// makes the render depend on the online poll assigning `onlineData` — so a rejected poll, or a tab
 	// hidden past the window (the poll returns early while hidden), leaves a peer pinned "Online"
 	// and the age frozen. That is the bug W5 exists to kill, wearing a different hat. This tick is
 	// local-only: no relay traffic, and it keeps running while hidden so the first paint after a
@@ -265,6 +272,9 @@
 	}
 
 	let dragSourceNpub = $state<string | null>(null);     // the lifted row, or null when idle
+	// The npubs this drag carries, captured at dragstart. dragover handlers read the payload
+	// from HERE, not from the DataTransfer — getData() is blanked during dragover (see isOurDrag).
+	let dragCarriedNpubs = $state<string[]>([]);
 	let dragOverNpub = $state<string | null>(null);       // the row currently under the cursor
 	// M22 W5: how many contacts are being carried in the current drag (0 for a W3 single-pair drag,
 	// N-1 for a multi-select drag of N). Used for the Aim-moment text ("group N contacts").
@@ -301,6 +311,7 @@
 			carried = [npub];
 		}
 		dragSourceNpub = npub;
+		dragCarriedNpubs = carried;
 		// M22 W6: capture prior membership at drag START (not drop) so the move/ungrouped inverse
 		// restores the exact prior state. A slow write between start and drop cannot race this.
 		const m = new Map<string, string[]>();
@@ -324,6 +335,7 @@
 		// naming popover (if opened) stays open until Enter or Esc closes IT — the drag has ended
 		// but the create gesture continues at the naming step.
 		dragSourceNpub = null;
+		dragCarriedNpubs = [];
 		dragOverNpub = null;
 		dragCount = 0;
 		// M22 W4: also clear the group-heading drop affordance state so a cancelled drag doesn't
@@ -493,12 +505,18 @@
 	}
 
 	function onGroupDragOver(e: DragEvent, targetName: string) {
-		// M22 W5: read the multi payload first; fall back to single-npub.
-		const multiNpubs = readDragPayloadMulti(e.dataTransfer);
-		if (multiNpubs && multiNpubs.length > 1) {
+		// Wrong drag type (e.g. a file drag) — don't claim the drop. Gate on the MIME TYPE, never
+		// on the payload: getData() returns "" during dragover, so reading it here refused every
+		// drop onto a group pill (owner report 2026-08-26). See isOurDrag.
+		if (!isOurDrag(e.dataTransfer)) return;
+		// The payload comes from our own drag state, captured at dragstart.
+		const carried = dragCarriedNpubs;
+		if (carried.length === 0) return;
+		// M22 W5: a multi-selection drag carries every selected npub.
+		if (carried.length > 1) {
 			e.preventDefault(); // allow drop
-			const groupsByNpub = new Map(multiNpubs.map((n) => [n, contactGroups(n)]));
-			const outcome = computeDropOutcomeMulti(multiNpubs, targetName, groupsByNpub, e.shiftKey);
+			const groupsByNpub = new Map(carried.map((n) => [n, contactGroups(n)]));
+			const outcome = computeDropOutcomeMulti(carried, targetName, groupsByNpub, e.shiftKey);
 			dropOverTarget = targetName;
 			dropOutcomeMulti = outcome;
 			if (e.dataTransfer) {
@@ -506,9 +524,7 @@
 			}
 			return;
 		}
-		const sourceNpub = readDragPayload(e.dataTransfer);
-		// No payload = wrong drag type (e.g. a file drag) — don't claim the drop.
-		if (!sourceNpub) return;
+		const sourceNpub = carried[0];
 		e.preventDefault(); // allow drop
 		const sourceGroups = contactGroups(sourceNpub);
 		const outcome = computeDropOutcome(sourceNpub, targetName, sourceGroups, e.shiftKey);
@@ -628,37 +644,14 @@
 		return groups.find(g => g.name === name)?.color;
 	}
 
-	// Per-contact group membership editor (M20 W5, data-loss half). The data model and renderer are
-	// many-to-many; this editor is too — checkboxes over ALL groups, pre-checked with the contact's
-	// CURRENT memberships, and on Apply the full checked set is sent to contact_update_groups (which
-	// diffs the complete set). The old single-select sent `[newGroupName]` and silently dropped every
-	// other membership; that live data loss is what this replaces.
-	let contactGroupEditing: Record<string, boolean> = $state({});
-	// Working checkbox state per contact being edited: hb_id → set of checked group names. Seeded from
-	// `contactGroups(hb_id)` when the editor opens so the pre-check never loses existing memberships.
-	let contactGroupDraft: Record<string, Set<string>> = $state({});
-
-	function beginGroupEdit(hb_id: string) {
-		contactGroupDraft = { ...contactGroupDraft, [hb_id]: new Set(contactGroups(hb_id)) };
-		contactGroupEditing = { ...contactGroupEditing, [hb_id]: true };
-	}
-
-	function toggleDraftGroup(hb_id: string, name: string, checked: boolean) {
-		const next = new Set(contactGroupDraft[hb_id] ?? []);
-		if (checked) next.add(name); else next.delete(name);
-		// Mutate-in-place then reassign so Svelte 5 sees the change (state[k] = v, not state={...}).
-		contactGroupDraft[hb_id] = next;
-		contactGroupDraft = { ...contactGroupDraft };
-	}
-
-	async function handleSaveGroups(hb_id: string) {
-		const groupNames = [...(contactGroupDraft[hb_id] ?? [])];
-		try {
-			await contactUpdateGroups(hb_id, groupNames);
-			await loadGroups();
-		} catch (e) { toast(String(e), 'error'); }
-		contactGroupEditing = { ...contactGroupEditing, [hb_id]: false };
-	}
+	// M20 W5 (data-loss half) used to live here as a SECOND checkbox editor inside the expanded
+	// detail panel: `contactGroupEditing` / `contactGroupDraft` / `beginGroupEdit` /
+	// `toggleDraftGroup` / `handleSaveGroups`. Devtest 2026-08-26 item 3, ruling 01 deleted it — one
+	// operation, one editor. The full-set semantics it existed to enforce did NOT go with it: they
+	// moved into the shared GroupMembershipPopover below, which seeds its draft from current
+	// memberships and sends the COMPLETE checked set to contactUpdateGroups. The single-select that
+	// sent `[newGroupName]` and silently dropped every other membership must never come back — see
+	// contacts-w5-dataloss.test.ts, which now pins the popover instead.
 
 	// M21 W5b / M22 W8: the `+` on the collapsed card face opens a popover anchored to the chip row,
 	// so group membership is reachable without expanding the detail. Same full-set semantics as the
@@ -847,6 +840,32 @@
 			await navigator.clipboard.writeText(npub);
 			toast('npub copied');
 		} catch (e) { toast(String(e), 'error'); }
+	}
+
+	// Devtest item 3. `copyNpub` above is the pattern; these are the peer-published strings that get
+	// the same treatment (ruling 02 — inert + mono + copy, never a mailto:/https:// link, because the
+	// value is a string somebody else wrote and a click must not launch a mail client or a browser).
+	async function copyText(value: string, label: string) {
+		try {
+			await navigator.clipboard.writeText(value);
+			toast(label);
+		} catch (e) { toast(String(e), 'error'); }
+	}
+
+	// True when the peer published at least one fact the CARD FACE has no room for. Deliberately does
+	// NOT count bio (face row 3), tags/content_types (their own block) or est_size (face row 4): if it
+	// already renders on the face, it must not make the panel claim to hold "the rest".
+	function hasProfileFacts(pr: Profile | null | undefined): boolean {
+		if (!pr) return false;
+		return Boolean(
+			pr.location ||
+				pr.contact_hint ||
+				pr.email ||
+				pr.since ||
+				(pr.languages?.length ?? 0) > 0 ||
+				(pr.willing_to?.length ?? 0) > 0 ||
+				(pr.social_links?.length ?? 0) > 0,
+		);
 	}
 
 	function openRowMenu(npub: string, anchor: HTMLElement) {
@@ -1175,8 +1194,8 @@
 							{gname}
 						</span>
 					{/each}
-					<!-- M21 W5b: `+` opens a membership popover anchored to this row (no detail expand
-					     needed). Full-set Apply — the same command the expanded editor uses. -->
+					<!-- M21 W5b: `+` opens a membership popover anchored to this row. Since devtest item 3
+					     ruling 01 it is the ONLY group editor on this page. Full-set Apply. -->
 					{#if groups.length > 0}
 						<button
 							class="group-add-btn"
@@ -1222,99 +1241,142 @@
 
 		{#if isOpen}
 			<div class="contact-detail">
-				<!-- M21 W4 behaviour 7: the detail's OWN bio paragraph is GONE (the clamped face bio
-				     replaced it — keeping both would duplicate the same text behind two controls). -->
-				{#if (peer.profile?.content_types?.length ?? 0) > 0}
-					<div class="badge-row-sm">
-						{#each peer.profile?.content_types ?? [] as ct (ct)}
-							<span class="ct-badge">{ct}</span>
-						{/each}
-					</div>
-				{/if}
-				{#if (peer.profile?.tags?.length ?? 0) > 0}
-					<div class="peer-tags">
-						{#each peer.profile?.tags ?? [] as tag (tag)}
-							<span class="peer-tag">{tag}</span>
-						{/each}
-					</div>
-				{/if}
+				<!-- Devtest 2026-08-26 item 3 (owner: "right now its showing duplicated information. It
+				     should contain the rest of the bio stuff that the base card didnt have room for like
+				     region, contact, other socials if any, willing to etc"), artifact greenlit.
 
-				<!-- Groups -->
-				{#if peerGroups.length > 0 || contactGroupEditing[peer.npub]}
-					<div class="group-row">
-						{#if contactGroupEditing[peer.npub]}
-							<!-- M20 W5: multi-select checkbox editor. Every group is listed with a checkbox
-							     pre-checked to its current membership; on Apply the full checked set is sent to
-							     contact_update_groups. This replaces the single-select that silently dropped all
-							     other memberships (live data loss). -->
-							<div class="group-edit-list">
-								{#each groups as g (g.name)}
-									<label class="group-check">
-										<input
-											type="checkbox"
-											checked={peerGroups.includes(g.name)}
-											onchange={(e) => toggleDraftGroup(peer.npub, g.name, e.currentTarget.checked)}
-										/>
-										{#if g.color}<span class="group-dot" style={`background:${g.color}`}></span>{/if}
-										{g.name}
-									</label>
-								{/each}
-								{#if groups.length === 0}
-									<span class="group-edit-empty">No groups yet.</span>
-								{/if}
-							</div>
-							<button class="tag-x" onclick={() => { contactGroupEditing = { ...contactGroupEditing, [peer.npub]: false }; }}>×</button>
-							<button class="btn-primary btn-xs" onclick={() => handleSaveGroups(peer.npub)}>Apply</button>
-						{:else}
-							{#each peerGroups as gname (gname)}
-								{@const gcolor = groupColor(gname)}
-								<span class="group-pill">
-									{#if gcolor}<span class="group-dot" style={`background:${gcolor}`}></span>{/if}
-									{gname}
-								</span>
-							{/each}
-							{#if groups.length > 0}
-								<button class="tag-add-btn" onclick={() => beginGroupEdit(peer.npub)}>
-									{peerGroups.length > 0 ? '✎' : '+ group'}
-								</button>
+				     The panel is now THE REST OF THE PROFILE — only facts the face has no room for —
+				     followed by your own local notes. Nothing the face already renders is repeated: the bio
+				     (face row 3), the fingerprint words (row 2), the group pills and est. size (row 4) are
+				     all absent here on purpose. Blocks are grouped by WHO OWNS THE DATA, which is a real
+				     distinction in a phonebook: `detail-theirs` is what they published and you cannot
+				     change, `detail-yours` is stored only on this machine.
+
+				     Seven Profile fields (location, languages, willing_to, contact_hint, email,
+				     social_links, since) crossed the Tauri boundary on every contact and were rendered
+				     NOWHERE before this. -->
+				<div class="detail-block detail-theirs">
+					<div class="block-head">Profile <em>published by them</em></div>
+					{#if hasProfileFacts(peer.profile)}
+						{@const p = peer.profile!}
+						<dl class="facts">
+							{#if p.location}
+								<dt>Region</dt><dd>{p.location}</dd>
 							{/if}
-						{/if}
-					</div>
-				{:else if groups.length > 0}
-					<div class="group-row">
-						<button class="tag-add-btn" onclick={() => beginGroupEdit(peer.npub)}>+ group</button>
-					</div>
-				{/if}
-
-				<!-- Local tags -->
-				<div class="tag-row">
-					{#each (peer.local_tags ?? []) as tag}
-						<span class="local-tag">
-							{tag}
-							<button class="tag-x" onclick={() => handleRemoveTag(peer.npub, peer.local_tags ?? [], tag)}>×</button>
-						</span>
-					{/each}
-					{#if editingTagsFor === peer.npub}
-						<input
-							class="hb-input tag-input"
-							type="text"
-							placeholder="tag…"
-							bind:value={tagInput}
-							onkeydown={(e) => {
-								if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); handleAddTag(peer.npub, peer.local_tags ?? []); }
-								if (e.key === 'Escape') { editingTagsFor = null; tagInput = ''; }
-							}}
-							onblur={() => { editingTagsFor = null; tagInput = ''; }}
-						/>
+							{#if (p.languages?.length ?? 0) > 0}
+								<dt>Languages</dt><dd>{p.languages.join(' · ')}</dd>
+							{/if}
+							{#if (p.willing_to?.length ?? 0) > 0}
+								<dt>Willing to</dt>
+								<dd class="fact-chips">
+									{#each p.willing_to as w (w)}<span class="fact-chip">{w}</span>{/each}
+								</dd>
+							{/if}
+							<!-- Ruling 02: contact_hint, email and social handles are PEER-CONTROLLED STRINGS.
+							     They render inert + mono with a copy button — never mailto:/https:// links, so a
+							     click on a contact card can't open a mail client or a browser on a string
+							     somebody else wrote. Same treatment the npub gets below. -->
+							{#if p.contact_hint}
+								<dt>Contact</dt>
+								<dd class="fact-copyable">
+									<span class="fact-mono">{p.contact_hint}</span>
+									<button class="copy-btn" onclick={() => copyText(p.contact_hint ?? '', 'Contact copied')}>copy</button>
+								</dd>
+							{/if}
+							{#if p.email}
+								<dt>Email</dt>
+								<dd class="fact-copyable">
+									<span class="fact-mono">{p.email}</span>
+									<button class="copy-btn" onclick={() => copyText(p.email ?? '', 'Email copied')}>copy</button>
+								</dd>
+							{/if}
+							{#if (p.social_links?.length ?? 0) > 0}
+								<dt>Socials</dt>
+								<dd class="fact-socials">
+									{#each p.social_links as sl (sl.platform + sl.handle)}
+										<span class="fact-social">
+											<span class="social-plat">{sl.platform}</span>
+											<span class="fact-mono">{sl.handle}</span>
+											<button class="copy-btn" onclick={() => copyText(sl.handle, 'Handle copied')}>copy</button>
+										</span>
+									{/each}
+								</dd>
+							{/if}
+							{#if p.since}
+								<dt>Hoarding since</dt><dd>{p.since}</dd>
+							{/if}
+						</dl>
 					{:else}
-						<button class="tag-add-btn" onclick={() => { editingTagsFor = peer.npub; tagInput = ''; }}>+ tag</button>
+						<!-- Ruling 03: hiding the block would make "they published nothing" indistinguishable
+						     from "the panel is broken" — the QURATOR-93 confident-empty shape. State it. -->
+						<div class="detail-empty">No profile details published.</div>
 					{/if}
 				</div>
 
-				<!-- M21 W5: the Private-collection audience is a per-contact toggle, decoupled from
-				     groups (owner ruling 2026-08-04). Ticking it seals every Private collection to
-				     this contact on the next publish; unticking revokes on the next republish only. -->
-				<div class="group-row">
+				{#if (peer.profile?.content_types?.length ?? 0) > 0 || (peer.profile?.tags?.length ?? 0) > 0}
+					<div class="detail-block detail-theirs">
+						<div class="block-head">Collects</div>
+						{#if (peer.profile?.content_types?.length ?? 0) > 0}
+							<div class="badge-row-sm">
+								{#each peer.profile?.content_types ?? [] as ct (ct)}
+									<span class="ct-badge">{ct}</span>
+								{/each}
+							</div>
+						{/if}
+						{#if (peer.profile?.tags?.length ?? 0) > 0}
+							<div class="peer-tags">
+								{#each peer.profile?.tags ?? [] as tag (tag)}
+									<span class="peer-tag">{tag}</span>
+								{/each}
+							</div>
+						{/if}
+					</div>
+				{/if}
+
+				<!-- The npub came off the card face in M21 W4 behaviour 1, and the old panel comment claimed
+				     it "survives in the expanded detail" — it did not. This is that claim made true. -->
+				<div class="detail-block detail-theirs">
+					<div class="block-head">Identity</div>
+					<div class="fact-copyable">
+						<span class="fact-mono fact-npub">{peer.npub}</span>
+						<button class="copy-btn" onclick={() => copyNpub(peer.npub)}>copy</button>
+					</div>
+				</div>
+
+				<!-- Ruling 01: the panel's checkbox group editor is GONE. The face's `+` opens the shared
+				     GroupMembershipPopover (the same component Browse uses) and the pills there are also the
+				     drag-to-group drop targets, so a second editor here was a second implementation of one
+				     operation — and its read-only pill row duplicated the face's row outright. ONE editor.
+				     The ⋯ menu's "Edit groups…" now opens that popover instead of expanding this panel. -->
+				<div class="detail-block detail-yours">
+					<div class="block-head">Your notes <em>local to this machine</em></div>
+					<div class="tag-row">
+						{#each (peer.local_tags ?? []) as tag}
+							<span class="local-tag">
+								{tag}
+								<button class="tag-x" onclick={() => handleRemoveTag(peer.npub, peer.local_tags ?? [], tag)}>×</button>
+							</span>
+						{/each}
+						{#if editingTagsFor === peer.npub}
+							<input
+								class="hb-input tag-input"
+								type="text"
+								placeholder="tag…"
+								bind:value={tagInput}
+								onkeydown={(e) => {
+									if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); handleAddTag(peer.npub, peer.local_tags ?? []); }
+									if (e.key === 'Escape') { editingTagsFor = null; tagInput = ''; }
+								}}
+								onblur={() => { editingTagsFor = null; tagInput = ''; }}
+							/>
+						{:else}
+							<button class="tag-add-btn" onclick={() => { editingTagsFor = peer.npub; tagInput = ''; }}>+ tag</button>
+						{/if}
+					</div>
+
+					<!-- M21 W5: the Private-collection audience is a per-contact toggle, decoupled from
+					     groups (owner ruling 2026-08-04). Ticking it seals every Private collection to
+					     this contact on the next publish; unticking revokes on the next republish only. -->
 					<label class="audience-check">
 						<input
 							type="checkbox"
@@ -1352,7 +1414,10 @@
 		<button class="menu-item" onclick={() => { handleRefresh(peer.npub); menuOpenFor = null; }} disabled={refreshing === peer.npub}>
 			{refreshing === peer.npub ? 'Refreshing…' : 'Refresh'}
 		</button>
-		<button class="menu-item" onclick={() => { detailExpanded = peer.npub; beginGroupEdit(peer.npub); menuOpenFor = null; }}>Edit groups…</button>
+		<!-- Devtest item 3 / ruling 01: was `detailExpanded = …; beginGroupEdit(…)`, which expanded the
+		     panel to reach its own checkbox editor. That editor is gone; this opens the shared popover,
+		     anchored to the ⋯ button that is still on screen. -->
+		<button class="menu-item" onclick={() => { if (menuAnchor) openGroupPopover(peer.npub, menuAnchor); menuOpenFor = null; }}>Edit groups…</button>
 		<button class="menu-item" onclick={() => { detailExpanded = peer.npub; editingTagsFor = peer.npub; tagInput = ''; menuOpenFor = null; }}>Edit tags…</button>
 		<div class="menu-item menu-item-confirm">
 			<ConfirmButton label="Remove contact" confirmText="Remove this contact?" onconfirm={() => { handleUnfollow(peer.npub); menuOpenFor = null; }} />
@@ -1888,6 +1953,60 @@
 		gap: 8px;
 	}
 
+	/* Devtest item 3 — the expanded panel's blocks. The visual split is the ONLY thing carrying
+	   "who owns this data", so it has to be legible at a glance without being loud: `detail-theirs`
+	   gets a warm left rule, `detail-yours` the accent. Both sit on the same elev2 ground, so the
+	   distinction reads as grouping rather than as two different kinds of importance. */
+	.detail-block {
+		background: var(--bg-elev2);
+		border-radius: 8px;
+		border-left: 2px solid transparent;
+		padding: 8px 12px;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+	/* Neutral, not amber: item 6 gave amber a meaning in this app (a collection nearing the
+	   100k item cap), and a second amber here would read as a warning about the contact.
+	   The distinction that matters is which block you can act on — that one gets the accent. */
+	.detail-theirs { border-left-color: var(--border-strong); }
+	.detail-yours { border-left-color: color-mix(in oklch, var(--accent) 55%, transparent); }
+	.block-head {
+		font-size: 10.5px; font-weight: 600; letter-spacing: 0.4px; text-transform: uppercase;
+		color: var(--fg-muted); margin-bottom: 4px;
+	}
+	.block-head em { font-style: normal; font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--fg-dim); }
+	.detail-empty { font-size: 11.5px; color: var(--fg-dim); }
+
+	/* Label/value grid. The label column is fixed so the values line up down the panel; it wraps to
+	   a single column below 380px, where a 92px gutter would leave nothing for a URL-ish handle. */
+	.facts { display: grid; grid-template-columns: 92px 1fr; gap: 4px 10px; margin: 0; }
+	.facts dt { font-size: 11.5px; color: var(--fg-dim); }
+	.facts dd { font-size: 12px; color: var(--fg); margin: 0; min-width: 0; overflow-wrap: anywhere; }
+	@media (max-width: 380px) {
+		.facts { grid-template-columns: 1fr; gap: 1px 0; }
+		.facts dd { margin-bottom: 5px; }
+	}
+	.fact-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+	.fact-chip {
+		font-size: 10.5px; padding: 2px 8px; border-radius: 999px;
+		background: var(--bg-elev3); color: var(--fg-muted);
+	}
+	/* Ruling 02: peer-published strings render as inert text + a copy button, never as a link. */
+	.fact-copyable { display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; max-width: 100%; }
+	.fact-mono { font-family: var(--font-mono); font-size: 11.5px; overflow-wrap: anywhere; }
+	.fact-npub { color: var(--fg-muted); }
+	.copy-btn {
+		flex-shrink: 0;
+		font-size: 10.5px; line-height: 1; color: var(--fg-dim); background: transparent;
+		border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; cursor: pointer;
+		font-family: var(--font-ui);
+	}
+	.copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+	.fact-socials { display: flex; flex-direction: column; gap: 4px; }
+	.fact-social { display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; }
+	.social-plat { font-size: 10.5px; color: var(--fg-dim); text-transform: lowercase; flex-shrink: 0; }
+
 	/* Pills */
 	.pill {
 		display: inline-flex; align-items: center; gap: 5px;
@@ -1905,8 +2024,8 @@
 		background: color-mix(in oklch, var(--fg-muted) 12%, transparent);
 	}
 
-	/* Group row on contact cards */
-	.group-row { display: flex; flex-wrap: wrap; gap: 4px; margin: 3px 0 2px; align-items: center; min-height: 20px; }
+	/* Group chips on contact cards. (.group-row went with the detail panel's own chip row in devtest
+	   item 3 — the face's row is .contact-sub-row and was never styled by it.) */
 	.group-pill {
 		display: inline-flex; align-items: center; gap: 4px;
 		padding: 1px 8px; border-radius: 4px; font-size: 11px; font-weight: 500;
@@ -1923,16 +2042,9 @@
 		font-family: var(--font-ui); display: inline-flex; align-items: center;
 	}
 	.group-add-btn:hover { border-color: var(--accent); color: var(--accent); }
-	/* M20 W5: inline multi-select group membership editor (replaces the single-select that dropped
-	   every other membership). Checkboxes over all groups + an Apply button, matching the inline-edit
-	   pattern the tag row already uses in this detail area. */
-	.group-edit-list { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; }
-	.group-check {
-		display: inline-flex; align-items: center; gap: 4px;
-		font-size: 11.5px; color: var(--fg-muted); cursor: pointer;
-	}
-	.group-check input { margin: 0; cursor: pointer; }
-	.group-edit-empty { font-size: 11px; color: var(--fg-dim); }
+	/* M20 W5's inline checkbox editor was styled here (.group-edit-list / .group-check /
+	   .group-edit-empty). Deleted with the editor in devtest item 3 ruling 01 — the surviving editor
+	   is GroupMembershipPopover, which carries its own styles. */
 
 	/* M15 W1: buttons unified on the app.css .btn system (local copies removed). */
 

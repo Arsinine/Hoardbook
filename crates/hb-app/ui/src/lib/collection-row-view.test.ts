@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { deriveRowChip, menuItems, badges } from './collection-row-view.js';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { deriveRowChip, menuItems, badges, sizeTier, sizeTierTooltip, MAX_COLLECTION_ITEMS } from './collection-row-view.js';
 import type { Collection } from './types.js';
 
 function col(overrides: Partial<Collection> = {}): Collection {
@@ -56,5 +58,58 @@ describe('collection-row-view', () => {
 		]);
 		// Absent visibility ⇒ Public (pre-M10 collection) — never a silent Private badge.
 		expect(badges(col({ sorted: false, visibility: undefined }))).toEqual([]);
+	});
+});
+
+// ── Size tiers (devtest 2026-08-26 item 6) ────────────────────────────────────────────────────────
+describe('sizeTier — size-coded item counts', () => {
+	it('under 80,000 is untiered: "remain as is"', () => {
+		expect(sizeTier(0)).toBe('normal');
+		expect(sizeTier(79_999)).toBe('normal');
+		expect(sizeTierTooltip(79_999)).toBeNull();
+	});
+
+	it('80,000–99,999 is the amber band, inclusive at both ends', () => {
+		expect(sizeTier(80_000)).toBe('warn');
+		expect(sizeTier(99_999)).toBe('warn');
+	});
+
+	it('100,000 and over is the red band', () => {
+		expect(sizeTier(100_000)).toBe('over');
+		expect(sizeTier(1_000_000)).toBe('over');
+	});
+
+	it('both warning tiers carry a tooltip that names the cap', () => {
+		for (const n of [80_000, 100_000]) {
+			const tip = sizeTierTooltip(n);
+			expect(tip, `tier at ${n} must explain itself`).toBeTruthy();
+			expect(tip).toContain('100,000');
+		}
+	});
+
+	// Chorus review 2026-08-27, finding 3. The tier and the Rust cap disagree by ONE at the boundary,
+	// on purpose: the owner asked for red at "100000 items and over", but `enforce_item_cap` rejects
+	// only `> MAX_COLLECTION_ITEMS`, so a 100,000-item collection is red AND scannable. The tooltip
+	// is the thing that must not lie about that — it may say the cap is reached, never that this
+	// collection is already broken.
+	it('the red tooltip does not claim a scannable 100,000-item collection cannot be scanned', () => {
+		const atCap = sizeTierTooltip(100_000)!;
+		expect(atCap).toBeTruthy();
+		// The false claim: an unconditional "this collection cannot be…" about a size Rust accepts.
+		expect(atCap).not.toMatch(/A collection this large cannot be/);
+		expect(atCap).not.toMatch(/this collection (can ?not|cannot)/i);
+		// The true claim it must make instead: the consequence is PAST the cap, not AT it.
+		expect(atCap).toMatch(/[Pp]ast the cap/);
+	});
+
+	// DRIFT GUARD: the 100,000 boundary is not ours to choose — it mirrors Rust's MAX_COLLECTION_ITEMS,
+	// the cap `enforce_item_cap` rejects a scan at. If someone raises the Rust cap, the red tier would
+	// otherwise keep warning about a wall that moved. Read the Rust source rather than a second copy of
+	// the number, so this cannot pass against a stale duplicate.
+	it('MAX_COLLECTION_ITEMS matches the Rust cap it describes', () => {
+		const rust = readFileSync(resolve(process.cwd(), '../src/commands/collection.rs'), 'utf8');
+		const m = rust.match(/const MAX_COLLECTION_ITEMS: u64 = ([0-9_]+);/);
+		expect(m, 'MAX_COLLECTION_ITEMS not found in hb-app/src/commands/collection.rs').toBeTruthy();
+		expect(Number(m![1].replace(/_/g, ''))).toBe(MAX_COLLECTION_ITEMS);
 	});
 });

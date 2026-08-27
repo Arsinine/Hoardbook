@@ -1,5 +1,7 @@
 // QURATOR-81 — layout-level source-scan: the window chrome lives ONCE in +layout.svelte (not
-// per-route), so every route — including Browse and Chat, which have no .topbar — gets the controls.
+// per-route), so every route gets the controls. (When this was written Browse and Chat had no
+// .topbar at all; devtest 2026-08-26 item 5 gave them one — see page-bar-item5.test.ts, which
+// MOUNTS both pages rather than scanning them.)
 // Source-text assertions, the repo's established pattern for route-page guards (see topics-w9.test.ts).
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
@@ -38,7 +40,7 @@ describe('QURATOR-81 — window chrome in the layout shell', () => {
 	// "there's no drag". A whole-file scan cannot measure a drag target. jsdom computes no layout, so
 	// nothing here can either; what these tests CAN pin is that the attribute sits on the full-width
 	// topbar element rather than only on a sliver. That is the structural half of the fix.
-	it.each(['contacts', 'settings', 'topics', 'home'])(
+	it.each(['contacts', 'settings', 'topics', 'home', 'browse', 'chat'])(
 		'the %s topbar element itself carries the drag attribute, not just the file',
 		(route) => {
 			// 'home' is the root route — its +page.svelte sits next to this test file (routes/), not
@@ -54,11 +56,11 @@ describe('QURATOR-81 — window chrome in the layout shell', () => {
 		},
 	);
 
-	it('Browse panel-top (the one unconditional header it has) carries the drag attribute', () => {
-		// Browse's right panel is peer-selection-dependent and has no unconditional header, so full
-		// parity with the .topbar routes isn't possible without a layout change (owner-gated, see
-		// QURATOR-81). panel-top in the left sidebar is the pragmatic fix: always present, clear of
-		// the window controls (no padding-right needed — they're anchored top-right of .main).
+	it('Browse panel-top keeps its drag attribute alongside the topbar added in item 5', () => {
+		// Was "the one unconditional header it has" — the layout change that comment called
+		// owner-gated is the one the owner later ruled on (devtest item 5, Option B). panel-top is
+		// now a second handle inside the left sidebar, kept because removing it would take drag away
+		// from that column for no gain.
 		const src = readFileSync(new URL('./browse/+page.svelte', import.meta.url), 'utf8');
 		const tag = src.match(/<div class="panel-top"[^>]*>/);
 		expect(tag, 'browse has no .panel-top opening tag').not.toBeNull();
@@ -77,10 +79,10 @@ describe('QURATOR-81 — window chrome in the layout shell', () => {
 		}
 	});
 
-	it('the layout drag strip is documented as a fallback, still the only cover for Browse\'s right panel', () => {
-		// Browse's right (collection-detail) panel still has no unconditional header — the thin
-		// strip is what it has there. Recorded so the next reader knows that gap is deliberate, not
-		// an oversight, unlike the Home/Chat gaps this ticket closed.
+	it('the layout drag strip survives as a fallback, but is no longer any route\'s only cover', () => {
+		// Was: "still the only cover for Browse's right panel". Devtest item 5 ended that — Browse's
+		// right panel now sits under the page's own full-width .topbar. The 8px strip stays because
+		// it is a real (if thin) handle at the very top edge; it is just no longer load-bearing.
 		const s = layoutSrc();
 		expect(s).toContain('win-drag-top');
 	});
@@ -92,11 +94,14 @@ describe('QURATOR-81 — window chrome in the layout shell', () => {
 		expect(s).toMatch(/:global\(\.topbar\)\s*\{[^}]*padding-right/);
 	});
 
-	it('Chat pane-header reserves the same right-padding, fixing the View-profile overlap', () => {
-		// pane-header isn't .topbar, so the global :global(.topbar) rule above doesn't reach it — it
-		// needs its own padding-right. Without this, "View profile" (and the topic-channel/requests
-		// header actions) render under the absolute-positioned window controls.
+	it('Chat pane-header no longer reserves right-padding — the topbar above it does', () => {
+		// INVERTED by devtest item 5. The 120px was there because the window controls overlaid
+		// pane-header; they now overlay Chat's own .topbar, which sits above .chat-frame and picks
+		// the reservation up from the layout's one :global(.topbar) rule. Leaving it would push
+		// "View profile" 120px inward for no reason. If a future change moves the controls back over
+		// the pane-header, this assertion is the one that should be flipped back — not silently
+		// deleted.
 		const src = readFileSync(new URL('./chat/+page.svelte', import.meta.url), 'utf8');
-		expect(src).toMatch(/\.pane-header\s*\{[^}]*padding-right:\s*120px/);
+		expect(src).not.toMatch(/\.pane-header\s*\{[^}]*padding-right:\s*120px/);
 	});
 });

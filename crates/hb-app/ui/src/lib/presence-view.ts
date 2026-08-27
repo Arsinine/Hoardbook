@@ -8,17 +8,23 @@
 // So there are two strings, and they are labelled as what they are:
 //   - **"checked {t}"** — OUR cache age, from `last_fetched` (W5.1: the word "seen" was the lie).
 //   - **"Last seen {t}"** — THEIR presence, from a beacon's `created_at` (W5.2), which we learn
-//     from the fresh-presence map the 60s online poll already fetches. No per-contact fan-out.
+//     from the fresh-presence map the online poll already fetches. No per-contact fan-out.
 //
 // Never-observed renders "Last seen — unknown", not "never": "never" asserts something about them,
 // when all we can honestly claim is something about our own knowledge.
 
-/** The presence freshness window — matches `online.rs::ONLINE_WINDOW_SECS` (10 min, Decision #12).
- *  A beacon inside it means "Online"; outside it, we render its age instead. */
-export const PRESENCE_WINDOW_MS = 600_000;
+/** The presence freshness window — matches `online.rs::ONLINE_WINDOW_SECS`. A beacon inside it means
+ *  "Online"; outside it, we render its age instead.
+ *
+ *  8 min (owner ruling 2026-08-27, devtest item 1 — was 10 min). This is a COPY of a Rust constant,
+ *  so `presence-view.test.ts` parses online.rs and asserts the two agree; it also asserts the window
+ *  keeps enough slack over the beacon republish cadence that one missed publish does not read as
+ *  offline. Both must stay green — a one-sided edit here is how the pill ends up calling a stale
+ *  beacon "Online" for a window Rust no longer uses. */
+export const PRESENCE_WINDOW_MS = 480_000;
 
 /** How often the contact list re-reads the wall clock. The age must advance on its own — if it only
- *  moved when the 60s relay poll assigned new data, a failed poll or a hidden tab would freeze it,
+ *  moved when the relay poll assigned new data, a failed poll or a hidden tab would freeze it,
  *  which is the original "seen just now forever" defect in a new form. Purely local: no network. */
 export const PRESENCE_TICK_MS = 30_000;
 

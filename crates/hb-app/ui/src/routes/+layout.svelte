@@ -4,7 +4,8 @@
 	import { get } from 'svelte/store';
 	import { page } from '$app/stores';
 	import { getIdentity, getProfile, getCollections, getContacts, getMessages, getReadState, topicAnnouncements, topicAnnounceSeen } from '$lib/api.js';
-	import { identity, profile, inboxMessages, readWatermarks, toastMessage, appReady, toast, identityLoadError, topicAnnounceSummaries, announceSeen, seedSentFromFeed, loadCollectionsInto, loadContactsInto } from '$lib/stores.js';
+	import { identity, profile, inboxMessages, readWatermarks, toastMessage, appReady, toast, dismissToast, isStickyToast, identityLoadError, topicAnnounceSummaries, announceSeen, seedSentFromFeed, loadCollectionsInto, loadContactsInto } from '$lib/stores.js';
+	import { isOurDrag } from '$lib/drag-group.js';
 	import { totalUnread, unreadByPeer } from '$lib/unread-view.js';
 	import { unseenAnnouncementCount, newlyArrivedAnnouncements, announcementBaseline } from '$lib/topics-view.js';
 	import { listen } from '@tauri-apps/api/event';
@@ -143,7 +144,27 @@
 	// count folds into the Chat nav badge (unread DMs + unseen announcements) — the Topics item no
 	// longer badges. Opening a topic channel advances its seen watermark, clearing its share here.
 	let navChatCount = $derived(navUnreadCount + navAnnounceCount);
+
+	// ── Foreign-drag guard (devtest 2026-08-26 item 2, chorus finding 1) ──────────────────────────
+	// `dragDropEnabled: false` in tauri.conf.json is what un-breaks contact drag: WebView2's native
+	// file-drop handler was swallowing the HTML5 gesture and painting the no-drop cursor the owner
+	// reported. But that flag cuts BOTH ways — with the native handler off, a file dragged in from
+	// Explorer and released anywhere on the window reaches the webview, which does the browser
+	// default and NAVIGATES to the file:// URL, blanking the SPA until restart.
+	//
+	// So the window itself refuses foreign drags. `isOurDrag` reads `dataTransfer.types`, which is
+	// readable during dragover (unlike getData(), see drag-group.ts) — our own contact/collection
+	// drags are let through untouched so their per-element handlers keep full control of dropEffect
+	// and the drop itself. Anything else gets preventDefault (no navigation) plus dropEffect 'none'
+	// (an honest cursor: this window does not accept dropped files).
+	function guardForeignDrag(e: DragEvent) {
+		if (isOurDrag(e.dataTransfer)) return;
+		e.preventDefault();
+		if (e.dataTransfer) e.dataTransfer.dropEffect = 'none';
+	}
 </script>
+
+<svelte:window ondragover={guardForeignDrag} ondrop={guardForeignDrag} />
 
 <div class="frame">
 	<!-- Sidebar -->
@@ -193,8 +214,8 @@
 	<div class="main">
 		<!-- QURATOR-81 — window controls overlay the route's top-right corner, absolute-positioned so
 		     they add zero vertical cost (the owner's ruling: merge into existing chrome, no new bar).
-		     One site covers all six routes — Browse and Chat have no .topbar, so per-route placement
-		     would leave them with no controls at all. The top drag strip is a thin full-width bar at
+		     One site covers all six routes — and it predates devtest item 5, when Browse and Chat had
+		     no .topbar at all, so per-route placement would have left them with no controls. The top drag strip is a thin full-width bar at
 		     the very top edge — route topbars start with 16px of padding, so this 8px strip overlaps
 		     only empty padding and never swallows a click on a route action. It gives the user an
 		     obvious grab point to drag the window. Route topbars reserve right-space for the controls
@@ -209,10 +230,20 @@
 
 <!-- Toast (M22 W6: the Undo button renders only when an action is present — conditional, never unconditional) -->
 {#if $toastMessage}
-	<div class="toast" class:toast-error={$toastMessage.kind === 'error'}>
-		{$toastMessage.text}
+	<div
+		class="toast"
+		class:toast-error={$toastMessage.kind === 'error'}
+		class:toast-sticky={isStickyToast($toastMessage.kind)}
+		role={$toastMessage.kind === 'error' ? 'alert' : 'status'}
+	>
+		<span class="toast-text">{$toastMessage.text}</span>
 		{#if $toastMessage.action}
 			<button type="button" class="toast-action" onclick={$toastMessage.action.run}>{$toastMessage.action.label}</button>
+		{/if}
+		{#if isStickyToast($toastMessage.kind)}
+			<!-- Devtest item 7: a sticky error has no timer, so this X is the ONLY way to close it. It
+			     renders for EVERY error toast, never conditionally on the message text. -->
+			<button type="button" class="toast-dismiss" aria-label="Dismiss" onclick={dismissToast}>&#10005;</button>
 		{/if}
 	</div>
 {/if}
@@ -360,8 +391,9 @@
 		min-width: 0;
 		/* QURATOR-81 — the custom window controls (minimize/maximize/close) are absolute-positioned
 		   in the top-right corner of .main (see .win-controls-host). They overlay each route's topbar
-		   (or panel header for Browse/Chat), matching the owner's "merge into existing chrome, no new
-		   bar" ruling: zero added vertical cost. Position:relative here anchors them. */
+		   — all six routes have one since devtest item 5 gave Browse and Chat theirs — matching the
+		   owner's "merge into existing chrome, no new bar" ruling. Position:relative here anchors
+		   them. */
 		position: relative;
 	}
 
@@ -426,6 +458,40 @@
 		color: var(--fg);
 		border: 1px solid var(--border-strong);
 		box-shadow: 0 8px 24px oklch(0 0 0 / 0.4);
+		/* Devtest item 7: errors are multi-sentence (the manifest one names a byte count and a menu
+		   path). Without a ceiling the toast stretched to the window width and read as one long line;
+		   cap it and let the text wrap. flex-start keeps the buttons on the FIRST line of wrapped text. */
+		display: flex;
+		align-items: flex-start;
+		gap: 10px;
+		max-width: min(420px, calc(100vw - 32px));
+	}
+
+	.toast-text {
+		line-height: 1.45;
+		min-width: 0;
+	}
+
+	/* A sticky toast waits for the X, so it can be read at leisure — give it a little more room. */
+	.toast-sticky {
+		padding: 10px 12px 10px 14px;
+	}
+
+	.toast-dismiss {
+		flex: none;
+		margin-left: auto;
+		padding: 0 2px;
+		line-height: 1.45;
+		font-size: 12px;
+		border: 0;
+		background: transparent;
+		color: inherit;
+		opacity: 0.7;
+		cursor: pointer;
+	}
+
+	.toast-dismiss:hover {
+		opacity: 1;
 	}
 
 	.toast-error {
@@ -435,7 +501,7 @@
 	}
 
 	.toast-action {
-		margin-left: 10px;
+		flex: none;
 		padding: 2px 8px;
 		font-size: 12px;
 		font-weight: 600;

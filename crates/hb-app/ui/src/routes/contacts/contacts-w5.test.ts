@@ -39,7 +39,7 @@ describe('contacts W5 — the row stops calling our poll time "seen"', () => {
 });
 
 describe('contacts W5 — no new relay load', () => {
-	it('the fresh set rides the EXISTING 60s online poll, not a new query', () => {
+	it('the fresh set rides the EXISTING online poll, not a new query', () => {
 		const s = src();
 		// The per-contact data is read off `onlineData` — the chip's own cached payload.
 		expect(s).toMatch(/freshIndex\(\(?onlineData[^)]*\)?\?\.fresh\)/);

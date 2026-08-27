@@ -12,7 +12,7 @@ use crate::canary::with_canary_marker;
 use crate::harness::{now, result, settle, Ctx, FETCH_TIMEOUT};
 use crate::tap::TestResult;
 
-const WINDOW: u64 = 600; // online freshness window (Decision #12)
+const WINDOW: u64 = 480; // online freshness window — tracks hb-app ONLINE_WINDOW_SECS
 const TTL: u64 = 30 * 60;
 
 pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
