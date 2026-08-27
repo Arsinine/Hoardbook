@@ -759,6 +759,7 @@ pub async fn build_probe_input(
         petname: Some("wan-e2e-serve".to_string()),
         profile: None,
         collections: vec![],
+        listings_state: Default::default(), // QURATOR-134 tri-state (not classified on this stub path)
         online: false,
         last_fetched: chrono::Utc::now(),
         last_presence: None,

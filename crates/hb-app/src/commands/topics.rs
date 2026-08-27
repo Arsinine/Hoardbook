@@ -186,6 +186,7 @@ pub(crate) fn upsert_topic_contact(store: &DataStore, npub: &str) -> Result<(), 
         petname: None,
         profile: None,
         collections: vec![],
+        listings_state: Default::default(), // QURATOR-134 tri-state (not classified on this stub path)
         online: false,
         last_fetched: chrono::Utc::now(),
         last_presence: None, // W5.2: stamped by the online poll only
@@ -806,6 +807,7 @@ mod tests {
             petname: Some("hand-added".into()),
             profile: None,
             collections: vec![],
+            listings_state: Default::default(), // QURATOR-134: fixtures predate the tri-state; Fetched is the least-wrong default
             online: false,
             last_fetched: chrono::Utc::now(),
             last_presence: None,
