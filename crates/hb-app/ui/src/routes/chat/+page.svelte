@@ -1014,7 +1014,7 @@
 							<div class="convo-info">
 								<div class="convo-row">
 									<span class="convo-name" class:convo-name-active={selectedTopic?.topic_id === t.topic_id}>{t.name}</span>
-									{#if t.private}<span class="convo-lock" title="Private topic">🔒</span>{/if}
+									{#if t.private}<span class="hb-tag">private</span>{/if}
 								</div>
 							</div>
 						</button>
@@ -1097,7 +1097,7 @@
 					<div class="pane-peer-info">
 						<div class="pane-peer-row">
 							<span class="pane-peer-name">{selectedTopic.name}</span>
-							{#if selectedTopic.private}<span class="pill pill-offline">private</span>{/if}
+							{#if selectedTopic.private}<span class="hb-tag">private</span>{/if}
 						</div>
 						<span class="channel-sub">Topic channel · each post disappears 24h after it's posted · manage in Topics</span>
 					</div>
@@ -1655,7 +1655,6 @@
 
 	/* devtest v0.12.1 #5: a private-topic marker reads as a lock, not a filled dot (the old amber dot
 	   looked like a permanent unread/notification bubble). */
-	.convo-lock { font-size: 10px; line-height: 1; flex-shrink: 0; opacity: 0.6; }
 
 	/* Topic channels (M11) */
 	.convo-section-label {

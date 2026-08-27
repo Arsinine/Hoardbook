@@ -757,7 +757,17 @@
 		</div>
 	</div>
 
-	<!-- M16 W3: optional big relay for large-collection full manifests -->
+<!-- ===================================================================================
+     BIG RELAY — TEMPORARILY DISABLED, owner 2026-08-27. Commented out rather than deleted so it
+     can come back unchanged. The BACKEND IS UNTOUCHED: `settings.big_relay_url` still round-trips
+     through get/saveSettings, M16 Layer 3 still publishes there when the value is non-empty, and
+     `handleSaveBigRelay` is still defined above. Only the way to EDIT it is hidden.
+     ⚠ Consequence to know: anyone who already set a big relay keeps using it with no way to see or
+     clear it from the UI. If that is not wanted, the value must also be cleared on upgrade — that
+     is a separate decision, deliberately NOT taken here.
+     To restore: delete this comment opener and its closer below.
+
+     (was: M16 W3 - optional big relay for large-collection full manifests)
 	<div class="section-label">Big relay (large collections)</div>
 	<div class="surface surface-nop">
 		<div class="relay-add-row">
@@ -778,6 +788,7 @@
 			fetch the rest from it. Leave empty to publish only the preview.
 		</div>
 	</div>
+     =================================================================================== -->
 
 	<!-- Preferences -->
 	<div class="section-label">Preferences</div>
@@ -915,7 +926,7 @@
 		     "strong signal, not proof" and the copy must not overclaim. -->
 		<div class="nat-row" data-nat-class={natClass}>
 			<div class="toggle-text">
-				<div class="toggle-label">Network type</div>
+				<div class="toggle-label">Network type<FeatureTooltip key="network-type" /></div>
 				<div class="toggle-sub">{natSub}</div>
 			</div>
 			<div
