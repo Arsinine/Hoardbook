@@ -592,6 +592,7 @@ pub(crate) async fn dm_request_accept_inner(
         petname,
         profile: None,
         collections: vec![],
+        listings_state: Default::default(), // QURATOR-134 tri-state (not classified on this stub path)
         online: false,
         last_fetched: chrono::Utc::now(),
         last_presence: None, // W5.2: stamped by the online poll only
@@ -1679,6 +1680,59 @@ mod tests {
 
         dm_unblock_inner(&store, npub.clone()).unwrap();
         assert!(!store.load_dm_blocked().unwrap().contains(&npub));
+    }
+
+    /// QURATOR-141 — a PROACTIVE block (Settings' block-by-npub, no prior DM Request, no contact
+    /// record) must reach the same DM-acceptance path chat's `handleBlock` feeds. The acceptance
+    /// classifier is `route_dm` driven by `get_messages`'s fresh `load_dm_blocked()` read, keyed on
+    /// the bare npub string — NOT on any request record — so a store-side block is enforced there
+    /// with zero relationship prerequisites. This pins that end-to-end at the store level: block a
+    /// stranger with no bucket/decline/contact anywhere, then assert (a) their subsequent DM is
+    /// REFUSED (`route_dm` → Drop), not merely hidden, (b) a stranger-Request is never created for
+    /// them, and (c) unblock restores acceptance (Request, since they're still a stranger).
+    #[test]
+    fn proactive_block_refuses_later_dms_and_unblock_restores_acceptance() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
+        let stranger = "npub1hostile".to_string();
+        let own_npub = me.npub();
+
+        // The proactive state: nothing exists for this npub — no Request bucket, no decline, no
+        // contact. `dm_block_inner` must work purely from the npub (creating a contact is out of
+        // scope by owner ruling).
+        assert!(store.load_dm_requests(&me).unwrap().is_empty());
+        assert!(store.load_dm_declined().unwrap().is_empty());
+        dm_block_inner(&store, &me, stranger.clone()).unwrap();
+
+        // (a) REFUSED, not hidden: the blocklist written by the proactive block is exactly what
+        // `get_messages` loads into `DmClassifyCtx::blocked`, and `route_dm` consults it FIRST —
+        // blocked supersedes contact, decline, and the stranger-Request path alike.
+        let blocked: HashSet<String> = store.load_dm_blocked().unwrap().into_iter().collect();
+        assert!(blocked.contains(&stranger), "the proactive block landed in dm_blocked.json");
+        let contacts: HashSet<String> = HashSet::new();
+        let declined: HashSet<String> = HashSet::new();
+        let on = ctx(&contacts, &blocked, &declined, true);
+        assert_eq!(
+            route_dm(&stranger, &own_npub, &on),
+            DmRoute::Drop,
+            "a proactively-blocked stranger's DM is refused at acceptance, not merely hidden"
+        );
+
+        // (b) No Request entry may be created for them (blocked supersedes the stranger-Request
+        // path — this is the WAN-C C5 shape, pinned here at the unit level too).
+        assert!(store.load_dm_requests(&me).unwrap().is_empty());
+
+        // (c) Unblock restores acceptance: same stranger, now no contact/decline and allow_dms on,
+        // routes to Request again.
+        dm_unblock_inner(&store, stranger.clone()).unwrap();
+        let blocked_after: HashSet<String> = store.load_dm_blocked().unwrap().into_iter().collect();
+        let restored = ctx(&contacts, &blocked_after, &declined, true);
+        assert_eq!(
+            route_dm(&stranger, &own_npub, &restored),
+            DmRoute::Request,
+            "unblock restores stranger-DM acceptance"
+        );
     }
 
     // ── QURATOR-91 — own sent history survives a restart via the at-rest cache ──────────────────
