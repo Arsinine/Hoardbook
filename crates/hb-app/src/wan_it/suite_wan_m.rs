@@ -35,7 +35,10 @@ use anyhow::{anyhow, Result};
 use hb_core::TransportTicket;
 use nostr::prelude::ToBech32;
 
-use crate::commands::browse::accept_manifest_bytes;
+// `accept_manifest_bytes` is no longer imported here on purpose: the M16 W4 gate is applied
+// INSIDE `redeem_manifest_ticket_inner`, which this suite now calls. The harness importing the gate
+// itself was the shape of the 2026-08-27 defect — a copy of the production sequence, kept in step by
+// hand, that silently omitted one step.
 use crate::identity_state::{AppIdentity, SharedIdentity};
 use crate::store::DataStore;
 use crate::transport::{fetch_manifest, parse_node_addr};
@@ -184,73 +187,74 @@ async fn m9_dead_endpoint_fails_bounded(probe: &ProbeInput) -> Result<(), String
 // M1 — the live redeem + exactly-once
 // ---------------------------------------------------------------------------
 
-/// Redeem the live ticket through the production path: `fetch_manifest` with the `accept_manifest_bytes`
-/// gate (the same function `redeem_manifest_ticket` and the file/paste import call — author pinned to
-/// the serve's npub, slug bound, signature verified before decrypt, completeness required). Retries
-/// ×3 (flake policy); a persistent failure is an honest `not ok` with the observed error.
+/// Redeem the live ticket by calling **the production command body itself**.
+///
+/// This used to hand-copy `redeem_manifest_ticket`'s steps — claim the ask, `fetch_manifest` with
+/// the `accept_manifest_bytes` gate, spend the ask — each one mirrored here and kept in step by
+/// comments saying "the harness mirrors it". That is exactly how the 2026-08-27 devtest failure got
+/// out: the ONE step the copy omitted was `sanitize_node_addr`, the asker's SSRF guard, which
+/// rewrites `ticket.node_addr` before the ticket is presented. The owner side then compared the
+/// presented ticket against the issued one byte-for-byte and refused every honest redemption between
+/// two real machines, while 18 loopback QUIC tests and this suite stayed green.
+///
+/// So the harness no longer mirrors anything: `redeem_manifest_ticket_inner` IS the command's body
+/// (the `#[tauri::command]` is a marshalling shim over it), and every guard, transformation and
+/// ordering rule inside it is now on the WAN path by construction rather than by a comment asking a
+/// future editor to keep two copies in step. Retries ×3 stay (flake policy).
+///
+/// This is CLAUDE.md §9 applied where it was being violated: *a round-trip test must END WHERE
+/// PRODUCTION ENDS.*
 async fn m1_live_redeem(probe: &ProbeInput) -> Result<(), String> {
-    // Claim the ask before the dial (production gate, before any dial). A prior dead-leg claim for
-    // the same request id re-claims Granted; a different request id would be ClaimedByAnother.
-    claim_for_probe(probe, &probe.live_ticket).await?;
-
-    let endpoint = probe_client_endpoint(probe).await?;
-    let store = probe.store.clone();
-    let serve_npub = probe.serve_npub.clone();
-    let expected_slug = probe.live_ticket.slug.clone();
+    // NOTE: the ask claim, the gate and the spend all happen INSIDE the call below now. The harness
+    // does not pre-claim — doing so would re-introduce a hand-copy of the very gate under test.
+    let (live_npub, shared) = probe_shared_state(probe);
+    let ticket_json = serde_json::to_string(&probe.live_ticket)
+        .map_err(|e| format!("re-serialize the live ticket: {e}"))?;
 
     let mut last_err = String::new();
     for attempt in 1..=LIVE_REDEEM_RETRIES {
-        let store = store.clone();
-        let serve_npub = serve_npub.clone();
-        let expected_slug = expected_slug.clone();
-        // Clone the endpoint per attempt — iroh::Endpoint is cheap to clone (an Arc internally), and
-        // fetch_manifest borrows it by ref. A fresh clone per retry keeps the move semantics clean.
-        let endpoint = endpoint.clone();
-        // A second clone, kept OUTSIDE the async move block below, so it survives past the await for
-        // the post-success connection-type diagnostic (the first clone is consumed by fetch_manifest).
-        let diag_endpoint = endpoint.clone();
-        let result = tokio::time::timeout(LIVE_REDEEM_TIMEOUT, async move {
-            // THE production redeem path: fetch_manifest runs the gate INSIDE (before the ACK), so a
-            // manifest we reject does not burn the ticket. The closure is accept_manifest_bytes —
-            // the real M16 W4 gate, not a transport-flavoured copy.
-            fetch_manifest(&endpoint, &probe.live_ticket, |payload| {
-                let raw = std::str::from_utf8(payload.as_bytes())
-                    .map_err(|_| anyhow!("the manifest that arrived was not text"))?;
-                accept_manifest_bytes(
-                    &serve_npub,
-                    Some(&expected_slug),
-                    raw,
-                    None,
-                    &store,
-                    // The cache IS the delivery on this path (Chat discards the tree; Browse reads the
-                    // cache back). A dropped write fails the gate, so no ACK is sent and the ticket
-                    // survives — the production property `redeem_manifest_ticket` relies on.
-                    true,
-                )
-                .map_err(|e| anyhow!("{e}"))?;
-                Ok(())
-            })
-            .await
-        })
+        let result = tokio::time::timeout(
+            LIVE_REDEEM_TIMEOUT,
+            crate::commands::fulfil::redeem_manifest_ticket_inner(
+                probe.serve_npub.clone(),
+                ticket_json.clone(),
+                None,
+                &live_npub,
+                &probe.store,
+                &shared,
+            ),
+        )
         .await;
 
         match result {
-            Ok(Ok(_payload)) => {
-                eprintln!("   M1-live redeem succeeded on attempt {attempt}");
-                log_redeem_connection_type(&diag_endpoint, &probe.live_ticket.node_addr).await;
-                // Spend the ask now that the redemption landed — the production command
-                // (redeem_manifest_ticket) does this after fetch_manifest returns Ok, so the harness
-                // mirrors it. Conditional on the nonce; a no-op if already spent.
-                let _ = probe.store.spend_manifest_ask(
-                    &probe.serve_npub,
-                    &probe.live_ticket.slug,
-                    probe.live_ticket.ask_nonce.as_deref().unwrap_or_default(),
-                );
+            Ok(Ok(_imported)) => {
+                eprintln!("   M1-live redeem succeeded on attempt {attempt} (via the production command body)");
+                // The endpoint the command bound, for the hole-punch diagnostic. Re-reading it through
+                // `ensure_endpoint` returns the same binding rather than making a second one.
+                if let Ok(ep) = ensure_endpoint(
+                    &shared,
+                    &probe.probe_npub,
+                    &live_npub,
+                    &probe.transport_key,
+                    probe_source(probe),
+                    Role::DialOnly,
+                )
+                .await
+                {
+                    log_redeem_connection_type(&ep, &probe.live_ticket.node_addr).await;
+                }
                 return Ok(());
             }
             Ok(Err(e)) => {
-                last_err = format!("attempt {attempt}: fetch_manifest failed: {e}");
+                last_err = format!("attempt {attempt}: redeem_manifest_ticket_inner failed: {e}");
                 eprintln!("   M1-live attempt {attempt} failed: {e}");
+                // The claim is durable and bound to this request id, so a retry re-claims Granted.
+                // An `Unsolicited`/`ClaimedByAnother` error here is a real finding, not a flake —
+                // report it verbatim rather than retrying into a misleading timeout.
+                if e.contains("doesn't answer a request you sent") || e.contains("already answering")
+                {
+                    return Err(last_err);
+                }
             }
             Err(_) => {
                 last_err = format!(
@@ -398,27 +402,35 @@ async fn m1_second_attempt_refused(
 /// The probe never listens (owner ruling ③): binding a listening endpoint would leave it answering
 /// anyone holding its permanently-stable node id. Constructs a fresh `SharedIdentity` from the
 /// probe's fields (AppIdentity is not Clone — it holds ZeroizeOnDrop secrets).
-async fn probe_client_endpoint(probe: &ProbeInput) -> Result<iroh::Endpoint, String> {
+/// The two pieces of app state the production command bodies take. Built exactly as the running app
+/// builds them, so `redeem_manifest_ticket_inner` gets the same shapes it gets in production.
+fn probe_shared_state(probe: &ProbeInput) -> (SharedIdentity, crate::transport_state::SharedEndpoint) {
     let app_id = AppIdentity {
         identity: probe.identity.clone(),
         browse_key: probe.browse_key.clone(),
         transport_key: probe.transport_key.clone(),
     };
-    let live_npub: SharedIdentity = Arc::new(tokio::sync::RwLock::new(Some(app_id)));
-    let source: Arc<dyn crate::transport::ManifestSource> = crate::manifest_source::StoreManifestSource::new(
+    (Arc::new(tokio::sync::RwLock::new(Some(app_id))), new_shared_endpoint())
+}
+
+fn probe_source(probe: &ProbeInput) -> Arc<dyn crate::transport::ManifestSource> {
+    crate::manifest_source::StoreManifestSource::new(
         probe.store.clone(),
         probe.identity.clone(),
         probe.browse_key.clone(),
-    );
+    )
+}
+
+async fn probe_client_endpoint(probe: &ProbeInput) -> Result<iroh::Endpoint, String> {
+    let (live_npub, shared) = probe_shared_state(probe);
     // new_shared_endpoint + ensure_endpoint is the production path (transport_state). DialOnly never
     // spawns an accept loop.
-    let shared = new_shared_endpoint();
     ensure_endpoint(
         &shared,
         &probe.probe_npub,
         &live_npub,
         &probe.transport_key,
-        source,
+        probe_source(probe),
         Role::DialOnly,
     )
     .await
