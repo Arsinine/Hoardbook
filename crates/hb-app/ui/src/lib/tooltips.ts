@@ -10,7 +10,8 @@ export type TooltipKey =
 	| 'listings-locked'
 	| 'k-of-n-folders'
 	| 'fingerprint'
-	| 'custom-relays';
+	| 'custom-relays'
+	| 'network-type';
 
 /** The canonical key list — single source of truth for iteration + the registry-completeness test. */
 export const TOOLTIP_KEYS: TooltipKey[] = [
@@ -20,6 +21,7 @@ export const TOOLTIP_KEYS: TooltipKey[] = [
 	'k-of-n-folders',
 	'fingerprint',
 	'custom-relays',
+	'network-type',
 ];
 
 export interface TooltipContent {
@@ -56,5 +58,15 @@ export const TOOLTIPS: Record<TooltipKey, TooltipContent> = {
 	'custom-relays': {
 		title: 'Custom relays',
 		body: 'Add a relay to build a private community — you and the people you tell will meet there. It does not make you easier to find: nobody else is connected to your relay by default, so adding more does not widen your reach. The defaults are where strangers will see you.',
+	},
+	// Owner, 2026-08-27: "add a tooltip letting the user know what it means if they're being a NAT."
+	// Says what it COSTS them, not what it is — a definition of network address translation helps
+	// nobody decide anything. Deliberately does not overclaim: the classifier's own copy calls CGNAT
+	// "a strong signal, not proof" (QURATOR-68), so this must not promise that direct transfer will
+	// fail, only that it may need a relay. Everything except the direct manifest hand-off works
+	// identically behind any NAT, and saying so is the point — otherwise the pill reads as a fault.
+	'network-type': {
+		title: 'Network type',
+		body: 'How your connection sits behind your router. Behind NAT is normal and fine. CGNAT means your provider shares one address across many customers, so another Hoardbook cannot always reach you directly — sending someone a full collection list may fall back to a relay, or fail if neither side is reachable. Nothing else changes: browsing, chat, Topics and presence all work the same. You cannot change this from here; it describes your connection, not a setting.',
 	},
 };

@@ -574,7 +574,7 @@
 					{#each mine as t (t.topic_id)}
 						<button class="topic-row" class:topic-selected={openTopic?.topic_id === t.topic_id} onclick={() => open(t)}>
 							<div class="grow">
-								<div class="name">{t.name} {#if t.private}<span class="tag">private</span>{/if}</div>
+								<div class="name">{t.name} {#if t.private}<span class="hb-tag">private</span>{/if}</div>
 								{#if t.description}<div class="muted">{t.description}</div>{/if}
 							</div>
 							<!-- Hoardbook Topics draft r1 — unread pill: this topic's announcement is past its
@@ -593,7 +593,7 @@
 				{#if openTopic}
 					<div class="detail-head">
 						<div class="grow">
-							<div class="detail-title">{openTopic.name} {#if openTopic.private}<span class="tag">private</span>{/if}</div>
+							<div class="detail-title">{openTopic.name} {#if openTopic.private}<span class="hb-tag">private</span>{/if}</div>
 							<!-- devtest v0.12.1 #8: description is editable after creation (the name is not). -->
 							{#if editingDesc}
 								<div class="desc-edit">
@@ -634,7 +634,7 @@
 						<div class="announce-row">
 							<input
 								class="hb-input grow"
-								placeholder="a highlighted notice for all members…"
+								placeholder="Pushes a highlighted notice to all members' channel view for 24h. Limited to one per hour."
 								bind:value={announceBody}
 								onkeydown={(e) => e.key === 'Enter' && sendAnnounce()}
 								disabled={!canAnnounce(announceRemaining) || announcing}
@@ -647,10 +647,11 @@
 								{announcing ? '…' : cooldownLabel(announceRemaining)}
 							</button>
 						</div>
-						<!-- Hoardbook Topics draft r1 — the terms are visible without hovering: the 24h/one-per-
-						     hour limits shouldn't be hidden behind the HintMarker tooltip (kept for the "?"
-						     affordance). The constant itself is unchanged; announce-view.test.ts pins it. -->
-						<div class="announce-terms">{ANNOUNCE_EXPLAINER}</div>
+						<!-- Owner, 2026-08-27: the terms moved INTO the placeholder and the label underneath was
+						     deleted. Same facts, one surface instead of two — the field now states its own terms
+						     where you are about to type, rather than restating them below the button. The
+						     HintMarker keeps the long-form ANNOUNCE_EXPLAINER for the "?" affordance, and
+						     announce-view.test.ts still pins that constant. -->
 					</div>
 
 					<a class="channel-link" href="/chat?topic={openTopic.topic_id}">💬 Open this Topic’s channel in Chat →</a>
@@ -882,7 +883,6 @@
 	.row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid var(--divider); }
 	.name { font-size: 13px; font-weight: 600; }
 	.muted { font-size: 11.5px; color: var(--fg-dim); }
-	.tag { font-size: 10px; color: var(--accent); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
 	.path-row { display: flex; align-items: center; gap: 6px; }
 	.path-sep { color: var(--fg-dim); }
 	.path-preview { font-size: 11px; }
