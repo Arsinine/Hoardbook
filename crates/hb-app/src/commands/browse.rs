@@ -15,8 +15,9 @@ use hb_core::fingerprint::Fingerprint;
 use hb_core::types::Collection;
 use hb_core::{ShareCode, Identity};
 use hb_net::{
-    browse_peer_listings, browse_share_code, fetch_full_listing_if_current,
-    listing_snapshot_fingerprint, search_teasers_capped, RelayClient, RenderedListing, SearchHit,
+    browse_peer_listings, browse_peer_listings_state, browse_share_code,
+    fetch_full_listing_if_current, listing_snapshot_fingerprint, search_teasers_capped,
+    ListingsState, RelayClient, RenderedListing, SearchHit,
 };
 use serde::{Deserialize, Serialize};
 
@@ -304,6 +305,13 @@ pub(crate) async fn resolve_peer(
     // published (M13 HANDOVER gap #5). A locked/failed family is already skipped inside
     // `browse_peer_listings` (BR1) — best-effort here too, mirroring the teaser fetch above:
     // unreadable listings must never fail the whole resolve.
+    //
+    // QURATOR-134: the KEYLESS arm is the one this bug lived in. `browse_peer_listings_state`
+    // (hb-net, the one implementation — the UI never re-derives it) tells "they published
+    // nothing" (Fetched) apart from "they published listings we can't decrypt" (Sealed) apart
+    // from "the enumeration itself failed" (FetchFailed). For a keyed contact `collections` is
+    // authoritative and the state stays `Fetched`.
+    let mut listings_state = crate::store::ListingsStatus::Fetched;
     let collections = match share_code.browse_key() {
         Some(bk) => {
             // The browser's OWN big relay (option a) — tried before the peer's advertised one (b).
@@ -330,7 +338,22 @@ pub(crate) async fn resolve_peer(
             }
             out
         }
-        None => vec![],
+        None => {
+            // Keyless: run the enumeration read purely for its tri-state — it only fetches the
+            // peer's own KIND_LISTING events (author-pinned) and classifies them; the throwaway
+            // zero key decrypts nothing, so `Sealed` is reported for any existing family, which
+            // is exactly the keyless reading. Never fails the resolve (BR1).
+            let (_, state) = browse_peer_listings_state(
+                &client,
+                &peer,
+                &[0u8; 32], // throwaway key — decrypts nothing; the read is for the tri-state
+                net::RELAY_TIMEOUT,
+            )
+            .await
+            .unwrap_or((Vec::new(), ListingsState::FetchFailed(String::new())));
+            listings_state = state.into();
+            vec![]
+        }
     };
 
     // Fall back to the cached contact if the relay yielded no teaser.
@@ -347,6 +370,10 @@ pub(crate) async fn resolve_peer(
             if !collections.is_empty() {
                 stale.collections = collections;
             }
+            // QURATOR-134: the fresh tri-state supersedes the stale classification even when the
+            // teaser flaked (same devtest-#3 reasoning — a keyless empty must not cache as
+            // `Sealed` forever just because a later refresh's teaser fetch hiccuped).
+            stale.listings_state = listings_state;
             return Ok(stale);
         }
     }
@@ -358,6 +385,7 @@ pub(crate) async fn resolve_peer(
         petname: profile.as_ref().map(|p| p.display_name.clone()),
         profile,
         collections,
+        listings_state,
         online,
         last_fetched: Utc::now(),
         // W5.2: presence age is stamped by the online poll, not by a browse (which proves nothing
@@ -1374,6 +1402,7 @@ mod tests {
             petname: petname.map(|s| s.to_string()),
             profile: None,
             collections: vec![],
+            listings_state: Default::default(), // QURATOR-134: fixtures predate the tri-state; Fetched is the least-wrong default
             online: false,
             last_fetched: Utc::now(),
             last_presence: None,

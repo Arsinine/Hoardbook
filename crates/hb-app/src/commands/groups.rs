@@ -193,6 +193,7 @@ mod tests {
             petname: None,
             profile: None,
             collections: vec![],
+            listings_state: Default::default(), // QURATOR-134: fixtures predate the tri-state; Fetched is the least-wrong default
             online: false,
             last_fetched: chrono::Utc::now(),
             last_presence: None,
