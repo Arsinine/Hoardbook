@@ -4,7 +4,7 @@
 	// so no `overflow: hidden` ancestor can clip it (the original devtest #2 bug — it lived in a
 	// scrolling `.coll-list`/`.collections-pane`).
 	import type { Collection } from '../types.js';
-	import { deriveRowChip, menuItems, badges, sizeTier, sizeTierTooltip, type RowMenuItem, type ExportFormat } from '../collection-row-view.js';
+	import { deriveRowChip, menuItems, badges, sizeTier, sizeTierTooltip, rowIcon, type RowMenuItem, type ExportFormat } from '../collection-row-view.js';
 	import CollectionPanel from './CollectionPanel.svelte';
 	import ConfirmButton from './ConfirmButton.svelte';
 	import OverflowMenu from './OverflowMenu.svelte';
@@ -34,6 +34,7 @@
 	let chip = $derived(deriveRowChip(collection));
 	let items = $derived(menuItems(collection));
 	let rowBadges = $derived(badges(collection));
+	let icon = $derived(icons[rowIcon(collection)]);
 
 	function fmtBytes(b: number): string {
 		const GB = 1073741824, MB = 1048576, KB = 1024;
@@ -80,7 +81,7 @@
 	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
 	<div class="row-head" onclick={() => (rowExpanded = !rowExpanded)}>
 		<span class="chevron" class:chevron-open={rowExpanded}>{@html icons.chevronDown}</span>
-		<div class="row-icon">{@html icons.folder}</div>
+		<div class="row-icon">{@html icon}</div>
 		<div class="row-info">
 			<div class="row-name">{collection.path_alias}</div>
 			<div class="row-meta">

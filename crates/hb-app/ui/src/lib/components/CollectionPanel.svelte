@@ -2,7 +2,7 @@
 	import type { Collection } from '../types.js';
 	import DirItem from './DirItem.svelte';
 	import { icons } from '$lib/icons.js';
-	import { sizeTier, sizeTierTooltip } from '../collection-row-view.js';
+	import { sizeTier, sizeTierTooltip, rowIcon } from '../collection-row-view.js';
 
 	
 	
@@ -24,13 +24,18 @@
 	}: Props = $props();
 
 	let fmt = $derived(collection.content_types?.[0] ?? '');
+
+	// QURATOR-140 drift-pair: the panel expands from the row, so it must name the collection with the
+	// SAME glyph the row just used. Shares `rowIcon` rather than re-deciding — two lists that must
+	// agree is how this codebase's Contacts/Browse pair keeps drifting.
+	let icon = $derived(icons[rowIcon(collection)]);
 </script>
 
 <div class="panel">
 	{#if header}
 		<button class="panel-header" onclick={() => (expanded = !expanded)}>
 			<div class="panel-left">
-				<div class="folder-icon">{@html icons.folder}</div>
+				<div class="folder-icon">{@html icon}</div>
 				<div class="panel-info">
 					<div class="panel-name">{collection.path_alias}</div>
 					<div class="panel-meta">
