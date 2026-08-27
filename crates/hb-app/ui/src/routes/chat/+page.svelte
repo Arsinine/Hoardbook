@@ -4,7 +4,6 @@
 	import { page } from '$app/stores';
 	// M17 W7.1b: the manifest export path reuses the same save dialog as Home → ⋯ → Export (no new
 	// export logic — this is a second entry point to the shipped `export_manifest` Tauri command).
-	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { contacts, identity, inboxMessages, sentMessages, readWatermarks, toast, dmRequests, announceSeen, collections, seedSentFromFeed, loadContactsInto, loadCollectionsInto } from '$lib/stores.js';
 	import {
 		getMessages,
@@ -30,7 +29,6 @@
 		relayStatus,
 		type RelayHealth,
 		getCollections,
-		exportManifest,
 		sendFullList,
 		redeemManifestTicket,
 		getManifestAsks,
@@ -48,14 +46,14 @@
 	// the FeatureTooltip registry is drift-guarded to exactly five keys, so a sixth is not the tool).
 	import HintMarker from '$lib/components/HintMarker.svelte';
 	import ConfirmButton from '$lib/components/ConfirmButton.svelte';
-	import { DM_POLL_VISIBLE_MS, CHANNEL_REFRESH_EVERY_TICKS, ONLINE_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
+	import { DM_POLL_VISIBLE_MS, CHANNEL_REFRESH_EVERY_TICKS, RELAY_HEALTH_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
 	import { renderFingerprint } from '$lib/identity-display.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
 	import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER, manifestRequestHint } from '$lib/request-inbox.js';
 	// M17 W7.1b: the manifest-request fulfilment card. The capability (`export_manifest`) is fully
 	// wired on Home; this is its second entry point — surfaced where the request lands. The card's
 	// state is derived PURELY (zero network on render); the export Tauri call fires only on click.
-	import { manifestFulfilFor, MANIFEST_EXPORTED_TOAST } from '$lib/manifest-fulfil.js';
+	import { manifestFulfilFor } from '$lib/manifest-fulfil.js';
 	// M18 W4: the fulfil verb's two halves. The owner's "Send the full list" mints a ticket and DMs
 	// it; the asker's side recognises that ticket and redeems it ON ARRIVAL — there is deliberately no
 	// deferred redemption entry point in the backend to bind a button to (owner ruling 2026-07-30).
@@ -169,7 +167,6 @@
 	// empty, a muted one-liner links to that Settings field instead. Honest about the last mile.
 	let bigRelayUrl = $state('');
 	// In-flight export guard (idempotency: a double-click Export is a no-op while one is resolving).
-	let exportingSlug: string | null = $state(null);
 
 
 	// ── Compose-to-npub (spec §9 first-contact deep link from Discovery) ─────────────────────────
@@ -439,28 +436,11 @@
 		addContactTarget = null;
 	}
 
-	// M17 W7.1b — the fulfil click: the exact `handleExport(slug,'manifest')` path from Home, with the
-	// honest post-export copy (Hoardbook writes the file and moves no bytes — send it yourself).
-	// No new export logic; this is the second entry point to the shipped `export_manifest` command.
-	// Idempotent: a double-click while one save dialog is resolving is a no-op (`exportingSlug` guard).
-	async function handleExportManifest(slug: string) {
-		if (exportingSlug === slug) return;
-		exportingSlug = slug;
-		try {
-			const path = await saveDialog({
-				defaultPath: `${slug}.hbmanifest`,
-				filters: [{ name: 'Hoardbook manifest', extensions: ['hbmanifest'] }],
-			});
-			if (!path) return;
-			await exportManifest(slug, path);
-			const filename = path.split(/[\\/]/).pop() ?? `${slug}.hbmanifest`;
-			toast(MANIFEST_EXPORTED_TOAST(filename), 'success');
-		} catch (e) {
-			toast(String(e), 'error');
-		} finally {
-			exportingSlug = null;
-		}
-	}
+	// The Export-manifest handler lived here until the owner's 2026-08-27 ruling removed the button
+	// from ManifestFulfilCard. Nothing called it after that, and a dead handler that tests still pin
+	// is the vacuous-control shape CLAUDE.md §9 warns about — so it went with its button. Export is
+	// still a real capability, reached from Home → ⋯ → Export (which is also where the
+	// over-the-ceiling error points).
 
 	// M18 W4 — the fulfil verb. The whole of the owner's decision is this click: `send_full_list`
 	// builds the manifest, refuses it up front if it exceeds the transport ceiling (naming export in
@@ -739,7 +719,7 @@
 			try { relayHealth = await relayStatus(); } catch { /* keep last health */ }
 		};
 		readRelayHealth();
-		const healthPoll = setInterval(() => { if (!document.hidden) readRelayHealth(); }, ONLINE_POLL_VISIBLE_MS);
+		const healthPoll = setInterval(() => { if (!document.hidden) readRelayHealth(); }, RELAY_HEALTH_POLL_VISIBLE_MS);
 
 		return () => {
 			clearInterval(fastPoll);
@@ -967,6 +947,21 @@
 		if (selectedRequest) scan(selectedRequest.messages);
 	});
 </script>
+
+<!-- Devtest 2026-08-26 item 5: Chat's only drag surfaces were the four .pane-header bars, every one
+     of them behind a {#if} (topic selected / peer selected / request open / …) — with nothing
+     selected there was no handle at all beyond the layout's 8px top strip, which on Windows doubles
+     as the resize hotspot (owner: "cannot drag move the app"). This bar sits ABOVE the identity
+     branch deliberately, so it covers the no-identity empty state too, and it is the SAME .topbar
+     every other route carries — it inherits the layout's :global(.topbar) 120px right reservation
+     and reads as existing chrome, not a new bar (owner ruling: consistent with Home and Contacts,
+     must not stand out). The .pane-headers keep their own drag regions; this is the guaranteed one. -->
+<div class="topbar" data-tauri-drag-region>
+	<div>
+		<div class="topbar-title">Chat</div>
+		<div class="topbar-sub">Direct messages and topic channels</div>
+	</div>
+</div>
 
 {#if !$identity}
 	<div class="no-identity">
@@ -1253,8 +1248,6 @@
 											<ManifestFulfilCard
 												state={mf.state}
 												fingerprintSeen={mf.request.fingerprintSeen}
-												hasBigRelay={bigRelayUrl !== ''}
-												onexport={() => {}}
 												onsend={() => {}}
 												sending={false}
 											/>
@@ -1390,8 +1383,6 @@
 										<ManifestFulfilCard
 											state={mf.state}
 											fingerprintSeen={mf.request.fingerprintSeen}
-											hasBigRelay={bigRelayUrl !== ''}
-											onexport={(slug) => handleExportManifest(slug)}
 											onsend={(slug) => handleSendFullList(slug, mf.request.askNonce)}
 											sending={sendingFullList === mf.state.slug}
 										/>
@@ -1533,17 +1524,36 @@
 />
 
 <style>
+	/* Devtest item 5 — copied verbatim from Contacts/Home so the bar is indistinguishable from
+	   theirs. Svelte styles are component-scoped, so this cannot be shared; the 120px right
+	   reservation still comes from the ONE global rule in +layout.svelte. */
+	.topbar {
+		padding: 16px 24px;
+		border-bottom: 1px solid var(--border);
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: 16px;
+		background: var(--bg);
+		flex-shrink: 0;
+	}
+	.topbar-title { font-size: 17px; font-weight: 600; color: var(--fg); letter-spacing: -0.3px; }
+	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
+
+	/* Both of these were height: 100% before the topbar existed; with a sibling bar above them that
+	   overflows .main by the bar's height. flex:1 takes whatever is left instead. */
 	.no-identity {
 		display: flex;
 		flex-direction: column;
 		align-items: center;
 		justify-content: center;
-		height: 100%;
+		flex: 1;
+		min-height: 0;
 		gap: 12px;
 		color: var(--fg-muted);
 	}
 
-	.chat-frame { display: flex; height: 100%; overflow: hidden; }
+	.chat-frame { display: flex; flex: 1; min-height: 0; overflow: hidden; }
 
 	/* Conversation list sidebar */
 	.convo-sidebar {
@@ -1707,14 +1717,13 @@
 
 	.privacy-note { font-size: 12px; color: var(--fg-dim); text-align: center; max-width: 320px; }
 
-	/* QURATOR-81: pane-header is Chat's only unconditional right-pane header (topic channel,
-	   requests list, opened request, and the selected-peer conversation all use it) and sits under
-	   the window controls, same as every route topbar — reserve the same 120px so trailing content
-	   (e.g. "View profile") never renders under them. data-tauri-drag-region on the div gives it a
-	   drag surface too; it does not inherit to the buttons inside. */
+	/* QURATOR-81 + devtest item 5: pane-header used to reserve 120px on its right because the window
+	   controls (absolute, top-right of .main) overlaid it. They now overlay the .topbar added above
+	   .chat-frame instead, so the reservation was dead space pushing "View profile" 120px inward and
+	   has been removed. Each pane-header keeps its data-tauri-drag-region — a second handle for
+	   whichever right-pane view is showing; the topbar is the guaranteed one. */
 	.pane-header {
 		padding: 12px 18px;
-		padding-right: 120px;
 		border-bottom: 1px solid var(--border);
 		display: flex;
 		gap: 12px;

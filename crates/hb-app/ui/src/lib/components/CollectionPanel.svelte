@@ -2,6 +2,7 @@
 	import type { Collection } from '../types.js';
 	import DirItem from './DirItem.svelte';
 	import { icons } from '$lib/icons.js';
+	import { sizeTier, sizeTierTooltip } from '../collection-row-view.js';
 
 	
 	
@@ -33,7 +34,11 @@
 				<div class="panel-info">
 					<div class="panel-name">{collection.path_alias}</div>
 					<div class="panel-meta">
-						<span class="tnum">{collection.item_count.toLocaleString()} items</span>
+						<!-- devtest item 6: same size coding as the row it expands from. -->
+						<span
+							class="tnum size-{sizeTier(collection.item_count)}"
+							title={sizeTierTooltip(collection.item_count) ?? undefined}
+						>{collection.item_count.toLocaleString()} items</span>
 						{#if collection.est_size}
 							<span class="dot">·</span>
 							<span class="tnum">{collection.est_size}</span>
@@ -126,6 +131,13 @@
 	.dot { color: var(--fg-dim); }
 
 	.tnum { font-feature-settings: 'tnum'; }
+
+	/* devtest item 6 — size tiers. `normal` is deliberately absent: "under 80000 items remain as is",
+	   so it inherits .row-meta's colour and no rule fires. Amber matches .row-badge-offline's hue;
+	   the over-cap red is DESATURATED from --error (0.18 -> 0.09 chroma) because the owner asked for
+	   "faint red" — a full-strength error red on a count that is merely large reads as a failure. */
+	.size-warn { color: oklch(0.78 0.13 60); }
+	.size-over { color: oklch(0.70 0.09 25); }
 
 	.mono-sm { font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); }
 

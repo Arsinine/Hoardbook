@@ -56,6 +56,27 @@ export function readDragPayload(dt: DataTransfer | null): string | null {
 	}
 }
 
+/** True when the drag currently in flight is one of OURS — i.e. it carries our MIME type.
+ *
+ *  ⚠ Why this exists, and why a dragenter/dragover handler must NOT call readDragPayload():
+ *  during `dragenter` and `dragover` the DataTransfer is in the spec's "protected mode", where
+ *  getData() returns "" for EVERY type. A handler that reads the payload to decide whether to
+ *  claim the drop therefore never reaches preventDefault(), the browser refuses the drop, and
+ *  the cursor shows the no-drop symbol for the whole gesture (owner report 2026-08-26, "I get a
+ *  red stop symbol when I try dragging a card"). `types` IS readable in protected mode.
+ *
+ *  So: gate the claim on this, and take the payload itself from the page's own drag state,
+ *  captured at dragstart. getData() stays correct — and stays used — in the `drop` handler,
+ *  where protected mode has ended. */
+export function isOurDrag(dt: DataTransfer | null): boolean {
+	if (!dt) return false;
+	try {
+		return Array.from(dt.types ?? []).includes(DRAG_MIME);
+	} catch {
+		return false;
+	}
+}
+
 /** A self-drop (source onto itself) is a no-op, not a one-member group. */
 export function isSelfDrop(sourceNpub: string | null, targetNpub: string): boolean {
 	return sourceNpub === targetNpub;
