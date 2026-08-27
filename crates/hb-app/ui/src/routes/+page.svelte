@@ -69,7 +69,7 @@
 			});
 			if (!path) return; // dialog cancelled
 			await backupData(obBackupPass, path);
-			toast('Backup saved — keep it somewhere safe', 'success');
+			toast('Backup saved. Keep it somewhere safe.', 'success');
 			obBackupPass = '';
 			obStep = 2;
 		} catch (e) {
@@ -314,8 +314,7 @@
 			// devtest #7: a too-large collection publishes only a truncated paywall teaser — tell the user
 			// their browsers see a preview, not the whole thing.
 			if (summary.truncated) {
-				const hidden = Math.max(0, summary.total_items - summary.shown_items);
-				toast(`Published a preview — this collection is too large to publish in full, so ${hidden.toLocaleString()} of ${summary.total_items.toLocaleString()} items are hidden from browsers.`);
+				toast(`Published a preview. This collection is too large to publish in full, so people browsing it see ${summary.shown_items.toLocaleString()} of ${summary.total_items.toLocaleString()} items.`);
 			} else {
 				toast('Collection published');
 			}
@@ -360,7 +359,7 @@
 
 	function handleScannedCollection(collection: Collection) {
 		mergeCollectionIntoStore(collection);
-		toast(`Scanned "${collection.path_alias}" — ${collection.item_count} items`);
+		toast(`Scanned "${collection.path_alias}": ${collection.item_count} items`);
 	}
 
 	// The Details step already toasts its own "saved"/"published" message — just sync the store.
@@ -580,7 +579,7 @@
 					<div class="ob-card-sub">Hoardbook uses a Nostr key (your <span class="mono">npub</span>) as your identity. No email, no server account. It is stored encrypted on this device and never sent to a server.</div>
 					<div class="ob-notice">
 						<span class="ob-notice-icon">{@html icons.shield}</span>
-						<div class="ob-notice-text">Your key is stored locally and never transmitted. There is no recovery if you lose it — so you'll back it up next.</div>
+						<div class="ob-notice-text">Your key is stored locally and never transmitted. It can't be recovered if lost, so back it up in the next step.</div>
 					</div>
 					<button class="btn-primary btn-full" onclick={obGenerateKeypair} disabled={obGenerating}>
 						{obGenerating ? 'Generating…' : 'Generate my Hoardbook identity'}
@@ -590,14 +589,14 @@
 					</button>
 				{:else}
 					<div class="ob-card-title">Your identity is ready</div>
-					<div class="ob-card-sub">This is your <strong>share code</strong>. Give it only to people you want browsing your collections — anyone holding it can decrypt your listings.</div>
+					<div class="ob-card-sub">This is your <strong>share code</strong>. Anyone holding it can decrypt and browse your listings. Give it only to people you trust with that.</div>
 					<div class="ob-hbid-row">
 						<span class="ob-hbid mono">{$identity?.share_code ?? ''}</span>
 						<button class="btn-ghost btn-sm" onclick={() => { navigator.clipboard.writeText($identity?.share_code ?? ''); toast('Copied', 'success'); }}>Copy</button>
 					</div>
 					<div class="ob-notice" style="margin-top:12px">
 						<span class="ob-notice-icon">{@html icons.shield}</span>
-						<div class="ob-notice-text">Export a backup now and store it somewhere safe. <strong>If you lose this key your identity is gone — there is no recovery.</strong></div>
+						<div class="ob-notice-text">Export a backup now and store it somewhere safe. <strong>A lost key cannot be recovered.</strong></div>
 					</div>
 					<input class="hb-input" style="margin-top:10px" type="password" placeholder="Backup passphrase (min 12 characters)" bind:value={obBackupPass} />
 					{#if obBackupPass && !obBackupStrength.acceptable}
@@ -612,7 +611,7 @@
 				{/if}
 			{:else if obStep === 2}
 				<div class="ob-card-title">Name yourself</div>
-				<div class="ob-card-sub">Pick a display name — optional. You can change it and fill in the rest of your profile later from Home.</div>
+				<div class="ob-card-sub">Pick a display name (optional). You can change it and fill in the rest of your profile later from Home.</div>
 				<div class="field" style="margin-bottom:16px">
 					<label class="field-label" for="ob-name">Display name</label>
 					<input id="ob-name" class="hb-input" type="text" placeholder="e.g. DataHoarder_42"
@@ -648,11 +647,11 @@
 				</div>
 				<div class="ob-notice">
 					<span class="ob-notice-icon">{@html icons.shield}</span>
-					<div class="ob-notice-text"><strong>Linking warning:</strong> if this is a public key — or the same
-						key you use in Qurator or elsewhere — importing it links that identity to your Hoardbook
-						activity and de-pseudonymizes you. Only continue if you understand this.</div>
+					<div class="ob-notice-text"><strong>Linking warning:</strong> importing a key you use publicly, in
+						Qurator, or anywhere else ties that identity to your Hoardbook activity. Anyone who knows
+						the key will know this is you.</div>
 				</div>
-				<label class="ob-ack"><input type="checkbox" bind:checked={obImportWarnAck} /> I understand the linking implication.</label>
+				<label class="ob-ack"><input type="checkbox" bind:checked={obImportWarnAck} /> I understand.</label>
 				<input class="hb-input mono" style="margin-top:10px" type="password" placeholder="nsec1…" bind:value={obImportNsec} />
 				<button class="btn-primary btn-full" style="margin-top:10px" onclick={obImportExistingKey} disabled={!obImportWarnAck || !obImportNsec.trim() || obImporting}>
 					{obImporting ? 'Importing…' : 'Import key'}
@@ -672,11 +671,11 @@
 			<div class="topbar-title">My Profile</div>
 			<div class="topbar-sub">
 				{#if neverPublished}
-					<span class="pub-status pub-warn">● Not published yet — others can't find you in search until you publish</span>
+					<span class="pub-status pub-warn">● Not published yet. Others can't find you in search.</span>
 				{:else if profileDirty}
-					<span class="pub-status pub-warn">● Unpublished changes — re-publish to update your public listing</span>
+					<span class="pub-status pub-warn">● Unpublished changes. Publish again to update your public listing.</span>
 				{:else}
-					<span class="pub-status pub-ok">● Published — you're discoverable in search</span>
+					<span class="pub-status pub-ok">● Published. You're discoverable in search.</span>
 				{/if}
 			</div>
 		</div>
@@ -777,12 +776,12 @@
 				</div>
 
 				<div class="field">
-					<label class="field-label">Contact hint<HintMarker label="Contact hint" text="How people can reach you outside Hoardbook — a Discord/Matrix handle or an email. It is kept out of your public profile, and how your contacts re-find you if you ever lose your key." /></label>
+					<label class="field-label">Contact hint<HintMarker label="Contact hint" text="How people reach you outside Hoardbook, like a Discord or Matrix handle or an email. It stays out of your public profile. If you ever lose your key, it's how your contacts find you again." /></label>
 					<input class="hb-input hb-input-mono" type="text" placeholder="you@example.com · @you:matrix.org" bind:value={form.contact_hint} />
 				</div>
 
 				<div class="field">
-					<label class="field-label">Region / City<HintMarker label="Region / City" text="Optional — fill this in if you're interested in local meetups." /></label>
+					<label class="field-label">Region / City<HintMarker label="Region / City" text="Optional. Fill this in if you're interested in local meetups." /></label>
 					<input class="hb-input" type="text" bind:value={form.location} />
 				</div>
 
@@ -892,7 +891,7 @@
 					     collections yet" negative. Same copy shape as Topics' Discover root machine. -->
 					<EmptyState
 						error
-						message="Couldn't load collections — the scan catalog didn't answer."
+						message="Couldn't load your collections."
 						onretry={retryCollectionsLoad}
 					/>
 				{:else if $collections.length === 0}
