@@ -300,44 +300,51 @@ describe('Hoardbook Topics draft r1 — Discover search (already-fetched roots o
 });
 
 describe('Hoardbook Topics draft r1 — announce terms visible without hovering', () => {
-	it('renders the explainer as an always-visible line under the composer', async () => {
+	// Owner, 2026-08-27: the terms moved INTO the composer's placeholder and the separate
+	// `.announce-terms` caption line was deleted — "same facts, one surface instead of two."
+	// A placeholder is on screen before any hover or typing, so the "visible without hovering"
+	// property still holds; it's just carried by the input now, not a sibling div. The HintMarker
+	// "?" affordance still carries the same ANNOUNCE_EXPLAINER constant for anyone who does hover.
+	it('states the terms in the composer placeholder, visible with no hover and nothing typed', async () => {
 		rosterMock.mockResolvedValue([]);
 		listMock.mockResolvedValue([{ topic_id: 't1', name: 'video/anime', description: '', tags: [], private: false, joined_at: 0 }]);
 		const { container } = render(TopicsPage);
 		await openFirstTopic(container);
 
-		// The caption (NOT the HintMarker tooltip — that renders the same constant inside a
-		// role=tooltip span hidden until hover, which is exactly what this feature stops relying on).
-		// Pinned to the SAME constant the tooltip uses, so the visible line can never drift from the
-		// registered terms.
-		const terms = container.querySelector('.announce-terms');
-		expect(terms).not.toBeNull();
-		expect(terms!.textContent?.trim()).toBe(ANNOUNCE_EXPLAINER);
-		expect(terms!.textContent).toContain('24h');
-		expect(terms!.textContent).toContain('one per hour');
-		// Nothing hides it — no `hidden` attribute, so it is on screen without any hover.
-		expect(terms!.getAttribute('hidden')).toBeNull();
-		expect(terms!.getAttribute('style') ?? '').not.toContain('display: none');
+		const input = container.querySelector('.announce-row input') as HTMLInputElement | null;
+		expect(input).not.toBeNull();
+		// Pinned to the SAME constant the HintMarker tooltip uses, so the two can never drift apart.
+		expect(input!.placeholder).toBe(ANNOUNCE_EXPLAINER);
+		expect(input!.placeholder).toContain('24h');
+		expect(input!.placeholder).toContain('one per hour');
+		expect(input!.value).toBe('');
 	});
 });
 
 describe('Hoardbook Topics draft r1 — member count wording', () => {
 	// The label's unit test lives in lib/topics-view.test.ts; this pins it on the RENDERED page so a
 	// revert of the wording reds here too (the page is where the owner reads it).
+	//
+	// SUPERSEDED r1 wording test, r4 2026-08-27 (QURATOR-143 W1): the sidebar no longer displays a
+	// count AT ALL — the lazily-fetched member_count_estimate serves ORDERING only (most-popular-
+	// first), and the count displays in the detail pane (W2), never here. What stays pinned is the
+	// negative: neither the old "~N members (estimate)" NOR any count wording renders on the row.
 	const hits41 = () => [
 		{ topic_id: 'd1', name: 'video/anime', description: '', tags: ['video'], member_count_estimate: 41 },
 	];
 
-	it('reads "N claimed" on the Discover rows, never the old "~N members (estimate)"', async () => {
+	it('renders NO count on the Discover rows — the count orders, never displays (r4)', async () => {
 		discoverMock.mockResolvedValue(hits41());
-		const { getByRole, findByText, queryByText } = render(TopicsPage);
+		const { getByRole, container, queryByText } = render(TopicsPage);
 		await fireEvent.click(getByRole('button', { name: /discover/i }));
 		await tick();
 		await fireEvent.click(getByRole('button', { name: /^\s*video/i }));
 		await waitFor(() => expect(discoverMock).toHaveBeenCalled());
-
-		expect(await findByText('41 claimed')).toBeTruthy();
+		// Row rendered (old-lookup path still populates the accordion)…
+		await waitFor(() => expect(container.querySelector('.tree-child')).not.toBeNull());
+		// …but no count wording anywhere on it.
 		expect(queryByText(/estimate/)).toBeNull();
 		expect(queryByText(/~41 members/)).toBeNull();
+		expect(queryByText(/claimed/)).toBeNull();
 	});
 });

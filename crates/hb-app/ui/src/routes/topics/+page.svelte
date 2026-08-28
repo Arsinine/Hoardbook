@@ -6,6 +6,8 @@
 		topicCreate,
 		topicUpdateMeta,
 		topicDiscover,
+		topicDiscoverPaint,
+		topicRank,
 		topicLookup,
 		topicJoinPublic,
 		topicRedeemInvite,
@@ -17,7 +19,17 @@
 		topicAnnounceStatus,
 	} from '$lib/api.js';
 	import type { TopicView, DiscoveredTopic, TopicLookup, CachedPeer } from '$lib/types.js';
-	import { memberCountLabel, rosterLabel, unseenTopicAnnouncements, TOPIC_ROOTS, composeTopicPath, subPathLabel, createPrimaryAction } from '$lib/topics-view.js';
+	import {
+		rosterLabel,
+		unseenTopicAnnouncements,
+		TOPIC_ROOTS,
+		composeTopicPath,
+		subPathLabel,
+		createPrimaryAction,
+		interleaveRoundRobin,
+		orderByMemberCount,
+		TOPIC_GROUP_DRAW_CAP,
+	} from '$lib/topics-view.js';
 	import { canAnnounce, cooldownLabel, ANNOUNCE_EXPLAINER } from '$lib/announce-view.js';
 	import { icons } from '$lib/icons.js';
 	import EmptyState from '$lib/components/EmptyState.svelte';
@@ -70,6 +82,17 @@
 	// user's own new Topic until restart. That is QURATOR-83 again by another route (codex). Bumped
 	// on every public create; a resolving fetch applies its result only if its generation still holds.
 	let discoverGeneration = 0;
+
+	// QURATOR-143 W1 — one read paints the whole directory, ranking trickles behind it. The paint
+	// fires ONCE on the first Discover open: `topicDiscoverPaint(TOPIC_ROOTS)` is ONE relay query
+	// (all six roots ride one #t OR-filter) with ZERO member_count round trips, and fills every
+	// root's cache at once. The lazy ranker then fetches counts ONLY for rows that will actually be
+	// drawn (the per-group cap + joined rows), interleaved round-robin across roots so no root can
+	// drain another's concurrency slots. The sidebar still DISPLAYS no count (unchanged ruling) —
+	// the fetch serves ordering only. `painted` is never reset: the per-root cache/retry machine
+	// below (`toggleRoot`) owns everything after the first paint.
+	let painted = $state(false);
+	let painting = $state(false);
 
 	// The consent gate: which Topic (public name + private flag) is pending a join. For a private
 	// redeem, `issuerNpub` carries who vouches (surfaced in the consent modal); `mode: 'redeem'` routes
@@ -257,29 +280,118 @@
 		}
 	}
 
+	// QURATOR-143 W1 — the ONE-READ paint. Fires the single whole-directory query the first time the
+	// Discover tab is opened (or the first expand, whichever comes first) and populates EVERY root's
+	// cache from it. Before W1 this was six per-root `topicDiscover` calls, each followed by a
+	// member_count round trip per topic found — ~600 relay round trips per page open, the exact burst
+	// the M16 relay-citizenship ruling forbids. Now: one read, no counts. A FAILED paint is not
+	// cached (the per-root error machine below stays in charge of retry).
+	async function paintDirectory() {
+		if (painted || painting) return;
+		painting = true;
+		try {
+			const all = await topicDiscoverPaint([...TOPIC_ROOTS]);
+			const byRoot: Record<string, DiscoveredTopic[]> = {};
+			for (const root of TOPIC_ROOTS) byRoot[root] = [];
+			// Dedupe by topic_id across roots (Codex 2026-08-15): the same topic can legitimately
+			// surface under several roots' tags — first root in TOPIC_ROOTS order wins the row, the
+			// later duplicates are dropped so the keyed #each never renders duplicate keys.
+			const seen = new Set<string>();
+			for (const d of all) {
+				if (seen.has(d.topic_id)) continue;
+				seen.add(d.topic_id);
+				const root = d.name.split('/')[0];
+				(byRoot[root] ??= []).push(d);
+			}
+			rootTopics = { ...rootTopics, ...byRoot };
+			painted = true;
+		} catch (e) {
+			// The paint failed as a whole: every root is "we could not reach the relays" (QURATOR-80
+			// — a failed fetch is NEVER the confident negative). The next expand retries, because
+			// `painted` stays false.
+			for (const root of TOPIC_ROOTS) if (rootTopics[root] === undefined) erroredRoots = new Set([...erroredRoots, root]);
+			toast(String(e), 'error');
+		} finally {
+			painting = false;
+		}
+	}
+
+	// QURATOR-143 W1 — the lazy ranker: fetch member_count ONLY for rows that will actually be drawn
+	// (per-group cap + joined rows + the selected row), round-robin across roots, then re-order each
+	// group most-popular-first as the counts land. Bounded to concurrency 8 by hb-net (`topic_rank`);
+	// this side bounds the REQUEST to the drawn rows, which is the other half of the bound.
+	let rankedIds = $state(new Set<string>());
+	async function rankDrawnRows(generation: number) {
+		// Per-root queues of the ids that WILL be drawn (cap per group + joined rows), in draw order.
+		const queues: string[][] = [];
+		for (const root of TOPIC_ROOTS) {
+			const rows = rootTopics[root] ?? [];
+			if (rows.length === 0) continue;
+			const drawn = rows.filter((d) => !rankedIds.has(d.topic_id)).slice(0, TOPIC_GROUP_DRAW_CAP);
+			if (drawn.length > 0) queues.push(drawn.map((d) => d.topic_id));
+		}
+		if (queues.length === 0) return;
+		// Round-robin interleave (r4: "never spend all budget on one root") — with two roots pending,
+		// neither drains the other's slots: the first 8 ids cannot all come from one root.
+		const ids = interleaveRoundRobin(queues);
+		try {
+			const ranks = await topicRank(ids);
+			if (generation !== rankGeneration) return; // a newer expand superseded this rank pass
+			// Fold the counts in: unknown stays unknown (null), never 0.
+			const byId = new Map(ranks.map((r) => [r.topic_id, r.member_count_estimate]));
+			const next: Record<string, DiscoveredTopic[]> = {};
+			for (const root of TOPIC_ROOTS) {
+				next[root] = orderByMemberCount(
+					(rootTopics[root] ?? []).map((d) =>
+						byId.has(d.topic_id) ? { ...d, member_count_estimate: byId.get(d.topic_id)! } : d,
+					),
+				);
+			}
+			rootTopics = { ...rootTopics, ...next };
+			rankedIds = new Set([...rankedIds, ...ids]);
+		} catch {
+			/* ranking is best-effort ordering — the paint is the data; leave rows in paint order */
+		}
+	}
+
 	// devtest v0.12.1 #7: expand a primitive (root category) to list every public Topic under it. The
 	// per-root fetch is lazy (first expand) + cached; the backend activity-ranks and caps the results.
+	let rankGeneration = 0;
+	let rankGenAtLaunch = 0;
 	async function toggleRoot(root: string) {
 		if (expandedRoot === root) {
 			expandedRoot = null;
 			return;
 		}
 		expandedRoot = root;
+		// W1: the first expand anywhere kicks the one-read paint (it populates every root), then the
+		// lazy ranker behind it. `await` the paint so the rows exist before ranking decides what is
+		// drawn; the ranker itself runs behind the render (it must not block paint).
+		if (!painted) {
+			await paintDirectory();
+		}
+		rankGeneration += 1;
+		const gen = rankGeneration;
+		void rankDrawnRows(gen);
 		// A successful fetch caches NON-EMPTY results (the cache exists so switching roots isn't a
 		// relay round-trip each time). A cached genuine EMPTY (`[]`) is NOT terminal — QURATOR-83: an
 		// empty found before a Topic existed was cached forever, swallowing every later create in that
 		// root until restart. Now an empty is a miss: re-expand re-fetches. A FAILED fetch is NOT
 		// cached either: it lands in `erroredRoots` instead (QURATOR-80), so a re-expand retries.
+		//
+		// W1: after the one-read paint, a cached non-empty root just draws. The EMPTY and error
+		// branches still fall through to the per-root `topicDiscover` re-fetch below, which stays as
+		// the retry path (an errored/empty root = "ask again for this root alone" — one query, not
+		// six), and its success re-uses the same cache/error machine QURATOR-80/83/85 pin.
 		const cached = rootTopics[root];
-		if ((cached !== undefined && cached.length > 0) || erroredRoots.has(root)) {
-			if (erroredRoots.has(root)) {
-				// Re-expand on an errored root = explicit retry: clear the error and re-fetch.
-				const next = new Set(erroredRoots);
-				next.delete(root);
-				erroredRoots = next;
-			} else {
-				return; // cached non-empty result — a genuine empty falls through to re-fetch
-			}
+		if (cached !== undefined && cached.length > 0) {
+			if (!erroredRoots.has(root)) return; // cached non-empty result — a genuine empty falls through to re-fetch
+		}
+		if (erroredRoots.has(root)) {
+			// Re-expand on an errored root = explicit retry: clear the error and re-fetch.
+			const next = new Set(erroredRoots);
+			next.delete(root);
+			erroredRoots = next;
 		}
 		loadingRoot = root;
 		const generation = discoverGeneration;
@@ -532,7 +644,9 @@
 		return [...seen.values()];
 	});
 	// Partial-coverage hint: true while at least one root category has never been fetched, so the
-	// search can only speak for the expanded subset.
+	// search can only speak for the fetched subset. Under W1 the one-read paint fills every root at
+	// once, so after a successful paint coverage is full; a root evicted by a create (or never
+	// painted, on a failed paint) keeps the hint honest.
 	let searchCoveragePartial = $derived(TOPIC_ROOTS.some((root) => rootTopics[root] === undefined));
 </script>
 
@@ -549,7 +663,7 @@
 	<div class="topbar-actions">
 		<div class="tabs">
 			<button class="tab" class:tab-active={tab === 'mine'} onclick={() => (tab = 'mine')}>My Topics</button>
-			<button class="tab" class:tab-active={tab === 'discover'} onclick={() => (tab = 'discover')}>Discover</button>
+			<button class="tab" class:tab-active={tab === 'discover'} onclick={() => { tab = 'discover'; void paintDirectory(); }}>Discover</button>
 		</div>
 		<button class="btn-primary" onclick={() => (createOpen = true)}>+ New Topic</button>
 	</div>
@@ -661,8 +775,9 @@
 			</div>
 		</section>
 	{:else}
-		<!-- Discover tab — devtest v0.12.1 #7: browse public Topics by primitive (root category). No tag
-		     search; expand a category to fetch every public Topic under it (backend activity-ranked). -->
+		<!-- Discover tab — devtest v0.12.1 #7 + QURATOR-143 W1: the whole directory paints from ONE
+		     relay read (all six roots in one #t query, zero member_count round trips); ranking
+		     (order by roster size) trickles in behind the paint for the rows actually drawn. -->
 		<section class="discover-tab">
 			<p class="muted discover-hint">Browse public Topics by category. Expand one to see every public Topic under it.</p>
 			<!-- Hoardbook Topics draft r1 — search across the already-fetched roots only. No fetch-on-
@@ -697,7 +812,6 @@
 								<div class="grow">
 									<div class="name">{subPathLabel(d.name) || d.name}</div>
 									{#if d.description}<div class="muted">{d.description}</div>{/if}
-									<div class="muted">{memberCountLabel(d.member_count_estimate)}</div>
 								</div>
 								<button class="btn-default" onclick={() => askToJoin(d.name, false)}>Join</button>
 							</div>
@@ -725,16 +839,24 @@
 							{:else if (rootTopics[root] ?? []).length === 0}
 								<div class="root-status muted">No public Topics under “{root}” yet.</div>
 							{:else}
-								{#each rootTopics[root] as d (d.topic_id)}
+								{@const rows = rootTopics[root] ?? []}
+								{#each rows.slice(0, TOPIC_GROUP_DRAW_CAP) as d (d.topic_id)}
 									<div class="row tree-child">
 										<div class="grow">
 											<div class="name">{subPathLabel(d.name) || d.name}</div>
 											{#if d.description}<div class="muted">{d.description}</div>{/if}
-											<div class="muted">{memberCountLabel(d.member_count_estimate)}</div>
+											<!-- W1 (r4 ruling): the sidebar DISPLAYS no count — the lazily-fetched
+							     member_count_estimate serves ORDERING only, most-popular-first. It
+							     renders in the detail pane (W2), never here. -->
 										</div>
 										<button class="btn-default" onclick={() => askToJoin(d.name, false)}>Join</button>
 									</div>
 								{/each}
+								{#if rows.length > TOPIC_GROUP_DRAW_CAP}
+									<!-- r4: the ~25 a group keeps are the most popular; the remainder is STATED,
+									     never silently truncated (same honesty rule as the discovery cap log). -->
+									<div class="root-status muted">+{rows.length - TOPIC_GROUP_DRAW_CAP} more under {root}</div>
+								{/if}
 							{/if}
 						{/if}
 					</div>
@@ -903,9 +1025,6 @@
 	.invite { display: flex; gap: 6px; }
 	.announce-row { display: flex; gap: 6px; margin-top: 2px; }
 	.announce-row input { flex: 1; }
-	/* Hoardbook Topics draft r1 — the announce terms as an always-visible caption (a .dest-style
-	   small line: same 11.5px / --fg-dim ramp the page's .muted captions use). */
-	.announce-terms { font-size: 11.5px; color: var(--fg-dim); margin-top: 4px; }
 	/* Hoardbook Topics draft r1 — unread pill: the per-row announce share, on the nav-badge's accent
 	   fill (boolean only — this data shape carries no per-topic count). */
 	.unread {
