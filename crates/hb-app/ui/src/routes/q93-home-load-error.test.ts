@@ -69,7 +69,7 @@ const ONE_COLLECTION: Collection = {
 };
 
 const EMPTY_STRING = /no collections yet/i;
-const ERROR_STRING = /couldn.t load collections/i;
+const ERROR_STRING = /couldn.t load your collections/i;
 
 function resetStores() {
 	identity.set(IDENT);
