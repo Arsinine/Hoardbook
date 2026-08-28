@@ -1024,7 +1024,7 @@
 <div class="subheader">
 	<div class="hb-input subheader-search">
 		<span class="search-icon">{@html icons.search}</span>
-		<input type="text" placeholder="Search name, bio, tags, collections…" bind:value={searchQuery} />
+		<input type="text" placeholder="Search name, bio, tags, profile, collections…" bind:value={searchQuery} />
 	</div>
 	<div class="view-toggle" role="group" aria-label="View">
 		<button type="button" aria-pressed={view === 'name'} onclick={() => (view = 'name')}>Name</button>
