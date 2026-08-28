@@ -39,10 +39,11 @@ describe('tooltips — feature-help registry (HOARDBOOK_SPEC §8)', () => {
 		expect(body).toContain('share code');
 	});
 
-	// Fingerprint copy must state it binds to the npub, not the display name.
-	it('fingerprint body binds the fingerprint to the npub, not the display name', () => {
+	// Fingerprint copy must state it follows the key, not the display name (202a4e0 dropped the
+	// literal word "npub" — the binding claim is now carried by "follows the key").
+	it('fingerprint body binds the fingerprint to the key, not the display name', () => {
 		const body = TOOLTIPS['fingerprint'].body.toLowerCase();
-		expect(body).toContain('npub');
-		expect(body).toContain('display name');
+		expect(body).toContain('follows the key');
+		expect(body).toContain('not the display name');
 	});
 });

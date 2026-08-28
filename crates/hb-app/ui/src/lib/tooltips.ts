@@ -67,6 +67,6 @@ export const TOOLTIPS: Record<TooltipKey, TooltipContent> = {
 	// identically behind any NAT, and saying so is the point — otherwise the pill reads as a fault.
 	'network-type': {
 		title: 'Network type',
-		body: 'How your connection sits behind your router. Behind NAT is normal. CGNAT means your provider shares one address across many customers, so sending someone a full collection list may need a relay, or fail if neither side is reachable. Browsing, chat, Topics, and presence work the same either way.',
+		body: 'How your connection sits behind your router. Behind NAT is normal. CGNAT means your provider funnels many customers through one address, so sending someone a full collection list may need a relay, or fail if neither side is reachable. Browsing, chat, Topics, and presence work the same either way.',
 	},
 };
