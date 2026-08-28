@@ -275,8 +275,7 @@ jobs:
           ALLOWED="crates/hb-app/src/identity_state.rs:1
           crates/hb-app/src/commands/chat.rs:3
           crates/hb-core/src/ticket.rs:1
-          crates/hb-app/ui/src/lib/request-inbox.ts:1
-          crates/hb-app/ui/src/routes/+page.svelte:1"
+          crates/hb-app/ui/src/lib/request-inbox.ts:1"
           fail=0
           # Scans every TRACKED file, not just the two src roots. Scanning `crates/*/src` +
           # `crates/hb-app/ui/src` left `build.rs`, the Cargo manifests, the vite/svelte configs and
