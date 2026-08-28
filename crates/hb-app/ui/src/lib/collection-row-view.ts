@@ -23,18 +23,12 @@ export type RowMenuItem =
 /** The overflow-menu items for a row, in display order. Publish/Unpublish is mutually exclusive by
  *  published state. */
 export function menuItems(col: Pick<Collection, 'published'>): RowMenuItem[] {
+	// QURATOR-138: the Export entry (and its text/markdown/manifest submenu) is deleted — owner:
+	// "Delete the … export buttons in collections as well." Unpublish stays pending an explicit
+	// owner ruling (INV-8: it is currently the only way to retract a published collection).
 	return [
 		{ key: 'rescan', label: 'Rescan' },
 		{ key: 'edit', label: 'Edit details' },
-		{
-			key: 'export',
-			label: 'Export',
-			submenu: [
-				{ key: 'text', label: 'Plain text' },
-				{ key: 'markdown', label: 'Markdown checklist' },
-				{ key: 'manifest', label: 'Manifest file (.hbmanifest)' },
-			],
-		},
 		col.published ? { key: 'unpublish', label: 'Unpublish' } : { key: 'publish', label: 'Publish' },
 		{ key: 'remove', label: 'Remove' },
 	];

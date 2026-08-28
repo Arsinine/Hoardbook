@@ -4,7 +4,7 @@
 	// so no `overflow: hidden` ancestor can clip it (the original devtest #2 bug — it lived in a
 	// scrolling `.coll-list`/`.collections-pane`).
 	import type { Collection } from '../types.js';
-	import { deriveRowChip, menuItems, badges, sizeTier, sizeTierTooltip, rowIcon, type RowMenuItem, type ExportFormat } from '../collection-row-view.js';
+	import { deriveRowChip, menuItems, badges, sizeTier, sizeTierTooltip, rowIcon, type RowMenuItem } from '../collection-row-view.js';
 	import CollectionPanel from './CollectionPanel.svelte';
 	import ConfirmButton from './ConfirmButton.svelte';
 	import OverflowMenu from './OverflowMenu.svelte';
@@ -21,14 +21,12 @@
 		onpublish?: (collection: Collection) => void;
 		onunpublish?: (collection: Collection) => void;
 		onremove?: (collection: Collection) => void;
-		onexport?: (detail: { slug: string; format: ExportFormat }) => void;
 	}
 
-	let { collection, accessible, onrescan, onedit, onpublish, onunpublish, onremove, onexport }: Props = $props();
+	let { collection, accessible, onrescan, onedit, onpublish, onunpublish, onremove }: Props = $props();
 
 	let rowExpanded = $state(false);
 	let menuOpen = $state(false);
-	let exportOpen = $state(false);
 	let menuBtnEl: HTMLButtonElement | undefined = $state();
 
 	let chip = $derived(deriveRowChip(collection));
@@ -46,28 +44,17 @@
 
 	function toggleMenu() {
 		menuOpen = !menuOpen; // OverflowMenu computes its own placement from the anchor
-		exportOpen = false;
 	}
 
 	function closeMenu() {
 		menuOpen = false;
-		exportOpen = false;
 	}
 
 	function handleItemClick(item: RowMenuItem) {
-		if (item.key === 'export') {
-			exportOpen = !exportOpen;
-			return;
-		}
 		if (item.key === 'rescan') onrescan?.(collection);
 		else if (item.key === 'edit') onedit?.(collection);
 		else if (item.key === 'publish') onpublish?.(collection);
 		else if (item.key === 'unpublish') onunpublish?.(collection);
-		closeMenu();
-	}
-
-	function handleExportClick(format: ExportFormat) {
-		onexport?.({ slug: collection.slug, format });
 		closeMenu();
 	}
 
@@ -129,20 +116,7 @@
 
 <OverflowMenu open={menuOpen} anchor={menuBtnEl} onclose={closeMenu}>
 	{#each items as item (item.key)}
-		{#if item.key === 'export'}
-			<button type="button" role="menuitem" class="menu-item" onclick={() => handleItemClick(item)}>
-				{item.label}<span class="submenu-caret" aria-hidden="true">▸</span>
-			</button>
-			{#if exportOpen}
-				<div class="submenu">
-					{#each item.submenu as sub (sub.key)}
-						<button type="button" role="menuitem" class="menu-item menu-item-sub" onclick={() => handleExportClick(sub.key)}>
-							{sub.label}
-						</button>
-					{/each}
-				</div>
-			{/if}
-		{:else if item.key === 'remove'}
+		{#if item.key === 'remove'}
 			<div class="menu-item menu-item-confirm">
 				<ConfirmButton role="menuitem" label={item.label} onconfirm={handleRemoveConfirm} />
 			</div>
@@ -275,10 +249,6 @@
 	}
 	.menu-item:hover { background: var(--bg-elev3); }
 
-	.submenu-caret { color: var(--fg-dim); font-size: 10px; }
-
-	.submenu { padding-left: 10px; }
-	.menu-item-sub { font-size: 12px; color: var(--fg-muted); }
 
 	.menu-item-confirm { padding: 3px 6px; display: flex; }
 </style>

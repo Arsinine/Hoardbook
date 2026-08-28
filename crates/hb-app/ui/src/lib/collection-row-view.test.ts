@@ -36,15 +36,13 @@ describe('collection-row-view', () => {
 		expect(publishedKeys).not.toContain('publish');
 
 		// Always available regardless of state.
-		expect(draftKeys).toEqual(expect.arrayContaining(['rescan', 'edit', 'export', 'remove']));
-	});
-
-	it('export_submenu_offers_the_manifest_file_alongside_the_checklists', () => {
-		// M16 W4: the `.hbmanifest` full-listing envelope is a third export format, next to the two
-		// human-readable checklists.
-		const exportItem = menuItems(col()).find((i) => i.key === 'export');
-		const subKeys = exportItem && 'submenu' in exportItem ? exportItem.submenu.map((s) => s.key) : [];
-		expect(subKeys).toEqual(['text', 'markdown', 'manifest']);
+		expect(draftKeys).toEqual(expect.arrayContaining(['rescan', 'edit', 'remove']));
+		// QURATOR-138: the collections-list Export affordance is deleted (owner ask).
+		expect(draftKeys).not.toContain('export');
+		expect(publishedKeys).not.toContain('export');
+		// Unpublish deliberately REMAINS — held for an explicit owner ruling (INV-8: it is the
+		// only way to retract a published collection).
+		expect(publishedKeys).toContain('unpublish');
 	});
 
 	it('badges_include_sorted_and_private_when_set', () => {
