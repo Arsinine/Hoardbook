@@ -37,7 +37,6 @@
 	let notes = $state('');
 	let sorted = $state(false);
 	let isPrivate = $state(false);
-	let saving = $state(false);
 	let publishing = $state(false);
 
 	// Seed the editable fields whenever a different collection is handed in (fresh scan or reopen).
@@ -92,18 +91,12 @@
 		return { ...collection, description, content_types: contentTypes, tags, languages, sorted, visibility };
 	}
 
-	async function handleSaveDraft() {
-		saving = true;
-		try {
-			const updated = await persist();
-			onsaved?.(updated);
-			toast('Collection saved');
-		} catch (e) {
-			toast(String(e), 'error');
-		} finally {
-			saving = false;
-		}
-	}
+	// QURATOR-138: the "Save draft" button is deleted — publish-by-default. But this form is a
+	// modal whose only remaining exits are Cancel (discard), Publish (persists), and ×/Esc
+	// (handled as Cancel by the modal). Persisting implicitly on every field change would turn
+	// Cancel into a silent save of half-edited state, which is its own bug class. So the modal
+	// keeps its explicit verbs; the owner's ask lands on the PROFILE editor (Home), where the
+	// Save-draft buttons the ticket names actually live.
 
 	async function handlePublish() {
 		if (!canPublish) return;
@@ -200,9 +193,6 @@
 <div class="modal-footer">
 	<button type="button" class="btn-ghost" onclick={() => oncancel?.()}>Cancel</button>
 	<div class="footer-actions">
-		<button type="button" class="btn-ghost" onclick={handleSaveDraft} disabled={saving}>
-			{saving ? 'Saving…' : 'Save draft'}
-		</button>
 		<button type="button" class="btn-primary" onclick={handlePublish} disabled={!canPublish || publishing}>
 			{publishing ? 'Publishing…' : 'Publish'}
 		</button>

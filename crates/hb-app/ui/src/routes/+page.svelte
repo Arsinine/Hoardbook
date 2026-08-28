@@ -1,12 +1,16 @@
 <script lang="ts">
-	import { saveProfile, publishProfile, publishCollection, unpublishCollection, deleteCollection, exportCollection, exportManifest, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec, collectionSourceAccessible, getCollections } from '$lib/api.js';
-	// M18 W5: Home and Chat are two entry points to ONE export — they read the same toast
-	// constant so they cannot drift into saying different things about what just happened.
-	import { MANIFEST_EXPORTED_TOAST } from '$lib/manifest-fulfil.js';
+	import { saveProfile, publishProfile, publishCollection, unpublishCollection, deleteCollection, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec, collectionSourceAccessible, getCollections } from '$lib/api.js';
+	// M18 W5 note (QURATOR-138): Home's export entry point is deleted; MANIFEST_EXPORTED_TOAST
+	// stays in $lib/manifest-fulfil.js, still used by Chat's fulfil path.
 	import { passphraseStrength } from '$lib/backup-export.js';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { profile, collections, identity, toast, appReady, homeDraft, identityLoadError, collectionsLoadError, loadCollectionsInto } from '$lib/stores.js';
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
+	// QURATOR-138: publish-by-default — the "Save draft" button is gone; every edit persists
+	// locally at once and publishes on a debounce through this controller (relay writes stay rare:
+	// N rapid edits coalesce into ONE publish, and the call still routes through the backend's
+	// shared relay-write governor).
+	import { createAutopublish, AUTOPUBLISH_TEST_DEBOUNCE_MS, setAutopublishDebounceForTests } from '$lib/profile-autopublish.js';
 	import { icons, socialIcons, avatarHue } from '$lib/icons.js';
 	import ScanDialog from '$lib/components/ScanDialog.svelte';
 	import AddCollectionModal from '$lib/components/AddCollectionModal.svelte';
@@ -118,14 +122,15 @@
 		try {
 			// devtest #4: the picture lives on the shared profile store, but the editor `form` is what
 			// Save/Publish persist. Sync it back or the next publish rewrites `form` and reverts the image.
-			if (await applyProfilePicture(file)) form.picture = $profile?.picture;
+			// (applyProfilePicture saved+republished the profile itself, so the sync is not an edit.)
+			if (await applyProfilePicture(file)) syncFormFromStore(() => { form.picture = $profile?.picture; });
 		} catch (e) { toast(String(e), 'error'); }
 		finally { pictureBusy = false; }
 	}
 
 	async function handleRemovePicture() {
 		pictureBusy = true;
-		try { await removeProfilePicture(); form.picture = $profile?.picture; }
+		try { await removeProfilePicture(); syncFormFromStore(() => { form.picture = $profile?.picture; }); }
 		catch (e) { toast(String(e), 'error'); }
 		finally { pictureBusy = false; }
 	}
@@ -141,6 +146,9 @@
 
 	onMount(async () => {
 		profileWasPublished = await hasPublishedProfile().catch(() => false);
+		// Belt-and-braces: the published-check resolving can re-run reactive readers before the
+		// seed has armed; anything that slipped through is cancelled here.
+		autopublish.cancel();
 	});
 
 	// Capture the snapshot the moment BOTH the published-check has resolved true AND the profile
@@ -267,24 +275,54 @@
 	// Persist form in store across navigation — load from homeDraft first, then $profile.
 	let profileLoaded = $state(false);
 
-
-	async function handleSave() {
-		// R1 (display name required to publish) does not apply to a draft — a blank name stays a
-		// legal, unpublished draft. Trim before persisting so whitespace-only never sticks around.
-		form.display_name = form.display_name.trim();
-		saving = true;
-		try {
-			form.updated = new Date().toISOString();
-			form.est_size = totalBytes > 0 ? diskSize : undefined;
-			await saveProfile(form);
-			profile.set({ ...form });
-			toast('Profile saved');
-		} catch (e) {
-			toast(String(e), 'error');
-		} finally {
-			saving = false;
-		}
+	// ── QURATOR-138: publish-by-default ─────────────────────────────────────────
+	// `saving`/`handleSave` were only ever the "Save draft" button's state; the button is deleted
+	// (local persistence is now immediate, below). The flag stays for the onboarding name step,
+	// which is a one-shot Continue, not the profile editor.
+	// The canonical shape of `form` at save time — mirrors the old handleSave/handlePublish body.
+	// MUST be a pure snapshot: it is read from inside the homeDraft effect's reactive graph via the
+	// autopublish getter, so mutating `form` here (trim/stamp) would re-trigger that effect and
+	// loop edit→save→edit (observed: 49 publishes for one keystroke). Trim/stamp the COPY.
+	function formForSave(): Profile {
+		return {
+			...form,
+			display_name: form.display_name.trim(),
+			updated: new Date().toISOString(),
+			est_size: totalBytes > 0 ? diskSize : undefined,
+		};
 	}
+
+	const autopublish = createAutopublish(
+		() => formForSave(),
+		{
+			save: async (p) => { await saveProfile(p); profile.set({ ...p }); },
+			publish: () => publishProfile(),
+			onError: (msg) => toast(msg, 'error'),
+			// QURATOR-95 interaction: refresh the as-published snapshot when a debounced publish
+			// lands, or the status line keeps reading "Unpublished changes" after the write went
+			// out (unknown rendered as a confident negative). Only on SUCCESS — after a failure
+			// "Unpublished changes" is the honest state.
+			onPublished: () => { publishedSnapshot = stableProfileJson(form); },
+		},
+	);
+
+	// Every edit: persist locally NOW (homeDraft keeps the cross-navigation copy in sync too —
+	// see the homeDraft effect below) and arm the debounced publish.
+	function profileEdited() {
+		autopublish.edit();
+	}
+	// A store-driven refresh is NOT an edit: the picture pipeline (lib/profile-picture.ts) already
+	// saves AND republishes the profile itself; when the page syncs `form.picture` back from the
+	// store afterwards, that write must not arm a second, redundant publish burst on top of it.
+	let syncingFromStore = false;
+	function syncFormFromStore(apply: () => void) {
+		syncingFromStore = true;
+		try { apply(); } finally { syncingFromStore = false; }
+	}
+	// Flush-on-blur: the editor's inputs are inside .fields — one delegated focusout catches them
+	// all (typing then tabbing/clicking away must not wait out the debounce).
+	// Flush-on-navigate/destroy: onDestroy below.
+	onDestroy(() => { void autopublish.destroy(); });
 
 	async function handlePublish() {
 		if (!form.display_name.trim()) {
@@ -293,12 +331,14 @@
 		}
 		publishing = true;
 		try {
-			form.updated = new Date().toISOString();
-			form.est_size = totalBytes > 0 ? diskSize : undefined;
-			await saveProfile(form);
-			profile.set({ ...form });
+			// Reuse the canonical save shape (trimmed, stamped, sized) — as a SNAPSHOT, not a
+			// reassignment: `form = …` would re-run the homeDraft effect and arm a second,
+			// redundant debounced publish on top of this explicit one.
+			const p = formForSave();
+			await saveProfile(p);
+			profile.set({ ...p });
 			await publishProfile();
-			publishedSnapshot = stableProfileJson(form);
+			publishedSnapshot = stableProfileJson(p);
 			toast('Profile published to relay');
 		} catch (e) {
 			toast(String(e), 'error');
@@ -427,35 +467,23 @@
 		form.languages = form.languages.filter((_, idx) => idx !== i);
 	}
 
-	async function handleExport(slug: string, format: 'text' | 'markdown' | 'manifest') {
-		try {
-			if (format === 'manifest') {
-				// M16 W4: the full-listing manifest envelope → a user-picked `.hbmanifest` file.
-				// Hoardbook writes the file the user chose and moves no collection files (INV-4′). Since
-				// M18 W4 this is the FALLBACK, not the only route — the fulfil verb in Chat sends the
-				// same manifest over the transport plane when the asker can be reached.
-				const path = await saveDialog({
-					defaultPath: `${slug}.hbmanifest`,
-					filters: [{ name: 'Hoardbook manifest', extensions: ['hbmanifest'] }],
-				});
-				if (!path) return;
-				await exportManifest(slug, path);
-				// Was `'Manifest exported — send it with Mascara'` — user-facing copy naming a product
-				// that no longer has that role (courier framing retired 2026-07-26). Home and Chat are
-				// two entry points to ONE export; they now say the same thing because they read the
-				// same constant.
-				toast(MANIFEST_EXPORTED_TOAST(path.split(/[\\/]/).pop() ?? `${slug}.hbmanifest`));
-				return;
-			}
-			const text = await exportCollection(slug, format);
-			await navigator.clipboard.writeText(text);
-			toast('Copied to clipboard');
-		} catch (e) { toast(String(e), 'error'); }
-	}
+	// QURATOR-138: the Export affordance is deleted from the collections list (owner: "Delete the
+	// unpublish and export buttons in collections as well" — Export is a pure local affordance, no
+	// coupling; the Unpublish half of that sentence is held for an explicit owner ruling, INV-8).
+	// `exportCollection`/`exportManifest` stay in api.js untouched; so does the manifest fulfil
+	// path in Chat, which is a different surface that still needs them.
+
 	$effect(() => {
 		if ($appReady && !profileLoaded) {
 			form = $homeDraft ?? ($profile ? { ...$profile } : form);
 			profileLoaded = true;
+			// Seeding is not an edit: arm only AFTER the assignment (see the sync effect above for
+			// why the gate must be a separate flag), and cancel any timer the sync effect's
+			// synchronous re-run may have armed before this line.
+			autopublish.cancel();
+			// Defer arming a microtask: the sync effect re-runs synchronously on the seed write, and
+			// reading autopublishArmed in the same tick it was set would still see the armed pass.
+			Promise.resolve().then(() => { autopublishArmed = true; });
 		}
 	});
 	let langSuggestions = $derived(langInput.length > 0
@@ -474,9 +502,23 @@
 	let neverPublished = $derived(publishedSnapshot === null);
 	let totalBytes = $derived($collections.reduce((s, c) => s + (c.total_bytes ?? 0), 0));
 	let diskSize = $derived(totalBytes > 0 ? formatBytes(totalBytes) : '—');
-	// Keep homeDraft in sync whenever form changes.
+	// Keep homeDraft in sync whenever form changes — QURATOR-138: this is ALSO the edit signal for
+	// publish-by-default. Every form mutation the template can make (bind:value on name/bio/since,
+	// tag/lang/social helpers, picture) lands here, so one effect covers them all: persist locally
+	// immediately + arm the debounced publish.
+	//
+	// The seed write (`form = $homeDraft ?? …`) is NOT an edit: with Svelte's default `sync`
+	// flush, this effect re-runs synchronously after the seed effect assigns `form`, BEFORE the
+	// seed's own `autopublish.cancel()` line executes — so the seed armed a phantom publish on
+	// every mount and even fired a spurious local save. Arming is therefore gated on a separate
+	// one-shot flag the seed effect sets AFTER its assignment, which keeps hydration silent while
+	// every later form mutation still arms normally.
+	let autopublishArmed = $state(false);
 	$effect(() => {
-		if (profileLoaded) homeDraft.set({ ...form });
+		if (profileLoaded) {
+			homeDraft.set({ ...form });
+			if (autopublishArmed && !syncingFromStore) profileEdited();
+		}
 	});
 	let nameInitial = $derived(form.display_name?.[0]?.toUpperCase() ?? 'Y');
 	let nameHue = $derived(avatarHue(nameInitial));
@@ -680,9 +722,6 @@
 			</div>
 		</div>
 		<div class="topbar-actions">
-			<button class="btn-ghost btn-sm" onclick={handleSave} disabled={saving}>
-				{saving ? 'Saving…' : 'Save draft'}
-			</button>
 			<button class="btn-primary btn-sm" class:publish-pulse={neverPublished && !publishing} onclick={handlePublish} disabled={publishing || !profileDirty || !form.display_name.trim()} title={!form.display_name.trim() ? 'Enter a display name before publishing' : !profileDirty ? 'No changes since last publish' : undefined}>
 				{publishing ? 'Publishing…' : profileDirty ? 'Publish profile' : 'Published ✓'}
 			</button>
@@ -722,7 +761,9 @@
 				/>
 			</div>
 
-			<div class="fields">
+			<!-- QURATOR-138 flush-on-blur: leaving any editor field pushes the pending burst out now
+			     instead of waiting out the debounce (typing then tabbing away must not drop it). -->
+			<div class="fields" onfocusout={() => { void autopublish.flush(); }}>
 				<div class="field">
 					<label class="field-label">Display name <span class="accent-dot">•</span></label>
 					<input class="hb-input" type="text" placeholder="e.g. DataHoarder_42" bind:value={form.display_name} />
@@ -906,7 +947,6 @@
 							onpublish={() => handlePublishCollection(col.slug)}
 							onunpublish={() => handleUnpublishCollection(col.slug)}
 							onremove={() => handleDeleteCollection(col.slug)}
-							onexport={(detail) => handleExport(detail.slug, detail.format)}
 						/>
 					{/each}
 				{/if}
