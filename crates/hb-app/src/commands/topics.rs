@@ -9,7 +9,7 @@
 //! on that contact has no browse-key to use (wire layer). Joining grants awareness + npub + teaser
 //! only.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nostr::prelude::*;
@@ -18,13 +18,14 @@ use tauri::State;
 
 use hb_core::topic::{
     build_announce, build_public_join, new_topic, normalized_public_name, seal_membership,
-    topic_id_for_name,
+    topic_id_for_name, TopicMeta,
 };
 use hb_core::{announce_cooldown_remaining, Identity};
 use hb_net::{
-    announce_to_topic, approve_join, discover_public_topics, fetch_announce, fetch_channel_full,
-    fetch_invite, fetch_roster, join_public, join_topic, leave_topic, member_count, post_to_channel,
-    publish_topic, request_join,
+    announce_to_topic, approve_join, discover_public_topics, discover_public_topics_paint,
+    fetch_announce, fetch_channel_full, fetch_invite, fetch_roster, join_public, join_topic,
+    leave_topic, member_count, post_to_channel, publish_topic, rank_discovered_topics,
+    request_join, TopicDiscoveries,
 };
 
 use crate::{
@@ -67,8 +68,9 @@ pub struct DiscoveredTopic {
     pub description: String,
     pub tags: Vec<String>,
     /// Best-effort, **spoofable** count (Decision: anyone can publish a fake membership) — present it
-    /// as approximate in the UI, never authoritative.
-    pub member_count_estimate: usize,
+    /// as approximate in the UI, never authoritative. `None` on the W1 paint path: the count has not
+    /// been fetched yet (ranking is lazy) — the UI orders by it but must not display a missing count.
+    pub member_count_estimate: Option<usize>,
 }
 
 /// The result of the join-first lookup (devtest #11): does this public Topic name already have a
@@ -336,6 +338,8 @@ pub async fn topic_update_meta(
 }
 
 /// Discover public Topics by tag (non-member view: name + description + the spoofable member count).
+/// The ONE-SHOT path (paint + rank in one call); the Topics page's Discover accordion still uses it
+/// for a single expanded root, where the member-count wave behind the fetch is the status quo.
 #[tauri::command]
 pub async fn topic_discover(
     tags: Vec<String>,
@@ -355,9 +359,75 @@ pub async fn topic_discover(
             name: m.name,
             description: m.description,
             tags: m.tags,
-            member_count_estimate: count,
+            member_count_estimate: Some(count),
         })
         .collect())
+}
+
+/// The PAINT half of discovery (QURATOR-143 W1): every public Topic under `tags` in **one relay
+/// read** (all roots ride one `#t` OR-filter), with **zero `member_count` round trips** — each entry
+/// carries `member_count_estimate: None` and the UI paints immediately. The lazy ranking half is
+/// [`topic_rank`], which the caller runs after first render for the rows it will actually draw.
+///
+/// The starved-root escalation (hb-net) is already folded in: a junk-announce flood under one root
+/// that evicts every other root from the shared-`limit` response pays one follow-up read per starved
+/// root, only when the response actually hit its limit.
+#[tauri::command]
+pub async fn topic_discover_paint(
+    tags: Vec<String>,
+    identity: State<'_, SharedIdentity>,
+    store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
+) -> CmdResult<Vec<DiscoveredTopic>> {
+    let me = me(&identity).await?;
+    let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
+    let found: TopicDiscoveries =
+        discover_public_topics_paint(&client, &tags, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
+    Ok(found
+        .topics
+        .into_iter()
+        .map(|m| DiscoveredTopic {
+            topic_id: m.topic_id,
+            name: m.name,
+            description: m.description,
+            tags: m.tags,
+            member_count_estimate: None,
+        })
+        .collect())
+}
+
+/// The LAZY RANKING half of discovery (QURATOR-143 W1): fetch the spoofable `member_count` for each
+/// named `topic_id` (bounded to `TOPIC_DISCOVERY_CONCURRENCY` inside hb-net) and return
+/// `(topic_id, count)` pairs, count-desc. The caller sends ONLY the rows it will actually draw —
+/// bounding the wave to what is on screen is the caller's half of the relay-citizenship contract;
+/// hb-net bounds the concurrency. The round-robin across roots is likewise the caller's: interleave
+/// the ids so no root drains another's slots.
+#[tauri::command]
+pub async fn topic_rank(
+    topic_ids: Vec<String>,
+    identity: State<'_, SharedIdentity>,
+    store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
+) -> CmdResult<Vec<TopicRank>> {
+    let me = me(&identity).await?;
+    let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
+    let found = TopicDiscoveries {
+        topics: topic_ids
+            .into_iter()
+            .map(|topic_id| TopicMeta { topic_id, name: String::new(), description: String::new(), tags: Vec::new(), private: false })
+            .collect(),
+        root_event_counts: BTreeMap::new(),
+        hit_limit: false,
+    };
+    let ranked = rank_discovered_topics(&client, found, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
+    Ok(ranked.into_iter().map(|(m, count)| TopicRank { topic_id: m.topic_id, member_count_estimate: count }).collect())
+}
+
+/// One lazy-ranking result: a `topic_id` + its spoofable count (see [`topic_rank`]).
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicRank {
+    pub topic_id: String,
+    pub member_count_estimate: usize,
 }
 
 /// Join-first lookup (devtest #11): before minting a new **public** Topic, check whether its

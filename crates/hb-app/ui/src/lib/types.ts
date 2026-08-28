@@ -209,12 +209,21 @@ export interface TopicView {
 }
 
 /** A discovered public Topic (non-member view) — the roster identities are NOT here (members-only);
- *  the count is a deliberately **spoofable** estimate. */
+ *  the count is a deliberately **spoofable** estimate. `member_count_estimate` is `null` on the W1
+ *  paint path (QURATOR-143): the count has not been fetched yet, because ranking is lazy — the
+ *  sidebar ORDERS by the count once `topicRank` lands it, but never displays it, and `null` must
+ *  never render as "0 claimed". */
 export interface DiscoveredTopic {
 	topic_id: string;
 	name: string;
 	description: string;
 	tags: string[];
+	member_count_estimate: number | null;
+}
+
+/** One lazy-ranking result (QURATOR-143 W1): a `topic_id` + its spoofable count, count-desc. */
+export interface TopicRank {
+	topic_id: string;
 	member_count_estimate: number;
 }
 

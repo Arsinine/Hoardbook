@@ -22,6 +22,7 @@ import type {
 	WatchHit,
 	TopicView,
 	DiscoveredTopic,
+	TopicRank,
 	TopicLookup,
 	TopicInvitePreview,
 	ChannelPost,
@@ -569,6 +570,19 @@ export const topicUpdateMeta = (topicId: string, description: string) =>
  *  root (e.g. `['video']`); the backend returns every public Topic beneath it, activity-ranked. */
 export const topicDiscover = (tags: string[]) =>
 	invoke<DiscoveredTopic[]>('topic_discover', { tags });
+
+/** The W1 PAINT path (QURATOR-143): every public Topic under ALL the given roots in ONE relay read,
+ *  with `member_count_estimate: null` everywhere — zero member_count round trips before first
+ *  render. Ranking (ordering) is the lazy `topicRank` half, run after paint. */
+export const topicDiscoverPaint = (tags: string[]) =>
+	invoke<DiscoveredTopic[]>('topic_discover_paint', { tags });
+
+/** The W1 LAZY-RANK half (QURATOR-143): fetch the spoofable member count for exactly the ids sent
+ *  (bounded to concurrency 8 in hb-net), returning `(topic_id, count)` pairs count-desc. Send ONLY
+ *  the ids of rows that will actually be drawn — bounding the wave to the screen is this caller's
+ *  half of the relay-citizenship contract. */
+export const topicRank = (topicIds: string[]) =>
+	invoke<TopicRank[]>('topic_rank', { topicIds });
 
 /** Join-first lookup (devtest #11): does this public Topic name already have a room? Never call for
  *  a private Topic (no announce to find). */

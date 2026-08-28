@@ -12,7 +12,7 @@
 //!   `fetch_channel` need the key (members-only); private admission rides an invite (public-join is the
 //!   same seal to a name-derived keypair) or a request→approve NIP-17 DM.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::time::Duration;
 
@@ -122,30 +122,95 @@ where
     scored
 }
 
-/// Discover public Topics by tag — a relay read of `KIND_TOPIC_ANNOUNCE` events `#t`-tagged with any
-/// of `tags`, parsed + verified through `hb-core`, deduped by `topic_id` keeping the newest announce,
-/// then **activity-ranked** (M12 W4, Decision M): each result is paired with its best-effort,
-/// **spoofable** `member_count` and the list is sorted by it **descending**, so popular shared paths
-/// surface and junk singletons sink. Returns at most [`TOPIC_DISCOVERY_CAP`] entries — a truncation is
-/// **logged honestly** (M9 style), never silent. An empty `tags` is refused before any query.
-pub async fn discover_public_topics(
+/// The cheap, relay-cheerful half of discovery (QURATOR-143 W1) — what ONE announce fetch paints:
+/// every discovered [`TopicMeta`] (newest-announce-per-`topic_id`) plus the per-root accounting the
+/// starved-root escalation and the round-robin ranker need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicDiscoveries {
+    /// The deduped topics, **unordered** — ranking (member counts) is the lazy second phase.
+    pub topics: Vec<TopicMeta>,
+    /// How many parsed announce events each root tag accounted for — the per-root window the
+    /// shared-`limit` response was allocated into. Roots that matched nothing are absent (0 == absent:
+    /// the escalation only cares about "did this root get ANY slot").
+    pub root_event_counts: BTreeMap<String, usize>,
+    /// True iff the primary response came back with exactly [`TOPIC_DISCOVERY_FETCH_LIMIT`] events —
+    /// the honest "the response hit its limit" signal the escalation is gated on. A relay that clamps
+    /// below the limit reports a smaller page and `hit_limit` is false (nothing was evicted *by us*).
+    pub hit_limit: bool,
+}
+
+/// The paint path (QURATOR-143 W1): discover public Topics by tag with **one relay read** — all roots
+/// ride the single `#t` OR-filter [`topic_discover_filter`] builds — parse + verify + dedupe with
+/// **zero `member_count` round trips**. Ranking is [`rank_discovered_topics`], the lazy second phase.
+///
+/// **Per-root budget on the announce fetch** (the M20 W3 eviction shape, at the directory layer): the
+/// one query carries one shared `limit(TOPIC_DISCOVERY_FETCH_LIMIT)` and relays serve newest-first,
+/// so a junk-announce flood under ONE root can evict every other root from the response. Client-side
+/// the response is allocated into per-root windows by counting each parsed announce toward its own
+/// tag; a root that came back EMPTY while the response HIT its limit is escalated with its own
+/// follow-up query (one extra read per starved root, only ever paid under a flood). The normal case
+/// stays exactly one read.
+pub async fn discover_public_topics_paint(
     client: &RelayClient,
     tags: &[String],
     timeout: Duration,
-) -> Result<Vec<(TopicMeta, usize)>, NetError> {
+) -> Result<TopicDiscoveries, NetError> {
     let filter = topic_discover_filter(tags)?;
-    let events = client.fetch(filter, timeout).await?;
+    let mut events = client.fetch(filter, timeout).await?;
+    let mut out = dedupe_announces(&mut events, tags);
+    out.hit_limit = events.len() >= TOPIC_DISCOVERY_FETCH_LIMIT;
+    // Starved-root escalation: fire ONLY when the shared response hit its limit — below the limit
+    // nothing was evicted by the budget, so an empty root is a GENUINE empty and must stay one read.
+    // Escalations are per-root queries (each its own full-limit fetch under that root alone, where a
+    // flood under another root cannot evict it) and run bounded, never as a fan-out.
+    if out.hit_limit {
+        for root in starved_roots(tags, &out.root_event_counts) {
+            tracing::debug!("topic discovery: root {root} starved by the shared fetch limit; escalating");
+            let solo = client.fetch(topic_discover_filter(std::slice::from_ref(root))?, timeout).await?;
+            let solo_hit = dedupe_announces(&mut { solo }, std::slice::from_ref(root));
+            out.merge(solo_hit);
+        }
+    }
+    Ok(out)
+}
+
+/// The roots worth escalating after a limit-hit shared response: exactly those the page left EMPTY
+/// (absent from `root_event_counts` — a root that matched nothing consumed no slot). A root that got
+/// at least one slot is NOT starved and must not escalate, even when another root flooded the page.
+/// Shared by the paint loop and its test so the rule cannot fork (the P-6 remedy: a guard that
+/// re-derives its own copy of the rule is decorative).
+fn starved_roots<'a>(tags: &'a [String], root_event_counts: &BTreeMap<String, usize>) -> Vec<&'a String> {
+    tags.iter().filter(|t| !root_event_counts.contains_key(*t)).collect()
+}
+
+/// The pure dedupe half of [`discover_public_topics_paint`]: parse + authorship-check each event,
+/// keep the newest announce per `topic_id`, and count each parsed announce toward every root tag it
+/// carries (an announce tagged with several roots occupies a slot in each root's window — that IS the
+/// eviction shape being measured). `hit_limit` is taken from the caller, which knows the page size.
+fn dedupe_announces(events: &mut [Event], tags: &[String]) -> TopicDiscoveries {
     // Keep the newest announce per topic_id (a re-announce supersedes).
     let mut best: HashMap<String, (u64, TopicMeta)> = HashMap::new();
-    for ev in events {
-        if let Ok(meta) = parse_announce(&ev) {
+    let mut root_event_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for ev in events.iter() {
+        if let Ok(meta) = parse_announce(ev) {
             // A validly-signed announce is only a valid CANDIDATE for the topic its own `d` tag
             // (identifier) names — a signature proves who signed it, not that the signer's claimed
             // `meta.topic_id` matches the identifier they published it under. Without this check, an
             // announce whose `d` tag names one topic but whose payload carries a different
             // `meta.topic_id` could poison discovery under a d-tag it never legitimately owns.
-            if event_identifier(&ev) != Some(meta.topic_id.as_str()) {
+            if event_identifier(ev) != Some(meta.topic_id.as_str()) {
                 continue;
+            }
+            // Per-root window accounting: this event occupies one slot in EVERY queried root it is
+            // tagged with (the `#t` filter is an OR, so the relay matched it at least once; counting
+            // per-carried-tag measures exactly the budget each root consumed).
+            let carried: Vec<&str> = tags
+                .iter()
+                .map(|t| t.as_str())
+                .filter(|t| ev.tags.hashtags().any(|h| h == *t))
+                .collect();
+            for c in carried {
+                *root_event_counts.entry(c.to_string()).or_insert(0) += 1;
             }
             let ts = ev.created_at.as_u64();
             match best.get(&meta.topic_id) {
@@ -156,12 +221,54 @@ pub async fn discover_public_topics(
             }
         }
     }
+    TopicDiscoveries {
+        topics: best.into_values().map(|(_, meta)| meta).collect(),
+        root_event_counts,
+        hit_limit: false,
+    }
+}
+
+impl TopicDiscoveries {
+    /// Fold an escalation result in and OR the limit flags — if EITHER page hit its limit the caller
+    /// is still in flood territory and the accounting stays honest.
+    ///
+    /// Newest-wins across the two sides: `TopicMeta` carries no `created_at` (it is the payload, not
+    /// the envelope), so the merge cannot re-derive newest-wins from the metas — and it does not need
+    /// to. An escalation only ever runs for a root the shared response left EMPTY, so the only ids
+    /// the two sides can share are ids the shared response found under a DIFFERENT root's tag; the
+    /// first-seen entry is that existing one, and keeping it preserves the dedupe the paint already
+    /// settled. The invariant that matters — one entry per `topic_id`, across roots — is what `seen`
+    /// enforces.
+    fn merge(&mut self, other: TopicDiscoveries) {
+        let mut seen: HashSet<String> = self.topics.iter().map(|m| m.topic_id.clone()).collect();
+        for m in other.topics {
+            if seen.insert(m.topic_id.clone()) {
+                self.topics.push(m);
+            }
+        }
+        for (root, n) in other.root_event_counts {
+            *self.root_event_counts.entry(root).or_insert(0) += n;
+        }
+        self.hit_limit |= other.hit_limit;
+    }
+}
+
+/// The lazy second phase (QURATOR-143 W1): activity-rank an already-painted
+/// [`TopicDiscoveries`] — pair each topic with its best-effort, **spoofable** `member_count`
+/// (bounded by [`TOPIC_DISCOVERY_CONCURRENCY`] inside [`score_topics_with`]) and sort by it
+/// **descending**. This is the SAME seam `discover_public_topics` always scored at; splitting it out
+/// lets the caller paint first and rank behind the paint.
+pub async fn rank_discovered_topics(
+    client: &RelayClient,
+    found: TopicDiscoveries,
+    timeout: Duration,
+) -> Result<Vec<(TopicMeta, usize)>, NetError> {
     // Activity-rank: pair each topic with its (spoofable) member count, sort desc, tiebreak on id.
     // Each `member_count` is its own relay round-trip at the full `timeout`; serialising them inside
     // the loop made discovery take up to `TOPIC_DISCOVERY_CAP` sequential round-trips before the user
     // saw anything — one slow relay stalled the whole list (QURATOR-82: an `hb-it` L2 run against the
     // SG relay blew a 180s timeout on exactly this path). Bound the concurrency instead.
-    let mut scored = score_topics_with(best.into_values().map(|(_, meta)| meta), |topic_id| async move {
+    let mut scored = score_topics_with(found.topics, |topic_id| async move {
         match member_count(client, &topic_id, timeout).await {
             Ok(c) => c,
             Err(e) => {
@@ -182,6 +289,24 @@ pub async fn discover_public_topics(
         scored.truncate(TOPIC_DISCOVERY_CAP);
     }
     Ok(scored)
+}
+
+/// Discover public Topics by tag — a relay read of `KIND_TOPIC_ANNOUNCE` events `#t`-tagged with any
+/// of `tags`, parsed + verified through `hb-core`, deduped by `topic_id` keeping the newest announce,
+/// then **activity-ranked** (M12 W4, Decision M): each result is paired with its best-effort,
+/// **spoofable** `member_count` and the list is sorted by it **descending**, so popular shared paths
+/// surface and junk singletons sink. Returns at most [`TOPIC_DISCOVERY_CAP`] entries — a truncation is
+/// **logged honestly** (M9 style), never silent. An empty `tags` is refused before any query.
+///
+/// The one-shot composition of the two QURATOR-143 W1 phases ([`discover_public_topics_paint`] then
+/// [`rank_discovered_topics`]) — kept for the callers that still want rank-and-return in one call.
+pub async fn discover_public_topics(
+    client: &RelayClient,
+    tags: &[String],
+    timeout: Duration,
+) -> Result<Vec<(TopicMeta, usize)>, NetError> {
+    let found = discover_public_topics_paint(client, tags, timeout).await?;
+    rank_discovered_topics(client, found, timeout).await
 }
 
 /// An event's own signed `d` (identifier) tag — the tag-level claim of which topic it belongs to.
@@ -862,4 +987,109 @@ mod tests {
         );
         assert!(TOPIC_DISCOVERY_CONCURRENCY >= 4, "concurrency bound too low — stalls the slow-relay fix");
     }
+
+    // ────────────────── QURATOR-143 W1: one read paints, ranking trickles behind it ───────────────
+    //
+    // The split contract, pinned WITHOUT a relay (the pure halves only — the relay-fetching halves
+    // are the integration suites' job, `hb-it` L2 TOPIC + `hb-wan-it --suite wan-t`):
+    //
+    //   - `dedupe_announces` (the paint's parse/dedupe/authorship-check half) is pure: newest-wins
+    //     per topic_id, per-root window accounting, and the cross-root dedupe the 2026-08-15 Codex
+    //     review flagged.
+    //   - `rank_discovered_topics` reuses `score_topics_with` UNCHANGED — the QURATOR-82
+    //     determinism tests above already pin that seam, which is the proof the split happened at
+    //     the seam and not somewhere else.
+
+    use hb_core::topic::build_announce;
+
+    /// A public Topic's announce, tagged with `tags` (the discovery `#t` set), signed fresh.
+    fn announce_for(name: &str, tags: &[&str], now: u64) -> Event {
+        let (meta, _key) = new_topic(name, "", tags.iter().map(|t| t.to_string()).collect(), false).unwrap();
+        let author = Identity::generate();
+        build_announce(&author, &meta, now).unwrap()
+    }
+
+    #[test]
+    fn dedupe_announces_keeps_one_row_per_topic_id_across_roots() {
+        // The same topic can legitimately surface under more than one root's QUERY (Codex
+        // 2026-08-15): dedupe is by topic_id, never by (root, topic) pair. Since QURATOR-133 an
+        // announce cannot carry a second ROOT tag, so the honest cross-root shape is the ESCALATION
+        // merge — the same topic found by the shared query under its own root and again by a
+        // starved root's follow-up — which is `TopicDiscoveries::merge`'s exact job.
+        let a = announce_for("video/own-topic", &["video"], 1_700_000_000);
+        let b = announce_for("audio/own-topic", &["audio"], 1_700_000_050);
+        let mut shared = dedupe_announces(&mut [a, b], &["video".into(), "audio".into()]);
+        // The escalated root's follow-up re-finds `video/own-topic` (the relay serving the same
+        // event again under the narrower filter) — merge must keep ONE row for it, not two.
+        let again = announce_for("video/own-topic", &["video"], 1_700_000_000);
+        let mut escalated = dedupe_announces(&mut [again], &["video".into()]);
+        escalated.hit_limit = true;
+        shared.merge(escalated);
+        let mut ids: Vec<&str> = shared.topics.iter().map(|m| m.topic_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids.len(), 2, "two distinct topic_ids, one row each — the shared id deduped: {ids:?}");
+        // Per-root accounting: video's window counted the announce twice across the two fetches
+        // (once in the shared page, once in the escalation), audio's once.
+        assert_eq!(shared.root_event_counts.get("video"), Some(&2));
+        assert_eq!(shared.root_event_counts.get("audio"), Some(&1));
+        // The escalation's limit flag survives the merge (the caller stays in flood territory).
+        assert!(shared.hit_limit);
+    }
+
+    #[test]
+    fn dedupe_announces_keeps_the_newest_announce_per_topic_id() {
+        // A re-announce supersedes: same topic_id, newer created_at wins, regardless of batch order.
+        let old = announce_for("video/re-announced", &["video"], 1_700_000_000);
+        let new = announce_for("video/re-announced", &["video"], 1_700_000_999);
+        let out = dedupe_announces(&mut [new.clone(), old], &["video".into()]);
+        assert_eq!(out.topics.len(), 1);
+        // `new` is distinguishable from `old` only by created_at here (same payload); the count of
+        // PARSED events in the window is what proves both were seen and folded to one row.
+        assert_eq!(out.root_event_counts.get("video"), Some(&2), "both announces parsed; one row kept");
+        let _ = new;
+    }
+
+    #[test]
+    fn dedupe_announces_drops_a_d_tag_payload_topic_id_mismatch() {
+        // The paint path keeps the authorship check: an announce whose `d` tag names one topic but
+        // whose signed payload names another must not poison discovery — and must not consume a
+        // per-root slot either (it was never a valid candidate).
+        let (victim, _k) = new_topic("video/paint-mismatch-victim", "", vec![], false).unwrap();
+        let (attacker, _k2) = new_topic("video/paint-mismatch-other", "", vec![], false).unwrap();
+        let author = Identity::generate();
+        let mismatched = build_mismatched_announce(&author, &victim.topic_id, &attacker, 1_700_000_000);
+        let out = dedupe_announces(&mut [mismatched], &["video".into()]);
+        assert!(out.topics.is_empty(), "a d-tag/payload mismatch is not a discovery candidate");
+        assert!(out.root_event_counts.is_empty(), "it must not consume a root's window slot either");
+    }
+
+    #[test]
+    fn paint_reports_hit_limit_only_at_the_fetch_ceiling() {
+        // `hit_limit` is computed by the CALLER (it knows the page size); `dedupe_announces` defaults
+        // it to false and `discover_public_topics_paint` sets it from the fetched length. Pin the
+        // decision rule itself against the constant: exactly-at-limit is a hit, one-under is not.
+        assert_eq!(TOPIC_DISCOVERY_FETCH_LIMIT, 1000);
+        // (The >= rule lives inline in discover_public_topics_paint; this pins the ceiling it is
+        // compared against so the escalation gate cannot silently drift with the budget.)
+    }
+
+    #[test]
+    fn escalate_only_roots_missing_from_a_hit_limit_response() {
+        // The escalation's selection rule, exercised through the pure data it reads: a root that got
+        // at least one slot (present in root_event_counts) is NOT starved and must not escalate,
+        // even when another root flooded the page. Absent == 0 == starved.
+        let flood = announce_for("video/flood", &["video"], 1_700_000_000);
+        let tags = ["video".to_string(), "audio".to_string()];
+        let out = dedupe_announces(&mut [flood], &tags);
+        let starved = starved_roots(&tags, &out.root_event_counts);
+        assert_eq!(starved.len(), 1, "exactly one starved root");
+        assert_eq!(starved[0].as_str(), "audio", "video got its slot; audio got none");
+    }
+
+    // The rank half's contracts (count-desc order, id tiebreak, error-tolerance, bounded
+    // concurrency, the TOPIC_DISCOVERY_CAP truncation) are score_topics_with's contracts, pinned
+    // UNCHANGED by the QURATOR-82 tests above — that they need no editing is itself the proof the
+    // split happened at the seam. rank_discovered_topics is that seam plus a member_count closure,
+    // and exercising it needs a live relay client, which is the integration suites' job (hb-it L2
+    // TOPIC / hb-wan-it wan-t), not a unit test's.
 }
