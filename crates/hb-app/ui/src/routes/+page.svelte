@@ -513,7 +513,14 @@
 	// every mount and even fired a spurious local save. Arming is therefore gated on a separate
 	// one-shot flag the seed effect sets AFTER its assignment, which keeps hydration silent while
 	// every later form mutation still arms normally.
-	let autopublishArmed = $state(false);
+	//
+	// The flag is deliberately a PLAIN variable, not `$state`: as `$state`, the deferred
+	// `autopublishArmed = true` write itself re-ran this effect (it reads the flag), passing the
+	// gate on hydration and arming a phantom edit + local save on every mount (QURATOR-100's
+	// "no error toast on a successful picture apply" caught the residue: the save rejected in
+	// jsdom and its onError toast landed). Non-reactive, the write can't re-trigger anything —
+	// only a real `form` mutation runs the edit arm below.
+	let autopublishArmed = false;
 	$effect(() => {
 		if (profileLoaded) {
 			homeDraft.set({ ...form });

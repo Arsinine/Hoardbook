@@ -113,7 +113,7 @@ describe('AddContactPanel — M20 W3 truncation affordance', () => {
 		// One hit returned, but the backend flagged more candidates existed (capped=true). Hit count
 		// is independent of the cap flag — one hit + capped=true still means "there are more".
 		const { findByText } = await discoverHits([makeHit()], {}, true);
-		const affordance = await findByText(/more matches exist/i);
+		const affordance = await findByText(/more matches than shown/i);
 		expect(affordance).toBeTruthy();
 		expect(affordance.getAttribute('role')).toBe('status');
 	});
@@ -121,7 +121,7 @@ describe('AddContactPanel — M20 W3 truncation affordance', () => {
 	it('shows no cap notice when the result is not capped', async () => {
 		// capped=false → no notice. Mutation probe: rendering the notice unconditionally reds this.
 		const { queryByText } = await discoverHits([makeHit()], {}, false);
-		expect(queryByText(/more matches exist/i)).toBeNull();
+		expect(queryByText(/more matches than shown/i)).toBeNull();
 	});
 });
 
