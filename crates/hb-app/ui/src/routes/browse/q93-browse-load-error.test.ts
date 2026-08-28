@@ -87,7 +87,7 @@ const SELECTED_PEER: CachedPeer = {
 };
 
 const EMPTY_STRING = /no contacts yet/i;
-const CONTACTS_ERROR_STRING = /couldn.t load contacts/i;
+const CONTACTS_ERROR_STRING = /couldn.t load your contacts/i;
 const PRIVATE_ERROR_STRING = /couldn.t load private collections/i;
 
 afterEach(() => {
