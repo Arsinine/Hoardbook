@@ -174,7 +174,7 @@ describe('MAS-INV-5 + INV-4 — no "Download" anywhere; no Hoardbook-side "Send"
 		// The "send it to them yourself" line is the spec-mandated instruction that Hoardbook did
 		// NOT deliver — the owner is the courier. This is positive copy, not a forbidden affordance.
 		const toast = MANIFEST_EXPORTED_TOAST('criterion.hbmanifest').toLowerCase();
-		expect(toast).toMatch(/Send it yourself/);
+		expect(toast).toMatch(/send it yourself/);
 		expect(toast).toMatch(/hoardbook moves no files/);
 	});
 

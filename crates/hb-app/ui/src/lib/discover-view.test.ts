@@ -192,7 +192,9 @@ describe('discover-view — QURATOR-70 search-box copy tracks what the filter do
 		expect(src).toContain('placeholder="name, bio, or tag (e.g. anime, vhs)"');
 		// The two-term narrowing rule is stated so narrowing does not read as broken (a hit found by
 		// bio on term 1 would vanish under strict AND-on-tags on term 2 without this affordance).
-		expect(src).toContain('two or more tags narrow');
+		// f50985a (QURATOR-134) tightened the wording — "Add more tags to narrow" carries the same
+		// affordance the old "two or more tags narrow" clause did.
+		expect(src).toContain('Add more tags to narrow');
 		// And it must NOT overpromise the multi-term behaviour: multi-term is tags-only, not name/bio.
 		expect(src).not.toContain('name, bio, tags, or content type');
 	});
