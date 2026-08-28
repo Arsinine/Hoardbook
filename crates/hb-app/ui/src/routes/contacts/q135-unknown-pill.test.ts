@@ -22,6 +22,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, cleanup, waitFor } from '@testing-library/svelte';
 import ContactsPage from './+page.svelte';
+import { onlineCount } from '$lib/api.js';
 import { contacts, contactsLoadError } from '$lib/stores.js';
 import type { CachedPeer, Profile } from '$lib/types.js';
 
@@ -101,5 +102,27 @@ describe('QURATOR-135 — unknown presence is not Offline', () => {
 		// The contacts-page Online pill is dot-only (no text), so it is asserted by class.
 		await waitFor(() => expect(container.querySelectorAll('.pill-online').length).toBe(1));
 		expect(container.querySelectorAll('.pill-unknown').length).toBe(0);
+	});
+});
+
+// QURATOR-135, the OWED second half — "first poll fires on mount, not on the first
+// REFRESH_INTERVAL/ONLINE_POLL_VISIBLE_MS tick."
+//
+// Why this is the acquisition half: `online_count` is a cached read — the first call CLAIMS the
+// refresh slot and returns the (empty) cache immediately, the spawned relay query lands later, and
+// the SECOND read is what picks up the completed pills. If the page's first read only happens on
+// the first interval tick, the whole relay query is shifted a full ONLINE_POLL_VISIBLE_MS (20 s)
+// later than it needs to be, stacking with the backend's first-connect latency into the owner's
+// ~90 s cold start. Firing the read in onMount means the relay query is claimed the moment the
+// page exists.
+//
+// No fake timers and no timer advancement: onMount flushes during render under testing-library, so
+// reaching for the tick is provably unnecessary — if the poll only ran on the interval, this test
+// would time out waiting (a real 20 s interval never fires inside a 5 s waitFor).
+describe('QURATOR-135 — the first poll fires on mount, not on the first tick', () => {
+	it('online_count has been called by the time the mount settles — no tick fired', async () => {
+		contacts.set([peer({ last_presence: undefined })]);
+		render(ContactsPage);
+		await waitFor(() => expect(vi.mocked(onlineCount).mock.calls.length).toBeGreaterThanOrEqual(1));
 	});
 });
