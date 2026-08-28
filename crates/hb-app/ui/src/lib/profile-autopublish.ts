@@ -61,7 +61,8 @@ export interface AutopublishController {
 	cancel: () => void;
 	/** True while a publish is in flight (for a "Publishing…" affordance). */
 	isPublishing: () => boolean;
-	/** Component teardown: flush (navigate-away must not drop the last edit), then disarm. */
+	/** Component teardown: flush a PENDING burst (navigate-away must not drop the last edit), then
+	 *  disarm. With nothing pending this is a no-op — teardown alone is never a reason to write. */
 	destroy: () => Promise<void>;
 }
 
@@ -119,9 +120,12 @@ export function createAutopublish(form: () => Profile, deps: AutopublishDeps): A
 		isPublishing: () => publishing,
 		async destroy() {
 			if (destroyed) return;
-			if (timer) { clearTimeout(timer); timer = undefined; }
 			// Flush FIRST, then latch `destroyed` — the guard must not eat the navigate-away flush.
-			await publishNow();
+			// Only a burst the edit path actually armed counts: teardown with nothing pending is a
+			// no-op, not a save+publish. (Without the pending check, every unmount of the page ran a
+			// relay write for a form nobody touched — observed as the cross-test toast residue in
+			// QURATOR-100's success case, and in production as a phantom publish per navigate-away.)
+			if (timer) { clearTimeout(timer); timer = undefined; await publishNow(); }
 			destroyed = true;
 		},
 	};

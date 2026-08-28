@@ -411,7 +411,7 @@
 														<!-- QURATOR-104: roster hit — they ARE a contact, so no stranger banner. -->
 														<span class="hit-known" title="Already in your contacts">in your contacts</span>
 													{:else}
-														<span class="hit-stranger" title="Verify the fingerprint before trusting a stranger">unverified — not in your contacts</span>
+														<span class="hit-stranger" title="Verify the fingerprint before trusting a stranger">unverified · not in your contacts</span>
 													{/if}
 												</div>
 												{#if known}
