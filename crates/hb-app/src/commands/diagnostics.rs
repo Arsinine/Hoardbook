@@ -165,6 +165,59 @@ pub(crate) fn cap_tail(bytes: &[u8]) -> Option<String> {
     Some(format!("…(truncated to fit {TAIL_MAX_BYTES} bytes)\n{trimmed}"))
 }
 
+/// QURATOR-139 — the repository URL the sidebar brand opens in the system browser. Hard-coded in
+/// Rust, NOT a command argument: an opener that accepted an arbitrary URL from the webview would be
+/// an escalation surface (any injected script could aim the system browser at a phishing lookalike),
+/// and nothing here needs that generality. This command opens exactly this URL and nothing else.
+pub const REPO_URL: &str = "https://github.com/Arsinine/Hoardbook";
+
+/// QURATOR-139 — click the Hoardbook logo → open the GitHub repository in the system browser.
+///
+/// Takes **no arguments** (see [`REPO_URL`]). Hand-rolls the platform opener rather than adding the
+/// shell plugin or the `open` crate, matching the `open_in_file_manager` discipline two functions
+/// down: no new dependency for a one-shot spawn, and no plugin capability that could open anything
+/// other than this one URL. On Windows `cmd /c start` is used (not `start` directly — it is a shell
+/// builtin, not an executable, so `Command::new("start")` fails to spawn).
+#[tauri::command]
+pub async fn open_repo_page() -> CmdResult<()> {
+    open_url_in_browser(REPO_URL)
+}
+
+/// Open `url` in the system default browser. Same three-way platform split as
+/// [`open_in_file_manager`], but written with `#[cfg]` blocks rather than the `cfg!()` if/else
+/// that function uses: the Windows arm needs `creation_flags`, a method that only exists on
+/// Windows' `Command`, so the branches must not all compile everywhere. The spawn is
+/// non-blocking (we never wait on the child).
+fn open_url_in_browser(url: &str) -> CmdResult<()> {
+    #[cfg(target_os = "windows")]
+    {
+        // `start "" <url>`: the empty title argument stops `start` treating a quoted URL as the
+        // window title; `cmd /c` because `start` is a cmd.exe builtin with no executable. cmd.exe
+        // is a CONSOLE binary — spawned from this GUI process it would flash a console window on
+        // every brand click — so CREATE_NO_WINDOW suppresses the allocation.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(cmd_err)?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn().map_err(cmd_err)?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn().map_err(cmd_err)?;
+    }
+    #[cfg(not(any(target_os = "windows", unix)))]
+    {
+        let _ = url;
+    }
+    Ok(())
+}
+
 /// Open a path in the OS file manager. Platform-specific because there is no opener plugin loaded
 /// (M-era discipline: no new dependency for a one-shot spawn). Windows: `explorer /select,...` needs a
 /// child file; for a directory, `explorer <dir>` is the idiom. macOS: `open`. Linux: `xdg-open`.

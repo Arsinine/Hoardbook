@@ -3,7 +3,7 @@
 	import { onMount } from 'svelte';
 	import { get } from 'svelte/store';
 	import { page } from '$app/stores';
-	import { getIdentity, getProfile, getCollections, getContacts, getMessages, getReadState, topicAnnouncements, topicAnnounceSeen } from '$lib/api.js';
+	import { getIdentity, getProfile, getCollections, getContacts, getMessages, getReadState, topicAnnouncements, topicAnnounceSeen, openRepoPage } from '$lib/api.js';
 	import { identity, profile, inboxMessages, readWatermarks, toastMessage, appReady, toast, dismissToast, isStickyToast, identityLoadError, topicAnnounceSummaries, announceSeen, seedSentFromFeed, loadCollectionsInto, loadContactsInto } from '$lib/stores.js';
 	import { isOurDrag } from '$lib/drag-group.js';
 	import { totalUnread, unreadByPeer } from '$lib/unread-view.js';
@@ -162,6 +162,19 @@
 		e.preventDefault();
 		if (e.dataTransfer) e.dataTransfer.dropEffect = 'none';
 	}
+
+	// QURATOR-139 — brand click. The Rust command takes NO url argument (it is hard-coded as
+	// commands::diagnostics::REPO_URL), so the webview cannot redirect the opener anywhere else.
+	// A plain <a href> was not an option: inside the Tauri webview it navigates the app away from
+	// itself instead of handing off to the system browser. Failure surfaces as a toast — an opener
+	// that dies silently reads as "the logo does nothing".
+	async function openRepo() {
+		try {
+			await openRepoPage();
+		} catch (e) {
+			toast(`Could not open the repository page: ${e}`, 'error');
+		}
+	}
 </script>
 
 <svelte:window ondragover={guardForeignDrag} ondrop={guardForeignDrag} />
@@ -169,8 +182,12 @@
 <div class="frame">
 	<!-- Sidebar -->
 	<div class="sidebar">
-		<!-- Brand -->
-		<div class="brand">
+		<!-- Brand. QURATOR-139: the whole block (not just the 15x20 mark) is the click target —
+		     a bare-div onclick would be unreachable by keyboard. Opens OUTSIDE the app, in the
+		     system browser, via a Rust command with the URL hard-coded server-side. -->
+		<button class="brand" type="button" title="Open the Hoardbook repository on GitHub"
+			aria-label="Open the Hoardbook repository on GitHub"
+			onclick={openRepo}>
 			<div class="brand-logo">
 				<svg viewBox="0 0 18 24" width="15" height="20" style="overflow:visible" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
 					<line x1="4" y1="-8" x2="4" y2="22"/>
@@ -178,7 +195,7 @@
 				</svg>
 			</div>
 			<span class="brand-name">Hoardbook</span>
-		</div>
+		</button>
 
 		<!-- Nav items -->
 		{#each navItems as item}
@@ -278,6 +295,20 @@
 		padding: 0 8px 18px;
 		border-bottom: 1px solid var(--divider);
 		margin-bottom: 12px;
+		/* QURATOR-139: this is a <button> now (was a bare div). Reset the UA button chrome, then
+		   add back the affordances a div never had: a pointer cursor and a hover tint. The focus
+		   ring comes from app.css's global `:focus-visible` (M15 W1) — nothing extra needed. */
+		background: none;
+		font: inherit;
+		text-align: left;
+		width: 100%;
+		cursor: pointer;
+		border: none;
+		border-bottom: 1px solid var(--divider);
+	}
+
+	.brand:hover .brand-name {
+		color: var(--accent);
 	}
 
 	.brand-logo {

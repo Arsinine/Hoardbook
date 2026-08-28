@@ -535,6 +535,13 @@ export const copyDiagnostics = () => invoke<string>('copy_diagnostics');
 /** Open the OS file manager at the log directory. Creates it if missing (first launch). */
 export const revealLogFolder = () => invoke<void>('reveal_log_folder');
 
+/**
+ * QURATOR-139 — open the GitHub repository in the system browser. Takes no arguments: the URL is
+ * hard-coded in the Rust command (`commands::diagnostics::REPO_URL`), so the webview can never aim
+ * the opener at anything else.
+ */
+export const openRepoPage = () => invoke<void>('open_repo_page');
+
 // QURATOR-68 — the NAT classification token for the Settings → Diagnostics UI. One of
 // "no-nat" | "nat" | "cgnat" | "unknown" | "undetermined" (before the first probe completes).
 // The mapped address is never returned — only the classification (INV: peer/self addresses are
