@@ -156,11 +156,16 @@ describe('QURATOR-145 (W3) — the cross-mount directory cache', () => {
 		await waitFor(() => expect(paintMock).toHaveBeenCalledTimes(2));
 		await tick();
 
-		// THE assertion: the failure did not blank what was on screen, and the retryable error
-		// surface (the alert) did not replace the populated tree — the template's error branch
-		// only renders over an EMPTY tree, and the catch never touches `directory`.
+		// THE assertion: the failure did not blank what was on screen — the catch never touches
+		// `directory`, so the populated tree stays. Since the GLM-review fix (2026-08-28) a failed
+		// paint over a POPULATED tree also renders the retryable error banner alongside the rows
+		// (it used to render nothing at all — the tree silently read as "no public Topics exist");
+		// what must still hold is that the error never REPLACES the tree and never reads as the
+		// confident empty.
 		expect(b.getByText('animation/anime')).toBeTruthy();
-		expect(b.queryByRole('alert')).toBeNull();
-		expect(b.queryByText(/Nothing here yet/i)).toBeNull();
+		const alert = b.queryByRole('alert');
+		expect(alert).not.toBeNull(); // the banner rides WITH the rows...
+		expect(alert!.textContent).toContain('stale'); // ...saying the directory may be stale
+		expect(b.queryByText(/Nothing here yet/i)).toBeNull(); // never the confident negative
 	});
 });
