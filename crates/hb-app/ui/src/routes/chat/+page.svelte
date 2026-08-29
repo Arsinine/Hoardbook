@@ -908,21 +908,64 @@
 	// M17 W2: `&intent=ask-access` populates the composer draft from askAccessDraft WITHOUT sending.
 	// No-clobber: if the user already typed a draft, the helper returns the untouched text and we just
 	// focus the composer. The petname (carried via `&petname=`) personalises the greeting.
+	//
+	// QURATOR-146 (Topics W4): the deep-link now ALSO opens a NON-contact — the whole population of a
+	// Topic roster is people you have not added, and the old `if (peer)` guard made `?peer=` from a
+	// roster row silently do nothing (the interest-first flow dead-ended at a read-only list). The
+	// stranger is resolved the same way fetchNonContactNames resolves one — pasteKey(npub), which
+	// networks for the profile but NEVER persists a contact (persistence is `follow`, a deliberate
+	// act elsewhere) — and selectPeer is called with the resolved peer. selectedIsContact then reads
+	// false on its own and the existing "may filter your messages" notice does its job with zero
+	// further changes. pasteKey REJECTS a profileless peer (the `reject_profileless` guard), so a
+	// dead link surfaces as that error toast, not a blank pane. Contact-first, always: a stale relay
+	// resolve must never shadow a contact the user actually has.
 	$effect(() => {
 		const npub = $page.url.searchParams.get('peer') ?? '';
 		if (!npub || npub === peerDeepLinked) return;
-		const peer = $contacts.find((c) => c.npub === npub);
-		if (peer) {
+		const open = (peer: CachedPeer, petnameFallback: string) => {
 			peerDeepLinked = npub;
 			selectPeer(peer);
 			const intent = $page.url.searchParams.get('intent');
 			if (intent) {
-				const petname = $page.url.searchParams.get('petname') ?? peer.petname ?? '';
+				const petname = $page.url.searchParams.get('petname') ?? petnameFallback;
 				const applied = applyAskAccessIntent(intent, draft, petname);
 				draft = applied.draft;
 				if (applied.focus) tick().then(() => draftEl?.focus());
 			}
+		};
+		const peer = $contacts.find((c) => c.npub === npub);
+		if (peer) {
+			open(peer, peer.petname ?? '');
+			return;
 		}
+		// QURATOR-146: a non-contact npub still opens the conversation. Resolve lazily — the guard
+		// set stops a refire while the resolve is in flight; on failure peerDeepLinked stays '' so a
+		// later $contacts settle can retry (the relay may have just been unreachable).
+		if (fetchingNames.has(npub)) return;
+		fetchingNames.add(npub);
+		pasteKey(npub)
+			.then((resolved) => {
+				peerDeepLinked = npub;
+				fetchingNames.delete(npub);
+				// Seed the name cache exactly as fetchNonContactNames does, so a request that later
+				// arrives from this peer renders their display name (and the guard-set entry is not
+				// left behind to suppress that pass).
+				if (resolved.profile?.display_name) {
+					peerNameCache = { ...peerNameCache, [npub]: resolved.profile.display_name };
+				}
+				selectPeer({
+					...resolved,
+					// A resolve that came back profileless still opens the pane — the pane itself is
+					// absent-graceful (shortId name, empty thread), so the conversation is reachable
+					// even when the profile is not. (pasteKey normally rejects profileless; a mocked
+					// or partial resolve must not crash the pane render.)
+					profile: resolved.profile ?? { display_name: '', tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '' },
+				});
+			})
+			.catch((e) => {
+				fetchingNames.delete(npub);
+				toast(String(e), 'error'); // carries pasteKey's own "hasn't published a profile" wording
+			});
 	});
 	// devtest #16: derived straight from the persisted per-peer watermark, replacing the old
 	// seenCounts in-memory snapshot (which reset to "no unread" on every remount).
