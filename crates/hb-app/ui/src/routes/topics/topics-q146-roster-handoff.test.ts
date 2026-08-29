@@ -11,7 +11,8 @@
 //   3. Hover a member → their bio, one lazy pasteKey fetch per hovered person, CACHED (a re-hover
 //      costs no second relay round-trip), and absent-means-absent: a peer whose resolve carries no
 //      bio renders the HONEST "No published profile" line, never a blank card. A REJECTED resolve
-//      lands on the same honest line — relay unreachable is not a blank either.
+//      (GLM review, 2026-08-28) is "couldn't ask", NOT "asked and there is none": it renders no
+//      bio line and the next hover retries — the rejection is never cached as final absence.
 //
 // Per CLAUDE.md §9 / P-10 these were proven red by mutating the production half each pins:
 //   - deleting the ondblclick handler reds the double-click test; deleting the Enter keydown reds
@@ -173,16 +174,30 @@ describe('QURATOR-146 — roster row hands off to chat', () => {
 		expect(container.querySelectorAll('.roster-bio')).toHaveLength(1);
 	});
 
-	it('a pasteKey REJECTION also lands on the honest absent line (relay unreachable is not a blank)', async () => {
+	it('a pasteKey REJECTION renders no bio line and a later hover retries (GLM review: a reject is not "asked and there is none")', async () => {
 		seedSelf();
 		rosterMock.mockResolvedValue([STRANGER_NPUB]);
 		listMock.mockResolvedValue(ONE_TOPIC);
-		pasteKeyMock.mockRejectedValue(new Error('relay unreachable'));
+		pasteKeyMock.mockRejectedValueOnce(new Error('relay unreachable')).mockResolvedValue({
+			npub: STRANGER_NPUB,
+			profile: { display_name: 'Stranger', bio: 'back online', tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '' },
+			collections: [], online: false, last_fetched: '',
+		});
 		const { container, findByText } = render(TopicsPage);
 		await openFirstTopic(container);
 
 		await fireEvent.mouseEnter(strangerRow(container));
-		expect(await findByText('No published profile')).toBeTruthy();
+		await waitFor(() => expect(pasteKeyMock).toHaveBeenCalledTimes(1));
+		await new Promise((r) => setTimeout(r, 20));
+		// "Couldn't ask" must NOT assert the bio absent for the session — the stated-nothing line
+		// is reserved for a resolve that genuinely carried no bio.
+		expect(container.querySelector('.roster-bio')).toBeNull();
+
+		// And a later hover retries: the relay is back and the real bio lands.
+		await fireEvent.mouseLeave(strangerRow(container));
+		await fireEvent.mouseEnter(strangerRow(container));
+		expect(await findByText('back online')).toBeTruthy();
+		expect(pasteKeyMock).toHaveBeenCalledTimes(2);
 	});
 
 	it('never wires upsert_topic_contact — no add-to-contacts affordance on the roster (owner ruling)', () => {

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, onDestroy } from 'svelte';
+	import { onMount, onDestroy, tick } from 'svelte';
 	import { get } from 'svelte/store';
 	import { goto } from '$app/navigation';
 	import { toast, contacts, identity, profile, topicAnnounceSummaries, announceSeen, topicDirectoryCache } from '$lib/stores.js';
@@ -148,7 +148,14 @@
 	let announcing = $state(false);
 	let announceTicker: ReturnType<typeof setInterval> | undefined;
 
-	onDestroy(() => { if (announceTicker) clearInterval(announceTicker); });
+	// The expand-rank coalescing timer (declared with toggleGroup below, hoisted here so the
+	// unmount cleanup can see it): a pending window that outlives the component would fire
+	// rankDrawnRows against a destroyed tree.
+	let expandRankTimer: ReturnType<typeof setTimeout> | undefined;
+	onDestroy(() => {
+		if (announceTicker) clearInterval(announceTicker);
+		if (expandRankTimer) clearTimeout(expandRankTimer);
+	});
 
 	async function sendAnnounce() {
 		if (!openTopic || !announceBody.trim() || !canAnnounce(announceRemaining) || announcing) return;
@@ -365,16 +372,29 @@
 	let rankedIds = $state(new Set<string>());
 	let rankGeneration = 0;
 	async function rankDrawnRows(generation: number) {
-		// Per-root queues of the ids that WILL be drawn (cap per group + joined rows), in draw order.
+		// Await the flush BEFORE consulting collapse state: this runs in the same turn that set
+		// `directory`, and the group-seeding $effect below (which writes collapsedRoots) has not
+		// run yet — reading isCollapsed now would see every group open.
+		await tick();
+		// Per-root queues of the ids that WILL be drawn, in draw order. Two exclusions, both because
+		// a queued id is a spent relay read:
+		//   — JOINED rows never enter the queue: the sidebar renders them from the local `mine`
+		//     record (mergedRows hardcodes member_count_estimate null for the joined half), and the
+		//     fold below only writes counts back into `directory`, so a joined id's result is
+		//     discarded — and it would still displace an unjoined row from the group's capped batch.
+		//   — COLLAPSED groups' rows wait: a queued-but-undrawn row is a read spent on nobody (GLM
+		//     review: a fresh user with everything collapsed was firing up to 6×25 reads for
+		//     invisible rows). The expand path ranks them lazily.
 		const queues: string[][] = [];
 		for (const root of TOPIC_ROOTS) {
 			const rows = rowsForRoot(root);
 			if (rows.length === 0) continue;
-			// A paint that already carried the count (a member's announce states one) IS the
-			// ordering datum — re-asking topicRank for it is the redundant call W2 forbids.
-			const drawn = rows
-				.filter((d) => !rankedIds.has(d.topic_id) && d.member_count_estimate === null)
-				.slice(0, TOPIC_GROUP_DRAW_CAP);
+			if (isCollapsed(root, true)) continue; // not drawn — not ranked until expanded
+			// The same visibleRows the template draws with — the queue is exactly what is drawn.
+			const drawn = visibleRows(rows).drawn
+				// A paint that already carried the count (a member's announce states one) IS the
+				// ordering datum — re-asking topicRank for it is the redundant call W2 forbids.
+				.filter((d) => !d.joined && !rankedIds.has(d.topic_id) && d.member_count_estimate === null);
 			if (drawn.length > 0) queues.push(drawn.map((d) => d.topic_id));
 		}
 		if (queues.length === 0) return;
@@ -434,10 +454,21 @@
 	async function confirmJoin() {
 		if (!pendingJoin) return;
 		busy = true;
+		const name = pendingJoin.name;
 		try {
-			await topicJoinPublic(pendingJoin.name);
+			await topicJoinPublic(name);
 			pendingJoin = null;
+			// The join may have been confirmed from the DETAIL pane of that same Topic: the stale
+			// unjoined selection would keep rendering "You're not a member yet" + a live Join for a
+			// Topic just joined (`directory` still carries its announce until the next paint, and
+			// `selectedDiscovered` derives from `directory`, so the stale view would win). Clear the
+			// unjoined selection and re-derive the detail from the joined record — the same
+			// joined-wins merge the sidebar row already flipped to.
+			selectedDiscoveredId = null;
+			selectedClaimed = null;
 			await loadMine();
+			const joined = mine.find((t) => t.name === name);
+			if (joined) await open(joined);
 			toast('Joined Topic', 'success');
 		} catch (e) {
 			toast(String(e), 'error');
@@ -607,16 +638,24 @@
 	// npub need not be a contact, so the bio comes from their PUBLISHED profile via pasteKey(npub) —
 	// the existing helper that resolves a profile from just an npub (chat's fetchNonContactNames uses
 	// it for the same purpose); there is no second resolution path. ONE fetch per hovered person,
-	// cached; a hover NEVER sweeps the whole roster. `false` is the honest "asked and there is none"
-	// (pasteKey resolves a profile with no bio just as truly as a profile with one), which is why the
-	// cache is Record<string, string | false> rather than omitting the falsy case.
-	let rosterBios: Record<string, string | false> = $state({});
+	// cached; a hover NEVER sweeps the whole roster. TRI-STATE (GLM review, the QURATOR-134 idiom):
+	// a string is "asked and here it is", `false` is the honest "asked and there is none" (pasteKey
+	// resolves a profile with no bio just as truly as a profile with one), and `'retry'` is "couldn't
+	// ask — relay unreachable". A REJECTED resolve must not poison the cache: caching the failure as
+	// `false` asserted the bio absent for the rest of the session, across every roster that npub
+	// appears in, with no retry; the reject is recorded only as retry-later, so a later hover asks
+	// again. A resolved empty string ('') is a REAL bio that happens to be empty — rendered as-is
+	// under the string branch, never conflated with `false`'s stated-nothing line.
+	let rosterBios: Record<string, string | false | 'retry'> = $state({});
 	const fetchingBios = new Set<string>(); // in-flight guard — hover events re-fire on jitter
 	let rosterHover: string | null = $state(null);
 
 	async function rosterBioOnHover(npub: string) {
 		rosterHover = npub;
-		if (npub in rosterBios || fetchingBios.has(npub)) return; // cached or already asking
+		// Only a RESOLVED answer is final; a reject ('retry') asks again on the next hover.
+		const cached = rosterBios[npub];
+		if (cached !== undefined && cached !== 'retry') return;
+		if (fetchingBios.has(npub)) return; // already asking
 		fetchingBios.add(npub);
 		try {
 			const resolved = await pasteKey(npub);
@@ -626,7 +665,7 @@
 			const bio = contact?.profile?.bio ?? resolved.profile?.bio ?? false;
 			rosterBios = { ...rosterBios, [npub]: bio };
 		} catch {
-			rosterBios = { ...rosterBios, [npub]: false }; // relay unreachable — absent, never blank
+			rosterBios = { ...rosterBios, [npub]: 'retry' }; // couldn't ask — NOT absent; a later hover retries
 		} finally {
 			fetchingBios.delete(npub);
 		}
@@ -715,6 +754,25 @@
 		if (next.has(root)) next.delete(root);
 		else next.add(root);
 		collapsedRoots = next;
+		// Expanding reveals rows the paint-time pass deliberately did NOT rank (collapsed groups
+		// were skipped so an invisible row never spent a read) — rank them now, lazily. Coalesced
+		// on a short window: opening several groups in quick succession (the W1 test's two-root
+		// case, or a user batch-opening) must still batch into ONE round-robin interleave, never
+		// one topicRank call per group.
+		scheduleExpandRank();
+	}
+	// The coalescing window for expand-triggered ranking (see toggleGroup). 100ms is "same burst"
+	// for human double-opens and test sequences alike, and stays imperceptible next to the relay
+	// round-trip it precedes.
+	const EXPAND_RANK_COALESCE_MS = 100;
+	function scheduleExpandRank() {
+		rankGeneration += 1; // any in-flight fold is superseded by this newer pass
+		const generation = rankGeneration;
+		if (expandRankTimer) clearTimeout(expandRankTimer);
+		expandRankTimer = setTimeout(() => {
+			expandRankTimer = undefined;
+			void rankDrawnRows(generation);
+		}, EXPAND_RANK_COALESCE_MS);
 	}
 
 	// The per-group draw cap (r4): a group draws its ~25 most popular rows and STATES the remainder
@@ -842,7 +900,10 @@
 												<div class="name">{subPathLabel(r.name) || r.name}</div>
 												{#if r.description}<div class="blurb">{r.description}</div>{/if}
 											</div>
-											<button class="btn-default" onclick={() => askToJoin(r.name, false)}>Join</button>
+											<!-- The Join button stops propagation: without it the click also bubbles into
+											     the row's own click-to-select handler, firing an unwanted extra topicRank
+											     call for a Topic the user is about to join. -->
+											<button class="btn-default" onclick={(e) => { e.stopPropagation(); askToJoin(r.name, false); }}>Join</button>
 										</div>
 									{/if}
 								{/each}
@@ -858,6 +919,17 @@
 				{#if groups.length === 0}
 					<!-- A filter that matches nothing: an honest empty, not an error. -->
 					<EmptyState message="No Topics match that path." />
+				{/if}
+				<!-- GLM review: a failed paint with JOINED rows on screen used to show NOTHING — the
+				     tree silently read as "no public Topics exist" (the exact QURATOR-80 confusion
+				     this redesign exists to avoid). Keep the still-valid joined rows visible; the
+				     failure rides BELOW them in the same retryable error dialect, never as a blank. -->
+				{#if paintError && mergedRows.length > 0}
+					<EmptyState
+						error
+						message="Couldn’t reach the relays — the directory may be stale."
+						onretry={() => { painted = false; paintError = false; void paintDirectory(); }}
+					/>
 				{/if}
 			{/if}
 			<button class="link" disabled={busy} onclick={redeemInvite}>Redeem a private Topic invite</button>
@@ -909,7 +981,7 @@
 											type="button"
 											class="roster-row"
 											title="Double-click or press Enter to open a chat with this member"
-											onfocus={() => (rosterHover = npub)}
+											onfocus={() => rosterBioOnHover(npub)}
 											onblur={() => (rosterHover = rosterHover === npub ? null : rosterHover)}
 											onmouseenter={() => rosterBioOnHover(npub)}
 											onmouseleave={() => (rosterHover = rosterHover === npub ? null : rosterHover)}
@@ -919,10 +991,12 @@
 											<PersonRow name={row.name} letter={row.letter} picture={row.picture} fingerprint={row.fingerprint} online={row.online} />
 											<span class="roster-cue" aria-hidden="true">chat ⏎</span>
 										</button>
-										{#if bio !== undefined}
+										{#if bio !== undefined && bio !== 'retry'}
 											<div class="roster-bio" role="tooltip">
 												<!-- Absent-means-absent: a resolved "no bio" is a stated nothing, never a
-												     blank card — the same honesty rule as PersonRow's omitted fingerprint. -->
+												     blank card — the same honesty rule as PersonRow's omitted fingerprint.
+												     'retry' (a rejected resolve) renders NOTHING here — it is "couldn't
+												     ask", not "asked and there is none", and the next hover asks again. -->
 												{bio === false ? 'No published profile' : bio}
 											</div>
 										{/if}
