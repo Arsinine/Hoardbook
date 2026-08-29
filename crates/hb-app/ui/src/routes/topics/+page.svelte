@@ -1,8 +1,10 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { get } from 'svelte/store';
+	import { goto } from '$app/navigation';
 	import { toast, contacts, identity, profile, topicAnnounceSummaries, announceSeen, topicDirectoryCache } from '$lib/stores.js';
 	import {
+		pasteKey,
 		topicList,
 		topicCreate,
 		topicUpdateMeta,
@@ -562,6 +564,7 @@
 		picture?: string;
 		fingerprint?: CachedPeer['fingerprint'];
 		online: boolean;
+		isSelf: boolean;
 	} {
 		const self = $identity ? { npub: $identity.npub, display_name: $profile?.display_name } : null;
 		const isSelf = self !== null && npub === self.npub;
@@ -573,7 +576,56 @@
 			picture: contact?.profile?.picture,
 			fingerprint: contact?.fingerprint,
 			online: isSelf || contact?.online === true,
+			// QURATOR-146: the hand-off is for reaching OTHER people — you cannot DM yourself, and
+			// pasteKey rejects your own code, so the self row stays a plain non-interactive row.
+			isSelf,
 		};
+	}
+
+	// ── QURATOR-146 (Topics W4) — the roster hand-off: an interest-first search ends at a list of
+	// people, and a read-only list dead-ends the flow. Contacts and Topics are two paths to the same
+	// end (owner, 2026-08-27), so the roster row hands off to Chat with the SAME gesture Contacts
+	// already uses — double-click → `/chat?peer=<npub>`. No add-to-contacts button here: owner ruling
+	// "adding someone directly from the topic makes no sense. Makes more sense to talk to them first
+	// and then add them, from the chat page" — `upsert_topic_contact` stays unused by this page.
+	// A gesture with no affordance is invisible to a first-time user, so the row is also a real
+	// button: Enter on the focused row fires the same navigation, and the hover cue says what it does.
+	function openRosterChat(npub: string) {
+		// Svelte's SPA `goto` (same as Contacts' ondblclick) — no full page reload.
+		goto('/chat?peer=' + encodeURIComponent(npub));
+	}
+
+	// QURATOR-146 — hover a member → their bio, "much like contacts". Contacts has NO hovercard: it
+	// clamps the bio on the card face (bioExpanded/bioOverflows + $lib/bio-overflow.js) and shows it
+	// whole in the detail pane. The TREATMENT is the precedent (lazy-fetched, cached,
+	// absent-means-absent); the TRIGGER (hover on a roster row) is new here because a roster row has
+	// no card face to clamp onto — the row is one line, so the bio surfaces on hover instead. A roster
+	// npub need not be a contact, so the bio comes from their PUBLISHED profile via pasteKey(npub) —
+	// the existing helper that resolves a profile from just an npub (chat's fetchNonContactNames uses
+	// it for the same purpose); there is no second resolution path. ONE fetch per hovered person,
+	// cached; a hover NEVER sweeps the whole roster. `false` is the honest "asked and there is none"
+	// (pasteKey resolves a profile with no bio just as truly as a profile with one), which is why the
+	// cache is Record<string, string | false> rather than omitting the falsy case.
+	let rosterBios: Record<string, string | false> = $state({});
+	const fetchingBios = new Set<string>(); // in-flight guard — hover events re-fire on jitter
+	let rosterHover: string | null = $state(null);
+
+	async function rosterBioOnHover(npub: string) {
+		rosterHover = npub;
+		if (npub in rosterBios || fetchingBios.has(npub)) return; // cached or already asking
+		fetchingBios.add(npub);
+		try {
+			const resolved = await pasteKey(npub);
+			// The local cache answers first for a saved contact: a petname-bearing local copy beats a
+			// possibly-staler relay copy, and skips the round-trip entirely.
+			const contact = $contacts.find((c) => c.npub === npub);
+			const bio = contact?.profile?.bio ?? resolved.profile?.bio ?? false;
+			rosterBios = { ...rosterBios, [npub]: bio };
+		} catch {
+			rosterBios = { ...rosterBios, [npub]: false }; // relay unreachable — absent, never blank
+		} finally {
+			fetchingBios.delete(npub);
+		}
 	}
 
 	// ── QURATOR-144 W2 — the self-populating sidebar ─────────────────────────────────────────
@@ -830,10 +882,44 @@
 
 					<div class="detail-section">
 						<div class="section-label">Roster ({roster.length})</div>
+						<!-- QURATOR-146: each row is a real <button> (keyboard-reachable; Enter fires the
+						     same navigation as double-click) wrapped in the hover region. The bio rides the
+						     same hover as the chat hand-off so the row explains itself once. -->
 						<ul class="roster">
 							{#each roster as npub (npub)}
 								{@const row = rosterRowProps(npub)}
-								<li><PersonRow name={row.name} letter={row.letter} picture={row.picture} fingerprint={row.fingerprint} online={row.online} /></li>
+								{@const bio = rosterHover === npub ? rosterBios[npub] : undefined}
+								<li class="roster-item">
+									{#if row.isSelf}
+										<!-- The self row keeps r1's plain non-interactive form — there is no "talk to
+										     yourself" hand-off to offer. -->
+										<div class="roster-row self">
+											<PersonRow name={row.name} letter={row.letter} picture={row.picture} fingerprint={row.fingerprint} online={row.online} />
+										</div>
+									{:else}
+										<button
+											type="button"
+											class="roster-row"
+											title="Double-click or press Enter to open a chat with this member"
+											onfocus={() => (rosterHover = npub)}
+											onblur={() => (rosterHover = rosterHover === npub ? null : rosterHover)}
+											onmouseenter={() => rosterBioOnHover(npub)}
+											onmouseleave={() => (rosterHover = rosterHover === npub ? null : rosterHover)}
+											ondblclick={() => openRosterChat(npub)}
+											onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); openRosterChat(npub); } }}
+										>
+											<PersonRow name={row.name} letter={row.letter} picture={row.picture} fingerprint={row.fingerprint} online={row.online} />
+											<span class="roster-cue" aria-hidden="true">chat ⏎</span>
+										</button>
+										{#if bio !== undefined}
+											<div class="roster-bio" role="tooltip">
+												<!-- Absent-means-absent: a resolved "no bio" is a stated nothing, never a
+												     blank card — the same honesty rule as PersonRow's omitted fingerprint. -->
+												{bio === false ? 'No published profile' : bio}
+											</div>
+										{/if}
+									{/if}
+								</li>
 							{/each}
 						</ul>
 					</div>
@@ -1053,6 +1139,46 @@
 	.desc-edit input { flex: 1; }
 	.roster { list-style: none; margin: 0; padding: 0; font-size: 12px; max-height: 200px; overflow-y: auto; }
 	.roster li { padding: 3px 0; }
+	/* QURATOR-146 — the row becomes the hover region AND the focusable hand-off. The button fills the
+	   row so the whole strip is clickable/keyboard-focusable; the cue appears only while the row is
+	   hovered or focused (the affordance a bare double-click gesture would never advertise). */
+	.roster-item { padding: 0; position: relative; }
+	.roster-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 8px;
+		width: 100%;
+		padding: 3px 4px;
+		background: transparent;
+		border: none;
+		border-radius: 5px;
+		color: inherit;
+		font: inherit;
+		text-align: left;
+		cursor: default;
+	}
+	.roster-row:hover, .roster-row:focus-visible { background: var(--bg-elev2); cursor: pointer; }
+	.roster-row:focus { outline: none; } /* :focus-visible carries the ring; a pointer click stays quiet */
+	.roster-row.self { cursor: default; } /* no hand-off for the self row — nothing to talk to */
+	.roster-cue { visibility: hidden; font-size: 10.5px; color: var(--fg-dim); white-space: nowrap; }
+	.roster-row:hover .roster-cue, .roster-row:focus-visible .roster-cue { visibility: visible; }
+	/* The bio surfaces under the row on hover/focus — inline expansion, NOT a floating hovercard
+	   (Contacts' precedent is an inline clamp + detail pane; a floating card is a new pattern this
+	   page deliberately does not introduce). max-height 0 → auto is a transition nicety only: jsdom
+	   computes no layout, so nothing here is visually proven by tests. */
+	.roster-bio {
+		margin: 2px 4px 4px 36px; /* aligns under the name, past the 24px avatar + 8px gap */
+		padding: 4px 8px;
+		font-size: 11.5px;
+		line-height: 1.45;
+		color: var(--fg-muted);
+		background: var(--bg-elev1);
+		border-left: 2px solid var(--accent);
+		border-radius: 4px;
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+	}
 	.invite { display: flex; gap: 6px; }
 	.announce-row { display: flex; gap: 6px; margin-top: 2px; }
 	.announce-row input { flex: 1; }
