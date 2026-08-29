@@ -26,6 +26,7 @@
 		unseenTopicAnnouncements,
 		TOPIC_ROOTS,
 		composeTopicPath,
+		topicRootOf,
 		subPathLabel,
 		createPrimaryAction,
 		interleaveRoundRobin,
@@ -58,15 +59,18 @@
 	// state; a later successful loadMine clears it (a stale error never hides a good list).
 	let mineLoadError = $state(false);
 
-	// Create form. W4: a PUBLIC Topic is a category root (picker — a bad root is unrepresentable) + a
-	// freeform sub-path (e.g. video / animation/anime). A PRIVATE Topic keeps a freeform name.
+	// Create form. W4: a Topic is a category root (picker — a bad root is unrepresentable) + a
+	// freeform sub-path (e.g. video / animation/anime). QURATOR-147 W5: PRIVATE Topics use the same
+	// picker — the owner ruling is that private obeys the public path convention, and before W5 the
+	// form offered private only a free-text name, so obeying meant knowing to type `video/foo` by
+	// hand (which is why legacy private Topics look like `back room`). The backend keeps a private
+	// name freeform and verbatim; `other` is the root for anything that wants a bare word.
 	let newRoot: string = $state(TOPIC_ROOTS[0]);
 	let newSubPath = $state('');
-	let newName = $state(''); // private (freeform) name
 	let newDesc = $state('');
 	let newPrivate = $state(false);
-	// The composed public path, previewed under the inputs.
-	let composedPublicName = $derived(composeTopicPath(newRoot, newSubPath));
+	// The composed path (root + sub-path), previewed under the inputs. Same for public and private.
+	let composedName = $derived(composeTopicPath(newRoot, newSubPath));
 
 	// QURATOR-144 W2 — the whole directory lives in the left pane on open. One paint fetch fills it;
 	// there is no per-root cache/retry machine anymore (that was the tab split's machine). Its
@@ -199,9 +203,9 @@
 		void paintDirectory();
 	});
 
-	// The effective name to create: a freeform private name, or the composed category path for public.
-	let createName = $derived(newPrivate ? newName.trim() : composedPublicName);
-	let canCreate = $derived(newPrivate ? newName.trim().length > 0 : composedPublicName.length > 0);
+	// The effective name to create: the composed category path (public and private alike — W5).
+	let createName = $derived(composedName);
+	let canCreate = $derived(composedName.length > 0);
 
 	// devtest #11 — join-first: before minting a new PUBLIC Topic, check (debounced) whether its
 	// composed name already has a room. A private Topic never looks up (no announce exists to find).
@@ -215,7 +219,7 @@
 	let lookupGeneration = 0;
 
 	$effect(() => {
-		const name = composedPublicName;
+		const name = composedName;
 		// Clear immediately on any input change — pending state defaults to Create, never a stale
 		// Join carried over from a previous name.
 		topicNameLookup = null;
@@ -270,7 +274,7 @@
 				painted = false;
 				void paintDirectory();
 			}
-			newName = newSubPath = newDesc = '';
+			newSubPath = newDesc = '';
 			newRoot = TOPIC_ROOTS[0];
 			newPrivate = false;
 			createOpen = false;
@@ -285,7 +289,7 @@
 			// consent gate (F12) still requires an explicit click.
 			if (!newPrivate && msg.includes('already exists')) {
 				try {
-					topicNameLookup = await topicLookup(composedPublicName);
+					topicNameLookup = await topicLookup(composedName);
 				} catch {
 					topicNameLookup = null;
 				}
@@ -673,8 +677,12 @@
 		if (!q) return mergedRows;
 		return mergedRows.filter((r) => r.name.toLowerCase().includes(q));
 	});
+	// QURATOR-147 W5: one shared root derivation (`topicRootOf`) feeds the row filter and the group
+	// seed below — a name whose first segment is not a category root (e.g. the legacy rootless
+	// private "back room") must land under `other` here exactly as it does in `groupTopicsByRoot`,
+	// or the group header and its rows would disagree.
 	function rowsForRoot(root: string): TreeRow[] {
-		return filteredRows.filter((r) => (r.name.split('/')[0] ?? 'other') === root);
+		return filteredRows.filter((r) => topicRootOf(r.name) === root);
 	}
 	let groups = $derived(groupTopicsByRoot(filteredRows));
 
@@ -684,11 +692,11 @@
 	// start collapsed, user-toggled thereafter, and force-opened by a live filter. The seed runs
 	// once per root as that root first appears (`seededRoots` is a plain Set, not state — a later
 	// reorder or repaint must never re-collapse a group the user deliberately expanded).
-	let rootsWithJoined = $derived(new Set(mine.map((t) => t.name.split('/')[0])));
+	let rootsWithJoined = $derived(new Set(mine.map((t) => topicRootOf(t.name))));
 	let seededRoots = new Set<string>();
 	$effect(() => {
 		for (const r of mergedRows) {
-			const root = r.name.split('/')[0] ?? 'other';
+			const root = topicRootOf(r.name);
 			if (seededRoots.has(root)) continue;
 			seededRoots.add(root);
 			if (!rootsWithJoined.has(root)) collapsedRoots = new Set([...collapsedRoots, root]);
@@ -994,20 +1002,18 @@
 <!-- Create-a-Topic modal (devtest #9: was an always-on card; now invoked from "+ New Topic"). -->
 <Modal open={createOpen} title="New Topic" closeOnBackdrop={false} onclose={() => (createOpen = false)}>
 	<div class="create-fields">
-		{#if newPrivate}
-			<input class="hb-input" placeholder="name (freeform, e.g. back room)" bind:value={newName} />
-		{:else}
-			<!-- W4: a public Topic is a category root (picker) + freeform sub-path. The root picker
-			     makes a non-category root unrepresentable; the backend re-validates authoritatively. -->
-			<div class="path-row">
-				<select class="hb-input" bind:value={newRoot}>
-					{#each TOPIC_ROOTS as r}<option value={r}>{r}</option>{/each}
-				</select>
-				<span class="path-sep">/</span>
-				<input class="hb-input grow" placeholder="optional sub-path (e.g. animation/anime)" bind:value={newSubPath} />
-			</div>
-			<div class="muted path-preview">Topic path: <code>{composedPublicName}</code></div>
-		{/if}
+		<!-- W4: a Topic is a category root (picker) + freeform sub-path. The root picker makes a
+		     non-category root unrepresentable; the backend re-validates authoritatively. QURATOR-147
+		     W5: the SAME picker serves private Topics — private obeys the public path convention, so
+		     the convention is the path of least resistance, not folklore. -->
+		<div class="path-row">
+			<select class="hb-input" bind:value={newRoot}>
+				{#each TOPIC_ROOTS as r}<option value={r}>{r}</option>{/each}
+			</select>
+			<span class="path-sep">/</span>
+			<input class="hb-input grow" placeholder="optional sub-path (e.g. animation/anime)" bind:value={newSubPath} />
+		</div>
+		<div class="muted path-preview">Topic path: <code>{composedName}</code></div>
 		<input class="hb-input" placeholder="description" bind:value={newDesc} />
 		<label class="check"><input type="checkbox" bind:checked={newPrivate} /> Private (unlisted)</label>
 	</div>
