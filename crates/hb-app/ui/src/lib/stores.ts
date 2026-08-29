@@ -1,5 +1,5 @@
 import { get, writable } from 'svelte/store';
-import type { CachedPeer, Collection, IdentityInfo, Profile, ReceivedMessage, DmRequestView, TopicAnnounceSummary } from './types.js';
+import type { CachedPeer, Collection, DiscoveredTopic, IdentityInfo, Profile, ReceivedMessage, DmRequestView, TopicAnnounceSummary } from './types.js';
 
 export const identity = writable<IdentityInfo | null>(null);
 export const profile = writable<Profile | null>(null);
@@ -121,6 +121,21 @@ export const readWatermarks = writable<Record<string, string>>({});
  *  nav badge derives from both together (a topic is "unseen" when its latest_ts is past its watermark). */
 export const topicAnnounceSummaries = writable<TopicAnnounceSummary[]>([]);
 export const announceSeen = writable<Record<string, number>>({});
+
+/** QURATOR-145 (Topics W3) — the cross-mount directory cache: the last-known-good painted tree.
+ *  A plain top-level `let` inside a `.svelte` file's `<script>` is re-initialized every component
+ *  instantiation, so it does NOT survive leaving the Topics route and coming back — that only
+ *  looks module-level. This module-level store does survive, and that is its entire job.
+ *
+ *  WHY ONLY NON-EMPTY WINS EVER GET WRITTEN: the QURATOR-83 bug (shipped 52ca0b2) cached an EMPTY
+ *  Discover root for the whole session, and a cached NOTHING is indistinguishable from the feature
+ *  being broken — it caused the owner's original "Discover finds nothing" report (QURATOR-80). An
+ *  empty or FAILED answer is never written, so the next open always re-asks the relays (W2's
+ *  auto-population is what makes a slightly-stale populated tree harmless: it is the landing
+ *  screen, not something you had to go clicking for). "Degrade to last-known-good" is the other
+ *  half: a FAILED fetch leaves whatever is on screen alone — never blank, never a confident
+ *  "no Topics" over data we already had. */
+export const topicDirectoryCache = writable<DiscoveredTopic[]>([]);
 
 // M22 W6: the toast timer is tracked so a second toast REPLACES the live one (chosen over queueing —
 // a queue risks undoing the wrong operation, and a stale handler firing against changed state is the

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { toast, contacts, identity, profile, topicAnnounceSummaries, announceSeen } from '$lib/stores.js';
+	import { get } from 'svelte/store';
+	import { toast, contacts, identity, profile, topicAnnounceSummaries, announceSeen, topicDirectoryCache } from '$lib/stores.js';
 	import {
 		topicList,
 		topicCreate,
@@ -174,7 +175,24 @@
 		}
 	}
 
+	// QURATOR-145 (W3) — paint the CACHED tree instantly, refresh behind it. The cache is the
+	// last-known-good directory (see `topicDirectoryCache` in stores.ts): non-empty on arrival
+	// here means a populated tree, so the landing screen is instant and a slightly-stale list is
+	// harmless (W2's auto-population made it the landing screen, not something you went clicking
+	// for). An EMPTY cache paints nothing — there is no honest "instant" screen for a nothing we
+	// never had, and the fetch alone fills the pane (the QURATOR-80/83 rule: a cached NOTHING is
+	// indistinguishable from the feature being broken, so an empty is never cached at all).
+	// `painted` STAYS FALSE with a cached paint: this is a landing screen, not an answer — the
+	// background fetch still fires below and its result replaces `directory` as normal. The
+	// cached tree renders in PAINT order only, with NO eager rankDrawnRows: ranking fires when
+	// the fresh answer lands (the paint path's own call), and an eager pass on the cached rows
+	// would both double the open-time rank calls and mark those ids ranked, suppressing the fresh
+	// answer's rank pass over the same ids (rankedIds is page state the fresh paint inherits).
 	onMount(() => {
+		const cached = get(topicDirectoryCache);
+		if (cached.length > 0) {
+			directory = cached;
+		}
 		void loadMine();
 		void paintDirectory();
 	});
@@ -306,6 +324,14 @@
 				directory = uniq;
 				painted = true;
 				paintError = false;
+				// QURATOR-145 (W3): only a NON-EMPTY answer enters the cross-mount cache. An empty
+				// is never cached (a cached NOTHING is indistinguishable from broken — the exact
+				// QURATOR-80/83 bug this workstream exists to not recreate at ten times the
+				// visibility), and a FAILURE writes nothing (the catch below), so the next open
+				// always re-asks and the last-known-good tree survives to degrade to. The screen
+				// still takes the fresh EMPTY as truth (`directory = uniq` above) — only the CACHE
+				// is protected from it.
+				if (uniq.length > 0) topicDirectoryCache.set(uniq);
 				rankGeneration += 1;
 				void rankDrawnRows(rankGeneration);
 			}
@@ -313,6 +339,11 @@
 			// QURATOR-80, one-tree form: a failed paint is a retryable error, NEVER the confident
 			// negative "no public Topics" — the surface says "we could not reach the relays" and
 			// keeps the retry affordance. `painted` stays false, so the Retry button re-paints.
+			// QURATOR-145 (W3): a failure also never touches the cross-mount cache, and it never
+			// blanks `directory` — whatever is on screen (cached-and-painted, or a fresh tree)
+			// STAYS on screen: degrade to last-known, never blank. `paintError` only renders the
+			// error branch when the tree is EMPTY (the template's `mergedRows.length === 0`
+			// guard), so a populated screen never swaps itself for the error surface either.
 			paintError = true;
 			toast(String(e), 'error');
 		} finally {
