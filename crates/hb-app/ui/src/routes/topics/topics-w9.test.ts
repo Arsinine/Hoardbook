@@ -52,8 +52,14 @@ describe('Topics page — M17 W9 shared shell', () => {
 		const open = src.indexOf('<div class="topbar-actions">');
 		expect(open).toBeGreaterThan(-1);
 		const block = src.slice(open, src.indexOf('</div>\n</div>', open));
-		expect(block).toContain('class="tabs"');
+		// QURATOR-144 W2 removed the joined/directory tab split (ONE merged tree), so the `.tabs`
+		// block this test used to demand is gone by design. What must survive: the page's primary
+		// action lives in the shared topbar actions slot, and the tree (not a tab) is what fills
+		// the list pane below it.
 		expect(block).toContain('+ New Topic');
+		expect(src).toContain('<section class="master-detail">');
+		expect(src).toContain('class="root-header"');
+		expect(src).not.toContain('class="tabs"'); // the retired tab split must not creep back
 		// The old local wrapper is retired.
 		expect(src).not.toContain('header-actions');
 	});

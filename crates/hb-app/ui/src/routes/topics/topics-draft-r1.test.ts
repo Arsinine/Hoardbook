@@ -29,7 +29,8 @@ vi.mock('$lib/api.js', () => ({
 	topicList: vi.fn().mockResolvedValue([]),
 	topicCreate: vi.fn(),
 	topicUpdateMeta: vi.fn(),
-	topicDiscover: vi.fn(),
+	topicDiscoverPaint: vi.fn().mockResolvedValue([]),
+	topicRank: vi.fn().mockResolvedValue([]),
 	topicLookup: vi.fn().mockResolvedValue({ topic_id: '', name: '', exists: false, member_count_estimate: 0 }),
 	topicJoinPublic: vi.fn(),
 	topicRedeemInvite: vi.fn(),
@@ -41,8 +42,8 @@ vi.mock('$lib/api.js', () => ({
 	topicAnnounceStatus: vi.fn().mockResolvedValue(0),
 }));
 
-import { topicDiscover, topicRoster, topicList } from '$lib/api.js';
-const discoverMock = topicDiscover as unknown as ReturnType<typeof vi.fn>;
+import { topicDiscoverPaint, topicRoster, topicList } from '$lib/api.js';
+const paintMock = topicDiscoverPaint as unknown as ReturnType<typeof vi.fn>;
 const rosterMock = topicRoster as unknown as ReturnType<typeof vi.fn>;
 const listMock = topicList as unknown as ReturnType<typeof vi.fn>;
 
@@ -194,108 +195,91 @@ describe('Hoardbook Topics draft r1 — unread pill (My Topics)', () => {
 	});
 });
 
-describe('Hoardbook Topics draft r1 — Discover search (already-fetched roots only)', () => {
+describe('Hoardbook Topics draft r1 — Discover search (one-tree form, QURATOR-144 W2)', () => {
+	// W2 replaced the per-root Discover accordion with ONE merged tree painted by a single
+	// topicDiscoverPaint on mount. The behaviours this block has protected since r1 carry over:
+	// the search is client-side over ALREADY-FETCHED data (no new fetch per keystroke), it is
+	// PATH-ONLY, a topic_id surfacing under several roots renders once (paint-side dedup), and a
+	// no-match query states it. The partial-coverage hint is GONE BY DESIGN — the one-read paint
+	// covers all six roots up front, so there is no "some roots never expanded" state to hint about.
 	const hits = [
 		{ topic_id: 'd1', name: 'video/animation/anime', description: 'cel work', tags: ['video'], member_count_estimate: 2 },
 		{ topic_id: 'd2', name: 'audio/lossless', description: '', tags: ['audio'], member_count_estimate: 5 },
 	];
 
-	async function goToDiscover(getByRole: (r: string, o?: Record<string, unknown>) => HTMLElement) {
-		await fireEvent.click(getByRole('button', { name: /discover/i }));
-		await tick();
+	async function treeReady(container: HTMLElement) {
+		await waitFor(() => expect(container.querySelector('.root-header')).not.toBeNull());
 	}
 
-	/** Expand `root` and let its fetch settle (clickRoot pattern from topics-q83). */
-	async function expandRoot(getByRole: (r: string, o?: Record<string, unknown>) => HTMLElement, root: string) {
-		await fireEvent.click(getByRole('button', { name: new RegExp(`^\\s*${root}`, 'i') }));
-		await tick();
-		await waitFor(() => expect(discoverMock).toHaveBeenCalled());
-	}
-
-	it('filters the cached roots by sub-path and fires NO extra topicDiscover call', async () => {
-		discoverMock.mockResolvedValue(hits);
-		const { getByRole, container, getByText, queryByText } = render(TopicsPage);
-		await goToDiscover(getByRole);
-		await expandRoot(getByRole, 'video');
-		const callsAfterExpand = discoverMock.mock.calls.length;
+	it('filters the merged tree by sub-path and fires NO extra fetch per keystroke', async () => {
+		paintMock.mockResolvedValue(hits);
+		const { container, getByText, queryByText } = render(TopicsPage);
+		await treeReady(container);
+		const callsAfterPaint = paintMock.mock.calls.length;
 
 		const input = container.querySelector<HTMLInputElement>('.discover-search input');
 		expect(input).toBeTruthy();
 		await fireEvent.input(input!, { target: { value: 'animation' } });
 		await tick();
 
-		// THE no-new-fetch claim: typing filtered zero extra topicDiscover calls.
-		expect(discoverMock.mock.calls.length).toBe(callsAfterExpand);
+		// THE no-new-fetch claim, one-tree form: filtering is client-side, zero extra paints.
+		expect(paintMock.mock.calls.length).toBe(callsAfterPaint);
 		// The match renders (path-only search: the sub-path label carries "animation/anime").
 		expect(getByText('animation/anime')).toBeTruthy();
 		// The non-matching root's topic does not.
 		expect(queryByText('lossless')).toBeNull();
 	});
 
-	it('Codex review 2026-08-15: dedupes a topic_id cached under more than one root', async () => {
-		// topic_discover is a TAG query, not a strict name-prefix lookup, so the same topic_id can
-		// legitimately surface under two different root queries (e.g. a legacy/externally published
-		// announce carrying multiple root-category tags). The mock returns the SAME hits list for
-		// every root, so expanding both video and audio caches d1 under both — exactly the
-		// cross-root duplication this test targets.
-		discoverMock.mockResolvedValue(hits);
-		const { getByRole, container } = render(TopicsPage);
-		await goToDiscover(getByRole);
-		await expandRoot(getByRole, 'video');
-		await expandRoot(getByRole, 'audio');
+	it('Codex review 2026-08-15: a topic_id surfacing under more than one root renders ONCE', async () => {
+		// The paint is a TAG query across all six roots, so the same topic_id can legitimately come
+		// back twice in one answer (a legacy/externally published announce carrying multiple
+		// root-category tags). The mock returns the SAME hit list twice — exactly the duplication
+		// the paint-side dedup exists to collapse.
+		paintMock.mockResolvedValue([...hits, ...hits]);
+		const { container } = render(TopicsPage);
+		await treeReady(container);
 
 		const input = container.querySelector<HTMLInputElement>('.discover-search input');
-		// 'a' matches BOTH d1 (video/animation/anime) and d2 (audio/lossless) once each per root —
-		// four raw (root, hit) pairs total before dedup, two distinct topic_ids.
+		// 'a' matches BOTH d1 (video/animation/anime) and d2 (audio/lossless) — 4 raw entries
+		// before dedup, 2 distinct topic_ids.
 		await fireEvent.input(input!, { target: { value: 'a' } });
 		await tick();
 
-		const rows = container.querySelectorAll('.search-results .tree-child');
-		expect(rows.length).toBe(2); // not 4 — one row per DISTINCT topic_id, not per (root, hit) pair
+		const rows = container.querySelectorAll('.list-pane .tree-child');
+		expect(rows.length).toBe(2); // not 4 — one row per DISTINCT topic_id
 	});
 
-	it('shows the partial-coverage hint while some roots have never been expanded', async () => {
-		discoverMock.mockResolvedValue(hits);
-		const { getByRole, container, getByText } = render(TopicsPage);
-		await goToDiscover(getByRole);
-		await expandRoot(getByRole, 'video'); // 1 of 6 roots fetched
-
-		const input = container.querySelector<HTMLInputElement>('.discover-search input');
-		await fireEvent.input(input!, { target: { value: 'anime' } });
-		await tick();
-
-		expect(getByText(/expand a category to search it too/i)).toBeTruthy();
-	});
-
-	it('shows the empty result line for a query that matches nothing cached', async () => {
-		discoverMock.mockResolvedValue(hits);
-		const { getByRole, container, getByText } = render(TopicsPage);
-		await goToDiscover(getByRole);
-		await expandRoot(getByRole, 'video');
+	it('shows the empty result line for a query that matches nothing', async () => {
+		paintMock.mockResolvedValue(hits);
+		const { container, getByText } = render(TopicsPage);
+		await treeReady(container);
 
 		const input = container.querySelector<HTMLInputElement>('.discover-search input');
 		await fireEvent.input(input!, { target: { value: 'zzz-no-such-topic' } });
 		await tick();
 
-		expect(getByText(/no public topics matching/i)).toBeTruthy();
+		expect(getByText(/no topics match that path/i)).toBeTruthy();
 	});
 
-	it('clearing the query restores the accordion', async () => {
-		discoverMock.mockResolvedValue(hits);
-		const { getByRole, container } = render(TopicsPage);
-		await goToDiscover(getByRole);
-		await expandRoot(getByRole, 'video');
+	it('clearing the query restores the full unfiltered tree', async () => {
+		paintMock.mockResolvedValue(hits);
+		const { container } = render(TopicsPage);
+		await treeReady(container);
 
 		const input = container.querySelector<HTMLInputElement>('.discover-search input');
 		await fireEvent.input(input!, { target: { value: 'animation' } });
 		await tick();
-		expect(container.querySelector('.search-results')).not.toBeNull();
+		expect(container.querySelectorAll('.list-pane .tree-child').length).toBe(1); // only d1
 
 		await fireEvent.input(input!, { target: { value: '' } });
 		await tick();
-		expect(container.querySelector('.search-results')).toBeNull();
-		// The accordion root headers are back.
-		expect(getByRole('button', { name: /^audio$/i })).toBeTruthy();
+		// The whole tree is back: both root headers, and every row findable again.
+		const headers = [...container.querySelectorAll('.root-header .root-name')].map((n) => n.textContent?.trim());
+		expect(headers).toContain('video');
+		expect(headers).toContain('audio');
+		await fireEvent.input(input!, { target: { value: 'lossless' } });
+		await tick();
+		expect(container.querySelectorAll('.list-pane .tree-child').length).toBe(1); // d2 back
 	});
 });
 
@@ -333,16 +317,11 @@ describe('Hoardbook Topics draft r1 — member count wording', () => {
 		{ topic_id: 'd1', name: 'video/anime', description: '', tags: ['video'], member_count_estimate: 41 },
 	];
 
-	it('renders NO count on the Discover rows — the count orders, never displays (r4)', async () => {
-		discoverMock.mockResolvedValue(hits41());
-		const { getByRole, container, queryByText } = render(TopicsPage);
-		await fireEvent.click(getByRole('button', { name: /discover/i }));
-		await tick();
-		await fireEvent.click(getByRole('button', { name: /^\s*video/i }));
-		await waitFor(() => expect(discoverMock).toHaveBeenCalled());
-		// Row rendered (old-lookup path still populates the accordion)…
+	it('renders NO count on the tree rows — the count orders, never displays (r4)', async () => {
+		paintMock.mockResolvedValue(hits41());
+		const { container, queryByText } = render(TopicsPage);
 		await waitFor(() => expect(container.querySelector('.tree-child')).not.toBeNull());
-		// …but no count wording anywhere on it.
+		// …but no count wording anywhere on the row.
 		expect(queryByText(/estimate/)).toBeNull();
 		expect(queryByText(/~41 members/)).toBeNull();
 		expect(queryByText(/claimed/)).toBeNull();
