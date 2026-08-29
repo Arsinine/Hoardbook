@@ -945,7 +945,6 @@
 		fetchingNames.add(npub);
 		pasteKey(npub)
 			.then((resolved) => {
-				peerDeepLinked = npub;
 				fetchingNames.delete(npub);
 				// Seed the name cache exactly as fetchNonContactNames does, so a request that later
 				// arrives from this peer renders their display name (and the guard-set entry is not
@@ -953,6 +952,23 @@
 				if (resolved.profile?.display_name) {
 					peerNameCache = { ...peerNameCache, [npub]: resolved.profile.display_name };
 				}
+				// The resolve can legitimately take tens of seconds (teaser + presence + listings,
+				// each with its own timeout — resolve_peer on the Rust side). Re-validate at LANDING
+				// time that this is still the conversation the user wants open, because selectPeer
+				// clears selectedTopic/viewingRequests/selectedRequest: a resolve that outlives the
+				// user's patience would otherwise yank them off whatever they navigated to next.
+				// Prong 1 — the URL param changed (they deep-linked/typed elsewhere). Prong 2 — a
+				// sidebar click selects WITHOUT rewriting the URL (selectPeer/selectTopic/
+				// openRequests never touch it), so the param alone can't see those; "nothing is
+				// selected" is exactly "no view has displaced the pending deep-link".
+				const stillWanted = ($page.url.searchParams.get('peer') ?? '') === npub
+					&& selectedPeer === null && selectedTopic === null && !viewingRequests;
+				// Discarded or opened, this npub is HANDLED — marking it either way stops a later
+				// $contacts settle from re-resolving a link the user already navigated away from
+				// (which would yank them back through the retry path). A FAILED resolve stays
+				// retryable: peerDeepLinked is set only here, on the catch-free path.
+				peerDeepLinked = npub;
+				if (!stillWanted) return;
 				selectPeer({
 					...resolved,
 					// A resolve that came back profileless still opens the pane — the pane itself is
