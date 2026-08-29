@@ -13,6 +13,7 @@ import {
 	composeTopicPath,
 	splitTopicPath,
 	subPathLabel,
+	topicRootOf,
 	groupTopicsByRoot,
 	sortChannelPostsAscending,
 	interleaveChannel,
@@ -161,6 +162,23 @@ describe('topics-view — W4 public Topic paths', () => {
 		expect(tree.map((g) => g.root)).toEqual(['video', 'audio']); // video before audio (root order)
 		expect(tree[0].topics.map((t) => t.name)).toEqual(['video/animation/anime', 'video/films']);
 		expect(tree[1].topics.map((t) => t.name)).toEqual(['audio/lossless']);
+	});
+});
+
+describe('topics-view — QURATOR-147 W5: private Topics obey the public path convention', () => {
+	it('a first segment that is NOT a category root routes to other — a rootless name never gets its own group', () => {
+		// The pre-W5 bug: `splitTopicPath('back room')[0] ?? 'other'` is `'back room'` (truthy), so
+		// the fallback never fired and every rootless legacy private Topic sat under a singleton
+		// group header of its own. Mutate `topicRootOf` back to `splitTopicPath(name)[0] ?? 'other'`
+		// and this reds.
+		expect(topicRootOf('back room')).toBe('other');
+		expect(topicRootOf('nonsense/sub')).toBe('other');
+		expect(topicRootOf('video/anime')).toBe('video');
+		expect(topicRootOf('other/back room')).toBe('other');
+
+		const tree = groupTopicsByRoot([{ name: 'back room' }, { name: 'other/club' }, { name: 'video/anime' }]);
+		expect(tree.map((g) => g.root)).toEqual(['video', 'other']); // no 'back room' singleton group
+		expect(tree[1].topics.map((t) => t.name)).toEqual(['back room', 'other/club']);
 	});
 });
 

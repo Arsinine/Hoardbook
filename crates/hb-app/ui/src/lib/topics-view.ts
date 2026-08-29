@@ -195,13 +195,25 @@ export interface TopicGroup<T> {
 	topics: T[];
 }
 
+/** The root group a Topic name lands under (QURATOR-147 W5): its first path segment when that
+ *  segment is one of [`TOPIC_ROOTS`], otherwise `other`. The membership check is load-bearing —
+ *  `splitTopicPath('back room')[0]` is `'back room'` itself (truthy, never undefined), so a
+ *  `?? 'other'` fallback NEVER fires and every rootless legacy private Topic used to get its own
+ *  singleton root-group header. Shared by the sidebar's per-root call sites so the page's row
+ *  filter, its group-seed rule, and this tree can never disagree about where a name lands. */
+export function topicRootOf(name: string): string {
+	const first = splitTopicPath(name)[0] ?? 'other';
+	return (TOPIC_ROOTS as readonly string[]).includes(first) ? first : 'other';
+}
+
 /** Group discovered Topics by their root category (the first path segment) for the collapsible tree
- *  (root category → sub-paths). Roots are ordered by [`TOPIC_ROOTS`]; an unexpected root sorts last.
- *  Within a root, input order is preserved (the backend already activity-ranks). */
+ *  (root category → sub-paths). Roots are ordered by [`TOPIC_ROOTS`]; a first segment that is not a
+ *  category root routes to `other` ([`topicRootOf`]). Within a root, input order is preserved (the
+ *  backend already activity-ranks). */
 export function groupTopicsByRoot<T extends { name: string }>(topics: T[]): TopicGroup<T>[] {
 	const byRoot = new Map<string, T[]>();
 	for (const t of topics) {
-		const root = splitTopicPath(t.name)[0] ?? 'other';
+		const root = topicRootOf(t.name);
 		const bucket = byRoot.get(root);
 		if (bucket) bucket.push(t);
 		else byRoot.set(root, [t]);

@@ -115,7 +115,12 @@ describe('QURATOR-83 (W2 form) — an empty paint is not terminal', () => {
 		const check = container.querySelector<HTMLInputElement>('input[type="checkbox"]');
 		expect(check).toBeTruthy();
 		await fireEvent.click(check!);
-		await fireEvent.input(getByPlaceholderText(/^name/i), { target: { value: 'back room' } });
+		// QURATOR-147 W5: private uses the SAME root picker + sub-path as public (no freeform field
+		// anymore) — `other` + `back room` composes `other/back room`.
+		const select = container.querySelector<HTMLSelectElement>('.path-row select');
+		expect(select).toBeTruthy();
+		await fireEvent.change(select!, { target: { value: 'other' } });
+		await fireEvent.input(getByPlaceholderText(/sub-path/i), { target: { value: 'back room' } });
 		await tick();
 		const createBtn = getAllByRoleLikeCreate(container);
 		await fireEvent.click(createBtn);
