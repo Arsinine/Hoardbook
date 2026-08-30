@@ -345,6 +345,13 @@
 				superseded = true;
 			} else {
 				directory = uniq;
+				// QURATOR-151 — the fresh answer carries `member_count_estimate: null` for every row
+				// (the paint half fetches no counts), so any id in `rankedIds` is now a stale "its
+				// count is on screen" claim: the repaint just wiped it. Same treatment as the W3
+				// cache-paint gives the OPEN path — an inherited rankedIds would both hide the lost
+				// counts and suppress the re-fetch (the rank filter trusts the set), degrading the
+				// group's popularity order to paint order for the rest of the session.
+				rankedIds = new Set();
 				painted = true;
 				paintError = false;
 				// QURATOR-145 (W3): only a NON-EMPTY answer enters the cross-mount cache. An empty
