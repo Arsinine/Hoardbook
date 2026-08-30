@@ -20,7 +20,7 @@ them are new:
 |---|---|
 | (i) An affordance for **C to decide** to hand out a cached envelope | **new** (nothing today can export or send a *cached* copy — `export_manifest` builds only from C's own drafts, `commands/collection.rs:892`) |
 | (ii) A **transport** from C to D | **new wiring, reuses an existing plane** (see §1) |
-| (iii) **D's acceptance gate** | **exists unchanged** — `accept_manifest_bytes` / `open_manifest`, `commands/browse.rs:736` / `:833` |
+| (iii) **D's acceptance gate** | **exists unchanged** — `accept_manifest_bytes` / `open_manifest`, `commands/browse.rs:764` / `:861` (re-verified today; drifted from `:736`/`:833`) |
 | (iv) **Public-only structural enforcement** | **new** — the incumbent fence guards the producer, and carrier 4 opens a serve path that bypasses it (§3) |
 | (v) **Staleness UX** | exists, needs a provenance dimension (§6) |
 
@@ -39,7 +39,8 @@ which is exactly what the existing ticket machinery already models.
   envelopes it has cached: reuses `ManifestPlane`, `ManifestSource`, `TransportTicket`,
   `claim_manifest_ask`/`spend_manifest_ask`, and the redeem-on-arrival flow wholesale. Covers the
   full envelope size range the plane already handles (16 MB; pinned by
-  `a_multi_megabyte_manifest_crosses_a_real_connection`, `transport.rs:1188`). **RECOMMENDED.**
+  `a_multi_megabyte_manifest_crosses_a_real_connection`, `transport.rs:1209`, drifted from `:1188`).
+  **RECOMMENDED.**
 - **T2 — DM the envelope directly.** Rejected: a NIP-17 gift-wrapped DM is NIP-44-bounded (~64 KB
   plaintext) while a manifest is bounded at 16 MB, so this is a partial feature for anything but
   small collections, and chunking DMs is a new split protocol (Simplicity First violation).
@@ -64,19 +65,22 @@ fails closed on an unlisted iroh user, which is the guard working).
 Actors: **A** owner (offline), **C** cache-holder, **D** requester.
 
 1. D browses A's teaser via share code; it truncates. D clicks *Ask owner* — the request-DM goes to
-   A's inbox (`request_manifest`, `commands/chat.rs:930`) and sits unanswered. Dead end, as today.
+   A's inbox (`request_manifest`, `commands/chat.rs:931`, drifted from `:930`) and sits unanswered.
+   Dead end, as today.
 2. D, in chat with C (an existing contact — a stranger hits C's Q7 Request bucket, `dm_quarantine.rs`,
    and nothing is answerable until accepted), sends a **forward-request**: the same tagged
    `manifest_request` body with one new optional field —
    `{hb:"manifest_request", author_npub: A, slug, fingerprint_seen, ask_nonce}`.
    `author_npub` absent = the existing meaning (you, the recipient, own it). This is exactly how
-   `ask_nonce` was added (`chat.rs:859-925`; wire-freeze precedent test at `chat.rs:1168`).
+   `ask_nonce` was added (`new_ask_nonce`/`build_manifest_request`, `chat.rs:855-921`, drifted from
+   `:859-925`; wire-freeze precedent test `manifest_request_ask_nonce_is_wire_frozen` at
+   `chat.rs:1169`, drifted from `:1168`).
 3. C's chat recognises it (a sibling of `lib/transport-ticket.ts`'s recognisers) and shows a card:
    *"D asks for A's «slug» — you hold a cached copy from <date>*"** only when C's cache has an entry
    for `(A_npub, slug)`; otherwise the card shows the ask plainly and C answers in prose. C's human
    clicks **Send cached copy**. (M17 ruling #4 holds: nothing auto-sends.)
 4. C's side — a new command `send_cached_manifest(npub, author_npub, slug)`, a thin sibling of
-   `send_full_list` (`commands/fulfil.rs:83`):
+   `send_full_list` (`commands/fulfil.rs:90`, drifted from `:83`):
    - resolve the cache entry (`manifest_cache::get`, keyed `(npub, slug, fingerprint)`; when D's
      request carried `fingerprint_seen`, prefer the matching entry, else C's newest);
    - parse `ManifestEnvelope::from_json`, **verify `envelope.verify_author(A)` before anything
@@ -87,14 +91,14 @@ Actors: **A** owner (offline), **C** cache-holder, **D** requester.
    - `record_issued_ticket` (the redeem-time contact check that follows is **C's** standing for
      **D**, which is the correct semantics: C is the issuer now);
    - DM the ticket to D — unchanged.
-5. D's side — `redeem_manifest_ticket` (`fulfil.rs:223`) with one scoping change: the ask-ledger
-   key and the `accept_manifest_bytes` call use `author_npub` where they today use the responder's
-   npub. `claim_manifest_ask`'s durable atomic claim, `fetch_manifest`'s inside-the-ACK-window
-   gate, `spend_manifest_ask` after success: all unchanged.
+5. D's side — `redeem_manifest_ticket` (`fulfil.rs:247`, drifted from `:223`) with one scoping
+   change: the ask-ledger key and the `accept_manifest_bytes` call use `author_npub` where they
+   today use the responder's npub. `claim_manifest_ask`'s durable atomic claim, `fetch_manifest`'s
+   inside-the-ACK-window gate, `spend_manifest_ask` after success: all unchanged.
 6. D's gate is `accept_manifest_bytes(npub = A, expected_slug = ticket.slug, raw, newest_fp =
    D's teaser fingerprint, cache_required = true)` — the **same function**, per the W4 extraction
-   rule ("one path, so there is nothing to drift", `browse.rs:736`). Author pinned to A, signature
-   before decrypt, slug bound, completeness required, staleness flagged.
+   rule ("one path, so there is nothing to drift", `browse.rs:764`, drifted from `:736`). Author
+   pinned to A, signature before decrypt, slug bound, completeness required, staleness flagged.
 
 ### 1.3 How this diverges from `seal → bind → mint → record → DM`
 
@@ -109,10 +113,12 @@ Actors: **A** owner (offline), **C** cache-holder, **D** requester.
 
 ### 1.4 Named touch-points
 
-- `crates/hb-app/src/transport.rs` — `FetchRequest`, `ManifestSource` (trait signature, §3),
-  `serve_manifest_stream` (slug-binding check needs no change: A's envelope declares A's bare slug
-  and the ticket still carries that slug; the *author* is pinned separately, below),
-  `issue_ticket`.
+- `crates/hb-app/src/transport.rs` — `ManifestSource::payload` **widens from `fn payload(&self, slug:
+  &str)` to `fn payload(&self, request_id: &str)`** (real signature verified at `transport.rs:178`;
+  real call site `source.payload(&issued.ticket.slug)` at `transport.rs:314` — see §3 for why the
+  slug-only shape cannot carry carrier 4 and what replaces it). `FetchRequest`,
+  `serve_manifest_stream` (slug-binding check itself needs no change: A's envelope declares A's bare
+  slug and the ticket still carries that slug; the *author* is pinned separately, below), `issue_ticket`.
 - `crates/hb-core/src/ticket.rs` — `TransportTicket` gains
   `#[serde(default, skip_serializing_if = "Option::is_none")] pub author_npub: Option<String>`
   (`None` = issuer's own collection). Follow the `ask_nonce` precedent rather than bumping
@@ -129,7 +135,12 @@ Actors: **A** owner (offline), **C** cache-holder, **D** requester.
   recogniser.
 - `crates/hb-app/src/store.rs` — `record_manifest_ask` / `claim_manifest_ask` / `spend_manifest_ask`
   key widened to include the author (lenient-load pattern for pre-existing entries: an ask recorded
-  without an author is `author = the asked peer`, i.e. today's semantics).
+  without an author is `author = the asked peer`, i.e. today's semantics). **`IssuedTicketRecord`
+  (`store.rs:1276`, fields verified: `ticket`, `redeemer_npub`, `consumed_at`, `delivered_bytes` —
+  no cache key today) gains `served_fingerprint: Option<String>`**, set by `send_cached_manifest` at
+  mint time to the fingerprint of the cache entry the human actually approved. This is the resolved
+  cache key §3 depends on: serve time replays a mint-time decision instead of re-resolving "newest
+  for slug".
 - `crates/hb-app/src/commands/browse.rs` — `accept_manifest_bytes` unchanged (that is the point);
   caller passes A's npub.
 
@@ -143,17 +154,18 @@ entitlement check should be built.** The reasoning, sharpened:
 - **Content authenticity is already unforgeable by C.** The envelope is BIP-340-signed by A over
   `manifest_v‖created_at‖slug‖fingerprint‖sha256` (`hb-core/src/manifest.rs`), and D's gate pins
   the author to the browsed peer *before* the signature is checked, then the signature before any
-  decrypt (`open_manifest`, `browse.rs:833`). C passing off its own envelope as A's fails
-  `verify_author`. C passing off a tampered A envelope fails the digest. Nothing to add.
+  decrypt (`open_manifest`, `browse.rs:861`, drifted from `:833`). C passing off its own envelope as
+  A's fails `verify_author`. C passing off a tampered A envelope fails the digest. Nothing to add.
 - **Entitlement is the browse key, and only D can evaluate it.** The body is browse-key symmetric;
   D without A's key gets ciphertext. C cannot hand D a key D does not have — C can only hand
   ciphertext (C may itself be a *pure carrier*, unable to read what it re-serves; verified: the
   cache stores envelopes and nothing in the re-serve path needs to decrypt). So the entitlement
   check already exists, already runs on D, and is already unforgable by the serving party.
 - **What C's side actually needs is C's own consent gate** — and that is precisely what reusing the
-  ticket machinery gives: `contact_standing` re-read at redeem time (`manifest_source.rs:24-41`,
-  verified exactly) means a D that C removed after approving loses the re-serve exactly as a
-  removed contact loses an owner-issued ticket today. The revocability property survives with C in
+  ticket machinery gives: `contact_standing` (`manifest_source.rs:30-42`, drifted from the
+  `:24-41`/`:30-44` this document cited inconsistently before — the function's real span is 30-42),
+  re-read live in `issued()`, means a D that C removed after approving loses the re-serve exactly as
+  a removed contact loses an owner-issued ticket today. The revocability property survives with C in
   A's chair.
 - **C-side provenance fence (new, and required):** C must verify the envelope's author against the
   *requested* author before serving. Without it, a D could request `(author = A, slug = s)` and be
@@ -167,7 +179,8 @@ anyway") was **wrong**, and understated what carrier 4 gives away. Two cases def
 
 - **Block without re-key.** A removes or blocks D *after* approving it. Today `contact_standing`
   returns Unknown/Blocked and `authorize_redemption` refuses the redemption
-  (`manifest_source.rs:30-44`, `ticket.rs:257-276`). Under carrier 4, C serves D directly and — if
+  (`manifest_source.rs:30-42`, `ticket.rs:290-307`, drifted from `:257-276`). Under carrier 4, C
+  serves D directly and — if
   C's cache is *current* — D receives the current full manifest **it never held**. "Could have
   retained anyway" is a possession conflation: the whole point of the feature is that D does *not*
   already hold the snapshot.
@@ -197,42 +210,113 @@ consistent with every other consent surface in the app.
 ## 3. Structural public-only enforcement
 
 **The gap, sharpened:** `build_slug_manifest` refuses `Visibility::Private`
-(`commands/collection.rs:830`, red test `build_slug_manifest_refuses_a_private_collection` at
-`:2507` — verified). That fence guards the **producer**. Carrier 4's serve path reads the **cache**,
-not the producer, so the incumbent fence does not gate it. This is the concrete instance of the
-tracker's "enforced structurally rather than by comment".
+(`commands/collection.rs:830`, the check itself at `:841`; red test
+`build_slug_manifest_refuses_a_private_collection` now at `:2861` — line moved from the `:2507` this
+document originally cited, drifted by QURATOR-161's 638-line `collection.rs` growth on 2026-08-30;
+re-verified against HEAD today). That fence guards the **producer**. Carrier 4's serve path reads the
+**cache**, not the producer, so the incumbent fence does not gate it. This is the concrete instance of
+the tracker's "enforced structurally rather than by comment".
 
 Verified foundation: a private collection **has no `ManifestEnvelope` representation at all** — it
 seals via `priv_listing`'s per-recipient CEK wrap over nostr seal/gift-wrap events
 (`hb-core/src/priv_listing.rs:1-22`), never truncates, never enters `parse_manifest_source`, and the
-manifest cache (whose only production writer is `accept_manifest_bytes`, verified by a per-file
-count sweep: `manifest_cache::put` appears in exactly one production site, `browse.rs`; one read
-site, `resolve_from_cache`) stores only envelopes. So the type is the first fence — but per
-INV-4′'s own logic and CLAUDE.md §9 ("any one mechanism alone is just a comment"; "assume any
-privacy guard is decorative until a mutation of production code reds it"), it needs company:
+manifest cache stores only envelopes. Re-counted today, by hand, against HEAD (not yet by a CI
+sweep — that gap is fix (b) below): `manifest_cache::put` appears **3 times** in `crates/hb-app/src`
+— **exactly 1 production call site**, `commands/browse.rs:799` inside `accept_manifest_bytes`, and 2
+test-only sites (`commands/browse.rs:1246`, inside `#[test] fn
+resolve_from_cache_upgrades_a_truncated_teaser_and_gates_on_the_signed_fingerprint`; `store.rs:2002`,
+inside `mod tests`) — both after their file's `#[cfg(test)]` boundary (`browse.rs:994`,
+`store.rs:1426`). So the type is the first fence — but per INV-4′'s own logic and CLAUDE.md §9
+("any one mechanism alone is just a comment"; "assume any privacy guard is decorative until a
+mutation of production code reds it"), it needs company. Two things changed here from the prior pass
+of this document, both forced by adversarial review:
 
-1. **Type/seam fence — LOAD-BEARING.** The re-serve source's payload function takes **only a cache
-   key** — `(author_npub, slug, fingerprint)` — and returns a `ManifestPayload` obtainable solely
-   via `ManifestEnvelope::from_json` → `verify_integrity` → `verify_author` →
-   `ManifestPayload::seal`. No `Vec<u8>` parameter, no path, no event, no fallback source. This
-   mirrors `ManifestSource::payload`'s documented seam ("no path parameter and no byte-slice
-   parameter… mechanism 1 reaching one layer up from the type into the seam") and, one layer
-   further, `ManifestPayload`'s constructor discipline. A private listing cannot physically enter
-   the path because no value of the input type can name one.
+**(a) The load-bearing fence's real shape.** The previous draft of this section specified a re-serve
+`payload` function "keyed on `(author_npub, slug, fingerprint)`". That does not match the seam: the
+actual trait method is `fn payload(&self, slug: &str) -> Result<ManifestPayload>`
+(`transport.rs:178`), called as `source.payload(&issued.ticket.slug)` (`transport.rs:314`) —
+**slug only**, and `TransportTicket`'s fields are exactly `hb`, `ticket_v`, `request_id`, `slug`,
+`node_addr`, `issued_at`, `ask_nonce` (`hb-core/src/ticket.rs:98-123`, verified against HEAD) — no
+author, no fingerprint. Resolving "newest cached envelope for this bare slug" at serve time is a real
+bug, not a simplification: slugs are bare names, so C holding both B's «roms» and A's «roms» would
+serve **B's envelope under an A-scoped ask**. D's gate refuses it on the author pin — but only *after*
+`authorize_redemption` has already granted the ticket and `into_consumed` has run, which is exactly
+the spurious-spend the mint-time fence in §2 exists to prevent (that fence runs at mint, not serve).
+
+Two routes were open: widen the shared `ManifestSource` trait to carry more than a bare slug (cost:
+touches the owner-issuer path too, the drift risk the one-seam rule exists for), or accept "newest for
+slug" and its cross-tenant collision. **This design takes the widening route**, in its narrowest
+form: `ManifestSource::payload` changes from `fn payload(&self, slug: &str)` to `fn payload(&self,
+request_id: &str)`. `request_id` is not a new concept at this seam — `IssuedTicketRecord`s are
+already stored keyed by exactly that string (`store.rs`'s `load_issued_tickets: HashMap<String,
+IssuedTicketRecord>`, verified), and `issued()` was just called with the same `request_id` one line
+above the `payload()` call in `serve_manifest_stream`. Each implementation resolves its own payload
+from it:
+- **Owner path** (`StoreManifestSource`, unchanged behavior): looks up its own issued-ticket record
+  for `request_id` to recover `slug`, then `build_slug_manifest(slug)` exactly as today — ruling ②
+  ("built from the collection as it is NOW") is untouched, because C's cache-serving branch is a
+  different code path in the same struct, not a change to this one.
+- **Cache-serving branch** (new, in the same `StoreManifestSource`): looks up the *same* issued-ticket
+  record, reads `ticket.author_npub` (Some when this is a re-serve) and the new
+  `IssuedTicketRecord.served_fingerprint` (§1.4, `store.rs`) — the exact `(author_npub, slug,
+  fingerprint)` triple the human approved when `send_cached_manifest` minted this ticket — and fetches
+  that exact `manifest_cache` entry. **Resolution happens once, at mint, under the human's "Send
+  cached copy" click; serve time replays it rather than re-guessing "newest for slug".** This is the
+  fix `IssuedTicketRecord` needed and did not have (§1.4 adds `served_fingerprint`).
+
+This keeps the load-bearing property `payload` always had — the parameter is an opaque identifier
+(a `request_id` string is no more of a byte-slice-or-path escape hatch than a `slug` string was), it
+still returns only a `ManifestPayload` obtainable via `ManifestEnvelope::from_json` →
+`verify_integrity` → `verify_author` → `ManifestPayload::seal`, and it still never accepts a
+`Vec<u8>`, a path, an event, or a fallback source. A private listing cannot physically enter the path
+because no value of `request_id`'s type can name one — the fence in the numbered list below still
+holds, restated against the real signature:
+
+1. **Type/seam fence — LOAD-BEARING.** `ManifestSource::payload(&self, request_id: &str) ->
+   Result<ManifestPayload>` (widened as above). No `Vec<u8>` parameter, no path, no event, no
+   fallback source; a `ManifestPayload` is obtainable solely via `ManifestEnvelope::from_json` →
+   `verify_integrity` → `verify_author` → `ManifestPayload::seal`. This mirrors the seam's existing
+   documented discipline ("no path parameter and no byte-slice parameter… mechanism 1 reaching one
+   layer up from the type into the seam", `transport.rs:170-172`) and, one layer further,
+   `ManifestPayload`'s constructor discipline.
 2. **Compile-shape pin (red-testable).** A `compile_fail` doctest in the re-serve module, same
    trick as `RedemptionGrant::into_consumed` (`ticket.rs`): calling the serve function with raw
    bytes / an event / a draft does not compile. The mutation this reds on: a later edit widening
    the signature "just to also support X".
-3. **Runtime red tests.** (a) A `(author, slug)` key with **no cache entry errors — never falls
-   through** to any other source (reds on a later "helpful" fallback to `build_slug_manifest`,
-   which would silently serve C's own same-slug collection as if it were A's). (b) An envelope that
-   fails `verify_author(requested author)` is refused before `seal` (§2's fence). (c) **Stale
-   non-clobber** (§6): a re-served older fingerprint must not shadow a newer teaser.
-4. **CI sweep — defence in depth.** Extend the INV-4′-style sweep in `.github/workflows/ci.yml:79+`
-   with a re-serve-surface probe: the re-serve module (and `manifest_cache.rs`) must not reference
-   `priv_listing`, `seal_private_listing`, `private_audience`, or `browse_private`; sweep at the
-   source with comment-stripping (the sweep already implements `code_only`) and per-file counts,
-   absolute paths, `command -v` the tool — per the P-5 / `rg -E` traps in CLAUDE.md.
+3. **Runtime red tests.** (a) A `request_id` whose `IssuedTicketRecord` has no `served_fingerprint`
+   (owner-issued, not a re-serve) never falls through to the cache; a `request_id` whose
+   `served_fingerprint` names a cache-miss **errors — never falls through** to any other source
+   (reds on a later "helpful" fallback to `build_slug_manifest`, which would silently serve C's own
+   same-slug collection as if it were A's). (b) An envelope that fails `verify_author(requested
+   author)` is refused before `seal`, at mint time (§2's fence) — proving the *stored*
+   `served_fingerprint` can only ever point at an author-checked entry. (c) **Stale non-clobber**
+   (§6): a re-served older fingerprint must not shadow a newer teaser.
+4. **CI sweep — defence in depth, two probes.**
+   - **(existing shape) Re-serve-surface probe.** Extend the INV-4′-style sweep in
+     `.github/workflows/ci.yml:79` (confirmed unmoved — "INV-4′ sweep — the plane carries manifests,
+     never collection files" is still the step name at that line) with a re-serve-surface probe: the
+     re-serve module (and `manifest_cache.rs`) must not reference `priv_listing`,
+     `seal_private_listing`, `private_audience`, or `browse_private`; sweep at the source with
+     comment-stripping (the sweep already implements `code_only`) and per-file counts, absolute
+     paths, `command -v` the tool — per the P-5 / `rg -E` traps in CLAUDE.md.
+   - **(b) NEW — `manifest_cache::put` single-writer allowlist.** This is fix (b) this pass adds:
+     "exactly one production writer" was, until today, hand-verified prose, not a CI gate — a later
+     feature writing private data into the cache would break the fence silently, because the existing
+     sweep greps for `priv_listing`, not for new `put` call sites. Per CLAUDE.md §9 ("a hand-written
+     list of sites cannot fix a hand-written list of sites — invert to an allowlist with per-file
+     counts"), the new step must: grep `crates/hb-app/src` for both the qualified form
+     (`manifest_cache::put\(`, for external callers) and the bare form (`\bput\(` within
+     `manifest_cache.rs` itself, since a same-module caller does not need the `manifest_cache::`
+     prefix — verified today that this bare form is what the module's own tests already use, so the
+     probe must not miss it); restrict each file's scan to the region **before** its first
+     `#[cfg(test)]` line (verified boundaries: `browse.rs:994`, `store.rs:1426`,
+     `manifest_cache.rs:142`) so test fixtures don't count as writers; comment-strip with the
+     existing `code_only`; print one line per file scanned — `<absolute path>: <count>` — so "0 hits"
+     reads as "0 hits across N files scanned", never as "did the sweep run at all"; and fail unless
+     the non-test hits are **exactly one**, at **`crates/hb-app/src/commands/browse.rs`**. Any second
+     production site, or a site outside `commands/browse.rs`, fails the build. This is the mechanism
+     that makes today's hand count (3 total, 1 production, both above) durable instead of a one-time
+     observation.
 
 Which is load-bearing: **#1**. #2–#4 are decoration until each is shown red by a mutation of
 production code (P-10); the implementation ticket must include the mutation runs, not just the
@@ -286,16 +370,17 @@ reveal the affordance needs to exist; it is not advertising in the publish sense
 
 ## 6. Staleness UX
 
-Existing treatment, verified: `ImportedManifest.stale` (`browse.rs:655`) → toast *"Imported an
-older version of this list — ask the owner for a fresh manifest."* at
-`ui/src/routes/browse/+page.svelte:221`; the owner-side note in
-`ui/src/lib/components/ManifestFulfilCard.svelte:64`; the field documented at
-`ui/src/lib/types.ts:93`. Under carrier 4 the message is wrong in two ways: the owner cannot be
-asked (offline), and the user cannot tell **who served this or how old it is**.
+Existing treatment, verified: `ImportedManifest.stale` (`browse.rs:683`, drifted from `:655`) →
+toast *"Imported an older version of this list. Ask the owner for a fresh manifest."* at
+`ui/src/routes/browse/+page.svelte:238` (drifted from `:221`; exact current copy re-verified above —
+period, not em dash, between the two sentences); the owner-side note in
+`ui/src/lib/components/ManifestFulfilCard.svelte:64` (re-verified, unmoved); the field documented at
+`ui/src/lib/types.ts:93` (re-verified, unmoved). Under carrier 4 the message is wrong in two ways:
+the owner cannot be asked (offline), and the user cannot tell **who served this or how old it is**.
 
 Changes:
 
-- `ImportedManifest` (Rust `browse.rs:655`, TS mirror `ui/src/lib/types.ts`) gains
+- `ImportedManifest` (Rust `browse.rs:683`, drifted from `:655`; TS mirror `ui/src/lib/types.ts`) gains
   `served_by: Option<String>` (C's npub) and `cached_at: Option<u64>`. `collection.manifest_imported_at`
   already carries the envelope's own `created_at` (set in `open_manifest`) — surface it rather than
   inventing a second clock.
@@ -310,9 +395,10 @@ Changes:
   slug, nonce) identity so a re-serve ticket is redeemed on arrival exactly like an owner ticket.
 
 **A property worth pinning (verified, needs a test):** the cache is keyed
-`(npub, slug, fingerprint)` and `resolve_from_cache` gates on the *teaser's* fingerprint
-(`browse.rs:797`, requiring `envelope.snapshot_fingerprint == fingerprint`), so an older re-serve
-lands *beside*, never *over*, a newer teaser — the existing keying already prevents stale-clobber.
+`(npub, slug, fingerprint)` and `resolve_from_cache` (`browse.rs:825`, drifted from `:797`) gates on
+the *teaser's* fingerprint (the refusal check itself at `browse.rs:844`: `if
+envelope.snapshot_fingerprint != fingerprint`), so an older re-serve lands *beside*, never *over*, a
+newer teaser — the existing keying already prevents stale-clobber.
 Write the discriminator test in the same commit (P-13: attribute-pinning suites are blind to shape).
 
 Gates for the UI work: vitest with `--pool=forks --no-file-parallelism`, the `svelteTesting()`
@@ -339,7 +425,7 @@ The re-serve logic lives in hb-app (cache, source, commands, UI), so:
 
 | Piece | Suite | Notes |
 |---|---|---|
-| `TransportTicket.author_npub` wire freeze | hb-core unit (`wire_freeze.rs` pattern) | present-field, absent-field, and wrong-discriminator cases; mirrors the `ask_nonce` freeze test at `chat.rs:1168` |
+| `TransportTicket.author_npub` wire freeze | hb-core unit (`wire_freeze.rs` pattern) | present-field, absent-field, and wrong-discriminator cases; mirrors the `ask_nonce` freeze test at `chat.rs:1169` (drifted from `:1168`) |
 | request-body `author_npub` freeze | hb-app unit (`commands/chat.rs` tests) | same three cases |
 | re-serve source: cache-miss errors, no fallthrough, author-pin refusal, `verify_author` before `seal` | hb-app unit | each with its named mutation run (P-10) |
 | compile-shape pin (raw bytes / event / draft don't compile) | hb-app `compile_fail` doctest | the `into_consumed` trick |
@@ -367,7 +453,8 @@ The re-serve logic lives in hb-app (cache, source, commands, UI), so:
 3. **Owner ruling ③ (2026-07-31) scope** — a node that has never published its own collection
    becomes a *listener* on the manifest plane when it re-serves. The ruling's rationale ("a
    redeemer should not listen merely because it redeemed" — the probeable liveness oracle,
-   `transport.rs:720-737`) is respected: C listens because C *serves*, and C's node id reaches
+   `bind_client_endpoint`'s doc comment, `transport.rs:724-740`, drifted from `:720-737`) is
+   respected: C listens because C *serves*, and C's node id reaches
    others only inside C's own tickets, the same containment A has. Confirm this reading.
 4. **Wire change route** — optional `author_npub` on `TransportTicket` and the request body via the
    `ask_nonce` serde-default precedent (no `TICKET_V` bump), vs a discriminant bump. CLAUDE.md says
@@ -387,14 +474,32 @@ addressed in §2/§3); INV-5, INV-8 (no new deletion semantics).
 
 ## 9. Verification notes — what was and wasn't confirmed
 
+**2026-08-30 pass (this revision):** all six owner rulings resolved; two adversarial-review findings
+fixed (§3's fence mechanism corrected to match the real `ManifestSource::payload` seam, and a
+concrete CI allowlist specified for the `manifest_cache::put` single-writer claim); every `file:line`
+citation in this document was re-checked against HEAD (`feffec8`) with `grep -n`, individually listed
+inline at each citation rather than re-listed here. Net result: `collection.rs:830` and `:892` were
+unchanged (QURATOR-161's 638 new lines in that file landed *after* both cited functions); every other
+cited line in `browse.rs`, `chat.rs`, `fulfil.rs`, `transport.rs`, `ticket.rs`, and
+`manifest_source.rs` had drifted from unrelated commits between 2026-08-26 (when this document was
+first written) and today, by amounts from 1 to 354 lines — all corrected in place, each flagged with
+its old value. `ci.yml:79`, `types.ts:93`, `ManifestFulfilCard.svelte:64`, `hb-net/src/browse.rs:485`,
+and `hb-core/src/priv_listing.rs:1-22` were re-checked and found unmoved. One citation was not just
+stale but **wrong on the content, not only the line**: the browse-page stale toast's copy is
+"Imported an older version of this list. Ask the owner for a fresh manifest." (period, sentence
+case) — this document had it as an em-dash-joined single sentence; corrected in §6. `manifest_cache::put`
+was re-counted from source today (not re-run through any CI mechanism, because none exists yet — that
+absence is exactly FIX 2 in §3): 3 total occurrences, 1 production (`browse.rs:799`), 2 test-only
+(`browse.rs:1246`, `store.rs:2002`), both confirmed past their file's `#[cfg(test)]` boundary.
+
 **Verified against the code (all claims above rest on these):**
 
 - `manifest.rs` head doc: "Browse-key symmetric, not per-recipient (M16 decision): access = holding
   the full `hbk1…` share code" — present, in the module doc block around lines 22-28.
 - `priv_listing.rs:1-22`: per-recipient CEK wrap; private collections never truncate, never produce
   an envelope.
-- `manifest_source.rs:24-41`: `contact_standing` (block → decline → contact-hood; `Unknown`
-  refused), re-read live in `issued()`.
+- `manifest_source.rs:30-42` (drifted from `:24-41`): `contact_standing` (block → decline →
+  contact-hood; `Unknown` refused), re-read live in `issued()`.
 - `transport.rs`: `FetchRequest`, `ManifestSource` seam, `serve_manifest_stream` gate order
   (issued → ticket equality → `authorize_redemption` → payload → slug binding → send → ACK →
   consume), `ManifestPlane` in-flight/poisoned sets, `fetch_manifest` with the accept-gate inside
@@ -408,9 +513,13 @@ addressed in §2/§3); INV-5, INV-8 (no new deletion semantics).
   completeness → cache write, `cache_required` semantics), `open_manifest` (stale =
   `!matches_fingerprint`, surfaced never blocking), `resolve_from_cache` fingerprint gate.
 - `manifest_cache.rs`: `(npub, slug, fingerprint)` keying, LRU, `CacheEntry` carries its key
-  fields in plaintext. Per-file count sweep: `manifest_cache::put` has exactly one production call
-  site (`browse.rs`), `get` one (`resolve_from_cache`); the other hits are `store.rs` tests.
-- `collection.rs:830` + `:2507`: `build_slug_manifest` refuses Private, with its red test.
+  fields in plaintext. Re-counted today by hand (not yet by CI — §3 FIX 2): `manifest_cache::put`
+  has exactly one production call site (`browse.rs:799`), `get` one (`resolve_from_cache`,
+  `browse.rs:825`); the other `put` hits are test-only, in `browse.rs:1246` and `store.rs:2002`.
+- `collection.rs:830` + `:2861` (test line drifted from `:2507` — the only citation this document
+  had into `collection.rs` whose line number QURATOR-161 actually moved; the function-definition
+  citations `:830` and `:892` were unaffected): `build_slug_manifest` refuses Private, with its red
+  test `build_slug_manifest_refuses_a_private_collection`.
 - `hb-it/Cargo.toml`: depends on hb-core, hb-net, nostr-sdk, nostr, tokio, anyhow, serde_json,
   chrono, tracing-subscriber — **no hb-app**. `hb-wan-it` is a bin inside hb-app.
 - `ci.yml:79+`: the INV-4′ sweep, `TRANSPORT_FILES`, the fails-closed iroh-user scan, and
