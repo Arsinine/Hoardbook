@@ -3581,3 +3581,175 @@ mod collection_command_guards_b {
     //   - `export_collection` (line 1071): `is_valid_slug` guard at line 1078, and the
     //     "Collection '{safe_slug}' not found" guard at line 1083. Same shape — no `*_inner`.
 }
+
+/// The five commands above (`publish_collection`, `export_manifest`, `unpublish_collection`,
+/// `update_collection_visibility`, `export_collection`) hold their guards INLINE with no
+/// extractable `*_inner`, and take `State<'_, DataStore>` (plus, for three of them,
+/// `State<'_, SharedIdentity>` / `State<'_, SharedRelay>`) — so `collection_command_guards_b`
+/// reported them OWED, reachable only by enabling `tauri`'s `test` feature. That feature is now
+/// on (`hb-app/Cargo.toml` dev-dependencies), and `collection_command_guards_a`'s `guard_app()`
+/// pattern (mock `tauri::App`, `.manage()` the same states the real app manages) already proves
+/// the route works for sibling commands in this same file. This module drives all seven guards
+/// listed as OWED above through that same route.
+#[cfg(test)]
+mod collection_command_guards_c {
+    use super::*;
+    use tauri::Manager;
+    use tempfile::TempDir;
+
+    fn guard_app() -> (TempDir, tauri::App<tauri::test::MockRuntime>) {
+        let app = tauri::test::mock_app();
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        app.manage(store);
+        let identity: SharedIdentity = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        app.manage(identity);
+        app.manage(net::new_shared());
+        (dir, app)
+    }
+
+    // -- publish_collection (line 808) -------------------------------------------------------
+
+    /// With no identity loaded, `publish_collection` refuses before touching the store or relay.
+    /// Pins the "No identity loaded" guard at line 816.
+    ///
+    /// Mutation to redden: in `publish_collection`, change the exact literal
+    /// `"No identity loaded. Generate a keypair first."` at that `.ok_or(...)` to any other text.
+    #[tokio::test]
+    async fn publish_collection_refuses_without_identity() {
+        let (_dir, app) = guard_app();
+        let err = publish_collection(
+            "my-slug".into(),
+            app.state::<DataStore>(),
+            app.state::<SharedIdentity>(),
+            app.state::<SharedRelay>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "No identity loaded. Generate a keypair first.");
+    }
+
+    // -- export_manifest (line 892) ----------------------------------------------------------
+
+    /// With no identity loaded, `export_manifest` refuses before it ever calls
+    /// `build_slug_manifest` or touches the filesystem. Pins the "No identity loaded" guard at
+    /// line 900.
+    ///
+    /// Mutation to redden: in `export_manifest`, change the exact literal
+    /// `"No identity loaded. Generate a keypair first."` at that `.ok_or(...)` to any other text.
+    #[tokio::test]
+    async fn export_manifest_refuses_without_identity() {
+        let (dir, app) = guard_app();
+        let out_path = dir.path().join("out.hbmanifest").to_string_lossy().into_owned();
+        let err = export_manifest(
+            "my-slug".into(),
+            out_path.clone(),
+            app.state::<DataStore>(),
+            app.state::<SharedIdentity>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "No identity loaded. Generate a keypair first.");
+        assert!(!std::path::Path::new(&out_path).exists(), "a refused export must not write a file");
+    }
+
+    // -- unpublish_collection (line 1036) ----------------------------------------------------
+
+    /// With no identity loaded, `unpublish_collection` refuses before delegating to
+    /// `unpublish_collection_inner`. Pins the "No identity loaded" guard at line 1044.
+    ///
+    /// Mutation to redden: in `unpublish_collection`, change the exact literal
+    /// `"No identity loaded. Generate a keypair first."` at that `.ok_or(...)` to any other text.
+    #[tokio::test]
+    async fn unpublish_collection_refuses_without_identity() {
+        let (_dir, app) = guard_app();
+        let err = unpublish_collection(
+            "my-slug".into(),
+            app.state::<DataStore>(),
+            app.state::<SharedIdentity>(),
+            app.state::<SharedRelay>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "No identity loaded. Generate a keypair first.");
+    }
+
+    // -- update_collection_visibility (line 1052) --------------------------------------------
+
+    /// An alias that fails `is_valid_slug` is refused before any store access. Pins the guard at
+    /// line 1059.
+    ///
+    /// Mutation to redden: in `update_collection_visibility`, change the exact literal
+    /// `"Invalid collection slug"` at that `.ok_or(...)` to any other text.
+    #[tokio::test]
+    async fn update_collection_visibility_rejects_an_invalid_slug() {
+        let (_dir, app) = guard_app();
+        let err = update_collection_visibility(
+            "../evil".into(),
+            Visibility::Private,
+            app.state::<DataStore>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "Invalid collection slug");
+    }
+
+    /// A valid slug with no saved draft refuses rather than silently creating one. Pins the "No
+    /// draft found" guard at line 1063.
+    ///
+    /// Mutation to redden: in `update_collection_visibility`, change the exact literal
+    /// `"No draft found for collection '{safe_slug}'"` at that `.ok_or_else(...)` to different
+    /// text (e.g. drop the slug interpolation) — the test's `assert_eq!` on the exact message
+    /// reds.
+    #[tokio::test]
+    async fn update_collection_visibility_refuses_a_missing_draft() {
+        let (_dir, app) = guard_app();
+        let err = update_collection_visibility(
+            "no-such-draft".into(),
+            Visibility::Private,
+            app.state::<DataStore>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "No draft found for collection 'no-such-draft'");
+    }
+
+    // -- export_collection (line 1071) -------------------------------------------------------
+
+    /// An alias that fails `is_valid_slug` is refused before any store access. Pins the guard at
+    /// line 1078.
+    ///
+    /// Mutation to redden: in `export_collection`, change the exact literal
+    /// `"Invalid collection slug"` at that `.ok_or(...)` to any other text.
+    #[tokio::test]
+    async fn export_collection_rejects_an_invalid_slug() {
+        let (_dir, app) = guard_app();
+        let err = export_collection(
+            "../evil".into(),
+            "text".into(),
+            app.state::<DataStore>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "Invalid collection slug");
+    }
+
+    /// A valid slug with no saved draft refuses rather than returning an empty export. Pins the
+    /// "not found" guard at line 1083.
+    ///
+    /// Mutation to redden: in `export_collection`, change the exact literal
+    /// `"Collection '{safe_slug}' not found"` at that `.ok_or_else(...)` to different text (e.g.
+    /// drop the slug interpolation) — the test's `assert_eq!` on the exact message reds.
+    #[tokio::test]
+    async fn export_collection_refuses_a_missing_collection() {
+        let (_dir, app) = guard_app();
+        let err = export_collection(
+            "no-such-collection".into(),
+            "text".into(),
+            app.state::<DataStore>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "Collection 'no-such-collection' not found");
+    }
+}
