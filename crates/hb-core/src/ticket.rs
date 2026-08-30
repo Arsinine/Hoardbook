@@ -122,6 +122,24 @@ pub struct TransportTicket {
     /// alternative re-opens the hole to anyone who claims to be an old client).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_nonce: Option<String>,
+    /// `None` means "the issuer's own collection" — the ordinary, pre-existing case: this node is
+    /// serving what it holds. `Some(npub)` means this ticket is a re-serve of that author's cached
+    /// manifest (carrier 4): the issuer is not the author, and the redeemer must pin the manifest to
+    /// `npub`, not to whoever dialed the address.
+    ///
+    /// **Additive and optional, `TICKET_V` unchanged** — same wire-compat shape as `ask_nonce`
+    /// (owner ruling, QURATOR-79, 2026-08-30): `ticket.rs`'s version gate refuses any ticket whose
+    /// `ticket_v` exceeds the build's own, so bumping it would make every old build reject *every*
+    /// ticket from a new one, including ordinary manifest sends with no carrier-4 involvement.
+    ///
+    /// **Unlike `ask_nonce`, this field needs no fail-closed gate on `None`.** An optional field is
+    /// only safe when its absence cannot be exploited as a downgrade. Strip this field and the
+    /// issuer serves its *own* collection — which it is entitled to serve, and which the redeemer's
+    /// author pin (when one is expected) refuses on mismatch. There is no weaker behaviour hiding
+    /// behind `None` to downgrade into, so absence carries no capability an attacker could induce a
+    /// peer into granting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_npub: Option<String>,
 }
 
 impl TransportTicket {
@@ -143,6 +161,9 @@ impl TransportTicket {
             // Empty is normalized to absent so "present but blank" cannot masquerade as a real
             // nonce at the gate.
             ask_nonce: ask_nonce.filter(|n| !n.is_empty()).map(str::to_string),
+            // `issue` mints the ordinary "own collection" ticket; carrier-4 re-serve tickets are a
+            // separate slice and not constructed here.
+            author_npub: None,
         }
     }
 
@@ -375,6 +396,32 @@ mod tests {
             None,
             "issue normalizes empty to absent, so we never mint the ambiguous shape"
         );
+    }
+
+    /// **Field present** — a carrier-4 re-serve ticket carries `author_npub` and it survives the DM
+    /// body verbatim (QURATOR-79, additive/optional, `TICKET_V` unchanged).
+    #[test]
+    fn an_author_npub_round_trips_through_a_dm_body() {
+        let mut t = ticket();
+        t.author_npub = Some("npub1author".to_string());
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(json.contains("\"author_npub\":\"npub1author\""), "the field name is the contract");
+        let back: TransportTicket = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.author_npub.as_deref(), Some("npub1author"));
+        back.verify_shape().unwrap();
+    }
+
+    /// **Field absent** — an ordinary "own collection" ticket, minted before this field existed or
+    /// simply by an issuer serving its own collection, still parses with `author_npub: None`. This is
+    /// the case the owner's ruling turned on: absence is not a downgrade, because `None` means the
+    /// issuer serves its own collection, which it is entitled to do.
+    #[test]
+    fn a_ticket_without_an_author_npub_still_parses_and_is_shape_valid() {
+        let json = r#"{"hb":"transport_ticket","ticket_v":1,"request_id":"r","slug":"s",
+                       "node_addr":"a","issued_at":1}"#;
+        let t: TransportTicket = serde_json::from_str(json).expect("a ticket without the field still parses");
+        assert_eq!(t.author_npub, None);
+        t.verify_shape().expect("absence is the ordinary own-collection case, not an error");
     }
 
     #[test]
