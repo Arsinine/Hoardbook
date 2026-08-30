@@ -535,18 +535,32 @@ mod tests {
         /// A persisted identity that parses as JSON but fails `AppIdentity::from_stored` is the
         /// "corrupted" refusal — this is the message a user with a tampered/garbled identity file
         /// actually sees.
+        ///
+        /// The corruption is written through `save_identity`, NOT as a raw `fs::write` of JSON,
+        /// because the identity file is not JSON on every platform: on Windows `save_identity`
+        /// DPAPI-encrypts it and `load_identity` decrypts before parsing. Planting plaintext JSON
+        /// there fails the *decrypt* step with "DPAPI decryption failed", so `get_identity` never
+        /// reaches the guard this test names and the assertion fails for the wrong reason — which
+        /// is exactly what CI reported once the Windows harness could run at all (2026-08-30).
+        /// Going through the store keeps the corruption in the CONTENT, where the guard lives,
+        /// rather than in the file ENCODING, which is the store's business.
         #[tokio::test]
         async fn get_identity_flags_a_corrupted_stored_identity() {
             let app = guard_app(false);
-            let store = app.state::<DataStore>();
-            let path = store.identity_path();
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            // Valid JSON, every field present, but the nsec is garbage — parse succeeds, key fails.
-            std::fs::write(
-                &path,
-                br#"{"version":1,"nsec":"garbage","browse_key_hex":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff","transport_secret_hex":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
-            )
-            .unwrap();
+            // Valid record, every field present, but the nsec is garbage — the JSON parses and the
+            // key derivation is what fails.
+            app.state::<DataStore>()
+                .save_identity(&crate::store::StoredIdentity {
+                    version: 1,
+                    nsec: "garbage".to_string(),
+                    browse_key_hex:
+                        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+                            .to_string(),
+                    transport_secret_hex:
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                            .to_string(),
+                })
+                .expect("planting a corrupted identity must itself succeed");
 
             let err = get_identity(app.state::<DataStore>(), app.state::<SharedIdentity>())
                 .await
