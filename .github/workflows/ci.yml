@@ -301,10 +301,13 @@ jobs:
           for f in $files; do
             # Production region = everything before this file's own #[cfg(test)] marker (or the whole
             # file if it has none). Test-only call sites are not the invariant this sweep guards.
-            boundary=$(grep -n '^#\[cfg(test)\]' "$f" | head -1 | cut -d: -f1)
+            # `|| true`: a file with no `#[cfg(test)]` makes grep exit 1, and GitHub runs this step
+          # under `-e -o pipefail`, so an unguarded no-match kills the sweep after the first such
+          # file — silently, with no ::error:: and a green-looking "0 hits" for everything after it.
+          boundary=$(grep -n '^#\[cfg(test)\]' "$f" | head -1 | cut -d: -f1 || true)
             boundary=${boundary:-999999}
             region=$(awk -v b="$boundary" -v fn="$f" 'NR<b {print fn":"NR":"$0}' "$f")
-            nlines=$(printf '%s\n' "$region" | grep -c .)
+            nlines=$(printf '%s\n' "$region" | grep -c . || true); nlines=${nlines:-0}
             if [ "$f" = "$MC_FILE" ]; then
               pattern='manifest_cache::put[[:space:]]*\(|(^|[^a-zA-Z0-9_])put[[:space:]]*\('
             else
