@@ -109,3 +109,7 @@ tauri-plugin-single-instance = "2"
 
 [dev-dependencies]
 tempfile = "3"
+# QURATOR-161: the `test` feature unlocks `tauri::test::{mock_app, StateManager}` — the documented
+# way to call a `#[tauri::command]` fn directly with real managed `State<'_, T>` values, so tests
+# exercise the command body itself rather than a reimplementation of its guards.
+tauri = { version = "2", features = ["test"] }
