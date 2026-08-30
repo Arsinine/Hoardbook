@@ -319,4 +319,17 @@ mod tests {
             "the client contacted the untrusted redirect target — the redirect policy is absent or not refusing cross-host hops"
         );
     }
+
+    // ── QURATOR-161 slice 2 — `apply_portable_update`: OWED, not reachable without restructuring ──
+    //
+    // Both guards this slice targets (the `!is_newer` refusal and the `is_trusted_artifact_url`
+    // refusal) sit DOWNSTREAM of `fetch_manifest()`, which is hard-wired to the `PORTABLE_MANIFEST_URL`
+    // const — no parameter, no `State` to manage, no injection seam. Driving either guard needs a
+    // manifest this test controls, and the only ways to get one are a production change (extract an
+    // `*_inner` taking the URL/manifest, or manage the URL as state) or a live network fetch of the
+    // real GitHub release — the first is out of scope for a tests-only slice, the second is not a
+    // hermetic unit test. The pure halves ARE pinned: `is_newer` in `portable_update_logic` (fail-closed
+    // on a parse failure) and `is_trusted_artifact_url` + `redirect_hop_allowed` here. What stays
+    // unpinned is the guards' PLACEMENT in the command — that they fire before any artifact bytes are
+    // fetched. Extracting the seam is the first step of the slice that picks this up.
 }
