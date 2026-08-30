@@ -1813,4 +1813,83 @@ mod tests {
             "a non-empty incoming key (rotation) wins over the stored key"
         );
     }
+
+    // ── QURATOR-161 — import_manifest's size guards, driven through the command itself ─────────
+    //
+    // Same class as the chat tests above: `import_manifest`'s three refusals live in the
+    // `#[tauri::command]` body, BEFORE `accept_manifest_bytes` is reached — so nothing here needs a
+    // contact, a share code, or a valid manifest. The command fn is called at its real signature
+    // with real managed `State<'_, DataStore>`, via tauri's `StateManager`.
+    mod command_guards {
+        use super::*;
+        use tauri::Manager;
+
+        fn import_via_command(
+            app: &tauri::App<tauri::test::MockRuntime>,
+            npub: &str,
+            expected_slug: Option<String>,
+            path: Option<String>,
+            pasted: Option<String>,
+            newest_fingerprint: Option<String>,
+        ) -> CmdResult<ImportedManifest> {
+            let store = app.state::<DataStore>();
+            tauri::async_runtime::block_on(import_manifest(
+                npub.to_string(),
+                expected_slug,
+                path,
+                pasted,
+                newest_fingerprint,
+                store,
+            ))
+        }
+
+        fn guard_app() -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            app.manage(store);
+            app
+        }
+
+        #[test]
+        fn import_manifest_command_rejects_oversized_file() {
+            let app = guard_app();
+            // A real file just over the cap, so the guard's `fs::metadata` read sees a true length.
+            let dir = tempfile::tempdir().unwrap();
+            let big = dir.path().join("big.hbmanifest");
+            std::fs::write(&big, vec![b'x'; MANIFEST_FILE_MAX_BYTES as usize + 1]).unwrap();
+            let err = import_via_command(
+                &app,
+                "npub1anyone",
+                None,
+                Some(big.to_string_lossy().into_owned()),
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(err, "That file is too large to be a manifest.");
+        }
+
+        #[test]
+        fn import_manifest_command_rejects_oversized_paste() {
+            let app = guard_app();
+            let err = import_via_command(
+                &app,
+                "npub1anyone",
+                None,
+                None,
+                Some("x".repeat(MANIFEST_FILE_MAX_BYTES as usize + 1)),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(err, "That pasted text is too large to be a manifest.");
+        }
+
+        #[test]
+        fn import_manifest_command_requires_a_source() {
+            let app = guard_app();
+            let err = import_via_command(&app, "npub1anyone", None, None, None, None).unwrap_err();
+            assert_eq!(err, "No manifest file or text provided.");
+        }
+    }
 }
