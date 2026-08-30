@@ -2006,4 +2006,115 @@ mod tests {
             );
         }
     }
+
+    // ── QURATOR-161 slice 6 — `follow`'s pre-resolved-peer guard, through the command ───────────
+    //
+    // M20 W2 added `resolved_peer` so the AddContact funnel's already-completed lookup is not
+    // repeated. The npub-binding guard is its whole safety story: a caller-supplied peer whose npub
+    // differs from the share code's pubkey (a stale lookup for a DIFFERENT peer) must be refused
+    // BEFORE it is trusted. Both sides are pinned here on the real `#[tauri::command]` fn at its
+    // real signature, via tauri's StateManager — no mirror, no `*_inner`, no restructuring.
+    //
+    // Reachability note: the `Some(pre)` arm touches no network at all. `ShareCode::parse`,
+    // `pubkey().to_bech32()`, the npub comparison, `save_followed_peer` (a store write) — every
+    // statement is offline, so unlike the `paste_key` pass-side tests these need no discarded
+    // loopback port. A MATCHING peer runs the command to completion (the peer is persisted), which
+    // discriminates the guard far better than dying at the next statement would: an inverted guard
+    // turns the matching case into the refusal and the mismatched case into a save, and BOTH
+    // assertions red.
+    mod follow_command_guards {
+        use super::*;
+        use tauri::Manager;
+
+        fn guard_app() -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            // The identity/relay states are managed so the signature is satisfied, but the
+            // `Some(pre)` arm never reads them: `identity` is only awaited in the `None` arm, and
+            // `relay` only inside `resolve_peer`. An unloaded identity here doubles as a tripwire —
+            // if the guard ever regressed into resolving from the code, the matching-side test
+            // would fail with "No identity loaded" instead of persisting the peer.
+            let identity: SharedIdentity =
+                std::sync::Arc::new(tokio::sync::RwLock::new(None));
+            app.manage(identity);
+            app.manage(store);
+            app.manage(net::new_shared());
+            app
+        }
+
+        async fn follow_via_command(
+            app: &tauri::App<tauri::test::MockRuntime>,
+            code: &str,
+            resolved_peer: Option<CachedPeer>,
+        ) -> CmdResult<()> {
+            follow(
+                code.to_string(),
+                None,
+                None,
+                resolved_peer,
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+        }
+
+        /// A pre-resolved peer whose npub is NOT the code's pubkey is refused with the command's
+        /// exact error — and nothing is written to the contact store.
+        #[tokio::test]
+        async fn follow_command_refuses_a_mismatched_pre_resolved_peer() {
+            let app = guard_app();
+            // Two independent identities: the code belongs to `code_owner`, the caller hands us a
+            // peer resolved for `someone_else` — the stale-lookup shape the guard exists for.
+            let code_owner = crate::identity_state::AppIdentity::generate();
+            let code = code_owner.share_code().expect("encode the owner's share code");
+            let mut stale = stub_peer_with_profile("npub1_someone_else_entirely", "SomeoneElse");
+            stale.npub = crate::identity_state::AppIdentity::generate().npub();
+
+            let err = follow_via_command(&app, &code, Some(stale.clone()))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err,
+                "The resolved peer does not match the share code. Re-look the peer up and try again."
+            );
+
+            // The refusal fires before `save_followed_peer`: no contact file for the stale peer,
+            // and none for the code's owner either (a half-follow is not persisted).
+            let store = app.state::<DataStore>();
+            assert!(
+                store.load_contact(&CachedPeer::pubkey_hash(&stale.npub)).unwrap().is_none(),
+                "a refused peer must not be persisted"
+            );
+            let code_npub = code_owner.npub();
+            assert!(
+                store.load_contact(&CachedPeer::pubkey_hash(&code_npub)).unwrap().is_none(),
+                "the share code's owner must not be persisted by a refused follow"
+            );
+        }
+
+        /// The other side of the same guard: a peer whose npub IS the code's pubkey clears it,
+        /// skips `resolve_peer` (no relay dial — proven by the unloaded identity), and is
+        /// persisted by `save_followed_peer`.
+        #[tokio::test]
+        async fn follow_command_accepts_a_matching_pre_resolved_peer_and_persists_it() {
+            let app = guard_app();
+            let owner = crate::identity_state::AppIdentity::generate();
+            let code = owner.share_code().expect("encode the owner's share code");
+            let peer = stub_peer_with_profile(&owner.npub(), "MatchedPeer");
+
+            follow_via_command(&app, &code, Some(peer))
+                .await
+                .expect("a matching pre-resolved peer is followed without any relay round-trip");
+
+            let store = app.state::<DataStore>();
+            let loaded = store
+                .load_contact(&CachedPeer::pubkey_hash(&owner.npub()))
+                .unwrap()
+                .expect("the matched peer is persisted by the follow leg");
+            assert_eq!(loaded.npub, owner.npub());
+            assert_eq!(loaded.petname.as_deref(), Some("MatchedPeer"));
+        }
+    }
 }

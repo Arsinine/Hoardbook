@@ -115,3 +115,53 @@ pub async fn take_update_notice(
     }
     Ok(show.then_some(UpdateNotice { version: current }))
 }
+
+// ── QURATOR-161 slice 6 — the update commands' guards, driven through the commands ───────────
+//
+// Same technique as the browse/groups/chat command-guard blocks: the real `#[tauri::command]` fns
+// at their real signatures, with `tauri::test::mock_app()` supplying the `AppHandle` and the
+// StateManager supplying the managed `State<'_, _>` values — no mirror, no `*_inner`, no
+// restructuring.
+//
+// `check_update` and `download_update` are OWED (see the comment beside their tests): every guard
+// they have sits downstream of `app.updater_builder().build()`, which reads the updater endpoint +
+// minisign pubkey from the app config. `mock_app()` carries a dummy config with no updater keys,
+// so the build refuses before any branch can be taken — and constructing a real `Update` value is
+// not possible from outside the plugin (its constructors are not public).
+#[cfg(test)]
+mod command_guards {
+
+    // ── `apply_staged_update` / `check_update` / `download_update`: OWED ──────────────────────
+    //
+    // Blocker, verbatim from the compiler: every command in this file that has a guard takes
+    // `app: tauri::AppHandle` — the DEFAULT type parameter, i.e. `AppHandle<Wry<EventLoopMessage>>`.
+    // `tauri::test::mock_app()` returns `App<MockRuntime>`, and there is no conversion between an
+    // `AppHandle<MockRuntime>` and an `AppHandle<Wry>` (the `mock_app` doc's own example only calls
+    // commands that take NO app parameter). Passing the mock handle is
+    // `expected AppHandle<Wry<EventLoopMessage>>, found AppHandle<MockRuntime>` (E0308) — a type
+    // error, not a runtime failure, so the guard cannot even be entered. Unlike the `State<'_, T>`
+    // parameters (which tauri's StateManager satisfies for any runtime) the `AppHandle` parameter
+    // pins the runtime the test must drive, and building a real `Wry` app needs a display server —
+    // not available in the offline CI/dev env this file's own header documents (decision #7/#8).
+    //
+    // `apply_staged_update` has a second, independent blocker on its PASS side: a staged update
+    // makes the command run `update.install(&bytes)` and then `app.restart()`, which is `-> !` —
+    // on a test thread it calls `cleanup_before_exit()` and then re-execs the TEST BINARY. And
+    // `tauri_plugin_updater::Update` has no public constructor, so a staged value cannot be built
+    // from outside the plugin either. Driving any of this needs a production change (an `*_inner`
+    // over a generic `R: Runtime`, or a State-managed restart flag), which a tests-only slice must
+    // not make.
+    //
+    // What IS already pinned, and where: the "No update is staged." guard's data shape
+    // (`StagedUpdate::inner` is an `Option` that `take()` empties — nothing else reads it), the
+    // once-per-version-change decision both `take_update_notice` and the up-to-date branch of
+    // `check_update`/`download_update` report through (`crate::update_logic`, CI-tested there),
+    // and the updater trust/config boundary (`tauri.conf.json` + minisign, plugin-owned). What
+    // stays unpinned is the guards' PLACEMENT in these command bodies. Making `apply_staged_update`
+    // generic over `R: Runtime` (a signature-only change, `Wry` remaining the concrete runtime in
+    // `lib.rs`) is the first step of the slice that picks this up.
+    //
+    // (Kept as a compiled no-op module so the blocker is read where the tests would live, matching
+    // the `apply_portable_update` OWED precedent in portable_update.rs.)
+    const _: () = ();
+}
