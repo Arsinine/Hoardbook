@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, validateBackup, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, hasPublishedProfile, publishProfile, copyDiagnostics, revealLogFolder, natClassification, dmBlockedList, dmUnblock } from '$lib/api.js';
+	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, validateBackup, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, hasPublishedProfile, publishProfile, copyDiagnostics, revealLogFolder, natClassification, dmBlockedList, dmUnblock, dmBlock, validateShareCode, shareCodeInfo } from '$lib/api.js';
 	import type { Settings, UpdateInfo, PortableUpdateInfo, BeaconReport, NatClassification } from '$lib/api.js';
 	import { keyView } from '$lib/key-view.js';
 	import { shortNpub } from '$lib/contact-display.js';
@@ -53,7 +53,7 @@
 		if (!path) return;
 		if (backupMode === 'plaintext') {
 			const ok = await confirm(
-				'This backup is UNENCRYPTED — the file IS your identity. Anyone who obtains it becomes you. Store it like a master key. Continue?',
+				'This backup is unencrypted. The file is your identity, and anyone who has it becomes you. Store it like a master key. Continue?',
 				{ title: 'Plaintext backup', kind: 'warning' },
 			);
 			if (!ok) return;
@@ -114,7 +114,7 @@
 			const info = await restoreData(pass, path);
 			identity.set(info);
 			restorePath = null; restorePass = ''; restoreNeedsPass = false;
-			toast('Backup restored — restarting…');
+			toast('Backup restored. Restarting…');
 			await new Promise(r => setTimeout(r, 2500));
 			await relaunch();
 		} catch (e) { toast(String(e), 'error'); restoring = false; }
@@ -149,6 +149,9 @@
 	let isPortable = $state(false);
 	let portableInfo: PortableUpdateInfo | null = $state(null);
 	let portableApplying = $state(false);
+	// QURATOR-158: the update row itself — the new-version badge routes into it (scrolls it into
+	// view), which is the "reuse the existing update UI" half of the ticket.
+	let updateRowEl: HTMLElement | undefined = $state();
 
 	async function doCheckUpdate() {
 		updateChecking = true;
@@ -167,6 +170,24 @@
 			updateError = String(e).replace(/^Error: /, '');
 		} finally {
 			updateChecking = false;
+		}
+	}
+
+	// QURATOR-158 — the launch-time background check. Deliberately NOT doCheckUpdate(): an
+	// unrequested check must fail silently (offline launches are normal), must not claim "up to
+	// date" the user never asked to confirm, and must not busy the manual button's spinner. It
+	// only fills updateInfo/portableInfo, from which the indicator + the existing update-row UI
+	// light up. Must be called AFTER isPortable resolves (onMount does), or a portable build
+	// silently takes the NSIS branch.
+	async function backgroundUpdateCheck() {
+		try {
+			if (isPortable) {
+				portableInfo = await checkPortableUpdate();
+			} else {
+				updateInfo = await checkUpdate();
+			}
+		} catch {
+			/* silent by design: an offline/unconfigured updater is not a launch error */
 		}
 	}
 
@@ -189,7 +210,7 @@
 		try {
 			stagedVersion = await downloadUpdate();
 			if (stagedVersion) {
-				toast(`Update v${stagedVersion} downloaded — it applies when you restart`, 'success');
+				toast(`Update v${stagedVersion} downloaded. It installs when you restart.`, 'success');
 			}
 		} catch (e) { toast(String(e), 'error'); }
 		finally { updateStaging = false; }
@@ -216,22 +237,22 @@
 			case 'cgnat': return 'CGNAT (carrier-grade NAT) detected';
 			case 'nat': return 'Behind NAT';
 			case 'no-nat': return 'No NAT';
-			case 'unknown': return 'Unknown — could not determine';
+			case 'unknown': return 'Unknown';
 			default: return 'Not yet determined';
 		}
 	}
 	function natSubFor(c: NatClassification): string {
 		switch (c) {
 			case 'cgnat':
-				return 'Your observed address is in 100.64.0.0/10. Strong signal, not proof — some ISPs use other ranges, and double-NAT exists.';
+				return 'Your public address is in the range providers use for carrier-grade NAT. A strong sign, not proof.';
 			case 'nat':
-				return 'Your local address is RFC 1918 private, or your observed address differs from your local one.';
+				return 'Your local address is a private one, or it differs from the address the outside world sees.';
 			case 'no-nat':
 				return 'Your local address is what the outside world sees.';
 			case 'unknown':
-				return 'No mapped address was observed and your local address is not RFC 1918 private. This is NOT "no NAT" — it is undecided.';
+				return 'No mapped address was seen and your local address is not a private one. The result is undecided. It does not mean no NAT.';
 			default:
-				return 'The launch-time probe has not completed yet. Reload Settings to retry.';
+				return 'Still checking. Reopen Settings in a moment.';
 		}
 	}
 	let natLabel = $derived(natLabelFor(natClass));
@@ -242,7 +263,7 @@
 		try {
 			const text = await copyDiagnostics();
 			await handleCopy(text);
-			toast('Diagnostics copied — paste it in your bug report', 'success');
+			toast('Diagnostics copied. Paste it into your bug report.', 'success');
 		} catch (e) { toast(String(e), 'error'); }
 		finally { copyingDiagnostics = false; }
 	}
@@ -364,16 +385,61 @@
 		}
 	}
 
+	// ── QURATOR-141 — proactive block-by-npub. Previously dmBlock's ONLY call site was chat's
+	// handleBlock(r: DmRequestView), so the blocklist was a surface you could only ever SHRINK —
+	// growing it required the stranger to message you first. Validation reuses
+	// validateShareCode (ShareCode::parse, bech32-checksummed) rather than a new parser: a
+	// typo'd block is silent and useless. A full hbk1 share code is accepted too — the block
+	// target is its embedded identity npub, so no contact record is created (out of scope by
+	// owner ruling: what blocking a contact means beyond DMs is undecided).
+	let blockNpubInput = $state('');
+	let blockNpubBusy = $state(false);
+
+	async function handleBlockNpub() {
+		const raw = blockNpubInput.trim();
+		if (!raw || blockNpubBusy) return;
+		blockNpubBusy = true;
+		try {
+			// The npub is validated BEFORE storing (validate_share_code is local: parse +
+			// bech32 checksum, zero network). Accept a full share code by canonicalising to the
+			// npub it carries, so pasting someone's hbk1… doesn't block a string that will never
+			// match a decoded DM sender.
+			const valid = await validateShareCode(raw);
+			if (!valid) {
+				toast('That is not a valid npub (or share code). Nothing was blocked.', 'error');
+				blockNpubBusy = false;
+				return;
+			}
+			const npub = raw.startsWith('npub1') ? raw : await shareCodeInfo(raw).then((i) => i.npub);
+			if (npub === ($identity?.npub ?? '')) {
+				toast('That is your own npub.', 'error');
+				blockNpubBusy = false;
+				return;
+			}
+			await dmBlock(npub);
+			blockNpubInput = '';
+			await loadBlocked();
+			toast('Blocked', 'success');
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			blockNpubBusy = false;
+		}
+	}
+
 	onMount(async () => {
 		try { appVersion = await getVersion(); } catch { appVersion = ''; }
 		loadSettings();
 		// Route the updater UI: the portable (loose-exe) build self-replaces; an NSIS install uses the
 		// staged/deferred flow. Best-effort — a detection failure falls back to the NSIS path.
 		try { isPortable = await updaterIsPortable(); } catch { isPortable = false; }
+		// QURATOR-158: launch-time check. Strictly AFTER the isPortable line above — the branch
+		// pick inside reads it. Never awaited-blocking: mount must not stall on a slow updater.
+		void backgroundUpdateCheck();
 		// Visible-after "now running vX.Y" notice — fires once per version change.
 		try {
 			const notice = updateNoticeVM(await takeUpdateNotice());
-			if (notice.show) toast(`Now running v${notice.version} — see the changelog for what's new`, 'success');
+			if (notice.show) toast(`Now running v${notice.version}.`, 'success');
 		} catch { /* updater not configured */ }
 		// QURATOR-68: read the NAT classification the startup probe wrote. Best-effort — a failure
 		// leaves the explicit "Not yet determined" state, never a confident negative. Re-checked
@@ -606,9 +672,8 @@
 
 			{#if kv.showStorageWarning}
 				<div class="key-storage-warn">
-					{@html icons.key} Your key is stored as a protected file ({kv.storageLabel}), not in an
-					OS keyring on this platform. Anyone with access to your user account can read it —
-					keep this device and your home directory secure. Keyring support is planned.
+					{@html icons.key} Your key is stored as a protected file, not in an OS keyring on this
+					platform. Anyone with access to your user account can read it, so keep this device secure.
 				</div>
 			{/if}
 		</div>
@@ -616,7 +681,7 @@
 		<!-- Backup / restore -->
 		<div class="section-label">Backup &amp; restore</div>
 		<div class="surface">
-			<div class="field-label">Export a portable backup of your whole profile (all three keys + collections, contacts, settings). Store it somewhere safe — it is your only protection against losing your identity.</div>
+			<div class="field-label">Export a portable backup of everything: your keys, collections, contacts, and settings. Store it somewhere safe. It is your only protection against losing your identity.</div>
 			<div class="backup-modes">
 				{#each backupModes as opt (opt.mode)}
 					<label class="backup-mode" class:backup-mode-on={backupMode === opt.mode}>
@@ -668,11 +733,11 @@
 				</div>
 			{:else}
 				<div class="link-warn">
-					{@html icons.key} <strong>Linking warning:</strong> if this key is public — or the
-					same key you use in Qurator or anywhere else — importing it links that identity to your
-					Hoardbook activity and de-pseudonymizes you. Only continue if you understand this.
+					{@html icons.key} <strong>Linking warning:</strong> importing a key you use publicly, in
+					Qurator, or anywhere else ties that identity to your Hoardbook activity. Anyone who knows
+					the key will know this is you.
 				</div>
-				<label class="ack-row"><input type="checkbox" bind:checked={importWarnAck} /> I understand the linking implication.</label>
+				<label class="ack-row"><input type="checkbox" bind:checked={importWarnAck} /> I understand.</label>
 				<input class="hb-input hb-mono" type="password" placeholder="nsec1…" bind:value={importNsecValue} />
 				<div style="display:flex; gap:8px;">
 					<button class="btn-primary btn-sm" onclick={handleImportNsec} disabled={!importWarnAck || !importNsecValue.trim() || importingNsec}>
@@ -715,7 +780,7 @@
 			     error + Retry instead, and keep Save disabled until a load succeeds (see below). -->
 			<EmptyState
 				error
-				message="Couldn't load your settings — Save stays disabled until a real load succeeds, so a failed load can't overwrite them."
+				message="Couldn't load your settings. Saving is disabled until they load."
 				onretry={loadSettings}
 			/>
 		{/if}
@@ -757,7 +822,17 @@
 		</div>
 	</div>
 
-	<!-- M16 W3: optional big relay for large-collection full manifests -->
+<!-- ===================================================================================
+     BIG RELAY — TEMPORARILY DISABLED, owner 2026-08-27. Commented out rather than deleted so it
+     can come back unchanged. The BACKEND IS UNTOUCHED: `settings.big_relay_url` still round-trips
+     through get/saveSettings, M16 Layer 3 still publishes there when the value is non-empty, and
+     `handleSaveBigRelay` is still defined above. Only the way to EDIT it is hidden.
+     ⚠ Consequence to know: anyone who already set a big relay keeps using it with no way to see or
+     clear it from the UI. If that is not wanted, the value must also be cleared on upgrade — that
+     is a separate decision, deliberately NOT taken here.
+     To restore: delete this comment opener and its closer below.
+
+     (was: M16 W3 - optional big relay for large-collection full manifests)
 	<div class="section-label">Big relay (large collections)</div>
 	<div class="surface surface-nop">
 		<div class="relay-add-row">
@@ -778,6 +853,7 @@
 			fetch the rest from it. Leave empty to publish only the preview.
 		</div>
 	</div>
+     =================================================================================== -->
 
 	<!-- Preferences -->
 	<div class="section-label">Preferences</div>
@@ -797,9 +873,8 @@
 			<div class="toggle-text">
 				<div class="toggle-label">Auto-update snapshots on change</div>
 				<div class="toggle-sub">
-					Re-publish a published listing when its folder changes (filesystem-watch). Off = manual
-					"Regenerate" only. Note: a watch sees your local edits, not server-side changes another
-					host makes on an SMB share — those reconcile on launch.
+					Re-publish a published collection when its folder changes. When off, only a manual rescan
+					updates it. Changes made from another computer on a network share are picked up at launch.
 				</div>
 			</div>
 			<button class="toggle" class:toggle-on={snapshotAutoUpdate} onclick={() => toggleSetting('snapshot_auto_update')} disabled={!settingsLoaded} aria-label="Auto-update snapshots on change">
@@ -831,15 +906,30 @@
 		</div>
 	</div>
 
-	<!-- Blocked contacts (QURATOR-94 — the unblock surface; previously unreachable from any UI) -->
+	<!-- Blocked contacts (QURATOR-94 — the unblock surface; previously unreachable from any UI).
+	     QURATOR-141 adds the proactive block input below — the only other way to GROW the list was
+	     chat's handleBlock, which needs an existing DM request. -->
 	<div class="section-label">Blocked contacts</div>
 	<div class="surface surface-nop">
+		<div class="relay-add-row blocked-add-row">
+			<input
+				class="hb-input hb-mono"
+				type="text"
+				placeholder="npub1… (paste an npub to block them)"
+				bind:value={blockNpubInput}
+				onkeydown={(e) => e.key === 'Enter' && handleBlockNpub()}
+				disabled={blockNpubBusy}
+			/>
+			<button class="btn-default btn-sm" onclick={handleBlockNpub} disabled={!blockNpubInput.trim() || blockNpubBusy}>
+				{blockNpubBusy ? 'Blocking…' : 'Block'}
+			</button>
+		</div>
 		{#if blockedLoadFailed && blocked.length === 0}
 			<!-- minor-5: an unknown blocklist must not render as the confident "No blocked contacts"
 			     line — same rule as QURATOR-93/QURATOR-80/85. -->
 			<EmptyState
 				error
-				message="Couldn't load your blocked contacts — an unknown blocklist can't be shown as empty."
+				message="Couldn't load your blocked contacts."
 				onretry={loadBlocked}
 			/>
 		{:else if blocked.length === 0}
@@ -863,9 +953,20 @@
 	<!-- Updates -->
 	<div class="section-label">Updates</div>
 	<div class="surface">
-		<div class="update-row">
+		<div class="update-row" bind:this={updateRowEl}>
 			<div class="toggle-text">
 				<div class="toggle-label">App version</div>
+				<!-- QURATOR-158: new-version indicator — visible ONLY when a check (background or
+				     manual) actually found a newer version. Click-through is the existing update
+				     flow to its right (the "vX.Y available" + Download/Update &amp; restart pair),
+				     so this badge scrolls the same affordance into view rather than forking one.
+				     jsdom computes no layout — placement above the sub-label is CSS, not tested. -->
+				{#if isPortable ? portableInfo : updateInfo}
+					<button class="update-badge" title="A newer version is available" onclick={() => updateRowEl?.scrollIntoView({ block: 'center' })}>
+						<span class="update-badge-dot" aria-hidden="true"></span>
+						New version available
+					</button>
+				{/if}
 				<div class="toggle-sub">Currently running v{appVersion || '…'}</div>
 			</div>
 			<div class="update-actions">
@@ -915,7 +1016,7 @@
 		     "strong signal, not proof" and the copy must not overclaim. -->
 		<div class="nat-row" data-nat-class={natClass}>
 			<div class="toggle-text">
-				<div class="toggle-label">Network type</div>
+				<div class="toggle-label">Network type<FeatureTooltip key="network-type" /></div>
 				<div class="toggle-sub">{natSub}</div>
 			</div>
 			<div
@@ -930,8 +1031,8 @@
 			<div class="toggle-text">
 				<div class="toggle-label">Copy diagnostics to clipboard</div>
 				<div class="toggle-sub">
-					A version/config header (npub truncated, no keys) plus the tail of the current log — ready
-					to paste in a bug report or Reddit comment. Capped to ~2000 lines / ~256 KB.
+					A version and config header (npub truncated, no keys) plus the recent log, ready to paste
+					into a bug report or Reddit comment.
 				</div>
 			</div>
 			<button class="btn-default btn-sm" onclick={handleCopyDiagnostics} disabled={copyingDiagnostics}>
@@ -960,7 +1061,7 @@
 		<div class="danger-row">
 			<div>
 				<div class="toggle-label">Wipe all data</div>
-				<div class="toggle-sub">Permanently removes your identity, profile, and app data from this device. Your actual files on disk are not touched — only Hoardbook's database is cleared.</div>
+				<div class="toggle-sub">Permanently removes your identity, profile, and app data from this device. Your files on disk are not touched. Only Hoardbook's database is cleared.</div>
 			</div>
 			{#if !wipeConfirm}
 				<button class="btn-danger btn-sm" onclick={() => (wipeConfirm = true)}>Wipe data</button>
@@ -1154,7 +1255,12 @@
 	/* M20 W4: input contract is global in app.css. Only the flex-grow LAYOUT stays, scoped to the
 	   two row containers where the input must grow — never re-declaring .hb-input itself. */
 	.relay-add-row > .hb-input,
+	.blocked-add-row > .hb-input,
 	.restore-pass > .hb-input { flex: 1; }
+
+	/* QURATOR-141: the block-by-npub input row sits inside surface-nop, so it needs the same
+	   padding the blocked rows carry; the hairline separates it from the list below. */
+	.blocked-add-row { padding: 12px 16px; border-bottom: 1px solid var(--divider); }
 
 
 	/* Toggles */
@@ -1259,6 +1365,21 @@
 	.update-available-text { font-size: 12px; color: var(--accent); font-weight: 600; white-space: nowrap; }
 	.update-ok-text { font-size: 12px; color: var(--online); white-space: nowrap; }
 	.update-error-text { font-size: 11.5px; color: var(--error); margin-top: 4px; }
+	/* QURATOR-158 — new-version indicator, above "Currently running v…". Unobtrusive by design:
+	   a small accent dot + label. Routing = scrollIntoView on the row that owns the real update
+	   buttons (right there on the same row), not a second updater UI. */
+	.update-badge {
+		display: inline-flex; align-items: center; gap: 6px;
+		border: none; background: none; padding: 0; margin: 2px 0 3px;
+		font: inherit; font-size: 12px; font-weight: 600; color: var(--accent);
+		cursor: pointer;
+	}
+	.update-badge:hover { text-decoration: underline; }
+	.update-badge-dot {
+		width: 8px; height: 8px; border-radius: 50%;
+		background: var(--accent);
+		box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+	}
 
 	/* Pills */
 	.pill {

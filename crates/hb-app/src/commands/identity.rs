@@ -375,4 +375,495 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "overwrite must force 0600, not leave the pre-existing 0644 (mode {mode:#o})");
     }
+
+    // ── QURATOR-161 slice 3 — this file's commands, driven through the command itself ──────────
+    //
+    // Same technique as slices 1-2 (`e4d5cf6`, `33a6c00`): `tauri::test::mock_app()` mints genuine
+    // `State<'_, T>` handles through the same StateManager the command macro uses at invoke time,
+    // so every test below calls the REAL `#[tauri::command]` fn at its real signature — no mirror,
+    // no `*_inner` shim, no restructuring. The pure halves that already had tests above stay put;
+    // what this block adds is the guards' placement inside the command fns themselves.
+    mod command_guards {
+        use super::super::{
+            backup_data, generate_keypair, get_identity, get_share_code, import_nsec, peek_backup,
+            restore_data, validate_backup, validate_share_code, wipe_data,
+        };
+        use super::nsec_of;
+        use crate::error::CmdResult;
+        use crate::identity_state::{AppIdentity, SharedIdentity};
+        use crate::store::DataStore;
+        use crate::transport_state::{new_shared_endpoint, SharedEndpoint};
+        use std::sync::Arc;
+        use tauri::Manager;
+
+        fn guard_app(identity_on_disk: bool) -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            if identity_on_disk {
+                store.save_identity(&AppIdentity::generate().to_stored().unwrap()).unwrap();
+            }
+            let identity: SharedIdentity =
+                Arc::new(tokio::sync::RwLock::new(None));
+            app.manage(identity);
+            app.manage(store);
+            app.manage(new_shared_endpoint());
+            app
+        }
+
+        async fn generate(app: &tauri::App<tauri::test::MockRuntime>) -> CmdResult<super::super::IdentityInfo> {
+            generate_keypair(app.state::<DataStore>(), app.state::<SharedIdentity>()).await
+        }
+
+        // -- generate_keypair: three guards, one match ---------------------------------------------
+
+        /// A populated profile refuses with its exact message AND the file on disk is untouched.
+        #[tokio::test]
+        async fn generate_refuses_when_an_identity_already_exists() {
+            let app = guard_app(true);
+            let before = std::fs::read(app.state::<DataStore>().identity_path()).unwrap();
+
+            let err = generate(&app).await.unwrap_err();
+            assert_eq!(
+                err,
+                "An identity already exists. Wipe data first to generate a new one."
+            );
+
+            let after = std::fs::read(app.state::<DataStore>().identity_path()).unwrap();
+            assert_eq!(after, before, "a refused generate must not rewrite the identity file");
+            assert!(
+                app.state::<SharedIdentity>().read().await.is_none(),
+                "the in-memory identity stays unset — a refused generate mints nothing"
+            );
+        }
+
+        /// An identity file that EXISTS but cannot be read is the wipe-me recovery message, not a
+        /// bare `cmd_err` — this is the branch that must not dead-end a user on the unreadable
+        /// recovery screen. Pinned in two flavors: a file that parses as neither JSON nor an
+        /// identity record, and a DIRECTORY sitting at the identity path (`exists()` is true, the
+        /// read is what fails).
+        #[tokio::test]
+        async fn generate_flags_unreadable_existing_identity_data() {
+            let app = guard_app(false);
+            let store = app.state::<DataStore>();
+            let path = store.identity_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Valid JSON, but not an identity record — `load_identity` fails at the parse, and the
+            // path exists, so the guard (not `cmd_err`) owns the refusal.
+            std::fs::write(&path, b"{\"nsec\": 3}").unwrap();
+
+            let err = generate(&app).await.unwrap_err();
+            assert!(
+                err.starts_with("Existing identity data cannot be read"),
+                "the unreadable-data guard must fire, got {err}"
+            );
+            assert!(
+                err.contains("Wipe data"),
+                "the recovery pointer is part of the guard's contract, got {err}"
+            );
+
+            // Flavor two: a directory at the identity path. `exists()` is still TRUE, so this is
+            // the same arm — proving the guard keys on path existence, not on file-ness.
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir_all(&path).unwrap();
+            let err = generate(&app).await.unwrap_err();
+            assert!(
+                err.starts_with("Existing identity data cannot be read"),
+                "a directory-shaped identity path takes the same recovery arm, got {err}"
+            );
+            assert!(
+                app.state::<SharedIdentity>().read().await.is_none(),
+                "neither refusal populates the shared identity"
+            );
+        }
+
+        /// The pass side: an EMPTY profile sails through all three guards and mints a full
+        /// identity — persisted, returned, and loaded into the shared state.
+        #[tokio::test]
+        async fn generate_mints_an_identity_on_an_empty_profile() {
+            let app = guard_app(false);
+            let info = generate(&app).await.expect("an empty profile must generate");
+            assert!(info.npub.starts_with("npub1"));
+            assert!(info.share_code.starts_with("hbk1"));
+            assert!(
+                app.state::<DataStore>().identity_path().exists(),
+                "the new identity is persisted"
+            );
+            assert!(
+                app.state::<SharedIdentity>().read().await.is_some(),
+                "the shared identity is populated by the command, not just written to disk"
+            );
+            let reloaded = AppIdentity::from_stored(
+                &app.state::<DataStore>().load_identity().unwrap().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(reloaded.npub(), info.npub);
+        }
+
+        // -- import_nsec: the identity-exists refusal, through the command ------------------------
+
+        /// The `import_nsec_inner` mirror-free refusal, now via the command: an occupied profile
+        /// refuses an import with its exact message and does not clobber the incumbent identity.
+        #[tokio::test]
+        async fn import_nsec_command_refuses_an_occupied_profile() {
+            let app = guard_app(true);
+            let incumbent = app.state::<DataStore>().load_identity().unwrap().unwrap();
+            let err = import_nsec(
+                nsec_of(&AppIdentity::generate()),
+                app.state::<DataStore>(),
+                app.state::<SharedIdentity>(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                err,
+                "An identity already exists. Wipe data first to import a different key."
+            );
+            let after = app.state::<DataStore>().load_identity().unwrap().unwrap();
+            assert_eq!(
+                after.nsec, incumbent.nsec,
+                "a refused import must not overwrite the incumbent identity"
+            );
+            assert_eq!(
+                after.browse_key_hex, incumbent.browse_key_hex,
+                "nor its browse-key"
+            );
+        }
+
+        // -- get_identity: the corrupted-stored-identity refusal -----------------------------------
+
+        /// A persisted identity that parses as JSON but fails `AppIdentity::from_stored` is the
+        /// "corrupted" refusal — this is the message a user with a tampered/garbled identity file
+        /// actually sees.
+        ///
+        /// The corruption is written through `save_identity`, NOT as a raw `fs::write` of JSON,
+        /// because the identity file is not JSON on every platform: on Windows `save_identity`
+        /// DPAPI-encrypts it and `load_identity` decrypts before parsing. Planting plaintext JSON
+        /// there fails the *decrypt* step with "DPAPI decryption failed", so `get_identity` never
+        /// reaches the guard this test names and the assertion fails for the wrong reason — which
+        /// is exactly what CI reported once the Windows harness could run at all (2026-08-30).
+        /// Going through the store keeps the corruption in the CONTENT, where the guard lives,
+        /// rather than in the file ENCODING, which is the store's business.
+        #[tokio::test]
+        async fn get_identity_flags_a_corrupted_stored_identity() {
+            let app = guard_app(false);
+            // Valid record, every field present, but the nsec is garbage — the JSON parses and the
+            // key derivation is what fails.
+            app.state::<DataStore>()
+                .save_identity(&crate::store::StoredIdentity {
+                    version: 1,
+                    nsec: "garbage".to_string(),
+                    browse_key_hex:
+                        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+                            .to_string(),
+                    transport_secret_hex:
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                            .to_string(),
+                })
+                .expect("planting a corrupted identity must itself succeed");
+
+            let err = get_identity(app.state::<DataStore>(), app.state::<SharedIdentity>())
+                .await
+                .unwrap_err();
+            assert!(
+                err.starts_with("Stored identity is corrupted:"),
+                "the corrupted-stored guard must fire, got {err}"
+            );
+        }
+
+        /// The other side: a HEALTHY stored identity with a cold in-memory state is loaded, cached
+        /// into the shared state, and returns real info.
+        #[tokio::test]
+        async fn get_identity_loads_and_caches_a_healthy_stored_identity() {
+            let app = guard_app(true);
+            let expected = app.state::<DataStore>().load_identity().unwrap().unwrap();
+            let info = get_identity(app.state::<DataStore>(), app.state::<SharedIdentity>())
+                .await
+                .expect("a healthy on-disk identity must load")
+                .expect("Some(info) — the file exists");
+            let expected_npub = AppIdentity::from_stored(&expected).unwrap().npub();
+            assert_eq!(info.npub, expected_npub);
+            assert!(
+                app.state::<SharedIdentity>().read().await.is_some(),
+                "a successful get_identity populates the shared state (the cache the fast path reads)"
+            );
+        }
+
+        /// The empty-profile side of the load: no in-memory state and no file → `Ok(None)`, the
+        /// signal the UI uses to show onboarding.
+        #[tokio::test]
+        async fn get_identity_returns_none_on_an_empty_profile() {
+            let app = guard_app(false);
+            let out = get_identity(app.state::<DataStore>(), app.state::<SharedIdentity>())
+                .await
+                .expect("an empty profile is Ok(None), never an error");
+            assert!(out.is_none());
+        }
+
+        // -- get_share_code: the no-identity-loaded refusal ----------------------------------------
+
+        /// With nothing loaded, `get_share_code` refuses — the command-level partner of the
+        /// in-memory fast path in `get_identity`.
+        #[tokio::test]
+        async fn get_share_code_refuses_when_no_identity_is_loaded() {
+            let app = guard_app(false);
+            let err = get_share_code(app.state::<SharedIdentity>()).await.unwrap_err();
+            assert_eq!(err, "No identity loaded.");
+        }
+
+        /// The pass side: a loaded identity yields its `hbk…` code (the UI's copyable string).
+        #[tokio::test]
+        async fn get_share_code_returns_the_loaded_identitys_code() {
+            let app = guard_app(false);
+            let id = AppIdentity::generate();
+            *app.state::<SharedIdentity>().write().await = Some(id);
+            let code = get_share_code(app.state::<SharedIdentity>())
+                .await
+                .expect("a loaded identity has a share code");
+            assert!(code.starts_with("hbk1"));
+        }
+
+        // -- validate_share_code: the codec gate ----------------------------------------------------
+
+        /// The parse guard through the command: garbage is `false`, a real code is `true`.
+        #[tokio::test]
+        async fn validate_share_code_command_pins_the_codec_gate() {
+            assert!(!validate_share_code("not a share code".into()).await.unwrap());
+            let id = AppIdentity::generate();
+            let real = id.share_code().unwrap();
+            assert!(validate_share_code(real).await.unwrap());
+        }
+
+        // -- backup_data: the write-failure refusal + the 0600 contract through the command ------
+
+        /// The whole command end-to-end: a plaintext export produces the on-disk archive (with the
+        /// HBK magic), and writing it to an unwritable path is the "Could not write backup file"
+        /// refusal — the command's own guard, not `backup_inner`'s.
+        #[tokio::test]
+        async fn backup_data_command_writes_the_archive_and_refuses_an_unwritable_path() {
+            let app = guard_app(true);
+            let dir = tempfile::tempdir().unwrap();
+            let good = dir.path().join("export.hb");
+            backup_data(
+                None,
+                good.to_str().unwrap().to_string(),
+                app.state::<DataStore>(),
+            )
+            .await
+            .expect("a populated profile exports");
+            let bytes = std::fs::read(&good).unwrap();
+            assert_eq!(&bytes[..4], b"HBK1", "the archive is a versioned HBK backup");
+            assert!(
+                bytes.len() > 72,
+                "header plus a non-empty body (the identity entry is in it)"
+            );
+
+            // The guard: the archive built fine, but the destination cannot be written — a
+            // DIRECTORY as the target makes `write_backup_file` fail at the open.
+            let err = backup_data(
+                None,
+                dir.path().to_str().unwrap().to_string(),
+                app.state::<DataStore>(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.starts_with("Could not write backup file:"),
+                "the write-failure guard must fire after the archive is built, got {err}"
+            );
+        }
+
+        /// The mode is honoured through the command: a passphrase export is recognised as encrypted
+        /// by `is_encrypted_backup` (the UI's "needs a passphrase" oracle).
+        #[tokio::test]
+        async fn backup_data_command_seals_a_passphrase_export() {
+            let app = guard_app(true);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("locked.hb");
+            backup_data(
+                Some("a-real-passphrase-12chars".into()),
+                path.to_str().unwrap().to_string(),
+                app.state::<DataStore>(),
+            )
+            .await
+            .expect("a populated profile exports with a passphrase");
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(&bytes[..4], b"HBK1");
+            assert!(
+                hb_core::is_encrypted_backup(&bytes).unwrap(),
+                "a passphrase export must read as encrypted (mode byte 1)"
+            );
+        }
+
+        // -- peek_backup / validate_backup / restore_data: the read-failure guard -----------------
+
+        /// The shared first guard of all three backup-consuming commands: a missing file is the
+        /// "Could not read backup file" refusal, verbatim, in each command.
+        #[tokio::test]
+        async fn backup_consumers_refuse_a_missing_backup_file() {
+            let app = guard_app(false);
+            let missing = "/nonexistent-hb-test/no-such-backup.hb".to_string();
+
+            let err = peek_backup(missing.clone()).await.unwrap_err();
+            assert!(err.starts_with("Could not read backup file:"), "peek_backup: {err}");
+
+            let err = validate_backup(None, missing.clone()).await.unwrap_err();
+            assert!(err.starts_with("Could not read backup file:"), "validate_backup: {err}");
+
+            let err = restore_data(
+                None,
+                missing,
+                app.state::<DataStore>(),
+                app.state::<SharedIdentity>(),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.starts_with("Could not read backup file:"), "restore_data: {err}");
+        }
+
+        /// The pass side of `peek_backup`'s second guard: a file that IS readable but is NOT an
+        /// HBK archive is the reasoned `cmd_err`, never a panic or a bare bool.
+        #[tokio::test]
+        async fn peek_backup_flags_a_non_backup_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("not-a-backup.hb");
+            std::fs::write(&path, b"just some bytes, no magic").unwrap();
+            let err = peek_backup(path.to_str().unwrap().to_string())
+                .await
+                .unwrap_err();
+            assert!(
+                err.starts_with("not a Hoardbook backup archive:"),
+                "the header-sniff guard must fire, got {err}"
+            );
+        }
+
+        /// The pass side for `validate_backup`: a REAL plaintext archive (made by `backup_data`
+        /// itself, so the fixture is the production bytes) validates clean, and a TAMPERED body is
+        /// refused.
+        #[tokio::test]
+        async fn validate_backup_accepts_a_real_archive_and_refuses_a_tampered_one() {
+            let app = guard_app(true);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("export.hb");
+            backup_data(
+                None,
+                path.to_str().unwrap().to_string(),
+                app.state::<DataStore>(),
+            )
+            .await
+            .expect("export for the fixture");
+            validate_backup(None, path.to_str().unwrap().to_string())
+                .await
+                .expect("the production archive validates clean");
+
+            // Tamper by REPLACING the tar body with garbage: a plaintext archive has no AEAD, so
+            // this destroys the tar structure outright and `validate_inner` must refuse it —
+            // deterministic, never dependent on which byte a flip happens to hit.
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes.truncate(72);
+            bytes.extend_from_slice(b"this is not a tar archive at all, just noise");
+            let tampered = dir.path().join("tampered.hb");
+            std::fs::write(&tampered, &bytes).unwrap();
+            let err = validate_backup(None, tampered.to_str().unwrap().to_string())
+                .await
+                .unwrap_err();
+            assert!(
+                !err.is_empty(),
+                "a tampered archive is refused with a reason, got {err}"
+            );
+        }
+
+        /// The pass side for `restore_data`: restoring a real archive into an EMPTY profile
+        /// succeeds end-to-end and loads the identity into the shared state.
+        #[tokio::test]
+        async fn restore_data_restores_a_real_archive_into_an_empty_profile() {
+            let source = guard_app(true);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("export.hb");
+            backup_data(
+                None,
+                path.to_str().unwrap().to_string(),
+                source.state::<DataStore>(),
+            )
+            .await
+            .expect("export for the fixture");
+            let expected =
+                AppIdentity::from_stored(&source.state::<DataStore>().load_identity().unwrap().unwrap())
+                    .unwrap()
+                    .npub();
+
+            let target = guard_app(false);
+            let info = restore_data(
+                None,
+                path.to_str().unwrap().to_string(),
+                target.state::<DataStore>(),
+                target.state::<SharedIdentity>(),
+            )
+            .await
+            .expect("a real archive restores into an empty profile");
+            assert_eq!(info.npub, expected, "the restored npub matches the source");
+            assert!(
+                target.state::<SharedIdentity>().read().await.is_some(),
+                "restore loads the identity into the shared state"
+            );
+        }
+
+        // -- wipe_data: the reset contract ----------------------------------------------------------
+
+        /// Wipe clears the persisted identity AND the in-memory one AND resets the endpoint
+        /// generation (the manifest-plane rule) — the full reset, observable end-to-end.
+        #[tokio::test]
+        async fn wipe_data_clears_disk_state_and_the_shared_identity() {
+            let app = guard_app(true);
+            // Load the session the way a running app would: a LIVE in-memory identity plus a bound
+            // plane. Without this the reset assertions are vacuous — the state starts empty.
+            *app.state::<SharedIdentity>().write().await = Some(AppIdentity::generate());
+            let endpoint = app.state::<SharedEndpoint>();
+            let generation_before = endpoint.read().await.generation;
+
+            let ok = wipe_data(
+                app.state::<DataStore>(),
+                app.state::<SharedIdentity>(),
+                endpoint.clone(),
+            )
+            .await
+            .expect("a populated profile wipes");
+            assert!(ok);
+
+            assert!(
+                !app.state::<DataStore>().identity_path().exists(),
+                "the identity file is gone"
+            );
+            assert!(
+                app.state::<DataStore>().load_identity().unwrap().is_none(),
+                "the store reads as empty afterwards"
+            );
+            assert!(
+                app.state::<SharedIdentity>().read().await.is_none(),
+                "the in-memory identity is cleared by the COMMAND, not left to the caller"
+            );
+            let generation_after = app.state::<SharedEndpoint>().read().await.generation;
+            assert!(
+                generation_after != generation_before,
+                "close_plane bumps the endpoint generation — the manifest plane must not outlive the identity"
+            );
+
+            // Wiping an ALREADY-empty profile is Ok(true), not an error (the wipe-after-wipe path).
+            assert!(
+                wipe_data(
+                    app.state::<DataStore>(),
+                    app.state::<SharedIdentity>(),
+                    app.state::<SharedEndpoint>(),
+                )
+                .await
+                .expect("wipe is idempotent from empty")
+            );
+        }
+
+        // The `Ok(None)` / `cmd_err` arms of `generate_keypair`'s third guard cannot be driven
+        // without restructuring: reaching `Err(e)` with `identity_path()` NOT existing requires a
+        // failure inside `load_identity` while its first statement (`!path.exists() → Ok(None)`)
+        // is false — i.e. an unreadable filesystem the test cannot manufacture through the public
+        // `DataStore` API. This is recorded here rather than hacked around.
+    }
 }

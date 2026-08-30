@@ -142,6 +142,19 @@ pub fn pool_is_live(statuses: &[RelayStatus]) -> bool {
             .any(|s| !matches!(s, RelayStatus::Terminated | RelayStatus::Banned))
 }
 
+/// Whether **any** relay is currently connected (`Connected` only — the state that can actually
+/// serve a REQ). The gap between this and [`pool_is_live`] is exactly the relay-outage hole
+/// (QURATOR-80's class, transient form): `pool_is_live` deliberately counts `Disconnected` as live
+/// because nostr-sdk *will retry*, which is the right call for rebuild policy — but during that
+/// retry window a fetch is issued against a pool where no relay can answer, and nostr-relay-pool
+/// (0.43.1) resolves that as `Ok(no events)`, not an error: `stream_events_targeted` logs-and-drops
+/// every per-relay failure (`tracing::error!`, never propagated) and an all-dropped fetch yields an
+/// empty stream. Zero connected relays ⇒ the empty answer carries no evidence any relay was even
+/// asked. Pure, so the classification is unit-tested without a relay.
+fn any_relay_connected(statuses: &[RelayStatus]) -> bool {
+    statuses.iter().any(|s| matches!(s, RelayStatus::Connected))
+}
+
 impl RelayClient {
     /// Connect to `relays`, waiting up to `timeout` for the websocket handshake. Fails if **no**
     /// relay completed the handshake — publishing against an unconnected relay silently fails
@@ -315,6 +328,17 @@ impl RelayClient {
     /// Fetch events by `filter`, **deduped by event id** across the relay set (a peer's event
     /// pulled from two relays collapses to one). A filter constraining nothing is refused before
     /// the query — an unbounded fetch is never issued.
+    ///
+    /// An all-relays-unreachable fetch is an **Err, not an empty Ok**. nostr-relay-pool 0.43.1
+    /// swallows per-relay failures (`stream_events_targeted` logs them and returns a stream that
+    /// yields nothing), so a fetch against a pool where every relay dropped resolves
+    /// `Ok(vec![])` — indistinguishable from a genuine "nothing matches". Callers that cache by
+    /// result (the Topics directory paint, QURATOR-145) would then overwrite a warm tree with the
+    /// empty state during an outage, the exact failure [`pool_is_live`]'s `Disconnected`-is-live
+    /// ruling leaves open on a shared warm client. The post-fetch status check closes it: with
+    /// **zero** relays `Connected` the answer cannot have come from any relay, so it is refused.
+    /// One-or-more connected relays returning nothing stays `Ok(vec![])` — that IS a genuine
+    /// empty, and turning it into an Err would be the opposite bug.
     pub async fn fetch(&self, filter: Filter, timeout: Duration) -> Result<Vec<Event>, NetError> {
         if filter.is_empty() {
             return Err(NetError::EmptyFilter);
@@ -324,6 +348,19 @@ impl RelayClient {
             .fetch_events(filter, timeout)
             .await
             .map_err(|e| NetError::Client(e.to_string()))?;
+        // The check runs on the EMPTY result only, and after the fetch: a non-empty answer proves a
+        // relay answered (and a connected pool that went down mid-fetch still returned its events),
+        // so only `Ok(vec![])` can be the outage masquerading as success.
+        if events.is_empty() {
+            let relays = self.client.relays().await;
+            let statuses: Vec<RelayStatus> = relays.values().map(|r| r.status()).collect();
+            if !any_relay_connected(&statuses) {
+                return Err(NetError::NoRelayConnected(format!(
+                    "{} relay(s) configured, none connected during the fetch",
+                    statuses.len()
+                )));
+            }
+        }
         Ok(dedup_by_id(events))
     }
 
@@ -525,6 +562,99 @@ mod tests {
         assert!(!pool_is_live(&[RelayStatus::Terminated]));
         assert!(!pool_is_live(&[RelayStatus::Terminated, RelayStatus::Banned]));
         assert!(!pool_is_live(&[]), "no relays = not live");
+    }
+
+    // ── The outage-vs-empty discriminator at the fetch seam (QURATOR-145 review, HIGH) ─────────
+
+    #[test]
+    fn any_relay_connected_false_for_every_non_connected_state() {
+        // The outage shape: a warm shared client whose relays ALL dropped. `pool_is_live` still
+        // says live (Disconnected is transient, nostr-sdk retries) so no rebuild happens — yet not
+        // one relay can serve a REQ. Also pinned: Terminated/Banned/empty, and the never-connected
+        // states (Initialized/Pending/Connecting), which all reach the same "no answer possible".
+        for statuses in [
+            vec![],
+            vec![RelayStatus::Disconnected],
+            vec![RelayStatus::Disconnected, RelayStatus::Disconnected],
+            vec![RelayStatus::Terminated],
+            vec![RelayStatus::Banned, RelayStatus::Terminated],
+            vec![RelayStatus::Initialized],
+            vec![RelayStatus::Pending],
+            vec![RelayStatus::Connecting],
+        ] {
+            assert!(
+                !any_relay_connected(&statuses),
+                "no Connected relay in {statuses:?} ⇒ nothing can answer a fetch"
+            );
+        }
+    }
+
+    #[test]
+    fn any_relay_connected_true_when_at_least_one_relay_is_connected() {
+        // A pool with one live connection CAN have answered — even if other relays are down or
+        // dead. This is the case that must stay `Ok(vec![])` (a genuine empty), so the
+        // discriminator has to return true here or genuine empties become false errors.
+        for statuses in [
+            vec![RelayStatus::Connected],
+            vec![RelayStatus::Connected, RelayStatus::Disconnected],
+            vec![RelayStatus::Disconnected, RelayStatus::Connected, RelayStatus::Terminated],
+            vec![RelayStatus::Connected, RelayStatus::Connecting],
+        ] {
+            assert!(any_relay_connected(&statuses), "{statuses:?} holds a connected relay");
+        }
+    }
+
+    #[test]
+    fn outage_pool_is_live_but_cannot_answer() {
+        // The seam the QURATOR-145 review found, pinned as one assertion: the all-Disconnected
+        // pool is simultaneously LIVE (rebuild policy must not churn it — nostr-sdk retries) and
+        // UNABLE to answer a fetch (no Connected relay). `fetch` therefore has to discriminate on
+        // `any_relay_connected`, NOT on `pool_is_live`; gating the Err on liveness would either
+        // never fire (Disconnected is live) or force a rebuild churn the M12 ruling forbids.
+        let outage = [RelayStatus::Disconnected, RelayStatus::Disconnected];
+        assert!(pool_is_live(&outage), "Disconnected is transient — the pool must not be rebuilt");
+        assert!(!any_relay_connected(&outage), "yet no relay can serve the REQ");
+    }
+
+    /// The warm-client outage, driven through the REAL `fetch` (QURATOR-145 review, HIGH). A
+    /// hand-built client whose only relay is unreachable is the exact shape the review traced:
+    /// `connect`-time reachability is not assumed (this client never had a Connected relay, but
+    /// the production pool had one and lost it — both land in "no relay can answer"), and
+    /// nostr-relay-pool 0.43.1 resolves the REQ as `Ok(no events)` because the per-relay failure
+    /// is logged-and-dropped in `stream_events_targeted`. Without the gate this is a successful
+    /// empty answer; with it, the caller can finally tell an outage from a genuine empty.
+    ///
+    /// Uses `ws://127.0.0.1:1` (connection refused, nothing listens) so the test needs no relay
+    /// server and no real network egress. The relay lands in Disconnected/reconnect-backoff states,
+    /// never Connected — which is precisely the state the gate refuses on.
+    #[tokio::test]
+    async fn fetch_errors_when_no_relay_is_connected() {
+        let url = "ws://127.0.0.1:1";
+        let client = Client::builder().build();
+        client.add_relay(url).await.expect("add_relay of a URL is offline bookkeeping");
+        // The handshake fails (port 1 refuses); try_connect reports the failure and the relay
+        // settles into Disconnected with reconnect backoff — the transient state pool_is_live
+        // deliberately tolerates.
+        let conn = client.try_connect(Duration::from_millis(500)).await;
+        assert!(
+            conn.success.is_empty(),
+            "the unreachable relay must not report a completed handshake"
+        );
+        let rc = RelayClient {
+            client,
+            relays: vec![url.to_string()],
+            limiter: Mutex::new(RelayRateLimiter::relay_writes()),
+            start: Instant::now(),
+        };
+        let filter = Filter::new().kind(Kind::from_u16(hb_core::event::KIND_TEASER)).limit(1);
+        let err = rc
+            .fetch(filter, Duration::from_secs(2))
+            .await
+            .expect_err("a fetch no relay could answer must be an Err, never an empty Ok");
+        assert!(
+            matches!(err, NetError::NoRelayConnected(_)),
+            "the outage must be reported as NoRelayConnected, got {err:?}"
+        );
     }
 
     // ── The write governor wired into publish/publish_to (ban-avoidance pacing) ────────────────

@@ -11,10 +11,10 @@ describe('TopicJoinConsent (M11 — F12 consent gate)', () => {
 		const { getByRole, getByLabelText } = render(TopicJoinConsent, {
 			props: { isPrivate: true, onjoin: () => joins.push(1) },
 		});
-		// The consent copy is present and names the durable members-only record.
+		// The consent copy is present and names the persistent members-only record.
 		const note = getByRole('note');
-		expect(note.textContent?.toLowerCase()).toContain('durable');
-		expect(note.textContent?.toLowerCase()).toContain('membership record');
+		expect(note.textContent?.toLowerCase()).toContain('members-only record');
+		expect(note.textContent?.toLowerCase()).toContain('stays on relays');
 
 		// The Join button is DISABLED until the user explicitly acknowledges (F12 — gate, not just prose).
 		const join = getByRole('button', { name: /join topic/i }) as HTMLButtonElement;
@@ -31,10 +31,10 @@ describe('TopicJoinConsent (M11 — F12 consent gate)', () => {
 		expect(joins.length).toBe(1);
 	});
 
-	it('public join: renders the "anyone who joins sees you" consent copy', () => {
+	it('public join: renders the "anyone can see you are a member" consent copy', () => {
 		const { getByRole } = render(TopicJoinConsent, { props: { isPrivate: false } });
 		const note = getByRole('note');
-		expect(note.textContent?.toLowerCase()).toContain('anyone who joins');
+		expect(note.textContent?.toLowerCase()).toContain('can see you are a member');
 	});
 
 	it('always surfaces the INV-2 "no listing unlock" note', () => {

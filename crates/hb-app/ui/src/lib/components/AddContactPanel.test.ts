@@ -113,7 +113,7 @@ describe('AddContactPanel — M20 W3 truncation affordance', () => {
 		// One hit returned, but the backend flagged more candidates existed (capped=true). Hit count
 		// is independent of the cap flag — one hit + capped=true still means "there are more".
 		const { findByText } = await discoverHits([makeHit()], {}, true);
-		const affordance = await findByText(/more matches exist/i);
+		const affordance = await findByText(/more matches than shown/i);
 		expect(affordance).toBeTruthy();
 		expect(affordance.getAttribute('role')).toBe('status');
 	});
@@ -121,7 +121,7 @@ describe('AddContactPanel — M20 W3 truncation affordance', () => {
 	it('shows no cap notice when the result is not capped', async () => {
 		// capped=false → no notice. Mutation probe: rendering the notice unconditionally reds this.
 		const { queryByText } = await discoverHits([makeHit()], {}, false);
-		expect(queryByText(/more matches exist/i)).toBeNull();
+		expect(queryByText(/more matches than shown/i)).toBeNull();
 	});
 });
 
@@ -364,7 +364,7 @@ describe('AddContactPanel — QURATOR-104 hit-card roster dedup', () => {
 			{ onadd },
 		);
 		// No stranger banner on the hit.
-		expect(queryAllByText(/unverified — not in your contacts/i).length).toBe(0);
+		expect(queryAllByText(/unverified · not in your contacts/i).length).toBe(0);
 		// The roster membership is shown (petname, distinct from the teaser display_name).
 		expect(await findByText('Keyed Pal')).toBeTruthy();
 		// No ENABLED "Add contact" button anywhere in the panel.
@@ -382,7 +382,7 @@ describe('AddContactPanel — QURATOR-104 hit-card roster dedup', () => {
 			[makeHit({ npub: KEYLESS, display_name: 'Online Persona' })],
 			{ onadd },
 		);
-		expect(queryAllByText(/unverified — not in your contacts/i).length).toBe(0);
+		expect(queryAllByText(/unverified · not in your contacts/i).length).toBe(0);
 		expect(await findByText('Bare Pal')).toBeTruthy();
 		const enabledAdds = getAllByRole('button')
 			.filter((b) => (b.textContent ?? '').trim() === 'Add contact' && !(b as HTMLButtonElement).disabled);
@@ -397,7 +397,7 @@ describe('AddContactPanel — QURATOR-104 hit-card roster dedup', () => {
 			[makeHit({ npub: UNKNOWN, display_name: 'Stranger' })],
 			{ onadd },
 		);
-		expect(await findByText(/unverified — not in your contacts/i)).toBeTruthy();
+		expect(await findByText(/unverified · not in your contacts/i)).toBeTruthy();
 		expect(addBtn).toBeTruthy();
 		expect((addBtn as HTMLButtonElement).disabled).toBe(false);
 		expect(getAllByRole('button', { name: 'Message' }).length).toBe(1);

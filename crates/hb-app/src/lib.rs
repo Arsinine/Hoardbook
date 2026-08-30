@@ -538,6 +538,8 @@ pub fn run() {
             commands::diagnostics::copy_diagnostics,
             // QURATOR-68 — the NAT classification token for the Settings → Diagnostics UI.
             commands::diagnostics::nat_classification,
+            // QURATOR-139 — brand click → the GitHub repo in the system browser (URL hard-coded).
+            commands::diagnostics::open_repo_page,
             commands::browse::import_manifest,
             // M18 W4 — the fulfil verb, both halves.
             commands::fulfil::send_full_list,
@@ -591,6 +593,8 @@ pub fn run() {
             commands::topics::topic_create,
             commands::topics::topic_update_meta,
             commands::topics::topic_discover,
+            commands::topics::topic_discover_paint,
+            commands::topics::topic_rank,
             commands::topics::topic_lookup,
             commands::topics::topic_join_public,
             commands::topics::topic_redeem_invite,

@@ -12,7 +12,7 @@ export function canAnnounce(remainingSecs: number): boolean {
 export function cooldownLabel(remainingSecs: number): string {
 	if (canAnnounce(remainingSecs)) return 'Announce';
 	const mins = Math.max(1, Math.ceil(remainingSecs / 60));
-	return `Announce — ready in ${mins} min`;
+	return `Ready in ${mins} min`;
 }
 
 export const ANNOUNCE_EXPLAINER =

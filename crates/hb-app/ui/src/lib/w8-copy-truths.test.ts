@@ -31,6 +31,9 @@ describe('W8.1 — topic-channel copy describes PER-MESSAGE expiry, not a collec
 
 	it('the empty state explains per-message expiry rather than implying a window sweep', () => {
 		const copy = extractUserFacingSegments(chatSrc()).join('\n');
+		// The production line is "posts here expire 24h after they're sent" (lowercase, mid-sentence).
+		// 202a4e0 rewrote this assertion to the capitalised "Posts expire…" but never touched the
+		// page itself, so it stopped matching — pin the string the page actually renders.
 		expect(copy).toContain("posts here expire 24h after they're sent");
 	});
 
@@ -64,7 +67,7 @@ describe('W8.2 — the contact hint no longer suggests Reddit', () => {
 		// Removing the example must not leave the field meaningless — the point of the hint is to
 		// show what shape of thing belongs here.
 		const copy = extractUserFacingSegments(homeSrc()).join('\n');
-		expect(copy).toContain('a Discord/Matrix handle or an email');
+		expect(copy).toContain('a Discord or Matrix handle or an email');
 		expect(copy).toContain('you@example.com');
 	});
 

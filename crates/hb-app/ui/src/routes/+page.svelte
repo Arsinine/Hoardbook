@@ -1,12 +1,16 @@
 <script lang="ts">
-	import { saveProfile, publishProfile, publishCollection, unpublishCollection, deleteCollection, exportCollection, exportManifest, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec, collectionSourceAccessible, getCollections } from '$lib/api.js';
-	// M18 W5: Home and Chat are two entry points to ONE export — they read the same toast
-	// constant so they cannot drift into saying different things about what just happened.
-	import { MANIFEST_EXPORTED_TOAST } from '$lib/manifest-fulfil.js';
+	import { saveProfile, publishProfile, publishCollection, unpublishCollection, deleteCollection, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec, collectionSourceAccessible, getCollections } from '$lib/api.js';
+	// M18 W5 note (QURATOR-138): Home's export entry point is deleted; MANIFEST_EXPORTED_TOAST
+	// stays in $lib/manifest-fulfil.js, still used by Chat's fulfil path.
 	import { passphraseStrength } from '$lib/backup-export.js';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { profile, collections, identity, toast, appReady, homeDraft, identityLoadError, collectionsLoadError, loadCollectionsInto } from '$lib/stores.js';
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
+	// QURATOR-138: publish-by-default — the "Save draft" button is gone; every edit persists
+	// locally at once and publishes on a debounce through this controller (relay writes stay rare:
+	// N rapid edits coalesce into ONE publish, and the call still routes through the backend's
+	// shared relay-write governor).
+	import { createAutopublish, AUTOPUBLISH_TEST_DEBOUNCE_MS, setAutopublishDebounceForTests } from '$lib/profile-autopublish.js';
 	import { icons, socialIcons, avatarHue } from '$lib/icons.js';
 	import ScanDialog from '$lib/components/ScanDialog.svelte';
 	import AddCollectionModal from '$lib/components/AddCollectionModal.svelte';
@@ -69,7 +73,7 @@
 			});
 			if (!path) return; // dialog cancelled
 			await backupData(obBackupPass, path);
-			toast('Backup saved — keep it somewhere safe', 'success');
+			toast('Backup saved. Keep it somewhere safe.', 'success');
 			obBackupPass = '';
 			obStep = 2;
 		} catch (e) {
@@ -118,14 +122,15 @@
 		try {
 			// devtest #4: the picture lives on the shared profile store, but the editor `form` is what
 			// Save/Publish persist. Sync it back or the next publish rewrites `form` and reverts the image.
-			if (await applyProfilePicture(file)) form.picture = $profile?.picture;
+			// (applyProfilePicture saved+republished the profile itself, so the sync is not an edit.)
+			if (await applyProfilePicture(file)) syncFormFromStore(() => { form.picture = $profile?.picture; });
 		} catch (e) { toast(String(e), 'error'); }
 		finally { pictureBusy = false; }
 	}
 
 	async function handleRemovePicture() {
 		pictureBusy = true;
-		try { await removeProfilePicture(); form.picture = $profile?.picture; }
+		try { await removeProfilePicture(); syncFormFromStore(() => { form.picture = $profile?.picture; }); }
 		catch (e) { toast(String(e), 'error'); }
 		finally { pictureBusy = false; }
 	}
@@ -141,6 +146,9 @@
 
 	onMount(async () => {
 		profileWasPublished = await hasPublishedProfile().catch(() => false);
+		// Belt-and-braces: the published-check resolving can re-run reactive readers before the
+		// seed has armed; anything that slipped through is cancelled here.
+		autopublish.cancel();
 	});
 
 	// Capture the snapshot the moment BOTH the published-check has resolved true AND the profile
@@ -267,24 +275,54 @@
 	// Persist form in store across navigation — load from homeDraft first, then $profile.
 	let profileLoaded = $state(false);
 
-
-	async function handleSave() {
-		// R1 (display name required to publish) does not apply to a draft — a blank name stays a
-		// legal, unpublished draft. Trim before persisting so whitespace-only never sticks around.
-		form.display_name = form.display_name.trim();
-		saving = true;
-		try {
-			form.updated = new Date().toISOString();
-			form.est_size = totalBytes > 0 ? diskSize : undefined;
-			await saveProfile(form);
-			profile.set({ ...form });
-			toast('Profile saved');
-		} catch (e) {
-			toast(String(e), 'error');
-		} finally {
-			saving = false;
-		}
+	// ── QURATOR-138: publish-by-default ─────────────────────────────────────────
+	// `saving`/`handleSave` were only ever the "Save draft" button's state; the button is deleted
+	// (local persistence is now immediate, below). The flag stays for the onboarding name step,
+	// which is a one-shot Continue, not the profile editor.
+	// The canonical shape of `form` at save time — mirrors the old handleSave/handlePublish body.
+	// MUST be a pure snapshot: it is read from inside the homeDraft effect's reactive graph via the
+	// autopublish getter, so mutating `form` here (trim/stamp) would re-trigger that effect and
+	// loop edit→save→edit (observed: 49 publishes for one keystroke). Trim/stamp the COPY.
+	function formForSave(): Profile {
+		return {
+			...form,
+			display_name: form.display_name.trim(),
+			updated: new Date().toISOString(),
+			est_size: totalBytes > 0 ? diskSize : undefined,
+		};
 	}
+
+	const autopublish = createAutopublish(
+		() => formForSave(),
+		{
+			save: async (p) => { await saveProfile(p); profile.set({ ...p }); },
+			publish: () => publishProfile(),
+			onError: (msg) => toast(msg, 'error'),
+			// QURATOR-95 interaction: refresh the as-published snapshot when a debounced publish
+			// lands, or the status line keeps reading "Unpublished changes" after the write went
+			// out (unknown rendered as a confident negative). Only on SUCCESS — after a failure
+			// "Unpublished changes" is the honest state.
+			onPublished: () => { publishedSnapshot = stableProfileJson(form); },
+		},
+	);
+
+	// Every edit: persist locally NOW (homeDraft keeps the cross-navigation copy in sync too —
+	// see the homeDraft effect below) and arm the debounced publish.
+	function profileEdited() {
+		autopublish.edit();
+	}
+	// A store-driven refresh is NOT an edit: the picture pipeline (lib/profile-picture.ts) already
+	// saves AND republishes the profile itself; when the page syncs `form.picture` back from the
+	// store afterwards, that write must not arm a second, redundant publish burst on top of it.
+	let syncingFromStore = false;
+	function syncFormFromStore(apply: () => void) {
+		syncingFromStore = true;
+		try { apply(); } finally { syncingFromStore = false; }
+	}
+	// Flush-on-blur: the editor's inputs are inside .fields — one delegated focusout catches them
+	// all (typing then tabbing/clicking away must not wait out the debounce).
+	// Flush-on-navigate/destroy: onDestroy below.
+	onDestroy(() => { void autopublish.destroy(); });
 
 	async function handlePublish() {
 		if (!form.display_name.trim()) {
@@ -293,12 +331,14 @@
 		}
 		publishing = true;
 		try {
-			form.updated = new Date().toISOString();
-			form.est_size = totalBytes > 0 ? diskSize : undefined;
-			await saveProfile(form);
-			profile.set({ ...form });
+			// Reuse the canonical save shape (trimmed, stamped, sized) — as a SNAPSHOT, not a
+			// reassignment: `form = …` would re-run the homeDraft effect and arm a second,
+			// redundant debounced publish on top of this explicit one.
+			const p = formForSave();
+			await saveProfile(p);
+			profile.set({ ...p });
 			await publishProfile();
-			publishedSnapshot = stableProfileJson(form);
+			publishedSnapshot = stableProfileJson(p);
 			toast('Profile published to relay');
 		} catch (e) {
 			toast(String(e), 'error');
@@ -314,8 +354,7 @@
 			// devtest #7: a too-large collection publishes only a truncated paywall teaser — tell the user
 			// their browsers see a preview, not the whole thing.
 			if (summary.truncated) {
-				const hidden = Math.max(0, summary.total_items - summary.shown_items);
-				toast(`Published a preview — this collection is too large to publish in full, so ${hidden.toLocaleString()} of ${summary.total_items.toLocaleString()} items are hidden from browsers.`);
+				toast(`Published a preview. This collection is too large to publish in full, so people browsing it see ${summary.shown_items.toLocaleString()} of ${summary.total_items.toLocaleString()} items.`);
 			} else {
 				toast('Collection published');
 			}
@@ -360,7 +399,7 @@
 
 	function handleScannedCollection(collection: Collection) {
 		mergeCollectionIntoStore(collection);
-		toast(`Scanned "${collection.path_alias}" — ${collection.item_count} items`);
+		toast(`Scanned "${collection.path_alias}": ${collection.item_count} items`);
 	}
 
 	// The Details step already toasts its own "saved"/"published" message — just sync the store.
@@ -428,35 +467,23 @@
 		form.languages = form.languages.filter((_, idx) => idx !== i);
 	}
 
-	async function handleExport(slug: string, format: 'text' | 'markdown' | 'manifest') {
-		try {
-			if (format === 'manifest') {
-				// M16 W4: the full-listing manifest envelope → a user-picked `.hbmanifest` file.
-				// Hoardbook writes the file the user chose and moves no collection files (INV-4′). Since
-				// M18 W4 this is the FALLBACK, not the only route — the fulfil verb in Chat sends the
-				// same manifest over the transport plane when the asker can be reached.
-				const path = await saveDialog({
-					defaultPath: `${slug}.hbmanifest`,
-					filters: [{ name: 'Hoardbook manifest', extensions: ['hbmanifest'] }],
-				});
-				if (!path) return;
-				await exportManifest(slug, path);
-				// Was `'Manifest exported — send it with Mascara'` — user-facing copy naming a product
-				// that no longer has that role (courier framing retired 2026-07-26). Home and Chat are
-				// two entry points to ONE export; they now say the same thing because they read the
-				// same constant.
-				toast(MANIFEST_EXPORTED_TOAST(path.split(/[\\/]/).pop() ?? `${slug}.hbmanifest`));
-				return;
-			}
-			const text = await exportCollection(slug, format);
-			await navigator.clipboard.writeText(text);
-			toast('Copied to clipboard');
-		} catch (e) { toast(String(e), 'error'); }
-	}
+	// QURATOR-138: the Export affordance is deleted from the collections list (owner: "Delete the
+	// unpublish and export buttons in collections as well" — Export is a pure local affordance, no
+	// coupling; the Unpublish half of that sentence is held for an explicit owner ruling, INV-8).
+	// `exportCollection`/`exportManifest` stay in api.js untouched; so does the manifest fulfil
+	// path in Chat, which is a different surface that still needs them.
+
 	$effect(() => {
 		if ($appReady && !profileLoaded) {
 			form = $homeDraft ?? ($profile ? { ...$profile } : form);
 			profileLoaded = true;
+			// Seeding is not an edit: arm only AFTER the assignment (see the sync effect above for
+			// why the gate must be a separate flag), and cancel any timer the sync effect's
+			// synchronous re-run may have armed before this line.
+			autopublish.cancel();
+			// Defer arming a microtask: the sync effect re-runs synchronously on the seed write, and
+			// reading autopublishArmed in the same tick it was set would still see the armed pass.
+			Promise.resolve().then(() => { autopublishArmed = true; });
 		}
 	});
 	let langSuggestions = $derived(langInput.length > 0
@@ -475,9 +502,30 @@
 	let neverPublished = $derived(publishedSnapshot === null);
 	let totalBytes = $derived($collections.reduce((s, c) => s + (c.total_bytes ?? 0), 0));
 	let diskSize = $derived(totalBytes > 0 ? formatBytes(totalBytes) : '—');
-	// Keep homeDraft in sync whenever form changes.
+	// Keep homeDraft in sync whenever form changes — QURATOR-138: this is ALSO the edit signal for
+	// publish-by-default. Every form mutation the template can make (bind:value on name/bio/since,
+	// tag/lang/social helpers, picture) lands here, so one effect covers them all: persist locally
+	// immediately + arm the debounced publish.
+	//
+	// The seed write (`form = $homeDraft ?? …`) is NOT an edit: with Svelte's default `sync`
+	// flush, this effect re-runs synchronously after the seed effect assigns `form`, BEFORE the
+	// seed's own `autopublish.cancel()` line executes — so the seed armed a phantom publish on
+	// every mount and even fired a spurious local save. Arming is therefore gated on a separate
+	// one-shot flag the seed effect sets AFTER its assignment, which keeps hydration silent while
+	// every later form mutation still arms normally.
+	//
+	// The flag is deliberately a PLAIN variable, not `$state`: as `$state`, the deferred
+	// `autopublishArmed = true` write itself re-ran this effect (it reads the flag), passing the
+	// gate on hydration and arming a phantom edit + local save on every mount (QURATOR-100's
+	// "no error toast on a successful picture apply" caught the residue: the save rejected in
+	// jsdom and its onError toast landed). Non-reactive, the write can't re-trigger anything —
+	// only a real `form` mutation runs the edit arm below.
+	let autopublishArmed = false;
 	$effect(() => {
-		if (profileLoaded) homeDraft.set({ ...form });
+		if (profileLoaded) {
+			homeDraft.set({ ...form });
+			if (autopublishArmed && !syncingFromStore) profileEdited();
+		}
 	});
 	let nameInitial = $derived(form.display_name?.[0]?.toUpperCase() ?? 'Y');
 	let nameHue = $derived(avatarHue(nameInitial));
@@ -580,7 +628,7 @@
 					<div class="ob-card-sub">Hoardbook uses a Nostr key (your <span class="mono">npub</span>) as your identity. No email, no server account. It is stored encrypted on this device and never sent to a server.</div>
 					<div class="ob-notice">
 						<span class="ob-notice-icon">{@html icons.shield}</span>
-						<div class="ob-notice-text">Your key is stored locally and never transmitted. There is no recovery if you lose it — so you'll back it up next.</div>
+						<div class="ob-notice-text">Your key is stored locally and never transmitted. It can't be recovered if lost, so back it up in the next step.</div>
 					</div>
 					<button class="btn-primary btn-full" onclick={obGenerateKeypair} disabled={obGenerating}>
 						{obGenerating ? 'Generating…' : 'Generate my Hoardbook identity'}
@@ -590,14 +638,14 @@
 					</button>
 				{:else}
 					<div class="ob-card-title">Your identity is ready</div>
-					<div class="ob-card-sub">This is your <strong>share code</strong>. Give it only to people you want browsing your collections — anyone holding it can decrypt your listings.</div>
+					<div class="ob-card-sub">This is your <strong>share code</strong>. Anyone holding it can decrypt and browse your listings. Give it only to people you trust with that.</div>
 					<div class="ob-hbid-row">
 						<span class="ob-hbid mono">{$identity?.share_code ?? ''}</span>
 						<button class="btn-ghost btn-sm" onclick={() => { navigator.clipboard.writeText($identity?.share_code ?? ''); toast('Copied', 'success'); }}>Copy</button>
 					</div>
 					<div class="ob-notice" style="margin-top:12px">
 						<span class="ob-notice-icon">{@html icons.shield}</span>
-						<div class="ob-notice-text">Export a backup now and store it somewhere safe. <strong>If you lose this key your identity is gone — there is no recovery.</strong></div>
+						<div class="ob-notice-text">Export a backup now and store it somewhere safe. <strong>A lost key cannot be recovered.</strong></div>
 					</div>
 					<input class="hb-input" style="margin-top:10px" type="password" placeholder="Backup passphrase (min 12 characters)" bind:value={obBackupPass} />
 					{#if obBackupPass && !obBackupStrength.acceptable}
@@ -612,7 +660,7 @@
 				{/if}
 			{:else if obStep === 2}
 				<div class="ob-card-title">Name yourself</div>
-				<div class="ob-card-sub">Pick a display name — optional. You can change it and fill in the rest of your profile later from Home.</div>
+				<div class="ob-card-sub">Pick a display name (optional). You can change it and fill in the rest of your profile later from Home.</div>
 				<div class="field" style="margin-bottom:16px">
 					<label class="field-label" for="ob-name">Display name</label>
 					<input id="ob-name" class="hb-input" type="text" placeholder="e.g. DataHoarder_42"
@@ -648,11 +696,11 @@
 				</div>
 				<div class="ob-notice">
 					<span class="ob-notice-icon">{@html icons.shield}</span>
-					<div class="ob-notice-text"><strong>Linking warning:</strong> if this is a public key — or the same
-						key you use in Qurator or elsewhere — importing it links that identity to your Hoardbook
-						activity and de-pseudonymizes you. Only continue if you understand this.</div>
+					<div class="ob-notice-text"><strong>Linking warning:</strong> importing a key you use publicly, in
+						Qurator, or anywhere else ties that identity to your Hoardbook activity. Anyone who knows
+						the key will know this is you.</div>
 				</div>
-				<label class="ob-ack"><input type="checkbox" bind:checked={obImportWarnAck} /> I understand the linking implication.</label>
+				<label class="ob-ack"><input type="checkbox" bind:checked={obImportWarnAck} /> I understand.</label>
 				<input class="hb-input mono" style="margin-top:10px" type="password" placeholder="nsec1…" bind:value={obImportNsec} />
 				<button class="btn-primary btn-full" style="margin-top:10px" onclick={obImportExistingKey} disabled={!obImportWarnAck || !obImportNsec.trim() || obImporting}>
 					{obImporting ? 'Importing…' : 'Import key'}
@@ -672,18 +720,15 @@
 			<div class="topbar-title">My Profile</div>
 			<div class="topbar-sub">
 				{#if neverPublished}
-					<span class="pub-status pub-warn">● Not published yet — others can't find you in search until you publish</span>
+					<span class="pub-status pub-warn">● Not published yet. Others can't find you in search.</span>
 				{:else if profileDirty}
-					<span class="pub-status pub-warn">● Unpublished changes — re-publish to update your public listing</span>
+					<span class="pub-status pub-warn">● Unpublished changes. Publish again to update your public listing.</span>
 				{:else}
-					<span class="pub-status pub-ok">● Published — you're discoverable in search</span>
+					<span class="pub-status pub-ok">● Published. You're discoverable in search.</span>
 				{/if}
 			</div>
 		</div>
 		<div class="topbar-actions">
-			<button class="btn-ghost btn-sm" onclick={handleSave} disabled={saving}>
-				{saving ? 'Saving…' : 'Save draft'}
-			</button>
 			<button class="btn-primary btn-sm" class:publish-pulse={neverPublished && !publishing} onclick={handlePublish} disabled={publishing || !profileDirty || !form.display_name.trim()} title={!form.display_name.trim() ? 'Enter a display name before publishing' : !profileDirty ? 'No changes since last publish' : undefined}>
 				{publishing ? 'Publishing…' : profileDirty ? 'Publish profile' : 'Published ✓'}
 			</button>
@@ -723,7 +768,9 @@
 				/>
 			</div>
 
-			<div class="fields">
+			<!-- QURATOR-138 flush-on-blur: leaving any editor field pushes the pending burst out now
+			     instead of waiting out the debounce (typing then tabbing away must not drop it). -->
+			<div class="fields" onfocusout={() => { void autopublish.flush(); }}>
 				<div class="field">
 					<label class="field-label">Display name <span class="accent-dot">•</span></label>
 					<input class="hb-input" type="text" placeholder="e.g. DataHoarder_42" bind:value={form.display_name} />
@@ -777,12 +824,12 @@
 				</div>
 
 				<div class="field">
-					<label class="field-label">Contact hint<HintMarker label="Contact hint" text="How people can reach you outside Hoardbook — a Discord/Matrix handle or an email. It is kept out of your public profile, and how your contacts re-find you if you ever lose your key." /></label>
+					<label class="field-label">Contact hint<HintMarker label="Contact hint" text="How people reach you outside Hoardbook, like a Discord or Matrix handle or an email. It stays out of your public profile. If you ever lose your key, it's how your contacts find you again." /></label>
 					<input class="hb-input hb-input-mono" type="text" placeholder="you@example.com · @you:matrix.org" bind:value={form.contact_hint} />
 				</div>
 
 				<div class="field">
-					<label class="field-label">Region / City<HintMarker label="Region / City" text="Optional — fill this in if you're interested in local meetups." /></label>
+					<label class="field-label">Region / City<HintMarker label="Region / City" text="Optional. Fill this in if you're interested in local meetups." /></label>
 					<input class="hb-input" type="text" bind:value={form.location} />
 				</div>
 
@@ -892,7 +939,7 @@
 					     collections yet" negative. Same copy shape as Topics' Discover root machine. -->
 					<EmptyState
 						error
-						message="Couldn't load collections — the scan catalog didn't answer."
+						message="Couldn't load your collections."
 						onretry={retryCollectionsLoad}
 					/>
 				{:else if $collections.length === 0}
@@ -907,7 +954,6 @@
 							onpublish={() => handlePublishCollection(col.slug)}
 							onunpublish={() => handleUnpublishCollection(col.slug)}
 							onremove={() => handleDeleteCollection(col.slug)}
-							onexport={(detail) => handleExport(detail.slug, detail.format)}
 						/>
 					{/each}
 				{/if}

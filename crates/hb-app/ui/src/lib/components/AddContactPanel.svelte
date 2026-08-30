@@ -50,7 +50,7 @@
 		if (!id) return;
 		// devtest #14 self-guard — the same exact-match check the page used to run inline.
 		if (id === $identity?.npub) {
-			toast("That's your own ID — you can't add yourself as a contact.", 'error');
+			toast("That's your own ID. You can't add yourself as a contact.", 'error');
 			return;
 		}
 		loading = true;
@@ -335,7 +335,7 @@
 					</button>
 					{#if discoverOpen}
 						<div class="discover-body">
-							<div class="discover-sub">Search public profiles by name, bio, or tag. One term searches broadly; two or more tags narrow (pick tags from the list as you type). Only what people chose to announce is searchable — everyone's listings stay encrypted.</div>
+							<div class="discover-sub">Search public profiles by name, bio, or tag. Add more tags to narrow. Only what people announce is searchable. Listings stay encrypted.</div>
 							<div class="ct-row">
 								{#each DISCOVER_CONTENT_TYPES as ct (ct.value)}
 									<button type="button" class="ct-chip" class:ct-on={discoverTypes.includes(ct.value)}
@@ -411,7 +411,7 @@
 														<!-- QURATOR-104: roster hit — they ARE a contact, so no stranger banner. -->
 														<span class="hit-known" title="Already in your contacts">in your contacts</span>
 													{:else}
-														<span class="hit-stranger" title="Verify the fingerprint before trusting a stranger">unverified — not in your contacts</span>
+														<span class="hit-stranger" title="Verify the fingerprint before trusting a stranger">unverified · not in your contacts</span>
 													{/if}
 												</div>
 												{#if known}
@@ -431,7 +431,7 @@
 											{/if}
 											{#if hit.bio}<div class="hit-bio">{hit.bio}</div>{/if}
 											{#if hit.fingerprint}
-												<div class="hit-fp" title="Identity fingerprint — check it before trusting a stranger">
+												<div class="hit-fp" title="Identity fingerprint. Check it before trusting a stranger.">
 													<span class="hit-fp-swatch" style="background:{hit.fingerprint.colorHex}"></span>
 													{renderFingerprint(hit.fingerprint)}
 												</div>
@@ -442,7 +442,12 @@
 													{#each hit.tags.slice(0, 6) as t}<span class="hit-tag">#{t}</span>{/each}
 												</div>
 											{/if}
-											<div class="hit-locked">🔒 Listings locked<FeatureTooltip key="listings-locked" /></div>
+											<!-- QURATOR-134 sibling fix: a Discover hit is teaser-only (DISC3) — the panel holds
+										     NO listings data, so it cannot distinguish "published nothing" from "sealed". The
+										     old unconditional "Listings locked" asserted sealed listings exist for every hit,
+										     the same conflation one surface over. State the access fact (always true for a
+										     hit); the tooltip carries the ask-for-the-code explanation. -->
+										<div class="hit-locked">🔒 Needs share code to browse<FeatureTooltip key="listings-locked" /></div>
 										</div>
 									{/each}
 								</div>
@@ -460,7 +465,7 @@
 									<!-- M20 W3: the cap truncated the ranked set (more existed than SEARCH_CAP kept). Shown
 									     below the pager so the user knows there may be more matches beyond the cap. -->
 									<div class="discover-capped" role="status">
-										More matches exist — refine your search to narrow the results.
+										More matches than shown. Narrow your search.
 									</div>
 								{/if}
 							{:else}

@@ -25,7 +25,7 @@ describe('AB4b — petname binds to the npub, not the display name', () => {
 		const label = petnameFor('npub1impostor', 'Alice', contacts);
 		expect(label.verified).toBe(false);
 		expect(label.stranger).toBe(false);
-		expect(label.warning).toBe('not Alice — different key');
+		expect(label.warning).toBe('not Alice (different key)');
 		expect(label.label).toBe('Alice'); // shows the claimed name, but flagged
 	});
 

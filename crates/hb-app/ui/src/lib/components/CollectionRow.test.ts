@@ -48,20 +48,24 @@ describe('CollectionRow', () => {
 		expect(queryByRole('menuitem', { name: /^publish$/i })).toBeNull();
 	});
 
-	it('export_menu_opens_from_overflow_menu', async () => {
-		const exported = vi.fn();
-		const { container, findByRole } = render(CollectionRow, {
-			props: { collection: makeCollection(), onexport: exported },
+	it('q138_no_export_affordance_in_the_collections_menu', async () => {
+		// QURATOR-138 (owner 2026-08-27): "Delete the … export buttons in collections as well."
+		// The OverflowMenu entry (and its text/markdown/manifest submenu) is the collections-list
+		// export affordance — it must be GONE. `onexport` is removed from CollectionRow's Props
+		// entirely; nothing else in the tree passes it to this component.
+		const { container, findByRole, queryByRole } = render(CollectionRow, {
+			props: { collection: makeCollection() },
 		});
 
 		await openMenu(container);
-		await fireEvent.click(await findByRole('menuitem', { name: /^export$/i }));
-		const plainText = await findByRole('menuitem', { name: /plain text/i });
-		expect(plainText).toBeTruthy();
-
-		await fireEvent.click(plainText);
-		expect(exported).toHaveBeenCalledTimes(1);
-		expect(exported.mock.calls[0][0]).toEqual({ slug: 'movies', format: 'text' });
+		// The other actions are still there (this is a deletion of export, not of the menu).
+		expect(await findByRole('menuitem', { name: /^rescan$/i })).toBeTruthy();
+		expect(await findByRole('menuitem', { name: /^edit details$/i })).toBeTruthy();
+		// THE assertion: no Export item, none of its submenu formats.
+		expect(queryByRole('menuitem', { name: /^export$/i })).toBeNull();
+		expect(queryByRole('menuitem', { name: /plain text/i })).toBeNull();
+		expect(queryByRole('menuitem', { name: /markdown/i })).toBeNull();
+		expect(queryByRole('menuitem', { name: /manifest/i })).toBeNull();
 	});
 
 	it('remove_requires_confirm', async () => {

@@ -567,6 +567,14 @@ pub fn build_announce(author: &Identity, meta: &TopicMeta, now: u64) -> Result<E
 
 /// Verify + parse a public-Topic announce → its `TopicMeta` (with `private` forced false — an
 /// announced Topic is public by definition). No key is recoverable here (there is none to recover).
+///
+/// The payload's `name` is **derived-checked, never trusted** (QURATOR-133): `topic_id_for_name`
+/// (the same function `new_topic` uses) must re-derive the claimed `topic_id`, and the event must
+/// not be `#t`-tagged with a DIFFERENT category root than `topic_root(&name)` — so a validly-signed
+/// announce can never relabel a room it does not own or file it under a root it does not belong to.
+/// The root itself is derived, never read back from the tags (a correctly-named announce with only
+/// user tags stays valid — the root is implied by the name). Topics are user-agnostic: nobody owns
+/// a public Topic, so nobody gets to rename it — the name IS the identity.
 pub fn parse_announce(event: &Event) -> Result<TopicMeta, HbError> {
     verify_event(event)?;
     if event.kind != Kind::from_u16(KIND_TOPIC_ANNOUNCE) {
@@ -578,6 +586,21 @@ pub fn parse_announce(event: &Event) -> Result<TopicMeta, HbError> {
     let payload: AnnouncePayload = serde_json::from_str(&event.content)?;
     check_schema(payload.v)?;
     let mut meta = payload.meta;
+    if topic_id_for_name(&meta.name) != meta.topic_id {
+        return Err(HbError::InvalidEvent(format!(
+            "announce name '{}' does not derive to its claimed topic_id (QURATOR-133 relabel)",
+            meta.name
+        )));
+    }
+    let root = topic_root(&meta.name).ok_or_else(|| {
+        HbError::InvalidEvent(format!("announce name '{}' has no category root", meta.name))
+    })?;
+    if let Some(wrong) = event.tags.hashtags().find(|t| TOPIC_ROOTS.contains(t) && *t != root) {
+        return Err(HbError::InvalidEvent(format!(
+            "announce for '{}' is hashtag-rooted '{wrong}' but its name derives to root '{root}' (QURATOR-133 misfiling)",
+            meta.name
+        )));
+    }
     meta.private = false;
     Ok(meta)
 }
@@ -1244,6 +1267,79 @@ mod tests {
         let author = Identity::generate();
         let (meta, _key) = private_topic();
         assert!(build_announce(&author, &meta, NOW).is_err(), "a private Topic must be unlisted (no announce)");
+    }
+
+    // ── QURATOR-133: an announce is only valid for the room its name derives to ──────────────────
+
+    /// Test-only helper: an announce whose payload `meta` disagrees with its tags — exactly the
+    /// attacker shape (take a real topic_id, relabel the room) — signed by an arbitrary key so it is
+    /// otherwise a perfectly valid event. Built from raw parts rather than `build_announce` because
+    /// production would refuse to emit it.
+    fn forged_announce(
+        author: &Identity,
+        d_tag: &str,
+        meta: TopicMeta,
+        t_tags: Vec<String>,
+        now: u64,
+    ) -> Event {
+        let payload = serde_json::to_string(&AnnouncePayload { v: SCHEMA_V, meta }).unwrap();
+        let mut tags = vec![
+            Tag::identifier(d_tag.to_string()),
+            Tag::custom(TagKind::custom(TAG_SCHEMA), [SCHEMA_V.to_string()]),
+        ];
+        for t in t_tags {
+            tags.push(Tag::hashtag(t));
+        }
+        author
+            .sign(EventBuilder::new(Kind::from_u16(KIND_TOPIC_ANNOUNCE), payload).tags(tags).custom_created_at(Timestamp::from(now)))
+            .unwrap()
+    }
+
+    #[test]
+    fn announce_whose_name_does_not_derive_to_its_topic_id_is_rejected() {
+        // QURATOR-133: anyone can re-announce an existing topic_id under an arbitrary name. Without
+        // the derivation check the payload wins on recency and the directory shows their label.
+        let attacker = Identity::generate();
+        let (real, _key) = public_topic();
+        let mut forged = real.clone();
+        forged.name = "video/smear-campaign".to_string(); // a different room, same topic_id
+        let ev = forged_announce(&attacker, &real.topic_id, forged, vec![], NOW + 1);
+        assert!(
+            parse_announce(&ev).is_err(),
+            "an announce whose name does not derive to its topic_id must be rejected"
+        );
+    }
+
+    #[test]
+    fn announce_whose_hashtag_root_disagrees_with_topic_root_is_rejected() {
+        // QURATOR-133 second half: even a correctly-named room must not be filed under a root it
+        // does not belong to — no `#t` tag may be a category root other than topic_root(name).
+        let attacker = Identity::generate();
+        let (real, _key) = public_topic(); // root is `video`
+        let ev = forged_announce(
+            &attacker,
+            &real.topic_id,
+            real.clone(),
+            vec!["audio".to_string()], // wrong root: `topic_root("video/80s-anime")` is `video`
+            NOW + 1,
+        );
+        assert!(
+            parse_announce(&ev).is_err(),
+            "an announce #t-tagged with a root other than topic_root(name) must be rejected"
+        );
+    }
+
+    #[test]
+    fn well_formed_announce_still_parses() {
+        let author = Identity::generate();
+        let (meta, _key) = public_topic();
+        let ev = build_announce(&author, &meta, NOW).unwrap();
+        let parsed = parse_announce(&ev).unwrap();
+        assert_eq!(parsed.topic_id, meta.topic_id);
+        assert_eq!(parsed.name, meta.name);
+        assert_eq!(parsed.description, meta.description);
+        assert_eq!(parsed.tags, meta.tags);
+        assert!(!parsed.private);
     }
 
     #[test]

@@ -1,11 +1,15 @@
 <script lang="ts">
-	import { onMount, onDestroy } from 'svelte';
-	import { toast, contacts, identity, profile, topicAnnounceSummaries, announceSeen } from '$lib/stores.js';
+	import { onMount, onDestroy, tick } from 'svelte';
+	import { get } from 'svelte/store';
+	import { goto } from '$app/navigation';
+	import { toast, contacts, identity, profile, topicAnnounceSummaries, announceSeen, topicDirectoryCache } from '$lib/stores.js';
 	import {
+		pasteKey,
 		topicList,
 		topicCreate,
 		topicUpdateMeta,
-		topicDiscover,
+		topicDiscoverPaint,
+		topicRank,
 		topicLookup,
 		topicJoinPublic,
 		topicRedeemInvite,
@@ -17,7 +21,20 @@
 		topicAnnounceStatus,
 	} from '$lib/api.js';
 	import type { TopicView, DiscoveredTopic, TopicLookup, CachedPeer } from '$lib/types.js';
-	import { memberCountLabel, rosterLabel, unseenTopicAnnouncements, TOPIC_ROOTS, composeTopicPath, subPathLabel, createPrimaryAction } from '$lib/topics-view.js';
+	import {
+		rosterLabel,
+		unseenTopicAnnouncements,
+		TOPIC_ROOTS,
+		composeTopicPath,
+		topicRootOf,
+		subPathLabel,
+		createPrimaryAction,
+		interleaveRoundRobin,
+		orderByMemberCount,
+		TOPIC_GROUP_DRAW_CAP,
+		groupTopicsByRoot,
+		memberCountLabel,
+	} from '$lib/topics-view.js';
 	import { canAnnounce, cooldownLabel, ANNOUNCE_EXPLAINER } from '$lib/announce-view.js';
 	import { icons } from '$lib/icons.js';
 	import EmptyState from '$lib/components/EmptyState.svelte';
@@ -28,48 +45,48 @@
 	import ContactPicker from '$lib/components/ContactPicker.svelte';
 	import PersonRow from '$lib/components/PersonRow.svelte';
 
-	// Redesign (devtest 2026-06-25 #9): master–detail (My Topics list ↔ selected-topic detail),
-	// Create as a modal + Discover as a tab (forms are no longer always-on stacked cards), and the
-	// chat channel is a deep-link (its content lives in Chat since M11). Owner-chosen layout.
-	let tab: 'mine' | 'discover' = $state('mine');
+	// Redesign (devtest 2026-06-25 #9) → QURATOR-89 r3 W2: the master–detail shell keeps its shape
+	// but the master IS the directory now — every announced public Topic, grouped by path root,
+	// joined rows in white with the admin meta line, unjoined rows muted with their blurb. There is
+	// no My/Discover tab split anymore: the room list is the directory, painted by one relay read.
 	let createOpen = $state(false);
 
 	let mine: TopicView[] = $state([]);
 	let busy = $state(false);
 	// QURATOR-93: loadMine used to toast its failure and then fall through to the template, whose
 	// `mine.length === 0` branch rendered the confident "You haven't joined any Topics yet" negative
-	// on data that never arrived. Same rule as Discover's erroredRoots: a FAILED load is a separate
+	// on data that never arrived. Same rule as the tree error below: a FAILED load is a separate
 	// state; a later successful loadMine clears it (a stale error never hides a good list).
 	let mineLoadError = $state(false);
 
-	// Create form. W4: a PUBLIC Topic is a category root (picker — a bad root is unrepresentable) + a
-	// freeform sub-path (e.g. video / animation/anime). A PRIVATE Topic keeps a freeform name.
+	// Create form. W4: a Topic is a category root (picker — a bad root is unrepresentable) + a
+	// freeform sub-path (e.g. video / animation/anime). QURATOR-147 W5: PRIVATE Topics use the same
+	// picker — the owner ruling is that private obeys the public path convention, and before W5 the
+	// form offered private only a free-text name, so obeying meant knowing to type `video/foo` by
+	// hand (which is why legacy private Topics look like `back room`). The backend keeps a private
+	// name freeform and verbatim; `other` is the root for anything that wants a bare word.
 	let newRoot: string = $state(TOPIC_ROOTS[0]);
 	let newSubPath = $state('');
-	let newName = $state(''); // private (freeform) name
 	let newDesc = $state('');
 	let newPrivate = $state(false);
-	// The composed public path, previewed under the inputs.
-	let composedPublicName = $derived(composeTopicPath(newRoot, newSubPath));
+	// The composed path (root + sub-path), previewed under the inputs. Same for public and private.
+	let composedName = $derived(composeTopicPath(newRoot, newSubPath));
 
-	// devtest v0.12.1 #7: Discover-by-primitive — the six root categories, each expandable to every
-	// public Topic under it (no tag search). Results are fetched lazily on first expand + cached.
-	let expandedRoot: string | null = $state(null);
-	let rootTopics: Record<string, DiscoveredTopic[]> = $state({});
-	let loadingRoot: string | null = $state(null);
-	// QURATOR-80: a fetch FAILURE must not render as the confident negative "No public Topics under X
-	// yet" — that string is indistinguishable from a genuine empty, a timeout, an empty relay set, or
-	// an untagged announce. Track which roots FAILED so the surface can say "we could not reach the
-	// relays" (retryable) vs "the relays answered, there are none" (not). An error is NOT cached: a
-	// re-expand retries. Nor is a successful EMPTY (QURATOR-83) — only a non-empty list is cached.
-	let erroredRoots: Set<string> = $state(new Set());
-	// Request-generation guard for Discover, same shape as `lookupGeneration` below. A fetch already
-	// IN FLIGHT when a Topic is created would otherwise resolve afterwards and cache its PRE-PUBLISH
-	// result: at eviction time the key is still `undefined`, so deleting it is a no-op, and the late
-	// resolve then writes a stale NON-EMPTY list — which `toggleRoot` treats as terminal, hiding the
-	// user's own new Topic until restart. That is QURATOR-83 again by another route (codex). Bumped
-	// on every public create; a resolving fetch applies its result only if its generation still holds.
+	// QURATOR-144 W2 — the whole directory lives in the left pane on open. One paint fetch fills it;
+	// there is no per-root cache/retry machine anymore (that was the tab split's machine). Its
+	// QURATOR-80/85 error contract survives as ONE tree-level state: a failed paint is a retryable
+	// error, never the confident negative "no public Topics under X yet" — one error for the whole
+	// tree where there used to be six independent per-root ones.
+	let painted = $state(false);
+	let painting = $state(false);
+	let paintError = $state(false);
+	// QURATOR-83, carried into W2: a fetch already IN FLIGHT when a Topic is created would resolve
+	// afterwards and cache its PRE-PUBLISH result, hiding the user's own new Topic until restart.
+	// Bumped on every public create; a resolving paint applies its result only if its generation
+	// still holds.
 	let discoverGeneration = 0;
+	// The painted half of the directory (announced public Topics, counts null until ranked).
+	let directory: DiscoveredTopic[] = $state([]);
 
 	// The consent gate: which Topic (public name + private flag) is pending a join. For a private
 	// redeem, `issuerNpub` carries who vouches (surfaced in the consent modal); `mode: 'redeem'` routes
@@ -93,6 +110,20 @@
 	// bare inline text field.
 	let invitePickerOpen = $state(false);
 
+	// QURATOR-144 W2 — one selection drives one detail pane, and the row can now be an UNJOINED
+	// directory row (a grey row is never disabled: selecting it shows what a non-member can honestly
+	// be shown — blurb + claimed count + Join, never the roster). A joined selection re-uses `open`
+	// (which owns the roster fetch + generation guard); an unjoined selection only carries the id.
+	let selectedDiscoveredId: string | null = $state(null);
+	// The claimed count for the SELECTED unjoined Topic, fetched lazily on selection (never in the
+	// list — r4: the sidebar orders by counts, it never displays them; the detail pane is where a
+	// count is allowed to appear).
+	let selectedClaimed: number | null = $state(null);
+	// Which root groups the user has collapsed. A group starts OPEN if you are joined to something
+	// under it; pure-discovery groups start collapsed — modelled as a collapsed SET seeded from that
+	// rule (not an open set), so the default is computable and the user's toggles are remembered.
+	let collapsedRoots = $state(new Set<string>());
+
 	// Hoardbook Topics draft r1 — unread pill: the per-row twin of the Chat nav badge's announce
 	// share. The data is already polled app-wide (+layout.svelte); this is a pure render addition —
 	// no new fetch. A topic is "unseen" when its latest announcement is past its seen watermark; the
@@ -100,11 +131,8 @@
 	// the shared `announceSeen` store.
 	let unseenTopics = $derived(new Set(unseenTopicAnnouncements($topicAnnounceSummaries, $announceSeen).map((s) => s.topic_id)));
 
-	// Hoardbook Topics draft r1 — Discover search: filters ONLY across roots already expanded and
-	// successfully cached (pure client-side over already-fetched data). Deliberately NO fetch-on-
-	// search: `toggleRoot`'s fetch/cache/retry machine is pinned by three call-count tests
-	// (QURATOR-80/83/85), and an eager fetch here would break them. Coverage is therefore partial by
-	// design and says so (the hint below) rather than pretending to be full.
+	// QURATOR-144 W2 — the filter matches PATHS ONLY (owner ruling): every match is then
+	// self-evident in the row label. Matching groups are force-opened while a query is live.
 	let searchQuery = $state('');
 
 	// devtest v0.12.1 #8: a Topic's description is editable after creation (the name is immutable).
@@ -120,7 +148,14 @@
 	let announcing = $state(false);
 	let announceTicker: ReturnType<typeof setInterval> | undefined;
 
-	onDestroy(() => { if (announceTicker) clearInterval(announceTicker); });
+	// The expand-rank coalescing timer (declared with toggleGroup below, hoisted here so the
+	// unmount cleanup can see it): a pending window that outlives the component would fire
+	// rankDrawnRows against a destroyed tree.
+	let expandRankTimer: ReturnType<typeof setTimeout> | undefined;
+	onDestroy(() => {
+		if (announceTicker) clearInterval(announceTicker);
+		if (expandRankTimer) clearTimeout(expandRankTimer);
+	});
 
 	async function sendAnnounce() {
 		if (!openTopic || !announceBody.trim() || !canAnnounce(announceRemaining) || announcing) return;
@@ -145,19 +180,49 @@
 
 	async function loadMine() {
 		try {
-			mine = await topicList();
+			const next = await topicList();
+			// QURATOR-149: the JOIN TRANSITION opens the group, not a permanent override. `had` is
+			// read from the OLD `mine` before the assignment; a root that just GAINED a joined Topic
+			// un-collapses here (the original rationale, narrowed to the instant it was about: "a
+			// toggle collapsing it then a join landing"). `isCollapsed` no longer consults
+			// `rootsWithJoined`, so the chevron stays a live control afterwards — including in the
+			// groups the user actually works in.
+			const had = new Set(mine.map((t) => topicRootOf(t.name)));
+			mine = next;
 			mineLoadError = false;
+			const gained = new Set(next.map((t) => topicRootOf(t.name)).filter((r) => !had.has(r)));
+			if (gained.size > 0) collapsedRoots = new Set([...collapsedRoots].filter((r) => !gained.has(r)));
 		} catch (e) {
 			toast(String(e), 'error');
 			mineLoadError = true;
 		}
 	}
 
-	onMount(loadMine);
+	// QURATOR-145 (W3) — paint the CACHED tree instantly, refresh behind it. The cache is the
+	// last-known-good directory (see `topicDirectoryCache` in stores.ts): non-empty on arrival
+	// here means a populated tree, so the landing screen is instant and a slightly-stale list is
+	// harmless (W2's auto-population made it the landing screen, not something you went clicking
+	// for). An EMPTY cache paints nothing — there is no honest "instant" screen for a nothing we
+	// never had, and the fetch alone fills the pane (the QURATOR-80/83 rule: a cached NOTHING is
+	// indistinguishable from the feature being broken, so an empty is never cached at all).
+	// `painted` STAYS FALSE with a cached paint: this is a landing screen, not an answer — the
+	// background fetch still fires below and its result replaces `directory` as normal. The
+	// cached tree renders in PAINT order only, with NO eager rankDrawnRows: ranking fires when
+	// the fresh answer lands (the paint path's own call), and an eager pass on the cached rows
+	// would both double the open-time rank calls and mark those ids ranked, suppressing the fresh
+	// answer's rank pass over the same ids (rankedIds is page state the fresh paint inherits).
+	onMount(() => {
+		const cached = get(topicDirectoryCache);
+		if (cached.length > 0) {
+			directory = cached;
+		}
+		void loadMine();
+		void paintDirectory();
+	});
 
-	// The effective name to create: a freeform private name, or the composed category path for public.
-	let createName = $derived(newPrivate ? newName.trim() : composedPublicName);
-	let canCreate = $derived(newPrivate ? newName.trim().length > 0 : composedPublicName.length > 0);
+	// The effective name to create: the composed category path (public and private alike — W5).
+	let createName = $derived(composedName);
+	let canCreate = $derived(composedName.length > 0);
 
 	// devtest #11 — join-first: before minting a new PUBLIC Topic, check (debounced) whether its
 	// composed name already has a room. A private Topic never looks up (no announce exists to find).
@@ -171,7 +236,7 @@
 	let lookupGeneration = 0;
 
 	$effect(() => {
-		const name = composedPublicName;
+		const name = composedName;
 		// Clear immediately on any input change — pending state defaults to Create, never a stale
 		// Join carried over from a previous name.
 		topicNameLookup = null;
@@ -216,26 +281,20 @@
 			const createdName = createName;
 			const createdPrivate = newPrivate;
 			await topicCreate(createdName, newDesc.trim(), createdPrivate);
-			// QURATOR-83: a new public Topic in a root invalidates that root's cached Discover result so
-			// the next expand re-fetches (otherwise a previously-empty root stays empty until restart).
-			// A private Topic is unlisted, so no root is affected. Delete the single key by constructing a
-			// new object explicitly — a cached empty for this root is the stale value being evicted here.
+			// QURATOR-83, W2 form: a new PUBLIC Topic must be visible in the directory without a
+			// restart. There is no per-root cache to evict anymore — the whole tree re-paints (one
+			// read). A private Topic is unlisted, so the directory is unaffected.
 			if (!createdPrivate) {
-				const root = createdName.split('/')[0];
-				// Bump FIRST and unconditionally: a fetch in flight right now has a key that is still
-				// `undefined`, so the deletion below cannot reach it — only the generation can.
+				// Bump FIRST and unconditionally: a paint in flight right now can only be stopped by
+				// the generation — there is no cache key whose deletion would reach it.
 				discoverGeneration += 1;
-				if (root && rootTopics[root] !== undefined) {
-					const next: Record<string, DiscoveredTopic[]> = {};
-					for (const k in rootTopics) if (k !== root) next[k] = rootTopics[k];
-					rootTopics = next;
-				}
+				painted = false;
+				void paintDirectory();
 			}
-			newName = newSubPath = newDesc = '';
+			newSubPath = newDesc = '';
 			newRoot = TOPIC_ROOTS[0];
 			newPrivate = false;
 			createOpen = false;
-			tab = 'mine';
 			await loadMine();
 			toast('Topic created', 'success');
 		} catch (e) {
@@ -247,7 +306,7 @@
 			// consent gate (F12) still requires an explicit click.
 			if (!newPrivate && msg.includes('already exists')) {
 				try {
-					topicNameLookup = await topicLookup(composedPublicName);
+					topicNameLookup = await topicLookup(composedName);
 				} catch {
 					topicNameLookup = null;
 				}
@@ -257,64 +316,121 @@
 		}
 	}
 
-	// devtest v0.12.1 #7: expand a primitive (root category) to list every public Topic under it. The
-	// per-root fetch is lazy (first expand) + cached; the backend activity-ranks and caps the results.
-	async function toggleRoot(root: string) {
-		if (expandedRoot === root) {
-			expandedRoot = null;
-			return;
-		}
-		expandedRoot = root;
-		// A successful fetch caches NON-EMPTY results (the cache exists so switching roots isn't a
-		// relay round-trip each time). A cached genuine EMPTY (`[]`) is NOT terminal — QURATOR-83: an
-		// empty found before a Topic existed was cached forever, swallowing every later create in that
-		// root until restart. Now an empty is a miss: re-expand re-fetches. A FAILED fetch is NOT
-		// cached either: it lands in `erroredRoots` instead (QURATOR-80), so a re-expand retries.
-		const cached = rootTopics[root];
-		if ((cached !== undefined && cached.length > 0) || erroredRoots.has(root)) {
-			if (erroredRoots.has(root)) {
-				// Re-expand on an errored root = explicit retry: clear the error and re-fetch.
-				const next = new Set(erroredRoots);
-				next.delete(root);
-				erroredRoots = next;
-			} else {
-				return; // cached non-empty result — a genuine empty falls through to re-fetch
-			}
-		}
-		loadingRoot = root;
+	// QURATOR-143 W1 + QURATOR-144 W2 — the ONE-READ paint. Fires the single whole-directory query
+	// when the page opens (and after a public create re-dirties the tree) and fills the merged
+	// sidebar's directory half. Before W1 this was six per-root `topicDiscover` calls, each followed
+	// by a member_count round trip per topic found — ~600 relay round trips per page open, the exact
+	// burst the M16 relay-citizenship ruling forbids. Now: one read, no counts.
+	async function paintDirectory() {
+		if (painted || painting) return;
+		painting = true;
 		const generation = discoverGeneration;
+		let superseded = false;
 		try {
-			const found = await topicDiscover([root]);
-			// Drop the result if a Topic was published while this was in flight — it predates the
-			// publish, and caching it would re-hide the user's own Topic. The key stays absent, so the
-			// next expand re-fetches.
-			if (generation === discoverGeneration) {
-				rootTopics = { ...rootTopics, [root]: found }; // cache regardless — keyed by root
-				// QURATOR-85: a successful fetch clears a stale error on this root — the relays just
-				// answered, so "we could not reach them" is no longer true. Without this, an overlapping
-				// FAILED request can leave erroredRoots set AFTER a SUCCESSFUL one caches real topics, and
-				// the template checks the error branch first, hiding the list.
-				if (erroredRoots.has(root)) {
-					const next = new Set(erroredRoots);
-					next.delete(root);
-					erroredRoots = next;
-				}
+			const all = await topicDiscoverPaint([...TOPIC_ROOTS]);
+			// Dedupe by topic_id across roots (Codex 2026-08-15): the same topic can legitimately
+			// surface under several roots' tags — first seen wins, so the keyed #each never renders
+			// duplicate keys.
+			const seen = new Set<string>();
+			const uniq: DiscoveredTopic[] = [];
+			for (const d of all) {
+				if (seen.has(d.topic_id)) continue;
+				seen.add(d.topic_id);
+				uniq.push(d);
+			}
+			if (generation !== discoverGeneration) {
+				// A public create landed mid-flight: this answer predates it. The create's own
+				// paintDirectory() call bailed on the `painting` guard, so this resolve must chain
+				// the re-read itself (QURATOR-83 — the user's own Topic must not stay hidden).
+				superseded = true;
+			} else {
+				directory = uniq;
+				// QURATOR-151 — the fresh answer carries `member_count_estimate: null` for every row
+				// (the paint half fetches no counts), so any id in `rankedIds` is now a stale "its
+				// count is on screen" claim: the repaint just wiped it. Same treatment as the W3
+				// cache-paint gives the OPEN path — an inherited rankedIds would both hide the lost
+				// counts and suppress the re-fetch (the rank filter trusts the set), degrading the
+				// group's popularity order to paint order for the rest of the session.
+				rankedIds = new Set();
+				painted = true;
+				paintError = false;
+				// QURATOR-145 (W3): only a NON-EMPTY answer enters the cross-mount cache. An empty
+				// is never cached (a cached NOTHING is indistinguishable from broken — the exact
+				// QURATOR-80/83 bug this workstream exists to not recreate at ten times the
+				// visibility), and a FAILURE writes nothing (the catch below), so the next open
+				// always re-asks and the last-known-good tree survives to degrade to. The screen
+				// still takes the fresh EMPTY as truth (`directory = uniq` above) — only the CACHE
+				// is protected from it.
+				if (uniq.length > 0) topicDirectoryCache.set(uniq);
+				rankGeneration += 1;
+				void rankDrawnRows(rankGeneration);
 			}
 		} catch (e) {
-			// Only surface if this root is STILL the open one: a stale request for a category the user
-			// already switched away from must not error over the current one (codex). Keep the section
-			// expanded with an error status (distinct from the genuine-empty message) so the user can
-			// retry by collapsing + re-expanding — do NOT collapse to a confident negative.
-			if (expandedRoot === root) {
-				toast(String(e), 'error');
-				const next = new Set(erroredRoots);
-				next.add(root);
-				erroredRoots = next;
-			}
+			// QURATOR-80, one-tree form: a failed paint is a retryable error, NEVER the confident
+			// negative "no public Topics" — the surface says "we could not reach the relays" and
+			// keeps the retry affordance. `painted` stays false, so the Retry button re-paints.
+			// QURATOR-145 (W3): a failure also never touches the cross-mount cache, and it never
+			// blanks `directory` — whatever is on screen (cached-and-painted, or a fresh tree)
+			// STAYS on screen: degrade to last-known, never blank. `paintError` only renders the
+			// error branch when the tree is EMPTY (the template's `mergedRows.length === 0`
+			// guard), so a populated screen never swaps itself for the error surface either.
+			paintError = true;
+			toast(String(e), 'error');
 		} finally {
-			// Only clear the spinner if it belongs to THIS request — a stale resolve must not clear a
-			// newer root's loading state (codex).
-			if (loadingRoot === root) loadingRoot = null;
+			painting = false;
+		}
+		if (superseded) await paintDirectory();
+	}
+
+	// QURATOR-143 W1 — the lazy ranker: fetch member_count ONLY for rows that will actually be drawn
+	// (per-group cap + joined rows + the selected row), round-robin across roots, then re-order each
+	// group most-popular-first as the counts land. Bounded to concurrency 8 by hb-net (`topic_rank`);
+	// this side bounds the REQUEST to the drawn rows, which is the other half of the bound.
+	let rankedIds = $state(new Set<string>());
+	let rankGeneration = 0;
+	async function rankDrawnRows(generation: number) {
+		// Await the flush BEFORE consulting collapse state: this runs in the same turn that set
+		// `directory`, and the group-seeding $effect below (which writes collapsedRoots) has not
+		// run yet — reading isCollapsed now would see every group open.
+		await tick();
+		// Per-root queues of the ids that WILL be drawn, in draw order. Two exclusions, both because
+		// a queued id is a spent relay read:
+		//   — JOINED rows never enter the queue: the sidebar renders them from the local `mine`
+		//     record (mergedRows hardcodes member_count_estimate null for the joined half), and the
+		//     fold below only writes counts back into `directory`, so a joined id's result is
+		//     discarded — and it would still displace an unjoined row from the group's capped batch.
+		//   — COLLAPSED groups' rows wait: a queued-but-undrawn row is a read spent on nobody (GLM
+		//     review: a fresh user with everything collapsed was firing up to 6×25 reads for
+		//     invisible rows). The expand path ranks them lazily.
+		const queues: string[][] = [];
+		for (const root of TOPIC_ROOTS) {
+			const rows = rowsForRoot(root);
+			if (rows.length === 0) continue;
+			if (isCollapsed(root, true)) continue; // not drawn — not ranked until expanded
+			// The same visibleRows the template draws with — the queue is exactly what is drawn.
+			const drawn = visibleRows(rows).drawn
+				// A paint that already carried the count (a member's announce states one) IS the
+				// ordering datum — re-asking topicRank for it is the redundant call W2 forbids.
+				.filter((d) => !d.joined && !rankedIds.has(d.topic_id) && d.member_count_estimate === null);
+			if (drawn.length > 0) queues.push(drawn.map((d) => d.topic_id));
+		}
+		if (queues.length === 0) return;
+		// Round-robin interleave (r4: "never spend all budget on one root") — with two roots pending,
+		// neither drains the other's slots: the first 8 ids cannot all come from one root.
+		const ids = interleaveRoundRobin(queues);
+		try {
+			const ranks = await topicRank(ids);
+			if (generation !== rankGeneration) return; // a newer pass superseded this rank request
+			// Fold the counts in: unknown stays unknown (null), never 0.
+			const byId = new Map(ranks.map((r) => [r.topic_id, r.member_count_estimate]));
+			directory = orderByMemberCount(
+				directory.map((d) =>
+					byId.has(d.topic_id) ? { ...d, member_count_estimate: byId.get(d.topic_id)! } : d,
+				),
+			);
+			rankedIds = new Set([...rankedIds, ...ids]);
+		} catch {
+			/* ranking is best-effort ordering — the paint is the data; leave rows in paint order */
 		}
 	}
 
@@ -355,11 +471,21 @@
 	async function confirmJoin() {
 		if (!pendingJoin) return;
 		busy = true;
+		const name = pendingJoin.name;
 		try {
-			await topicJoinPublic(pendingJoin.name);
+			await topicJoinPublic(name);
 			pendingJoin = null;
-			tab = 'mine';
+			// The join may have been confirmed from the DETAIL pane of that same Topic: the stale
+			// unjoined selection would keep rendering "You're not a member yet" + a live Join for a
+			// Topic just joined (`directory` still carries its announce until the next paint, and
+			// `selectedDiscovered` derives from `directory`, so the stale view would win). Clear the
+			// unjoined selection and re-derive the detail from the joined record — the same
+			// joined-wins merge the sidebar row already flipped to.
+			selectedDiscoveredId = null;
+			selectedClaimed = null;
 			await loadMine();
+			const joined = mine.find((t) => t.name === name);
+			if (joined) await open(joined);
 			toast('Joined Topic', 'success');
 		} catch (e) {
 			toast(String(e), 'error');
@@ -405,7 +531,6 @@
 			const joined = await topicRedeemInvite(pendingJoin.topicId);
 			if (joined) {
 				pendingJoin = null;
-				tab = 'mine';
 				await loadMine();
 				toast(`Joined private Topic “${joined.name}”`, 'success');
 			} else {
@@ -438,6 +563,7 @@
 
 	async function open(t: TopicView) {
 		openTopic = t;
+		selectedDiscoveredId = null; // the two selection kinds are mutually exclusive
 		roster = [];
 		announceBody = '';
 		editingDesc = false;
@@ -490,6 +616,7 @@
 		picture?: string;
 		fingerprint?: CachedPeer['fingerprint'];
 		online: boolean;
+		isSelf: boolean;
 	} {
 		const self = $identity ? { npub: $identity.npub, display_name: $profile?.display_name } : null;
 		const isSelf = self !== null && npub === self.npub;
@@ -501,39 +628,206 @@
 			picture: contact?.profile?.picture,
 			fingerprint: contact?.fingerprint,
 			online: isSelf || contact?.online === true,
+			// QURATOR-146: the hand-off is for reaching OTHER people — you cannot DM yourself, and
+			// pasteKey rejects your own code, so the self row stays a plain non-interactive row.
+			isSelf,
 		};
 	}
 
-	// Hoardbook Topics draft r1 — Discover search corpus: every root that has been successfully
-	// fetched (a key in `rootTopics`), path-only per the draft's own choice (the name / sub-path
-	// label, never the description). Roots never expanded are simply not in the corpus, and the
-	// template says so instead of pretending full coverage. Pure array filtering — no fetches, no
-	// new state machine (`toggleRoot`'s cache/retry machine is pinned by the QURATOR-80/83/85
-	// call-count tests and stays untouched).
-	let searchResults = $derived.by(() => {
-		const q = searchQuery.trim().toLowerCase();
-		if (!q) return [] as DiscoveredTopic[];
-		// Codex review (2026-08-15): topic_discover is a TAG query (crates/hb-app/src/commands/
-		// topics.rs), not a strict name-prefix lookup, so the same topic_id can legitimately surface
-		// under more than one root's cache (e.g. a legacy/externally published announce carrying
-		// multiple root-category tags). Dedupe by topic_id — first-seen wins — or the `(d.topic_id)`
-		// keyed #each below renders duplicate keys.
-		const seen = new Map<string, DiscoveredTopic>();
-		for (const root of TOPIC_ROOTS) {
-			for (const d of rootTopics[root] ?? []) {
-				if (
-					!seen.has(d.topic_id) &&
-					(d.name.toLowerCase().includes(q) || subPathLabel(d.name).toLowerCase().includes(q))
-				) {
-					seen.set(d.topic_id, d);
-				}
-			}
+	// ── QURATOR-146 (Topics W4) — the roster hand-off: an interest-first search ends at a list of
+	// people, and a read-only list dead-ends the flow. Contacts and Topics are two paths to the same
+	// end (owner, 2026-08-27), so the roster row hands off to Chat with the SAME gesture Contacts
+	// already uses — double-click → `/chat?peer=<npub>`. No add-to-contacts button here: owner ruling
+	// "adding someone directly from the topic makes no sense. Makes more sense to talk to them first
+	// and then add them, from the chat page" — `upsert_topic_contact` stays unused by this page.
+	// A gesture with no affordance is invisible to a first-time user, so the row is also a real
+	// button: Enter on the focused row fires the same navigation, and the hover cue says what it does.
+	function openRosterChat(npub: string) {
+		// Svelte's SPA `goto` (same as Contacts' ondblclick) — no full page reload.
+		goto('/chat?peer=' + encodeURIComponent(npub));
+	}
+
+	// QURATOR-146 — hover a member → their bio, "much like contacts". Contacts has NO hovercard: it
+	// clamps the bio on the card face (bioExpanded/bioOverflows + $lib/bio-overflow.js) and shows it
+	// whole in the detail pane. The TREATMENT is the precedent (lazy-fetched, cached,
+	// absent-means-absent); the TRIGGER (hover on a roster row) is new here because a roster row has
+	// no card face to clamp onto — the row is one line, so the bio surfaces on hover instead. A roster
+	// npub need not be a contact, so the bio comes from their PUBLISHED profile via pasteKey(npub) —
+	// the existing helper that resolves a profile from just an npub (chat's fetchNonContactNames uses
+	// it for the same purpose); there is no second resolution path. ONE fetch per hovered person,
+	// cached; a hover NEVER sweeps the whole roster. TRI-STATE (GLM review, the QURATOR-134 idiom):
+	// a string is "asked and here it is", `false` is the honest "asked and there is none" (pasteKey
+	// resolves a profile with no bio just as truly as a profile with one), and `'retry'` is "couldn't
+	// ask — relay unreachable". A REJECTED resolve must not poison the cache: caching the failure as
+	// `false` asserted the bio absent for the rest of the session, across every roster that npub
+	// appears in, with no retry; the reject is recorded only as retry-later, so a later hover asks
+	// again. A resolved empty string ('') is a REAL bio that happens to be empty — rendered as-is
+	// under the string branch, never conflated with `false`'s stated-nothing line.
+	let rosterBios: Record<string, string | false | 'retry'> = $state({});
+	const fetchingBios = new Set<string>(); // in-flight guard — hover events re-fire on jitter
+	let rosterHover: string | null = $state(null);
+
+	async function rosterBioOnHover(npub: string) {
+		rosterHover = npub;
+		// Only a RESOLVED answer is final; a reject ('retry') asks again on the next hover.
+		const cached = rosterBios[npub];
+		if (cached !== undefined && cached !== 'retry') return;
+		if (fetchingBios.has(npub)) return; // already asking
+		fetchingBios.add(npub);
+		try {
+			const resolved = await pasteKey(npub);
+			// The local cache answers first for a saved contact: a petname-bearing local copy beats a
+			// possibly-staler relay copy, and skips the round-trip entirely.
+			const contact = $contacts.find((c) => c.npub === npub);
+			const bio = contact?.profile?.bio ?? resolved.profile?.bio ?? false;
+			rosterBios = { ...rosterBios, [npub]: bio };
+		} catch {
+			rosterBios = { ...rosterBios, [npub]: 'retry' }; // couldn't ask — NOT absent; a later hover retries
+		} finally {
+			fetchingBios.delete(npub);
 		}
-		return [...seen.values()];
+	}
+
+	// ── QURATOR-144 W2 — the self-populating sidebar ─────────────────────────────────────────
+	// Merged list: local `mine` ∪ discovered, keyed on topic_id, JOINED WINS — a joined public
+	// Topic renders from the local record (its name/description are what the member manages), never
+	// from the announce. Private joined Topics carry no announce and can never be discovered, so
+	// they simply ride the joined half. The row shape is a superset so one template serves both.
+	interface TreeRow {
+		topic_id: string;
+		name: string;
+		description: string;
+		joined: boolean;
+		private: boolean;
+		member_count_estimate: number | null;
+	}
+	let mineIds = $derived(new Set(mine.map((t) => t.topic_id)));
+	let mergedRows = $derived.by(() => {
+		const rows: TreeRow[] = mine.map((t) => ({
+			topic_id: t.topic_id,
+			name: t.name,
+			description: t.description,
+			joined: true,
+			private: t.private,
+			member_count_estimate: null,
+		}));
+		// `directory` is already deduped by topic_id inside paintDirectory, and the joined set wins:
+		// an announced topic you ARE in does not get a second row from its announce.
+		for (const d of directory) {
+			if (mineIds.has(d.topic_id)) continue;
+			rows.push({
+				topic_id: d.topic_id,
+				name: d.name,
+				description: d.description,
+				joined: false,
+				private: false,
+				member_count_estimate: d.member_count_estimate,
+			});
+		}
+		return rows;
 	});
-	// Partial-coverage hint: true while at least one root category has never been fetched, so the
-	// search can only speak for the expanded subset.
-	let searchCoveragePartial = $derived(TOPIC_ROOTS.some((root) => rootTopics[root] === undefined));
+	// The path-only filter (owner ruling): matches `name` only — never the description — so every
+	// match is self-evident in the row label itself. Matching groups are force-opened.
+	let filteredRows = $derived.by(() => {
+		const q = searchQuery.trim().toLowerCase();
+		if (!q) return mergedRows;
+		return mergedRows.filter((r) => r.name.toLowerCase().includes(q));
+	});
+	// QURATOR-147 W5: one shared root derivation (`topicRootOf`) feeds the row filter and the group
+	// seed below — a name whose first segment is not a category root (e.g. the legacy rootless
+	// private "back room") must land under `other` here exactly as it does in `groupTopicsByRoot`,
+	// or the group header and its rows would disagree.
+	function rowsForRoot(root: string): TreeRow[] {
+		return filteredRows.filter((r) => topicRootOf(r.name) === root);
+	}
+	let groups = $derived(groupTopicsByRoot(filteredRows));
+
+	// Collapsed groups: seeded by the default-open rule (a group is open if you are joined to
+	// anything under it — a PRIVATE join opens its group too: the row is otherwise unreachable,
+	// hidden behind a collapsed header for a Topic you are a member of), pure-discovery groups
+	// start collapsed, user-toggled thereafter, and force-opened by a live filter. The seed runs
+	// once per root as that root first appears (`seededRoots` is a plain Set, not state — a later
+	// reorder or repaint must never re-collapse a group the user deliberately expanded).
+	// QURATOR-149: a join that LANDS under an already-seeded root opens it via `loadMine`'s
+	// transition (the `gained` un-collapse), so this set is ONLY the seed input — `isCollapsed`
+	// never consults it as an override.
+	let rootsWithJoined = $derived(new Set(mine.map((t) => topicRootOf(t.name))));
+	let seededRoots = new Set<string>();
+	$effect(() => {
+		for (const r of mergedRows) {
+			const root = topicRootOf(r.name);
+			if (seededRoots.has(root)) continue;
+			seededRoots.add(root);
+			if (!rootsWithJoined.has(root)) collapsedRoots = new Set([...collapsedRoots, root]);
+		}
+	});
+	function isCollapsed(root: string, hasMatches: boolean): boolean {
+		if (searchQuery.trim() && hasMatches) return false; // the filter force-opens matching groups
+		// QURATOR-149: no `rootsWithJoined` override here — the chevron must stay a live control in
+		// the groups the user works in. The join transition opens its group in `loadMine` instead.
+		return collapsedRoots.has(root);
+	}
+	function toggleGroup(root: string) {
+		const next = new Set(collapsedRoots);
+		if (next.has(root)) next.delete(root);
+		else next.add(root);
+		collapsedRoots = next;
+		// Expanding reveals rows the paint-time pass deliberately did NOT rank (collapsed groups
+		// were skipped so an invisible row never spent a read) — rank them now, lazily. Coalesced
+		// on a short window: opening several groups in quick succession (the W1 test's two-root
+		// case, or a user batch-opening) must still batch into ONE round-robin interleave, never
+		// one topicRank call per group.
+		scheduleExpandRank();
+	}
+	// The coalescing window for expand-triggered ranking (see toggleGroup). 100ms is "same burst"
+	// for human double-opens and test sequences alike, and stays imperceptible next to the relay
+	// round-trip it precedes.
+	const EXPAND_RANK_COALESCE_MS = 100;
+	function scheduleExpandRank() {
+		rankGeneration += 1; // any in-flight fold is superseded by this newer pass
+		const generation = rankGeneration;
+		if (expandRankTimer) clearTimeout(expandRankTimer);
+		expandRankTimer = setTimeout(() => {
+			expandRankTimer = undefined;
+			void rankDrawnRows(generation);
+		}, EXPAND_RANK_COALESCE_MS);
+	}
+
+	// The per-group draw cap (r4): a group draws its ~25 most popular rows and STATES the remainder
+	// ("+N more under X") — never a silent truncation (M9 posture). Joined rows are never truncated,
+	// so they are pulled out first and the cap spends what is left on the unjoined tail.
+	function visibleRows(rows: TreeRow[]): { drawn: TreeRow[]; remainder: number } {
+		const joinedRows = rows.filter((r) => r.joined);
+		const unjoined = rows.filter((r) => !r.joined);
+		const kept = unjoined.slice(0, Math.max(0, TOPIC_GROUP_DRAW_CAP - joinedRows.length));
+		return { drawn: [...joinedRows, ...kept], remainder: unjoined.length - kept.length };
+	}
+
+	// Selecting an unjoined row: show what a non-member can honestly be shown (blurb + claimed
+	// count + Join — never the roster). The claimed count is fetched lazily HERE (never in the
+	// list — r4: the sidebar orders by counts, never displays them); a rank already on file is
+	// reused so this is usually a cache hit, and null must never render as "0 claimed".
+	let selectedDiscovered = $derived(
+		selectedDiscoveredId === null ? null : directory.find((d) => d.topic_id === selectedDiscoveredId) ?? null,
+	);
+	async function selectDiscovered(d: DiscoveredTopic) {
+		selectedDiscoveredId = d.topic_id;
+		openTopic = null;
+		selectedClaimed = null;
+		if (d.member_count_estimate !== null) {
+			selectedClaimed = d.member_count_estimate;
+			return;
+		}
+		try {
+			const ranks = await topicRank([d.topic_id]);
+			// A stale resolve (the user moved on to another row) must not bind here.
+			if (selectedDiscoveredId === d.topic_id && ranks.length > 0) {
+				selectedClaimed = ranks[0].member_count_estimate;
+			}
+		} catch {
+			/* the count is cosmetic — the row's honest content does not depend on it */
+		}
+	}
 </script>
 
 <!-- TopBar — the shared app shell (see routes/+page.svelte, contacts, settings). -->
@@ -547,53 +841,138 @@
 		</div>
 	</div>
 	<div class="topbar-actions">
-		<div class="tabs">
-			<button class="tab" class:tab-active={tab === 'mine'} onclick={() => (tab = 'mine')}>My Topics</button>
-			<button class="tab" class:tab-active={tab === 'discover'} onclick={() => (tab = 'discover')}>Discover</button>
-		</div>
 		<button class="btn-primary" onclick={() => (createOpen = true)}>+ New Topic</button>
 	</div>
 </div>
 
 <div class="body">
-	{#if tab === 'mine'}
-		<section class="master-detail">
-			<!-- Left: My Topics list -->
-			<div class="list-pane">
-				{#if mineLoadError}
-					<!-- QURATOR-93: a FAILED loadMine is not the confident "You haven't joined any Topics
-					     yet" negative — same machine as Discover's erroredRoots one tab over. -->
+	<section class="master-detail">
+		<!-- Left: the merged directory tree (QURATOR-144 W2). Joined rows in white with the admin
+		     meta line; unjoined rows muted with their blurb + Join. Colour is never the only tell —
+		     the two states differ STRUCTURALLY (meta line + unread pill vs blurb + Join). -->
+		<div class="list-pane">
+			<!-- QURATOR-144 W2: path-only filter over the whole merged tree; matching groups are
+			     force-opened by `isCollapsed`. -->
+			<div class="discover-search">
+				<input
+					class="hb-input"
+					type="search"
+					placeholder="Filter by path…"
+					bind:value={searchQuery}
+					aria-label="Filter Topics by path"
+				/>
+			</div>
+			{#if mineLoadError && mergedRows.length === 0}
+				<!-- QURATOR-93: a FAILED loadMine is not the confident "You haven't joined any Topics
+				     yet" negative. QURATOR-152/154: the whole-pane error is only for a failure with
+				     NOTHING painted — see the inline notice in the tree branch below. -->
+				<EmptyState
+					error
+					message="Couldn't load your Topics."
+					onretry={loadMine}
+				/>
+			{:else if paintError && mergedRows.length === 0}
+				<!-- QURATOR-80, one-tree form: a failed paint is retryable, never the confident
+				     negative. -->
+				<EmptyState
+					error
+					message="Couldn’t reach the relays."
+					onretry={() => { painted = false; paintError = false; void paintDirectory(); }}
+				/>
+			{:else if mergedRows.length === 0}
+				<EmptyState message="Nothing here yet. Create a Topic, or join one from the directory." />
+			{:else}
+				{#each groups as g (g.root)}
+					{@const rows = rowsForRoot(g.root)}
+					{@const hasMatches = rows.length > 0}
+					{#if hasMatches || !searchQuery.trim()}
+						<div class="root-group">
+							<button class="root-header" onclick={() => toggleGroup(g.root)} aria-expanded={!isCollapsed(g.root, hasMatches)}>
+								<span class="root-chevron" class:open={!isCollapsed(g.root, hasMatches)}>{@html icons.chevronRight}</span>
+								<span class="root-name">{g.root}</span>
+								<span class="root-count muted">{rows.length}</span>
+							</button>
+							{#if !isCollapsed(g.root, hasMatches)}
+								{@const vis = visibleRows(rows)}
+								{#each vis.drawn as r (r.topic_id)}
+									{#if r.joined}
+										<!-- Joined: white, with the admin meta line (roster + channel live in the
+										     detail pane). Never truncated, never muted. -->
+										<button class="topic-row" class:topic-selected={openTopic?.topic_id === r.topic_id} onclick={() => open(mine.find((t) => t.topic_id === r.topic_id)!)}>
+											<div class="grow">
+												<div class="name">{r.name} {#if r.private}<span class="hb-tag">private</span>{/if}</div>
+												{#if r.description}<div class="muted">{r.description}</div>{/if}
+												<div class="muted row-meta">joined</div>
+											</div>
+											<!-- Unread pill (draft r1): this Topic's announcement is past its seen
+											     watermark. Mirrors the Chat nav-badge's visual language. -->
+											{#if unseenTopics.has(r.topic_id)}
+												<span class="unread" title="New announcement"></span>
+											{/if}
+										</button>
+									{:else}
+										<!-- Unjoined: the announce's own blurb + a Join affordance. `--fg-muted`,
+										     NOT `--fg-dim` — dim fails contrast on --bg-raised and a whole
+										     directory under 4.5:1 is a defect, not a state. Never disabled. -->
+										<div class="row tree-child unjoined" role="button" tabindex="0" onclick={() => selectDiscovered(directory.find((d) => d.topic_id === r.topic_id)!)} onkeydown={(e) => e.key === 'Enter' && selectDiscovered(directory.find((d) => d.topic_id === r.topic_id)!)}>
+											<div class="grow">
+												<div class="name">{subPathLabel(r.name) || r.name}</div>
+												{#if r.description}<div class="blurb">{r.description}</div>{/if}
+											</div>
+											<!-- The Join button stops propagation: without it the click also bubbles into
+											     the row's own click-to-select handler, firing an unwanted extra topicRank
+											     call for a Topic the user is about to join. -->
+											<button class="btn-default" onclick={(e) => { e.stopPropagation(); askToJoin(r.name, false); }}>Join</button>
+										</div>
+									{/if}
+								{/each}
+								{#if vis.remainder > 0}
+									<!-- r4 / M9 posture: the cap states its remainder, never a silent
+									     truncation. Joined rows are never truncated (visibleRows). -->
+									<div class="root-status muted">+{vis.remainder} more under {g.root}</div>
+								{/if}
+							{/if}
+						</div>
+					{/if}
+				{/each}
+				{#if groups.length === 0}
+					<!-- A filter that matches nothing: an honest empty, not an error. -->
+					<EmptyState message="No Topics match that path." />
+				{/if}
+				<!-- GLM review: a failed paint with JOINED rows on screen used to show NOTHING — the
+				     tree silently read as "no public Topics exist" (the exact QURATOR-80 confusion
+				     this redesign exists to avoid). Keep the still-valid joined rows visible; the
+				     failure rides BELOW them in the same retryable error dialect, never as a blank. -->
+				{#if paintError && mergedRows.length > 0}
 					<EmptyState
 						error
-						message="Couldn't load your Topics — the listing didn't answer."
+						message="Couldn’t reach the relays — the directory may be stale."
+						onretry={() => { painted = false; paintError = false; void paintDirectory(); }}
+					/>
+				{/if}
+				<!-- QURATOR-152/154 (W2 merge + W3 instant paint): a failed LOCAL `topicList` read is the
+				     "joined Topics" half's failure — it must not replace a directory that just painted
+				     (from cache or fresh). It rides BELOW the tree in the same retryable error dialect
+				     the paintError banner above uses, never as a blank pane. -->
+				{#if mineLoadError}
+					<EmptyState
+						error
+						message="Couldn't load your Topics."
 						onretry={loadMine}
 					/>
-				{:else if mine.length === 0}
-					<EmptyState message="You haven’t joined any Topics yet. Create one, or switch to Discover." />
-				{:else}
-					{#each mine as t (t.topic_id)}
-						<button class="topic-row" class:topic-selected={openTopic?.topic_id === t.topic_id} onclick={() => open(t)}>
-							<div class="grow">
-								<div class="name">{t.name} {#if t.private}<span class="tag">private</span>{/if}</div>
-								{#if t.description}<div class="muted">{t.description}</div>{/if}
-							</div>
-							<!-- Hoardbook Topics draft r1 — unread pill: this topic's announcement is past its
-							     seen watermark (boolean only; no per-topic count exists in this data shape).
-							     Mirrors the Chat nav-badge's visual language (+layout.svelte .nav-badge). -->
-							{#if unseenTopics.has(t.topic_id)}
-								<span class="unread" title="New announcement"></span>
-							{/if}
-						</button>
-					{/each}
 				{/if}
-			</div>
+			{/if}
+			<button class="link" disabled={busy} onclick={redeemInvite}>Redeem a private Topic invite</button>
+		</div>
 
-			<!-- Right: detail (roster + invite + chat deep-link) -->
+			<!-- Right: detail (roster + invite + chat deep-link for a joined Topic; the honest
+			     non-member view — blurb + claimed count + Join — for an unjoined one. A grey row is
+			     never disabled: selecting it shows what a non-member can honestly be shown.) -->
 			<div class="detail-pane">
 				{#if openTopic}
 					<div class="detail-head">
 						<div class="grow">
-							<div class="detail-title">{openTopic.name} {#if openTopic.private}<span class="tag">private</span>{/if}</div>
+							<div class="detail-title">{openTopic.name} {#if openTopic.private}<span class="hb-tag">private</span>{/if}</div>
 							<!-- devtest v0.12.1 #8: description is editable after creation (the name is not). -->
 							{#if editingDesc}
 								<div class="desc-edit">
@@ -613,10 +992,46 @@
 
 					<div class="detail-section">
 						<div class="section-label">Roster ({roster.length})</div>
+						<!-- QURATOR-146: each row is a real <button> (keyboard-reachable; Enter fires the
+						     same navigation as double-click) wrapped in the hover region. The bio rides the
+						     same hover as the chat hand-off so the row explains itself once. -->
 						<ul class="roster">
 							{#each roster as npub (npub)}
 								{@const row = rosterRowProps(npub)}
-								<li><PersonRow name={row.name} letter={row.letter} picture={row.picture} fingerprint={row.fingerprint} online={row.online} /></li>
+								{@const bio = rosterHover === npub ? rosterBios[npub] : undefined}
+								<li class="roster-item">
+									{#if row.isSelf}
+										<!-- The self row keeps r1's plain non-interactive form — there is no "talk to
+										     yourself" hand-off to offer. -->
+										<div class="roster-row self">
+											<PersonRow name={row.name} letter={row.letter} picture={row.picture} fingerprint={row.fingerprint} online={row.online} />
+										</div>
+									{:else}
+										<button
+											type="button"
+											class="roster-row"
+											title="Double-click or press Enter to open a chat with this member"
+											onfocus={() => rosterBioOnHover(npub)}
+											onblur={() => (rosterHover = rosterHover === npub ? null : rosterHover)}
+											onmouseenter={() => rosterBioOnHover(npub)}
+											onmouseleave={() => (rosterHover = rosterHover === npub ? null : rosterHover)}
+											ondblclick={() => openRosterChat(npub)}
+											onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); openRosterChat(npub); } }}
+										>
+											<PersonRow name={row.name} letter={row.letter} picture={row.picture} fingerprint={row.fingerprint} online={row.online} />
+											<span class="roster-cue" aria-hidden="true">chat ⏎</span>
+										</button>
+										{#if bio !== undefined && bio !== 'retry'}
+											<div class="roster-bio" role="tooltip">
+												<!-- Absent-means-absent: a resolved "no bio" is a stated nothing, never a
+												     blank card — the same honesty rule as PersonRow's omitted fingerprint.
+												     'retry' (a rejected resolve) renders NOTHING here — it is "couldn't
+												     ask", not "asked and there is none", and the next hover asks again. -->
+												{bio === false ? 'No published profile' : bio}
+											</div>
+										{/if}
+									{/if}
+								</li>
 							{/each}
 						</ul>
 					</div>
@@ -634,7 +1049,7 @@
 						<div class="announce-row">
 							<input
 								class="hb-input grow"
-								placeholder="a highlighted notice for all members…"
+								placeholder="Pushes a highlighted notice to all members' channel view for 24h. Limited to one per hour."
 								bind:value={announceBody}
 								onkeydown={(e) => e.key === 'Enter' && sendAnnounce()}
 								disabled={!canAnnounce(announceRemaining) || announcing}
@@ -647,120 +1062,62 @@
 								{announcing ? '…' : cooldownLabel(announceRemaining)}
 							</button>
 						</div>
-						<!-- Hoardbook Topics draft r1 — the terms are visible without hovering: the 24h/one-per-
-						     hour limits shouldn't be hidden behind the HintMarker tooltip (kept for the "?"
-						     affordance). The constant itself is unchanged; announce-view.test.ts pins it. -->
-						<div class="announce-terms">{ANNOUNCE_EXPLAINER}</div>
+						<!-- Owner, 2026-08-27: the terms moved INTO the placeholder and the label underneath was
+						     deleted. Same facts, one surface instead of two — the field now states its own terms
+						     where you are about to type, rather than restating them below the button. The
+						     HintMarker keeps the long-form ANNOUNCE_EXPLAINER for the "?" affordance, and
+						     announce-view.test.ts still pins that constant. -->
 					</div>
 
 					<a class="channel-link" href="/chat?topic={openTopic.topic_id}">💬 Open this Topic’s channel in Chat →</a>
+				{:else if selectedDiscovered}
+					<!-- W2: the non-member detail. The claimed count is fetched lazily on selection and
+					     renders ONLY here (r4: the sidebar orders by counts, never displays them); null
+					     is "unknown", never "0 claimed". -->
+					<div class="detail-head">
+						<div class="grow">
+							<div class="detail-title">{selectedDiscovered.name}</div>
+							{#if selectedDiscovered.description}
+								<div class="desc-row"><span class="muted">{selectedDiscovered.description}</span></div>
+							{:else}
+								<div class="desc-row"><span class="muted desc-empty">No description</span></div>
+							{/if}
+						</div>
+						<button class="btn-primary" disabled={busy} onclick={() => askToJoin(selectedDiscovered!.name, false)}>Join</button>
+					</div>
+					<div class="detail-section">
+						<div class="section-label">Members</div>
+						<div class="muted">
+							{#if selectedClaimed === null}
+								unknown
+							{:else}
+								{memberCountLabel(selectedClaimed)}
+							{/if}
+						</div>
+					</div>
+					<div class="muted">You’re not a member of this Topic yet. Joining is always gated by an explicit confirmation.</div>
 				{:else}
 					<div class="detail-empty">Select a Topic to see its roster, invite members, and open its chat channel.</div>
 				{/if}
 			</div>
 		</section>
-	{:else}
-		<!-- Discover tab — devtest v0.12.1 #7: browse public Topics by primitive (root category). No tag
-		     search; expand a category to fetch every public Topic under it (backend activity-ranked). -->
-		<section class="discover-tab">
-			<p class="muted discover-hint">Browse public Topics by category. Expand one to see every public Topic under it.</p>
-			<!-- Hoardbook Topics draft r1 — search across the already-fetched roots only. No fetch-on-
-			     search: toggleRoot's fetch/cache/retry machine is pinned by the QURATOR-80/83/85
-			     call-count tests and stays untouched, so typing never fires topicDiscover. -->
-			<div class="discover-search">
-				<input
-					class="hb-input"
-					type="search"
-					placeholder="Search expanded categories…"
-					bind:value={searchQuery}
-					aria-label="Search expanded categories"
-				/>
-				{#if searchQuery.trim()}
-					{#if searchCoveragePartial}
-						<span class="search-hint muted">Expand a category to search it too</span>
-					{:else}
-						<span class="search-hint muted">{searchResults.length} match{searchResults.length === 1 ? '' : 'es'} across all categories</span>
-					{/if}
-				{/if}
-			</div>
-			{#if searchQuery.trim()}
-				<!-- Filtered results replace the accordion while a query is live (the categories are the
-				     corpus being searched). Path-only per the draft's own choice — descriptions are not
-				     searched. Rows reuse the accordion's own row markup + Join action. -->
-				<div class="search-results">
-					{#if searchResults.length === 0}
-						<div class="root-status muted">No public Topics matching “{searchQuery.trim()}” in the expanded categories.</div>
-					{:else}
-						{#each searchResults as d (d.topic_id)}
-							<div class="row tree-child">
-								<div class="grow">
-									<div class="name">{subPathLabel(d.name) || d.name}</div>
-									{#if d.description}<div class="muted">{d.description}</div>{/if}
-									<div class="muted">{memberCountLabel(d.member_count_estimate)}</div>
-								</div>
-								<button class="btn-default" onclick={() => askToJoin(d.name, false)}>Join</button>
-							</div>
-						{/each}
-					{/if}
-				</div>
-			{:else}
-				{#each TOPIC_ROOTS as root (root)}
-					<div class="root-group">
-						<button class="root-header" onclick={() => toggleRoot(root)} aria-expanded={expandedRoot === root}>
-							<span class="root-chevron" class:open={expandedRoot === root}>{@html icons.chevronRight}</span>
-							<span class="root-name">{root}</span>
-						</button>
-						{#if expandedRoot === root}
-							{#if loadingRoot === root}
-								<div class="root-status muted">Loading…</div>
-							{:else if erroredRoots.has(root)}
-								<!-- QURATOR-80: a fetch failure is NOT the confident negative "No public Topics under X
-								     yet" — that string is indistinguishable from a genuine empty. This surface reads "we
-								     could not reach the relays" (retryable) so an unknown is never rendered as a confident
-								     negative. Collapsing + re-expanding retries (toggleRoot clears the error and re-fetches). -->
-								<div class="root-status root-error">
-									Couldn’t reach the relays for “{root}”. Collapse and re-expand to retry.
-								</div>
-							{:else if (rootTopics[root] ?? []).length === 0}
-								<div class="root-status muted">No public Topics under “{root}” yet.</div>
-							{:else}
-								{#each rootTopics[root] as d (d.topic_id)}
-									<div class="row tree-child">
-										<div class="grow">
-											<div class="name">{subPathLabel(d.name) || d.name}</div>
-											{#if d.description}<div class="muted">{d.description}</div>{/if}
-											<div class="muted">{memberCountLabel(d.member_count_estimate)}</div>
-										</div>
-										<button class="btn-default" onclick={() => askToJoin(d.name, false)}>Join</button>
-									</div>
-								{/each}
-							{/if}
-						{/if}
-					</div>
-				{/each}
-			{/if}
-			<button class="link" disabled={busy} onclick={redeemInvite}>Redeem a private Topic invite</button>
-		</section>
-	{/if}
 </div>
 
 <!-- Create-a-Topic modal (devtest #9: was an always-on card; now invoked from "+ New Topic"). -->
 <Modal open={createOpen} title="New Topic" closeOnBackdrop={false} onclose={() => (createOpen = false)}>
 	<div class="create-fields">
-		{#if newPrivate}
-			<input class="hb-input" placeholder="name (freeform, e.g. back room)" bind:value={newName} />
-		{:else}
-			<!-- W4: a public Topic is a category root (picker) + freeform sub-path. The root picker
-			     makes a non-category root unrepresentable; the backend re-validates authoritatively. -->
-			<div class="path-row">
-				<select class="hb-input" bind:value={newRoot}>
-					{#each TOPIC_ROOTS as r}<option value={r}>{r}</option>{/each}
-				</select>
-				<span class="path-sep">/</span>
-				<input class="hb-input grow" placeholder="sub-path (e.g. animation/anime) — optional" bind:value={newSubPath} />
-			</div>
-			<div class="muted path-preview">Topic path: <code>{composedPublicName}</code></div>
-		{/if}
+		<!-- W4: a Topic is a category root (picker) + freeform sub-path. The root picker makes a
+		     non-category root unrepresentable; the backend re-validates authoritatively. QURATOR-147
+		     W5: the SAME picker serves private Topics — private obeys the public path convention, so
+		     the convention is the path of least resistance, not folklore. -->
+		<div class="path-row">
+			<select class="hb-input" bind:value={newRoot}>
+				{#each TOPIC_ROOTS as r}<option value={r}>{r}</option>{/each}
+			</select>
+			<span class="path-sep">/</span>
+			<input class="hb-input grow" placeholder="optional sub-path (e.g. animation/anime)" bind:value={newSubPath} />
+		</div>
+		<div class="muted path-preview">Topic path: <code>{composedName}</code></div>
 		<input class="hb-input" placeholder="description" bind:value={newDesc} />
 		<label class="check"><input type="checkbox" bind:checked={newPrivate} /> Private (unlisted)</label>
 	</div>
@@ -813,15 +1170,6 @@
 
 	.body { flex: 1; min-height: 0; padding: 18px 22px; box-sizing: border-box; display: flex; flex-direction: column; }
 
-	.tabs { display: inline-flex; background: var(--bg-elev1); border: 1px solid var(--border); border-radius: 8px; padding: 2px; }
-	.tab {
-		padding: 5px 12px; border: none; background: transparent; color: var(--fg-muted);
-		font: inherit; font-size: 12.5px; border-radius: 6px; cursor: pointer;
-	}
-	/* M20 W4: converged to the accent-soft form (DESIGN_SYSTEM §3 "Segmented toggle") — matches
-	   Contacts' Name|Groups toggle exactly, replacing the off-system elev3 fill. */
-	.tab-active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
-
 	/* Master–detail — flat, matching Browse's .left-panel / Chat's .convo-sidebar: a divider, not a
 	   box. (Previously wrapped in a shared `.surface` card with a 16px gap between panes; that made
 	   Topics the only master-detail page boxed like Settings/Contacts instead of flat like its
@@ -848,12 +1196,10 @@
 	.section-label { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 1.2px; color: var(--fg-dim); }
 	.detail-empty { color: var(--fg-dim); font-size: 12.5px; margin: auto; text-align: center; max-width: 280px; }
 
-	/* Discover tab — devtest v0.12.1 #7: primitive (root category) accordion. */
-	.discover-tab {
-		flex: 1; min-height: 0; overflow-y: auto; padding: 16px;
-		display: flex; flex-direction: column; gap: 4px;
-	}
-	.discover-hint { margin-bottom: 6px; }
+	/* QURATOR-144 W2 — the directory tree in the list pane. Root groups collapse per the
+	   default-open rule (joined-under-it = open; pure discovery = collapsed). */
+	.discover-search { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+	.discover-search input { flex: 1; }
 	.root-group { border-top: 1px solid var(--divider); }
 	.root-group:first-of-type { border-top: none; }
 	.root-header {
@@ -864,17 +1210,21 @@
 	.root-header:hover { color: var(--accent); }
 	.root-chevron { display: flex; transition: transform 0.15s; color: var(--fg-dim); }
 	.root-chevron.open { transform: rotate(90deg); }
+	.root-count { font-size: 10.5px; font-weight: 400; margin-left: auto; }
 	.root-status { padding: 6px 0 6px 22px; }
-	/* QURATOR-80: the fetch-failure status is on the shared --error ramp (same token as .btn-danger),
-	   so an unknown reads visually distinct from the muted genuine-empty status, not as a confident
-	   negative. jsdom computes no layout — this colour is asserted in the source-scan test, not
-	   rendered by vitest. */
-	.root-error { color: var(--error); }
+	/* The joined row's admin meta line — a member's marker, structural (not colour-only): it is
+	   what makes the two row states differ for a screen reader and in greyscale. */
+	.row-meta { margin-top: 1px; }
+	/* Unjoined rows: --fg-muted, NOT --fg-dim — dim fails contrast on --bg-raised, and a whole
+	   directory under 4.5:1 is a defect, not a state. The row stays interactive (never disabled). */
+	.unjoined { color: var(--fg-muted); cursor: pointer; }
+	.unjoined:hover { background: var(--bg-elev2); border-radius: 7px; color: var(--fg); }
+	.unjoined .blurb { font-size: 11.5px; color: var(--fg-muted); }
 
 	/* Shared controls — M20 W4: inputs use the global .hb-input contract (app.css); the bare
 	   `input {}` element selector is gone (it filled --bg-elev2 and leaked onto modal fields). */
 	/* M15 W1: buttons unified on the app.css .btn system. `.link` stays a local text-link (no boxed
-	   equivalent in the shared system); `button:disabled` keeps the .tab/.link dim state. */
+	   equivalent in the shared system); `button:disabled` keeps the .link dim state. */
 	button:disabled { opacity: 0.5; cursor: not-allowed; }
 	button.link { background: transparent; border: none; color: var(--accent); text-align: left; padding: 4px 0; margin-top: 4px; cursor: pointer; }
 	.check { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--fg-muted); }
@@ -882,7 +1232,6 @@
 	.row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid var(--divider); }
 	.name { font-size: 13px; font-weight: 600; }
 	.muted { font-size: 11.5px; color: var(--fg-dim); }
-	.tag { font-size: 10px; color: var(--accent); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
 	.path-row { display: flex; align-items: center; gap: 6px; }
 	.path-sep { color: var(--fg-dim); }
 	.path-preview { font-size: 11px; }
@@ -900,23 +1249,55 @@
 	.desc-edit input { flex: 1; }
 	.roster { list-style: none; margin: 0; padding: 0; font-size: 12px; max-height: 200px; overflow-y: auto; }
 	.roster li { padding: 3px 0; }
+	/* QURATOR-146 — the row becomes the hover region AND the focusable hand-off. The button fills the
+	   row so the whole strip is clickable/keyboard-focusable; the cue appears only while the row is
+	   hovered or focused (the affordance a bare double-click gesture would never advertise). */
+	.roster-item { padding: 0; position: relative; }
+	.roster-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 8px;
+		width: 100%;
+		padding: 3px 4px;
+		background: transparent;
+		border: none;
+		border-radius: 5px;
+		color: inherit;
+		font: inherit;
+		text-align: left;
+		cursor: default;
+	}
+	.roster-row:hover, .roster-row:focus-visible { background: var(--bg-elev2); cursor: pointer; }
+	.roster-row:focus { outline: none; } /* :focus-visible carries the ring; a pointer click stays quiet */
+	.roster-row.self { cursor: default; } /* no hand-off for the self row — nothing to talk to */
+	.roster-cue { visibility: hidden; font-size: 10.5px; color: var(--fg-dim); white-space: nowrap; }
+	.roster-row:hover .roster-cue, .roster-row:focus-visible .roster-cue { visibility: visible; }
+	/* The bio surfaces under the row on hover/focus — inline expansion, NOT a floating hovercard
+	   (Contacts' precedent is an inline clamp + detail pane; a floating card is a new pattern this
+	   page deliberately does not introduce). max-height 0 → auto is a transition nicety only: jsdom
+	   computes no layout, so nothing here is visually proven by tests. */
+	.roster-bio {
+		margin: 2px 4px 4px 36px; /* aligns under the name, past the 24px avatar + 8px gap */
+		padding: 4px 8px;
+		font-size: 11.5px;
+		line-height: 1.45;
+		color: var(--fg-muted);
+		background: var(--bg-elev1);
+		border-left: 2px solid var(--accent);
+		border-radius: 4px;
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+	}
 	.invite { display: flex; gap: 6px; }
 	.announce-row { display: flex; gap: 6px; margin-top: 2px; }
 	.announce-row input { flex: 1; }
-	/* Hoardbook Topics draft r1 — the announce terms as an always-visible caption (a .dest-style
-	   small line: same 11.5px / --fg-dim ramp the page's .muted captions use). */
-	.announce-terms { font-size: 11.5px; color: var(--fg-dim); margin-top: 4px; }
 	/* Hoardbook Topics draft r1 — unread pill: the per-row announce share, on the nav-badge's accent
 	   fill (boolean only — this data shape carries no per-topic count). */
 	.unread {
 		width: 8px; height: 8px; border-radius: 999px; flex-shrink: 0;
 		background: var(--accent); box-shadow: 0 0 0 1px var(--bg-elev1);
 	}
-	/* Hoardbook Topics draft r1 — Discover search (filters the already-fetched roots; never fetches). */
-	.discover-search { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-	.discover-search input { flex: 1; }
-	.search-hint { flex-shrink: 0; font-size: 11px; }
-	.search-results { display: flex; flex-direction: column; }
 	.channel-link { display: inline-block; margin-top: 4px; font-size: 12px; color: var(--accent); text-decoration: none; }
 	.channel-link:hover { text-decoration: underline; }
 	/* M15 W2: the two Topic modals now use Modal.svelte; only the create form's field spacing is local. */

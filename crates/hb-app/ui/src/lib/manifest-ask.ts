@@ -86,7 +86,7 @@ export function manifestAskKey(npub: string, slug: string): string {
 /** The muted asked-state line. "Asked {relative} — waiting for their reply." Relative is the compact
  *  chat-preview label (now / 2m / 3h / Tue / Mar 4). Never contains "Download" (MAS-INV-5). */
 export const MANIFEST_ASKED_LINE = (relative: string) =>
-	`Asked ${relative} — waiting for their reply.`;
+	`Asked ${relative}. Waiting for their reply.`;
 
 /** The secondary "Ask again" button label. Disabled inside the cooldown; enabled after. */
 export const MANIFEST_ASK_AGAIN_LABEL = 'Ask again';
@@ -113,7 +113,7 @@ export const MANIFEST_ASK_AGAIN_COOLDOWN_TIP = (remainingSecs: number) => {
 /** The inline muted reason shown when a publish failed. The button stays in its un-asked state —
  *  "Failure is loud" (spec): a failed ask must never render as "Asked". */
 export const MANIFEST_ASK_FAILED_LINE = (reason: string) =>
-	`Couldn’t send the request — ${reason}. You can try again.`;
+	`Couldn’t send the request: ${reason}.`;
 
 // Compact relative time for the asked-state label. Mirrors `relativeTime` in chat-preview.ts:59 —
 // "now" / "2m" / "3h" / weekday / "Mar 4". Kept local (not imported) so this helper has zero

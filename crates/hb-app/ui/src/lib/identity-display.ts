@@ -50,7 +50,7 @@ export function petnameFor(npub: string, displayName: string, contacts: Contact[
 			label: displayName,
 			verified: false,
 			stranger: false,
-			warning: `not ${nameCollision.petname} — different key`,
+			warning: `not ${nameCollision.petname} (different key)`,
 		};
 	}
 	return { label: displayName, verified: false, stranger: true };
@@ -58,7 +58,7 @@ export function petnameFor(npub: string, displayName: string, contacts: Contact[
 
 /** A short, stable label for the unverified-stranger badge a tag-search hit carries until followed. */
 export function strangerBadge(label: DisplayLabel): string | null {
-	return label.stranger ? 'unverified — not in your contacts' : null;
+	return label.stranger ? 'unverified · not in your contacts' : null;
 }
 
 /**

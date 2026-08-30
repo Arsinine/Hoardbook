@@ -23,18 +23,12 @@ export type RowMenuItem =
 /** The overflow-menu items for a row, in display order. Publish/Unpublish is mutually exclusive by
  *  published state. */
 export function menuItems(col: Pick<Collection, 'published'>): RowMenuItem[] {
+	// QURATOR-138: the Export entry (and its text/markdown/manifest submenu) is deleted — owner:
+	// "Delete the … export buttons in collections as well." Unpublish stays pending an explicit
+	// owner ruling (INV-8: it is currently the only way to retract a published collection).
 	return [
 		{ key: 'rescan', label: 'Rescan' },
 		{ key: 'edit', label: 'Edit details' },
-		{
-			key: 'export',
-			label: 'Export',
-			submenu: [
-				{ key: 'text', label: 'Plain text' },
-				{ key: 'markdown', label: 'Markdown checklist' },
-				{ key: 'manifest', label: 'Manifest file (.hbmanifest)' },
-			],
-		},
 		col.published ? { key: 'unpublish', label: 'Unpublish' } : { key: 'publish', label: 'Publish' },
 		{ key: 'remove', label: 'Remove' },
 	];
@@ -52,6 +46,27 @@ export function badges(col: Pick<Collection, 'sorted' | 'visibility'>): RowBadge
 	if (col.sorted) out.push({ label: 'Sorted', kind: 'sorted' });
 	if ((col.visibility ?? 'Public') === 'Private') out.push({ label: 'Private', kind: 'private' });
 	return out;
+}
+
+// ── Type icon (QURATOR-140) ───────────────────────────────────────────────────────────────────────
+// A type icon means the collection IS that thing, so it is earned only by a PURE collection — one
+// single content type, from the fixed six-value enum the details form offers
+// (video/audio/image/text/software/other). Owner ruling 2026-08-27: "a video icon should be for a
+// pure video collection."
+//
+// Anything mixed falls to the folder, which is why the folder stays meaningful: it says "not one
+// thing" (mixed, Other, or not yet classified). Keying off content_types[0] instead would let a
+// video+audio collection wear the video icon and assert something false about its contents — the
+// user picks these in a form, so [0] is the first box they happened to tick, not a dominant type.
+export type RowIcon = 'video' | 'audio' | 'image' | 'text' | 'software' | 'folder';
+
+export function rowIcon(col: Pick<Collection, 'content_types'>): RowIcon {
+	const types = col.content_types ?? [];
+	if (types.length !== 1) return 'folder'; // mixed, or none set yet — never one thing
+	switch (types[0]) {
+		case 'video': case 'audio': case 'image': case 'text': case 'software': return types[0];
+		default: return 'folder'; // 'other', or an unrecognised value
+	}
 }
 
 // ── Size tiers (devtest 2026-08-26 item 6) ────────────────────────────────────────────────────────
@@ -87,9 +102,9 @@ export function sizeTierTooltip(itemCount: number): string | null {
 			// "100000 items and over", so the TIER is right — but the tooltip must not tell a
 			// 100,000-item collection it cannot be scanned, because it can. Phrased to hold at both
 			// ends: true at the cap, true past it.
-			return `${itemCount.toLocaleString()} items — at or past the ${MAX_COLLECTION_ITEMS.toLocaleString()}-item cap. Past the cap a collection can no longer be scanned or shared, so split this into smaller collections.`;
+			return `${itemCount.toLocaleString()} items is at or past the ${MAX_COLLECTION_ITEMS.toLocaleString()}-item cap. Past the cap a collection can no longer be scanned or published. Split it into smaller collections.`;
 		case 'warn':
-			return `${itemCount.toLocaleString()} items is approaching the ${MAX_COLLECTION_ITEMS.toLocaleString()}-item cap. Past that, this collection can no longer be scanned or shared.`;
+			return `${itemCount.toLocaleString()} items is approaching the ${MAX_COLLECTION_ITEMS.toLocaleString()}-item cap. Past that, this collection can no longer be scanned or published.`;
 		default:
 			return null;
 	}

@@ -110,6 +110,12 @@
 	// devtest v0.12.1 #4: a `/chat?peer=<npub>` deep-link (from double-clicking a contact) opens that
 	// conversation. Guarded so it fires once per distinct param, and re-evaluates as `$contacts` loads.
 	let peerDeepLinked = $state('');
+	// QURATOR-156: a rejected non-contact deep-link resolve dead-ended after one toast — the effect
+	// only re-runs on $page.url/$contacts changes, neither of which the chat poll touches. The flag
+	// drives an in-place Retry in the empty pane; the counter is the effect's retry dependency
+	// (clearing peerDeepLinked is a no-op on the failure path, where it was never set).
+	let peerResolveFailed = $state(false);
+	let peerResolveAttempt = $state(0);
 
 	// ── Topic channels (M11) — a Topic you've joined surfaces here as a persistent channel. The
 	//    channel ENTRY lasts as long as your membership (durable, §11), but its posts are 24h-ephemeral
@@ -608,10 +614,16 @@
 	// fetchNonContactNames(); never causes re-triggers because we only write when a key is absent.
 	let peerNameCache: Record<string, string> = {};
 	const fetchingNames = new Set<string>(); // prevents duplicate in-flight fetches
+	// QURATOR-155 cadence: an npub whose attempt has SETTLED (any outcome — resolved with a name,
+	// profileless, or relay-unreachable) so the poll-driven effect below does not re-fetch it every
+	// DM_POLL_VISIBLE_MS tick. A separate Set, not `peerNameCache[npub] = ''`: the guard below tests
+	// that value for truthiness, so an empty string would not skip. Entries live for the SESSION —
+	// this is a cadence guard, not a permanent verdict about the peer.
+	const settledNames = new Set<string>();
 
 	async function fetchNonContactNames(npubs: string[]) {
 		for (const npub of npubs) {
-			if (fetchingNames.has(npub) || peerNameCache[npub]) continue;
+			if (fetchingNames.has(npub) || settledNames.has(npub) || peerNameCache[npub]) continue;
 			fetchingNames.add(npub);
 			try {
 				const fetched = await pasteKey(npub);
@@ -619,6 +631,10 @@
 					peerNameCache = { ...peerNameCache, [npub]: fetched.profile.display_name };
 				}
 			} catch { /* relay unreachable or peer has no profile — fall back to shortId */ }
+			// QURATOR-155: the set means "in flight", never "ever attempted" — clear the entry when
+			// the request settles (success OR failure) so it keeps de-duplicating concurrent
+			// requests without permanently suppressing a later fetch for the same npub.
+			finally { fetchingNames.delete(npub); settledNames.add(npub); }
 		}
 	}
 
@@ -908,22 +924,98 @@
 	// M17 W2: `&intent=ask-access` populates the composer draft from askAccessDraft WITHOUT sending.
 	// No-clobber: if the user already typed a draft, the helper returns the untouched text and we just
 	// focus the composer. The petname (carried via `&petname=`) personalises the greeting.
+	//
+	// QURATOR-146 (Topics W4): the deep-link now ALSO opens a NON-contact — the whole population of a
+	// Topic roster is people you have not added, and the old `if (peer)` guard made `?peer=` from a
+	// roster row silently do nothing (the interest-first flow dead-ended at a read-only list). The
+	// stranger is resolved the same way fetchNonContactNames resolves one — pasteKey(npub), which
+	// networks for the profile but NEVER persists a contact (persistence is `follow`, a deliberate
+	// act elsewhere) — and selectPeer is called with the resolved peer. selectedIsContact then reads
+	// false on its own and the existing "may filter your messages" notice does its job with zero
+	// further changes. pasteKey REJECTS a profileless peer (the `reject_profileless` guard), so a
+	// dead link surfaces as that error toast, not a blank pane. Contact-first, always: a stale relay
+	// resolve must never shadow a contact the user actually has.
 	$effect(() => {
 		const npub = $page.url.searchParams.get('peer') ?? '';
+		peerResolveAttempt; // QURATOR-156: retry dependency — see retryPeerResolve below
 		if (!npub || npub === peerDeepLinked) return;
-		const peer = $contacts.find((c) => c.npub === npub);
-		if (peer) {
+		// QURATOR-156: `&intent=`/`&petname=` are applied by ONE helper for BOTH branches — the
+		// non-contact path used to skip it, so an intent-carrying stranger link opened an empty
+		// composer instead of the pre-filled draft.
+		const applyIntent = (petnameFallback: string) => {
+			const intent = $page.url.searchParams.get('intent');
+			if (!intent) return;
+			const petname = $page.url.searchParams.get('petname') ?? petnameFallback;
+			const applied = applyAskAccessIntent(intent, draft, petname);
+			draft = applied.draft;
+			if (applied.focus) tick().then(() => draftEl?.focus());
+		};
+		const open = (peer: CachedPeer, petnameFallback: string) => {
 			peerDeepLinked = npub;
 			selectPeer(peer);
-			const intent = $page.url.searchParams.get('intent');
-			if (intent) {
-				const petname = $page.url.searchParams.get('petname') ?? peer.petname ?? '';
-				const applied = applyAskAccessIntent(intent, draft, petname);
-				draft = applied.draft;
-				if (applied.focus) tick().then(() => draftEl?.focus());
-			}
+			applyIntent(petnameFallback);
+		};
+		const peer = $contacts.find((c) => c.npub === npub);
+		if (peer) {
+			open(peer, peer.petname ?? '');
+			return;
 		}
+		// QURATOR-146: a non-contact npub still opens the conversation. Resolve lazily — the guard
+		// set stops a refire while the resolve is in flight; on failure peerDeepLinked stays '' and
+		// the failed-deeplink EmptyState (QURATOR-156) offers the in-place Retry the effect's own
+		// dependencies can't (the relay may have just been unreachable).
+		if (fetchingNames.has(npub)) return;
+		fetchingNames.add(npub);
+		peerResolveFailed = false;
+		pasteKey(npub)
+			.then((resolved) => {
+				fetchingNames.delete(npub);
+				// Seed the name cache exactly as fetchNonContactNames does, so a request that later
+				// arrives from this peer renders their display name (and the guard-set entry is not
+				// left behind to suppress that pass).
+				if (resolved.profile?.display_name) {
+					peerNameCache = { ...peerNameCache, [npub]: resolved.profile.display_name };
+				}
+				// The resolve can legitimately take tens of seconds (teaser + presence + listings,
+				// each with its own timeout — resolve_peer on the Rust side). Re-validate at LANDING
+				// time that this is still the conversation the user wants open, because selectPeer
+				// clears selectedTopic/viewingRequests/selectedRequest: a resolve that outlives the
+				// user's patience would otherwise yank them off whatever they navigated to next.
+				// Prong 1 — the URL param changed (they deep-linked/typed elsewhere). Prong 2 — a
+				// sidebar click selects WITHOUT rewriting the URL (selectPeer/selectTopic/
+				// openRequests never touch it), so the param alone can't see those; "nothing is
+				// selected" is exactly "no view has displaced the pending deep-link".
+				const stillWanted = ($page.url.searchParams.get('peer') ?? '') === npub
+					&& selectedPeer === null && selectedTopic === null && !viewingRequests;
+				// Discarded or opened, this npub is HANDLED — marking it either way stops a later
+				// $contacts settle from re-resolving a link the user already navigated away from
+				// (which would yank them back through the retry path). A FAILED resolve stays
+				// retryable: peerDeepLinked is set only here, on the catch-free path.
+				peerDeepLinked = npub;
+				if (!stillWanted) return;
+				selectPeer({
+					...resolved,
+					// A resolve that came back profileless still opens the pane — the pane itself is
+					// absent-graceful (shortId name, empty thread), so the conversation is reachable
+					// even when the profile is not. (pasteKey normally rejects profileless; a mocked
+					// or partial resolve must not crash the pane render.)
+					profile: resolved.profile ?? { display_name: '', tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '' },
+				});
+				applyIntent(resolved.petname ?? '');
+			})
+			.catch((e) => {
+				fetchingNames.delete(npub);
+				peerResolveFailed = true;
+				toast(String(e), 'error'); // carries pasteKey's own "hasn't published a profile" wording
+			});
 	});
+	// QURATOR-156: the in-place retry for the failed deep-link resolve above. Bumping the attempt
+	// counter re-runs the effect (its retry dependency), which re-enters the SAME pasteKey path and
+	// clears the error pane on the way in.
+	function retryPeerResolve() {
+		peerResolveFailed = false;
+		peerResolveAttempt++;
+	}
 	// devtest #16: derived straight from the persisted per-peer watermark, replacing the old
 	// seenCounts in-memory snapshot (which reset to "no unread" on every remount).
 	let unreadCounts = $derived(unreadByPeer($inboxMessages, $readWatermarks, myId));
@@ -1014,7 +1106,7 @@
 							<div class="convo-info">
 								<div class="convo-row">
 									<span class="convo-name" class:convo-name-active={selectedTopic?.topic_id === t.topic_id}>{t.name}</span>
-									{#if t.private}<span class="convo-lock" title="Private topic">🔒</span>{/if}
+									{#if t.private}<span class="hb-tag">private</span>{/if}
 								</div>
 							</div>
 						</button>
@@ -1097,7 +1189,7 @@
 					<div class="pane-peer-info">
 						<div class="pane-peer-row">
 							<span class="pane-peer-name">{selectedTopic.name}</span>
-							{#if selectedTopic.private}<span class="pill pill-offline">private</span>{/if}
+							{#if selectedTopic.private}<span class="hb-tag">private</span>{/if}
 						</div>
 						<span class="channel-sub">Topic channel · each post disappears 24h after it's posted · manage in Topics</span>
 					</div>
@@ -1286,11 +1378,23 @@
 				{/if}
 			{:else if !selectedPeer}
 				<div class="convo-empty-state">
-					<EmptyState
-						centered
-						message="Select a contact to view the conversation."
-						cta={{ label: 'Find hoarders in Contacts →', href: '/contacts' }}
-					/>
+					{#if peerResolveFailed}
+						<!-- QURATOR-156: a rejected `?peer=` resolve dead-ended after one toast (the effect's
+						     dependencies never change again in-session). Same EmptyState error surface as the
+						     sidebar's failed getMessages — no new visual language. -->
+						<EmptyState
+							centered
+							error
+							message="Couldn’t reach this person — the relay didn’t answer."
+							onretry={retryPeerResolve}
+						/>
+					{:else}
+						<EmptyState
+							centered
+							message="Select a contact to view the conversation."
+							cta={{ label: 'Find hoarders in Contacts →', href: '/contacts' }}
+						/>
+					{/if}
 					<p class="privacy-note">
 						{@html icons.shield} Messages are end-to-end encrypted — relays never see who sent them or what they say.
 					</p>
@@ -1309,6 +1413,8 @@
 							<span class="pane-peer-name">{selectedPeer.profile?.display_name || shortId(selectedPeer.npub)}</span>
 							{#if selectedPeer.online}
 								<span class="pill pill-online"><span class="pill-dot"></span> Online</span>
+							{:else if !selectedPeer.last_presence}
+								<span class="pill pill-unknown" title="No presence beacon observed yet — checking.">Checking…</span>
 							{:else}
 								<span class="pill pill-offline">Offline</span>
 							{/if}
@@ -1321,8 +1427,8 @@
 					<button class="btn-ghost btn-sm" onclick={() => { if (selectedPeer) viewProfile(selectedPeer); }}>View profile</button>
 				</div>
 
-				<!-- Offline notice -->
-				{#if !selectedPeer.online}
+				<!-- Offline notice (not shown while presence is still unknown — QURATOR-135). -->
+				{#if !selectedPeer.online && selectedPeer.last_presence}
 					<div class="offline-banner">
 						<span class="offline-dot"></span>
 						<span>{selectedPeer.profile?.display_name || shortId(selectedPeer.npub)} is offline — they'll see your message the next time they open Hoardbook.</span>
@@ -1655,7 +1761,6 @@
 
 	/* devtest v0.12.1 #5: a private-topic marker reads as a lock, not a filled dot (the old amber dot
 	   looked like a permanent unread/notification bubble). */
-	.convo-lock { font-size: 10px; line-height: 1; flex-shrink: 0; opacity: 0.6; }
 
 	/* Topic channels (M11) */
 	.convo-section-label {
@@ -1865,6 +1970,13 @@
 		color: var(--fg-muted);
 		background: color-mix(in oklch, var(--fg-muted) 12%, transparent);
 		border: 1px solid color-mix(in oklch, var(--fg-muted) 20%, transparent);
+	}
+	/* QURATOR-135 — the unknown pill: neither the offline nor the online styling. */
+	.pill-unknown {
+		color: var(--fg-dim);
+		background: transparent;
+		border: 1px dashed var(--border);
+		font-style: italic;
 	}
 
 	/* M15 W1: buttons unified on the app.css .btn system (local copies removed; .btn-send stays,

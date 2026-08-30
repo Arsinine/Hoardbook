@@ -211,7 +211,7 @@ export const SEND_FULL_LIST_LABEL = 'Send the full list';
 /** Owner-side success. Names what was sent and what was not — the asker gets the listing, and the
  *  files stay where they are (INV-4′). */
 export const SEND_FULL_LIST_TOAST = (slug: string) =>
-	`Sent the full list of “${slug}”. They get the listing — your files stay where they are.`;
+	`Sent the full list of “${slug}”. Your files stay put.`;
 
 /** Shown on the fulfil card next to the send button. Says the thing owner ruling ② made explicit:
  *  what crosses is the collection **as it stands when they fetch it**, not a frozen copy of what you
@@ -229,11 +229,11 @@ export const REDEEMING_LINE = (slug: string) => `Fetching the full list of “${
 /** Asker-side success. Points at Browse because that is where the upgraded tree appears — the
  *  redemption caches the verified envelope and Browse's existing cache resolution picks it up. */
 export const REDEEMED_LINE = (slug: string) =>
-	`The full list of “${slug}” arrived — open it in Browse.`;
+	`The full list of “${slug}” arrived. Open it in Browse.`;
 
 /** Asker-side failure. Says the ticket survives, because it does: the owner spends it only on this
  *  side's acknowledgement, so a failed attempt costs nothing and Retry is honest. */
-export const REDEEM_FAILED_LINE = 'Could not fetch it — the sender may be offline. Your request is still good.';
+export const REDEEM_FAILED_LINE = 'Couldn’t fetch it. The sender may be offline. Your request is still good.';
 
 /** The retry button. Not a "redeem later" affordance: it appears only after a failure. */
 export const REDEEM_RETRY_LABEL = 'Try again';
@@ -243,7 +243,7 @@ export const REDEEM_RETRY_LABEL = 'Try again';
 /** Shown while the local ask trace is unavailable. Fail-closed like `unsolicited` — nothing is
  *  fetched — but recoverable and honestly labelled: the problem is on this side. */
 export const UNVERIFIED_LINE =
-	"Couldn't check your sent requests just now, so this wasn't fetched. It will retry shortly.";
+	"Couldn't check your sent requests, so nothing was fetched yet. It retries automatically.";
 
 export const UNSOLICITED_LINE =
-	"They sent a link to a full list you didn't ask for. Nothing was fetched. Ask from their collection in Browse if you want it.";
+	"They sent a full list you didn't ask for, so nothing was fetched. If you want it, request it from their collection in Browse.";

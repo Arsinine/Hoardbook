@@ -110,6 +110,11 @@ export interface PrivatePeerCollections {
  *  §11 Topic (a distinct badge). Absent ⇒ `Manual` (a pre-M11 contact). */
 export type ContactSource = 'Manual' | 'Topic';
 
+/** QURATOR-134 — the tri-state a keyless contact's listings resolve to (see
+ *  `CachedPeer.listings_state`). Mirrors hb-app's `store::ListingsStatus`, which mirrors
+ *  hb-net's `ListingsState` — the one implementation; the UI renders, never re-derives. */
+export type ListingsStatus = 'Fetched' | 'Sealed' | 'FetchFailed';
+
 export interface CachedPeer {
 	/** The peer's Nostr identity (bech32 npub) — the stable contact key. */
 	npub: string;
@@ -121,6 +126,14 @@ export interface CachedPeer {
 	petname?: string;
 	profile?: Profile;
 	collections: Collection[];
+	/** QURATOR-134 — WHY `collections` looks the way it does for a KEYLESS contact, computed by
+	 *  the hb-app browse command from hb-net's enumeration (never re-derived here from
+	 *  `collections.length === 0`, which cannot tell "published nothing" from "sealed"):
+	 *  'Fetched' = enumeration completed, peer authored no listing events (honest empty);
+	 *  'Sealed' = listings exist but none decryptable (the genuine 🔒 locked case);
+	 *  'FetchFailed' = the enumeration itself failed (error + Retry). Absent ⇒ 'Fetched'
+	 *  (a pre-QURATOR-134 cached contact; the least-wrong reading). */
+	listings_state?: ListingsStatus;
 	online: boolean;
 	/** When WE last polled — our cache age. Rendered as "checked {t}", never "seen {t}" (M17 W5.1:
 	 *  the old label reported our poll and so claimed "just now" about a peer gone for a week). */
@@ -196,12 +209,21 @@ export interface TopicView {
 }
 
 /** A discovered public Topic (non-member view) — the roster identities are NOT here (members-only);
- *  the count is a deliberately **spoofable** estimate. */
+ *  the count is a deliberately **spoofable** estimate. `member_count_estimate` is `null` on the W1
+ *  paint path (QURATOR-143): the count has not been fetched yet, because ranking is lazy — the
+ *  sidebar ORDERS by the count once `topicRank` lands it, but never displays it, and `null` must
+ *  never render as "0 claimed". */
 export interface DiscoveredTopic {
 	topic_id: string;
 	name: string;
 	description: string;
 	tags: string[];
+	member_count_estimate: number | null;
+}
+
+/** One lazy-ranking result (QURATOR-143 W1): a `topic_id` + its spoofable count, count-desc. */
+export interface TopicRank {
+	topic_id: string;
 	member_count_estimate: number;
 }
 

@@ -22,6 +22,7 @@ import type {
 	WatchHit,
 	TopicView,
 	DiscoveredTopic,
+	TopicRank,
 	TopicLookup,
 	TopicInvitePreview,
 	ChannelPost,
@@ -534,6 +535,13 @@ export const copyDiagnostics = () => invoke<string>('copy_diagnostics');
 /** Open the OS file manager at the log directory. Creates it if missing (first launch). */
 export const revealLogFolder = () => invoke<void>('reveal_log_folder');
 
+/**
+ * QURATOR-139 — open the GitHub repository in the system browser. Takes no arguments: the URL is
+ * hard-coded in the Rust command (`commands::diagnostics::REPO_URL`), so the webview can never aim
+ * the opener at anything else.
+ */
+export const openRepoPage = () => invoke<void>('open_repo_page');
+
 // QURATOR-68 — the NAT classification token for the Settings → Diagnostics UI. One of
 // "no-nat" | "nat" | "cgnat" | "unknown" | "undetermined" (before the first probe completes).
 // The mapped address is never returned — only the classification (INV: peer/self addresses are
@@ -569,6 +577,19 @@ export const topicUpdateMeta = (topicId: string, description: string) =>
  *  root (e.g. `['video']`); the backend returns every public Topic beneath it, activity-ranked. */
 export const topicDiscover = (tags: string[]) =>
 	invoke<DiscoveredTopic[]>('topic_discover', { tags });
+
+/** The W1 PAINT path (QURATOR-143): every public Topic under ALL the given roots in ONE relay read,
+ *  with `member_count_estimate: null` everywhere — zero member_count round trips before first
+ *  render. Ranking (ordering) is the lazy `topicRank` half, run after paint. */
+export const topicDiscoverPaint = (tags: string[]) =>
+	invoke<DiscoveredTopic[]>('topic_discover_paint', { tags });
+
+/** The W1 LAZY-RANK half (QURATOR-143): fetch the spoofable member count for exactly the ids sent
+ *  (bounded to concurrency 8 in hb-net), returning `(topic_id, count)` pairs count-desc. Send ONLY
+ *  the ids of rows that will actually be drawn — bounding the wave to the screen is this caller's
+ *  half of the relay-citizenship contract. */
+export const topicRank = (topicIds: string[]) =>
+	invoke<TopicRank[]>('topic_rank', { topicIds });
 
 /** Join-first lookup (devtest #11): does this public Topic name already have a room? Never call for
  *  a private Topic (no announce to find). */

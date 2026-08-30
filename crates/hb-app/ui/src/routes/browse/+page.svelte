@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { contacts, toast, toastWithAction, contactsLoadError, loadContactsInto } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
-	import { sizeTier, sizeTierTooltip } from '$lib/collection-row-view.js';
+	import { sizeTier, sizeTierTooltip, rowIcon } from '$lib/collection-row-view.js';
 	import { refreshContact, importManifest, requestManifest, getManifestAsks, getContacts, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, browsePrivateCollections, type ManifestAsk } from '$lib/api.js';
 	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 	import { page } from '$app/stores';
@@ -66,6 +66,21 @@
 
 	function peerInitial(peer: CachedPeer): string {
 		return (peer.profile?.display_name?.[0] ?? peer.npub[0]).toUpperCase();
+	}
+
+	// QURATOR-134 state 3's Retry target: re-run exactly the keyed-refresh `selectPeer` performs,
+	// without re-entering the selection bookkeeping (which is already correct for this peer).
+	async function selectPeerRefresh(peer: CachedPeer) {
+		loadingListings = true;
+		try {
+			const updated = await refreshContact(peer.npub);
+			contacts.update(cs => cs.map(c => c.npub === updated.npub ? { ...updated, local_tags: c.local_tags } : c));
+			if (selectedPeer?.npub === updated.npub) selectedPeer = updated;
+		} catch {
+			/* keep the view — the error state stays up until a retry succeeds */
+		} finally {
+			loadingListings = false;
+		}
 	}
 
 	async function selectPeer(peer: CachedPeer) {
@@ -220,7 +235,7 @@
 				);
 			}
 			if (result.stale) {
-				toast('Imported an older version of this list — ask the owner for a fresh manifest.', 'error');
+				toast('Imported an older version of this list. Ask the owner for a fresh manifest.', 'error');
 			} else {
 				toast('Full manifest imported');
 			}
@@ -334,8 +349,15 @@
 	]);
 	// Feature-tooltip anchor data (HOARDBOOK_SPEC §8).
 	let peerWillingTo = $derived(selectedPeer?.profile?.willing_to ?? []);
-	// A peer followed by bare npub (no share code) has sealed listings — they can't be decrypted.
-	let listingsLocked = $derived(!!selectedPeer && !selectedPeer.browse_key_hex && selectedPeer.collections.length === 0);
+	// QURATOR-134 — a KEYLESS contact's empty collections pane is a TRI-STATE, keyed on
+	// `listings_state` (computed by the hb-app browse command from hb-net's enumeration — the one
+	// implementation; `collections.length === 0` cannot tell "they published nothing" from "sealed"
+	// from "the fetch failed", which is why every keyless peer with zero collections used to read
+	// as 🔒 locked). Only meaningful when keyless: a keyed contact's `collections` is authoritative.
+	let listingsLocked = $derived(!!selectedPeer && !selectedPeer.browse_key_hex && selectedPeer.listings_state === 'Sealed');
+	// The enumeration itself failed — genuinely distinct from both empty and locked (the
+	// QURATOR-67/68/93 rule: never render a confident negative on data that never arrived).
+	let listingsLoadFailed = $derived(!!selectedPeer && !selectedPeer.browse_key_hex && selectedPeer.listings_state === 'FetchFailed');
 
 	// M22 W3 — drag-to-group gesture on the People list. Same shared primitives as Contacts;
 	// create is ALWAYS ADDITIVE. Esc cancels. The naming popover is a simple inline panel here
@@ -886,7 +908,7 @@
 				     "No contacts yet" negative — that string is indistinguishable from a genuine empty. -->
 				<EmptyState
 					error
-					message="Couldn't load contacts — the peer cache didn't answer."
+					message="Couldn't load your contacts."
 					onretry={retryContactsLoad}
 				/>
 			{:else if $contacts.length === 0}
@@ -1016,11 +1038,22 @@
 
 			<!-- Collections grid -->
 			{#if !selectedCollection}
-				{#if loadingListings && selectedPeer.collections.length === 0}
+				{#if loadingListings && selectedPeer.collections.length === 0 && !listingsLoadFailed}
 					<div class="empty-state">
 						<div class="empty-icon">{@html icons.folder}</div>
 						<div class="empty-label">Loading collections…</div>
 					</div>
+				{:else if listingsLoadFailed}
+					<!-- QURATOR-134 state 3: the listings enumeration FAILED — neither a confident
+					     "No public collections" nor a 🔒 (a keyless peer's failed read used to fall
+					     into whichever branch matched first). The QURATOR-93 machinery: retryable
+					     error, wired to the same refresh selectPeer performs. -->
+					{@const p = selectedPeer}
+					<EmptyState
+						error
+						message="Couldn't load collections."
+						onretry={() => { const t = p; if (!t) return; selectPeerRefresh(t); }}
+					/>
 				{:else if listingsLocked}
 					<div class="empty-state">
 						<div class="empty-icon">{@html icons.folder}</div>
@@ -1045,7 +1078,9 @@
 					<div class="col-grid">
 						{#each selectedPeer.collections as col (col.slug)}
 							<button class="col-card" onclick={() => selectCollection(col)}>
-								<div class="col-card-icon">{@html icons.folder}</div>
+								<!-- QURATOR-140 drift-pair: a peer's collection is the same object Home renders, so it
+								     must carry the same glyph. Shares `rowIcon` — never a second local rule. -->
+								<div class="col-card-icon">{@html icons[rowIcon(col)]}</div>
 								<div class="col-card-name">{col.path_alias}</div>
 								{#if col.description}
 									<div class="col-card-desc">{col.description}</div>
@@ -1082,7 +1117,7 @@
 					<div class="private-collections">
 						<div class="private-collections-label">
 							Private collections
-							<span class="private-pill" title="Sealed to you by the owner — not visible to other viewers.">Private</span>
+							<span class="private-pill" title="The owner made this visible only to you.">Private</span>
 						</div>
 						{#if privateLoadError}
 							<EmptyState error message="Couldn't load private collections." onretry={loadPrivateInto} />
@@ -1090,7 +1125,8 @@
 							<div class="col-grid">
 								{#each selectedPrivate as col (col.slug)}
 									<button class="col-card" onclick={() => selectCollection(col)}>
-										<div class="col-card-icon">{@html icons.folder}</div>
+										<!-- QURATOR-140 drift-pair: private collections are Collections too — same glyph rule. -->
+										<div class="col-card-icon">{@html icons[rowIcon(col)]}</div>
 										<div class="col-card-name">{col.path_alias}</div>
 										{#if col.description}
 											<div class="col-card-desc">{col.description}</div>
@@ -1109,7 +1145,7 @@
 												{/if}
 											</div>
 										{/if}
-										<span class="private-pill" title="Sealed to you by the owner — not visible to other viewers.">Private</span>
+										<span class="private-pill" title="The owner made this visible only to you.">Private</span>
 									</button>
 								{/each}
 							</div>
@@ -1204,7 +1240,7 @@
 								<span class="paywall-lock">🔒</span>
 								<div>
 									<div class="paywall-title">{paywall.hidden.toLocaleString()} more item{paywall.hidden !== 1 ? 's' : ''} hidden</div>
-									<div class="paywall-sub">Showing {paywall.shown.toLocaleString()} of {paywall.total.toLocaleString()} — this collection is too large to publish in full.</div>
+									<div class="paywall-sub">Showing {paywall.shown.toLocaleString()} of {paywall.total.toLocaleString()}. The collection is too large to publish in full.</div>
 									<!-- M16 W4 + M17 W7.1a: the "get the rest" affordance. The primary "Ask the owner" button
 									     becomes the muted "Asked {relative} — waiting for their reply" state after a successful
 									     send, with a secondary "Ask again" (60-min cooldown, mirroring announce-cooldown) and an
@@ -1252,7 +1288,7 @@
 					{/if}
 					<!-- The listing is metadata only — Hoardbook moves no files (H4/INV-4). -->
 					<div class="no-download-note">
-						<span>Metadata only — Hoardbook moves no files.</span>
+						<span>Metadata only. Hoardbook moves no files.</span>
 						<FeatureTooltip key="no-download" />
 					</div>
 				</div>
