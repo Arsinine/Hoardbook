@@ -1583,6 +1583,360 @@ fn apply_notes(
 // Tests
 // ---------------------------------------------------------------------------
 
+// QURATOR-161 (Lane A, slice covering lines 178-807 of this file): Tauri-command guard tests for
+// `scan_directory`, `list_subdirs`, `delete_collection`, `get_collections`,
+// `collection_source_accessible`, and `update_collection_meta`. Same technique as identity.rs /
+// browse.rs: `tauri::test::mock_app()` mints genuine `State<'_, T>` handles through the real
+// `StateManager`, so these call the actual `#[tauri::command]` fns at their real signatures — not a
+// reimplementation of their guards.
+#[cfg(test)]
+mod collection_command_guards_a {
+    use super::*;
+    use tauri::Manager;
+    use tempfile::TempDir;
+
+    fn test_store() -> (TempDir, DataStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        (dir, store)
+    }
+
+    /// A minimal, valid `Collection` draft — enough to exercise the metadata/publish-adjacent
+    /// guards without depending on the other module's private `mod tests` helpers (not visible
+    /// from here).
+    fn a_collection(slug: &str) -> Collection {
+        Collection {
+            slug: slug.into(),
+            path_alias: slug.into(),
+            description: None,
+            item_count: 0,
+            est_size: None,
+            content_types: vec![],
+            tags: vec![],
+            languages: vec![],
+            visibility: Visibility::Public,
+            sorted: false,
+            last_updated: chrono::Utc::now(),
+            listing: vec![],
+        }
+    }
+
+    fn guard_app() -> (TempDir, tauri::App<tauri::test::MockRuntime>) {
+        let app = tauri::test::mock_app();
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        app.manage(store);
+        let identity: SharedIdentity = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        app.manage(identity);
+        app.manage(net::new_shared());
+        (dir, app)
+    }
+
+    // -- scan_directory --------------------------------------------------------------------------
+
+    /// An alias that collapses to an empty slug (all punctuation) is refused before any filesystem
+    /// walk happens. Pins the `is_valid_slug` guard in `scan_directory_inner` (line 231).
+    ///
+    /// Mutation to redden: in `scan_directory_inner`, change the guard at (current) line 231 from
+    /// `if !is_valid_slug(&slug) {` to `if false {` (or delete the `if` block entirely) — the slug
+    /// derivation and the message text stay, only the branch is defeated.
+    #[tokio::test]
+    async fn scan_directory_rejects_an_alias_that_collapses_to_no_slug() {
+        let (_dir, app) = guard_app();
+        let opts = ScanOptions {
+            path: "/does/not/matter/for/this/guard".into(),
+            path_alias: "!!!".into(),
+            include: vec![],
+            exclude: vec![],
+        };
+        let err = scan_directory(opts, app.state::<DataStore>()).await.unwrap_err();
+        assert!(
+            err.contains("produces an invalid collection slug"),
+            "expected the invalid-slug message, got {err}"
+        );
+    }
+
+    /// Bonus (not a ticket-listed line, but immediately adjacent): a `path_alias` that survives
+    /// slugging but points at a non-directory is refused by the scan closure's `ensure!`, not
+    /// silently treated as an empty scan.
+    ///
+    /// Mutation to redden: in the `scan` closure inside `scan_directory_inner`, change
+    /// `anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());` to
+    /// `anyhow::ensure!(true, "{} is not a directory", root.display());`.
+    #[tokio::test]
+    async fn scan_directory_refuses_a_source_root_that_is_not_a_directory() {
+        let (dir, app) = guard_app();
+        let missing = dir.path().join("nope-does-not-exist");
+        let opts = ScanOptions {
+            path: missing.to_string_lossy().into_owned(),
+            path_alias: "valid-alias".into(),
+            include: vec![],
+            exclude: vec![],
+        };
+        let err = scan_directory(opts, app.state::<DataStore>()).await.unwrap_err();
+        assert!(err.contains("is not a directory"), "expected a not-a-directory refusal, got {err}");
+    }
+
+    // -- list_subdirs -----------------------------------------------------------------------------
+
+    /// `list_subdirs` refuses a non-directory path via `list_subdirs_core`'s `ensure!` — reachable
+    /// directly since the command takes no `State`. This does NOT pin the ticket-listed line 216
+    /// (the `spawn_blocking` `JoinError` branch); see the OWED note in the report.
+    ///
+    /// Mutation to redden: in `list_subdirs_core`, change
+    /// `anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());` to
+    /// `anyhow::ensure!(true, "{} is not a directory", root.display());`.
+    #[tokio::test]
+    async fn list_subdirs_refuses_a_non_directory_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope-does-not-exist");
+        let err = list_subdirs(missing.to_string_lossy().into_owned()).await.unwrap_err();
+        assert!(err.contains("is not a directory"), "expected a not-a-directory refusal, got {err}");
+    }
+
+    // -- delete_collection --------------------------------------------------------------------------
+
+    /// An invalid slug is refused before any store access. Pins the `is_valid_slug` guard (lines
+    /// 369-371).
+    ///
+    /// Mutation to redden: change the exact literal `"Invalid collection slug"` at that `.ok_or(...)`
+    /// to any other text — the test's `assert_eq!` on the exact message reds.
+    #[tokio::test]
+    async fn delete_collection_rejects_an_invalid_slug() {
+        let (_dir, app) = guard_app();
+        let err = delete_collection(
+            "not a valid slug!!".into(),
+            app.state::<DataStore>(),
+            app.state::<SharedIdentity>(),
+            app.state::<SharedRelay>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "Invalid collection slug");
+    }
+
+    /// A published collection refuses to delete when no identity is loaded (the unpublish-first
+    /// path needs an identity to sign the retraction), and does so BEFORE touching the on-disk
+    /// draft. Pins line 379. Only reachable when `store.is_published(slug)` is true, so the test
+    /// marks the collection published directly via the store's on-disk layout.
+    ///
+    /// Mutation to redden: change the exact literal `"No identity loaded. Generate a keypair first."`
+    /// at that `.ok_or(...)` to any other text.
+    #[tokio::test]
+    async fn delete_collection_refuses_to_unpublish_without_an_identity() {
+        let (_dir, app) = guard_app();
+        let store = app.state::<DataStore>();
+        let slug = "my-slug";
+        std::fs::create_dir_all(store.published_path(slug).parent().unwrap()).unwrap();
+        std::fs::write(store.published_path(slug), b"{}").unwrap();
+        assert!(store.is_published(slug), "test setup: the collection must read as published");
+
+        let err = delete_collection(
+            slug.into(),
+            app.state::<DataStore>(),
+            app.state::<SharedIdentity>(),
+            app.state::<SharedRelay>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "No identity loaded. Generate a keypair first.");
+        assert!(
+            store.is_published(slug),
+            "a refused delete must not have removed the published marker"
+        );
+    }
+
+    // -- get_collections ----------------------------------------------------------------------------
+
+    /// `get_collections` has no refusal path (confirmed by reading the fn: it never returns `Err`).
+    /// This is a pass-side test instead: entries sort by `path_alias`, and a collection scanned
+    /// before the byte-total sidecar existed defaults `total_bytes` to 0 rather than erroring.
+    ///
+    /// Mutation to redden: in `get_collections`, change
+    /// `entries.sort_by(|a, b| a.collection.path_alias.cmp(&b.collection.path_alias));` to a no-op
+    /// (delete the sort call) — the assertion on ordering reds.
+    #[tokio::test]
+    async fn get_collections_sorts_by_alias_and_defaults_missing_total_bytes_to_zero() {
+        let (_dir, app) = guard_app();
+        let store = app.state::<DataStore>();
+        store.save_collection_draft(&a_collection("zebra")).unwrap();
+        store.save_collection_draft(&a_collection("apple")).unwrap();
+        // No scan_spec sidecar saved for either slug — total_bytes must default to 0, not error.
+
+        let entries = get_collections(app.state::<DataStore>()).await.unwrap();
+        let aliases: Vec<&str> =
+            entries.iter().map(|e| e.collection.path_alias.as_str()).collect();
+        assert_eq!(aliases, vec!["apple", "zebra"], "entries must sort by path_alias");
+        assert!(entries.iter().all(|e| e.total_bytes == 0), "missing sidecar must default to 0");
+    }
+
+    // -- collection_source_accessible --------------------------------------------------------------
+
+    /// No recorded scan spec at all reports reachable (line 421-423) — nothing to gate on.
+    ///
+    /// Mutation to redden: change `let Some(spec) = store.load_scan_spec(&slug).map_err(cmd_err)?
+    /// else { return Ok(true); };` so the `else` arm returns `Ok(false)` instead.
+    #[tokio::test]
+    async fn collection_source_accessible_is_true_with_no_recorded_scan_spec() {
+        let (_dir, app) = guard_app();
+        let ok = collection_source_accessible("never-scanned".into(), app.state::<DataStore>())
+            .await
+            .unwrap();
+        assert!(ok, "a collection with no scan spec has nothing to gate on");
+    }
+
+    /// A scan spec with an empty `root` reports reachable (line 424-426) rather than stat-ing an
+    /// empty path.
+    ///
+    /// Mutation to redden: change `if spec.root.is_empty() { return Ok(true); }` to
+    /// `if spec.root.is_empty() { return Ok(false); }`.
+    #[tokio::test]
+    async fn collection_source_accessible_is_true_when_root_is_empty() {
+        let (_dir, app) = guard_app();
+        let store = app.state::<DataStore>();
+        store.save_scan_spec("blank-root", &crate::store::ScanSpec::default()).unwrap();
+        let ok = collection_source_accessible("blank-root".into(), app.state::<DataStore>())
+            .await
+            .unwrap();
+        assert!(ok, "an empty scan root has nothing to gate on");
+    }
+
+    /// A root already mid-stat (present in the process-wide `inflight_access_stats()` set) reports
+    /// unreachable instead of launching a second concurrent stat (line 431-435, the dedup insert).
+    /// Cleans the key up afterward so this test cannot poison a sibling test sharing the same
+    /// process-wide static.
+    ///
+    /// Mutation to redden: change `if !set.insert(root.clone()) { return Ok(false); }` to
+    /// `if !set.insert(root.clone()) { return Ok(true); }`.
+    #[tokio::test]
+    async fn collection_source_accessible_reports_unreachable_when_a_stat_is_already_in_flight() {
+        let (_dir, app) = guard_app();
+        let store = app.state::<DataStore>();
+        let root = "/a/root/already/being/stat-ed/by/another/caller";
+        let spec = crate::store::ScanSpec { root: root.into(), ..Default::default() };
+        store.save_scan_spec("busy-slug", &spec).unwrap();
+
+        {
+            let mut set = inflight_access_stats().lock().unwrap();
+            set.insert(root.to_string());
+        }
+
+        let result = collection_source_accessible("busy-slug".into(), app.state::<DataStore>()).await;
+
+        // Clean up unconditionally so a later assertion failure can't leave the static poisoned for
+        // other tests in this process.
+        inflight_access_stats().lock().unwrap().remove(root);
+
+        assert!(!result.unwrap(), "a root already in flight must report unreachable");
+    }
+
+    // -- update_collection_meta ----------------------------------------------------------------------
+
+    /// No draft on disk for the slug is refused (line 473).
+    ///
+    /// Mutation to redden: change the exact literal in
+    /// `.ok_or_else(|| format!("No draft found for collection '{safe_slug}'"))?` from
+    /// `"No draft found for collection '{safe_slug}'"` to any other text.
+    #[tokio::test]
+    async fn update_collection_meta_rejects_a_missing_draft() {
+        let (_dir, app) = guard_app();
+        let err = update_collection_meta(
+            "no-such-draft".into(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            false,
+            app.state::<DataStore>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "No draft found for collection 'no-such-draft'");
+    }
+
+    // -- prepare_listing (ticket-table line 525/527; see report note on grouping) --------------------
+    //
+    // NOTE: `prepare_listing`, `private_recipients`, and `save_collection_marker_guarded` below are
+    // NOT inside `update_collection_meta`'s own call graph — they're separate `pub(crate)` helpers
+    // used by the (out-of-scope) publish flow. The ticket's guard-site table lists lines 525, 527,
+    // 562, 597 under the `update_collection_meta` row, but only line 473 is actually inside that
+    // command's body (which ends at line 484). Testing these three directly, as plain functions
+    // (they take `&DataStore`, not `State<'_, DataStore>`, so no `mock_app()` is needed) rather than
+    // through `update_collection_meta`, which cannot reach them at all.
+
+    /// `prepare_listing` refuses a missing draft (line 525) with the same message shape as
+    /// `update_collection_meta`'s own guard, but this is a DIFFERENT call site.
+    ///
+    /// Mutation to redden: change the literal in `prepare_listing`'s
+    /// `.ok_or_else(|| format!("No draft found for collection '{safe_slug}'"))?` to any other text.
+    #[test]
+    fn prepare_listing_rejects_a_missing_draft() {
+        let (_dir, store) = test_store();
+        let err = prepare_listing("missing-slug", &store).unwrap_err();
+        assert_eq!(err, "No draft found for collection 'missing-slug'");
+    }
+
+    /// `prepare_listing` refuses a draft with no content types before ever building the listing
+    /// JSON (line 527).
+    ///
+    /// Mutation to redden: change
+    /// `if collection.content_types.is_empty() { return Err("At least one content type is required
+    /// before publishing a collection.".into()); }` so the condition is always false (e.g.
+    /// `if false {`).
+    #[test]
+    fn prepare_listing_rejects_a_draft_with_no_content_types() {
+        let (_dir, store) = test_store();
+        let mut col = a_collection("empty-types");
+        col.content_types = vec![];
+        store.save_collection_draft(&col).unwrap();
+
+        let err = prepare_listing("empty-types", &store).unwrap_err();
+        assert_eq!(err, "At least one content type is required before publishing a collection.");
+    }
+
+    /// `private_recipients` refuses an empty Private audience (line 562) rather than silently
+    /// publishing to nobody.
+    ///
+    /// Mutation to redden: change `if out.is_empty() { return Err(...) }` so the condition is always
+    /// false (e.g. `if false {`).
+    #[test]
+    fn private_recipients_rejects_an_empty_audience() {
+        let (_dir, store) = test_store();
+        // No `private_audience.json` written at all — `load_private_audience` defaults to `vec![]`.
+        let err = private_recipients(&store).unwrap_err();
+        assert!(
+            err.contains("haven't chosen anyone to receive it"),
+            "expected the empty-audience refusal, got {err}"
+        );
+    }
+
+    /// `save_collection_marker_guarded` reports `Revoked` (as its own `Err`, line 597) instead of
+    /// re-creating a marker for a collection that was unpublished while the publish was in flight —
+    /// simulated here by bumping the revocation generation (via `delete_published`, which bumps
+    /// unconditionally even when nothing was ever published) past the `gen_at_start` the caller
+    /// still holds.
+    ///
+    /// Mutation to redden: change `if ... == PublishedSave::Revoked { return Err(revoked_during_publish(slug)); }`
+    /// so the condition is always false (e.g. compare against a variant that can never be produced).
+    #[test]
+    fn save_collection_marker_guarded_reports_revocation_instead_of_re_creating_the_marker() {
+        let (_dir, store) = test_store();
+        let slug = "in-flight-slug";
+        // Bump the revocation generation from 0 to 1, so the caller's stale `gen_at_start` of 0 no
+        // longer matches.
+        store.delete_published(slug).unwrap();
+        assert_eq!(store.published_generation(slug), 1);
+
+        let err = save_collection_marker_guarded(&store, slug, "{}", 0).unwrap_err();
+        assert_eq!(
+            err,
+            "collection 'in-flight-slug' was unpublished while its publish was in flight; not \
+             re-creating the published marker"
+        );
+        assert!(!store.is_published(slug), "a revoked save must not have written the marker");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3114,4 +3468,116 @@ mod tests {
         let txt = render_text(&[item], 0);
         assert!(!txt.contains('\n'), "filename newline must not forge a row: {txt:?}");
     }
+}
+
+// Guards pinned here are the ones reachable through the PURE cores: `build_slug_manifest` (what
+// `export_manifest` wraps) and `unpublish_collection_inner` (what `unpublish_collection` wraps).
+// Both take real types directly, so each guard is exercised against the actual production fn.
+//
+// The five commands' OWN inline guards (the "No identity loaded" checks in `publish_collection`/
+// `export_manifest`/`unpublish_collection`, and the slug/draft-not-found checks in
+// `update_collection_visibility`/`export_collection`) are NOT covered here and remain OWED.
+// They ARE reachable: `tauri`'s `test` feature is enabled in hb-app's dev-dependencies and
+// `mock_app`/`guard_app` are used throughout this crate — see `collection_command_guards_a`
+// above, and identity.rs/fulfil.rs. An earlier draft of this module asserted the opposite; that
+// was written against a stale worktree predating QURATOR-161 and is not true of this branch.
+#[cfg(test)]
+mod collection_command_guards_b {
+    use super::*;
+
+    // ── export_manifest → build_slug_manifest (line 830) ───────────────────────────────────
+
+    /// Pins `build_slug_manifest`'s OWN copy of the slug-format guard (line 836:
+    /// `is_valid_slug(slug).then_some(slug).ok_or("Invalid collection slug")?`). This is a
+    /// distinct call site from `prepare_listing`'s identical-looking check (already pinned by
+    /// `prepare_listing_rejects_invalid_slug` above) — a future edit that drops the check from
+    /// `build_slug_manifest` specifically, while leaving `prepare_listing`'s intact, would not be
+    /// caught by that other test.
+    #[test]
+    fn build_slug_manifest_refuses_an_invalid_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let identity = Identity::generate();
+        let err = build_slug_manifest("../evil", &store, &identity, &[7u8; 32]).unwrap_err();
+        assert!(err.contains("Invalid collection slug"), "got: {err}");
+    }
+
+    /// Pins `build_slug_manifest`'s empty-content-types refusal (lines 846-849) — the manifest
+    /// path's own copy of this check, distinct from `prepare_listing`'s publish-path copy (pinned
+    /// by `prepare_listing_rejects_empty_content_types` above). Not covered anywhere else: the
+    /// existing `build_slug_manifest_*` tests all use `a_video_collection`, which always carries
+    /// `content_types: vec!["video".into()]`.
+    #[test]
+    fn build_slug_manifest_refuses_empty_content_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let identity = Identity::generate();
+        let col = Collection {
+            slug: "empty-types".into(),
+            path_alias: "empty-types".into(),
+            description: None,
+            item_count: 1,
+            est_size: None,
+            content_types: vec![],
+            tags: vec![],
+            languages: vec![],
+            visibility: Visibility::Public,
+            sorted: false,
+            last_updated: chrono::Utc::now(),
+            listing: vec![DirectoryItem {
+                name: "file.txt".into(),
+                item_type: ItemType::File,
+                size: None,
+                format: None,
+                year: None,
+                tags: vec![],
+                note: None,
+                children: vec![],
+            }],
+        };
+        store.save_collection_draft(&col).unwrap();
+        let err = build_slug_manifest("empty-types", &store, &identity, &[7u8; 32]).unwrap_err();
+        assert!(
+            err.contains("At least one content type is required"),
+            "got: {err}"
+        );
+    }
+
+    // ── unpublish_collection → unpublish_collection_inner (line 944) ───────────────────────
+
+    /// Pins `unpublish_collection_inner`'s own slug-format guard (line 950). Every existing
+    /// `unpublish_collection_inner` test (`unpublish_*`, `deleting_a_published_collection_*`)
+    /// calls it with an already-valid slug, so this guard has no coverage anywhere in the file.
+    /// The guard fires before any store or relay access, so an unrouted `SharedRelay` and an
+    /// empty store are both fine here.
+    #[tokio::test]
+    async fn unpublish_collection_inner_refuses_an_invalid_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let identity = Identity::generate();
+        let relay = crate::net::new_shared();
+        let err = unpublish_collection_inner("../evil", &store, &identity, &relay)
+            .await
+            .unwrap_err();
+        assert!(err.contains("Invalid collection slug"), "got: {err}");
+    }
+
+    // ── OWED — reported, not refactored into reach ──────────────────────────────────────────
+    //
+    // Each of these is a guard living directly in a `#[tauri::command]` body with no `*_inner`
+    // (or, for the identity checks, one whose own delegate takes the ALREADY-unwrapped identity —
+    // the guard itself never runs except inside the command). Reaching any of them from a test
+    // would mean either enabling `tauri`'s `test` feature in `hb-app/Cargo.toml` (a Cargo.toml
+    // change) or extracting a new `*_inner` function (a production restructuring) — both out of
+    // scope for a tests-only slice, per the ticket's hard constraint.
+    //
+    //   - `publish_collection` (line 808), "No identity loaded" guard at line 816.
+    //   - `export_manifest` (line 892), "No identity loaded" guard at line 900.
+    //   - `unpublish_collection` (line 1036), "No identity loaded" guard at line 1044.
+    //   - `update_collection_visibility` (line 1052): `is_valid_slug` guard at line 1059, and the
+    //     "No draft found for collection '{safe_slug}'" guard at line 1063. Nothing in the command
+    //     body delegates to an extractable pure function — load → mutate `visibility` → save is
+    //     all inline.
+    //   - `export_collection` (line 1071): `is_valid_slug` guard at line 1078, and the
+    //     "Collection '{safe_slug}' not found" guard at line 1083. Same shape — no `*_inner`.
 }
