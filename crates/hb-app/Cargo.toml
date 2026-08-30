@@ -26,6 +26,9 @@ path = "src/bin/hb-wan-it.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# QURATOR-161: build.rs re-emits the Windows application manifest through this crate so it reaches
+# the lib unittest harness, not just the bins. See build.rs for why that is necessary.
+embed-resource = "3"
 
 [dependencies]
 hb-core    = { path = "../hb-core" }
