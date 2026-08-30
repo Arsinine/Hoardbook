@@ -10,7 +10,8 @@ export type TooltipKey =
 	| 'listings-locked'
 	| 'k-of-n-folders'
 	| 'fingerprint'
-	| 'custom-relays';
+	| 'custom-relays'
+	| 'network-type';
 
 /** The canonical key list — single source of truth for iteration + the registry-completeness test. */
 export const TOOLTIP_KEYS: TooltipKey[] = [
@@ -20,6 +21,7 @@ export const TOOLTIP_KEYS: TooltipKey[] = [
 	'k-of-n-folders',
 	'fingerprint',
 	'custom-relays',
+	'network-type',
 ];
 
 export interface TooltipContent {
@@ -32,11 +34,11 @@ export const TOOLTIPS: Record<TooltipKey, TooltipContent> = {
 	// plane carries manifests (listings), never a user's collection files.
 	'no-download': {
 		title: 'No downloads here',
-		body: 'Hoardbook moves no files; it finds people and shows what they have. Arrange the transfer off-platform — a DM, their contact hint, or whatever the two of you already use.',
+		body: 'Hoardbook moves no files. It finds people and shows what they have. Arrange the transfer yourselves: a DM, their contact hint, or whatever you both already use.',
 	},
 	'willing-to': {
 		title: 'Willing to',
-		body: 'How this hoarder prefers to arrange an off-platform exchange — seed (share via torrent), trade (swap), upload (send a copy), or meet up (hand off in person). Hoardbook moves no files, so these are hints, not buttons.',
+		body: 'How this hoarder prefers to arrange an exchange: seed a torrent, trade, upload a copy, or meet up in person. Hoardbook moves no files, so these are hints, not buttons.',
 	},
 	// Spec verbatim: "you have their npub but not their share code."
 	'listings-locked': {
@@ -45,16 +47,26 @@ export const TOOLTIPS: Record<TooltipKey, TooltipContent> = {
 	},
 	'k-of-n-folders': {
 		title: 'K of N folders available',
-		body: 'A large listing is split into per-folder parts. Some are missing — a part the owner withheld, or an oversize-split part a relay has not returned — so you are seeing only some of the folders.',
+		body: 'Large listings travel in parts, one per folder. Some parts are missing, withheld by the owner or not yet returned by a relay, so you are seeing only some of the folders.',
 	},
 	'fingerprint': {
 		title: 'Identity fingerprint',
-		body: 'A word-and-color fingerprint of this person’s key — your impersonation defense. It is bound to the npub, not the display name, so a copycat reusing the same name shows a different fingerprint.',
+		body: 'A word-and-color fingerprint of this person’s key. It follows the key, not the display name, so a copycat reusing the same name shows a different fingerprint.',
 	},
 	// M23 W4 (QURATOR-75): corrects the "more relays = more reach" misconception. A relay nobody
 	// else dials is a private room, not a megaphone — the defaults are where strangers see you.
 	'custom-relays': {
 		title: 'Custom relays',
-		body: 'Add a relay to build a private community — you and the people you tell will meet there. It does not make you easier to find: nobody else is connected to your relay by default, so adding more does not widen your reach. The defaults are where strangers will see you.',
+		body: 'Add a relay to build a private community where you and the people you tell will meet. It will not widen your reach: nobody else connects to your relay by default. The defaults are where strangers see you.',
+	},
+	// Owner, 2026-08-27: "add a tooltip letting the user know what it means if they're being a NAT."
+	// Says what it COSTS them, not what it is — a definition of network address translation helps
+	// nobody decide anything. Deliberately does not overclaim: the classifier's own copy calls CGNAT
+	// "a strong signal, not proof" (QURATOR-68), so this must not promise that direct transfer will
+	// fail, only that it may need a relay. Everything except the direct manifest hand-off works
+	// identically behind any NAT, and saying so is the point — otherwise the pill reads as a fault.
+	'network-type': {
+		title: 'Network type',
+		body: 'How your connection sits behind your router. Behind NAT is normal. CGNAT means your provider funnels many customers through one address, so sending someone a full collection list may need a relay, or fail if neither side is reachable. Browsing, chat, Topics, and presence work the same either way.',
 	},
 };

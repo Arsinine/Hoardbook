@@ -24,7 +24,7 @@ describe('settings key-view', () => {
 		expect(labels).not.toContain('Browse key');
 		expect(v.rows.find((r) => r.label === 'Share code')?.sensitive).toBe(true);
 		expect(v.storageLabel).toBe('Encrypted by your OS');
-		expect(v.noRecoveryNotice).toMatch(/cannot be recovered/i);
+		expect(v.noRecoveryNotice).toMatch(/no reset if you lose it/i);
 	});
 
 	it('linux_storage_warning_shown_when_plain_file', () => {

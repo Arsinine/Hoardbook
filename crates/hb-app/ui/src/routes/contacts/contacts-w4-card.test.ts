@@ -139,7 +139,7 @@ describe('M21 W4 behaviour 6 — N collections hoverable, public ONLY', () => {
 		const s = contactsSrc();
 		expect(s).toMatch(/col\.path_alias/);
 		expect(s).toMatch(/col\.est_size/);
-		expect(s).toMatch(/public collections only — private ones live in the detail/);
+		expect(s).toMatch(/Public collections only\. Private ones show in the expanded card\./);
 	});
 
 	it('the trigger shows a ▼ caret signalling hover, and :focus-within makes it keyboard-reachable', () => {

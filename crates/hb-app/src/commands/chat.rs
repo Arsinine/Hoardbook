@@ -592,6 +592,7 @@ pub(crate) async fn dm_request_accept_inner(
         petname,
         profile: None,
         collections: vec![],
+        listings_state: Default::default(), // QURATOR-134 tri-state (not classified on this stub path)
         online: false,
         last_fetched: chrono::Utc::now(),
         last_presence: None, // W5.2: stamped by the online poll only
@@ -1681,6 +1682,59 @@ mod tests {
         assert!(!store.load_dm_blocked().unwrap().contains(&npub));
     }
 
+    /// QURATOR-141 — a PROACTIVE block (Settings' block-by-npub, no prior DM Request, no contact
+    /// record) must reach the same DM-acceptance path chat's `handleBlock` feeds. The acceptance
+    /// classifier is `route_dm` driven by `get_messages`'s fresh `load_dm_blocked()` read, keyed on
+    /// the bare npub string — NOT on any request record — so a store-side block is enforced there
+    /// with zero relationship prerequisites. This pins that end-to-end at the store level: block a
+    /// stranger with no bucket/decline/contact anywhere, then assert (a) their subsequent DM is
+    /// REFUSED (`route_dm` → Drop), not merely hidden, (b) a stranger-Request is never created for
+    /// them, and (c) unblock restores acceptance (Request, since they're still a stranger).
+    #[test]
+    fn proactive_block_refuses_later_dms_and_unblock_restores_acceptance() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
+        let stranger = "npub1hostile".to_string();
+        let own_npub = me.npub();
+
+        // The proactive state: nothing exists for this npub — no Request bucket, no decline, no
+        // contact. `dm_block_inner` must work purely from the npub (creating a contact is out of
+        // scope by owner ruling).
+        assert!(store.load_dm_requests(&me).unwrap().is_empty());
+        assert!(store.load_dm_declined().unwrap().is_empty());
+        dm_block_inner(&store, &me, stranger.clone()).unwrap();
+
+        // (a) REFUSED, not hidden: the blocklist written by the proactive block is exactly what
+        // `get_messages` loads into `DmClassifyCtx::blocked`, and `route_dm` consults it FIRST —
+        // blocked supersedes contact, decline, and the stranger-Request path alike.
+        let blocked: HashSet<String> = store.load_dm_blocked().unwrap().into_iter().collect();
+        assert!(blocked.contains(&stranger), "the proactive block landed in dm_blocked.json");
+        let contacts: HashSet<String> = HashSet::new();
+        let declined: HashSet<String> = HashSet::new();
+        let on = ctx(&contacts, &blocked, &declined, true);
+        assert_eq!(
+            route_dm(&stranger, &own_npub, &on),
+            DmRoute::Drop,
+            "a proactively-blocked stranger's DM is refused at acceptance, not merely hidden"
+        );
+
+        // (b) No Request entry may be created for them (blocked supersedes the stranger-Request
+        // path — this is the WAN-C C5 shape, pinned here at the unit level too).
+        assert!(store.load_dm_requests(&me).unwrap().is_empty());
+
+        // (c) Unblock restores acceptance: same stranger, now no contact/decline and allow_dms on,
+        // routes to Request again.
+        dm_unblock_inner(&store, stranger.clone()).unwrap();
+        let blocked_after: HashSet<String> = store.load_dm_blocked().unwrap().into_iter().collect();
+        let restored = ctx(&contacts, &blocked_after, &declined, true);
+        assert_eq!(
+            route_dm(&stranger, &own_npub, &restored),
+            DmRoute::Request,
+            "unblock restores stranger-DM acceptance"
+        );
+    }
+
     // ── QURATOR-91 — own sent history survives a restart via the at-rest cache ──────────────────
 
     /// The inbox fetch filter (`dm_inbox_filter`) is `Kind::GiftWrap` + `.pubkey(me)` — the `#p`
@@ -1951,5 +2005,104 @@ mod tests {
             !declined_after.iter().any(|(n, _)| n == "npub1race0"),
             "unblocking a racing-declined sender must not reveal a silent decline"
         );
+    }
+
+    // ── QURATOR-161 — the #[tauri::command] guards, driven through the command itself ──────────
+    //
+    // The v0.18.0 post-mortem: the WAN harness re-implemented command bodies step by step, and the
+    // one step it never copied was the broken one. These tests call `send_message` ITSELF — the
+    // `#[tauri::command]` fn at its real signature, `State<'_, T>` and all — via tauri's own test
+    // scaffolding (`mock_app()` + the app's `StateManager`), so what is pinned is the command the
+    // frontend invokes, not a lookalike. No re-implementation of any guard appears here.
+    //
+    // All three guards fire BEFORE `net::client` (the first network I/O), so no relay is ever
+    // dialled: the tests are offline and hermetic by construction, not by chance.
+    mod command_guards {
+        use super::*;
+        use crate::identity_state::AppIdentity;
+        use std::sync::Arc;
+        use tauri::Manager;
+
+        /// `send_message` as the frontend calls it: the real command fn with real managed `State`.
+        /// Tauri's `State<'_, T>` has a private field, so the ONLY way to mint one outside the IPC
+        /// machinery is `StateManager::get` — which is exactly what the `#[tauri::command]` macro's
+        /// generated `CommandArg` impl asks at invoke time. This is the same seam, driven directly.
+        async fn send_message_via_command(
+            app: &tauri::App<tauri::test::MockRuntime>,
+            to: &str,
+            content: &str,
+        ) -> CmdResult<ReceivedMessage> {
+            send_message(
+                to.to_string(),
+                content.to_string(),
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+        }
+
+        fn guard_app(identity_loaded: bool) -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            let identity: SharedIdentity = Arc::new(tokio::sync::RwLock::new(
+                identity_loaded.then(AppIdentity::generate),
+            ));
+            app.manage(Arc::clone(&identity));
+            app.manage(store);
+            app.manage(net::new_shared());
+            app
+        }
+
+        #[tokio::test]
+        async fn send_message_command_rejects_empty_and_whitespace() {
+            let app = guard_app(true);
+            let peer = Identity::generate().npub();
+            for empty in ["", "   ", "\n\t "] {
+                let err = send_message_via_command(&app, &peer, empty)
+                    .await
+                    .unwrap_err();
+                assert_eq!(err, "Message cannot be empty", "content {empty:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn send_message_command_rejects_over_4096_chars() {
+            let app = guard_app(true);
+            let peer = Identity::generate().npub();
+            let err = send_message_via_command(&app, &peer, &"x".repeat(4097))
+                .await
+                .unwrap_err();
+            assert_eq!(err, "Message too long (4097 chars, max 4096)");
+            // The boundary's other side: exactly 4096 PASSES the length guard. Proven hermetically
+            // by pairing it with an unparseable recipient, which errors at `parse_recipient` — the
+            // very next statement after the guard — so the command never reaches the relay connect.
+            // This is what reds under an off-by-one (`>=`) mutation of the comparison.
+            let err = send_message_via_command(&app, "not-a-share-code", &"x".repeat(4096))
+                .await
+                .unwrap_err();
+            assert!(
+                err.starts_with("Invalid recipient:"),
+                "4096 chars clears the length guard and fails at the recipient parse instead, \
+                 got {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn send_message_command_rejects_self_send_before_any_network_io() {
+            let app = guard_app(true);
+            // `to` = our own npub. The identity is loaded, so the guard is reached with the real
+            // `AppIdentity` the command reads from `SharedIdentity`.
+            let own_npub = {
+                let guard = app.state::<SharedIdentity>();
+                let id = guard.read().await;
+                id.as_ref().unwrap().npub()
+            };
+            let err = send_message_via_command(&app, &own_npub, "note to self")
+                .await
+                .unwrap_err();
+            assert_eq!(err, "You can't send a message to yourself.");
+        }
     }
 }

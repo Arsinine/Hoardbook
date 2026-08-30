@@ -67,18 +67,22 @@ describe('AddCollectionModal', () => {
 		expect(publishBtn.disabled).toBe(false);
 	});
 
-	it('save_draft_closes_without_publishing', async () => {
+	it('q138_save_draft_button_is_gone_and_details_still_publish', async () => {
+		// QURATOR-138: "Delete the 'Save Draft' button … in edit details." The footer now has
+		// exactly Cancel + Publish; there is no third path, and Publish still persists-then-publishes.
 		const col = makeCollection({ content_types: ['video'] });
 		const closed = vi.fn();
-		const { getByRole } = render(AddCollectionModal, {
+		const { getByRole, queryByRole } = render(AddCollectionModal, {
 			props: { open: true, editCollection: col, onclose: closed },
 		});
 
-		await fireEvent.click(getByRole('button', { name: /save draft/i }));
-		await waitFor(() => expect(closed).toHaveBeenCalled());
+		expect(queryByRole('button', { name: /save draft/i })).toBeNull();
+		expect(getByRole('button', { name: /^cancel$/i })).toBeTruthy();
 
+		await fireEvent.click(getByRole('button', { name: /^publish$/i }));
+		await waitFor(() => expect(closed).toHaveBeenCalled());
 		expect(updateCollectionMeta).toHaveBeenCalled();
-		expect(publishCollection).not.toHaveBeenCalled();
+		expect(publishCollection).toHaveBeenCalled();
 	});
 
 	// QURATOR-97 — the wizard's close() resets step/collection, so a stray backdrop click on the

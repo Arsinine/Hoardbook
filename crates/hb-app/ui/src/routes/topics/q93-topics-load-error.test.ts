@@ -2,12 +2,13 @@
 // QURATOR-93 (Topics half) — a FAILED `loadMine` (topicList) used to toast its failure and then fall
 // through to the template, whose `mine.length === 0` branch rendered the confident "You haven't joined
 // any Topics yet" negative on data that never arrived. The fix splits the mine load into a DISTINCT
-// `mineLoadError` state (same machine as Discover's erroredRoots one tab over): a FAILED load renders
-// an error + Retry; a later success clears it (the QURATOR-80/85 both-directions rule).
+// `mineLoadError` state (same machine as the tree's paintError): a FAILED load renders an error +
+// Retry; a later success clears it (the QURATOR-80/85 both-directions rule). QURATOR-144 W2 keeps the
+// machine verbatim — only the genuine-empty wording changed (the merged tree carries the pane now).
 //
 // BEHAVIOURAL mount tests: assert on the AFFORDANCES (role=alert, Retry BUTTON) plus the ABSENCE of
-// the confident "haven't joined any Topics" string. This file only touches the MINE tab's loadMine —
-// the Discover-tab suites (topics-q83, q80, q85) have their own mocks and are unaffected.
+// the confident negative. This file only touches loadMine — the tree suites (q83, q80, q85, w2)
+// have their own mocks and are unaffected.
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, fireEvent, cleanup, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
@@ -27,7 +28,8 @@ vi.mock('$lib/api.js', () => ({
 		joined_at: 0,
 	}),
 	topicUpdateMeta: vi.fn(),
-	topicDiscover: vi.fn(),
+	topicDiscoverPaint: vi.fn().mockResolvedValue([]),
+	topicRank: vi.fn().mockResolvedValue([]),
 	topicLookup: vi.fn().mockResolvedValue({ topic_id: '', name: '', exists: false, member_count_estimate: 0 }),
 	topicJoinPublic: vi.fn(),
 	topicRedeemInvite: vi.fn(),
@@ -89,11 +91,14 @@ describe('QURATOR-93 — Topics mine load failure is not a confident empty', () 
 		await waitFor(() => expect(queryByRole('alert')).toBeNull());
 	});
 
-	it('a SUCCESSFUL load renders the genuine empty state, not the error', async () => {
+	it('a SUCCESSFUL empty load renders no error — the directory half carries the pane', async () => {
+		// QURATOR-144 W2: an empty `mine` is no longer a whole-pane state (the merged tree also
+		// holds the announced public Topics), so the confident negative is gone entirely; only a
+		// totally empty tree renders the honest "nothing here yet" line.
 		topicListMock.mockResolvedValue([]);
 
 		const { queryByRole, findByText } = render(TopicsPage);
-		expect(await findByText(EMPTY_STRING)).toBeTruthy();
+		expect(await findByText(/nothing here yet/i)).toBeTruthy();
 		expect(queryByRole('alert')).toBeNull();
 	});
 });

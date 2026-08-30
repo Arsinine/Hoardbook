@@ -7,21 +7,20 @@ import { contactDisplayName } from './contact-display.js';
 
 /** Public-join consent: the visibility is the deal. Anyone who joins can see you are a member. */
 export const PUBLIC_JOIN_CONSENT =
-	'Joining is public: anyone who joins this Topic can see that you are a member (your npub is on ' +
-	'the members-only roster, which any joiner can read). Fine for a pseudonymous interest — the same ' +
-	'exposure class as your public teaser.';
+	'Joining is public. Anyone in this Topic can see you are a member, because your npub goes on a ' +
+	'roster every joiner can read. That is the same visibility as your public profile.';
 
 /** Private-join consent: a durable members-only membership record exists — the §11 threat note,
  *  lifted verbatim in spirit. The join MUST be gated behind an explicit acknowledgment (F12). */
 export const PRIVATE_JOIN_CONSENT =
-	'A durable, members-only membership record exists for this private Topic — it persists (encrypted) ' +
-	'on relays for as long as members keep it, scoped to the people you have been admitted alongside. ' +
-	'Weigh it before joining a private Topic around a sensitive subject.';
+	'Private Topics keep an encrypted, members-only record of who joined. It stays on relays for as ' +
+	'long as the Topic lives, visible to the people you were admitted alongside. Think twice before ' +
+	'joining one around a sensitive subject.';
 
 /** Joining unlocks no listings (INV-2) — surfaced wherever a Topic is joined/shown. */
 export const NO_UNLOCK_NOTE =
-	'Joining a Topic does not unlock anyone’s collections — you get each member’s npub + public teaser ' +
-	'only. Browsing their listings still needs their share code, exchanged one-to-one as normal.';
+	'Joining a Topic does not unlock anyone’s collections. You get each member’s npub and public ' +
+	'profile only. Browsing their listings still needs their share code, person to person.';
 
 /** The consent copy to show before joining — private vs public. */
 export function joinConsentCopy(isPrivate: boolean): string {
@@ -196,13 +195,25 @@ export interface TopicGroup<T> {
 	topics: T[];
 }
 
+/** The root group a Topic name lands under (QURATOR-147 W5): its first path segment when that
+ *  segment is one of [`TOPIC_ROOTS`], otherwise `other`. The membership check is load-bearing —
+ *  `splitTopicPath('back room')[0]` is `'back room'` itself (truthy, never undefined), so a
+ *  `?? 'other'` fallback NEVER fires and every rootless legacy private Topic used to get its own
+ *  singleton root-group header. Shared by the sidebar's per-root call sites so the page's row
+ *  filter, its group-seed rule, and this tree can never disagree about where a name lands. */
+export function topicRootOf(name: string): string {
+	const first = splitTopicPath(name)[0] ?? 'other';
+	return (TOPIC_ROOTS as readonly string[]).includes(first) ? first : 'other';
+}
+
 /** Group discovered Topics by their root category (the first path segment) for the collapsible tree
- *  (root category → sub-paths). Roots are ordered by [`TOPIC_ROOTS`]; an unexpected root sorts last.
- *  Within a root, input order is preserved (the backend already activity-ranks). */
+ *  (root category → sub-paths). Roots are ordered by [`TOPIC_ROOTS`]; a first segment that is not a
+ *  category root routes to `other` ([`topicRootOf`]). Within a root, input order is preserved (the
+ *  backend already activity-ranks). */
 export function groupTopicsByRoot<T extends { name: string }>(topics: T[]): TopicGroup<T>[] {
 	const byRoot = new Map<string, T[]>();
 	for (const t of topics) {
-		const root = splitTopicPath(t.name)[0] ?? 'other';
+		const root = topicRootOf(t.name);
 		const bucket = byRoot.get(root);
 		if (bucket) bucket.push(t);
 		else byRoot.set(root, [t]);
@@ -214,4 +225,49 @@ export function groupTopicsByRoot<T extends { name: string }>(topics: T[]): Topi
 	return [...byRoot.entries()]
 		.sort((a, b) => rank(a[0]) - rank(b[0]))
 		.map(([root, ts]) => ({ root, topics: ts }));
+}
+
+// ── QURATOR-143 W1: lazy ranking (order by roster size, most popular first) ────────────────────────
+
+/** The per-group draw cap (r4 ruling): a root group draws its ~25 most popular rows and states the
+ *  remainder ("+N more under X"); joined rows are never truncated. The lazy ranker fetches counts
+ *  ONLY for rows that will actually be drawn, so this cap is also the fetch bound per root. */
+export const TOPIC_GROUP_DRAW_CAP = 25;
+
+/** Round-robin interleave (QURATOR-143 W1, r4 owner ruling: "never spend all budget on one root").
+ *  Takes per-root queues (root → ids, the ids in that root's draw order) and emits ONE flat list
+ *  taking the head of each non-empty queue in turn — so with two roots pending, neither drains the
+ *  other's slots: root A's first 8 ids cannot occupy all 8 concurrency slots before root B gets
+ *  one. Removing the interleave (concatenating the queues instead) is exactly the mutation the
+ *  round-robin test reds on. */
+export function interleaveRoundRobin(queues: readonly (readonly string[])[]): string[] {
+	const out: string[] = [];
+	const rest = queues.map((q) => [...q]);
+	// Loop until every queue is drained. `progress` guards a hypothetical all-empty input.
+	for (let progressed = true; progressed; ) {
+		progressed = false;
+		for (const q of rest) {
+			const head = q.shift();
+			if (head !== undefined) {
+				out.push(head);
+				progressed = true;
+			}
+		}
+	}
+	return out;
+}
+
+/** Order a root group's rows by the lazily-fetched counts (most popular first), stable on ties and
+ *  on not-yet-ranked rows (they keep their paint order, after every ranked row — an unfetched count
+ *  is an unknown, not a zero). Pure: `counts` is a `topic_id → count` map as `topicRank` lands them. */
+export function orderByMemberCount<T extends { topic_id: string; member_count_estimate: number | null }>(rows: readonly T[]): T[] {
+	return [...rows].sort((a, b) => {
+		const ca = a.member_count_estimate;
+		const cb = b.member_count_estimate;
+		// Unknown (null) sorts after known, whatever the known value is — never rendered as 0.
+		if (ca === null && cb === null) return 0;
+		if (ca === null) return 1;
+		if (cb === null) return -1;
+		return cb - ca; // most popular first (r4)
+	});
 }

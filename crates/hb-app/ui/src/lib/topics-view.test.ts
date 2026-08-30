@@ -13,6 +13,7 @@ import {
 	composeTopicPath,
 	splitTopicPath,
 	subPathLabel,
+	topicRootOf,
 	groupTopicsByRoot,
 	sortChannelPostsAscending,
 	interleaveChannel,
@@ -30,9 +31,9 @@ describe('topics-view (M11)', () => {
 		expect(joinConsentCopy(false)).toBe(PUBLIC_JOIN_CONSENT);
 		expect(joinConsentCopy(true)).toBe(PRIVATE_JOIN_CONSENT);
 		// The public copy makes the visibility explicit; the private copy names the durable record.
-		expect(PUBLIC_JOIN_CONSENT.toLowerCase()).toContain('anyone who joins');
-		expect(PRIVATE_JOIN_CONSENT.toLowerCase()).toContain('durable');
-		expect(PRIVATE_JOIN_CONSENT.toLowerCase()).toContain('membership record');
+		expect(PUBLIC_JOIN_CONSENT.toLowerCase()).toContain('anyone in this topic can see you are a member');
+		expect(PRIVATE_JOIN_CONSENT.toLowerCase()).toContain('stays on relays for as long as the topic lives');
+		expect(PRIVATE_JOIN_CONSENT.toLowerCase()).toContain('members-only record of who joined');
 	});
 
 	it('F12: the join gate requires an explicit acknowledgment', () => {
@@ -164,6 +165,23 @@ describe('topics-view — W4 public Topic paths', () => {
 	});
 });
 
+describe('topics-view — QURATOR-147 W5: private Topics obey the public path convention', () => {
+	it('a first segment that is NOT a category root routes to other — a rootless name never gets its own group', () => {
+		// The pre-W5 bug: `splitTopicPath('back room')[0] ?? 'other'` is `'back room'` (truthy), so
+		// the fallback never fired and every rootless legacy private Topic sat under a singleton
+		// group header of its own. Mutate `topicRootOf` back to `splitTopicPath(name)[0] ?? 'other'`
+		// and this reds.
+		expect(topicRootOf('back room')).toBe('other');
+		expect(topicRootOf('nonsense/sub')).toBe('other');
+		expect(topicRootOf('video/anime')).toBe('video');
+		expect(topicRootOf('other/back room')).toBe('other');
+
+		const tree = groupTopicsByRoot([{ name: 'back room' }, { name: 'other/club' }, { name: 'video/anime' }]);
+		expect(tree.map((g) => g.root)).toEqual(['video', 'other']); // no 'back room' singleton group
+		expect(tree[1].topics.map((t) => t.name)).toEqual(['back room', 'other/club']);
+	});
+});
+
 describe('topics-view — devtest #12 channel post order', () => {
 	function post(author_npub: string, ts: number): ChannelPost {
 		return { author_npub, body: author_npub, ts };
@@ -250,5 +268,63 @@ describe('topics-view — devtest #11 join-first primary action', () => {
 		const action = createPrimaryAction(lookup(true, 7));
 		expect(action.mode).toBe('join');
 		expect(action.label).toContain(memberCountLabel(7));
+	});
+});
+
+// ── QURATOR-143 W1: the lazy-ranker helpers (round-robin interleave + count ordering) ────────────
+
+import { interleaveRoundRobin, orderByMemberCount, TOPIC_GROUP_DRAW_CAP } from './topics-view.js';
+
+describe('interleaveRoundRobin (QURATOR-143 W1)', () => {
+	it('alternates heads — with two roots pending, neither drains the other’s slots', () => {
+		// The relay-citizenship shape: the first TOPIC_DISCOVERY_CONCURRENCY = 8 requests must not
+		// all come from one root. 12 video + 12 audio ids.
+		const out = interleaveRoundRobin([
+			[...Array(12)].map((_, i) => `video-${i}`),
+			[...Array(12)].map((_, i) => `audio-${i}`),
+		]);
+		expect(out).toHaveLength(24);
+		// Strict alternation at the head.
+		expect(out[0]).toBe('video-0');
+		expect(out[1]).toBe('audio-0');
+		expect(out[2]).toBe('video-1');
+		// The first 8 contain both roots.
+		const roots = new Set(out.slice(0, 8).map((id) => id.split('-')[0]));
+		expect(roots).toEqual(new Set(['video', 'audio']));
+	});
+
+	it('handles three queues of unequal length without dropping or duplicating an id', () => {
+		const out = interleaveRoundRobin([['a1', 'a2'], ['b1'], ['c1', 'c2', 'c3']]);
+		expect(out).toHaveLength(6);
+		expect(new Set(out).size).toBe(6);
+		// Every queue's first id lands before any queue's second.
+		expect(out.indexOf('a1')).toBeLessThan(out.indexOf('a2'));
+		expect(out.indexOf('c1')).toBeLessThan(out.indexOf('c2'));
+	});
+
+	it('returns [] for all-empty queues', () => {
+		expect(interleaveRoundRobin([[], [], []])).toEqual([]);
+	});
+});
+
+describe('orderByMemberCount (QURATOR-143 W1, r4: most popular first)', () => {
+	const row = (id: string, count: number | null) => ({ topic_id: id, member_count_estimate: count });
+
+	it('sorts count-desc, stable on ties', () => {
+		const out = orderByMemberCount([row('a', 1), row('b', 3), row('c', 2), row('d', 3)]);
+		expect(out.map((r) => r.topic_id)).toEqual(['b', 'd', 'c', 'a']);
+	});
+
+	it('an unknown count (null) sorts AFTER every known count — never as zero', () => {
+		// A null must never be conflated with a real 0: an unfetched row is an unknown, and ranking
+		// it as 0 would sink a popular-but-unfetched topic below a fetched junk singleton.
+		const out = orderByMemberCount([row('unknown', null), row('zero', 0), row('five', 5)]);
+		expect(out.map((r) => r.topic_id)).toEqual(['five', 'zero', 'unknown']);
+	});
+});
+
+describe('TOPIC_GROUP_DRAW_CAP (r4 per-group cap)', () => {
+	it('is the ~25 the r4 ruling names', () => {
+		expect(TOPIC_GROUP_DRAW_CAP).toBe(25);
 	});
 });

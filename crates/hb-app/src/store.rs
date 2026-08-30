@@ -757,6 +757,33 @@ pub enum ContactSource {
     Topic,
 }
 
+/// QURATOR-134 — the UI-facing projection of `hb_net::ListingsState`, carried on
+/// [`CachedPeer::listings_state`]. Serialized as its bare variant name (`"Fetched"` /
+/// `"Sealed"` / `"FetchFailed"`); `FetchFailed`'s diagnostic reason is dropped at this boundary
+/// (the UI only needs to know the load failed, not why — it renders error + Retry).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ListingsStatus {
+    /// The enumeration completed and the peer authored no listing events — an honest empty.
+    #[default]
+    Fetched,
+    /// The peer authored listings but none decryptable for us — the genuine 🔒 locked case.
+    Sealed,
+    /// The author-wide listing enumeration itself failed — error + Retry, never a confident
+    /// negative on data that never arrived.
+    FetchFailed,
+}
+
+impl From<hb_net::ListingsState> for ListingsStatus {
+    fn from(s: hb_net::ListingsState) -> Self {
+        match s {
+            hb_net::ListingsState::Fetched => ListingsStatus::Fetched,
+            hb_net::ListingsState::Sealed => ListingsStatus::Sealed,
+            // The reason string is diagnostic-only here (logged upstream in hb-net).
+            hb_net::ListingsState::FetchFailed(_) => ListingsStatus::FetchFailed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedPeer {
     /// The peer's Nostr identity (bech32 `npub`) — the stable key the follower-gate keys on.
@@ -779,6 +806,17 @@ pub struct CachedPeer {
     /// `#[serde(default)]` on `PeerCollection`'s parts fields keep a pre-M13 cache (plain `Collection`
     /// objects, no parts info) loading with `parts_total`/`parts_present` as `None`.
     pub collections: Vec<PeerCollection>,
+    /// QURATOR-134 — WHY `collections` looks the way it does for a KEYLESS contact, threaded from
+    /// `hb_net::ListingsState` (the one implementation; the UI must never re-derive it from
+    /// `collections.is_empty()`): `Fetched` = the enumeration completed and the peer authored no
+    /// listing events (an honest empty — "No public collections"); `Sealed` = they authored
+    /// listings but none decryptable for us (the genuine 🔒 locked case); `FetchFailed` = the
+    /// enumeration itself failed (error + Retry, never a confident negative). Only meaningful
+    /// when `browse_key_hex` is `None` — a keyed contact's `collections` is authoritative.
+    /// `#[serde(default)]` ⇒ a pre-QURATOR-134 cached contact loads as `Fetched` (the honest
+    /// empty — the least-wrong reading of data the old code never classified).
+    #[serde(default)]
+    pub listings_state: ListingsStatus,
     pub online: bool,
     pub last_fetched: chrono::DateTime<chrono::Utc>,
     /// **When we last saw this peer's presence beacon** — real last-seen, as opposed to
@@ -1459,6 +1497,7 @@ mod tests {
             petname: None,
             profile: None,
             collections: vec![],
+            listings_state: Default::default(), // QURATOR-134: fixtures predate the tri-state; Fetched is the least-wrong default
             online: false,
             last_fetched: chrono::Utc::now(),
             last_presence: None,
@@ -1929,6 +1968,7 @@ mod tests {
             petname: None,
             profile: None,
             collections: vec![],
+            listings_state: Default::default(), // QURATOR-134: fixtures predate the tri-state; Fetched is the least-wrong default
             online: false,
             last_fetched: chrono::Utc::now(),
             last_presence: None,

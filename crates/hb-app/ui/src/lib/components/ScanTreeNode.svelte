@@ -33,7 +33,7 @@
 	let lockHint = $derived(
 		rootFileLocked
 			? 'Root-level files are always included'
-			: 'Included via a checked parent — uncheck the parent to refine'
+			: 'Included via a checked parent. Uncheck the parent to refine.'
 	);
 	// `indeterminate` is a DOM property, not an attribute — set it imperatively so it stays in sync.
 	$effect(() => {

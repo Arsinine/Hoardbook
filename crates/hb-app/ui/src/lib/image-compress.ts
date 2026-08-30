@@ -21,7 +21,7 @@ export async function compressToDataUri(file: File | Blob, maxBytes: number = PI
 				if (uri.length <= maxBytes) return uri;
 			}
 		}
-		throw new Error(`Could not compress this image under ${maxBytes} bytes — try a simpler picture.`);
+		throw new Error(`Couldn’t compress this image under ${maxBytes} bytes. Try a simpler picture.`);
 	} finally {
 		bitmap.close();
 	}

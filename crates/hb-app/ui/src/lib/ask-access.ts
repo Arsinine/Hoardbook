@@ -12,8 +12,8 @@
  *  elided to the bare "Hi —" form when absent. A whitespace-only petname is treated as absent. */
 export function askAccessDraft(petname: string): string {
 	const name = petname.trim();
-	if (name) return `Hi ${name} — could I have your share code? I'd like to browse your collections.`;
-	return `Hi — could I have your share code? I'd like to browse your collections.`;
+	if (name) return `Hi ${name}, could I have your share code? I'd like to browse your collections.`;
+	return `Hi, could I have your share code? I'd like to browse your collections.`;
 }
 
 /** The pure intent→draft decision. Given the URL `intent` param value, the current composer draft,

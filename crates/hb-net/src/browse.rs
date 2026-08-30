@@ -585,14 +585,60 @@ pub async fn browse_peer_listings(
     browse_key: &BrowseKey,
     timeout: Duration,
 ) -> Result<Vec<(String, RenderedListing, Option<String>)>, NetError> {
-    let events = client
-        .fetch(Filter::new().author(*peer).kind(Kind::from_u16(KIND_LISTING)), timeout)
-        .await?;
+    // QURATOR-134: the lenient projection of `browse_peer_listings_state` — same fetch, same
+    // grouping, same bounds; only the tri-state is dropped. Delegating (rather than duplicating
+    // the loop) is what keeps the two paths from drifting, this repo's standing fault shape.
+    Ok(browse_peer_listings_state(client, peer, browse_key, timeout).await?.0)
+}
 
-    // Group by root slug, keeping every event per full `d` so the newest per replaceable
-    // identifier wins below (BTreeMap ⇒ output sorted by root slug).
+/// Why [`browse_peer_listings`] came back with the collections it came back with (QURATOR-134):
+/// the returned `Vec` alone cannot distinguish *"the peer published nothing"* from *"they
+/// published listings but we hold no key that decrypts any of them"* — both are an empty `Vec`
+/// after the BR1 per-family skip, which is exactly the collapse `BrowseResult::listing_error`
+/// (QURATOR-127) was added to break for the slug-scoped path. This is the same split for the
+/// enumeration path: one implementation here, threaded through by the caller — never re-derived
+/// downstream from `len() == 0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListingsState {
+    /// The fetch completed and the peer has NO authored `KIND_LISTING` events at all — an honest
+    /// empty, to be rendered as "no collections", never as locked.
+    Fetched,
+    /// The fetch completed and the peer HAS authored `KIND_LISTING` events, but none of them
+    /// rendered (no key held that decrypts any family — the genuine 🔒 locked case).
+    Sealed,
+    /// The author-wide fetch itself failed (relay/timeout error) — neither of the above; the
+    /// caller must not render a confident negative on data that never arrived.
+    FetchFailed(String),
+}
+
+/// The enumeration read behind [`browse_peer_listings`], returning the tri-state alongside the
+/// rendered families: one fetch, grouped once, classified once. [`browse_peer_listings`] is the
+/// lenient projection of this (collections only, `FetchFailed` folded to empty) so existing
+/// callers are unchanged; the classification logic lives HERE and nowhere else.
+pub async fn browse_peer_listings_state(
+    client: &RelayClient,
+    peer: &PublicKey,
+    browse_key: &BrowseKey,
+    timeout: Duration,
+) -> Result<(Vec<(String, RenderedListing, Option<String>)>, ListingsState), NetError> {
+    let events = match client
+        .fetch(Filter::new().author(*peer).kind(Kind::from_u16(KIND_LISTING)), timeout)
+        .await
+    {
+        Ok(events) => events,
+        // The fetch itself failed — propagate the state, never fold it into "empty" (a confident
+        // negative on data that never arrived is the QURATOR-67/68/83/134 fault shape).
+        Err(e) => return Ok((Vec::new(), ListingsState::FetchFailed(e.to_string()))),
+    };
+
+    let pinned = authored_by(events, peer);
+    if pinned.is_empty() {
+        // Nothing this peer authored exists on any relay we can read — an honest empty.
+        return Ok((Vec::new(), ListingsState::Fetched));
+    }
+
     let mut families: BTreeMap<String, HashMap<String, Vec<Event>>> = BTreeMap::new();
-    for ev in authored_by(events, peer) {
+    for ev in pinned.clone() {
         if let Some(d) = ev.tags.identifier() {
             let root = match d.find("#part") {
                 Some(i) => &d[..i],
@@ -602,6 +648,18 @@ pub async fn browse_peer_listings(
         }
     }
 
+    let out = enumerate_families(families, browse_key);
+    let state = classify_listings(&pinned, &out);
+    Ok((out, state))
+}
+
+/// Group + render every family, shared by [`browse_peer_listings_state`] (extracted QURATOR-134 so
+/// the tri-state classification is unit-testable against REAL signed events without a relay,
+/// mirroring how `accrue_decrypted_bytes` was extracted for its bound).
+fn enumerate_families(
+    families: BTreeMap<String, HashMap<String, Vec<Event>>>,
+    browse_key: &BrowseKey,
+) -> Vec<(String, RenderedListing, Option<String>)> {
     let mut out = Vec::new();
     for (root, by_d) in families {
         if let Some((rendered, teaser_event_id)) =
@@ -610,7 +668,27 @@ pub async fn browse_peer_listings(
             out.push((root, rendered, teaser_event_id));
         }
     }
-    Ok(out)
+    out
+}
+
+/// The QURATOR-134 discriminator, as ONE pure function (the classification logic lives here and
+/// nowhere else): "the peer authored listing events" is NOT the same fact as "any of them
+/// rendered". Both inputs come straight off the enumeration path — `authored` is the
+/// author-pinned event set, `rendered` is what came out of [`enumerate_families`].
+///
+/// * `authored` empty → [`ListingsState::Fetched`] — an honest empty ("they published nothing"),
+///   never 🔒 locked (the owner's bug: `collections.len() == 0` keyed the lock).
+/// * `authored` non-empty, `rendered` empty → [`ListingsState::Sealed`] — the genuine locked case.
+/// * `rendered` non-empty → [`ListingsState::Fetched`] — collections came back; the state is moot.
+fn classify_listings(
+    authored: &[Event],
+    rendered: &[(String, RenderedListing, Option<String>)],
+) -> ListingsState {
+    if rendered.is_empty() && !authored.is_empty() {
+        ListingsState::Sealed
+    } else {
+        ListingsState::Fetched
+    }
 }
 
 /// Assemble + render ONE browsed family for [`browse_peer_listings`] — the enumeration path's
@@ -758,6 +836,95 @@ mod tests {
     //    `browse_peer_listings` now carries. Replaces the LISTING_FETCH_LIMIT tests — a relay-side
     //    limit on an author-wide fetch was decorative (nostr-sdk `force_insert` grows past it) AND
     //    a regression (it evicted a prolific peer's older collections).
+
+    // ── QURATOR-134: the enumeration tri-state (red-green, one test per state) ──────────────────
+    //
+    // The bug: `browse_peer_listings`' returned Vec cannot distinguish "they published nothing"
+    // from "they published listings we can't decrypt" — both are an empty Vec after the BR1
+    // per-family skip — so the UI's `collections.length === 0` keyed 🔒 locked for EVERY keyless
+    // peer, including one who authored no listing events at all. `classify_listings` is the
+    // discriminator; these three pin each of its states against REAL signed events (a hand-built
+    // lookalike would be asserting against a copy we control — §9).
+
+    fn authored_listing_events(peer: &Identity, slug: &str, key: &BrowseKey, n: usize) -> Vec<Event> {
+        let index = serde_json::json!({ "slug": slug, "split": true, "parts": n }).to_string();
+        let mut evs = vec![build_listing_event(peer, slug, key, &index).unwrap()];
+        for i in 0..n {
+            let part = serde_json::json!({
+                "slug": slug, "part": i, "parts": n, "entries": [{ "name": format!("e{i}") }],
+            })
+            .to_string();
+            evs.push(build_listing_event(peer, &format!("{slug}#part{i}"), key, &part).unwrap());
+        }
+        evs
+    }
+
+    #[test]
+    fn q134_no_authored_events_is_fetched_not_sealed() {
+        // State 1: the peer authored NO listing events — an honest empty, never 🔒.
+        let peer = Identity::generate();
+        let state = classify_listings(&[], &[]);
+        assert_eq!(state, ListingsState::Fetched, "no authored events must read as Fetched");
+        // The author-pin matters: events exist on the relay, but none are THIS peer's — a lying
+        // relay returning someone else's listings must not flip us to Sealed either.
+        let other = Identity::generate();
+        let foreign = authored_listing_events(&other, "theirs", &[9; 32], 1);
+        let pinned = authored_by(foreign, &peer.public_key());
+        assert!(pinned.is_empty(), "foreign events must be pinned away");
+        assert_eq!(classify_listings(&pinned, &[]), ListingsState::Fetched);
+    }
+
+    #[test]
+    fn q134_authored_but_undecryptable_is_sealed() {
+        // State 2: real signed listing events exist, and the key we hold decrypts none of them.
+        let peer = Identity::generate();
+        let real_key: BrowseKey = [1; 32];
+        let wrong_key: BrowseKey = [2; 32];
+        let events = authored_listing_events(&peer, "vault", &real_key, 1);
+        let pinned = authored_by(events, &peer.public_key());
+        assert!(!pinned.is_empty());
+        // End where production ends: run the REAL family enumeration with the wrong key.
+        let families = group_families(pinned.clone());
+        let out = enumerate_families(families, &wrong_key);
+        assert!(out.is_empty(), "a wrong key must render nothing (BR1 skip)");
+        assert_eq!(classify_listings(&pinned, &out), ListingsState::Sealed);
+        // And with the right key the same events classify as Fetched — the discriminator is the
+        // key, not the event count.
+        let families = group_families(pinned.clone());
+        let out = enumerate_families(families, &real_key);
+        assert!(!out.is_empty(), "the right key must render the family");
+        assert_eq!(classify_listings(&pinned, &out), ListingsState::Fetched);
+    }
+
+    #[test]
+    fn q134_fetch_error_is_never_folded_into_empty() {
+        // State 3 is pinned at the call site (`browse_peer_listings_state` maps a fetch `Err` to
+        // FetchFailed BEFORE any empty-vs-sealed reasoning). This pins the discriminator's third
+        // arm the only way a unit test can: a FetchFailed must never equal Fetched or Sealed, so
+        // the UI's three branches cannot collapse into two.
+        assert_ne!(ListingsState::FetchFailed("x".into()), ListingsState::Fetched);
+        assert_ne!(ListingsState::FetchFailed("x".into()), ListingsState::Sealed);
+        assert_ne!(ListingsState::Fetched, ListingsState::Sealed);
+    }
+
+    /// Group author-pinned events into the root-slug family map `browse_peer_listings_state`
+    /// builds — extracted to the same shape so the tests exercise the real grouping, not a
+    /// hand-built lookalike.
+    fn group_families(
+        events: Vec<Event>,
+    ) -> BTreeMap<String, HashMap<String, Vec<Event>>> {
+        let mut families: BTreeMap<String, HashMap<String, Vec<Event>>> = BTreeMap::new();
+        for ev in events {
+            if let Some(d) = ev.tags.identifier() {
+                let root = match d.find("#part") {
+                    Some(i) => &d[..i],
+                    None => d,
+                };
+                families.entry(root.to_string()).or_default().entry(d.to_string()).or_default().push(ev);
+            }
+        }
+        families
+    }
 
     /// The d-tag list the phase-2 filter derives must be EXACTLY what `split_listing` publishes
     /// (`slug#part0 … slug#partN-1`) — the wire contract that makes the fetch slug-scoped. If

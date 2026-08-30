@@ -81,15 +81,15 @@ export function manifestFulfilFor(
  *  no bytes (MAS-INV-5 + INV-4). The owner is the courier — "send it to them yourself" is the
  *  instruction, never a Hoardbook-side Send affordance (no button, no auto-deliver). */
 export const MANIFEST_EXPORTED_TOAST = (filename: string) =>
-	`Saved ${filename}. Hoardbook moves no files — send it to them yourself.`;
+	`Saved ${filename}. Hoardbook moves no files. Send it yourself.`;
 
 /** The Private inert line. Mirrors the backend's `collection.rs:713` refusal BEFORE the click. */
 export const MANIFEST_PRIVATE_LINE =
-	"Private collections are already sent whole to trusted contacts — there's no manifest to export.";
+	"Private collections are already sent whole to trusted contacts. There's no manifest to export.";
 
 /** The empty-content-types inert line. Mirrors the backend's `collection.rs:721` refusal. */
 export const MANIFEST_EMPTY_LINE =
-	"This collection has no content types yet — add one before exporting a manifest.";
+	"This collection has no content types yet. Add one first.";
 
 /** The missing-draft inert line. Rendered when the slug no longer matches any of your drafts. */
 export const MANIFEST_MISSING_LINE = (slug: string) =>
@@ -97,11 +97,11 @@ export const MANIFEST_MISSING_LINE = (slug: string) =>
 
 /** The stale-fingerprint note. The export still fires (a fresh manifest is what they want). */
 export const MANIFEST_STALE_NOTE =
-	'they saw an older version — this exports your current one.';
+	'They saw an older version. You will be sending the current one.';
 
 /** The big-relay hint, shown when the owner has a `big_relay_url` configured. */
 export const MANIFEST_BIG_RELAY_HINT =
-	'Or publish to your big relay — they’ll get the rest automatically.';
+	'Or publish to your big relay. They get the rest automatically.';
 
 /** The muted one-liner linking to the Settings field, when no big relay is configured. */
 export const MANIFEST_BIG_RELAY_LINK = 'Add a big relay in Settings to publish the rest for them.';

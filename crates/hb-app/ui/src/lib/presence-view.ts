@@ -10,7 +10,7 @@
 //   - **"Last seen {t}"** — THEIR presence, from a beacon's `created_at` (W5.2), which we learn
 //     from the fresh-presence map the online poll already fetches. No per-contact fan-out.
 //
-// Never-observed renders "Last seen — unknown", not "never": "never" asserts something about them,
+// Never-observed renders "Last seen: unknown", not "never": "never" asserts something about them,
 // when all we can honestly claim is something about our own knowledge.
 
 /** The presence freshness window — matches `online.rs::ONLINE_WINDOW_SECS`. A beacon inside it means
@@ -28,10 +28,18 @@ export const PRESENCE_WINDOW_MS = 480_000;
  *  which is the original "seen just now forever" defect in a new form. Purely local: no network. */
 export const PRESENCE_TICK_MS = 30_000;
 
+/** QURATOR-135 — the pill's state is a TRI-STATE, and the type is what enforces it: `online` is
+ *  `boolean | null`, where `null` means "no beacon observed yet" — NOT false. Before this, a
+ *  contact the poll had not reached yet rendered a confident "Offline" pill for ~90s after launch
+ *  (contacts refresh is gated by REFRESH_FRESHNESS_MS = 10 min; the poll runs every 20s). The
+ *  renderer must branch on `=== true` / `=== false` / `null` explicitly, so "Offline" can only be
+ *  produced by a beacon that actually lapsed — absence-of-data cannot reach it by construction. */
 export interface PresenceView {
-	/** True while the newest beacon is inside the window → the row shows the Online pill, no age. */
-	online: boolean;
-	/** The offline age line, e.g. "Last seen 4h ago" / "Last seen — unknown". Empty when online (an
+	/** True while the newest beacon is inside the window → the row shows the Online pill, no age.
+	 *  False only when a beacon EXISTS and is outside the window. Null when we hold no beacon at
+	 *  all — render "Checking…", never "Offline". */
+	online: boolean | null;
+	/** The offline age line, e.g. "Last seen 4h ago" / "Last seen: unknown". Empty when online (an
 	 *  online contact needs no age — the pill already says it). */
 	lastSeen: string;
 }
@@ -69,9 +77,11 @@ export function presenceView(
 	now: number,
 	windowMs: number = PRESENCE_WINDOW_MS,
 ): PresenceView {
-	if (!seenAt) return { online: false, lastSeen: 'Last seen — unknown' };
+	// QURATOR-135: no (or unparseable) beacon is UNKNOWN, not offline. This is the whole fix —
+	// the old `online: false` here is what let the pill assert "Offline" about absence-of-data.
+	if (!seenAt) return { online: null, lastSeen: 'Last seen: unknown' };
 	const ts = new Date(seenAt).getTime();
-	if (!Number.isFinite(ts)) return { online: false, lastSeen: 'Last seen — unknown' };
+	if (!Number.isFinite(ts)) return { online: null, lastSeen: 'Last seen: unknown' };
 	const age = Math.max(0, now - ts);
 	if (age <= windowMs) return { online: true, lastSeen: '' };
 	return { online: false, lastSeen: `Last seen ${formatAge(age)}` };

@@ -371,3 +371,20 @@ select.hb-input { display: inline-block; }
 }
 ::-webkit-scrollbar-thumb:hover { background: var(--fg-dim); }
 ::-webkit-scrollbar-corner { background: transparent; }
+
+/* The privacy badge. GLOBAL because it is a CONVENTION, not a page's decoration: Topics and Chat
+   name the same state, so they must render it identically. Svelte scopes component styles, so a
+   page-local copy is how the two silently drift — Chat had a 🔒 in its list and a grey pill in its
+   header while Topics had this badge, three renderings of one fact (owner, 2026-08-27). A LABEL,
+   never a lock glyph: a lock reads as "you cannot get in", which is wrong for a room you are in.
+   Pinned by `private-badge-contract.test.ts`. */
+.hb-tag {
+  font-size: 10px;
+  color: var(--accent);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+  line-height: 1.5;
+  flex-shrink: 0;
+  white-space: nowrap;
+}

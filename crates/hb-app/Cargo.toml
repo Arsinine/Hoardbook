@@ -26,6 +26,9 @@ path = "src/bin/hb-wan-it.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# QURATOR-161: build.rs re-emits the Windows application manifest through this crate so it reaches
+# the lib unittest harness, not just the bins. See build.rs for why that is necessary.
+embed-resource = "3"
 
 [dependencies]
 hb-core    = { path = "../hb-core" }
@@ -109,3 +112,7 @@ tauri-plugin-single-instance = "2"
 
 [dev-dependencies]
 tempfile = "3"
+# QURATOR-161: the `test` feature unlocks `tauri::test::{mock_app, StateManager}` — the documented
+# way to call a `#[tauri::command]` fn directly with real managed `State<'_, T>` values, so tests
+# exercise the command body itself rather than a reimplementation of its guards.
+tauri = { version = "2", features = ["test"] }

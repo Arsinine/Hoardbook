@@ -15,8 +15,9 @@ use hb_core::fingerprint::Fingerprint;
 use hb_core::types::Collection;
 use hb_core::{ShareCode, Identity};
 use hb_net::{
-    browse_peer_listings, browse_share_code, fetch_full_listing_if_current,
-    listing_snapshot_fingerprint, search_teasers_capped, RelayClient, RenderedListing, SearchHit,
+    browse_peer_listings, browse_peer_listings_state, browse_share_code,
+    fetch_full_listing_if_current, listing_snapshot_fingerprint, search_teasers_capped,
+    ListingsState, RelayClient, RenderedListing, SearchHit,
 };
 use serde::{Deserialize, Serialize};
 
@@ -304,6 +305,13 @@ pub(crate) async fn resolve_peer(
     // published (M13 HANDOVER gap #5). A locked/failed family is already skipped inside
     // `browse_peer_listings` (BR1) — best-effort here too, mirroring the teaser fetch above:
     // unreadable listings must never fail the whole resolve.
+    //
+    // QURATOR-134: the KEYLESS arm is the one this bug lived in. `browse_peer_listings_state`
+    // (hb-net, the one implementation — the UI never re-derives it) tells "they published
+    // nothing" (Fetched) apart from "they published listings we can't decrypt" (Sealed) apart
+    // from "the enumeration itself failed" (FetchFailed). For a keyed contact `collections` is
+    // authoritative and the state stays `Fetched`.
+    let mut listings_state = crate::store::ListingsStatus::Fetched;
     let collections = match share_code.browse_key() {
         Some(bk) => {
             // The browser's OWN big relay (option a) — tried before the peer's advertised one (b).
@@ -330,7 +338,22 @@ pub(crate) async fn resolve_peer(
             }
             out
         }
-        None => vec![],
+        None => {
+            // Keyless: run the enumeration read purely for its tri-state — it only fetches the
+            // peer's own KIND_LISTING events (author-pinned) and classifies them; the throwaway
+            // zero key decrypts nothing, so `Sealed` is reported for any existing family, which
+            // is exactly the keyless reading. Never fails the resolve (BR1).
+            let (_, state) = browse_peer_listings_state(
+                &client,
+                &peer,
+                &[0u8; 32], // throwaway key — decrypts nothing; the read is for the tri-state
+                net::RELAY_TIMEOUT,
+            )
+            .await
+            .unwrap_or((Vec::new(), ListingsState::FetchFailed(String::new())));
+            listings_state = state.into();
+            vec![]
+        }
     };
 
     // Fall back to the cached contact if the relay yielded no teaser.
@@ -347,6 +370,10 @@ pub(crate) async fn resolve_peer(
             if !collections.is_empty() {
                 stale.collections = collections;
             }
+            // QURATOR-134: the fresh tri-state supersedes the stale classification even when the
+            // teaser flaked (same devtest-#3 reasoning — a keyless empty must not cache as
+            // `Sealed` forever just because a later refresh's teaser fetch hiccuped).
+            stale.listings_state = listings_state;
             return Ok(stale);
         }
     }
@@ -358,6 +385,7 @@ pub(crate) async fn resolve_peer(
         petname: profile.as_ref().map(|p| p.display_name.clone()),
         profile,
         collections,
+        listings_state,
         online,
         last_fetched: Utc::now(),
         // W5.2: presence age is stamped by the online poll, not by a browse (which proves nothing
@@ -1374,6 +1402,7 @@ mod tests {
             petname: petname.map(|s| s.to_string()),
             profile: None,
             collections: vec![],
+            listings_state: Default::default(), // QURATOR-134: fixtures predate the tri-state; Fetched is the least-wrong default
             online: false,
             last_fetched: Utc::now(),
             last_presence: None,
@@ -1783,5 +1812,309 @@ mod tests {
             Some(hex::encode([22u8; 32]).as_str()),
             "a non-empty incoming key (rotation) wins over the stored key"
         );
+    }
+
+    // ── QURATOR-161 — import_manifest's size guards, driven through the command itself ─────────
+    //
+    // Same class as the chat tests above: `import_manifest`'s three refusals live in the
+    // `#[tauri::command]` body, BEFORE `accept_manifest_bytes` is reached — so nothing here needs a
+    // contact, a share code, or a valid manifest. The command fn is called at its real signature
+    // with real managed `State<'_, DataStore>`, via tauri's `StateManager`.
+    mod command_guards {
+        use super::*;
+        use tauri::Manager;
+
+        fn import_via_command(
+            app: &tauri::App<tauri::test::MockRuntime>,
+            npub: &str,
+            expected_slug: Option<String>,
+            path: Option<String>,
+            pasted: Option<String>,
+            newest_fingerprint: Option<String>,
+        ) -> CmdResult<ImportedManifest> {
+            let store = app.state::<DataStore>();
+            tauri::async_runtime::block_on(import_manifest(
+                npub.to_string(),
+                expected_slug,
+                path,
+                pasted,
+                newest_fingerprint,
+                store,
+            ))
+        }
+
+        fn guard_app() -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            app.manage(store);
+            app
+        }
+
+        #[test]
+        fn import_manifest_command_rejects_oversized_file() {
+            let app = guard_app();
+            // A real file just over the cap, so the guard's `fs::metadata` read sees a true length.
+            let dir = tempfile::tempdir().unwrap();
+            let big = dir.path().join("big.hbmanifest");
+            std::fs::write(&big, vec![b'x'; MANIFEST_FILE_MAX_BYTES as usize + 1]).unwrap();
+            let err = import_via_command(
+                &app,
+                "npub1anyone",
+                None,
+                Some(big.to_string_lossy().into_owned()),
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(err, "That file is too large to be a manifest.");
+        }
+
+        #[test]
+        fn import_manifest_command_rejects_oversized_paste() {
+            let app = guard_app();
+            let err = import_via_command(
+                &app,
+                "npub1anyone",
+                None,
+                None,
+                Some("x".repeat(MANIFEST_FILE_MAX_BYTES as usize + 1)),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(err, "That pasted text is too large to be a manifest.");
+        }
+
+        #[test]
+        fn import_manifest_command_requires_a_source() {
+            let app = guard_app();
+            let err = import_via_command(&app, "npub1anyone", None, None, None, None).unwrap_err();
+            assert_eq!(err, "No manifest file or text provided.");
+        }
+    }
+
+    // ── QURATOR-161 slice 2 — `paste_key`'s guards, driven through the command itself ──────────
+    //
+    // Same class as the chat/browse command tests: the guards fire BEFORE `net::client` (the first
+    // network I/O), so no relay is ever dialled and these are offline by construction.
+    //
+    // The pass-side probe for the self-lookup guard is the hermetic `net::client` refusal: a store
+    // configured with `relay_urls = vec!["ws://127.0.0.1:9"]` (a port that is closed by definition,
+    // and one `net::validate_relay_url` would refuse as user input) makes `net::client` fail at the
+    // handshake, NOT in the self-lookup guard. That is exactly the "at exactly the limit it must get
+    // past the guard and fail at the next statement" shape the slice-1 boundary tests learned the
+    // hard way — a refusal-only test here would stay green under an inverted guard.
+    mod paste_key_command_guards {
+        use super::*;
+        use crate::identity_state::AppIdentity;
+        use tauri::Manager;
+
+        fn guard_app(identity_loaded: bool) -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            // A deliberately unreachable relay: the self-lookup guard is BEFORE `net::client`, so a
+            // non-self code that clears the guard proceeds into `resolve_peer` and fails at the
+            // connect — proving the guard let it through without any test reaching the network.
+            store
+                .save_settings(&crate::store::Settings {
+                    relay_urls: vec!["ws://127.0.0.1:9".into()],
+                    ..Default::default()
+                })
+                .unwrap();
+            let identity: SharedIdentity = std::sync::Arc::new(tokio::sync::RwLock::new(
+                identity_loaded.then(AppIdentity::generate),
+            ));
+            app.manage(identity);
+            app.manage(store);
+            app.manage(net::new_shared());
+            app
+        }
+
+        async fn paste_key_via_command(
+            app: &tauri::App<tauri::test::MockRuntime>,
+            code: &str,
+        ) -> CmdResult<CachedPeer> {
+            paste_key(
+                code.to_string(),
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+        }
+
+        fn code_for(id: &AppIdentity) -> String {
+            id.share_code().expect("encode the identity's own share code")
+        }
+
+        /// Refuses a pasted string that is not a share code at all, with the command's error text.
+        #[tokio::test]
+        async fn paste_key_command_rejects_an_unparseable_code() {
+            let app = guard_app(true);
+            let err = paste_key_via_command(&app, "not a share code")
+                .await
+                .unwrap_err();
+            assert!(
+                err.starts_with("Invalid share code:"),
+                "garbage is refused by the parse guard, got {err}"
+            );
+        }
+
+        /// Refuses the user's OWN code — and, the other side of that guard, a DIFFERENT user's code
+        /// clears it and proceeds into `resolve_peer` (failing at the relay connect, the next
+        /// statement, with no relay actually reached).
+        #[tokio::test]
+        async fn paste_key_command_rejects_own_code_and_passes_a_foreign_one_past_the_guard() {
+            let app = guard_app(true);
+            let own = app.state::<SharedIdentity>();
+            let own_code = {
+                let guard = own.read().await;
+                code_for(guard.as_ref().unwrap())
+            };
+
+            // The guard: our own code (either form — full `hbk…` or bare `npub1…`) is refused.
+            let err = paste_key_via_command(&app, &own_code).await.unwrap_err();
+            assert_eq!(err, "You cannot look up your own code");
+            let own_npub = {
+                let own = app.state::<SharedIdentity>();
+                let guard = own.read().await;
+                guard.as_ref().unwrap().npub()
+            };
+            let err = paste_key_via_command(&app, &own_npub).await.unwrap_err();
+            assert_eq!(err, "You cannot look up your own code");
+
+            // The other side: a different identity's code clears the guard and fails at the relay
+            // connect inside `resolve_peer` — never at the self-lookup refusal.
+            let foreign = AppIdentity::generate();
+            let err = paste_key_via_command(&app, &code_for(&foreign)).await.unwrap_err();
+            assert!(
+                err.contains("Could not connect to any relay"),
+                "a foreign code must clear the self-lookup guard and proceed into resolve_peer, got {err}"
+            );
+        }
+
+        /// Refuses the lookup when no identity is loaded, before any parsing of a peer code.
+        #[tokio::test]
+        async fn paste_key_command_requires_a_loaded_identity() {
+            let app = guard_app(false);
+            let foreign = AppIdentity::generate();
+            let err = paste_key_via_command(&app, &code_for(&foreign)).await.unwrap_err();
+            assert_eq!(
+                err,
+                "No identity loaded. Generate a keypair first."
+            );
+        }
+    }
+
+    // ── QURATOR-161 slice 6 — `follow`'s pre-resolved-peer guard, through the command ───────────
+    //
+    // M20 W2 added `resolved_peer` so the AddContact funnel's already-completed lookup is not
+    // repeated. The npub-binding guard is its whole safety story: a caller-supplied peer whose npub
+    // differs from the share code's pubkey (a stale lookup for a DIFFERENT peer) must be refused
+    // BEFORE it is trusted. Both sides are pinned here on the real `#[tauri::command]` fn at its
+    // real signature, via tauri's StateManager — no mirror, no `*_inner`, no restructuring.
+    //
+    // Reachability note: the `Some(pre)` arm touches no network at all. `ShareCode::parse`,
+    // `pubkey().to_bech32()`, the npub comparison, `save_followed_peer` (a store write) — every
+    // statement is offline, so unlike the `paste_key` pass-side tests these need no discarded
+    // loopback port. A MATCHING peer runs the command to completion (the peer is persisted), which
+    // discriminates the guard far better than dying at the next statement would: an inverted guard
+    // turns the matching case into the refusal and the mismatched case into a save, and BOTH
+    // assertions red.
+    mod follow_command_guards {
+        use super::*;
+        use tauri::Manager;
+
+        fn guard_app() -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            // The identity/relay states are managed so the signature is satisfied, but the
+            // `Some(pre)` arm never reads them: `identity` is only awaited in the `None` arm, and
+            // `relay` only inside `resolve_peer`. An unloaded identity here doubles as a tripwire —
+            // if the guard ever regressed into resolving from the code, the matching-side test
+            // would fail with "No identity loaded" instead of persisting the peer.
+            let identity: SharedIdentity =
+                std::sync::Arc::new(tokio::sync::RwLock::new(None));
+            app.manage(identity);
+            app.manage(store);
+            app.manage(net::new_shared());
+            app
+        }
+
+        async fn follow_via_command(
+            app: &tauri::App<tauri::test::MockRuntime>,
+            code: &str,
+            resolved_peer: Option<CachedPeer>,
+        ) -> CmdResult<()> {
+            follow(
+                code.to_string(),
+                None,
+                None,
+                resolved_peer,
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+        }
+
+        /// A pre-resolved peer whose npub is NOT the code's pubkey is refused with the command's
+        /// exact error — and nothing is written to the contact store.
+        #[tokio::test]
+        async fn follow_command_refuses_a_mismatched_pre_resolved_peer() {
+            let app = guard_app();
+            // Two independent identities: the code belongs to `code_owner`, the caller hands us a
+            // peer resolved for `someone_else` — the stale-lookup shape the guard exists for.
+            let code_owner = crate::identity_state::AppIdentity::generate();
+            let code = code_owner.share_code().expect("encode the owner's share code");
+            let mut stale = stub_peer_with_profile("npub1_someone_else_entirely", "SomeoneElse");
+            stale.npub = crate::identity_state::AppIdentity::generate().npub();
+
+            let err = follow_via_command(&app, &code, Some(stale.clone()))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err,
+                "The resolved peer does not match the share code. Re-look the peer up and try again."
+            );
+
+            // The refusal fires before `save_followed_peer`: no contact file for the stale peer,
+            // and none for the code's owner either (a half-follow is not persisted).
+            let store = app.state::<DataStore>();
+            assert!(
+                store.load_contact(&CachedPeer::pubkey_hash(&stale.npub)).unwrap().is_none(),
+                "a refused peer must not be persisted"
+            );
+            let code_npub = code_owner.npub();
+            assert!(
+                store.load_contact(&CachedPeer::pubkey_hash(&code_npub)).unwrap().is_none(),
+                "the share code's owner must not be persisted by a refused follow"
+            );
+        }
+
+        /// The other side of the same guard: a peer whose npub IS the code's pubkey clears it,
+        /// skips `resolve_peer` (no relay dial — proven by the unloaded identity), and is
+        /// persisted by `save_followed_peer`.
+        #[tokio::test]
+        async fn follow_command_accepts_a_matching_pre_resolved_peer_and_persists_it() {
+            let app = guard_app();
+            let owner = crate::identity_state::AppIdentity::generate();
+            let code = owner.share_code().expect("encode the owner's share code");
+            let peer = stub_peer_with_profile(&owner.npub(), "MatchedPeer");
+
+            follow_via_command(&app, &code, Some(peer))
+                .await
+                .expect("a matching pre-resolved peer is followed without any relay round-trip");
+
+            let store = app.state::<DataStore>();
+            let loaded = store
+                .load_contact(&CachedPeer::pubkey_hash(&owner.npub()))
+                .unwrap()
+                .expect("the matched peer is persisted by the follow leg");
+            assert_eq!(loaded.npub, owner.npub());
+            assert_eq!(loaded.petname.as_deref(), Some("MatchedPeer"));
+        }
     }
 }

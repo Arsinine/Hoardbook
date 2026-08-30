@@ -102,20 +102,45 @@ export function onlineBucket(peers: CachedPeer[]): CachedPeer[] {
 	return sortPeers(peers.filter((p) => p.online === true));
 }
 
+/** The per-profile sub-haystack — the ONE place the published half of `matchesQuery` reads from.
+ *  Kept next to the page's `hasProfileFacts` shape deliberately: every field the contact DETAIL
+ *  CARD renders is searched here, so a field added to the card has one obvious place to land.
+ *  QURATOR-136: `profile.tags` was missing, so locally tagging a contact made them findable but a
+ *  tag THEY published silently matched nothing. The card renders since/est_size/picture/updated
+ *  too, but those are a year/size-label/avatar/timestamp — not things you type into a search box,
+ *  so they stay out (see contacts-view.test.ts for the guard that keeps this list honest). */
+function profileHaystack(profile: CachedPeer['profile'] | null | undefined): string[] {
+	if (!profile) return [];
+	return [
+		profile.display_name,
+		profile.bio ?? '',
+		...(profile.tags ?? []),
+		...(profile.content_types ?? []),
+		...(profile.languages ?? []),
+		...(profile.willing_to ?? []),
+		profile.location ?? '',
+		profile.contact_hint ?? '',
+		// Social handles, not platform labels ("github"/"matrix" are enums — searching them would
+		// return everyone with a GitHub link, which is not what anyone types).
+		...(profile.social_links ?? []).map((sl) => sl.handle),
+	];
+}
+
 /** Case-insensitive free-text search across every field a contact card actually shows: display_name,
- *  petname, npub, bio, local tags, content types, and each collection's path_alias/description/
- *  content_types. Empty/whitespace query matches everything (identity). Never throws on an absent
- *  profile or empty collections list. */
+ *  petname, npub, bio, their published tags/languages/willing-to/region/contact hint (QURATOR-136 —
+ *  the detail card renders these), your local tags, content types, and each collection's
+ *  path_alias/description/content_types. `profile.email` is deliberately NOT searched: the owner
+ *  opted it in for hand-copying from the card, and the search box is not the place to enumerate
+ *  who has an address on file. Empty/whitespace query matches everything (identity). Never throws
+ *  on an absent profile or empty collections list. */
 export function matchesQuery(peer: CachedPeer, q: string): boolean {
 	const query = q.trim().toLowerCase();
 	if (!query) return true;
 	const haystacks: string[] = [
-		peer.profile?.display_name ?? '',
 		peer.petname ?? '',
 		peer.npub,
-		peer.profile?.bio ?? '',
 		...(peer.local_tags ?? []),
-		...(peer.profile?.content_types ?? []),
+		...profileHaystack(peer.profile),
 	];
 	for (const col of peer.collections ?? []) {
 		haystacks.push(col.path_alias ?? '', col.description ?? '', ...(col.content_types ?? []));
