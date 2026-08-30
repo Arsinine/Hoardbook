@@ -1032,4 +1032,190 @@ mod tests {
         );
         assert!(audience.is_empty(), "the audience file is untouched by the topic-join path");
     }
+
+    // ── QURATOR-161 slice 5 — `topic_create` + `topic_join_public` driven through the commands ───
+    //
+    // Call order found (must be re-verified if the bodies move):
+    //
+    //   topic_create:       me() → new_topic() [public-name validation] → discovery_tags() →
+    //                       net::client() → fetch_announce() …
+    //   topic_join_public:  me() → net::client() → join_public() → fetch_announce() …
+    //
+    // So the guards BEFORE the first network I/O are: the "no identity loaded" refusal (both
+    // commands) and `new_topic`'s public-name validation — empty path, root ∉ category, depth > 6
+    // (`topic_create` only; a private name is freeform by design). Those are pinned here.
+    //
+    // Everything else is OWED, recorded below with the verbatim blocker.
+    mod command_guards {
+        use super::*;
+        use crate::identity_state::AppIdentity;
+        use tauri::Manager;
+
+        /// Mock app + managed state, with the store pointed at a deliberately dead relay — the
+        /// slice-2 hermetic pass-side probe. `net::client` dials `ws://127.0.0.1:9` (closed by
+        /// definition) and fails at the handshake, so an input that CLEARS a pre-client guard is
+        /// proven to have passed it: the error is the connect refusal, never the guard's text.
+        fn guard_app(identity_loaded: bool) -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            store
+                .save_settings(&crate::store::Settings {
+                    relay_urls: vec!["ws://127.0.0.1:9".into()],
+                    ..Default::default()
+                })
+                .unwrap();
+            let identity: SharedIdentity = std::sync::Arc::new(tokio::sync::RwLock::new(
+                identity_loaded.then(AppIdentity::generate),
+            ));
+            app.manage(identity);
+            app.manage(store);
+            app.manage(net::new_shared());
+            app
+        }
+
+        async fn create_via_command(
+            app: &tauri::App<tauri::test::MockRuntime>,
+            name: &str,
+            private: bool,
+        ) -> CmdResult<TopicView> {
+            topic_create(
+                name.to_string(),
+                "slice 5".into(),
+                private,
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+        }
+
+        async fn join_via_command(
+            app: &tauri::App<tauri::test::MockRuntime>,
+            name: &str,
+        ) -> CmdResult<TopicView> {
+            topic_join_public(
+                name.to_string(),
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+        }
+
+        /// The three public-name rules are `topic_create`'s only input guards, and they fire inside
+        /// `new_topic` — BEFORE `net::client` is built. Each is asserted on both sides: the bad
+        /// name is refused with the command's own error text, and a good name CLEARS the guard and
+        /// fails at the relay connect (the next statement), proving the guard was actually passed
+        /// rather than never reached. A PRIVATE name skips validation by design, so the freeform
+        /// side of that branch is pinned too.
+        #[tokio::test]
+        async fn topic_create_command_rejects_invalid_public_names_and_passes_a_valid_one() {
+            let app = guard_app(true);
+
+            // Root ∉ category ("gaming" is not one of video/audio/image/text/software/other).
+            let err = create_via_command(&app, "gaming/retro", false).await.unwrap_err();
+            assert!(
+                err.starts_with("invalid event: a public Topic's first path segment must be a category"),
+                "non-category root must be refused by the validate guard, got {err}"
+            );
+            assert!(err.contains("got 'gaming'"), "the refusal names the offending root, got {err}");
+
+            // Depth cap: MAX_TOPIC_DEPTH = 6, so 7 segments is over.
+            let deep = ["video", "a", "b", "c", "d", "e", "f"].join("/");
+            let err = create_via_command(&app, &deep, false).await.unwrap_err();
+            assert!(
+                err.starts_with("invalid event: a public Topic path may be at most 6 segments deep"),
+                "a 7-segment path must be refused by the depth guard, got {err}"
+            );
+            assert!(err.contains("got 7"), "the refusal names the actual depth, got {err}");
+
+            // Empty-after-normalization (whitespace/stray slashes only).
+            let err = create_via_command(&app, "  /  ", false).await.unwrap_err();
+            assert!(
+                err.ends_with("a public Topic name cannot be empty"),
+                "a name that normalizes to nothing must be refused, got {err}"
+            );
+
+            // The other side of all three guards at once: a VALID 6-segment public name (exactly at
+            // the depth cap) clears validation and dies at the relay connect — never in the guard.
+            let at_cap = ["video", "a", "b", "c", "d", "e"].join("/");
+            let err = create_via_command(&app, &at_cap, false).await.unwrap_err();
+            assert!(
+                err.contains("Could not connect to any relay"),
+                "a valid public name must clear every name guard and fail at the connect, got {err}"
+            );
+
+            // A PRIVATE create with the same bad name is NOT validated (freeform by design) — it too
+            // proceeds to the connect. Pins that `private` is the seam that skips the guard.
+            let err = create_via_command(&app, "gaming/retro", true).await.unwrap_err();
+            assert!(
+                err.contains("Could not connect to any relay"),
+                "a private name is freeform and must skip the public-name guard, got {err}"
+            );
+        }
+
+        /// Both commands refuse to run with no identity loaded, before any name parsing or I/O.
+        #[tokio::test]
+        async fn both_commands_require_a_loaded_identity() {
+            for err in [
+                // topic_create (a bad name is irrelevant — the identity guard fires FIRST)
+                create_via_command(&guard_app(false), "gaming/retro", false)
+                    .await
+                    .unwrap_err(),
+                // topic_join_public
+                join_via_command(&guard_app(false), "video/films").await.unwrap_err(),
+            ] {
+                assert_eq!(err, "No identity loaded. Generate a keypair first.");
+            }
+        }
+
+        /// `topic_join_public` takes the name straight to `net::client` — the join's own
+        /// `normalized_public_name` validation lives INSIDE `join_public`, downstream of the
+        /// connect. So the pass-side probe is the connect refusal itself: a well-formed name
+        /// proceeds past the identity guard into the client build and fails there, which is what
+        /// reds under an inverted identity guard. The invalid-name probe pins the PLACEMENT: a
+        /// name the join would refuse still reaches the connect today, so hoisting validation
+        /// ahead of `net::client` in this command reds the second assertion. The name-validation
+        /// half itself is OWED (see below).
+        #[tokio::test]
+        async fn topic_join_public_command_proceeds_to_the_relay_with_a_well_formed_name() {
+            let app = guard_app(true);
+            let err = join_via_command(&app, "video/films").await.unwrap_err();
+            assert!(
+                err.contains("Could not connect to any relay"),
+                "a loaded identity must carry the join into net::client, got {err}"
+            );
+
+            // Placement: even a name that fails public-name rules must reach the connect (the join's
+            // validation is downstream of the client build, unlike topic_create's).
+            let err = join_via_command(&app, "gaming/retro").await.unwrap_err();
+            assert!(
+                err.contains("Could not connect to any relay"),
+                "the join must NOT refuse a bad name before net::client (validation is inside join_public, downstream), got {err}"
+            );
+        }
+
+        // ── OWED — guards that only fire AFTER a relay is contacted ─────────────────────────────
+        //
+        // topic_create — the duplicate-public-name refusal (`"That topic already exists — joining
+        // it instead of creating a duplicate."`): blocker, verbatim — the guard is
+        // `fetch_announce(&client, …)` on the far side of `net::client(&me, &store, &relay)`, so
+        // reaching it needs a live relay serving an announce for that topic_id. There is no
+        // parameter, State, or injection seam carrying a fixture announce, and extracting one is a
+        // production change, which a tests-only slice must not make.
+        //
+        // topic_join_public — the not-found refusal (`"Could not find a public-join credential for
+        // that Topic — is the name right?"`): blocker, verbatim — the guard is the `None` arm of
+        // `join_public(&client, …)`, which is downstream of `net::client`; every input that would
+        // distinguish it requires a relay serving a public-join credential. No seam exists to
+        // inject one, and the pre-connect `normalized_public_name` refusal inside `join_public`
+        // shares the same downstream position (it runs after the client is built), so it is owed
+        // for the same reason.
+        //
+        // Notably NOT pinned here, and deliberately so: QURATOR-133 (parse_announce trusting the
+        // announce's own name/id/root) is a known live production defect ruled on by the owner —
+        // these tests document the current command call order only and do not pin the relabel
+        // behaviour as correct.
+    }
 }
