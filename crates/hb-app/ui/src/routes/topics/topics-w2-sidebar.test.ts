@@ -23,7 +23,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, fireEvent, cleanup, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import TopicsPage from './+page.svelte';
-import { topicAnnounceSummaries, announceSeen } from '$lib/stores.js';
+import { topicAnnounceSummaries, announceSeen, topicDirectoryCache } from '$lib/stores.js';
 
 vi.mock('$lib/api.js', () => ({
 	topicList: vi.fn().mockResolvedValue([]),
@@ -61,6 +61,10 @@ afterEach(() => {
 	vi.clearAllMocks();
 	topicAnnounceSummaries.set([]);
 	announceSeen.set({});
+	// The W3 cross-mount directory cache (QURATOR-145) outlives one test: a non-empty paint
+	// writes it, so the NEXT test's mount paints the stale tree AND the fresh answer — two
+	// rankDrawnRows passes and a call count that belongs to no test. Reset it here.
+	topicDirectoryCache.set([]);
 });
 
 /** The root-group header button for `root`, or null. */
@@ -118,12 +122,18 @@ describe('QURATOR-144 W2 — merged list, joined wins', () => {
 	it('private joined Topics ride the tree (they can never be announced)', async () => {
 		listMock.mockResolvedValue([mine('p1', 'back room', '', true)]);
 		paintMock.mockResolvedValue([]);
-		const { container, findAllByText } = render(TopicsPage);
-		// The root name and the row label are legitimately BOTH "back room" (a rootless private
-		// name groups under itself) — assert the ROW, not the ambiguous text.
+		const { container } = render(TopicsPage);
 		await waitFor(() => expect(container.querySelectorAll('.topic-row').length).toBe(1));
 		const rows = [...container.querySelectorAll('.topic-row .name')];
 		expect(rows.some((n) => (n.textContent ?? '').includes('back room'))).toBe(true);
+		// QURATOR-147 W5: a rootless private name (first path segment not in TOPIC_ROOTS) groups
+		// under `other` — NEVER under itself. The pre-W5 behavior gave "back room" its own
+		// singleton root-group header; both header assertions below red if that regresses.
+		const headers = [...container.querySelectorAll('.root-header .root-name')].map((n) =>
+			(n.textContent ?? '').trim(),
+		);
+		expect(headers).toContain('other');
+		expect(headers).not.toContain('back room');
 		// The private tag rides the joined row (the structural tell, not a colour).
 		expect(container.textContent).toContain('private');
 	});
@@ -246,11 +256,25 @@ describe('QURATOR-144 W2 — claimed count is detail-only and lazy', () => {
 		expect(container.textContent).not.toContain('Roster');
 	});
 
-	it('a paint that already carries the count reuses it — no extra topicRank call on selection', async () => {
+	it('a row whose count a prior topicRank fold already supplied is not re-ranked on selection', async () => {
+		// QURATOR-153: the paint NEVER carries a count — `topic_discover_paint` hardcodes
+		// member_count_estimate: None for every row. The ONLY production path to a known count is a
+		// prior `topicRank` fold (rankDrawnRows writes it back into `directory`). So seed it the
+		// way production does: paint the row count-less, let the paint-time rank pass supply 7,
+		// THEN select — the guard under test is selectDiscovered's known-count early return.
 		listMock.mockResolvedValue([]); // defensive: clearAllMocks keeps mockResolvedValue
-		paintMock.mockResolvedValue([disc('d1', 'video/retro', 'a blurb', 7)]);
+		paintMock.mockResolvedValue([disc('d1', 'video/retro', 'a blurb', null)]);
+		rankMock.mockResolvedValue([{ topic_id: 'd1', member_count_estimate: 7 }]);
 		const { container } = render(TopicsPage);
 		await openRoot(container, 'video');
+		// The expand-time rank pass fires first and folds 7 into the row. The call is recorded the
+		// moment rankDrawnRows invokes topicRank, but the FOLD into `directory` lands in the
+		// microtasks after that promise resolves — drain them (one macrotask + a flush) before
+		// clearing, or the row click below can race the fold and read a still-null count.
+		await waitFor(() => expect(rankMock).toHaveBeenCalledWith(['d1']));
+		await new Promise((r) => setTimeout(r, 0));
+		await tick();
+		rankMock.mockClear();
 		const row = await waitFor(() => {
 			const el = [...container.querySelectorAll('.list-pane .row .name')].find((n) =>
 				(n.textContent ?? '').trim() === 'retro',
@@ -261,6 +285,7 @@ describe('QURATOR-144 W2 — claimed count is detail-only and lazy', () => {
 		await fireEvent.click(row.closest('.row')!);
 		await tick();
 		await waitFor(() => expect(container.textContent).toContain('7 claimed'));
+		// The known count is reused — selection never re-fires topicRank for this row.
 		expect(rankMock).not.toHaveBeenCalled();
 	});
 });
