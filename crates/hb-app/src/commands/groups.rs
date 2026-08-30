@@ -631,4 +631,52 @@ mod tests {
         );
         assert!(audience.is_empty(), "the audience file stays independent of group creation");
     }
+
+    // ── QURATOR-161 — `groups_create` itself, driven through the command ────────────────────────
+    //
+    // The M22 W1 block above had to MIRROR the command body because `State<'_, DataStore>` could not
+    // be built in a plain unit test. Tauri's dev-only "test" feature (mock_app + StateManager) removes
+    // that constraint, so the duplicate-name guard is now pinned on the real `#[tauri::command]` fn at
+    // its real signature — no mirror, no `*_inner` shim, no restructuring. The one guard it has is
+    // name-equality, which is not a numeric boundary, so there is no off-by-one side to assert: the
+    // proof of the guard is the refusal plus the byte-identical no-op on disk.
+    mod command_guards {
+        use super::*;
+        use super::super::groups_create;
+        use crate::error::CmdResult;
+        use tauri::Manager;
+
+        fn guard_app() -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            app.manage(DataStore::new(dir));
+            app
+        }
+
+        fn create_via_command(
+            app: &tauri::App<tauri::test::MockRuntime>,
+            name: &str,
+            color: Option<String>,
+        ) -> CmdResult<Group> {
+            let store = app.state::<DataStore>();
+            tauri::async_runtime::block_on(groups_create(name.to_string(), color, store))
+        }
+
+        /// Refuses a duplicate name AND writes nothing — the command's whole contract.
+        #[test]
+        fn groups_create_command_rejects_a_duplicate_name() {
+            let app = guard_app();
+            let group = create_via_command(&app, "Pals", None).expect("first create succeeds");
+            assert_eq!(group.name, "Pals");
+            assert!(group.pubkeys.is_empty(), "groups_create mints a memberless group");
+            let snapshot = std::fs::read_to_string(app.state::<DataStore>().groups_path()).unwrap();
+
+            let err = create_via_command(&app, "Pals", Some("#ff00aa".into()))
+                .expect_err("duplicate name must error, not overwrite");
+            assert_eq!(err, "Group 'Pals' already exists");
+
+            let after = std::fs::read_to_string(app.state::<DataStore>().groups_path()).unwrap();
+            assert_eq!(after, snapshot, "a rejected create must not mutate groups.json");
+        }
+    }
 }

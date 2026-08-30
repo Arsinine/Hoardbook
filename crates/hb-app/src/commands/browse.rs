@@ -1892,4 +1892,118 @@ mod tests {
             assert_eq!(err, "No manifest file or text provided.");
         }
     }
+
+    // ── QURATOR-161 slice 2 — `paste_key`'s guards, driven through the command itself ──────────
+    //
+    // Same class as the chat/browse command tests: the guards fire BEFORE `net::client` (the first
+    // network I/O), so no relay is ever dialled and these are offline by construction.
+    //
+    // The pass-side probe for the self-lookup guard is the hermetic `net::client` refusal: a store
+    // configured with `relay_urls = vec!["ws://127.0.0.1:9"]` (a port that is closed by definition,
+    // and one `net::validate_relay_url` would refuse as user input) makes `net::client` fail at the
+    // handshake, NOT in the self-lookup guard. That is exactly the "at exactly the limit it must get
+    // past the guard and fail at the next statement" shape the slice-1 boundary tests learned the
+    // hard way — a refusal-only test here would stay green under an inverted guard.
+    mod paste_key_command_guards {
+        use super::*;
+        use crate::identity_state::AppIdentity;
+        use tauri::Manager;
+
+        fn guard_app(identity_loaded: bool) -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            // A deliberately unreachable relay: the self-lookup guard is BEFORE `net::client`, so a
+            // non-self code that clears the guard proceeds into `resolve_peer` and fails at the
+            // connect — proving the guard let it through without any test reaching the network.
+            store
+                .save_settings(&crate::store::Settings {
+                    relay_urls: vec!["ws://127.0.0.1:9".into()],
+                    ..Default::default()
+                })
+                .unwrap();
+            let identity: SharedIdentity = std::sync::Arc::new(tokio::sync::RwLock::new(
+                identity_loaded.then(AppIdentity::generate),
+            ));
+            app.manage(identity);
+            app.manage(store);
+            app.manage(net::new_shared());
+            app
+        }
+
+        async fn paste_key_via_command(
+            app: &tauri::App<tauri::test::MockRuntime>,
+            code: &str,
+        ) -> CmdResult<CachedPeer> {
+            paste_key(
+                code.to_string(),
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+        }
+
+        fn code_for(id: &AppIdentity) -> String {
+            id.share_code().expect("encode the identity's own share code")
+        }
+
+        /// Refuses a pasted string that is not a share code at all, with the command's error text.
+        #[tokio::test]
+        async fn paste_key_command_rejects_an_unparseable_code() {
+            let app = guard_app(true);
+            let err = paste_key_via_command(&app, "not a share code")
+                .await
+                .unwrap_err();
+            assert!(
+                err.starts_with("Invalid share code:"),
+                "garbage is refused by the parse guard, got {err}"
+            );
+        }
+
+        /// Refuses the user's OWN code — and, the other side of that guard, a DIFFERENT user's code
+        /// clears it and proceeds into `resolve_peer` (failing at the relay connect, the next
+        /// statement, with no relay actually reached).
+        #[tokio::test]
+        async fn paste_key_command_rejects_own_code_and_passes_a_foreign_one_past_the_guard() {
+            let app = guard_app(true);
+            let own = app.state::<SharedIdentity>();
+            let own_code = {
+                let guard = own.read().await;
+                code_for(guard.as_ref().unwrap())
+            };
+
+            // The guard: our own code (either form — full `hbk…` or bare `npub1…`) is refused.
+            let err = paste_key_via_command(&app, &own_code).await.unwrap_err();
+            assert_eq!(err, "You cannot look up your own code");
+            let own_npub = {
+                let own = app.state::<SharedIdentity>();
+                let guard = own.read().await;
+                guard.as_ref().unwrap().npub()
+            };
+            let err = paste_key_via_command(&app, &own_npub).await.unwrap_err();
+            assert_eq!(err, "You cannot look up your own code");
+
+            // The other side: a different identity's code clears the guard and fails at the relay
+            // connect inside `resolve_peer` — never at the self-lookup refusal.
+            let foreign = AppIdentity::generate();
+            let err = paste_key_via_command(&app, &code_for(&foreign)).await.unwrap_err();
+            assert!(
+                err.contains("Could not connect to any relay"),
+                "a foreign code must clear the self-lookup guard and proceed into resolve_peer, got {err}"
+            );
+        }
+
+        /// Refuses the lookup when no identity is loaded, before any parsing of a peer code.
+        #[tokio::test]
+        async fn paste_key_command_requires_a_loaded_identity() {
+            let app = guard_app(false);
+            let foreign = AppIdentity::generate();
+            let err = paste_key_via_command(&app, &code_for(&foreign)).await.unwrap_err();
+            assert_eq!(
+                err,
+                "No identity loaded. Generate a keypair first."
+            );
+        }
+    }
 }
