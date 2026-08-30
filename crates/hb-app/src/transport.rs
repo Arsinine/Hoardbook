@@ -874,6 +874,20 @@ pub(crate) mod tests {
         iroh::EndpointAddr { id: server.id(), addrs }
     }
 
+    /// A serialized address that parses, sanitizes to itself, and has NOTHING to dial: a real
+    /// endpoint id with an empty transport-address set. Callers outside this module use it to reach
+    /// the statement after a guard without emitting a packet — the dial has no address, no relay and
+    /// no discovery to ask, so it fails locally. It lives HERE, rather than beside its caller,
+    /// because naming `iroh::` in a command module trips the INV-4′ CI sweep: that sweep defines the
+    /// transport surface as "the files that name iroh", and this file is on the list.
+    pub(crate) fn undialable_addr_json() -> String {
+        let addr = iroh::EndpointAddr::from_parts(
+            iroh::SecretKey::generate().public(),
+            std::iter::empty::<iroh::TransportAddr>(),
+        );
+        serde_json::to_string(&addr).expect("EndpointAddr serializes")
+    }
+
     /// QURATOR-113 #20 — the peer-authored ticket address is sanitized: only globally-routable
     /// transport addresses survive, so a stranger who answers a manifest ask cannot make this node
     /// dial an internal host. Pure (no endpoint bound): `sanitize_node_addr` runs the exact filter

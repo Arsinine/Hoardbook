@@ -508,14 +508,10 @@ mod tests {
         /// and no relay/discovery to ask. This is how the tests get "past the guard, fails at the
         /// next statement" WITHOUT emitting a packet: the address set is empty, not merely private.
         fn undialable_ticket(request_id: &str, slug: &str, nonce: Option<&str>) -> String {
-            let addr = iroh::EndpointAddr::from_parts(
-                iroh::SecretKey::generate().public(),
-                std::iter::empty::<iroh::TransportAddr>(),
-            );
             let ticket = TransportTicket::issue(
                 request_id,
                 slug,
-                &serde_json::to_string(&addr).unwrap(),
+                &crate::transport::tests::undialable_addr_json(),
                 1_700_000_000,
                 nonce,
             );
