@@ -243,6 +243,104 @@ jobs:
           echo "INV-4′ no-fs probe self-test OK — caught $n evasion(s), and exempted every comment line:"
           printf '%s\n' "$hits" | sed 's/^/  /'
 
+      # QURATOR-79 — Carrier 4's public-only fence rests on manifest_cache having exactly ONE
+      # production writer (crates/hb-app/src/commands/browse.rs, inside accept_manifest_bytes). If a
+      # private listing can never physically enter the cache, it can never be re-served from it — but
+      # that claim was hand-verified once and nothing re-checked it since. The INV-4′ sweep above greps
+      # for `priv_listing` references, not for new manifest_cache::put call sites, so a later feature
+      # that writes private data to the cache would break the fence silently, with every test green.
+      #
+      # Two write forms exist, and a grep for only one of them is exactly the "hand-written list
+      # cannot fix a hand-written list" trap: (a) any other file calling the qualified path
+      # `manifest_cache::put(` (this also catches `crate::manifest_cache::put(`, a substring match),
+      # and (b) manifest_cache.rs calling its OWN function unqualified — bare `put(` — which a
+      # qualified-name-only grep misses entirely. The bare form is only probed for INSIDE
+      # manifest_cache.rs itself: nowhere else can write `put(` and mean this function without
+      # importing or qualifying it, and confining it there keeps an unrelated `put(` in some other
+      # module from tripping this guard.
+      #
+      # Scanned per-file, comment-stripped, and restricted to each file's own PRODUCTION region — the
+      # lines before its first `#[cfg(test)]` marker (the whole file if it has none) — so the two
+      # known test-only call sites (browse.rs:1246, store.rs:2002) are not flagged, and the function's
+      # own `pub fn put(` declaration is excluded so a definition isn't miscounted as a call.
+      #
+      # The allowlist is a single file, verified to exist before anything else runs (an allowlist
+      # naming a renamed/deleted file must fail loudly, not go silently green — same trap as the
+      # INV-4′ TRANSPORT_FILES list above). The scan itself covers all of crates/hb-app/src (the
+      # widest scope the defect could hide in, not just the two known files), prints a per-file count
+      # so a clean result is distinguishable from a sweep that looked nowhere, and fails if it examined
+      # zero files — a sweep that finds nothing because it found no files is the exact "wrong cwd /
+      # absent tool" failure mode this repo has shipped before.
+      - name: manifest-cache single-writer sweep — Carrier 4's public-only fence has exactly one writer
+        if: matrix.platform == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -uo pipefail
+          fail=0
+          code_only() { grep -vE '^[^:]*:[0-9]+:[[:space:]]*(//|#|\*|/\*|<!--)'; }
+
+          ALLOWED_FILE="crates/hb-app/src/commands/browse.rs"
+          MC_FILE="crates/hb-app/src/manifest_cache.rs"
+
+          if [ ! -f "$ALLOWED_FILE" ]; then
+            echo "::error::manifest-cache single-writer sweep is stale — it allowlists $ALLOWED_FILE, which"
+            echo "::error::does not exist. A renamed or deleted file silently shrinks this guard. Update it."
+            exit 1
+          fi
+
+          files=$(find crates/hb-app/src -name '*.rs' | sort)
+          nfiles=$(printf '%s\n' "$files" | grep -c .)
+          if [ "$nfiles" -eq 0 ]; then
+            echo "::error::manifest-cache single-writer sweep examined ZERO files under crates/hb-app/src —"
+            echo "::error::wrong cwd or an absent tree reads as clean otherwise. Failing loudly instead."
+            exit 1
+          fi
+
+          total_hits=0
+          violations=""
+          for f in $files; do
+            # Production region = everything before this file's own #[cfg(test)] marker (or the whole
+            # file if it has none). Test-only call sites are not the invariant this sweep guards.
+            # `|| true`: a file with no `#[cfg(test)]` makes grep exit 1, and GitHub runs this step
+          # under `-e -o pipefail`, so an unguarded no-match kills the sweep after the first such
+          # file — silently, with no ::error:: and a green-looking "0 hits" for everything after it.
+          boundary=$(grep -n '^#\[cfg(test)\]' "$f" | head -1 | cut -d: -f1 || true)
+            boundary=${boundary:-999999}
+            region=$(awk -v b="$boundary" -v fn="$f" 'NR<b {print fn":"NR":"$0}' "$f")
+            nlines=$(printf '%s\n' "$region" | grep -c . || true); nlines=${nlines:-0}
+            if [ "$f" = "$MC_FILE" ]; then
+              pattern='manifest_cache::put[[:space:]]*\(|(^|[^a-zA-Z0-9_])put[[:space:]]*\('
+            else
+              pattern='manifest_cache::put[[:space:]]*\('
+            fi
+            hits=$(printf '%s\n' "$region" | grep -E "$pattern" 2>/dev/null | code_only | grep -vE ':[[:space:]]*(pub[[:space:]]+)?fn[[:space:]]+put[[:space:]]*\(' || true)
+            n=$(printf '%s\n' "$hits" | grep -c . || true)
+            printf '%s: %d production manifest_cache::put site(s) (%d lines examined pre-cfg(test))\n' "$f" "$n" "$nlines"
+            if [ "$n" -gt 0 ]; then
+              total_hits=$((total_hits + n))
+              if [ "$f" != "$ALLOWED_FILE" ]; then
+                violations="$violations"$'\n'"$hits"
+              fi
+            fi
+          done
+
+          if [ -n "$violations" ]; then
+            echo "::error::manifest-cache single-writer regression — a production write to manifest_cache::put appeared outside $ALLOWED_FILE (the only site Carrier 4's public-only fence assumes):"
+            echo "$violations"
+            fail=1
+          fi
+
+          if [ "$total_hits" -ne 1 ]; then
+            echo "::error::manifest-cache single-writer regression — expected exactly 1 production manifest_cache::put call site (at $ALLOWED_FILE), found $total_hits."
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::the manifest cache single-writer invariant is what Carrier 4's public-only fence rests on — a private listing cannot re-enter the cache if nothing new can write to it."
+            exit 1
+          fi
+          echo "manifest-cache single-writer sweep clean — examined $nfiles file(s), exactly 1 production writer, at $ALLOWED_FILE."
+
       # M18 W5 — the retired MASCARA-COURIER framing must not creep back into code.
       #
       # Mascara is a separate Buddy Backup/Sync platform (2026-07-26 ruling). It is NOT Hoardbook's
