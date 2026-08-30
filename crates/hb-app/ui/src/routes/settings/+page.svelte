@@ -149,6 +149,9 @@
 	let isPortable = $state(false);
 	let portableInfo: PortableUpdateInfo | null = $state(null);
 	let portableApplying = $state(false);
+	// QURATOR-158: the update row itself — the new-version badge routes into it (scrolls it into
+	// view), which is the "reuse the existing update UI" half of the ticket.
+	let updateRowEl: HTMLElement | undefined = $state();
 
 	async function doCheckUpdate() {
 		updateChecking = true;
@@ -167,6 +170,24 @@
 			updateError = String(e).replace(/^Error: /, '');
 		} finally {
 			updateChecking = false;
+		}
+	}
+
+	// QURATOR-158 — the launch-time background check. Deliberately NOT doCheckUpdate(): an
+	// unrequested check must fail silently (offline launches are normal), must not claim "up to
+	// date" the user never asked to confirm, and must not busy the manual button's spinner. It
+	// only fills updateInfo/portableInfo, from which the indicator + the existing update-row UI
+	// light up. Must be called AFTER isPortable resolves (onMount does), or a portable build
+	// silently takes the NSIS branch.
+	async function backgroundUpdateCheck() {
+		try {
+			if (isPortable) {
+				portableInfo = await checkPortableUpdate();
+			} else {
+				updateInfo = await checkUpdate();
+			}
+		} catch {
+			/* silent by design: an offline/unconfigured updater is not a launch error */
 		}
 	}
 
@@ -412,6 +433,9 @@
 		// Route the updater UI: the portable (loose-exe) build self-replaces; an NSIS install uses the
 		// staged/deferred flow. Best-effort — a detection failure falls back to the NSIS path.
 		try { isPortable = await updaterIsPortable(); } catch { isPortable = false; }
+		// QURATOR-158: launch-time check. Strictly AFTER the isPortable line above — the branch
+		// pick inside reads it. Never awaited-blocking: mount must not stall on a slow updater.
+		void backgroundUpdateCheck();
 		// Visible-after "now running vX.Y" notice — fires once per version change.
 		try {
 			const notice = updateNoticeVM(await takeUpdateNotice());
@@ -929,9 +953,20 @@
 	<!-- Updates -->
 	<div class="section-label">Updates</div>
 	<div class="surface">
-		<div class="update-row">
+		<div class="update-row" bind:this={updateRowEl}>
 			<div class="toggle-text">
 				<div class="toggle-label">App version</div>
+				<!-- QURATOR-158: new-version indicator — visible ONLY when a check (background or
+				     manual) actually found a newer version. Click-through is the existing update
+				     flow to its right (the "vX.Y available" + Download/Update &amp; restart pair),
+				     so this badge scrolls the same affordance into view rather than forking one.
+				     jsdom computes no layout — placement above the sub-label is CSS, not tested. -->
+				{#if isPortable ? portableInfo : updateInfo}
+					<button class="update-badge" title="A newer version is available" onclick={() => updateRowEl?.scrollIntoView({ block: 'center' })}>
+						<span class="update-badge-dot" aria-hidden="true"></span>
+						New version available
+					</button>
+				{/if}
 				<div class="toggle-sub">Currently running v{appVersion || '…'}</div>
 			</div>
 			<div class="update-actions">
@@ -1330,6 +1365,21 @@
 	.update-available-text { font-size: 12px; color: var(--accent); font-weight: 600; white-space: nowrap; }
 	.update-ok-text { font-size: 12px; color: var(--online); white-space: nowrap; }
 	.update-error-text { font-size: 11.5px; color: var(--error); margin-top: 4px; }
+	/* QURATOR-158 — new-version indicator, above "Currently running v…". Unobtrusive by design:
+	   a small accent dot + label. Routing = scrollIntoView on the row that owns the real update
+	   buttons (right there on the same row), not a second updater UI. */
+	.update-badge {
+		display: inline-flex; align-items: center; gap: 6px;
+		border: none; background: none; padding: 0; margin: 2px 0 3px;
+		font: inherit; font-size: 12px; font-weight: 600; color: var(--accent);
+		cursor: pointer;
+	}
+	.update-badge:hover { text-decoration: underline; }
+	.update-badge-dot {
+		width: 8px; height: 8px; border-radius: 50%;
+		background: var(--accent);
+		box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+	}
 
 	/* Pills */
 	.pill {
