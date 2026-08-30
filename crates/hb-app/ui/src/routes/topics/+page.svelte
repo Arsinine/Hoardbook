@@ -180,8 +180,18 @@
 
 	async function loadMine() {
 		try {
-			mine = await topicList();
+			const next = await topicList();
+			// QURATOR-149: the JOIN TRANSITION opens the group, not a permanent override. `had` is
+			// read from the OLD `mine` before the assignment; a root that just GAINED a joined Topic
+			// un-collapses here (the original rationale, narrowed to the instant it was about: "a
+			// toggle collapsing it then a join landing"). `isCollapsed` no longer consults
+			// `rootsWithJoined`, so the chevron stays a live control afterwards — including in the
+			// groups the user actually works in.
+			const had = new Set(mine.map((t) => topicRootOf(t.name)));
+			mine = next;
 			mineLoadError = false;
+			const gained = new Set(next.map((t) => topicRootOf(t.name)).filter((r) => !had.has(r)));
+			if (gained.size > 0) collapsedRoots = new Set([...collapsedRoots].filter((r) => !gained.has(r)));
 		} catch (e) {
 			toast(String(e), 'error');
 			mineLoadError = true;
@@ -731,6 +741,9 @@
 	// start collapsed, user-toggled thereafter, and force-opened by a live filter. The seed runs
 	// once per root as that root first appears (`seededRoots` is a plain Set, not state — a later
 	// reorder or repaint must never re-collapse a group the user deliberately expanded).
+	// QURATOR-149: a join that LANDS under an already-seeded root opens it via `loadMine`'s
+	// transition (the `gained` un-collapse), so this set is ONLY the seed input — `isCollapsed`
+	// never consults it as an override.
 	let rootsWithJoined = $derived(new Set(mine.map((t) => topicRootOf(t.name))));
 	let seededRoots = new Set<string>();
 	$effect(() => {
@@ -743,11 +756,9 @@
 	});
 	function isCollapsed(root: string, hasMatches: boolean): boolean {
 		if (searchQuery.trim() && hasMatches) return false; // the filter force-opens matching groups
-		if (!collapsedRoots.has(root)) return false;
-		// Never re-collapse a group the default rule says is open — a toggle collapsing it then a
-		// join landing would otherwise hide the user's own Topic behind a collapsed header.
-		if (rootsWithJoined.has(root)) return false;
-		return true;
+		// QURATOR-149: no `rootsWithJoined` override here — the chevron must stay a live control in
+		// the groups the user works in. The join transition opens its group in `loadMine` instead.
+		return collapsedRoots.has(root);
 	}
 	function toggleGroup(root: string) {
 		const next = new Set(collapsedRoots);
@@ -844,9 +855,10 @@
 					aria-label="Filter Topics by path"
 				/>
 			</div>
-			{#if mineLoadError}
+			{#if mineLoadError && mergedRows.length === 0}
 				<!-- QURATOR-93: a FAILED loadMine is not the confident "You haven't joined any Topics
-				     yet" negative. -->
+				     yet" negative. QURATOR-152/154: the whole-pane error is only for a failure with
+				     NOTHING painted — see the inline notice in the tree branch below. -->
 				<EmptyState
 					error
 					message="Couldn't load your Topics."
@@ -929,6 +941,17 @@
 						error
 						message="Couldn’t reach the relays — the directory may be stale."
 						onretry={() => { painted = false; paintError = false; void paintDirectory(); }}
+					/>
+				{/if}
+				<!-- QURATOR-152/154 (W2 merge + W3 instant paint): a failed LOCAL `topicList` read is the
+				     "joined Topics" half's failure — it must not replace a directory that just painted
+				     (from cache or fresh). It rides BELOW the tree in the same retryable error dialect
+				     the paintError banner above uses, never as a blank pane. -->
+				{#if mineLoadError}
+					<EmptyState
+						error
+						message="Couldn't load your Topics."
+						onretry={loadMine}
 					/>
 				{/if}
 			{/if}
