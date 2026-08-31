@@ -1288,72 +1288,59 @@ mod tests {
         );
     }
 
-    // QURATOR-79 carrier 4, the P-13 discriminator: the test above pins the *attributes* of the
-    // gate (same-fp serves, different-fp doesn't), which stays green through a change that only
-    // alters the *shape* of the resolution. This one pins the property the design names — an older
-    // re-served copy lands BESIDE a newer teaser, never OVER it, across the whole cache lifecycle.
-    //
-    // Concretely: a peer re-serves an older manifest (older fingerprint, author-signed) while the
-    // browser is showing a newer teaser. Whatever `accept_manifest_bytes` does with that re-serve
-    // (it caches under the older key), a later `resolve_from_cache` against the NEWER teaser must
-    // still refuse it — the newer teaser's tree is never shadowed by the stale copy. And a return
-    // to the OLDER fingerprint must still resolve, so the refusal is a gate, not a wipe.
-    //
-    // MUTATION (P-10, for the orchestrator to apply and revert): the defense is LAYERED — the
-    // cache key includes the teaser's fingerprint (a different-fp teaser is a pure miss in
-    // `manifest_cache::get`), and the author-signed refusal gate inside `resolve_from_cache` is the
-    // second layer. Merely deleting that refusal block does NOT red this test (the keying already
-    // misses), which is the design's own point. The edit that must red it is the one that lets a
-    // MISMATCHED envelope through: in `resolve_from_cache` — the function starting
-    // `fn resolve_from_cache(` — change the `!=` in the refusal to `==`
-    // (`if envelope.snapshot_fingerprint == fingerprint { return None; }`). Resolve the target by
-    // its containing function, never by matching this text. That inversion serves ONLY the
-    // mismatched copy: the first assertion below (newer teaser, expects None) reds because the
-    // stale envelope now passes the gate, and the second (older teaser under its own fp, expects
-    // Some) reds because the matching copy is now refused — exactly the clobber the design forbids.
-    // (The existing `…gates_on_the_signed_fingerprint` test reds under it too; that is fine.)
+    /// A cached envelope authored by SOMEONE ELSE must not resolve — even when it is filed under the
+    /// browsed peer's npub AND its signed fingerprint matches the teaser exactly.
+    ///
+    /// Under Carrier 4 this stops being hypothetical. Peer C re-serves cached copies, so D's cache
+    /// holds envelopes D never fetched from their author, and the npub a file is stored under is no
+    /// longer proof of who signed it. `resolve_from_cache` re-runs `verify_author` BEFORE the
+    /// fingerprint gate, and that check is the only thing standing between a mis-filed or tampered
+    /// cache entry and a manifest served under the wrong peer's name.
+    ///
+    /// Replaces `resolve_from_cache_never_clobbers_a_newer_teaser_with_an_older_re_serve`, deleted
+    /// 2026-08-31 by audit: its two assertions were structurally identical to
+    /// `…gates_on_the_signed_fingerprint` above, so no mutation could red one without the other, and
+    /// its name claimed a TEMPORAL property the code does not implement — the gate is fingerprint
+    /// equality, with no notion of older or newer.
+    ///
+    /// MUTATION (reds this test): in `fn resolve_from_cache`, delete the
+    /// `envelope.verify_author(peer).ok()?;` line. The fingerprints match, so the mutant resolves the
+    /// other peer's manifest while browsing this one. Resolve the target by its containing function,
+    /// never by matching this text. The sibling `…gates_on_the_signed_fingerprint` stays GREEN under
+    /// that edit — which is precisely what makes this test worth having.
     #[test]
-    fn resolve_from_cache_never_clobbers_a_newer_teaser_with_an_older_re_serve() {
+    fn resolve_from_cache_refuses_an_envelope_authored_by_another_peer() {
         let dir = tempfile::tempdir().unwrap();
-        // Peer C's cached copy: an OLDER snapshot of the same collection (different fingerprint,
-        // validly signed by the author A).
-        let older_fp = "1111111111111111111111111111111111111111111111111111111111111111";
-        let newer_fp = "2222222222222222222222222222222222222222222222222222222222222222";
-        let (id, bk, old_env) = a_manifest("criterion", older_fp);
-        let npub = id.npub();
-        // The re-serve lands in the cache under its OWN (older) key — `accept_manifest_bytes`'s
-        // `manifest_cache::put` keys on the envelope's signed fingerprint, which is the point.
+        let fp = "4444444444444444444444444444444444444444444444444444444444444444";
+
+        // The peer being browsed, plus a DIFFERENT author's envelope for the same slug at the same
+        // fingerprint. Only the signature distinguishes them.
+        let (browsed, bk, _own) = a_manifest("criterion", fp);
+        let (_other, _other_bk, other_env) = a_manifest("criterion", fp);
+
+        // File the other author's envelope under the browsed peer's cache key — exactly the shape a
+        // mis-filed re-serve or a tampered cache directory produces.
         manifest_cache::put(
-            dir.path(), &npub, "criterion", older_fp, &old_env.to_json().unwrap(), 1,
+            dir.path(), &browsed.npub(), "criterion", fp, &other_env.to_json().unwrap(), 1,
             manifest_cache::DEFAULT_MANIFEST_CACHE_BYTES,
         )
         .unwrap();
 
-        // The browser is showing a NEWER truncated teaser for the same collection.
-        let mut newer_meta = valid_meta("criterion");
-        newer_meta.insert("truncated".into(), serde_json::json!(true));
-        newer_meta.insert("snapshot_fingerprint".into(), serde_json::json!(newer_fp));
-        let newer_teaser = RenderedListing {
-            meta: newer_meta,
+        let mut meta = valid_meta("criterion");
+        meta.insert("truncated".into(), serde_json::json!(true));
+        meta.insert("snapshot_fingerprint".into(), serde_json::json!(fp));
+        let teaser = RenderedListing {
+            meta,
             entries: vec![],
             parts_total: 1,
             parts_present: 1,
             missing: vec![],
         };
-        assert!(
-            resolve_from_cache(dir.path(), &id.public_key(), &npub, "criterion", &bk, &newer_teaser, 2).is_none(),
-            "an older re-served copy must never upgrade (shadow) a newer teaser",
-        );
 
-        // The same older copy, browsed under its own fingerprint, still resolves: the refusal is a
-        // gate on WHICH teaser is served, not a wipe of the cache entry.
-        let mut older_meta = valid_meta("criterion");
-        older_meta.insert("truncated".into(), serde_json::json!(true));
-        older_meta.insert("snapshot_fingerprint".into(), serde_json::json!(older_fp));
-        let older_teaser = RenderedListing { meta: older_meta, ..newer_teaser.clone() };
         assert!(
-            resolve_from_cache(dir.path(), &id.public_key(), &npub, "criterion", &bk, &older_teaser, 3).is_some(),
-            "the older entry survives beside the newer one — beside, never over",
+            resolve_from_cache(dir.path(), &browsed.public_key(), &browsed.npub(), "criterion", &bk, &teaser, 2)
+                .is_none(),
+            "a cache entry signed by another peer must be refused, however it got there",
         );
     }
 

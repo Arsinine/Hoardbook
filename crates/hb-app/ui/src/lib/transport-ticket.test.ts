@@ -207,11 +207,23 @@ describe('ticketAnswersOurAsk — the unsolicited-dial gate', () => {
 		expect(ticketAnswersOurAsk(asks, 'npub1owner', 'criterion', '')).toBe(false);
 	});
 
-	/** The lookup must not be satisfied by inherited Object properties — `asks['constructor']` is
-	 *  truthy on a plain object. */
-	it('is not fooled by inherited Object properties', () => {
-		expect(ticketAnswersOurAsk({}, 'npub1owner', 'constructor', 'n-abc')).toBe(false);
-		expect(ticketAnswersOurAsk({}, 'toString', 'constructor', 'n-abc')).toBe(false);
+	/** The lookup must not be satisfied by an INHERITED property.
+	 *
+	 *  Rewritten 2026-08-31 (audit). The previous version passed 'constructor' as a *slug*, which
+	 *  could not fail under any implementation: the lookup key is composite (`npub|slug`, now
+	 *  `npub|author|slug`) and no `Object.prototype` member name contains a `|`, so the map access
+	 *  was always `undefined` whether or not the guard existed. Polluting the prototype with the
+	 *  exact composite key is the only input shape that actually reaches the `hasOwnProperty`
+	 *  check. */
+	it('is not fooled by an inherited property on Object.prototype', () => {
+		const proto = Object.prototype as unknown as Record<string, unknown>;
+		const polluted = 'npub1owner|criterion';
+		proto[polluted] = { nonce: 'n-abc' };
+		try {
+			expect(ticketAnswersOurAsk({}, 'npub1owner', 'criterion', 'n-abc')).toBe(false);
+		} finally {
+			delete proto[polluted];
+		}
 	});
 
 	// ── Carrier 4 — the ask identity is (responder, author, slug, nonce) ────────────────────────
