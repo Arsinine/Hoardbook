@@ -6,7 +6,9 @@
 //
 // The fix is feedback, not transport. The ask is now persisted server-side (inside `request_manifest`,
 // AFTER `send_dm_inner` resolves — a failed publish never records) as a small `manifest_asks.json` map
-// keyed `"{npub}|{slug}"`. This helper derives the paywall block's asked-state PURELY from that map +
+// keyed `"{npub}|{author}|{slug}"` (Carrier 4; pre-widening records on disk use the 2-segment
+// `"{npub}|{slug}"` spelling and still resolve on the owner path). This helper derives the paywall
+// block's asked-state PURELY from that map +
 // the current clock, so:
 //   - the asked-state survives a restart (read back from the store, not component-local state);
 //   - "Ask again" is disabled inside the cooldown (60 min, mirroring the announce-cooldown idiom);
@@ -47,21 +49,34 @@ export type ManifestAskState =
 	| { kind: 'unasked' }
 	| { kind: 'asked'; sentAt: string; relative: string; cooldownRemaining: number; cooldownOver: boolean };
 
-/** Read the ask map for `(npub, slug)` and derive the paywall block's state. `relative` is the
- *  compact "Asked {relative} — waiting for their reply" label, produced via `relativeTime` so it
+/** Read the ask map for `(npub, author, slug)` and derive the paywall block's state. `relative` is
+ *  the compact "Asked {relative} — waiting for their reply" label, produced via `relativeTime` so it
  *  matches the rest of the app (chat-preview.ts). `cooldownRemaining` (seconds) drives the "Ask again"
  *  button's disabled state + tooltip; `cooldownOver` is the boolean the template reads.
  *
- *  `undefined` map / missing key / malformed sent_at ⇒ `unasked` (the paywall's default — never a
- *  phantom "Asked" from a corrupted or absent record). */
+ *  Carrier 4 widens the key's identity by the AUTHOR: peer C can re-serve a manifest A authored, so
+ *  the ask is scoped by who authored it, not just who answers. An `undefined`/empty author is NOT
+ *  "any author" — it fails closed to `unasked`, because the authorless reading can only ever mean the
+ *  owner path, and that path is served by the legacy-key probe below. `undefined` map / missing key /
+ *  malformed sent_at all ⇒ `unasked` too (the paywall's default — never a phantom "Asked" from a
+ *  corrupted or absent record).
+ *
+ *  Legacy keys: pre-Carrier-4 records on disk use the 2-segment `npub|slug` spelling. They resolve
+ *  only on the owner path (`author === npub`), exactly the two spellings `ticketAnswersOurAsk`
+ *  (transport-ticket.ts) tries for that path — and never for a re-serve, where an authorless
+ *  fallback would be the cross-tenant collision. A widened key must never be EASIER to satisfy than
+ *  the one it replaced: each candidate is still the full `(npub, author, slug)` identity. */
 export function deriveManifestAskState(
 	asks: Record<string, ManifestAsk> | undefined | null,
 	npub: string,
+	author: string | undefined,
 	slug: string,
 	now: Date,
 ): ManifestAskState {
 	if (!asks) return { kind: 'unasked' };
-	const entry = asks[manifestAskKey(npub, slug)];
+	const entry = manifestAskLookupKeys(npub, author, slug)
+		.map((k) => asks[k])
+		.find((e) => e !== undefined);
 	if (!entry) return { kind: 'unasked' };
 	const then = Date.parse(entry.sent_at);
 	if (Number.isNaN(then)) return { kind: 'unasked' }; // corrupted record ⇒ honest default
@@ -75,10 +90,25 @@ export function deriveManifestAskState(
 	};
 }
 
-/** The on-disk key for an ask trace. Mirrors the Rust `manifest_ask_key` (store.rs). The pipe is
- *  unambiguous because npubs (bech32) and slugs (URL-safe charset) never contain `|`. */
-export function manifestAskKey(npub: string, slug: string): string {
-	return `${npub}|${slug}`;
+/** The on-disk key for an ask trace, widened to carry the author (Carrier 4). Mirrors the Rust
+ *  `manifest_ask_key` (store.rs). The pipe is unambiguous because npubs (bech32) and slugs (URL-safe
+ *  charset) never contain `|`. An unknown author fails closed: the empty string never appears as a
+ *  stored key segment, so the lookup misses rather than widening. */
+export function manifestAskKey(npub: string, author: string, slug: string): string {
+	return `${npub}|${author}|${slug}`;
+}
+
+/** Every on-disk spelling an ask for `(npub, author, slug)` may live under. The
+ *  author must be known and be the peer itself before the legacy 2-segment key is tried: a re-serve
+ *  ask resolves ONLY under its fully-qualified key, never an authorless fallback. Mirrors the
+ *  candidate list `ticketAnswersOurAsk` (transport-ticket.ts) walks — keep the two in step. */
+function manifestAskLookupKeys(npub: string, author: string | undefined, slug: string): string[] {
+	if (author === undefined || author === '') return []; // unknown author ⇒ unasked, never asked
+	if (author !== npub) return [manifestAskKey(npub, author, slug)];
+	// Owner path: the record may predate the widening (legacy spelling) or postdate it (self-author).
+	// Two spellings of one identity; trying both cannot widen what matches because the identity being
+	// asked about is the same on both.
+	return [`${npub}|${slug}`, manifestAskKey(npub, npub, slug)];
 }
 
 // ── Copy (single source — the paywall block and the tests read from here) ─────────────────────

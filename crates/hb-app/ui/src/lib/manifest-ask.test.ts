@@ -70,36 +70,36 @@ describe('askCooldownRemaining — mirrors hb-core::announce_cooldown_remaining 
 
 describe('deriveManifestAskState — table-driven over the asked/unasked axis', () => {
 	it('undefined map ⇒ unasked', () => {
-		expect(deriveManifestAskState(undefined, 'npub1a', 'criterion', NOW)).toEqual({ kind: 'unasked' });
+		expect(deriveManifestAskState(undefined, 'npub1a', 'npub1a', 'criterion', NOW)).toEqual({ kind: 'unasked' });
 	});
 
 	it('null map ⇒ unasked', () => {
-		expect(deriveManifestAskState(null, 'npub1a', 'criterion', NOW)).toEqual({ kind: 'unasked' });
+		expect(deriveManifestAskState(null, 'npub1a', 'npub1a', 'criterion', NOW)).toEqual({ kind: 'unasked' });
 	});
 
 	it('missing key ⇒ unasked', () => {
-		const asks = { 'npub1a|other': entry(0) };
-		expect(deriveManifestAskState(asks, 'npub1a', 'criterion', NOW)).toEqual({ kind: 'unasked' });
+		const asks = { 'npub1a|npub1a|other': entry(0) };
+		expect(deriveManifestAskState(asks, 'npub1a', 'npub1a', 'criterion', NOW)).toEqual({ kind: 'unasked' });
 	});
 
-	it('different npub, same slug ⇒ unasked (keyed by BOTH npub and slug)', () => {
-		const asks = { 'npub1a|criterion': entry(0) };
-		expect(deriveManifestAskState(asks, 'npub1b', 'criterion', NOW)).toEqual({ kind: 'unasked' });
+	it('different npub, same slug ⇒ unasked (keyed by npub AND author AND slug)', () => {
+		const asks = { 'npub1a|npub1a|criterion': entry(0) };
+		expect(deriveManifestAskState(asks, 'npub1b', 'npub1b', 'criterion', NOW)).toEqual({ kind: 'unasked' });
 	});
 
 	it('different slug, same npub ⇒ unasked', () => {
-		const asks = { 'npub1a|criterion': entry(0) };
-		expect(deriveManifestAskState(asks, 'npub1a', 'other', NOW)).toEqual({ kind: 'unasked' });
+		const asks = { 'npub1a|npub1a|criterion': entry(0) };
+		expect(deriveManifestAskState(asks, 'npub1a', 'npub1a', 'other', NOW)).toEqual({ kind: 'unasked' });
 	});
 
 	it('malformed sent_at ⇒ unasked (honest default — a corrupted record must not phantom-render "Asked")', () => {
-		const asks = { 'npub1a|criterion': { sent_at: 'garbage', fingerprint_seen: 'fp' } };
-		expect(deriveManifestAskState(asks, 'npub1a', 'criterion', NOW)).toEqual({ kind: 'unasked' });
+		const asks = { 'npub1a|npub1a|criterion': { sent_at: 'garbage', fingerprint_seen: 'fp' } };
+		expect(deriveManifestAskState(asks, 'npub1a', 'npub1a', 'criterion', NOW)).toEqual({ kind: 'unasked' });
 	});
 
 	it('just-asked entry ⇒ asked, cooldown active, cooldownOver=false, relative="now"', () => {
-		const asks = { 'npub1a|criterion': entry(0) };
-		const state = deriveManifestAskState(asks, 'npub1a', 'criterion', NOW);
+		const asks = { 'npub1a|npub1a|criterion': entry(0) };
+		const state = deriveManifestAskState(asks, 'npub1a', 'npub1a', 'criterion', NOW);
 		expect(state.kind).toBe('asked');
 		if (state.kind === 'asked') {
 			expect(state.sentAt).toBe(iso(0));
@@ -110,8 +110,8 @@ describe('deriveManifestAskState — table-driven over the asked/unasked axis', 
 	});
 
 	it('asked 30 min ago ⇒ asked, half cooldown remaining, relative="30m"', () => {
-		const asks = { 'npub1a|criterion': entry(-30 * 60_000) };
-		const state = deriveManifestAskState(asks, 'npub1a', 'criterion', NOW);
+		const asks = { 'npub1a|npub1a|criterion': entry(-30 * 60_000) };
+		const state = deriveManifestAskState(asks, 'npub1a', 'npub1a', 'criterion', NOW);
 		expect(state.kind).toBe('asked');
 		if (state.kind === 'asked') {
 			expect(state.relative).toBe('30m');
@@ -121,8 +121,8 @@ describe('deriveManifestAskState — table-driven over the asked/unasked axis', 
 	});
 
 	it('asked exactly 60 min ago ⇒ asked, cooldownOver=true (Ask again enabled)', () => {
-		const asks = { 'npub1a|criterion': entry(-60 * 60_000) };
-		const state = deriveManifestAskState(asks, 'npub1a', 'criterion', NOW);
+		const asks = { 'npub1a|npub1a|criterion': entry(-60 * 60_000) };
+		const state = deriveManifestAskState(asks, 'npub1a', 'npub1a', 'criterion', NOW);
 		expect(state.kind).toBe('asked');
 		if (state.kind === 'asked') {
 			expect(state.cooldownRemaining).toBe(0);
@@ -131,8 +131,8 @@ describe('deriveManifestAskState — table-driven over the asked/unasked axis', 
 	});
 
 	it('asked 2 hours ago ⇒ asked, cooldownOver=true, relative ladder advances to "2h"', () => {
-		const asks = { 'npub1a|criterion': entry(-2 * 60 * 60_000) };
-		const state = deriveManifestAskState(asks, 'npub1a', 'criterion', NOW);
+		const asks = { 'npub1a|npub1a|criterion': entry(-2 * 60 * 60_000) };
+		const state = deriveManifestAskState(asks, 'npub1a', 'npub1a', 'criterion', NOW);
 		expect(state.kind).toBe('asked');
 		if (state.kind === 'asked') {
 			expect(state.relative).toBe('2h');
@@ -142,25 +142,90 @@ describe('deriveManifestAskState — table-driven over the asked/unasked axis', 
 
 	it('the state is read from the persisted record, not component-local state — survives a remount', () => {
 		// Simulate a remount: the map persists, the component is fresh. The same map ⇒ the same state.
-		const asks = { 'npub1a|criterion': entry(-5 * 60_000) };
-		const first = deriveManifestAskState(asks, 'npub1a', 'criterion', NOW);
-		const second = deriveManifestAskState(asks, 'npub1a', 'criterion', NOW);
+		const asks = { 'npub1a|npub1a|criterion': entry(-5 * 60_000) };
+		const first = deriveManifestAskState(asks, 'npub1a', 'npub1a', 'criterion', NOW);
+		const second = deriveManifestAskState(asks, 'npub1a', 'npub1a', 'criterion', NOW);
 		expect(second).toEqual(first);
 		expect(second.kind).toBe('asked');
 	});
 });
 
+describe('Carrier 4 — the ask key is widened by the author (re-serve vs owner path)', () => {
+	it('a re-serve ask (peer C serving author A) resolves under the fully-qualified key', () => {
+		const asks = { 'npub1c|npub1a|criterion': entry(0) };
+		const state = deriveManifestAskState(asks, 'npub1c', 'npub1a', 'criterion', NOW);
+		expect(state.kind).toBe('asked');
+	});
+
+	it('an owner-path ask under the legacy 2-segment key still resolves (records on disk predate the widening)', () => {
+		const asks = { 'npub1a|criterion': entry(0) };
+		const state = deriveManifestAskState(asks, 'npub1a', 'npub1a', 'criterion', NOW);
+		expect(state.kind).toBe('asked');
+	});
+
+	it('an owner-path ask under the widened self-author spelling resolves too (both spellings of one identity)', () => {
+		const asks = { 'npub1a|npub1a|criterion': entry(0) };
+		const state = deriveManifestAskState(asks, 'npub1a', 'npub1a', 'criterion', NOW);
+		expect(state.kind).toBe('asked');
+	});
+
+	it('FAILS CLOSED: an unknown author (undefined) ⇒ unasked, never asked', () => {
+		// The authorless reading can only ever mean the owner path, and the owner path is served by the
+		// legacy-key probe — so an unknown author must not resolve a re-serve-shaped entry either.
+		const asks = {
+			'npub1c|npub1a|criterion': entry(0), // a re-serve ask of A's manifest exists…
+			'npub1c|criterion': entry(0), // …and so does a legacy owner-path ask
+		};
+		expect(deriveManifestAskState(asks, 'npub1c', undefined, 'criterion', NOW)).toEqual({ kind: 'unasked' });
+	});
+
+	it('FAILS CLOSED: an empty-string author ⇒ unasked, never asked', () => {
+		const asks = { 'npub1c|criterion': entry(0) };
+		expect(deriveManifestAskState(asks, 'npub1c', '', 'criterion', NOW)).toEqual({ kind: 'unasked' });
+	});
+
+	it('NO AUTHORLESS FALLBACK for a re-serve: an ask for A\'s manifest does not resolve an owner-path record', () => {
+		// This is the cross-tenant collision the widening exists to stop: ask C for A's manifest, and
+		// the authorless key (C's own collection) must not read as "we already asked for A's".
+		const asks = { 'npub1c|criterion': entry(0), 'npub1c|npub1c|criterion': entry(0) };
+		expect(deriveManifestAskState(asks, 'npub1c', 'npub1a', 'criterion', NOW)).toEqual({ kind: 'unasked' });
+	});
+
+	it('a re-serve ask for a DIFFERENT author does not resolve (the author is part of the identity)', () => {
+		const asks = { 'npub1c|npub1a|criterion': entry(0) };
+		expect(deriveManifestAskState(asks, 'npub1c', 'npub1b', 'criterion', NOW)).toEqual({ kind: 'unasked' });
+	});
+
+	it('an owner-path ask does not leak into a re-serve reading of the same (npub, slug)', () => {
+		// Inverse direction of the same collision: the legacy owner record must not satisfy a lookup
+		// scoped to a third-party author.
+		const asks = { 'npub1c|criterion': entry(0) };
+		expect(deriveManifestAskState(asks, 'npub1c', 'npub1a', 'criterion', NOW)).toEqual({ kind: 'unasked' });
+	});
+});
+
 describe('manifestAskKey — mirrors the Rust manifest_ask_key (store.rs)', () => {
-	it('joins npub and slug with a pipe', () => {
-		expect(manifestAskKey('npub1a', 'criterion')).toBe('npub1a|criterion');
+	it('joins npub, author and slug with pipes', () => {
+		expect(manifestAskKey('npub1a', 'npub1a', 'criterion')).toBe('npub1a|npub1a|criterion');
+		expect(manifestAskKey('npub1c', 'npub1a', 'criterion')).toBe('npub1c|npub1a|criterion');
 	});
 
 	it('disambiguates same-slug-different-peer (no clobber)', () => {
-		expect(manifestAskKey('npub1a', 'criterion')).not.toBe(manifestAskKey('npub1b', 'criterion'));
+		expect(manifestAskKey('npub1a', 'npub1a', 'criterion')).not.toBe(manifestAskKey('npub1b', 'npub1b', 'criterion'));
 	});
 
 	it('disambiguates same-peer-different-slug', () => {
-		expect(manifestAskKey('npub1a', 'criterion')).not.toBe(manifestAskKey('npub1a', 'other'));
+		expect(manifestAskKey('npub1a', 'npub1a', 'criterion')).not.toBe(manifestAskKey('npub1a', 'npub1a', 'other'));
+	});
+
+	it('disambiguates same-responder-different-AUTHOR (the carrier-4 widening — C serving A vs C serving B)', () => {
+		expect(manifestAskKey('npub1c', 'npub1a', 'criterion')).not.toBe(manifestAskKey('npub1c', 'npub1b', 'criterion'));
+	});
+
+	it('the widened key never collides with the legacy 2-segment spelling of a different (npub, slug)', () => {
+		// `npub1a|npub1a|criterion` must not be reachable as some legacy `X|Y` key — the pipe is
+		// unambiguous only if no npub/slug contains one, and npubs (bech32) and slugs (URL-safe) never do.
+		expect(manifestAskKey('npub1a', 'npub1a', 'criterion')).not.toBe('npub1a|npub1a|criterion'.slice(0, 'npub1a|criterion'.length));
 	});
 });
 

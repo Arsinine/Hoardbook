@@ -2,7 +2,7 @@
 	import { contacts, toast, toastWithAction, contactsLoadError, loadContactsInto } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import { sizeTier, sizeTierTooltip, rowIcon } from '$lib/collection-row-view.js';
-	import { refreshContact, importManifest, requestManifest, getManifestAsks, getContacts, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, browsePrivateCollections, type ManifestAsk } from '$lib/api.js';
+	import { refreshContact, importManifest, requestManifest, getManifestAsks, getContacts, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, browsePrivateCollections, type ManifestAsk, type ImportedManifest } from '$lib/api.js';
 	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
@@ -17,7 +17,7 @@
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote, arrangeItems, fileTypesPresent, type BrowseViewMode, type BrowseSortKey, type BrowseSortDir } from '$lib/browse-view.js';
 	import { deriveManifestAskState, ASK_TICK_MS, MANIFEST_ASKED_LINE, MANIFEST_ASK_AGAIN_LABEL, MANIFEST_ASK_AGAIN_COOLDOWN_TIP, MANIFEST_OPEN_CHAT_LABEL, MANIFEST_ASK_FAILED_LINE } from '$lib/manifest-ask.js';
-	import type { CachedPeer, Collection, DirectoryItem, Group, ImportedManifestProvenance } from '$lib/types.js';
+	import type { CachedPeer, Collection, DirectoryItem, Group } from '$lib/types.js';
 	import { groupByGroups, matchesQuery } from '$lib/contacts-view.js';
 	// M22 W3 — drag-to-group gesture primitives (shared with Contacts). Create is ALWAYS ADDITIVE.
 	// M22 W4 — drop onto an existing group heading: plain drop MOVES, Shift-drop ADDS (owner ruling
@@ -193,12 +193,16 @@
 		}
 	}
 
-	// Pure derivation of the paywall block's asked-state from (map, npub, slug, now). `nowTick` is the
-	// reactive clock that keeps the cooldown + relative label fresh; reading it here makes the $derived
-	// recompute every second.
+	// Pure derivation of the paywall block's asked-state from (map, npub, author, slug, now). The
+	// author is the browsed peer itself — this ask path asks a peer for THEIR OWN collection (the M16
+	// W4 author-pin gates mean a browsed teaser is always authored by the browsed peer), so it walks
+	// the owner path and resolves both the legacy 2-segment key and the widened self-author spelling.
+	// A re-serve ask (peer C asked for A's manifest) has no UI call site yet. `nowTick` is the
+	// reactive clock that keeps the cooldown + relative label fresh; reading it here makes the
+	// $derived recompute every second.
 	let askState = $derived(
 		selectedPeer && selectedCollection
-			? deriveManifestAskState(manifestAsks, selectedPeer.npub, selectedCollection.slug, new Date(nowTick))
+			? deriveManifestAskState(manifestAsks, selectedPeer.npub, selectedPeer.npub, selectedCollection.slug, new Date(nowTick))
 			: { kind: 'unasked' as const },
 	);
 
@@ -735,7 +739,7 @@
 	// The import toast, provenance-aware. The old copy ("Ask the owner for a fresh manifest") was
 	// wrong twice under carrier 4: the owner is offline (that's why a peer re-served it), and the
 	// user couldn't tell who served this or how old it is.
-	function importToast(result: { stale: boolean } & ImportedManifestProvenance): { text: string; kind: 'success' | 'error' } {
+	function importToast(result: ImportedManifest): { text: string; kind: 'success' | 'error' } {
 		const reServed = result.served_by !== undefined;
 		if (result.stale && reServed) {
 			const who = servingPeerName(result.served_by!);

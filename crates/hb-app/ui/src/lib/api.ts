@@ -324,12 +324,19 @@ export const unfollowContact = (npub: string) => invoke<void>('unfollow_contact'
 export const refreshContact = (npub: string) => invoke<CachedPeer>('refresh_contact', { npub });
 
 /** M16 W4 — the result of importing a `.hbmanifest`: the full-tree collection (fade lifted), and
- *  `stale` when the manifest predates the teaser the browser is showing (imported anyway, with a warn). */
+ *  `stale` when the manifest predates the teaser the browser is showing (imported anyway, with a warn).
+ *
+ *  QURATOR-79 carrier 4 provenance: `served_by` names the peer whose cached copy arrived (None ⇒ the
+ *  author served it directly); `cached_at` is when that peer's cached copy was taken. Both additive-
+ *  optional, absent on every pre-carrier-4 serve. The envelope's own clock is
+ *  `collection.manifest_imported_at` — there is no second one here. */
 export interface ImportedManifest {
 	slug: string;
 	collection: Collection;
 	created_at: number;
 	stale: boolean;
+	served_by?: string;
+	cached_at?: number;
 }
 
 /** M16 W4 — import a full-listing manifest the user received (a picked file path OR pasted text/base64),
