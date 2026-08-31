@@ -895,6 +895,18 @@ struct ManifestRequest {
     /// exactly what `wire_freeze` exists to prevent.
     #[serde(skip_serializing_if = "Option::is_none")]
     mascara_pubkey: Option<String>,
+    /// **Carrier 4 (QURATOR-79) — the author of the collection being asked for**, when it is not
+    /// the asked peer's own: peer D asks peer C for a manifest peer A authored, and C re-serves it
+    /// from its cache. `None` means "the asked peer's own collection" — today's semantics exactly.
+    ///
+    /// Additive and optional, no wire-discriminant change (owner ruling, QURATOR-79, 2026-08-30 —
+    /// the same shape as the ticket-side `author_npub` in `hb-core::ticket`). The exemption's
+    /// load-bearing condition holds: absence cannot be exploited as a downgrade, because `None`
+    /// is the ordinary own-collection ask the asked peer is entitled to serve — there is no weaker
+    /// behaviour hiding behind `None`, so unlike `ask_nonce` there is no fail-closed gate to write.
+    /// No `#[serde(default)]`: it is a no-op on an `Option` (a missing key already reads as `None`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author_npub: Option<String>,
 }
 
 /// Build the manifest-request DM body (canonical JSON). Pure — unit-tested without a relay.
@@ -916,6 +928,39 @@ pub(crate) fn build_manifest_request(
         teaser_event_id,
         ask_nonce,
         mascara_pubkey,
+        // Carrier 4 not in play from this builder: the ordinary ask targets the asked peer's own
+        // collection. A third-party-author ask goes through `build_manifest_request_for_author`.
+        author_npub: None,
+    };
+    serde_json::to_string(&req).map_err(cmd_err)
+}
+
+/// Carrier 4 (QURATOR-79) — build a manifest-request DM body naming a **third-party author**: peer D
+/// asks peer C for a manifest peer A authored, so C can re-serve it from its cache. `author_npub`
+/// must be a non-empty npub string; empty is normalised to `None` so "present but blank" cannot
+/// masquerade as a real author pin on the wire (same normalisation the ticket side applies to
+/// `ask_nonce`). Pure — unit-tested without a relay, alongside the frozen-wire tests below.
+///
+/// No production caller yet — the carrier-4 UI slice that drives a third-party ask is a later
+/// slice — hence the `#[allow(dead_code)]` outside `test` (same shape as `logging.rs`'s
+/// copy-diagnostics helper). The wire body it emits is production regardless.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn build_manifest_request_for_author(
+    slug: &str,
+    fingerprint_seen: &str,
+    teaser_event_id: Option<String>,
+    mascara_pubkey: Option<String>,
+    ask_nonce: Option<String>,
+    author_npub: &str,
+) -> Result<String, String> {
+    let req = ManifestRequest {
+        hb: MANIFEST_REQUEST_TAG,
+        slug: slug.to_string(),
+        fingerprint_seen: fingerprint_seen.to_string(),
+        teaser_event_id,
+        ask_nonce,
+        mascara_pubkey,
+        author_npub: if author_npub.is_empty() { None } else { Some(author_npub.to_string()) },
     };
     serde_json::to_string(&req).map_err(cmd_err)
 }
@@ -950,6 +995,9 @@ pub async fn request_manifest(
     // Mint the nonce HERE, not in the UI: it must be the same value that reaches both the wire and
     // the local trace, and a caller that could supply it could also replay one.
     let ask_nonce = new_ask_nonce();
+    // Carrier 4 not in play: this command asks the PEER for the peer's own collection. A
+    // third-party-author ask (peer D asking C for A's manifest) has no call site yet — the carrier-4
+    // slice that drives it passes the author here via `build_manifest_request_for_author`.
     let content = build_manifest_request(
         &slug,
         &fingerprint_seen,
@@ -1186,6 +1234,54 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(legacy).unwrap();
         assert_eq!(v["hb"], MANIFEST_REQUEST_TAG, "a pre-nonce request still reads as a request");
         assert!(v.get("ask_nonce").is_none());
+    }
+
+    /// **The `ManifestRequest.author_npub` half of the carrier-4 ask wire (QURATOR-79)** — same
+    /// pinning discipline as `manifest_request_ask_nonce_is_wire_frozen` above. Additive optional
+    /// field, no discriminant bump: the exemption is earned ONLY by covering present AND absent,
+    /// which is strictly more coverage than a bump (a bump proves a number changed; this proves
+    /// both shapes a peer can actually receive still parse as requests).
+    ///
+    /// MUTATION (P-10) — each arm reds under one production edit, all inside `build_manifest_request`
+    /// or `build_manifest_request_for_author` (resolved by containing function, not text):
+    /// 1. present-arm: inside `build_manifest_request_for_author`, hardcode the `author_npub:`
+    ///    init to `None` (or rename the struct field / its serde key) → `v["author_npub"]` reads
+    ///    `null` and the `assert_eq!` against "npub1a" fails.
+    /// 2. absent-arm: drop `#[serde(skip_serializing_if = "Option::is_none")]` from the struct's
+    ///    `author_npub` field → the ordinary body emits `"author_npub":null` and the
+    ///    `!json.contains("author_npub")` assert fails.
+    /// 3. legacy-arm: change `MANIFEST_REQUEST_TAG`'s value, or make `build_manifest_request`
+    ///    serialise `hb` from a different constant, → `v["hb"]` no longer equals the tag and the
+    ///    pre-author request stops reading as a request.
+    #[test]
+    fn manifest_request_author_npub_is_wire_frozen() {
+        const FREEZE: &str = "FROZEN WIRE FIELD — changing this breaks in-flight requests";
+
+        // 1. PRESENT — a carrier-4 ask names the third-party author, and the field name is the
+        //    contract the asked peer's inbox parses against.
+        let json =
+            build_manifest_request_for_author("s", "fp", None, None, Some("n0nce".into()), "npub1a")
+                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["author_npub"], "npub1a", "ManifestRequest.author_npub field name — {FREEZE}");
+
+        // 2. ABSENT — `None` omits the key entirely (never `null`), so a client that predates the
+        //    field parses a new request exactly as it always did, and `None` keeps meaning "the
+        //    asked peer's own collection" — today's semantics, no weaker behaviour to fall into.
+        let json = build_manifest_request("s", "fp", None, None, Some("n0nce".into())).unwrap();
+        assert!(
+            !json.contains("author_npub"),
+            "an absent author is omitted, not null — {FREEZE}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("author_npub").is_none());
+
+        // 3. LEGACY / wrong-discriminator — a pre-author_npub request body is still a recognisable
+        //    request, carrying none of the new field.
+        let legacy = r#"{"hb":"manifest_request","slug":"s","fingerprint_seen":"fp","ask_nonce":"n"}"#;
+        let v: serde_json::Value = serde_json::from_str(legacy).unwrap();
+        assert_eq!(v["hb"], MANIFEST_REQUEST_TAG, "a pre-author request still reads as a request");
+        assert!(v.get("author_npub").is_none());
     }
 
     #[test]
