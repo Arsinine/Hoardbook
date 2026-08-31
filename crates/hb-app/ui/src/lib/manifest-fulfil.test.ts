@@ -1,5 +1,6 @@
 // M17 W7.1b — the manifest-request fulfilment card's pure state derivation (table-driven over all
-// five states) + the post-export copy invariant sweeps (MAS-INV-5 + INV-4: no "Download"/"Send").
+// five pre-carrier-4 states, plus carrier 4's `re-serve` in its own describe below) + the post-export
+// copy invariant sweeps (MAS-INV-5 + INV-4: no "Download"/"Send").
 // The card itself is a thin presentational Svelte component (see ManifestFulfilCard.svelte); every
 // branch is decided by `deriveManifestFulfil` here, so pinning the helper pins the card.
 import { describe, expect, it } from 'vitest';
@@ -13,8 +14,10 @@ import {
 	MANIFEST_STALE_NOTE,
 	MANIFEST_BIG_RELAY_HINT,
 	MANIFEST_BIG_RELAY_LINK,
+	MANIFEST_RESERVE_LINE,
 } from './manifest-fulfil.js';
 import { parseManifestRequest, type ManifestRequest } from './request-inbox.js';
+import { shortNpub } from './contact-display.js';
 import type { Collection } from './types.js';
 
 function makeDraft(opts: Partial<Collection> & { slug: string }): Collection {
@@ -31,17 +34,18 @@ function makeDraft(opts: Partial<Collection> & { slug: string }): Collection {
 	};
 }
 
-function manifestReq(opts: { slug: string; fingerprintSeen?: string }): ManifestRequest {
+function manifestReq(opts: { slug: string; fingerprintSeen?: string; authorNpub?: string }): ManifestRequest {
 	const fp = opts.fingerprintSeen ?? '';
 	return {
 		slug: opts.slug,
 		fingerprintSeen: fp,
 		teaserEventId: undefined,
 		mascaraPubkey: undefined,
+		authorNpub: opts.authorNpub,
 	};
 }
 
-describe('deriveManifestFulfil — table-driven over all five states', () => {
+describe('deriveManifestFulfil — table-driven over all five pre-carrier-4 states', () => {
 	it('Public draft → exportable (primary)', () => {
 		const drafts = [makeDraft({ slug: 'criterion', visibility: 'Public' })];
 		const state = deriveManifestFulfil(manifestReq({ slug: 'criterion' }), drafts, { quarantined: false });
@@ -220,5 +224,73 @@ describe('deriveManifestFulfil — the Public case is the EXACT existing export 
 		// A differently-cased slug does NOT match — the owner has no draft "Criterion".
 		const state = deriveManifestFulfil(manifestReq({ slug: 'Criterion' }), drafts, { quarantined: false });
 		expect(state.kind).toBe('missing');
+	});
+});
+
+describe('authorNpub (QURATOR-79 carrier 4 — the third-party re-serve ask)', () => {
+	const NPUB_A = 'npub1author0000abcdefghij012345678901234567890123456789012345wxyz';
+
+	it('a request naming a third-party author derives `re-serve`, carrying slug AND author', () => {
+		// A re-serve ask is judged by the human on the card, not by the own-draft slug match: the
+		// envelope lives in the owner's manifest CACHE (put there by browsing that author), so even a
+		// slug that matches one of the owner's own drafts must not be conflated with an own-collection
+		// ask — the author pin is what tells the two apart.
+		const drafts = [makeDraft({ slug: 'criterion', visibility: 'Public' })];
+		const state = deriveManifestFulfil(manifestReq({ slug: 'criterion', authorNpub: NPUB_A }), drafts, {
+			quarantined: false,
+		});
+		expect(state).toEqual({ kind: 're-serve', slug: 'criterion', authorNpub: NPUB_A });
+	});
+
+	it('a re-serve ask derives `re-serve` even when the slug matches NO own draft', () => {
+		// The mirror of the one above: "missing" is the own-draft answer. For a re-serve ask the
+		// missing-DRAFT line ("You don't have a collection called … any more") would be a lie — the
+		// thing that might be missing is a CACHED COPY, and the card must not answer a different
+		// question than the one asked.
+		const state = deriveManifestFulfil(manifestReq({ slug: 'not-mine', authorNpub: NPUB_A }), [], {
+			quarantined: false,
+		});
+		expect(state.kind).toBe('re-serve');
+	});
+
+	it('quarantine still short-circuits BEFORE the re-serve branch is judged (Accept first, always)', () => {
+		// Same hard constraint as every other state: inside the Q7 request inbox the card renders for
+		// recognition with ZERO action buttons. The re-serve branch must not sneak a verb into
+		// quarantine — but it MUST still derive honestly, so what the owner reads pre-Accept says
+		// whose list is being asked for.
+		const state = deriveManifestFulfil(manifestReq({ slug: 'criterion', authorNpub: NPUB_A }), [], {
+			quarantined: true,
+		});
+		expect(state).toEqual({ kind: 'quarantine', slug: 'criterion' });
+	});
+
+	it('an authorless request derives exactly the pre-carrier-4 states (every existing peer)', () => {
+		// Regression: the own-draft resolution must be untouched. Same drafts, same request, same
+		// five states as before carrier 4 — the widening only ADDED a branch.
+		const drafts = [makeDraft({ slug: 'criterion', visibility: 'Public' })];
+		expect(deriveManifestFulfil(manifestReq({ slug: 'criterion' }), drafts, { quarantined: false })).toEqual(
+			{ kind: 'public', slug: 'criterion', stale: false },
+		);
+	});
+
+	it('manifestFulfilFor threads the parsed author through to the state in one pass', () => {
+		const content = JSON.stringify({
+			hb: 'manifest_request',
+			slug: 'criterion',
+			fingerprint_seen: 'fp-1',
+			author_npub: NPUB_A,
+		});
+		const out = manifestFulfilFor(content, [], { quarantined: false });
+		expect(out!.request.authorNpub).toBe(NPUB_A);
+		expect(out!.state).toEqual({ kind: 're-serve', slug: 'criterion', authorNpub: NPUB_A });
+	});
+
+	it('the re-serve line names the author and the LIST — never the files (MAS-INV-5 + INV-4)', () => {
+		const line = MANIFEST_RESERVE_LINE(NPUB_A);
+		// The author must appear (truncated the way the rest of the app renders an npub) so the click
+		// is an informed one; and the thing crossing is named as a list/cache read, never a file move.
+		expect(line).toContain(shortNpub(NPUB_A));
+		expect(line.toLowerCase()).not.toMatch(/\bdownload\b/);
+		expect(line.toLowerCase()).not.toMatch(/\bsend\b/);
 	});
 });
