@@ -1015,9 +1015,12 @@ pub async fn request_manifest(
     // recipient's inbox only (no self-copy), so without this record the ask leaves zero local trace and
     // the button reads as dead on the requester's side. One entry per `(npub, slug)`, overwritten on
     // re-ask; the re-ask cooldown is derived client-side from `sent_at`.
+    //
+    // Carrier 4: the ask is keyed on the AUTHOR it asks about, which for this command (the ordinary
+    // owner-path ask — see `build_manifest_request`) is the asked peer itself.
     let sent_at = chrono::Utc::now().to_rfc3339();
     store
-        .record_manifest_ask(&npub, &slug, &fingerprint_seen, &sent_at, &ask_nonce)
+        .record_manifest_ask(&npub, &npub, &slug, &fingerprint_seen, &sent_at, &ask_nonce)
         .map_err(cmd_err)?;
     Ok(())
 }
@@ -1276,12 +1279,13 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v.get("author_npub").is_none());
 
-        // 3. LEGACY / wrong-discriminator — a pre-author_npub request body is still a recognisable
-        //    request, carrying none of the new field.
-        let legacy = r#"{"hb":"manifest_request","slug":"s","fingerprint_seen":"fp","ask_nonce":"n"}"#;
-        let v: serde_json::Value = serde_json::from_str(legacy).unwrap();
-        assert_eq!(v["hb"], MANIFEST_REQUEST_TAG, "a pre-author request still reads as a request");
-        assert!(v.get("author_npub").is_none());
+        // 3. LEGACY / wrong-discriminator: deliberately NOT asserted here, audit 2026-08-31. The
+        //    arm that stood here parsed a string literal written by the test into a generic
+        //    `serde_json::Value` and asserted the `hb` field it had itself hardcoded — no
+        //    production code ran, so it could not fail for the reason it claimed. It cannot be
+        //    fixed in place either: `ManifestRequest` derives `Serialize` only, and nothing in Rust
+        //    deserializes a request body. The recogniser is TypeScript, and the property is really
+        //    pinned in `ui/src/lib/request-inbox.test.ts` against the real `parseManifestRequest`.
     }
 
     #[test]

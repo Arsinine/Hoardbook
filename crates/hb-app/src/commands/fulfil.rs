@@ -487,9 +487,17 @@ pub(crate) async fn redeem_manifest_ticket_inner(
     // `request_id` **durably**, so: one ask admits one ticket, a retry must be that same ticket, and
     // a restart cannot resurrect the authorization. This is the security boundary; the ledger in the
     // Chat page is only render-idempotence.
+    //
+    // **Carrier 4 — the ask is keyed on the AUTHOR, not the sender.** On a re-serve the DM arrives
+    // from peer C but answers an ask we recorded about peer A's collection, so the key must be the
+    // one the asker recorded: `ticket.author_npub` when present, else the DM sender (`None` means
+    // "the issuer's own collection" — exactly today's behaviour). Keying on the sender would make
+    // every re-serve claim fall through as `Unsolicited` and fail closed.
+    let expected_author = ticket.author_npub.clone().unwrap_or_else(|| npub.clone());
     let claim = store
         .claim_manifest_ask(
             &npub,
+            &expected_author,
             &ticket.slug,
             ticket.ask_nonce.as_deref().unwrap_or_default(),
             &ticket.request_id,
@@ -522,7 +530,12 @@ pub(crate) async fn redeem_manifest_ticket_inner(
             .map_err(|_| anyhow::anyhow!("the manifest that arrived was not text"))?;
         imported = Some(
             accept_manifest_bytes(
-                &npub,
+                // Carrier 4: pin the author to the one the ticket names, not the DM sender. On a
+                // re-serve D receives A's envelope from C; pinning to C made `open_manifest`'s
+                // author check refuse every carrier-4 delivery. This also keys the CACHE by the
+                // resolved author, so a re-serve files A's manifest under A (not under C) — the
+                // cache write inside `accept_manifest_bytes` uses this same npub.
+                &expected_author,
                 Some(&ticket.slug),
                 raw,
                 newest_fingerprint.as_deref(),
@@ -561,6 +574,7 @@ pub(crate) async fn redeem_manifest_ticket_inner(
     // failure is loud rather than silent.
     if let Err(e) = store.spend_manifest_ask(
         &npub,
+        &expected_author,
         &ticket.slug,
         ticket.ask_nonce.as_deref().unwrap_or_default(),
     ) {
@@ -867,7 +881,7 @@ mod tests {
             let slug = "vault";
             let nonce = "nonce-1";
             store
-                .record_manifest_ask(npub, slug, "fp", "2026-01-01T00:00:00Z", nonce)
+                .record_manifest_ask(npub, npub, slug, "fp", "2026-01-01T00:00:00Z", nonce)
                 .unwrap();
 
             // First ticket: GRANTED the claim, then fails at the connect (nothing dialable) — the
@@ -885,7 +899,7 @@ mod tests {
                 !first.as_ref().unwrap_err().contains("already answering"),
                 "the first claim must be Granted, not refused: {first:?}"
             );
-            let ask = store.load_manifest_asks().unwrap().get(&format!("{npub}|{slug}")).unwrap().clone();
+            let ask = store.load_manifest_asks().unwrap().get(&format!("{npub}|{npub}|{slug}")).unwrap().clone();
             assert_eq!(ask.claimed_by.as_deref(), Some("req-A"), "the claim is durable on disk");
             assert!(!ask.spent, "a failed dial must not spend the ask");
 
@@ -900,7 +914,7 @@ mod tests {
             .await
             .expect_err("a second, different ticket must not take the same ask");
             assert_eq!(err, "Another link is already answering that request, so nothing was fetched.");
-            let ask = store.load_manifest_asks().unwrap().get(&format!("{npub}|{slug}")).unwrap().clone();
+            let ask = store.load_manifest_asks().unwrap().get(&format!("{npub}|{npub}|{slug}")).unwrap().clone();
             assert_eq!(ask.claimed_by.as_deref(), Some("req-A"), "a refused claim does not steal the ask");
 
             // The SAME ticket retries: granted again, proceeds to the connect. This is the pass
@@ -930,11 +944,11 @@ mod tests {
             let slug = "vault";
             let nonce = "nonce-1";
             store
-                .record_manifest_ask(npub, slug, "fp", "2026-01-01T00:00:00Z", nonce)
+                .record_manifest_ask(npub, npub, slug, "fp", "2026-01-01T00:00:00Z", nonce)
                 .unwrap();
             // Claim, then spend — the exact sequence a successful redemption leaves behind.
-            store.claim_manifest_ask(npub, slug, nonce, "req-A").unwrap();
-            store.spend_manifest_ask(npub, slug, nonce).unwrap();
+            store.claim_manifest_ask(npub, npub, slug, nonce, "req-A").unwrap();
+            store.spend_manifest_ask(npub, npub, slug, nonce).unwrap();
 
             let err = redeem(
                 npub,
@@ -946,6 +960,116 @@ mod tests {
             .await
             .expect_err("a spent ask must refuse even the ticket that spent it");
             assert_eq!(err, "You've already received this list. Ask again if you want a fresh copy.");
+        }
+
+        // ── Carrier 4 (QURATOR-79) — the redeem side's AUTHOR resolution ─────────────────────────
+        //
+        // Both tests are hermetic the same way `one_ask_admits_one_ticket` is: the ticket's address
+        // set carries nothing dialable, so a claim that is Granted proceeds to a connect that fails
+        // locally — no packet. What discriminates is WHICH key the claim resolved: an ask recorded
+        // for author A answers a ticket naming A (Granted → a dial error, not the claim refusal),
+        // and only that.
+
+        /// A re-serve redeem resolves the expected author from `ticket.author_npub`, not the DM
+        /// sender. The ask was recorded for `(sender C, author A, slug)` — the key the asker's side
+        /// writes via `build_manifest_request_for_author`. Keying the claim on the sender alone (the
+        /// pre-Carrier-4 shape) resolves `(C, C, slug)`, misses the ask, and every carrier-4
+        /// delivery fails closed as `Unsolicited`.
+        ///
+        /// MUTATION (P-10) — resolved by containing function: inside
+        /// `redeem_manifest_ticket_inner`, change
+        /// `let expected_author = ticket.author_npub.clone().unwrap_or_else(|| npub.clone());`
+        /// to `let expected_author = npub.clone();` → the claim resolves `(C, C, slug)`, misses the
+        /// recorded ask, and the `Unsolicited` assert below reds.
+        #[tokio::test]
+        async fn a_re_serve_redeem_resolves_the_author_from_the_ticket() {
+            let (_dir, store, identity, endpoint) = fixture();
+            let sender = "npub1server"; // peer C, who re-serves from its cache
+            let author = "npub1author"; // peer A, whose collection it is
+            let slug = "vault";
+            let nonce = "nonce-1";
+            // The asker's record: asked C for A's collection.
+            store
+                .record_manifest_ask(sender, author, slug, "fp", "2026-01-01T00:00:00Z", nonce)
+                .unwrap();
+
+            // A carrier-4 ticket: same shape the mint side stamps (`ticket.author_npub = Some(A)`).
+            let mut ticket: TransportTicket =
+                serde_json::from_str(&undialable_ticket("req-A", slug, Some(nonce))).unwrap();
+            ticket.author_npub = Some(author.to_string());
+            let err = redeem(
+                sender,
+                serde_json::to_string(&ticket).unwrap(),
+                &identity,
+                &store,
+                &endpoint,
+            )
+            .await
+            .expect_err("the undialable address can never deliver — but the CLAIM must be Granted");
+            assert_ne!(
+                err,
+                "That link doesn't answer a request you sent, so nothing was fetched.",
+                "the claim must resolve the author from the ticket, not the sender — got: {err}"
+            );
+            assert_ne!(
+                err,
+                "Another link is already answering that request, so nothing was fetched.",
+                "the claim must be Granted on the first ticket — got: {err}"
+            );
+            // And the claim was taken under the AUTHOR-scoped key, durably.
+            let asks = store.load_manifest_asks().unwrap();
+            let ask = asks.get(&format!("{sender}|{author}|{slug}")).unwrap();
+            assert_eq!(ask.claimed_by.as_deref(), Some("req-A"), "the claim landed on the author-scoped key");
+        }
+
+        /// The negative half of the boundary: an ask recorded for author A must NOT claim under a
+        /// key scoped to a different author. A ticket from C naming a DIFFERENT author B — the
+        /// cross-tenant collision shape — is `Unsolicited`, and nothing on disk moves.
+        ///
+        /// MUTATION (P-10) — resolved by containing function: inside `claim_manifest_ask`
+        /// (`store.rs`), replace the exact `manifest_ask_key(npub, author, slug)` lookup with an
+        /// author-BLIND fallback that matches any stored key sharing `(npub, slug)` (ignoring the
+        /// middle segment) → the ticket's claim resolves Granted on the asked-author's entry and the
+        /// `Unsolicited` assert below reds. (Verified: dropping the author from `manifest_ask_key`
+        /// alone does NOT redden this test — the lenient legacy widening then rewrites the collapsed
+        /// key back to the self spelling, so the ask still misses; that mutation reds the sibling
+        /// `a_re_serve_redeem_resolves_the_author_from_the_ticket` instead.)
+        #[tokio::test]
+        async fn a_re_serve_ask_does_not_claim_under_a_different_author() {
+            let (_dir, store, identity, endpoint) = fixture();
+            let sender = "npub1server";
+            let asked_author = "npub1author";
+            let other_author = "npub1other";
+            let slug = "vault";
+            let nonce = "nonce-1";
+            store
+                .record_manifest_ask(sender, asked_author, slug, "fp", "2026-01-01T00:00:00Z", nonce)
+                .unwrap();
+
+            // A ticket naming a DIFFERENT author than the one we asked about.
+            let mut ticket: TransportTicket =
+                serde_json::from_str(&undialable_ticket("req-X", slug, Some(nonce))).unwrap();
+            ticket.author_npub = Some(other_author.to_string());
+            let err = redeem(
+                sender,
+                serde_json::to_string(&ticket).unwrap(),
+                &identity,
+                &store,
+                &endpoint,
+            )
+            .await
+            .expect_err("a ticket for a different author's collection answers no ask of ours");
+            assert_eq!(
+                err,
+                "That link doesn't answer a request you sent, so nothing was fetched.",
+                "the author is part of the ask's identity — got: {err}"
+            );
+            // Nothing was claimed on any key for this sender/slug.
+            let asks = store.load_manifest_asks().unwrap();
+            assert!(
+                asks.values().all(|a| a.claimed_by.is_none()),
+                "a refused claim must not touch any ask: {asks:?}"
+            );
         }
 
         // ── send_full_list — the owner side's early guards ──────────────────────────────────────
