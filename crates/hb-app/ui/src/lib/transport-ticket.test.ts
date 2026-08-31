@@ -168,6 +168,8 @@ describe('RedemptionLedger', () => {
 
 describe('ticketAnswersOurAsk — the unsolicited-dial gate', () => {
 	const asks = { 'npub1owner|criterion': { nonce: 'n-abc' } };
+	// Carrier 4 — an ask scoped to a THIRD-party author: we asked npub1C for npub1A's "criterion".
+	const reServeAsks = { 'npub1C|npub1A|criterion': { nonce: 'n-rs' } };
 
 	/** **An IP-exposure control.** Redemption dials the peer and the card fires on render, so a
 	 *  ticket we did not provoke must never dial. */
@@ -210,6 +212,82 @@ describe('ticketAnswersOurAsk — the unsolicited-dial gate', () => {
 	it('is not fooled by inherited Object properties', () => {
 		expect(ticketAnswersOurAsk({}, 'npub1owner', 'constructor', 'n-abc')).toBe(false);
 		expect(ticketAnswersOurAsk({}, 'toString', 'constructor', 'n-abc')).toBe(false);
+	});
+
+	// ── Carrier 4 — the ask identity is (responder, author, slug, nonce) ────────────────────────
+	// Peer C can re-serve a manifest peer A authored, so an ask is scoped by the author too, and a
+	// re-serve ticket is redeemed on arrival exactly like an owner ticket — no more, no less.
+
+	/** The happy path that did not exist before: we asked C for A's manifest, C re-served it, and the
+	 *  ticket echoes the nonce we minted for exactly that ask. */
+	it('a re-serve ticket from C for an ask scoped to author A matches', () => {
+		expect(ticketAnswersOurAsk(reServeAsks, 'npub1C', 'criterion', 'n-rs', 'npub1A')).toBe(true);
+	});
+
+	/** **The whole point of the widening.** Without the author in the key, C's re-serve ticket would
+	 *  collide with any ask of ours that happens to share (C, slug, nonce-equivalent) — the
+	 *  cross-tenant collision. The nonce alone does not close it: the nonce is per-ask, not
+	 *  per-author, so two asks to C for two different authors' "criterion" carry two nonces, and
+	 *  nonce equality alone could still bind the WRONG ask's authorization to this ticket. */
+	it('a ticket from C carrying the WRONG author does not match', () => {
+		expect(ticketAnswersOurAsk(reServeAsks, 'npub1C', 'criterion', 'n-rs', 'npub1B')).toBe(false);
+		// And the ask recorded under the authorless key must not be redeemed by a re-serve ticket —
+		// that is the fallback the widening exists to close.
+		expect(
+			ticketAnswersOurAsk(asks, 'npub1owner', 'criterion', 'n-abc', 'npub1A'),
+		).toBe(false);
+	});
+
+	/** **Backward compatibility, and it is load-bearing.** An ask recorded WITHOUT an author is
+	 *  "the asked peer's own collection" — author === responder — so the owner-path ticket still
+	 *  matches it. Breaking this would break every owner-path ask recorded before Carrier 4. */
+	it('a legacy authorless ask still matches the owner-path ticket', () => {
+		expect(ticketAnswersOurAsk(asks, 'npub1owner', 'criterion', 'n-abc', undefined)).toBe(true);
+		expect(ticketAnswersOurAsk(asks, 'npub1owner', 'cookie', 'n-cookie', 'npub1owner')).toBe(
+			false,
+		); // no such ask
+		// The widened self-author spelling of the SAME owner ask — one identity, two spellings.
+		const selfAuthored = { 'npub1owner|npub1owner|criterion': { nonce: 'n-abc' } };
+		expect(
+			ticketAnswersOurAsk(selfAuthored, 'npub1owner', 'criterion', 'n-abc', 'npub1owner'),
+		).toBe(true);
+		expect(
+			ticketAnswersOurAsk(selfAuthored, 'npub1owner', 'criterion', 'n-abc', undefined),
+		).toBe(true);
+	});
+
+	/** The widened identity must never be EASIER to satisfy than the old one. Every fail-closed
+	 *  property of the narrow gate, re-run against the widened key shapes. */
+	it('fails closed on every ambiguity under the widened identity too', () => {
+		// Re-serve: trace not loaded, empty map, missing stored nonce, empty/missing ticket nonce.
+		expect(ticketAnswersOurAsk(null, 'npub1C', 'criterion', 'n-rs', 'npub1A')).toBe(false);
+		expect(ticketAnswersOurAsk({}, 'npub1C', 'criterion', 'n-rs', 'npub1A')).toBe(false);
+		expect(
+			ticketAnswersOurAsk({ 'npub1C|npub1A|criterion': {} }, 'npub1C', 'criterion', 'n-rs', 'npub1A'),
+		).toBe(false);
+		expect(ticketAnswersOurAsk(reServeAsks, 'npub1C', 'criterion', undefined, 'npub1A')).toBe(
+			false,
+		);
+		expect(ticketAnswersOurAsk(reServeAsks, 'npub1C', 'criterion', '', 'npub1A')).toBe(false);
+		// Nonce mismatch on the exact widened key.
+		expect(ticketAnswersOurAsk(reServeAsks, 'npub1C', 'criterion', 'attacker-chosen', 'npub1A')).toBe(
+			false,
+		);
+		// Prototype pollution, widened: the third segment must not be satisfied by inheritance.
+		expect(ticketAnswersOurAsk({}, 'npub1C', 'constructor', 'n-rs', 'toString')).toBe(false);
+	});
+
+	/** The ticket's author is part of the parsed binding, not just a gate argument — the page passes
+	 *  `tk.authorNpub` from the parsed DM body into the gate, so the parser must carry it through
+	 *  with the same strictness as `ask_nonce` (absent/empty ⇒ undefined ⇒ owner path). */
+	it('parseTransportTicket carries the author through', () => {
+		expect(parseTransportTicket(ticketBody({ author_npub: 'npub1A' }))).toMatchObject({
+			authorNpub: 'npub1A',
+		});
+		expect(parseTransportTicket(ticketBody())).toMatchObject({ authorNpub: undefined });
+		expect(parseTransportTicket(ticketBody({ author_npub: '' }))).toMatchObject({
+			authorNpub: undefined,
+		});
 	});
 });
 

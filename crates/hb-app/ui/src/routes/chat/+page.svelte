@@ -545,13 +545,18 @@
 		ticketNonce: string | undefined,
 		ticketJson: string,
 		requestId: string,
+		ticketAuthor?: string,
 	) {
 		void redemptionTick; // read so this re-evaluates when a redemption settles
 		// Trace not loaded yet (or its read failed): we cannot tell solicited from unsolicited, so we
 		// dial nothing AND say so honestly rather than accusing the sender. Recoverable — the loader
 		// above retries, and this re-evaluates when it lands.
 		if (manifestAsks === null) return { kind: 'unverified' } as const;
-		if (!npub || !ticketNonce || !ticketAnswersOurAsk(manifestAsks, npub, slug, ticketNonce)) {
+		if (
+			!npub ||
+			!ticketNonce ||
+			!ticketAnswersOurAsk(manifestAsks, npub, slug, ticketNonce, ticketAuthor)
+		) {
 			return { kind: 'unsolicited' } as const;
 		}
 		// Scope the claim to the ASK, not the ticket: one nonce must not authorize N concurrent dials
@@ -575,8 +580,14 @@
 		ticketNonce: string | undefined,
 		ticketJson: string,
 		requestId: string,
+		ticketAuthor?: string,
 	) {
-		if (!npub || !ticketNonce || !ticketAnswersOurAsk(manifestAsks, npub, slug, ticketNonce)) return;
+		if (
+			!npub ||
+			!ticketNonce ||
+			!ticketAnswersOurAsk(manifestAsks, npub, slug, ticketNonce, ticketAuthor)
+		)
+			return;
 		const ask = askIdentity(npub, slug, ticketNonce);
 		if (!redemptions.claimRetry(requestId, ask)) return;
 		redemptionTick += 1;
@@ -1507,6 +1518,7 @@
 												tk.askNonce,
 												msg.content,
 												tk.requestId,
+												tk.authorNpub,
 											)}
 											quarantined={false}
 											onretry={() =>
@@ -1516,6 +1528,7 @@
 													tk.askNonce,
 													msg.content,
 													tk.requestId,
+													tk.authorNpub,
 												)}
 										/>
 									{/if}
