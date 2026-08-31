@@ -218,45 +218,45 @@ mod tests {
         use crate::store::AskClaim;
         let (_dir, store) = store();
         store
-            .record_manifest_ask("npub1a", "criterion", "fp", "2026-01-01T00:00:00Z", "n-1")
+            .record_manifest_ask("npub1a", "npub1a", "criterion", "fp", "2026-01-01T00:00:00Z", "n-1")
             .unwrap();
 
         assert_eq!(
-            store.claim_manifest_ask("npub1a", "criterion", "n-1", "req-A").unwrap(),
+            store.claim_manifest_ask("npub1a", "npub1a", "criterion", "n-1", "req-A").unwrap(),
             AskClaim::Granted
         );
         // The same ticket may retry after a failed dial — that costs nothing and must stay possible.
         assert_eq!(
-            store.claim_manifest_ask("npub1a", "criterion", "n-1", "req-A").unwrap(),
+            store.claim_manifest_ask("npub1a", "npub1a", "criterion", "n-1", "req-A").unwrap(),
             AskClaim::Granted
         );
         // A DIFFERENT ticket echoing the same nonce is refused, however many the peer invents.
         for invented in ["req-B", "req-C", "req-D"] {
             assert_eq!(
-                store.claim_manifest_ask("npub1a", "criterion", "n-1", invented).unwrap(),
+                store.claim_manifest_ask("npub1a", "npub1a", "criterion", "n-1", invented).unwrap(),
                 AskClaim::ClaimedByAnother,
                 "a peer must not turn one ask into a dial per ticket"
             );
         }
 
         // Answered → spent, durably, so a restart cannot resurrect the authorization.
-        store.spend_manifest_ask("npub1a", "criterion", "n-1").unwrap();
+        store.spend_manifest_ask("npub1a", "npub1a", "criterion", "n-1").unwrap();
         assert_eq!(
-            store.claim_manifest_ask("npub1a", "criterion", "n-1", "req-A").unwrap(),
+            store.claim_manifest_ask("npub1a", "npub1a", "criterion", "n-1", "req-A").unwrap(),
             AskClaim::Spent
         );
 
         // A fresh ask is a fresh authorization: new nonce, claim and spent flags cleared.
         store
-            .record_manifest_ask("npub1a", "criterion", "fp", "2026-01-02T00:00:00Z", "n-2")
+            .record_manifest_ask("npub1a", "npub1a", "criterion", "fp", "2026-01-02T00:00:00Z", "n-2")
             .unwrap();
         assert_eq!(
-            store.claim_manifest_ask("npub1a", "criterion", "n-2", "req-E").unwrap(),
+            store.claim_manifest_ask("npub1a", "npub1a", "criterion", "n-2", "req-E").unwrap(),
             AskClaim::Granted
         );
         // …and the OLD nonce is dead.
         assert_eq!(
-            store.claim_manifest_ask("npub1a", "criterion", "n-1", "req-A").unwrap(),
+            store.claim_manifest_ask("npub1a", "npub1a", "criterion", "n-1", "req-A").unwrap(),
             AskClaim::Unsolicited
         );
     }
@@ -268,23 +268,23 @@ mod tests {
         use crate::store::AskClaim;
         let (_dir, store) = store();
         store
-            .record_manifest_ask("npub1a", "criterion", "fp", "2026-01-01T00:00:00Z", "n-1")
+            .record_manifest_ask("npub1a", "npub1a", "criterion", "fp", "2026-01-01T00:00:00Z", "n-1")
             .unwrap();
         assert_eq!(
-            store.claim_manifest_ask("npub1a", "criterion", "wrong", "r").unwrap(),
+            store.claim_manifest_ask("npub1a", "npub1a", "criterion", "wrong", "r").unwrap(),
             AskClaim::Unsolicited
         );
         assert_eq!(
-            store.claim_manifest_ask("npub1zzz", "criterion", "n-1", "r").unwrap(),
+            store.claim_manifest_ask("npub1zzz", "npub1zzz", "criterion", "n-1", "r").unwrap(),
             AskClaim::Unsolicited
         );
         assert_eq!(
-            store.claim_manifest_ask("npub1a", "other", "n-1", "r").unwrap(),
+            store.claim_manifest_ask("npub1a", "npub1a", "other", "n-1", "r").unwrap(),
             AskClaim::Unsolicited
         );
         // An empty nonce on either side never matches.
         assert_eq!(
-            store.claim_manifest_ask("npub1a", "criterion", "", "r").unwrap(),
+            store.claim_manifest_ask("npub1a", "npub1a", "criterion", "", "r").unwrap(),
             AskClaim::Unsolicited
         );
     }
@@ -297,24 +297,24 @@ mod tests {
     fn spending_an_ask_is_conditional_on_the_nonce_that_was_answered() {
         let (_dir, store) = store();
         store
-            .record_manifest_ask("npub1a", "criterion", "fp", "2026-01-01T00:00:00Z", "nonce-A")
+            .record_manifest_ask("npub1a", "npub1a", "criterion", "fp", "2026-01-01T00:00:00Z", "nonce-A")
             .unwrap();
         // The user re-asks while ticket A is still in flight — same key, new nonce.
         store
-            .record_manifest_ask("npub1a", "criterion", "fp", "2026-01-01T00:05:00Z", "nonce-B")
+            .record_manifest_ask("npub1a", "npub1a", "criterion", "fp", "2026-01-01T00:05:00Z", "nonce-B")
             .unwrap();
 
         // Ticket A now completes. It must NOT spend B's ask.
-        store.spend_manifest_ask("npub1a", "criterion", "nonce-A").unwrap();
+        store.spend_manifest_ask("npub1a", "npub1a", "criterion", "nonce-A").unwrap();
         let asks = store.load_manifest_asks().unwrap();
-        let kept = asks.get("npub1a|criterion").expect("the newer ask is still there");
+        let kept = asks.get("npub1a|npub1a|criterion").expect("the newer ask is still there");
         assert_eq!(kept.nonce, "nonce-B");
         assert!(!kept.spent, "an older completion must not spend the newer ask");
 
         // And the ask that IS answered is spent.
-        store.spend_manifest_ask("npub1a", "criterion", "nonce-B").unwrap();
+        store.spend_manifest_ask("npub1a", "npub1a", "criterion", "nonce-B").unwrap();
         assert!(
-            store.load_manifest_asks().unwrap()["npub1a|criterion"].spent,
+            store.load_manifest_asks().unwrap()["npub1a|npub1a|criterion"].spent,
             "one ask, one auto-dial — the answered ask is spent"
         );
     }
