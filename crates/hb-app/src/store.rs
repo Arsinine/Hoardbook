@@ -1281,6 +1281,15 @@ pub struct IssuedTicketRecord {
     pub consumed_at: Option<u64>,
     /// Payload size the receipt attested to. Provenance only.
     pub delivered_bytes: Option<usize>,
+    /// The `snapshot_fingerprint` of the cache entry this ticket re-serves, set at MINT time by
+    /// `send_cached_manifest` — the `(author_npub, slug, fingerprint)` triple the human approved on
+    /// the "send cached copy" click (QURATOR-79 Carrier 4). `None` means owner-issued: the payload is
+    /// rebuilt from the collection as it is NOW at redeem time (owner ruling ②), and the
+    /// cache-serving branch never engages. Optional-additive like `ask_nonce`: a record written
+    /// before this field loads as `None`, which IS the owner-issued case — fail closed by
+    /// construction, no `#[serde(default)]` needed for an `Option`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_fingerprint: Option<String>,
 }
 
 /// Drop the stalest consumed records until the map is within [`ISSUED_TICKET_CAP`]. Unspent tickets
@@ -2213,6 +2222,7 @@ mod tests {
                 redeemer_npub: "npub1race".into(),
                 consumed_at: None,
                 delivered_bytes: None,
+                served_fingerprint: None,
             })
             .unwrap();
 
@@ -2242,6 +2252,7 @@ mod tests {
                     redeemer_npub: "npub1other".into(),
                     consumed_at: None,
                     delivered_bytes: None,
+                    served_fingerprint: None,
                 })
                 .unwrap();
         });
