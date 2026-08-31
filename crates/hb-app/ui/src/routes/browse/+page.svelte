@@ -17,7 +17,7 @@
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote, arrangeItems, fileTypesPresent, type BrowseViewMode, type BrowseSortKey, type BrowseSortDir } from '$lib/browse-view.js';
 	import { deriveManifestAskState, ASK_TICK_MS, MANIFEST_ASKED_LINE, MANIFEST_ASK_AGAIN_LABEL, MANIFEST_ASK_AGAIN_COOLDOWN_TIP, MANIFEST_OPEN_CHAT_LABEL, MANIFEST_ASK_FAILED_LINE } from '$lib/manifest-ask.js';
-	import type { CachedPeer, Collection, DirectoryItem, Group } from '$lib/types.js';
+	import type { CachedPeer, Collection, DirectoryItem, Group, ImportedManifestProvenance } from '$lib/types.js';
 	import { groupByGroups, matchesQuery } from '$lib/contacts-view.js';
 	// M22 W3 — drag-to-group gesture primitives (shared with Contacts). Create is ALWAYS ADDITIVE.
 	// M22 W4 — drop onto an existing group heading: plain drop MOVES, Shift-drop ADDS (owner ruling
@@ -234,11 +234,8 @@
 					),
 				);
 			}
-			if (result.stale) {
-				toast('Imported an older version of this list. Ask the owner for a fresh manifest.', 'error');
-			} else {
-				toast('Full manifest imported');
-			}
+			const note = importToast(result);
+			toast(note.text, note.kind);
 		} catch (e) {
 			toast(String(e), 'error');
 		} finally {
@@ -725,6 +722,38 @@
 	function dropName(npub: string): string {
 		const c = $contacts.find((p) => p.npub === npub);
 		return c ? contactDisplayName(c) : shortNpub(npub);
+	}
+
+	// QURATOR-79 carrier 4 — the import result's provenance: a re-served copy names the peer that
+	// held it and when their cache was taken. The author's own clock is `manifest_imported_at`; this
+	// is the SERVING peer's clock, and it only exists when the copy was re-served.
+	function servingPeerName(npub: string): string {
+		const c = $contacts.find((p) => p.npub === npub);
+		return c ? contactDisplayName(c) : shortNpub(npub);
+	}
+
+	// The import toast, provenance-aware. The old copy ("Ask the owner for a fresh manifest") was
+	// wrong twice under carrier 4: the owner is offline (that's why a peer re-served it), and the
+	// user couldn't tell who served this or how old it is.
+	function importToast(result: { stale: boolean } & ImportedManifestProvenance): { text: string; kind: 'success' | 'error' } {
+		const reServed = result.served_by !== undefined;
+		if (result.stale && reServed) {
+			const who = servingPeerName(result.served_by!);
+			const when = result.cached_at !== undefined ? new Date(result.cached_at * 1000).toLocaleDateString() : null;
+			return {
+				text: when
+					? `Imported an older copy that ${who} had cached on ${when} — the owner is offline, so ask again once they're back.`
+					: `Imported an older copy from ${who}'s cache — the owner is offline, so ask again once they're back.`,
+				kind: 'error',
+			};
+		}
+		if (result.stale) {
+			return { text: 'Imported an older version of this list. Ask the owner for a fresh manifest.', kind: 'error' };
+		}
+		if (reServed) {
+			return { text: `Full manifest imported from ${servingPeerName(result.served_by!)}'s cached copy`, kind: 'success' };
+		}
+		return { text: 'Full manifest imported', kind: 'success' };
 	}
 
 	function registerUndo(label: string, inverses: import('$lib/drag-group.js').DropInverse[]) {
