@@ -32,6 +32,12 @@ export interface TransportTicket {
 	/** Unix seconds. Provenance and display only — **never an expiry input.** A ticket has no expiry
 	 *  by design, and `hb_core::ticket` has a test that reds if one is added. */
 	issuedAt: number;
+	/** Carrier 4 — the AUTHOR of the collection being served. Absent on a ticket minted before the
+	 *  field existed, and absent means **the issuer's own collection** (author === responder). The
+	 *  field is additive and optional, so `TICKET_V` stays 1 (owner ruling 2026-08-30) — and absence
+	 *  is not a downgrade: an authorless ticket can only ever answer an ask scoped to the issuer
+	 *  itself, never a re-serve ask. */
+	authorNpub?: string;
 }
 
 /** The `content.hb` discriminator for a ticket DM. Distinct from `manifest_request`'s, because the
@@ -63,6 +69,7 @@ export function parseTransportTicket(content: string): TransportTicket | null {
 		slug: o.slug,
 		issuedAt: typeof o.issued_at === 'number' ? o.issued_at : 0,
 		askNonce: typeof o.ask_nonce === 'string' && o.ask_nonce !== '' ? o.ask_nonce : undefined,
+		authorNpub: typeof o.author_npub === 'string' && o.author_npub !== '' ? o.author_npub : undefined,
 	};
 }
 
@@ -89,7 +96,7 @@ export type RedemptionState =
 	| { kind: 'unverified' };
 
 /** Does this ticket answer an ask **we** made? Compares the ticket's echoed nonce against the one
- *  stored in the local ask trace for `(npub, slug)`.
+ *  stored in the local ask trace for `(responder, author, slug)`.
  *
  *  **This is an IP-exposure control, and the nonce is what makes it one** (owner ruling ①,
  *  2026-07-31). Redeeming *dials the peer*, so it reveals our address; the card fires on render.
@@ -97,6 +104,12 @@ export type RedemptionState =
  *  which the peer can satisfy once and then exploit forever, minting fresh tickets with any
  *  `request_id` and **any node address of their choosing** and having us dial each one. `request_id`
  *  cannot close that: the OWNER mints it, so it proves nothing to us. Only a value we generated can.
+ *
+ *  Carrier 4 widens the identity from `(responder, slug, nonce)` to `(responder, author, slug,
+ *  nonce)`: peer C can re-serve a manifest that peer A authored, so the ask is scoped by the author
+ *  too. A ticket with no `author_npub` means **the issuer's own collection** — the lenient legacy
+ *  reading, and the reason an authorless ticket can only ever answer an owner-path ask, never a
+ *  re-serve one: absence is not a downgrade because there is no weaker behaviour to fall into.
  *
  *  Fails closed on every ambiguity — trace not loaded, no stored nonce (a pre-ruling ask), no nonce
  *  on the ticket (a pre-ruling owner), or a mismatch. The cost of failing closed is one re-ask; the
@@ -107,6 +120,7 @@ export function ticketAnswersOurAsk(
 	npub: string,
 	slug: string,
 	ticketNonce: string | undefined,
+	ticketAuthor?: string,
 ): boolean {
 	// Not loaded yet, or its read failed. Never read as "we asked" — a slow load must not become an
 	// open auto-dial window.
@@ -116,12 +130,27 @@ export function ticketAnswersOurAsk(
 	// loosened. Deleting it does NOT redden the suite — verified — so do not read its presence as the
 	// thing enforcing this case.
 	if (!ticketNonce) return false;
-	const entry = Object.prototype.hasOwnProperty.call(asks, `${npub}|${slug}`)
-		? asks[`${npub}|${slug}`]
-		: undefined;
-	const stored = entry?.nonce;
-	if (!stored) return false; // a pre-ruling ask carries no nonce and can no longer auto-dial
-	return stored === ticketNonce;
+	// Carrier 4 — normalize the ticket's author. Absent means the ISSUER'S OWN collection, not "any
+	// collection the issuer cares to re-serve": the author is part of the ask's identity on BOTH
+	// sides of the trace.
+	const author = ticketAuthor && ticketAuthor !== '' ? ticketAuthor : npub;
+	const candidates =
+		author === npub
+			? // Owner path: the same ask may be recorded under the pre-Carrier-4 authorless key OR the
+				// widened self-author spelling — two spellings of one identity, and each is still
+				// nonce-gated below, so trying both cannot widen what matches.
+				[`${npub}|${slug}`, `${npub}|${npub}|${slug}`]
+			: // Re-serve path: scoped to THIS author ONLY. It must never fall back to the authorless
+				// key — that fallback IS the cross-tenant collision (ask for A's manifest, redeem on a
+				// nonce minted for a different ask of ours, or the reverse).
+				[`${npub}|${author}|${slug}`];
+	for (const key of candidates) {
+		if (!Object.prototype.hasOwnProperty.call(asks, key)) continue;
+		const stored = asks[key]?.nonce;
+		// A pre-ruling ask carries no nonce and can no longer auto-dial — it matches nothing.
+		if (stored && stored === ticketNonce) return true;
+	}
+	return false;
 }
 
 /** The identity of one ASK — the unit an authorization is actually scoped to.
