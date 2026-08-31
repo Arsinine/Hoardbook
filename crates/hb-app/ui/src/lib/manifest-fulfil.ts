@@ -24,14 +24,22 @@
 
 import type { Collection } from './types.js';
 import { parseManifestRequest, type ManifestRequest } from './request-inbox.js';
+import { shortNpub } from './contact-display.js';
 
-/** The five card states (spec W7.1b). Pure derivation from (request, own drafts). */
+/** The card states (five from spec W7.1b, plus carrier 4's `re-serve`). Pure derivation from
+ *  (request, own drafts).
+ *
+ *  Carrier 4 (QURATOR-79): `authorNpub` on a state is the third-party author the request named, or
+ *  undefined for the asked peer's own collection (the only shape before carrier 4). It is carried,
+ *  not acted on, by the derivation — the re-serve decision belongs to the human reading the card,
+ *  and the state machine's job is to make sure the card says WHOSE list is being asked for. */
 export type ManifestFulfilState =
-	| { kind: 'public'; slug: string; stale: boolean }
-	| { kind: 'private'; slug: string }
-	| { kind: 'empty'; slug: string }
-	| { kind: 'missing'; slug: string }
-	| { kind: 'quarantine'; slug: string };
+	| { kind: 'public'; slug: string; stale: boolean; authorNpub?: string }
+	| { kind: 'private'; slug: string; authorNpub?: string }
+	| { kind: 'empty'; slug: string; authorNpub?: string }
+	| { kind: 'missing'; slug: string; authorNpub?: string }
+	| { kind: 'quarantine'; slug: string; authorNpub?: string }
+	| { kind: 're-serve'; slug: string; authorNpub: string };
 
 /** The card's resolution of a request against the owner's own drafts. `quarantined=true` short-
  *  circuits to the inert state regardless of slug match (Accept first, always — same rule as W3).
@@ -50,7 +58,16 @@ export function deriveManifestFulfil(
 	opts: { quarantined: boolean },
 ): ManifestFulfilState {
 	const slug = request.slug;
+	const authorNpub = request.authorNpub;
+	// Quarantine short-circuits FIRST, as ever — Accept comes before any state is judged (same rule
+	// as W3). What the quarantined card renders is the hint's copy (request-inbox.ts), which already
+	// names the third-party author, so the pre-Accept read stays honest without a verb here.
 	if (opts.quarantined) return { kind: 'quarantine', slug };
+	// A third-party-author ask is a RE-SERVE: the peer wants an envelope this owner never authored —
+	// it lives in the owner's manifest cache (put there by browsing that author), not in the drafts
+	// the slug-match below walks. So the own-draft resolution only applies to the own-collection ask;
+	// a re-serve ask is always derived as `re-serve` and judged by the human on the card.
+	if (authorNpub) return { kind: 're-serve', slug, authorNpub };
 	const draft = drafts.find((c) => c.slug === slug);
 	if (!draft) return { kind: 'missing', slug };
 	// Absent visibility ⇒ Public (pre-M10 default). Only an EXPLICIT 'Private' is refused.
@@ -105,3 +122,11 @@ export const MANIFEST_BIG_RELAY_HINT =
 
 /** The muted one-liner linking to the Settings field, when no big relay is configured. */
 export const MANIFEST_BIG_RELAY_LINK = 'Add a big relay in Settings to publish the rest for them.';
+
+/** Carrier 4 (QURATOR-79) — the re-serve ask's inert explanatory line, shown when the request names
+ *  a third-party author. The peer is asking for someone else's list from this owner's cache: the
+ *  serve is a cache read (not a build), and only the owner can say whether they still hold a copy.
+ *  Kept honest in the family voice: it names the LIST as what crosses, never the files (MAS-INV-5 +
+ *  INV-4, same as every line above). */
+export const MANIFEST_RESERVE_LINE = (authorNpub: string) =>
+	`They're asking for a list ${shortNpub(authorNpub)} made — say the word and it goes from your cache.`;
