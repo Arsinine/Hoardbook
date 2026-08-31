@@ -619,6 +619,7 @@ async fn approve_request(
         redeemer_npub: asker_npub.to_string(),
         consumed_at: None,
         delivered_bytes: None,
+        served_fingerprint: None,
     })?;
 
     // (6) DM the ticket to the asker via the production NIP-17 path (send_dm_inner). This is the

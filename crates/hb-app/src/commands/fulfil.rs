@@ -197,6 +197,7 @@ pub(crate) async fn send_full_list_inner(
             redeemer_npub,
             consumed_at: None,
             delivered_bytes: None,
+            served_fingerprint: None,
         })
         .map_err(cmd_err)?;
     tracing::debug!(
@@ -226,6 +227,192 @@ pub(crate) async fn send_full_list_inner(
         "fulfil: send_full_list complete — ticket DM delivered"
     );
     Ok(())
+}
+
+/// **Carrier 4 (QURATOR-79) — the re-serving half.** Mint a ticket for a CACHED copy of a peer's
+/// manifest this node holds, answering a peer's "please send me the full list" ask out of the
+/// manifest cache instead of out of this node's own collections.
+///
+/// The ordering is [`send_full_list`]'s, with one substitution at step (1) and one extra fence:
+///
+/// 1. **The envelope is read from the cache and its author verified BEFORE anything is promised.**
+///    `verify_author` runs here, at MINT time, against the *requested* author — the §2 C-side
+///    provenance fence. Without it a D asking for `(author = A, slug = s)` could be served B's
+///    same-slug envelope: D's own gate would refuse it (author pin), so this is not a disclosure
+///    hole, but C would have spent a ticket on a delivery that can never land. Resolving the cache
+///    entry here — once, under the human's "Send cached copy" click — is also what
+///    `IssuedTicketRecord.served_fingerprint` records: serve time (`StoreManifestSource::payload`)
+///    replays this decision instead of re-guessing "newest for slug".
+/// 2. **The record is persisted before the DM**, as ever — a redeemer always presents a ticket this
+///    node can recognise, and the reverse order is indistinguishable from a forgery. An orphaned
+///    record (the DM then failed) is inert: nobody holds the matching ticket.
+///
+/// The served envelope is the one already in the cache, so no manifest is built here and the
+/// ceiling cannot be exceeded — `ManifestPayload::seal` re-checks it at serve time regardless.
+///
+/// **A marshalling shim only** — the behaviour is [`send_cached_manifest_inner`], same split as the
+/// other two commands, so the harness drives the real body.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn send_cached_manifest(
+    npub: String,
+    author_npub: String,
+    slug: String,
+    ask_nonce: Option<String>,
+    identity: State<'_, SharedIdentity>,
+    store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
+    endpoint: State<'_, SharedEndpoint>,
+) -> CmdResult<()> {
+    send_cached_manifest_inner(npub, author_npub, slug, ask_nonce, &identity, &store, &relay, &endpoint)
+        .await
+}
+
+/// The whole of `send_cached_manifest`'s behaviour, callable without a Tauri runtime.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_cached_manifest_inner(
+    npub: String,
+    author_npub: String,
+    slug: String,
+    ask_nonce: Option<String>,
+    identity: &SharedIdentity,
+    store: &DataStore,
+    relay: &SharedRelay,
+    endpoint: &SharedEndpoint,
+) -> CmdResult<()> {
+    let recipient = crate::commands::chat::parse_recipient(&npub)?;
+    // The requested author: whose collection the asker asked about. This is the npub the envelope's
+    // author is pinned against below — never `None`, never "whoever's envelope is handy".
+    let expected_author = crate::commands::chat::parse_recipient(&author_npub)
+        .map_err(|e| format!("Invalid author: {e}"))?;
+    let author_npub = crate::commands::chat::npub_of(&expected_author);
+    let (id_clone, browse_key, transport_key, own_npub) = {
+        let guard = identity.read().await;
+        let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
+        (id.identity.clone(), id.browse_key.clone(), id.transport_key.clone(), id.npub())
+    };
+    if crate::commands::chat::is_self_send(&recipient, &id_clone.public_key()) {
+        return Err("You can't send a cached list to yourself.".into());
+    }
+    let recipient_npub = crate::commands::chat::npub_of(&recipient);
+
+    // (1) Resolve the cache entry and verify its author, before the endpoint binds or a ticket
+    // exists. This scan is the read-only half — the ONLY production writer of the cache is
+    // `accept_manifest_bytes` in `commands/browse.rs` (CI sweep).
+    let cache_dir = store.manifest_cache_dir();
+    let Some((fingerprint, envelope)) = newest_cached_for(&cache_dir, &author_npub, &slug) else {
+        return Err(format!(
+            "You don't have a cached copy of '{slug}' from that peer, so it can't be re-sent."
+        ));
+    };
+    envelope
+        .verify_author(&expected_author)
+        .map_err(|e| format!("That cached copy could not be verified as this peer's ({e})."))?;
+    tracing::debug!(
+        recipient = %crate::logging::trunc_npub(&recipient_npub),
+        author = %crate::logging::trunc_npub(&author_npub),
+        slug = %slug,
+        fingerprint = %fingerprint,
+        "fulfil: send_cached_manifest — author verified against the requested peer, minting"
+    );
+
+    let source: Arc<dyn crate::transport::ManifestSource> = StoreManifestSource::new(
+        (*store).clone(),
+        id_clone.clone(),
+        browse_key.clone(),
+    );
+    let ep = ensure_endpoint(endpoint, &own_npub, identity, &transport_key, source, Role::Listen)
+        .await
+        .map_err(|e| {
+            format!("Could not start the transport ({e}). Export the list instead: Home → ⋯ → Export.")
+        })?;
+
+    let request_id = new_request_id();
+    let mut ticket =
+        issue_ticket(&ep, &request_id, &slug, now_secs(), ask_nonce.as_deref()).map_err(cmd_err)?;
+    // The carrier-4 mark: `author_npub` names whose collection this re-serves (None = the issuer's
+    // own, the `send_full_list` case), and `served_fingerprint` is the exact cache entry resolved
+    // above — recorded at MINT time so serve time replays this decision rather than re-resolving.
+    ticket.author_npub = Some(author_npub.clone());
+
+    // (2) Record before the DM — same canonicalization note as `send_full_list_inner`.
+    let redeemer_npub = crate::commands::chat::npub_of(&recipient);
+    store
+        .record_issued_ticket(&IssuedTicketRecord {
+            ticket: ticket.clone(),
+            redeemer_npub,
+            consumed_at: None,
+            delivered_bytes: None,
+            served_fingerprint: Some(fingerprint),
+        })
+        .map_err(cmd_err)?;
+    tracing::debug!(
+        recipient = %crate::logging::trunc_npub(&recipient_npub),
+        slug = %slug,
+        request_id = %request_id,
+        "fulfil: cached re-serve record persisted — publishing the ticket DM"
+    );
+
+    let body = serde_json::to_string(&ticket).map_err(cmd_err)?;
+    let own = crate::net::relay_urls(store);
+    let client = crate::net::client(&id_clone, store, relay).await.map_err(cmd_err)?;
+    crate::commands::chat::send_dm_inner(
+        &client,
+        &id_clone,
+        &recipient,
+        &body,
+        &own,
+        crate::net::RELAY_TIMEOUT,
+    )
+    .await
+    .map_err(cmd_err)?;
+    tracing::info!(
+        recipient = %crate::logging::trunc_npub(&recipient_npub),
+        slug = %slug,
+        request_id = %request_id,
+        "fulfil: send_cached_manifest complete — cached-copy ticket DM delivered"
+    );
+    Ok(())
+}
+
+/// Resolve the newest cache entry for `(author, slug)` by scanning the cache — a `CacheEntry`
+/// carries `npub`/`slug`/`fingerprint` in plaintext, so "newest" is a `last_access` max. Returns
+/// `(fingerprint, envelope)`. Read-only: this NEVER writes the cache.
+fn newest_cached_for(
+    dir: &std::path::Path,
+    author: &str,
+    slug: &str,
+) -> Option<(String, hb_core::manifest::ManifestEnvelope)> {
+    let mut best: Option<(u64, String, hb_core::manifest::ManifestEnvelope)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(parsed) = serde_json::from_slice::<CacheIndexEntry>(&bytes) else { continue };
+        if parsed.npub != author || parsed.slug != slug {
+            continue;
+        }
+        let Ok(env) = hb_core::manifest::ManifestEnvelope::from_json(&parsed.envelope) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(t, _, _)| parsed.last_access > *t) {
+            best = Some((parsed.last_access, parsed.fingerprint.clone(), env));
+        }
+    }
+    best.map(|(_, fp, env)| (fp, env))
+}
+
+/// The plaintext half of `manifest_cache::CacheEntry`, read here for scanning. A private struct
+/// twin, not a schema change: the fields are the cache's stable on-disk contract.
+#[derive(serde::Deserialize)]
+struct CacheIndexEntry {
+    npub: String,
+    slug: String,
+    fingerprint: String,
+    envelope: String,
+    last_access: u64,
 }
 
 /// **The asker's half.** Redeem a ticket that arrived by DM: dial the address it carries, fetch the
@@ -439,7 +626,7 @@ mod tests {
             .join("\n");
 
         for (cmd, inner) in
-            [("send_full_list", "send_full_list_inner"), ("redeem_manifest_ticket", "redeem_manifest_ticket_inner")]
+            [("send_full_list", "send_full_list_inner"), ("redeem_manifest_ticket", "redeem_manifest_ticket_inner"), ("send_cached_manifest", "send_cached_manifest_inner")]
         {
             let sig = format!("pub async fn {cmd}(");
             let at = code.find(&sig).unwrap_or_else(|| panic!("{cmd} not found"));

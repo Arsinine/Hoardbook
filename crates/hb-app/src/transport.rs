@@ -167,15 +167,19 @@ pub struct IssuedTicket {
 /// The owner side's seam onto app state. A trait so the plane is testable over real QUIC without
 /// Tauri, and so the plane itself holds no store handle.
 ///
-/// **Note what `payload` returns and does not take:** a [`ManifestPayload`] for a slug. There is no
-/// path parameter and no byte-slice parameter, so an implementation cannot answer with a collection
-/// file even if it wanted to — mechanism 1 reaching one layer up from the type into the seam.
+/// **Note what `payload` returns and does not take:** a [`ManifestPayload`] for a `request_id`.
+/// There is no path parameter and no byte-slice parameter, so an implementation cannot answer with a
+/// collection file even if it wanted to — mechanism 1 reaching one layer up from the type into the
+/// seam. The parameter is an opaque identifier, exactly as it was when it was a bare slug (a
+/// `request_id` string is no more of a byte-slice-or-path escape hatch than a slug string was):
+/// each implementation resolves its own payload from it — the owner path rebuilds from the
+/// collection as it is NOW, the carrier-4 re-serve path replays the mint-time cache decision.
 pub trait ManifestSource: Send + Sync + 'static {
     /// What we issued for `request_id`, or `None` if we issued nothing (an invented request id).
     fn issued(&self, request_id: &str) -> Option<IssuedTicket>;
 
-    /// The manifest for an authorized request.
-    fn payload(&self, slug: &str) -> Result<ManifestPayload>;
+    /// The manifest for an authorized request, resolved from the `request_id` the asker presented.
+    fn payload(&self, request_id: &str) -> Result<ManifestPayload>;
 
     /// Record the receipt, so a replay of the same ticket is refused by the next `issued` call.
     ///
@@ -311,7 +315,7 @@ pub(crate) async fn serve_manifest_stream(
         }
     };
 
-    let payload = match source.payload(&issued.ticket.slug) {
+    let payload = match source.payload(&req.request_id) {
         Ok(p) => p,
         Err(e) => {
             // The grant is dropped here without `into_consumed`, so the ticket is untouched and the
@@ -321,8 +325,9 @@ pub(crate) async fn serve_manifest_stream(
         }
     };
 
-    // **Bind the bytes to the ticket.** `ManifestSource::payload(slug)` is a naming convention, and
-    // a convention is not enforcement: a source that answers with collection B for a ticket naming
+    // **Bind the bytes to the ticket.** `ManifestSource::payload(request_id)` resolving to the
+    // right collection is a naming convention, and a convention is not enforcement: a source that
+    // answers with collection B for a ticket naming
     // collection A would otherwise be served, and the asker would accept it as self-consistent
     // (it *is* — it is a perfectly valid envelope for the wrong collection). A ticket names one
     // collection; the bytes must agree. Checked on both sides — see `fetch_over_connection`.
@@ -1075,12 +1080,12 @@ pub(crate) mod tests {
             })
         }
 
-        fn payload(&self, slug: &str) -> Result<ManifestPayload> {
+        fn payload(&self, request_id: &str) -> Result<ManifestPayload> {
             if let Some(rigged) = self.serve_instead.lock().unwrap().clone() {
                 return Ok(rigged);
             }
-            if slug != self.ticket.slug {
-                return Err(anyhow!("unknown collection {slug}"));
+            if request_id != self.ticket.request_id {
+                return Err(anyhow!("unknown request {request_id}"));
             }
             Ok(self.payload.clone())
         }
