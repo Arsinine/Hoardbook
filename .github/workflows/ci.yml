@@ -4,6 +4,22 @@ name: CI
 # shipped undetected because the hb-dpapi tests are `#[cfg(target_os = "windows")]`
 # and CI/dev ran only on Linux. Every `#[cfg(target_os = ...)]`-gated test must run
 # on its native runner, so a green Linux run is no longer treated as "tests pass".
+#
+# macOS is deliberately ABSENT from this matrix — removed 2026-08-31 (owner), applying the
+# QURATOR-131/132 ruling consistently: macOS is NOT SUPPORTED. release.yml dropped its macOS
+# legs on 2026-08-26 and this leg was the leftover.
+#
+# The rule above does NOT argue for keeping it, which is the trap to avoid: there are ZERO
+# `#[cfg(target_os = "macos")]`-gated TESTS. The only macOS-gated code is three lines in
+# commands/diagnostics.rs that shell out to `open`, plus a `not(target_os = "macos")` branch
+# in lib.rs — nothing a runner can exercise, so the leg proved only that three lines compile
+# for a platform that is never shipped. It also put a green "test (macos-latest)" check on
+# every PR, implying a support level that does not exist. Removing it costs nothing
+# measurable: the repo is public (no billing) and macOS was never the critical path
+# (4m03s vs windows-latest at 6m59s on run 33383190145).
+#
+# Do NOT re-add it as an oversight. QURATOR-132 is PARKED, not closed — if macOS is ever
+# un-parked, re-add this leg in the SAME change that restores the release legs.
 
 on:
   push:
@@ -20,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [windows-latest, macos-latest, ubuntu-latest]
+        platform: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
