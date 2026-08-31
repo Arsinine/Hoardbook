@@ -679,12 +679,24 @@ fn save_refreshed_contact(
 /// The result of importing a `.hbmanifest` file (M16 W4): the slug it upgrades, the full-tree
 /// `PeerCollection` (its `truncated`/`total_items` cleared — the fade lifts), and whether the
 /// manifest is older than the teaser the browser is showing (`stale` ⇒ "ask again", still imported).
+///
+/// Carrier 4 provenance: `served_by` names the peer whose cached copy arrived (None when the author
+/// served it directly) and `cached_at` is when that copy was taken. Additive optional fields — the
+/// envelope's own clock already surfaces as `collection.manifest_imported_at` (set in
+/// `open_manifest`), so these carry no second clock and no downgrade when absent.
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportedManifest {
     pub slug: String,
     pub collection: PeerCollection,
     pub created_at: u64,
     pub stale: bool,
+    /// The npub of the peer that served this copy (peer C in the carrier-4 relay), or `None` when
+    /// the author served it directly. Optional: absent on every pre-carrier-4 build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_by: Option<String>,
+    /// When the serving peer's cached copy was taken (unix seconds). `None` for a direct serve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_at: Option<u64>,
 }
 
 /// Upper bound on a manifest file / paste we will read before parsing. A single-ciphertext envelope
@@ -894,6 +906,8 @@ fn open_manifest(
         collection,
         created_at: envelope.created_at,
         stale,
+        served_by: None,
+        cached_at: None,
     })
 }
 
@@ -1271,6 +1285,75 @@ mod tests {
         assert!(
             resolve_from_cache(dir.path(), &id.public_key(), &npub, "criterion", &bk, &newer_teaser, 3).is_none(),
             "a newer teaser (different fingerprint) never hits the old cache entry",
+        );
+    }
+
+    // QURATOR-79 carrier 4, the P-13 discriminator: the test above pins the *attributes* of the
+    // gate (same-fp serves, different-fp doesn't), which stays green through a change that only
+    // alters the *shape* of the resolution. This one pins the property the design names — an older
+    // re-served copy lands BESIDE a newer teaser, never OVER it, across the whole cache lifecycle.
+    //
+    // Concretely: a peer re-serves an older manifest (older fingerprint, author-signed) while the
+    // browser is showing a newer teaser. Whatever `accept_manifest_bytes` does with that re-serve
+    // (it caches under the older key), a later `resolve_from_cache` against the NEWER teaser must
+    // still refuse it — the newer teaser's tree is never shadowed by the stale copy. And a return
+    // to the OLDER fingerprint must still resolve, so the refusal is a gate, not a wipe.
+    //
+    // MUTATION (P-10, for the orchestrator to apply and revert): the defense is LAYERED — the
+    // cache key includes the teaser's fingerprint (a different-fp teaser is a pure miss in
+    // `manifest_cache::get`), and the author-signed refusal gate inside `resolve_from_cache` is the
+    // second layer. Merely deleting that refusal block does NOT red this test (the keying already
+    // misses), which is the design's own point. The edit that must red it is the one that lets a
+    // MISMATCHED envelope through: in `resolve_from_cache` — the function starting
+    // `fn resolve_from_cache(` — change the `!=` in the refusal to `==`
+    // (`if envelope.snapshot_fingerprint == fingerprint { return None; }`). Resolve the target by
+    // its containing function, never by matching this text. That inversion serves ONLY the
+    // mismatched copy: the first assertion below (newer teaser, expects None) reds because the
+    // stale envelope now passes the gate, and the second (older teaser under its own fp, expects
+    // Some) reds because the matching copy is now refused — exactly the clobber the design forbids.
+    // (The existing `…gates_on_the_signed_fingerprint` test reds under it too; that is fine.)
+    #[test]
+    fn resolve_from_cache_never_clobbers_a_newer_teaser_with_an_older_re_serve() {
+        let dir = tempfile::tempdir().unwrap();
+        // Peer C's cached copy: an OLDER snapshot of the same collection (different fingerprint,
+        // validly signed by the author A).
+        let older_fp = "1111111111111111111111111111111111111111111111111111111111111111";
+        let newer_fp = "2222222222222222222222222222222222222222222222222222222222222222";
+        let (id, bk, old_env) = a_manifest("criterion", older_fp);
+        let npub = id.npub();
+        // The re-serve lands in the cache under its OWN (older) key — `accept_manifest_bytes`'s
+        // `manifest_cache::put` keys on the envelope's signed fingerprint, which is the point.
+        manifest_cache::put(
+            dir.path(), &npub, "criterion", older_fp, &old_env.to_json().unwrap(), 1,
+            manifest_cache::DEFAULT_MANIFEST_CACHE_BYTES,
+        )
+        .unwrap();
+
+        // The browser is showing a NEWER truncated teaser for the same collection.
+        let mut newer_meta = valid_meta("criterion");
+        newer_meta.insert("truncated".into(), serde_json::json!(true));
+        newer_meta.insert("snapshot_fingerprint".into(), serde_json::json!(newer_fp));
+        let newer_teaser = RenderedListing {
+            meta: newer_meta,
+            entries: vec![],
+            parts_total: 1,
+            parts_present: 1,
+            missing: vec![],
+        };
+        assert!(
+            resolve_from_cache(dir.path(), &id.public_key(), &npub, "criterion", &bk, &newer_teaser, 2).is_none(),
+            "an older re-served copy must never upgrade (shadow) a newer teaser",
+        );
+
+        // The same older copy, browsed under its own fingerprint, still resolves: the refusal is a
+        // gate on WHICH teaser is served, not a wipe of the cache entry.
+        let mut older_meta = valid_meta("criterion");
+        older_meta.insert("truncated".into(), serde_json::json!(true));
+        older_meta.insert("snapshot_fingerprint".into(), serde_json::json!(older_fp));
+        let older_teaser = RenderedListing { meta: older_meta, ..newer_teaser.clone() };
+        assert!(
+            resolve_from_cache(dir.path(), &id.public_key(), &npub, "criterion", &bk, &older_teaser, 3).is_some(),
+            "the older entry survives beside the newer one — beside, never over",
         );
     }
 

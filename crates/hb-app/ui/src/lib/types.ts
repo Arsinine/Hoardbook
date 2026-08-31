@@ -100,6 +100,17 @@ export interface Collection {
 	teaser_event_id?: string;
 }
 
+/** QURATOR-79 carrier 4 — the provenance half of an imported manifest's result. The base shape
+ *  (`slug`, `collection`, `created_at`, `stale`) lives in `api.ts::ImportedManifest`; this is the
+ *  additive-optional provenance mirror of the Rust `browse.rs::ImportedManifest` fields, absent on
+ *  every pre-carrier-4 serve. `servedBy` is the serving peer's npub (None ⇒ the author served it
+ *  directly); `cachedAt` is when that peer's cached copy was taken. The envelope's own clock is
+ *  `collection.manifest_imported_at` — there is no second one here. */
+export interface ImportedManifestProvenance {
+	served_by?: string;
+	cached_at?: number;
+}
+
 /** A trusted peer's decrypted Private collections, grouped by author npub (M10 browse). */
 export interface PrivatePeerCollections {
 	npub: string;
