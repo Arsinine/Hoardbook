@@ -1234,14 +1234,18 @@ impl DataStore {
     /// hand a peer a ticket this node cannot authorize, which is indistinguishable from a forgery. An
     /// orphaned record (the DM then failed) is harmless — nobody holds the ticket that matches it.
     ///
-    /// LRU-evicts the stalest **consumed** record when over [`ISSUED_TICKET_CAP`], never an unspent
-    /// one: evicting an unspent ticket would silently revoke an approval a human already gave, and
-    /// the asker would see the refusal reserved for a forgery.
+    /// **Nothing is ever evicted** (owner ruling 2026-09-01). This map previously LRU-dropped the
+    /// stalest *consumed* records past a 512 cap. Eviction was safe — an unknown `request_id` is
+    /// refused exactly like a forgery, see `StoreManifestSource::issued` — so the cap only ever
+    /// bounded the audit tail, and the owner ruled that history is worth keeping.
+    ///
+    /// ⚠ The map is loaded and rewritten whole on every mint, so retention is O(n) per issued
+    /// ticket. Under QURATOR-137's standing grants a record is minted per FETCH rather than per
+    /// human approval, which is when this cost becomes worth measuring.
     pub fn record_issued_ticket(&self, record: &IssuedTicketRecord) -> Result<()> {
         let _guard = ISSUED_TICKETS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut m = self.load_issued_tickets()?;
         m.insert(record.ticket.request_id.clone(), record.clone());
-        prune_issued_tickets(&mut m);
         self.save_issued_tickets(&m)
     }
 
@@ -1264,6 +1268,65 @@ impl DataStore {
         }
         Ok(())
     }
+
+    // ── Standing grants (QURATOR-137 slice 2) — the owner-approval half of the 2026-08-31 ruling:
+    //    manifest approval becomes a STANDING GRANT per (peer, collection), re-checked at redeem
+    //    time instead of being frozen into the ticket. This map is only the RECORD: it is written
+    //    when the owner approves and read by nothing that decides anything yet — slice 3 wires the
+    //    redeem-time consultation deliberately.
+    //
+    //    ⚠ Wording that must never attach to this feature: the redeem-time standing check is
+    //    revocation ON THIS NODE'S OWN ENDPOINT ONLY, never end-to-end. Since Carrier 4 a blocked
+    //    contact can still get the current manifest from a mutual contact's cache, and re-keying
+    //    does not help. A grant record is an authorization to serve, not a recall of bytes already
+    //    handed out.
+    pub fn standing_grants_path(&self) -> PathBuf {
+        self.base.join("standing_grants.json")
+    }
+
+    pub fn load_standing_grants(&self) -> Result<std::collections::HashMap<String, StandingGrant>> {
+        Ok(read_json_lenient::<std::collections::HashMap<String, StandingGrant>>(
+            &self.standing_grants_path(),
+        )
+        .context("loading standing grants")?
+        .unwrap_or_default())
+    }
+
+    pub fn save_standing_grants(
+        &self,
+        m: &std::collections::HashMap<String, StandingGrant>,
+    ) -> Result<()> {
+        write_json(&self.standing_grants_path(), m).context("saving standing grants")
+    }
+
+    /// Record that the owner approved serving `slug` to `npub` at `granted_at` (unix seconds).
+    /// Called at the approval click — the same place a ticket is minted — and an upsert: a
+    /// re-approval overwrites `granted_at`, because each click is a fresh human act.
+    ///
+    /// **Nothing is ever evicted — no cap, no pruning (owner ruling 2026-09-01, the same ruling
+    /// that removed `ISSUED_TICKET_CAP`).** Evicting a grant would silently revoke an approval a
+    /// human gave, and the peer would then see the refusal reserved for a forgery — an outcome no
+    /// cap ever justified. Do not invent an equivalent for grants.
+    pub fn record_standing_grant(&self, npub: &str, slug: &str, granted_at: u64) -> Result<()> {
+        let _guard = STANDING_GRANTS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut m = self.load_standing_grants()?;
+        m.insert(standing_grant_key(npub, slug), StandingGrant { granted_at });
+        self.save_standing_grants(&m)
+    }
+
+    /// The reader slice 3 will consult at redeem time: the grant for `(npub, slug)`, if the owner
+    /// ever approved one. **Nothing calls this to gate anything yet** (slice 2). A pure read — it
+    /// takes no lock, like `load_issued_ticket`.
+    ///
+    /// Uncalled outside `cfg(test)` until slice 3 lands, hence the `#[allow(dead_code)]` outside
+    /// `test` — the same shape as `save_published`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn standing_grant_for(&self, npub: &str, slug: &str) -> Result<Option<StandingGrant>> {
+        Ok(self
+            .load_standing_grants()?
+            .get(&standing_grant_key(npub, slug))
+            .cloned())
+    }
 }
 
 /// Serializes every load-modify-save of the issued-ticket map.
@@ -1283,9 +1346,37 @@ static ISSUED_TICKETS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// load→modify→save and lose the newer write entirely.
 static MANIFEST_ASKS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// How many issued-ticket records to keep. Only **consumed** records are eligible for eviction, so
-/// this bounds the audit tail rather than the set of live approvals.
-pub const ISSUED_TICKET_CAP: usize = 512;
+/// Serializes every load-modify-save of the standing-grant map (QURATOR-137 slice 2).
+///
+/// **One shared static, not one per function** — the same rule `ISSUED_TICKETS_LOCK` and
+/// `MANIFEST_ASKS_LOCK` above exist to enforce: a `static` declared inside a function body is its
+/// own distinct item, so two such locks never serialize against each other. Today only
+/// `record_standing_grant` mutates this map, but the lock is hoisted so the slice-3 writers inherit
+/// the serialized load→modify→save rather than re-learning the lost-write lesson.
+static STANDING_GRANTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The persisted record of one standing grant (QURATOR-137): the owner approved serving this
+/// collection to this peer. Keyed by (peer npub, collection slug) on disk.
+///
+/// **Only the approval is recorded here — standing is NOT a stored state.** The 2026-08-31 ruling
+/// re-checks standing at redeem time, so this record says "a human approved this", never "the peer
+/// may still be served". Slice 3 consults it; nothing reads it to decide anything yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StandingGrant {
+    /// Unix seconds of the approving click. A re-approval overwrites it.
+    pub granted_at: u64,
+}
+
+/// The on-disk key for a standing grant: `"{npub}|{slug}"` — same shape as `manifest_ask_key`
+/// (the pipe is unambiguous; npubs and slugs never contain `|`).
+pub fn standing_grant_key(npub: &str, slug: &str) -> String {
+    format!("{npub}|{slug}")
+}
+
+// The issued-ticket record map is UNBOUNDED (owner ruling 2026-09-01) — see
+// `DataStore::record_issued_ticket`. `ISSUED_TICKET_CAP` and `prune_issued_tickets` were removed
+// with it; eviction was never load-bearing (an unknown request_id is refused like a forgery), it
+// only discarded audit history.
 
 /// The persisted record of one approval: the ticket verbatim (so redemption compares against the
 /// exact bytes issued, not a reconstruction), who it was addressed to, and whether it has been spent.
@@ -1310,26 +1401,6 @@ pub struct IssuedTicketRecord {
     /// construction, no `#[serde(default)]` needed for an `Option`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub served_fingerprint: Option<String>,
-}
-
-/// Drop the stalest consumed records until the map is within [`ISSUED_TICKET_CAP`]. Unspent tickets
-/// are never candidates — see [`DataStore::record_issued_ticket`].
-pub(crate) fn prune_issued_tickets(m: &mut std::collections::HashMap<String, IssuedTicketRecord>) {
-    if m.len() <= ISSUED_TICKET_CAP {
-        return;
-    }
-    let mut spent: Vec<(String, u64)> = m
-        .iter()
-        .filter(|(_, r)| r.consumed_at.is_some())
-        .map(|(k, r)| (k.clone(), r.ticket.issued_at))
-        .collect();
-    spent.sort_by_key(|(_, issued_at)| *issued_at);
-    for (key, _) in spent {
-        if m.len() <= ISSUED_TICKET_CAP {
-            break;
-        }
-        m.remove(&key);
-    }
 }
 
 /// The persisted ask trace: `fingerprint_seen` (the snapshot fingerprint the requester observed when
@@ -2222,7 +2293,7 @@ mod tests {
         // their OWN `static ISSUED_TICKETS_LOCK` inside the function body — and a `static` inside a
         // function is its own distinct item, so the two never serialized against each other. Both do a
         // load→modify→save over the SAME `issued_tickets.json` map, so an interleaved approval (which
-        // inserts a fresh record for its OWN request_id and prunes) and a redemption receipt (which
+        // inserts a fresh record for its OWN request_id) and a redemption receipt (which
         // sets `consumed_at` on a DIFFERENT request_id) could each load the same stale map, apply
         // their own edit, and the save that lands second clobbers the other — reverting a just-written
         // `consumed_at` back to `None` (or dropping the newly-issued record). The hoisted module-level
@@ -2483,6 +2554,141 @@ mod tests {
         assert!(
             !store.manifest_asks_path().exists(),
             "manifest_asks.json must be removed by wipe()"
+        );
+    }
+
+    // ── Standing grants (QURATOR-137 slice 2) — record-only: nothing reads these to decide
+    //    anything yet; slice 3 wires the redeem-time consultation.
+
+    /// A grant round-trips through disk and — the property that matters — a FRESH `DataStore` on
+    /// the same directory reads it back, so the approval survives a restart. The reader
+    /// (`standing_grant_for`) is the slice-3 entry point and must read absent as `None`.
+    ///
+    /// MUTATION (P-10) — resolved by containing function: inside `record_standing_grant`, delete
+    /// the `self.save_standing_grants(&m)` call (replace with `Ok(())`) → nothing is persisted,
+    /// the fresh-store read comes back `None`, and the `expect("...")` on it reds.
+    #[test]
+    fn a_standing_grant_survives_a_restart_and_reads_absent_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        assert!(
+            store.standing_grant_for("npub1peer", "vault").unwrap().is_none(),
+            "no grant yet reads as None — the slice-3 default must be absent, not an error"
+        );
+
+        store.record_standing_grant("npub1peer", "vault", 1_700_000_000).unwrap();
+
+        // Same-process read-back…
+        let direct = store.standing_grant_for("npub1peer", "vault").unwrap();
+        assert_eq!(
+            direct.expect("the recorded grant reads back").granted_at,
+            1_700_000_000
+        );
+
+        // …and the restart: a fresh DataStore over the same base dir must see the SAME grant.
+        let restarted = DataStore::new(dir.path().to_path_buf());
+        let reread = restarted.standing_grant_for("npub1peer", "vault").unwrap();
+        assert_eq!(
+            reread.expect("the grant survives a restart — it is on disk").granted_at,
+            1_700_000_000,
+            "a fresh DataStore reads the persisted grant, not an empty map"
+        );
+    }
+
+    /// The grant identity is `(peer npub, collection slug)`: two peers for one slug and one peer
+    /// for two slugs stay distinct, and a re-approval OVERWRITES `granted_at` (each click is a
+    /// fresh human act).
+    ///
+    /// MUTATION (P-10) — resolved by containing function: inside `standing_grant_key`, emit
+    /// `format!("{slug}")` (drop the npub) → peerA and peerB's grants collide on one key,
+    /// `m.len()` becomes 1, and the length assert reds.
+    /// SECOND MUTATION (same test, separate edit — revert one at a time per the two-halves rule):
+    /// inside `record_standing_grant`, replace `m.insert(...)` with
+    /// `m.entry(key).or_insert(StandingGrant { granted_at })` → the re-approval no longer
+    /// overwrites, `granted_at` stays 111, and the overwrite assert reds.
+    #[test]
+    fn standing_grants_key_by_peer_and_slug_and_reapproval_overwrites() {
+        let (_dir, store) = test_store();
+        store.record_standing_grant("npub1peerA", "vault", 111).unwrap();
+        store.record_standing_grant("npub1peerB", "vault", 222).unwrap();
+        store.record_standing_grant("npub1peerA", "other", 333).unwrap();
+
+        let m = store.load_standing_grants().unwrap();
+        assert_eq!(m.len(), 3, "peer and slug are BOTH part of a grant's identity");
+        assert_eq!(m[&standing_grant_key("npub1peerA", "vault")].granted_at, 111);
+        assert_eq!(m[&standing_grant_key("npub1peerB", "vault")].granted_at, 222);
+        assert_eq!(m[&standing_grant_key("npub1peerA", "other")].granted_at, 333);
+        assert_eq!(standing_grant_key("npub1peerA", "vault"), "npub1peerA|vault");
+
+        // A re-approval is an upsert: the newest click wins.
+        store.record_standing_grant("npub1peerA", "vault", 999).unwrap();
+        let m = store.load_standing_grants().unwrap();
+        assert_eq!(
+            m[&standing_grant_key("npub1peerA", "vault")].granted_at,
+            999,
+            "a re-approval overwrites granted_at — still exactly one grant per (peer, slug)"
+        );
+        assert_eq!(m.len(), 3, "the re-approval overwrote in place, it did not append");
+    }
+
+    /// Pins AC-2: `record_standing_grant`'s lock is the MODULE-LEVEL `STANDING_GRANTS_LOCK`, not a
+    /// `static` declared inside the function. The forced rendezvous is the M19 W9 shape: the main
+    /// thread holds the shared static, a spawned `record_standing_grant` signals it has started
+    /// and then must be PARKED on that same lock until release.
+    ///
+    /// MUTATION (P-10) — resolved by containing function: inside `record_standing_grant`, stop
+    /// using the shared static — declare a FUNCTION-LOCAL one instead (the exact historical bug):
+    /// replace `let _guard = STANDING_GRANTS_LOCK.lock()...` with
+    /// `static LOCAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());`
+    /// `let _guard = LOCAL_LOCK.lock().unwrap_or_else(|p| p.into_inner());`
+    /// (leave the module-level static in place so this test still compiles and holds IT) → the
+    /// function acquires its own distinct item, the spawned record never blocks on the lock the
+    /// main thread holds, `record.is_finished()` becomes true, and the blocked assert reds.
+    #[test]
+    fn record_standing_grant_blocks_on_the_shared_module_level_lock() {
+        let (_dir, store) = test_store();
+        let store = std::sync::Arc::new(store);
+
+        // Hold the real shared lock on the main thread.
+        let real_guard = STANDING_GRANTS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store_rec = std::sync::Arc::clone(&store);
+        let started_clone = std::sync::Arc::clone(&started);
+        let record = std::thread::spawn(move || {
+            started_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            store_rec.record_standing_grant("npub1peer", "vault", 1).unwrap();
+        });
+
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Brief grace so a blocked thread is definitely parked, not just unscheduled.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !record.is_finished(),
+            "record_standing_grant must block on the shared module-level STANDING_GRANTS_LOCK — \
+             if it finished, its lock is a function-local static (AC-2)"
+        );
+
+        drop(real_guard);
+        record.join().unwrap();
+        assert_eq!(
+            store.standing_grant_for("npub1peer", "vault").unwrap().expect("written after release").granted_at,
+            1
+        );
+    }
+
+    #[test]
+    fn standing_grants_are_wiped_with_the_rest_of_the_profile() {
+        let (_dir, store) = test_store();
+        store.record_standing_grant("npub1peer", "vault", 1).unwrap();
+        assert!(store.standing_grants_path().exists());
+
+        store.wipe().unwrap();
+        assert!(
+            !store.standing_grants_path().exists(),
+            "standing_grants.json must be removed by wipe()"
         );
     }
 }

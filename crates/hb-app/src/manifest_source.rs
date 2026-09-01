@@ -84,7 +84,7 @@ impl ManifestSource for StoreManifestSource {
     /// **Built from the collection as it is NOW, not as it was at approval** (owner ruling ②,
     /// 2026-07-31). Tickets do not expire, so this can deliver a newer list than the owner reviewed.
     /// Ratified as intended: see `send_full_list`'s note for why freezing it would be worse.
-    /// Sealing is what applies the 8 MiB ceiling; an over-cap collection is refused here, before a
+    /// Sealing is what applies the 16 MiB ceiling; an over-cap collection is refused here, before a
     /// byte moves, by [`ManifestPayload::seal`].
     ///
     /// The parameter is the `request_id`, not the slug: the record keyed by it says WHICH kind of
@@ -355,29 +355,48 @@ mod tests {
         assert_eq!(contact_standing(&store, &npub), ContactStanding::Blocked);
     }
 
-    /// The cap bounds the audit tail, never the live approvals: over-cap pruning evicts consumed
-    /// records only, because evicting an unspent one silently revokes an approval a human gave and
-    /// the asker would then see the refusal reserved for a forgery.
+    /// Owner ruling 2026-09-01: the issued-ticket map is UNBOUNDED — no record is ever evicted,
+    /// spent or unspent. Eviction was never load-bearing (an unknown `request_id` is refused exactly
+    /// like a forgery, see [`StoreManifestSource::issued`]); the old 512 cap only discarded audit
+    /// history, and dropping an *unspent* one would have silently revoked a human's approval.
+    ///
+    /// Driven through the real `record_issued_ticket` path rather than a bare map, so it ends where
+    /// production ends: a reinstated prune anywhere in that call chain reds this test.
+    ///
+    /// MUTATION (P-10) — resolved by containing function: in `DataStore::record_issued_ticket`
+    /// (`store.rs`), re-add a truncation after the insert, e.g.
+    /// `if m.len() > 512 { let k = m.keys().next().cloned().unwrap(); m.remove(&k); }`.
+    /// The count assertion below reds.
     #[test]
-    fn pruning_never_evicts_an_unspent_ticket() {
-        let mut m = std::collections::HashMap::new();
-        for i in 0..(crate::store::ISSUED_TICKET_CAP + 50) {
+    fn no_issued_ticket_record_is_ever_evicted() {
+        let (_dir, store) = store();
+        const N: usize = 600; // comfortably past the 512 the removed cap used to enforce
+        for i in 0..N {
             let id = format!("req-{i}");
-            // Every record is UNSPENT and older than the last, so a naive LRU would evict the oldest.
-            m.insert(
-                id.clone(),
-                IssuedTicketRecord {
+            store
+                .record_issued_ticket(&IssuedTicketRecord {
                     ticket: TransportTicket::issue(&id, "slug", "addr", i as u64, None),
                     redeemer_npub: "npub-x".into(),
-                    consumed_at: None,
+                    // Half are CONSUMED — under the old cap these were exactly the eviction candidates.
+                    consumed_at: (i % 2 == 0).then_some(1_700_000_000),
                     delivered_bytes: None,
                     served_fingerprint: None,
-                },
-            );
+                })
+                .unwrap();
         }
-        let before = m.len();
-        crate::store::prune_issued_tickets(&mut m);
-        assert_eq!(m.len(), before, "no unspent approval may be dropped to make room");
+        // EVERY record, not a sample: an eviction policy drops arbitrary keys, so spot-checking a
+        // handful passes by luck. (Observed 2026-09-01 — the sampled version of this test survived
+        // a mutation that was evicting ~88 of the 600.)
+        let missing: Vec<usize> = (0..N)
+            .filter(|i| store.load_issued_ticket(&format!("req-{i}")).unwrap().is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} of {N} records were evicted (first few: {:?}) — the map must retain every record, \
+             consumed or not",
+            missing.len(),
+            &missing[..missing.len().min(5)]
+        );
     }
 
     // ── QURATOR-79 Carrier 4 — the cache-serving branch of `payload` ─────────────────────────────

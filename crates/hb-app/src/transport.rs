@@ -115,7 +115,7 @@ const REFUSAL_NO_MATCH: &str = "no approved manifest request matches this ticket
 const HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long the owner's side waits for the asker's acknowledgement after writing the payload.
-/// Generous: the asker has to read up to 8 MiB, parse it, and verify its integrity before it can
+/// Generous: the asker has to read up to 16 MiB, parse it, and verify its integrity before it can
 /// honestly ACK. A timeout is **not** a success — the ticket stays unspent.
 const ACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -1207,7 +1207,8 @@ pub(crate) mod tests {
     /// 10,000 is not arbitrary: it is the owner's stated human browse limit, the number MECH-2's
     /// ceiling was derived from. **Measured here, that shape is ~245 bytes of sealed envelope per
     /// entry, not the ~70 MECH-2 assumed** — realistic nested paths and long names cost more than
-    /// bare filenames. So 8 MiB carries ~33k such entries rather than ~75k. The ceiling still sits
+    /// bare filenames. So the 16 MiB ceiling carries ~68k such entries, well short of what the
+    /// ~70-byte assumption implied. The ceiling still sits
     /// comfortably above the browseable band, which is what it was pinned to; the headroom is just
     /// smaller than the derivation's arithmetic implied.
     #[tokio::test]

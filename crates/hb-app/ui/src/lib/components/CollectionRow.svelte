@@ -19,11 +19,10 @@
 		onrescan?: (collection: Collection) => void;
 		onedit?: (collection: Collection) => void;
 		onpublish?: (collection: Collection) => void;
-		onunpublish?: (collection: Collection) => void;
 		onremove?: (collection: Collection) => void;
 	}
 
-	let { collection, accessible, onrescan, onedit, onpublish, onunpublish, onremove }: Props = $props();
+	let { collection, accessible, onrescan, onedit, onpublish, onremove }: Props = $props();
 
 	let rowExpanded = $state(false);
 	let menuOpen = $state(false);
@@ -54,7 +53,6 @@
 		if (item.key === 'rescan') onrescan?.(collection);
 		else if (item.key === 'edit') onedit?.(collection);
 		else if (item.key === 'publish') onpublish?.(collection);
-		else if (item.key === 'unpublish') onunpublish?.(collection);
 		closeMenu();
 	}
 
@@ -118,7 +116,14 @@
 	{#each items as item (item.key)}
 		{#if item.key === 'remove'}
 			<div class="menu-item menu-item-confirm">
-				<ConfirmButton role="menuitem" label={item.label} onconfirm={handleRemoveConfirm} />
+				<ConfirmButton
+					role="menuitem"
+					label={item.label}
+					confirmText={collection.published
+						? 'Deletes your local record AND unpublishes. People who already fetched this collection keep their copy.'
+						: 'Deletes your local record. This cannot be undone.'}
+					onconfirm={handleRemoveConfirm}
+				/>
 			</div>
 		{:else}
 			<button type="button" role="menuitem" class="menu-item" onclick={() => handleItemClick(item)}>

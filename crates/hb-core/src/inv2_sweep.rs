@@ -16,7 +16,7 @@ use crate::binding::build_binding;
 use crate::event::{build_listing_event, build_teaser, Teaser};
 use crate::identity::Identity;
 use crate::listing::BrowseKey;
-use crate::priv_listing::seal_private_listing;
+use crate::priv_listing::{open_key_grant, seal_key_grant, seal_private_listing};
 use crate::sharecode::ShareCode;
 use crate::topic::{
     build_announce, build_public_join, mint_invite, new_topic, seal_announce, seal_membership,
@@ -107,6 +107,16 @@ fn no_public_event_broadcasts_the_browse_key_in_any_encoding() {
         events.push(("priv_listing::seal_private_listing", wrap));
     }
 
+    // Key grant (QURATOR-160) — THE headline surface for INV-2: the one event that deliberately
+    // CARRIES the fixed browse-key as its payload. It must reach the relay only through the full
+    // ECDH→NIP-44→seal→gift-wrap chain, so the wire bytes are scanned like every other event,
+    // and then unwrapped layer by layer below to prove each layer is actually ciphertext.
+    // A new wrap builder is ADDED here, never skipped.
+    for wrap in seal_key_grant(&me, &[peer.public_key()], &browse_key, NOW).expect("key grant seals")
+    {
+        events.push(("priv_listing::seal_key_grant", wrap));
+    }
+
     // ── The sweep: the browse-key must appear in NO event under NO encoding. ──
     for (builder, ev) in &events {
         let json = ev.as_json();
@@ -118,4 +128,55 @@ fn no_public_event_broadcasts_the_browse_key_in_any_encoding() {
             );
         }
     }
+
+    // ── INV-2, the layer-strip half (QURATOR-160): the wire scan above can only see the OUTER
+    // bytes. A dropped encryption one layer in (e.g. the NIP-44 key wrap replaced by plaintext)
+    // still hides the key under the seal + gift-wrap, so the scan alone is blind to it. Unwrap the
+    // grant as the recipient and assert the key appears in NO INTERMEDIATE layer a relay-side
+    // observer could ever obtain: not the outer 1059 content (relay-visible), and not the seal
+    // content (relay-visible). The rumor content and the key wrap are NOT obtainable without the
+    // recipient's secret key, so they are gated by round-trip instead: the opened key must equal
+    // the fixed browse-key through the full ECDH chain — which reds the moment the wrap stops
+    // being the NIP-44 wrap, because a recipient's `nip44::decrypt` on plaintext fails outright.
+    //
+    // ⚠ P-10 MUTATION RECIPE (orchestrator applies; do NOT trust this test red until seen):
+    //   file: crates/hb-core/src/priv_listing.rs, fn `seal_wrapped`, the per-recipient loop,
+    //   replace  `let wrapped_cek = nip44::encrypt(author_sk, r, cek_wrap, nip44::Version::V2)`
+    //            `.map_err(|e| HbError::Nostr(e.to_string()))?;`
+    //   with     `let wrapped_cek = cek_wrap.clone();`
+    //   (drop the per-recipient ECDH wrap; ship the wrap JSON as plaintext inside the seal).
+    //   This MUST redden this test at the layer-3 `.expect("the recipient opens its own grant")`
+    //   (the open fails: the wrap no longer decrypts) — note the wire-scan half above stays GREEN
+    //   under this mutation (the seal still encrypts the rumor), which is exactly why the
+    //   layer-strip half exists. It also reddens priv_listing's `key_grant_round_trip…` and every
+    //   private-listing round-trip. Revert and confirm green.
+    let grant_wraps =
+        seal_key_grant(&me, &[peer.public_key()], &browse_key, NOW).expect("key grant seals");
+    let grant = &grant_wraps[0];
+    // Layer 1 — the relay-visible outer 1059 content must not carry the key in any encoding.
+    for (encoding, needle) in &needles {
+        assert!(
+            !grant.content.contains(needle.as_str()),
+            "INV-2 LEAK: key-grant outer 1059 content carries the browse-key as {encoding}"
+        );
+    }
+    // Layer 2 — unwrap to the seal (needs the recipient key, so a relay cannot do this; the
+    // assertion documents that the seal content is ciphertext, not a plaintext key carrier).
+    let peer_sk = peer.keys().secret_key();
+    let seal_json = nip44::decrypt(peer_sk, &grant.pubkey, &grant.content)
+        .expect("the grant's outer layer unwraps for its recipient");
+    for (encoding, needle) in &needles {
+        assert!(
+            !seal_json.contains(needle.as_str()),
+            "INV-2 LEAK: key-grant seal content carries the browse-key as {encoding}"
+        );
+    }
+    // Layer 3 — the full open returns exactly the fixed key (delivery), via the verified chain.
+    let opened = open_key_grant(&peer, grant).expect("the recipient opens its own grant");
+    assert_eq!(opened.browse_key, browse_key, "the grant delivers the exact browse key");
+    assert_eq!(
+        opened.inner_author,
+        me.public_key(),
+        "the grant's inner author is the verified seal signer"
+    );
 }
