@@ -186,7 +186,7 @@ impl<'de> Deserialize<'de> for BoundedParts {
 pub struct ManifestPayload(Vec<u8>);
 
 /// Hand-written so a payload logs as its size, not its contents. A derived `Debug` prints every
-/// byte, which for this type means **up to 8 MiB of remote-supplied data into a log line or a test
+/// byte, which for this type means **up to 16 MiB of remote-supplied data into a log line or a test
 /// failure** — the derive turned one assertion message into 848 KB of decimal byte values.
 impl std::fmt::Debug for ManifestPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -375,7 +375,7 @@ mod tests {
         );
     }
 
-    /// **The part cap bounds the work an in-budget frame can demand.** A manifest well under 8 MiB
+    /// **The part cap bounds the work an in-budget frame can demand.** A manifest well under 16 MiB
     /// can still declare a colossal number of parts — each `String` costs far more in memory than in
     /// JSON — and `verify_integrity` only requires the vector to be non-empty. The envelope here is
     /// **honestly self-consistent**: built by the real constructor, so its `manifest_sha256` genuinely

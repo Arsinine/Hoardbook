@@ -584,7 +584,7 @@ async fn approve_request(
     use crate::commands::collection::build_slug_manifest;
     use hb_core::ManifestPayload;
 
-    // (1) Prove the manifest exists and fits (seal = the 8 MiB ceiling). Same check send_full_list
+    // (1) Prove the manifest exists and fits (seal = the 16 MiB ceiling). Same check send_full_list
     // runs before promising anything.
     let envelope =
         build_slug_manifest(slug, store, identity, browse_key.bytes()).map_err(|e| anyhow!("{e}"))?;

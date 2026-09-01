@@ -10,7 +10,12 @@ use hb_net::RelayClient;
 use crate::tap::TestResult;
 
 /// Presence online window (spec / TEST_PLAN §7: "presence online window 10 min").
-pub const ONLINE_WINDOW_SECS: u64 = 480; // tracks hb-app commands::online::ONLINE_WINDOW_SECS
+/// The app's online-freshness window. hb-it cannot depend on hb-app (the Tauri crate), so the value
+/// is restated — and pinned to hb-app's source by [`window_pin`], because a silently-restated
+/// constant is exactly how a window change leaves this harness green while production moves.
+/// Precedent: `suite_cap::ensure_budget_matches_hb_app`.
+pub const ONLINE_WINDOW_SECS: u64 = 480;
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -80,5 +85,23 @@ pub fn result(name: &str, r: Result<()>) -> TestResult {
     match r {
         Ok(()) => TestResult::ok(name),
         Err(e) => TestResult::fail(name, format!("{e:#}")),
+    }
+}
+
+#[cfg(test)]
+mod window_pin {
+    /// MUTATION (P-10) — resolved by containing item: change [`super::ONLINE_WINDOW_SECS`] to any
+    /// other value (or edit hb-app's declaration). The expectation is DERIVED from the local
+    /// constant, so either side moving alone reds this — which a hardcoded expected string would not.
+    #[test]
+    fn the_restated_online_window_matches_hb_app() {
+        const SRC: &str = include_str!("../../hb-app/src/commands/online.rs");
+        let decl = format!("pub const ONLINE_WINDOW_SECS: u64 = {};", super::ONLINE_WINDOW_SECS);
+        assert!(
+            SRC.contains(&decl),
+            "hb-app no longer declares `{decl}` — hb-it's restated online window has drifted from \
+             production, so every presence assertion in this harness describes a window the app \
+             does not use"
+        );
     }
 }

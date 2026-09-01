@@ -1234,14 +1234,18 @@ impl DataStore {
     /// hand a peer a ticket this node cannot authorize, which is indistinguishable from a forgery. An
     /// orphaned record (the DM then failed) is harmless — nobody holds the ticket that matches it.
     ///
-    /// LRU-evicts the stalest **consumed** record when over [`ISSUED_TICKET_CAP`], never an unspent
-    /// one: evicting an unspent ticket would silently revoke an approval a human already gave, and
-    /// the asker would see the refusal reserved for a forgery.
+    /// **Nothing is ever evicted** (owner ruling 2026-09-01). This map previously LRU-dropped the
+    /// stalest *consumed* records past a 512 cap. Eviction was safe — an unknown `request_id` is
+    /// refused exactly like a forgery, see `StoreManifestSource::issued` — so the cap only ever
+    /// bounded the audit tail, and the owner ruled that history is worth keeping.
+    ///
+    /// ⚠ The map is loaded and rewritten whole on every mint, so retention is O(n) per issued
+    /// ticket. Under QURATOR-137's standing grants a record is minted per FETCH rather than per
+    /// human approval, which is when this cost becomes worth measuring.
     pub fn record_issued_ticket(&self, record: &IssuedTicketRecord) -> Result<()> {
         let _guard = ISSUED_TICKETS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut m = self.load_issued_tickets()?;
         m.insert(record.ticket.request_id.clone(), record.clone());
-        prune_issued_tickets(&mut m);
         self.save_issued_tickets(&m)
     }
 
@@ -1283,9 +1287,10 @@ static ISSUED_TICKETS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// load→modify→save and lose the newer write entirely.
 static MANIFEST_ASKS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// How many issued-ticket records to keep. Only **consumed** records are eligible for eviction, so
-/// this bounds the audit tail rather than the set of live approvals.
-pub const ISSUED_TICKET_CAP: usize = 512;
+// The issued-ticket record map is UNBOUNDED (owner ruling 2026-09-01) — see
+// `DataStore::record_issued_ticket`. `ISSUED_TICKET_CAP` and `prune_issued_tickets` were removed
+// with it; eviction was never load-bearing (an unknown request_id is refused like a forgery), it
+// only discarded audit history.
 
 /// The persisted record of one approval: the ticket verbatim (so redemption compares against the
 /// exact bytes issued, not a reconstruction), who it was addressed to, and whether it has been spent.
@@ -1310,26 +1315,6 @@ pub struct IssuedTicketRecord {
     /// construction, no `#[serde(default)]` needed for an `Option`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub served_fingerprint: Option<String>,
-}
-
-/// Drop the stalest consumed records until the map is within [`ISSUED_TICKET_CAP`]. Unspent tickets
-/// are never candidates — see [`DataStore::record_issued_ticket`].
-pub(crate) fn prune_issued_tickets(m: &mut std::collections::HashMap<String, IssuedTicketRecord>) {
-    if m.len() <= ISSUED_TICKET_CAP {
-        return;
-    }
-    let mut spent: Vec<(String, u64)> = m
-        .iter()
-        .filter(|(_, r)| r.consumed_at.is_some())
-        .map(|(k, r)| (k.clone(), r.ticket.issued_at))
-        .collect();
-    spent.sort_by_key(|(_, issued_at)| *issued_at);
-    for (key, _) in spent {
-        if m.len() <= ISSUED_TICKET_CAP {
-            break;
-        }
-        m.remove(&key);
-    }
 }
 
 /// The persisted ask trace: `fingerprint_seen` (the snapshot fingerprint the requester observed when
@@ -2222,7 +2207,7 @@ mod tests {
         // their OWN `static ISSUED_TICKETS_LOCK` inside the function body — and a `static` inside a
         // function is its own distinct item, so the two never serialized against each other. Both do a
         // load→modify→save over the SAME `issued_tickets.json` map, so an interleaved approval (which
-        // inserts a fresh record for its OWN request_id and prunes) and a redemption receipt (which
+        // inserts a fresh record for its OWN request_id) and a redemption receipt (which
         // sets `consumed_at` on a DIFFERENT request_id) could each load the same stale map, apply
         // their own edit, and the save that lands second clobbers the other — reverting a just-written
         // `consumed_at` back to `None` (or dropping the newly-issued record). The hoisted module-level
