@@ -57,7 +57,10 @@ pub use fingerprint::{fingerprint, Fingerprint};
 pub use identity::Identity;
 pub use listing::{decrypt_listing, encrypt_listing, BrowseKey, ContentKey};
 pub use manifest::{build_manifest_envelope, ManifestEnvelope, MANIFEST_V};
-pub use priv_listing::{open_private_listing, seal_private_listing, OpenedPrivate, KIND_PRIV_LISTING};
+pub use priv_listing::{
+    open_key_grant, open_private_listing, seal_key_grant, seal_private_listing, seal_wrapped,
+    OpenedKeyGrant, OpenedPrivate, KIND_KEY_GRANT, KIND_PRIV_LISTING,
+};
 pub use ratelimit::{RelayRateLimiter, RELAY_WRITE_BURST, RELAY_WRITE_REFILL_PER_SEC};
 pub use ticket::{authorize_redemption, ContactStanding, TransportTicket, TICKET_V};
 pub use transport_payload::{

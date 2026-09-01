@@ -26,23 +26,38 @@ describe('collection-row-view', () => {
 		expect(deriveRowChip(col({ published: true }))).toBe('Published');
 	});
 
-	it('menuItems_show_publish_when_draft_and_unpublish_when_published', () => {
+	it('menuItems_show_publish_when_draft_and_no_unpublish_anywhere', () => {
 		const draftKeys = menuItems(col({ published: false })).map((i) => i.key);
 		expect(draftKeys).toContain('publish');
-		expect(draftKeys).not.toContain('unpublish');
 
+		// Publish stays available for a published row too — re-publishing is the normal
+		// parameterized-replaceable update path, and with Unpublish gone it is the only way to
+		// refresh a listing (QURATOR-138).
 		const publishedKeys = menuItems(col({ published: true })).map((i) => i.key);
-		expect(publishedKeys).toContain('unpublish');
-		expect(publishedKeys).not.toContain('publish');
+		expect(publishedKeys).toContain('publish');
 
 		// Always available regardless of state.
 		expect(draftKeys).toEqual(expect.arrayContaining(['rescan', 'edit', 'remove']));
+		// QURATOR-138 (owner ruling 2026-08-30): "Unpublish becomes DELETE. One destructive
+		// operation that removes the local record and zeroes the published event." There is no
+		// Unpublish affordance in ANY state — Delete is the single retract-and-remove verb.
+		expect(draftKeys).not.toContain('unpublish');
+		expect(publishedKeys).not.toContain('unpublish');
 		// QURATOR-138: the collections-list Export affordance is deleted (owner ask).
 		expect(draftKeys).not.toContain('export');
 		expect(publishedKeys).not.toContain('export');
-		// Unpublish deliberately REMAINS — held for an explicit owner ruling (INV-8: it is the
-		// only way to retract a published collection).
-		expect(publishedKeys).toContain('unpublish');
+	});
+
+	it('q138_the_remove_affordance_is_named_delete', () => {
+		// QURATOR-138 AC 5: the affordance is named Delete, not Unpublish — in BOTH states, since
+		// Delete is now the one operation (published collections retract + remove; drafts remove).
+		// Mutation to redden: change menuItems' `{ key: 'remove', label: 'Delete' }` label back to
+		// 'Remove' — both assertions fail.
+		for (const published of [false, true]) {
+			const labels = menuItems(col({ published })).filter((i) => i.key === 'remove');
+			expect(labels).toHaveLength(1);
+			expect(labels[0].label).toBe('Delete');
+		}
 	});
 
 	it('badges_include_sorted_and_private_when_set', () => {

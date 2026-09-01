@@ -26,6 +26,10 @@ fn event_kinds_are_frozen() {
     assert_eq!(event::KIND_TEASER, 30_117, "KIND_TEASER — {FREEZE}");
     assert_eq!(event::KIND_LISTING, 31_111, "KIND_LISTING — {FREEZE}");
     assert_eq!(priv_listing::KIND_PRIV_LISTING, 31_113, "KIND_PRIV_LISTING — {FREEZE}");
+    // ADDED (QURATOR-160), never bumped: the inner key-grant kind — sealed inside a NIP-59 wrap,
+    // never a top-level event, so adding it changes no existing wire traffic (no existing field's
+    // meaning moved; this is a new pin, which is the only edit wire_freeze permits).
+    assert_eq!(priv_listing::KIND_KEY_GRANT, 31_114, "KIND_KEY_GRANT — {FREEZE}");
     assert_eq!(topic::KIND_TOPIC_ANNOUNCE, 31_117, "KIND_TOPIC_ANNOUNCE — {FREEZE}");
     assert_eq!(topic::KIND_TOPIC_MEMBER, 31_118, "KIND_TOPIC_MEMBER — {FREEZE}");
     assert_eq!(topic::KIND_TOPIC_POST, 1_117, "KIND_TOPIC_POST — {FREEZE}");
@@ -73,7 +77,7 @@ fn manifest_transport_ceiling_is_frozen() {
 /// `hb-net::MAX_LISTING_PARTS`, the producer's own limit. hb-core cannot import it (no hb-net dep),
 /// so the number is duplicated — and a duplicated constant drifts unless something compares them.
 /// Too low and the transport refuses manifests this very app builds; too high and the cap stops
-/// bounding the work an 8 MiB frame can demand (millions of empty parts, hash honestly matching).
+/// bounding the work a 16 MiB frame can demand (millions of empty parts, hash honestly matching).
 #[test]
 fn manifest_transport_part_cap_matches_the_producer_cap() {
     assert_eq!(

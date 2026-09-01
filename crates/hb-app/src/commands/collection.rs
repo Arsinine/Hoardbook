@@ -369,16 +369,18 @@ pub async fn delete_collection(
     let safe_slug = is_valid_slug(&slug)
         .then_some(slug.as_str())
         .ok_or("Invalid collection slug")?;
-    // devtest #11: a published collection contributes to the profile teaser's content_types union and
-    // still has listing events on relays. Unpublish it first (NIP-09 delete + teaser content_types/tags
-    // recompute, both best-effort offline) so removal drops it from the public teaser AND from relays,
-    // then delete the local draft/marker.
+    // devtest #11 + QURATOR-138 (owner ruling 2026-08-30): a published collection contributes to
+    // the profile teaser's content_types union and still has listing events on relays. Unpublish it
+    // first (tombstone + NIP-09 delete + teaser content_types/tags recompute, all best-effort
+    // offline) so removal drops it from the public teaser AND from relays, then delete the local
+    // draft/marker — the local record goes too. INV-8: the caller (UI) must have confirmed.
     if store.is_published(safe_slug) {
-        let id_clone = {
+        let (id_clone, key_clone) = {
             let guard = identity.read().await;
-            guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?.identity.clone()
+            let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
+            (id.identity.clone(), *id.browse_key.bytes())
         };
-        unpublish_collection_inner(safe_slug, &store, &id_clone, &relay).await?;
+        unpublish_collection_inner(safe_slug, &store, &id_clone, &key_clone, &relay).await?;
     }
     store.delete_collection(safe_slug).map_err(cmd_err)
 }
@@ -945,6 +947,7 @@ pub(crate) async fn unpublish_collection_inner(
     slug: &str,
     store: &DataStore,
     identity: &Identity,
+    browse_key: &BrowseKey,
     relay: &SharedRelay,
 ) -> Result<(), String> {
     let safe_slug = is_valid_slug(slug).then_some(slug).ok_or("Invalid collection slug")?;
@@ -972,6 +975,19 @@ pub(crate) async fn unpublish_collection_inner(
                         }
                     }
                 }
+            }
+            // QURATOR-138 (owner ruling 2026-08-30) — the TOMBSTONE, published to the shared pool
+            // AFTER the NIP-09 loop above (the fetch would otherwise find our own tombstone and
+            // NIP-09-delete it). KIND_LISTING is parameterized-replaceable (`d` = slug), so a zeroed
+            // listing at `created_at = now` makes every conforming relay REPLACE the published
+            // listing — enforced, unlike the NIP-09 request a relay MAY ignore. It reaches clients
+            // that re-fetch; a peer who already fetched keeps their copy (the Delete confirmation
+            // says exactly that — never promise retraction the mechanism cannot deliver). Sealed
+            // under the SAME browse key so a share-code holder decrypts an empty collection rather
+            // than a locked one. Best-effort, same posture as the NIP-09 half.
+            if let Ok(tombstone) = hb_core::event::build_tombstone_event(identity, safe_slug, browse_key)
+            {
+                let _ = client.publish(&tombstone).await;
             }
         }
 
@@ -1023,6 +1039,14 @@ pub(crate) async fn unpublish_collection_inner(
                         }
                     }
                 }
+                // QURATOR-138: the tombstone goes to the big relay too — same relay the family was
+                // actually published to, AFTER the NIP-09 loop (the fetch above must not see and
+                // delete our own replacement event). Best-effort, identical posture to the pool half.
+                if let Ok(tombstone) =
+                    hb_core::event::build_tombstone_event(identity, safe_slug, browse_key)
+                {
+                    let _ = big_client.publish_to(&tombstone, &relays).await;
+                }
                 big_client.disconnect().await;
             }
         }
@@ -1039,11 +1063,12 @@ pub async fn unpublish_collection(
     identity: State<'_, SharedIdentity>,
     relay: State<'_, SharedRelay>,
 ) -> CmdResult<()> {
-    let id_clone = {
+    let (id_clone, key_clone) = {
         let guard = identity.read().await;
-        guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?.identity.clone()
+        let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
+        (id.identity.clone(), *id.browse_key.bytes())
     };
-    unpublish_collection_inner(&slug, &store, &id_clone, &relay).await
+    unpublish_collection_inner(&slug, &store, &id_clone, &key_clone, &relay).await
 }
 
 /// Set a collection's visibility (Public / Private). The selector default is Public; a collection
@@ -3183,8 +3208,9 @@ mod tests {
         assert!(store.is_published("films"));
 
         let identity = Identity::generate();
+        let bk: BrowseKey = rand::random();
         let relay = crate::net::new_shared();
-        unpublish_collection_inner("films", &store, &identity, &relay).await.unwrap();
+        unpublish_collection_inner("films", &store, &identity, &bk, &relay).await.unwrap();
 
         assert!(!store.is_published("films"), "the published marker must be gone");
         match crate::watch::evaluate_rescan("films", &store).unwrap() {
@@ -3212,8 +3238,9 @@ mod tests {
         store.save_published("vault", r#"{"private":true,"recipients":1}"#).unwrap();
 
         let identity = Identity::generate();
+        let bk: BrowseKey = rand::random();
         let relay = crate::net::new_shared();
-        unpublish_collection_inner("vault", &store, &identity, &relay).await.unwrap();
+        unpublish_collection_inner("vault", &store, &identity, &bk, &relay).await.unwrap();
 
         assert!(!store.is_published("vault"), "the published marker must be gone");
     }
@@ -3260,8 +3287,9 @@ mod tests {
 
         // Delete "films" exactly as `delete_collection` does for a published collection.
         let identity = Identity::generate();
+        let bk: BrowseKey = rand::random();
         let relay = crate::net::new_shared();
-        unpublish_collection_inner("films", &store, &identity, &relay).await.unwrap();
+        unpublish_collection_inner("films", &store, &identity, &bk, &relay).await.unwrap();
         store.delete_collection("films").unwrap();
 
         // The union — and the persisted teaser draft — no longer carry the deleted collection's type.
@@ -3555,8 +3583,9 @@ mod collection_command_guards_b {
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
         let identity = Identity::generate();
+        let bk: BrowseKey = rand::random();
         let relay = crate::net::new_shared();
-        let err = unpublish_collection_inner("../evil", &store, &identity, &relay)
+        let err = unpublish_collection_inner("../evil", &store, &identity, &bk, &relay)
             .await
             .unwrap_err();
         assert!(err.contains("Invalid collection slug"), "got: {err}");
@@ -3674,7 +3703,7 @@ mod collection_command_guards_c {
         assert_eq!(err, "No identity loaded. Generate a keypair first.");
     }
 
-    // -- update_collection_visibility (line 1052) --------------------------------------------
+// -- update_collection_visibility (line 1052) --------------------------------------------
 
     /// An alias that fails `is_valid_slug` is refused before any store access. Pins the guard at
     /// line 1059.
@@ -3752,4 +3781,172 @@ mod collection_command_guards_c {
         .unwrap_err();
         assert_eq!(err, "Collection 'no-such-collection' not found");
     }
+}
+
+
+/// QURATOR-138 — "Unpublish becomes DELETE" (owner ruling 2026-08-30): one destructive operation
+/// that removes the local record AND zeroes the published event (a tombstone KIND_LISTING at the
+/// same `d`, plus the existing best-effort NIP-09 request). These pins hold the local half; the
+/// wire half (a conforming relay actually replacing the listing) is `hb-wan-it`'s, owner-run.
+#[cfg(test)]
+mod q138_delete_pins {
+    use super::*;
+    use tauri::Manager;
+
+    fn guard_app_with_identity() -> (tempfile::TempDir, tauri::App<tauri::test::MockRuntime>) {
+        let app = tauri::test::mock_app();
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        // An unroutable relay: the best-effort wire attempts (NIP-09 + tombstone) fail fast
+        // without ever touching a real relay — these tests assert LOCAL effects only.
+        store
+            .save_settings(&crate::store::Settings {
+                relay_urls: vec!["ws://127.0.0.1:1".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        app.manage(store);
+        let identity: SharedIdentity = std::sync::Arc::new(tokio::sync::RwLock::new(Some(
+            crate::identity_state::AppIdentity::generate(),
+        )));
+        app.manage(identity);
+        app.manage(net::new_shared());
+        (dir, app)
+    }
+
+    fn make_draft(store: &DataStore, slug: &str) {
+        let col = Collection {
+            slug: slug.to_string(),
+            path_alias: slug.to_string(),
+            description: None,
+            item_count: 1,
+            est_size: None,
+            content_types: vec!["video".into()],
+            tags: vec![],
+            languages: vec![],
+            visibility: Visibility::Public,
+            sorted: false,
+            last_updated: chrono::Utc::now(),
+            listing: vec![],
+        };
+        store.save_collection_draft(&col).unwrap();
+    }
+
+// ── QURATOR-138 — Unpublish becomes DELETE (owner ruling 2026-08-30) ────────────────────
+
+/// AC: the tombstone the delete path publishes must be a real KIND_LISTING event — the same
+/// kind, the SAME `d` = slug, a zeroed payload, and `created_at = now` (never future-dated —
+/// strfry refuses future-dated writes, which would make the delete silently fail to publish).
+/// Built with the EXACT production function the delete path calls
+/// (`hb_core::event::build_tombstone_event`), so a production regression reds this.
+///
+/// Mutation to redden: in `crates/hb-core/src/event.rs`, change `build_tombstone_event` to sign
+/// `EventBuilder::new(Kind::from_u16(KIND_LISTING), "")` with NO `.tags(...)` — the
+/// `tags.identifier()` assertion fails; or in `tombstone_listing_json`, change `"entries": []`
+/// to `"entries": [{"name":"x"}]` — the `entries` assertion fails.
+#[test]
+fn tombstone_is_a_same_d_zeroed_listing_at_now() {
+    let id = Identity::generate();
+    let bk: BrowseKey = rand::random();
+    let ev = hb_core::event::build_tombstone_event(&id, "films", &bk).unwrap();
+    assert_eq!(ev.kind, Kind::from_u16(hb_core::event::KIND_LISTING), "same replaceable kind");
+    assert_eq!(ev.tags.identifier(), Some("films"), "same d — so a conforming relay REPLACES");
+    assert!(ev.created_at <= nostr::Timestamp::now(), "created_at must never be future-dated");
+    let (slug, json) = hb_core::event::parse_listing_event(&ev, &bk).unwrap();
+    assert_eq!(slug, "films");
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["entries"], serde_json::json!([]), "zeroed");
+    assert_eq!(v["item_count"], serde_json::json!(0), "zeroed");
+}
+
+/// AC: deleting a published collection destroys the LOCAL record completely — draft, published
+/// marker, share settings, scan spec, snapshot fingerprint — leaving nothing for auto-republish
+/// or the collections list to resurrect it from. `delete_collection` is called exactly as the
+/// UI calls it (the full command, identity loaded, unroutable relay so the best-effort wire
+/// side fails fast — local effects only; the wire half is `hb-wan-it`'s, owner-run).
+///
+/// Mutation to redden: in `delete_collection`, change the final
+/// `store.delete_collection(safe_slug).map_err(cmd_err)` to
+/// `store.delete_published(safe_slug).map_err(cmd_err)?;` (deleting only the marker) — the
+/// `load_collection_draft` assertion fails. (Flipping the `if store.is_published(...)` gate to
+/// `if false` does NOT red this test: the store method removes the published path anyway —
+/// marker removal is doubly covered, which is why the draft assertion is the discriminator.)
+#[tokio::test]
+async fn deleting_a_published_collection_destroys_the_local_record() {
+    let (_dir, app) = guard_app_with_identity();
+    let store = app.state::<DataStore>();
+    make_draft(&store, "films");
+    store.save_published("films", r#"{"parts":1}"#).unwrap();
+    assert!(store.is_published("films"), "premise: published before the delete");
+
+    delete_collection(
+        "films".into(),
+        app.state::<DataStore>(),
+        app.state::<SharedIdentity>(),
+        app.state::<SharedRelay>(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        store.load_collection_draft("films").unwrap().is_none(),
+        "the local draft record must be destroyed"
+    );
+    assert!(!store.is_published("films"), "the published marker must be destroyed");
+    assert!(!store.list_collection_slugs().unwrap().contains(&"films".to_string()));
+}
+
+/// AC 4: auto-publish must not resurrect a deleted collection. The owner named this trap: a
+/// delete that clears the published event while the local record survives gets undone by the
+/// next auto-publish tick. The watch's republish gate is `evaluate_rescan`, so the pin is:
+/// after `delete_collection`, `evaluate_rescan` must read **Skipped("not published")** — no
+/// republish can even be scheduled for the deleted slug, because there is neither marker nor
+/// draft nor scan spec left to act on.
+///
+/// Mutation to redden: in `watch.rs::evaluate_rescan`, invert the early-return gate — change
+/// `if !store.is_published(slug) { return Ok(RescanDecision::Skipped("not published".into())); }`
+/// to `if store.is_published(slug) { return Ok(RescanDecision::Skipped("not published".into())); }`.
+/// A deleted slug then walks past the gate; the scan spec this test sets up makes `rescan_listing`
+/// return a listing, so the decision becomes `Changed` and the `assert_eq!(reason, "not published")`
+/// panic fires. (No single delete-path edit reds this test — the marker is removed twice, once by
+/// `unpublish_collection_inner`'s `delete_published` and once by the store's own
+/// `delete_collection` — so the watch gate is the single attributable resurrection mechanism.)
+#[tokio::test]
+async fn delete_stops_the_watch_so_autopublish_cannot_resurrect() {
+    let (dir, app) = guard_app_with_identity();
+    let store = app.state::<DataStore>();
+    make_draft(&store, "films");
+    // A scan spec + fingerprint make the watch's republish path otherwise actionable — the
+    // strongest possible setup for a resurrection.
+    store
+        .save_scan_spec("films", &crate::store::ScanSpec {
+            root: dir.path().to_string_lossy().into_owned(),
+            include: vec![],
+            exclude: vec![],
+            total_bytes: 1,
+        })
+        .unwrap();
+    store.save_published("films", r#"{"parts":1}"#).unwrap();
+    assert!(store.is_published("films"));
+
+    delete_collection(
+        "films".into(),
+        app.state::<DataStore>(),
+        app.state::<SharedIdentity>(),
+        app.state::<SharedRelay>(),
+    )
+    .await
+    .unwrap();
+
+    // The auto-publish tick's exact gate: the watch cannot republish what is not published.
+    match crate::watch::evaluate_rescan("films", &store).unwrap() {
+        crate::watch::RescanDecision::Skipped(reason) => assert_eq!(
+            reason, "not published",
+            "the deleted collection must be out of the watch's scope entirely"
+        ),
+        other => panic!("a deleted collection must never be republishable, got {other:?}"),
+    }
+}
+
+
 }

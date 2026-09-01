@@ -25,7 +25,9 @@ use super::tap::Tap;
 
 /// Online freshness window — matches `commands::online::ONLINE_WINDOW_SECS` (480 s since the owner
 /// ruling of 2026-08-27; was 600 s).
-const ONLINE_WINDOW_SECS: u64 = 480;
+// Not restated: this suite is inside hb-app, so it uses production's constant directly. A copy
+// here could drift from the app it is meant to be testing.
+use crate::commands::online::ONLINE_WINDOW_SECS;
 /// A presence beacon TTL comfortably inside the freshness window.
 const PRESENCE_TTL_SECS: u64 = 30 * 60;
 /// Relay handshake/fetch timeout.
