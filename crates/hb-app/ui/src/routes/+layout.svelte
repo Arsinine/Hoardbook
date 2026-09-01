@@ -63,17 +63,22 @@
 		})();
 
 		// Update-available event from the backend background check.
+		// The `.catch` terminators on BOTH listen() chains below are LOAD-BEARING: outside Tauri —
+		// every jsdom mount of this layout that does not stub the event module — listen() REJECTS,
+		// and one unhandled rejection fails the whole vitest run even with every test green (25 of
+		// them, exit 1, 2026-09-01). Same shape Browse already carries for `manifest-progress`.
+		// Pinned by layout-listen-catch.test.ts.
 		let unlistenUpdate: (() => void) | undefined;
 		listen<string>('update-available', (event) => {
 			toast(`Update v${event.payload} is available. Install it from Settings.`, 'success');
-		}).then(fn => { unlistenUpdate = fn; });
+		}).then(fn => { unlistenUpdate = fn; }).catch(() => { });
 
 		// Direct DM received via iroh — refresh the inbox; the nav badge (derived from
 		// readWatermarks) picks up the new message on its own (devtest #16).
 		let unlistenDm: (() => void) | undefined;
 		listen<number>('dm-received', () => {
 			getMessages().then((msgs) => { inboxMessages.set(msgs); seedSentFromFeed(msgs, get(identity)?.npub ?? ''); }).catch(() => { });
-		}).then(fn => { unlistenDm = fn; });
+		}).then(fn => { unlistenDm = fn; }).catch(() => { });
 
 		// Background poll: keeps inboxMessages fresh. M12 W1 Decision B: skip the relay read while
 		// the window is hidden (tray/minimized) — no reconnect storm against a window nobody is
