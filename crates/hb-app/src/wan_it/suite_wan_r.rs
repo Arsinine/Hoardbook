@@ -51,6 +51,12 @@ const PRESENCE_TTL_SECS: u64 = 30 * 60;
 /// guaranteed not to route). The dead relay in the degraded set.
 const DEAD_RELAY: &str = "ws://192.0.2.1:7777";
 
+/// The ceiling `publish` actually waits per relay: nostr-relay-pool's `WAIT_FOR_OK_TIMEOUT`
+/// (`relay/constants.rs`, nostr-relay-pool 0.43.1). Our `RELAY_TIMEOUT` does NOT bound publish —
+/// `RelayClient::publish` → `send_event` → per-relay `wait_for_ok` uses this internal constant
+/// (QURATOR-168 hypothesis (b); see the R1 comment block below).
+const PUBLISH_OK_CEILING: Duration = Duration::from_secs(10);
+
 /// The bound for a degraded-set read (R1): the connect+publish+fetch must not be dragged by the dead
 /// relay. The hb-it twin (suite_relay::relay1) uses 25s against a localhost dead relay (port 1); the
 /// WAN version must account for real WAN connect latency on the live relay PLUS the dead-relay
@@ -95,6 +101,43 @@ pub async fn run(tap: &mut Tap, probe: &ProbeInput) {
 // A set of [live VPS, dead TEST-NET-1]: connect succeeds (one relay came up), and a publish+fetch
 // returns the live relay's result BOUNDED — it must not block on the dead relay for the full timeout
 // on every call (the rate-limit/half-open drag the devtest described).
+//
+// QURATOR-168 (2026-09-01): first completed live run measured 43.01s against the 40s bound. Three
+// hypotheses under investigation — do not re-derive them:
+//
+//   (a) Stage attribution is simply UNKNOWN — one wall-clock number covered connect+publish+fetch.
+//       This row now times each stage separately and reports all three on both the pass and fail
+//       paths; the breakdown is what resolves (a).
+//   (b) OUR OWN TIMEOUT PLUMBING (reading hb-net + nostr-relay-pool 0.43.1, no run needed):
+//         connect — `RelayClient::connect` (hb-net/src/client.rs:162) calls
+//             `client.try_connect(RELAY_TIMEOUT)`; pool `try_connect` joins per-relay attempts, so
+//             connect is bounded by the 15s RELAY_TIMEOUT while the dead relay's handshake times
+//             out.
+//         publish — `RelayClient::publish` (hb-net/src/client.rs:234) → `send_event` → pool
+//             `send_event_to` → per-relay `send_event` → `wait_for_ok(WAIT_FOR_OK_TIMEOUT)` with
+//             WAIT_FOR_OK_TIMEOUT = 10s (nostr-relay-pool-0.43.1/src/relay/constants.rs). OUR
+//             RELAY_TIMEOUT DOES NOT BOUND PUBLISH. The pool joins ALL relays' futures
+//             (`future::join_all`), so a dead relay can hold the publish open up to 10s — though
+//             `ensure_operational` normally errors a disconnected relay out fast, which is why
+//             publish may NOT be the eater.
+//         fetch   — `RelayClient::fetch` (hb-net/src/client.rs:342) passes RELAY_TIMEOUT through to
+//             `fetch_events`; per-relay `stream_events` opens an auto-closing subscription with
+//             `.timeout(Some(timeout))`, so fetch is bounded by the 15s RELAY_TIMEOUT per relay —
+//             and the pool-level driver joins ALL relay streams before the receiver closes, so the
+//             caller waits for the dead relay's 15s too, NOT just the live relay's EOSE
+//             (hypothesis (c), folded in here: it is join-all, not first-sufficient).
+//       ⚠ CONSTANT PROVENANCE (corrected): the 15s RELAY_TIMEOUT above is THIS HARNESS'S OWN
+//       (suite_wan_r.rs:42, matching WAN-P/WAN-U convention) — it is NOT an hb-net constant, and
+//       hb-net defines none. PRODUCTION's timeout is `hb_app::net::RELAY_TIMEOUT` = 10s
+//       (net.rs:34). So the 43s below describes THE HARNESS's worst case, not the app's; the app's
+//       equivalent cliff is 10+10+3+10 = 33s. Do not quote 15s as a production figure.
+//       Arithmetic: connect 15 + publish 10 + settle 3 + fetch 15 = 43s, matching the measured
+//       43.01s. If that attribution holds, DEGRADED_BOUND=40s is arithmetically unreachable under
+//       our own plumbing — an OWNER call (see the report), not something this row may change.
+//   (c) nostr-sdk's all-relays-vs-first-sufficient semantics: the reading in (b) says join-all
+//       (pool `send_event_to` joins every relay's send future; `stream_events_targeted`'s driver
+//       task joins every relay stream before the channel closes). The stage timings this row now
+//       prints confirm or refute that against the live relays.
 // ---------------------------------------------------------------------------
 
 async fn r1_degraded_set(probe: &ProbeInput) -> Result<(), String> {
@@ -109,10 +152,14 @@ async fn r1_degraded_set(probe: &ProbeInput) -> Result<(), String> {
     let client = RelayClient::connect(&alice, &set, RELAY_TIMEOUT)
         .await
         .map_err(|e| format!("R1 connect (degraded set [live, dead]): {e}"))?;
+    let t_connect = started.elapsed();
+    let t_publish_start = Instant::now();
     let beacon = build_binding(&alice, unix_now(), PRESENCE_TTL_SECS).map_err(|e| format!("R1 beacon: {e}"))?;
     client.publish(&beacon).await.map_err(|e| format!("R1 publish (accepted by the live relay): {e}"))?;
+    let t_publish = t_publish_start.elapsed();
     settle().await;
 
+    let t_fetch_start = Instant::now();
     let got = client
         .fetch(
             Filter::new().author(alice.public_key()).kind(Kind::from_u16(KIND_PRESENCE)),
@@ -120,8 +167,21 @@ async fn r1_degraded_set(probe: &ProbeInput) -> Result<(), String> {
         )
         .await
         .map_err(|e| format!("R1 fetch: {e}"))?;
+    let t_fetch = t_fetch_start.elapsed();
     let elapsed = started.elapsed();
     client.disconnect().await;
+
+    eprintln!(
+        "   R1 degraded-set stage breakdown: connect {:.2}s / publish {:.2}s / settle+fetch {:.2}s / total {:.2}s \
+         (budget {:.2}s, internal per-stage ceilings: connect+fetch {:.0}s RELAY_TIMEOUT, publish {:.0}s WAIT_FOR_OK_TIMEOUT)",
+        t_connect.as_secs_f64(),
+        t_publish.as_secs_f64(),
+        t_fetch.as_secs_f64(),
+        elapsed.as_secs_f64(),
+        DEGRADED_BOUND.as_secs_f64(),
+        RELAY_TIMEOUT.as_secs_f64(),
+        PUBLISH_OK_CEILING.as_secs_f64(),
+    );
 
     if got.is_empty() {
         return Err(format!(
@@ -130,9 +190,34 @@ async fn r1_degraded_set(probe: &ProbeInput) -> Result<(), String> {
         ));
     }
     if elapsed >= DEGRADED_BOUND {
+        let over = elapsed - DEGRADED_BOUND;
+        // Measured facts only: name each stage that ran past its own ceiling and by how much. Do not
+        // assert a cause for the overrun — which relay or op owned the time is not observable here.
+        let mut stages = Vec::with_capacity(3);
+        if t_connect > RELAY_TIMEOUT {
+            stages.push(format!("connect {:.2}s > {:.0}s RELAY_TIMEOUT by {:.2}s", t_connect.as_secs_f64(), RELAY_TIMEOUT.as_secs_f64(), (t_connect - RELAY_TIMEOUT).as_secs_f64()));
+        }
+        if t_publish > PUBLISH_OK_CEILING {
+            stages.push(format!("publish {:.2}s > {:.0}s WAIT_FOR_OK_TIMEOUT by {:.2}s", t_publish.as_secs_f64(), PUBLISH_OK_CEILING.as_secs_f64(), (t_publish - PUBLISH_OK_CEILING).as_secs_f64()));
+        }
+        if t_fetch > RELAY_TIMEOUT {
+            stages.push(format!("fetch {:.2}s > {:.0}s RELAY_TIMEOUT by {:.2}s", t_fetch.as_secs_f64(), RELAY_TIMEOUT.as_secs_f64(), (t_fetch - RELAY_TIMEOUT).as_secs_f64()));
+        }
+        if stages.is_empty() {
+            stages.push(format!(
+                "no single stage exceeded its own ceiling (connect {:.2}s / publish {:.2}s / fetch {:.2}s) — the sum with the {:.0}s settle overran the bound",
+                t_connect.as_secs_f64(),
+                t_publish.as_secs_f64(),
+                t_fetch.as_secs_f64(),
+                SETTLE.as_secs_f64(),
+            ));
+        }
         return Err(format!(
-            "R1 a dead relay dragged the read to {elapsed:?} (>= {DEGRADED_BOUND:?}) — not bounded. \
-             The half-open connection to {DEAD_RELAY} stalled every op."
+            "R1 degraded-set total {elapsed:?} (>= {DEGRADED_BOUND:?}, over by {over:?}). \
+             Stage timings: connect {t_connect:?}, publish {t_publish:?}, fetch {t_fetch:?} \
+             (settle adds {SETTLE:?}). Exceeded: {}. This is measurement, not attribution — \
+             consistent with, but not proof of, the dead relay {DEAD_RELAY} holding an op open.",
+            stages.join("; ")
         ));
     }
     eprintln!("   R1 degraded-set connect+publish+fetch completed in {:.2}s (bounded)", elapsed.as_secs_f64());
