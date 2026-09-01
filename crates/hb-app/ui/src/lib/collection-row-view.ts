@@ -17,20 +17,22 @@ export function deriveRowChip(col: Pick<Collection, 'published'>): RowChip {
 export type ExportFormat = 'text' | 'markdown' | 'manifest';
 
 export type RowMenuItem =
-	| { key: 'rescan' | 'edit' | 'publish' | 'unpublish' | 'remove'; label: string }
+	| { key: 'rescan' | 'edit' | 'publish' | 'remove'; label: string }
 	| { key: 'export'; label: string; submenu: { key: ExportFormat; label: string }[] };
 
-/** The overflow-menu items for a row, in display order. Publish/Unpublish is mutually exclusive by
- *  published state. */
+/** The overflow-menu items for a row, in display order. There is no Unpublish — QURATOR-138
+ *  (owner ruling 2026-08-30): "Unpublish becomes DELETE. One destructive operation that removes
+ *  the local record and zeroes the published event." Delete is the single retract+remove
+ *  affordance, confirmed before it runs (INV-8). The `published` flag now picks only the Delete
+ *  confirm copy (retraction wording for published rows) — see CollectionRow.svelte. */
 export function menuItems(col: Pick<Collection, 'published'>): RowMenuItem[] {
 	// QURATOR-138: the Export entry (and its text/markdown/manifest submenu) is deleted — owner:
-	// "Delete the … export buttons in collections as well." Unpublish stays pending an explicit
-	// owner ruling (INV-8: it is currently the only way to retract a published collection).
+	// "Delete the … export buttons in collections as well."
 	return [
 		{ key: 'rescan', label: 'Rescan' },
 		{ key: 'edit', label: 'Edit details' },
-		col.published ? { key: 'unpublish', label: 'Unpublish' } : { key: 'publish', label: 'Publish' },
-		{ key: 'remove', label: 'Remove' },
+		{ key: 'publish', label: 'Publish' },
+		{ key: 'remove', label: 'Delete' },
 	];
 }
 

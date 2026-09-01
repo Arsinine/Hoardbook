@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { saveProfile, publishProfile, publishCollection, unpublishCollection, deleteCollection, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec, collectionSourceAccessible, getCollections } from '$lib/api.js';
+	import { saveProfile, publishProfile, publishCollection, deleteCollection, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec, collectionSourceAccessible, getCollections } from '$lib/api.js';
 	// M18 W5 note (QURATOR-138): Home's export entry point is deleted; MANIFEST_EXPORTED_TOAST
 	// stays in $lib/manifest-fulfil.js, still used by Chat's fulfil path.
 	import { passphraseStrength } from '$lib/backup-export.js';
@@ -358,16 +358,6 @@
 			} else {
 				toast('Collection published');
 			}
-		} catch (e) {
-			toast(String(e), 'error');
-		}
-	}
-
-	async function handleUnpublishCollection(slug: string) {
-		try {
-			await unpublishCollection(slug);
-			collections.update(cols => cols.map(c => c.slug === slug ? { ...c, published: false } : c));
-			toast('Collection unpublished');
 		} catch (e) {
 			toast(String(e), 'error');
 		}
@@ -952,7 +942,6 @@
 							onrescan={() => openRescan(col)}
 							onedit={() => openEditDetails(col)}
 							onpublish={() => handlePublishCollection(col.slug)}
-							onunpublish={() => handleUnpublishCollection(col.slug)}
 							onremove={() => handleDeleteCollection(col.slug)}
 						/>
 					{/each}
