@@ -941,10 +941,8 @@ pub(crate) fn build_manifest_request(
 /// masquerade as a real author pin on the wire (same normalisation the ticket side applies to
 /// `ask_nonce`). Pure — unit-tested without a relay, alongside the frozen-wire tests below.
 ///
-/// No production caller yet — the carrier-4 UI slice that drives a third-party ask is a later
-/// slice — hence the `#[allow(dead_code)]` outside `test` (same shape as `logging.rs`'s
-/// copy-diagnostics helper). The wire body it emits is production regardless.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Production caller: `request_manifest_from` (the carrier-4 ask-origination command) — the wire
+/// body this builds is what a peer D sends peer C to ask for a manifest A authored.
 pub(crate) fn build_manifest_request_for_author(
     slug: &str,
     fingerprint_seen: &str,
@@ -1021,6 +1019,69 @@ pub async fn request_manifest(
     let sent_at = chrono::Utc::now().to_rfc3339();
     store
         .record_manifest_ask(&npub, &npub, &slug, &fingerprint_seen, &sent_at, &ask_nonce)
+        .map_err(cmd_err)?;
+    Ok(())
+}
+
+/// Carrier 4 (QURATOR-79) — the ask-origination half: peer D asks peer **C** for a manifest peer **A**
+/// authored, so C can re-serve it from its cache (`send_cached_manifest` on C's side). Mirrors
+/// `request_manifest` exactly — nonce minted here, never in the UI; `parse_recipient` on the asked
+/// peer; the `is_self_send` refusal before any network I/O; `send_dm_inner` over
+/// `net::relay_urls`/`net::client`/`net::RELAY_TIMEOUT`; and the ask trace recorded only AFTER the
+/// send resolves (a failed publish must never render as "Asked"). The one difference is the two
+/// arguments the author path needs: `author_npub` (whose collection the ask is about — the body's
+/// `author_npub` and the trace's author key) and no `mascara_pubkey` (Mascara is not a Hoardbook
+/// courier; a re-serve ask has no Mascara fallback to name).
+// The 5 request fields + 3 injected Tauri `State` handles are all load-bearing (mirrors `request_manifest`).
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn request_manifest_from(
+    npub: String,
+    author_npub: String,
+    slug: String,
+    fingerprint_seen: String,
+    teaser_event_id: Option<String>,
+    identity: State<'_, SharedIdentity>,
+    store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
+) -> CmdResult<()> {
+    let recipient = parse_recipient(&npub)?;
+    // The named author must be a real key, not a label — the ask pins WHICH collection it is about,
+    // and a blank/garbled string would silently widen into "whoever's envelope is handy".
+    let author = parse_recipient(&author_npub)
+        .map_err(|e| format!("Invalid author: {e}"))?;
+    let author_npub = npub_of(&author);
+    let id_clone = {
+        let guard = identity.read().await;
+        let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
+        id.identity.clone()
+    };
+    if is_self_send(&recipient, &id_clone.public_key()) {
+        return Err("You can't request a manifest from yourself.".into());
+    }
+    // Mint the nonce HERE, not in the UI — same reason as `request_manifest`: it must be the same
+    // value on the wire and in the local trace, and a caller that could supply it could replay one.
+    let ask_nonce = new_ask_nonce();
+    let content = build_manifest_request_for_author(
+        &slug,
+        &fingerprint_seen,
+        teaser_event_id,
+        None,
+        Some(ask_nonce.clone()),
+        &author_npub,
+    )?;
+    let own = net::relay_urls(&store);
+    let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
+    send_dm_inner(&client, &id_clone, &recipient, &content, &own, net::RELAY_TIMEOUT)
+        .await
+        .map_err(cmd_err)?;
+    // Same M17 W7.1a ordering as `request_manifest` — and the author-scoped key is the whole point
+    // here: the ask is recorded under (asked peer, AUTHOR), so a re-serve ask never collides with
+    // (or answers as) an owner-path ask for the same slug. `claim_manifest_ask` on C's side reads
+    // this exact key when a cached-copy ticket echoes the nonce.
+    let sent_at = chrono::Utc::now().to_rfc3339();
+    store
+        .record_manifest_ask(&npub, &author_npub, &slug, &fingerprint_seen, &sent_at, &ask_nonce)
         .map_err(cmd_err)?;
     Ok(())
 }
@@ -1286,6 +1347,168 @@ mod tests {
         //    fixed in place either: `ManifestRequest` derives `Serialize` only, and nothing in Rust
         //    deserializes a request body. The recogniser is TypeScript, and the property is really
         //    pinned in `ui/src/lib/request-inbox.test.ts` against the real `parseManifestRequest`.
+    }
+
+    /// **Carrier 4 ask-origination (QURATOR-79): `request_manifest_from` sends the author-pinned
+    /// body and records the (peer, author) ledger key.** The command's Tauri `State` + relay halves
+    /// are integration-covered on the ticket (owner-run); the two properties that are THIS slice's
+    /// to lose, and that a `State`-free harness can see, are pinned here by replaying the command's
+    /// own two expressions against a real `DataStore`:
+    ///   - the body carries `author_npub` when an author is named, and the ordinary owner-path ask
+    ///     (`request_manifest` → `build_manifest_request`) omits the key ENTIRELY — the absent shape
+    ///     is the downgrade case: `"author_npub": null` would tell a new build "no author" while an
+    ///     old build saw a request it could still serve, and vice versa;
+    ///   - the ask lands under the AUTHOR-scoped key, never the peer-only one — the widened ledger
+    ///     is what keeps a re-serve ask from answering as (or clobbering) an owner-path ask for the
+    ///     same slug, and what C's `claim_manifest_ask` reads when a cached-copy ticket echoes the
+    ///     nonce.
+    ///
+    /// MUTATION (P-10) — each edit is inside `request_manifest_from` (resolved by containing
+    /// function, not by text: this file has near-identical lines in `request_manifest`), applied
+    /// alone, and must red exactly one of the two tests below while the other stays green (P-9):
+    /// 1. in `request_manifest_from`, build the body with `build_manifest_request(...)` (the
+    ///    authorless builder) instead of `build_manifest_request_for_author(...)` →
+    ///    `request_manifest_from_pins_the_author_on_the_wire` reds on the
+    ///    `v["author_npub"]` assert; the ledger-key test stays green (it does not read the body).
+    /// 2. in `request_manifest_from`'s `record_manifest_ask(...)` call, pass `&npub` as the second
+    ///    (author) argument — the peer-only spelling `request_manifest` uses → the ledger-key test
+    ///    reds on the `manifest_ask_key(&peer, &author, ...)` assert; the body asserts stay green.
+    /// 3. in `request_manifest_from`, pass the raw `author_npub` parameter through without the
+    ///    `parse_recipient`+`npub_of` canonicalization (delete those two lines, bind the parameter
+    ///    straight into the body/record calls) → the ledger-key test reds: a non-canonical spelling
+    ///    (e.g. an `hbk` share code) records under a key nothing will ever look up.
+    #[test]
+    fn request_manifest_from_pins_the_author_on_the_wire() {
+        // Real keys, so the author canonicalization the command performs is exercised, not skipped.
+        let author = Identity::generate();
+        let author_npub = author.npub();
+
+        // (1) THE BODY — the exact expression `request_manifest_from` evaluates: the author-pinned
+        // builder, with the `mascara_pubkey` the command hardcodes to `None` (a re-serve ask has no
+        // Mascara fallback to name).
+        let json = build_manifest_request_for_author(
+            "criterion",
+            "fp-seen",
+            Some("ev1".into()),
+            None,
+            Some("n0nce".into()),
+            &author_npub,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["author_npub"], author_npub.as_str(), "the carrier-4 ask names whose collection it is about");
+        assert_eq!(v["slug"], "criterion");
+        assert_eq!(v["fingerprint_seen"], "fp-seen");
+        assert_eq!(v["teaser_event_id"], "ev1");
+        assert_eq!(v["ask_nonce"], "n0nce", "the nonce the command mints reaches the wire");
+        assert_eq!(v["hb"], MANIFEST_REQUEST_TAG);
+
+        // (2) THE ABSENT SHAPE — the ordinary owner-path ask (what `request_manifest` sends) omits
+        // `author_npub` entirely. `None` means "the asked peer's own collection" — there is no
+        // weaker behaviour behind it, which is the condition the no-discriminant-bump exemption
+        // rests on. `"author_npub": null` here would break that reading.
+        let ordinary = build_manifest_request("criterion", "fp-seen", None, None, Some("n0nce".into()))
+            .unwrap();
+        assert!(
+            !ordinary.contains("author_npub"),
+            "the owner-path ask must omit the key, not null it"
+        );
+        let ov: serde_json::Value = serde_json::from_str(&ordinary).unwrap();
+        assert!(ov.get("author_npub").is_none());
+    }
+
+    /// The ledger-key half of the pair above (split so P-9 holds: mutation 2/3 red this file's
+    /// second test and leave the first green). MUTATION targets are listed on the companion test.
+    #[test]
+    fn request_manifest_from_records_under_the_author_scoped_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let peer = Identity::generate();
+        let author = Identity::generate();
+        let peer_npub = peer.npub();
+        let author_npub = author.npub();
+
+        // Replay the recording expression `request_manifest_from` runs after `send_dm_inner`
+        // resolves: author-scoped, NOT the peer-only spelling `request_manifest` uses.
+        let sent_at = chrono::Utc::now().to_rfc3339();
+        store
+            .record_manifest_ask(&peer_npub, &author_npub, "criterion", "fp-seen", &sent_at, "n1")
+            .unwrap();
+
+        let m = store.load_manifest_asks().unwrap();
+        assert_eq!(
+            m.get(&crate::store::manifest_ask_key(&peer_npub, &author_npub, "criterion"))
+                .map(|a| a.nonce.as_str()),
+            Some("n1"),
+            "the re-serve ask lands under the (peer, AUTHOR, slug) key"
+        );
+        // The peer-only / self-ask spelling is a DIFFERENT entry — it must not exist for this ask.
+        assert!(
+            !m.contains_key(&crate::store::manifest_ask_key(&peer_npub, &peer_npub, "criterion")),
+            "a re-serve ask must never masquerade as an owner-path ask for the same slug"
+        );
+        assert_eq!(m.len(), 1, "exactly one ask recorded");
+    }
+
+    /// **The drift guard the two tests above need to mean anything (orchestrator, 2026-09-01).**
+    /// Both of them call `build_manifest_request_for_author` / `record_manifest_ask` DIRECTLY with
+    /// their own arguments — they never invoke `request_manifest_from`, because it takes Tauri
+    /// `State` and cannot be constructed in a unit test. So they pin the BUILDER and the STORE, not
+    /// the command's use of them: mutating the call site inside `request_manifest_from` left both
+    /// green (verified by mutation, 2026-09-01). That is the §9 P-6 shape — "a guard that re-emits
+    /// its own copy of the thing it checks is asserting against a lookalike it controls".
+    ///
+    /// This closes the gap the same way `redeem_sets_served_by_through_the_shared_discriminator`
+    /// does in `fulfil.rs`: assert the production call site still passes the AUTHOR, so the two
+    /// tests above stay attached to the code they claim to describe.
+    ///
+    /// MUTATION (P-10) — resolved by containing function (this file has a near-identical owner-path
+    /// call in `request_manifest`, which legitimately passes `&npub, &npub` — do NOT aim there):
+    /// inside `request_manifest_from`, change `&author_npub` to `""` in the builder call, or change
+    /// `.record_manifest_ask(&npub, &author_npub,` to `.record_manifest_ask(&npub, &npub,` → this
+    /// test reds on the corresponding assert. Both mutations left the two tests above green.
+    #[test]
+    fn request_manifest_from_wires_the_author_through_at_the_call_site() {
+        let src = include_str!("chat.rs");
+        // Comments stripped, so documenting the rule (including this doc comment) cannot satisfy it.
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Resolve by containing function, and bound the region at `#[cfg(test)]`: this test's own
+        // assertion literals echo the strings it looks for, so an unbounded scan would be satisfied
+        // by its own copy — the very P-6 hole this guard exists to close.
+        let at = code
+            .find("pub async fn request_manifest_from(")
+            .expect("the ask-origination command must exist");
+        let end = code[at..]
+            .find("#[cfg(test)]")
+            .expect("the test module must follow the command")
+            + at;
+        let body = &code[at..end];
+        assert!(
+            body.contains("build_manifest_request_for_author("),
+            "the command must build the AUTHOR-pinned body, not the owner-path one"
+        );
+        // Scope to the BUILDER CALL, not the whole function: `&author_npub,` also appears in the
+        // `record_manifest_ask` line below, so a bare `body.contains` here passes even when the
+        // builder has lost the author. (Caught by mutation, 2026-09-01 — the first cut of this
+        // guard was vacuous on exactly that arm.)
+        let call_at = body
+            .find("build_manifest_request_for_author(")
+            .expect("the author-pinned builder call must exist");
+        let call_end = body[call_at..].find(")?;").expect("the builder call must terminate") + call_at;
+        assert!(
+            body[call_at..call_end].contains("&author_npub"),
+            "the author must reach the BUILDER — passing \"\" normalises to None and silently \
+             degrades the ask to an authorless one"
+        );
+        assert!(
+            body.contains(".record_manifest_ask(&npub, &author_npub,"),
+            "the ask must be recorded under the (peer, AUTHOR) key — the peer-only spelling is the \
+             owner-path one and would let a re-serve ask collide with it"
+        );
     }
 
     #[test]

@@ -566,6 +566,7 @@ pub fn run() {
             commands::online::online_count,
             commands::chat::send_message,
             commands::chat::request_manifest,
+            commands::chat::request_manifest_from,
             commands::chat::get_messages,
             commands::chat::dm_requests,
             commands::chat::dm_request_accept,
