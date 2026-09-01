@@ -679,12 +679,24 @@ fn save_refreshed_contact(
 /// The result of importing a `.hbmanifest` file (M16 W4): the slug it upgrades, the full-tree
 /// `PeerCollection` (its `truncated`/`total_items` cleared — the fade lifts), and whether the
 /// manifest is older than the teaser the browser is showing (`stale` ⇒ "ask again", still imported).
+///
+/// Carrier 4 provenance: `served_by` names the peer whose cached copy arrived (None when the author
+/// served it directly) and `cached_at` is when that copy was taken. Additive optional fields — the
+/// envelope's own clock already surfaces as `collection.manifest_imported_at` (set in
+/// `open_manifest`), so these carry no second clock and no downgrade when absent.
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportedManifest {
     pub slug: String,
     pub collection: PeerCollection,
     pub created_at: u64,
     pub stale: bool,
+    /// The npub of the peer that served this copy (peer C in the carrier-4 relay), or `None` when
+    /// the author served it directly. Optional: absent on every pre-carrier-4 build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_by: Option<String>,
+    /// When the serving peer's cached copy was taken (unix seconds). `None` for a direct serve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_at: Option<u64>,
 }
 
 /// Upper bound on a manifest file / paste we will read before parsing. A single-ciphertext envelope
@@ -894,6 +906,8 @@ fn open_manifest(
         collection,
         created_at: envelope.created_at,
         stale,
+        served_by: None,
+        cached_at: None,
     })
 }
 
@@ -1271,6 +1285,62 @@ mod tests {
         assert!(
             resolve_from_cache(dir.path(), &id.public_key(), &npub, "criterion", &bk, &newer_teaser, 3).is_none(),
             "a newer teaser (different fingerprint) never hits the old cache entry",
+        );
+    }
+
+    /// A cached envelope authored by SOMEONE ELSE must not resolve — even when it is filed under the
+    /// browsed peer's npub AND its signed fingerprint matches the teaser exactly.
+    ///
+    /// Under Carrier 4 this stops being hypothetical. Peer C re-serves cached copies, so D's cache
+    /// holds envelopes D never fetched from their author, and the npub a file is stored under is no
+    /// longer proof of who signed it. `resolve_from_cache` re-runs `verify_author` BEFORE the
+    /// fingerprint gate, and that check is the only thing standing between a mis-filed or tampered
+    /// cache entry and a manifest served under the wrong peer's name.
+    ///
+    /// Replaces `resolve_from_cache_never_clobbers_a_newer_teaser_with_an_older_re_serve`, deleted
+    /// 2026-08-31 by audit: its two assertions were structurally identical to
+    /// `…gates_on_the_signed_fingerprint` above, so no mutation could red one without the other, and
+    /// its name claimed a TEMPORAL property the code does not implement — the gate is fingerprint
+    /// equality, with no notion of older or newer.
+    ///
+    /// MUTATION (reds this test): in `fn resolve_from_cache`, delete the
+    /// `envelope.verify_author(peer).ok()?;` line. The fingerprints match, so the mutant resolves the
+    /// other peer's manifest while browsing this one. Resolve the target by its containing function,
+    /// never by matching this text. The sibling `…gates_on_the_signed_fingerprint` stays GREEN under
+    /// that edit — which is precisely what makes this test worth having.
+    #[test]
+    fn resolve_from_cache_refuses_an_envelope_authored_by_another_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = "4444444444444444444444444444444444444444444444444444444444444444";
+
+        // The peer being browsed, plus a DIFFERENT author's envelope for the same slug at the same
+        // fingerprint. Only the signature distinguishes them.
+        let (browsed, bk, _own) = a_manifest("criterion", fp);
+        let (_other, _other_bk, other_env) = a_manifest("criterion", fp);
+
+        // File the other author's envelope under the browsed peer's cache key — exactly the shape a
+        // mis-filed re-serve or a tampered cache directory produces.
+        manifest_cache::put(
+            dir.path(), &browsed.npub(), "criterion", fp, &other_env.to_json().unwrap(), 1,
+            manifest_cache::DEFAULT_MANIFEST_CACHE_BYTES,
+        )
+        .unwrap();
+
+        let mut meta = valid_meta("criterion");
+        meta.insert("truncated".into(), serde_json::json!(true));
+        meta.insert("snapshot_fingerprint".into(), serde_json::json!(fp));
+        let teaser = RenderedListing {
+            meta,
+            entries: vec![],
+            parts_total: 1,
+            parts_present: 1,
+            missing: vec![],
+        };
+
+        assert!(
+            resolve_from_cache(dir.path(), &browsed.public_key(), &browsed.npub(), "criterion", &bk, &teaser, 2)
+                .is_none(),
+            "a cache entry signed by another peer must be refused, however it got there",
         );
     }
 

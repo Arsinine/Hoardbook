@@ -92,7 +92,7 @@ async function createPublicTopic(getByRole: (role: string, opts?: object) => HTM
 describe('QURATOR-151 — a create-forced repaint re-fetches the ranked counts it wiped', () => {
 	it('republishing paints a countless tree; previously-ranked ids are re-ranked and order survives', async () => {
 		paintMock.mockResolvedValueOnce([B, A]).mockResolvedValue([B, A, NEW]);
-		rankMock.mockImplementation(async (ids: string[]) => rankByRequest(ids));
+		rankMock.mockImplementation(async (rows: { topic_id: string }[]) => rankByRequest(rows.map((r) => r.topic_id)));
 		const { getByRole, getByPlaceholderText, container } = render(TopicsPage);
 		await waitFor(() => expect(paintMock).toHaveBeenCalledTimes(1));
 
@@ -100,7 +100,7 @@ describe('QURATOR-151 — a create-forced repaint re-fetches the ranked counts i
 		// it to force the lazy rank pass over A and B (counts land, ids enter rankedIds).
 		await expandVideoGroup(container);
 		await waitFor(() => expect(rankMock).toHaveBeenCalledTimes(1));
-		expect(rankMock.mock.calls[0][0]).toEqual(['t-b', 't-a']);
+		expect((rankMock.mock.calls[0][0] as { topic_id: string }[]).map((r) => r.topic_id)).toEqual(['t-b', 't-a']);
 		// Wait for the FOLD, not the call: rankedIds is only written after the rank resolve, and
 		// the order flip (paint order B,A -> count order A,B) is its observable effect. Without
 		// this wait the create can race the fold, and on broken code rankedIds may still be empty
@@ -126,7 +126,7 @@ describe('QURATOR-151 — a create-forced repaint re-fetches the ranked counts i
 			() => {
 				expect(
 					rankMock.mock.calls.some((c) => {
-						const ids = c[0] as string[];
+						const ids = (c[0] as { topic_id: string }[]).map((r) => r.topic_id);
 						return ids.includes('t-a') && ids.includes('t-b');
 					}),
 				).toBe(true);
@@ -134,7 +134,7 @@ describe('QURATOR-151 — a create-forced repaint re-fetches the ranked counts i
 			{ timeout: 2000 },
 		);
 		const requeuedCall = rankMock.mock.calls.find((c) => {
-			const ids = c[0] as string[];
+			const ids = (c[0] as { topic_id: string }[]).map((r) => r.topic_id);
 			return ids.includes('t-a') && ids.includes('t-b');
 		});
 		expect(requeuedCall).toBeTruthy();
@@ -151,7 +151,7 @@ describe('QURATOR-151 — a create-forced repaint re-fetches the ranked counts i
 
 	it('the de-dup rankedIds exists for is otherwise intact — a stable tree never re-ranks', async () => {
 		paintMock.mockResolvedValue([B, A]);
-		rankMock.mockImplementation(async (ids: string[]) => rankByRequest(ids));
+		rankMock.mockImplementation(async (rows: { topic_id: string }[]) => rankByRequest(rows.map((r) => r.topic_id)));
 		const { container, getByPlaceholderText } = render(TopicsPage);
 		await waitFor(() => expect(paintMock).toHaveBeenCalledTimes(1));
 		// The filter force-opens matching groups, deterministically — unlike the collapse seed,

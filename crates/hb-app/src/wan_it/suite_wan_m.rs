@@ -443,10 +443,12 @@ async fn probe_client_endpoint(probe: &ProbeInput) -> Result<iroh::Endpoint, Str
 /// is ClaimedByAnother (the security boundary).
 async fn claim_for_probe(probe: &ProbeInput, ticket: &TransportTicket) -> Result<(), String> {
     use crate::store::AskClaim;
+    let expected_author = ticket.author_npub.clone().unwrap_or_else(|| probe.serve_npub.clone());
     let claim = probe
         .store
         .claim_manifest_ask(
             &probe.serve_npub,
+            &expected_author,
             &ticket.slug,
             ticket.ask_nonce.as_deref().unwrap_or_default(),
             &ticket.request_id,
@@ -480,7 +482,9 @@ fn assert_probe_ask_unspent(probe: &ProbeInput, ticket: &TransportTicket) -> Res
         .store
         .load_manifest_asks()
         .map_err(|e| format!("load_manifest_asks: {e}"))?;
-    let key = format!("{}|{}", probe.serve_npub, ticket.slug);
+    // The author the ticket names, else the DM sender — same resolution as the redeem path.
+    let author = ticket.author_npub.as_deref().unwrap_or(&probe.serve_npub);
+    let key = format!("{}|{}|{}", probe.serve_npub, author, ticket.slug);
     match asks.get(&key) {
         Some(ask) if ask.spent => Err(format!(
             "the ask is marked spent after a dead-endpoint dial that never reached the serve — \
@@ -545,6 +549,7 @@ pub async fn build_probe_input(
     // it must match the one serve echoed into the ticket. The fingerprint is informational (we have
     // not browsed a teaser); a placeholder stands in (the gate checks nonce + request id, not fp).
     store.record_manifest_ask(
+        &serve_npub,
         &serve_npub,
         &live_ticket.slug,
         "wan-it-probe",
@@ -731,21 +736,21 @@ mod tests {
         let slug = "slug";
         let nonce = "nonce-1";
         let req = "req-1";
-        store.record_manifest_ask(npub, slug, "fp", "2026-01-01T00:00:00Z", nonce).unwrap();
+        store.record_manifest_ask(npub, npub, slug, "fp", "2026-01-01T00:00:00Z", nonce).unwrap();
 
         // The claim is Granted and does not spend the ask.
-        let claim = store.claim_manifest_ask(npub, slug, nonce, req).unwrap();
+        let claim = store.claim_manifest_ask(npub, npub, slug, nonce, req).unwrap();
         assert!(matches!(claim, crate::store::AskClaim::Granted));
 
         // The ask is still present and unspent after the claim (a failed dial changes nothing).
         let asks = store.load_manifest_asks().unwrap();
-        let ask = asks.get(&format!("{npub}|{slug}")).unwrap();
+        let ask = asks.get(&format!("{npub}|{npub}|{slug}")).unwrap();
         assert!(!ask.spent, "a claim does not spend the ask");
 
         // spend_manifest_ask is what marks it spent (the production command calls this AFTER success).
-        store.spend_manifest_ask(npub, slug, nonce).unwrap();
+        store.spend_manifest_ask(npub, npub, slug, nonce).unwrap();
         let asks = store.load_manifest_asks().unwrap();
-        assert!(asks.get(&format!("{npub}|{slug}")).unwrap().spent);
+        assert!(asks.get(&format!("{npub}|{npub}|{slug}")).unwrap().spent);
     }
 
     /// `build_probe_input` parses a full share code into a contact with the browse-key, and records
@@ -785,7 +790,7 @@ mod tests {
         // The ask is recorded with the matching nonce (claim_manifest_ask passes).
         let claim = input
             .store
-            .claim_manifest_ask(&serve_npub, "my-slug", "nonce-1", "req-1")
+            .claim_manifest_ask(&serve_npub, &serve_npub, "my-slug", "nonce-1", "req-1")
             .unwrap();
         assert!(matches!(claim, crate::store::AskClaim::Granted));
 
@@ -803,8 +808,8 @@ mod tests {
         let npub = "npub1serve";
         let slug = "slug";
         let nonce = "nonce-1";
-        store.record_manifest_ask(npub, slug, "fp", "t", nonce).unwrap();
-        store.spend_manifest_ask(npub, slug, nonce).unwrap();
+        store.record_manifest_ask(npub, npub, slug, "fp", "t", nonce).unwrap();
+        store.spend_manifest_ask(npub, npub, slug, nonce).unwrap();
 
         let probe_id = AppIdentity::generate();
         let ticket = TransportTicket::issue("req-1", slug, "addr", 1, Some(nonce));

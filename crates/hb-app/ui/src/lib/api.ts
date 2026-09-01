@@ -324,12 +324,19 @@ export const unfollowContact = (npub: string) => invoke<void>('unfollow_contact'
 export const refreshContact = (npub: string) => invoke<CachedPeer>('refresh_contact', { npub });
 
 /** M16 W4 — the result of importing a `.hbmanifest`: the full-tree collection (fade lifted), and
- *  `stale` when the manifest predates the teaser the browser is showing (imported anyway, with a warn). */
+ *  `stale` when the manifest predates the teaser the browser is showing (imported anyway, with a warn).
+ *
+ *  QURATOR-79 carrier 4 provenance: `served_by` names the peer whose cached copy arrived (None ⇒ the
+ *  author served it directly); `cached_at` is when that peer's cached copy was taken. Both additive-
+ *  optional, absent on every pre-carrier-4 serve. The envelope's own clock is
+ *  `collection.manifest_imported_at` — there is no second one here. */
 export interface ImportedManifest {
 	slug: string;
 	collection: Collection;
 	created_at: number;
 	stale: boolean;
+	served_by?: string;
+	cached_at?: number;
 }
 
 /** M16 W4 — import a full-listing manifest the user received (a picked file path OR pasted text/base64),
@@ -418,6 +425,26 @@ export const requestManifest = (
 		fingerprintSeen,
 		teaserEventId: teaserEventId ?? null,
 		mascaraPubkey: mascaraPubkey ?? null,
+	});
+
+/** Carrier 4 (QURATOR-79) — the ask-origination half: DM `npub` (peer C) a structured request for
+ *  `authorNpub`'s (peer A's) manifest, so C can re-serve it from its cache. Answer-only and
+ *  human-mediated by design (design §5): this promises nothing about whether C holds it — C's
+ *  client turns a recognised forward-request into a card only when it actually does. One relay
+ *  write; the ask is recorded server-side under the (peer, author)-scoped ledger key. */
+export const requestManifestFrom = (
+	npub: string,
+	authorNpub: string,
+	slug: string,
+	fingerprintSeen: string,
+	teaserEventId?: string,
+) =>
+	invoke<void>('request_manifest_from', {
+		npub,
+		authorNpub,
+		slug,
+		fingerprintSeen,
+		teaserEventId: teaserEventId ?? null,
 	});
 
 /** M17 W7.1a — the persisted ask-trace map (npub|slug → {fingerprint_seen, sent_at}), so the Browse
@@ -584,12 +611,14 @@ export const topicDiscover = (tags: string[]) =>
 export const topicDiscoverPaint = (tags: string[]) =>
 	invoke<DiscoveredTopic[]>('topic_discover_paint', { tags });
 
-/** The W1 LAZY-RANK half (QURATOR-143): fetch the spoofable member count for exactly the ids sent
+/** The W1 LAZY-RANK half (QURATOR-143): fetch the spoofable member count for exactly the rows sent
  *  (bounded to concurrency 8 in hb-net), returning `(topic_id, count)` pairs count-desc. Send ONLY
- *  the ids of rows that will actually be drawn — bounding the wave to the screen is this caller's
- *  half of the relay-citizenship contract. */
-export const topicRank = (topicIds: string[]) =>
-	invoke<TopicRank[]>('topic_rank', { topicIds });
+ *  the rows that will actually be drawn — bounding the wave to the screen is this caller's half of
+ *  the relay-citizenship contract. Each row carries its NAME alongside the id (QURATOR-148): the
+ *  name derives the public-join credential a non-member's aliveness read recovers the topic key
+ *  with — without it `alive_count` can only ever come back null (unknown). */
+export const topicRank = (topics: { topic_id: string; name: string }[]) =>
+	invoke<TopicRank[]>('topic_rank', { topics });
 
 /** Join-first lookup (devtest #11): does this public Topic name already have a room? Never call for
  *  a private Topic (no announce to find). */

@@ -599,7 +599,7 @@ async fn approve_request(
     // The harness owns both sides, so the nonce is the one from the request-DM.
     let nonce = ask_nonce.unwrap_or("");
     let fp = envelope.snapshot_fingerprint.clone();
-    store.record_manifest_ask(asker_npub, slug, &fp, &rfc3339_now(), nonce)?;
+    store.record_manifest_ask(asker_npub, asker_npub, slug, &fp, &rfc3339_now(), nonce)?;
 
     // (4) Bind the endpoint via the production path (ensure_endpoint, Role::Listen). The accept loop
     // serves manifests for approved tickets.
@@ -619,6 +619,7 @@ async fn approve_request(
         redeemer_npub: asker_npub.to_string(),
         consumed_at: None,
         delivered_bytes: None,
+        served_fingerprint: None,
     })?;
 
     // (6) DM the ticket to the asker via the production NIP-17 path (send_dm_inner). This is the
@@ -708,7 +709,7 @@ async fn setup_manifest_plane(
     // (3) Record a manifest ask the probe's claim gate expects — same nonce the ticket will echo.
     // The harness owns both sides, so the nonce is harness-chosen and known to both.
     let nonce = "wan-it-nonce";
-    store.record_manifest_ask(asker_npub, slug, "wan-it", &rfc3339_now(), nonce)?;
+    store.record_manifest_ask(asker_npub, asker_npub, slug, "wan-it", &rfc3339_now(), nonce)?;
 
     // (4) Approve, exactly as the owner's click does: `send_full_list_inner` IS the body of the
     // `send_full_list` Tauri command (the command is a marshalling shim over it). One call now does

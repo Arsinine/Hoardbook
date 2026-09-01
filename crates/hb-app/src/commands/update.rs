@@ -102,8 +102,8 @@ pub fn apply_staged_on_exit(app: &tauri::AppHandle) {
 /// persisted `last_seen_version` against the running app version (exact string), persists the
 /// running version, and returns the notice exactly once after a version change.
 #[tauri::command]
-pub async fn take_update_notice(
-    app: tauri::AppHandle,
+pub async fn take_update_notice<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     store: State<'_, DataStore>,
 ) -> CmdResult<Option<UpdateNotice>> {
     let current = app.package_info().version.to_string();
@@ -116,52 +116,99 @@ pub async fn take_update_notice(
     Ok(show.then_some(UpdateNotice { version: current }))
 }
 
-// ── QURATOR-161 slice 6 — the update commands' guards, driven through the commands ───────────
+
+// QURATOR-161 slice 6 -- the update commands. Owner ruling 2026-08-31 after an adversarial pass
+// over what each of these would actually prove. The previous note here claimed all three were
+// OWED; two of those three were wrong, in opposite directions.
 //
-// Same technique as the browse/groups/chat command-guard blocks: the real `#[tauri::command]` fns
-// at their real signatures, with `tauri::test::mock_app()` supplying the `AppHandle` and the
-// StateManager supplying the managed `State<'_, _>` values — no mirror, no `*_inner`, no
-// restructuring.
+//   check_update          -- has NO guard. Four lines: `updater_builder().build()?`, `check()?`,
+//                            and a struct field copy. Every failure is a plugin error propagated
+//                            by `cmd_err`. There is nothing here to pin; it should never have been
+//                            counted as an untested guard.
 //
-// `check_update` and `download_update` are OWED (see the comment beside their tests): every guard
-// they have sits downstream of `app.updater_builder().build()`, which reads the updater endpoint +
-// minisign pubkey from the app config. `mock_app()` carries a dummy config with no updater keys,
-// so the build refuses before any branch can be taken — and constructing a real `Update` value is
-// not possible from outside the plugin (its constructors are not public).
+//   download_update       -- genuinely unreachable. Its only branch (the already-up-to-date
+//                            `Ok(None)`) sits downstream of `app.updater_builder().build()`, which
+//                            reads the updater endpoint + minisign pubkey from the app config.
+//                            `mock_app()` carries a dummy config with no updater keys, so the build
+//                            refuses before any branch can be taken, and `tauri_plugin_updater::Update`
+//                            has no public constructor, so a real one cannot be supplied either.
+//
+//   apply_staged_update   -- reachable, but the test would be near-vacuous, so it is deliberately
+//                            NOT written. Its guard is `let Some((update, bytes)) = inner else
+//                            { return Err(..) }` -- the refusal and the value binding are the SAME
+//                            statement. `update.install(&bytes)` cannot be reached without both
+//                            values being bound, which happens only on the `Some` arm, so the
+//                            compiler already enforces the ordering a placement test would assert.
+//                            The one regression it would catch is someone rewriting it as
+//                            `inner.unwrap()`, which does not justify a signature change on the
+//                            path that ships binaries to users.
+//
+//   take_update_notice    -- the one with real, uncovered risk, and the only one made generic over
+//                            `R: Runtime` (Tauri's documented mechanism for mock-runtime testing;
+//                            `Wry` stays the concrete runtime in `lib.rs`). `should_show_update_notice`
+//                            is CI-tested in `crate::update_logic`, but the WIRING around it is not:
+//                            that the new version is persisted, and that a second call therefore
+//                            goes quiet. Break the persistence and the "now running vX.Y" notice
+//                            fires on every launch forever while the pure function's tests stay
+//                            green. That is the bug class the test below exists for.
 #[cfg(test)]
 mod command_guards {
+    use super::*;
+    use tauri::Manager;
 
-    // ── `apply_staged_update` / `check_update` / `download_update`: OWED ──────────────────────
-    //
-    // Blocker, verbatim from the compiler: every command in this file that has a guard takes
-    // `app: tauri::AppHandle` — the DEFAULT type parameter, i.e. `AppHandle<Wry<EventLoopMessage>>`.
-    // `tauri::test::mock_app()` returns `App<MockRuntime>`, and there is no conversion between an
-    // `AppHandle<MockRuntime>` and an `AppHandle<Wry>` (the `mock_app` doc's own example only calls
-    // commands that take NO app parameter). Passing the mock handle is
-    // `expected AppHandle<Wry<EventLoopMessage>>, found AppHandle<MockRuntime>` (E0308) — a type
-    // error, not a runtime failure, so the guard cannot even be entered. Unlike the `State<'_, T>`
-    // parameters (which tauri's StateManager satisfies for any runtime) the `AppHandle` parameter
-    // pins the runtime the test must drive, and building a real `Wry` app needs a display server —
-    // not available in the offline CI/dev env this file's own header documents (decision #7/#8).
-    //
-    // `apply_staged_update` has a second, independent blocker on its PASS side: a staged update
-    // makes the command run `update.install(&bytes)` and then `app.restart()`, which is `-> !` —
-    // on a test thread it calls `cleanup_before_exit()` and then re-execs the TEST BINARY. And
-    // `tauri_plugin_updater::Update` has no public constructor, so a staged value cannot be built
-    // from outside the plugin either. Driving any of this needs a production change (an `*_inner`
-    // over a generic `R: Runtime`, or a State-managed restart flag), which a tests-only slice must
-    // not make.
-    //
-    // What IS already pinned, and where: the "No update is staged." guard's data shape
-    // (`StagedUpdate::inner` is an `Option` that `take()` empties — nothing else reads it), the
-    // once-per-version-change decision both `take_update_notice` and the up-to-date branch of
-    // `check_update`/`download_update` report through (`crate::update_logic`, CI-tested there),
-    // and the updater trust/config boundary (`tauri.conf.json` + minisign, plugin-owned). What
-    // stays unpinned is the guards' PLACEMENT in these command bodies. Making `apply_staged_update`
-    // generic over `R: Runtime` (a signature-only change, `Wry` remaining the concrete runtime in
-    // `lib.rs`) is the first step of the slice that picks this up.
-    //
-    // (Kept as a compiled no-op module so the blocker is read where the tests would live, matching
-    // the `apply_portable_update` OWED precedent in portable_update.rs.)
-    const _: () = ();
+    /// The notice fires exactly ONCE after a version change: the first call reports it and persists
+    /// the running version, the second call sees no change and goes quiet.
+    ///
+    /// This pins the command's WIRING, not its decision -- `should_show_update_notice` is already
+    /// covered in `crate::update_logic`. What is uncovered until now is that `take_update_notice`
+    /// actually writes the new version back, which is the whole once-only guarantee.
+    ///
+    /// MUTATION (reds this test): in `take_update_notice`, delete the `store.save_settings(&settings)?`
+    /// call inside the `if settings.last_seen_version != current` block (keeping the in-memory
+    /// assignment). The first call still reports the notice, but nothing is persisted, so the second
+    /// call reports it again -- the `second.is_none()` assertion fails.
+    #[tokio::test]
+    async fn the_update_notice_fires_once_then_persists_and_goes_quiet() {
+        let app = tauri::test::mock_app();
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+
+        // Seed a prior version that cannot equal the running one. Not the `""` default: that is the
+        // fresh-install case, where `version_changed` decides on its own terms and would conflate
+        // "no notice because nothing changed" with "no notice because we never persisted".
+        let mut settings = store.load_settings().unwrap().unwrap_or_default();
+        settings.last_seen_version = "0.0.0-before".into();
+        store.save_settings(&settings).unwrap();
+        app.manage(store);
+
+        let current = app.package_info().version.to_string();
+
+        let first = take_update_notice(app.handle().clone(), app.state::<DataStore>())
+            .await
+            .unwrap();
+        assert_eq!(
+            first.map(|n| n.version),
+            Some(current.clone()),
+            "a changed version must report the notice once, naming the running version"
+        );
+
+        let persisted = app
+            .state::<DataStore>()
+            .load_settings()
+            .unwrap()
+            .unwrap()
+            .last_seen_version;
+        assert_eq!(
+            persisted, current,
+            "the running version must be written back, or the notice can never go quiet"
+        );
+
+        let second = take_update_notice(app.handle().clone(), app.state::<DataStore>())
+            .await
+            .unwrap();
+        assert!(
+            second.is_none(),
+            "the second call must go quiet -- this is the once-only guarantee"
+        );
+    }
 }

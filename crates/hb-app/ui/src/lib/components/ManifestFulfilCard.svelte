@@ -15,6 +15,7 @@
 		MANIFEST_EMPTY_LINE,
 		MANIFEST_MISSING_LINE,
 		MANIFEST_STALE_NOTE,
+		MANIFEST_RESERVE_LINE,
 		type ManifestFulfilState,
 	} from '$lib/manifest-fulfil.js';
 	import { SEND_FULL_LIST_LABEL } from '$lib/transport-ticket.js';
@@ -26,6 +27,12 @@
 		 *  the manifest, proves it fits the transport ceiling, mints a ticket for this one approval,
 		 *  and DMs it. **Always behind this explicit click**: the app never auto-sends (M17 #4). */
 		onsend: (slug: string) => void;
+		/** Carrier 4 (QURATOR-79) — the re-serve verb, fired only from the `re-serve` state's button.
+		 *  Same explicit click, same never-auto rule; the parent invokes `send_cached_manifest`,
+		 *  which re-serves the cached envelope the author field names rather than building one. The
+		 *  two verbs are separate props (not one re-dispatching closure) so each stays a single,
+		 *  pin-able wiring in the route. */
+		onserve: (state: ManifestFulfilState) => void;
 		/** True while a send for this slug is in flight — the button disables rather than queueing a
 		 *  second approval for the same request. */
 		sending: boolean;
@@ -35,7 +42,7 @@
 		fingerprintSeen: string;
 	}
 
-	let { state, fingerprintSeen, onsend, sending }: Props = $props();
+	let { state, fingerprintSeen, onsend, onserve, sending }: Props = $props();
 
 	let slug = $derived(state.slug);
 </script>
@@ -83,6 +90,21 @@
 		<!-- Quarantine (Q7 request inbox): the card renders for recognition, but ZERO action buttons —
 		     Accept comes first, always (hard constraint #3, same rule as W3's ShareCodeCard). -->
 		<div class="mf-card-inert">Accept first to act on this request.</div>
+	{:else if state.kind === 're-serve'}
+		<!-- Carrier 4 (QURATOR-79): the third-party-author ask. The verb is the same explicit click,
+		     but WHAT it sends is not: a cached copy someone else authored, not a manifest built from
+		     this owner's draft. The line names the author so the click is an informed one. -->
+		<div class="mf-card-note" role="note">{MANIFEST_RESERVE_LINE(state.authorNpub)}</div>
+		<div class="mf-card-actions">
+			<button
+				type="button"
+				class="btn-primary btn-sm mf-card-action"
+				onclick={() => onserve(state)}
+				disabled={sending}
+			>
+				{sending ? '…' : SEND_FULL_LIST_LABEL}
+			</button>
+		</div>
 	{/if}
 </div>
 

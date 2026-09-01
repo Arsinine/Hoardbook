@@ -197,6 +197,7 @@ pub(crate) async fn send_full_list_inner(
             redeemer_npub,
             consumed_at: None,
             delivered_bytes: None,
+            served_fingerprint: None,
         })
         .map_err(cmd_err)?;
     tracing::debug!(
@@ -228,6 +229,192 @@ pub(crate) async fn send_full_list_inner(
     Ok(())
 }
 
+/// **Carrier 4 (QURATOR-79) — the re-serving half.** Mint a ticket for a CACHED copy of a peer's
+/// manifest this node holds, answering a peer's "please send me the full list" ask out of the
+/// manifest cache instead of out of this node's own collections.
+///
+/// The ordering is [`send_full_list`]'s, with one substitution at step (1) and one extra fence:
+///
+/// 1. **The envelope is read from the cache and its author verified BEFORE anything is promised.**
+///    `verify_author` runs here, at MINT time, against the *requested* author — the §2 C-side
+///    provenance fence. Without it a D asking for `(author = A, slug = s)` could be served B's
+///    same-slug envelope: D's own gate would refuse it (author pin), so this is not a disclosure
+///    hole, but C would have spent a ticket on a delivery that can never land. Resolving the cache
+///    entry here — once, under the human's "Send cached copy" click — is also what
+///    `IssuedTicketRecord.served_fingerprint` records: serve time (`StoreManifestSource::payload`)
+///    replays this decision instead of re-guessing "newest for slug".
+/// 2. **The record is persisted before the DM**, as ever — a redeemer always presents a ticket this
+///    node can recognise, and the reverse order is indistinguishable from a forgery. An orphaned
+///    record (the DM then failed) is inert: nobody holds the matching ticket.
+///
+/// The served envelope is the one already in the cache, so no manifest is built here and the
+/// ceiling cannot be exceeded — `ManifestPayload::seal` re-checks it at serve time regardless.
+///
+/// **A marshalling shim only** — the behaviour is [`send_cached_manifest_inner`], same split as the
+/// other two commands, so the harness drives the real body.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn send_cached_manifest(
+    npub: String,
+    author_npub: String,
+    slug: String,
+    ask_nonce: Option<String>,
+    identity: State<'_, SharedIdentity>,
+    store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
+    endpoint: State<'_, SharedEndpoint>,
+) -> CmdResult<()> {
+    send_cached_manifest_inner(npub, author_npub, slug, ask_nonce, &identity, &store, &relay, &endpoint)
+        .await
+}
+
+/// The whole of `send_cached_manifest`'s behaviour, callable without a Tauri runtime.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_cached_manifest_inner(
+    npub: String,
+    author_npub: String,
+    slug: String,
+    ask_nonce: Option<String>,
+    identity: &SharedIdentity,
+    store: &DataStore,
+    relay: &SharedRelay,
+    endpoint: &SharedEndpoint,
+) -> CmdResult<()> {
+    let recipient = crate::commands::chat::parse_recipient(&npub)?;
+    // The requested author: whose collection the asker asked about. This is the npub the envelope's
+    // author is pinned against below — never `None`, never "whoever's envelope is handy".
+    let expected_author = crate::commands::chat::parse_recipient(&author_npub)
+        .map_err(|e| format!("Invalid author: {e}"))?;
+    let author_npub = crate::commands::chat::npub_of(&expected_author);
+    let (id_clone, browse_key, transport_key, own_npub) = {
+        let guard = identity.read().await;
+        let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
+        (id.identity.clone(), id.browse_key.clone(), id.transport_key.clone(), id.npub())
+    };
+    if crate::commands::chat::is_self_send(&recipient, &id_clone.public_key()) {
+        return Err("You can't send a cached list to yourself.".into());
+    }
+    let recipient_npub = crate::commands::chat::npub_of(&recipient);
+
+    // (1) Resolve the cache entry and verify its author, before the endpoint binds or a ticket
+    // exists. This scan is the read-only half — the ONLY production writer of the cache is
+    // `accept_manifest_bytes` in `commands/browse.rs` (CI sweep).
+    let cache_dir = store.manifest_cache_dir();
+    let Some((fingerprint, envelope)) = newest_cached_for(&cache_dir, &author_npub, &slug) else {
+        return Err(format!(
+            "You don't have a cached copy of '{slug}' from that peer, so it can't be re-sent."
+        ));
+    };
+    envelope
+        .verify_author(&expected_author)
+        .map_err(|e| format!("That cached copy could not be verified as this peer's ({e})."))?;
+    tracing::debug!(
+        recipient = %crate::logging::trunc_npub(&recipient_npub),
+        author = %crate::logging::trunc_npub(&author_npub),
+        slug = %slug,
+        fingerprint = %fingerprint,
+        "fulfil: send_cached_manifest — author verified against the requested peer, minting"
+    );
+
+    let source: Arc<dyn crate::transport::ManifestSource> = StoreManifestSource::new(
+        (*store).clone(),
+        id_clone.clone(),
+        browse_key.clone(),
+    );
+    let ep = ensure_endpoint(endpoint, &own_npub, identity, &transport_key, source, Role::Listen)
+        .await
+        .map_err(|e| {
+            format!("Could not start the transport ({e}). Export the list instead: Home → ⋯ → Export.")
+        })?;
+
+    let request_id = new_request_id();
+    let mut ticket =
+        issue_ticket(&ep, &request_id, &slug, now_secs(), ask_nonce.as_deref()).map_err(cmd_err)?;
+    // The carrier-4 mark: `author_npub` names whose collection this re-serves (None = the issuer's
+    // own, the `send_full_list` case), and `served_fingerprint` is the exact cache entry resolved
+    // above — recorded at MINT time so serve time replays this decision rather than re-resolving.
+    ticket.author_npub = Some(author_npub.clone());
+
+    // (2) Record before the DM — same canonicalization note as `send_full_list_inner`.
+    let redeemer_npub = crate::commands::chat::npub_of(&recipient);
+    store
+        .record_issued_ticket(&IssuedTicketRecord {
+            ticket: ticket.clone(),
+            redeemer_npub,
+            consumed_at: None,
+            delivered_bytes: None,
+            served_fingerprint: Some(fingerprint),
+        })
+        .map_err(cmd_err)?;
+    tracing::debug!(
+        recipient = %crate::logging::trunc_npub(&recipient_npub),
+        slug = %slug,
+        request_id = %request_id,
+        "fulfil: cached re-serve record persisted — publishing the ticket DM"
+    );
+
+    let body = serde_json::to_string(&ticket).map_err(cmd_err)?;
+    let own = crate::net::relay_urls(store);
+    let client = crate::net::client(&id_clone, store, relay).await.map_err(cmd_err)?;
+    crate::commands::chat::send_dm_inner(
+        &client,
+        &id_clone,
+        &recipient,
+        &body,
+        &own,
+        crate::net::RELAY_TIMEOUT,
+    )
+    .await
+    .map_err(cmd_err)?;
+    tracing::info!(
+        recipient = %crate::logging::trunc_npub(&recipient_npub),
+        slug = %slug,
+        request_id = %request_id,
+        "fulfil: send_cached_manifest complete — cached-copy ticket DM delivered"
+    );
+    Ok(())
+}
+
+/// Resolve the newest cache entry for `(author, slug)` by scanning the cache — a `CacheEntry`
+/// carries `npub`/`slug`/`fingerprint` in plaintext, so "newest" is a `last_access` max. Returns
+/// `(fingerprint, envelope)`. Read-only: this NEVER writes the cache.
+fn newest_cached_for(
+    dir: &std::path::Path,
+    author: &str,
+    slug: &str,
+) -> Option<(String, hb_core::manifest::ManifestEnvelope)> {
+    let mut best: Option<(u64, String, hb_core::manifest::ManifestEnvelope)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(parsed) = serde_json::from_slice::<CacheIndexEntry>(&bytes) else { continue };
+        if parsed.npub != author || parsed.slug != slug {
+            continue;
+        }
+        let Ok(env) = hb_core::manifest::ManifestEnvelope::from_json(&parsed.envelope) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(t, _, _)| parsed.last_access > *t) {
+            best = Some((parsed.last_access, parsed.fingerprint.clone(), env));
+        }
+    }
+    best.map(|(_, fp, env)| (fp, env))
+}
+
+/// The plaintext half of `manifest_cache::CacheEntry`, read here for scanning. A private struct
+/// twin, not a schema change: the fields are the cache's stable on-disk contract.
+#[derive(serde::Deserialize)]
+struct CacheIndexEntry {
+    npub: String,
+    slug: String,
+    fingerprint: String,
+    envelope: String,
+    last_access: u64,
+}
+
 /// **The asker's half.** Redeem a ticket that arrived by DM: dial the address it carries, fetch the
 /// manifest, and hand it to the M16 W4 gate.
 ///
@@ -254,6 +441,22 @@ pub async fn redeem_manifest_ticket(
 ) -> CmdResult<crate::commands::browse::ImportedManifest> {
     redeem_manifest_ticket_inner(npub, ticket_json, newest_fingerprint, &identity, &store, &endpoint)
         .await
+}
+
+/// Carrier 4 provenance — the redeem side's answer to "who served this copy?".
+///
+/// A re-serve is exactly the delivery whose ticket names a third-party author (`author_npub` is
+/// `Some`): the DM arrived from peer C while the collection is A's, so the serving peer is the DM
+/// sender. A direct serve (`None`, the `send_full_list` case) must stay `None` — the author served
+/// it themselves, and the UI's `reServed` branch must not fire. This is the SAME discriminator the
+/// claim key in `redeem_manifest_ticket_inner` already resolves from (`expected_author`), not a new
+/// signal.
+///
+/// `cached_at` is `None` on both paths: when C took its copy is a property of C's cache that never
+/// crosses the wire, and the envelope's own clock is A's authoring time, not a cache time —
+/// surfacing that would render a false date.
+pub(crate) fn carrier4_served_by(ticket: &TransportTicket, dm_sender: &str) -> Option<String> {
+    ticket.author_npub.is_some().then(|| dm_sender.to_string())
 }
 
 /// The whole of `redeem_manifest_ticket`'s behaviour, callable without a Tauri runtime.
@@ -300,9 +503,17 @@ pub(crate) async fn redeem_manifest_ticket_inner(
     // `request_id` **durably**, so: one ask admits one ticket, a retry must be that same ticket, and
     // a restart cannot resurrect the authorization. This is the security boundary; the ledger in the
     // Chat page is only render-idempotence.
+    //
+    // **Carrier 4 — the ask is keyed on the AUTHOR, not the sender.** On a re-serve the DM arrives
+    // from peer C but answers an ask we recorded about peer A's collection, so the key must be the
+    // one the asker recorded: `ticket.author_npub` when present, else the DM sender (`None` means
+    // "the issuer's own collection" — exactly today's behaviour). Keying on the sender would make
+    // every re-serve claim fall through as `Unsolicited` and fail closed.
+    let expected_author = ticket.author_npub.clone().unwrap_or_else(|| npub.clone());
     let claim = store
         .claim_manifest_ask(
             &npub,
+            &expected_author,
             &ticket.slug,
             ticket.ask_nonce.as_deref().unwrap_or_default(),
             &ticket.request_id,
@@ -335,7 +546,12 @@ pub(crate) async fn redeem_manifest_ticket_inner(
             .map_err(|_| anyhow::anyhow!("the manifest that arrived was not text"))?;
         imported = Some(
             accept_manifest_bytes(
-                &npub,
+                // Carrier 4: pin the author to the one the ticket names, not the DM sender. On a
+                // re-serve D receives A's envelope from C; pinning to C made `open_manifest`'s
+                // author check refuse every carrier-4 delivery. This also keys the CACHE by the
+                // resolved author, so a re-serve files A's manifest under A (not under C) — the
+                // cache write inside `accept_manifest_bytes` uses this same npub.
+                &expected_author,
                 Some(&ticket.slug),
                 raw,
                 newest_fingerprint.as_deref(),
@@ -350,8 +566,15 @@ pub(crate) async fn redeem_manifest_ticket_inner(
     })
     .await
     .map_err(cmd_err)?;
-    let imported =
+    let mut imported =
         imported.ok_or_else(|| "The manifest was acknowledged but never accepted.".to_string())?;
+    // Carrier 4 provenance: name the peer that actually served the copy when this was a re-serve
+    // (the ticket naming a third-party author is the discriminator — see `carrier4_served_by`).
+    // `ImportedManifest`'s fields are `pub` and `open_manifest` hardcodes `None` (it has no notion
+    // of who carried the bytes; the file/paste import path is by definition a direct serve), so
+    // this sets it AT the redeem call site rather than widening `accept_manifest_bytes` for all
+    // three of its callers.
+    imported.served_by = carrier4_served_by(&ticket, &npub);
 
     // **Consume the ask now that it has been answered** (owner ruling ①). One ask, one auto-dial:
     // leaving it would restore the standing authorization the nonce exists to remove, since a peer
@@ -374,6 +597,7 @@ pub(crate) async fn redeem_manifest_ticket_inner(
     // failure is loud rather than silent.
     if let Err(e) = store.spend_manifest_ask(
         &npub,
+        &expected_author,
         &ticket.slug,
         ticket.ask_nonce.as_deref().unwrap_or_default(),
     ) {
@@ -439,7 +663,7 @@ mod tests {
             .join("\n");
 
         for (cmd, inner) in
-            [("send_full_list", "send_full_list_inner"), ("redeem_manifest_ticket", "redeem_manifest_ticket_inner")]
+            [("send_full_list", "send_full_list_inner"), ("redeem_manifest_ticket", "redeem_manifest_ticket_inner"), ("send_cached_manifest", "send_cached_manifest_inner")]
         {
             let sig = format!("pub async fn {cmd}(");
             let at = code.find(&sig).unwrap_or_else(|| panic!("{cmd} not found"));
@@ -680,7 +904,7 @@ mod tests {
             let slug = "vault";
             let nonce = "nonce-1";
             store
-                .record_manifest_ask(npub, slug, "fp", "2026-01-01T00:00:00Z", nonce)
+                .record_manifest_ask(npub, npub, slug, "fp", "2026-01-01T00:00:00Z", nonce)
                 .unwrap();
 
             // First ticket: GRANTED the claim, then fails at the connect (nothing dialable) — the
@@ -698,7 +922,7 @@ mod tests {
                 !first.as_ref().unwrap_err().contains("already answering"),
                 "the first claim must be Granted, not refused: {first:?}"
             );
-            let ask = store.load_manifest_asks().unwrap().get(&format!("{npub}|{slug}")).unwrap().clone();
+            let ask = store.load_manifest_asks().unwrap().get(&format!("{npub}|{npub}|{slug}")).unwrap().clone();
             assert_eq!(ask.claimed_by.as_deref(), Some("req-A"), "the claim is durable on disk");
             assert!(!ask.spent, "a failed dial must not spend the ask");
 
@@ -713,7 +937,7 @@ mod tests {
             .await
             .expect_err("a second, different ticket must not take the same ask");
             assert_eq!(err, "Another link is already answering that request, so nothing was fetched.");
-            let ask = store.load_manifest_asks().unwrap().get(&format!("{npub}|{slug}")).unwrap().clone();
+            let ask = store.load_manifest_asks().unwrap().get(&format!("{npub}|{npub}|{slug}")).unwrap().clone();
             assert_eq!(ask.claimed_by.as_deref(), Some("req-A"), "a refused claim does not steal the ask");
 
             // The SAME ticket retries: granted again, proceeds to the connect. This is the pass
@@ -743,11 +967,11 @@ mod tests {
             let slug = "vault";
             let nonce = "nonce-1";
             store
-                .record_manifest_ask(npub, slug, "fp", "2026-01-01T00:00:00Z", nonce)
+                .record_manifest_ask(npub, npub, slug, "fp", "2026-01-01T00:00:00Z", nonce)
                 .unwrap();
             // Claim, then spend — the exact sequence a successful redemption leaves behind.
-            store.claim_manifest_ask(npub, slug, nonce, "req-A").unwrap();
-            store.spend_manifest_ask(npub, slug, nonce).unwrap();
+            store.claim_manifest_ask(npub, npub, slug, nonce, "req-A").unwrap();
+            store.spend_manifest_ask(npub, npub, slug, nonce).unwrap();
 
             let err = redeem(
                 npub,
@@ -759,6 +983,209 @@ mod tests {
             .await
             .expect_err("a spent ask must refuse even the ticket that spent it");
             assert_eq!(err, "You've already received this list. Ask again if you want a fresh copy.");
+        }
+
+        // ── Carrier 4 (QURATOR-79) — the redeem side's AUTHOR resolution ─────────────────────────
+        //
+        // Both tests are hermetic the same way `one_ask_admits_one_ticket` is: the ticket's address
+        // set carries nothing dialable, so a claim that is Granted proceeds to a connect that fails
+        // locally — no packet. What discriminates is WHICH key the claim resolved: an ask recorded
+        // for author A answers a ticket naming A (Granted → a dial error, not the claim refusal),
+        // and only that.
+
+        /// A re-serve redeem resolves the expected author from `ticket.author_npub`, not the DM
+        /// sender. The ask was recorded for `(sender C, author A, slug)` — the key the asker's side
+        /// writes via `build_manifest_request_for_author`. Keying the claim on the sender alone (the
+        /// pre-Carrier-4 shape) resolves `(C, C, slug)`, misses the ask, and every carrier-4
+        /// delivery fails closed as `Unsolicited`.
+        ///
+        /// MUTATION (P-10) — resolved by containing function: inside
+        /// `redeem_manifest_ticket_inner`, change
+        /// `let expected_author = ticket.author_npub.clone().unwrap_or_else(|| npub.clone());`
+        /// to `let expected_author = npub.clone();` → the claim resolves `(C, C, slug)`, misses the
+        /// recorded ask, and the `Unsolicited` assert below reds.
+        #[tokio::test]
+        async fn a_re_serve_redeem_resolves_the_author_from_the_ticket() {
+            let (_dir, store, identity, endpoint) = fixture();
+            let sender = "npub1server"; // peer C, who re-serves from its cache
+            let author = "npub1author"; // peer A, whose collection it is
+            let slug = "vault";
+            let nonce = "nonce-1";
+            // The asker's record: asked C for A's collection.
+            store
+                .record_manifest_ask(sender, author, slug, "fp", "2026-01-01T00:00:00Z", nonce)
+                .unwrap();
+
+            // A carrier-4 ticket: same shape the mint side stamps (`ticket.author_npub = Some(A)`).
+            let mut ticket: TransportTicket =
+                serde_json::from_str(&undialable_ticket("req-A", slug, Some(nonce))).unwrap();
+            ticket.author_npub = Some(author.to_string());
+            let err = redeem(
+                sender,
+                serde_json::to_string(&ticket).unwrap(),
+                &identity,
+                &store,
+                &endpoint,
+            )
+            .await
+            .expect_err("the undialable address can never deliver — but the CLAIM must be Granted");
+            assert_ne!(
+                err,
+                "That link doesn't answer a request you sent, so nothing was fetched.",
+                "the claim must resolve the author from the ticket, not the sender — got: {err}"
+            );
+            assert_ne!(
+                err,
+                "Another link is already answering that request, so nothing was fetched.",
+                "the claim must be Granted on the first ticket — got: {err}"
+            );
+            // And the claim was taken under the AUTHOR-scoped key, durably.
+            let asks = store.load_manifest_asks().unwrap();
+            let ask = asks.get(&format!("{sender}|{author}|{slug}")).unwrap();
+            assert_eq!(ask.claimed_by.as_deref(), Some("req-A"), "the claim landed on the author-scoped key");
+        }
+
+        /// The negative half of the boundary: an ask recorded for author A must NOT claim under a
+        /// key scoped to a different author. A ticket from C naming a DIFFERENT author B — the
+        /// cross-tenant collision shape — is `Unsolicited`, and nothing on disk moves.
+        ///
+        /// MUTATION (P-10) — resolved by containing function: inside `claim_manifest_ask`
+        /// (`store.rs`), replace the exact `manifest_ask_key(npub, author, slug)` lookup with an
+        /// author-BLIND fallback that matches any stored key sharing `(npub, slug)` (ignoring the
+        /// middle segment) → the ticket's claim resolves Granted on the asked-author's entry and the
+        /// `Unsolicited` assert below reds. (Verified: dropping the author from `manifest_ask_key`
+        /// alone does NOT redden this test — the lenient legacy widening then rewrites the collapsed
+        /// key back to the self spelling, so the ask still misses; that mutation reds the sibling
+        /// `a_re_serve_redeem_resolves_the_author_from_the_ticket` instead.)
+        #[tokio::test]
+        async fn a_re_serve_ask_does_not_claim_under_a_different_author() {
+            let (_dir, store, identity, endpoint) = fixture();
+            let sender = "npub1server";
+            let asked_author = "npub1author";
+            let other_author = "npub1other";
+            let slug = "vault";
+            let nonce = "nonce-1";
+            store
+                .record_manifest_ask(sender, asked_author, slug, "fp", "2026-01-01T00:00:00Z", nonce)
+                .unwrap();
+
+            // A ticket naming a DIFFERENT author than the one we asked about.
+            let mut ticket: TransportTicket =
+                serde_json::from_str(&undialable_ticket("req-X", slug, Some(nonce))).unwrap();
+            ticket.author_npub = Some(other_author.to_string());
+            let err = redeem(
+                sender,
+                serde_json::to_string(&ticket).unwrap(),
+                &identity,
+                &store,
+                &endpoint,
+            )
+            .await
+            .expect_err("a ticket for a different author's collection answers no ask of ours");
+            assert_eq!(
+                err,
+                "That link doesn't answer a request you sent, so nothing was fetched.",
+                "the author is part of the ask's identity — got: {err}"
+            );
+            // Nothing was claimed on any key for this sender/slug.
+            let asks = store.load_manifest_asks().unwrap();
+            assert!(
+                asks.values().all(|a| a.claimed_by.is_none()),
+                "a refused claim must not touch any ask: {asks:?}"
+            );
+        }
+
+        // ── Carrier 4 (QURATOR-79) — the redeem side's SERVED-BY provenance ──────────────────────
+        //
+        // The two halves of the discriminator. `carrier4_served_by` is the function the production
+        // redeem path calls on the returned `ImportedManifest` — there is no second copy of the
+        // discriminator here to drift (the §9 P-6 shape: a guard that re-emits its own copy of the
+        // thing it checks). The call-site wiring itself cannot be reached from a unit test: the
+        // success stage sits behind `fetch_manifest`'s real dial, and `sanitize_node_addr` strips the
+        // loopback address a hermetic endpoint could offer — the same documented OWED shape as the
+        // SSRF rewrite note above. What pins the wiring against drifting off the call site is the
+        // `redeem_sets_served_by_through_the_shared_discriminator` test below.
+
+        /// The re-serve half: a ticket naming a third-party author yields `served_by == Some(C)`,
+        /// where C is the DM sender — the peer whose cached copy arrived.
+        ///
+        /// MUTATION (P-10) — resolved by containing function: inside `carrier4_served_by`, change
+        /// `ticket.author_npub.is_some().then(|| dm_sender.to_string())` to
+        /// `Some(dm_sender.to_string())` (stop consulting the ticket) → this test STAYS green
+        /// (the value is the same); the SIBLING test `a_direct_serve_stays_served_by_none` is the
+        /// one that reds. The mutation that reds THIS test is the inverse, below.
+        #[test]
+        fn a_re_serve_names_the_serving_peer() {
+            let mut ticket: TransportTicket =
+                serde_json::from_str(&undialable_ticket("req-A", "vault", Some("nonce-1"))).unwrap();
+            ticket.author_npub = Some("npub1author".to_string());
+            assert_eq!(
+                carrier4_served_by(&ticket, "npub1server"),
+                Some("npub1server".to_string()),
+                "a re-serve names the DM sender (peer C), whose cached copy arrived"
+            );
+        }
+
+        /// The direct-serve half — LOAD-BEARING: the shape that must not regress, and the one that
+        /// distinguishes this fix from unconditionally setting the field. A ticket with NO
+        /// `author_npub` (the author served it themselves) yields `served_by == None`, so the UI's
+        /// `reServed` branch stays false and the plain "Full manifest imported" copy keeps firing.
+        ///
+        /// MUTATION (P-10) — resolved by containing function: inside `carrier4_served_by`, change
+        /// `ticket.author_npub.is_some().then(|| dm_sender.to_string())` to
+        /// `Some(dm_sender.to_string())` (stop consulting the ticket) → THIS test reds; the sibling
+        /// `a_re_serve_names_the_serving_peer` stays green. The pair together discriminates
+        /// "consults the ticket" from "always Some".
+        #[test]
+        fn a_direct_serve_stays_served_by_none() {
+            let ticket: TransportTicket =
+                serde_json::from_str(&undialable_ticket("req-A", "vault", Some("nonce-1"))).unwrap();
+            assert_eq!(
+                ticket.author_npub, None,
+                "fixture premise: a direct-serve ticket carries no author_npub"
+            );
+            assert_eq!(
+                carrier4_served_by(&ticket, "npub1author"),
+                None,
+                "a direct serve must not name a serving peer — the author served it themselves"
+            );
+        }
+
+        /// The wiring did not drift off the call site: the redeem path sets `served_by` by CALLING
+        /// the shared discriminator, not by re-deriving (or dropping) it. This is the drift guard
+        /// that keeps the two tests above attached to production — without it they pin a function
+        /// nothing calls, which is exactly how the field was decorative before this fix.
+        ///
+        /// MUTATION (P-10) — resolved by containing function: inside
+        /// `redeem_manifest_ticket_inner`, delete the statement
+        /// `imported.served_by = carrier4_served_by(&ticket, &npub);` → this test reds while both
+        /// sibling tests stay green (they test the function directly).
+        #[test]
+        fn redeem_sets_served_by_through_the_shared_discriminator() {
+            let src = include_str!("fulfil.rs");
+            // Comments stripped, so documenting the rule cannot satisfy it.
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Resolve by containing function, never by matching text anywhere. And bound the
+            // region at `#[cfg(test)]`: this test's own assertion literal echoes the assignment it
+            // checks, so an unbounded to-EOF scan would be satisfied by its own copy — the exact
+            // P-6 shape the guard exists to prevent.
+            let sig = "async fn redeem_manifest_ticket_inner(";
+            let at = code.find(sig).expect("the inner fn must exist");
+            let end = code[at..]
+                .find("#[cfg(test)]")
+                .expect("the test module must follow the inner fn")
+                + at;
+            let body = &code[at..end];
+            assert!(
+                body.contains("imported.served_by = carrier4_served_by(&ticket, &npub);"),
+                "the redeem path must set served_by through the shared `carrier4_served_by` \
+                 discriminator — an inline re-derivation or a dropped assignment is the P-6 \
+                 lookalike shape this field was decorative under"
+            );
         }
 
         // ── send_full_list — the owner side's early guards ──────────────────────────────────────

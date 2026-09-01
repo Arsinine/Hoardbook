@@ -397,6 +397,38 @@ pub async fn fetch_membership_events(
     client.fetch(filter, timeout).await
 }
 
+/// **Topic aliveness** (QURATOR-148, owner ruling 2026-08-31): how many of this Topic's roster
+/// published a presence beacon within [`crate::count::TOPIC_ALIVE_WINDOW_SECS`] (30 days). `0` ⇒ the Topic
+/// is not alive and drops out of the discovery sidebar. "People are already using [the presence
+/// beacon] to signal they're on"; kind-11111 is replaceable, so the relay keeps each npub's newest
+/// beacon with its `created_at` — the durable, anyone-can-observe last-seen record.
+///
+/// **The roster's real npubs need the topic key** (they live inside the membership ciphertext).
+/// For a member this is the stored key. For an un-joined public Topic the caller may recover the
+/// key read-only via the name-derived public-join credential ([`join_public`] semantics — the
+/// credential is reusable, has no expiry, and is not consumed by redemption), so aliveness gates
+/// discovery without joining. Private Topics are out of scope by ruling (the key is a genuine
+/// crypto bar).
+///
+/// The presence read itself is [`crate::fetch_last_seen_for_authors`]: **author-bounded**, never a
+/// global unbounded kind-11111 query (the 2026-08-01 launch-gate defect class). A relay/connect
+/// error is `Err` — the caller treats aliveness as unknown, never as dead.
+pub async fn alive_member_count(
+    client: &RelayClient,
+    topic_id: &str,
+    key: &TopicKey,
+    window_secs: u64,
+    timeout: Duration,
+) -> Result<usize, NetError> {
+    let events = fetch_membership_events(client, topic_id, timeout).await?;
+    let roster = roster(key, &events);
+    if roster.is_empty() {
+        return Ok(0); // dissolved (empty roster is the derived dissolution signal) ⇒ not alive
+    }
+    let (alive, _) = crate::count::fetch_last_seen_for_authors(client, &roster, window_secs, timeout).await?;
+    Ok(alive.len())
+}
+
 /// Join a Topic: publish a membership event (signed on the wire under the derived pseudonym, carrying
 /// the member's real-key proof of participation). Takes the member's own `Identity` (you only join as
 /// yourself). Returns the published event so the caller can persist it and later [`leave_topic`].
