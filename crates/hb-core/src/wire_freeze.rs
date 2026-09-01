@@ -26,6 +26,10 @@ fn event_kinds_are_frozen() {
     assert_eq!(event::KIND_TEASER, 30_117, "KIND_TEASER — {FREEZE}");
     assert_eq!(event::KIND_LISTING, 31_111, "KIND_LISTING — {FREEZE}");
     assert_eq!(priv_listing::KIND_PRIV_LISTING, 31_113, "KIND_PRIV_LISTING — {FREEZE}");
+    // ADDED (QURATOR-160), never bumped: the inner key-grant kind — sealed inside a NIP-59 wrap,
+    // never a top-level event, so adding it changes no existing wire traffic (no existing field's
+    // meaning moved; this is a new pin, which is the only edit wire_freeze permits).
+    assert_eq!(priv_listing::KIND_KEY_GRANT, 31_114, "KIND_KEY_GRANT — {FREEZE}");
     assert_eq!(topic::KIND_TOPIC_ANNOUNCE, 31_117, "KIND_TOPIC_ANNOUNCE — {FREEZE}");
     assert_eq!(topic::KIND_TOPIC_MEMBER, 31_118, "KIND_TOPIC_MEMBER — {FREEZE}");
     assert_eq!(topic::KIND_TOPIC_POST, 1_117, "KIND_TOPIC_POST — {FREEZE}");
