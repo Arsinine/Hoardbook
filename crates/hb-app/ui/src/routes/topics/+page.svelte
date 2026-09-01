@@ -352,6 +352,7 @@
 				// counts and suppress the re-fetch (the rank filter trusts the set), degrading the
 				// group's popularity order to paint order for the rest of the session.
 				rankedIds = new Set();
+				deadDropped = 0;
 				painted = true;
 				paintError = false;
 				// QURATOR-145 (W3): only a NON-EMPTY answer enters the cross-mount cache. An empty
@@ -387,6 +388,9 @@
 	// group most-popular-first as the counts land. Bounded to concurrency 8 by hb-net (`topic_rank`);
 	// this side bounds the REQUEST to the drawn rows, which is the other half of the bound.
 	let rankedIds = $state(new Set<string>());
+	// QURATOR-148: how many painted rows the aliveness fold has DROPPED (known-dead Topics). Drives
+	// the honest all-quiet empty state above — reset on each fresh paint, like `rankedIds`.
+	let deadDropped = $state(0);
 	let rankGeneration = 0;
 	async function rankDrawnRows(generation: number) {
 		// Await the flush BEFORE consulting collapse state: this runs in the same turn that set
@@ -419,14 +423,30 @@
 		// neither drains the other's slots: the first 8 ids cannot all come from one root.
 		const ids = interleaveRoundRobin(queues);
 		try {
-			const ranks = await topicRank(ids);
+			// QURATOR-148: each ranked row rides with its directory NAME — the backend derives the
+			// public-join credential from it to recover a non-member's topic key for the aliveness
+			// read. An id that somehow misses the directory sends '' (recovery skipped, aliveness
+			// stays unknown — never a guessed name).
+			const nameById = new Map(directory.map((d) => [d.topic_id, d.name]));
+			const ranks = await topicRank(ids.map((id) => ({ topic_id: id, name: nameById.get(id) ?? '' })));
 			if (generation !== rankGeneration) return; // a newer pass superseded this rank request
 			// Fold the counts in: unknown stays unknown (null), never 0.
 			const byId = new Map(ranks.map((r) => [r.topic_id, r.member_count_estimate]));
+			// QURATOR-148: fold aliveness in alongside. A KNOWN zero (no member pinged in 30 days)
+			// drops the row from the directory — "whether or not it's worth joining, meaning whether
+			// or not it shows up as an option in the discovery sidebar". null is UNKNOWN: the row
+			// stays (the same never-a-confident-zero rule the count obeys). The backend reads a
+			// non-member row's roster via the name-derived public-join credential (the name rides
+			// the rank request above), so an unjoined public row CAN come back as a known 0 here.
+			const aliveById = new Map(ranks.map((r) => [r.topic_id, r.alive_count]));
+			const dropped = directory.filter((d) => aliveById.get(d.topic_id) === 0).length;
+			if (dropped > 0) deadDropped += dropped;
 			directory = orderByMemberCount(
-				directory.map((d) =>
-					byId.has(d.topic_id) ? { ...d, member_count_estimate: byId.get(d.topic_id)! } : d,
-				),
+				directory
+					.filter((d) => aliveById.get(d.topic_id) !== 0)
+					.map((d) =>
+						byId.has(d.topic_id) ? { ...d, member_count_estimate: byId.get(d.topic_id)! } : d,
+					),
 			);
 			rankedIds = new Set([...rankedIds, ...ids]);
 		} catch {
@@ -819,10 +839,19 @@
 			return;
 		}
 		try {
-			const ranks = await topicRank([d.topic_id]);
+			const ranks = await topicRank([{ topic_id: d.topic_id, name: d.name }]);
 			// A stale resolve (the user moved on to another row) must not bind here.
 			if (selectedDiscoveredId === d.topic_id && ranks.length > 0) {
 				selectedClaimed = ranks[0].member_count_estimate;
+				// QURATOR-148: the same answer carries aliveness. A KNOWN dead Topic (no member
+				// pinged in 30 days) must not keep a selected row alive either — drop the selection
+				// so the row leaves the directory and the detail pane returns to the empty state.
+				if (ranks[0].alive_count === 0) {
+					directory = directory.filter((x) => x.topic_id !== d.topic_id);
+					deadDropped += 1;
+					if (selectedDiscoveredId === d.topic_id) selectedDiscoveredId = null;
+					selectedClaimed = null;
+				}
 			}
 		} catch {
 			/* the count is cosmetic — the row's honest content does not depend on it */
@@ -880,7 +909,15 @@
 					onretry={() => { painted = false; paintError = false; void paintDirectory(); }}
 				/>
 			{:else if mergedRows.length === 0}
-				<EmptyState message="Nothing here yet. Create a Topic, or join one from the directory." />
+				<!-- QURATOR-148: an empty tree is not always "nothing exists" — a paint can return
+				     rows whose Topics are all dead (no member pinged in 30 days), which the rank
+				     fold drops. Painted-but-dropped is a DIFFERENT honest state from never-painted:
+				     it says the directory was read and nothing in it is worth joining. -->
+				{#if painted && directory.length === 0 && deadDropped > 0}
+					<EmptyState message="No live Topics right now — every public Topic in the directory went quiet over 30 days ago. Create one, or check back later." />
+				{:else}
+					<EmptyState message="Nothing here yet. Create a Topic, or join one from the directory." />
+				{/if}
 			{:else}
 				{#each groups as g (g.root)}
 					{@const rows = rowsForRoot(g.root)}

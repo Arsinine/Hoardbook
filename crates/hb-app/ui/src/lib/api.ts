@@ -611,12 +611,14 @@ export const topicDiscover = (tags: string[]) =>
 export const topicDiscoverPaint = (tags: string[]) =>
 	invoke<DiscoveredTopic[]>('topic_discover_paint', { tags });
 
-/** The W1 LAZY-RANK half (QURATOR-143): fetch the spoofable member count for exactly the ids sent
+/** The W1 LAZY-RANK half (QURATOR-143): fetch the spoofable member count for exactly the rows sent
  *  (bounded to concurrency 8 in hb-net), returning `(topic_id, count)` pairs count-desc. Send ONLY
- *  the ids of rows that will actually be drawn — bounding the wave to the screen is this caller's
- *  half of the relay-citizenship contract. */
-export const topicRank = (topicIds: string[]) =>
-	invoke<TopicRank[]>('topic_rank', { topicIds });
+ *  the rows that will actually be drawn — bounding the wave to the screen is this caller's half of
+ *  the relay-citizenship contract. Each row carries its NAME alongside the id (QURATOR-148): the
+ *  name derives the public-join credential a non-member's aliveness read recovers the topic key
+ *  with — without it `alive_count` can only ever come back null (unknown). */
+export const topicRank = (topics: { topic_id: string; name: string }[]) =>
+	invoke<TopicRank[]>('topic_rank', { topics });
 
 /** Join-first lookup (devtest #11): does this public Topic name already have a room? Never call for
  *  a private Topic (no announce to find). */

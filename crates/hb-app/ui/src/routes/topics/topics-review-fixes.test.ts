@@ -126,7 +126,7 @@ describe('review 2 — the rank queue excludes joined topic_ids', () => {
 
 		render(TopicsPage);
 		await waitFor(() => expect(rankMock).toHaveBeenCalled());
-		const ids = rankMock.mock.calls.flatMap((c) => c[0] as string[]);
+		const ids = rankMock.mock.calls.flatMap((c) => (c[0] as { topic_id: string }[]).map((r) => r.topic_id));
 		expect(ids).not.toContain('mine-joined'); // the joined id never spends a read
 		expect(ids).toContain('u1');
 		expect(ids).toContain('u2');
@@ -141,7 +141,7 @@ describe('review 2 — the rank queue excludes joined topic_ids', () => {
 
 		render(TopicsPage);
 		await waitFor(() => expect(rankMock).toHaveBeenCalled());
-		const ids = rankMock.mock.calls.flatMap((c) => c[0] as string[]);
+		const ids = rankMock.mock.calls.flatMap((c) => (c[0] as { topic_id: string }[]).map((r) => r.topic_id));
 		expect(ids.every((id) => id !== 'mine-joined')).toBe(true);
 		expect(ids.length).toBeLessThanOrEqual(25); // the cap spends itself on unjoined rows only
 	});
@@ -300,7 +300,7 @@ describe('review 4 — the paint-time rank pass skips collapsed groups; expand r
 		await fireEvent.click(header!);
 		await tick();
 		await waitFor(() => expect(rankMock).toHaveBeenCalled());
-		const ids = rankMock.mock.calls.flatMap((c) => c[0] as string[]);
+		const ids = rankMock.mock.calls.flatMap((c) => (c[0] as { topic_id: string }[]).map((r) => r.topic_id));
 		expect(ids).toContain('d1');
 		expect(ids).toContain('d2');
 	});
@@ -313,7 +313,7 @@ describe('review 4 — the paint-time rank pass skips collapsed groups; expand r
 		const { container } = render(TopicsPage);
 		await waitFor(() => expect(container.textContent).toContain('retro')); // group open, row drawn
 		await waitFor(() => expect(rankMock).toHaveBeenCalled());
-		expect(rankMock.mock.calls.flatMap((c) => c[0] as string[])).toContain('d1');
+		expect(rankMock.mock.calls.flatMap((c) => (c[0] as { topic_id: string }[]).map((r) => r.topic_id))).toContain('d1');
 	});
 });
 

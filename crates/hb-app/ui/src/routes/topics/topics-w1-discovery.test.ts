@@ -139,7 +139,7 @@ describe('QURATOR-143 W1 (W2 sidebar form) — the lazy ranker is bounded and ro
 		await tick();
 
 		await waitFor(() => expect(rankMock).toHaveBeenCalled());
-		const ids = rankMock.mock.calls[0][0] as string[];
+		const ids = (rankMock.mock.calls[0][0] as { topic_id: string }[]).map((r) => r.topic_id);
 		expect(ids.length).toBe(25);
 		expect(ids.every((id) => id.startsWith('video-'))).toBe(true);
 		// And the remainder is STATED, never silently truncated.
@@ -162,7 +162,7 @@ describe('QURATOR-143 W1 (W2 sidebar form) — the lazy ranker is bounded and ro
 			await tick();
 		}
 		await waitFor(() => expect(rankMock).toHaveBeenCalled());
-		const ids = rankMock.mock.calls[0][0] as string[];
+		const ids = (rankMock.mock.calls[0][0] as { topic_id: string }[]).map((r) => r.topic_id);
 		expect(ids.length).toBe(24);
 		const firstEight = ids.slice(0, 8);
 		const roots = new Set(firstEight.map((id) => id.split('-')[0]));
