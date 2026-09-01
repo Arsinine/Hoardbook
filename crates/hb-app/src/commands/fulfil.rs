@@ -443,6 +443,22 @@ pub async fn redeem_manifest_ticket(
         .await
 }
 
+/// Carrier 4 provenance — the redeem side's answer to "who served this copy?".
+///
+/// A re-serve is exactly the delivery whose ticket names a third-party author (`author_npub` is
+/// `Some`): the DM arrived from peer C while the collection is A's, so the serving peer is the DM
+/// sender. A direct serve (`None`, the `send_full_list` case) must stay `None` — the author served
+/// it themselves, and the UI's `reServed` branch must not fire. This is the SAME discriminator the
+/// claim key in `redeem_manifest_ticket_inner` already resolves from (`expected_author`), not a new
+/// signal.
+///
+/// `cached_at` is `None` on both paths: when C took its copy is a property of C's cache that never
+/// crosses the wire, and the envelope's own clock is A's authoring time, not a cache time —
+/// surfacing that would render a false date.
+pub(crate) fn carrier4_served_by(ticket: &TransportTicket, dm_sender: &str) -> Option<String> {
+    ticket.author_npub.is_some().then(|| dm_sender.to_string())
+}
+
 /// The whole of `redeem_manifest_ticket`'s behaviour, callable without a Tauri runtime.
 pub(crate) async fn redeem_manifest_ticket_inner(
     npub: String,
@@ -550,8 +566,15 @@ pub(crate) async fn redeem_manifest_ticket_inner(
     })
     .await
     .map_err(cmd_err)?;
-    let imported =
+    let mut imported =
         imported.ok_or_else(|| "The manifest was acknowledged but never accepted.".to_string())?;
+    // Carrier 4 provenance: name the peer that actually served the copy when this was a re-serve
+    // (the ticket naming a third-party author is the discriminator — see `carrier4_served_by`).
+    // `ImportedManifest`'s fields are `pub` and `open_manifest` hardcodes `None` (it has no notion
+    // of who carried the bytes; the file/paste import path is by definition a direct serve), so
+    // this sets it AT the redeem call site rather than widening `accept_manifest_bytes` for all
+    // three of its callers.
+    imported.served_by = carrier4_served_by(&ticket, &npub);
 
     // **Consume the ask now that it has been answered** (owner ruling ①). One ask, one auto-dial:
     // leaving it would restore the standing authorization the nonce exists to remove, since a peer
@@ -1069,6 +1092,99 @@ mod tests {
             assert!(
                 asks.values().all(|a| a.claimed_by.is_none()),
                 "a refused claim must not touch any ask: {asks:?}"
+            );
+        }
+
+        // ── Carrier 4 (QURATOR-79) — the redeem side's SERVED-BY provenance ──────────────────────
+        //
+        // The two halves of the discriminator. `carrier4_served_by` is the function the production
+        // redeem path calls on the returned `ImportedManifest` — there is no second copy of the
+        // discriminator here to drift (the §9 P-6 shape: a guard that re-emits its own copy of the
+        // thing it checks). The call-site wiring itself cannot be reached from a unit test: the
+        // success stage sits behind `fetch_manifest`'s real dial, and `sanitize_node_addr` strips the
+        // loopback address a hermetic endpoint could offer — the same documented OWED shape as the
+        // SSRF rewrite note above. What pins the wiring against drifting off the call site is the
+        // `redeem_sets_served_by_through_the_shared_discriminator` test below.
+
+        /// The re-serve half: a ticket naming a third-party author yields `served_by == Some(C)`,
+        /// where C is the DM sender — the peer whose cached copy arrived.
+        ///
+        /// MUTATION (P-10) — resolved by containing function: inside `carrier4_served_by`, change
+        /// `ticket.author_npub.is_some().then(|| dm_sender.to_string())` to
+        /// `Some(dm_sender.to_string())` (stop consulting the ticket) → this test STAYS green
+        /// (the value is the same); the SIBLING test `a_direct_serve_stays_served_by_none` is the
+        /// one that reds. The mutation that reds THIS test is the inverse, below.
+        #[test]
+        fn a_re_serve_names_the_serving_peer() {
+            let mut ticket: TransportTicket =
+                serde_json::from_str(&undialable_ticket("req-A", "vault", Some("nonce-1"))).unwrap();
+            ticket.author_npub = Some("npub1author".to_string());
+            assert_eq!(
+                carrier4_served_by(&ticket, "npub1server"),
+                Some("npub1server".to_string()),
+                "a re-serve names the DM sender (peer C), whose cached copy arrived"
+            );
+        }
+
+        /// The direct-serve half — LOAD-BEARING: the shape that must not regress, and the one that
+        /// distinguishes this fix from unconditionally setting the field. A ticket with NO
+        /// `author_npub` (the author served it themselves) yields `served_by == None`, so the UI's
+        /// `reServed` branch stays false and the plain "Full manifest imported" copy keeps firing.
+        ///
+        /// MUTATION (P-10) — resolved by containing function: inside `carrier4_served_by`, change
+        /// `ticket.author_npub.is_some().then(|| dm_sender.to_string())` to
+        /// `Some(dm_sender.to_string())` (stop consulting the ticket) → THIS test reds; the sibling
+        /// `a_re_serve_names_the_serving_peer` stays green. The pair together discriminates
+        /// "consults the ticket" from "always Some".
+        #[test]
+        fn a_direct_serve_stays_served_by_none() {
+            let ticket: TransportTicket =
+                serde_json::from_str(&undialable_ticket("req-A", "vault", Some("nonce-1"))).unwrap();
+            assert_eq!(
+                ticket.author_npub, None,
+                "fixture premise: a direct-serve ticket carries no author_npub"
+            );
+            assert_eq!(
+                carrier4_served_by(&ticket, "npub1author"),
+                None,
+                "a direct serve must not name a serving peer — the author served it themselves"
+            );
+        }
+
+        /// The wiring did not drift off the call site: the redeem path sets `served_by` by CALLING
+        /// the shared discriminator, not by re-deriving (or dropping) it. This is the drift guard
+        /// that keeps the two tests above attached to production — without it they pin a function
+        /// nothing calls, which is exactly how the field was decorative before this fix.
+        ///
+        /// MUTATION (P-10) — resolved by containing function: inside
+        /// `redeem_manifest_ticket_inner`, delete the statement
+        /// `imported.served_by = carrier4_served_by(&ticket, &npub);` → this test reds while both
+        /// sibling tests stay green (they test the function directly).
+        #[test]
+        fn redeem_sets_served_by_through_the_shared_discriminator() {
+            let src = include_str!("fulfil.rs");
+            // Comments stripped, so documenting the rule cannot satisfy it.
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Resolve by containing function, never by matching text anywhere. And bound the
+            // region at `#[cfg(test)]`: this test's own assertion literal echoes the assignment it
+            // checks, so an unbounded to-EOF scan would be satisfied by its own copy — the exact
+            // P-6 shape the guard exists to prevent.
+            let sig = "async fn redeem_manifest_ticket_inner(";
+            let at = code.find(sig).expect("the inner fn must exist");
+            let end = code[at..]
+                .find("#[cfg(test)]")
+                .expect("the test module must follow the inner fn")
+                + at;
+            let body = &code[at..end];
+            assert!(
+                body.contains("imported.served_by = carrier4_served_by(&ticket, &npub);"),
+                "the redeem path must set served_by through the shared `carrier4_served_by` \
+                 discriminator — an inline re-derivation or a dropped assignment is the P-6 \
+                 lookalike shape this field was decorative under"
             );
         }
 
