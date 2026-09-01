@@ -36,11 +36,13 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use hb_core::event::{build_listing_event, build_teaser, KIND_LISTING, KIND_TEASER, Teaser};
+use hb_core::event::{
+    build_listing_event, build_teaser, parse_listing_event, KIND_LISTING, KIND_TEASER, Teaser,
+};
 use hb_core::Identity;
 use hb_net::{
-    bootstrap_order, build_relay_list, fetch_full_listing_if_current, parse_relay_list,
-    publish_listing_capped, publish_listing_to, search_teasers, RelayClient,
+    bootstrap_order, build_relay_list, fetch_full_listing_from, fetch_full_listing_if_current,
+    parse_relay_list, publish_listing_capped, publish_listing_to, search_teasers, RelayClient,
 };
 use nostr::prelude::*;
 use serde_json::Value;
@@ -503,6 +505,25 @@ async fn d4_bigrelay_cross_region(probe: &ProbeInput) -> Result<(), String> {
     eprintln!("   D4 truncated teaser → normal relay ({}) ONLY", normal);
     settle().await;
 
+    // QURATOR-169 evidence: `fetch_full_listing_if_current` collapsing to `None` here conflates four
+    // materially different causes, and the old failure message asserted "fingerprint matched" for a
+    // branch this row never evaluated. Before the gated fetch, independently read back what the big
+    // relay actually holds for this author/slug and compare it against what the gated fetch needs.
+    //   (a) parts never landed — publish reported success but the relay dropped/rate-limited them
+    //       (publish counts events SENT, not events INDEXED). 0 part events readable → (a).
+    //   (b) landed but not fetched — subscription/filter/timing (settle too short, restricted relay
+    //       list not applied, relay slow to index). Parts readable here but `fetch_err`/`render_err`
+    //       below → (b). If this looks like the big relay throttling a multi-part publish/read, the
+    //       fix is a HARNESS correction (back off / retry), never a recorded product defect.
+    //   (c) fetched but the fingerprints did not agree, so the staleness gate refused the family —
+    //       see the `fingerprints_seen` vs `fp` comparison below. NOTE the real gate
+    //       (`full_supersedes`) compares `teaser_fingerprint` against `fp`, and the fixture
+    //       `full_listing` stamps NO `teaser_fingerprint` — a legitimate `(c)` way for this row to
+    //       fail that is a FIXTURE gap, not a product fault (hb-it's suite_bigrelay stamps it).
+    //   (d) all parts arrived but restitching failed — `fetch_err` carries the render error.
+    let diag = d4_big_relay_state(big, &owner, &slug, &key, &fp).await;
+    eprintln!("   D4 pre-fetch big-relay read: {}", diag.summary());
+
     // A holder browses: fetch the full family from the big relay, gated on the teaser's fingerprint.
     let browser = connect(&Identity::generate(), &probe.relays)
         .await
@@ -517,9 +538,13 @@ async fn d4_bigrelay_cross_region(probe: &ProbeInput) -> Result<(), String> {
         RELAY_TIMEOUT,
     )
     .await
-    .map_err(|e| format!("D4 fetch_full_listing_if_current: {e}"))?;
+    .map_err(|e| format!("D4 fetch_full_listing_if_current: {e} (diag: {})", diag.summary()))?;
     let full_tree = current.ok_or_else(|| {
-        "D4 a current big-relay family must supersede the teaser (fingerprint matched)".to_string()
+        format!(
+            "D4 a current big-relay family must supersede the teaser — the gated fetch returned \
+             None. Observed: {}",
+            diag.summary()
+        )
     })?;
     if !full_tree.complete() {
         return Err("D4 the full family did not render as a complete tree".to_string());
@@ -639,6 +664,199 @@ fn full_listing(slug: &str, n: usize, fp: &str) -> String {
 fn token() -> String {
     let bytes: [u8; 4] = rand::random();
     hex::encode(bytes)
+}
+
+// ---------------------------------------------------------------------------
+// D4 diagnostics (QURATOR-169) — what the big relay ACTUALLY holds, independently of the gated
+// fetch under test. `fetch_full_listing_if_current` collapsing to `None` conflates four causes
+// (parts-never-landed / landed-but-not-fetched / fingerprint-mismatch / restitch-failed); this
+// read separates them so a WAN failure names WHICH it hit.
+// ---------------------------------------------------------------------------
+
+/// What an independent raw read of the big relay found for the D4 author/slug.
+struct BigRelayState {
+    /// How the raw read itself went (the diagnostic can fail too — never fold that into the row's
+    /// verdict about the fetch path).
+    read_err: Option<String>,
+    /// Decrypted payload count for this slug's family (index + parts).
+    parts_seen: usize,
+    /// Distinct `d`-tags those payloads carried (index = the bare slug; parts = `slug#partN`).
+    d_tags_seen: Vec<String>,
+    /// Per-payload fingerprint pairs found in decrypted JSON, as `(d_tag, snapshot_fp, teaser_fp)`.
+    /// `None` fingerprint = the payload carried no such field.
+    fingerprints_seen: Vec<(String, Option<String>, Option<String>)>,
+    /// Whether ANY decrypted payload carries the row's expected `snapshot_fingerprint` (`fp`).
+    /// NOTE: the real gate compares `teaser_fingerprint` — see the (c) note at the call site.
+    snapshot_fp_matches: bool,
+    /// Whether ANY decrypted payload carries `teaser_fingerprint == fp` (what the gate reads).
+    teaser_fp_matches: bool,
+    /// What `fetch_full_listing_from` (ungated) did over the same relay: `Err(msg)` = fetch or
+    /// render failed (cases b/d), `Ok(n)` = rendered fine with n entries, so a `None` from the
+    /// gated call is the staleness gate refusing (case c).
+    ungated: Result<usize, String>,
+}
+
+impl BigRelayState {
+    fn summary(&self) -> String {
+        let read = match &self.read_err {
+            Some(e) => format!("raw read FAILED ({e})"),
+            None => format!(
+                "raw read: {} payload(s) across d-tags {:?}",
+                self.parts_seen, self.d_tags_seen
+            ),
+        };
+        let fps = self
+            .fingerprints_seen
+            .iter()
+            .map(|(d, s, t)| {
+                format!(
+                    "{d}: snapshot_fp={} teaser_fp={}",
+                    s.as_deref().unwrap_or("<none>"),
+                    t.as_deref().unwrap_or("<none>")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let ungated = match &self.ungated {
+            Ok(n) => format!("ungated fetch rendered a complete tree ({n} entries)"),
+            Err(e) => format!("ungated fetch FAILED: {e}"),
+        };
+        format!(
+            "{read}; fingerprints [{fps}]; snapshot_fp match: {}, teaser_fp (what the gate \
+             compares) match: {}; {ungated}",
+            self.snapshot_fp_matches, self.teaser_fp_matches
+        )
+    }
+}
+
+/// Independently read back what the big relay holds for `owner`/`slug` (QURATOR-169 evidence).
+/// One `KIND_LISTING` fetch by author (the widest honest scope the family shape allows), filtered
+/// client-side to this slug's family, then decrypted and inspected for both fingerprint fields.
+/// Never fails the row: every error is carried into the printed summary.
+async fn d4_big_relay_state(
+    big: &str,
+    owner: &Identity,
+    slug: &str,
+    key: &[u8; 32],
+    fp: &str,
+) -> BigRelayState {
+    let part_prefix = format!("{slug}#part");
+    let mut state = BigRelayState {
+        read_err: None,
+        parts_seen: 0,
+        d_tags_seen: Vec::new(),
+        fingerprints_seen: Vec::new(),
+        snapshot_fp_matches: false,
+        teaser_fp_matches: false,
+        ungated: Err("not attempted".to_string()),
+    };
+
+    let reader = match connect(&Identity::generate(), std::slice::from_ref(&big.to_string())).await {
+        Ok(c) => c,
+        Err(e) => {
+            state.read_err = Some(format!("connect: {e}"));
+            return state;
+        }
+    };
+    let events = match reader
+        .fetch(Filter::new().author(owner.public_key()).kind(Kind::from_u16(KIND_LISTING)), RELAY_TIMEOUT)
+        .await
+    {
+        Ok(evs) => evs,
+        Err(e) => {
+            state.read_err = Some(format!("author fetch: {e}"));
+            let _ = reader.disconnect().await;
+            return state;
+        }
+    };
+    let _ = reader.disconnect().await;
+
+    // Group by d-tag, newest per d — the same newest-wins discipline `render_slug_family` applies.
+    let mut by_d: std::collections::HashMap<String, Vec<Event>> = std::collections::HashMap::new();
+    for ev in events {
+        if ev.created_at > now_secs() + 60 {
+            continue; // a future-dated stray; newest-wins below must not be poisoned by it
+        }
+        if let Some(d) = ev.tags.identifier() {
+            if d == slug || d.starts_with(&part_prefix) {
+                by_d.entry(d.to_string()).or_default().push(ev);
+            }
+        }
+    }
+    let mut d_tags: Vec<(String, Event)> = by_d
+        .into_iter()
+        .map(|(d, mut group)| {
+            group.sort_by_key(|e| e.created_at.as_u64());
+            (d, group.pop().unwrap())
+        })
+        .collect();
+    d_tags.sort();
+
+    for (d, ev) in &d_tags {
+        state.d_tags_seen.push(d.clone());
+        state.parts_seen += 1;
+        // Decrypt with the same production parser the fetch path uses (re-verifies the signature).
+        match parse_listing_event(ev, key) {
+            Ok((_slug, json)) => {
+                let v: Value = match serde_json::from_str(&json) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        state.fingerprints_seen.push((d.clone(), None, None));
+                        continue;
+                    }
+                };
+                let sfp = v.get("snapshot_fingerprint").and_then(Value::as_str).map(str::to_string);
+                let tfp = v.get("teaser_fingerprint").and_then(Value::as_str).map(str::to_string);
+                if sfp.as_deref() == Some(fp) {
+                    state.snapshot_fp_matches = true;
+                }
+                if tfp.as_deref() == Some(fp) {
+                    state.teaser_fp_matches = true;
+                }
+                state.fingerprints_seen.push((d.clone(), sfp, tfp));
+            }
+            Err(e) => {
+                // Undecryptable = an event that is not part of this family's keying (or a corrupt
+                // one) — record it as a payload with no fingerprints rather than aborting the read.
+                let _ = e;
+                state.fingerprints_seen.push((d.clone(), None, None));
+            }
+        }
+    }
+    if state.d_tags_seen.is_empty() {
+        state.read_err = Some("author fetch returned no events for this slug's family".to_string());
+    }
+
+    // The ungated counterpart of the call under test, over the SAME restricted relay list: if this
+    // renders while the gated call returned None, the gate (fingerprint) refused the family — (c).
+    // If this fails too, the failure is upstream of the gate — (a)/(b)/(d) — with the error naming
+    // which (a fetch error = (b); a Split/render error = (d); "no listing found" = (a)).
+    let browser = connect(&Identity::generate(), std::slice::from_ref(&big.to_string())).await;
+    state.ungated = match browser {
+        Ok(b) => {
+            let r = fetch_full_listing_from(
+                &b,
+                &owner.public_key(),
+                slug,
+                key,
+                std::slice::from_ref(&big.to_string()),
+                RELAY_TIMEOUT,
+            )
+            .await;
+            let _ = b.disconnect().await;
+            match r {
+                Ok(rendered) => Ok(rendered.entries.len()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        Err(e) => Err(format!("connect: {e}")),
+    };
+    state
+}
+
+/// Wall-clock seconds (for the future-dated-stray guard above).
+fn now_secs() -> Timestamp {
+    Timestamp::now()
 }
 
 // ---------------------------------------------------------------------------
