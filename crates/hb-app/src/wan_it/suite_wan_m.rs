@@ -607,15 +607,21 @@ pub async fn m4_n0_canary() -> Result<(), String> {
     // (1) Bind a listening endpoint via the production path. bind_endpoint uses presets::N0 + the
     //     manifest ALPN — the same binding serve uses. A fresh transport secret per run is fine (M4
     //     asserts reachability, not stable identity).
+    let t_start = std::time::Instant::now();
     let server_secret: [u8; 32] = rand::random();
     let server = bind_endpoint(&server_secret)
         .await
         .map_err(|e| format!("M4 bind_endpoint (presets::N0 listener) failed: {e}"))?;
-    eprintln!("   M4 listener bound via presets::N0; waiting for a home relay");
+    let t_bind = t_start.elapsed();
+    eprintln!(
+        "   M4 listener bound via presets::N0 in {:.2}s; waiting for a home relay",
+        t_bind.as_secs_f64()
+    );
 
     // (2) Wait for the listener to acquire a home relay. The addr watcher yields EndpointAddrs; once
     //     one carries a relay URL (a TransportAddr::Relay), the home relay is up and the endpoint is
     //     dialable through it. Poll the watcher until a relay addr appears or the deadline fires.
+    let t_relay_start = std::time::Instant::now();
     let deadline = std::time::Instant::now() + HOME_RELAY_WAIT;
     let mut relay_url: Option<String> = None;
     while std::time::Instant::now() < deadline {
@@ -634,7 +640,14 @@ pub async fn m4_n0_canary() -> Result<(), String> {
     }
     let relay_info = match relay_url {
         Some(r) => {
-            eprintln!("   M4 listener acquired a home relay (addr carries a Relay transport)");
+            // What this line may claim is bounded by how it was detected: a substring match for
+            // "relay" over the addr's JSON, which a field NAME satisfies as readily as a live
+            // relay path. So it reports a relay addr APPEARING — never that the relay is
+            // reachable or routing. The dial below is the only reachability evidence here.
+            eprintln!(
+                "   M4 a relay addr appeared in {:.2}s (substring match on the addr JSON, not a reachability proof)",
+                t_relay_start.elapsed().as_secs_f64()
+            );
             r
         }
         None => {
@@ -660,14 +673,21 @@ pub async fn m4_n0_canary() -> Result<(), String> {
     // The listener's addr (with the relay URL) — the dial target. watch_addr().get() snapshots it.
     let target = server.watch_addr().get();
 
+    let t_dial_start = std::time::Instant::now();
     let dial_result = tokio::time::timeout(M4_DIAL_TIMEOUT, async {
         client.connect(target, MANIFEST_ALPN).await
     })
     .await;
+    let t_dial = t_dial_start.elapsed();
 
     let conn = match dial_result {
         Ok(Ok(conn)) => {
-            eprintln!("   M4 dial-only endpoint reached the listener through the n0 home relay (ALPN ok)");
+            eprintln!(
+                "   M4 dial-only endpoint reached the listener through the n0 home relay (ALPN ok); \
+                 bind {:.2}s / dial {:.2}s",
+                t_bind.as_secs_f64(),
+                t_dial.as_secs_f64()
+            );
             conn
         }
         Ok(Err(e)) => {
@@ -677,16 +697,24 @@ pub async fn m4_n0_canary() -> Result<(), String> {
             drop(server);
             drop(client);
             return Err(format!(
-                "M4 the dial through the home relay FAILED (the home relay is up but not routing — a \
-                 partial n0 outage): {e}"
+                "M4 the dial through the home relay FAILED after {:.2}s (bind {:.2}s): iroh/quinn \
+                 returned {e:?}. OUR OWN {M4_DIAL_TIMEOUT:?} M4_DIAL_TIMEOUT did NOT fire, so this \
+                 deadline is iroh's, not ours. Attribution stops there: quinn's \
+                 ConnectionError::TimedOut means the QUIC handshake did not complete, which does \
+                 NOT distinguish an n0 relay fault from local egress (WSL2/NAT) or from the two \
+                 endpoints failing to find a path to each other.",
+                t_dial.as_secs_f64(),
+                t_bind.as_secs_f64()
             ));
         }
         Err(_) => {
             drop(server);
             drop(client);
             return Err(format!(
-                "M4 the dial through the home relay TIMED OUT at {M4_DIAL_TIMEOUT:?} — the home relay \
-                 is up but the connection did not complete (a relay-routing failure or a stale addr)"
+                "M4 the dial exceeded OUR OWN {M4_DIAL_TIMEOUT:?} M4_DIAL_TIMEOUT (bind {:.2}s). That \
+                 outran every iroh deadline beneath it (relay-path idle 30s, direct-path idle 15s), \
+                 so the dial was still in flight rather than refused. Cause NOT established here.",
+                t_bind.as_secs_f64()
             ));
         }
     };
