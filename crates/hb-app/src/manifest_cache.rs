@@ -72,9 +72,12 @@ fn entry_filename(npub: &str, slug: &str) -> String {
     format!("{}.json", hex::encode(&h.finalize()[..16]))
 }
 
-/// Read every well-formed entry file in `dir` as `(filename, byte_len, last_access)`. A malformed or
-/// unreadable file is skipped (a cache is best-effort — never a hard error).
-fn scan(dir: &Path) -> Vec<(String, usize, u64)> {
+/// Read every well-formed entry file in `dir` as `(filename, byte_len, last_access, npub, slug)`. A
+/// malformed or unreadable file is skipped (a cache is best-effort — never a hard error). The
+/// `npub`/`slug` are the entry's OWN recorded key, not anything derived from the filename — that is
+/// what lets [`migrate_legacy_entries`] tell a legacy file (named by a hash of
+/// `(npub, slug, fingerprint)`) from a canonical one by comparison, not by parsing.
+fn scan(dir: &Path) -> Vec<(String, usize, u64, String, String)> {
     let mut out = Vec::new();
     let Ok(read_dir) = std::fs::read_dir(dir) else {
         return out;
@@ -87,7 +90,7 @@ fn scan(dir: &Path) -> Vec<(String, usize, u64)> {
         let Ok(bytes) = std::fs::read(&path) else { continue };
         let Ok(parsed) = serde_json::from_slice::<CacheEntry>(&bytes) else { continue };
         let Some(name) = path.file_name().and_then(|n| n.to_str()).map(String::from) else { continue };
-        out.push((name, bytes.len(), parsed.last_access));
+        out.push((name, bytes.len(), parsed.last_access, parsed.npub, parsed.slug));
     }
     out
 }
@@ -129,6 +132,7 @@ pub fn put(
     cap_bytes: usize,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
+    migrate_legacy_entries(dir);
     let entry = CacheEntry {
         npub: npub.to_string(),
         slug: slug.to_string(),
@@ -150,8 +154,11 @@ pub fn put(
     // Only walk the directory when a caller actually asked for a ceiling. `scan` READS EVERY CACHED
     // MANIFEST to build its plan, so running it at the unbounded default would make each write cost
     // O(total cache bytes) — on a cache of multi-MB manifests that is the dominant cost of a fetch.
+    // The projection drops the key fields `scan` also returns — eviction sorts on bytes/recency only.
     if cap_bytes != usize::MAX {
-        for name in eviction_plan(&scan(dir), cap_bytes) {
+        let entries: Vec<(String, usize, u64)> =
+            scan(dir).into_iter().map(|(n, b, la, _, _)| (n, b, la)).collect();
+        for name in eviction_plan(&entries, cap_bytes) {
             let _ = std::fs::remove_file(dir.join(name)); // best-effort; a stuck file just lingers
         }
     }
@@ -185,6 +192,104 @@ pub fn get(dir: &Path, npub: &str, slug: &str, fingerprint: &str, now: u64) -> O
 pub fn cache_dir(base: &Path) -> PathBuf {
     base.join("manifests")
 }
+
+/// Directories already migrated this process. Hoisted to MODULE scope — a per-function static is
+/// never serialized (CLAUDE.md §9) and the guard must cover every call site, not one closure.
+static MIGRATED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+/// The on-disk sentinel naming a directory whose legacy migration has completed. The in-process
+/// [`MIGRATED`] guard is keyed per PROCESS — without this marker, every launch would pay a full
+/// `scan` on its first `put`, and `scan` READS EVERY CACHED MANIFEST: the exact O(total cache
+/// bytes) cost the eviction comment in `put` refuses to pay per write, reintroduced once per
+/// launch.
+///
+/// Invisible to the cache by construction: `scan` admits only `.json` files that parse as
+/// [`CacheEntry`], and this name is neither, so `eviction_plan` (fed by `scan`) and `get` (an
+/// exact `<hex>.json` path lookup) can never see it.
+const MIGRATION_MARKER: &str = ".hb-migrated-v1";
+
+/// One-time, best-effort migration of legacy fingerprint-keyed entries (QURATOR-165).
+///
+/// Before the `(npub, slug)` re-keying, `entry_filename` hashed THREE parts —
+/// `(npub, slug, fingerprint)` — so every update wrote a NEW file and left the old one behind. On
+/// any install that ran a pre-`6f0bdaa` build, those files are still there: unreachable ([`get`]
+/// looks up the two-part name, a different path) and never collected (the cap defaults to
+/// `usize::MAX`, so LRU never runs). This pass recovers the data instead of discarding it — this
+/// cache holds the ONLY offline copy of a manifest, and discarding a recoverable copy is an INV-8
+/// outcome, not cleanup.
+///
+/// **The discriminator is exact, not heuristic:** every entry file carries its own `npub`/`slug`
+/// (see [`CacheEntry`]), so a file is legacy iff `filename != entry_filename(entry.npub,
+/// entry.slug)`. No filename parsing, no timestamp guessing.
+///
+/// Per distinct `(npub, slug)` among legacy files: if no canonical file exists, RENAME the newest
+/// (by `last_access`) legacy entry into the canonical name — recovering an offline copy that is
+/// currently invisible — then delete the rest; if a canonical file already exists, delete all the
+/// legacy ones for that key. **Ordering is load-bearing:** the rename (or confirmed canonical
+/// presence) completes BEFORE any delete for that key, so a crash mid-migration leaves a readable
+/// copy, never neither — the same posture as `put`'s write-beside-then-rename.
+///
+/// Best-effort, matching `put`: a single failed rename or unlink skips that entry and carries on;
+/// nothing is propagated as a hard error that could break browsing. Runs once per process per
+/// directory (see [`MIGRATED`]), invoked from [`put`]. The work itself lives in
+/// [`migrate_legacy_dir`], unguarded, so the tests can run it twice for idempotency.
+fn migrate_legacy_entries(dir: &Path) {
+    // Marker first: once a directory has completed a pass, the sentinel alone short-circuits, so
+    // steady state is one `exists()` per process — not a full `scan` on every first launch.
+    if dir.join(MIGRATION_MARKER).exists() {
+        return;
+    }
+    {
+        let mut done = MIGRATED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if done.contains(dir) {
+            return;
+        }
+        done.insert(dir.to_path_buf());
+    }
+    migrate_legacy_dir(dir);
+    // Mark only AFTER the pass completes, so a crash mid-pass leaves the directory unmarked and
+    // the next launch retries. Best-effort: an unwritable marker means the pass simply runs again
+    // next launch — never an error, never a skipped migration.
+    let _ = std::fs::write(dir.join(MIGRATION_MARKER), b"");
+}
+
+/// The migration work, unguarded — see [`migrate_legacy_entries`] for the rationale and posture.
+fn migrate_legacy_dir(dir: &Path) {
+    // Group legacy files by the key they themselves claim. A malformed/unreadable file never
+    // reaches here (scan skips it) and is therefore left alone — it is indistinguishable from a
+    // non-entry file, and deleting unknown files is not this pass's business.
+    let mut by_key: std::collections::HashMap<(String, String), Vec<(String, u64)>> =
+        std::collections::HashMap::new();
+    for (name, _bytes, last_access, npub, slug) in scan(dir) {
+        if name != entry_filename(&npub, &slug) {
+            by_key.entry((npub, slug)).or_default().push((name, last_access));
+        }
+    }
+    for ((npub, slug), mut group) in by_key {
+        let canonical = entry_filename(&npub, &slug);
+        // The survivor, if a rename is needed: the NEWEST legacy copy by `last_access`. The rename
+        // lands its content under the canonical name FIRST; only then are the others deleted, so
+        // no delete can leave the key with neither file. (A legacy name can never equal the
+        // canonical one — that inequality is what put the file in this group — so the renamed
+        // source's own `remove_file` below no-ops on a path that no longer exists.)
+        group.sort_by_key(|(_, la)| std::cmp::Reverse(*la)); // newest first
+        if !dir.join(&canonical).exists() {
+            if let Some((newest, _)) = group.first() {
+                if std::fs::rename(dir.join(newest), dir.join(&canonical)).is_err() {
+                    continue; // best-effort: skip this key entirely, retry on a later process
+                }
+            }
+        }
+        for (name, _) in group {
+            let _ = std::fs::remove_file(dir.join(name)); // best-effort
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -317,5 +422,250 @@ mod tests {
         // And the machinery still works when a caller passes a real ceiling, so reinstating one
         // stays a one-line change rather than a rewrite.
         assert_eq!(eviction_plan(&entries, 100), vec!["old.json"]);
+    }
+
+    // ── QURATOR-165: recovery of legacy fingerprint-keyed entries ─────────────────────────
+    //
+    // CLAUDE.md §5 scoping: a local on-disk cache touches no relay/transport/presence/DM/
+    // discovery/crypto trigger, so these unit tests ARE the gate for the migration.
+
+    /// The PRE-`6f0bdaa` filename shape: `entry_filename` hashed THREE parts —
+    /// `for part in [npub, slug, fingerprint]`. TEST-ONLY by design; putting it in production
+    /// code would be rebuilding the very scheme this migration exists to retire.
+    fn legacy_entry_filename(npub: &str, slug: &str, fingerprint: &str) -> String {
+        let mut h = Sha256::new();
+        for part in [npub, slug, fingerprint] {
+            h.update((part.len() as u64).to_le_bytes());
+            h.update(part.as_bytes());
+        }
+        format!("{}.json", hex::encode(&h.finalize()[..16]))
+    }
+
+    /// Write a `CacheEntry` under an explicit filename (canonical or legacy), bypassing `put` —
+    /// how the tests plant the exact on-disk state either scheme produces.
+    fn write_entry(
+        dir: &Path,
+        filename: &str,
+        npub: &str,
+        slug: &str,
+        fingerprint: &str,
+        envelope: &str,
+        last_access: u64,
+    ) -> PathBuf {
+        let entry = CacheEntry {
+            npub: npub.to_string(),
+            slug: slug.to_string(),
+            fingerprint: fingerprint.to_string(),
+            envelope: envelope.to_string(),
+            last_access,
+        };
+        let path = dir.join(filename);
+        std::fs::write(&path, serde_json::to_vec(&entry).unwrap()).unwrap();
+        path
+    }
+
+    /// Plant an entry under its LEGACY name — the state an install that ran a pre-`6f0bdaa`
+    /// build wakes up with: a valid entry, filed under a name nothing looks up any more.
+    fn plant_legacy(
+        dir: &Path,
+        npub: &str,
+        slug: &str,
+        fingerprint: &str,
+        envelope: &str,
+        last_access: u64,
+    ) -> PathBuf {
+        write_entry(dir, &legacy_entry_filename(npub, slug, fingerprint), npub, slug, fingerprint, envelope, last_access)
+    }
+
+    /// Plant an entry under its CANONICAL name, without `put` (so no migration or marker runs
+    /// as a side effect — the pass under test starts from a known virgin directory).
+    fn plant_canonical(
+        dir: &Path,
+        npub: &str,
+        slug: &str,
+        fingerprint: &str,
+        envelope: &str,
+        last_access: u64,
+    ) -> PathBuf {
+        write_entry(dir, &entry_filename(npub, slug), npub, slug, fingerprint, envelope, last_access)
+    }
+
+    /// The directory's entry files as sorted `(filename, bytes)` — canonical before/after shape.
+    /// Non-`.json` files (the migration marker, `.tmp` strays) are EXCLUDED on purpose: only
+    /// `scan`'s own admission rule decides what is an entry.
+    fn entry_snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+            .map(|e| {
+                let p = e.path();
+                let name = p.file_name().unwrap().to_str().unwrap().to_string();
+                (name, std::fs::read(&p).unwrap())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A legacy file with no canonical sibling is RENAMED into place — the offline copy is
+    /// RECOVERED, not merely cleaned up: `get` for its key serves its envelope afterwards.
+    ///
+    /// MUTATION (P-10) — resolved by containing item: in `migrate_legacy_dir`, replace
+    /// `std::fs::rename(dir.join(newest), dir.join(&canonical))` with
+    /// `Ok::<(), std::io::Error>(())` (no rename happens; `.is_err()` is then false and the
+    /// deletes still run). No canonical file ever appears, so `get` misses and every assertion
+    /// here reds.
+    #[test]
+    fn a_legacy_entry_with_no_canonical_sibling_is_recovered_by_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = plant_legacy(dir.path(), "npubA", "films", "fp1", "ENV-LEGACY", 100);
+
+        migrate_legacy_dir(dir.path());
+
+        assert_eq!(get(dir.path(), "npubA", "films", "fp1", 200).as_deref(), Some("ENV-LEGACY"));
+        assert!(!legacy.exists(), "renamed away, not copied");
+        assert_eq!(entry_snapshot(dir.path()).len(), 1, "exactly the canonical file remains");
+    }
+
+    /// A legacy file for a key that ALREADY has a canonical entry is deleted, and the canonical
+    /// entry is byte-identical afterwards — the canonical copy wins by existing, never by
+    /// being overwritten.
+    ///
+    /// MUTATION (P-10): in `migrate_legacy_dir`, replace the guard
+    /// `if !dir.join(&canonical).exists()` with `if true`, so the newest legacy file always
+    /// renames OVER the canonical one. The reread differs from `canonical_bytes` and reds.
+    #[test]
+    fn a_legacy_entry_is_deleted_when_a_canonical_sibling_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "npubA", "films", "fp9", "ENV-CANON", 10, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
+        let canonical = dir.path().join(entry_filename("npubA", "films"));
+        let canonical_bytes = std::fs::read(&canonical).unwrap();
+        let legacy = plant_legacy(dir.path(), "npubA", "films", "fp1", "ENV-LEGACY", 999);
+
+        migrate_legacy_dir(dir.path());
+
+        assert!(!legacy.exists(), "the legacy copy is deleted");
+        assert_eq!(
+            std::fs::read(&canonical).unwrap(),
+            canonical_bytes,
+            "the canonical entry must be byte-identical — nothing overwrote it"
+        );
+    }
+
+    /// Of two legacy files for the same `(npub, slug)`, the NEWER by `last_access` survives as
+    /// the canonical entry and the older is deleted.
+    ///
+    /// MUTATION (P-10): in `migrate_legacy_dir`, change
+    /// `group.sort_by_key(|(_, la)| std::cmp::Reverse(*la))` to
+    /// `group.sort_by_key(|(_, la)| *la)` (oldest first). The OLDER copy is renamed into place,
+    /// `get` for `fp-new` misses, and the assertions red.
+    #[test]
+    fn the_newest_legacy_copy_for_a_key_survives_as_canonical() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = plant_legacy(dir.path(), "npubA", "films", "fp-old", "ENV-OLD", 100);
+        let newer = plant_legacy(dir.path(), "npubA", "films", "fp-new", "ENV-NEW", 200);
+
+        migrate_legacy_dir(dir.path());
+
+        assert_eq!(get(dir.path(), "npubA", "films", "fp-new", 300).as_deref(), Some("ENV-NEW"));
+        assert!(get(dir.path(), "npubA", "films", "fp-old", 300).is_none(), "the older copy is gone");
+        assert!(!older.exists(), "the older legacy filename is gone");
+        assert!(!newer.exists(), "the newer legacy filename is gone");
+        assert_eq!(entry_snapshot(dir.path()).len(), 1);
+    }
+
+    /// A canonical-only directory is left completely unchanged — no entry file added, removed,
+    /// or renamed. The sentinel `.hb-migrated-v1` IS expected to appear; the assertions are
+    /// deliberately on ENTRY files (`.json`) only, plus the marker's presence.
+    ///
+    /// MUTATION (P-10): in `migrate_legacy_dir`, invert the discriminator —
+    /// `if name != entry_filename(&npub, &slug)` → `if name == entry_filename(&npub, &slug)`.
+    /// Both canonical files land in groups whose canonical path exists, so the pass deletes
+    /// them and the before/after snapshot reds. (Deleting the marker write in
+    /// `migrate_legacy_entries` reds the marker assertion instead.)
+    #[test]
+    fn a_canonical_only_directory_is_left_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        plant_canonical(dir.path(), "npubA", "films", "fp1", "ENV-1", 10);
+        plant_canonical(dir.path(), "npubB", "music", "fp2", "ENV-2", 20);
+        let before = entry_snapshot(dir.path());
+
+        migrate_legacy_entries(dir.path());
+
+        assert_eq!(entry_snapshot(dir.path()), before, "no entry file added, removed, or renamed");
+        assert!(dir.path().join(MIGRATION_MARKER).exists(), "a completed pass marks the directory");
+    }
+
+    /// The migration is idempotent — a second `migrate_legacy_dir` over an already-migrated
+    /// directory changes nothing.
+    ///
+    /// Two legacy files, deliberately: with only one, the pass renames it and the delete loop
+    /// no-ops on a path that no longer exists, so the whole delete arm goes unexercised and NO
+    /// mutation of it can red this test. The older file is what forces that arm to run.
+    ///
+    /// MUTATION (P-10), verified red 2026-09-01 — replace the delete loop's body in
+    /// `migrate_legacy_dir` with
+    /// `let _ = std::fs::rename(dir.join(&name), dir.join(format!("{name}x.json")));`. The first
+    /// pass then leaves the older entry as a `.json` residue that `scan` still reads and
+    /// `entry_snapshot` still sees; the second pass renames it again, so the snapshots differ.
+    ///
+    /// ⚠ ANCHOR BY CONTAINING FUNCTION, not by the line. `let _ = std::fs::remove_file(dir.join(
+    /// name)); // best-effort` appears TWICE — the twin is `put`'s eviction loop, and its comment
+    /// merely continues (`; a stuck file just lingers`), so the shorter text is a prefix of both.
+    /// A mutation keyed on that line alone silently matches nothing, leaves the file PRISTINE,
+    /// and the run comes back green — a phantom proof. Anchor on the `for (name, _) in group {`
+    /// header, which is unique to this function.
+    ///
+    /// ⚠ Three candidates were tried and rejected, each for a different reason worth keeping:
+    /// `rename` → `copy` converges to the same end state (the delete removes the source either
+    /// way); a `.bak` residue is invisible because `entry_snapshot` filters on
+    /// `extension == "json"`; and with only ONE legacy file planted the delete arm never runs at
+    /// all (the sole entry is renamed away, so its own delete no-ops). Hence the second
+    /// `plant_legacy` below — it is what gives this test any teeth.
+    #[test]
+    fn migration_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        plant_legacy(dir.path(), "npubA", "films", "fp1", "ENV-1", 100);
+        plant_legacy(dir.path(), "npubA", "films", "fp2", "ENV-2", 200); // newer; fp1 must be deleted
+
+        migrate_legacy_dir(dir.path());
+        assert_eq!(get(dir.path(), "npubA", "films", "fp2", 250).as_deref(), Some("ENV-2"));
+        // Snapshot AFTER the read: `get` bumps `last_access` and rewrites the file, and that
+        // legitimate rewrite must not be mistaken for a second-pass change below.
+        let first = entry_snapshot(dir.path());
+
+        migrate_legacy_dir(dir.path());
+        assert_eq!(entry_snapshot(dir.path()), first, "the second pass changes nothing");
+    }
+
+    /// The ON-DISK marker — not just the in-process guard — suppresses a later pass: after a
+    /// completed migration, a newly planted legacy file is left alone by a subsequent
+    /// `migrate_legacy_entries` on fresh guard state (the directory dropped from `MIGRATED`,
+    /// i.e. exactly what the next process launch sees). This is the test that pins the
+    /// sentinel; without it the marker is decorative and every launch still pays a full `scan`.
+    ///
+    /// MUTATION (P-10): delete the marker short-circuit at the top of `migrate_legacy_entries`
+    /// (`if dir.join(MIGRATION_MARKER).exists() { return; }`). The second call then falls
+    /// through the cleared in-process guard, runs the pass, migrates the planted file, and both
+    /// assertions red.
+    #[test]
+    fn the_on_disk_marker_suppresses_a_second_pass_on_fresh_guard_state() {
+        let dir = tempfile::tempdir().unwrap();
+        plant_legacy(dir.path(), "npubA", "films", "fp1", "ENV-1", 100);
+        migrate_legacy_entries(dir.path());
+        assert_eq!(get(dir.path(), "npubA", "films", "fp1", 150).as_deref(), Some("ENV-1"));
+
+        // Fresh "process": this directory is no longer in the in-process guard.
+        MIGRATED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(dir.path());
+
+        let planted = plant_legacy(dir.path(), "npubB", "music", "fp2", "ENV-2", 200);
+        migrate_legacy_entries(dir.path());
+        assert!(planted.exists(), "the marker must suppress the pass — no rename happened");
+        assert!(get(dir.path(), "npubB", "music", "fp2", 250).is_none(), "no canonical file was created");
     }
 }
