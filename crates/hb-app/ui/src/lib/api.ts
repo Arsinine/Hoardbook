@@ -427,6 +427,26 @@ export const requestManifest = (
 		mascaraPubkey: mascaraPubkey ?? null,
 	});
 
+/** Carrier 4 (QURATOR-79) — the ask-origination half: DM `npub` (peer C) a structured request for
+ *  `authorNpub`'s (peer A's) manifest, so C can re-serve it from its cache. Answer-only and
+ *  human-mediated by design (design §5): this promises nothing about whether C holds it — C's
+ *  client turns a recognised forward-request into a card only when it actually does. One relay
+ *  write; the ask is recorded server-side under the (peer, author)-scoped ledger key. */
+export const requestManifestFrom = (
+	npub: string,
+	authorNpub: string,
+	slug: string,
+	fingerprintSeen: string,
+	teaserEventId?: string,
+) =>
+	invoke<void>('request_manifest_from', {
+		npub,
+		authorNpub,
+		slug,
+		fingerprintSeen,
+		teaserEventId: teaserEventId ?? null,
+	});
+
 /** M17 W7.1a — the persisted ask-trace map (npub|slug → {fingerprint_seen, sent_at}), so the Browse
  *  paywall can read back the asked-state across restarts. Pure local read, no relay I/O. The ask is
  *  recorded INSIDE `request_manifest` after `send_dm_inner` resolves — a failed publish leaves no trace. */
