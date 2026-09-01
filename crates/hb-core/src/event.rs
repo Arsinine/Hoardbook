@@ -138,6 +138,39 @@ pub fn build_listing_event(
     ]))
 }
 
+/// The zeroed listing payload a delete publishes as its tombstone (owner ruling 2026-08-30,
+/// QURATOR-138): a valid listing JSON whose every field is empty — so a reader that fetches it
+/// after the delete renders an **empty collection**, never the deleted one. No new wire shape, no
+/// sentinel, no discriminant bump (a reader cannot distinguish a tombstone from a legitimately
+/// empty collection — an honest limit, reported to the owner, not solved here).
+pub fn tombstone_listing_json(slug: &str) -> String {
+    serde_json::json!({
+        "slug": slug,
+        "path_alias": "",
+        "item_count": 0,
+        "content_types": [],
+        "tags": [],
+        "languages": [],
+        "sorted": false,
+        "entries": [],
+    })
+    .to_string()
+}
+
+/// Build a signed **tombstone** listing event (owner ruling 2026-08-30, QURATOR-138): the SAME
+/// kind (31111), the SAME `d` = slug, and a **zeroed** encrypted payload — so parameterized-
+/// replaceable semantics make every conforming relay REPLACE the published listing with it. The
+/// `created_at` is exactly `now` (**never future-dated** — strfry rejects future-dated events at
+/// the write boundary, which would make the delete silently fail to publish). NIP-09 deletion
+/// requests remain a strictly additive, best-effort companion published alongside this.
+pub fn build_tombstone_event(
+    identity: &Identity,
+    slug: &str,
+    browse_key: &BrowseKey,
+) -> Result<Event, HbError> {
+    build_listing_event(identity, slug, browse_key, &tombstone_listing_json(slug))
+}
+
 /// Verify + parse a listing event and decrypt it with the browse-key. Returns `(slug, json)`.
 pub fn parse_listing_event(
     event: &Event,
@@ -343,6 +376,48 @@ mod tests {
         let (slug, decrypted) = parse_listing_event(&ev, &bk).unwrap();
         assert_eq!(slug, "criterion");
         assert_eq!(decrypted, json);
+    }
+
+    #[test]
+    fn tombstone_is_a_zeroed_listing_the_reader_accepts() {
+        // QURATOR-138: the delete tombstone must be a VALID listing event — same kind, same `d`,
+        // same schema/crypto tags — so a conforming relay replaces the published listing with it and
+        // every existing reader accepts it. A reader cannot tell it from a legitimately empty
+        // collection (no new wire shape was added — an honest limit reported to the owner).
+        // Mutation to redden: change `tombstone_listing_json`'s `"entries": []` to
+        // `"entries": [{"name":"x"}]`, or make `build_tombstone_event` sign with a DIFFERENT slug
+        // than the `d` tag it writes — both assertions below fail.
+        let id = Identity::generate();
+        let bk: BrowseKey = rand::random();
+        let ev = build_tombstone_event(&id, "criterion", &bk).unwrap();
+        assert_eq!(ev.kind, Kind::from_u16(KIND_LISTING), "same parameterized-replaceable kind");
+        assert_eq!(ev.tags.identifier(), Some("criterion"), "same d = slug, so it REPLACES");
+        assert!(
+            ev.created_at <= nostr::Timestamp::now(),
+            "never future-dated (strfry rejects future writes)"
+        );
+        // The existing reader accepts it and decrypts it to the zeroed payload.
+        let (slug, json) = parse_listing_event(&ev, &bk).unwrap();
+        assert_eq!(slug, "criterion");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["entries"], serde_json::json!([]), "zeroed: no entries");
+        assert_eq!(v["item_count"], serde_json::json!(0), "zeroed: zero items");
+        assert_eq!(v["path_alias"], serde_json::json!(""), "zeroed: empty alias");
+        assert_eq!(v["content_types"], serde_json::json!([]), "zeroed: no content types");
+    }
+
+    #[test]
+    fn tombstone_payload_renders_as_an_empty_unsplit_listing() {
+        // The tombstone must satisfy `render.rs::is_plain_unsplit`'s shape (an object carrying
+        // `entries`, none of the split/part markers) — pinned here so the read side renders it as
+        // an empty collection rather than a parse error.
+        // Mutation to redden: add `"split": true` (or a `"part"` key) to `tombstone_listing_json`.
+        let v: serde_json::Value = serde_json::from_str(&tombstone_listing_json("x")).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("entries"));
+        for marker in ["split", "part", "parts_v"] {
+            assert!(!obj.contains_key(marker), "tombstone must stay unsplit (no {marker})");
+        }
     }
 
     #[test]

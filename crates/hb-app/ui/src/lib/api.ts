@@ -136,9 +136,13 @@ export interface PublishSummary {
 export const publishCollection = (slug: string) =>
 	invoke<PublishSummary>('publish_collection', { slug });
 
-/** Unpublish a collection (spec §4): NIP-09-deletes its listing events (Public only — a Private
- *  collection's gift-wrapped events are ephemeral-keyed and cannot be deleted by this identity),
- *  drops the local published marker (stops auto-republish), and refreshes the profile teaser. */
+/** Unpublish a collection (spec §4): publishes a zeroed tombstone KIND_LISTING at the same `d`
+ *  (QURATOR-138 owner ruling 2026-08-30 — conforming relays REPLACE the listing with it), plus the
+ *  best-effort NIP-09 deletion (Public only — a Private collection's gift-wrapped events are
+ *  ephemeral-keyed and cannot be deleted by this identity), drops the local published marker, and
+ *  refreshes the profile teaser. The Home UI no longer calls this directly — Delete
+ *  (`deleteCollection`) is the single retract-and-remove affordance; this stays for the backend
+ *  contract and any future non-destructive retract. */
 export const unpublishCollection = (slug: string) =>
 	invoke<void>('unpublish_collection', { slug });
 

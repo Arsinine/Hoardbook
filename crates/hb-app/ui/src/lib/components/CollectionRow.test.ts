@@ -36,16 +36,20 @@ describe('CollectionRow', () => {
 		});
 		await openMenu(container);
 		expect(await findByRole('menuitem', { name: /^publish$/i })).toBeTruthy();
-		expect(queryByRole('menuitem', { name: /^unpublish$/i })).toBeNull();
+		expect(queryByRole('menuitem', { name: /^delete$/i })).toBeTruthy();
 	});
 
-	it('published_row_shows_unpublish_menu_item', async () => {
+	it('q138_no_unpublish_affordance_in_any_state', async () => {
+		// QURATOR-138 (owner ruling 2026-08-30): "Unpublish becomes DELETE." There is no Unpublish
+		// menu item for a published collection — Delete is the single retract-and-remove verb.
+		// (Publish itself stays: re-publishing is the replaceable-update path, and with Unpublish
+		// gone it is the only way to refresh a listing.)
 		const { container, findByRole, queryByRole } = render(CollectionRow, {
 			props: { collection: makeCollection({ published: true }) },
 		});
 		await openMenu(container);
-		expect(await findByRole('menuitem', { name: /^unpublish$/i })).toBeTruthy();
-		expect(queryByRole('menuitem', { name: /^publish$/i })).toBeNull();
+		expect(await findByRole('menuitem', { name: /^delete$/i })).toBeTruthy();
+		expect(queryByRole('menuitem', { name: /unpublish/i })).toBeNull();
 	});
 
 	it('q138_no_export_affordance_in_the_collections_menu', async () => {
@@ -75,11 +79,53 @@ describe('CollectionRow', () => {
 		});
 
 		await openMenu(container);
-		await fireEvent.click(await findByRole('menuitem', { name: /^remove$/i }));
+		await fireEvent.click(await findByRole('menuitem', { name: /^delete$/i }));
 		// First click only reveals the confirm prompt.
 		expect(removed).not.toHaveBeenCalled();
 
 		await fireEvent.click(getByRole('button', { name: /confirm/i }));
 		expect(removed).toHaveBeenCalledTimes(1);
+	});
+
+	it('q138_delete_confirm_states_both_local_loss_and_peer_copies', async () => {
+		// QURATOR-138 AC 3: the mandatory confirmation for a PUBLISHED collection must state BOTH
+		// (a) the local record is destroyed, and (b) peers who already fetched the collection may
+		// keep their copy — the tombstone cannot reach them. Do not promise retraction the
+		// mechanism cannot deliver.
+		// Mutation to redden: in CollectionRow.svelte, drop the `collection.published` ternary and
+		// pass only the draft branch's confirmText — both `toContain` assertions fail; or delete
+		// either clause of the published-branch copy — the matching assertion fails.
+		const removed = vi.fn();
+		const { container, findByText, findByRole, getByRole } = render(CollectionRow, {
+			props: { collection: makeCollection({ published: true }), onremove: removed },
+		});
+
+		await openMenu(container);
+		await fireEvent.click(await findByRole('menuitem', { name: /^delete$/i }));
+		// First click only reveals the confirm — nothing runs before it.
+		expect(removed).not.toHaveBeenCalled();
+
+		const prompt = await findByText(/Deletes your local record/i);
+		expect(prompt.textContent).toContain('unpublishes');
+		expect(prompt.textContent).toContain('keep their copy');
+
+		await fireEvent.click(getByRole('button', { name: /confirm/i }));
+		expect(removed).toHaveBeenCalledTimes(1);
+	});
+
+	it('q138_delete_confirm_for_a_draft_does_not_promise_retraction', async () => {
+		// A DRAFT was never published — its confirm must NOT claim anything about unpublishing or
+		// peers, only the local-record loss (never promise what the mechanism cannot deliver).
+		// Mutation to redden: make the ternary's condition `!collection.published` (inverted) —
+		// this test's assertions fail against the published copy.
+		const { container, findByText, findByRole } = render(CollectionRow, {
+			props: { collection: makeCollection({ published: false }) },
+		});
+
+		await openMenu(container);
+		await fireEvent.click(await findByRole('menuitem', { name: /^delete$/i }));
+		const prompt = await findByText(/Deletes your local record/i);
+		expect(prompt.textContent).not.toContain('unpublish');
+		expect(prompt.textContent).not.toContain('keep their copy');
 	});
 });
