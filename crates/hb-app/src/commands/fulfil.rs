@@ -203,10 +203,10 @@ pub(crate) async fn send_full_list_inner(
     // (2b) The standing-grant record (QURATOR-137 slice 2): this click IS the owner's approval of
     // serving `slug` to this peer, so it lands in the grant map too. Record-only for now — slice 3
     // is what consults it at redeem time. Fails the fulfilment rather than minting a ticket the
-    // grant ledger cannot back. The slug is the OWNER's own collection here, so the (peer, slug)
-    // key needs no author component.
+    // grant ledger cannot back. `None` is the author: this is the OWNER's own collection, the same
+    // meaning `Ticket::author_npub` already gives `None` — one convention, not two.
     store
-        .record_standing_grant(&redeemer_npub, &slug, now_secs())
+        .record_standing_grant(&redeemer_npub, None, &slug, now_secs())
         .map_err(cmd_err)?;
     tracing::debug!(
         recipient = %crate::logging::trunc_npub(&recipient_npub),
@@ -356,12 +356,18 @@ pub(crate) async fn send_cached_manifest_inner(
         .map_err(cmd_err)?;
     // (2b) The standing-grant record (QURATOR-137 slice 2), cached-serve side: this click is an
     // owner approval of serving this (author, slug) to this peer, so it lands in the grant map.
-    // ⚠ Keyed on the (peer, slug) the grant ruling names — the author is deliberately NOT part of
-    // the key. A grant is "this peer may fetch this collection from me": which upstream copy is
-    // served is a serving detail, and gating it on the author would let a re-serve of the same
-    // collection under a different author bypass a refusal. Record-only for now; slice 3 consults.
+    // The author IS part of the key — it names WHICH collection was approved.
+    //
+    // ⚠ An earlier revision excluded it deliberately, reasoning that "gating on the author would
+    // let a re-serve of the same collection under a different author bypass a refusal". That does
+    // not hold: the author is half of a collection's identity (the NIP-01 coordinate is
+    // `kind:author_pubkey:d-tag`, and the d-tag IS the slug), so "the same collection under a
+    // different author" is not a thing. What the omission DID create is real — re-serving A's
+    // `films` to D wrote `D|films`, which slice 3 would then have matched when D asked after THIS
+    // node's own `films`. Pinned by
+    // `a_carrier4_grant_does_not_authorize_this_nodes_own_same_named_collection`.
     store
-        .record_standing_grant(&redeemer_npub, &slug, now_secs())
+        .record_standing_grant(&redeemer_npub, Some(&author_npub), &slug, now_secs())
         .map_err(cmd_err)?;
     tracing::debug!(
         recipient = %crate::logging::trunc_npub(&recipient_npub),

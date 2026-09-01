@@ -1299,7 +1299,10 @@ impl DataStore {
         write_json(&self.standing_grants_path(), m).context("saving standing grants")
     }
 
-    /// Record that the owner approved serving `slug` to `npub` at `granted_at` (unix seconds).
+    /// Record that the owner approved serving `(author_npub, slug)` to `npub` at `granted_at`
+    /// (unix seconds). `author_npub` is `None` for this node's OWN collection and `Some(a)` for a
+    /// carrier-4 re-serve of `a`'s — see [`standing_grant_key`] for why the author must be in the
+    /// key at all.
     /// Called at the approval click — the same place a ticket is minted — and an upsert: a
     /// re-approval overwrites `granted_at`, because each click is a fresh human act.
     ///
@@ -1307,24 +1310,35 @@ impl DataStore {
     /// that removed `ISSUED_TICKET_CAP`).** Evicting a grant would silently revoke an approval a
     /// human gave, and the peer would then see the refusal reserved for a forgery — an outcome no
     /// cap ever justified. Do not invent an equivalent for grants.
-    pub fn record_standing_grant(&self, npub: &str, slug: &str, granted_at: u64) -> Result<()> {
+    pub fn record_standing_grant(
+        &self,
+        npub: &str,
+        author_npub: Option<&str>,
+        slug: &str,
+        granted_at: u64,
+    ) -> Result<()> {
         let _guard = STANDING_GRANTS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut m = self.load_standing_grants()?;
-        m.insert(standing_grant_key(npub, slug), StandingGrant { granted_at });
+        m.insert(standing_grant_key(npub, author_npub, slug), StandingGrant { granted_at });
         self.save_standing_grants(&m)
     }
 
-    /// The reader slice 3 will consult at redeem time: the grant for `(npub, slug)`, if the owner
+    /// The reader slice 3 will consult at redeem time: the grant for `(npub, author, slug)`, if the owner
     /// ever approved one. **Nothing calls this to gate anything yet** (slice 2). A pure read — it
     /// takes no lock, like `load_issued_ticket`.
     ///
     /// Uncalled outside `cfg(test)` until slice 3 lands, hence the `#[allow(dead_code)]` outside
     /// `test` — the same shape as `save_published`.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn standing_grant_for(&self, npub: &str, slug: &str) -> Result<Option<StandingGrant>> {
+    pub fn standing_grant_for(
+        &self,
+        npub: &str,
+        author_npub: Option<&str>,
+        slug: &str,
+    ) -> Result<Option<StandingGrant>> {
         Ok(self
             .load_standing_grants()?
-            .get(&standing_grant_key(npub, slug))
+            .get(&standing_grant_key(npub, author_npub, slug))
             .cloned())
     }
 }
@@ -1367,10 +1381,33 @@ pub struct StandingGrant {
     pub granted_at: u64,
 }
 
-/// The on-disk key for a standing grant: `"{npub}|{slug}"` — same shape as `manifest_ask_key`
-/// (the pipe is unambiguous; npubs and slugs never contain `|`).
-pub fn standing_grant_key(npub: &str, slug: &str) -> String {
-    format!("{npub}|{slug}")
+/// The author component for a grant over the issuer's OWN collection. Mirrors
+/// [`crate::transport::Ticket::author_npub`], where `None` already means "the issuer's own" — one
+/// convention, not two. Cannot collide with a real author: npubs are bech32 and always start
+/// `npub1`.
+const SELF_AUTHOR: &str = "self";
+
+/// The on-disk key for a standing grant: `"{peer}|{author}|{slug}"` — same pipe shape as
+/// `manifest_ask_key` (npubs and slugs never contain `|`).
+///
+/// **The author is load-bearing, not defensive padding.** A collection's identity on the wire is
+/// the NIP-01 replaceable-event coordinate `kind:author_pubkey:d-tag`, and the d-tag IS the slug
+/// (`hb-core/src/event.rs` builds the listing with `Tag::identifier(slug)`). `Collection::slug`'s
+/// own doc says as much: *"the stable key in the relay (`pubkey + slug`)"*. The slug alone is HALF
+/// an identity — user-typed text derived from a path alias, with no uniqueness across authors.
+///
+/// Keyed on `(peer, slug)` this map conflated two different authorizations. Carrier 4 records a
+/// grant when this node re-serves SOMEONE ELSE's collection from cache, so one re-serve of A's
+/// `films` to D wrote `D|films` — and slice 3's lookup for D asking after THIS node's own `films`
+/// would have found it and served. Slugs like `films`, `music`, `books` collide constantly.
+///
+/// ⚠ **The pre-existing on-disk entries are NOT migrated, and cannot be.** The old key never
+/// recorded which author a grant was about, so a `"{peer}|{slug}"` entry is genuinely ambiguous
+/// between "my own collection" and "someone else's, re-served" — the missing field IS the bug.
+/// Discarding them is safe and is the only honest option: slice 2 is record-only, nothing consults
+/// this map to decide anything yet, so no authorization is lost. A re-approval writes a correct key.
+pub fn standing_grant_key(npub: &str, author_npub: Option<&str>, slug: &str) -> String {
+    format!("{npub}|{}|{slug}", author_npub.unwrap_or(SELF_AUTHOR))
 }
 
 // The issued-ticket record map is UNBOUNDED (owner ruling 2026-09-01) — see
@@ -2572,14 +2609,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
         assert!(
-            store.standing_grant_for("npub1peer", "vault").unwrap().is_none(),
+            store.standing_grant_for("npub1peer", None, "vault").unwrap().is_none(),
             "no grant yet reads as None — the slice-3 default must be absent, not an error"
         );
 
-        store.record_standing_grant("npub1peer", "vault", 1_700_000_000).unwrap();
+        store.record_standing_grant("npub1peer", None, "vault", 1_700_000_000).unwrap();
 
         // Same-process read-back…
-        let direct = store.standing_grant_for("npub1peer", "vault").unwrap();
+        let direct = store.standing_grant_for("npub1peer", None, "vault").unwrap();
         assert_eq!(
             direct.expect("the recorded grant reads back").granted_at,
             1_700_000_000
@@ -2587,7 +2624,7 @@ mod tests {
 
         // …and the restart: a fresh DataStore over the same base dir must see the SAME grant.
         let restarted = DataStore::new(dir.path().to_path_buf());
-        let reread = restarted.standing_grant_for("npub1peer", "vault").unwrap();
+        let reread = restarted.standing_grant_for("npub1peer", None, "vault").unwrap();
         assert_eq!(
             reread.expect("the grant survives a restart — it is on disk").granted_at,
             1_700_000_000,
@@ -2595,40 +2632,86 @@ mod tests {
         );
     }
 
-    /// The grant identity is `(peer npub, collection slug)`: two peers for one slug and one peer
-    /// for two slugs stay distinct, and a re-approval OVERWRITES `granted_at` (each click is a
-    /// fresh human act).
+    /// The grant identity is the TRIPLE `(peer npub, collection author, slug)`: two peers for one
+    /// slug, one peer for two slugs, and one peer for the same slug under two AUTHORS all stay
+    /// distinct. A re-approval OVERWRITES `granted_at` (each click is a fresh human act).
     ///
     /// MUTATION (P-10) — resolved by containing function: inside `standing_grant_key`, emit
     /// `format!("{slug}")` (drop the npub) → peerA and peerB's grants collide on one key,
-    /// `m.len()` becomes 1, and the length assert reds.
+    /// `m.len()` drops, and the length assert reds.
     /// SECOND MUTATION (same test, separate edit — revert one at a time per the two-halves rule):
     /// inside `record_standing_grant`, replace `m.insert(...)` with
     /// `m.entry(key).or_insert(StandingGrant { granted_at })` → the re-approval no longer
     /// overwrites, `granted_at` stays 111, and the overwrite assert reds.
     #[test]
-    fn standing_grants_key_by_peer_and_slug_and_reapproval_overwrites() {
+    fn standing_grants_key_by_peer_author_and_slug_and_reapproval_overwrites() {
         let (_dir, store) = test_store();
-        store.record_standing_grant("npub1peerA", "vault", 111).unwrap();
-        store.record_standing_grant("npub1peerB", "vault", 222).unwrap();
-        store.record_standing_grant("npub1peerA", "other", 333).unwrap();
+        store.record_standing_grant("npub1peerA", None, "vault", 111).unwrap();
+        store.record_standing_grant("npub1peerB", None, "vault", 222).unwrap();
+        store.record_standing_grant("npub1peerA", None, "other", 333).unwrap();
+        // Same peer, same slug, DIFFERENT author — a carrier-4 re-serve of someone else's `vault`.
+        store.record_standing_grant("npub1peerA", Some("npub1authorX"), "vault", 444).unwrap();
 
         let m = store.load_standing_grants().unwrap();
-        assert_eq!(m.len(), 3, "peer and slug are BOTH part of a grant's identity");
-        assert_eq!(m[&standing_grant_key("npub1peerA", "vault")].granted_at, 111);
-        assert_eq!(m[&standing_grant_key("npub1peerB", "vault")].granted_at, 222);
-        assert_eq!(m[&standing_grant_key("npub1peerA", "other")].granted_at, 333);
-        assert_eq!(standing_grant_key("npub1peerA", "vault"), "npub1peerA|vault");
+        assert_eq!(m.len(), 4, "peer, author and slug are ALL part of a grant's identity");
+        assert_eq!(m[&standing_grant_key("npub1peerA", None, "vault")].granted_at, 111);
+        assert_eq!(m[&standing_grant_key("npub1peerB", None, "vault")].granted_at, 222);
+        assert_eq!(m[&standing_grant_key("npub1peerA", None, "other")].granted_at, 333);
+        assert_eq!(
+            m[&standing_grant_key("npub1peerA", Some("npub1authorX"), "vault")].granted_at,
+            444,
+            "the same (peer, slug) under a different author is a DIFFERENT grant"
+        );
+        assert_eq!(standing_grant_key("npub1peerA", None, "vault"), "npub1peerA|self|vault");
+        assert_eq!(
+            standing_grant_key("npub1peerA", Some("npub1authorX"), "vault"),
+            "npub1peerA|npub1authorX|vault"
+        );
 
         // A re-approval is an upsert: the newest click wins.
-        store.record_standing_grant("npub1peerA", "vault", 999).unwrap();
+        store.record_standing_grant("npub1peerA", None, "vault", 999).unwrap();
         let m = store.load_standing_grants().unwrap();
         assert_eq!(
-            m[&standing_grant_key("npub1peerA", "vault")].granted_at,
+            m[&standing_grant_key("npub1peerA", None, "vault")].granted_at,
             999,
-            "a re-approval overwrites granted_at — still exactly one grant per (peer, slug)"
+            "a re-approval overwrites granted_at — still exactly one grant per (peer, author, slug)"
         );
-        assert_eq!(m.len(), 3, "the re-approval overwrote in place, it did not append");
+        assert_eq!(m.len(), 4, "the re-approval overwrote in place, it did not append");
+    }
+
+    /// ⚑ THE REGRESSION THIS KEY CHANGE EXISTS FOR (QURATOR-137).
+    ///
+    /// Carrier 4 records a grant when this node re-serves ANOTHER author's collection from its
+    /// cache. Keyed on `(peer, slug)` alone, one such re-serve of A's `films` to D wrote `D|films`
+    /// — and slice 3's lookup, asking "may D fetch MY `films`?", would have found that entry and
+    /// served a collection this node never approved sharing. Slug collisions across authors are the
+    /// normal case, not an edge case: `films`, `music`, `books`.
+    ///
+    /// Latent while slice 2 is record-only; a live privilege escalation the moment slice 3 consults
+    /// the map. Pinned here so the key can never quietly lose its author component again.
+    ///
+    /// MUTATION (P-10) — resolved by containing function: inside `standing_grant_key`, emit
+    /// `format!("{npub}|{slug}")` (drop the author) → the carrier-4 grant and the own-collection
+    /// lookup collide on one key, the `is_none()` assert finds `Some`, and it reds.
+    #[test]
+    fn a_carrier4_grant_does_not_authorize_this_nodes_own_same_named_collection() {
+        let (_dir, store) = test_store();
+        // This node re-served author A's "films" to peer D once, from cache.
+        store.record_standing_grant("npub1D", Some("npub1A"), "films", 111).unwrap();
+
+        assert!(
+            store.standing_grant_for("npub1D", None, "films").unwrap().is_none(),
+            "re-serving ANOTHER author's collection must NOT authorize this node's own \
+             same-named one — the slug is only half a collection's identity"
+        );
+        assert!(
+            store.standing_grant_for("npub1D", Some("npub1A"), "films").unwrap().is_some(),
+            "the grant that WAS approved still reads back under its own author"
+        );
+        assert!(
+            store.standing_grant_for("npub1D", Some("npub1B"), "films").unwrap().is_none(),
+            "nor does it leak across to a THIRD author's same-named collection"
+        );
     }
 
     /// Pins AC-2: `record_standing_grant`'s lock is the MODULE-LEVEL `STANDING_GRANTS_LOCK`, not a
@@ -2657,7 +2740,7 @@ mod tests {
         let started_clone = std::sync::Arc::clone(&started);
         let record = std::thread::spawn(move || {
             started_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-            store_rec.record_standing_grant("npub1peer", "vault", 1).unwrap();
+            store_rec.record_standing_grant("npub1peer", None, "vault", 1).unwrap();
         });
 
         while !started.load(std::sync::atomic::Ordering::SeqCst) {
@@ -2674,7 +2757,7 @@ mod tests {
         drop(real_guard);
         record.join().unwrap();
         assert_eq!(
-            store.standing_grant_for("npub1peer", "vault").unwrap().expect("written after release").granted_at,
+            store.standing_grant_for("npub1peer", None, "vault").unwrap().expect("written after release").granted_at,
             1
         );
     }
@@ -2682,7 +2765,7 @@ mod tests {
     #[test]
     fn standing_grants_are_wiped_with_the_rest_of_the_profile() {
         let (_dir, store) = test_store();
-        store.record_standing_grant("npub1peer", "vault", 1).unwrap();
+        store.record_standing_grant("npub1peer", None, "vault", 1).unwrap();
         assert!(store.standing_grants_path().exists());
 
         store.wipe().unwrap();
