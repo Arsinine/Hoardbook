@@ -107,12 +107,22 @@ pub(crate) fn should_rebind_for_owner(
 /// How many redemptions may be served concurrently.
 ///
 /// The plane's in-flight set stops one *ticket* being served twice; it does not stop N distinct
-/// peers each holding a handler. Each handler can hold up to 8 MiB of sealed manifest, so an
+/// peers each holding a handler. Each handler can hold up to
+/// [`hb_core::transport_payload::MANIFEST_MAX_TRANSPORT_BYTES`] of sealed manifest, so an
 /// unbounded accept loop is an unbounded allocation with extra steps. Over-limit connections wait
 /// for a permit rather than being refused — the deadlines in `transport.rs` mean a waiter cannot
 /// stall forever, and a queued redemption is a better answer than a refusal indistinguishable from
 /// "your ticket is forged".
-pub const MAX_CONCURRENT_REDEMPTIONS: usize = 8;
+///
+/// **3, set by owner ruling 2026-09-01, on upload bandwidth rather than memory.** The previous 8 was
+/// chosen against an 8 MiB ceiling; when that doubled to 16 MiB (QURATOR-106 follow-up, 2026-08-19)
+/// the same 8 permits silently doubled peak serve-side allocation to ~128 MiB, and nobody revisited
+/// it. But memory was never the binding constraint: **most peers serve from residential connections
+/// whose UPLOAD is the scarce resource**, and 8 concurrent manifest serves saturate a typical one —
+/// making every transfer slow rather than a few fast. 3 is the owner's number. It also brings peak
+/// allocation to ~48 MiB, below even the original 8 × 8 MiB budget, which is a side effect and not
+/// the reason.
+pub const MAX_CONCURRENT_REDEMPTIONS: usize = 3;
 
 /// How long [`ensure_endpoint`] will wait for the iroh `Endpoint::bind()` to resolve before giving up
 /// with a loud error rather than hanging the caller (the fulfil/redeem click) forever.

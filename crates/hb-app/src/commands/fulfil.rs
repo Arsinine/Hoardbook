@@ -58,7 +58,7 @@ fn new_request_id() -> String {
 /// Ordering is load-bearing at three points:
 ///
 /// 1. **The manifest is built first**, before the endpoint binds or a ticket exists. Sealing applies
-///    the 8 MiB ceiling, so an over-cap collection is refused here — before a promise is made, rather
+///    the 16 MiB ceiling, so an over-cap collection is refused here — before a promise is made, rather
 ///    than after the asker has a ticket that can only ever fail.
 /// 2. **The record is persisted before the DM.** The reverse order hands a peer a ticket this node
 ///    cannot authorize, which is indistinguishable from a forgery. An orphaned record — the DM then

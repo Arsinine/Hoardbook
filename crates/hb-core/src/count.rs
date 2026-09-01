@@ -132,7 +132,10 @@ mod tests {
     use crate::Identity;
 
     const NOW: u64 = 1_700_000_000;
-    const WINDOW: u64 = 600; // 10 min online window (Decision #12)
+    // An arbitrary fixture window, NOT the app's. `count_distinct_online` takes `window_secs` as a
+    // parameter, so hb-core holds no copy of the production value (which is 480 — Decision #12's
+    // 600 was superseded by the owner on 2026-08-26).
+    const WINDOW: u64 = 600;
 
     /// A signed presence event for `id`, created at `created_at`.
     fn presence_at(id: &Identity, created_at: u64) -> Event {

@@ -73,7 +73,7 @@ fn manifest_transport_ceiling_is_frozen() {
 /// `hb-net::MAX_LISTING_PARTS`, the producer's own limit. hb-core cannot import it (no hb-net dep),
 /// so the number is duplicated — and a duplicated constant drifts unless something compares them.
 /// Too low and the transport refuses manifests this very app builds; too high and the cap stops
-/// bounding the work an 8 MiB frame can demand (millions of empty parts, hash honestly matching).
+/// bounding the work a 16 MiB frame can demand (millions of empty parts, hash honestly matching).
 #[test]
 fn manifest_transport_part_cap_matches_the_producer_cap() {
     assert_eq!(
