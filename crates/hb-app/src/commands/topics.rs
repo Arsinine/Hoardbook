@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nostr::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use hb_core::topic::{
@@ -402,9 +402,18 @@ pub async fn topic_discover_paint(
 /// bounding the wave to what is on screen is the caller's half of the relay-citizenship contract;
 /// hb-net bounds the concurrency. The round-robin across roots is likewise the caller's: interleave
 /// the ids so no root drains another's slots.
+///
+/// QURATOR-148 (owner ruling 2026-08-31): each row now also carries `alive_count` — how many roster
+/// members pinged within the last 30 days. **`alive_count` gates discovery-sidebar visibility**: the
+/// UI drops an un-joined public row whose Topic has no member alive in 30 days (it is not worth
+/// joining, so it is not an option in the left-pane directory). `alive_count: None` means unknown
+/// (not a member — the roster needs the key — or the read failed); unknown keeps the row, exactly as
+/// an unknown member count never rendered as a confident "0". A member's OWN topic uses the stored
+/// key; a non-member's read recovers it read-only via the reusable public-join credential — which is
+/// why each row carries the topic NAME alongside its id (the name derives the credential keypair).
 #[tauri::command]
 pub async fn topic_rank(
-    topic_ids: Vec<String>,
+    topics: Vec<TopicRankRequest>,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
     relay: State<'_, SharedRelay>,
@@ -412,15 +421,114 @@ pub async fn topic_rank(
     let me = me(&identity).await?;
     let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
     let found = TopicDiscoveries {
-        topics: topic_ids
+        topics: topics
             .into_iter()
-            .map(|topic_id| TopicMeta { topic_id, name: String::new(), description: String::new(), tags: Vec::new(), private: false })
+            .map(|t| TopicMeta { topic_id: t.topic_id, name: t.name, description: String::new(), tags: Vec::new(), private: false })
             .collect(),
         root_event_counts: BTreeMap::new(),
         hit_limit: false,
     };
     let ranked = rank_discovered_topics(&client, found, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
-    Ok(ranked.into_iter().map(|(m, count)| TopicRank { topic_id: m.topic_id, member_count_estimate: count }).collect())
+    let mut out = Vec::with_capacity(ranked.len());
+    for (m, count) in ranked {
+        let topic_id = m.topic_id.clone();
+        let alive = alive_count_for(&client, &store, &topic_id, &m.name).await;
+        out.push(TopicRank { topic_id, member_count_estimate: count, alive_count: alive });
+    }
+    Ok(out)
+}
+
+/// One `topic_rank` request row (QURATOR-148): the id names WHICH topic to rank; the name is what a
+/// non-member's aliveness read derives the public-join credential keypair from ("the name IS the
+/// password", topic.rs Decision A). An empty name simply skips recovery (aliveness stays unknown).
+#[derive(Debug, Deserialize)]
+pub struct TopicRankRequest {
+    pub topic_id: String,
+    pub name: String,
+}
+
+/// The key half of aliveness (QURATOR-148): which stored topic, if any, supplies the roster key for
+/// `topic_id`. `None` = aliveness unknown — either the user is not a member (no stored key), or the
+/// topic is private (a private Topic keeps the pseudonym; the key is a genuine crypto bar, out of
+/// scope by ruling, and no public-join credential exists to recover one with). Pure, so the None
+/// arms are directly testable; the member arm proceeds to [`alive_count_for`]'s relay read.
+/// A miss here is not the end of the road: for a topic ABSENT from the store,
+/// [`public_recovery_allowed`] decides whether the non-member recovery path may try the
+/// name-derived public-join credential instead.
+fn alive_key_for(store: &DataStore, topic_id: &str) -> Option<hb_core::topic::TopicKey> {
+    let stored = store.load_topics().ok()?.into_iter().find(|t| t.meta.topic_id == topic_id)?;
+    if stored.meta.private {
+        return None;
+    }
+    Some(stored.key)
+}
+
+/// The non-member recovery gate (QURATOR-148, the owed half): may [`alive_count_for`] try to
+/// recover `topic_id`'s key via the name-derived public-join credential? Pure, so each refusal arm
+/// is directly testable. Recovery is allowed only when BOTH hold:
+/// - the name is non-empty — an empty name cannot derive the credential keypair, and `topic_rank`'s
+///   older callers sent no name at all;
+/// - the topic is NOT in the local store, in any form. A stored topic already had its chance in
+///   [`alive_key_for`]; if that returned None the topic is PRIVATE, and recovery must not be a
+///   bypass around the private bar (it would fail on the relay anyway — no public-join credential
+///   exists — but the refusal belongs here, before any relay I/O). A store read failure counts as
+///   "possibly stored": refuse, aliveness stays unknown, the row stays.
+fn public_recovery_allowed(store: &DataStore, topic_id: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    match store.load_topics() {
+        Ok(topics) => !topics.iter().any(|t| t.meta.topic_id == topic_id),
+        Err(_) => false,
+    }
+}
+
+/// Recover a public Topic's key WITHOUT joining (QURATOR-148): derive the public-join identity from
+/// the name and redeem the reusable credential — exactly [`join_public`]'s read path, with a scratch
+/// `NonceSet` (the public-join credential is nonce-exempt, so nothing is consumed and nothing is
+/// persisted) and **no membership publish**. `join_public` binds the expected topic_id derived from
+/// the name into the redeem (W4), and the final id check refuses a UI-supplied (id, name) pair that
+/// disagrees — a recovered key must never be used to read a DIFFERENT topic's roster.
+async fn recover_public_topic_key(
+    client: &std::sync::Arc<hb_net::RelayClient>,
+    topic_id: &str,
+    name: &str,
+) -> Option<hb_core::topic::TopicKey> {
+    let mut scratch = hb_core::topic::NonceSet::new();
+    let (meta, key, _issuer) =
+        join_public(client, name, &mut scratch, now(), net::RELAY_TIMEOUT).await.ok()??;
+    (meta.topic_id == topic_id).then_some(key)
+}
+
+/// The aliveness half of one rank row (QURATOR-148): the stored key when the user is a member, else
+/// — for an un-stored public topic with a known name — the key recovered read-only via the
+/// public-join credential. Best-effort: any failure — no key, a private topic, a relay error — is
+/// `None` (aliveness unknown ⇒ the UI keeps the row), never `Some(0)` (a confident "dead" drop of a
+/// Topic we simply could not read) and never an error that would take the whole ranking down with it.
+async fn alive_count_for(
+    client: &std::sync::Arc<hb_net::RelayClient>,
+    store: &DataStore,
+    topic_id: &str,
+    name: &str,
+) -> Option<usize> {
+    let key = match alive_key_for(store, topic_id) {
+        Some(k) => k,
+        None => {
+            if !public_recovery_allowed(store, topic_id, name) {
+                return None;
+            }
+            recover_public_topic_key(client, topic_id, name).await?
+        }
+    };
+    hb_net::topic::alive_member_count(
+        client,
+        topic_id,
+        &key,
+        hb_net::count::TOPIC_ALIVE_WINDOW_SECS,
+        net::RELAY_TIMEOUT,
+    )
+    .await
+    .ok()
 }
 
 /// One lazy-ranking result: a `topic_id` + its spoofable count (see [`topic_rank`]).
@@ -428,6 +536,10 @@ pub async fn topic_rank(
 pub struct TopicRank {
     pub topic_id: String,
     pub member_count_estimate: usize,
+    /// Members whose newest presence beacon is within 30 days (QURATOR-148) — gates sidebar
+    /// visibility, unlike `member_count_estimate` which only orders. `None` = unknown (no key / the
+    /// read failed): keep the row, never a confident drop.
+    pub alive_count: Option<usize>,
 }
 
 /// Join-first lookup (devtest #11): before minting a new **public** Topic, check whether its
@@ -1217,5 +1329,151 @@ mod tests {
         // announce's own name/id/root) is a known live production defect ruled on by the owner —
         // these tests document the current command call order only and do not pin the relabel
         // behaviour as correct.
+    }
+
+    // ── QURATOR-148 — Topic aliveness gates discovery visibility (owner ruling 2026-08-31) ──────
+    //
+    // The network half (30-day window, the .authors() bound, the 29/31-day boundary) is pinned in
+    // hb-net/src/count.rs. What is THIS layer's to pin is the key-recovery seam: aliveness reads the
+    // roster's real npubs, which need the topic key, so a Topic with no stored key must report
+    // alive_count = None (UNKNOWN — the UI keeps the row), never 0 (a confident "dead" drop of a
+    // Topic we simply could not read). The `topic_rank` command itself needs a live relay to reach
+    // `alive_count_for` (same downstream-of-net::client blocker as every guard in this module), so
+    // the pure half is exercised directly.
+
+    #[test]
+    fn aliveness_reports_unknown_not_dead_when_the_topic_key_is_unavailable() {
+        // P-10 MUTATION (orchestrator): in `alive_key_for` (the containing fn), rewrite the tail as
+        //   let stored = store.load_topics().ok()?.into_iter().find(|t| t.meta.topic_id == topic_id);
+        //   match stored {
+        //       None => Some(hb_core::topic::TopicKey::generate()),   // ← the mutation: fabricate
+        //       Some(t) if t.meta.private => None,                    //   a key for an absent topic
+        //       Some(t) => Some(t.key),
+        //   }
+        // i.e. the absent-topic arm yields a fabricated key instead of falling through as None.
+        // THIS test reds (`is_none()` fails). Siblings stay green: the private arm still returns
+        // None, the member arm still returns the stored key.
+        // ✓ PROVEN RED 2026-09-01: mutation applied → exactly this test FAILED, siblings green →
+        //   reverted.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        // No stored topic at all: aliveness is unknowable, and the key seam must yield None —
+        // `alive_count_for` turns that into `alive_count: None` (the UI keeps the row), never
+        // `Some(0)` (a confident "dead" drop of a Topic we simply could not read).
+        assert!(
+            alive_key_for(&store, "no-such-topic-id").is_none(),
+            "no stored key ⇒ alive_count is unknown (None), never a confident dead 0"
+        );
+    }
+
+    #[test]
+    fn a_private_topic_reports_aliveness_unknown_never_recovering_a_key() {
+        // P-10 MUTATION (orchestrator): in `alive_key_for` (the containing fn), delete the
+        //   if stored.meta.private { return None; }
+        // guard — the stored PRIVATE key is then returned and `is_none()` REDS. Siblings stay
+        // green (the public member test expects Some either way; the absent-topic test's store is
+        // empty).
+        // ✓ PROVEN RED 2026-09-01: mutation applied → exactly this test FAILED, siblings green →
+        //   reverted.
+        // Owner ruling: private Topics keep the pseudonym — the key is a genuine crypto bar. There
+        // is no public-join credential to recover one with, so the private arm must yield None
+        // BEFORE any relay I/O.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let (meta, key) = new_topic("back room", "private", vec![], true).unwrap();
+        store
+            .save_topics(&[StoredTopic { meta: meta.clone(), key, joined_at: 0, membership_json: None }])
+            .unwrap();
+        assert!(
+            alive_key_for(&store, &meta.topic_id).is_none(),
+            "a private Topic's aliveness is unknown — no key recovery is attempted"
+        );
+    }
+
+    #[test]
+    fn a_member_topic_supplies_its_stored_key_for_the_aliveness_read() {
+        // P-10 MUTATION (orchestrator): in `alive_key_for` (the containing fn), change the final
+        // `Some(stored.key)` to `None` — `is_some()` REDS while both siblings (which assert
+        // `is_none()`) stay green, proving the three arms are pinned independently.
+        // ✓ PROVEN RED 2026-09-01: mutation applied → exactly this test FAILED, siblings green →
+        //   reverted.
+        // The member arm: the stored PUBLIC topic's key is the one `alive_count_for` passes to
+        // `hb_net::topic::alive_member_count`. (The relay read itself needs a live relay — the
+        // same downstream-of-net::client blocker as every command-level guard in this module; the
+        // window bound and the 29/31-day boundary are pinned in hb-net's count.rs.)
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let (meta, key) = new_topic("video/films", "criterion", vec!["video".into()], false).unwrap();
+        store
+            .save_topics(&[StoredTopic { meta: meta.clone(), key, joined_at: 0, membership_json: None }])
+            .unwrap();
+        assert!(
+            alive_key_for(&store, &meta.topic_id).is_some(),
+            "a stored public topic supplies its key — the member arm proceeds to the roster read"
+        );
+    }
+
+    // ── QURATOR-148 owed half — non-member key recovery via the public-join credential ───────────
+    //
+    // `recover_public_topic_key` itself is downstream of a live relay (the same blocker as every
+    // command-level guard here); its network half — join_public's name→topic_id binding (W4) and the
+    // credential redeem — is pinned in hb-core/hb-net. What is THIS layer's to pin is the pure gate
+    // `public_recovery_allowed`: WHEN recovery may be attempted at all.
+
+    #[test]
+    fn recovery_is_refused_without_a_name() {
+        // P-10 MUTATION (orchestrator): in `public_recovery_allowed` (the containing fn), delete
+        // the `if name.is_empty() { return false; }` guard — an empty name on an empty store then
+        // falls through to `true` and THIS test reds. Siblings stay green (both pass a real name).
+        // ✓ PROVEN RED 2026-09-01 (this run): mutation applied → exactly this test FAILED, both
+        //   siblings green → reverted.
+        // An empty name cannot derive the public-join keypair; older callers sent no name at all.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        assert!(
+            !public_recovery_allowed(&store, "some-topic-id", ""),
+            "no name ⇒ no credential to derive ⇒ recovery is not attempted (aliveness stays unknown)"
+        );
+    }
+
+    #[test]
+    fn recovery_is_refused_for_any_stored_topic_the_private_bar_is_not_bypassed() {
+        // P-10 MUTATION (orchestrator): in `public_recovery_allowed` (the containing fn), change
+        // the Ok arm to `Ok(_) => true` — the stored private topic is then eligible for recovery
+        // and THIS test reds. Siblings stay green (the no-name test reds on the name guard alone;
+        // the absent-topic test expects true regardless).
+        // ✓ PROVEN RED 2026-09-01: mutation applied → exactly this test FAILED, siblings green →
+        //   reverted.
+        // A stored topic already had its chance in `alive_key_for`; a None from there means PRIVATE,
+        // and the name-derived recovery must not become a bypass around the private crypto bar. The
+        // refusal must land BEFORE any relay I/O.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let (meta, key) = new_topic("back room", "private", vec![], true).unwrap();
+        store
+            .save_topics(&[StoredTopic { meta: meta.clone(), key, joined_at: 0, membership_json: None }])
+            .unwrap();
+        assert!(
+            !public_recovery_allowed(&store, &meta.topic_id, "back room"),
+            "a stored (private) topic is never re-derived via the public-join path"
+        );
+    }
+
+    #[test]
+    fn recovery_is_allowed_for_an_unstored_topic_with_a_name() {
+        // P-10 MUTATION (orchestrator): in `public_recovery_allowed` (the containing fn), change
+        // the Ok arm to `Ok(_) => false` (refuse everything the store could be read for) — THIS
+        // test reds on the absent-topic affirmative, while both siblings stay green (they assert
+        // refusals, which the mutation only strengthens).
+        // ✓ PROVEN RED 2026-09-01: mutation applied → exactly this test FAILED, siblings green →
+        //   reverted.
+        // The affirmative arm: an un-joined public row with its directory name is exactly the case
+        // the owed half exists for — the discovery sidebar's rows.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        assert!(
+            public_recovery_allowed(&store, "unjoined-topic-id", "video/films"),
+            "an un-stored topic with a name is the non-member recovery case — allowed"
+        );
     }
 }

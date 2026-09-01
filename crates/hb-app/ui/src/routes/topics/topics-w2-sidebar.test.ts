@@ -247,7 +247,7 @@ describe('QURATOR-144 W2 — claimed count is detail-only and lazy', () => {
 		await fireEvent.click(row.closest('.row')!);
 		await tick();
 
-		await waitFor(() => expect(rankMock).toHaveBeenCalledWith(['d1']));
+		await waitFor(() => expect(rankMock).toHaveBeenCalledWith([{ topic_id: 'd1', name: 'video/retro' }]));
 		await waitFor(() => expect(container.textContent).toContain('12 claimed'));
 		// The count lives ONLY in the detail pane — the list pane never prints it.
 		const listText = container.querySelector('.list-pane')?.textContent ?? '';
@@ -271,7 +271,7 @@ describe('QURATOR-144 W2 — claimed count is detail-only and lazy', () => {
 		// moment rankDrawnRows invokes topicRank, but the FOLD into `directory` lands in the
 		// microtasks after that promise resolves — drain them (one macrotask + a flush) before
 		// clearing, or the row click below can race the fold and read a still-null count.
-		await waitFor(() => expect(rankMock).toHaveBeenCalledWith(['d1']));
+		await waitFor(() => expect(rankMock).toHaveBeenCalledWith([{ topic_id: 'd1', name: 'video/retro' }]));
 		await new Promise((r) => setTimeout(r, 0));
 		await tick();
 		rankMock.mockClear();
