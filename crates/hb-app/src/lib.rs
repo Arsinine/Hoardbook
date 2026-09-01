@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod auto_approve;
 mod backup;
 mod commands;
 // M18 W1 — the manifest plane's connection helpers. W4 wired the verb, so the `dead_code` allow that
@@ -163,7 +164,8 @@ fn restore_identity(store: DataStore, identity: SharedIdentity) {
     *identity.blocking_write() = Some(app_id);
 }
 
-/// Spawn the long-running background tasks: the presence-publish loop + the update check.
+/// Spawn the long-running background tasks: the presence-publish loop + the update check + the
+/// QURATOR-137 slice 3 auto-approve loop.
 fn spawn_background_tasks(
     identity: SharedIdentity,
     relay: net::SharedRelay,
@@ -171,7 +173,25 @@ fn spawn_background_tasks(
     store: DataStore,
     app: tauri::AppHandle,
     beacon: presence::SharedBeaconState,
+    endpoint: transport_state::SharedEndpoint,
 ) {
+    // QURATOR-137 slice 3 (owner ruling 2026-08-31, option B): a granted peer's manifest
+    // request-DM is answered without a human click — this keeps running while the window is
+    // minimised or hidden to tray, which is the point of a background task rather than a
+    // render-time handler. Takes its own clones; the presence loop below keeps its original args.
+    // The MANAGED endpoint (not a fresh one): `ensure_endpoint` inside the approval body reuses the
+    // session's single listening plane — the startup rebind's binding if it exists, else it binds
+    // here — exactly as the fulfil click's `State<SharedEndpoint>` does. A fresh handle per spawn
+    // would double-bind the same transport secret, the coin-toss failure `ensure_endpoint`'s own
+    // doc calls out. (The WAN harness's `new_shared_endpoint` is its substitute for this managed
+    // state, not a pattern to copy.)
+    tauri::async_runtime::spawn(auto_approve::run_auto_approve_loop(
+        store.clone(),
+        Arc::clone(&identity),
+        Arc::clone(&relay),
+        endpoint,
+    ));
+
     // The wakeup counter is the L4 idle-guard hook; in prod it is written-and-ignored.
     tauri::async_runtime::spawn(presence::run_presence_loop(
         identity,
@@ -476,6 +496,7 @@ pub fn run() {
                 store.clone(),
                 app_handle.clone(),
                 Arc::clone(&beacon),
+                Arc::clone(&manifest_endpoint),
             );
 
             // M9: the snapshot-watch sibling task (single watcher per app — single-instance, M8).

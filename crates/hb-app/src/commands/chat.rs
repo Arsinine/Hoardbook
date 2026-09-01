@@ -165,9 +165,9 @@ fn dm_delivery_targets(own_relays: &[String], targets: Vec<String>) -> Vec<Strin
 ///
 /// devtest v0.12.4 #2: `get_messages` now decodes via `merge_wraps_into_cache` (it needs the gift-wrap
 /// event id for both the cache dedup key and the Request bucket, which this simpler contacts-only
-/// filter doesn't track) — `decode_dms` has no remaining production caller, but is kept for its own
-/// NIP-17 conformance tests below.
-#[allow(dead_code)]
+/// filter doesn't track). `decode_dms` regained a production caller with the QURATOR-137 slice 3
+/// auto-approve loop (`auto_approve.rs`), which has no cache to merge into and needs exactly this
+/// sender-attributed decode.
 pub(crate) async fn decode_dms(
     own_npub: &str,
     identity: &hb_core::Identity,
