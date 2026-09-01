@@ -178,7 +178,7 @@ export function parseEstSize(s: string | undefined): number {
 }
 
 /** Format a byte count in its largest whole unit (1 decimal place), e.g. `536870912` → `"512.0 MB"`. */
-function fmtLargestUnit(bytes: number): string {
+export function fmtLargestUnit(bytes: number): string {
 	for (const [unit, size] of SIZE_UNITS) {
 		if (bytes >= size) return `${(bytes / size).toFixed(1)} ${unit}`;
 	}
