@@ -2,7 +2,7 @@
 	import { contacts, toast, toastWithAction, contactsLoadError, loadContactsInto } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import { sizeTier, sizeTierTooltip, rowIcon } from '$lib/collection-row-view.js';
-	import { refreshContact, importManifest, requestManifest, getManifestAsks, getContacts, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, browsePrivateCollections, type ManifestAsk } from '$lib/api.js';
+	import { refreshContact, importManifest, requestManifest, requestManifestFrom, getManifestAsks, getContacts, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, browsePrivateCollections, type ManifestAsk, type ImportedManifest } from '$lib/api.js';
 	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
@@ -193,12 +193,78 @@
 		}
 	}
 
-	// Pure derivation of the paywall block's asked-state from (map, npub, slug, now). `nowTick` is the
-	// reactive clock that keeps the cooldown + relative label fresh; reading it here makes the $derived
-	// recompute every second.
+	// Carrier 4 (QURATOR-79) — ask-origination. Design §5 rules discovery ANSWER-ONLY and
+	// human-mediated: "D asks C — in chat, by name, the way a human asks a mutual." This is D's half
+	// of that sentence. The user picks a contact (peer C) from a dropdown seeded with everyone else
+	// in their contact list — the author (peer A, whose collection is behind the paywall) is excluded,
+	// because asking A directly is the "Ask the owner" button beside it. The ask names A through the
+	// wire body's `author_npub`; it promises nothing about whether C holds the list (C's client only
+	// surfaces a card when it does). Copy is deliberately "might have" — honest about both the
+	// person and the uncertainty.
+	let askContactOpen = $state(false);
+	let askContactNpub = $state('');
+	let askingContact = $state(false);
+	let askContactError = $state<string | null>(null);
+
+	/** Who the user can ask: every contact EXCEPT the collection's author. Keyed by npub, rendered
+	 *  by display name — the "by name" half of the design's sentence. */
+	let askableContacts = $derived.by(() => {
+		// Bound to a local first: `selectedPeer` is reactive state, so TS cannot narrow it INSIDE the
+		// filter closure (it could change between the guard and the call) — svelte-check flags it.
+		const author = selectedPeer;
+		return author ? $contacts.filter((c) => c.npub !== author.npub) : [];
+	});
+
+	// The asked-state for the re-serve ask reads the SAME persisted map, under the author-scoped key
+	// `request_manifest_from` records — (asked contact, AUTHOR, slug) — so a re-serve ask and an
+	// owner-path ask for the same slug are two different traces (and two different cooldowns), and
+	// this one survives restarts exactly like the owner-path one does.
+	let askContactState = $derived(
+		selectedPeer && selectedCollection
+			? deriveManifestAskState(manifestAsks, askContactNpub, selectedPeer.npub, selectedCollection.slug, new Date(nowTick))
+			: { kind: 'unasked' as const },
+	);
+
+	async function handleAskContact() {
+		if (!selectedPeer || !selectedCollection || !askContactNpub) return;
+		askingContact = true;
+		askContactError = null;
+		try {
+			// The author is the peer whose collection is behind the paywall (the M16 W4 author-pin
+			// gates mean a browsed teaser is always authored by the browsed peer). fingerprint/teaser
+			// travel exactly as the owner-path ask sends them, so C's staleness card is the same one.
+			await requestManifestFrom(
+				askContactNpub,
+				selectedPeer.npub,
+				selectedCollection.slug,
+				selectedCollection.snapshot_fingerprint ?? '',
+				selectedCollection.teaser_event_id,
+			);
+			// `find` can miss (contact removed mid-flight). `contactDisplayName` takes a non-optional
+			// and dereferences it, so the old `?? shortNpub(...)` was dead code and an unmatched
+			// contact would have THROWN, not fallen back. Branch on the lookup instead.
+			const asked = $contacts.find((c) => c.npub === askContactNpub);
+			toast(`Asked ${asked ? contactDisplayName(asked) : shortNpub(askContactNpub)} for this list`);
+			await refreshManifestAsks();
+		} catch (e) {
+			askContactError = String(e);
+			toast(String(e), 'error');
+			await refreshManifestAsks();
+		} finally {
+			askingContact = false;
+		}
+	}
+
+	// Pure derivation of the paywall block's asked-state from (map, npub, author, slug, now). The
+	// author is the browsed peer itself — this ask path asks a peer for THEIR OWN collection (the M16
+	// W4 author-pin gates mean a browsed teaser is always authored by the browsed peer), so it walks
+	// the owner path and resolves both the legacy 2-segment key and the widened self-author spelling.
+	// A re-serve ask (peer C asked for A's manifest) has no UI call site yet. `nowTick` is the
+	// reactive clock that keeps the cooldown + relative label fresh; reading it here makes the
+	// $derived recompute every second.
 	let askState = $derived(
 		selectedPeer && selectedCollection
-			? deriveManifestAskState(manifestAsks, selectedPeer.npub, selectedCollection.slug, new Date(nowTick))
+			? deriveManifestAskState(manifestAsks, selectedPeer.npub, selectedPeer.npub, selectedCollection.slug, new Date(nowTick))
 			: { kind: 'unasked' as const },
 	);
 
@@ -234,11 +300,8 @@
 					),
 				);
 			}
-			if (result.stale) {
-				toast('Imported an older version of this list. Ask the owner for a fresh manifest.', 'error');
-			} else {
-				toast('Full manifest imported');
-			}
+			const note = importToast(result);
+			toast(note.text, note.kind);
 		} catch (e) {
 			toast(String(e), 'error');
 		} finally {
@@ -725,6 +788,38 @@
 	function dropName(npub: string): string {
 		const c = $contacts.find((p) => p.npub === npub);
 		return c ? contactDisplayName(c) : shortNpub(npub);
+	}
+
+	// QURATOR-79 carrier 4 — the import result's provenance: a re-served copy names the peer that
+	// held it and when their cache was taken. The author's own clock is `manifest_imported_at`; this
+	// is the SERVING peer's clock, and it only exists when the copy was re-served.
+	function servingPeerName(npub: string): string {
+		const c = $contacts.find((p) => p.npub === npub);
+		return c ? contactDisplayName(c) : shortNpub(npub);
+	}
+
+	// The import toast, provenance-aware. The old copy ("Ask the owner for a fresh manifest") was
+	// wrong twice under carrier 4: the owner is offline (that's why a peer re-served it), and the
+	// user couldn't tell who served this or how old it is.
+	function importToast(result: ImportedManifest): { text: string; kind: 'success' | 'error' } {
+		const reServed = result.served_by !== undefined;
+		if (result.stale && reServed) {
+			const who = servingPeerName(result.served_by!);
+			const when = result.cached_at !== undefined ? new Date(result.cached_at * 1000).toLocaleDateString() : null;
+			return {
+				text: when
+					? `Imported an older copy that ${who} had cached on ${when} — the owner is offline, so ask again once they're back.`
+					: `Imported an older copy from ${who}'s cache — the owner is offline, so ask again once they're back.`,
+				kind: 'error',
+			};
+		}
+		if (result.stale) {
+			return { text: 'Imported an older version of this list. Ask the owner for a fresh manifest.', kind: 'error' };
+		}
+		if (reServed) {
+			return { text: `Full manifest imported from ${servingPeerName(result.served_by!)}'s cached copy`, kind: 'success' };
+		}
+		return { text: 'Full manifest imported', kind: 'success' };
 	}
 
 	function registerUndo(label: string, inverses: import('$lib/drag-group.js').DropInverse[]) {
@@ -1263,7 +1358,50 @@
 										{/if}
 										<button class="btn-ghost btn-sm" onclick={pickManifestFile} disabled={importingManifest}>Import a manifest file you received</button>
 										<button class="btn-ghost btn-sm" onclick={() => (pasteOpen = !pasteOpen)}>or paste it</button>
+										<!-- Carrier 4 (QURATOR-79) — ask-origination. Answer-only and human-mediated (design §5):
+										     "D asks C — in chat, by name, the way a human asks a mutual." The contact picker IS the
+										     by-name half; the author is the browsed peer (A), never a choice. No promise C holds it. -->
+										<button class="btn-ghost btn-sm" onclick={() => { askContactOpen = !askContactOpen; askContactError = null; }}>Ask a contact for this list</button>
 									</div>
+									{#if askContactOpen}
+										<!-- The contact picker + honest copy. `askableContacts` already excludes the author, so the
+										     only peer who is never offered is the one the "Ask the owner" button above already covers. -->
+										<div class="ask-contact-row">
+											<select
+												class="hb-input ask-contact-select"
+												bind:value={askContactNpub}
+												aria-label="Contact to ask for this list"
+											>
+												<option value="" disabled>Choose a contact…</option>
+												{#each askableContacts as c (c.npub)}
+													<option value={c.npub}>{contactDisplayName(c)}</option>
+												{/each}
+											</select>
+											{#if askContactState.kind === 'asked'}
+												<button
+													class="btn-ghost btn-sm"
+													onclick={handleAskContact}
+													disabled={askingContact || !askContactNpub || !askContactState.cooldownOver}
+													title={askContactState.cooldownOver ? '' : MANIFEST_ASK_AGAIN_COOLDOWN_TIP(askContactState.cooldownRemaining)}
+												>{MANIFEST_ASK_AGAIN_LABEL}</button>
+											{:else}
+												<button
+													class="btn-primary btn-sm"
+													onclick={handleAskContact}
+													disabled={askingContact || !askContactNpub}
+												>Ask them</button>
+											{/if}
+										</div>
+										<div class="ask-contact-hint">They’ll only see this if they hold a copy. Nothing is promised — they may not have it.</div>
+										{#if askContactState.kind === 'asked'}
+											<div class="asked-line">{MANIFEST_ASKED_LINE(askContactState.relative)}</div>
+										{/if}
+										{#if askContactError && askContactState.kind !== 'asked'}
+											<!-- Failure is loud here too: a rejected publish shows the muted reason inline and never
+											     renders as "Asked" (same W7.1a rule as the owner-path ask). -->
+											<div class="ask-failed-note">{MANIFEST_ASK_FAILED_LINE(askContactError)}</div>
+										{/if}
+									{/if}
 									{#if askError && askState.kind !== 'asked'}
 										<!-- Failure is loud (W7.1a): a rejected publish leaves the un-asked state AND shows the
 										     muted reason inline. A failed ask must never render as "Asked". -->
@@ -1643,6 +1781,10 @@
 	/* M17 W7.1a: the muted asked-state line + the inline failure reason. */
 	.asked-line { font-size: 11.5px; color: var(--fg-dim); }
 	.ask-failed-note { font-size: 11.5px; color: var(--error); margin-top: 6px; }
+	/* Carrier 4 (QURATOR-79): the contact picker row — same muted register as the paste row. */
+	.ask-contact-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; align-items: center; }
+	.ask-contact-select { max-width: 220px; }
+	.ask-contact-hint { font-size: 11.5px; color: var(--fg-dim); margin-top: 4px; }
 	.imported-note {
 		display: flex;
 		align-items: center;

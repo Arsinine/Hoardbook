@@ -221,10 +221,15 @@ export interface DiscoveredTopic {
 	member_count_estimate: number | null;
 }
 
-/** One lazy-ranking result (QURATOR-143 W1): a `topic_id` + its spoofable count, count-desc. */
+/** One lazy-ranking result (QURATOR-143 W1): a `topic_id` + its spoofable count, count-desc.
+ *  QURATOR-148 adds `alive_count` — members whose newest presence beacon is within 30 days. It
+ *  GATES SIDEBAR VISIBILITY (a dead Topic drops out of the left-pane directory), unlike
+ *  `member_count_estimate`, which only orders. `null` = unknown (no key / the read failed): keep
+ *  the row, never a confident drop. */
 export interface TopicRank {
 	topic_id: string;
 	member_count_estimate: number;
+	alive_count: number | null;
 }
 
 /** The join-first lookup result (devtest #11) — does this public Topic name already have a room? */

@@ -4,6 +4,7 @@
 
 import type { DmRequestView } from './types.js';
 import { transportTicketHint } from './transport-ticket.js';
+import { shortNpub } from './contact-display.js';
 
 /** Shown beside the "Message requests" sidebar row — the number of quarantined stranger BUCKETS (not
  *  total messages: one badge count per distinct sender awaiting a decision). */
@@ -44,6 +45,13 @@ export interface ManifestRequest {
 	 *  nothing writes or reads this. Kept because the request body is `wire_freeze`-pinned and the
 	 *  field is already omitted from the wire in practice (owner ruling 2026-07-31, option b). */
 	mascaraPubkey?: string;
+	/** Carrier 4 (QURATOR-79) — the AUTHOR of the collection being asked for, when it is not the
+	 *  asked peer's own: peer D asks peer C to re-serve a manifest peer A authored, from C's cache.
+	 *  Absent means "the asked peer's own collection" — today's semantics exactly, which is why the
+	 *  field is additive-optional and no wire discriminant moves (owner ruling 2026-08-30, same shape
+	 *  as the ticket-side `authorNpub` in transport-ticket.ts). An empty string normalises to absent
+	 *  here, so "present but blank" can never masquerade as a real author pin. */
+	authorNpub?: string;
 }
 
 /** Detect the `{hb:"manifest_request",...}` JSON a browser sends as a DM. Returns the parsed request,
@@ -65,6 +73,8 @@ export function parseManifestRequest(content: string): ManifestRequest | null {
 		askNonce:
 			typeof o.ask_nonce === 'string' && o.ask_nonce !== '' ? o.ask_nonce : undefined,
 		mascaraPubkey: typeof o.mascara_pubkey === 'string' ? o.mascara_pubkey : undefined,
+		authorNpub:
+			typeof o.author_npub === 'string' && o.author_npub !== '' ? o.author_npub : undefined,
 	};
 }
 
@@ -73,7 +83,14 @@ export function parseManifestRequest(content: string): ManifestRequest | null {
  *  list" over the transport plane (M18 W4), or the manifest export as the fallback. */
 export function manifestRequestHint(content: string): string | null {
 	const req = parseManifestRequest(content);
-	return req ? `Asking for the full list of “${req.slug}”` : null;
+	if (!req) return null;
+	// Carrier 4: a request naming a third-party author is a RE-SERVE ask — the peer is being asked
+	// to hand over someone else's list from their cache, and the copy must say whose. The npub is
+	// truncated the way the pane header renders one (shortNpub), so the hint stays one line.
+	if (req.authorNpub) {
+		return `Asking you to re-serve the full list of “${req.slug}” from ${shortNpub(req.authorNpub)}'s collection`;
+	}
+	return `Asking for the full list of “${req.slug}”`;
 }
 
 /** No reply is possible until the sender becomes a contact (accepting the request adds them). */

@@ -17,8 +17,17 @@ use hb_core::{ContactStanding, Identity, ManifestPayload};
 
 use crate::commands::collection::build_slug_manifest;
 use crate::identity_state::SessionBrowseKey;
+use crate::manifest_cache;
 use crate::store::DataStore;
 use crate::transport::{IssuedTicket, ManifestSource};
+
+/// Unix seconds now — the cache's LRU recency stamp on a re-serve read.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Read `npub`'s **live** standing with this identity, in the order that makes the strictest answer
 /// win: an explicit block, then an explicit decline, then contact-hood.
@@ -77,10 +86,61 @@ impl ManifestSource for StoreManifestSource {
     /// Ratified as intended: see `send_full_list`'s note for why freezing it would be worse.
     /// Sealing is what applies the 8 MiB ceiling; an over-cap collection is refused here, before a
     /// byte moves, by [`ManifestPayload::seal`].
-    fn payload(&self, slug: &str) -> Result<ManifestPayload> {
-        let envelope =
-            build_slug_manifest(slug, &self.store, &self.identity, self.browse_key.bytes())
-                .map_err(|e| anyhow!("{e}"))?;
+    ///
+    /// The parameter is the `request_id`, not the slug: the record keyed by it says WHICH kind of
+    /// serve this is. `ticket.author_npub: None` (or a record without `served_fingerprint`) is the
+    /// owner-issued case above, unchanged — the slug is recovered from the record and the manifest
+    /// rebuilt from the collection as it is NOW. `author_npub: Some` AND `served_fingerprint:
+    /// Some` is a carrier-4 re-serve (QURATOR-79): the exact `(author_npub, slug, fingerprint)`
+    /// cache entry the human approved when `send_cached_manifest` minted this ticket is fetched,
+    /// with NO fallback — resolution happened once, at mint; serve time replays it. A cache MISS on
+    /// a re-serve errors rather than falling through to `build_slug_manifest`, because a
+    /// "helpful" fallback would silently serve C's OWN same-slug collection as if it were A's
+    /// (slugs are bare names; C may hold B's «roms» and A's «roms» both).
+    fn payload(&self, request_id: &str) -> Result<ManifestPayload> {
+        let rec = self
+            .store
+            .load_issued_ticket(request_id)
+            .map_err(|e| anyhow!("look up the issued-ticket record: {e}"))?
+            .ok_or_else(|| anyhow!("no issued-ticket record for '{request_id}'"))?;
+
+        // The cache-serving branch: BOTH fields must be present. `author_npub` alone is not enough
+        // (a record written before `served_fingerprint` existed loads as `None`, and that IS the
+        // owner-issued case for it), and `served_fingerprint` alone would resolve an authorless
+        // cache key. Read-only use of the cache — `manifest_cache::put` has exactly one production
+        // writer, in `commands/browse.rs`, pinned by a CI sweep.
+        if let (Some(author_npub), Some(fingerprint)) =
+            (&rec.ticket.author_npub, &rec.served_fingerprint)
+        {
+            let json = manifest_cache::get(
+                &self.store.manifest_cache_dir(),
+                author_npub,
+                &rec.ticket.slug,
+                fingerprint,
+                now_secs(),
+            )
+            .ok_or_else(|| {
+                anyhow!(
+                    "the approved copy of '{slug}' by {author} is no longer in the manifest cache — \
+                     ask the owner to re-send it",
+                    slug = rec.ticket.slug,
+                    author = crate::logging::trunc_npub(author_npub),
+                )
+            })?;
+            let envelope = hb_core::manifest::ManifestEnvelope::from_json(&json)
+                .map_err(|e| anyhow!("the cached manifest is not readable: {e}"))?;
+            return ManifestPayload::seal(&envelope).map_err(|e| anyhow!("{e}"));
+        }
+
+        // The owner-issued path, byte-for-byte what it always did: rebuild from the collection as
+        // it is NOW (owner ruling ②).
+        let envelope = build_slug_manifest(
+            &rec.ticket.slug,
+            &self.store,
+            &self.identity,
+            self.browse_key.bytes(),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
         ManifestPayload::seal(&envelope).map_err(|e| anyhow!("{e}"))
     }
 
@@ -102,7 +162,7 @@ impl ManifestSource for StoreManifestSource {
 mod tests {
     use super::*;
     use crate::store::IssuedTicketRecord;
-    use hb_core::TransportTicket;
+    use hb_core::{Collection, DirectoryItem, ItemType, TransportTicket, Visibility};
 
     fn store() -> (tempfile::TempDir, DataStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -130,6 +190,7 @@ mod tests {
                 redeemer_npub: npub,
                 consumed_at: None,
                 delivered_bytes: None,
+                served_fingerprint: None,
             })
             .unwrap();
 
@@ -157,45 +218,45 @@ mod tests {
         use crate::store::AskClaim;
         let (_dir, store) = store();
         store
-            .record_manifest_ask("npub1a", "criterion", "fp", "2026-01-01T00:00:00Z", "n-1")
+            .record_manifest_ask("npub1a", "npub1a", "criterion", "fp", "2026-01-01T00:00:00Z", "n-1")
             .unwrap();
 
         assert_eq!(
-            store.claim_manifest_ask("npub1a", "criterion", "n-1", "req-A").unwrap(),
+            store.claim_manifest_ask("npub1a", "npub1a", "criterion", "n-1", "req-A").unwrap(),
             AskClaim::Granted
         );
         // The same ticket may retry after a failed dial — that costs nothing and must stay possible.
         assert_eq!(
-            store.claim_manifest_ask("npub1a", "criterion", "n-1", "req-A").unwrap(),
+            store.claim_manifest_ask("npub1a", "npub1a", "criterion", "n-1", "req-A").unwrap(),
             AskClaim::Granted
         );
         // A DIFFERENT ticket echoing the same nonce is refused, however many the peer invents.
         for invented in ["req-B", "req-C", "req-D"] {
             assert_eq!(
-                store.claim_manifest_ask("npub1a", "criterion", "n-1", invented).unwrap(),
+                store.claim_manifest_ask("npub1a", "npub1a", "criterion", "n-1", invented).unwrap(),
                 AskClaim::ClaimedByAnother,
                 "a peer must not turn one ask into a dial per ticket"
             );
         }
 
         // Answered → spent, durably, so a restart cannot resurrect the authorization.
-        store.spend_manifest_ask("npub1a", "criterion", "n-1").unwrap();
+        store.spend_manifest_ask("npub1a", "npub1a", "criterion", "n-1").unwrap();
         assert_eq!(
-            store.claim_manifest_ask("npub1a", "criterion", "n-1", "req-A").unwrap(),
+            store.claim_manifest_ask("npub1a", "npub1a", "criterion", "n-1", "req-A").unwrap(),
             AskClaim::Spent
         );
 
         // A fresh ask is a fresh authorization: new nonce, claim and spent flags cleared.
         store
-            .record_manifest_ask("npub1a", "criterion", "fp", "2026-01-02T00:00:00Z", "n-2")
+            .record_manifest_ask("npub1a", "npub1a", "criterion", "fp", "2026-01-02T00:00:00Z", "n-2")
             .unwrap();
         assert_eq!(
-            store.claim_manifest_ask("npub1a", "criterion", "n-2", "req-E").unwrap(),
+            store.claim_manifest_ask("npub1a", "npub1a", "criterion", "n-2", "req-E").unwrap(),
             AskClaim::Granted
         );
         // …and the OLD nonce is dead.
         assert_eq!(
-            store.claim_manifest_ask("npub1a", "criterion", "n-1", "req-A").unwrap(),
+            store.claim_manifest_ask("npub1a", "npub1a", "criterion", "n-1", "req-A").unwrap(),
             AskClaim::Unsolicited
         );
     }
@@ -207,23 +268,23 @@ mod tests {
         use crate::store::AskClaim;
         let (_dir, store) = store();
         store
-            .record_manifest_ask("npub1a", "criterion", "fp", "2026-01-01T00:00:00Z", "n-1")
+            .record_manifest_ask("npub1a", "npub1a", "criterion", "fp", "2026-01-01T00:00:00Z", "n-1")
             .unwrap();
         assert_eq!(
-            store.claim_manifest_ask("npub1a", "criterion", "wrong", "r").unwrap(),
+            store.claim_manifest_ask("npub1a", "npub1a", "criterion", "wrong", "r").unwrap(),
             AskClaim::Unsolicited
         );
         assert_eq!(
-            store.claim_manifest_ask("npub1zzz", "criterion", "n-1", "r").unwrap(),
+            store.claim_manifest_ask("npub1zzz", "npub1zzz", "criterion", "n-1", "r").unwrap(),
             AskClaim::Unsolicited
         );
         assert_eq!(
-            store.claim_manifest_ask("npub1a", "other", "n-1", "r").unwrap(),
+            store.claim_manifest_ask("npub1a", "npub1a", "other", "n-1", "r").unwrap(),
             AskClaim::Unsolicited
         );
         // An empty nonce on either side never matches.
         assert_eq!(
-            store.claim_manifest_ask("npub1a", "criterion", "", "r").unwrap(),
+            store.claim_manifest_ask("npub1a", "npub1a", "criterion", "", "r").unwrap(),
             AskClaim::Unsolicited
         );
     }
@@ -236,24 +297,24 @@ mod tests {
     fn spending_an_ask_is_conditional_on_the_nonce_that_was_answered() {
         let (_dir, store) = store();
         store
-            .record_manifest_ask("npub1a", "criterion", "fp", "2026-01-01T00:00:00Z", "nonce-A")
+            .record_manifest_ask("npub1a", "npub1a", "criterion", "fp", "2026-01-01T00:00:00Z", "nonce-A")
             .unwrap();
         // The user re-asks while ticket A is still in flight — same key, new nonce.
         store
-            .record_manifest_ask("npub1a", "criterion", "fp", "2026-01-01T00:05:00Z", "nonce-B")
+            .record_manifest_ask("npub1a", "npub1a", "criterion", "fp", "2026-01-01T00:05:00Z", "nonce-B")
             .unwrap();
 
         // Ticket A now completes. It must NOT spend B's ask.
-        store.spend_manifest_ask("npub1a", "criterion", "nonce-A").unwrap();
+        store.spend_manifest_ask("npub1a", "npub1a", "criterion", "nonce-A").unwrap();
         let asks = store.load_manifest_asks().unwrap();
-        let kept = asks.get("npub1a|criterion").expect("the newer ask is still there");
+        let kept = asks.get("npub1a|npub1a|criterion").expect("the newer ask is still there");
         assert_eq!(kept.nonce, "nonce-B");
         assert!(!kept.spent, "an older completion must not spend the newer ask");
 
         // And the ask that IS answered is spent.
-        store.spend_manifest_ask("npub1a", "criterion", "nonce-B").unwrap();
+        store.spend_manifest_ask("npub1a", "npub1a", "criterion", "nonce-B").unwrap();
         assert!(
-            store.load_manifest_asks().unwrap()["npub1a|criterion"].spent,
+            store.load_manifest_asks().unwrap()["npub1a|npub1a|criterion"].spent,
             "one ask, one auto-dial — the answered ask is spent"
         );
     }
@@ -310,11 +371,223 @@ mod tests {
                     redeemer_npub: "npub-x".into(),
                     consumed_at: None,
                     delivered_bytes: None,
+                    served_fingerprint: None,
                 },
             );
         }
         let before = m.len();
         crate::store::prune_issued_tickets(&mut m);
         assert_eq!(m.len(), before, "no unspent approval may be dropped to make room");
+    }
+
+    // ── QURATOR-79 Carrier 4 — the cache-serving branch of `payload` ─────────────────────────────
+
+    fn a_record(request_id: &str, author_npub: Option<String>, served_fingerprint: Option<String>) -> IssuedTicketRecord {
+        let mut ticket = TransportTicket::issue(request_id, "roms", "addr", 1_700_000_000, None);
+        ticket.author_npub = author_npub;
+        IssuedTicketRecord {
+            ticket,
+            redeemer_npub: "npub1x".into(),
+            consumed_at: None,
+            delivered_bytes: None,
+            served_fingerprint,
+        }
+    }
+
+    /// Required test 1 — an owner-issued `request_id` (NO `served_fingerprint`) never falls through
+    /// to the cache. The dangerous shape is `author_npub` PRESENT with `served_fingerprint` absent
+    /// (a pre-Carrier-4 record, or a hand-crafted one): a sloppy branch that engages on the author
+    /// ALONE would re-resolve "newest for (author, slug)" and serve the cache; the correct code
+    /// takes the owner branch and rebuilds from the collection as it is NOW (ruling ②).
+    ///
+    /// MUTATION (reds this test): in `StoreManifestSource::payload`
+    /// (crates/hb-app/src/manifest_source.rs, the `impl ManifestSource for StoreManifestSource`
+    /// block), weaken the two-field guard `if let (Some(author_npub), Some(fingerprint)) = ...` to
+    /// engage on the author ALONE — `if let Some(author_npub) = &rec.ticket.author_npub` — and
+    /// supply the `manifest_cache::get` fingerprint argument by re-resolving "newest for (author,
+    /// slug)" at serve time (e.g. via the same scan `send_cached_manifest_inner`'s
+    /// `newest_cached_for` performs). That is exactly the serve-time re-guess the design forbids:
+    /// the branch engages for the record below (author set, fingerprint None), the cache DOES hold
+    /// an entry for `(that author, "roms")`, the mutant serves it — and `unwrap_err()` panics.
+    #[test]
+    fn an_owner_issued_request_id_never_falls_through_to_the_cache() {
+        let (_dir, store) = store();
+        let source = StoreManifestSource::new(
+            store.clone(),
+            Identity::generate(),
+            SessionBrowseKey::new([7u8; 32]),
+        );
+        // The bait: a cache entry EXISTS for (author, "roms") — and no draft for the slug. The
+        // owner branch names the missing DRAFT; the cache branch would silently serve the entry.
+        let author = Identity::generate();
+        let author_npub = npub_of(&author);
+        let env = hb_core::build_manifest_envelope(
+            &author,
+            "roms",
+            &[9u8; 32],
+            "fp-bait",
+            1_700_000_000,
+            &[r#"{"slug":"roms","entries":[]}"#.to_string()],
+        )
+        .unwrap();
+        crate::manifest_cache::put(
+            &store.manifest_cache_dir(),
+            &author_npub,
+            "roms",
+            "fp-bait",
+            &env.to_json().unwrap(),
+            1_700_000_000,
+            crate::manifest_cache::DEFAULT_MANIFEST_CACHE_BYTES,
+        )
+        .unwrap();
+        // `author_npub` set but `served_fingerprint` ABSENT: an owner-issued record for the same
+        // slug the cache happens to hold. Only the fingerprint's absence keeps this on the owner
+        // path — which is exactly the optional-field condition TICKET_V's exemption rests on.
+        store
+            .record_issued_ticket(&a_record("req-owner", Some(author_npub), None))
+            .unwrap();
+        let err = source.payload("req-owner").unwrap_err().to_string();
+        assert!(
+            err.contains("No draft found"),
+            "an owner-issued record must take the build_slug_manifest branch, got: {err}"
+        );
+    }
+
+    /// Required test 2 — the LOAD-BEARING one. A `request_id` whose `served_fingerprint` names a
+    /// cache-MISS must ERROR, never fall through to `build_slug_manifest` or any other source. A
+    /// "helpful" fallback would silently serve C's own same-slug collection as if it were A's.
+    ///
+    /// MUTATION (reds this test): in `StoreManifestSource::payload` (same containing impl block),
+    /// turn the cache-miss into a FALLTHROUGH — nest the serve inside the hit so a miss skips it
+    /// and execution reaches the `build_slug_manifest` call below the `if let`:
+    /// change `let json = manifest_cache::get(...).ok_or_else(|| ...)?` to
+    /// `if let Some(json) = manifest_cache::get(...) { ...return the sealed payload...; }` —
+    /// the "helpful fallback" the design names. With the draft saved below, the mutant serves
+    /// C's own «roms» envelope as if it were A's, the call returns `Ok`, and `unwrap_err()` panics.
+    #[test]
+    fn a_cache_miss_on_a_re_serve_errors_it_never_falls_through() {
+        let (_dir, store) = store();
+        let source = StoreManifestSource::new(
+            store.clone(),
+            Identity::generate(),
+            SessionBrowseKey::new([7u8; 32]),
+        );
+        // The trap: C DOES own a same-slug collection (the draft exists), and the request carries
+        // an author + fingerprint that resolves to NO cache entry. Serving C's own «roms» here is
+        // exactly the cross-tenant collision the fence exists to prevent.
+        store
+            .save_collection_draft(&Collection {
+                slug: "roms".into(),
+                path_alias: "roms".into(),
+                description: None,
+                item_count: 1,
+                est_size: None,
+                content_types: vec!["video".into()],
+                tags: vec![],
+                languages: vec![],
+                visibility: Visibility::Public,
+                sorted: false,
+                last_updated: chrono::Utc::now(),
+                listing: vec![DirectoryItem {
+                    name: "C's own rom".into(),
+                    item_type: ItemType::File,
+                    size: None,
+                    format: None,
+                    year: None,
+                    tags: vec![],
+                    note: None,
+                    children: vec![],
+                }],
+            })
+            .unwrap();
+        store
+            .record_issued_ticket(&a_record(
+                "req-re-serve",
+                Some("npub1author".into()),
+                Some("fp-not-in-the-cache".into()),
+            ))
+            .unwrap();
+        let err = source.payload("req-re-serve").unwrap_err().to_string();
+        assert!(
+            err.contains("no longer in the manifest cache"),
+            "a cache miss on a re-serve must error naming the cache, never serve a fallback: {err}"
+        );
+    }
+
+    /// Required test 3 — an envelope failing `verify_author(requested_author)` is refused BEFORE
+    /// `seal`, at MINT time: the §2 C-side provenance fence, driven through the real
+    /// `send_cached_manifest_inner` (the same seam the WAN harness uses). Without it a D asking for
+    /// `(author = A, slug = s)` could be served B's same-slug envelope and cost C a spurious ticket
+    /// spend.
+    ///
+    /// MUTATION (reds this test): in `send_cached_manifest_inner`
+    /// (crates/hb-app/src/commands/fulfil.rs), delete the
+    /// `envelope.verify_author(&expected_author).map_err(...)?` call — the mutated mint proceeds to
+    /// bind a real endpoint and mint a ticket instead of refusing at the fence, so the error below
+    /// stops matching "could not be verified as this peer's" and the assert fails.
+    #[tokio::test]
+    async fn an_envelope_failing_the_requested_author_is_refused_at_mint() {
+        use crate::identity_state::AppIdentity;
+        use crate::transport_state::new_shared_endpoint;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let identity: crate::identity_state::SharedIdentity =
+            std::sync::Arc::new(tokio::sync::RwLock::new(Some(AppIdentity::generate())));
+
+        // The attack shape: an envelope AUTHORED by B sitting in the cache under A's key — the
+        // key/author mismatch the §2 fence exists to catch (B relaying its own same-slug envelope
+        // into an A-scoped ask). The cache key resolves; the signature does not.
+        let b = Identity::generate();
+        let b_npub = npub_of(&b);
+        let env = hb_core::build_manifest_envelope(
+            &b,
+            "roms",
+            &[9u8; 32],
+            "fp-mint",
+            1_700_000_000,
+            &[r#"{"slug":"roms","entries":[]}"#.to_string()],
+        )
+        .unwrap();
+        let a = Identity::generate();
+        let a_npub = npub_of(&a);
+        let d = Identity::generate();
+        let d_npub = npub_of(&d);
+        assert_ne!(a_npub, b_npub, "the fixture needs two distinct authors");
+        assert_ne!(env.author_npub, a_npub, "the envelope must be B's, not A's");
+        crate::manifest_cache::put(
+            &store.manifest_cache_dir(),
+            &a_npub,
+            "roms",
+            "fp-mint",
+            &env.to_json().unwrap(),
+            1_700_000_000,
+            crate::manifest_cache::DEFAULT_MANIFEST_CACHE_BYTES,
+        )
+        .unwrap();
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::commands::fulfil::send_cached_manifest_inner(
+                d_npub.clone(),
+                a_npub.clone(),
+                "roms".into(),
+                None,
+                &identity,
+                &store,
+                &crate::net::new_shared(),
+                &new_shared_endpoint(),
+            ),
+        )
+        .await
+        .expect("the call must resolve — a hang is a finding")
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("could not be verified as this peer's"),
+            "B's envelope under an A-scoped ask must be refused at the mint-time author fence, got: {err}"
+        );
     }
 }

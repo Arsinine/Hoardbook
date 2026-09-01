@@ -480,6 +480,7 @@ async fn send_request_dm(probe: &ProbeInput, fingerprint_seen: &Option<String>) 
         .store
         .record_manifest_ask(
             &probe.serve_npub,
+            &probe.serve_npub,
             SEED_SLUG,
             fingerprint_seen.as_deref().unwrap_or(""),
             &sent_at,
@@ -602,6 +603,9 @@ async fn redeem_ticket(
     let endpoint = probe_client_endpoint(probe).await?;
     let store = probe.store.clone();
     let serve_npub = probe.serve_npub.clone();
+    // Carrier 4: the author the ticket names, else the DM sender — same resolution as
+    // `redeem_manifest_ticket_inner`.
+    let expected_author = ticket.author_npub.clone().unwrap_or_else(|| serve_npub.clone());
     let expected_slug = ticket.slug.clone();
     // Capture the nonce before the ticket is moved into the retry loop's async closure.
     let ticket_nonce = ticket.ask_nonce.clone();
@@ -609,7 +613,7 @@ async fn redeem_ticket(
     let mut last_err = String::new();
     for attempt in 1..=LIVE_REDEEM_RETRIES {
         let store = store.clone();
-        let serve_npub = serve_npub.clone();
+        let expected_author = expected_author.clone();
         let expected_slug = expected_slug.clone();
         let endpoint = endpoint.clone();
         let ticket = ticket.clone();
@@ -622,7 +626,7 @@ async fn redeem_ticket(
                     .map_err(|_| anyhow!("the manifest that arrived was not text"))?;
                 imported = Some(
                     accept_manifest_bytes(
-                        &serve_npub,
+                        &expected_author,
                         Some(&expected_slug),
                         raw,
                         newest_fingerprint,
@@ -648,6 +652,7 @@ async fn redeem_ticket(
                 // Spend the ask now that the redemption landed (production ordering). Uses the
                 // pre-captured slug + nonce (the ticket is moved into the async closure above).
                 let _ = probe.store.spend_manifest_ask(
+                    &probe.serve_npub,
                     &probe.serve_npub,
                     SEED_SLUG,
                     ticket_nonce.as_deref().unwrap_or_default(),
@@ -706,10 +711,12 @@ async fn probe_client_endpoint(probe: &ProbeInput) -> Result<iroh::Endpoint, Str
 /// WAN-M's `claim_for_probe`.
 async fn claim_for_probe(probe: &ProbeInput, ticket: &TransportTicket) -> Result<(), String> {
     use crate::store::AskClaim;
+    let expected_author = ticket.author_npub.clone().unwrap_or_else(|| probe.serve_npub.clone());
     let claim = probe
         .store
         .claim_manifest_ask(
             &probe.serve_npub,
+            &expected_author,
             &ticket.slug,
             ticket.ask_nonce.as_deref().unwrap_or_default(),
             &ticket.request_id,

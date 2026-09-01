@@ -544,6 +544,8 @@ pub fn run() {
             // M18 W4 — the fulfil verb, both halves.
             commands::fulfil::send_full_list,
             commands::fulfil::redeem_manifest_ticket,
+            // QURATOR-79 Carrier 4 — re-serve a cached copy of a peer's manifest.
+            commands::fulfil::send_cached_manifest,
             commands::private::browse_private_collections,
             commands::browse::paste_key,
             commands::browse::share_code_info,
@@ -564,6 +566,7 @@ pub fn run() {
             commands::online::online_count,
             commands::chat::send_message,
             commands::chat::request_manifest,
+            commands::chat::request_manifest_from,
             commands::chat::get_messages,
             commands::chat::dm_requests,
             commands::chat::dm_request_accept,

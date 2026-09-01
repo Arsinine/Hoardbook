@@ -53,7 +53,10 @@
 	// M17 W7.1b: the manifest-request fulfilment card. The capability (`export_manifest`) is fully
 	// wired on Home; this is its second entry point — surfaced where the request lands. The card's
 	// state is derived PURELY (zero network on render); the export Tauri call fires only on click.
-	import { manifestFulfilFor } from '$lib/manifest-fulfil.js';
+	// Carrier 4 (QURATOR-79) adds the re-serve half: a request naming a third-party author asks this
+	// owner to hand over a cached copy of SOMEONE ELSE'S list, so the card must say whose before the
+	// verb fires. The author rides the request (`parseManifestRequest`), not a second wire shape.
+	import { manifestFulfilFor, type ManifestFulfilState } from '$lib/manifest-fulfil.js';
 	// M18 W4: the fulfil verb's two halves. The owner's "Send the full list" mints a ticket and DMs
 	// it; the asker's side recognises that ticket and redeems it ON ARRIVAL — there is deliberately no
 	// deferred redemption entry point in the backend to bind a button to (owner ruling 2026-07-30).
@@ -474,6 +477,41 @@
 		}
 	}
 
+	// Carrier 4 (QURATOR-79) — the re-serve verb, the mirror of `handleSendFullList` above. The two
+	// differ in exactly one thing: WHAT is being sent. `send_full_list` builds a manifest from one of
+	// this owner's own drafts; `send_cached_manifest` re-serves an envelope another peer authored,
+	// straight from the cache browsing put it in — nothing is built, and the backend pins the served
+	// copy's author against the requested one before anything is promised (fulfil.rs, §2 C-side
+	// provenance fence). Same human-click-only rule (M17 #4), same concurrency guard with a `finally`
+	// release so a failed dial is retryable — the QURATOR-45 shape, kept identical.
+	let servingCached: string | null = $state(null);
+	async function handleServeCached(state: ManifestFulfilState, askNonce?: string) {
+		const npub = selectedPeer?.npub;
+		// The author pin travels on the state, never a guess: the card's re-serve button only exists
+		// for a named author (see deriveManifestFulfil), so an authorless state here is a wiring
+		// error and the honest answer is to do nothing rather than serve the wrong peer's copy.
+		if (state.kind !== 're-serve' || !npub || servingCached === state.slug) return;
+		servingCached = state.slug;
+		try {
+			// NOTE (Lane C): `send_cached_manifest` is registered on the Rust side (lib.rs:548) but
+			// has no wrapper in api.ts — that file is Lane B's fence in this fan-out, so the invoke is
+			// made here with the same argument shape api.ts uses (camelCase Tauri arg names, null for
+			// absent optionals). Moving it into api.ts later changes no call site.
+			const { invoke } = await import('@tauri-apps/api/core');
+			await invoke<void>('send_cached_manifest', {
+				npub,
+				authorNpub: state.authorNpub,
+				slug: state.slug,
+				askNonce: askNonce ?? null,
+			});
+			toast(SEND_FULL_LIST_TOAST(state.slug), 'success');
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			servingCached = null;
+		}
+	}
+
 	// M18 W4 — the asker's half. A ticket DM is redeemed the first time it is SEEN, not on a click:
 	// redemption is immediate by owner ruling, and the backend exposes no "redeem later" path. The
 	// ledger is keyed by `request_id` so the same DM re-rendered on every 3s poll (and re-read from
@@ -545,13 +583,18 @@
 		ticketNonce: string | undefined,
 		ticketJson: string,
 		requestId: string,
+		ticketAuthor?: string,
 	) {
 		void redemptionTick; // read so this re-evaluates when a redemption settles
 		// Trace not loaded yet (or its read failed): we cannot tell solicited from unsolicited, so we
 		// dial nothing AND say so honestly rather than accusing the sender. Recoverable — the loader
 		// above retries, and this re-evaluates when it lands.
 		if (manifestAsks === null) return { kind: 'unverified' } as const;
-		if (!npub || !ticketNonce || !ticketAnswersOurAsk(manifestAsks, npub, slug, ticketNonce)) {
+		if (
+			!npub ||
+			!ticketNonce ||
+			!ticketAnswersOurAsk(manifestAsks, npub, slug, ticketNonce, ticketAuthor)
+		) {
 			return { kind: 'unsolicited' } as const;
 		}
 		// Scope the claim to the ASK, not the ticket: one nonce must not authorize N concurrent dials
@@ -575,8 +618,14 @@
 		ticketNonce: string | undefined,
 		ticketJson: string,
 		requestId: string,
+		ticketAuthor?: string,
 	) {
-		if (!npub || !ticketNonce || !ticketAnswersOurAsk(manifestAsks, npub, slug, ticketNonce)) return;
+		if (
+			!npub ||
+			!ticketNonce ||
+			!ticketAnswersOurAsk(manifestAsks, npub, slug, ticketNonce, ticketAuthor)
+		)
+			return;
 		const ask = askIdentity(npub, slug, ticketNonce);
 		if (!redemptions.claimRetry(requestId, ask)) return;
 		redemptionTick += 1;
@@ -1336,11 +1385,14 @@
 											{@const mf = manifestFulfilFor(msg.content, $collections, { quarantined: true })!}
 											<!-- M17 W7.1b quarantine: the fulfilment card renders for recognition, but ZERO action
 														buttons (Accept first, always — same rule as W3's ShareCodeCard). The state is derived
-														PURELY so the owner can see what the request is about before deciding to accept. -->
+														PURELY so the owner can see what the request is about before deciding to accept.
+														Carrier 4: a third-party-author ask still derives `re-serve` here, so what the
+														owner reads before Accepting is honest about WHOSE list is being asked for. -->
 											<ManifestFulfilCard
 												state={mf.state}
 												fingerprintSeen={mf.request.fingerprintSeen}
 												onsend={() => {}}
+												onserve={() => {}}
 												sending={false}
 											/>
 										{/if}
@@ -1485,12 +1537,16 @@
 										{@const mf = manifestFulfilFor(msg.content, $collections, { quarantined: false })!}
 										<!-- M17 W7.1b: the fulfilment card is an ADDENDUM below the verbatim message
 													text (same rule as W3). Zero-network at render: state is derived PURELY from
-													(request, own drafts); the export save dialog fires only on click. -->
+													(request, own drafts); the export save dialog fires only on click.
+													Carrier 4: a request naming a third-party author derives `re-serve`, and the
+													card's verb becomes the cache read — the author travels on the state so the
+													click can never serve the wrong peer's copy. -->
 										<ManifestFulfilCard
 											state={mf.state}
 											fingerprintSeen={mf.request.fingerprintSeen}
 											onsend={(slug) => handleSendFullList(slug, mf.request.askNonce)}
-											sending={sendingFullList === mf.state.slug}
+											onserve={() => handleServeCached(mf.state, mf.request.askNonce)}
+											sending={sendingFullList === mf.state.slug || servingCached === mf.state.slug}
 										/>
 									{/if}
 									{#if parseTransportTicket(msg.content)}
@@ -1507,6 +1563,7 @@
 												tk.askNonce,
 												msg.content,
 												tk.requestId,
+												tk.authorNpub,
 											)}
 											quarantined={false}
 											onretry={() =>
@@ -1516,6 +1573,7 @@
 													tk.askNonce,
 													msg.content,
 													tk.requestId,
+													tk.authorNpub,
 												)}
 										/>
 									{/if}

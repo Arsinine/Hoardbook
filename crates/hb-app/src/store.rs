@@ -1073,11 +1073,23 @@ impl DataStore {
     }
 
     pub fn load_manifest_asks(&self) -> Result<std::collections::HashMap<String, ManifestAsk>> {
-        Ok(read_json_lenient::<std::collections::HashMap<String, ManifestAsk>>(
+        let mut m = read_json_lenient::<std::collections::HashMap<String, ManifestAsk>>(
             &self.manifest_asks_path(),
         )
         .context("loading manifest asks")?
-        .unwrap_or_default())
+        .unwrap_or_default();
+        // Lenient load (Carrier 4): an ask map written by an older build carries 2-segment
+        // `{npub}|{slug}` keys. Every such ask was by construction a self-ask — the only kind that
+        // existed — so widen it in memory to `{npub}|{npub}|{slug}`. The rewrite is not persisted
+        // here (a pure read must stay a pure read); the next `record`/`claim`/`spend` write saves
+        // the widened map, so the migration converges without a dedicated pass.
+        if m.keys().any(|k| k.matches('|').count() == 1) {
+            m = m
+                .into_iter()
+                .map(|(k, v)| (widen_legacy_ask_key(&k).unwrap_or(k), v))
+                .collect();
+        }
+        Ok(m)
     }
 
     pub fn save_manifest_asks(
@@ -1095,6 +1107,7 @@ impl DataStore {
     pub fn record_manifest_ask(
         &self,
         npub: &str,
+        author: &str,
         slug: &str,
         fingerprint_seen: &str,
         sent_at: &str,
@@ -1103,7 +1116,7 @@ impl DataStore {
         let _guard = MANIFEST_ASKS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut m = self.load_manifest_asks()?;
         m.insert(
-            manifest_ask_key(npub, slug),
+            manifest_ask_key(npub, author, slug),
             ManifestAsk {
                 fingerprint_seen: fingerprint_seen.to_string(),
                 sent_at: sent_at.to_string(),
@@ -1136,13 +1149,14 @@ impl DataStore {
     pub fn claim_manifest_ask(
         &self,
         npub: &str,
+        author: &str,
         slug: &str,
         nonce: &str,
         request_id: &str,
     ) -> Result<AskClaim> {
         let _guard = MANIFEST_ASKS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut m = self.load_manifest_asks()?;
-        let key = manifest_ask_key(npub, slug);
+        let key = manifest_ask_key(npub, author, slug);
         let Some(ask) = m.get_mut(&key) else { return Ok(AskClaim::Unsolicited) };
         // An empty nonce on either side never matches — a pre-ruling ask fails closed by
         // construction rather than by a branch.
@@ -1167,10 +1181,16 @@ impl DataStore {
     ///
     /// Conditional on `expected_nonce`: a re-ask made while an older ticket was in flight must not be
     /// marked spent by that older ticket's completion.
-    pub fn spend_manifest_ask(&self, npub: &str, slug: &str, expected_nonce: &str) -> Result<()> {
+    pub fn spend_manifest_ask(
+        &self,
+        npub: &str,
+        author: &str,
+        slug: &str,
+        expected_nonce: &str,
+    ) -> Result<()> {
         let _guard = MANIFEST_ASKS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut m = self.load_manifest_asks()?;
-        if let Some(ask) = m.get_mut(&manifest_ask_key(npub, slug)) {
+        if let Some(ask) = m.get_mut(&manifest_ask_key(npub, author, slug)) {
             if ask.nonce == expected_nonce {
                 ask.spent = true;
                 self.save_manifest_asks(&m)?;
@@ -1281,6 +1301,15 @@ pub struct IssuedTicketRecord {
     pub consumed_at: Option<u64>,
     /// Payload size the receipt attested to. Provenance only.
     pub delivered_bytes: Option<usize>,
+    /// The `snapshot_fingerprint` of the cache entry this ticket re-serves, set at MINT time by
+    /// `send_cached_manifest` — the `(author_npub, slug, fingerprint)` triple the human approved on
+    /// the "send cached copy" click (QURATOR-79 Carrier 4). `None` means owner-issued: the payload is
+    /// rebuilt from the collection as it is NOW at redeem time (owner ruling ②), and the
+    /// cache-serving branch never engages. Optional-additive like `ask_nonce`: a record written
+    /// before this field loads as `None`, which IS the owner-issued case — fail closed by
+    /// construction, no `#[serde(default)]` needed for an `Option`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_fingerprint: Option<String>,
 }
 
 /// Drop the stalest consumed records until the map is within [`ISSUED_TICKET_CAP`]. Unspent tickets
@@ -1345,10 +1374,20 @@ pub enum AskClaim {
     ClaimedByAnother,
 }
 
-/// The on-disk key for an ask trace: `"{npub}|{slug}"`. The pipe is unambiguous because npubs and
-/// slugs never contain `|` (bech32 / URL-safe slug charset).
-pub fn manifest_ask_key(npub: &str, slug: &str) -> String {
-    format!("{npub}|{slug}")
+/// The on-disk key for an ask trace: `"{npub}|{author}|{slug}"` — who we asked, **which author's
+/// collection we asked about** (Carrier 4: a re-serve ask names a third-party author; a self-ask is
+/// spelled `author == npub`), and the slug. The pipe is unambiguous because npubs and slugs never
+/// contain `|` (bech32 / URL-safe slug charset).
+pub fn manifest_ask_key(npub: &str, author: &str, slug: &str) -> String {
+    format!("{npub}|{author}|{slug}")
+}
+
+/// Widen a pre-Carrier-4 2-segment key `"{npub}|{slug}"` to the self-ask spelling
+/// `"{npub}|{npub}|{slug}"` — all an authorless ask could ever have meant was the asked peer's own
+/// collection. Any other segment count is left as-is (never happens for well-formed keys).
+fn widen_legacy_ask_key(key: &str) -> Option<String> {
+    let parts: Vec<&str> = key.split('|').collect();
+    (parts.len() == 2).then(|| format!("{}|{}|{}", parts[0], parts[0], parts[1]))
 }
 
 impl DataStore {
@@ -2213,6 +2252,7 @@ mod tests {
                 redeemer_npub: "npub1race".into(),
                 consumed_at: None,
                 delivered_bytes: None,
+                served_fingerprint: None,
             })
             .unwrap();
 
@@ -2242,6 +2282,7 @@ mod tests {
                     redeemer_npub: "npub1other".into(),
                     consumed_at: None,
                     delivered_bytes: None,
+                    served_fingerprint: None,
                 })
                 .unwrap();
         });
@@ -2315,23 +2356,23 @@ mod tests {
     fn manifest_ask_roundtrips_and_is_keyed_by_npub_and_slug() {
         let (_dir, store) = test_store();
         store
-            .record_manifest_ask("npub1a", "criterion", "fp-1", "2026-01-01T00:00:00Z", "nonce-1")
+            .record_manifest_ask("npub1a", "npub1a", "criterion", "fp-1", "2026-01-01T00:00:00Z", "nonce-1")
             .unwrap();
         // Same slug, different peer ⇒ distinct entry (don't clobber).
         store
-            .record_manifest_ask("npub1b", "criterion", "fp-2", "2026-01-02T00:00:00Z", "nonce-x")
+            .record_manifest_ask("npub1b", "npub1b", "criterion", "fp-2", "2026-01-02T00:00:00Z", "nonce-x")
             .unwrap();
         // Same peer, different slug ⇒ distinct entry.
         store
-            .record_manifest_ask("npub1a", "other", "fp-3", "2026-01-03T00:00:00Z", "nonce-x")
+            .record_manifest_ask("npub1a", "npub1a", "other", "fp-3", "2026-01-03T00:00:00Z", "nonce-x")
             .unwrap();
         let m = store.load_manifest_asks().unwrap();
         assert_eq!(m.len(), 3);
-        let key_a = manifest_ask_key("npub1a", "criterion");
+        let key_a = manifest_ask_key("npub1a", "npub1a", "criterion");
         assert_eq!(m[&key_a].fingerprint_seen, "fp-1");
         assert_eq!(m[&key_a].sent_at, "2026-01-01T00:00:00Z");
-        assert_eq!(m[&manifest_ask_key("npub1b", "criterion")].sent_at, "2026-01-02T00:00:00Z");
-        assert_eq!(m[&manifest_ask_key("npub1a", "other")].sent_at, "2026-01-03T00:00:00Z");
+        assert_eq!(m[&manifest_ask_key("npub1b", "npub1b", "criterion")].sent_at, "2026-01-02T00:00:00Z");
+        assert_eq!(m[&manifest_ask_key("npub1a", "npub1a", "other")].sent_at, "2026-01-03T00:00:00Z");
     }
 
     #[test]
@@ -2339,23 +2380,102 @@ mod tests {
         // A re-ask is a re-ask: the newest send wins. One entry per (npub, slug), not a history.
         let (_dir, store) = test_store();
         store
-            .record_manifest_ask("npub1a", "criterion", "fp-old", "2026-01-01T00:00:00Z", "nonce-x")
+            .record_manifest_ask("npub1a", "npub1a", "criterion", "fp-old", "2026-01-01T00:00:00Z", "nonce-x")
             .unwrap();
         store
-            .record_manifest_ask("npub1a", "criterion", "fp-new", "2026-01-09T00:00:00Z", "nonce-x")
+            .record_manifest_ask("npub1a", "npub1a", "criterion", "fp-new", "2026-01-09T00:00:00Z", "nonce-x")
             .unwrap();
         let m = store.load_manifest_asks().unwrap();
         assert_eq!(m.len(), 1, "exactly one entry per (npub, slug)");
-        let entry = &m[&manifest_ask_key("npub1a", "criterion")];
+        let entry = &m[&manifest_ask_key("npub1a", "npub1a", "criterion")];
         assert_eq!(entry.fingerprint_seen, "fp-new");
         assert_eq!(entry.sent_at, "2026-01-09T00:00:00Z");
+    }
+
+    /// **Carrier 4 lenient load (QURATOR-79)** — an ask map written by an older build carries
+    /// 2-segment `{npub}|{slug}` keys. Every such ask was by construction a self-ask (the only kind
+    /// that existed), so it must still CLAIM and SPEND correctly after the key widened to
+    /// `{npub}|{author}|{slug}` — the migration is on load, not on a command the user must re-run.
+    ///
+    /// MUTATION (P-10) — resolved by containing function, not text: inside `load_manifest_asks`,
+    /// drop the `widen_legacy_ask_key` rewrite (delete the `if m.keys().any(...)` block) → the
+    /// 2-segment key stays 2-segment, `claim_manifest_ask` finds nothing, and the first assert
+    /// below reds with `Unsolicited`.
+    #[test]
+    fn a_legacy_two_segment_ask_key_still_claims_and_spends() {
+        let (_dir, store) = test_store();
+        // Write the OLD shape by hand — this is what an older build left on disk. A nonce too: a
+        // pre-ruling ask (no nonce) fails closed by construction and would pass vacuously.
+        write_json(
+            &store.manifest_asks_path(),
+            &std::collections::HashMap::from([(
+                "npub1a|criterion".to_string(),
+                ManifestAsk {
+                    fingerprint_seen: "fp-1".into(),
+                    sent_at: "2026-01-01T00:00:00Z".into(),
+                    nonce: "n-1".into(),
+                    claimed_by: None,
+                    spent: false,
+                },
+            )]),
+        )
+        .unwrap();
+
+        // The widened key resolves the legacy entry: claim is Granted (not Unsolicited).
+        let claim = store.claim_manifest_ask("npub1a", "npub1a", "criterion", "n-1", "req-A").unwrap();
+        assert!(matches!(claim, AskClaim::Granted), "a legacy ask must still claim: {claim:?}");
+
+        // And it spends — one ask, one auto-dial survives the widening.
+        store.spend_manifest_ask("npub1a", "npub1a", "criterion", "n-1").unwrap();
+        let claim = store.claim_manifest_ask("npub1a", "npub1a", "criterion", "n-1", "req-A").unwrap();
+        assert!(matches!(claim, AskClaim::Spent), "a legacy ask must still spend: {claim:?}");
+
+        // The claim's WRITE persisted the widened spelling — the migration converges on disk.
+        let raw = std::fs::read_to_string(store.manifest_asks_path()).unwrap();
+        assert!(raw.contains("\"npub1a|npub1a|criterion\""), "the widened key is what saved: {raw}");
+    }
+
+    /// **Carrier 4 (QURATOR-79)** — a self-ask (the peer's own collection) is spelled
+    /// `author == npub`, i.e. `{npub}|{npub}|{slug}` — the exact spelling the TypeScript gate
+    /// `ticketAnswersOurAsk` tries on the owner path. Round-trips through the widened key, and does
+    /// NOT collide with a third-party-author ask for the same `(npub, slug)`.
+    ///
+    /// MUTATION (P-10): inside `manifest_ask_key`, emit `format!("{npub}|{slug}")` (drop the
+    /// author) → the two entries below land on one key, `m.len() == 1`, and the length assert reds.
+    #[test]
+    fn a_self_ask_round_trips_through_the_widened_key() {
+        let (_dir, store) = test_store();
+        // Self-ask: we asked npub1a for npub1a's own collection.
+        store
+            .record_manifest_ask("npub1a", "npub1a", "criterion", "fp-own", "2026-01-01T00:00:00Z", "n-own")
+            .unwrap();
+        // Re-serve ask: we asked npub1a for npub1b's collection. Same peer, same slug.
+        store
+            .record_manifest_ask("npub1a", "npub1b", "criterion", "fp-b", "2026-01-02T00:00:00Z", "n-b")
+            .unwrap();
+
+        let m = store.load_manifest_asks().unwrap();
+        assert_eq!(m.len(), 2, "the author is part of the ask's identity — two distinct entries");
+        assert_eq!(manifest_ask_key("npub1a", "npub1a", "criterion"), "npub1a|npub1a|criterion");
+        assert_eq!(m[&manifest_ask_key("npub1a", "npub1a", "criterion")].nonce, "n-own");
+        assert_eq!(m[&manifest_ask_key("npub1a", "npub1b", "criterion")].nonce, "n-b");
+
+        // Each claims under its own key only — the cross-tenant boundary the re-serve spelling draws.
+        assert!(matches!(
+            store.claim_manifest_ask("npub1a", "npub1a", "criterion", "n-own", "req-own").unwrap(),
+            AskClaim::Granted
+        ));
+        assert!(matches!(
+            store.claim_manifest_ask("npub1a", "npub1a", "criterion", "n-b", "req-x").unwrap(),
+            AskClaim::Unsolicited
+        ));
     }
 
     #[test]
     fn manifest_asks_is_wiped_with_the_rest_of_the_profile() {
         let (_dir, store) = test_store();
         store
-            .record_manifest_ask("npub1a", "criterion", "fp-1", "2026-01-01T00:00:00Z", "nonce-1")
+            .record_manifest_ask("npub1a", "npub1a", "criterion", "fp-1", "2026-01-01T00:00:00Z", "nonce-1")
             .unwrap();
         assert!(store.manifest_asks_path().exists());
 
