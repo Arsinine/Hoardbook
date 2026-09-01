@@ -51,8 +51,8 @@ use crate::commands::fulfil::send_full_list_inner;
 use hb_core::ticket::TransportTicket;
 use crate::net;
 use crate::presence;
-use crate::store::{DataStore, IssuedTicketRecord, Settings};
-use crate::transport::{issue_ticket, ManifestSource};
+use crate::store::{DataStore, Settings};
+use crate::transport::ManifestSource;
 use crate::transport_state::{ensure_endpoint, new_shared_endpoint, Role};
 
 /// Entry point — invoked by the thin `bin/hb-wan-it.rs` wrapper. Matches the retired harness's
@@ -287,8 +287,8 @@ fn unix_now() -> u64 {
 //
 // All production paths: scan_selective + save_collection_draft (the add-collection scan), the
 // production teaser publish (publish_listing_capped), the production DM inbox poll (fetch gift-wraps
-// → decode_dms), and the production approval body (the same fns send_full_list drives: build_slug_manifest
-// → ManifestPayload::seal → ensure_endpoint → issue_ticket → record_issued_ticket → send_dm_inner).
+// → decode_dms), and the production approval body itself (`send_full_list_inner` — the same fn the
+// owner's click drives).
 // ---------------------------------------------------------------------------
 
 /// The fixed slug the E2E serve seeds (matches the probe's `SEED_SLUG`).
@@ -441,13 +441,13 @@ fn generate_seed_tree(dir: &Path, count: usize, offset: usize) -> Result<()> {
 }
 
 /// The auto-approve loop: poll the DM inbox for request-DMs, and for each one drive the production
-/// approval body (the same fns `send_full_list` drives: build manifest → bind endpoint → mint ticket →
-/// record → DM the ticket). Runs forever; every approval is logged to stderr.
+/// approval body (`send_full_list_inner`, the fn the "Send the full list" click drives). Runs forever;
+/// every approval is logged to stderr.
 ///
 /// The loop is the serve side of WAN-E2E: it replaces the human "Send the full list" click with a
 /// harness policy (auto-approve every request-DM from any asker). This is the ONLY deviation from the
-/// production path, and it exists because a headless harness cannot click a button — every fn the loop
-/// drives IS the production code.
+/// production path, and it exists because a headless harness cannot click a button — the approval
+/// itself IS the production code, called directly.
 async fn run_auto_approve_loop(
     store: &DataStore,
     live_npub: &crate::identity_state::SharedIdentity,
@@ -463,18 +463,16 @@ async fn run_auto_approve_loop(
     let timeout = Duration::from_secs(15);
     let mut seen_request_ids: HashSet<String> = HashSet::new();
 
-    // The identity fields the approval body needs (snapshot once under the lock; AppIdentity is not Clone).
-    let (identity, browse_key, transport_key, own_npub) = {
+    // The identity fields the inbox poll needs (snapshot once under the lock; AppIdentity is not
+    // Clone). Only `identity` + `own_npub` now: the approval itself reads the session secrets from the
+    // live `SharedIdentity` inside `send_full_list_inner`, so the loop no longer holds a second copy
+    // of them (same reasoning as `setup_manifest_plane`'s snapshot note).
+    let (identity, own_npub) = {
         let guard = live_npub.read().await;
         let id = guard
             .as_ref()
             .ok_or_else(|| anyhow!("no identity loaded for the auto-approve loop"))?;
-        (
-            id.identity.clone(),
-            id.browse_key.clone(),
-            id.transport_key.clone(),
-            id.npub(),
-        )
+        (id.identity.clone(), id.npub())
     };
 
     eprintln!("[serve] auto-approve loop started (polling DM inbox every {poll_interval:?})");
@@ -541,21 +539,10 @@ async fn run_auto_approve_loop(
                 ask_nonce
             );
 
-            // Drive the production approval body (the same fns send_full_list drives). If it fails,
-            // log and continue — the loop stays alive for the next request.
-            if let Err(e) = approve_request(
-                store,
-                &identity,
-                &browse_key,
-                &transport_key,
-                &own_npub,
-                live_npub,
-                shared_relay,
-                &msg.from,
-                slug,
-                ask_nonce,
-            )
-            .await
+            // Drive the production approval body (send_full_list_inner). If it fails, log and
+            // continue — the loop stays alive for the next request.
+            if let Err(e) =
+                approve_request(store, live_npub, shared_relay, &msg.from, slug, ask_nonce).await
             {
                 eprintln!("[serve] auto-approve failed for {slug}: {e:#}");
             }
@@ -564,85 +551,63 @@ async fn run_auto_approve_loop(
     }
 }
 
-/// Drive the production approval body for one request-DM: build the manifest, bind the endpoint, mint
-/// the ticket, record it, and DM it to the asker. This is the body of `send_full_list` (fulfil.rs),
-/// driven directly (the Tauri `State` wrapper is the only thing skipped — every fn called IS
-/// production).
-#[allow(clippy::too_many_arguments)]
+/// Drive the production approval body for one request-DM: `send_full_list_inner` IS the body of the
+/// `send_full_list` Tauri command (the command is a marshalling shim over it), so approving here does
+/// exactly what the owner's click does — seal the manifest against the 16 MiB ceiling, bind the
+/// listening endpoint, mint the ticket, persist the issued-ticket record AND the QURATOR-137 standing
+/// grant before the DM, and DM the ticket to the asker.
 async fn approve_request(
     store: &DataStore,
-    identity: &hb_core::Identity,
-    browse_key: &crate::identity_state::SessionBrowseKey,
-    transport_key: &crate::identity_state::SessionTransportKey,
-    own_npub: &str,
     live_npub: &crate::identity_state::SharedIdentity,
     shared_relay: &net::SharedRelay,
     asker_npub: &str,
     slug: &str,
     ask_nonce: Option<&str>,
 ) -> Result<()> {
-    use crate::commands::collection::build_slug_manifest;
-    use hb_core::ManifestPayload;
-
-    // (1) Prove the manifest exists and fits (seal = the 16 MiB ceiling). Same check send_full_list
-    // runs before promising anything.
-    let envelope =
-        build_slug_manifest(slug, store, identity, browse_key.bytes()).map_err(|e| anyhow!("{e}"))?;
-    ManifestPayload::seal(&envelope)
-        .map_err(|e| anyhow!("the E2E collection's manifest is over the transport ceiling: {e}"))?;
-
-    // (2) Save the asker as a contact in good standing (contact_standing returns Good, which
+    // (1) Save the asker as a contact in good standing (contact_standing returns Good, which
     // authorize_redemption requires). The auto-approve policy trusts any asker — a real human reviews.
+    // This is the harness's ONLY deviation from the production approval, and it must run BEFORE the
+    // approval call: in production the human's contact already exists, so `send_full_list_inner` never
+    // creates one.
     save_asker_contact(store, asker_npub)?;
 
-    // (3) Record a manifest ask the probe's claim gate expects — same nonce the ticket will echo.
-    // The harness owns both sides, so the nonce is the one from the request-DM.
+    // (2) Record a manifest ask with the nonce from the request-DM — same nonce the ticket will echo.
+    // Kept harness-side (placeholder fingerprint, as in `setup_manifest_plane`) because production
+    // writes this record on the ASKER's side, when the request-DM is sent; `send_full_list_inner` has
+    // no ask-record step to delegate to. The probe already recorded its own ask with the fingerprint
+    // it browsed, and that is the record the claim gate reads.
     let nonce = ask_nonce.unwrap_or("");
-    let fp = envelope.snapshot_fingerprint.clone();
-    store.record_manifest_ask(asker_npub, asker_npub, slug, &fp, &rfc3339_now(), nonce)?;
+    store.record_manifest_ask(asker_npub, asker_npub, slug, "wan-e2e", &rfc3339_now(), nonce)?;
 
-    // (4) Bind the endpoint via the production path (ensure_endpoint, Role::Listen). The accept loop
-    // serves manifests for approved tickets.
-    let source: Arc<dyn ManifestSource> =
-        crate::manifest_source::StoreManifestSource::new(store.clone(), identity.clone(), browse_key.clone());
-    let shared_ep = new_shared_endpoint();
-    let endpoint = ensure_endpoint(&shared_ep, own_npub, live_npub, transport_key, source, Role::Listen)
-        .await
-        .map_err(|e| anyhow!("bind endpoint for approval: {e}"))?;
-
-    // (5) Mint the ticket via the production path + persist it (record before the DM, same ordering
-    // as send_full_list: a redeemer always presents a ticket we can recognise).
-    let request_id = new_request_id();
-    let ticket = issue_ticket(&endpoint, &request_id, slug, unix_now(), ask_nonce)?;
-    store.record_issued_ticket(&IssuedTicketRecord {
-        ticket: ticket.clone(),
-        redeemer_npub: asker_npub.to_string(),
-        consumed_at: None,
-        delivered_bytes: None,
-        served_fingerprint: None,
-    })?;
-
-    // (6) DM the ticket to the asker via the production NIP-17 path (send_dm_inner). This is the
-    // ticket-DM leg the E2E probe polls for.
-    let body = serde_json::to_string(&ticket)?;
-    let client = net::client(identity, store, shared_relay).await?;
-    let recipient = crate::commands::chat::parse_recipient(asker_npub)
-        .map_err(|e| anyhow!("parse asker npub for ticket-DM: {e}"))?;
-    let own_relays = net::relay_urls(store);
-    crate::commands::chat::send_dm_inner(
-        &client,
-        identity,
-        &recipient,
-        &body,
-        &own_relays,
-        net::RELAY_TIMEOUT,
+    // (3) Approve through the production command body, exactly as `setup_manifest_plane` does. The
+    // harness used to re-implement the steps here one by one, and that copy is how the QURATOR-137
+    // grant write stayed invisible: WAN-E2E ran 2/2 green while writing no grant at all, so a green
+    // run could not discharge §5 for any grant-related change. No `std::mem::forget` either — the
+    // accept loop `ensure_endpoint` spawns holds its own endpoint clone, so the handle can drop.
+    //
+    // P-10 mutation (resolve by containing function, not text search): delete the
+    // `record_issued_ticket` call inside `send_full_list_inner` (fulfil.rs) and WAN-E2E row E1 must go
+    // red — the probe's redeem is refused (`source.issued()` finds no record → REFUSAL_NO_MATCH) and
+    // `e1_truncated_round_trip`'s owner-side check reports "no record of this request id". Before this
+    // convergence that same edit left WAN-E2E green, which was the defect. The grant write itself is
+    // record-only until slice 3 consults it (`standing_grant_for` has no production caller yet), so no
+    // executable test reds on removing it TODAY — the convergence is what puts it on the tested path
+    // for when slice 3 lands.
+    send_full_list_inner(
+        asker_npub.to_string(),
+        slug.to_string(),
+        ask_nonce.map(|n| n.to_string()),
+        live_npub,
+        store,
+        shared_relay,
+        &new_shared_endpoint(),
     )
-    .await?;
+    .await
+    .map_err(|e| anyhow!("send_full_list_inner: {e}"))?;
     eprintln!(
-        "[serve] auto-approve: ticket minted + DM'd for request {request_id} (slug '{slug}', nonce '{nonce}')"
+        "[serve] auto-approve: approved via send_full_list_inner (slug '{slug}', nonce '{nonce}') — \
+         ticket minted, recorded, grant written, and DM'd to {asker_npub}"
     );
-    // The endpoint lives for the process; forget it so the accept loop keeps running.
-    std::mem::forget(endpoint);
     Ok(())
 }
 
@@ -829,13 +794,6 @@ fn save_asker_contact(store: &DataStore, asker_npub: &str) -> Result<()> {
         .save_contact(&crate::store::CachedPeer::pubkey_hash(asker_npub), &contact)
         .map_err(|e| anyhow!("save asker contact: {e}"))?;
     Ok(())
-}
-
-/// Mint a request id: 128 bits of randomness, hex. Mirrors `fulfil::new_request_id` — unguessable
-/// (the ticket's primary binding) and unique per approval.
-fn new_request_id() -> String {
-    let bytes: [u8; 16] = rand::random();
-    hex::encode(bytes)
 }
 
 fn rfc3339_now() -> String {
@@ -1454,5 +1412,61 @@ mod tests {
     #[test]
     fn parse_peer_rejects_garbage() {
         assert!(parse_peer("not-a-code").is_err());
+    }
+
+    /// The other half of `fulfil_commands_stay_thin_so_the_harness_keeps_covering_them`.
+    ///
+    /// That guard pins the `#[tauri::command]` bodies as thin shims over `*_inner`, and its whole
+    /// rationale is the sentence "the WAN harness calls the inner fn, so anything here is untested".
+    /// Nothing verified that sentence. It was false: `approve_request` re-implemented the approval
+    /// step by step, so WAN-E2E ran green while never executing `send_full_list_inner` — and
+    /// therefore never writing the QURATOR-137 standing grant (`fulfil.rs`, `record_standing_grant`).
+    /// A green WAN-E2E could not discharge §5 for any grant-related change, and nothing said so.
+    ///
+    /// This is the same failure shape as the `sanitize_node_addr` defect (2026-08-27): a harness that
+    /// copies a body instead of calling it covers the copy, not the code that ships. A drift guard,
+    /// not integration coverage — the `suite_cap.rs` precedent — but it fails loudly on re-divergence,
+    /// which is the part no one was getting.
+    ///
+    /// MUTATION (P-10, resolve by containing function): in `approve_request`, replace the
+    /// `send_full_list_inner(` call with any hand-rolled step — e.g. re-add `issue_ticket(` — and
+    /// this test reds. Comments are stripped first, so restating the rule in prose cannot satisfy it.
+    #[test]
+    fn the_harness_approves_through_send_full_list_inner_and_never_rebuilds_it() {
+        let src = include_str!("mod.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let sig = "async fn approve_request(";
+        let at = code.find(sig).expect("approve_request not found");
+        let end = code[at..].find("\n}").expect("approve_request must terminate") + at;
+        let body = &code[at..end];
+
+        assert!(
+            body.contains("send_full_list_inner("),
+            "approve_request must approve by calling send_full_list_inner — the body the owner's \
+             'Send the full list' click runs. Re-implementing the steps here is how WAN-E2E went \
+             green while writing no standing grant at all."
+        );
+
+        // The steps send_full_list_inner owns. Any one of them reappearing here means the harness
+        // has started keeping its own copy again — the exact drift that hid the grant write.
+        for step in [
+            "ManifestPayload::seal(",
+            "ensure_endpoint(",
+            "issue_ticket(",
+            "record_issued_ticket(",
+            "send_dm_inner(",
+        ] {
+            assert!(
+                !body.contains(step),
+                "approve_request re-implements {step:?}, which send_full_list_inner already does. \
+                 The harness would then be testing its own copy instead of the shipping path — \
+                 delete it and let the delegated call do the work."
+            );
+        }
     }
 }
