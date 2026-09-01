@@ -16,10 +16,17 @@
 //! (A third concept, the Mascara download ticket, was retired 2026-07-26 and is *dead* — deleted
 //! from the vocabulary, not merely unused.)
 //!
-//! ## Lifecycle — owner ruling 2026-07-30. Do not re-open the time-box option.
+//! ## Lifecycle — owner rulings 2026-07-30 and 2026-08-31. Do not re-open the time-box option.
 //!
-//! > **One ticket per request. Consumed on SUCCESS, not on attempt. Redeemed immediately. Not
-//! > time-boxed — valid until redeemed.**
+//! > **Minted per fetch. Consumed on SUCCESS, not on attempt. Redeemed immediately. Not time-boxed
+//! > — valid until redeemed. Backed by a standing grant per (peer, collection).**
+//!
+//! The 2026-08-31 amendment (QURATOR-137): the authorization a ticket exercises is a **standing
+//! grant per (peer, collection)** — a peer already granted needs no new ask, so "one ticket per
+//! request" in its original one-human-ask sense is dead. What survives unchanged is the mint
+//! discipline: every fetch still mints its own ticket, still consumed on delivery, with live
+//! contact standing re-read at **every** redeem — removing or blocking the contact refuses the
+//! next fetch at this node's own gate. **There is still no time-box.**
 //!
 //! Each property answers a failure the alternatives cause, and each is enforced here rather than
 //! documented:
@@ -50,10 +57,16 @@
 //! from its DM and withholding redemption) rather than routine, but it is the whole difference
 //! between "cannot un-approve" and "can".
 //!
-//! **Why reuse is not offered.** There is no scenario needing repeated fetches: collection updates
-//! are already handled — `snapshot_fingerprint` + the stale flag let a peer *detect* staleness and
-//! re-ask, which is a **new request and a new ticket** (exactly what `hb-it` Suite MAN's MAN2 pins).
-//! Reuse would solve a problem that does not exist.
+//! **Reuse IS offered — as a standing grant, owner ruling 2026-08-31 (QURATOR-137).** The premise
+//! this file used to argue ("no scenario needs repeated fetches") is overruled: a peer already
+//! granted for a collection skips the ask entirely, and each fetch still mints a fresh ticket. The
+//! old re-ask path (`snapshot_fingerprint` + the stale flag → new request, new ticket) is no longer
+//! the *required* route for a granted peer, but nothing here forbids it either — `request_id` stays
+//! per-ask, and the asker's `ask_nonce` gate (fail-closed on `None`) still binds each ticket to one
+//! specific ask, so a standing grant never becomes a licence to make our client dial an address of
+//! someone's choosing unprompted. The one-per-request framing now describes mint discipline, not
+//! a limit on how often a granted peer may fetch: the ticket records that gate the re-serve are
+//! hb-app's (`load_issued_ticket` / `consumed_at`), not anything in this module.
 
 use serde::{Deserialize, Serialize};
 
@@ -99,8 +112,10 @@ pub struct TransportTicket {
     /// Always [`TICKET_TAG`] — how the asker's inbox recognises the DM.
     pub hb: String,
     pub ticket_v: u8,
-    /// The request this ticket answers. **One ticket per request**: the binding that stops a ticket
-    /// issued for one request being spent on another.
+    /// The request this ticket answers. **One ticket per ask** (mint discipline, not a fetch limit
+    /// — the standing grant behind it is per (peer, collection), owner ruling 2026-08-31): the
+    /// binding that stops a ticket issued for one request being spent on another. A granted peer
+    /// re-fetching gets a *newly minted* ticket, not a replay of this one.
     pub request_id: String,
     /// The collection the request was about, so a redeemer cannot silently fetch a different one.
     pub slug: String,
@@ -301,7 +316,7 @@ impl ConsumedTicket {
 /// Four checks, in this order, each of which a real failure mode motivates:
 ///
 /// 1. the ticket is structurally a ticket of a version we speak;
-/// 2. it answers **this** request (one ticket per request — no spending A's ticket on B);
+/// 2. it answers **this** request (one ticket per ask — no spending A's ticket on B);
 /// 3. it has not already been consumed (replay of a completed transfer);
 /// 4. the redeemer is **still** a contact in good standing (revocability — the property
 ///    valid-until-redeemed would otherwise cost).
@@ -510,7 +525,89 @@ mod tests {
         assert_eq!(restored.request_id(), "req-1");
     }
 
-    /// **One ticket per request** — a ticket cannot be spent on a different request or collection.
+    /// **The standing grant as this module sees it** (owner ruling 2026-08-31, QURATOR-137). A
+    /// granted peer's next fetch is a NEWLY MINTED ticket: the previous ticket's consumption is
+    /// spent-ticket bookkeeping, not a revoke of the peer. And the grant is re-read live at EVERY
+    /// redeem, so a contact blocked between fetches is refused on the next one — at this node's own
+    /// gate only, NOT system-wide: since Carrier 4 a mutual contact may still re-serve its cached
+    /// copy without consulting the author, and re-keying does not rescue that. Never call this
+    /// end-to-end revocation.
+    ///
+    /// P-10 mutations the orchestrator must apply and see red (do not run here):
+    /// (a) delete the `if already_consumed { return Err(HbError::TicketAlreadyRedeemed); }` arm in
+    ///     `authorize_redemption` — the replay assertion below must fail;
+    /// (b) delete the `if !standing.may_redeem()` arm in the same function — the Blocked assertion
+    ///     must fail. (This test shares (b) with
+    ///     `a_redeemer_blocked_or_declined_after_approval_is_refused`; (a) is the discriminator
+    ///     unique to this test's first half.)
+    /// No edit *inside* this module can redden the "second mint authorizes" half, because the module
+    /// holds no cross-call state — that statelessness is the finding: hb-core needed no code change
+    /// for the ruling, only this pin plus the rationale rewrite above.
+    #[test]
+    fn a_standing_grant_re_mints_rather_than_replays_and_is_rechecked_every_redeem() {
+        // Fetch 1: the granted peer redeems ticket req-1 successfully.
+        let first = ticket();
+        let grant = authorize_redemption(&first, "req-1", false, ContactStanding::Good).unwrap();
+        let _receipt = grant.into_consumed(&delivered());
+
+        // That ticket is spent: a replay of it is refused — spent-ticket bookkeeping.
+        assert!(
+            matches!(
+                authorize_redemption(&first, "req-1", true, ContactStanding::Good),
+                Err(HbError::TicketAlreadyRedeemed)
+            ),
+            "consuming one ticket never licenses a replay of the same ticket"
+        );
+
+        // Fetch 2 — same peer, same collection, no new ask needed: a FRESH mint authorizes. The
+        // prior consumption is not a revoke of the grant.
+        let second = TransportTicket::issue(
+            "req-2",
+            "my-slug",
+            "node-addr-opaque",
+            1_700_000_100,
+            Some("nonce-2"),
+        );
+        let grant = authorize_redemption(&second, "req-2", false, ContactStanding::Good)
+            .expect("a granted peer's next fetch is a new ticket, not a replay of the spent one");
+        drop(grant); // not delivered — costs nothing, and does not touch the grant
+
+        // Blocked between fetches: the NEXT fetch is refused, here, at this node's own gate.
+        let third = TransportTicket::issue(
+            "req-3",
+            "my-slug",
+            "node-addr-opaque",
+            1_700_000_200,
+            Some("nonce-3"),
+        );
+        assert!(
+            matches!(
+                authorize_redemption(&third, "req-3", false, ContactStanding::Blocked),
+                Err(HbError::TicketRedeemerNotInGoodStanding)
+            ),
+            "blocking the contact must refuse the next fetch at this node's gate"
+        );
+
+        // Unblocked again: the following fetch mints and authorizes — refusal is per-check, not
+        // sticky, and no time-box intervenes.
+        let fourth = TransportTicket::issue(
+            "req-4",
+            "my-slug",
+            "node-addr-opaque",
+            1_700_000_300,
+            Some("nonce-4"),
+        );
+        assert!(
+            authorize_redemption(&fourth, "req-4", false, ContactStanding::Good).is_ok(),
+            "restoring the contact restores the grant — the refusal was the standing read, not a burn"
+        );
+    }
+
+    /// **One ticket per ask** — a ticket cannot be spent on a different request or collection.
+    /// UNCHANGED by the 2026-08-31 standing-grant ruling: that ruling changes WHO is entitled to a
+    /// ticket (a granted peer, without re-asking), not WHAT a ticket is bound to. `request_id` +
+    /// `ask_nonce` remain the anti-forgery binding (a peer must not make our client dial an address
+    /// of their choosing "for" a request we never made), so this stays exactly as pinned.
     #[test]
     fn a_ticket_is_bound_to_its_own_request() {
         let t = ticket();
