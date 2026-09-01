@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use hb_core::{ManifestPayload, TransportTicket};
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::commands::browse::accept_manifest_bytes;
 use crate::commands::collection::build_slug_manifest;
@@ -27,7 +27,7 @@ use crate::identity_state::SharedIdentity;
 use crate::manifest_source::StoreManifestSource;
 use crate::net::SharedRelay;
 use crate::store::{DataStore, IssuedTicketRecord};
-use crate::transport::{fetch_manifest, issue_ticket, sanitize_node_addr};
+use crate::transport::{fetch_manifest_with_progress, issue_ticket, sanitize_node_addr};
 use crate::transport_state::{ensure_endpoint, Role, SharedEndpoint};
 
 fn cmd_err<E: std::fmt::Display>(e: E) -> String {
@@ -445,8 +445,9 @@ struct CacheIndexEntry {
 /// acknowledgement, so a dial that never connects can simply be retried.
 ///
 /// **A marshalling shim only** — see [`send_full_list`]'s note. The body is
-/// [`redeem_manifest_ticket_inner`], which the WAN harness calls directly, so the sanitize/claim/
-/// fetch/spend sequence the harness used to hand-copy is now the one the app runs.
+/// [`redeem_manifest_ticket_emitting`], which owns the Tauri-only progress forwarder and then
+/// calls the same body fn [`redeem_manifest_ticket_inner`] does, so the sanitize/claim/fetch/spend
+/// sequence the harness used to hand-copy is still the one the app runs.
 #[tauri::command]
 pub async fn redeem_manifest_ticket(
     npub: String,
@@ -455,9 +456,54 @@ pub async fn redeem_manifest_ticket(
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
     endpoint: State<'_, SharedEndpoint>,
+    app: tauri::AppHandle,
 ) -> CmdResult<crate::commands::browse::ImportedManifest> {
-    redeem_manifest_ticket_inner(npub, ticket_json, newest_fingerprint, &identity, &store, &endpoint)
-        .await
+    redeem_manifest_ticket_emitting(app, npub, ticket_json, newest_fingerprint, &identity, &store, &endpoint).await
+}
+
+/// The Tauri-only half of [`redeem_manifest_ticket`]: stand up the progress forwarder, then run the
+/// same body [`redeem_manifest_ticket_inner`] runs.
+///
+/// This exists so the `#[tauri::command]` body stays a single delegating call. The forwarder is the
+/// `"snapshot-progress"` shape from `lib.rs` — an unbounded channel into a spawned task that emits —
+/// and the CHANNEL, never `AppHandle`, is what crosses into the body fn, so the WAN harness's direct
+/// call to `_inner` stays Tauri-free. Nothing here decides anything: no guard, transform or ordering
+/// rule may move into this function, because the harness cannot run it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn redeem_manifest_ticket_emitting(
+    app: tauri::AppHandle,
+    npub: String,
+    ticket_json: String,
+    newest_fingerprint: Option<String>,
+    identity: &SharedIdentity,
+    store: &DataStore,
+    endpoint: &SharedEndpoint,
+) -> CmdResult<crate::commands::browse::ImportedManifest> {
+    let (prog_tx, mut prog_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::transport::ManifestProgress>();
+    tauri::async_runtime::spawn(async move {
+        while let Some(p) = prog_rx.recv().await {
+            let _ = app.emit(
+                "manifest-progress",
+                serde_json::json!({
+                    "request_id": p.request_id,
+                    "slug": p.slug,
+                    "received": p.received,
+                    "total": p.total,
+                }),
+            );
+        }
+    });
+    redeem_manifest_ticket_with_progress(
+        npub,
+        ticket_json,
+        newest_fingerprint,
+        identity,
+        store,
+        endpoint,
+        Some(&prog_tx),
+    )
+    .await
 }
 
 /// Carrier 4 provenance — the redeem side's answer to "who served this copy?".
@@ -476,7 +522,8 @@ pub(crate) fn carrier4_served_by(ticket: &TransportTicket, dm_sender: &str) -> O
     ticket.author_npub.is_some().then(|| dm_sender.to_string())
 }
 
-/// The whole of `redeem_manifest_ticket`'s behaviour, callable without a Tauri runtime.
+/// The whole of `redeem_manifest_ticket`'s behaviour, callable without a Tauri runtime — the
+/// signature the WAN harness drives, unchanged by QURATOR-159.
 pub(crate) async fn redeem_manifest_ticket_inner(
     npub: String,
     ticket_json: String,
@@ -484,6 +531,30 @@ pub(crate) async fn redeem_manifest_ticket_inner(
     identity: &SharedIdentity,
     store: &DataStore,
     endpoint: &SharedEndpoint,
+) -> CmdResult<crate::commands::browse::ImportedManifest> {
+    redeem_manifest_ticket_with_progress(
+        npub,
+        ticket_json,
+        newest_fingerprint,
+        identity,
+        store,
+        endpoint,
+        None,
+    )
+    .await
+}
+
+/// [`redeem_manifest_ticket_inner`] plus an optional progress channel: a plain `mpsc` sender, so no
+/// `AppHandle` ever reaches this seam. `None` means no progress — the WAN harness's path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn redeem_manifest_ticket_with_progress(
+    npub: String,
+    ticket_json: String,
+    newest_fingerprint: Option<String>,
+    identity: &SharedIdentity,
+    store: &DataStore,
+    endpoint: &SharedEndpoint,
+    progress: Option<&tokio::sync::mpsc::UnboundedSender<crate::transport::ManifestProgress>>,
 ) -> CmdResult<crate::commands::browse::ImportedManifest> {
     let mut ticket: TransportTicket = serde_json::from_str(&ticket_json)
         .map_err(|_| "That message is not a readable transport ticket.".to_string())?;
@@ -558,7 +629,20 @@ pub(crate) async fn redeem_manifest_ticket_inner(
     // undecryptable, incomplete) would still have burned the ticket, forcing the human to ask again
     // and the owner to approve again.
     let mut imported: Option<crate::commands::browse::ImportedManifest> = None;
-    fetch_manifest(&ep, &ticket, |payload| {
+    // QURATOR-159: byte progress for the manifest body. `(received, total)` straight off the
+    // framing layer; the wrapper's forwarder is what turns these into Tauri events. Every sample
+    // names the ticket this redeem is bound to, so the UI can never attribute one bar's bytes to
+    // another in-flight redeem.
+    let progress_sink = progress.map(|tx| {
+        crate::transport::ManifestProgress {
+            request_id: ticket.request_id.clone(),
+            slug: ticket.slug.clone(),
+            received: 0,
+            total: 0,
+        }
+        .sink(tx)
+    });
+    fetch_manifest_with_progress(&ep, &ticket, |payload| {
         let raw = std::str::from_utf8(payload.as_bytes())
             .map_err(|_| anyhow::anyhow!("the manifest that arrived was not text"))?;
         imported = Some(
@@ -580,7 +664,7 @@ pub(crate) async fn redeem_manifest_ticket_inner(
             .map_err(|e| anyhow::anyhow!("{e}"))?,
         );
         Ok(())
-    })
+    }, progress_sink.as_ref().map(|f| f as crate::transport::ProgressSink))
     .await
     .map_err(cmd_err)?;
     let mut imported =
@@ -680,7 +764,7 @@ mod tests {
             .join("\n");
 
         for (cmd, inner) in
-            [("send_full_list", "send_full_list_inner"), ("redeem_manifest_ticket", "redeem_manifest_ticket_inner"), ("send_cached_manifest", "send_cached_manifest_inner")]
+            [("send_full_list", "send_full_list_inner"), ("redeem_manifest_ticket", "redeem_manifest_ticket_emitting"), ("send_cached_manifest", "send_cached_manifest_inner")]
         {
             let sig = format!("pub async fn {cmd}(");
             let at = code.find(&sig).unwrap_or_else(|| panic!("{cmd} not found"));
@@ -715,6 +799,23 @@ mod tests {
             assert!(
                 stmts <= 1,
                 "{cmd}'s command body should be one delegating call, found {stmts} statements"
+            );
+        }
+
+        // QURATOR-159: `redeem_manifest_ticket` delegates to `_emitting` rather than straight to
+        // `_inner`, because the progress forwarder needs an `AppHandle` the harness cannot supply.
+        // That indirection is only safe while BOTH paths rejoin the SAME body — the production one
+        // through `_emitting`, the harness one through `_inner`. Assert the convergence, or the two
+        // can drift apart and the harness silently stops covering what ships, which is precisely the
+        // failure this guard exists to prevent.
+        for f in ["redeem_manifest_ticket_emitting", "redeem_manifest_ticket_inner"] {
+            let sig = format!("async fn {f}(");
+            let at = code.find(&sig).unwrap_or_else(|| panic!("{f} not found"));
+            let end = code[at..].find("\n}").expect("fn must terminate") + at;
+            assert!(
+                code[at..end].contains("redeem_manifest_ticket_with_progress("),
+                "{f} must converge on redeem_manifest_ticket_with_progress, so the harness path and \
+                 the production path run one body and cannot drift apart"
             );
         }
     }

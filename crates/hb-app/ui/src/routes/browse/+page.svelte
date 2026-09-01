@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { contacts, toast, toastWithAction, contactsLoadError, loadContactsInto } from '$lib/stores.js';
+	import { onMount } from 'svelte';
+	import { listen } from '@tauri-apps/api/event';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import { sizeTier, sizeTierTooltip, rowIcon } from '$lib/collection-row-view.js';
 	import { refreshContact, importManifest, requestManifest, requestManifestFrom, getManifestAsks, getContacts, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, browsePrivateCollections, type ManifestAsk, type ImportedManifest } from '$lib/api.js';
@@ -15,7 +17,7 @@
 	// QURATOR-98 — the shared dialog shell (backdrop, Escape, Tab trap, focus restore).
 	import Modal from '$lib/components/Modal.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
-	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote, arrangeItems, fileTypesPresent, type BrowseViewMode, type BrowseSortKey, type BrowseSortDir } from '$lib/browse-view.js';
+	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote, arrangeItems, fileTypesPresent, fmtLargestUnit, type BrowseViewMode, type BrowseSortKey, type BrowseSortDir } from '$lib/browse-view.js';
 	import { deriveManifestAskState, ASK_TICK_MS, MANIFEST_ASKED_LINE, MANIFEST_ASK_AGAIN_LABEL, MANIFEST_ASK_AGAIN_COOLDOWN_TIP, MANIFEST_OPEN_CHAT_LABEL, MANIFEST_ASK_FAILED_LINE } from '$lib/manifest-ask.js';
 	import type { CachedPeer, Collection, DirectoryItem, Group } from '$lib/types.js';
 	import { groupByGroups, matchesQuery } from '$lib/contacts-view.js';
@@ -124,6 +126,9 @@
 		selectedCollection = col;
 		folderStack = [];
 		resetFileFilters();
+		// QURATOR-159: drop the previous collection's progress run — a bar keyed to a slug nobody is
+		// looking at must not survive a navigation (the peer list re-entry path lands here too).
+		manifestProgress = {};
 	}
 
 	// M16 W4: import a full-listing manifest the user received out of band, upgrading a truncated
@@ -166,6 +171,38 @@
 		// interval is created once and torn down on unmount.
 		const id = setInterval(() => { nowTick = Date.now(); }, ASK_TICK_MS);
 		return () => clearInterval(id);
+	});
+
+	// QURATOR-159: live byte-progress for an in-flight manifest fetch, keyed by collection slug (a
+	// transfer started on collection X must never paint a bar on collection Y). The backend emits
+	// `manifest-progress` events; a final event with received === total closes the run out. Entries
+	// are assigned in place -- CLAUDE.md's Svelte 5 idiom is `state[k] = v`, NOT a spread
+	// reassignment, which silently drops concurrent updates the moment an await lands between the
+	// read and the write. Entries are cleared on re-select so a stale run never lingers.
+	// The `.catch` on listen() is LOAD-BEARING: outside Tauri -- every jsdom mount of this page that
+	// does not stub the event module -- listen() REJECTS, and one unhandled rejection fails the whole
+	// vitest run even with all 1400 tests green (it did: 25 errors, GATE_EXIT=1, 2026-09-01).
+	type ManifestProgress = { received: number; total: number };
+	let manifestProgress = $state<Record<string, ManifestProgress>>({});
+	let manifestProgressUnlisten: (() => void) | undefined;
+
+	onMount(() => {
+		listen<{ request_id: string; slug: string; received: number; total: number }>('manifest-progress', (event) => {
+			const p = event.payload;
+			if (!p || typeof p.slug !== 'string') return;
+			manifestProgress[p.slug] = { received: p.received, total: p.total };
+		}).then(fn => { manifestProgressUnlisten = fn; }).catch(() => { });
+		return () => { manifestProgressUnlisten?.(); };
+	});
+
+	// The selected collection's in-flight run only. Complete runs (received === total) and
+	// degenerate ones (total <= 0 — nothing to draw a ratio against) are not "in flight".
+	let paywallProgress = $derived.by(() => {
+		const slug = selectedCollection?.slug;
+		if (!slug) return null;
+		const p = manifestProgress[slug];
+		if (!p || p.total <= 0 || p.received >= p.total) return null;
+		return { ...p, pct: Math.min(100, Math.max(0, Math.round((p.received / p.total) * 100))) };
 	});
 
 	// M16 W4: the primary "get the rest" affordance — DM the owner asking for the full list. The owner
@@ -1342,7 +1379,20 @@
 									     "Open chat" link to where the reply will arrive. Import stays alongside. No Download
 									     button (MAS-INV-5): Hoardbook moves no files. -->
 									<div class="paywall-actions">
-										{#if askState.kind === 'asked'}
+										{#if paywallProgress}
+											<!-- QURATOR-159: an in-flight manifest fetch. Owner-signed copy, exact: "Fetching the
+											     full list" + byte progress. SOURCE-AGNOSTIC by owner ruling D6: no peer name, npub,
+											     avatar or "from X" — carrier 4 means the answering peer may not be the peer asked.
+											     Deliberately NO stalled/"never answered" state (ruling D7): tickets never expire and
+											     none exists until the peer fulfils, so there is no timeout event to key on. -->
+											<div class="paywall-progress">
+												<span class="paywall-progress-label">Fetching the full list</span>
+												<div class="paywall-progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={paywallProgress.pct} aria-label="Fetching the full list">
+													<div class="paywall-progress-fill" style:flex-grow={paywallProgress.pct}></div>
+												</div>
+												<span class="paywall-progress-bytes">{fmtLargestUnit(paywallProgress.received)} / {fmtLargestUnit(paywallProgress.total)}</span>
+											</div>
+										{:else if askState.kind === 'asked'}
 											<!-- Asked-state: read from the persisted record, not component-local state. The muted
 											     line + cooldown-gated "Ask again" + "Open chat" deep-link (W1) to where the reply lands. -->
 											<span class="asked-line">{MANIFEST_ASKED_LINE(askState.relative)}</span>
@@ -1785,6 +1835,20 @@
 	.ask-contact-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; align-items: center; }
 	.ask-contact-select { max-width: 220px; }
 	.ask-contact-hint { font-size: 11.5px; color: var(--fg-dim); margin-top: 4px; }
+	/* QURATOR-159: the in-flight manifest-fetch bar — one row, label + track + byte counts. */
+	.paywall-progress { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+	.paywall-progress-label { font-size: 11.5px; color: var(--fg); }
+	.paywall-progress-track {
+		display: flex;
+		width: 160px;
+		height: 6px;
+		flex-shrink: 0;
+		border-radius: 3px;
+		background: var(--bg-elev2);
+		overflow: hidden;
+	}
+	.paywall-progress-fill { background: var(--accent); }
+	.paywall-progress-bytes { font-size: 11.5px; color: var(--fg-dim); }
 	.imported-note {
 		display: flex;
 		align-items: center;

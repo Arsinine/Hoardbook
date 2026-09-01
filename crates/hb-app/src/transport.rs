@@ -199,9 +199,56 @@ pub trait ManifestSource: Send + Sync + 'static {
 /// order matters and is the whole point: a peer that declares `u32::MAX` is refused on the four
 /// bytes it sent, not after a 4 GiB allocation. `from_wire` remains the second check — defence in
 /// depth for any future caller that assembles bytes some other way.
+/// Byte-level progress for an in-flight frame read: `(received, total)` — cumulative body bytes
+/// read so far, and the frame's **declared** length. A plain callable rather than a Tauri handle,
+/// so the seam the WAN harness calls stays runtime-free; only the `redeem_manifest_ticket`
+/// wrapper passes one.
+pub(crate) type ProgressSink<'a> = &'a (dyn Fn(u64, u64) + Send + Sync);
+
+/// One progress sample for an in-flight manifest fetch, tagged with the ticket it belongs to —
+/// this is the payload the wrapper emits as the `manifest-progress` Tauri event. Plain data, no
+/// Tauri types, so it can cross the runtime-free seam into `redeem_manifest_ticket_inner`.
+#[derive(Clone, Debug)]
+pub(crate) struct ManifestProgress {
+    pub(crate) request_id: String,
+    pub(crate) slug: String,
+    pub(crate) received: u64,
+    pub(crate) total: u64,
+}
+
+impl ManifestProgress {
+    /// The `ProgressSink` closure for one fetch: stamps each `(received, total)` sample with this
+    /// ticket's `request_id` and `slug`, and forwards it over the channel.
+    pub(crate) fn sink(
+        self,
+        tx: &tokio::sync::mpsc::UnboundedSender<ManifestProgress>,
+    ) -> impl Fn(u64, u64) + Send + Sync + '_ {
+        move |received, total| {
+            let _ = tx.send(Self {
+                received,
+                total,
+                ..self.clone()
+            });
+        }
+    }
+}
+
 pub(crate) async fn read_framed(
+    recv: impl tokio::io::AsyncRead + Unpin,
+    max: usize,
+) -> Result<Vec<u8>> {
+    read_framed_with_progress(recv, max, None).await
+}
+
+/// [`read_framed`] plus an optional progress sink, handed `(received, total)` as the body arrives.
+///
+/// The body still lands in the ONE `declared`-byte allocation — chunking changes when progress is
+/// reported, not how much memory is held — and the ceiling still fires on the declared length
+/// before that allocation exists.
+pub(crate) async fn read_framed_with_progress(
     mut recv: impl tokio::io::AsyncRead + Unpin,
     max: usize,
+    progress: Option<ProgressSink<'_>>,
 ) -> Result<Vec<u8>> {
     let declared = recv.read_u32_le().await.context("read frame length")? as usize;
     if declared > max {
@@ -212,8 +259,37 @@ pub(crate) async fn read_framed(
         ));
     }
     let mut buf = vec![0u8; declared];
-    recv.read_exact(&mut buf).await.context("read frame body")?;
+    read_body_chunked(&mut recv, &mut buf, progress)
+        .await
+        .context("read frame body")?;
     Ok(buf)
+}
+
+/// `read_exact` in bounded chunks, reporting cumulative progress. EOF partway through is the same
+/// `UnexpectedEof` `read_exact` produces, so a truncated body still reads as a failure.
+async fn read_body_chunked(
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
+    buf: &mut [u8],
+    progress: Option<ProgressSink<'_>>,
+) -> std::io::Result<()> {
+    const CHUNK: usize = 64 * 1024;
+    let total = buf.len() as u64;
+    let mut done = 0usize;
+    while done < buf.len() {
+        let end = (done + CHUNK).min(buf.len());
+        let n = recv.read(&mut buf[done..end]).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "failed to fill whole buffer",
+            ));
+        }
+        done += n;
+        if let Some(sink) = progress {
+            sink(done as u64, total);
+        }
+    }
+    Ok(())
 }
 
 async fn write_framed(mut send: impl tokio::io::AsyncWrite + Unpin, bytes: &[u8]) -> Result<()> {
@@ -601,6 +677,18 @@ pub async fn fetch_manifest(
     ticket: &TransportTicket,
     accept: impl FnOnce(&ManifestPayload) -> Result<()>,
 ) -> Result<ManifestPayload> {
+    fetch_manifest_with_progress(endpoint, ticket, accept, None).await
+}
+
+/// [`fetch_manifest`] with byte-level progress for the manifest body, reported through the sink as
+/// `(received, total)`. `None` on every existing caller, so the seam the WAN harness drives is
+/// unchanged.
+pub async fn fetch_manifest_with_progress(
+    endpoint: &iroh::Endpoint,
+    ticket: &TransportTicket,
+    accept: impl FnOnce(&ManifestPayload) -> Result<()>,
+    progress: Option<ProgressSink<'_>>,
+) -> Result<ManifestPayload> {
     ticket.verify_shape().map_err(|e| anyhow!("ticket refused before dialling: {e}"))?;
     let addr = parse_node_addr(&ticket.node_addr)?;
     tracing::debug!(slug = %ticket.slug, "iroh: dialing the manifest plane");
@@ -609,7 +697,7 @@ pub async fn fetch_manifest(
         .await
         .with_context(|| format!("dial the manifest plane for {}", ticket.slug))?;
     tracing::debug!(slug = %ticket.slug, "iroh: connected — fetching manifest");
-    let result = fetch_over_connection(&conn, ticket, accept).await;
+    let result = fetch_over_connection(&conn, ticket, accept, progress).await;
     conn.close(0u32.into(), b"");
     result
 }
@@ -618,6 +706,7 @@ async fn fetch_over_connection(
     conn: &iroh::endpoint::Connection,
     ticket: &TransportTicket,
     accept: impl FnOnce(&ManifestPayload) -> Result<()>,
+    progress: Option<ProgressSink<'_>>,
 ) -> Result<ManifestPayload> {
     let (mut send, mut recv) = with_deadline(
         HANDSHAKE_DEADLINE,
@@ -650,7 +739,7 @@ async fn fetch_over_connection(
             let bytes = with_deadline(
                 ACK_DEADLINE,
                 "the peer never finished sending the manifest",
-                read_framed(&mut recv, MANIFEST_MAX_TRANSPORT_BYTES),
+                read_framed_with_progress(&mut recv, MANIFEST_MAX_TRANSPORT_BYTES, progress),
             )
             .await??;
             let payload = ManifestPayload::from_wire(bytes)
@@ -1355,7 +1444,7 @@ pub(crate) mod tests {
             let out = fetch_over_connection(&conn, &presented, |p| {
                 got = Some(p.as_bytes().len());
                 Ok(())
-            })
+            }, None)
             .await;
             conn.close(0u32.into(), b"");
             out.expect("a redeemer that sanitized the address it was handed must still be served");
@@ -1459,6 +1548,87 @@ pub(crate) mod tests {
         assert!(
             !err.to_string().contains("over the"),
             "a declared length exactly at the ceiling must be accepted, got: {err}"
+        );
+    }
+
+    /// **QURATOR-159 — byte progress for the manifest transport.**
+    ///
+    /// `read_framed_with_progress` over a known body must report monotonically increasing
+    /// cumulative bytes ending exactly at the declared total, the frame must round-trip intact,
+    /// and the over-cap refusal must still fire before the sink is ever called (the
+    /// before-allocation ordering the test above pins, seen from the sink's side).
+    ///
+    /// **Mutation proof (P-10) — the orchestrator applies this, not this lane.** Both edits are in
+    /// `read_body_chunked` above. (1) Change `sink(done as u64, total);` to `sink(total, total);`
+    /// — reporting the declared total instead of the cumulative count. With the body spanning
+    /// more than one chunk, every sample then carries the same `received`, so the
+    /// strictly-increasing assertion (`cumulative bytes strictly increase`) REDS. (2) Delete the
+    /// `if let Some(sink) = progress { sink(done as u64, total); }` block outright — the
+    /// `the sink fired at least once` assertion REDS. The refusal leg (sink never fires on an
+    /// over-cap declared length) is covered by the existing `PanicAfter` ordering test above,
+    /// which already reds if the ceiling moves after the body read.
+    #[tokio::test]
+    async fn read_framed_reports_monotonic_progress_ending_at_the_total() {
+        use std::io::Cursor;
+
+        // Larger than one 64 KiB chunk so the chunked loop runs more than once — a single-pass
+        // read would report once and prove nothing about monotonicity.
+        let body: Vec<u8> = (0..6 * 64 * 1024 + 1).map(|i| (i % 251) as u8).collect();
+        let mut wire = Vec::new();
+        write_framed(&mut wire, &body).await.unwrap();
+
+        let samples: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+        let sink = |received: u64, total: u64| {
+            samples.lock().unwrap().push((received, total));
+        };
+        let got = read_framed_with_progress(
+            Cursor::new(wire),
+            MANIFEST_MAX_TRANSPORT_BYTES,
+            Some(&sink),
+        )
+        .await
+        .expect("the frame reads back");
+        assert_eq!(got, body, "chunked reading returns exactly the declared body");
+
+        let s = samples.into_inner().unwrap();
+        assert!(!s.is_empty(), "the sink fired at least once");
+        assert!(
+            s.iter().all(|&(_, t)| t == body.len() as u64),
+            "every sample carries the declared total"
+        );
+        assert!(
+            s.iter().all(|&(r, _)| r > 0 && r <= body.len() as u64),
+            "cumulative bytes stay in (0, total]"
+        );
+        assert!(
+            s.windows(2).all(|w| w[0].0 < w[1].0),
+            "cumulative bytes strictly increase: {s:?}"
+        );
+        assert_eq!(
+            s.last().copied(),
+            Some((body.len() as u64, body.len() as u64)),
+            "the final sample is received == total — the UI's completion signal"
+        );
+        // Over-cap still refuses with the sink never firing: the ceiling is evaluated on the
+        // declared length, before a body byte is read or reported.
+        let over: Vec<u8> = ((MANIFEST_MAX_TRANSPORT_BYTES + 1) as u32)
+            .to_le_bytes()
+            .to_vec();
+        let fired = std::sync::atomic::AtomicUsize::new(0);
+        let err = read_framed_with_progress(
+            Cursor::new(over),
+            MANIFEST_MAX_TRANSPORT_BYTES,
+            Some(&|_, _| {
+                fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        )
+        .await
+        .expect_err("an over-cap declared length is refused");
+        assert!(err.to_string().contains("over the"), "got: {err}");
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the sink must not fire for a refused frame"
         );
     }
 
