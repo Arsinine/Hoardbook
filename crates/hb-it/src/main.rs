@@ -29,6 +29,7 @@ mod suite_count;
 mod suite_disc;
 mod suite_dm;
 mod suite_id;
+mod suite_keygrant;
 mod suite_manifest;
 mod suite_n;
 mod suite_priv;
@@ -130,6 +131,8 @@ async fn main() -> Result<()> {
     results.extend(suite_manifest::run(&ctx).await);
     eprintln!("-- Suite PRIV: Private Collections (per-recipient gift-wrapped listings, M10) --");
     results.extend(suite_priv::run(&ctx).await);
+    eprintln!("-- Suite KG: Key Grant (QURATOR-160) — browse key sealed per recipient, kind 31_114 --");
+    results.extend(suite_keygrant::run(&ctx).await);
     eprintln!("-- Suite TOPIC: Topics (announce / membership / channel / invite, M11) --");
     results.extend(suite_topic::run(&ctx).await);
     eprintln!("-- Suite COUNT: relay-derived count + canary exclusion (M9) --");
