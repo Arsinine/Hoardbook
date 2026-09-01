@@ -386,8 +386,12 @@ jobs:
           # Occurrences, not matching LINES: `grep -c` counts lines, so a second mention appended
           # to an existing line would not move the number and would sail straight through.
           # (`chat.rs` is the live example — 2 matching lines, 3 mentions.)
+          # chat.rs 3 -> 6 (QURATOR-79, 2026-09-01): `request_manifest_from` passes no
+          # `mascara_pubkey`, and both its doc comment and its test say why — "Mascara is not a
+          # Hoardbook courier; a re-serve ask has no Mascara fallback to name". Tombstones that
+          # DENY the courier role, which is the bump case this guard describes, not the delete one.
           ALLOWED="crates/hb-app/src/identity_state.rs:1
-          crates/hb-app/src/commands/chat.rs:3
+          crates/hb-app/src/commands/chat.rs:6
           crates/hb-core/src/ticket.rs:1
           crates/hb-app/ui/src/lib/request-inbox.ts:1"
           fail=0
