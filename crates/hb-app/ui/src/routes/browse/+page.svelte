@@ -28,6 +28,7 @@
 	// plain click selects one, Shift-click extends a contiguous run, Cmd/Ctrl toggles one.
 	import { writeDragPayload, readDragPayload, writeDragPayloadMulti, readDragPayloadMulti, isOurDrag, isValidDropTarget, isSelfDrop, groupSuggestions, groupSuggestionsMulti, commitCreateGroup, commitCreateGroupMulti, computeDropOutcome, commitDropOnGroup, computeDropOutcomeMulti, commitDropOnGroupMulti, applyClickToSelection, applyKeyToSelection, isTypingTargetShape, rovingTabindexForIdx, shouldHandleArrowKey, rowId, computeDropInverse, computeDropInverseMulti, computeCreateInverse, commitInverse, commitInverseMulti, UNGROUPED_TARGET, type DropOutcome, type DropOutcomeMulti } from '$lib/drag-group.js';
 	import { contactDisplayName, shortNpub } from '$lib/contact-display.js';
+	import { importToast } from '$lib/manifest-provenance.js';
 	import { tick } from 'svelte';
 
 	type BcItem =
@@ -337,7 +338,7 @@
 					),
 				);
 			}
-			const note = importToast(result);
+			const note = importToast(result, servingPeerName);
 			toast(note.text, note.kind);
 		} catch (e) {
 			toast(String(e), 'error');
@@ -833,30 +834,6 @@
 	function servingPeerName(npub: string): string {
 		const c = $contacts.find((p) => p.npub === npub);
 		return c ? contactDisplayName(c) : shortNpub(npub);
-	}
-
-	// The import toast, provenance-aware. The old copy ("Ask the owner for a fresh manifest") was
-	// wrong twice under carrier 4: the owner is offline (that's why a peer re-served it), and the
-	// user couldn't tell who served this or how old it is.
-	function importToast(result: ImportedManifest): { text: string; kind: 'success' | 'error' } {
-		const reServed = result.served_by !== undefined;
-		if (result.stale && reServed) {
-			const who = servingPeerName(result.served_by!);
-			const when = result.cached_at !== undefined ? new Date(result.cached_at * 1000).toLocaleDateString() : null;
-			return {
-				text: when
-					? `Imported an older copy that ${who} had cached on ${when} — the owner is offline, so ask again once they're back.`
-					: `Imported an older copy from ${who}'s cache — the owner is offline, so ask again once they're back.`,
-				kind: 'error',
-			};
-		}
-		if (result.stale) {
-			return { text: 'Imported an older version of this list. Ask the owner for a fresh manifest.', kind: 'error' };
-		}
-		if (reServed) {
-			return { text: `Full manifest imported from ${servingPeerName(result.served_by!)}'s cached copy`, kind: 'success' };
-		}
-		return { text: 'Full manifest imported', kind: 'success' };
 	}
 
 	function registerUndo(label: string, inverses: import('$lib/drag-group.js').DropInverse[]) {

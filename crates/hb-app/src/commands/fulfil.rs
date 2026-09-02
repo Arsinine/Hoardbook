@@ -521,9 +521,11 @@ pub(crate) async fn redeem_manifest_ticket_emitting(
 /// claim key in `redeem_manifest_ticket_inner` already resolves from (`expected_author`), not a new
 /// signal.
 ///
-/// `cached_at` is `None` on both paths: when C took its copy is a property of C's cache that never
-/// crosses the wire, and the envelope's own clock is A's authoring time, not a cache time —
-/// surfacing that would render a false date.
+/// There is deliberately no companion cache-time value on either path: when C took its copy is a
+/// property of C's cache that never crosses the wire, and the envelope's own clock is A's authoring
+/// time, not a cache time — surfacing that would render a false date. A `cached_at` field was
+/// declared for months on the strength of this reasoning and never had a producer; it was removed
+/// in QURATOR-172 #2.
 pub(crate) fn carrier4_served_by(ticket: &TransportTicket, dm_sender: &str) -> Option<String> {
     ticket.author_npub.is_some().then(|| dm_sender.to_string())
 }

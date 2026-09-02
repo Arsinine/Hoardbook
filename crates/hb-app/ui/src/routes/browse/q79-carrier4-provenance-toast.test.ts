@@ -2,9 +2,15 @@
 // QURATOR-79 carrier 4 — the stale-import toast becomes provenance-aware. The old copy
 // ("Imported an older version of this list. Ask the owner for a fresh manifest.") is wrong twice
 // when a PEER re-served the manifest: the owner cannot be asked (offline — that is why a peer
-// answered), and the user cannot tell WHO served the copy or HOW OLD it is. The new copy names
-// the serving peer (via the contact list, falling back to shortNpub) and the cached date, and
-// says to ask again once the author is back.
+// answered), and the user cannot tell WHO served the copy. The new copy names the serving peer
+// (via the contact list, falling back to shortNpub) and says to ask again once the author is back.
+//
+// ⚠ WHAT THIS FILE DOES NOT PROVE (QURATOR-172 #1). It mocks `importManifest`, and Browse's real
+// backend hardcodes `served_by: None` on that path — so the provenance branches asserted here were
+// UNREACHABLE in production for as long as this file was green. It proves the COPY, given a
+// provenance value; it never proved one could arrive. REACHABILITY is pinned separately, on the
+// redeem path that actually produces the value, by chat-q172-provenance-reachable.test.ts. Keep
+// both: this one guards the wording, that one guards the wiring.
 //
 // This is a BEHAVIOURAL mount test (the q92/q134/q83 pattern): the real Browse page is mounted
 // with only `$lib/api.js` mocked, the peer is selected through the `/browse?peer=` deep-link
@@ -22,8 +28,6 @@
 // this file (each applied alone, then reverted) are documented in the lane report:
 //   A. `const reServed = result.served_by !== undefined;` → `const reServed = false;`
 //      — reds the two re-served cases, leaves the two direct cases green.
-//   B. in the stale+re-served branch, `result.cached_at` → `result.created_at` (the fixture
-//      deliberately sets the two APART) — reds only the cached-date assertion.
 //   C. `servingPeerName` drops its contacts lookup (always shortNpub) — reds only the
 //      peer-name assertion.
 //
@@ -71,10 +75,9 @@ const PEER_NPUB = 'npub1archarcharcharcharcharcharcharcharcharcharchar';
 // the raw npub, and not the author's name.
 const SERVER_NPUB = 'npub1m1ram1ram1ram1ram1ram1ram1ram1ram1ram1ram1r';
 
-// The envelope's own clock (created_at) and the serving peer's cache clock (cached_at) are
-// deliberately set APART so a mutation that confuses the two reds the date assertion.
+// The envelope's own clock. There is deliberately no second (cache) clock: a `cached_at` field was
+// declared for months with no producer and was removed in QURATOR-172 #2.
 const CREATED_AT = 1_700_000_000;
-const CACHED_AT = 1_754_000_000;
 
 const TRUNCATED_COL: Collection = {
 	slug: 'archive',
@@ -143,7 +146,7 @@ const importMock = importManifest as unknown as ReturnType<typeof vi.fn>;
 
 /** Drive the real page to a completed manifest import and hand back the live toast. */
 async function importThroughThePage(
-	result: { stale: boolean; served_by?: string; cached_at?: number },
+	result: { stale: boolean; served_by?: string },
 ): Promise<{ text: string; kind: 'success' | 'error' } | null> {
 	importMock.mockResolvedValue({ slug: 'archive', collection: FULL_COL, created_at: CREATED_AT, ...result });
 	contacts.set([PEER, SERVER]);
@@ -172,14 +175,14 @@ async function importThroughThePage(
 	return get(toastMessage);
 }
 
-describe('QURATOR-79 carrier 4 — the import toast names who served the copy and how old it is', () => {
-	it('stale + re-served: names the serving peer, the cached date, and that the author is offline', async () => {
-		const toast = await importThroughThePage({ stale: true, served_by: SERVER_NPUB, cached_at: CACHED_AT });
+describe('QURATOR-79 carrier 4 — the import toast names who served the copy', () => {
+	it('stale + re-served: names the serving peer and that the author is offline', async () => {
+		const toast = await importThroughThePage({ stale: true, served_by: SERVER_NPUB });
 		// The serving peer is named from the contact list (display name), never the raw npub.
 		expect(toast?.text).toContain('Mira');
 		expect(toast?.text).not.toContain(SERVER_NPUB);
-		// The date is the SERVING PEER'S cache clock, formatted the way the app formats unix secs.
-		expect(toast?.text).toContain(new Date(CACHED_AT * 1000).toLocaleDateString());
+		// No date is claimed: there is no cache clock, and the envelope's own clock is the AUTHOR's
+		// writing time, so rendering it here would state a falsehood about when the copy was taken.
 		expect(toast?.text).not.toContain(new Date(CREATED_AT * 1000).toLocaleDateString());
 		// The author is offline — the whole reason a peer answered — and the ask is deferred.
 		expect(toast?.text).toContain('offline');
@@ -195,7 +198,7 @@ describe('QURATOR-79 carrier 4 — the import toast names who served the copy an
 	});
 
 	it('fresh + re-served: the lighter note that it came from a peer\'s cached copy', async () => {
-		const toast = await importThroughThePage({ stale: false, served_by: SERVER_NPUB, cached_at: CACHED_AT });
+		const toast = await importThroughThePage({ stale: false, served_by: SERVER_NPUB });
 		expect(toast?.text).toContain("Full manifest imported from Mira's cached copy");
 		expect(toast?.text).not.toContain('older');
 		expect(toast?.kind).toBe('success');

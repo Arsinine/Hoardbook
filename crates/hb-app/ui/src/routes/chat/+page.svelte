@@ -50,6 +50,7 @@
 	import { DM_POLL_VISIBLE_MS, CHANNEL_REFRESH_EVERY_TICKS, RELAY_HEALTH_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
 	import { renderFingerprint } from '$lib/identity-display.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
+	import { importToast } from '$lib/manifest-provenance.js';
 	import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER, manifestRequestHint } from '$lib/request-inbox.js';
 	// M17 W7.1b: the manifest-request fulfilment card. The capability (`export_manifest`) is fully
 	// wired on Home; this is its second entry point — surfaced where the request lands. The card's
@@ -527,8 +528,17 @@
 			// gate has something to compare against. Sourced from the ask record via
 			// askFingerprintSeen — never the served envelope's own fingerprint, which would compare a
 			// value against itself and always report "current" (worse than today's always-false).
-			await redeemManifestTicket(npub, ticketJson, newestFingerprint);
+			const imported = await redeemManifestTicket(npub, ticketJson, newestFingerprint);
 			redemptions.succeed(requestId, ask);
+			// QURATOR-172 #1: this return value used to be DISCARDED, and it is the only place a
+			// provenance value is ever produced — `carrier4_served_by` sets `served_by` on this
+			// redeem path, while Browse's `open_manifest` hardcodes it to None. So the provenance
+			// toast could not fire in production at all, despite two green tests either side of the
+			// gap. Surfacing it HERE rather than plumbing the tree to Browse preserves the
+			// "one hand-off, not two" design stated above: we render a string, we never hold the
+			// manifest. `senderName` is chat's own resolver, so a known peer reads as their petname.
+			const note = importToast(imported, senderName);
+			toast(note.text, note.kind);
 			// The backend consumed the ask, so our copy is stale — re-read it. Without this the
 			// in-memory trace would still authorize a second ticket for the rest of the session,
 			// which is exactly the standing authorization the nonce removes.

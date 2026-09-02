@@ -344,16 +344,16 @@ export const refreshContact = (npub: string) => invoke<CachedPeer>('refresh_cont
  *  `stale` when the manifest predates the teaser the browser is showing (imported anyway, with a warn).
  *
  *  QURATOR-79 carrier 4 provenance: `served_by` names the peer whose cached copy arrived (None ⇒ the
- *  author served it directly); `cached_at` is when that peer's cached copy was taken. Both additive-
- *  optional, absent on every pre-carrier-4 serve. The envelope's own clock is
- *  `collection.manifest_imported_at` — there is no second one here. */
+ *  author served it directly). Additive-optional, absent on every pre-carrier-4 serve. The envelope's
+ *  own clock is `collection.manifest_imported_at` — there is no second one here, and deliberately no
+ *  cache-time field: a `cached_at` was declared here for months with no producer and was removed in
+ *  QURATOR-172 #2. Only the REDEEM path produces `served_by`; `import_manifest` hardcodes None. */
 export interface ImportedManifest {
 	slug: string;
 	collection: Collection;
 	created_at: number;
 	stale: boolean;
 	served_by?: string;
-	cached_at?: number;
 }
 
 /** M16 W4 — import a full-listing manifest the user received (a picked file path OR pasted text/base64),

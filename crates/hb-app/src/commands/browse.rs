@@ -681,9 +681,14 @@ fn save_refreshed_contact(
 /// manifest is older than the teaser the browser is showing (`stale` ⇒ "ask again", still imported).
 ///
 /// Carrier 4 provenance: `served_by` names the peer whose cached copy arrived (None when the author
-/// served it directly) and `cached_at` is when that copy was taken. Additive optional fields — the
-/// envelope's own clock already surfaces as `collection.manifest_imported_at` (set in
-/// `open_manifest`), so these carry no second clock and no downgrade when absent.
+/// served it directly). Additive and optional — the envelope's own clock already surfaces as
+/// `collection.manifest_imported_at` (set in `open_manifest`), so this carries no second clock and
+/// no downgrade when absent.
+///
+/// There is deliberately NO cache-time field (QURATOR-172 #2, removed 2026-09-02). One was declared
+/// for months and written `None` at the only construction site, because when C took its copy is a
+/// property of C's cache that never crosses the wire — see `fulfil::carrier4_served_by`. Do not
+/// reintroduce it without a wire field to populate it from.
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportedManifest {
     pub slug: String,
@@ -694,9 +699,6 @@ pub struct ImportedManifest {
     /// the author served it directly. Optional: absent on every pre-carrier-4 build.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub served_by: Option<String>,
-    /// When the serving peer's cached copy was taken (unix seconds). `None` for a direct serve.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cached_at: Option<u64>,
 }
 
 /// Upper bound on a manifest file / paste we will read before parsing. A single-ciphertext envelope
@@ -907,7 +909,6 @@ fn open_manifest(
         created_at: envelope.created_at,
         stale,
         served_by: None,
-        cached_at: None,
     })
 }
 
