@@ -101,7 +101,8 @@ pub async fn build_probe_input(relays: Vec<String>, flood_ctx: Option<FloodCtx>)
 }
 
 /// Run the WAN-D rows (D1–D4) against the live relay set. Each row is an honest TAP check:
-/// Ok ⇒ pass, Err(detail) ⇒ fail with a `# diagnostic` block.
+/// Ok ⇒ pass, Err(detail) ⇒ fail with a `# diagnostic` block — with ONE deliberate exception:
+/// D3 not armed is an explicit `Tap::skip` row (below), never an `Err`.
 pub async fn run(tap: &mut Tap, probe: &ProbeInput) {
     tap.check(
         "D1: teaser published via the production fan-out is served by EACH relay of the set individually",
@@ -113,10 +114,24 @@ pub async fn run(tap: &mut Tap, probe: &ProbeInput) {
         d2_nip65_resolution(probe).await,
     );
 
-    tap.check(
-        "D3: search-eviction — all-tags-AND match survives >cap loose matches (W3 discriminator, VPS strfry only)",
-        d3_search_eviction(probe).await,
-    );
+    // D3 has TWO non-pass paths and only ONE of them is a skip. Not armed (--flood-relay absent)
+    // is a deliberate skip, constructed HERE as an explicit `Tap::skip` — relay citizenship
+    // forbids flood-shaped rows against the public defaults, so an unarmed run skips rather than
+    // defects. The citizenship REFUSAL (a read relay outside the --flood-relay allowlist) stays
+    // inside d3's `Err` and travels `check`: it renders `not ok` and fails the run. The skip is
+    // never sniffed out of error text — `check` cannot produce a skip at all, so no row can skip
+    // itself by rephrasing its error, and WAN-P's expected-red rows stay unreachable by skip.
+    let d3_name =
+        "D3: search-eviction — all-tags-AND match survives >cap loose matches (W3 discriminator, VPS strfry only)";
+    match &probe.flood_ctx {
+        None => tap.skip(
+            d3_name,
+            "not armed: pass --flood-relay <url>... (VPS strfry only) to run the search-eviction \
+             measurement. It is skipped here rather than run against a public relay — relay \
+             citizenship forbids flood-shaped rows on the public defaults.",
+        ),
+        Some(ctx) => tap.check(d3_name, d3_search_eviction(ctx).await),
+    }
 
     tap.check(
         "D4: BIGRELAY — full family on the big relay only, INV-5 no public leak, stale snapshot gated",
@@ -314,16 +329,9 @@ async fn d2_nip65_resolution(probe: &ProbeInput) -> Result<(), String> {
 // read relay to be in the --flood-relay allowlist.
 // ---------------------------------------------------------------------------
 
-async fn d3_search_eviction(probe: &ProbeInput) -> Result<(), String> {
-    let Some(ctx) = &probe.flood_ctx else {
-        return Err(
-            "D3 SKIPPED (not armed): pass --flood-relay <url>... (VPS strfry only) to run the \
-             search-eviction measurement. It is skipped here rather than run against a public relay — \
-             relay citizenship forbids flood-shaped rows on the public defaults."
-                .to_string(),
-        );
-    };
-
+/// Takes the ARMED context — the not-armed case never reaches this function; `run` renders it as
+/// an explicit `Tap::skip` row instead, so no wording-sniffing path exists here.
+async fn d3_search_eviction(ctx: &FloodCtx) -> Result<(), String> {
     // The guard: every read relay must be a flood relay.
     let violations = args::flood_guard_violations(&ctx.read_relays, &ctx.flood_relays);
     if !violations.is_empty() {
