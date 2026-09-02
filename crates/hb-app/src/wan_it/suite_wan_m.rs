@@ -626,14 +626,16 @@ pub async fn m4_n0_canary() -> Result<(), String> {
     let mut relay_url: Option<String> = None;
     while std::time::Instant::now() < deadline {
         let addr = server.watch_addr().get();
-        // Look for a relay transport addr in the set. The addr's addrs are a BTreeSet; a Relay variant
-        // means the endpoint registered with a home relay.
-        let found = serde_json::to_string(&addr).unwrap_or_default();
-        if found.contains("Relay") || found.contains("relay") {
-            // Extract the relay URL from the addr for the diagnostic. The EndpointAddr's Display/Debug
-            // names the relay; the JSON serialization carries it. This is best-effort — the assertion
-            // is "a relay addr exists", not "we parsed the URL".
-            relay_url = Some(found);
+        // Match the REAL `TransportAddr::Relay` variant, the way production does
+        // (`retain_global_transport_addrs`, transport.rs). This replaced a substring search for
+        // "relay" over the addr's JSON, which a field NAME satisfies as readily as a live relay
+        // path — so the row could report "a relay addr appeared" when none had been assigned, and
+        // then blame the dial for failing to route through a relay it never had (QURATOR-167).
+        if let Some(url) = addr.addrs.iter().find_map(|a| match a {
+            iroh::TransportAddr::Relay(url) => Some(url.to_string()),
+            _ => None,
+        }) {
+            relay_url = Some(url);
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -645,7 +647,8 @@ pub async fn m4_n0_canary() -> Result<(), String> {
             // relay path. So it reports a relay addr APPEARING — never that the relay is
             // reachable or routing. The dial below is the only reachability evidence here.
             eprintln!(
-                "   M4 a relay addr appeared in {:.2}s (substring match on the addr JSON, not a reachability proof)",
+                "   M4 home relay ASSIGNED in {:.2}s: {r} (a parsed TransportAddr::Relay — the relay \
+                 is assigned, which is still not proof it ROUTES; the dial below is that evidence)",
                 t_relay_start.elapsed().as_secs_f64()
             );
             r
@@ -672,6 +675,27 @@ pub async fn m4_n0_canary() -> Result<(), String> {
 
     // The listener's addr (with the relay URL) — the dial target. watch_addr().get() snapshots it.
     let target = server.watch_addr().get();
+
+    // QURATOR-167: enumerate EVERY transport addr the dialer is being handed, not just the relay.
+    // Both endpoints are in-process on ONE host, so a direct path should connect in milliseconds; if
+    // the dial still dies at iroh's 30s relay-path idle timeout, the useful question is whether a
+    // direct candidate was ever OFFERED. "Ip addrs present and it still failed" and "relay-only, so
+    // everything had to traverse a US-West relay" are very different diagnoses, and the row could
+    // not previously tell them apart.
+    let offered: Vec<String> = target
+        .addrs
+        .iter()
+        .map(|a| match a {
+            iroh::TransportAddr::Ip(sock) => format!("Ip({sock})"),
+            iroh::TransportAddr::Relay(url) => format!("Relay({url})"),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    eprintln!(
+        "   M4 dial target offers {} transport addr(s): [{}]",
+        offered.len(),
+        offered.join(", ")
+    );
 
     let t_dial_start = std::time::Instant::now();
     let dial_result = tokio::time::timeout(M4_DIAL_TIMEOUT, async {
