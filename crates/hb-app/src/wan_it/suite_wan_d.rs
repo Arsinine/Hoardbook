@@ -473,6 +473,22 @@ async fn d4_bigrelay_cross_region(probe: &ProbeInput) -> Result<(), String> {
     let full = crate::commands::collection::stamp_teaser_fingerprint(&full_listing(&slug, 1300, &fp))
         .map_err(|e| format!("D4 stamp_teaser_fingerprint: {e}"))?;
 
+    // The value a real browser gates on is the TEASER's digest, NOT the full-tree `fp`. A truncated
+    // teaser's `snapshot_fingerprint` meta IS its teaser digest (`truncate_listing` re-stamps it),
+    // and a browser reads it off the teaser it just fetched. This row used to pass `fp`, which
+    // `full_supersedes` then compared against the family's `teaser_fingerprint` — two different
+    // digests, so the gate refused a family that was genuinely current. Read the expected value back
+    // out of the stamped family rather than recomputing it, so it cannot drift from what the stamp
+    // derived (QURATOR-169).
+    let teaser_fp = serde_json::from_str::<Value>(&full)
+        .ok()
+        .and_then(|v| v.get("teaser_fingerprint").and_then(Value::as_str).map(str::to_string))
+        .ok_or_else(|| {
+            "D4 the stamped family carries no teaser_fingerprint — the gate compares that field, so \
+             a browser would have nothing to gate on. Entries must deserialize as DirectoryItem."
+                .to_string()
+        })?;
+
     // Full family → the big relay ONLY (publish_listing_to → publish_to, targeted).
     let cbig = connect(&owner, std::slice::from_ref(big))
         .await
@@ -534,7 +550,7 @@ async fn d4_bigrelay_cross_region(probe: &ProbeInput) -> Result<(), String> {
     //       `full_listing` stamps NO `teaser_fingerprint` — a legitimate `(c)` way for this row to
     //       fail that is a FIXTURE gap, not a product fault (hb-it's suite_bigrelay stamps it).
     //   (d) all parts arrived but restitching failed — `fetch_err` carries the render error.
-    let diag = d4_big_relay_state(big, &owner, &slug, &key, &fp).await;
+    let diag = d4_big_relay_state(big, &owner, &slug, &key, &teaser_fp).await;
     eprintln!("   D4 pre-fetch big-relay read: {}", diag.summary());
 
     // A holder browses: fetch the full family from the big relay, gated on the teaser's fingerprint.
@@ -547,7 +563,7 @@ async fn d4_bigrelay_cross_region(probe: &ProbeInput) -> Result<(), String> {
         &slug,
         &key,
         std::slice::from_ref(big),
-        &fp,
+        &teaser_fp,
         RELAY_TIMEOUT,
     )
     .await
@@ -624,7 +640,14 @@ async fn d4_bigrelay_cross_region(probe: &ProbeInput) -> Result<(), String> {
         &owner2,
         &slug2,
         &key2,
-        &full_listing(&slug2, 1300, &fp_old),
+        // Genuinely older CONTENT (1200 entries, not 1300). The teaser digest is derived from the
+        // entries + elided count, so a copy that differs only in its `snapshot_fingerprint` meta
+        // hashes IDENTICALLY and would legitimately supersede — changing the meta does not make a
+        // copy stale. Stamped, so it carries a real teaser digest that genuinely differs from the
+        // current one: before this the family was unstamped AND gated against `fp`, so the refusal
+        // below could not fail and proved nothing (QURATOR-169).
+        &crate::commands::collection::stamp_teaser_fingerprint(&full_listing(&slug2, 1200, &fp_old))
+            .map_err(|e| format!("D4 stale stamp_teaser_fingerprint: {e}"))?,
         LISTING_MAX_BYTES,
         std::slice::from_ref(big),
     )
@@ -642,7 +665,7 @@ async fn d4_bigrelay_cross_region(probe: &ProbeInput) -> Result<(), String> {
         &slug2,
         &key2,
         std::slice::from_ref(big),
-        &fp,
+        &teaser_fp,
         RELAY_TIMEOUT,
     )
     .await
@@ -667,7 +690,15 @@ async fn d4_bigrelay_cross_region(probe: &ProbeInput) -> Result<(), String> {
 /// (over the visible entries + elided count, QURATOR-169).
 fn full_listing(slug: &str, n: usize, fp: &str) -> String {
     let entries: Vec<Value> = (0..n)
-        .map(|i| serde_json::json!({ "name": format!("title-{i:05}-padding-padding-padding-xx") }))
+        // `item_type` is REQUIRED by `DirectoryItem` (no serde default). Without it these entries do
+        // not deserialize as a tree, `truncate_listing` cannot re-derive the teaser digest, and
+        // `stamp_teaser_fingerprint` takes its documented "underivable" branch and returns the
+        // listing UNCHANGED — silently. That is exactly how D4 kept failing with `teaser_fp=<none>`
+        // after the stamp call was added (QURATOR-169, second pass).
+        .map(|i| serde_json::json!({
+            "name": format!("title-{i:05}-padding-padding-padding-xx"),
+            "item_type": "File",
+        }))
         .collect();
     serde_json::json!({
         "slug": slug, "content_types": ["video"], "snapshot_fingerprint": fp, "entries": entries,
@@ -938,6 +969,43 @@ mod tests {
              stamp_teaser_fingerprint before publishing — the gate reads teaser_fingerprint, \
              which only the stamp derives. Publishing a bare hand-built fixture is how D4 failed \
              as a phantom product defect (QURATOR-169)."
+        );
+    }
+
+    /// The half the call-site guard above CANNOT see: that the stamp actually PRODUCES a digest.
+    ///
+    /// `stamp_teaser_fingerprint` returns the listing UNCHANGED, with no error, when
+    /// `truncate_listing`'s kept entries do not deserialize as a `DirectoryItem` tree — the digest
+    /// is underivable and there is nothing to stamp. `DirectoryItem` requires `item_type`, so a
+    /// fixture emitting bare `{"name": …}` objects silently produces no `teaser_fingerprint` at all.
+    ///
+    /// That is not hypothetical: it is what the first fix for QURATOR-169 did. The call-site guard
+    /// passed — the call WAS there — while the published family still carried `teaser_fp=<none>` and
+    /// D4 still failed. A guard that pins a call pins nothing about its effect.
+    ///
+    /// MUTATION (P-10, resolve by containing function): in `full_listing`, drop the `"item_type"`
+    /// line from the entry map. It still compiles, and this test reds because the stamp goes back to
+    /// returning its input unchanged.
+    #[test]
+    fn the_stamp_actually_derives_a_teaser_digest_for_this_fixture() {
+        let raw = full_listing("stamp-effect", 1300, "deadbeef");
+        let stamped = crate::commands::collection::stamp_teaser_fingerprint(&raw)
+            .expect("the stamp must not error on this fixture");
+        let v: Value = serde_json::from_str(&stamped).expect("stamped listing must be JSON");
+
+        // Precondition, loud: the fixture must actually exceed the budget, or the stamp is a
+        // legitimate no-op and the assertion below would be vacuous.
+        assert!(
+            hb_net::truncate_listing(&raw, LISTING_MAX_BYTES).unwrap().truncated,
+            "precondition: the fixture must truncate, or there is nothing for the stamp to derive"
+        );
+
+        let tf = v.get("teaser_fingerprint").and_then(Value::as_str);
+        assert!(
+            tf.is_some_and(|t| !t.is_empty()),
+            "the stamp produced NO teaser_fingerprint — the gate compares that field, so the \
+             published family would be refused. Entries must deserialize as DirectoryItem \
+             (item_type is required) or the digest is underivable and the stamp silently no-ops."
         );
     }
 }
