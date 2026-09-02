@@ -668,6 +668,27 @@ pub async fn m4_n0_canary() -> Result<(), String> {
     //     is the production dial-only binding (no advertised ALPN). The dial uses the listener's addr
     //     (which now carries the relay URL), so the connection routes through the home relay. The
     //     ALPN handshake completing (connect returns Ok) is the reachability proof.
+    // (2b) ACCEPT. Binding with an ALPN advertises a protocol; it does NOT accept connections —
+    // in iroh something must drive `endpoint.accept()`. Production always does (conn.rs,
+    // transport_state.rs's `Role::Listen` loop), and every OTHER wan-m row binds its listener
+    // through `ensure_endpoint(..., Role::Listen)` for exactly that reason. This row called
+    // `bind_endpoint` raw and drove nothing, so the dialer's handshake arrived at a socket nobody
+    // was accepting on and sat there until iroh's 30s relay-path idle timeout expired.
+    //
+    // That is the whole of QURATOR-167's "n0 outage": five runs across TWO operating systems, two
+    // networks, two different n0 relays (usw1 and aps1) and with/without Tailscale all failed
+    // identically at 30.00s — because the failure was never on the network at all.
+    let accept_ep = server.clone();
+    let accept_task = tokio::spawn(async move {
+        while let Some(incoming) = accept_ep.accept().await {
+            if let Ok(connecting) = incoming.accept() {
+                // Completing the handshake IS the reachability proof this row asserts; the
+                // connection itself is then dropped, which is all a canary needs.
+                let _ = connecting.await;
+            }
+        }
+    });
+
     let client_secret: [u8; 32] = rand::random();
     let client = bind_client_endpoint(&client_secret)
         .await
@@ -718,6 +739,7 @@ pub async fn m4_n0_canary() -> Result<(), String> {
             // Bounded close: iroh's close().await can hang on a wedged relay path. Drop the endpoints
             // (background cleanup) rather than awaiting close — the canary force-exits via
             // std::process::exit in --once mode, and the OS reclaims sockets on exit.
+            accept_task.abort();
             drop(server);
             drop(client);
             return Err(format!(
@@ -732,6 +754,7 @@ pub async fn m4_n0_canary() -> Result<(), String> {
             ));
         }
         Err(_) => {
+            accept_task.abort();
             drop(server);
             drop(client);
             return Err(format!(
@@ -745,6 +768,7 @@ pub async fn m4_n0_canary() -> Result<(), String> {
 
     // A clean close proves the connection was real (not a half-open that the runtime tear-down masks).
     conn.close(0u32.into(), b"M4 canary complete");
+    accept_task.abort();
     drop(server);
     drop(client);
     Ok(())
