@@ -57,11 +57,15 @@ use sha2::{Digest, Sha256};
 /// The eviction machinery below is retained and still unit-tested: `put` takes an explicit
 /// `cap_bytes`, so reinstating a ceiling is a one-line change at the call sites, not a rewrite.
 ///
-/// ⚠ Unbounded storage makes the absence of supersede-invalidation a permanent leak: a superseded
-/// `(npub, slug)` entry is unreachable (lookup is fingerprint-exact) but is never removed, and LRU
-/// was previously the only thing that ever collected it. Deleting other fingerprints of the same
-/// `(npub, slug)` on a successful `put` is the fix; until then this directory grows monotonically
-/// with every collection update.
+/// ⚠ This paragraph once warned that unbounded storage made supersede-invalidation a permanent
+/// leak, because `entry_filename` hashed `(npub, slug, fingerprint)` and so every update stranded
+/// its predecessor, unreachable and uncollected. **That is no longer true, and the warning outlived
+/// its fix by long enough to mislead a ticket.** `6f0bdaa` re-keyed on `(npub, slug)` alone, so a
+/// `put` OVERWRITES in place and there is exactly one file per collection — pinned by
+/// `an_update_overwrites_in_place_and_leaves_exactly_one_file`. Entries stranded by pre-`6f0bdaa`
+/// builds are recovered, not discarded, by [`migrate_legacy_entries`]. The directory is therefore
+/// bounded by collections-cached, not by how often they change, which is exactly what makes an
+/// unbounded cache safe: there is nothing to collect, so no cleanup pass is ever needed.
 pub const DEFAULT_MANIFEST_CACHE_BYTES: usize = usize::MAX;
 
 /// One cached manifest. `envelope` is the canonical `.hbmanifest` JSON; `last_access` (unix secs) is
