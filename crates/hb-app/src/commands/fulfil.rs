@@ -621,7 +621,7 @@ pub(crate) async fn redeem_manifest_ticket_with_progress(
             return Err("That link doesn't answer a request you sent, so nothing was fetched.".into())
         }
         crate::store::AskClaim::Spent => {
-            return Err("You've already received this list. Ask again if you want a fresh copy.".into())
+            return Err("You've already received this list.".into())
         }
         crate::store::AskClaim::ClaimedByAnother => {
             return Err("Another link is already answering that request, so nothing was fetched.".into())
@@ -1108,7 +1108,7 @@ mod tests {
             )
             .await
             .expect_err("a spent ask must refuse even the ticket that spent it");
-            assert_eq!(err, "You've already received this list. Ask again if you want a fresh copy.");
+            assert_eq!(err, "You've already received this list.");
         }
 
         // ── Carrier 4 (QURATOR-79) — the redeem side's AUTHOR resolution ─────────────────────────
