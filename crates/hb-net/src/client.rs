@@ -2,9 +2,10 @@
 //! spike's proven `Client::builder → add_relay → try_connect → send_event → fetch_events`
 //! sequence into the production client `hb-it` drives now and `hb-app` will drive in M4.
 //!
-//! Two disciplines from M0 are load-bearing: `connect()` returns *before* the websocket
-//! handshake, so we always `try_connect` and refuse to proceed if no relay came up; and a
-//! relay's per-event accept/reject is surfaced (the `Output.success`/`failed` split) so a
+//! Two disciplines from M0 are load-bearing: `connect()` returns *before* every relay's
+//! websocket handshake (the first relay's handshake gates the return, QURATOR-168; the rest
+//! keep connecting in the background), and it still refuses to proceed if NO relay came up;
+//! and a relay's per-event accept/reject is surfaced (the `Output.success`/`failed` split) so a
 //! silent drop or an explicit `OK: false` is observable (AB8), never swallowed.
 
 use std::collections::HashSet;
@@ -22,6 +23,11 @@ use crate::error::NetError;
 /// mis-set constant asking for an implausibly long single sleep — [`RelayRateLimiter::new`] already
 /// clamps the config, so this is belt-and-suspenders).
 const MAX_THROTTLE_SLEEP: Duration = Duration::from_secs(2);
+
+/// Poll cadence of the first-success race in [`RelayClient::connect`] (QURATOR-168): a healthy
+/// relay's handshake lands in tens of milliseconds, so a 50 ms tick adds at most one tick of
+/// latency to the fast path, while the slow path stays bounded by the join's own `timeout`.
+const CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// A connected multi-relay client.
 pub struct RelayClient {
@@ -155,10 +161,44 @@ fn any_relay_connected(statuses: &[RelayStatus]) -> bool {
     statuses.iter().any(|s| matches!(s, RelayStatus::Connected))
 }
 
+/// The per-tick decision of [`RelayClient::connect`]'s first-success race (QURATOR-168). Pure,
+/// so the proceed-vs-keep-waiting policy is unit-testable without standing up a relay.
+#[derive(Debug, PartialEq, Eq)]
+enum ConnectRaceDecision {
+    /// A relay reached `Connected` — proceed now; stragglers keep connecting in the background.
+    Proceed,
+    /// No relay is up yet and the join is still driving handshakes — sleep and re-check.
+    KeepWaiting,
+    /// The join resolved without any relay observed `Connected` — await it for the full
+    /// per-relay diagnostics path.
+    AwaitOutcome,
+}
+
+/// Priority is load-bearing: `Proceed` must outrank a finished join, because a relay can land
+/// `Connected` in the very tick the join resolves — testing `join_finished` first would take the
+/// slow path and re-pay exactly the stragglers' wait the race exists to skip.
+fn connect_race_tick(statuses: &[RelayStatus], join_finished: bool) -> ConnectRaceDecision {
+    if any_relay_connected(statuses) {
+        ConnectRaceDecision::Proceed
+    } else if join_finished {
+        ConnectRaceDecision::AwaitOutcome
+    } else {
+        ConnectRaceDecision::KeepWaiting
+    }
+}
+
 impl RelayClient {
-    /// Connect to `relays`, waiting up to `timeout` for the websocket handshake. Fails if **no**
-    /// relay completed the handshake — publishing against an unconnected relay silently fails
-    /// with "relay not connected" (the M0 finding), so we never proceed half-connected.
+    /// Connect to `relays`, returning as soon as the **first** relay completes its websocket
+    /// handshake (QURATOR-168), or up to `timeout` if none does — in which case this fails with
+    /// the per-relay reasons. Tradeoff, accepted by the 2026-09-02 owner ruling ("fix the
+    /// plumbing, not the bound"): slower-but-healthy relays may still be handshaking when the
+    /// first publish goes out, and nostr-relay-pool surfaces that per relay as an
+    /// `Output.failed` "relay not connected" entry (the M0 finding) — a straggler's first
+    /// publish can be dropped exactly as M0 described. The spawned join keeps driving those
+    /// stragglers to completion in the background, so later publishes reach them; and at least
+    /// one relay is always fully `Connected` before we return, so nothing is published into a
+    /// fully-dead pool. The alternative — waiting for every relay — cost the full `timeout`
+    /// whenever one relay in the set was dead, which R1 measured at 43s against a 40s bound.
     pub async fn connect(
         identity: &Identity,
         relays: &[String],
@@ -181,7 +221,63 @@ impl RelayClient {
                 .await
                 .map_err(|e| NetError::Client(format!("add_relay({r}): {e}")))?;
         }
-        let conn = client.try_connect(timeout).await;
+        // QURATOR-168 (owner ruling 2026-09-02: fix the plumbing, not the bound): nostr-relay-pool
+        // 0.43.1's `try_connect` joins EVERY per-relay handshake, so one blackholing relay cost the
+        // full `timeout` even when a healthy relay finished in milliseconds (the WAN-R R1 row
+        // measured 43.01s against a 40s bound). Race the join against a first-success poller and
+        // return the moment any relay reaches `Connected`.
+        //
+        // The join is SPAWNED, not `select!`ed inline: dropping an in-flight `try_connect`
+        // strands its relays in `Connecting`, and 0.43.1's `RelayStatus::can_connect()` covers
+        // only {Initialized, Terminated, Sleeping} — nothing would ever pick them up again (the
+        // pool monitor is notification-only). Spawned, the detached join keeps driving every
+        // handshake to completion, so on the early win the stragglers still come up for later
+        // publishes and the pool never rides a single relay.
+        let join = tokio::spawn({
+            let client = client.clone();
+            async move { client.try_connect(timeout).await }
+        });
+        loop {
+            let relays_now = client.relays().await;
+            let statuses: Vec<RelayStatus> = relays_now.values().map(|r| r.status()).collect();
+            match connect_race_tick(&statuses, join.is_finished()) {
+                ConnectRaceDecision::Proceed => {
+                    // Contract preserved (QURATOR-66): the per-connected-relay info! line names the
+                    // relays that are up, in the same canonical form the failure path logs.
+                    let connected: Vec<String> = relays_now
+                        .iter()
+                        .filter(|(_, r)| matches!(r.status(), RelayStatus::Connected))
+                        .map(|(url, _)| canonical_relay_url(&url.to_string()))
+                        .collect();
+                    for url in &connected {
+                        tracing::info!(relay = %url, "relay client: connected");
+                    }
+                    tracing::info!(
+                        connected = connected.len(),
+                        total = statuses.len(),
+                        "relay client: first relay connected, proceeding (stragglers keep connecting)"
+                    );
+                    return Ok(Self {
+                        client,
+                        relays: relays.to_vec(),
+                        limiter: Mutex::new(RelayRateLimiter::relay_writes()),
+                        start: Instant::now(),
+                    });
+                }
+                ConnectRaceDecision::KeepWaiting => {}
+                ConnectRaceDecision::AwaitOutcome => break,
+            }
+            tokio::time::sleep(CONNECT_POLL_INTERVAL).await;
+        }
+        let conn = match join.await {
+            Ok(conn) => conn,
+            Err(e) => {
+                // A panicked join must not surface as a bare NoRelayConnected with an empty failed
+                // set — name the join error so the log cannot be mistaken for relay diagnostics.
+                tracing::error!(error = %e, "relay client: try_connect join panicked");
+                return Err(NetError::NoRelayConnected(format!("try_connect join failed: {e}")));
+            }
+        };
         // Log the per-relay connect outcome: which relays came up vs failed. The failed set carries a
         // reason string per relay — currently surfaced only in the error path; logging it here means a
         // partial connect (some relays up, some down) is visible without a full failure.
@@ -614,6 +710,98 @@ mod tests {
         let outage = [RelayStatus::Disconnected, RelayStatus::Disconnected];
         assert!(pool_is_live(&outage), "Disconnected is transient — the pool must not be rebuilt");
         assert!(!any_relay_connected(&outage), "yet no relay can serve the REQ");
+    }
+
+    // ── The first-success race at the connect seam (QURATOR-168) ─────────────────────────────
+    //
+    // MUTATION (for the orchestrator's red proof): in `connect_race_tick`, swap the branch order
+    // so the join check runs first —
+    //     `if any_relay_connected(statuses) {`  →  `if join_finished {` returning AwaitOutcome,
+    //     `} else if join_finished {`            →  `} else if any_relay_connected(statuses) {`
+    // This still COMPILES and must redden `connect_race_tick_proceed_outranks_a_finished_join`
+    // (the tick would answer AwaitOutcome for [Connected, Terminated] with the join finished).
+    // A second, independent mutation: make the `join_finished` branch return KeepWaiting instead
+    // of AwaitOutcome — that reddens `connect_race_tick_awaits_outcome_when_the_join_resolves…`
+    // and hangs the async `connect_still_fails…` test (never reaching the diagnostics path).
+
+    #[test]
+    fn connect_race_tick_proceeds_the_instant_any_relay_is_connected() {
+        // The race's whole point (the R1 shape: one healthy relay up, one blackholing): the tick
+        // must say Proceed, never KeepWaiting, so connect() never pays the straggler's wait.
+        assert_eq!(
+            connect_race_tick(&[RelayStatus::Connected, RelayStatus::Connecting], false),
+            ConnectRaceDecision::Proceed
+        );
+        assert_eq!(
+            connect_race_tick(&[RelayStatus::Terminated, RelayStatus::Connected], false),
+            ConnectRaceDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn connect_race_tick_keeps_waiting_while_no_relay_is_up_and_the_join_runs() {
+        // Stragglers mid-handshake (Connecting/Initialized/Pending) are NOT connected: returning
+        // on them would recreate the half-connected publish the M0 finding forbids. The join is
+        // still driving them, so the only honest answer is keep waiting.
+        assert_eq!(
+            connect_race_tick(&[RelayStatus::Connecting, RelayStatus::Initialized], false),
+            ConnectRaceDecision::KeepWaiting
+        );
+        assert_eq!(
+            connect_race_tick(&[RelayStatus::Disconnected, RelayStatus::Terminated], false),
+            ConnectRaceDecision::KeepWaiting
+        );
+    }
+
+    #[test]
+    fn connect_race_tick_awaits_outcome_when_the_join_resolves_with_nothing_connected() {
+        // The timeout-expiry shape: the join finished, nothing connected. Only now does connect()
+        // take the full-diagnostics path (per-relay failure reasons → NoRelayConnected).
+        assert_eq!(
+            connect_race_tick(&[RelayStatus::Terminated, RelayStatus::Terminated], true),
+            ConnectRaceDecision::AwaitOutcome
+        );
+        assert_eq!(
+            connect_race_tick(&[], true),
+            ConnectRaceDecision::AwaitOutcome
+        );
+    }
+
+    #[test]
+    fn connect_race_tick_proceed_outranks_a_finished_join() {
+        // Load-bearing priority: a relay can land `Connected` in the very tick the join resolves
+        // (status is set to Connected inside the join's own execution, before it completes).
+        // Testing `join_finished` first would take the slow path and re-pay the stragglers' wait —
+        // exactly what the race exists to skip.
+        assert_eq!(
+            connect_race_tick(&[RelayStatus::Connected, RelayStatus::Terminated], true),
+            ConnectRaceDecision::Proceed
+        );
+    }
+
+    /// The timeout path through the REAL `connect` loop (QURATOR-168): no relay ever reaches
+    /// `Connected`, so the poller never fires the early return; the spawned join resolves at the
+    /// timeout, the tick says AwaitOutcome, and the caller still gets the per-relay
+    /// `NoRelayConnected` with the QURATOR-66 diagnostics logged. Uses `ws://127.0.0.1:1`
+    /// (connection refused, nothing listens) so it needs no relay server and no network egress —
+    /// the same trick as `fetch_errors_when_no_relay_is_connected` above.
+    #[tokio::test]
+    async fn connect_still_fails_with_diagnostics_when_no_relay_ever_connects() {
+        let id = Identity::generate();
+        // Destructured rather than `expect_err`, which would require `RelayClient: Debug` —
+        // deriving that on a production struct holding the pool and the rate limiter, purely to
+        // satisfy a test, widens what a stray `{:?}` can print at the network edge.
+        let outcome =
+            RelayClient::connect(&id, &["ws://127.0.0.1:1".into()], Duration::from_millis(500))
+                .await;
+        let err = match outcome {
+            Ok(_) => panic!("no relay can come up; connect must refuse, never half-proceed"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, NetError::NoRelayConnected(_)),
+            "the outage must be reported as NoRelayConnected, got {err:?}"
+        );
     }
 
     /// The warm-client outage, driven through the REAL `fetch` (QURATOR-145 review, HIGH). A
