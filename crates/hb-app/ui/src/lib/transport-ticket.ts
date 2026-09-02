@@ -20,6 +20,8 @@
 // truncated teaser on its own. This module deliberately does NOT plumb a tree across tabs — the cache
 // is already the hand-off, and inventing a second one would give the two paths different behaviour.
 
+import { manifestAskKey } from './manifest-ask.js';
+
 /** A transport ticket as it rides a DM body. Mirrors `hb_core::ticket::TransportTicket`; the fields
  *  this side needs are the bindings (which request, which collection) — `node_addr` stays opaque
  *  here exactly as it is in hb-core, and is passed back to the backend verbatim. */
@@ -81,6 +83,52 @@ export function transportTicketHint(content: string): string | null {
 	return t ? `Sent you the full list of “${t.slug}”` : null;
 }
 
+/** Every trace key an ask for `(responder, author, slug)` may be recorded under (Carrier 4 widened
+ *  the on-disk identity from `responder|slug` to `responder|author|slug`; pre-widening records
+ *  still resolve on the owner path). `ticketAuthor` absent means the issuer's own collection
+ *  (author === responder) — the lenient legacy reading. Mirrors `manifestAskLookupKeys`
+ *  (manifest-ask.ts) — keep the two in step. */
+function askTraceKeys(npub: string, slug: string, ticketAuthor?: string): string[] {
+	const author = ticketAuthor && ticketAuthor !== '' ? ticketAuthor : npub;
+	return author === npub
+		? // Owner path: the same ask may be recorded under the pre-Carrier-4 authorless key OR the
+			// widened self-author spelling — two spellings of one identity, so trying both cannot
+			// widen what matches (each is still nonce-gated at the caller). The widened spelling is
+			// built by `manifestAskKey`, never interpolated here: that format has already been
+			// widened once (Carrier 4), and a second hand-rolled copy is how the next change drifts.
+			[`${npub}|${slug}`, manifestAskKey(npub, npub, slug)]
+		: // Re-serve path: scoped to THIS author ONLY. It must never fall back to the authorless
+			// key — that fallback IS the cross-tenant collision (ask for A's manifest, redeem on a
+			// nonce minted for a different ask of ours, or the reverse).
+			[manifestAskKey(npub, author, slug)];
+}
+
+/** QURATOR-171 — the asker's newest-known fingerprint for the collection a ticket answers: the
+ *  `fingerprint_seen` of the ask record whose nonce the ticket echoes — i.e. exactly the record
+ *  that authorized the dial. The nonce and the fingerprint are written in one store insert
+ *  (`record_manifest_ask`), so there is no newer one this side could have seen without re-asking
+ *  (and a re-ask overwrites both together). Keyed by nonce, not by first-match, because a
+ *  pre-Carrier-4 legacy record (`npub|slug`) can coexist with a newer widened one
+ *  (`npub|npub|slug`) for the same ask — first-match would hand back the OLDER fingerprint.
+ *  Feeds `redeem_manifest_ticket`'s staleness gate; NOT the served fingerprint (that would
+ *  compare the envelope against itself and always report "current"). Undefined when the trace is
+ *  unloaded or records no fingerprint — the backend treats that as "nothing to gate on", never as
+ *  stale. */
+export function askFingerprintSeen(
+	asks: Record<string, { nonce?: string; fingerprint_seen?: string }> | null,
+	npub: string,
+	slug: string,
+	ticketNonce: string | undefined,
+	ticketAuthor?: string,
+): string | undefined {
+	if (!asks || ticketNonce === undefined) return undefined;
+	for (const key of askTraceKeys(npub, slug, ticketAuthor)) {
+		const rec = asks[key];
+		if (rec?.nonce === ticketNonce) return rec.fingerprint_seen || undefined;
+	}
+	return undefined;
+}
+
 /** The redemption's lifecycle, as the card renders it.
  *
  *  `unsolicited` is the state a ticket lands in when we have **no local record of asking** that peer
@@ -130,20 +178,9 @@ export function ticketAnswersOurAsk(
 	// loosened. Deleting it does NOT redden the suite — verified — so do not read its presence as the
 	// thing enforcing this case.
 	if (!ticketNonce) return false;
-	// Carrier 4 — normalize the ticket's author. Absent means the ISSUER'S OWN collection, not "any
-	// collection the issuer cares to re-serve": the author is part of the ask's identity on BOTH
-	// sides of the trace.
-	const author = ticketAuthor && ticketAuthor !== '' ? ticketAuthor : npub;
-	const candidates =
-		author === npub
-			? // Owner path: the same ask may be recorded under the pre-Carrier-4 authorless key OR the
-				// widened self-author spelling — two spellings of one identity, and each is still
-				// nonce-gated below, so trying both cannot widen what matches.
-				[`${npub}|${slug}`, `${npub}|${npub}|${slug}`]
-			: // Re-serve path: scoped to THIS author ONLY. It must never fall back to the authorless
-				// key — that fallback IS the cross-tenant collision (ask for A's manifest, redeem on a
-				// nonce minted for a different ask of ours, or the reverse).
-				[`${npub}|${author}|${slug}`];
+	// The candidate keys (and the author normalization they encode) live in askTraceKeys — one walk,
+	// shared with the fingerprint read-back, so the two cannot drift apart.
+	const candidates = askTraceKeys(npub, slug, ticketAuthor);
 	for (const key of candidates) {
 		if (!Object.prototype.hasOwnProperty.call(asks, key)) continue;
 		const stored = asks[key]?.nonce;

@@ -30,6 +30,7 @@
 		type RelayHealth,
 		getCollections,
 		sendFullList,
+		sendCachedManifest,
 		redeemManifestTicket,
 		getManifestAsks,
 		getSettings,
@@ -67,6 +68,7 @@
 		SEND_FULL_LIST_TOAST,
 		ticketAnswersOurAsk,
 		askIdentity,
+		askFingerprintSeen,
 	} from '$lib/transport-ticket.js';
 	import TransportTicketCard from '$lib/components/TransportTicketCard.svelte';
 	import ContactPicker from '$lib/components/ContactPicker.svelte';
@@ -493,17 +495,7 @@
 		if (state.kind !== 're-serve' || !npub || servingCached === state.slug) return;
 		servingCached = state.slug;
 		try {
-			// NOTE (Lane C): `send_cached_manifest` is registered on the Rust side (lib.rs:548) but
-			// has no wrapper in api.ts — that file is Lane B's fence in this fan-out, so the invoke is
-			// made here with the same argument shape api.ts uses (camelCase Tauri arg names, null for
-			// absent optionals). Moving it into api.ts later changes no call site.
-			const { invoke } = await import('@tauri-apps/api/core');
-			await invoke<void>('send_cached_manifest', {
-				npub,
-				authorNpub: state.authorNpub,
-				slug: state.slug,
-				askNonce: askNonce ?? null,
-			});
+			await sendCachedManifest(npub, state.authorNpub, state.slug, askNonce);
 			toast(SEND_FULL_LIST_TOAST(state.slug), 'success');
 		} catch (e) {
 			toast(String(e), 'error');
@@ -523,9 +515,19 @@
 	// truncated teaser on its own. One hand-off, not two.
 	const redemptions = new RedemptionLedger();
 	let redemptionTick = $state(0); // bumped to re-render the cards; the ledger itself is not reactive
-	async function redeem(npub: string, requestId: string, ask: string, ticketJson: string) {
+	async function redeem(
+		npub: string,
+		requestId: string,
+		ask: string,
+		ticketJson: string,
+		newestFingerprint?: string,
+	) {
 		try {
-			await redeemManifestTicket(npub, ticketJson);
+			// QURATOR-171: the asker's newest-known fingerprint rides along so the backend's staleness
+			// gate has something to compare against. Sourced from the ask record via
+			// askFingerprintSeen — never the served envelope's own fingerprint, which would compare a
+			// value against itself and always report "current" (worse than today's always-false).
+			await redeemManifestTicket(npub, ticketJson, newestFingerprint);
 			redemptions.succeed(requestId, ask);
 			// The backend consumed the ask, so our copy is stale — re-read it. Without this the
 			// in-memory trace would still authorize a second ticket for the rest of the session,
@@ -601,7 +603,7 @@
 		// to N peer-chosen addresses.
 		const ask = askIdentity(npub, slug, ticketNonce);
 		if (redemptions.claim(requestId, ask)) {
-			void redeem(npub, requestId, ask, ticketJson);
+			void redeem(npub, requestId, ask, ticketJson, askFingerprintSeen(manifestAsks, npub, slug, ticketNonce, ticketAuthor));
 		}
 		return redemptions.get(requestId) ?? ({ kind: 'unsolicited' } as const);
 	}
@@ -629,7 +631,7 @@
 		const ask = askIdentity(npub, slug, ticketNonce);
 		if (!redemptions.claimRetry(requestId, ask)) return;
 		redemptionTick += 1;
-		void redeem(npub, requestId, ask, ticketJson);
+		void redeem(npub, requestId, ask, ticketJson, askFingerprintSeen(manifestAsks, npub, slug, ticketNonce, ticketAuthor));
 	}
 
 	async function sendChannelPost() {
