@@ -174,6 +174,17 @@ enum ConnectRaceDecision {
     AwaitOutcome,
 }
 
+/// The statuses of just the relays named in `wanted`, given the pool's `(canonical_url, status)`
+/// pairs. Pure, so the scoping is unit-testable without a relay.
+///
+/// **Scoping is load-bearing in [`RelayClient::ensure_relays`]**, which runs against an ALREADY-WARM
+/// client: a pool-wide `any_relay_connected` would hold on the very first tick because some existing
+/// relay is up, so the race would return having waited for none of the peer's newly-added relays —
+/// which is the entire purpose of that call.
+fn statuses_of(pool: &[(String, RelayStatus)], wanted: &[String]) -> Vec<RelayStatus> {
+    pool.iter().filter(|(url, _)| wanted.contains(url)).map(|(_, s)| *s).collect()
+}
+
 /// Priority is load-bearing: `Proceed` must outrank a finished join, because a relay can land
 /// `Connected` in the very tick the join resolves — testing `join_finished` first would take the
 /// slow path and re-pay exactly the stragglers' wait the race exists to skip.
@@ -498,16 +509,39 @@ impl RelayClient {
     /// own relays is still reachable. Best-effort and idempotent: a relay that fails to connect is
     /// skipped (existing connections keep working); `add_relay` is a no-op for already-known relays.
     pub async fn ensure_relays(&self, relays: &[String], timeout: Duration) -> Result<(), NetError> {
-        let mut added = false;
+        let mut added: Vec<String> = Vec::new();
         for r in relays {
             if !self.relays.contains(r) && self.client.add_relay(r.as_str()).await.is_ok() {
                 tracing::debug!(relay = %canonical_relay_url(r), "ensure_relays: added peer relay to the pool");
-                added = true;
+                added.push(canonical_relay_url(r));
             }
         }
-        if added {
-            // Connect the newly-added relays; already-connected ones are unaffected.
-            let _ = self.client.try_connect(timeout).await;
+        if !added.is_empty() {
+            // QURATOR-175: the same first-success race as `connect` — see its comment for why the
+            // join is SPAWNED rather than `select!`ed and dropped. Previously this awaited the
+            // join-all, so one dead relay in a peer's advertised outbox taxed every browse of that
+            // peer by the full `timeout`.
+            let join = tokio::spawn({
+                let client = self.client.clone();
+                async move { client.try_connect(timeout).await }
+            });
+            loop {
+                let pool: Vec<(String, RelayStatus)> = self
+                    .client
+                    .relays()
+                    .await
+                    .iter()
+                    .map(|(url, r)| (canonical_relay_url(&url.to_string()), r.status()))
+                    .collect();
+                let statuses = statuses_of(&pool, &added);
+                match connect_race_tick(&statuses, join.is_finished()) {
+                    // Best-effort by contract: a join that resolved with none of the peer's relays
+                    // up is not an error here, exactly as the discarded `let _ =` was not.
+                    ConnectRaceDecision::Proceed | ConnectRaceDecision::AwaitOutcome => break,
+                    ConnectRaceDecision::KeepWaiting => {}
+                }
+                tokio::time::sleep(CONNECT_POLL_INTERVAL).await;
+            }
         }
         Ok(())
     }
@@ -775,6 +809,44 @@ mod tests {
         // exactly what the race exists to skip.
         assert_eq!(
             connect_race_tick(&[RelayStatus::Connected, RelayStatus::Terminated], true),
+            ConnectRaceDecision::Proceed
+        );
+    }
+
+    /// `ensure_relays` runs against an ALREADY-WARM client, so the race must look at ONLY the
+    /// relays it just added (QURATOR-175). This is the shape that would otherwise pass vacuously:
+    /// an existing relay is `Connected` (the client is warm) while the peer's newly-added relay is
+    /// still `Connecting`. Unscoped, the tick would see the warm relay, answer `Proceed`, and
+    /// return having waited for none of the peer's relays — silently defeating the entire purpose
+    /// of `ensure_relays`, and doing it in a way no timing measurement would reveal.
+    ///
+    /// MUTATION (P-10, applied by the orchestrator): in `statuses_of`, drop the filter —
+    /// `pool.iter().filter(|(url, _)| wanted.contains(url))` becomes `pool.iter()` — one line,
+    /// still compiles. The warm relay's `Connected` then leaks in, the tick answers `Proceed`, and
+    /// this test reds on the `KeepWaiting` assertion.
+    #[test]
+    fn ensure_relays_waits_on_the_peers_relays_not_the_warm_pool() {
+        let pool = vec![
+            ("wss://already.example".to_string(), RelayStatus::Connected),
+            ("wss://peer.example".to_string(), RelayStatus::Connecting),
+        ];
+        let added = vec!["wss://peer.example".to_string()];
+
+        let scoped = statuses_of(&pool, &added);
+        assert_eq!(scoped, vec![RelayStatus::Connecting], "only the newly-added relay counts");
+        assert_eq!(
+            connect_race_tick(&scoped, false),
+            ConnectRaceDecision::KeepWaiting,
+            "a warm relay being up must not stand in for the peer's relay coming up"
+        );
+
+        // ...and once the peer's own relay lands, the race proceeds on that.
+        let up = vec![
+            ("wss://already.example".to_string(), RelayStatus::Connected),
+            ("wss://peer.example".to_string(), RelayStatus::Connected),
+        ];
+        assert_eq!(
+            connect_race_tick(&statuses_of(&up, &added), false),
             ConnectRaceDecision::Proceed
         );
     }
