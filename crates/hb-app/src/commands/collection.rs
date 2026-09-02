@@ -110,7 +110,7 @@ fn stamp_big_relay_url(listing_json: &str, big_relay_url: &str) -> Result<String
 /// the two cannot drift). A listing that fits the budget whole is returned **unchanged** — nothing
 /// is hidden, the teaser carries the full-tree `snapshot_fingerprint`, and the byte-identical
 /// untruncated publish survives. Pure.
-fn stamp_teaser_fingerprint(listing_json: &str) -> Result<String, String> {
+pub(crate) fn stamp_teaser_fingerprint(listing_json: &str) -> Result<String, String> {
     let t = hb_net::truncate_listing(listing_json, LISTING_MAX_BYTES).map_err(cmd_err)?;
     if !t.truncated {
         return Ok(listing_json.to_string());

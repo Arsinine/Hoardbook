@@ -525,9 +525,11 @@ fn full_supersedes(rendered: &RenderedListing, expected_fingerprint: &str) -> bo
     rendered.complete() && family_teaser_fingerprint(rendered) == Some(expected_fingerprint)
 }
 
-/// Fetch the big-relay full family **only if it is current** — its snapshot fingerprint matches
-/// `expected_fingerprint` (the truncated teaser's). A mismatch (the big relay holds a stale older
-/// snapshot), an absent family, or any fetch failure yields `Ok(None)`, so the caller keeps the
+/// Fetch the big-relay full family **only if it is current** — its **teaser** fingerprint
+/// (`teaser_fingerprint`, stamped by the publish path beside the family's own full-tree
+/// `snapshot_fingerprint`) matches `expected_fingerprint` (the truncated teaser's). A mismatch
+/// (the big relay holds a stale older snapshot), an absent family, or any fetch failure yields
+/// `Ok(None)`, so the caller keeps the
 /// paywall teaser rather than serving stale or un-gated data (M16 headline failure mode #1). Only a
 /// current, verified full tree returns `Ok(Some(_))`.
 pub async fn fetch_full_listing_if_current(

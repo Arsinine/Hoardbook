@@ -458,7 +458,20 @@ async fn d4_bigrelay_cross_region(probe: &ProbeInput) -> Result<(), String> {
     let owner = Identity::generate();
     let key = bk(31);
     let slug = format!("wan-d-d4-{}", token());
-    let full = full_listing(&slug, 1300, &fp);
+    // QURATOR-169: publish the family through the PRODUCTION stamp, exactly as the big-relay arm of
+    // the publish path does (`commands/collection.rs`, gated on `will_truncate`). The staleness gate
+    // (`full_supersedes`) compares `teaser_fingerprint` — audit #25: the only value a teaser and a
+    // full carrier can share — and that field exists ONLY where the stamp put it. A bare
+    // `full_listing(...)` publish carried no such field, `family_teaser_fingerprint` read `None`,
+    // and the gate correctly refused the family: a harness omission surfacing as a phantom product
+    // defect (the third of its shape here, after `sanitize_node_addr` and `approve_request`).
+    // `stamp_teaser_fingerprint` is derived, not hand-built: it runs the same `truncate_listing`
+    // the teaser publish runs, on these exact bytes, and reads the digest back — the two cannot
+    // drift the way a hand-stamped fixture (`hb-it`'s `full_listing(slug, n, fp, tf)` would be)
+    // silently can. The teaser publish below re-truncates the same stamped bytes, so both arms see
+    // identical meta and the digest is by construction the one the teaser carries.
+    let full = crate::commands::collection::stamp_teaser_fingerprint(&full_listing(&slug, 1300, &fp))
+        .map_err(|e| format!("D4 stamp_teaser_fingerprint: {e}"))?;
 
     // Full family → the big relay ONLY (publish_listing_to → publish_to, targeted).
     let cbig = connect(&owner, std::slice::from_ref(big))
@@ -648,7 +661,10 @@ async fn d4_bigrelay_cross_region(probe: &ProbeInput) -> Result<(), String> {
 
 /// A full listing of `n` padded entries carrying `snapshot_fingerprint = fp` (matches
 /// `hb-it/suite_bigrelay::full_listing`). Big enough to split into an index + several content parts
-/// under the 40 KiB per-part budget.
+/// under the 40 KiB per-part budget. The returned JSON is UNSTAMPED: callers on the gated path must
+/// pass it through the production stamp (`stamp_teaser_fingerprint`) before publishing — the gate
+/// `fetch_full_listing_if_current` reads `teaser_fingerprint`, which only the stamp can derive
+/// (over the visible entries + elided count, QURATOR-169).
 fn full_listing(slug: &str, n: usize, fp: &str) -> String {
     let entries: Vec<Value> = (0..n)
         .map(|i| serde_json::json!({ "name": format!("title-{i:05}-padding-padding-padding-xx") }))
@@ -881,5 +897,47 @@ mod tests {
         assert_eq!(t.display_name, "name");
         assert_eq!(t.tags, vec!["a".to_string()]);
         assert_eq!(t.content_types, vec!["video".to_string()]);
+    }
+
+    /// D4 must publish its full family through the PRODUCTION teaser stamp
+    /// (`commands::collection::stamp_teaser_fingerprint`) — the same step the big-relay arm of the
+    /// real publish path performs. The staleness gate (`full_supersedes`, hb-net browse.rs) compares
+    /// `teaser_fingerprint` — audit #25 / QURATOR-123: "the only value a teaser and a full carrier
+    /// can still share" — and that field exists only where the stamp put it. D4 used to hand-build
+    /// its `listing_json` and call `publish_listing_to` directly, omitting the stamp: the family
+    /// genuinely lacked the field, `family_teaser_fingerprint` read `None`, and the gate correctly
+    /// refused it. The third instance here of the WAN harness re-implementing a production path and
+    /// omitting a step (`sanitize_node_addr` 2026-08-27; `approve_request` 2026-09-01) — without a
+    /// guard the omission comes back with the next fixture edit. A drift guard, not integration
+    /// coverage — the `suite_cap.rs` precedent: it fails loudly on re-divergence.
+    ///
+    /// MUTATION (P-10, resolve by containing function): in `d4_bigrelay_cross_region`, revert the
+    /// stamped publish to the bare fixture — replace the `crate::commands::collection::stamp_teaser_fingerprint(&full_listing(...))`
+    /// expression with plain `full_listing(&slug, 1300, &fp)` (delete the surrounding `?`-mapped
+    /// call, keep the `String` binding) — and this test reds: the sliced body no longer contains
+    /// the call. The mutated file still COMPILES (both forms bind a `String`), so the red is a
+    /// result, not a build failure. Comments are stripped first, so documenting this rule cannot
+    /// satisfy it.
+    #[test]
+    fn d4_publishes_through_the_production_teaser_stamp() {
+        let src = include_str!("suite_wan_d.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let sig = "async fn d4_bigrelay_cross_region(";
+        let at = code.find(sig).expect("d4_bigrelay_cross_region not found");
+        let end = code[at..].find("\n}").expect("d4_bigrelay_cross_region must terminate") + at;
+        let body = &code[at..end];
+
+        assert!(
+            body.contains("stamp_teaser_fingerprint("),
+            "d4_bigrelay_cross_region must stamp its full family via the production \
+             stamp_teaser_fingerprint before publishing — the gate reads teaser_fingerprint, \
+             which only the stamp derives. Publishing a bare hand-built fixture is how D4 failed \
+             as a phantom product defect (QURATOR-169)."
+        );
     }
 }
