@@ -200,6 +200,13 @@ impl TransportTicket {
         if self.ask_nonce.as_deref().is_some_and(str::is_empty) {
             return Err(HbError::InvalidTicket("ticket carries an empty ask nonce".into()));
         }
+        // Same shape, same reasoning: absent is the only legal way to say "the issuer's own
+        // collection", so a blank must not be readable as that case. Production mints this field
+        // only through `npub_of(parse_recipient(..))`, which never yields `""` — so a blank can
+        // only arrive from the wire, and a serde derive is an unvalidated public constructor.
+        if self.author_npub.as_deref().is_some_and(str::is_empty) {
+            return Err(HbError::InvalidTicket("ticket carries an empty author npub".into()));
+        }
         Ok(())
     }
 
@@ -437,6 +444,32 @@ mod tests {
         let t: TransportTicket = serde_json::from_str(json).expect("a ticket without the field still parses");
         assert_eq!(t.author_npub, None);
         t.verify_shape().expect("absence is the ordinary own-collection case, not an error");
+    }
+
+    /// **Present-but-blank is malformed, not "own collection"** — the `ask_nonce` shape exactly
+    /// (QURATOR-172 #4). Collapsing the two would let a peer send `"author_npub":""` and have the
+    /// re-serve signal read as the ordinary own-collection case. The blank is built by
+    /// deserializing wire JSON, NOT via `issue`/`npub_of`: production mints this field only through
+    /// `npub_of(parse_recipient(..))` (fulfil.rs), which never yields `""`, so deserializing
+    /// attacker-supplied bytes is the only route a blank can take — and `verify_shape` is the gate
+    /// that meets it. Together with the two tests above this pins all three shapes: absent (pass),
+    /// present-and-valid (pass), present-and-blank (reject).
+    ///
+    /// MUTATION (P-10, applied by the orchestrator — this lane compiles nothing): in
+    /// `verify_shape`, delete the three code lines of the `if self.author_npub.as_deref()
+    /// .is_some_and(str::is_empty)` block (the `if` line, the `return Err(HbError::InvalidTicket(
+    /// "ticket carries an empty author npub".into()));` arm, and its closing brace) — this test
+    /// reds on the `.is_err()` assertion while still compiling.
+    #[test]
+    fn an_empty_author_npub_is_refused_rather_than_read_as_absent() {
+        let json = r#"{"hb":"transport_ticket","ticket_v":1,"request_id":"r","slug":"s",
+                       "node_addr":"a","issued_at":1,"author_npub":""}"#;
+        let t: TransportTicket = serde_json::from_str(json).unwrap();
+        assert!(t.verify_shape().is_err(), "an empty author npub is a malformed ticket");
+        assert!(
+            matches!(t.verify_shape(), Err(HbError::InvalidTicket(_))),
+            "the refusal names the ticket malformed, not a version problem"
+        );
     }
 
     #[test]
