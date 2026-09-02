@@ -8,8 +8,30 @@
 //! `DataStore::wipe` (which clears the whole base dir) covers this cache for free — no wipe change.
 //!
 //! The cache stores only browse-key-*encrypted* envelope bytes (the same safety class as any listing
-//! already at rest); the reader re-verifies the author signature + re-decrypts on every read, so a
-//! tampered cache file fails closed exactly like a tampered file import.
+//! already at rest). **It has TWO readers, and they do not carry the same guarantee** — this used to
+//! read "the reader re-verifies ... on every read", which was true of one of them and false of the
+//! other (QURATOR-172 #3, corrected 2026-09-02):
+//!
+//! - `commands::browse::resolve_from_cache` — the LOCAL browse reader. Does
+//!   `get` -> `from_json` -> `verify_author(peer)` -> binds the AUTHOR-SIGNED
+//!   `snapshot_fingerprint` to the teaser's -> `decrypt(browse_key)`. A tampered cache file fails
+//!   closed here exactly like a tampered file import.
+//! - `manifest_source::StoreManifestSource::payload`'s re-serve branch — the CARRIER-4 reader. Does
+//!   `get` -> `from_json` -> `ManifestPayload::seal` and **verifies nothing**; `seal` is serialize +
+//!   byte-bound and deliberately leaves author verification to its caller.
+//!
+//! The re-serve branch is nonetheless safe, and the reason is worth stating because it is NOT
+//! "the reader checks": **the RECEIVER checks, before it commits.** The fetching node runs its
+//! accept gate (`verify_author` pinned to the ticket's named author, plus slug bind and
+//! completeness) INSIDE `fetch_manifest_with_progress`, before the ACK — and the ticket is spent
+//! only on the ACK. So a tampered cache re-served by C reaches D and is refused **without burning
+//! D's ticket**; the cost is a wasted round-trip and a confusing serve-side error, not a
+//! disclosure or a lost capability.
+//!
+//! ⚠ That safety is a property of the RECEIVE path, not of this cache. **A third reader that
+//! consumes these bytes locally — rendering, importing, or trusting them without its own
+//! `verify_author` — would be a real hole**, because nothing in this module establishes
+//! authenticity. Verify at the point of use, or hand the bytes to something that does.
 
 use std::path::{Path, PathBuf};
 
