@@ -478,6 +478,17 @@ export interface ManifestAsk {
 export const getManifestAsks = () =>
 	invoke<Record<string, ManifestAsk>>('get_manifest_asks');
 
+/** QURATOR-137 — the owner-side auto-approve signal: does a standing grant exist for
+ *  `(peer_npub, author_npub, slug)`? `authorNpub` null/undefined means the asked peer's own
+ *  collection (the `self` key component — `standing_grant_key`). A pure local read, no relay I/O.
+ *  The chat route feeds the boolean into `deriveManifestFulfil`'s `answered` input; the derivation
+ *  stays pure. */
+export const hasStandingGrant = (
+	peerNpub: string,
+	authorNpub: string | null | undefined,
+	slug: string,
+) => invoke<boolean>('has_standing_grant', { peerNpub, authorNpub, slug });
+
 export const getMessages = () => invoke<ReceivedMessage[]>('get_messages');
 
 // ── Unified read state (devtest #16) ────────────────────────────────────────────

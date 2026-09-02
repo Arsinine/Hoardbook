@@ -598,6 +598,7 @@ pub fn run() {
             commands::chat::get_read_state,
             commands::chat::advance_read_watermark,
             commands::chat::get_manifest_asks,
+            commands::chat::has_standing_grant,
             commands::sharing::get_share_settings,
             commands::groups::groups_get,
             commands::groups::groups_create,

@@ -29,6 +29,7 @@
 		relayStatus,
 		type RelayHealth,
 		getCollections,
+		hasStandingGrant,
 		sendFullList,
 		sendCachedManifest,
 		redeemManifestTicket,
@@ -51,7 +52,7 @@
 	import { renderFingerprint } from '$lib/identity-display.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
 	import { importToast } from '$lib/manifest-provenance.js';
-	import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER, manifestRequestHint } from '$lib/request-inbox.js';
+	import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER, manifestRequestHint, parseManifestRequest } from '$lib/request-inbox.js';
 	// M17 W7.1b: the manifest-request fulfilment card. The capability (`export_manifest`) is fully
 	// wired on Home; this is its second entry point — surfaced where the request lands. The card's
 	// state is derived PURELY (zero network on render); the export Tauri call fires only on click.
@@ -352,6 +353,10 @@
 	 *  the same second is genuinely the same card, so a collision there is harmless). */
 	const messageKey = (m: { from: string; sent_at: string; content: string }) =>
 		`${m.from}|${m.sent_at}|${m.content}`;
+	/** QURATOR-137 — the slug a fulfil card's `answered` input is keyed by: the request's own slug
+	 *  when the message carries one, else the empty string (no grant lookup matches, so the card
+	 *  keeps its verb — the same default `grantedSlugs[...] === undefined` already gives). */
+	const mfReqSlug = (m: { content: string }) => parseManifestRequest(m.content)?.slug ?? '';
 	/** Detect a share code in a message ONCE per message id and cache the local-parse result. The
 	 *  card render path invokes only LOCAL Tauri commands (`validate_share_code` + `share_code_info`)
 	 *  — zero network. `paste_key`/`follow` never fire here; they fire in `handleUnlock` on click.
@@ -473,6 +478,9 @@
 		try {
 			await sendFullList(npub, slug, askNonce);
 			toast(SEND_FULL_LIST_TOAST(slug), 'success');
+			// QURATOR-137: the send records the standing grant, so the card flips to its answered
+			// state immediately — no peer switch or new message needed to notice.
+			refreshGrantState(true);
 		} catch (e) {
 			toast(String(e), 'error');
 		} finally {
@@ -498,12 +506,61 @@
 		try {
 			await sendCachedManifest(npub, state.authorNpub, state.slug, askNonce);
 			toast(SEND_FULL_LIST_TOAST(state.slug), 'success');
+			// QURATOR-137: same as the send path — the re-serve click records an author-scoped grant
+			// (not one this card's lookup reads), but refresh anyway so the state stays honest.
+			refreshGrantState(true);
 		} catch (e) {
 			toast(String(e), 'error');
 		} finally {
 			servingCached = null;
 		}
 	}
+
+	// QURATOR-137 (the auto-approve UI half) — the grant fact the fulfil card renders on. Once a
+	// standing grant exists for (this peer, this slug), the auto-approve loop answers their asks
+	// without a click, so the card must render informationally (see `deriveManifestFulfil`'s
+	// `answered` arm): a "Send the full list" click there would mint a SECOND ticket for a request
+	// the machine already handled. Keyed by slug for the SELECTED peer and rebuilt on peer switch;
+	// only authorless (own-collection) asks are collected, because an authorful ask derives
+	// `re-serve` before `answered` is ever judged — the loop declines those (auto_approve step 0),
+	// so marking them answered would claim an answer the machine never gave.
+	let grantedSlugs: Record<string, boolean> = $state({});
+	let grantSig = '';
+	let grantsInFlight = false;
+	async function refreshGrantState(force = false) {
+		const peer = selectedPeer;
+		if (!peer || grantsInFlight) return;
+		const slugs = new Set<string>();
+		for (const m of conversation) {
+			const req = parseManifestRequest(m.content);
+			if (req && !req.authorNpub) slugs.add(req.slug);
+		}
+		const sig = `${peer.npub}|${[...slugs].sort().join(',')}`;
+		if (!force && sig === grantSig) return;
+		if (slugs.size === 0) {
+			grantedSlugs = {};
+			grantSig = sig;
+			return;
+		}
+		grantsInFlight = true;
+		try {
+			const next: Record<string, boolean> = {};
+			for (const slug of slugs) next[slug] = await hasStandingGrant(peer.npub, null, slug);
+			grantedSlugs = next;
+			grantSig = sig;
+		} catch {
+			/* keep the last known grant state — the card falls back to its verb, never an error */
+		} finally {
+			grantsInFlight = false;
+		}
+	}
+	// Re-check when the conversation changes shape (peer switched, messages arrived). The signature
+	// guard makes an idle 3s poll with the same requests a no-op; a successful send forces a
+	// refresh because the send itself is what records the grant.
+	$effect(() => {
+		void conversation.length;
+		refreshGrantState();
+	});
 
 	// M18 W4 — the asker's half. A ticket DM is redeemed the first time it is SEEN, not on a click:
 	// redemption is immediate by owner ruling, and the backend exposes no "redeem later" path. The
@@ -1395,6 +1452,8 @@
 										{/if}
 										{#if manifestFulfilFor(msg.content, $collections, { quarantined: true })}
 											{@const mf = manifestFulfilFor(msg.content, $collections, { quarantined: true })!}
+											<!-- QURATOR-137: no `answered` input here, on purpose — quarantine short-circuits
+											     before `answered` is judged, so a quarantined peer's card stays quarantined. -->
 											<!-- M17 W7.1b quarantine: the fulfilment card renders for recognition, but ZERO action
 														buttons (Accept first, always — same rule as W3's ShareCodeCard). The state is derived
 														PURELY so the owner can see what the request is about before deciding to accept.
@@ -1545,8 +1604,11 @@
 											onaddcontact={() => handleAddContact(card)}
 										/>
 									{/if}
-									{#if manifestFulfilFor(msg.content, $collections, { quarantined: false })}
-										{@const mf = manifestFulfilFor(msg.content, $collections, { quarantined: false })!}
+									{#if manifestFulfilFor(msg.content, $collections, { quarantined: false, answered: grantedSlugs[mfReqSlug(msg)] })}
+										{@const mf = manifestFulfilFor(msg.content, $collections, { quarantined: false, answered: grantedSlugs[mfReqSlug(msg)] })!}
+										<!-- QURATOR-137: `answered` carries the standing-grant fact for the SELECTED peer and
+										     this request's slug (refreshGrantState). The derivation stays pure; quarantine-first
+										     and the re-serve branch both outrank it inside deriveManifestFulfil. -->
 										<!-- M17 W7.1b: the fulfilment card is an ADDENDUM below the verbatim message
 													text (same rule as W3). Zero-network at render: state is derived PURELY from
 													(request, own drafts); the export save dialog fires only on click.
