@@ -694,8 +694,26 @@ pub async fn m4_n0_canary() -> Result<(), String> {
         .await
         .map_err(|e| format!("M4 bind_client_endpoint (dial-only) failed: {e}"))?;
 
+    // RELAY-ONLY dial target. Both endpoints are in-process on ONE host, so iroh will hole-punch a
+    // direct local path in milliseconds and never touch n0 — measured: direct=true relay=false, a
+    // green row that would stay green with n0 entirely down, which is the single failure this canary
+    // exists to catch. Strip every non-Relay candidate so the handshake has nowhere to go but
+    // through the home relay, exactly as production's `retain_global_transport_addrs` filters a
+    // ticket's addr set. NOW a pass means n0 routed traffic (QURATOR-167).
+    //
     // The listener's addr (with the relay URL) — the dial target. watch_addr().get() snapshots it.
-    let target = server.watch_addr().get();
+    let mut target = server.watch_addr().get();
+    target.addrs.retain(|a| a.is_relay());
+    if target.addrs.is_empty() {
+        accept_task.abort();
+        drop(server);
+        drop(client);
+        return Err(
+            "M4 the listener's addr carried NO relay transport after filtering — there is no relay \
+             path to test, so a dial here could only ever prove local connectivity."
+                .to_string(),
+        );
+    }
 
     // QURATOR-167: enumerate EVERY transport addr the dialer is being handed, not just the relay.
     // Both endpoints are in-process on ONE host, so a direct path should connect in milliseconds; if
@@ -727,9 +745,30 @@ pub async fn m4_n0_canary() -> Result<(), String> {
 
     let conn = match dial_result {
         Ok(Ok(conn)) => {
+            // WHICH PATH actually carried it. The row's whole purpose is to canary n0, and both
+            // endpoints are in-process on ONE host — so iroh can hole-punch a direct local path and
+            // never touch the relay. Claiming "through the n0 home relay" without checking would
+            // make this canary pass while n0 was entirely down, which is the one failure it exists
+            // to catch. Same inspection M1-live already performs, twenty lines up.
+            let server_id = server.id();
+            let (direct, relay) = match client.remote_info(server_id).await {
+                Some(info) => {
+                    let active: Vec<_> = info
+                        .addrs()
+                        .filter(|a| matches!(a.usage(), iroh::endpoint::TransportAddrUsage::Active))
+                        .collect();
+                    (
+                        active.iter().any(|a| !a.addr().is_relay()),
+                        active.iter().any(|a| a.addr().is_relay()),
+                    )
+                }
+                None => (false, false),
+            };
             eprintln!(
-                "   M4 dial-only endpoint reached the listener through the n0 home relay (ALPN ok); \
-                 bind {:.2}s / dial {:.2}s",
+                "   M4 dial-only endpoint reached the listener (ALPN ok); bind {:.2}s / dial {:.2}s \
+                 — active paths: direct={direct} relay={relay}. A same-host pair can hole-punch \
+                 locally, so direct=true alone does NOT exercise n0's relay; relay=true is the only \
+                 evidence the relay carried traffic.",
                 t_bind.as_secs_f64(),
                 t_dial.as_secs_f64()
             );
