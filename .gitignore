@@ -50,3 +50,8 @@ docs/RULE-PROVENANCE.md
 
 # Claude Code local settings (contains LiteLLM key)
 .claude/settings.local.json
+
+# Documentation is LOCAL-ONLY by owner ruling 2026-09-03 (confidentiality): the repo is public, and
+# design/spec/runbook prose must not reach public observers. README.md is the sole exception.
+*.md
+!README.md
