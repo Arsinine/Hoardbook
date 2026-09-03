@@ -99,8 +99,7 @@ pub enum HbError {
     #[error("this transport ticket has already been redeemed — ask again for a new one")]
     TicketAlreadyRedeemed,
 
-    /// The redeemer is no longer a contact in good standing (blocked, declined, or unknown). The
-    /// redeem-time standing check is what keeps a valid-until-redeemed ticket revocable.
-    #[error("the requester is no longer an approved contact")]
-    TicketRedeemerNotInGoodStanding,
+    // TicketRedeemerNotInGoodStanding — deleted 2026-09-03, QURATOR-177 (owner ruling: blocking
+    // gates chat/DM interaction only). Its only raiser was `authorize_redemption`'s redeem-time
+    // standing arm, removed in the same change.
 }

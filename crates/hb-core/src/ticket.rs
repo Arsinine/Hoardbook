@@ -24,9 +24,9 @@
 //! The 2026-08-31 amendment (QURATOR-137): the authorization a ticket exercises is a **standing
 //! grant per (peer, collection)** — a peer already granted needs no new ask, so "one ticket per
 //! request" in its original one-human-ask sense is dead. What survives unchanged is the mint
-//! discipline: every fetch still mints its own ticket, still consumed on delivery, with live
-//! contact standing re-read at **every** redeem — removing or blocking the contact refuses the
-//! next fetch at this node's own gate. **There is still no time-box.**
+//! discipline: every fetch still mints its own ticket, still consumed on delivery. **There is
+//! still no time-box, and no standing re-read at redeem** — the 2026-07-30 "live standing at
+//! every redeem" clause was withdrawn by owner ruling 2026-09-03 (see below).
 //!
 //! Each property answers a failure the alternatives cause, and each is enforced here rather than
 //! documented:
@@ -48,14 +48,14 @@
 //!    owner approves; the asker's client redeems whenever it next comes online. Time-boxing
 //!    optimizes the wrong failure.
 //!
-//! **Redeem-time contact standing is REQUIRED** (owner ruling 2026-07-30). Valid-until-redeemed
-//! means the ticket alone cannot be the whole authorization: an asker later blocked or declined
-//! must not be able to redeem an older ticket. So [`authorize_redemption`] checks **live standing
-//! at redeem time**, not just ticket validity. It costs nothing — the owner's node is the one
-//! accepting the connection — and it restores revocability without touching the ticket design.
-//! Property 2 makes this defence-in-depth (an adversarial asker deliberately extracting a ticket
-//! from its DM and withholding redemption) rather than routine, but it is the whole difference
-//! between "cannot un-approve" and "can".
+//! **Redeem-time contact standing is WITHDRAWN** (owner ruling 2026-09-03, QURATOR-177: *"Blocks
+//! should only block interaction i.e. chats, it should not meaningfully affect other traffic."*).
+//! From 2026-07-30 until that ruling [`authorize_redemption`] re-read the redeemer's live standing
+//! and refused Blocked/Declined/Unknown, described then as "revocability" — a misnomer the ruling
+//! retired: blocking was never read-access revocation (a mutual contact may re-serve its cached
+//! copy, Carrier 4; a public browse key is a forwardable string), and it now gates chat/DM
+//! interaction only. The check, its `ContactStanding` vocabulary, and its error variant are
+//! deleted. Do not re-introduce a standing input to redemption.
 //!
 //! **Reuse IS offered — as a standing grant, owner ruling 2026-08-31 (QURATOR-137).** The premise
 //! this file used to argue ("no scenario needs repeated fetches") is overruled: a peer already
@@ -81,26 +81,10 @@ pub const TICKET_V: u8 = 1;
 /// direction, distinct from `manifest_request`'s asker→owner. Frozen for the same reason.
 pub const TICKET_TAG: &str = "transport_ticket";
 
-/// Where a redeemer stands with the issuer **right now**, read at redeem time rather than trusted
-/// from the ticket. `Unknown` is deliberately its own case and deliberately refused: a redeemer the
-/// issuer can no longer identify is not "probably fine".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContactStanding {
-    /// A saved contact in good standing.
-    Good,
-    /// Explicitly blocked since the ticket was issued.
-    Blocked,
-    /// Their request was declined since the ticket was issued.
-    Declined,
-    /// Not a known contact (removed, or never saved).
-    Unknown,
-}
-
-impl ContactStanding {
-    fn may_redeem(self) -> bool {
-        matches!(self, ContactStanding::Good)
-    }
-}
+// `ContactStanding` (Good/Blocked/Declined/Unknown) was deleted 2026-09-03, QURATOR-177: its only
+// consumer was `authorize_redemption`'s redeem-time standing arm, withdrawn by the owner ruling
+// that blocking gates chat/DM interaction only. Chat's acceptance gate reads `dm_blocked`
+// directly (`commands/chat.rs`, `route_dm`) and never used this vocabulary.
 
 /// A transport ticket: the address to dial plus the binding that says which request it answers.
 ///
@@ -232,7 +216,7 @@ impl TransportTicket {
     /// holds the address too, and a redeemer that reached us self-evidently found a working address
     /// already. The secret that rode a sealed one-recipient DM is the `request_id`/`ask_nonce`/`slug`
     /// triple, and every one of those is still compared here. `authorize_redemption` then applies the
-    /// live standing and spent checks on top.
+    /// spent check on top.
     #[must_use]
     pub fn matches_issued(&self, issued: &Self) -> bool {
         self.hb == issued.hb
@@ -254,9 +238,9 @@ impl TransportTicket {
 /// caller cannot assert success, only demonstrate it. This must not compile:
 ///
 /// ```compile_fail
-/// # use hb_core::ticket::{authorize_redemption, ContactStanding, TransportTicket};
+/// # use hb_core::ticket::{authorize_redemption, TransportTicket};
 /// let t = TransportTicket::issue("req-1", "slug", "addr", 0, None);
-/// let grant = authorize_redemption(&t, "req-1", false, ContactStanding::Good).unwrap();
+/// let grant = authorize_redemption(&t, "req-1", false).unwrap();
 /// // A dropped connection has no ManifestPayload to hand over, so there is no way to reach
 /// // ConsumedTicket from here. Calling it with nothing is a type error, by design.
 /// let _receipt = grant.into_consumed();
@@ -320,21 +304,22 @@ impl ConsumedTicket {
 
 /// The redeem-time gate, run by the **issuer's** node as it accepts a connection.
 ///
-/// Four checks, in this order, each of which a real failure mode motivates:
+/// Three checks, in this order, each of which a real failure mode motivates:
 ///
 /// 1. the ticket is structurally a ticket of a version we speak;
 /// 2. it answers **this** request (one ticket per ask — no spending A's ticket on B);
-/// 3. it has not already been consumed (replay of a completed transfer);
-/// 4. the redeemer is **still** a contact in good standing (revocability — the property
-///    valid-until-redeemed would otherwise cost).
+/// 3. it has not already been consumed (replay of a completed transfer).
 ///
 /// Deliberately absent: any expiry comparison. There is no clock input, so this function
 /// *cannot* time-box a ticket even by accident.
+///
+/// Also deliberately absent: any contact-standing check (owner ruling 2026-09-03, QURATOR-177 —
+/// blocking gates chat/DM interaction only, and was never read-access revocation). Do not re-add
+/// a standing parameter here.
 pub fn authorize_redemption(
     ticket: &TransportTicket,
     for_request_id: &str,
     already_consumed: bool,
-    standing: ContactStanding,
 ) -> Result<RedemptionGrant, HbError> {
     ticket.verify_shape()?;
     if ticket.request_id != for_request_id {
@@ -342,9 +327,6 @@ pub fn authorize_redemption(
     }
     if already_consumed {
         return Err(HbError::TicketAlreadyRedeemed);
-    }
-    if !standing.may_redeem() {
-        return Err(HbError::TicketRedeemerNotInGoodStanding);
     }
     Ok(RedemptionGrant { request_id: ticket.request_id.clone(), slug: ticket.slug.clone() })
 }
@@ -376,7 +358,7 @@ mod tests {
     #[test]
     fn a_valid_ticket_for_this_request_is_authorized() {
         let grant =
-            authorize_redemption(&ticket(), "req-1", false, ContactStanding::Good).unwrap();
+            authorize_redemption(&ticket(), "req-1", false).unwrap();
         assert_eq!(grant.request_id(), "req-1");
     }
 
@@ -490,12 +472,12 @@ mod tests {
         let mut consumed = false;
 
         // Attempt 1: authorized, then the connection dies. Nothing calls `into_consumed`.
-        let grant = authorize_redemption(&t, "req-1", consumed, ContactStanding::Good).unwrap();
+        let grant = authorize_redemption(&t, "req-1", consumed).unwrap();
         drop(grant);
         assert!(!consumed, "a dropped grant cannot have consumed anything — there is no path");
 
         // Attempt 2: the same ticket still works.
-        let grant = authorize_redemption(&t, "req-1", consumed, ContactStanding::Good)
+        let grant = authorize_redemption(&t, "req-1", consumed)
             .expect("a retry after a failed connection must be authorized");
         let receipt = grant.into_consumed(&delivered());
         consumed = true;
@@ -505,7 +487,7 @@ mod tests {
         // Attempt 3: now that it succeeded, a replay is refused.
         assert!(
             matches!(
-                authorize_redemption(&t, "req-1", consumed, ContactStanding::Good),
+                authorize_redemption(&t, "req-1", consumed),
                 Err(HbError::TicketAlreadyRedeemed)
             ),
             "a completed transfer consumes the ticket and a replay is refused"
@@ -519,7 +501,7 @@ mod tests {
         // Issued a year ago. There is no clock argument to `authorize_redemption` at all, so this
         // cannot depend on elapsed time — which is the point.
         let ancient = TransportTicket::issue("req-1", "my-slug", "node-addr-opaque", 1, None);
-        let grant = authorize_redemption(&ancient, "req-1", false, ContactStanding::Good)
+        let grant = authorize_redemption(&ancient, "req-1", false)
             .expect("a ticket is valid until redeemed, never expired");
         assert_eq!(grant.request_id(), "req-1");
     }
@@ -539,61 +521,52 @@ mod tests {
         }
     }
 
-    /// **The revocation test** — the property that valid-until-redeemed would otherwise cost.
-    #[test]
-    fn a_redeemer_blocked_or_declined_after_approval_is_refused() {
-        let t = ticket();
-        for standing in [ContactStanding::Blocked, ContactStanding::Declined, ContactStanding::Unknown] {
-            assert!(
-                matches!(
-                    authorize_redemption(&t, "req-1", false, standing),
-                    Err(HbError::TicketRedeemerNotInGoodStanding)
-                ),
-                "{standing:?} must not be able to redeem an already-issued ticket"
-            );
-        }
-        // And the ticket itself is untouched — revoking standing is not the same as burning it, so
-        // restoring the contact restores the approval rather than requiring a fresh request.
-        let restored = authorize_redemption(&t, "req-1", false, ContactStanding::Good).unwrap();
-        assert_eq!(restored.request_id(), "req-1");
-    }
+    // DELETED 2026-09-03, QURATOR-177 (owner ruling: *"Blocks should only block interaction i.e.
+    // chats, it should not meaningfully affect other traffic."*):
+    // `a_redeemer_blocked_or_declined_after_approval_is_refused` pinned the withdrawn redeem-time
+    // standing refusal — Blocked / Declined / Unknown refused with `TicketRedeemerNotInGoodStanding`,
+    // restore-to-Good re-admitted. The standing parameter, the arm, the `ContactStanding` type, and
+    // the error variant are all gone, so a blocked redeemer holding a valid unspent ticket now
+    // redeems. Blocking still gates chat/DM (pinned in hb-app's `commands/chat.rs`, e.g.
+    // `proactive_block_refuses_later_dms_and_unblock_restores_acceptance`).
 
     /// **The standing grant as this module sees it** (owner ruling 2026-08-31, QURATOR-137). A
     /// granted peer's next fetch is a NEWLY MINTED ticket: the previous ticket's consumption is
-    /// spent-ticket bookkeeping, not a revoke of the peer. And the grant is re-read live at EVERY
-    /// redeem, so a contact blocked between fetches is refused on the next one — at this node's own
-    /// gate only, NOT system-wide: since Carrier 4 a mutual contact may still re-serve its cached
-    /// copy without consulting the author, and re-keying does not rescue that. Never call this
-    /// end-to-end revocation.
+    /// spent-ticket bookkeeping, not a revoke of the peer. The "re-read live standing at every
+    /// redeem" half of the old pin was WITHDRAWN by owner ruling 2026-09-03 (QURATOR-177:
+    /// blocking gates chat/DM interaction only and must not meaningfully affect other traffic) —
+    /// and it was never end-to-end revocation: since Carrier 4 a mutual contact may still re-serve
+    /// its cached copy without consulting the author, and re-keying does not rescue that. Never
+    /// call blocking revocation.
     ///
     /// P-10 mutations the orchestrator must apply and see red (do not run here):
     /// (a) delete the `if already_consumed { return Err(HbError::TicketAlreadyRedeemed); }` arm in
-    ///     `authorize_redemption` — the replay assertion below must fail;
-    /// (b) delete the `if !standing.may_redeem()` arm in the same function — the Blocked assertion
-    ///     must fail. (This test shares (b) with
-    ///     `a_redeemer_blocked_or_declined_after_approval_is_refused`; (a) is the discriminator
-    ///     unique to this test's first half.)
+    ///     `authorize_redemption` — the replay assertion below must fail.
     /// No edit *inside* this module can redden the "second mint authorizes" half, because the module
-    /// holds no cross-call state — that statelessness is the finding: hb-core needed no code change
-    /// for the ruling, only this pin plus the rationale rewrite above.
+    /// holds no cross-call state — that statelessness is the finding: hb-core's entire change for
+    /// the ruling was deletions (the standing parameter, the `ContactStanding` type, the error
+    /// variant), with no behavioural rewrite beyond what those deletions express.
     #[test]
-    fn a_standing_grant_re_mints_rather_than_replays_and_is_rechecked_every_redeem() {
+    fn a_standing_grant_re_mints_rather_than_replays() {
         // Fetch 1: the granted peer redeems ticket req-1 successfully.
         let first = ticket();
-        let grant = authorize_redemption(&first, "req-1", false, ContactStanding::Good).unwrap();
+        let grant = authorize_redemption(&first, "req-1", false).unwrap();
         let _receipt = grant.into_consumed(&delivered());
 
         // That ticket is spent: a replay of it is refused — spent-ticket bookkeeping.
         assert!(
             matches!(
-                authorize_redemption(&first, "req-1", true, ContactStanding::Good),
+                authorize_redemption(&first, "req-1", true),
                 Err(HbError::TicketAlreadyRedeemed)
             ),
             "consuming one ticket never licenses a replay of the same ticket"
         );
 
         // Fetch 2 — same peer, same collection, no new ask needed: a FRESH mint authorizes. The
-        // prior consumption is not a revoke of the grant.
+        // prior consumption is not a revoke of the grant. Standing is not consulted at all
+        // (QURATOR-177), so this holds for a blocked or removed peer exactly as for a good-standing
+        // one — the seam-level pins for that live in hb-app (`manifest_source.rs`,
+        // `auto_approve.rs`).
         let second = TransportTicket::issue(
             "req-2",
             "my-slug",
@@ -601,39 +574,9 @@ mod tests {
             1_700_000_100,
             Some("nonce-2"),
         );
-        let grant = authorize_redemption(&second, "req-2", false, ContactStanding::Good)
+        let grant = authorize_redemption(&second, "req-2", false)
             .expect("a granted peer's next fetch is a new ticket, not a replay of the spent one");
         drop(grant); // not delivered — costs nothing, and does not touch the grant
-
-        // Blocked between fetches: the NEXT fetch is refused, here, at this node's own gate.
-        let third = TransportTicket::issue(
-            "req-3",
-            "my-slug",
-            "node-addr-opaque",
-            1_700_000_200,
-            Some("nonce-3"),
-        );
-        assert!(
-            matches!(
-                authorize_redemption(&third, "req-3", false, ContactStanding::Blocked),
-                Err(HbError::TicketRedeemerNotInGoodStanding)
-            ),
-            "blocking the contact must refuse the next fetch at this node's gate"
-        );
-
-        // Unblocked again: the following fetch mints and authorizes — refusal is per-check, not
-        // sticky, and no time-box intervenes.
-        let fourth = TransportTicket::issue(
-            "req-4",
-            "my-slug",
-            "node-addr-opaque",
-            1_700_000_300,
-            Some("nonce-4"),
-        );
-        assert!(
-            authorize_redemption(&fourth, "req-4", false, ContactStanding::Good).is_ok(),
-            "restoring the contact restores the grant — the refusal was the standing read, not a burn"
-        );
     }
 
     /// **One ticket per ask** — a ticket cannot be spent on a different request or collection.
@@ -646,7 +589,7 @@ mod tests {
         let t = ticket();
         assert!(
             matches!(
-                authorize_redemption(&t, "req-2", false, ContactStanding::Good),
+                authorize_redemption(&t, "req-2", false),
                 Err(HbError::InvalidTicket(_))
             ),
             "a ticket issued for req-1 must not redeem req-2"

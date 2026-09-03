@@ -564,8 +564,10 @@ async fn approve_request(
     slug: &str,
     ask_nonce: Option<&str>,
 ) -> Result<()> {
-    // (1) Save the asker as a contact in good standing (contact_standing returns Good, which
-    // authorize_redemption requires). The auto-approve policy trusts any asker — a real human reviews.
+    // (1) Save the asker as a contact — the realistic world the approval runs in (a standing
+    // gate used to require Good here; withdrawn by owner ruling 2026-09-03, QURATOR-177, so the
+    // save is now realism, not a requirement). The auto-approve policy trusts any asker — a real
+    // human reviews.
     // This is the harness's ONLY deviation from the production approval, and it must run BEFORE the
     // approval call: in production the human's contact already exists, so `send_full_list_inner` never
     // creates one.
@@ -625,7 +627,7 @@ fn load_or_create_identity(store: &DataStore) -> Result<AppIdentity> {
 // WAN-M serve setup — seed a collection, bind the endpoint, mint a ticket
 //
 // All production paths: scan_selective + save_collection_draft (the add-collection scan), the
-// contact save (so contact_standing returns Good for the asker), record_manifest_ask (so the
+// contact save (realism: production's asker is a known contact), record_manifest_ask (so the
 // probe's claim_manifest_ask passes), ensure_endpoint with Role::Listen (the real accept loop +
 // in-flight set), issue_ticket + record_issued_ticket (the real mint+authorize path, so
 // consumed-exactly-once is the REAL mechanism).
@@ -665,11 +667,11 @@ async fn setup_manifest_plane(
     seed_collection(store, &identity, &browse_key, seed_dir, slug)?;
     eprintln!("[serve] seeded collection '{slug}' from {seed_dir}");
 
-    // (2) Add the asker as a contact in good standing — contact_standing returns Good, which
-    // authorize_redemption requires. browse_key_hex is None on the asker side; the serve never
-    // decrypts the asker's listings (it is the owner here).
+    // (2) Add the asker as a contact — realism, not a gate (no standing is read on the serve path
+    // since owner ruling 2026-09-03, QURATOR-177). browse_key_hex is None on the asker side; the
+    // serve never decrypts the asker's listings (it is the owner here).
     save_asker_contact(store, asker_npub)?;
-    eprintln!("[serve] asker {asker_npub} saved as a contact (Good standing)");
+    eprintln!("[serve] asker {asker_npub} saved as a contact");
 
     // (3) Record a manifest ask the probe's claim gate expects — same nonce the ticket will echo.
     // The harness owns both sides, so the nonce is harness-chosen and known to both.
@@ -773,8 +775,9 @@ fn seed_collection(
     Ok(())
 }
 
-/// Save `asker_npub` as a contact with no browse-key (the serve never browses the asker). This is
-/// enough for `contact_standing` to return `Good`, which `authorize_redemption` requires.
+/// Save `asker_npub` as a contact with no browse-key (the serve never browses the asker). Realism
+/// only: no standing is read on the serve path (owner ruling 2026-09-03, QURATOR-177 — blocking
+/// gates chat/DM interaction only).
 fn save_asker_contact(store: &DataStore, asker_npub: &str) -> Result<()> {
     let contact = crate::store::CachedPeer {
         npub: asker_npub.to_string(),

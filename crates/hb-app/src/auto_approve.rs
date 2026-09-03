@@ -35,9 +35,14 @@
 //!   1. a standing grant exists for `(sender_npub, author, slug)` — the owner approved this exact
 //!      triple before. The AUTHOR is part of the key (see `standing_grant_key`): a grant over this
 //!      node's own `films` is not a grant over some third party's `films`.
-//!   2. `contact_standing(store, sender_npub) == Good` — the peer is a live, unblocked, undeclined
-//!      contact right now. This is re-read on EVERY auto-approval, and again at redeem time by
-//!      `authorize_redemption`; blocking or removing the contact stops both.
+//!   2. the cap budget allows another approval for this pair (and globally).
+//!
+//! A live-standing check used to sit between them, requiring `ContactStanding::Good` (re-read
+//! every request and again at redeem). It was withdrawn by owner ruling 2026-09-03, QURATOR-177
+//! (*"Blocks should only block interaction i.e. chats, it should not meaningfully affect other
+//! traffic."*): blocking gates chat/DM interaction only — never the approval mint and never the
+//! serve. Grants are permanent (owner ruling 2026-09-03), so for a granted pair there is
+//! deliberately no second veto left to re-introduce.
 //!
 //! A request that fails either check is not an error — it is today's behaviour: the DM stays for
 //! the human. The loop never creates contacts (the WAN harness's `save_asker_contact` is
@@ -75,13 +80,11 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use hb_core::ticket::ContactStanding;
 use nostr::prelude::*;
 
 use crate::commands::chat::decode_dms;
 use crate::commands::fulfil::send_full_list_inner;
 use crate::identity_state::SharedIdentity;
-use crate::manifest_source::contact_standing;
 use crate::net::{self, SharedRelay};
 use crate::store::DataStore;
 use crate::transport_state::SharedEndpoint;
@@ -236,14 +239,11 @@ fn should_auto_approve(
         .ok()
         .flatten()?;
 
-    // (2) Live standing, re-read on every request — the same re-read redeem-time
-    // `authorize_redemption` performs. Blocked → Declined → contact-hood; a removed contact is
-    // `Unknown`. Only `Good` auto-approves; anything else falls back to the human.
-    if contact_standing(store, sender_npub) != ContactStanding::Good {
-        return None;
-    }
-
-    // (3) The caps. Exhausted budget falls back to the human exactly like (1) and (2) do.
+    // (2) The caps. Exhausted budget falls back to the human exactly like (1) does. (A live-standing
+    // check used to sit here as step 2, requiring `ContactStanding::Good`; withdrawn by owner
+    // ruling 2026-09-03, QURATOR-177 — blocking gates chat/DM interaction only. Do not re-add it:
+    // with permanent grants it would be a silent second veto over an approval the owner already
+    // gave, and it was never read-access revocation to begin with.)
     let pair_key = crate::store::standing_grant_key(sender_npub, body.author_npub.as_deref(), &body.slug);
     if !caps.allows(&pair_key, now) {
         return None;
@@ -256,7 +256,7 @@ fn should_auto_approve(
 ///
 /// Modelled on the WAN harness's `run_auto_approve_loop` (`wan_it/mod.rs`), with the one deviation
 /// that matters removed: the harness approves *any* asker because it has no human; this loop
-/// approves only on a standing grant plus live good standing, and creates no contacts.
+/// approves only on a standing grant within cap budget, and creates no contacts.
 pub(crate) async fn run_auto_approve_loop(
     store: DataStore,
     live_npub: SharedIdentity,
@@ -282,7 +282,7 @@ pub(crate) async fn run_auto_approve_loop(
     // **Bounded on purpose.** The nonce is attacker-chosen, so a peer can mint unboundedly many
     // distinct dedup keys. Once the set is full it is CLEARED, not refused — the worst a flood
     // achieves is that already-seen request-DMs get re-decided, and every one of those decisions
-    // runs the full grant + standing + caps gate again (a granted pair then hits its 60 s
+    // runs the full grant + caps gate again (a granted pair then hits its 60 s
     // cooldown; an ungranted one is refused outright). A cache that protects memory by denying
     // service would be the rate-limit-as-denial failure the caps forbid.
     let mut seen_request_ids: HashSet<String> = HashSet::new();
@@ -301,7 +301,7 @@ pub(crate) async fn run_auto_approve_loop(
 
     tracing::info!(
         poll_secs = AUTO_APPROVE_POLL_INTERVAL.as_secs(),
-        "auto-approve: loop started (grant + live standing + caps gate every approval)"
+        "auto-approve: loop started (grant + caps gate every approval)"
     );
     loop {
         // The identity snapshot for THIS poll (see the note above on why per-poll, not once).
@@ -361,7 +361,7 @@ pub(crate) async fn run_auto_approve_loop(
         let batch_newest = wraps.iter().map(|w| w.created_at.as_u64()).max().unwrap_or(0);
         newest_seen_outer = newest_seen_outer.max(batch_newest.min(now_outer));
 
-        // Decode with no contact filter — the grant + standing checks below are the filter. A wrap
+        // Decode with no contact filter — the grant + caps checks below are the filter. A wrap
         // not addressed to us is skipped inside `decode_dms` (NIP-17 seal verification), so a
         // stranger's gift-wrap cannot forge a sender.
         let msgs = decode_dms(&own_npub, &identity, wraps, None).await;
@@ -383,7 +383,7 @@ pub(crate) async fn run_auto_approve_loop(
                 seen_request_ids.clear();
                 tracing::debug!(
                     "auto-approve: dedup set full ({SEEN_REQUESTS_MAX}) — cleared; every \
-                     re-decided request still runs the full grant+standing+caps gate"
+                     re-decided request still runs the full grant+caps gate"
                 );
             }
 
@@ -396,7 +396,7 @@ pub(crate) async fn run_auto_approve_loop(
                 tracing::debug!(
                     sender = %crate::logging::trunc_npub(&msg.from),
                     slug = %body.slug,
-                    "auto-approve: left for the human (no grant / standing not Good / caps exhausted)"
+                    "auto-approve: left for the human (no grant / caps exhausted)"
                 );
                 continue;
             };
@@ -471,8 +471,10 @@ mod tests {
         id.public_key().to_bech32().unwrap()
     }
 
-    /// A saved contact in good standing — production's precondition for every auto-approval. Built
-    /// through the real `save_contact` path so the test ends where production ends.
+    /// A saved contact — the realistic shape of a granted peer. Built through the real
+    /// `save_contact` path so the test ends where production ends. (It used to assert the contact
+    /// read as `ContactStanding::Good`; that vocabulary was deleted 2026-09-03, QURATOR-177, and
+    /// the helper keeps its name because every caller still means "a peer we know".)
     fn save_contact_in_good_standing(store: &DataStore, npub: &str) {
         let peer = CachedPeer {
             npub: npub.to_string(),
@@ -491,10 +493,9 @@ mod tests {
         store
             .save_contact(&CachedPeer::pubkey_hash(npub), &peer)
             .expect("save_contact must succeed on a fresh store");
-        assert_eq!(
-            contact_standing(store, npub),
-            ContactStanding::Good,
-            "precondition: the saved contact must read as Good before the test asserts anything"
+        assert!(
+            store.load_contact(&CachedPeer::pubkey_hash(npub)).expect("contact read").is_some(),
+            "precondition: the contact is really saved before the test asserts anything"
         );
     }
 
@@ -541,15 +542,28 @@ mod tests {
         );
     }
 
-    /// Blocked beats the grant. Blocking is RESOURCE control, not revocation (owner ruling
-    /// 2026-09-01), but it DOES stop the auto-approval mint — a blocked peer must not consume this
-    /// node's endpoint or serve slots through this loop. The request stays for the human.
+    // DELETED 2026-09-03, QURATOR-177 (owner ruling: *"Blocks should only block interaction i.e.
+    // chats, it should not meaningfully affect other traffic."*): `blocked_contact_with_a_grant_
+    // is_not_auto_approved` pinned the opposite of the ruling — that a blocked peer's grant was
+    // vetoed at the auto-approve gate. It is replaced by the test directly below, which pins the
+    // ruled behaviour: the grant alone authorises, blocking changes nothing here, and blocking's
+    // remaining enforcement (chat/DM acceptance) stays pinned in `commands/chat.rs` by
+    // `proactive_block_refuses_later_dms_and_unblock_restores_acceptance`.
+
+    /// **Blocking does not gate the auto-approve mint** (owner ruling 2026-09-03, QURATOR-177).
+    /// A BLOCKED peer holding a standing grant is auto-approved exactly as an unblocked one is:
+    /// the grant is permanent, the caps still bind independently, and blocking's enforcement is
+    /// chat/DM interaction only. (A blocked peer cannot DELIVER a new ask over chat — that is
+    /// chat gating, and it is `commands/chat.rs`'s to enforce — but this test pins the decision
+    /// function itself, so a re-introduced standing veto anywhere in `should_auto_approve` reds
+    /// it regardless of delivery.)
     ///
-    /// MUTATION (P-10) — resolved by containing function: in `should_auto_approve`, delete the
-    /// `if contact_standing(...) != ContactStanding::Good { return None; }` block. This test reds
-    /// (a blocked peer starts auto-approving).
+    /// MUTATION (P-10) — the orchestrator applies this and must see this test red: in
+    /// `should_auto_approve` (this file), re-introduce a standing veto between steps (1) and (2),
+    /// e.g. `if store.load_dm_blocked().map(|b| b.iter().any(|n| n == sender_npub)).unwrap_or(false)
+    /// { return None; }`. The blocked-peer expectation reds (decision becomes None).
     #[test]
-    fn blocked_contact_with_a_grant_is_not_auto_approved() {
+    fn a_blocked_peer_with_a_grant_is_still_auto_approved() {
         let (_dir, store) = store();
         let peer = npub_of(&Identity::generate());
         save_contact_in_good_standing(&store, &peer);
@@ -557,17 +571,22 @@ mod tests {
             .record_standing_grant(&peer, None, "vault", 1)
             .expect("precondition: grant write must succeed");
         store.save_dm_blocked(std::slice::from_ref(&peer)).unwrap();
-        assert_eq!(
-            contact_standing(&store, &peer),
-            ContactStanding::Blocked,
-            "precondition: the peer must read as Blocked before asserting the decision"
+        assert!(
+            store.load_dm_blocked().unwrap().iter().any(|n| n == &peer),
+            "precondition: the peer really is blocked before asserting the decision"
         );
 
         let mut caps = AutoApproveCaps::default();
+        should_auto_approve(&store, &mut caps, &peer, &body("vault", None), 1_700_000_500)
+            .expect("a blocked peer with a valid grant MUST still auto-approve (owner ruling 2026-09-03)");
+
+        // The caps are the independent bound: exhausted budget still falls to the human, blocked
+        // or not. Same rig as the caps tests below — record a use, ask again inside the window.
+        let key = crate::store::standing_grant_key(&peer, None, "vault");
+        caps.record(&key, 1_700_000_700);
         assert!(
-            should_auto_approve(&store, &mut caps, &peer, &body("vault", None), 1_700_000_500)
-                .is_none(),
-            "a blocked contact must never auto-approve, grant or no grant"
+            should_auto_approve(&store, &mut caps, &peer, &body("vault", None), 1_700_000_710).is_none(),
+            "caps bind a blocked peer exactly as they bind an unblocked one — independent of standing"
         );
     }
 

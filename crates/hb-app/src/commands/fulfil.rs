@@ -186,10 +186,14 @@ pub(crate) async fn send_full_list_inner(
 
     // (2) Record before the DM, so a redeemer always presents a ticket we can recognise.
     // **Canonicalize the recipient before storing it.** `parse_recipient` also accepts a full `hbk`
-    // share code, but contacts are keyed by canonical npub and `contact_standing` hashes whatever is
-    // stored here. Persisting the raw input meant an `hbk` caller stored a share code, the later
-    // lookup missed, standing came back `Unknown`, and a ticket this node had legitimately issued and
-    // delivered was refused at redemption.
+    // share code, but standing grants are keyed by canonical npub (`standing_grant_key`), and this
+    // field is the provenance for that key. Persisting the raw input means an `hbk` caller stores a
+    // share code, the later grant lookup misses, and a peer this node legitimately authorized is
+    // refused. **This got MORE load-bearing, not less, under QURATOR-177:** the grant is now the
+    // authorization, so a mis-keyed npub is an auth failure rather than a downgrade.
+    // (The original wording blamed `contact_standing` returning `Unknown` at redemption. That
+    // function and that refusal are gone — owner ruling 2026-09-03, blocking gates chat/DM only —
+    // but the canonicalization it motivated is still required, for the reason above.)
     let redeemer_npub = crate::commands::chat::npub_of(&recipient);
     store
         .record_issued_ticket(&IssuedTicketRecord {

@@ -1117,8 +1117,10 @@ pub async fn has_standing_grant(
 /// `record_standing_grant` use, so a grant recorded by one path is found by the other.
 ///
 /// **This answers the GRANT FACT only — never auto-approve suitability.** The loop additionally
-/// requires live `ContactStanding::Good` and cap budget (`auto_approve`, steps 2-3); folding those
-/// in here would make the card hide its verb for a request the machine actually left for the human.
+/// requires cap budget (`auto_approve`, step 2); folding that in here would make the card hide its
+/// verb for a request the machine actually left for the human. (A live `ContactStanding::Good`
+/// requirement used to sit there too; withdrawn by owner ruling 2026-09-03, QURATOR-177 — blocking
+/// gates chat/DM interaction only, never the approval mint.)
 pub(crate) fn has_standing_grant_inner(
     store: &DataStore,
     peer_npub: &str,

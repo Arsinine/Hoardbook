@@ -1418,12 +1418,15 @@ pub fn standing_grant_key(npub: &str, author_npub: Option<&str>, slug: &str) -> 
 /// The persisted record of one approval: the ticket verbatim (so redemption compares against the
 /// exact bytes issued, not a reconstruction), who it was addressed to, and whether it has been spent.
 ///
-/// **`redeemer_npub` is stored rather than the standing** — standing is re-read at redeem time by
-/// owner ruling (2026-07-30), so freezing it here would defeat revocability.
+/// **`redeemer_npub` is provenance, not a gate.** A live standing used to be re-read from it at
+/// redeem time (owner ruling 2026-07-30); that re-read was withdrawn by owner ruling 2026-09-03,
+/// QURATOR-177 — blocking gates chat/DM interaction only, so nothing on the serve path consults
+/// this npub to refuse. `fulfil.rs`'s `record_standing_grant` still reads it to key the grant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssuedTicketRecord {
     pub ticket: hb_core::TransportTicket,
-    /// The npub this ticket was DM'd to — whose live standing gates the redemption.
+    /// The npub this ticket was DM'd to — provenance for grant keying (`record_standing_grant`),
+    /// never consulted to refuse a redemption (owner ruling 2026-09-03, QURATOR-177).
     pub redeemer_npub: String,
     /// Unix seconds the asker's receipt landed; `None` while the ticket is unspent.
     pub consumed_at: Option<u64>,

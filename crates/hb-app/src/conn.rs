@@ -28,8 +28,6 @@ pub(crate) async fn drain_connection(conn: &iroh::endpoint::Connection) {
 
 #[cfg(test)]
 mod tests {
-    use hb_core::ticket::ContactStanding;
-
     use crate::transport::tests::{bind_local_endpoint, loopback_addr, real_payload_for, TestSource};
     use crate::transport::{fetch_manifest, ManifestPlane, MANIFEST_ALPN};
     use hb_core::ticket::TransportTicket;
@@ -44,10 +42,6 @@ mod tests {
             let addr = serde_json::to_string(&loopback_addr(&server)).unwrap();
             let ticket = TransportTicket::issue("req-1", "small", &addr, 1_700_000_000, Some("nonce-1"));
             let source = TestSource::new(ticket.clone(), real_payload_for("small", 10));
-            // Blocked standing ⇒ every round takes the refusal path, the smallest response the
-            // plane writes and the documented deterministic loss without the drain.
-            *source.standing.lock().unwrap() = ContactStanding::Blocked;
-
             let accept_ep = server.clone();
             let plane = ManifestPlane::new(source.clone());
             tokio::spawn(async move {
@@ -60,13 +54,22 @@ mod tests {
             });
 
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
+            // Spend the ticket first, then replay: every round takes the refusal path, the
+            // smallest response the plane writes and the documented deterministic loss without the
+            // drain. (This rig used to set `TestSource.standing` to `Blocked`; that serve-path
+            // standing check was withdrawn by owner ruling 2026-09-03, QURATOR-177 — blocking
+            // gates chat/DM interaction only — so the spent ticket is now the way to force a
+            // refusal. Wait for the receipt before replaying so the test races no bookkeeping.)
+            fetch_manifest(&client, &ticket, |_| Ok(())).await.expect("the first redemption succeeds");
+            crate::transport::tests::await_receipt(&source).await;
+
             for round in 0..3 {
                 let err = fetch_manifest(&client, &ticket, |_| Ok(()))
                     .await
-                    .expect_err("a blocked redeemer must be refused");
-                let msg = err.to_string();
+                    .expect_err("a replay of a consumed ticket must be refused");
+                let msg = err.to_string().to_lowercase();
                 assert!(
-                    msg.contains("no longer an approved contact"),
+                    msg.contains("already") || msg.contains("redeem"),
                     "round {round}: the refusal must arrive intact, got: {msg}"
                 );
             }

@@ -44,13 +44,15 @@
 //!
 //! There is no binding token here and the retired follower gate is **not** re-imported. The asker
 //! presents the [`TransportTicket`] it received, and the owner's node checks it against what it
-//! actually issued for that request, then runs [`authorize_redemption`] — which additionally
-//! refuses a redeemer whose contact standing has changed since approval (the revocation property
-//! that "valid until redeemed" would otherwise cost).
+//! actually issued for that request, then runs [`authorize_redemption`]. A redeem-time contact
+//! standing check used to run here too, withdrawn by owner ruling 2026-09-03 (QURATOR-177):
+//! blocking gates chat/DM interaction only — and it was never read-access revocation, since a
+//! mutual contact may re-serve a cached copy (Carrier 4) and a public browse key is a single
+//! forwardable string.
 //!
 //! The ticket rode a **sealed NIP-17 DM to one recipient**, so presenting it back is evidence of
 //! receipt — but note precisely what it is: a **BEARER capability**. The owner verifies the ticket
-//! and the *stored recipient's* live standing; it does not authenticate the connecting peer as that
+//! and the spent bit; it does not authenticate the connecting peer as the
 //! recipient, and it cannot, because this design deliberately has no `npub`→node-key map to check
 //! against. A recipient who forwards the ticket JSON lets someone else dial and spend it. What that
 //! costs is the OWNER's address plus one ciphertext delivery — binding a ticket to the asker's
@@ -77,9 +79,7 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use hb_core::ticket::{
-    authorize_redemption, ConsumedTicket, ContactStanding, TransportTicket, TICKET_TAG,
-};
+use hb_core::ticket::{authorize_redemption, ConsumedTicket, TransportTicket, TICKET_TAG};
 use hb_core::{ManifestPayload, MANIFEST_MAX_TRANSPORT_BYTES};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -151,16 +151,12 @@ pub struct FetchRequest {
     pub ticket: TransportTicket,
 }
 
-/// What the owner's node knows about a request at redeem time: the ticket it *actually issued*, the
-/// redeemer's **live** standing, and whether the ticket has already been spent.
-///
-/// The standing is read here rather than carried in the ticket deliberately — a ticket is valid
-/// until redeemed, so standing must be evaluated at redemption or a peer blocked after approval
-/// could still redeem (owner ruling 2026-07-30).
+/// What the owner's node knows about a request at redeem time: the ticket it *actually issued*, and
+/// whether it has already been spent. The live-standing field it used to carry was removed by owner
+/// ruling 2026-09-03 (QURATOR-177) — blocking gates chat/DM interaction only, never serving.
 #[derive(Debug, Clone)]
 pub struct IssuedTicket {
     pub ticket: TransportTicket,
-    pub standing: ContactStanding,
     pub already_consumed: bool,
 }
 
@@ -378,12 +374,7 @@ pub(crate) async fn serve_manifest_stream(
         return Ok(None);
     }
 
-    let grant = match authorize_redemption(
-        &issued.ticket,
-        &req.request_id,
-        issued.already_consumed,
-        issued.standing,
-    ) {
+    let grant = match authorize_redemption(&issued.ticket, &req.request_id, issued.already_consumed) {
         Ok(g) => g,
         Err(e) => {
             refuse(&mut send, &format!("ticket refused: {e}")).await?;
@@ -1082,7 +1073,6 @@ pub(crate) mod tests {
     /// A `ManifestSource` over a single approved request, recording what it consumed.
     pub(crate) struct TestSource {
         pub ticket: TransportTicket,
-        pub standing: Mutex<ContactStanding>,
         pub consumed: Mutex<Vec<ConsumedTicket>>,
         pub payload: ManifestPayload,
         /// Rig the source to answer with this payload regardless of the slug asked for — the
@@ -1130,7 +1120,6 @@ pub(crate) mod tests {
         pub(crate) fn new(ticket: TransportTicket, payload: ManifestPayload) -> Arc<Self> {
             Arc::new(Self {
                 ticket,
-                standing: Mutex::new(ContactStanding::Good),
                 consumed: Mutex::new(Vec::new()),
                 payload,
                 serve_instead: Mutex::new(None),
@@ -1164,7 +1153,6 @@ pub(crate) mod tests {
             }
             Some(IssuedTicket {
                 ticket: self.ticket.clone(),
-                standing: *self.standing.lock().unwrap(),
                 already_consumed: !self.consumed.lock().unwrap().is_empty(),
             })
         }
@@ -1278,7 +1266,7 @@ pub(crate) mod tests {
     /// manifest the ticket is not yet marked spent. That ordering is deliberate: a transfer the peer
     /// never finished reading has not succeeded and must not burn the ticket. Asserting on
     /// `consumed` without this wait is a race — it read 0 on the first run of the multi-MB case.
-    async fn await_receipt(source: &TestSource) -> ConsumedTicket {
+    pub(crate) async fn await_receipt(source: &TestSource) -> ConsumedTicket {
         for _ in 0..100 {
             if let Some(r) = source.consumed.lock().unwrap().first().cloned() {
                 return r;
@@ -1365,32 +1353,56 @@ pub(crate) mod tests {
         .expect("test timed out");
     }
 
-    /// **The revocation test, end to end.** An asker blocked after approval is refused at redeem
-    /// time — and the ticket is not burned, so restoring standing restores the approval rather than
-    /// forcing a fresh request.
+    // DELETED 2026-09-03, QURATOR-177 (owner ruling: *"Blocks should only block interaction i.e.
+    // chats, it should not meaningfully affect other traffic."*):
+    // `a_redeemer_blocked_after_approval_is_refused_then_restored` pinned the withdrawn
+    // serve-path standing refusal end to end — rig `TestSource.standing` to `Blocked` mid-flight,
+    // assert the fetch errors naming the standing check, restore to `Good`, assert it succeeds.
+    // Its replacement, pinning the OPPOSITE (a blocked redeemer holding a valid unspent ticket is
+    // served), is `a_blocked_redeemer_with_a_valid_ticket_is_still_served` below. The
+    // `TestSource.standing` rig itself is gone; the drain test in `conn.rs` now forces the
+    // refusal path with a consumed ticket instead.
+
+    /// **Blocking does not gate the serve path** (owner ruling 2026-09-03, QURATOR-177: *"Blocks
+    /// should only block interaction i.e. chats, it should not meaningfully affect other
+    /// traffic."*). This replaces the deleted `a_redeemer_blocked_after_approval_is_refused_then_
+    /// restored`, which pinned the opposite. The plane's `IssuedTicket` no longer carries a
+    /// standing at all, so a redeemer whose contact the owner has blocked — or removed, or
+    /// declined — is served a manifest it holds a valid unspent ticket for, exactly as a
+    /// good-standing redeemer is. Blocking's remaining enforcement is chat/DM acceptance, pinned in
+    /// `commands/chat.rs` (`proactive_block_refuses_later_dms_and_unblock_restores_acceptance`).
+    ///
+    /// The assertion is the plane's own observable: the fetch SUCCEEDS and the receipt is
+    /// recorded — not merely "no standing-naming refusal", which a compile error would also
+    /// satisfy. (The string "no longer an approved contact" is deleted from the codebase, so a
+    /// re-introduced standing check could not re-use it verbatim.)
+    ///
+    /// MUTATION (P-10) — the orchestrator applies this and must see this test red: in
+    /// `serve_manifest_stream` (this file), after the `if !req.ticket.matches_issued(&issued.ticket)`
+    /// block, insert a fresh standing refusal, e.g.
+    ///   if source_blocking_hint(&issued) { refuse(&mut send, "no longer an approved contact").await?; return Ok(None); }
+    /// where `source_blocking_hint` is a new `fn(&IssuedTicket) -> bool { true }` in this file —
+    /// i.e. ANY re-introduced standing gate on the serve path reds this test, because the fetch
+    /// that expects success errors. (Restoring the old arm verbatim needs the standing field, which
+    /// no longer exists — that is the point of deleting the field rather than ignoring it.)
     #[tokio::test]
-    async fn a_redeemer_blocked_after_approval_is_refused_then_restored() {
+    async fn a_blocked_redeemer_with_a_valid_ticket_is_still_served() {
         tokio::time::timeout(TEST_TIMEOUT, async {
             let (server, source, ticket) = spawn_plane(50, "small").await;
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
 
-            *source.standing.lock().unwrap() = ContactStanding::Blocked;
-            let err = fetch_manifest(&client, &ticket, |_| Ok(()))
-                .await
-                .expect_err("a blocked redeemer must be refused");
-            assert!(
-                err.to_string().contains("no longer an approved contact"),
-                "the refusal must name the standing check, got: {err}"
-            );
-            assert!(
-                source.consumed.lock().unwrap().is_empty(),
-                "a refused redemption must not consume the ticket"
-            );
-
-            *source.standing.lock().unwrap() = ContactStanding::Good;
+            // No standing rig exists to set: blocking a contact changes nothing the plane can see.
+            // The blocked redeemer holds a valid, unspent ticket, so the fetch must succeed and
+            // the receipt must land.
             fetch_manifest(&client, &ticket, |_| Ok(()))
                 .await
-                .expect("restoring the contact restores the approval — the ticket was not burned");
+                .expect("a blocked redeemer holding a valid unspent ticket must still be served");
+            await_receipt(&source).await;
+            assert_eq!(
+                source.consumed.lock().unwrap().len(),
+                1,
+                "the serve must complete normally — one receipt, the same as any redemption"
+            );
 
             client.close().await;
             server.close().await;

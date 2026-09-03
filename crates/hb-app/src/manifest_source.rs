@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use hb_core::{ContactStanding, Identity, ManifestPayload};
+use hb_core::{Identity, ManifestPayload};
 
 use crate::commands::collection::build_slug_manifest;
 use crate::identity_state::SessionBrowseKey;
@@ -29,26 +29,12 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Read `npub`'s **live** standing with this identity, in the order that makes the strictest answer
-/// win: an explicit block, then an explicit decline, then contact-hood.
-///
-/// `Unknown` is returned for a peer that is not a saved contact — deliberately, and deliberately
-/// refused by `authorize_redemption`. A redeemer this node can no longer identify is not "probably
-/// fine": if the contact was removed since the approval, the human who approved it is no longer in a
-/// relationship with the asker, and the ticket should not outlive that.
-pub fn contact_standing(store: &DataStore, npub: &str) -> ContactStanding {
-    if store.load_dm_blocked().map(|b| b.iter().any(|n| n == npub)).unwrap_or(false) {
-        return ContactStanding::Blocked;
-    }
-    if store.load_dm_declined().map(|d| d.iter().any(|(n, _)| n == npub)).unwrap_or(false) {
-        return ContactStanding::Declined;
-    }
-    let known = store
-        .load_contact(&crate::store::CachedPeer::pubkey_hash(npub))
-        .map(|c| c.is_some())
-        .unwrap_or(false);
-    if known { ContactStanding::Good } else { ContactStanding::Unknown }
-}
+// `contact_standing(store, npub) -> ContactStanding` (strictest-wins: blocked → declined →
+// contact-hood → Unknown) was deleted 2026-09-03, QURATOR-177 (owner ruling: *"Blocks should only
+// block interaction i.e. chats, it should not meaningfully affect other traffic."*). Its only two
+// production callers were the standing reads this change removed from `issued()` below and from
+// `auto_approve`'s step (2). Blocking still gates chat/DM acceptance — `commands/chat.rs` reads
+// `dm_blocked` directly and never used this vocabulary.
 
 /// The session's [`ManifestSource`]: the data directory plus the two keys needed to author an
 /// envelope. Holds owned copies because the plane's accept loop outlives any request handler.
@@ -65,15 +51,15 @@ impl StoreManifestSource {
 }
 
 impl ManifestSource for StoreManifestSource {
-    /// What this node issued for `request_id`, with standing re-read now rather than trusted from
-    /// the record. `None` for an id we never issued — which is the same refusal a forged ticket gets,
-    /// by way of the shared constant in `transport.rs`.
+    /// What this node issued for `request_id`. `None` for an id we never issued — which is the same
+    /// refusal a forged ticket gets, by way of the shared constant in `transport.rs`. Deliberately
+    /// NOT read here: any live contact standing — blocking, removing, or declining the redeemer
+    /// changes nothing on the serve path (owner ruling 2026-09-03, QURATOR-177: blocking gates
+    /// chat/DM interaction only). The ticket itself and the spent bit are the whole decision.
     fn issued(&self, request_id: &str) -> Option<IssuedTicket> {
         let rec = self.store.load_issued_ticket(request_id).ok().flatten()?;
-        let standing = contact_standing(&self.store, &rec.redeemer_npub);
         Some(IssuedTicket {
             ticket: rec.ticket,
-            standing,
             already_consumed: rec.consumed_at.is_some(),
         })
     }
@@ -327,32 +313,88 @@ mod tests {
         assert!(store.load_issued_ticket("never-issued").unwrap().is_none());
     }
 
-    /// Standing is read at redeem time, so blocking a contact after approval refuses the redemption
-    /// **without** spending the ticket (owner ruling 2026-07-30: restoring the contact restores the
-    /// approval). This asserts the standing half; `hb_core::ticket` owns the no-spend half.
-    #[test]
-    fn blocking_a_contact_after_approval_downgrades_its_standing() {
-        let (_dir, store) = store();
-        let npub = npub_of(&Identity::generate());
-        assert_eq!(
-            contact_standing(&store, &npub),
-            ContactStanding::Unknown,
-            "a peer that was never a contact is Unknown, not Good"
-        );
-        store.save_dm_blocked(std::slice::from_ref(&npub)).unwrap();
-        assert_eq!(contact_standing(&store, &npub), ContactStanding::Blocked);
-    }
+    // DELETED 2026-09-03, QURATOR-177 (owner ruling: *"Blocks should only block interaction i.e.
+    // chats, it should not meaningfully affect other traffic."*): `blocking_a_contact_after_
+    // approval_downgrades_its_standing` and `a_block_outranks_a_decline` pinned `contact_standing`
+    // itself — the strictest-wins vocabulary that fed the serve-path and auto-approve standing gates
+    // this change removes. The block-vs-decline ordering they exercised is still real for CHAT
+    // acceptance, but chat reads `dm_blocked`/`dm_declined` directly (`commands/chat.rs`) and never
+    // went through this fn, so there is nothing left for these tests to pin. Replaced by the test
+    // directly below, which pins the new seam behaviour: blocking changes nothing on the serve path.
 
-    /// A block outranks a decline, and both outrank contact-hood — the strictest answer wins, so a
-    /// blocked peer that is also still a saved contact does not read as `Good`.
+    /// **Blocking does not gate the serve path at its seam with real app state** (owner ruling
+    /// 2026-09-03, QURATOR-177). The owner issues a ticket; the redeemer is then BLOCKED (and,
+    /// independently, declined); `StoreManifestSource::issued` still returns the ticket with the
+    /// same spent bit as an unblocked redeemer — because the serve decision is now exactly the
+    /// ticket + the spent bit, with no standing read anywhere between the data directory and the
+    /// plane. This is the seam-level twin of `transport.rs`'s
+    /// `a_blocked_redeemer_with_a_valid_ticket_is_still_served` (which proves the same thing through
+    /// real QUIC), and it exists because the plane-level test cannot see WHICH store state the
+    /// decision ignored — only this one, backed by the real `DataStore`, can.
+    ///
+    /// MUTATION (P-10) — the orchestrator applies one of these and must see this test red:
+    ///   (a) In `StoreManifestSource::issued` (this file), re-introduce a standing gate, e.g.
+    ///       `if self.store.load_dm_blocked().map(|b| b.iter().any(|n| n == &rec.redeemer_npub))
+    ///       .unwrap_or(false) { return None; }` after the `load_issued_ticket` line — the
+    ///       blocked assertion reds (issued() returns None).
+    ///   (b) In `transport.rs`'s `serve_manifest_stream`, refuse after a successful
+    ///       `issued()` on any store-derived hint — the plane-level twin test reds instead. This
+    ///       test's purpose is to name WHICH seam the mutation must hit to be caught.
     #[test]
-    fn a_block_outranks_a_decline() {
+    fn a_blocked_redeemers_ticket_is_still_issued() {
         let (_dir, store) = store();
         let npub = npub_of(&Identity::generate());
-        store.save_dm_declined(&[(npub.clone(), 1_700_000_000)]).unwrap();
-        assert_eq!(contact_standing(&store, &npub), ContactStanding::Declined);
+        store
+            .record_issued_ticket(&IssuedTicketRecord {
+                ticket: TransportTicket::issue("req-a", "slug-a", "addr", 1_700_000_000, Some("n1")),
+                redeemer_npub: npub.clone(),
+                consumed_at: None,
+                delivered_bytes: None,
+                served_fingerprint: None,
+            })
+            .unwrap();
+
+        // Sanity: the block and the decline really are in the store — without this the test would
+        // pass vacuously through a store that never persisted them.
         store.save_dm_blocked(std::slice::from_ref(&npub)).unwrap();
-        assert_eq!(contact_standing(&store, &npub), ContactStanding::Blocked);
+        store.save_dm_declined(&[(npub.clone(), 1_700_000_000)]).unwrap();
+        assert!(
+            store.load_dm_blocked().unwrap().iter().any(|n| n == &npub),
+            "precondition: the redeemer really is blocked"
+        );
+
+        // The seam: `issued` still hands back the ticket, unspent — the same answer as for an
+        // unblocked redeemer. There is no `standing` field left to compare, and that absence IS
+        // the pinned property.
+        let src = StoreManifestSource::new(
+            store.clone(),
+            Identity::generate(),
+            SessionBrowseKey::new([7u8; 32]),
+        );
+        let issued = src.issued("req-a").expect(
+            "a blocked redeemer holding a valid unspent ticket must still be issued for serving",
+        );
+        assert!(
+            !issued.already_consumed,
+            "the spent bit is still reported faithfully — blocking did not masquerade as spending"
+        );
+
+        // And the twin check on the OTHER standing the old fn conflated: an UNKNOWN redeemer (never
+        // a contact at all) is served the same way. The old `Unknown` arm refused; it must not
+        // return under any name.
+        store
+            .record_issued_ticket(&IssuedTicketRecord {
+                ticket: TransportTicket::issue("req-u", "slug-a", "addr", 1_700_000_000, Some("n2")),
+                redeemer_npub: "npub1unknown".into(),
+                consumed_at: None,
+                delivered_bytes: None,
+                served_fingerprint: None,
+            })
+            .unwrap();
+        assert!(
+            src.issued("req-u").is_some(),
+            "an unknown redeemer (never a contact) is served too — the old Unknown refusal is gone"
+        );
     }
 
     /// Owner ruling 2026-09-01: the issued-ticket map is UNBOUNDED — no record is ever evicted,
