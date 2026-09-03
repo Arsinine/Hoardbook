@@ -197,4 +197,159 @@ mod tests {
         // Default port normalization: wss defaults to 443.
         assert!(big_relay_overlaps_public("wss://relay.example:443", &publics), "default port must not bypass");
     }
+
+    // -----------------------------------------------------------------------
+    // Command-dispatch tests (QURATOR-179, slice 1 remainder) — through the real
+    // #[tauri::command] shim (arg deserialization + state injection + error conversion), not by
+    // calling bodies directly. `check_relay` dials the network on a URL that PASSES
+    // `validate_relay_url`, so every dispatch below either uses a URL the SSRF guard rejects (never
+    // reaches the dial) or avoids `check_relay` entirely — no test here touches the real internet.
+    // -----------------------------------------------------------------------
+    mod command_guards {
+        use super::super::*;
+        use tauri::Manager;
+
+        /// Mock app + managed `DataStore` (relay set = a deliberately unroutable sentinel, per
+        /// `store::tests::test_store_unroutable_relays`'s reasoning — `net::relay_urls` falls back
+        /// to the four real public `DEFAULT_RELAYS` for any store with an empty configured set) +
+        /// managed `SharedRelay` + managed `SharedIdentity` (no identity loaded). Built directly
+        /// rather than via `test_store_unroutable_relays` because that helper's `TempDir` would
+        /// drop (deleting the directory) at the end of THIS function if bound here — the dir must
+        /// outlive the returned `app`, so it is leaked with `.keep()`, matching `watches.rs`'s and
+        /// `topics.rs`'s house `guard_app()`.
+        fn guard_app() -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            store
+                .save_settings(&Settings {
+                    relay_urls: vec!["wss://hoardbook-test-sentinel.invalid".into()],
+                    ..Default::default()
+                })
+                .unwrap();
+            app.manage(store);
+            app.manage(net::new_shared());
+            let identity: SharedIdentity = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+            app.manage(identity);
+            app
+        }
+
+        #[tokio::test]
+        async fn check_relay_command_rejects_a_private_url_before_dialing() {
+            // No managed state: `check_relay` takes only its `url` argument, so this dispatches
+            // through the shim without a `guard_app()`.
+            let err = check_relay("ws://127.0.0.1:9".into()).await.unwrap_err();
+            assert_eq!(
+                err,
+                "This relay address points at a private/loopback network — enter a public relay URL."
+            );
+            // mutation: in `check_relay`, change `net::validate_relay_url(&url)?;` to
+            // `let _ = net::validate_relay_url(&url);` — the shim would then fall through to the
+            // dial against the (still-loopback, still-closed) `127.0.0.1:9`, which fails with a
+            // connection-refused error, not the SSRF guard's text this test pins.
+        }
+
+        #[tokio::test]
+        async fn relay_status_command_reports_the_configured_relays_disconnected_with_no_identity() {
+            let app = guard_app();
+            let got = relay_status(
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].url, "wss://hoardbook-test-sentinel.invalid");
+            assert_eq!(got[0].status, "disconnected");
+            assert!(!got[0].connected);
+            assert_eq!(got[0].last_error, None);
+            // mutation: change `None => return Ok(disconnected())` to `None => return Ok(vec![])` —
+            // the shim would then report an empty list instead of the managed store's configured
+            // relay (reached via `State<DataStore>`, not passed as an argument).
+        }
+
+        #[tokio::test]
+        async fn beacon_status_command_reaches_the_managed_beacon_state() {
+            let app = guard_app();
+            let beacon: SharedBeaconState = std::sync::Arc::new(tokio::sync::RwLock::new(BeaconReport {
+                stage: "acquiring-client".into(),
+                ..Default::default()
+            }));
+            app.manage(beacon);
+            let got = beacon_status(app.state::<SharedBeaconState>()).await.unwrap();
+            assert_eq!(got.stage, "acquiring-client");
+            // mutation: change `Ok(beacon.read().await.clone())` to
+            // `Ok(BeaconReport::default())` — the shim would then report the default empty stage
+            // instead of what the managed `SharedBeaconState` actually holds.
+        }
+
+        #[tokio::test]
+        async fn save_settings_then_get_settings_round_trips_relay_urls_via_the_managed_store() {
+            let app = guard_app();
+            let settings = Settings {
+                relay_urls: vec!["wss://relay.one.example".into(), "wss://relay.two.example".into()],
+                ..Default::default()
+            };
+            save_settings(settings.clone(), app.state::<DataStore>(), app.state::<SharedRelay>())
+                .await
+                .unwrap();
+            let got = get_settings(app.state::<DataStore>()).await.unwrap();
+            assert_eq!(got.relay_urls, settings.relay_urls);
+            // mutation: in `save_settings`, change `store.save_settings(&settings)` to
+            // `store.save_settings(&Settings::default())` — the round trip through the managed
+            // store would then read back an empty `relay_urls` instead of the two saved above.
+        }
+
+        #[tokio::test]
+        async fn save_settings_command_rejects_a_private_relay_url_and_never_reaches_the_store() {
+            let app = guard_app();
+            let settings =
+                Settings { relay_urls: vec!["ws://127.0.0.1:9".into()], ..Default::default() };
+            let err =
+                save_settings(settings, app.state::<DataStore>(), app.state::<SharedRelay>())
+                    .await
+                    .unwrap_err();
+            assert_eq!(
+                err,
+                "This relay address points at a private/loopback network — enter a public relay URL."
+            );
+            // The store must still hold the sentinel `guard_app` seeded, not the rejected URL —
+            // proves validation ran BEFORE any write through the managed store.
+            let got = get_settings(app.state::<DataStore>()).await.unwrap();
+            assert_eq!(got.relay_urls, vec!["wss://hoardbook-test-sentinel.invalid".to_string()]);
+            // mutation: delete the `net::validate_relay_url(url)?;` line inside `save_settings`'s
+            // `for url in &settings.relay_urls` loop — the private URL would then be accepted and
+            // written through the managed store, so `unwrap_err()` above panics.
+        }
+
+        #[tokio::test]
+        async fn acknowledge_privacy_notice_command_persists_through_the_managed_store() {
+            let app = guard_app();
+            let before = get_settings(app.state::<DataStore>()).await.unwrap();
+            assert!(!before.privacy_notice_acknowledged);
+            acknowledge_privacy_notice(app.state::<DataStore>()).await.unwrap();
+            let after = get_settings(app.state::<DataStore>()).await.unwrap();
+            assert!(after.privacy_notice_acknowledged);
+            // mutation: change `settings.privacy_notice_acknowledged = true;` to `= false;` in
+            // `acknowledge_privacy_notice` — the second read through the managed store would still
+            // observe `false`.
+        }
+
+        #[tokio::test]
+        async fn clear_manifest_cache_command_removes_the_managed_stores_cache_directory() {
+            let app = guard_app();
+            let store = app.state::<DataStore>();
+            let cache_dir = store.manifest_cache_dir();
+            std::fs::create_dir_all(&cache_dir).unwrap();
+            std::fs::write(cache_dir.join("stale.json"), b"{}").unwrap();
+            assert!(cache_dir.exists());
+            clear_manifest_cache(app.state::<DataStore>()).await.unwrap();
+            assert!(!cache_dir.exists(), "the managed store's own cache dir must be gone");
+            // mutation: change `clear_manifest_cache`'s body from
+            // `crate::manifest_cache::clear_all(&store.manifest_cache_dir()).map_err(cmd_err)` to
+            // `Ok(())` — the shim would report success while the managed store's cache directory,
+            // seeded above, is left on disk.
+        }
+    }
 }
