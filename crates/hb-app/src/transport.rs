@@ -1885,5 +1885,156 @@ pub(crate) mod tests {
         .await
         .expect("test timed out");
     }
+
+    /// **QURATOR-180 — the request-binding arm of `authorize_redemption`, answered as a HOSTILE
+    /// client.**
+    ///
+    /// `fetch_manifest` always builds `FetchRequest { request_id: ticket.request_id.clone(), .. }`,
+    /// so an honest client can never make the outer `request_id` disagree with the ticket it is
+    /// presenting — the binding check inside `authorize_redemption` (crates/hb-core/src/ticket.rs)
+    /// is unreachable from that path, which is why `a_refused_connection_releases_its_claim_...`
+    /// above forges the *ticket* (its `.slug`) but leaves `request_id` matching: that test cannot
+    /// reach this arm either. This test writes the wire frame by hand instead — the shape a prober
+    /// who captured someone else's ticket and tried to redeem it against a request of their own
+    /// choosing would send — and drives `serve_manifest_stream` directly (no QUIC needed; see
+    /// `a_failed_payload_write_fails_the_redemption_and_a_retry_succeeds` above for the same
+    /// Cursor/`Vec<u8>` pattern).
+    ///
+    /// MUTATION (P-10, orchestrator applies and must see this red): in `authorize_redemption`
+    /// (crates/hb-core/src/ticket.rs), delete the
+    /// `if ticket.request_id != for_request_id { return Err(HbError::InvalidTicket(...)); }` arm —
+    /// the mismatched request then sails through `authorize_redemption`, and `TestSource::payload`
+    /// (which checks the TICKET's own `request_id`, unchanged and still matching) serves it; this
+    /// test's `served.is_none()` assertion reds.
+    #[tokio::test]
+    async fn a_ticket_redeemed_under_a_different_request_id_is_refused() {
+        let ep = bind_local_endpoint(&rand::random(), vec![]).await;
+        let ticket = issue_ticket(&ep, "req-1", "small", 1_700_000_000, Some("nonce-1")).unwrap();
+        let source = TestSource::new(ticket.clone(), real_payload_for("small", 10));
+
+        // A hostile client: the outer request id does not match the ticket's own. `fetch_manifest`
+        // can never produce this shape, so it is written onto the wire by hand.
+        let req = FetchRequest { request_id: "someone-elses-request".into(), ticket: ticket.clone() };
+        let mut frame = Vec::new();
+        write_framed(&mut frame, &serde_json::to_vec(&req).unwrap()).await.unwrap();
+
+        let mut response = Vec::new();
+        let served =
+            serve_manifest_stream(&mut response, std::io::Cursor::new(frame), source.as_ref())
+                .await
+                .expect("a refusal is Ok(None), not an error — the transport call itself succeeds");
+        assert!(served.is_none(), "a ticket redeemed under a different request id must not be served");
+
+        let mut reader = std::io::Cursor::new(response);
+        assert_eq!(
+            reader.read_u8().await.unwrap(),
+            STATUS_REFUSED,
+            "a ticket redeemed under a different request id is refused"
+        );
+        let reason = read_framed(&mut reader, REFUSAL_MAX_FRAME).await.unwrap();
+        assert_eq!(
+            reason,
+            REFUSAL_NO_MATCH.as_bytes(),
+            "the request-binding refusal uses the shared constant, not a bespoke message"
+        );
+
+        ep.close().await;
+    }
+
+    /// **QURATOR-180 — the SHAPE arm of the same gate, isolated from the binding arm above.**
+    ///
+    /// A structurally invalid ticket (blank `slug`, mirroring hb-core's
+    /// `malformed_and_unknown_version_tickets_are_refused`) fails `TransportTicket::verify_shape`
+    /// inside `authorize_redemption`, before the request-id comparison is even reached.
+    /// `issue_ticket` itself refuses to mint this shape (it calls `verify_shape` before returning),
+    /// so the ticket is broken by hand after issuance. The outer `request_id` is left matching the
+    /// ticket's own so this test cannot accidentally be satisfied by the binding arm above — it is
+    /// isolated to the shape check.
+    ///
+    /// MUTATION (P-10, orchestrator applies and must see this red): in `authorize_redemption`
+    /// (crates/hb-core/src/ticket.rs), delete the leading `ticket.verify_shape()?;` line — the
+    /// blank slug then sails past authorization into `source.payload`/the slug-binding check below
+    /// it in `serve_manifest_stream`, which refuses for a DIFFERENT reason (the declared slug not
+    /// matching a blank ticket slug), so this test's `REFUSAL_NO_MATCH` equality assertion reds.
+    #[tokio::test]
+    async fn a_structurally_malformed_ticket_is_refused_the_same_way() {
+        let ep = bind_local_endpoint(&rand::random(), vec![]).await;
+        let mut malformed =
+            issue_ticket(&ep, "req-2", "small", 1_700_000_000, Some("nonce-1")).unwrap();
+        malformed.slug = String::new();
+        let source = TestSource::new(malformed.clone(), real_payload_for("small", 10));
+
+        let req = FetchRequest { request_id: malformed.request_id.clone(), ticket: malformed };
+        let mut frame = Vec::new();
+        write_framed(&mut frame, &serde_json::to_vec(&req).unwrap()).await.unwrap();
+
+        let mut response = Vec::new();
+        let served =
+            serve_manifest_stream(&mut response, std::io::Cursor::new(frame), source.as_ref())
+                .await
+                .expect("a refusal is Ok(None), not an error");
+        assert!(served.is_none(), "a structurally invalid ticket must not be served");
+
+        let mut reader = std::io::Cursor::new(response);
+        assert_eq!(reader.read_u8().await.unwrap(), STATUS_REFUSED);
+        let reason = read_framed(&mut reader, REFUSAL_MAX_FRAME).await.unwrap();
+        assert_eq!(
+            reason,
+            REFUSAL_NO_MATCH.as_bytes(),
+            "same constant as the binding-arm refusal — the two arms must be indistinguishable"
+        );
+
+        ep.close().await;
+    }
+
+    /// **QURATOR-180 — the anti-probing invariant: the two refusal arms are byte-identical on the
+    /// wire.** `REFUSAL_NO_MATCH` is deliberately the SAME string for a malformed ticket and a
+    /// wrong-request ticket (see the comment at `authorize_redemption`'s call site in
+    /// `serve_manifest_stream`) so a prober cannot distinguish "no such ticket" from "wrong ticket
+    /// for this request". This test drives both hostile shapes from the two tests above and
+    /// compares the raw response bytes — status byte, length prefix, and message — not just the
+    /// message string, so it also pins that neither arm pads or truncates differently.
+    ///
+    /// MUTATION (P-10, orchestrator applies and must see this red): give the shape-check and the
+    /// request-binding check inside `authorize_redemption` distinct refusal strings at their call
+    /// site in `serve_manifest_stream` (e.g. `refuse(&mut send, "no such ticket").await?` for one
+    /// arm only, leaving the other on `REFUSAL_NO_MATCH`) — this test's `assert_eq!` on the two
+    /// response byte vectors reds, even though each half still redeems correctly as "refused".
+    #[tokio::test]
+    async fn the_two_refusal_arms_are_byte_identical_on_the_wire() {
+        let ep = bind_local_endpoint(&rand::random(), vec![]).await;
+
+        // Arm 1: well-formed ticket, wrong request id.
+        let ticket = issue_ticket(&ep, "req-3", "small", 1_700_000_000, Some("nonce-1")).unwrap();
+        let source_a = TestSource::new(ticket.clone(), real_payload_for("small", 10));
+        let req_a =
+            FetchRequest { request_id: "not-the-tickets-request".into(), ticket: ticket.clone() };
+        let mut frame_a = Vec::new();
+        write_framed(&mut frame_a, &serde_json::to_vec(&req_a).unwrap()).await.unwrap();
+        let mut response_a = Vec::new();
+        serve_manifest_stream(&mut response_a, std::io::Cursor::new(frame_a), source_a.as_ref())
+            .await
+            .unwrap();
+
+        // Arm 2: structurally invalid ticket, matching request id.
+        let mut malformed =
+            issue_ticket(&ep, "req-4", "small", 1_700_000_000, Some("nonce-1")).unwrap();
+        malformed.slug = String::new();
+        let source_b = TestSource::new(malformed.clone(), real_payload_for("small", 10));
+        let req_b = FetchRequest { request_id: malformed.request_id.clone(), ticket: malformed };
+        let mut frame_b = Vec::new();
+        write_framed(&mut frame_b, &serde_json::to_vec(&req_b).unwrap()).await.unwrap();
+        let mut response_b = Vec::new();
+        serve_manifest_stream(&mut response_b, std::io::Cursor::new(frame_b), source_b.as_ref())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response_a, response_b,
+            "a malformed ticket and a wrong-request ticket must be indistinguishable on the wire"
+        );
+
+        ep.close().await;
+    }
 }
 
