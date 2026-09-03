@@ -73,4 +73,100 @@ mod tests {
         // return "/x" instead of the default, since the shim's deserialized argument would no
         // longer reach the store call.
     }
+
+    // -----------------------------------------------------------------------
+    // IPC-boundary tests (QURATOR-179's second concern) — dispatched as a real JSON
+    // payload through `tauri::test::get_ipc_response`, exercising argument
+    // deserialization itself, not the command fn called at its Rust signature.
+    // -----------------------------------------------------------------------
+
+    /// Builds an app with `get_share_settings` wired into a real `invoke_handler`, so IPC
+    /// dispatch (unlike `guard_app()`, which calls command fns directly) can reach it.
+    fn ipc_app() -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![get_share_settings])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap().keep();
+        app.manage(DataStore::new(dir));
+        app
+    }
+
+    /// Dispatches `get_share_settings` over the mocked IPC boundary with the given JSON body.
+    fn dispatch_get_share_settings(
+        app: &tauri::App<tauri::test::MockRuntime>,
+        body: serde_json::Value,
+    ) -> Result<tauri::ipc::InvokeResponseBody, serde_json::Value> {
+        let webview = tauri::WebviewWindowBuilder::new(app, "main", Default::default())
+            .build()
+            .unwrap();
+        tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: "get_share_settings".into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: if cfg!(any(windows, target_os = "android")) {
+                    "http://tauri.localhost"
+                } else {
+                    "tauri://localhost"
+                }
+                .parse()
+                .unwrap(),
+                body: tauri::ipc::InvokeBody::Json(body),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn get_share_settings_ipc_deserializes_a_well_formed_payload_and_returns_the_saved_value() {
+        let app = ipc_app();
+        app.state::<DataStore>()
+            .save_share_settings("vault", &ShareSettings { root_path: Some("/x".into()) })
+            .unwrap();
+
+        let res = dispatch_get_share_settings(&app, serde_json::json!({ "slug": "vault" }));
+        let got: ShareSettings = res.unwrap().deserialize().unwrap();
+        assert_eq!(
+            got.root_path,
+            Some("/x".into()),
+            "a real JSON payload, deserialized at the IPC boundary, must reach the command"
+        );
+        // mutation: rename the `slug` parameter in get_share_settings (e.g. to `collection_slug`)
+        // — the payload `{"slug": "vault"}` would then miss the key the shim looks up and this
+        // dispatch would return Err instead of the saved value.
+    }
+
+    #[test]
+    fn get_share_settings_ipc_rejects_a_wrong_typed_slug_before_the_body_runs() {
+        let app = ipc_app();
+        let res = dispatch_get_share_settings(&app, serde_json::json!({ "slug": 42 }));
+        assert!(
+            res.is_err(),
+            "a numeric slug must be rejected while deserializing IPC args, not coerced to a string"
+        );
+        // mutation: widen `slug: String` to `slug: serde_json::Value` in get_share_settings's
+        // signature (body then reads `slug.as_str().unwrap_or_default()`) — a numeric slug would
+        // then deserialize successfully instead of being rejected, and this dispatch would return
+        // Ok instead of Err. No narrower one-line production mutation exists: the strict-typing
+        // behaviour this test pins is tauri's `CommandItem` JSON deserializer
+        // (`ipc/command.rs`), not anything `get_share_settings` itself does — which is exactly the
+        // IPC-boundary gap this lane exists to test.
+    }
+
+    #[test]
+    fn get_share_settings_ipc_rejects_a_payload_missing_the_slug_argument() {
+        let app = ipc_app();
+        let res = dispatch_get_share_settings(&app, serde_json::json!({}));
+        assert!(
+            res.is_err(),
+            "a payload with no `slug` key must be rejected, not silently defaulted"
+        );
+        // mutation: change `slug: String` to `slug: Option<String>` in get_share_settings's
+        // signature (body then reads `slug.unwrap_or_default()`) — a payload missing the key
+        // would then deserialize to `None` instead of being rejected, and this dispatch would
+        // return Ok instead of Err.
+    }
 }
