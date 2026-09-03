@@ -9,12 +9,13 @@
 //! only at render time (`ui/src/lib/request-inbox.ts`, `parseManifestRequest`) — there was NO
 //! production Rust handler for an incoming request-DM before this module. This loop is that seam.
 //!
-//! **The ticket contract is untouched.** `authorize_redemption` is not modified — not its
-//! signature, not its arms. Every approval this loop issues goes through
-//! [`crate::commands::fulfil::send_full_list_inner`], which mints a FRESH ticket per fetch the same
-//! way the click does. Nothing here lets a granted peer replay a spent ticket; a rejected attempt
-//! still does not consume a ticket, and a peer whose fetch failed still retries the ticket it
-//! already holds — immediately, unlimited, never waiting on a cooldown.
+//! **The ticket contract is untouched.** Every approval this loop issues goes through
+//! [`crate::commands::fulfil::send_full_list_inner`], which mints a FRESH ticket per fetch the
+//! same way the click does. Nothing here adds any serve-path check — there is none to modify
+//! (QURATOR-177 Option E, owner ruling 2026-09-03: authorization is the standing grant this loop
+//! itself checks, and the ticket is address delivery; a repeat fetch is a legitimate fetch, and a
+//! peer whose fetch failed retries the ticket it already holds — immediately, unlimited, never
+//! waiting on a cooldown).
 //!
 //! **What the caps are NOT:** they bound how often this node MINTS A NEW APPROVAL, never how long a
 //! minted ticket lives. No ticket may ever expire (standing owner ruling); conflating the two would
@@ -60,8 +61,9 @@
 //! today — one ticket per click, each independently consumable at most once, each recorded before
 //! its DM — so it is safe by the existing per-ticket mechanics rather than by anything this module
 //! adds. Coordinating the two (e.g. dismissing the card once auto-approved) is UI work owed to a
-//! follow-up, not a defect in this seam: an extra unspent ticket is inert, costs one DM, and
-//! changes no authorisation. This is recorded here rather than silently ignored.
+//! follow-up, not a defect in this seam: an extra ticket is inert, costs one DM, and changes no
+//! authorisation (QURATOR-177 Option E: there is no spent bit for a second one to collide with —
+//! both would fetch, and that is legitimate). This is recorded here rather than silently ignored.
 //!
 //! ## Locking
 //!
@@ -91,10 +93,10 @@ use crate::transport_state::SharedEndpoint;
 
 /// One auto-approval per `(peer, author, slug)` per this many seconds (owner-ruled).
 ///
-/// Gates MINTING A NEW APPROVAL ONLY — never the retry path. A failed transfer does not consume a
-/// ticket (`into_consumed` requires a delivered `ManifestPayload`, so a dropped connection has no
-/// path to it), and a peer whose fetch failed retries the ticket it already holds immediately and
-/// without limit; this cooldown never makes a retrying peer wait.
+/// Gates MINTING A NEW APPROVAL ONLY — never the retry path. A failed transfer is simply
+/// undelivered (QURATOR-177 Option E: there is no spent bit — `into_consumed` and the receipt it
+/// required are deleted with the ledger), and a peer whose fetch failed retries the ticket it
+/// already holds immediately and without limit; this cooldown never makes a retrying peer wait.
 const AUTO_APPROVE_PER_PAIR_COOLDOWN_SECS: u64 = 60;
 
 /// At most this many auto-approvals per rolling [`AUTO_APPROVE_GLOBAL_WINDOW_SECS`] (owner-ruled).
@@ -402,8 +404,8 @@ pub(crate) async fn run_auto_approve_loop(
             };
 
             // The approval: one call to the production body — the same call the click makes. A
-            // FRESH ticket is minted per fetch; `authorize_redemption` and its one-shot consume
-            // are untouched. Endpoint binding, record-before-DM, grant refresh, and the ticket DM
+            // FRESH ticket is minted per fetch; no serve-path check exists to touch (QURATOR-177
+            // Option E). Endpoint binding, grant-record-before-DM, grant refresh, and the ticket DM
             // all happen inside, outside every DM cache/request lock (see the module doc). The
             // endpoint handle is the app's MANAGED one (passed in at spawn): `ensure_endpoint`
             // reuses the session's single listening plane or binds it here, exactly as the fulfil

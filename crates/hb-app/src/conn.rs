@@ -54,22 +54,36 @@ mod tests {
             });
 
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
-            // Spend the ticket first, then replay: every round takes the refusal path, the
-            // smallest response the plane writes and the documented deterministic loss without the
-            // drain. (This rig used to set `TestSource.standing` to `Blocked`; that serve-path
-            // standing check was withdrawn by owner ruling 2026-09-03, QURATOR-177 — blocking
-            // gates chat/DM interaction only — so the spent ticket is now the way to force a
-            // refusal. Wait for the receipt before replaying so the test races no bookkeeping.)
-            fetch_manifest(&client, &ticket, |_| Ok(())).await.expect("the first redemption succeeds");
-            crate::transport::tests::await_receipt(&source).await;
+            // Force a refusal without a spent ticket: a ticket naming a request the source
+            // cannot resolve fails at `payload()`, and the plane writes a refusal frame. This
+            // test is about the DRAIN — that a refusal survives an immediate connection close —
+            // so which refusal it is does not matter, only that one arrives intact 3x running.
+            //
+            // ⚠ It must be a payload refusal, because after QURATOR-177 Option E (owner ruling
+            // 2026-09-03) `REFUSAL_NO_MATCH` is UNREACHABLE from an honest client. Two facts
+            // combine: `fetch_manifest` validates the ticket's shape client-side before dialling,
+            // and it builds `FetchRequest { request_id: ticket.request_id.clone(), .. }` — so the
+            // request id always matches the ticket's. `authorize_redemption`'s two arms (shape,
+            // request binding) therefore refuse nothing an honest client can send; that gate now
+            // defends only against a hand-built hostile request. Two earlier rigs are gone with
+            // the issued-ticket ledger: the serve-path standing check (blocking gates chat/DM
+            // interaction only) and the spent-ticket replay (a repeat fetch is legitimate now). (Two earlier rigs are gone with the
+            // issued-ticket ledger, QURATOR-177 Option E, owner ruling 2026-09-03: the serve-path
+            // standing check — blocking gates chat/DM interaction only — and the spent-ticket
+            // replay, since a repeat fetch is a legitimate fetch under Option E. A wrong-request
+            // ticket is refused for a reason that still exists: the ticket does not answer THIS
+            // request.)
+            let mut mismatched = ticket.clone();
+            mismatched.request_id = "req-a-different-request".into();
+            mismatched.ask_nonce = Some("nonce-other".into());
 
             for round in 0..3 {
-                let err = fetch_manifest(&client, &ticket, |_| Ok(()))
+                let err = fetch_manifest(&client, &mismatched, |_| Ok(()))
                     .await
-                    .expect_err("a replay of a consumed ticket must be refused");
+                    .expect_err("a ticket bound to a different request must be refused");
                 let msg = err.to_string().to_lowercase();
                 assert!(
-                    msg.contains("already") || msg.contains("redeem"),
+                    msg.contains("could not produce the manifest"),
                     "round {round}: the refusal must arrive intact, got: {msg}"
                 );
             }

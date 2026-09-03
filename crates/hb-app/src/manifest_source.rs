@@ -2,8 +2,15 @@
 //!
 //! `transport.rs` deliberately holds no store handle — the plane is a protocol, and its tests bind
 //! real QUIC endpoints against in-memory fakes. This module is the one place the protocol meets the
-//! data directory, and it is small on purpose: three methods, each a thin composition of things that
+//! data directory, and it is small on purpose: one method, a thin composition of things that
 //! already existed.
+//!
+//! **The issued-ticket lookup is gone** (owner ruling 2026-09-03, QURATOR-177 Option E): until
+//! that ruling this module also answered "what did we issue for `request_id`, and is it spent?"
+//! — the serve path's only authorization read, backed by hb-app's issued-ticket ledger.
+//! Authorization now happens at ASK time (the standing grant checked under the NIP-17 seal in
+//! `auto_approve`), the ticket is address delivery, and `payload` resolves by the ticket's OWN
+//! fields — `author_npub` for the branch, `slug` for the key — with no ledger lookup anywhere.
 //!
 //! **What it cannot do is the point.** `payload` takes a slug and returns a [`ManifestPayload`].
 //! There is no path parameter and no byte-slice parameter anywhere in the trait, so this
@@ -13,13 +20,13 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use hb_core::{Identity, ManifestPayload};
+use hb_core::{Identity, ManifestPayload, TransportTicket};
 
 use crate::commands::collection::build_slug_manifest;
 use crate::identity_state::SessionBrowseKey;
 use crate::manifest_cache;
 use crate::store::DataStore;
-use crate::transport::{IssuedTicket, ManifestSource};
+use crate::transport::ManifestSource;
 
 /// Unix seconds now — the cache's LRU recency stamp on a re-serve read.
 fn now_secs() -> u64 {
@@ -51,18 +58,11 @@ impl StoreManifestSource {
 }
 
 impl ManifestSource for StoreManifestSource {
-    /// What this node issued for `request_id`. `None` for an id we never issued — which is the same
-    /// refusal a forged ticket gets, by way of the shared constant in `transport.rs`. Deliberately
-    /// NOT read here: any live contact standing — blocking, removing, or declining the redeemer
-    /// changes nothing on the serve path (owner ruling 2026-09-03, QURATOR-177: blocking gates
-    /// chat/DM interaction only). The ticket itself and the spent bit are the whole decision.
-    fn issued(&self, request_id: &str) -> Option<IssuedTicket> {
-        let rec = self.store.load_issued_ticket(request_id).ok().flatten()?;
-        Some(IssuedTicket {
-            ticket: rec.ticket,
-            already_consumed: rec.consumed_at.is_some(),
-        })
-    }
+    // `issued(&self, request_id)` — DELETED 2026-09-03, QURATOR-177 Option E (owner ruling:
+    // authorization is the standing grant at ASK time; the ticket is address delivery). It read
+    // the issued-ticket ledger and fed the serve path's per-request lookup; the ledger is deleted
+    // and with it this method. Do not re-introduce any request_id → record lookup here.
+
 
     /// Build the manifest for an authorized request, from the same pure core `export_manifest`
     /// wraps — so the transport can never serve a tree the export would have described differently.
@@ -73,43 +73,40 @@ impl ManifestSource for StoreManifestSource {
     /// Sealing is what applies the 16 MiB ceiling; an over-cap collection is refused here, before a
     /// byte moves, by [`ManifestPayload::seal`].
     ///
-    /// The parameter is the `request_id`, not the slug: the record keyed by it says WHICH kind of
-    /// serve this is. `ticket.author_npub: None` (or a record without `served_fingerprint`) is the
-    /// owner-issued case above, unchanged — the slug is recovered from the record and the manifest
-    /// rebuilt from the collection as it is NOW. `author_npub: Some` AND `served_fingerprint:
-    /// Some` is a carrier-4 re-serve (QURATOR-79): the exact `(author_npub, slug, fingerprint)`
-    /// cache entry the human approved when `send_cached_manifest` minted this ticket is fetched,
-    /// with NO fallback — resolution happened once, at mint; serve time replays it. A cache MISS on
-    /// a re-serve errors rather than falling through to `build_slug_manifest`, because a
+    /// The parameter is the ticket itself (QURATOR-177 Option E): its OWN fields say WHICH kind
+    /// of serve this is, with no ledger lookup. `ticket.author_npub: None` is the owner-issued
+    /// case, unchanged — the manifest is rebuilt from the collection as it is NOW.
+    /// `author_npub: Some` is a carrier-4 re-serve (QURATOR-79): the resolution target is
+    /// **the newest cached copy for `(author_npub, slug)`** (QURATOR-177 slice 1, owner ruling
+    /// 2026-09-03) — serve time resolves to whatever is currently cached for that author+slug,
+    /// NOT the exact entry whose fingerprint `send_cached_manifest` minted the ticket against
+    /// (resolution used to happen once, at mint; it no longer does). Serving a newer snapshot than
+    /// the human approved is intended and matches the owner ruling above that rebuilds the owner's
+    /// own collection as-it-is-NOW at redeem time, because tickets never expire — the refetch
+    /// machinery updates the cache in place and the next re-serve serves what is there. A cache
+    /// MISS on a re-serve errors rather than falling through to `build_slug_manifest`, because a
     /// "helpful" fallback would silently serve C's OWN same-slug collection as if it were A's
     /// (slugs are bare names; C may hold B's «roms» and A's «roms» both).
-    fn payload(&self, request_id: &str) -> Result<ManifestPayload> {
-        let rec = self
-            .store
-            .load_issued_ticket(request_id)
-            .map_err(|e| anyhow!("look up the issued-ticket record: {e}"))?
-            .ok_or_else(|| anyhow!("no issued-ticket record for '{request_id}'"))?;
-
-        // The cache-serving branch: BOTH fields must be present. `author_npub` alone is not enough
-        // (a record written before `served_fingerprint` existed loads as `None`, and that IS the
-        // owner-issued case for it), and `served_fingerprint` alone would resolve an authorless
-        // cache key. Read-only use of the cache — `manifest_cache::put` has exactly one production
-        // writer, in `commands/browse.rs`, pinned by a CI sweep.
-        if let (Some(author_npub), Some(fingerprint)) =
-            (&rec.ticket.author_npub, &rec.served_fingerprint)
-        {
-            let json = manifest_cache::get(
+    fn payload(&self, ticket: &TransportTicket) -> Result<ManifestPayload> {
+        // The cache-serving branch: `author_npub` ALONE is the Carrier-4 signal (QURATOR-177
+        // slice 1). It used to additionally require `served_fingerprint` — under that rule a
+        // record with `author_npub: Some` but `served_fingerprint: None` (a pre-field Carrier-4
+        // mint) fell to the owner branch; `author_npub` is the real discriminator, so the
+        // fingerprint is no longer read anywhere (the record itself is gone with the ledger,
+        // QURATOR-177 Option E). Read-only use of the cache — `manifest_cache::put` has exactly
+        // one production writer, in `commands/browse.rs`, pinned by a CI sweep.
+        if let Some(author_npub) = &ticket.author_npub {
+            let json = manifest_cache::get_latest(
                 &self.store.manifest_cache_dir(),
                 author_npub,
-                &rec.ticket.slug,
-                fingerprint,
+                &ticket.slug,
                 now_secs(),
             )
             .ok_or_else(|| {
                 anyhow!(
                     "the approved copy of '{slug}' by {author} is no longer in the manifest cache — \
                      ask the owner to re-send it",
-                    slug = rec.ticket.slug,
+                    slug = ticket.slug,
                     author = crate::logging::trunc_npub(author_npub),
                 )
             })?;
@@ -121,7 +118,7 @@ impl ManifestSource for StoreManifestSource {
         // The owner-issued path, byte-for-byte what it always did: rebuild from the collection as
         // it is NOW (owner ruling ②).
         let envelope = build_slug_manifest(
-            &rec.ticket.slug,
+            &ticket.slug,
             &self.store,
             &self.identity,
             self.browse_key.bytes(),
@@ -130,24 +127,15 @@ impl ManifestSource for StoreManifestSource {
         ManifestPayload::seal(&envelope).map_err(|e| anyhow!("{e}"))
     }
 
-    /// Persist the receipt, and **report failure** rather than logging past it. A lost write leaves
-    /// the ticket unspent on disk, so the plane needs to know in order to fail closed — it poisons
-    /// the request for the rest of the session instead of allowing a second delivery.
-    fn record_consumed(&self, receipt: &hb_core::ticket::ConsumedTicket) -> Result<()> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        self.store
-            .mark_ticket_consumed(receipt.request_id(), receipt.delivered_bytes(), now)
-            .map_err(|e| anyhow!("persist the manifest receipt: {e}"))
-    }
 }
+
+// `record_consumed(&self, receipt: &ConsumedTicket)` — DELETED 2026-09-03, QURATOR-177 Option E
+// (owner ruling), with the receipt ledger it wrote and the plane's poisoning that consumed its
+// errors. There is no spent bit to persist and no audit trail — both deliberately given up.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::IssuedTicketRecord;
     use hb_core::{Collection, DirectoryItem, ItemType, TransportTicket, Visibility};
 
     fn store() -> (tempfile::TempDir, DataStore) {
@@ -162,32 +150,12 @@ mod tests {
         id.public_key().to_bech32().unwrap()
     }
 
-    /// The core of the durable half: a ticket issued, then marked consumed, is reported as spent —
-    /// which is what makes a replay after a restart refuse instead of serving a second manifest.
-    #[test]
-    fn a_consumed_ticket_reads_back_as_already_consumed() {
-        let (_dir, store) = store();
-        let id = Identity::generate();
-        let npub = npub_of(&id);
-        let ticket = TransportTicket::issue("req-a", "slug-a", "addr", 1_700_000_000, Some("n1"));
-        store
-            .record_issued_ticket(&IssuedTicketRecord {
-                ticket,
-                redeemer_npub: npub,
-                consumed_at: None,
-                delivered_bytes: None,
-                served_fingerprint: None,
-            })
-            .unwrap();
+    // `a_consumed_ticket_reads_back_as_already_consumed` — DELETED 2026-09-03, QURATOR-177
+    // Option E (owner ruling): the issued-ticket ledger and its `consumed_at`/`delivered_bytes`
+    // fields are deleted, so there is nothing to read back and no spent bit to report. Durable
+    // replay protection was deliberately given up; what bounds repeat traffic is the asker-side
+    // fingerprint-change trigger, never a serve-side spent bit.
 
-        let before = store.load_issued_ticket("req-a").unwrap().unwrap();
-        assert!(before.consumed_at.is_none(), "a freshly issued ticket is unspent");
-
-        store.mark_ticket_consumed("req-a", 4096, 1_700_000_100).unwrap();
-        let after = store.load_issued_ticket("req-a").unwrap().unwrap();
-        assert_eq!(after.consumed_at, Some(1_700_000_100));
-        assert_eq!(after.delivered_bytes, Some(4096));
-    }
 
     /// **One ask admits ONE ticket — the defect that survived two rounds of fixes.**
     ///
@@ -305,13 +273,13 @@ mod tests {
         );
     }
 
-    /// An invented request id must be indistinguishable from a forged ticket — the source reports
-    /// nothing, and `transport.rs`'s single refusal constant says the same thing either way.
-    #[test]
-    fn an_unissued_request_id_is_unknown() {
-        let (_dir, store) = store();
-        assert!(store.load_issued_ticket("never-issued").unwrap().is_none());
-    }
+    // `an_unissued_request_id_is_unknown` — DELETED 2026-09-03, QURATOR-177 Option E. It pinned
+    // that the source could not answer for a request id it never issued — a property OF THE
+    // LEDGER. With the ledger gone the serve path resolves by the ticket's own fields; an
+    // unknowable request is indistinguishable because nothing is looked up, not because a map
+    // lookup missed. The request-binding refusal survives in hb-core
+    // (`a_ticket_is_bound_to_its_own_request`).
+
 
     // DELETED 2026-09-03, QURATOR-177 (owner ruling: *"Blocks should only block interaction i.e.
     // chats, it should not meaningfully affect other traffic."*): `blocking_a_contact_after_
@@ -322,154 +290,54 @@ mod tests {
     // went through this fn, so there is nothing left for these tests to pin. Replaced by the test
     // directly below, which pins the new seam behaviour: blocking changes nothing on the serve path.
 
-    /// **Blocking does not gate the serve path at its seam with real app state** (owner ruling
-    /// 2026-09-03, QURATOR-177). The owner issues a ticket; the redeemer is then BLOCKED (and,
-    /// independently, declined); `StoreManifestSource::issued` still returns the ticket with the
-    /// same spent bit as an unblocked redeemer — because the serve decision is now exactly the
-    /// ticket + the spent bit, with no standing read anywhere between the data directory and the
-    /// plane. This is the seam-level twin of `transport.rs`'s
-    /// `a_blocked_redeemer_with_a_valid_ticket_is_still_served` (which proves the same thing through
-    /// real QUIC), and it exists because the plane-level test cannot see WHICH store state the
-    /// decision ignored — only this one, backed by the real `DataStore`, can.
-    ///
-    /// MUTATION (P-10) — the orchestrator applies one of these and must see this test red:
-    ///   (a) In `StoreManifestSource::issued` (this file), re-introduce a standing gate, e.g.
-    ///       `if self.store.load_dm_blocked().map(|b| b.iter().any(|n| n == &rec.redeemer_npub))
-    ///       .unwrap_or(false) { return None; }` after the `load_issued_ticket` line — the
-    ///       blocked assertion reds (issued() returns None).
-    ///   (b) In `transport.rs`'s `serve_manifest_stream`, refuse after a successful
-    ///       `issued()` on any store-derived hint — the plane-level twin test reds instead. This
-    ///       test's purpose is to name WHICH seam the mutation must hit to be caught.
-    #[test]
-    fn a_blocked_redeemers_ticket_is_still_issued() {
-        let (_dir, store) = store();
-        let npub = npub_of(&Identity::generate());
-        store
-            .record_issued_ticket(&IssuedTicketRecord {
-                ticket: TransportTicket::issue("req-a", "slug-a", "addr", 1_700_000_000, Some("n1")),
-                redeemer_npub: npub.clone(),
-                consumed_at: None,
-                delivered_bytes: None,
-                served_fingerprint: None,
-            })
-            .unwrap();
+    // `a_blocked_redeemers_ticket_is_still_issued` — DELETED 2026-09-03, QURATOR-177 Option E.
+    // It pinned that `StoreManifestSource::issued` ignored contact standing — but `issued()` and
+    // the issued-ticket record it read are both deleted with the ledger, so there is no seam left
+    // to pin: the serve path now resolves by the ticket's own fields and reads no app state that
+    // standing could influence. The plane-level replacement pin (any re-introduced gate on the
+    // serve path reds the fetch) is `transport.rs`'s
+    // `a_blocked_redeemer_with_a_valid_ticket_is_still_served`, whose MUTATION names inserting a
+    // refusal after `authorize_redemption` in `serve_manifest_stream`.
 
-        // Sanity: the block and the decline really are in the store — without this the test would
-        // pass vacuously through a store that never persisted them.
-        store.save_dm_blocked(std::slice::from_ref(&npub)).unwrap();
-        store.save_dm_declined(&[(npub.clone(), 1_700_000_000)]).unwrap();
-        assert!(
-            store.load_dm_blocked().unwrap().iter().any(|n| n == &npub),
-            "precondition: the redeemer really is blocked"
-        );
 
-        // The seam: `issued` still hands back the ticket, unspent — the same answer as for an
-        // unblocked redeemer. There is no `standing` field left to compare, and that absence IS
-        // the pinned property.
-        let src = StoreManifestSource::new(
-            store.clone(),
-            Identity::generate(),
-            SessionBrowseKey::new([7u8; 32]),
-        );
-        let issued = src.issued("req-a").expect(
-            "a blocked redeemer holding a valid unspent ticket must still be issued for serving",
-        );
-        assert!(
-            !issued.already_consumed,
-            "the spent bit is still reported faithfully — blocking did not masquerade as spending"
-        );
+    // `no_issued_ticket_record_is_ever_evicted` — DELETED 2026-09-03, QURATOR-177 Option E: the
+    // issued-ticket map itself is deleted (it existed to answer "is this ticket spent?" and to
+    // audit), so its eviction policy is moot. The ruling explicitly gives up the audit trail.
 
-        // And the twin check on the OTHER standing the old fn conflated: an UNKNOWN redeemer (never
-        // a contact at all) is served the same way. The old `Unknown` arm refused; it must not
-        // return under any name.
-        store
-            .record_issued_ticket(&IssuedTicketRecord {
-                ticket: TransportTicket::issue("req-u", "slug-a", "addr", 1_700_000_000, Some("n2")),
-                redeemer_npub: "npub1unknown".into(),
-                consumed_at: None,
-                delivered_bytes: None,
-                served_fingerprint: None,
-            })
-            .unwrap();
-        assert!(
-            src.issued("req-u").is_some(),
-            "an unknown redeemer (never a contact) is served too — the old Unknown refusal is gone"
-        );
-    }
 
-    /// Owner ruling 2026-09-01: the issued-ticket map is UNBOUNDED — no record is ever evicted,
-    /// spent or unspent. Eviction was never load-bearing (an unknown `request_id` is refused exactly
-    /// like a forgery, see [`StoreManifestSource::issued`]); the old 512 cap only discarded audit
-    /// history, and dropping an *unspent* one would have silently revoked a human's approval.
-    ///
-    /// Driven through the real `record_issued_ticket` path rather than a bare map, so it ends where
-    /// production ends: a reinstated prune anywhere in that call chain reds this test.
-    ///
-    /// MUTATION (P-10) — resolved by containing function: in `DataStore::record_issued_ticket`
-    /// (`store.rs`), re-add a truncation after the insert, e.g.
-    /// `if m.len() > 512 { let k = m.keys().next().cloned().unwrap(); m.remove(&k); }`.
-    /// The count assertion below reds.
-    #[test]
-    fn no_issued_ticket_record_is_ever_evicted() {
-        let (_dir, store) = store();
-        const N: usize = 600; // comfortably past the 512 the removed cap used to enforce
-        for i in 0..N {
-            let id = format!("req-{i}");
-            store
-                .record_issued_ticket(&IssuedTicketRecord {
-                    ticket: TransportTicket::issue(&id, "slug", "addr", i as u64, None),
-                    redeemer_npub: "npub-x".into(),
-                    // Half are CONSUMED — under the old cap these were exactly the eviction candidates.
-                    consumed_at: (i % 2 == 0).then_some(1_700_000_000),
-                    delivered_bytes: None,
-                    served_fingerprint: None,
-                })
-                .unwrap();
-        }
-        // EVERY record, not a sample: an eviction policy drops arbitrary keys, so spot-checking a
-        // handful passes by luck. (Observed 2026-09-01 — the sampled version of this test survived
-        // a mutation that was evicting ~88 of the 600.)
-        let missing: Vec<usize> = (0..N)
-            .filter(|i| store.load_issued_ticket(&format!("req-{i}")).unwrap().is_none())
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "{} of {N} records were evicted (first few: {:?}) — the map must retain every record, \
-             consumed or not",
-            missing.len(),
-            &missing[..missing.len().min(5)]
-        );
-    }
 
-    // ── QURATOR-79 Carrier 4 — the cache-serving branch of `payload` ─────────────────────────────
-
-    fn a_record(request_id: &str, author_npub: Option<String>, served_fingerprint: Option<String>) -> IssuedTicketRecord {
-        let mut ticket = TransportTicket::issue(request_id, "roms", "addr", 1_700_000_000, None);
+    /// A re-serve-shaped ticket: same shape `send_cached_manifest` mints (QURATOR-177 Option E
+    /// deleted the issued-ticket record these fixtures used to plant; the ticket's OWN
+    /// `author_npub` is the branch discriminator now, so the fixture IS the ticket).
+    fn a_re_serve_ticket(author_npub: Option<String>) -> TransportTicket {
+        let mut ticket = TransportTicket::issue("req-x", "roms", "addr", 1_700_000_000, None);
         ticket.author_npub = author_npub;
-        IssuedTicketRecord {
-            ticket,
-            redeemer_npub: "npub1x".into(),
-            consumed_at: None,
-            delivered_bytes: None,
-            served_fingerprint,
-        }
+        ticket
     }
 
-    /// Required test 1 — an owner-issued `request_id` (NO `served_fingerprint`) never falls through
-    /// to the cache. The dangerous shape is `author_npub` PRESENT with `served_fingerprint` absent
-    /// (a pre-Carrier-4 record, or a hand-crafted one): a sloppy branch that engages on the author
-    /// ALONE would re-resolve "newest for (author, slug)" and serve the cache; the correct code
-    /// takes the owner branch and rebuilds from the collection as it is NOW (ruling ②).
+    /// Required test 1 — an owner-issued ticket (`author_npub: None`) never falls through to the
+    /// cache.
+    ///
+    /// ⚠ **EXPECTATION DELIBERATELY CHANGED by QURATOR-177 slice 1 (owner ruling 2026-09-03).**
+    /// Until this slice the dangerous shape was `author_npub` PRESENT with `served_fingerprint`
+    /// ABSENT (a record written before the field existed): the branch required BOTH fields, so
+    /// that record took the owner-issued path, and this test asserted a "No draft found" error for
+    /// exactly that shape. The ruling makes `author_npub` ALONE the Carrier-4 signal — a
+    /// pre-field record with it set WAS a Carrier-4 mint (`send_cached_manifest` is the only
+    /// writer of `author_npub`), so it now belongs on the cache branch and is pinned there by
+    /// `a_pre_field_re_serve_record_is_resolved_from_the_cache` below. The owner-issued shape
+    /// THIS test pins is `author_npub: None`.
     ///
     /// MUTATION (reds this test): in `StoreManifestSource::payload`
     /// (crates/hb-app/src/manifest_source.rs, the `impl ManifestSource for StoreManifestSource`
-    /// block), weaken the two-field guard `if let (Some(author_npub), Some(fingerprint)) = ...` to
-    /// engage on the author ALONE — `if let Some(author_npub) = &rec.ticket.author_npub` — and
-    /// supply the `manifest_cache::get` fingerprint argument by re-resolving "newest for (author,
-    /// slug)" at serve time (e.g. via the same scan `send_cached_manifest_inner`'s
-    /// `newest_cached_for` performs). That is exactly the serve-time re-guess the design forbids:
-    /// the branch engages for the record below (author set, fingerprint None), the cache DOES hold
-    /// an entry for `(that author, "roms")`, the mutant serves it — and `unwrap_err()` panics.
+    /// block), weaken the author guard `if let Some(author_npub) = &ticket.author_npub` to
+    /// engage on every ticket — e.g. change the binding to
+    /// `ticket.author_npub.as_deref().or(Some(""))`. The ticket below has `author_npub: None`
+    /// and no draft for the slug, so the mutant takes the cache branch, the lookup misses, and the
+    /// error becomes "…no longer in the manifest cache" instead of "No draft found" — the assert
+    /// on the message reds. (The inverse mutation — any second condition on the guard that this
+    /// ticket cannot satisfy — reds `a_pre_field_re_serve_record_is_resolved_from_the_cache`
+    /// instead, which is this slice's load-bearing pin.)
     #[test]
     fn an_owner_issued_request_id_never_falls_through_to_the_cache() {
         let (_dir, store) = store();
@@ -478,8 +346,10 @@ mod tests {
             Identity::generate(),
             SessionBrowseKey::new([7u8; 32]),
         );
-        // The bait: a cache entry EXISTS for (author, "roms") — and no draft for the slug. The
-        // owner branch names the missing DRAFT; the cache branch would silently serve the entry.
+        // Scene-setting: the cache DOES hold some author's «roms» and there is no draft for the
+        // slug — the historical trap. The discriminator is the error message: only the owner
+        // branch can produce "No draft found" here, and only a cache HIT (not this fixture's
+        // stray entry) could produce an `Ok`.
         let author = Identity::generate();
         let author_npub = npub_of(&author);
         let env = hb_core::build_manifest_envelope(
@@ -501,28 +371,133 @@ mod tests {
             crate::manifest_cache::DEFAULT_MANIFEST_CACHE_BYTES,
         )
         .unwrap();
-        // `author_npub` set but `served_fingerprint` ABSENT: an owner-issued record for the same
-        // slug the cache happens to hold. Only the fingerprint's absence keeps this on the owner
-        // path — which is exactly the optional-field condition TICKET_V's exemption rests on.
-        store
-            .record_issued_ticket(&a_record("req-owner", Some(author_npub), None))
-            .unwrap();
-        let err = source.payload("req-owner").unwrap_err().to_string();
+        // `author_npub: None` — the OWNER-ISSUED ticket (QURATOR-177 slice 1 made the author
+        // field alone the branch condition; `served_fingerprint` no longer decides anything
+        // here). It names the same slug the cache happens to hold a copy of; the cache branch
+        // would silently serve that entry under a ticket that never carried Carrier-4 provenance.
+        let err = source.payload(&a_re_serve_ticket(None)).unwrap_err().to_string();
         assert!(
             err.contains("No draft found"),
             "an owner-issued record must take the build_slug_manifest branch, got: {err}"
         );
     }
 
-    /// Required test 2 — the LOAD-BEARING one. A `request_id` whose `served_fingerprint` names a
-    /// cache-MISS must ERROR, never fall through to `build_slug_manifest` or any other source. A
+    /// QURATOR-177 slice 1 — the LOAD-BEARING pin. A re-serve whose ticket names
+    /// `(author_npub, slug)` resolves **the currently cached entry for that key**. (Until
+    /// QURATOR-177 Option E the fingerprint to compare against came from the issued-ticket
+    /// record; the record is gone, and the ticket never carried a fingerprint — the newest cached
+    /// copy IS the resolution, with nothing to pin against.) The cache holds one entry per
+    /// `(npub, slug)` and a refetch `put` replaces it in place, so serve time wants what is
+    /// cached NOW. Under the pre-slice code (fingerprint-exact `get`) this fixture was a cache
+    /// miss and the whole call errored.
+    ///
+    /// MUTATION (reds this test): in `StoreManifestSource::payload`
+    /// (crates/hb-app/src/manifest_source.rs), change the resolve call
+    /// `manifest_cache::get_latest(&self.store.manifest_cache_dir(), author_npub, &ticket.slug,
+    /// now_secs())` back to a fingerprint-pinned lookup — e.g. refuse unless the cache holds an
+    /// entry whose fingerprint is present in some map the ticket cannot supply (or simply return
+    /// `Err` when the newest entry's fingerprint does not match a hardcoded "fp-at-mint"). Any
+    /// pinned-fingerprint arm misses on this fixture — the cache holds `fp-new` and no fingerprint
+    /// ever accompanied the ticket — so the call returns `Err` and `unwrap()` panics.
+    #[test]
+    fn a_re_serve_serves_the_currently_cached_snapshot_not_the_minted_one() {
+        let (_dir, store) = store();
+        let source = StoreManifestSource::new(
+            store.clone(),
+            Identity::generate(),
+            SessionBrowseKey::new([7u8; 32]),
+        );
+        // The refetch-shaped state: the cache was updated (fp-new) — the newest cached copy for
+        // `(author_npub, "roms")` is the fp-new envelope, and that is what must be served.
+        let author = Identity::generate();
+        let author_npub = npub_of(&author);
+        let env = hb_core::build_manifest_envelope(
+            &author,
+            "roms",
+            &[9u8; 32],
+            "fp-new",
+            1_700_000_000,
+            &[r#"{"slug":"roms","entries":[]}"#.to_string()],
+        )
+        .unwrap();
+        crate::manifest_cache::put(
+            &store.manifest_cache_dir(),
+            &author_npub,
+            "roms",
+            "fp-new",
+            &env.to_json().unwrap(),
+            1_700_000_000,
+            crate::manifest_cache::DEFAULT_MANIFEST_CACHE_BYTES,
+        )
+        .unwrap();
+        let payload = source.payload(&a_re_serve_ticket(Some(author_npub))).unwrap();
+        // The served bytes are the fp-new envelope, sealed — not the (now absent) fp-at-mint one,
+        // and not any same-slug owner build.
+        let served = String::from_utf8(payload.as_bytes().to_vec()).unwrap();
+        assert!(
+            served.contains("fp-new"),
+            "the re-serve must serve the currently cached snapshot, got: {served}"
+        );
+    }
+
+    /// QURATOR-177 slice 1 — `author_npub` alone is the Carrier-4 signal; Option E deletes the
+    /// issued-ticket record, so the ticket's own `author_npub` is the ONLY thing `payload` can
+    /// branch on. A ticket with the author set takes the CACHE branch, full stop.
+    ///
+    /// MUTATION (reds this test): in `StoreManifestSource::payload`
+    /// (crates/hb-app/src/manifest_source.rs), weaken the guard so this ticket escapes the cache
+    /// branch — e.g. add `&& author_npub.len() > 40` to the `if let`, or restore any second
+    /// condition the ticket cannot satisfy. The fixture has no draft for the slug, so the mutant
+    /// falls to the owner branch, `build_slug_manifest` errors "No draft found", and `unwrap()`
+    /// panics.
+    #[test]
+    fn a_pre_field_re_serve_record_is_resolved_from_the_cache() {
+        let (_dir, store) = store();
+        let source = StoreManifestSource::new(
+            store.clone(),
+            Identity::generate(),
+            SessionBrowseKey::new([7u8; 32]),
+        );
+        let author = Identity::generate();
+        let author_npub = npub_of(&author);
+        let env = hb_core::build_manifest_envelope(
+            &author,
+            "roms",
+            &[9u8; 32],
+            "fp-prefield",
+            1_700_000_000,
+            &[r#"{"slug":"roms","entries":[]}"#.to_string()],
+        )
+        .unwrap();
+        crate::manifest_cache::put(
+            &store.manifest_cache_dir(),
+            &author_npub,
+            "roms",
+            "fp-prefield",
+            &env.to_json().unwrap(),
+            1_700_000_000,
+            crate::manifest_cache::DEFAULT_MANIFEST_CACHE_BYTES,
+        )
+        .unwrap();
+        // No draft for the slug either, so the owner branch would error; only the cache branch
+        // can satisfy this call.
+        let payload = source.payload(&a_re_serve_ticket(Some(author_npub))).unwrap();
+        let served = String::from_utf8(payload.as_bytes().to_vec()).unwrap();
+        assert!(
+            served.contains("fp-prefield"),
+            "a pre-field re-serve record must resolve from the cache on the author alone, got: {served}"
+        );
+    }
+
+    /// Required test 2 — the LOAD-BEARING one. A re-serve whose `(author_npub, slug)` has NO cache
+    /// entry must ERROR, never fall through to `build_slug_manifest` or any other source. A
     /// "helpful" fallback would silently serve C's own same-slug collection as if it were A's.
     ///
     /// MUTATION (reds this test): in `StoreManifestSource::payload` (same containing impl block),
     /// turn the cache-miss into a FALLTHROUGH — nest the serve inside the hit so a miss skips it
     /// and execution reaches the `build_slug_manifest` call below the `if let`:
-    /// change `let json = manifest_cache::get(...).ok_or_else(|| ...)?` to
-    /// `if let Some(json) = manifest_cache::get(...) { ...return the sealed payload...; }` —
+    /// change `let json = manifest_cache::get_latest(...).ok_or_else(|| ...)?` to
+    /// `if let Some(json) = manifest_cache::get_latest(...) { ...return the sealed payload...; }` —
     /// the "helpful fallback" the design names. With the draft saved below, the mutant serves
     /// C's own «roms» envelope as if it were A's, the call returns `Ok`, and `unwrap_err()` panics.
     #[test]
@@ -533,9 +508,11 @@ mod tests {
             Identity::generate(),
             SessionBrowseKey::new([7u8; 32]),
         );
-        // The trap: C DOES own a same-slug collection (the draft exists), and the request carries
-        // an author + fingerprint that resolves to NO cache entry. Serving C's own «roms» here is
-        // exactly the cross-tenant collision the fence exists to prevent.
+        // The trap: C DOES own a same-slug collection (the draft exists), and the ticket carries
+        // an author whose `(author, "roms")` resolves to NO cache entry (the cache is empty for
+        // that key entirely — there is no fingerprint pin to miss, so the fixture plants nothing
+        // at all). Serving C's own «roms» here is exactly the
+        // cross-tenant collision the fence exists to prevent.
         store
             .save_collection_draft(&Collection {
                 slug: "roms".into(),
@@ -561,14 +538,10 @@ mod tests {
                 }],
             })
             .unwrap();
-        store
-            .record_issued_ticket(&a_record(
-                "req-re-serve",
-                Some("npub1author".into()),
-                Some("fp-not-in-the-cache".into()),
-            ))
-            .unwrap();
-        let err = source.payload("req-re-serve").unwrap_err().to_string();
+        let err = source
+            .payload(&a_re_serve_ticket(Some("npub1author".into())))
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("no longer in the manifest cache"),
             "a cache miss on a re-serve must error naming the cache, never serve a fallback: {err}"

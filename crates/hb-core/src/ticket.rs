@@ -31,14 +31,19 @@
 //! Each property answers a failure the alternatives cause, and each is enforced here rather than
 //! documented:
 //!
-//! 1. **Consumed on success, not attempt.** Hole-punching succeeds ~90% of the time and the
-//!    `drain_connection` teardown truncation is a known recurring bug, so a strictly one-attempt
-//!    ticket would put a **human back in the loop after a dropped connection** — for a transfer
-//!    both humans already agreed to. That is the launch embarrassment relocated, not fixed. **A
-//!    failed connection must cost nothing.** Enforced by [`RedemptionGrant`]: the only way to reach
-//!    a [`ConsumedTicket`] is [`RedemptionGrant::into_consumed`], which **requires the delivered
-//!    payload as proof**. There is no code path that consumes a ticket without the goods in hand,
-//!    and dropping a grant does nothing.
+//! 1. **No replay bookkeeping at all** (owner ruling 2026-09-03, QURATOR-177 Option E). Until that
+//!    ruling a ticket was "consumed on success" via `RedemptionGrant`/`ConsumedTicket` and a
+//!    durable spent bit on the issuer; the issued-ticket ledger that held it is DELETED, and with
+//!    it `RedemptionGrant`, `ConsumedTicket`, `into_consumed`, `matches_issued` and
+//!    `HbError::TicketAlreadyRedeemed`. Authorization happens at ASK time (the auto-approve path
+//!    consults the standing grant against the asker's npub, established by the NIP-17 seal); the
+//!    ticket is reduced to address delivery, so the serve path performs **no per-request
+//!    authorization lookup at all**. Deliberately given up: cross-restart replay protection and the
+//!    audit trail. **Do not re-introduce a spent bit, a replay set, or any per-request serve-side
+//!    authorization check — the absence is the ruling, not an oversight.** What actually prevents
+//!    repeat traffic is the TRIGGER condition on the asker (a refetch fires only when the
+//!    collection's fingerprint changed) plus the asker-side ask-trace spend gate in hb-app — never
+//!    a serve-side refusal.
 //! 2. **Redeemed immediately, with no affordance to defer.** *"There is no way of strategically
 //!    keeping a ticket to cash in later"* (owner) — which is what makes property 3 safe. This is an
 //!    **implementation constraint, not a nicety: do not add a "redeem later" button.**
@@ -65,13 +70,13 @@
 //! per-ask, and the asker's `ask_nonce` gate (fail-closed on `None`) still binds each ticket to one
 //! specific ask, so a standing grant never becomes a licence to make our client dial an address of
 //! someone's choosing unprompted. The one-per-request framing now describes mint discipline, not
-//! a limit on how often a granted peer may fetch: the ticket records that gate the re-serve are
-//! hb-app's (`load_issued_ticket` / `consumed_at`), not anything in this module.
+//! a limit on how often a granted peer may fetch. What gates a re-serve is hb-app's ask-trace
+//! spend gate and the standing-grant map, not anything in this module (the issued-ticket records
+//! `load_issued_ticket`/`consumed_at` were deleted by the same 2026-09-03 ruling).
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::HbError;
-use crate::transport_payload::ManifestPayload;
 
 /// Ticket schema version. Pinned in `wire_freeze`: a ticket rides a durable NIP-17 DM, so one
 /// already sitting in a relay-stored wrap must stay readable.
@@ -194,121 +199,30 @@ impl TransportTicket {
         Ok(())
     }
 
-    /// Does the ticket a redeemer presented match the one this node issued?
-    ///
-    /// **Every field except `node_addr`** — and that exclusion is the whole reason this method
-    /// exists rather than a `==`.
-    ///
-    /// The owner side used to compare the structs with `==`, which was wrong in a way that broke the
-    /// feature outright between two real machines (owner devtest 2026-08-27: "Send the full list"
-    /// returned the forged-ticket refusal with both peers online). The asker is *required* to rewrite
-    /// `node_addr` before redeeming: `redeem_manifest_ticket` runs it through `sanitize_node_addr`,
-    /// the QURATOR-113 #20 SSRF guard, which drops loopback/RFC1918/link-local/CGNAT transport
-    /// addresses and re-serializes what is left. Two machines on a LAN both advertise RFC1918
-    /// addresses, so the guard always changed the string, so the comparison could never succeed. Even
-    /// with nothing dropped, a parse-and-re-serialize round trip is not guaranteed byte-identical.
-    /// The loopback QUIC tests never caught it because they call `fetch_manifest` directly and so
-    /// never sanitize.
-    ///
-    /// **Excluding it costs nothing, because `node_addr` was never part of the capability.** It is
-    /// the ISSUER'S OWN address — a value this node generated and put in the ticket itself. Making
-    /// the asker echo it back byte-for-byte authenticates nobody: an attacker holding the ticket
-    /// holds the address too, and a redeemer that reached us self-evidently found a working address
-    /// already. The secret that rode a sealed one-recipient DM is the `request_id`/`ask_nonce`/`slug`
-    /// triple, and every one of those is still compared here. `authorize_redemption` then applies the
-    /// spent check on top.
-    #[must_use]
-    pub fn matches_issued(&self, issued: &Self) -> bool {
-        self.hb == issued.hb
-            && self.ticket_v == issued.ticket_v
-            && self.request_id == issued.request_id
-            && self.slug == issued.slug
-            && self.issued_at == issued.issued_at
-            && self.ask_nonce == issued.ask_nonce
-    }
 }
 
-/// Permission to attempt **one** redemption — and the only route to a [`ConsumedTicket`].
+// `matches_issued` — DELETED 2026-09-03, QURATOR-177 Option E (owner ruling: authorization is
+// at ASK time via the standing grant; the ticket is address delivery). Its only caller was the
+// serve gate that compared the presented ticket against the ledger's stored copy — that gate and
+// the ledger behind it are gone with the same ruling. The `node_addr`-exclusion lesson lives on
+// in the type's doc comments above.
+
+// `RedemptionGrant`, `RedemptionGrant::into_consumed`, `ConsumedTicket` and its accessors —
+// DELETED 2026-09-03, QURATOR-177 Option E (owner ruling 2026-09-03). Their entire purpose was
+// one-ticket-one-delivery replay bookkeeping: the issuer's node spent the ticket on the asker's
+// ACK and refused a later replay. The ruling deletes that machinery — the issued-ticket ledger
+// that durably held the spent bit is gone, and with it the need for a compile-time "consumed on
+// success" type story. Do not re-introduce a spent bit, a receipt, or any per-request
+// authorization state on the serve path: the absence is the ruling, not an oversight. What
+// prevents repeat traffic is the asker-side TRIGGER condition (a refetch fires only on a
+// fingerprint change) and the ask-trace spend gate in hb-app.
+
+// The redeem-time gate, run by the **issuer's** node as it accepts a connection.
 ///
-/// `#[must_use]` because ignoring one silently discards an authorization the user granted. Dropping
-/// it *without* calling [`Self::into_consumed`] is the failed-connection path and is deliberately a
-/// no-op: **the ticket stays unspent and a retry works.**
-///
-/// "Consumed on success, not on attempt" is a **compile-time** property, not a tested one — a
-/// caller cannot assert success, only demonstrate it. This must not compile:
-///
-/// ```compile_fail
-/// # use hb_core::ticket::{authorize_redemption, TransportTicket};
-/// let t = TransportTicket::issue("req-1", "slug", "addr", 0, None);
-/// let grant = authorize_redemption(&t, "req-1", false).unwrap();
-/// // A dropped connection has no ManifestPayload to hand over, so there is no way to reach
-/// // ConsumedTicket from here. Calling it with nothing is a type error, by design.
-/// let _receipt = grant.into_consumed();
-/// ```
-#[must_use = "a grant that is neither redeemed nor deliberately dropped means the approval was lost"]
-#[derive(Debug)]
-pub struct RedemptionGrant {
-    request_id: String,
-    slug: String,
-}
-
-impl RedemptionGrant {
-    /// Spend the ticket — **only reachable with the delivered payload in hand.**
-    ///
-    /// This signature *is* the enforcement of "consumed on success, not on attempt": there is no
-    /// way to call it after a dropped connection, because a dropped connection has no
-    /// [`ManifestPayload`] to pass. (Taking the payload by reference and returning a receipt, rather
-    /// than taking a bool, is the same discipline as INV-4′ mechanism 1 — the caller cannot assert
-    /// success, only demonstrate it.)
-    pub fn into_consumed(self, delivered: &ManifestPayload) -> ConsumedTicket {
-        ConsumedTicket {
-            request_id: self.request_id,
-            slug: self.slug,
-            delivered_bytes: delivered.len(),
-        }
-    }
-
-    pub fn request_id(&self) -> &str {
-        &self.request_id
-    }
-}
-
-/// Proof that a ticket was spent on a completed transfer. The caller records this so a replay of
-/// the same ticket is refused (see [`authorize_redemption`]'s `already_consumed`).
-///
-/// **The fields are private on purpose.** A receipt is evidence, and public fields made it
-/// *constructible* — anything could mint a `ConsumedTicket { .. }` and burn a ticket that was never
-/// delivered, which is the same class of hole as a serde derive on [`ManifestPayload`]. The only
-/// way to obtain one is [`RedemptionGrant::into_consumed`], with the payload in hand.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConsumedTicket {
-    request_id: String,
-    slug: String,
-    delivered_bytes: usize,
-}
-
-impl ConsumedTicket {
-    pub fn request_id(&self) -> &str {
-        &self.request_id
-    }
-
-    pub fn slug(&self) -> &str {
-        &self.slug
-    }
-
-    /// Size of what was actually delivered — the receipt's evidence, and useful for a log line.
-    pub fn delivered_bytes(&self) -> usize {
-        self.delivered_bytes
-    }
-}
-
-/// The redeem-time gate, run by the **issuer's** node as it accepts a connection.
-///
-/// Three checks, in this order, each of which a real failure mode motivates:
+/// Two checks, in this order, each of which a real failure mode motivates:
 ///
 /// 1. the ticket is structurally a ticket of a version we speak;
-/// 2. it answers **this** request (one ticket per ask — no spending A's ticket on B);
-/// 3. it has not already been consumed (replay of a completed transfer).
+/// 2. it answers **this** request (one ticket per ask — no spending A's ticket on B).
 ///
 /// Deliberately absent: any expiry comparison. There is no clock input, so this function
 /// *cannot* time-box a ticket even by accident.
@@ -316,50 +230,38 @@ impl ConsumedTicket {
 /// Also deliberately absent: any contact-standing check (owner ruling 2026-09-03, QURATOR-177 —
 /// blocking gates chat/DM interaction only, and was never read-access revocation). Do not re-add
 /// a standing parameter here.
+///
+/// And deliberately absent: the **already-consumed replay check** (owner ruling 2026-09-03,
+/// QURATOR-177 Option E). Until that ruling this function took an `already_consumed: bool` and
+/// refused a replay with `HbError::TicketAlreadyRedeemed`; the durable spent bit that fed it lived
+/// in hb-app's issued-ticket ledger, which the same ruling deletes. Its removal is a ruling, not
+/// an oversight: cross-restart replay protection and the audit trail were deliberately given up,
+/// because authorization belongs at ASK time (the standing grant, established under the NIP-17
+/// seal) and repeat traffic is prevented by the asker-side trigger condition, never by a
+/// serve-side refusal. Do not re-add a consumed/spent/replay input here.
 pub fn authorize_redemption(
     ticket: &TransportTicket,
     for_request_id: &str,
-    already_consumed: bool,
-) -> Result<RedemptionGrant, HbError> {
+) -> Result<(), HbError> {
     ticket.verify_shape()?;
     if ticket.request_id != for_request_id {
         return Err(HbError::InvalidTicket("ticket was issued for a different request".into()));
     }
-    if already_consumed {
-        return Err(HbError::TicketAlreadyRedeemed);
-    }
-    Ok(RedemptionGrant { request_id: ticket.request_id.clone(), slug: ticket.slug.clone() })
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::Identity;
-    use crate::manifest::build_manifest_envelope;
 
     fn ticket() -> TransportTicket {
         TransportTicket::issue("req-1", "my-slug", "node-addr-opaque", 1_700_000_000, Some("nonce-1"))
     }
 
-    fn delivered() -> ManifestPayload {
-        let id = Identity::generate();
-        let env = build_manifest_envelope(
-            &id,
-            "my-slug",
-            &[3u8; 32],
-            "fp-abc",
-            1_700_000_000,
-            &[r#"{"part":0,"entries":[]}"#.to_string()],
-        )
-        .unwrap();
-        ManifestPayload::seal(&env).unwrap()
-    }
 
     #[test]
     fn a_valid_ticket_for_this_request_is_authorized() {
-        let grant =
-            authorize_redemption(&ticket(), "req-1", false).unwrap();
-        assert_eq!(grant.request_id(), "req-1");
+        authorize_redemption(&ticket(), "req-1").unwrap();
     }
 
     /// **The nonce is what makes an approval answer ONE ask** (owner ruling ① 2026-07-31). It
@@ -464,35 +366,14 @@ mod tests {
         back.verify_shape().unwrap();
     }
 
-    /// **Property 1 — a failed connection costs nothing.** The grant is dropped without
-    /// `into_consumed`, the ticket is still not consumed, and the retry authorizes again.
-    #[test]
-    fn a_failed_attempt_does_not_consume_the_ticket_and_a_retry_succeeds() {
-        let t = ticket();
-        let mut consumed = false;
-
-        // Attempt 1: authorized, then the connection dies. Nothing calls `into_consumed`.
-        let grant = authorize_redemption(&t, "req-1", consumed).unwrap();
-        drop(grant);
-        assert!(!consumed, "a dropped grant cannot have consumed anything — there is no path");
-
-        // Attempt 2: the same ticket still works.
-        let grant = authorize_redemption(&t, "req-1", consumed)
-            .expect("a retry after a failed connection must be authorized");
-        let receipt = grant.into_consumed(&delivered());
-        consumed = true;
-        assert_eq!(receipt.request_id(), "req-1");
-        assert!(receipt.delivered_bytes() > 0, "the receipt records what actually arrived");
-
-        // Attempt 3: now that it succeeded, a replay is refused.
-        assert!(
-            matches!(
-                authorize_redemption(&t, "req-1", consumed),
-                Err(HbError::TicketAlreadyRedeemed)
-            ),
-            "a completed transfer consumes the ticket and a replay is refused"
-        );
-    }
+    // DELETED 2026-09-03, QURATOR-177 Option E (owner ruling: authorization is at ASK time via the
+    // standing grant; the ticket is address delivery): `a_failed_attempt_does_not_consume_the_
+    // ticket_and_a_retry_succeeds` pinned the withdrawn one-ticket-one-delivery consume semantics —
+    // drop a `RedemptionGrant` without `into_consumed`, retry, then assert the successful delivery
+    // consumes and a replay is refused with `TicketAlreadyRedeemed`. The grant, the receipt, the
+    // spent bit and the error variant are all gone with the ruling, so "a failed connection costs
+    // nothing" now holds trivially (nothing is ever recorded to cost anything) and the replay half
+    // pinned withdrawn behaviour. Deliberately given up: durable replay protection.
 
     /// **Property 3 — not time-boxed.** An approval issued while the asker was offline is still
     /// redeemable when they return, however long that took.
@@ -501,9 +382,8 @@ mod tests {
         // Issued a year ago. There is no clock argument to `authorize_redemption` at all, so this
         // cannot depend on elapsed time — which is the point.
         let ancient = TransportTicket::issue("req-1", "my-slug", "node-addr-opaque", 1, None);
-        let grant = authorize_redemption(&ancient, "req-1", false)
+        authorize_redemption(&ancient, "req-1")
             .expect("a ticket is valid until redeemed, never expired");
-        assert_eq!(grant.request_id(), "req-1");
     }
 
     /// **Property 3, structurally.** The absence of an expiry field is a ruling, not an oversight —
@@ -530,66 +410,32 @@ mod tests {
     // redeems. Blocking still gates chat/DM (pinned in hb-app's `commands/chat.rs`, e.g.
     // `proactive_block_refuses_later_dms_and_unblock_restores_acceptance`).
 
-    /// **The standing grant as this module sees it** (owner ruling 2026-08-31, QURATOR-137). A
-    /// granted peer's next fetch is a NEWLY MINTED ticket: the previous ticket's consumption is
-    /// spent-ticket bookkeeping, not a revoke of the peer. The "re-read live standing at every
-    /// redeem" half of the old pin was WITHDRAWN by owner ruling 2026-09-03 (QURATOR-177:
-    /// blocking gates chat/DM interaction only and must not meaningfully affect other traffic) —
-    /// and it was never end-to-end revocation: since Carrier 4 a mutual contact may still re-serve
-    /// its cached copy without consulting the author, and re-keying does not rescue that. Never
-    /// call blocking revocation.
-    ///
-    /// P-10 mutations the orchestrator must apply and see red (do not run here):
-    /// (a) delete the `if already_consumed { return Err(HbError::TicketAlreadyRedeemed); }` arm in
-    ///     `authorize_redemption` — the replay assertion below must fail.
-    /// No edit *inside* this module can redden the "second mint authorizes" half, because the module
-    /// holds no cross-call state — that statelessness is the finding: hb-core's entire change for
-    /// the ruling was deletions (the standing parameter, the `ContactStanding` type, the error
-    /// variant), with no behavioural rewrite beyond what those deletions express.
-    #[test]
-    fn a_standing_grant_re_mints_rather_than_replays() {
-        // Fetch 1: the granted peer redeems ticket req-1 successfully.
-        let first = ticket();
-        let grant = authorize_redemption(&first, "req-1", false).unwrap();
-        let _receipt = grant.into_consumed(&delivered());
-
-        // That ticket is spent: a replay of it is refused — spent-ticket bookkeeping.
-        assert!(
-            matches!(
-                authorize_redemption(&first, "req-1", true),
-                Err(HbError::TicketAlreadyRedeemed)
-            ),
-            "consuming one ticket never licenses a replay of the same ticket"
-        );
-
-        // Fetch 2 — same peer, same collection, no new ask needed: a FRESH mint authorizes. The
-        // prior consumption is not a revoke of the grant. Standing is not consulted at all
-        // (QURATOR-177), so this holds for a blocked or removed peer exactly as for a good-standing
-        // one — the seam-level pins for that live in hb-app (`manifest_source.rs`,
-        // `auto_approve.rs`).
-        let second = TransportTicket::issue(
-            "req-2",
-            "my-slug",
-            "node-addr-opaque",
-            1_700_000_100,
-            Some("nonce-2"),
-        );
-        let grant = authorize_redemption(&second, "req-2", false)
-            .expect("a granted peer's next fetch is a new ticket, not a replay of the spent one");
-        drop(grant); // not delivered — costs nothing, and does not touch the grant
-    }
+    // DELETED 2026-09-03, QURATOR-177 Option E (owner ruling): `a_standing_grant_re_mints_rather_
+    // than_replays` pinned the withdrawn spent-ticket bookkeeping — consume ticket req-1 via
+    // `into_consumed`, assert a replay of it is refused with `TicketAlreadyRedeemed`, then assert a
+    // fresh mint authorizes. The consume/refuse half exercised machinery the ruling deletes (the
+    // grant, the receipt, the durable spent bit); the fresh-mint half is now trivially true for
+    // EVERY ticket, granted or not, because nothing is ever recorded. The asker-side ask-trace
+    // spend gate (`AskClaim::Spent`) is what one-ask-one-fetch means now, pinned in hb-app's
+    // `manifest_source.rs`.
 
     /// **One ticket per ask** — a ticket cannot be spent on a different request or collection.
     /// UNCHANGED by the 2026-08-31 standing-grant ruling: that ruling changes WHO is entitled to a
     /// ticket (a granted peer, without re-asking), not WHAT a ticket is bound to. `request_id` +
     /// `ask_nonce` remain the anti-forgery binding (a peer must not make our client dial an address
     /// of their choosing "for" a request we never made), so this stays exactly as pinned.
+    ///
+    /// MUTATION (P-10, orchestrator applies and must see this red): in `authorize_redemption`
+    /// (crates/hb-core/src/ticket.rs), delete the
+    /// `if ticket.request_id != for_request_id { return Err(HbError::InvalidTicket(...)); }` arm —
+    /// this test reds on the `matches!(Err(HbError::InvalidTicket(_)))` assertion while still
+    /// compiling.
     #[test]
     fn a_ticket_is_bound_to_its_own_request() {
         let t = ticket();
         assert!(
             matches!(
-                authorize_redemption(&t, "req-2", false),
+                authorize_redemption(&t, "req-2"),
                 Err(HbError::InvalidTicket(_))
             ),
             "a ticket issued for req-1 must not redeem req-2"
@@ -625,69 +471,16 @@ mod tests {
             );
         }
     }
-    /// **The devtest 2026-08-27 regression.** The owner clicked "Send the full list" with both dev
-    /// machines online and the asker got the refusal reserved for a forged ticket. Cause: the owner
-    /// side compared the two tickets with `==`, but the asker MUST rewrite `node_addr` first
-    /// (`sanitize_node_addr`, the QURATOR-113 #20 SSRF guard, drops RFC1918/loopback/link-local/CGNAT
-    /// addresses and re-serializes). Two machines on a LAN always trip that, so the check could never
-    /// pass. This is the red-green: it fails against a `==` comparison and passes against
-    /// `matches_issued`.
-    #[test]
-    fn a_redeemer_that_sanitized_the_node_addr_still_matches_the_issued_ticket() {
-        let issued = TransportTicket::issue(
-            "req-1",
-            "vhs",
-            r#"{"node_id":"abc","addrs":["192.168.1.20:41234","203.0.113.9:41234"]}"#,
-            1_700_000_000,
-            Some("nonce-1"),
-        );
 
-        // What the asker actually presents: same ticket, private address stripped by the SSRF guard.
-        let mut presented = issued.clone();
-        presented.node_addr = r#"{"node_id":"abc","addrs":["203.0.113.9:41234"]}"#.to_string();
-
-        assert_ne!(presented, issued, "the fixture must actually differ, or this proves nothing");
-        assert!(
-            presented.matches_issued(&issued),
-            "a redeemer that sanitized the address it was given must still be recognised"
-        );
-    }
-
-    /// The other half: everything that IS the capability still has to match, or the exclusion of
-    /// `node_addr` would have widened the gate instead of correcting it. Each field is mutated on its
-    /// own so a single over-broad `true` cannot pass this.
-    #[test]
-    fn matches_issued_still_refuses_every_capability_field_mismatch() {
-        let issued = TransportTicket::issue("req-1", "vhs", "addr-a", 1_700_000_000, Some("nonce-1"));
-
-        let mut wrong_request = issued.clone();
-        wrong_request.request_id = "req-2".into();
-        assert!(!wrong_request.matches_issued(&issued), "a different request id is refused");
-
-        let mut wrong_slug = issued.clone();
-        wrong_slug.slug = "betamax".into();
-        assert!(!wrong_slug.matches_issued(&issued), "a ticket redirected at another collection is refused");
-
-        let mut wrong_nonce = issued.clone();
-        wrong_nonce.ask_nonce = Some("nonce-2".into());
-        assert!(!wrong_nonce.matches_issued(&issued), "a different ask nonce is refused");
-
-        let mut no_nonce = issued.clone();
-        no_nonce.ask_nonce = None;
-        assert!(!no_nonce.matches_issued(&issued), "dropping the nonce entirely is refused");
-
-        let mut wrong_issued_at = issued.clone();
-        wrong_issued_at.issued_at += 1;
-        assert!(!wrong_issued_at.matches_issued(&issued), "a re-dated ticket is refused");
-
-        let mut wrong_v = issued.clone();
-        wrong_v.ticket_v = TICKET_V + 1;
-        assert!(!wrong_v.matches_issued(&issued), "a different ticket version is refused");
-
-        let mut wrong_tag = issued.clone();
-        wrong_tag.hb = "hb-something-else".into();
-        assert!(!wrong_tag.matches_issued(&issued), "a different discriminator is refused");
-
-        assert!(issued.matches_issued(&issued), "and the unmodified ticket still matches");
-    }
+    // DELETED 2026-09-03, QURATOR-177 Option E (owner ruling: authorization is at ASK time via the
+    // standing grant; the ticket is address delivery):
+    // `a_redeemer_that_sanitized_the_node_addr_still_matches_the_issued_ticket` and
+    // `matches_issued_still_refuses_every_capability_field_mismatch` pinned `matches_issued` — the
+    // serve-path comparison of the presented ticket against the ledger's stored copy, deliberately
+    // excluding `node_addr` (the devtest 2026-08-27 `==` defect). That comparison's only caller was
+    // the serve gate `serve_manifest_stream` ran after `source.issued(...)`; the gate and the
+    // ledger behind it are deleted by the same ruling, so there is no stored copy left to compare
+    // against. The `node_addr`-rewriting requirement itself survives: `sanitize_node_addr` still
+    // runs asker-side (QURATOR-113 #20), and `a_redeemer_that_sanitized_the_node_addr_is_still_
+    // served` in hb-app's transport.rs pins that a sanitized ticket is served over real QUIC.
 }

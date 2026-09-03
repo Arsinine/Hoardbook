@@ -135,8 +135,9 @@ fn build_system_tray(app: &mut tauri::App) -> tauri::Result<()> {
 ///
 /// **Binding happens in three places, not one** — an earlier version of this comment named only the
 /// first and was therefore misleading about when a QUIC endpoint and its accept loop come up:
-///   1. `transport_state::rebind_if_tickets_outstanding` at startup, when an unspent ticket is on
-///      the books (a ticket outlives the session that issued it);
+///   1. `transport_state::rebind_if_tickets_outstanding` at startup, when a standing grant is on
+///      the books (a ticket outlives the session that issued it; QURATOR-177 Option E replaced the
+///      unspent-ticket read with the permanent grant map, which never empties);
 ///   2. `send_full_list`, when the owner approves a request;
 ///   3. **`redeem_manifest_ticket`** — the ASKER binds too, in order to dial. Since owner ruling ③
 ///      that binding is **dial-only** (`Role::DialOnly`): no advertised ALPN and no accept loop, so
@@ -433,8 +434,9 @@ pub fn run() {
 
             // M18 W4: a ticket is valid until redeemed, so an approval given last session must still
             // be dialable this one. `restore_identity` populates synchronously above, so the transport
-            // key is available here. Binds ONLY if an unspent ticket is on the books — see
-            // `transport_state::rebind_if_tickets_outstanding` for why that asymmetry is deliberate.
+            // key is available here. Binds ONLY if this node has ever issued an approval (QURATOR-177
+            // Option E: the standing-grant map, permanent by ruling — see
+            // `transport_state::rebind_if_tickets_outstanding` for why that asymmetry is deliberate).
             //
             // QURATOR-68: this same task also runs the NAT classification probe once the transport
             // key is available. The probe is a one-shot `bind_client_endpoint` (owner ruling ③ —

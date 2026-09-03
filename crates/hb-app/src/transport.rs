@@ -36,25 +36,36 @@
 //! **The trailing receipt frame is not a courtesy.** Writing bytes proves only that the *sender* had
 //! them; the ACK is the asker asserting that a manifest it could actually parse, verify, match to its
 //! ticket **and accept** is now in hand — the acceptance gate is the caller's, and it runs before the
-//! ACK precisely so the owner never spends a ticket on a manifest the asker then rejects. Everything about "consumed on success" rests on it — see
-//! [`serve_manifest_stream`]. Every step also carries a deadline, so a peer cannot hold a handler
+//! ACK precisely so the asker never asserts possession of a manifest it cannot use. (Until
+//! QURATOR-177 Option E the ACK also spent the ticket; the spent bit is deleted with the ledger —
+//! see [`serve_manifest_stream`] — but the ACK's meaning is unchanged.) Every step also carries a deadline, so a peer cannot hold a handler
 //! open by connecting and going quiet.
 //!
 //! ## Authorization — the capability is the ticket, not the address
 //!
 //! There is no binding token here and the retired follower gate is **not** re-imported. The asker
-//! presents the [`TransportTicket`] it received, and the owner's node checks it against what it
-//! actually issued for that request, then runs [`authorize_redemption`]. A redeem-time contact
-//! standing check used to run here too, withdrawn by owner ruling 2026-09-03 (QURATOR-177):
-//! blocking gates chat/DM interaction only — and it was never read-access revocation, since a
-//! mutual contact may re-serve a cached copy (Carrier 4) and a public browse key is a single
-//! forwardable string.
+//! presents the [`TransportTicket`] it received; the owner's node runs [`authorize_redemption`] on
+//! it (shape + the request binding) and serves. A redeem-time contact standing check used to run
+//! here too, withdrawn by owner ruling 2026-09-03 (QURATOR-177): blocking gates chat/DM interaction
+//! only — and it was never read-access revocation, since a mutual contact may re-serve a cached
+//! copy (Carrier 4) and a public browse key is a single forwardable string.
+//!
+//! **There is NO per-request authorization lookup on the serve path at all** (owner ruling
+//! 2026-09-03, QURATOR-177 Option E). Authorization happens at ASK time — the auto-approve loop
+//! consults the standing grant against the asker's npub, established by the NIP-17 seal on the
+//! request DM — and the ticket is reduced to address delivery. The issued-ticket ledger that used
+//! to answer "what did we issue for this request, and is it spent?" is deleted with the same
+//! ruling, and deliberately given up with it: durable replay protection and the audit trail. Do
+//! not re-introduce a grant lookup, a replay set, a peer-identity check, or a rate limit on the
+//! serve path — **the absence is the ruling, not an oversight.** What bounds repeat traffic is the
+//! asker-side trigger condition (a refetch fires only when the collection's fingerprint changed)
+//! and the ask-trace claim gate in hb-app, never a serve-side refusal.
 //!
 //! The ticket rode a **sealed NIP-17 DM to one recipient**, so presenting it back is evidence of
-//! receipt — but note precisely what it is: a **BEARER capability**. The owner verifies the ticket
-//! and the spent bit; it does not authenticate the connecting peer as the
+//! receipt — but note precisely what it is: a **BEARER capability**. The owner verifies the ticket's
+//! shape and request binding; it does not authenticate the connecting peer as the
 //! recipient, and it cannot, because this design deliberately has no `npub`→node-key map to check
-//! against. A recipient who forwards the ticket JSON lets someone else dial and spend it. What that
+//! against. A recipient who forwards the ticket JSON lets someone else dial and redeem it. What that
 //! costs is the OWNER's address plus one ciphertext delivery — binding a ticket to the asker's
 //! transport identity would need the asker's node key on the wire, which is an owner-level protocol
 //! decision, not a local fix. Note also what the capability is *not*: read access. The payload stays browse-key
@@ -62,24 +73,22 @@
 //! reserves between a share code (grants *read*) and a transport ticket (grants *connect and
 //! fetch*).
 //!
-//! **Consumed on success needs both halves: the type system AND the receipt.** The owner side holds
-//! a `RedemptionGrant`, and the only route to a `ConsumedTicket` is `into_consumed(&ManifestPayload)`
-//! — so no code path burns a ticket without the goods. But that signature proves only that *we* had
-//! the payload, which is why the grant is spent only after the asker's ACK: a peer that read half the
-//! payload and died would otherwise still burn the ticket, which is precisely the "human back in the
-//! loop after a dropped connection" failure the owner's ruling exists to prevent. A connection that
-//! dies mid-write drops the grant, which is a no-op: the ticket stays unspent and the retry works.
-//! [`drain_connection`](crate::conn::drain_connection) still precedes it — without the drain a fast
-//! link can close ahead of the last chunk.
+//! **No receipt, no spent bit.** Until 2026-09-03 the owner side held a `RedemptionGrant`, spent
+//! only after the asker's ACK (`into_consumed(&ManifestPayload)` — "consumed on success"), and
+//! refused a replay. That machinery is deleted by the ruling above; what survives of it here is the
+//! framing and the slug binding. [`drain_connection`](crate::conn::drain_connection) still
+//! precedes the owner's close — without it a fast link can close ahead of the last chunk.
 //!
-//! **One ticket, one delivery.** [`ManifestPlane`] holds an in-flight set keyed by `request_id`,
-//! because the read of `already_consumed` and the write of the receipt are far apart and two
-//! concurrent connections would otherwise both pass the gate.
+//! **One concurrent redemption per `request_id`.** [`ManifestPlane`] holds an in-flight set keyed
+//! by `request_id`, so two simultaneous connections presenting the same ticket cannot both drive
+//! half-delivered streams against the same payload resolution at once; the guard is per-connection
+//! concurrency control, **not** authorization (which would be a new serve-path check the ruling
+//! forbids).
 
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use hb_core::ticket::{authorize_redemption, ConsumedTicket, TransportTicket, TICKET_TAG};
+use hb_core::ticket::{authorize_redemption, TransportTicket, TICKET_TAG};
 use hb_core::{ManifestPayload, MANIFEST_MAX_TRANSPORT_BYTES};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -104,7 +113,10 @@ const REFUSAL_MAX_FRAME: usize = 4 * 1024;
 /// The single refusal for "no approved request matches this ticket". A **constant** rather than two
 /// identical string literals, because the property that an unknown request id and a forged ticket
 /// are indistinguishable is only as good as the two messages staying byte-identical — and two
-/// literals drift the first time someone improves one of them.
+/// literals drift the first time someone improves one of them. (Under QURATOR-177 Option E the
+/// indistinguishable pair is *a malformed ticket and a wrong-request ticket* — the issued-record
+/// lookup whose absence used to be the other half of the pair is deleted with the ledger; the
+/// constant itself and the indistinguishability property stay.)
 const REFUSAL_NO_MATCH: &str = "no approved manifest request matches this ticket";
 
 /// How long the owner's side waits for a peer to open a stream and finish its request frame.
@@ -151,38 +163,28 @@ pub struct FetchRequest {
     pub ticket: TransportTicket,
 }
 
-/// What the owner's node knows about a request at redeem time: the ticket it *actually issued*, and
-/// whether it has already been spent. The live-standing field it used to carry was removed by owner
-/// ruling 2026-09-03 (QURATOR-177) — blocking gates chat/DM interaction only, never serving.
-#[derive(Debug, Clone)]
-pub struct IssuedTicket {
-    pub ticket: TransportTicket,
-    pub already_consumed: bool,
-}
+// `IssuedTicket` and the `issued()`/`record_consumed()` trait methods — DELETED 2026-09-03,
+// QURATOR-177 Option E (owner ruling: authorization is at ASK time via the standing grant; the
+// ticket is address delivery). `issued()` was the serve path's lookup into the issued-ticket
+// ledger ("what did we mint for this request, and is it spent?"); `record_consumed()` wrote the
+// durable spent bit that fed it. Both the ledger and the whole one-ticket-one-delivery story are
+// gone with the ruling — deliberately, giving up cross-restart replay protection and the audit
+// trail. Do not re-introduce either method or any per-request authorization lookup on the serve
+// path: the absence is the ruling, not an oversight.
 
 /// The owner side's seam onto app state. A trait so the plane is testable over real QUIC without
 /// Tauri, and so the plane itself holds no store handle.
 ///
-/// **Note what `payload` returns and does not take:** a [`ManifestPayload`] for a `request_id`.
-/// There is no path parameter and no byte-slice parameter, so an implementation cannot answer with a
-/// collection file even if it wanted to — mechanism 1 reaching one layer up from the type into the
-/// seam. The parameter is an opaque identifier, exactly as it was when it was a bare slug (a
-/// `request_id` string is no more of a byte-slice-or-path escape hatch than a slug string was):
-/// each implementation resolves its own payload from it — the owner path rebuilds from the
-/// collection as it is NOW, the carrier-4 re-serve path replays the mint-time cache decision.
+/// **Note what `payload` returns and does not take:** a [`ManifestPayload`] for a presented
+/// [`TransportTicket`]. There is no path parameter and no byte-slice parameter, so an
+/// implementation cannot answer with a collection file even if it wanted to — mechanism 1
+/// reaching one layer up from the type into the seam. The ticket names the slug and (for a
+/// Carrier-4 re-serve) the author to resolve from: the owner path rebuilds from the collection as
+/// it is NOW, the carrier-4 re-serve path serves the newest cached copy for `(author_npub, slug)`
+/// (QURATOR-177 slice 1).
 pub trait ManifestSource: Send + Sync + 'static {
-    /// What we issued for `request_id`, or `None` if we issued nothing (an invented request id).
-    fn issued(&self, request_id: &str) -> Option<IssuedTicket>;
-
-    /// The manifest for an authorized request, resolved from the `request_id` the asker presented.
-    fn payload(&self, request_id: &str) -> Result<ManifestPayload>;
-
-    /// Record the receipt, so a replay of the same ticket is refused by the next `issued` call.
-    ///
-    /// **Fallible on purpose.** A lost write leaves the ticket unspent on disk, so a replay would be
-    /// served a second manifest — the one-ticket-one-delivery property is only as durable as this
-    /// call. Returning `Err` lets [`ManifestPlane`] fail closed instead of merely logging.
-    fn record_consumed(&self, receipt: &ConsumedTicket) -> Result<()>;
+    /// The manifest for the request the presented ticket answers.
+    fn payload(&self, ticket: &TransportTicket) -> Result<ManifestPayload>;
 }
 
 // ---------------------------------------------------------------------------
@@ -329,16 +331,27 @@ async fn drain_refusal(conn: &iroh::endpoint::Connection) {
 // Owner side — serve one manifest for one ticket
 // ---------------------------------------------------------------------------
 
-/// Serve one request over an already-accepted bi-stream. Returns the receipt when the asker
-/// **acknowledged** a valid manifest, `Ok(None)` when the request was refused for a stated reason.
+/// Serve one request over an already-accepted bi-stream. Returns the delivered payload when the
+/// asker **acknowledged** a valid manifest, `Ok(None)` when the request was refused for a stated
+/// reason.
 ///
 /// Generic over the streams so the framing and the gate are testable without QUIC; the real caller
 /// is [`ManifestPlane::serve`].
+///
+/// **No authorization lookup happens here** (owner ruling 2026-09-03, QURATOR-177 Option E): the
+/// ask was authorized when it was made — the standing grant, checked under the NIP-17 seal — and
+/// the ticket is address delivery. Until that ruling this function looked up the issued-ticket
+/// record (`source.issued`), compared the presented ticket against the stored one
+/// (`matches_issued`) and refused a spent one; all three steps are deleted with the ledger, and
+/// deliberately so, giving up durable replay protection and the audit trail. What remains is
+/// parsing, the request-binding check (`authorize_redemption`: shape + the ticket answers THIS
+/// request) — a correctness check, not authorization — the payload resolution, and the byte/slug
+/// binding.
 pub(crate) async fn serve_manifest_stream(
     mut send: impl tokio::io::AsyncWrite + Unpin,
     mut recv: impl tokio::io::AsyncRead + Unpin,
     source: &dyn ManifestSource,
-) -> Result<Option<(ConsumedTicket, ManifestPayload)>> {
+) -> Result<Option<ManifestPayload>> {
     let frame = with_deadline(
         HANDSHAKE_DEADLINE,
         "the asker never finished sending its request",
@@ -353,60 +366,41 @@ pub(crate) async fn serve_manifest_stream(
         }
     };
 
-    let Some(issued) = source.issued(&req.request_id) else {
-        // Deliberately not "no such request" — an unknown id and a wrong ticket get the same
-        // answer, so a prober learns nothing about which requests exist.
-        refuse(&mut send, REFUSAL_NO_MATCH).await?;
-        return Ok(None);
-    };
-
-    // The ticket presented must be the ticket issued. This — not the node address, and not the
-    // request id — is the capability: it rode a sealed DM to one recipient.
-    //
-    // `matches_issued`, NOT `!=`. The comparison deliberately excludes `node_addr`, because the
-    // asker is REQUIRED to rewrite that field before redeeming (`redeem_manifest_ticket` runs it
-    // through `sanitize_node_addr`, the QURATOR-113 #20 SSRF guard). A `!=` here therefore refused
-    // every honest redemption between two machines on a LAN — see `matches_issued`'s doc comment for
-    // the full account and for why dropping that field from the comparison authenticates exactly as
-    // much as it did before.
-    if !req.ticket.matches_issued(&issued.ticket) {
+    // The request-binding gate (correctness, not authorization): the ticket must be structurally
+    // valid and answer the request it was presented under. A malformed or wrong-request ticket is
+    // refused identically — the same constant — so a prober learns nothing about which requests
+    // exist. (Until QURATOR-177 Option E this also refused a spent ticket; that arm is deleted
+    // with the ledger.)
+    if authorize_redemption(&req.ticket, &req.request_id).is_err() {
         refuse(&mut send, REFUSAL_NO_MATCH).await?;
         return Ok(None);
     }
 
-    let grant = match authorize_redemption(&issued.ticket, &req.request_id, issued.already_consumed) {
-        Ok(g) => g,
-        Err(e) => {
-            refuse(&mut send, &format!("ticket refused: {e}")).await?;
-            return Ok(None);
-        }
-    };
-
-    let payload = match source.payload(&req.request_id) {
+    let payload = match source.payload(&req.ticket) {
         Ok(p) => p,
         Err(e) => {
-            // The grant is dropped here without `into_consumed`, so the ticket is untouched and the
-            // asker can retry once the owner's side is healthy. A failure must cost nothing.
+            // A payload-resolution failure costs nothing: the asker can retry once the owner's
+            // side is healthy.
             refuse(&mut send, &format!("could not produce the manifest: {e}")).await?;
             return Ok(None);
         }
     };
 
-    // **Bind the bytes to the ticket.** `ManifestSource::payload(request_id)` resolving to the
-    // right collection is a naming convention, and a convention is not enforcement: a source that
-    // answers with collection B for a ticket naming
-    // collection A would otherwise be served, and the asker would accept it as self-consistent
-    // (it *is* — it is a perfectly valid envelope for the wrong collection). A ticket names one
-    // collection; the bytes must agree. Checked on both sides — see `fetch_over_connection`.
+    // **Bind the bytes to the ticket.** `ManifestSource::payload(ticket)` resolving to the right
+    // collection is a naming convention, and a convention is not enforcement: a source that
+    // answers with collection B for a ticket naming collection A would otherwise be served, and
+    // the asker would accept it as self-consistent (it *is* — it is a perfectly valid envelope
+    // for the wrong collection). A ticket names one collection; the bytes must agree. Checked on
+    // both sides — see `fetch_over_connection`.
     match payload.declared_slug() {
-        Ok(declared) if declared == issued.ticket.slug => {}
+        Ok(declared) if declared == req.ticket.slug => {}
         Ok(declared) => {
             refuse(
                 &mut send,
                 &format!(
                     "refusing to serve: the manifest describes '{declared}' but this ticket is for \
                      '{}'",
-                    issued.ticket.slug
+                    req.ticket.slug
                 ),
             )
             .await?;
@@ -430,17 +424,14 @@ pub(crate) async fn serve_manifest_stream(
     )
     .await??;
 
-    // ── The receipt frame: what turns "we wrote it" into "they have it" ──
+    // ── The acknowledgement frame ──
     //
     // Writing the bytes proves only that WE had them. The asker acknowledges only after
     // `ManifestPayload::from_wire` and the slug check have both passed on its side, so an ACK means
-    // a validated manifest is in the asker's hands. **Without this, a peer that read half the
-    // payload and died would still burn the ticket** — the connection closes, the drain returns, and
-    // the receipt is recorded for a transfer that never landed. That is exactly the "human back in
-    // the loop after a dropped connection" failure the owner's ruling exists to prevent.
-    //
-    // A timeout here is NOT a success: the grant is dropped, the ticket stays unspent, the retry
-    // works.
+    // a validated manifest is in the asker's hands. Until QURATOR-177 Option E this is also where
+    // the ticket was spent (`into_consumed`); the receipt is gone with the ledger, but the ACK
+    // still matters — it is what tells this side the transfer actually landed rather than dying
+    // mid-write, so a failure is reported (and logged) as undelivered.
     match with_deadline(
         ACK_DEADLINE,
         "the asker never acknowledged the manifest — treating it as undelivered",
@@ -448,37 +439,35 @@ pub(crate) async fn serve_manifest_stream(
     )
     .await
     {
-        Ok(Ok(STATUS_OK)) => Ok(Some((grant.into_consumed(&payload), payload))),
+        Ok(Ok(STATUS_OK)) => Ok(Some(payload)),
         Ok(Ok(other)) => Err(anyhow!("asker sent {other} instead of an acknowledgement")),
         Ok(Err(e)) => Err(anyhow!("asker closed before acknowledging: {e}")),
         Err(e) => Err(e),
     }
 }
 
-/// The manifest plane's accept side: a [`ManifestSource`] plus the **in-flight set** that makes one
-/// ticket one delivery.
+/// The manifest plane's accept side: a [`ManifestSource`] plus an **in-flight set** keyed by
+/// `request_id`.
 ///
-/// The set is the fix for a real race, not a defensive flourish. `ManifestSource::issued` reads
-/// `already_consumed` and `record_consumed` writes it much later — after the payload, after the
-/// drain, after the ACK. Two connections presenting the same valid ticket could therefore both read
-/// `already_consumed == false`, both serve the manifest, and both record afterwards: **one ticket,
-/// two deliveries.** No test caught it because the tests serialize their accept loop and only replay
-/// after the first receipt has landed.
+/// **Concurrency control, NOT authorization** (owner ruling 2026-09-03, QURATOR-177 Option E).
+/// Until that ruling the set existed to make one ticket one delivery: `issued()` read
+/// `already_consumed` and `record_consumed()` wrote it much later, so two simultaneous connections
+/// could both pass the gate and both deliver. The ledger that fed that story is deleted, so the set
+/// no longer guards a spent bit — what it guards is the connection lifecycle itself: two
+/// simultaneous streams answering the same `request_id` would race their payload resolution and
+/// writes against one another inside one handler pair, and the claim makes the second wait for the
+/// first to finish rather than interleave. It is per-process, which is the right scope: a ticket
+/// names one issuer, and the issuer is one node.
 ///
-/// Holding the `request_id` for the whole lifetime of a redemption closes it at the only layer that
-/// can see both ends of the window. It is per-process, which is the right scope: a ticket names one
-/// issuer, and the issuer is one node.
+/// Do not grow this back into an authorization check — that is the withdrawn behaviour.
 pub struct ManifestPlane {
     source: Arc<dyn ManifestSource>,
     in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// Requests whose receipt could NOT be persisted. Held for the process lifetime and refused by
-    /// [`ManifestPlane::claim`], so a durable-write failure cannot become a second delivery.
-    ///
-    /// **Honest limit, stated rather than implied:** this is per-process. A receipt write that fails
-    /// and is followed by a restart leaves the ticket redeemable again — closing that needs a durable
-    /// spent-marker written before the ACK, which is a protocol change, not a local fix.
-    poisoned: std::sync::Mutex<std::collections::HashSet<String>>,
 }
+
+// The `poisoned` set (requests whose receipt could NOT be persisted, refused for the rest of the
+// process so a durable-write failure could not become a second delivery) — DELETED 2026-09-03,
+// QURATOR-177 Option E, with the receipts it guarded. There is no receipt write left to fail.
 
 /// Removes its `request_id` from the in-flight set on drop, so a panic or an early return cannot
 /// wedge a ticket permanently un-redeemable.
@@ -500,16 +489,11 @@ impl ManifestPlane {
         Arc::new(Self {
             source,
             in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
-            poisoned: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
     /// Claim `request_id` for this redemption, or `None` if one is already running.
     fn claim(&self, request_id: &str) -> Option<InFlightGuard<'_>> {
-        // A request whose receipt we failed to persist is never served again this process.
-        if self.poisoned.lock().map(|p| p.contains(request_id)).unwrap_or(true) {
-            return None;
-        }
         let mut set = self.in_flight.lock().ok()?;
         if !set.insert(request_id.to_string()) {
             return None;
@@ -521,9 +505,10 @@ impl ManifestPlane {
     ///
     /// The [`drain_connection`] call is load-bearing and its position is deliberate: it holds the
     /// connection open until the asker closes it, so the last chunk is not raced by a
-    /// `CONNECTION_CLOSE` on a fast link. The receipt is recorded **after** the drain, and only when
-    /// the asker acknowledged — a transfer the peer never finished reading has not succeeded and
-    /// must not burn the ticket.
+    /// `CONNECTION_CLOSE` on a fast link. Until QURATOR-177 Option E the receipt was recorded
+    /// after this drain, only when the asker acknowledged; the receipt is deleted with the ledger,
+    /// and what survives is the delivered/undelivered distinction the ACK decides inside
+    /// [`serve_manifest_stream`].
     pub async fn serve(&self, conn: iroh::endpoint::Connection) -> Result<()> {
         let (send, mut recv) = with_deadline(
             HANDSHAKE_DEADLINE,
@@ -575,21 +560,10 @@ impl ManifestPlane {
         // response landed — the drain stays, and `conn::a_refusal_response_survives_connection_close`
         // is what holds it there.
         match served {
-            Ok(Some((receipt, _payload))) => {
-                // Fail CLOSED on a persistence failure: the asker HAS the manifest (they ACKed), so
-                // we must not let the ticket look unspent. Poisoning refuses any replay for the rest
-                // of this process. Previously this was logged and moved on — a hole documented in a
-                // comment instead of being closed.
-                if let Err(e) = self.source.record_consumed(&receipt) {
-                    if let Ok(mut p) = self.poisoned.lock() {
-                        p.insert(receipt.request_id().to_string());
-                    }
-                    tracing::error!(
-                        request_id = receipt.request_id(),
-                        "could not persist a manifest receipt; refusing further redemptions of this \
-                         ticket for the rest of this session: {e}"
-                    );
-                }
+            Ok(Some(_delivered)) => {
+                // Delivered and acknowledged. Until QURATOR-177 Option E this arm also recorded the
+                // receipt and poisoned the request on a write failure; both are deleted with the
+                // ledger (owner ruling 2026-09-03).
                 conn.close(0u32.into(), b"delivered");
                 Ok(())
             }
@@ -647,7 +621,7 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Framed<R> {
 ///
 /// ## `accept` — why the caller's gate runs *inside* this function
 ///
-/// The owner spends the ticket on our acknowledgement, so the ACK must mean **"a manifest we can
+/// The ACK is what tells the owner the transfer landed, so it must mean **"a manifest we can
 /// actually use arrived"**. `from_wire` does not prove that: it proves the bytes are a structurally
 /// self-consistent envelope, under the ceilings, declaring the ticket's slug. It cannot prove the
 /// envelope is signed by *the peer we are browsing*, that the body decrypts under *our* browse-key,
@@ -655,8 +629,8 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Framed<R> {
 /// not have.
 ///
 /// Running that gate *after* `fetch_manifest` returned would ACK first and reject second: the asker
-/// ends up with nothing usable and the ticket is **already spent**, so the human has to ask again and
-/// the owner has to approve again. That is the `6691377` defect — "consumed on success" quietly
+/// ends up with nothing usable while the owner has counted a delivery that never landed, and the
+/// human has to ask again. That is the `6691377` defect — "consumed on success" quietly
 /// meaning "consumed on written" — recurring one layer up, with the boundary moved from *we wrote
 /// it* to *they parsed it* when what matters is *they can use it*.
 ///
@@ -812,8 +786,9 @@ pub async fn bind_endpoint(transport_secret: &[u8; 32]) -> Result<iroh::Endpoint
 /// **Why a redeemer should not listen.** Redeeming reveals our node id and IP to the owner; that much
 /// is unavoidable, because we dial them. What a *listening* endpoint adds is durable: the transport
 /// secret is persisted, so that node identity is stable forever, and an accept loop answers anyone
-/// who has it. They get no data — `issued()` returns `None` and they get the standard refusal — but
-/// they get **liveness**, on demand, for as long as the app runs.
+/// who has it. They get no plaintext — any payload the plane serves is browse-key sealed, so a
+/// ticket without the share code buys ciphertext — but they get **liveness**, on demand, for as
+/// long as the app runs.
 ///
 /// That makes every asker a probeable presence oracle for every owner they have ever redeemed from,
 /// which contradicts the design elsewhere: presence is a **signed beacon with a TTL that you
@@ -1070,113 +1045,41 @@ pub(crate) mod tests {
         ManifestPayload::seal(&env).expect("seal the payload")
     }
 
-    /// A `ManifestSource` over a single approved request, recording what it consumed.
+    /// A `ManifestSource` over a single approved request.
     pub(crate) struct TestSource {
         pub ticket: TransportTicket,
-        pub consumed: Mutex<Vec<ConsumedTicket>>,
         pub payload: ManifestPayload,
         /// Rig the source to answer with this payload regardless of the slug asked for — the
         /// "lookup fell through to the wrong collection" bug, which no honest implementation would
         /// write on purpose and which the slug binding exists to catch.
         pub serve_instead: Mutex<Option<ManifestPayload>>,
-        /// Make `record_consumed` fail, standing in for a full disk or a permission error — the case
-        /// that used to be logged and stepped over, leaving the ticket replayable.
-        pub fail_receipt: Mutex<bool>,
-        /// Rendezvous used only by the concurrency test — see [`Self::rendezvous`].
-        rendezvous: Option<Rendezvous>,
-    }
-
-    /// Makes two redemptions **provably** overlap instead of hopefully overlapping.
-    ///
-    /// The first caller into `issued()` waits here for a second; if none comes it proceeds after a
-    /// short grace period. That asymmetry is deliberate. A plain 2-party barrier would deadlock the
-    /// *fixed* code, because with the in-flight guard in place the second connection is refused
-    /// before it ever reaches `issued()` — so the barrier would wait forever for a party that is
-    /// never coming.
-    ///
-    /// Why bother: without this the test was **timing-dependent**. Bypassing the guard and running
-    /// the test alone failed it every time, but the same bypass under full-suite load passed — the
-    /// second connection simply arrived after the first had recorded its receipt. A regression test
-    /// that reds only on an idle machine is not a regression test.
-    struct Rendezvous {
-        seen: std::sync::Mutex<usize>,
-        arrived: std::sync::Condvar,
-        grace: std::time::Duration,
-    }
-
-    impl Rendezvous {
-        fn wait_for_a_second_caller(&self) {
-            let mut seen = self.seen.lock().unwrap();
-            *seen += 1;
-            if *seen >= 2 {
-                self.arrived.notify_all();
-                return;
-            }
-            let _ = self.arrived.wait_timeout(seen, self.grace);
-        }
     }
 
     impl TestSource {
         pub(crate) fn new(ticket: TransportTicket, payload: ManifestPayload) -> Arc<Self> {
             Arc::new(Self {
                 ticket,
-                consumed: Mutex::new(Vec::new()),
                 payload,
                 serve_instead: Mutex::new(None),
-                fail_receipt: Mutex::new(false),
-                rendezvous: None,
             })
-        }
-    }
-
-    impl TestSource {
-        /// Turn on the rendezvous: every call into `issued` waits (briefly) for a second caller, so
-        /// two simultaneous redemptions are guaranteed to be inside the gate together.
-        pub(crate) fn with_rendezvous(mut self: Arc<Self>) -> Arc<Self> {
-            let inner = Arc::get_mut(&mut self).expect("no other handles yet");
-            inner.rendezvous = Some(Rendezvous {
-                seen: std::sync::Mutex::new(0),
-                arrived: std::sync::Condvar::new(),
-                grace: std::time::Duration::from_millis(750),
-            });
-            self
         }
     }
 
     impl ManifestSource for TestSource {
-        fn issued(&self, request_id: &str) -> Option<IssuedTicket> {
-            if let Some(r) = &self.rendezvous {
-                r.wait_for_a_second_caller();
-            }
-            if request_id != self.ticket.request_id {
-                return None;
-            }
-            Some(IssuedTicket {
-                ticket: self.ticket.clone(),
-                already_consumed: !self.consumed.lock().unwrap().is_empty(),
-            })
-        }
-
-        fn payload(&self, request_id: &str) -> Result<ManifestPayload> {
+        fn payload(&self, ticket: &TransportTicket) -> Result<ManifestPayload> {
             if let Some(rigged) = self.serve_instead.lock().unwrap().clone() {
                 return Ok(rigged);
             }
-            if request_id != self.ticket.request_id {
-                return Err(anyhow!("unknown request {request_id}"));
+            if ticket.request_id != self.ticket.request_id {
+                return Err(anyhow!("unknown request {}", ticket.request_id));
             }
             Ok(self.payload.clone())
         }
-
-        fn record_consumed(&self, receipt: &ConsumedTicket) -> Result<()> {
-            // A test source can be told to fail its receipt write, which is how the fail-closed
-            // poisoning is exercised without a real disk error.
-            if *self.fail_receipt.lock().unwrap() {
-                return Err(anyhow!("simulated receipt-write failure"));
-            }
-            self.consumed.lock().unwrap().push(receipt.clone());
-            Ok(())
-        }
     }
+
+    // TestSource's `consumed`/`fail_receipt` rigs and the `Rendezvous` — DELETED 2026-09-03,
+    // QURATOR-177 Option E, with the `issued()`/`record_consumed()` methods they exercised. The
+    // replay/poison tests that drove them are deleted below, each with the ruling named.
 
     /// Spawn the production accept loop for `source` on a fresh loopback endpoint, and return the
     /// endpoint plus a ticket addressed at it.
@@ -1187,22 +1090,12 @@ pub(crate) mod tests {
         // Built FOR this slug: the payload and the ticket must agree, or a test would be exercising
         // the slug-binding refusal instead of the path it means to test. (Every test was — the
         // fixture said "big" while the tickets said "small", and the new binding check found it.)
-        spawn_plane_inner(entries, slug, false).await
-    }
-
-    /// As `spawn_plane`, but every `issued()` call waits briefly for a second — so a concurrency test
-    /// cannot silently stop testing concurrency.
-    async fn spawn_plane_with_rendezvous(
-        entries: usize,
-        slug: &str,
-    ) -> (iroh::Endpoint, Arc<TestSource>, TransportTicket) {
-        spawn_plane_inner(entries, slug, true).await
+        spawn_plane_inner(entries, slug).await
     }
 
     async fn spawn_plane_inner(
         entries: usize,
         slug: &str,
-        rendezvous: bool,
     ) -> (iroh::Endpoint, Arc<TestSource>, TransportTicket) {
         let payload = real_payload_for(slug, entries);
         let server = bind_local_endpoint(&rand::random(), vec![MANIFEST_ALPN.to_vec()]).await;
@@ -1211,7 +1104,6 @@ pub(crate) mod tests {
         let addr = serde_json::to_string(&loopback_addr(&server)).unwrap();
         let ticket = TransportTicket::issue("req-1", slug, &addr, 1_700_000_000, Some("nonce-1"));
         let source = TestSource::new(ticket.clone(), payload);
-        let source = if rendezvous { source.with_rendezvous() } else { source };
 
         let accept_ep = server.clone();
         let plane = ManifestPlane::new(source.clone());
@@ -1259,22 +1151,9 @@ pub(crate) mod tests {
         assert_eq!(read_framed(std::io::Cursor::new(wire), 16).await.unwrap(), b"hi");
     }
 
-    /// Wait (bounded) for the owner's side to record its receipt.
-    ///
-    /// **Not a convenience — an ordering property made explicit.** The receipt is recorded *after*
-    /// `drain_connection`, i.e. after the asker has closed, so the instant the asker holds the
-    /// manifest the ticket is not yet marked spent. That ordering is deliberate: a transfer the peer
-    /// never finished reading has not succeeded and must not burn the ticket. Asserting on
-    /// `consumed` without this wait is a race — it read 0 on the first run of the multi-MB case.
-    pub(crate) async fn await_receipt(source: &TestSource) -> ConsumedTicket {
-        for _ in 0..100 {
-            if let Some(r) = source.consumed.lock().unwrap().first().cloned() {
-                return r;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        panic!("the owner's side never recorded the receipt for a delivered manifest");
-    }
+    // `await_receipt` — DELETED 2026-09-03, QURATOR-177 Option E, with the `consumed` rig it
+    // polled. There is no receipt to wait for; tests that only needed the owner's side to finish
+    // settling now just run to the fetch's own completion.
 
     /// **The acceptance test: a multi-MB manifest crosses a real connection.** 10,000 entries of
     /// realistic long filenames through the real splitter — ~60 parts and ~2.4 MB of sealed
@@ -1310,13 +1189,8 @@ pub(crate) mod tests {
                 "the envelope survived the plane byte-for-byte"
             );
 
-            let receipt = await_receipt(&source).await;
-            assert_eq!(receipt.delivered_bytes(), payload.len(), "the receipt records what arrived");
-            assert_eq!(
-                source.consumed.lock().unwrap().len(),
-                1,
-                "a successful transfer consumes the ticket exactly once"
-            );
+            // (Until QURATOR-177 Option E this also awaited the owner's receipt and asserted the
+            // ticket was consumed exactly once; the receipt rig is deleted with the ledger.)
 
             client.close().await;
             server.close().await;
@@ -1325,33 +1199,15 @@ pub(crate) mod tests {
         .expect("test timed out");
     }
 
-    /// **A replay of a spent ticket is refused** — over the real plane, not just in hb-core's unit
-    /// test. The second fetch is a fresh connection presenting the same ticket.
-    #[tokio::test]
-    async fn a_spent_ticket_is_refused_on_a_second_connection() {
-        tokio::time::timeout(TEST_TIMEOUT, async {
-            let (server, source, ticket) = spawn_plane(50, "small").await;
-            let client = bind_local_endpoint(&rand::random(), vec![]).await;
+    // `a_spent_ticket_is_refused_on_a_second_connection` — DELETED 2026-09-03, QURATOR-177
+    // Option E (owner ruling: the issued-ticket ledger is deleted; authorization is the standing
+    // grant checked at ASK time, and the ticket is address delivery). A second redemption attempt
+    // is no longer a replay to refuse — it either never fires (the collection's fingerprint is
+    // unchanged, so no refetch ask originates; that absence IS the anti-nuisance control) or it is
+    // a legitimate fetch (the fingerprint changed) and must succeed. Durable replay protection and
+    // the audit trail were deliberately given up with the ledger. The trigger condition is pinned
+    // by the WAN-M row `a_refetch_fires_only_on_a_fingerprint_change_and_succeeds_when_it_does`.
 
-            fetch_manifest(&client, &ticket, |_| Ok(())).await.expect("the first redemption succeeds");
-            // Wait for the receipt before replaying: without it this test races the owner's
-            // post-drain bookkeeping and would pass or fail on timing rather than on the rule.
-            await_receipt(&source).await;
-            let err = fetch_manifest(&client, &ticket, |_| Ok(()))
-                .await
-                .expect_err("a replay of a consumed ticket must be refused");
-            let msg = err.to_string().to_lowercase();
-            assert!(
-                msg.contains("already") || msg.contains("redeem"),
-                "the refusal must name the replay, got: {msg}"
-            );
-
-            client.close().await;
-            server.close().await;
-        })
-        .await
-        .expect("test timed out");
-    }
 
     // DELETED 2026-09-03, QURATOR-177 (owner ruling: *"Blocks should only block interaction i.e.
     // chats, it should not meaningfully affect other traffic."*):
@@ -1366,43 +1222,38 @@ pub(crate) mod tests {
     /// **Blocking does not gate the serve path** (owner ruling 2026-09-03, QURATOR-177: *"Blocks
     /// should only block interaction i.e. chats, it should not meaningfully affect other
     /// traffic."*). This replaces the deleted `a_redeemer_blocked_after_approval_is_refused_then_
-    /// restored`, which pinned the opposite. The plane's `IssuedTicket` no longer carries a
-    /// standing at all, so a redeemer whose contact the owner has blocked — or removed, or
-    /// declined — is served a manifest it holds a valid unspent ticket for, exactly as a
-    /// good-standing redeemer is. Blocking's remaining enforcement is chat/DM acceptance, pinned in
-    /// `commands/chat.rs` (`proactive_block_refuses_later_dms_and_unblock_restores_acceptance`).
+    /// restored`, which pinned the opposite. There is no standing check anywhere on the serve path
+    /// and no issued-ticket record left that could carry one, so a redeemer whose contact the owner
+    /// has blocked — or removed, or declined — is served a manifest it holds a valid ticket for,
+    /// exactly as a good-standing redeemer is. Blocking's remaining enforcement is chat/DM
+    /// acceptance, pinned in `commands/chat.rs`
+    /// (`proactive_block_refuses_later_dms_and_unblock_restores_acceptance`).
     ///
-    /// The assertion is the plane's own observable: the fetch SUCCEEDS and the receipt is
-    /// recorded — not merely "no standing-naming refusal", which a compile error would also
-    /// satisfy. (The string "no longer an approved contact" is deleted from the codebase, so a
-    /// re-introduced standing check could not re-use it verbatim.)
+    /// The assertion is the plane's own observable: the fetch SUCCEEDS — not merely "no
+    /// standing-naming refusal", which a compile error would also satisfy. (The string "no longer
+    /// an approved contact" is deleted from the codebase, so a re-introduced standing check could
+    /// not re-use it verbatim.)
     ///
     /// MUTATION (P-10) — the orchestrator applies this and must see this test red: in
-    /// `serve_manifest_stream` (this file), after the `if !req.ticket.matches_issued(&issued.ticket)`
-    /// block, insert a fresh standing refusal, e.g.
-    ///   if source_blocking_hint(&issued) { refuse(&mut send, "no longer an approved contact").await?; return Ok(None); }
-    /// where `source_blocking_hint` is a new `fn(&IssuedTicket) -> bool { true }` in this file —
-    /// i.e. ANY re-introduced standing gate on the serve path reds this test, because the fetch
-    /// that expects success errors. (Restoring the old arm verbatim needs the standing field, which
-    /// no longer exists — that is the point of deleting the field rather than ignoring it.)
+    /// `serve_manifest_stream` (this file), immediately after the `authorize_redemption` call,
+    /// insert any refusal, e.g.
+    ///   if source_blocking_hint(&req.ticket) { refuse(&mut send, "no longer an approved contact").await?; return Ok(None); }
+    /// where `source_blocking_hint` is a new `fn(&TransportTicket) -> bool { true }` in this file —
+    /// i.e. ANY re-introduced gate on the serve path reds this test, because the fetch that
+    /// expects success errors. (Restoring the old arm verbatim needs the issued-ticket record's
+    /// standing field, which no longer exists — that is the point of deleting the record rather
+    /// than ignoring it.)
     #[tokio::test]
     async fn a_blocked_redeemer_with_a_valid_ticket_is_still_served() {
         tokio::time::timeout(TEST_TIMEOUT, async {
-            let (server, source, ticket) = spawn_plane(50, "small").await;
+            let (server, _source, ticket) = spawn_plane(50, "small").await;
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
 
             // No standing rig exists to set: blocking a contact changes nothing the plane can see.
-            // The blocked redeemer holds a valid, unspent ticket, so the fetch must succeed and
-            // the receipt must land.
+            // The blocked redeemer holds a valid ticket, so the fetch must succeed outright.
             fetch_manifest(&client, &ticket, |_| Ok(()))
                 .await
-                .expect("a blocked redeemer holding a valid unspent ticket must still be served");
-            await_receipt(&source).await;
-            assert_eq!(
-                source.consumed.lock().unwrap().len(),
-                1,
-                "the serve must complete normally — one receipt, the same as any redemption"
-            );
+                .expect("a blocked redeemer holding a valid ticket must still be served");
 
             client.close().await;
             server.close().await;
@@ -1428,7 +1279,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_redeemer_that_sanitized_the_node_addr_is_still_served() {
         tokio::time::timeout(TEST_TIMEOUT, async {
-            let (server, source, ticket) = spawn_plane(50, "small").await;
+            let (server, _source, ticket) = spawn_plane(50, "small").await;
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
 
             // What production does to the ticket before presenting it.
@@ -1461,7 +1312,6 @@ pub(crate) mod tests {
             conn.close(0u32.into(), b"");
             out.expect("a redeemer that sanitized the address it was handed must still be served");
             assert!(got.is_some_and(|n| n > 0), "the manifest actually arrived");
-            await_receipt(&source).await;
 
             client.close().await;
             server.close().await;
@@ -1470,36 +1320,18 @@ pub(crate) mod tests {
         .expect("test timed out");
     }
 
-    /// A ticket for a request this node never approved, and a forged ticket for one it did, get the
-    /// **same** refusal — a prober learns nothing about which requests exist.
-    #[tokio::test]
-    async fn an_unknown_request_and_a_forged_ticket_are_indistinguishable() {
-        tokio::time::timeout(TEST_TIMEOUT, async {
-            let (server, source, ticket) = spawn_plane(50, "small").await;
-            let client = bind_local_endpoint(&rand::random(), vec![]).await;
+    // `an_unknown_request_and_a_forged_ticket_are_indistinguishable` — DELETED 2026-09-03,
+    // QURATOR-177 Option E. The indistinguishability was a property OF THE LEDGER: the plane knew
+    // which requests it had issued for, and refused both an unknown request and a right-request/
+    // wrong-ticket pair with the same `REFUSAL_NO_MATCH` so a prober learned nothing about which
+    // requests existed. With the ledger deleted the plane no longer knows which requests exist —
+    // an unresolvable ticket is refused at payload resolution and a slug mismatch at the byte
+    // binding, with different messages, and that is inherent to Option E: the ticket is a bearer
+    // capability, and the payload it buys is browse-key sealed ciphertext. The surviving
+    // same-refusal pin (malformed vs wrong-request-binding, both `REFUSAL_NO_MATCH`) lives in
+    // hb-core's `authorize_redemption` tests (`ticket.rs`,
+    // `a_ticket_is_bound_to_its_own_request`).
 
-            let mut invented = ticket.clone();
-            invented.request_id = "req-never-approved".into();
-            let unknown = fetch_manifest(&client, &invented, |_| Ok(())).await.expect_err("unknown request");
-
-            // Same request id, but a ticket body this node did not issue (a different slug bound in).
-            let mut forged = ticket.clone();
-            forged.slug = "some-other-collection".into();
-            let mismatch = fetch_manifest(&client, &forged, |_| Ok(())).await.expect_err("forged ticket");
-
-            assert_eq!(
-                unknown.to_string(),
-                mismatch.to_string(),
-                "an unknown request and a forged ticket must be indistinguishable"
-            );
-            assert!(source.consumed.lock().unwrap().is_empty());
-
-            client.close().await;
-            server.close().await;
-        })
-        .await
-        .expect("test timed out");
-    }
 
     /// A reader that yields exactly the bytes it was given and then **panics** if read again.
     ///
@@ -1644,39 +1476,73 @@ pub(crate) mod tests {
         );
     }
 
-    /// **Codex finding 2 — one ticket, one delivery, under real concurrency.**
+    // `two_simultaneous_redemptions_deliver_the_manifest_once` — DELETED 2026-09-03, QURATOR-177
+    // Option E. Its claim ("exactly one of two simultaneous redemptions may succeed") WAS the
+    // spent bit under concurrency: the `Rendezvous` forced both connections inside `issued()`
+    // before either could write `already_consumed`. The ledger that fed it is deleted, and a
+    // second redemption is a legitimate fetch under Option E — two sequential redemptions both
+    // succeed, and which of two racing ones wins the in-flight claim is not a property anyone
+    // rules on. What the in-flight set still does — and the replacement test below pins — is
+    // concurrency control: one handler per `request_id` at a time, so two streams never interleave
+    // their payload writes.
+
+    /// **The in-flight claim is concurrency control, not authorization** (owner ruling 2026-09-03,
+    /// QURATOR-177 Option E). While one redemption of a request is mid-flight — here, payload
+    /// delivered and the handler waiting on the ACK — a second connection presenting the same
+    /// request is refused with the in-flight message; once the first connection ends (the asker
+    /// vanished without ACKing, so the handler errors out and drops its claim) the honest retry
+    /// succeeds. A second redemption is a LEGITIMATE fetch under Option E; what the claim prevents
+    /// is two handlers interleaving their writes for one `request_id` inside one process, never a
+    /// second delivery as such.
     ///
-    /// Two connections present the same valid ticket at the same moment. Before the in-flight set
-    /// both could read `already_consumed == false`, both serve the manifest, and both record
-    /// afterwards. The old tests could not catch this: they awaited the accept loop serially and only
-    /// replayed after the first receipt landed, so the window never existed.
-    // multi_thread: the rendezvous blocks a worker thread on a condvar, which would stall a
-    // single-threaded runtime rather than let the second connection through.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn two_simultaneous_redemptions_deliver_the_manifest_once() {
+    /// MUTATION (P-10) — the orchestrator applies this and must see this test red: in
+    /// `ManifestPlane::serve` (this file), make the `None` arm of the `claim` match a pass-through
+    /// (delete the `refuse(... "already being redeemed" ...)` call so the second stream is served
+    /// mid-flight) — the mid-flight `expect_err` then succeeds and the assertion on its error
+    /// message reds.
+    #[tokio::test]
+    async fn a_second_connection_while_a_redemption_is_in_flight_is_refused_then_retry_succeeds() {
         tokio::time::timeout(TEST_TIMEOUT, async {
-            let (server, source, ticket) = spawn_plane_with_rendezvous(400, "small").await;
+            let (server, _source, ticket) = spawn_plane(50, "small").await;
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
 
-            // Fired together, on separate connections, with no ordering between them. The
-            // rendezvous inside `issued()` is what makes the overlap a fact rather than a hope.
-            let (a, b) = tokio::join!(
-                fetch_manifest(&client, &ticket, |_| Ok(())),
-                fetch_manifest(&client, &ticket, |_| Ok(()))
-            );
+            // Hold the claim open: send a valid request, read the payload, then stop just short
+            // of the ACK — the handler sits in its ACK wait with the claim held.
+            {
+                let conn = client
+                    .connect(parse_node_addr(&ticket.node_addr).unwrap(), MANIFEST_ALPN)
+                    .await
+                    .expect("dial");
+                let (mut send, mut recv) = conn.open_bi().await.unwrap();
+                let req =
+                    FetchRequest { request_id: ticket.request_id.clone(), ticket: ticket.clone() };
+                write_framed(&mut send, &serde_json::to_vec(&req).unwrap()).await.unwrap();
+                assert_eq!(recv.read_u8().await.unwrap(), STATUS_OK, "the owner serves it");
+                let bytes = read_framed(&mut recv, MANIFEST_MAX_TRANSPORT_BYTES).await.unwrap();
+                assert!(!bytes.is_empty(), "the whole payload was read");
 
-            let winners = [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count();
-            assert_eq!(
-                winners, 1,
-                "exactly one of two simultaneous redemptions may succeed — got {winners}. \
-                 a={a:?} b={b:?}"
-            );
-            await_receipt(&source).await;
-            assert_eq!(
-                source.consumed.lock().unwrap().len(),
-                1,
-                "and the ticket is consumed exactly once"
-            );
+                // Mid-flight: a second connection for the same request is refused, naming the
+                // in-flight claim — the concurrency control doing its only remaining job.
+                let err = fetch_manifest(&client, &ticket, |_| Ok(()))
+                    .await
+                    .expect_err("a second stream while the first is mid-flight must be refused");
+                assert!(
+                    err.to_string().contains("already being redeemed"),
+                    "the refusal names the in-flight claim, got: {err}"
+                );
+
+                // Now vanish without ACKing: the handler's ACK read errors, the claim is dropped.
+                conn.close(0u32.into(), b"gone");
+            }
+
+            // Room for the handler to observe the close and drop its claim.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            // The claim is free and the honest retry succeeds — a second redemption is a
+            // legitimate fetch (Option E), never a replay to refuse.
+            fetch_manifest(&client, &ticket, |_| Ok(()))
+                .await
+                .expect("the retry after the in-flight handler ended must succeed");
 
             client.close().await;
             server.close().await;
@@ -1715,11 +1581,6 @@ pub(crate) mod tests {
                 msg.contains("big") && msg.contains("small"),
                 "the refusal must name both the manifest's slug and the ticket's, got: {msg}"
             );
-            assert!(
-                source.consumed.lock().unwrap().is_empty(),
-                "a refused delivery must not consume the ticket"
-            );
-
             client.close().await;
             server.close().await;
         })
@@ -1781,17 +1642,22 @@ pub(crate) mod tests {
         .expect("test timed out");
     }
 
-    /// **Codex finding 3 — a peer that never acknowledges does not burn the ticket.**
+    /// **An unacknowledged transfer is treated as undelivered — and the retry is a legitimate
+    /// fetch** (QURATOR-177 Option E, owner ruling 2026-09-03).
     ///
-    /// The asker here speaks the protocol by hand: it sends a valid request, reads the whole payload,
-    /// and then walks away without acknowledging — the shape of a client that crashed mid-parse, or
-    /// read half the bytes and died. Before the receipt frame the owner recorded the ticket as
-    /// consumed anyway (write + drain + timeout = "success"), so the asker's retry was refused as a
-    /// replay for a transfer that never landed.
+    /// The asker here speaks the protocol by hand: it sends a valid request, reads the whole
+    /// payload, and then walks away without acknowledging — the shape of a client that crashed
+    /// mid-parse, or read half the bytes and died. The owner's handler errors out ("asker closed
+    /// before acknowledging") rather than recording a delivery: the ACK is the assertion that a
+    /// usable manifest landed, so its absence means undelivered. Until Option E the point of that
+    /// was consumed-on-success — an unacknowledged transfer must not burn the ticket — and the
+    /// receipt that pinned it is deleted with the ledger. What survives is the honest accounting
+    /// plus the Option E fact the retry now pins directly: a repeat fetch is never refused as a
+    /// replay, because replay is not a concept the serve path knows any more.
     #[tokio::test]
-    async fn a_peer_that_never_acknowledges_leaves_the_ticket_unspent() {
+    async fn a_peer_that_never_acknowledges_is_undelivered_and_the_retry_succeeds() {
         tokio::time::timeout(TEST_TIMEOUT, async {
-            let (server, source, ticket) = spawn_plane(50, "small").await;
+            let (server, _source, ticket) = spawn_plane(50, "small").await;
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
 
             {
@@ -1810,17 +1676,8 @@ pub(crate) mod tests {
                 conn.close(0u32.into(), b"gone");
             }
 
-            // Give the owner's side room to (wrongly) record a receipt.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            assert!(
-                source.consumed.lock().unwrap().is_empty(),
-                "an unacknowledged transfer must not consume the ticket — a failed delivery costs \
-                 nothing, which is the whole point of consumed-on-success"
-            );
-
-            // And the honest retry works, which is what the owner's ruling actually asked for.
+            // The retry is a legitimate fetch — never a replay to refuse (Option E).
             fetch_manifest(&client, &ticket, |_| Ok(())).await.expect("the retry must succeed");
-            await_receipt(&source).await;
 
             client.close().await;
             server.close().await;
@@ -1829,32 +1686,26 @@ pub(crate) mod tests {
         .expect("test timed out");
     }
 
-    /// **The acceptance gate runs BEFORE the acknowledgement — a manifest the caller rejects must not
-    /// burn the ticket.**
+    /// **The acceptance gate runs BEFORE the acknowledgement — a manifest the caller rejects is
+    /// never acknowledged, and a retry is a legitimate fetch** (QURATOR-177 Option E).
     ///
-    /// The sibling of `a_peer_that_never_acknowledges_leaves_the_ticket_unspent`, one layer up. That
-    /// one covers a peer that never answers; this one covers a peer that answers *correctly at the
-    /// wire level* and is still rejected by the app: `from_wire` proves the envelope is
-    /// self-consistent, under the ceilings, and declares the ticket's slug — it cannot prove the
-    /// signature is the browsed peer's, that the body decrypts under our browse-key, or that the tree
-    /// is complete. Those checks live in `commands::browse::open_manifest`, behind the contact store.
+    /// The sibling of `a_peer_that_never_acknowledges_is_undelivered_and_the_retry_succeeds`, one
+    /// layer up. That one covers a peer that never answers; this one covers a peer that answers
+    /// *correctly at the wire level* and is still rejected by the app: `from_wire` proves the
+    /// envelope is self-consistent, under the ceilings, and declares the ticket's slug — it cannot
+    /// prove the signature is the browsed peer's, that the body decrypts under our browse-key, or
+    /// that the tree is complete. Those checks live in `commands::browse::open_manifest`, behind
+    /// the contact store.
     ///
-    /// Run the gate after `fetch_manifest` returns and the ACK is already gone: the asker has nothing
-    /// usable, the ticket is spent, and the human has to ask again while the owner approves again.
-    /// That is `6691377`'s "consumed on written" defect recurring with the boundary moved from *we
-    /// wrote it* to *they parsed it*, when what the ruling means is *they can use it*.
-    ///
-    /// **⚠ RED-verifying this needs the FAITHFUL pre-fix ordering, and the obvious probe is not it.**
-    /// Moving the gate to just after the ACK but *before* `drain_connection` leaves this test GREEN:
-    /// the early return skips the drain, so `CONNECTION_CLOSE` outruns the ACK and the owner never
-    /// sees it — the teardown race accidentally does the fix's job. Only placing the gate after the
-    /// drain (where a caller running it *after* `fetch_manifest` returns effectively puts it) reddens
-    /// this. The lesson generalises: **when a probe passes, check whether some unrelated mechanism is
-    /// masking the defect rather than concluding the guard holds.**
+    /// Run the gate after `fetch_manifest` returns and the ACK is already gone: the owner counts a
+    /// delivery that never landed, the asker has nothing usable, and the human has to ask again.
+    /// That is the `6691377` "consumed on written" defect recurring one layer up — the spent bit
+    /// that used to make it worse is deleted with the ledger (Option E), but the mis-accounting is
+    /// the surviving harm, and the gate-before-ACK ordering is what prevents it.
     #[tokio::test]
-    async fn a_manifest_the_caller_rejects_leaves_the_ticket_unspent() {
+    async fn a_manifest_the_caller_rejects_is_not_acknowledged_and_a_retry_succeeds() {
         tokio::time::timeout(TEST_TIMEOUT, async {
-            let (server, source, ticket) = spawn_plane(50, "small").await;
+            let (server, _source, ticket) = spawn_plane(50, "small").await;
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
 
             // A gate that refuses everything — standing in for a failed author pin, a browse-key that
@@ -1867,19 +1718,11 @@ pub(crate) mod tests {
                 "the caller's reason must survive to the user, got: {err}"
             );
 
-            // Room for the owner to (wrongly) record a receipt if the ACK leaked out.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            assert!(
-                source.consumed.lock().unwrap().is_empty(),
-                "a manifest the asker could not accept must not consume the ticket — the ACK is the \
-                 assertion that a USABLE manifest arrived, not merely a parseable one"
-            );
-
-            // And the approval survives, so a fixed client (or a re-added contact) can still redeem.
+            // The retry succeeds — a repeat fetch is a legitimate fetch (Option E), and the
+            // earlier rejection never acknowledged anything, so nothing was mis-counted.
             fetch_manifest(&client, &ticket, |_| Ok(()))
                 .await
                 .expect("the ticket is still good after a rejection");
-            await_receipt(&source).await;
 
             client.close().await;
             server.close().await;
@@ -1888,52 +1731,13 @@ pub(crate) mod tests {
         .expect("test timed out");
     }
 
-    /// **A receipt that could not be persisted must not leave the ticket replayable.**
-    ///
-    /// The asker has ACKed, so it *has* the manifest. If the durable write then fails, the ticket
-    /// still reads unspent on disk and a second connection would be served a second delivery —
-    /// breaking one-ticket-one-delivery at exactly the moment the evidence says it was delivered.
-    /// This was previously logged and stepped over: the hole was described in a comment instead of
-    /// being closed, which is the same shape as the guard that asserted a property it never
-    /// implemented.
-    ///
-    /// The fix is per-process poisoning, and its limit is stated rather than implied: a restart
-    /// after a failed write does make the ticket redeemable again. Closing *that* needs a durable
-    /// spent-marker written before the ACK, which is a protocol change.
-    #[tokio::test]
-    async fn a_failed_receipt_write_poisons_the_ticket_instead_of_allowing_a_replay() {
-        tokio::time::timeout(TEST_TIMEOUT, async {
-            let (server, source, ticket) = spawn_plane(50, "small").await;
-            let client = bind_local_endpoint(&rand::random(), vec![]).await;
+    // `a_failed_receipt_write_poisons_the_ticket_instead_of_allowing_a_replay` — DELETED
+    // 2026-09-03, QURATOR-177 Option E, together with the `poisoned` set and the `fail_receipt`
+    // rig that drove it. It pinned one-ticket-one-delivery at exactly the moment a durable write
+    // failed; with the issued-ticket ledger deleted there is no receipt write that can fail and no
+    // spent bit a failed write could desynchronize. Per-process poisoning of a request whose
+    // receipt could not be persisted is meaningless without the receipt.
 
-            *source.fail_receipt.lock().unwrap() = true;
-
-            // The delivery itself succeeds — the asker gets the manifest and acknowledges it.
-            fetch_manifest(&client, &ticket, |_| Ok(()))
-                .await
-                .expect("the manifest is delivered; only the RECEIPT write fails");
-            assert!(
-                source.consumed.lock().unwrap().is_empty(),
-                "the receipt write failed, so nothing was recorded — this is the setup, not the claim"
-            );
-
-            // The claim: a replay is refused anyway, because the plane poisoned the request.
-            let replay = fetch_manifest(&client, &ticket, |_| Ok(()))
-                .await
-                .expect_err("a ticket whose receipt could not be persisted must not be served again");
-            assert!(
-                replay.to_string().contains(REFUSAL_NO_MATCH)
-                    || replay.to_string().contains("already being redeemed")
-                    || replay.to_string().contains("ticket refused"),
-                "the replay is refused, got: {replay}"
-            );
-
-            client.close().await;
-            server.close().await;
-        })
-        .await
-        .expect("test timed out");
-    }
 
     /// `ticket_node_addr` and `parse_node_addr` are one format, not two: the ticket's opaque string
     /// round-trips back to the same dialable address. This is the seam where hb-core's
@@ -1948,10 +1752,13 @@ pub(crate) mod tests {
         ep.close().await;
     }
 
-    /// **QURATOR-112 #6 — a failed payload write drops the grant WITHOUT `into_consumed`.**
+    /// **QURATOR-112 #6 — a failed payload write fails the redemption outright (never
+    /// `Ok(Some(..))`), so a retry can succeed.**
     ///
     /// The serve-path write now carries `SEND_DEADLINE`, and — the piece the ticket flags as worse
-    /// than the DoS itself — a write that fails must leave the ticket unspent so the peer can retry.
+    /// than the DoS itself — a write that fails must fail the redemption, never read as delivered,
+    /// so the failure is reported and the peer can retry. (Until QURATOR-177 Option E "unspent"
+    /// was a durable fact; now it is simply the absence of a delivered outcome.)
     /// A deadline expiry and a hard write error take the *same* `?` out of `serve_manifest_stream`,
     /// and neither may ever produce `Ok(Some(..))`: a receipt only exists after a validated
     /// acknowledgement. The 120s deadline itself cannot be awaited in a unit test (no `tokio`
@@ -1959,7 +1766,7 @@ pub(crate) mod tests {
     /// so this drives that shared failure path with a writer that errors immediately instead of
     /// stalling.
     #[tokio::test]
-    async fn a_failed_payload_write_leaves_the_ticket_unspent_and_retryable() {
+    async fn a_failed_payload_write_fails_the_redemption_and_a_retry_succeeds() {
         let ep = bind_local_endpoint(&rand::random(), vec![]).await;
         let ticket = issue_ticket(&ep, "req-1", "small", 1_700_000_000, Some("nonce-1")).unwrap();
         let payload = real_payload_for("small", 10);
@@ -1973,7 +1780,7 @@ pub(crate) mod tests {
         // "peer vanished mid-manifest" shape, which a bounded write must treat as undelivered.
         let err = serve_manifest_stream(FailingWriter, std::io::Cursor::new(frame), source.as_ref())
             .await
-            .expect_err("a failed payload write must fail the redemption, never produce a receipt");
+            .expect_err("a failed payload write must fail the redemption, never read as delivered");
         assert!(
             err.to_string().contains("write ok status"),
             "the error must name the failed write, got: {err}"
@@ -1990,7 +1797,7 @@ pub(crate) mod tests {
         )
         .await
         .expect("a healthy retry of the unspent ticket succeeds");
-        assert!(served.is_some(), "the retry produces a receipt — the ticket was not burned");
+        assert!(served.is_some(), "the retry delivers and is acknowledged");
 
         ep.close().await;
     }
@@ -2041,10 +1848,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_refused_connection_releases_its_claim_within_the_short_drain() {
         tokio::time::timeout(TEST_TIMEOUT, async {
-            let (server, source, ticket) = spawn_plane(50, "small").await;
+            let (server, _source, ticket) = spawn_plane(50, "small").await;
             let client = bind_local_endpoint(&rand::random(), vec![]).await;
 
-            // Same request id, wrong ticket: survives parsing and the `issued()` lookup, so the claim
+            // Same request id, wrong ticket: survives parsing and the request-binding gate, so the claim
             // on `request_id` is taken, then refused for the ticket mismatch. The connection is held
             // open (never closed) so the owner's drain is the only thing ending it.
             let mut forged = ticket.clone();
@@ -2071,7 +1878,6 @@ pub(crate) mod tests {
             fetch_manifest(&client, &ticket, |_| Ok(()))
                 .await
                 .expect("the claim was released by the short drain, so the honest redemption succeeds");
-            await_receipt(&source).await;
 
             client.close().await;
             server.close().await;

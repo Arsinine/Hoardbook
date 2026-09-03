@@ -26,7 +26,7 @@ use crate::error::CmdResult;
 use crate::identity_state::SharedIdentity;
 use crate::manifest_source::StoreManifestSource;
 use crate::net::SharedRelay;
-use crate::store::{DataStore, IssuedTicketRecord};
+use crate::store::DataStore;
 use crate::transport::{fetch_manifest_with_progress, issue_ticket, sanitize_node_addr};
 use crate::transport_state::{ensure_endpoint, Role, SharedEndpoint};
 
@@ -177,33 +177,20 @@ pub(crate) async fn send_full_list_inner(
     let request_id = new_request_id();
     let ticket =
         issue_ticket(&ep, &request_id, &slug, now_secs(), ask_nonce.as_deref()).map_err(cmd_err)?;
-    tracing::debug!(
-        recipient = %crate::logging::trunc_npub(&recipient_npub),
-        slug = %slug,
-        request_id = %request_id,
-        "fulfil: ticket minted — persisting the issued-ticket record"
-    );
-
-    // (2) Record before the DM, so a redeemer always presents a ticket we can recognise.
-    // **Canonicalize the recipient before storing it.** `parse_recipient` also accepts a full `hbk`
-    // share code, but standing grants are keyed by canonical npub (`standing_grant_key`), and this
-    // field is the provenance for that key. Persisting the raw input means an `hbk` caller stores a
-    // share code, the later grant lookup misses, and a peer this node legitimately authorized is
-    // refused. **This got MORE load-bearing, not less, under QURATOR-177:** the grant is now the
-    // authorization, so a mis-keyed npub is an auth failure rather than a downgrade.
+    // (2) Record the standing grant before the DM, so the approval is durable the moment a ticket
+    // leaves. **Canonicalize the recipient before storing it.** `parse_recipient` also accepts a
+    // full `hbk` share code, but standing grants are keyed by canonical npub
+    // (`standing_grant_key`), and this field is the provenance for that key. Persisting the raw
+    // input means an `hbk` caller stores a share code, the later grant lookup misses, and a peer
+    // this node legitimately authorized is refused. **This got MORE load-bearing, not less, under
+    // QURATOR-177:** the grant is now the authorization, so a mis-keyed npub is an auth failure
+    // rather than a downgrade.
     // (The original wording blamed `contact_standing` returning `Unknown` at redemption. That
     // function and that refusal are gone — owner ruling 2026-09-03, blocking gates chat/DM only —
-    // but the canonicalization it motivated is still required, for the reason above.)
+    // but the canonicalization it motivated is still required, for the reason above. The
+    // issued-ticket record this step used to write first is deleted with the ledger, QURATOR-177
+    // Option E: the grant map is the whole durable record of an approval now.)
     let redeemer_npub = crate::commands::chat::npub_of(&recipient);
-    store
-        .record_issued_ticket(&IssuedTicketRecord {
-            ticket: ticket.clone(),
-            redeemer_npub: redeemer_npub.clone(),
-            consumed_at: None,
-            delivered_bytes: None,
-            served_fingerprint: None,
-        })
-        .map_err(cmd_err)?;
     // (2b) The standing-grant record (QURATOR-137 slice 2): this click IS the owner's approval of
     // serving `slug` to this peer, so it lands in the grant map too. Record-only for now — slice 3
     // is what consults it at redeem time. Fails the fulfilment rather than minting a ticket the
@@ -216,7 +203,7 @@ pub(crate) async fn send_full_list_inner(
         recipient = %crate::logging::trunc_npub(&recipient_npub),
         slug = %slug,
         request_id = %request_id,
-        "fulfil: issued-ticket record persisted — publishing the ticket DM"
+        "fulfil: standing grant persisted — publishing the ticket DM"
     );
 
     let body = serde_json::to_string(&ticket).map_err(cmd_err)?;
@@ -251,13 +238,13 @@ pub(crate) async fn send_full_list_inner(
 ///    `verify_author` runs here, at MINT time, against the *requested* author — the §2 C-side
 ///    provenance fence. Without it a D asking for `(author = A, slug = s)` could be served B's
 ///    same-slug envelope: D's own gate would refuse it (author pin), so this is not a disclosure
-///    hole, but C would have spent a ticket on a delivery that can never land. Resolving the cache
-///    entry here — once, under the human's "Send cached copy" click — is also what
-///    `IssuedTicketRecord.served_fingerprint` records: serve time (`StoreManifestSource::payload`)
-///    replays this decision instead of re-guessing "newest for slug".
-/// 2. **The record is persisted before the DM**, as ever — a redeemer always presents a ticket this
-///    node can recognise, and the reverse order is indistinguishable from a forgery. An orphaned
-///    record (the DM then failed) is inert: nobody holds the matching ticket.
+///    hole, but C would have spent a ticket on a delivery that can never land. (Until QURATOR-177
+///    Option E the resolved entry was also recorded as `IssuedTicketRecord.served_fingerprint` for
+///    serve time to replay; the record is deleted with the ledger, and serve time now resolves the
+///    newest cached copy for `(author_npub, slug)` on its own — QURATOR-177 slice 1.)
+/// 2. **The standing grant is persisted before the DM**, as ever — the approval is durable the
+///    moment a ticket leaves. (The issued-ticket record this step used to write is gone with the
+///    ledger, QURATOR-177 Option E.)
 ///
 /// The served envelope is the one already in the cache, so no manifest is built here and the
 /// ceiling cannot be exceeded — `ManifestPayload::seal` re-checks it at serve time regardless.
@@ -343,21 +330,15 @@ pub(crate) async fn send_cached_manifest_inner(
     let mut ticket =
         issue_ticket(&ep, &request_id, &slug, now_secs(), ask_nonce.as_deref()).map_err(cmd_err)?;
     // The carrier-4 mark: `author_npub` names whose collection this re-serves (None = the issuer's
-    // own, the `send_full_list` case), and `served_fingerprint` is the exact cache entry resolved
-    // above — recorded at MINT time so serve time replays this decision rather than re-resolving.
+    // own, the `send_full_list` case) — the ticket's OWN field, and the whole branch discriminator
+    // at serve time (QURATOR-177 slice 1 + Option E: the fingerprint this used to record on the
+    // issued-ticket record is gone with the ledger; serve time resolves the newest cached copy).
     ticket.author_npub = Some(author_npub.clone());
 
-    // (2) Record before the DM — same canonicalization note as `send_full_list_inner`.
+    // (2) Record the standing grant before the DM — same canonicalization note as
+    // `send_full_list_inner`. (The issued-ticket record this step used to write first is deleted
+    // with the ledger, QURATOR-177 Option E.)
     let redeemer_npub = crate::commands::chat::npub_of(&recipient);
-    store
-        .record_issued_ticket(&IssuedTicketRecord {
-            ticket: ticket.clone(),
-            redeemer_npub: redeemer_npub.clone(),
-            consumed_at: None,
-            delivered_bytes: None,
-            served_fingerprint: Some(fingerprint),
-        })
-        .map_err(cmd_err)?;
     // (2b) The standing-grant record (QURATOR-137 slice 2), cached-serve side: this click is an
     // owner approval of serving this (author, slug) to this peer, so it lands in the grant map.
     // The author IS part of the key — it names WHICH collection was approved.

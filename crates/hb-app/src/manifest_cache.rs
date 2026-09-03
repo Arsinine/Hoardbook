@@ -17,7 +17,8 @@
 //!   `snapshot_fingerprint` to the teaser's -> `decrypt(browse_key)`. A tampered cache file fails
 //!   closed here exactly like a tampered file import.
 //! - `manifest_source::StoreManifestSource::payload`'s re-serve branch — the CARRIER-4 reader. Does
-//!   `get` -> `from_json` -> `ManifestPayload::seal` and **verifies nothing**; `seal` is serialize +
+//!   `get_latest` (QURATOR-177 slice 1: resolves "newest cached for (author, slug)", no fingerprint
+//!   pin) -> `from_json` -> `ManifestPayload::seal` and **verifies nothing**; `seal` is serialize +
 //!   byte-bound and deliberately leaves author verification to its caller.
 //!
 //! The re-serve branch is nonetheless safe, and the reason is worth stating because it is NOT
@@ -87,8 +88,9 @@ struct CacheEntry {
 /// `resolve_from_cache` demand an exact fingerprint match, yet never collected. Keying on
 /// `(npub, slug)` makes an update overwrite in place, so the directory is bounded by the number of
 /// collections cached rather than by how often they change, and **no cleanup pass is ever needed**.
-/// Reachability is unchanged: [`get`] still compares the stored fingerprint to the requested one, so
-/// a superseded snapshot is a miss exactly as before.
+/// Reachability is unchanged for the browse reader: [`get`] still compares the stored fingerprint to
+/// the requested one, so a superseded snapshot is a miss exactly as before. (The Carrier-4 re-serve
+/// reader [`get_latest`] deliberately opts OUT of that pin — it wants the snapshot currently stored.)
 fn entry_filename(npub: &str, slug: &str) -> String {
     let mut h = Sha256::new();
     for part in [npub, slug] {
@@ -199,10 +201,40 @@ pub fn put(
 /// keyed on `(npub, slug)` alone, the entry on disk may hold a DIFFERENT (superseded) fingerprint,
 /// and returning it would serve a stale snapshot as if it were current. Mismatch ⇒ `None`.
 pub fn get(dir: &Path, npub: &str, slug: &str, fingerprint: &str, now: u64) -> Option<String> {
+    get_inner(dir, npub, slug, Some(fingerprint), now)
+}
+
+/// Look up the **newest cached copy** for `(npub, slug)` — the Carrier-4 re-serve reader
+/// (QURATOR-177 slice 1, owner ruling 2026-09-03). The cache holds exactly ONE entry per
+/// `(npub, slug)` — `entry_filename` hashes that pair and `put` replaces it atomically — so there
+/// is no set of versions to choose among: "newest" is simply the entry at that path, whatever
+/// fingerprint it carries. Skipping the fingerprint comparison is the ONLY behavioural difference
+/// from [`get`]: the stored `npub`/`slug` are still validated (load-bearing against a mis-keyed or
+/// hand-edited file — without it, an entry file renamed onto another key's name would serve the
+/// wrong author's manifest), and `last_access` is still bumped best-effort so the read counts for
+/// LRU recency.
+pub fn get_latest(dir: &Path, npub: &str, slug: &str, now: u64) -> Option<String> {
+    get_inner(dir, npub, slug, None, now)
+}
+
+/// The shared body of [`get`] and [`get_latest`]: read the single file keyed `(npub, slug)`,
+/// validate the stored key against the lookup key, pin the fingerprint only when the caller asked
+/// for an exact snapshot, and bump `last_access`.
+fn get_inner(
+    dir: &Path,
+    npub: &str,
+    slug: &str,
+    fingerprint: Option<&str>,
+    now: u64,
+) -> Option<String> {
     let path = dir.join(entry_filename(npub, slug));
     let bytes = std::fs::read(&path).ok()?;
     let mut entry: CacheEntry = serde_json::from_slice(&bytes).ok()?;
-    if entry.npub != npub || entry.slug != slug || entry.fingerprint != fingerprint {
+    if entry.npub != npub || entry.slug != slug {
+        return None;
+    }
+    // `None` = the caller wants whatever snapshot is stored (no pin); `Some` = exact-match or miss.
+    if fingerprint.is_some_and(|fp| entry.fingerprint != fp) {
         return None;
     }
     let envelope = entry.envelope.clone();
@@ -358,6 +390,80 @@ mod tests {
     fn get_of_absent_key_is_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(get(dir.path(), "npubA", "films", "fp1", 1).is_none());
+    }
+
+    /// QURATOR-177 slice 1 — the Carrier-4 re-serve reader resolves "newest cached copy for
+    /// `(npub, slug)`": the single entry at that key's path, whatever fingerprint it carries.
+    /// A refetch `put` replaces the entry in place, so a stored fingerprint that differs from
+    /// anything an older reader asked for is the NORMAL state, not a mismatch.
+    ///
+    /// MUTATION (P-10) — resolved by containing function: in `get_inner`
+    /// (crates/hb-app/src/manifest_cache.rs), change the fingerprint gate
+    /// `if fingerprint.is_some_and(|fp| entry.fingerprint != fp) { return None; }` to fire on
+    /// EVERY caller — `if Some(entry.fingerprint.as_str()) != fingerprint { return None; }`.
+    /// `get_latest` passes `None` while the stored entry holds `fp2`, so the mutant misses and
+    /// the `assert_eq!` below (which expects `Some("NEW")`) reds with `None`. The `get` round-trip
+    /// above keeps passing — that caller passes a matching `Some`, which is the point: the
+    /// mutation discriminates the two readers.
+    #[test]
+    fn get_latest_serves_the_stored_snapshot_without_a_fingerprint_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "npubA", "films", "fp1", "OLD", 10, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
+        // The refetch: same key, new fingerprint — replaces in place.
+        put(dir.path(), "npubA", "films", "fp2", "NEW", 20, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
+        assert_eq!(get_latest(dir.path(), "npubA", "films", 30).as_deref(), Some("NEW"));
+        // And the pinned reader still misses on the superseded fingerprint — unchanged.
+        assert!(get(dir.path(), "npubA", "films", "fp1", 30).is_none(), "stale fingerprint misses");
+    }
+
+    /// The stored-key check in `get_latest` is load-bearing, not decoration: the file is named by
+    /// a hash of `(npub, slug)`, so an entry whose RECORDED key disagrees with the lookup key
+    /// means a mis-keyed or hand-edited file — serving it would answer one author's re-serve with
+    /// another author's manifest. Mismatch ⇒ `None`, exactly as for `get`.
+    ///
+    /// MUTATION (P-10) — resolved by containing function: in `get_inner`
+    /// (crates/hb-app/src/manifest_cache.rs), delete the stored-key guard
+    /// `if entry.npub != npub || entry.slug != slug { return None; }`. The fixture below uses
+    /// `write_entry` (the same helper the migration tests use) to plant an entry whose recorded
+    /// key is `(npubA, films)` under the FILENAME `entry_filename("npubB", "films")` resolves
+    /// to — a name/key disagreement no `put` can produce. The mutant serves it and the `None`
+    /// assertion reds. (`get` has its own copy of the pin through the same guard; the mutation
+    /// therefore also reds `get_is_key_scoped`, which is fine — the point is THIS test names the
+    /// `get_latest` half.)
+    #[test]
+    fn get_latest_still_rejects_a_mis_keyed_entry_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        write_entry(
+            dir.path(),
+            &entry_filename("npubB", "films"),
+            "npubA",
+            "films",
+            "fp1",
+            "WRONG-KEY",
+            10,
+        );
+        assert!(get_latest(dir.path(), "npubB", "films", 20).is_none());
+    }
+
+    /// `get_latest` bumps `last_access` exactly as `get` does, so a re-serve read counts for LRU
+    /// recency — a re-served collection must not become the first thing a future cap evicts.
+    ///
+    /// MUTATION (P-10) — resolved by containing function: in `get_inner`
+    /// (crates/hb-app/src/manifest_cache.rs), delete the best-effort recency bump
+    /// (`entry.last_access = now;` and the `if let Ok(updated) = ... { let _ = ... }` block).
+    /// Re-read the entry with `scan` afterwards and assert the recorded `last_access` moved from
+    /// 10 to 200; under the mutant it stays 10 and the assert reds. (`scan` returns
+    /// `(filename, byte_len, last_access, npub, slug)`, so the bump is directly observable.)
+    #[test]
+    fn get_latest_bumps_last_access_for_lru_recency() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "npubA", "films", "fp1", "ENV-1", 10, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
+        assert!(get_latest(dir.path(), "npubA", "films", 200).is_some());
+        let entries = scan(dir.path());
+        let entry = entries.iter().find(|(_, _, _, npub, slug)| npub == "npubA" && slug == "films")
+            .expect("the entry is still there");
+        assert_eq!(entry.2, 200, "a get_latest read must bump last_access to `now`");
     }
 
     #[test]

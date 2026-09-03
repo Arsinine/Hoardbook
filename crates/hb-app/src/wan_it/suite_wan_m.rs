@@ -3,15 +3,17 @@
 //!
 //! Both rows drive the **real production redeem path** end to end — `transport::fetch_manifest` with
 //! the M16 W4 acceptance gate (`browse::accept_manifest_bytes`) running *inside* it, exactly as
-//! `redeem_manifest_ticket` calls it. The consume-exactly-once mechanism is the REAL one
-//! (`ManifestSource::issued` → `authorize_redemption` → `into_consumed` → `record_consumed`), not a
-//! harness reimplementation: serve binds the endpoint via `transport_state::ensure_endpoint` with a
+//! `redeem_manifest_ticket` calls it. (Until QURATOR-177 Option E, 2026-09-03, this paragraph also
+//! named the consume-exactly-once chain `ManifestSource::issued` → `into_consumed` →
+//! `record_consumed`; the issued-ticket ledger is deleted by owner ruling — authorization is the
+//! standing grant at ASK time, the ticket is address delivery — and no serve-side replay machinery
+//! exists to re-implement.) Serve binds the endpoint via `transport_state::ensure_endpoint` with a
 //! `StoreManifestSource` over the real data directory, so the accept loop and the in-flight set are
 //! production.
 //!
 //! **M1 — cross-NAT redemption.** Redeem a live ticket → manifest parses/verifies/slug-matches via
-//! the production gate, the receipt is recorded, the ticket is consumed exactly once; a second
-//! redemption attempt gets the standard refusal ("already redeemed").
+//! the production gate. The ticket's replay semantics (what a second redemption attempt does) are
+//! ruled, not tested here — see the M1-once tombstone in `run`.
 //!
 //! **M9 — owner offline / stale node_addr.** Redeem a ticket whose `node_addr` points at a dead
 //! endpoint → bounded failure (explicit timeout, no hang, ticket unspent); then the live redeem
@@ -25,7 +27,7 @@
 //!
 //! **Flake policy (P3b precedent):** the live redeem retries ×3; every failure is a recorded data
 //! point. The dead-endpoint leg asserts a BOUNDED failure (it must time out, not hang), and the
-//! ticket staying unspent is checked against the probe's own store — the probe recorded the claim,
+//! ask staying unspent is checked against the probe's own store — the probe recorded the claim,
 //! and a failed dial does not spend it (the production property).
 
 use std::sync::Arc;
@@ -90,10 +92,8 @@ pub struct ProbeInput {
 }
 
 /// Run the WAN-M rows (M1, M9) against a live serve. Each row is an honest TAP check: Ok ⇒ pass,
-/// Err(detail) ⇒ fail with a `# diagnostic` block. Rows that need the serve's receipt state share it
-/// via the `serve_store` handle (the harness on a single machine can read it; across machines the
-/// orchestrator correlates the TAP output).
-pub async fn run(tap: &mut Tap, probe: &ProbeInput, serve_store: Option<&DataStore>) {
+/// Err(detail) ⇒ fail with a `# diagnostic` block.
+pub async fn run(tap: &mut Tap, probe: &ProbeInput) {
     // M9's dead-endpoint leg FIRST — it must fail bounded and leave the ticket unspent, then the
     // live redeem (M1's first leg) demonstrates "succeeds on retry once serve returns". Ordering the
     // dead leg first keeps the two rows honest: the live redeem is not pre-burned by the dead leg.
@@ -104,18 +104,39 @@ pub async fn run(tap: &mut Tap, probe: &ProbeInput, serve_store: Option<&DataSto
 
     // M1's first leg — the live redeem. Doubles as M9's "succeeds on retry once serve returns".
     tap.check(
-        "M1-live: redeem the live ticket → manifest parses/verifies/slug-matches via accept_manifest_bytes, receipt recorded",
+        "M1-live: redeem the live ticket → manifest parses/verifies/slug-matches via accept_manifest_bytes",
         m1_live_redeem(probe).await,
     );
 
-    // M1's exactly-once leg — the ticket is now spent, so a second attempt gets the standard refusal.
-    // The refusal is observed on the PROBE side as an error from fetch_manifest; the OWNER-side
-    // confirmation (the store shows consumed_at set) is checked below when the orchestrator runs
-    // single-machine.
-    tap.check(
-        "M1-once: a second redemption attempt is refused (ticket consumed exactly once)",
-        m1_second_attempt_refused(probe, serve_store).await,
-    );
+    // M1-once — REPLACED 2026-09-03, QURATOR-177 Option E (owner ruling), by a TWO-ARM
+    // specification that this harness cannot honestly drive as WAN-M rows. The ruling: "a second
+    // redemption attempt either shouldn't trigger (because the collection id hasn't changed,
+    // implying the collection data hasn't changed) or it shouldn't be refused because it is a
+    // legitimate fetch." The deleted row (`m1_second_attempt_refused` + its owner-side
+    // `load_issued_ticket`/`consumed_at` confirmation) asserted the opposite of both arms — that a
+    // replay IS refused — because the serve used to keep a spent bit. That bit, the
+    // issued-ticket ledger that held it, and the durable replay protection/audit trail it bought
+    // are deleted by ruling; a serve-side refusal for a second fetch must NOT be re-added.
+    //
+    //   Arm 1 — UNCHANGED fingerprint ⇒ NO second redemption is triggered. The refetch trigger is
+    //   asker-side and lives in the UI layer (it fires when the app observes the collection's
+    //   `newest_fingerprint` change; there is no manual retrigger, and that absence IS the
+    //   anti-nuisance control). The WAN harness is a CLI: it has no fingerprint-watch loop, so
+    //   "nothing was triggered" is not observable here — writing a row that asserts the absence
+    //   would be fake. What arm 1 needs: a harness (or UI-mount test) that runs the asker-side
+    //   refetch watcher against a served collection whose fingerprint does NOT change, asserting
+    //   no new ask is recorded (probe store: `load_manifest_asks` gains no entry) and no fetch
+    //   dials.
+    //   Arm 2 — CHANGED fingerprint ⇒ fresh ask → fresh nonce → freshly minted ticket → fetch
+    //   succeeds. Already pinned end to end by WAN-E2E: E2 sends a FRESH request-DM, the
+    //   auto-approve serve answers with a freshly minted ticket, and the redeem succeeds over the
+    //   real link — and E1+E2 together are two fetches of the same collection, both succeeding,
+    //   which is exactly the legitimate-fetch arm. WAN-M's serve approves exactly once at startup
+    //   (no auto-approve loop), so a fresh ask has nothing to answer it here.
+    //
+    // The condition self-heals: an offline peer's unattended retry is covered by the ask trace
+    // (one ask admits one ticket; a retry of the SAME ticket re-claims Granted), never by a
+    // serve-side spent bit.
 }
 
 // ---------------------------------------------------------------------------
@@ -304,98 +325,10 @@ async fn log_redeem_connection_type(endpoint: &iroh::Endpoint, ticket_node_addr:
     }
 }
 
-/// The exactly-once assertion: a second redemption of the same ticket is refused. The refusal is
-/// observed on the probe side as an error from `fetch_manifest`; the owner-side confirmation (the
-/// ticket's `consumed_at` is set) is checked against `serve_store` when the harness runs
-/// single-machine. The refusal message must indicate the ticket is already redeemed / no match (the
-/// standard refusal an invented request id gets is the same constant — indistinguishable-from-forged
-/// per M8 semantics, which is what the production path returns; we do NOT build the M8 row here).
-async fn m1_second_attempt_refused(
-    probe: &ProbeInput,
-    serve_store: Option<&DataStore>,
-) -> Result<(), String> {
-    let endpoint = probe_client_endpoint(probe).await?;
+// `m1_second_attempt_refused` — DELETED 2026-09-03, QURATOR-177 Option E, with the M1-once row
+// it drove (see the tombstone in `run` for the two-arm ruling and where each arm is pinned). Its
+// owner-side half read `load_issued_ticket(...).consumed_at` — the deleted ledger's spent bit.
 
-    // The second redeem — the ticket is spent on the serve, so this must fail. The acceptance gate
-    // never runs (the serve refuses before sending the manifest).
-    let result = tokio::time::timeout(LIVE_REDEEM_TIMEOUT, async {
-        fetch_manifest(&endpoint, &probe.live_ticket, |_| Ok(())).await
-    })
-    .await;
-
-    let err_msg = match result {
-        Ok(Err(e)) => e.to_string(),
-        Ok(Ok(_payload)) => {
-            return Err(
-                "the second redemption UNEXPECTEDLY succeeded — the ticket was not consumed on the \
-                 first redeem, which breaks one-ticket-one-delivery. Check the serve's accept loop \
-                 and receipt persistence."
-                    .to_string(),
-            )
-        }
-        Err(_) => {
-            return Err(format!(
-                "the second redemption timed out past {LIVE_REDEEM_TIMEOUT:?} — a spent-ticket \
-                 refusal should be fast (the serve refuses before sending anything); a timeout \
-                 suggests the serve is unreachable, not that the ticket is spent"
-            ))
-        }
-    };
-
-    // The refusal must indicate the ticket is no longer redeemable. The production path returns the
-    // standard refusal constant ("no approved manifest request matches this ticket") for a spent
-    // ticket too — indistinguishable-from-forged per M8 semantics, which is the intended property.
-    // Accept either the "no match" constant or a message naming the replay (the transport's refusal
-    // surfaces the authorize_redemption error string, which for a consumed ticket is "already
-    // redeemed").
-    let lower = err_msg.to_lowercase();
-    let is_refusal = lower.contains("already")
-        || lower.contains("redeem")
-        || lower.contains("no approved")
-        || lower.contains("matches this ticket");
-    if !is_refusal {
-        return Err(format!(
-            "the second redemption failed, but not with the standard refusal — got: {err_msg}. \
-             A spent ticket must refuse with the no-match/already-redeemed message."
-        ));
-    }
-    eprintln!("   M1-once second attempt refused as expected: {err_msg}");
-
-    // The owner-side confirmation: when the harness runs single-machine, the serve's store shows the
-    // ticket consumed. This is the strongest assertion (the receipt was persisted); across machines
-    // the orchestrator correlates the TAP output and this leg is informational.
-    if let Some(serve) = serve_store {
-        match serve.load_issued_ticket(&probe.live_ticket.request_id) {
-            Ok(Some(rec)) => match rec.consumed_at {
-                Some(ts) => eprintln!(
-                    "   M1-once owner-side confirmation: ticket consumed_at={ts}, delivered_bytes={:?}",
-                    rec.delivered_bytes
-                ),
-                None => {
-                    return Err(
-                        "the owner-side store shows the ticket NOT consumed after a successful redeem \
-                         + a refused replay — the receipt was not persisted, which breaks the \
-                         one-ticket-one-delivery property on the owner side"
-                            .to_string(),
-                    )
-                }
-            },
-            Ok(None) => {
-                return Err(
-                    "the owner-side store has no record of this request id — the serve did not mint \
-                     this ticket through its store (harness wiring error)"
-                        .to_string(),
-                )
-            }
-            Err(e) => eprintln!("   M1-once could not read serve store (informational): {e}"),
-        }
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Helpers — probe endpoint, claim, unspent assertion
 // ---------------------------------------------------------------------------
 
 /// Bind the probe's dial-only endpoint via the production path (`ensure_endpoint` with `DialOnly`).

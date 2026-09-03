@@ -554,8 +554,9 @@ async fn run_auto_approve_loop(
 /// Drive the production approval body for one request-DM: `send_full_list_inner` IS the body of the
 /// `send_full_list` Tauri command (the command is a marshalling shim over it), so approving here does
 /// exactly what the owner's click does — seal the manifest against the 16 MiB ceiling, bind the
-/// listening endpoint, mint the ticket, persist the issued-ticket record AND the QURATOR-137 standing
-/// grant before the DM, and DM the ticket to the asker.
+/// listening endpoint, mint the ticket, persist the QURATOR-137 standing grant before the DM, and
+/// DM the ticket to the asker. (Until QURATOR-177 Option E it also persisted the issued-ticket
+/// record; that ledger is deleted by owner ruling.)
 async fn approve_request(
     store: &DataStore,
     live_npub: &crate::identity_state::SharedIdentity,
@@ -588,13 +589,12 @@ async fn approve_request(
     // accept loop `ensure_endpoint` spawns holds its own endpoint clone, so the handle can drop.
     //
     // P-10 mutation (resolve by containing function, not text search): delete the
-    // `record_issued_ticket` call inside `send_full_list_inner` (fulfil.rs) and WAN-E2E row E1 must go
-    // red — the probe's redeem is refused (`source.issued()` finds no record → REFUSAL_NO_MATCH) and
-    // `e1_truncated_round_trip`'s owner-side check reports "no record of this request id". Before this
-    // convergence that same edit left WAN-E2E green, which was the defect. The grant write itself is
-    // record-only until slice 3 consults it (`standing_grant_for` has no production caller yet), so no
-    // executable test reds on removing it TODAY — the convergence is what puts it on the tested path
-    // for when slice 3 lands.
+    // `record_standing_grant` call inside `send_full_list_inner` (fulfil.rs) — the serve's grant map
+    // ends up empty, and the auto-approve loop's `standing_grant_for` read returns None, so a second
+    // request for the same (peer, slug) is left for the human instead of auto-approved. (Until
+    // QURATOR-177 this named deleting `record_issued_ticket` and E1's owner-side check reddening;
+    // the ledger, that check, and the spent-bit refusal it caused are all deleted — Option E, owner
+    // ruling 2026-09-03. What remains load-bearing on this path is the GRANT, the authorization.)
     send_full_list_inner(
         asker_npub.to_string(),
         slug.to_string(),
@@ -608,7 +608,7 @@ async fn approve_request(
     .map_err(|e| anyhow!("send_full_list_inner: {e}"))?;
     eprintln!(
         "[serve] auto-approve: approved via send_full_list_inner (slug '{slug}', nonce '{nonce}') — \
-         ticket minted, recorded, grant written, and DM'd to {asker_npub}"
+         ticket minted, grant written, and DM'd to {asker_npub}"
     );
     Ok(())
 }
@@ -629,8 +629,8 @@ fn load_or_create_identity(store: &DataStore) -> Result<AppIdentity> {
 // All production paths: scan_selective + save_collection_draft (the add-collection scan), the
 // contact save (realism: production's asker is a known contact), record_manifest_ask (so the
 // probe's claim_manifest_ask passes), ensure_endpoint with Role::Listen (the real accept loop +
-// in-flight set), issue_ticket + record_issued_ticket (the real mint+authorize path, so
-// consumed-exactly-once is the REAL mechanism).
+// in-flight set), and the production approval body send_full_list_inner (the real mint path; the
+// record_issued_ticket step it used to perform is deleted with the ledger, QURATOR-177 Option E).
 // ---------------------------------------------------------------------------
 
 /// Seed a collection from `seed_dir`, add `asker_npub` as a contact in good standing, bind the
@@ -682,8 +682,8 @@ async fn setup_manifest_plane(
     // `send_full_list` Tauri command (the command is a marshalling shim over it). One call now does
     // what steps (4) and (5) used to do by hand — bind the listening endpoint via `ensure_endpoint`,
     // seal the manifest and prove it fits the transport ceiling, mint the ticket, persist the
-    // issued-ticket record BEFORE the DM (the ordering that stops a peer holding a ticket this node
-    // cannot authorize), and DM the ticket to the asker.
+    // standing grant BEFORE the DM, and DM the ticket to the asker. (Until QURATOR-177 Option E it
+    // also persisted the issued-ticket record before the DM; the ledger is deleted by ruling.)
     //
     // **This replaced a hand-copy, and that is the whole point.** The harness used to re-implement
     // the approval sequence here and print `ticket=<json>` for an operator to paste into the probe's
@@ -702,7 +702,7 @@ async fn setup_manifest_plane(
     .await
     .map_err(|e| anyhow!("send_full_list_inner: {e}"))?;
     eprintln!(
-        "[serve] approved via send_full_list_inner: manifest endpoint bound, ticket minted, \
+        "[serve] approved via send_full_list_inner: manifest endpoint bound, ticket minted, grant \
          recorded, and DM'd to {asker_npub} (slug '{slug}', nonce '{nonce}')"
     );
     eprintln!("[serve] the probe picks the ticket up from its own inbox — no --ticket-json needed");
@@ -1019,10 +1019,11 @@ async fn run_probe_wan_m(args: &[String], peer_str: &str) -> Result<ExitCode> {
 
     // When --serve-data-dir points at the serve's data dir (single-machine smoke), the probe can read
     // the serve's store to confirm the ticket was consumed — the owner-side half of M1-once.
-    let serve_store = args::flag_value(args, "--serve-data-dir").map(|d| DataStore::new(PathBuf::from(d)));
+    // (--serve-data-dir used to open the serve's store for M1-once's owner-side consumed_at
+    // confirmation; deleted with the issued-ticket ledger, QURATOR-177 Option E.)
 
     let mut tap = tap::Tap::new();
-    suite_wan_m::run(&mut tap, &input, serve_store.as_ref()).await;
+    suite_wan_m::run(&mut tap, &input).await;
     Ok(tap.finish())
 }
 
@@ -1088,13 +1089,11 @@ async fn run_probe_wan_e2e(args: &[String], peer_str: &str) -> Result<ExitCode> 
     println!("# WAN-E2E probe against serve {}", input.serve_npub);
     println!("# relay set: {}", relays.join(", "));
 
-    // When --serve-data-dir points at the serve's data dir (single-machine smoke), the probe can read
-    // the serve's store to confirm the ticket was consumed — the owner-side half of E1.
-    let serve_store =
-        args::flag_value(args, "--serve-data-dir").map(|d| DataStore::new(PathBuf::from(d)));
+    // (--serve-data-dir used to feed the probe the serve's store for E1's owner-side receipt
+    // confirmation; that read is deleted with the issued-ticket ledger, QURATOR-177 Option E.)
 
     let mut tap = tap::Tap::new();
-    suite_wan_e2e::run(&mut tap, &input, serve_store.as_ref()).await;
+    suite_wan_e2e::run(&mut tap, &input).await;
     Ok(tap.finish())
 }
 
@@ -1480,11 +1479,13 @@ mod tests {
 
         // The steps send_full_list_inner owns. Any one of them reappearing here means the harness
         // has started keeping its own copy again — the exact drift that hid the grant write.
+        // (`record_issued_ticket(` was in this list until QURATOR-177 Option E deleted the call
+        // from production; a step production no longer performs is not one the harness can
+        // re-implement.)
         for step in [
             "ManifestPayload::seal(",
             "ensure_endpoint(",
             "issue_ticket(",
-            "record_issued_ticket(",
             "send_dm_inner(",
         ] {
             assert!(

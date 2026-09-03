@@ -21,11 +21,14 @@
 //! Redeeming only needs to DIAL, and binding a listening endpoint for it would leave the redeemer
 //! answering anyone who holds its permanently-stable node id — see [`crate::transport::bind_client_endpoint`].
 //!
-//! **But an unspent ticket outlives the session that issued it** (tickets are valid until redeemed,
-//! by owner ruling), and the transport secret is persisted precisely so the address in an old ticket
+//! **But a ticket outlives the session that issued it** (tickets are valid until redeemed, by
+//! owner ruling), and the transport secret is persisted precisely so the address in an old ticket
 //! still resolves. So [`rebind_if_tickets_outstanding`] runs at startup and binds *only* when this
-//! node has an unspent approval on the books — otherwise a peer redeeming yesterday's ticket would
-//! find nothing listening and see a failure with no cause a human could act on.
+//! node has issued an approval at all — a standing grant on the books (QURATOR-177 Option E: the
+//! issued-ticket ledger that used to answer "is a ticket unspent?" is deleted, and a grant is
+//! permanent by ruling, so "ever approved serving" is the honest basis; it over-binds rather than
+//! under-binds, which is the safe direction — an unnecessary listener costs a relay connection,
+//! a missing one breaks a promise a peer still holds).
 
 use std::sync::Arc;
 
@@ -339,12 +342,15 @@ fn spawn_accept_loop(endpoint: iroh::Endpoint, plane: Arc<ManifestPlane>) {
     });
 }
 
-/// At startup, bind the plane **only if** an unspent ticket is outstanding.
+/// At startup, bind the plane **only if** this node has ever issued an approval.
 ///
 /// The asymmetry is deliberate. Binding unconditionally would give every user a QUIC endpoint and a
 /// relay connection they may never need; binding never would make a ticket issued in a previous
-/// session undialable, which is a silent broken promise rather than an honest error. Reading the
-/// issued-ticket store answers exactly the question that decides it.
+/// session undialable, which is a silent broken promise rather than an honest error. Until
+/// QURATOR-177 Option E the issued-ticket store answered exactly the question that decided it
+/// ("any unspent ticket?"); the ledger is deleted, and the standing-grant map — permanent by
+/// ruling — is the surviving durable record of "this node has promised a manifest to someone", so
+/// it is the basis now.
 pub async fn rebind_if_tickets_outstanding(
     shared: &SharedEndpoint,
     owner_npub: &str,
@@ -353,17 +359,14 @@ pub async fn rebind_if_tickets_outstanding(
     source: Arc<dyn ManifestSource>,
     store: &crate::store::DataStore,
 ) {
-    let outstanding = store
-        .load_issued_tickets()
-        .map(|m| m.values().any(|r| r.consumed_at.is_none()))
-        .unwrap_or(false);
-    if !outstanding {
+    let has_grant = store.load_standing_grants().map(|m| !m.is_empty()).unwrap_or(false);
+    if !has_grant {
         return;
     }
     if let Err(e) =
         ensure_endpoint(shared, owner_npub, live_npub, transport_key, source, Role::Listen).await
     {
-        tracing::warn!("manifest plane: could not rebind for an outstanding ticket: {e}");
+        tracing::warn!("manifest plane: could not rebind for an outstanding approval: {e}");
     }
 }
 

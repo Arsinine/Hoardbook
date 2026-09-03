@@ -94,10 +94,11 @@ pub enum HbError {
     #[error("invalid transport ticket: {0}")]
     InvalidTicket(String),
 
-    /// The ticket was already spent on a completed transfer. Consumed on SUCCESS, so this is a
-    /// genuine replay, never a retry after a dropped connection.
-    #[error("this transport ticket has already been redeemed — ask again for a new one")]
-    TicketAlreadyRedeemed,
+    // TicketAlreadyRedeemed — deleted 2026-09-03, QURATOR-177 Option E (owner ruling:
+    // authorization is at ASK time via the standing grant; the ticket is address delivery). Its
+    // only raiser was `authorize_redemption`'s `already_consumed` arm, fed by hb-app's
+    // issued-ticket ledger — both deleted in the same change. Durable replay protection and the
+    // audit trail were deliberately given up.
 
     // TicketRedeemerNotInGoodStanding — deleted 2026-09-03, QURATOR-177 (owner ruling: blocking
     // gates chat/DM interaction only). Its only raiser was `authorize_redemption`'s redeem-time

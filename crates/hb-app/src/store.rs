@@ -1199,75 +1199,15 @@ impl DataStore {
         Ok(())
     }
 
-    // ── Issued transport tickets (M18 W4) — the owner side's record of what it actually issued, so a
-    //    redemption arriving minutes or a restart later can be authorized against it. This is the
-    //    durable half of `ManifestSource::issued`/`record_consumed`; the plane's in-flight set covers
-    //    only the same-process race, and a ticket is valid until redeemed, so the *spent* bit has to
-    //    survive a restart or a replay after relaunch would be served a second manifest.
-    //
-    //    Keyed by `request_id` (a fresh 128-bit value per approval), which is also the ticket's
-    //    binding — one ticket per request, so one record per request.
-    pub fn issued_tickets_path(&self) -> PathBuf {
-        self.base.join("issued_tickets.json")
-    }
+    // ── Issued transport tickets (M18 W4) — DELETED 2026-09-03, QURATOR-177 Option E (owner
+    //    ruling: authorization is the standing grant checked at ASK time; the ticket is address
+    //    delivery). This section was `issued_tickets_path`/`load_issued_tickets`/
+    //    `save_issued_tickets`/`load_issued_ticket`/`record_issued_ticket`/`mark_ticket_consumed`
+    //    — the issued-ticket ledger that answered "what did we mint for this request, and is it
+    //    spent?" on the serve path. Durable replay protection and the audit trail were
+    //    deliberately given up with it; a stale `issued_tickets.json` on an upgrading install is
+    //    dead data (nothing reads it; `wipe()` already removes the whole directory).
 
-    pub fn load_issued_tickets(&self) -> Result<std::collections::HashMap<String, IssuedTicketRecord>> {
-        Ok(read_json_lenient::<std::collections::HashMap<String, IssuedTicketRecord>>(
-            &self.issued_tickets_path(),
-        )
-        .context("loading issued tickets")?
-        .unwrap_or_default())
-    }
-
-    pub fn save_issued_tickets(
-        &self,
-        m: &std::collections::HashMap<String, IssuedTicketRecord>,
-    ) -> Result<()> {
-        write_json(&self.issued_tickets_path(), m).context("saving issued tickets")
-    }
-
-    pub fn load_issued_ticket(&self, request_id: &str) -> Result<Option<IssuedTicketRecord>> {
-        Ok(self.load_issued_tickets()?.remove(request_id))
-    }
-
-    /// Persist a freshly-minted ticket. Called **before** the ticket is DM'd: the reverse order would
-    /// hand a peer a ticket this node cannot authorize, which is indistinguishable from a forgery. An
-    /// orphaned record (the DM then failed) is harmless — nobody holds the ticket that matches it.
-    ///
-    /// **Nothing is ever evicted** (owner ruling 2026-09-01). This map previously LRU-dropped the
-    /// stalest *consumed* records past a 512 cap. Eviction was safe — an unknown `request_id` is
-    /// refused exactly like a forgery, see `StoreManifestSource::issued` — so the cap only ever
-    /// bounded the audit tail, and the owner ruled that history is worth keeping.
-    ///
-    /// ⚠ The map is loaded and rewritten whole on every mint, so retention is O(n) per issued
-    /// ticket. Under QURATOR-137's standing grants a record is minted per FETCH rather than per
-    /// human approval, which is when this cost becomes worth measuring.
-    pub fn record_issued_ticket(&self, record: &IssuedTicketRecord) -> Result<()> {
-        let _guard = ISSUED_TICKETS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let mut m = self.load_issued_tickets()?;
-        m.insert(record.ticket.request_id.clone(), record.clone());
-        self.save_issued_tickets(&m)
-    }
-
-    /// Record the receipt for `request_id`. Idempotent, and deliberately a no-op for an unknown id —
-    /// the plane hands us a `ConsumedTicket` it could only have obtained from a `RedemptionGrant`,
-    /// but this layer is not the place to turn a bookkeeping surprise into a failed delivery the peer
-    /// has already received.
-    pub fn mark_ticket_consumed(
-        &self,
-        request_id: &str,
-        delivered_bytes: usize,
-        now: u64,
-    ) -> Result<()> {
-        let _guard = ISSUED_TICKETS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let mut m = self.load_issued_tickets()?;
-        if let Some(rec) = m.get_mut(request_id) {
-            rec.consumed_at = Some(now);
-            rec.delivered_bytes = Some(delivered_bytes);
-            self.save_issued_tickets(&m)?;
-        }
-        Ok(())
-    }
 
     // ── Standing grants (QURATOR-137 slice 2) — the owner-approval half of the 2026-08-31 ruling:
     //    manifest approval becomes a STANDING GRANT per (peer, collection), re-checked at redeem
@@ -1325,7 +1265,7 @@ impl DataStore {
 
     /// The reader slice 3 will consult at redeem time: the grant for `(npub, author, slug)`, if the owner
     /// ever approved one. **Nothing calls this to gate anything yet** (slice 2). A pure read — it
-    /// takes no lock, like `load_issued_ticket`.
+    /// takes no lock, like the other point reads.
     ///
     /// Uncalled outside `cfg(test)` until slice 3 lands, hence the `#[allow(dead_code)]` outside
     /// `test` — the same shape as `save_published`.
@@ -1343,14 +1283,10 @@ impl DataStore {
     }
 }
 
-/// Serializes every load-modify-save of the issued-ticket map.
-///
-/// **One shared static, not one per function.** A `static` declared inside a function body is its own
-/// distinct item, so a per-function `ISSUED_TICKETS_LOCK` in `record_issued_ticket` and another in
-/// `mark_ticket_consumed` never serialized against *each other* — a concurrent approval and consume
-/// could interleave their load→modify→save and revert `consumed_at` back to `None`, letting an
-/// already-delivered ticket be redeemed again. Same defect `MANIFEST_ASKS_LOCK` already fixed once.
-static ISSUED_TICKETS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// `ISSUED_TICKETS_LOCK` — DELETED 2026-09-03, QURATOR-177 Option E, with the issued-ticket map it
+// serialized. The M19 W9 lesson it embodied (hoist the RMW lock to ONE shared static, never one
+// per function — `MANIFEST_ASKS_LOCK` and `STANDING_GRANTS_LOCK` below still enforce it) outlives
+// the map.
 
 /// Serializes every load-modify-save of the ask trace.
 ///
@@ -1362,9 +1298,10 @@ static MANIFEST_ASKS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Serializes every load-modify-save of the standing-grant map (QURATOR-137 slice 2).
 ///
-/// **One shared static, not one per function** — the same rule `ISSUED_TICKETS_LOCK` and
-/// `MANIFEST_ASKS_LOCK` above exist to enforce: a `static` declared inside a function body is its
-/// own distinct item, so two such locks never serialize against each other. Today only
+/// **One shared static, not one per function** — the same rule `MANIFEST_ASKS_LOCK` above
+/// exists to enforce (and the deleted `ISSUED_TICKETS_LOCK` once did, QURATOR-177 Option E): a
+/// `static` declared inside a function body is its own distinct item, so two such locks never
+/// serialize against each other. Today only
 /// `record_standing_grant` mutates this map, but the lock is hoisted so the slice-3 writers inherit
 /// the serialized load→modify→save rather than re-learning the lost-write lesson.
 static STANDING_GRANTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1410,38 +1347,12 @@ pub fn standing_grant_key(npub: &str, author_npub: Option<&str>, slug: &str) -> 
     format!("{npub}|{}|{slug}", author_npub.unwrap_or(SELF_AUTHOR))
 }
 
-// The issued-ticket record map is UNBOUNDED (owner ruling 2026-09-01) — see
-// `DataStore::record_issued_ticket`. `ISSUED_TICKET_CAP` and `prune_issued_tickets` were removed
-// with it; eviction was never load-bearing (an unknown request_id is refused like a forgery), it
-// only discarded audit history.
-
-/// The persisted record of one approval: the ticket verbatim (so redemption compares against the
-/// exact bytes issued, not a reconstruction), who it was addressed to, and whether it has been spent.
-///
-/// **`redeemer_npub` is provenance, not a gate.** A live standing used to be re-read from it at
-/// redeem time (owner ruling 2026-07-30); that re-read was withdrawn by owner ruling 2026-09-03,
-/// QURATOR-177 — blocking gates chat/DM interaction only, so nothing on the serve path consults
-/// this npub to refuse. `fulfil.rs`'s `record_standing_grant` still reads it to key the grant.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IssuedTicketRecord {
-    pub ticket: hb_core::TransportTicket,
-    /// The npub this ticket was DM'd to — provenance for grant keying (`record_standing_grant`),
-    /// never consulted to refuse a redemption (owner ruling 2026-09-03, QURATOR-177).
-    pub redeemer_npub: String,
-    /// Unix seconds the asker's receipt landed; `None` while the ticket is unspent.
-    pub consumed_at: Option<u64>,
-    /// Payload size the receipt attested to. Provenance only.
-    pub delivered_bytes: Option<usize>,
-    /// The `snapshot_fingerprint` of the cache entry this ticket re-serves, set at MINT time by
-    /// `send_cached_manifest` — the `(author_npub, slug, fingerprint)` triple the human approved on
-    /// the "send cached copy" click (QURATOR-79 Carrier 4). `None` means owner-issued: the payload is
-    /// rebuilt from the collection as it is NOW at redeem time (owner ruling ②), and the
-    /// cache-serving branch never engages. Optional-additive like `ask_nonce`: a record written
-    /// before this field loads as `None`, which IS the owner-issued case — fail closed by
-    /// construction, no `#[serde(default)]` needed for an `Option`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub served_fingerprint: Option<String>,
-}
+// `IssuedTicketRecord` (ticket verbatim, `redeemer_npub`, `consumed_at`, `delivered_bytes`,
+// `served_fingerprint`) — DELETED 2026-09-03, QURATOR-177 Option E, with the
+// `issued_tickets.json` map that held it. Its two surviving consumers moved elsewhere at the same
+// time: the grant keying `redeemer_npub` fed is now keyed inline by `fulfil.rs`
+// (`record_standing_grant`), and the Carrier-4 branch `served_fingerprint` once discriminated is
+// now the ticket's own `author_npub` (`manifest_source.rs`). The audit trail is deliberately gone.
 
 /// The persisted ask trace: `fingerprint_seen` (the snapshot fingerprint the requester observed when
 /// they asked — for staleness notes on the fulfil side) + `sent_at` (RFC3339 UTC, as everywhere else
@@ -2327,118 +2238,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn consume_then_concurrent_record_does_not_revert_the_consumption() {
-        // M19 W9 regression: `record_issued_ticket` and `mark_ticket_consumed` each used to declare
-        // their OWN `static ISSUED_TICKETS_LOCK` inside the function body — and a `static` inside a
-        // function is its own distinct item, so the two never serialized against each other. Both do a
-        // load→modify→save over the SAME `issued_tickets.json` map, so an interleaved approval (which
-        // inserts a fresh record for its OWN request_id) and a redemption receipt (which
-        // sets `consumed_at` on a DIFFERENT request_id) could each load the same stale map, apply
-        // their own edit, and the save that lands second clobbers the other — reverting a just-written
-        // `consumed_at` back to `None` (or dropping the newly-issued record). The hoisted module-level
-        // `ISSUED_TICKETS_LOCK` makes the two RMWs serialize. This is the same defect class
-        // `MANIFEST_ASKS_LOCK` already fixed for the ask-trace map.
-        //
-        // The serialization is FORCED, not hoped for. The main thread holds the shared lock, then
-        // spawns a consume (for req-A) and an approval (for a DIFFERENT req-B); both must queue on
-        // that lock. A shared `AtomicBool` proves the consume is actually blocked (it flips the flag
-        // on entry, before blocking): under the fix the flag is set but the consume cannot finish
-        // while the lock is held; under the old per-function statics the consume held a DIFFERENT
-        // lock, never blocked, and finished before the main thread released. This is the asymmetric
-        // rendezvous the M18 lesson demands: a concurrency test not forced to overlap is
-        // timing-dependent. (The approval targets its own request_id, as in production where each
-        // fulfilment mints a fresh id — so neither RMW overwrites the other's key; the only way an
-        // edit is lost is the unserialized load→modify→save the lock now prevents.)
-        use hb_core::TransportTicket;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let (_dir, store) = test_store();
-        let store = std::sync::Arc::new(store);
-
-        // Pre-seed an unspent ticket (req-A) that the consume will mark spent.
-        let ticket_a = TransportTicket::issue("req-A", "slug-a", "addr", 1_700_000_000, Some("n1"));
-        store
-            .record_issued_ticket(&IssuedTicketRecord {
-                ticket: ticket_a.clone(),
-                redeemer_npub: "npub1race".into(),
-                consumed_at: None,
-                delivered_bytes: None,
-                served_fingerprint: None,
-            })
-            .unwrap();
-
-        // Acquire the real shared lock on the main thread and hold it.
-        let real_guard = ISSUED_TICKETS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-
-        let consume_started = std::sync::Arc::new(AtomicBool::new(false));
-        let store_consume = std::sync::Arc::clone(&store);
-        let started_clone = std::sync::Arc::clone(&consume_started);
-        let consume = std::thread::spawn(move || {
-            // Signal we are running, THEN block on the lock `mark_ticket_consumed` needs.
-            started_clone.store(true, Ordering::SeqCst);
-            store_consume
-                .mark_ticket_consumed("req-A", 4096, 1_700_000_100)
-                .unwrap();
-        });
-
-        // The approval issues a DIFFERENT ticket (req-B) — as production does (new_request_id() each
-        // fulfilment). Its edit touches a different key in the same map, so under the shared lock it
-        // cannot lose the consume's write to req-A.
-        let ticket_b = TransportTicket::issue("req-B", "slug-b", "addr", 1_700_000_000, Some("n2"));
-        let store_record = std::sync::Arc::clone(&store);
-        let record = std::thread::spawn(move || {
-            store_record
-                .record_issued_ticket(&IssuedTicketRecord {
-                    ticket: ticket_b,
-                    redeemer_npub: "npub1other".into(),
-                    consumed_at: None,
-                    delivered_bytes: None,
-                    served_fingerprint: None,
-                })
-                .unwrap();
-        });
-
-        // Wait for the consume thread to have started, then assert neither spawned thread could finish
-        // while we hold the lock. Under the old per-function statics the consume ran to completion
-        // immediately (it held a different lock) and this assertion would red.
-        while !consume_started.load(Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        // Brief grace so a blocked thread is definitely parked, not just unscheduled.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(
-            !consume.is_finished(),
-            "mark_ticket_consumed must block on the shared ISSUED_TICKETS_LOCK while the main thread \
-             holds it — if it finished, the two functions do not share a lock (M19 W9)"
-        );
-        assert!(
-            !record.is_finished(),
-            "record_issued_ticket must block on the same shared lock (M19 W9)"
-        );
-
-        // Release the lock: both queued threads proceed SERIALLY. Each loads the current map (with the
-        // other's edit already applied, because they no longer interleave), applies its own edit, and
-        // saves — so BOTH edits survive. Under the old per-function statics both could load the same
-        // stale map and the save landing second would drop the other's edit (reverting consumed_at).
-        drop(real_guard);
-
-        record.join().unwrap();
-        consume.join().unwrap();
-
-        // Both edits must survive: req-A is consumed, req-B is present and unspent.
-        let a = store.load_issued_ticket("req-A").unwrap().unwrap();
-        assert_eq!(
-            a.consumed_at,
-            Some(1_700_000_100),
-            "a concurrent approval must not revert a ticket's consumption (M19 W9)"
-        );
-        assert_eq!(a.delivered_bytes, Some(4096));
-        let b = store.load_issued_ticket("req-B").unwrap().unwrap();
-        assert_eq!(
-            b.consumed_at, None,
-            "the concurrently-issued ticket must also survive the serialized RMW"
-        );
-    }
+    // `consume_then_concurrent_record_does_not_revert_the_consumption` (the M19 W9 regression
+    // test) — DELETED 2026-09-03, QURATOR-177 Option E: it pinned that `record_issued_ticket` and
+    // `mark_ticket_consumed` serialized on ONE shared `ISSUED_TICKETS_LOCK`, and both functions
+    // are deleted with the ledger. The lock-hoisting lesson it taught is still enforced by
+    // `MANIFEST_ASKS_LOCK` and `STANDING_GRANTS_LOCK` (whose own tests remain).
 
     #[test]
     fn read_state_is_wiped_with_the_rest_of_the_profile() {

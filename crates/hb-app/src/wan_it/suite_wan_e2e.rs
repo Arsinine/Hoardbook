@@ -9,9 +9,11 @@
 //! → sends the production **request-DM** (the ask-owner path: `build_manifest_request` → `send_dm_inner`,
 //! the NIP-17 gift-wrap wire the "Ask owner" button drives) → serve polls its DM inbox, **auto-approves**
 //! (harness policy) by driving the production approval body (`send_full_list`'s inner fns: build manifest
-//! → bind endpoint → mint ticket → record → DM the ticket) → probe polls DMs for the ticket → redeems it
-//! (claim → fetch_manifest → accept_manifest_bytes → spend) → asserts the **full tree** parses with entry
-//! count > the truncated teaser's, slug matches → serve-side receipt shows consumed.
+//! → bind endpoint → mint ticket → DM the ticket) → probe polls DMs for the ticket → redeems it
+//! (claim → fetch_manifest → accept_manifest_bytes) → asserts the **full tree** parses with entry
+//! count > the truncated teaser's, slug matches. (The redeem used to end by spending the ticket and
+//! reading the serve's receipt; the issued-ticket ledger is deleted — QURATOR-177 Option E, owner
+//! ruling 2026-09-03 — and a repeat fetch is a legitimate fetch, never a replay to refuse.)
 //!
 //! **E2 — staleness gate over a real link.** The probe sends a fresh request-DM, the serve auto-approves
 //! and delivers a ticket, and the probe redeems it — but passes a **synthetic stale fingerprint** (all
@@ -112,14 +114,14 @@ const SEED_SLUG: &str = "wan-e2e";
 /// Run the WAN-E2E rows against a live serve. E1 is the full truncating round-trip; E2 is the
 /// staleness gate over a republished (changed-fingerprint) collection. Each row is an honest TAP check.
 ///
-/// `serve_store` is the serve's store handle (single-machine smoke only — the probe reads the serve's
-/// receipt to confirm the ticket was consumed). Across machines, the orchestrator correlates the TAP
-/// output and this leg is informational.
-pub async fn run(tap: &mut Tap, probe: &ProbeInput, serve_store: Option<&DataStore>) {
+/// (The serve's receipt used to be read through a `serve_store` handle single-machine; that
+/// confirmation is deleted with the issued-ticket ledger — QURATOR-177 Option E, owner ruling
+/// 2026-09-03 — and across machines the orchestrator correlates TAP output as before.)
+pub async fn run(tap: &mut Tap, probe: &ProbeInput) {
     // E1 — the full truncating paywall round-trip.
     tap.check(
         "E1: browse truncated teaser → request-DM → approve → ticket-DM → redeem → full tree > teaser",
-        e1_truncated_round_trip(probe, serve_store).await,
+        e1_truncated_round_trip(probe).await,
     );
 
     // E2 — staleness gate fires when newest_fingerprint mismatches the manifest's.
@@ -134,12 +136,11 @@ pub async fn run(tap: &mut Tap, probe: &ProbeInput, serve_store: Option<&DataSto
 // ---------------------------------------------------------------------------
 
 /// E1: the full pipeline. Browse the truncated teaser → request-DM → (serve auto-approves) → ticket-DM
-/// → redeem → assert full tree > teaser, slug matches, receipt consumed.
+/// → redeem → assert full tree > teaser, slug matches.
 ///
 /// The serve side (auto-approve loop) runs as a SEPARATE process (`hb-wan-it serve --auto-approve`). The
-/// probe's job here is: browse, ask, wait for the ticket, redeem, assert. The serve's receipt is checked
-/// via `serve_store` when the harness runs single-machine.
-async fn e1_truncated_round_trip(probe: &ProbeInput, serve_store: Option<&DataStore>) -> Result<(), String> {
+/// probe's job here is: browse, ask, wait for the ticket, redeem, assert.
+async fn e1_truncated_round_trip(probe: &ProbeInput) -> Result<(), String> {
     // (1) Browse the teaser via the production path (browse_share_code). Assert truncated == true.
     let teaser = browse_truncated_teaser(probe).await?;
     let teaser_entry_count = teaser.kept_entry_count;
@@ -198,34 +199,13 @@ async fn e1_truncated_round_trip(probe: &ProbeInput, serve_store: Option<&DataSt
         );
     }
 
-    // (6) Serve-side receipt: when the harness runs single-machine, the serve's store shows the ticket
-    // consumed. This is the strongest assertion (the receipt was persisted); across machines it is
-    // informational.
-    if let Some(serve) = serve_store {
-        match serve.load_issued_ticket(&ticket.request_id) {
-            Ok(Some(rec)) => match rec.consumed_at {
-                Some(ts) => eprintln!(
-                    "   E1 owner-side confirmation: ticket consumed_at={ts}, delivered_bytes={:?}",
-                    rec.delivered_bytes
-                ),
-                None => {
-                    return Err(
-                        "the owner-side store shows the ticket NOT consumed after a successful redeem — \
-                         the receipt was not persisted"
-                            .to_string(),
-                    )
-                }
-            },
-            Ok(None) => {
-                return Err(
-                    "the owner-side store has no record of this request id — the serve did not mint \
-                     this ticket through its store"
-                        .to_string(),
-                )
-            }
-            Err(e) => eprintln!("   E1 could not read serve store (informational): {e}"),
-        }
-    }
+    // (6) DELETED 2026-09-03, QURATOR-177 Option E (owner ruling): the serve-side receipt
+    // confirmation read `load_issued_ticket(...).consumed_at` — the issued-ticket ledger is
+    // deleted, and with it the spent bit this checked. Deliberately NOT replaced by any
+    // "a second redemption now succeeds" assertion: a repeat fetch is a legitimate fetch under
+    // Option E, and E1's claim is the truncated round trip, which ended at step (5). The durable
+    // audit trail was given up by ruling; what remains observable serve-side (the standing grant)
+    // is pinned by the WAN-M rows.
 
     Ok(())
 }
