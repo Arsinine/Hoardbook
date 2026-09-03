@@ -325,4 +325,78 @@ mod tests {
         let out = out.unwrap().unwrap();
         assert!(out.ends_with("tail line"));
     }
+
+    // -----------------------------------------------------------------------
+    // Command-dispatch tests (QURATOR-179 slice 1 remainder) — through the real
+    // #[tauri::command] shim (state injection, error conversion), not by calling
+    // bodies directly. `copy_diagnostics` is NOT covered here: it takes the
+    // concrete `tauri::AppHandle` (not generic over `R: tauri::Runtime`), so a
+    // `MockRuntime` handle from `tauri::test::mock_app()` cannot be passed to it
+    // without first making the command generic — a production-code change that is
+    // the orchestrator's call, not this lane's. `reveal_log_folder` and
+    // `open_repo_page` are out of scope entirely (they spawn a real OS window).
+    mod command_guards {
+        use super::*;
+        use tauri::Manager;
+
+        fn guard_app() -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            app.manage(crate::nat::new_shared_classification());
+            app
+        }
+
+        /// Pins the pre-probe path: a freshly-managed slot is `None`, and the command must return
+        /// exactly `"undetermined"` — the token the Settings → Diagnostics UI renders as "not yet
+        /// determined". Also proves state injection: the command reaches the SAME `Arc<RwLock<..>>`
+        /// this test manages, through the real `#[tauri::command]` shim (arg extraction from
+        /// `State<'_, _>`, not a direct body call).
+        // mutation: in `nat_classification`, change the `unwrap_or_else(|| "undetermined".to_string())`
+        // literal to any other string (e.g. `"unknown".to_string()`) — this assert_eq must fail.
+        #[tokio::test]
+        async fn nat_classification_command_returns_undetermined_before_first_probe() {
+            let app = guard_app();
+            let got = nat_classification(app.state::<crate::nat::SharedNatClassification>())
+                .await
+                .unwrap();
+            assert_eq!(got, "undetermined");
+        }
+
+        /// INV pin (not a smoke test): for every real classification the slot can hold, the value
+        /// that crosses the command boundary is one of the five documented short tokens and NEVER an
+        /// address-shaped string (no `.` or `:`, which any IPv4/IPv6/socket-address rendering would
+        /// contain). "The discovered mapped address is never returned — only the classification" is
+        /// the doc comment's own invariant; this drives every variant through the real shim and
+        /// checks the set is exact, not just "looks plausible".
+        // mutation: in `NatClassification::as_log_token` (crates/hb-app/src/net.rs), change the
+        // `NatClassification::BehindCgnat => "cgnat"` arm to e.g. `"100.64.0.1"` — the address-shape
+        // assertion (no '.' / ':') on that variant's token must fail, and the exact-set assertion
+        // must fail too (a `.` string is neither a valid token nor equal to "cgnat").
+        #[tokio::test]
+        async fn nat_classification_command_never_crosses_the_shim_as_an_address() {
+            use crate::net::NatClassification;
+
+            let variants = [
+                NatClassification::NoNat,
+                NatClassification::BehindNat,
+                NatClassification::BehindCgnat,
+                NatClassification::Unknown,
+            ];
+            let mut tokens: Vec<String> = Vec::new();
+            for v in variants {
+                let app = guard_app();
+                let slot = app.state::<crate::nat::SharedNatClassification>();
+                *slot.write().await = Some(v);
+                let got = nat_classification(slot).await.unwrap();
+                assert!(
+                    !got.contains('.') && !got.contains(':'),
+                    "token for {v:?} must never be address-shaped; got {got:?}"
+                );
+                tokens.push(got);
+            }
+            let expected: std::collections::HashSet<&str> =
+                ["no-nat", "nat", "cgnat", "unknown"].into_iter().collect();
+            let got: std::collections::HashSet<&str> = tokens.iter().map(String::as_str).collect();
+            assert_eq!(got, expected, "shim must carry the exact documented token set, nothing else");
+        }
+    }
 }
