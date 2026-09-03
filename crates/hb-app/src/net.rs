@@ -410,8 +410,27 @@ pub async fn reset(shared: &SharedRelay) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::tests::test_store_unroutable_relays;
     use crate::store::Settings;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn relay_urls_of_an_unroutable_test_store_never_falls_back_to_the_real_defaults() {
+        // Guard for QURATOR-179 slice 2: `test_store_unroutable_relays` exists so a test that
+        // reaches relay I/O fails loudly against a sentinel host instead of quietly dialling the
+        // four real public DEFAULT_RELAYS. This pins that the helper actually keeps relay_urls()
+        // off the fallback path — without it, a bug in the helper (e.g. saving an empty relay set)
+        // would silently re-open the exact hole this ticket closes.
+        //
+        // MUTATION (must red this test): in `relay_urls` above, change the guard condition from
+        // `if configured.is_empty()` to `if true` — relay_urls would then return DEFAULT_RELAYS for
+        // every store, including this one. (This also reds the existing
+        // `relay_urls_uses_configured_set_when_present` test below, which pins the same line.)
+        let (_dir, store) = test_store_unroutable_relays();
+        let urls = relay_urls(&store);
+        assert_ne!(urls, *DEFAULT_RELAYS, "an unroutable test store must never fall back to the real defaults");
+        assert_eq!(urls, vec!["wss://hoardbook-test-sentinel.invalid".to_string()]);
+    }
 
     #[test]
     fn relay_urls_falls_back_to_defaults_when_unset() {

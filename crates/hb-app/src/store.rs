@@ -1485,13 +1485,32 @@ impl DataStore {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tempfile::TempDir;
 
     fn test_store() -> (TempDir, DataStore) {
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
+        (dir, store)
+    }
+
+    /// [`test_store`], but with an explicit, deliberately-unroutable relay set already saved
+    /// (QURATOR-179 slice 2). `relay_urls()` (see `net.rs`) falls back to the four REAL public
+    /// `DEFAULT_RELAYS` whenever a store's configured set is empty — which a plain `test_store()`
+    /// always is — so any test that reaches relay I/O through a plain store silently targets the
+    /// live internet. Use this helper instead for such a test: its non-empty sentinel set means
+    /// `relay_urls()` returns the sentinel, not the defaults, so a test that tries to dial out fails
+    /// loudly against a host that cannot resolve rather than succeeding slowly against a real relay.
+    /// `.invalid` is the RFC 2606 reserved TLD guaranteed to never resolve.
+    pub(crate) fn test_store_unroutable_relays() -> (TempDir, DataStore) {
+        let (dir, store) = test_store();
+        store
+            .save_settings(&Settings {
+                relay_urls: vec!["wss://hoardbook-test-sentinel.invalid".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
         (dir, store)
     }
 
