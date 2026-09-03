@@ -439,15 +439,21 @@ struct CacheIndexEntry {
 /// [`redeem_manifest_ticket_emitting`], which owns the Tauri-only progress forwarder and then
 /// calls the same body fn [`redeem_manifest_ticket_inner`] does, so the sanitize/claim/fetch/spend
 /// sequence the harness used to hand-copy is still the one the app runs.
+///
+/// Generic over `R: Runtime` for the same reason `take_update_notice` is — Tauri's documented
+/// mechanism for mock-runtime testing; `Wry` stays the concrete runtime in `lib.rs`. The uncovered
+/// risk that earns it here: `npub` and `ticket_json` are adjacent `String`s, so transposing them in
+/// the delegating call below compiles silently. That is the `sanitize_node_addr` class (QURATOR-179),
+/// and it is what `redeem_manifest_ticket_command_dispatch_keeps_npub_and_ticket_json_in_order` pins.
 #[tauri::command]
-pub async fn redeem_manifest_ticket(
+pub async fn redeem_manifest_ticket<R: tauri::Runtime>(
     npub: String,
     ticket_json: String,
     newest_fingerprint: Option<String>,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
     endpoint: State<'_, SharedEndpoint>,
-    app: tauri::AppHandle,
+    app: tauri::AppHandle<R>,
 ) -> CmdResult<crate::commands::browse::ImportedManifest> {
     redeem_manifest_ticket_emitting(app, npub, ticket_json, newest_fingerprint, &identity, &store, &endpoint).await
 }
@@ -461,8 +467,8 @@ pub async fn redeem_manifest_ticket(
 /// call to `_inner` stays Tauri-free. Nothing here decides anything: no guard, transform or ordering
 /// rule may move into this function, because the harness cannot run it.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn redeem_manifest_ticket_emitting(
-    app: tauri::AppHandle,
+pub(crate) async fn redeem_manifest_ticket_emitting<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     npub: String,
     ticket_json: String,
     newest_fingerprint: Option<String>,
@@ -759,12 +765,24 @@ mod tests {
         for (cmd, inner) in
             [("send_full_list", "send_full_list_inner"), ("redeem_manifest_ticket", "redeem_manifest_ticket_emitting"), ("send_cached_manifest", "send_cached_manifest_inner")]
         {
-            let sig = format!("pub async fn {cmd}(");
-            let at = code.find(&sig).unwrap_or_else(|| panic!("{cmd} not found"));
-            let inner_sig = format!("async fn {inner}(");
+            // Match the name, then require the next char to open either the parameter list `(`
+            // or a generic list `<` — `redeem_manifest_ticket` is generic over `R: Runtime` (the
+            // `take_update_notice` precedent) so that a MockRuntime dispatch test can reach it.
+            // The next-char check is what keeps this from matching `{cmd}_inner`/`{cmd}_emitting`.
+            let sig = format!("pub async fn {cmd}");
+            let at = code
+                .match_indices(&sig)
+                .find(|(i, _)| matches!(code[i + sig.len()..].chars().next(), Some('(') | Some('<')))
+                .map(|(i, _)| i)
+                .unwrap_or_else(|| panic!("{cmd} not found"));
+            // Same next-char rule as above: the inner fn may also carry a generic list.
+            let inner_sig = format!("async fn {inner}");
             let inner_at = code[at..]
-                .find(&inner_sig)
-                .map(|i| at + i)
+                .match_indices(&inner_sig)
+                .find(|(i, _)| {
+                    matches!(code[at + i + inner_sig.len()..].chars().next(), Some('(') | Some('<'))
+                })
+                .map(|(i, _)| at + i)
                 .unwrap_or_else(|| panic!("{cmd}'s inner fn {inner} must follow it"));
             // Everything between the command's signature and its inner fn: the parameter list plus
             // the body. Only the body can contain statements, so counting `;` here is safe.
@@ -802,8 +820,13 @@ mod tests {
         // can drift apart and the harness silently stops covering what ships, which is precisely the
         // failure this guard exists to prevent.
         for f in ["redeem_manifest_ticket_emitting", "redeem_manifest_ticket_inner"] {
-            let sig = format!("async fn {f}(");
-            let at = code.find(&sig).unwrap_or_else(|| panic!("{f} not found"));
+            // Next-char rule again: `_emitting` is generic over `R: Runtime`.
+            let sig = format!("async fn {f}");
+            let at = code
+                .match_indices(&sig)
+                .find(|(i, _)| matches!(code[i + sig.len()..].chars().next(), Some('(') | Some('<')))
+                .map(|(i, _)| i)
+                .unwrap_or_else(|| panic!("{f} not found"));
             let end = code[at..].find("\n}").expect("fn must terminate") + at;
             assert!(
                 code[at..end].contains("redeem_manifest_ticket_with_progress("),
@@ -1393,5 +1416,212 @@ mod tests {
         // must not make. The four REFUSAL guards above (recipient, identity, self-send, draft) are
         // each pinned on the real command; what stays unpinned is only the pass-through.
 
+    }
+
+    // ── QURATOR-179 slice 1a — the command SHIM dispatch, not the inner bodies ──────────────────
+    //
+    // `command_guards` above pins these commands' guard order by calling the `*_inner`/`_with_progress`
+    // fns directly — deliberately bypassing the `#[tauri::command]` shim (state extraction, arg
+    // deserialization, the delegate call itself). That shim is exactly where the 2026-08-27
+    // `sanitize_node_addr` omission lived (QURATOR-179's own premise): a step present in the real
+    // command wiring, absent from a hand-rolled harness call, is invisible to every inner-level test
+    // however many of them are green.
+    //
+    // `fulfil_commands_stay_thin_so_the_harness_keeps_covering_them` (above) proves each shim body is
+    // ONE delegating call — no `if`/`match`/loop/`?`. That guarantees the shim adds no *branching*
+    // logic, but it does NOT guarantee argument ORDER: `send_full_list(npub, slug, ...)` and
+    // `send_cached_manifest(npub, author_npub, slug, ...)` each carry two or three consecutive
+    // `String` params, so a transposition at the delegate call site (e.g.
+    // `send_full_list_inner(slug, npub, ...)`) still compiles as "one delegating call" and is invisible
+    // to that guard. It is also invisible to `command_guards`'s own tests, which call the `_inner` fns
+    // with already-correctly-ordered arguments and so never exercise the shim's own call site at all.
+    // These three tests dispatch the REAL `#[tauri::command]` fns — through `State` extracted via
+    // `app.state::<T>()`, the established convention in this codebase (see `update.rs`'s
+    // `command_guards`) — with two distinguishable string values in the swappable positions, so a
+    // transposition flips which error fires.
+    mod command_shim_dispatch {
+        use super::*;
+        use crate::identity_state::AppIdentity;
+        use tauri::Manager;
+
+        /// Mirrors `command_guards::CALL_BUDGET` — sibling `mod`s do not share private items, so this
+        /// is a deliberate, minimal re-declaration, not drift.
+        const CALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+        /// A `tauri::test::mock_app()` with every managed state the three fulfil commands take,
+        /// registered exactly as `lib.rs` registers them. `identity_loaded` mirrors the same knob
+        /// `browse.rs`'s and `topics.rs`'s `guard_app(identity_loaded: bool)` use. The relay slot is
+        /// built the same way `command_guards::send`'s own `SharedRelay` is — `Arc::new(RwLock::new(None))`,
+        /// never `crate::net::new_shared()` backed by an empty/default relay set — every test below
+        /// fails at a guard strictly before any relay read, so `None` both satisfies the type and keeps
+        /// the relay-hazard (`net::relay_urls` falling back to the four real public relays on an empty
+        /// configured set) structurally unreachable, not merely avoided by care.
+        fn guard_app(identity_loaded: bool) -> tauri::App<tauri::test::MockRuntime> {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            let identity: SharedIdentity = std::sync::Arc::new(tokio::sync::RwLock::new(
+                identity_loaded.then(AppIdentity::generate),
+            ));
+            let relay: SharedRelay = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+            let app = tauri::test::mock_app();
+            app.manage(store);
+            app.manage(identity);
+            app.manage(relay);
+            app.manage(crate::transport_state::new_shared_endpoint());
+            app
+        }
+
+        /// A ticket that parses, clears `verify_shape`, and sanitizes to itself — same fixture as
+        /// `command_guards::undialable_ticket`, replicated here (not imported: it is private to that
+        /// sibling module) because `redeem_manifest_ticket`'s dispatch test needs a well-formed ticket
+        /// body to get past the parse/shape guards before the npub/ticket_json ordering can matter.
+        fn undialable_ticket(request_id: &str, slug: &str, nonce: Option<&str>) -> String {
+            let ticket = TransportTicket::issue(
+                request_id,
+                slug,
+                &crate::transport::tests::undialable_addr_json(),
+                1_700_000_000,
+                nonce,
+            );
+            serde_json::to_string(&ticket).unwrap()
+        }
+
+        /// `send_full_list(npub, slug, ...)` — `npub` and `slug` are consecutive `String` params.
+        /// Dispatched through the real command with a real peer npub and a slug that has no draft:
+        /// correctly ordered, the recipient parses fine and the call dies at the missing-draft guard,
+        /// naming the SLUG. Swapped at the call site, the recipient parser would instead receive the
+        /// slug text and die first, naming "Invalid recipient" — a different error, so the two orderings
+        /// are always distinguishable.
+        ///
+        /// MUTATION (P-10): in `send_full_list`'s body, change
+        /// `send_full_list_inner(npub, slug, ask_nonce, &identity, &store, &relay, &endpoint).await`
+        /// to `send_full_list_inner(slug, npub, ask_nonce, &identity, &store, &relay, &endpoint).await`
+        /// — this test reds (the error becomes `"Invalid recipient: ..."`); no test in `command_guards`
+        /// reds, since none of them dispatch through this shim.
+        #[tokio::test]
+        async fn send_full_list_command_dispatch_keeps_npub_and_slug_in_order() {
+            let app = guard_app(true);
+            let peer = AppIdentity::generate();
+            let err = tokio::time::timeout(
+                CALL_BUDGET,
+                send_full_list(
+                    peer.npub(),
+                    "no-such-slug".into(),
+                    None,
+                    app.state::<SharedIdentity>(),
+                    app.state::<DataStore>(),
+                    app.state::<SharedRelay>(),
+                    app.state::<SharedEndpoint>(),
+                ),
+            )
+            .await
+            .expect("the call must resolve well inside the budget — a hang is a finding")
+            .expect_err("a peer npub and a slug with no draft must be refused at the draft guard");
+            assert_eq!(
+                err, "No draft found for collection 'no-such-slug'",
+                "npub must reach the recipient parser and slug must reach the draft lookup, in that \
+                 order — a different error here means the shim's call site transposed them"
+            );
+        }
+
+        /// `send_cached_manifest(npub, author_npub, slug, ...)` — `npub` and `author_npub` are the
+        /// first two consecutive `String` params. Dispatched with `npub` = our OWN npub (the intended
+        /// recipient) and `author_npub` = a peer's (whose cached copy we'd be re-sending): correctly
+        /// ordered, `npub` resolves to a self-send and the call dies at the self-send guard, which runs
+        /// BEFORE the cache lookup. Swapped, `npub` instead carries the peer's npub (no self-send) and
+        /// `author_npub` carries our own — the call proceeds past the self-send guard and dies at the
+        /// cache-miss guard instead, naming the slug. The two guards produce distinct text, so the
+        /// ordering is always distinguishable.
+        ///
+        /// MUTATION (P-10): in `send_cached_manifest`'s body, change
+        /// `send_cached_manifest_inner(npub, author_npub, slug, ask_nonce, ...)` to
+        /// `send_cached_manifest_inner(author_npub, npub, slug, ask_nonce, ...)` — this test reds (the
+        /// error becomes the cache-miss message); no `command_guards` test reds, since none dispatch
+        /// through this shim.
+        #[tokio::test]
+        async fn send_cached_manifest_command_dispatch_keeps_npub_and_author_npub_in_order() {
+            let app = guard_app(true);
+            let own_npub = app.state::<SharedIdentity>().read().await.as_ref().unwrap().npub();
+            let peer = AppIdentity::generate();
+            let err = tokio::time::timeout(
+                CALL_BUDGET,
+                send_cached_manifest(
+                    own_npub,
+                    peer.npub(),
+                    "vault".into(),
+                    None,
+                    app.state::<SharedIdentity>(),
+                    app.state::<DataStore>(),
+                    app.state::<SharedRelay>(),
+                    app.state::<SharedEndpoint>(),
+                ),
+            )
+            .await
+            .expect("the call must resolve well inside the budget — a hang is a finding")
+            .expect_err("addressing the message to ourselves must be refused as a self-send");
+            assert_eq!(
+                err, "You can't send a cached list to yourself.",
+                "npub must reach the self-send check and author_npub must reach the cache lookup, in \
+                 that order — a different error here means the shim's call site transposed them"
+            );
+        }
+
+        /// `redeem_manifest_ticket(npub, ticket_json, ...)` — `npub` and `ticket_json` are the first
+        /// two consecutive `String` params. Dispatched with a well-formed (if undialable) ticket and no
+        /// recorded ask: correctly ordered, `npub` is used only as an opaque bookkeeping key (it is
+        /// never parsed as a recipient in this path) and `ticket_json` parses and clears shape, so the
+        /// call dies at the claim guard, `Unsolicited`. Swapped, `ticket_json`'s well-formed JSON would
+        /// land in the `npub` slot (harmless — it's opaque) while `npub`'s plain string would land in
+        /// the `ticket_json` slot and fail to parse as JSON at all, dying at the very first guard
+        /// instead. This also dispatches through `redeem_manifest_ticket_emitting`'s progress forwarder
+        /// (`tauri::async_runtime::spawn` + `app.emit`) via a real `AppHandle`, a code path no
+        /// `command_guards` test reaches (those call `_inner` directly, which skips `_emitting`
+        /// entirely).
+        ///
+        /// MUTATION (P-10): in `redeem_manifest_ticket`'s body, change
+        /// `redeem_manifest_ticket_emitting(app, npub, ticket_json, newest_fingerprint, ...)` to
+        /// `redeem_manifest_ticket_emitting(app, ticket_json, npub, newest_fingerprint, ...)` — this
+        /// test reds (the error becomes `"That message is not a readable transport ticket."`); no
+        /// `command_guards` test reds, since none dispatch through this shim.
+        #[tokio::test]
+        async fn redeem_manifest_ticket_command_dispatch_keeps_npub_and_ticket_json_in_order() {
+            let app = guard_app(true);
+            let ticket = undialable_ticket("req-shim", "vault", Some("nonce-shim"));
+            let err = tokio::time::timeout(
+                CALL_BUDGET,
+                redeem_manifest_ticket(
+                    "npub1peer".into(),
+                    ticket,
+                    None,
+                    app.state::<SharedIdentity>(),
+                    app.state::<DataStore>(),
+                    app.state::<SharedEndpoint>(),
+                    app.handle().clone(),
+                ),
+            )
+            .await
+            .expect("the call must resolve well inside the budget — a hang is a finding")
+            .expect_err("no recorded ask means Unsolicited, not a parse failure");
+            assert_eq!(
+                err, "That link doesn't answer a request you sent, so nothing was fetched.",
+                "npub must reach claim bookkeeping and ticket_json must reach the parser, in that \
+                 order — a different error here means the shim's call site transposed them"
+            );
+        }
+
+        // ── State injection / error conversion — honest limit of this convention ─────────────────
+        //
+        // The ticket's priority list also asks for error-conversion and state-injection coverage (a
+        // missing/absent managed state, an identity-absent dispatch). Deliberately NOT added as
+        // separate tests here: every `State<'_, T>` param in these three commands is a DISTINCT Rust
+        // type, so — unlike the `String`/`String` pairs above — a transposition of two differently-typed
+        // state params would not compile, and there is no other shim-level mutation available to
+        // discriminate such a test from the equivalent `command_guards` inner-level test (e.g.
+        // `send_refuses_when_no_identity_is_loaded`). A "dispatch with identity=None" test here would
+        // pin the identical string the inner test already pins, reached one call frame further out —
+        // real wiring, but not a NEW mutation, and P-10 says to name that plainly rather than count it
+        // as new coverage. The three tests above are dispatch-through-the-shim tests that ARE
+        // discriminating; this module stops there rather than pad with the non-discriminating kind.
     }
 }
