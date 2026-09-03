@@ -219,6 +219,22 @@ pub fn cache_dir(base: &Path) -> PathBuf {
     base.join("manifests")
 }
 
+/// Clear the ENTIRE cache — one global, all-or-nothing directory removal (QURATOR-176, owner
+/// ruling 2026-09-03). NOT eviction: `eviction_plan`/LRU is never consulted here, and no cap is
+/// applied — this is the cleanup affordance the no-caps ruling of 2026-09-02 acknowledged would
+/// be needed, and it takes no per-entry policy because it deletes the directory wholesale.
+///
+/// Idempotent: an already-absent directory is success, not an error (`put` recreates the
+/// directory on demand, so nothing needs to be recreated here). Scope is the manifest cache
+/// ONLY — never the wider store (`DataStore::wipe` is a different, destructive operation).
+pub fn clear_all(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Directories already migrated this process. Hoisted to MODULE scope — a per-function static is
 /// never serialized (CLAUDE.md §9) and the guard must cover every call site, not one closure.
 static MIGRATED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
@@ -693,5 +709,44 @@ mod tests {
         migrate_legacy_entries(dir.path());
         assert!(planted.exists(), "the marker must suppress the pass — no rename happened");
         assert!(get(dir.path(), "npubB", "music", "fp2", 250).is_none(), "no canonical file was created");
+    }
+
+    // QURATOR-176 — the global, all-or-nothing clear.
+    //
+    // MUTATION PROOF (P-10, for the orchestrator to apply and revert): replace the
+    // `std::fs::remove_dir_all(dir)` expression in `clear_all`'s body with `Ok(())` (a no-op body).
+    // `clear_all_removes_every_entry_across_npubs` must go RED (the entries survive, both `get`s
+    // return `Some`); `clear_all_on_an_absent_cache_is_success` stays green under that mutation —
+    // its discriminator is the NotFound arm, reds under the mutation named beside it.
+    #[test]
+    fn clear_all_removes_every_entry_across_npubs() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "npubA", "films", "fp1", "ENV-A", 100, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
+        put(dir.path(), "npubB", "music", "fp2", "ENV-B", 100, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
+        assert!(get(dir.path(), "npubA", "films", "fp1", 200).is_some(), "precondition: entries are cached");
+
+        clear_all(dir.path()).unwrap();
+
+        assert!(get(dir.path(), "npubA", "films", "fp1", 200).is_none(), "npubA entry must be gone");
+        assert!(get(dir.path(), "npubB", "music", "fp2", 200).is_none(), "npubB entry must be gone");
+        assert!(!dir.path().exists(), "the cache directory itself is removed, not emptied");
+
+        // The cache must keep working afterwards: `put` recreates the directory on demand, so a
+        // clear cannot brick later browsing.
+        put(dir.path(), "npubC", "books", "fp3", "ENV-C", 300, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
+        assert_eq!(get(dir.path(), "npubC", "books", "fp3", 400).as_deref(), Some("ENV-C"));
+    }
+
+    // MUTATION PROOF (P-10): in `clear_all`, change the NotFound arm
+    // `Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(())` to return `Err(e)` instead.
+    // This test must go RED (removing an absent dir returns NotFound, now propagated); the
+    // removes-every-entry test above stays green under this mutation.
+    #[test]
+    fn clear_all_on_an_absent_cache_is_success() {
+        let base = tempfile::tempdir().unwrap();
+        // The cache dir has never been created — `put` is what creates it, and it was never called.
+        clear_all(&cache_dir(base.path())).unwrap();
+        // Idempotent: a second clear of the now-still-absent directory is also success.
+        clear_all(&cache_dir(base.path())).unwrap();
     }
 }

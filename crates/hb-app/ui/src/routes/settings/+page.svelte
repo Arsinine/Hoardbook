@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, validateBackup, wipeData, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, hasPublishedProfile, publishProfile, copyDiagnostics, revealLogFolder, natClassification, dmBlockedList, dmUnblock, dmBlock, validateShareCode, shareCodeInfo } from '$lib/api.js';
+	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, validateBackup, wipeData, clearManifestCache, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, hasPublishedProfile, publishProfile, copyDiagnostics, revealLogFolder, natClassification, dmBlockedList, dmUnblock, dmBlock, validateShareCode, shareCodeInfo } from '$lib/api.js';
 	import type { Settings, UpdateInfo, PortableUpdateInfo, BeaconReport, NatClassification } from '$lib/api.js';
 	import { keyView } from '$lib/key-view.js';
 	import { shortNpub } from '$lib/contact-display.js';
@@ -226,6 +226,22 @@
 	// log dir — the backend creates/handles that.
 	let copyingDiagnostics = $state(false);
 	let revealingLogs = $state(false);
+
+	// QURATOR-176 — the manifest-cache clear. One click, the whole cache goes (owner ruling
+	// 2026-09-03): NO confirm dialog, NO undo, NO two-step toggle — deliberateness comes from the
+	// label, which must say exactly what it does and no more. Copy must not overclaim either: the
+	// cache is re-fetchable, so this is disk-space cleanup, not data loss.
+	let clearingCache = $state(false);
+
+	async function handleClearManifestCache() {
+		if (clearingCache) return;
+		clearingCache = true;
+		try {
+			await clearManifestCache();
+			toast('Manifest cache cleared. Cached copies re-download the next time you browse.', 'success');
+		} catch (e) { toast(String(e), 'error'); }
+		finally { clearingCache = false; }
+	}
 
 	// QURATOR-68 — the NAT classification reading. 'undetermined' is the explicit "not yet
 	// determined" state (probe not yet complete / cold or offline start), NEVER a confident "no NAT"
@@ -1046,6 +1062,21 @@
 			</div>
 			<button class="btn-default btn-sm" onclick={handleRevealLogs} disabled={revealingLogs}>
 				{@html icons.folder} {revealingLogs ? 'Opening…' : 'Reveal logs'}
+			</button>
+		</div>
+		<!-- QURATOR-176: deliberately NOT in the Danger zone — this is re-fetchable disk-space
+		     cleanup, not data loss, and a danger framing would overclaim it. Also deliberately
+		     one click with no confirm (owner ruling 2026-09-03). -->
+		<div class="toggle-row">
+			<div class="toggle-text">
+				<div class="toggle-label">Clear manifest cache</div>
+				<div class="toggle-sub">
+					Removes every cached offline copy of browsed collections to free disk space. Nothing
+					else is touched, and each copy re-downloads the next time you browse it.
+				</div>
+			</div>
+			<button class="btn-default btn-sm" onclick={handleClearManifestCache} disabled={clearingCache}>
+				{clearingCache ? 'Clearing…' : 'Clear cache'}
 			</button>
 		</div>
 	</div>

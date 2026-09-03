@@ -82,6 +82,10 @@ export const validateBackup = (passphrase: string | null, path: string) =>
 
 export const wipeData = () => invoke<void>('wipe_data');
 
+/** QURATOR-176 — clear the manifest cache in full. Global and all-or-nothing: removes every
+ *  cached offline manifest, nothing else. Re-fetchable, so it is not data loss. */
+export const clearManifestCache = () => invoke<void>('clear_manifest_cache');
+
 // ── Profile ───────────────────────────────────────────────────────────────────
 
 export const saveProfile = (profile: Profile) => invoke<void>('save_profile', { profile });

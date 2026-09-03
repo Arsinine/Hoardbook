@@ -584,6 +584,7 @@ pub fn run() {
             commands::settings::relay_status,
             commands::settings::beacon_status,
             commands::settings::acknowledge_privacy_notice,
+            commands::settings::clear_manifest_cache,
             commands::online::online_count,
             commands::chat::send_message,
             commands::chat::request_manifest,

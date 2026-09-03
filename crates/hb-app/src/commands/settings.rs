@@ -146,6 +146,14 @@ pub async fn acknowledge_privacy_notice(store: State<'_, DataStore>) -> CmdResul
     store.save_settings(&settings).map_err(cmd_err)
 }
 
+/// Clear the manifest cache in full (QURATOR-176): one global, all-or-nothing removal of
+/// `<base>/manifests/`, no confirmation flow in the backend either. Scope is this cache ONLY —
+/// identity, profile, and every other store entry are untouched (`wipe_data` is the other one).
+#[tauri::command]
+pub async fn clear_manifest_cache(store: State<'_, DataStore>) -> CmdResult<()> {
+    crate::manifest_cache::clear_all(&store.manifest_cache_dir()).map_err(cmd_err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::big_relay_overlaps_public;
