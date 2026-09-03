@@ -1495,22 +1495,28 @@ pub(crate) mod tests {
         (dir, store)
     }
 
-    /// [`test_store`], but with an explicit, deliberately-unroutable relay set already saved
-    /// (QURATOR-179 slice 2). `relay_urls()` (see `net.rs`) falls back to the four REAL public
-    /// `DEFAULT_RELAYS` whenever a store's configured set is empty — which a plain `test_store()`
-    /// always is — so any test that reaches relay I/O through a plain store silently targets the
-    /// live internet. Use this helper instead for such a test: its non-empty sentinel set means
-    /// `relay_urls()` returns the sentinel, not the defaults, so a test that tries to dial out fails
-    /// loudly against a host that cannot resolve rather than succeeding slowly against a real relay.
-    /// `.invalid` is the RFC 2606 reserved TLD guaranteed to never resolve.
-    pub(crate) fn test_store_unroutable_relays() -> (TempDir, DataStore) {
-        let (dir, store) = test_store();
+    /// Persists a deliberately-unroutable relay set (QURATOR-179 slice 2) on an *existing* store.
+    /// `relay_urls()` (see `net.rs`) falls back to the four REAL public `DEFAULT_RELAYS` whenever a
+    /// store's configured set is empty, so any test that reaches relay I/O through a plain store
+    /// silently targets the live internet. Call this on a store instead: its non-empty sentinel set
+    /// means `relay_urls()` returns the sentinel, not the defaults, so a test that tries to dial out
+    /// fails loudly against a host that cannot resolve rather than succeeding slowly against a real
+    /// relay. `.invalid` is the RFC 2606 reserved TLD guaranteed to never resolve. Exposed for
+    /// callers (e.g. `commands/settings.rs`'s `guard_app()`) that must build the store directly
+    /// because they need its owning `TempDir` to outlive this function's return.
+    pub(crate) fn pin_unroutable_relays(store: &DataStore) {
         store
             .save_settings(&Settings {
                 relay_urls: vec!["wss://hoardbook-test-sentinel.invalid".to_string()],
                 ..Default::default()
             })
             .unwrap();
+    }
+
+    /// [`test_store`], but with [`pin_unroutable_relays`] already applied.
+    pub(crate) fn test_store_unroutable_relays() -> (TempDir, DataStore) {
+        let (dir, store) = test_store();
+        pin_unroutable_relays(&store);
         (dir, store)
     }
 

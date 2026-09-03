@@ -210,23 +210,18 @@ mod tests {
         use tauri::Manager;
 
         /// Mock app + managed `DataStore` (relay set = a deliberately unroutable sentinel, per
-        /// `store::tests::test_store_unroutable_relays`'s reasoning — `net::relay_urls` falls back
-        /// to the four real public `DEFAULT_RELAYS` for any store with an empty configured set) +
-        /// managed `SharedRelay` + managed `SharedIdentity` (no identity loaded). Built directly
-        /// rather than via `test_store_unroutable_relays` because that helper's `TempDir` would
+        /// `store::tests::pin_unroutable_relays`'s reasoning — `net::relay_urls` falls back to the
+        /// four real public `DEFAULT_RELAYS` for any store with an empty configured set) + managed
+        /// `SharedRelay` + managed `SharedIdentity` (no identity loaded). The store is built
+        /// directly, not via `test_store_unroutable_relays`, because that helper's `TempDir` would
         /// drop (deleting the directory) at the end of THIS function if bound here — the dir must
-        /// outlive the returned `app`, so it is leaked with `.keep()`, matching `watches.rs`'s and
-        /// `topics.rs`'s house `guard_app()`.
+        /// outlive the returned `app`, so it is leaked with `.keep()` and the sentinel relay set
+        /// pinned onto it separately.
         fn guard_app() -> tauri::App<tauri::test::MockRuntime> {
             let app = tauri::test::mock_app();
             let dir = tempfile::tempdir().unwrap().keep();
             let store = DataStore::new(dir);
-            store
-                .save_settings(&Settings {
-                    relay_urls: vec!["wss://hoardbook-test-sentinel.invalid".into()],
-                    ..Default::default()
-                })
-                .unwrap();
+            crate::store::tests::pin_unroutable_relays(&store);
             app.manage(store);
             app.manage(net::new_shared());
             let identity: SharedIdentity = std::sync::Arc::new(tokio::sync::RwLock::new(None));
