@@ -18,16 +18,23 @@
 //!   closed here exactly like a tampered file import.
 //! - `manifest_source::StoreManifestSource::payload`'s re-serve branch — the CARRIER-4 reader. Does
 //!   `get_latest` (QURATOR-177 slice 1: resolves "newest cached for (author, slug)", no fingerprint
-//!   pin) -> `from_json` -> `ManifestPayload::seal` and **verifies nothing**; `seal` is serialize +
-//!   byte-bound and deliberately leaves author verification to its caller.
+//!   pin) -> `from_json` -> `verify_author(ticket.author_npub)` -> `ManifestPayload::seal`.
+//!   ⚑ **That `verify_author` was ADDED 2026-09-03** (QURATOR-164, owner ruling "C verifies before
+//!   re-serving", closing QURATOR-172 #3); this bullet used to end "**verifies nothing**". `seal`
+//!   itself is still only serialize + byte-bound and still leaves author verification to its
+//!   caller — the caller now does it.
+//!   ⚠ **It changed WHERE the refusal happens, not WHETHER the system is safe.** Read on.
 //!
-//! The re-serve branch is nonetheless safe, and the reason is worth stating because it is NOT
-//! "the reader checks": **the RECEIVER checks, before it commits.** The fetching node runs its
-//! accept gate (`verify_author` pinned to the ticket's named author, plus slug bind and
+//! The re-serve branch was ALREADY safe before that check existed, and the reason is worth stating
+//! because it is NOT "the reader checks": **the RECEIVER checks, before it commits.** The fetching
+//! node runs its accept gate (`verify_author` pinned to the ticket's named author, plus slug bind and
 //! completeness) INSIDE `fetch_manifest_with_progress`, before the ACK — and the ticket is spent
 //! only on the ACK. So a tampered cache re-served by C reaches D and is refused **without burning
 //! D's ticket**; the cost is a wasted round-trip and a confusing serve-side error, not a
-//! disclosure or a lost capability.
+//! disclosure or a lost capability. **That receiver-side gate remains the actual security
+//! boundary** — C's new check is defence in depth and better attribution (the error now names the
+//! serving node's own bad cache entry instead of surfacing as a confusing failure at D), and it
+//! must not be treated as a reason to relax anything on the receive path.
 //!
 //! ⚠ That safety is a property of the RECEIVE path, not of this cache. **A third reader that
 //! consumes these bytes locally — rendering, importing, or trusting them without its own

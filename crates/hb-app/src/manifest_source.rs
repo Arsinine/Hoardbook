@@ -112,6 +112,19 @@ impl ManifestSource for StoreManifestSource {
             })?;
             let envelope = hb_core::manifest::ManifestEnvelope::from_json(&json)
                 .map_err(|e| anyhow!("the cached manifest is not readable: {e}"))?;
+            // Defence in depth (QURATOR-164 / QURATOR-172 #3): the RECEIVER already verifies
+            // before it commits (see manifest_cache.rs), so this does not close a hole — it moves
+            // the refusal earlier and makes it attributable at the serving node.
+            let expected_author = hb_core::identity::parse_npub(author_npub)
+                .map_err(|e| anyhow!("the ticket's author npub is invalid: {e}"))?;
+            envelope.verify_author(&expected_author).map_err(|_| {
+                anyhow!(
+                    "the cached copy of '{slug}' by {author} failed verification — \
+                     ask the owner to re-send it",
+                    slug = ticket.slug,
+                    author = crate::logging::trunc_npub(author_npub),
+                )
+            })?;
             return ManifestPayload::seal(&envelope).map_err(|e| anyhow!("{e}"));
         }
 
@@ -622,6 +635,150 @@ mod tests {
         assert!(
             err.contains("could not be verified as this peer's"),
             "B's envelope under an A-scoped ask must be refused at the mint-time author fence, got: {err}"
+        );
+    }
+
+    /// QURATOR-164 / QURATOR-172 #3 ("C verifies before re-serving") — happy path. A cached
+    /// envelope genuinely authored by the ticket's `author_npub` must still serve; the new author
+    /// check must not regress the existing re-serve behaviour.
+    ///
+    /// MUTATION (reds this test): in `StoreManifestSource::payload`, change
+    /// `envelope.verify_author(&expected_author)` to always fail, e.g.
+    /// `Err::<(), _>(hb_core::HbError::WrongSigner)` unconditionally — a genuinely-authored
+    /// envelope is then refused too, `unwrap()` panics.
+    #[test]
+    fn a_re_serve_with_a_matching_author_still_serves() {
+        let (_dir, store) = store();
+        let source = StoreManifestSource::new(
+            store.clone(),
+            Identity::generate(),
+            SessionBrowseKey::new([7u8; 32]),
+        );
+        let author = Identity::generate();
+        let author_npub = npub_of(&author);
+        let env = hb_core::build_manifest_envelope(
+            &author,
+            "roms",
+            &[9u8; 32],
+            "fp-good",
+            1_700_000_000,
+            &[r#"{"slug":"roms","entries":[]}"#.to_string()],
+        )
+        .unwrap();
+        crate::manifest_cache::put(
+            &store.manifest_cache_dir(),
+            &author_npub,
+            "roms",
+            "fp-good",
+            &env.to_json().unwrap(),
+            1_700_000_000,
+            crate::manifest_cache::DEFAULT_MANIFEST_CACHE_BYTES,
+        )
+        .unwrap();
+        let payload = source.payload(&a_re_serve_ticket(Some(author_npub))).unwrap();
+        let served = String::from_utf8(payload.as_bytes().to_vec()).unwrap();
+        assert!(
+            served.contains("fp-good"),
+            "a genuinely-authored cached envelope must still be re-served, got: {served}"
+        );
+    }
+
+    /// QURATOR-164 / QURATOR-172 #3 — the load-bearing pin. A cached envelope whose declared
+    /// author does NOT match the ticket's `author_npub` must be refused, and refused before any
+    /// payload is produced (no `Ok` result at all).
+    ///
+    /// MUTATION (reds this test): in `StoreManifestSource::payload`, delete the
+    /// `envelope.verify_author(&expected_author).map_err(...)?` call (and its `expected_author`
+    /// binding) — the mismatched envelope then reaches `ManifestPayload::seal` unchecked, the call
+    /// returns `Ok`, and `unwrap_err()` panics.
+    #[test]
+    fn a_re_serve_with_a_mismatched_author_is_refused() {
+        let (_dir, store) = store();
+        let source = StoreManifestSource::new(
+            store.clone(),
+            Identity::generate(),
+            SessionBrowseKey::new([7u8; 32]),
+        );
+        // The cache is keyed by A's npub, but the envelope stored under it is B's — the
+        // key/author mismatch this fence exists to catch.
+        let a = Identity::generate();
+        let a_npub = npub_of(&a);
+        let b = Identity::generate();
+        let env = hb_core::build_manifest_envelope(
+            &b,
+            "roms",
+            &[9u8; 32],
+            "fp-mismatch",
+            1_700_000_000,
+            &[r#"{"slug":"roms","entries":[]}"#.to_string()],
+        )
+        .unwrap();
+        crate::manifest_cache::put(
+            &store.manifest_cache_dir(),
+            &a_npub,
+            "roms",
+            "fp-mismatch",
+            &env.to_json().unwrap(),
+            1_700_000_000,
+            crate::manifest_cache::DEFAULT_MANIFEST_CACHE_BYTES,
+        )
+        .unwrap();
+        let err = source
+            .payload(&a_re_serve_ticket(Some(a_npub)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("failed verification"),
+            "a re-serve whose cached author does not match the ticket must be refused, got: {err}"
+        );
+    }
+
+    /// QURATOR-164 / QURATOR-172 #3 — a cached envelope with the right declared author but a
+    /// broken signature (tampered content) must also be refused, not just a bare npub mismatch.
+    ///
+    /// MUTATION (reds this test): in `StoreManifestSource::payload`, change
+    /// `envelope.verify_author(&expected_author)` to `envelope.verify_author(&expected_author).or(Ok(()))`
+    /// — a broken signature is then swallowed, the call returns `Ok`, and `unwrap_err()` panics.
+    #[test]
+    fn a_re_serve_with_a_broken_signature_is_refused() {
+        let (_dir, store) = store();
+        let source = StoreManifestSource::new(
+            store.clone(),
+            Identity::generate(),
+            SessionBrowseKey::new([7u8; 32]),
+        );
+        let author = Identity::generate();
+        let author_npub = npub_of(&author);
+        let mut env = hb_core::build_manifest_envelope(
+            &author,
+            "roms",
+            &[9u8; 32],
+            "fp-tampered",
+            1_700_000_000,
+            &[r#"{"slug":"roms","entries":[]}"#.to_string()],
+        )
+        .unwrap();
+        // Tamper with the signed slug after signing — the declared author still matches, but the
+        // signature no longer covers the content, so `verify_author`'s integrity/signature check
+        // must fail.
+        env.slug = "not-roms".into();
+        crate::manifest_cache::put(
+            &store.manifest_cache_dir(),
+            &author_npub,
+            "roms",
+            "fp-tampered",
+            &env.to_json().unwrap(),
+            1_700_000_000,
+            crate::manifest_cache::DEFAULT_MANIFEST_CACHE_BYTES,
+        )
+        .unwrap();
+        let err = source
+            .payload(&a_re_serve_ticket(Some(author_npub)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("failed verification"),
+            "a cached envelope with a broken signature must be refused, got: {err}"
         );
     }
 }
