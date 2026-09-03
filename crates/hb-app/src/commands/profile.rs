@@ -473,4 +473,134 @@ mod tests {
             "an un-bumped generation must save the marker"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Command-dispatch tests (QURATOR-179) — through the real #[tauri::command]
+    // shim (arg deserialization + state injection), not by calling bodies directly.
+    // publish_profile / unpublish_profile reach relay I/O past their first guard, so every test
+    // here is chosen to fail (or short-circuit past relay entirely) BEFORE `net::client` is ever
+    // built — the settings relay is a dead loopback port precisely so a guard that were removed by
+    // mistake would fail loudly at connect, never silently succeed.
+    // -----------------------------------------------------------------------
+    mod command_guards {
+        use super::*;
+        use crate::identity_state::AppIdentity;
+        use tauri::Manager;
+
+        fn guard_app(identity_loaded: bool) -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            store
+                .save_settings(&crate::store::Settings {
+                    relay_urls: vec!["ws://127.0.0.1:9".into()],
+                    ..Default::default()
+                })
+                .unwrap();
+            let identity: SharedIdentity = std::sync::Arc::new(tokio::sync::RwLock::new(
+                identity_loaded.then(AppIdentity::generate),
+            ));
+            app.manage(identity);
+            app.manage(store);
+            app.manage(net::new_shared());
+            app
+        }
+
+        #[tokio::test]
+        async fn has_published_profile_command_reaches_the_managed_store() {
+            let app = guard_app(true);
+            assert!(!has_published_profile(app.state::<DataStore>()).await.unwrap());
+            app.state::<DataStore>().save_published(PROFILE_KEY, "{}").unwrap();
+            assert!(has_published_profile(app.state::<DataStore>()).await.unwrap());
+            // mutation: change has_published_profile's body from
+            // `Ok(store.is_published(PROFILE_KEY))` to `Ok(false)` — the second assert would red
+            // despite the managed store (reached via State<DataStore>) holding a published marker.
+        }
+
+        #[tokio::test]
+        async fn save_profile_command_persists_struct_fields_intact_for_get_profile_to_read_back() {
+            let app = guard_app(true);
+            let mut profile = make_profile("Tester", vec!["video".into()]);
+            profile.contact_hint = Some("hint-value".into());
+            profile.email = Some("email-value".into());
+            save_profile(profile.clone(), app.state::<DataStore>()).await.unwrap();
+
+            let got = get_profile(app.state::<DataStore>()).await.unwrap().unwrap();
+            assert_eq!(
+                got.contact_hint.as_deref(),
+                Some("hint-value"),
+                "contact_hint must not transpose with email"
+            );
+            assert_eq!(
+                got.email.as_deref(),
+                Some("email-value"),
+                "email must not transpose with contact_hint"
+            );
+            assert_eq!(got.display_name, "Tester");
+            // mutation: in save_profile's body, before `store.save_profile_draft(&profile)`, insert
+            // `std::mem::swap(&mut profile.contact_hint, &mut profile.email);` (requires making the
+            // `profile` parameter `mut`) — the two assert_eq! calls above would then red because
+            // the struct arg-deserialized by the shim would reach the managed store transposed.
+        }
+
+        #[tokio::test]
+        async fn publish_profile_command_refuses_without_identity_before_any_relay_io() {
+            let app = guard_app(false);
+            let err = publish_profile(
+                app.state::<DataStore>(),
+                app.state::<SharedIdentity>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err, "No identity loaded. Generate a keypair first.");
+            // mutation: reword publish_profile's
+            // `.ok_or("No identity loaded. Generate a keypair first.")?` string — this assert_eq
+            // pins the exact text the frontend receives through the shim's error conversion.
+        }
+
+        #[tokio::test]
+        async fn publish_profile_command_refuses_without_a_saved_draft_before_any_relay_io() {
+            let app = guard_app(true);
+            let err = publish_profile(
+                app.state::<DataStore>(),
+                app.state::<SharedIdentity>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err, "No profile draft found. Save a profile first.");
+            // mutation: reword publish_profile's
+            // `.ok_or("No profile draft found. Save a profile first.")?` string — identity is
+            // loaded here, so this pins the SECOND guard (still before `compute_content_types` /
+            // `net::client`), distinct from the identity-missing test above.
+        }
+
+        #[tokio::test]
+        async fn unpublish_profile_command_clears_the_published_marker_via_the_managed_store() {
+            // identity_loaded(false): the seeded marker "{}" also fails Event::from_json on its
+            // own, so the relay branch is unreachable from two independent directions — belt and
+            // braces against ever dialing the dead loopback relay in this guard_app.
+            let app = guard_app(false);
+            app.state::<DataStore>().save_published(PROFILE_KEY, "{}").unwrap();
+            assert!(app.state::<DataStore>().is_published(PROFILE_KEY));
+
+            unpublish_profile(
+                app.state::<DataStore>(),
+                app.state::<SharedIdentity>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                !app.state::<DataStore>().is_published(PROFILE_KEY),
+                "the managed store's marker must be cleared"
+            );
+            // mutation: change unpublish_profile's final line from
+            // `store.delete_published(PROFILE_KEY).map_err(cmd_err)` to `Ok(())` — the marker
+            // seeded directly on the SAME managed store the command was given would still read as
+            // published after the call.
+        }
+    }
 }
