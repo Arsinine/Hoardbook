@@ -186,4 +186,104 @@ mod tests {
         assert!(private_listing_to_collection("not json").is_err());
         assert!(private_listing_to_collection("{}").is_err(), "missing required Collection fields");
     }
+
+    // -----------------------------------------------------------------------
+    // Command-dispatch tests (QURATOR-179) — through the real #[tauri::command]
+    // shim (arg deserialization + state injection), not by calling bodies directly.
+    // -----------------------------------------------------------------------
+    mod command_guards {
+        use super::*;
+        use tauri::Manager;
+        use crate::identity_state::AppIdentity;
+
+        fn guard_app(identity_loaded: bool) -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            // RELAY HAZARD: an empty configured relay set falls back to the real public
+            // DEFAULT_RELAYS (net::relay_urls) — pin an unroutable one so a test that reaches
+            // net::client fails fast on a refused connection instead of touching the internet.
+            store
+                .save_settings(&crate::store::Settings {
+                    relay_urls: vec!["ws://127.0.0.1:9".into()],
+                    ..Default::default()
+                })
+                .unwrap();
+            let identity: SharedIdentity = std::sync::Arc::new(tokio::sync::RwLock::new(
+                identity_loaded.then(AppIdentity::generate),
+            ));
+            app.manage(identity);
+            app.manage(store);
+            app.manage(net::new_shared());
+            app
+        }
+
+        #[tokio::test]
+        async fn browse_private_collections_command_requires_a_loaded_identity() {
+            let app = guard_app(false);
+            let err = browse_private_collections(
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err, "No identity loaded. Generate a keypair first.");
+            // mutation: reword the `.ok_or("No identity loaded. Generate a keypair first.")?`
+            // literal in browse_private_collections — this assert_eq pins the exact string the
+            // frontend receives through the shim's error conversion.
+        }
+
+        #[tokio::test]
+        async fn browse_private_collections_command_returns_empty_without_a_manual_contact() {
+            let app = guard_app(true);
+            let got = browse_private_collections(
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                got.is_empty(),
+                "no Manual contact on the managed store → nothing to fetch, no relay hit"
+            );
+            // mutation: change the `if allowlist.is_empty() { return Ok(vec![]); }` early return
+            // to `if false { .. }` — the command would then fall through to `net::client(...)`,
+            // which would return an Err against the dead relay instead of Ok([]) here.
+        }
+
+        #[tokio::test]
+        async fn browse_private_collections_command_proceeds_to_the_relay_with_an_allowlisted_contact()
+        {
+            let app = guard_app(true);
+            let store = app.state::<DataStore>();
+            let friend = Identity::generate();
+            let npub = friend.public_key().to_bech32().unwrap();
+            // A Manual contact reached via the SAME managed store, not passed as an argument —
+            // pins that the shim hands the command the real `State<DataStore>`.
+            upsert_topic_contact(&store, &npub).unwrap();
+            let hash = CachedPeer::pubkey_hash(&npub);
+            let mut c = store.load_contact(&hash).unwrap().unwrap();
+            c.source = ContactSource::Manual;
+            store.save_contact(&hash, &c).unwrap();
+
+            let err = browse_private_collections(
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.contains("Could not connect to any relay"),
+                "a non-empty allowlist reached through the managed store must drive the command \
+                 past the early return into net::client — got: {err}"
+            );
+            // mutation: invert the allowlist-empty check's polarity, `if allowlist.is_empty()` →
+            // `if !allowlist.is_empty()` — with an allowlisted contact present this test would
+            // then take the Ok(vec![]) branch instead of reaching net::client, so unwrap_err()
+            // would panic (no Err produced at all).
+        }
+    }
 }

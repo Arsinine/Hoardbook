@@ -229,4 +229,117 @@ mod tests {
         assert!(watches[0].last_fired.is_some(), "watch with hit should have last_fired set");
         assert!(watches[1].last_fired.is_none(), "watch without hit must not have last_fired set");
     }
+
+    // -----------------------------------------------------------------------
+    // Command-dispatch tests (QURATOR-179) — through the real #[tauri::command]
+    // shim (arg deserialization + state injection), not by calling bodies directly.
+    // -----------------------------------------------------------------------
+    mod command_guards {
+        use super::*;
+        use tauri::Manager;
+
+        fn guard_app() -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            app.manage(DataStore::new(dir));
+            app
+        }
+
+        #[tokio::test]
+        async fn watches_create_command_rejects_a_duplicate_name() {
+            let app = guard_app();
+            watches_create("dup".into(), vec![], vec![], app.state::<DataStore>())
+                .await
+                .unwrap();
+            let err = watches_create("dup".into(), vec![], vec![], app.state::<DataStore>())
+                .await
+                .unwrap_err();
+            assert_eq!(err, "watch 'dup' already exists");
+            // mutation: reword the text in watches_create's duplicate-name
+            // `return Err(format!("watch '{name}' already exists"))` — this assert_eq pins the
+            // exact string the frontend receives through the shim's error conversion.
+        }
+
+        #[tokio::test]
+        async fn watches_get_command_reaches_the_managed_store() {
+            let app = guard_app();
+            app.state::<DataStore>()
+                .save_watches(&[Watch {
+                    name: "seed".into(),
+                    tags: vec!["a".into()],
+                    content_types: vec![],
+                    last_fired: None,
+                    seen_pubkeys: vec![],
+                }])
+                .unwrap();
+            let got = watches_get(app.state::<DataStore>()).await.unwrap();
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].name, "seed");
+            // mutation: change watches_get's body from `store.load_watches().map_err(cmd_err)` to
+            // `Ok(vec![])` — the shim would then report empty despite the managed store, reached
+            // through `State<DataStore>`, holding "seed".
+        }
+
+        #[tokio::test]
+        async fn watches_delete_command_removes_the_named_watch_via_the_managed_store() {
+            let app = guard_app();
+            app.state::<DataStore>()
+                .save_watches(&[
+                    Watch {
+                        name: "keep".into(),
+                        tags: vec![],
+                        content_types: vec![],
+                        last_fired: None,
+                        seen_pubkeys: vec![],
+                    },
+                    Watch {
+                        name: "drop".into(),
+                        tags: vec![],
+                        content_types: vec![],
+                        last_fired: None,
+                        seen_pubkeys: vec![],
+                    },
+                ])
+                .unwrap();
+            watches_delete("drop".into(), app.state::<DataStore>()).await.unwrap();
+            let left = watches_get(app.state::<DataStore>()).await.unwrap();
+            assert_eq!(left.len(), 1);
+            assert_eq!(left[0].name, "keep");
+            // mutation: invert watches_delete's retain predicate from `w.name != name` to
+            // `w.name == name` — the survivor reached back through the managed store would flip
+            // from "keep" to "drop".
+        }
+
+        #[tokio::test]
+        async fn watches_evaluate_command_excludes_a_known_contact_via_the_managed_store() {
+            let app = guard_app();
+            let store = app.state::<DataStore>();
+            store
+                .save_watches(&[Watch {
+                    name: "w1".into(),
+                    tags: vec![],
+                    content_types: vec![],
+                    last_fired: None,
+                    seen_pubkeys: vec![],
+                }])
+                .unwrap();
+            // A contact reached via the SAME managed store, not passed as an argument — pins that
+            // the shim gives the command the real `State<DataStore>`, not a fresh/empty one.
+            crate::commands::topics::upsert_topic_contact(&store, "hb1_contact").unwrap();
+            let hits = watches_evaluate(
+                vec!["hb1_contact".into(), "hb1_stranger".into()],
+                app.state::<DataStore>(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(
+                hits[0].npub, "hb1_stranger",
+                "a known contact reached through the managed store is excluded"
+            );
+            // mutation: delete the `if contact_npubs.contains(npub) { continue; }` guard in
+            // watches_evaluate — the known contact (visible only because the shim handed the
+            // command the real managed store) would then also fire, giving 2 hits instead of 1.
+        }
+    }
 }

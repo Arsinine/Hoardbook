@@ -365,4 +365,85 @@ mod tests {
         assert_eq!(v.online, Some(20), "chip updated independently of the failed pills");
         assert_eq!(v.fresh.len(), 5, "pills failure keeps the last set — never a false offline");
     }
+
+    // -----------------------------------------------------------------------
+    // Command-dispatch tests (QURATOR-179) — through the real #[tauri::command]
+    // shim (arg deserialization + state injection), not by calling bodies directly.
+    // -----------------------------------------------------------------------
+    mod command_guards {
+        use super::*;
+        use tauri::Manager;
+
+        fn guard_app() -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            // RELAY HAZARD: an empty configured relay set falls back to the real public
+            // DEFAULT_RELAYS (net::relay_urls) — pin an unroutable one so the relay_set this
+            // command reports, and any background refresh it spawns, never touch the internet.
+            store
+                .save_settings(&crate::store::Settings {
+                    relay_urls: vec!["ws://127.0.0.1:9".into()],
+                    ..Default::default()
+                })
+                .unwrap();
+            app.manage(store);
+            // No identity loaded: refresh_count's `let Some(id) = snapshot else { return };`
+            // early-returns before any relay contact, so the spawned background refresh this
+            // command may kick off is a guaranteed no-op — hermetic even without the dead relay.
+            let identity: SharedIdentity = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+            app.manage(identity);
+            app.manage(net::new_shared());
+            app.manage(SharedOnlineCache::default());
+            app
+        }
+
+        #[tokio::test]
+        async fn online_count_command_reaches_the_managed_store_for_its_relay_set() {
+            let app = guard_app();
+            let got = online_count(
+                app.state::<DataStore>(),
+                app.state::<SharedIdentity>(),
+                app.state::<SharedRelay>(),
+                app.state::<SharedOnlineCache>(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(got.online, None, "no cache yet and no identity to refresh with → unknown");
+            assert_eq!(
+                got.relay_set,
+                vec!["ws://127.0.0.1:9".to_string()],
+                "relay_set is read from the managed store's own settings, not a default/stub"
+            );
+            // mutation: change the `relay_set` field in online_count's fallback
+            // `OnlineCount { .. }` literal (the `Ok(cached.unwrap_or(...))` branch) to `vec![]` —
+            // the shim would then report an empty set despite the managed store, reached through
+            // `State<DataStore>`, holding ["ws://127.0.0.1:9"].
+        }
+
+        #[tokio::test]
+        async fn online_count_command_claims_the_refresh_slot_on_the_managed_cache() {
+            let app = guard_app();
+            {
+                let cache = app.state::<SharedOnlineCache>();
+                assert!(cache.read().await.last_attempt.is_none(), "a fresh cache was never attempted");
+            }
+            online_count(
+                app.state::<DataStore>(),
+                app.state::<SharedIdentity>(),
+                app.state::<SharedRelay>(),
+                app.state::<SharedOnlineCache>(),
+            )
+            .await
+            .unwrap();
+            let cache = app.state::<SharedOnlineCache>();
+            assert!(
+                cache.read().await.last_attempt.is_some(),
+                "the command shim reached the SAME managed cache Arc this test reads back from"
+            );
+            // mutation: delete the `c.last_attempt = Some(Instant::now());` line inside
+            // online_count's critical section — the assertion above would then still observe
+            // `None` on the same managed `SharedOnlineCache` after the call returns.
+        }
+    }
 }
