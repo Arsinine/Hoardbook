@@ -59,9 +59,12 @@ use crate::transport_state::{ensure_endpoint, new_shared_endpoint, Role};
 /// `run()` shape: dispatch on the first positional, return an ExitCode.
 pub(crate) async fn run() -> ExitCode {
     // The lock resolves rustls with both providers enabled (iroh `tls-ring` + reqwest aws-lc-rs),
-    // so there is no automatic process default; production installs one as a side effect of binding
-    // the iroh endpoint at startup. This harness never binds iroh, so without this line every
-    // `wss://` relay connect panics. Err = a provider is already installed, which is fine.
+    // so there is no automatic process default; production installs one EXPLICITLY in `lib.rs`,
+    // before `spawn_background_tasks`. (It does NOT arrive as a side effect of binding the iroh
+    // endpoint — the 2026-08-04 v0.12.11 log falsified that claim; it was a race the app lost 12
+    // times in 32 s at launch. See the `rustls` entry in Cargo.toml.) This harness never runs that
+    // startup path, so without this line every `wss://` relay connect panics. Err = a provider is
+    // already installed, which is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args::command(&args) {

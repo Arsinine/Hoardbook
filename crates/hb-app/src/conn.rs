@@ -66,13 +66,11 @@ mod tests {
             // request id always matches the ticket's. `authorize_redemption`'s two arms (shape,
             // request binding) therefore refuse nothing an honest client can send; that gate now
             // defends only against a hand-built hostile request. Two earlier rigs are gone with
-            // the issued-ticket ledger: the serve-path standing check (blocking gates chat/DM
-            // interaction only) and the spent-ticket replay (a repeat fetch is legitimate now). (Two earlier rigs are gone with the
-            // issued-ticket ledger, QURATOR-177 Option E, owner ruling 2026-09-03: the serve-path
-            // standing check — blocking gates chat/DM interaction only — and the spent-ticket
-            // replay, since a repeat fetch is a legitimate fetch under Option E. A wrong-request
-            // ticket is refused for a reason that still exists: the ticket does not answer THIS
-            // request.)
+            // the issued-ticket ledger (QURATOR-177 Option E, owner ruling 2026-09-03): the
+            // serve-path standing check — blocking gates chat/DM interaction only — and the
+            // spent-ticket replay, since a repeat fetch is a legitimate fetch under Option E. A
+            // wrong-request ticket is refused for a reason that still exists: the ticket does not
+            // answer THIS request.
             let mut mismatched = ticket.clone();
             mismatched.request_id = "req-a-different-request".into();
             mismatched.ask_nonce = Some("nonce-other".into());
