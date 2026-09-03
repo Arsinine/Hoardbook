@@ -126,7 +126,7 @@ fn usage() -> &'static str {
             [--suite wan-r]\n\
             [--suite wan-m4]\n\
             Runs WAN-P rows P1–P5 against a live serve by default. --flood-relay arms P3\n\
-            (VPS strfry only: ws://198.51.100.1:7777, ws://198.51.100.2:7777).\n\
+            (VPS strfry only: pass them with --relay, or set HB_CANARY_RELAYS in .env).\n\
             --suite wan-m runs the WAN-M rows (M1 + M9) instead, redeeming the ticket the serve\n\
             DM'd (§W6's --ticket-json remains for targeted iroh isolation runs;\n\
             the E2E suite rides the full DM leg).\n\
@@ -1339,27 +1339,38 @@ async fn canary_pass() -> bool {
     // P2 — beacon acceptance. Reuse the WAN-P P2 body (publish a beacon, record per-relay
     // accept/reject). Needs a relay set; the canary uses the VPS strfry backbone.
     let beacon_relays = canary_beacon_relays();
-    match tokio::time::timeout(
-        Duration::from_secs(45),
-        suite_wan_p::canary_beacon_acceptance(&beacon_relays),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => failures.push(("P2", e)),
-        Err(_) => failures.push(("P2", "timed out at 45s".to_string())),
+    // An empty backbone is a CONFIGURATION failure, not a pass. Probing an empty relay set would
+    // let the canary print "ok" while watching nothing at all.
+    const NO_BACKBONE: &str = "HB_CANARY_RELAYS is unset or empty - no backbone to probe (set it in .env)";
+    if beacon_relays.is_empty() {
+        failures.push(("P2", NO_BACKBONE.to_string()));
+    } else {
+        match tokio::time::timeout(
+            Duration::from_secs(45),
+            suite_wan_p::canary_beacon_acceptance(&beacon_relays),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => failures.push(("P2", e)),
+            Err(_) => failures.push(("P2", "timed out at 45s".to_string())),
+        }
     }
 
     // C1 — DM round-trip. Reuse the WAN-C C1 body (send + fetch+unwrap). Needs the relay set.
-    match tokio::time::timeout(
-        Duration::from_secs(60),
-        suite_wan_c::canary_dm_round_trip(&beacon_relays),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => failures.push(("C1", e)),
-        Err(_) => failures.push(("C1", "timed out at 60s".to_string())),
+    if beacon_relays.is_empty() {
+        failures.push(("C1", NO_BACKBONE.to_string()));
+    } else {
+        match tokio::time::timeout(
+            Duration::from_secs(60),
+            suite_wan_c::canary_dm_round_trip(&beacon_relays),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => failures.push(("C1", e)),
+            Err(_) => failures.push(("C1", "timed out at 60s".to_string())),
+        }
     }
 
     // The [ALERT] lines (stderr) — one per failure.
@@ -1380,9 +1391,21 @@ async fn canary_pass() -> bool {
 }
 
 /// The VPS strfry backbone the canary uses for P2 + C1 (the M5 launch relays, the fallback for the
-/// M20 W1 discriminator). Hardcoded: the canary is a daemon, not a probe that takes --relay.
+/// M20 W1 discriminator). The canary is a daemon, not a probe that takes `--relay`, so there is no
+/// CLI path here — the addresses come from **`HB_CANARY_RELAYS`** (comma-separated `ws://host:port`),
+/// which lives in the **gitignored `.env`**: they are infrastructure and must not sit in a public repo.
+///
+/// Returns empty when the variable is unset or blank. The caller MUST fail the affected rows rather
+/// than probe an empty set — a canary that probes nothing would print "ok" and be indistinguishable
+/// from a healthy backbone, which is the exact confident-negative failure this repo keeps shipping.
 fn canary_beacon_relays() -> Vec<String> {
-    vec!["ws://198.51.100.1:7777".to_string(), "ws://198.51.100.2:7777".to_string()]
+    std::env::var("HB_CANARY_RELAYS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

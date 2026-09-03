@@ -243,7 +243,7 @@ async fn p3_cap_displacement(
     if !violations.is_empty() {
         return Err(format!(
             "P3 REFUSED (relay citizenship): these --relay URLs are not in the --flood-relay allowlist: {}. \
-             Flood-shaped rows run only against explicitly-passed VPS strfry (ws://198.51.100.1:7777, ws://198.51.100.2:7777).",
+             Flood-shaped rows run only against explicitly-passed VPS strfry relays.",
             violations.join(", ")
         ));
     }

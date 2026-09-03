@@ -1603,12 +1603,17 @@ mod tests {
         let targets = vec![
             "ws://localhost:7777".to_string(),      // own, local — kept because it is ours
             "wss://peer.example".to_string(),       // peer, public wss — kept
-            "ws://198.51.100.1:7777".to_string(), // peer, public plain-ws VPS relay — kept (address class, not scheme)
+            // A genuinely PUBLIC-class IP is required here and an RFC 5737 documentation address
+            // will NOT do: `net.rs:122`'s SSRF guard rejects `is_documentation()`, so 192.0.2.x /
+            // 198.51.100.x / 203.0.113.x are all filtered and this assertion would fail. 8.8.8.8 is
+            // a stand-in that is public by class and is never dialled — this test is pure
+            // classification, no I/O.
+            "ws://8.8.8.8:7777".to_string(), // peer, public plain-ws relay — kept (address class, not scheme)
         ];
         let kept = dm_delivery_targets(&own, targets);
         assert_eq!(kept.len(), 3, "own + public peer relays all survive, got {kept:?}");
         assert!(kept.contains(&"ws://localhost:7777".to_string()), "own local relay is never filtered");
-        assert!(kept.contains(&"ws://198.51.100.1:7777".to_string()), "plain-ws public relay kept");
+        assert!(kept.contains(&"ws://8.8.8.8:7777".to_string()), "plain-ws public relay kept");
     }
 
     #[test]

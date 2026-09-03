@@ -55,3 +55,6 @@ docs/RULE-PROVENANCE.md
 # design/spec/runbook prose must not reach public observers. README.md is the sole exception.
 *.md
 !README.md
+
+# Local infrastructure config (VPS addresses) — never committed.
+.env
