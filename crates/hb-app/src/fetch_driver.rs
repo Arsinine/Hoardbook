@@ -95,9 +95,9 @@ pub(crate) fn candidates_for(contacts: &[String], author: &str, me: &str) -> Vec
 }
 
 /// Per-collection ask state, in memory for the process lifetime.
-struct AskState {
-    peers: Vec<Candidate>,
-    author: Candidate,
+pub(crate) struct AskState {
+    pub peers: Vec<Candidate>,
+    pub author: Candidate,
 }
 
 /// Record an attempt against `npub` in `state`, so the wave's backoff and 3-try cap advance.
@@ -113,7 +113,22 @@ fn note_attempt(state: &mut AskState, npub: &str, now: Instant) {
     }
 }
 
+/// What one poll actually did — the harness's only observable, and the reason [`poll_once`] is a
+/// separate function rather than a block inside the loop.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PollOutcome {
+    /// Holdings this poll found superseded.
+    pub stale: Vec<StaleHolding>,
+    /// The npubs actually asked, in wave order — carriers first, then the author.
+    pub asked: Vec<String>,
+}
+
 /// The driver loop. Spawned once at startup; runs for the process lifetime.
+///
+/// Deliberately thin: it owns the cadence and the attempt state and delegates every decision to
+/// [`poll_once`]. The split is what makes the behaviour reachable by the WAN harness — a loop that
+/// sleeps five minutes between observations cannot be driven, and a harness carrying its own copy
+/// of the poll would be the drift this project has already paid for three times.
 pub(crate) async fn run_fetch_driver_loop(store: DataStore, live_npub: SharedIdentity, relay: SharedRelay) {
     // Keyed (author_npub, slug). In memory, like the auto-approve loop's caps: a restart re-reads
     // fingerprints and starts its attempt counting over, which is correct — a fresh process has no
@@ -122,102 +137,130 @@ pub(crate) async fn run_fetch_driver_loop(store: DataStore, live_npub: SharedIde
 
     tracing::info!(
         poll_secs = POLL_INTERVAL.as_secs(),
-        "fetch driver: loop started (refetch on fingerprint change; carriers before author)"
+        "fetch driver: loop started (refetch on fingerprint change; author asked alongside carriers)"
     );
 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
+        poll_once(&store, &live_npub, &relay, &mut states).await;
+    }
+}
 
-        // Per-poll identity read, for the same reason the auto-approve loop does it: a fresh
-        // install has no identity when this loop starts, and a one-shot snapshot would leave the
-        // driver dead for the whole session.
-        let (identity, own_npub) = {
-            let guard = live_npub.read().await;
-            let Some(id) = guard.as_ref() else { continue };
-            (id.identity.clone(), id.npub())
-        };
+/// One poll of the driver: read what is held, resolve each author's published listing, and ask for
+/// anything whose fingerprint has moved.
+///
+/// Takes `states` by reference so attempt counts survive across polls — that is what makes the
+/// backoff and the 3-try cap mean anything. Returns [`PollOutcome`] so a caller (the WAN harness)
+/// can assert on WHO was asked, which is the whole claim of QURATOR-164: a carrier is asked, not
+/// only the author.
+pub(crate) async fn poll_once(
+    store: &DataStore,
+    live_npub: &SharedIdentity,
+    relay: &SharedRelay,
+    states: &mut HashMap<(String, String), AskState>,
+) -> PollOutcome {
+    let mut outcome = PollOutcome::default();
 
-        let held = crate::manifest_cache::list(&store.manifest_cache_dir());
-        if held.is_empty() {
+    // Per-poll identity read, for the same reason the auto-approve loop does it: a fresh install
+    // has no identity when the driver starts, and a one-shot snapshot would leave it dead for the
+    // whole session.
+    let (identity, own_npub) = {
+        let guard = live_npub.read().await;
+        let Some(id) = guard.as_ref() else { return outcome };
+        (id.identity.clone(), id.npub())
+    };
+
+    let held = crate::manifest_cache::list(&store.manifest_cache_dir());
+    if held.is_empty() {
+        return outcome;
+    }
+    let Ok(contacts) = store.list_contacts() else { return outcome };
+    let contact_npubs: Vec<String> = contacts.iter().map(|c| c.npub.clone()).collect();
+
+    // Group holdings by author so each author's listing is resolved once per poll, not once per
+    // collection held.
+    let mut by_author: HashMap<String, Vec<CachedKey>> = HashMap::new();
+    for k in held {
+        by_author.entry(k.npub.clone()).or_default().push(k);
+    }
+
+    for (author_npub, keys) in by_author {
+        let Some(contact) = contacts.iter().find(|c| c.npub == author_npub) else {
+            // We hold a manifest from someone who is not a contact, so there is no share code to
+            // resolve their listing with. Nothing to compare against; leave it alone.
             continue;
-        }
-        let Ok(contacts) = store.list_contacts() else { continue };
-        let contact_npubs: Vec<String> = contacts.iter().map(|c| c.npub.clone()).collect();
-
-        // Group holdings by author so each author's listing is resolved once per poll, not once
-        // per collection held.
-        let mut by_author: HashMap<String, Vec<CachedKey>> = HashMap::new();
-        for k in held {
-            by_author.entry(k.npub.clone()).or_default().push(k);
-        }
-
-        for (author_npub, keys) in by_author {
-            let Some(contact) = contacts.iter().find(|c| c.npub == author_npub) else {
-                // We hold a manifest from someone who is not a contact, so there is no share code
-                // to resolve their listing with. Nothing to compare against; leave it alone.
-                continue;
-            };
-            let Ok(share_code) = contact_share_code(contact) else { continue };
-            let published: Vec<(String, Option<String>)> =
-                match resolve_peer(&share_code, &identity, &store, &relay).await {
-                    Ok(peer) => peer
-                        .collections
-                        .into_iter()
-                        .map(|c| (c.collection.slug, c.snapshot_fingerprint))
-                        .collect(),
-                    Err(e) => {
-                        tracing::debug!(author = %truncate(&author_npub), error = %e, "fetch driver: listing resolve failed");
-                        continue;
-                    }
-                };
-
-            for stale in stale_holdings(&keys, &published) {
-                let key = (stale.author_npub.clone(), stale.slug.clone());
-                let state = states.entry(key).or_insert_with(|| AskState {
-                    peers: candidates_for(&contact_npubs, &stale.author_npub, &own_npub),
-                    author: Candidate::fresh(stale.author_npub.clone()),
-                });
-
-                let now = Instant::now();
-                // The wave already carries the author when the author is ready (owner ruling
-                // 2026-09-04: whoever has a free slot answers first), so there is no separate
-                // fallback branch to take here.
-                let targets = match next_action(&state.peers, &state.author, now) {
-                    WaveAction::Ask(sources) => sources,
-                    // Backing off, or every source exhausted. Both are handled by simply not
-                    // asking this poll — the next one re-evaluates, which is what makes the
-                    // give-up bound self-healing rather than terminal.
-                    WaveAction::Wait(_) | WaveAction::GiveUp => continue,
-                };
-
-                for target in targets {
-                    // The production ask body — never a second copy (property 4). It takes the
-                    // shared 1/sec throttle slot itself, so a wide wave leaves slowly rather than
-                    // bursting.
-                    match request_manifest_from_inner(
-                        &target,
-                        &stale.author_npub,
-                        &stale.slug,
-                        &stale.want_fingerprint,
-                        None,
-                        &identity,
-                        &store,
-                        &relay,
-                    )
-                    .await
-                    {
-                        Ok(()) => tracing::info!(
-                            asked = %truncate(&target),
-                            slug = %stale.slug,
-                            "fetch driver: asked for a refreshed manifest"
-                        ),
-                        Err(e) => tracing::debug!(asked = %truncate(&target), error = %e, "fetch driver: ask failed"),
-                    }
-                    note_attempt(state, &target, now);
+        };
+        let Ok(share_code) = contact_share_code(contact) else { continue };
+        let published: Vec<(String, Option<String>)> =
+            match resolve_peer(&share_code, &identity, store, relay).await {
+                Ok(peer) => peer
+                    .collections
+                    .into_iter()
+                    .map(|c| (c.collection.slug, c.snapshot_fingerprint))
+                    .collect(),
+                Err(e) => {
+                    tracing::debug!(
+                        author = %truncate(&author_npub),
+                        error = %e,
+                        "fetch driver: listing resolve failed"
+                    );
+                    continue;
                 }
+            };
+
+        for stale in stale_holdings(&keys, &published) {
+            let key = (stale.author_npub.clone(), stale.slug.clone());
+            let state = states.entry(key).or_insert_with(|| AskState {
+                peers: candidates_for(&contact_npubs, &stale.author_npub, &own_npub),
+                author: Candidate::fresh(stale.author_npub.clone()),
+            });
+
+            let now = Instant::now();
+            // The wave already carries the author when the author is ready (owner ruling
+            // 2026-09-04: whoever has a free slot answers first), so there is no separate fallback
+            // branch here.
+            let targets = match next_action(&state.peers, &state.author, now) {
+                WaveAction::Ask(sources) => sources,
+                // Backing off, or every source exhausted. Both are handled by simply not asking
+                // this poll — the next one re-evaluates, which is what makes the give-up bound
+                // self-healing rather than terminal.
+                WaveAction::Wait(_) | WaveAction::GiveUp => continue,
+            };
+
+            outcome.stale.push(stale.clone());
+            for target in targets {
+                // The production ask body — never a second copy. It takes the shared 1/sec
+                // throttle slot itself, so a wide wave leaves slowly rather than bursting.
+                match request_manifest_from_inner(
+                    &target,
+                    &stale.author_npub,
+                    &stale.slug,
+                    &stale.want_fingerprint,
+                    None,
+                    &identity,
+                    store,
+                    relay,
+                )
+                .await
+                {
+                    Ok(()) => tracing::info!(
+                        asked = %truncate(&target),
+                        slug = %stale.slug,
+                        "fetch driver: asked for a refreshed manifest"
+                    ),
+                    Err(e) => tracing::debug!(
+                        asked = %truncate(&target),
+                        error = %e,
+                        "fetch driver: ask failed"
+                    ),
+                }
+                note_attempt(state, &target, now);
+                outcome.asked.push(target);
             }
         }
     }
+
+    outcome
 }
 
 /// npubs are truncated in logs — a full one identifies a person, and this loop names every peer it
@@ -232,6 +275,43 @@ mod tests {
 
     fn held(npub: &str, slug: &str, fp: &str) -> CachedKey {
         CachedKey { npub: npub.into(), slug: slug.into(), fingerprint: fp.into() }
+    }
+
+    /// The loop must stay a THIN SHELL over [`poll_once`] — cadence and state only.
+    ///
+    /// This is what makes the WAN row meaningful. The harness drives `poll_once` directly, so if
+    /// the loop ever grew its own copy of the poll, the suite would be exercising a path production
+    /// no longer takes — a phantom GREEN of exactly the shape this project has hit three times
+    /// (`sanitize_node_addr`, `approve_request`, D4's teaser stamp).
+    ///
+    /// MUTATION (P-10) — in `run_fetch_driver_loop`, replace the `poll_once(...)` call with an
+    /// inlined `crate::manifest_cache::list(&store.manifest_cache_dir());` → this test reds on both
+    /// asserts.
+    #[test]
+    fn the_loop_delegates_to_poll_once_and_holds_no_copy_of_it() {
+        let src = include_str!("fetch_driver.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("pub(crate) async fn run_fetch_driver_loop(")
+            .expect("the loop must exist");
+        let end = code[at..].find("pub(crate) async fn poll_once(").expect("poll_once must follow") + at;
+        let loop_body = &code[at..end];
+        // Count the CALL FORM, never the bare name: this test's own strings mention the symbol, and
+        // a guard that counts an identifier it also writes can be satisfied by itself (CLAUDE.md §9).
+        assert_eq!(
+            loop_body.matches("poll_once(").count(),
+            1,
+            "the loop must delegate to poll_once exactly once"
+        );
+        assert!(
+            !loop_body.contains("manifest_cache::list("),
+            "the loop must not read the cache itself — that is poll_once's job, and a second copy \
+             is how the harness ends up driving a path production has left behind"
+        );
     }
 
     /// MUTATION (P-10) — in `stale_holdings`, invert the comparison in the `.then(...)` guard to
