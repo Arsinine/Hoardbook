@@ -840,4 +840,45 @@ mod tests {
         let json = serde_json::to_string(&ordinary).expect("serialize ordinary ticket");
         assert!(!json.contains("author_npub"), "None must not serialize the field");
     }
+    /// C's cache MUST be populated by driving the production browse path, never by writing the
+    /// cache directly. The shortcut (`manifest_cache::put`) is two lines, irresistible, and would
+    /// make all four row assertions pass while proving nothing — including the negative in #3,
+    /// because the harness would have written the very key the row exists to test.
+    ///
+    /// Same shape as `sanitize_node_addr` (2026-08-27) and `approve_request` (2026-09-01): a
+    /// harness that copies a production path instead of calling it covers the copy, not the code
+    /// that ships. Twice that surfaced as a phantom PRODUCT defect, once as a phantom GREEN. This
+    /// is a drift guard, not integration coverage (the `suite_cap.rs` precedent) — but it fails
+    /// loudly on re-divergence, which is the part nobody was getting.
+    ///
+    /// MUTATION (P-10): in `run_role_c_phase1`, replace the `redeem_manifest_ticket_inner(` call
+    /// with a direct `crate::manifest_cache::put(` write — both halves red. Comments are stripped
+    /// first, so restating the rule in prose cannot satisfy it.
+    #[test]
+    fn the_carry_suite_caches_by_redeeming_and_never_writes_the_cache_directly() {
+        // Slice the PRODUCTION half only. Scanning the whole file would make this guard red on
+        // its own needle literals below — the self-referential trap that CLAUDE.md §9 records
+        // ("a raw whole-page scan reds on the page's own prose"). The model guard,
+        // `the_harness_approves_through_send_full_list_inner_and_never_rebuilds_it`, slices a
+        // function body for exactly this reason.
+        let src = include_str!("suite_wan_carry.rs");
+        let production = &src[..src.find("#[cfg(test)]").expect("test module must exist")];
+        let code: String = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !code.contains("manifest_cache::put("),
+            "the carry suite must never write C's cache directly — populate it by redeeming, so \
+             the row tests the keying that production performs rather than the keying the harness \
+             chose for itself"
+        );
+        assert!(
+            code.contains("redeem_manifest_ticket_inner("),
+            "C must cache by redeeming through the production path, which is what writes the \
+             cache entry via accept_manifest_bytes"
+        );
+    }
 }
