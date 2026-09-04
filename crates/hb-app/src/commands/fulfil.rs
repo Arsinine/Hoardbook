@@ -63,6 +63,7 @@ fn new_request_id() -> String {
 /// 2. **The record is persisted before the DM.** The reverse order hands a peer a ticket this node
 ///    cannot authorize, which is indistinguishable from a forgery. An orphaned record — the DM then
 ///    failed — is inert, because nobody holds the matching ticket.
+///
 /// `ask_nonce` is the asker's own value, taken from the request being answered (owner ruling ①,
 /// 2026-07-31). It is echoed into the ticket **verbatim and never interpreted** — only the asker can
 /// check it, and that check is what stops a peer minting tickets we would auto-dial. `None` when the
@@ -86,20 +87,11 @@ fn new_request_id() -> String {
 /// defect: the harness used to re-implement the asker's half step by step, the one step it did not
 /// copy was `sanitize_node_addr`, and the feature was broken end to end while 18 QUIC tests stayed
 /// green (owner devtest 2026-08-27). `fulfil_commands_stay_thin` pins the shim shape.
-#[tauri::command]
-pub async fn send_full_list(
-    npub: String,
-    slug: String,
-    ask_nonce: Option<String>,
-    identity: State<'_, SharedIdentity>,
-    store: State<'_, DataStore>,
-    relay: State<'_, SharedRelay>,
-    endpoint: State<'_, SharedEndpoint>,
-) -> CmdResult<()> {
-    send_full_list_inner(npub, slug, ask_nonce, &identity, &store, &relay, &endpoint).await
-}
-
-/// The whole of `send_full_list`'s behaviour, callable without a Tauri runtime.
+/// ⚠ The `send_full_list` Tauri COMMAND was deleted 2026-09-04 (QURATOR-164) along with the UI
+/// verb it existed for: public collections need no approval, so nothing offers a click. This body
+/// is unchanged and is now called by the auto-approve loop and the WAN harness directly. A
+/// registered command with zero callers that mints a ticket and DMs it is webview attack surface,
+/// not merely dead code — that is why it went rather than being left registered.
 pub(crate) async fn send_full_list_inner(
     npub: String,
     slug: String,
@@ -248,23 +240,9 @@ pub(crate) async fn send_full_list_inner(
 ///
 /// **A marshalling shim only** — the behaviour is [`send_cached_manifest_inner`], same split as the
 /// other two commands, so the harness drives the real body.
-#[allow(clippy::too_many_arguments)]
-#[tauri::command]
-pub async fn send_cached_manifest(
-    npub: String,
-    author_npub: String,
-    slug: String,
-    ask_nonce: Option<String>,
-    identity: State<'_, SharedIdentity>,
-    store: State<'_, DataStore>,
-    relay: State<'_, SharedRelay>,
-    endpoint: State<'_, SharedEndpoint>,
-) -> CmdResult<()> {
-    send_cached_manifest_inner(npub, author_npub, slug, ask_nonce, &identity, &store, &relay, &endpoint)
-        .await
-}
-
-/// The whole of `send_cached_manifest`'s behaviour, callable without a Tauri runtime.
+/// ⚠ The `send_cached_manifest` Tauri COMMAND was deleted 2026-09-04 (QURATOR-164), same reason as
+/// `send_full_list`. The Carrier-4 re-serve is answered by the auto-approve loop, with no human in
+/// the path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_cached_manifest_inner(
     npub: String,
@@ -771,9 +749,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        for (cmd, inner) in
-            [("send_full_list", "send_full_list_inner"), ("redeem_manifest_ticket", "redeem_manifest_ticket_emitting"), ("send_cached_manifest", "send_cached_manifest_inner")]
-        {
+        // Only `redeem_manifest_ticket` is still a command: QURATOR-164 deleted `send_full_list`
+        // and `send_cached_manifest` with the UI verbs they served. Their `*_inner` bodies live on,
+        // called by the auto-approve loop, and the harness drives those directly.
+        for (cmd, inner) in [("redeem_manifest_ticket", "redeem_manifest_ticket_emitting")] {
             // Match the name, then require the next char to open either the parameter list `(`
             // or a generic list `<` — `redeem_manifest_ticket` is generic over `R: Runtime` (the
             // `take_update_notice` precedent) so that a MockRuntime dispatch test can reach it.
@@ -1496,85 +1475,7 @@ mod tests {
             serde_json::to_string(&ticket).unwrap()
         }
 
-        /// `send_full_list(npub, slug, ...)` — `npub` and `slug` are consecutive `String` params.
-        /// Dispatched through the real command with a real peer npub and a slug that has no draft:
-        /// correctly ordered, the recipient parses fine and the call dies at the missing-draft guard,
-        /// naming the SLUG. Swapped at the call site, the recipient parser would instead receive the
-        /// slug text and die first, naming "Invalid recipient" — a different error, so the two orderings
-        /// are always distinguishable.
-        ///
-        /// MUTATION (P-10): in `send_full_list`'s body, change
-        /// `send_full_list_inner(npub, slug, ask_nonce, &identity, &store, &relay, &endpoint).await`
-        /// to `send_full_list_inner(slug, npub, ask_nonce, &identity, &store, &relay, &endpoint).await`
-        /// — this test reds (the error becomes `"Invalid recipient: ..."`); no test in `command_guards`
-        /// reds, since none of them dispatch through this shim.
-        #[tokio::test]
-        async fn send_full_list_command_dispatch_keeps_npub_and_slug_in_order() {
-            let app = guard_app(true);
-            let peer = AppIdentity::generate();
-            let err = tokio::time::timeout(
-                CALL_BUDGET,
-                send_full_list(
-                    peer.npub(),
-                    "no-such-slug".into(),
-                    None,
-                    app.state::<SharedIdentity>(),
-                    app.state::<DataStore>(),
-                    app.state::<SharedRelay>(),
-                    app.state::<SharedEndpoint>(),
-                ),
-            )
-            .await
-            .expect("the call must resolve well inside the budget — a hang is a finding")
-            .expect_err("a peer npub and a slug with no draft must be refused at the draft guard");
-            assert_eq!(
-                err, "No draft found for collection 'no-such-slug'",
-                "npub must reach the recipient parser and slug must reach the draft lookup, in that \
-                 order — a different error here means the shim's call site transposed them"
-            );
-        }
 
-        /// `send_cached_manifest(npub, author_npub, slug, ...)` — `npub` and `author_npub` are the
-        /// first two consecutive `String` params. Dispatched with `npub` = our OWN npub (the intended
-        /// recipient) and `author_npub` = a peer's (whose cached copy we'd be re-sending): correctly
-        /// ordered, `npub` resolves to a self-send and the call dies at the self-send guard, which runs
-        /// BEFORE the cache lookup. Swapped, `npub` instead carries the peer's npub (no self-send) and
-        /// `author_npub` carries our own — the call proceeds past the self-send guard and dies at the
-        /// cache-miss guard instead, naming the slug. The two guards produce distinct text, so the
-        /// ordering is always distinguishable.
-        ///
-        /// MUTATION (P-10): in `send_cached_manifest`'s body, change
-        /// `send_cached_manifest_inner(npub, author_npub, slug, ask_nonce, ...)` to
-        /// `send_cached_manifest_inner(author_npub, npub, slug, ask_nonce, ...)` — this test reds (the
-        /// error becomes the cache-miss message); no `command_guards` test reds, since none dispatch
-        /// through this shim.
-        #[tokio::test]
-        async fn send_cached_manifest_command_dispatch_keeps_npub_and_author_npub_in_order() {
-            let app = guard_app(true);
-            let own_npub = app.state::<SharedIdentity>().read().await.as_ref().unwrap().npub();
-            let peer = AppIdentity::generate();
-            let err = tokio::time::timeout(
-                CALL_BUDGET,
-                send_cached_manifest(
-                    own_npub,
-                    peer.npub(),
-                    "vault".into(),
-                    None,
-                    app.state::<SharedIdentity>(),
-                    app.state::<DataStore>(),
-                    app.state::<SharedRelay>(),
-                    app.state::<SharedEndpoint>(),
-                ),
-            )
-            .await
-            .expect("the call must resolve well inside the budget — a hang is a finding")
-            .expect_err("addressing the message to ourselves must be refused as a self-send");
-            assert_eq!(
-                err, "You can't send a cached list to yourself.",
-                "npub must reach the self-send check and author_npub must reach the cache lookup, in \
-                 that order — a different error here means the shim's call site transposed them"
-            );
-        }
 
         /// `redeem_manifest_ticket(npub, ticket_json, ...)` — `npub` and `ticket_json` are the first
         /// two consecutive `String` params. Dispatched with a well-formed (if undialable) ticket and no

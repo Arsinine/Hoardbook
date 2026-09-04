@@ -84,17 +84,21 @@ describe('Chat page — M17 W7.1b manifest-request fulfilment card wiring', () =
 		const reqBlockStart = src.lastIndexOf('{#if manifestFulfilFor', cardAfterReq);
 		const reqBlock = src.slice(reqBlockStart, cardAfterReq);
 		expect(reqBlock).toContain('quarantined: true');
-		// `onexport` is gone entirely (owner ruling 2026-08-27) — the no-op that used to stand in for
-		// "inert here" no longer exists, so what this pins now is that the quarantine card is handed
-		// an inert `onsend` and nothing else actionable.
-		expect(quarantinedCard).not.toContain('onexport');
-		expect(quarantinedCard).toContain('onsend={() => {}}');
+		// QURATOR-164: the card now takes NO action props at all — the send verb was deleted with the
+		// approval, so "inert here" is no longer a special case of the quarantine branch, it is the
+		// card's only mode. The `quarantined: true` derivation above still matters (it forces the
+		// Accept-first copy), which is why this test survives rather than merging with the one below.
+		for (const prop of ['onexport', 'onsend', 'onserve', 'sending']) {
+			expect(quarantinedCard).not.toContain(prop);
+		}
 	});
 
-	// INVERTED with the button (owner ruling 2026-08-27). Was: "the conversation-thread card IS
-	// wired to handleExportManifest". The conversation card now has exactly one action — Send — so
-	// what needs pinning is that the send wiring survived the removal intact.
-	it('the conversation-thread card is wired to send, and to nothing else', () => {
+	// INVERTED TWICE. 2026-08-27 (owner) turned "wired to handleExportManifest" into "wired to
+	// Send". 2026-09-04 (owner, QURATOR-164) removed Send as well: public collections need no
+	// approval, so the conversation card is wired to NOTHING and the auto-approve loop answers the
+	// request. What still needs pinning is the `quarantined: false` derivation — that is the only
+	// thing distinguishing this call site from the quarantine one above.
+	it('the conversation-thread card is wired to no action at all', () => {
 		const src = chatSrc();
 		const convEach = src.indexOf('{#each conversation as msg');
 		expect(convEach).toBeGreaterThan(-1);
@@ -106,8 +110,9 @@ describe('Chat page — M17 W7.1b manifest-request fulfilment card wiring', () =
 		const convBlockStart = src.lastIndexOf('{#if manifestFulfilFor', cardAfterConv);
 		const convBlock = src.slice(convBlockStart, cardAfterConv);
 		expect(convBlock).toContain('quarantined: false');
-		expect(convCard).toContain('onsend={(slug) => handleSendFullList(slug, mf.request.askNonce)}');
-		expect(convCard).not.toContain('onexport');
+		for (const prop of ['onexport', 'onsend', 'onserve', 'sending']) {
+			expect(convCard).not.toContain(prop);
+		}
 	});
 
 	it('the card is an ADDENDUM — verbatim message text renders above it, never replaced', () => {
@@ -146,39 +151,15 @@ describe('Chat page — M17 W7.1b manifest-request fulfilment card wiring', () =
 		expect(src).toContain('getCollections');
 	});
 
-	// QURATOR-45: the "Send the full list" click guard must not permanently swallow retries after a
-	// failed or hung first attempt. The guard blocks CONCURRENT double-clicks (so two approvals are
-	// never minted for one request), but the `finally` block MUST clear `sendingFullList` on BOTH
-	// success and failure — otherwise a bind that hangs or fails leaves the button permanently
-	// disabled and every subsequent click silently discarded. Source-scan guards (route-page idiom):
-	//   1. The guard sets sendingFullList = slug (blocking concurrent clicks).
-	//   2. The finally block resets sendingFullList = null (releasing the guard for retries).
-	//   3. The catch block surfaces the error (so a failed send is visible, not silent).
-	it('the send-full-list guard releases on failure so retries are not permanently swallowed', () => {
-		const src = chatSrc();
-		const sendOpen = src.indexOf('async function handleSendFullList');
-		expect(sendOpen).toBeGreaterThan(-1);
-		const afterSend = src.indexOf('\tasync function', sendOpen + 1);
-		const block = src.slice(sendOpen, afterSend === -1 ? src.length : afterSend);
-		// Guard blocks concurrent clicks (prevents double-approval).
-		expect(block).toMatch(/sendingFullList === slug/);
-		expect(block).toMatch(/sendingFullList = slug/);
-		// The finally block MUST clear the guard — without this, a hung/failed first attempt
-		// permanently swallows every subsequent click (the QURATOR-45 defect).
-		expect(block).toMatch(/finally\s*\{[\s\S]*sendingFullList = null/);
-		// The catch block surfaces the error as a toast (not silent) — a hung bind that returns an
-		// Err now reaches this catch and is visible.
-		expect(block).toMatch(/catch\s*\(e\)\s*\{[\s\S]*toast\(String\(e\),\s*['"]error['"]\)/);
-	});
-
-	it('the send-full-list handler has a catch AND finally (both are required for recovery)', () => {
-		// If the catch or finally were removed, a failed send would either swallow the error
-		// (no catch) or leave the guard stuck (no finally). Both must be present.
-		const src = chatSrc();
-		const sendOpen = src.indexOf('async function handleSendFullList');
-		const afterSend = src.indexOf('\tasync function', sendOpen + 1);
-		const block = src.slice(sendOpen, afterSend === -1 ? src.length : afterSend);
-		expect(block).toMatch(/catch\s*\(e\)/);
-		expect(block).toMatch(/finally\s*\{/);
-	});
+	/* ⚠ TWO TESTS DELETED HERE 2026-09-04 (QURATOR-164), and the reason is not "they were noisy".
+	 * They pinned `handleSendFullList`'s concurrency guard — that a `finally` released
+	 * `sendingFullList` so a failed attempt did not permanently swallow every later click, and that
+	 * a `catch` surfaced the error rather than dropping it. That was the QURATOR-45 defect, and the
+	 * guard was worth having.
+	 *
+	 * The handler itself is gone: the owner deleted the send verb because public collections need no
+	 * approval, so there is no click to guard and no in-flight state to release. The equivalent
+	 * concern now lives in Rust, in the auto-approve loop, which logs a failed serve and continues
+	 * rather than wedging — and a failure there leaves the request in the hold queue rather than
+	 * lost. Do not restore these tests without first restoring a handler for them to guard. */
 });

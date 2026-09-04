@@ -29,8 +29,6 @@
 		relayStatus,
 		type RelayHealth,
 		getCollections,
-		sendFullList,
-		sendCachedManifest,
 		redeemManifestTicket,
 		getManifestAsks,
 		getSettings,
@@ -66,7 +64,6 @@
 		parseTransportTicket,
 		transportTicketHint,
 		RedemptionLedger,
-		SEND_FULL_LIST_TOAST,
 		ticketAnswersOurAsk,
 		askIdentity,
 		askFingerprintSeen,
@@ -453,59 +450,11 @@
 	// is the vacuous-control shape CLAUDE.md §9 warns about — so it went with its button. Export is
 	// still a real capability, reached from Home → ⋯ → Export (which is also where the
 	// over-the-ceiling error points).
-
-	// M18 W4 — the fulfil verb. The whole of the owner's decision is this click: `send_full_list`
-	// builds the manifest, refuses it up front if it exceeds the transport ceiling (naming export in
-	// the error), mints a ticket bound to this one approval, records it, and DMs it. Nothing auto-fires
-	// (M17 ruling #4), and export stays on the card beside it for when the transport can't connect.
-	// Guarded per slug so a double-click cannot mint two approvals for one request. The guard
-	// releases in `finally` on BOTH success and failure, so a failed attempt (including a bind
-	// timeout surfaced from the backend) clears the way for a retry — it only blocks CONCURRENT
-	// clicks while one attempt for this slug is in flight. The button is also `disabled` while
-	// `sending` is true, so a double-click lands on a disabled control and never reaches this guard
-	// in practice.
-	let sendingFullList: string | null = $state(null);
-	async function handleSendFullList(slug: string, askNonce?: string) {
-		if (sendingFullList === slug) return;
-		const npub = selectedPeer?.npub;
-		if (!npub) return;
-		sendingFullList = slug;
-		try {
-			await sendFullList(npub, slug, askNonce);
-			toast(SEND_FULL_LIST_TOAST(slug), 'success');
-		} catch (e) {
-			toast(String(e), 'error');
-		} finally {
-			sendingFullList = null;
-		}
-	}
-
-	// Carrier 4 (QURATOR-79) — the re-serve verb, the mirror of `handleSendFullList` above. The two
-	// differ in exactly one thing: WHAT is being sent. `send_full_list` builds a manifest from one of
-	// this owner's own drafts; `send_cached_manifest` re-serves an envelope another peer authored,
-	// straight from the cache browsing put it in — nothing is built, and the backend pins the served
-	// copy's author against the requested one before anything is promised (fulfil.rs, §2 C-side
-	// provenance fence). Same human-click-only rule (M17 #4), same concurrency guard with a `finally`
-	// release so a failed dial is retryable — the QURATOR-45 shape, kept identical.
-	let servingCached: string | null = $state(null);
-	async function handleServeCached(state: ManifestFulfilState, askNonce?: string) {
-		const npub = selectedPeer?.npub;
-		// The author pin travels on the state, never a guess: the card's re-serve button only exists
-		// for a named author (see deriveManifestFulfil), so an authorless state here is a wiring
-		// error and the honest answer is to do nothing rather than serve the wrong peer's copy.
-		if (state.kind !== 're-serve' || !npub || servingCached === state.slug) return;
-		servingCached = state.slug;
-		try {
-			await sendCachedManifest(npub, state.authorNpub, state.slug, askNonce);
-			toast(SEND_FULL_LIST_TOAST(state.slug), 'success');
-			// QURATOR-137: same as the send path — the re-serve click records an author-scoped grant
-			// (not one this card's lookup reads), but refresh anyway so the state stays honest.
-		} catch (e) {
-			toast(String(e), 'error');
-		} finally {
-			servingCached = null;
-		}
-	}
+	// The "Send the full list" and re-serve HANDLERS are GONE (QURATOR-164, 2026-09-04). Both were
+	// human-click verbs over `send_full_list` / `send_cached_manifest`; owner ruling: public collections
+	// need no approval, so nothing should offer a click. The auto-approve loop answers every public
+	// ask, and both Tauri commands were deleted with these handlers — the `*_inner` bodies the loop
+	// calls are untouched.
 
 	// The grant-fact poll that used to live here is GONE (QURATOR-164, 2026-09-04). It called
 	// `has_standing_grant` per slug to decide whether the fulfil card should render its
@@ -1410,9 +1359,6 @@
 											<ManifestFulfilCard
 												state={mf.state}
 												fingerprintSeen={mf.request.fingerprintSeen}
-												onsend={() => {}}
-												onserve={() => {}}
-												sending={false}
 											/>
 										{/if}
 										{#if parseTransportTicket(msg.content)}
@@ -1563,9 +1509,6 @@
 										<ManifestFulfilCard
 											state={mf.state}
 											fingerprintSeen={mf.request.fingerprintSeen}
-											onsend={(slug) => handleSendFullList(slug, mf.request.askNonce)}
-											onserve={() => handleServeCached(mf.state, mf.request.askNonce)}
-											sending={sendingFullList === mf.state.slug || servingCached === mf.state.slug}
 										/>
 									{/if}
 									{#if parseTransportTicket(msg.content)}

@@ -10,39 +10,26 @@
 // STATEMENT itself and assert against that; the no-raw-invoke assertion strips comments first so
 // it can never red on its own explanation.
 //
-// Mutation probes (each must RED its named test):
-//   - restore the raw `await import('@tauri-apps/api/core')` in handleServeCached → both tests red;
-//   - delete `sendCachedManifest` from api.ts → the api.ts tests red.
+// Mutation probe (must RED the surviving test):
+//   - add `const { invoke } = await import('@tauri-apps/api/core')` anywhere in the chat page's
+//     script block → the no-raw-invoke test reds.
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 const chatSrc = () => readFileSync(new URL('./+page.svelte', import.meta.url), 'utf8');
 const apiSrc = () => readFileSync(new URL('../../lib/api.ts', import.meta.url), 'utf8');
 
-/** Slice ONE import statement out of a source string: from the `import {` opening on the line that
- *  starts the module's import block through the closing `} from '…';`. Anchors on the imported
- *  symbol so the slice is the statement that actually binds it (P-7 — the call site satisfies a
- *  bare symbol scan, so the assertion must run against the statement). */
-function importStatementFor(src: string, symbol: string): string | null {
-	const re = new RegExp(`import\\s*\\{[^}]*\\b${symbol}\\b[^}]*\\}\\s*from\\s*'[^']+';`, 'm');
-	const m = src.match(re);
-	return m ? m[0] : null;
-}
-
 describe('QURATOR-171 — send_cached_manifest goes through api.ts, not a raw dynamic import', () => {
-	it("api.ts exports sendCachedManifest invoking the command (the wrapper the Lane C note named)", () => {
-		const src = apiSrc();
-		expect(src).toContain("export const sendCachedManifest");
-		expect(src).toContain("'send_cached_manifest'");
-	});
-
-	it("the chat page's import statement binds sendCachedManifest from $lib/api.js (sliced, not symbol-scanned)", () => {
-		const stmt = importStatementFor(chatSrc(), 'sendCachedManifest');
-		// Loud precondition: a null here means the import line is GONE, which is exactly the defect
-		// this guards — never a pass.
-		expect(stmt).not.toBeNull();
-		expect(stmt).toContain("from '$lib/api.js'");
-	});
+	/* ⚠ Two assertions here were DELETED 2026-09-04 (QURATOR-164), not weakened: they pinned that
+	 * `api.ts` exports `sendCachedManifest` and that the chat page imports it. The owner deleted the
+	 * fulfil verb — public collections need no approval, so nothing offers a click — and the
+	 * `send_cached_manifest` Tauri command went with it, since a registered command with zero callers
+	 * that mints a ticket and DMs it is attack surface rather than dead code. There is no wrapper left
+	 * to pin.
+	 *
+	 * The third assertion below is KEPT and is the one that still earns its place: it guards the
+	 * *general* rule the defect violated — the chat page must never reach Tauri directly, bypassing
+	 * api.ts's `isTauri` guard — and that applies to every command, not just the deleted one. */
 
 	it('the chat page carries NO raw @tauri-apps import or invoke — every Tauri call lives in api.ts', () => {
 		// Strip comments first (P-12): the deletion left prose naming the old path; an absence

@@ -142,5 +142,17 @@ export const MANIFEST_BIG_RELAY_LINK = 'Add a big relay in Settings to publish t
  *  Kept honest in the family voice: it names the LIST as what crosses, never the files (MAS-INV-5 +
  *  INV-4, same as every line above). */
 export const MANIFEST_RESERVE_LINE = (authorNpub: string) =>
-	`They're asking for a list ${shortNpub(authorNpub)} made — say the word and it goes from your cache.`;
+	`They're asking for a list ${shortNpub(authorNpub)} made — it goes from your cache.`;
+
+/** QURATOR-164 — the line that replaced the "Send the full list" verb on both public branches.
+ *  Owner ruling 2026-09-04: public collections need no approval, so there is nothing for a human to
+ *  decide and the card must not imply otherwise. It states what already happened, in the register of
+ *  the other inert lines.
+ *
+ *  ⚠ Copy constraints, and they are the same ones that made the deleted `answered` line wrong: it
+ *  must not claim the reader approved anything (they did not, and cannot), must not offer or imply
+ *  an action, and must not promise the send has completed — the auto-approve loop paces requests, so
+ *  "handles this for you" is true where "already sent" would sometimes be a lie. */
+export const MANIFEST_AUTO_SENT_LINE =
+	'Your app handles this one for you — public lists go out without anyone approving them.';
 

@@ -166,31 +166,10 @@ export const exportCollection = (slug: string, format: 'text' | 'markdown') =>
 
 /** M16 W4: serialize a collection's full-listing manifest envelope to a user-picked `.hbmanifest`
  *  file. `path` comes from the save dialog; Hoardbook writes the file and moves no collection files
- *  (INV-4′). Since M18 W4 this is the FALLBACK for when the transport can't connect — see
- *  [`sendFullList`]. */
+ *  (INV-4′). Since M18 W4 this is the FALLBACK for when the transport can't connect; the primary
+ *  path is now unattended — the auto-approve loop answers public asks with no click (QURATOR-164). */
 export const exportManifest = (slug: string, path: string) =>
 	invoke<void>('export_manifest', { slug, path });
-
-/** M18 W4: **the fulfil verb.** Approve one asker's request for one collection — the backend builds
- *  the manifest, proves it fits the 8 MiB transport ceiling *before* promising anything, mints a
- *  ticket bound to that single approval, and DMs it. Fires only from an explicit click; Hoardbook
- *  never auto-sends (M17 ruling #4). Still moves no collection files (INV-4′) — a manifest is a
- *  listing, not a file. */
-export const sendFullList = (npub: string, slug: string, askNonce?: string) =>
-	invoke<void>('send_full_list', { npub, slug, askNonce: askNonce ?? null });
-
-/** Carrier 4 (QURATOR-79) — the re-serve verb: hand `npub` a cached copy of `authorNpub`'s manifest,
- *  straight from the cache browsing put it in (nothing is built; the backend pins the served copy's
- *  author before promising anything). Fires only from an explicit click (M17 ruling #4). The wrapper
- *  exists so every Tauri call site lives in this file (QURATOR-171) — the chat page used to invoke
- *  the command through a raw dynamic import with this exact argument shape. */
-export const sendCachedManifest = (npub: string, authorNpub: string, slug: string, askNonce?: string) =>
-	invoke<void>('send_cached_manifest', {
-		npub,
-		authorNpub,
-		slug,
-		askNonce: askNonce ?? null,
-	});
 
 /** M18 W4: redeem a transport ticket that arrived by DM — dial, fetch, and consume through the
  *  unchanged M16 W4 gates (author pinned to the peer, slug bound to the ticket, signature verified

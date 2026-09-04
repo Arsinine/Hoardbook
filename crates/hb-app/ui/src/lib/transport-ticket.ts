@@ -270,14 +270,14 @@ export class RedemptionLedger {
 
 // ── Copy (single source — the chat route and the tests read from here) ───────────────────────
 
-/** The owner-side button. The verb is "send", not "download": what crosses is the **list**, and
- *  saying so is the difference between this and the affordance MAS-INV-5 forbids. */
-export const SEND_FULL_LIST_LABEL = 'Send the full list';
-
-/** Owner-side success. Names what was sent and what was not — the asker gets the listing, and the
- *  files stay where they are (INV-4′). */
-export const SEND_FULL_LIST_TOAST = (slug: string) =>
-	`Sent the full list of “${slug}”. Your files stay put.`;
+// `SEND_FULL_LIST_LABEL` and `SEND_FULL_LIST_TOAST` — DELETED 2026-09-04, QURATOR-164. They were
+// the owner-side button and its success toast. The owner deleted the verb ("nothing should show
+// that") because public collections need no approval, so neither string could ever reach a screen
+// again. They were left readable only by their own tests — a control pinning the wording of copy
+// nobody renders, which is the vacuous shape this file's own header warns about.
+//
+// MAS-INV-5's positive half moved with them: the "what crosses is the LIST" claim is now pinned on
+// `MANIFEST_AUTO_SENT_LINE` (manifest-fulfil.ts), which IS rendered.
 
 /** Shown on the fulfil card next to the send button. Says the thing owner ruling ② made explicit:
  *  what crosses is the collection **as it stands when they fetch it**, not a frozen copy of what you

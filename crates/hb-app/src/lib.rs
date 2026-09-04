@@ -141,7 +141,8 @@ fn build_system_tray(app: &mut tauri::App) -> tauri::Result<()> {
 ///   1. `transport_state::rebind_if_tickets_outstanding` at startup, when servable content is on
 ///      the books (a ticket outlives the session that issued it; QURATOR-177 Option E replaced the
 ///      unspent-ticket read with the permanent grant map, which never empties);
-///   2. `send_full_list`, when the owner approves a request;
+///   2. the auto-approve loop's `send_full_list_inner` / `send_cached_manifest_inner`, when a
+///      request-DM arrives (there is no approval — QURATOR-164);
 ///   3. **`redeem_manifest_ticket`** — the ASKER binds too, in order to dial. Since owner ruling ③
 ///      that binding is **dial-only** (`Role::DialOnly`): no advertised ALPN and no accept loop, so
 ///      redeeming does not leave this node answering anyone who holds its node id.
@@ -568,10 +569,8 @@ pub fn run() {
             commands::diagnostics::open_repo_page,
             commands::browse::import_manifest,
             // M18 W4 — the fulfil verb, both halves.
-            commands::fulfil::send_full_list,
             commands::fulfil::redeem_manifest_ticket,
             // QURATOR-79 Carrier 4 — re-serve a cached copy of a peer's manifest.
-            commands::fulfil::send_cached_manifest,
             commands::private::browse_private_collections,
             commands::browse::paste_key,
             commands::browse::share_code_info,

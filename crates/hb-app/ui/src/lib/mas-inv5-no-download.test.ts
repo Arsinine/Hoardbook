@@ -1,9 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { extractUserFacingSegments } from './copy-audit.js';
+import { MANIFEST_AUTO_SENT_LINE } from './manifest-fulfil.js';
 import {
-	SEND_FULL_LIST_LABEL,
-	SEND_FULL_LIST_TOAST,
 	SEND_FULL_LIST_FALLBACK,
 	SEND_FULL_LIST_CURRENT_TREE,
 	REDEEMING_LINE,
@@ -78,8 +77,6 @@ describe('MAS-INV-5 — the M18 fulfil surfaces move listings, never files', () 
 	// show, and `copy-source-completeness` below fails if a new one is exported without being added
 	// here — which is what stops this guard from quietly going vacuous again.
 	const COPY: string[] = [
-		SEND_FULL_LIST_LABEL,
-		SEND_FULL_LIST_TOAST('criterion'),
 		SEND_FULL_LIST_FALLBACK,
 		SEND_FULL_LIST_CURRENT_TREE,
 		REDEEMING_LINE('criterion'),
@@ -151,11 +148,12 @@ describe('MAS-INV-5 — the M18 fulfil surfaces move listings, never files', () 
 	/** The other half of the same claim: the surfaces must positively say what DOES cross. Copy that
 	 *  merely avoided the word "files" while describing nothing would pass every scan above. */
 	it('the fulfil copy names the LIST as the thing that crosses', () => {
-		expect(SEND_FULL_LIST_LABEL).toMatch(/\blist\b/i);
-		expect(SEND_FULL_LIST_TOAST('criterion')).toMatch(/\blist(ing)?\b/i);
+		// QURATOR-164: the two owner-side strings this used to assert on (`SEND_FULL_LIST_LABEL`,
+		// `SEND_FULL_LIST_TOAST`) were deleted with the verb — nothing rendered them, so pinning their
+		// wording pinned nothing. The claim itself still matters, so it moved to the copy that
+		// REPLACED them on the card and is actually shown.
+		expect(MANIFEST_AUTO_SENT_LINE).toMatch(/\blists?\b/i);
 		expect(REDEEMED_LINE('criterion')).toMatch(/\blist\b/i);
-		// …and says out loud that the files do not move.
-		expect(SEND_FULL_LIST_TOAST('criterion')).toMatch(/files stay/i);
 	});
 
 	/** Positive assertion, mirroring the browse one: the ratified M18 affordances are present, so a
@@ -179,9 +177,23 @@ describe('MAS-INV-5 — the M18 fulfil surfaces move listings, never files', () 
 	 *
 	 *  Do not restore the assertion. If a fallback needs pinning, pin the big-relay path — and pin it
 	 *  by BEHAVIOUR, not by grepping the source for a label. */
-	it('the fulfil card offers "Send the full list"', () => {
+	/** QURATOR-164 INVERTED THIS. It asserted the card CONTAINS `SEND_FULL_LIST_LABEL` — a source
+	 *  grep for a label, which is precisely what the comment above it warns against ("pin it by
+	 *  BEHAVIOUR, not by grepping the source for a label"), and which said nothing about whether the
+	 *  affordance was reachable.
+	 *
+	 *  The owner deleted the verb: public collections need no approval, so the card offers no action
+	 *  at all. MAS-INV-5 is satisfied MORE strongly than before — there is no affordance to mistake
+	 *  for a download, because there is no affordance. That is what this now pins, and it is a
+	 *  structural absence rather than a string match. */
+	it('the fulfil card offers NO action at all — not a send, and certainly not a download', () => {
 		const src = read('./components/ManifestFulfilCard.svelte');
-		expect(src).toContain('SEND_FULL_LIST_LABEL');
+		expect(src).not.toContain('<button');
+		expect(src).not.toContain('SEND_FULL_LIST_LABEL');
+		const offenders = extractUserFacingSegments(src).filter((seg) =>
+			/\b(download|fetch|save)\b/i.test(seg),
+		);
+		expect(offenders).toEqual([]);
 	});
 
 	/** The asker's card fires its redemption on render. It must therefore never grow a button that

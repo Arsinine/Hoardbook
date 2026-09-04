@@ -7,7 +7,6 @@ import {
 	askIdentity,
 	TICKET_TAG,
 	REDEEM_FAILED_LINE,
-	SEND_FULL_LIST_LABEL,
 } from './transport-ticket.js';
 import { parseManifestRequest } from './request-inbox.js';
 
@@ -304,13 +303,15 @@ describe('ticketAnswersOurAsk — the unsolicited-dial gate', () => {
 });
 
 describe('copy', () => {
-	/** The verb is the whole point. What crosses the plane is the LIST; the files stay with their
-	 *  owner (INV-4′, MAS-INV-5). Copy that said "download" or "send the files" would describe an
-	 *  affordance that does not exist and that the invariant forbids. */
-	it('the fulfil verb names the list, never the files or a download', () => {
-		expect(SEND_FULL_LIST_LABEL).toBe('Send the full list');
-		expect(SEND_FULL_LIST_LABEL).not.toMatch(/download|file/i);
-	});
+	/* ⚠ 'the fulfil verb names the list, never the files or a download' — DELETED 2026-09-04
+	 * (QURATOR-164). It pinned `SEND_FULL_LIST_LABEL`, the owner-side button's text. The owner
+	 * deleted the verb ("nothing should show that"): public collections need no approval, so the card
+	 * offers no action and the constant rendered nowhere. A test asserting the wording of copy that
+	 * cannot reach a screen is vacuous, so the constant and this went together.
+	 *
+	 * MAS-INV-5 did NOT lose coverage — it gained. `mas-inv5-no-download.test.ts` now pins the
+	 * stronger structural fact (the card contains no `<button` at all) plus the positive claim on
+	 * `MANIFEST_AUTO_SENT_LINE`, which is copy that is actually rendered. */
 
 	/** A failed redemption must say the request survives, because it does — the owner spends the
 	 *  ticket only on this side's acknowledgement. Copy implying the user has to ask again would send
