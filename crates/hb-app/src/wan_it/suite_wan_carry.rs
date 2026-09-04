@@ -26,7 +26,7 @@
 //! | C·1 | send the ask DM | `commands::chat::build_manifest_request` + `commands::chat::send_dm_inner` + `DataStore::record_manifest_ask` |
 //! | C·1 | receive A's ticket | `commands::chat::decode_dms` + `hb_core::TransportTicket::verify_shape` |
 //! | C·1 | redeem + cache | `commands::fulfil::redeem_manifest_ticket_inner` (claim + `ensure_endpoint` DialOnly + `fetch_manifest` + `commands::browse::accept_manifest_bytes` + spend) |
-//! | C·2 | receive D's ask | `commands::chat::decode_dms` (request-DM JSON parse is harness-side — `auto_approve::ManifestRequestBody` is private, same as the serve loop in `wan_it/mod.rs`) |
+//! | C·2 | receive D's ask | `commands::chat::decode_dms` + `auto_approve::ManifestRequestBody::parse` + `auto_approve::approval_body_for` (production's parser AND its routing discriminator — QURATOR-183) |
 //! | C·2 | answer by re-serving | `commands::fulfil::send_cached_manifest_inner` (cache read + `verify_author` + `ensure_endpoint` Listen + `issue_ticket` + `record_standing_grant` + `send_dm_inner`) |
 //! | D | send the author-ask DM | `commands::chat::build_manifest_request_for_author` + `send_dm_inner` + `DataStore::record_manifest_ask` |
 //! | D | receive C's ticket | `commands::chat::decode_dms` + `TransportTicket::verify_shape` (harness asserts `author_npub == Some(A)`) |
@@ -35,8 +35,10 @@
 //!
 //! Harness-side by design (each mirrors the documented deviation in `wan_it/mod.rs` /
 //! `suite_wan_e2e.rs`): nonce minting (`rand::random`, as in `send_request_dm`), the human decision
-//! of WHICH ask C answers (a harness has no human; same deviation as `approve_request`), and the
-//! request-DM JSON field reads on C.
+//! of WHICH ask C answers (a harness has no human; same deviation as `approve_request`). The
+//! request-DM parse is NO LONGER harness-side — QURATOR-183 routed both roles through
+//! `auto_approve::ManifestRequestBody::parse`, and C's re-serve decision through
+//! `auto_approve::approval_body_for`, so neither can drift from production.
 //!
 //! ## Not a CI gate
 //!
@@ -239,16 +241,6 @@ async fn poll_dms<T>(
     Err(format!("never received {what} from {expected_sender}: {last_err}"))
 }
 
-/// Pull a string field (blank-normalised) out of a request-DM body. Harness-side JSON field read —
-/// `auto_approve::ManifestRequestBody` is private to its module, and `wan_it/mod.rs`'s own serve
-/// loop reads the same fields the same way for the same reason.
-fn request_str_field(v: &serde_json::Value, name: &str) -> Option<String> {
-    match v.get(name).and_then(|f| f.as_str()) {
-        Some(s) if !s.is_empty() => Some(s.to_string()),
-        _ => None,
-    }
-}
-
 /// Redeem a ticket through the FULL production redeem body — claim gate, dial-only endpoint,
 /// fetch, `accept_manifest_bytes` (which writes the cache that is this row's subject), and the
 /// spend — with a bounded retry. A failed attempt leaves the ask retryable (the claim is keyed to
@@ -379,17 +371,9 @@ async fn run_role_a(input: &CarryInput) -> Result<(), String> {
         input,
         &asker_npub,
         |msg| {
-            let trimmed = msg.content.trim();
-            if !trimmed.starts_with('{') {
-                return None;
-            }
-            let v: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-            if v.get("hb").and_then(|h| h.as_str()) != Some("manifest_request") {
-                return None;
-            }
-            let slug = v.get("slug")?.as_str()?.to_string();
-            let nonce = request_str_field(&v, "ask_nonce");
-            Some((slug, nonce))
+            // Production's parser, never a copy (QURATOR-183).
+            let body = crate::auto_approve::ManifestRequestBody::parse(&msg.content)?;
+            Some((body.slug.clone(), body.ask_nonce.clone()))
         },
         "manifest request from the cacher",
     )
@@ -523,18 +507,17 @@ async fn run_role_c_phase2(input: &CarryInput) -> Result<(), String> {
         input,
         &asker_npub,
         |msg| {
-            let trimmed = msg.content.trim();
-            if !trimmed.starts_with('{') {
-                return None;
-            }
-            let v: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-            if v.get("hb").and_then(|h| h.as_str()) != Some("manifest_request") {
-                return None;
-            }
-            let slug = v.get("slug")?.as_str()?.to_string();
-            let nonce = request_str_field(&v, "ask_nonce");
-            let author = request_str_field(&v, "author_npub");
-            Some((slug, nonce, author))
+            // Production's parser AND production's routing decision (QURATOR-183) — the harness
+            // must not decide for itself that this is a re-serve. `approval_body_for` is the same
+            // discriminator the auto-approve loop matches on, so if production ever stopped
+            // routing an author-bearing ask to the cached-manifest body, this row goes red instead
+            // of silently diverging from the code that ships.
+            let body = crate::auto_approve::ManifestRequestBody::parse(&msg.content)?;
+            let author = match crate::auto_approve::approval_body_for(&body) {
+                crate::auto_approve::ApprovalBody::CachedManifest { author } => Some(author),
+                crate::auto_approve::ApprovalBody::FullList => None,
+            };
+            Some((body.slug.clone(), body.ask_nonce.clone(), author))
         },
         "author-request from the asker",
     )
@@ -549,7 +532,12 @@ async fn run_role_c_phase2(input: &CarryInput) -> Result<(), String> {
     // an author-bearing ask too — third-party serving is background infrastructure, needing no
     // grant and no human. The harness's remaining deviation is only that it has no caps pacer.
     let Some(author_from_ask) = author_from_ask else {
-        return Err("the asker's request-DM carried no author_npub — not a Carrier-4 ask".to_string());
+        return Err(
+            "production's `approval_body_for` routed the asker's request-DM to the OWN-COLLECTION \
+             body, not the cached-manifest one — it is not a Carrier-4 ask (no `author_npub`), and \
+             re-serving it here would serve the wrong collection on a slug collision"
+                .to_string(),
+        );
     };
     if author_from_ask != author_npub {
         return Err(format!(
@@ -843,6 +831,50 @@ mod tests {
         let json = serde_json::to_string(&ordinary).expect("serialize ordinary ticket");
         assert!(!json.contains("author_npub"), "None must not serialize the field");
     }
+    /// The request-DM parse and the re-serve ROUTING DECISION must come from production, never
+    /// from a harness copy. This is the 4th instance of that defect class in this repo
+    /// (`sanitize_node_addr` 2026-08-27, `approve_request` 2026-09-01, QURATOR-169) — twice it
+    /// surfaced as a phantom PRODUCT defect, once as a phantom GREEN. A hand-rolled field read
+    /// also silently loses production's blank-string-to-`None` normalisation, which is the exact
+    /// thing that decides whether an ask counts as Carrier-4.
+    ///
+    /// MUTATION (P-10) — resolved by containing function, not by text: in `run_role_c_phase2`,
+    /// replace the `ManifestRequestBody::parse` + `approval_body_for` block with a hand-rolled
+    /// `serde_json::from_str` + `v.get("hb")` field read → the tag-literal assert and both
+    /// call-count asserts red. Comments are stripped first, so restating the rule in prose
+    /// cannot satisfy it.
+    #[test]
+    fn the_carry_suite_parses_and_routes_through_production_never_a_copy() {
+        // Production half only — the test half below quotes the very literals this scans for,
+        // the self-referential trap CLAUDE.md §9 records.
+        let src = include_str!("suite_wan_carry.rs");
+        let production = &src[..src.find("#[cfg(test)]").expect("test module must exist")];
+        let code: String = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !code.contains("\"manifest_request\""),
+            "the suite must not re-implement the request-DM tag check — that literal belongs to \
+             `ManifestRequestBody::parse`, and a copy of it covers the copy, not what ships"
+        );
+        assert_eq!(
+            code.matches("ManifestRequestBody::parse").count(),
+            2,
+            "both roles (A reading C's ask, C reading D's) must parse with production's parser"
+        );
+        // The CALL form specifically: this file's own refusal message names the symbol in prose,
+        // and prose is not a call. Counting the bare name would have this guard satisfy itself.
+        assert_eq!(
+            code.matches("approval_body_for(").count(),
+            1,
+            "C's re-serve must be reached BECAUSE production's discriminator said so — the harness \
+             does not get to decide for itself that an ask is a re-serve"
+        );
+    }
+
     /// C's cache MUST be populated by driving the production browse path, never by writing the
     /// cache directly. The shortcut (`manifest_cache::put`) is two lines, irresistible, and would
     /// make all four row assertions pass while proving nothing — including the negative in #3,

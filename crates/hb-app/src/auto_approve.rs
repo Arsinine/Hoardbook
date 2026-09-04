@@ -178,27 +178,37 @@ impl AutoApproveCaps {
 }
 
 /// A parsed `{"hb":"manifest_request",…}` DM body — the Rust counterpart of the TS
-/// `parseManifestRequest` (`request-inbox.ts`). Kept private to this module: production has
-/// exactly one consumer (this loop), and the wire shape is `wire_freeze`-pinned on the TS side.
+/// `parseManifestRequest` (`request-inbox.ts`). The wire shape is `wire_freeze`-pinned on the TS
+/// side, and production still has exactly one consumer: this loop.
+///
+/// **Shared `pub(crate)` with the WAN carry suite** (`wan_it/suite_wan_carry.rs`, QURATOR-183) —
+/// the type, [`Self::parse`], and the `slug`/`ask_nonce` fields. A harness that re-implements this
+/// parse covers its own copy, not the code that ships: that is the defect class behind
+/// `sanitize_node_addr` (2026-08-27), `approve_request` (2026-09-01) and QURATOR-169. The blank-to-
+/// `None` normalisation below is exactly what a hand-rolled field read gets wrong.
+///
+/// `author_npub` stays module-private on purpose: the harness reaches the author through
+/// [`approval_body_for`], so it routes by production's decision rather than by reading the field
+/// and deciding for itself.
 ///
 /// `author_npub` is `None` when the field is absent **or an empty string** — the same
 /// normalisation the TS parser performs (`typeof o.author_npub === 'string' && o.author_npub !== ''`),
 /// so "present but blank" can never masquerade as a real author pin and become a bogus grant-key
 /// author. `None` means "the asked peer's own collection", the one convention
 /// [`hb_core::TransportTicket::author_npub`] already gives `None`.
-struct ManifestRequestBody {
-    slug: String,
+pub(crate) struct ManifestRequestBody {
+    pub(crate) slug: String,
     #[allow(dead_code)] // parsed for wire-shape parity with the TS parser; this loop has no use
     fingerprint_seen: Option<String>,
-    ask_nonce: Option<String>,
+    pub(crate) ask_nonce: Option<String>,
     author_npub: Option<String>,
 }
 
 impl ManifestRequestBody {
     /// Parse one DM's content. `None` for an ordinary chat DM (any non-JSON / wrong-tag content),
     /// a non-object, a body missing its `hb` discriminator or its `slug` — the exact conditions
-    /// the TS parser rejects on.
-    fn parse(content: &str) -> Option<Self> {
+    /// the TS parser rejects on. `pub(crate)` so the WAN carry suite parses with THIS, not a copy.
+    pub(crate) fn parse(content: &str) -> Option<Self> {
         let trimmed = content.trim();
         if !trimmed.starts_with('{') {
             return None;
@@ -286,7 +296,7 @@ fn should_auto_approve(
 /// discriminator, extracted pure so the branch is testable without a relay. The loop's serve call
 /// matches on this value, and its tracing derives from it, so the routing and the attributable
 /// evidence can never drift apart.
-enum ApprovalBody {
+pub(crate) enum ApprovalBody {
     /// An author-bearing (Carrier-4 re-serve) ask: serve the cached copy pinned to that author via
     /// [`crate::commands::fulfil::send_cached_manifest_inner`]. NEVER the own-collection body —
     /// common slugs ("films", "music") collide constantly and the author is load-bearing in the key.
@@ -308,7 +318,7 @@ impl ApprovalBody {
 
 /// The one pure decision the serve branch consults: author-bearing ⇒ re-serve body, authorless ⇒
 /// own-collection body. Pinned by `author_bearing_asks_route_to_the_cached_manifest_body`.
-fn approval_body_for(body: &ManifestRequestBody) -> ApprovalBody {
+pub(crate) fn approval_body_for(body: &ManifestRequestBody) -> ApprovalBody {
     match body.author_npub.as_deref() {
         Some(author) => ApprovalBody::CachedManifest { author: author.to_string() },
         None => ApprovalBody::FullList,
