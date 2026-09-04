@@ -62,7 +62,7 @@ pub use priv_listing::{
     OpenedKeyGrant, OpenedPrivate, KIND_KEY_GRANT, KIND_PRIV_LISTING,
 };
 pub use ratelimit::{RelayRateLimiter, RELAY_WRITE_BURST, RELAY_WRITE_REFILL_PER_SEC};
-pub use ticket::{authorize_redemption, TransportTicket, TICKET_V};
+pub use ticket::{validate_redemption, TransportTicket, TICKET_V};
 pub use transport_payload::{
     ManifestPayload, MANIFEST_MAX_TRANSPORT_BYTES, MANIFEST_MAX_TRANSPORT_PARTS,
 };

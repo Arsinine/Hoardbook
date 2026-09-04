@@ -63,7 +63,7 @@ mod tests {
             // 2026-09-03) `REFUSAL_NO_MATCH` is UNREACHABLE from an honest client. Two facts
             // combine: `fetch_manifest` validates the ticket's shape client-side before dialling,
             // and it builds `FetchRequest { request_id: ticket.request_id.clone(), .. }` — so the
-            // request id always matches the ticket's. `authorize_redemption`'s two arms (shape,
+            // request id always matches the ticket's. `validate_redemption`'s two arms (shape,
             // request binding) therefore refuse nothing an honest client can send; that gate now
             // defends only against a hand-built hostile request. Two earlier rigs are gone with
             // the issued-ticket ledger (QURATOR-177 Option E, owner ruling 2026-09-03): the

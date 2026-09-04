@@ -44,7 +44,7 @@
 //! ## Authorization — the capability is the ticket, not the address
 //!
 //! There is no binding token here and the retired follower gate is **not** re-imported. The asker
-//! presents the [`TransportTicket`] it received; the owner's node runs [`authorize_redemption`] on
+//! presents the [`TransportTicket`] it received; the owner's node runs [`validate_redemption`] on
 //! it (shape + the request binding) and serves. A redeem-time contact standing check used to run
 //! here too, withdrawn by owner ruling 2026-09-03 (QURATOR-177): blocking gates chat/DM interaction
 //! only — and it was never read-access revocation, since a mutual contact may re-serve a cached
@@ -88,7 +88,7 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use hb_core::ticket::{authorize_redemption, TransportTicket, TICKET_TAG};
+use hb_core::ticket::{validate_redemption, TransportTicket, TICKET_TAG};
 use hb_core::{ManifestPayload, MANIFEST_MAX_TRANSPORT_BYTES};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -344,7 +344,7 @@ async fn drain_refusal(conn: &iroh::endpoint::Connection) {
 /// record (`source.issued`), compared the presented ticket against the stored one
 /// (`matches_issued`) and refused a spent one; all three steps are deleted with the ledger, and
 /// deliberately so, giving up durable replay protection and the audit trail. What remains is
-/// parsing, the request-binding check (`authorize_redemption`: shape + the ticket answers THIS
+/// parsing, the request-binding check (`validate_redemption`: shape + the ticket answers THIS
 /// request) — a correctness check, not authorization — the payload resolution, and the byte/slug
 /// binding.
 pub(crate) async fn serve_manifest_stream(
@@ -371,7 +371,7 @@ pub(crate) async fn serve_manifest_stream(
     // refused identically — the same constant — so a prober learns nothing about which requests
     // exist. (Until QURATOR-177 Option E this also refused a spent ticket; that arm is deleted
     // with the ledger.)
-    if authorize_redemption(&req.ticket, &req.request_id).is_err() {
+    if validate_redemption(&req.ticket, &req.request_id).is_err() {
         refuse(&mut send, REFUSAL_NO_MATCH).await?;
         return Ok(None);
     }
@@ -1235,7 +1235,7 @@ pub(crate) mod tests {
     /// not re-use it verbatim.)
     ///
     /// MUTATION (P-10) — the orchestrator applies this and must see this test red: in
-    /// `serve_manifest_stream` (this file), immediately after the `authorize_redemption` call,
+    /// `serve_manifest_stream` (this file), immediately after the `validate_redemption` call,
     /// insert any refusal, e.g.
     ///   if source_blocking_hint(&req.ticket) { refuse(&mut send, "no longer an approved contact").await?; return Ok(None); }
     /// where `source_blocking_hint` is a new `fn(&TransportTicket) -> bool { true }` in this file —
@@ -1329,7 +1329,7 @@ pub(crate) mod tests {
     // binding, with different messages, and that is inherent to Option E: the ticket is a bearer
     // capability, and the payload it buys is browse-key sealed ciphertext. The surviving
     // same-refusal pin (malformed vs wrong-request-binding, both `REFUSAL_NO_MATCH`) lives in
-    // hb-core's `authorize_redemption` tests (`ticket.rs`,
+    // hb-core's `validate_redemption` tests (`ticket.rs`,
     // `a_ticket_is_bound_to_its_own_request`).
 
 
@@ -1886,12 +1886,12 @@ pub(crate) mod tests {
         .expect("test timed out");
     }
 
-    /// **QURATOR-180 — the request-binding arm of `authorize_redemption`, answered as a HOSTILE
+    /// **QURATOR-180 — the request-binding arm of `validate_redemption`, answered as a HOSTILE
     /// client.**
     ///
     /// `fetch_manifest` always builds `FetchRequest { request_id: ticket.request_id.clone(), .. }`,
     /// so an honest client can never make the outer `request_id` disagree with the ticket it is
-    /// presenting — the binding check inside `authorize_redemption` (crates/hb-core/src/ticket.rs)
+    /// presenting — the binding check inside `validate_redemption` (crates/hb-core/src/ticket.rs)
     /// is unreachable from that path, which is why `a_refused_connection_releases_its_claim_...`
     /// above forges the *ticket* (its `.slug`) but leaves `request_id` matching: that test cannot
     /// reach this arm either. This test writes the wire frame by hand instead — the shape a prober
@@ -1900,10 +1900,10 @@ pub(crate) mod tests {
     /// `a_failed_payload_write_fails_the_redemption_and_a_retry_succeeds` above for the same
     /// Cursor/`Vec<u8>` pattern).
     ///
-    /// MUTATION (P-10, orchestrator applies and must see this red): in `authorize_redemption`
+    /// MUTATION (P-10, orchestrator applies and must see this red): in `validate_redemption`
     /// (crates/hb-core/src/ticket.rs), delete the
     /// `if ticket.request_id != for_request_id { return Err(HbError::InvalidTicket(...)); }` arm —
-    /// the mismatched request then sails through `authorize_redemption`, and `TestSource::payload`
+    /// the mismatched request then sails through `validate_redemption`, and `TestSource::payload`
     /// (which checks the TICKET's own `request_id`, unchanged and still matching) serves it; this
     /// test's `served.is_none()` assertion reds.
     #[tokio::test]
@@ -1945,13 +1945,13 @@ pub(crate) mod tests {
     ///
     /// A structurally invalid ticket (blank `slug`, mirroring hb-core's
     /// `malformed_and_unknown_version_tickets_are_refused`) fails `TransportTicket::verify_shape`
-    /// inside `authorize_redemption`, before the request-id comparison is even reached.
+    /// inside `validate_redemption`, before the request-id comparison is even reached.
     /// `issue_ticket` itself refuses to mint this shape (it calls `verify_shape` before returning),
     /// so the ticket is broken by hand after issuance. The outer `request_id` is left matching the
     /// ticket's own so this test cannot accidentally be satisfied by the binding arm above — it is
     /// isolated to the shape check.
     ///
-    /// MUTATION (P-10, orchestrator applies and must see this red): in `authorize_redemption`
+    /// MUTATION (P-10, orchestrator applies and must see this red): in `validate_redemption`
     /// (crates/hb-core/src/ticket.rs), delete the leading `ticket.verify_shape()?;` line — the
     /// blank slug then sails past authorization into `source.payload`/the slug-binding check below
     /// it in `serve_manifest_stream`, which refuses for a DIFFERENT reason (the declared slug not
@@ -1989,14 +1989,14 @@ pub(crate) mod tests {
 
     /// **QURATOR-180 — the anti-probing invariant: the two refusal arms are byte-identical on the
     /// wire.** `REFUSAL_NO_MATCH` is deliberately the SAME string for a malformed ticket and a
-    /// wrong-request ticket (see the comment at `authorize_redemption`'s call site in
+    /// wrong-request ticket (see the comment at `validate_redemption`'s call site in
     /// `serve_manifest_stream`) so a prober cannot distinguish "no such ticket" from "wrong ticket
     /// for this request". This test drives both hostile shapes from the two tests above and
     /// compares the raw response bytes — status byte, length prefix, and message — not just the
     /// message string, so it also pins that neither arm pads or truncates differently.
     ///
     /// MUTATION (P-10, orchestrator applies and must see this red): give the shape-check and the
-    /// request-binding check inside `authorize_redemption` distinct refusal strings at their call
+    /// request-binding check inside `validate_redemption` distinct refusal strings at their call
     /// site in `serve_manifest_stream` (e.g. `refuse(&mut send, "no such ticket").await?` for one
     /// arm only, leaving the other on `REFUSAL_NO_MATCH`) — this test's `assert_eq!` on the two
     /// response byte vectors reds, even though each half still redeems correctly as "refused".

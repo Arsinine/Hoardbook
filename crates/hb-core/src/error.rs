@@ -96,11 +96,11 @@ pub enum HbError {
 
     // TicketAlreadyRedeemed — deleted 2026-09-03, QURATOR-177 Option E (owner ruling:
     // authorization is at ASK time via the standing grant; the ticket is address delivery). Its
-    // only raiser was `authorize_redemption`'s `already_consumed` arm, fed by hb-app's
+    // only raiser was `validate_redemption`'s `already_consumed` arm, fed by hb-app's
     // issued-ticket ledger — both deleted in the same change. Durable replay protection and the
     // audit trail were deliberately given up.
 
     // TicketRedeemerNotInGoodStanding — deleted 2026-09-03, QURATOR-177 (owner ruling: blocking
-    // gates chat/DM interaction only). Its only raiser was `authorize_redemption`'s redeem-time
+    // gates chat/DM interaction only). Its only raiser was `validate_redemption`'s redeem-time
     // standing arm, removed in the same change.
 }

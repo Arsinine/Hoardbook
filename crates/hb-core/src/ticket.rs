@@ -55,7 +55,7 @@
 //!
 //! **Redeem-time contact standing is WITHDRAWN** (owner ruling 2026-09-03, QURATOR-177: *"Blocks
 //! should only block interaction i.e. chats, it should not meaningfully affect other traffic."*).
-//! From 2026-07-30 until that ruling [`authorize_redemption`] re-read the redeemer's live standing
+//! From 2026-07-30 until that ruling [`validate_redemption`] re-read the redeemer's live standing
 //! and refused Blocked/Declined/Unknown, described then as "revocability" — a misnomer the ruling
 //! retired: blocking was never read-access revocation (a mutual contact may re-serve its cached
 //! copy, Carrier 4; a public browse key is a forwardable string), and it now gates chat/DM
@@ -87,7 +87,7 @@ pub const TICKET_V: u8 = 1;
 pub const TICKET_TAG: &str = "transport_ticket";
 
 // `ContactStanding` (Good/Blocked/Declined/Unknown) was deleted 2026-09-03, QURATOR-177: its only
-// consumer was `authorize_redemption`'s redeem-time standing arm, withdrawn by the owner ruling
+// consumer was `validate_redemption`'s redeem-time standing arm, withdrawn by the owner ruling
 // that blocking gates chat/DM interaction only. Chat's acceptance gate reads `dm_blocked`
 // directly (`commands/chat.rs`, `route_dm`) and never used this vocabulary.
 
@@ -236,10 +236,17 @@ impl TransportTicket {
 /// refused a replay with `HbError::TicketAlreadyRedeemed`; the durable spent bit that fed it lived
 /// in hb-app's issued-ticket ledger, which the same ruling deletes. Its removal is a ruling, not
 /// an oversight: cross-restart replay protection and the audit trail were deliberately given up,
-/// because authorization belongs at ASK time (the standing grant, established under the NIP-17
-/// seal) and repeat traffic is prevented by the asker-side trigger condition, never by a
-/// serve-side refusal. Do not re-add a consumed/spent/replay input here.
-pub fn authorize_redemption(
+/// and repeat traffic is prevented by the asker-side trigger condition, never by a serve-side
+/// refusal. Do not re-add a consumed/spent/replay input here.
+///
+/// ⚠ **This function performs NO AUTHORIZATION, and its old name (`validate_redemption`) said
+/// otherwise for months.** It checks two things, both pure validation: the ticket is well-formed,
+/// and it is the ticket for THIS request. There is no permission lookup, because there is nothing
+/// to look up — QURATOR-164 (2026-09-04) deleted approvals entirely on the grounds that public
+/// collections need none, and this doc previously claimed "authorization belongs at ASK time (the
+/// standing grant)", which became false the moment the grant map was deleted. CLAUDE.md records
+/// that this misnomer already misled a whole design pass; the rename is the fix.
+pub fn validate_redemption(
     ticket: &TransportTicket,
     for_request_id: &str,
 ) -> Result<(), HbError> {
@@ -261,7 +268,7 @@ mod tests {
 
     #[test]
     fn a_valid_ticket_for_this_request_is_authorized() {
-        authorize_redemption(&ticket(), "req-1").unwrap();
+        validate_redemption(&ticket(), "req-1").unwrap();
     }
 
     /// **The nonce is what makes an approval answer ONE ask** (owner ruling ① 2026-07-31). It
@@ -379,10 +386,10 @@ mod tests {
     /// redeemable when they return, however long that took.
     #[test]
     fn an_approval_given_while_the_asker_was_offline_is_still_redeemable() {
-        // Issued a year ago. There is no clock argument to `authorize_redemption` at all, so this
+        // Issued a year ago. There is no clock argument to `validate_redemption` at all, so this
         // cannot depend on elapsed time — which is the point.
         let ancient = TransportTicket::issue("req-1", "my-slug", "node-addr-opaque", 1, None);
-        authorize_redemption(&ancient, "req-1")
+        validate_redemption(&ancient, "req-1")
             .expect("a ticket is valid until redeemed, never expired");
     }
 
@@ -425,7 +432,7 @@ mod tests {
     /// `ask_nonce` remain the anti-forgery binding (a peer must not make our client dial an address
     /// of their choosing "for" a request we never made), so this stays exactly as pinned.
     ///
-    /// MUTATION (P-10, orchestrator applies and must see this red): in `authorize_redemption`
+    /// MUTATION (P-10, orchestrator applies and must see this red): in `validate_redemption`
     /// (crates/hb-core/src/ticket.rs), delete the
     /// `if ticket.request_id != for_request_id { return Err(HbError::InvalidTicket(...)); }` arm —
     /// this test reds on the `matches!(Err(HbError::InvalidTicket(_)))` assertion while still
@@ -435,7 +442,7 @@ mod tests {
         let t = ticket();
         assert!(
             matches!(
-                authorize_redemption(&t, "req-2"),
+                validate_redemption(&t, "req-2"),
                 Err(HbError::InvalidTicket(_))
             ),
             "a ticket issued for req-1 must not redeem req-2"

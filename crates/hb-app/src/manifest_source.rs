@@ -310,7 +310,7 @@ mod tests {
     // standing could influence. The plane-level replacement pin (any re-introduced gate on the
     // serve path reds the fetch) is `transport.rs`'s
     // `a_blocked_redeemer_with_a_valid_ticket_is_still_served`, whose MUTATION names inserting a
-    // refusal after `authorize_redemption` in `serve_manifest_stream`.
+    // refusal after `validate_redemption` in `serve_manifest_stream`.
 
 
     // `no_issued_ticket_record_is_ever_evicted` — DELETED 2026-09-03, QURATOR-177 Option E: the
