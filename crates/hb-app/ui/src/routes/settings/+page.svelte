@@ -29,6 +29,7 @@
 		snapshot_auto_update: true, snapshot_reconcile_poll: false, show_online_count: true,
 		discoverable: false,
 		big_relay_url: '',
+		swarm_caching: false, serving_notice_acknowledged: false,
 	});
 
 	// ── 3-key identity view ───────────────────────────────────────────────────────
@@ -557,6 +558,20 @@
 		}
 	}
 
+	// QURATOR-164: the one opt-in switch (discovery auto-fetch + relay-caching together). Same
+	// flip-and-persist shape as the others — no side effects yet, the behaviour is a later build
+	// item that reads this flag.
+	async function toggleSwarmCaching() {
+		// QURATOR-93 twin (M1): see toggleAllowDms.
+		if (!settingsLoaded) return;
+		settings = { ...settings, swarm_caching: !settings.swarm_caching };
+		try {
+			await saveSettings(fullSettings());
+		} catch (e) {
+			toast(String(e), 'error');
+		}
+	}
+
 	// devtest #5: the discoverability opt-out. Flip + persist like the other toggles, then — only if
 	// a teaser is already published — republish it so the change (add/drop hashtags) takes effect
 	// immediately instead of waiting for the next unrelated publish.
@@ -917,6 +932,21 @@
 				</div>
 			</div>
 			<button class="toggle" class:toggle-on={settings.discoverable} onclick={toggleDiscoverable} disabled={!settingsLoaded} aria-label="Show up in Discover Hoarders">
+				<span class="toggle-thumb"></span>
+			</button>
+		</div>
+
+		<div class="toggle-row">
+			<div class="toggle-text">
+				<div class="toggle-label">Fetch new collections automatically</div>
+				<div class="toggle-sub">
+					When someone new shows up in Discover, fetch every public collection they've published,
+					and keep copies of collections you've passed along to other people. This is one
+					switch for both. It works both ways: you'll hold a lot more, and other people will
+					request collections from you too. Off means you fetch only what you ask for.
+				</div>
+			</div>
+			<button class="toggle" class:toggle-on={settings.swarm_caching} onclick={toggleSwarmCaching} disabled={!settingsLoaded} aria-label="Fetch new collections automatically">
 				<span class="toggle-thumb"></span>
 			</button>
 		</div>

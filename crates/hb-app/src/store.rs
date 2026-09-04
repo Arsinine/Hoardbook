@@ -71,6 +71,21 @@ pub struct Settings {
     /// no migration.
     #[serde(default)]
     pub big_relay_url: String,
+    /// QURATOR-164 — the ONE opt-in switch for the swarm-caching tier. Covers two things at once
+    /// (owner ruling 2026-09-04, "relay-caching is the same switch"): discovery-triggered
+    /// auto-fetch of every public collection of a newly-surfaced peer, AND relay-caching
+    /// (retaining data that passed through this node to a recipient). Opting in means holding far
+    /// more and therefore being asked far more — the Settings copy must say so plainly. This is
+    /// the switch tier only; the always-on baseline (serving what this node itself browsed) has
+    /// NO switch. **Default false**: a pre-existing `settings.json` with no such key loads as
+    /// `false` (bool serde default) — the intended silent opt-out, no migration.
+    #[serde(default)]
+    pub swarm_caching: bool,
+    /// QURATOR-164 — the one-time baseline startup notice ("you pass along collections you have
+    /// browsed, in the background") has been shown. A notice, NOT consent: there is no decline,
+    /// and nothing is gated by it — shown iff this is false; acknowledging persists it.
+    #[serde(default)]
+    pub serving_notice_acknowledged: bool,
 }
 
 impl Default for Settings {
@@ -85,6 +100,8 @@ impl Default for Settings {
             show_online_count: true,
             discoverable: false,
             big_relay_url: String::new(),
+            swarm_caching: false,
+            serving_notice_acknowledged: false,
         }
     }
 }
@@ -1799,6 +1816,17 @@ pub(crate) mod tests {
         // M16 W3: a pre-M16 file with no `big_relay_url` loads empty — the full-manifest feature is
         // off until the owner configures a big relay.
         assert_eq!(s.big_relay_url, "", "big_relay_url defaults empty (feature off) on an old file");
+        // QURATOR-164: a pre-QURATOR-164 file with neither new key loads both as false — the
+        // switch tier off, and the baseline startup notice still owed.
+        // MUTATION (P-10): on the `pub swarm_caching: bool,` field in the `Settings` struct
+        // above, change `#[serde(default)]` to `#[serde(default = "default_true")]` — this
+        // assert reds (an old file would then load the switch as ON, silently opting every
+        // existing user into the heavier tier).
+        assert!(!s.swarm_caching, "swarm_caching defaults OFF on an old file (opt-in only)");
+        assert!(
+            !s.serving_notice_acknowledged,
+            "serving_notice_acknowledged defaults OFF on an old file (notice still owed)"
+        );
     }
 
     #[test]
@@ -1816,6 +1844,8 @@ pub(crate) mod tests {
             show_online_count: false,
             discoverable: true,
             big_relay_url: "ws://big.example:7777".into(),
+            swarm_caching: true,
+            serving_notice_acknowledged: true,
         };
         store.save_settings(&s).unwrap();
         let r = store.load_settings().unwrap().unwrap();
@@ -1828,6 +1858,11 @@ pub(crate) mod tests {
         assert!(!r.show_online_count, "online-count toggle preserved");
         assert!(r.discoverable, "discoverable toggle preserved");
         assert_eq!(r.big_relay_url, "ws://big.example:7777", "big_relay_url preserved");
+        // MUTATION (P-10): on the `pub swarm_caching: bool,` field in the `Settings` struct
+        // above, change `#[serde(default)]` to `#[serde(skip_serializing)]` — this assert reds
+        // (the save would drop the field, and the reload would read the `false` default).
+        assert!(r.swarm_caching, "swarm_caching preserved");
+        assert!(r.serving_notice_acknowledged, "serving_notice_acknowledged preserved");
     }
 
     #[test]

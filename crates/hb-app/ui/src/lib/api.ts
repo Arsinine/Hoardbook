@@ -234,6 +234,13 @@ export interface Settings {
 	 *  so a browser with the share code can fetch the rest. **Empty = off** (only the preview teaser
 	 *  is published — today's behaviour). */
 	big_relay_url: string;
+	/** QURATOR-164: the ONE opt-in switch — discovery auto-fetch AND relay-caching together.
+	 *  Default **false**. Opting in means you hold far more, so people will request from you as
+	 *  well. The baseline (serving what you yourself browsed) has no switch. */
+	swarm_caching: boolean;
+	/** QURATOR-164: the one-time baseline startup notice ("you pass along collections you have
+	 *  browsed, in the background") has been shown. A notice, not consent — nothing is gated. */
+	serving_notice_acknowledged: boolean;
 }
 
 export const getSettings = () => invoke<Settings>('get_settings');
