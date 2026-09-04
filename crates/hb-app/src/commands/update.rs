@@ -75,12 +75,28 @@ pub async fn apply_staged_update(
     app: tauri::AppHandle,
     staged: State<'_, SharedStagedUpdate>,
 ) -> CmdResult<()> {
-    let inner = staged.lock().unwrap().inner.take();
-    let Some((update, bytes)) = inner else {
-        return Err("No update is staged.".into());
-    };
+    let (update, bytes) = take_staged_update(&staged)?;
     update.install(&bytes).map_err(cmd_err)?;
     app.restart();
+}
+
+/// The guard of [`apply_staged_update`]: atomically take the staged update, or refuse with the
+/// user-visible message if nothing is staged. Extracted (QURATOR-182, 2026-09-04) after the
+/// `portable_update.rs` precedent (`fb84b993`) so the refusal path is unit-drivable without an
+/// `AppHandle`. ⚠ The 2026-08-31 note below is a prior session's engineering reasoning, NOT an
+/// owner ruling — the 2026-08-31 owner rulings do not mention this command. It declined this arm
+/// on ONE stated cost: "a signature change on the path that ships binaries to users". This
+/// extraction pays no such cost — the command's signature is unchanged and the helper is private.
+/// Behaviour-preserving: the condition (`inner.take()` yields `None`) and the refusal message are
+/// byte-identical to the inline `let-else` that stood in the command. The install/relaunch tail
+/// stays in the command — that half is the I/O boundary and is never driven from a test.
+fn take_staged_update(staged: &SharedStagedUpdate) -> Result<(Update, Vec<u8>), String> {
+    staged
+        .lock()
+        .unwrap()
+        .inner
+        .take()
+        .ok_or_else(|| "No update is staged.".into())
 }
 
 /// Deferred Obsidian apply, called from the app's `ExitRequested` hook: if an update is staged,
@@ -133,15 +149,14 @@ pub async fn take_update_notice<R: tauri::Runtime>(
 //                            refuses before any branch can be taken, and `tauri_plugin_updater::Update`
 //                            has no public constructor, so a real one cannot be supplied either.
 //
-//   apply_staged_update   -- reachable, but the test would be near-vacuous, so it is deliberately
-//                            NOT written. Its guard is `let Some((update, bytes)) = inner else
-//                            { return Err(..) }` -- the refusal and the value binding are the SAME
-//                            statement. `update.install(&bytes)` cannot be reached without both
-//                            values being bound, which happens only on the `Some` arm, so the
-//                            compiler already enforces the ordering a placement test would assert.
-//                            The one regression it would catch is someone rewriting it as
-//                            `inner.unwrap()`, which does not justify a signature change on the
-//                            path that ships binaries to users.
+//   apply_staged_update   -- REVISED 2026-09-04 (QURATOR-182): the refusal arm IS now tested.
+//                            ⚠ The note above is a prior SESSION's reasoning, not an owner ruling.
+//                            It declined the arm on one stated cost, a signature change on the
+//                            shipping path; that cost is not paid here. The
+//                            `take_staged_update` extraction (same seam shape `fb84b993` gave
+//                            `apply_portable_update_inner`) removed that cost. The install/relaunch
+//                            tail stays in the command and remains untested -- it needs a real
+//                            `Update`, which has no public constructor.
 //
 //   take_update_notice    -- the one with real, uncovered risk, and the only one made generic over
 //                            `R: Runtime` (Tauri's documented mechanism for mock-runtime testing;
@@ -209,6 +224,80 @@ mod command_guards {
         assert!(
             second.is_none(),
             "the second call must go quiet -- this is the once-only guarantee"
+        );
+    }
+
+    /// A fresh install (empty `last_seen_version`) shows NO "now running" notice --
+    /// `version_changed` treats an empty `last_seen` as "nothing to have updated *from*" -- and
+    /// still performs the first-write normalization: `last_seen_version` becomes the running
+    /// version, so the next launch after a real upgrade compares against a genuine prior version.
+    /// Without the write, a brand-new install that later upgrades would compare `""` vs the new
+    /// version forever.
+    ///
+    /// MUTATION (reds this test): in `take_update_notice`, replace the line
+    /// `let show = crate::update_logic::should_show_update_notice(&settings.last_seen_version, &current);`
+    /// with `let show = settings.last_seen_version != current;` (inlining the comparison and
+    /// dropping the empty-`last_seen` guard). The fresh install then reports a notice it must not
+    /// show. Only THIS test reds -- the once-only test above seeds a non-empty prior version, so
+    /// both its calls behave identically under the mutation. (Deleting the
+    /// `store.save_settings(&settings)` call also reds this test, via the persisted-version assert;
+    /// that edit reds the once-only test too. The `should_show_update_notice` call line occurs
+    /// exactly once in this file, in `take_update_notice`.)
+    #[tokio::test]
+    async fn fresh_install_shows_no_notice_but_normalizes_last_seen() {
+        let app = tauri::test::mock_app();
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        // Seed a settings file whose `last_seen_version` is the `""` default -- the fresh-install
+        // state as the command sees it -- with an unroutable relay pinned (test-hazard rule).
+        store
+            .save_settings(&crate::store::Settings {
+                relay_urls: vec!["ws://127.0.0.1:9".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        app.manage(store);
+
+        let current = app.package_info().version.to_string();
+
+        let notice = take_update_notice(app.handle().clone(), app.state::<DataStore>())
+            .await
+            .unwrap();
+        assert!(
+            notice.is_none(),
+            "a first-ever launch is not an update -- no 'now running vX.Y' notice"
+        );
+
+        let persisted = app
+            .state::<DataStore>()
+            .load_settings()
+            .unwrap()
+            .unwrap()
+            .last_seen_version;
+        assert_eq!(
+            persisted, current,
+            "the first write must normalize last_seen to the running version"
+        );
+    }
+
+    /// The apply command's guard, via the extracted `take_staged_update` seam (the `fb84b993`
+    /// shape given `apply_portable_update_inner`): with nothing staged, applying REFUSES with the
+    /// user-visible message instead of proceeding toward install/relaunch. The command's Ok arm
+    /// needs a real `Update` (no public constructor), so the refusal is pinned at the guard. The
+    /// regression the 2026-08-31 note feared -- someone rewriting the take as `inner.unwrap()` --
+    /// is caught here as a panic (red), not as a silent install.
+    ///
+    /// MUTATION (reds this test): in `take_staged_update`, edit the refusal message string
+    /// `"No update is staged."` in any way (e.g. drop the trailing period). The string's only
+    /// PRODUCTION occurrence is inside `take_staged_update`; the only other occurrences in this
+    /// file are this test's own expected value and this comment block.
+    #[test]
+    fn applying_with_nothing_staged_refuses_with_the_no_update_staged_message() {
+        let staged: SharedStagedUpdate = Default::default();
+        assert_eq!(
+            take_staged_update(&staged).err(),
+            Some("No update is staged.".to_string()),
+            "an empty stage must refuse, never fall through toward install"
         );
     }
 }
