@@ -2188,4 +2188,245 @@ mod tests {
             assert_eq!(loaded.petname.as_deref(), Some("MatchedPeer"));
         }
     }
+
+    // ── Command-dispatch coverage (QURATOR-182) — the four browse commands that had no test ────
+    // driving them through their real `#[tauri::command]` signatures: get_contacts,
+    // unfollow_contact, discover_observed_tags, search_peers.
+    //
+    // Hermeticity, per command (ticket premises re-checked against source):
+    //   • get_contacts / unfollow_contact / discover_observed_tags are STORE-ONLY — no identity,
+    //     no relay — so they run to completion offline.
+    //   • discover_observed_tags does NOT publish (the ticket said it did): its body is
+    //     `load_profile_draft` + `list_contacts` — pure over the local cache, per its own doc.
+    //   • search_peers IS relay-bound on its pass path (`net::client` → `search_teasers_capped`'s
+    //     `client.fetch` has no seam short of a production change), so only its GUARDS are driven
+    //     here: both refusals fire before any relay I/O, and the pass-side probe pins that a valid
+    //     search clears both guards and dies at the connect to the pinned dead relay — the shape
+    //     `paste_key_command_guards` (QURATOR-161 slice 2) already established in this file.
+    //     Nothing here can reach the internet: every store pins ws://127.0.0.1:9.
+    mod command_dispatch {
+        use super::*;
+        use super::super::{discover_observed_tags, get_contacts, search_peers, unfollow_contact};
+        use crate::identity_state::AppIdentity;
+        use tauri::Manager;
+
+        fn dispatch_app(identity_loaded: bool) -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            // RELAY HAZARD: an empty configured relay set falls back to the real public
+            // DEFAULT_RELAYS (net::relay_urls). Only search_peers' dead-relay probe reaches relay
+            // I/O, but every store pins the unroutable relay anyway so nothing here can ever
+            // touch the internet.
+            store
+                .save_settings(&crate::store::Settings {
+                    relay_urls: vec!["ws://127.0.0.1:9".into()],
+                    ..Default::default()
+                })
+                .unwrap();
+            let identity: SharedIdentity = std::sync::Arc::new(tokio::sync::RwLock::new(
+                identity_loaded.then(AppIdentity::generate),
+            ));
+            app.manage(identity);
+            app.manage(store);
+            app.manage(net::new_shared());
+            app
+        }
+
+        fn seed_contact(app: &tauri::App<tauri::test::MockRuntime>, npub: &str, petname: &str) {
+            app.state::<DataStore>()
+                .save_contact(&CachedPeer::pubkey_hash(npub), &stub_peer(npub, Some(petname)))
+                .unwrap();
+        }
+
+        fn profile_with_tags(tags: &[&str]) -> hb_core::types::Profile {
+            hb_core::types::Profile {
+                display_name: "Tagged".into(),
+                bio: None,
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+                since: None,
+                est_size: None,
+                languages: vec![],
+                contact_hint: None,
+                email: None,
+                location: None,
+                social_links: vec![],
+                willing_to: vec![],
+                content_types: vec![],
+                picture: None,
+                updated: chrono::Utc::now(),
+            }
+        }
+
+        /// P-10: in `get_contacts`, replace the body expression `store.list_contacts().map_err(cmd_err)`
+        /// with `Ok(Vec::new())` — the "both seeded contacts come back" assert must go red.
+        /// (Locating the line: it is the ONLY bare `store.list_contacts().map_err(cmd_err)` in
+        /// this file — the lookalikes inside `search_peers`/`discover_observed_tags` continue
+        /// with `.into_iter()` or sit inside a `for` header.)
+        #[tokio::test]
+        async fn get_contacts_command_round_trips_seeded_contacts_from_the_managed_store() {
+            let app = dispatch_app(false);
+
+            // An empty store lists empty — an Ok vec, never an error.
+            let empty = get_contacts(app.state::<DataStore>()).await.unwrap();
+            assert!(empty.is_empty(), "a store with no contacts dir lists empty");
+
+            // list_contacts iterates read_dir (OS order, deliberately unsorted) — assert on a
+            // sorted projection, never positional order.
+            seed_contact(&app, "npub1alpha", "Alpha");
+            seed_contact(&app, "npub1beta", "Beta");
+            let mut listed = get_contacts(app.state::<DataStore>()).await.unwrap();
+            listed.sort_by(|a, b| a.npub.cmp(&b.npub));
+            assert_eq!(listed.len(), 2, "both seeded contacts come back through the command");
+            assert_eq!(listed[0].npub, "npub1alpha");
+            assert_eq!(listed[0].petname.as_deref(), Some("Alpha"), "petname round-trips");
+            assert_eq!(listed[1].npub, "npub1beta");
+            assert_eq!(listed[1].petname.as_deref(), Some("Beta"));
+        }
+
+        /// P-10: in `unfollow_contact`, replace the body
+        /// `store.delete_contact(&CachedPeer::pubkey_hash(&npub)).map_err(cmd_err)`
+        /// (the file's ONLY `store.delete_contact` call site) with `Ok(())` — the
+        /// "the named contact is deleted" assert must go red.
+        #[tokio::test]
+        async fn unfollow_contact_command_deletes_only_the_named_contact() {
+            let app = dispatch_app(false);
+            seed_contact(&app, "npub1victim", "Victim");
+            seed_contact(&app, "npub1keeper", "Keeper");
+
+            unfollow_contact("npub1victim".into(), app.state::<DataStore>())
+                .await
+                .unwrap();
+
+            assert!(
+                app.state::<DataStore>()
+                    .load_contact(&CachedPeer::pubkey_hash("npub1victim"))
+                    .unwrap()
+                    .is_none(),
+                "the named contact is deleted"
+            );
+            assert!(
+                app.state::<DataStore>()
+                    .load_contact(&CachedPeer::pubkey_hash("npub1keeper"))
+                    .unwrap()
+                    .is_some(),
+                "a different contact survives the unfollow"
+            );
+
+            // The other half: unfollowing an unknown npub is a no-op Ok, not an error
+            // (delete_contact ignores a missing file), and drops nobody.
+            unfollow_contact("npub1never_existed".into(), app.state::<DataStore>())
+                .await
+                .unwrap();
+            assert_eq!(
+                app.state::<DataStore>().list_contacts().unwrap().len(),
+                1,
+                "an unknown-npub unfollow neither errors nor drops anyone"
+            );
+        }
+
+        /// P-10: in `discover_observed_tags`, inside the PROFILE-DRAFT loop (the FIRST of the two
+        /// `let t = tag.trim().to_lowercase();` lines — the other sits in the contacts loop),
+        /// replace it with `let t = tag.clone();` — the normalized/sorted/deduped assert must go
+        /// red, because the draft's "  Anime  " and "RAWGALLERY" would land verbatim.
+        #[tokio::test]
+        async fn discover_observed_tags_command_merges_and_normalizes_draft_and_contact_tags() {
+            let app = dispatch_app(false);
+            app.state::<DataStore>()
+                .save_profile_draft(&profile_with_tags(&["  Anime  ", "anime", "RAWGALLERY"]))
+                .unwrap();
+            let mut tagged = stub_peer("npub1tagged", None);
+            tagged.profile = Some(profile_with_tags(&[" Manga ", "", "manga"]));
+            let bare = stub_peer("npub1bare", None); // profile: None — tolerated, not an error
+            let store = app.state::<DataStore>();
+            store.save_contact(&CachedPeer::pubkey_hash("npub1tagged"), &tagged).unwrap();
+            store.save_contact(&CachedPeer::pubkey_hash("npub1bare"), &bare).unwrap();
+
+            let tags = discover_observed_tags(app.state::<DataStore>()).await.unwrap();
+            assert_eq!(
+                tags,
+                vec!["anime".to_string(), "manga".to_string(), "rawgallery".to_string()],
+                "draft + contact tags merge, lowercased, trimmed, deduped, sorted; empty drops"
+            );
+        }
+
+        /// P-10: in `normalize_search_filters`, replace the
+        /// `return Err("Enter at least one tag or content type to search.".into());` (inside the
+        /// `if tags.is_empty() && content_types.is_empty()` guard — the only such `if` in the
+        /// file) with `return Ok((vec!["mutant".into()], vec![]));` — this call would then clear
+        /// the filter gate and die at the identity gate with a DIFFERENT message, and the
+        /// assert_eq must go red.
+        #[tokio::test]
+        async fn search_peers_command_refuses_an_empty_filter_before_the_identity_gate() {
+            // Identity deliberately NOT loaded: the filter refusal must still be the error that
+            // comes back — pinning that the filter guard precedes the identity guard.
+            let app = dispatch_app(false);
+            for (tags, cts) in
+                [(vec!["".to_string()], vec!["  ".to_string()]), (vec![], vec![])]
+            {
+                let err = search_peers(
+                    tags,
+                    cts,
+                    app.state::<SharedIdentity>(),
+                    app.state::<DataStore>(),
+                    app.state::<SharedRelay>(),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    err,
+                    "Enter at least one tag or content type to search.",
+                    "whitespace-only counts as empty, and the filter gate fires first"
+                );
+            }
+        }
+
+        /// P-10: in `fn identity_clone`, change the error string on the
+        /// `.ok_or_else(|| "No identity loaded. Generate a keypair first.".to_string())` line
+        /// (the real one lives in `identity_clone`; the two other occurrences of that text in
+        /// this file are test literals/comments) to `"mutant".to_string()` — the assert_eq must
+        /// go red.
+        #[tokio::test]
+        async fn search_peers_command_requires_a_loaded_identity_before_any_relay_work() {
+            // Valid filters + no identity + dead-relay store: the identity refusal must be the
+            // error that comes back, proving the gate fires before `net::client` ever connects.
+            let app = dispatch_app(false);
+            let err = search_peers(
+                vec!["anime".into()],
+                vec![],
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err, "No identity loaded. Generate a keypair first.");
+        }
+
+        /// P-10: in `search_peers`, insert
+        /// `return Ok(PeerSearchResult { hits: vec![], capped: false });` immediately after the
+        /// `let me = identity_clone(&identity).await?;` line — the command would then succeed
+        /// without ever reaching `net::client`, and the `unwrap_err` must go red.
+        #[tokio::test]
+        async fn search_peers_command_carries_valid_filters_into_the_relay_connect() {
+            // Identity loaded + a real filter: both guards clear, and the command proceeds into
+            // `net::client`, which fails at the connect to the pinned dead relay — never at a
+            // guard. The pass-side discriminator (QURATOR-161 slice 2's shape): a guard made
+            // accidentally stricter turns this into a refusal error and redden the contains.
+            let app = dispatch_app(true);
+            let err = search_peers(
+                vec!["anime".into()],
+                vec![],
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.contains("Could not connect to any relay"),
+                "a valid search must clear both guards and reach the relay connect, got {err}"
+            );
+        }
+    }
 }
