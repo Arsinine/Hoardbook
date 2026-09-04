@@ -138,7 +138,7 @@ fn build_system_tray(app: &mut tauri::App) -> tauri::Result<()> {
 ///
 /// **Binding happens in three places, not one** — an earlier version of this comment named only the
 /// first and was therefore misleading about when a QUIC endpoint and its accept loop come up:
-///   1. `transport_state::rebind_if_tickets_outstanding` at startup, when a standing grant is on
+///   1. `transport_state::rebind_if_tickets_outstanding` at startup, when servable content is on
 ///      the books (a ticket outlives the session that issued it; QURATOR-177 Option E replaced the
 ///      unspent-ticket read with the permanent grant map, which never empties);
 ///   2. `send_full_list`, when the owner approves a request;
@@ -604,7 +604,6 @@ pub fn run() {
             commands::chat::get_read_state,
             commands::chat::advance_read_watermark,
             commands::chat::get_manifest_asks,
-            commands::chat::has_standing_grant,
             commands::sharing::get_share_settings,
             commands::groups::groups_get,
             commands::groups::groups_create,

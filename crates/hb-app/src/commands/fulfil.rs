@@ -190,20 +190,17 @@ pub(crate) async fn send_full_list_inner(
     // but the canonicalization it motivated is still required, for the reason above. The
     // issued-ticket record this step used to write first is deleted with the ledger, QURATOR-177
     // Option E: the grant map is the whole durable record of an approval now.)
-    let redeemer_npub = crate::commands::chat::npub_of(&recipient);
-    // (2b) The standing-grant record (QURATOR-137 slice 2): this click IS the owner's approval of
-    // serving `slug` to this peer, so it lands in the grant map too. Record-only for now — slice 3
-    // is what consults it at redeem time. Fails the fulfilment rather than minting a ticket the
-    // grant ledger cannot back. `None` is the author: this is the OWNER's own collection, the same
-    // meaning `Ticket::author_npub` already gives `None` — one convention, not two.
-    store
-        .record_standing_grant(&redeemer_npub, None, &slug, now_secs())
-        .map_err(cmd_err)?;
+    // (2b) The standing-grant record is GONE (owner ruling 2026-09-04, QURATOR-164). It recorded
+    // "the owner approved serving `slug` to this peer" so a later ask could skip the human — but
+    // this path only ever serves PUBLIC collections (`build_slug_manifest` refuses a private one),
+    // and public bytes need no approval, so there is nothing for a later ask to consult. Its one
+    // remaining reader was deleted with it. Do not reintroduce a record here "just for the audit
+    // trail": that is how the issued-ticket ledger justified itself before Option E deleted it.
     tracing::debug!(
         recipient = %crate::logging::trunc_npub(&recipient_npub),
         slug = %slug,
         request_id = %request_id,
-        "fulfil: standing grant persisted — publishing the ticket DM"
+        "fulfil: publishing the ticket DM"
     );
 
     let body = serde_json::to_string(&ticket).map_err(cmd_err)?;
@@ -338,7 +335,6 @@ pub(crate) async fn send_cached_manifest_inner(
     // (2) Record the standing grant before the DM — same canonicalization note as
     // `send_full_list_inner`. (The issued-ticket record this step used to write first is deleted
     // with the ledger, QURATOR-177 Option E.)
-    let redeemer_npub = crate::commands::chat::npub_of(&recipient);
     // (2b) The standing-grant record (QURATOR-137 slice 2), cached-serve side: this click is an
     // owner approval of serving this (author, slug) to this peer, so it lands in the grant map.
     // The author IS part of the key — it names WHICH collection was approved.
@@ -351,14 +347,15 @@ pub(crate) async fn send_cached_manifest_inner(
     // `films` to D wrote `D|films`, which slice 3 would then have matched when D asked after THIS
     // node's own `films`. Pinned by
     // `a_carrier4_grant_does_not_authorize_this_nodes_own_same_named_collection`.
-    store
-        .record_standing_grant(&redeemer_npub, Some(&author_npub), &slug, now_secs())
-        .map_err(cmd_err)?;
+    // The Carrier-4 grant record is GONE too — same ruling, same reason. It once carried the
+    // author so a re-serve grant could not be mistaken for this node's own same-named collection;
+    // that distinction now lives where it belongs, in the SERVE ROUTING (`approval_body_for` picks
+    // the cached-manifest body from the ask's `author_npub`), not in a permission record.
     tracing::debug!(
         recipient = %crate::logging::trunc_npub(&recipient_npub),
         slug = %slug,
         request_id = %request_id,
-        "fulfil: cached re-serve record persisted — publishing the ticket DM"
+        "fulfil: cached re-serve — publishing the ticket DM"
     );
 
     let body = serde_json::to_string(&ticket).map_err(cmd_err)?;

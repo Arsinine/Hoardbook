@@ -1105,42 +1105,6 @@ pub async fn get_manifest_asks(
     store.load_manifest_asks().map_err(cmd_err)
 }
 
-/// QURATOR-137 (the UI half of the auto-approve commit) — does a standing grant exist for
-/// `(peer_npub, author_npub, slug)`? The chat route consults this so the fulfil card can render a
-/// request the auto-approve loop answers as already-handled, with no verb (a human click there
-/// would mint a SECOND ticket for the same request). A pure local read, no relay I/O.
-///
-/// A thin shim over [`has_standing_grant_inner`] — the WAN-harness rule: command bodies live in
-/// `_inner` fns so harnesses call the real path instead of re-implementing it.
-#[tauri::command]
-pub async fn has_standing_grant(
-    store: State<'_, DataStore>,
-    peer_npub: String,
-    author_npub: Option<String>,
-    slug: String,
-) -> CmdResult<bool> {
-    Ok(has_standing_grant_inner(&store, &peer_npub, author_npub.as_deref(), &slug))
-}
-
-/// The Tauri-free seam for [`has_standing_grant`]. `author_npub=None` is the `self` key component
-/// (the asked peer's own collection) — the exact shape `auto_approve`'s grant lookup and
-/// `record_standing_grant` use, so a grant recorded by one path is found by the other.
-///
-/// **This answers the GRANT FACT only — never auto-approve suitability.** The loop additionally
-/// requires cap budget (`auto_approve`, step 2); folding that in here would make the card hide its
-/// verb for a request the machine actually left for the human. (A live `ContactStanding::Good`
-/// requirement used to sit there too; withdrawn by owner ruling 2026-09-03, QURATOR-177 — blocking
-/// gates chat/DM interaction only, never the approval mint.)
-pub(crate) fn has_standing_grant_inner(
-    store: &DataStore,
-    peer_npub: &str,
-    author_npub: Option<&str>,
-    slug: &str,
-) -> bool {
-    // A store error reads as NO grant: the card keeps its verb and the human decides, which is the
-    // fail-safe direction here (the opposite would hide the verb for a request nothing answered).
-    store.standing_grant_for(peer_npub, author_npub, slug).ok().flatten().is_some()
-}
 
 /// Fetch + decrypt the NIP-17 inbox: contacts' messages only (Q7 — a stranger's DM never reaches the
 /// main inbox at all). As a side effect, persists any newly-seen stranger messages into the quarantined
@@ -1497,47 +1461,6 @@ mod tests {
         assert_eq!(m.len(), 1, "exactly one ask recorded");
     }
 
-    /// **QURATOR-137 — the `has_standing_grant` shim is the owner-side grant fact the chat card
-    /// renders on.** Pins three things at once: absent reads `false` (the default every pre-grant
-    /// request must see, or the card would hide its verb for a request the machine never answers);
-    /// a recorded grant reads `true` through the SAME key shape the writers use (`self` for a
-    /// `None` author, so a grant `send_full_list` records is found by the card's lookup); and the
-    /// author stays load-bearing — a grant over someone else's `vault` (carrier 4) is NOT this
-    /// owner's `vault`.
-    ///
-    /// MUTATION (P-10 — the ORCHESTRATOR runs this, not the lane): inside
-    /// `has_standing_grant_inner`, replace the body's `author_npub` argument with `None` —
-    /// `store.standing_grant_for(peer_npub, None, slug)` — → the carrier-4 mismatch arm below
-    /// (`is_some_author` grant read as ours) reds on the `!` assert, while the two own-collection
-    /// arms stay green. That proves the author is pinned, not incidentally passing.
-    /// SECOND MUTATION (same file, separate edit): replace the whole `has_standing_grant_inner`
-    /// body with `false` → the `assert!` on the own-collection grant reds.
-    #[test]
-    fn has_standing_grant_inner_reports_the_grant_fact_the_card_renders_on() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = DataStore::new(dir.path().to_path_buf());
-
-        // Absent — the card's default: the verb stays.
-        assert!(
-            !has_standing_grant_inner(&store, "npub1peer", None, "vault"),
-            "no grant yet reads false — the card keeps its verb, exactly as before the feature"
-        );
-
-        // A grant the owner path records (`record_standing_grant(peer, None, slug, …)` — the exact
-        // expression `send_full_list_inner` runs) is found by the card's lookup.
-        store.record_standing_grant("npub1peer", None, "vault", 1_700_000_000).unwrap();
-        assert!(
-            has_standing_grant_inner(&store, "npub1peer", None, "vault"),
-            "a grant the click path recorded reads true through the self-author key"
-        );
-
-        // The author is part of the key (see `standing_grant_key`): a carrier-4 grant over SOMEONE
-        // ELSE's `vault` is not a grant over this owner's `vault`, common-slug collision included.
-        assert!(
-            !has_standing_grant_inner(&store, "npub1peer", Some("npub1authorX"), "vault"),
-            "an authorful lookup must not borrow the self-author grant — common slugs collide"
-        );
-    }
 
     /// **The drift guard the two tests above need to mean anything (orchestrator, 2026-09-01).**
     /// Both of them call `build_manifest_request_for_author` / `record_manifest_ask` DIRECTLY with

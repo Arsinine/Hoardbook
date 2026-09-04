@@ -23,12 +23,14 @@
 //!
 //! **But a ticket outlives the session that issued it** (tickets are valid until redeemed, by
 //! owner ruling), and the transport secret is persisted precisely so the address in an old ticket
-//! still resolves. So [`rebind_if_tickets_outstanding`] runs at startup and binds *only* when this
-//! node has issued an approval at all — a standing grant on the books (QURATOR-177 Option E: the
-//! issued-ticket ledger that used to answer "is a ticket unspent?" is deleted, and a grant is
-//! permanent by ruling, so "ever approved serving" is the honest basis; it over-binds rather than
-//! under-binds, which is the safe direction — an unnecessary listener costs a relay connection,
-//! a missing one breaks a promise a peer still holds).
+//! still resolves. So [`rebind_if_tickets_outstanding`] runs at startup and binds when this node
+//! holds anything servable — see [`has_servable_content`]. That basis has moved twice as the
+//! approval machinery was dismantled: the issued-ticket ledger answered "is a ticket unspent?"
+//! until Option E deleted it (QURATOR-177); the standing-grant map answered "did I ever approve
+//! serving?" until QURATOR-164 deleted approvals entirely. **Public collections need no approval,
+//! so there is no promise to look up** — only content to serve. It over-binds rather than
+//! under-binds, which is the safe direction: an unnecessary listener costs a relay connection, a
+//! missing one makes this node silently unreachable to a peer holding a valid ticket.
 
 use std::sync::Arc;
 
@@ -348,9 +350,12 @@ fn spawn_accept_loop(endpoint: iroh::Endpoint, plane: Arc<ManifestPlane>) {
 /// relay connection they may never need; binding never would make a ticket issued in a previous
 /// session undialable, which is a silent broken promise rather than an honest error. Until
 /// QURATOR-177 Option E the issued-ticket store answered exactly the question that decided it
-/// ("any unspent ticket?"); the ledger is deleted, and the standing-grant map — permanent by
-/// ruling — is the surviving durable record of "this node has promised a manifest to someone", so
-/// it is the basis now.
+/// ("any unspent ticket?"); the ledger was deleted and the standing-grant map became the basis.
+/// **QURATOR-164 (2026-09-04) deleted the grant map too**, and with it the last durable record of
+/// "someone may dial me" — because under the ruling that record is meaningless: every node serves
+/// the public collections it holds, in the background, without approval. The honest question is no
+/// longer *"did I promise anyone anything?"* but *"do I hold anything servable?"*, which is what
+/// [`has_servable_content`] answers.
 pub async fn rebind_if_tickets_outstanding(
     shared: &SharedEndpoint,
     owner_npub: &str,
@@ -359,15 +364,31 @@ pub async fn rebind_if_tickets_outstanding(
     source: Arc<dyn ManifestSource>,
     store: &crate::store::DataStore,
 ) {
-    let has_grant = store.load_standing_grants().map(|m| !m.is_empty()).unwrap_or(false);
-    if !has_grant {
+    if !has_servable_content(store) {
         return;
     }
     if let Err(e) =
         ensure_endpoint(shared, owner_npub, live_npub, transport_key, source, Role::Listen).await
     {
-        tracing::warn!("manifest plane: could not rebind for an outstanding approval: {e}");
+        tracing::warn!("manifest plane: could not rebind a listener for servable content: {e}");
     }
+}
+
+/// Does this node hold anything a peer could legitimately dial it for?
+///
+/// Two sources, matching the two serve bodies: **cached manifests** this node browsed (which
+/// `send_cached_manifest_inner` re-serves — the Carrier-4 baseline every node participates in) and
+/// **its own published collections** (which `send_full_list_inner` builds). Either one means a
+/// dial is possible, so the listener is bound.
+///
+/// ⚠ This is deliberately a CHEAP, IMPRECISE check — a non-empty cache directory, not a parse of
+/// its contents. Binding a listener nothing dials costs an idle endpoint; NOT binding one that
+/// something does dial costs a silently unreachable node, which is the failure that actually hurts.
+/// When in doubt it must bind.
+fn has_servable_content(store: &crate::store::DataStore) -> bool {
+    std::fs::read_dir(store.manifest_cache_dir())
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

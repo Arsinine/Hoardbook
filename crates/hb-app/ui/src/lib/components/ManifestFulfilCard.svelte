@@ -16,7 +16,6 @@
 		MANIFEST_MISSING_LINE,
 		MANIFEST_STALE_NOTE,
 		MANIFEST_RESERVE_LINE,
-		MANIFEST_ANSWERED_LINE,
 		type ManifestFulfilState,
 	} from '$lib/manifest-fulfil.js';
 	import { SEND_FULL_LIST_LABEL } from '$lib/transport-ticket.js';
@@ -106,12 +105,6 @@
 				{sending ? '…' : SEND_FULL_LIST_LABEL}
 			</button>
 		</div>
-	{:else if state.kind === 'answered'}
-		<!-- QURATOR-137 (auto-approve UI half): the machine already answers this peer's asks for this
-		     list (a standing grant), so the card carries ZERO verbs — a "Send the full list" click
-		     here would mint a SECOND ticket for a request the auto-approve loop already handled.
-		     Informational line only, like the other inert branches. -->
-		<div class="mf-card-inert">{MANIFEST_ANSWERED_LINE}</div>
 	{/if}
 </div>
 

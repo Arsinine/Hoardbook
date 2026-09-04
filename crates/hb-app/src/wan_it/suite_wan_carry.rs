@@ -27,7 +27,7 @@
 //! | C·1 | receive A's ticket | `commands::chat::decode_dms` + `hb_core::TransportTicket::verify_shape` |
 //! | C·1 | redeem + cache | `commands::fulfil::redeem_manifest_ticket_inner` (claim + `ensure_endpoint` DialOnly + `fetch_manifest` + `commands::browse::accept_manifest_bytes` + spend) |
 //! | C·2 | receive D's ask | `commands::chat::decode_dms` + `auto_approve::ManifestRequestBody::parse` + `auto_approve::approval_body_for` (production's parser AND its routing discriminator — QURATOR-183) |
-//! | C·2 | answer by re-serving | `commands::fulfil::send_cached_manifest_inner` (cache read + `verify_author` + `ensure_endpoint` Listen + `issue_ticket` + `record_standing_grant` + `send_dm_inner`) |
+//! | C·2 | answer by re-serving | `commands::fulfil::send_cached_manifest_inner` (cache read + `verify_author` + `ensure_endpoint` Listen + `issue_ticket` + `send_dm_inner`) |
 //! | D | send the author-ask DM | `commands::chat::build_manifest_request_for_author` + `send_dm_inner` + `DataStore::record_manifest_ask` |
 //! | D | receive C's ticket | `commands::chat::decode_dms` + `TransportTicket::verify_shape` (harness asserts `author_npub == Some(A)`) |
 //! | D | redeem C's cached copy | `commands::fulfil::redeem_manifest_ticket_inner` |
@@ -530,7 +530,8 @@ async fn run_role_c_phase2(input: &CarryInput) -> Result<(), String> {
     // own-collection body. Answering it here is NO LONGER a harness deviation: owner ruling
     // 2026-09-04 (QURATOR-164) deleted `should_auto_approve`'s step (0), so production auto-serves
     // an author-bearing ask too — third-party serving is background infrastructure, needing no
-    // grant and no human. The harness's remaining deviation is only that it has no caps pacer.
+    // approval and no human — QURATOR-164 deleted approvals entirely. The harness's remaining
+    // deviation is only that it has no caps pacer.
     let Some(author_from_ask) = author_from_ask else {
         return Err(
             "production's `approval_body_for` routed the asker's request-DM to the OWN-COLLECTION \
@@ -546,12 +547,12 @@ async fn run_role_c_phase2(input: &CarryInput) -> Result<(), String> {
     }
     eprintln!("   CC2 got the asker's author-ask for '{slug}' by {author_npub} (nonce={nonce:?})");
 
-    // Save D as a contact (realism — `send_cached_manifest_inner` records the grant keyed by D).
+    // Save D as a contact (realism only — nothing on the serve path reads contacts or grants).
     super::save_asker_contact(&input.store, &asker_npub)
         .map_err(|e| format!("save asker contact: {e:#}"))?;
 
     // THE production re-serve body: cache read + verify-under-A + Listen endpoint + ticket with
-    // author_npub = Some(A) + standing grant + ticket DM, all inside.
+    // author_npub = Some(A) + ticket DM, all inside.
     let shared_relay = crate::net::new_shared();
     send_cached_manifest_inner(
         asker_npub.clone(),
@@ -567,18 +568,12 @@ async fn run_role_c_phase2(input: &CarryInput) -> Result<(), String> {
     .map_err(|e| format!("send_cached_manifest_inner: {e}"))?;
     eprintln!("   CC2 re-served the cached copy via send_cached_manifest_inner — ticket DM'd");
 
-    // Anti-"green while writing no grant" evidence (the QURATOR-137 lesson): the re-serve body must
-    // have written the standing grant keyed (D, Some(A), slug) BEFORE the DM.
-    let grant = input
-        .store
-        .standing_grant_for(&asker_npub, Some(&author_npub), &slug)
-        .map_err(|e| format!("standing_grant_for: {e}"))?;
-    if grant.is_none() {
-        return Err("send_cached_manifest_inner completed but no standing grant exists for \
-             (asker, author, slug) — the re-serve wrote no authorization"
-            .to_string());
-    }
-    eprintln!("   CC2 standing grant present for (D, Some(A), '{slug}')");
+    // The "green while writing nothing" guard that used to sit here checked that the re-serve body
+    // had written a standing grant keyed (D, Some(A), slug) before the DM. **Grants were deleted
+    // by owner ruling 2026-09-04 (QURATOR-164) — public collections need no approval — so there is
+    // no longer a record to assert on.** The row's real evidence is unchanged and stronger: D
+    // redeems the ticket and verifies the envelope under A's key (phase D below), which is a
+    // property of the bytes rather than of a bookkeeping row.
 
     // HOLD: the asker dials THIS process's iroh endpoint to redeem the cached copy, so C must
     // stay up until D's CD1 row reports done. The accept loop spawned by ensure_endpoint inside

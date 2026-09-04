@@ -26,25 +26,31 @@ import type { Collection } from './types.js';
 import { parseManifestRequest, type ManifestRequest } from './request-inbox.js';
 import { shortNpub } from './contact-display.js';
 
-/** The card states (five from spec W7.1b, plus carrier 4's `re-serve` and QURATOR-137's `answered`).
- *  Pure derivation from (request, own drafts, grant fact).
+/** The card states (five from spec W7.1b, plus carrier 4's `re-serve`).
+ *  Pure derivation from (request, own drafts).
  *
  *  Carrier 4 (QURATOR-79): `authorNpub` on a state is the third-party author the request named, or
  *  undefined for the asked peer's own collection (the only shape before carrier 4). It is carried,
  *  not acted on, by the derivation — the re-serve decision belongs to the human reading the card,
  *  and the state machine's job is to make sure the card says WHOSE list is being asked for.
  *
- *  QURATOR-137 (`answered`, the auto-approve UI half): a standing grant means the machine already
- *  answers this peer's request-DMs — see `auto_approve.rs`. The card renders the fact informationally,
- *  with zero verbs, so a human click cannot mint a second ticket for a request the machine handled. */
+ *  ⚠ There was an `answered` state here until 2026-09-04. It rendered the STANDING GRANT fact —
+ *  "the machine already answers this peer" — and QURATOR-164 deleted grants outright, because
+ *  public collections need no approval. Nothing derives it any more, so it is gone rather than
+ *  left to render a fact that no longer exists.
+ *
+ *  ⚠ OPEN, deliberately not decided here: the owner ruling that manifest exchange needs "no manual
+ *  back-and-forth — neither side clicks" arguably makes the `public` card's SEND VERB vestigial
+ *  too, since the auto-approve loop now answers every public ask without a human. The verb is kept
+ *  for now (it is harmless — a ticket is address delivery, not a capability — and it still serves a
+ *  request the loop has paced but not yet reached). Removing it is a UI call for the owner. */
 export type ManifestFulfilState =
 	| { kind: 'public'; slug: string; stale: boolean; authorNpub?: string }
 	| { kind: 'private'; slug: string; authorNpub?: string }
 	| { kind: 'empty'; slug: string; authorNpub?: string }
 	| { kind: 'missing'; slug: string; authorNpub?: string }
 	| { kind: 'quarantine'; slug: string; authorNpub?: string }
-	| { kind: 're-serve'; slug: string; authorNpub: string }
-	| { kind: 'answered'; slug: string };
+	| { kind: 're-serve'; slug: string; authorNpub: string };
 
 /** The card's resolution of a request against the owner's own drafts. `quarantined=true` short-
  *  circuits to the inert state regardless of slug match (Accept first, always — same rule as W3).
@@ -60,14 +66,13 @@ export type ManifestFulfilState =
 export function deriveManifestFulfil(
 	request: ManifestRequest,
 	drafts: Collection[],
-	opts: { quarantined: boolean; answered?: boolean },
+	opts: { quarantined: boolean },
 ): ManifestFulfilState {
 	const slug = request.slug;
 	const authorNpub = request.authorNpub;
 	// Quarantine short-circuits FIRST, as ever — Accept comes before any state is judged (same rule
 	// as W3). What the quarantined card renders is the hint's copy (request-inbox.ts), which already
 	// names the third-party author, so the pre-Accept read stays honest without a verb here.
-	// `answered` is deliberately unreachable here: it is judged AFTER quarantine, never before.
 	if (opts.quarantined) return { kind: 'quarantine', slug };
 	// A third-party-author ask is a RE-SERVE: the peer wants an envelope this owner never authored —
 	// it lives in the owner's manifest cache (put there by browsing that author), not in the drafts
@@ -81,13 +86,6 @@ export function deriveManifestFulfil(
 	// Absent visibility ⇒ Public (pre-M10 default). Only an EXPLICIT 'Private' is refused.
 	if (draft.visibility === 'Private') return { kind: 'private', slug };
 	if (draft.content_types.length === 0) return { kind: 'empty', slug };
-	// QURATOR-137 — the auto-approve UI half. The grant fact arrives as an INPUT (the derivation
-	// stays pure; the route reads `has_standing_grant` and hands the boolean in). It is judged HERE,
-	// at the `public` outcome and nowhere earlier, because the machine's answer path IS the public
-	// path (`send_full_list_inner` → `build_slug_manifest`): a private, empty or missing draft, or a
-	// carrier-4 ask, is never auto-answered, so `answered` must not claim it was — a card asserting
-	// an answer the backend cannot give is the Carrier-4 dead-copy defect again.
-	if (opts.answered) return { kind: 'answered', slug };
 	const stale =
 		request.fingerprintSeen !== '' &&
 		draft.snapshot_fingerprint !== undefined &&
@@ -100,7 +98,7 @@ export function deriveManifestFulfil(
 export function manifestFulfilFor(
 	content: string,
 	drafts: Collection[],
-	opts: { quarantined: boolean; answered?: boolean },
+	opts: { quarantined: boolean },
 ): { request: ManifestRequest; state: ManifestFulfilState } | null {
 	const req = parseManifestRequest(content);
 	if (!req) return null;
@@ -146,11 +144,3 @@ export const MANIFEST_BIG_RELAY_LINK = 'Add a big relay in Settings to publish t
 export const MANIFEST_RESERVE_LINE = (authorNpub: string) =>
 	`They're asking for a list ${shortNpub(authorNpub)} made — say the word and it goes from your cache.`;
 
-/** QURATOR-137 — the answered card's informational line. The machine already answers this peer's
- *  asks for this list, so no verb is offered: a click would mint a second ticket for a request the
- *  auto-approve loop handled. Copy constraints, pinned by tests: a standing grant is RESOURCE
- *  control, never revocation — this line may not state or imply that blocking or removing the
- *  contact withdraws their read access — and no expiry/time-box language, because grants do not
- *  expire. Names the LIST, same as every line above (MAS-INV-5 + INV-4). */
-export const MANIFEST_ANSWERED_LINE =
-	'Already answered — you approved this peer, so they get this list without another click.';
