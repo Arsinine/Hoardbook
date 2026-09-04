@@ -679,4 +679,380 @@ mod tests {
             assert_eq!(after, snapshot, "a rejected create must not mutate groups.json");
         }
     }
+
+    // ── Command-dispatch coverage — the six commands that had no test driving them through ────
+    // their real `#[tauri::command]` signatures: groups_delete, groups_get, groups_rename,
+    // groups_unassign, private_audience_list, private_audience_set. Each test asserts the
+    // command's observable effect on the DataStore (or its return value), and carries its P-10
+    // mutation (the one-line production edit that must red it) in a comment beside it.
+    mod command_dispatch {
+        use super::*;
+        use super::super::{
+            groups_assign, groups_delete, groups_get, groups_rename, groups_unassign,
+            private_audience_list, private_audience_set,
+        };
+        use tauri::Manager;
+
+        fn dispatch_app() -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            // RELAY HAZARD: an empty configured relay set falls back to the real public
+            // DEFAULT_RELAYS (net::relay_urls). These commands are local-only, but every test
+            // store pins an unroutable relay anyway so nothing here can ever reach the internet.
+            store
+                .save_settings(&crate::store::Settings {
+                    relay_urls: vec!["ws://127.0.0.1:9".into()],
+                    ..Default::default()
+                })
+                .unwrap();
+            app.manage(store);
+            app
+        }
+
+        /// P-10: in `groups_get`, replace the body expression `store.load_groups().map_err(cmd_err)`
+        /// with `Ok(Vec::new())` — the names assert must go red.
+        #[test]
+        fn groups_get_command_lists_what_is_saved_on_disk() {
+            let app = dispatch_app();
+            let store = app.state::<DataStore>();
+            let now = chrono::Utc::now();
+            // Distinct modified_at values: load_groups sorts newest-first, so the expected order
+            // is deterministic rather than relying on stable-sort tie-breaking.
+            store
+                .save_groups(&[
+                    Group {
+                        name: "Pals".into(),
+                        pubkeys: vec!["npub_a".into()],
+                        modified_at: now - chrono::Duration::hours(1),
+                        color: Some("#ff00aa".into()),
+                    },
+                    Group {
+                        name: "Work".into(),
+                        pubkeys: vec![],
+                        modified_at: now - chrono::Duration::hours(2),
+                        color: None,
+                    },
+                ])
+                .unwrap();
+
+            let got = tauri::async_runtime::block_on(groups_get(app.state::<DataStore>())).unwrap();
+            let names: Vec<&str> = got.iter().map(|g| g.name.as_str()).collect();
+            assert_eq!(names, vec!["Pals", "Work"], "groups_get returns what the store saved");
+            let pals = got.iter().find(|g| g.name == "Pals").unwrap();
+            assert_eq!(pals.pubkeys, vec!["npub_a".to_string()], "members round-trip");
+            assert_eq!(pals.color.as_deref(), Some("#ff00aa"), "color round-trips");
+        }
+
+        /// P-10: in `groups_rename`, delete the line `group.name = new_name;` (replace it with
+        /// `let _ = new_name;`) — the `groups[0].name == "Friends"` assert must go red.
+        /// (Refusal half: change the find predicate to `|g| g.name != old_name` — the
+        /// `expect_err` must go red because the command starts succeeding.)
+        #[test]
+        fn groups_rename_command_persists_the_new_name() {
+            let app = dispatch_app();
+            let store = app.state::<DataStore>();
+            let seeded_at = chrono::Utc::now() - chrono::Duration::hours(2);
+            store
+                .save_groups(&[Group {
+                    name: "Pals".into(),
+                    pubkeys: vec!["npub_a".into(), "npub_b".into()],
+                    modified_at: seeded_at,
+                    color: Some("#ff00aa".into()),
+                }])
+                .unwrap();
+            let snapshot = std::fs::read_to_string(store.groups_path()).unwrap();
+
+            // Renaming an absent group refuses AND writes nothing.
+            let err = tauri::async_runtime::block_on(groups_rename(
+                "Nope".into(),
+                "X".into(),
+                app.state::<DataStore>(),
+            ))
+            .expect_err("renaming a group that does not exist must error");
+            assert_eq!(err, "Group 'Nope' not found");
+            assert_eq!(
+                std::fs::read_to_string(store.groups_path()).unwrap(),
+                snapshot,
+                "a refused rename must not rewrite groups.json"
+            );
+
+            tauri::async_runtime::block_on(groups_rename(
+                "Pals".into(),
+                "Friends".into(),
+                app.state::<DataStore>(),
+            ))
+            .unwrap();
+            let groups = store.load_groups().unwrap();
+            assert_eq!(groups.len(), 1, "rename does not add or drop groups");
+            assert_eq!(groups[0].name, "Friends", "the new name is persisted");
+            assert_eq!(
+                groups[0].pubkeys,
+                vec!["npub_a".to_string(), "npub_b".to_string()],
+                "members survive the rename"
+            );
+            assert_eq!(groups[0].color.as_deref(), Some("#ff00aa"), "color survives the rename");
+            assert!(
+                groups[0].modified_at > seeded_at,
+                "rename stamps a fresh modified_at"
+            );
+        }
+
+        /// P-10: in `groups_delete`, replace `groups.retain(|g| g.name != name);` with
+        /// `let _ = &name;` — the `groups.len() == 1` assert must go red (nothing was deleted).
+        #[test]
+        fn groups_delete_command_removes_only_the_named_group() {
+            let app = dispatch_app();
+            let store = app.state::<DataStore>();
+            let now = chrono::Utc::now();
+            store
+                .save_groups(&[
+                    Group {
+                        name: "Pals".into(),
+                        pubkeys: vec!["npub_a".into()],
+                        modified_at: now - chrono::Duration::hours(2),
+                        color: None,
+                    },
+                    Group {
+                        name: "Work".into(),
+                        pubkeys: vec!["npub_b".into(), "npub_c".into()],
+                        modified_at: now - chrono::Duration::hours(1),
+                        color: Some("#00aaff".into()),
+                    },
+                ])
+                .unwrap();
+
+            tauri::async_runtime::block_on(groups_delete("Pals".into(), app.state::<DataStore>()))
+                .unwrap();
+
+            let groups = store.load_groups().unwrap();
+            assert_eq!(groups.len(), 1, "only the named group is deleted");
+            assert_eq!(groups[0].name, "Work");
+            assert_eq!(
+                groups[0].pubkeys,
+                vec!["npub_b".to_string(), "npub_c".to_string()],
+                "the surviving group keeps its members"
+            );
+            assert_eq!(groups[0].color.as_deref(), Some("#00aaff"));
+
+            // Deleting an absent name is a silent no-op — survivors untouched.
+            tauri::async_runtime::block_on(groups_delete("Ghost".into(), app.state::<DataStore>()))
+                .unwrap();
+            assert_eq!(
+                store.load_groups().unwrap().len(),
+                1,
+                "deleting an absent group must not touch the survivors"
+            );
+        }
+
+        /// P-10: in `groups_unassign`, replace `group.pubkeys.retain(|id| id != &npub);` with
+        /// `let _ = &npub;` — the `pals.pubkeys == ["npub_b"]` assert must go red.
+        #[test]
+        fn groups_unassign_command_removes_only_the_named_npub() {
+            let app = dispatch_app();
+            let store = app.state::<DataStore>();
+            let now = chrono::Utc::now();
+            store
+                .save_groups(&[
+                    Group {
+                        name: "Pals".into(),
+                        pubkeys: vec!["npub_a".into(), "npub_b".into()],
+                        modified_at: now - chrono::Duration::hours(2),
+                        color: None,
+                    },
+                    Group {
+                        name: "Work".into(),
+                        pubkeys: vec!["npub_a".into()],
+                        modified_at: now - chrono::Duration::hours(1),
+                        color: None,
+                    },
+                ])
+                .unwrap();
+            let snapshot = std::fs::read_to_string(store.groups_path()).unwrap();
+
+            // Unassigning from an absent group refuses AND writes nothing.
+            let err = tauri::async_runtime::block_on(groups_unassign(
+                "npub_a".into(),
+                "Nope".into(),
+                app.state::<DataStore>(),
+            ))
+            .expect_err("unassigning from an absent group must error");
+            assert_eq!(err, "Group 'Nope' not found");
+            assert_eq!(
+                std::fs::read_to_string(store.groups_path()).unwrap(),
+                snapshot,
+                "a refused unassign must not rewrite groups.json"
+            );
+
+            tauri::async_runtime::block_on(groups_unassign(
+                "npub_a".into(),
+                "Pals".into(),
+                app.state::<DataStore>(),
+            ))
+            .unwrap();
+            let groups = store.load_groups().unwrap();
+            let pals = groups.iter().find(|g| g.name == "Pals").unwrap();
+            assert_eq!(
+                pals.pubkeys,
+                vec!["npub_b".to_string()],
+                "the named npub leaves the named group"
+            );
+            let work = groups.iter().find(|g| g.name == "Work").unwrap();
+            assert_eq!(
+                work.pubkeys,
+                vec!["npub_a".to_string()],
+                "membership in OTHER groups is untouched"
+            );
+        }
+
+        /// P-10: in `private_audience_list`, replace the body expression
+        /// `store.load_private_audience().map_err(cmd_err)` with `Ok(Vec::new())` — the equality
+        /// assert must go red.
+        #[test]
+        fn private_audience_list_command_reads_the_audience_file() {
+            let app = dispatch_app();
+            let store = app.state::<DataStore>();
+            store
+                .save_private_audience(&["npub_a".into(), "npub_c".into()])
+                .unwrap();
+
+            let got = tauri::async_runtime::block_on(private_audience_list(app.state::<DataStore>()))
+                .unwrap();
+            assert_eq!(
+                got,
+                vec!["npub_a".to_string(), "npub_c".to_string()],
+                "private_audience_list returns exactly what the store holds — no group derivation"
+            );
+        }
+
+        /// P-10: in `private_audience_set`, change `if receives {` to `if !receives {` — enrol
+        /// becomes revoke, so the first equality assert must go red.
+        #[test]
+        fn private_audience_set_command_enrols_and_revokes_idempotently() {
+            let app = dispatch_app();
+            let store = app.state::<DataStore>();
+
+            // Enrol, twice each — the second call must not duplicate.
+            tauri::async_runtime::block_on(private_audience_set(
+                "npub_a".into(),
+                true,
+                app.state::<DataStore>(),
+            ))
+            .unwrap();
+            tauri::async_runtime::block_on(private_audience_set(
+                "npub_a".into(),
+                true,
+                app.state::<DataStore>(),
+            ))
+            .unwrap();
+            tauri::async_runtime::block_on(private_audience_set(
+                "npub_b".into(),
+                true,
+                app.state::<DataStore>(),
+            ))
+            .unwrap();
+            assert_eq!(
+                store.load_private_audience().unwrap(),
+                vec!["npub_a".to_string(), "npub_b".to_string()],
+                "both npubs enrolled, no duplicate"
+            );
+
+            // Revoke one; revoking an absent npub is a no-op; the survivor stays.
+            tauri::async_runtime::block_on(private_audience_set(
+                "npub_a".into(),
+                false,
+                app.state::<DataStore>(),
+            ))
+            .unwrap();
+            tauri::async_runtime::block_on(private_audience_set(
+                "npub_ghost".into(),
+                false,
+                app.state::<DataStore>(),
+            ))
+            .unwrap();
+            assert_eq!(
+                store.load_private_audience().unwrap(),
+                vec!["npub_b".to_string()],
+                "revoked npub gone, absent-npub revoke changed nothing"
+            );
+        }
+
+        /// THE invariant this slice exists to pin (CLAUDE.md §6), now at the COMMAND seam: the
+        /// Private-collection audience is EXPLICIT and never group-derived, so driving the four
+        /// group-mutation commands through their real `#[tauri::command]` fns must leave
+        /// `private_audience.json` byte-identical and `private_audience_list` unchanged. The
+        /// store-seam twin is `group_mutations_do_not_touch_private_audience` above; this test is
+        /// the same property proved through dispatch rather than through a mirrored body.
+        /// P-10: in `groups_assign`, insert one line after `group.pubkeys.push(npub);`:
+        /// `store.save_private_audience(&[npub.clone()]).unwrap();` — the byte-identical assert
+        /// must go red (the audience file was rewritten).
+        #[test]
+        fn group_command_mutations_do_not_touch_private_audience() {
+            let app = dispatch_app();
+            let store = app.state::<DataStore>();
+            let now = chrono::Utc::now();
+            // Seed one group and a NON-empty audience — "unchanged" must mean the file keeps its
+            // contents, not merely that an empty file stayed missing.
+            store
+                .save_groups(&[Group {
+                    name: "Pals".into(),
+                    pubkeys: vec![],
+                    modified_at: now,
+                    color: None,
+                }])
+                .unwrap();
+            store.save_private_audience(&["npub_kept".into()]).unwrap();
+            let audience_snapshot = std::fs::read(store.private_audience_path()).unwrap();
+            let listed_before =
+                tauri::async_runtime::block_on(private_audience_list(app.state::<DataStore>()))
+                    .unwrap();
+
+            // The four group-mutation commands, driven through the real command fns.
+            tauri::async_runtime::block_on(groups_assign(
+                "npub_filed".into(),
+                "Pals".into(),
+                app.state::<DataStore>(),
+            ))
+            .unwrap();
+            tauri::async_runtime::block_on(groups_unassign(
+                "npub_filed".into(),
+                "Pals".into(),
+                app.state::<DataStore>(),
+            ))
+            .unwrap();
+            tauri::async_runtime::block_on(groups_rename(
+                "Pals".into(),
+                "Friends".into(),
+                app.state::<DataStore>(),
+            ))
+            .unwrap();
+            tauri::async_runtime::block_on(groups_delete(
+                "Friends".into(),
+                app.state::<DataStore>(),
+            ))
+            .unwrap();
+
+            // groups.json really moved — otherwise the asserts above prove nothing about the
+            // four commands this test is supposed to drive.
+            assert!(
+                store.load_groups().unwrap().is_empty(),
+                "the four commands must have actually mutated groups.json"
+            );
+
+            let audience_after = std::fs::read(store.private_audience_path()).unwrap();
+            assert_eq!(
+                audience_after, audience_snapshot,
+                "private_audience.json is byte-identical after every group command"
+            );
+            let listed_after =
+                tauri::async_runtime::block_on(private_audience_list(app.state::<DataStore>()))
+                    .unwrap();
+            assert_eq!(listed_after, listed_before);
+            assert_eq!(
+                listed_after,
+                vec!["npub_kept".to_string()],
+                "npub_filed was filed into a group and must NOT be enrolled as a recipient"
+            );
+        }
+    }
 }
