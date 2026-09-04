@@ -1005,6 +1005,11 @@ pub async fn request_manifest(
     )?;
     let own = net::relay_urls(&store);
     let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
+    // QURATOR-164 ask throttle — the ONE shared limiter (1/sec, module scope in `ask_throttle.rs`).
+    // Sits after every pre-send failure path (parse/identity/self-send/build/client) so only an ask
+    // that actually reaches the relay consumes a slot, and before `send_dm_inner` because the ruling
+    // paces the outbound relay traffic. It delays, it never discards — chat/DM is not throttled.
+    crate::ask_throttle::acquire().await;
     send_dm_inner(&client, &id_clone, &recipient, &content, &own, net::RELAY_TIMEOUT)
         .await
         .map_err(cmd_err)?;
@@ -1072,6 +1077,11 @@ pub async fn request_manifest_from(
     )?;
     let own = net::relay_urls(&store);
     let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
+    // QURATOR-164 ask throttle — the ONE shared limiter (1/sec, module scope in `ask_throttle.rs`).
+    // Sits after every pre-send failure path (parse/identity/self-send/build/client) so only an ask
+    // that actually reaches the relay consumes a slot, and before `send_dm_inner` because the ruling
+    // paces the outbound relay traffic. It delays, it never discards — chat/DM is not throttled.
+    crate::ask_throttle::acquire().await;
     send_dm_inner(&client, &id_clone, &recipient, &content, &own, net::RELAY_TIMEOUT)
         .await
         .map_err(cmd_err)?;
