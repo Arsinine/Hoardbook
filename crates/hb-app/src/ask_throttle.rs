@@ -198,7 +198,7 @@ mod tests {
     /// 1. **Over-apply**: inside `send_message` (or any other DM path in `chat.rs`), insert
     ///    `crate::ask_throttle::acquire().await;` → the count assert reds (3 ≠ 2), and the
     ///    `send_message` region assert reds.
-    /// 2. **Under-apply**: delete the acquire from `request_manifest` or `request_manifest_from`
+    /// 2. **Under-apply**: delete the acquire from `request_manifest` or `request_manifest_from_inner`
     ///    → the count assert reds (1 ≠ 2) and that command's region assert reds (0 ≠ 1).
     #[test]
     fn chat_and_dm_paths_are_not_throttled() {
@@ -220,7 +220,10 @@ mod tests {
             1,
             "the owner-path ask must go through the shared limiter exactly once"
         );
-        let rmf = fn_region(&code, "pub async fn request_manifest_from(");
+        // The carrier-4 ask body lives in the INNER since QURATOR-164 item 3 extracted it so the
+        // background fetch driver could call the production path instead of hand-rolling a copy.
+        // The guard follows the behaviour, not the name.
+        let rmf = fn_region(&code, "pub(crate) async fn request_manifest_from_inner(");
         assert_eq!(
             rmf.matches("crate::ask_throttle::acquire").count(),
             1,
@@ -239,7 +242,7 @@ mod tests {
     /// outbound relay traffic, so an acquire moved past the send would pace nothing.
     ///
     /// MUTATION (P-10) — in `commands/chat.rs`, move the `crate::ask_throttle::acquire().await;`
-    /// line in `request_manifest` (or `request_manifest_from`) to AFTER the `send_dm_inner(…)`
+    /// line in `request_manifest` (or `request_manifest_from_inner`) to AFTER the `send_dm_inner(…)`
     /// `.map_err(cmd_err)?;` → the index assert for that region reds.
     #[test]
     fn ask_acquire_precedes_the_relay_write_in_both_ask_commands() {
@@ -251,7 +254,7 @@ mod tests {
             .join("\n");
         for sig in [
             "pub async fn request_manifest(",
-            "pub async fn request_manifest_from(",
+            "pub(crate) async fn request_manifest_from_inner(",
         ] {
             let region = fn_region(&code, sig);
             let at = region

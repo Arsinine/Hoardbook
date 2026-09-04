@@ -1050,17 +1050,54 @@ pub async fn request_manifest_from(
     store: State<'_, DataStore>,
     relay: State<'_, SharedRelay>,
 ) -> CmdResult<()> {
-    let recipient = parse_recipient(&npub)?;
-    // The named author must be a real key, not a label — the ask pins WHICH collection it is about,
-    // and a blank/garbled string would silently widen into "whoever's envelope is handy".
-    let author = parse_recipient(&author_npub)
-        .map_err(|e| format!("Invalid author: {e}"))?;
-    let author_npub = npub_of(&author);
     let id_clone = {
         let guard = identity.read().await;
         let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
         id.identity.clone()
     };
+    request_manifest_from_inner(
+        &npub,
+        &author_npub,
+        &slug,
+        &fingerprint_seen,
+        teaser_event_id,
+        &id_clone,
+        &store,
+        &relay,
+    )
+    .await
+}
+
+/// The body of [`request_manifest_from`], callable without Tauri `State`.
+///
+/// Extracted (QURATOR-164 item 3) so the background fetch driver originates its asks **through the
+/// production path** rather than hand-rolling a second copy. That is not a stylistic preference:
+/// the WAN harness has re-implemented a command body and silently omitted one step three separate
+/// times (`sanitize_node_addr` 2026-08-27, `approve_request` 2026-09-01, D4's teaser stamp) —
+/// twice manufacturing a phantom PRODUCT defect, once a phantom GREEN. A driver carrying its own
+/// copy of this would be the fourth, and the step it dropped would be invisible until a live run.
+///
+/// Everything load-bearing stays here rather than in the shim above: the author is re-parsed and
+/// normalised (the ask must pin WHICH collection it concerns), the nonce is minted here so the
+/// value on the wire and in the local trace cannot diverge, the throttle slot is taken after every
+/// pre-send failure path, and the trace is recorded only once the send resolves.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn request_manifest_from_inner(
+    npub: &str,
+    author_npub: &str,
+    slug: &str,
+    fingerprint_seen: &str,
+    teaser_event_id: Option<String>,
+    id_clone: &hb_core::Identity,
+    store: &DataStore,
+    relay: &SharedRelay,
+) -> Result<(), String> {
+    let recipient = parse_recipient(npub)?;
+    // The named author must be a real key, not a label — the ask pins WHICH collection it is about,
+    // and a blank/garbled string would silently widen into "whoever's envelope is handy".
+    let author = parse_recipient(author_npub)
+        .map_err(|e| format!("Invalid author: {e}"))?;
+    let author_npub = npub_of(&author);
     if is_self_send(&recipient, &id_clone.public_key()) {
         return Err("You can't request a manifest from yourself.".into());
     }
@@ -1068,21 +1105,21 @@ pub async fn request_manifest_from(
     // value on the wire and in the local trace, and a caller that could supply it could replay one.
     let ask_nonce = new_ask_nonce();
     let content = build_manifest_request_for_author(
-        &slug,
-        &fingerprint_seen,
+        slug,
+        fingerprint_seen,
         teaser_event_id,
         None,
         Some(ask_nonce.clone()),
         &author_npub,
     )?;
-    let own = net::relay_urls(&store);
-    let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
+    let own = net::relay_urls(store);
+    let client = net::client(id_clone, store, relay).await.map_err(cmd_err)?;
     // QURATOR-164 ask throttle — the ONE shared limiter (1/sec, module scope in `ask_throttle.rs`).
     // Sits after every pre-send failure path (parse/identity/self-send/build/client) so only an ask
     // that actually reaches the relay consumes a slot, and before `send_dm_inner` because the ruling
     // paces the outbound relay traffic. It delays, it never discards — chat/DM is not throttled.
     crate::ask_throttle::acquire().await;
-    send_dm_inner(&client, &id_clone, &recipient, &content, &own, net::RELAY_TIMEOUT)
+    send_dm_inner(&client, id_clone, &recipient, &content, &own, net::RELAY_TIMEOUT)
         .await
         .map_err(cmd_err)?;
     // Same M17 W7.1a ordering as `request_manifest` — and the author-scoped key is the whole point
@@ -1091,7 +1128,7 @@ pub async fn request_manifest_from(
     // this exact key when a cached-copy ticket echoes the nonce.
     let sent_at = chrono::Utc::now().to_rfc3339();
     store
-        .record_manifest_ask(&npub, &author_npub, &slug, &fingerprint_seen, &sent_at, &ask_nonce)
+        .record_manifest_ask(npub, &author_npub, slug, fingerprint_seen, &sent_at, &ask_nonce)
         .map_err(cmd_err)?;
     Ok(())
 }
@@ -1476,9 +1513,51 @@ mod tests {
     ///
     /// MUTATION (P-10) — resolved by containing function (this file has a near-identical owner-path
     /// call in `request_manifest`, which legitimately passes `&npub, &npub` — do NOT aim there):
-    /// inside `request_manifest_from`, change `&author_npub` to `""` in the builder call, or change
-    /// `.record_manifest_ask(&npub, &author_npub,` to `.record_manifest_ask(&npub, &npub,` → this
+    /// inside `request_manifest_from_inner`, change `&author_npub` to `""` in the builder call, or
+    /// change `.record_manifest_ask(npub, &author_npub,` to `.record_manifest_ask(npub, npub,` → this
     /// test reds on the corresponding assert. Both mutations left the two tests above green.
+    /// The command must stay a THIN SHIM over `request_manifest_from_inner`.
+    ///
+    /// Extracting that body (QURATOR-164 item 3, so the background fetch driver could originate
+    /// asks through the production path) moved every guard above onto the inner — which opens a
+    /// hole none of them can see: the command could stop calling the inner, or grow a second
+    /// divergent copy of the send, and they would all still pass while production did something
+    /// else. This is the same drift guard the fulfil path carries over `send_full_list_inner`, and
+    /// it is what keeps the guards above meaningful after the extraction.
+    ///
+    /// MUTATION (P-10) — in `request_manifest_from`, delete the call to the inner and return
+    /// `Ok(())` → this test reds on the delegation count.
+    #[test]
+    fn request_manifest_from_stays_a_thin_shim_over_its_inner() {
+        let src = include_str!("chat.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("pub async fn request_manifest_from(")
+            .expect("the ask-origination command must exist");
+        let end = code[at..]
+            .find("pub(crate) async fn request_manifest_from_inner(")
+            .expect("the inner must follow the command")
+            + at;
+        let shim = &code[at..end];
+        // Count the CALL FORM, never the bare identifier: this test's own assertion strings name
+        // the symbol, and a guard that counts a name it also mentions can be satisfied by its own
+        // message (CLAUDE.md §9). Prose is not a call.
+        assert_eq!(
+            shim.matches("request_manifest_from_inner(").count(),
+            1,
+            "the command must delegate to the inner exactly once"
+        );
+        assert!(
+            !shim.contains("send_dm_inner("),
+            "the command must not send its own DM — that is the inner's job, and a second copy is \
+             exactly how a step gets silently dropped"
+        );
+    }
+
     #[test]
     fn request_manifest_from_wires_the_author_through_at_the_call_site() {
         let src = include_str!("chat.rs");
@@ -1492,8 +1571,8 @@ mod tests {
         // assertion literals echo the strings it looks for, so an unbounded scan would be satisfied
         // by its own copy — the very P-6 hole this guard exists to close.
         let at = code
-            .find("pub async fn request_manifest_from(")
-            .expect("the ask-origination command must exist");
+            .find("pub(crate) async fn request_manifest_from_inner(")
+            .expect("the ask-origination body must exist");
         let end = code[at..]
             .find("#[cfg(test)]")
             .expect("the test module must follow the command")
@@ -1517,7 +1596,7 @@ mod tests {
              degrades the ask to an authorless one"
         );
         assert!(
-            body.contains(".record_manifest_ask(&npub, &author_npub,"),
+            body.contains(".record_manifest_ask(npub, &author_npub,"),
             "the ask must be recorded under the (peer, AUTHOR) key — the peer-only spelling is the \
              owner-path one and would let a re-serve ask collide with it"
         );

@@ -12,6 +12,9 @@ mod conn;
 mod dm_cache_store;
 mod dm_quarantine;
 mod error;
+// QURATOR-164 item 3 — the background fetch driver (owner ruling 2026-09-04, option (b)):
+// refetch on fingerprint change, carriers before the author.
+mod fetch_driver;
 mod identity_state;
 // v0.12.10 diagnostic build — file-based tracing subscriber for the beacon-loop wedge.
 mod logging;
@@ -198,6 +201,16 @@ fn spawn_background_tasks(
         Arc::clone(&identity),
         Arc::clone(&relay),
         endpoint,
+    ));
+
+    // QURATOR-164 item 3 (owner ruling 2026-09-04, option (b)): the background fetch driver.
+    // Nobody clicks — it notices a held collection's fingerprint has moved and re-asks, carriers
+    // before the author. Spawned alongside the auto-approve loop because the two are the serve and
+    // fetch halves of the same background infrastructure; neither has a UI surface.
+    tauri::async_runtime::spawn(fetch_driver::run_fetch_driver_loop(
+        store.clone(),
+        Arc::clone(&identity),
+        Arc::clone(&relay),
     ));
 
     // The wakeup counter is the L4 idle-guard hook; in prod it is written-and-ignored.

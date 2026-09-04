@@ -265,10 +265,6 @@ fn get_inner(
 ///
 /// Deliberately carries no envelope — a caller enumerating the cache wants to know *what is here*,
 /// and loading every manifest body to answer that would cost O(total cache bytes).
-// QURATOR-164 item 3: consumed by the background fetch driver (slice 3), which is not
-// built yet. REMOVE this allow when that lands — an allow that outlives its reason is how
-// dead code has survived here before.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedKey {
     pub npub: String,
@@ -289,7 +285,6 @@ pub struct CachedKey {
 ///
 /// Since the cache is keyed on `(npub, slug)` alone, a collection appears **at most once**, at
 /// whatever snapshot was written last.
-#[allow(dead_code)] // see the tombstone on `CachedKey` above.
 pub fn list(dir: &Path) -> Vec<CachedKey> {
     scan(dir)
         .into_iter()

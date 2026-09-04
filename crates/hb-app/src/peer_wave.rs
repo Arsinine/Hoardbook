@@ -31,11 +31,6 @@
 //! the asks through [`crate::ask_throttle::acquire`] and watches fingerprints is a separate slice;
 //! this module deliberately knows nothing about transports, stores or DMs.
 
-// QURATOR-164 item 3, slice 1 of 3: the policy core lands before the driver that calls it, so
-// every item below is built-but-uncalled until slice 2 wires it into the fetch loop. REMOVE this
-// allow in that slice — an allow that outlives its reason is how dead UI has shipped here before.
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -117,7 +112,7 @@ fn backoff_for(attempts: u32) -> Duration {
 ///
 /// Order of preference is property 3 in the module doc: ready carriers first, then wait on a
 /// backing-off carrier, then the author, then give up. Never panics and never reads the clock.
-fn next_action(peers: &[Candidate], author: &Candidate, now: Instant) -> WaveAction {
+pub(crate) fn next_action(peers: &[Candidate], author: &Candidate, now: Instant) -> WaveAction {
     let wave: Vec<String> = peers
         .iter()
         .filter(|c| c.is_ready(now))

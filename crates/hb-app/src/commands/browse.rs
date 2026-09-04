@@ -623,7 +623,7 @@ pub async fn unfollow_contact(npub: String, store: State<'_, DataStore>) -> CmdR
 }
 
 /// Rebuild a share code from a saved contact (npub + cached browse-key) so a refresh can re-read.
-fn contact_share_code(contact: &CachedPeer) -> Result<ShareCode, String> {
+pub(crate) fn contact_share_code(contact: &CachedPeer) -> Result<ShareCode, String> {
     let pubkey = hb_core::identity::parse_npub(&contact.npub).map_err(cmd_err)?;
     match &contact.browse_key_hex {
         Some(hexk) => {
