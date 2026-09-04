@@ -1476,4 +1476,368 @@ mod tests {
             "an un-stored topic with a name is the non-member recovery case — allowed"
         );
     }
+
+    // ── QURATOR-182 — dispatch coverage, hermetic subset of `commands/topics.rs` ────────────────
+    //
+    // TRIAGE (16 commands × their real signature, no network):
+    //
+    //   HERMETIC (driven through the real command below):
+    //     topic_list               — store.load_topics() only; no State beyond DataStore.
+    //     topic_announce_status    — store.load_announce_times() + announce_cooldown_remaining; pure.
+    //     topic_announce_seen      — store.load_announce_seen(); pure read.
+    //     topic_announce_mark_seen — store.advance_announce_seen(); pure write.
+    //     topic_update_meta (private arm) — me() → load_stored() → description/tags mutation →
+    //                               store_topic(). The relay publish sits inside `if !private`, so a
+    //                               PRIVATE topic never builds a client. (The public re-announce arm
+    //                               is relay-bound and owed below.)
+    //     topic_lookup (refusal arm) — me() → normalized_public_name() both fire BEFORE
+    //                               net::client(). A name that fails validation reds at the guard's
+    //                               own text, never reaching the network. (The exists/member_count
+    //                               arms need fetch_announce on a live relay — owed below.)
+    //     topic_invite / topic_request_join (npub-parse arm) — me() → parse_npub() →
+    //                               load_stored()/net::client(). A malformed npub is refused by the
+    //                               parse before any I/O; topic_invite additionally has load_stored
+    //                               BEFORE its parse, so its "not in topic" refusal is also hermetic.
+    //     topic_announcements (empty-store early return) — load_topics().is_empty() returns Ok(vec![])
+    //                               before me()/net::client(), so an empty store drives it hermetically.
+    //
+    //   RELAY-BOUND (skipped, with reason — the guard is downstream of net::client()):
+    //     topic_discover, topic_discover_paint — fetch immediately after client build, no pre-client
+    //                               guard worth pinning (tags are passed through to hb-net).
+    //     topic_post, topic_channel, topic_roster, topic_announce (publish arm), topic_redeem_invite,
+    //     topic_preview_invite, topic_announcements (non-empty store), topic_lookup (exists arm),
+    //     topic_update_meta (public arm) — every distinguishing behaviour is on the far side of a
+    //                               live relay read/publish. Per-module convention (see the OWED
+    //                               blocks in `mod command_guards` above), the pure halves are
+    //                               factored out and unit-tested elsewhere in this file; a tests-only
+    //                               slice must not build an injection seam.
+
+    mod dispatch {
+        use super::*;
+        use crate::identity_state::AppIdentity;
+        use tauri::Manager;
+
+        /// Mock app + managed state. `identity_loaded` = false leaves SharedIdentity EMPTY so the
+        /// identity guard can be exercised; true generates one. RELAY HAZARD: the store pins
+        /// `ws://127.0.0.1:9` (closed by definition) so no test in this module can reach the
+        /// internet even if a code path drifts toward net::client.
+        fn dispatch_app(identity_loaded: bool) -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            store
+                .save_settings(&crate::store::Settings {
+                    relay_urls: vec!["ws://127.0.0.1:9".into()],
+                    ..Default::default()
+                })
+                .unwrap();
+            let identity: SharedIdentity = std::sync::Arc::new(tokio::sync::RwLock::new(
+                identity_loaded.then(AppIdentity::generate),
+            ));
+            app.manage(identity);
+            app.manage(store);
+            app.manage(net::new_shared());
+            app
+        }
+
+        /// Seed one stored Topic (APPENDING — `save_topics` replaces the whole list, so two
+        /// single-element saves would erase each other) and return its `topic_id`.
+        /// `membership_json: None` keeps every seeded topic off the wire (only `topic_leave` reads
+        /// it, and that path is relay-bound).
+        fn seed_topic(store: &DataStore, name: &str, description: &str, private: bool) -> String {
+            let (meta, key) = new_topic(name, description, vec![], private).unwrap();
+            let id = meta.topic_id.clone();
+            let mut topics = store.load_topics().unwrap();
+            topics.push(StoredTopic { meta, key, joined_at: 7, membership_json: None });
+            store.save_topics(&topics).unwrap();
+            id
+        }
+
+        /// P-10: in `topic_list` (whose body is the single expression
+        /// `Ok(store.load_topics().map_err(cmd_err)?.iter().map(TopicView::from).collect())`,
+        /// unique to that fn at line ~251), replace the body with `Ok(Vec::new())` — the
+        /// `len() == 2` assert must go red.
+        #[tokio::test]
+        async fn topic_list_command_round_trips_saved_topics() {
+            let app = dispatch_app(true);
+            let store = app.state::<DataStore>();
+            let public_id = seed_topic(&store, "video/films", "criterion", false);
+            let private_id = seed_topic(&store, "back room", "secret", true);
+
+            let got = topic_list(app.state::<DataStore>()).await.unwrap();
+            assert_eq!(got.len(), 2, "both seeded topics come back");
+            let pub_view = got.iter().find(|t| t.topic_id == public_id).expect("public topic present");
+            assert_eq!(pub_view.name, "video/films");
+            assert_eq!(pub_view.description, "criterion");
+            assert!(!pub_view.private, "public flag round-trips");
+            assert_eq!(pub_view.joined_at, 7, "joined_at round-trips");
+            let priv_view = got.iter().find(|t| t.topic_id == private_id).expect("private topic present");
+            assert!(priv_view.private, "private flag round-trips");
+        }
+
+        /// P-10: in `topic_announce_status`, change
+        ///   `Ok(announce_cooldown_remaining(times.get(&topic_id).copied(), now()))`
+        /// to `Ok(0)` — the `remaining > 103_000` assert must go red. (The `times.get(..)` line
+        /// is unique to `topic_announce_status`; `announce_cooldown_remaining` is called from
+        /// `burn_announce_cooldown` too, but never with a `times.get(..)` argument.)
+        #[tokio::test]
+        async fn topic_announce_status_reports_the_persisted_cooldown_and_zero_for_unknown_topics() {
+            let app = dispatch_app(true);
+            let store = app.state::<DataStore>();
+            // A burn stamped 100_000s in the FUTURE: remaining = (t0 + 3600) - now, comfortably
+            // above 103_000 and below 104_000 for any realistic wall-clock drift during the test.
+            let t0 = now() + 100_000;
+            let mut times = HashMap::new();
+            times.insert("films".to_string(), t0);
+            store.save_announce_times(&times, t0).unwrap();
+
+            let remaining =
+                topic_announce_status("films".into(), app.state::<DataStore>()).await.unwrap();
+            assert!(
+                remaining > 103_000,
+                "the command reads the PERSISTED burn (≈103_600 minus elapsed), got {remaining}"
+            );
+            assert!(
+                remaining <= 104_000,
+                "and not the raw timestamp or anything unbounded, got {remaining}"
+            );
+
+            // No burn on record for this topic ⇒ ready now.
+            let unknown = topic_announce_status("other".into(), app.state::<DataStore>()).await.unwrap();
+            assert_eq!(unknown, 0, "a topic with no persisted burn reports ready (0)");
+        }
+
+        /// P-10: in `topic_announce_mark_seen`, replace the body
+        ///   `store.advance_announce_seen(&topic_id, ts).map_err(cmd_err)`
+        /// with `Ok(())` — the `seen["films"] == 5_000` assert must go red.
+        #[tokio::test]
+        async fn topic_announce_mark_seen_then_topic_announce_seen_round_trips() {
+            let app = dispatch_app(true);
+
+            topic_announce_mark_seen("films".into(), 5_000, app.state::<DataStore>())
+                .await
+                .unwrap();
+
+            let seen = topic_announce_seen(app.state::<DataStore>()).await.unwrap();
+            assert_eq!(seen.get("films"), Some(&5_000), "the watermark written by mark_seen is read back by topic_announce_seen");
+            assert!(!seen.contains_key("other"), "an unmarked topic has no watermark entry");
+        }
+
+        /// P-10: this pins the never-rewind semantic THROUGH the command pair. The mutation is in
+        /// `crates/hb-app/src/store.rs`, in `advance_announce_seen` — change
+        ///   `Some(existing) => ts > *existing,`
+        /// to
+        ///   `Some(_) => true,`
+        /// — the `seen["films"] == 9_000` assert must go red (the stale 4_000 write lands).
+        #[tokio::test]
+        async fn topic_announce_mark_seen_never_rewinds_the_watermark() {
+            let app = dispatch_app(true);
+
+            topic_announce_mark_seen("films".into(), 9_000, app.state::<DataStore>())
+                .await
+                .unwrap();
+            // A STALE stamp (e.g. an out-of-order poll) must not drag the watermark backwards.
+            topic_announce_mark_seen("films".into(), 4_000, app.state::<DataStore>())
+                .await
+                .unwrap();
+
+            let seen = topic_announce_seen(app.state::<DataStore>()).await.unwrap();
+            assert_eq!(
+                seen.get("films"),
+                Some(&9_000),
+                "advance_announce_seen is an ADVANCE — a stale ts never rewinds the watermark"
+            );
+        }
+
+        /// P-10: in `topic_update_meta`, delete the line `stored.meta.description = description;`
+        /// (replace it with `let _ = description;`) — the `description == "new blurb"` assert must
+        /// go red, and so must the reload assert, proving the write-through is the command's, not
+        /// a leftover of the seed.
+        ///
+        /// The PRIVATE arm is the only hermetic one: the relay publish sits inside
+        /// `if !stored.meta.private`, so a private Topic never builds a client (the public arm is
+        /// relay-bound — see the triage comment at the top of this module).
+        #[tokio::test]
+        async fn topic_update_meta_updates_a_private_topic_description_without_any_relay() {
+            let app = dispatch_app(true);
+            let store = app.state::<DataStore>();
+            let id = seed_topic(&store, "back room", "old blurb", true);
+
+            let view = topic_update_meta(
+                id.clone(),
+                "new blurb".into(),
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(view.description, "new blurb", "the new description is returned");
+            assert_eq!(view.name, "back room", "the NAME is immutable — it is not a parameter and cannot drift");
+            assert!(view.private);
+            // And it persisted (store_topic write-through), not just the returned view.
+            let reloaded = store.load_topics().unwrap();
+            assert_eq!(
+                reloaded.iter().find(|t| t.meta.topic_id == id).unwrap().meta.description,
+                "new blurb",
+                "the edit is on disk, not only in the response"
+            );
+        }
+
+        /// P-10: in `topic_lookup`, replace the line
+        ///   `let normalized = normalized_public_name(&name).map_err(cmd_err)?;`
+        /// with `let normalized = name.clone();` — both `starts_with("invalid event: …")`
+        /// asserts must go red (each bad name then sails into net::client and fails at the
+        /// connect instead). That exact line lives in `topic_lookup` only — `topic_create`'s
+        /// validation is inside hb-core's `new_topic`, and `topic_join_public`'s is inside
+        /// hb-net's `join_public`, both distinct call sites.
+        ///
+        /// Both refusals fire BEFORE `net::client` is built, so the error text is the guard's
+        /// own — and the valid-name probe proves the placement by dying at the connect instead.
+        #[tokio::test]
+        async fn topic_lookup_refuses_invalid_public_names_before_any_relay_contact() {
+            let app = dispatch_app(true);
+
+            let err = topic_lookup(
+                "gaming/retro".into(),
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.starts_with("invalid event: a public Topic's first path segment must be a category"),
+                "the non-category root is refused by the name guard, got {err}"
+            );
+
+            let err = topic_lookup(
+                "  /  ".into(),
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.ends_with("a public Topic name cannot be empty"),
+                "a name that normalizes to nothing is refused by the name guard, got {err}"
+            );
+
+            // Pass-side probe: a well-formed name clears the guard and dies at the pinned
+            // unroutable relay (ws://127.0.0.1:9), never in the guard.
+            let err = topic_lookup(
+                "video/films".into(),
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.contains("Could not connect to any relay"),
+                "a valid name must clear the guard and fail at the connect, got {err}"
+            );
+        }
+
+        /// Two pre-client guards of `topic_invite` (its call order is me() → parse_npub →
+        /// load_stored → net::client — both refusals land before any I/O):
+        ///
+        /// P-10 (unknown-topic arm): in `load_stored` (the helper fn near the top of this file,
+        /// NOT the similar `.find` inside `store_topic` or `alive_key_for`), change
+        ///   `.find(|t| t.meta.topic_id == topic_id)`
+        /// to `.find(|_| true)` — the `starts_with("You are not in topic")` assert must go red
+        /// (the first stored topic is returned and the command proceeds to the connect).
+        ///
+        /// P-10 (bad-npub arm): in `topic_invite`, change
+        ///   `hb_core::identity::parse_npub(&invitee_npub).map_err(cmd_err)?`
+        /// to `hb_core::identity::parse_npub(&Identity::generate().npub()).map_err(cmd_err)?`
+        /// — the bad-npub assert must go red (the garbage input is replaced by a valid key and
+        /// the command proceeds to the connect).
+        #[tokio::test]
+        async fn topic_invite_refuses_an_unknown_topic_and_a_malformed_npub_before_the_relay() {
+            let app = dispatch_app(true);
+            let store = app.state::<DataStore>();
+            let id = seed_topic(&store, "back room", "d", true);
+            let stranger = npub_of(&Identity::generate());
+
+            // Unknown topic, valid invitee: refused by load_stored's guard.
+            let err = topic_invite(
+                "no-such-topic".into(),
+                stranger,
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.starts_with("You are not in topic no-such-topic"),
+                "inviting into a topic I'm not in is refused before the relay, got {err}"
+            );
+
+            // Stored topic, malformed invitee npub: refused by parse_npub.
+            let err = topic_invite(
+                id,
+                "not-an-npub".into(),
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.starts_with("invalid public key"),
+                "a malformed invitee npub is refused before the relay, got {err}"
+            );
+        }
+
+        /// P-10: in `topic_request_join`, change
+        ///   `hb_core::identity::parse_npub(&member_npub).map_err(cmd_err)?`
+        /// to `hb_core::identity::parse_npub(&Identity::generate().npub()).map_err(cmd_err)?`
+        /// — the assert must go red (the garbage input is replaced by a valid key and the
+        /// command proceeds to the connect). Distinct from `topic_invite`'s identical-shaped
+        /// line: this one names `member_npub` and lives in `topic_request_join`.
+        #[tokio::test]
+        async fn topic_request_join_refuses_a_malformed_member_npub_before_the_relay() {
+            let app = dispatch_app(true);
+
+            let err = topic_request_join(
+                "not-an-npub".into(),
+                "some-topic-id".into(),
+                "video/films".into(),
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.starts_with("invalid public key"),
+                "a malformed member npub is refused before the relay, got {err}"
+            );
+        }
+
+        /// P-10: in `topic_announcements`, delete the early-return block
+        ///   `if topics.is_empty() { return Ok(Vec::new()); }`
+        /// — this test must go red: with NO identity loaded the command then falls into
+        /// `me(&identity)` and returns "No identity loaded…", so the `.unwrap()` panics. That
+        /// pins the ORDER (empty-store check precedes the identity guard), not just the value.
+        #[tokio::test]
+        async fn topic_announcements_returns_empty_before_the_identity_guard_on_an_empty_store() {
+            // Identity deliberately NOT loaded: an empty topic store must still return Ok(vec![]),
+            // because the empty-store early return fires before me().
+            let app = dispatch_app(false);
+
+            let got = topic_announcements(
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap();
+            assert!(got.is_empty(), "an empty store returns an empty summary list without needing an identity");
+        }
+    }
 }
