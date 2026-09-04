@@ -107,12 +107,13 @@ fn entry_filename(npub: &str, slug: &str) -> String {
     format!("{}.json", hex::encode(&h.finalize()[..16]))
 }
 
-/// Read every well-formed entry file in `dir` as `(filename, byte_len, last_access, npub, slug)`. A
+/// Read every well-formed entry file in `dir` as
+/// `(filename, byte_len, last_access, npub, slug, fingerprint)`. A
 /// malformed or unreadable file is skipped (a cache is best-effort — never a hard error). The
 /// `npub`/`slug` are the entry's OWN recorded key, not anything derived from the filename — that is
 /// what lets [`migrate_legacy_entries`] tell a legacy file (named by a hash of
 /// `(npub, slug, fingerprint)`) from a canonical one by comparison, not by parsing.
-fn scan(dir: &Path) -> Vec<(String, usize, u64, String, String)> {
+fn scan(dir: &Path) -> Vec<(String, usize, u64, String, String, String)> {
     let mut out = Vec::new();
     let Ok(read_dir) = std::fs::read_dir(dir) else {
         return out;
@@ -125,7 +126,14 @@ fn scan(dir: &Path) -> Vec<(String, usize, u64, String, String)> {
         let Ok(bytes) = std::fs::read(&path) else { continue };
         let Ok(parsed) = serde_json::from_slice::<CacheEntry>(&bytes) else { continue };
         let Some(name) = path.file_name().and_then(|n| n.to_str()).map(String::from) else { continue };
-        out.push((name, bytes.len(), parsed.last_access, parsed.npub, parsed.slug));
+        out.push((
+            name,
+            bytes.len(),
+            parsed.last_access,
+            parsed.npub,
+            parsed.slug,
+            parsed.fingerprint,
+        ));
     }
     out
 }
@@ -192,7 +200,7 @@ pub fn put(
     // The projection drops the key fields `scan` also returns — eviction sorts on bytes/recency only.
     if cap_bytes != usize::MAX {
         let entries: Vec<(String, usize, u64)> =
-            scan(dir).into_iter().map(|(n, b, la, _, _)| (n, b, la)).collect();
+            scan(dir).into_iter().map(|(n, b, la, _, _, _)| (n, b, la)).collect();
         for name in eviction_plan(&entries, cap_bytes) {
             let _ = std::fs::remove_file(dir.join(name)); // best-effort; a stuck file just lingers
         }
@@ -251,6 +259,42 @@ fn get_inner(
         let _ = std::fs::write(&path, &updated);
     }
     Some(envelope)
+}
+
+/// One cached manifest's identity: which collection, at which snapshot.
+///
+/// Deliberately carries no envelope — a caller enumerating the cache wants to know *what is here*,
+/// and loading every manifest body to answer that would cost O(total cache bytes).
+// QURATOR-164 item 3: consumed by the background fetch driver (slice 3), which is not
+// built yet. REMOVE this allow when that lands — an allow that outlives its reason is how
+// dead code has survived here before.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedKey {
+    pub npub: String,
+    pub slug: String,
+    pub fingerprint: String,
+}
+
+/// Every manifest currently cached, as `(npub, slug, fingerprint)`.
+///
+/// **This is the only way to ask "what do I hold?".** Both readers ([`get`] and [`get_latest`])
+/// require a key the caller already has, so until this existed the cache could answer *do I have
+/// this?* but never *what have I got?* — which is precisely what a background fetch driver needs
+/// before it can notice that a held collection's fingerprint has moved on.
+///
+/// Order is filesystem order and carries no meaning; do not depend on it. A malformed or
+/// unreadable entry is skipped rather than erroring, exactly as `scan` skips it — a cache is
+/// best-effort, and one corrupt file must not blind the driver to every other collection.
+///
+/// Since the cache is keyed on `(npub, slug)` alone, a collection appears **at most once**, at
+/// whatever snapshot was written last.
+#[allow(dead_code)] // see the tombstone on `CachedKey` above.
+pub fn list(dir: &Path) -> Vec<CachedKey> {
+    scan(dir)
+        .into_iter()
+        .map(|(_, _, _, npub, slug, fingerprint)| CachedKey { npub, slug, fingerprint })
+        .collect()
 }
 
 /// The cache directory under a store base — `DataStore::manifest_cache_dir` returns this.
@@ -345,7 +389,7 @@ fn migrate_legacy_dir(dir: &Path) {
     // non-entry file, and deleting unknown files is not this pass's business.
     let mut by_key: std::collections::HashMap<(String, String), Vec<(String, u64)>> =
         std::collections::HashMap::new();
-    for (name, _bytes, last_access, npub, slug) in scan(dir) {
+    for (name, _bytes, last_access, npub, slug, _fingerprint) in scan(dir) {
         if name != entry_filename(&npub, &slug) {
             by_key.entry((npub, slug)).or_default().push((name, last_access));
         }
@@ -461,16 +505,83 @@ mod tests {
     /// (`entry.last_access = now;` and the `if let Ok(updated) = ... { let _ = ... }` block).
     /// Re-read the entry with `scan` afterwards and assert the recorded `last_access` moved from
     /// 10 to 200; under the mutant it stays 10 and the assert reds. (`scan` returns
-    /// `(filename, byte_len, last_access, npub, slug)`, so the bump is directly observable.)
+    /// `(filename, byte_len, last_access, npub, slug, fingerprint)`, so the bump is directly
+    /// observable.)
     #[test]
     fn get_latest_bumps_last_access_for_lru_recency() {
         let dir = tempfile::tempdir().unwrap();
         put(dir.path(), "npubA", "films", "fp1", "ENV-1", 10, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
         assert!(get_latest(dir.path(), "npubA", "films", 200).is_some());
         let entries = scan(dir.path());
-        let entry = entries.iter().find(|(_, _, _, npub, slug)| npub == "npubA" && slug == "films")
+        let entry = entries.iter().find(|(_, _, _, npub, slug, _)| npub == "npubA" && slug == "films")
             .expect("the entry is still there");
         assert_eq!(entry.2, 200, "a get_latest read must bump last_access to `now`");
+    }
+
+    /// MUTATION (P-10) — in `scan`'s `out.push((...))`, replace the `parsed.fingerprint` field
+    /// with `String::new()` → this test reds. (Anchored to the push expression in `scan`, not to
+    /// the word "fingerprint", which appears throughout this file's prose and struct fields.)
+    #[test]
+    fn list_reports_every_cached_collection_with_its_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "npubA", "films", "fp-A", "ENV-A", 10, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
+        put(dir.path(), "npubB", "music", "fp-B", "ENV-B", 11, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
+
+        let mut got = list(dir.path());
+        got.sort_by(|a, b| a.npub.cmp(&b.npub));
+        assert_eq!(
+            got,
+            vec![
+                CachedKey { npub: "npubA".into(), slug: "films".into(), fingerprint: "fp-A".into() },
+                CachedKey { npub: "npubB".into(), slug: "music".into(), fingerprint: "fp-B".into() },
+            ],
+            "the driver needs the fingerprint to tell a current copy from a superseded one"
+        );
+    }
+
+    /// MUTATION (P-10) — in `scan`, replace the `let Ok(read_dir) = std::fs::read_dir(dir) else
+    /// { return out; };` binding with `let read_dir = std::fs::read_dir(dir).unwrap();` → this
+    /// test reds (it panics on the absent directory instead of reporting nothing held).
+    #[test]
+    fn list_is_empty_for_a_cache_directory_that_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-created");
+        assert!(list(&missing).is_empty(), "a cold cache holds nothing; it is not an error");
+    }
+
+    /// MUTATION (P-10) — in `entry_filename`, add the fingerprint to the hashed parts (change the
+    /// `for part in [npub, slug]` array to `[npub, slug, "x"]` is NOT enough — instead take a
+    /// third `fingerprint: &str` param and hash it, updating the two call sites) → this test reds
+    /// with 2 entries instead of 1.
+    ///
+    /// This is the pin on the owner ruling of 2026-09-01 that the filename is keyed on
+    /// `(npub, slug)` ALONE: keying it on the fingerprint too made every update strand an
+    /// unreachable file. If that ever regresses, `list` would report the same collection several
+    /// times at different snapshots and the driver would chase snapshots that no reader can reach.
+    #[test]
+    fn list_reports_one_entry_per_collection_at_the_newest_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "npubA", "films", "fp-old", "ENV-1", 10, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
+        put(dir.path(), "npubA", "films", "fp-new", "ENV-2", 20, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
+
+        let got = list(dir.path());
+        assert_eq!(got.len(), 1, "the cache is keyed on (npub, slug), so an update overwrites");
+        assert_eq!(got[0].fingerprint, "fp-new", "and what remains is the newest snapshot");
+    }
+
+    /// MUTATION (P-10) — in `scan`, replace the `let Ok(parsed) =
+    /// serde_json::from_slice::<CacheEntry>(&bytes) else { continue };` binding with
+    /// `let parsed = serde_json::from_slice::<CacheEntry>(&bytes).unwrap();` → this test reds
+    /// (it panics on the corrupt file instead of skipping it).
+    #[test]
+    fn list_skips_a_malformed_entry_rather_than_losing_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "npubA", "films", "fp-A", "ENV-A", 10, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
+        std::fs::write(dir.path().join("corrupt.json"), b"{not json").unwrap();
+
+        let got = list(dir.path());
+        assert_eq!(got.len(), 1, "one bad file must not blind the driver to every other collection");
+        assert_eq!(got[0].npub, "npubA");
     }
 
     #[test]
