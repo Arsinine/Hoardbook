@@ -28,6 +28,7 @@
 
 mod args;
 mod suite_wan_c;
+mod suite_wan_carry;
 mod suite_wan_d;
 mod suite_wan_e2e;
 mod suite_wan_m;
@@ -123,6 +124,7 @@ fn usage() -> &'static str {
             [--suite wan-m]                 ticket arrives by DM; --ticket-json only overrides it\n\
             [--suite wan-e2e]\n\
             [--suite wan-u]\n\
+            [--suite carry --role a|c|d]\n\
             [--suite wan-c]\n\
             [--suite wan-t]\n\
             [--suite wan-d [--flood-relay <ws-url>... --flood-count <n>]]\n\
@@ -144,6 +146,10 @@ fn usage() -> &'static str {
             visibility, NIP-65, search-eviction VPS-only, BIGRELAY). --flood-relay arms D3.\n\
             --suite wan-r runs the WAN-R rows (R1–R2): relay-set resilience + the default-relay\n\
             policy watch (the canary row). R2 touches the public defaults — that is its job.\n\
+            --suite carry runs the CARRY rows (CA-CD): the 4-party Carrier-4 re-serve over real\n\
+            relays (A publishes then goes offline; C caches + re-serves; D asks + redeems).\n\
+            --role a|c|d picks the party this process plays; see the carry suite's module doc\n\
+            for the two-phase choreography and the flags each role takes.\n\
             --suite wan-m4 runs the M4 row standalone (n0 canary core — bind_endpoint obtains a\n\
             home relay and the endpoint is reachable through it). Probe-plays-both — no serve needed.\n\
      \n\
@@ -837,7 +843,7 @@ async fn run_probe(args: &[String]) -> Result<ExitCode> {
         bail!("probe requires at least one --relay");
     }
 
-    // WAN-U / WAN-C / WAN-T / WAN-D / WAN-R are probe-plays-both: every row constructs its own throwaway
+    // WAN-U / WAN-C / WAN-T / WAN-D / WAN-R (and the CARRY suite) are probe-plays-both: every row constructs its own throwaway
     // identities, so they need no --peer. All other suites (wan-p/m/e2e) drive a live serve and
     // require --peer.
     if suite == "wan-u" {
@@ -854,6 +860,11 @@ async fn run_probe(args: &[String]) -> Result<ExitCode> {
     }
     if suite == "wan-r" {
         return run_probe_wan_r(args).await;
+    }
+    // CARRY (QURATOR-178) is also probe-plays-a-role: each phase is driven by one process playing
+    // exactly one party (A, C or D) with its own --data-dir, so it needs no --peer either.
+    if suite == "carry" {
+        return run_probe_wan_carry(args).await;
     }
 
     let peer_str = args::flag_value(args, "--peer")
@@ -1261,6 +1272,54 @@ async fn run_probe_wan_r(args: &[String]) -> Result<ExitCode> {
 
     let mut tap = tap::Tap::new();
     suite_wan_r::run(&mut tap, &input).await;
+    Ok(tap.finish())
+}
+
+// ---------------------------------------------------------------------------
+// probe — CARRY (QURATOR-178 — the 4-party Carrier-4 re-serve)
+// ---------------------------------------------------------------------------
+
+/// Run the CARRY suite's rows for ONE party, chosen by `--role a|c|d`. Each phase is a separate
+/// `hb-wan-it probe --suite carry --role <x>` invocation with its own `--data-dir`:
+///
+/// * role A (the author):  `--role a --seed-dir <dir> --asker-npub <C npub>` — seeds + publishes the
+///   collection, answers C's ask, then the OPERATOR kills the process (that kill is the "A offline"
+///   leg; it is topology, not a row).
+/// * role C (the cacher):  `--role c --phase 1 --author-npub <A npub> --author-share-code <hbk…>`
+///   (fetch + cache from A), then `--role c --phase 2 --asker-npub <D npub>` (answer D's author-ask
+///   by re-serving the cached copy).
+/// * role D (the asker):   `--role d --carrier-npub <C npub> --carrier-share-code <hbk…>
+///   --author-npub <A npub>` — asks C for A's collection and redeems C's cached copy.
+///
+/// All relays come from `--relay` as usual (the SG strfry for the documented topology).
+async fn run_probe_wan_carry(args: &[String]) -> Result<ExitCode> {
+    let role = args::flag_value(args, "--role")
+        .ok_or_else(|| anyhow!("probe --suite carry requires --role a|c|d"))?
+        .to_string();
+
+    let data_dir = PathBuf::from(
+        args::flag_value(args, "--data-dir").unwrap_or("./hb-wan-it-probe-data").to_string(),
+    );
+    let store = DataStore::new(data_dir.clone());
+    let relays = args::collect_relays(args);
+    if relays.is_empty() {
+        bail!("probe requires at least one --relay");
+    }
+    store.save_settings(&Settings { relay_urls: relays.clone(), ..Default::default() })?;
+    let app_id = load_or_create_identity(&store)?;
+
+    println!("# CARRY probe — role {role}");
+    println!("# relay set: {}", relays.join(", "));
+
+    let input = suite_wan_carry::CarryInput {
+        app_id,
+        store,
+        relays,
+        args: args.to_vec(),
+    };
+
+    let mut tap = tap::Tap::new();
+    suite_wan_carry::run(&mut tap, &role, &input).await;
     Ok(tap.finish())
 }
 
