@@ -521,21 +521,33 @@ async fn run_auto_approve_loop(
         // recovers the real sender from the NIP-17 seal.
         let msgs = decode_dms(&own_npub, &identity, wraps, None).await;
         for msg in msgs {
-            // Try to parse the DM as a manifest request (the "Ask owner" wire). The body is JSON tagged
-            // `manifest_request`. If it doesn't parse, skip — it's a regular chat DM.
-            let trimmed = msg.content.trim();
-            if !trimmed.starts_with('{') {
-                continue;
-            }
-            let v: serde_json::Value = match serde_json::from_str(trimmed) {
-                Ok(v) => v,
-                Err(_) => continue,
+            // Parse with PRODUCTION's parser (QURATOR-183) — never a harness copy. A hand-rolled
+            // field read here silently lost the blank-string-to-`None` normalisation that decides
+            // whether an ask is Carrier-4, and that is the discriminator the routing below turns on.
+            let Some(body) = crate::auto_approve::ManifestRequestBody::parse(&msg.content) else {
+                continue; // an ordinary chat DM — not ours
             };
-            if v.get("hb").and_then(|h| h.as_str()) != Some("manifest_request") {
+            // Route by PRODUCTION's discriminator, and REFUSE what this loop cannot serve. This
+            // loop's only body is `approve_request` → `send_full_list_inner`, which builds THIS
+            // node's collection by slug. Handing it an author-bearing (Carrier-4 re-serve) ask
+            // would serve the WRONG collection whenever the slugs collide — "films" and "music"
+            // collide constantly — which is precisely the mis-route `should_auto_approve`'s
+            // deleted step (0) used to prevent. `--suite carry` owns the re-serve path and drives
+            // `send_cached_manifest_inner` itself; this loop must say so out loud rather than
+            // quietly answer with the wrong bytes.
+            if let crate::auto_approve::ApprovalBody::CachedManifest { author } =
+                crate::auto_approve::approval_body_for(&body)
+            {
+                eprintln!(
+                    "[serve] REFUSED a Carrier-4 re-serve ask from {} for '{}' by author {author}: \
+                     this loop only serves its OWN collections (send_full_list_inner). Use \
+                     --suite carry, which drives send_cached_manifest_inner.",
+                    msg.from, body.slug
+                );
                 continue;
             }
-            let slug = v.get("slug").and_then(|s| s.as_str()).unwrap_or("");
-            let ask_nonce = v.get("ask_nonce").and_then(|n| n.as_str());
+            let slug = body.slug.as_str();
+            let ask_nonce = body.ask_nonce.as_deref();
             // Dedup by (sender, slug, nonce) so a re-delivered request-DM doesn't trigger a second
             // approval (the production inbox would show it once).
             let dedup_key = format!("{}|{slug}|{}", msg.from, ask_nonce.unwrap_or(""));
@@ -1518,6 +1530,49 @@ mod tests {
     /// MUTATION (P-10, resolve by containing function): in `approve_request`, replace the
     /// `send_full_list_inner(` call with any hand-rolled step — e.g. re-add `issue_ticket(` — and
     /// this test reds. Comments are stripped first, so restating the rule in prose cannot satisfy it.
+    /// The serve loop must parse with PRODUCTION's parser and route by PRODUCTION's
+    /// discriminator — QURATOR-183, the same fix `suite_wan_carry.rs` took. Two things are pinned,
+    /// and the second is a real trap rather than tidiness:
+    ///
+    /// 1. No hand-rolled request-DM tag check. A copy loses the blank-string-to-`None`
+    ///    normalisation that decides whether an ask is Carrier-4.
+    /// 2. An author-bearing ask is REFUSED, not served. This loop's only body is
+    ///    `send_full_list_inner`, which builds THIS node's collection by slug — serving a
+    ///    Carrier-4 re-serve ask through it returns the wrong collection on a slug collision,
+    ///    which is exactly what `should_auto_approve`'s deleted step (0) used to prevent.
+    ///
+    /// MUTATION (P-10) — resolved by containing function: in `run_auto_approve_loop`, delete the
+    /// `ApprovalBody::CachedManifest` refusal arm → the routing assert reds; or restore a
+    /// `serde_json::from_str` + `v.get("hb")` parse → the tag-literal assert reds.
+    #[test]
+    fn the_serve_loop_parses_via_production_and_refuses_carrier4_asks() {
+        let src = include_str!("mod.rs");
+        // Comments stripped: documenting the rule must not satisfy it. The test half below quotes
+        // the literals this scans for, so slice the production half only.
+        let production = &src[..src.find("#[cfg(test)]").expect("test module must exist")];
+        let code: String = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !code.contains("\"manifest_request\""),
+            "the serve loop must not re-implement the request-DM tag check — that literal belongs \
+             to ManifestRequestBody::parse, and a copy covers the copy, not what ships"
+        );
+        assert!(
+            code.contains("ManifestRequestBody::parse"),
+            "the serve loop must parse request-DMs with production's parser"
+        );
+        assert!(
+            code.contains("ApprovalBody::CachedManifest"),
+            "the serve loop must consult production's routing discriminator and REFUSE an \
+             author-bearing ask — its only body is send_full_list_inner, which would serve THIS \
+             node's same-named collection instead of the author's"
+        );
+    }
+
     #[test]
     fn the_harness_approves_through_send_full_list_inner_and_never_rebuilds_it() {
         let src = include_str!("mod.rs");
