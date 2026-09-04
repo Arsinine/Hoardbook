@@ -20,6 +20,9 @@ mod manifest_source;
 mod net;
 // QURATOR-68 — wires the pure NAT classifier (`net::classify_nat`) to a launch-time reading.
 mod nat;
+// QURATOR-164 item 3 — pure peer-wave selection policy (2-3 per wave, 3 attempts per peer,
+// exponential backoff, author last). No I/O; the driver that calls it is a later slice.
+mod peer_wave;
 mod portable_update_logic;
 mod presence;
 mod single_instance;
