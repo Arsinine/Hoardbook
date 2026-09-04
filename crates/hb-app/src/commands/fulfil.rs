@@ -641,6 +641,18 @@ pub(crate) async fn redeem_manifest_ticket_with_progress(
         }
         .sink(tx)
     });
+    // QURATOR-164 ask throttle — the FETCH-REQUEST half of the ruling ("scope is manifest asks and
+    // fetch requests"). Placement, deliberately:
+    //   - AFTER every cheap local failure path (parse, shape, SSRF sanitize, identity, claim,
+    //     endpoint) — a redemption that `?`s above never reaches the network and consumes no slot.
+    //   - IMMEDIATELY BEFORE the fetch, so it paces the INITIATION, not the transfer: `acquire()`
+    //     returns once its own wait is done and holds nothing across this multi-second,
+    // progress-reporting fetch, so concurrent redemptions still overlap — only their dials are
+    //     spaced >=1s apart. The ruling is about relay/peer citizenship on outbound request
+    //     bursts, never about serialising transfers.
+    //   - It DELAYS, it never DISCARDS: a burst of redemptions queues here and leaves one per
+    //     second. There is no error path — an error path would mean the ruling was misread.
+    crate::ask_throttle::acquire().await;
     fetch_manifest_with_progress(&ep, &ticket, |payload| {
         let raw = std::str::from_utf8(payload.as_bytes())
             .map_err(|_| anyhow::anyhow!("the manifest that arrived was not text"))?;

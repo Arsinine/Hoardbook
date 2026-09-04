@@ -13,9 +13,14 @@
 //!    callers (CLAUDE.md §7) and would silently give every call site its own budget. There is
 //!    exactly one `ASK_THROTTLE` cell below; both ask commands go through it.
 //! 3. **Chat/DM is NOT throttled** — 1/sec would make chat feel broken. Scope is manifest asks
-//!    (`request_manifest` / `request_manifest_from` in `commands/chat.rs`); `send_message` and
-//!    every other DM path never touch this module. Pinned by
-//!    `chat_and_dm_paths_are_not_throttled`.
+//!    (`request_manifest` / `request_manifest_from` in `commands/chat.rs`) AND fetch requests
+//!    (`redeem_manifest_ticket_with_progress` in `commands/fulfil.rs`) — the ruling's own wording;
+//!    `send_message` and every other DM path never touch this module. Pinned by
+//!    `chat_and_dm_paths_are_not_throttled` and `the_fetch_request_path_takes_a_slot_before_dialing`.
+//!    On the fetch side the slot paces the DIAL, not the transfer: `acquire()` releases its lock
+//!    before returning, so concurrent redemptions still overlap and only their initiations are
+//!    spaced. Serialising multi-second transfers behind a 1/sec gate would be different, and
+//!    unruled, behaviour.
 //!
 //! Shape: a pure, synchronous core ([`delay_until_slot`]) that computes the wait — no I/O, no
 //! globals, no async — plus a thin shared wrapper ([`acquire`]) that holds ONE lock across the
@@ -262,6 +267,43 @@ mod tests {
                 "{sig}: the throttle acquire must precede the relay write — it paces the outbound DM"
             );
         }
+    }
+
+    /// The FETCH-REQUEST half of the ruling's scope ("manifest asks and fetch requests"). Pins
+    /// that the one production fetch initiation takes a slot, and takes it BEFORE dialing — a
+    /// throttle applied after the fetch would pace nothing at all.
+    ///
+    /// MUTATION (P-10) — resolved by containing function, never bare text, since `fulfil.rs` has
+    /// near-identical lines elsewhere: in `redeem_manifest_ticket_with_progress`, either delete
+    /// the `crate::ask_throttle::acquire().await;` line (the count assert reds) or move it below
+    /// the `fetch_manifest_with_progress(` call (the ordering assert reds).
+    #[test]
+    fn the_fetch_request_path_takes_a_slot_before_dialing() {
+        let src = include_str!("commands/fulfil.rs");
+        // Comments stripped, so documenting the rule cannot satisfy it — same construction as
+        // `chat_and_dm_paths_are_not_throttled`, and for the same reason.
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("crate::ask_throttle::acquire").count(),
+            1,
+            "exactly one fetch initiation in fulfil.rs may take the throttle"
+        );
+        let region = fn_region(&code, "pub(crate) async fn redeem_manifest_ticket_with_progress(");
+        let acquire = region
+            .find("crate::ask_throttle::acquire")
+            .expect("the redeem path must go through the shared limiter");
+        let fetch = region
+            .find("fetch_manifest_with_progress(")
+            .expect("the redeem path must still dial");
+        assert!(
+            acquire < fetch,
+            "the throttle must precede the dial — it paces the INITIATION of a fetch, and a slot \
+             taken afterwards would pace nothing"
+        );
     }
 
     /// Slice `code` from the (first, i.e. production) occurrence of `sig` to the next line-start
