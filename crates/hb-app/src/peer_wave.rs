@@ -18,10 +18,13 @@
 //!    enforced (a wave takes every ready peer up to the cap, so it is only smaller than 2 when
 //!    fewer than 2 peers are actually ready — waiting to batch a bigger wave would add delay for
 //!    no benefit).
-//! 3. **The author is the TERMINAL fallback, not the first choice.** Spreading load off the author
-//!    is the entire reason this module exists, so the author is consulted only once every carrier
-//!    is exhausted. It is still a real destination — [`WaveAction::FallBackToAuthor`] — because a
-//!    fetch that gave up while the author was reachable would be a worse outcome than the load.
+//! 3. **The author rides IN the wave, not after it** (owner ruling 2026-09-04): *"if the author and
+//!    a carrier are both online, fetch from whichever has a free download slot."* A free slot is
+//!    discovered by asking, so the author is asked ALONGSIDE the carriers and the first answer
+//!    wins. ⚠ An earlier cut of this module made the author a terminal fallback reached only once
+//!    every carrier was exhausted — strictly more load-spreading, but NOT what was ruled, and it
+//!    paid up to three backoffs per carrier in latency before trying the one source guaranteed to
+//!    hold the collection. Do not reinstate that ordering.
 //! 4. **Give-up is bounded and explicit.** Without a terminal state a fetch can hang across many
 //!    dead peers. [`WaveAction::GiveUp`] is reached only after the author itself is exhausted.
 //!
@@ -85,13 +88,12 @@ impl Candidate {
 /// What the driver should do next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WaveAction {
-    /// Ask these peers now — between 1 and [`WAVE_MAX_PEERS`] npubs, never empty.
+    /// Ask these sources now: up to [`WAVE_MAX_PEERS`] carriers, plus the author when ready.
+    /// Never empty. Whoever answers first wins — that is how a free download slot is discovered.
     Ask(Vec<String>),
-    /// Every live candidate is inside its backoff; wait this long and decide again.
+    /// Every live source is inside its backoff; wait this long and decide again.
     Wait(Duration),
-    /// Every carrier is exhausted — go to the author.
-    FallBackToAuthor,
-    /// The author is exhausted too. Nothing left to try.
+    /// Every source, the author included, is exhausted. Nothing left to try.
     GiveUp,
 }
 
@@ -110,39 +112,38 @@ fn backoff_for(attempts: u32) -> Duration {
 
 /// Pure core — pick the next action, given the carriers, the author, and the current instant.
 ///
-/// Order of preference is property 3 in the module doc: ready carriers first, then wait on a
-/// backing-off carrier, then the author, then give up. Never panics and never reads the clock.
+/// The wave is up to [`WAVE_MAX_PEERS`] ready carriers **plus the author when the author is ready**
+/// (property 3). Carriers are listed first, which expresses the load-spreading preference as
+/// ORDERING rather than as exclusion — but the author is in the same wave, so a carrier that is
+/// merely slow can never stall a fetch the author could have served at once.
+///
+/// Never panics and never reads the clock.
 pub(crate) fn next_action(peers: &[Candidate], author: &Candidate, now: Instant) -> WaveAction {
-    let wave: Vec<String> = peers
+    let mut wave: Vec<String> = peers
         .iter()
         .filter(|c| c.is_ready(now))
         .take(WAVE_MAX_PEERS)
         .map(|c| c.npub.clone())
         .collect();
+    if author.is_ready(now) {
+        wave.push(author.npub.clone());
+    }
     if !wave.is_empty() {
         return WaveAction::Ask(wave);
     }
 
-    // No carrier is ready. If any is merely backing off, wait for the soonest rather than
-    // burdening the author — the shortest remaining backoff is when the picture next changes.
-    let soonest = peers
+    // Nothing is ready. If any source — carrier or author — is merely backing off, wait for the
+    // soonest: that is when the picture next changes. Only when every source has spent its attempt
+    // budget is there nothing left to try.
+    match peers
         .iter()
+        .chain(std::iter::once(author))
         .filter(|c| !c.is_exhausted())
         .map(|c| c.remaining_backoff(now))
-        .min();
-    if let Some(wait) = soonest {
-        return WaveAction::Wait(wait);
-    }
-
-    // Every carrier is exhausted.
-    if author.is_exhausted() {
-        return WaveAction::GiveUp;
-    }
-    let author_wait = author.remaining_backoff(now);
-    if author_wait.is_zero() {
-        WaveAction::FallBackToAuthor
-    } else {
-        WaveAction::Wait(author_wait)
+        .min()
+    {
+        Some(wait) => WaveAction::Wait(wait),
+        None => WaveAction::GiveUp,
     }
 }
 
@@ -155,6 +156,12 @@ mod tests {
         Candidate { npub: npub.into(), attempts, last_attempt: Some(now - ago) }
     }
 
+    /// A source that has spent its whole attempt budget, long enough ago that only the cap can be
+    /// keeping it out of a wave.
+    fn spent(npub: &str, now: Instant) -> Candidate {
+        tried(npub, MAX_ATTEMPTS_PER_PEER, Duration::from_secs(600), now)
+    }
+
     fn asked(action: &WaveAction) -> &[String] {
         match action {
             WaveAction::Ask(v) => v,
@@ -162,59 +169,77 @@ mod tests {
         }
     }
 
-    /// MUTATION (P-10) — the edit goes in the `MAX_ATTEMPTS_PER_PEER` const initializer (the
-    /// `3` above the tests): change it to `4` → this test reds. (Anchored to the const's
-    /// initializer by line, not by a text search — this file's prose also quotes the ruling's
-    /// "3 attempts".)
+    /// MUTATION (P-10) — the edit goes in the `MAX_ATTEMPTS_PER_PEER` const initializer (the `3`
+    /// above the tests): change it to `4` → this test reds. (Anchored to the const's initializer by
+    /// line, not by a text search — this file's prose also quotes the ruling's "3 attempts".)
     #[test]
     fn the_attempt_cap_is_the_ruled_three() {
         assert_eq!(MAX_ATTEMPTS_PER_PEER, 3);
     }
 
-    /// MUTATION (P-10) — the edit goes in the `WAVE_MAX_PEERS` const initializer: change `3` to
-    /// `5` → this test reds (all five ready peers would be asked at once).
+    /// ⚠ THIS TEST REPLACED `a_ready_carrier_is_preferred_over_the_author`, WHICH PINNED THE WRONG
+    /// RULING. That test asserted the author was NOT asked while a carrier was ready — a stricter
+    /// ordering than the owner ruled. The ruling is *"if the author and a carrier are both online,
+    /// fetch from whichever has a free download slot"*, and a free slot is discovered by asking, so
+    /// both go in the same wave. The inversion is deliberate; do not "restore" the old assertion.
+    ///
+    /// MUTATION (P-10) — in `next_action`, delete the `if author.is_ready(now) { wave.push(...) }`
+    /// block → this test reds (the author would be dropped from the wave and only reached once
+    /// every carrier had exhausted, which is exactly the behaviour this replaced).
     #[test]
-    fn a_wave_is_capped_at_three_peers() {
+    fn the_author_is_asked_alongside_carriers_not_after_them() {
         let now = Instant::now();
-        let peers: Vec<Candidate> =
-            (0..5).map(|i| Candidate::fresh(format!("npub{i}"))).collect();
+        let peers = vec![Candidate::fresh("carrier")];
         let action = next_action(&peers, &Candidate::fresh("author"), now);
-        assert_eq!(asked(&action).len(), WAVE_MAX_PEERS);
-        assert_eq!(asked(&action), ["npub0", "npub1", "npub2"]);
-    }
-
-    /// MUTATION (P-10) — in `next_action`, change the `.take(WAVE_MAX_PEERS)` on the wave
-    /// iterator to `.take(1)` → this test reds (two ready peers must both be asked; a wave of one
-    /// is the concentration this module exists to avoid).
-    #[test]
-    fn a_wave_takes_every_ready_peer_when_fewer_than_the_cap() {
-        let now = Instant::now();
-        let peers = vec![Candidate::fresh("a"), Candidate::fresh("b")];
-        let action = next_action(&peers, &Candidate::fresh("author"), now);
-        assert_eq!(asked(&action), ["a", "b"]);
-    }
-
-    /// MUTATION (P-10) — in `Candidate::is_exhausted`, change `>=` to `>` → this test reds (a peer
-    /// on exactly the cap would still be asked, giving it a fourth attempt).
-    #[test]
-    fn a_peer_is_exhausted_after_the_third_attempt() {
-        let now = Instant::now();
-        // Well past any backoff, so only the attempt cap can be keeping it out of the wave.
-        let peers = vec![tried("spent", MAX_ATTEMPTS_PER_PEER, Duration::from_secs(600), now)];
         assert_eq!(
-            next_action(&peers, &Candidate::fresh("author"), now),
-            WaveAction::FallBackToAuthor
+            asked(&action),
+            ["carrier", "author"],
+            "both are asked in one wave; whoever has a free slot answers first"
         );
     }
 
+    /// MUTATION (P-10) — the edit goes in the `WAVE_MAX_PEERS` const initializer: change `3` to
+    /// `5` → this test reds (all five carriers would be asked at once).
+    #[test]
+    fn a_wave_is_capped_at_three_carriers_plus_the_author() {
+        let now = Instant::now();
+        let peers: Vec<Candidate> = (0..5).map(|i| Candidate::fresh(format!("npub{i}"))).collect();
+        let action = next_action(&peers, &Candidate::fresh("author"), now);
+        assert_eq!(
+            asked(&action),
+            ["npub0", "npub1", "npub2", "author"],
+            "the CAP is on carriers; the author rides along and is not counted against it"
+        );
+    }
+
+    /// MUTATION (P-10) — in `next_action`, change the `.take(WAVE_MAX_PEERS)` on the carrier
+    /// iterator to `.take(1)` → this test reds (both ready carriers must be asked; a wave of one
+    /// carrier is the concentration this module exists to avoid).
+    #[test]
+    fn a_wave_takes_every_ready_carrier_when_fewer_than_the_cap() {
+        let now = Instant::now();
+        let peers = vec![Candidate::fresh("a"), Candidate::fresh("b")];
+        let action = next_action(&peers, &Candidate::fresh("author"), now);
+        assert_eq!(asked(&action), ["a", "b", "author"]);
+    }
+
+    /// MUTATION (P-10) — in `Candidate::is_exhausted`, change `>=` to `>` → this test reds (a
+    /// carrier sitting exactly on the cap would be asked again, giving it a fourth attempt).
+    #[test]
+    fn a_carrier_is_exhausted_after_the_third_attempt() {
+        let now = Instant::now();
+        let peers = vec![spent("spent", now)];
+        let action = next_action(&peers, &Candidate::fresh("author"), now);
+        assert_eq!(asked(&action), ["author"], "the spent carrier drops out; the author remains");
+    }
+
     /// MUTATION (P-10) — in `backoff_for`, replace the shift expression `1u32 << doublings` with
-    /// the constant `1` → this test reds (backoff becomes flat 2s instead of doubling).
+    /// the constant `1` → this test reds (backoff becomes a flat 2s instead of doubling).
     #[test]
     fn backoff_doubles_with_each_attempt() {
         assert_eq!(backoff_for(1), BACKOFF_BASE);
         assert_eq!(backoff_for(2), BACKOFF_BASE * 2);
         assert_eq!(backoff_for(3), BACKOFF_BASE * 4);
-        // Strictly increasing is the property that matters; the exact values above are the knob.
         assert!(backoff_for(2) > backoff_for(1));
         assert!(backoff_for(3) > backoff_for(2));
     }
@@ -223,105 +248,83 @@ mod tests {
     /// through to the shift) → this test reds, because `0 - 1` underflows in debug and the call
     /// panics rather than returning zero.
     #[test]
-    fn a_peer_never_asked_has_no_backoff() {
+    fn a_source_never_asked_has_no_backoff() {
         assert_eq!(backoff_for(0), Duration::ZERO);
     }
 
     /// MUTATION (P-10) — in `Candidate::remaining_backoff`, swap the subtraction operands to
     /// `now.saturating_duration_since(last).saturating_sub(backoff_for(self.attempts))` → this
-    /// test reds (the remainder collapses to zero and the peer is asked early).
+    /// test reds (the remainder collapses to zero and the carrier is asked early).
+    ///
+    /// The author is spent here on purpose: with a ready author the wave would be non-empty and
+    /// this test would measure nothing about the carrier's backoff.
     #[test]
-    fn a_peer_inside_its_backoff_is_waited_on_not_asked() {
+    fn a_source_inside_its_backoff_is_waited_on_not_asked() {
         let now = Instant::now();
         // One attempt 500ms ago ⇒ 2s backoff, 1.5s left to run.
         let peers = vec![tried("cooling", 1, Duration::from_millis(500), now)];
         assert_eq!(
-            next_action(&peers, &Candidate::fresh("author"), now),
+            next_action(&peers, &spent("author", now), now),
             WaveAction::Wait(Duration::from_millis(1500))
         );
     }
 
-    /// MUTATION (P-10) — in `next_action`, change the `soonest` combinator from `.min()` to
-    /// `.max()` → this test reds (it would wait 3.5s for the slowest peer instead of 1.5s for the
-    /// soonest, sitting idle while a peer was already askable).
+    /// MUTATION (P-10) — in `next_action`, change the wait combinator from `.min()` to `.max()` →
+    /// this test reds (it would idle 3.5s for the slowest source instead of 1.5s for the soonest,
+    /// while a source was already askable).
     #[test]
-    fn the_wait_is_the_soonest_peer_not_the_latest() {
+    fn the_wait_is_the_soonest_source_not_the_latest() {
         let now = Instant::now();
         let peers = vec![
             tried("slow", 2, Duration::from_millis(500), now), // 4s backoff, 3.5s left
             tried("soon", 1, Duration::from_millis(500), now), // 2s backoff, 1.5s left
         ];
         assert_eq!(
-            next_action(&peers, &Candidate::fresh("author"), now),
+            next_action(&peers, &spent("author", now), now),
             WaveAction::Wait(Duration::from_millis(1500))
         );
-    }
-
-    /// MUTATION (P-10) — in `next_action`, move the author block above the wave block (return
-    /// `WaveAction::FallBackToAuthor` before computing `wave`) → this test reds. This is the pin
-    /// on property 3: the author is the LAST resort, and going to them while a carrier is ready is
-    /// exactly the load concentration QURATOR-164 exists to prevent.
-    #[test]
-    fn a_ready_carrier_is_preferred_over_the_author() {
-        let now = Instant::now();
-        let peers = vec![Candidate::fresh("carrier")];
-        let action = next_action(&peers, &Candidate::fresh("author"), now);
-        assert_eq!(asked(&action), ["carrier"]);
-    }
-
-    /// MUTATION (P-10) — in `next_action`, change the no-carriers author branch to return
-    /// `WaveAction::GiveUp` unconditionally (drop the `author.is_exhausted()` test) → this test
-    /// reds (a live author would be abandoned).
-    #[test]
-    fn the_author_is_the_fallback_once_every_carrier_is_exhausted() {
-        let now = Instant::now();
-        let peers = vec![
-            tried("a", MAX_ATTEMPTS_PER_PEER, Duration::from_secs(600), now),
-            tried("b", MAX_ATTEMPTS_PER_PEER, Duration::from_secs(600), now),
-        ];
-        assert_eq!(
-            next_action(&peers, &Candidate::fresh("author"), now),
-            WaveAction::FallBackToAuthor
-        );
-    }
-
-    /// MUTATION (P-10) — in `next_action`, change the author-exhausted branch to return
-    /// `WaveAction::FallBackToAuthor` instead of `WaveAction::GiveUp` → this test reds (the fetch
-    /// would loop on an author that has already refused three times, with no terminal state).
-    #[test]
-    fn give_up_only_once_the_author_is_exhausted_too() {
-        let now = Instant::now();
-        let peers = vec![tried("a", MAX_ATTEMPTS_PER_PEER, Duration::from_secs(600), now)];
-        let author = tried("author", MAX_ATTEMPTS_PER_PEER, Duration::from_secs(600), now);
-        assert_eq!(next_action(&peers, &author, now), WaveAction::GiveUp);
     }
 
     /// MUTATION (P-10) — in `next_action`, change the wave's `.filter(|c| c.is_ready(now))` to
-    /// `.filter(|c| !c.is_exhausted())` → this test reds (the backing-off peer would be asked
+    /// `.filter(|c| !c.is_exhausted())` → this test reds (the cooling carrier would be asked
     /// immediately, defeating the backoff entirely).
     #[test]
-    fn an_exhausted_peer_and_a_cooling_peer_are_distinguished() {
+    fn an_exhausted_carrier_and_a_cooling_one_are_distinguished() {
         let now = Instant::now();
-        let peers = vec![
-            tried("spent", MAX_ATTEMPTS_PER_PEER, Duration::from_secs(600), now),
-            tried("cooling", 1, Duration::from_millis(500), now),
-        ];
-        // The cooling peer is still live, so we wait for it rather than falling to the author.
+        let peers = vec![spent("spent", now), tried("cooling", 1, Duration::from_millis(500), now)];
         assert_eq!(
-            next_action(&peers, &Candidate::fresh("author"), now),
-            WaveAction::Wait(Duration::from_millis(1500))
+            next_action(&peers, &spent("author", now), now),
+            WaveAction::Wait(Duration::from_millis(1500)),
+            "the cooling carrier is still live, so we wait for it rather than giving up"
+        );
+    }
+
+    /// MUTATION (P-10) — in `next_action`, drop the `.chain(std::iter::once(author))` from the
+    /// wait/give-up scan → this test reds on the second assert: with no carriers left, the live
+    /// author would be invisible to the scan and the driver would give up while the one source
+    /// guaranteed to hold the collection was merely backing off.
+    #[test]
+    fn give_up_only_once_every_source_including_the_author_is_exhausted() {
+        let now = Instant::now();
+        let peers = vec![spent("a", now)];
+        assert_eq!(next_action(&peers, &spent("author", now), now), WaveAction::GiveUp);
+
+        // Same carriers, but the author is merely cooling: there is still something to wait for.
+        let cooling_author = tried("author", 1, Duration::from_millis(500), now);
+        assert_eq!(
+            next_action(&peers, &cooling_author, now),
+            WaveAction::Wait(Duration::from_millis(1500)),
+            "a backing-off author is not an exhausted one"
         );
     }
 
     /// MUTATION (P-10) — in `next_action`, change the `if !wave.is_empty()` guard to
-    /// `if wave.is_empty()` → this test reds (an empty candidate list would return
-    /// `Ask([])`, telling the driver to send a wave to nobody).
+    /// `if wave.is_empty()` → this test reds (with no carriers the author-only wave would be
+    /// discarded and the driver would fall through to the wait/give-up scan).
     #[test]
-    fn no_carriers_at_all_goes_straight_to_the_author() {
+    fn no_carriers_at_all_still_asks_the_author() {
         let now = Instant::now();
-        assert_eq!(
-            next_action(&[], &Candidate::fresh("author"), now),
-            WaveAction::FallBackToAuthor
-        );
+        let action = next_action(&[], &Candidate::fresh("author"), now);
+        assert_eq!(asked(&action), ["author"]);
     }
 }

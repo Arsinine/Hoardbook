@@ -179,9 +179,11 @@ pub(crate) async fn run_fetch_driver_loop(store: DataStore, live_npub: SharedIde
                 });
 
                 let now = Instant::now();
+                // The wave already carries the author when the author is ready (owner ruling
+                // 2026-09-04: whoever has a free slot answers first), so there is no separate
+                // fallback branch to take here.
                 let targets = match next_action(&state.peers, &state.author, now) {
-                    WaveAction::Ask(peers) => peers,
-                    WaveAction::FallBackToAuthor => vec![state.author.npub.clone()],
+                    WaveAction::Ask(sources) => sources,
                     // Backing off, or every source exhausted. Both are handled by simply not
                     // asking this poll — the next one re-evaluates, which is what makes the
                     // give-up bound self-healing rather than terminal.
