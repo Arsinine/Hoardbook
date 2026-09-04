@@ -7,9 +7,10 @@
 //! version; [`apply_portable_update`] downloads the stable `Hoardbook.exe`, **verifies its minisign
 //! signature under the SAME key as the NSIS updater** (`portable_update_logic::verify_signature`), then
 //! swaps the running exe in place via `self_replace` and relaunches. **No unsigned binary is ever
-//! written over the running exe** — verification happens before anything touches it. The
-//! download/replace is the I/O boundary (not offline-testable); the pure logic + the signature check
-//! are unit-tested in `portable_update_logic`.
+//! written over the running exe** — verification happens before anything touches it. The pure logic
+//! and the signature check are unit-tested in `portable_update_logic`; the guards' ORDER at the
+//! site is unit-tested here via [`apply_portable_update_inner`] (fetch injected). The replace/relaunch
+//! tail is the I/O boundary (not offline-testable).
 
 use std::time::Duration;
 
@@ -136,12 +137,49 @@ pub async fn check_portable_update(app: tauri::AppHandle) -> CmdResult<Option<Po
 
 /// Download the newer portable binary, verify its signature under [`UPDATER_PUBKEY`], swap the running
 /// exe in place, and relaunch. Refuses if there is no newer version, no artifact for this platform, or
-/// the signature fails — the self-replace happens ONLY after a good signature.
+/// the signature fails — the self-replace happens ONLY after a good signature. The guards are the
+/// seam-extracted [`apply_portable_update_inner`]; this shim owns only the manifest fetch and the
+/// replace/relaunch tail.
 #[tauri::command]
 pub async fn apply_portable_update(app: tauri::AppHandle) -> CmdResult<()> {
     let current = app.package_info().version.to_string();
     let manifest = fetch_manifest().await.map_err(cmd_err)?;
-    if !is_newer(&current, &manifest.version) {
+    let bytes = apply_portable_update_inner(&current, &manifest, |url| async move {
+        let client = http_client()?;
+        fetch_capped(&client, &url, MAX_BINARY_BYTES).await
+    })
+    .await?;
+    install_verified_bytes(&app, &bytes)
+}
+
+/// The guarded half of [`apply_portable_update`] — every security refusal in the command, in their
+/// REQUIRED ORDER, with the artifact download injected so a test can observe whether (and when) any
+/// bytes are actually fetched. Extracted per the seam the file's own OWED comment (2026-08-30,
+/// QURATOR-161 slice 2) prescribed: "extract an `*_inner` taking the URL/manifest" — the ordering
+/// pins are otherwise undriveable: the guards sit downstream of `fetch_manifest()`, which is
+/// hard-wired to [`PORTABLE_MANIFEST_URL`]. The extraction is behavior-preserving — every guard
+/// condition and refusal message is unchanged from the ones that stood inline in the command; the
+/// only differences are the injected `fetch` and `current` arriving as a borrowed `&str`. `fetch` is the artifact
+/// download (production: [`fetch_capped`] under the [`MAX_BINARY_BYTES`] cap); it is the ONLY I/O in
+/// this half, so "a guard fired before the fetch" is observable here.
+///
+/// Guard ORDER, which the `mod guard_order` tests pin:
+/// 1. `!is_newer(current, manifest.version)` — refuse before ANYTHING else happens.
+/// 2. `!is_trusted_artifact_url(artifact.url)` — refuse before any artifact bytes are fetched.
+/// 3. `verify_signature(bytes, artifact.signature, UPDATER_PUBKEY)` — verify before the
+///    embedded-version binding is consulted.
+/// 4. `!binary_matches_claimed_version(bytes, manifest.version)` — bind before anything touches the
+///    running exe.
+pub(crate) async fn apply_portable_update_inner<F, Fut>(
+    current: &str,
+    manifest: &PortableManifest,
+    fetch: F,
+) -> Result<Vec<u8>, String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, String>> + Send,
+{
+    if !is_newer(current, &manifest.version) {
         return Err("No newer portable version is available.".into());
     }
     let target = current_target_key();
@@ -155,8 +193,7 @@ pub async fn apply_portable_update(app: tauri::AppHandle) -> CmdResult<()> {
         return Err(format!("refusing to download the update from an untrusted URL: {}", artifact.url));
     }
 
-    let client = http_client()?;
-    let bytes = fetch_capped(&client, &artifact.url, MAX_BINARY_BYTES).await?;
+    let bytes = fetch(artifact.url.clone()).await?;
 
     // Verify BEFORE anything touches the running exe — same trust root as the NSIS updater.
     verify_signature(&bytes, &artifact.signature, UPDATER_PUBKEY).map_err(cmd_err)?;
@@ -173,16 +210,22 @@ pub async fn apply_portable_update(app: tauri::AppHandle) -> CmdResult<()> {
         ));
     }
 
-    // Stage the verified bytes next to the current exe (same volume), then swap in place. `self_replace`
-    // handles the Windows running-exe lock (rename-self dance); the in-memory process keeps running
-    // until we relaunch it below.
+    Ok(bytes)
+}
+
+/// The tail of [`apply_portable_update`] — stage the verified bytes next to the current exe (same
+/// volume), swap in place, and relaunch. This is the I/O boundary (not offline-testable) and is
+/// reached ONLY with bytes that have cleared every guard in [`apply_portable_update_inner`].
+fn install_verified_bytes(app: &tauri::AppHandle, bytes: &[u8]) -> CmdResult<()> {
+    // `self_replace` handles the Windows running-exe lock (rename-self dance); the in-memory process
+    // keeps running until we relaunch it below.
     let exe = std::env::current_exe().map_err(cmd_err)?;
     let dir = exe.parent().ok_or_else(|| "cannot resolve the running exe's directory".to_string())?;
     let staged = tempfile::Builder::new()
         .prefix(".hoardbook-update-")
         .tempfile_in(dir)
         .map_err(cmd_err)?;
-    std::fs::write(staged.path(), &bytes).map_err(cmd_err)?;
+    std::fs::write(staged.path(), bytes).map_err(cmd_err)?;
     self_replace::self_replace(staged.path()).map_err(cmd_err)?;
     drop(staged); // self_replace copied it into place; remove the leftover temp.
 
@@ -320,16 +363,134 @@ mod tests {
         );
     }
 
-    // ── QURATOR-161 slice 2 — `apply_portable_update`: OWED, not reachable without restructuring ──
+    // ── QURATOR-181 item 1 — the guards' ORDER at the call site ────────────────────────────────
     //
-    // Both guards this slice targets (the `!is_newer` refusal and the `is_trusted_artifact_url`
-    // refusal) sit DOWNSTREAM of `fetch_manifest()`, which is hard-wired to the `PORTABLE_MANIFEST_URL`
-    // const — no parameter, no `State` to manage, no injection seam. Driving either guard needs a
-    // manifest this test controls, and the only ways to get one are a production change (extract an
-    // `*_inner` taking the URL/manifest, or manage the URL as state) or a live network fetch of the
-    // real GitHub release — the first is out of scope for a tests-only slice, the second is not a
-    // hermetic unit test. The pure halves ARE pinned: `is_newer` in `portable_update_logic` (fail-closed
-    // on a parse failure) and `is_trusted_artifact_url` + `redirect_hop_allowed` here. What stays
-    // unpinned is the guards' PLACEMENT in the command — that they fire before any artifact bytes are
-    // fetched. Extracting the seam is the first step of the slice that picks this up.
+    // The comment that stood here (QURATOR-161 slice 2, 2026-08-30) said the `!is_newer` and
+    // `is_trusted_artifact_url` PLACEMENT was unpinned because both sit downstream of
+    // `fetch_manifest()`, hard-wired to `PORTABLE_MANIFEST_URL`, and named the fix: "extract an
+    // `*_inner` taking the URL/manifest". That seam now exists — `apply_portable_update_inner`, guard
+    // conditions and messages unchanged from the ones that stood inline, with the artifact fetch injected so a test
+    // can observe whether (and when) any bytes were fetched. The pure halves stay pinned where they
+    // were (`is_newer`, `is_trusted_artifact_url` in `portable_update_logic`; `redirect_hop_allowed`
+    // above); what this block adds is the ORDERING.
+    //
+    // Method: every input below is built so that TWO guards would both fire, and the test asserts
+    // WHICH one wins — a reorder changes the winner, a removal changes the winner or lets the fetch
+    // spy run. A test that only checked "it returns an error" would pass in any order; these do not.
+    // The fetch spy's log is the "before any bytes were fetched" witness.
+    mod guard_order {
+        use super::super::apply_portable_update_inner;
+        use crate::portable_update_logic::{current_target_key, PortableArtifact, PortableManifest};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        fn manifest(version: &str, url: &str) -> PortableManifest {
+            PortableManifest {
+                version: version.to_string(),
+                notes: None,
+                platforms: HashMap::from([(
+                    current_target_key(),
+                    PortableArtifact { url: url.to_string(), signature: String::new() },
+                )]),
+            }
+        }
+
+        /// ORDER 1 — a non-newer version is refused before ANYTHING else: before the URL trust
+        /// check, and before any artifact bytes are fetched. The manifest carries BOTH defects
+        /// (version 0.0.1 vs current 9.9.9, and an untrusted artifact URL) — with the guards in
+        /// order, the `is_newer` refusal must win; with them swapped, the URL refusal would.
+        ///
+        /// P-10 mutation: in `apply_portable_update_inner`, move the `if !is_newer(current,
+        /// &manifest.version) { … }` block to just AFTER the `if !is_trusted_artifact_url(&artifact.url)
+        /// { … }` block — this test reds on the message assert; moving the fetch line above the
+        /// `is_newer` block instead reds the log assert.
+        #[tokio::test]
+        async fn non_newer_refuses_before_the_url_trust_check_and_any_fetch() {
+            let m = manifest("0.0.1", "https://evil.com/Hoardbook.exe");
+            let fetched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&fetched);
+            let err = apply_portable_update_inner("9.9.9", &m, move |url| async move {
+                seen.lock().unwrap().push(url);
+                Ok(Vec::new())
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(err, "No newer portable version is available.");
+            assert!(
+                fetched.lock().unwrap().is_empty(),
+                "a non-newer manifest must be refused before any artifact bytes are fetched"
+            );
+        }
+
+        /// ORDER 2 — an untrusted URL is refused BEFORE the download: the fetch spy must never run.
+        /// Download-first-check-after is exactly the security-review-#3 primitive ("tampered manifest
+        /// redirects the download") the guard exists to close, so the empty fetch log — not the error
+        /// message alone — is the load-bearing assert here.
+        ///
+        /// P-10 mutation: in `apply_portable_update_inner`, move the `let bytes =
+        /// fetch(artifact.url.clone()).await?;` line to just ABOVE the `if
+        /// !is_trusted_artifact_url(&artifact.url) { … }` block — this test reds on the log assert
+        /// (the spy recorded a fetch of the untrusted URL).
+        #[tokio::test]
+        async fn untrusted_url_is_refused_before_any_bytes_are_fetched() {
+            let m = manifest("99.0.0", "https://github.com.evil.com/Hoardbook.exe");
+            let fetched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&fetched);
+            let err = apply_portable_update_inner("9.9.9", &m, move |url| async move {
+                seen.lock().unwrap().push(url);
+                Ok(b"attacker bytes".to_vec())
+            })
+            .await
+            .unwrap_err();
+            assert!(
+                err.starts_with("refusing to download the update from an untrusted URL"),
+                "the URL-trust guard must own this refusal, got {err}"
+            );
+            assert!(
+                fetched.lock().unwrap().is_empty(),
+                "bytes were fetched from an untrusted URL before the guard fired"
+            );
+        }
+
+        /// ORDER 3 — the signature verifies BEFORE the embedded-version binding is consulted. The
+        /// fetched bytes are junk (no VS_VERSION_INFO resource) with no valid signature, so BOTH
+        /// post-fetch guards would refuse; which one's message surfaces is the order witness. If
+        /// `binary_matches_claimed_version` ran first, this input would surface the downgrade error
+        /// instead of the signature error.
+        ///
+        /// P-10 mutation: in `apply_portable_update_inner`, swap the `verify_signature(&bytes,
+        /// &artifact.signature, UPDATER_PUBKEY).map_err(cmd_err)?;` line with the whole `if
+        /// !binary_matches_claimed_version(&bytes, &manifest.version) { … }` block — this test reds
+        /// (the error no longer names the signature; it becomes "the downloaded binary reports a
+        /// version other than 99.0.0 …").
+        ///
+        /// Honest limit: the green side of guard 4 (validly-SIGNED bytes whose embedded version
+        /// mismatches the claim) is not driveable here — `UPDATER_PUBKEY` is pinned inside the seam,
+        /// and signing under it requires the release private key. What IS pinned is that guard 3
+        /// precedes guard 4 for every input a test can construct.
+        #[tokio::test]
+        async fn signature_verifies_before_the_embedded_version_binding() {
+            let m = manifest(
+                "99.0.0",
+                "https://github.com/Arsinine/Hoardbook/releases/download/v99.0.0/Hoardbook.exe",
+            );
+            let fetched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&fetched);
+            let err = apply_portable_update_inner("9.9.9", &m, move |url| async move {
+                seen.lock().unwrap().push(url);
+                Ok(b"these bytes are not an exe and carry no version resource".to_vec())
+            })
+            .await
+            .unwrap_err();
+            assert!(
+                err.contains("signature"),
+                "the signature guard must fire before the version binding is consulted, got {err}"
+            );
+            assert_eq!(
+                fetched.lock().unwrap().len(),
+                1,
+                "a trusted URL on a newer manifest IS downloaded — only the guards' order is under test here"
+            );
+        }
+    }
 }
