@@ -1,17 +1,22 @@
-//! QURATOR-137 slice 3 — the auto-approve loop (owner ruling 2026-08-31, option B).
+//! QURATOR-137 slice 3 — the auto-approve loop (owner ruling 2026-08-31, option B); Carrier-4
+//! auto re-serve added 2026-09-04 (QURATOR-164, owner rulings below).
 //!
 //! This is the Rust half of "manifest on demand": once the owner has approved a peer once, a later
 //! request-DM from that peer is answered **without a human click** — a fresh ticket is minted and
 //! DM'd, exactly as the "Send the full list" click does, so the asker's fetch proceeds without a
-//! round trip the owner already paid.
+//! round trip the owner already paid. An AUTHOR-BEARING ask (a Carrier-4 re-serve) is answered
+//! the same way with NO prior approval at all: third-party serving is background infrastructure
+//! (owner ruling 2026-09-04), so this node re-serves a cached copy to anyone who asks with the
+//! `(author, slug, fingerprint)` triple only the author's own public teaser can have given them.
 //!
 //! Where the request is recognised today: production knows the `{"hb":"manifest_request",…}` DM
 //! only at render time (`ui/src/lib/request-inbox.ts`, `parseManifestRequest`) — there was NO
 //! production Rust handler for an incoming request-DM before this module. This loop is that seam.
 //!
-//! **The ticket contract is untouched.** Every approval this loop issues goes through
-//! [`crate::commands::fulfil::send_full_list_inner`], which mints a FRESH ticket per fetch the
-//! same way the click does. Nothing here adds any serve-path check — there is none to modify
+//! **The ticket contract is untouched.** Every approval this loop issues goes through a production
+//! body — [`crate::commands::fulfil::send_full_list_inner`] for an own-collection ask (author
+//! `None`), [`crate::commands::fulfil::send_cached_manifest_inner`] for an author-bearing
+//! (Carrier-4 re-serve) ask — and each mints a FRESH ticket per fetch the same way the click does. Nothing here adds any serve-path check — there is none to modify
 //! (QURATOR-177 Option E, owner ruling 2026-09-03: authorization is the standing grant this loop
 //! itself checks, and the ticket is address delivery; a repeat fetch is a legitimate fetch, and a
 //! peer whose fetch failed retries the ticket it already holds — immediately, unlimited, never
@@ -32,11 +37,26 @@
 //!
 //! ## What may be auto-approved
 //!
-//! Both must hold, checked in this order (cheapest and most-discriminating first):
-//!   1. a standing grant exists for `(sender_npub, author, slug)` — the owner approved this exact
+//! The two paths have different authorisation, per the 2026-09-04 Carrier-4 rulings (QURATOR-164):
+//!
+//! * **Own-collection ask (`author_npub == None`)** — BOTH must hold:
+//!   1. a standing grant exists for `(sender_npub, None, slug)` — the owner approved this exact
 //!      triple before. The AUTHOR is part of the key (see `standing_grant_key`): a grant over this
 //!      node's own `films` is not a grant over some third party's `films`.
 //!   2. the cap budget allows another approval for this pair (and globally).
+//!
+//! * **Author-bearing ask (`author_npub == Some(author)`, a Carrier-4 RE-SERVE ask)** — the grant
+//!   requirement is WAIVED. The asker must already hold `(author, slug, fingerprint)` — a triple
+//!   only the author's own public teaser can have given them — so there is no list to enumerate
+//!   and no per-asker consent step left to ask for (the probe objection was refuted 2026-09-04).
+//!   Third-party serving is background infrastructure: *"sharing third party should be background
+//!   behavior - clients essentially become cognizant infrastructure nodes. Data passes through
+//!   them on the way to the recipient, they dont need to auth it. They just need to pass it on."*
+//!   Only the caps still bind. **The serving body is `send_cached_manifest_inner`, NEVER
+//!   `send_full_list_inner`**: the own-collection body builds THIS node's collection by slug, so a
+//!   common-slug collision ("films", "music") would serve the wrong collection — the author is
+//!   load-bearing in the key, and that mis-route is exactly what the deleted step (0) used to
+//!   guard against.
 //!
 //! A live-standing check used to sit between them, requiring `ContactStanding::Good` (re-read
 //! every request and again at redeem). It was withdrawn by owner ruling 2026-09-03, QURATOR-177
@@ -45,7 +65,7 @@
 //! serve. Grants are permanent (owner ruling 2026-09-03), so for a granted pair there is
 //! deliberately no second veto left to re-introduce.
 //!
-//! A request that fails either check is not an error — it is today's behaviour: the DM stays for
+//! A request that fails its checks is not an error — it is today's behaviour: the DM stays for
 //! the human. The loop never creates contacts (the WAN harness's `save_asker_contact` is
 //! harness-only policy, deliberately not carried over), never writes an ask record, and never
 //! answers a request for a collection it cannot build a manifest for — private collections are
@@ -85,7 +105,7 @@ use std::time::Duration;
 use nostr::prelude::*;
 
 use crate::commands::chat::decode_dms;
-use crate::commands::fulfil::send_full_list_inner;
+use crate::commands::fulfil::{send_cached_manifest_inner, send_full_list_inner};
 use crate::identity_state::SharedIdentity;
 use crate::net::{self, SharedRelay};
 use crate::store::DataStore;
@@ -129,7 +149,8 @@ struct AutoApproveCaps {
 impl AutoApproveCaps {
     /// Whether a new auto-approval may be minted for `pair_key` at `now`. **A pure decision** — it
     /// records nothing; the caller commits via [`record`](Self::record) only after the approval
-    /// succeeded, so a failed `send_full_list_inner` spends no budget.
+    /// succeeded, so a failed approval body (`send_full_list_inner` or
+    /// `send_cached_manifest_inner`) spends no budget.
     fn allows(&mut self, pair_key: &str, now: u64) -> bool {
         // Prune first so the window check below is against the live set, not history.
         let cutoff = now.saturating_sub(AUTO_APPROVE_GLOBAL_WINDOW_SECS);
@@ -149,7 +170,7 @@ impl AutoApproveCaps {
         }
     }
 
-    /// Commit one minted auto-approval. Only called after `send_full_list_inner` returned Ok.
+    /// Commit one minted auto-approval. Only called after whichever approval body ran returned Ok.
     fn record(&mut self, pair_key: &str, now: u64) {
         self.per_pair.insert(pair_key.to_string(), now);
         self.global.push_back(now);
@@ -211,10 +232,14 @@ impl ManifestRequestBody {
 /// The decision half of the loop, extracted so it is testable without a relay: should this
 /// request-DM, arriving from `sender_npub` at unix-seconds `now`, be auto-approved?
 ///
-/// Returns the `pair_key` of the grant that authorised it (the caller's rate-limit key — distinct
+/// Returns the `pair_key` the caps will pace this ask under (the caller's rate-limit key — distinct
 /// from the loop's dedup key, which additionally carries the nonce) so the decision and the
-/// bookkeeping can never drift apart on what "this pair" means. `None` means "leave it for the
-/// human" — which is a normal outcome, not an error, and is never reported to the peer as anything.
+/// bookkeeping can never drift apart on what "this pair" means. For an own-collection ask that key
+/// is the grant's own key (the grant is what authorised it); for an author-bearing ask it is the
+/// same `standing_grant_key(sender, author, slug)` shape, computable with no grant existing — a
+/// deliberate reuse, so an author-bearing triple is paced under the same key shape the store
+/// writes. `None` means "leave it for the human" — which is a normal outcome, not an error, and is
+/// never reported to the peer as anything.
 fn should_auto_approve(
     store: &DataStore,
     caps: &mut AutoApproveCaps,
@@ -222,30 +247,34 @@ fn should_auto_approve(
     body: &ManifestRequestBody,
     now: u64,
 ) -> Option<String> {
-    // (0) Own-collection asks ONLY. `send_full_list_inner` — the one body this loop may call —
-    // builds THIS node's collection by slug (`build_slug_manifest`). A request carrying an author
-    // is a Carrier-4 RE-SERVE ask (peer D asking this node to re-serve peer A's collection from
-    // cache), a different carrier with a different approval body (`send_cached_manifest_inner`)
-    // that is still owed owner rulings (QURATOR-79): routing it through the own-collection body
-    // would serve the WRONG collection whenever the slugs collide — and common slugs ("films",
-    // "music") collide constantly, which is exactly why the author is load-bearing in the grant
-    // key. Those asks fall to the human until Carrier 4 lands its own auto path.
-    if body.author_npub.is_some() {
-        return None;
+    // (1) The grant — OWN-COLLECTION asks ONLY. A standing grant over `(sender, None, slug)` is the
+    // owner's own prior approval of this exact triple, and the human's click is still what creates
+    // the first one. Blank-author was already normalised to `None` at parse time, so the key
+    // carries "self", not "".
+    //
+    // An AUTHOR-BEARING ask (Carrier-4 re-serve: peer D asking this node to re-serve peer A's
+    // collection from cache) needs NO grant — owner ruling 2026-09-04 (QURATOR-164): third-party
+    // serving is background infrastructure, the asker must already hold the
+    // `(author, slug, fingerprint)` triple, and there is no per-ask consent step to consult.
+    // Step (0) here used to refuse those asks outright "until Carrier 4 lands its own auto path";
+    // this IS that path, and the gate is deleted, not made conditional on a setting. What the old
+    // gate was really protecting against — the mis-route to the own-collection body on a slug
+    // collision — is now prevented by the serve branch in the loop body, which routes author-bearing
+    // asks to `send_cached_manifest_inner`.
+    if body.author_npub.is_none() {
+        store
+            .standing_grant_for(sender_npub, None, &body.slug)
+            .ok()
+            .flatten()?;
     }
 
-    // (1) The grant: the owner approved THIS (peer, author, slug) before. Blank-author was already
-    // normalised to `None` at parse time, so the key carries "self", not "".
-    store
-        .standing_grant_for(sender_npub, body.author_npub.as_deref(), &body.slug)
-        .ok()
-        .flatten()?;
-
-    // (2) The caps. Exhausted budget falls back to the human exactly like (1) does. (A live-standing
-    // check used to sit here as step 2, requiring `ContactStanding::Good`; withdrawn by owner
-    // ruling 2026-09-03, QURATOR-177 — blocking gates chat/DM interaction only. Do not re-add it:
-    // with permanent grants it would be a silent second veto over an approval the owner already
-    // gave, and it was never read-access revocation to begin with.)
+    // (2) The caps — BOTH paths. A pacer, not a refusal to participate (the ask-throttle ruling:
+    // "it DELAYS, it never DISCARDS"), so an author-bearing ask is paced exactly like an
+    // own-collection one. (A live-standing check used to sit here as step 2, requiring
+    // `ContactStanding::Good`; withdrawn by owner ruling 2026-09-03, QURATOR-177 — blocking gates
+    // chat/DM interaction only. Do not re-add it: with permanent grants it would be a silent second
+    // veto over an approval the owner already gave, and it was never read-access revocation to
+    // begin with.)
     let pair_key = crate::store::standing_grant_key(sender_npub, body.author_npub.as_deref(), &body.slug);
     if !caps.allows(&pair_key, now) {
         return None;
@@ -253,12 +282,46 @@ fn should_auto_approve(
     Some(pair_key)
 }
 
+/// Which production approval body an ask of this shape must be served by — the Carrier-4 routing
+/// discriminator, extracted pure so the branch is testable without a relay. The loop's serve call
+/// matches on this value, and its tracing derives from it, so the routing and the attributable
+/// evidence can never drift apart.
+enum ApprovalBody {
+    /// An author-bearing (Carrier-4 re-serve) ask: serve the cached copy pinned to that author via
+    /// [`crate::commands::fulfil::send_cached_manifest_inner`]. NEVER the own-collection body —
+    /// common slugs ("films", "music") collide constantly and the author is load-bearing in the key.
+    CachedManifest { author: String },
+    /// An own-collection ask (`author_npub == None`): build THIS node's collection by slug via
+    /// [`crate::commands::fulfil::send_full_list_inner`], exactly as before Carrier 4.
+    FullList,
+}
+
+impl ApprovalBody {
+    /// The tracing name — always the actual `fulfil` body this variant routes to.
+    fn log_name(&self) -> &'static str {
+        match self {
+            ApprovalBody::CachedManifest { .. } => "send_cached_manifest_inner",
+            ApprovalBody::FullList => "send_full_list_inner",
+        }
+    }
+}
+
+/// The one pure decision the serve branch consults: author-bearing ⇒ re-serve body, authorless ⇒
+/// own-collection body. Pinned by `author_bearing_asks_route_to_the_cached_manifest_body`.
+fn approval_body_for(body: &ManifestRequestBody) -> ApprovalBody {
+    match body.author_npub.as_deref() {
+        Some(author) => ApprovalBody::CachedManifest { author: author.to_string() },
+        None => ApprovalBody::FullList,
+    }
+}
+
 /// The loop itself. Runs forever; every decision is logged (info for approvals, debug/warn for the
 /// human-fallback cases) so a real run produces evidence without spamming idle polls.
 ///
 /// Modelled on the WAN harness's `run_auto_approve_loop` (`wan_it/mod.rs`), with the one deviation
-/// that matters removed: the harness approves *any* asker because it has no human; this loop
-/// approves only on a standing grant within cap budget, and creates no contacts.
+/// that matters removed: the harness approves *any* asker because it has no human; this loop gates
+/// an own-collection ask on a standing grant within cap budget, paces an author-bearing (Carrier-4
+/// re-serve) ask on the caps alone (owner ruling 2026-09-04), and creates no contacts.
 pub(crate) async fn run_auto_approve_loop(
     store: DataStore,
     live_npub: SharedIdentity,
@@ -303,7 +366,8 @@ pub(crate) async fn run_auto_approve_loop(
 
     tracing::info!(
         poll_secs = AUTO_APPROVE_POLL_INTERVAL.as_secs(),
-        "auto-approve: loop started (grant + caps gate every approval)"
+        "auto-approve: loop started (own-collection asks: grant + caps; Carrier-4 re-serve asks: \
+         caps only)"
     );
     loop {
         // The identity snapshot for THIS poll (see the note above on why per-poll, not once).
@@ -398,45 +462,75 @@ pub(crate) async fn run_auto_approve_loop(
                 tracing::debug!(
                     sender = %crate::logging::trunc_npub(&msg.from),
                     slug = %body.slug,
-                    "auto-approve: left for the human (no grant / caps exhausted)"
+                    "auto-approve: left for the human (own-collection: no grant / caps exhausted; \
+                     re-serve: caps exhausted)"
                 );
                 continue;
             };
 
-            // The approval: one call to the production body — the same call the click makes. A
-            // FRESH ticket is minted per fetch; no serve-path check exists to touch (QURATOR-177
-            // Option E). Endpoint binding, grant-record-before-DM, grant refresh, and the ticket DM
-            // all happen inside, outside every DM cache/request lock (see the module doc). The
-            // endpoint handle is the app's MANAGED one (passed in at spawn): `ensure_endpoint`
-            // reuses the session's single listening plane or binds it here, exactly as the fulfil
-            // click's `State<SharedEndpoint>` does — never a second binding of the same secret.
-            match send_full_list_inner(
-                msg.from.clone(),
-                body.slug.clone(),
-                body.ask_nonce.clone(),
-                &live_npub,
-                &store,
-                &relay,
-                &endpoint,
-            )
-            .await
-            {
+            // The approval: one call to the production body — the same call the click makes, chosen
+            // by ask shape. A FRESH ticket is minted per fetch; no serve-path check exists to touch
+            // (QURATOR-177 Option E). Endpoint binding, grant-record-before-DM, grant refresh, and
+            // the ticket DM all happen inside, outside every DM cache/request locks (see the module
+            // doc). The endpoint handle is the app's MANAGED one (passed in at spawn):
+            // `ensure_endpoint` reuses the session's single listening plane or binds it here,
+            // exactly as the fulfil click's `State<SharedEndpoint>` does — never a second binding
+            // of the same secret.
+            //
+            // The branch IS the Carrier-4 contract: an author-bearing ask is a RE-SERVE and must go
+            // to `send_cached_manifest_inner` (the author-pinned cache read). Routing it to
+            // `send_full_list_inner` would build THIS node's same-slug collection instead — the
+            // mis-route the deleted step (0) existed to prevent, since common slugs ("films",
+            // "music") collide constantly and the author is load-bearing in the key.
+            // Names the body in every tracing line below and routes the serve call — the Carrier-4
+            // discriminator, extracted pure so it is testable (see `approval_body_for`).
+            let which_body = approval_body_for(&body);
+            let send_result = match &which_body {
+                ApprovalBody::CachedManifest { author } => {
+                    send_cached_manifest_inner(
+                        msg.from.clone(),
+                        author.clone(),
+                        body.slug.clone(),
+                        body.ask_nonce.clone(),
+                        &live_npub,
+                        &store,
+                        &relay,
+                        &endpoint,
+                    )
+                    .await
+                }
+                ApprovalBody::FullList => {
+                    send_full_list_inner(
+                        msg.from.clone(),
+                        body.slug.clone(),
+                        body.ask_nonce.clone(),
+                        &live_npub,
+                        &store,
+                        &relay,
+                        &endpoint,
+                    )
+                    .await
+                }
+            };
+            match send_result {
                 Ok(()) => {
                     caps.record(&pair_key, now);
                     tracing::info!(
                         sender = %crate::logging::trunc_npub(&msg.from),
                         slug = %body.slug,
-                        "auto-approve: approved via send_full_list_inner — fresh ticket minted, \
-                         recorded, grant refreshed, and DM'd"
+                        which_body = which_body.log_name(),
+                        "auto-approve: approved — fresh ticket minted, recorded, grant refreshed, \
+                         and DM'd"
                     );
                 }
                 Err(e) => {
-                    // No budget consumed: a failed `send_full_list_inner` mints no ticket that
-                    // reaches an asker's redeem path, and the human can still answer the card.
+                    // No budget consumed: a failed body mints no ticket that reaches an asker's
+                    // redeem path, and the human can still answer the card.
                     tracing::warn!(
                         sender = %crate::logging::trunc_npub(&msg.from),
                         slug = %body.slug,
-                        "auto-approve: send_full_list_inner failed — request left for the human: {e}"
+                        which_body = which_body.log_name(),
+                        "auto-approve: request left for the human: {e}"
                     );
                 }
             }
@@ -592,8 +686,10 @@ mod tests {
         );
     }
 
-    /// No grant → not auto-approved. Today's behaviour preserved for every first ask: the human's
-    /// click is still what creates the first grant.
+    /// No grant → not auto-approved. Today's behaviour preserved for every first OWN-COLLECTION
+    /// ask (author `None`): the human's click is still what creates the first grant. The
+    /// author-bearing path is different by ruling — see
+    /// `an_author_bearing_ask_with_no_grant_is_approved_but_an_authorless_one_is_not`.
     ///
     /// MUTATION (P-10) — resolved by containing function: in `should_auto_approve`, replace
     /// `.ok().flatten()?` on the `standing_grant_for` chain with `.ok().flatten().or_else(|| Some(
@@ -620,24 +716,23 @@ mod tests {
         );
     }
 
-    /// Two refusals the author and slug are load-bearing for (QURATOR-137, `907f6ba`), plus the
-    /// own-collection gate this loop adds:
-    ///   - a grant over `films` must not answer an ask about `music` (different slug);
-    ///   - a grant over authorA's `films` must not answer an own-collection ask about `films`
+    /// The key and the two regimes the author and slug are load-bearing for (QURATOR-137,
+    /// `907f6ba`; Carrier-4 regime added by the 2026-09-04 owner ruling, QURATOR-164):
+    ///   - a grant over `films` must not answer an own-collection ask about `music` (different
+    ///     slug);
+    ///   - a grant over authorA's `films` must not answer an OWN-COLLECTION ask about `films`
     ///     (same slug, different author — the collision the author-in-key exists for);
-    ///   - an author-bearing ask NEVER auto-approves, grant or no grant: it is a Carrier-4 re-serve
-    ///     ask with a different approval body (`send_cached_manifest_inner`, QURATOR-79 owed), and
-    ///     routing it through the own-collection body would serve the wrong collection on slug
-    ///     collision.
+    ///   - an author-bearing (Carrier-4 re-serve) ask with the exact grant present IS approved —
+    ///     **this assertion was INVERTED by the 2026-09-04 owner ruling** (QURATOR-164: third-party
+    ///     serving is background infrastructure; step (0), which refused every author-bearing ask,
+    ///     was deleted outright). It used to assert `.is_none()` "must never auto-approve through
+    ///     this loop";
+    ///   - the own-collection ask the self-author grant covers still approves — proving the two
+    ///     refusals above are the key, not a broken fixture.
     ///
-    /// MUTATION (P-10) — resolved by containing function: in `should_auto_approve`, change the
-    /// `standing_grant_for` call's second argument from `body.author_npub.as_deref()` to `None`
-    /// (ignore the requested author). The different-slug assertion still holds (the slug still
-    /// mismatches), but the "grant over authorA's films vs own films" one no longer reds on its own
-    /// — that refusal is now primarily the (0) author gate; to red THIS test end to end, delete
-    /// the `if body.author_npub.is_some() { return None; }` block instead. Both assertions above
-    /// that depend on the key (different slug; author-bearing vs own) are covered between the two
-    /// mutations.
+    /// MUTATION (P-10) — resolved by containing function: in `should_auto_approve`, restore
+    /// `if body.author_npub.is_some() { return None; }` as the first statement (the deleted step
+    /// (0)). The author-bearing-with-exact-grant assertion reds (decision becomes None).
     #[test]
     fn a_grant_for_a_different_author_or_slug_does_not_answer() {
         let (_dir, store) = store();
@@ -664,7 +759,8 @@ mod tests {
                 .standing_grant_for(&peer, None, "films")
                 .expect("grant read must succeed")
                 .is_some(),
-            "precondition: the (self, films) grant is in the map — the bait the author gate refuses"
+            "precondition: the (self, films) grant is in the map — the bait the author half of the \
+             key refuses"
         );
 
         let mut caps = AutoApproveCaps::default();
@@ -673,19 +769,144 @@ mod tests {
             should_auto_approve(&store, &mut caps, &peer, &body("music", None), 500).is_none(),
             "a grant over 'films' must not answer an ask about 'music'"
         );
-        // Author-bearing ask, exact grant present — refused by the (0) own-collection gate. With
-        // the self-author grant over the same slug in the map, only that gate can be refusing.
-        assert!(
-            should_auto_approve(&store, &mut caps, &peer, &body("films", Some(&author_a)), 500)
-                .is_none(),
-            "an author-bearing (Carrier-4 re-serve) ask must never auto-approve through this loop"
+        // Author-bearing ask, exact grant present — APPROVED under the 2026-09-04 ruling (the
+        // grant is not even consulted on this path; its presence here proves the approval is not an
+        // accident of the fixture).
+        let key = should_auto_approve(&store, &mut caps, &peer, &body("films", Some(&author_a)), 500)
+            .expect("an author-bearing (Carrier-4 re-serve) ask MUST auto-approve (owner ruling \
+                    2026-09-04 — background infrastructure, no per-ask consent)");
+        assert_eq!(
+            key,
+            crate::store::standing_grant_key(&peer, Some(&author_a), "films"),
+            "an author-bearing ask is paced under the (peer, author, slug) key shape even with no \
+             grant consulted"
         );
-        // And the own-collection ask the self-author grant covers still approves — proving the two
-        // refusals above are the key and the gate, not a broken fixture.
+        // And the own-collection ask the self-author grant covers still approves — proving the
+        // first refusal above is the key, not a broken fixture.
         assert!(
             should_auto_approve(&store, &mut caps, &peer, &body("films", None), 500).is_some(),
             "the exact granted own-collection triple must auto-approve"
         );
+    }
+
+    /// **The 2026-09-04 ruling's whole point** (QURATOR-164): an author-bearing ask — a stranger
+    /// asking this node to re-serve a third party's collection from cache — is auto-approved with
+    /// NO grant anywhere in the store, while an authorless ask from the same peer with the same
+    /// empty grant map is still left for the human. The contrast is the pin: widening the
+    /// author-bearing path must never widen the own-collection path, and vice versa.
+    ///
+    /// MUTATION (P-10) — resolved by containing function: in `should_auto_approve`, change the
+    /// `if body.author_npub.is_none() {` guard to `if true {` (apply the grant check to BOTH
+    /// paths). The author-bearing-with-no-grant assertion reds (decision becomes None) while the
+    /// authorless one still passes — proving the refusal is the regime split, not the fixture.
+    #[test]
+    fn an_author_bearing_ask_with_no_grant_is_approved_but_an_authorless_one_is_not() {
+        let (_dir, store) = store();
+        let peer = npub_of(&Identity::generate());
+        let author_a = npub_of(&Identity::generate());
+        save_contact_in_good_standing(&store, &peer);
+        // Loud precondition: NO grant of any shape exists for this peer.
+        assert!(
+            store.standing_grant_for(&peer, None, "films").expect("grant read").is_none()
+                && store
+                    .standing_grant_for(&peer, Some(&author_a), "films")
+                    .expect("grant read")
+                    .is_none(),
+            "precondition: no grant exists — this peer was never approved for anything"
+        );
+
+        let mut caps = AutoApproveCaps::default();
+        // The ruling: background infrastructure, no gate on who may be served, no per-ask consent.
+        let key = should_auto_approve(&store, &mut caps, &peer, &body("films", Some(&author_a)), 500)
+            .expect("an author-bearing ask with NO grant MUST auto-approve (owner ruling \
+                    2026-09-04: third-party serving is background infrastructure)");
+        assert_eq!(
+            key,
+            crate::store::standing_grant_key(&peer, Some(&author_a), "films"),
+            "the pacing key is computable with no grant existing — same shape the store writes"
+        );
+        // The own-collection path is UNCHANGED: same peer, same slug, same empty grant map — the
+        // human's click is still what creates the first own-collection grant.
+        assert!(
+            should_auto_approve(&store, &mut caps, &peer, &body("films", None), 500).is_none(),
+            "an authorless ask with NO grant must STILL be left for the human — the own-collection \
+             path is exactly as it was"
+        );
+    }
+
+    /// The caps bind the author-bearing path exactly as they bind the own-collection one (a pacer,
+    /// never a refusal to participate — the ask-throttle ruling: "it DELAYS, it never DISCARDS").
+    /// No grant is needed on this path, so the caps are the ONLY thing standing between a
+    /// re-serve ask and a mint.
+    ///
+    /// MUTATION (P-10) — resolved by containing function: in `should_auto_approve`, change
+    /// `if !caps.allows(&pair_key, now) { return None; }` to skip the check (delete the `if` and
+    /// its body, or replace the condition with `false &&`). The inside-the-window assertion reds
+    /// (decision becomes Some) while the after-cooldown one still passes.
+    #[test]
+    fn caps_refuse_an_author_bearing_ask_once_exhausted() {
+        let (_dir, store) = store();
+        let peer = npub_of(&Identity::generate());
+        let author_a = npub_of(&Identity::generate());
+        save_contact_in_good_standing(&store, &peer);
+        // Deliberately NO grant — the caps are what is under test, and the ruling path needs none.
+        let mut caps = AutoApproveCaps::default();
+        let t0: u64 = 1_700_000_000;
+        let key = should_auto_approve(&store, &mut caps, &peer, &body("films", Some(&author_a)), t0)
+            .expect("precondition: the first author-bearing ask must auto-approve");
+        caps.record(&key, t0); // the loop records only on a successful send
+        assert!(
+            should_auto_approve(&store, &mut caps, &peer, &body("films", Some(&author_a)), t0 + 30)
+                .is_none(),
+            "a second author-bearing ask 30s in must FALL BACK to the human (None) — the caps pace \
+             the re-serve path too"
+        );
+        assert!(
+            should_auto_approve(&store, &mut caps, &peer, &body("films", Some(&author_a)), t0 + 60)
+                .is_some(),
+            "after the 60s cooldown the same author-bearing ask must auto-approve again — the caps \
+             DELAY, they never DISCARD"
+        );
+    }
+
+    /// The routing discriminator the serve branch consults: an author-bearing ask is served by the
+    /// CACHED-MANIFEST body (author-pinned re-serve), an authorless one by the FULL-LIST body
+    /// (own-collection build). Routing the author-bearing shape to the full-list body is the
+    /// mis-route the deleted step (0) existed to prevent — common slugs ("films", "music") collide
+    /// constantly and the author is load-bearing in the key.
+    ///
+    /// MUTATION (P-10) — resolved by containing function: in `approval_body_for`, swap the two
+    /// match arms (`Some(author) => ApprovalBody::FullList` / `None` =>
+    /// `ApprovalBody::CachedManifest { .. }`). Both assertions red (each ask is attributed to the
+    /// wrong body).
+    #[test]
+    fn author_bearing_asks_route_to_the_cached_manifest_body() {
+        let author_a = npub_of(&Identity::generate());
+        match approval_body_for(&body("films", Some(&author_a))) {
+            ApprovalBody::CachedManifest { author } => {
+                assert_eq!(
+                    author, author_a,
+                    "the re-serve body must carry the ASKED author verbatim — it is what the \
+                     envelope is pinned against"
+                );
+            }
+            ApprovalBody::FullList => panic!(
+                "an author-bearing ask routed to the FULL-LIST body — the slug-collision mis-route \
+                 (this would serve this node's own same-named collection as the other author's)"
+            ),
+        }
+        assert!(
+            matches!(approval_body_for(&body("films", None)), ApprovalBody::FullList),
+            "an authorless ask routes to the FULL-LIST (own-collection) body, exactly as before \
+             Carrier 4"
+        );
+        // The tracing name is the actual `fulfil` body each variant routes to, so a real run's
+        // evidence names the body that served each ask.
+        assert_eq!(
+            approval_body_for(&body("films", Some(&author_a))).log_name(),
+            "send_cached_manifest_inner"
+        );
+        assert_eq!(approval_body_for(&body("films", None)).log_name(), "send_full_list_inner");
     }
 
     /// Blank `author_npub` normalises to `None` at PARSE time, so the grant lookup carries "self"

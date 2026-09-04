@@ -543,8 +543,11 @@ async fn run_role_c_phase2(input: &CarryInput) -> Result<(), String> {
         return Err(format!("the asker asked for slug '{slug}', not '{CARRY_SLUG}'"));
     }
     // The ask MUST name A as the author — that field is the whole Carrier-4 discriminator on the
-    // ask wire, and `should_auto_approve` rejects it in production precisely because it is a
-    // different carrier. A harness has no human; answering it here is the documented deviation.
+    // ask wire, and it is what routes the ask to `send_cached_manifest_inner` rather than the
+    // own-collection body. Answering it here is NO LONGER a harness deviation: owner ruling
+    // 2026-09-04 (QURATOR-164) deleted `should_auto_approve`'s step (0), so production auto-serves
+    // an author-bearing ask too — third-party serving is background infrastructure, needing no
+    // grant and no human. The harness's remaining deviation is only that it has no caps pacer.
     let Some(author_from_ask) = author_from_ask else {
         return Err("the asker's request-DM carried no author_npub — not a Carrier-4 ask".to_string());
     };
