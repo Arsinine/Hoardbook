@@ -2512,4 +2512,282 @@ mod tests {
             assert_eq!(err, "You can't send a message to yourself.");
         }
     }
+
+    // ── Command dispatch — blocking, requests, read state, ask trace ───────────────────────────
+    //
+    // Same discipline as `command_guards` above: each test drives the `#[tauri::command]` fn at its
+    // real signature (`State<'_, T>` and all) through `mock_app()`'s `StateManager`, and asserts on
+    // what actually lands in the `DataStore` or what the command returns — never a re-implementation
+    // of a command body.
+    //
+    // None of these commands dial a relay (they are local reads/writes over the store), but the
+    // RELAY HAZARD is pinned anyway: an empty configured relay set falls back to the real public
+    // DEFAULT_RELAYS, so the helper's store carries one unroutable relay — if a future edit adds
+    // relay contact to any of these paths, the test fails on a dead 127.0.0.1:9 dial instead of
+    // silently touching the internet.
+    //
+    // ⚠ OWNER RULING 2026-09-03, honoured by what these tests do NOT assert: blocking gates
+    // chat/DM INTERACTION only — it is not access control and never revocation. Nothing here
+    // asserts that `dm_block` withdraws read access, stops a serve/redeem, or blocks
+    // auto-approval; that behaviour was withdrawn and its pinning tests deliberately deleted. The
+    // blocklist observed below is exactly the list `route_dm` consults, nothing more.
+    mod command_dispatch {
+        use super::*;
+        use crate::dm_quarantine::{DmRequestBucket, RequestMessage};
+        use crate::identity_state::AppIdentity;
+        use std::sync::Arc;
+        use tauri::Manager;
+
+        fn dispatch_app(identity_loaded: bool) -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            // RELAY HAZARD — see the module comment.
+            store
+                .save_settings(&crate::store::Settings {
+                    relay_urls: vec!["ws://127.0.0.1:9".into()],
+                    ..Default::default()
+                })
+                .unwrap();
+            let identity: SharedIdentity = Arc::new(tokio::sync::RwLock::new(
+                identity_loaded.then(AppIdentity::generate),
+            ));
+            app.manage(Arc::clone(&identity));
+            app.manage(store);
+            app.manage(net::new_shared());
+            app
+        }
+
+        /// The inner `hb_core::Identity` the loaded AppIdentity wraps — the same clone the commands
+        /// read out of `SharedIdentity` to key the sealed per-identity stores (`dm_requests`, cache).
+        async fn inner_identity(app: &tauri::App<tauri::test::MockRuntime>) -> hb_core::Identity {
+            let guard = app.state::<SharedIdentity>();
+            let id = guard.read().await;
+            id.as_ref().unwrap().identity.clone()
+        }
+
+        fn request_bucket(peer: &str, content: &str) -> DmRequestBucket {
+            DmRequestBucket {
+                npub: peer.to_string(),
+                first_seen: 100,
+                last_message_at: 200,
+                messages: vec![RequestMessage {
+                    wrap_id: format!("dead{peer}beef"),
+                    content: content.to_string(),
+                    sent_at: "2026-09-01T10:00:00Z".to_string(),
+                }],
+            }
+        }
+
+        /// `dm_block` via the command: the peer lands in the blocklist `route_dm` consults, AND the
+        /// two records a block supersedes — the quarantined Request bucket and any decline record —
+        /// are cleared. The blocklist is read back through `dm_blocked_list` itself.
+        /// P-10 mutation: in `dm_block`, change `dm_block_inner(&store, &id_clone, npub)` to
+        /// `dm_block_inner(&store, &id_clone, String::new())` — this test must go red (the
+        /// blocklist assert fires first; the bucket/decline asserts fire with it).
+        #[tokio::test]
+        async fn dm_block_via_command_blocks_peer_and_clears_request_and_decline() {
+            let app = dispatch_app(true);
+            let id = inner_identity(&app).await;
+            let peer = Identity::generate().npub();
+
+            // Blocked supersedes both: seed a Request bucket and a decline record for this peer.
+            app.state::<DataStore>()
+                .save_dm_requests(&id, &[request_bucket(&peer, "hello there")])
+                .unwrap();
+            app.state::<DataStore>().save_dm_declined(&[(peer.clone(), 1)]).unwrap();
+
+            dm_block(peer.clone(), app.state::<SharedIdentity>(), app.state::<DataStore>())
+                .await
+                .unwrap();
+
+            let blocked = dm_blocked_list(app.state::<DataStore>()).await.unwrap();
+            assert_eq!(blocked, vec![peer.clone()], "the blocked peer is listed, and only them");
+
+            let declined = app.state::<DataStore>().load_dm_declined().unwrap();
+            assert!(
+                !declined.iter().any(|(n, _)| n == &peer),
+                "a block supersedes the decline record"
+            );
+
+            let buckets = app.state::<DataStore>().load_dm_requests(&id).unwrap();
+            assert!(buckets.iter().all(|b| b.npub != peer), "a block deletes the Request bucket");
+        }
+
+        /// `dm_unblock` via the command removes exactly the named peer — the other blocked peer
+        /// survives — read back through `dm_blocked_list` itself.
+        /// P-10 mutation: in `dm_unblock`, change `dm_unblock_inner(&store, npub)` to
+        /// `dm_unblock_inner(&store, String::new())` — this test must go red.
+        #[tokio::test]
+        async fn dm_unblock_via_command_removes_only_the_named_peer() {
+            let app = dispatch_app(true);
+            let peer_a = Identity::generate().npub();
+            let peer_b = Identity::generate().npub();
+
+            for peer in [&peer_a, &peer_b] {
+                dm_block(peer.clone(), app.state::<SharedIdentity>(), app.state::<DataStore>())
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(dm_blocked_list(app.state::<DataStore>()).await.unwrap().len(), 2);
+
+            dm_unblock(peer_a.clone(), app.state::<DataStore>()).await.unwrap();
+
+            let blocked = dm_blocked_list(app.state::<DataStore>()).await.unwrap();
+            assert_eq!(blocked, vec![peer_b], "only the named peer is unblocked");
+        }
+
+        /// `dm_block` with no identity loaded refuses before touching the store — the command
+        /// reads the signer out of `SharedIdentity`, it does not default to one.
+        /// P-10 mutation: in `dm_block`, change the guard's `ok_or("No identity loaded.")?` to
+        /// `ok_or("changed")?` — this test must go red.
+        #[tokio::test]
+        async fn dm_block_without_identity_errors_before_touching_the_store() {
+            let app = dispatch_app(false);
+            let peer = Identity::generate().npub();
+            let err =
+                dm_block(peer, app.state::<SharedIdentity>(), app.state::<DataStore>())
+                    .await
+                    .unwrap_err();
+            assert_eq!(err, "No identity loaded.");
+            assert!(
+                dm_blocked_list(app.state::<DataStore>()).await.unwrap().is_empty(),
+                "the refused command must not write anything"
+            );
+        }
+
+        /// `advance_read_watermark` + `get_read_state` round-trip through the commands, and the
+        /// watermark never rewinds: an OLDER `sent_at` submitted afterwards leaves the newer stamp.
+        /// P-10 mutation: in `advance_read_watermark`, replace the body line
+        /// `store.advance_read_watermark(&npub, &sent_at).map_err(cmd_err)` with
+        /// `let _ = (&npub, &sent_at); Ok(())` — this test must go red (the map comes back empty).
+        /// (Replacing `get_read_state`'s `store.load_read_state().map_err(cmd_err)` with
+        /// `Ok(Default::default())` reds it too.)
+        #[tokio::test]
+        async fn advance_read_watermark_via_command_never_rewinds_through_get_read_state() {
+            let app = dispatch_app(true);
+            let peer = Identity::generate().npub();
+
+            advance_read_watermark(peer.clone(), "2026-09-01T10:00:00Z".into(), app.state::<DataStore>())
+                .await
+                .unwrap();
+            // An OLDER stamp must not rewind the newer one.
+            advance_read_watermark(peer.clone(), "2026-08-01T09:00:00Z".into(), app.state::<DataStore>())
+                .await
+                .unwrap();
+
+            let state = get_read_state(app.state::<DataStore>()).await.unwrap();
+            assert_eq!(
+                state.get(&peer).map(String::as_str),
+                Some("2026-09-01T10:00:00Z"),
+                "the newer watermark survives; an older stamp never rewinds it"
+            );
+            assert_eq!(state.len(), 1, "no stray entries for other peers");
+        }
+
+        /// `dm_request_accept` via the command: the stranger becomes a Manual contact (petname
+        /// set), the bucket is drained, its history is migrated into the DM cache, and the drained
+        /// messages are returned to the caller.
+        /// P-10 mutation: in `dm_request_accept`, change
+        /// `dm_request_accept_inner(&store, &id_clone, &own_npub, npub, petname).await` to pass
+        /// `String::new()` as the `npub` argument — this test must go red (the returned-history
+        /// assert fires first).
+        #[tokio::test]
+        async fn dm_request_accept_via_command_promotes_sender_and_drains_the_bucket() {
+            let app = dispatch_app(true);
+            let id = inner_identity(&app).await;
+            let own_npub = {
+                let guard = app.state::<SharedIdentity>();
+                let g = guard.read().await;
+                g.as_ref().unwrap().npub()
+            };
+            let peer = Identity::generate().npub();
+            app.state::<DataStore>()
+                .save_dm_requests(&id, &[request_bucket(&peer, "let me in")])
+                .unwrap();
+
+            let drained = dm_request_accept(
+                peer.clone(),
+                Some("penpal".into()),
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(drained.len(), 1, "the accepted bucket's history is returned");
+            assert_eq!(drained[0].from, peer);
+            assert_eq!(drained[0].to, own_npub);
+            assert_eq!(drained[0].content, "let me in");
+
+            let contact = app
+                .state::<DataStore>()
+                .load_contact(&CachedPeer::pubkey_hash(&peer))
+                .unwrap()
+                .expect("the accepted stranger is now a contact");
+            assert_eq!(contact.source, ContactSource::Manual);
+            assert_eq!(contact.petname.as_deref(), Some("penpal"));
+
+            assert!(
+                app.state::<DataStore>().load_dm_requests(&id).unwrap().is_empty(),
+                "the bucket is drained"
+            );
+            let cache = app.state::<DataStore>().load_dm_cache(&id).unwrap();
+            assert_eq!(cache.messages.len(), 1, "the accepted history is migrated into the DM cache");
+            assert_eq!(cache.messages[0].from, peer);
+        }
+
+        /// `dm_request_decline` via the command: the bucket is deleted and the decline is
+        /// remembered, so the next inbox poll (which re-derives requests from relay history)
+        /// doesn't resurrect it.
+        /// P-10 mutation: in `dm_request_decline`, change
+        /// `dm_request_decline_inner(&store, &id_clone, npub, now_secs())` to pass `String::new()`
+        /// as the `npub` argument — this test must go red.
+        #[tokio::test]
+        async fn dm_request_decline_via_command_removes_bucket_and_records_the_decline() {
+            let app = dispatch_app(true);
+            let id = inner_identity(&app).await;
+            let peer = Identity::generate().npub();
+            app.state::<DataStore>()
+                .save_dm_requests(&id, &[request_bucket(&peer, "spam")])
+                .unwrap();
+
+            dm_request_decline(peer.clone(), app.state::<SharedIdentity>(), app.state::<DataStore>())
+                .await
+                .unwrap();
+
+            assert!(
+                app.state::<DataStore>().load_dm_requests(&id).unwrap().is_empty(),
+                "the declined sender's bucket is deleted"
+            );
+            let declined = app.state::<DataStore>().load_dm_declined().unwrap();
+            assert!(
+                declined.iter().any(|(n, _)| n == &peer),
+                "the decline is remembered"
+            );
+        }
+
+        /// `get_manifest_asks` via the command round-trips a recorded ask under the same
+        /// `npub|author|slug` key shape the writer used — the persisted ask trace the Browse
+        /// paywall reads back across restarts.
+        /// P-10 mutation: in `get_manifest_asks`, replace `store.load_manifest_asks().map_err(cmd_err)`
+        /// with `Ok(Default::default())` — this test must go red.
+        #[tokio::test]
+        async fn get_manifest_asks_via_command_round_trips_a_recorded_ask() {
+            let app = dispatch_app(true);
+            let peer = Identity::generate().npub();
+            app.state::<DataStore>()
+                .record_manifest_ask(&peer, "self", "roms", "fp-seen-1", "2026-09-01T00:00:00Z", "n0nce")
+                .unwrap();
+
+            let asks = get_manifest_asks(app.state::<DataStore>()).await.unwrap();
+            let ask = asks
+                .get(&crate::store::manifest_ask_key(&peer, "self", "roms"))
+                .expect("the ask is filed under the writer's npub|author|slug key");
+            assert_eq!(ask.fingerprint_seen, "fp-seen-1");
+            assert_eq!(ask.nonce, "n0nce");
+            assert_eq!(ask.claimed_by, None);
+            assert!(!ask.spent);
+        }
+    }
 }
