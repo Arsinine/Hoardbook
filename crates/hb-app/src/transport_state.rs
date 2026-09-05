@@ -385,10 +385,12 @@ pub async fn rebind_if_tickets_outstanding(
 /// its contents. Binding a listener nothing dials costs an idle endpoint; NOT binding one that
 /// something does dial costs a silently unreachable node, which is the failure that actually hurts.
 /// When in doubt it must bind.
+///
+/// The directory read itself lives in `manifest_cache::has_any` — this file is inside INV-4′'s
+/// swept transport surface and must touch no filesystem. See that function's doc for why the fence
+/// is not widened instead.
 fn has_servable_content(store: &crate::store::DataStore) -> bool {
-    std::fs::read_dir(store.manifest_cache_dir())
-        .map(|mut d| d.next().is_some())
-        .unwrap_or(false)
+    crate::manifest_cache::has_any(&store.manifest_cache_dir())
 }
 
 #[cfg(test)]

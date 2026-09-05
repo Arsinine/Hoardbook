@@ -261,6 +261,23 @@ fn get_inner(
     Some(envelope)
 }
 
+/// Does this cache hold anything at all?
+///
+/// Deliberately CHEAP and IMPRECISE — it stops at the first entry and never parses one, because the
+/// only caller uses it to decide whether to bind a listening endpoint. Binding one nothing dials
+/// costs an idle endpoint; NOT binding one something dials costs a silently unreachable node, which
+/// is the failure that actually hurts. When in doubt it must say yes.
+///
+/// ⚠ **It lives here rather than at its call site for a structural reason.** The caller is
+/// `transport_state::has_servable_content`, and `transport_state.rs` is inside INV-4′'s swept
+/// transport surface, which must touch NO filesystem — `std::fs`, a bare `fs::`, `PathBuf` and
+/// `std::path::Path` are all flagged there. That fence is one of the four mechanisms keeping the
+/// plane manifest-only, and any one of them alone is just a comment, so the read moves to the
+/// module that owns the cache instead of the fence being widened to admit it.
+pub fn has_any(dir: &Path) -> bool {
+    std::fs::read_dir(dir).map(|mut d| d.next().is_some()).unwrap_or(false)
+}
+
 /// One cached manifest's identity: which collection, at which snapshot.
 ///
 /// Deliberately carries no envelope — a caller enumerating the cache wants to know *what is here*,
@@ -511,6 +528,28 @@ mod tests {
         let entry = entries.iter().find(|(_, _, _, npub, slug, _)| npub == "npubA" && slug == "films")
             .expect("the entry is still there");
         assert_eq!(entry.2, 200, "a get_latest read must bump last_access to `now`");
+    }
+
+    /// MUTATION (P-10) — in `has_any`, change `d.next().is_some()` to `d.next().is_none()` →
+    /// this test reds on both asserts.
+    ///
+    /// The direction is the whole point: this answers "bind a listener?", and the doc's own rule is
+    /// that when in doubt it must say YES. Inverted, a node holding cached manifests would decline
+    /// to bind and go silently unreachable — the failure the check exists to prevent.
+    #[test]
+    fn has_any_is_true_exactly_when_the_cache_holds_something() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!has_any(dir.path()), "an empty cache dir holds nothing");
+        put(dir.path(), "npubA", "films", "fp-A", "ENV-A", 10, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
+        assert!(has_any(dir.path()), "one cached manifest is enough to make a dial possible");
+    }
+
+    /// MUTATION (P-10) — in `has_any`, change `.unwrap_or(false)` to `.unwrap_or(true)` → this test
+    /// reds. A missing directory is a cold cache, not a reason to bind.
+    #[test]
+    fn has_any_is_false_for_a_directory_that_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!has_any(&dir.path().join("never-created")));
     }
 
     /// MUTATION (P-10) — in `scan`'s `out.push((...))`, replace the `parsed.fingerprint` field
