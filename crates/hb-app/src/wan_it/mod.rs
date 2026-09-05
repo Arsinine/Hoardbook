@@ -31,6 +31,7 @@ mod suite_wan_c;
 mod suite_wan_carry;
 mod suite_wan_d;
 mod suite_wan_e2e;
+mod suite_wan_fetch;
 mod suite_wan_m;
 mod suite_wan_p;
 mod suite_wan_r;
@@ -125,6 +126,7 @@ fn usage() -> &'static str {
             [--suite wan-e2e]\n\
             [--suite wan-u]\n\
             [--suite carry --role a|c|d]\n\
+            [--suite fetch --role a|d --phase 1|2]\n\
             [--suite wan-c]\n\
             [--suite wan-t]\n\
             [--suite wan-d [--flood-relay <ws-url>... --flood-count <n>]]\n\
@@ -150,6 +152,9 @@ fn usage() -> &'static str {
             relays (A publishes then goes offline; C caches + re-serves; D asks + redeems).\n\
             --role a|c|d picks the party this process plays; see the carry suite's module doc\n\
             for the two-phase choreography and the flags each role takes.\n\
+            --suite fetch runs the FETCH rows (FA1-FA2, FD1-FD3): the BACKGROUND FETCH DRIVER over\n\
+            real relays. A publishes, D caches, A republishes a changed tree, and D's poll_once must\n\
+            notice, ask and redeem with no operator step in between. Two parties, --role a|d.\n\
             --suite wan-m4 runs the M4 row standalone (n0 canary core — bind_endpoint obtains a\n\
             home relay and the endpoint is reachable through it). Probe-plays-both — no serve needed.\n\
      \n\
@@ -878,6 +883,11 @@ async fn run_probe(args: &[String]) -> Result<ExitCode> {
     if suite == "carry" {
         return run_probe_wan_carry(args).await;
     }
+    // FETCH (QURATOR-164 item 3) is probe-plays-a-role too: A and D each run one process with
+    // their own --data-dir, so no --peer.
+    if suite == "fetch" {
+        return run_probe_wan_fetch(args).await;
+    }
 
     let peer_str = args::flag_value(args, "--peer")
         .ok_or_else(|| anyhow!("probe requires --peer <npub or hbk… share-code>"))?;
@@ -1332,6 +1342,42 @@ async fn run_probe_wan_carry(args: &[String]) -> Result<ExitCode> {
 
     let mut tap = tap::Tap::new();
     suite_wan_carry::run(&mut tap, &role, &input).await;
+    Ok(tap.finish())
+}
+
+/// Run the FETCH rows (QURATOR-164 item 3) — the background fetch driver over real relays.
+///
+/// Two parties, sequenced by the operator:
+/// * role A (the author):  `--role a --phase 1 --seed-dir <dir> --asker-npub <D npub>`, then
+///   `--role a --phase 2 --seed-dir <dir> --asker-npub <D npub>` (republishes a CHANGED tree, so
+///   the snapshot fingerprint moves, then answers the ask the driver itself sends).
+/// * role D (the driver node): `--role d --phase 1 --author-npub <A npub>
+///   --author-share-code <hbk…>` (cache at the OLD fingerprint), then
+///   `--role d --phase 2 --author-npub <A npub>` (run `poll_once` and assert it asked AND
+///   redeemed with no operator step in between).
+async fn run_probe_wan_fetch(args: &[String]) -> Result<ExitCode> {
+    let role = args::flag_value(args, "--role")
+        .ok_or_else(|| anyhow!("probe --suite fetch requires --role a|d"))?
+        .to_string();
+
+    let data_dir = PathBuf::from(
+        args::flag_value(args, "--data-dir").unwrap_or("./hb-wan-it-probe-data").to_string(),
+    );
+    let store = DataStore::new(data_dir.clone());
+    let relays = args::collect_relays(args);
+    if relays.is_empty() {
+        bail!("probe requires at least one --relay");
+    }
+    store.save_settings(&Settings { relay_urls: relays.clone(), ..Default::default() })?;
+    let app_id = load_or_create_identity(&store)?;
+
+    println!("# FETCH probe — role {role}");
+    println!("# relay set: {}", relays.join(", "));
+
+    let input = suite_wan_carry::CarryInput { app_id, store, relays, args: args.to_vec() };
+
+    let mut tap = tap::Tap::new();
+    suite_wan_fetch::run(&mut tap, &role, &input).await;
     Ok(tap.finish())
 }
 

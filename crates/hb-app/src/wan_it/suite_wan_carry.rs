@@ -81,11 +81,11 @@ pub struct CarryInput {
 }
 
 impl CarryInput {
-    fn flag<'a>(&'a self, name: &'a str) -> Option<&'a str> {
+    pub(super) fn flag<'a>(&'a self, name: &'a str) -> Option<&'a str> {
         super::args::flag_value(&self.args, name)
     }
 
-    fn live_identity(&self) -> SharedIdentity {
+    pub(super) fn live_identity(&self) -> SharedIdentity {
         Arc::new(tokio::sync::RwLock::new(Some(
             AppIdentity {
                 identity: self.app_id.identity.clone(),
@@ -141,14 +141,14 @@ pub async fn run(tap: &mut Tap, role: &str, input: &CarryInput) {
 
 /// Mint the ask nonce harness-side (128 bits, hex) — the same shape `send_request_dm` in
 /// suite_wan_e2e uses, because `commands::chat::new_ask_nonce` is private.
-fn mint_ask_nonce() -> String {
+pub(super) fn mint_ask_nonce() -> String {
     let bytes: [u8; 16] = rand::random();
     hex::encode(bytes)
 }
 
 /// Send an already-built request-DM body to `recipient` via the production NIP-17 send path, and
 /// record the ask locally in production ordering (record AFTER the send resolves).
-async fn send_request_dm_to(
+pub(super) async fn send_request_dm_to(
     input: &CarryInput,
     content: &str,
     recipient_npub: &str,
@@ -189,7 +189,7 @@ async fn send_request_dm_to(
 /// Poll this party's DM inbox via the production unwrap path (`decode_dms`) and hand every decoded
 /// message from `expected_sender` to `inspect`. Retries with a settle sleep; `inspect` returns
 /// `Some(T)` when it has found what it wants (a ticket, a request).
-async fn poll_dms<T>(
+pub(super) async fn poll_dms<T>(
     input: &CarryInput,
     expected_sender: &str,
     mut inspect: impl FnMut(&crate::commands::chat::ReceivedMessage) -> Option<T>,
@@ -245,7 +245,7 @@ async fn poll_dms<T>(
 /// fetch, `accept_manifest_bytes` (which writes the cache that is this row's subject), and the
 /// spend — with a bounded retry. A failed attempt leaves the ask retryable (the claim is keyed to
 /// the same request_id, and `claim_manifest_ask` re-grants on the same id), so retries are safe.
-async fn redeem_via_production(
+pub(super) async fn redeem_via_production(
     input: &CarryInput,
     ticket: &TransportTicket,
     newest_fingerprint: Option<&str>,
@@ -707,7 +707,7 @@ async fn run_role_d(input: &CarryInput) -> Result<(), String> {
 
 /// Save `peer_npub` as a contact carrying the full share code's browse key — the contact shape
 /// `accept_manifest_bytes` loads (same construction as `suite_wan_e2e::build_probe_input`).
-fn save_peer_contact(input: &CarryInput, peer_npub: &str, share_code_str: &str) -> Result<(), String> {
+pub(super) fn save_peer_contact(input: &CarryInput, peer_npub: &str, share_code_str: &str) -> Result<(), String> {
     let share = hb_core::ShareCode::parse(share_code_str)
         .map_err(|e| format!("invalid share code for {peer_npub}: {e}"))?;
     let contact = crate::store::CachedPeer {
@@ -731,7 +731,7 @@ fn save_peer_contact(input: &CarryInput, peer_npub: &str, share_code_str: &str) 
 }
 
 /// Read D's (or C's) own cached copy for `(npub, slug)` back through the production reader.
-fn read_cached(input: &CarryInput, npub: &str) -> Result<String, String> {
+pub(super) fn read_cached(input: &CarryInput, npub: &str) -> Result<String, String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -742,7 +742,7 @@ fn read_cached(input: &CarryInput, npub: &str) -> Result<String, String> {
 
 /// Assert the cached copy for `(npub, slug)` exists and verifies under that npub's x-only key —
 /// the exact read + verify `send_cached_manifest_inner` performs before re-serving.
-fn verify_cached_under(input: &CarryInput, npub: &str) -> Result<(), String> {
+pub(super) fn verify_cached_under(input: &CarryInput, npub: &str) -> Result<(), String> {
     let json = read_cached(input, npub)?;
     let envelope = hb_core::manifest::ManifestEnvelope::from_json(&json)
         .map_err(|e| format!("parse cached envelope: {e}"))?;
