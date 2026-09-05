@@ -32,18 +32,23 @@
 //! sends. §5's integration half — a live two-machine run — is owed on QURATOR-164 and is not
 //! discharged by any unit test here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use hb_core::TransportTicket;
+use hb_net::RelayClient;
+use nostr::prelude::*;
 use tokio::time::Instant;
 
 use crate::commands::browse::{contact_share_code, resolve_peer};
-use crate::commands::chat::request_manifest_from_inner;
+use crate::commands::chat::{decode_dms, request_manifest_from_inner};
+use crate::commands::fulfil::redeem_manifest_ticket_inner;
 use crate::identity_state::SharedIdentity;
 use crate::manifest_cache::CachedKey;
 use crate::net::SharedRelay;
 use crate::peer_wave::{next_action, Candidate, WaveAction};
-use crate::store::DataStore;
+use crate::store::{manifest_ask_key, DataStore};
+use crate::transport_state::SharedEndpoint;
 
 /// How often the driver re-reads published fingerprints.
 ///
@@ -121,6 +126,103 @@ pub(crate) struct PollOutcome {
     pub stale: Vec<StaleHolding>,
     /// The npubs actually asked, in wave order — carriers first, then the author.
     pub asked: Vec<String>,
+    /// Slugs redeemed this poll, from tickets answering asks a PREVIOUS poll sent.
+    pub redeemed: Vec<String>,
+}
+
+/// The peers this node has actually asked — the allow-list for [`redeem_pending_tickets`].
+///
+/// **This is a security boundary, not a filter for tidiness.** It is what stops an unsolicited
+/// "ticket" from a stranger reaching the redeem body at all: a ticket names a node address to dial,
+/// so accepting one nobody asked for would let any peer make this node dial an address of their
+/// choosing. Keys are `peer|author|slug`; the peer is the first segment.
+/// Generic in the value because it reads only the KEYS — which keeps the allow-list decoupled
+/// from whatever the ask record holds, and lets the test exercise the segment logic without
+/// fabricating a `ManifestAsk`.
+pub(crate) fn asked_peers<V>(asks: &HashMap<String, V>) -> HashSet<String> {
+    asks.keys().filter_map(|k| k.split('|').next()).map(String::from).collect()
+}
+
+/// Drain tickets that answer asks THIS node sent, redeeming each through the production body.
+///
+/// Runs at the START of a poll, before the staleness check, so a ticket that arrived since the last
+/// poll is in the cache before we decide whether anything is still stale — otherwise the driver
+/// would re-ask for a collection it had just been handed.
+///
+/// ⚠ **This exists because redemption had no unattended path.** The only other caller of
+/// `redeem_manifest_ticket` is the chat page, whose DM poll is created in `onMount`, torn down on
+/// destroy, and gated on `!document.hidden`. So before this, the driver could ask unattended and
+/// then sit on the answer until the user happened to open the Chat tab with the window focused —
+/// which is not the background driver that was ruled for (owner, 2026-09-04, option (b)).
+async fn redeem_pending_tickets(
+    store: &DataStore,
+    identity: &hb_core::Identity,
+    own_npub: &str,
+    live: &SharedIdentity,
+    endpoint: &SharedEndpoint,
+) -> Vec<String> {
+    let mut redeemed = Vec::new();
+    let Ok(asks) = store.load_manifest_asks() else { return redeemed };
+    if asks.is_empty() {
+        return redeemed;
+    }
+    let allow = asked_peers(&asks);
+
+    // A short-lived client per poll, as the auto-approve loop does: the persistent shared client
+    // belongs to the command surface and must not be held across this loop's sleeps.
+    let relays = crate::net::relay_urls(store);
+    let Ok(client) = RelayClient::connect(identity, &relays, crate::net::RELAY_TIMEOUT).await else {
+        return redeemed;
+    };
+    let wraps = client
+        .fetch(
+            Filter::new().kind(Kind::GiftWrap).pubkey(identity.public_key()),
+            crate::net::RELAY_TIMEOUT,
+        )
+        .await;
+    client.disconnect().await;
+    let Ok(wraps) = wraps else { return redeemed };
+
+    for msg in decode_dms(own_npub, identity, wraps, Some(&allow)).await {
+        let trimmed = msg.content.trim();
+        let Ok(ticket) = serde_json::from_str::<TransportTicket>(trimmed) else { continue };
+        if ticket.verify_shape().is_err() {
+            continue;
+        }
+        // The fingerprint we asked for, so the backend's staleness gate has a real comparand rather
+        // than None. An authorless ticket is the peer serving their own collection, so the author
+        // key is the sender.
+        let author = ticket.author_npub.clone().unwrap_or_else(|| msg.from.clone());
+        let want = asks
+            .get(&manifest_ask_key(&msg.from, &author, &ticket.slug))
+            .map(|a| a.fingerprint_seen.clone());
+
+        match redeem_manifest_ticket_inner(
+            msg.from.clone(),
+            trimmed.to_string(),
+            want,
+            live,
+            store,
+            endpoint,
+        )
+        .await
+        {
+            Ok(_) => {
+                tracing::info!(
+                    from = %truncate(&msg.from),
+                    slug = %ticket.slug,
+                    "fetch driver: redeemed a ticket answering our ask"
+                );
+                redeemed.push(ticket.slug.clone());
+            }
+            Err(e) => tracing::debug!(
+                from = %truncate(&msg.from),
+                error = %e,
+                "fetch driver: redeem failed; the ask stays retryable"
+            ),
+        }
+    }
+    redeemed
 }
 
 /// The driver loop. Spawned once at startup; runs for the process lifetime.
@@ -129,7 +231,12 @@ pub(crate) struct PollOutcome {
 /// [`poll_once`]. The split is what makes the behaviour reachable by the WAN harness — a loop that
 /// sleeps five minutes between observations cannot be driven, and a harness carrying its own copy
 /// of the poll would be the drift this project has already paid for three times.
-pub(crate) async fn run_fetch_driver_loop(store: DataStore, live_npub: SharedIdentity, relay: SharedRelay) {
+pub(crate) async fn run_fetch_driver_loop(
+    store: DataStore,
+    live_npub: SharedIdentity,
+    relay: SharedRelay,
+    endpoint: SharedEndpoint,
+) {
     // Keyed (author_npub, slug). In memory, like the auto-approve loop's caps: a restart re-reads
     // fingerprints and starts its attempt counting over, which is correct — a fresh process has no
     // reason to believe a peer that was down an hour ago still is.
@@ -142,7 +249,7 @@ pub(crate) async fn run_fetch_driver_loop(store: DataStore, live_npub: SharedIde
 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
-        poll_once(&store, &live_npub, &relay, &mut states).await;
+        poll_once(&store, &live_npub, &relay, &endpoint, &mut states).await;
     }
 }
 
@@ -157,6 +264,7 @@ pub(crate) async fn poll_once(
     store: &DataStore,
     live_npub: &SharedIdentity,
     relay: &SharedRelay,
+    endpoint: &SharedEndpoint,
     states: &mut HashMap<(String, String), AskState>,
 ) -> PollOutcome {
     let mut outcome = PollOutcome::default();
@@ -169,6 +277,10 @@ pub(crate) async fn poll_once(
         let Some(id) = guard.as_ref() else { return outcome };
         (id.identity.clone(), id.npub())
     };
+
+    // Redeem BEFORE checking staleness — see `redeem_pending_tickets`' doc.
+    outcome.redeemed =
+        redeem_pending_tickets(store, &identity, &own_npub, live_npub, endpoint).await;
 
     let held = crate::manifest_cache::list(&store.manifest_cache_dir());
     if held.is_empty() {
@@ -275,6 +387,95 @@ mod tests {
 
     fn held(npub: &str, slug: &str, fp: &str) -> CachedKey {
         CachedKey { npub: npub.into(), slug: slug.into(), fingerprint: fp.into() }
+    }
+
+    /// MUTATION (P-10) — in `asked_peers`, change `.split('|').next()` to `.split('|').last()`
+    /// → this test reds (the SLUG would become the allow-list entry, so every real peer would be
+    /// filtered out and no ticket could ever be redeemed).
+    #[test]
+    fn asked_peers_takes_the_peer_segment_not_the_slug() {
+        let mut asks: HashMap<String, ()> = HashMap::new();
+        asks.insert("npubC|npubA|films".to_string(), ());
+        asks.insert("npubC|npubA|music".to_string(), ());
+        asks.insert("npubE|npubA|films".to_string(), ());
+
+        let got = asked_peers(&asks);
+        assert_eq!(got.len(), 2, "two distinct peers across three asks");
+        assert!(got.contains("npubC") && got.contains("npubE"));
+        assert!(!got.contains("films"), "the slug is not a peer");
+        assert!(
+            !got.contains("npubZ"),
+            "a peer we never asked is absent — this set IS the gate on whose ticket may be redeemed"
+        );
+    }
+
+    /// The allow-list must actually reach `decode_dms` — the boundary, not just a computed set.
+    ///
+    /// A ticket names a node address this process will DIAL. Redeeming an unsolicited one would let
+    /// any stranger choose that address, which is the SSRF shape `redeem_manifest_ticket_with_progress`
+    /// guards at QURATOR-113 #20; this allow-list is the layer before it. Passing `None` here would
+    /// admit every gift-wrap the relay returns.
+    ///
+    /// MUTATION (P-10) — in `redeem_pending_tickets`, change `Some(&allow)` in the `decode_dms`
+    /// call to `None` → this test reds.
+    #[test]
+    fn the_redeem_allow_list_is_wired_into_decode_dms() {
+        let src = include_str!("fetch_driver.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("async fn redeem_pending_tickets(")
+            .expect("the redeem helper must exist");
+        // Anchored on a SIGNATURE, not a doc comment: the strip above removes every `///` line,
+        // so a doc-comment anchor can never be found in `code` (this guard failed exactly that way
+        // when first written).
+        let end = code[at..]
+            .find("pub(crate) async fn run_fetch_driver_loop(")
+            .expect("the loop must follow the redeem helper")
+            + at;
+        let region = &code[at..end];
+        assert!(
+            region.contains("decode_dms(own_npub, identity, wraps, Some(&allow))"),
+            "the decoded set must be restricted to peers we asked; None would admit any stranger's \
+             ticket and let them choose an address this node dials"
+        );
+    }
+
+    /// `poll_once` must redeem BEFORE it checks staleness.
+    ///
+    /// A ticket that arrived since the last poll has to land in the cache first, or the staleness
+    /// check still sees the old fingerprint and re-asks for a collection this node was just handed —
+    /// burning a wave slot, a throttle slot, and one of the three attempts, every poll.
+    ///
+    /// MUTATION (P-10) — in `poll_once`, replace the
+    /// `outcome.redeemed = redeem_pending_tickets(...).await;` statement with
+    /// `outcome.redeemed = Vec::new();` → this test reds.
+    #[test]
+    fn poll_once_redeems_before_it_checks_staleness() {
+        let src = include_str!("fetch_driver.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code.find("pub(crate) async fn poll_once(").expect("poll_once must exist");
+        let end = code[at..].find("fn truncate(").expect("truncate must follow") + at;
+        let region = &code[at..end];
+        // Call forms, never bare names: this test's own prose names both symbols, and a guard that
+        // counts an identifier it also writes can be satisfied by its own message (CLAUDE.md §9).
+        let redeem_at = region
+            .find("redeem_pending_tickets(")
+            .expect("poll_once must drain tickets");
+        let check_at = region
+            .find("manifest_cache::list(")
+            .expect("poll_once must read what is held");
+        assert!(
+            redeem_at < check_at,
+            "redeem must precede the staleness read, or the driver re-asks for what it just received"
+        );
     }
 
     /// The loop must stay a THIN SHELL over [`poll_once`] — cadence and state only.

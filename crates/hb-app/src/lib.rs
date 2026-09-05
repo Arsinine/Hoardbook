@@ -200,7 +200,7 @@ fn spawn_background_tasks(
         store.clone(),
         Arc::clone(&identity),
         Arc::clone(&relay),
-        endpoint,
+        Arc::clone(&endpoint),
     ));
 
     // QURATOR-164 item 3 (owner ruling 2026-09-04, option (b)): the background fetch driver.
@@ -211,6 +211,7 @@ fn spawn_background_tasks(
         store.clone(),
         Arc::clone(&identity),
         Arc::clone(&relay),
+        endpoint,
     ));
 
     // The wakeup counter is the L4 idle-guard hook; in prod it is written-and-ignored.
