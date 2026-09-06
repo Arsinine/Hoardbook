@@ -1348,9 +1348,10 @@ async fn run_probe_wan_carry(args: &[String]) -> Result<ExitCode> {
 /// Run the FETCH rows (QURATOR-164 item 3) — the background fetch driver over real relays.
 ///
 /// Two parties, sequenced by the operator:
-/// * role A (the author):  `--role a --phase 1 --seed-dir <dir> --asker-npub <D npub>`, then
-///   `--role a --phase 2 --seed-dir <dir> --asker-npub <D npub>` (republishes a CHANGED tree, so
-///   the snapshot fingerprint moves, then answers the ask the driver itself sends).
+/// * role A (the author):  `--role a --phase 1 --seed-dir <dir>`, then
+///   `--role a --phase 2 --seed-dir <dir>` (republishes a CHANGED tree, so the snapshot fingerprint
+///   moves). A answers asks continuously and needs NO npub flag — it serves whoever asks, so the
+///   roles have no circular bootstrap: only D needs the other side's identity.
 /// * role D (the driver node): `--role d --phase 1 --author-npub <A npub>
 ///   --author-share-code <hbk…>` (cache at the OLD fingerprint), then
 ///   `--role d --phase 2 --author-npub <A npub>` (run `poll_once` and assert it asked AND

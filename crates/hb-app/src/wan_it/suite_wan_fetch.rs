@@ -5,9 +5,12 @@
 //!
 //! Topology (two parties, driven by the operator in two phases):
 //!
-//! * **A — the author**: seeds + publishes a collection, answers D's ordinary ask, then on phase 2
-//!   REPUBLISHES a changed tree (a new `snapshot_fingerprint`) and answers the ask the driver
-//!   itself originates.
+//! * **A — the author**: seeds + publishes a collection and answers asks continuously; on phase 2
+//!   it REPUBLISHES a changed tree (a new `snapshot_fingerprint`) and keeps answering, including
+//!   the ask the driver itself originates.
+//!   ⚠ A needs NO flag naming D. It answers whoever asks, exactly as the auto-approve loop does,
+//!   which is what removes the circular bootstrap the roles used to have (A wanting D's npub while
+//!   D wanted A's).
 //! * **D — the driver node**: phase 1 caches A's collection at the OLD fingerprint; phase 2 runs
 //!   `fetch_driver::poll_once` and must, unattended, notice the change, ask, and redeem.
 //!
@@ -23,7 +26,7 @@
 //! | A | seed the collection | `wan_it::seed_collection` → `commands::collection::scan_selective` + `DataStore::save_collection_draft` |
 //! | A | publish the teaser | `commands::collection::prepare_listing` + `hb_net::publish_listing_capped` |
 //! | A | REPUBLISH (new fingerprint) | the same two, over a regenerated seed tree — the fingerprint moves because the TREE moved, never because the harness wrote one |
-//! | A | answer an ask | `wan_it::approve_request` → `commands::fulfil::send_full_list_inner` |
+//! | A | answer asks (continuously) | `wan_it::run_auto_approve_loop` → `commands::fulfil::send_full_list_inner` |
 //! | D·1 | ask + cache | `commands::chat::build_manifest_request` + `send_dm_inner`, then `commands::fulfil::redeem_manifest_ticket_inner` |
 //! | D·2 | **notice, ask, redeem** | `fetch_driver::poll_once` — the whole row. It reads `manifest_cache::list`, resolves A's listing via `commands::browse::resolve_peer`, decides with `peer_wave::next_action`, asks via `commands::chat::request_manifest_from_inner`, and redeems via `commands::fulfil::redeem_manifest_ticket_inner` |
 //! | D·2 | verify under A | `manifest_cache::get_latest` + `hb_core::ManifestEnvelope::verify_author` |
@@ -190,18 +193,11 @@ async fn run_role_a_phase1(input: &CarryInput) -> Result<(), String> {
         .flag("--seed-dir")
         .ok_or_else(|| "role a requires --seed-dir <dir>".to_string())?
         .to_string();
-    let asker_npub = input
-        .flag("--asker-npub")
-        .ok_or_else(|| "role a phase 1 requires --asker-npub <driver-node npub>".to_string())?
-        .to_string();
-
     publish_tree(input, &seed_dir, 24, 0, "FA1").await?;
 
     // The npub + share code are printed by the probe entry before role dispatch, so they are
     // available even on a run that fails its flag checks.
-    answer_one_ask(input, &asker_npub, "FA1").await?;
-    hold("FA1").await;
-    Ok(())
+    serve_asks(input, "FA1").await
 }
 
 /// Republish a CHANGED tree, then answer the ask the driver originates.
@@ -210,11 +206,6 @@ async fn run_role_a_phase2(input: &CarryInput) -> Result<(), String> {
         .flag("--seed-dir")
         .ok_or_else(|| "role a requires --seed-dir <dir>".to_string())?
         .to_string();
-    let asker_npub = input
-        .flag("--asker-npub")
-        .ok_or_else(|| "role a phase 2 requires --asker-npub <driver-node npub>".to_string())?
-        .to_string();
-
     // A DIFFERENT tree. `generate_seed_tree` does NOT wipe — it writes `file-{offset+i}.bin` over
     // whatever is already there — so 31 files at offset 1 land alongside phase 1's 24 at offset 0
     // and the tree ends at 32 entries, not 31. Either way the fingerprint moves because the CONTENT
@@ -226,9 +217,7 @@ async fn run_role_a_phase2(input: &CarryInput) -> Result<(), String> {
     publish_tree(input, &seed_dir, 31, 1, "FA2").await?;
     eprintln!("   FA2 republished — the snapshot fingerprint has moved; the driver should notice");
 
-    answer_one_ask(input, &asker_npub, "FA2").await?;
-    hold("FA2").await;
-    Ok(())
+    serve_asks(input, "FA2").await
 }
 
 /// Generate a seed tree, scan it into a draft, and publish the teaser — all production functions.
@@ -275,44 +264,30 @@ async fn publish_tree(
     Ok(())
 }
 
-/// Wait for one request-DM and answer it through the production approval body.
-async fn answer_one_ask(input: &CarryInput, asker_npub: &str, row: &str) -> Result<(), String> {
-    eprintln!("   {row} waiting for the driver node's request-DM (polling)...");
-    let (slug, nonce) = poll_dms_newest(
-        input,
-        asker_npub,
-        |msg| {
-            // Production's parser, never a copy (QURATOR-183).
-            let body = crate::auto_approve::ManifestRequestBody::parse(&msg.content)?;
-            Some((body.slug.clone(), body.ask_nonce.clone()))
-        },
-        "manifest request from the driver node (newest)",
-    )
-    .await?;
-    if slug != FETCH_SLUG {
-        return Err(format!("the driver node asked for slug '{slug}', not '{FETCH_SLUG}'"));
-    }
+/// Answer asks CONTINUOUSLY, through the production auto-approve loop, until the operator kills
+/// this process.
+///
+/// ⚠ **It must not answer one ask and stop.** An earlier cut did, and it made the choreography
+/// order-dependent in a way no amount of "take the newest" could fix: relay state outlives a run,
+/// so when A started it found four SUPERSEDED asks already sitting there, answered the newest of
+/// those, and went idle — before D had sent anything at all. D's fresh ask then arrived with nobody
+/// listening (observed live, 2026-09-06). Production has never behaved that way: `auto_approve`
+/// answers every request-DM it sees, for as long as the app runs.
+///
+/// This is `wan_it::run_auto_approve_loop`, the same helper the `--auto-approve` serve drives, so
+/// every approval still goes through `send_full_list_inner`. It also keeps this process up for the
+/// asker's dial, which is what the old explicit hold was for.
+async fn serve_asks(input: &CarryInput, row: &str) -> Result<(), String> {
+    eprintln!("   {row} serving asks continuously (production auto-approve loop) — kill this process when the row reports done");
     let shared_relay = crate::net::new_shared();
-    super::approve_request(
+    super::run_auto_approve_loop(
         &input.store,
         &input.live_identity(),
         &shared_relay,
-        asker_npub,
-        &slug,
-        nonce.as_deref(),
+        &input.relays,
     )
     .await
-    .map_err(|e| format!("approve_request (send_full_list_inner): {e:#}"))?;
-    eprintln!("   {row} answered via send_full_list_inner — ticket minted + DM'd");
-    Ok(())
-}
-
-/// Stay up so the asker can dial this process's iroh endpoint.
-async fn hold(row: &str) {
-    eprintln!("   {row} holding for the redeem — kill this process when the row reports done");
-    for _ in 0..180 {
-        tokio::time::sleep(Duration::from_secs(10)).await;
-    }
+    .map_err(|e| format!("auto-approve loop: {e:#}"))
 }
 
 /// FD1: an ordinary ask + redeem, so the driver node holds the collection at the OLD fingerprint.
