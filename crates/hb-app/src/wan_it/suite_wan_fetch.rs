@@ -132,9 +132,14 @@ async fn run_role_a_phase2(input: &CarryInput) -> Result<(), String> {
         .ok_or_else(|| "role a phase 2 requires --asker-npub <driver-node npub>".to_string())?
         .to_string();
 
-    // A DIFFERENT tree — 31 files rather than 24. The fingerprint moves because the CONTENT moved,
-    // which is what the driver watches. A harness that wrote a fingerprint directly would prove
-    // nothing about the production path that derives one.
+    // A DIFFERENT tree. `generate_seed_tree` does NOT wipe — it writes `file-{offset+i}.bin` over
+    // whatever is already there — so 31 files at offset 1 land alongside phase 1's 24 at offset 0
+    // and the tree ends at 32 entries, not 31. Either way the fingerprint moves because the CONTENT
+    // moved, which is what the driver watches. A harness that wrote a fingerprint directly would
+    // prove nothing about the production path that derives one.
+    //
+    // ⚠ --seed-dir is SCANNED IN FULL and PUBLISHED as a public teaser (subdirectories included,
+    // Windows junctions followed). Point it at a scratch directory, never at real collection data.
     publish_tree(input, &seed_dir, 31, 1, "FA2").await?;
     eprintln!("   FA2 republished — the snapshot fingerprint has moved; the driver should notice");
 
