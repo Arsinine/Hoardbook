@@ -380,6 +380,7 @@ async fn run_role_d_phase2(input: &CarryInput) -> Result<(), String> {
 
     let mut asked_author = false;
     let mut redeemed = false;
+    let mut saw_stale = false;
     for attempt in 1..=DRIVER_POLLS {
         let outcome = poll_once(&input.store, &live, &shared_relay, &endpoint, &mut states).await;
         eprintln!(
@@ -388,6 +389,9 @@ async fn run_role_d_phase2(input: &CarryInput) -> Result<(), String> {
             outcome.asked,
             outcome.redeemed
         );
+        if !outcome.stale.is_empty() {
+            saw_stale = true;
+        }
         if outcome.asked.iter().any(|n| n == &author_npub) {
             asked_author = true;
         }
@@ -399,9 +403,24 @@ async fn run_role_d_phase2(input: &CarryInput) -> Result<(), String> {
     }
 
     if !asked_author {
+        // ⚠ Distinguish NOTHING TO DO from a broken watch. `stale=0` on every poll means the held
+        // fingerprint already equals the published one — overwhelmingly because a previous phase-2
+        // run SUCCEEDED and advanced the cache, which is a passing row being re-run, not a failure.
+        // The message used to offer only two causes, both of them defects, and sent the operator
+        // looking for a bug in a driver that had correctly done nothing.
+        if !saw_stale {
+            return Err(format!(
+                "nothing was stale across {DRIVER_POLLS} polls: this node already holds {before}, \
+                 which is what the author currently publishes — so there is nothing to fetch and \
+                 the driver was right not to ask. This is what a SUCCEEDED phase 2 looks like when \
+                 it is re-run. To exercise the row again, reset the CONTENT and not the identities: \
+                 delete the --seed-dir, then re-run role a phase 1, role d phase 1, role a phase 2, \
+                 role d phase 2. Keep both --data-dir values — deleting those mints new npubs."
+            ));
+        }
         return Err(format!(
-            "the driver never asked the author across {DRIVER_POLLS} polls — either it did not \
-             notice the fingerprint move, or the wave did not include the author"
+            "the driver saw a stale holding but never asked the author across {DRIVER_POLLS} polls \
+             — the wave did not include the author, or every attempt was still backing off"
         ));
     }
     eprintln!("   FD2 the driver originated the ask ITSELF — no operator step sent it");
