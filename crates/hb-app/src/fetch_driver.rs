@@ -41,7 +41,7 @@ use nostr::prelude::*;
 use tokio::time::Instant;
 
 use crate::commands::browse::{contact_share_code, resolve_peer};
-use crate::commands::chat::{decode_dms, request_manifest_from_inner};
+use crate::commands::chat::{decode_dms, request_manifest_from_inner, request_manifest_inner};
 use crate::commands::fulfil::redeem_manifest_ticket_inner;
 use crate::identity_state::SharedIdentity;
 use crate::manifest_cache::CachedKey;
@@ -341,20 +341,43 @@ pub(crate) async fn poll_once(
 
             outcome.stale.push(stale.clone());
             for target in targets {
-                // The production ask body — never a second copy. It takes the shared 1/sec
+                // ⚠ THE SHAPE OF THE ASK MUST MATCH WHO IS BEING ASKED. `approval_body_for` routes
+                // purely on `author_npub` being present: Some ⇒ `send_cached_manifest_inner` (read
+                // the CACHE), None ⇒ `send_full_list_inner` (build from the collection). An author
+                // does not cache its own published manifest — the only production
+                // `manifest_cache::put` is the import path — so an author-bearing ask sent TO that
+                // author makes it look for a cached copy of its own collection and miss. Since the
+                // author rides in every wave (owner ruling 2026-09-04), getting this wrong fails
+                // the author leg of EVERY fetch, silently.
+                //
+                // Both are production bodies; neither is a second copy. Each takes the shared 1/sec
                 // throttle slot itself, so a wide wave leaves slowly rather than bursting.
-                match request_manifest_from_inner(
-                    &target,
-                    &stale.author_npub,
-                    &stale.slug,
-                    &stale.want_fingerprint,
-                    None,
-                    &identity,
-                    store,
-                    relay,
-                )
-                .await
-                {
+                let sent = if target == stale.author_npub {
+                    request_manifest_inner(
+                        &target,
+                        &stale.slug,
+                        &stale.want_fingerprint,
+                        None,
+                        None,
+                        &identity,
+                        store,
+                        relay,
+                    )
+                    .await
+                } else {
+                    request_manifest_from_inner(
+                        &target,
+                        &stale.author_npub,
+                        &stale.slug,
+                        &stale.want_fingerprint,
+                        None,
+                        &identity,
+                        store,
+                        relay,
+                    )
+                    .await
+                };
+                match sent {
                     Ok(()) => tracing::info!(
                         asked = %truncate(&target),
                         slug = %stale.slug,
@@ -387,6 +410,46 @@ mod tests {
 
     fn held(npub: &str, slug: &str, fp: &str) -> CachedKey {
         CachedKey { npub: npub.into(), slug: slug.into(), fingerprint: fp.into() }
+    }
+
+    /// The driver must ask the AUTHOR authorlessly and a CARRIER author-bearingly.
+    ///
+    /// `approval_body_for` routes on `author_npub` alone — Some to the cache re-serve, None to the
+    /// full-list build — and an author never caches its own publish. Send the author an
+    /// author-bearing ask and it looks for a cached copy of its own collection and misses, so the
+    /// author leg of every wave fails while the carrier legs still work: an intermittent,
+    /// source-dependent fetch failure rather than a loud one.
+    ///
+    /// MUTATION (P-10) — in `poll_once`, replace the `if target == stale.author_npub` discriminator
+    /// with `if false` → this test reds (every ask becomes author-bearing).
+    #[test]
+    fn the_ask_shape_matches_whether_the_target_is_the_author() {
+        let src = include_str!("fetch_driver.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code.find("pub(crate) async fn poll_once(").expect("poll_once must exist");
+        let end = code[at..].find("fn truncate(").expect("truncate must follow") + at;
+        let region = &code[at..end];
+        assert!(
+            region.contains("if target == stale.author_npub"),
+            "the driver must discriminate on whether the target IS the author"
+        );
+        // Call forms, not bare names — this test's own prose names both symbols (CLAUDE.md §9).
+        // `request_manifest_from_inner(` does not contain `request_manifest_inner(`, so these count
+        // the two bodies separately.
+        assert_eq!(
+            region.matches("request_manifest_inner(").count(),
+            1,
+            "the authorless ask must be sent, exactly once, for the author target"
+        );
+        assert_eq!(
+            region.matches("request_manifest_from_inner(").count(),
+            1,
+            "the author-bearing ask must be sent, exactly once, for a carrier target"
+        );
     }
 
     /// MUTATION (P-10) — in `asked_peers`, change `.split('|').next()` to `.split('|').last()`

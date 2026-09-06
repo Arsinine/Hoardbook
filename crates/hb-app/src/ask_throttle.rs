@@ -214,7 +214,10 @@ mod tests {
             2,
             "exactly the two ask commands may take the throttle — no other path in chat.rs"
         );
-        let rm = fn_region(&code, "pub async fn request_manifest(");
+        // Both ask bodies live in their `_inner` now (QURATOR-164 item 3 extracted them so the
+        // background fetch driver calls production instead of hand-rolling). The guard follows
+        // the behaviour, not the name.
+        let rm = fn_region(&code, "pub(crate) async fn request_manifest_inner(");
         assert_eq!(
             rm.matches("crate::ask_throttle::acquire").count(),
             1,
@@ -253,7 +256,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         for sig in [
-            "pub async fn request_manifest(",
+            "pub(crate) async fn request_manifest_inner(",
             "pub(crate) async fn request_manifest_from_inner(",
         ] {
             let region = fn_region(&code, sig);

@@ -981,12 +981,48 @@ pub async fn request_manifest(
     store: State<'_, DataStore>,
     relay: State<'_, SharedRelay>,
 ) -> CmdResult<()> {
-    let recipient = parse_recipient(&npub)?;
     let id_clone = {
         let guard = identity.read().await;
         let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
         id.identity.clone()
     };
+    request_manifest_inner(
+        &npub,
+        &slug,
+        &fingerprint_seen,
+        teaser_event_id,
+        mascara_pubkey,
+        &id_clone,
+        &store,
+        &relay,
+    )
+    .await
+}
+
+/// The body of [`request_manifest`], callable without Tauri `State`.
+///
+/// Extracted (QURATOR-164 item 3) for the same reason as
+/// [`request_manifest_from_inner`], and the background fetch driver needs BOTH: the shape of the
+/// ask has to match who is being asked.
+///
+/// ⚠ **An ask naming an author routes to the RE-SERVE body** — `approval_body_for` switches purely
+/// on `author_npub` being present, `Some` to `send_cached_manifest_inner` and `None` to
+/// `send_full_list_inner`. An author does NOT cache its own published manifest (the only production
+/// `manifest_cache::put` is the import path in `browse.rs`), so sending an author-bearing ask TO
+/// that author makes it look for a cached copy of its own collection and miss. The author leg of
+/// every wave would fail silently. So: authorless to the author, author-bearing to a carrier.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn request_manifest_inner(
+    npub: &str,
+    slug: &str,
+    fingerprint_seen: &str,
+    teaser_event_id: Option<String>,
+    mascara_pubkey: Option<String>,
+    id_clone: &hb_core::Identity,
+    store: &DataStore,
+    relay: &SharedRelay,
+) -> Result<(), String> {
+    let recipient = parse_recipient(npub)?;
     if is_self_send(&recipient, &id_clone.public_key()) {
         return Err("You can't request a manifest from yourself.".into());
     }
@@ -997,20 +1033,20 @@ pub async fn request_manifest(
     // third-party-author ask (peer D asking C for A's manifest) has no call site yet — the carrier-4
     // slice that drives it passes the author here via `build_manifest_request_for_author`.
     let content = build_manifest_request(
-        &slug,
-        &fingerprint_seen,
+        slug,
+        fingerprint_seen,
         teaser_event_id,
         mascara_pubkey,
         Some(ask_nonce.clone()),
     )?;
-    let own = net::relay_urls(&store);
-    let client = net::client(&id_clone, &store, &relay).await.map_err(cmd_err)?;
+    let own = net::relay_urls(store);
+    let client = net::client(id_clone, store, relay).await.map_err(cmd_err)?;
     // QURATOR-164 ask throttle — the ONE shared limiter (1/sec, module scope in `ask_throttle.rs`).
     // Sits after every pre-send failure path (parse/identity/self-send/build/client) so only an ask
     // that actually reaches the relay consumes a slot, and before `send_dm_inner` because the ruling
     // paces the outbound relay traffic. It delays, it never discards — chat/DM is not throttled.
     crate::ask_throttle::acquire().await;
-    send_dm_inner(&client, &id_clone, &recipient, &content, &own, net::RELAY_TIMEOUT)
+    send_dm_inner(&client, id_clone, &recipient, &content, &own, net::RELAY_TIMEOUT)
         .await
         .map_err(cmd_err)?;
     // M17 W7.1a — record the ask AFTER `send_dm_inner` resolves, so a failed publish never leaves a
@@ -1023,7 +1059,7 @@ pub async fn request_manifest(
     // owner-path ask — see `build_manifest_request`) is the asked peer itself.
     let sent_at = chrono::Utc::now().to_rfc3339();
     store
-        .record_manifest_ask(&npub, &npub, &slug, &fingerprint_seen, &sent_at, &ask_nonce)
+        .record_manifest_ask(npub, npub, slug, fingerprint_seen, &sent_at, &ask_nonce)
         .map_err(cmd_err)?;
     Ok(())
 }
@@ -1516,6 +1552,41 @@ mod tests {
     /// inside `request_manifest_from_inner`, change `&author_npub` to `""` in the builder call, or
     /// change `.record_manifest_ask(npub, &author_npub,` to `.record_manifest_ask(npub, npub,` → this
     /// test reds on the corresponding assert. Both mutations left the two tests above green.
+    /// `request_manifest` must stay a THIN SHIM over `request_manifest_inner`.
+    ///
+    /// Same reasoning as the `request_manifest_from` guard below: extracting the body moved every
+    /// throttle guard onto the inner, so nothing else would notice if the command stopped
+    /// delegating or grew a second send of its own.
+    ///
+    /// MUTATION (P-10) — in `request_manifest`, delete the call to the inner and return `Ok(())`
+    /// → this test reds on the delegation count.
+    #[test]
+    fn request_manifest_stays_a_thin_shim_over_its_inner() {
+        let src = include_str!("chat.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("pub async fn request_manifest(")
+            .expect("the owner-path ask command must exist");
+        let end = code[at..]
+            .find("pub(crate) async fn request_manifest_inner(")
+            .expect("the inner must follow the command")
+            + at;
+        let shim = &code[at..end];
+        assert_eq!(
+            shim.matches("request_manifest_inner(").count(),
+            1,
+            "the command must delegate to the inner exactly once"
+        );
+        assert!(
+            !shim.contains("send_dm_inner("),
+            "the command must not send its own DM — that is the inner's job"
+        );
+    }
+
     /// The command must stay a THIN SHIM over `request_manifest_from_inner`.
     ///
     /// Extracting that body (QURATOR-164 item 3, so the background fetch driver could originate
