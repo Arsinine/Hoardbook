@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use crate::fetch_driver::{poll_once, AskState};
 use crate::wan_it::suite_wan_carry::{
-    poll_dms, redeem_via_production, save_peer_contact, send_request_dm_to, verify_cached_under,
+    redeem_via_production, save_peer_contact, send_request_dm_to, verify_cached_under,
     CarryInput,
 };
 use crate::wan_it::tap::Tap;
@@ -57,6 +57,92 @@ const DRIVER_POLLS: usize = 8;
 /// Between polls. The production loop waits 5 minutes; the row does not, because the cadence is
 /// pinned by a unit test and re-proving it here would only cost wall clock.
 const POLL_SETTLE: Duration = Duration::from_secs(5);
+/// DM poll attempts and the wait between them, for [`poll_dms_newest`].
+///
+/// 20 x 3s = a full minute, deliberately more patient than carry's 6 attempts. The phases here are
+/// sequenced BY HAND across two terminals, and the window has to be wide enough for the operator to
+/// start the second role after the first is already polling. Too short a window is what makes the
+/// stale-ask race likely: A gives up, or settles on an OLD ask, before D's new one arrives.
+const DM_RETRIES: usize = 20;
+const DM_SETTLE: Duration = Duration::from_secs(3);
+const DM_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Poll for DMs from `expected_sender` and return the **NEWEST** match by `sent_at`, not the first.
+///
+/// ⚠ **This exists because RELAY STATE OUTLIVES A RUN, and carry's `poll_dms` returns the FIRST
+/// match it decodes.** A failed or repeated phase leaves earlier asks and tickets on the relay,
+/// addressed to the same npubs and still perfectly decodable. On 2026-09-06 that made role A answer
+/// a SUPERSEDED ask: the ticket it minted echoed a stale `ask_nonce`, and D's production claim gate
+/// refused it as `Unsolicited` — the gate working exactly as designed, reported as a harness
+/// failure. Re-running a phase must be idempotent, and taking the first match is not.
+async fn poll_dms_newest<T>(
+    input: &CarryInput,
+    expected_sender: &str,
+    mut inspect: impl FnMut(&crate::commands::chat::ReceivedMessage) -> Option<T>,
+    what: &str,
+) -> Result<T, String> {
+    use crate::commands::chat::decode_dms;
+    use hb_net::RelayClient;
+    use nostr::prelude::*;
+    use std::collections::HashSet;
+
+    let own_npub = input.app_id.npub();
+    let allow: HashSet<String> = [expected_sender.to_string()].into_iter().collect();
+    let mut wraps_seen = 0usize;
+    let mut decoded_seen = 0usize;
+
+    for attempt in 1..=DM_RETRIES {
+        if let Ok(client) =
+            RelayClient::connect(&input.app_id.identity, &input.relays, DM_TIMEOUT).await
+        {
+            let wraps = client
+                .fetch(
+                    Filter::new().kind(Kind::GiftWrap).pubkey(input.app_id.identity.public_key()),
+                    DM_TIMEOUT,
+                )
+                .await;
+            client.disconnect().await;
+            if let Ok(wraps) = wraps {
+                wraps_seen = wraps_seen.max(wraps.len());
+                let msgs = decode_dms(&own_npub, &input.app_id.identity, wraps, Some(&allow)).await;
+                decoded_seen = decoded_seen.max(msgs.len());
+                // Every match, then the newest by the rumor's own send time — NOT the first.
+                let mut hits: Vec<(String, T)> = msgs
+                    .iter()
+                    .filter_map(|m| inspect(m).map(|t| (m.sent_at.clone(), t)))
+                    .collect();
+                eprintln!(
+                    "   fetch DM poll (for {what}) attempt {attempt}: {} wrap(s), {} decoded, {} match(es)",
+                    wraps_seen,
+                    msgs.len(),
+                    hits.len()
+                );
+                if !hits.is_empty() {
+                    hits.sort_by(|a, b| a.0.cmp(&b.0));
+                    let (sent_at, found) = hits.pop().expect("non-empty");
+                    eprintln!("   fetch DM poll: taking the NEWEST match (sent_at={sent_at})");
+                    return Ok(found);
+                }
+            }
+        }
+        tokio::time::sleep(DM_SETTLE).await;
+    }
+
+    // Wraps arrived but none decoded from the expected sender: an npub mismatch, not a lost DM.
+    if wraps_seen > 0 && decoded_seen == 0 {
+        return Err(format!(
+            "never received {what} from {expected_sender}: {wraps_seen} gift-wrap(s) DID arrive but \
+             none decoded as being from that npub — the DM reached this node and was FILTERED OUT, \
+             not lost. Compare the npub the sending role printed at ITS startup against the one on \
+             this command line; an identity is minted per --data-dir, so a data-dir that was \
+             deleted or moved mints a NEW npub that silently stops matching."
+        ));
+    }
+    Err(format!(
+        "never received {what} from {expected_sender} after {DM_RETRIES} attempts \
+         ({wraps_seen} wrap(s) seen, {decoded_seen} decoded)"
+    ))
+}
 
 /// Dispatch on `--role`. The operator sequences the phases by hand:
 /// phase 1 — A up, D asks and caches; then A phase 2 republishes; then D phase 2 polls.
@@ -192,7 +278,7 @@ async fn publish_tree(
 /// Wait for one request-DM and answer it through the production approval body.
 async fn answer_one_ask(input: &CarryInput, asker_npub: &str, row: &str) -> Result<(), String> {
     eprintln!("   {row} waiting for the driver node's request-DM (polling)...");
-    let (slug, nonce) = poll_dms(
+    let (slug, nonce) = poll_dms_newest(
         input,
         asker_npub,
         |msg| {
@@ -200,7 +286,7 @@ async fn answer_one_ask(input: &CarryInput, asker_npub: &str, row: &str) -> Resu
             let body = crate::auto_approve::ManifestRequestBody::parse(&msg.content)?;
             Some((body.slug.clone(), body.ask_nonce.clone()))
         },
-        "manifest request from the driver node",
+        "manifest request from the driver node (newest)",
     )
     .await?;
     if slug != FETCH_SLUG {
@@ -256,7 +342,12 @@ async fn run_role_d_phase1(input: &CarryInput) -> Result<(), String> {
         .await?;
     eprintln!("   FD1 sent the ordinary ask (nonce={nonce})");
 
-    let ticket = poll_dms(
+    // ⚠ The ticket must echo THIS run's nonce. `ask_nonce` exists precisely to bind a ticket to ONE
+    // ask, and `claim_manifest_ask` refuses any other as `Unsolicited`. A stale ticket answering a
+    // SUPERSEDED ask is still on the relay and still decodes fine, so accepting the first valid one
+    // hands the production claim gate a ticket it is right to reject — which reads as a product
+    // failure and is not one (observed live, 2026-09-06).
+    let ticket = poll_dms_newest(
         input,
         &author_npub,
         |msg| {
@@ -266,9 +357,12 @@ async fn run_role_d_phase1(input: &CarryInput) -> Result<(), String> {
             }
             let t: hb_core::TransportTicket = serde_json::from_str(trimmed).ok()?;
             t.verify_shape().ok()?;
+            if t.ask_nonce.as_deref() != Some(nonce.as_str()) {
+                return None;
+            }
             Some(t)
         },
-        "ticket from the author",
+        "ticket answering THIS run's ask",
     )
     .await?;
     redeem_via_production(input, &ticket, None).await?;
