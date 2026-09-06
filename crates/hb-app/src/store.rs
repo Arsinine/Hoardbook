@@ -1089,6 +1089,32 @@ impl DataStore {
         self.base.join("manifest_asks.json")
     }
 
+    /// Where the auto-approve loop remembers which asks it has already answered (QURATOR-184).
+    pub fn answered_asks_path(&self) -> PathBuf {
+        self.base.join("answered_asks.json")
+    }
+
+    /// Load the answered-ask dedup set.
+    ///
+    /// Missing or unreadable ⇒ empty, never an error: this is a de-duplication memory, and losing
+    /// it costs redundant work, never correctness. A re-answered ask is refused by the asker's own
+    /// claim gate as `Spent` or nonce-mismatched.
+    pub fn load_answered_asks(&self) -> Result<std::collections::HashSet<String>> {
+        Ok(read_json_lenient::<std::collections::HashSet<String>>(&self.answered_asks_path())
+            .context("loading answered asks")?
+            .unwrap_or_default())
+    }
+
+    /// Persist the answered-ask dedup set.
+    ///
+    /// ⚠ The caller MUST keep this bounded. Every key carries an attacker-chosen nonce, so an
+    /// unbounded set is a durable disk-growth vector a peer can drive — which is exactly why the
+    /// in-memory set was capped and cleared rather than grown. Persisting it does not relax that;
+    /// see `auto_approve::remember_answered`.
+    pub fn save_answered_asks(&self, seen: &std::collections::HashSet<String>) -> Result<()> {
+        write_json(&self.answered_asks_path(), seen).context("saving answered asks")
+    }
+
     pub fn load_manifest_asks(&self) -> Result<std::collections::HashMap<String, ManifestAsk>> {
         let mut m = read_json_lenient::<std::collections::HashMap<String, ManifestAsk>>(
             &self.manifest_asks_path(),
@@ -2272,6 +2298,35 @@ pub(crate) mod tests {
     /// `{npub}|{author}|{slug}` — the migration is on load, not on a command the user must re-run.
     ///
     /// MUTATION (P-10) — resolved by containing function, not text: inside `load_manifest_asks`,
+    /// MUTATION (P-10) — in `save_answered_asks`, write an empty set instead of `seen`
+    /// (`write_json(&self.answered_asks_path(), &std::collections::HashSet::<String>::new())`) →
+    /// this test reds on the reload assert.
+    ///
+    /// This is the whole point of QURATOR-184: without persistence every app start re-fetched the
+    /// relay backlog and re-answered all of it, and strfry retains those asks so the replay grew
+    /// over a node's lifetime.
+    #[test]
+    fn the_answered_ask_memory_survives_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        assert!(
+            store.load_answered_asks().unwrap().is_empty(),
+            "a node that has never answered anything remembers nothing"
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        seen.insert("npubA|npubA|films|nonce-1".to_string());
+        store.save_answered_asks(&seen).unwrap();
+
+        // A fresh handle on the same directory — the restart this exists to survive.
+        let reopened = DataStore::new(dir.path().to_path_buf());
+        assert_eq!(
+            reopened.load_answered_asks().unwrap(),
+            seen,
+            "the memory must outlive the process, or the backlog is re-answered on every start"
+        );
+    }
+
     /// drop the `widen_legacy_ask_key` rewrite (delete the `if m.keys().any(...)` block) → the
     /// 2-segment key stays 2-segment, `claim_manifest_ask` finds nothing, and the first assert
     /// below reds with `Unsolicited`.

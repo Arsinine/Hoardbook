@@ -329,6 +329,29 @@ impl ApprovalBody {
 
 /// The one pure decision the serve branch consults: author-bearing ⇒ re-serve body, authorless ⇒
 /// own-collection body. Pinned by `author_bearing_asks_route_to_the_cached_manifest_body`.
+/// Ceiling on the answered-ask memory.
+///
+/// ⚠ **Bounded on purpose, and the bound survived being made durable.** Every key carries an
+/// attacker-chosen nonce, so a peer can mint unboundedly many distinct keys. Unbounded, the
+/// persisted set would be a disk-growth vector a stranger can drive. At this cap it is a few
+/// hundred KB, and overflow CLEARS rather than refuses — the worst a flood achieves is that
+/// already-answered asks get answered again, which is harmless for public bytes and is exactly the
+/// behaviour that existed before persistence.
+pub(crate) const SEEN_REQUESTS_MAX: usize = 4096;
+
+/// Remember that `key` has been answered. Returns **true when it was NEW**, i.e. the caller should
+/// answer it; false when it is a repeat to skip.
+///
+/// Clears at the cap rather than refusing, for the reason on [`SEEN_REQUESTS_MAX`]. Pure so the
+/// bound is testable without a loop, a relay or a clock.
+pub(crate) fn remember_answered(seen: &mut HashSet<String>, key: String, max: usize) -> bool {
+    let is_new = seen.insert(key);
+    if seen.len() > max {
+        seen.clear();
+    }
+    is_new
+}
+
 pub(crate) fn approval_body_for(body: &ManifestRequestBody) -> ApprovalBody {
     match body.author_npub.as_deref() {
         Some(author) => ApprovalBody::CachedManifest { author: author.to_string() },
@@ -371,8 +394,22 @@ pub(crate) async fn run_auto_approve_loop(
     // runs the full grant + caps gate again (a granted pair then hits its 60 s
     // cooldown; an ungranted one is refused outright). A cache that protects memory by denying
     // service would be the rate-limit-as-denial failure the caps forbid.
-    let mut seen_request_ids: HashSet<String> = HashSet::new();
-    const SEEN_REQUESTS_MAX: usize = 4096;
+    // QURATOR-184: LOADED from disk, not started empty. Before this, every app start re-fetched the
+    // whole relay backlog and re-answered all of it — strfry retains those request-DMs, so the set
+    // grows over a node's lifetime and each restart re-answered a bigger one. Owner ruling
+    // 2026-09-06: persist the bounded dedup set.
+    //
+    // A failed load is an empty set, never an error: this is a memory, and losing it costs
+    // redundant work rather than correctness.
+    let mut seen_request_ids: HashSet<String> = store.load_answered_asks().unwrap_or_default();
+    tracing::info!(
+        remembered = seen_request_ids.len(),
+        "auto-approve: loaded the answered-ask memory"
+    );
+    // Saved at most ONCE PER POLL, not per answered ask. The set is written whole, so a per-ask
+    // save would rewrite the entire file for each of them — during a backlog replay that is one
+    // full write per ask. Once per poll bounds it to one write per AUTO_APPROVE_POLL_INTERVAL.
+    let mut seen_dirty = false;
     // Requests the caps paced away from this instant. They are RETRIED, never dropped: with the
     // approval deleted there is no human card to fall through to, so a dropped request would be a
     // silent denial of public bytes. The inbox cursor only moves forward, so a paced request would
@@ -487,16 +524,10 @@ pub(crate) async fn run_auto_approve_loop(
                     body.slug,
                     body.ask_nonce.as_deref().unwrap_or("")
                 );
-                if !seen_request_ids.insert(dedup_key) {
+                if !remember_answered(&mut seen_request_ids, dedup_key, SEEN_REQUESTS_MAX) {
                     continue;
                 }
-            }
-            if seen_request_ids.len() > SEEN_REQUESTS_MAX {
-                seen_request_ids.clear();
-                tracing::debug!(
-                    "auto-approve: dedup set full ({SEEN_REQUESTS_MAX}) — cleared; a re-decided \
-                     request is simply served again, which is harmless for public bytes"
-                );
+                seen_dirty = true;
             }
 
             let now = now_secs();
@@ -593,6 +624,19 @@ pub(crate) async fn run_auto_approve_loop(
                 }
             }
         }
+        if seen_dirty {
+            // Best-effort: a failed write costs redundant work on the next start, never
+            // correctness. Logged rather than propagated so a read-only or full disk cannot stop
+            // the loop serving.
+            match store.save_answered_asks(&seen_request_ids) {
+                Ok(()) => seen_dirty = false,
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "auto-approve: could not persist the answered-ask memory; the backlog may be \
+                     re-answered after a restart"
+                ),
+            }
+        }
         tokio::time::sleep(AUTO_APPROVE_POLL_INTERVAL).await;
     }
 }
@@ -614,6 +658,41 @@ mod tests {
 
     fn npub_of(id: &Identity) -> String {
         id.public_key().to_bech32().unwrap()
+    }
+
+    /// MUTATION (P-10) — in `remember_answered`, change `let is_new = seen.insert(key);` to
+    /// `let is_new = { seen.insert(key); true };` → this test reds (every ask reads as new, so the
+    /// memory stops suppressing anything and the backlog is answered again on every poll).
+    #[test]
+    fn a_remembered_ask_is_not_answered_twice() {
+        let mut seen = HashSet::new();
+        assert!(remember_answered(&mut seen, "k".into(), SEEN_REQUESTS_MAX), "first time is new");
+        assert!(
+            !remember_answered(&mut seen, "k".into(), SEEN_REQUESTS_MAX),
+            "the second sighting must be suppressed — that is the whole point of persisting it"
+        );
+    }
+
+    /// The cap is what keeps a DURABLE memory from being a disk-growth vector: every key carries an
+    /// attacker-chosen nonce, so a peer can mint unboundedly many. It must CLEAR, never refuse —
+    /// refusing would turn a flood into a denial of public bytes.
+    ///
+    /// MUTATION (P-10) — in `remember_answered`, change `if seen.len() > max` to `if false` → this
+    /// test reds on the size assert (the set grows without bound, on disk).
+    #[test]
+    fn the_memory_clears_at_the_cap_rather_than_refusing() {
+        let mut seen = HashSet::new();
+        let max = 8;
+        for i in 0..=max {
+            assert!(
+                remember_answered(&mut seen, format!("k{i}"), max),
+                "a fresh key is always new — the cap must never REFUSE, only forget"
+            );
+        }
+        assert!(
+            seen.len() <= max,
+            "the set must stay bounded; unbounded, a peer with fresh nonces grows this file forever"
+        );
     }
 
 
