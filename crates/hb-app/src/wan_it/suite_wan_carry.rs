@@ -527,7 +527,7 @@ async fn run_role_c_phase1(input: &CarryInput) -> Result<(), String> {
 
     // The cache is the delivery — read it back through the production reader and prove it verifies
     // under A's key (this is the exact read `send_cached_manifest_inner` will do in phase 2).
-    verify_cached_under(input, &author_npub)?;
+    verify_cached_under(input, &author_npub, CARRY_SLUG)?;
     println!("# carry-C cache primed for author {author_npub} / slug {CARRY_SLUG}");
     Ok(())
 }
@@ -732,10 +732,10 @@ async fn run_role_d(input: &CarryInput) -> Result<(), String> {
 
     // (4) THE authenticity property: the copy now in D's cache verifies under A's x-only key and
     // refuses C's. This is owner ruling ② — the property lives in the signature, never a ledger.
-    verify_cached_under(input, &author_npub)?;
+    verify_cached_under(input, &author_npub, CARRY_SLUG)?;
     let carrier_pk = hb_core::identity::parse_npub(&carrier_npub)
         .map_err(|e| format!("parse carrier npub: {e}"))?;
-    let json = read_cached(input, &author_npub)?;
+    let json = read_cached(input, &author_npub, CARRY_SLUG)?;
     let envelope = hb_core::manifest::ManifestEnvelope::from_json(&json)
         .map_err(|e| format!("parse cached envelope: {e}"))?;
     if envelope.verify_author(&carrier_pk).is_ok() {
@@ -779,19 +779,23 @@ pub(super) fn save_peer_contact(input: &CarryInput, peer_npub: &str, share_code_
 }
 
 /// Read D's (or C's) own cached copy for `(npub, slug)` back through the production reader.
-pub(super) fn read_cached(input: &CarryInput, npub: &str) -> Result<String, String> {
+/// ⚠ The slug is a PARAMETER. It was `CARRY_SLUG` until 2026-09-06 — the same hardcoding that broke
+/// `send_request_dm_to`, in the same file, found two commits later because fixing the first one did
+/// not prompt a check of its neighbours. A sibling suite reusing this looked up the wrong key and
+/// reported "accept_manifest_bytes never wrote it" about a cache entry that was written correctly.
+pub(super) fn read_cached(input: &CarryInput, npub: &str, slug: &str) -> Result<String, String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    crate::manifest_cache::get_latest(&input.store.manifest_cache_dir(), npub, CARRY_SLUG, now)
-        .ok_or_else(|| format!("no cached copy for ({npub}, {CARRY_SLUG}) — accept_manifest_bytes never wrote it"))
+    crate::manifest_cache::get_latest(&input.store.manifest_cache_dir(), npub, slug, now)
+        .ok_or_else(|| format!("no cached copy for ({npub}, {slug}) — accept_manifest_bytes never wrote it"))
 }
 
 /// Assert the cached copy for `(npub, slug)` exists and verifies under that npub's x-only key —
 /// the exact read + verify `send_cached_manifest_inner` performs before re-serving.
-pub(super) fn verify_cached_under(input: &CarryInput, npub: &str) -> Result<(), String> {
-    let json = read_cached(input, npub)?;
+pub(super) fn verify_cached_under(input: &CarryInput, npub: &str, slug: &str) -> Result<(), String> {
+    let json = read_cached(input, npub, slug)?;
     let envelope = hb_core::manifest::ManifestEnvelope::from_json(&json)
         .map_err(|e| format!("parse cached envelope: {e}"))?;
     let pk = hb_core::identity::parse_npub(npub).map_err(|e| format!("parse npub: {e}"))?;

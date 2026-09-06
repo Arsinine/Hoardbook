@@ -423,7 +423,7 @@ async fn run_role_d_phase2(input: &CarryInput) -> Result<(), String> {
     eprintln!("   FD3 the cache moved {before} -> {after}, unattended");
 
     // The re-served envelope must still verify under A's key, not whoever handed it over.
-    verify_cached_under(input, &author_npub)?;
+    verify_cached_under(input, &author_npub, FETCH_SLUG)?;
     eprintln!("   FD3 the cached envelope verifies under the AUTHOR's key");
     Ok(())
 }
