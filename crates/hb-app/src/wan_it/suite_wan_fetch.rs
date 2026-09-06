@@ -313,8 +313,20 @@ async fn run_role_d_phase1(input: &CarryInput) -> Result<(), String> {
         None,
         Some(nonce.clone()),
     )?;
-    send_request_dm_to(input, &content, &author_npub, &author_npub, &author_npub, "", &nonce)
-        .await?;
+    // FETCH_SLUG, not carry's. The helper hardcoded a slug until 2026-09-06 and this is the call
+    // that exposed it: the ask was recorded under the wrong key and every redeem came back
+    // "That link doesn't answer a request you sent".
+    send_request_dm_to(
+        input,
+        &content,
+        &author_npub,
+        &author_npub,
+        &author_npub,
+        FETCH_SLUG,
+        "",
+        &nonce,
+    )
+    .await?;
     eprintln!("   FD1 sent the ordinary ask (nonce={nonce})");
 
     // ⚠ The ticket must echo THIS run's nonce. `ask_nonce` exists precisely to bind a ticket to ONE

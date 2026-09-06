@@ -148,12 +148,18 @@ pub(super) fn mint_ask_nonce() -> String {
 
 /// Send an already-built request-DM body to `recipient` via the production NIP-17 send path, and
 /// record the ask locally in production ordering (record AFTER the send resolves).
+// 8 args, all load-bearing: the three npubs are genuinely distinct roles (DM recipient, the
+// peer the ask is keyed under, and the AUTHOR whose collection it concerns — for a Carrier-4
+// ask those differ), and collapsing them into a struct would hide exactly the distinction the
+// key depends on.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_request_dm_to(
     input: &CarryInput,
     content: &str,
     recipient_npub: &str,
     asked_peer: &str,
     author_npub_for_key: &str,
+    slug: &str,
     fingerprint_seen: &str,
     ask_nonce: &str,
 ) -> Result<(), String> {
@@ -178,10 +184,18 @@ pub(super) async fn send_request_dm_to(
 
     // Production ordering: the ask trace exists only once the DM actually went out. The key is
     // (asked_peer, author, slug) — for a Carrier-4 ask the AUTHOR is A, not the DM sender C.
+    //
+    // ⚠ The slug is a PARAMETER, not `CARRY_SLUG`. It was hardcoded until 2026-09-06, which silently
+    // broke every sibling suite that reused this helper: the fetch suite recorded its ask under
+    // (A, A, "wan-carry") while its DM asked for "wan-fetch" and the returned ticket carried
+    // "wan-fetch", so `claim_manifest_ask` looked up a key that did not exist and returned
+    // `Unsolicited` — surfacing as "That link doesn't answer a request you sent" through three live
+    // runs. `claim_manifest_ask` fails on EITHER a key miss or a nonce mismatch and reports both
+    // identically, so the nonce is the tempting half to blame and the key is the one to check.
     let sent_at = chrono::Utc::now().to_rfc3339();
     input
         .store
-        .record_manifest_ask(asked_peer, author_npub_for_key, CARRY_SLUG, fingerprint_seen, &sent_at, ask_nonce)
+        .record_manifest_ask(asked_peer, author_npub_for_key, slug, fingerprint_seen, &sent_at, ask_nonce)
         .map_err(|e| format!("record_manifest_ask: {e}"))?;
     Ok(())
 }
@@ -200,6 +214,10 @@ pub(super) async fn poll_dms<T>(
 
     let own_npub = input.app_id.npub();
     let mut last_err = String::from("no poll attempt ran");
+    // Tracked so a failure can distinguish "nothing arrived" from "something arrived and was
+    // filtered out" — see the error at the bottom. Without it both read as "no DM yet".
+    let mut wraps_seen = 0usize;
+    let mut decoded_seen = 0usize;
     for attempt in 1..=DM_POLL_RETRIES {
         let client = match RelayClient::connect(&input.app_id.identity, &input.relays, RELAY_TIMEOUT).await {
             Ok(c) => c,
@@ -226,9 +244,11 @@ pub(super) async fn poll_dms<T>(
         };
         client.disconnect().await;
         eprintln!("   carry DM poll (for {what}) attempt {attempt}: {} gift-wrap(s)", wraps.len());
+        wraps_seen = wraps_seen.max(wraps.len());
 
         let allow: HashSet<String> = [expected_sender.to_string()].into_iter().collect();
         let msgs = decode_dms(&own_npub, &input.app_id.identity, wraps, Some(&allow)).await;
+        decoded_seen = decoded_seen.max(msgs.len());
         eprintln!("   carry DM poll (for {what}) attempt {attempt}: {} decoded DM(s) from sender", msgs.len());
         for msg in &msgs {
             if let Some(found) = inspect(msg) {
@@ -237,6 +257,21 @@ pub(super) async fn poll_dms<T>(
         }
         tokio::time::sleep(SETTLE).await;
         last_err = format!("attempt {attempt}: no {what} DM yet");
+    }
+    // ⚠ Gift-wraps arrived but NONE decoded as being from the expected sender. That is an npub
+    // MISMATCH in all but pathological cases — the peer is running under a different identity than
+    // the one configured here — and saying "no DM yet" instead sends the operator hunting a relay
+    // or sealing fault that is not there. Cost a live round trip on 2026-09-06 before the two
+    // counts already printed above were read side by side.
+    if wraps_seen > 0 && decoded_seen == 0 {
+        return Err(format!(
+            "never received {what} from {expected_sender}: {wraps_seen} gift-wrap(s) DID arrive, but \
+             none decoded as being from that npub — so the DM reached this node and was FILTERED \
+             OUT, not lost. Almost certainly an npub mismatch: compare the npub the sending role \
+             printed at ITS startup against the one on this command line. An identity is minted per \
+             --data-dir, so a data-dir that was deleted, moved or changed mints a NEW npub and the \
+             old one silently stops matching."
+        ));
     }
     Err(format!("never received {what} from {expected_sender}: {last_err}"))
 }
@@ -435,7 +470,7 @@ async fn run_role_c_phase1(input: &CarryInput) -> Result<(), String> {
         None,      // mascara_pubkey — vestigial, always None (wire_freeze)
         Some(nonce.clone()),
     )?;
-    send_request_dm_to(input, &content, &author_npub, &author_npub, &author_npub, "", &nonce)
+    send_request_dm_to(input, &content, &author_npub, &author_npub, &author_npub, CARRY_SLUG, "", &nonce)
         .await?;
     eprintln!("   CC1 sent the ordinary ask to the author (nonce={nonce})");
 
@@ -624,7 +659,7 @@ async fn run_role_d(input: &CarryInput) -> Result<(), String> {
     )?;
     // The ask is keyed on the AUTHOR (A), not the DM sender (C) — the same key resolution
     // `redeem_manifest_ticket_inner` performs via `ticket.author_npub`.
-    send_request_dm_to(input, &content, &carrier_npub, &carrier_npub, &author_npub, "", &nonce)
+    send_request_dm_to(input, &content, &carrier_npub, &carrier_npub, &author_npub, CARRY_SLUG, "", &nonce)
         .await?;
     eprintln!("   CD1 sent the author-ask to the cacher (nonce={nonce})");
 
