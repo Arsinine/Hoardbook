@@ -1373,6 +1373,19 @@ async fn run_probe_wan_fetch(args: &[String]) -> Result<ExitCode> {
 
     println!("# FETCH probe — role {role}");
     println!("# relay set: {}", relays.join(", "));
+    // Printed HERE — before any role dispatch or flag validation — because the bootstrap is
+    // circular: A needs D's npub for --asker-npub, and D needs A's npub for --author-npub, so
+    // whichever you start first MUST be able to tell you who it is while still failing its own
+    // flag checks. Printing this inside a role, after its `?` guards, makes the first run
+    // unrunnable in both directions.
+    // Upper-cased to match how the roles are named everywhere else (role A, role D) and in the
+    // suite's own module doc — a operator grepping for `# fetch-D npub:` must find it.
+    let role_label = role.to_uppercase();
+    println!("# fetch-{role_label} npub:  {}", app_id.npub());
+    match app_id.share_code() {
+        Ok(sc) => println!("# fetch-{role_label} share: {sc}"),
+        Err(e) => println!("# fetch-{role_label} share: <unavailable: {e}>"),
+    }
 
     let input = suite_wan_carry::CarryInput { app_id, store, relays, args: args.to_vec() };
 

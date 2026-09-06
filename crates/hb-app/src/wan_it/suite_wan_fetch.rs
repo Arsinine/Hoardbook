@@ -111,11 +111,8 @@ async fn run_role_a_phase1(input: &CarryInput) -> Result<(), String> {
 
     publish_tree(input, &seed_dir, 24, 0, "FA1").await?;
 
-    let own_npub = input.app_id.npub();
-    let share_code = input.app_id.share_code().map_err(|e| format!("share code: {e}"))?;
-    println!("# fetch-A npub:  {own_npub}");
-    println!("# fetch-A share: {share_code}");
-
+    // The npub + share code are printed by the probe entry before role dispatch, so they are
+    // available even on a run that fails its flag checks.
     answer_one_ask(input, &asker_npub, "FA1").await?;
     hold("FA1").await;
     Ok(())
@@ -242,8 +239,6 @@ async fn run_role_d_phase1(input: &CarryInput) -> Result<(), String> {
         .flag("--author-share-code")
         .ok_or_else(|| "role d phase 1 requires --author-share-code <hbk…>".to_string())?
         .to_string();
-
-    println!("# fetch-D npub:  {}", input.app_id.npub());
 
     // A must be a contact WITH the browse key: `accept_manifest_bytes` reads it to decrypt, and
     // `poll_once` reads it again in phase 2 to resolve A's listing.
