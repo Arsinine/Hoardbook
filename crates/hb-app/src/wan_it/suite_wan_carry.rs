@@ -282,13 +282,24 @@ pub(super) async fn poll_dms<T>(
 /// the same request_id, and `claim_manifest_ask` re-grants on the same id), so retries are safe.
 pub(super) async fn redeem_via_production(
     input: &CarryInput,
+    from_npub: &str,
     ticket: &TransportTicket,
     newest_fingerprint: Option<&str>,
 ) -> Result<ImportedManifest, String> {
     let live = input.live_identity();
     let store = input.store.clone();
     let endpoint = new_shared_endpoint();
-    let npub = input.app_id.npub();
+    // ⚠ The redeem body's first argument is the peer the ticket CAME FROM, never this node. It is
+    // the first segment of the claim key — `claim_manifest_ask(&npub, &expected_author, …)` — and
+    // the `expected_author` fallback (`ticket.author_npub.unwrap_or(npub)`, i.e. "an authorless
+    // ticket means the SENDER's own collection") is the proof.
+    //
+    // This passed `input.app_id.npub()` — OUR OWN — until 2026-09-06, so the claim looked up
+    // (us, author, slug) while the ask was recorded under (asked_peer, author, slug). Every redeem
+    // fell through as `Unsolicited` and reported "That link doesn't answer a request you sent". It
+    // survived because no suite using this helper has ever completed a live run: QURATOR-178 still
+    // owes carry's 4-host run, and the fetch suite hit it on its first.
+    let npub = from_npub.to_string();
     let ticket_json = serde_json::to_string(ticket)
         .map_err(|e| format!("serialize ticket: {e}"))?;
 
@@ -500,7 +511,8 @@ async fn run_role_c_phase1(input: &CarryInput) -> Result<(), String> {
     eprintln!("   CC1 received the author's ticket (request_id={})", ticket.request_id);
 
     // Redeem through the full production body — this is what writes A's envelope into C's cache.
-    let imported = redeem_via_production(input, &ticket, None).await?;
+    // The ticket came from A, so A is the claim key's peer segment.
+    let imported = redeem_via_production(input, &author_npub, &ticket, None).await?;
     if imported.served_by.is_some() {
         return Err(format!(
             "served_by={:?} on a direct serve — carrier-4 provenance must be None here",
@@ -691,9 +703,10 @@ async fn run_role_d(input: &CarryInput) -> Result<(), String> {
     }
     eprintln!("   CD1 received the cacher's ticket naming the author (request_id={})", ticket.request_id);
 
-    // Redeem through the full production body. The claim resolves the author from the ticket (A),
-    // matching the ask record above; `accept_manifest_bytes` pins to A and caches under A.
-    let imported = redeem_via_production(input, &ticket, None).await?;
+    // Redeem through the full production body. The ticket came from C, so C is the claim key's peer
+    // segment — matching the ask D recorded against C. The claim resolves the AUTHOR from the ticket
+    // (A) separately; `accept_manifest_bytes` pins to A and caches under A.
+    let imported = redeem_via_production(input, &carrier_npub, &ticket, None).await?;
 
     // (1) Carrier-4 provenance: the serving peer is C, not A.
     match imported.served_by.as_deref() {

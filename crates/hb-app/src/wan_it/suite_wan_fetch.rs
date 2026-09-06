@@ -352,7 +352,8 @@ async fn run_role_d_phase1(input: &CarryInput) -> Result<(), String> {
         "ticket answering THIS run's ask",
     )
     .await?;
-    redeem_via_production(input, &ticket, None).await?;
+    // The ticket came from A, so A is the claim key's peer segment — the ask was recorded against A.
+    redeem_via_production(input, &author_npub, &ticket, None).await?;
 
     let held = held_fingerprint(input, &author_npub)?;
     eprintln!("   FD1 cached '{FETCH_SLUG}' at fingerprint {held}");
