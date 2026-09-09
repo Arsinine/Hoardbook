@@ -11,12 +11,17 @@
 //!    nothing is skipped, it merely leaves slower.
 //! 2. **One shared limiter, hoisted to MODULE scope.** A per-function static is never shared across
 //!    callers (CLAUDE.md §7) and would silently give every call site its own budget. There is
-//!    exactly one `ASK_THROTTLE` cell below; both ask commands go through it.
-//! 3. **Chat/DM is NOT throttled** — 1/sec would make chat feel broken. Scope is manifest asks
+//!    exactly one `ASK_THROTTLE` cell below; every throttled path — the ask commands, the fetch
+//!    request, and the serve-side ticket DMs — goes through it.
+//! 3. **Chat is NOT throttled** — 1/sec would make chat feel broken. Scope is manifest asks
 //!    (`request_manifest` / `request_manifest_from` in `commands/chat.rs`) AND fetch requests
-//!    (`redeem_manifest_ticket_with_progress` in `commands/fulfil.rs`) — the ruling's own wording;
-//!    `send_message` and every other DM path never touch this module. Pinned by
-//!    `chat_and_dm_paths_are_not_throttled` and `the_fetch_request_path_takes_a_slot_before_dialing`.
+//!    (`redeem_manifest_ticket_with_progress` in `commands/fulfil.rs`) — the ruling's own wording —
+//!    AND, since QURATOR-184, the SERVE-side ticket DMs (`send_full_list_inner` /
+//!    `send_cached_manifest_inner` in `commands/fulfil.rs`): a node answering a replayed backlog
+//!    of asks was an unpaced relay burst. `send_message` and every other chat path never touch
+//!    this module. Pinned by `chat_and_dm_paths_are_not_throttled`,
+//!    `the_fetch_request_path_takes_a_slot_before_dialing`, and
+//!    `serve_side_ticket_dms_take_a_slot_before_the_relay_write`.
 //!    On the fetch side the slot paces the DIAL, not the transfer: `acquire()` releases its lock
 //!    before returning, so concurrent redemptions still overlap and only their initiations are
 //!    spaced. Serialising multi-second transfers behind a 1/sec gate would be different, and
@@ -279,6 +284,11 @@ mod tests {
     /// that the one production fetch initiation takes a slot, and takes it BEFORE dialing — a
     /// throttle applied after the fetch would pace nothing at all.
     ///
+    /// The whole-file count is fulfil.rs's scope fence: exactly THREE ruled slots — the fetch
+    /// initiation plus the two serve-side ticket DMs (QURATOR-184, pinned in detail by
+    /// `serve_side_ticket_dms_take_a_slot_before_the_relay_write`) — so an acquire smuggled into
+    /// any other path of this file reds the count, not just the ruled ones drifting.
+    ///
     /// MUTATION (P-10) — resolved by containing function, never bare text, since `fulfil.rs` has
     /// near-identical lines elsewhere: in `redeem_manifest_ticket_with_progress`, either delete
     /// the `crate::ask_throttle::acquire().await;` line (the count assert reds) or move it below
@@ -295,8 +305,9 @@ mod tests {
             .join("\n");
         assert_eq!(
             code.matches("crate::ask_throttle::acquire").count(),
-            1,
-            "exactly one fetch initiation in fulfil.rs may take the throttle"
+            3,
+            "exactly three ruled slots in fulfil.rs — the fetch initiation and the two serve-side \
+             ticket DMs — nothing else may take the throttle"
         );
         let region = fn_region(&code, "pub(crate) async fn redeem_manifest_ticket_with_progress(");
         let acquire = region
@@ -310,6 +321,71 @@ mod tests {
             "the throttle must precede the dial — it paces the INITIATION of a fetch, and a slot \
              taken afterwards would pace nothing"
         );
+    }
+
+    /// The SERVE half of the throttle's scope (QURATOR-184): a node answering many asks at once —
+    /// a startup backlog replay is the shape — must not DM tickets to the relay as fast as it can
+    /// mint them. Both serve bodies take exactly one slot each, and the slot sits BETWEEN the mint
+    /// and the DM:
+    ///   - BEFORE the DM, because the ruling paces the outbound relay write — a slot after it
+    ///     paces nothing.
+    ///   - AFTER the mint — the last local step before the send tail. A slot taken earlier is held
+    ///     across local work. The ticket RECORD this ordering originally guarded (persist before
+    ///     the DM; never hold the limiter across a filesystem write) was deleted with the ledger
+    ///     (QURATOR-177 Option E), so the mint is the standing local anchor: a record reintroduced
+    ///     on this path must land before the acquire, never between the acquire and the DM.
+    ///
+    /// Region resolution and comment-stripping exactly as in the sibling scope tests above — this
+    /// file's comments quote the strings it looks for.
+    ///
+    /// MUTATION (P-10) — resolved by containing function, never bare text, since the two serve
+    /// sites are near-identical: in `commands/fulfil.rs`,
+    /// 1. delete the `crate::ask_throttle::acquire().await;` inside `send_full_list_inner` (or
+    ///    `send_cached_manifest_inner`) → that region's count assert reds (0 ≠ 1), and the
+    ///    whole-file fence in `the_fetch_request_path_takes_a_slot_before_dialing` reds (2 ≠ 3);
+    /// 2. move that acquire to AFTER the `send_dm_inner(…)` call's `.map_err(cmd_err)?;` → that
+    ///    region's `acquire < send` assert reds;
+    /// 3. move it to BEFORE the `issue_ticket(&ep, …)` call → that region's `mint < acquire`
+    ///    assert reds.
+    #[test]
+    fn serve_side_ticket_dms_take_a_slot_before_the_relay_write() {
+        let src = include_str!("commands/fulfil.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for sig in [
+            "pub(crate) async fn send_full_list_inner(",
+            "pub(crate) async fn send_cached_manifest_inner(",
+        ] {
+            let region = fn_region(&code, sig);
+            assert_eq!(
+                region.matches("crate::ask_throttle::acquire").count(),
+                1,
+                "{sig}: the serve path must go through the shared limiter exactly once"
+            );
+            let acquire = region
+                .find("crate::ask_throttle::acquire")
+                .unwrap_or_else(|| panic!("{sig} must take the shared ask throttle"));
+            let send = region
+                .find("send_dm_inner(")
+                .unwrap_or_else(|| panic!("{sig} must send its ticket via send_dm_inner"));
+            assert!(
+                acquire < send,
+                "{sig}: the throttle acquire must precede the ticket DM — it paces the outbound \
+                 relay write"
+            );
+            let mint = region
+                .find("issue_ticket(")
+                .unwrap_or_else(|| panic!("{sig} must mint its ticket through issue_ticket"));
+            assert!(
+                mint < acquire,
+                "{sig}: the throttle acquire must come after the mint — a slot taken earlier is \
+                 held across local work, and any record reintroduced on this path must persist \
+                 before the slot, never between the slot and the DM"
+            );
+        }
     }
 
     /// Slice `code` from the (first, i.e. production) occurrence of `sig` to the next line-start

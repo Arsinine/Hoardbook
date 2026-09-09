@@ -29,8 +29,10 @@
 //! until Option E deleted it (QURATOR-177); the standing-grant map answered "did I ever approve
 //! serving?" until QURATOR-164 deleted approvals entirely. **Public collections need no approval,
 //! so there is no promise to look up** — only content to serve. It over-binds rather than
-//! under-binds, which is the safe direction: an unnecessary listener costs a relay connection, a
-//! missing one makes this node silently unreachable to a peer holding a valid ticket.
+//! under-binds, which is the safe direction: an unnecessary listener costs a relay connection,
+//! a missing one costs a peer holding an old ticket one failed dial plus a re-ask round trip
+//! before the lazy bind on the serve path recovers it (QURATOR-185 traced this; the miss is
+//! delay, never silence).
 
 use std::sync::Arc;
 
@@ -376,10 +378,21 @@ pub async fn rebind_if_tickets_outstanding(
 
 /// Does this node hold anything a peer could legitimately dial it for?
 ///
-/// Two sources, matching the two serve bodies: **cached manifests** this node browsed (which
-/// `send_cached_manifest_inner` re-serves — the Carrier-4 baseline every node participates in) and
-/// **its own published collections** (which `send_full_list_inner` builds). Either one means a
-/// dial is possible, so the listener is bound.
+/// **One source: the manifest cache directory, nothing else.** Own published collections are
+/// deliberately NOT a startup signal — QURATOR-185 traced the serve path and narrowed an earlier
+/// two-source claim here. Why they need none: a peer can only dial this node against a ticket;
+/// tickets are minted only inside the two serve bodies; and the manifest-ordering invariant
+/// (seal → bind → mint → record → DM) puts the `Role::Listen` bind BEFORE the mint in both — no
+/// ticket has ever existed without a listener bound in the same call. Those bodies run only from
+/// the auto-approve loop, in response to an ask DM, and ask DMs arrive over relays — a channel
+/// that needs no listener — so a published-but-never-browsed node still binds on the first ask of
+/// any session and is never stranded by skipping this bind. What the startup rebind buys is
+/// immediacy for tickets minted in a PREVIOUS session and not yet redeemed ("valid until
+/// redeemed"): a peer holding one eats a single failed dial, after which its ask retry
+/// self-heals ("redeem failed; the ask stays retryable" — the fetch driver re-asks next poll,
+/// which lazily binds and mints fresh). The cache directory is the cheap durable proxy for that
+/// case — evidence this node relays others' bytes (the Carrier-4 baseline every node participates
+/// in), which is also what `send_cached_manifest_inner` re-serves.
 ///
 /// ⚠ This is deliberately a CHEAP, IMPRECISE check — a non-empty cache directory, not a parse of
 /// its contents. Binding a listener nothing dials costs an idle endpoint; NOT binding one that
@@ -462,6 +475,77 @@ mod tests {
             outcome.is_err(),
             "a never-returning bind wrapped in tokio::time::timeout MUST surface a timeout error, \
              not hang"
+        );
+    }
+
+    /// QURATOR-185 — the startup bind signal is the manifest CACHE DIRECTORY ONLY. Own published
+    /// collections are deliberately NOT a signal, and this pins that direction: the serve path
+    /// cannot strand a published-but-never-browsed node, because a peer can only dial against a
+    /// ticket, tickets are minted only inside the two serve bodies, and both bind `Role::Listen`
+    /// BEFORE minting (the seal → bind → mint → record → DM ordering invariant), in response to an
+    /// ask DM that arrives over relays and needs no listener. A peer holding a ticket from a
+    /// previous session eats one failed dial, then its ask retry self-heals ("redeem failed; the
+    /// ask stays retryable"). So a startup bind keyed on own collections would buy nothing the
+    /// lazy bind does not already cover — see `has_servable_content`'s doc for the full chain.
+    ///
+    /// MUTATION (P-10) — the exact production edit that must red this test: in this file's
+    /// `has_servable_content` body, widen
+    /// `crate::manifest_cache::has_any(&store.manifest_cache_dir())`
+    /// to
+    /// `crate::manifest_cache::has_any(&store.manifest_cache_dir()) ||
+    ///  store.list_published_slugs().map(|s| !s.is_empty()).unwrap_or(false)`.
+    /// The FIRST assertion below reds (the store holds a published collection and an empty cache,
+    /// so the widened check says true where the reconciled behaviour says false). Reverting the
+    /// widen must restore green — and if it is ever re-widened for real, the doc above must be
+    /// re-reconciled in the same commit, not left claiming one source.
+    #[test]
+    fn own_published_collections_alone_do_not_bind_the_startup_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::DataStore::new(dir.path().to_path_buf());
+        // The store state a widened check would consult: one OWN PUBLISHED collection (draft +
+        // published marker — exactly what `list_published_slugs` reads). All writes route through
+        // the owning modules: this file is inside INV-4′'s swept surface and names no filesystem
+        // symbols, in tests no less than in production code.
+        let col = hb_core::types::Collection {
+            slug: "vault".into(),
+            path_alias: "vault".into(),
+            description: None,
+            item_count: 0,
+            est_size: None,
+            content_types: vec![],
+            tags: vec![],
+            languages: vec![],
+            visibility: hb_core::types::Visibility::Public,
+            sorted: false,
+            last_updated: chrono::Utc::now(),
+            listing: vec![],
+        };
+        store.save_collection_draft(&col).unwrap();
+        store.save_published("vault", "{}").unwrap();
+        assert!(
+            !store.list_published_slugs().unwrap().is_empty(),
+            "setup sanity: the store DOES hold an own published collection"
+        );
+        assert!(
+            !has_servable_content(&store),
+            "own published collections with an EMPTY manifest cache must NOT trigger the startup \
+             bind — the serve bodies bind lazily on the ask, so the signal is cache-only"
+        );
+        // The positive side: one cached manifest (written through the module that owns the cache)
+        // IS the signal.
+        crate::manifest_cache::put(
+            &store.manifest_cache_dir(),
+            "npub-some-author",
+            "their-slug",
+            "fp-1",
+            "sealed-fixture",
+            1_700_000_000,
+            crate::manifest_cache::DEFAULT_MANIFEST_CACHE_BYTES,
+        )
+        .unwrap();
+        assert!(
+            has_servable_content(&store),
+            "a non-empty manifest cache IS the startup signal"
         );
     }
 

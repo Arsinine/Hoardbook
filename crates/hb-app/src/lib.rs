@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 // QURATOR-164 build item 2 — the ask throttle (one shared module-scope limiter, 1/sec, delays
-// never discards). Scope: manifest asks only; chat/DM never touches it.
+// never discards). Scope: manifest asks, fetch requests, and the serve-side ticket DMs
+// (QURATOR-184); chat never touches it.
 mod ask_throttle;
 mod auto_approve;
 mod backup;

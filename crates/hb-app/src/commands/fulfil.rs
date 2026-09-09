@@ -198,6 +198,13 @@ pub(crate) async fn send_full_list_inner(
     let body = serde_json::to_string(&ticket).map_err(cmd_err)?;
     let own = crate::net::relay_urls(store);
     let client = crate::net::client(&id_clone, store, relay).await.map_err(cmd_err)?;
+    // QURATOR-184 — the SERVE half of the throttle's scope: a node answering many asks at once (a
+    // startup backlog replay is the shape) would otherwise DM tickets to the relay as fast as it
+    // can mint them — an unpaced relay burst. Same ONE shared limiter, same placement as the ask
+    // sites in `chat.rs` and the fetch site below: after every pre-send failure path (the ticket
+    // record that used to persist here is gone — QURATOR-177 Option E — so no filesystem write is
+    // straddled), immediately before the relay write it paces. It delays, it never discards.
+    crate::ask_throttle::acquire().await;
     crate::commands::chat::send_dm_inner(
         &client,
         &id_clone,
@@ -339,6 +346,13 @@ pub(crate) async fn send_cached_manifest_inner(
     let body = serde_json::to_string(&ticket).map_err(cmd_err)?;
     let own = crate::net::relay_urls(store);
     let client = crate::net::client(&id_clone, store, relay).await.map_err(cmd_err)?;
+    // QURATOR-184 — the SERVE half of the throttle's scope: a node answering many asks at once (a
+    // startup backlog replay is the shape) would otherwise DM tickets to the relay as fast as it
+    // can mint them — an unpaced relay burst. Same ONE shared limiter, same placement as the ask
+    // sites in `chat.rs` and the fetch site below: after every pre-send failure path (the ticket
+    // record that used to persist here is gone — QURATOR-177 Option E — so no filesystem write is
+    // straddled), immediately before the relay write it paces. It delays, it never discards.
+    crate::ask_throttle::acquire().await;
     crate::commands::chat::send_dm_inner(
         &client,
         &id_clone,
