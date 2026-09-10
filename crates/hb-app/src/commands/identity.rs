@@ -391,8 +391,9 @@ mod tests {
         use super::nsec_of;
         use crate::error::CmdResult;
         use crate::identity_state::{AppIdentity, SharedIdentity};
-        use crate::store::DataStore;
+        use crate::store::{CachedPeer, ContactSource, DataStore};
         use crate::transport_state::{new_shared_endpoint, SharedEndpoint};
+        use hb_core::{Collection, DirectoryItem, ItemType, Visibility};
         use std::sync::Arc;
         use tauri::Manager;
 
@@ -805,6 +806,259 @@ mod tests {
             assert!(
                 target.state::<SharedIdentity>().read().await.is_some(),
                 "restore loads the identity into the shared state"
+            );
+        }
+
+        // -- QURATOR-186: backup_data → restore_data round-trip + the non-empty-target refusal ----
+
+        const BACKUP_PASSPHRASE: &str = "a-strong-command-roundtrip-passphrase";
+
+        /// A command-shaped fixture in `backup.rs`'s `store_with_fake_profile` image: a MockRuntime
+        /// app whose managed `DataStore` holds a real profile — identity, one contact, one
+        /// collection draft WITH a listing — all seeded through the store's own API (not raw
+        /// `fs::write`), so a restore can be verified via the store's normal accessors rather than
+        /// by re-parsing the archive (the `*_inner` unit tests' job).
+        fn seeded_app() -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            store.save_identity(&AppIdentity::generate().to_stored().unwrap()).unwrap();
+
+            // One contact, written the way production writes contacts (hash-named file under
+            // contacts/), with a petname so "same contact came back" is a named-field assertion.
+            let contact_npub = AppIdentity::generate().npub();
+            store
+                .save_contact(
+                    &CachedPeer::pubkey_hash(&contact_npub),
+                    &CachedPeer {
+                        npub: contact_npub,
+                        source: ContactSource::Manual,
+                        browse_key_hex: None,
+                        petname: Some("seed contact".to_string()),
+                        profile: None,
+                        collections: vec![],
+                        listings_state: Default::default(),
+                        online: false,
+                        last_fetched: chrono::Utc::now(),
+                        last_presence: None,
+                        local_tags: vec![],
+                        fingerprint: None,
+                    },
+                )
+                .unwrap();
+
+            // One collection draft with a two-item listing — enough structure (per-item type,
+            // size, year, a nested child) that "restored == original" pins the payload, not just
+            // tar integrity.
+            store
+                .save_collection_draft(&Collection {
+                    slug: "films".to_string(),
+                    path_alias: "Films".to_string(),
+                    description: Some("seeded for the command round-trip".to_string()),
+                    item_count: 2,
+                    est_size: Some("~2 items".to_string()),
+                    content_types: vec!["movies".to_string()],
+                    tags: vec![],
+                    languages: vec![],
+                    visibility: Visibility::Public,
+                    sorted: true,
+                    last_updated: chrono::Utc::now(),
+                    listing: vec![
+                        DirectoryItem {
+                            name: "A Folder".to_string(),
+                            item_type: ItemType::Folder,
+                            size: None,
+                            format: None,
+                            year: None,
+                            tags: vec![],
+                            note: None,
+                            children: vec![DirectoryItem {
+                                name: "nested.txt".to_string(),
+                                item_type: ItemType::File,
+                                size: Some("12 B".to_string()),
+                                format: None,
+                                year: None,
+                                tags: vec![],
+                                note: None,
+                                children: vec![],
+                            }],
+                        },
+                        DirectoryItem {
+                            name: "b.mkv".to_string(),
+                            item_type: ItemType::File,
+                            size: Some("1.4G".to_string()),
+                            format: Some("Matroska".to_string()),
+                            year: Some(2019),
+                            tags: vec![],
+                            note: None,
+                            children: vec![],
+                        },
+                    ],
+                })
+                .unwrap();
+
+            let identity: SharedIdentity = Arc::new(tokio::sync::RwLock::new(None));
+            app.manage(identity);
+            app.manage(store);
+            app.manage(new_shared_endpoint());
+            app
+        }
+
+        /// The REAL `backup_data` command exports a seeded profile under a passphrase, and the REAL
+        /// `restore_data` command — into a FRESH app on an empty directory — brings the identity,
+        /// contact, and collection-with-listing back. Assertions read through the store's normal
+        /// accessors, proving the command LAYER (arg wiring, `cmd_err` mapping, `State` plumbing)
+        /// works end to end on top of the already-unit-tested `*_inner` halves.
+        ///
+        /// P-10 (named, NOT applied): in `restore_data` (this file, the `restore_inner` call at the
+        /// top of the fn), change the third argument from `pass.as_ref().map(|p| p.as_str())` to
+        /// `None` — the passphrase-sealed archive then hits the passphrase-less path, restore
+        /// errors, and this test reds at the `.expect` on "a passphrase-seeded profile restores".
+        #[tokio::test]
+        async fn backup_data_then_restore_data_roundtrips_a_seeded_profile() {
+            let source = seeded_app();
+            let expected_npub = AppIdentity::from_stored(
+                &source.state::<DataStore>().load_identity().unwrap().unwrap(),
+            )
+            .unwrap()
+            .npub();
+            let expected_contacts = source.state::<DataStore>().list_contacts().unwrap();
+            assert_eq!(expected_contacts.len(), 1, "fixture sanity: exactly one seeded contact");
+            let expected_collection = source
+                .state::<DataStore>()
+                .load_collection_draft("films")
+                .unwrap()
+                .expect("fixture sanity: the seeded collection draft exists");
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("seeded-export.hb");
+            backup_data(
+                Some(BACKUP_PASSPHRASE.into()),
+                path.to_str().unwrap().to_string(),
+                source.state::<DataStore>(),
+            )
+            .await
+            .expect("a seeded profile exports under a passphrase");
+
+            // A FRESH app on a fresh empty directory — the target shares nothing with the source.
+            let target = guard_app(false);
+            let info = restore_data(
+                Some(BACKUP_PASSPHRASE.into()),
+                path.to_str().unwrap().to_string(),
+                target.state::<DataStore>(),
+                target.state::<SharedIdentity>(),
+            )
+            .await
+            .expect("a passphrase-seeded profile restores through the command");
+
+            assert_eq!(info.npub, expected_npub, "the restored identity is the seeded one");
+            assert!(
+                target.state::<SharedIdentity>().read().await.is_some(),
+                "restore loads the identity into the shared state"
+            );
+
+            let contacts = target.state::<DataStore>().list_contacts().unwrap();
+            assert_eq!(contacts.len(), 1, "the seeded contact came back");
+            assert_eq!(contacts[0].npub, expected_contacts[0].npub, "same npub");
+            assert_eq!(contacts[0].petname, expected_contacts[0].petname, "same petname");
+            assert_eq!(
+                contacts[0].fingerprint, expected_contacts[0].fingerprint,
+                "the store-derived fingerprint matches — same npub, same print"
+            );
+
+            let collection = target
+                .state::<DataStore>()
+                .load_collection_draft("films")
+                .unwrap()
+                .expect("the seeded collection draft came back");
+            assert_eq!(collection.slug, expected_collection.slug);
+            assert_eq!(collection.path_alias, expected_collection.path_alias);
+            assert_eq!(collection.description, expected_collection.description);
+            assert_eq!(collection.item_count, expected_collection.item_count);
+            assert_eq!(collection.sorted, expected_collection.sorted);
+            assert_eq!(
+                collection.listing.len(),
+                expected_collection.listing.len(),
+                "the LISTING round-trips item-for-item through the two commands"
+            );
+            let (got_top, want_top) = (&collection.listing[0], &expected_collection.listing[0]);
+            assert_eq!(got_top.name, want_top.name);
+            assert_eq!(got_top.item_type, want_top.item_type);
+            assert_eq!(
+                got_top.children.len(),
+                want_top.children.len(),
+                "the nested child item survives the round-trip"
+            );
+            assert_eq!(got_top.children[0].name, want_top.children[0].name);
+            let (got_file, want_file) = (&collection.listing[1], &expected_collection.listing[1]);
+            assert_eq!(got_file.name, want_file.name);
+            assert_eq!(got_file.size, want_file.size);
+            assert_eq!(got_file.year, want_file.year);
+        }
+
+        /// The refusal side through the command: `restore_data` against a NON-EMPTY target is
+        /// refused with `BackupError::TargetNotEmpty`'s message VERBATIM — pinned here at the
+        /// command layer because `restore_inner`'s own unit tests only prove `restore_inner`
+        /// returns it, not that the command surfaces it through `cmd_err` instead of swallowing
+        /// it. The incumbent profile must survive the refused attempt untouched.
+        ///
+        /// P-10 (named, NOT applied): in `restore_data` (this file), replace the
+        /// `crate::backup::restore_inner(store.inner(), &archive,
+        /// pass.as_ref().map(|p| p.as_str())).map_err(cmd_err)?;` statement with the same call
+        /// prefixed `let _ =` and without `.map_err(cmd_err)?` — the refusal is then swallowed,
+        /// the command falls through to returning the incumbent identity as `Ok`, and this test
+        /// reds at `unwrap_err` (and again at the shared-identity `is_none` assert).
+        #[tokio::test]
+        async fn restore_data_command_refuses_a_non_empty_target() {
+            let source = seeded_app();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("seeded-export.hb");
+            backup_data(
+                Some(BACKUP_PASSPHRASE.into()),
+                path.to_str().unwrap().to_string(),
+                source.state::<DataStore>(),
+            )
+            .await
+            .expect("export for the fixture");
+
+            // The target already holds a live profile (identity + contact + collection): occupied.
+            let target = seeded_app();
+            let incumbent = std::fs::read(target.state::<DataStore>().identity_path()).unwrap();
+
+            let err = restore_data(
+                Some(BACKUP_PASSPHRASE.into()),
+                path.to_str().unwrap().to_string(),
+                target.state::<DataStore>(),
+                target.state::<SharedIdentity>(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                err,
+                "the target profile already contains data — wipe it before restoring a backup",
+                "the TargetNotEmpty refusal arrives verbatim through the command's cmd_err mapping"
+            );
+
+            assert_eq!(
+                std::fs::read(target.state::<DataStore>().identity_path()).unwrap(),
+                incumbent,
+                "a refused restore leaves the incumbent identity untouched"
+            );
+            assert_eq!(
+                target.state::<DataStore>().list_contacts().unwrap().len(),
+                1,
+                "and the incumbent contact survives the refused restore"
+            );
+            assert!(
+                target.state::<DataStore>()
+                    .load_collection_draft("films")
+                    .unwrap()
+                    .is_some(),
+                "and the incumbent collection survives the refused restore"
+            );
+            assert!(
+                target.state::<SharedIdentity>().read().await.is_none(),
+                "a refused restore must not load anything into the shared identity"
             );
         }
 
