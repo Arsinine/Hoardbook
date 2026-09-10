@@ -454,6 +454,13 @@ export const requestManifestFrom = (
 		teaserEventId: teaserEventId ?? null,
 	});
 
+/** QURATOR-137 slice 2 — DM `npub` a structured access request (`{"hb":"access_request",…}`): the
+ *  machine-recognisable form of the "Ask for access" affordance's prefilled prose. One relay write;
+ *  the nonce is minted and the asker npub derived server-side, never supplied here. The answer is
+ *  still human ("Share my code") — no auto-grant exists yet. */
+export const sendAccessRequest = (npub: string) =>
+	invoke<void>('send_access_request', { npub });
+
 /** M17 W7.1a — the persisted ask-trace map (npub|slug → {fingerprint_seen, sent_at}), so the Browse
  *  paywall can read back the asked-state across restarts. Pure local read, no relay I/O. The ask is
  *  recorded INSIDE `request_manifest` after `send_dm_inner` resolves — a failed publish leaves no trace. */

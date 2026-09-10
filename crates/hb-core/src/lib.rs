@@ -10,6 +10,7 @@ pub mod types;
 //     npub→iroh-node binding + xfer gate were removed in v0.9.6 and did NOT return with M18's
 //     manifest plane — that plane needs no public node map, because an address rides a sealed
 //     ticket. Hoardbook moves no *collection files* (INV-4′).) ---
+pub mod access_request;
 pub mod backup;
 pub mod binding;
 pub mod count;

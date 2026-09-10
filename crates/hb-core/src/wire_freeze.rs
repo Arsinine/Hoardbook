@@ -4,6 +4,7 @@
 //! INV-8 audit (INVARIANT_AUDIT.md I-3) — never an edit. A NEW durable event kind must be added
 //! here and must answer INV-8 (is this data safe to keep forever?) in the spec first.
 
+use crate::access_request;
 use crate::backup::BACKUP_FORMAT_VER;
 use crate::binding;
 use crate::event;
@@ -115,6 +116,26 @@ fn ticket_version_and_tag_are_frozen() {
     let without = ticket::TransportTicket::issue("r", "s", "addr", 1, None);
     let json = serde_json::to_string(&without).expect("a ticket serializes");
     assert!(!json.contains("ask_nonce"), "an absent ask nonce is omitted, not null — {FREEZE}");
+}
+
+/// The access request's version + DM discriminator (QURATOR-137 slice 2) — a NEW pin, which per
+/// the rule above is the only edit this file permits: no existing field's meaning moved. Same
+/// reasoning as the ticket pin: a request rides a NIP-17 DM that a relay stores like any wrap, so
+/// one already sitting in an issuer's inbox must stay recognisable, and the discriminator is how
+/// that inbox tells an access request from a `manifest_request` or a `transport_ticket`.
+#[test]
+fn access_request_version_and_tag_are_frozen() {
+    assert_eq!(access_request::ACCESS_REQUEST_V, 1, "access_request::ACCESS_REQUEST_V — {FREEZE}");
+    assert_eq!(
+        access_request::ACCESS_REQUEST_TAG, "access_request",
+        "access_request::ACCESS_REQUEST_TAG — {FREEZE}"
+    );
+
+    // Field name pinned by serialized shape, the ticket-pin style: the name is the contract, and a
+    // rename would silently stop every gate matching while every test kept passing.
+    let req = access_request::AccessRequest::new("npub1a", "n0nce", 1);
+    let json = serde_json::to_string(&req).expect("an access request serializes");
+    assert!(json.contains("\"asker_npub\":\"npub1a\""), "access request asker_npub field name — {FREEZE}");
 }
 
 /// The manifest envelope's `author_sig` pre-image domain tag (M16 W1). It is hashed into every

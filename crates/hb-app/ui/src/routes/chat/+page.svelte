@@ -8,6 +8,7 @@
 	import {
 		getMessages,
 		sendMessage,
+		sendAccessRequest,
 		pasteKey,
 		follow,
 		validateShareCode,
@@ -49,7 +50,7 @@
 	import { renderFingerprint } from '$lib/identity-display.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
 	import { importToast } from '$lib/manifest-provenance.js';
-	import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER, manifestRequestHint, parseManifestRequest } from '$lib/request-inbox.js';
+	import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER, manifestRequestHint, parseManifestRequest, accessRequestHint } from '$lib/request-inbox.js';
 	// M17 W7.1b: the manifest-request fulfilment card. The capability (`export_manifest`) is fully
 	// wired on Home; this is its second entry point — surfaced where the request lands. The card's
 	// state is derived PURELY (zero network on render); the export Tauri call fires only on click.
@@ -98,6 +99,12 @@
 	// M17 W4 review: in-flight guard for the share-code fetch, and the binding of an inserted grant
 	// to the conversation it was raised in (the draft itself is global — see selectPeer).
 	let sharingCode = $state(false);
+	// QURATOR-137 slice 2: which conversation the ask-access intent was raised for. The M17 W2 rule
+	// ("no auto-send" — a human always presses Send) is preserved: the intent still only prefills
+	// prose; this flag merely shows the structured-send affordance beside Send while that intent is
+	// live for THIS peer, so the ask can leave as a machine-recognisable access request instead of
+	// prose. Cleared by either send (prose or structured) and never shown for another conversation.
+	let askAccessFor = $state('');
 	// M17 W5.3: relay reachability, read from the same store the Contacts topbar uses. Drives ONE
 	// muted line — the DM poll swallows its own errors, so this is the only place the user can learn
 	// that a quiet inbox is actually an unreachable one.
@@ -808,12 +815,33 @@
 		try {
 			const sent = await sendMessage(selectedPeer.npub, content);
 			sharedCodeInDraft = null; // the grant left the composer
+			askAccessFor = ''; // the human chose prose — the structured affordance retires with it
 			sentMessages.update((prev) => [...prev, sent]);
 			await tick();
 			scrollToBottom();
 		} catch (e) {
 			toast(String(e), 'error');
 			draft = content;
+		} finally {
+			sending = false;
+		}
+	}
+
+	// QURATOR-137 slice 2: the structured send. One deliberate press (same no-auto-send rule as
+	// Send — this is a button, not an event handler firing on navigation), calling the dedicated
+	// Tauri command rather than overloading send_message: the nonce is minted and the asker npub
+	// derived server-side, and the body the peer receives is `{"hb":"access_request",…}` — what
+	// their client can recognise, instead of prefilled prose only a human can read.
+	async function handleSendAccessRequest() {
+		if (!selectedPeer || sending) return;
+		const forPeer = selectedPeer.npub;
+		sending = true;
+		try {
+			await sendAccessRequest(forPeer);
+			askAccessFor = '';
+			toast('Access request sent.', 'success');
+		} catch (e) {
+			toast(String(e), 'error');
 		} finally {
 			sending = false;
 		}
@@ -965,6 +993,9 @@
 			const petname = $page.url.searchParams.get('petname') ?? petnameFallback;
 			const applied = applyAskAccessIntent(intent, draft, petname);
 			draft = applied.draft;
+			// QURATOR-137 slice 2: while this intent is live for THIS peer, the composer also offers
+			// the structured send (see askAccessFor's declaration for the no-auto-send rationale).
+			if (intent === 'ask-access') askAccessFor = npub;
 			if (applied.focus) tick().then(() => draftEl?.focus());
 		};
 		const open = (peer: CachedPeer, petnameFallback: string) => {
@@ -1329,7 +1360,7 @@
 						{#each req.messages as msg}
 							<div class="bubble-wrap">
 								<div class="bubble bubble-recv">
-									<p class="bubble-text">{manifestRequestHint(msg.content) ?? transportTicketHint(msg.content) ?? msg.content}</p>
+									<p class="bubble-text">{manifestRequestHint(msg.content) ?? accessRequestHint(msg.content) ?? transportTicketHint(msg.content) ?? msg.content}</p>
 									<span class="bubble-time">{formatTime(msg.sent_at)}</span>
 										{#if detectedFor(messageKey(msg))}
 											{@const card = detectedFor(messageKey(msg))!}
@@ -1477,7 +1508,7 @@
 							{/if}
 							<div class="bubble-wrap" class:bubble-me={isMe}>
 								<div class="bubble" class:bubble-sent={isMe} class:bubble-recv={!isMe}>
-									<p class="bubble-text">{manifestRequestHint(msg.content) ?? transportTicketHint(msg.content) ?? msg.content}</p>
+									<p class="bubble-text">{manifestRequestHint(msg.content) ?? accessRequestHint(msg.content) ?? transportTicketHint(msg.content) ?? msg.content}</p>
 									<span class="bubble-time">{formatTime(msg.sent_at)}</span>
 									{#if detectedFor(messageKey(msg))}
 										{@const card = detectedFor(messageKey(msg))!}
@@ -1572,6 +1603,19 @@
 									{@html icons.key}
 								</button>
 								<HintMarker text={SHARE_MY_CODE_WARNING} label="Share my code" />
+								<!-- QURATOR-137 slice 2: the structured ask — shown only while the
+								     ask-access intent is live for THIS conversation. -->
+								{#if askAccessFor && selectedPeer && askAccessFor === selectedPeer.npub}
+									<button
+										type="button"
+										class="btn-default btn-sm"
+										onclick={handleSendAccessRequest}
+										disabled={sending}
+										title="Send a structured access request this peer's client can recognise (the composer text stays yours to edit and send as prose)"
+									>
+										Send access request
+									</button>
+								{/if}
 							</div>
 							<button
 								class="btn-primary btn-send"

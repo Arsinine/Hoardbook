@@ -611,6 +611,7 @@ pub fn run() {
             commands::chat::send_message,
             commands::chat::request_manifest,
             commands::chat::request_manifest_from,
+            commands::chat::send_access_request,
             commands::chat::get_messages,
             commands::chat::dm_requests,
             commands::chat::dm_request_accept,

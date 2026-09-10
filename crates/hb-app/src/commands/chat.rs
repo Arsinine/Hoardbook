@@ -1178,6 +1178,94 @@ pub async fn get_manifest_asks(
     store.load_manifest_asks().map_err(cmd_err)
 }
 
+/// QURATOR-137 slice 2 — build the access-request DM body (canonical JSON). A thin delegate to
+/// hb-core's `AccessRequest` so the wire body has ONE source — the harness-gap lesson from
+/// `build_manifest_request`: a second hand-rolled copy of a wire body is exactly where a step
+/// silently drops. Pure — unit-tested without a relay, alongside the manifest-request body tests.
+pub(crate) fn build_access_request_content(
+    asker_npub: &str,
+    nonce: &str,
+    requested_at: u64,
+) -> Result<String, String> {
+    hb_core::access_request::AccessRequest::new(asker_npub, nonce, requested_at)
+        .to_dm_content()
+        .map_err(cmd_err)
+}
+
+/// QURATOR-137 slice 2 — DM a peer a structured **access request**: the machine-recognisable form
+/// of the "Ask for access" affordance's prefilled prose (M17 W2). Until now that ask left as an
+/// ordinary kind-14 chat DM — indistinguishable on the wire from any other message — so nothing on
+/// the issuer's side could recognise one. This command sends the `{"hb":"access_request",…}` body
+/// over the same NIP-17 plane; the prefilled-prose path stays available alongside it (a human may
+/// still edit words, and peers on builds without the parser just see the JSON body).
+///
+/// Mirrors `request_manifest` exactly: the nonce is minted here, never in the UI; `parse_recipient`
+/// on the asked peer; the `is_self_send` refusal before any network I/O; the QURATOR-164 ask
+/// throttle after every pre-send failure path (it delays, it never discards); and `send_dm_inner`
+/// over `net::relay_urls`/`net::client`/`net::RELAY_TIMEOUT`. `asker_npub` is derived from OUR
+/// identity — the seal signer is the authoritative attribution, the field is convenience (the
+/// `author_npub` rationale on `TransportTicket`).
+///
+/// **The answer is deliberately NOT automated here.** The owner ruling (auto-grant the browse key
+/// to anyone who asks, except a blocked npub) has no issuance path to reuse yet: `seal_key_grant`
+/// has no hb-app caller, and the standing-grant map it might have fed was deleted (QURATOR-177/164,
+/// 2026-09-03/04). Building new crypto-sensitive grant-minting logic under this slice was ruled out
+/// of scope — the receive/auto-answer half is decomposed and owed separately. What exists today:
+/// the issuer's inbox recognises the body (UI hint) and the human answers with "Share my code", as
+/// before. Note blocking already gates the whole DM: `route_dm` drops a blocked peer's message
+/// before any body parsing runs, so a blocked asker's request never reaches the inbox at all.
+///
+/// No local ask trace yet — the manifest asks persist `manifest_asks.json` so the paywall can show
+/// "Asked"; an access-ask trace/cooldown is a follow-up if the affordance needs the same feedback.
+#[tauri::command]
+pub async fn send_access_request(
+    npub: String,
+    identity: State<'_, SharedIdentity>,
+    store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
+) -> CmdResult<()> {
+    let id_clone = {
+        let guard = identity.read().await;
+        let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
+        id.identity.clone()
+    };
+    send_access_request_inner(&npub, &id_clone, &store, &relay).await
+}
+
+/// The body of [`send_access_request`], callable without Tauri `State` — the same shim/`_inner`
+/// split every command here follows (the WAN-harness lesson: the harness must drive the production
+/// body, never a re-implementation of it).
+pub(crate) async fn send_access_request_inner(
+    npub: &str,
+    id_clone: &hb_core::Identity,
+    store: &DataStore,
+    relay: &SharedRelay,
+) -> Result<(), String> {
+    let recipient = parse_recipient(npub)?;
+    if is_self_send(&recipient, &id_clone.public_key()) {
+        return Err("You can't request access from yourself.".into());
+    }
+    // Provenance/display only (hb-core's doc ruling) — never an expiry input.
+    let requested_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let content = build_access_request_content(
+        &npub_of(&id_clone.public_key()),
+        &new_ask_nonce(),
+        requested_at,
+    )?;
+    let own = net::relay_urls(store);
+    let client = net::client(id_clone, store, relay).await.map_err(cmd_err)?;
+    // Same placement as `request_manifest_inner`: after every pre-send failure path, before the
+    // send — only a request that actually reaches the relay consumes a slot.
+    crate::ask_throttle::acquire().await;
+    send_dm_inner(&client, id_clone, &recipient, &content, &own, net::RELAY_TIMEOUT)
+        .await
+        .map_err(cmd_err)?;
+    Ok(())
+}
+
 
 /// Fetch + decrypt the NIP-17 inbox: contacts' messages only (Q7 — a stranger's DM never reaches the
 /// main inbox at all). As a side effect, persists any newly-seen stranger messages into the quarantined
@@ -1743,6 +1831,52 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["teaser_event_id"], "evt1");
         assert_eq!(v["mascara_pubkey"], "mpub");
+    }
+
+    /// QURATOR-137 slice 2 — the body `send_access_request` puts on the wire IS the hb-core
+    /// `AccessRequest` shape and parses back as one (the asker npub is derived from our identity in
+    /// production, never caller-supplied from the UI); and the manifest-request body is NOT one —
+    /// the two asks must never be mis-read for each other in either direction.
+    ///
+    /// MUTATION (P-10, applied by the orchestrator — this lane compiles nothing): in
+    /// `build_access_request_content`, change the `asker_npub` argument passed to
+    /// `AccessRequest::new` from `asker_npub` to `"wrong"` (or swap the `nonce`/`asker_npub`
+    /// argument ORDER at the `AccessRequest::new` call inside `build_access_request_content`) —
+    /// this test reds on the `asker_npub`/`nonce` assertions while still compiling.
+    #[test]
+    fn access_request_dm_body_round_trips_through_the_production_builder() {
+        let json = build_access_request_content("npub1asker", "n-1", 7).unwrap();
+        let parsed = hb_core::access_request::AccessRequest::parse(&json)
+            .expect("the body this command sends must parse as the request it claims to be");
+        assert_eq!(parsed.asker_npub, "npub1asker");
+        assert_eq!(parsed.nonce, "n-1");
+        assert_eq!(parsed.requested_at, 7);
+
+        let manifest = build_manifest_request("s", "fp", None, None, Some("n1".into())).unwrap();
+        assert!(
+            hb_core::access_request::AccessRequest::parse(&manifest).is_none(),
+            "a manifest_request body is a different ask — fall through, never mis-read"
+        );
+    }
+
+    /// QURATOR-137 slice 2 — devtest #14's rule for every send path: a self-send is refused BEFORE
+    /// any network I/O (no relay client is built, nothing leaves the node).
+    ///
+    /// MUTATION (P-10, applied by the orchestrator — this lane compiles nothing): in
+    /// `send_access_request_inner`, change the refusal string "You can't request access from
+    /// yourself." to anything else — this test reds on the exact-message assertion while still
+    /// compiling. (Deleting the whole `is_self_send` arm also reds, but then proceeds to build a
+    /// relay client from an empty store — slower, and the assertion fires either way.)
+    #[tokio::test]
+    async fn send_access_request_refuses_a_self_send() {
+        let me = Identity::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let relay = crate::net::new_shared();
+        let err = send_access_request_inner(&npub_of(&me.public_key()), &me, &store, &relay)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "You can't request access from yourself.");
     }
 
     #[tokio::test]

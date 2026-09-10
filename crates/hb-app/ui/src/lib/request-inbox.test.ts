@@ -7,6 +7,8 @@ import {
 	REQUEST_EXPLAINER,
 	parseManifestRequest,
 	manifestRequestHint,
+	parseAccessRequest,
+	accessRequestHint,
 } from './request-inbox.js';
 import type { DmRequestView, ReceivedMessage } from './types.js';
 import { shortNpub } from './contact-display.js';
@@ -190,5 +192,58 @@ describe('author_npub (QURATOR-79 carrier 4 — the third-party re-serve ask)', 
 		expect(hint).toContain('criterion');
 		// ...and the ordinary ask keeps the exact pre-carrier-4 copy, byte for byte.
 		expect(manifestRequestHint(noAuthor)).toBe('Asking for the full list of “criterion”');
+	});
+});
+
+describe('parseAccessRequest / accessRequestHint (QURATOR-137 slice 2 — the structured share-code ask)', () => {
+	// MUTATION (P-10, applied by the orchestrator): in request-inbox.ts's `parseAccessRequest`,
+	// change the gate `if (o.hb !== 'access_request') return null;` to `if (false) return null;` —
+	// the wrong-tag cases below red (a manifest_request body would parse) while the file still
+	// compiles. The version-gate mutation: delete the `typeof o.v` check line and the v2 body parses.
+	it('recognises the wire body and reads its fields back', () => {
+		const body = JSON.stringify({
+			hb: 'access_request',
+			v: 1,
+			asker_npub: 'npub1asker',
+			nonce: 'n-1',
+			requested_at: 7,
+		});
+		const parsed = parseAccessRequest(body);
+		expect(parsed).not.toBeNull();
+		expect(parsed!.askerNpub).toBe('npub1asker');
+		expect(parsed!.nonce).toBe('n-1');
+		expect(parsed!.requestedAt).toBe(7);
+		expect(accessRequestHint(body)).toBe('Asking for your share code (access request)');
+	});
+
+	it('falls through to null for prose, malformed JSON, other bodies, and unknown versions', () => {
+		// The prefilled M17 W2 prose is the exact string the intent path puts in the composer — it
+		// must stay an ordinary chat message, never a structured request.
+		expect(parseAccessRequest("Hi, could I have your share code? I'd like to browse your collections.")).toBeNull();
+		expect(parseAccessRequest('not json')).toBeNull();
+		expect(parseAccessRequest(JSON.stringify({ hb: 'manifest_request', slug: 'vault' }))).toBeNull();
+		expect(parseAccessRequest(JSON.stringify({ hb: 'transport_ticket' }))).toBeNull();
+		// Unknown version: recognised and refused, never mis-read (the TICKET_V contract).
+		expect(
+			parseAccessRequest(
+				JSON.stringify({ hb: 'access_request', v: 2, asker_npub: 'npub1a', nonce: 'n', requested_at: 1 }),
+			),
+		).toBeNull();
+		// Blank identity fields are malformed, not absent.
+		expect(
+			parseAccessRequest(JSON.stringify({ hb: 'access_request', v: 1, asker_npub: '', nonce: 'n', requested_at: 1 })),
+		).toBeNull();
+	});
+
+	it('requestPreview shows the hint instead of raw JSON', () => {
+		const body = JSON.stringify({
+			hb: 'access_request',
+			v: 1,
+			asker_npub: 'npub1asker',
+			nonce: 'n-1',
+			requested_at: 7,
+		});
+		const r = makeRequest('npub1asker', 2, [body]);
+		expect(requestPreview(r)).toBe('Asking for your share code (access request)');
 	});
 });

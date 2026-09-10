@@ -25,7 +25,8 @@ export function sortRequests(requests: DmRequestView[]): DmRequestView[] {
 export function requestPreview(r: DmRequestView, max = 80): string {
 	const last = r.messages[r.messages.length - 1];
 	const content = last?.content ?? '';
-	const text = manifestRequestHint(content) ?? transportTicketHint(content) ?? content;
+	const text =
+		manifestRequestHint(content) ?? accessRequestHint(content) ?? transportTicketHint(content) ?? content;
 	return text.length > max ? text.slice(0, max - 1) + '…' : text;
 }
 
@@ -96,6 +97,49 @@ export function manifestRequestHint(content: string): string | null {
 /** No reply is possible until the sender becomes a contact (accepting the request adds them). */
 export function canReply(isContact: boolean): boolean {
 	return isContact;
+}
+
+/** QURATOR-137 slice 2 — the structured "may I have your share code?" ask a peer DMs instead of the
+ *  M17 W2 prefilled prose. Mirrors `parseManifestRequest`: the TS counterpart of hb-core's
+ *  `AccessRequest::parse`, with the SAME fall-through contract — anything that is not a
+ *  well-formed, recognised access request returns null, which the caller must treat as an ordinary
+ *  chat message (failure-to-parse was the behaviour for every DM before this body existed). */
+export interface AccessRequestBody {
+	askerNpub: string;
+	nonce: string;
+	requestedAt: number;
+}
+
+/** Detect the `{hb:"access_request",…}` JSON a peer sends as a DM. Returns the parsed request, or
+ *  null for an ordinary chat message (any non-JSON / wrong-tag / unknown-version content). Pure. */
+export function parseAccessRequest(content: string): AccessRequestBody | null {
+	let v: unknown;
+	try {
+		v = JSON.parse(content);
+	} catch {
+		return null;
+	}
+	if (typeof v !== 'object' || v === null) return null;
+	const o = v as Record<string, unknown>;
+	// The tag + a recognised version are the recognition gate — mirrors the Rust `verify_shape`.
+	if (o.hb !== 'access_request') return null;
+	if (typeof o.v !== 'number' || o.v < 1 || o.v > 1 || !Number.isInteger(o.v)) return null;
+	if (typeof o.asker_npub !== 'string' || o.asker_npub === '') return null;
+	if (typeof o.nonce !== 'string' || o.nonce === '') return null;
+	if (typeof o.requested_at !== 'number') return null;
+	return {
+		askerNpub: o.asker_npub,
+		nonce: o.nonce,
+		requestedAt: o.requested_at,
+	};
+}
+
+/** The light, human hint an access-request DM renders as, or null for an ordinary message. Until
+ *  the auto-answer half lands (no reusable grant-issuance path exists — see the Rust command's
+ *  doc), the issuer answers it exactly as the prose ask before it: "Share my code" in the
+ *  composer. The hint exists so the row/bubble shows intent, not raw JSON. */
+export function accessRequestHint(content: string): string | null {
+	return parseAccessRequest(content) ? 'Asking for your share code (access request)' : null;
 }
 
 export const REQUEST_EXPLAINER =

@@ -94,6 +94,13 @@ pub enum HbError {
     #[error("invalid transport ticket: {0}")]
     InvalidTicket(String),
 
+    /// An access request DM body is malformed — wrong discriminator, blank bindings (QURATOR-137
+    /// slice 2). Kept separate from [`Self::InvalidTicket`] because the two bodies flow in opposite
+    /// directions over the DM plane; `AccessRequest::parse` turns every variant of this into `None`
+    /// ("ordinary chat") for the caller.
+    #[error("invalid access request: {0}")]
+    InvalidAccessRequest(String),
+
     // TicketAlreadyRedeemed — deleted 2026-09-03, QURATOR-177 Option E (owner ruling:
     // authorization is at ASK time via the standing grant; the ticket is address delivery). Its
     // only raiser was `validate_redemption`'s `already_consumed` arm, fed by hb-app's
