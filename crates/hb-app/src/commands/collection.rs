@@ -3274,7 +3274,7 @@ mod tests {
             social_links: vec![],
             willing_to: vec![],
             content_types: vec![],
-            picture: None,
+            picture: None, hide_in_rosters: false,
             updated: chrono::Utc::now(),
         };
         store.save_profile_draft(&profile).unwrap();

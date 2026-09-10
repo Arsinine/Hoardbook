@@ -32,7 +32,7 @@ mod tests {
                 bio: String::new(),
                 tags: vec![],
                 content_types: vec![],
-                picture: None,
+                picture: None, hide_in_rosters: false,
             },
             true,
         )

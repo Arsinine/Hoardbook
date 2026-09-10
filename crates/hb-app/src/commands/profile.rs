@@ -50,6 +50,9 @@ pub(crate) fn teaser_from_profile(store: &DataStore, profile: &Profile) -> Tease
         tags,
         content_types: profile.content_types.clone(),
         picture: profile.picture.clone(),
+        // QURATOR-142: input value is always OVERWRITTEN by build_teaser (derived there from the
+        // `discoverable` param — the single source of truth); set for literal completeness only.
+        hide_in_rosters: false,
     }
 }
 
@@ -209,7 +212,7 @@ mod tests {
             social_links: vec![],
             willing_to: vec![],
             content_types,
-            picture: None,
+            picture: None, hide_in_rosters: false,
             updated: chrono::Utc::now(),
         }
     }

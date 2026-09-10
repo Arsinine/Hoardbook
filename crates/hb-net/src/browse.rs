@@ -1700,14 +1700,14 @@ mod tests {
             bio: String::new(),
             tags: vec![],
             content_types: vec![],
-            picture: None,
+            picture: None, hide_in_rosters: false,
         };
         let attacker_teaser = Teaser {
             display_name: "SPOOFED".into(),
             bio: String::new(),
             tags: vec![],
             content_types: vec![],
-            picture: None,
+            picture: None, hide_in_rosters: false,
         };
 
         let victim_event = build_teaser(&victim, &victim_teaser, false).unwrap();

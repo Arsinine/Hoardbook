@@ -129,7 +129,7 @@ pub fn build_canary_events(id: &Identity, bk: &BrowseKey, run_tag: &str) -> Resu
             bio: "synthetic backbone probe".into(),
             tags: vec![run_tag.to_string()],
             content_types: vec!["canary".into()],
-            picture: None,
+            picture: None, hide_in_rosters: false,
         },
         true,
     )?;

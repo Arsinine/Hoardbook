@@ -357,7 +357,7 @@ mod tests {
             bio: "hoards".into(),
             tags: tags.iter().map(|s| s.to_string()).collect(),
             content_types: cts.iter().map(|s| s.to_string()).collect(),
-            picture: None,
+            picture: None, hide_in_rosters: false,
         }
     }
 
@@ -712,7 +712,7 @@ mod tests {
                 bio: bio.into(),
                 tags: vec!["anime".into()],
                 content_types: vec!["video".into()],
-                picture: None,
+                picture: None, hide_in_rosters: false,
             },
             created_at: Timestamp::from(ts),
         };
@@ -734,7 +734,7 @@ mod tests {
                 bio: bio.into(),
                 tags: vec![],
                 content_types: vec![],
-                picture: None,
+                picture: None, hide_in_rosters: false,
             },
             created_at: Timestamp::from(ts),
         }

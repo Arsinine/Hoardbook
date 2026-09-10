@@ -35,6 +35,13 @@ export interface Profile {
 	content_types: string[];
 	/** Optional avatar as a `data:` URI (M13 item #13) — never an http(s) URL. */
 	picture?: string;
+	/** QURATOR-142 — roster opt-out (internal-use-only, NEVER rendered): true when this peer's
+	 *  published teaser was built with `discoverable` OFF. The Topics roster reads it to drop the
+	 *  chat hand-off; the member still appears in the roster and its count. Absent (`undefined`)
+	 *  means old/unresolved — the roster deliberately reads that as OPTED OUT (fail-closed), the
+	 *  OPPOSITE direction from the Rust serde default (`false` = not hidden); see rosterChatLocked
+	 *  in routes/topics/+page.svelte. */
+	hide_in_rosters?: boolean;
 	updated: string; // ISO datetime
 }
 

@@ -94,14 +94,37 @@ function strangerRow(container: HTMLElement) {
 	return row!;
 }
 
+/** The locked (non-interactive) row form — the same plain div the self row uses. In these tests
+ *  the roster is stranger-only, so `.roster-row.self` can only be the stranger's locked form. */
+function lockedRow(container: HTMLElement) {
+	const row = container.querySelector<HTMLDivElement>('.roster-row.self');
+	expect(row).toBeTruthy();
+	return row!;
+}
+
+/** A pasteKey resolve carrying the QURATOR-142 opt-out verdict (`hide_in_rosters`). */
+function resolvedPeer(hideInRosters: boolean) {
+	return {
+		npub: STRANGER_NPUB,
+		profile: { display_name: 'Stranger', bio: 'b', tags: [], languages: [], social_links: [], willing_to: [], content_types: [], hide_in_rosters: hideInRosters, updated: '' },
+		collections: [], online: false, last_fetched: '',
+	};
+}
+
 describe('QURATOR-146 — roster row hands off to chat', () => {
 	it('double-click navigates to /chat?peer=<npub> for a NON-contact member', async () => {
 		seedSelf();
 		rosterMock.mockResolvedValue([STRANGER_NPUB]);
 		listMock.mockResolvedValue(ONE_TOPIC);
+		// QURATOR-142: rows are fail-closed — the hand-off only exists once the hover resolve has
+		// explicitly said `hide_in_rosters: false`, so seed that resolve and let it land first.
+		pasteKeyMock.mockResolvedValue(resolvedPeer(false));
 		const { container } = render(TopicsPage);
 		await openFirstTopic(container);
 
+		// Hover fires the shared bio/opt-out resolve; the row becomes the interactive form.
+		await fireEvent.mouseEnter(lockedRow(container));
+		await waitFor(() => expect(strangerRow(container)).toBeTruthy());
 		await fireEvent.dblClick(strangerRow(container));
 		expect(gotoMock).toHaveBeenCalledWith('/chat?peer=' + STRANGER_NPUB);
 	});
@@ -110,9 +133,12 @@ describe('QURATOR-146 — roster row hands off to chat', () => {
 		seedSelf();
 		rosterMock.mockResolvedValue([STRANGER_NPUB]);
 		listMock.mockResolvedValue(ONE_TOPIC);
+		pasteKeyMock.mockResolvedValue(resolvedPeer(false));
 		const { container } = render(TopicsPage);
 		await openFirstTopic(container);
 
+		await fireEvent.mouseEnter(lockedRow(container));
+		await waitFor(() => expect(strangerRow(container)).toBeTruthy());
 		const row = strangerRow(container);
 		row.focus();
 		await fireEvent.keyDown(row, { key: 'Enter' });
@@ -143,7 +169,9 @@ describe('QURATOR-146 — roster row hands off to chat', () => {
 		const { container, findByText } = render(TopicsPage);
 		await openFirstTopic(container);
 
-		const row = strangerRow(container);
+		// QURATOR-142: this profile carries no `hide_in_rosters` (pre-flag shape), so the row
+		// stays in the locked form — the bio rides the SAME locked row's hover.
+		const row = lockedRow(container);
 		await fireEvent.mouseEnter(row);
 		expect(await findByText('I collect laserdisc rips.')).toBeTruthy();
 
@@ -167,7 +195,7 @@ describe('QURATOR-146 — roster row hands off to chat', () => {
 		const { container, findByText } = render(TopicsPage);
 		await openFirstTopic(container);
 
-		await fireEvent.mouseEnter(strangerRow(container));
+		await fireEvent.mouseEnter(lockedRow(container));
 
 		// The stated nothing, not an empty tooltip div.
 		expect(await findByText('No published profile')).toBeTruthy();
@@ -186,7 +214,7 @@ describe('QURATOR-146 — roster row hands off to chat', () => {
 		const { container, findByText } = render(TopicsPage);
 		await openFirstTopic(container);
 
-		await fireEvent.mouseEnter(strangerRow(container));
+		await fireEvent.mouseEnter(lockedRow(container));
 		await waitFor(() => expect(pasteKeyMock).toHaveBeenCalledTimes(1));
 		await new Promise((r) => setTimeout(r, 20));
 		// "Couldn't ask" must NOT assert the bio absent for the session — the stated-nothing line
@@ -194,8 +222,8 @@ describe('QURATOR-146 — roster row hands off to chat', () => {
 		expect(container.querySelector('.roster-bio')).toBeNull();
 
 		// And a later hover retries: the relay is back and the real bio lands.
-		await fireEvent.mouseLeave(strangerRow(container));
-		await fireEvent.mouseEnter(strangerRow(container));
+		await fireEvent.mouseLeave(lockedRow(container));
+		await fireEvent.mouseEnter(lockedRow(container));
 		expect(await findByText('back online')).toBeTruthy();
 		expect(pasteKeyMock).toHaveBeenCalledTimes(2);
 	});
@@ -211,5 +239,89 @@ describe('QURATOR-146 — roster row hands off to chat', () => {
 			.replace(/(^|\s)\/\/[^\n]*/g, '$1') // line comments
 			.replace(/<!--[\s\S]*?-->/g, '');   // HTML comments
 		expect(noComments).not.toContain('upsert_topic_contact');
+	});
+});
+
+// QURATOR-142 — the roster opt-out: a member with "Show up in Discover Hoarders" OFF still
+// appears in the roster and counts in Roster (N), but their row is NEVER double-click/Enter-
+// navigable to Chat. The flag rides the SAME pasteKey resolve that populates rosterBios (teaser
+// body → Profile.hide_in_rosters) — no second fetch. The read is FAIL-CLOSED and deliberately the
+// OPPOSITE of the Rust serde default: on the wire an absent field parses as `false` (not hidden)
+// so old events keep parsing, but the UI renders anything unresolved (hover not fired, fetch
+// failed, old cached copy) as the non-interactive form; only an explicit resolved `false` unlocks.
+// Internal-use-only: the flag is never rendered — it only picks which of the two row forms to draw
+// (pinned here: the locked row has no `.roster-cue` and no title text about chatting).
+//
+// MUTATION PROOFS (P-10, run 2026-09-10, both red confirmed then reverted):
+//   - fail-open mutation — make rosterChatLocked() `return false;` (always unlocked): reds BOTH
+//     the fail-closed test (an unresolved row would render as a button) and the opted-out test
+//     (a resolved hide_in_rosters:true member would render as a button).
+//   - ignoring the resolve — delete the `if (!hidden) rosterChatUnlocked[npub] = true;` line:
+//     reds the "normal member unaffected" path in the Q146 tests above (row never unlocks, the
+//     dblClick/Enter tests time out on waitFor).
+describe('QURATOR-142 — roster opt-out: fail-closed, never rendered, count unchanged', () => {
+	it('an UNRESOLVED member renders non-interactive (fail-closed) — never an opted-in button', async () => {
+		seedSelf();
+		rosterMock.mockResolvedValue([STRANGER_NPUB]);
+		listMock.mockResolvedValue(ONE_TOPIC);
+		// pasteKey never resolves this hover — the opt-out state stays unknown.
+		pasteKeyMock.mockReturnValue(new Promise(() => {}));
+		const { container } = render(TopicsPage);
+		await openFirstTopic(container);
+
+		await fireEvent.mouseEnter(lockedRow(container));
+		await new Promise((r) => setTimeout(r, 20));
+		// Fail-closed: no interactive row exists, and the locked form carries no chat affordance.
+		expect(container.querySelector('.roster-row:not(.self)')).toBeNull();
+		expect(lockedRow(container).querySelector('.roster-cue')).toBeNull();
+		expect(lockedRow(container).getAttribute('title')).toBeNull();
+	});
+
+	it('a REJECTED resolve keeps the row locked (the catch path records no unlock)', async () => {
+		seedSelf();
+		rosterMock.mockResolvedValue([STRANGER_NPUB]);
+		listMock.mockResolvedValue(ONE_TOPIC);
+		pasteKeyMock.mockRejectedValue(new Error('relay unreachable'));
+		const { container } = render(TopicsPage);
+		await openFirstTopic(container);
+
+		await fireEvent.mouseEnter(lockedRow(container));
+		await waitFor(() => expect(pasteKeyMock).toHaveBeenCalledTimes(1));
+		await new Promise((r) => setTimeout(r, 20));
+		expect(container.querySelector('.roster-row:not(.self)')).toBeNull();
+	});
+
+	it('a resolved hide_in_rosters:true member stays non-interactive — no dblclick, no Enter', async () => {
+		seedSelf();
+		rosterMock.mockResolvedValue([STRANGER_NPUB]);
+		listMock.mockResolvedValue(ONE_TOPIC);
+		pasteKeyMock.mockResolvedValue(resolvedPeer(true));
+		const { container } = render(TopicsPage);
+		await openFirstTopic(container);
+
+		await fireEvent.mouseEnter(lockedRow(container));
+		await waitFor(() => expect(pasteKeyMock).toHaveBeenCalledTimes(1));
+		await new Promise((r) => setTimeout(r, 20));
+		// The resolve landed (bio cache filled) yet the row never became a button.
+		await fireEvent.dblClick(lockedRow(container));
+		await fireEvent.keyDown(lockedRow(container), { key: 'Enter' });
+		expect(gotoMock).not.toHaveBeenCalled();
+		expect(container.querySelector('.roster-row:not(.self)')).toBeNull();
+	});
+
+	it('an opted-out member still counts in the Roster (N) label', async () => {
+		seedSelf();
+		rosterMock.mockResolvedValue([SELF_NPUB, STRANGER_NPUB]);
+		listMock.mockResolvedValue(ONE_TOPIC);
+		pasteKeyMock.mockResolvedValue(resolvedPeer(true));
+		const { container } = render(TopicsPage);
+		await openFirstTopic(container);
+
+		// Roster order [SELF, STRANGER]: the second `.self`-formed row is the stranger's locked form.
+		const rows = container.querySelectorAll('.roster-row.self');
+		expect(rows).toHaveLength(2);
+		await fireEvent.mouseEnter(rows[1]);
+		await waitFor(() => expect(pasteKeyMock).toHaveBeenCalledTimes(1));
+		expect(container.textContent).toContain('Roster (2)');
 	});
 });

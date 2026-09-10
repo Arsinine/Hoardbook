@@ -335,7 +335,9 @@ describe('review 5 — focusing a roster row fetches the bio', () => {
 		await waitFor(() => expect(rosterMock).toHaveBeenCalled());
 		await tick();
 
-		const row = container.querySelector<HTMLButtonElement>('.roster-row:not(.self)')!;
+		// QURATOR-142: the roster is stranger-only and the resolve carries no `hide_in_rosters`,
+		// so the row stays in the LOCKED form (`.self`-classed div) — the bio still rides it.
+		const row = container.querySelector<HTMLDivElement>('.roster-row.self')!;
 		expect(row).toBeTruthy();
 		row.focus();
 		await fireEvent.focus(row); // jsdom does not dispatch focus from .focus() alone
@@ -362,7 +364,9 @@ describe('review 6 — a rejected bio fetch does not poison the cache', () => {
 		await waitFor(() => expect(rosterMock).toHaveBeenCalled());
 		await tick();
 
-		const row = container.querySelector<HTMLButtonElement>('.roster-row:not(.self)')!;
+		// QURATOR-142: the roster is stranger-only and the resolve carries no `hide_in_rosters`,
+		// so the row stays in the LOCKED form (`.self`-classed div) — the bio still rides it.
+		const row = container.querySelector<HTMLDivElement>('.roster-row.self')!;
 		// Hover 1: the relay is unreachable. The honest absent line must NOT appear — "couldn't
 		// ask" is not "asked and there is none" — and nothing is cached as final.
 		await fireEvent.mouseEnter(row);
@@ -393,7 +397,9 @@ describe('review 6 — a rejected bio fetch does not poison the cache', () => {
 		await waitFor(() => expect(rosterMock).toHaveBeenCalled());
 		await tick();
 
-		const row = container.querySelector<HTMLButtonElement>('.roster-row:not(.self)')!;
+		// QURATOR-142: the roster is stranger-only and the resolve carries no `hide_in_rosters`,
+		// so the row stays in the LOCKED form (`.self`-classed div) — the bio still rides it.
+		const row = container.querySelector<HTMLDivElement>('.roster-row.self')!;
 		await fireEvent.mouseEnter(row);
 		await waitFor(() => expect(pasteKeyMock).toHaveBeenCalledTimes(1));
 		// The empty string resolves and is cached — a hover renders the bio REGION (no stated

@@ -37,6 +37,18 @@ pub struct Teaser {
     /// [`validate_picture`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub picture: Option<String>,
+    /// QURATOR-142 — roster opt-out, mirrored into the teaser BODY. `parse_teaser` never reads
+    /// `event.tags` (by design — the `t`-hashtag discoverable path is a dead end for this), so the
+    /// opt-out rides the body instead: [`build_teaser`] DERIVES this as `!discoverable` at publish
+    /// time (a value set on the input struct is always overwritten — the `discoverable` param is
+    /// the single source of truth). Old events without the key serde-default to `false`
+    /// (= not hidden) so archived/cached teasers keep parsing — no `SCHEMA_V` bump, the
+    /// additive-optional-field precedent of `ask_nonce`/`author_npub` in `ticket.rs`. NOTE the
+    /// Topics roster UI deliberately reads an unresolved/absent value as OPTED OUT instead
+    /// (fail-closed) — the opposite direction from this serde default, by design; see the roster
+    /// read in `topics/+page.svelte`. Internal-use-only: never rendered anywhere.
+    #[serde(default)]
+    pub hide_in_rosters: bool,
 }
 
 /// Hard cap on [`Teaser::picture`]'s encoded size (the whole `data:` URI string, in bytes) — keeps
@@ -85,7 +97,11 @@ pub fn build_teaser(identity: &Identity, teaser: &Teaser, discoverable: bool) ->
     if let Some(pic) = &teaser.picture {
         validate_picture(pic)?;
     }
-    let content = serde_json::to_string(&Versioned { v: SCHEMA_V, inner: teaser.clone() })?;
+    // QURATOR-142: the roster opt-out rides the BODY (never the tags — `parse_teaser` doesn't read
+    // them), derived here from the same `discoverable` param both publish call sites already pass.
+    let mut inner = teaser.clone();
+    inner.hide_in_rosters = !discoverable;
+    let content = serde_json::to_string(&Versioned { v: SCHEMA_V, inner })?;
     let mut tags = vec![
         Tag::identifier(TEASER_D),
         Tag::custom(TagKind::custom(TAG_SCHEMA), [SCHEMA_V.to_string()]),
@@ -216,6 +232,7 @@ mod tests {
             tags: vec!["anime".into(), "vhs".into()],
             content_types: vec!["video".into()],
             picture: None,
+            hide_in_rosters: false,
         }
     }
 
@@ -233,12 +250,46 @@ mod tests {
     fn teaser_without_discoverable_emits_no_hashtags() {
         // devtest #5: discoverable=false de-lists from tag search — zero `t` hashtags — while the
         // teaser BODY still carries tags/content_types (npub lookup + share-code browse read the
-        // body, unaffected) and the round-trip is unchanged.
+        // body, unaffected). QURATOR-142: the round-trip now differs from the discoverable build
+        // in EXACTLY ONE field — `hide_in_rosters` (the opt-out mirror) — everything else is equal.
         let id = Identity::generate();
         let ev = build_teaser(&id, &teaser(), false).unwrap();
         assert_eq!(ev.tags.hashtags().count(), 0, "no hashtags when not discoverable");
         assert!(ev.content.contains("anime") && ev.content.contains("video"), "body still carries the tags");
-        assert_eq!(parse_teaser(&ev).unwrap(), teaser(), "round-trips equal regardless of discoverable");
+        let mut expected = teaser();
+        expected.hide_in_rosters = true;
+        assert_eq!(parse_teaser(&ev).unwrap(), expected, "differs from the discoverable build only in hide_in_rosters");
+    }
+
+    #[test]
+    fn teaser_body_carries_roster_opt_out_mirror_of_discoverable() {
+        // QURATOR-142: the roster opt-out rides the teaser BODY (parse_teaser never reads
+        // event.tags, so the `t`-hashtag path can't carry it): build_teaser derives
+        // `hide_in_rosters = !discoverable` into the serialized payload, parse_teaser returns it,
+        // and a body from BEFORE the field existed serde-defaults to false — no SCHEMA_V bump
+        // (the ask_nonce/author_npub additive-optional precedent). The Topics roster UI reads an
+        // unresolved value as opted-OUT instead — fail-closed, deliberately the opposite
+        // direction from this serde default; that read lives in +page.svelte, not here.
+        //
+        // MUTATION PROOF (P-10, orchestrator applies): in build_teaser, change
+        // `inner.hide_in_rosters = !discoverable;` to `inner.hide_in_rosters = false;` — the
+        // discoverable=false assertion below must RED (expected true, parsed false). Revert after.
+        let id = Identity::generate();
+        let hidden = build_teaser(&id, &teaser(), false).unwrap();
+        let mut want_hidden = teaser();
+        want_hidden.hide_in_rosters = true;
+        assert_eq!(parse_teaser(&hidden).unwrap(), want_hidden, "discoverable=false mirrors into hide_in_rosters=true");
+
+        let shown = build_teaser(&id, &teaser(), true).unwrap();
+        assert_eq!(parse_teaser(&shown).unwrap(), teaser(), "discoverable=true mirrors into hide_in_rosters=false");
+
+        // A pre-QURATOR-142 body (no `hide_in_rosters` key) parses as false — old archived/cached
+        // teasers keep working.
+        let legacy: Teaser = serde_json::from_str(
+            r#"{"display_name":"old","bio":"","tags":[],"content_types":[]}"#,
+        )
+        .unwrap();
+        assert!(!legacy.hide_in_rosters, "absent key serde-defaults to false (not hidden)");
     }
 
     #[test]

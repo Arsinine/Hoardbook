@@ -56,6 +56,15 @@ pub struct Profile {
     /// field's doc for the privacy rails (never http(s), 16 KB cap).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub picture: Option<String>,
+    /// QURATOR-142 — the roster opt-out, threaded from the teaser body by
+    /// `hb_app::commands::browse::teaser_to_profile` (`Teaser::hide_in_rosters`, itself derived
+    /// from the publisher's `discoverable` setting at build time). Internal-use-only: the Topics
+    /// roster reads it to drop the chat hand-off for opted-out members (they still count in the
+    /// roster); it is NEVER rendered anywhere. Serde-defaults to `false` (not hidden) so old
+    /// cached peers keep parsing — the UI deliberately reads unresolved/absent as OPTED OUT
+    /// instead (fail-closed, the opposite direction); see the roster read in `topics/+page.svelte`.
+    #[serde(default)]
+    pub hide_in_rosters: bool,
     pub updated: DateTime<Utc>,
 }
 
@@ -322,6 +331,7 @@ mod tests {
             willing_to: vec![],
             content_types: vec![],
             picture: None,
+            hide_in_rosters: false,
             updated: chrono::Utc::now(),
         };
         let json = serde_json::to_string(&profile).unwrap();

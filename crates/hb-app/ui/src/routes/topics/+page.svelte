@@ -687,6 +687,24 @@
 	const fetchingBios = new Set<string>(); // in-flight guard — hover events re-fire on jitter
 	let rosterHover: string | null = $state(null);
 
+	// ── QURATOR-142 — the roster opt-out ────────────────────────────────────────────────────
+	// A member with "Show up in Discover Hoarders" OFF still appears in the roster and counts in
+	// Roster (N), but their row never hands off to Chat (no double-click, no Enter). The flag rides
+	// the SAME pasteKey resolve that fills rosterBios (teaser BODY → Profile.hide_in_rosters — the
+	// teaser's `t`-hashtag path can't carry it, parse_teaser never reads tags): no second fetch, no
+	// new fan-out. FAIL-CLOSED read, and deliberately the OPPOSITE direction from the Rust serde
+	// default: on the wire an absent `hide_in_rosters` parses as `false` (= not hidden) so old
+	// archived/cached events keep parsing, but the UI cannot afford that read — an unresolved
+	// member (hover not yet fired, relay unreachable, old cached copy without the field) must
+	// render non-interactive. So the ONLY thing that unlocks a row is an explicit `false` recorded
+	// from a resolved profile (rosterBioOnHover); everything else — true, undefined, fetch failed —
+	// stays locked. Internal-use-only: the flag is never rendered anywhere, it only picks which of
+	// the two existing row forms to draw.
+	let rosterChatUnlocked: Record<string, true> = $state({});
+	function rosterChatLocked(npub: string): boolean {
+		return rosterChatUnlocked[npub] !== true;
+	}
+
 	async function rosterBioOnHover(npub: string) {
 		rosterHover = npub;
 		// Only a RESOLVED answer is final; a reject ('retry') asks again on the next hover.
@@ -701,6 +719,17 @@
 			const contact = $contacts.find((c) => c.npub === npub);
 			const bio = contact?.profile?.bio ?? resolved.profile?.bio ?? false;
 			rosterBios = { ...rosterBios, [npub]: bio };
+			// QURATOR-142 — record the opt-out verdict from this same resolve. Local contact copy
+			// first (the same local-first rule as the bio), but an explicit `true` from EITHER
+			// source locks; only an explicit `false` unlocks. Both absent ⇒ locked (fail-closed —
+			// the asymmetry with the Rust serde default is documented at rosterChatLocked above).
+			const contactFlag = contact?.profile?.hide_in_rosters;
+			const resolvedFlag = resolved.profile?.hide_in_rosters;
+			const hidden =
+				contactFlag === true ||
+				resolvedFlag === true ||
+				(contactFlag !== false && resolvedFlag !== false);
+			if (!hidden) rosterChatUnlocked[npub] = true; // mutate, never replace (Svelte 5 rule)
 		} catch {
 			rosterBios = { ...rosterBios, [npub]: 'retry' }; // couldn't ask — NOT absent; a later hover retries
 		} finally {
@@ -1037,10 +1066,27 @@
 								{@const row = rosterRowProps(npub)}
 								{@const bio = rosterHover === npub ? rosterBios[npub] : undefined}
 								<li class="roster-item">
-									{#if row.isSelf}
+									{#if row.isSelf || rosterChatLocked(npub)}
 										<!-- The self row keeps r1's plain non-interactive form — there is no "talk to
-										     yourself" hand-off to offer. -->
-										<div class="roster-row self">
+										     yourself" hand-off to offer. QURATOR-142: an opted-out member (and, fail
+										     closed, any member whose opt-out state is not yet RESOLVED to "not
+										     hidden") draws the SAME plain form — still listed, still counted in
+										     Roster (N), never navigable to Chat. For a non-self member the hover
+										     still fires the bio resolve, which is also what resolves the opt-out
+										     state; the self row keeps no hover (nothing to resolve, and pasteKey
+										     rejects your own npub). -->
+										<!-- Keyboard bio parity (review 5) survives the lock: the row stays focusable so
+										     Tab still fetches the bio, but carries NO keydown handler — Enter is inert
+										     (the QURATOR-142 opt-out is navigation-only; the bio feature is unaffected). -->
+										<!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_static_element_interactions -->
+										<div
+											class="roster-row self"
+											tabindex={row.isSelf ? -1 : 0}
+											onfocus={() => { if (!row.isSelf) rosterBioOnHover(npub); }}
+											onblur={() => { if (!row.isSelf) rosterHover = rosterHover === npub ? null : rosterHover; }}
+											onmouseenter={() => { if (!row.isSelf) rosterBioOnHover(npub); }}
+											onmouseleave={() => { if (!row.isSelf) rosterHover = rosterHover === npub ? null : rosterHover; }}
+										>
 											<PersonRow name={row.name} letter={row.letter} picture={row.picture} fingerprint={row.fingerprint} online={row.online} />
 										</div>
 									{:else}
@@ -1058,7 +1104,8 @@
 											<PersonRow name={row.name} letter={row.letter} picture={row.picture} fingerprint={row.fingerprint} online={row.online} />
 											<span class="roster-cue" aria-hidden="true">chat ⏎</span>
 										</button>
-										{#if bio !== undefined && bio !== 'retry'}
+									{/if}
+									{#if !row.isSelf && bio !== undefined && bio !== 'retry'}
 											<div class="roster-bio" role="tooltip">
 												<!-- Absent-means-absent: a resolved "no bio" is a stated nothing, never a
 												     blank card — the same honesty rule as PersonRow's omitted fingerprint.
@@ -1067,7 +1114,6 @@
 												{bio === false ? 'No published profile' : bio}
 											</div>
 										{/if}
-									{/if}
 								</li>
 							{/each}
 						</ul>

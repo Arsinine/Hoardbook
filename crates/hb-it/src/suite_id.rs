@@ -25,7 +25,7 @@ fn teaser() -> Teaser {
         bio: String::new(),
         tags: vec!["hbid".into()],
         content_types: vec!["video".into()],
-        picture: None,
+        picture: None, hide_in_rosters: false,
     }
 }
 

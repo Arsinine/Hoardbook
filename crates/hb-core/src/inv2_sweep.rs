@@ -57,7 +57,7 @@ fn no_public_event_broadcasts_the_browse_key_in_any_encoding() {
         bio: "90s anime, VHS rips".into(),
         tags: vec!["anime".into(), "vhs".into()],
         content_types: vec!["video".into()],
-        picture: None,
+        picture: None, hide_in_rosters: false,
     };
     events.push(("event::build_teaser", build_teaser(&me, &teaser, true).expect("teaser builds")));
 

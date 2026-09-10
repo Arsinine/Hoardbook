@@ -112,6 +112,9 @@ fn teaser_to_profile(t: Teaser) -> hb_core::types::Profile {
         tags: t.tags,
         content_types: t.content_types,
         picture: t.picture,
+        // QURATOR-142 — the roster opt-out survives teaser → profile → CachedPeer.profile; the
+        // Topics roster reads it to drop the chat hand-off (internal-use-only, never rendered).
+        hide_in_rosters: t.hide_in_rosters,
         since: None,
         est_size: None,
         languages: vec![],
@@ -1034,6 +1037,7 @@ mod tests {
                 tags: vec!["anime".into()],
                 content_types: vec!["video".into()],
                 picture: Some("data:image/webp;base64,AA==".into()),
+                hide_in_rosters: false,
             },
             created_at: nostr::Timestamp::from(0),
         };
@@ -1051,7 +1055,7 @@ mod tests {
         let id = Identity::generate();
         let hit = SearchHit {
             npub: id.npub(),
-            teaser: Teaser { display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None },
+            teaser: Teaser { display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None, hide_in_rosters: false },
             created_at: nostr::Timestamp::from(0),
         };
         assert_eq!(hit_to_card(hit).bio, None, "a blank bio renders as None, not an empty string");
@@ -1060,7 +1064,7 @@ mod tests {
     fn hit_for(npub: String) -> SearchHit {
         SearchHit {
             npub,
-            teaser: Teaser { display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None },
+            teaser: Teaser { display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None, hide_in_rosters: false },
             created_at: nostr::Timestamp::from(0),
         }
     }
@@ -1498,7 +1502,7 @@ mod tests {
             bio: String::new(),
             tags: vec![],
             content_types: vec![],
-            picture: None,
+            picture: None, hide_in_rosters: false,
         }));
         assert!(reject_profileless(&peer).is_ok());
     }
@@ -1682,7 +1686,7 @@ mod tests {
             bio: String::new(),
             tags: vec![],
             content_types: vec![],
-            picture: None,
+            picture: None, hide_in_rosters: false,
         }));
         peer
     }
@@ -2253,7 +2257,7 @@ mod tests {
                 social_links: vec![],
                 willing_to: vec![],
                 content_types: vec![],
-                picture: None,
+                picture: None, hide_in_rosters: false,
                 updated: chrono::Utc::now(),
             }
         }

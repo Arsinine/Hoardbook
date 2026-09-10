@@ -25,7 +25,7 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
 }
 
 fn teaser(name: &str, tags: Vec<String>, cts: Vec<String>) -> Teaser {
-    Teaser { display_name: name.into(), bio: String::new(), tags, content_types: cts, picture: None }
+    Teaser { display_name: name.into(), bio: String::new(), tags, content_types: cts, picture: None, hide_in_rosters: false }
 }
 
 /// COUNT1: a fresh non-canary npub published to **every** relay raises `count_online` by exactly one

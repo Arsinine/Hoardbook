@@ -170,7 +170,7 @@ fn teaser(name: &str, tags: Vec<String>) -> Teaser {
         bio: "hoards".into(),
         tags,
         content_types: vec!["video".into()],
-        picture: None,
+        picture: None, hide_in_rosters: false,
     }
 }
 

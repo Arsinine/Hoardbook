@@ -293,7 +293,7 @@ pub(crate) async fn r2_default_relay_policy_watch() -> Result<(), String> {
                 bio: "hoards".into(),
                 tags: vec![format!("wan-r-r2-{token}")],
                 content_types: vec!["video".into()],
-                picture: None,
+                picture: None, hide_in_rosters: false,
             },
             true,
         ) {

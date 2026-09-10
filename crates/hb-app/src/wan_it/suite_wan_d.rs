@@ -150,7 +150,7 @@ fn bk(seed: u8) -> [u8; 32] {
 
 /// A teaser with a display name + tags (matches `hb-it/suite_browse::teaser`).
 fn teaser(name: &str, tags: Vec<String>, cts: Vec<String>) -> Teaser {
-    Teaser { display_name: name.into(), bio: "hoards".into(), tags, content_types: cts, picture: None }
+    Teaser { display_name: name.into(), bio: "hoards".into(), tags, content_types: cts, picture: None, hide_in_rosters: false }
 }
 
 /// Connect a client to the relay set (matches `hb-it/harness.rs::Ctx::connect`).

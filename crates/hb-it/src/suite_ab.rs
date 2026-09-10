@@ -35,7 +35,7 @@ fn teaser(name: &str, tags: &[String]) -> Teaser {
         bio: String::new(),
         tags: tags.to_vec(),
         content_types: vec!["video".into()],
-        picture: None,
+        picture: None, hide_in_rosters: false,
     }
 }
 

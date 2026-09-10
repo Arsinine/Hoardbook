@@ -33,7 +33,7 @@ fn teaser() -> Teaser {
         bio: "90s anime, VHS rips".into(),
         tags: vec!["anime".into(), "vhs".into()],
         content_types: vec!["video".into()],
-        picture: None,
+        picture: None, hide_in_rosters: false,
     }
 }
 
