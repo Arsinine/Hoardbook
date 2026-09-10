@@ -654,10 +654,23 @@ async fn run_role_d(input: &CarryInput) -> Result<(), String> {
         .flag("--author-npub")
         .ok_or_else(|| "role d requires --author-npub <A npub>".to_string())?
         .to_string();
+    let author_share_code = input
+        .flag("--author-share-code")
+        .ok_or_else(|| "role d requires --author-share-code <hbk…> (the AUTHOR's, not the carrier's)".to_string())?
+        .to_string();
 
-    // C must be a contact with its browse key for `accept_manifest_bytes` to decrypt C-carried
-    // envelopes — production D would have C's share code already.
+    // C must be a contact with its browse key for the redeem's DM/ticket leg — production D would
+    // have C's share code already (it dialled/asked C).
     save_peer_contact(input, &carrier_npub, &carrier_share_code)?;
+    // A must ALSO be a contact, carrying A's OWN browse key: `redeem_via_production` calls
+    // `accept_manifest_bytes(&expected_author, ...)` pinned to the ticket's `author_npub` (A), never
+    // the DM sender (C) — that pin is what makes Carrier-4 authorship attribution correct
+    // (fulfil.rs's own comment: "pinning to C made open_manifest's author check refuse every
+    // carrier-4 delivery"). Without A as a contact here, `accept_manifest_bytes`'s `load_contact`
+    // lookup on A's npub finds nothing and the redeem fails with "Add this peer as a contact..." —
+    // found live 2026-09-10, the harness's role D never saved A at all (0 integration coverage
+    // before this run; production D would already hold A's share code from having added them).
+    save_peer_contact(input, &author_npub, &author_share_code)?;
 
     // Ask C for A's collection — the production Carrier-4 ask wire (author_npub names A).
     let nonce = mint_ask_nonce();

@@ -1311,7 +1311,10 @@ async fn run_probe_wan_r(args: &[String]) -> Result<ExitCode> {
 ///   (fetch + cache from A), then `--role c --phase 2 --asker-npub <D npub>` (answer D's author-ask
 ///   by re-serving the cached copy).
 /// * role D (the asker):   `--role d --carrier-npub <C npub> --carrier-share-code <hbk…>
-///   --author-npub <A npub>` — asks C for A's collection and redeems C's cached copy.
+///   --author-npub <A npub> --author-share-code <hbk…>` — asks C for A's collection and redeems
+///   C's cached copy. Needs A's OWN share code too (not just C's): the redeem pins authorship to A
+///   (`accept_manifest_bytes(&expected_author, ...)`), so D must hold A as a contact with A's
+///   browse key to decrypt — production D would already have added A from having browsed them.
 ///
 /// All relays come from `--relay` as usual (the SG strfry for the documented topology).
 async fn run_probe_wan_carry(args: &[String]) -> Result<ExitCode> {
