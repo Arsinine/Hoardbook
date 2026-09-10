@@ -54,7 +54,7 @@ pub use dm::{unwrap_dm, wrap_dm, DirectMessage};
 pub use error::NetError;
 pub use nip09::build_deletion;
 pub use nip65::{bootstrap_order, build_relay_list, inbox_order, parse_relay_list, RelayList};
-pub use priv_browse::{dedup_newest, fetch_private_listings, publish_private_listing};
+pub use priv_browse::{dedup_newest, fetch_key_grants, fetch_private_listings, publish_private_listing};
 pub use pow::{leading_zero_bits, mine_pow, pow_difficulty};
 pub use render::{render_listing, RenderedListing, MAX_LISTING_PARTS};
 pub use split::{restitch_listing, split_listing, truncate_listing, ListingPart, TruncatedListing};

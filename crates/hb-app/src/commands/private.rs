@@ -9,14 +9,14 @@ use nostr::prelude::ToBech32;
 use serde::Serialize;
 use tauri::State;
 
-use hb_core::types::Collection;
-use hb_net::fetch_private_listings;
+use hb_core::{types::Collection, OpenedKeyGrant};
+use hb_net::{fetch_key_grants, fetch_private_listings};
 
 use crate::{
     error::{cmd_err, CmdResult},
     identity_state::SharedIdentity,
     net::{self, SharedRelay},
-    store::DataStore,
+    store::{CachedPeer, DataStore},
 };
 
 /// A trusted peer's decrypted Private collections, grouped under their `npub` for the UI.
@@ -105,6 +105,105 @@ pub async fn browse_private_collections(
         .collect())
 }
 
+/// QURATOR-160 receive side — apply one opened key grant to the granter's stored contact. This is
+/// the trust decision `open_key_grant` explicitly pushes to its caller (priv_listing.rs: "the
+/// caller MUST decide whether `inner_author` is allowed to hand it a browse key before trusting
+/// the key"), made here, once:
+///
+/// **(a) Accept a grant iff the granter is a hand-added (`ContactSource::Manual`) contact** — the
+/// SAME owner-ruled gate sealed private listings already use ([`contact_author_allowlist`], ruling
+/// 2026-07-03, INVARIANT_AUDIT §6a). A stranger's or topic-sourced (auto-added) peer's grant is
+/// refused, so nobody can push a key at us that Browse would start decrypting with unsolicited.
+/// Chosen over **(b) "only a granter we actually sent an `AccessRequest` to"**: (b) needs an
+/// ask-trace store that does not exist (QURATOR-137's send side records none — "No local ask trace
+/// yet"), i.e. new tracking infrastructure beyond this slice, and the only hole (b) would
+/// additionally close is an *unrequested* grant from a contact we deliberately hand-added — a peer
+/// we chose to trust handing us the key to browse **their own** content. The granted key lands on
+/// that granter's contact row only (never anyone else's), so the worst case of a malicious Manual
+/// contact pushing a wrong key is self-inflicted — their own listings stop decrypting until
+/// re-shared — which is not worth new infrastructure to prevent.
+///
+/// **No-downgrade (mirrors `merge_browse_key`'s absent-incoming-key rule):** an accepted grant only
+/// ever SETS `browse_key_hex` — a grant always carries a key (`open_key_grant` fails otherwise),
+/// and a refused or unopenable one never reaches this function's store write at all, so nothing
+/// here can clear an existing key. In the honest case the granted key is the granter's account
+/// browse key — the same bytes a full `hbk` share code carries — so re-applying is idempotent, and
+/// a genuinely rotated key must win (same reasoning as `merge_local_state`'s "a full code carrying
+/// a different, non-empty key must win").
+///
+/// Returns `Ok(true)` iff the contact's stored key was written. Never `Err` on refusal — an
+/// untrusted grant is expected traffic in the shared 1059 inbox, not an error.
+pub(crate) fn apply_grant_to_contact(store: &DataStore, grant: &OpenedKeyGrant) -> Result<bool, String> {
+    let allowlist = contact_author_allowlist(store);
+    if !allowlist.contains(&grant.inner_author) {
+        return Ok(false); // untrusted granter — refused BEFORE any store write
+    }
+    let npub = grant.inner_author.to_bech32().map_err(cmd_err)?;
+    let hash = CachedPeer::pubkey_hash(&npub);
+    // The allowlist was just read from the same store, so this row exists; the `None` arm only
+    // covers a contact deleted between the two reads — nothing to update, and nothing created.
+    let Some(mut peer) = store.load_contact(&hash).map_err(cmd_err)? else {
+        return Ok(false);
+    };
+    peer.browse_key_hex = Some(hex::encode(grant.browse_key));
+    store.save_contact(&hash, &peer).map_err(cmd_err)?;
+    Ok(true)
+}
+
+/// Fetch and apply pending browse-key grants (QURATOR-160 receive side — the mirror of
+/// `grant_browse_access`): pull the kind-1059 inbox, open the 31_114 grants, accept those from
+/// hand-added contacts ([`apply_grant_to_contact`]), and store each accepted key as that granter's
+/// `CachedPeer.browse_key_hex` so Browse can decrypt their listings with it. Returns the npubs
+/// whose contact row gained a key (empty = nothing pending or nothing trusted).
+///
+/// **Trigger — an on-demand command, not a poll hook.** Called when the Contacts view loads (where
+/// a browse key takes effect), mirroring `browse_private_collections`' on-demand shape. Hooking
+/// the ~15s chat DM poll was considered and rejected: it would couple grant application into the
+/// Q7 message-routing gate of `get_messages`, mutate the contact store silently on a timer, and
+/// bury a trust-relevant change inside an unrelated subsystem. Unlike the send side's deliberately
+/// manual one-click grant (a trust decision about SOMEONE ELSE), receiving is applying a key a
+/// hand-added contact already chose to send us — so no extra confirmation is asked here; the
+/// Manual-contact check IS the trust gate.
+#[tauri::command]
+pub async fn apply_key_grants(
+    identity: State<'_, SharedIdentity>,
+    store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
+) -> CmdResult<Vec<String>> {
+    let me = {
+        let guard = identity.read().await;
+        guard
+            .as_ref()
+            .map(|id| id.identity.clone())
+            .ok_or("No identity loaded. Generate a keypair first.")?
+    };
+    apply_key_grants_inner(&me, &store, &relay).await
+}
+
+/// The body of [`apply_key_grants`], callable without Tauri `State` — the same shim/`_inner` split
+/// every command here follows.
+pub(crate) async fn apply_key_grants_inner(
+    me: &hb_core::Identity,
+    store: &DataStore,
+    relay: &SharedRelay,
+) -> Result<Vec<String>, String> {
+    let allowlist = contact_author_allowlist(store);
+    if allowlist.is_empty() {
+        return Ok(vec![]); // nobody hand-added → no grant can be accepted (and nothing leaks)
+    }
+    let client = net::client(me, store, relay).await.map_err(cmd_err)?;
+    let grants =
+        fetch_key_grants(&client, me, &allowlist, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
+    let mut applied = Vec::new();
+    for g in &grants {
+        if apply_grant_to_contact(store, g)? {
+            let npub = g.inner_author.to_bech32().map_err(cmd_err)?;
+            applied.push(npub);
+        }
+    }
+    Ok(applied)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +284,95 @@ mod tests {
     fn malformed_listing_json_is_a_reasoned_err() {
         assert!(private_listing_to_collection("not json").is_err());
         assert!(private_listing_to_collection("{}").is_err(), "missing required Collection fields");
+    }
+
+    // -----------------------------------------------------------------------
+    // QURATOR-160 receive side — the trust gate + the store application.
+    // -----------------------------------------------------------------------
+
+    /// An accepted grant (hand-added granter) writes the granter's `CachedPeer.browse_key_hex` —
+    /// exactly the bytes the grant carried — and a later grant with a different key replaces it:
+    /// in the honest case both are the granter's account key (idempotent), and a genuinely rotated
+    /// key must win (`merge_local_state`'s "a different, non-empty key must win" reasoning).
+    ///
+    /// MUTATION (P-10, for the orchestrator to apply): in `apply_grant_to_contact`, delete the
+    /// `peer.browse_key_hex = Some(hex::encode(grant.browse_key));` line — the save still runs but
+    /// writes nothing new, and this reds on the `Some(hex::encode([0x5A; 32]))` assertion.
+    #[test]
+    fn an_accepted_grant_sets_the_contacts_browse_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let granter = Identity::generate();
+        let npub = granter.public_key().to_bech32().unwrap();
+        upsert_topic_contact(&store, &npub).unwrap();
+        let hash = CachedPeer::pubkey_hash(&npub);
+        let mut c = store.load_contact(&hash).unwrap().unwrap();
+        c.source = ContactSource::Manual; // the deliberate, hand-added act
+        store.save_contact(&hash, &c).unwrap();
+
+        let grant = OpenedKeyGrant {
+            browse_key: [0x5A; 32],
+            inner_author: granter.public_key(),
+            created_at: 1_700_000_000,
+        };
+        assert!(apply_grant_to_contact(&store, &grant).unwrap(), "a Manual contact's grant applies");
+        assert_eq!(
+            store.load_contact(&hash).unwrap().unwrap().browse_key_hex,
+            Some(hex::encode([0x5Au8; 32])),
+            "the stored key is the granted key, hex-encoded"
+        );
+
+        let rotated = OpenedKeyGrant { browse_key: [0x77; 32], ..grant };
+        assert!(apply_grant_to_contact(&store, &rotated).unwrap());
+        assert_eq!(
+            store.load_contact(&hash).unwrap().unwrap().browse_key_hex,
+            Some(hex::encode([0x77u8; 32])),
+            "a re-grant after key rotation wins"
+        );
+    }
+
+    /// A grant that fails the trust check NEVER touches the store: neither a topic-sourced
+    /// (auto-added, not hand-promoted) contact's key nor a stranger's is written, and no contact
+    /// row is created for the stranger. Refusal is `Ok(false)` — expected traffic, not an error.
+    ///
+    /// MUTATION (P-10): in `apply_grant_to_contact`, delete the
+    /// `if !allowlist.contains(&grant.inner_author) { return Ok(false); }` guard — the
+    /// topic-sourced grant is then applied and this reds on the `browse_key_hex` assertion.
+    #[test]
+    fn an_untrusted_grant_never_touches_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let topic_peer = Identity::generate();
+        let stranger = Identity::generate();
+        // Auto-added via a shared Topic — NOT hand-promoted, so not a valid granter (ruling
+        // 2026-07-03: joining a public Topic is not a deliberate act of trust).
+        let topic_npub = topic_peer.public_key().to_bech32().unwrap();
+        upsert_topic_contact(&store, &topic_npub).unwrap();
+        let topic_hash = CachedPeer::pubkey_hash(&topic_npub);
+
+        let from_topic = OpenedKeyGrant {
+            browse_key: [0x11; 32],
+            inner_author: topic_peer.public_key(),
+            created_at: 1,
+        };
+        let from_stranger = OpenedKeyGrant {
+            browse_key: [0x22; 32],
+            inner_author: stranger.public_key(),
+            created_at: 1,
+        };
+        assert!(!apply_grant_to_contact(&store, &from_topic).unwrap());
+        assert!(!apply_grant_to_contact(&store, &from_stranger).unwrap());
+
+        assert_eq!(
+            store.load_contact(&topic_hash).unwrap().unwrap().browse_key_hex,
+            None,
+            "a topic-sourced granter's key is never applied"
+        );
+        assert_eq!(
+            store.list_contacts().unwrap().len(),
+            1,
+            "no contact row is created for a stranger granter"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -284,6 +472,42 @@ mod tests {
             // `if !allowlist.is_empty()` — with an allowlisted contact present this test would
             // then take the Ok(vec![]) branch instead of reaching net::client, so unwrap_err()
             // would panic (no Err produced at all).
+        }
+
+        #[tokio::test]
+        async fn apply_key_grants_command_requires_a_loaded_identity() {
+            let app = guard_app(false);
+            let err = apply_key_grants(
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err, "No identity loaded. Generate a keypair first.");
+            // mutation: reword the `.ok_or("No identity loaded. Generate a keypair first.")?`
+            // literal in apply_key_grants — this assert_eq pins the exact string the frontend
+            // receives through the shim's error conversion.
+        }
+
+        #[tokio::test]
+        async fn apply_key_grants_command_returns_empty_without_a_manual_contact() {
+            let app = guard_app(true);
+            let got = apply_key_grants(
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                got.is_empty(),
+                "no Manual contact on the managed store → nothing to accept, no relay hit"
+            );
+            // mutation: change the `if allowlist.is_empty() { return Ok(vec![]); }` early return
+            // in apply_key_grants_inner to `if false { .. }` — the command would then fall
+            // through to net::client(...), which would return an Err against the dead relay
+            // instead of Ok([]) here.
         }
     }
 }

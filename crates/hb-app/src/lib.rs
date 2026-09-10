@@ -590,6 +590,8 @@ pub fn run() {
             commands::fulfil::redeem_manifest_ticket,
             // QURATOR-79 Carrier 4 — re-serve a cached copy of a peer's manifest.
             commands::private::browse_private_collections,
+            // QURATOR-160 receive side — fetch + apply pending browse-key grants.
+            commands::private::apply_key_grants,
             commands::browse::paste_key,
             commands::browse::share_code_info,
             commands::browse::follow,

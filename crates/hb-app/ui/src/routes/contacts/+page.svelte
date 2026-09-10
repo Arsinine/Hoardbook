@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { follow, refreshContact, unfollowContact, setContactTags, groupsGet, groupsCreate, groupsDelete, groupsAssign, groupsUnassign, groupsCreateWithMembers, contactUpdateGroups, browsePrivateCollections, onlineCount, relayStatus, getContacts, privateAudienceList, privateAudienceSet, type OnlineCount, type RelayHealth } from '$lib/api.js';
+	import { follow, refreshContact, unfollowContact, setContactTags, groupsGet, groupsCreate, groupsDelete, groupsAssign, groupsUnassign, groupsCreateWithMembers, contactUpdateGroups, browsePrivateCollections, applyKeyGrants, onlineCount, relayStatus, getContacts, privateAudienceList, privateAudienceSet, type OnlineCount, type RelayHealth } from '$lib/api.js';
 	import { contacts, toast, toastWithAction, contactsLoadError, loadContactsInto } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
@@ -112,6 +112,15 @@
 
 	async function loadPrivateAudience() {
 		try { privateAudience = await privateAudienceList(); } catch { /* non-fatal */ }
+	}
+
+	// QURATOR-160 receive side — pull any pending browse-key grants (a hand-added contact who
+	// granted us access via "Grant access") into that contact's stored row, so Browse can decrypt
+	// their listings with it. On-demand here (where a browse key takes effect), mirroring the
+	// browsePrivateCollections load above — not a poll hook. Non-fatal: relays may be unreachable,
+	// and an unapplied grant simply retries on the next visit.
+	async function loadKeyGrants() {
+		try { await applyKeyGrants(); } catch { /* non-fatal — retried on the next load */ }
 	}
 
 	// Toggle whether a contact receives Private collections (M21 W5). Idempotent on the backend;
@@ -688,6 +697,7 @@
 		loadGroups();
 		loadPrivate();
 		loadPrivateAudience();
+		loadKeyGrants();
 		refreshOnline();
 		onlinePollTimer = setInterval(refreshOnline, ONLINE_POLL_VISIBLE_MS);
 		// Refresh contacts on page load, but bounded: skip freshly-refreshed contacts and cap how many

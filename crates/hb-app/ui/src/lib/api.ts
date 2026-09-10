@@ -161,6 +161,10 @@ export const updateCollectionVisibility = (slug: string, visibility: Visibility)
 export const browsePrivateCollections = () =>
 	invoke<PrivatePeerCollections[]>('browse_private_collections');
 
+/** QURATOR-160 receive side — fetch pending browse-key grants sealed to me, apply those from
+ *  hand-added contacts to their stored contact row, and return the npubs that gained a key. */
+export const applyKeyGrants = () => invoke<string[]>('apply_key_grants');
+
 export const exportCollection = (slug: string, format: 'text' | 'markdown') =>
 	invoke<string>('export_collection', { slug, format });
 
