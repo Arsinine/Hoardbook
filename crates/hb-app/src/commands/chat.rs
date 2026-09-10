@@ -1291,6 +1291,93 @@ pub(crate) async fn send_access_request_inner(
 }
 
 
+/// QURATOR-160 send side — build the browse-key grant wraps (pure, no I/O). A thin delegate to
+/// hb-core's `seal_key_grant`, same one-source discipline as `build_access_request_content`: the
+/// wire shape has ONE producer, so the receive side (QURATOR-160's follow-up) can pin against this
+/// seam without a relay. Returns exactly one event for the one recipient this command serves.
+pub(crate) fn build_key_grant(
+    author: &hb_core::Identity,
+    recipient: &PublicKey,
+    browse_key: &hb_core::BrowseKey,
+    now: u64,
+) -> Result<Vec<Event>, String> {
+    hb_core::priv_listing::seal_key_grant(author, std::slice::from_ref(recipient), browse_key, now)
+        .map_err(cmd_err)
+}
+
+/// QURATOR-160 send side — DM-less answer to a recognised `AccessRequest`: seal this node's account
+/// browse key to the asker and publish it, one click ("Grant access" beside the recognised request in
+/// the chat thread). The wire shape (what the RECEIVE-side task must build against) is exactly what
+/// `hb_core::priv_listing::seal_key_grant` emits, already frozen — this command changes NO wire
+/// shape, it only calls it and publishes the output:
+///
+/// - **Outer**: a NIP-59 gift wrap (kind 1059) signed by a fresh ephemeral key, `p`-tagged to the
+///   asker — published via `hb_net::publish_private_listing` (the same multi-relay publish private
+///   listings use; error only on all-relay reject, never a silent drop).
+/// - **Sealed inner rumor**: kind 31_114 (`hb_core::priv_listing::KIND_KEY_GRANT`); the Schnorr-
+///   verified seal author is OUR npub (`open_key_grant` returns it as `inner_author`).
+/// - **Content**: the browse key rides ONLY the per-recipient ECDH NIP-44 wrap (`CekWrap` shape);
+///   `PrivContent.body` is empty. The receiver opens it with
+///   `hb_core::priv_listing::open_key_grant(&me, &wrap)` → `OpenedKeyGrant { browse_key,
+///   inner_author, created_at }` and MUST apply its own trust check on `inner_author`.
+///
+/// The browse key is OUR OWN account key from `AppIdentity::browse_key` (the same source
+/// `publish_collection`/teasers seal with) — no new derivation.
+///
+/// **One click, not automatic — deliberate.** A silent no-human-step auto-grant would need body
+/// recognition inside the Rust DM-merge path (today recognition is client-side only,
+/// `parseAccessRequest` in `request-inbox.ts`) plus auto-minted crypto grants; that trust decision
+/// is out of this slice. The one-click shape mirrors the standing "Share my code" precedent.
+///
+/// **Blocked askers never reach the button.** `route_dm` (above) drops a blocked peer's DM before
+/// any body parsing or cache/request write, so a blocked asker's `AccessRequest` never renders in
+/// any thread — the only trigger for this command is a visible, recognised request from a peer
+/// whose DM routed to Inbox. No new block check is needed here (Q7: blocked supersedes everything).
+///
+/// Mirrors `send_access_request`: `parse_recipient` on the asker; the `is_self_send` refusal before
+/// any network I/O; the QURATOR-164 ask throttle after every pre-send failure path; and the same
+/// `net::client` over `net::relay_urls`/`net::RELAY_TIMEOUT` (via `publish_private_listing`).
+#[tauri::command]
+pub async fn grant_browse_access(
+    npub: String,
+    identity: State<'_, SharedIdentity>,
+    store: State<'_, DataStore>,
+    relay: State<'_, SharedRelay>,
+) -> CmdResult<()> {
+    let (id_clone, browse_key) = {
+        let guard = identity.read().await;
+        let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
+        (id.identity.clone(), *id.browse_key.bytes())
+    };
+    grant_browse_access_inner(&npub, &id_clone, &browse_key, &store, &relay).await
+}
+
+/// The body of [`grant_browse_access`], callable without Tauri `State` — the same shim/`_inner`
+/// split every command here follows.
+pub(crate) async fn grant_browse_access_inner(
+    npub: &str,
+    id_clone: &hb_core::Identity,
+    browse_key: &hb_core::BrowseKey,
+    store: &DataStore,
+    relay: &SharedRelay,
+) -> Result<(), String> {
+    let recipient = parse_recipient(npub)?;
+    if is_self_send(&recipient, &id_clone.public_key()) {
+        return Err("You can't grant access to yourself.".into());
+    }
+    // Seal before any client build (same position as `build_access_request_content`): every
+    // failure above costs no network resources. Exactly one wrap for the one recipient.
+    let wraps = build_key_grant(id_clone, &recipient, browse_key, now_secs())?;
+    let client = net::client(id_clone, store, relay).await.map_err(cmd_err)?;
+    // Same placement as `send_access_request_inner`: after every pre-send failure path, before
+    // the publish — only a grant that actually reaches the relay consumes a slot.
+    crate::ask_throttle::acquire().await;
+    // NOT `send_dm_inner`: its output is already a fully-formed gift-wrapped Event, published
+    // directly (the `publish_private_listing` pattern), not plain content needing a fresh wrap.
+    hb_net::publish_private_listing(&client, &wraps).await.map_err(cmd_err)?;
+    Ok(())
+}
+
 /// Fetch + decrypt the NIP-17 inbox: contacts' messages only (Q7 — a stranger's DM never reaches the
 /// main inbox at all). As a side effect, persists any newly-seen stranger messages into the quarantined
 /// Request store (`dm_requests`); `allow_dms=false` preserves the stricter drop-everything behaviour.
@@ -1901,6 +1988,64 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, "You can't request access from yourself.");
+    }
+
+    /// QURATOR-160 send side — the grant the "Grant access" affordance sends IS the frozen 31_114
+    /// wire shape, through the PRODUCTION builder (`build_key_grant`, the no-I/O half of
+    /// `grant_browse_access_inner`): exactly one wrap for the one recipient, outer kind 1059 under
+    /// an ephemeral author, sealed inner rumor kind `KIND_KEY_GRANT` (31_114), the asker recovers
+    /// exactly OUR browse key with the granter as `inner_author`, and a non-recipient cannot open
+    /// it. This is the seam the receive-side task builds against — the wire shape is hb-core's,
+    /// already frozen; this pins that the command actually emits it.
+    ///
+    /// MUTATION (P-10, applied by the orchestrator — this lane compiles nothing): in
+    /// `build_key_grant`, change the `browse_key` argument passed to `seal_key_grant` from
+    /// `browse_key` to `&[0u8; 32]` — this test reds on the `opened.browse_key == key` assertion
+    /// while still compiling.
+    #[tokio::test]
+    async fn key_grant_round_trips_through_the_production_builder() {
+        let me = Identity::generate();
+        let asker = Identity::generate();
+        let key: hb_core::BrowseKey = [0x5A; 32];
+        let wraps = build_key_grant(&me, &asker.public_key(), &key, 1_700_000_000).unwrap();
+        assert_eq!(wraps.len(), 1, "one recipient — exactly one wrap");
+        let wrap = &wraps[0];
+        assert_eq!(wrap.kind, Kind::GiftWrap, "grant rides a kind-1059 gift wrap");
+        assert_ne!(wrap.pubkey, me.public_key(), "outer author is ephemeral, never the granter");
+        // The inner kind is pinned directly (not only via open_key_grant's internal check) —
+        // mirrors `send_dm_inner_inner_rumor_is_kind_14`'s discipline.
+        let unwrapped = nostr::nips::nip59::extract_rumor(asker.keys(), wrap).await.unwrap();
+        assert_eq!(
+            unwrapped.rumor.kind.as_u16(),
+            hb_core::priv_listing::KIND_KEY_GRANT,
+            "inner rumor must be kind 31_114 (key grant)"
+        );
+        assert_eq!(unwrapped.sender, me.public_key(), "seal sender is the real granter npub");
+        let opened = hb_core::priv_listing::open_key_grant(&asker, wrap).unwrap();
+        assert_eq!(opened.browse_key, key, "the asker recovers exactly the granted browse key");
+        assert_eq!(opened.inner_author, me.public_key(), "inner_author is the granter");
+        // A non-recipient (even the granter themself) cannot open a wrap sealed to someone else.
+        assert!(hb_core::priv_listing::open_key_grant(&me, wrap).is_err());
+    }
+
+    /// QURATOR-160 send side — devtest #14's rule for every send path: a self-send is refused
+    /// BEFORE any network I/O (no relay client is built, nothing leaves the node).
+    ///
+    /// MUTATION (P-10, applied by the orchestrator — this lane compiles nothing): in
+    /// `grant_browse_access_inner`, change the refusal string "You can't grant access to
+    /// yourself." to anything else — this test reds on the exact-message assertion while still
+    /// compiling.
+    #[tokio::test]
+    async fn grant_browse_access_refuses_a_self_send() {
+        let me = Identity::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let relay = crate::net::new_shared();
+        let err =
+            grant_browse_access_inner(&npub_of(&me.public_key()), &me, &[1u8; 32], &store, &relay)
+                .await
+                .unwrap_err();
+        assert_eq!(err, "You can't grant access to yourself.");
     }
 
     #[tokio::test]

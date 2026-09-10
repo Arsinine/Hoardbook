@@ -9,6 +9,7 @@
 		getMessages,
 		sendMessage,
 		sendAccessRequest,
+		grantBrowseAccess,
 		pasteKey,
 		follow,
 		validateShareCode,
@@ -50,7 +51,7 @@
 	import { renderFingerprint } from '$lib/identity-display.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
 	import { importToast } from '$lib/manifest-provenance.js';
-	import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER, manifestRequestHint, parseManifestRequest, accessRequestHint } from '$lib/request-inbox.js';
+	import { requestBadge, sortRequests, requestPreview, canReply, REQUEST_EXPLAINER, manifestRequestHint, parseManifestRequest, accessRequestHint, parseAccessRequest } from '$lib/request-inbox.js';
 	// M17 W7.1b: the manifest-request fulfilment card. The capability (`export_manifest`) is fully
 	// wired on Home; this is its second entry point — surfaced where the request lands. The card's
 	// state is derived PURELY (zero network on render); the export Tauri call fires only on click.
@@ -847,6 +848,26 @@
 		}
 	}
 
+	// QURATOR-160 send side: the one-click ANSWER to a recognised access request. One deliberate
+	// press (same no-auto-send rule as handleSendAccessRequest — a silent auto-grant is a bigger
+	// trust decision than this slice makes), calling the dedicated `grant_browse_access` Tauri
+	// command: the browse key is read from our own identity server-side and leaves ONLY inside a
+	// per-recipient ECDH gift wrap (INV-2 — never unsealed on the wire). The grant target is bound
+	// to the MESSAGE's sender (`fromNpub`), never to whoever is selected when the click lands.
+	let grantingAccess = $state('');
+	async function handleGrantAccess(fromNpub: string) {
+		if (!fromNpub || grantingAccess) return;
+		grantingAccess = fromNpub;
+		try {
+			await grantBrowseAccess(fromNpub);
+			toast('Browse-key grant sent.', 'success');
+		} catch (e) {
+			toast(String(e), 'error');
+		} finally {
+			grantingAccess = '';
+		}
+	}
+
 	// M17 W4: "Share my code" grant leg. Fetches the LOCAL get_share_code (no network) and splices the
 	// hbk1… string into the draft at the cursor via the pure helper. Does NOT send — insert-then-send
 	// is already two deliberate acts, so there is no confirm modal (owner may override; we ship the
@@ -1510,6 +1531,24 @@
 								<div class="bubble" class:bubble-sent={isMe} class:bubble-recv={!isMe}>
 									<p class="bubble-text">{manifestRequestHint(msg.content) ?? accessRequestHint(msg.content) ?? transportTicketHint(msg.content) ?? msg.content}</p>
 									<span class="bubble-time">{formatTime(msg.sent_at)}</span>
+									{#if !isMe && parseAccessRequest(msg.content)}
+										<!-- QURATOR-160 send side: the one-click answer to a RECOGNISED access
+										     request — seals our browse key to exactly this message's sender and
+										     publishes it as a gift-wrapped 31_114 grant (see handleGrantAccess).
+										     One deliberate press, mirroring "Share my code"; the quarantined
+										     Request view deliberately gets NO such button (M17 W3 hard
+										     constraint: Accept comes first, always). A blocked asker's DM never
+										     reaches this thread at all (route_dm drops it pre-parse). -->
+										<button
+											type="button"
+											class="btn-default btn-sm"
+											onclick={() => handleGrantAccess(msg.from)}
+											disabled={grantingAccess === msg.from}
+											title="Send this peer your browse key as a sealed, gift-wrapped grant they can open"
+										>
+											{grantingAccess === msg.from ? '…' : 'Grant access'}
+										</button>
+									{/if}
 									{#if detectedFor(messageKey(msg))}
 										{@const card = detectedFor(messageKey(msg))!}
 										<!-- M17 W3: the card is an ADDENDUM below the verbatim message text (never a

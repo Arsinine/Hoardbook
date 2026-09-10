@@ -461,6 +461,13 @@ export const requestManifestFrom = (
 export const sendAccessRequest = (npub: string) =>
 	invoke<void>('send_access_request', { npub });
 
+/** QURATOR-160 send side — answer `npub`'s recognised access request with a sealed browse-key grant:
+ *  a gift-wrapped (kind 1059) kind-31_114 event whose per-recipient ECDH wrap carries OUR account
+ *  browse key (never unsealed on the wire — INV-2). One click ("Grant access"), never automatic;
+ *  the browse key is read from our own session identity server-side, never supplied here. */
+export const grantBrowseAccess = (npub: string) =>
+	invoke<void>('grant_browse_access', { npub });
+
 /** M17 W7.1a — the persisted ask-trace map (npub|slug → {fingerprint_seen, sent_at}), so the Browse
  *  paywall can read back the asked-state across restarts. Pure local read, no relay I/O. The ask is
  *  recorded INSIDE `request_manifest` after `send_dm_inner` resolves — a failed publish leaves no trace. */
