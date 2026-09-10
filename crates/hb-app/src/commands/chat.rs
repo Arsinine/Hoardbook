@@ -462,6 +462,30 @@ pub(crate) async fn merge_wraps_into_cache(
                 seen.insert(wrap_id.clone());
                 cache.seen_wraps.push(wrap_id.clone());
                 changed = true;
+
+                // QURATOR-187 — dispatch on the INNER kind before treating this as chat. The
+                // inbox filter (`dm_inbox_filter`) fetches on the outer kind 1059 alone, so a
+                // successfully-unwrapped rumor here is not necessarily a chat message: kind-31_113
+                // private listings (`hb_core::KIND_PRIV_LISTING`, published by
+                // `publish_private_listing` into this very p-tagged inbox) and kind-31_114 key
+                // grants ride the identical outer-envelope shape. Only kind 14 is chat; anything
+                // else must never be rendered as a chat bubble nor handed to the message
+                // parse/classify path.
+                //
+                // `seen_wraps` decision — RECORD-BUT-SKIP: the non-chat wrap's id IS recorded in
+                // the success ledger above. That is safe because the correct consumer of a
+                // 31_113 wrap, `hb_net::fetch_private_listings`, shares NO state with this
+                // ledger — it re-fetches the whole 1059 inbox fresh on every call and dedups by
+                // inner `(author, slug)` content (`dedup_newest`), never by wrap id, so nothing
+                // recorded here can hide a listing from the Private tab. The alternative (not
+                // recording) would make this ~15 s poller re-run the full unwrap (Schnorr
+                // verification + ECDH + AES-GCM) on every skipped wrap for as long as it sits in
+                // the 48 h `since` fetch window — exactly the redundant-decrypt cost the
+                // failed-wrap negative cache exists to avoid (audit #11).
+                if dm.kind != Kind::PrivateDirectMessage {
+                    continue;
+                }
+
                 let from = npub_of(&dm.sender);
                 let sent_at = rfc3339_of(dm.created_at);
                 match route_dm(&from, own_npub, ctx) {
@@ -2054,6 +2078,70 @@ mod tests {
         assert!(!changed2, "an all-seen re-poll leaves the cache untouched (no needless re-seal/write)");
         assert_eq!(cache.messages.len(), 1, "no duplicate cache entry on re-poll");
         assert_eq!(cache.seen_wraps.len(), 2, "seen ledger unchanged");
+    }
+
+    #[tokio::test]
+    async fn non_chat_wrap_is_skipped_not_rendered_but_ledgered() {
+        // QURATOR-187: `seal_private_listing` gift-wraps a kind-31_113 rumor into the recipient's
+        // p-tagged 1059 inbox — outer shape identical to a chat DM, and it unwraps "successfully"
+        // (the seal is well-formed NIP-59). The chat merge must NOT render it as a message nor
+        // route it as a request, and (record-but-skip decision — see the comment at the guard in
+        // `merge_wraps_into_cache`) its id IS recorded in `seen_wraps` so the poller never
+        // re-unwraps it; `fetch_private_listings` still sees it via its own stateless fetch.
+        //
+        // MUTATION (P-10, orchestrator applies): in `merge_wraps_into_cache`, delete the
+        // `if dm.kind != Kind::PrivateDirectMessage { continue; }` guard so every successful
+        // unwrap falls through to the chat path — this test must then FAIL with
+        // `messages.len() == 2` (the listing renders as a junk chat bubble).
+        let me = Identity::generate();
+        let contact = Identity::generate();
+        let chat_wrap = build_dm(&contact, &me.public_key(), "hello").await.unwrap();
+        let listing = hb_core::seal_private_listing(
+            &contact,
+            &[me.public_key()],
+            r#"{"slug":"vault","entries":[]}"#,
+            now_secs(),
+        )
+        .unwrap();
+        let listing_id = listing[0].id.to_hex();
+        let contacts: HashSet<String> = [contact.npub()].into_iter().collect();
+        let empty: HashSet<String> = HashSet::new();
+        let ctxv = ctx(&contacts, &empty, &empty, true);
+        let now = now_secs();
+        let mut cache = DmCache::default();
+
+        let (requests, changed) = merge_wraps_into_cache(
+            &me,
+            &me.npub(),
+            vec![chat_wrap.clone(), listing[0].clone()],
+            &ctxv,
+            &mut cache,
+            now,
+        )
+        .await;
+        assert!(changed, "the batch dirtied the cache (both wraps were ledgered)");
+        assert_eq!(cache.messages.len(), 1, "only the kind-14 chat DM is rendered as a message");
+        assert_eq!(cache.messages[0].content, "hello");
+        assert_eq!(cache.messages[0].from, contact.npub());
+        assert!(requests.is_empty(), "the private-listing wrap never becomes a chat request");
+        assert_eq!(cache.seen_wraps.len(), 2, "record-but-skip: BOTH ids land in the success ledger");
+        assert!(
+            cache.seen_wraps.iter().any(|id| id == &listing_id),
+            "the non-chat wrap's id is ledgered, so the poll never re-unwraps it"
+        );
+
+        // Re-poll with the same wraps: nothing re-rendered, nothing re-decoded — the ledger holds.
+        let (requests2, changed2) = merge_wraps_into_cache(
+            &me,
+            &me.npub(),
+            vec![chat_wrap, listing[0].clone()],
+            &ctxv,
+            &mut cache,
+            now,
+        )
+        .await;
+        assert!(requests2.is_empty() && !changed2, "an all-seen re-poll is a no-op");
+        assert_eq!(cache.messages.len(), 1, "still exactly one chat message after a re-poll");
     }
 
     #[tokio::test]
