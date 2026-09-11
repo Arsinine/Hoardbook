@@ -156,7 +156,7 @@ async fn ab8(ctx: &Ctx) -> Result<()> {
 
     // (4) A REPLAYED stale presence reads offline, not online.
     let stale = build_binding(&a, now - 20 * 60, 30 * 60)?;
-    ensure!(!is_online(stale.created_at.as_u64(), now), "replayed stale presence read as online");
+    ensure!(!is_online(stale.created_at.as_secs(), now), "replayed stale presence read as online");
 
     // (2) A WITHHELD event is still found via another relay (multi-relay only).
     if ctx.multi() {

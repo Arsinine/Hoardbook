@@ -439,7 +439,7 @@ async fn c3_disjoint_relays(probe: &ProbeInput) -> Result<(), String> {
 // Drives the production fns directly: `dm_inbox_filter`, `merge_wraps_into_cache`, the cache
 // load/save path (`DataStore::load_dm_cache` / `save_dm_cache`), and the classify ctx
 // (`route_dm`). The clamp is in `merge_wraps_into_cache` (`cache.newest_seen_outer > now` ⇒ heal to
-// `now`; and `wrap.created_at.as_u64().min(now)` per wrap).
+// `now`; and `wrap.created_at.as_secs().min(now)` per wrap).
 //
 // Shape: probe-plays-both.
 // ---------------------------------------------------------------------------
@@ -464,14 +464,14 @@ async fn c4_cursor_discipline(probe: &ProbeInput) -> Result<(), String> {
 
     // Craft a future-dated gift wrap. NOTE: the VPS strfry rejects a published future-dated wrap
     // ("invalid: created_at too late" — the relay defends at the write boundary, a recorded finding).
-    // The production client-side clamp (`merge_wraps_into_cache`: `wrap.created_at.as_u64().min(now)`
+    // The production client-side clamp (`merge_wraps_into_cache`: `wrap.created_at.as_secs().min(now)`
     // + `cache.newest_seen_outer > now ⇒ heal`) is the defense that MUST hold regardless of what a
     // relay serves — so we INJECT the future wrap directly into the merge batch (simulating a relay
     // that DID serve one), not publish it. This is the correct unit of the assertion: the CLIENT
     // clamps, independent of relay policy.
     let body_future = format!("wan-c-c4-future-{token}");
     let future_wrap = craft_future_dated_wrap(&alice, &bob.public_key(), &body_future).await?;
-    let future_ts = future_wrap.created_at.as_u64();
+    let future_ts = future_wrap.created_at.as_secs();
     eprintln!(
         "   C4 crafted future-dated wrap (outer created_at={future_ts}, ~1yr ahead) — injected into the merge batch (VPS strfry rejects a publish of it)"
     );

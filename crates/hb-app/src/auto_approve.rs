@@ -492,7 +492,7 @@ pub(crate) async fn run_auto_approve_loop(
         // Advance the cursor (clamped to now, never backwards) BEFORE any processing: even if
         // every wrap below fails to decode, they have been fetched and are covered by the dedup
         // set, so the next poll must not re-download them.
-        let batch_newest = wraps.iter().map(|w| w.created_at.as_u64()).max().unwrap_or(0);
+        let batch_newest = wraps.iter().map(|w| w.created_at.as_secs()).max().unwrap_or(0);
         newest_seen_outer = newest_seen_outer.max(batch_newest.min(now_outer));
 
         // Decode with no contact filter — there is no filter left to apply. A wrap not addressed to

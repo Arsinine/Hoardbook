@@ -98,7 +98,7 @@ async fn verify_peer_online(client: &RelayClient, peer: &Identity) -> Result<()>
         .fetch(Filter::new().author(peer.public_key()).kind(Kind::from_u16(KIND_PRESENCE)), FETCH_TIMEOUT)
         .await?;
     let newest = select_newest_by_created_at(events).ok_or_else(|| anyhow::anyhow!("no presence for peer"))?;
-    ensure!(is_online(newest.created_at.as_u64(), now()), "peer's presence is not within the online window");
+    ensure!(is_online(newest.created_at.as_secs(), now()), "peer's presence is not within the online window");
     verify_binding(&newest, &peer.public_key(), now()).map_err(|e| anyhow::anyhow!("verify_binding failed: {e}"))?;
     Ok(())
 }

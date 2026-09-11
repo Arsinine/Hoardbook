@@ -714,8 +714,17 @@ jobs:
       - name: F2 count-tally wall-clock budget
         run: cargo test -p hb-core --locked count_tally_over_500_events_is_under_budget_f2
 
-  # Supply-chain scanners — added by audit I-4. NON-BLOCKING (every scanner step carries
-  # continue-on-error) until the baseline is triaged, then flip. Policy lives in deny.toml.
+  # Supply-chain scanners — added by audit I-4. Policy lives in deny.toml.
+  #
+  # `cargo audit` is BLOCKING as of QURATOR-128 step 4 (2026-09-11): the nostr 0.44.8 bump cleared
+  # every RustSec vulnerability, so a red here is a NEW advisory, not the accepted baseline.
+  #
+  # `cargo deny` and `npm audit` remain NON-BLOCKING (continue-on-error). cargo deny errors on
+  # `unmaintained` for nine crates (nostr-relay-pool RUSTSEC-2026-0243, instant, paste,
+  # proc-macro-error, unic-char-property, unic-char-range, unic-common, unic-ucd-ident,
+  # unic-ucd-version) — none has a patched release, and the owner ruled an allowlist out. Flip it
+  # when those move upstream. A green tick on those two steps means "the scanner ran", not
+  # "it passed" — read the raw log.
   supply-chain:
     name: supply chain (cargo-audit + cargo-deny + npm audit)
     runs-on: ubuntu-latest
@@ -734,7 +743,6 @@ jobs:
           tool: cargo-audit,cargo-deny
 
       - name: cargo audit (RustSec advisories over Cargo.lock)
-        continue-on-error: true
         run: cargo audit
 
       - name: cargo deny (advisories + bans + sources)

@@ -81,7 +81,7 @@ pub fn fresh_presence(events: &[Event], now: u64, window_secs: u64) -> HashMap<P
         if is_canary(ev) {
             continue; // F-canary: synthetic presence never counts
         }
-        let created = ev.created_at.as_u64();
+        let created = ev.created_at.as_secs();
         if created < floor || created > ceiling {
             continue; // stale → offline; future-dated beyond skew → don't trust the relay's clock
         }
