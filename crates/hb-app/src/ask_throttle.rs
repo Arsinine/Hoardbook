@@ -18,7 +18,10 @@
 //!    (`redeem_manifest_ticket_with_progress` in `commands/fulfil.rs`) — the ruling's own wording —
 //!    AND, since QURATOR-184, the SERVE-side ticket DMs (`send_full_list_inner` /
 //!    `send_cached_manifest_inner` in `commands/fulfil.rs`): a node answering a replayed backlog
-//!    of asks was an unpaced relay burst. `send_message` and every other chat path never touch
+//!    of asks was an unpaced relay burst. AND, since the owner ruling of 2026-09-11
+//!    (QURATOR-191), the ACCESS-REQUEST and KEY-GRANT sends (`send_access_request_inner` /
+//!    `grant_browse_access_inner` in `commands/chat.rs`) — one-shot outbound relay writes in the
+//!    ask family. `send_message` and every other chat path never touch
 //!    this module. Pinned by `chat_and_dm_paths_are_not_throttled`,
 //!    `the_fetch_request_path_takes_a_slot_before_dialing`, and
 //!    `serve_side_ticket_dms_take_a_slot_before_the_relay_write`.
@@ -190,10 +193,12 @@ mod tests {
     }
 
     /// **The scope fence** — chat/DM is NOT throttled (owner ruling 2026-09-04: 1/sec would make
-    /// chat feel broken). The ONLY call sites of the limiter in the whole of `chat.rs` are the two
-    /// manifest-ask commands; `send_message` and every other DM path must have none. A count of
-    /// exactly 2 plus containment in the two named regions covers every other function in the file
-    /// at once — an acquire smuggled into ANY path (not just `send_message`) breaks the count.
+    /// chat feel broken). The ONLY call sites of the limiter in the whole of `chat.rs` are the
+    /// four ask-family commands — the two manifest asks plus, since the owner ruling of
+    /// 2026-09-11 (QURATOR-191), the access request and the one-click browse-key grant;
+    /// `send_message` and every other DM path must have none. A count of exactly 4 plus
+    /// containment in the four named regions covers every other function in the file at once —
+    /// an acquire smuggled into ANY path (not just `send_message`) breaks the count.
     ///
     /// Region resolution is by containing function (`fn_region` slices from the real signature to
     /// the next line-start signature), never by bare text: this file's own assertion literals echo
@@ -201,10 +206,12 @@ mod tests {
     ///
     /// MUTATION (P-10) — two anchors, both in `commands/chat.rs`:
     /// 1. **Over-apply**: inside `send_message` (or any other DM path in `chat.rs`), insert
-    ///    `crate::ask_throttle::acquire().await;` → the count assert reds (3 ≠ 2), and the
+    ///    `crate::ask_throttle::acquire().await;` → the count assert reds (5 ≠ 4), and the
     ///    `send_message` region assert reds.
-    /// 2. **Under-apply**: delete the acquire from `request_manifest` or `request_manifest_from_inner`
-    ///    → the count assert reds (1 ≠ 2) and that command's region assert reds (0 ≠ 1).
+    /// 2. **Under-apply**: delete the acquire from `request_manifest_inner`,
+    ///    `request_manifest_from_inner`, `send_access_request_inner`, or
+    ///    `grant_browse_access_inner` → the count assert reds (3 ≠ 4) and that command's region
+    ///    assert reds (0 ≠ 1).
     #[test]
     fn chat_and_dm_paths_are_not_throttled() {
         let src = include_str!("commands/chat.rs");
@@ -216,8 +223,10 @@ mod tests {
             .join("\n");
         assert_eq!(
             code.matches("crate::ask_throttle::acquire").count(),
-            2,
-            "exactly the two ask commands may take the throttle — no other path in chat.rs"
+            4,
+            "exactly four ask-family paths may take the throttle — request_manifest_inner, \
+             request_manifest_from_inner, send_access_request_inner, grant_browse_access_inner; \
+             no other path in chat.rs"
         );
         // Both ask bodies live in their `_inner` now (QURATOR-164 item 3 extracted them so the
         // background fetch driver calls production instead of hand-rolling). The guard follows
@@ -236,6 +245,22 @@ mod tests {
             rmf.matches("crate::ask_throttle::acquire").count(),
             1,
             "the carrier-4 ask must go through the shared limiter exactly once"
+        );
+        // Widened from 2 to 4 by owner ruling 2026-09-11 (QURATOR-191): the access request
+        // (QURATOR-137 slice 2, commit 414fcef) and the one-click browse-key grant
+        // (QURATOR-160 send side, commit 5019fcc) are ask-family one-shot relay writes and join
+        // the two manifest asks in the same 1/sec budget. Same shim/`_inner` split as above.
+        let sar = fn_region(&code, "pub(crate) async fn send_access_request_inner(");
+        assert_eq!(
+            sar.matches("crate::ask_throttle::acquire").count(),
+            1,
+            "the access request must go through the shared limiter exactly once"
+        );
+        let gba = fn_region(&code, "pub(crate) async fn grant_browse_access_inner(");
+        assert_eq!(
+            gba.matches("crate::ask_throttle::acquire").count(),
+            1,
+            "the browse-key grant must go through the shared limiter exactly once"
         );
         assert_eq!(
             fn_region(&code, "pub async fn send_message(")
