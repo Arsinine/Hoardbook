@@ -80,6 +80,15 @@
 	let painted = $state(false);
 	let painting = $state(false);
 	let paintError = $state(false);
+	// QURATOR-193 — the COLD-paint hold. A cold open (empty `topicDirectoryCache`) used to paint
+	// the tree in PAINT order, then visibly re-order it (and lose rows) as the rank/aliveness fold
+	// landed — the flicker. While `coldPaintPending` is true the tree renders but stays
+	// `visibility: hidden`; it lifts when the paint-path rank pass SETTLES — via `.finally`, never
+	// a success-only path, because the rank catch is best-effort by design and a rank failure must
+	// not strand the directory hidden. The CACHED paint (QURATOR-145 W3) never sets this: the
+	// last-known-good tree paints INSTANTLY by owner ruling ("cold paint only") — only the
+	// no-cache path may be held.
+	let coldPaintPending = $state(false);
 	// QURATOR-83, carried into W2: a fetch already IN FLIGHT when a Topic is created would resolve
 	// afterwards and cache its PRE-PUBLISH result, hiding the user's own new Topic until restart.
 	// Bumped on every public create; a resolving paint applies its result only if its generation
@@ -215,6 +224,11 @@
 		const cached = get(topicDirectoryCache);
 		if (cached.length > 0) {
 			directory = cached;
+		} else {
+			// No last-known-good tree: this is a COLD paint — hold the reveal until the drawn rows
+			// are ranked (see `coldPaintPending` above). The empty/error surfaces render OUTSIDE
+			// the held wrapper, so "Nothing here yet" and the retryable paint error still show.
+			coldPaintPending = true;
 		}
 		void loadMine();
 		void paintDirectory();
@@ -364,7 +378,14 @@
 				// is protected from it.
 				if (uniq.length > 0) topicDirectoryCache.set(uniq);
 				rankGeneration += 1;
-				void rankDrawnRows(rankGeneration);
+				// QURATOR-193: the cold-paint hold lifts when THIS pass settles. `.finally`, not a
+				// success-only path — a rank failure (the best-effort catch inside rankDrawnRows)
+				// must reveal too, and an early return (nothing drawn to rank) reveals at once. The
+				// cached paint also passes through here, but it never set the hold, so this is a
+				// no-op clear for it.
+				void rankDrawnRows(rankGeneration).finally(() => {
+					coldPaintPending = false;
+				});
 			}
 		} catch (e) {
 			// QURATOR-80, one-tree form: a failed paint is a retryable error, NEVER the confident
@@ -376,6 +397,10 @@
 			// error branch when the tree is EMPTY (the template's `mergedRows.length === 0`
 			// guard), so a populated screen never swaps itself for the error surface either.
 			paintError = true;
+			// QURATOR-193: a failed paint lifts the cold hold itself — no rank pass will ever settle
+			// for this paint, and the retryable error surface (plus any joined rows still on screen)
+			// must be reachable, not stranded behind the hold.
+			coldPaintPending = false;
 			toast(String(e), 'error');
 		} finally {
 			painting = false;
@@ -948,6 +973,9 @@
 					<EmptyState message="Nothing here yet. Create a Topic, or join one from the directory." />
 				{/if}
 			{:else}
+				<!-- QURATOR-193 — the cold-paint hold rides HERE, not on .list-pane: the empty and
+				     error surfaces above/below must stay reachable while the tree is withheld. -->
+				<div class="directory-tree" class:cold-hold={coldPaintPending}>
 				{#each groups as g (g.root)}
 					{@const rows = rowsForRoot(g.root)}
 					{@const hasMatches = rows.length > 0}
@@ -1001,6 +1029,7 @@
 						</div>
 					{/if}
 				{/each}
+				</div>
 				{#if groups.length === 0}
 					<!-- A filter that matches nothing: an honest empty, not an error. -->
 					<EmptyState message="No Topics match that path." />
@@ -1262,6 +1291,12 @@
 		width: 280px; flex-shrink: 0; overflow-y: auto; padding: 6px;
 		border-right: 1px solid var(--border);
 	}
+	/* QURATOR-193 — the cold-paint hold: the tree occupies its space but paints nothing until the
+	   drawn rows' ranks have folded in, so a cold open never visibly re-orders the directory.
+	   `visibility` (not `display: none`) keeps the layout stable across the reveal and keeps the
+	   rows in the accessibility tree's DOM flow for tests; the hold is CSS-only by design so a
+	   jsdom run can assert the class without computing layout. */
+	.directory-tree.cold-hold { visibility: hidden; }
 	.topic-row {
 		display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
 		padding: 9px 10px; background: transparent; border: none; border-radius: 7px; cursor: pointer; color: inherit;
