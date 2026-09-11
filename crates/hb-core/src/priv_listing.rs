@@ -276,7 +276,7 @@ pub fn open_private_listing(me: &Identity, wrap: &Event) -> Result<OpenedPrivate
     // (8) Decrypt the body under the CEK at its declared version.
     let listing_json = decrypt_with_cek(&cek, cek_wrap.kdf_v, &parsed.body)?;
 
-    Ok(OpenedPrivate { listing_json, inner_author, created_at: rumor.created_at.as_u64() })
+    Ok(OpenedPrivate { listing_json, inner_author, created_at: rumor.created_at.as_secs() })
 }
 
 /// Seal a **browse-key grant** to each recipient (QURATOR-160 slice 1) — the key delivered exactly
@@ -368,7 +368,7 @@ pub fn open_key_grant(me: &Identity, wrap: &Event) -> Result<OpenedKeyGrant, HbE
         .try_into()
         .map_err(|_| HbError::InvalidEncryptedMessage)?;
 
-    Ok(OpenedKeyGrant { browse_key, inner_author, created_at: rumor.created_at.as_u64() })
+    Ok(OpenedKeyGrant { browse_key, inner_author, created_at: rumor.created_at.as_secs() })
 }
 
 /// Read a custom named tag from a rumor's `Tags` as a `u8` (None if absent or malformed). The
@@ -685,13 +685,13 @@ mod tests {
         seal.verify().unwrap();
         assert_eq!(seal.kind, Kind::Seal);
         assert_eq!(seal.pubkey, author.public_key(), "the seal is signed by the real author");
-        assert_eq!(seal.created_at.as_u64(), NOW, "the seal carries the true publish time");
+        assert_eq!(seal.created_at.as_secs(), NOW, "the seal carries the true publish time");
         let rumor_json =
             nip44::decrypt(r.keys().secret_key(), &seal.pubkey, &seal.content).unwrap();
         let rumor = UnsignedEvent::from_json(&rumor_json).unwrap();
         assert_eq!(rumor.kind.as_u16(), KIND_PRIV_LISTING, "inner kind is pinned to 31_113");
         assert_eq!(rumor.pubkey, author.public_key());
-        assert_eq!(rumor.created_at.as_u64(), NOW, "the rumor carries the true publish time");
+        assert_eq!(rumor.created_at.as_secs(), NOW, "the rumor carries the true publish time");
         assert_eq!(tag_u8_from(&rumor.tags, TAG_SCHEMA), Some(SCHEMA_V));
         assert_eq!(tag_u8_from(&rumor.tags, TAG_CRYPTO), Some(CRYPTO_V));
         assert_eq!(

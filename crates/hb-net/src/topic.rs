@@ -212,7 +212,7 @@ fn dedupe_announces(events: &mut [Event], tags: &[String]) -> TopicDiscoveries {
             for c in carried {
                 *root_event_counts.entry(c.to_string()).or_insert(0) += 1;
             }
-            let ts = ev.created_at.as_u64();
+            let ts = ev.created_at.as_secs();
             match best.get(&meta.topic_id) {
                 Some((prev, _)) if *prev >= ts => {}
                 _ => {
@@ -331,7 +331,7 @@ fn newest_announce(events: Vec<Event>, expected_topic_id: &str) -> Option<TopicM
             if meta.topic_id != expected_topic_id {
                 continue;
             }
-            let ts = ev.created_at.as_u64();
+            let ts = ev.created_at.as_secs();
             match &best {
                 Some((prev, _)) if *prev >= ts => {}
                 _ => best = Some((ts, meta)),

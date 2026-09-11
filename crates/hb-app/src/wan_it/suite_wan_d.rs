@@ -840,7 +840,7 @@ async fn d4_big_relay_state(
     let mut d_tags: Vec<(String, Event)> = by_d
         .into_iter()
         .map(|(d, mut group)| {
-            group.sort_by_key(|e| e.created_at.as_u64());
+            group.sort_by_key(|e| e.created_at.as_secs());
             (d, group.pop().unwrap())
         })
         .collect();

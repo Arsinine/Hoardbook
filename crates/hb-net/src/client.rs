@@ -371,7 +371,7 @@ impl RelayClient {
         let kind = event.kind.as_u16() as u64;
         let output = self
             .client
-            .send_event_to(relays.iter().map(|s| s.as_str()), event)
+            .send_event_to(relays.iter().map(String::as_str), event)
             .await
             .map_err(|e| NetError::Client(format!("send_event_to(kind {}): {e}", event.kind.as_u16())))?;
         let outcome = PublishOutcome {
@@ -491,7 +491,7 @@ impl RelayClient {
         }
         let events = self
             .client
-            .fetch_events_from(relays.iter().map(|s| s.as_str()), filter, timeout)
+            .fetch_events_from(relays.iter().map(String::as_str), filter, timeout)
             .await
             .map_err(|e| NetError::Client(e.to_string()))?;
         Ok(dedup_by_id(events))

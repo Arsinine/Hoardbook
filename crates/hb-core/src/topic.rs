@@ -539,7 +539,7 @@ fn verify_proof(proof_json: &str, expected_member: &PublicKey, statement: &str, 
     if proof.content != statement {
         return Err(HbError::InvalidEvent("proof does not bind the expected statement".into()));
     }
-    if proof.created_at.as_u64() != at {
+    if proof.created_at.as_secs() != at {
         return Err(HbError::InvalidEvent("proof time does not bind the membership/post time".into()));
     }
     Ok(())

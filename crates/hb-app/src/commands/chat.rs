@@ -441,7 +441,7 @@ pub(crate) async fn merge_wraps_into_cache(
     // Vec stays the source of truth; this set mirrors it plus this batch's ids.
     let mut seen: HashSet<String> = cache.seen_wraps.iter().cloned().collect();
     for wrap in wraps {
-        let outer = wrap.created_at.as_u64().min(now); // clamp: a future-dated wrap can't poison the cursor
+        let outer = wrap.created_at.as_secs().min(now); // clamp: a future-dated wrap can't poison the cursor
         if outer > cache.newest_seen_outer {
             cache.newest_seen_outer = outer;
             changed = true;

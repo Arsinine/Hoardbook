@@ -173,7 +173,7 @@ pub fn last_seen_within(
         if hb_core::is_canary(ev) {
             continue; // F-canary: synthetic presence never counts as aliveness
         }
-        let created = ev.created_at.as_u64();
+        let created = ev.created_at.as_secs();
         if created < floor || created > ceiling {
             continue; // outside the aliveness window → not alive; future-dated beyond skew → untrusted
         }
