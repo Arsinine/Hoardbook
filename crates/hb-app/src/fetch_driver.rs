@@ -18,14 +18,20 @@
 //! 3. **Carriers before the author.** Candidates are every contact EXCEPT the author, ordered by
 //!    [`crate::peer_wave`], which asks 2-3 per wave, retries a peer 3 times with exponential
 //!    backoff, and falls back to the author only once every carrier is exhausted.
-//! 4. **Asks go through the production path.** Every ask this loop sends is
-//!    [`request_manifest_from_inner`] — the same body the UI's ask calls. The WAN harness has three
-//!    times re-implemented a command body and dropped one step from it; a driver with its own copy
-//!    would be the fourth, and the dropped step would not surface until a live run.
+//! 4. **Asks go through the production path.** Every ask this loop sends is a production command
+//!    body — [`request_manifest_from_inner`] when the target is a carrier, [`request_manifest_inner`]
+//!    when the target IS the author. The WAN harness has three times re-implemented a command body
+//!    and dropped one step from it; a driver with its own copy would be the fourth, and the dropped
+//!    step would not surface until a live run.
 //!
-//! ⚠ **This is the BASELINE behaviour, not the opt-in one.** Refreshing something you already hold
-//! is what "no manual retrigger" means, so it is not gated on `swarm_caching`. That switch governs
-//! discovery-triggered auto-fetch of collections you have NEVER held, which is a separate slice.
+//! ⚠ **Refreshing is the BASELINE behaviour, not the opt-in one.** Refreshing something you already
+//! hold is what "no manual retrigger" means, so it is not gated on `swarm_caching`. That switch
+//! governs discovery-triggered auto-fetch of collections you have NEVER held — QURATOR-189, wired
+//! as [`discover_unheld`]: one authorless ask to the author per unheld published collection, with
+//! "never held" derived from the manifest cache so a collection stops qualifying the moment it is
+//! held (no seen-set, nothing new persisted). The switch's OTHER half — relay-caching, retaining
+//! data that passed through this node — stays unwired by owner ruling (QURATOR-164: "that is an
+//! architectural question of its own").
 //!
 //! Shape: the decisions are pure functions ([`stale_holdings`], [`candidates_for`]) with the clock
 //! and the network kept out of them; the loop is a thin shell that gathers inputs, calls them, and
@@ -86,6 +92,27 @@ pub(crate) fn stale_holdings(held: &[CachedKey], published: &[(String, Option<St
         .collect()
 }
 
+/// Pure core — which of `author`'s published collections this node has NEVER held (QURATOR-189,
+/// the `swarm_caching` discovery tier).
+///
+/// "Newly discovered" is DERIVED, never persisted: a collection stops qualifying the moment it
+/// appears in `held`, which is the whole anti-nuisance control — until the reply lands the ask
+/// repeats, which is the same self-heal the refresh path rests on ("an offline peer leaves the
+/// inequality true"). A listing without a fingerprint does not qualify either, for the same reason
+/// as property 2 in the module doc: the ask NAMES the snapshot ("what a reply must match"), and a
+/// pre-M16 listing cannot name one.
+pub(crate) fn unheld_collections(
+    held: &[CachedKey],
+    author: &str,
+    published: &[(String, Option<String>)],
+) -> Vec<(String, String)> {
+    published
+        .iter()
+        .filter(|(slug, _)| !held.iter().any(|k| k.npub == author && k.slug == *slug))
+        .filter_map(|(slug, fp)| Some((slug.clone(), fp.as_ref()?.clone())))
+        .collect()
+}
+
 /// Pure core — who may be asked for `author`'s collection.
 ///
 /// Every contact except the author themself (they are the fallback, held separately) and except
@@ -128,6 +155,11 @@ pub(crate) struct PollOutcome {
     pub asked: Vec<String>,
     /// Slugs redeemed this poll, from tickets answering asks a PREVIOUS poll sent.
     pub redeemed: Vec<String>,
+    /// Collections this poll asked an AUTHOR for that this node has NEVER held — the
+    /// `swarm_caching` discovery tier (QURATOR-189). Entries are `author|slug`; empty whenever
+    /// the switch is off. Like `asked`, this records asks SENT, not manifests received: the reply
+    /// lands in a later poll's `redeemed`.
+    pub discovered: Vec<String>,
 }
 
 /// The peers this node has actually asked — the allow-list for [`redeem_pending_tickets`].
@@ -225,6 +257,88 @@ async fn redeem_pending_tickets(
     redeemed
 }
 
+/// QURATOR-189 — the `swarm_caching` discovery tier's network half.
+///
+/// The refresh loop inside [`poll_once`] only ever tends what is held; this asks each contact, as
+/// the AUTHOR of their own listings, for collections this node has NEVER held — so a fresh node
+/// with an empty cache still fills. Public-only is by construction: `resolve_peer` builds listings
+/// from the browse key, and private listings come from a different function
+/// (`hb_net::priv_browse::fetch_private_listings`) this path never calls. Keyless contacts
+/// self-skip the same way they do everywhere else: `contact_share_code` answers `FollowOnly` and
+/// `resolve_peer`'s no-browse-key arm yields no collections.
+///
+/// Returns `author|slug` per ask SENT, not per manifest received — the reply lands in a later
+/// poll's `redeemed`, exactly like the refresh tier.
+async fn discover_unheld(
+    store: &DataStore,
+    identity: &hb_core::Identity,
+    own_npub: &str,
+    contacts: &[crate::store::CachedPeer],
+    held: &[CachedKey],
+    relay: &SharedRelay,
+) -> Vec<String> {
+    let mut discovered = Vec::new();
+    for contact in contacts {
+        if contact.npub == own_npub {
+            // Never discover from yourself: the listings would be your own, and the ask is a
+            // self-send `request_manifest_inner` already refuses.
+            continue;
+        }
+        let Ok(share_code) = contact_share_code(contact) else { continue };
+        let published: Vec<(String, Option<String>)> =
+            match resolve_peer(&share_code, identity, store, relay).await {
+                Ok(peer) => peer
+                    .collections
+                    .into_iter()
+                    .map(|c| (c.collection.slug, c.snapshot_fingerprint))
+                    .collect(),
+                Err(e) => {
+                    tracing::debug!(
+                        author = %truncate(&contact.npub),
+                        error = %e,
+                        "fetch driver: discovery listing resolve failed"
+                    );
+                    continue;
+                }
+            };
+
+        for (slug, fingerprint) in unheld_collections(held, &contact.npub, &published) {
+            // ⚠ THE SHAPE OF THE ASK MUST MATCH WHO IS BEING ASKED — same rule as the refresh
+            // loop: the target IS the author, so the ask is AUTHORLESS. `approval_body_for`
+            // routes purely on `author_npub` being present, and an author never caches its own
+            // publish, so an author-bearing ask sent TO the author makes it look for a cached
+            // copy of its own collection and miss, silently. `request_manifest_inner` takes the
+            // shared 1/sec throttle slot itself, so a contact with many unheld collections is
+            // asked slowly rather than in a burst.
+            let sent = request_manifest_inner(
+                &contact.npub,
+                &slug,
+                &fingerprint,
+                None,
+                None,
+                identity,
+                store,
+                relay,
+            )
+            .await;
+            match sent {
+                Ok(()) => tracing::info!(
+                    author = %truncate(&contact.npub),
+                    slug = %slug,
+                    "fetch driver: asked the author for a collection never held (swarm_caching)"
+                ),
+                Err(e) => tracing::debug!(
+                    author = %truncate(&contact.npub),
+                    error = %e,
+                    "fetch driver: discovery ask failed"
+                ),
+            }
+            discovered.push(format!("{}|{}", contact.npub, slug));
+        }
+    }
+    discovered
+}
+
 /// The driver loop. Spawned once at startup; runs for the process lifetime.
 ///
 /// Deliberately thin: it owns the cadence and the attempt state and delegates every decision to
@@ -283,11 +397,24 @@ pub(crate) async fn poll_once(
         redeem_pending_tickets(store, &identity, &own_npub, live_npub, endpoint).await;
 
     let held = crate::manifest_cache::list(&store.manifest_cache_dir());
-    if held.is_empty() {
+    // QURATOR-189 — the discovery tier's gate, read the way `resolve_peer` reads `big_relay_url`:
+    // a missing or unreadable settings file must mean OFF, never a failed poll. The early return
+    // now fires only when there is nothing held AND discovery is off: a fresh node (empty `held`)
+    // is precisely the case that needs discovery, so it must NOT strand here.
+    let swarm_caching = store.load_settings().ok().flatten().unwrap_or_default().swarm_caching;
+    if held.is_empty() && !swarm_caching {
         return outcome;
     }
     let Ok(contacts) = store.list_contacts() else { return outcome };
     let contact_npubs: Vec<String> = contacts.iter().map(|c| c.npub.clone()).collect();
+
+    // The opt-in discovery tier runs before the refresh grouping only because that grouping
+    // consumes `held` below; both tiers' asks share one 1/sec throttle, so the order between
+    // them changes nothing observable.
+    if swarm_caching {
+        outcome.discovered =
+            discover_unheld(store, &identity, &own_npub, &contacts, &held, relay).await;
+    }
 
     // Group holdings by author so each author's listing is resolved once per poll, not once per
     // collection held.
@@ -691,5 +818,137 @@ mod tests {
         let full = "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
         assert_eq!(truncate(full).len(), 12);
         assert!(truncate(full).len() < full.len());
+    }
+
+    /// QURATOR-189 — the discovery tier must actually READ the switch: `swarm_caching` sat inert
+    /// (defined, defaulted, tested in `store.rs`, read by nobody) until this ticket.
+    ///
+    /// MUTATION (P-10) — in `poll_once`, replace the
+    /// `let swarm_caching = store.load_settings().ok().flatten().unwrap_or_default().swarm_caching;`
+    /// line with `let swarm_caching = true;` → this test reds (the region no longer reads settings
+    /// at all, so the tier would run for users who never opted in).
+    #[test]
+    fn discovery_is_gated_on_the_swarm_caching_flag() {
+        let src = include_str!("fetch_driver.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code.find("pub(crate) async fn poll_once(").expect("poll_once must exist");
+        let end = code[at..].find("fn truncate(").expect("truncate must follow") + at;
+        let region = &code[at..end];
+        // Call forms, never bare names (CLAUDE.md §9): the test's own prose names the flag, so
+        // every assert below is on the poll_once region, not on this test's text.
+        assert!(
+            region.contains("load_settings("),
+            "the poll must read the settings file, or swarm_caching stays the inert flag it was"
+        );
+        assert!(
+            region.contains(".swarm_caching") && region.contains("if swarm_caching {"),
+            "the flag read must gate the discovery tier, not merely be loaded"
+        );
+        assert!(
+            region.contains("discover_unheld("),
+            "the gate must actually reach the discovery tier's call"
+        );
+    }
+
+    /// QURATOR-189 — a discovery ask goes TO the author, so it must use the AUTHORLESS body.
+    ///
+    /// Same rule as `the_ask_shape_matches_whether_the_target_is_the_author`: `approval_body_for`
+    /// routes on `author_npub` alone — Some to the cache re-serve, None to the full-list build —
+    /// and an author never caches its own publish. An author-bearing ask sent TO the author fails
+    /// every discovery fetch silently, which is exactly the failure this ticket must not ship.
+    ///
+    /// MUTATION (P-10) — in `discover_unheld`, replace the whole `request_manifest_inner(...)`
+    /// `.await` expression assigned to `sent` with `let sent: Result<(), String> = Ok(());` →
+    /// this test reds (the ask would never be sent — the inert-flag failure shape again).
+    #[test]
+    fn discovery_asks_the_author_authorlessly() {
+        let src = include_str!("fetch_driver.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("async fn discover_unheld(")
+            .expect("the discovery helper must exist");
+        let end = code[at..]
+            .find("pub(crate) async fn run_fetch_driver_loop(")
+            .expect("the loop must follow the discovery helper")
+            + at;
+        let region = &code[at..end];
+        // Call forms, not bare names (CLAUDE.md §9): `request_manifest_from_inner(` does not
+        // contain `request_manifest_inner(`, so the two bodies are counted separately.
+        assert_eq!(
+            region.matches("request_manifest_inner(").count(),
+            1,
+            "the discovery ask must use the authorless body, exactly once"
+        );
+        assert!(
+            !region.contains("request_manifest_from_inner("),
+            "an author-bearing ask sent TO the author looks for a cached copy of the author's \
+             own collection and misses, silently"
+        );
+    }
+
+    /// QURATOR-189 — a fresh node holds nothing, and it is exactly the node that needs discovery.
+    /// The old `held.is_empty()` early return must now spare the discovery tier.
+    ///
+    /// MUTATION (P-10) — in `poll_once`, replace `if held.is_empty() && !swarm_caching {` with
+    /// `if held.is_empty() {` → this test reds (a fresh node would return before the discovery
+    /// call, making the tier unreachable exactly where it matters most).
+    #[test]
+    fn discovery_is_not_stranded_behind_the_empty_holdings_return() {
+        let src = include_str!("fetch_driver.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code.find("pub(crate) async fn poll_once(").expect("poll_once must exist");
+        let end = code[at..].find("fn truncate(").expect("truncate must follow") + at;
+        let region = &code[at..end];
+        assert!(
+            region.contains("if held.is_empty() && !swarm_caching {"),
+            "the early return must be conditioned on the flag, or a fresh node — the one with \
+             nothing to refresh and everything to discover — never reaches the tier"
+        );
+        let guard_at = region.find("held.is_empty()").expect("the guard must exist");
+        let discover_at = region.find("discover_unheld(").expect("the discovery call must exist");
+        assert!(
+            guard_at < discover_at,
+            "the discovery call must live past the holdings guard, not before it"
+        );
+    }
+
+    /// MUTATION (P-10) — in `unheld_collections`, change the held-membership test inside the
+    /// `.filter(...)` from `!held.iter().any(|k| k.npub == author && k.slug == *slug)` to
+    /// `!held.iter().any(|k| k.slug == *slug)` → this test reds (one author's holding would mask
+    /// another author's same-named slug, so discovery would skip a collection never held).
+    #[test]
+    fn unheld_collections_is_published_minus_held_per_author() {
+        let h = vec![held("npubA", "films", "fp-old")];
+        let published = vec![
+            ("films".to_string(), Some("fp-new".to_string())),
+            ("music".to_string(), Some("fp-2".to_string())),
+            ("retro".to_string(), None),
+        ];
+        assert_eq!(
+            unheld_collections(&h, "npubA", &published),
+            vec![("music".to_string(), "fp-2".to_string())],
+            "the held slug does not qualify even though its fingerprint differs; a listing \
+             without a fingerprint cannot name the snapshot the ask must match"
+        );
+        // A different author's same-named slug is a DIFFERENT collection: never held, still
+        // discoverable. Slugs are per-author namespaces.
+        let other = vec![("films".to_string(), Some("fp-other".to_string()))];
+        assert_eq!(
+            unheld_collections(&h, "npubB", &other),
+            vec![("films".to_string(), "fp-other".to_string())],
+            "holding npubA/films must not mask npubB/films"
+        );
     }
 }
