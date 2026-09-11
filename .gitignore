@@ -58,3 +58,9 @@ docs/RULE-PROVENANCE.md
 
 # Local infrastructure config (VPS addresses) — never committed.
 .env
+
+# UI-audit screenshots (Playwright MCP output, 2026-08-16 audit). Local evidence, not source:
+# they were untracked-and-unignored, which reads as scratch and left them one `git clean -fd`
+# from loss — same failure mode the docs/ORCHESTRATOR.md note above describes.
+.playwright-mcp/
+audit-*.png
