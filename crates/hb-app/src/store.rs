@@ -1420,6 +1420,28 @@ impl DataStore {
     pub fn save_topic_nonces(&self, nonces: &std::collections::HashSet<String>) -> Result<()> {
         write_json(&self.topic_nonces_path(), nonces).context("saving topic nonces")
     }
+
+    pub fn dead_topic_verdicts_path(&self) -> PathBuf {
+        self.base.join("dead_topic_verdicts.json")
+    }
+
+    /// The persisted **known-dead public Topic verdicts** (QURATOR-192): topic_id → unix-secs the
+    /// verdict was stamped. Only a CONFIDENT `alive_count == Some(0)` may ever land here — the gate
+    /// is `commands/topics.rs`'s `dead_verdict_warranted` — never `None` (unknown: no key / private
+    /// / relay error), which would bury a live Topic permanently. A verdict is honoured for one
+    /// aliveness window (`hb_net::count::TOPIC_ALIVE_WINDOW_SECS`) so a revived Topic reappears.
+    /// Device-local by design.
+    pub fn load_dead_topic_verdicts(&self) -> Result<std::collections::HashMap<String, u64>> {
+        Ok(
+            read_json_lenient::<std::collections::HashMap<String, u64>>(&self.dead_topic_verdicts_path())
+                .context("loading dead topic verdicts")?
+                .unwrap_or_default(),
+        )
+    }
+
+    pub fn save_dead_topic_verdicts(&self, verdicts: &std::collections::HashMap<String, u64>) -> Result<()> {
+        write_json(&self.dead_topic_verdicts_path(), verdicts).context("saving dead topic verdicts")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2103,6 +2125,30 @@ pub(crate) mod tests {
         assert!(store.announce_seen_path().exists());
         store.wipe().unwrap();
         assert!(!store.announce_seen_path().exists(), "announce_seen.json must be removed by wipe()");
+    }
+
+    // ── Known-dead public Topic verdicts (QURATOR-192) ──────────────────────────────────────────
+
+    #[test]
+    fn dead_topic_verdicts_default_empty_and_roundtrip() {
+        // P-10 MUTATION (orchestrator): in `save_dead_topic_verdicts` (the containing fn), replace
+        // the `verdicts` argument with `&std::collections::HashMap::new()` — the round-trip assert
+        // below reds (an empty map comes back instead of the saved one). The sibling defaults
+        // assert stays green either way, proving the round-trip is the pinned half.
+        let (_dir, store) = test_store();
+        assert!(
+            store.load_dead_topic_verdicts().unwrap().is_empty(),
+            "no verdicts yet defaults to empty, never an error"
+        );
+
+        let verdicts =
+            std::collections::HashMap::from([("films".to_string(), 1_234_u64), ("games".to_string(), 5_678_u64)]);
+        store.save_dead_topic_verdicts(&verdicts).unwrap();
+        assert_eq!(
+            store.load_dead_topic_verdicts().unwrap(),
+            verdicts,
+            "the stamped verdict map round-trips through dead_topic_verdicts.json"
+        );
     }
 
     // ── Read state (devtest #16) ────────────────────────────────────────────────────────────────

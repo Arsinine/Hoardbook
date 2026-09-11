@@ -372,6 +372,10 @@ pub async fn topic_discover(
 /// The starved-root escalation (hb-net) is already folded in: a junk-announce flood under one root
 /// that evicts every other root from the shared-`limit` response pays one follow-up read per starved
 /// root, only when the response actually hit its limit.
+///
+/// QURATOR-192: rows carrying an UNEXPIRED known-dead verdict (stamped by [`topic_rank`]'s
+/// `Some(0)` aliveness result) are dropped HERE, before they reach the UI — otherwise a dead public
+/// Topic is rediscovered, repainted, re-queried and re-dropped on every single page open, forever.
 #[tauri::command]
 pub async fn topic_discover_paint(
     tags: Vec<String>,
@@ -383,9 +387,12 @@ pub async fn topic_discover_paint(
     let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
     let found: TopicDiscoveries =
         discover_public_topics_paint(&client, &tags, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
+    // Fail-open: a verdict-map load failure suppresses nothing — never a confident negative.
+    let dead = store.load_dead_topic_verdicts().unwrap_or_default();
     Ok(found
         .topics
         .into_iter()
+        .filter(|m| !known_dead_verdict_active(&dead, &m.topic_id))
         .map(|m| DiscoveredTopic {
             topic_id: m.topic_id,
             name: m.name,
@@ -430,11 +437,19 @@ pub async fn topic_rank(
     };
     let ranked = rank_discovered_topics(&client, found, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
     let mut out = Vec::with_capacity(ranked.len());
+    // QURATOR-192: the rows that earned a CONFIDENT dead verdict (`Some(0)` only — `None` is
+    // unknown and must never be stamped dead) are persisted after the loop, so the next
+    // `topic_discover_paint` suppresses them instead of rediscovering and re-querying them forever.
+    let mut newly_dead: Vec<String> = Vec::new();
     for (m, count) in ranked {
         let topic_id = m.topic_id.clone();
         let alive = alive_count_for(&client, &store, &topic_id, &m.name).await;
+        if dead_verdict_warranted(alive) {
+            newly_dead.push(topic_id.clone());
+        }
         out.push(TopicRank { topic_id, member_count_estimate: count, alive_count: alive });
     }
+    record_dead_verdicts(&store, &newly_dead);
     Ok(out)
 }
 
@@ -529,6 +544,43 @@ async fn alive_count_for(
     )
     .await
     .ok()
+}
+
+/// Does this row's aliveness result warrant a PERSISTED dead verdict (QURATOR-192)? `Some(0)` —
+/// the roster was read with a real key and every member's newest beacon is older than the window —
+/// is the ONLY confident dead. `None` is UNKNOWN (no key / a private topic / a relay error):
+/// persisting it would bury a LIVE Topic permanently (the never-render-a-confident-negative rule,
+/// same as QURATOR-67/68/93). `Some(n > 0)` is alive. Pure, so the gate is directly testable.
+fn dead_verdict_warranted(alive: Option<usize>) -> bool {
+    alive == Some(0)
+}
+
+/// Stamp `topic_ids` known-dead in the persisted verdict map (QURATOR-192), keyed by the verdict's
+/// unix-secs. Best-effort by design: a store failure is swallowed, never propagated — ranking must
+/// not die for a bookkeeping write, and a lost verdict only costs one re-query. Callers pass only
+/// ids that cleared [`dead_verdict_warranted`].
+fn record_dead_verdicts(store: &DataStore, topic_ids: &[String]) {
+    if topic_ids.is_empty() {
+        return;
+    }
+    let ts = now();
+    if let Ok(mut verdicts) = store.load_dead_topic_verdicts() {
+        for id in topic_ids {
+            verdicts.insert(id.clone(), ts);
+        }
+        let _ = store.save_dead_topic_verdicts(&verdicts);
+    }
+}
+
+/// The suppression check [`topic_discover_paint`] applies (QURATOR-192): does `topic_id` carry an
+/// UNEXPIRED known-dead verdict? A verdict is honoured for one aliveness window
+/// ([`hb_net::count::TOPIC_ALIVE_WINDOW_SECS`]) past its stamp: a revival beacon sent after the
+/// verdict is still inside its own window when ours lapses, so a revived Topic reappears — and a
+/// still-dead one simply earns a fresh verdict on its next rank. Pure, so the expiry is testable.
+fn known_dead_verdict_active(verdicts: &HashMap<String, u64>, topic_id: &str) -> bool {
+    verdicts
+        .get(topic_id)
+        .is_some_and(|&ts| now() < ts.saturating_add(hb_net::count::TOPIC_ALIVE_WINDOW_SECS))
 }
 
 /// One lazy-ranking result: a `topic_id` + its spoofable count (see [`topic_rank`]).
@@ -1474,6 +1526,96 @@ mod tests {
         assert!(
             public_recovery_allowed(&store, "unjoined-topic-id", "video/films"),
             "an un-stored topic with a name is the non-member recovery case — allowed"
+        );
+    }
+
+    // ── QURATOR-192 — the dead-Topic verdict is PERSISTED, not re-derived on every page open ─────
+    //
+    // A dead public Topic was rediscovered, repainted, re-queried and re-dropped on every page open
+    // because the aliveness verdict lived only in that render's TopicRank rows. The fix has three
+    // pure seams, each pinned here: WHICH verdicts may be persisted (`dead_verdict_warranted` —
+    // `Some(0)` only, never `None`), the store round-trip + suppression lookup
+    // (`record_dead_verdicts` / `known_dead_verdict_active`), and the EXPIRY (one aliveness window,
+    // so a revived Topic reappears). `topic_rank`'s loop and `topic_discover_paint`'s filter are
+    // downstream of net::client — the same blocker as every command-level guard in this module — so
+    // the pure halves are exercised directly, per-module convention.
+
+    #[test]
+    fn an_unknown_aliveness_is_never_persisted_as_dead() {
+        // P-10 MUTATION (orchestrator) — THE LOAD-BEARING ONE: in `dead_verdict_warranted` (the
+        // containing fn, just below `alive_count_for`), change
+        //     alive == Some(0)
+        // to
+        //     alive.unwrap_or(0) == 0
+        // — i.e. make the persist path store `None` as dead. THIS test reds on the FIRST assert
+        // (unknown starts warranting a verdict); the two asserts below stay green, proving the gate
+        // discriminates unknown from confident-dead rather than merely testing a boolean.
+        assert!(
+            !dead_verdict_warranted(None),
+            "None = UNKNOWN (no key / a private topic / a relay error) must NEVER be persisted as \
+             dead — it would bury a LIVE Topic permanently"
+        );
+        assert!(
+            !dead_verdict_warranted(Some(3)),
+            "an alive topic is not dead"
+        );
+        assert!(
+            dead_verdict_warranted(Some(0)),
+            "Some(0) — roster read with a real key, every member staler than the window — is the \
+             ONE confident dead"
+        );
+    }
+
+    #[test]
+    fn a_persisted_dead_verdict_suppresses_its_topic_and_only_its_topic() {
+        // P-10 MUTATION (orchestrator): in `record_dead_verdicts` (the containing fn), delete the
+        //     verdicts.insert(id.clone(), ts);
+        // line inside the for-loop — THIS test reds on the first assert (nothing is ever stamped,
+        // so nothing is suppressed). The pure-gate sibling above is untouched by it and stays
+        // green.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        record_dead_verdicts(&store, &["dead-topic-id".to_string()]);
+        let verdicts = store.load_dead_topic_verdicts().unwrap();
+        assert!(
+            known_dead_verdict_active(&verdicts, "dead-topic-id"),
+            "a freshly stamped verdict is honoured — the topic never reaches the UI"
+        );
+        assert!(
+            !known_dead_verdict_active(&verdicts, "never-verdicted-id"),
+            "a topic with NO verdict on file keeps its row — suppression needs a verdict"
+        );
+        // The stamp is a real unix-secs (not a placeholder): stamped within the last minute.
+        let ts = *verdicts.get("dead-topic-id").unwrap();
+        assert!(
+            ts <= now() && ts + 60 > now(),
+            "the verdict carries its stamping time (got {ts}, now {})", now()
+        );
+    }
+
+    #[test]
+    fn a_dead_verdict_expires_after_one_aliveness_window_so_a_revived_topic_reappears() {
+        // P-10 MUTATION (orchestrator): in `known_dead_verdict_active` (the containing fn), remove
+        // the expiry check — change
+        //     .is_some_and(|&ts| now() < ts.saturating_add(hb_net::count::TOPIC_ALIVE_WINDOW_SECS))
+        // to
+        //     .is_some_and(|_| true)
+        // — THIS test reds on the FIRST assert (the stale verdict is then honoured forever, so a
+        // revived Topic can never reappear); the fresh-verdict assert stays green.
+        let stale = now().saturating_sub(hb_net::count::TOPIC_ALIVE_WINDOW_SECS + 60);
+        let fresh = now().saturating_sub(60);
+        let verdicts = HashMap::from([
+            ("stale-topic-id".to_string(), stale),
+            ("fresh-topic-id".to_string(), fresh),
+        ]);
+        assert!(
+            !known_dead_verdict_active(&verdicts, "stale-topic-id"),
+            "a verdict one window + slack old has EXPIRED — the topic reappears and is re-queried, \
+             so a revived one is found"
+        );
+        assert!(
+            known_dead_verdict_active(&verdicts, "fresh-topic-id"),
+            "a verdict stamped a minute ago is still honoured"
         );
     }
 
