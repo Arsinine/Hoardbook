@@ -4,7 +4,7 @@
 	import { listen } from '@tauri-apps/api/event';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import { sizeTier, sizeTierTooltip, rowIcon } from '$lib/collection-row-view.js';
-	import { refreshContact, importManifest, requestManifest, requestManifestFrom, getManifestAsks, getContacts, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, browsePrivateCollections, type ManifestAsk, type ImportedManifest } from '$lib/api.js';
+	import { refreshContact, importManifest, requestManifest, requestManifestFrom, getManifestAsks, getContacts, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, browsePrivateCollections, applyKeyGrants, type ManifestAsk, type ImportedManifest } from '$lib/api.js';
 	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
@@ -187,7 +187,26 @@
 	let manifestProgress = $state<Record<string, ManifestProgress>>({});
 	let manifestProgressUnlisten: (() => void) | undefined;
 
+	// QURATOR-188 — the Browse-side twin of Contacts' loadKeyGrants (QURATOR-160 receive side):
+	// pull any pending browse-key grants into their stored contact rows, so a granted-but-keyless
+	// contact no longer shows 🔒 here just because the user went straight to Browse and never
+	// visited Contacts. Non-fatal: relays may be unreachable, and an unapplied grant simply
+	// retries on the next visit. The contact re-read fires ONLY when a grant actually applied
+	// (applyKeyGrants returns the npubs that gained a key) — an unconditional re-fetch on every
+	// mount is the unbounded per-visit refresh this repo treats as a defect. Only the refreshed
+	// store lets a not-yet-selected peer (the ?peer= deep-link waits on $contacts) select as
+	// keyed instead of keyless.
+	async function loadKeyGrants() {
+		try {
+			const applied = await applyKeyGrants();
+			if (applied.length > 0) await loadContactsInto(getContacts);
+		} catch { /* non-fatal — retried on the next load */ }
+	}
+
 	onMount(() => {
+		// QURATOR-188: fire-and-forget — onMount must stay synchronous or it loses the cleanup
+		// return below (same pattern as `void loadPrivateInto()`).
+		void loadKeyGrants();
 		listen<{ request_id: string; slug: string; received: number; total: number }>('manifest-progress', (event) => {
 			const p = event.payload;
 			if (!p || typeof p.slug !== 'string') return;
