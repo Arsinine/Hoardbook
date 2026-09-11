@@ -53,7 +53,7 @@ vi.mock('$lib/api.js', async (importOriginal) => ({
 		{ from: ASKER, to: ME, content: ACCESS_BODY, sent_at: '2026-09-10T10:00:00Z' },
 	]),
 	grantBrowseAccess: vi.fn().mockResolvedValue(undefined),
-	getContacts: vi.fn().mockResolvedValue([{ npub: ASKER, petname: 'Asker', groups: [] }]),
+	getContacts: vi.fn().mockResolvedValue([{ npub: ASKER, petname: 'Asker', collections: [], online: false, last_fetched: '2026-09-10T10:00:00Z', local_tags: [] }]),
 	groupsGet: vi.fn().mockResolvedValue([]),
 	getCollections: vi.fn().mockResolvedValue([]),
 	getSettings: vi.fn().mockResolvedValue({}),
@@ -74,8 +74,8 @@ afterEach(() => {
 });
 
 function mount() {
-	identity.set({ npub: ME });
-	contacts.set([{ npub: ASKER, petname: 'Asker', groups: [] }]);
+	identity.set({ npub: ME, npub_short: ME, share_code: 'hbk1x', key_storage: 'plain-file' });
+	contacts.set([{ npub: ASKER, petname: 'Asker', collections: [], online: false, last_fetched: '2026-09-10T10:00:00Z', local_tags: [] }]);
 	return render(ChatPage);
 }
 
