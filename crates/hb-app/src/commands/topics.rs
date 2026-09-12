@@ -1006,12 +1006,20 @@ mod tests {
         // Decision E: the seen-nonce set survives a restart, so an old invite can't be re-accepted.
         let dir = tempfile::tempdir().unwrap();
         let store = DataStore::new(dir.path().to_path_buf());
+        let issuer = Identity::generate();
         let id = Identity::generate();
         let mut seen = store.load_topic_nonces().unwrap();
-        seen.insert(hb_core::topic::invite_seen_key("topic-abc", &id.public_key()));
+        seen.insert(hb_core::topic::invite_seen_key(&issuer.public_key(), "topic-abc", &id.public_key(), "n1"));
         store.save_topic_nonces(&seen).unwrap();
         let reloaded = store.load_topic_nonces().unwrap();
-        assert!(reloaded.contains(&hb_core::topic::invite_seen_key("topic-abc", &id.public_key())));
+        assert!(
+            reloaded.contains(&hb_core::topic::invite_seen_key(
+                &issuer.public_key(),
+                "topic-abc",
+                &id.public_key(),
+                "n1"
+            ))
+        );
     }
 
     #[test]

@@ -586,6 +586,11 @@ pub fn parse_announce(event: &Event) -> Result<TopicMeta, HbError> {
     let payload: AnnouncePayload = serde_json::from_str(&event.content)?;
     check_schema(payload.v)?;
     let mut meta = payload.meta;
+    // The reader enforces the same public-namespace shape `new_topic` enforces (QURATOR-199): a
+    // peer's announce never went through the create path, so without this check an over-deep path
+    // (the only thing `validate_public_name` adds beyond the root checks below) would admit an
+    // unbounded discovery tree from forged announces.
+    validate_public_name(&meta.name)?;
     if topic_id_for_name(&meta.name) != meta.topic_id {
         return Err(HbError::InvalidEvent(format!(
             "announce name '{}' does not derive to its claimed topic_id (QURATOR-133 relabel)",
@@ -876,11 +881,19 @@ pub fn announce_cooldown_remaining(last_announce_at: Option<u64>, now: u64) -> u
 
 // ── INVITE CREDENTIAL (sealed, single-use) + public-join ─────────────────────────────────────────
 
-/// The seen-set key for an invite redemption — scoped `(topic_id, invitee)` (Decision E). The caller
-/// inserts this after a successful `redeem_invite`; `redeem_invite` rejects an invite whose key is
-/// already present (replay).
-pub fn invite_seen_key(topic_id: &str, invitee: &PublicKey) -> String {
-    format!("{topic_id}:{}", invitee.to_hex())
+/// The seen-set key for an invite redemption — scoped `(issuer, topic_id, invitee, nonce)` (Decision
+/// E). The caller inserts this after a successful `redeem_invite`; `redeem_invite` rejects an invite
+/// whose key is already present (replay).
+///
+/// **The issuer MUST be the VERIFIED seal signer** [`redeem_invite`] recovers (never a
+/// payload-declared value): the topic_id and nonce inside `InvitePayload` are self-declared, so a
+/// hostile-but-validly-signed wrap can freely name a victim's real `(topic_id, invitee)`. Keying on
+/// those alone let such a wrap burn the victim's single-use slot ("already redeemed" for the genuine
+/// invite). Binding the VERIFIED issuer makes the slot unforgeable across issuers — a hostile wrap
+/// occupies only the attacker's own slot — and the nonce keeps the "this-invite" identity, so
+/// replaying the SAME invite still collides while a legitimate re-mint (fresh nonce) does not.
+pub fn invite_seen_key(issuer: &PublicKey, topic_id: &str, invitee: &PublicKey, nonce: &str) -> String {
+    format!("{}:{topic_id}:{}:{nonce}", issuer.to_hex(), invitee.to_hex())
 }
 
 /// Mint a **single-use** sealed invite credential carrying the topic key, addressed to `invitee`
@@ -950,7 +963,7 @@ fn mint_invite_with_policy(
 /// `topic_id` binding).
 ///
 /// **Single-use is enforced here, atomically (chorus-1):** for a **single-use** invite (`expires_at =
-/// Some`), the `(topic_id, invitee)` key is checked-and-inserted into `seen` in one step, closing the
+/// Some`), the `(issuer, topic_id, invitee, nonce)` key is checked-and-inserted into `seen` in one step, closing the
 /// caller-side TOCTOU. A **public-join** credential (`expires_at = None`) is intentionally **reusable**
 /// — it is exempt from the seen-set (every joiner derives the same name-scoped invitee, so a shared
 /// key would collide). The caller persists `seen` after a successful redeem. **Honest limit:** `seen`
@@ -1026,7 +1039,11 @@ pub fn redeem_invite(
     // reusable public-join credential is exempt (every joiner derives the same name-scoped invitee, so a
     // shared seen-key would collide and block honest joiners).
     if !payload.reusable {
-        let seen_key = invite_seen_key(&payload.meta.topic_id, &me.public_key());
+        // QURATOR-198: the seen-key binds the VERIFIED issuer (recovered from the seal above, after
+        // `seal.verify()`) plus the payload nonce — NOT the self-declared topic_id alone. A hostile
+        // wrap validly names any (topic_id, invitee), but cannot make its seal be signed by the
+        // genuine issuer, so it can never occupy the genuine invite's slot.
+        let seen_key = invite_seen_key(&issuer, &payload.meta.topic_id, &me.public_key(), &payload.nonce);
         if !seen.insert(seen_key) {
             return Err(HbError::InvalidEvent("invite already redeemed (replay)".into()));
         }
@@ -1330,6 +1347,48 @@ mod tests {
     }
 
     #[test]
+    fn announce_deeper_than_max_topic_depth_is_rejected() {
+        // QURATOR-199: the reader must enforce the same depth cap as `new_topic`. Built via
+        // `forged_announce` with a topic_id that IS derived from the too-deep name (so the
+        // QURATOR-133 re-derivation passes) and a valid category root — the depth cap is the only
+        // check that can fire. Mutation that must red this: remove the `validate_public_name` call
+        // from `parse_announce` — the too-deep assert below then fails (parses Ok), while the
+        // at-cap control stays green.
+        let attacker = Identity::generate();
+        let too_deep = std::iter::once("video").chain(std::iter::repeat_n("x", MAX_TOPIC_DEPTH)).collect::<Vec<_>>().join("/");
+        let deep_meta = TopicMeta {
+            topic_id: topic_id_for_name(&too_deep),
+            name: too_deep,
+            description: String::new(),
+            tags: vec![],
+            private: false,
+        };
+        let deep_id = deep_meta.topic_id.clone();
+        let ev = forged_announce(&attacker, &deep_id, deep_meta, vec![], NOW);
+        assert!(
+            parse_announce(&ev).is_err(),
+            "an announce deeper than MAX_TOPIC_DEPTH must be rejected by the reader, not just the creator"
+        );
+
+        // Control: the same forged shape at exactly MAX_TOPIC_DEPTH segments still parses — the
+        // depth cap is the only thing firing above, not some other property of the forged event.
+        let at_cap = std::iter::once("video").chain(std::iter::repeat_n("x", MAX_TOPIC_DEPTH - 1)).collect::<Vec<_>>().join("/");
+        let cap_meta = TopicMeta {
+            topic_id: topic_id_for_name(&at_cap),
+            name: at_cap,
+            description: String::new(),
+            tags: vec![],
+            private: false,
+        };
+        let cap_id = cap_meta.topic_id.clone();
+        let ev = forged_announce(&attacker, &cap_id, cap_meta, vec![], NOW);
+        assert!(
+            parse_announce(&ev).is_ok(),
+            "an announce at exactly MAX_TOPIC_DEPTH segments must still parse"
+        );
+    }
+
+    #[test]
     fn well_formed_announce_still_parses() {
         let author = Identity::generate();
         let (meta, _key) = public_topic();
@@ -1432,8 +1491,9 @@ mod tests {
         let expired = mint_invite(&issuer, &invitee.public_key(), &meta, &key, "n2", Some(NOW - 1), NOW).unwrap();
         assert!(redeem_invite(&invitee, &expired, &mut NonceSet::new(), NOW, None).is_err(), "an expired invite is refused");
 
-        // (c) replayed: the FIRST redeem atomically records the (topic_id, invitee) seen-key, so the
-        // SECOND is rejected — single-use is enforced inside redeem_invite (no caller TOCTOU).
+        // (c) replayed: the FIRST redeem atomically records the (issuer, topic_id, invitee, nonce)
+        // seen-key, so the SECOND is rejected — single-use is enforced inside redeem_invite (no
+        // caller TOCTOU).
         let mut seen = NonceSet::new();
         let _ = redeem_invite(&invitee, &inv, &mut seen, NOW, None).unwrap();
         assert!(redeem_invite(&invitee, &inv, &mut seen, NOW, None).is_err(), "a redeemed invite cannot be replayed");
@@ -1513,8 +1573,9 @@ mod tests {
         // A hand-crafted single-use invite carrying a malformed `topic_key` passes every earlier check
         // (schema/crypto/expiry/topic-match), so the key decode/length gate is the LAST validation
         // before the replay-nonce insert. Ordered wrongly (insert-then-decode), the malformed invite
-        // would burn the (topic_id, invitee) seen-key and then fail, permanently poisoning the slot so
-        // the genuine invite is later rejected as "already redeemed". The decode must precede the insert.
+        // would burn the issuer's (issuer, topic_id, invitee, nonce) seen-key and then fail,
+        // permanently poisoning the slot so the genuine invite is later rejected as "already
+        // redeemed". The decode must precede the insert.
         let issuer = Identity::generate();
         let invitee = Identity::generate();
         let (meta, key) = private_topic();
@@ -1546,6 +1607,63 @@ mod tests {
         assert!(
             redeem_invite(&invitee, &good, &mut seen, NOW, None).is_ok(),
             "the genuine invite redeems because the malformed one never claimed the seen-key"
+        );
+    }
+
+    #[test]
+    fn hostile_wrap_cannot_burn_another_issuers_single_use_invite_slot() {
+        // QURATOR-198: the seen-set key must bind the VERIFIED issuer (+ payload nonce), not the
+        // payload's self-declared topic_id alone. Mallory mints a perfectly-valid invite of her own
+        // (her seal signature, her topic key) that DECLARES the genuine topic_id and names victim B
+        // as invitee — both are knowable, so this wrap is fully constructible. Every crypto check in
+        // redeem_invite passes it BY DESIGN; the returned issuer is what a caller consent-gates on.
+        // What must NOT happen is the seen-set side effect: under the old topic_id-only key,
+        // redeeming the hostile wrap first burned the "T:B" slot, so the genuine invite later
+        // failed "already redeemed". With the issuer-bound key, Mallory's wrap occupies only
+        // Mallory's own slot.
+        //
+        // MUTATION that reds this test: revert `invite_seen_key` to the topic_id-only form
+        // (`format!("{topic_id}:{}", invitee.to_hex())`, ignoring issuer and nonce) — the genuine
+        // redemption below then fails with "invite already redeemed (replay)".
+        let genuine_issuer = Identity::generate();
+        let mallory = Identity::generate();
+        let invitee = Identity::generate();
+        let (meta, key) = private_topic(); // T: the genuine topic
+        let hostile_key = TopicKey::generate();
+
+        // The hostile wrap: validly signed BY MALLORY, declaring the genuine (T, B).
+        let hostile =
+            mint_invite(&mallory, &invitee.public_key(), &meta, &hostile_key, "m1", Some(NOW + 100), NOW).unwrap();
+        // The genuine invite from the real issuer: same declared topic and invitee, different issuer.
+        let genuine =
+            mint_invite(&genuine_issuer, &invitee.public_key(), &meta, &key, "g1", Some(NOW + 100), NOW).unwrap();
+
+        // Hostile-first redemption (the blind private-redeem path). It succeeds — it IS a valid
+        // invite — but it substitutes nothing: MALLORY is surfaced as the issuer and MALLORY's key
+        // is returned, so the caller can refuse whose key it got; only Mallory's own seen slot is
+        // claimed.
+        let mut seen = NonceSet::new();
+        let (h_meta, h_key, h_issuer) = redeem_invite(&invitee, &hostile, &mut seen, NOW, None).unwrap();
+        assert_eq!(h_issuer, mallory.public_key(), "the hostile wrap's issuer is surfaced as Mallory");
+        assert_ne!(h_key.0, key.0, "the hostile wrap carries Mallory's key, not the genuine one");
+        assert_eq!(h_meta.topic_id, meta.topic_id, "the hostile wrap did declare the genuine topic_id");
+
+        // THE PIN: the genuine invite still redeems afterwards — the hostile wrap could not burn
+        // its slot — and returns the genuine issuer and genuine key.
+        let (g_meta, g_key, g_issuer) = redeem_invite(&invitee, &genuine, &mut seen, NOW, None).unwrap();
+        assert_eq!(g_issuer, genuine_issuer.public_key(), "the genuine issuer is recovered from the seal");
+        assert_eq!(g_key.0, key.0, "the genuine topic key is returned");
+        assert_eq!(g_meta.topic_id, meta.topic_id);
+
+        // Single-use still holds PER INVITE: replaying the genuine event (same issuer + nonce ⇒
+        // same seen-key) is refused, and so is replaying the hostile one.
+        assert!(
+            redeem_invite(&invitee, &genuine, &mut seen, NOW, None).is_err(),
+            "a genuine invite still cannot be replayed"
+        );
+        assert!(
+            redeem_invite(&invitee, &hostile, &mut seen, NOW, None).is_err(),
+            "the hostile invite is itself single-use too"
         );
     }
 
