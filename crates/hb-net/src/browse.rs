@@ -20,7 +20,7 @@ use hb_core::listing::BrowseKey;
 use hb_core::{Identity, ShareCode};
 use nostr::prelude::*;
 
-use crate::client::{teaser_search_filter, RelayClient};
+use crate::client::{dedup_by_id, teaser_search_filter, validate_relay_url, RelayClient};
 use crate::discover::{ingest_teasers_capped, select_newest_by_created_at, SearchHit};
 use crate::error::NetError;
 use crate::nip65::{bootstrap_order, inbox_order, parse_relay_list};
@@ -166,6 +166,12 @@ pub async fn resolve_recipient_relays(
 /// Browse a share code as a pure relay read. Always returns the teaser when present; the listing is
 /// `None` for a follow-only code or when the held browse-key can't decrypt it (locked, not an
 /// error). `seed`/`own` seed the NIP-65 bootstrap.
+///
+/// QURATOR-196: the NIP-65 resolution is still **acted on** — a peer who publishes only to their
+/// own relays (not the caller's seed set) remains browsable — but through a scoped read, never a
+/// pool mutation: the peer-advertised relays not already in the shared pool are fetched via a
+/// dedicated ephemeral client and disconnected after, so nothing addressed to our identity ever
+/// reaches a peer-chosen URL. See [`scope_peer_relays`].
 pub async fn browse_share_code(
     client: &RelayClient,
     share_code: &ShareCode,
@@ -176,26 +182,84 @@ pub async fn browse_share_code(
 ) -> Result<BrowseResult, NetError> {
     let peer = share_code.pubkey();
     let resolved_relays = resolve_peer_relays(client, &peer, seed, own, timeout).await;
-    // **Act on** the NIP-65 resolution: connect to the peer's advertised outbox before fetching, so
-    // a peer who publishes only to their own relays (not the caller's seed set) is still reachable.
-    let _ = client.ensure_relays(&resolved_relays, timeout).await;
+    // **Act on** the NIP-65 resolution — scoped. The old `ensure_relays(&resolved_relays)` here
+    // added the peer's advertised outbox to the PERSISTENT shared M12 pool, and nothing ever
+    // removed it: after one browse of a hostile share code, every pool-wide read — including the
+    // identity-bearing private-inbox fetches `{kinds:[1059], #p:[me]}` (`priv_browse`) — was
+    // issued to the attacker-chosen relay indefinitely. A permanent presence/liveness leak. The
+    // peer's relays are instead read through a DEDICATED, EPHEMERAL client with a throwaway
+    // identity, connected only for this fetch and disconnected after — the same mechanism the
+    // M16 W2 big-relay path ruled in ("Codex finding 1" / option-b privacy note,
+    // `hb-app::commands::browse`): the peer's relay never receives anything addressed to our npub.
+    // (nostr-sdk 0.44 has no scoped fetch against non-pool relays — `fetch_events_from` resolves
+    // targets via pool membership and errors `RelayNotFound` for strangers — so a non-mutating
+    // scoped read needs its own client; add-then-remove was rejected because the connected window
+    // would still carry every concurrent pool-wide read.)
+    let scoped = scope_peer_relays(client.relays(), &resolved_relays);
+    let scoped_client = if scoped.is_empty() {
+        None
+    } else {
+        // Best-effort, mirroring the big-relay path: an unconnectable peer outbox means the teaser
+        // comes from the caller's own seed set — never a browse failure.
+        match RelayClient::connect(&Identity::generate(), &scoped, timeout).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::debug!(
+                    relays = ?scoped,
+                    error = %e,
+                    "browse: peer outbox unreachable; reading the configured pool only"
+                );
+                None
+            }
+        }
+    };
 
-    // Teaser (public): newest by created_at, then verify+parse.
-    let teaser_events =
-        client.fetch(Filter::new().author(peer).kind(Kind::from_u16(KIND_TEASER)), timeout).await?;
-    let teaser = select_newest_teaser(teaser_events, &peer);
+    // Teaser (public): newest by created_at, then verify+parse. Pool-wide read merged with the
+    // scoped peer-outbox read and deduped by id, so a teaser mirrored on both still selects the
+    // newest copy (the scoped read is best-effort and never fails the browse).
+    let teaser_filter = Filter::new().author(peer).kind(Kind::from_u16(KIND_TEASER));
+    let mut teaser_events = client.fetch(teaser_filter.clone(), timeout).await?;
+    if let Some(sc) = scoped_client.as_ref() {
+        if let Ok(extra) = sc.fetch(teaser_filter, timeout).await {
+            teaser_events.extend(extra);
+        }
+    }
+    let teaser = select_newest_teaser(dedup_by_id(teaser_events), &peer);
 
     // Listing (gated by the browse-key): a decrypt failure locks the listing without failing the
     // whole browse — the teaser still shows (BR1). The reason rides on the result so the failure
-    // mode stays attributable (QURATOR-127).
+    // mode stays attributable (QURATOR-127). Same scoped merge as the teaser read.
     let (listing, listing_error) = match share_code.browse_key() {
         Some(bk) => {
-            listing_or_lock_reason(slug, fetch_listing(client, &peer, slug, &bk, timeout).await)
+            listing_or_lock_reason(
+                slug,
+                fetch_listing(client, scoped_client.as_ref(), &peer, slug, &bk, timeout).await,
+            )
         }
         None => (None, None),
     };
+    if let Some(sc) = scoped_client {
+        sc.disconnect().await;
+    }
 
     Ok(BrowseResult { teaser, listing, listing_error, resolved_relays })
+}
+
+/// QURATOR-196 — the browse-side peer-relay scope: of a resolved bootstrap order, the relays that
+/// are NOT already in the shared pool's configured set, kept only if they pass the SSRF guard
+/// ([`validate_relay_url`]). These are exactly the relays that must be read through a scoped
+/// ephemeral client: `add_relay`ing any of them to the shared pool would hand the identity
+/// gift-wrap read (`{kinds:[1059], #p:[me]}`, `priv_browse`) to a peer-chosen URL. Pool members
+/// are skipped — the user already chose to put their identity there (and the hb-it/WAN harnesses'
+/// `ws://localhost` strfry is a pool member, so harness browses are unaffected by the guard; a
+/// peer-advertised `ws://localhost` is refused). Pure, so the partition + guard are unit-testable
+/// without a relay.
+pub(crate) fn scope_peer_relays(pooled: &[String], resolved: &[String]) -> Vec<String> {
+    resolved
+        .iter()
+        .filter(|r| !pooled.contains(r) && validate_relay_url(r).is_ok())
+        .cloned()
+        .collect()
 }
 
 /// The BR1 fold, as ONE function both callers use (QURATOR-127): a listing failure locks the
@@ -341,15 +405,27 @@ where
 /// Fetch a slug's listing family (index + content parts), pick the newest event per `d`-tag (so a
 /// non-compliant relay's stale replaceable duplicate can't win — N3/AB8), decrypt each with the
 /// browse-key (which re-verifies the Schnorr signature), and render into a possibly-partial tree.
-/// Slug-scoped and two-phase — see [`fetch_slug_family`].
+/// Slug-scoped and two-phase — see [`fetch_slug_family`]. `scoped` is the QURATOR-196 peer-outbox
+/// client: each phase's pool-wide read is merged with the scoped read (deduped by id), so a family
+/// that lives only on the peer's own relay still assembles; the scoped read is best-effort.
 async fn fetch_listing(
     client: &RelayClient,
+    scoped: Option<&RelayClient>,
     peer: &PublicKey,
     slug: &str,
     browse_key: &BrowseKey,
     timeout: Duration,
 ) -> Result<RenderedListing, NetError> {
-    fetch_slug_family(peer, slug, browse_key, |filter| client.fetch(filter, timeout)).await
+    fetch_slug_family(peer, slug, browse_key, |filter| async move {
+        let mut events = client.fetch(filter.clone(), timeout).await?;
+        if let Some(sc) = scoped {
+            if let Ok(extra) = sc.fetch(filter, timeout).await {
+                events.extend(extra);
+            }
+        }
+        Ok(dedup_by_id(events))
+    })
+    .await
 }
 
 /// Drop any event not authored by `peer` (CWE-346 / Codex review, M16 W2 + M19 W3). The relay-side
@@ -623,15 +699,48 @@ pub async fn browse_peer_listings_state(
     browse_key: &BrowseKey,
     timeout: Duration,
 ) -> Result<(Vec<(String, RenderedListing, Option<String>)>, ListingsState), NetError> {
-    let events = match client
-        .fetch(Filter::new().author(*peer).kind(Kind::from_u16(KIND_LISTING)), timeout)
-        .await
-    {
+    // QURATOR-196: the enumeration read is scoped exactly like `browse_share_code`'s — the peer's
+    // advertised NIP-65 outbox relays not already in the shared pool are read through a dedicated
+    // ephemeral client, merged into this author-wide fetch (deduped by id), then disconnected.
+    // This path previously reached a peer's outbox only as a SIDE EFFECT of `browse_share_code`'s
+    // (leaking) `ensure_relays` leaving those relays in the shared pool; scoping that away without
+    // scoping here would have silently narrowed enumeration to the caller's own relay set — the
+    // hardened-path/unhardened-sibling drift this repo's §9 warns about. Re-resolving the NIP-65
+    // list with an empty seed keeps the signature (and every caller) unchanged; it costs one
+    // extra kind-10002 REQ per enumeration.
+    let listing_filter = Filter::new().author(*peer).kind(Kind::from_u16(KIND_LISTING));
+    let resolved = resolve_peer_relays(client, peer, &[], &[], timeout).await;
+    let scoped = scope_peer_relays(client.relays(), &resolved);
+    let scoped_client = if scoped.is_empty() {
+        None
+    } else {
+        match RelayClient::connect(&Identity::generate(), &scoped, timeout).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::debug!(
+                    relays = ?scoped,
+                    error = %e,
+                    "listings: peer outbox unreachable; reading the configured pool only"
+                );
+                None
+            }
+        }
+    };
+    let mut events = match client.fetch(listing_filter.clone(), timeout).await {
         Ok(events) => events,
         // The fetch itself failed — propagate the state, never fold it into "empty" (a confident
         // negative on data that never arrived is the QURATOR-67/68/83/134 fault shape).
         Err(e) => return Ok((Vec::new(), ListingsState::FetchFailed(e.to_string()))),
     };
+    if let Some(sc) = scoped_client.as_ref() {
+        if let Ok(extra) = sc.fetch(listing_filter, timeout).await {
+            events.extend(extra);
+        }
+    }
+    let events = dedup_by_id(events);
+    if let Some(sc) = scoped_client {
+        sc.disconnect().await;
+    }
 
     let pinned = authored_by(events, peer);
     if pinned.is_empty() {
@@ -831,6 +940,74 @@ mod tests {
                 Ok(_) => panic!("{s:?} should not parse as a valid share code"),
             }
         }
+    }
+
+    // ── QURATOR-196 — peer-advertised relays never join the shared identity pool ─────────────
+    //
+    // The leak: `browse_share_code` used to `ensure_relays(&resolved_relays)` — `add_relay`ing the
+    // peer's advertised outbox onto the PERSISTENT shared M12 pool, with no removal anywhere. Pool
+    // membership is exactly "who receives every pool-wide fetch": `fetch_private_listings` /
+    // `fetch_key_grants` issue `{kinds:[1059], #p:[me]}` to the whole pool, so one browse of a
+    // hostile share code taught the node to reveal its own npub to an attacker-chosen relay
+    // indefinitely. The sentinel below is the PEER relay URL appearing in the shared pool — a
+    // user-configured relay would be logged infrastructure (§9), not a leak.
+
+    #[test]
+    fn scope_peer_relays_keeps_only_validated_non_pooled_relays() {
+        let pooled = vec!["wss://configured.example".to_string()];
+        let resolved = vec![
+            "wss://configured.example".to_string(), // already pooled: the user put it there
+            "wss://peer-outbox.example".to_string(), // peer-advertised, global: KEEP (scoped read)
+            "ws://127.0.0.1:7777".to_string(),       // peer-advertised loopback: SSRF-drop
+            "ws://10.1.2.3:7777".to_string(),        // peer-advertised private: SSRF-drop
+            "ws://mybox.local:7777".to_string(),     // mDNS name: SSRF-drop
+            "https://peer.example".to_string(),      // not ws/wss: drop
+        ];
+        assert_eq!(
+            scope_peer_relays(&pooled, &resolved),
+            vec!["wss://peer-outbox.example".to_string()],
+            "only the validated, not-already-pooled peer relays may be scoped in"
+        );
+        // Nothing new survives when the resolution holds only pool members.
+        assert!(scope_peer_relays(&pooled, &pooled).is_empty());
+    }
+
+    // Offline by construction: the shared client is `undialed` (relays registered in the pool,
+    // never dialled), so the peer's NIP-65 fetch fails and `resolved` falls back to the caller's
+    // seed — the test plants the PEER relay there, exactly where a hostile peer's outbox lands in
+    // the resolved order. `browse_share_code` may legitimately return Err here (an undialed pool
+    // cannot serve the teaser); the assertion is purely about shared-pool membership after the
+    // call, which is the surface every pool-wide `{kinds:[1059], #p:[me]}` fetch is issued to.
+    //
+    // PRODUCTION MUTATION THAT MUST RED THIS (§9 / P-10): restore the unconditional
+    // `let _ = client.ensure_relays(&resolved_relays, timeout).await;` in `browse_share_code`
+    // (replacing the scoped read). `add_relay` succeeds without dialling, `wss://peer-outbox.example`
+    // joins the shared pool, and this `assert_eq!` fails. The orchestrator applies that edit,
+    // confirms the red, and reverts.
+    #[tokio::test]
+    async fn browse_never_adds_a_peer_advertised_relay_to_the_shared_identity_pool() {
+        let me = Identity::generate();
+        let peer = Identity::generate().public_key();
+        let shared = RelayClient::undialed(&me, &["wss://configured.example".to_string()]).await;
+        let before = shared.pool_urls().await;
+        assert_eq!(before, vec!["wss://configured.example".to_string()]);
+
+        // Follow-only code: the relay-handling site runs before any browse-key use, so no key
+        // material is needed to reach the code under test.
+        let code = ShareCode::FollowOnly { pubkey: peer }.encode().unwrap();
+        let parsed = ok(&code);
+        // seed = the PEER's advertised outbox (not in the shared pool); own = the pooled relay.
+        // A hostile peer's resolved order is exactly this: their relay first.
+        let seed = vec!["wss://peer-outbox.example".to_string()];
+        let own = vec!["wss://configured.example".to_string()];
+        let _ = browse_share_code(&shared, &parsed, "slug", &seed, &own, Duration::from_secs(2)).await;
+
+        let after = shared.pool_urls().await;
+        assert_eq!(
+            after, before,
+            "a peer-advertised relay must never join the shared pool: pool membership IS the \
+             delivery set for the identity gift-wrap read (`#p:[me]`, priv_browse)"
+        );
     }
 
     // ── 2026-08-24 redesign: the slug-scoped two-phase family fetch (per-slug fetch, index

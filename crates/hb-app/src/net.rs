@@ -76,83 +76,27 @@ pub fn relay_urls(store: &DataStore) -> Vec<String> {
 /// SSRF guard on **user-supplied** relay URLs (audit I-11): reject any scheme other than
 /// `ws://`/`wss://`, and any host that is loopback (127.0.0.0/8, ::1, localhost), private
 /// (10/8, 172.16/12, 192.168/16, fc00::/7), link-local (169.254/16, fe80::/10), or another
-/// non-global class (chorus M13 #2: CGNAT 100.64/10, benchmarking 198.18/15, multicast,
+/// non-global class (chorus M13 #2: CGNAT 100.64.0.0/10, benchmarking 198.18/15, multicast,
 /// broadcast, documentation, unspecified) — including IPv4-mapped/-compatible IPv6
 /// (`::ffff:127.0.0.1`, `::10.0.0.5`) and bracketed hosts with ports. Hostnames are checked
 /// **literally only** (`localhost`, `*.localhost`, mDNS `*.local`) — there is deliberately NO DNS
 /// resolution here, so a public name that rebinds to a private IP is an accepted residual
 /// (prosumer tier; resolving would add a blocking lookup + TOCTOU without closing the hole).
-/// Guards the Settings input paths only — hb-net itself stays unguarded (the hb-it L2 harness
-/// legitimately dials a `ws://localhost` strfry).
+///
+/// The implementation lives in `hb_net::client::validate_relay_url` since QURATOR-196 (it now also
+/// guards peer-advertised relay URLs on the browse path, so it had to be reachable from hb-net);
+/// this wrapper keeps the `net::validate_relay_url` call sites and the app-layer tests unchanged,
+/// asserting against the ONE implementation.
 pub fn validate_relay_url(url: &str) -> Result<(), String> {
-    let parsed = nostr::Url::parse(url.trim()).map_err(|e| format!("Not a valid relay URL: {e}"))?;
-    match parsed.scheme() {
-        "ws" | "wss" => {}
-        other => return Err(format!("Relay URLs must start with ws:// or wss:// (got {other}://).")),
-    }
-    const PRIVATE: &str =
-        "This relay address points at a private/loopback network — enter a public relay URL.";
-    let host = parsed.host_str().ok_or_else(|| "The relay URL has no host.".to_string())?;
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(v4) = bare.parse::<std::net::Ipv4Addr>() {
-        if ipv4_non_global(v4) {
-            return Err(PRIVATE.into());
-        }
-    } else if let Ok(v6) = bare.parse::<std::net::Ipv6Addr>() {
-        if ipv6_non_global(v6) {
-            return Err(PRIVATE.into());
-        }
-    } else {
-        let name = bare.trim_end_matches('.').to_ascii_lowercase();
-        if name == "localhost" || name.ends_with(".localhost") || name.ends_with(".local") {
-            return Err(PRIVATE.into());
-        }
-    }
-    Ok(())
+    hb_net::validate_relay_url(url)
 }
 
-fn ipv4_non_global(ip: std::net::Ipv4Addr) -> bool {
-    let o = ip.octets();
-    ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_unspecified()
-        || ip.is_broadcast()
-        || ip.is_multicast()
-        || ip.is_documentation()
-        || (o[0] == 100 && (o[1] & 0xC0) == 64) // CGNAT 100.64.0.0/10 (chorus M13 #2)
-        || (o[0] == 198 && (o[1] & 0xFE) == 18) // benchmarking 198.18.0.0/15
-}
-
-fn ipv6_non_global(ip: std::net::Ipv6Addr) -> bool {
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return ipv4_non_global(v4);
-    }
-    let seg = ip.segments();
-    // Deprecated IPv4-compatible `::a.b.c.d` (::/96): judge the embedded v4 by its own class,
-    // exactly like the mapped form above (`::` and `::1` fall through to the checks below).
-    if seg[..6] == [0, 0, 0, 0, 0, 0] && !ip.is_loopback() && !ip.is_unspecified() {
-        if let Some(v4) = ip.to_ipv4() {
-            return ipv4_non_global(v4);
-        }
-    }
-    ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_unique_local()
-        || ip.is_unicast_link_local()
-        || ip.is_multicast()
-        || (seg[0] == 0x2001 && seg[1] == 0xdb8) // documentation 2001:db8::/32
-}
-
-/// Whether `ip` is non-globally-routable — the `IpAddr` dispatch wrapper over
-/// [`ipv4_non_global`]/[`ipv6_non_global`] for callers holding a bare address (e.g. a socket address
-/// from a peer-authored dial target, QURATOR-113 #20). No new classification: this only re-routes
-/// the two existing checks by address family.
+/// Whether `ip` is non-globally-routable — the `IpAddr` dispatch over hb-net's
+/// `ipv4_non_global`/`ipv6_non_global` for callers holding a bare address (e.g. a socket address
+/// from a peer-authored dial target, QURATOR-113 #20). Delegates to the one implementation in
+/// hb-net since QURATOR-196; no new classification.
 pub(crate) fn ip_non_global(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => ipv4_non_global(v4),
-        std::net::IpAddr::V6(v6) => ipv6_non_global(v6),
-    }
+    hb_net::ip_non_global(ip)
 }
 
 /// Local NAT classification inferred from the observed local address and, when available, the

@@ -103,6 +103,95 @@ fn canonical_relay_url(url: &str) -> String {
     lower.trim_end_matches('/').to_string()
 }
 
+/// SSRF guard on relay URLs (audit I-11): reject any scheme other than `ws://`/`wss://`, and any
+/// host that is loopback (127.0.0.0/8, ::1, localhost), private (10/8, 172.16/12, 192.168/16,
+/// fc00::/7), link-local (169.254/16, fe80::/10), or another non-global class (chorus M13 #2:
+/// CGNAT 100.64/10, benchmarking 198.18/15, multicast, broadcast, documentation, unspecified) —
+/// including IPv4-mapped/-compatible IPv6 (`::ffff:127.0.0.1`, `::10.0.0.5`) and bracketed hosts
+/// with ports. Hostnames are checked **literally only** (`localhost`, `*.localhost`, mDNS
+/// `*.local`) — there is deliberately NO DNS resolution here, so a public name that rebinds to a
+/// private IP is an accepted residual (prosumer tier; resolving would add a blocking lookup +
+/// TOCTOU without closing the hole).
+///
+/// Home moved from `hb-app::net` (QURATOR-196) so the ONE implementation guards both the
+/// Settings input paths and **peer-advertised** relay URLs (a browse's NIP-65 outbox, a peer's
+/// `big_relay_url`): a peer-supplied URL must never point the client at loopback/private
+/// infrastructure. `hb-app::net::validate_relay_url` now delegates here. Harness note: the hb-it
+/// L2 / WAN suites legitimately DIAL a `ws://localhost` strfry — those are the caller's own
+/// configured/seed relays (shared-pool members), which browse-side scoping never re-validates;
+/// only the peer-advertised not-already-pooled subset passes through this guard.
+pub fn validate_relay_url(url: &str) -> Result<(), String> {
+    let parsed = nostr::Url::parse(url.trim()).map_err(|e| format!("Not a valid relay URL: {e}"))?;
+    match parsed.scheme() {
+        "ws" | "wss" => {}
+        other => return Err(format!("Relay URLs must start with ws:// or wss:// (got {other}://).")),
+    }
+    const PRIVATE: &str =
+        "This relay address points at a private/loopback network — enter a public relay URL.";
+    let host = parsed.host_str().ok_or_else(|| "The relay URL has no host.".to_string())?;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(v4) = bare.parse::<std::net::Ipv4Addr>() {
+        if ipv4_non_global(v4) {
+            return Err(PRIVATE.into());
+        }
+    } else if let Ok(v6) = bare.parse::<std::net::Ipv6Addr>() {
+        if ipv6_non_global(v6) {
+            return Err(PRIVATE.into());
+        }
+    } else {
+        let name = bare.trim_end_matches('.').to_ascii_lowercase();
+        if name == "localhost" || name.ends_with(".localhost") || name.ends_with(".local") {
+            return Err(PRIVATE.into());
+        }
+    }
+    Ok(())
+}
+
+fn ipv4_non_global(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation()
+        || (o[0] == 100 && (o[1] & 0xC0) == 64) // CGNAT 100.64.0.0/10 (chorus M13 #2)
+        || (o[0] == 198 && (o[1] & 0xFE) == 18) // benchmarking 198.18.0.0/15
+}
+
+fn ipv6_non_global(ip: std::net::Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return ipv4_non_global(v4);
+    }
+    let seg = ip.segments();
+    // Deprecated IPv4-compatible `::a.b.c.d` (::/96): judge the embedded v4 by its own class,
+    // exactly like the mapped form above (`::` and `::1` fall through to the checks below).
+    if seg[..6] == [0, 0, 0, 0, 0, 0] && !ip.is_loopback() && !ip.is_unspecified() {
+        if let Some(v4) = ip.to_ipv4() {
+            return ipv4_non_global(v4);
+        }
+    }
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_unique_local()
+        || ip.is_unicast_link_local()
+        || ip.is_multicast()
+        || (seg[0] == 0x2001 && seg[1] == 0xdb8) // documentation 2001:db8::/32
+}
+
+/// Whether `ip` is non-globally-routable — the `IpAddr` dispatch wrapper over
+/// [`ipv4_non_global`]/[`ipv6_non_global`] for callers holding a bare address (e.g. a socket address
+/// from a peer-authored dial target, QURATOR-113 #20). No new classification: this only re-routes
+/// the two existing checks by address family. (`hb-app::net::ip_non_global` delegates here since
+/// QURATOR-196, so the address classes stay single-sourced.)
+pub fn ip_non_global(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => ipv4_non_global(v4),
+        std::net::IpAddr::V6(v6) => ipv6_non_global(v6),
+    }
+}
+
 /// Log the per-relay outcome of a publish (QURATOR-66). strfry rejects future-dated and NIP-40-
 /// expired events at the **write** boundary, and that rejection was previously invisible — the
 /// caller saw `PublishOutcome.rejected` only as an error string when ALL relays rejected. Logging
@@ -501,6 +590,45 @@ impl RelayClient {
     /// the underlying client but not recorded here — this getter reports the initial configured set.)
     pub fn relays(&self) -> &[String] {
         &self.relays
+    }
+
+    /// Test-only (QURATOR-196): build a client whose relays are REGISTERED in the nostr pool but
+    /// never dialed — `connect` without the handshake race — so an offline unit test can observe
+    /// **pool membership** (the leak shape: pool members are exactly the relays every pool-wide
+    /// fetch, including the `{kinds:[1059], #p:[me]}` private-inbox read, is issued to) without
+    /// standing up a relay. `add_relay` alone does not dial; only `try_connect` does.
+    #[cfg(test)]
+    pub(crate) async fn undialed(identity: &Identity, relays: &[String]) -> Self {
+        let client = Client::builder().signer(identity.keys().clone()).build();
+        for r in relays {
+            client
+                .add_relay(r.as_str())
+                .await
+                .expect("add_relay registers without dialing");
+        }
+        Self {
+            client,
+            relays: relays.to_vec(),
+            limiter: Mutex::new(RelayRateLimiter::relay_writes()),
+            start: Instant::now(),
+        }
+    }
+
+    /// Test-only (QURATOR-196): the URLs currently in the underlying nostr pool, canonicalized —
+    /// the honest view of "who would receive a pool-wide fetch", unlike [`Self::relays`] (the
+    /// configured set) and [`Self::relay_status`] (which deliberately reports configured relays
+    /// only). This is the sentinel surface the leak tests assert on.
+    #[cfg(test)]
+    pub(crate) async fn pool_urls(&self) -> Vec<String> {
+        let mut urls: Vec<String> = self
+            .client
+            .relays()
+            .await
+            .keys()
+            .map(|u| canonical_relay_url(&u.to_string()))
+            .collect();
+        urls.sort();
+        urls
     }
 
     /// Ensure the client is connected to every relay in `relays`, adding + connecting any not in the

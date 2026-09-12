@@ -38,8 +38,8 @@ pub use browse::{
 };
 pub use cache::{cache_decision, CacheDecision, CachedListing, CACHE_FRESH_SECS};
 pub use client::{
-    dedup_by_id, pool_is_live, teaser_search_filter, PublishOutcome, RelayClient, RelayHealth,
-    TEASER_SEARCH_FETCH_LIMIT,
+    dedup_by_id, ip_non_global, pool_is_live, teaser_search_filter, validate_relay_url,
+    PublishOutcome, RelayClient, RelayHealth, TEASER_SEARCH_FETCH_LIMIT,
 };
 pub use count::{
     count_online, count_userbase, count_userbase_for, fetch_online_presence,
