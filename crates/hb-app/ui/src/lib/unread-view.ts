@@ -7,10 +7,25 @@
 // Scope: DM-only. Topic channels carry no unread signal anywhere in the app — this stays that way.
 
 import type { ReceivedMessage } from './types.js';
+import { manifestRequestHint, accessRequestHint } from './request-inbox.js';
+import { transportTicketHint } from './transport-ticket.js';
+
+/** QURATOR-204: manifest asks, access requests and transport tickets ride the real chat kind
+ *  (kind 14) at the wire level — see chat.rs's QURATOR-187 kind guard, which only screens out the
+ *  key-grant/private-listing kinds, not these. They already render as a hint bubble, not a chat
+ *  message (chat/+page.svelte), so they must not bump the chat unread badge either. */
+function isMachinePayload(content: string): boolean {
+	return (
+		manifestRequestHint(content) !== null ||
+		accessRequestHint(content) !== null ||
+		transportTicketHint(content) !== null
+	);
+}
 
 /** Unread DM count per sender npub: messages strictly newer than that peer's watermark
  *  (`watermarks[from] ?? ''` — an absent watermark counts everything). Skips the caller's own
- *  sent-echoes (`from === ownNpub`) — those never count as unread. */
+ *  sent-echoes (`from === ownNpub`) — those never count as unread. Also skips a recognized
+ *  manifest-ask / access-request / transport-ticket payload (QURATOR-204) — those aren't chat. */
 export function unreadByPeer(
 	inbox: ReceivedMessage[],
 	watermarks: Record<string, string>,
@@ -19,6 +34,7 @@ export function unreadByPeer(
 	const counts: Record<string, number> = {};
 	for (const m of inbox) {
 		if (m.from === ownNpub) continue;
+		if (isMachinePayload(m.content)) continue;
 		const watermark = watermarks[m.from] ?? '';
 		if (m.sent_at > watermark) {
 			counts[m.from] = (counts[m.from] ?? 0) + 1;
