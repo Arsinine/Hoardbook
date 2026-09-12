@@ -48,15 +48,15 @@ describe('collection-row-view', () => {
 		expect(publishedKeys).not.toContain('export');
 	});
 
-	it('q138_the_remove_affordance_is_named_delete', () => {
-		// QURATOR-138 AC 5: the affordance is named Delete, not Unpublish — in BOTH states, since
-		// Delete is now the one operation (published collections retract + remove; drafts remove).
-		// Mutation to redden: change menuItems' `{ key: 'remove', label: 'Delete' }` label back to
-		// 'Remove' — both assertions fail.
+	it('q202_the_remove_affordance_is_named_remove_not_delete', () => {
+		// QURATOR-202 (owner ruling): the verb is Remove, not Delete — the action only touches the
+		// local record and the published event, never the user's files, in BOTH states.
+		// Mutation to redden: change menuItems' `{ key: 'remove', label: 'Remove' }` label back to
+		// 'Delete' — both assertions fail.
 		for (const published of [false, true]) {
 			const labels = menuItems(col({ published })).filter((i) => i.key === 'remove');
 			expect(labels).toHaveLength(1);
-			expect(labels[0].label).toBe('Delete');
+			expect(labels[0].label).toBe('Remove');
 		}
 	});
 

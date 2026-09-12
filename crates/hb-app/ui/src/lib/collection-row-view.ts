@@ -22,9 +22,9 @@ export type RowMenuItem =
 
 /** The overflow-menu items for a row, in display order. There is no Unpublish — QURATOR-138
  *  (owner ruling 2026-08-30): "Unpublish becomes DELETE. One destructive operation that removes
- *  the local record and zeroes the published event." Delete is the single retract+remove
- *  affordance, confirmed before it runs (INV-8). The `published` flag now picks only the Delete
- *  confirm copy (retraction wording for published rows) — see CollectionRow.svelte. */
+ *  the local record and zeroes the published event." QURATOR-202 (owner ruling): the verb is
+ *  Remove, not Delete — the action never touches the user's files, only the local record and the
+ *  published event, so it no longer warrants destructive framing or a confirm step. */
 export function menuItems(col: Pick<Collection, 'published'>): RowMenuItem[] {
 	// QURATOR-138: the Export entry (and its text/markdown/manifest submenu) is deleted — owner:
 	// "Delete the … export buttons in collections as well."
@@ -32,7 +32,7 @@ export function menuItems(col: Pick<Collection, 'published'>): RowMenuItem[] {
 		{ key: 'rescan', label: 'Rescan' },
 		{ key: 'edit', label: 'Edit details' },
 		{ key: 'publish', label: 'Publish' },
-		{ key: 'remove', label: 'Delete' },
+		{ key: 'remove', label: 'Remove' },
 	];
 }
 

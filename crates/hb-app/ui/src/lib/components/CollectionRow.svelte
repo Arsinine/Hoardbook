@@ -6,7 +6,6 @@
 	import type { Collection } from '../types.js';
 	import { deriveRowChip, menuItems, badges, sizeTier, sizeTierTooltip, rowIcon, type RowMenuItem } from '../collection-row-view.js';
 	import CollectionPanel from './CollectionPanel.svelte';
-	import ConfirmButton from './ConfirmButton.svelte';
 	import OverflowMenu from './OverflowMenu.svelte';
 	import { icons } from '../icons.js';
 
@@ -115,16 +114,9 @@
 <OverflowMenu open={menuOpen} anchor={menuBtnEl} onclose={closeMenu}>
 	{#each items as item (item.key)}
 		{#if item.key === 'remove'}
-			<div class="menu-item menu-item-confirm">
-				<ConfirmButton
-					role="menuitem"
-					label={item.label}
-					confirmText={collection.published
-						? 'Deletes your local record AND unpublishes. People who already fetched this collection keep their copy.'
-						: 'Deletes your local record. This cannot be undone.'}
-					onconfirm={handleRemoveConfirm}
-				/>
-			</div>
+			<button type="button" role="menuitem" class="menu-item" onclick={handleRemoveConfirm}>
+				{item.label}
+			</button>
 		{:else}
 			<button type="button" role="menuitem" class="menu-item" onclick={() => handleItemClick(item)}>
 				{item.label}
@@ -253,7 +245,4 @@
 		cursor: pointer;
 	}
 	.menu-item:hover { background: var(--bg-elev3); }
-
-
-	.menu-item-confirm { padding: 3px 6px; display: flex; }
 </style>
