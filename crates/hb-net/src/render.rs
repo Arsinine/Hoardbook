@@ -225,7 +225,13 @@ fn render_v2(payloads: &[String]) -> Result<RenderedListing, NetError> {
     let mut filled: Vec<Option<Value>> = vec![None; part_count];
     let mut matched_bytes: usize = 0;
     for raw in &candidates {
-        let slot = match slot_hashes.iter().position(|s| s == &sha256_hex(raw.as_bytes())) {
+        // Digest each candidate exactly ONCE (QURATOR-195): with the sha256 inside the `.position`
+        // closure it was recomputed once per slot COMPARED — O(candidates × part_count) full-payload
+        // hashes on a peer-authored listing (worst case ~4096 × ~700). Purely computational: which
+        // part fills which slot is unchanged. Pinned by `v2_slot_matcher_digests_each_candidate_once`
+        // (split.rs) via the shared `sha256_hex` call counter. Twin of the `restitch_v2` hoist.
+        let raw_sha = sha256_hex(raw.as_bytes());
+        let slot = match slot_hashes.iter().position(|s| s == &raw_sha) {
             Some(slot) => slot,
             None => continue,
         };

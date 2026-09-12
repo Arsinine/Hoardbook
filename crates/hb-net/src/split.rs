@@ -74,7 +74,31 @@ fn normalize(json: &str) -> Result<String, NetError> {
 /// Hex-encode a sha256 digest of `bytes` (lowercase). No `hex` crate dependency needed — this
 /// crate already carries `sha2`, and a lowercase-hex fold is a one-liner.
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    #[cfg(test)]
+    SHA256_CALLS.with(|c| c.set(c.get() + 1));
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// Test-only per-thread count of `sha256_hex` invocations. Lets a test pin that the v2
+// slot-matching loops (`restitch_v2` here, `render_v2` in `render.rs`) digest each candidate
+// part exactly ONCE (QURATOR-195's hoist) rather than once per slot COMPARED — measuring the
+// production call sites themselves, not a re-emitted copy of them. Thread-local so parallel
+// libtest threads cannot cross-contaminate each other's counts. Zero cost in non-test builds.
+#[cfg(test)]
+thread_local! {
+    static SHA256_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Read the per-thread `sha256_hex` call count (see [`sha256_hex`]). Test-only.
+#[cfg(test)]
+pub(crate) fn sha256_call_count() -> u64 {
+    SHA256_CALLS.with(|c| c.get())
+}
+
+/// Zero the per-thread `sha256_hex` call count (see [`sha256_hex`]). Test-only.
+#[cfg(test)]
+pub(crate) fn reset_sha256_call_count() {
+    SHA256_CALLS.with(|c| c.set(0))
 }
 
 /// 64 lowercase hex characters — the exact shape a digest from [`sha256_hex`] takes.
@@ -863,7 +887,12 @@ fn restitch_v2(parts: &[String]) -> Result<String, NetError> {
     let mut filled: Vec<Option<Value>> = vec![None; part_count];
     let mut matched_bytes: usize = 0;
     for raw in &candidates {
-        let slot = match slot_hashes.iter().position(|s| s == &sha256_hex(raw.as_bytes())) {
+        // Digest each candidate exactly ONCE (QURATOR-195): with the sha256 inside the `.position`
+        // closure it was recomputed once per slot COMPARED — O(candidates × part_count) full-payload
+        // hashes on a peer-authored listing (worst case ~4096 × ~700). Purely computational: which
+        // part fills which slot is unchanged. Pinned by `v2_slot_matcher_digests_each_candidate_once`.
+        let raw_sha = sha256_hex(raw.as_bytes());
+        let slot = match slot_hashes.iter().position(|s| s == &raw_sha) {
             Some(slot) => slot,
             None => continue, // sha256 matches no declared slot → stale/unreferenced, ignored
         };
@@ -1583,6 +1612,84 @@ mod tests {
         // array, not a number — must fail, so it falls into its existing clean "index missing part
         // count" error instead of silently mis-rendering.
         assert!(index.get("parts").and_then(Value::as_u64).is_none());
+    }
+
+    /// QURATOR-195: both v2 slot-matchers — `restitch_v2` (this file) and `render_v2`
+    /// (`render.rs`), both reached here through their production dispatchers — must digest each
+    /// candidate part exactly ONCE. The quadratic form this pins out,
+    /// `slot_hashes.iter().position(|s| s == &sha256_hex(raw.as_bytes()))`, recomputed the
+    /// full-payload SHA-256 once per slot COMPARED, so a peer-authored listing cost
+    /// O(candidates × part_count) full hashes (worst case ~4096 × ~700 ≈ 2.9M). The count is
+    /// taken inside `sha256_hex` itself (`#[cfg(test)]` thread-local counter), so this measures
+    /// the production call sites, not a lookalike re-emitted here.
+    ///
+    /// MUTATION THAT MUST RED THIS TEST (P-10): in `restitch_v2`, delete the hoisted
+    /// `let raw_sha = sha256_hex(raw.as_bytes());` and move the call back inside the closure —
+    /// `slot_hashes.iter().position(|s| s == &sha256_hex(raw.as_bytes()))`. The restitch count
+    /// below must then read 33, not 8 (six matched parts found at slots 0..5 cost 1+2+…+6 = 21
+    /// comparisons; each of the two stale parts scans all 6 slots and misses → 12 more), and the
+    /// `assert_eq!` fails. Doing the same in `render_v2` (render.rs) reds the render half
+    /// identically. Assembled results are byte-identical either way — only the call count moves,
+    /// which is exactly what this pins.
+    #[test]
+    fn v2_slot_matcher_digests_each_candidate_once() {
+        // Six content parts (slots 0..5) plus two stale parts matching no declared slot — the
+        // stale ones are the quadratic form's worst case: a full scan that misses.
+        let mut payloads: Vec<String> = Vec::with_capacity(9);
+        let mut hashes: Vec<String> = Vec::with_capacity(6);
+        for i in 0..6 {
+            let p = serde_json::json!({
+                "entries": [{"name": format!("p{i}")}],
+                "mount": [], "part": i, "parts_v": 2
+            })
+            .to_string();
+            hashes.push(sha256_hex(p.as_bytes()));
+            payloads.push(p);
+        }
+        for i in 0..2 {
+            payloads.push(
+                serde_json::json!({
+                    "entries": [{"name": format!("stale{i}")}],
+                    "mount": [], "part": 0, "parts_v": 2
+                })
+                .to_string(),
+            );
+        }
+        let index = serde_json::json!({
+            "slug": "quad", "split": true, "parts_v": 2, "part_count": 6,
+            "parts": hashes.into_iter().map(|h| serde_json::json!({ "sha256": h })).collect::<Vec<_>>(),
+        })
+        .to_string();
+        let mut family = vec![index];
+        family.extend(payloads.iter().cloned());
+        const CANDIDATES: u64 = 8; // every candidate — matched or stale — is digested exactly once
+
+        // Correctness through the hoist first, then the cost pin. Restitch:
+        reset_sha256_call_count();
+        let restitched = restitch_listing(&family).expect("restitch must still succeed post-hoist");
+        assert_eq!(
+            sha256_call_count(),
+            CANDIDATES,
+            "restitch_v2 must digest each candidate once — QURATOR-195 hoist reverted?"
+        );
+        let v: Value = serde_json::from_str(&restitched).unwrap();
+        let names: Vec<&str> =
+            v["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["p0", "p1", "p2", "p3", "p4", "p5"], "slot order, stale ignored");
+
+        // Render (the production browse path; `render_v2` is its private v2 leg):
+        reset_sha256_call_count();
+        let rendered = crate::render::render_listing(&family).expect("render must still succeed post-hoist");
+        assert_eq!(
+            sha256_call_count(),
+            CANDIDATES,
+            "render_v2 must digest each candidate once — QURATOR-195 hoist reverted?"
+        );
+        assert_eq!(rendered.parts_total, 6);
+        assert_eq!(rendered.parts_present, 6);
+        assert!(rendered.missing.is_empty(), "all six slots must be filled");
+        let rnames: Vec<&str> = rendered.entries.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(rnames, ["p0", "p1", "p2", "p3", "p4", "p5"], "slot order, stale ignored");
     }
 
     /// Minimal seeded xorshift32 PRNG — no new dependency, just enough determinism for the
