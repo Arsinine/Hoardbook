@@ -129,6 +129,25 @@ pub(crate) fn stamp_teaser_fingerprint(listing_json: &str) -> Result<String, Str
     serde_json::to_string(&out).map_err(cmd_err)
 }
 
+/// The one place that decides whether a listing will truncate and, when it will, stamps it into its
+/// final publishable form (QURATOR-205): the `will_truncate` decision is made on the UNSTAMPED bytes
+/// (stamping a ~40-byte URL must never itself tip a near-limit collection into truncation), then, only
+/// on that branch, the big-relay URL and the teaser digest are stamped in — in that order, since the
+/// URL adds meta bytes that shift the entries budget `truncate_listing` uses to decide what stays
+/// visible. Shared by the publish path (`publish_collection_inner`) and the mint path
+/// (`build_slug_manifest`) so the two cannot derive different visible-entry sets, and therefore
+/// different `snapshot_fingerprint` digests, for the SAME unchanged collection. A listing that fits
+/// the budget whole is returned byte-identical.
+pub(crate) fn stamp_for_teaser(listing_json: &str, big_relay_url: &str) -> Result<String, String> {
+    let will_truncate =
+        hb_net::truncate_listing(listing_json, LISTING_MAX_BYTES).map_err(cmd_err)?.truncated;
+    if will_truncate {
+        stamp_teaser_fingerprint(&stamp_big_relay_url(listing_json, big_relay_url)?)
+    } else {
+        Ok(listing_json.to_string())
+    }
+}
+
 /// Collection with publication status, returned to the frontend.
 #[derive(Debug, Clone, Serialize)]
 pub struct CollectionEntry {
@@ -373,7 +392,9 @@ pub async fn delete_collection(
     // the profile teaser's content_types union and still has listing events on relays. Unpublish it
     // first (tombstone + NIP-09 delete + teaser content_types/tags recompute, all best-effort
     // offline) so removal drops it from the public teaser AND from relays, then delete the local
-    // draft/marker — the local record goes too. INV-8: the caller (UI) must have confirmed.
+    // draft/marker — the local record goes too. This never touches the user's files (only the
+    // local record and the published event), so QURATOR-202 (owner ruling) drops the confirm step
+    // in the UI — no INV-8 confirmation gate here.
     if store.is_published(safe_slug) {
         let (id_clone, key_clone) = {
             let guard = identity.read().await;
@@ -636,17 +657,7 @@ pub(crate) async fn publish_collection_inner(
     // tip a near-limit collection over the cap into an unnecessary teaser (Codex finding 3). A whole
     // listing is therefore left byte-identical.
     let big_relay_url = store.load_settings().map_err(cmd_err)?.unwrap_or_default().big_relay_url;
-    let will_truncate =
-        hb_net::truncate_listing(&listing_json, LISTING_MAX_BYTES).map_err(cmd_err)?.truncated;
-    let listing_json = if will_truncate {
-        // Order matters for the teaser digest: stamp the URL first, then derive `teaser_fingerprint`
-        // from the SAME final bytes the teaser publish will truncate (the URL adds meta bytes, which
-        // moves the entries budget and therefore what is visible). The teaser itself is re-stamped
-        // inside `truncate_listing` regardless.
-        stamp_teaser_fingerprint(&stamp_big_relay_url(&listing_json, &big_relay_url)?)?
-    } else {
-        listing_json
-    };
+    let listing_json = stamp_for_teaser(&listing_json, &big_relay_url)?;
 
     let client = net::client(identity, store, relay).await.map_err(cmd_err)?;
     // devtest #7: publish a single event, truncated (paywall teaser) when the listing is too large,
@@ -856,15 +867,20 @@ pub(crate) fn build_slug_manifest(
     // on the SAME bytes, then reading the digest out of the artifact — not by re-implementing the
     // derivation. A listing that fits the budget whole carries the full-tree digest (nothing is
     // hidden), which is what the teaser carries then too, so parity holds on both branches.
+    //
+    // QURATOR-205: the mint path must stamp the SAME final bytes the publish path truncates — a big
+    // relay URL rides into the listing meta before truncation and shifts the entries budget, so what
+    // counts as "visible" (and therefore the digest) can differ between an unstamped mint and a
+    // stamped publish of the SAME unchanged collection. `stamp_for_teaser` is the one function both
+    // paths call, so they cannot drift apart again.
     let plaintext = collection_to_listing_json(col.clone())?;
+    let big_relay_url = store.load_settings().map_err(cmd_err)?.unwrap_or_default().big_relay_url;
+    let plaintext = stamp_for_teaser(&plaintext, &big_relay_url)?;
     let teaser = hb_net::truncate_listing(&plaintext, LISTING_MAX_BYTES).map_err(cmd_err)?;
     let fingerprint = serde_json::from_str::<serde_json::Value>(&teaser.json)
         .ok()
         .and_then(|v| v.get("snapshot_fingerprint").and_then(|f| f.as_str()).map(str::to_string))
         .unwrap_or_else(|| hb_core::snapshot_fingerprint(&col.listing).0);
-    // The sealed plaintext is the full tree with the teaser digest stamped beside it, so the
-    // imported family's meta carries the same value the envelope's signed digest names.
-    let plaintext = stamp_teaser_fingerprint(&plaintext)?;
     // Chunk the listing exactly like the big-relay carrier — split at the per-part NIP-44 budget, so a
     // `.hbmanifest` can hold a collection of ANY size (the envelope stores the encrypted parts inline,
     // bounded by part count, not by one event's plaintext cap). A listing that fits one event yields a
@@ -2825,6 +2841,64 @@ mod tests {
         );
         assert_eq!(env.snapshot_fingerprint, teaser_fp, "the envelope gates on the teaser digest");
         assert!(env.matches_fingerprint(&teaser_fp), "the manifest is not stale against its teaser");
+    }
+
+    #[test]
+    // QURATOR-205: publish and mint must agree on the digest of the SAME unchanged collection when a
+    // big relay is configured and the listing truncates. Before the fix, `build_slug_manifest`
+    // truncated the bare, unstamped `plaintext` while `publish_collection_inner` stamped
+    // `big_relay_url` (then `teaser_fingerprint`) into the listing BEFORE truncating — the extra meta
+    // bytes shift `truncate_listing`'s budget, so the two paths can keep different visible entries and
+    // therefore mint different `snapshot_fingerprint` digests for a collection that never changed.
+    //
+    // Mutation-proof (P-10): in `build_slug_manifest`, replace
+    //     `let plaintext = stamp_for_teaser(&plaintext, &big_relay_url)?;`
+    // with
+    //     `let plaintext = plaintext;` (i.e. drop the `stamp_for_teaser` call, reverting to the bare,
+    //     unstamped `plaintext` the pre-fix code truncated) — this test must then fail on the final
+    //     `assert_eq!` below, since the mint path would once again truncate different bytes than the
+    //     publish-equivalent computation it's compared against.
+    fn build_slug_manifest_matches_the_publish_digest_when_a_big_relay_is_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        // Pin the relay set unroutable first (avoids the empty-relay-set → real DEFAULT_RELAYS
+        // fallback), then re-save with the big relay ALSO set: `pin_unroutable_relays` replaces the
+        // whole `Settings` struct via `..Default::default()`, so a later save must re-specify BOTH
+        // fields together or it would silently wipe the sentinel relay back to empty.
+        crate::store::tests::pin_unroutable_relays(&store);
+        store
+            .save_settings(&crate::store::Settings {
+                relay_urls: vec!["wss://hoardbook-test-sentinel.invalid".into()],
+                big_relay_url: "wss://big.example:7777".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let identity = Identity::generate();
+        let browse_key: BrowseKey = [7u8; 32];
+        let col = a_big_collection("vault");
+        store.save_collection_draft(&col).unwrap();
+
+        let env = build_slug_manifest("vault", &store, &identity, &browse_key).unwrap();
+
+        // The publish-path-equivalent computation: the SAME stamping sequence
+        // `publish_collection_inner` runs (via the shared `stamp_for_teaser`), on the SAME
+        // collection, then truncated the SAME way, reading the digest back out of the artifact.
+        let full = collection_to_listing_json(col).unwrap();
+        let stamped = stamp_for_teaser(&full, "wss://big.example:7777").unwrap();
+        let t = hb_net::truncate_listing(&stamped, LISTING_MAX_BYTES).unwrap();
+        assert!(t.truncated, "the fixture must truncate");
+        let publish_fp = serde_json::from_str::<serde_json::Value>(&t.json)
+            .unwrap()
+            .get("snapshot_fingerprint")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        assert_eq!(
+            env.snapshot_fingerprint, publish_fp,
+            "mint and publish must agree on the teaser digest for the same unchanged collection \
+             once a big relay is configured"
+        );
     }
 
     // ── M16 W4: manifest export (the `.hbmanifest` envelope) ─────────────────────
