@@ -104,7 +104,7 @@ use std::time::Duration;
 
 use nostr::prelude::*;
 
-use crate::commands::chat::decode_dms;
+use crate::commands::chat::{decode_dms, DM_FETCH_MARGIN_SECS, DM_INBOX_FETCH_LIMIT};
 use crate::commands::fulfil::{send_cached_manifest_inner, send_full_list_inner};
 use crate::identity_state::SharedIdentity;
 use crate::net::{self, SharedRelay};
@@ -359,6 +359,21 @@ pub(crate) fn approval_body_for(body: &ManifestRequestBody) -> ApprovalBody {
     }
 }
 
+/// QURATOR-197 — this loop's gift-wrap inbox filter: the SAME hardening `dm_inbox_filter`
+/// (`commands/chat.rs`) gives the chat inbox, so the background poll is not the unhardened sibling
+/// of the pair. The explicit `.limit()` keeps the fetch budget ours — without it the 5 s poll
+/// leaves the response size to the relay's own default (strfry's `maxFilterLimit`; CWE-400) and
+/// re-decrypts whatever comes back, every tick. `since == 0` (cold cursor) omits the window, so
+/// the first poll stays the one full initial pull.
+fn auto_approve_inbox_filter(me: PublicKey, since: u64) -> Filter {
+    let f = Filter::new().kind(Kind::GiftWrap).pubkey(me).limit(DM_INBOX_FETCH_LIMIT);
+    if since > 0 {
+        f.since(Timestamp::from(since))
+    } else {
+        f
+    }
+}
+
 /// The loop itself. Runs forever; every decision is logged (info for approvals, debug/warn for the
 /// human-fallback cases) so a real run produces evidence without spamming idle polls.
 ///
@@ -458,14 +473,12 @@ pub(crate) async fn run_auto_approve_loop(
         let relays = net::relay_urls(&store);
         let now_outer = now_secs();
         // Bandwidth-only cursor (see the declaration above); the 48 h margin is `get_messages`'s
-        // own `DM_FETCH_MARGIN_SECS` allowance for relay-side `since` boundary wobble.
+        // own `DM_FETCH_MARGIN_SECS` allowance for relay-side `since` boundary wobble — the shared
+        // const, not a copy of its value, so the two windows can't drift (QURATOR-197).
         let since = newest_seen_outer
-            .saturating_sub(48 * 60 * 60)
+            .saturating_sub(DM_FETCH_MARGIN_SECS)
             .min(now_outer);
-        let mut filter = Filter::new().kind(Kind::GiftWrap).pubkey(identity.public_key());
-        if since > 0 {
-            filter = filter.since(Timestamp::from(since));
-        }
+        let filter = auto_approve_inbox_filter(identity.public_key(), since);
         let wraps = match RelayClient::connect(&identity, &relays, AUTO_APPROVE_FETCH_TIMEOUT).await {
             Ok(client) => {
                 let fetched = client.fetch(filter, AUTO_APPROVE_FETCH_TIMEOUT).await;
@@ -655,6 +668,35 @@ mod tests {
     use hb_core::Identity;
     use nostr::prelude::ToBech32;
 
+    /// QURATOR-197 — the poll's inbox filter must carry an explicit fetch budget, mirroring
+    /// `dm_inbox_filter`'s pin (audit #11, CWE-400): without `.limit()` the 5 s poll leaves the
+    /// response size to the relay's own default and re-decrypts whatever comes back, every tick.
+    ///
+    /// MUTATION (P-10) — remove `.limit(DM_INBOX_FETCH_LIMIT)` from `auto_approve_inbox_filter`
+    /// and the first two asserts red (`None != Some(1000)`); remove the `since` arm and the
+    /// third reds.
+    #[test]
+    fn auto_approve_inbox_filter_declares_a_fetch_budget() {
+        let me = Identity::generate();
+        let cold = auto_approve_inbox_filter(me.public_key(), 0);
+        assert_eq!(
+            cold.limit,
+            Some(DM_INBOX_FETCH_LIMIT),
+            "the cold-cursor filter declares a budget"
+        );
+        let warm = auto_approve_inbox_filter(me.public_key(), 1_700_000_000);
+        assert_eq!(
+            warm.limit,
+            Some(DM_INBOX_FETCH_LIMIT),
+            "the incremental filter too"
+        );
+        assert_eq!(
+            warm.since.map(|s| s.as_secs()),
+            Some(1_700_000_000),
+            "a warm cursor bounds the fetch window"
+        );
+        assert!(cold.since.is_none(), "a cold cursor keeps the one full initial pull");
+    }
 
     fn npub_of(id: &Identity) -> String {
         id.public_key().to_bech32().unwrap()

@@ -940,7 +940,8 @@ pub struct Watch {
 }
 
 /// Parse a persisted `sent_at` (RFC3339, any offset) into a UTC instant. `None` on unparseable input.
-fn parse_watermark_ts(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+/// Also the fetch driver's QURATOR-197 `since` anchor parse.
+pub(crate) fn parse_watermark_ts(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|d| d.with_timezone(&chrono::Utc))

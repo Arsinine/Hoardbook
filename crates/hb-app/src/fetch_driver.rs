@@ -47,13 +47,16 @@ use nostr::prelude::*;
 use tokio::time::Instant;
 
 use crate::commands::browse::{contact_share_code, resolve_peer};
-use crate::commands::chat::{decode_dms, request_manifest_from_inner, request_manifest_inner};
+use crate::commands::chat::{
+    decode_dms, request_manifest_from_inner, request_manifest_inner, DM_FETCH_MARGIN_SECS,
+    DM_INBOX_FETCH_LIMIT,
+};
 use crate::commands::fulfil::redeem_manifest_ticket_inner;
 use crate::identity_state::SharedIdentity;
 use crate::manifest_cache::CachedKey;
 use crate::net::SharedRelay;
 use crate::peer_wave::{next_action, Candidate, WaveAction};
-use crate::store::{manifest_ask_key, DataStore};
+use crate::store::{manifest_ask_key, parse_watermark_ts, ManifestAsk, DataStore};
 use crate::transport_state::SharedEndpoint;
 
 /// How often the driver re-reads published fingerprints.
@@ -175,6 +178,51 @@ pub(crate) fn asked_peers<V>(asks: &HashMap<String, V>) -> HashSet<String> {
     asks.keys().filter_map(|k| k.split('|').next()).map(String::from).collect()
 }
 
+/// Unix seconds now — the same helper shape every module here carries (cf. `auto_approve`).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// QURATOR-197 — the `since` floor for [`redeem_pending_tickets`]' inbox fetch.
+///
+/// A wrap this loop can redeem answers an ask this node sent (the `allow` list and the ask lookup
+/// in the redeem body both enforce that), so it cannot predate the oldest still-pending ask:
+/// anchoring the window there covers every legitimate — including much-delayed — answer, while
+/// stopping the 300 s poll from re-fetching all-time history every tick. `DM_FETCH_MARGIN_SECS`
+/// is the same NIP-59 outer-stamp wobble allowance `dm_inbox_filter` subtracts (a peer's clock
+/// may also sit behind ours). The `.min(now)` clamp keeps a hostile or skewed future `sent_at`
+/// from future-poisoning the window (the codebase's clamp-to-now discipline). Any absent or
+/// unparseable trace maps to 0, forcing the WHOLE window open — the pre-QURATOR-197 fetch's
+/// behaviour, never silent delivery loss.
+fn ticket_inbox_since(asks: &HashMap<String, ManifestAsk>, now: u64) -> u64 {
+    asks.values()
+        .map(|a| {
+            parse_watermark_ts(&a.sent_at)
+                .map(|ts| ts.timestamp().max(0) as u64)
+                .unwrap_or(0)
+        })
+        .min()
+        .map(|oldest| oldest.saturating_sub(DM_FETCH_MARGIN_SECS).min(now))
+        .unwrap_or(0)
+}
+
+/// QURATOR-197 — the redemption poll's inbox filter: BOTH bounds the chat inbox's
+/// `dm_inbox_filter` (`commands/chat.rs`) already carries. The `.limit()` keeps the fetch budget
+/// ours (CWE-400 — otherwise the relay's own default decides how much the 300 s poll
+/// re-decrypts); the `since` window (from [`ticket_inbox_since`]) stops the poll from
+/// re-fetching all-time history. `since == 0` omits the window — the cold/fail-open anchor.
+fn ticket_inbox_filter(me: PublicKey, since: u64) -> Filter {
+    let f = Filter::new().kind(Kind::GiftWrap).pubkey(me).limit(DM_INBOX_FETCH_LIMIT);
+    if since > 0 {
+        f.since(Timestamp::from(since))
+    } else {
+        f
+    }
+}
+
 /// Drain tickets that answer asks THIS node sent, redeeming each through the production body.
 ///
 /// Runs at the START of a poll, before the staleness check, so a ticket that arrived since the last
@@ -200,6 +248,11 @@ async fn redeem_pending_tickets(
     }
     let allow = asked_peers(&asks);
 
+    // QURATOR-197 — bound the redemption fetch: the window anchors to the oldest pending ask
+    // (minus the shared wobble allowance, clamped to now), the budget to the shared inbox limit.
+    // Neither narrows a legitimate answer — see `ticket_inbox_since`'s doc.
+    let since = ticket_inbox_since(&asks, now_secs());
+
     // A short-lived client per poll, as the auto-approve loop does: the persistent shared client
     // belongs to the command surface and must not be held across this loop's sleeps.
     let relays = crate::net::relay_urls(store);
@@ -208,7 +261,7 @@ async fn redeem_pending_tickets(
     };
     let wraps = client
         .fetch(
-            Filter::new().kind(Kind::GiftWrap).pubkey(identity.public_key()),
+            ticket_inbox_filter(identity.public_key(), since),
             crate::net::RELAY_TIMEOUT,
         )
         .await;
@@ -537,6 +590,93 @@ mod tests {
 
     fn held(npub: &str, slug: &str, fp: &str) -> CachedKey {
         CachedKey { npub: npub.into(), slug: slug.into(), fingerprint: fp.into() }
+    }
+
+    fn ask(sent_at: &str) -> ManifestAsk {
+        ManifestAsk {
+            fingerprint_seen: "fp".into(),
+            sent_at: sent_at.into(),
+            nonce: String::new(),
+            claimed_by: None,
+            spent: false,
+        }
+    }
+
+    /// QURATOR-197 — the redemption poll's inbox filter must carry BOTH bounds the chat inbox's
+    /// `dm_inbox_filter` has: an explicit `.limit` (CWE-400 — otherwise the relay's own default
+    /// decides how much the 300 s poll re-decrypts) and a `since` window (otherwise it re-fetches
+    /// all-time history every poll).
+    ///
+    /// MUTATION (P-10) — remove `.limit(DM_INBOX_FETCH_LIMIT)` from `ticket_inbox_filter` and the
+    /// first two asserts red; remove the `since` arm and the third reds.
+    #[test]
+    fn ticket_inbox_filter_declares_budget_and_window() {
+        let me = hb_core::Identity::generate();
+        let cold = ticket_inbox_filter(me.public_key(), 0);
+        assert_eq!(
+            cold.limit,
+            Some(DM_INBOX_FETCH_LIMIT),
+            "a budget, not the relay's default"
+        );
+        let warm = ticket_inbox_filter(me.public_key(), 1_700_000_000);
+        assert_eq!(warm.limit, Some(DM_INBOX_FETCH_LIMIT), "the bounded filter too");
+        assert_eq!(
+            warm.since.map(|s| s.as_secs()),
+            Some(1_700_000_000),
+            "a warm anchor bounds the fetch window"
+        );
+        assert!(cold.since.is_none(), "a zero anchor is the cold, full initial pull");
+    }
+
+    /// QURATOR-197 — the window anchors to the OLDEST still-pending ask minus the shared 48 h
+    /// NIP-59 wobble allowance: a redeemable wrap answers an ask, so it cannot predate it, and
+    /// the margin absorbs relay-side `since` wobble plus a peer clock sitting behind ours.
+    /// `2026-09-01T00:00:00Z` = 1_788_220_800 unix secs.
+    ///
+    /// MUTATION (P-10) — change `.min()` to `.max()` in `ticket_inbox_since` (newest ask, not
+    /// oldest) and the first assert reds; drop the `DM_FETCH_MARGIN_SECS` subtraction and it reds
+    /// too.
+    #[test]
+    fn ticket_inbox_since_anchors_to_the_oldest_pending_ask() {
+        let now = 1_800_000_000u64;
+        let mut asks = HashMap::new();
+        asks.insert("a|a|films".to_string(), ask("2026-09-01T00:00:00Z"));
+        asks.insert("b|b|music".to_string(), ask("2026-09-10T12:00:00Z"));
+        assert_eq!(
+            ticket_inbox_since(&asks, now),
+            1_788_220_800 - DM_FETCH_MARGIN_SECS,
+            "oldest ask minus the wobble allowance"
+        );
+        assert_eq!(
+            ticket_inbox_since(&HashMap::new(), now),
+            0,
+            "no asks -> no window (the loop does not fetch at all)"
+        );
+    }
+
+    /// QURATOR-197 — future-poison and fail-open discipline for the window anchor: a future
+    /// `sent_at` (hostile or merely skewed) clamps to `now` so `since` can never land in the
+    /// future and silently stop delivery; an unparseable trace maps to 0, forcing the whole
+    /// window open rather than letting the parseable remainder silently narrow past it.
+    ///
+    /// MUTATION (P-10) — remove `.min(now)` in `ticket_inbox_since` and the first assert reds;
+    /// change the inner `.unwrap_or(0)` to `.unwrap_or(now)` and the second reds.
+    #[test]
+    fn ticket_inbox_since_clamps_future_and_fails_open() {
+        let now = 1_800_000_000u64; // ≈ 2027-01-15, comfortably after both stamps below
+        let mut asks = HashMap::new();
+        asks.insert("a|a|films".to_string(), ask("2027-06-01T00:00:00Z"));
+        assert_eq!(
+            ticket_inbox_since(&asks, now),
+            now,
+            "a future stamp clamps down to now, never past it"
+        );
+        asks.insert("b|b|music".to_string(), ask("not-a-timestamp"));
+        assert_eq!(
+            ticket_inbox_since(&asks, now),
+            0,
+            "one unparseable trace opens the whole window (0 = no since filter)"
+        );
     }
 
     /// The driver must ask the AUTHOR authorlessly and a CARRIER author-bearingly.

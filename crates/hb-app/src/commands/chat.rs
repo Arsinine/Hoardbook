@@ -309,14 +309,21 @@ pub(crate) fn route_dm(from: &str, own_npub: &str, ctx: &DmClassifyCtx<'_>) -> D
 /// stamp landed in the past. 48 h = the NIP-59 window, so any wrap newer than the last one we saw is
 /// always inside `[cursor − margin, now]` (proof: a message sent at real time T has outer ≥ T−48h;
 /// with `since = cursor−48h` and T ≥ cursor, its outer ≥ since).
-const DM_FETCH_MARGIN_SECS: u64 = 48 * 60 * 60;
+///
+/// `pub(crate)`: shared with the two background poll loops (`auto_approve`'s request inbox,
+/// `fetch_driver`'s ticket redemption — QURATOR-197) so the wobble allowance can't drift between
+/// fetches of the same gift-wrap inbox.
+pub(crate) const DM_FETCH_MARGIN_SECS: u64 = 48 * 60 * 60;
 
 /// Fetch budget for the inbox poll. Without an explicit `.limit()` the client leaves the response
 /// size to the relay's own default (strfry's `maxFilterLimit`) — a hostile or misconfigured relay
 /// could return an unbounded batch (CWE-400). 1000 is far above realistic DM volume in a 48 h window
 /// and matches the other fetch-budget constants (`TEASER_SEARCH_FETCH_LIMIT`,
 /// `TOPIC_DISCOVERY_FETCH_LIMIT`).
-const DM_INBOX_FETCH_LIMIT: usize = 1000;
+///
+/// `pub(crate)`: also the fetch budget for the two background poll loops' inbox filters
+/// (QURATOR-197) — one number, so the budgets can't drift.
+pub(crate) const DM_INBOX_FETCH_LIMIT: usize = 1000;
 
 /// Cap on remembered failed-unwrap wrap ids (the negative cache). A wrap that fails to unwrap is
 /// remembered here so the ~15 s poll doesn't re-run the full unwrap (schnorr + ECDH + AES-GCM) on it
