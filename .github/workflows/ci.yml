@@ -597,6 +597,22 @@ jobs:
             -v "$PWD/crates/hb-it/strfry.conf:/etc/strfry.conf:ro" \
             -v strfrydb2:/app/strfry-db dockurr/strfry@sha256:7ae77f50cc0cf5dab53a50c2790681dfaa40d7d6df3e0d77df6bf0a84fff58bd  # was :latest, 2026-07-21 build
 
+      # QURATOR-196 collateral: the relays are addressed by HOSTNAME, not 127.0.0.1, and this is
+      # load-bearing for BR4. That case is the NIP-65 outbox model — the peer advertises relay2 as
+      # their outbox and publishes their listing ONLY there, while the browser starts connected to
+      # relay1 only. QURATOR-196 (rightly) stopped browse from pooling a peer-advertised relay and
+      # now reads it through a scoped ephemeral client, but only after `validate_relay_url`, which
+      # rejects loopback as SSRF. So a peer-advertised `ws://127.0.0.1:7778` is dropped, no scoped
+      # client is built, and BR4 fails with "browse did not reach the peer's outbox relay" — which
+      # is exactly what happened on `29265975`, whose own doc comment assumed the harness relay was
+      # always a pool member (in BR4 it deliberately is not). `validate_relay_url` matches literal
+      # names and IP strings and does NO DNS resolution (deliberate — see its doc comment), so a
+      # hostname passes the guard while the guard itself stays byte-identical and still runs. This
+      # keeps CI hermetic (no third-party relays, no secrets, no events on strangers' infra) and
+      # keeps BR4 exercising the real production path. Do NOT "simplify" these back to 127.0.0.1.
+      - name: Alias the relay hostnames to loopback
+        run: echo '127.0.0.1 hb-relay1.test hb-relay2.test' | sudo tee -a /etc/hosts
+
       - name: Wait for the relays to accept connections
         run: |
           for port in 7777 7778; do
@@ -625,13 +641,13 @@ jobs:
           done
 
       - name: Run the L2 integration suite (hb-it) — incl. Suite COUNT + Suite CANARY (M9)
-        run: cargo run -p hb-it --locked -- --relay ws://127.0.0.1:7777 --relay ws://127.0.0.1:7778 --pow 8
+        run: cargo run -p hb-it --locked -- --relay ws://hb-relay1.test:7777 --relay ws://hb-relay2.test:7778 --pow 8
 
       # M9 Track K: exercise the canary CLI end-to-end (the systemd oneshot form). A green backbone
       # must exit 0; a deliberately-broken relay must exit nonzero (the alarm fires). The two relays
       # simulate SG↔JP for the cross-region step.
       - name: Canary CLI — green backbone exits 0
-        run: cargo run -p hb-it --locked -- --canary --relay ws://127.0.0.1:7777 --relay ws://127.0.0.1:7778
+        run: cargo run -p hb-it --locked -- --canary --relay ws://hb-relay1.test:7777 --relay ws://hb-relay2.test:7778
 
       - name: Canary CLI — broken relay exits nonzero (alarm fires)
         run: |
