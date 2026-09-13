@@ -480,6 +480,19 @@
 		await loadContactsInto(getContacts);
 	}
 
+	// Owner feedback #6 — Chat's Refresh affordance, Browse twin. One click re-pulls the three
+	// stores this page paints from (contacts, groups, private collections) through the same
+	// loaders mount uses; the button is disabled while in flight so it cannot double-fire.
+	let browseRefreshing = $state(false);
+	async function refreshBrowse() {
+		browseRefreshing = true;
+		try {
+			await Promise.all([loadContactsInto(getContacts), loadGroupsInto(), loadPrivateInto()]);
+		} finally {
+			browseRefreshing = false;
+		}
+	}
+
 	function onDragStart(e: DragEvent, npub: string) {
 		if (!e.dataTransfer) return;
 		let carried: string[];
@@ -816,6 +829,11 @@
 	<div>
 		<div class="topbar-title">Browse</div>
 		<div class="topbar-sub">Collections your contacts have published</div>
+	</div>
+	<div class="topbar-actions">
+		<button class="icon-btn" onclick={refreshBrowse} disabled={browseRefreshing} title="Refresh collections" aria-label="Refresh collections">
+			{@html icons.refresh}
+		</button>
 	</div>
 </div>
 
@@ -1301,6 +1319,18 @@
 	}
 	.topbar-title { font-size: 17px; font-weight: 600; color: var(--fg); letter-spacing: -0.3px; }
 	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
+	/* Same rule Topics' topbar carries — kept identical so the two pages read as one chrome set. */
+	.topbar-actions { display: flex; gap: 8px; align-items: center; }
+	/* Chat's .icon-btn, copied verbatim (component styles are scoped, so each page carries its own). */
+	.icon-btn {
+		background: transparent;
+		border: none;
+		cursor: pointer;
+		color: var(--fg-muted);
+		display: flex;
+		padding: 2px;
+	}
+	.icon-btn:disabled { opacity: 0.5; }
 
 	.browse-shell {
 		display: flex;

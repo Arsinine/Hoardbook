@@ -207,6 +207,23 @@
 		}
 	}
 
+	// Owner feedback #6 — Chat's Refresh affordance, Topics twin. One click re-pulls BOTH halves
+	// of the merged tree the pane shows: loadMine (joined) and the directory paint (discovery).
+	// paintDirectory bails while `painted` is set, so this uses the exact reset the pane's own
+	// paintError retry affordances use — no new fetch logic, just the existing loaders.
+	let topicsRefreshing = $state(false);
+	async function refreshTopics() {
+		topicsRefreshing = true;
+		try {
+			await loadMine();
+			painted = false;
+			paintError = false;
+			await paintDirectory();
+		} finally {
+			topicsRefreshing = false;
+		}
+	}
+
 	// QURATOR-145 (W3) — paint the CACHED tree instantly, refresh behind it. The cache is the
 	// last-known-good directory (see `topicDirectoryCache` in stores.ts): non-empty on arrival
 	// here means a populated tree, so the landing screen is instant and a slightly-stale list is
@@ -232,6 +249,7 @@
 		}
 		void loadMine();
 		void paintDirectory();
+		void probeInvite();
 	});
 
 	// The effective name to create: the composed category path (public and private alike — W5).
@@ -539,6 +557,20 @@
 		}
 	}
 
+	// Owner feedback #7: Redeem is offered only when an invite is actually pending. Probed once on
+	// mount; starts false and is only ever turned ON by a positive probe, so the affordance never
+	// flashes on load. A THROWING probe (offline, relay down) counts as "no invite" for display —
+	// and a background probe the user didn't ask for never toasts an error.
+	let hasPendingInvite = $state(false);
+
+	async function probeInvite() {
+		try {
+			hasPendingInvite = !!(await topicPreviewInvite());
+		} catch {
+			hasPendingInvite = false;
+		}
+	}
+
 	// W8: redeem is consent-gated like the public join. The preview reveals the invite issuer + topic
 	// name WITHOUT committing; the follow-up `confirmRedeem` calls the commit only after the ack.
 	async function redeemInvite() {
@@ -546,7 +578,10 @@
 		try {
 			const preview = await topicPreviewInvite();
 			if (!preview) {
-				toast('No pending invite found', 'success');
+				// Defensive fallback: the invite was consumed or expired between the mount probe and
+				// this click. Retract the dead affordance; "nothing here" is not a success.
+				hasPendingInvite = false;
+				toast('No pending invite found', 'error');
 				return;
 			}
 			// Open the consent modal carrying the issuer npub + topic name — do NOT commit yet. The
@@ -924,6 +959,9 @@
 		</div>
 	</div>
 	<div class="topbar-actions">
+		<button class="icon-btn" onclick={refreshTopics} disabled={topicsRefreshing} title="Refresh topics" aria-label="Refresh topics">
+			{@html icons.refresh}
+		</button>
 		<button class="btn-primary" onclick={() => (createOpen = true)}>+ New Topic</button>
 	</div>
 </div>
@@ -1057,7 +1095,9 @@
 					/>
 				{/if}
 			{/if}
-			<button class="link" disabled={busy} onclick={redeemInvite}>Redeem a private Topic invite</button>
+			{#if hasPendingInvite}
+				<button class="link" disabled={busy} onclick={redeemInvite}>Redeem a private Topic invite</button>
+			{/if}
 		</div>
 
 			<!-- Right: detail (roster + invite + chat deep-link for a joined Topic; the honest
@@ -1279,6 +1319,16 @@
 	.topbar-title { font-size: 17px; font-weight: 600; color: var(--fg); letter-spacing: -0.3px; }
 	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
 	.topbar-actions { display: flex; gap: 8px; align-items: center; }
+	/* Chat's .icon-btn, copied verbatim (component styles are scoped, so each page carries its own). */
+	.icon-btn {
+		background: transparent;
+		border: none;
+		cursor: pointer;
+		color: var(--fg-muted);
+		display: flex;
+		padding: 2px;
+	}
+	.icon-btn:disabled { opacity: 0.5; }
 
 	.body { flex: 1; min-height: 0; padding: 18px 22px; box-sizing: border-box; display: flex; flex-direction: column; }
 
