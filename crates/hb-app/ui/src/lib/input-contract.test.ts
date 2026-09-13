@@ -230,7 +230,7 @@ describe('input contract QURATOR-101 — markup carries the contract class', () 
 	// finds every native form-control tag, and asserts it carries `hb-input` (`hb-textarea` too, for
 	// <textarea>) UNLESS it is a checkbox/radio (categorically outside the contract's scope) or a
 	// bare input nested inside a wrapper div that itself carries `hb-input` (the sanctioned "wrap"
-	// pattern — see ScanDialog's `.hb-input-wrap`, matching the `.subheader-search` precedent in
+	// pattern — see AddCollectionModal's `.hb-input-wrap`, matching the `.subheader-search` precedent in
 	// routes/contacts/+page.svelte). Per CLAUDE.md §9/§7: jsdom proves CLASSES here, not pixels — this
 	// guard cannot and does not claim anything about rendered layout, only that the markup wires the
 	// contract class onto the element. Per-file counts are printed so "0 violations" is distinguishable
@@ -240,9 +240,8 @@ describe('input contract QURATOR-101 — markup carries the contract class', () 
 	// QURATOR-101 page half: the four heavily-pinned route pages join the scan alongside the nine
 	// components migrated in the component half (64aba00) — same rule, same allowlist mechanism.
 	const COMPONENT_FILES = [
-		'src/lib/components/ScanDialog.svelte',
+		'src/lib/components/AddCollectionModal.svelte',
 		'src/lib/components/AddContactPanel.svelte',
-		'src/lib/components/CollectionDetailsForm.svelte',
 		'src/lib/components/CollectionTagsEditor.svelte',
 		'src/lib/components/AddContactDialog.svelte',
 		'src/lib/components/ConfirmButton.svelte',
@@ -261,7 +260,7 @@ describe('input contract QURATOR-101 — markup carries the contract class', () 
 	// same file is not silently covered by this entry.
 	const NESTED_WRAP_ALLOWLIST: Array<{ file: string; classAttr: string; reason: string }> = [
 		{
-			file: 'src/lib/components/ScanDialog.svelte',
+			file: 'src/lib/components/AddCollectionModal.svelte',
 			classAttr: 'hb-input-bare hb-mono',
 			reason: 'nested inside <div class="hb-input hb-input-wrap">',
 		},
@@ -271,7 +270,7 @@ describe('input contract QURATOR-101 — markup carries the contract class', () 
 			reason: 'nested inside <div class="hb-input search-input-wrap">',
 		},
 		{
-			file: 'src/lib/components/CollectionDetailsForm.svelte',
+			file: 'src/lib/components/AddCollectionModal.svelte',
 			classAttr: 'lang-input',
 			reason: 'nested inside <div class="hb-input lang-wrap">',
 		},

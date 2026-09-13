@@ -12,7 +12,6 @@
 	// shared relay-write governor).
 	import { createAutopublish, AUTOPUBLISH_TEST_DEBOUNCE_MS, setAutopublishDebounceForTests } from '$lib/profile-autopublish.js';
 	import { icons, socialIcons, avatarHue } from '$lib/icons.js';
-	import ScanDialog from '$lib/components/ScanDialog.svelte';
 	import AddCollectionModal from '$lib/components/AddCollectionModal.svelte';
 	import CollectionRow from '$lib/components/CollectionRow.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
@@ -178,15 +177,12 @@
 
 
 	// ── Regular state ────────────────────────────────────────────────────────────
-	// The Rescan flow reuses the plain ScanDialog directly (single step — the collection's details
-	// already exist). The Add-collection wizard (AddCollectionModal) owns the two-step Source→Details
-	// flow, and also reopens straight to Details for "Edit details".
-	let scanOpen = $state(false);
-	let scanTitle = $state('Rescan collection');
-	let scanInitialPath = $state('');
-	let scanInitialAlias = $state('');
+	// QURATOR-206: one screen for add, rescan and edit — the combined AddCollectionModal
+	// (Directory + Details side by side). A row menu's Rescan / Edit details opens it pre-loaded
+	// with the existing collection; editInitialPath is the root path used to pre-resolve the tree.
 	let addModalOpen = $state(false);
 	let editTarget: Collection | null = $state(null);
+	let editInitialPath = $state('');
 	let saving = $state(false);
 	let publishing = $state(false);
 	let langInput = $state('');
@@ -387,30 +383,21 @@
 		});
 	}
 
-	function handleScannedCollection(collection: Collection) {
-		mergeCollectionIntoStore(collection);
-		toast(`Scanned "${collection.path_alias}": ${collection.item_count} items`);
-	}
-
-	// QURATOR-207: a scanned-but-unpublished collection does not exist yet — the wizard's scan
-	// must NOT merge it into the Home list, or a Cancel would leave a ghost row backed by nothing
-	// (it only becomes real when the wizard's Publish promotes the backend's scan cache). The
-	// standalone ScanDialog above keeps merging: that path is only the Rescan verb, whose row is
-	// already published and backed.
+	// QURATOR-207: a scanned-but-unpublished collection does not exist yet — the scan must NOT
+	// merge it into the Home list, or a Cancel would leave a ghost row backed by nothing (it only
+	// becomes real when Publish promotes the backend's scan cache).
 	function onWizardScanned(collection: Collection) {
 		toast(`Scanned "${collection.path_alias}": ${collection.item_count} items`);
 	}
 
-	// The Details step already toasts its own "saved"/"published" message — just sync the store.
-	function onWizardSaved(collection: Collection) {
-		mergeCollectionIntoStore(collection);
-	}
+	// The Publish path toasts its own "published" message — just sync the store.
 	function onWizardPublished(collection: Collection) {
 		mergeCollectionIntoStore(collection);
 	}
 
 	function openAddModal() {
 		editTarget = null;
+		editInitialPath = '';
 		addModalOpen = true;
 	}
 
@@ -421,21 +408,17 @@
 		await loadCollectionsInto(getCollections);
 	}
 
-	function openEditDetails(col: Collection) {
+	// QURATOR-206: Rescan and Edit details open the SAME combined screen, pre-loaded with the
+	// existing collection and the tree pre-resolved from the collection's root path.
+	async function openCollectionEditor(col: Collection) {
 		editTarget = col;
-		addModalOpen = true;
-	}
-
-	async function openRescan(col: Collection) {
-		scanTitle = 'Rescan collection';
-		scanInitialAlias = col.path_alias;
 		try {
 			const share = await getShareSettings(col.slug);
-			scanInitialPath = share?.root_path ?? '';
+			editInitialPath = share?.root_path ?? '';
 		} catch {
-			scanInitialPath = '';
+			editInitialPath = '';
 		}
-		scanOpen = true;
+		addModalOpen = true;
 	}
 
 
@@ -948,8 +931,8 @@
 						<CollectionRow
 							collection={col}
 							accessible={collectionAccess[col.slug]}
-							onrescan={() => openRescan(col)}
-							onedit={() => openEditDetails(col)}
+							onrescan={() => openCollectionEditor(col)}
+							onedit={() => openCollectionEditor(col)}
 							onpublish={() => handlePublishCollection(col.slug)}
 							onremove={() => handleDeleteCollection(col.slug)}
 						/>
@@ -959,8 +942,7 @@
 		</div>
 	</div>
 
-	<ScanDialog bind:open={scanOpen} title={scanTitle} initialPath={scanInitialPath} initialAlias={scanInitialAlias} onscanned={handleScannedCollection} />
-	<AddCollectionModal bind:open={addModalOpen} editCollection={editTarget} onscanned={onWizardScanned} onsaved={onWizardSaved} onpublished={onWizardPublished} />
+	<AddCollectionModal bind:open={addModalOpen} editCollection={editTarget} initialPath={editInitialPath} onscanned={onWizardScanned} onpublished={onWizardPublished} />
 {/if}
 
 <style>

@@ -1,5 +1,5 @@
 // Folder-tree picker derivation (M8, HANDOVER §A2.1) — pure include-set + tri-state logic, unit
-// tested with vitest so ScanTreeNode/ScanDialog stay thin. Mirrors the backend `IncludeSet`
+// tested with vitest so ScanTreeNode/AddCollectionModal stay thin. Mirrors the backend `IncludeSet`
 // (hb-app::commands::collection) so the picker and the selective walk agree on what gets published.
 //
 // `rel` paths are relative, "/"-separated directory paths (no leading/trailing slash), exactly the
