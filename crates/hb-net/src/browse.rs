@@ -230,13 +230,20 @@ pub async fn browse_share_code(
     // whole browse — the teaser still shows (BR1). The reason rides on the result so the failure
     // mode stays attributable (QURATOR-127). Same scoped merge as the teaser read.
     let (listing, listing_error) = match share_code.browse_key() {
-        Some(bk) => {
+        // QURATOR-218 — an empty slug is the teaser-only browse: callers with no single slug to
+        // scope (hb-app's `resolve_peer`, the WAN e2e harness) pass `""` because enumeration,
+        // when wanted, is `browse_peer_listings`'s job. A slug-scoped family read for
+        // `#d = [""]` can never match an index event, so the leg was a wasted relay round-trip
+        // per resolve ending in a guaranteed BR1 WARN (~94×/day from the 5-minute fetch-driver
+        // poll). Skip it — same `(None, None)` shape as the keyless arm, so no caller sees a
+        // behaviour change (`listing_error` has no consumers for the empty-slug callers).
+        Some(bk) if slug_scoped_listing_wanted(slug) => {
             listing_or_lock_reason(
                 slug,
                 fetch_listing(client, scoped_client.as_ref(), &peer, slug, &bk, timeout).await,
             )
         }
-        None => (None, None),
+        _ => (None, None),
     };
     if let Some(sc) = scoped_client {
         sc.disconnect().await;
@@ -280,6 +287,15 @@ pub fn listing_or_lock_reason(
             (None, Some(reason))
         }
     }
+}
+
+/// QURATOR-218 — does this share-code browse want the slug-scoped listing leg at all? A caller
+/// with no single collection in mind (hb-app's `resolve_peer` — driven once per keyed contact by
+/// the 5-minute fetch-driver poll — and the WAN e2e harness) passes an empty slug; a `#d = [""]`
+/// family read can never match an index event, so running the leg only produced a guaranteed BR1
+/// lock + WARN and a wasted relay round-trip. Pure so the skip is unit-testable without a relay.
+fn slug_scoped_listing_wanted(slug: &str) -> bool {
+    !slug.is_empty()
 }
 
 /// Phase-1 fetch budget for a slug's **index** event (`d = slug`): one parameterized-replaceable
@@ -1405,6 +1421,28 @@ mod tests {
         let (listing, reason) = listing_or_lock_reason("fine", r);
         assert!(listing.is_some(), "a compliant listing must render");
         assert!(reason.is_none(), "a rendered listing carries no lock reason");
+    }
+
+    /// QURATOR-218 — a teaser-only browse (empty slug — what hb-app's `resolve_peer` issues once
+    /// per keyed contact per 5-minute fetch-driver poll, ~94×/day) must NOT run the slug-scoped
+    /// listing leg: a `#d = [""]` family read can never match an index event, so the leg was a
+    /// wasted relay round-trip ending in a guaranteed BR1 WARN on every resolve.
+    ///
+    /// MUTATION (P-10) — in the production function `slug_scoped_listing_wanted` (defined just
+    /// above `listing_or_lock_reason`, the 3-line body `!slug.is_empty()`): change the body to
+    /// `let _ = slug; true`. This test reds on the first assert. The wiring this pins is the
+    /// `Some(bk) if slug_scoped_listing_wanted(slug)` match arm in `browse_share_code`; the arm
+    /// itself needs a live relay to reach, which is why the pin is at the predicate.
+    #[test]
+    fn empty_slug_skips_the_slug_scoped_listing_leg() {
+        assert!(
+            !slug_scoped_listing_wanted(""),
+            "an empty slug (teaser-only browse) must skip the slug-scoped listing fetch"
+        );
+        assert!(
+            slug_scoped_listing_wanted("films"),
+            "a real slug keeps the slug-scoped listing fetch"
+        );
     }
 
     /// `browse_peer_listings`'s count bound (the sibling gap two reviewers found): a family with
