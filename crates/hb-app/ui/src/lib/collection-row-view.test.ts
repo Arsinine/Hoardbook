@@ -20,10 +20,13 @@ function col(overrides: Partial<Collection> = {}): Collection {
 }
 
 describe('collection-row-view', () => {
-	it('deriveRowChip_draft_vs_published', () => {
-		expect(deriveRowChip(col({ published: false }))).toBe('Draft');
-		expect(deriveRowChip(col({ published: undefined }))).toBe('Draft'); // pre-publish collection
+	it('deriveRowChip_published_vs_unpublished', () => {
+		// QURATOR-207: the Draft state is gone — a listed collection was published the moment it
+		// was created (Publish is the only durable write). false/absent can only be a legacy
+		// pre-207 on-disk draft, and reads "Unpublished" rather than "Draft".
 		expect(deriveRowChip(col({ published: true }))).toBe('Published');
+		expect(deriveRowChip(col({ published: false }))).toBe('Unpublished');
+		expect(deriveRowChip(col({ published: undefined }))).toBe('Unpublished'); // legacy pre-207 draft
 	});
 
 	it('menuItems_show_publish_when_draft_and_no_unpublish_anywhere', () => {

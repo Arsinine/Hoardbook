@@ -4,11 +4,15 @@
 
 import type { Collection } from './types.js';
 
-export type RowChip = 'Draft' | 'Published';
+export type RowChip = 'Published' | 'Unpublished';
 
-/** Draft until published — mirrors the old inline draft-badge, now the row's status chip. */
+/** QURATOR-207 (owner ruling 2026-09-13): a collection is PUBLISHED or it does not exist — the
+ *  Draft state is gone and Publish is the only durable write, so a row the backend lists was
+ *  published the moment it was created. `false`/absent can now only be a legacy on-disk draft
+ *  written by a pre-207 build (migration pending an owner ruling); it reads "Unpublished" rather
+ *  than pretending the Draft state still exists. */
 export function deriveRowChip(col: Pick<Collection, 'published'>): RowChip {
-	return col.published ? 'Published' : 'Draft';
+	return col.published ? 'Published' : 'Unpublished';
 }
 
 /** Export sub-actions: the two human-readable checklists, plus the M16 W4 `.hbmanifest` envelope

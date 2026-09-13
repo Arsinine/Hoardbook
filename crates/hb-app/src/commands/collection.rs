@@ -199,13 +199,15 @@ pub async fn scan_directory(
     store: State<'_, DataStore>,
 ) -> CmdResult<CollectionEntry> {
     let collection = scan_directory_inner(opts, store.inner()).await?;
-    // Surface the scanned byte total to the freshly-added collection immediately (devtest #5) — read
-    // it back from the sidecar scan_directory_inner just persisted, so size shows pre-reload too.
-    let total_bytes = store
-        .load_scan_spec(&collection.slug)
-        .ok()
-        .flatten()
-        .map(|s| s.total_bytes)
+    // Surface the scanned byte total to the freshly-added collection immediately (devtest #5).
+    // QURATOR-207: the scan persists nothing durable, so the total is read back from the in-memory
+    // scan cache `scan_directory_inner` just populated — it rides there until Publish promotes it
+    // (Publish persists the ScanSpec sidecar `get_collections` reads).
+    let total_bytes = scan_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&collection.slug)
+        .map(|c| c.total_bytes)
         .unwrap_or(0);
     Ok(CollectionEntry { collection, published: false, total_bytes })
 }
@@ -236,9 +238,32 @@ pub async fn list_subdirs(path: String) -> CmdResult<Vec<SubdirEntry>> {
     }
 }
 
-/// Core scan + persist logic, extracted for testability (mirrors
-/// `publish_collection_inner`). Walks the directory off the async runtime
-/// thread under a deadline, then builds and persists the draft collection.
+/// QURATOR-207 (owner ruling 2026-09-13) — the in-memory scan cache. A collection is PUBLISHED or
+/// it does not exist: `scan_directory` persists NOTHING durable, so the scanned tree lives here
+/// until Publish promotes it to the store ([`promote_cached_scan`]). Closing the Add-collection
+/// wizard before Publish discards it — nothing was written, so there is no cleanup path (that is
+/// the design; do not add one). Keyed by slug; a hit additionally requires the same path +
+/// include/exclude settings, so any change re-walks. Best-effort and process-lifetime only — it
+/// evaporates on app exit and is never persisted to disk.
+struct CachedScan {
+    path: String,
+    include: Vec<String>,
+    exclude: Vec<String>,
+    total_bytes: u64,
+    collection: Collection,
+}
+
+/// The process-global scan cache (same OnceLock idiom as `inflight_access_stats` above).
+fn scan_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, CachedScan>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, CachedScan>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Core scan logic, extracted for testability (mirrors `publish_collection_inner`). Walks the
+/// directory off the async runtime thread under a deadline, then builds the collection — and
+/// persists NOTHING (QURATOR-207): the result goes to the in-memory scan cache, and Publish is
+/// the single durable write.
 async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult<Collection> {
     let root = std::path::PathBuf::from(&opts.path);
 
@@ -252,6 +277,21 @@ async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult
             opts.path_alias
         ));
     }
+    // Cache fast path (the ruling's "reopening the add/edit flow loads instantly instead of
+    // re-walking the directory"): the SAME path scanned with the SAME include/exclude settings
+    // returns the cached tree. Two deliberate limits: it applies only while the slug has NO
+    // durable record — the row-menu Rescan verb targets a persisted collection and must always
+    // re-walk the disk, never serve the last walk — and a changed alias, path, or settings misses
+    // and re-walks. Best-effort by design; everything evaporates on app exit.
+    if store.load_collection_draft(&slug).map_err(cmd_err)?.is_none() {
+        let cache = scan_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.get(&slug) {
+            if hit.path == opts.path && hit.include == opts.include && hit.exclude == opts.exclude {
+                return Ok(hit.collection.clone());
+            }
+        }
+    }
+
     let globs = build_glob_set(&opts.exclude)?;
     let include = IncludeSet::new(opts.include.clone());
 
@@ -317,31 +357,24 @@ async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult
     }
 
     collection.clamp_metadata();
-    store.save_collection_draft(&collection).map_err(cmd_err)?;
 
-    // Persist the collection's on-disk root so the snapshot re-scan can find the tree again.
-    let mut share = store
-        .load_share_settings(&collection.slug)
-        .map_err(cmd_err)?
-        .unwrap_or_default();
-    share.root_path = Some(opts.path.clone());
-    store.save_share_settings(&collection.slug, &share).map_err(cmd_err)?;
-
-    // M9: persist the exact scan parameters so the snapshot watch can faithfully re-scan this tree
-    // (same root, same checked folders, same exclusions) when the source changes.
-    store
-        .save_scan_spec(
-            &collection.slug,
-            &crate::store::ScanSpec {
-                root: opts.path.clone(),
+    // QURATOR-207: no durable write here — the scan inputs ride along in the cache so Publish can
+    // persist the draft, the share root, and the scan spec in one place (the single durable write,
+    // [`promote_cached_scan`]). A Close/Cancel before Publish discards this entry, which is the
+    // design: nothing was written, so there is nothing to clean up.
+    scan_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            collection.slug.clone(),
+            CachedScan {
+                path: opts.path.clone(),
                 include: opts.include.clone(),
                 exclude: opts.exclude.clone(),
-                // Persisted here (never published) so get_collections can surface the aggregate
-                // "Total Size" the home view reads from `total_bytes` (devtest 2026-06-25 #5).
                 total_bytes,
+                collection: collection.clone(),
             },
-        )
-        .map_err(cmd_err)?;
+        );
 
     Ok(collection)
 }
@@ -489,11 +522,27 @@ pub async fn update_collection_meta(
         .then_some(slug.as_str())
         .ok_or("Invalid collection slug")?;
 
-    // Load the draft, update fields, and re-save.
-    let mut col = store
-        .load_collection_draft(safe_slug)
-        .map_err(cmd_err)?
-        .ok_or_else(|| format!("No draft found for collection '{safe_slug}'"))?;
+    // Load the draft, update fields, and re-save. QURATOR-207: before Publish there is no durable
+    // record — a freshly-scanned collection lives in the in-memory scan cache, so the Details
+    // form's edits land there until Publish promotes them; an already-persisted collection (the
+    // edit flow) still writes the store directly below.
+    let mut col = match store.load_collection_draft(safe_slug).map_err(cmd_err)? {
+        Some(col) => col,
+        None => {
+            let mut cache = scan_cache().lock().unwrap_or_else(|e| e.into_inner());
+            let Some(cached) = cache.get_mut(safe_slug) else {
+                return Err(format!("No draft found for collection '{safe_slug}'"));
+            };
+            cached.collection.description = description;
+            cached.collection.content_types = content_types;
+            cached.collection.tags = tags;
+            cached.collection.languages = languages;
+            cached.collection.sorted = sorted;
+            // Same publish-budget clamp as the persisted path below.
+            cached.collection.clamp_metadata();
+            return Ok(());
+        }
+    };
 
     col.description = description;
     col.content_types = content_types;
@@ -622,6 +671,80 @@ fn save_collection_marker_guarded(
     Ok(())
 }
 
+/// QURATOR-207: promote a scan waiting in the in-memory cache to the store — the single durable
+/// write. Persists the draft, the share root, and the scan spec (exactly the writes the scan used
+/// to do at scan time), then drops the cache entry. Returns `false` when no scan is waiting (an
+/// already-persisted collection that was not re-scanned — the plain edit flow; a no-op).
+///
+/// Merge rule for a RESCAN of an already-persisted collection: listing-side fields come from the
+/// freshly-walked cache copy, metadata-side fields from the persisted record. The Details form
+/// wrote its edits to the persisted record (the draft exists), so taking the cache copy wholesale
+/// would silently drop them; taking the record's tree would publish the stale pre-rescan walk.
+fn promote_cached_scan(slug: &str, store: &DataStore) -> Result<bool, String> {
+    // The ≥1-content-type publish gate (the ruling keeps it) runs BEFORE anything is consumed or
+    // written: a gate-failing publish must persist nothing, and the waiting scan must stay in the
+    // cache so the user can tick a content type in the Details form and retry without rescanning.
+    // Same message as `prepare_listing`'s gate — one rule, two choke points.
+    {
+        let cache = scan_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = cache.get(slug) {
+            if cached.collection.content_types.is_empty() {
+                // A rescan promoting over a persisted record takes its metadata (merge rule
+                // below), so the RECORD's content types satisfy the gate too — the Details form
+                // wrote them there. Refuse only when both are empty.
+                let record_has_types = store
+                    .load_collection_draft(slug)
+                    .map_err(cmd_err)?
+                    .is_some_and(|prev| !prev.content_types.is_empty());
+                if !record_has_types {
+                    return Err(
+                        "At least one content type is required before publishing a collection."
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
+    let Some(scan) = scan_cache().lock().unwrap_or_else(|e| e.into_inner()).remove(slug) else {
+        return Ok(false);
+    };
+    let mut col = scan.collection;
+    if let Some(prev) = store.load_collection_draft(slug).map_err(cmd_err)? {
+        col.description = prev.description;
+        col.content_types = prev.content_types;
+        col.tags = prev.tags;
+        col.languages = prev.languages;
+        col.visibility = prev.visibility;
+        col.sorted = prev.sorted;
+    }
+    store.save_collection_draft(&col).map_err(cmd_err)?;
+
+    // The on-disk root so the snapshot re-scan can find the tree again.
+    let mut share = store
+        .load_share_settings(slug)
+        .map_err(cmd_err)?
+        .unwrap_or_default();
+    share.root_path = Some(scan.path.clone());
+    store.save_share_settings(slug, &share).map_err(cmd_err)?;
+
+    // M9: the exact scan parameters so the snapshot watch can faithfully re-scan this tree
+    // (same root, same checked folders, same exclusions) when the source changes.
+    store
+        .save_scan_spec(
+            slug,
+            &crate::store::ScanSpec {
+                root: scan.path,
+                include: scan.include,
+                exclude: scan.exclude,
+                // Persisted here (never published) so get_collections can surface the aggregate
+                // "Total Size" the home view reads from `total_bytes` (devtest 2026-06-25 #5).
+                total_bytes: scan.total_bytes,
+            },
+        )
+        .map_err(cmd_err)?;
+    Ok(true)
+}
+
 /// Publish a collection's listing. **Branches on visibility (M10):** a *Public* collection is
 /// encrypted once under the account browse-key (M3); a *Private* collection is sealed per recipient
 /// in the Private audience (M21 W5) and gift-wrapped — the browse-key is **not** used and the public
@@ -636,6 +759,10 @@ pub(crate) async fn publish_collection_inner(
     relay: &SharedRelay,
     gen_at_start: u64,
 ) -> Result<PublishSummary, String> {
+    // QURATOR-207: Publish is the single durable write — a scan waiting in the in-memory cache is
+    // promoted to the store here (draft + share root + scan spec) before the listing is prepared.
+    // A collection that was never scanned this session is already persisted; this is a no-op.
+    promote_cached_scan(slug, store)?;
     let listing_json = prepare_listing(slug, store)?;
 
     // Visibility gate: a Private collection takes the sealed, per-recipient path and never touches
@@ -1098,10 +1225,19 @@ pub async fn update_collection_visibility(
     let safe_slug = is_valid_slug(&slug)
         .then_some(slug.as_str())
         .ok_or("Invalid collection slug")?;
-    let mut col = store
-        .load_collection_draft(safe_slug)
-        .map_err(cmd_err)?
-        .ok_or_else(|| format!("No draft found for collection '{safe_slug}'"))?;
+    let mut col = match store.load_collection_draft(safe_slug).map_err(cmd_err)? {
+        Some(col) => col,
+        None => {
+            // QURATOR-207: a scanned-but-unpublished collection lives in the in-memory scan cache
+            // (see `update_collection_meta`) — the visibility choice rides to Publish with it.
+            let mut cache = scan_cache().lock().unwrap_or_else(|e| e.into_inner());
+            let Some(cached) = cache.get_mut(safe_slug) else {
+                return Err(format!("No draft found for collection '{safe_slug}'"));
+            };
+            cached.collection.visibility = visibility;
+            return Ok(());
+        }
+    };
     col.visibility = visibility;
     store.save_collection_draft(&col).map_err(cmd_err)
 }
@@ -1716,6 +1852,168 @@ mod collection_command_guards_a {
         };
         let err = scan_directory(opts, app.state::<DataStore>()).await.unwrap_err();
         assert!(err.contains("is not a directory"), "expected a not-a-directory refusal, got {err}");
+    }
+
+    /// QURATOR-207 (owner ruling 2026-09-13): a scanned-but-unpublished collection leaves NO
+    /// durable trace — `scan_directory` writes no draft, no scan spec, no share settings — and
+    /// Publish is the only writer, promoting the in-memory scan cache to the store (gated on ≥1
+    /// content type). Also pins that `update_collection_meta`'s pre-Publish edits land in the
+    /// cache (still nothing durable), and the promote merge rule: promoting over an existing
+    /// record keeps the record's metadata (where the Details form's edits live) and takes the
+    /// scan's freshly-walked tree.
+    ///
+    /// Mutations to redden (orchestrator applies one at a time, then reverts):
+    /// 1. Restore the durable write at the end of `scan_directory_inner` — re-add
+    ///    `store.save_collection_draft(&collection).map_err(cmd_err)?;` immediately after the
+    ///    `collection.clamp_metadata();` line — the `load_collection_draft(&slug).unwrap().is_none()`
+    ///    assert must FAIL (the scan would have persisted an orphan draft).
+    /// 2. Make `promote_cached_scan` return `Ok(false);` as its first statement — the
+    ///    "promote must persist the collection" expect and everything after it must FAIL.
+    /// 3. In `update_collection_meta`'s `None` arm, delete the line
+    ///    `cached.collection.content_types = content_types;` — the cache entry keeps an empty
+    ///    content_types, so the later `promote_cached_scan(&slug, &store).unwrap()` (the
+    ///    "a waiting scan must promote" assert) must FAIL on the gate error.
+    /// 4. Delete the content-type gate at the top of `promote_cached_scan` — the
+    ///    `promote_cached_scan(&slug, &store).unwrap_err()` assert must FAIL (it would return Ok).
+    /// 5. Delete the `.is_none()` guard around the cache fast path in `scan_directory_inner`
+    ///    (change `if store.load_collection_draft(&slug).map_err(cmd_err)?.is_none() {` to
+    ///    `if true {`) — the final `assert_ne!(rewolked.item_count, 9999, ...)` must FAIL (the
+    ///    poisoned cache entry would be served to the persisted slug's Rescan).
+    ///
+    /// No relay pinning needed: neither the scan, the meta update, nor the promote touches the
+    /// network.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_writes_nothing_durable_until_publish_promotes() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join("season-1")).unwrap();
+        std::fs::write(work.path().join("film.mkv"), b"x").unwrap();
+        std::fs::write(work.path().join("season-1").join("ep.mkv"), b"y").unwrap();
+        let (_data, app) = guard_app();
+        let store = app.state::<DataStore>();
+        let opts = ScanOptions {
+            path: work.path().to_string_lossy().into_owned(),
+            path_alias: "Q207 Pin".into(),
+            include: vec![],
+            exclude: vec![],
+        };
+
+        let scanned = scan_directory_inner(opts, &store).await.unwrap();
+        let slug = Collection::slug_from_alias("Q207 Pin");
+        assert_eq!(scanned.slug, slug);
+        assert!(
+            store.load_collection_draft(&slug).unwrap().is_none(),
+            "the scan must leave NO durable draft (QURATOR-207)"
+        );
+        assert!(
+            store.load_scan_spec(&slug).unwrap().is_none(),
+            "the scan must leave NO durable scan spec (QURATOR-207)"
+        );
+        assert!(
+            store.load_share_settings(&slug).unwrap().is_none(),
+            "the scan must leave NO durable share settings (QURATOR-207)"
+        );
+        assert!(
+            scan_cache().lock().unwrap().get(&slug).is_some(),
+            "the scanned tree must be held in the in-memory cache, waiting for Publish"
+        );
+
+        // The publish gate holds BEFORE anything durable: a content-type-less scan refuses to
+        // promote, and the scan stays waiting in the cache so the user can retry without rescanning.
+        let err = promote_cached_scan(&slug, &store).unwrap_err();
+        assert_eq!(
+            err,
+            "At least one content type is required before publishing a collection."
+        );
+        assert!(
+            scan_cache().lock().unwrap().get(&slug).is_some(),
+            "a gate-refused promote must not consume the waiting scan"
+        );
+
+        // The Details form's edit lands in the CACHE — still nothing durable.
+        update_collection_meta(
+            slug.clone(),
+            Some("notes".into()),
+            vec!["video".into()],
+            vec![],
+            vec![],
+            false,
+            app.state::<DataStore>(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            store.load_collection_draft(&slug).unwrap().is_none(),
+            "a pre-Publish meta edit must not persist a draft (QURATOR-207)"
+        );
+
+        // Publish is the only writer: the promote step persists draft + share root + scan spec.
+        assert!(promote_cached_scan(&slug, &store).unwrap(), "a waiting scan must promote");
+        let persisted = store
+            .load_collection_draft(&slug)
+            .unwrap()
+            .expect("promote must persist the collection");
+        assert_eq!(persisted.listing.len(), scanned.listing.len(), "promote keeps the scanned tree");
+        assert_eq!(persisted.content_types, vec!["video".to_string()], "the cached meta edit rode to Publish");
+        assert_eq!(persisted.description.as_deref(), Some("notes"), "the cached description rode to Publish");
+        let spec = store.load_scan_spec(&slug).unwrap().expect("promote must persist the scan spec");
+        assert_eq!(spec.root, work.path().to_string_lossy().into_owned());
+        let share =
+            store.load_share_settings(&slug).unwrap().expect("promote must persist the share root");
+        assert_eq!(share.root_path, Some(work.path().to_string_lossy().into_owned()));
+        // Promoted once — the cache entry is consumed, so a second promote is a no-op.
+        assert!(!promote_cached_scan(&slug, &store).unwrap(), "a second promote must be a no-op");
+
+        // Merge rule: a rescan waiting in the cache promotes over the record WITHOUT clobbering
+        // the metadata the Details form persisted (listing-side from the scan, metadata from disk).
+        let mut record = store.load_collection_draft(&slug).unwrap().unwrap();
+        record.tags = vec!["night".into()];
+        store.save_collection_draft(&record).unwrap();
+        let rescan_opts = ScanOptions {
+            path: work.path().to_string_lossy().into_owned(),
+            path_alias: "Q207 Pin".into(),
+            include: vec![],
+            exclude: vec![],
+        };
+        scan_directory_inner(rescan_opts, &store).await.unwrap();
+        assert!(promote_cached_scan(&slug, &store).unwrap(), "the rescan must be waiting and promote");
+        let merged =
+            store.load_collection_draft(&slug).unwrap().expect("record persists after merge-promote");
+        assert_eq!(merged.content_types, vec!["video".to_string()], "metadata survives a rescan promote");
+        assert_eq!(merged.tags, vec!["night".to_string()], "tags survive a rescan promote");
+
+        // A persisted collection never serves the cache — the Rescan verb must always re-walk.
+        // Plant a poisoned cache entry for the now-persisted slug; a fast-path hit would return
+        // its item_count verbatim.
+        {
+            let mut stale = merged.clone();
+            stale.item_count = 9999;
+            let mut cache = scan_cache().lock().unwrap();
+            cache.insert(
+                slug.clone(),
+                CachedScan {
+                    path: work.path().to_string_lossy().into_owned(),
+                    include: vec![],
+                    exclude: vec![],
+                    total_bytes: 0,
+                    collection: stale,
+                },
+            );
+        }
+        let rewolked = scan_directory_inner(
+            ScanOptions {
+                path: work.path().to_string_lossy().into_owned(),
+                path_alias: "Q207 Pin".into(),
+                include: vec![],
+                exclude: vec![],
+            },
+            &store,
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            rewolked.item_count, 9999,
+            "a scan of a persisted collection must re-walk the disk, never serve the cache"
+        );
     }
 
     // -- list_subdirs -----------------------------------------------------------------------------
@@ -2463,9 +2761,14 @@ mod tests {
         assert!(collection.est_size.is_none(), "empty folder has no size estimate");
         assert!(collection.listing.is_empty(), "empty folder has an empty listing");
 
-        // The draft must be persisted so the empty collection shows up in the list.
+        // QURATOR-207: the scan persists nothing durable — the empty collection lives in the
+        // in-memory scan cache until Publish promotes it (no orphan draft on Cancel).
         let draft = store.load_collection_draft(&collection.slug).unwrap();
-        assert!(draft.is_some(), "empty-folder scan must still save a draft");
+        assert!(draft.is_none(), "empty-folder scan must NOT save a draft (QURATOR-207)");
+        assert!(
+            scan_cache().lock().unwrap().get(&collection.slug).is_some(),
+            "empty-folder scan must populate the in-memory cache"
+        );
     }
 
     /// Regression (devtest 2026-06-25 #5): the home "Total Size" / "Disk size (auto)" aggregate
@@ -2473,6 +2776,7 @@ mod tests {
     /// privacy invariant). The scanned byte total must therefore be persisted in the per-slug
     /// `ScanSpec` sidecar so `get_collections` can surface it on `CollectionEntry` — before the fix
     /// it was computed at scan time and dropped, so the aggregate always read "—".
+    /// QURATOR-207: the spec is now persisted by Publish's promote step, not by the scan.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scan_persists_total_bytes_for_the_size_aggregate() {
         use tempfile::TempDir;
@@ -2488,7 +2792,26 @@ mod tests {
             exclude: vec![],
         };
         let collection = scan_directory_inner(opts, &store).await.unwrap();
-        let spec = store.load_scan_spec(&collection.slug).unwrap().expect("scan persists a spec");
+        // QURATOR-207: nothing is durable until Publish — the spec (and its byte total) appears
+        // only when the waiting scan is promoted.
+        assert!(
+            store.load_scan_spec(&collection.slug).unwrap().is_none(),
+            "scan must not persist a spec (QURATOR-207)"
+        );
+        // The promote gate requires ≥1 content type (the ruling keeps that gate) — tick one on the
+        // waiting cache entry, as the Details form's update_collection_meta would.
+        scan_cache()
+            .lock()
+            .unwrap()
+            .get_mut(&collection.slug)
+            .unwrap()
+            .collection
+            .content_types = vec!["video".into()];
+        assert!(
+            promote_cached_scan(&collection.slug, &store).unwrap(),
+            "the scanned collection must be waiting in the cache for Publish to promote"
+        );
+        let spec = store.load_scan_spec(&collection.slug).unwrap().expect("promote persists a spec");
         assert_eq!(spec.total_bytes, 3048, "the byte total must be persisted for the UI size aggregate");
         // And the published Collection must STILL NOT carry total_bytes (privacy invariant unchanged).
         let json = serde_json::to_string(&collection).unwrap();

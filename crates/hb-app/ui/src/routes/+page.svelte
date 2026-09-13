@@ -392,6 +392,15 @@
 		toast(`Scanned "${collection.path_alias}": ${collection.item_count} items`);
 	}
 
+	// QURATOR-207: a scanned-but-unpublished collection does not exist yet — the wizard's scan
+	// must NOT merge it into the Home list, or a Cancel would leave a ghost row backed by nothing
+	// (it only becomes real when the wizard's Publish promotes the backend's scan cache). The
+	// standalone ScanDialog above keeps merging: that path is only the Rescan verb, whose row is
+	// already published and backed.
+	function onWizardScanned(collection: Collection) {
+		toast(`Scanned "${collection.path_alias}": ${collection.item_count} items`);
+	}
+
 	// The Details step already toasts its own "saved"/"published" message — just sync the store.
 	function onWizardSaved(collection: Collection) {
 		mergeCollectionIntoStore(collection);
@@ -951,7 +960,7 @@
 	</div>
 
 	<ScanDialog bind:open={scanOpen} title={scanTitle} initialPath={scanInitialPath} initialAlias={scanInitialAlias} onscanned={handleScannedCollection} />
-	<AddCollectionModal bind:open={addModalOpen} editCollection={editTarget} onscanned={handleScannedCollection} onsaved={onWizardSaved} onpublished={onWizardPublished} />
+	<AddCollectionModal bind:open={addModalOpen} editCollection={editTarget} onscanned={onWizardScanned} onsaved={onWizardSaved} onpublished={onWizardPublished} />
 {/if}
 
 <style>
