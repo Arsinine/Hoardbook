@@ -767,12 +767,27 @@ pub(crate) async fn publish_collection_inner(
 
     // Visibility gate: a Private collection takes the sealed, per-recipient path and never touches
     // the browse-key or the public teaser (and is never truncated — trusted recipients get it all).
+    // QURATOR-200: no fail-open here — `prepare_listing` above already proved the draft exists, so
+    // a missing draft at this point means it was deleted mid-publish, and defaulting that to
+    // Public would publish a public event for a collection that no longer exists.
     let visibility = store
         .load_collection_draft(slug)
         .map_err(cmd_err)?
         .map(|c| c.visibility)
-        .unwrap_or(Visibility::Public);
+        .ok_or_else(|| format!("No draft found for collection '{slug}'"))?;
     if visibility == Visibility::Private {
+        // QURATOR-200 (F10's sibling): republishing as Private must retract the PUBLIC listing the
+        // previous publish left live. Without this the marker is overwritten with the private
+        // shape, so no later unpublish can ever discover the public tier to retract — the public
+        // listing is stranded on relays forever. Only a marker that RECORDS the public tier pulls
+        // this (never a missing marker: that means "never published", and retraction would publish
+        // a tombstone for a slug that never had a public event). It runs BEFORE the private
+        // publish (INV-8 bias: a failed private publish must not leave the public listing
+        // re-stranded) and touches no marker and no revocation generation, so the guarded
+        // private-marker save below still sees the original `gen_at_start`.
+        if marker_tier(store, slug)? == MarkerTier::Public {
+            retract_public_listing(slug, store, identity, browse_key, relay).await?;
+        }
         publish_private_collection_inner(slug, store, identity, &listing_json, relay, gen_at_start).await?;
         return Ok(PublishSummary::whole());
     }
@@ -1067,6 +1082,159 @@ fn listing_dtag_belongs_to_slug(d: &str, slug: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// The tier a collection's published marker records (QURATOR-200 / F10): the AUTHORITATIVE record
+/// of what is actually live on relays, written at publish time — the public shape by
+/// [`publish_collection_inner`] (`{"parts":…}`), the private shape by
+/// [`publish_private_collection_inner`] (`{"private":true,"recipients":…}`). Retraction decisions
+/// must read THIS, never a re-read of the mutable draft: the F10 sequence (publish Public → flip
+/// the draft to Private → unpublish/delete) used to read Private off the draft and skip the entire
+/// public retraction while the original public listing stayed live on relays — an INV-8 failure
+/// (durable public data surviving a deliberate deletion) wearing a privacy regression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerTier {
+    /// The marker records the public tier (or is indeterminate — see [`marker_tier`]).
+    Public,
+    /// The marker records the private tier (`"private": true`).
+    Private,
+    /// No marker exists: nothing this build ever published under this slug.
+    Unpublished,
+}
+
+/// Classify a collection's published marker into its recorded tier (QURATOR-200 / F10).
+///
+/// **Indeterminate markers fail toward [`MarkerTier::Public`], and that is a decision, not the old
+/// code's reflex:** markers written by older builds may carry neither the public keys (`parts`, …)
+/// nor `"private": true`. The two misclassification directions are asymmetric. Reading such a
+/// marker as Private permanently strands a live public event through a deliberate deletion — this
+/// very bug. Reading a genuinely-private marker as Public costs one best-effort author+kind relay
+/// fetch that matches nothing by `d`-tag (private listings are gift-wrapped under per-recipient
+/// ephemeral keys, so they never appear under this identity's author filter) plus a tombstone that
+/// replaces nothing — bounded noise, no invariant broken, no data lost. Only
+/// [`publish_private_collection_inner`] ever writes `"private": true`, so its presence is a
+/// positive, unambiguous signal.
+fn marker_tier(store: &DataStore, slug: &str) -> Result<MarkerTier, String> {
+    let marker = store.load_published(slug).map_err(cmd_err)?;
+    Ok(match marker.as_deref() {
+        None => MarkerTier::Unpublished,
+        Some(m) => {
+            let private = serde_json::from_str::<serde_json::Value>(m)
+                .ok()
+                .and_then(|v| v.get("private").and_then(|p| p.as_bool()))
+                .unwrap_or(false);
+            if private { MarkerTier::Private } else { MarkerTier::Public }
+        }
+    })
+}
+
+/// The public-tier retraction proper (QURATOR-200): NIP-09-delete the author's whole `d`-tag
+/// listing family from the shared pool, publish the QURATOR-138 tombstone, then repeat both on the
+/// big relay the marker recorded (falling back to the current setting). Extracted VERBATIM from
+/// `unpublish_collection_inner` — behaviour unchanged — so `publish_collection_inner`'s Private
+/// branch can run the SAME retraction when a republish flips a previously-public collection to
+/// Private. Best-effort throughout (a relay MAY ignore a NIP-09 request; the tombstone is the
+/// enforced half). Touches no local state and bumps no revocation generation: the marker drop
+/// stays with the callers, so a publish-side call cannot trip the CWE-367 guard.
+async fn retract_public_listing(
+    safe_slug: &str,
+    store: &DataStore,
+    identity: &Identity,
+    browse_key: &BrowseKey,
+    relay: &SharedRelay,
+) -> Result<(), String> {
+    if let Ok(client) = net::client(identity, store, relay).await {
+        let filter =
+            Filter::new().author(identity.public_key()).kind(Kind::from_u16(hb_core::event::KIND_LISTING));
+        if let Ok(events) = client.fetch(filter, net::RELAY_TIMEOUT).await {
+            for ev in events {
+                let belongs = ev
+                    .tags
+                    .identifier()
+                    .map(|d| listing_dtag_belongs_to_slug(d, safe_slug))
+                    .unwrap_or(false);
+                if belongs {
+                    if let Ok(deletion) = hb_net::build_deletion(identity, &ev) {
+                        let _ = client.publish(&deletion).await;
+                    }
+                }
+            }
+        }
+        // QURATOR-138 (owner ruling 2026-08-30) — the TOMBSTONE, published to the shared pool
+        // AFTER the NIP-09 loop above (the fetch would otherwise find our own tombstone and
+        // NIP-09-delete it). KIND_LISTING is parameterized-replaceable (`d` = slug), so a zeroed
+        // listing at `created_at = now` makes every conforming relay REPLACE the published
+        // listing — enforced, unlike the NIP-09 request a relay MAY ignore. It reaches clients
+        // that re-fetch; a peer who already fetched keeps their copy (the Delete confirmation
+        // says exactly that — never promise retraction the mechanism cannot deliver). Sealed
+        // under the SAME browse key so a share-code holder decrypts an empty collection rather
+        // than a locked one. Best-effort, same posture as the NIP-09 half.
+        if let Ok(tombstone) = hb_core::event::build_tombstone_event(identity, safe_slug, browse_key)
+        {
+            let _ = client.publish(&tombstone).await;
+        }
+    }
+
+    // Codex finding 2: the big-relay full family (published to the big relay ONLY, W3) is invisible
+    // to the shared pool above — delete it from the big relay too, through a dedicated client, so an
+    // unpublished collection isn't left readable there by share-code holders who know the URL. The
+    // family events are authored by THIS identity, so this identity can NIP-09 them. Best-effort.
+    //
+    // Codex re-review HIGH: delete from the relay the family was ACTUALLY published to — recorded in
+    // the marker at publish time — NOT merely the current setting, which the owner may have changed
+    // or cleared since. Fall back to the current setting for a listing published before the marker
+    // carried the URL.
+    let recorded_big = store
+        .load_published(safe_slug)
+        .ok()
+        .flatten()
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+        .and_then(|v| v.get("big_relay_url").and_then(|u| u.as_str()).map(str::to_string))
+        .filter(|s| !s.trim().is_empty());
+    let big = match recorded_big {
+        Some(url) => url.trim().to_string(),
+        None => store
+            .load_settings()
+            .map_err(cmd_err)?
+            .unwrap_or_default()
+            .big_relay_url
+            .trim()
+            .to_string(),
+    };
+    if !big.is_empty() {
+        let relays = [big];
+        if let Ok(big_client) =
+            hb_net::RelayClient::connect(identity, &relays, net::RELAY_TIMEOUT).await
+        {
+            let filter = Filter::new()
+                .author(identity.public_key())
+                .kind(Kind::from_u16(hb_core::event::KIND_LISTING));
+            if let Ok(events) = big_client.fetch_from(&relays, filter, net::RELAY_TIMEOUT).await {
+                for ev in events {
+                    let belongs = ev
+                        .tags
+                        .identifier()
+                        .map(|d| listing_dtag_belongs_to_slug(d, safe_slug))
+                        .unwrap_or(false);
+                    if belongs {
+                        if let Ok(deletion) = hb_net::build_deletion(identity, &ev) {
+                            let _ = big_client.publish_to(&deletion, &relays).await;
+                        }
+                    }
+                }
+            }
+            // QURATOR-138: the tombstone goes to the big relay too — same relay the family was
+            // actually published to, AFTER the NIP-09 loop (the fetch above must not see and
+            // delete our own replacement event). Best-effort, identical posture to the pool half.
+            if let Ok(tombstone) =
+                hb_core::event::build_tombstone_event(identity, safe_slug, browse_key)
+            {
+                let _ = big_client.publish_to(&tombstone, &relays).await;
+            }
+            big_client.disconnect().await;
+        }
+    }
+    Ok(())
+}
+
 /// Unpublish a collection (spec §4 Unpublish): NIP-09 delete every relay event for a **Public**
 /// collection (best-effort — the index + every split part), drop the local published marker (which
 /// alone stops the watch's auto-republish: `evaluate_rescan` returns `Skipped("not published")`
@@ -1085,7 +1253,10 @@ fn listing_dtag_belongs_to_slug(d: &str, slug: &str) -> bool {
 /// **Private collections**: a gift-wrapped (1059) event is authored by a fresh **ephemeral** key
 /// per recipient (M10) — this identity cannot produce a valid NIP-09 for it (a deletion request
 /// must be signed by the target event's own author). The private path is therefore local-only
-/// (marker drop only): an honest limit, not a bug.
+/// (marker drop only): an honest limit, not a bug. **Which tier applies is decided by
+/// [`marker_tier`] — the PUBLISHED MARKER's recorded tier — never by the draft** (QURATOR-200/F10:
+/// a collection published Public and later flipped Private in the draft is still a public listing
+/// on relays and must be retracted as one).
 pub(crate) async fn unpublish_collection_inner(
     slug: &str,
     store: &DataStore,
@@ -1095,104 +1266,17 @@ pub(crate) async fn unpublish_collection_inner(
 ) -> Result<(), String> {
     let safe_slug = is_valid_slug(slug).then_some(slug).ok_or("Invalid collection slug")?;
 
-    let visibility = store
-        .load_collection_draft(safe_slug)
-        .map_err(cmd_err)?
-        .map(|c| c.visibility)
-        .unwrap_or(Visibility::Public);
-
-    if visibility == Visibility::Public {
-        if let Ok(client) = net::client(identity, store, relay).await {
-            let filter =
-                Filter::new().author(identity.public_key()).kind(Kind::from_u16(hb_core::event::KIND_LISTING));
-            if let Ok(events) = client.fetch(filter, net::RELAY_TIMEOUT).await {
-                for ev in events {
-                    let belongs = ev
-                        .tags
-                        .identifier()
-                        .map(|d| listing_dtag_belongs_to_slug(d, safe_slug))
-                        .unwrap_or(false);
-                    if belongs {
-                        if let Ok(deletion) = hb_net::build_deletion(identity, &ev) {
-                            let _ = client.publish(&deletion).await;
-                        }
-                    }
-                }
-            }
-            // QURATOR-138 (owner ruling 2026-08-30) — the TOMBSTONE, published to the shared pool
-            // AFTER the NIP-09 loop above (the fetch would otherwise find our own tombstone and
-            // NIP-09-delete it). KIND_LISTING is parameterized-replaceable (`d` = slug), so a zeroed
-            // listing at `created_at = now` makes every conforming relay REPLACE the published
-            // listing — enforced, unlike the NIP-09 request a relay MAY ignore. It reaches clients
-            // that re-fetch; a peer who already fetched keeps their copy (the Delete confirmation
-            // says exactly that — never promise retraction the mechanism cannot deliver). Sealed
-            // under the SAME browse key so a share-code holder decrypts an empty collection rather
-            // than a locked one. Best-effort, same posture as the NIP-09 half.
-            if let Ok(tombstone) = hb_core::event::build_tombstone_event(identity, safe_slug, browse_key)
-            {
-                let _ = client.publish(&tombstone).await;
-            }
-        }
-
-        // Codex finding 2: the big-relay full family (published to the big relay ONLY, W3) is invisible
-        // to the shared pool above — delete it from the big relay too, through a dedicated client, so an
-        // unpublished collection isn't left readable there by share-code holders who know the URL. The
-        // family events are authored by THIS identity, so this identity can NIP-09 them. Best-effort.
-        //
-        // Codex re-review HIGH: delete from the relay the family was ACTUALLY published to — recorded in
-        // the marker at publish time — NOT merely the current setting, which the owner may have changed
-        // or cleared since. Fall back to the current setting for a listing published before the marker
-        // carried the URL.
-        let recorded_big = store
-            .load_published(safe_slug)
-            .ok()
-            .flatten()
-            .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
-            .and_then(|v| v.get("big_relay_url").and_then(|u| u.as_str()).map(str::to_string))
-            .filter(|s| !s.trim().is_empty());
-        let big = match recorded_big {
-            Some(url) => url.trim().to_string(),
-            None => store
-                .load_settings()
-                .map_err(cmd_err)?
-                .unwrap_or_default()
-                .big_relay_url
-                .trim()
-                .to_string(),
-        };
-        if !big.is_empty() {
-            let relays = [big];
-            if let Ok(big_client) =
-                hb_net::RelayClient::connect(identity, &relays, net::RELAY_TIMEOUT).await
-            {
-                let filter = Filter::new()
-                    .author(identity.public_key())
-                    .kind(Kind::from_u16(hb_core::event::KIND_LISTING));
-                if let Ok(events) = big_client.fetch_from(&relays, filter, net::RELAY_TIMEOUT).await {
-                    for ev in events {
-                        let belongs = ev
-                            .tags
-                            .identifier()
-                            .map(|d| listing_dtag_belongs_to_slug(d, safe_slug))
-                            .unwrap_or(false);
-                        if belongs {
-                            if let Ok(deletion) = hb_net::build_deletion(identity, &ev) {
-                                let _ = big_client.publish_to(&deletion, &relays).await;
-                            }
-                        }
-                    }
-                }
-                // QURATOR-138: the tombstone goes to the big relay too — same relay the family was
-                // actually published to, AFTER the NIP-09 loop (the fetch above must not see and
-                // delete our own replacement event). Best-effort, identical posture to the pool half.
-                if let Ok(tombstone) =
-                    hb_core::event::build_tombstone_event(identity, safe_slug, browse_key)
-                {
-                    let _ = big_client.publish_to(&tombstone, &relays).await;
-                }
-                big_client.disconnect().await;
-            }
-        }
+    // QURATOR-200 (F10): the retraction tier comes from the PUBLISHED MARKER — the record of what
+    // is actually live on relays — never from a re-read of the mutable draft. The F10 sequence
+    // (publish Public → flip the draft Private → delete) used to read Private off the draft and
+    // skip the entire retraction, leaving the public listing live on relays: an INV-8 failure. A
+    // marker that is missing entirely ALSO retracts: `delete_collection` only reaches this
+    // function with a marker present, an explicit unpublish must still find a pre-marker-era
+    // public listing, and the wrong guess costs one fetch that matches nothing by `d`-tag — while
+    // the other direction is this bug.
+    let tier = marker_tier(store, safe_slug)?;
+    if tier != MarkerTier::Private {
+        retract_public_listing(safe_slug, store, identity, browse_key, relay).await?;
     }
 
     store.delete_published(safe_slug).map_err(cmd_err)?;
@@ -3641,6 +3725,141 @@ mod tests {
 
         assert!(!store.is_published("vault"), "the published marker must be gone");
     }
+
+    // ── QURATOR-200 (F10): the retraction tier comes from the published MARKER, not the draft ──
+
+    /// The tier classifier on the exact store states of the defect and its mirror. The public and
+    /// private marker shapes are the ones `publish_collection_inner` /
+    /// `publish_private_collection_inner` write today; `{}` and unparseable bytes are the legacy
+    /// indeterminate shapes. **Why the wire behaviour itself is not asserted here:** with relays
+    /// configured unroutable (the only offline-safe configuration) the public retraction is
+    /// locally SILENT — every step is best-effort against a dead pool — so the branch choice is
+    /// pinned at the decision (`marker_tier`) and the read-wiring (the two tests below); the
+    /// emitted NIP-09/tombstone is `hb-it`'s to observe on a live relay, same split as the
+    /// existing unpublish tests above.
+    #[test]
+    fn marker_tier_reads_the_published_tier_never_the_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+
+        // F10 state: published PUBLIC (marker), draft since flipped PRIVATE.
+        make_collection_draft(&store, "films", vec!["video".into()]);
+        let mut col = store.load_collection_draft("films").unwrap().unwrap();
+        col.visibility = Visibility::Private;
+        store.save_collection_draft(&col).unwrap();
+        store.save_published("films", r#"{"parts":1,"truncated":false}"#).unwrap();
+        assert_eq!(
+            marker_tier(&store, "films").unwrap(),
+            MarkerTier::Public,
+            "F10: the marker's recorded public tier wins over the flipped draft"
+        );
+
+        // Mirror (criterion 2): published PRIVATE (marker), draft since flipped PUBLIC — the
+        // marker is authoritative in BOTH directions, so the fix is not merely an inversion.
+        make_collection_draft(&store, "vault", vec!["forbidden".into()]);
+        store.save_published("vault", r#"{"private":true,"recipients":1}"#).unwrap();
+        assert_eq!(
+            marker_tier(&store, "vault").unwrap(),
+            MarkerTier::Private,
+            "a genuinely-private marker keeps the local-only path even though the draft says Public"
+        );
+
+        // Indeterminate legacy markers fail toward Public (retraction attempted), never Private.
+        store.save_published("legacy", "{}").unwrap();
+        assert_eq!(marker_tier(&store, "legacy").unwrap(), MarkerTier::Public);
+        store.save_published("ancient", "not-json-at-all").unwrap();
+        assert_eq!(marker_tier(&store, "ancient").unwrap(), MarkerTier::Public);
+
+        // Never published.
+        assert_eq!(marker_tier(&store, "ghost").unwrap(), MarkerTier::Unpublished);
+    }
+    // MUTATION (P-10): in `marker_tier` (collection.rs, the `Some(m)` arm), swap the classification
+    // line `if private { MarkerTier::Private } else { MarkerTier::Public }` to
+    // `if !private { MarkerTier::Private } else { MarkerTier::Public }` — every assertion above
+    // reds (Public↔Private swap; `Unpublished` is the untouched `None` arm).
+
+    /// Wiring of the read (F10 proper): `unpublish_collection_inner` must CONSULT THE MARKER to
+    /// decide the tier — the defect was exactly that it read the draft. Probe: the marker FILE is
+    /// replaced by a directory, so a marker read fails with `load_published`'s
+    /// "loading published event" context, while the draft-driven code never reads the marker on
+    /// this path and instead fails later at `delete_published`'s `remove_file` with a bare io
+    /// message. **No relay is configured and none is needed:** the fixed path errors at the marker
+    /// read (before any relay I/O), and the draft-driven path sees a Private draft and takes the
+    /// local-only branch — neither can reach the network, which is what makes this test safe.
+    #[tokio::test]
+    async fn unpublish_decides_its_tier_from_the_marker_not_the_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        make_collection_draft(&store, "films", vec!["video".into()]);
+        let mut col = store.load_collection_draft("films").unwrap().unwrap();
+        col.visibility = Visibility::Private;
+        store.save_collection_draft(&col).unwrap();
+        store.save_published("films", r#"{"parts":1}"#).unwrap();
+        // Make the recorded-public marker UNREADABLE, so WHICH read failed is observable.
+        let marker_path = store.published_path("films");
+        assert!(marker_path.is_file(), "fixture premise: the marker write created the file");
+        std::fs::remove_file(&marker_path).unwrap();
+        std::fs::create_dir(&marker_path).unwrap();
+
+        let identity = Identity::generate();
+        let bk: BrowseKey = rand::random();
+        let relay = crate::net::new_shared();
+        let err = unpublish_collection_inner("films", &store, &identity, &bk, &relay)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("loading published event"),
+            "the tier decision must fail on the MARKER read (QURATOR-200); got: {err}"
+        );
+    }
+    // MUTATION (P-10): in `unpublish_collection_inner` (collection.rs, the tier-decision lines at
+    // the top of the fn, right after the `safe_slug` let), replace `let tier = marker_tier(store,
+    // safe_slug)?;` with a draft-derived tier:
+    //   let tier = if store.load_collection_draft(safe_slug).map_err(cmd_err)?
+    //       .map(|c| c.visibility) == Some(Visibility::Private) { MarkerTier::Private }
+    //   else { MarkerTier::Public };
+    // (compiles; recreates F10). The error then comes from the later `delete_published`
+    // `remove_file`, so the "loading published event" assertion reds. This test is also RED on the
+    // pre-fix tree by construction — it is the red half of this fix's own red-green.
+
+    /// Wiring of the republish flip (F10's sibling): `publish_collection_inner`'s Private branch
+    /// must consult the RECORDED tier before the audience gate, so a stranded public listing is
+    /// retracted at the flip. Same unreadable-marker probe, and again **no relay is configured and
+    /// none is reached**: the fixed path errors at the marker read, and the retract-free path
+    /// errors at `private_recipients` (empty audience) — both before any relay I/O.
+    #[tokio::test]
+    async fn republish_as_private_consults_the_recorded_public_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        make_collection_draft(&store, "flipzone", vec!["video".into()]);
+        let mut col = store.load_collection_draft("flipzone").unwrap().unwrap();
+        col.visibility = Visibility::Private;
+        store.save_collection_draft(&col).unwrap();
+        store.save_published("flipzone", r#"{"parts":1}"#).unwrap();
+        let marker_path = store.published_path("flipzone");
+        assert!(marker_path.is_file(), "fixture premise: the marker write created the file");
+        std::fs::remove_file(&marker_path).unwrap();
+        std::fs::create_dir(&marker_path).unwrap();
+
+        let identity = Identity::generate();
+        let bk: BrowseKey = rand::random();
+        let relay = crate::net::new_shared();
+        let err = publish_collection_inner("flipzone", &store, &identity, &bk, &relay, 0)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("loading published event"),
+            "the Private branch must consult the recorded tier BEFORE the audience gate; got: {err}"
+        );
+        assert!(
+            !err.contains("haven't chosen anyone"),
+            "reaching the audience gate means the marker was never consulted; got: {err}"
+        );
+    }
+    // MUTATION (P-10): in `publish_collection_inner` (collection.rs, the Private-visibility
+    // branch), delete the `if marker_tier(store, slug)? == MarkerTier::Public {
+    // retract_public_listing(...).await?; }` consult. The error then comes from
+    // `private_recipients` ("haven't chosen anyone") and both assertions above red.
 
     /// devtest #11: deleting a *published* collection must drop its content_types from the published
     /// profile teaser's union. The delete path routes a published collection through
