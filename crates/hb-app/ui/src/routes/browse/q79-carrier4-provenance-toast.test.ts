@@ -1,38 +1,27 @@
 // @vitest-environment jsdom
-// QURATOR-79 carrier 4 — the stale-import toast becomes provenance-aware. The old copy
-// ("Imported an older version of this list. Ask the owner for a fresh manifest.") is wrong twice
-// when a PEER re-served the manifest: the owner cannot be asked (offline — that is why a peer
-// answered), and the user cannot tell WHO served the copy. The new copy names the serving peer
-// (via the contact list, falling back to shortNpub) and says to ask again once the author is back.
+// QURATOR-79 carrier 4 — the stale-import toast was made provenance-aware (names the serving peer,
+// says the author is offline rather than "Ask the owner for a fresh manifest"). QURATOR-203 then
+// deleted the paywall's manual import affordances ("or paste it" / "Import from text") as dead
+// round-trip chrome: fetch/serve are now fully automatic (fetch_driver.rs, auto_approve.rs), so a
+// user can no longer reach `importManifest` through the paywall UI at all. The provenance-copy
+// behaviour this file used to exercise is therefore unreachable from the mounted page; this file
+// now pins that unreachability instead.
 //
-// ⚠ WHAT THIS FILE DOES NOT PROVE (QURATOR-172 #1). It mocks `importManifest`, and Browse's real
-// backend hardcodes `served_by: None` on that path — so the provenance branches asserted here were
-// UNREACHABLE in production for as long as this file was green. It proves the COPY, given a
-// provenance value; it never proved one could arrive. REACHABILITY is pinned separately, on the
-// redeem path that actually produces the value, by chat-q172-provenance-reachable.test.ts. Keep
-// both: this one guards the wording, that one guards the wiring.
+// ⚠ Historical note (QURATOR-172 #1), kept for context: the provenance branches were already
+// unreachable in PRODUCTION even before this slice (Browse's backend hardcoded `served_by: None`
+// on the import path) — reachability was pinned separately by
+// chat-q172-provenance-reachable.test.ts. That test is untouched by this slice.
 //
 // This is a BEHAVIOURAL mount test (the q92/q134/q83 pattern): the real Browse page is mounted
-// with only `$lib/api.js` mocked, the peer is selected through the `/browse?peer=` deep-link
-// (which routes through selectPeer exactly as production does), the truncated collection is
-// clicked open, and the manifest is imported through the paywall's paste affordance — the same
-// buttons a user presses. The toast is asserted on the `toastMessage` store because the toast
-// DOM lives in +layout.svelte, which a route-page render does not mount; the store is what the
-// layout renders, so asserting there is asserting the production payload.
+// with only `$lib/api.js` mocked, the peer is selected through the `/browse?peer=` deep-link, and
+// the truncated collection is clicked open so the paywall block renders. A source-scan is NOT
+// acceptable for this (CLAUDE.md → P-4): the property is what the mounted DOM does or does not
+// expose.
 //
-// The four cases are one derivation apart, so the FILE is the discriminator, not any single
-// test: stale+re-served, stale+direct (today's copy, unchanged), fresh+re-served (the lighter
-// note), fresh+direct (the plain note).
-//
-// Per CLAUDE.md §9, a green test proves nothing until seen red. The mutation probes run for
-// this file (each applied alone, then reverted) are documented in the lane report:
-//   A. `const reServed = result.served_by !== undefined;` → `const reServed = false;`
-//      — reds the two re-served cases, leaves the two direct cases green.
-//   C. `servingPeerName` drops its contacts lookup (always shortNpub) — reds only the
-//      peer-name assertion.
-//
-// jsdom computes no layout — nothing here proves the toast RENDERS on one line or that the
-// paywall fade paints; only that the payload the page hands the toast store is right.
+// Per CLAUDE.md §9 / P-10, a green absence test proves nothing until seen red. Mutation probe
+// (applied, confirmed red, then reverted; see the lane report): re-adding the
+// `<button ...>or paste it</button>` markup to the paywall block reds
+// "the manual import (paste) affordance no longer appears in the paywall block".
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, fireEvent, cleanup, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
@@ -144,70 +133,34 @@ afterEach(() => {
 import { importManifest } from '$lib/api.js';
 const importMock = importManifest as unknown as ReturnType<typeof vi.fn>;
 
-/** Drive the real page to a completed manifest import and hand back the live toast. */
-async function importThroughThePage(
-	result: { stale: boolean; served_by?: string },
-): Promise<{ text: string; kind: 'success' | 'error' } | null> {
-	importMock.mockResolvedValue({ slug: 'archive', collection: FULL_COL, created_at: CREATED_AT, ...result });
+/** Drive the real page to the open truncated-collection paywall block. */
+async function driveToPaywall(): Promise<void> {
+	importMock.mockResolvedValue({ slug: 'archive', collection: FULL_COL, created_at: CREATED_AT, stale: false });
 	contacts.set([PEER, SERVER]);
 	render(BrowsePage);
 	await tick();
 
-	// Open the truncated collection — the paywall block with the import affordances is inside.
+	// Open the truncated collection — the paywall block is inside.
 	await waitFor(() => expect(document.body.textContent).toContain('The Archive'));
 	const card = document.querySelector<HTMLButtonElement>('.col-card');
 	expect(card).toBeTruthy();
 	await fireEvent.click(card!);
 	await tick();
 	await waitFor(() => expect(document.body.textContent).toContain('more item'));
-
-	// The paste affordance, then the import — the buttons a user actually presses.
-	await fireEvent.click([...document.querySelectorAll('button')].find((b) => b.textContent?.trim() === 'or paste it')!);
-	await tick();
-	const area = document.querySelector<HTMLTextAreaElement>('.paywall-paste');
-	expect(area).toBeTruthy();
-	await fireEvent.input(area!, { target: { value: 'eyJoYm1hbmlmZXN0IjoiMSJ9' } });
-	const importBtn = [...document.querySelectorAll('button')].find((b) => b.textContent?.trim() === 'Import from text');
-	expect(importBtn).toBeTruthy();
-	await fireEvent.click(importBtn!);
-
-	await waitFor(() => expect(get(toastMessage)).not.toBeNull());
-	return get(toastMessage);
 }
 
 describe('QURATOR-79 carrier 4 — the import toast names who served the copy', () => {
-	it('stale + re-served: names the serving peer and that the author is offline', async () => {
-		const toast = await importThroughThePage({ stale: true, served_by: SERVER_NPUB });
-		// The serving peer is named from the contact list (display name), never the raw npub.
-		expect(toast?.text).toContain('Mira');
-		expect(toast?.text).not.toContain(SERVER_NPUB);
-		// No date is claimed: there is no cache clock, and the envelope's own clock is the AUTHOR's
-		// writing time, so rendering it here would state a falsehood about when the copy was taken.
-		expect(toast?.text).not.toContain(new Date(CREATED_AT * 1000).toLocaleDateString());
-		// The author is offline — the whole reason a peer answered — and the ask is deferred.
-		expect(toast?.text).toContain('offline');
-		expect(toast?.text).not.toContain('Ask the owner for a fresh manifest');
-		expect(toast?.kind).toBe('error');
-	});
-
-	it('stale + served directly by the author: today\'s copy, unchanged', async () => {
-		const toast = await importThroughThePage({ stale: true });
-		expect(toast?.text).toBe('Imported an older version of this list. Ask the owner for a fresh manifest.');
-		expect(toast?.text).not.toContain('Mira');
-		expect(toast?.kind).toBe('error');
-	});
-
-	it('fresh + re-served: the lighter note that it came from a peer\'s cached copy', async () => {
-		const toast = await importThroughThePage({ stale: false, served_by: SERVER_NPUB });
-		expect(toast?.text).toContain("Full manifest imported from Mira's cached copy");
-		expect(toast?.text).not.toContain('older');
-		expect(toast?.kind).toBe('success');
-	});
-
-	it('fresh + served directly: the plain note, no provenance', async () => {
-		const toast = await importThroughThePage({ stale: false });
-		expect(toast?.text).toBe('Full manifest imported');
-		expect(toast?.text).not.toContain('cached');
-		expect(toast?.kind).toBe('success');
+	it('the manual import (paste) affordance no longer appears in the paywall block', async () => {
+		await driveToPaywall();
+		// QURATOR-203: fetch/serve are now fully automatic; the manual "or paste it" / "Import from
+		// text" round trip was deleted from the paywall markup, so `importManifest` (and the
+		// provenance-aware toast copy it used to feed) is no longer reachable from this UI.
+		const pasteBtn = [...document.querySelectorAll('button')].find((b) => b.textContent?.trim() === 'or paste it');
+		expect(pasteBtn).toBeUndefined();
+		expect(document.querySelector('.paywall-paste')).toBeNull();
+		const importBtn = [...document.querySelectorAll('button')].find((b) => b.textContent?.trim() === 'Import from text');
+		expect(importBtn).toBeUndefined();
+		expect(importMock).not.toHaveBeenCalled();
+		expect(get(toastMessage)).toBeNull();
 	});
 });

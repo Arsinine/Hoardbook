@@ -1,29 +1,20 @@
 // @vitest-environment jsdom
-// QURATOR-79 carrier 4 — the ASK-ORIGINATION slice. The C-side (serving) and the inbox-recognition
-// side had landed; D had no way to originate the ask. This pins the Browse paywall's new affordance:
-// the user picks a contact (peer C) and the ask names the collection's AUTHOR (peer A — the browsed
-// peer), through `request_manifest_from`.
+// QURATOR-79 carrier 4 — the ASK-ORIGINATION slice originally pinned the Browse paywall's
+// "ask a contact" affordance (picker + `request_manifest_from`). QURATOR-203 deleted that
+// affordance from the paywall markup: fetch/serve are now fully automatic (fetch_driver.rs,
+// auto_approve.rs), so the manual ask-a-contact round trip is dead chrome. This file now pins the
+// ABSENCE of that affordance instead of its behaviour.
 //
 // This is a BEHAVIOURAL mount test (the q83/q79-provenance pattern): the real Browse page is
 // mounted with only `$lib/api.js` mocked, the peer is selected through the `/browse?peer=` deep-link
-// (which routes through selectPeer exactly as production does), the truncated collection is clicked
-// open, and the ask is driven through the same buttons a user presses. A source-scan is NOT
-// acceptable for this (CLAUDE.md → P-4): the property is what the page CALLS and with WHICH author,
-// which only a mount can see.
+// (which routes through selectPeer exactly as production does), and the truncated collection is
+// clicked open so the paywall block renders. A source-scan is NOT acceptable for this (CLAUDE.md →
+// P-4): the property is what the mounted DOM does or does not expose.
 //
-// Per CLAUDE.md §9, a green test proves nothing until seen red. The mutation probes (each applied
-// alone, then reverted) are documented in the lane report:
-//   A. in `handleAskContact`, swap the `requestManifestFrom(...)` call for `requestManifest(...)`
-//      (dropping the author) — reds the "calls the command with the author's npub" assertions in
-//      every test here; the affordance-presence assertion alone would stay green, which is why the
-//      call-shape asserts exist.
-//   B. in the template, delete the `Ask a contact for this list` button — reds every test at the
-//      affordance-presence step.
-//   C. in `askableContacts`, drop the `c.npub !== selectedPeer.npub` filter — reds the
-//      "author is never offered" test only.
-//
-// jsdom computes no layout — nothing here proves the picker row RENDERS on one line; only that the
-// affordance appears and that invoking it calls the command with the author's npub.
+// Per CLAUDE.md §9 / P-10, a green absence test proves nothing until seen red. Mutation probe
+// (applied, confirmed red, then reverted; see the lane report): re-adding the
+// `<button class="btn-ghost btn-sm" onclick={...}>Ask a contact for this list</button>` markup to
+// the paywall block reds "the ask-a-contact affordance no longer appears in the paywall block".
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, fireEvent, cleanup, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
@@ -118,98 +109,37 @@ import { requestManifestFrom, requestManifest } from '$lib/api.js';
 const askFromMock = requestManifestFrom as unknown as ReturnType<typeof vi.fn>;
 const askOwnerMock = requestManifest as unknown as ReturnType<typeof vi.fn>;
 
-/** Drive the real page to the paywall block with the contact picker OPEN, and return the picker. */
-async function driveToOpenPicker(): Promise<HTMLSelectElement> {
+/** Drive the real page to the open truncated-collection paywall block. */
+async function driveToPaywall(): Promise<void> {
 	contacts.set([AUTHOR_PEER, CONTACT_PEER]);
 	render(BrowsePage);
 	await tick();
 
-	// Open the truncated collection — the paywall block with the ask affordances is inside.
+	// Open the truncated collection — the paywall block is inside.
 	await waitFor(() => expect(document.body.textContent).toContain('The Archive'));
 	const card = document.querySelector<HTMLButtonElement>('.col-card');
 	expect(card).toBeTruthy();
 	await fireEvent.click(card!);
 	await tick();
 	await waitFor(() => expect(document.body.textContent).toContain('more item'));
-
-	// The ask-a-contact affordance — the button a user presses.
-	const openBtn = [...document.querySelectorAll('button')].find(
-		(b) => b.textContent?.trim() === 'Ask a contact for this list',
-	);
-	expect(openBtn, 'the ask-a-contact affordance must appear in the paywall block').toBeTruthy();
-	await fireEvent.click(openBtn!);
-	await tick();
-
-	const select = document.querySelector<HTMLSelectElement>('.ask-contact-select');
-	expect(select, 'opening the affordance reveals the contact picker').toBeTruthy();
-	return select!;
 }
 
 describe('QURATOR-79 carrier 4 — ask origination (D asks C for A\'s manifest)', () => {
-	it('the affordance appears in the paywall block and offers contacts BY NAME, excluding the author', async () => {
-		const select = await driveToOpenPicker();
-		const options = [...select.querySelectorAll('option')];
-		// Mira is offered by display name — the "by name" half of design §5's sentence.
-		expect(options.some((o) => o.textContent?.trim() === 'Mira' && o.value === CONTACT_NPUB)).toBe(true);
-		// The author is NEVER offered: asking A directly is the "Ask the owner" button beside it.
-		expect(options.every((o) => o.value !== AUTHOR_NPUB)).toBe(true);
-		// The honest uncertainty copy is present.
-		expect(document.body.textContent).toContain('They’ll only see this if they hold a copy');
-	});
-
-	it('invoking it calls request_manifest_from with the AUTHOR\'s npub (never the contact\'s)', async () => {
-		const select = await driveToOpenPicker();
-		await fireEvent.change(select, { target: { value: CONTACT_NPUB } });
-		await tick();
-
-		const askBtn = [...document.querySelectorAll('button')].find((b) => b.textContent?.trim() === 'Ask them');
-		expect(askBtn, 'choosing a contact enables the Ask them button').toBeTruthy();
-		expect((askBtn as HTMLButtonElement).disabled).toBe(false);
-		await fireEvent.click(askBtn!);
-
-		await waitFor(() => expect(askFromMock).toHaveBeenCalledTimes(1));
-		// THE assertion that matters: the ask names WHO AUTHORED the collection (the browsed peer A),
-		// and is ADDRESSED to the chosen contact C. The two must not be swapped or dropped.
-		expect(askFromMock).toHaveBeenCalledWith(
-			CONTACT_NPUB,
-			AUTHOR_NPUB,
-			'archive',
-			'aaaa',
-			'ev-teaser',
+	it('the ask-a-contact affordance no longer appears in the paywall block', async () => {
+		await driveToPaywall();
+		// QURATOR-203: fetch/serve are now fully automatic; the manual "ask a contact" round trip
+		// (button, picker, "Ask them") was deleted from the paywall markup. Neither the trigger
+		// button, the contact picker, nor the hint text should be reachable from the mounted DOM.
+		const openBtn = [...document.querySelectorAll('button')].find(
+			(b) => b.textContent?.trim() === 'Ask a contact for this list',
 		);
-		// The owner-path ask is NOT fired by this affordance.
+		expect(openBtn).toBeUndefined();
+		expect(document.querySelector('.ask-contact-select')).toBeNull();
+		expect(document.querySelector('.ask-contact-hint')).toBeNull();
+		const askThemBtn = [...document.querySelectorAll('button')].find((b) => b.textContent?.trim() === 'Ask them');
+		expect(askThemBtn).toBeUndefined();
+		// Neither ask path is ever invoked, since neither trigger exists anymore.
+		expect(askFromMock).not.toHaveBeenCalled();
 		expect(askOwnerMock).not.toHaveBeenCalled();
-		// Success is fed back: the toast names the asked CONTACT (by name), never the raw npub.
-		const { get } = await import('svelte/store');
-		await waitFor(() => expect(get(toastMessage)).not.toBeNull());
-		expect(get(toastMessage)?.text).toContain('Mira');
-		expect(get(toastMessage)?.text).not.toContain(CONTACT_NPUB);
-	});
-
-	it('the ask is re-read from the persisted map after the send (the trace is not optimistic)', async () => {
-		const { getManifestAsks } = await import('$lib/api.js');
-		const asksMock = getManifestAsks as unknown as ReturnType<typeof vi.fn>;
-		const select = await driveToOpenPicker();
-		const callsBefore = asksMock.mock.calls.length;
-		await fireEvent.change(select, { target: { value: CONTACT_NPUB } });
-		await tick();
-		const askBtn = [...document.querySelectorAll('button')].find((b) => b.textContent?.trim() === 'Ask them');
-		await fireEvent.click(askBtn!);
-		// A successful send re-reads the persisted map so the asked-state renders from the store —
-		// the same W7.1a discipline as the owner-path ask.
-		await waitFor(() => expect(asksMock.mock.calls.length).toBeGreaterThan(callsBefore));
-	});
-
-	it('the honest copy promises nothing about whether the contact holds the list', async () => {
-		await driveToOpenPicker();
-		const hint = document.querySelector('.ask-contact-hint');
-		expect(hint, 'the hint line renders beside the picker').toBeTruthy();
-		const text = hint?.textContent ?? '';
-		// No promise of possession, no "has"/"holds a copy" certainty directed at the reader.
-		expect(text).toContain('Nothing is promised');
-		expect(text).toContain('may not have it');
-		// MAS-INV-5 unchanged: the NEW copy introduces no "download" (the page's pre-existing
-		// "No downloads here" footer is out of scope here — it is not this affordance's copy).
-		expect(/download/i.test(text)).toBe(false);
 	});
 });

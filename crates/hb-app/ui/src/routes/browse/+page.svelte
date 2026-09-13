@@ -4,8 +4,7 @@
 	import { listen } from '@tauri-apps/api/event';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import { sizeTier, sizeTierTooltip, rowIcon } from '$lib/collection-row-view.js';
-	import { refreshContact, importManifest, requestManifest, requestManifestFrom, getManifestAsks, getContacts, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, browsePrivateCollections, applyKeyGrants, type ManifestAsk, type ImportedManifest } from '$lib/api.js';
-	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
+	import { refreshContact, getContacts, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, browsePrivateCollections, applyKeyGrants } from '$lib/api.js';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
 	import Avatar from '$lib/components/Avatar.svelte';
@@ -18,7 +17,6 @@
 	import Modal from '$lib/components/Modal.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote, arrangeItems, fileTypesPresent, fmtLargestUnit, type BrowseViewMode, type BrowseSortKey, type BrowseSortDir } from '$lib/browse-view.js';
-	import { deriveManifestAskState, ASK_TICK_MS, MANIFEST_ASKED_LINE, MANIFEST_ASK_AGAIN_LABEL, MANIFEST_ASK_AGAIN_COOLDOWN_TIP, MANIFEST_OPEN_CHAT_LABEL, MANIFEST_ASK_FAILED_LINE } from '$lib/manifest-ask.js';
 	import type { CachedPeer, Collection, DirectoryItem, Group } from '$lib/types.js';
 	import { groupByGroups, matchesQuery } from '$lib/contacts-view.js';
 	// M22 W3 — drag-to-group gesture primitives (shared with Contacts). Create is ALWAYS ADDITIVE.
@@ -28,7 +26,6 @@
 	// plain click selects one, Shift-click extends a contiguous run, Cmd/Ctrl toggles one.
 	import { writeDragPayload, readDragPayload, writeDragPayloadMulti, readDragPayloadMulti, isOurDrag, isValidDropTarget, isSelfDrop, groupSuggestions, groupSuggestionsMulti, commitCreateGroup, commitCreateGroupMulti, computeDropOutcome, commitDropOnGroup, computeDropOutcomeMulti, commitDropOnGroupMulti, applyClickToSelection, applyKeyToSelection, isTypingTargetShape, rovingTabindexForIdx, shouldHandleArrowKey, rowId, computeDropInverse, computeDropInverseMulti, computeCreateInverse, commitInverse, commitInverseMulti, UNGROUPED_TARGET, type DropOutcome, type DropOutcomeMulti } from '$lib/drag-group.js';
 	import { contactDisplayName, shortNpub } from '$lib/contact-display.js';
-	import { importToast } from '$lib/manifest-provenance.js';
 	import { tick } from 'svelte';
 
 	type BcItem =
@@ -132,48 +129,6 @@
 		manifestProgress = {};
 	}
 
-	// M16 W4: import a full-listing manifest the user received out of band, upgrading a truncated
-	// paywall teaser to the whole tree. The backend verifies the manifest author against this peer's
-	// npub before decrypting; on success the fade lifts (`truncated` cleared ⇒ `paywallTeaser` → null).
-	let importingManifest = $state(false);
-	let pasteOpen = $state(false);
-	let pasteText = $state('');
-	let askingOwner = $state(false);
-
-	// M17 W7.1a — the ask must leave a trace. `request_manifest` delivers to the recipient's inbox only
-	// (no self-copy), so without reading the persisted ask-trace map back the paywall block reads as
-	// unchanged and the button as dead. The asked-state is derived PURELY from this map + the clock,
-	// never from component-local state — so it survives a remount/restart. Re-read after every send
-	// (success OR failure) so a rejected publish leaves the un-asked state (the record is written only
-	// after `send_dm_inner` resolves; a failed ask must never render as "Asked").
-	let manifestAsks = $state<Record<string, ManifestAsk> | null>(null);
-	// A slow tick re-derives the cooldown countdown + the relative label so the tooltip and "Ask again"
-	// disabled state stay honest without a page reload. Idempotent + cheap (pure derivation).
-	let nowTick = $state(Date.now());
-	let askError = $state<string | null>(null);
-
-	async function refreshManifestAsks() {
-		try {
-			manifestAsks = await getManifestAsks();
-		} catch {
-			// A read failure must never blank a previously-rendered asked-state (the user DID ask). Keep
-			// the stale map; the paywall block still renders the last-known asked-state from it.
-		}
-	}
-
-	$effect(() => {
-		// Load the ask map on mount so the asked-state renders from the persisted record immediately.
-		refreshManifestAsks();
-		// Tick to refresh the cooldown countdown + relative label. Both are MINUTE-granular
-		// (`MANIFEST_ASK_AGAIN_COOLDOWN_TIP` ceils to minutes), so a 1s tick would wake the reactive
-		// graph 60× per displayable change; ASK_TICK_MS bounds the lag at half a minute for a
-		// fraction of the wakeups — same call W5 made for the contact-row clock (PRESENCE_TICK_MS).
-		// The effect does NOT re-run on `nowTick`: it writes that state, never reads it, so the
-		// interval is created once and torn down on unmount.
-		const id = setInterval(() => { nowTick = Date.now(); }, ASK_TICK_MS);
-		return () => clearInterval(id);
-	});
-
 	// QURATOR-159: live byte-progress for an in-flight manifest fetch, keyed by collection slug (a
 	// transfer started on collection X must never paint a bar on collection Y). The backend emits
 	// `manifest-progress` events; a final event with received === total closes the run out. Entries
@@ -224,157 +179,6 @@
 		if (!p || p.total <= 0 || p.received >= p.total) return null;
 		return { ...p, pct: Math.min(100, Math.max(0, Math.round((p.received / p.total) * 100))) };
 	});
-
-	// M16 W4: the primary "get the rest" affordance — DM the owner asking for the full list. The owner
-	// decides whether to export + ticket a manifest (Hoardbook never auto-produces one; MASCARA_SPEC Q1).
-	async function handleAskOwner() {
-		if (!selectedPeer || !selectedCollection) return;
-		askingOwner = true;
-		askError = null;
-		try {
-			await requestManifest(selectedPeer.npub, selectedCollection.slug, selectedCollection.snapshot_fingerprint ?? '', selectedCollection.teaser_event_id);
-			toast('Asked the owner for the full list');
-			// Re-read the persisted record so the asked-state renders from the store, not from optimistic
-			// component state. The record is written server-side AFTER `send_dm_inner` resolves, so on
-			// success it is guaranteed present; the catch branch handles the failure case explicitly.
-			await refreshManifestAsks();
-		} catch (e) {
-			askError = String(e);
-			toast(String(e), 'error');
-			// "Failure is loud": leave the button in its un-asked state with the muted reason inline.
-			// Re-read in case the store carries a prior successful ask (the user may be re-asking after
-			// a cooldown and the previous asked-state should still show — not be hidden by this failure).
-			await refreshManifestAsks();
-		} finally {
-			askingOwner = false;
-		}
-	}
-
-	// Carrier 4 (QURATOR-79) — ask-origination. Design §5 rules discovery ANSWER-ONLY and
-	// human-mediated: "D asks C — in chat, by name, the way a human asks a mutual." This is D's half
-	// of that sentence. The user picks a contact (peer C) from a dropdown seeded with everyone else
-	// in their contact list — the author (peer A, whose collection is behind the paywall) is excluded,
-	// because asking A directly is the "Ask the owner" button beside it. The ask names A through the
-	// wire body's `author_npub`; it promises nothing about whether C holds the list (C's client only
-	// surfaces a card when it does). Copy is deliberately "might have" — honest about both the
-	// person and the uncertainty.
-	let askContactOpen = $state(false);
-	let askContactNpub = $state('');
-	let askingContact = $state(false);
-	let askContactError = $state<string | null>(null);
-
-	/** Who the user can ask: every contact EXCEPT the collection's author. Keyed by npub, rendered
-	 *  by display name — the "by name" half of the design's sentence. */
-	let askableContacts = $derived.by(() => {
-		// Bound to a local first: `selectedPeer` is reactive state, so TS cannot narrow it INSIDE the
-		// filter closure (it could change between the guard and the call) — svelte-check flags it.
-		const author = selectedPeer;
-		return author ? $contacts.filter((c) => c.npub !== author.npub) : [];
-	});
-
-	// The asked-state for the re-serve ask reads the SAME persisted map, under the author-scoped key
-	// `request_manifest_from` records — (asked contact, AUTHOR, slug) — so a re-serve ask and an
-	// owner-path ask for the same slug are two different traces (and two different cooldowns), and
-	// this one survives restarts exactly like the owner-path one does.
-	let askContactState = $derived(
-		selectedPeer && selectedCollection
-			? deriveManifestAskState(manifestAsks, askContactNpub, selectedPeer.npub, selectedCollection.slug, new Date(nowTick))
-			: { kind: 'unasked' as const },
-	);
-
-	async function handleAskContact() {
-		if (!selectedPeer || !selectedCollection || !askContactNpub) return;
-		askingContact = true;
-		askContactError = null;
-		try {
-			// The author is the peer whose collection is behind the paywall (the M16 W4 author-pin
-			// gates mean a browsed teaser is always authored by the browsed peer). fingerprint/teaser
-			// travel exactly as the owner-path ask sends them, so C's staleness card is the same one.
-			await requestManifestFrom(
-				askContactNpub,
-				selectedPeer.npub,
-				selectedCollection.slug,
-				selectedCollection.snapshot_fingerprint ?? '',
-				selectedCollection.teaser_event_id,
-			);
-			// `find` can miss (contact removed mid-flight). `contactDisplayName` takes a non-optional
-			// and dereferences it, so the old `?? shortNpub(...)` was dead code and an unmatched
-			// contact would have THROWN, not fallen back. Branch on the lookup instead.
-			const asked = $contacts.find((c) => c.npub === askContactNpub);
-			toast(`Asked ${asked ? contactDisplayName(asked) : shortNpub(askContactNpub)} for this list`);
-			await refreshManifestAsks();
-		} catch (e) {
-			askContactError = String(e);
-			toast(String(e), 'error');
-			await refreshManifestAsks();
-		} finally {
-			askingContact = false;
-		}
-	}
-
-	// Pure derivation of the paywall block's asked-state from (map, npub, author, slug, now). The
-	// author is the browsed peer itself — this ask path asks a peer for THEIR OWN collection (the M16
-	// W4 author-pin gates mean a browsed teaser is always authored by the browsed peer), so it walks
-	// the owner path and resolves both the legacy 2-segment key and the widened self-author spelling.
-	// A re-serve ask (peer C asked for A's manifest) has no UI call site yet. `nowTick` is the
-	// reactive clock that keeps the cooldown + relative label fresh; reading it here makes the
-	// $derived recompute every second.
-	let askState = $derived(
-		selectedPeer && selectedCollection
-			? deriveManifestAskState(manifestAsks, selectedPeer.npub, selectedPeer.npub, selectedCollection.slug, new Date(nowTick))
-			: { kind: 'unasked' as const },
-	);
-
-	async function handleImportManifest(source: { path?: string; pasted?: string }) {
-		if (!selectedPeer || !selectedCollection) return;
-		const targetNpub = selectedPeer.npub;
-		const targetSlug = selectedCollection.slug;
-		importingManifest = true;
-		try {
-			const result = await importManifest(targetNpub, targetSlug, source, selectedCollection.snapshot_fingerprint);
-			const full = result.collection;
-			// M19 W10: the await may have resolved after the user switched peers/collections. Only swap
-			// the live view if they are still looking at the peer+collection the import was started
-			// for — otherwise the result lands under a different peer's identity chrome (content
-			// misattribution). Mirrors `selectPeer`'s `if (selectedPeer?.npub === updated.npub)` guard.
-			if (selectedPeer?.npub === targetNpub && selectedCollection?.slug === targetSlug) {
-				// Swap the truncated collection for the full tree, in the view and the in-memory contact.
-				selectedPeer = {
-					...selectedPeer,
-					collections: selectedPeer.collections.map((c) => (c.slug === result.slug ? full : c)),
-				};
-				selectedCollection = full;
-				folderStack = [];
-			} else {
-				// Stale result — fold the full tree into the background `contacts` store only, so a
-				// later return to that peer shows the upgraded listing without clobbering whoever the
-				// user is currently viewing.
-				contacts.update((cs) =>
-					cs.map((c) =>
-						c.npub === targetNpub
-							? { ...c, collections: c.collections.map((x) => (x.slug === result.slug ? full : x)) }
-							: c,
-					),
-				);
-			}
-			const note = importToast(result, servingPeerName);
-			toast(note.text, note.kind);
-		} catch (e) {
-			toast(String(e), 'error');
-		} finally {
-			importingManifest = false;
-			pasteOpen = false;
-			pasteText = '';
-		}
-	}
-
-	async function pickManifestFile() {
-		const path = await openFileDialog({
-			multiple: false,
-			filters: [{ name: 'Hoardbook manifest', extensions: ['hbmanifest'] }],
-		});
-		if (typeof path === 'string') await handleImportManifest({ path });
-	}
 
 	function enterFolder(item: DirectoryItem) {
 		folderStack = [...folderStack, { name: item.name, items: item.children }];
@@ -1369,93 +1173,19 @@
 								<div>
 									<div class="paywall-title">{paywall.hidden.toLocaleString()} more item{paywall.hidden !== 1 ? 's' : ''} hidden</div>
 									<div class="paywall-sub">Showing {paywall.shown.toLocaleString()} of {paywall.total.toLocaleString()}. The collection is too large to publish in full.</div>
-									<!-- M16 W4 + M17 W7.1a: the "get the rest" affordance. The primary "Ask the owner" button
-									     becomes the muted "Asked {relative} — waiting for their reply" state after a successful
-									     send, with a secondary "Ask again" (60-min cooldown, mirroring announce-cooldown) and an
-									     "Open chat" link to where the reply will arrive. Import stays alongside. No Download
-									     button (MAS-INV-5): Hoardbook moves no files. -->
-									<div class="paywall-actions">
-										{#if paywallProgress}
-											<!-- QURATOR-159: an in-flight manifest fetch. Owner-signed copy, exact: "Fetching the
-											     full list" + byte progress. SOURCE-AGNOSTIC by owner ruling D6: no peer name, npub,
-											     avatar or "from X" — carrier 4 means the answering peer may not be the peer asked.
-											     Deliberately NO stalled/"never answered" state (ruling D7): tickets never expire and
-											     none exists until the peer fulfils, so there is no timeout event to key on. -->
-											<div class="paywall-progress">
-												<span class="paywall-progress-label">Fetching the full list</span>
-												<div class="paywall-progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={paywallProgress.pct} aria-label="Fetching the full list">
-													<div class="paywall-progress-fill" style:flex-grow={paywallProgress.pct}></div>
-												</div>
-												<span class="paywall-progress-bytes">{fmtLargestUnit(paywallProgress.received)} / {fmtLargestUnit(paywallProgress.total)}</span>
+									{#if paywallProgress}
+										<!-- QURATOR-159: an in-flight manifest fetch. Owner-signed copy, exact: "Fetching the
+										     full list" + byte progress. SOURCE-AGNOSTIC by owner ruling D6: no peer name, npub,
+										     avatar or "from X" — carrier 4 means the answering peer may not be the peer asked.
+										     Deliberately NO stalled/"never answered" state (ruling D7): tickets never expire and
+										     none exists until the peer fulfils, so there is no timeout event to key on. -->
+										<div class="paywall-progress">
+											<span class="paywall-progress-label">Fetching the full list</span>
+											<div class="paywall-progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={paywallProgress.pct} aria-label="Fetching the full list">
+												<div class="paywall-progress-fill" style:flex-grow={paywallProgress.pct}></div>
 											</div>
-										{:else if askState.kind === 'asked'}
-											<!-- Asked-state: read from the persisted record, not component-local state. The muted
-											     line + cooldown-gated "Ask again" + "Open chat" deep-link (W1) to where the reply lands. -->
-											<span class="asked-line">{MANIFEST_ASKED_LINE(askState.relative)}</span>
-											<button
-												class="btn-ghost btn-sm"
-												onclick={handleAskOwner}
-												disabled={askingOwner || !askState.cooldownOver}
-												title={askState.cooldownOver ? '' : MANIFEST_ASK_AGAIN_COOLDOWN_TIP(askState.cooldownRemaining)}
-											>{MANIFEST_ASK_AGAIN_LABEL}</button>
-											<a class="btn-ghost btn-sm open-chat-link" href={`/chat?peer=${selectedPeer?.npub ?? ''}`}>{MANIFEST_OPEN_CHAT_LABEL}</a>
-										{:else}
-											<button class="btn-primary btn-sm" onclick={handleAskOwner} disabled={askingOwner}>Ask the owner for the full list</button>
-										{/if}
-										<button class="btn-ghost btn-sm" onclick={pickManifestFile} disabled={importingManifest}>Import a manifest file you received</button>
-										<button class="btn-ghost btn-sm" onclick={() => (pasteOpen = !pasteOpen)}>or paste it</button>
-										<!-- Carrier 4 (QURATOR-79) — ask-origination. Answer-only and human-mediated (design §5):
-										     "D asks C — in chat, by name, the way a human asks a mutual." The contact picker IS the
-										     by-name half; the author is the browsed peer (A), never a choice. No promise C holds it. -->
-										<button class="btn-ghost btn-sm" onclick={() => { askContactOpen = !askContactOpen; askContactError = null; }}>Ask a contact for this list</button>
-									</div>
-									{#if askContactOpen}
-										<!-- The contact picker + honest copy. `askableContacts` already excludes the author, so the
-										     only peer who is never offered is the one the "Ask the owner" button above already covers. -->
-										<div class="ask-contact-row">
-											<select
-												class="hb-input ask-contact-select"
-												bind:value={askContactNpub}
-												aria-label="Contact to ask for this list"
-											>
-												<option value="" disabled>Choose a contact…</option>
-												{#each askableContacts as c (c.npub)}
-													<option value={c.npub}>{contactDisplayName(c)}</option>
-												{/each}
-											</select>
-											{#if askContactState.kind === 'asked'}
-												<button
-													class="btn-ghost btn-sm"
-													onclick={handleAskContact}
-													disabled={askingContact || !askContactNpub || !askContactState.cooldownOver}
-													title={askContactState.cooldownOver ? '' : MANIFEST_ASK_AGAIN_COOLDOWN_TIP(askContactState.cooldownRemaining)}
-												>{MANIFEST_ASK_AGAIN_LABEL}</button>
-											{:else}
-												<button
-													class="btn-primary btn-sm"
-													onclick={handleAskContact}
-													disabled={askingContact || !askContactNpub}
-												>Ask them</button>
-											{/if}
+											<span class="paywall-progress-bytes">{fmtLargestUnit(paywallProgress.received)} / {fmtLargestUnit(paywallProgress.total)}</span>
 										</div>
-										<div class="ask-contact-hint">They’ll only see this if they hold a copy. Nothing is promised — they may not have it.</div>
-										{#if askContactState.kind === 'asked'}
-											<div class="asked-line">{MANIFEST_ASKED_LINE(askContactState.relative)}</div>
-										{/if}
-										{#if askContactError && askContactState.kind !== 'asked'}
-											<!-- Failure is loud here too: a rejected publish shows the muted reason inline and never
-											     renders as "Asked" (same W7.1a rule as the owner-path ask). -->
-											<div class="ask-failed-note">{MANIFEST_ASK_FAILED_LINE(askContactError)}</div>
-										{/if}
-									{/if}
-									{#if askError && askState.kind !== 'asked'}
-										<!-- Failure is loud (W7.1a): a rejected publish leaves the un-asked state AND shows the
-										     muted reason inline. A failed ask must never render as "Asked". -->
-										<div class="ask-failed-note">{MANIFEST_ASK_FAILED_LINE(askError)}</div>
-									{/if}
-									{#if pasteOpen}
-										<textarea class="hb-input hb-textarea hb-mono paywall-paste" bind:value={pasteText} placeholder="Paste the .hbmanifest text or its base64 here"></textarea>
-										<button class="btn-primary btn-sm" disabled={importingManifest || !pasteText.trim()} onclick={() => handleImportManifest({ pasted: pasteText })}>Import from text</button>
 									{/if}
 								</div>
 							</div>
@@ -1821,16 +1551,6 @@
 	.paywall-title { font-size: 12.5px; font-weight: 600; color: var(--fg); }
 	.paywall-sub { font-size: 11.5px; color: var(--fg-dim); margin-top: 1px; }
 
-	/* M16 W4: the "get the rest" affordances inside the paywall note. */
-	.paywall-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center; }
-	.paywall-paste { display: block; width: 100%; margin-top: 6px; min-height: 52px; }
-	/* M17 W7.1a: the muted asked-state line + the inline failure reason. */
-	.asked-line { font-size: 11.5px; color: var(--fg-dim); }
-	.ask-failed-note { font-size: 11.5px; color: var(--error); margin-top: 6px; }
-	/* Carrier 4 (QURATOR-79): the contact picker row — same muted register as the paste row. */
-	.ask-contact-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; align-items: center; }
-	.ask-contact-select { max-width: 220px; }
-	.ask-contact-hint { font-size: 11.5px; color: var(--fg-dim); margin-top: 4px; }
 	/* QURATOR-159: the in-flight manifest-fetch bar — one row, label + track + byte counts. */
 	.paywall-progress { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 	.paywall-progress-label { font-size: 11.5px; color: var(--fg); }

@@ -205,7 +205,7 @@ describe('QURATOR-159 — the manifest-fetch progress bar (paywall block)', () =
 		expect(barEl()!.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('50');
 	});
 
-	it('the final event (received === total) clears the bar back to the ask affordance', async () => {
+	it('the final event (received === total) clears the bar', async () => {
 		await driveToPaywall('archive');
 		emitProgress({ request_id: 'req-1', slug: 'archive', received: 5242880, total: 10485760 });
 		await tick();
@@ -213,7 +213,6 @@ describe('QURATOR-159 — the manifest-fetch progress bar (paywall block)', () =
 		emitProgress({ request_id: 'req-1', slug: 'archive', received: 10485760, total: 10485760 });
 		await tick();
 		expect(barEl(), 'a completed run is no longer in flight').toBeNull();
-		expect(document.body.textContent).toContain('Ask the owner for the full list');
 	});
 
 	it('is keyed on slug: a DIFFERENT collection\'s event never paints this one', async () => {
@@ -221,7 +220,6 @@ describe('QURATOR-159 — the manifest-fetch progress bar (paywall block)', () =
 		emitProgress({ request_id: 'req-9', slug: 'other-vault', received: 5242880, total: 10485760 });
 		await tick();
 		expect(barEl(), 'a foreign slug must not render a bar here').toBeNull();
-		expect(document.body.textContent).toContain('Ask the owner for the full list');
 
 		// And the same slug's event does — proving the null above is the KEY, not a dead listener.
 		emitProgress({ request_id: 'req-1', slug: 'archive', received: 5242880, total: 10485760 });

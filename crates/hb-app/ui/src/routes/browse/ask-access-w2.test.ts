@@ -18,33 +18,19 @@ describe('Browse page — M17 W2 ask-access ramp on Listings locked', () => {
 	});
 
 	it('ask-access button sits inside the Listings locked empty state', () => {
-		// The button lives in the `listingsLocked` branch (not the paywall block, which already has
-		// its own "Ask the owner for the full list" affordance — that is a DIFFERENT ask, for a
-		// different surface, and must not be disturbed).
+		// The button lives in the `listingsLocked` branch. The paywall block's manifest-ask
+		// affordances (QURATOR-203: round-trip buttons removed) no longer exist to bound against.
 		const src = browseSrc();
 		const lockIdx = src.indexOf('🔒 Listings locked');
 		expect(lockIdx).toBeGreaterThan(-1);
 		const askIdx = src.indexOf('>Ask for access<');
 		expect(askIdx).toBeGreaterThan(lockIdx);
-		// And it must be before the paywall block (the next distinct surface) — sanity bound.
-		const paywallIdx = src.indexOf('Ask the owner for the full list');
-		expect(paywallIdx).toBeGreaterThan(-1);
-		expect(askIdx).toBeLessThan(paywallIdx);
 	});
 
 	it('ask-access button routes to the chat peer deep-link with the ask-access intent', () => {
 		const src = browseSrc();
 		expect(src).toMatch(/intent=ask-access/);
 		expect(src).toMatch(/petname=/);
-	});
-
-	it('does not disturb the existing paywall Ask-the-owner affordance (different surface, different ask)', () => {
-		// The paywall's "Ask the owner for the full list" (M16 W3) stays exactly as shipped — that is
-		// a manifest request, NOT a share-code ask. W2 adds a NEW affordance; it must not edit the old one.
-		const src = browseSrc();
-		expect(src).toContain('Ask the owner for the full list');
-		// Exactly one of each — the two asks must stay distinct, never merged.
-		expect((src.match(/Ask the owner for the full list/g) ?? []).length).toBe(1);
 	});
 
 	it('no new user-facing copy contains the forbidden word "Download" (MAS-INV-5)', () => {
