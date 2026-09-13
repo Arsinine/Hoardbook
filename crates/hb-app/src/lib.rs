@@ -56,10 +56,14 @@ use tokio::sync::RwLock;
 pub use identity_state::{AppIdentity, SharedIdentity};
 
 /// Managed state types — Arc-wrapped so they can be cloned into background tasks.
-/// Sender half of the presence-loop cancel channel. Send `true` to stop the task.
-pub type SharedCancelPresence = Arc<tokio::sync::watch::Sender<bool>>;
-/// Sender half of the snapshot-watch-loop cancel channel.
-pub type SharedCancelWatch = Arc<tokio::sync::watch::Sender<bool>>;
+/// Cancel handle for the presence loop: the sender half of its watch channel. Send `true` to stop
+/// the task. A distinct newtype, not a bare alias — QURATOR-217: StateManager keys on `TypeId`, so
+/// two aliases over `Arc<watch::Sender<bool>>` were ONE type and the second `manage` call below was
+/// a silent no-op, dropping that sender and closing the channel under its loop.
+pub struct SharedCancelPresence(pub Arc<tokio::sync::watch::Sender<bool>>);
+/// Cancel handle for the snapshot-watch loop: the sender half of its watch channel. Distinct
+/// newtype for the same QURATOR-217 reason as [`SharedCancelPresence`].
+pub struct SharedCancelWatch(pub Arc<tokio::sync::watch::Sender<bool>>);
 
 /// Keeps the OS filesystem watcher alive for the process lifetime (dropping it stops watching).
 /// Managed as state purely so it isn't dropped at the end of `setup`.
@@ -386,6 +390,15 @@ pub fn run() {
 
             let store = DataStore::new(data_dir);
 
+            // QURATOR-208 (owner devtest v0.20.0 #2) — additive default-relay sync: a persisted
+            // set frozen on an old default list gains the genuinely-new defaults, while a default
+            // the user deleted stays deleted (known-defaults watermark in Settings). Runs ONCE
+            // here — before the diagnostics header and every background task read
+            // `net::relay_urls`, and never inside `relay_urls` itself (hot path, read-only by
+            // contract). Never-fail: internal errors log and leave the file for the next launch.
+            net::reconcile_default_relays(&store);
+            tracing::info!("startup: default relays reconciled (QURATOR-208)");
+
             let identity: SharedIdentity = Arc::new(RwLock::new(None));
             // M12 W1: the one persistent shared relay client, lazily built on first network use.
             let relay: net::SharedRelay = net::new_shared();
@@ -403,16 +416,17 @@ pub fn run() {
             let nat_classification: nat::SharedNatClassification = nat::new_shared_classification();
 
             let (presence_cancel_tx, presence_cancel_rx) = tokio::sync::watch::channel(false);
-            let presence_cancel: SharedCancelPresence = Arc::new(presence_cancel_tx);
 
             let (watch_cancel_tx, watch_cancel_rx) = tokio::sync::watch::channel(false);
-            let watch_cancel: SharedCancelWatch = Arc::new(watch_cancel_tx);
 
             app.manage(store.clone());
             app.manage(Arc::clone(&identity));
             app.manage(Arc::clone(&relay));
-            app.manage(Arc::clone(&presence_cancel));
-            app.manage(Arc::clone(&watch_cancel));
+            // QURATOR-217: distinct newtypes, so each `manage` registers its own TypeId and BOTH
+            // senders live in state for the app lifetime (a dropped sender closes the channel under
+            // its loop).
+            app.manage(SharedCancelPresence(Arc::new(presence_cancel_tx)));
+            app.manage(SharedCancelWatch(Arc::new(watch_cancel_tx)));
             app.manage(Arc::clone(&staged_update));
             app.manage(Arc::clone(&online_cache));
             app.manage(Arc::clone(&beacon));

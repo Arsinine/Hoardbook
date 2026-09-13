@@ -391,10 +391,22 @@ pub async fn run_watch_loop(
                 }
             }
             _ = tokio::time::sleep(tick) => {}
-            _ = cancel_rx.changed() => {
-                if *cancel_rx.borrow() {
-                    tracing::debug!("watch loop cancelled");
-                    break;
+            changed = cancel_rx.changed() => {
+                match changed {
+                    // QURATOR-217: every sender dropped → the channel is closed, and `changed()`
+                    // then resolves `Err` immediately, forever. Closure is shutdown, not a
+                    // pollable event — break rather than re-poll (same rule as the fs `None` arm
+                    // above: a closed channel must never be hot-polled).
+                    Err(_) => {
+                        tracing::debug!("watch loop cancel channel closed — shutting down");
+                        break;
+                    }
+                    Ok(()) => {
+                        if *cancel_rx.borrow() {
+                            tracing::debug!("watch loop cancelled");
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -767,6 +779,49 @@ mod tests {
         // Budget: an idle loop wakes ~window/tick (~6) plus slack. 100 wakeups in 300ms (333/s) is a
         // generous ceiling a correct loop never approaches but a busy-spin blows past.
         assert!(wakeups < 100, "idle watch loop woke {wakeups} times in 300ms — busy-spinning?");
+    }
+
+    /// QURATOR-217: with every sender dropped, the cancel watch channel is CLOSED and `changed()`
+    /// resolves `Err` immediately, forever. The pre-fix select arm discarded that `Err`, fell
+    /// through the `false` borrow and re-polled — a hot spin (~15-27% idle CPU). Closure must be
+    /// terminal: the loop exits promptly and its wakeup count stays far below the busy-spin budget.
+    ///
+    /// MUTATION (P-10): in `run_watch_loop` (this file, the steady-state `tokio::select!`'s
+    /// `cancel_rx.changed()` arm — the `match changed` block added by QURATOR-217, the only one in
+    /// the function): revert the arm to the pre-fix shape, binding it as `_ = cancel_rx.changed()`
+    /// and keeping only the `if *cancel_rx.borrow() { break; }` fall-through (dropping the
+    /// `Err(_) => break` shutdown arm). The closed channel then never terminates the loop, so the
+    /// timeout below elapses and this test reds — wakeups blow the budget too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watch_loop_exits_promptly_when_cancel_sender_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let (_fs_tx, fs_rx) = mpsc::channel(8);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        drop(cancel_tx); // nobody can ever send `true` again — the channel is closed
+        let wakeups = Arc::new(AtomicU64::new(0));
+        let handle = tokio::spawn(run_watch_loop(
+            store,
+            WatchCfg::default(),
+            Arc::new(CountingSink { calls: Arc::new(std::sync::Mutex::new(Vec::new())) }),
+            fs_rx,
+            cancel_rx,
+            Duration::from_millis(50),
+            None,
+            Arc::clone(&wakeups),
+        ));
+        // Bounded wait, not a fixed sleep: a closed channel terminates the loop almost immediately
+        // (well inside the 300ms window), while a hot spin never terminates.
+        let joined = tokio::time::timeout(Duration::from_millis(300), handle).await;
+        assert!(
+            joined.is_ok(),
+            "watch loop must exit when its cancel sender is dropped (channel closed), not spin forever"
+        );
+        let woken = wakeups.load(Ordering::Relaxed);
+        assert!(
+            woken < 100,
+            "a dropped cancel sender must not busy-spin the loop (woke {woken} times in 300ms)"
+        );
     }
 
     /// A deliberately-spinning loop: it yields (so cancel can fire) but never sleeps, re-polling as
