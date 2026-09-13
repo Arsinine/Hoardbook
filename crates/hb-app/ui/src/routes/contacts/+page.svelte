@@ -41,7 +41,7 @@
 	// plain click selects one. Dragging any selected row carries the WHOLE selection; dragging an
 	// unselected row carries just that row. Ghost shows a count badge. Refuse over selection: a
 	// target ALL selected already belong to refuses; MIXED allowed.
-	import { writeDragPayload, readDragPayload, writeDragPayloadMulti, readDragPayloadMulti, isOurDrag, isValidDropTarget, isSelfDrop, groupSuggestions, groupSuggestionsMulti, commitCreateGroup, commitCreateGroupMulti, computeDropOutcome, commitDropOnGroup, computeDropOutcomeMulti, commitDropOnGroupMulti, applyClickToSelection, applyKeyToSelection, shouldHandleArrowKey, computeDropInverse, computeDropInverseMulti, computeCreateInverse, commitInverse, commitInverseMulti, rovingTabindexForIdx, isTypingTargetShape, rowId, UNGROUPED_TARGET, type DropOutcome, type DropOutcomeMulti } from '$lib/drag-group.js';
+	import { writeDragPayload, readDragPayload, writeDragPayloadMulti, readDragPayloadMulti, isOurDrag, isValidDropTarget, alreadyGroupedTogether, isSelfDrop, groupSuggestions, groupSuggestionsMulti, dropzoneHoverCopy, commitCreateGroup, commitCreateGroupMulti, computeDropOutcome, commitDropOnGroup, computeDropOutcomeMulti, commitDropOnGroupMulti, applyClickToSelection, applyKeyToSelection, shouldHandleArrowKey, computeDropInverse, computeDropInverseMulti, computeCreateInverse, commitInverse, commitInverseMulti, rovingTabindexForIdx, isTypingTargetShape, rowId, UNGROUPED_TARGET, type DropOutcome, type DropOutcomeMulti } from '$lib/drag-group.js';
 	import { onMount, onDestroy, tick } from 'svelte';
 	import { goto } from '$app/navigation';
 
@@ -295,6 +295,10 @@
 	let dragPopoverAnchor: HTMLElement | undefined = $state();
 	let dragNameInput = $state('');
 	let dragSuggestions = $state<string[]>([]);
+	// Owner feedback #3/#4 — the drop-to-create zone at the bottom of the group list. `hovered` is
+	// set by the zone's own dragover/dragleave; the armed state needs no flag — it is derived from
+	// dragSourceNpub !== null (a drag is live).
+	let zoneHovered = $state(false);
 	// M22 W7 A3 — the namer's input element, bound so we can focus it when the namer opens.
 	let dragNameEl: HTMLInputElement | undefined = $state();
 	// M22 W7 — the row that had focus before the namer opened, so focus returns to it on close
@@ -331,11 +335,25 @@
 	function onDragOver(e: DragEvent, npub: string) {
 		if (!dragSourceNpub) return;
 		e.preventDefault(); // allow drop
-		if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+		// Owner feedback #2: dropping a card on a co-member must not offer a new group for exactly
+		// the people who already share one. The cursor shows the refuse state on dragover, not on
+		// drop — the same rule as the W4 group-heading affordance (onGroupDragOver below).
+		let refused = false;
+		if (dragCarriedNpubs.length > 1 ? !dragCarriedNpubs.includes(npub) : npub !== dragSourceNpub) {
+			const groupsByNpub = new Map([...dragCarriedNpubs, npub].map((n) => [n, contactGroups(n)]));
+			refused = alreadyGroupedTogether(dragCarriedNpubs, npub, groupsByNpub);
+		}
+		if (e.dataTransfer) e.dataTransfer.dropEffect = refused ? 'none' : 'copy';
 		dragOverNpub = npub;
 	}
 
-	function onDragLeave(npub: string) {
+	function onDragLeave(e: DragEvent, npub: string) {
+		// dragleave fires when the cursor crosses into one of the card's many children (buttons,
+		// chips, bio rows), not only when it truly leaves — leave-clears + dragover-re-sets every
+		// frame were the owner-reported flicker. A leave whose relatedTarget is still inside this
+		// card is a child crossing, not a departure; relatedTarget null (out the window) is real.
+		const to = e.relatedTarget as Node | null;
+		if (to && (e.currentTarget as HTMLElement).contains(to)) return;
 		if (dragOverNpub === npub) dragOverNpub = null;
 	}
 
@@ -367,6 +385,15 @@
 				dragOverNpub = null;
 				return;
 			}
+			// Owner feedback #2: a selection that (with the target) already sits together in ONE
+			// group is not offered a re-create of that group. Any member outside it keeps the
+			// gesture working — create is additive, so they would genuinely gain the group.
+			const cogroupMap = new Map([...multiNpubs, targetNpub].map((n) => [n, contactGroups(n)]));
+			if (alreadyGroupedTogether(multiNpubs, targetNpub, cogroupMap)) {
+				dragSourceNpub = null;
+				dragOverNpub = null;
+				return;
+			}
 			// Build the combined peer list (selection + target) for suggestions.
 			const peers = [...multiNpubs, targetNpub]
 				.map((n) => $contacts.find((c) => c.npub === n))
@@ -389,6 +416,14 @@
 			return;
 		}
 		if (!isValidDropTarget(sourceNpub, targetNpub)) return;
+		// Owner feedback #2: co-members of one existing group are not offered a second group for
+		// exactly the two of them. The cursor already refused this on dragover.
+		if (alreadyGroupedTogether([sourceNpub], targetNpub,
+			new Map([sourceNpub, targetNpub].map((n) => [n, contactGroups(n)])))) {
+			dragSourceNpub = null;
+			dragOverNpub = null;
+			return;
+		}
 		// Open the naming popover anchored at the drop point. The name field is NOT pre-filled.
 		const source = $contacts.find((c) => c.npub === sourceNpub);
 		const target = $contacts.find((c) => c.npub === targetNpub);
@@ -404,6 +439,60 @@
 
 	function pickSuggestion(name: string) {
 		dragNameInput = name;
+	}
+
+	// ── Owner feedback #3/#4 — the drop-to-create zone (bottom of the group list) ─────────────
+	// One element answers both asks: its resting copy IS the "you can drag these cards" copy (#4),
+	// and dropping on it creates a group (#3). The hovered fill/border deliberately reuse
+	// .contact-card.drag-target's values so a hovered zone and a hovered card read as the same
+	// kind of target. Membership is additive: an already-grouped contact JOINS the new group.
+
+	function onZoneDragOver(e: DragEvent) {
+		// Claimed only for OUR drags, gated on component state — never on the DataTransfer, which
+		// is blanked during dragover (the rule the dragCarriedNpubs comment states above).
+		if (!dragSourceNpub) return;
+		e.preventDefault(); // allow drop
+		if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+		zoneHovered = true;
+	}
+
+	function onZoneDragLeave(e: DragEvent) {
+		// Same child-crossing guard as onDragLeave: a leave whose relatedTarget is still inside
+		// the zone is a child crossing, not a departure.
+		const to = e.relatedTarget as Node | null;
+		if (to && (e.currentTarget as HTMLElement).contains(to)) return;
+		zoneHovered = false;
+	}
+
+	function onZoneDrop(e: DragEvent) {
+		e.preventDefault();
+		zoneHovered = false;
+		// Payload from dragstart-captured state (the same source dragover uses), never from the
+		// DataTransfer. Copy it NOW: dragend fires on the source right after this and clears it.
+		const npubs = [...dragCarriedNpubs];
+		if (npubs.length === 0) return;
+		const peers = npubs
+			.map((n) => $contacts.find((c) => c.npub === n))
+			.filter((p): p is CachedPeer => !!p);
+		if (peers.length === 0) return;
+		// ONE group containing every carried contact. A single card drops as the string[] shape
+		// with one entry — the shape the G-key namer already uses — because commitDragCreate
+		// routes arrays to commitCreateGroupMulti, which takes any non-empty member list. No other
+		// path produces length 1, which is how the popover knows to show the "first member" line.
+		dragSuggestions = groupSuggestionsMulti(peers);
+		dragNameInput = '';
+		dragPopoverAnchor = e.currentTarget as HTMLElement;
+		dragPopoverFor = npubs;
+		focusNamer();
+		dragOverNpub = null;
+	}
+
+	// The hovered copy's contact name for a single-card drag — the first carried contact, which
+	// for a single drag IS the lifted row.
+	function zoneHoverName(): string {
+		const n = dragCarriedNpubs[0] ?? dragSourceNpub;
+		const peer = n ? $contacts.find((c) => c.npub === n) : undefined;
+		return peer ? contactDisplayName(peer) : 'this contact';
 	}
 
 	// M22 W7 A3 — focus the namer's field once it has rendered. Without this the popover opens and
@@ -545,7 +634,12 @@
 		}
 	}
 
-	function onGroupDragLeave(targetName: string) {
+	function onGroupDragLeave(e: DragEvent, targetName: string) {
+		// Same child-crossing guard as onDragLeave: the section header renders its own .drop-hint
+		// span while hovered (and a group pill contains its .group-dot), so an unguarded leave
+		// clears the very state that draws the element the cursor just entered.
+		const to = e.relatedTarget as Node | null;
+		if (to && (e.currentTarget as HTMLElement).contains(to)) return;
 		if (dropOverTarget === targetName) {
 			dropOverTarget = null;
 			dropOutcome = null;
@@ -1110,7 +1204,7 @@
 			onmousedown={(e) => onContactMouseDown(e, peer.npub)}
 			ondragstart={(e) => onDragStart(e, peer.npub)}
 			ondragover={(e) => onDragOver(e, peer.npub)}
-			ondragleave={() => onDragLeave(peer.npub)}
+			ondragleave={(e) => onDragLeave(e, peer.npub)}
 			ondrop={(e) => onDrop(e, peer.npub)}
 			ondragend={onDragEnd}
 			ondblclick={(e) => { if ((e.target as HTMLElement).closest('button, a')) return; goto('/chat?peer=' + peer.npub); }}
@@ -1206,7 +1300,7 @@
 							class:group-drop-active={dropOverTarget === gname && dropOutcome && dropOutcome.kind !== 'refused' && dropOutcome.kind !== 'noop'}
 							class:group-drop-refused={dropOverTarget === gname && dropOutcome && (dropOutcome.kind === 'refused' || dropOutcome.kind === 'noop')}
 							ondragover={(e) => { e.stopPropagation(); onGroupDragOver(e, gname); }}
-							ondragleave={(e) => { e.stopPropagation(); onGroupDragLeave(gname); }}
+							ondragleave={(e) => { e.stopPropagation(); onGroupDragLeave(e, gname); }}
 							ondrop={(e) => { e.stopPropagation(); onGroupDrop(e, gname); }}
 						>
 							{#if gcolor}<span class="group-dot" style={`background:${gcolor}`}></span>{/if}
@@ -1528,7 +1622,7 @@
 							class:group-drop-active={dropOverTarget === dropTargetName && dropOutcome && dropOutcome.kind !== 'refused' && dropOutcome.kind !== 'noop'}
 							class:group-drop-refused={dropOverTarget === dropTargetName && dropOutcome && (dropOutcome.kind === 'refused' || dropOutcome.kind === 'noop')}
 							ondragover={(e) => onGroupDragOver(e, dropTargetName)}
-							ondragleave={() => onGroupDragLeave(dropTargetName)}
+							ondragleave={(e) => onGroupDragLeave(e, dropTargetName)}
 							ondrop={(e) => onGroupDrop(e, dropTargetName)}
 							role={view === 'groups' ? 'group' : undefined}
 							aria-label={view === 'groups' ? section.label : undefined}
@@ -1546,6 +1640,29 @@
 						</div>
 					</div>
 				{/each}
+				<!-- Owner feedback #3/#4 — the drop-to-create zone, in the normal flow below the last
+				     group section (NOT fixed to the viewport — a floating bar would cover contacts on
+				     a short window). Its resting copy IS the "you can drag these cards" copy (#4). -->
+				<div
+					class="create-dropzone"
+					class:dz-armed={dragSourceNpub !== null && !zoneHovered}
+					class:dz-hovered={dragSourceNpub !== null && zoneHovered}
+					ondragover={onZoneDragOver}
+					ondragleave={onZoneDragLeave}
+					ondrop={onZoneDrop}
+					data-testid="create-dropzone"
+				>
+					<span class="dz-plus" aria-hidden="true">+</span>
+					{#if dragSourceNpub !== null && zoneHovered}
+						{#if dragCount > 1}
+							{dropzoneHoverCopy(dragCount)}
+						{:else}
+							Release to put <strong class="dz-name">{zoneHoverName()}</strong> in a new group
+						{/if}
+					{:else}
+						Drag a contact here to start a group
+					{/if}
+				</div>
 			{/if}
 		{/if}
 	</div>
@@ -1611,6 +1728,13 @@
 				onkeydown={onDragNameKey}
 			/>
 		</div>
+		{#if isMulti && (dragPopoverFor as string[]).length === 1}
+			<!-- Owner feedback #3 — a zone drop carries no target peer, and no other path produces a
+			     one-member array, so this sub-line can only mean "create fresh from the dragged
+			     card". Reads dragPopoverFor (not the drag state, which dragend has cleared). -->
+			{@const dzFirstPeer = $contacts.find((c) => c.npub === (dragPopoverFor as string[])[0])}
+			<div class="dg-subline">{dzFirstPeer ? contactDisplayName(dzFirstPeer) : 'This contact'} will be the first member.</div>
+		{/if}
 		{#if dragSuggestions.length > 0}
 			<div class="dg-suggestions">
 				{#each dragSuggestions as s (s)}
@@ -2096,6 +2220,47 @@
 		font-size: 11px; font-weight: 600; color: var(--accent);
 		padding: 2px 0 4px;
 	}
+	/* Owner feedback #3/#4 — the drop-to-create zone at the bottom of the group list. Resting IS
+	   the instructional copy (#4): dashed, dim, circled +. Hovered reuses .contact-card
+	   .drag-target's border/fill values verbatim so a hovered zone and a hovered card read as the
+	   same kind of target; border-radius matches .contact-card (10px). */
+	.create-dropzone {
+		margin: 4px 16px 24px;
+		padding: 16px;
+		border: 1px dashed var(--border-strong);
+		border-radius: 10px;
+		background: transparent;
+		color: var(--fg-dim);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 8px;
+		font-size: 13px;
+	}
+	.create-dropzone.dz-armed {
+		border-color: color-mix(in oklch, var(--accent) 55%, transparent);
+		color: var(--fg-muted);
+	}
+	.create-dropzone.dz-hovered {
+		border-style: solid;
+		border-color: var(--accent);
+		background: color-mix(in oklch, var(--accent) 8%, var(--bg-elev1));
+		color: var(--fg);
+	}
+	.dz-plus {
+		width: 18px; height: 18px;
+		border: 1px solid currentColor;
+		border-radius: 50%;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 12px;
+		line-height: 1;
+		flex-shrink: 0;
+	}
+	.dz-name { color: var(--accent); font-weight: 600; }
+	/* Owner feedback #3 — the naming popover's one-member sub-line (zone drop only). */
+	.dg-subline { font-size: 11px; color: var(--fg-muted); padding: 0 8px 4px; }
 
 	/* M22 W3 — naming popover (OverflowMenu shell). Two overlapping avatars + focused input. */
 	.dg-header { display: flex; align-items: center; gap: 10px; padding: 6px 8px; }

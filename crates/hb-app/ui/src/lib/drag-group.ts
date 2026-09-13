@@ -87,6 +87,30 @@ export function isValidDropTarget(sourceNpub: string | null, targetNpub: string)
 	return sourceNpub !== null && !isSelfDrop(sourceNpub, targetNpub);
 }
 
+/** Owner feedback #2 (2026-09-13): "Dragging a card over another card in the same group allows
+ *  you to create another subgroup which we dont want." True when the group this drop-to-create
+ *  gesture would mint — every carried npub plus the drop target — already exists whole: some ONE
+ *  existing group already contains ALL of them, so the gesture could only re-create it. Pure:
+ *  membership is passed in as a map of npub → that contact's group names; a npub missing from the
+ *  map counts as "in no group".
+ *
+ *  Refusal is all-or-nothing over the set: a MIXED multi-select (any carried contact outside the
+ *  shared group) is NOT refused — create is additive (Reading B), so that drop genuinely adds the
+ *  outsiders to the group for the first time. Degenerate calls (fewer than two distinct parties)
+ *  are the caller's business (isSelfDrop / isValidDropTarget already gate them) and return false. */
+export function alreadyGroupedTogether(
+	sourceNpubs: readonly string[],
+	targetNpub: string,
+	groupsByNpub: ReadonlyMap<string, string[]>,
+): boolean {
+	const members = [...sourceNpubs, targetNpub];
+	if (members.length < 2) return false;
+	// A group they all share must be one of the first member's groups — enumerate from there.
+	return (groupsByNpub.get(members[0]) ?? []).some((gname) =>
+		members.every((n) => (groupsByNpub.get(n) ?? []).includes(gname)),
+	);
+}
+
 /** Suggestions for the naming popover — up to 3 from W2's suggestGroupNames. These are
  *  suggestions for the user to accept or discard, never a default — the caller must NOT
  *  pre-fill the name field from the return. */
@@ -379,6 +403,14 @@ export function readDragPayloadMulti(dt: DataTransfer | null): string[] | null {
  *  groupSuggestions helper and so the test can pin the multi path independently. */
 export function groupSuggestionsMulti(peers: CachedPeer[]): string[] {
 	return suggestGroupNames(peers);
+}
+
+/** Owner feedback #3 — the hovered copy for the drop-to-create zone when the drag carries `count`
+ *  contacts (count >= 2; a single-card drag names the contact in markup instead, with the name
+ *  emphasised in the accent colour). Mirrors the .drag-outcome label's "group N contacts" wording
+ *  so the two affordances read the same. Pure so it is unit-testable without a DOM. */
+export function dropzoneHoverCopy(count: number): string {
+	return `Release to group ${count} contacts`;
 }
 
 /** Commit: create the group with ALL selected peers, additive (Reading B). Calls

@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 // M22 W3 — the drag-to-group gesture ("drag one user onto another creates an ad hoc group").
 //
 // Two test layers:
@@ -15,8 +16,9 @@
 //   - Create is ALWAYS ADDITIVE (Reading B): both peers keep every group they were already in
 //     and both gain the new one. No Shift handling, nothing on this path clears a membership.
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import {
 	DRAG_MIME,
 	DRAG_MULTI_MIME,
@@ -27,6 +29,7 @@ import {
 	readDragPayloadMulti,
 	isSelfDrop,
 	isValidDropTarget,
+	alreadyGroupedTogether,
 	pickGroupColor,
 	groupSuggestions,
 	groupSuggestionsMulti,
@@ -55,7 +58,10 @@ import {
 } from '$lib/drag-group.js';
 import type { CachedPeer, Profile } from '$lib/types.js';
 
-const contactsSrc = () => readFileSync(new URL('./+page.svelte', import.meta.url), 'utf8');
+// Resolved from cwd, not import.meta.url: under `@vitest-environment jsdom` (needed by the mounted
+// block at the bottom of this file) import.meta.url is an http:// URL and readFileSync rejects it.
+// vitest's root is crates/hb-app/ui. Same workaround as contacts-drag-protected-mode.test.ts.
+const contactsSrc = () => readFileSync(resolve(process.cwd(), 'src/routes/contacts/+page.svelte'), 'utf8');
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -141,7 +147,7 @@ describe('M22 W3 — contacts page wiring (source-scan, no behavioural equivalen
 		expect(s).toMatch(/ondragover=\{\(e\) => onDragOver\(e, peer\.npub\)\}/);
 		expect(s).toMatch(/ondrop=\{\(e\) => onDrop\(e, peer\.npub\)\}/);
 		expect(s).toMatch(/ondragend=\{onDragEnd\}/);
-		expect(s).toMatch(/ondragleave=\{\(\) => onDragLeave\(peer\.npub\)\}/);
+		expect(s).toMatch(/ondragleave=\{\(e\) => onDragLeave\(e, peer\.npub\)\}/);
 	});
 
 	it('the Aim moment renders a text outcome "group these two" for a single-pair drag (not an icon)', () => {
@@ -236,6 +242,72 @@ describe('M22 W3 — self-drop is a no-op', () => {
 
 	it('isValidDropTarget rejects a null source', () => {
 		expect(isValidDropTarget(null, 'npub1b')).toBe(false);
+	});
+});
+
+// ── Owner feedback #2 (2026-09-13) — "dragging a card over another card in the same group
+// allows you to create another subgroup which we dont want" ────────────────────────────────────
+
+describe('alreadyGroupedTogether — the co-member refuse predicate (owner feedback #2)', () => {
+	const map = (entries: Record<string, string[]>) => new Map(Object.entries(entries));
+
+	it('true when source and target already share one group — the owner complaint', () => {
+		const m = map({ npub1a: ['Archivists'], npub1b: ['Archivists', 'Film'] });
+		expect(alreadyGroupedTogether(['npub1a'], 'npub1b', m)).toBe(true);
+	});
+
+	it('false when they share NO group — the popover opens as today', () => {
+		const m = map({ npub1a: ['Film'], npub1b: ['Music'] });
+		expect(alreadyGroupedTogether(['npub1a'], 'npub1b', m)).toBe(false);
+	});
+
+	it('false when the source is in NO group, even though the target is grouped', () => {
+		const m = map({ npub1b: ['Film'] });
+		expect(alreadyGroupedTogether(['npub1a'], 'npub1b', m)).toBe(false);
+	});
+
+	it('false when a npub is missing from the map entirely (missing = ungrouped)', () => {
+		const m = map({ npub1a: ['Film'] });
+		expect(alreadyGroupedTogether(['npub1a'], 'npub1b', m)).toBe(false);
+	});
+
+	it('true when EVERY dragged contact plus the target already sit together in ONE group', () => {
+		const m = map({ a: ['Arch'], b: ['Arch'], c: ['Arch', 'Film'] });
+		expect(alreadyGroupedTogether(['a', 'b'], 'c', m)).toBe(true);
+	});
+
+	it('false for a MIXED selection — one dragged contact outside the shared group keeps the gesture alive', () => {
+		const m = map({ a: ['Arch'], c: ['Arch'], d: ['Film'] });
+		expect(alreadyGroupedTogether(['a', 'd'], 'c', m)).toBe(false);
+	});
+
+	it('false when they share groups only PAIRWISE — no ONE group holds them all', () => {
+		const m = map({ a: ['Arch'], b: ['Film'], c: ['Arch', 'Film'] });
+		expect(alreadyGroupedTogether(['a', 'b'], 'c', m)).toBe(false);
+	});
+
+	it('false on a degenerate call (empty carried set)', () => {
+		expect(alreadyGroupedTogether([], 'npub1b', map({ npub1b: ['Film'] }))).toBe(false);
+	});
+});
+
+describe('owner feedback #2 — the page refuses the co-member create gesture (source-scan)', () => {
+	const fnSrc = (name: string) => {
+		const s = contactsSrc();
+		const start = s.indexOf(`function ${name}(`);
+		expect(start, `${name} not found in +page.svelte`).toBeGreaterThan(-1);
+		return s.slice(start, s.indexOf('\n\tfunction ', start));
+	};
+
+	it('onDrop guards BOTH paths (multi-select and single-peer) with alreadyGroupedTogether', () => {
+		const body = fnSrc('onDrop');
+		expect(body.split('alreadyGroupedTogether').length).toBe(3); // 2 calls + the split head
+	});
+
+	it('onDragOver refuses on dragover — dropEffect none, the cursor rule the page already states', () => {
+		const body = fnSrc('onDragOver');
+		expect(body).toMatch(/alreadyGroupedTogether/);
+		expect(body).toMatch(/dropEffect = refused \? 'none' : 'copy'/);
 	});
 });
 
@@ -793,7 +865,7 @@ describe('M22 W6 structural — the Undo button renders only when an action is p
 	}
 
 	it('the layout toast renders the Undo button inside {#if $toastMessage.action}', () => {
-		const layoutSrc = stripLayoutComments(readFileSync(new URL('../+layout.svelte', import.meta.url), 'utf8'));
+		const layoutSrc = stripLayoutComments(readFileSync(resolve(process.cwd(), 'src/routes/+layout.svelte'), 'utf8'));
 		const toastStart = layoutSrc.indexOf('{$toastMessage.text}');
 		expect(toastStart).toBeGreaterThan(-1);
 		const toastBlock = layoutSrc.slice(toastStart, toastStart + 400);
@@ -889,7 +961,7 @@ describe('M22 W4 — contacts page wiring (source-scan, no behavioural equivalen
 		const s = contactsSrc();
 		expect(s).toMatch(/ondragover=\{\(e\) => onGroupDragOver\(e, dropTargetName\)\}/);
 		expect(s).toMatch(/ondrop=\{\(e\) => onGroupDrop\(e, dropTargetName\)\}/);
-		expect(s).toMatch(/ondragleave=\{\(\) => onGroupDragLeave\(dropTargetName\)\}/);
+		expect(s).toMatch(/ondragleave=\{\(e\) => onGroupDragLeave\(e, dropTargetName\)\}/);
 	});
 
 	it('the Ungrouped section maps to UNGROUPED_TARGET (not passed as a real group name)', () => {
@@ -902,6 +974,7 @@ describe('M22 W4 — contacts page wiring (source-scan, no behavioural equivalen
 		const sub = s.slice(s.indexOf('class="contact-sub-row"'), s.indexOf('group-add-btn'));
 		expect(sub).toMatch(/ondragover=\{\(e\) => \{ e\.stopPropagation\(\); onGroupDragOver\(e, gname\); \}\}/);
 		expect(sub).toMatch(/ondrop=\{\(e\) => \{ e\.stopPropagation\(\); onGroupDrop\(e, gname\); \}\}/);
+		expect(sub).toMatch(/ondragleave=\{\(e\) => \{ e\.stopPropagation\(\); onGroupDragLeave\(e, gname\); \}\}/);
 	});
 
 	it('the refuse state is computed on dragover (dropOutcome set before drop)', () => {
@@ -1733,7 +1806,7 @@ describe('M22 W7 acceptance — every drop kind has a keyboard route (table-driv
 	 *  sites... scan at the SOURCE"). Proven: adding a 6th kind to the union left the previous
 	 *  literal-vs-literal version green at 265/265, which is the one scenario this test exists for. */
 	function dropOutcomeKindsFromSource(): string[] {
-		const src = readFileSync(new URL('../../lib/drag-group.ts', import.meta.url), 'utf8');
+		const src = readFileSync(resolve(process.cwd(), 'src/lib/drag-group.ts'), 'utf8');
 		const start = src.indexOf('export type DropOutcome =');
 		// To the blank line after the union — NOT to the first ';', which lands inside the very
 		// first member (`{ kind: 'move'; target: string }`) and would report a single kind.
@@ -1744,7 +1817,7 @@ describe('M22 W7 acceptance — every drop kind has a keyboard route (table-driv
 	/** The DropOutcomeMulti kinds read from drag-group.ts SOURCE — the W5 multi path is a distinct
 	 *  union and must be covered by the same table (M22 W8 coverage fix). */
 	function dropOutcomeMultiKindsFromSource(): string[] {
-		const src = readFileSync(new URL('../../lib/drag-group.ts', import.meta.url), 'utf8');
+		const src = readFileSync(resolve(process.cwd(), 'src/lib/drag-group.ts'), 'utf8');
 		const start = src.indexOf('export type DropOutcomeMulti =');
 		const union = src.slice(start, src.indexOf('\n\n', start));
 		return [...union.matchAll(/kind: '([a-z-]+)'/g)].map((m) => m[1]);
@@ -1849,6 +1922,194 @@ describe('M22 W7 acceptance — keyboard and drag converge on the same api calls
 		const inverse = computeCreateInverse('Anime Club');
 		expect(inverse.kind).toBe('delete-group');
 		expect((inverse as { kind: string; name: string }).name).toBe('Anime Club');
+	});
+});
+
+// ── Owner feedback #1 (2026-09-13): "dragging a card over the bottom half of another card
+// causes horrible flickering" ─────────────────────────────────────────────────────────────────
+//
+// Root cause: dragleave fires when the cursor crosses into a CHILD of the drop target, not only
+// when it truly leaves. The leave handler cleared the affordance state, the continuously-firing
+// dragover re-set it, and the bound class flipped every frame — densest over the bottom half's
+// fingerprint/bio/chip rows, all small inline elements. The fix ignores a dragleave whose
+// relatedTarget is still inside the current target; relatedTarget null (out the window) is real.
+//
+// This block MOUNTS the page and drives real dispatched events — mount recipe (api mock,
+// DataTransfer doubles, dragstart sequence) is the one proven by contacts-drag-protected-mode.
+// test.ts. jsdom implements neither DragEvent nor DataTransfer, so both are modelled here, and
+// the leave event carries relatedTarget via defineProperty because fireEvent.dragLeave's init
+// fallback cannot guarantee that property lands without a DragEvent constructor.
+//
+// ⚠ P-13: jsdom computes no layout, so nothing in vitest can prove the FLICKER is visually gone.
+// What this proves is the state machine under it (dragOverNpub / dropOverTarget) no longer
+// toggles on a child crossing; the visual claim rests on those states being what .drag-target,
+// .drag-outcome and group-drop-active bind to.
+
+vi.mock('$lib/api.js', () => ({
+	follow: vi.fn().mockResolvedValue(undefined),
+	refreshContact: vi.fn().mockResolvedValue(undefined),
+	unfollowContact: vi.fn().mockResolvedValue(undefined),
+	setContactTags: vi.fn().mockResolvedValue(undefined),
+	groupsGet: vi.fn(),
+	groupsCreate: vi.fn().mockResolvedValue(undefined),
+	groupsDelete: vi.fn().mockResolvedValue(undefined),
+	groupsAssign: vi.fn().mockResolvedValue(undefined),
+	groupsUnassign: vi.fn().mockResolvedValue(undefined),
+	groupsCreateWithMembers: vi.fn().mockResolvedValue(undefined),
+	contactUpdateGroups: vi.fn().mockResolvedValue(undefined),
+	browsePrivateCollections: vi.fn().mockResolvedValue([]),
+	onlineCount: vi.fn().mockResolvedValue({ online: 0, fetched_at: null, relay_set: [] }),
+	relayStatus: vi.fn().mockResolvedValue([]),
+	getContacts: vi.fn().mockResolvedValue([]),
+	privateAudienceList: vi.fn().mockResolvedValue([]),
+	privateAudienceSet: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('$app/navigation', () => ({ goto: vi.fn() }));
+
+import { render, fireEvent, cleanup, waitFor } from '@testing-library/svelte';
+import { tick } from 'svelte';
+import ContactsPage from './+page.svelte';
+import { contacts } from '$lib/stores.js';
+import { groupsGet } from '$lib/api.js';
+
+const groupsGetMock = groupsGet as unknown as ReturnType<typeof vi.fn>;
+
+/** A DataTransfer as it behaves during dragstart and drop: reads and writes both work. */
+function readWriteDT() {
+	const store = new Map<string, string>();
+	return {
+		types: [] as string[],
+		dropEffect: 'none',
+		effectAllowed: 'none',
+		setData(type: string, value: string) {
+			if (!store.has(type)) this.types.push(type);
+			store.set(type, value);
+		},
+		getData(type: string) {
+			return store.get(type) ?? '';
+		},
+	};
+}
+
+/** A DataTransfer as the spec requires during dragenter/dragover: types readable, getData blanked. */
+function protectedModeDT(types: string[]) {
+	return {
+		types,
+		dropEffect: 'none',
+		effectAllowed: 'copy',
+		setData() {},
+		getData() {
+			return '';
+		},
+	};
+}
+
+/** jsdom has no DragEvent; build a cancellable bubbling Event carrying a dataTransfer. */
+function dragEvent(type: string, dataTransfer: unknown) {
+	const e = new Event(type, { bubbles: true, cancelable: true });
+	Object.defineProperty(e, 'dataTransfer', { value: dataTransfer });
+	return e;
+}
+
+/** A dragleave carrying only what the guard reads: where the cursor went (null = out the window). */
+function dragLeaveEvent(relatedTarget: Node | null) {
+	const e = new Event('dragleave', { bubbles: true, cancelable: false });
+	Object.defineProperty(e, 'relatedTarget', { value: relatedTarget });
+	return e;
+}
+
+const profileNamed = (name: string): Profile => ({
+	display_name: name,
+	tags: [],
+	languages: [],
+	social_links: [],
+	willing_to: [],
+	content_types: [],
+	updated: '2026-09-01T00:00:00Z',
+});
+
+const ALPHA = makePeer({ npub: 'npub1alpha' + 'a'.repeat(52), profile: profileNamed('Alpha Hoarder') });
+const BRAVO = makePeer({ npub: 'npub1bravo' + 'c'.repeat(52), profile: profileNamed('Bravo Hoarder') });
+
+/** Renders the Groups view with Alpha ungrouped and Bravo in "Film". */
+async function mountGroupsView() {
+	groupsGetMock.mockResolvedValue([{ name: 'Film', pubkeys: [BRAVO.npub] }]);
+	contacts.set([ALPHA, BRAVO]);
+	const utils = render(ContactsPage);
+	await waitFor(() => expect(groupsGetMock).toHaveBeenCalled());
+	await tick();
+	await fireEvent.click(utils.getByRole('button', { name: 'Groups' }));
+	await tick();
+	return utils;
+}
+
+afterEach(() => {
+	cleanup();
+	vi.clearAllMocks();
+	contacts.set([]);
+});
+
+describe('owner feedback #1 — a child-crossing dragleave does not clear the drop affordance', () => {
+	it('dragleave whose relatedTarget is a CHILD of the card does not clear drag-target; a real leave does', async () => {
+		const { getByRole } = await mountGroupsView();
+		const alpha = getByRole('option', { name: /Alpha Hoarder/ }) as HTMLElement;
+		const bravo = getByRole('option', { name: /Bravo Hoarder/ }) as HTMLElement;
+
+		// Lift Alpha, hover it over Bravo: Bravo lights up as the drop affordance.
+		alpha.dispatchEvent(dragEvent('dragstart', readWriteDT()));
+		await tick();
+		bravo.dispatchEvent(dragEvent('dragover', protectedModeDT([DRAG_MIME])));
+		await tick();
+		expect(bravo.classList.contains('drag-target')).toBe(true);
+
+		// Crossing INTO one of the card's children (the bottom half's fp words, bio, chips) must
+		// not read as leaving — this crossing is the flicker.
+		const child = bravo.querySelector('.contact-info') ?? bravo.querySelector('*');
+		expect(child, 'fixture card has a child element to cross into').toBeTruthy();
+		fireEvent(bravo, dragLeaveEvent(child));
+		await tick();
+		expect(bravo.classList.contains('drag-target')).toBe(true);
+
+		// A leave to an element OUTSIDE the card (another card) is real and must clear it.
+		fireEvent(bravo, dragLeaveEvent(alpha));
+		await tick();
+		expect(bravo.classList.contains('drag-target')).toBe(false);
+
+		// relatedTarget null (cursor out the window) is also a real leave.
+		bravo.dispatchEvent(dragEvent('dragover', protectedModeDT([DRAG_MIME])));
+		await tick();
+		expect(bravo.classList.contains('drag-target')).toBe(true);
+		fireEvent(bravo, dragLeaveEvent(null));
+		await tick();
+		expect(bravo.classList.contains('drag-target')).toBe(false);
+	});
+
+	it("dragleave whose relatedTarget is the section header's own .drop-hint child does not clear the group affordance", async () => {
+		const { getByRole } = await mountGroupsView();
+		const alpha = getByRole('option', { name: /Alpha Hoarder/ }) as HTMLElement;
+
+		alpha.dispatchEvent(dragEvent('dragstart', readWriteDT()));
+		await tick();
+
+		const head = getByRole('group', { name: 'Film' }) as HTMLElement;
+		head.dispatchEvent(dragEvent('dragover', protectedModeDT([DRAG_MIME])));
+		await tick();
+		expect(head.classList.contains('group-drop-active')).toBe(true);
+
+		// The drop-hint span renders INSIDE the header because of the hover state itself —
+		// crossing onto it must not read as leaving (unguarded, the leave clears the very class
+		// that draws the element the cursor just entered).
+		const hint = head.querySelector('.drop-hint') ?? head.querySelector('*');
+		expect(hint, 'hovered section header renders a child element').toBeTruthy();
+		fireEvent(head, dragLeaveEvent(hint));
+		await tick();
+		expect(head.classList.contains('group-drop-active')).toBe(true);
+
+		// A genuine leave clears it.
+		fireEvent(head, dragLeaveEvent(document.body));
+		await tick();
+		expect(head.classList.contains('group-drop-active')).toBe(false);
 	});
 });
 
