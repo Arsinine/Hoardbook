@@ -29,7 +29,7 @@
 	// `bioMeasure` action below; this seam is what the unit test pins).
 	import { bioOverflows } from '$lib/bio-overflow.js';
 	// M17 W5 — presence honesty: "checked {t}" (our cache) vs "Last seen {t}" (their beacon).
-	import { PRESENCE_TICK_MS, checkedLabel, freshIndex, newestSeen, presenceView, type PresenceView } from '$lib/presence-view.js';
+	import { PRESENCE_TICK_MS, PRESENCE_WINDOW_MS, checkedLabel, freshIndex, newestSeen, presenceView, type PresenceView } from '$lib/presence-view.js';
 	import { relayWhyHint } from '$lib/relay-health.js';
 	import { ONLINE_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
 	import { ALPHABET, groupByLetter, groupByGroups, onlineBucket, matchesQuery, presentSectionKeys } from '$lib/contacts-view.js';
@@ -1008,17 +1008,40 @@
 	// since the only assignment is inside the poll closure.)
 	let freshSeen = $derived(freshIndex((onlineData as OnlineCount | null)?.fresh));
 
+	// QURATOR-216 — has the presence query actually ANSWERED? This is what separates a real
+	// "Offline" from the eternal "Checking…" for a contact with no beacon at all (never published
+	// one, or it aged out of the relays). Three deliberate choices:
+	//
+	// 1. It reads `fetched_at`, NOT `onlineData !== null`. The backend's m4 no-cache fallback
+	//    resolves the FIRST poll immediately with a placeholder (`fetched_at: null`, `fresh: []`)
+	//    while the real relay read is still in flight — so mere payload-arrival would flip the
+	//    whole roster to Offline on launch, which is the pre-QURATOR-135 confident-offline bug,
+	//    faster. `fetched_at` is stamped only once at least one half of a real read has landed.
+	// 2. A REJECTED poll is NOT an answer (chosen deliberately): `refreshOnline`'s catch keeps the
+	//    last value, so a failed first poll leaves `onlineData` null (⇒ still "Checking…") and a
+	//    failed later poll keeps the last REAL read, whose beacons age out via `nowMs` on their
+	//    own. Marking "done" on failure instead would render every contact Offline whenever the
+	//    relays are unreachable — the wall-clock-timeout failure mode the owner rejected, with
+	//    extra steps. A failed poll has told us nothing about anybody, so it lands in "Checking…".
+	// 3. Known bound (the wire cannot say more): a cycle where the chip count succeeds but the
+	//    author-filtered pills read fails still stamps `fetched_at` with the fresh set carried
+	//    forward — indistinguishable from "the read succeeded and nobody's beacon is there". In
+	//    that narrow half-split a beacon-less contact can read Offline one poll early; the next
+	//    successful pills read corrects it. Fixing it needs a Rust-side signal, out of scope here.
+	let presenceAnswered = $derived((onlineData as OnlineCount | null)?.fetched_at != null);
+
 	function presenceOf(peer: import('$lib/types.js').CachedPeer): PresenceView {
 		const seen = newestSeen(peer.npub, freshSeen, peer.last_presence);
-		return presenceView(seen, nowMs);
+		return presenceView(seen, nowMs, PRESENCE_WINDOW_MS, presenceAnswered);
 	}
 
 	/** A real beacon outranks the stored `online` flag (which a browse stamped once and nobody ever
-	 *  clears). With no beacon at all we keep the stored flag rather than flipping a just-browsed
-	 *  contact to offline on no evidence. Applied before bucketing so the pill, the "Online now"
-	 *  bucket and the header count can never disagree. QURATOR-135: the branch is on the view's own
-	 *  tri-state (`online === null` ⇒ never observed), so "Offline" below can only come from a
-	 *  beacon that actually lapsed — never from absence-of-data. */
+	 *  clears). While the query has not ANSWERED we keep the stored flag rather than flipping a
+	 *  just-browsed contact to offline on no evidence. Applied before bucketing so the pill, the
+	 *  "Online now" bucket and the header count can never disagree. QURATOR-135/216: the branch is
+	 *  on the view's own tri-state (`online === null` ⇒ the query has not answered yet), so
+	 *  "Offline" below can only come from a beacon that actually lapsed — or from an ANSWERED
+	 *  query that holds no beacon — never from absence-of-data. */
 	function withPresence(peer: import('$lib/types.js').CachedPeer): import('$lib/types.js').CachedPeer {
 		const p = presenceOf(peer);
 		return p.online !== null ? { ...peer, online: p.online } : peer;
@@ -1230,13 +1253,15 @@
 						<span class="collision-badge" title={collision}>⚠ {collision}</span>
 					{/if}
 					{#if true}
-						<!-- QURATOR-135: `presence.online === null` means NO beacon observed yet — the
-						     row must say what is true ("Checking…"), never assert "Offline". -->
+						<!-- QURATOR-135: `presence.online === null` means the presence query has not ANSWERED yet — the
+						     row must say what is true ("Checking…"), never assert "Offline" on absence-of-data.
+							     QURATOR-216: once the query HAS answered, a beacon-less contact
+							     is a real Offline. -->
 						{@const presence = presenceOf(peer)}
 						{#if peer.online}
 							<span class="pill pill-online"><span class="pill-dot"></span></span>
 						{:else if presence.online === null}
-							<span class="pill pill-unknown" title="No presence beacon observed yet — checking.">Checking…</span>
+							<span class="pill pill-unknown" title="The presence query hasn't answered yet — checking.">Checking…</span>
 						{:else}
 							<span class="pill pill-offline">Offline</span>
 						{/if}

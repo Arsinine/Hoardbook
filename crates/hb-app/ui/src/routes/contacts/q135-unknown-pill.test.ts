@@ -103,6 +103,25 @@ describe('QURATOR-135 — unknown presence is not Offline', () => {
 		await waitFor(() => expect(container.querySelectorAll('.pill-online').length).toBe(1));
 		expect(container.querySelectorAll('.pill-unknown').length).toBe(0);
 	});
+
+	// QURATOR-216 — the answered half of the tri-state, at the MOUNT seam: the pill must stop
+	// saying "Checking…" about a beacon-less contact once the poll has actually RETURNED. The
+	// module mock above models the pre-answer poll (fetched_at: null — the backend's m4
+	// no-cache placeholder, and exactly what a rejected first poll leaves behind); this
+	// override models the poll that read: fetched_at is stamped, and the fresh set holds
+	// nobody. First test above + this one pin BOTH sides of the discriminator end-to-end:
+	// no answer ⇒ "Checking…", answered + no beacon ⇒ Offline.
+	it('QURATOR-216 — query ANSWERED (fetched_at) + no beacon → Offline, not eternal "Checking…"', async () => {
+		contacts.set([peer({ last_presence: undefined })]);
+		vi.mocked(onlineCount).mockResolvedValueOnce({
+			online: 0,
+			fetched_at: new Date().toISOString(),
+			relay_set: [],
+		});
+		const { container } = render(ContactsPage);
+		await waitFor(() => expect(container.querySelectorAll('.pill-offline').length).toBe(1));
+		expect(container.querySelectorAll('.pill-unknown').length).toBe(0);
+	});
 });
 
 // QURATOR-135, the OWED second half — "first poll fires on mount, not on the first

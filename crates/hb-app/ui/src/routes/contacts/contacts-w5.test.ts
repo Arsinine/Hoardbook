@@ -61,7 +61,9 @@ describe('contacts W5 — no new relay load', () => {
 		// in a new form. The row must read a reactive `nowMs`, never Date.now() directly.
 		const s = src();
 		const fn = s.slice(s.indexOf('function presenceOf'), s.indexOf('function withPresence'));
-		expect(fn).toContain('presenceView(seen, nowMs)');
+		// QURATOR-216 extended the call with the window + answered flag; the pinned property is
+		// unchanged — the age reads the reactive `nowMs`, never Date.now() directly.
+		expect(fn).toContain('presenceView(seen, nowMs, PRESENCE_WINDOW_MS, presenceAnswered)');
 		expect(fn).not.toContain('Date.now()');
 		expect(s).toContain('let nowMs = $state(Date.now())');
 		// The tick is torn down with the page.
@@ -87,5 +89,23 @@ describe('contacts W5 — no new relay load', () => {
 		const s = src();
 		const fn = s.slice(s.indexOf('function withPresence'), s.indexOf('// Tag editing state'));
 		expect(fn).toContain('p.online !== null ? { ...peer, online: p.online } : peer');
+	});
+});
+
+// QURATOR-216 — the "answered" signal's wiring. A contact with NO beacon hung the row on
+// "Checking…" forever because answered and not-yet-asked were indistinguishable (both null). The
+// page must derive "answered" from evidence a real read landed, not from mere payload arrival.
+describe('contacts QURATOR-216 — answered vs not-yet-asked, at the wiring seam', () => {
+	it('"answered" is the payload\'s fetched_at — never mere arrival, never a rejected poll', () => {
+		const s = src();
+		// fetched_at is stamped only once at least one half of a real read landed: the backend's
+		// m4 no-cache placeholder resolves the FIRST poll immediately with fetched_at null while
+		// the real relay read is still in flight, and refreshOnline's catch keeps the last value
+		// on a rejected poll. Both must leave the roster honestly on "Checking…" — Offline
+		// before an answer exists is the pre-135 confident-offline bug, faster.
+		expect(s).toContain('fetched_at != null');
+		// The flag is threaded through the view, which owns the four-branch verdict (pinned with
+		// all four branches in presence-view.test.ts) — the page never branches on it directly.
+		expect(s).toContain('presenceView(seen, nowMs, PRESENCE_WINDOW_MS, presenceAnswered)');
 	});
 });

@@ -33,11 +33,23 @@ export const PRESENCE_TICK_MS = 30_000;
  *  contact the poll had not reached yet rendered a confident "Offline" pill for ~90s after launch
  *  (contacts refresh is gated by REFRESH_FRESHNESS_MS = 10 min; the poll runs every 20s). The
  *  renderer must branch on `=== true` / `=== false` / `null` explicitly, so "Offline" can only be
- *  produced by a beacon that actually lapsed — absence-of-data cannot reach it by construction. */
+ *  produced by a beacon that actually lapsed — absence-of-data cannot reach it by construction.
+ *
+ * QURATOR-216 — `null` now has a sharper meaning: "no beacon AND the query has not answered". A
+ * contact whose beacon simply does not exist (never published one, or it aged out of the relays)
+ * used to be indistinguishable from "not queried yet" — both `null` — so the row said "Checking…"
+ * FOREVER (owner report: "users that are offline have their status set to 'Checking'
+ * permanently"). The fix branches on whether the presence query has COMPLETED, never on a
+ * wall-clock timeout: a timer cannot tell a slow relay from a dead contact, so it would flip a
+ * genuinely-online peer to Offline — the pre-135 confident-offline bug wearing a stopwatch. With
+ * that, `false` is reachable two ways — a beacon that lapsed, or an ANSWERED query that holds no
+ * beacon — and both are honest: the relays told us. What stays impossible is Offline BEFORE an
+ * answer exists. */
 export interface PresenceView {
 	/** True while the newest beacon is inside the window → the row shows the Online pill, no age.
-	 *  False only when a beacon EXISTS and is outside the window. Null when we hold no beacon at
-	 *  all — render "Checking…", never "Offline". */
+	 *  False when a beacon EXISTS and is outside the window — or (QURATOR-216) when the query has
+	 *  ANSWERED and holds no beacon at all. Null only while the query has not answered: render
+	 *  "Checking…", never "Offline". */
 	online: boolean | null;
 	/** The offline age line, e.g. "Last seen 4h ago" / "Last seen: unknown". Empty when online (an
 	 *  online contact needs no age — the pill already says it). */
@@ -71,17 +83,31 @@ export function checkedLabel(lastFetched: string | null | undefined, now: number
  *
  *  `seenAt` is the live fresh-set entry if the current poll saw them, else the persisted
  *  `last_presence`, else null. A future-dated stamp is treated as now (we don't trust a relay's
- *  clock to invent a negative age). */
+ *  clock to invent a negative age).
+ *
+ *  QURATOR-216 — `queryAnswered` says whether the presence poll has actually RETURNED for the
+ *  roster (the contacts page derives it from the payload's `fetched_at`, which the backend stamps
+ *  only once a real read has landed). It is what separates the two no-beacon cases that used to
+ *  share `null`: not-asked-yet ("Checking…" — QURATOR-135's protection, intact) from
+ *  asked-and-absent ("Offline": a beacon that never existed cannot lapse, but an answer that
+ *  holds none is still an answer). */
 export function presenceView(
 	seenAt: string | null | undefined,
 	now: number,
 	windowMs: number = PRESENCE_WINDOW_MS,
+	queryAnswered: boolean = false,
 ): PresenceView {
-	// QURATOR-135: no (or unparseable) beacon is UNKNOWN, not offline. This is the whole fix —
-	// the old `online: false` here is what let the pill assert "Offline" about absence-of-data.
-	if (!seenAt) return { online: null, lastSeen: 'Last seen: unknown' };
+	// What a missing/unparseable beacon verdicts to now depends on whether the query answered.
+	// QURATOR-216: answered (false) — the relays were asked and hold no beacon for them, so the
+	// honest verdict is Offline, with no age to show ("Last seen: unknown"). This is the arm that
+	// used to hang a beacon-less contact on "Checking…" forever.
+	const absent: PresenceView['online'] = queryAnswered ? false : null;
+	// QURATOR-135 (arm unchanged): no (or unparseable) beacon with NO answer yet is UNKNOWN, not
+	// offline — the old `online: false` here is what let the pill assert "Offline" about
+	// absence-of-data, and Offline before the query returns is still a verdict made of nothing.
+	if (!seenAt) return { online: absent, lastSeen: 'Last seen: unknown' };
 	const ts = new Date(seenAt).getTime();
-	if (!Number.isFinite(ts)) return { online: null, lastSeen: 'Last seen: unknown' };
+	if (!Number.isFinite(ts)) return { online: absent, lastSeen: 'Last seen: unknown' };
 	const age = Math.max(0, now - ts);
 	if (age <= windowMs) return { online: true, lastSeen: '' };
 	return { online: false, lastSeen: `Last seen ${formatAge(age)}` };

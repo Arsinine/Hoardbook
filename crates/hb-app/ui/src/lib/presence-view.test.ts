@@ -131,6 +131,56 @@ describe('presenceView — real presence, honestly labelled', () => {
 	});
 });
 
+// QURATOR-216 — the four branches of a presence verdict, pinned with the queryAnswered flag in
+// play. The owner report: "users that are offline have their status set to 'Checking'
+// permanently" — a beacon that simply does not exist (never published, or aged out of the relays)
+// was indistinguishable from "not queried yet"; both were `null`. The flag is the completion
+// signal, NOT a wall-clock timeout: a timer cannot tell a slow relay from a dead contact, so it
+// would flip a genuinely-online peer to Offline — the pre-135 bug wearing a stopwatch.
+describe('QURATOR-216 — an ANSWERED query with no beacon is Offline, not eternal "Checking…"', () => {
+	it('branch 1 — query NOT yet returned: no beacon stays unknown ("Checking…"), QURATOR-135 intact', () => {
+		for (const empty of [null, undefined, '', 'not-a-date']) {
+			const v = presenceView(empty, NOW, PRESENCE_WINDOW_MS, false);
+			expect(v.online).toBeNull();
+			expect(v.lastSeen).toBe('Last seen: unknown');
+		}
+	});
+
+	it('branch 2 — query returned, beacon inside the window ⇒ Online', () => {
+		const v = presenceView(iso(60_000), NOW, PRESENCE_WINDOW_MS, true);
+		expect(v.online).toBe(true);
+		expect(v.lastSeen).toBe('');
+	});
+
+	it('branch 3 — query returned, beacon outside the window ⇒ Offline with its age', () => {
+		const v = presenceView(iso(20 * 60_000), NOW, PRESENCE_WINDOW_MS, true);
+		expect(v.online).toBe(false);
+		expect(v.lastSeen).toBe('Last seen 20m ago');
+	});
+
+	it('branch 4 (the fix) — query returned, NO beacon ⇒ Offline, never a verdict-less hang', () => {
+		const v = presenceView(null, NOW, PRESENCE_WINDOW_MS, true);
+		// THE 216 assertion: an answered query that holds no beacon is a real Offline — the arm
+		// that used to render "Checking…" forever. Mutation target: reverting the answered arm
+		// in presence-view.ts to produce `null` must red exactly this line (proven red, then
+		// green after revert — see the task report).
+		expect(v.online).toBe(false);
+		// No age exists to show and none is invented: the verdict is Offline, the age unknown.
+		expect(v.lastSeen).toBe('Last seen: unknown');
+	});
+
+	it('a REJECTED poll is not an answer — the flag stays false and absence stays unknown', () => {
+		// The failed-poll decision, pinned at this seam: the page feeds `queryAnswered` from the
+		// payload's `fetched_at` (stamped only once a real read has landed), never from a
+		// `finally` — a failed poll has told us nothing about anybody, so "Checking…" stands.
+		// Marking "answered" on failure instead would render every contact Offline whenever the
+		// relays are unreachable: the wall-clock timeout's failure mode, with extra steps.
+		const v = presenceView(null, NOW, PRESENCE_WINDOW_MS, false);
+		expect(v.online).toBeNull();
+		expect(v.lastSeen).toBe('Last seen: unknown');
+	});
+});
+
 describe('formatAge — the offline ladder has no "just now" rung', () => {
 	it('floors at 1m rather than collapsing to "just now"', () => {
 		expect(formatAge(0)).toBe('1m ago');
