@@ -66,6 +66,19 @@ use crate::transport_state::SharedEndpoint;
 /// relay traffic is the request never made.
 const POLL_INTERVAL: Duration = Duration::from_secs(300);
 
+/// QURATOR-197 (F19) — failed DIALS against one ask before the redeem poll stops dialling it,
+/// mirroring `peer_wave`'s ruled convention (owner 2026-09-04: *"3 attempts against the same peer
+/// before moving on"*). Exhaustion is terminal **for that ask**: the recovery paths are a FRESH
+/// ask (`record_manifest_ask` resets the budget with the new nonce) or a manual redeem on the
+/// Chat page — the bound here gags the UNATTENDED loop, never the human.
+const REDEEM_DIAL_CAP: u32 = 3;
+
+/// QURATOR-197 (F19) — the re-dial backoff base, at POLL scale. `peer_wave::backoff_for`'s 2 s
+/// base is invisible to a 300 s poll (the backoff would lapse before the next tick), so the base
+/// here is two poll intervals: the first retry waits out one whole poll, each further failure
+/// doubles the wait, and the cap stops the dialling outright.
+const REDEEM_DIAL_BACKOFF_BASE_SECS: u64 = POLL_INTERVAL.as_secs() * 2;
+
 /// A held collection whose author has published a newer snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StaleHolding {
@@ -223,6 +236,31 @@ fn ticket_inbox_filter(me: PublicKey, since: u64) -> Filter {
     }
 }
 
+/// QURATOR-197 (F19) — pure core: the re-dial wait after `attempts` failed dials of one ask.
+///
+/// `peer_wave::backoff_for`'s sibling at poll scale: `0` failures means nothing to back off from,
+/// otherwise the base doubles per failure (600 s, 1200 s, …). The shift is clamped so an
+/// out-of-range `attempts` (which the cap should prevent, but this function does not get to
+/// assume) can never overflow.
+fn redeem_backoff_for(attempts: u32) -> u64 {
+    if attempts == 0 {
+        return 0;
+    }
+    let doublings = (attempts - 1).min(16);
+    REDEEM_DIAL_BACKOFF_BASE_SECS.saturating_mul(1u64 << doublings)
+}
+
+/// QURATOR-197 (F19) — pure core: may this ask be dialled at `now_unix`?
+///
+/// `peer_wave::Candidate::is_ready`'s sibling (`!is_exhausted && backoff elapsed`), collapsed to
+/// one predicate over the persisted counter pair. False once the cap is reached — terminal for
+/// the ask, see [`REDEEM_DIAL_CAP`] — or while the exponential backoff still has time to run.
+/// A never-failed ask (`last_fail_unix == 0`) is always ready.
+fn redeem_dial_ready(attempts: u32, last_fail_unix: u64, now_unix: u64) -> bool {
+    attempts < REDEEM_DIAL_CAP
+        && now_unix.saturating_sub(last_fail_unix) >= redeem_backoff_for(attempts)
+}
+
 /// Drain tickets that answer asks THIS node sent, redeeming each through the production body.
 ///
 /// Runs at the START of a poll, before the staleness check, so a ticket that arrived since the last
@@ -248,10 +286,12 @@ async fn redeem_pending_tickets(
     }
     let allow = asked_peers(&asks);
 
+    // One poll, one clock read — the fetch window and the re-dial gate below must agree on "now".
+    let now = now_secs();
     // QURATOR-197 — bound the redemption fetch: the window anchors to the oldest pending ask
     // (minus the shared wobble allowance, clamped to now), the budget to the shared inbox limit.
     // Neither narrows a legitimate answer — see `ticket_inbox_since`'s doc.
-    let since = ticket_inbox_since(&asks, now_secs());
+    let since = ticket_inbox_since(&asks, now);
 
     // A short-lived client per poll, as the auto-approve loop does: the persistent shared client
     // belongs to the command surface and must not be held across this loop's sleeps.
@@ -278,9 +318,26 @@ async fn redeem_pending_tickets(
         // than None. An authorless ticket is the peer serving their own collection, so the author
         // key is the sender.
         let author = ticket.author_npub.clone().unwrap_or_else(|| msg.from.clone());
-        let want = asks
-            .get(&manifest_ask_key(&msg.from, &author, &ticket.slug))
-            .map(|a| a.fingerprint_seen.clone());
+        let entry = asks.get(&manifest_ask_key(&msg.from, &author, &ticket.slug));
+        let want = entry.map(|a| a.fingerprint_seen.clone());
+
+        // QURATOR-197 (F19) — the re-dial gate. A wrap that answered one of our asks stays on the
+        // relay until it expires, so this loop re-reads it EVERY poll; without this check a
+        // permanently-failing ticket was re-dialled every 300 s forever (the claim re-grants the
+        // same `request_id`, and only a success spends). Backoff first, cap terminal — see
+        // `redeem_dial_ready`. An ask missing from our own map cannot be dial-budgeted here; the
+        // claim inside the body still refuses it as `Unsolicited`.
+        if !entry
+            .map(|a| redeem_dial_ready(a.dial_attempts, a.dial_last_fail_unix, now))
+            .unwrap_or(true)
+        {
+            tracing::debug!(
+                from = %truncate(&msg.from),
+                slug = %ticket.slug,
+                "fetch driver: redeem backed off — a failing ticket is not re-dialled this poll"
+            );
+            continue;
+        }
 
         match redeem_manifest_ticket_inner(
             msg.from.clone(),
@@ -300,11 +357,26 @@ async fn redeem_pending_tickets(
                 );
                 redeemed.push(ticket.slug.clone());
             }
-            Err(e) => tracing::debug!(
-                from = %truncate(&msg.from),
-                error = %e,
-                "fetch driver: redeem failed; the ask stays retryable"
-            ),
+            Err(e) => {
+                tracing::debug!(
+                    from = %truncate(&msg.from),
+                    error = %e,
+                    "fetch driver: redeem failed; the ask stays retryable inside its dial budget"
+                );
+                // QURATOR-197 (F19) — count the failure so the gate above bites on the NEXT poll.
+                // `note_failed_dial` no-ops for pre-claim refusals (nothing dialled), so this is
+                // safe to call unconditionally. Best-effort: a backoff we failed to persist is a
+                // retry we fail to avoid, not a lost delivery.
+                if let Err(be) =
+                    store.note_failed_dial(&msg.from, &author, &ticket.slug, &ticket.request_id)
+                {
+                    tracing::warn!(
+                        from = %truncate(&msg.from),
+                        error = %be,
+                        "fetch driver: could not record the failed dial; its backoff is lost"
+                    );
+                }
+            }
         }
     }
     redeemed
@@ -599,7 +671,256 @@ mod tests {
             nonce: String::new(),
             claimed_by: None,
             spent: false,
+            dial_attempts: 0,
+            dial_last_fail_unix: 0,
         }
+    }
+
+    /// The store fixture the ask-lifecycle tests need — same shape as `store.rs`'s `test_store`
+    /// (that one is private to its module), kept here so the store.rs footprint of this ticket
+    /// stays minimal.
+    fn test_store() -> (tempfile::TempDir, DataStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        (dir, store)
+    }
+
+    // ── QURATOR-197 (F19) — the redeem-path re-dial backoff ──────────────────────────────────
+    //
+    // The ask wave already had `peer_wave` (attempts + last-attempt + exponential backoff + a 3
+    // cap) for SENDING asks; the REDEEM half — a wrap that answered one of our asks persists on
+    // the relay and was re-dialled every 300 s poll forever, because `claim_manifest_ask`
+    // re-grants the same `request_id` and only a SUCCESS spends — had no equivalent. These pin
+    // the one added here.
+
+    /// QURATOR-197 (F19), acceptance (b): the re-dial delay GROWS — the base is two poll
+    /// intervals (a wave-scale 2 s base is invisible to a 300 s poll), and each further failure
+    /// doubles it.
+    ///
+    /// MUTATION (P-10) — in `redeem_backoff_for` (the pure fn between `ticket_inbox_filter` and
+    /// `redeem_pending_tickets`), replace the multiply line
+    /// `REDEEM_DIAL_BACKOFF_BASE_SECS.saturating_mul(1u64 << doublings)` with
+    /// `REDEEM_DIAL_BACKOFF_BASE_SECS` (a flat base) → the third and fourth asserts red.
+    #[test]
+    fn redeem_backoff_doubles_per_failed_dial_and_starts_at_two_polls() {
+        assert_eq!(redeem_backoff_for(0), 0, "a never-failed ask has nothing to back off from");
+        assert_eq!(REDEEM_DIAL_BACKOFF_BASE_SECS, 600, "the base is two 300 s polls");
+        assert_eq!(redeem_backoff_for(1), 600, "the first retry waits out one whole poll");
+        assert_eq!(redeem_backoff_for(2), 1_200, "the second failure doubles the wait");
+        assert_eq!(redeem_backoff_for(3), 2_400, "and so on");
+    }
+
+    /// QURATOR-197 (F19), acceptance (c): once the cap is reached the ask is NEVER dial-ready
+    /// again, however much time passes — exhaustion is terminal for that ask (a fresh ask or a
+    /// manual redeem are the recovery paths; see `REDEEM_DIAL_CAP`'s doc), and deliberately NOT
+    /// the same state as `spent`.
+    ///
+    /// MUTATION (P-10) — in `redeem_dial_ready` (the pure fn directly after `redeem_backoff_for`),
+    /// change the cap clause `attempts < REDEEM_DIAL_CAP` to `attempts < REDEEM_DIAL_CAP + 1`
+    /// → this test reds (a capped ask would become ready again once its backoff lapsed).
+    #[test]
+    fn a_capped_ask_is_never_dial_ready_again_even_after_its_backoff_lapses() {
+        let far_future = 2_000_000_000u64;
+        assert!(
+            !redeem_dial_ready(REDEEM_DIAL_CAP, 0, far_future),
+            "the cap is terminal — no elapsed time re-arms it"
+        );
+        assert!(
+            redeem_dial_ready(REDEEM_DIAL_CAP - 1, 0, far_future),
+            "one failure short of the cap is only backoff, not exhaustion"
+        );
+    }
+
+    /// QURATOR-197 (F19), acceptance (b) at the gate: an ask INSIDE its backoff window waits
+    /// (the poll skips it — no dial), one at or past the boundary dials.
+    ///
+    /// MUTATION (P-10) — in `redeem_dial_ready` (the pure fn directly after `redeem_backoff_for`),
+    /// change the window comparison `>= redeem_backoff_for(attempts)` to
+    /// `> redeem_backoff_for(attempts) + 1` → the second assert reds; changing it to always
+    /// `true` reds the first.
+    #[test]
+    fn an_ask_inside_its_backoff_waits_and_one_past_it_dials() {
+        let now = 1_788_220_800u64;
+        let base = REDEEM_DIAL_BACKOFF_BASE_SECS;
+        assert!(!redeem_dial_ready(1, now - (base - 1), now), "one second inside the window: wait");
+        assert!(redeem_dial_ready(1, now - base, now), "at the boundary exactly: dial");
+        assert!(redeem_dial_ready(0, 0, now), "a never-failed ask dials at once");
+    }
+
+    /// QURATOR-197 (F19), acceptance (a): attempts ACCUMULATE per ask, and survive a reload —
+    /// the ask persists in `manifest_asks.json` and the wrap persists on the relay, so both
+    /// halves of the loop survive a restart and the counter must too (the design choice recorded
+    /// on `ManifestAsk::dial_attempts`: an in-memory budget like `AskState` would reset exactly
+    /// when the storm does not).
+    ///
+    /// MUTATION (P-10) — in `store.rs`'s `note_failed_dial` (the fn directly after
+    /// `spend_manifest_ask`), delete the `ask.dial_attempts += 1;` statement → the first and
+    /// third asserts red (the reloads would keep showing 0).
+    #[test]
+    fn failed_dials_accumulate_on_the_ask_across_reloads() {
+        let (dir, store) = test_store();
+        let (npub, slug, nonce) = ("npub1peer", "vault", "nonce-1");
+        store
+            .record_manifest_ask(npub, npub, slug, "fp", "2026-01-01T00:00:00Z", nonce)
+            .unwrap();
+        // The claim is what makes a later failure a DIAL failure (see the sibling test below).
+        store.claim_manifest_ask(npub, npub, slug, nonce, "req-A").unwrap();
+
+        // Poll 1's dial fails.
+        store.note_failed_dial(npub, npub, slug, "req-A").unwrap();
+        let after_one = store
+            .load_manifest_asks()
+            .unwrap()
+            .get(&manifest_ask_key(npub, npub, slug))
+            .unwrap()
+            .clone();
+        assert_eq!(after_one.dial_attempts, 1, "the first failed dial is recorded");
+        assert!(after_one.dial_last_fail_unix > 0, "the wall-clock stamp is set");
+
+        // A "restart": a fresh DataStore over the same directory, then poll 2's dial fails.
+        let reopened = DataStore::new(dir.path().to_path_buf());
+        reopened.note_failed_dial(npub, npub, slug, "req-A").unwrap();
+        let after_two = reopened
+            .load_manifest_asks()
+            .unwrap()
+            .get(&manifest_ask_key(npub, npub, slug))
+            .unwrap()
+            .clone();
+        assert_eq!(after_two.dial_attempts, 2, "the second failure ADDS to the persisted count");
+        assert!(
+            after_two.dial_last_fail_unix >= after_one.dial_last_fail_unix,
+            "the stamp advances, never rewinds"
+        );
+    }
+
+    /// QURATOR-197 (F19): only a failure that REACHED A DIAL counts. `claimed_by == request_id`
+    /// is durable proof that the redeem body's claim returned Granted for this exact ticket (the
+    /// claim writes it only after the nonce and spent checks passed), so a pre-claim refusal —
+    /// the relay replays the wrap every poll, including stale-nonce ones — must leave the
+    /// CURRENT ask's budget alone, or the loop would be gagged without a dial ever happening.
+    ///
+    /// MUTATION (P-10) — in `store.rs`'s `note_failed_dial` (the fn directly after
+    /// `spend_manifest_ask`), change the guard
+    /// `if ask.spent || ask.claimed_by.as_deref() != Some(request_id) { return Ok(()); }`
+    /// to `if ask.spent { return Ok(()); }` → this test reds (the unclaimed note would count).
+    #[test]
+    fn a_refusal_that_never_dialled_does_not_burn_the_dial_budget() {
+        let (_dir, store) = test_store();
+        let (npub, slug, nonce) = ("npub1peer", "vault", "nonce-1");
+        store
+            .record_manifest_ask(npub, npub, slug, "fp", "2026-01-01T00:00:00Z", nonce)
+            .unwrap();
+
+        // Before any claim: a wrap failing now fails AT the claim, before any dial.
+        store.note_failed_dial(npub, npub, slug, "req-A").unwrap();
+        // After req-A claims: a DIFFERENT ticket's failure is a ClaimedByAnother refusal.
+        store.claim_manifest_ask(npub, npub, slug, nonce, "req-A").unwrap();
+        store.note_failed_dial(npub, npub, slug, "req-B").unwrap();
+
+        let ask = store
+            .load_manifest_asks()
+            .unwrap()
+            .get(&manifest_ask_key(npub, npub, slug))
+            .unwrap()
+            .clone();
+        assert_eq!(ask.dial_attempts, 0, "pre-claim refusals record nothing");
+        assert_eq!(ask.dial_last_fail_unix, 0, "and stamp nothing");
+    }
+
+    /// QURATOR-197 (F19), acceptance (d): a SUCCESS is unchanged by the backoff — the ask that
+    /// succeeded is SPENT, which stays distinguishable on disk from an exhausted one (`spent`
+    /// means served; `dial_attempts` means tried-and-failed). A spent ask's replays stop
+    /// counting, and a FRESH ask re-arms the dial budget with its new nonce.
+    ///
+    /// MUTATION (P-10) — in `store.rs`'s `record_manifest_ask` (the struct literal the insert
+    /// builds), change the fresh-ask reset `dial_attempts: 0,` to `dial_attempts: 3,` → the
+    /// final assert reds (a fresh ask would arrive pre-exhausted).
+    #[test]
+    fn a_success_spends_a_spent_ask_stops_counting_and_a_fresh_ask_re_arms() {
+        let (_dir, store) = test_store();
+        let (npub, slug, nonce) = ("npub1peer", "vault", "nonce-1");
+        store
+            .record_manifest_ask(npub, npub, slug, "fp", "2026-01-01T00:00:00Z", nonce)
+            .unwrap();
+        store.claim_manifest_ask(npub, npub, slug, nonce, "req-A").unwrap();
+
+        // The success path, exactly as production sequences it: claim, dial, spend — no note.
+        store.spend_manifest_ask(npub, npub, slug, nonce).unwrap();
+        let served = store
+            .load_manifest_asks()
+            .unwrap()
+            .get(&manifest_ask_key(npub, npub, slug))
+            .unwrap()
+            .clone();
+        assert!(served.spent, "a success still spends the ask");
+        assert_eq!(served.dial_attempts, 0, "a served ask was never a failing one");
+
+        // The wrap keeps arriving off the relay; a spent ask is terminal, nothing more counts.
+        store.note_failed_dial(npub, npub, slug, "req-A").unwrap();
+        let still = store
+            .load_manifest_asks()
+            .unwrap()
+            .get(&manifest_ask_key(npub, npub, slug))
+            .unwrap()
+            .clone();
+        assert_eq!(still.dial_attempts, 0, "a spent ask's replays burn no budget");
+
+        // A fresh ask (new nonce) resets the budget and the claim — the ruled recovery path.
+        store
+            .record_manifest_ask(npub, npub, slug, "fp2", "2026-02-01T00:00:00Z", "nonce-2")
+            .unwrap();
+        let fresh = store
+            .load_manifest_asks()
+            .unwrap()
+            .get(&manifest_ask_key(npub, npub, slug))
+            .unwrap()
+            .clone();
+        assert_eq!(fresh.dial_attempts, 0, "a fresh ask re-arms the dial budget");
+        assert_eq!(fresh.claimed_by, None, "and clears the old claim");
+        assert!(!fresh.spent, "and the spent flag");
+    }
+
+    /// QURATOR-197 (F19) — the pure cores above must actually be WIRED into the redeem poll:
+    /// the gate consulted BEFORE the production redeem body (a backed-off ask never dials, never
+    /// even claims), and the failure NOTED after it (so the gate has something to read next
+    /// poll). Without this guard the backoff could rot into decoration while every unit test
+    /// above stays green — the round-trip-test rule (a guard must end where production ends).
+    ///
+    /// MUTATION (P-10) — in `redeem_pending_tickets`, delete the gate block that consults
+    /// `redeem_dial_ready` (the `if !entry ... { ...; continue; }` immediately before the
+    /// `match redeem_manifest_ticket_inner(...)`) → the first assert reds; delete the
+    /// `store.note_failed_dial(...)` call inside the `Err` arm → the second reds.
+    #[test]
+    fn the_redeem_poll_consults_the_gate_and_notes_failures() {
+        let src = include_str!("fetch_driver.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("async fn redeem_pending_tickets(")
+            .expect("the redeem helper must exist");
+        let end = code[at..]
+            .find("pub(crate) async fn run_fetch_driver_loop(")
+            .expect("the loop must follow the redeem helper")
+            + at;
+        let region = &code[at..end];
+        // Call forms, never bare names (CLAUDE.md §9): this test's own prose names both symbols.
+        let gate_at = region
+            .find("redeem_dial_ready(")
+            .expect("the poll must consult the re-dial gate");
+        let body_at = region
+            .find("redeem_manifest_ticket_inner(")
+            .expect("the poll must call the production redeem body");
+        assert!(
+            gate_at < body_at,
+            "the gate must run BEFORE the redeem body, or a backed-off ask still dials"
+        );
+        assert!(
+            region.contains("note_failed_dial("),
+            "a failed redeem must be recorded, or the gate has nothing to read next poll"
+        );
     }
 
     /// QURATOR-197 — the redemption poll's inbox filter must carry BOTH bounds the chat inbox's
