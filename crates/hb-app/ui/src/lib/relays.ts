@@ -14,6 +14,15 @@ import defaultRelays from './default_relays.json';
  *  `hb-app/src/net.rs::DEFAULT_RELAYS` (audit I-2: no more hand-mirrored Rust/TS copies). */
 export const DEFAULT_RELAYS: string[] = defaultRelays;
 
+/** The effective relay set the Settings UI displays (QURATOR-208): the backend-configured list
+ *  VERBATIM — the Rust side reconciles additive default changes into it once at startup
+ *  (`net::reconcile_default_relays`: new defaults are appended, user deletions stick), and this
+ *  side must not diverge from what the backend will actually dial — falling back to the shared
+ *  defaults only while nothing is configured (fresh install / non-relay settings write). */
+export function effectiveRelays(configured: string[]): string[] {
+	return configured.length ? configured : [...DEFAULT_RELAYS];
+}
+
 export type RelayUrlCheck = { ok: true; url: string } | { ok: false; error: string };
 
 /** Validate a relay URL the user typed. Nostr relays are `ws://` or `wss://` — NOT `http(s)://`

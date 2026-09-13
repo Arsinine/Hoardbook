@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { DEFAULT_RELAYS, validateRelayUrl } from './relays';
+import { DEFAULT_RELAYS, effectiveRelays, validateRelayUrl } from './relays';
 import defaultRelaysJson from './default_relays.json';
 
 // Regression for the pre-pivot relay-wiring bugs (the settings UI was built for the retired
@@ -53,5 +53,27 @@ describe('DEFAULT_RELAYS — real wss seeds, not the dead bootstrap', () => {
 			expect(r).not.toContain(':3000');
 			expect(r.startsWith('http://')).toBe(false);
 		}
+	});
+});
+
+describe('effectiveRelays — the Settings UI shows the backend-configured set verbatim (QURATOR-208)', () => {
+	it('returns a non-empty configured set VERBATIM — the backend reconciles defaults at startup, the UI must not diverge from what it dials', () => {
+		// The reconciled shape the Rust side persists for the owner's case plus a custom relay:
+		// custom first (persisted order kept), then every default. Whatever the backend saved,
+		// Settings must display exactly that list — a second, divergent "effective set" computed
+		// on the UI side is how "Settings shows 2, backend uses 4" reports happen.
+		//
+		// MUTATION (P-10): in `effectiveRelays` (relays.ts), change the body to
+		// `return [...DEFAULT_RELAYS];` — the UI would ignore the configured set and both asserts
+		// red (toEqual(configured) fails, and the set would equal DEFAULT_RELAYS).
+		const configured = ['wss://custom.example', ...DEFAULT_RELAYS];
+		expect(effectiveRelays(configured)).toEqual(configured);
+		expect(effectiveRelays(configured)).not.toEqual(DEFAULT_RELAYS);
+	});
+
+	it('falls back to the shared defaults only while nothing is configured (fresh install)', () => {
+		// MUTATION (P-10): in `effectiveRelays`, change the body to `return configured;` — an
+		// empty configured set would be returned as-is and this assert reds.
+		expect(effectiveRelays([])).toEqual(DEFAULT_RELAYS);
 	});
 });

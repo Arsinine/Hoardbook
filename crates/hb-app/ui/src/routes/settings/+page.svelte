@@ -7,7 +7,7 @@
 	import { passphraseStrength, backupModeOptions, type BackupMode } from '$lib/backup-export.js';
 	import { updateNoticeVM } from '$lib/update-ux.js';
 	import { beaconLine, loopLine } from '$lib/beacon-view.js';
-	import { DEFAULT_RELAYS, validateRelayUrl } from '$lib/relays.js';
+	import { effectiveRelays, validateRelayUrl } from '$lib/relays.js';
 	import { relaunch } from '@tauri-apps/plugin-process';
 	import { open as openFileDialog, save as saveFileDialog, confirm } from '@tauri-apps/plugin-dialog';
 	import { getVersion } from '@tauri-apps/api/app';
@@ -317,7 +317,7 @@
 			settings = await getSettings();
 			// Fresh install has no saved relays — show the curated public defaults (the backend
 			// falls back to the same set). The user can edit or remove them.
-			relayUrls = settings.relay_urls.length ? settings.relay_urls : [...DEFAULT_RELAYS];
+			relayUrls = effectiveRelays(settings.relay_urls);
 			relayUrls.forEach(probeRelay);
 			// Overlay the live data-path status once the persistent client has had a moment to dial,
 			// then keep it current on a slow tick while the page is open.

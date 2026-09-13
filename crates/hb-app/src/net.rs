@@ -28,7 +28,7 @@ use hb_core::Identity;
 use hb_net::RelayClient;
 use tokio::sync::RwLock;
 
-use crate::store::DataStore;
+use crate::store::{DataStore, Settings};
 
 /// Handshake/fetch timeout for a relay connection.
 pub const RELAY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -71,6 +71,62 @@ pub fn relay_urls(store: &DataStore) -> Vec<String> {
         return DEFAULT_RELAYS.clone();
     }
     configured
+}
+
+/// (QURATOR-208) Pure core of the additive default-relay sync: given the persisted relay set, the
+/// known-defaults watermark (see [`Settings::known_default_relays`]) and the CURRENT default list,
+/// return the new persisted set (persisted order kept, genuinely-new defaults appended after it)
+/// and the new watermark (the full current default list — a default some future release drops
+/// from the shipped set is harmlessly forgotten). A default already in `persisted` is never
+/// duplicated; a default in the watermark is never appended — which is exactly what makes a
+/// user's deletion stick across upgrades.
+pub(crate) fn merge_default_relays(
+    persisted: &[String],
+    watermark: &[String],
+    defaults: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut merged = persisted.to_vec();
+    for d in defaults {
+        let offered = watermark.iter().any(|w| w == d);
+        let present = merged.iter().any(|r| r == d);
+        if !offered && !present {
+            merged.push(d.clone());
+        }
+    }
+    (merged, defaults.to_vec())
+}
+
+/// (QURATOR-208 — owner devtest v0.20.0 #2: "Settings shows 2 relays, don't we have 4 now? Not
+/// synced with backend".) Additive default-relay sync, run **once at app startup** — never in
+/// [`relay_urls`], which sits on hot paths (DM poll, presence, online/nav polls) and must stay
+/// read-only; a write-on-read there would re-write `settings.json` on every poll. Append the
+/// current defaults the user has never been offered to the persisted set and persist the
+/// watermark; see [`Settings::known_default_relays`] for what an ABSENT watermark means (the
+/// one-time-union ruling). Never-fail by contract: a settings read/write error logs and returns,
+/// leaving the previous file untouched — a failed sync must not brick startup, and the next
+/// launch simply retries it.
+pub fn reconcile_default_relays(store: &DataStore) {
+    let mut settings = match store.load_settings() {
+        Ok(Some(s)) => s,
+        // No settings file yet (fresh install, or only a non-relay write ever happened): start
+        // from the serde defaults — empty persisted set AND empty watermark — so the union below
+        // materialises the defaults as the explicitly-configured set and records the offering.
+        Ok(None) => Settings::default(),
+        Err(e) => {
+            tracing::warn!(error = %e, "default-relay sync: could not load settings; skipping");
+            return;
+        }
+    };
+    let (merged, watermark) =
+        merge_default_relays(&settings.relay_urls, &settings.known_default_relays, &DEFAULT_RELAYS);
+    if merged == settings.relay_urls && watermark == settings.known_default_relays {
+        return; // nothing new offered — leave settings.json byte-identical (no gratuitous rewrite)
+    }
+    settings.relay_urls = merged;
+    settings.known_default_relays = watermark;
+    if let Err(e) = store.save_settings(&settings) {
+        tracing::warn!(error = %e, "default-relay sync: could not save settings; will retry next launch");
+    }
 }
 
 /// SSRF guard on **user-supplied** relay URLs (audit I-11): reject any scheme other than
@@ -394,6 +450,114 @@ mod tests {
         let store = DataStore::new(dir.path().to_path_buf());
         store.save_settings(&Settings { relay_urls: vec![], ..Default::default() }).unwrap();
         assert_eq!(relay_urls(&store), *DEFAULT_RELAYS);
+    }
+
+    #[test]
+    fn reconcile_gains_new_defaults_for_a_set_frozen_on_an_old_default_list() {
+        // QURATOR-208 acceptance 1 — the owner's own case (devtest v0.20.0 #2): the persisted set
+        // is exactly the first two entries of a PRIOR shipped default list (nos.lol +
+        // relay.primal.net, the Aug-2026 pair) with NO watermark (their settings.json predates the
+        // field, so serde loads it as []). Absent watermark = "never offered ANY default" (see
+        // Settings::known_default_relays for the ruling) → the first reconcile is a one-time
+        // union and the install is un-stranded at the full current set. The second call pins
+        // convergence: once the watermark covers the defaults, reconcile is a no-op.
+        //
+        // MUTATION (P-10): in `merge_default_relays` (the `for d in defaults` loop body), gate the
+        // `merged.push(d.clone());` on `false` (or delete the push) — nothing is ever appended,
+        // the owner stays stranded at 2, and every assert below reds.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let frozen: Vec<String> = DEFAULT_RELAYS.iter().take(2).cloned().collect();
+        store.save_settings(&Settings { relay_urls: frozen, ..Default::default() }).unwrap();
+        reconcile_default_relays(&store);
+        reconcile_default_relays(&store); // idempotent: the watermark written by run 1 stops run 2
+        assert_eq!(
+            relay_urls(&store), *DEFAULT_RELAYS,
+            "the owner's 2-relay frozen set must reach the 4 current defaults"
+        );
+        let saved = store.load_settings().unwrap().unwrap();
+        assert_eq!(saved.relay_urls, *DEFAULT_RELAYS);
+        assert_eq!(
+            saved.known_default_relays, *DEFAULT_RELAYS,
+            "the watermark must now cover every current default"
+        );
+    }
+
+    #[test]
+    fn reconcile_never_resurrects_a_default_the_user_removed() {
+        // QURATOR-208 acceptance 2 — the ruling the ticket exists to enforce: additive sync means
+        // a relay the user DELETED stays deleted across upgrades. The watermark covers the current
+        // 4 (they were offered them); the persisted set is those 4 minus offchain.pub (removed);
+        // the NEXT release ships one genuinely-new default. Only the new one may be added.
+        //
+        // MUTATION (P-10): in `merge_default_relays`, change the loop guard
+        // `if !offered && !present` to `if !present` — the watermark no longer suppresses
+        // anything, offchain.pub is re-added, and the `!merged.contains(&removed)` assert reds.
+        let removed = DEFAULT_RELAYS.last().unwrap().clone();
+        let kept: Vec<String> = DEFAULT_RELAYS.iter().filter(|r| *r != &removed).cloned().collect();
+        let mut next_release = DEFAULT_RELAYS.clone();
+        next_release.push("wss://new-default.example".to_string());
+        let (merged, watermark) = merge_default_relays(&kept, &DEFAULT_RELAYS, &next_release);
+        assert!(!merged.contains(&removed), "a user-removed default must NOT come back on upgrade");
+        assert_eq!(
+            merged.last().unwrap(),
+            "wss://new-default.example",
+            "the genuinely-new default is the only addition"
+        );
+        assert_eq!(merged.len(), kept.len() + 1);
+        assert_eq!(watermark, next_release, "the watermark advances to the new release's defaults");
+    }
+
+    #[test]
+    fn reconcile_preserves_the_inv5_floor_and_never_removes_a_configured_relay() {
+        // QURATOR-208 acceptance 3 — INV-5 says spread relays, never a SPOF: the sync may only
+        // GROW the effective set. A reconcile that dropped configured relays could take an
+        // install below the two-distinct-relay floor. Worst case for that bug: nothing new is
+        // offered (watermark already covers the defaults), so the merge must be an EXACT no-op —
+        // the user's custom relay and their one kept default survive untouched.
+        //
+        // MUTATION (P-10): in `merge_default_relays`, change
+        // `let mut merged = persisted.to_vec();` to `let mut merged = Vec::new();` — with
+        // everything already offered the loop appends nothing, so the result is empty: the
+        // no-op equality assert reds, and the distinct-count assert names the INV-5 consequence.
+        let persisted = vec!["wss://custom.example".to_string(), DEFAULT_RELAYS[0].clone()];
+        let watermark = DEFAULT_RELAYS.clone();
+        let (merged, _) = merge_default_relays(&persisted, &watermark, &DEFAULT_RELAYS);
+        assert_eq!(
+            merged, persisted,
+            "nothing new offered: exact no-op — the custom relay and the kept default survive"
+        );
+        let distinct: std::collections::HashSet<&String> = merged.iter().collect();
+        assert!(distinct.len() >= 2, "INV-5: the sync must never take an install below two distinct relays");
+    }
+
+    #[test]
+    fn reconciled_set_is_what_the_settings_ui_will_display() {
+        // QURATOR-208 acceptance 4 — frontend and backend must resolve the SAME effective set.
+        // Backend half: after reconcile the persisted set is non-empty, so `relay_urls()` returns
+        // it VERBATIM (no fallback) — exactly the list the Settings page displays via
+        // `effectiveRelays` (relays.ts), which returns a non-empty configured set verbatim too
+        // (pinned in relays.test.ts). Both sides' default list is the same default_relays.json
+        // (audit I-2, pinned in both suites), so verbatim-on-both-ends ⇒ identical effective sets.
+        // The scenario is the owner's plus a custom relay, so the expected set differs from
+        // DEFAULT_RELAYS and the verbatim property is actually load-bearing here.
+        //
+        // MUTATION (P-10): in `reconcile_default_relays`, delete the
+        // `settings.relay_urls = merged;` assignment — the watermark is persisted but the relay
+        // set never gains the new defaults, and the `relay_urls` assert reds (the persisted
+        // custom-plus-frozen-pair set would be returned instead of the union).
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let mut frozen_with_custom = vec!["wss://custom.example".to_string()];
+        frozen_with_custom.extend(DEFAULT_RELAYS.iter().take(2).cloned());
+        store
+            .save_settings(&Settings { relay_urls: frozen_with_custom, ..Default::default() })
+            .unwrap();
+        reconcile_default_relays(&store);
+        let mut expected = vec!["wss://custom.example".to_string()];
+        expected.extend(DEFAULT_RELAYS.iter().cloned());
+        assert_eq!(relay_urls(&store), expected);
+        assert_ne!(relay_urls(&store), *DEFAULT_RELAYS, "the custom relay must survive the sync");
     }
 
     #[test]

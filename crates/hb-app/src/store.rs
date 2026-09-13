@@ -86,6 +86,23 @@ pub struct Settings {
     /// and nothing is gated by it — shown iff this is false; acknowledging persists it.
     #[serde(default)]
     pub serving_notice_acknowledged: bool,
+    /// QURATOR-208 — the **known-defaults watermark**: every default relay this install has
+    /// already been offered. At startup `net::reconcile_default_relays` appends to `relay_urls`
+    /// any current default that is absent here (a genuinely-new default the user has never seen),
+    /// then sets this to the full current default list — so a default the user DELIBERATELY
+    /// REMOVED stays removed across upgrades (it is in the watermark, so it is never "new" again),
+    /// while an upgrade that ships new defaults still reaches existing installs. **Empty (the
+    /// serde default for a pre-QURATOR-208 `settings.json`) means "never offered ANY default"**,
+    /// which makes the first reconcile a one-time union with the current defaults: a pre-watermark
+    /// install frozen on an old default set is un-stranded (the owner's v0.20.0 report: 2 relays
+    /// shown where 4 ship), at the cost that a pre-watermark user who had deleted a then-default
+    /// relay sees it return once — re-deletable, and the deletion sticks from then on, because the
+    /// watermark is written in the same pass. That trade is deliberate: the alternative (treat an
+    /// absent watermark as "already seen everything") permanently strands every pre-watermark
+    /// install at its stale set, silently eroding the INV-5 floor, while the one-time resurrection
+    /// is visible in Settings, INV-5-ward, and happens at most once per relay.
+    #[serde(default)]
+    pub known_default_relays: Vec<String>,
 }
 
 impl Default for Settings {
@@ -102,6 +119,7 @@ impl Default for Settings {
             big_relay_url: String::new(),
             swarm_caching: false,
             serving_notice_acknowledged: false,
+            known_default_relays: Vec::new(),
         }
     }
 }
@@ -1166,9 +1184,12 @@ impl DataStore {
                 sent_at: sent_at.to_string(),
                 nonce: nonce.to_string(),
                 // A re-ask is a fresh authorization: new nonce, so any prior claim or spent flag
-                // must be cleared with it.
+                // must be cleared with it — and a fresh DIAL BUDGET (QURATOR-197): renewal of the
+                // authorization renews the retries it pays for.
                 claimed_by: None,
                 spent: false,
+                dial_attempts: 0,
+                dial_last_fail_unix: 0,
             },
         );
         self.save_manifest_asks(&m)
@@ -1241,6 +1262,42 @@ impl DataStore {
             }
         }
         Ok(())
+    }
+
+    /// QURATOR-197 (F19) — record one FAILED DIAL against the ask `(npub, author, slug)`, so the
+    /// fetch driver's redeem poll backs off instead of re-dialling the same ticket every 300 s
+    /// forever. The companion gate lives in `fetch_driver::redeem_dial_ready`.
+    ///
+    /// **Counts only failures that actually reached a dial.** The caller cannot tell a post-claim
+    /// failure (endpoint/fetch/accept — a real dial attempt) from a pre-claim refusal
+    /// (Unsolicited/Spent/ClaimedByAnother — no dial happened), so the discriminator is read here,
+    /// from the durable state `claim_manifest_ask` itself wrote, rather than re-derived at the
+    /// call site: `claimed_by == request_id` can only ever have been written by a **Granted**
+    /// claim of this exact ticket (the claim sets it after the nonce and spent checks passed), and
+    /// a spent ask is terminal. A refusal therefore lands here as a silent no-op — a stale-nonce
+    /// wrap replayed by the relay every poll must not burn the CURRENT ask's dial budget.
+    ///
+    /// Silently `Ok(())` when there is nothing to count (missing ask, unclaimed, someone else's
+    /// ticket, spent): this is bookkeeping for a backoff, never a failure the caller should surface.
+    pub fn note_failed_dial(
+        &self,
+        npub: &str,
+        author: &str,
+        slug: &str,
+        request_id: &str,
+    ) -> Result<()> {
+        let _guard = MANIFEST_ASKS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut m = self.load_manifest_asks()?;
+        let Some(ask) = m.get_mut(&manifest_ask_key(npub, author, slug)) else { return Ok(()) };
+        if ask.spent || ask.claimed_by.as_deref() != Some(request_id) {
+            return Ok(());
+        }
+        ask.dial_attempts += 1;
+        ask.dial_last_fail_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.save_manifest_asks(&m)
     }
 
     // ── Issued transport tickets (M18 W4) — DELETED 2026-09-03, QURATOR-177 Option E (owner
@@ -1324,6 +1381,25 @@ pub struct ManifestAsk {
     /// Answered. Durable, so a restart cannot resurrect the authorization.
     #[serde(default)]
     pub spent: bool,
+    /// QURATOR-197 (F19) — failed redemption DIALS recorded against this ask. The fetch driver's
+    /// 300 s poll re-reads the wrap from the relay every tick and, before these two fields, a
+    /// permanently-failing ticket was re-dialled forever: `claim_manifest_ask` re-grants the same
+    /// `request_id` and only a SUCCESS spends. Mirrors `peer_wave`'s per-candidate convention
+    /// (attempts + last-attempt + exponential backoff + a small cap) — see
+    /// `fetch_driver::redeem_dial_ready`.
+    ///
+    /// **Persisted, not in-memory like the driver's `AskState`, deliberately**: both halves of the
+    /// loop survive a restart — this ask on disk, the wrap on the relay — so a process-lifetime
+    /// counter would reset exactly when the storm does not. Persisted-with-a-bound, the
+    /// `answered_asks` precedent: no new map entries (a field on a row the user's own ask
+    /// created), the gate stops incrementing once the cap is hit, and a fresh ask
+    /// (`record_manifest_ask`) resets both — so it can grow in neither entries nor value.
+    #[serde(default)]
+    pub dial_attempts: u32,
+    /// Unix seconds of the most recent failed dial (`0` = never) — wall clock, not `Instant`,
+    /// because the backoff must hold across a restart.
+    #[serde(default)]
+    pub dial_last_fail_unix: u64,
 }
 
 /// Why a redemption may not proceed. Anything but [`AskClaim::Granted`] must not dial.
@@ -1794,6 +1870,7 @@ pub(crate) mod tests {
             big_relay_url: "ws://big.example:7777".into(),
             swarm_caching: true,
             serving_notice_acknowledged: true,
+            known_default_relays: vec!["wss://offered.example".into()],
         };
         store.save_settings(&s).unwrap();
         let r = store.load_settings().unwrap().unwrap();
@@ -1811,6 +1888,15 @@ pub(crate) mod tests {
         // (the save would drop the field, and the reload would read the `false` default).
         assert!(r.swarm_caching, "swarm_caching preserved");
         assert!(r.serving_notice_acknowledged, "serving_notice_acknowledged preserved");
+        // MUTATION (P-10): on the `pub known_default_relays: Vec<String>,` field in the
+        // `Settings` struct above, change `#[serde(default)]` to `#[serde(skip_serializing)]` —
+        // this assert reds (the save would drop the QURATOR-208 watermark, and the reload would
+        // read the empty serde default, un-stranding nothing and resurrecting every upgrade).
+        assert_eq!(
+            r.known_default_relays,
+            vec!["wss://offered.example".to_string()],
+            "the QURATOR-208 known-defaults watermark round-trips (a dropped field would reset it)"
+        );
     }
 
     #[test]
@@ -2392,6 +2478,8 @@ pub(crate) mod tests {
                     nonce: "n-1".into(),
                     claimed_by: None,
                     spent: false,
+                    dial_attempts: 0,
+                    dial_last_fail_unix: 0,
                 },
             )]),
         )
