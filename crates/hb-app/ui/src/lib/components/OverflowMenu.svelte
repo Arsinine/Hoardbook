@@ -1,4 +1,7 @@
 <script lang="ts">
+	import { tick } from 'svelte';
+	import { menuPosition } from '../menu-position.js';
+
 	// M15 W3 — the reusable `⋯` overflow-menu shell extracted from CollectionRow. Renders
 	// position:fixed (anchored to the trigger via getBoundingClientRect) so no `overflow:hidden`
 	// ancestor can clip it, with a full-viewport backdrop and Escape to close. The menu *contents*
@@ -14,13 +17,26 @@
 	let { open, anchor, onclose, minWidth = '190px', children }: Props = $props();
 
 	let pos = $state({ top: 0, left: 0 });
+	let menuEl = $state<HTMLDivElement | undefined>(undefined); // set by bind:this while the {#if open} branch renders
 
-	// Recompute placement each time it opens (anchor may have scrolled since last time).
+	// Recompute placement each time it opens (anchor may have scrolled since last time). The menu
+	// is only measurable once the {#if open} branch has rendered, so this waits one tick before
+	// reading menuEl's rect — a same-tick read returns all zeros and the edge flip would never
+	// fire. If it closed again before the tick landed, menuEl is undefined — guard, don't assume.
 	$effect(() => {
-		if (open && anchor) {
-			const r = anchor.getBoundingClientRect();
-			pos = { top: r.bottom + 4, left: Math.max(8, r.right - 200) };
-		}
+		if (!open || !anchor) return;
+		const a = anchor;
+		void (async () => {
+			await tick();
+			if (!menuEl) return;
+			const r = a.getBoundingClientRect();
+			const m = menuEl.getBoundingClientRect();
+			pos = menuPosition(
+				{ top: r.top, right: r.right, bottom: r.bottom },
+				{ width: m.width, height: m.height },
+				{ width: window.innerWidth, height: window.innerHeight },
+			);
+		})();
 	});
 
 	// Escape closes. Capture phase + stopPropagation so an open menu consumes Escape as the topmost
@@ -40,7 +56,7 @@
 {#if open}
 	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
 	<div class="menu-backdrop" onclick={onclose}></div>
-	<div class="overflow-menu" role="menu" style="top:{pos.top}px; left:{pos.left}px; min-width:{minWidth}">
+	<div class="overflow-menu" role="menu" bind:this={menuEl} style="top:{pos.top}px; left:{pos.left}px; min-width:{minWidth}">
 		{@render children()}
 	</div>
 {/if}
