@@ -84,6 +84,12 @@ describe('QURATOR-209 — OverflowMenu placement wiring', () => {
 		const anchor = document.createElement('button');
 		const anchorRect = { top: 760, right: 1196, bottom: 790, left: 1166, width: 30, height: 30 };
 		const menuRect = { top: 0, left: 0, right: 240, bottom: 120, width: 240, height: 120 };
+		// Capture and restore the viewport: a sibling test file in the full suite run redefines
+		// window.innerHeight, and without restoring it this assertion silently took the NO-flip
+		// branch (794px = anchor.bottom + 4) while passing in isolation. Test pollution, not a
+		// product defect -- but it made the wiring proof vacuous in exactly the run that matters.
+		const origW = Object.getOwnPropertyDescriptor(window, 'innerWidth');
+		const origH = Object.getOwnPropertyDescriptor(window, 'innerHeight');
 		Object.defineProperty(window, 'innerWidth', { value: 1200, configurable: true });
 		Object.defineProperty(window, 'innerHeight', { value: 800, configurable: true });
 		const orig = HTMLElement.prototype.getBoundingClientRect;
@@ -101,6 +107,8 @@ describe('QURATOR-209 — OverflowMenu placement wiring', () => {
 			expect(el.style.left).toBe('952px'); // right-clamped: 1200 - 240 - 8
 		} finally {
 			HTMLElement.prototype.getBoundingClientRect = orig;
+			if (origW) Object.defineProperty(window, 'innerWidth', origW);
+			if (origH) Object.defineProperty(window, 'innerHeight', origH);
 		}
 	});
 });

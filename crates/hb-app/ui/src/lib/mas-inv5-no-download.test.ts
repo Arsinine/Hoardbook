@@ -34,12 +34,20 @@ describe('MAS-INV-5 — no Download affordance in the browse/paywall surface', (
 		expect(offenders).toEqual([]);
 	});
 
-	it('the paywall offers the "ask by DM" + "import" affordances (never a download)', () => {
-		// Positive assertion: the ratified "get the rest" affordances are present, so a regression that
-		// removed them (or swapped in a Download) is caught, not just the negative word-scan.
+	it('the paywall explains the cap and shows fetch progress — and still never a download', () => {
+		// RE-AIMED by QURATOR-203 (owner ruling: fetch and serve are automatic now, so all nine
+		// manual round-trip buttons were dead chrome and were removed). This was a POSITIVE control
+		// on "Ask the owner for the full list" / "Import a manifest file you received"; those
+		// affordances are gone by design, and the control caught their removal exactly as intended.
+		//
+		// It is re-pointed, not deleted: what must survive is the panel's INFORMATIONAL half — the
+		// hidden-count explanation and the QURATOR-159 byte-progress branch, which is now the only
+		// signal that the background fetch is running. A regression that silently emptied the panel
+		// (or swapped in a Download) is still caught.
 		const src = browseSrc();
-		expect(src).toContain('Ask the owner for the full list');
-		expect(src).toContain('Import a manifest file you received');
+		expect(src).toContain('more item');
+		expect(src).toContain('too large to publish in full');
+		expect(src).toMatch(/paywall-(fade|lock|note)/);
 	});
 });
 
