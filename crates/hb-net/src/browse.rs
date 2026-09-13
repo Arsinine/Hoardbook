@@ -254,7 +254,7 @@ pub async fn browse_share_code(
 /// `ws://localhost` strfry is a pool member, so harness browses are unaffected by the guard; a
 /// peer-advertised `ws://localhost` is refused). Pure, so the partition + guard are unit-testable
 /// without a relay.
-pub(crate) fn scope_peer_relays(pooled: &[String], resolved: &[String]) -> Vec<String> {
+pub fn scope_peer_relays(pooled: &[String], resolved: &[String]) -> Vec<String> {
     resolved
         .iter()
         .filter(|r| !pooled.contains(r) && validate_relay_url(r).is_ok())

@@ -29,7 +29,7 @@ use nostr::prelude::*;
 use serde::Serialize;
 use tauri::State;
 
-use hb_net::{unwrap_dm, wrap_dm, RelayClient};
+use hb_net::{scope_peer_relays, unwrap_dm, wrap_dm, RelayClient};
 
 use crate::{
     dm_cache_store::{CachedDm, DmCache},
@@ -100,9 +100,21 @@ pub(crate) async fn build_dm(
 }
 
 /// Send a DM: build the gift wrap and deliver it to the **recipient's NIP-65 read-relays** (their
-/// inbox) ∪ your own/seed (spec §9, M12 W2). Resolves the recipient's read relays, `ensure_relays`
-/// them onto the shared pool, then **targets** the publish (`publish_to`) so the wrap reaches the
-/// inbox + your own relays but **not** every accreted relay (the metadata-spread guard, chorus #3).
+/// inbox) ∪ your own/seed (spec §9, M12 W2). Resolves the recipient's read relays, then **targets**
+/// the publish (`publish_to`) so the wrap reaches the inbox + your own relays but **not** every
+/// accreted relay (the metadata-spread guard, chorus #3).
+///
+/// QURATOR-201: the target set is peer-influenced (the recipient's own NIP-65 read-relay list), so
+/// it is never handed to the shared client's `ensure_relays` — that would `add_relay` a
+/// recipient-chosen URL onto the SAME persistent pool every later identity-bearing fetch
+/// (`{kinds:[1059], #p:[me]}`) is issued against, permanently (same leak shape as QURATOR-196's
+/// `browse_share_code`, and `publish_to`'s own doc comment used to endorse exactly this
+/// `ensure_relays`-then-`publish_to` idiom). Instead: targets already in the shared pool are
+/// published on the shared client directly; any target NOT already pooled (`scope_peer_relays`) is
+/// published through a DEDICATED, EPHEMERAL client with a throwaway identity, connected only for
+/// this send and disconnected after — the peer's relay never receives anything addressed to our
+/// real npub via the shared pool.
+///
 /// **Honest limit:** if the recipient never published a NIP-65 list, delivery falls back to own/seed
 /// (best-effort — works when the two parties' sets overlap). Returns the wrap.
 pub(crate) async fn send_dm_inner(
@@ -135,13 +147,59 @@ pub(crate) async fn send_dm_inner(
         target_relays = targets.len(),
         "dm: publishing gift wrap to recipient inbox ∪ own relays"
     );
-    client.ensure_relays(&targets, timeout).await?;
-    client.publish_to(&wrap, &targets).await?;
+    deliver_dm(client, &wrap, &targets, timeout).await?;
     tracing::info!(
         recipient = %crate::logging::trunc_npub(&npub_of(recipient)),
         "dm: delivered"
     );
     Ok(wrap)
+}
+
+/// Publish `wrap` to `targets` without ever `ensure_relays`ing a not-yet-pooled, peer-influenced
+/// relay onto the shared `client` (QURATOR-201 — see [`send_dm_inner`]'s doc comment for the full
+/// rationale). Already-pooled targets publish on the shared client directly; any target NOT already
+/// pooled ([`scope_peer_relays`]) is published through a dedicated ephemeral client, connected only
+/// for this send and disconnected after. Best-effort merge (mirrors `browse_share_code`'s
+/// dual-source read): fails only if EVERY target — pooled and scoped — was rejected.
+async fn deliver_dm(
+    client: &RelayClient,
+    wrap: &Event,
+    targets: &[String],
+    timeout: std::time::Duration,
+) -> Result<(), hb_net::NetError> {
+    let pooled: Vec<String> = targets
+        .iter()
+        .filter(|t| client.relays().contains(t))
+        .cloned()
+        .collect();
+    let scoped = scope_peer_relays(client.relays(), targets);
+
+    let mut delivered = false;
+    let mut last_err: Option<hb_net::NetError> = None;
+    if !pooled.is_empty() {
+        match client.publish_to(wrap, &pooled).await {
+            Ok(_) => delivered = true,
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if !scoped.is_empty() {
+        match hb_net::RelayClient::connect(&hb_core::Identity::generate(), &scoped, timeout).await {
+            Ok(ephemeral) => {
+                let result = ephemeral.publish_to(wrap, &scoped).await;
+                ephemeral.disconnect().await;
+                match result {
+                    Ok(_) => delivered = true,
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if !delivered {
+        return Err(last_err
+            .unwrap_or_else(|| hb_net::NetError::NoRelayConnected("no target relays for publish_to".into())));
+    }
+    Ok(())
 }
 
 /// SSRF-filter the DM delivery targets (QURATOR-113 #21). `resolve_recipient_relays` merges the
@@ -168,6 +226,13 @@ fn dm_delivery_targets(own_relays: &[String], targets: Vec<String>) -> Vec<Strin
 /// filter doesn't track). `decode_dms` regained a production caller with the QURATOR-137 slice 3
 /// auto-approve loop (`auto_approve.rs`), which has no cache to merge into and needs exactly this
 /// sender-attributed decode.
+///
+/// QURATOR-204 note: unlike `merge_wraps_into_cache` (QURATOR-187's kind guard at line ~492), this
+/// function has NO kind-dispatch guard — it decodes every gift wrap regardless of `dm.kind`. Today
+/// that's harmless because the only caller (`auto_approve.rs`) doesn't feed the chat/unread badge
+/// path. Any future caller that DOES display these as chat would leak key-grant (31_114) and
+/// private-listing (31_113) payloads the same way QURATOR-187 fixed for the cache path — add the
+/// same `if dm.kind != Kind::PrivateDirectMessage { continue }` guard here first.
 pub(crate) async fn decode_dms(
     own_npub: &str,
     identity: &hb_core::Identity,
@@ -2081,6 +2146,54 @@ mod tests {
             "inner rumor must be kind 14 (private direct message)"
         );
         assert_eq!(unwrapped.sender, alice.public_key(), "rumor sender is the real npub");
+    }
+
+    // QURATOR-201: `deliver_dm` is `send_dm_inner`'s publish half (see its own doc comment for the
+    // full leak rationale) — the same shape as QURATOR-196's `browse_share_code` fix, adapted to a
+    // publish rather than a fetch. Offline by construction: `shared` is `undialed` (relays
+    // registered in the pool, never dialled), so `publish_to` on either client will error against
+    // an unreachable relay — `deliver_dm`'s own `Result` is discarded, exactly as
+    // `browse_never_adds_a_peer_advertised_relay_to_the_shared_identity_pool` discards
+    // `browse_share_code`'s. The assertion is purely about shared-pool membership after the call,
+    // which is the surface every pool-wide identity fetch (`{kinds:[1059], #p:[me]}`) is issued to.
+    // A recipient-supplied relay (a URL that arrives via the recipient's own NIP-65 list, resolved
+    // by `resolve_recipient_relays` before this function is ever called) is indistinguishable, once
+    // it lands in `targets`, from any other not-yet-pooled entry `scope_peer_relays` sees — the
+    // sentinel below stands directly for that URL, one call closer to the fix than a full
+    // `resolve_recipient_relays` round-trip could get without a live relay serving a signed kind
+    // 10002 event (not available to an offline unit test).
+    //
+    // PRODUCTION MUTATION THAT MUST RED THIS (§9 / P-10): in `deliver_dm`, delete the `pooled`/
+    // `scoped` partition and the two `if !X.is_empty()` dispatch blocks, replacing the whole body
+    // with the pre-fix idiom: `client.ensure_relays(targets, timeout).await?; client.publish_to(wrap,
+    // targets).await?; Ok(())`. `ensure_relays`'s `add_relay` succeeds without dialling,
+    // `wss://peer-outbox.example` joins the shared pool, and this `assert_eq!` fails. The
+    // orchestrator applies that edit, confirms the red on
+    // `send_dm_inner_never_adds_a_recipient_relay_to_the_shared_identity_pool`, and reverts.
+    #[tokio::test]
+    async fn send_dm_inner_never_adds_a_recipient_relay_to_the_shared_identity_pool() {
+        let me = Identity::generate();
+        let shared = RelayClient::undialed(&me, &["wss://configured.example".to_string()]).await;
+        let before = shared.pool_urls().await;
+        assert_eq!(before, vec!["wss://configured.example".to_string()]);
+
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let wrap = build_dm(&alice, &bob.public_key(), "back room is open").await.unwrap();
+        // Stand-in for the recipient's resolved NIP-65 read-relay list: one pooled relay, one
+        // not — exactly the shape `resolve_recipient_relays` would hand `deliver_dm` if the
+        // recipient's outbox included a relay we hadn't already dialled.
+        let targets = vec![
+            "wss://configured.example".to_string(),
+            "wss://peer-outbox.example".to_string(),
+        ];
+        let _ = deliver_dm(&shared, &wrap, &targets, std::time::Duration::from_secs(2)).await;
+
+        let after = shared.pool_urls().await;
+        assert_eq!(
+            after, before,
+            "a recipient-advertised relay must never join the shared pool: pool membership IS the              delivery set for the identity gift-wrap read (`#p:[me]`, priv_browse)"
+        );
     }
 
     #[tokio::test]

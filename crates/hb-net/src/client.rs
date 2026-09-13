@@ -592,13 +592,13 @@ impl RelayClient {
         &self.relays
     }
 
-    /// Test-only (QURATOR-196): build a client whose relays are REGISTERED in the nostr pool but
-    /// never dialed — `connect` without the handshake race — so an offline unit test can observe
-    /// **pool membership** (the leak shape: pool members are exactly the relays every pool-wide
-    /// fetch, including the `{kinds:[1059], #p:[me]}` private-inbox read, is issued to) without
-    /// standing up a relay. `add_relay` alone does not dial; only `try_connect` does.
-    #[cfg(test)]
-    pub(crate) async fn undialed(identity: &Identity, relays: &[String]) -> Self {
+    /// Build a client whose relays are REGISTERED in the nostr pool but never dialed — `connect`
+    /// without the handshake race — so an offline unit test (QURATOR-196, QURATOR-201; usable
+    /// cross-crate since both are outside hb-net) can observe **pool membership** (the leak shape:
+    /// pool members are exactly the relays every pool-wide fetch, including the `{kinds:[1059],
+    /// #p:[me]}` private-inbox read, is issued to) without standing up a relay. `add_relay` alone
+    /// does not dial; only `try_connect` does.
+    pub async fn undialed(identity: &Identity, relays: &[String]) -> Self {
         let client = Client::builder().signer(identity.keys().clone()).build();
         for r in relays {
             client
@@ -614,12 +614,11 @@ impl RelayClient {
         }
     }
 
-    /// Test-only (QURATOR-196): the URLs currently in the underlying nostr pool, canonicalized —
-    /// the honest view of "who would receive a pool-wide fetch", unlike [`Self::relays`] (the
-    /// configured set) and [`Self::relay_status`] (which deliberately reports configured relays
-    /// only). This is the sentinel surface the leak tests assert on.
-    #[cfg(test)]
-    pub(crate) async fn pool_urls(&self) -> Vec<String> {
+    /// The URLs currently in the underlying nostr pool, canonicalized — the honest view of "who
+    /// would receive a pool-wide fetch", unlike [`Self::relays`] (the configured set) and
+    /// [`Self::relay_status`] (which deliberately reports configured relays only). This is the
+    /// sentinel surface the leak tests (QURATOR-196, QURATOR-201) assert on.
+    pub async fn pool_urls(&self) -> Vec<String> {
         let mut urls: Vec<String> = self
             .client
             .relays()
