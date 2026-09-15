@@ -238,23 +238,29 @@ async fn run_serve(args: &[String]) -> Result<()> {
             eprintln!("[serve] --republish: rewriting the seed tree for E2 (fingerprint will change)");
             republish_e2e_seed(&store, &live_npub, &dir).await?;
         }
-        // Spawn the auto-approve loop. It runs alongside the beacon loop (both selected below).
+        // Spawn the PRODUCTION auto-approve loop — `auto_approve::run_auto_approve_loop`, the exact
+        // task `lib.rs` spawns at startup — NOT the harness copy below. This is what makes a green
+        // WAN-E2E discharge QURATOR-137's §5 gate: the gate is the SHIPPED background decider
+        // answering an unattended request-DM over a real relay, and only the production loop is that
+        // decider. The harness copy proves the approval BODY (`send_full_list_inner`); it does not
+        // prove the loop that decides to call it. (The relay set is read by the production loop from
+        // the store via `net::relay_urls`, and `run_serve` persisted it into Settings above, so the
+        // loop uses THIS run's relays, never the public fallback.)
+        //
+        // The endpoint is a fresh `new_shared_endpoint()` (the carry suite's precedent): this loop
+        // is the SOLE binder of the manifest plane in the serve process — the foreground beacon loop
+        // uses the presence plane — so the double-bind hazard `lib.rs` guards against (two spawns
+        // sharing one transport secret) does not arise here.
         let store_for_approve = store.clone();
-        let shared_relay_approve = net::new_shared();
         let live_npub_approve = live_npub.clone();
-        let relays_approve = relays.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_auto_approve_loop(
-                &store_for_approve,
-                &live_npub_approve,
-                &shared_relay_approve,
-                &relays_approve,
-            )
-            .await
-            {
-                eprintln!("[serve] auto-approve loop exited: {e:#}");
-            }
-        });
+        let shared_relay_approve = net::new_shared();
+        let endpoint_approve = new_shared_endpoint();
+        tokio::spawn(crate::auto_approve::run_auto_approve_loop(
+            store_for_approve,
+            live_npub_approve,
+            shared_relay_approve,
+            endpoint_approve,
+        ));
         // The beacon loop continues in the foreground; the auto-approve loop runs in the spawned task.
         // Both publish to the same relay set via the production path. The beacon keeps presence fresh
         // while the approve loop answers request-DMs.
@@ -1675,5 +1681,52 @@ mod tests {
                  delete it and let the delegated call do the work."
             );
         }
+    }
+
+    /// QURATOR-137 §5 discharge contract: the `--auto-approve` serve spawns PRODUCTION's
+    /// auto-approve loop, never the harness copy. The gate is the SHIPPED background decider
+    /// (`auto_approve::run_auto_approve_loop`, the task `lib.rs` spawns) answering an unattended
+    /// request-DM over a real relay; the harness loop below (`fn run_auto_approve_loop`) proves the
+    /// approval body, not the decider. Repoint the serve spawn back at the harness copy and a green
+    /// WAN-E2E would once again prove nothing about the shipped loop — exactly the 189-shaped
+    /// right-suite-wrong-mechanism gap this guard exists to catch.
+    ///
+    /// Scoped to the `if auto_approve {` region (not the whole file), because the harness loop's own
+    /// DEFINITION contains `fn run_auto_approve_loop` and its FETCH caller writes `super::` — a
+    /// whole-file scan would be satisfied by those and prove nothing. The needle is the CALL FORM
+    /// `auto_approve::run_auto_approve_loop(` (a call, not the bare name), so this test's own prose
+    /// mentioning the symbol cannot supply the hit (the string-literal-in-a-scan-guard trap).
+    ///
+    /// P-10 MUTATION (must red this test): in `run_serve`'s `if auto_approve {` block, change the
+    /// spawn from `crate::auto_approve::run_auto_approve_loop(` back to the harness `run_auto_approve_loop(` —
+    /// the call form vanishes from the region and this test reds.
+    #[test]
+    fn the_e2e_serve_spawns_production_auto_approve_not_the_harness_copy() {
+        let src = include_str!("mod.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Slice the --auto-approve serve region: from `if auto_approve {` to the beacon comment
+        // that closes it ("The beacon loop continues in the foreground").
+        let at = code
+            .find("if auto_approve {")
+            .expect("the --auto-approve serve block must exist");
+        let end = code[at..]
+            .find("The beacon loop continues in the foreground")
+            .expect("the auto-approve block's closing beacon comment must exist")
+            + at;
+        let region = &code[at..end];
+
+        assert!(
+            region.contains("crate::auto_approve::run_auto_approve_loop("),
+            "the --auto-approve serve must spawn PRODUCTION's auto_approve::run_auto_approve_loop, \
+             not the harness copy — QURATOR-137's §5 gate is the shipped decider answering over a \
+             real relay, and only the production loop is that decider. Repointing at the harness \
+             copy makes a green WAN-E2E prove the approval body while proving nothing about the \
+             loop that decides to call it (the 189-shaped gap)."
+        );
     }
 }
