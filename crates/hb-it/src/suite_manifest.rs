@@ -58,11 +58,33 @@ use crate::harness::{now, result, settle, Ctx, FETCH_TIMEOUT};
 use crate::suite_cap::{ensure_budget_matches_hb_app, LISTING_MAX_BYTES};
 use crate::tap::TestResult;
 
+/// The manifest/iroh split budget the app uses (`hb-app::commands::collection::MANIFEST_SPLIT_MAX_BYTES`).
+/// hb-it cannot depend on hb-app, so the value is restated — and pinned to hb-app's source below,
+/// because a silently-restated budget is exactly how MAN4's window would drift out from under the
+/// behaviour it proves. Distinct from `LISTING_MAX_BYTES` (40 KB, the relay anti-ban budget): the
+/// manifest carrier publishes nothing per-part to a relay, so its ceiling is NIP-44's plaintext cap,
+/// and QURATOR-106 is the bug that lived in the gap between the two.
+const MANIFEST_SPLIT_MAX_BYTES: usize = 65_408;
+
+/// Pin the restated manifest budget to hb-app's declaration — the twin of
+/// [`ensure_budget_matches_hb_app`], which pins only the relay budget.
+fn ensure_manifest_budget_matches_hb_app() -> Result<()> {
+    const SRC: &str = include_str!("../../hb-app/src/commands/collection.rs");
+    const DECL: &str = "const MANIFEST_SPLIT_MAX_BYTES: usize = 65_408;";
+    ensure!(
+        SRC.contains(DECL),
+        "hb-app no longer declares `{DECL}` — MAN4's restated manifest budget has drifted from \
+         production, so its (40 KB, 65 KB] overflow window no longer describes the shipped split"
+    );
+    Ok(())
+}
+
 pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
     vec![
         result("MAN1 .hbmanifest file round trip lifts a truncated teaser to the full tree", man1(ctx).await),
         result("MAN2 manifest older than the relay's teaser reads stale, still opens", man2(ctx).await),
         result("MAN3 index-only manifest renders incomplete and fails a foreign author", man3(ctx).await),
+        result("MAN4 large-index manifest: 40 KB split hard-errors, manifest budget succeeds (QURATOR-106)", man4(ctx).await),
     ]
 }
 
@@ -434,5 +456,121 @@ async fn man3(ctx: &Ctx) -> Result<()> {
         full.open(&bk(99), &owner.public_key()).is_err(),
         "the wrong browse key opened the manifest body"
     );
+    Ok(())
+}
+
+/// MAN4 — QURATOR-106: a large collection whose split INDEX lands between the relay budget (40 KB)
+/// and the manifest budget (NIP-44's 65,408-byte plaintext cap). The owner-reported failure was an
+/// index of 66,615 bytes — well under the iroh 16 MB transport ceiling, but over the 40 KB budget
+/// the manifest path was wrongly sharing with the relay anti-ban path. `split_listing` HARD-ERRORS
+/// on an over-budget index (split.rs:327, the exact "the listing index itself is N bytes" message
+/// the owner hit), so this row is a red/green pin in one body:
+///
+///   * at `LISTING_MAX_BYTES` (40 KB, the pre-fix budget) the split MUST error — reproducing the bug;
+///   * at `MANIFEST_SPLIT_MAX_BYTES` (65,408, the fix) the split MUST succeed, and the index part
+///     MUST fall in the (40 KB, 65 KB] window — proving the fix operates on exactly the case that failed.
+///
+/// The window assertion is load-bearing: an index that fit 40 KB would pass the success arm even
+/// against the old budget, so the row would prove nothing. The relay round-trip is kept (teaser
+/// published + browsed back) so this stays a live integration row exercising the cross-crate seam,
+/// not a unit test relocated — the hb-app unit `build_slug_manifest_accepts_an_index_over_40k_...`
+/// already covers the pure-function side; §5's integration half is what this adds.
+///
+/// The fixture mirrors the hb-app unit test's shape: a ~160-char slug inflates each index descriptor
+/// row (`slug#part{i}` + sha256) to ~250 B, so the 40 KB+ index is reached with a manageable part
+/// count, and a ~4 KB note per leaf drives the content size without an enormous entry count.
+async fn man4(ctx: &Ctx) -> Result<()> {
+    ensure_budget_matches_hb_app()?;
+    ensure_manifest_budget_matches_hb_app()?;
+    let owner = Identity::generate();
+    let key = bk(44);
+    // The long slug is the lever on index size; keep it a valid-ish tag but long. ctx.tag keeps runs
+    // from colliding on the relay.
+    let slug = format!("{}-{}", ctx.tag("man4"), "x".repeat(140));
+    let note = "n".repeat(4000);
+    let listing: Vec<DirectoryItem> = (0..3000)
+        .map(|i| DirectoryItem {
+            name: format!("file-{i:05}-padding-padding-padding.mkv"),
+            item_type: ItemType::File,
+            size: Some("12GB".into()),
+            format: Some("MKV".into()),
+            year: Some(1985),
+            tags: Vec::new(),
+            note: Some(note.clone()),
+            children: Vec::new(),
+        })
+        .collect();
+    let col = Collection {
+        slug: slug.clone(),
+        path_alias: "huge".into(),
+        description: None,
+        item_count: listing.len() as u64,
+        est_size: None,
+        content_types: vec!["video".into()],
+        tags: Vec::new(),
+        languages: Vec::new(),
+        visibility: Visibility::Public,
+        sorted: true,
+        last_updated: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
+        listing,
+    };
+    let json = listing_json(&col)?;
+
+    // (1) The bug arm: at the relay budget the index overflows and the split hard-errors — the exact
+    // failure the owner reported. If this does NOT error, the fixture is too small to reach the
+    // window and the row would be vacuous, so a missing error is itself a failure.
+    let at_relay_budget = split_listing(&slug, &json, LISTING_MAX_BYTES);
+    ensure!(
+        at_relay_budget.is_err(),
+        "the fixture's index did NOT overflow the 40 KB relay budget — MAN4 must reach the \
+         (40 KB, 65 KB] window or it proves nothing; grow the slug or the part count"
+    );
+    let msg = format!("{:#}", at_relay_budget.unwrap_err());
+    ensure!(
+        msg.contains("the listing index itself is"),
+        "expected the index-overflow error, got a different split failure: {msg}"
+    );
+
+    // (2) The fix arm: at the manifest budget the split succeeds.
+    let parts: Vec<String> = split_listing(&slug, &json, MANIFEST_SPLIT_MAX_BYTES)?
+        .into_iter()
+        .map(|p| p.json)
+        .collect();
+    ensure!(
+        parts.len() > 2,
+        "the manifest split must yield an index plus content parts, got {}",
+        parts.len()
+    );
+
+    // (3) The window: the index part (parts[0]) must sit in (40 KB, 65 KB]. Below 40 KB the success
+    // arm would have passed under the OLD budget too; above 65 KB it would exceed NIP-44 and fail.
+    let index_len = parts[0].len();
+    ensure!(
+        index_len > LISTING_MAX_BYTES && index_len <= MANIFEST_SPLIT_MAX_BYTES,
+        "the index is {index_len} bytes, expected in ({LISTING_MAX_BYTES}, {MANIFEST_SPLIT_MAX_BYTES}] \
+         — outside the window this row exists to prove"
+    );
+
+    // (4) Integration seam: seal + sign the real parts, then round-trip verify/decrypt/render, so the
+    // large-index envelope is proven readable end-to-end, not just splittable.
+    let fp = snapshot_fingerprint(&col.listing).0;
+    let env = build_manifest_envelope(&owner, &slug, &key, &fp, now(), &parts)?;
+    let imported = write_then_read(ctx, &slug, &env)?;
+    ensure!(imported == env, "the large-index manifest did not survive a file write/read byte-for-byte");
+    let rendered = render_listing(&imported.open(&key, &owner.public_key())?)?;
+    ensure!(
+        rendered.complete(),
+        "the large-index manifest rendered incomplete ({} of {} parts, missing {:?})",
+        rendered.parts_present,
+        rendered.parts_total,
+        rendered.missing
+    );
+    ensure!(
+        rendered.entries.len() == col.listing.len(),
+        "restitched {} of {} entries — the large-index manifest did not restore the whole tree",
+        rendered.entries.len(),
+        col.listing.len()
+    );
+    rendered_to_collection(&rendered)?; // production's import decodes it, not just renders it
     Ok(())
 }
