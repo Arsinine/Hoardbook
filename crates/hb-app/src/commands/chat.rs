@@ -1465,14 +1465,6 @@ pub async fn get_messages(
         (id.npub(), id.identity.clone())
     };
 
-    let allow_dms = store.load_settings().map_err(cmd_err)?.map(|s| s.allow_dms).unwrap_or(true);
-    let contacts: HashSet<String> = store.list_contacts().map_err(cmd_err)?.into_iter().map(|c| c.npub).collect();
-    let blocked: HashSet<String> = store.load_dm_blocked().map_err(cmd_err)?.into_iter().collect();
-    let declined: HashSet<String> =
-        store.load_dm_declined().map_err(cmd_err)?.into_iter().map(|(n, _)| n).collect();
-
-    let ctx = DmClassifyCtx { contacts: &contacts, blocked: &blocked, declined: &declined, allow_strangers: allow_dms };
-
     // devtest v0.12.4 #2: load the at-rest cache and fetch only wraps newer than what we've already
     // decoded — a `since`-bounded incremental read on the persistent shared client, not the old
     // whole-mailbox pull + full re-decrypt every poll. Received contact messages come from the cache
@@ -1484,7 +1476,56 @@ pub async fn get_messages(
     // just costs one extra re-fetched wrap (deduped by wrap id below), never a lost message.
     let cursor = store.load_dm_cache(&id_clone).map_err(cmd_err)?.newest_seen_outer.min(now);
     let filter = dm_inbox_filter(id_clone.public_key(), cursor);
-    let wraps = client.fetch(filter, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
+    // QURATOR-272: the relationship snapshot lives INSIDE `get_messages_inner`, taken after this
+    // fetch resolves — a block/decline that lands inside the multi-second fetch window is honoured
+    // by this poll, not the next one. The fetch passes as an injected future (the
+    // `send_dm_and_cache_inner` seam convention) so the inner owns the snapshot-to-classify ordering.
+    get_messages_inner(
+        &store,
+        &id_clone,
+        &own_npub,
+        async { client.fetch(filter, net::RELAY_TIMEOUT).await.map_err(cmd_err) },
+        now,
+    )
+    .await
+}
+
+/// The post-fetch half of `get_messages` (QURATOR-272): await the relay fetch, then — and only
+/// then — snapshot the classification state and classify. The fetch arrives as an injected future
+/// so tests can land a block "mid-fetch" and pin that classification honours it.
+///
+/// Why the snapshot belongs after the fetch: the fetch is bounded by `net::RELAY_TIMEOUT`
+/// (multi-second), and `get_messages` used to read `contacts`/`blocked`/`declined` into a
+/// `DmClassifyCtx` BEFORE it — so a block/unblock/decline/undecline landing inside that window was
+/// invisible to the poll: `merge_wraps_into_cache` classified the newly-fetched wraps (persisting
+/// route decisions into `dm_cache.json`/`dm_requests.json`) and the returned `cached_inbox`
+/// re-filtered the cache, both under the pre-fetch sets. The harmful direction: a peer blocked
+/// mid-fetch had that poll's message land in the inbox — a deliberate user action ignored. Both
+/// consumers below use this ONE post-fetch snapshot (fresh classification with a stale returned
+/// inbox would be a half-fix).
+///
+/// Locking: `blocked`/`declined` are read holding their mutation locks (`DM_DECLINED_LOCK` then
+/// `DM_BLOCKED_LOCK` — the documented decline-before-block order, so no lock-order cycle with
+/// `dm_block_inner`, which takes them the same way; nobody holds either while awaiting
+/// `DM_CACHE_LOCK`, so taking them inside this `DM_CACHE_LOCK` section cannot deadlock either).
+/// That serializes the read against a concurrent block/unblock/decline transaction AND prevents a
+/// torn read of `dm_block_inner`'s two-file write (it saves the cleared decline record before the
+/// added blocklist entry; an unlocked read between the two saves would observe "neither declined
+/// nor blocked" and mis-file the wrap as a Request). Contacts have no mutation lock to serialize
+/// against (`save_contact` is unguarded), so that one read is unsynchronized. **Residual, named:
+/// a block landing between this snapshot and the classification below still misses this poll** —
+/// the window is narrowed from the multi-second relay fetch to the local classify span (the merge
+/// awaits `unwrap_dm` per wrap, so milliseconds), not closed. The next poll recovers the VIEW
+/// (`cached_inbox` re-filters at read time under then-current sets); what persists is the wrap
+/// residency decision made here.
+pub(crate) async fn get_messages_inner(
+    store: &DataStore,
+    identity: &hb_core::Identity,
+    own_npub: &str,
+    fetch: impl std::future::Future<Output = Result<Vec<Event>, String>>,
+    now: u64,
+) -> CmdResult<Vec<ReceivedMessage>> {
+    let wraps = fetch.await?;
 
     // M2: reload + merge + save is ONE atomic transaction behind `DM_CACHE_LOCK`, taken only after
     // the (potentially slow) relay fetch returns — no relay I/O happens while the lock is held.
@@ -1492,20 +1533,36 @@ pub async fn get_messages(
     // the race: a `persist_sent_dm`/request-accept transaction that ran while the fetch was in flight
     // must not be clobbered by a save based on stale pre-fetch state.
     let guard = DM_CACHE_LOCK.lock().await;
-    let mut cache = store.load_dm_cache(&id_clone).map_err(cmd_err)?;
+    let mut cache = store.load_dm_cache(identity).map_err(cmd_err)?;
     // Heal a poisoned/future cursor before it drives the next fetch window (a stale install may carry
     // one).
     let healed = cache.newest_seen_outer > now;
     if healed {
         cache.newest_seen_outer = now;
     }
-    let (requests, merged) = merge_wraps_into_cache(&id_clone, &own_npub, wraps, &ctx, &mut cache, now).await;
+
+    // QURATOR-272: the classification snapshot — taken AFTER the fetch resolved (see this fn's doc
+    // for the locking and the named residual window).
+    let (contacts, blocked, declined, allow_dms) = {
+        let _declined_guard = DM_DECLINED_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _blocked_guard = DM_BLOCKED_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let contacts: HashSet<String> =
+            store.list_contacts().map_err(cmd_err)?.into_iter().map(|c| c.npub).collect();
+        let blocked: HashSet<String> = store.load_dm_blocked().map_err(cmd_err)?.into_iter().collect();
+        let declined: HashSet<String> =
+            store.load_dm_declined().map_err(cmd_err)?.into_iter().map(|(n, _)| n).collect();
+        let allow_dms = store.load_settings().map_err(cmd_err)?.map(|s| s.allow_dms).unwrap_or(true);
+        (contacts, blocked, declined, allow_dms)
+    };
+    let ctx = DmClassifyCtx { contacts: &contacts, blocked: &blocked, declined: &declined, allow_strangers: allow_dms };
+
+    let (requests, merged) = merge_wraps_into_cache(identity, own_npub, wraps, &ctx, &mut cache, now).await;
     let pruned = cache.prune();
     // Only re-seal + write when something actually changed — an idle 3s poll (all wraps already seen)
     // leaves the cache untouched, so it costs no disk write / re-encrypt. The explicit dirty flags
     // catch a balanced push+prune the length tuple alone would miss.
     if healed || merged || pruned {
-        store.save_dm_cache(&id_clone, &cache).map_err(cmd_err)?;
+        store.save_dm_cache(identity, &cache).map_err(cmd_err)?;
     }
     drop(guard); // release before the separate-file Request-bucket write below (its own DM_REQUESTS_LOCK)
 
@@ -1513,14 +1570,16 @@ pub async fn get_messages(
         // DM_REQUESTS_LOCK: see the lock's doc — serializes against accept/decline/block on the same
         // `dm_requests.json`.
         let _guard = DM_REQUESTS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let existing = store.load_dm_requests(&id_clone).map_err(cmd_err)?;
+        let existing = store.load_dm_requests(identity).map_err(cmd_err)?;
         let merged = merge_into_requests(existing, requests, now_secs());
-        store.save_dm_requests(&id_clone, &merged).map_err(cmd_err)?;
+        store.save_dm_requests(identity, &merged).map_err(cmd_err)?;
     }
 
-    // Return the received-contact inbox from the cache, reclassified under the current contacts/blocked
-    // sets (so a since-blocked/removed contact's cached messages are hidden — §8/Q7 stays authoritative).
-    Ok(cached_inbox(&cache, &own_npub, &contacts, &blocked))
+    // Return the received-contact inbox from the cache, reclassified under the SAME post-fetch
+    // snapshot the merge just used (so a since-blocked/removed contact's cached messages are
+    // hidden — §8/Q7 stays authoritative — and the returned view can never be staler than what
+    // was persisted above).
+    Ok(cached_inbox(&cache, own_npub, &contacts, &blocked))
 }
 
 // ---------------------------------------------------------------------------
@@ -2570,6 +2629,101 @@ mod tests {
         assert_eq!(inbox2[0].from, "npub1b");
         // A non-contact's cached messages never surface (e.g. after removing them).
         assert!(cached_inbox(&cache, own, &HashSet::new(), &HashSet::new()).is_empty());
+    }
+
+    // ── QURATOR-272 — the inbox poll classifies under post-fetch block state ────────────────────
+
+    /// QURATOR-272 — a block landing while the poll's relay fetch is in flight must be honoured by
+    /// THAT poll, not the next one. Production order is: `get_messages` builds the client and awaits
+    /// the fetch, then calls `get_messages_inner`, which snapshots relationships AFTER the fetch
+    /// resolves. Here the fetch future itself performs the block — the block lands mid-fetch, after
+    /// any pre-fetch snapshot would have been taken and before classification: the exact
+    /// interleaving the bug allowed. The peer is a CONTACT, so under a stale pre-block snapshot
+    /// their wrap routes `Inbox` (the harmful direction — a message from someone the user just
+    /// blocked, persisted into `dm_cache.json` and returned), while under the post-fetch snapshot
+    /// `route_dm` consults `blocked` FIRST and drops it.
+    ///
+    /// P-10 mutation (stated, NOT run — orchestrator gates it on the settled tree): in
+    /// `get_messages_inner`, in the region between `let wraps = fetch.await?;` and
+    /// `merge_wraps_into_cache(identity, ...)`, move the whole
+    /// `let (contacts, blocked, declined, allow_dms) = { … }` snapshot block AND the
+    /// `let ctx = DmClassifyCtx { … }` line that follows it ABOVE `let wraps = fetch.await?;` (the
+    /// top of the function body) — reverting QURATOR-272 to the pre-fetch snapshot. Expected red:
+    /// the `inbox.is_empty()` assert fails (the mid-fetch-blocked contact's wrap is returned) and
+    /// the `cache.messages` assert fails (the wrap is persisted as an Inbox entry). Anchor the
+    /// mutation by this line region, never by bare text — this comment names the same symbols.
+    #[tokio::test]
+    async fn get_messages_inner_honours_a_block_landed_mid_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
+        let peer = Identity::generate();
+
+        // The peer is a contact (the `dm_request_accept_inner` construction) — under a stale
+        // snapshot their DM classifies Inbox, not Request.
+        let npub = peer.npub();
+        let hash = CachedPeer::pubkey_hash(&npub);
+        store
+            .save_contact(
+                &hash,
+                &CachedPeer {
+                    npub: npub.clone(),
+                    source: ContactSource::Manual,
+                    browse_key_hex: None,
+                    petname: None,
+                    profile: None,
+                    collections: vec![],
+                    listings_state: Default::default(),
+                    online: false,
+                    last_fetched: chrono::Utc::now(),
+                    last_presence: None,
+                    local_tags: vec![],
+                    fingerprint: None,
+                },
+            )
+            .unwrap();
+
+        // Positive control (anti-vacuous): through this same seam, with no block, the contact's
+        // wrap IS delivered — proving the plumbing (wrap build, contact save, seam call) delivers
+        // messages, so the later empty-inbox assert can only be the block doing its job.
+        let wrap_ok = build_dm(&peer, &me.public_key(), "before the block").await.unwrap();
+        let now = now_secs();
+        let inbox_ok =
+            get_messages_inner(&store, &me, &me.npub(), std::future::ready(Ok(vec![wrap_ok])), now)
+                .await
+                .unwrap();
+        assert_eq!(inbox_ok.len(), 1, "control: an unblocked contact's mid-poll DM is delivered");
+        assert_eq!(inbox_ok[0].from, npub);
+
+        // The race: a SECOND wrap fetched while the user blocks the peer. `dm_block_inner` runs
+        // inside the fetch future — i.e. after the poll's snapshot point (pre-fix: pre-fetch) and
+        // before classification.
+        let wrap_raced = build_dm(&peer, &me.public_key(), "during the fetch").await.unwrap();
+        let raced_id = wrap_raced.id.to_hex();
+        let store_b = store.clone();
+        let me_b = me.clone();
+        let npub_b = npub.clone();
+        let fetch_with_block = async move {
+            dm_block_inner(&store_b, &me_b, npub_b).unwrap();
+            Ok(vec![wrap_raced])
+        };
+        let inbox =
+            get_messages_inner(&store, &me, &me.npub(), fetch_with_block, now_secs()).await.unwrap();
+        assert!(
+            inbox.is_empty(),
+            "QURATOR-272: a peer blocked mid-fetch has BOTH wraps hidden from the returned inbox — \
+             the freshly-fetched one never lands, and the previously-cached one is re-filtered out \
+             by the same post-fetch blocked set (the returned view is not a half-fix)"
+        );
+        let cache = store.load_dm_cache(&me).unwrap();
+        assert!(
+            cache.messages.iter().all(|m| m.wrap_id != raced_id),
+            "the mid-fetch wrap is never persisted as an Inbox entry (route_dm consults blocked first)"
+        );
+        assert!(
+            store.load_dm_requests(&me).unwrap().iter().all(|b| b.npub != npub),
+            "blocked supersedes the stranger-Request path — no bucket is minted either"
+        );
     }
 
     // ── Q7 — the Request-inbox `_inner` fns (no Tauri State) ────────────────────────────────────
