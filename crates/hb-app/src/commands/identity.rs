@@ -197,11 +197,50 @@ fn write_backup_file(path: &str, archive: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, archive)
 }
 
+/// Pre-read size cap on a backup file selected for restore (QURATOR-238). The tar-bomb caps in
+/// `crate::backup` (`MAX_TOTAL_BYTES` and friends) run on the *parsed archive contents*, i.e. only
+/// after the whole file is already in memory — a bare `fs::read` on a hostile multi-GB file OOMs
+/// before any of them can fire.
+///
+/// The bound is derived from what this app can ever RESTORE, not from what it can write: any
+/// archive that survives `extract_archive` has ≤ `MAX_TOTAL_BYTES` (500 MiB) of declared content
+/// and ≤ `MAX_ENTRIES` (10 000) entries, so with uncompressed tar storage, ≤ ~5 MiB of 512 B
+/// headers, block padding and the AEAD header it cannot exceed 512 MiB. **So a file larger than
+/// this was already un-restorable** — the cap converts an OOM-then-refuse into a refuse-upfront,
+/// and rejects nothing that would otherwise have succeeded.
+///
+/// ⚠ It is NOT true that a legitimate archive cannot approach this bound, and an earlier draft of
+/// this comment claimed so (caught by the 2026-09-16 adversarial review). `backup_inner` enforces
+/// NO write-side cap, and `collect_files` archives everything under the store base — including
+/// `base/manifests/`, whose production cap `DEFAULT_MANIFEST_CACHE_BYTES` is `usize::MAX`, i.e.
+/// the manifest cache never evicts. A user who browses enough collections can therefore have
+/// `backup_data` write an archive this app will refuse to open. That asymmetry is a REAL gap,
+/// filed separately; it is not introduced here (such an archive already failed downstream at
+/// `extract_archive`), and it must not be "fixed" by raising this number — raising it past what
+/// `extract_archive` accepts would restore the OOM this cap exists to prevent.
+const MAX_BACKUP_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Read a backup file whole, but only after `metadata()` confirms it fits
+/// [`MAX_BACKUP_FILE_BYTES`] — the shared first step of `peek_backup` / `validate_backup` /
+/// `restore_data`. Oversized is a clean refusal, never a truncated read (a silently-short read
+/// would corrupt the AEAD frame).
+fn read_backup_file(path: &str) -> Result<Vec<u8>, String> {
+    let len = std::fs::metadata(path)
+        .map_err(|e| format!("Could not read backup file: {e}"))?
+        .len();
+    if len > MAX_BACKUP_FILE_BYTES {
+        return Err(format!(
+            "Backup file is too large to open: {len} bytes (the cap is {MAX_BACKUP_FILE_BYTES} bytes)."
+        ));
+    }
+    std::fs::read(path).map_err(|e| format!("Could not read backup file: {e}"))
+}
+
 /// Does the backup at `path` need a passphrase? Lets the UI decide whether to prompt (cheap — no
 /// KDF). Returns an error for a non-backup / unknown-version file.
 #[tauri::command]
 pub async fn peek_backup(path: String) -> CmdResult<bool> {
-    let archive = std::fs::read(&path).map_err(|e| format!("Could not read backup file: {e}"))?;
+    let archive = read_backup_file(&path)?;
     hb_core::is_encrypted_backup(&archive).map_err(cmd_err)
 }
 
@@ -212,7 +251,7 @@ pub async fn peek_backup(path: String) -> CmdResult<bool> {
 /// irreversible wipe on this instead of the 72-byte header sniff `peek_backup` does.
 #[tauri::command]
 pub async fn validate_backup(passphrase: Option<String>, path: String) -> CmdResult<()> {
-    let archive = std::fs::read(&path).map_err(|e| format!("Could not read backup file: {e}"))?;
+    let archive = read_backup_file(&path)?;
     crate::backup::validate_inner(&archive, passphrase.as_deref()).map_err(cmd_err)
 }
 
@@ -226,7 +265,7 @@ pub async fn restore_data(
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
 ) -> CmdResult<IdentityInfo> {
-    let archive = std::fs::read(&path).map_err(|e| format!("Could not read backup file: {e}"))?;
+    let archive = read_backup_file(&path)?;
     let pass = passphrase.map(Zeroizing::new);
     crate::backup::restore_inner(store.inner(), &archive, pass.as_ref().map(|p| p.as_str()))
         .map_err(cmd_err)?;
@@ -720,6 +759,73 @@ mod tests {
             .await
             .unwrap_err();
             assert!(err.starts_with("Could not read backup file:"), "restore_data: {err}");
+        }
+
+        /// The size-cap guard of all three backup-consuming commands (QURATOR-238): an oversized
+        /// file is refused BEFORE the read. The fixture is a sparse file — `set_len` gives it an
+        /// apparent length over the cap without materializing half a GiB, so the test stays cheap
+        /// and proves the guard fires on `metadata()` alone (the bytes were never on disk).
+        // mutation: in the PRODUCTION region `fn read_backup_file` (identity.rs, guard at the
+        // `if len > MAX_BACKUP_FILE_BYTES {` line, ~217) change that condition to `if false {` —
+        // all three assertions below must go red (the sparse file is then actually read and fails
+        // later guards instead), while `backup_consumers_refuse_a_missing_backup_file` stays green
+        // because a missing file errors at the `metadata()` call, before the cap. Per-site
+        // attribution: revert ONE call site (e.g. the `let archive = read_backup_file(&path)?;`
+        // inside `peek_backup`, ~line 229) back to
+        // `let archive = std::fs::read(&path).map_err(|e| format!("Could not read backup file: {e}"))?;`
+        // — only the peek_backup assertion reds, the other two still refuse.
+        #[tokio::test]
+        async fn backup_consumers_refuse_an_oversized_backup_file_before_reading() {
+            let app = guard_app(false);
+            let dir = tempfile::tempdir().unwrap();
+            let huge = dir.path().join("huge.hb");
+            std::fs::File::create(&huge)
+                .unwrap()
+                .set_len(super::super::MAX_BACKUP_FILE_BYTES + 1)
+                .unwrap();
+            let path = huge.to_str().unwrap().to_string();
+
+            let err = peek_backup(path.clone()).await.unwrap_err();
+            assert!(err.starts_with("Backup file is too large to open:"), "peek_backup: {err}");
+
+            let err = validate_backup(None, path.clone()).await.unwrap_err();
+            assert!(err.starts_with("Backup file is too large to open:"), "validate_backup: {err}");
+
+            let err = restore_data(
+                None,
+                path,
+                app.state::<DataStore>(),
+                app.state::<SharedIdentity>(),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.starts_with("Backup file is too large to open:"), "restore_data: {err}");
+        }
+
+        /// The pass side of the size cap: a normal-sized production archive (made by `backup_data`
+        /// itself, so the fixture is the production bytes) flows through the capped read unchanged.
+        /// `peek_backup` had only error-path coverage before; this also pins that the cap does not
+        /// over-reject.
+        // mutation: same PRODUCTION guard line (`if len > MAX_BACKUP_FILE_BYTES {`, ~217 inside
+        // `fn read_backup_file`), changed to `if true {` — every file including this normal
+        // archive is refused, so THIS test reds while the oversized test above stays green: the
+        // pair together separates a bound from a blanket refusal.
+        #[tokio::test]
+        async fn peek_backup_reads_a_normal_sized_archive_through_the_capped_read() {
+            let app = guard_app(true);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("export.hb");
+            backup_data(
+                None,
+                path.to_str().unwrap().to_string(),
+                app.state::<DataStore>(),
+            )
+            .await
+            .expect("export for the fixture");
+            let needs_pass = peek_backup(path.to_str().unwrap().to_string())
+                .await
+                .expect("a normal-sized archive is read, not refused by the cap");
+            assert!(!needs_pass, "the plaintext export needs no passphrase");
         }
 
         /// The pass side of `peek_backup`'s second guard: a file that IS readable but is NOT an
