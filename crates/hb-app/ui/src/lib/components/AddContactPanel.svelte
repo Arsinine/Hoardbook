@@ -10,7 +10,7 @@
 	import Avatar from './Avatar.svelte';
 	import FeatureTooltip from './FeatureTooltip.svelte';
 	import Modal from './Modal.svelte';
-	import type { CachedPeer } from '../types.js';
+	import type { CachedPeer, ContactSummary } from '../types.js';
 	import { renderFingerprint } from '../identity-display.js';
 	import { DISCOVER_CONTENT_TYPES, parseTagInput, canSearch, toggleContentType, DISCOVER_PAGE_SIZE, pageItems, pageCount, suggestTags, matchReason } from '../discover-view.js';
 
@@ -43,7 +43,7 @@
 	// devtest #4: a contact added by npub/discovery is keyless. Pasting their FULL share code later
 	// must be allowed to attach the browse-key (re-adding overwrites the stored contact) — otherwise
 	// the "Added"/disabled button dead-ends the upgrade and they stay permanently unbrowseable.
-	let canUnlock = $derived(!!result?.browse_key_hex && !!existingContact && !existingContact.browse_key_hex);
+	let canUnlock = $derived(!!result?.browse_key_hex && !!existingContact && !existingContact.has_browse_key);
 
 	async function handleLookup() {
 		const id = input.trim();
@@ -221,7 +221,7 @@
 	// (followHit passes the bare npub), so there is NO canUnlock-style upgrade to offer here — a
 	// keyless contact hit is just "Added", and the real upgrade path stays the lookup leg (paste
 	// their full hbk… code above; the comment at the top of the lookup state explains that nuance).
-	function rosterEntry(npub: string): CachedPeer | undefined {
+	function rosterEntry(npub: string): ContactSummary | undefined {
 		return $contacts.find((c) => c.npub === npub);
 	}
 

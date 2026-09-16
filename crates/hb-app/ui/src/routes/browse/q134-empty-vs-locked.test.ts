@@ -30,7 +30,7 @@ import { render, fireEvent, cleanup, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import BrowsePage from './+page.svelte';
 import { contacts } from '$lib/stores.js';
-import type { CachedPeer } from '$lib/types.js';
+import type { ContactSummary } from '$lib/types.js';
 
 vi.mock('$lib/api.js', () => ({
 	refreshContact: vi.fn(),
@@ -63,17 +63,18 @@ vi.mock('$app/stores', () => stubPage);
 const PEER_NPUB = 'npub1q134q134q134q134q134q134q134q134q134q134q134q134q134';
 
 /** A KEYLESS contact (no browse_key_hex — the owner's exact scenario). */
-function keylessPeer(listings_state: 'Fetched' | 'Sealed' | 'FetchFailed'): CachedPeer {
+function keylessPeer(listings_state: 'Fetched' | 'Sealed' | 'FetchFailed'): ContactSummary {
 	return {
 		npub: PEER_NPUB,
 		// deliberately NO browse_key_hex — keyless
+		has_browse_key: false,
 		collections: [],
 		online: false,
 		last_fetched: '2026-08-01T00:00:00Z',
 		local_tags: [],
 		listings_state,
 		profile: { display_name: 'Bare Peer', tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '2026-08-01T00:00:00Z' },
-	} as CachedPeer & { listings_state: 'Fetched' | 'Sealed' | 'FetchFailed' };
+	} as ContactSummary & { listings_state: 'Fetched' | 'Sealed' | 'FetchFailed' };
 }
 
 afterEach(() => {

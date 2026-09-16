@@ -15,7 +15,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { matchesQuery } from '$lib/contacts-view.js';
-import type { CachedPeer, Profile } from '$lib/types.js';
+import type { ContactSummary, Profile } from '$lib/types.js';
 
 const page = readFileSync(new URL('./+page.svelte', import.meta.url), 'utf8');
 const start = page.indexOf('Seven Profile fields');
@@ -45,9 +45,10 @@ const BASE_PROFILE: Profile = {
 	updated: '2026-08-01T00:00:00Z',
 };
 
-function peer(profile: Profile): CachedPeer {
+function peer(profile: Profile): ContactSummary {
 	return {
 		npub: 'npub1q136' + 'a'.repeat(50),
+		has_browse_key: false,
 		collections: [],
 		online: false,
 		last_fetched: new Date().toISOString(),

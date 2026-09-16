@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import AddContactPanel from './AddContactPanel.svelte';
 import { contacts } from '../stores.js';
 import type { PeerSearchHit } from '../api.js';
-import type { CachedPeer } from '../types.js';
+import type { ContactSummary } from '../types.js';
 
 vi.mock('../api.js', () => ({
 	pasteKey: vi.fn(),
@@ -341,8 +341,8 @@ describe('AddContactPanel — QURATOR-104 hit-card roster dedup', () => {
 	const KEYLESS = 'npub1keylesscontact00000000000000000000000000000000000000000000';
 	const UNKNOWN = 'npub1stranger0000000000000000000000000000000000000000000000000';
 
-	/** A roster entry: one keyed (browse_key_hex set) and one keyless (added by bare npub). */
-	function roster(): CachedPeer[] {
+	/** A roster entry: one keyed (has_browse_key true) and one keyless (added by bare npub). */
+	function roster(): ContactSummary[] {
 		const base = {
 			npub_short: 'npub1…',
 			collections: [],
@@ -351,9 +351,9 @@ describe('AddContactPanel — QURATOR-104 hit-card roster dedup', () => {
 			local_tags: [],
 		};
 		return [
-			{ ...base, npub: KEYED, petname: 'Keyed Pal', browse_key_hex: 'ab12' },
-			{ ...base, npub: KEYLESS, petname: 'Bare Pal' },
-		] as unknown as CachedPeer[];
+			{ ...base, npub: KEYED, petname: 'Keyed Pal', has_browse_key: true },
+			{ ...base, npub: KEYLESS, petname: 'Bare Pal', has_browse_key: false },
+		] as unknown as ContactSummary[];
 	}
 
 	it('keyed contact hit: no stranger banner, no enabled Add, petname shown, Message kept', async () => {

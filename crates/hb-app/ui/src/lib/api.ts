@@ -9,6 +9,7 @@ function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 import type {
 	CachedPeer,
 	Collection,
+	ContactSummary,
 	Group,
 	IdentityInfo,
 	Profile,
@@ -328,11 +329,11 @@ export const follow = (
 		resolvedPeer: resolvedPeer ?? null,
 	});
 
-export const getContacts = () => invoke<CachedPeer[]>('get_contacts');
+export const getContacts = () => invoke<ContactSummary[]>('get_contacts');
 
 export const unfollowContact = (npub: string) => invoke<void>('unfollow_contact', { npub });
 
-export const refreshContact = (npub: string) => invoke<CachedPeer>('refresh_contact', { npub });
+export const refreshContact = (npub: string) => invoke<ContactSummary>('refresh_contact', { npub });
 
 /** M16 W4 — the result of importing a `.hbmanifest`: the full-tree collection (fade lifted), and
  *  `stale` when the manifest predates the teaser the browser is showing (imported anyway, with a warn).

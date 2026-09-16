@@ -138,7 +138,7 @@ describe('QURATOR-146 — a slow non-contact resolve must not override in-flight
 	it('a resolve landing AFTER a sidebar conversation click does not yank the view back', async () => {
 		identity.set({ npub: ME, npub_short: ME, share_code: 'hbk1x', key_storage: 'plain-file' });
 		const contact = {
-			npub: OTHER, petname: 'Saved Pal', local_tags: [],
+			npub: OTHER, petname: 'Saved Pal', has_browse_key: false, local_tags: [],
 			profile: { display_name: 'Saved Pal', tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '' },
 			collections: [], online: true, last_fetched: '',
 		};

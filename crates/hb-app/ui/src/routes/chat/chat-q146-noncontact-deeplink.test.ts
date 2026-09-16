@@ -134,7 +134,7 @@ describe('QURATOR-146 — `?peer=` opens a NON-contact (Topic roster hand-off)',
 	it('a contact deep-link still resolves WITHOUT pasteKey (contact-first, no regression)', async () => {
 		identity.set({ npub: ME, npub_short: ME, share_code: 'hbk1x', key_storage: 'plain-file' });
 		const contact = {
-			npub: STRANGER, petname: 'Saved Pal', local_tags: [],
+			npub: STRANGER, petname: 'Saved Pal', has_browse_key: false, local_tags: [],
 			profile: { display_name: 'Saved Pal', tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '' },
 			collections: [], online: true, last_fetched: '',
 		};

@@ -24,7 +24,7 @@ import { render, cleanup, waitFor } from '@testing-library/svelte';
 import ContactsPage from './+page.svelte';
 import { onlineCount } from '$lib/api.js';
 import { contacts, contactsLoadError } from '$lib/stores.js';
-import type { CachedPeer, Profile } from '$lib/types.js';
+import type { ContactSummary, Profile } from '$lib/types.js';
 
 // The api mock — every Tauri command Contacts imports is stubbed. onlineCount resolves with no
 // `fresh` set (the pre-poll state: the poll has not answered yet), getContacts with an empty list
@@ -61,9 +61,10 @@ const PROF: Profile = {
 	updated: '2026-08-01T00:00:00Z',
 };
 
-function peer(overrides: Partial<CachedPeer>): CachedPeer {
+function peer(overrides: Partial<ContactSummary>): ContactSummary {
 	return {
 		npub: 'npub1q135' + 'a'.repeat(50),
+		has_browse_key: false,
 		collections: [],
 		online: false,
 		last_fetched: new Date().toISOString(),

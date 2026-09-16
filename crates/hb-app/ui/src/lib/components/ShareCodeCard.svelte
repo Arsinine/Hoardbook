@@ -7,7 +7,7 @@
 	// commands the render path invokes are `validate_share_code` + `share_code_info`, both local.
 	// Resolution (`pasteKey` / `follow`) fires ONLY on the user's click (hard constraint #1/#5).
 	import { renderFingerprint, petnameFor, strangerBadge, type Contact } from '$lib/identity-display.js';
-	import type { CachedPeer } from '../types.js';
+	import type { ContactSummary } from '../types.js';
 	import type { ShareCodeInfo } from '../api.js';
 
 	interface Props {
@@ -19,7 +19,7 @@
 		/** The user's own npub (for the sent-bubble own-code inert state). */
 		ownNpub: string;
 		/** The user's contacts (for the impersonation collision badge + already-keyed check). */
-		contacts: CachedPeer[];
+		contacts: ContactSummary[];
 		/** True inside the Q7 request inbox — the card renders visually but with NO action buttons
 		 *  (the quarantine rule: Accept comes first, always). */
 		quarantined: boolean;
@@ -60,7 +60,7 @@
 	// A contact is "already keyed" when the embedded code's browse-key flag matches a saved contact
 	// who already holds a browse-key (i.e. they were added with a full hbk code, not a bare npub).
 	let alreadyKeyed = $derived(
-		isSamePeer && existingContact?.browse_key_hex != null && existingContact.browse_key_hex !== '',
+		isSamePeer && existingContact?.has_browse_key === true,
 	);
 	// "Unlocked" wins over "already keyed" — covers the just-clicked session state.
 	let state = $derived<'own' | 'same' | 'third' | 'quarantine'>(

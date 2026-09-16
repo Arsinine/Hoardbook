@@ -15,7 +15,7 @@
 	import AddContactPanel from '$lib/components/AddContactPanel.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import AZRail from '$lib/components/AZRail.svelte';
-	import type { CachedPeer, Collection, Group, Profile } from '$lib/types.js';
+	import type { CachedPeer, Collection, ContactSummary, Group, Profile } from '$lib/types.js';
 	import { contactDisplayName, shortNpub } from '$lib/contact-display.js';
 	import { NOT_DRM_NOTE, receivesPrivate } from '$lib/private-collections-view.js';
 	import { peerAccessBadge, summarizeCollectionsSize } from '$lib/browse-view.js';
@@ -268,7 +268,7 @@
 			e.preventDefault();
 			const peers = selectedNpubs
 				.map((n) => $contacts.find((c) => c.npub === n))
-				.filter((p): p is CachedPeer => !!p);
+				.filter((p): p is ContactSummary => !!p);
 			if (peers.length < 2) return;
 			// M22 W7 — remember the focused row so the namer can return focus on close (MUST be
 			// before dragPopoverFor is set, so the success path can restore it).
@@ -397,7 +397,7 @@
 			// Build the combined peer list (selection + target) for suggestions.
 			const peers = [...multiNpubs, targetNpub]
 				.map((n) => $contacts.find((c) => c.npub === n))
-				.filter((p): p is CachedPeer => !!p);
+				.filter((p): p is ContactSummary => !!p);
 			if (peers.length < 2) return;
 			dragSuggestions = groupSuggestionsMulti(peers);
 			dragNameInput = '';
@@ -473,7 +473,7 @@
 		if (npubs.length === 0) return;
 		const peers = npubs
 			.map((n) => $contacts.find((c) => c.npub === n))
-			.filter((p): p is CachedPeer => !!p);
+			.filter((p): p is ContactSummary => !!p);
 		if (peers.length === 0) return;
 		// ONE group containing every carried contact. A single card drops as the string[] shape
 		// with one entry — the shape the G-key namer already uses — because commitDragCreate
@@ -731,7 +731,7 @@
 	}
 
 	// Stale: last_fetched more than 7 days ago.
-	function isStale(peer: CachedPeer): boolean {
+	function isStale(peer: ContactSummary): boolean {
 		if (!peer.last_fetched) return false;
 		return Date.now() - new Date(peer.last_fetched).getTime() > 7 * 24 * 60 * 60 * 1000;
 	}
@@ -1030,7 +1030,7 @@
 	//    successful pills read corrects it. Fixing it needs a Rust-side signal, out of scope here.
 	let presenceAnswered = $derived((onlineData as OnlineCount | null)?.fetched_at != null);
 
-	function presenceOf(peer: import('$lib/types.js').CachedPeer): PresenceView {
+	function presenceOf(peer: import('$lib/types.js').ContactSummary): PresenceView {
 		const seen = newestSeen(peer.npub, freshSeen, peer.last_presence);
 		return presenceView(seen, nowMs, PRESENCE_WINDOW_MS, presenceAnswered);
 	}
@@ -1042,7 +1042,7 @@
 	 *  on the view's own tri-state (`online === null` ⇒ the query has not answered yet), so
 	 *  "Offline" below can only come from a beacon that actually lapsed — or from an ANSWERED
 	 *  query that holds no beacon — never from absence-of-data. */
-	function withPresence(peer: import('$lib/types.js').CachedPeer): import('$lib/types.js').CachedPeer {
+	function withPresence(peer: import('$lib/types.js').ContactSummary): import('$lib/types.js').ContactSummary {
 		const p = presenceOf(peer);
 		return p.online !== null ? { ...peer, online: p.online } : peer;
 	}
@@ -1176,7 +1176,7 @@
 	</div>
 {/if}
 
-{#snippet contactRow(peer: CachedPeer, renderIdx: number)}
+{#snippet contactRow(peer: ContactSummary, renderIdx: number)}
 	{@const name = contactDisplayName(peer)}
 	{@const initial = name[0]?.toUpperCase() ?? '?'}
 	{@const hue = avatarHue(initial)}

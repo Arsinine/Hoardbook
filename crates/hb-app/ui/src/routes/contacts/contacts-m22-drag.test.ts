@@ -56,7 +56,7 @@ import {
 	type DropOutcomeMulti,
 	type DropInverse,
 } from '$lib/drag-group.js';
-import type { CachedPeer, Profile } from '$lib/types.js';
+import type { ContactSummary, Profile } from '$lib/types.js';
 
 // Resolved from cwd, not import.meta.url: under `@vitest-environment jsdom` (needed by the mounted
 // block at the bottom of this file) import.meta.url is an http:// URL and readFileSync rejects it.
@@ -93,9 +93,9 @@ function makeProfile(overrides: Partial<Profile> = {}): Profile {
 	};
 }
 
-function makePeer(overrides: Partial<CachedPeer> & { npub: string }): CachedPeer {
+function makePeer(overrides: Partial<ContactSummary> & { npub: string }): ContactSummary {
 	return {
-		browse_key_hex: undefined,
+		has_browse_key: false,
 		petname: undefined,
 		profile: undefined,
 		collections: [],

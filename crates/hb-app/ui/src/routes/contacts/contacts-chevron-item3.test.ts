@@ -29,7 +29,7 @@ import { render, fireEvent, cleanup, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import ContactsPage from './+page.svelte';
 import { contacts } from '$lib/stores.js';
-import type { CachedPeer, Profile } from '$lib/types.js';
+import type { ContactSummary, Profile } from '$lib/types.js';
 
 // jsdom has no ResizeObserver, and `bioMeasure` (the M23 W6 bio-overflow action) constructs one the
 // moment a contact HAS a bio. No pre-existing mount test in this directory renders a peer with a
@@ -72,8 +72,9 @@ const NPUB = 'npub1full' + 'f'.repeat(53);
 const BIO = 'Collects VHS-era Australian television and regional broadcast tape.';
 
 /** A peer carrying ALL SEVEN of the fields that used to render nowhere. */
-const FULL: CachedPeer = {
+const FULL: ContactSummary = {
 	npub: NPUB,
+	has_browse_key: false,
 	collections: [],
 	online: false,
 	last_fetched: '2026-08-01T00:00:00Z',
@@ -96,8 +97,9 @@ const FULL: CachedPeer = {
 };
 
 /** Same shape, but they published nothing beyond a name — ruling 03's case. */
-const BARE: CachedPeer = {
+const BARE: ContactSummary = {
 	npub: 'npub1bare' + 'b'.repeat(53),
+	has_browse_key: false,
 	collections: [],
 	online: false,
 	last_fetched: '2026-08-01T00:00:00Z',
@@ -120,7 +122,7 @@ afterEach(() => {
 });
 
 /** Mount, wait for the page's own load to settle, then open the one card's chevron. */
-async function openPanel(peer: CachedPeer): Promise<HTMLElement> {
+async function openPanel(peer: ContactSummary): Promise<HTMLElement> {
 	contacts.set([peer]);
 	const { getByRole } = render(ContactsPage);
 	await waitFor(() => expect(groupsGetMock).toHaveBeenCalled());

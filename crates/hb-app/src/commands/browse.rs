@@ -656,9 +656,58 @@ pub async fn follow(
     save_followed_peer(&store, peer, petname, group_name, had_explicit_petname)
 }
 
+/// QURATOR-265 — the IPC-safe projection of a [`CachedPeer`] returned by [`get_contacts`]. The
+/// webview is a security boundary (XSS, a compromised frontend dependency): `CachedPeer` carries
+/// `browse_key_hex`, a raw secret that unlocks the peer's listings + presence address, and nothing
+/// in the UI ever reads its *value* — every call site only checks whether it is present (see
+/// `routes/browse/+page.svelte`, `ShareCodeCard.svelte`, `AddContactPanel.svelte`,
+/// `lib/browse-view.ts`). So `get_contacts` must never serialize the key at all; `has_browse_key`
+/// (naming precedent: [`ShareCodeInfo::has_browse_key`]) carries the same yes/no signal.
+/// [`refresh_contact`] returns this projection too — every call site only ever spread its result
+/// straight into the same `contacts` store. `paste_key` and `follow` still need the real key (a
+/// share-code paste, or the peer handed to `follow`) and keep returning `CachedPeer` unchanged.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContactSummary {
+    pub npub: String,
+    #[serde(default)]
+    pub source: crate::store::ContactSource,
+    /// True when this contact has a cached browse-key — never the key itself.
+    pub has_browse_key: bool,
+    pub petname: Option<String>,
+    pub profile: Option<hb_core::types::Profile>,
+    pub collections: Vec<PeerCollection>,
+    #[serde(default)]
+    pub listings_state: crate::store::ListingsStatus,
+    pub online: bool,
+    pub last_fetched: chrono::DateTime<Utc>,
+    pub last_presence: Option<chrono::DateTime<Utc>>,
+    pub local_tags: Vec<String>,
+    pub fingerprint: Option<Fingerprint>,
+}
+
+impl From<CachedPeer> for ContactSummary {
+    fn from(peer: CachedPeer) -> Self {
+        ContactSummary {
+            npub: peer.npub,
+            source: peer.source,
+            has_browse_key: peer.browse_key_hex.is_some(),
+            petname: peer.petname,
+            profile: peer.profile,
+            collections: peer.collections,
+            listings_state: peer.listings_state,
+            online: peer.online,
+            last_fetched: peer.last_fetched,
+            last_presence: peer.last_presence,
+            local_tags: peer.local_tags,
+            fingerprint: peer.fingerprint,
+        }
+    }
+}
+
 #[tauri::command]
-pub async fn get_contacts(store: State<'_, DataStore>) -> CmdResult<Vec<CachedPeer>> {
-    store.list_contacts().map_err(cmd_err)
+pub async fn get_contacts(store: State<'_, DataStore>) -> CmdResult<Vec<ContactSummary>> {
+    let peers = store.list_contacts().map_err(cmd_err)?;
+    Ok(peers.into_iter().map(ContactSummary::from).collect())
 }
 
 #[tauri::command]
@@ -681,13 +730,17 @@ pub(crate) fn contact_share_code(contact: &CachedPeer) -> Result<ShareCode, Stri
     }
 }
 
+/// QURATOR-265 — returns the same IPC-safe [`ContactSummary`] projection as [`get_contacts`]: every
+/// call site (`routes/browse/+page.svelte`, `routes/contacts/+page.svelte`) only ever spread the
+/// returned peer straight into the `contacts` store, which would otherwise re-inject the raw
+/// `browse_key_hex` the projection was built to keep out of the webview.
 #[tauri::command]
 pub async fn refresh_contact(
     npub: String,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
     relay: State<'_, SharedRelay>,
-) -> CmdResult<CachedPeer> {
+) -> CmdResult<ContactSummary> {
     let hash = CachedPeer::pubkey_hash(&npub);
     let existing = store
         .load_contact(&hash)
@@ -696,7 +749,7 @@ pub async fn refresh_contact(
     let share_code = contact_share_code(&existing)?;
     let me = identity_clone(&identity).await?;
     let updated = resolve_peer(&share_code, &me, &store, &relay).await?;
-    save_refreshed_contact(&store, &hash, &existing, updated)
+    save_refreshed_contact(&store, &hash, &existing, updated).map(ContactSummary::from)
 }
 
 /// QURATOR-267: reconcile the keyed listing-enumeration's outcome against the previously cached
@@ -2475,11 +2528,10 @@ mod tests {
             }
         }
 
-        /// P-10: in `get_contacts`, replace the body expression `store.list_contacts().map_err(cmd_err)`
-        /// with `Ok(Vec::new())` — the "both seeded contacts come back" assert must go red.
-        /// (Locating the line: it is the ONLY bare `store.list_contacts().map_err(cmd_err)` in
-        /// this file — the lookalikes inside `search_peers`/`discover_observed_tags` continue
-        /// with `.into_iter()` or sit inside a `for` header.)
+        /// P-10: QURATOR-265 moved `get_contacts`'s body onto two lines — replace line 708 (the
+        /// `store.list_contacts().map_err(cmd_err)?` binding to `peers`) with
+        /// `let peers: Vec<CachedPeer> = Vec::new();` — the "both seeded contacts come back"
+        /// assert below must go red.
         #[tokio::test]
         async fn get_contacts_command_round_trips_seeded_contacts_from_the_managed_store() {
             let app = dispatch_app(false);
@@ -2499,6 +2551,43 @@ mod tests {
             assert_eq!(listed[0].petname.as_deref(), Some("Alpha"), "petname round-trips");
             assert_eq!(listed[1].npub, "npub1beta");
             assert_eq!(listed[1].petname.as_deref(), Some("Beta"));
+        }
+
+        /// QURATOR-265 — `get_contacts` must never let the raw browse-key cross the IPC boundary;
+        /// a webview-side compromise (XSS, a bad frontend dependency) would otherwise be able to
+        /// read every contact's key straight out of the command's JSON response. Assert against
+        /// the SERIALIZED JSON, not the struct — a struct-only check cannot see a `Serialize` impl
+        /// that (re)adds the field back under a different name.
+        ///
+        /// P-10: in the `From<CachedPeer> for ContactSummary` impl, replace line 692
+        /// (`has_browse_key: peer.browse_key_hex.is_some()`) with `has_browse_key: false` — the
+        /// "has_browse_key is true" assert below must go red. (Replacing it with `true` instead
+        /// would leave that assert green but red the companion keyless-contact assert in this
+        /// same test, so either direction of tampering is caught.)
+        #[test]
+        fn contact_summary_redacts_the_browse_key_but_keeps_the_has_key_signal() {
+            let mut keyed = stub_peer("npub1keyed", Some("Keyed"));
+            let raw_key = hex::encode([9u8; 32]);
+            keyed.browse_key_hex = Some(raw_key.clone());
+            let summary = ContactSummary::from(keyed);
+            assert!(summary.has_browse_key, "the presence signal must survive the projection");
+
+            let json = serde_json::to_string(&summary).unwrap();
+            assert!(!json.contains(&raw_key), "the raw browse-key must never be serialized");
+            // ⚠ Assert the FIELD FORM, not the bare identifier: `"has_browse_key"` itself contains
+            // the substring `browse_key`, so a naive `!json.contains("browse_key")` is unsatisfiable
+            // by construction — it reds on the very field that proves the redaction worked. What
+            // must never appear is the serialized KEY field, i.e. the JSON key `"browse_key_hex":`.
+            // (CLAUDE.md §9's P-12 sibling: anchor a scan-guard on syntax, never a bare name.)
+            assert!(
+                !json.contains("\"browse_key_hex\""),
+                "the browse_key_hex field must not be serialized at all"
+            );
+            assert!(json.contains("\"has_browse_key\":true"), "the boolean signal round-trips");
+
+            let keyless = stub_peer("npub1keyless", Some("Keyless"));
+            let keyless_summary = ContactSummary::from(keyless);
+            assert!(!keyless_summary.has_browse_key, "a keyless contact reports false");
         }
 
         /// P-10: in `unfollow_contact`, replace the body

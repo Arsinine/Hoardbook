@@ -22,7 +22,7 @@ import { tick } from 'svelte';
 import ContactsPage from './+page.svelte';
 import { contacts } from '$lib/stores.js';
 import { DRAG_MIME } from '$lib/drag-group.js';
-import type { CachedPeer, Profile } from '$lib/types.js';
+import type { ContactSummary, Profile } from '$lib/types.js';
 
 vi.mock('$lib/api.js', () => ({
 	follow: vi.fn().mockResolvedValue(undefined),
@@ -99,8 +99,9 @@ const PROF = (name: string): Profile => ({
 	updated: '2026-08-01T00:00:00Z',
 });
 
-const ALPHA: CachedPeer = {
+const ALPHA: ContactSummary = {
 	npub: 'npub1alpha' + 'a'.repeat(52),
+	has_browse_key: false,
 	collections: [],
 	online: false,
 	last_fetched: '2026-08-01T00:00:00Z',
@@ -108,8 +109,9 @@ const ALPHA: CachedPeer = {
 	profile: PROF('Alpha Hoarder'),
 };
 
-const BRAVO: CachedPeer = {
+const BRAVO: ContactSummary = {
 	npub: 'npub1bravo' + 'c'.repeat(52),
+	has_browse_key: false,
 	collections: [],
 	online: false,
 	last_fetched: '2026-08-01T00:00:00Z',
@@ -117,8 +119,9 @@ const BRAVO: CachedPeer = {
 	profile: PROF('Bravo Hoarder'),
 };
 
-const CHARLIE: CachedPeer = {
+const CHARLIE: ContactSummary = {
 	npub: 'npub1charli' + 'e'.repeat(51),
+	has_browse_key: false,
 	collections: [],
 	online: false,
 	last_fetched: '2026-08-01T00:00:00Z',

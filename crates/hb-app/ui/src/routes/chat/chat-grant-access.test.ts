@@ -75,7 +75,7 @@ afterEach(() => {
 
 function mount() {
 	identity.set({ npub: ME, npub_short: ME, share_code: 'hbk1x', key_storage: 'plain-file' });
-	contacts.set([{ npub: ASKER, petname: 'Asker', collections: [], online: false, last_fetched: '2026-09-10T10:00:00Z', local_tags: [] }]);
+	contacts.set([{ npub: ASKER, petname: 'Asker', has_browse_key: false, collections: [], online: false, last_fetched: '2026-09-10T10:00:00Z', local_tags: [] }]);
 	return render(ChatPage);
 }
 

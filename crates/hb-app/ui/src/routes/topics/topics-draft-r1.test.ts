@@ -23,7 +23,7 @@ import {
 	announceSeen,
 } from '$lib/stores.js';
 import { ANNOUNCE_EXPLAINER } from '$lib/announce-view.js';
-import type { CachedPeer } from '$lib/types.js';
+import type { ContactSummary } from '$lib/types.js';
 
 vi.mock('$lib/api.js', () => ({
 	topicList: vi.fn().mockResolvedValue([]),
@@ -51,9 +51,10 @@ const SELF_NPUB = 'npub1selfselfselfselfselfselfselfselfselfselfselfse';
 const CONTACT_NPUB = 'npub1contactcontactcontactcontactcontactcontactca';
 const STRANGER_NPUB = 'npub1strangerstrangerstrangerstrangerstrange';
 
-function makeContact(overrides: Partial<CachedPeer> = {}): CachedPeer {
+function makeContact(overrides: Partial<ContactSummary> = {}): ContactSummary {
 	return {
 		npub: CONTACT_NPUB,
+		has_browse_key: false,
 		petname: 'Carol',
 		profile: { display_name: 'Carol', bio: undefined, tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '' },
 		collections: [],

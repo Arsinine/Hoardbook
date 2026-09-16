@@ -100,7 +100,7 @@ const ASK_TRACE = {
 describe("QURATOR-171 — redeem forwards the asker's newest-known fingerprint", () => {
 	it("mount: a solicited ticket DM auto-redeems with the ask record's fingerprint_seen as the 3rd arg", async () => {
 		identity.set({ npub: ME, npub_short: ME, share_code: 'hbk1x', key_storage: 'plain-file' });
-		contacts.set([{ npub: PEER, collections: [], online: false, last_fetched: '2026-08-01T00:00:00Z', local_tags: [] }]);
+		contacts.set([{ npub: PEER, has_browse_key: false, collections: [], online: false, last_fetched: '2026-08-01T00:00:00Z', local_tags: [] }]);
 
 		const { getMessages } = await import('$lib/api.js');
 		(getMessages as unknown as ReturnType<typeof vi.fn>).mockResolvedValue([

@@ -91,11 +91,11 @@
 	import type { ShareCodeInfo } from '$lib/api.js';
 	import { sortChannelPostsAscending, resolveTopicParam, interleaveChannel } from '$lib/topics-view.js';
 	import { latestFromPeer, unreadByPeer } from '$lib/unread-view.js';
-	import type { CachedPeer, ReceivedMessage, TopicView, ChannelPost, AnnouncementView, DmRequestView, Group } from '$lib/types.js';
+	import type { CachedPeer, ContactSummary, ReceivedMessage, TopicView, ChannelPost, AnnouncementView, DmRequestView, Group } from '$lib/types.js';
 
 	let loading = $state(false);
 	let sending = $state(false);
-	let selectedPeer: CachedPeer | null = $state(null);
+	let selectedPeer: CachedPeer | ContactSummary | null = $state(null);
 	let draft = $state('');
 	// M17 W4 review: in-flight guard for the share-code fetch, and the binding of an inserted grant
 	// to the conversation it was raised in (the draft itself is global — see selectPeer).
@@ -812,7 +812,7 @@
 		loadRequests();
 	}
 
-	async function selectPeer(peer: CachedPeer) {
+	async function selectPeer(peer: CachedPeer | ContactSummary) {
 		// W4 review: a share code inserted for someone else does NOT follow the switch (the draft is
 		// global; Send targets whoever is selected now). Withdraw the grant, keep the typed text.
 		if (sharedCodeInDraft && sharedCodeInDraft.npub !== peer.npub) {
@@ -945,9 +945,9 @@
 			composeBody = '';
 			await loadContactsInto(getContacts); // minor-3: clears a stale contactsLoadError on success
 			const peer = $contacts.find((c) => c.npub === sent.to) ?? ({
-				npub: sent.to, browse_key_hex: undefined, petname: undefined, profile: undefined,
+				npub: sent.to, has_browse_key: false, petname: undefined, profile: undefined,
 				collections: [], online: false, last_fetched: '', local_tags: [],
-			} satisfies CachedPeer);
+			} satisfies ContactSummary);
 			await selectPeer(peer);
 		} catch (e) {
 			toast(String(e), 'error');
@@ -980,7 +980,7 @@
 	}
 
 
-	function viewProfile(peer: CachedPeer) {
+	function viewProfile(peer: CachedPeer | ContactSummary) {
 		goto('/contacts');
 	}
 
@@ -1049,7 +1049,7 @@
 			if (intent === 'ask-access') askAccessFor = npub;
 			if (applied.focus) tick().then(() => draftEl?.focus());
 		};
-		const open = (peer: CachedPeer, petnameFallback: string) => {
+		const open = (peer: CachedPeer | ContactSummary, petnameFallback: string) => {
 			peerDeepLinked = npub;
 			selectPeer(peer);
 			applyIntent(petnameFallback);

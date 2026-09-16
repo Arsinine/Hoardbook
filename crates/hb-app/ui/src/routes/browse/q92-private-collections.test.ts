@@ -18,7 +18,7 @@ import { render, fireEvent, cleanup, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import BrowsePage from './+page.svelte';
 import { contacts } from '$lib/stores.js';
-import type { CachedPeer, Collection, PrivatePeerCollections } from '$lib/types.js';
+import type { ContactSummary, Collection, PrivatePeerCollections } from '$lib/types.js';
 
 // The api mock — every Tauri command Browse imports is stubbed. browsePrivateCollections is the
 // spy under test; the others just need to resolve so the page's mount effects don't throw.
@@ -71,9 +71,9 @@ const PRIVATE_COL: Collection = {
 	listing: [{ name: 'rare-clip.mkv', item_type: 'File', size: '9GB', tags: [], children: [] }],
 };
 
-const PEER: CachedPeer = {
+const PEER: ContactSummary = {
 	npub: PEER_NPUB,
-	browse_key_hex: 'aabbccdd',
+	has_browse_key: true,
 	collections: [], // no PUBLIC collections — the private section is the only content
 	online: false,
 	last_fetched: '2026-08-01T00:00:00Z',

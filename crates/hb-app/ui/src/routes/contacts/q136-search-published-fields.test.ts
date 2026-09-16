@@ -27,7 +27,7 @@ import { render, cleanup, waitFor, fireEvent } from '@testing-library/svelte';
 import ContactsPage from './+page.svelte';
 import { contacts } from '$lib/stores.js';
 import { matchesQuery } from '$lib/contacts-view.js';
-import type { CachedPeer, Profile } from '$lib/types.js';
+import type { ContactSummary, Profile } from '$lib/types.js';
 
 // jsdom has no ResizeObserver, and `bioMeasure` (the M23 W6 bio-overflow action) constructs one
 // the moment a contact HAS a bio (same stub as contacts-chevron-item3.test.ts — a jsdom gap, not a
@@ -76,9 +76,10 @@ const BASE_PROFILE: Profile = {
 	updated: '2026-08-01T00:00:00Z',
 };
 
-function peer(profile: Profile, npub = NPUB): CachedPeer {
+function peer(profile: Profile, npub = NPUB): ContactSummary {
 	return {
 		npub,
+		has_browse_key: false,
 		collections: [],
 		online: false,
 		last_fetched: new Date().toISOString(),

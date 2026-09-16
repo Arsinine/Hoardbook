@@ -28,7 +28,7 @@ import { tick } from 'svelte';
 import { get } from 'svelte/store';
 import BrowsePage from './+page.svelte';
 import { contacts, toastMessage } from '$lib/stores.js';
-import type { CachedPeer, Collection } from '$lib/types.js';
+import type { ContactSummary, Collection } from '$lib/types.js';
 
 vi.mock('$lib/api.js', () => ({
 	refreshContact: vi.fn(),
@@ -102,9 +102,9 @@ const FULL_COL: Collection = {
 	})),
 };
 
-const PEER: CachedPeer = {
+const PEER: ContactSummary = {
 	npub: PEER_NPUB,
-	browse_key_hex: 'aabbccdd',
+	has_browse_key: true,
 	collections: [TRUNCATED_COL],
 	online: false,
 	last_fetched: '2026-08-01T00:00:00Z',
@@ -112,8 +112,9 @@ const PEER: CachedPeer = {
 	profile: { display_name: 'The Author', tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '2026-08-01T00:00:00Z' },
 };
 
-const SERVER: CachedPeer = {
+const SERVER: ContactSummary = {
 	npub: SERVER_NPUB,
+	has_browse_key: false,
 	collections: [],
 	online: true,
 	last_fetched: '2026-08-01T00:00:00Z',

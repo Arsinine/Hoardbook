@@ -30,7 +30,7 @@ import { tick } from 'svelte';
 import ContactsPage from './+page.svelte';
 import { contacts } from '$lib/stores.js';
 import { DRAG_MIME, isOurDrag } from '$lib/drag-group.js';
-import type { CachedPeer, Profile } from '$lib/types.js';
+import type { ContactSummary, Profile } from '$lib/types.js';
 
 vi.mock('$lib/api.js', () => ({
 	follow: vi.fn().mockResolvedValue(undefined),
@@ -108,7 +108,8 @@ const PROF = (name: string): Profile => ({
 	updated: '2026-08-01T00:00:00Z',
 });
 
-const ALPHA: CachedPeer = {
+const ALPHA: ContactSummary = {
+	has_browse_key: false,
 	npub: 'npub1alpha' + 'a'.repeat(52),
 	collections: [],
 	online: false,
@@ -117,7 +118,8 @@ const ALPHA: CachedPeer = {
 	profile: PROF('Alpha Hoarder'),
 };
 
-const BRAVO: CachedPeer = {
+const BRAVO: ContactSummary = {
+	has_browse_key: false,
 	npub: 'npub1bravo' + 'c'.repeat(52),
 	collections: [],
 	online: false,

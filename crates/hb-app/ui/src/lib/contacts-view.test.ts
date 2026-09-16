@@ -10,11 +10,11 @@ import {
 	matchesQuery,
 	presentSectionKeys,
 } from './contacts-view.js';
-import type { CachedPeer, Collection, Group } from './types.js';
+import type { ContactSummary, Collection, Group } from './types.js';
 
-function makePeer(overrides: Partial<CachedPeer> & { npub: string }): CachedPeer {
+function makePeer(overrides: Partial<ContactSummary> & { npub: string }): ContactSummary {
 	return {
-		browse_key_hex: undefined,
+		has_browse_key: false,
 		petname: undefined,
 		profile: undefined,
 		collections: [],

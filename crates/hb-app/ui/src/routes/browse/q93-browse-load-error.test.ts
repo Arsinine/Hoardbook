@@ -22,7 +22,7 @@ import { render, fireEvent, cleanup, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import BrowsePage from './+page.svelte';
 import { contacts, contactsLoadError } from '$lib/stores.js';
-import type { CachedPeer } from '$lib/types.js';
+import type { ContactSummary } from '$lib/types.js';
 
 // The api mock — every Tauri command Browse imports is stubbed. getContacts and
 // browsePrivateCollections are the spies under test; the others just need to resolve so the
@@ -64,8 +64,9 @@ const PEER_NPUB = 'npub1pr0bepr0bepr0bepr0bepr0bepr0bepr0bepr0bepr0bepr0bepr0be'
 
 const PROF = { display_name: 'Load Error Peer', tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '2026-08-01T00:00:00Z' };
 
-const ONE_CONTACT: CachedPeer = {
+const ONE_CONTACT: ContactSummary = {
 	npub: 'npub1q93browsea' + 'a'.repeat(48),
+	has_browse_key: false,
 	collections: [],
 	online: false,
 	last_fetched: '2026-08-01T00:00:00Z',
@@ -76,9 +77,9 @@ const ONE_CONTACT: CachedPeer = {
 // A peer matching the stubbed `?peer=` URL, so the (b) tests auto-select it on mount (same
 // fixture shape as q92's PEER: `browse_key_hex` set so selectPeer's live-refetch path runs
 // through the mocked, non-throwing `refreshContact`).
-const SELECTED_PEER: CachedPeer = {
+const SELECTED_PEER: ContactSummary = {
 	npub: PEER_NPUB,
-	browse_key_hex: 'aabbccdd',
+	has_browse_key: true,
 	collections: [],
 	online: false,
 	last_fetched: '2026-08-01T00:00:00Z',

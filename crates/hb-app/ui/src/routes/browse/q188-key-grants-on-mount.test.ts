@@ -24,7 +24,7 @@ import { render, cleanup, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import BrowsePage from './+page.svelte';
 import { contacts } from '$lib/stores.js';
-import type { CachedPeer, Collection } from '$lib/types.js';
+import type { ContactSummary, Collection } from '$lib/types.js';
 
 // Every VALUE export Browse's `$lib/api.js` import names (line 7) — a missing one is `undefined`
 // at the call site and the mount throws. q134's mock is shorter because this page's line-7 list
@@ -81,27 +81,28 @@ function grantedCollection(): Collection {
 }
 
 /** The PRE-grant row — keyless with sealed listings, the exact state that renders 🔒 (q134 state 2). */
-function keylessSealedPeer(): CachedPeer {
+function keylessSealedPeer(): ContactSummary {
 	return {
 		npub: PEER_NPUB,
 		// deliberately NO browse_key_hex — keyless, the owner's scenario
+		has_browse_key: false,
 		collections: [],
 		online: false,
 		last_fetched: '2026-09-01T00:00:00Z',
 		local_tags: [],
 		listings_state: 'Sealed',
 		profile: { display_name: 'Granted Peer', tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '2026-09-01T00:00:00Z' },
-	} as CachedPeer & { listings_state: 'Sealed' };
+	} as ContactSummary & { listings_state: 'Sealed' };
 }
 
 /** The POST-grant row — same peer, same Sealed listings on the relay, but the key arrived. The
  *  lock derivation needs BOTH keyless AND Sealed, so the key alone clears it. */
-function grantedPeer(): CachedPeer {
+function grantedPeer(): ContactSummary {
 	return {
 		...keylessSealedPeer(),
-		browse_key_hex: 'a1b2c3grantkeyarrivedf0f0',
+		has_browse_key: true,
 		collections: [grantedCollection()],
-	} as CachedPeer & { listings_state: 'Sealed' };
+	} as ContactSummary & { listings_state: 'Sealed' };
 }
 
 afterEach(() => {
@@ -161,7 +162,7 @@ describe('QURATOR-188 — Browse applies pending key grants on mount', () => {
 	it('a rejected applyKeyGrants is non-fatal — the page still renders, no unhandled rejection', async () => {
 		grantsMock.mockRejectedValue(new Error('relays unreachable'));
 		// Keyless + Fetched (nothing published) — q134 state 1: renders "No public collections".
-		contacts.set([{ ...keylessSealedPeer(), listings_state: 'Fetched' } as CachedPeer]);
+		contacts.set([{ ...keylessSealedPeer(), listings_state: 'Fetched' } as ContactSummary]);
 		render(BrowsePage);
 		await tick();
 

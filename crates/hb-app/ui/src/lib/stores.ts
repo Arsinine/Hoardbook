@@ -1,10 +1,10 @@
 import { get, writable } from 'svelte/store';
-import type { CachedPeer, Collection, DiscoveredTopic, IdentityInfo, Profile, ReceivedMessage, DmRequestView, TopicAnnounceSummary } from './types.js';
+import type { Collection, ContactSummary, DiscoveredTopic, IdentityInfo, Profile, ReceivedMessage, DmRequestView, TopicAnnounceSummary } from './types.js';
 
 export const identity = writable<IdentityInfo | null>(null);
 export const profile = writable<Profile | null>(null);
 export const collections = writable<Collection[]>([]);
-export const contacts = writable<CachedPeer[]>([]);
+export const contacts = writable<ContactSummary[]>([]);
 
 /** QURATOR-93 — load-error flags for the layout-seeded stores. The layout's silent
  *  `.catch(() => {})` left a FAILED `get_collections`/`get_contacts` indistinguishable from an
@@ -48,8 +48,8 @@ export async function loadCollectionsInto(
  *  Returns the fresh list, or null when the load failed (callers fall back to the stale store). A
  *  call superseded by a later `loadContactsInto` before it settles applies nothing and returns null. */
 export async function loadContactsInto(
-	fetch: () => Promise<CachedPeer[]>,
-): Promise<CachedPeer[] | null> {
+	fetch: () => Promise<ContactSummary[]>,
+): Promise<ContactSummary[] | null> {
 	const gen = ++contactsGen;
 	try {
 		const fresh = await fetch();

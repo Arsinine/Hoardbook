@@ -10,7 +10,7 @@ import { render, cleanup, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import BrowsePage from './+page.svelte';
 import { contacts } from '$lib/stores.js';
-import type { CachedPeer } from '$lib/types.js';
+import type { ContactSummary } from '$lib/types.js';
 
 vi.mock('$lib/api.js', () => ({
 	refreshContact: vi.fn(),
@@ -42,9 +42,9 @@ vi.mock('$app/stores', () => stubPage);
 // the stubbed $page URL above — peerFromQuery matches on the full string.
 const PEER_NPUB = 'npub1ctactactactactactactactactactactactactactactactacta';
 
-const PEER: CachedPeer = {
+const PEER: ContactSummary = {
 	npub: PEER_NPUB,
-	browse_key_hex: 'aabbccdd', // keyed (not listingsLocked) so the empty branch, not the lock, renders
+	has_browse_key: true, // keyed (not listingsLocked) so the empty branch, not the lock, renders
 	collections: [], // no PUBLIC collections
 	online: false,
 	last_fetched: '2026-08-01T00:00:00Z',

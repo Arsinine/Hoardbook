@@ -17,7 +17,7 @@
 	import Modal from '$lib/components/Modal.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote, arrangeItems, fileTypesPresent, fmtLargestUnit, type BrowseViewMode, type BrowseSortKey, type BrowseSortDir } from '$lib/browse-view.js';
-	import type { CachedPeer, Collection, DirectoryItem, Group } from '$lib/types.js';
+	import type { Collection, ContactSummary, DirectoryItem, Group } from '$lib/types.js';
 	import { groupByGroups, matchesQuery } from '$lib/contacts-view.js';
 	// M22 W3 — drag-to-group gesture primitives (shared with Contacts). Create is ALWAYS ADDITIVE.
 	// M22 W4 — drop onto an existing group heading: plain drop MOVES, Shift-drop ADDS (owner ruling
@@ -34,7 +34,7 @@
 		| { label: string; kind: 'folder'; index: number };
 
 	let search = $state('');
-	let selectedPeer = $state<CachedPeer | null>(null);
+	let selectedPeer = $state<ContactSummary | null>(null);
 	let selectedCollection = $state<Collection | null>(null);
 	let folderStack: { name: string; items: DirectoryItem[] }[] = $state([]);
 	// devtest #3/#4: a keyed contact's collections are cached at add-time; a flaky fetch then leaves
@@ -58,19 +58,19 @@
 		activeTypes = activeTypes.includes(t) ? activeTypes.filter((x) => x !== t) : [...activeTypes, t];
 	}
 
-	function peerName(peer: CachedPeer): string {
+	function peerName(peer: ContactSummary): string {
 		// A legacy/adversarial teaser can carry display_name: "" (R1 only guards publish) — `??` would
 		// not fall back to a literal empty string, showing a blank name; `||` does.
 		return peer.profile?.display_name || peer.npub.slice(0, 10) + '…';
 	}
 
-	function peerInitial(peer: CachedPeer): string {
+	function peerInitial(peer: ContactSummary): string {
 		return (peer.profile?.display_name?.[0] ?? peer.npub[0]).toUpperCase();
 	}
 
 	// QURATOR-134 state 3's Retry target: re-run exactly the keyed-refresh `selectPeer` performs,
 	// without re-entering the selection bookkeeping (which is already correct for this peer).
-	async function selectPeerRefresh(peer: CachedPeer) {
+	async function selectPeerRefresh(peer: ContactSummary) {
 		loadingListings = true;
 		try {
 			const updated = await refreshContact(peer.npub);
@@ -83,7 +83,7 @@
 		}
 	}
 
-	async function selectPeer(peer: CachedPeer) {
+	async function selectPeer(peer: ContactSummary) {
 		selectedPeer = peer;
 		selectedCollection = null;
 		folderStack = [];
@@ -91,7 +91,7 @@
 		// devtest #3/#4: for a keyed contact, re-fetch listings live so a browse-key that arrived
 		// after (or a listing fetch that hiccuped at) add-time actually surfaces their collections.
 		// Bare (keyless) contacts have nothing to fetch — skip. Cached view stays if the fetch fails.
-		if (!peer.browse_key_hex) return;
+		if (!peer.has_browse_key) return;
 		loadingListings = true;
 		try {
 			const updated = await refreshContact(peer.npub);
@@ -278,10 +278,10 @@
 	// implementation; `collections.length === 0` cannot tell "they published nothing" from "sealed"
 	// from "the fetch failed", which is why every keyless peer with zero collections used to read
 	// as 🔒 locked). Only meaningful when keyless: a keyed contact's `collections` is authoritative.
-	let listingsLocked = $derived(!!selectedPeer && !selectedPeer.browse_key_hex && selectedPeer.listings_state === 'Sealed');
+	let listingsLocked = $derived(!!selectedPeer && !selectedPeer.has_browse_key && selectedPeer.listings_state === 'Sealed');
 	// The enumeration itself failed — genuinely distinct from both empty and locked (the
 	// QURATOR-67/68/93 rule: never render a confident negative on data that never arrived).
-	let listingsLoadFailed = $derived(!!selectedPeer && !selectedPeer.browse_key_hex && selectedPeer.listings_state === 'FetchFailed');
+	let listingsLoadFailed = $derived(!!selectedPeer && !selectedPeer.has_browse_key && selectedPeer.listings_state === 'FetchFailed');
 
 	// M22 W3 — drag-to-group gesture on the People list. Same shared primitives as Contacts;
 	// create is ALWAYS ADDITIVE. Esc cancels. The naming popover is a simple inline panel here
@@ -388,7 +388,7 @@
 			e.preventDefault();
 			const peers = selectedNpubs
 				.map((n) => $contacts.find((c) => c.npub === n))
-				.filter((p): p is CachedPeer => !!p);
+				.filter((p): p is ContactSummary => !!p);
 			if (peers.length < 2) return;
 			// MUST be set before dragPopoverFor, so the success path can restore it too.
 			dragPopoverReturnFocus = document.activeElement as HTMLElement | undefined;
@@ -551,7 +551,7 @@
 			}
 			const peers = [...multiNpubs, targetNpub]
 				.map((n) => $contacts.find((c) => c.npub === n))
-				.filter((p): p is CachedPeer => !!p);
+				.filter((p): p is ContactSummary => !!p);
 			if (peers.length < 2) return;
 			dragSuggestions = groupSuggestionsMulti(peers);
 			dragNameInput = '';
@@ -1011,7 +1011,7 @@
 							🔒 Listings locked<FeatureTooltip key="listings-locked" />
 						</div>
 						<!-- M17 W2: turn the locked dead-end into a next step → ask-access deep-link (a
-						     prefilled DM draft, no wire change). selectedPeer is a CachedPeer (has petname);
+						     prefilled DM draft, no wire change). selectedPeer is a ContactSummary (has petname);
 						     guarded because the listingsLocked derivation's non-null narrowing doesn't reach
 						     this closure. -->
 						<button class="btn-default btn-sm ask-access-btn" onclick={() => { const p = selectedPeer; if (!p) return; goto('/chat?peer=' + p.npub + '&intent=ask-access' + (p.petname ? '&petname=' + encodeURIComponent(p.petname) : '')); }}>Ask for access</button>

@@ -90,8 +90,8 @@ describe('browse-view — flattenTree handles deep nesting without recursion', (
 });
 
 describe('browse-view — peerAccessBadge (devtest #1)', () => {
-	it('a keyed peer (non-empty browse_key_hex) reads as browseable', () => {
-		expect(peerAccessBadge({ browse_key_hex: 'deadbeef' })).toEqual({
+	it('a keyed peer (has_browse_key true) reads as browseable', () => {
+		expect(peerAccessBadge({ has_browse_key: true })).toEqual({
 			locked: false,
 			icon: '🔓',
 			label: 'browseable',
@@ -99,7 +99,7 @@ describe('browse-view — peerAccessBadge (devtest #1)', () => {
 		});
 	});
 
-	it('a bare peer (absent browse_key_hex) reads as locked with a remedy hint', () => {
+	it('a bare peer (absent has_browse_key) reads as locked with a remedy hint', () => {
 		const badge = peerAccessBadge({});
 		expect(badge.locked).toBe(true);
 		expect(badge.icon).toBe('🔒');
@@ -107,12 +107,12 @@ describe('browse-view — peerAccessBadge (devtest #1)', () => {
 		expect(badge.hint.length).toBeGreaterThan(0);
 	});
 
-	it('an empty-string browse_key_hex reads as bare, not keyed', () => {
-		expect(peerAccessBadge({ browse_key_hex: '' }).locked).toBe(true);
+	it('a false has_browse_key reads as bare, not keyed', () => {
+		expect(peerAccessBadge({ has_browse_key: false }).locked).toBe(true);
 	});
 
-	it('stays locked even when a bare peer carries cached collections — keys off browse_key_hex only', () => {
-		const badge = peerAccessBadge({ browse_key_hex: undefined });
+	it('stays locked even when a bare peer carries cached collections — keys off has_browse_key only', () => {
+		const badge = peerAccessBadge({ has_browse_key: undefined });
 		expect(badge.locked).toBe(true);
 	});
 });

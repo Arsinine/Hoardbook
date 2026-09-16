@@ -17,7 +17,7 @@ import {
 	loadCollectionsInto,
 	loadContactsInto,
 } from './stores.js';
-import type { Collection, CachedPeer } from './types.js';
+import type { Collection, ContactSummary } from './types.js';
 
 afterEach(() => {
 	collections.set([]);
@@ -38,10 +38,10 @@ const COLLECTION_B: Collection = {
 	item_count: 0, total_bytes: 0, content_types: [], last_updated: '2026-08-17T00:00:00Z', listing: [],
 };
 
-const PEER_B: CachedPeer = {
+const PEER_B: ContactSummary = {
 	npub: 'npub1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-	collections: [], online: false, last_fetched: '2026-08-17T00:00:00Z', local_tags: [],
-} as CachedPeer;
+	has_browse_key: false, collections: [], online: false, last_fetched: '2026-08-17T00:00:00Z', local_tags: [],
+};
 
 describe('Concern-1 — loadCollectionsInto: a superseded load cannot clobber a newer one', () => {
 	it('slow A rejects AFTER fast B resolves → final state is B, error flag stays clear', async () => {
@@ -66,8 +66,8 @@ describe('Concern-1 — loadCollectionsInto: a superseded load cannot clobber a 
 
 describe('Concern-1 — loadContactsInto: a superseded load cannot clobber a newer one', () => {
 	it('slow A rejects AFTER fast B resolves → final state is B, error flag stays clear', async () => {
-		const a = deferred<CachedPeer[]>();
-		const b = deferred<CachedPeer[]>();
+		const a = deferred<ContactSummary[]>();
+		const b = deferred<ContactSummary[]>();
 
 		const pA = loadContactsInto(() => a.promise); // starts first, will fail — slow
 		const pB = loadContactsInto(() => b.promise); // starts second, succeeds — fast

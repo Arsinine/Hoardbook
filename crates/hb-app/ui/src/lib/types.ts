@@ -154,6 +154,29 @@ export interface CachedPeer {
 	fingerprint?: { words: string[]; colorHex: string };
 }
 
+/** QURATOR-265 — the IPC-safe projection of `CachedPeer` returned by `getContacts`. The webview is
+ *  a security boundary (XSS, a compromised frontend dependency): `CachedPeer.browse_key_hex` is a
+ *  raw secret that unlocks a peer's listings + presence address, and no UI call site ever reads its
+ *  *value* — every one only checks presence. So `get_contacts` never serializes the key at all;
+ *  `has_browse_key` carries the same yes/no signal `browse_key_hex` was used for. Every other
+ *  command that still needs the real key (`pasteKey`, `follow`, `refreshContact`) keeps returning
+ *  `CachedPeer` unchanged — this type is `get_contacts`-only. */
+export interface ContactSummary {
+	npub: string;
+	source?: ContactSource;
+	/** True when this contact has a cached browse-key — never the key itself. */
+	has_browse_key: boolean;
+	petname?: string;
+	profile?: Profile;
+	collections: Collection[];
+	listings_state?: ListingsStatus;
+	online: boolean;
+	last_fetched: string;
+	last_presence?: string;
+	local_tags: string[];
+	fingerprint?: { words: string[]; colorHex: string };
+}
+
 export interface ScanOptions {
 	path: string;
 	path_alias: string;

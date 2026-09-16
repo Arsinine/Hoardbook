@@ -102,10 +102,10 @@ export interface PeerAccessBadge {
 	hint: string;
 }
 
-/** Keyed off `browse_key_hex` alone — **never** collection count. A bare contact whose cache still
+/** Keyed off `has_browse_key` alone — **never** collection count. A bare contact whose cache still
  *  carries stale collections (e.g. from before the key was lost) must still read as locked. */
-export function peerAccessBadge(peer: { browse_key_hex?: string }): PeerAccessBadge {
-	if (peer.browse_key_hex) {
+export function peerAccessBadge(peer: { has_browse_key?: boolean }): PeerAccessBadge {
+	if (peer.has_browse_key) {
 		return { locked: false, icon: '🔓', label: 'browseable', hint: '' };
 	}
 	return {
