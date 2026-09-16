@@ -146,7 +146,11 @@ pub fn ingest_teasers_capped(
     // terms so it is stable for the lifetime of one query — coherent pagination across pages.
     let query = tags.join(" ");
     let seed = hash_seed(tags, content_types);
-    hits = rank_hits(hits, &query, seed);
+    // QURATOR-260: the ranking's future-skew ceiling needs `now`. This signature is frozen by its
+    // callers (`browse::search_teasers_capped`), so the wall clock is read once HERE, at the
+    // boundary — the same layering the freshness gates use (`binding`/`count` take `now` as a
+    // parameter; hb-app reads the clock above them).
+    hits = rank_hits(hits, &query, seed, Timestamp::now().as_secs());
     let capped = hits.len() > cap;
     hits.truncate(cap);
     (hits, capped)
@@ -162,8 +166,10 @@ pub fn ingest_teasers_capped(
 ///    `content_types`. Fuzzy, NOT semantic: semantic search would need either a large local
 ///    embedding model in the installer or a remote API call that leaks the user's search terms —
 ///    both unacceptable here. Trigram overlap is local, small, dependency-free, and catches typos
-///    and partial-word matches (e.g. "ani" matches "anime"). Recency (`created_at`, newest first) is
-///    the stable tiebreak.
+///    and partial-word matches (e.g. "ani" matches "anime"). Recency (newest first) is the stable
+///    tiebreak — but skew-capped: `created_at` is author-controlled and relay-carried, so a date
+///    beyond `now + FUTURE_SKEW_SECS` is demoted to the bottom of its group (QURATOR-260, see the
+///    `effective_recency` key) instead of winning recency forever.
 ///
 ///    **QURATOR-70 — exact tag outranks substring** (owner ruling 1: a self-applied tag is a
 ///    deliberate signal; a bio mention is incidental). The single ranking key is a `(tag_tier, score,
@@ -180,7 +186,7 @@ pub fn ingest_teasers_capped(
 /// `content_types`. Collection names, descriptions, and file/folder names are hoard contents sealed
 /// under a browse-key and fenced by `scan_selective` (M8 F1); a searchable index IS a disclosure, so
 /// they are deliberately absent (owner ruling 2026-08-10).
-pub fn rank_hits(hits: Vec<SearchHit>, query: &str, seed: u64) -> Vec<SearchHit> {
+pub fn rank_hits(hits: Vec<SearchHit>, query: &str, seed: u64, now: u64) -> Vec<SearchHit> {
     let query = query.trim();
     if query.is_empty() {
         // Type-toggle browse: deterministic shuffle so pagination is coherent across pages.
@@ -192,7 +198,7 @@ pub fn rank_hits(hits: Vec<SearchHit>, query: &str, seed: u64) -> Vec<SearchHit>
         // to substring counting, which is what a user typing two characters actually expects.
         let q_short = qlower.chars().count() < 3;
         let qtri = if q_short { std::collections::HashMap::new() } else { trigram_counts(&qlower) };
-        let mut scored: Vec<((u8, i64), SearchHit)> = hits
+        let mut scored: Vec<ScoredHit> = hits
             .into_iter()
             .map(|h| {
                 let hay = h.teaser.display_name.to_lowercase()
@@ -211,15 +217,54 @@ pub fn rank_hits(hits: Vec<SearchHit>, query: &str, seed: u64) -> Vec<SearchHit>
                 // the query as an exact (case-insensitive) tag outranks any pure-substring hit.
                 let tag_tier: u8 =
                     if h.teaser.tags.iter().any(|t| t.to_lowercase() == qlower) { 1 } else { 0 };
-                ((tag_tier, score), h)
+                // QURATOR-260: the recency tiebreak consumes the skew-capped key, never the raw
+                // `created_at`.
+                let recency = effective_recency(h.created_at, now);
+                ((tag_tier, score), recency, h)
             })
             .collect();
-        // Descending (tag_tier, fuzzy score), then descending recency. sort_by is stable, so
-        // equal-key hits preserve the ingest presort's newest-first-by-npub order.
-        scored.sort_by(|a, b| {
-            b.0.cmp(&a.0).then(b.1.created_at.cmp(&a.1.created_at))
-        });
-        scored.into_iter().map(|(_, h)| h).collect()
+        // Descending (tag_tier, fuzzy score), then descending effective recency. sort_by is stable,
+        // so equal-key hits preserve the ingest presort's newest-first-by-npub order; demoted
+        // teasers all share one recency key, so they keep that order among themselves too.
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        scored.into_iter().map(|(_, _, h)| h).collect()
+    }
+}
+
+/// One scored hit in the discovery ranking: the `(tag_tier, fuzzy score)` primary key, the
+/// skew-capped `(in_tolerance, secs)` recency tiebreak from [`effective_recency`], and the hit.
+/// Named because `-D clippy::type-complexity` rejects the bare tuple inline (QURATOR-260 grew it
+/// from two members to three).
+type ScoredHit = ((u8, i64), (u8, u64), SearchHit);
+
+/// QURATOR-260 — the effective recency key for the discovery sort's tiebreak.
+///
+/// `created_at` on a teaser event is an author-chosen number a relay passes through, and the sort
+/// used to consume it raw — so a teaser dated arbitrarily far in the future outranked every
+/// legitimate teaser FOREVER (its timestamp never ages past `now`). A date beyond the shared skew
+/// ceiling (`hb_core::FUTURE_SKEW_SECS` — the same ±300 s window the presence binding's freshness
+/// gate and the online tally judge by, so discovery cannot disagree with them) carries no
+/// trustworthy ordering information; the key demotes it to the BOTTOM of its (tag_tier, score)
+/// group: `(0, 0)`, below every in-tolerance teaser's `(1, created_at)`.
+///
+/// Why demote rather than reject, and why the bottom rather than a ceiling clamp:
+/// - **Demote, not reject** — rejection drops the content from discovery entirely, a bigger hammer
+///   than the defect (an unearned RANK) and a censorship vector against an honest peer whose clock
+///   is badly skewed. Demotion keeps the teaser discoverable on its merits (tier + score) and
+///   removes only the unearned recency.
+/// - **Bottom, not `now + FUTURE_SKEW_SECS` (nor `now`)** — clamping to the ceiling still leaves
+///   the teaser newer than every legitimately past-dated teaser, i.e. still winning recency against
+///   all of them; the attack would cost nothing. The unearned advantage is removed, not bounded.
+///
+/// `created_at` feeds no identifier here (the §7 fingerprint derives from the npub; the per-npub
+/// dedup key is the npub), so clamping a DERIVED ranking key touches no identifier input — the
+/// stored `SearchHit::created_at` is carried unchanged. Demoted teasers share one key, so the
+/// stable sort preserves the ingest presort order among them.
+fn effective_recency(created_at: Timestamp, now: u64) -> (u8, u64) {
+    if created_at.as_secs() > now.saturating_add(hb_core::FUTURE_SKEW_SECS) {
+        (0, 0)
+    } else {
+        (1, created_at.as_secs())
     }
 }
 
@@ -720,7 +765,7 @@ mod tests {
             mk("z-last", "nothing relevant", 9_000),
             mk("a-first", "anime collector", 1_000),
         ];
-        let ranked = rank_hits(hits, "anime collector", 0);
+        let ranked = rank_hits(hits, "anime collector", 0, RANK_NOW);
         assert_eq!(ranked[0].teaser.display_name, "a-first", "fuzzy overlap beats recency");
         assert_eq!(ranked[1].teaser.display_name, "z-last");
     }
@@ -751,7 +796,7 @@ mod tests {
             hit_with_bio("newer-irrelevant", "collects porcelain", 9_000),
             hit_with_bio("older-match", "tv broadcasts and tv rips", 1_000),
         ];
-        let ranked = rank_hits(hits, "tv", 0);
+        let ranked = rank_hits(hits, "tv", 0, RANK_NOW);
         assert_eq!(
             ranked[0].teaser.display_name, "older-match",
             "a 2-char query must match on substance, not fall through to recency"
@@ -768,7 +813,7 @@ mod tests {
                 hit_with_bio("newer-irrelevant", "unrelated text", 9_000),
                 hit_with_bio("older-match", &format!("i collect {q} things"), 1_000),
             ];
-            let ranked = rank_hits(hits, q, 0);
+            let ranked = rank_hits(hits, q, 0, RANK_NOW);
             assert_eq!(
                 ranked[0].teaser.display_name, "older-match",
                 "a single-glyph query ({q}) must match, not score zero everywhere"
@@ -938,6 +983,163 @@ mod tests {
         assert!(
             !teaser_matches(&not_matching, &["berserk".into()], &["video".into()]),
             "bio match but content-type mismatch → no match"
+        );
+    }
+
+    // ── QURATOR-260 — a future-dated teaser must not win discovery ranking unboundedly ─────────
+    //
+    // `created_at` is author-controlled and the recency tiebreak consumed it raw, so a teaser
+    // dated year-3000 outranked every legitimate teaser forever. The fix demotes anything beyond
+    // the shared skew ceiling to the bottom of its (tag_tier, score) group — content stays
+    // discoverable, only the unearned recency goes. The rank_hits-driven tests below pin `now`
+    // explicitly: the ingest path reads the wall clock at its boundary, and a wall-clock-SIGNED
+    // fixture dodging the gate under test is a recorded failure here (2026-09-01) — every
+    // timestamp below is pinned relative to RANK_NOW, never to the real clock.
+    //
+    // Mutation probe (P-10, for the orchestrator to apply and revert): in `rank_hits`, inside the
+    // `.map(|h| { .. })` closure that builds the scored tuples — the ONE production line calling
+    // `effective_recency` on `h.created_at` (the sole such call inside `fn rank_hits`; the other
+    // textual mentions of that helper live in this test-module comment and in the helper's own
+    // definition) — replace the call's result with the raw timestamp pair `(1,
+    // h.created_at.as_secs())`, reverting the tiebreak key to uncapped recency.
+    // `rank_far_future_teaser_no_longer_wins_recency` and
+    // `rank_demoted_teaser_ranks_below_even_an_ancient_legit_teaser` must RED;
+    // `rank_exact_tag_tier_still_wins_even_when_future_dated` must stay GREEN (it pins that the
+    // demotion never touches the tier ordering, so a red there means the mutation overreached).
+
+    /// Test clock for the direct `rank_hits` calls. The legacy tests above pass it too: their
+    /// fixtures are all ≤ 9_000, deep in RANK_NOW's past, so the future gate never fires for them
+    /// and their assertions are unchanged.
+    const RANK_NOW: u64 = 1_700_000_000;
+
+    /// Direct-hit builder with controllable tags, so tier + recency vary independently while
+    /// name/bio (the trigram haystack) stay identical for equal-score comparisons.
+    fn ranked_hit(name: &str, tags: &[&str], ts: u64) -> SearchHit {
+        SearchHit {
+            npub: format!("npub1{name}"),
+            teaser: Teaser {
+                display_name: name.into(),
+                bio: String::new(),
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+                content_types: vec![],
+                picture: None, hide_in_rosters: false,
+            },
+            created_at: Timestamp::from(ts),
+        }
+    }
+
+    #[test]
+    fn rank_far_future_teaser_no_longer_wins_recency() {
+        // Identical name/tags → identical (tag_tier, score); ONLY recency can decide. The
+        // far-future teaser's raw created_at is larger, so the OLD sort ranked it first —
+        // permanently, since its timestamp never ages. Fed in ingest-presort order (future first)
+        // so the pass cannot be input order wearing the result's clothes.
+        let legit = ranked_hit("peer", &["anime"], RANK_NOW - 60);
+        let future = ranked_hit("peer", &["anime"], RANK_NOW + hb_core::FUTURE_SKEW_SECS + 1);
+        let ranked = rank_hits(vec![future, legit], "anime", 0, RANK_NOW);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(
+            ranked[0].created_at.as_secs(),
+            RANK_NOW - 60,
+            "the legitimate recent teaser wins recency"
+        );
+        assert_eq!(
+            ranked[1].created_at.as_secs(),
+            RANK_NOW + hb_core::FUTURE_SKEW_SECS + 1,
+            "the far-future teaser is demoted to the bottom of its group — not dropped"
+        );
+    }
+
+    #[test]
+    fn rank_teaser_inside_tolerance_ranks_normally() {
+        // A teaser dated exactly AT the ceiling (now + FUTURE_SKEW_SECS) is an honest slightly-
+        // ahead clock, not an attack: it keeps its recency and beats an older legitimate teaser.
+        // The boundary is `>` (mirroring `binding::verify_binding`'s freshness gate), so equality
+        // is in-tolerance.
+        let older = ranked_hit("peer", &["anime"], RANK_NOW - 60);
+        let at_ceiling = ranked_hit("peer", &["anime"], RANK_NOW + hb_core::FUTURE_SKEW_SECS);
+        let ranked = rank_hits(vec![older, at_ceiling], "anime", 0, RANK_NOW);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(
+            ranked[0].created_at.as_secs(),
+            RANK_NOW + hb_core::FUTURE_SKEW_SECS,
+            "an in-tolerance future date still wins recency normally"
+        );
+        assert_eq!(ranked[1].created_at.as_secs(), RANK_NOW - 60);
+    }
+
+    #[test]
+    fn rank_demoted_teaser_ranks_below_even_an_ancient_legit_teaser() {
+        // The discriminator between "clamped to a ceiling" (insufficient — the teaser would still
+        // outrank everything past-dated) and "demoted to the bottom": even a 1970-dated legitimate
+        // teaser ranks ABOVE the demoted one.
+        let ancient = ranked_hit("peer", &["anime"], 0);
+        let future = ranked_hit("peer", &["anime"], RANK_NOW + hb_core::FUTURE_SKEW_SECS + 86_400);
+        let ranked = rank_hits(vec![future, ancient], "anime", 0, RANK_NOW);
+        assert_eq!(
+            ranked[0].created_at.as_secs(),
+            0,
+            "an ancient legitimate teaser still outranks the demoted far-future one"
+        );
+        assert_eq!(ranked[1].created_at.as_secs(), RANK_NOW + hb_core::FUTURE_SKEW_SECS + 86_400);
+    }
+
+    #[test]
+    fn rank_exact_tag_tier_still_wins_even_when_future_dated() {
+        // The demotion removes an unearned RECENCY advantage, never the tier win. The future-dated
+        // teaser carries the query as an EXACT tag (tier 1); the legitimate one only repeats it in
+        // the bio with higher multiplicity (tier 0). The tier ordering must put the future-dated
+        // teaser FIRST, demotion notwithstanding.
+        let mut legit_bio_repeater = ranked_hit("hoarder", &["vhs"], RANK_NOW - 60);
+        legit_bio_repeater.teaser.bio = "berserk berserk berserk berserk".into();
+        let future_tag_carrier =
+            ranked_hit("archivist", &["berserk"], RANK_NOW + hb_core::FUTURE_SKEW_SECS + 86_400);
+        let ranked = rank_hits(vec![legit_bio_repeater, future_tag_carrier], "berserk", 0, RANK_NOW);
+        assert_eq!(
+            ranked[0].teaser.display_name,
+            "archivist",
+            "exact-tag tier still wins despite the future date"
+        );
+        assert_eq!(ranked[1].teaser.display_name, "hoarder");
+    }
+
+    #[test]
+    fn rank_demoted_teasers_preserve_ingest_presort_order() {
+        // The documented stable-sort property must survive the demotion: demoted teasers share the
+        // key (0, 0), so equal-(tier, score) demoted hits keep the order ingest's newest-first
+        // presort produced — here the year-2300 teaser before the now+301 one, exactly as fed.
+        let near = ranked_hit("peer", &["anime"], RANK_NOW + hb_core::FUTURE_SKEW_SECS + 1);
+        let far = ranked_hit("peer", &["anime"], RANK_NOW + 86_400 * 365 * 300);
+        let ranked = rank_hits(vec![far, near], "anime", 0, RANK_NOW);
+        assert_eq!(ranked[0].created_at.as_secs(), RANK_NOW + 86_400 * 365 * 300);
+        assert_eq!(ranked[1].created_at.as_secs(), RANK_NOW + hb_core::FUTURE_SKEW_SECS + 1);
+    }
+
+    #[test]
+    fn ingest_future_dated_teaser_is_demoted_not_dropped() {
+        // End-to-end through the production entry point (`browse::search_teasers_capped` calls
+        // exactly this ingest). `now` is read at test setup and pinned into BOTH fixtures; the
+        // production wall-clock read happens microseconds later, and the drift between the two
+        // reads is astronomically below FUTURE_SKEW_SECS — so the gate's verdict is deterministic
+        // without signing a fixture from an ambient clock the gate never sees.
+        let now = Timestamp::now().as_secs();
+        let legit = {
+            let id = Identity::generate();
+            let t = teaser_with(&["anime"], &["video"]);
+            ev_at(&id, &t, now - 60)
+        };
+        let future = {
+            let id = Identity::generate();
+            let t = teaser_with(&["anime"], &["video"]);
+            ev_at(&id, &t, now + hb_core::FUTURE_SKEW_SECS + 60)
+        };
+        let hits = ingest_teasers(vec![future, legit], &["anime".into()], &[], 100);
+        assert_eq!(hits.len(), 2, "a future-dated teaser is DEMOTED, never dropped from discovery");
+        assert_eq!(hits[0].created_at.as_secs(), now - 60, "the legitimate teaser ranks first");
+        assert_eq!(
+            hits[1].created_at.as_secs(),
+            now + hb_core::FUTURE_SKEW_SECS + 60,
+            "the future-dated teaser is demoted to the bottom"
         );
     }
 }
