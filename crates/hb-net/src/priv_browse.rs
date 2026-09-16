@@ -18,6 +18,19 @@ use nostr::prelude::*;
 use crate::client::RelayClient;
 use crate::error::NetError;
 
+/// Relay-fetch budget for `me`'s personal gift-wrap inbox (QURATOR-291), shared by
+/// [`fetch_private_listings`] and [`fetch_key_grants`] — both build the identical
+/// `{kinds:[1059], #p:[me]}` filter documented at the top of this file as the same multiplexed
+/// inbox `hb_net::topic`'s `fetch_join_requests` / `fetch_invite` also read (DMs, join requests,
+/// invites, key grants and private listings all land on one `me`-tagged kind-1059 stream), so an
+/// attacker who knows `me`'s pubkey can flood it with throwaway wraps; without a `.limit()` the
+/// relay's own internal cap — not this budget — decides which of `me`'s real wraps come back.
+/// Matches `topic::TOPIC_INBOX_FETCH_LIMIT` (500): same physical inbox, same traffic profile, no
+/// basis for a different number here. Sized generously above any plausible backlog of pending
+/// private listings / key grants a browse should ever need to consider — a bound on the fetch,
+/// never on how many gift-wraps `me` may legitimately receive over time.
+pub const PRIV_INBOX_FETCH_LIMIT: usize = 500;
+
 /// Publish the N gift-wrapped private-listing events (from `seal_private_listing`) to **all** relays
 /// (F14 — each wrap multi-published like every Hoardbook event). Errors only if a wrap was accepted
 /// by no relay (an all-reject / all-drop), surfacing the reason — never a silent drop.
@@ -43,8 +56,7 @@ pub async fn fetch_private_listings(
     allowlist: &[PublicKey],
     timeout: Duration,
 ) -> Result<Vec<OpenedPrivate>, NetError> {
-    let filter = Filter::new().kind(Kind::GiftWrap).pubkey(me.public_key());
-    let wraps = client.fetch(filter, timeout).await?;
+    let wraps = client.fetch(priv_inbox_filter(me), timeout).await?;
     let mut opened: Vec<OpenedPrivate> = Vec::new();
     for w in wraps {
         if let Ok(o) = open_private_listing(me, &w) {
@@ -73,9 +85,18 @@ pub async fn fetch_key_grants(
     allowlist: &[PublicKey],
     timeout: Duration,
 ) -> Result<Vec<OpenedKeyGrant>, NetError> {
-    let filter = Filter::new().kind(Kind::GiftWrap).pubkey(me.public_key());
-    let wraps = client.fetch(filter, timeout).await?;
+    let wraps = client.fetch(priv_inbox_filter(me), timeout).await?;
     Ok(open_key_grant_wraps(me, &wraps, allowlist))
+}
+
+/// Build the personal gift-wrap inbox filter — **pure** (no I/O), shared by
+/// [`fetch_private_listings`] and [`fetch_key_grants`], which built byte-identical filters. One
+/// builder means one budget and one place a mutation can bite, so the pinning test reds when
+/// production loses its `.limit()`. ⚠ A test that rebuilds this filter inline instead of calling
+/// here asserts against a lookalike it controls and stays green under that mutation — the
+/// 2026-09-16 sweep caught exactly that (CLAUDE.md §9 P-6). Call this, never a copy.
+pub(crate) fn priv_inbox_filter(me: &Identity) -> Filter {
+    Filter::new().kind(Kind::GiftWrap).pubkey(me.public_key()).limit(PRIV_INBOX_FETCH_LIMIT)
 }
 
 /// The pure open/trust/dedup core of [`fetch_key_grants`] — everything after the relay fetch, so a
@@ -179,6 +200,20 @@ mod tests {
             inner_author: *author,
             created_at,
         }
+    }
+
+    #[test]
+    fn inbox_fetch_filter_declares_an_explicit_limit_qurator_291() {
+        // mutation: delete the `.limit(...)` call from the chain inside `priv_inbox_filter` (or
+        // change the const's declared value) — either reds this.
+        //
+        // ⚠ This test CALLS the production builder, which `fetch_private_listings` and
+        // `fetch_key_grants` now BOTH use. An earlier version rebuilt the filter inline and the
+        // 2026-09-16 mutation sweep proved it vacuous — deleting production's `.limit()` left it
+        // green. Never reconstruct this filter here.
+        let me = Identity::generate();
+        let f = priv_inbox_filter(&me);
+        assert_eq!(f.limit, Some(PRIV_INBOX_FETCH_LIMIT), "inbox fetch budget is declared explicitly");
     }
 
     #[test]
