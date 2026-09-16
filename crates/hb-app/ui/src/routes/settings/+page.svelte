@@ -85,7 +85,21 @@
 		} catch (e) { toast(`Not a valid Hoardbook backup: ${String(e)}`, 'error'); return; }
 		restorePath = path as string;
 		restorePass = '';
-		if (!restoreNeedsPass) doRestore();
+		if (!restoreNeedsPass) {
+			// QURATOR-275: the header declares plaintext, so no passphrase will ever be asked —
+			// make that absence EXPLICIT before anything destructive runs. The header is
+			// attacker-controlled: a forged plaintext archive swapped for the user's encrypted one
+			// otherwise sails through (prompt skipped, and validateBackup(null)/restoreData(null)
+			// is the legitimate plaintext combination, so nothing errors). Informed consent, not a
+			// credential: a genuine plaintext backup — which Hoardbook itself produces — stays
+			// restorable, it just has to be confirmed, like plaintext export is on the way out.
+			const ok = await confirm(
+				'This backup is not encrypted. It was saved without a passphrase, and anyone with the file could have read or changed it — if you saved yours with a passphrase, this is not your file. Restore it anyway?',
+				{ title: 'Unencrypted backup', kind: 'warning' },
+			);
+			if (!ok) { restorePath = null; return; }
+			doRestore();
+		}
 	}
 
 	async function doRestore() {
