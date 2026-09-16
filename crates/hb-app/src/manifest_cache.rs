@@ -165,8 +165,10 @@ fn eviction_plan(entries: &[(String, usize, u64)], cap: usize) -> Vec<String> {
 /// Per-directory write locks for the cache. Hoisted to MODULE scope — a per-function static is
 /// never shared across callers (CLAUDE.md §9, the same rule [`MIGRATED`] follows) — and keyed by
 /// directory because every mutation of one cache directory races only its siblings: `put`'s
-/// staged write+rename, `get_inner`'s recency write-back, and the legacy migration's
-/// canonical-slot rename (QURATOR-262/273/274). One lock per directory is per-key granularity
+/// staged write+rename and cap-eviction pass, `get_inner`'s recency write-back, the legacy
+/// migration's canonical-slot rename (QURATOR-262/273/274), and `clear_all`'s whole-directory
+/// wipe (QURATOR-277 — a `put` in flight landing its rename past the wipe's walk would resurrect
+/// a manifest the user just deliberately cleared). One lock per directory is per-key granularity
 /// in practice: the cache holds one file per `(npub, slug)` and production uses one directory.
 ///
 /// ⚠ **Never nest.** std's `Mutex` is not reentrant, so no code path may take a directory lock
@@ -231,26 +233,32 @@ pub fn put(
     // (QURATOR-274).
     let final_path = dir.join(entry_filename(npub, slug));
     let tmp_path = fresh_tmp_path(&final_path);
-    // Hold the directory's write lock across stage+rename so the swap is serialized against a
-    // concurrent `get`'s recency write-back and the legacy migration's rename — without it, that
-    // write-back can land AFTER this rename and revert the cache to its pre-read bytes
-    // (QURATOR-262). (`migrate_legacy_entries` above ran BEFORE this acquisition — no nesting.)
+    // Hold the directory's write lock across stage+rename AND the cap-eviction pass below, so both
+    // are serialized against a concurrent `get`'s recency write-back and the legacy migration's
+    // rename — without it, that write-back can land AFTER this rename and revert the cache to its
+    // pre-read bytes (QURATOR-262). (`migrate_legacy_entries` above ran BEFORE this acquisition —
+    // no nesting; `scan`/`remove_file` take no lock, so the widened hold stays flat.)
     {
         let lock = dir_write_lock(dir);
         let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         std::fs::write(&tmp_path, &bytes)?;
         std::fs::rename(&tmp_path, &final_path)?;
-    }
 
-    // Only walk the directory when a caller actually asked for a ceiling. `scan` READS EVERY CACHED
-    // MANIFEST to build its plan, so running it at the unbounded default would make each write cost
-    // O(total cache bytes) — on a cache of multi-MB manifests that is the dominant cost of a fetch.
-    // The projection drops the key fields `scan` also returns — eviction sorts on bytes/recency only.
-    if cap_bytes != usize::MAX {
-        let entries: Vec<(String, usize, u64)> =
-            scan(dir).into_iter().map(|(n, b, la, _, _, _)| (n, b, la)).collect();
-        for name in eviction_plan(&entries, cap_bytes) {
-            let _ = std::fs::remove_file(dir.join(name)); // best-effort; a stuck file just lingers
+        // Only walk the directory when a caller actually asked for a ceiling. `scan` READS EVERY
+        // CACHED MANIFEST to build its plan, so running it at the unbounded default would make each
+        // write cost O(total cache bytes) — on a cache of multi-MB manifests that is the dominant
+        // cost of a fetch. The projection drops the key fields `scan` also returns — eviction sorts
+        // on bytes/recency only. This pass runs INSIDE the lock (QURATOR-277 adjacency): a
+        // concurrent `get` that read an entry before this plan evicted it would otherwise land its
+        // recency write-back after the delete and RESURRECT the evicted entry — a cap overshoot
+        // under an otherwise best-effort posture. `get` holds the same lock across its whole
+        // read-modify-write, so inside the hold the two are indivisible.
+        if cap_bytes != usize::MAX {
+            let entries: Vec<(String, usize, u64)> =
+                scan(dir).into_iter().map(|(n, b, la, _, _, _)| (n, b, la)).collect();
+            for name in eviction_plan(&entries, cap_bytes) {
+                let _ = std::fs::remove_file(dir.join(name)); // best-effort; a stuck file just lingers
+            }
         }
     }
     Ok(())
@@ -381,6 +389,15 @@ pub fn cache_dir(base: &Path) -> PathBuf {
 /// directory on demand, so nothing needs to be recreated here). Scope is the manifest cache
 /// ONLY — never the wider store (`DataStore::wipe` is a different, destructive operation).
 pub fn clear_all(dir: &Path) -> std::io::Result<()> {
+    // Hold the directory's write lock across the removal (QURATOR-277), taken as the FIRST
+    // statement of the body so the shape stays flat — never nested. Without it, a `put` in flight
+    // completes its stage+rename AFTER `remove_dir_all` has walked past that entry, resurrecting a
+    // manifest the user just deliberately cleared (INV-8's deliberate-vs-accidental distinction is
+    // exactly what that resurrection blurs) — or fails the wipe with ENOTEMPTY. The lock is keyed
+    // by path and exists whether or not the directory does, so the already-absent arm below is
+    // unchanged: this only serializes the wipe against its siblings, it adds no behaviour.
+    let lock = dir_write_lock(dir);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
     match std::fs::remove_dir_all(dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1178,6 +1195,54 @@ mod tests {
             "the migration must not clobber a canonical file that appeared while it waited"
         );
         assert_eq!(entry_snapshot(dir.path()).len(), 1, "exactly the canonical file remains");
+    }
+
+    /// QURATOR-277: `clear_all` is the QURATOR-176 user-facing "clear cached collections" wipe —
+    /// GLOBAL and ALL-OR-NOTHING by owner ruling — and must hold the directory write lock across
+    /// its `remove_dir_all`. Without it, a `put` in flight completes its stage+rename AFTER the
+    /// wipe has walked past that entry, resurrecting a manifest the user just deliberately cleared
+    /// (INV-8: durable deletion is deliberate, never accidentally undone), or fails the wipe with
+    /// ENOTEMPTY. It is the write path the lock registry's "every mutation races only its siblings"
+    /// claim missed until QURATOR-277.
+    ///
+    /// MUTATION (P-10) — resolved by containing item, anchor by POSITION not text (`dir_write_lock(`
+    /// appears at multiple production sites plus comment sites like this one, so a bare identifier
+    /// is not a unique anchor): in `clear_all`, delete the two-line acquisition that is the FIRST
+    /// statement of the body, BEFORE the `match std::fs::remove_dir_all(dir)` (`let lock =
+    /// dir_write_lock(dir);` then the `let _guard = lock.lock()...` line). The spawned `clear_all`
+    /// then no longer blocks on the lock this test holds — a one-entry tempdir removes in well
+    /// under the 100 ms window — so `recv_timeout` returns `Ok` and the `is_err()` assertion reds.
+    /// The post-release assertions can stay green under it; the blocking witness is the control.
+    /// (Distinct from the two `clear_all` mutations noted beside the QURATOR-176 tests below: the
+    /// no-op body and the NotFound arm — three tests, three independent discriminators.)
+    #[test]
+    fn the_wipe_is_serialized_against_concurrent_puts() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "npubA", "films", "fp1", "ENV", 10, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
+
+        // The test owns the directory write lock — exactly the state an in-flight `put`'s critical
+        // section leaves the cache in: a wipe that begins now must wait, not race it.
+        let lock = dir_write_lock(dir.path());
+        let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cache_dir = dir.path().to_path_buf();
+        let wiper = std::thread::spawn(move || {
+            let res = clear_all(&cache_dir);
+            let _ = tx.send(());
+            res
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
+            "clear_all must hold the directory write lock across its removal — the user-asked wipe may not race an in-flight put"
+        );
+        drop(guard);
+        wiper.join().unwrap().unwrap();
+
+        // The released wipe still removes the directory itself, and the cache keeps working
+        // afterwards (`put` recreates it on demand — same posture as the QURATOR-176 tests below).
+        assert!(!dir.path().exists(), "the cache directory itself is removed, not emptied");
+        put(dir.path(), "npubB", "music", "fp2", "ENV-B", 300, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
+        assert_eq!(get(dir.path(), "npubB", "music", "fp2", 400).as_deref(), Some("ENV-B"));
     }
 
     // QURATOR-176 — the global, all-or-nothing clear.
