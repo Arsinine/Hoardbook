@@ -13,11 +13,14 @@
 //!   identity **into memory** and persists it **only** via [`DataStore::save_identity`] (DPAPI on
 //!   Windows, 0600 elsewhere), so the portable plaintext never lands on disk.
 //! - **Every tar entry is hostile input (AB6 discipline).** Restore rejects `..` / absolute /
-//!   escaping paths, forbids symlink + hardlink entries outright, and enforces tar-bomb caps
-//!   (total size + entry count). A corrupt/garbage tar is a reasoned `Err`, never a panic.
+//!   escaping paths (including the Windows-normalization variants like `.. ` and `...`,
+//!   QURATOR-224), forbids symlink + hardlink entries outright, and enforces tar-bomb caps
+//!   (total size + entry count + materialized directory components, QURATOR-230). A
+//!   corrupt/garbage tar is a reasoned `Err`, never a panic.
 //! - **Non-empty target is a hard refuse, not a clobber.** `restore_inner` returns
 //!   [`BackupError::TargetNotEmpty`]; the UI owns the confirm-and-wipe before re-calling.
 
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -30,6 +33,14 @@ use crate::store::{DataStore, StoredIdentity};
 const MAX_TOTAL_BYTES: u64 = 500 * 1024 * 1024;
 /// Tar-bomb cap: entry count. A real profile has tens–hundreds of files.
 const MAX_ENTRIES: usize = 10_000;
+/// Tar-bomb cap: cumulative path components materialized (QURATOR-230). Directories declare
+/// size 0 and count as one entry each, so neither the byte cap nor the entry cap bounds a sea
+/// of deep paths (~2,000-deep names just under PATH_MAX × `MAX_ENTRIES` entries ≈ 20M mkdirs,
+/// inode exhaust). Every entry's component count accrues here — a file's parent dirs are
+/// materialized just as truly as a dir entry's own segments — so shared prefixes are
+/// over-counted, which is conservative. 50k sits above a maximal legit profile (10,000 entries
+/// × 3 components deep) and far below the amplification.
+const MAX_DIR_COMPONENTS: usize = 50_000;
 
 /// The portable identity entry name inside the archive (always JSON, even on Windows where the
 /// at-rest file is `identity.bin`).
@@ -90,7 +101,8 @@ pub fn backup_inner(store: &DataStore, mode: BackupMode<'_>) -> Result<Vec<u8>, 
 
 /// Decrypt → sanitize → unpack an archive into `store`'s directory, re-wrapping the secrets under
 /// the local at-rest scheme. `passphrase` is `Option` because the archive header is self-describing
-/// (an encrypted archive + `None` is a reasoned `Err`). Refuses a non-empty target.
+/// (an encrypted archive + `None` is a reasoned `Err`; a plaintext archive + a supplied passphrase
+/// is a tamper-signal `Err`, QURATOR-228). Refuses a non-empty target.
 ///
 /// **Atomic (QURATOR-126 #15):** the archive is extracted *in full* into a staging directory
 /// beside the target; only a complete, error-free extraction is committed by renaming it into
@@ -123,7 +135,8 @@ pub fn restore_inner(
 
 /// Fully validate an archive WITHOUT touching any datastore (QURATOR-126 #15): run the exact
 /// [`extract_archive`] production path — Argon2id KDF, AEAD decrypt, every-entry sanitize + tar-bomb
-/// caps, identity JSON parse + at-rest re-wrap — into a throwaway directory. `Ok(())` is the
+/// caps, identity JSON parse + semantic validation (QURATOR-235) + at-rest re-wrap — into a
+/// throwaway directory. `Ok(())` is the
 /// promise that restoring this file with this passphrase into a wiped profile will succeed; every
 /// failure a restore can hit is hit here first, at zero risk to live data. This replaces a 72-byte
 /// header sniff as the pre-wipe gate.
@@ -143,8 +156,17 @@ fn extract_archive(
     archive: &[u8],
     passphrase: Option<&str>,
 ) -> Result<(), BackupError> {
+    // A supplied passphrase on a plaintext-header archive is a hard MISMATCH, not a silent
+    // no-op (QURATOR-228): the mode byte is attacker-controlled, and a file that claims
+    // plaintext while the user expects encryption is the classic swapped-file signal — the
+    // exact threat the passphrase AEAD exists to make detectable. Honouring the header over
+    // the user's encrypted posture would turn an authenticated restore into an unauthenticated
+    // one with no error ever reaching the user.
     if !hb_core::backup::is_encrypted_backup(archive)? && passphrase.is_some() {
-        tracing::debug!("plaintext backup: ignoring the supplied passphrase (header is authoritative)");
+        return Err(BackupError::Archive(
+            "passphrase supplied but the archive is not encrypted — the file may have been tampered with or swapped"
+                .into(),
+        ));
     }
 
     let tar_bytes = decrypt_backup(passphrase, archive)?;
@@ -158,6 +180,7 @@ fn extract_archive(
     let mut total: u64 = 0;
     let mut read_total: u64 = 0;
     let mut count: usize = 0;
+    let mut components_total: usize = 0;
     let mut pending_identity: Option<StoredIdentity> = None;
 
     for entry in entries {
@@ -184,11 +207,20 @@ fn extract_archive(
         let size = entry.header().size().unwrap_or(0);
         total = total.saturating_add(size);
         count += 1;
+        // Directory materialization is part of the bomb surface too: dirs declare size 0 and
+        // count as one entry, so only a cumulative component budget bounds deep-path
+        // amplification (QURATOR-230). Counted before anything is created on disk.
+        components_total = components_total.saturating_add(rel.components().count());
         if count > MAX_ENTRIES {
             return Err(BackupError::Archive(format!("too many entries (> {MAX_ENTRIES})")));
         }
         if total > MAX_TOTAL_BYTES {
             return Err(BackupError::Archive("archive exceeds the size cap (tar bomb?)".into()));
+        }
+        if components_total > MAX_DIR_COMPONENTS {
+            return Err(BackupError::Archive(
+                "archive exceeds the directory budget (tar bomb?)".into(),
+            ));
         }
 
         if etype.is_dir() {
@@ -208,6 +240,14 @@ fn extract_archive(
         if rel_eq(&rel, IDENTITY_ENTRY) {
             let stored: StoredIdentity = serde_json::from_slice(&buf)
                 .map_err(|e| BackupError::Archive(format!("identity entry is not valid JSON: {e}")))?;
+            // Semantic validation BEFORE anything is persisted (QURATOR-235): a JSON-valid but
+            // garbage identity must fail HERE, inside the shared core. `validate_inner`'s
+            // `Ok(())` promises the restore will succeed; a `from_stored` failure surfacing
+            // only after `commit_stage` has replaced the (already wiped) profile bricks it
+            // with attacker files and a dead-end identity.
+            crate::identity_state::AppIdentity::from_stored(&stored).map_err(|e| {
+                BackupError::Archive(format!("identity entry is not a valid identity: {e}"))
+            })?;
             pending_identity = Some(stored);
             continue;
         }
@@ -338,11 +378,26 @@ fn collect_files(
 
 /// Reject absolute / `..` / prefix / root components; return a clean relative path. The AB6
 /// discipline applied to restore — a `../../.ssh/authorized_keys` entry must never be written.
+///
+/// Windows-normalization hardening (QURATOR-224): Win32 path normalization strips trailing
+/// dots and spaces from every segment, so a component like `.. ` or `...` is `Normal` to
+/// Rust's lexical rules but resolves as `..` on the filesystem (and `identity. ` collides with
+/// `identity`). Any component that would not survive that normalization verbatim is rejected
+/// here, before it is ever pushed — the check must bind under the FILESYSTEM's rules, not just
+/// the lexer's.
 fn sanitize_rel(path: &Path) -> Result<PathBuf, BackupError> {
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {
-            Component::Normal(c) => out.push(c),
+            Component::Normal(c) => {
+                if win32_would_normalize(c) {
+                    return Err(BackupError::Archive(format!(
+                        "unsafe path component in '{}'",
+                        path.display()
+                    )));
+                }
+                out.push(c)
+            }
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err(BackupError::Archive(format!(
@@ -356,6 +411,15 @@ fn sanitize_rel(path: &Path) -> Result<PathBuf, BackupError> {
         return Err(BackupError::Archive("empty entry path".into()));
     }
     Ok(out)
+}
+
+/// A component Win32 path normalization would not preserve verbatim: normalization strips
+/// trailing dots and spaces from each path segment (`.. ` and `...` resolve as `..`, `foo. `
+/// as `foo`), so the filesystem-resolved name diverges from the lexically-checked one
+/// (QURATOR-224). Our own writer never emits such names; seeing one means a hand-crafted
+/// header.
+fn win32_would_normalize(c: &OsStr) -> bool {
+    matches!(c.as_encoded_bytes().last(), Some(b'.') | Some(b' '))
 }
 
 fn rel_to_slash(rel: &Path) -> String {
@@ -627,12 +691,37 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_archive_with_passphrase_ignores_passphrase() {
-        let (_d1, src, npub) = store_with_fake_profile();
+    fn plaintext_archive_with_passphrase_is_refused() {
+        // QURATOR-228: a supplied passphrase on a plaintext-header archive is a tamper signal,
+        // not a no-op — the mode byte is attacker-controlled, and silently honouring it over the
+        // user's encrypted posture turns an authenticated restore into an unauthenticated one
+        // (the swapped-file attack). This test SUPERSEDES
+        // `plaintext_archive_with_passphrase_ignores_passphrase`, which pinned the old
+        // ignore-behaviour (a debug log, then success).
+        //
+        // MUTATION (must redden): in `extract_archive`, revert the plaintext+passphrase guard
+        // to the old `tracing::debug!(...)`-and-continue — the restore then succeeds and
+        // `unwrap_err()` panics.
+        let (_d1, src, _npub) = store_with_fake_profile();
         let archive = backup_inner(&src, BackupMode::Plaintext).unwrap();
         let (_d2, dst) = empty_store();
-        // A stray passphrase on a plaintext archive is ignored (the mode=0 header is authoritative).
-        restore_inner(&dst, &archive, Some("ignored-passphrase")).unwrap();
+        let err = restore_inner(&dst, &archive, Some("a-passphrase")).unwrap_err();
+        assert!(matches!(err, BackupError::Archive(_)), "got {err:?}");
+        // The mismatch must also fire at the pre-wipe gate, before the UI destroys anything.
+        assert!(validate_inner(&archive, Some("a-passphrase")).is_err());
+        // And the target was never touched (staging discarded, INV-8).
+        assert!(std::fs::read_dir(dst.base_dir()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn plaintext_archive_restores_fine_without_passphrase() {
+        // Positive control for the QURATOR-228 guard: plaintext + `None` is the legitimate
+        // combination and must keep working — the guard pins the MISMATCH, not plaintext mode.
+        let (_d1, src, npub) = store_with_fake_profile();
+        let archive = backup_inner(&src, BackupMode::Plaintext).unwrap();
+        validate_inner(&archive, None).unwrap();
+        let (_d2, dst) = empty_store();
+        restore_inner(&dst, &archive, None).unwrap();
         let restored = AppIdentity::from_stored(&dst.load_identity().unwrap().unwrap()).unwrap();
         assert_eq!(restored.npub(), npub);
     }
@@ -791,5 +880,119 @@ mod tests {
         let ok = std::io::Cursor::new(vec![0xAAu8; 8]);
         let buf = read_entry_bounded(ok, 10).unwrap();
         assert_eq!(buf.len(), 8);
+    }
+
+    // -- QURATOR-224: Windows path-normalization traversal --------------------------------------
+
+    #[test]
+    fn sanitize_rel_rejects_windows_normalization_variants() {
+        // `.. `, `...`, ` .`, `foo.`, `foo ` are `Component::Normal` to Rust's lexer, but Win32
+        // normalization strips trailing dots/spaces per segment, so `.. ` resolves as `..` and
+        // `identity. ` collides with `identity` on the filesystem. All must be refused before
+        // any filesystem call, on every platform.
+        //
+        // MUTATION (must redden): in `sanitize_rel`, revert the `Component::Normal(c)` arm to
+        // the unguarded `out.push(c)` (delete the `win32_would_normalize` check) — these
+        // components then pass the lexer and `Ok(_)` is returned.
+        for hostile in [
+            ".. /escape",
+            "...",
+            "a/.. /b",
+            " .",
+            "foo.",
+            "foo ",
+            "identity/identity. ",
+        ] {
+            let err = sanitize_rel(Path::new(hostile)).unwrap_err();
+            assert!(
+                matches!(err, BackupError::Archive(_)),
+                "{hostile:?} must be refused, got {err:?}"
+            );
+        }
+        // Positive control: clean names (dots/spaces in the MIDDLE) still pass.
+        assert_eq!(
+            sanitize_rel(Path::new("a.b/c d/e.json")).unwrap(),
+            PathBuf::from("a.b/c d/e.json")
+        );
+    }
+
+    #[test]
+    fn restore_rejects_windows_dot_traversal_entries() {
+        // The QURATOR-224 vector end-to-end: a forged `.. ` component is `Normal` to the lexer
+        // but Win32 trims it to `..` at the filesystem layer. On Linux `.. ` is a literal
+        // filename, so the pin is that the GUARD refuses it — a `Normal(".. ")` component must
+        // never reach the FS on any platform. Forged into the header bytes like the plain `..`
+        // sibling test, since the builder sanitizes `..` on write but passes `.. ` through.
+        //
+        // MUTATION (must redden): in `sanitize_rel`, delete the `win32_would_normalize` guard
+        // so the arm is `Component::Normal(c) => out.push(c)` again — the entry is then
+        // written (on Linux as a literal `.. ` file) and restore returns `Ok(())`.
+        let archive = tar_with_forged_name(b".. /escape.txt");
+        let (_d, dst) = empty_store();
+        let err = restore_inner(&dst, &archive, None).unwrap_err();
+        assert!(matches!(err, BackupError::Archive(_)), "got {err:?}");
+        assert!(!dst.base_dir().parent().unwrap().join("escape.txt").exists());
+    }
+
+    // -- QURATOR-230: directory-materialization tar bomb ----------------------------------------
+
+    #[test]
+    fn restore_rejects_directory_materialization_bomb() {
+        // Directories declare size 0 and each counts as ONE entry, so neither the byte cap nor
+        // the entry cap sees a sea of deep paths (~2,000-deep names just under PATH_MAX ×
+        // MAX_ENTRIES entries ≈ 20M mkdirs of inode exhaust). The cumulative component budget
+        // must refuse it. Entries share a prefix so a mutated (guard-removed) run stays cheap —
+        // the budget still trips on the cumulative count.
+        //
+        // MUTATION (must redden): delete the `components_total` accrual + `MAX_DIR_COMPONENTS`
+        // check in `extract_archive`'s caps block — the archive then extracts cleanly (one
+        // shared ~1,899-dir prefix, 28 tiny files) and `unwrap_err()` panics.
+        let depth: usize = 1_900; // components per entry — full path stays under PATH_MAX
+        let entries = (MAX_DIR_COMPONENTS / depth) + 2; // 28 × 1,900 = 53,200 > 50,000
+        let prefix = vec!["a"; depth - 1].join("/");
+        let mut b = tar::Builder::new(Vec::new());
+        for i in 0..entries {
+            append_bytes(&mut b, &format!("{prefix}/f{i}"), b"x").unwrap();
+        }
+        let archive = encrypt_backup(BackupMode::Plaintext, &b.into_inner().unwrap()).unwrap();
+        let (_d, dst) = empty_store();
+        let err = restore_inner(&dst, &archive, None).unwrap_err();
+        assert!(matches!(err, BackupError::Archive(_)), "got {err:?}");
+        assert!(
+            std::fs::read_dir(dst.base_dir()).unwrap().next().is_none(),
+            "a refused bomb must not leave a half-materialized tree"
+        );
+    }
+
+    // -- QURATOR-235: semantic identity validation before the commit ----------------------------
+
+    #[test]
+    fn validate_inner_rejects_semantically_invalid_identity() {
+        // A JSON-valid but garbage identity must fail the PRE-WIPE gate: the semantic check
+        // (`AppIdentity::from_stored`) runs inside the shared extraction core, not only in
+        // `restore_data` after `commit_stage` has already replaced the wiped profile with
+        // attacker files and a broken identity.
+        //
+        // MUTATION (must redden): delete the `AppIdentity::from_stored` check in
+        // `extract_archive`'s identity arm — the JSON parses fine, `save_identity` accepts
+        // anything, and validation returns `Ok(())`.
+        let stored = StoredIdentity {
+            version: 1,
+            nsec: "garbage".into(),
+            browse_key_hex: "00".repeat(32),
+            transport_secret_hex: "00".repeat(32),
+        };
+        let json = serde_json::to_vec(&stored).unwrap();
+        let mut b = tar::Builder::new(Vec::new());
+        append_bytes(&mut b, IDENTITY_ENTRY, &json).unwrap();
+        let archive = encrypt_backup(BackupMode::Plaintext, &b.into_inner().unwrap()).unwrap();
+
+        assert!(validate_inner(&archive, None).is_err());
+        let (_d, dst) = empty_store();
+        assert!(restore_inner(&dst, &archive, None).is_err());
+        assert!(
+            std::fs::read_dir(dst.base_dir()).unwrap().next().is_none(),
+            "a semantically-invalid identity must not be committed"
+        );
     }
 }
