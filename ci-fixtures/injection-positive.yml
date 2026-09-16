@@ -67,6 +67,30 @@ jobs:
         run: |
           label: ${{ github.event.pull_request.title }}
 
+      # QURATOR-282 (2026-09-16 scan): the other classic fork-PR injection sources — commit
+      # messages (push-event commits[*].message, here in its valid [0] index spelling, and
+      # head_commit.message), the workflow_run re-run branch, and the release name — none of
+      # which the retired title|body alternation matched even inline. Guard MUST catch all four.
+      - name: bad-run-commit-message
+        run: echo "${{ github.event.commits[0].message }}"
+
+      - name: bad-run-head-commit-message
+        run: echo "${{ github.event.head_commit.message }}"
+
+      - name: bad-run-workflow-run-branch
+        run: echo "${{ github.event.workflow_run.head_branch }}"
+
+      - name: bad-run-release-name
+        run: echo "${{ github.event.release.name }}"
+
+      # QURATOR-282 needle gap: the retired gap between the dollar-double-brace and the
+      # context could not cross a right-brace, so a single one inside format('{0}', ...)
+      # stopped the needle short of the context and the wrapped form escaped inline
+      # detection entirely. The widened gap steps over a lone brace but never over the
+      # closing brace-brace of an interpolation. Guard MUST catch this.
+      - name: bad-run-format-wrapped
+        run: echo ${{ format('{0}', github.head_ref) }}
+
       # --- NEGATIVE CONTROL: these are SAFE and the guard must NOT flag them. ---
       # The exemption's lookahead must be anchored to the whole key. An unanchored
       # (?!run|script) also refuses to exempt keys that merely START with those

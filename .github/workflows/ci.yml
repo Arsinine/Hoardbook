@@ -74,6 +74,15 @@ jobs:
       # execution, and the one vetted build dep keeps working.
       - name: Build frontend (required to compile hb-app)
         working-directory: crates/hb-app/ui
+        # QURATOR-278: this step runs on windows-latest too, where a multi-line run: with no
+        # shell: defaults to pwsh — and pwsh gates the step on the LAST command's exit code,
+        # so a failed `npm ci --ignore-scripts` was masked whenever the later `npm rebuild
+        # esbuild` / `npm run build` exited 0. bash runs the body under fail-fast semantics.
+        # (The regression arrived when this step went from one `npm ci` to three commands;
+        # single-command steps like `cargo test --workspace` need no shell: — their only
+        # command IS the last one — and the only other multi-line run: in this job is
+        # ubuntu-only, so this was the sole gap.)
+        shell: bash
         run: |
           npm ci --ignore-scripts
           npm rebuild esbuild
@@ -314,6 +323,157 @@ jobs:
           fi
           echo "INV-4′ iroh-surface self-test OK — the aliased-import fixture is caught by the use-form alternative:"
           grep -nE '(^|[^a-zA-Z_])use[[:space:]]+iroh([^a-zA-Z0-9_:]|$)' ci-fixtures/inv4-iroh-positive.rs | sed 's/^/  /'
+
+      # QURATOR-281 (2026-09-16 scan): the iroh-surface enumeration above lists files because
+      # they NAME iroh in source — but a Cargo.toml dependency RENAME, `quic = { package =
+      # "iroh", version = "..." }`, means the token "iroh" appears in NO source file at all:
+      # the crate is imported under its local name, the file is never enumerated, never enters
+      # TRANSPORT_FILES, and escapes every downstream INV-4′ probe. The manifest is the other
+      # half of the surface, so this detector scans every crate manifest — and the workspace
+      # root, where a rename can be declared once under [workspace.dependencies] and inherited
+      # by every member as `quic = { workspace = true }` — for a dependency whose package is
+      # iroh under ANY local name, failing unless that local name is in the explicit allowlist
+      # below. ⚠ This ADDS a detector; it does NOT widen the INV-4′ fence — a fence breach is
+      # still fixed by moving code OUT of the transport surface, never by adding to
+      # TRANSPORT_FILES. A legitimate rename must be justified out loud in ALLOWED_IROH_NAMES
+      # and widen the source-side enumeration pattern in the same commit.
+      # Self-tested against ci-fixtures/inv4-iroh-rename-positive.toml in the step below.
+      - name: INV-4′ manifest-side iroh detector — a renamed iroh dep cannot slip past the surface enumeration
+        if: matrix.platform == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Exactly one local name is allowed: the crate's own. Anything else mapping to
+          # package "iroh" is a rename the enumeration cannot see.
+          ALLOWED_IROH_NAMES="iroh"
+          files=$( (find crates -name Cargo.toml -type f; [ -f Cargo.toml ] && echo Cargo.toml) | sort)
+          nfiles=$(printf '%s\n' "$files" | grep -c .)
+          if [ "$nfiles" -eq 0 ]; then
+            echo "::error::manifest-side iroh detector examined ZERO manifests — wrong cwd or an absent tree reads as clean otherwise. Failing loudly instead."
+            exit 1
+          fi
+          # Prints "manifest:localname" for EVERY dependency whose package resolves to iroh:
+          # the key `iroh` in any spelling (string, inline table, dotted, [dependencies.iroh])
+          # and any renamed key carrying package = "iroh". Section-aware — only *dependencies
+          # tables count, so [package] metadata prose cannot feed the detector.
+          decls=$(awk '
+            FNR == 1 { sect = ""; cur = "" }
+            {
+              line = $0
+              if (line ~ /^[[]/) {
+                sect = line; cur = ""
+                if (match(sect, /dependencies[.][A-Za-z0-9_-]+[]]/)) {
+                  cur = substr(sect, RSTART + 13, RLENGTH - 14)
+                }
+                next
+              }
+              if (sect !~ /dependencies/) next
+              if (line ~ /^[ \t]*#/) next
+              if (cur != "") {
+                if (line ~ /^[ \t]*package[ \t]*=[ \t]*"iroh"/) printf "%s:%s\n", FILENAME, cur
+                next
+              }
+              if (match(line, /^[ \t]*[A-Za-z0-9_-]+/)) {
+                key = substr(line, RSTART, RLENGTH)
+                rest = substr(line, RSTART + RLENGTH)
+                if (key == "iroh" || rest ~ /package[ \t]*=[ \t]*"iroh"/) printf "%s:%s\n", FILENAME, key
+                next
+              }
+            }
+          ' $files 2>/dev/null)
+          ndecls=$(printf '%s\n' "$decls" | grep -c . || true); ndecls=${ndecls:-0}
+          for f in $files; do
+            n=$(printf '%s\n' "$decls" | grep -cF -- "$f:" || true); n=${n:-0}
+            printf '%s: %d iroh dependency declaration(s)\n' "$f" "$n"
+          done
+          bad=""
+          while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            name=${d#*:}
+            ok=0
+            for a in $ALLOWED_IROH_NAMES; do [ "$name" = "$a" ] && ok=1; done
+            if [ "$ok" -ne 1 ]; then bad="$bad$d"$'\n'; fi
+          done <<< "$decls"
+          if [ -n "$bad" ]; then
+            echo "::error::INV-4′ regression — a dependency on iroh is declared under a LOCAL NAME the iroh-surface enumeration cannot see:"
+            printf '%s' "$bad"
+            echo "::error::A renamed iroh dep means no source file names the crate, so the module never enters TRANSPORT_FILES and every no-filesystem/no-path probe is silently unswept. Declare it as iroh, or justify the local name in ALLOWED_IROH_NAMES and widen the enumeration pattern in the same commit (QURATOR-281)."
+            exit 1
+          fi
+          echo "manifest-side iroh detector clean — $ndecls declaration(s) across $nfiles manifest(s), all under the allowlisted local name(s): $ALLOWED_IROH_NAMES."
+
+      # Positive control for the manifest-side iroh detector above (QURATOR-281, 2026-09-16
+      # scan). The fixture is a manifest-shaped fragment holding the exact evasion: a
+      # dependency renamed via package = "iroh" in plain and target-section form, so no
+      # source file would ever name the crate. This step runs the SAME awk-and-allowlist
+      # pipeline as the detector above against it and asserts the rename REDS. It lives
+      # under ci-fixtures/ (NOT crates/ or the workspace root), so the production detector
+      # never scans it.
+      - name: INV-4′ manifest-iroh self-test — must red on the renamed-dependency fixture
+        if: matrix.platform == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -uo pipefail
+          hits=$(awk '
+            FNR == 1 { sect = ""; cur = "" }
+            {
+              line = $0
+              if (line ~ /^[[]/) {
+                sect = line; cur = ""
+                if (match(sect, /dependencies[.][A-Za-z0-9_-]+[]]/)) {
+                  cur = substr(sect, RSTART + 13, RLENGTH - 14)
+                }
+                next
+              }
+              if (sect !~ /dependencies/) next
+              if (line ~ /^[ \t]*#/) next
+              if (cur != "") {
+                if (line ~ /^[ \t]*package[ \t]*=[ \t]*"iroh"/) printf "%s:%s\n", FILENAME, cur
+                next
+              }
+              if (match(line, /^[ \t]*[A-Za-z0-9_-]+/)) {
+                key = substr(line, RSTART, RLENGTH)
+                rest = substr(line, RSTART + RLENGTH)
+                if (key == "iroh" || rest ~ /package[ \t]*=[ \t]*"iroh"/) printf "%s:%s\n", FILENAME, key
+                next
+              }
+            }
+          ' ci-fixtures/inv4-iroh-rename-positive.toml 2>/dev/null) || true
+          if [ -z "$hits" ]; then
+            echo "::error::The manifest-side iroh detector is VACUOUS — it passed on ci-fixtures/inv4-iroh-rename-positive.toml, which holds the renamed-dependency evasion (a dep whose package is iroh, keyed under a different local name). The detector must catch this (QURATOR-281)."
+            exit 1
+          fi
+          # Same allowlist test as the production step: every detected local name must be
+          # allowlisted or the fixture has reds. The fixture holds only renames, so anything
+          # detected here MUST be flagged.
+          bad=""
+          while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            name=${d#*:}
+            if [ "$name" != "iroh" ]; then bad="$bad$d"$'\n'; fi
+          done <<< "$hits"
+          if [ -z "$bad" ]; then
+            echo "::error::The manifest-side iroh detector found declarations in the fixture but the allowlist test flagged none — the rename evasion walked past ALLOWED_IROH_NAMES (QURATOR-281)."
+            exit 1
+          fi
+          # Both fixture spellings must be among the flags: the plain [dependencies] rename
+          # and the target-section rename (the section-awareness half of the awk).
+          for shape in ':quic$' ':quic-helper$'; do
+            if ! printf '%s' "$bad" | grep -qE "$shape"; then
+              echo "::error::The manifest-side iroh detector missed the $shape local name — the renamed-dependency evasion is back (QURATOR-281)."
+              exit 1
+            fi
+          done
+          # Fixture hygiene: the fixture must demonstrate the RENAMING evasion specifically.
+          # If it ever declares the dependency under the allowlisted literal key it is caught
+          # trivially and pins nothing — same class as a control that passes because its own
+          # message supplied the hit.
+          if grep -qE '^[[:space:]]*iroh[[:space:]]*=' ci-fixtures/inv4-iroh-rename-positive.toml; then
+            echo "::error::ci-fixtures/inv4-iroh-rename-positive.toml declares the dependency under the literal allowlisted key — it no longer demonstrates the renaming evasion this self-test exists to pin."
+            exit 1
+          fi
+          echo "INV-4′ manifest-iroh self-test OK — both renamed declarations red the allowlist test:"
+          printf '%s' "$bad" | sed 's/^/  /'
 
       # Positive control for the serde-derive probe inside the INV-4′ sweep above
       # (QURATOR-269, 2026-09-15 scan). The probe's comment claimed "Self-tested in the step
@@ -642,6 +802,18 @@ jobs:
       #     safe by structure, not by exemption. github.repository is owner-controlled and
       #     never attacker-controllable, so it is not in the pattern. Ubuntu-only, like the
       #     guards above; one pass over every workflow file suffices.
+      # QURATOR-282 (2026-09-16 scan) fixed two more false negatives:
+      #   · the context set now also includes the other classic fork-PR injection sources —
+      #     commit messages (github.event.commits[*].message and head_commit.message, caught
+      #     by the message arm of the event alternation), workflow_run.head_branch (the
+      #     re-run branch, which a fork PR controls), and release.name — none of which the
+      #     retired title|body alternation matched even inline;
+      #   · the retired needle's gap between the dollar-double-brace and github. was `[^}]*`,
+      #     which cannot cross a `}` — so format-wrapped interpolation, with a single `}`
+      #     inside format('{0}', ...), never reached the context and escaped inline detection.
+      #     The gap is now `([^}]|}[^}])*`: it steps over a lone `}` but never over the `}}`
+      #     that TERMINATES an interpolation, so prose after a closed safe expression still
+      #     cannot be dragged into a match.
       - name: Workflow injection sweep — no attacker-context interpolation in script bodies
         if: matrix.platform == 'ubuntu-latest'
         shell: bash
@@ -663,7 +835,7 @@ jobs:
           # line dedents to or past the opener. Interpolations are flagged only inside those
           # bodies — mapping lines (env:/with: slots) are outside them and safe by structure.
           if out=$(awk '
-            BEGIN { att = "[$][{][{][^}]*github[.](ref_name|head_ref|event[.][^}]*(title|body)|event[.]pull_request[.]head[.](ref|label))" }
+            BEGIN { att = "[$][{][{]([^}]|}[^}])*github[.](ref_name|head_ref|event[.][^}]*(title|body|message)|event[.]pull_request[.]head[.](ref|label)|event[.]workflow_run[.]head_branch|event[.]release[.]name)" }
             FNR == 1 { inblock = 0; keyindent = -1 }
             {
               line = $0
@@ -711,7 +883,7 @@ jobs:
           # cannot recur here. The awk source uses the bracket-class form so no literal
           # dollar-double-brace ever appears in this run: body.
           hits=$(awk '
-            BEGIN { att = "[$][{][{][^}]*github[.](ref_name|head_ref|event[.][^}]*(title|body)|event[.]pull_request[.]head[.](ref|label))" }
+            BEGIN { att = "[$][{][{]([^}]|}[^}])*github[.](ref_name|head_ref|event[.][^}]*(title|body|message)|event[.]pull_request[.]head[.](ref|label)|event[.]workflow_run[.]head_branch|event[.]release[.]name)" }
             FNR == 1 { inblock = 0; keyindent = -1 }
             {
               line = $0
@@ -753,6 +925,23 @@ jobs:
               exit 1
             fi
           done
+          # And the four QURATOR-282 contexts must be too. -F (fixed-string) is load-bearing
+          # here: the commits shape carries literal brackets, which a pattern grep would read
+          # as its own bracket expression and match nothing.
+          for shape in 'commits[0].message' 'head_commit.message' 'workflow_run.head_branch' 'release.name'; do
+            if ! printf '%s\n' "$hits" | grep -qF "$shape"; then
+              echo "::error::The injection-sweep guard missed the $shape context — the QURATOR-282 alternation gap is back."
+              exit 1
+            fi
+          done
+          # The format()-wrapped form must be caught as a HIT, not merely present in the
+          # fixture: the retired needle's gap could not cross the lone right-brace inside
+          # format('{0}', ...), so this exact expression escaped inline detection. Pinning the
+          # full inner expression proves the widened gap stepped over that brace.
+          if ! printf '%s\n' "$hits" | grep -qF "format('{0}', github.head_ref)"; then
+            echo "::error::The injection-sweep guard missed the format-wrapped interpolation — the QURATOR-282 needle-gap evasion is back."
+            exit 1
+          fi
           if ! printf '%s\n' "$hits" | grep -qE '^[^:]+:[0-9]+:[[:space:]]+label: '; then
             echo "::error::The injection-sweep guard missed the label-prefixed line inside a run: body — the QURATOR-223 colon-lookalike exemption is back."
             exit 1

@@ -1,0 +1,20 @@
+# Positive control fixture for the manifest-side iroh detector in
+# .github/workflows/ci.yml (step "INV-4′ manifest-side iroh detector"). NOT a manifest any
+# build reads: it lives under ci-fixtures/, and the production detector scans only
+# crates/*/Cargo.toml and the workspace root, so this file is inert data. The self-test step
+# in ci.yml runs the SAME awk-and-allowlist pipeline against it and asserts the rename REDS.
+#
+# It holds the evasion from the 2026-09-16 scan (QURATOR-281): a dependency renamed via
+# package = "iroh", so every source file would import the crate under the local name and the
+# token the iroh-surface enumeration keys on appears in NO .rs file — the module holds QUIC
+# connections while sitting outside TRANSPORT_FILES and every probe it feeds. The detector
+# must flag every local name below as unallowlisted. Two spellings are held: the plain
+# [dependencies] rename and a target-section rename, to pin the awk's section-awareness.
+# (Prose here names package = "iroh" deliberately — for a manifest probe the rename itself
+# is the violation, and comment-stripping is not this probe's contract.)
+
+[dependencies]
+quic = { package = "iroh", version = "1.0", default-features = false }
+
+[target.'cfg(unix)'.dev-dependencies]
+quic-helper = { package = "iroh", version = "1.0" }
