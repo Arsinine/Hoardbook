@@ -382,12 +382,32 @@ fn newest_announce(events: Vec<Event>, expected_topic_id: &str, now: u64) -> Opt
 /// distinct rooms (same `topic_id`, different `topic_key`, Decision C). `None` means no announce was
 /// found (the name is free) — including when every candidate announce was dropped by the future-skew
 /// gate in [`newest_announce`] — never an error.
+/// Relay-fetch budget for [`fetch_announce`]'s `#d`-scoped lookup (QURATOR-232). Because
+/// `KIND_TOPIC_ANNOUNCE` is parameterized-replaceable, relay-side dedup is per `(kind, pubkey, d)`,
+/// never per `d` alone — so an attacker can flood a topic's `topic_id` with a throwaway pubkey per
+/// junk announce, each surviving dedup as its own event. A malformed/unparseable announce never
+/// counts toward `newest_announce`'s tally, but without an explicit `.limit()` it still occupies a
+/// slot in the unbounded fetch, and enough of them can push a legitimate topic's real announce out of
+/// the relay's own internally-capped response — reading as "not found" forever, the same H3 shape as
+/// [`TOPIC_DISCOVERY_FETCH_LIMIT`]. Sized at the relay's own conventional default (strfry
+/// `maxFilterLimit` = 500) so the budget is ours, explicitly, rather than the relay's silent choice.
+pub const TOPIC_ANNOUNCE_FETCH_LIMIT: usize = 500;
+
+/// Build the `#d`-scoped announce-lookup filter — pure (no I/O), so the fetch budget is
+/// unit-testable without a relay (mirrors [`topic_discover_filter`]).
+fn topic_announce_filter(topic_id: &str) -> Filter {
+    Filter::new()
+        .kind(Kind::from_u16(KIND_TOPIC_ANNOUNCE))
+        .identifier(topic_id.to_string())
+        .limit(TOPIC_ANNOUNCE_FETCH_LIMIT)
+}
+
 pub async fn fetch_announce(
     client: &RelayClient,
     topic_id: &str,
     timeout: Duration,
 ) -> Result<Option<TopicMeta>, NetError> {
-    let filter = Filter::new().kind(Kind::from_u16(KIND_TOPIC_ANNOUNCE)).identifier(topic_id.to_string());
+    let filter = topic_announce_filter(topic_id);
     let events = client.fetch(filter, timeout).await?;
     // The skew gate is judged against OUR clock, read once at ranking time (same "never trust the
     // relay's clock" posture as `hb_core::count::fresh_presence`); `now` stays injectable in the pure
@@ -425,15 +445,34 @@ pub async fn fetch_roster(
 
 /// Raw membership events for a Topic (`KIND_TOPIC_MEMBER`, `#d` = topic_id) — the ciphertext a
 /// non-member sees and the input to [`member_count`] / [`fetch_roster`].
+/// Relay-fetch budget for [`fetch_membership_events`] (QURATOR-236) — bounds how many
+/// `KIND_TOPIC_MEMBER` events a single topic's roster read can pull. Like the announce, this kind is
+/// parameterized-replaceable so dedup is per `(kind, pubkey, d)`, not per `d`: a flood of throwaway
+/// membership events under the same `topic_id` from distinct pubkeys would otherwise consume the
+/// unbounded fetch and could push real members out of the relay's own internal cap. Sized well above
+/// any plausible topic roster (a Topic is a small-group primitive, not a public channel) so a
+/// legitimate roster is never truncated, while still being an explicit budget rather than the
+/// relay's silent default.
+pub const TOPIC_MEMBERSHIP_FETCH_LIMIT: usize = 2000;
+
 pub async fn fetch_membership_events(
     client: &RelayClient,
     topic_id: &str,
     timeout: Duration,
 ) -> Result<Vec<Event>, NetError> {
-    let filter = Filter::new()
+    client.fetch(topic_membership_filter(topic_id), timeout).await
+}
+
+/// Build the membership relay filter — **pure** (no I/O), so the declared `.limit()` budget is
+/// unit-testable against the SAME expression production uses. ⚠ A test that rebuilds this filter
+/// inline instead of calling here is asserting against a lookalike it controls: the 2026-09-16
+/// mutation sweep proved exactly that, deleting the production `.limit()` while the test stayed
+/// green (CLAUDE.md §9 P-6). Call this, never a copy of it.
+pub(crate) fn topic_membership_filter(topic_id: &str) -> Filter {
+    Filter::new()
         .kind(Kind::from_u16(KIND_TOPIC_MEMBER))
-        .identifier(topic_id.to_string());
-    client.fetch(filter, timeout).await
+        .identifier(topic_id.to_string())
+        .limit(TOPIC_MEMBERSHIP_FETCH_LIMIT)
 }
 
 /// **Topic aliveness** (QURATOR-148, owner ruling 2026-08-31): how many of this Topic's roster
@@ -536,6 +575,16 @@ pub async fn announce_to_topic(
     Ok(ev)
 }
 
+/// Relay-fetch budget for the `KIND_TOPIC_POST` channel read (QURATOR-236), shared by
+/// [`fetch_channel`] and [`fetch_channel_full`] — both build the identical `{kind, #d}` filter, so one
+/// budget covers both. `KIND_TOPIC_POST` is a **regular**, non-replaceable kind, so every post/announce
+/// ever sent under this `topic_id` is a distinct event the relay keeps; both callers already discard
+/// anything older than 24h client-side (Decision D), but that filtering happens **after** the fetch, so
+/// an unbounded filter still lets a relay's own internal cap (or an attacker spamming the topic) decide
+/// which of today's events survive to be locally filtered. Sized well above a single day's plausible
+/// message volume for a small-group Topic (M3) so a legitimate day's channel is never truncated.
+pub const TOPIC_CHANNEL_FETCH_LIMIT: usize = 2000;
+
 /// Fetch the channel — `KIND_TOPIC_POST` for `topic_id`, opened with the key and **locally filtered to
 /// the last 24h** (Decision D: a non-compliant relay can't resurrect an expired post in the UI),
 /// newest first.
@@ -546,8 +595,7 @@ pub async fn fetch_channel(
     now: u64,
     timeout: Duration,
 ) -> Result<Vec<Post>, NetError> {
-    let filter = Filter::new().kind(Kind::from_u16(KIND_TOPIC_POST)).identifier(topic_id.to_string());
-    let events = client.fetch(filter, timeout).await?;
+    let events = client.fetch(topic_channel_filter(topic_id), timeout).await?;
     let mut posts: Vec<Post> = Vec::new();
     for ev in events {
         if let Ok(Some(p)) = open_post(key, &ev, now) {
@@ -601,9 +649,18 @@ pub async fn fetch_channel_full(
     now: u64,
     timeout: Duration,
 ) -> Result<ChannelRead, NetError> {
-    let filter = Filter::new().kind(Kind::from_u16(KIND_TOPIC_POST)).identifier(topic_id.to_string());
-    let events = client.fetch(filter, timeout).await?;
+    let events = client.fetch(topic_channel_filter(topic_id), timeout).await?;
     Ok(partition_channel_events(key, &events, now))
+}
+
+/// Build the channel-read relay filter — **pure**, shared by `fetch_channel` and
+/// `fetch_channel_full`, which built byte-identical filters. One builder means one budget and one
+/// place a mutation can bite, so the pinning test reds when production loses its `.limit()`.
+pub(crate) fn topic_channel_filter(topic_id: &str) -> Filter {
+    Filter::new()
+        .kind(Kind::from_u16(KIND_TOPIC_POST))
+        .identifier(topic_id.to_string())
+        .limit(TOPIC_CHANNEL_FETCH_LIMIT)
 }
 
 // ── private admission: request → approve (NIP-17 DM) ─────────────────────────────────────────────
@@ -642,6 +699,16 @@ pub async fn request_join(
     Ok(())
 }
 
+/// Relay-fetch budget for `me`'s personal gift-wrap inbox (QURATOR-236), shared by
+/// [`fetch_join_requests`] and [`fetch_invite`] — both build the identical `{kinds:[1059], #p:[me]}`
+/// filter, unscoped to any one topic. This inbox mixes every kind-1059 wrap addressed to `me` from
+/// every sender (DMs, join requests, invites, key grants, private listings all multiplex onto it), so
+/// an attacker who knows `me`'s pubkey can flood it with throwaway wraps; without a `.limit()` the
+/// relay's own internal cap decides which of `me`'s real wraps come back. Sized generously above any
+/// plausible backlog of pending join requests / invites a poll should ever need to consider — this is
+/// a bound on the fetch, not on how many gift-wraps `me` may legitimately receive over time.
+pub const TOPIC_INBOX_FETCH_LIMIT: usize = 500;
+
 /// Fetch + parse the join requests addressed to `me` (DMs whose body is a `JoinRequest`), returning
 /// `(requester, request)` pairs. Mirrors the M10 post-decrypt allowlist shape: the outer wrap author is
 /// ephemeral, so the real requester is recovered from inside the verified seal.
@@ -650,8 +717,7 @@ pub async fn fetch_join_requests(
     me: &Identity,
     timeout: Duration,
 ) -> Result<Vec<(PublicKey, JoinRequest)>, NetError> {
-    let filter = Filter::new().kind(Kind::GiftWrap).pubkey(me.public_key());
-    let wraps = client.fetch(filter, timeout).await?;
+    let wraps = client.fetch(topic_inbox_filter(me), timeout).await?;
     let mut out = Vec::new();
     for w in wraps {
         if let Ok(dm) = unwrap_dm(me, &w).await {
@@ -700,8 +766,7 @@ pub async fn fetch_invite(
     timeout: Duration,
     expected_topic_id: Option<&str>,
 ) -> Result<Option<(TopicMeta, TopicKey, PublicKey)>, NetError> {
-    let filter = Filter::new().kind(Kind::GiftWrap).pubkey(me.public_key());
-    let wraps = client.fetch(filter, timeout).await?;
+    let wraps = client.fetch(topic_inbox_filter(me), timeout).await?;
     for w in wraps {
         // `redeem_invite` atomically records a single-use invite's seen-nonce into `seen` on success
         // (the public-join credential is exempt); the caller persists `seen` after this returns.
@@ -710,6 +775,14 @@ pub async fn fetch_invite(
         }
     }
     Ok(None)
+}
+
+/// Build the personal gift-wrap inbox filter — **pure**, shared by `fetch_join_requests` and
+/// `fetch_invite`. This one `{kinds:[1059], #p:[me]}` stream multiplexes DMs, join requests,
+/// invites, key grants and private listings, so anyone who knows `me`'s pubkey can flood it; the
+/// declared budget is ours, not the relay's silent `maxFilterLimit` default.
+pub(crate) fn topic_inbox_filter(me: &Identity) -> Filter {
+    Filter::new().kind(Kind::GiftWrap).pubkey(me.public_key()).limit(TOPIC_INBOX_FETCH_LIMIT)
 }
 
 /// Join a **public** Topic by name: derive the public-join keypair, fetch the public-join credential
@@ -784,6 +857,60 @@ mod tests {
     #[test]
     fn topic_discover_filter_refuses_empty_tags_before_any_query() {
         assert!(topic_discover_filter(&[]).is_err(), "an empty tag set must not be shipped to a relay");
+    }
+
+    // ──────────────── QURATOR-232/236: sibling fetch-budget hardening (H3 extension) ───────────────
+    //
+    // `topic_discover_filter` (H3, QURATOR-80) was the ONLY fetch in this file with an explicit
+    // `.limit()`. Its five siblings built the identical shape of filter — unbounded — leaving the
+    // relay's own internal cap (strfry default `maxFilterLimit` = 500) to silently decide which
+    // events survive. Each test below pins one sibling's now-explicit budget the same way H3 pins
+    // its own: assert `filter.limit == Some(THE_CONST)`.
+
+    #[test]
+    fn topic_announce_filter_declares_an_explicit_limit_qurator_232() {
+        // mutation: at line 402, delete `.limit(TOPIC_ANNOUNCE_FETCH_LIMIT)` from the chain (or
+        // change the const's value at line 394 from 500 to a different number) — either reds this.
+        let f = topic_announce_filter("video/some-topic-id");
+        assert_eq!(f.limit, Some(TOPIC_ANNOUNCE_FETCH_LIMIT), "announce fetch budget is declared explicitly");
+    }
+
+    #[test]
+    fn membership_fetch_filter_declares_an_explicit_limit_qurator_236() {
+        // mutation: delete the `.limit(...)` call from the chain inside `topic_membership_filter`
+        // (or change the const's declared value) — either reds this.
+        //
+        // ⚠ This test CALLS the production builder. An earlier version rebuilt the filter inline
+        // and the 2026-09-16 mutation sweep caught it: deleting production's `.limit()` left the
+        // test GREEN, because it was asserting against its own copy (CLAUDE.md §9 P-6 — "a guard
+        // that re-emits its own copy of the thing it checks is asserting against a lookalike it
+        // controls"). Never reconstruct this filter here.
+        let f = topic_membership_filter("video/some-topic-id");
+        assert_eq!(f.limit, Some(TOPIC_MEMBERSHIP_FETCH_LIMIT), "membership fetch budget is declared explicitly");
+    }
+
+    #[test]
+    fn channel_fetch_filter_declares_an_explicit_limit_qurator_236() {
+        // mutation: delete the `.limit(...)` call from the chain inside `topic_channel_filter`
+        // (or change the const's declared value) — either reds this.
+        //
+        // ⚠ Calls the production builder, which `fetch_channel` and `fetch_channel_full` now BOTH
+        // use — so one assertion covers both call sites and a mutation actually bites. See the
+        // membership test above for why reconstructing the filter here would be vacuous.
+        let f = topic_channel_filter("video/some-topic-id");
+        assert_eq!(f.limit, Some(TOPIC_CHANNEL_FETCH_LIMIT), "channel fetch budget is declared explicitly");
+    }
+
+    #[test]
+    fn inbox_fetch_filter_declares_an_explicit_limit_qurator_236() {
+        // mutation: delete the `.limit(...)` call from the chain inside `topic_inbox_filter`
+        // (or change the const's declared value) — either reds this.
+        //
+        // ⚠ Calls the production builder, which `fetch_join_requests` and `fetch_invite` now BOTH
+        // use. See the membership test above for why reconstructing the filter here would be vacuous.
+        let me = Identity::generate();
+        let f = topic_inbox_filter(&me);
+        assert_eq!(f.limit, Some(TOPIC_INBOX_FETCH_LIMIT), "inbox fetch budget is declared explicitly");
     }
 
     // ───────────────────────── M13 Part A: channel partition (pure, no relay) ─────────────────────
