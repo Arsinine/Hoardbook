@@ -385,12 +385,16 @@ fn collect_files(
 /// `identity`). Any component that would not survive that normalization verbatim is rejected
 /// here, before it is ever pushed — the check must bind under the FILESYSTEM's rules, not just
 /// the lexer's.
+///
+/// Windows namespace hardening (QURATOR-279): the two standard siblings of that hole — reserved
+/// device names (`NUL`, `COM1`, …, with or without an extension) and the `:` stream separator
+/// (`file.txt:evil`) — are refused for the same reason; see `win32_reserved_or_stream`.
 fn sanitize_rel(path: &Path) -> Result<PathBuf, BackupError> {
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {
             Component::Normal(c) => {
-                if win32_would_normalize(c) {
+                if win32_would_normalize(c) || win32_reserved_or_stream(c) {
                     return Err(BackupError::Archive(format!(
                         "unsafe path component in '{}'",
                         path.display()
@@ -420,6 +424,34 @@ fn sanitize_rel(path: &Path) -> Result<PathBuf, BackupError> {
 /// header.
 fn win32_would_normalize(c: &OsStr) -> bool {
     matches!(c.as_encoded_bytes().last(), Some(b'.') | Some(b' '))
+}
+
+/// A component Win32 resolves to something other than a plain file name (QURATOR-279) — the
+/// reserved-device and stream-separator siblings of the normalization hole above:
+/// (a) `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9` still name their device even
+///     with an extension (`NUL.txt` resolves to `NUL`), so such an entry silently discards its
+///     content while restore reports success — and `COM1` can block on a device open;
+/// (b) `:` is the stream separator: `file.txt:evil` materialises as an alternate data stream
+///     off `file.txt`, invisible to `readdir` and to size accounting.
+/// The reserved set is exact, matched case-insensitively on the stem BEFORE the first `.`:
+/// `NULL.txt`, `CONFIG`, `communication.txt`, `LPT`, `COM` and `COM10` are legitimate names.
+fn win32_reserved_or_stream(c: &OsStr) -> bool {
+    let name = c.as_encoded_bytes();
+    if name.contains(&b':') {
+        return true;
+    }
+    let stem = &name[..name.iter().position(|&b| b == b'.').unwrap_or(name.len())];
+    let com_lpt = |prefix: &[u8; 3]| {
+        stem.len() == 4
+            && stem[..3].eq_ignore_ascii_case(prefix)
+            && (b'1'..=b'9').contains(&stem[3])
+    };
+    stem.eq_ignore_ascii_case(b"CON")
+        || stem.eq_ignore_ascii_case(b"PRN")
+        || stem.eq_ignore_ascii_case(b"AUX")
+        || stem.eq_ignore_ascii_case(b"NUL")
+        || com_lpt(b"COM")
+        || com_lpt(b"LPT")
 }
 
 fn rel_to_slash(rel: &Path) -> String {
@@ -909,11 +941,64 @@ mod tests {
                 "{hostile:?} must be refused, got {err:?}"
             );
         }
+        // QURATOR-279: reserved device names and `:` stream separators — the standard siblings
+        // of the normalization hole, same root cause (Win32 resolves names differently from how
+        // Rust's `Path` lexes them). The reserved stem binds BEFORE the first `.`, with or
+        // without an extension (`NUL.txt` still resolves to the device); a `:` anywhere in a
+        // component materialises as an alternate data stream off the preceding name.
+        //
+        // MUTATION (must redden): in `win32_reserved_or_stream` — the `fn` defined directly
+        // below `win32_would_normalize` in production — make the body return `false`. Anchor on
+        // that function's `fn` line, never a text search: the identifier also occurs at the
+        // call site in `sanitize_rel` and in this comment, so a blind text-replace could hit
+        // either of those instead of the code.
+        for hostile in [
+            "NUL",
+            "NUL.txt",
+            "con",
+            "Com3.tar.gz",
+            "PRN.cfg",
+            "aux",
+            "COM1",
+            "com9",
+            "LPT3",
+            "lpt1.dat",
+            "a/NUL/b",
+            "file.txt:evil",
+            "a/b:c/d",
+            "video:stream",
+        ] {
+            let err = sanitize_rel(Path::new(hostile)).unwrap_err();
+            assert!(
+                matches!(err, BackupError::Archive(_)),
+                "{hostile:?} must be refused, got {err:?}"
+            );
+        }
         // Positive control: clean names (dots/spaces in the MIDDLE) still pass.
         assert_eq!(
             sanitize_rel(Path::new("a.b/c d/e.json")).unwrap(),
             PathBuf::from("a.b/c d/e.json")
         );
+        // Boundary positive controls: near-misses OUTSIDE the exact reserved set are legitimate
+        // filenames and must not be over-rejected — a fourth letter, no digit, digit 0, or a
+        // two-digit COM/LPT number all miss the set.
+        for legit in [
+            "NULL.txt",
+            "CONFIG",
+            "COMMON",
+            "communication.txt",
+            "LPT",
+            "COM",
+            "COM0",
+            "COM10",
+            "LPT0.txt",
+        ] {
+            assert_eq!(
+                sanitize_rel(Path::new(legit)).unwrap(),
+                PathBuf::from(legit),
+                "{legit:?} is not a reserved name and must pass"
+            );
+        }
     }
 
     #[test]
