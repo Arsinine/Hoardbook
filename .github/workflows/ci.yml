@@ -352,36 +352,25 @@ jobs:
             echo "::error::manifest-side iroh detector examined ZERO manifests — wrong cwd or an absent tree reads as clean otherwise. Failing loudly instead."
             exit 1
           fi
-          # Prints "manifest:localname" for EVERY dependency whose package resolves to iroh:
-          # the key `iroh` in any spelling (string, inline table, dotted, [dependencies.iroh])
-          # and any renamed key carrying package = "iroh". Section-aware — only *dependencies
-          # tables count, so [package] metadata prose cannot feed the detector.
-          decls=$(awk '
-            FNR == 1 { sect = ""; cur = "" }
-            {
-              line = $0
-              if (line ~ /^[[]/) {
-                sect = line; cur = ""
-                if (match(sect, /dependencies[.][A-Za-z0-9_-]+[]]/)) {
-                  cur = substr(sect, RSTART + 13, RLENGTH - 14)
-                }
-                next
-              }
-              if (sect !~ /dependencies/) next
-              if (line ~ /^[ \t]*#/) next
-              if (cur != "") {
-                if (line ~ /^[ \t]*package[ \t]*=[ \t]*"iroh"/) printf "%s:%s\n", FILENAME, cur
-                next
-              }
-              if (match(line, /^[ \t]*[A-Za-z0-9_-]+/)) {
-                key = substr(line, RSTART, RLENGTH)
-                rest = substr(line, RSTART + RLENGTH)
-                if (key == "iroh" || rest ~ /package[ \t]*=[ \t]*"iroh"/) printf "%s:%s\n", FILENAME, key
-                next
-              }
-            }
-          ' $files 2>/dev/null)
+          # Prints "manifest:localname" for EVERY dependency whose package resolves to iroh,
+          # in every valid spelling: the key `iroh` itself (string, inline table, dotted,
+          # [dependencies.iroh]) bare or QUOTED, any renamed key carrying package = "iroh"
+          # or package = 'iroh' (TOML literal string), and dotted sections whose header key
+          # is bare or quoted ([dependencies."quic"]). Trailing # comments are stripped
+          # before matching — a # inside a quoted string is NOT a comment start — so prose
+          # naming iroh cannot feed the detector. Section-aware — only *dependencies tables
+          # count, so [package] metadata prose cannot feed the detector.
+          decls=$(awk -f ci-fixtures/inv4-iroh-detector.awk $files 2>/dev/null)
           ndecls=$(printf '%s\n' "$decls" | grep -c . || true); ndecls=${ndecls:-0}
+          # A detector that CANNOT RUN reports clean (QURATOR-281 review finding 5, the → P-5
+          # shape): if awk dies — engine drift, a bad edit, a missing program file — `decls` is
+          # empty, `bad` is empty, and this step echoes "clean" and exits 0 with `2>/dev/null`
+          # hiding the evidence. The tree's one real declaration is the positive control: assert
+          # it is present, so detector death and an unexpected tree shape both fail LOUDLY.
+          if ! printf '%s\n' "$decls" | grep -qF 'crates/hb-app/Cargo.toml:iroh'; then
+            echo "::error::INV-4′ manifest-side detector did not find the KNOWN iroh declaration in crates/hb-app/Cargo.toml. Either the detector failed to run (awk crash / missing ci-fixtures/inv4-iroh-detector.awk — note stderr is suppressed) or the dependency moved. A detector that cannot run reports clean, so this is failed loudly rather than trusted."
+            exit 1
+          fi
           for f in $files; do
             n=$(printf '%s\n' "$decls" | grep -cF -- "$f:" || true); n=${n:-0}
             printf '%s: %d iroh dependency declaration(s)\n' "$f" "$n"
@@ -404,41 +393,20 @@ jobs:
 
       # Positive control for the manifest-side iroh detector above (QURATOR-281, 2026-09-16
       # scan). The fixture is a manifest-shaped fragment holding the exact evasion: a
-      # dependency renamed via package = "iroh" in plain and target-section form, so no
-      # source file would ever name the crate. This step runs the SAME awk-and-allowlist
-      # pipeline as the detector above against it and asserts the rename REDS. It lives
-      # under ci-fixtures/ (NOT crates/ or the workspace root), so the production detector
-      # never scans it.
+      # dependency renamed via package = "iroh" in EVERY valid spelling (plain
+      # [dependencies], target section, dotted [dependencies.NAME] section, quoted dep key,
+      # quoted section header, single-quoted value), so no source file would ever name the
+      # crate. This step runs the SAME awk-and-allowlist pipeline as the detector above
+      # against it and asserts every rename REDS while the fixture's negatives — a benign
+      # dep and trailing comments that merely name the token — stay clean. It lives under
+      # ci-fixtures/ (NOT crates/ or the workspace root), so the production detector never
+      # scans it.
       - name: INV-4′ manifest-iroh self-test — must red on the renamed-dependency fixture
         if: matrix.platform == 'ubuntu-latest'
         shell: bash
         run: |
           set -uo pipefail
-          hits=$(awk '
-            FNR == 1 { sect = ""; cur = "" }
-            {
-              line = $0
-              if (line ~ /^[[]/) {
-                sect = line; cur = ""
-                if (match(sect, /dependencies[.][A-Za-z0-9_-]+[]]/)) {
-                  cur = substr(sect, RSTART + 13, RLENGTH - 14)
-                }
-                next
-              }
-              if (sect !~ /dependencies/) next
-              if (line ~ /^[ \t]*#/) next
-              if (cur != "") {
-                if (line ~ /^[ \t]*package[ \t]*=[ \t]*"iroh"/) printf "%s:%s\n", FILENAME, cur
-                next
-              }
-              if (match(line, /^[ \t]*[A-Za-z0-9_-]+/)) {
-                key = substr(line, RSTART, RLENGTH)
-                rest = substr(line, RSTART + RLENGTH)
-                if (key == "iroh" || rest ~ /package[ \t]*=[ \t]*"iroh"/) printf "%s:%s\n", FILENAME, key
-                next
-              }
-            }
-          ' ci-fixtures/inv4-iroh-rename-positive.toml 2>/dev/null) || true
+          hits=$(awk -f ci-fixtures/inv4-iroh-detector.awk ci-fixtures/inv4-iroh-rename-positive.toml 2>/dev/null) || true
           if [ -z "$hits" ]; then
             echo "::error::The manifest-side iroh detector is VACUOUS — it passed on ci-fixtures/inv4-iroh-rename-positive.toml, which holds the renamed-dependency evasion (a dep whose package is iroh, keyed under a different local name). The detector must catch this (QURATOR-281)."
             exit 1
@@ -456,11 +424,22 @@ jobs:
             echo "::error::The manifest-side iroh detector found declarations in the fixture but the allowlist test flagged none — the rename evasion walked past ALLOWED_IROH_NAMES (QURATOR-281)."
             exit 1
           fi
-          # Both fixture spellings must be among the flags: the plain [dependencies] rename
-          # and the target-section rename (the section-awareness half of the awk).
-          for shape in ':quic$' ':quic-helper$'; do
+          # Every positive spelling must be among the flags: the plain [dependencies] rename,
+          # the target-section rename (the section-awareness half of the awk), the dotted
+          # [dependencies.NAME] section, the QUOTED dep key, the QUOTED section header, and
+          # the SINGLE-QUOTED package value — the three spellings the detector once missed.
+          for shape in ':quic$' ':quic-helper$' ':quic-section$' ':quic-q$' ':quic-dotted$' ':quic-lit$'; do
             if ! printf '%s' "$bad" | grep -qE "$shape"; then
               echo "::error::The manifest-side iroh detector missed the $shape local name — the renamed-dependency evasion is back (QURATOR-281)."
+              exit 1
+            fi
+          done
+          # The negatives must NOT be flagged: a benign dep, and trailing comments that
+          # merely NAME the token — including one naming package = "iroh" itself. A red
+          # here means comment-stripping broke and prose is feeding the detector.
+          for neg in ':serde$' ':http-body$' ':something$'; do
+            if printf '%s' "$bad" | grep -qE "$neg"; then
+              echo "::error::The manifest-side iroh detector reds on the NEGATIVE $neg — a trailing comment naming iroh is not a dependency (comment-stripping regression, QURATOR-281)."
               exit 1
             fi
           done
@@ -472,7 +451,7 @@ jobs:
             echo "::error::ci-fixtures/inv4-iroh-rename-positive.toml declares the dependency under the literal allowlisted key — it no longer demonstrates the renaming evasion this self-test exists to pin."
             exit 1
           fi
-          echo "INV-4′ manifest-iroh self-test OK — both renamed declarations red the allowlist test:"
+          echo "INV-4′ manifest-iroh self-test OK — every spelling reds the allowlist test, negatives clean:"
           printf '%s' "$bad" | sed 's/^/  /'
 
       # Positive control for the serde-derive probe inside the INV-4′ sweep above
