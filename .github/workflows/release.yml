@@ -157,7 +157,9 @@ jobs:
         run: |
           # QURATOR-220: with the key gone from the build step's env, tauri-action
           # uploads the bundles unsigned and skips latest.json. This step re-adds
-          # both, using the same hardening the portable step below established
+          # the signatures (latest.json is assembled once, after both matrix legs
+          # finish, by the single-writer step in the publish-release job), using
+          # the same hardening the portable step below established
           # (QURATOR-107): the signer CLI comes from an integrity-pinned lockfile
           # (`npm ci` refuses any tarball whose sha512 differs), the key travels
           # env → temp file → --private-key-path and is unset before invoking (the
@@ -247,47 +249,17 @@ jobs:
             node "$cliDir/node_modules/@tauri-apps/cli/tauri.js" signer sign --private-key-path "$keyFile" "$a"
           done
 
-          # Assemble the shared latest.json: read-modify-write, each platform leg
-          # merging its own keys into whatever is already published — the same shape
-          # and the same narrow lost-update window tauri-action's uploadUpdaterJson
-          # had; it has never fired because the legs finish minutes apart.
-          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" -p latest.json --clobber \
-            || echo "no latest.json on the release yet (first platform leg)"
-          cat > "$cliDir/merge-updater-json.js" <<'NODE'
-          const fs = require("fs");
-          const artifacts = process.argv.slice(2);
-          const tag = process.env.GITHUB_REF_NAME;
-          const version = tag.replace(/^v/, "");
-          const repo = process.env.GITHUB_REPOSITORY;
-          // Which latest.json platform keys each bundle artifact serves — what
-          // tauri-action's uploadUpdaterJson + updaterJsonPreferNsis used to emit:
-          // the bare platform key the updater plugin resolves, plus the
-          // bundle-specific variants.
-          const keysBySuffix = [
-            ["x64-setup.exe", ["windows-x86_64", "windows-x86_64-nsis"]],
-            [".AppImage", ["linux-x86_64", "linux-x86_64-appimage"]],
-            [".deb", ["linux-x86_64-deb"]],
-          ];
-          let manifest = fs.existsSync("latest.json")
-            ? JSON.parse(fs.readFileSync("latest.json", "utf8"))
-            : {};
-          manifest.version = version;
-          manifest.notes = manifest.notes || "";
-          manifest.pub_date = new Date().toISOString();
-          manifest.platforms = manifest.platforms || {};
-          for (const artifact of artifacts) {
-            const name = artifact.split(/[\\/]/).pop();
-            const entry = keysBySuffix.find(([suffix]) => name.endsWith(suffix));
-            if (!entry) throw new Error("no platform-key mapping for " + name);
-            const url = "https://github.com/" + repo + "/releases/download/" + tag + "/" + name;
-            const signature = fs.readFileSync(artifact + ".sig", "utf8").trim();
-            for (const key of entry[1]) manifest.platforms[key] = { signature: signature, url: url };
-          }
-          fs.writeFileSync("latest.json", JSON.stringify(manifest, null, 2) + "\n");
-          NODE
-          node "$cliDir/merge-updater-json.js" "${artifacts[@]}"
+          # Publish ONLY this leg's signatures. latest.json is assembled once,
+          # after both matrix legs have finished, by the single-writer step in
+          # the publish-release job (QURATOR-276/280). With each leg doing a
+          # download → merge → upload --clobber here, the later leg could
+          # clobber the earlier leg's platform keys out of the manifest, and
+          # the `|| echo` fallback on the download made a transient failure
+          # indistinguishable from "first leg" — either way silently
+          # publishing a latest.json missing a platform, which stops
+          # installed clients on that platform from seeing updates.
           gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
-            "${artifacts[@]/%/.sig}" latest.json
+            "${artifacts[@]/%/.sig}"
 
       - name: Sign + publish the portable self-updater artifacts (Windows)
         if: matrix.platform == 'windows-latest'
@@ -400,6 +372,69 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     steps:
+      # QURATOR-276/280: the ONLY writer of latest.json in the workflow graph.
+      # It runs after BOTH matrix legs succeeded (the job needs build-tauri,
+      # and with fail-fast:false the matrix job only goes green when every leg
+      # has), so all three updater signatures are already on the release and
+      # there is no "asset not uploaded yet" case to tolerate. That makes every
+      # failure mode — API/download error, missing asset, empty signature —
+      # fatal, and because this step precedes the Publish release step below, a
+      # failure here keeps the release in draft instead of shipping a manifest
+      # that silently strands a platform's installed clients.
+      - name: Assemble latest.json (single writer)
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          setup="Hoardbook_${version}_x64-setup.exe"
+          appimage="Hoardbook_${version}_amd64.AppImage"
+          deb="Hoardbook_${version}_amd64.deb"
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            -p "${setup}.sig" -p "${appimage}.sig" -p "${deb}.sig" --clobber
+          for f in "${setup}.sig" "${appimage}.sig" "${deb}.sig"; do
+            if [ ! -s "$f" ]; then
+              echo "::error::Updater signature missing or empty on the release: $f"
+              exit 1
+            fi
+          done
+          python3 - "$version" "$setup" "$appimage" "$deb" <<'PY'
+          import json, os, sys
+          from datetime import datetime, timezone
+          version, setup, appimage, deb = sys.argv[1:5]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          # Which latest.json platform keys each bundle artifact serves — what
+          # tauri-action's uploadUpdaterJson + updaterJsonPreferNsis used to
+          # emit: the bare platform key the updater plugin resolves, plus the
+          # bundle-specific variants.
+          keys_by_artifact = [
+            (setup, ["windows-x86_64", "windows-x86_64-nsis"]),
+            (appimage, ["linux-x86_64", "linux-x86_64-appimage"]),
+            (deb, ["linux-x86_64-deb"]),
+          ]
+          platforms = {}
+          for name, keys in keys_by_artifact:
+            with open(name + ".sig") as f:
+              signature = f.read().strip()
+            if not signature:
+              raise SystemExit("empty signature file: " + name + ".sig")
+            url = "https://github.com/" + repo + "/releases/download/" + tag + "/" + name
+            for key in keys:
+              platforms[key] = {"signature": signature, "url": url}
+          manifest = {
+            "version": version,
+            "notes": "",
+            "pub_date": datetime.now(timezone.utc)
+              .isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "platforms": platforms,
+          }
+          with open("latest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
+            f.write("\n")
+          PY
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber latest.json
+
       - name: Publish release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
