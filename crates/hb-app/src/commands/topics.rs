@@ -199,14 +199,33 @@ pub(crate) fn upsert_topic_contact(store: &DataStore, npub: &str) -> Result<(), 
     store.save_contact(&hash, &peer).map_err(cmd_err)
 }
 
-/// Auto-add every roster member (except me) as a topic contact.
+/// Cap on roster entries ingested into the local contact store per join/refresh (QURATOR-239). A
+/// malicious topic can publish an oversized roster to flood a joining user's contact store; this
+/// bounds the local write regardless of what a relay-side membership fetch returns (a different
+/// layer's `.limit()` bounds what comes back from the relay, not what we're willing to ingest).
+/// 500 is generous for any plausible real topic (a Topic roster is a niche-interest club, not a
+/// mass broadcast list) while still bounding the flood to a fixed, cheap cost. Truncation takes a
+/// deterministic prefix of the roster's given order, never anything iteration-order-dependent.
+const MAX_AUTO_ADDED_ROSTER_CONTACTS: usize = 500;
+
+/// Auto-add roster members (except me) as topic contacts, up to [`MAX_AUTO_ADDED_ROSTER_CONTACTS`].
 fn auto_add_roster(store: &DataStore, roster: &[PublicKey], me_pk: &PublicKey) -> Result<(), String> {
+    let total = roster.len();
+    let mut added = 0usize;
     for pk in roster {
         if pk == me_pk {
             continue;
         }
+        if added >= MAX_AUTO_ADDED_ROSTER_CONTACTS {
+            tracing::warn!(
+                "topic roster has {total} entries; truncating auto-add at the \
+                 {MAX_AUTO_ADDED_ROSTER_CONTACTS}-contact cap"
+            );
+            break;
+        }
         let npub = pk.to_bech32().map_err(cmd_err)?;
         upsert_topic_contact(store, &npub)?;
+        added += 1;
     }
     Ok(())
 }
@@ -1061,6 +1080,71 @@ mod tests {
         let c = store.load_contact(&CachedPeer::pubkey_hash(&npub)).unwrap().unwrap();
         assert_eq!(c.source, ContactSource::Manual, "an existing manual contact keeps its badge");
         assert!(c.browse_key_hex.is_some(), "and keeps its browse-key");
+    }
+
+    // mutation: at topics.rs, change the `added >= MAX_AUTO_ADDED_ROSTER_CONTACTS` cap check in
+    // `auto_add_roster` to always-false (e.g. `false &&` prefix) — the oversized-roster test below
+    // must fail (it will then ingest every roster entry, not exactly the cap).
+    #[test]
+    fn an_oversized_roster_ingests_exactly_the_cap_deterministic_prefix() {
+        // QURATOR-239: a malicious topic with a roster far over the cap must not flood the local
+        // contact store — exactly MAX_AUTO_ADDED_ROSTER_CONTACTS entries land, taken as a
+        // deterministic prefix of the roster's given order (not hash-map-order-dependent).
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
+        let over = MAX_AUTO_ADDED_ROSTER_CONTACTS + 50;
+        let members: Vec<Identity> = (0..over).map(|_| Identity::generate()).collect();
+        let roster: Vec<PublicKey> = members.iter().map(|id| id.public_key()).collect();
+        auto_add_roster(&store, &roster, &me.public_key()).unwrap();
+
+        let ingested = members
+            .iter()
+            .filter(|id| store.load_contact(&CachedPeer::pubkey_hash(&npub_of(id))).unwrap().is_some())
+            .count();
+        assert_eq!(ingested, MAX_AUTO_ADDED_ROSTER_CONTACTS, "exactly the cap was ingested, not the whole roster");
+
+        // Deterministic prefix: the first MAX_AUTO_ADDED_ROSTER_CONTACTS members (in roster order)
+        // are the ones present; the trailing entries were dropped.
+        for id in &members[..MAX_AUTO_ADDED_ROSTER_CONTACTS] {
+            assert!(
+                store.load_contact(&CachedPeer::pubkey_hash(&npub_of(id))).unwrap().is_some(),
+                "a member within the cap-sized prefix must be ingested"
+            );
+        }
+        for id in &members[MAX_AUTO_ADDED_ROSTER_CONTACTS..] {
+            assert!(
+                store.load_contact(&CachedPeer::pubkey_hash(&npub_of(id))).unwrap().is_none(),
+                "a member past the cap-sized prefix must be dropped"
+            );
+        }
+    }
+
+    // mutation: at topics.rs, in `auto_add_roster` change `if pk == me_pk { continue; }` to
+    // `if false { continue; }` — the under-cap test below must fail (my own key would then also be
+    // ingested, growing the ingested count past the roster's member count).
+    #[test]
+    fn an_under_cap_roster_ingests_whole_and_unchanged() {
+        // QURATOR-239: an honest, small roster behaves exactly as before the cap — everyone
+        // (except me) is ingested, none dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
+        let members: Vec<Identity> = (0..10).map(|_| Identity::generate()).collect();
+        let mut roster: Vec<PublicKey> = members.iter().map(|id| id.public_key()).collect();
+        roster.push(me.public_key()); // me is in the roster too but must be skipped, not counted
+        auto_add_roster(&store, &roster, &me.public_key()).unwrap();
+
+        for id in &members {
+            assert!(
+                store.load_contact(&CachedPeer::pubkey_hash(&npub_of(id))).unwrap().is_some(),
+                "every under-cap member is ingested unchanged"
+            );
+        }
+        assert!(
+            store.load_contact(&CachedPeer::pubkey_hash(&npub_of(&me))).unwrap().is_none(),
+            "my own key in the roster is never added as my own contact"
+        );
     }
 
     #[test]
