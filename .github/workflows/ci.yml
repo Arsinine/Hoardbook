@@ -428,7 +428,10 @@ jobs:
           # the target-section rename (the section-awareness half of the awk), the dotted
           # [dependencies.NAME] section, the QUOTED dep key, the QUOTED section header, and
           # the SINGLE-QUOTED package value — the three spellings the detector once missed.
-          for shape in ':quic$' ':quic-helper$' ':quic-section$' ':quic-q$' ':quic-dotted$' ':quic-lit$'; do
+          # QURATOR-287 added the last four: multi-line inline table, quoted inner key, quoted
+          # key containing a dot, whitespace-padded dotted header. A fixture line with no
+          # assertion here is decorative — it would not red if the detector stopped catching it.
+          for shape in ':quic$' ':quic-helper$' ':quic-section$' ':quic-q$' ':quic-dotted$' ':quic-lit$' ':quic-ml$' ':quic-qkey$' ':quic\.dotted-name$' ':quic-padded$' ':quic-after-wedge$'; do
             if ! printf '%s' "$bad" | grep -qE "$shape"; then
               echo "::error::The manifest-side iroh detector missed the $shape local name — the renamed-dependency evasion is back (QURATOR-281)."
               exit 1

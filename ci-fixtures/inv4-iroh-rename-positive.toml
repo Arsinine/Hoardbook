@@ -16,6 +16,11 @@
 # exactly how a porous detector passes its own self-test. Comments are stripped before
 # matching, with a # inside a quoted string NOT treated as a comment start, so the
 # http-body line — whose comment names package = "iroh" itself — must stay clean.
+#
+# QURATOR-287 added the four EXOTIC spellings below (multi-line inline table, quoted key
+# containing a dot, quoted inner key, whitespace-padded dotted header) — all verified
+# evasions of the QURATOR-281 detector, each with its own line here and its own shape
+# assertion in the ci.yml self-test, same pattern as the six above.
 
 [dependencies]
 quic = { package = "iroh", version = "1.0", default-features = false }
@@ -34,3 +39,34 @@ package = "iroh"
 [dependencies."quic-dotted"]
 version = "1.0"
 package = "iroh"
+
+# --- QURATOR-287: the four exotic spellings the line-oriented detector missed ---
+
+# (1) MULTI-LINE inline table — the key and its package never share a line, so a purely
+# line-oriented matcher sees nothing. Cargo's parser accepts this shape today.
+[dependencies]
+quic-ml = {
+  package = "iroh",
+  version = "1.0",
+}
+
+# (3) QUOTED INNER KEY — the quote between `package` and `=` broke the old rest match.
+quic-qkey = { "package" = "iroh" }
+
+# (2) QUOTED KEY CONTAINING A DOT — the dot inside the quotes broke the old header char class.
+[dependencies."quic.dotted-name"]
+package = "iroh"
+
+# (4) WHITESPACE-PADDED DOTTED HEADER (valid TOML) — the old regex needed segments contiguous.
+[ dependencies . quic-padded ]
+package = "iroh"
+
+# --- QURATOR-287 review finding 2: the BRACE-IN-STRING WEDGE ---
+# `zz-wedge`'s quoted value holds a literal `{`. Counting braces on the RAW line wedged the
+# multi-line state machine open, and every later rename in the table was silently missed — a
+# false NEGATIVE the loud known-declaration control cannot catch (it starts AFTER that line).
+# Braces are now counted on quote-stripped text, so `quic-after-wedge` below must still red.
+# ⚠ Order matters: the wedge line must PRECEDE the rename it used to swallow.
+[dependencies]
+zz-wedge = { version = "0.1", features = ["{"] }
+quic-after-wedge = { package = "iroh", version = "1.0" }
