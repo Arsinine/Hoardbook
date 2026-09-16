@@ -681,7 +681,8 @@ pub(crate) async fn dm_request_accept_inner(
 ) -> Result<Vec<ReceivedMessage>, String> {
     let hash = CachedPeer::pubkey_hash(&npub);
     let fingerprint = hb_core::identity::parse_npub(&npub).ok().map(|pk| hb_core::fingerprint::fingerprint(&pk));
-    let peer = CachedPeer {
+    let existing = store.load_contact(&hash).map_err(cmd_err)?;
+    let mut peer = CachedPeer {
         npub: npub.clone(),
         source: ContactSource::Manual,
         browse_key_hex: None,
@@ -695,6 +696,37 @@ pub(crate) async fn dm_request_accept_inner(
         local_tags: vec![],
         fingerprint,
     };
+    // QURATOR-290: accepting a request from an npub that is ALREADY a contact must not clobber what
+    // we already know about them — merge onto the existing record rather than overwriting it with a
+    // blank stub (INV-8: durable local data is never destroyed by an unrelated, innocuous action).
+    if let Some(existing) = existing {
+        peer.collections = existing.collections;
+        peer.local_tags = existing.local_tags;
+        peer.browse_key_hex = existing.browse_key_hex;
+        peer.profile = existing.profile;
+        peer.source = existing.source;
+        peer.petname = peer.petname.or(existing.petname);
+        // QURATOR-134 tri-state: the stub defaults to `Fetched`, which asserts "enumeration
+        // completed and they published nothing" — a CONFIDENT NEGATIVE. Accepting a request is
+        // deliberately network-free, so this path enumerated nothing and has no standing to make
+        // that claim; overwriting a stored `Sealed` (locked) or `FetchFailed` (error + Retry) with
+        // it would re-introduce the exact empty-vs-locked misread QURATOR-134 fixed.
+        peer.listings_state = existing.listings_state;
+        // `last_fetched` means "when WE last polled this peer from the relays" (store.rs's own
+        // doc: as opposed to `last_presence`, which is when we last saw THEIR beacon). Accepting a
+        // request is network-free — it polls nothing — so stamping `Utc::now()` here would claim a
+        // refresh that never happened, resetting the Contacts 7-day stale pill and the "checked
+        // {t}" cold-cache button to "just now". Same confident-claim-never-earned shape as
+        // `listings_state` above. A brand-new contact keeps the stub's `now()`: there, the record
+        // genuinely is as fresh as it will ever be.
+        peer.last_fetched = existing.last_fetched;
+        // NOTE `last_presence` deliberately needs NO line here: `DataStore::save_contact`
+        // (store.rs) already refuses to clear it — an incoming `None` defers to what is on disk,
+        // because presence is owned by the online poll and every relay-resolve writer arrives
+        // without a stamp. Pinned by the assertion in the test below, so a future change to that
+        // self-healing is caught HERE rather than silently reintroducing the W5 "seen just now
+        // about someone gone for a week" regression.
+    }
     store.save_contact(&hash, &peer).map_err(cmd_err)?;
 
     // DM_REQUESTS_LOCK: this load→mutate→save transaction against `dm_requests.json` must serialize
@@ -2778,6 +2810,146 @@ mod tests {
         dm_request_accept_inner(&store, &me, "npub1me", npub2.clone(), Some("Bob".into())).await.unwrap();
         let contact2 = store.load_contact(&CachedPeer::pubkey_hash(&npub2)).unwrap().unwrap();
         assert_eq!(contact2.petname.as_deref(), Some("Bob"));
+    }
+
+    // QURATOR-290: accepting a request from an npub that is ALREADY a contact must merge onto the
+    // existing record, never overwrite it with a blank stub (INV-8).
+    // mutation: delete the `if let Some(existing) = existing { ... }` block at chat.rs lines 702-709
+    // (or any one field-copy line inside it) — the corresponding assertion below must fail.
+    #[tokio::test]
+    async fn accepting_a_request_from_an_existing_contact_preserves_their_cached_collections_tags_key_profile_and_source() {
+        use crate::commands::browse::PeerCollection;
+        use crate::store::ListingsStatus;
+        use hb_core::types::{Collection, Profile, Visibility};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
+        let npub = "npub1existing".to_string();
+        let hash = CachedPeer::pubkey_hash(&npub);
+
+        let existing = CachedPeer {
+            npub: npub.clone(),
+            source: ContactSource::Topic,
+            browse_key_hex: Some("deadbeef".into()),
+            petname: Some("Old Pal".into()),
+            profile: Some(Profile {
+                display_name: "Existing Peer".into(),
+                bio: None,
+                tags: vec![],
+                since: None,
+                est_size: None,
+                languages: vec![],
+                contact_hint: None,
+                email: None,
+                location: None,
+                social_links: vec![],
+                willing_to: vec![],
+                content_types: vec![],
+                picture: None,
+                hide_in_rosters: false,
+                updated: chrono::Utc::now(),
+            }),
+            collections: vec![PeerCollection {
+                collection: Collection {
+                    slug: "films".into(),
+                    path_alias: "films".into(),
+                    description: None,
+                    item_count: 3,
+                    est_size: None,
+                    content_types: vec![],
+                    tags: vec![],
+                    languages: vec![],
+                    visibility: Visibility::Public,
+                    sorted: false,
+                    last_updated: chrono::Utc::now(),
+                    listing: vec![],
+                },
+                parts_total: None,
+                parts_present: None,
+                truncated: None,
+                total_items: None,
+                snapshot_fingerprint: None,
+                manifest_imported_at: None,
+                teaser_event_id: None,
+            }],
+            // Deliberately NOT `Default::default()` (= `Fetched`). The stub built by the accept
+            // path uses the default, so a default here would make the assertion below vacuous —
+            // it would pass whether or not the merge preserves this field.
+            listings_state: ListingsStatus::Sealed,
+            online: false,
+            // Deliberately OLD, and deliberately not `now()`: the stub the accept path builds
+            // stamps `Utc::now()`, so a fresh value here would make the assertion below vacuous.
+            last_fetched: chrono::Utc::now() - chrono::Duration::days(30),
+            last_presence: Some(chrono::Utc::now() - chrono::Duration::days(3)),
+            local_tags: vec!["favorite".into()],
+            fingerprint: None,
+        };
+        store.save_contact(&hash, &existing).unwrap();
+
+        store
+            .save_dm_requests(&me, &[DmRequestBucket { npub: npub.clone(), first_seen: 1, last_message_at: 1, messages: vec![] }])
+            .unwrap();
+
+        dm_request_accept_inner(&store, &me, "npub1me", npub.clone(), None).await.unwrap();
+
+        let contact = store.load_contact(&hash).unwrap().unwrap();
+        assert_eq!(contact.source, ContactSource::Topic, "source is preserved, not reset to Manual");
+        assert_eq!(contact.browse_key_hex.as_deref(), Some("deadbeef"), "browse-key survives accept");
+        assert_eq!(contact.collections.len(), 1, "cached collections survive accept");
+        assert_eq!(contact.collections[0].collection.slug, "films");
+        assert_eq!(contact.local_tags, vec!["favorite".to_string()], "local tags survive accept");
+        assert_eq!(
+            contact.profile.as_ref().map(|p| p.display_name.as_str()),
+            Some("Existing Peer"),
+            "profile survives accept"
+        );
+        assert_eq!(
+            contact.listings_state,
+            ListingsStatus::Sealed,
+            "the QURATOR-134 tri-state survives accept: a network-free accept must not overwrite \
+             `Sealed` (locked) with the default `Fetched`, which asserts the enumeration completed \
+             and found nothing — a confident negative this path never earned"
+        );
+        assert!(
+            contact.last_fetched < chrono::Utc::now() - chrono::Duration::days(29),
+            "last_fetched survives accept: a network-free accept polled nothing, so it must not \
+             claim a fresh fetch — that would reset the 7-day stale pill and the cold-cache age"
+        );
+        assert!(
+            contact.last_presence.is_some(),
+            "last_presence survives accept — `DataStore::save_contact` refuses to clear it (an \
+             incoming None defers to disk). This pins that self-healing from the caller's side: \
+             if it is ever removed, the W5 'seen just now about someone gone for a week' \
+             regression reappears here first"
+        );
+        // Accept's own genuine behaviour is not dropped by the merge.
+        assert!(store.load_dm_requests(&me).unwrap().is_empty(), "the bucket is still drained on accept");
+    }
+
+    // QURATOR-290 case 2: an npub with no existing contact record still gets a fresh Manual stub —
+    // the merge must not require a prior contact to function.
+    // mutation: at chat.rs line 687, change `source: ContactSource::Manual,` to
+    // `source: ContactSource::Topic,` — a brand-new contact must still default to Manual, so the
+    // `assert_eq!(contact.source, ContactSource::Manual)` assertion below must fail.
+    #[tokio::test]
+    async fn accepting_a_request_from_a_brand_new_npub_still_creates_a_manual_contact() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
+        let npub = "npub1brandnew".to_string();
+        assert!(store.load_contact(&CachedPeer::pubkey_hash(&npub)).unwrap().is_none(), "sanity: not yet a contact");
+
+        store
+            .save_dm_requests(&me, &[DmRequestBucket { npub: npub.clone(), first_seen: 1, last_message_at: 1, messages: vec![] }])
+            .unwrap();
+
+        dm_request_accept_inner(&store, &me, "npub1me", npub.clone(), None).await.unwrap();
+
+        let contact = store.load_contact(&CachedPeer::pubkey_hash(&npub)).unwrap().unwrap();
+        assert_eq!(contact.source, ContactSource::Manual);
+        assert!(contact.collections.is_empty());
+        assert!(contact.browse_key_hex.is_none());
     }
 
     #[test]
