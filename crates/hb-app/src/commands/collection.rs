@@ -439,20 +439,12 @@ pub async fn delete_collection(
     // OWN sidecars, sparing `published/<slug>.json`: that file is the live profile teaser's
     // marker, and `DataStore::delete_collection` sweeps it (INV-8). A blanket refusal here
     // instead would strand the legacy draft as undeletable for every user whose profile is
-    // published, which the permissive `is_valid_slug` above deliberately avoids. The path list
-    // mirrors `DataStore::delete_collection` minus `published_path`; if the store ever gains
-    // another sidecar, consolidate this into a store-level delete-sparing-the-marker first.
+    // published, which the permissive `is_valid_slug` above deliberately avoids. QURATOR-288: this
+    // branch used to hand-roll its own four-path list, which could silently drift from the store's
+    // five-path sweep the day a sixth sidecar appeared. Both now consume the store's single
+    // `collection_sidecars` list, so drift is impossible by construction rather than watched for.
     if is_reserved_marker_slug(safe_slug) {
-        for path in [
-            store.collection_draft_path(safe_slug),
-            store.share_settings_path(safe_slug),
-            store.scan_spec_path(safe_slug),
-            store.snapshot_fingerprint_path(safe_slug),
-        ] {
-            if path.exists() {
-                std::fs::remove_file(&path).map_err(cmd_err)?;
-            }
-        }
+        store.delete_collection_sparing_published_marker(safe_slug).map_err(cmd_err)?;
         return Ok(());
     }
     // devtest #11 + QURATOR-138 (owner ruling 2026-08-30): a published collection contributes to
@@ -4649,12 +4641,20 @@ mod collection_command_guards_c {
     /// draft, this covers every path the branch must remove.
     ///
     /// Mutation to redden: in `delete_collection`'s reserved-marker branch, delete the
-    /// `store.share_settings_path(safe_slug),` entry from the `for path in [` array (production
-    /// lines ~446-451 — between the QURATOR-249 comment block and the `return Ok(());`). That is
-    /// the production occurrence inside the array, NOT the mention in this doc comment: an
-    /// unqualified text match would mutate the comment and report a good control as decorative.
-    /// The `share_settings_path` entry in the `gone` loop below reds; the sibling
-    /// spare-the-marker test stays green (it never creates share settings).
+    /// `store.share_settings_path(slug),` entry from the `vec![` inside `DataStore::
+    /// collection_sidecars` (store.rs) — the SINGLE list both delete variants now consume since
+    /// QURATOR-288. Resolve it by line number inside that fn; the same text appears in store.rs's
+    /// own test doc comments, so an unqualified text match would mutate a comment and report a
+    /// good control as decorative. The `share_settings_path` entry in the `gone` loop below reds.
+    ///
+    /// Second, independent mutation (attributes THIS call site rather than the shared list): in
+    /// `delete_collection`'s reserved-marker branch, change
+    /// `store.delete_collection_sparing_published_marker(safe_slug)` to
+    /// `store.delete_collection(safe_slug)` — the marker-survival assert below reds while the
+    /// four `gone` asserts stay green, which is the discrimination this test exists for.
+    /// ⚠ Re-pointed 2026-09-16: this comment previously named a hand-rolled four-path `for` loop
+    /// in this file. QURATOR-288 replaced that loop with the store call above, so the old anchor
+    /// no longer exists — a mutation aimed at it would silently no-op and read as a vacuous control.
     #[tokio::test]
     async fn deleting_a_reserved_slug_removes_every_sidecar_but_the_published_marker() {
         let (_dir, app) = guard_app();

@@ -497,14 +497,45 @@ impl DataStore {
         self.base.join("sharing").join(format!("{slug}.json"))
     }
 
-    pub fn delete_collection(&self, slug: &str) -> Result<()> {
-        for path in &[
-            self.collection_draft_path(slug),
+    /// The single source of truth for a slug's per-collection local sidecars — every file a
+    /// delete sweep removes, with the published-event marker returned separately because for a
+    /// reserved marker slug that file is the LIVE profile teaser's marker, not the collection's
+    /// (INV-8: the marker belongs to the profile teaser subsystem). Both delete variants below
+    /// consume exactly this list, and the reserved-marker teardown in `commands/collection.rs`
+    /// calls the sparing variant instead of hand-rolling its own path list.
+    /// **A sixth store sidecar is a one-line addition to the Vec here** — no other production
+    /// code needs editing.
+    fn collection_sidecars(&self, slug: &str) -> (Vec<PathBuf>, PathBuf) {
+        (
+            vec![
+                self.collection_draft_path(slug),
+                self.share_settings_path(slug),
+                self.scan_spec_path(slug),
+                self.snapshot_fingerprint_path(slug),
+            ],
             self.published_path(slug),
-            self.share_settings_path(slug),
-            self.scan_spec_path(slug),
-            self.snapshot_fingerprint_path(slug),
-        ] {
+        )
+    }
+
+    /// Remove every local sidecar of a slug, including its published-event marker.
+    pub fn delete_collection(&self, slug: &str) -> Result<()> {
+        let (mut sidecars, published_marker) = self.collection_sidecars(slug);
+        sidecars.push(published_marker);
+        for path in &sidecars {
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::delete_collection`] SPARING the published-event marker: for a reserved marker
+    /// slug that file is the live profile teaser's marker and must survive (INV-8). The sweep
+    /// is otherwise identical — both variants consume [`Self::collection_sidecars`], so a sixth
+    /// sidecar added there is swept here for free.
+    pub fn delete_collection_sparing_published_marker(&self, slug: &str) -> Result<()> {
+        let (sidecars, _published_marker) = self.collection_sidecars(slug);
+        for path in &sidecars {
             if path.exists() {
                 std::fs::remove_file(path)?;
             }
@@ -1918,6 +1949,126 @@ pub(crate) mod tests {
         assert_eq!(loaded.root, "/mnt/share/films");
         assert_eq!(loaded.include, vec!["criterion".to_string()]);
         assert_eq!(loaded.total_bytes, 4096, "total_bytes round-trips through the scan spec");
+    }
+
+    /// QURATOR-288 fixture: materialise every per-slug sidecar the delete sweeps cover, via the
+    /// store's own save methods so the paths cannot drift from the real ones.
+    fn materialise_every_sidecar(store: &DataStore) {
+        let col = Collection {
+            slug: "films".into(),
+            path_alias: "films".into(),
+            description: None,
+            item_count: 0,
+            est_size: None,
+            content_types: vec![],
+            tags: vec![],
+            languages: vec![],
+            visibility: hb_core::types::Visibility::Public,
+            sorted: false,
+            last_updated: chrono::Utc::now(),
+            listing: vec![],
+        };
+        store.save_collection_draft(&col).unwrap();
+        store.save_published("films", "{}").unwrap();
+        store.save_share_settings("films", &ShareSettings::default()).unwrap();
+        store.save_scan_spec("films", &ScanSpec::default()).unwrap();
+        store
+            .save_snapshot_fingerprint("films", &hb_core::SnapshotFingerprint("fp".into()))
+            .unwrap();
+    }
+
+    /// QURATOR-288: `delete_collection` itself had zero direct coverage — its sweep was only
+    /// pinned obliquely through the command layer. Materialise all five sidecars and assert all
+    /// five are gone.
+    ///
+    /// Mutation to redden (orchestrator applies on the settled tree; a Rust lane does not run
+    /// it — a filtered `cargo test -p hb-app` still compiles the whole crate and collides on
+    /// CARGO_TARGET_DIR): in `collection_sidecars` (the private `fn` immediately above
+    /// `delete_collection`, whose body is the tuple of a four-entry `vec![` and
+    /// `self.published_path(slug)`), delete the `self.share_settings_path(slug),` entry INSIDE
+    /// that `vec![` — resolve the line number in that production region; the same text appears
+    /// in this comment, so an unqualified text match would mutate the comment and report a good
+    /// control as decorative. The `share_settings_path` assert below reds.
+    #[test]
+    fn delete_collection_removes_every_sidecar_including_the_published_marker() {
+        let (_dir, store) = test_store();
+        materialise_every_sidecar(&store);
+        // Precondition: all five exist, so a silently failing save cannot vacuously green the
+        // absence asserts below.
+        for present in [
+            store.collection_draft_path("films"),
+            store.published_path("films"),
+            store.share_settings_path("films"),
+            store.scan_spec_path("films"),
+            store.snapshot_fingerprint_path("films"),
+        ] {
+            assert!(present.exists(), "precondition: {} must exist", present.display());
+        }
+
+        store.delete_collection("films").unwrap();
+
+        for gone in [
+            store.collection_draft_path("films"),
+            store.published_path("films"),
+            store.share_settings_path("films"),
+            store.scan_spec_path("films"),
+            store.snapshot_fingerprint_path("films"),
+        ] {
+            assert!(
+                !gone.exists(),
+                "delete_collection must sweep {} — an orphaned sidecar keeps \
+                 target_path_is_occupied (backup.rs) true and blocks future restores",
+                gone.display()
+            );
+        }
+    }
+
+    /// QURATOR-288: the spare-the-marker variant the reserved-marker teardown in
+    /// `commands/collection.rs` (QURATOR-249) calls instead of hand-rolling four paths. Same
+    /// five-sidecar fixture; exactly the published marker must survive.
+    ///
+    /// Mutation to redden (orchestrator applies; not run here): in
+    /// `delete_collection_sparing_published_marker` (the `pub fn` immediately after
+    /// `delete_collection`), replace the whole body — the
+    /// `let (sidecars, _published_marker) = self.collection_sidecars(slug);` destructure plus
+    /// its `for` loop — with a plain delegation to `self.delete_collection(slug)`, making the
+    /// sparing variant sweep the marker too. The marker-survival assert below reds while the
+    /// sibling `delete_collection_removes_every_sidecar_including_the_published_marker` stays
+    /// green (one mutation, one test — attributable).
+    #[test]
+    fn delete_collection_sparing_published_marker_removes_every_sidecar_but_the_marker() {
+        let (_dir, store) = test_store();
+        materialise_every_sidecar(&store);
+        for present in [
+            store.collection_draft_path("films"),
+            store.published_path("films"),
+            store.share_settings_path("films"),
+            store.scan_spec_path("films"),
+            store.snapshot_fingerprint_path("films"),
+        ] {
+            assert!(present.exists(), "precondition: {} must exist", present.display());
+        }
+
+        store.delete_collection_sparing_published_marker("films").unwrap();
+
+        assert!(
+            store.published_path("films").exists(),
+            "INV-8: the sparing variant must spare the published marker — for a reserved \
+             marker slug it is the live profile teaser's marker, not the collection's"
+        );
+        for gone in [
+            store.collection_draft_path("films"),
+            store.share_settings_path("films"),
+            store.scan_spec_path("films"),
+            store.snapshot_fingerprint_path("films"),
+        ] {
+            assert!(
+                !gone.exists(),
+                "the sparing variant must still sweep {} — an orphaned sidecar keeps \
+                 target_path_is_occupied (backup.rs) true and blocks future restores",
+                gone.display()
+            );
+        }
     }
 
     #[test]
