@@ -214,7 +214,6 @@ pub fn put(
     now: u64,
     cap_bytes: usize,
 ) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
     migrate_legacy_entries(dir);
     let entry = CacheEntry {
         npub: npub.to_string(),
@@ -241,6 +240,15 @@ pub fn put(
     {
         let lock = dir_write_lock(dir);
         let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        // Recreate the cache directory INSIDE the lock (QURATOR-285a). As an unlocked prologue this
+        // raced `clear_all`'s locked `remove_dir_all`: a `put` recreating the parent mid-wipe fails
+        // the user's deliberate clear with ENOTEMPTY, and a wipe that finished first left the staged
+        // write below hitting ENOENT — a spurious fetch failure. Under the lock a post-wipe `put`
+        // still recreates the directory (legitimate); it just cannot interleave with a wipe.
+        // (`migrate_legacy_entries` above therefore runs on a possibly-absent directory already:
+        // its `scan` treats NotFound as empty and its marker write fails silently — the posture
+        // documented at that marker write.)
+        std::fs::create_dir_all(dir)?;
         std::fs::write(&tmp_path, &bytes)?;
         std::fs::rename(&tmp_path, &final_path)?;
 
@@ -1210,11 +1218,24 @@ mod tests {
     /// is not a unique anchor): in `clear_all`, delete the two-line acquisition that is the FIRST
     /// statement of the body, BEFORE the `match std::fs::remove_dir_all(dir)` (`let lock =
     /// dir_write_lock(dir);` then the `let _guard = lock.lock()...` line). The spawned `clear_all`
-    /// then no longer blocks on the lock this test holds — a one-entry tempdir removes in well
-    /// under the 100 ms window — so `recv_timeout` returns `Ok` and the `is_err()` assertion reds.
+    /// then no longer blocks on the lock this test holds — after the liveness signal below it is
+    /// already running, and a one-entry tempdir removes in well under the 1 s window — so
+    /// `recv_timeout` returns `Ok` and the `is_err()` assertion reds.
     /// The post-release assertions can stay green under it; the blocking witness is the control.
     /// (Distinct from the two `clear_all` mutations noted beside the QURATOR-176 tests below: the
     /// no-op body and the NotFound arm — three tests, three independent discriminators.)
+    ///
+    /// QURATOR-285b — the witness is a LIVENESS HANDSHAKE, not a bare timeout. The original form
+    /// asserted `recv_timeout(100ms).is_err()`: if the runner simply never scheduled the wiper
+    /// thread within the window, a MUTATED (lock-free) `clear_all` also sent nothing and the
+    /// control passed vacuously — "nothing arrived" was indistinguishable from "nothing ran". Now
+    /// the wiper sends a `started` signal BEFORE calling `clear_all`, and the timing window opens
+    /// only after that signal arrives, so the thread is provably running when the clock starts;
+    /// within the window the only thing between `started` and `done` is `clear_all` itself, which
+    /// unguarded is three syscalls on a one-entry tempdir. The window is 1 s (not the 100 ms the
+    /// sibling lock tests use) because it now bounds only preemption of in-thread work, never
+    /// thread scheduling — and a spurious preemption miss would silently un-discriminate the
+    /// control, the exact failure this hardening exists to remove.
     #[test]
     fn the_wipe_is_serialized_against_concurrent_puts() {
         let dir = tempfile::tempdir().unwrap();
@@ -1224,15 +1245,26 @@ mod tests {
         // section leaves the cache in: a wipe that begins now must wait, not race it.
         let lock = dir_write_lock(dir.path());
         let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         let cache_dir = dir.path().to_path_buf();
         let wiper = std::thread::spawn(move || {
+            // Liveness FIRST (QURATOR-285b): this send proves the thread is running before any
+            // timing window opens. `clear_all` is the only work between it and `done`, so a silent
+            // window can only mean the wipe is blocked — never that the thread was never
+            // scheduled.
+            let _ = started_tx.send(());
             let res = clear_all(&cache_dir);
-            let _ = tx.send(());
+            let _ = done_tx.send(());
             res
         });
+        // No tight bound here: however long the runner takes to schedule the wiper is fine — this
+        // is the "it ran" half, distinguished from the blocking half below.
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the wiper thread must start for the blocking witness to mean anything");
         assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
+            done_rx.recv_timeout(std::time::Duration::from_secs(1)).is_err(),
             "clear_all must hold the directory write lock across its removal — the user-asked wipe may not race an in-flight put"
         );
         drop(guard);
@@ -1243,6 +1275,74 @@ mod tests {
         assert!(!dir.path().exists(), "the cache directory itself is removed, not emptied");
         put(dir.path(), "npubB", "music", "fp2", "ENV-B", 300, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
         assert_eq!(get(dir.path(), "npubB", "music", "fp2", 400).as_deref(), Some("ENV-B"));
+    }
+
+    /// QURATOR-285a: `put`'s directory recreation must happen UNDER the directory write lock, not
+    /// as an unlocked prologue. The raced interleaving: `clear_all` holds the lock mid-
+    /// `remove_dir_all` while a concurrent `put` recreates the parent directory under the wipe's
+    /// feet — the wipe then fails ENOTEMPTY and the user's deliberate clear surfaces an error.
+    /// (The mirror interleaving — the wipe completes first and `put`'s staged write hits ENOENT —
+    /// is closed by the same move: the recreation and the write now share one critical section.)
+    ///
+    /// The witness holds the lock and asserts the blocked `put` has created NOTHING on disk:
+    /// recreating the directory while another writer holds the lock is exactly the ENOTEMPTY half
+    /// of the race. A post-wipe `put` still recreates the directory once the lock is free —
+    /// legitimate, and asserted after the join.
+    ///
+    /// MUTATION (P-10) — resolved by containing item, anchor by POSITION not text: in `put`, move
+    /// the `std::fs::create_dir_all(dir)?;` line OUT of the lock block — delete it from
+    /// immediately after the `let _guard = lock.lock()...` line (the first statement inside the
+    /// `{` block, before `std::fs::write(&tmp_path, &bytes)?;`) and re-insert it as the FIRST
+    /// statement of `put`'s body, before `migrate_legacy_entries(dir);` — i.e. restore the
+    /// unlocked prologue. The spawned `put` then recreates the directory BEFORE blocking on the
+    /// lock, so once the liveness signal has arrived the directory exists and the
+    /// `!target.exists()` assertion reds while the blocking assertion stays green — the
+    /// recreation witness is the control. (Deleting the line outright also reds this test, via
+    /// the join: with no recreation anywhere the staged write fails ENOENT and `put` returns
+    /// `Err`.)
+    #[test]
+    fn puts_directory_recreation_is_serialized_against_the_wipe() {
+        let base = tempfile::tempdir().unwrap();
+        // Never created — `put` is what creates the cache directory (same shape as the
+        // absent-cache test below).
+        let target = cache_dir(base.path());
+
+        let lock = dir_write_lock(&target);
+        let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer_target = target.clone();
+        let writer = std::thread::spawn(move || {
+            let _ = started_tx.send(()); // liveness — same handshake as the wipe test above
+            let res = put(
+                &writer_target,
+                "npubA",
+                "films",
+                "fp1",
+                "ENV",
+                10,
+                DEFAULT_MANIFEST_CACHE_BYTES,
+            );
+            let _ = done_tx.send(());
+            res
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the writer thread must start for the witness to mean anything");
+        assert!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(1)).is_err(),
+            "put must hold the directory write lock across its whole critical section"
+        );
+        assert!(
+            !target.exists(),
+            "a put blocked on the write lock must have created nothing on disk — recreating the directory outside the lock is the ENOTEMPTY half of the QURATOR-285 race"
+        );
+        drop(guard);
+        writer.join().unwrap().unwrap();
+
+        // Released, the put recreates the directory and lands the entry — the legitimate
+        // post-wipe behaviour the lock preserves.
+        assert_eq!(get(&target, "npubA", "films", "fp1", 20).as_deref(), Some("ENV"));
     }
 
     // QURATOR-176 — the global, all-or-nothing clear.
