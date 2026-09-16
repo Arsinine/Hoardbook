@@ -49,6 +49,24 @@ jobs:
         with:
           script: ${{ github.event.pull_request.title }}
 
+      # QURATOR-223 (2026-09-15 scan): github.event.pull_request.head.ref and .head.label
+      # carry the fork branch name — the same value as github.head_ref — but the retired
+      # stage-1 alternation never matched either spelling. Guard MUST catch both.
+      - name: bad-run-head-ref-adjacent
+        run: ${{ github.event.pull_request.head.ref }}
+
+      - name: bad-run-head-label-adjacent
+        run: ${{ github.event.pull_request.head.label }}
+
+      # QURATOR-223 label-line shell exemption: inside a run: body, `word: token` is LIVE
+      # SHELL TEXT once GitHub splices the value in — `label:` fails as a command, then the
+      # injected title's `;` executes. It is not a YAML scalar, so it must NOT be exempted
+      # the way a genuine env: slot is. The retired colon-lookalike filter dropped exactly
+      # this line as "safe". Guard MUST catch it.
+      - name: bad-run-body-label-line
+        run: |
+          label: ${{ github.event.pull_request.title }}
+
       # --- NEGATIVE CONTROL: these are SAFE and the guard must NOT flag them. ---
       # The exemption's lookahead must be anchored to the whole key. An unanchored
       # (?!run|script) also refuses to exempt keys that merely START with those

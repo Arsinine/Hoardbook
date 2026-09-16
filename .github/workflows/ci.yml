@@ -65,10 +65,18 @@ jobs:
       # hb-app embeds frontendDist (`ui/build`) at compile time via
       # `tauri::generate_context!`, so the frontend must be built before any
       # `cargo` command that compiles hb-app, on every OS in the matrix.
+      # QURATOR-255 (2026-09-15 scan): bare `npm ci` also executes every lockfile package's
+      # install/postinstall/prepare scripts as the runner user, and on a fork PR the whole
+      # tree — package-lock.json included — is attacker-authored. Exactly two locked packages
+      # declare install scripts (esbuild; fsevents, which is darwin-only and never installs
+      # on these runners), so scripts are disabled wholesale and re-enabled for esbuild
+      # alone, by name: a PR that adds a new script-carrying dependency gets NO script
+      # execution, and the one vetted build dep keeps working.
       - name: Build frontend (required to compile hb-app)
         working-directory: crates/hb-app/ui
         run: |
-          npm ci
+          npm ci --ignore-scripts
+          npm rebuild esbuild
           npm run build
 
       - name: cargo test --workspace
@@ -139,7 +147,16 @@ jobs:
           # it fails CLOSED exactly like the harness filter above: rename or move the file and it
           # reappears in the scan, turning CI red until this line is corrected. If nat.rs ever grows
           # a stream, a send, or an fs call, delete this exemption rather than widening it.
-          iroh_users=$(grep -rlE '(^|[^a-zA-Z_])iroh::' crates/*/src | grep -v '/wan_it/' | grep -vx 'crates/hb-app/src/nat\.rs' | sort)
+          # QURATOR-256 (2026-09-15 scan): the retired enumeration pattern required the literal
+          # `iroh::` token, so a use-statement ALIASING the crate (`use iroh as quic;` and then
+          # `quic::` paths) never matched it — an aliased module held QUIC connections while
+          # sitting outside every probe below. The pattern now also flags the crate named bare
+          # in use/extern-crate position (any alias or re-import), while the original
+          # alternative keeps catching every qualified path and the brace/glob import forms.
+          # This is file-LISTING, comments included, and that is deliberate: prose naming the
+          # crate means a human has to say the file is transport-adjacent out loud too.
+          # Self-tested against ci-fixtures/inv4-iroh-positive.rs in the step below.
+          iroh_users=$(grep -rlE '(^|[^a-zA-Z_])(iroh::|use[[:space:]]+iroh([^a-zA-Z0-9_:]|$)|extern[[:space:]]+crate[[:space:]]+iroh([^a-zA-Z0-9_:]|$))' crates/*/src | grep -v '/wan_it/' | grep -vx 'crates/hb-app/src/nat\.rs' | sort)
           listed=$(printf '%s\n' $TRANSPORT_FILES | sort)
           if unlisted=$(comm -23 <(echo "$iroh_users") <(echo "$listed")) && [ -n "$unlisted" ]; then
             echo "::error::INV-4′ regression — these files use iroh but are not in the swept transport surface:"
@@ -172,17 +189,29 @@ jobs:
           # non-`WireEnvelope` type — while exempting exactly the private Deserialize-only mirror
           # that from_wire parses through. ERE cannot bind a derive attribute to the type it
           # annotates, so this is a small awk that pairs each derive with the next declared item
-          # and drops comment lines the way `code_only` does. Self-tested in the step below.
+          # and drops comment lines the way `code_only` does.
+          #
+          # QURATOR-269 (2026-09-15 scan) closed three evasions in that pairing: the anchor
+          # now permits LEADING WHITESPACE before the attribute (an indented derive inside a
+          # nested module used to match neither rule and RESET the accumulator);
+          # `#[cfg_attr(...)]` lines are FOLDED into the accumulator — `cfg_attr(all(),
+          # derive(Deserialize))` is a live derive, not "some other attribute" to skip — and
+          # the attribute block is held open until its parens actually BALANCE, so a
+          # multi-line cfg_attr cannot drop its derive clause mid-attribute. Self-tested
+          # against ci-fixtures/transport-payload-positive.rs in the step below — a claim that
+          # was FALSE before this change: the "step below" tested only the no-fs probe, and
+          # this probe had no positive control at all.
           if out=$(awk '
             function hit() { printf "%s:%d:%s\n", FILENAME, NR, $0; bad = 1 }
             {
-              if (open_derive) {
-                if ($0 !~ /^[ \t]*(\/\/|\/\*|\*)/) { d_body = d_body " " $0; if ($0 ~ /\)/) open_derive = 0 }
+              if (open_attr) {
+                if ($0 !~ /^[ \t]*(\/\/|\/\*|\*)/) { d_body = d_body " " $0; depth += gsub(/\(/, "("); depth -= gsub(/\)/, ")"); if (depth <= 0) open_attr = 0 }
                 next
               }
               if ($0 ~ /^[ \t]*(\/\/|\/\*|\*)/) next
-              if ($0 ~ /^#[ \t]*\[derive[ \t]*\(/) { d_body = d_body " " $0; if ($0 !~ /\)/) open_derive = 1; next }
-              if ($0 ~ /^#/) next
+              if ($0 ~ /^[ \t]*#\[derive[ \t]*\(/) { d_body = d_body " " $0; depth = gsub(/\(/, "(") - gsub(/\)/, ")"); if (depth > 0) open_attr = 1; next }
+              if ($0 ~ /^[ \t]*#\[cfg_attr[ \t]*\(/) { d_body = d_body " " $0; depth = gsub(/\(/, "(") - gsub(/\)/, ")"); if (depth > 0) open_attr = 1; next }
+              if ($0 ~ /^[ \t]*#/) next
               if ($0 ~ /^[ \t]*(pub([ \t]*\([^)]*\))?[ \t]+)?(struct|enum|union)[ \t]+[A-Za-z_0-9]+/) {
                 if (d_body != "") {
                   d = d_body; sub(/[ \t]*\/\/.*$/, "", d)
@@ -259,6 +288,96 @@ jobs:
           echo "INV-4′ no-fs probe self-test OK — caught $n evasion(s), and exempted every comment line:"
           printf '%s\n' "$hits" | sed 's/^/  /'
 
+      # Positive control for the iroh-surface enumeration inside the INV-4′ sweep above
+      # (QURATOR-256, 2026-09-15 scan). The retired pattern's premise — "nothing can hold a
+      # QUIC connection without naming iroh" — only held for the literal path prefix, so a
+      # use-statement aliasing the crate escaped the enumeration, and with it every probe
+      # that enumeration feeds. The fixture holds exactly that evasion; this step runs the
+      # SAME enumeration pattern against it and asserts the alias form is caught. It lives
+      # under ci-fixtures/ (NOT crates/), so the production enumeration never scans it.
+      - name: INV-4′ iroh-surface self-test — must red on the aliased-import fixture
+        if: matrix.platform == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -uo pipefail
+          if ! grep -qE '(^|[^a-zA-Z_])use[[:space:]]+iroh([^a-zA-Z0-9_:]|$)' ci-fixtures/inv4-iroh-positive.rs; then
+            echo "::error::The iroh-surface enumeration is VACUOUS — it passed on ci-fixtures/inv4-iroh-positive.rs, which holds the aliased-import evasion (a use-statement renaming the crate, then aliased paths). The enumeration must catch this (QURATOR-256)."
+            exit 1
+          fi
+          # Fixture hygiene: the fixture must demonstrate the ALIASING evasion specifically.
+          # If it ever grows the literal iroh path prefix it is caught trivially and pins
+          # nothing — same class as a control that passes because its own message supplied
+          # the hit.
+          if grep -qE '(^|[^a-zA-Z_])iroh::' ci-fixtures/inv4-iroh-positive.rs; then
+            echo "::error::ci-fixtures/inv4-iroh-positive.rs contains the literal iroh path prefix — it no longer demonstrates the aliasing evasion this self-test exists to pin."
+            exit 1
+          fi
+          echo "INV-4′ iroh-surface self-test OK — the aliased-import fixture is caught by the use-form alternative:"
+          grep -nE '(^|[^a-zA-Z_])use[[:space:]]+iroh([^a-zA-Z0-9_:]|$)' ci-fixtures/inv4-iroh-positive.rs | sed 's/^/  /'
+
+      # Positive control for the serde-derive probe inside the INV-4′ sweep above
+      # (QURATOR-269, 2026-09-15 scan). The probe's comment claimed "Self-tested in the step
+      # below" for months, but that step tested only the no-fs pattern — the awk had no
+      # positive control at all, and the scan found it evadable three ways (cfg_attr wrapping,
+      # indented derives, multi-line attributes). The fixture holds all three plus the shapes
+      # the probe must keep catching and the one it must keep exempting; this step runs the
+      # SAME awk against it and asserts it REDS. It lives under ci-fixtures/ (NOT crates/),
+      # so the production probe never scans it.
+      - name: Serde-derive probe self-test — must red on the positive fixture
+        if: matrix.platform == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -uo pipefail
+          hits=$(awk '
+            function hit() { printf "%s:%d:%s\n", FILENAME, NR, $0; bad = 1 }
+            {
+              if (open_attr) {
+                if ($0 !~ /^[ \t]*(\/\/|\/\*|\*)/) { d_body = d_body " " $0; depth += gsub(/\(/, "("); depth -= gsub(/\)/, ")"); if (depth <= 0) open_attr = 0 }
+                next
+              }
+              if ($0 ~ /^[ \t]*(\/\/|\/\*|\*)/) next
+              if ($0 ~ /^[ \t]*#\[derive[ \t]*\(/) { d_body = d_body " " $0; depth = gsub(/\(/, "(") - gsub(/\)/, ")"); if (depth > 0) open_attr = 1; next }
+              if ($0 ~ /^[ \t]*#\[cfg_attr[ \t]*\(/) { d_body = d_body " " $0; depth = gsub(/\(/, "(") - gsub(/\)/, ")"); if (depth > 0) open_attr = 1; next }
+              if ($0 ~ /^[ \t]*#/) next
+              if ($0 ~ /^[ \t]*(pub([ \t]*\([^)]*\))?[ \t]+)?(struct|enum|union)[ \t]+[A-Za-z_0-9]+/) {
+                if (d_body != "") {
+                  d = d_body; sub(/[ \t]*\/\/.*$/, "", d)
+                  vis = ($0 ~ /^[ \t]*pub/) ? "pub" : "priv"
+                  name = $0
+                  sub(/^[ \t]*(pub([ \t]*\([^)]*\))?[ \t]+)?(struct|enum|union)[ \t]+/, "", name)
+                  sub(/[^A-Za-z_0-9].*$/, "", name)
+                  if (d ~ /Serialize/ || (d ~ /Deserialize/ && !(vis == "priv" && name == "WireEnvelope"))) hit()
+                }
+                d_body = ""
+                next
+              }
+              if ($0 ~ /[^ \t]/) d_body = ""
+            }
+            END { exit(bad ? 0 : 1) }
+          ' ci-fixtures/transport-payload-positive.rs 2>/dev/null) || true
+          if [ -z "$hits" ]; then
+            echo "::error::The serde-derive probe is VACUOUS — it passed on ci-fixtures/transport-payload-positive.rs, which holds the cfg_attr, indented and multi-line derive evasions (QURATOR-269) plus the plain Serialize and pub-Deserialize shapes."
+            exit 1
+          fi
+          # Every planted shape must be named in the hit set — an awk edit that catches some
+          # shapes and drops others must not pass silently.
+          for shape in EvadesViaCfgAttr EvadesViaIndent EvadesViaMultilineCfgAttr PlainSerialize PubDeserialize; do
+            if ! printf '%s\n' "$hits" | grep -q "$shape"; then
+              echo "::error::The serde-derive probe missed the $shape case in ci-fixtures/transport-payload-positive.rs."
+              exit 1
+            fi
+          done
+          # Negative half: the private Deserialize-only WireEnvelope mirror is the one exempt
+          # shape. If it appears here, the exemption is gone and every legitimate change to
+          # the real transport_payload.rs reds the build.
+          if printf '%s\n' "$hits" | grep -q WireEnvelope; then
+            echo "::error::FALSE POSITIVE — the probe flagged the exempt WireEnvelope mirror."
+            exit 1
+          fi
+          n=$(printf '%s\n' "$hits" | grep -c .)
+          echo "Serde-derive probe self-test OK — caught $n derive(s), left the WireEnvelope mirror exempt:"
+          printf '%s\n' "$hits" | sed 's/^/  /'
+
       # QURATOR-79 — Carrier 4's public-only fence rests on manifest_cache having exactly ONE
       # production writer (crates/hb-app/src/commands/browse.rs, inside accept_manifest_bytes). If a
       # private listing can never physically enter the cache, it can never be re-served from it — but
@@ -271,9 +390,19 @@ jobs:
       # `manifest_cache::put(` (this also catches `crate::manifest_cache::put(`, a substring match),
       # and (b) manifest_cache.rs calling its OWN function unqualified — bare `put(` — which a
       # qualified-name-only grep misses entirely. The bare form is only probed for INSIDE
-      # manifest_cache.rs itself: nowhere else can write `put(` and mean this function without
-      # importing or qualifying it, and confining it there keeps an unrelated `put(` in some other
-      # module from tripping this guard.
+      # manifest_cache.rs itself: elsewhere an unrelated module's own `put(` would trip this
+      # guard on a name collision, not a write.
+      #
+      # QURATOR-233 (2026-09-15 scan): IMPORTING is itself an evasion — `use
+      # crate::manifest_cache::put;` followed by a bare `put(...)`, and a module alias `use
+      # crate::manifest_cache as mc;` followed by `mc::put(...)`, spell neither
+      # `manifest_cache::put(` nor a bare `put(` that this sweep may probe, so the qualified-only
+      # pattern reported "exactly 1 production writer" while a second writer existed. The import
+      # forms are therefore probed everywhere too: the use-line alternatives flag any import that
+      # NAMES put (brace lists and `as`-renames included) or ALIASES the module itself. A plain
+      # read-oriented module import (manifest_source.rs) and item imports not naming put
+      # (fetch_driver.rs `CachedKey`) deliberately do not match. Self-tested against
+      # ci-fixtures/manifest-writer-positive.rs in the step below.
       #
       # Scanned per-file, comment-stripped, and restricted to each file's own PRODUCTION region — the
       # lines before its first `#[cfg(test)]` marker (the whole file if it has none) — so the two
@@ -327,7 +456,9 @@ jobs:
             if [ "$f" = "$MC_FILE" ]; then
               pattern='manifest_cache::put[[:space:]]*\(|(^|[^a-zA-Z0-9_])put[[:space:]]*\('
             else
-              pattern='manifest_cache::put[[:space:]]*\('
+              # QURATOR-233: the second alternative catches the import-then-bare-call and
+              # module-alias evasions on the use line itself (see the comment above).
+              pattern='manifest_cache::put[[:space:]]*\(|(^|[^a-zA-Z0-9_])use[[:space:]][^;]*manifest_cache([^;]*[^a-zA-Z0-9_]put([^a-zA-Z0-9_]|$)|[[:space:]]+as[[:space:]])'
             fi
             hits=$(printf '%s\n' "$region" | grep -E "$pattern" 2>/dev/null | code_only | grep -vE ':[[:space:]]*(pub[[:space:]]+)?fn[[:space:]]+put[[:space:]]*\(' || true)
             n=$(printf '%s\n' "$hits" | grep -c . || true)
@@ -356,6 +487,44 @@ jobs:
             exit 1
           fi
           echo "manifest-cache single-writer sweep clean — examined $nfiles file(s), exactly 1 production writer, at $ALLOWED_FILE."
+
+      # Positive control for the import-evasion half of the manifest-cache single-writer
+      # sweep above (QURATOR-233, 2026-09-15 scan). The fixture holds both import forms that
+      # spell neither the qualified call nor a probe-able bare put( — the item import plus
+      # bare call, and the module alias — plus the plain read-oriented module import that
+      # must stay exempt. This step runs the SAME pattern-and-filter pipeline against it and
+      # asserts both evasions RED and the read import does not. It lives under ci-fixtures/
+      # (NOT crates/hb-app/src), so the production sweep never scans it.
+      - name: Manifest-cache import-evasion self-test — must red on the positive fixture
+        if: matrix.platform == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -uo pipefail
+          code_only() { grep -vE '^[^:]*:[0-9]+:[[:space:]]*(//|#|\*|/\*|<!--)'; }
+          # The exact non-manifest_cache.rs branch pattern from the sweep above.
+          pattern='manifest_cache::put[[:space:]]*\(|(^|[^a-zA-Z0-9_])use[[:space:]][^;]*manifest_cache([^;]*[^a-zA-Z0-9_]put([^a-zA-Z0-9_]|$)|[[:space:]]+as[[:space:]])'
+          # -H is load-bearing exactly as in the sweep above: code_only anchors on the
+          # file:line: prefix, which a single-file grep omits without it.
+          hits=$(grep -HnE "$pattern" ci-fixtures/manifest-writer-positive.rs 2>/dev/null | code_only) || true
+          if [ -z "$hits" ]; then
+            echo "::error::The manifest-cache single-writer sweep is VACUOUS against imports — it passed on ci-fixtures/manifest-writer-positive.rs, which holds the import-then-bare-call and module-alias evasions (QURATOR-233)."
+            exit 1
+          fi
+          for evasion in 'manifest_cache::put;' 'manifest_cache as mc'; do
+            if ! printf '%s\n' "$hits" | grep -qF "$evasion"; then
+              echo "::error::The manifest-cache sweep missed the '$evasion' import form in ci-fixtures/manifest-writer-positive.rs (QURATOR-233)."
+              exit 1
+            fi
+          done
+          # Negative half: the plain module import is the read-oriented form production code
+          # uses today (manifest_source.rs). Flagging it would red the build on the current tree.
+          if printf '%s\n' "$hits" | grep -qE 'use crate::manifest_cache;$'; then
+            echo "::error::FALSE POSITIVE — the sweep flagged a plain read-oriented module import, which manifest_source.rs uses today."
+            exit 1
+          fi
+          n=$(printf '%s\n' "$hits" | grep -c .)
+          echo "Manifest-cache import-evasion self-test OK — caught $n import evasion(s), exempted the read-oriented module import:"
+          printf '%s\n' "$hits" | sed 's/^/  /'
 
       # M18 W5 — the retired MASCARA-COURIER framing must not creep back into code.
       #
@@ -457,42 +626,72 @@ jobs:
       # block (or read the auto-populated GITHUB_REF_NAME) so the value never becomes script text.
       # This sweep fails the build if any of those contexts is interpolated INLINE in a script body.
       # The legitimate fix interpolates them as a YAML scalar value (`key: ${{ ... }}` under env:/
-      # with:), which is safe — the value enters the runner environment, never a shell parser — so
-      # those scalar-value lines are dropped before the fail check. github.repository is owner-
-      # controlled and never attacker-controllable, so it is not in the pattern. Ubuntu-only, like
-      # the guards above; one grep pass over every workflow file suffices.
+      # with:), which is safe — the value enters the runner environment, never a shell parser.
+      # QURATOR-223 (2026-09-15 scan) fixed two false negatives in how "script body" and
+      # "attacker context" were recognised:
+      #   · the context set now includes github.event.pull_request.head.ref/.head.label — the
+      #     fork branch name under its other spelling, which the retired alternation never
+      #     matched even for a direct inline interpolation;
+      #   · the retired line-regex exempted anything shaped `key: value` — but INSIDE a run:
+      #     body that shape is live shell text once GitHub splices the value in (`label:`
+      #     fails as a command, then the injected title's `;` executes). A line regex cannot
+      #     see YAML structure, so the sweep is now a small awk state machine that tracks
+      #     run:/script: block scalars and flags attacker-context interpolation ONLY inside
+      #     script bodies — exactly the decision this step has always documented. Genuine
+      #     env:/with: slots are mapping lines OUTSIDE any run:/script: block, so they are
+      #     safe by structure, not by exemption. github.repository is owner-controlled and
+      #     never attacker-controllable, so it is not in the pattern. Ubuntu-only, like the
+      #     guards above; one pass over every workflow file suffices.
       - name: Workflow injection sweep — no attacker-context interpolation in script bodies
         if: matrix.platform == 'ubuntu-latest'
         shell: bash
         run: |
           set -uo pipefail
-          # Match an interpolation expression (the dollar-double-brace form) naming an attacker-
-          # controllable context (github.ref_name, github.head_ref, or github.event.*.title/body).
-          # Then drop `path:line:  key:` scalar-value lines: those are YAML scalar values (env:/with:
-          # slots), the safe indirection pattern, not inline script text. What remains is an
-          # interpolation living inside a run:/script: body.
-          # The scalar exemption uses a negative lookahead (?!(?:run|script):): `run` and `script`
-          # are themselves valid matches for the generic `[A-Za-z_]` key pattern, but they introduce
-          # a script BODY, not a scalar value. Without the lookahead a line like `run: <interpolation>`
-          # is exempted as if it were a safe env: slot — the guard would silence the exact form it
-          # exists to catch (QURATOR-48). The script-bearing keys are `run` (shell) and `script`
-          # (the actions/github-script input); `uses:` is an action reference, not a script body.
-          # The trailing colon inside the lookahead is load-bearing: it anchors the match to the
-          # WHOLE key. Without it, (?!run|script) also refuses to exempt any key merely STARTING
-          # with those letters — `run_id:`, `scripts_dir:` — turning legitimate env:/with: slots
-          # into build-reding false positives. The fixture pins both directions.
-          # PCRE (-P) is available because this step is ubuntu-only (if guard above). ERE has no
-          # negative lookahead, and a two-stage "re-include" filter is unreadable in a run: body.
-          # NOTE: these comments must never contain a literal dollar-double-brace — GitHub interpolates
-          # `run:` bodies (comments included) at startup, so a literal one fails the whole workflow.
-          if out=$(grep -rHnE '\$\{\{[^}]*github\.(ref_name|head_ref|event\.[^}]*(title|body))' .github/workflows 2>/dev/null \
-                   | grep -vP '^[^:]+:[0-9]+:[[:space:]]*(?!(?:run|script):)[A-Za-z_][A-Za-z0-9_.-]*:[[:space:]]*\$\{\{'); then
-            echo "::error::CWE-94 regression — an attacker-controllable context is interpolated inline in a workflow:"
+          # NOTE: the comments and awk source below must never contain a literal
+          # dollar-double-brace — GitHub interpolates `run:` bodies (comments included) at
+          # startup, so a literal one fails the whole workflow. Every regex below writes the
+          # bracket-class form, which cannot form that sequence.
+          files=$(find .github/workflows -type f | sort)
+          nfiles=$(printf '%s\n' "$files" | grep -c .)
+          if [ "$nfiles" -eq 0 ]; then
+            echo "::error::workflow injection sweep examined ZERO files under .github/workflows —"
+            echo "::error::wrong cwd or an absent tree reads as clean otherwise. Failing loudly instead."
+            exit 1
+          fi
+          # The state machine: a run:/script: key line is checked inline; a block-scalar
+          # indicator (| or >) on such a line opens a body that stays open until a nonblank
+          # line dedents to or past the opener. Interpolations are flagged only inside those
+          # bodies — mapping lines (env:/with: slots) are outside them and safe by structure.
+          if out=$(awk '
+            BEGIN { att = "[$][{][{][^}]*github[.](ref_name|head_ref|event[.][^}]*(title|body)|event[.]pull_request[.]head[.](ref|label))" }
+            FNR == 1 { inblock = 0; keyindent = -1 }
+            {
+              line = $0
+              # Leading-space count (YAML forbids tabs for indentation); an all-blank line
+              # stays "deep" so empty lines never close a block.
+              n = match(line, /[^ ]/)
+              ind = (n == 0) ? 999999 : n - 1
+              if (inblock) {
+                if (ind > keyindent) {
+                  if (match(line, att)) { printf "%s:%d:%s\n", FILENAME, FNR, line; bad = 1 }
+                  next
+                }
+                inblock = 0   # dedented to/past the opener: back to mapping context
+              }
+              if (line ~ /^[ ]*(-[ ]+)?(run|script):/) {
+                if (match(line, att)) { printf "%s:%d:%s\n", FILENAME, FNR, line; bad = 1 }
+                if (line ~ /:[ ]*[|>]/) { inblock = 1; keyindent = ind }
+              }
+            }
+            END { exit(bad ? 0 : 1) }
+          ' $files 2>/dev/null); then
+            echo "::error::CWE-94 regression — an attacker-controllable context is interpolated inline in a workflow script body:"
             echo "$out"
             echo "::error::Route it through an env: block (or GITHUB_REF_NAME) as a YAML value, never inline as script text."
             exit 1
           fi
-          echo "Workflow injection sweep clean — no github.ref_name/head_ref/event.* inline in script bodies."
+          for f in $files; do printf 'workflow injection sweep examined %s (%s lines)\n' "$f" "$(wc -l < "$f")"; done
+          echo "Workflow injection sweep clean — no attacker-context interpolation inside any run:/script: body ($nfiles file(s))."
 
       # Positive control for the guard above (QURATOR-48). The guard is a security gate, so it
       # must have a test proving it is not vacuous: a fixture file holds deliberately-dangerous
@@ -506,36 +705,59 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          # -H is LOAD-BEARING. The exemption regex below anchors on a `file:line:` prefix, but
-          # `grep -rn` on a SINGLE EXPLICIT FILE omits the filename under GNU grep (it prefixes only
-          # for a directory or multiple files). The production sweep above scans a DIRECTORY so it
-          # always got the prefix; this self-test names one file, so on CI the stream was `line:...`,
-          # the exemption never matched, and every safe env: key became a false positive. It passed
-          # locally because the dev box's `grep` is ugrep, which DOES prefix a single file — the
-          # environment masked it until CI ran. -H makes both greps behave identically everywhere.
-          #
-          # This step runs the SAME grep pipeline as the guard above against a positive fixture
-          # and asserts it REDS, proving the guard is not vacuous. The regex uses the backslash-
-          # escaped form below; that form does NOT contain the literal dollar-double-brace (the
-          # backslashes break the sequence apart), so it is safe to write in a run: body — the
-          # guard step above uses the identical escaped form, and has since before this change.
-          hits=$(grep -rHnE '\$\{\{[^}]*github\.(ref_name|head_ref|event\.[^}]*(title|body))' ci-fixtures/injection-positive.yml 2>/dev/null \
-                 | grep -vP '^[^:]+:[0-9]+:[[:space:]]*(?!(?:run|script):)[A-Za-z_][A-Za-z0-9_.-]*:[[:space:]]*\$\{\{')
+          # This step runs the SAME awk state machine as the guard above against a positive
+          # fixture and asserts it REDS, proving the guard is not vacuous. The awk prints
+          # FILENAME itself, single file or not, so the retired -H single-file prefix drift
+          # cannot recur here. The awk source uses the bracket-class form so no literal
+          # dollar-double-brace ever appears in this run: body.
+          hits=$(awk '
+            BEGIN { att = "[$][{][{][^}]*github[.](ref_name|head_ref|event[.][^}]*(title|body)|event[.]pull_request[.]head[.](ref|label))" }
+            FNR == 1 { inblock = 0; keyindent = -1 }
+            {
+              line = $0
+              n = match(line, /[^ ]/)
+              ind = (n == 0) ? 999999 : n - 1
+              if (inblock) {
+                if (ind > keyindent) {
+                  if (match(line, att)) { printf "%s:%d:%s\n", FILENAME, FNR, line; bad = 1 }
+                  next
+                }
+                inblock = 0
+              }
+              if (line ~ /^[ ]*(-[ ]+)?(run|script):/) {
+                if (match(line, att)) { printf "%s:%d:%s\n", FILENAME, FNR, line; bad = 1 }
+                if (line ~ /:[ ]*[|>]/) { inblock = 1; keyindent = ind }
+              }
+            }
+            END { exit(bad ? 0 : 1) }
+          ' ci-fixtures/injection-positive.yml 2>/dev/null) || true
           if [ -z "$hits" ]; then
-            echo "::error::The injection-sweep guard is VACUOUS — it passed on ci-fixtures/injection-positive.yml, which holds deliberately-dangerous run:/script: interpolations. The guard must catch these (QURATOR-48)."
+            echo "::error::The injection-sweep guard is VACUOUS — it passed on ci-fixtures/injection-positive.yml, which holds deliberately-dangerous run:/script: interpolations. The guard must catch these (QURATOR-48, QURATOR-223)."
             exit 1
           fi
           n=$(printf '%s\n' "$hits" | grep -c .)
           # Negative half: the fixture also holds SAFE env: keys whose names merely start with a
-          # script-bearing name (run_id, scripts_dir, RUNNER_TAG). Those must be exempted. If they
-          # show up in the hit set, the exemption lookahead has lost its key anchor and every
+          # script-bearing name (run_id, scripts_dir, RUNNER_TAG). Those are mapping lines
+          # OUTSIDE any run:/script: block, so the structural scope must leave them alone. If
+          # they show up in the hit set, the block tracking has lost its anchor and every
           # workflow using such a key would red the build on a false positive.
           if fp=$(printf '%s\n' "$hits" | grep -E 'run_id:|scripts_dir:|RUNNER_TAG:'); then
-            echo "::error::FALSE POSITIVE — the guard flagged a safe env: key whose name merely starts with a script-bearing name. Anchor the exemption lookahead to the whole key, i.e. (?!(?:run|script):) not (?!run|script):"
+            echo "::error::FALSE POSITIVE — the guard flagged a safe env: key. The awk must scope hits to run:/script: bodies only; mapping lines are safe by structure."
             echo "$fp"
             exit 1
           fi
-          echo "Guard self-test OK — caught $n dangerous interpolation(s), and exempted every safe env: key:"
+          # And the two QURATOR-223 evasions must be among the hits, not just the old shapes.
+          for shape in 'pull_request.head.ref' 'pull_request.head.label'; do
+            if ! printf '%s\n' "$hits" | grep -q "$shape"; then
+              echo "::error::The injection-sweep guard missed the $shape context — the QURATOR-223 alternation gap is back."
+              exit 1
+            fi
+          done
+          if ! printf '%s\n' "$hits" | grep -qE '^[^:]+:[0-9]+:[[:space:]]+label: '; then
+            echo "::error::The injection-sweep guard missed the label-prefixed line inside a run: body — the QURATOR-223 colon-lookalike exemption is back."
+            exit 1
+          fi
+          echo "Guard self-test OK — caught $n dangerous interpolation(s), exempted every safe env: key, and caught both QURATOR-223 shapes:"
           printf '%s\n' "$hits" | sed 's/^/  /'
 
       # release.yml overwrites both versions from the tag at build time; this pins dev-build
@@ -671,9 +893,14 @@ jobs:
         with:
           node-version: 20
 
+      # QURATOR-255: no dependency lifecycle scripts on fork-PR trees (see the test job's
+      # frontend build step for the full rationale); esbuild is the one script-carrying dep
+      # these runners install, so it alone is rebuilt with its scripts.
       - name: Install frontend dependencies
         working-directory: crates/hb-app/ui
-        run: npm ci
+        run: |
+          npm ci --ignore-scripts
+          npm rebuild esbuild
 
       # svelte-check is the build-level guard for the content_types contract:
       # reading a nonexistent singular `content_type` is a strict-mode type error.
@@ -710,9 +937,14 @@ jobs:
       # repos/Swatinem/rust-cache/commits/v2.9.2 — the v2 branch head == the v2.9.2 tag.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
+      # QURATOR-255: no dependency lifecycle scripts on fork-PR trees (see the test job's
+      # frontend build step for the full rationale); esbuild is the one script-carrying dep
+      # these runners install, so it alone is rebuilt with its scripts.
       - name: Install frontend dependencies
         working-directory: crates/hb-app/ui
-        run: npm ci
+        run: |
+          npm ci --ignore-scripts
+          npm rebuild esbuild
 
       - name: Frontend L4 profiler + budget gate
         working-directory: crates/hb-app/ui
@@ -773,5 +1005,6 @@ jobs:
         continue-on-error: true
         working-directory: crates/hb-app/ui
         run: |
-          npm ci
+          # QURATOR-255: npm audit executes no package code, so scripts stay disabled here.
+          npm ci --ignore-scripts
           npm audit --audit-level=high
