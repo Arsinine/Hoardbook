@@ -142,6 +142,14 @@
 	// the surface can say "we couldn't reach the relays" (retryable) instead.
 	let topicsLoadError = $state(false);
 	let channelLoadError = $state(false);
+	// QURATOR-263 (CWE-362): request-generation guard for the channel pane, same shape as
+	// topics/+page.svelte's `openGeneration` (finding #36). loadChannel runs from FOUR sites
+	// (selectTopic, the slow poll, post-send refresh, the Retry affordance) and any of them can
+	// still be in flight when the user switches channel — or leaves the channel pane for a peer
+	// conversation / the Requests inbox. Selection changes bump this; a loadChannel resolve applies
+	// its result only if its captured generation still holds. Plain `let`, not $state: it must never
+	// drive rendering, only gate it.
+	let channelGeneration = 0;
 	// minor-4: same QURATOR-93 shape for the two surfaces that still swallowed a failure — a failed
 	// getMessages left the sidebar's "No conversations yet" rendering on data it never got, and a
 	// failed dmRequests fetch left "No message requests." rendering the same confident negative.
@@ -214,20 +222,33 @@
 	}
 
 	async function loadChannel(topicId: string) {
+		// QURATOR-263: capture the generation at entry, before the await — everything in the async
+		// tail belongs to the selection that was live when the fetch STARTED.
+		const generation = channelGeneration;
 		try {
 			const view = await topicChannel(topicId);
-			channelPosts = sortChannelPostsAscending(view.posts);
-			channelAnnouncements = view.announcements;
-			channelLoadError = false;
-			// devtest #2: reading the channel clears its Topics nav badge — advance the seen watermark to
-			// the newest announcement and mirror it into the store so the badge updates without a refetch.
-			const newest = view.announcements.reduce((m, a) => Math.max(m, a.ts), 0);
-			if (newest > 0) {
-				announceSeen.update((s) => (newest > (s[topicId] ?? 0) ? { ...s, [topicId]: newest } : s));
-				topicAnnounceMarkSeen(topicId, newest).catch(() => { /* non-fatal — reseeds next launch */ });
+			if (generation === channelGeneration) {
+				channelPosts = sortChannelPostsAscending(view.posts);
+				channelAnnouncements = view.announcements;
+				channelLoadError = false;
+				// devtest #2: reading the channel clears its Topics nav badge — advance the seen watermark to
+				// the newest announcement and mirror it into the store so the badge updates without a refetch.
+				// QURATOR-263: gated with the rest — the watermark records "the user READ this channel's
+				// announcements", and a stale resolve never rendered them. Advancing it late would silently
+				// clear the unread badge for content the user never saw, so a stale load skips it (the next
+				// on-screen load of that channel advances it then).
+				const newest = view.announcements.reduce((m, a) => Math.max(m, a.ts), 0);
+				if (newest > 0) {
+					announceSeen.update((s) => (newest > (s[topicId] ?? 0) ? { ...s, [topicId]: newest } : s));
+					topicAnnounceMarkSeen(topicId, newest).catch(() => { /* non-fatal — reseeds next launch */ });
+				}
 			}
 		} catch {
-			channelLoadError = true; /* relay unreachable — NOT the confident "No posts" negative */
+			// QURATOR-263: the error flag is gated too — a late failure for a channel we've already left
+			// must not raise "Couldn't load this channel" over whatever pane is on screen now.
+			if (generation === channelGeneration) {
+				channelLoadError = true; /* relay unreachable — NOT the confident "No posts" negative */
+			}
 		}
 	}
 
@@ -239,6 +260,9 @@
 		channelPosts = [];
 		channelAnnouncements = [];
 		channelLoadError = false; // a failed load for the PREVIOUS channel must not leak into this one
+		// QURATOR-263: selection changed — invalidate any channel load still in flight for the
+		// previous selection (or for the peer/requests panes this switch replaces).
+		channelGeneration += 1;
 		await loadChannel(t.topic_id);
 		await tick();
 		scrollToBottom();
@@ -249,6 +273,9 @@
 		selectedRequest = null;
 		selectedPeer = null;
 		selectedTopic = null;
+		// QURATOR-263: leaving the channel pane is a selection change too — a channel load still in
+		// flight must not land (posts, error flag, or watermark) over the Requests inbox.
+		channelGeneration += 1;
 	}
 
 	function openRequest(r: DmRequestView) {
@@ -796,6 +823,9 @@
 		selectedTopic = null;
 		viewingRequests = false;
 		selectedRequest = null;
+		// QURATOR-263: leaving the channel pane is a selection change too — a channel load still in
+		// flight must not land (posts, error flag, or watermark) over a peer conversation.
+		channelGeneration += 1;
 		// Opening a conversation reads it: advance the peer's watermark to the newest message we
 		// have from them (devtest #16 — the badge clears per-conversation, not on merely landing on
 		// /chat). Optimistic local update + best-effort persist.
