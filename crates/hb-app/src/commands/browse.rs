@@ -15,7 +15,7 @@ use hb_core::fingerprint::Fingerprint;
 use hb_core::types::Collection;
 use hb_core::{ShareCode, Identity};
 use hb_net::{
-    browse_peer_listings, browse_peer_listings_state, browse_share_code,
+    browse_peer_listings_state, browse_share_code,
     fetch_full_listing_if_current, listing_snapshot_fingerprint, search_teasers_capped,
     ListingsState, RelayClient, RenderedListing, SearchHit,
 };
@@ -312,16 +312,44 @@ pub(crate) async fn resolve_peer(
     // QURATOR-134: the KEYLESS arm is the one this bug lived in. `browse_peer_listings_state`
     // (hb-net, the one implementation — the UI never re-derives it) tells "they published
     // nothing" (Fetched) apart from "they published listings we can't decrypt" (Sealed) apart
-    // from "the enumeration itself failed" (FetchFailed). For a keyed contact `collections` is
-    // authoritative and the state stays `Fetched`.
-    let mut listings_state = crate::store::ListingsStatus::Fetched;
+    // from "the enumeration itself failed" (FetchFailed). QURATOR-267: BOTH arms now assign this
+    // from the tri-state they read — the keyed arm used to leave it at a hardcoded `Fetched`,
+    // which is what let a failed keyed enumeration render as an authoritative "no collections".
+    let listings_state;
+    // QURATOR-267: an empty keyed listing result is ambiguous on its own — "they unpublished
+    // everything" vs "the enumeration itself failed" (a transient relay blip). Keep the error's
+    // shape in `listings_failed` until the reconcile after the match decides, instead of folding
+    // it away with `.unwrap_or_default()` where the two cases are indistinguishable downstream.
+    let mut listings_failed = false;
     let collections = match share_code.browse_key() {
         Some(bk) => {
             // The browser's OWN big relay (option a) — tried before the peer's advertised one (b).
             let own_big = store.load_settings().map_err(cmd_err)?.unwrap_or_default().big_relay_url;
-            let families = browse_peer_listings(&client, &peer, &bk, net::RELAY_TIMEOUT)
-                .await
-                .unwrap_or_default();
+            // QURATOR-267: read the TRI-STATE, not the lenient projection. `browse_peer_listings`
+            // cannot express failure — `browse_peer_listings_state` folds a failed fetch into
+            // `Ok((vec![], FetchFailed(..)))` (hb-net/src/browse.rs) and the wrapper drops the
+            // state, so an `Err` arm here is structurally UNREACHABLE and a relay blip arrives
+            // indistinguishable from "this peer published nothing". The keyless arm below already
+            // reads the tri-state; this is the drift pair closed.
+            //
+            // Both non-`Fetched` states must preserve the cache, for different reasons:
+            //   FetchFailed — we never learned anything; the previous list is still our best truth.
+            //   Sealed      — families exist but none decrypt under this key (the peer re-keyed,
+            //                 or a stale share code was pasted). Clearing here would render a
+            //                 confident "no collections" for a peer who has plenty, and would
+            //                 durably destroy the cached list on every later auto-refresh.
+            // Only `Fetched` + empty is a genuine unpublish-everything, and that still clears.
+            let (families, listings_read) = browse_peer_listings_state(
+                &client,
+                &peer,
+                &bk,
+                net::RELAY_TIMEOUT,
+            )
+            .await
+            .unwrap_or((Vec::new(), ListingsState::FetchFailed(String::new())));
+            // Unreadable listings must never fail the whole resolve (BR1, unchanged).
+            listings_failed = !matches!(listings_read, ListingsState::Fetched);
+            listings_state = listings_read.into();
             let cache_dir = store.manifest_cache_dir();
             let now = now_secs();
             let mut out = Vec::with_capacity(families.len());
@@ -358,6 +386,19 @@ pub(crate) async fn resolve_peer(
             vec![]
         }
     };
+
+    // QURATOR-267 (INV-8 — durable deletion is deliberate, never accidental): a FAILED
+    // enumeration must preserve the previously cached collections — a transient relay blip is not
+    // an unpublish. An `Ok(vec![])` (they genuinely unpublished everything) skips this and still
+    // clears the cache in `save_refreshed_contact`. The store read only happens on failure, and
+    // its error propagates so the refresh aborts with the cache untouched rather than committing
+    // an empty list.
+    let cached = if listings_failed {
+        store.load_contact(&CachedPeer::pubkey_hash(&npub)).map_err(cmd_err)?
+    } else {
+        None
+    };
+    let collections = reconciled_listing_collections(collections, listings_failed, cached.as_ref());
 
     // Fall back to the cached contact if the relay yielded no teaser.
     if profile.is_none() {
@@ -658,6 +699,26 @@ pub async fn refresh_contact(
     save_refreshed_contact(&store, &hash, &existing, updated)
 }
 
+/// QURATOR-267: reconcile the keyed listing-enumeration's outcome against the previously cached
+/// contact. An empty `fresh` is ambiguous on its own — "the peer unpublished everything" (must
+/// clear the cache) vs "the enumeration errored and defaulted" (must preserve) — so the failure
+/// flag travels here from the `Result` itself (`resolve_peer` no longer folds it away with
+/// `.unwrap_or_default()`), never guessed from emptiness downstream. A failure with no stored
+/// contact (add-time hiccup) still yields empty — the devtest-#3 reasoning: refresh recovers it.
+/// This is the distinction `merge_local_state`'s blind #35 `if peer.collections.is_empty()` guard
+/// cannot make. Pure — unit-tested without a relay.
+fn reconciled_listing_collections(
+    fresh: Vec<PeerCollection>,
+    enumeration_failed: bool,
+    existing: Option<&CachedPeer>,
+) -> Vec<PeerCollection> {
+    if enumeration_failed {
+        existing.map(|peer| peer.collections.clone()).unwrap_or_default()
+    } else {
+        fresh
+    }
+}
+
 /// The pure save-tail of [`refresh_contact`]: merge local-only state onto the freshly resolved peer
 /// then persist. Extracted (QURATOR-119 #12) so the refresh path's preservation is unit-testable
 /// without a relay, mirroring [`follow`]'s [`save_followed_peer`] extraction. Never calls the relay;
@@ -665,6 +726,12 @@ pub async fn refresh_contact(
 /// `Manual`), so a pre-existing `Topic` contact must keep its badge — otherwise the Contacts
 /// auto-refresh would silently promote a topic-sourced stranger into the private-listing trust gate
 /// (`contact_author_allowlist` admits exactly `Manual`).
+///
+/// QURATOR-267: there is deliberately NO `if updated.collections.is_empty()` keep-existing guard
+/// here (unlike `merge_local_state`'s #35 guard) — the failed-vs-genuinely-empty distinction is
+/// made upstream in `resolve_peer` + [`reconciled_listing_collections`], where the enumeration's
+/// `Result` is still in hand. A blind guard here would hide a genuine unpublish-everything from
+/// the user forever — the stale-data twin of this ticket's data-loss bug.
 fn save_refreshed_contact(
     store: &DataStore,
     hash: &str,
@@ -1814,6 +1881,152 @@ mod tests {
             reloaded.source,
             crate::store::ContactSource::Topic,
             "the durable record keeps the Topic badge"
+        );
+    }
+
+    // ── QURATOR-267: a transient relay failure must not durably wipe cached collections ────
+    // `resolve_peer` used to fold a FAILED keyed listing-enumeration into an empty Vec
+    // (`.unwrap_or_default()`), and `save_refreshed_contact` saves unconditionally — so a relay
+    // blip during a refresh durably wiped the peer's cached collection list (INV-8). Emptiness
+    // alone cannot tell "the enumeration errored" from "they unpublished everything", so the
+    // failure flag now travels from the `Result` itself into `reconciled_listing_collections`,
+    // which owns the decision. Both halves are pinned: the reconcile (next two tests) and the
+    // save-tail round-trip (the two after) — the genuine-clear pin is what stops this fix
+    // becoming a stale-data bug.
+    //
+    // Honest limit: the glue inside `resolve_peer` (flagging the `Err`, the conditional store
+    // load, the reconcile call) is relay-touching and therefore NOT unit-reachable here — the
+    // WAN-U suite drives `resolve_peer` over a live relay. The unit tests pin the decision
+    // function and the save-tail, i.e. everything local.
+
+    #[test]
+    fn reconcile_listing_failure_preserves_the_cached_collections_q267() {
+        // Preserve direction. P-10 mutation (orchestrator applies; NOT run here — a filtered
+        // cargo test still compiles the whole crate and collides with sibling lanes): in
+        // `reconciled_listing_collections` (fn right after `refresh_contact`), failure arm — the
+        // `existing.map(|peer| peer.collections.clone()).unwrap_or_default()` line inside the
+        // `if enumeration_failed` block — replace that expression with `fresh`. This test must
+        // RED; `reconcile_genuinely_empty_listings_clear_q267` must stay green.
+        let mut cached = stub_peer("npub1_q267_blip", Some("Cached"));
+        cached.collections = vec![cached_collection("films"), cached_collection("music")];
+        let out = reconciled_listing_collections(vec![], true, Some(&cached));
+        assert_eq!(
+            out.iter().map(|c| c.collection.slug.clone()).collect::<Vec<_>>(),
+            vec!["films".to_string(), "music".to_string()],
+            "a failed enumeration preserves the previously cached collections"
+        );
+    }
+
+    /// ⚠ THE GUARD PREMISE ITSELF (QURATOR-267, added by the 2026-09-16 adversarial review).
+    /// The two tests above pin the pure decision fn, and BOTH passed while the production glue
+    /// was a no-op: the keyed arm's failure flag was set in an `Err(_)` arm that
+    /// `browse_peer_listings` can NEVER take — `browse_peer_listings_state` folds a failed fetch
+    /// into `Ok((vec![], FetchFailed(..)))` and the lenient wrapper drops the state. So a relay
+    /// blip arrived as `Ok(vec![])` with `listings_failed == false` and the cache was wiped
+    /// exactly as before the "fix". This is the recorded "guard premise unverified" class: the
+    /// tests were true, the SENTENCE THEY RESTED ON was false.
+    ///
+    /// This pins the premise directly — the mapping from tri-state to the preserve decision —
+    /// so the glue can no longer silently stop feeding it. `Sealed` preserves too: families
+    /// exist but none decrypt under this key (the peer re-keyed), which is not an unpublish.
+    ///
+    /// ⚠⚠ HONEST LIMIT — this test does NOT pin the glue, and that was VERIFIED, not assumed.
+    /// Setting `listings_failed = false;` in `resolve_peer`'s keyed arm (reverting to the
+    /// pre-review no-op) leaves this test and all four siblings GREEN — confirmed by running it.
+    /// `resolve_peer` takes a `SharedRelay` and dials, so no unit test can reach the assignment;
+    /// what is pinned here is the DECISION TABLE (which tri-state preserves), and what remains
+    /// unpinned is that the keyed arm still feeds it. That gap is WAN-suite territory
+    /// (`suite_wan_u` drives `resolve_peer` over a live relay).
+    /// **Do not read these five green tests as proof the production path is wired** — that exact
+    /// inference is what let the first version of this fix ship as a no-op: an unreachable
+    /// `Err(_)` arm under five true tests. If you change the keyed arm, re-check it by hand.
+    #[test]
+    fn listings_tri_state_maps_to_the_preserve_decision_q267() {
+        // Exactly the expression the keyed arm computes, for each variant.
+        let failed = |st: hb_net::browse::ListingsState| !matches!(st, hb_net::browse::ListingsState::Fetched);
+        assert!(
+            failed(hb_net::browse::ListingsState::FetchFailed("relay down".into())),
+            "a failed fetch must preserve — we learned nothing, the cache is still our best truth"
+        );
+        assert!(
+            failed(hb_net::browse::ListingsState::Sealed),
+            "Sealed must preserve — families exist but none decrypt under this key (the peer \
+             re-keyed); clearing would render a confident 'no collections' and destroy the cache"
+        );
+        assert!(
+            !failed(hb_net::browse::ListingsState::Fetched),
+            "only a clean fetch may clear — that is the genuine unpublish-everything"
+        );
+    }
+
+    #[test]
+    fn reconcile_genuinely_empty_listings_clear_q267() {
+        // The anti-stale-data pin: `Ok(vec![])` — the peer really did unpublish everything —
+        // must NOT be rescued by the failure arm. P-10 mutation: in
+        // `reconciled_listing_collections`, make the preserve arm unconditional (change the
+        // `if enumeration_failed` condition to `if true`). This test must RED;
+        // `reconcile_listing_failure_preserves_the_cached_collections_q267` must stay green.
+        let mut cached = stub_peer("npub1_q267_gone", Some("Cached"));
+        cached.collections = vec![cached_collection("films")];
+        let out = reconciled_listing_collections(vec![], false, Some(&cached));
+        assert!(
+            out.is_empty(),
+            "an Ok(empty) enumeration clears — a genuine unpublish stays visible"
+        );
+    }
+
+    #[test]
+    fn refresh_save_tail_keeps_collections_and_local_state_after_a_flagged_failure_q267() {
+        // What `resolve_peer` hands `refresh_contact` AFTER a flagged enumeration failure —
+        // i.e. with the cached collections re-hydrated by the reconcile: the save-tail must
+        // persist them AND keep the local-only state (AC 4). Drives `save_refreshed_contact` —
+        // the exact save-tail `refresh_contact` runs — through a store round-trip.
+        // P-10 mutation: in `save_refreshed_contact` (the "Preserve local-only state" block),
+        // delete the `updated.local_tags = existing.local_tags.clone();` line. This test must
+        // RED on the local_tags assert.
+        let (_dir, store) = test_store();
+        let npub = "npub1_q267_keep";
+        let hash = CachedPeer::pubkey_hash(npub);
+        let mut existing = stub_peer(npub, Some("Cached"));
+        existing.collections = vec![cached_collection("films")];
+        existing.local_tags = vec!["vip".into()];
+        store.save_contact(&hash, &existing).unwrap();
+
+        let mut updated = stub_peer(npub, Some("FreshTeaser"));
+        updated.collections = vec![cached_collection("films")]; // re-hydrated by the reconcile
+        let saved = save_refreshed_contact(&store, &hash, &existing, updated).unwrap();
+
+        assert_eq!(saved.collections.len(), 1, "the preserved list survives the save-tail");
+        assert_eq!(saved.local_tags, vec!["vip".to_string()], "AC 4: local tags unchanged");
+        assert_eq!(saved.petname.as_deref(), Some("Cached"), "AC 4: local petname wins");
+        let reloaded = store.load_contact(&hash).unwrap().unwrap();
+        assert_eq!(reloaded.collections.len(), 1, "the durable record keeps the cached list");
+    }
+
+    #[test]
+    fn refresh_save_tail_still_clears_collections_on_a_genuine_unpublish_q267() {
+        // The direction that stops this fix becoming a stale-data bug: when `resolve_peer` hands
+        // over an `Ok(empty)` resolve (no failure flag ⇒ no hydration), the save-tail must write
+        // the empty list — NO blind `if empty keep existing` guard here, unlike
+        // `merge_local_state`. P-10 mutation: in `save_refreshed_contact`, insert
+        // `if updated.collections.is_empty() { updated.collections = existing.collections.clone(); }`
+        // immediately before the `store.save_contact(hash, &updated)` call. This test must RED;
+        // `refresh_save_tail_keeps_collections_and_local_state_after_a_flagged_failure_q267`
+        // must stay green (its `updated` carries a non-empty list).
+        let (_dir, store) = test_store();
+        let npub = "npub1_q267_clear";
+        let hash = CachedPeer::pubkey_hash(npub);
+        let mut existing = stub_peer(npub, Some("Cached"));
+        existing.collections = vec![cached_collection("films")];
+        store.save_contact(&hash, &existing).unwrap();
+
+        let updated = stub_peer(npub, Some("FreshTeaser")); // collections: vec![] — Ok(empty)
+        let saved = save_refreshed_contact(&store, &hash, &existing, updated).unwrap();
+        assert!(saved.collections.is_empty(), "a genuine unpublish clears the returned peer");
+        let reloaded = store.load_contact(&hash).unwrap().unwrap();
+        assert!(
+            reloaded.collections.is_empty(),
+            "the durable record is cleared — the guard must not hide a real unpublish"
         );
     }
 
