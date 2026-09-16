@@ -47,6 +47,14 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # QURATOR-225: the default persist-credentials: true leaves the
+          # contents:write job token in .git/config, readable by every later
+          # dependency-executing step (npm lifecycle scripts, cargo build.rs).
+          # No later step uses git-protocol auth — release uploads go through
+          # the GITHUB_TOKEN env of the steps that need it — so nothing is
+          # lost by not persisting.
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -61,8 +69,8 @@ jobs:
         run: |
           if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
             echo "::error::TAURI_SIGNING_PRIVATE_KEY repo secret is not set."
-            echo "::error::Without it tauri-action skips latest.json and the in-app updater"
-            echo "::error::fails with 'Could not fetch a valid release JSON from the remote'."
+            echo "::error::Without it the post-build signing step below fails and the in-app"
+            echo "::error::updater fails with 'Could not fetch a valid release JSON from the remote'."
             echo "::error::Generate a key with 'cargo tauri signer generate' and add it to"
             echo "::error::repo Settings → Secrets → Actions as TAURI_SIGNING_PRIVATE_KEY."
             exit 1
@@ -120,24 +128,166 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: crates/hb-app/ui
-        run: npm install
+        # QURATOR-221: lockfile-strict install, matching ci.yml. `npm install` would
+        # silently re-resolve drifted package.json ranges from the registry at
+        # release time, embedding unreviewed dependency code in the signed build.
+        run: npm ci
 
+      # QURATOR-220: the updater signing key no longer rides this step. tauri build
+      # compiles and runs the whole Cargo/npm dependency tree (every build.rs, the
+      # beforeBuildCommand chain), so TAURI_SIGNING_PRIVATE_KEY here hands the fleet
+      # trust root to any one compromised dependency. The bundle is now built and
+      # uploaded unsigned; the post-build step below signs the updater artifacts
+      # with the integrity-pinned CLI — the shape QURATOR-107 established for the
+      # portable exe.
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           releaseId: ${{ needs.create-release.outputs.release-id }}
           projectPath: crates/hb-app
           args: ${{ matrix.args }}
-          # Generate platform-specific updater metadata. tauri-action
-          # read-modify-writes the release's shared latest.json, each platform
-          # leg merging its own keys into whatever is already published. That
-          # leaves a narrow lost-update window if two legs wrote concurrently;
-          # it has never fired because the legs finish minutes apart.
-          uploadUpdaterJson: true
-          updaterJsonPreferNsis: true
+
+      - name: Sign + publish the bundle updater artifacts (post-build)
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          # QURATOR-220: with the key gone from the build step's env, tauri-action
+          # uploads the bundles unsigned and skips latest.json. This step re-adds
+          # both, using the same hardening the portable step below established
+          # (QURATOR-107): the signer CLI comes from an integrity-pinned lockfile
+          # (`npm ci` refuses any tarball whose sha512 differs), the key travels
+          # env → temp file → --private-key-path and is unset before invoking (the
+          # CLI rejects the flag while the env var is set), the password is read
+          # from its own env var, never argv, and the temp key file is removed by
+          # trap even when signing fails. The only dependency code this step
+          # executes is that pinned CLI.
+          version="${GITHUB_REF_NAME#v}"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            artifacts=("target/release/bundle/nsis/Hoardbook_${version}_x64-setup.exe")
+          else
+            artifacts=("target/release/bundle/appimage/Hoardbook_${version}_amd64.AppImage"
+              "target/release/bundle/deb/Hoardbook_${version}_amd64.deb")
+          fi
+          for a in "${artifacts[@]}"; do
+            if [ ! -f "$a" ]; then
+              echo "::error::Expected bundle artifact not found: $a"
+              exit 1
+            fi
+          done
+
+          cliDir="$RUNNER_TEMP/tauri-cli-pin"
+          mkdir -p "$cliDir"
+          cat > "$cliDir/package.json" <<'PKG'
+          {
+            "name": "tauri-signer-pin",
+            "private": true,
+            "dependencies": { "@tauri-apps/cli": "2.11.4" }
+          }
+          PKG
+          # Same pin as the portable step below, plus the linux-x86_64-gnu optional
+          # binary so the one pinned lockfile serves both matrix legs (npm skips
+          # optional deps whose os/cpu do not match the runner).
+          cat > "$cliDir/package-lock.json" <<'PKGLOCK'
+          {
+            "name": "tauri-signer-pin",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+              "": {
+                "name": "tauri-signer-pin",
+                "version": "1.0.0",
+                "dependencies": { "@tauri-apps/cli": "2.11.4" }
+              },
+              "node_modules/@tauri-apps/cli": {
+                "version": "2.11.4",
+                "resolved": "https://registry.npmjs.org/@tauri-apps/cli/-/cli-2.11.4.tgz",
+                "integrity": "sha512-R8xGtMpwyetawSqm9kYOuMmEqkhUbvcUy8n0aNXIxollKBLESUu5f4Fx+64hgASYm1H+jSWq6jCW6zqTnH6hqQ==",
+                "bin": { "tauri": "tauri.js" },
+                "engines": { "node": ">= 10" },
+                "optionalDependencies": {
+                  "@tauri-apps/cli-win32-x64-msvc": "2.11.4",
+                  "@tauri-apps/cli-linux-x64-gnu": "2.11.4"
+                }
+              },
+              "node_modules/@tauri-apps/cli-win32-x64-msvc": {
+                "version": "2.11.4",
+                "resolved": "https://registry.npmjs.org/@tauri-apps/cli-win32-x64-msvc/-/cli-win32-x64-msvc-2.11.4.tgz",
+                "integrity": "sha512-+vDiqBIU5dMISg/wNvX3sF+ZHfgJGJ5T0AcO+EHNXV9GGAG+P5fzodlDXD3QdKCRgZxMoCm5PPvj3BqLNjBthw==",
+                "cpu": [ "x64" ],
+                "optional": true,
+                "os": [ "win32" ],
+                "engines": { "node": ">= 10" }
+              },
+              "node_modules/@tauri-apps/cli-linux-x64-gnu": {
+                "version": "2.11.4",
+                "resolved": "https://registry.npmjs.org/@tauri-apps/cli-linux-x64-gnu/-/cli-linux-x64-gnu-2.11.4.tgz",
+                "integrity": "sha512-2VRNWl84FOH0m2giiDkO2h0QXlcMJeX+zJDpI5kDIQAx6s+geF3v48F4DXfJez4GS/FdoDGnPnw1C2iYGbQ7bQ==",
+                "cpu": [ "x64" ],
+                "optional": true,
+                "os": [ "linux" ],
+                "engines": { "node": ">= 10" }
+              }
+            }
+          }
+          PKGLOCK
+          (cd "$cliDir" && npm ci --no-audit --no-fund)
+
+          keyFile="$RUNNER_TEMP/hb-updater-signing.key"
+          trap 'rm -f "$keyFile"' EXIT
+          # printf '%s' writes the exact key: no BOM, no trailing newline, no CRLF —
+          # all three corrupt the base64 key and make the CLI fail to decode it.
+          printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" > "$keyFile"
+          unset TAURI_SIGNING_PRIVATE_KEY
+          for a in "${artifacts[@]}"; do
+            node "$cliDir/node_modules/@tauri-apps/cli/tauri.js" signer sign --private-key-path "$keyFile" "$a"
+          done
+
+          # Assemble the shared latest.json: read-modify-write, each platform leg
+          # merging its own keys into whatever is already published — the same shape
+          # and the same narrow lost-update window tauri-action's uploadUpdaterJson
+          # had; it has never fired because the legs finish minutes apart.
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" -p latest.json --clobber \
+            || echo "no latest.json on the release yet (first platform leg)"
+          cat > "$cliDir/merge-updater-json.js" <<'NODE'
+          const fs = require("fs");
+          const artifacts = process.argv.slice(2);
+          const tag = process.env.GITHUB_REF_NAME;
+          const version = tag.replace(/^v/, "");
+          const repo = process.env.GITHUB_REPOSITORY;
+          // Which latest.json platform keys each bundle artifact serves — what
+          // tauri-action's uploadUpdaterJson + updaterJsonPreferNsis used to emit:
+          // the bare platform key the updater plugin resolves, plus the
+          // bundle-specific variants.
+          const keysBySuffix = [
+            ["x64-setup.exe", ["windows-x86_64", "windows-x86_64-nsis"]],
+            [".AppImage", ["linux-x86_64", "linux-x86_64-appimage"]],
+            [".deb", ["linux-x86_64-deb"]],
+          ];
+          let manifest = fs.existsSync("latest.json")
+            ? JSON.parse(fs.readFileSync("latest.json", "utf8"))
+            : {};
+          manifest.version = version;
+          manifest.notes = manifest.notes || "";
+          manifest.pub_date = new Date().toISOString();
+          manifest.platforms = manifest.platforms || {};
+          for (const artifact of artifacts) {
+            const name = artifact.split(/[\\/]/).pop();
+            const entry = keysBySuffix.find(([suffix]) => name.endsWith(suffix));
+            if (!entry) throw new Error("no platform-key mapping for " + name);
+            const url = "https://github.com/" + repo + "/releases/download/" + tag + "/" + name;
+            const signature = fs.readFileSync(artifact + ".sig", "utf8").trim();
+            for (const key of entry[1]) manifest.platforms[key] = { signature: signature, url: url };
+          }
+          fs.writeFileSync("latest.json", JSON.stringify(manifest, null, 2) + "\n");
+          NODE
+          node "$cliDir/merge-updater-json.js" "${artifacts[@]}"
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            "${artifacts[@]/%/.sig}" latest.json
 
       - name: Sign + publish the portable self-updater artifacts (Windows)
         if: matrix.platform == 'windows-latest'
