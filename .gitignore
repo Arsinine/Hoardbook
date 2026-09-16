@@ -64,3 +64,15 @@ docs/RULE-PROVENANCE.md
 # from loss — same failure mode the docs/ORCHESTRATOR.md note above describes.
 .playwright-mcp/
 audit-*.png
+
+# WAN-harness runtime state. `hb-wan-it` defaults `--data-dir` to these (wan_it/mod.rs: `./hb-wan-it-data`
+# for serve, `./hb-wan-it-probe-data` for every probe subcommand), so a WAN run materialises them in the
+# repo root, and the e2e runbook adds ./e2e-serve and ./e2e-seed the same way. Each holds an
+# identity/identity.json carrying `nsec`, `browse_key_hex` and `transport_secret_hex` — REAL secret
+# material, in a PUBLIC repo, previously untracked-and-unignored. That is one `git add -A` from
+# publishing a browse key unsealed, which is INV-2's exact failure shape; ignoring them is the fence.
+# (Nothing leaked: no commit on any branch or tag has ever touched these paths.)
+hb-wan-it-data/
+hb-wan-it-probe-data/
+e2e-serve/
+e2e-seed/
