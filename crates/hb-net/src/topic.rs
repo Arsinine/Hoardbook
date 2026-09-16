@@ -155,9 +155,14 @@ pub async fn discover_public_topics_paint(
     tags: &[String],
     timeout: Duration,
 ) -> Result<TopicDiscoveries, NetError> {
+    // The skew gate inside `dedupe_announces` is judged against OUR clock, read once per paint so
+    // the shared page and every escalation see the same `now` (same "never trust the relay's clock"
+    // posture as `fetch_announce`); `now` stays injectable in the pure half so tests pin it
+    // instead of the wall.
+    let now = Timestamp::now().as_secs();
     let filter = topic_discover_filter(tags)?;
     let mut events = client.fetch(filter, timeout).await?;
-    let mut out = dedupe_announces(&mut events, tags);
+    let mut out = dedupe_announces(&mut events, tags, now);
     out.hit_limit = events.len() >= TOPIC_DISCOVERY_FETCH_LIMIT;
     // Starved-root escalation: fire ONLY when the shared response hit its limit — below the limit
     // nothing was evicted by the budget, so an empty root is a GENUINE empty and must stay one read.
@@ -167,7 +172,7 @@ pub async fn discover_public_topics_paint(
         for root in starved_roots(tags, &out.root_event_counts) {
             tracing::debug!("topic discovery: root {root} starved by the shared fetch limit; escalating");
             let solo = client.fetch(topic_discover_filter(std::slice::from_ref(root))?, timeout).await?;
-            let solo_hit = dedupe_announces(&mut { solo }, std::slice::from_ref(root));
+            let solo_hit = dedupe_announces(&mut { solo }, std::slice::from_ref(root), now);
             out.merge(solo_hit);
         }
     }
@@ -187,7 +192,18 @@ fn starved_roots<'a>(tags: &'a [String], root_event_counts: &BTreeMap<String, us
 /// keep the newest announce per `topic_id`, and count each parsed announce toward every root tag it
 /// carries (an announce tagged with several roots occupies a slot in each root's window — that IS the
 /// eviction shape being measured). `hit_limit` is taken from the caller, which knows the page size.
-fn dedupe_announces(events: &mut [Event], tags: &[String]) -> TopicDiscoveries {
+///
+/// An announce whose `created_at` lies beyond `now + FUTURE_SKEW_SECS` cannot win its `topic_id`'s
+/// slot (QURATOR-289) — the same single-winner future-skew defect [`newest_announce`] closed for the
+/// one-topic lookup (QURATOR-246), on discovery's many-topics path: ranked purely by `created_at`,
+/// one far-future-dated announce would permanently shadow every legitimate metadata update for that
+/// `topic_id` in discovery. Dropped from candidacy, never clamped, for the same reason as 246 — a
+/// clamp to the ceiling would still outrank every legitimate announce (all ≤ now), i.e. would not
+/// fix the shadowing. The drop sits deliberately AFTER the per-root accounting below: the event
+/// physically consumed a slot of the relay's page (relays serve newest-first, so future-dated junk
+/// is served FIRST), so `root_event_counts` stays an honest measure of where the page budget went
+/// and the starvation/escalation logic reads exactly what it read before the gate existed.
+fn dedupe_announces(events: &mut [Event], tags: &[String], now: u64) -> TopicDiscoveries {
     // Keep the newest announce per topic_id (a re-announce supersedes).
     let mut best: HashMap<String, (u64, TopicMeta)> = HashMap::new();
     let mut root_event_counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -213,6 +229,12 @@ fn dedupe_announces(events: &mut [Event], tags: &[String]) -> TopicDiscoveries {
                 *root_event_counts.entry(c.to_string()).or_insert(0) += 1;
             }
             let ts = ev.created_at.as_secs();
+            // Future-skew gate (QURATOR-289), the sibling of `newest_announce`'s (QURATOR-246):
+            // never trust the relay's/event's clock past the shared tolerance. Placed after the
+            // per-root counting on purpose — see this function's doc comment.
+            if ts > now.saturating_add(FUTURE_SKEW_SECS) {
+                continue;
+            }
             match best.get(&meta.topic_id) {
                 Some((prev, _)) if *prev >= ts => {}
                 _ => {
@@ -1130,11 +1152,15 @@ mod tests {
         // starved root's follow-up — which is `TopicDiscoveries::merge`'s exact job.
         let a = announce_for("video/own-topic", &["video"], 1_700_000_000);
         let b = announce_for("audio/own-topic", &["audio"], 1_700_000_050);
-        let mut shared = dedupe_announces(&mut [a, b], &["video".into(), "audio".into()]);
+        // Pinned `now`, comfortably above every fixture (newest is 1_700_000_050) so the
+        // future-skew gate stays out of this test's way — it pins the cross-root dedupe, not the
+        // bound (that is the QURATOR-289 section's job, below).
+        let now = 1_700_001_000u64;
+        let mut shared = dedupe_announces(&mut [a, b], &["video".into(), "audio".into()], now);
         // The escalated root's follow-up re-finds `video/own-topic` (the relay serving the same
         // event again under the narrower filter) — merge must keep ONE row for it, not two.
         let again = announce_for("video/own-topic", &["video"], 1_700_000_000);
-        let mut escalated = dedupe_announces(&mut [again], &["video".into()]);
+        let mut escalated = dedupe_announces(&mut [again], &["video".into()], now);
         escalated.hit_limit = true;
         shared.merge(escalated);
         let mut ids: Vec<&str> = shared.topics.iter().map(|m| m.topic_id.as_str()).collect();
@@ -1153,7 +1179,10 @@ mod tests {
         // A re-announce supersedes: same topic_id, newer created_at wins, regardless of batch order.
         let old = announce_for("video/re-announced", &["video"], 1_700_000_000);
         let new = announce_for("video/re-announced", &["video"], 1_700_000_999);
-        let out = dedupe_announces(&mut [new.clone(), old], &["video".into()]);
+        // Pinned `now` above the newest fixture (1_700_000_999) so the skew bound cannot fire
+        // here — newest-wins is this test's subject, not the gate.
+        let now = 1_700_001_000u64;
+        let out = dedupe_announces(&mut [new.clone(), old], &["video".into()], now);
         assert_eq!(out.topics.len(), 1);
         // `new` is distinguishable from `old` only by created_at here (same payload); the count of
         // PARSED events in the window is what proves both were seen and folded to one row.
@@ -1170,7 +1199,8 @@ mod tests {
         let (attacker, _k2) = new_topic("video/paint-mismatch-other", "", vec![], false).unwrap();
         let author = Identity::generate();
         let mismatched = build_mismatched_announce(&author, &victim.topic_id, &attacker, 1_700_000_000);
-        let out = dedupe_announces(&mut [mismatched], &["video".into()]);
+        let now = 1_700_001_000u64; // pinned, far above the fixture — the skew gate must not fire
+        let out = dedupe_announces(&mut [mismatched], &["video".into()], now);
         assert!(out.topics.is_empty(), "a d-tag/payload mismatch is not a discovery candidate");
         assert!(out.root_event_counts.is_empty(), "it must not consume a root's window slot either");
     }
@@ -1192,10 +1222,97 @@ mod tests {
         // even when another root flooded the page. Absent == 0 == starved.
         let flood = announce_for("video/flood", &["video"], 1_700_000_000);
         let tags = ["video".to_string(), "audio".to_string()];
-        let out = dedupe_announces(&mut [flood], &tags);
+        let now = 1_700_001_000u64; // pinned, far above the fixture — the skew gate must not fire
+        let out = dedupe_announces(&mut [flood], &tags, now);
         let starved = starved_roots(&tags, &out.root_event_counts);
         assert_eq!(starved.len(), 1, "exactly one starved root");
         assert_eq!(starved[0].as_str(), "audio", "video got its slot; audio got none");
+    }
+
+    // ───────────────── QURATOR-289: the discovery path's copy of the 246 future-skew gate ─────────
+    //
+    // The defect: `dedupe_announces` ranked purely by `created_at` with no upper bound — the SAME
+    // defect class 246 closed in `newest_announce`, on the many-topics path: one far-future-dated
+    // announce (validly signed by any key — announces are unpermissioned) permanently won its
+    // `topic_id`'s slot and shadowed every legitimate metadata update in DISCOVERY. Same posture as
+    // 246 (and `hb_core::binding` / `hb_core::count`): dropped from candidacy, never clamped — a
+    // clamp to `now + FUTURE_SKEW_SECS` would still outrank every legitimate announce (all ≤ now),
+    // i.e. would not fix the shadowing at all.
+    //
+    // Placement decision (acceptance criterion 5, stated because it is the non-obvious part): the
+    // gate sits AFTER the per-root window accounting, so a skew-rejected announce still increments
+    // `root_event_counts` — it physically consumed a slot of the relay's page (relays serve
+    // newest-first, so future-dated junk is served FIRST), and the counts exist to measure exactly
+    // that. Escalation therefore reads precisely what it read before the gate existed; a
+    // future-only flood suppresses escalation for its root no more and no less than a same-size
+    // past-dated flood already does today. Moving the gate BEFORE the counting would reroute the
+    // starvation machinery (a rejected flood would read as "starved" and trigger escalation reads)
+    // — a query-pattern change, out of scope for a selection-predicate fix.
+    //
+    // P-10 mutation (stated, NOT run — the orchestrator applies it on the settled tree): inside
+    // `fn dedupe_announces` (NOT `newest_announce` — this file now carries TWO skew gates), in the
+    // loop body immediately after `let ts = ev.created_at.as_secs();`, delete the future-skew
+    // guard statement — the `if` whose condition is `ts > now.saturating_add(FUTURE_SKEW_SECS)`
+    // together with its `continue`. That edit must red
+    // `dedupe_announces_drops_a_future_dated_announce_beyond_the_shared_skew` (the far-future
+    // announce would win with "shadow desc", and the future-only batch would stop yielding an
+    // empty paint), while every `newest_announce_*` test stays green (their gate is untouched).
+
+    #[test]
+    fn dedupe_announces_drops_a_future_dated_announce_beyond_the_shared_skew() {
+        let (meta, _key) =
+            new_topic("video/hbnet-discovery-future-skew", "real desc", vec!["video".to_string()], false).unwrap();
+        let author = Identity::generate();
+        let now = 1_700_000_000u64;
+        // A legitimate, recent announce (60 s old) against an attacker's far-future one (a day
+        // ahead — far past the ±300 s tolerance) carrying different metadata, both tagged "video".
+        let legit = build_announce(&author, &meta, now - 60).unwrap();
+        let mut shadow_meta = meta.clone();
+        shadow_meta.description = "shadow desc".into();
+        let shadow = build_announce(&author, &shadow_meta, now + 86_400).unwrap();
+        let out = dedupe_announces(&mut [shadow.clone(), legit], &["video".into()], now);
+        assert_eq!(out.topics.len(), 1, "one row for the topic_id, held by the legitimate announce");
+        assert_eq!(
+            out.topics[0].description, "real desc",
+            "a future-dated announce must not win its topic_id's slot in discovery"
+        );
+        // Criterion 5, pinned: BOTH events consumed a "video" window slot — the drop is from
+        // CANDIDACY only, so the per-root tallies (and the starvation rule that reads them) are
+        // exactly what they were before the gate existed.
+        assert_eq!(
+            out.root_event_counts.get("video"),
+            Some(&2),
+            "a skew-rejected announce still occupies the slot it consumed on the wire"
+        );
+        // And when the future-dated announce is the ONLY candidate it wins nothing — the topic is
+        // simply absent from the paint instead of being shadowed by attacker metadata.
+        let solo_out = dedupe_announces(&mut [shadow], &["video".into()], now);
+        assert!(solo_out.topics.is_empty(), "a future-only batch must paint no row for the topic_id");
+        assert_eq!(solo_out.root_event_counts.get("video"), Some(&1), "it still consumed the slot it was served");
+    }
+
+    #[test]
+    fn dedupe_announces_admits_an_announce_inside_the_future_skew_tolerance() {
+        let (meta, _key) =
+            new_topic("video/hbnet-discovery-skew-edge", "older", vec!["video".to_string()], false).unwrap();
+        let author = Identity::generate();
+        let now = 1_700_000_000u64;
+        let recent = build_announce(&author, &meta, now - 10).unwrap();
+        // Exactly at the tolerance boundary (`now + FUTURE_SKEW_SECS`), inclusive — matching
+        // `newest_announce`'s edge pin and `binding.rs`'s `created > now + skew` rejection shape,
+        // so the boundary itself is admitted. This pins that the gate is a BOUND, not a blanket
+        // refusal of anything ahead of our clock (a slightly-fast author clock must still surface
+        // in discovery).
+        let mut edge_meta = meta.clone();
+        edge_meta.description = "at the edge".into();
+        let edge = build_announce(&author, &edge_meta, now + FUTURE_SKEW_SECS).unwrap();
+        let out = dedupe_announces(&mut [recent, edge], &["video".into()], now);
+        assert_eq!(out.topics.len(), 1);
+        assert_eq!(
+            out.topics[0].description, "at the edge",
+            "an announce within the skew tolerance still wins by recency"
+        );
+        assert_eq!(out.root_event_counts.get("video"), Some(&2), "both candidates parsed and counted");
     }
 
     // The rank half's contracts (count-desc order, id tiebreak, error-tolerance, bounded
