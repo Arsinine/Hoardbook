@@ -27,12 +27,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result as AnyResult};
 use tokio::sync::{mpsc, watch};
 
 use crate::commands::collection::{count_items, publish_collection_inner, rescan_listing};
 use crate::identity_state::SharedIdentity;
 use crate::net::SharedRelay;
-use crate::store::DataStore;
+use crate::store::{read_json_lenient, write_json, DataStore};
 
 /// Default per-collection republish cadence floor: a churning folder cannot publish (and therefore
 /// emit a timing signal) more than once a minute.
@@ -122,6 +123,10 @@ pub struct LaunchRescanPlan {
     pub max_concurrent: usize,
     /// Total published count (the M in the "checking N of M" progress signal).
     pub total: usize,
+    /// The rotation cursor to persist and pass into the *next* launch's `plan_launch_rescan` call
+    /// (QURATOR-268): advances the scan window each launch so the alphabetical tail isn't starved
+    /// forever. `0` when everything was scanned this launch (nothing to rotate past).
+    pub next_cursor: usize,
 }
 
 /// Progress signal emitted while the launch reconcile runs ("Checking snapshots… N of M").
@@ -189,23 +194,49 @@ pub fn watch_plan(
     actions
 }
 
-/// **Pure** bounded launch reconcile (F24): order the published slugs deterministically, take the
-/// first `startup_scan_budget` to scan now, defer the rest (handled by the watch / next launch), and
-/// surface the concurrency cap + the total for the "checking N of M" progress signal. The budget and
-/// cap clamp to ≥1 so a misconfig can't stall the reconcile entirely.
-pub fn plan_launch_rescan(published_slugs: &[String], cfg: &WatchCfg) -> LaunchRescanPlan {
+/// **Pure** bounded launch reconcile (F24): order the published slugs deterministically, take a
+/// window of `startup_scan_budget` starting at `cursor` (QURATOR-268 — wrapping around the sorted
+/// order so the alphabetical tail isn't starved on every launch), defer the rest (handled by the
+/// watch / next launch), and surface the concurrency cap + the total for the "checking N of M"
+/// progress signal. `cursor` is an arbitrary rotation offset (typically the `next_cursor` persisted
+/// from the previous launch) — it is taken modulo `total`, so any value is safe. The budget and cap
+/// clamp to ≥1 so a misconfig can't stall the reconcile entirely.
+pub fn plan_launch_rescan(published_slugs: &[String], cfg: &WatchCfg, cursor: usize) -> LaunchRescanPlan {
     let mut ordered: Vec<String> = published_slugs.to_vec();
     ordered.sort();
     let total = ordered.len();
     let budget = cfg.startup_scan_budget.max(1);
-    let split = budget.min(total);
-    let deferred = ordered.split_off(split);
-    LaunchRescanPlan {
-        to_scan: ordered,
-        deferred,
-        max_concurrent: cfg.max_concurrent_launch_scans.max(1),
-        total,
+    let max_concurrent = cfg.max_concurrent_launch_scans.max(1);
+
+    if total == 0 {
+        return LaunchRescanPlan { to_scan: Vec::new(), deferred: Vec::new(), max_concurrent, total, next_cursor: 0 };
     }
+    if total <= budget {
+        // Everything fits within budget — nothing to rotate past, so the cursor resets to the start
+        // for the next launch rather than drifting forward pointlessly.
+        return LaunchRescanPlan { to_scan: ordered, deferred: Vec::new(), max_concurrent, total, next_cursor: 0 };
+    }
+
+    // Rotating window: start at `cursor % total` and take `budget` slugs, wrapping around the
+    // sorted order. `deferred` stays in sorted order (not window-relative) so it matches the
+    // pre-rotation contract when `cursor == 0`.
+    let start = cursor % total;
+    let mut to_scan = Vec::with_capacity(budget);
+    let mut in_window = vec![false; total];
+    for i in 0..budget {
+        let idx = (start + i) % total;
+        to_scan.push(ordered[idx].clone());
+        in_window[idx] = true;
+    }
+    let deferred: Vec<String> = ordered
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| !in_window[*idx])
+        .map(|(_, s)| s.clone())
+        .collect();
+    let next_cursor = (start + budget) % total;
+
+    LaunchRescanPlan { to_scan, deferred, max_concurrent, total, next_cursor }
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +332,31 @@ impl PublishSink for RelayPublishSink {
 }
 
 // ---------------------------------------------------------------------------
+// DataStore persistence for the launch-rescan rotation cursor (QURATOR-268) — mirrors the
+// dm_quarantine.rs pattern: a sibling module adds its own `impl DataStore` block and persists a
+// small file directly under `base_dir()`, so `DataStore::wipe()`'s "remove everything under
+// base_dir()" sweep (audit I-11) covers it automatically — no wipe-list entry needed here.
+// ---------------------------------------------------------------------------
+
+impl DataStore {
+    pub fn launch_rescan_cursor_path(&self) -> PathBuf {
+        self.base_dir().join("launch_rescan_cursor.json")
+    }
+
+    /// Defaults to `0` (start of the sorted order) when absent or unreadable — never blocks the
+    /// launch reconcile on a missing/corrupt cursor file.
+    pub fn load_launch_rescan_cursor(&self) -> AnyResult<usize> {
+        Ok(read_json_lenient::<usize>(&self.launch_rescan_cursor_path())
+            .context("loading launch rescan cursor")?
+            .unwrap_or(0))
+    }
+
+    pub fn save_launch_rescan_cursor(&self, cursor: usize) -> AnyResult<()> {
+        write_json(&self.launch_rescan_cursor_path(), &cursor).context("saving launch rescan cursor")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The loop
 // ---------------------------------------------------------------------------
 
@@ -336,7 +392,11 @@ pub async fn run_watch_loop(
     // 1. Bounded launch reconcile (catches edits made while closed + server-side SMB edits the watch
     //    missed). Each re-scan no-ops via the fingerprint guard unless the tree actually changed.
     let published = store.list_published_slugs().unwrap_or_default();
-    let plan = plan_launch_rescan(&published, &cfg);
+    let cursor = store.load_launch_rescan_cursor().unwrap_or(0);
+    let plan = plan_launch_rescan(&published, &cfg, cursor);
+    if let Err(e) = store.save_launch_rescan_cursor(plan.next_cursor) {
+        tracing::debug!("failed to persist launch rescan cursor: {e:#}");
+    }
     if !plan.to_scan.is_empty() {
         tracing::info!(
             "snapshot launch reconcile: checking {} of {} published ({} deferred to the watch)",
@@ -592,7 +652,7 @@ mod tests {
             ..Default::default()
         };
         let slugs: Vec<String> = (0..20).map(|i| format!("col-{i:02}")).collect();
-        let plan = plan_launch_rescan(&slugs, &cfg);
+        let plan = plan_launch_rescan(&slugs, &cfg, 0);
         assert_eq!(plan.total, 20, "M (for 'N of M') is the full published count");
         assert_eq!(plan.to_scan.len(), 12, "at most the budget is scanned at launch");
         assert_eq!(plan.deferred.len(), 8, "the over-budget collections defer, not dropped");
@@ -610,10 +670,57 @@ mod tests {
     fn launch_rescan_under_budget_scans_all_with_nothing_deferred() {
         let cfg = WatchCfg { startup_scan_budget: 12, ..Default::default() };
         let slugs: Vec<String> = (0..3).map(|i| format!("c{i}")).collect();
-        let plan = plan_launch_rescan(&slugs, &cfg);
+        let plan = plan_launch_rescan(&slugs, &cfg, 0);
         assert_eq!(plan.to_scan.len(), 3);
         assert!(plan.deferred.is_empty());
         assert_eq!(plan.total, 3);
+        // mutation: watch.rs:214 (the `if total <= budget` short-circuit) — deleting it would route
+        // the ≤budget case through the windowed-selection branch instead, which is behaviorally
+        // equivalent for `to_scan` here but would set `next_cursor` to a nonzero value instead of 0;
+        // asserting next_cursor pins that the short-circuit is the one taken.
+        assert_eq!(plan.next_cursor, 0, "nothing to rotate past when everything fit in budget");
+    }
+
+    // QURATOR-268: the launch reconcile used to always start at index 0 of the sorted slugs, so a
+    // collection past the budget in alphabetical order was NEVER scanned at launch, for the life of
+    // the install. These tests pin the rotating-window fix.
+
+    #[test]
+    fn successive_launch_cursors_eventually_reach_a_starved_tail_collection() {
+        // 20 slugs, budget 12: under the old (non-rotating) behavior "col-19" (alphabetically last)
+        // would never appear in `to_scan` on any launch. Simulate successive launches by feeding
+        // each plan's `next_cursor` into the next call, and assert the starved tail is eventually
+        // scanned.
+        let cfg = WatchCfg { startup_scan_budget: 12, ..Default::default() };
+        let slugs: Vec<String> = (0..20).map(|i| format!("col-{i:02}")).collect();
+        let mut cursor = 0usize;
+        let mut ever_scanned_tail = false;
+        for _ in 0..5 {
+            let plan = plan_launch_rescan(&slugs, &cfg, cursor);
+            if plan.to_scan.iter().any(|s| s == "col-19") {
+                ever_scanned_tail = true;
+            }
+            cursor = plan.next_cursor;
+        }
+        // mutation: watch.rs:204 — reverting the function to ignore `cursor` (always starting the
+        // window at index 0, the pre-fix behavior) makes "col-19" never appear in `to_scan` across
+        // any number of launches, since it sits at index 19 of 20 and the budget is 12.
+        assert!(ever_scanned_tail, "the alphabetical-tail collection must eventually launch-reconcile");
+    }
+
+    #[test]
+    fn launch_rescan_window_wraps_around_the_end_of_sorted_order() {
+        // 5 slugs, budget 3, cursor 4 (last index): the window should wrap, taking indices
+        // [4, 0, 1] rather than stopping short at the end of the vec.
+        let cfg = WatchCfg { startup_scan_budget: 3, ..Default::default() };
+        let slugs: Vec<String> = (0..5).map(|i| format!("c{i}")).collect();
+        let plan = plan_launch_rescan(&slugs, &cfg, 4);
+        assert_eq!(plan.to_scan, vec!["c4", "c0", "c1"], "the window wraps past the end of sorted order");
+        assert_eq!(plan.deferred, vec!["c2", "c3"], "the two slugs outside the wrapped window defer");
+        // mutation: watch.rs:227 (`let idx = (start + i) % total;`) — removing the `% total` wrap
+        // (e.g. `let idx = start + i;`) would panic on out-of-bounds indexing here (start=4,
+        // budget=3, total=5), since index 5 doesn't exist.
+        assert_eq!(plan.next_cursor, 2, "the next cursor continues right after the wrapped window");
     }
 
     // ---- run_watch_loop wiring (injected fake sink; no RelayClient) --------
@@ -671,6 +778,96 @@ mod tests {
 
         let got = calls.lock().unwrap();
         assert_eq!(&*got, &["films".to_string()], "one fs event → one republish through the sink");
+    }
+
+    /// QURATOR-268 — **the GLUE test.** `plan_launch_rescan`'s rotation is pinned by pure unit
+    /// tests, but those stay green even if `run_watch_loop` never loads or saves the cursor — the
+    /// rotation would then restart at 0 every launch and the alphabetical tail would starve exactly
+    /// as before the fix. That is the **inert-fix** shape this repo shipped once already
+    /// (QURATOR-267): true tests over a pure helper, with nothing pinning the wiring.
+    ///
+    /// So this test drives the REAL loop and asserts on the cursor FILE: a pre-seeded cursor must
+    /// be honoured (the window starts there, not at index 0), and the advanced cursor must be
+    /// persisted for the next launch.
+    ///
+    /// mutation: in `run_watch_loop`, pass a literal `0` to `plan_launch_rescan` instead of the
+    /// loaded cursor (i.e. neutralise the load at line 395) — this test must red on the
+    /// "started at the persisted cursor" assertion. Deleting the save (line 397) instead must red
+    /// the "advanced cursor was persisted" assertion. Both live in production, not in a comment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watch_loop_honours_and_advances_the_persisted_launch_rescan_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        // Five published slugs, budget 2 ⇒ the window cannot cover them all in one launch, which is
+        // the only situation where a cursor matters at all.
+        for slug in ["a", "b", "c", "d", "e"] {
+            let col = hb_core::types::Collection {
+                slug: slug.into(),
+                path_alias: slug.into(),
+                description: None,
+                item_count: 0,
+                est_size: None,
+                content_types: vec![],
+                tags: vec![],
+                languages: vec![],
+                visibility: hb_core::types::Visibility::Public,
+                sorted: false,
+                last_updated: chrono::Utc::now(),
+                listing: vec![],
+            };
+            store.save_collection_draft(&col).unwrap();
+            store.save_published(slug, "{}").unwrap();
+            store
+                .save_scan_spec(
+                    slug,
+                    &crate::store::ScanSpec {
+                        root: dir.path().to_string_lossy().into(),
+                        include: vec![],
+                        exclude: vec![],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        // Seed a cursor of 2 — a launch that ignored it would scan ["a","b"].
+        store.save_launch_rescan_cursor(2).unwrap();
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::new(CountingSink { calls: Arc::clone(&calls) });
+        let (_fs_tx, fs_rx) = mpsc::channel(8);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let cfg = WatchCfg { startup_scan_budget: 2, max_concurrent_launch_scans: 1, ..Default::default() };
+
+        let handle = tokio::spawn(run_watch_loop(
+            store,
+            cfg,
+            sink,
+            fs_rx,
+            cancel_rx,
+            Duration::from_millis(50),
+            None,
+            Arc::new(AtomicU64::new(0)),
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = cancel_tx.send(true);
+        let _ = handle.await;
+
+        let got = calls.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec!["c".to_string(), "d".to_string()],
+            "the launch reconcile must START AT THE PERSISTED CURSOR (2 ⇒ c,d), not at index 0 \
+             (a,b). If this reads [a,b] the cursor is computed but never LOADED, and the rotation \
+             is inert — the alphabetical tail starves exactly as before QURATOR-268."
+        );
+
+        // And the advanced cursor must reach disk, or the next launch repeats this same window.
+        let reread = DataStore::new(dir.path().to_path_buf());
+        assert_eq!(
+            reread.load_launch_rescan_cursor().unwrap(),
+            4,
+            "the advanced cursor (2 + budget 2) must be PERSISTED for the next launch"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
