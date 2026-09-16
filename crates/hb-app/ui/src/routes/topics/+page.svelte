@@ -274,10 +274,13 @@
 		topicNameLookup = null;
 		lookupGeneration += 1;
 		const generation = lookupGeneration;
+		// Cancel any pending lookup BEFORE the private/empty early return — a timer scheduled
+		// while the topic was still Public must not survive the switch to Private, or the
+		// now-intended-private name still reaches relays via that one stale lookup (QURATOR-271).
+		clearTimeout(lookupTimer);
 		if (newPrivate || !name) {
 			return;
 		}
-		clearTimeout(lookupTimer);
 		lookupTimer = setTimeout(async () => {
 			let result: TopicLookup | null;
 			try {
