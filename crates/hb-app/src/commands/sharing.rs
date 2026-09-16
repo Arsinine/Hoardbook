@@ -10,6 +10,7 @@
 use tauri::State;
 
 use crate::{
+    commands::collection::is_valid_slug,
     store::{DataStore, ShareSettings},
     error::{CmdResult, cmd_err},
 };
@@ -19,7 +20,10 @@ pub async fn get_share_settings(
     slug: String,
     store: State<'_, DataStore>,
 ) -> CmdResult<ShareSettings> {
-    Ok(store.load_share_settings(&slug).map_err(cmd_err)?.unwrap_or_default())
+    let safe_slug = is_valid_slug(&slug)
+        .then_some(slug.as_str())
+        .ok_or("Invalid collection slug")?;
+    Ok(store.load_share_settings(safe_slug).map_err(cmd_err)?.unwrap_or_default())
 }
 
 // -----------------------------------------------------------------------
@@ -68,10 +72,41 @@ mod tests {
         // the deserialized `slug` argument rather than always returning the one saved value.
         let other = get_share_settings("other".into(), app.state::<DataStore>()).await.unwrap();
         assert_eq!(other.root_path, None);
-        // mutation: change `store.load_share_settings(&slug)` in get_share_settings to ignore the
-        // `slug` argument (e.g. hardcode `"vault"`) — the "other" lookup above would then wrongly
+        // mutation: change `store.load_share_settings(safe_slug)` in get_share_settings to ignore
+        // the slug argument (e.g. hardcode `"vault"`) — the "other" lookup above would then wrongly
         // return "/x" instead of the default, since the shim's deserialized argument would no
         // longer reach the store call.
+    }
+
+    /// A traversal-shaped slug is refused BEFORE `load_share_settings` joins it into a path
+    /// (QURATOR-270). The store builds `sharing/<slug>.json` naively (`share_settings_path`), so
+    /// without the guard a "../outside" slug reads `base/sharing/../outside.json` — i.e.
+    /// `base/outside.json`, OUTSIDE `sharing/`. The decoy is planted through the store's own
+    /// `save_share_settings` (same naive join, so it lands exactly where the unguarded read would
+    /// look) and would come back as "/pwned" if the guard were absent.
+    ///
+    /// Mutation to redden: in `get_share_settings`'s production body (the `let safe_slug =`
+    /// lines, NOT this comment), change the `.ok_or("Invalid collection slug")?;` line to
+    /// `.unwrap_or("");` — the traversal slug would then reach `load_share_settings`, read the
+    /// decoy, and the `unwrap_err()` below would panic on an Ok.
+    #[tokio::test]
+    async fn get_share_settings_command_rejects_a_traversal_slug_before_the_store_read() {
+        let app = guard_app();
+        app.state::<DataStore>()
+            .save_share_settings("../outside", &ShareSettings { root_path: Some("/pwned".into()) })
+            .unwrap();
+
+        let err = get_share_settings("../outside".into(), app.state::<DataStore>())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "Invalid collection slug",
+            "a traversal slug must be refused before load_share_settings joins it into a path"
+        );
+        // mutation: change the `.ok_or("Invalid collection slug")?;` line in get_share_settings's
+        // production body to `.unwrap_or("");` — the traversal slug would then reach
+        // load_share_settings, read the decoy above, and this unwrap_err would panic on an Ok.
     }
 
     // -----------------------------------------------------------------------

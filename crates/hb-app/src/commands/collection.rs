@@ -508,7 +508,14 @@ fn inflight_access_stats() -> &'static std::sync::Mutex<std::collections::HashSe
 /// back online fills back in.
 #[tauri::command]
 pub async fn collection_source_accessible(slug: String, store: State<'_, DataStore>) -> CmdResult<bool> {
-    let Some(spec) = store.load_scan_spec(&slug).map_err(cmd_err)? else {
+    // QURATOR-270 (sibling site): the slug is IPC-supplied and `scan_spec_path` joins it naively
+    // into `collections/<slug>.scan.json`, so an unguarded traversal slug reads a parsed file
+    // outside the store — an existence/parse oracle. Same guard, same message as every other
+    // supplied-slug command.
+    let safe_slug = is_valid_slug(&slug)
+        .then_some(slug.as_str())
+        .ok_or("Invalid collection slug")?;
+    let Some(spec) = store.load_scan_spec(safe_slug).map_err(cmd_err)? else {
         return Ok(true);
     };
     if spec.root.is_empty() {
@@ -1012,6 +1019,12 @@ pub async fn publish_collection(
     identity: State<'_, SharedIdentity>,
     relay: State<'_, SharedRelay>,
 ) -> CmdResult<PublishSummary> {
+    // QURATOR-270 (sibling site): `prepare_listing` guards the slug, but `published_generation`
+    // below is read BEFORE it and joins naively into `published/<slug>.gen`, so an unguarded
+    // traversal slug leaks that file's parsed integer. Guard at the command boundary instead.
+    if !is_valid_slug(&slug) {
+        return Err("Invalid collection slug".into());
+    }
     let (id_clone, browse_key) = {
         let guard = identity.read().await;
         let id = guard.as_ref().ok_or("No identity loaded. Generate a keypair first.")?;
@@ -4614,6 +4627,146 @@ mod collection_command_guards_c {
             store.is_published("profile"),
             "INV-8: deleting the draft must spare the profile teaser's marker — it belongs to \
              the profile subsystem, not this collection"
+        );
+    }
+
+    /// QURATOR-284: the reserved-slug branch hand-rolls a FOUR-path sidecar sweep that mirrors
+    /// `DataStore::delete_collection`'s FIVE-path list minus `published_path` (sparing the marker
+    /// is the fix). Nothing else pins the two lists together, and drift is worse than an orphan
+    /// file: a leftover sidecar keeps `target_path_is_occupied` (backup.rs) true, blocking future
+    /// restores until someone cleans the store by hand. So materialise ALL FIVE sidecars via the
+    /// store's own save methods and assert exactly `published_path` survives.
+    ///
+    /// ⚠ SCOPE, corrected after the 2026-09-16 review: this does NOT automatically red when the
+    /// store gains a SIXTH sidecar. It hardcodes today's five save methods, and nothing anywhere
+    /// pins `DataStore::delete_collection`'s own list, so a sixth path would be ignored by the
+    /// command, the store's caller here, and this test alike. What it genuinely pins is the
+    /// command's FOUR-path list and the spare-the-marker invariant — each path mutation-proven.
+    /// Closing the drift gap for real needs the consolidation the branch's own comment names: one
+    /// store-level sidecar list consumed by both deleters. Filed separately; do not read this
+    /// test as already providing it.
+    /// Unlike `deleting_a_legacy_profile_draft_spares_the_teaser_marker`, which creates only the
+    /// draft, this covers every path the branch must remove.
+    ///
+    /// Mutation to redden: in `delete_collection`'s reserved-marker branch, delete the
+    /// `store.share_settings_path(safe_slug),` entry from the `for path in [` array (production
+    /// lines ~446-451 — between the QURATOR-249 comment block and the `return Ok(());`). That is
+    /// the production occurrence inside the array, NOT the mention in this doc comment: an
+    /// unqualified text match would mutate the comment and report a good control as decorative.
+    /// The `share_settings_path` entry in the `gone` loop below reds; the sibling
+    /// spare-the-marker test stays green (it never creates share settings).
+    #[tokio::test]
+    async fn deleting_a_reserved_slug_removes_every_sidecar_but_the_published_marker() {
+        let (_dir, app) = guard_app();
+        let store = app.state::<DataStore>();
+        // Materialise every sidecar `DataStore::delete_collection` sweeps, via the store's own
+        // save methods so the paths cannot drift from the real ones.
+        store.save_published("profile", "{}").unwrap();
+        let col = Collection {
+            slug: "profile".into(),
+            path_alias: "profile".into(),
+            description: None,
+            item_count: 1,
+            est_size: None,
+            content_types: vec!["video".into()],
+            tags: vec![],
+            languages: vec![],
+            visibility: Visibility::Public,
+            sorted: false,
+            last_updated: chrono::Utc::now(),
+            listing: vec![],
+        };
+        store.save_collection_draft(&col).unwrap();
+        store
+            .save_share_settings("profile", &crate::store::ShareSettings::default())
+            .unwrap();
+        store
+            .save_scan_spec("profile", &crate::store::ScanSpec::default())
+            .unwrap();
+        store
+            .save_snapshot_fingerprint("profile", &hb_core::SnapshotFingerprint("pin".into()))
+            .unwrap();
+        // Precondition: all five exist, so a silently failing save cannot vacuously green the
+        // absence asserts below.
+        for present in [
+            store.published_path("profile"),
+            store.collection_draft_path("profile"),
+            store.share_settings_path("profile"),
+            store.scan_spec_path("profile"),
+            store.snapshot_fingerprint_path("profile"),
+        ] {
+            assert!(present.exists(), "precondition: {} must exist", present.display());
+        }
+
+        delete_collection(
+            "profile".into(),
+            app.state::<DataStore>(),
+            app.state::<SharedIdentity>(),
+            app.state::<SharedRelay>(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            store.published_path("profile").exists(),
+            "the profile teaser's marker is the one sidecar the reserved branch must spare"
+        );
+        for gone in [
+            store.collection_draft_path("profile"),
+            store.share_settings_path("profile"),
+            store.scan_spec_path("profile"),
+            store.snapshot_fingerprint_path("profile"),
+        ] {
+            assert!(
+                !gone.exists(),
+                "orphaned sidecar {} keeps target_path_is_occupied true and blocks future \
+                 restores — the reserved branch's list has drifted from \
+                 DataStore::delete_collection's",
+                gone.display()
+            );
+        }
+    }
+
+    /// QURATOR-270 sibling sites (found by the 2026-09-16 adversarial review of the
+    /// `get_share_settings` fix): the same defect class survived one file over. Both commands take
+    /// an IPC-supplied slug and reach a naive path join BEFORE any guard —
+    /// `collection_source_accessible` -> `scan_spec_path` (`collections/<slug>.scan.json`), and
+    /// `publish_collection` -> `published_generation` (`published/<slug>.gen`), which is read
+    /// before `prepare_listing`'s own guard fires. Each is an existence/parse oracle for a file
+    /// outside the store. This is the hardened-path/unhardened-sibling drift pair: fixing one slug
+    /// site without grepping the others is how the pair forms.
+    ///
+    /// Mutation to redden (two independent halves — apply ONE at a time, since mutating two
+    /// changes at once cannot attribute the failure):
+    /// (1) in `collection_source_accessible`'s production body, change its
+    ///     `.ok_or("Invalid collection slug")?;` line to `.unwrap_or("");` — the first assert reds.
+    /// (2) in `publish_collection`'s production body, change its `if !is_valid_slug(&slug) {`
+    ///     line to `if false {` — the second assert reds.
+    /// Neither anchor is unique by text (both forms recur in this file and in this comment), so
+    /// resolve each by its enclosing function, never by a bare match.
+    #[tokio::test]
+    async fn slug_consuming_siblings_refuse_a_traversal_slug_before_any_store_read() {
+        let (_dir, app) = guard_app();
+
+        let err = collection_source_accessible("../outside".into(), app.state::<DataStore>())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err, "Invalid collection slug",
+            "collection_source_accessible must refuse a traversal slug before load_scan_spec joins it"
+        );
+
+        let err = publish_collection(
+            "../outside".into(),
+            app.state::<DataStore>(),
+            app.state::<SharedIdentity>(),
+            app.state::<SharedRelay>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err, "Invalid collection slug",
+            "publish_collection must refuse a traversal slug before published_generation reads it"
         );
     }
 
