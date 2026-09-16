@@ -17,6 +17,11 @@
 //!   QURATOR-224), forbids symlink + hardlink entries outright, and enforces tar-bomb caps
 //!   (total size + entry count + materialized directory components, QURATOR-230). A
 //!   corrupt/garbage tar is a reasoned `Err`, never a panic.
+//! - **The writer refuses what the reader refuses (QURATOR-286).** Restore caps an archive's
+//!   contents at [`MAX_TOTAL_BYTES`] (and the file itself at `MAX_BACKUP_FILE_BYTES`, see
+//!   `commands/identity.rs`), so `backup_inner` refuses — mid-collection, before a 500+ MiB tar
+//!   is ever built in memory — a profile whose files already exceed that same cap. The usual
+//!   culprit is the never-evicting manifest cache (`<base>/manifests/`).
 //! - **Non-empty target is a hard refuse, not a clobber.** `restore_inner` returns
 //!   [`BackupError::TargetNotEmpty`]; the UI owns the confirm-and-wipe before re-calling.
 
@@ -58,6 +63,15 @@ pub enum BackupError {
     #[error("backup archive rejected: {0}")]
     Archive(String),
 
+    /// Backup-side size refusal (QURATOR-286): the profile's files total more than
+    /// [`MAX_TOTAL_BYTES`] — the very cap `extract_archive` enforces on restore — so writing the
+    /// archive would produce a file this app refuses to open. Refused while the files are still
+    /// being collected, before any 500+ MiB tar is built in memory. The payload names the
+    /// offending profile, the running total, and the remedy (the never-evicting manifest cache
+    /// under `<base>/manifests/` is the usual cause).
+    #[error("backup refused — the profile is too large to back up: {0}")]
+    SourceTooLarge(String),
+
     #[error(transparent)]
     Crypto(#[from] hb_core::HbError),
 
@@ -76,10 +90,33 @@ pub fn backup_inner(store: &DataStore, mode: BackupMode<'_>) -> Result<Vec<u8>, 
 
     let mut builder = tar::Builder::new(Vec::new());
 
+    // QURATOR-286, write-side half: every byte that will appear as a tar entry — the injected
+    // portable identity included — accrues in `total_bytes`, and `collect_files` refuses mid-walk
+    // once it passes `MAX_TOTAL_BYTES`: the same cap `extract_archive` enforces on restore,
+    // counted the same way (entry content bytes).
+    //
+    // ⚠ The alignment is CONDITIONAL, not absolute — two caveats, both narrow, both recorded here
+    // rather than left as an overstated invariant (a comment that sources a false premise has
+    // misdirected two tickets in this repo):
+    //   (1) TOCTOU. The ledger accrues `metadata().len()` at WALK time; the tar header declares
+    //       `data.len()` from the later `fs::read` below. A file that grows IN PLACE between the
+    //       two can emit an entry larger than ledgered. Near-infeasible in practice (the store's
+    //       own writes are atomic-rename, and manifest-cache entries are write-once), and it fails
+    //       safe — the read side still refuses, which is the pre-286 behaviour, not a new hole.
+    //   (2) Per-entry tar overhead. This ledger counts CONTENT only. Each entry also costs a 512 B
+    //       header plus <=511 B padding, spent against the ~12 MiB of slack between
+    //       `MAX_TOTAL_BYTES` (500 MiB) and `MAX_BACKUP_FILE_BYTES` (512 MiB). Past roughly 16-25k
+    //       entries a profile inside the content cap can still exceed the FILE cap. That region is
+    //       inside the deliberate no-write-side-entry-cap fence — restore's `MAX_ENTRIES` (10_000)
+    //       refuses such an archive first — so it is unreachable today, but the bound is what makes
+    //       it unreachable, not the arithmetic here. Re-check both if either cap moves.
+    let mut total_bytes: u64 = 0;
+
     // Inject the PORTABLE identity (not the at-rest file). Absent identity → skip; an empty profile
     // is still archivable.
     if let Some(stored) = store.load_identity()? {
         let json = serde_json::to_vec_pretty(&stored).map_err(|e| BackupError::Other(e.into()))?;
+        total_bytes += json.len() as u64;
         append_bytes(&mut builder, IDENTITY_ENTRY, &json)?;
     }
 
@@ -87,7 +124,7 @@ pub fn backup_inner(store: &DataStore, mode: BackupMode<'_>) -> Result<Vec<u8>, 
     // replaced by the portable form above).
     let mut files = Vec::new();
     if base.exists() {
-        collect_files(base, base, &identity_file, &mut files)?;
+        collect_files(base, base, &identity_file, &mut files, &mut total_bytes)?;
     }
     files.sort(); // deterministic ordering
     for (rel, abs) in files {
@@ -348,11 +385,17 @@ fn append_bytes(
 
 /// Recursively collect regular files under `dir` as `(forward-slash relative path, absolute path)`,
 /// skipping the at-rest identity file. (No symlink following: `read_dir` + `is_file` only.)
+/// `total_bytes` is the write-side ledger (QURATOR-286): each file's length accrues into it and
+/// the walk aborts with [`BackupError::SourceTooLarge`] the moment it passes `MAX_TOTAL_BYTES` —
+/// what `extract_archive` would refuse on restore is refused here, before the tar is built.
+/// ⚠ Content bytes only, read at walk time; see `backup_inner`'s ledger comment for the two
+/// conditions (in-place growth, per-entry tar overhead) under which the two sides can disagree.
 fn collect_files(
     base: &Path,
     dir: &Path,
     identity_file: &Path,
     out: &mut Vec<(String, PathBuf)>,
+    total_bytes: &mut u64,
 ) -> Result<(), BackupError> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -362,7 +405,7 @@ fn collect_files(
             continue; // never archive a symlink out of our own dir
         }
         if ft.is_dir() {
-            collect_files(base, &path, identity_file, out)?;
+            collect_files(base, &path, identity_file, out, total_bytes)?;
         } else if ft.is_file() {
             if path == identity_file {
                 continue; // machine-bound at-rest file; the portable form is injected separately
@@ -370,7 +413,25 @@ fn collect_files(
             let rel = path
                 .strip_prefix(base)
                 .map_err(|e| BackupError::Other(anyhow::anyhow!(e)))?;
-            out.push((rel_to_slash(rel), path));
+            let rel = rel_to_slash(rel);
+            // Declared-size accounting, the same basis `extract_archive` uses on restore: for a
+            // quiescent file `metadata().len()` IS the header size the tar will declare, sparse or
+            // not (the writer always emits a Regular entry with an explicit `data.len()`, never a
+            // GNU-sparse one). ⚠ Read at WALK time, while the header is written from the later
+            // `fs::read` — see the TOCTOU caveat on `backup_inner`'s ledger comment.
+            *total_bytes += entry.metadata()?.len();
+            if *total_bytes > MAX_TOTAL_BYTES {
+                return Err(BackupError::SourceTooLarge(format!(
+                    "files under '{}' total {} bytes, over the {MAX_TOTAL_BYTES}-byte cap a \
+                     backup may carry, so the archive could never be restored. The manifest \
+                     cache under '{}' never evicts and is the usual cause — clear it from \
+                     Settings and back up again. Tipped over by '{rel}'.",
+                    base.display(),
+                    *total_bytes,
+                    base.join("manifests").display()
+                )));
+            }
+            out.push((rel, path));
         }
     }
     Ok(())
@@ -640,6 +701,45 @@ mod tests {
             b"{\"npub\":\"x\"}"
         );
         assert!(dst.settings_path().exists());
+    }
+
+    /// QURATOR-286: the write side refuses, at collect time, what the read side would refuse
+    /// anyway. A profile whose files exceed `MAX_TOTAL_BYTES` could only become an archive that
+    /// `extract_archive`'s cap (and `MAX_BACKUP_FILE_BYTES`) rejects on open — so `backup_inner`
+    /// must fail loudly during collection, never silently write the unusable file. The fixture
+    /// is a SPARSE file (`set_len`): 500 MiB of logical length at ~zero disk cost, and the
+    /// refusal fires on the `metadata()` length alone, so the test never reads or tars content.
+    // mutation (P-10), resolved by containing item: inside `fn collect_files` (backup.rs, the
+    // `else if ft.is_file()` arm), neutralise the new ledger guard — change
+    // `if *total_bytes > MAX_TOTAL_BYTES {` to `if false {` (or delete the `return Err`).
+    // THIS test must red: with the guard gone the walk succeeds, the append loop then reads and
+    // tars the 500 MiB sparse file (~1.5 GB transient — the same cost the accepted
+    // `read_backup_file` mutation in commands/identity.rs, ~line 217, incurred on 2026-09-15),
+    // `backup_inner` returns Ok, and `unwrap_err()` panics. The pass side of the bound is
+    // `backup_inner_then_restore_inner_roundtrips_whole_dir` above: under the OPPOSITE mutation
+    // (`if true {`) THAT test reds while this one stays green — the pair separates a bound from
+    // a blanket refusal.
+    #[test]
+    fn backup_inner_refuses_a_profile_past_the_restore_cap_at_collect_time() {
+        let (_d, src, _npub) = store_with_fake_profile();
+        // A manifest-cache-shaped culprit — the real-world offender lives under
+        // `<base>/manifests/` — sparse to just past the cap.
+        let culprit = src.base_dir().join("manifests/npubB-films-fp9.json");
+        std::fs::create_dir_all(culprit.parent().unwrap()).unwrap();
+        std::fs::File::create(&culprit)
+            .unwrap()
+            .set_len(MAX_TOTAL_BYTES + 1)
+            .unwrap();
+
+        let err = backup_inner(&src, BackupMode::Passphrase(PASS)).unwrap_err();
+        assert!(matches!(err, BackupError::SourceTooLarge(_)), "got {err:?}");
+
+        // Actionable per QURATOR-286: names the cap, points at the never-evicting manifest
+        // cache, and says what to do about it.
+        let msg = err.to_string();
+        assert!(msg.contains(&MAX_TOTAL_BYTES.to_string()), "cap is named: {msg}");
+        assert!(msg.contains("manifests"), "cache location is named: {msg}");
+        assert!(msg.contains("Settings"), "remedy is named: {msg}");
     }
 
     #[test]

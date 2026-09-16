@@ -210,14 +210,22 @@ fn write_backup_file(path: &str, archive: &[u8]) -> std::io::Result<()> {
 /// and rejects nothing that would otherwise have succeeded.
 ///
 /// ⚠ It is NOT true that a legitimate archive cannot approach this bound, and an earlier draft of
-/// this comment claimed so (caught by the 2026-09-16 adversarial review). `backup_inner` enforces
-/// NO write-side cap, and `collect_files` archives everything under the store base — including
-/// `base/manifests/`, whose production cap `DEFAULT_MANIFEST_CACHE_BYTES` is `usize::MAX`, i.e.
-/// the manifest cache never evicts. A user who browses enough collections can therefore have
-/// `backup_data` write an archive this app will refuse to open. That asymmetry is a REAL gap,
-/// filed separately; it is not introduced here (such an archive already failed downstream at
-/// `extract_archive`), and it must not be "fixed" by raising this number — raising it past what
-/// `extract_archive` accepts would restore the OOM this cap exists to prevent.
+/// this comment claimed so (caught by the 2026-09-16 adversarial review). `collect_files` archives
+/// everything under the store base — including `base/manifests/`, whose production cap
+/// `DEFAULT_MANIFEST_CACHE_BYTES` is `usize::MAX`, i.e. the manifest cache never evicts. So a user
+/// who browses enough collections really can accumulate a profile larger than this cap.
+///
+/// What that USED to mean — `backup_data` silently writing an archive this app then refused to
+/// open — was closed by QURATOR-286: `backup::collect_files` now accrues a ledger mid-walk and
+/// refuses with `BackupError::SourceTooLarge` once the profile passes `MAX_TOTAL_BYTES`, the same
+/// cap `extract_archive` enforces, and the refusal names the manifest cache and points at
+/// Settings' clear action. ⚠ That alignment is CONDITIONAL — the write ledger counts content
+/// bytes read at walk time, so in-place growth mid-backup or per-entry tar overhead past the
+/// entry-count fence can still diverge; `backup_inner`'s ledger comment states both conditions.
+/// Both fail SAFE (the reader still refuses), which is the pre-286 behaviour. The underlying
+/// never-evicting cache is still a real gap, tracked on the QURATOR-176 track.
+/// ⚠ This cap must still never be "fixed" by raising the number: raising it past what
+/// `extract_archive` accepts would restore the OOM it exists to prevent.
 const MAX_BACKUP_FILE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Read a backup file whole, but only after `metadata()` confirms it fits
