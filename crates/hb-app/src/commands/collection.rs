@@ -433,6 +433,28 @@ pub async fn delete_collection(
     let safe_slug = is_valid_slug(&slug)
         .then_some(slug.as_str())
         .ok_or("Invalid collection slug")?;
+    // QURATOR-249 (teardown half): a reserved-marker slug has no collection listing to unpublish —
+    // its `is_published` bit is the profile teaser's marker read through the key collision — so
+    // bypass `unpublish_collection_inner` (which refuses these slugs) and remove only the draft's
+    // OWN sidecars, sparing `published/<slug>.json`: that file is the live profile teaser's
+    // marker, and `DataStore::delete_collection` sweeps it (INV-8). A blanket refusal here
+    // instead would strand the legacy draft as undeletable for every user whose profile is
+    // published, which the permissive `is_valid_slug` above deliberately avoids. The path list
+    // mirrors `DataStore::delete_collection` minus `published_path`; if the store ever gains
+    // another sidecar, consolidate this into a store-level delete-sparing-the-marker first.
+    if is_reserved_marker_slug(safe_slug) {
+        for path in [
+            store.collection_draft_path(safe_slug),
+            store.share_settings_path(safe_slug),
+            store.scan_spec_path(safe_slug),
+            store.snapshot_fingerprint_path(safe_slug),
+        ] {
+            if path.exists() {
+                std::fs::remove_file(&path).map_err(cmd_err)?;
+            }
+        }
+        return Ok(());
+    }
     // devtest #11 + QURATOR-138 (owner ruling 2026-08-30): a published collection contributes to
     // the profile teaser's content_types union and still has listing events on relays. Unpublish it
     // first (tombstone + NIP-09 delete + teaser content_types/tags recompute, all best-effort
@@ -606,8 +628,10 @@ pub(crate) fn prepare_listing(slug: &str, store: &DataStore) -> Result<String, S
     // QURATOR-249: the reserved marker namespace is refused at scan time (the creation site) and
     // again here — the single validation every publish passes through — so a draft that reached
     // the store without scanning (a restored backup, or one created before the scan guard
-    // existed) can still never write the colliding marker. Unpublish/delete/export lookups stay
-    // open so a legacy draft remains manageable; only the marker-writing step is closed.
+    // existed) can still never write the colliding marker. The teardown half is closed
+    // symmetrically: unpublish refuses these slugs and delete removes the draft while sparing
+    // the marker (see `unpublish_collection_inner` / `delete_collection`), so a legacy draft
+    // stays manageable — deletable, never publishable, never able to destroy the teaser marker.
     if is_reserved_marker_slug(safe_slug) {
         return Err(format!(
             "'{safe_slug}' is a reserved name — rename the collection before publishing it"
@@ -1287,6 +1311,23 @@ pub(crate) async fn unpublish_collection_inner(
     relay: &SharedRelay,
 ) -> Result<(), String> {
     let safe_slug = is_valid_slug(slug).then_some(slug).ok_or("Invalid collection slug")?;
+
+    // QURATOR-249 (teardown half): "profile" is charset-VALID, so `is_valid_slug` alone admits a
+    // legacy draft (restored from backup, or created before the scan guard) — and this function
+    // would then treat the profile teaser's marker as a collection marker: `delete_published`
+    // below destroys the LIVE teaser marker (INV-8 — `refresh_published_teaser` gates on it and
+    // the profile-unpublish path needs it to find the still-live event), and
+    // `retract_public_listing` aims tombstone/NIP-09 traffic at the reserved key. No collection
+    // listing can exist under this key (the scan + publish guards close both creation routes),
+    // so there is nothing legitimate to unpublish: refuse here, before any store read or relay
+    // access. `delete_collection` deliberately bypasses this refusal for reserved slugs — see its
+    // own QURATOR-249 branch — so a legacy draft stays deletable instead of stranded.
+    if is_reserved_marker_slug(safe_slug) {
+        return Err(format!(
+            "'{safe_slug}' is a reserved name — its published marker is the profile teaser's, \
+             not a collection's; deleting the draft is still allowed, but unpublishing it is not"
+        ));
+    }
 
     // QURATOR-200 (F10): the retraction tier comes from the PUBLISHED MARKER — the record of what
     // is actually live on relays — never from a re-read of the mutable draft. The F10 sequence
@@ -4360,6 +4401,48 @@ mod collection_command_guards_b {
         assert!(err.contains("Invalid collection slug"), "got: {err}");
     }
 
+    /// QURATOR-249 (teardown half): unpublishing a legacy "profile" draft — the exact population
+    /// the publish-half guard's comment names (restored from backup, or predating the scan guard)
+    /// — used to pass `is_valid_slug` and reach `delete_published("profile")`, destroying the LIVE
+    /// profile teaser marker. The refusal fires before any store read or relay access. The
+    /// survival assert is the INV-8 substance: the marker must still be there afterwards.
+    ///
+    /// Mutation to redden: in `unpublish_collection_inner` (the `pub(crate) async fn` whose body
+    /// starts with the `is_valid_slug` `.ok_or("Invalid collection slug")?` line), change the
+    /// `if is_reserved_marker_slug(safe_slug) {` of the QURATOR-249 teardown-half guard — the one
+    /// sitting between that `is_valid_slug` line and the QURATOR-200 `marker_tier` comment — to
+    /// `if false {` (or delete the whole block). The call then walks into
+    /// `retract_public_listing` (best-effort against the unroutable relay set up below, so no
+    /// real network) and on to `delete_published("profile")`: `unwrap_err()` panics on the Ok,
+    /// and even a `.unwrap()`-tolerant run leaves `is_published("profile")` false, redding the
+    /// final assert.
+    #[tokio::test]
+    async fn unpublish_collection_inner_refuses_a_reserved_marker_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        // Unroutable relay, as in `deleting_a_published_collection_*`: a mutated run walks into
+        // the best-effort retraction and must fail fast offline, not hang on the real defaults.
+        store
+            .save_settings(&crate::store::Settings {
+                relay_urls: vec!["ws://127.0.0.1:1".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        // The live profile teaser marker — the durable state the unguarded code destroyed.
+        store.save_published("profile", "{}").unwrap();
+        let identity = Identity::generate();
+        let bk: BrowseKey = rand::random();
+        let relay = crate::net::new_shared();
+        let err = unpublish_collection_inner("profile", &store, &identity, &bk, &relay)
+            .await
+            .unwrap_err();
+        assert!(err.contains("'profile' is a reserved name"), "got: {err}");
+        assert!(
+            store.is_published("profile"),
+            "INV-8: a refused unpublish must leave the profile teaser's marker in place"
+        );
+    }
+
     // ── OWED — reported, not refactored into reach ──────────────────────────────────────────
     //
     // Each of these is a guard living directly in a `#[tauri::command]` body with no `*_inner`
@@ -4470,6 +4553,68 @@ mod collection_command_guards_c {
         .await
         .unwrap_err();
         assert_eq!(err, "No identity loaded. Generate a keypair first.");
+    }
+
+    // -- delete_collection (line 427) ---------------------------------------------------------
+
+    /// QURATOR-249 (teardown half): deleting a legacy "profile" draft — with the profile teaser
+    /// marker live, so `is_published("profile")` reads TRUE through the key collision — must
+    /// still delete the draft (no stranding) while bypassing the unpublish half and sparing the
+    /// teaser's marker file, which `DataStore::delete_collection` would otherwise sweep. Drives
+    /// the real command through the mock app; no identity is loaded, which is fine because the
+    /// reserved branch must return before the identity read.
+    ///
+    /// Mutation to redden (primary): in `delete_collection` (the `#[tauri::command]` whose body
+    /// starts with the `is_valid_slug` `.ok_or("Invalid collection slug")?` guard), change the
+    /// `if is_reserved_marker_slug(safe_slug) {` of the QURATOR-249 branch — the one between
+    /// that guard and the devtest #11 / QURATOR-138 comment — to `if false {`. The flow then
+    /// enters the `store.is_published` branch, hits the missing identity, and `unwrap()` reds
+    /// with "No identity loaded". (With an identity loaded it would redden via the
+    /// `unpublish_collection_inner` refusal instead — the two guards back each other up.)
+    ///
+    /// Mutation to redden (secondary, pins the spared marker): in that same branch, replace the
+    /// four-path `for` loop with `store.delete_collection(safe_slug).map_err(cmd_err)?;` — the
+    /// marker file is swept and the `is_published("profile")` assert reds.
+    #[tokio::test]
+    async fn deleting_a_legacy_profile_draft_spares_the_teaser_marker() {
+        let (_dir, app) = guard_app();
+        let store = app.state::<DataStore>();
+        // The collision population: a live profile teaser marker + a draft slugged "profile".
+        store.save_published("profile", "{}").unwrap();
+        let col = Collection {
+            slug: "profile".into(),
+            path_alias: "profile".into(),
+            description: None,
+            item_count: 1,
+            est_size: None,
+            content_types: vec!["video".into()],
+            tags: vec![],
+            languages: vec![],
+            visibility: Visibility::Public,
+            sorted: false,
+            last_updated: chrono::Utc::now(),
+            listing: vec![],
+        };
+        store.save_collection_draft(&col).unwrap();
+
+        delete_collection(
+            "profile".into(),
+            app.state::<DataStore>(),
+            app.state::<SharedIdentity>(),
+            app.state::<SharedRelay>(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            store.load_collection_draft("profile").unwrap().is_none(),
+            "the legacy draft must actually be deleted — a reserved slug must not strand it"
+        );
+        assert!(
+            store.is_published("profile"),
+            "INV-8: deleting the draft must spare the profile teaser's marker — it belongs to \
+             the profile subsystem, not this collection"
+        );
     }
 
 // -- update_collection_visibility (line 1052) --------------------------------------------
