@@ -277,6 +277,18 @@ async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult
             opts.path_alias
         ));
     }
+    // QURATOR-249: collection markers and the fixed-key profile teaser share one flat marker
+    // namespace (`published/<key>.json`). A collection slugged "profile" would clobber the
+    // teaser marker on publish (and vice versa), corrupting tier/big-relay bookkeeping and
+    // flipping `is_published("profile")` on — republishing profile teasers the user never
+    // consented to. Reserved here, the single site collection slugs are created; lookups by
+    // slug (delete/unpublish/export) deliberately still accept it so a legacy draft stays
+    // manageable.
+    if is_reserved_marker_slug(&slug) {
+        return Err(format!(
+            "'{slug}' is a reserved name — pick a different alias for this collection"
+        ));
+    }
     // Cache fast path (the ruling's "reopening the add/edit flow loads instantly instead of
     // re-walking the directory"): the SAME path scanned with the SAME include/exclude settings
     // returns the cached tree. Two deliberate limits: it applies only while the slug has NO
@@ -591,6 +603,16 @@ pub(crate) fn collection_to_listing_json(mut col: Collection) -> Result<String, 
 /// validation paths are L1-testable.
 pub(crate) fn prepare_listing(slug: &str, store: &DataStore) -> Result<String, String> {
     let safe_slug = is_valid_slug(slug).then_some(slug).ok_or("Invalid collection slug")?;
+    // QURATOR-249: the reserved marker namespace is refused at scan time (the creation site) and
+    // again here — the single validation every publish passes through — so a draft that reached
+    // the store without scanning (a restored backup, or one created before the scan guard
+    // existed) can still never write the colliding marker. Unpublish/delete/export lookups stay
+    // open so a legacy draft remains manageable; only the marker-writing step is closed.
+    if is_reserved_marker_slug(safe_slug) {
+        return Err(format!(
+            "'{safe_slug}' is a reserved name — rename the collection before publishing it"
+        ));
+    }
     let collection = store
         .load_collection_draft(safe_slug)
         .map_err(cmd_err)?
@@ -1343,12 +1365,21 @@ pub async fn export_collection(
         .map_err(cmd_err)?
         .ok_or_else(|| format!("Collection '{safe_slug}' not found"))?;
 
-    let out = match format.as_str() {
-        "markdown" => render_markdown(&collection.listing, 0),
-        _ => render_text(&collection.listing, 0),
+    // QURATOR-254 (audit #18's missed sibling): `path_alias` is the first line of the exported
+    // string and reaches this point un-neutralized — it is bound from webview IPC at scan time
+    // (and a restored backup's draft is never field-validated), so an alias like
+    // `Films\n\n![p](https://…)` would forge rows and live markup in a checklist the user is
+    // told is safe to share. Item names already get the audit #18 treatment in `render_text` /
+    // `render_markdown`; the alias now gets the identical one, matched to the same format.
+    let (out, alias) = match format.as_str() {
+        "markdown" => (
+            render_markdown(&collection.listing, 0),
+            markdown_escape(&collection.path_alias),
+        ),
+        _ => (render_text(&collection.listing, 0), strip_control(&collection.path_alias)),
     };
 
-    Ok(format!("{}\n\n{}", collection.path_alias, out))
+    Ok(format!("{alias}\n\n{out}"))
 }
 
 fn render_text(items: &[DirectoryItem], depth: usize) -> String {
@@ -1442,6 +1473,19 @@ fn code_span_escape(s: &str) -> String {
 /// preventing path traversal attacks (e.g., "../identity/keypair").
 pub(crate) fn is_valid_slug(slug: &str) -> bool {
     !slug.is_empty() && slug.chars().all(|c| c.is_alphanumeric() || c == '-')
+}
+
+/// Fixed keys sharing the flat `published/<key>.json` marker namespace (`DataStore::published_path`)
+/// with collection slugs. The profile teaser marker is stored under `profile`, so a collection with
+/// that slug would clobber it on publish — and vice versa — corrupting tier/big-relay bookkeeping
+/// and flipping `is_published("profile")` on (QURATOR-249). Reserved at scan time, the single site
+/// collection slugs are created.
+const RESERVED_MARKER_SLUGS: &[&str] = &["profile"];
+
+/// True for a charset-valid slug that is nonetheless a fixed marker key (see
+/// [`RESERVED_MARKER_SLUGS`]) and must never become a collection.
+fn is_reserved_marker_slug(slug: &str) -> bool {
+    RESERVED_MARKER_SLUGS.contains(&slug)
 }
 
 // ---------------------------------------------------------------------------
@@ -1543,14 +1587,17 @@ pub(crate) fn scan_selective(
         contained_under_root(root, c).map_err(|e| anyhow::anyhow!(e))?;
     }
     let (items, total_bytes) = scan_selective_walk(root, include, exclude)?;
-    // MAX_COLLECTION_ITEMS: enforced once, here, on the final assembled tree — the single
-    // chokepoint every scan caller goes through, so no entry point can bypass it.
+    // MAX_COLLECTION_ITEMS: enforced DURING the walk (the walker aborts the moment its running
+    // count exceeds the cap — QURATOR-253, so a many-tiny-files tree is never fully materialized
+    // just to be rejected) and again here, on the final assembled tree — the single chokepoint
+    // every scan caller goes through, so no entry point can bypass it.
     enforce_item_cap(count_items(&items)).map_err(|e| anyhow::anyhow!(e))?;
     Ok((items, total_bytes))
 }
 
 /// Pure predicate behind the [`MAX_COLLECTION_ITEMS`] guard — no filesystem, so it's testable
-/// without materializing 100,000+ real files. `scan_selective` is the only caller.
+/// without materializing 100,000+ real files. Called incrementally by `scan_selective_walk`
+/// (QURATOR-253) and once post-walk by `scan_selective` on the assembled tree.
 fn enforce_item_cap(item_count: u64) -> Result<(), String> {
     if item_count > MAX_COLLECTION_ITEMS {
         return Err(format!(
@@ -1605,6 +1652,7 @@ impl WalkFrame {
         depth: usize,
         include: &IncludeSet,
         exclude: &globset::GlobSet,
+        seen: &mut u64,
     ) -> anyhow::Result<WalkFrame> {
         let is_root = rel_prefix.is_empty();
         // Loose files are listed at the root and inside any included directory; an ancestor-only
@@ -1661,6 +1709,13 @@ impl WalkFrame {
                     note: None,
                     children: vec![],
                 });
+                // QURATOR-253: count and cap DURING the walk, not after it. The many-tiny-files
+                // shape this cap exists for is exactly the shape that must not be fully walked
+                // and materialized first — abort at item MAX_COLLECTION_ITEMS + 1 with the same
+                // error the post-walk check would give, so a hostile synced share costs at most
+                // 100,001 items, never the whole tree.
+                *seen += 1;
+                enforce_item_cap(*seen).map_err(|e| anyhow::anyhow!(e))?;
             }
         }
         Ok(frame)
@@ -1680,8 +1735,11 @@ fn scan_selective_walk(
     include: &IncludeSet,
     exclude: &globset::GlobSet,
 ) -> anyhow::Result<(Vec<DirectoryItem>, u64)> {
+    // QURATOR-253: running item count threaded through every push (files in `WalkFrame::scan`,
+    // folders below) so the cap aborts the walk instead of trailing it.
+    let mut seen: u64 = 0;
     let mut stack: Vec<WalkFrame> =
-        vec![WalkFrame::scan(root, None, "", 0, include, exclude)?];
+        vec![WalkFrame::scan(root, None, "", 0, include, exclude, &mut seen)?];
     loop {
         let next = stack
             .last_mut()
@@ -1698,6 +1756,7 @@ fn scan_selective_walk(
                     parent_depth + 1,
                     include,
                     exclude,
+                    &mut seen,
                 )?);
             }
             None => {
@@ -1722,6 +1781,11 @@ fn scan_selective_walk(
                             note: None,
                             children: finished.items,
                         });
+                        // QURATOR-253: folders are items too (`count_items` counts them), so the
+                        // running cap counts the exact same units the post-walk check does —
+                        // the in-walk abort can never diverge from it.
+                        seen += 1;
+                        enforce_item_cap(seen).map_err(|e| anyhow::anyhow!(e))?;
                     }
                     None => return Ok((finished.items, finished.total_bytes)),
                 }
@@ -1914,6 +1978,33 @@ mod collection_command_guards_a {
         assert!(
             err.contains("produces an invalid collection slug"),
             "expected the invalid-slug message, got {err}"
+        );
+    }
+
+    /// QURATOR-249: an alias that slugs to `profile` — the fixed key the profile-teaser marker
+    /// lives under in the same flat `published/<key>.json` namespace collection markers use — is
+    /// refused before any filesystem walk, so a collection publish can never clobber the teaser
+    /// marker nor flip `is_published("profile")` on. "Profile" is charset-VALID (it passes
+    /// `is_valid_slug`), so this pins the reserved-name guard specifically, not the slug-charset
+    /// one beside it.
+    ///
+    /// Mutation to redden: in `scan_directory_inner`, change the reserved-name guard
+    /// `if is_reserved_marker_slug(&slug) {` to `if false {` (or delete the whole `if` block) —
+    /// the scan then walks past the guard and fails later with "is not a directory" (the test
+    /// path does not exist), so the `contains("'profile' is a reserved name")` assert reds.
+    #[tokio::test]
+    async fn scan_directory_rejects_an_alias_that_slugs_to_the_profile_marker_key() {
+        let (_dir, app) = guard_app();
+        let opts = ScanOptions {
+            path: "/does/not/matter/for/this/guard".into(),
+            path_alias: "Profile".into(),
+            include: vec![],
+            exclude: vec![],
+        };
+        let err = scan_directory(opts, app.state::<DataStore>()).await.unwrap_err();
+        assert!(
+            err.contains("'profile' is a reserved name"),
+            "expected the reserved-name message, got {err}"
         );
     }
 
@@ -2403,6 +2494,21 @@ mod tests {
         assert!(is_valid_slug("韓国ドラマ-collection"));
     }
 
+    /// QURATOR-249: the fixed marker keys that share the flat `published/` namespace with
+    /// collection slugs are reserved — charset-valid but collision-bound. `is_valid_slug`
+    /// itself deliberately stays silent on them (lookups like delete/unpublish must keep
+    /// accepting a legacy draft), so the reservation is its own predicate.
+    ///
+    /// Mutation to redden: change `is_reserved_marker_slug`'s body to `false` (or empty
+    /// `RESERVED_MARKER_SLUGS`) — the first assert reds.
+    #[test]
+    fn reserved_marker_slugs_are_exactly_the_fixed_keys() {
+        assert!(is_reserved_marker_slug("profile"));
+        assert!(!is_reserved_marker_slug("profiles"), "prefix-sharing slug is its own key");
+        assert!(!is_reserved_marker_slug("films"));
+        assert!(!is_reserved_marker_slug(""));
+    }
+
     #[test]
     fn format_size_uses_correct_units() {
         assert_eq!(format_size(0), "0 B");
@@ -2522,6 +2628,35 @@ mod tests {
         assert!(!json.contains("x_loose.txt"));
         assert!(items.iter().all(|i| i.item_type == ItemType::File),
             "with no selection, only loose root files appear (no folders)");
+    }
+
+    /// QURATOR-253: the item cap must fire DURING the walk, not after it. A flat directory of
+    /// MAX_COLLECTION_ITEMS + 5 files is over the cap either way, but only the in-walk check can
+    /// abort at item 100,001 and say so — a post-hoc-only cap walks the whole tree first and
+    /// reports the true total (100,005). The count inside the cap error is therefore the
+    /// discriminator between enforcing during the walk and enforcing after it.
+    ///
+    /// Mutation to redden: in `WalkFrame::scan`'s file arm, delete the two lines immediately
+    /// after the `frame.items.push(DirectoryItem { ... });` for files — `*seen += 1;` and
+    /// `enforce_item_cap(*seen).map_err(|e| anyhow::anyhow!(e))?;` — the walk then completes,
+    /// the post-walk check in `scan_selective` reports "100005 items", and the "100001 items"
+    /// assert below reds. (This flat-files tree pins the FILE half of the counting; deleting the
+    /// folder half in `scan_selective_walk`'s completion arm alone does not red it, but can only
+    /// delay a folder-overflow abort back to the post-walk check — never let an over-cap tree
+    /// through, since the post-walk check counts folders too.)
+    #[test]
+    fn scan_selective_aborts_the_walk_at_the_item_cap_not_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..(MAX_COLLECTION_ITEMS + 5) {
+            std::fs::write(dir.path().join(format!("f{i:06}.txt")), b"x").unwrap();
+        }
+        let err = scan_selective(dir.path(), &include(&[]), &empty_globs())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("100001 items, over the"),
+            "expected the in-walk cap to abort at item 100001 (not the post-walk total), got: {err}"
+        );
     }
 
     /// (e) F1 containment — an `include` entry that escapes the canonicalized root is a reasoned
@@ -3580,6 +3715,24 @@ mod tests {
         assert!(err.contains("Invalid collection slug"), "got: {err}");
     }
 
+    /// QURATOR-249 (publish half): a draft slugged `profile` — which can only exist by restore or
+    /// by predating the scan-time guard — is refused at `prepare_listing`, the single validation
+    /// every publish passes through, so no path can write a collection marker over the profile
+    /// teaser marker. The draft is otherwise publishable (charset-valid slug, content types set)
+    /// so this pins the reserved-name guard specifically.
+    ///
+    /// Mutation to redden: in `prepare_listing`, change the reserved-name guard
+    /// `if is_reserved_marker_slug(safe_slug) {` to `if false {` (or delete the `if` block) —
+    /// the prepare then succeeds and the `unwrap_err` reds.
+    #[test]
+    fn prepare_listing_refuses_a_draft_in_the_reserved_marker_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        make_collection_draft(&store, "profile", vec!["Films".into()]);
+        let err = prepare_listing("profile", &store).unwrap_err();
+        assert!(err.contains("'profile' is a reserved name"), "got: {err}");
+    }
+
     #[test]
     fn prepare_listing_rejects_empty_content_types() {
         let dir = tempfile::tempdir().unwrap();
@@ -4396,6 +4549,66 @@ mod collection_command_guards_c {
         .await
         .unwrap_err();
         assert_eq!(err, "Collection 'no-such-collection' not found");
+    }
+
+    /// QURATOR-254: `path_alias` — the first line of the export — gets the audit #18 treatment
+    /// item names already get, matched to the format: control characters stripped (so the alias
+    /// forges no rows) and, for markdown, metacharacters escaped (so no live `![image]` markup).
+    /// A hostile alias (`Films\n\n![p](https://attacker.example/t.png)`) must arrive as ONE
+    /// inert line in both formats.
+    ///
+    /// Mutation to redden: in `export_collection`, revert the emission to the raw field —
+    /// change `Ok(format!("{alias}\n\n{out}"))` to
+    /// `Ok(format!("{}\n\n{}", collection.path_alias, out))` — the markdown assert on the
+    /// escaped first line reds, and the text export's line count reds (the raw alias's `\n\n`
+    /// forges two extra lines).
+    #[tokio::test]
+    async fn export_collection_neutralizes_a_hostile_path_alias() {
+        let (_dir, app) = guard_app();
+        let col = Collection {
+            slug: "films".into(),
+            path_alias: "Films\n\n![p](https://attacker.example/t.png)".into(),
+            description: None,
+            item_count: 0,
+            est_size: None,
+            content_types: vec![],
+            tags: vec![],
+            languages: vec![],
+            visibility: Visibility::Public,
+            sorted: false,
+            last_updated: chrono::Utc::now(),
+            listing: vec![],
+        };
+        app.state::<DataStore>().save_collection_draft(&col).unwrap();
+
+        // Markdown: controls stripped AND metacharacters escaped — one line, no live markup.
+        let md = export_collection("films".into(), "markdown".into(), app.state::<DataStore>())
+            .await
+            .unwrap();
+        assert_eq!(
+            md.lines().next().unwrap(),
+            "Films\\!\\[p\\]\\(https://attacker\\.example/t\\.png\\)",
+            "markdown export must escape the alias's metacharacters"
+        );
+        assert!(!md.contains("\n\n!["), "the alias may not forge a live-image row");
+
+        // Text: controls stripped — the alias is one line; markup syntax is inert in plain text
+        // and stays literal, exactly as item names behave in `render_text`.
+        let txt = export_collection("films".into(), "text".into(), app.state::<DataStore>())
+            .await
+            .unwrap();
+        assert_eq!(
+            txt.lines().next().unwrap(),
+            "Films![p](https://attacker.example/t.png)",
+            "text export must strip the alias's control characters"
+        );
+        // The trailing blank line is the export's own `{alias}\n\n{out}` separator (the listing is
+        // empty here) — the alias itself contributes exactly ONE line and forges no row.
+        assert_eq!(
+            txt,
+            "Films![p](https://attacker.example/t.png)\n\n",
+            "the alias may not forge additional rows (only the separator's blank line may follow)"
+        );
     }
 }
 
