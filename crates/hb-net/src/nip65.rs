@@ -45,6 +45,14 @@ pub fn build_relay_list(
     Ok(identity.sign(EventBuilder::relay_list(entries))?)
 }
 
+/// The most relay tags a single NIP-65 event may contribute to the local relay set (QURATOR-240).
+/// A kind-10002 event is self-published and unbounded in tag count, so a malicious peer could list
+/// thousands of relays and drive the local client into a connection-fan-out DoS against everyone
+/// who resolves them. 32 is generous for any honest peer — the default relay set is 4 entries
+/// (INV-5) and a realistic peer advertises a handful to a couple of dozen — while still bounding
+/// the fan-out from a single hostile event to a small, fixed number of connection attempts.
+const MAX_RELAYS_PER_NIP65_EVENT: usize = 32;
+
 /// Verify + parse a NIP-65 relay-list event into its read/write sets. The Schnorr signature and
 /// the kind are checked first — a tampered or wrong-kind event is refused.
 ///
@@ -52,6 +60,10 @@ pub fn build_relay_list(
 /// author, but a relay can return a validly-signed relay-list authored by someone else. A caller
 /// resolving a *specific* peer must pin `event.pubkey` to that peer's npub (the resolution fetch
 /// is already author-scoped, so this is belt-and-suspenders against a lying relay).
+///
+/// At most [`MAX_RELAYS_PER_NIP65_EVENT`] relay tags are taken from the event, in the event's own
+/// tag order (a deterministic prefix, never hash-map order) — applied here, before any tag is
+/// merged into `read`/`write`, so an over-cap event can never inflate the local relay set.
 pub fn parse_relay_list(event: &Event) -> Result<RelayList, NetError> {
     event
         .verify()
@@ -63,7 +75,7 @@ pub fn parse_relay_list(event: &Event) -> Result<RelayList, NetError> {
         )));
     }
     let mut list = RelayList::default();
-    for (url, meta) in nip65::extract_relay_list(event) {
+    for (url, meta) in nip65::extract_relay_list(event).take(MAX_RELAYS_PER_NIP65_EVENT) {
         let s = url.to_string();
         match meta {
             None => {
@@ -191,6 +203,33 @@ mod tests {
         let id = Identity::generate();
         let ev = id.sign(EventBuilder::new(Kind::TextNote, "not a relay list")).unwrap();
         assert!(matches!(parse_relay_list(&ev), Err(NetError::InvalidRelayList(_))));
+    }
+
+    #[test]
+    // mutation: at nip65.rs line 78, change `.take(MAX_RELAYS_PER_NIP65_EVENT)` to
+    // `.take(usize::MAX)` (i.e. remove the cap) — this test must fail.
+    fn parse_relay_list_truncates_an_oversized_event_to_exactly_the_cap() {
+        let id = Identity::generate();
+        let write: Vec<String> =
+            (0..(MAX_RELAYS_PER_NIP65_EVENT + 18)).map(|i| format!("wss://relay{i}.example")).collect();
+        let ev = build_relay_list(&id, &[], &write).unwrap();
+        let parsed = parse_relay_list(&ev).unwrap();
+        assert_eq!(parsed.write.len(), MAX_RELAYS_PER_NIP65_EVENT, "ingestion must stop at the cap");
+        // The cap takes a deterministic PREFIX of the event's own tag order, not an arbitrary subset.
+        let expected: Vec<String> =
+            (0..MAX_RELAYS_PER_NIP65_EVENT).map(|i| format!("wss://relay{i}.example")).collect();
+        assert_eq!(parsed.write, expected, "truncation keeps the first cap relays in tag order");
+    }
+
+    #[test]
+    // mutation: at nip65.rs line 78, change `.take(MAX_RELAYS_PER_NIP65_EVENT)` to
+    // `.take(1)` — this test must fail.
+    fn parse_relay_list_ingests_an_under_cap_event_whole_and_unchanged() {
+        let id = Identity::generate();
+        let write: Vec<String> = (0..5).map(|i| format!("wss://relay{i}.example")).collect();
+        let ev = build_relay_list(&id, &[], &write).unwrap();
+        let parsed = parse_relay_list(&ev).unwrap();
+        assert_eq!(parsed.write, write, "an event under the cap is ingested unchanged");
     }
 
     #[test]
