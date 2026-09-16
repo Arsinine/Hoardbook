@@ -76,20 +76,30 @@ fn http_client() -> Result<reqwest::Client, String> {
 }
 
 /// GET `url` with a hard size cap: a declared `Content-Length` over `max` is refused before the body
-/// is read, and the buffered body is re-checked as a backstop. HTTPS/host trust of `url` is the
-/// caller's responsibility ([`is_trusted_artifact_url`]).
+/// is read (a cheap early refusal against an honest-but-large response), and the cap is then enforced
+/// INCREMENTALLY while the body streams in — the running total is checked after every chunk, so a
+/// response that omits or understates `Content-Length` can never buffer more than `max` bytes before
+/// being refused (security review: QURATOR-237). HTTPS/host trust of `url` is the caller's
+/// responsibility ([`is_trusted_artifact_url`]).
 async fn fetch_capped(client: &reqwest::Client, url: &str, max: u64) -> Result<Vec<u8>, String> {
-    let resp = client.get(url).send().await.map_err(cmd_err)?.error_for_status().map_err(cmd_err)?;
+    let mut resp =
+        client.get(url).send().await.map_err(cmd_err)?.error_for_status().map_err(cmd_err)?;
     if let Some(len) = resp.content_length() {
         if len > max {
             return Err(format!("update download too large ({len} bytes; cap {max})"));
         }
     }
-    let bytes = resp.bytes().await.map_err(cmd_err)?;
-    if bytes.len() as u64 > max {
-        return Err(format!("update download exceeded the {max}-byte cap"));
+    // Capacity hint from the declared length, but never above `max` — a falsified `Content-Length`
+    // must not be able to force a huge allocation via this hint.
+    let hint = resp.content_length().unwrap_or(0).min(max);
+    let mut bytes = Vec::with_capacity(hint as usize);
+    while let Some(chunk) = resp.chunk().await.map_err(cmd_err)? {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() as u64 > max {
+            return Err(format!("update download exceeded the {max}-byte cap"));
+        }
     }
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 #[derive(Serialize)]
@@ -361,6 +371,163 @@ mod tests {
             !attacker_hit.load(Ordering::SeqCst),
             "the client contacted the untrusted redirect target — the redirect policy is absent or not refusing cross-host hops"
         );
+    }
+
+    // ── QURATOR-237 — `fetch_capped` must enforce its cap INCREMENTALLY, never buffer-then-check ──
+    //
+    // Same raw-socket harness shape as the redirect test above: a loopback `TcpListener` hand-writes
+    // a real HTTP/1.1 response so we can control `Content-Length` (or its absence) independently of
+    // the actual body size, which is exactly what a buffer-then-check implementation cannot be
+    // distinguished from by any test that only controls a truthful server.
+
+    /// A response with NO `Content-Length` and a body far over `max`: the only thing that can ever
+    /// refuse this is the incremental running-total check inside the streaming loop — there is no
+    /// declared length for a pre-check to act on.
+    ///
+    /// mutation: production `fetch_capped` (this file), the running-total comparison inside the
+    /// `while let Some(chunk) = resp.chunk()...` loop — currently at line 98. Disabling or removing
+    /// that check must red this test.
+    #[tokio::test]
+    async fn fetch_capped_refuses_a_content_length_less_oversized_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use std::time::Duration;
+
+        let max: u64 = 1024;
+        let body = vec![b'A'; 1 << 20]; // 1 MiB, far over `max`, no Content-Length header at all.
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await; // drain the request
+                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n").await;
+                let _ = sock.write_all(&body).await;
+            }
+        });
+
+        let client = super::http_client().expect("client builds");
+        let url = format!("http://{addr}/portable.json");
+        let result = tokio::time::timeout(Duration::from_secs(5), super::fetch_capped(&client, &url, max))
+            .await
+            .expect("fetch_capped must not hang");
+
+        assert!(
+            result.is_err(),
+            "an oversized, Content-Length-less body must be refused, not buffered into an Ok"
+        );
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+    }
+
+    /// **Chunked** transfer-encoding: the body carries NO declared length at all, so nothing bounds
+    /// it but our own running total. This is the real shape of the QURATOR-237 threat.
+    ///
+    /// ⚠ The originally-drafted version of this test used an *understated* `Content-Length` (declared
+    /// 500, sent 1 MiB) and FAILED — correctly. HTTP/1.1 framing makes `Content-Length` the message
+    /// body's definitive length, so hyper stops reading at 500 bytes and discards the rest: the
+    /// client never sees more than the declared amount, `fetch_capped` returns `Ok`, and there is no
+    /// memory-exhaustion vector to defend against. An understated header is a *framing* violation the
+    /// transport already handles; only an OVERSTATED one (caught by the pre-check) or an unbounded
+    /// body (caught here) can actually make us buffer. Do not "fix" this by reinstating that case.
+    ///
+    /// mutation: production `fetch_capped` (this file), the running-total comparison inside the
+    /// `while let Some(chunk) = resp.chunk()...` loop — currently at line 98. Disabling or removing
+    /// that check must red this test, since no `Content-Length` exists for the pre-check to act on.
+    #[tokio::test]
+    async fn fetch_capped_refuses_an_unbounded_chunked_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use std::time::Duration;
+
+        let max: u64 = 1024;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await; // drain the request
+                let header =
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                if sock.write_all(header.as_bytes()).await.is_err() {
+                    return;
+                }
+                // 4 KiB chunks, unbounded — keep going until the client hangs up, which is exactly
+                // what the cap is supposed to make happen well before memory is exhausted.
+                let chunk = vec![b'C'; 4096];
+                loop {
+                    if sock.write_all(format!("{:x}\r\n", chunk.len()).as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if sock.write_all(&chunk).await.is_err() {
+                        return;
+                    }
+                    if sock.write_all(b"\r\n").await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+        let client = super::http_client().expect("client builds");
+        let url = format!("http://{addr}/portable.json");
+        let result = tokio::time::timeout(Duration::from_secs(5), super::fetch_capped(&client, &url, max))
+            .await
+            .expect("fetch_capped must not hang — the cap must fire mid-stream");
+
+        assert!(
+            result.is_err(),
+            "an unbounded chunked body must be refused mid-stream, before it is fully buffered"
+        );
+
+        server.abort();
+    }
+
+    /// A response under the cap, with an accurate `Content-Length`: must still succeed, with the
+    /// returned bytes byte-identical to what the server sent — the streaming rewrite must not
+    /// change the happy path.
+    ///
+    /// mutation: production `fetch_capped` (this file), the accumulation step inside the streaming
+    /// loop — currently at line 97 (`bytes.extend_from_slice(&chunk)`). Removing it (or returning a
+    /// value other than the accumulated `bytes`) must red this test while leaving the two oversized-
+    /// body tests above unaffected.
+    #[tokio::test]
+    async fn fetch_capped_succeeds_for_a_response_under_the_cap() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use std::time::Duration;
+
+        let max: u64 = 1024;
+        let body = b"HELLO PORTABLE UPDATE BYTES".to_vec();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let expected = body.clone();
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await; // drain the request
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+            }
+        });
+
+        let client = super::http_client().expect("client builds");
+        let url = format!("http://{addr}/portable.json");
+        let result = tokio::time::timeout(Duration::from_secs(5), super::fetch_capped(&client, &url, max))
+            .await
+            .expect("fetch_capped must not hang");
+
+        assert_eq!(
+            result.expect("an under-cap response must still succeed"),
+            expected,
+            "the returned bytes must be byte-identical to what the server sent"
+        );
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
     }
 
     // ── QURATOR-181 item 1 — the guards' ORDER at the call site ────────────────────────────────
