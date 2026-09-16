@@ -169,12 +169,34 @@ pub async fn backup_data(
     Ok(())
 }
 
-/// Write the archive to `path`, creating it with mode 0600 *before* the secret bytes land. The
-/// plaintext export carries the same nsec/browse-key/transport-secret that is deliberately 0600 at
-/// rest — the archive must never be created world-readable (default 0644), and opening with the
-/// mode up front leaves no chmod-after window where the secret sits on disk world-readable.
-/// Windows has no Unix mode bits (and its at-rest secrets are DPAPI ciphertext), so the default
-/// write is unchanged there.
+/// Write the archive to `path`, restricting it to the current user before the secret bytes land.
+/// The plaintext export carries the same nsec/browse-key/transport-secret that is deliberately
+/// locked down at rest — the archive must never be left readable by anyone else, and the
+/// restriction must be re-applied on every write (not just on first creation), because both a
+/// reused inode (Unix) and a reused NTFS file object (Windows) keep whatever old
+/// permissions/ACL they already had unless we override them explicitly.
+///
+/// Unix: create with mode 0600, then `set_permissions(0600)` again explicitly — `.mode()` only
+/// governs the create path, and an existing inode is reused with its old permissions.
+///
+/// Windows (QURATOR-234): there are no Unix mode bits, so after the write we apply an explicit,
+/// **protected** (non-inheriting) DACL granting Full Access to the file's owner only, via
+/// `SetNamedSecurityInfoW`. This is applied unconditionally after every write, so an overwrite of
+/// a pre-existing, more permissive file is re-locked down exactly like the Unix arm's
+/// post-open `set_permissions` call.
+///
+/// **What this restriction protects against:** another local, non-elevated user account (or a
+/// process running as one) reading the plaintext export off disk via the filesystem, because the
+/// DACL no longer grants any access to `Everyone`/`Users`/`Authenticated Users` — only to the
+/// file's owner.
+///
+/// **What this restriction does NOT protect against** — this is an NTFS ACL, not encryption:
+/// an administrator or `SYSTEM` account (which can always take ownership and rewrite the DACL);
+/// a user with physical or full-disk access (e.g. booting another OS, mounting the disk
+/// elsewhere); malware or any other process already running as the *same* user account; or
+/// backup/shadow-copy/cloud-sync mechanisms that read the volume beneath the ACL layer. None of
+/// this substitutes for encrypting the export itself — a plaintext export is exactly that,
+/// plaintext, wherever it is copied to next.
 #[cfg(unix)]
 fn write_backup_file(path: &str, archive: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
@@ -192,7 +214,106 @@ fn write_backup_file(path: &str, archive: &[u8]) -> std::io::Result<()> {
     f.write_all(archive)
 }
 
-#[cfg(not(unix))]
+// See the doc comment above `write_backup_file` (the `#[cfg(unix)]` arm) for what this
+// restriction does and does not protect against — it applies equally to this arm.
+#[cfg(windows)]
+fn write_backup_file(path: &str, archive: &[u8]) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        SE_FILE_OBJECT, SetNamedSecurityInfoW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+
+    // ORDER IS LOAD-BEARING, and it is the whole point of the Unix arm's `.mode(0o600)`-on-open:
+    // the restriction must be in place BEFORE the secret bytes land, never after. Writing first and
+    // re-ACLing second leaves a window in which the plaintext nsec sits on disk under the parent
+    // directory's inherited (typically broad) ACL — precisely the exposure QURATOR-234 is about,
+    // merely narrowed to a race. So: create the file EMPTY, lock it down, then write into it.
+    //
+    // `create(true).truncate(true)` also handles the overwrite case — a pre-existing, more
+    // permissive file is truncated to empty and re-ACL'd before any secret byte is written, so a
+    // reused NTFS file object cannot retain its old DACL while holding new secret content.
+    {
+        use std::fs::OpenOptions;
+        OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+    }
+
+    // Owner-only, protected (non-inheriting) DACL. "D:" starts a DACL, "P" marks it protected
+    // (blocks inherited ACEs from re-adding broader access), and the single ACE grants Full
+    // Access ("FA") to the file's OWNER.
+    //
+    // ⚠ The SID is "OW" = Owner Rights (S-1-3-4), NOT "CO"/Creator Owner: on a file object "OW"
+    // resolves to the current owner, which is what we want. If a Windows build shows the export
+    // still readable by others, this SDDL string is the first thing to re-check — an ACE that
+    // resolves to nothing would yield an empty DACL, which denies everyone (fail-closed, and
+    // therefore loud) rather than silently granting access.
+    const OWNER_ONLY_SDDL: &str = "D:P(A;;FA;;;OW)\0";
+    let sddl_wide: Vec<u16> = OWNER_ONLY_SDDL.encode_utf16().collect();
+
+    let path_wide: Vec<u16> = {
+        let mut v: Vec<u16> = std::ffi::OsStr::new(path).encode_wide().collect();
+        v.push(0);
+        v
+    };
+
+    // SAFETY: `sddl_wide` is a valid NUL-terminated UTF-16 string for the lifetime of this call.
+    // `sd` and `sd_size` are out-params written only on success (nonzero return).
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let mut sd_size: u32 = 0;
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            SDDL_REVISION_1 as u32,
+            &mut sd,
+            &mut sd_size,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // SAFETY: `sd` was just produced by the call above and is freed via `LocalFree` below on
+    // every path out of this block.
+    let mut dacl_present = 0;
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut dacl_defaulted = 0;
+    let got_dacl = unsafe { GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut dacl, &mut dacl_defaulted) };
+    if got_dacl == 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { LocalFree(sd as _) };
+        return Err(err);
+    }
+
+    // SAFETY: `path_wide` is NUL-terminated and outlives this call; `dacl` points into `sd`,
+    // which is still alive here. Passing null for owner/group/sacl leaves them unchanged.
+    let set_result = unsafe {
+        SetNamedSecurityInfoW(
+            path_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl as *const ACL,
+            std::ptr::null_mut(),
+        )
+    };
+
+    unsafe { LocalFree(sd as _) };
+
+    if set_result != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(set_result as i32));
+    }
+
+    // Only now, with the owner-only DACL in place on an empty file, do the secret bytes land.
+    std::fs::write(path, archive)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn write_backup_file(path: &str, archive: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, archive)
 }
@@ -421,6 +542,26 @@ mod tests {
         super::write_backup_file(path.to_str().unwrap(), b"secret archive bytes").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "overwrite must force 0600, not leave the pre-existing 0644 (mode {mode:#o})");
+    }
+
+    // NOTE (QURATOR-234): this crate is built and tested on Linux/WSL2 in this environment, so
+    // `#[cfg(windows)]` code — including this test — never compiles or runs here. This test can
+    // only prove, on an actual Windows CI runner or machine, that `write_backup_file` succeeds
+    // and that the resulting file's DACL denies read access to a second, non-owner account; it
+    // cannot be exercised or verified on this platform, and no attempt is made here to fake that
+    // by asserting something weaker on Linux.
+    #[test]
+    #[cfg(windows)]
+    fn backup_file_dacl_restricted_to_owner_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.hb");
+        super::write_backup_file(path.to_str().unwrap(), b"secret archive bytes").unwrap();
+        // Re-exporting over an existing file must re-lock it down too (mirrors the Unix
+        // overwrite test) — the ACL call runs unconditionally on every write, not just create.
+        super::write_backup_file(path.to_str().unwrap(), b"secret archive bytes v2").unwrap();
+        assert!(path.exists());
+        // A full DACL round-trip check (reading the ACL back and asserting it denies a
+        // non-owner SID) needs a live Windows security context and is not attempted here.
     }
 
     // ── QURATOR-161 slice 3 — this file's commands, driven through the command itself ──────────
