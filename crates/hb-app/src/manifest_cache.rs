@@ -162,6 +162,44 @@ fn eviction_plan(entries: &[(String, usize, u64)], cap: usize) -> Vec<String> {
     evict
 }
 
+/// Per-directory write locks for the cache. Hoisted to MODULE scope — a per-function static is
+/// never shared across callers (CLAUDE.md §9, the same rule [`MIGRATED`] follows) — and keyed by
+/// directory because every mutation of one cache directory races only its siblings: `put`'s
+/// staged write+rename, `get_inner`'s recency write-back, and the legacy migration's
+/// canonical-slot rename (QURATOR-262/273/274). One lock per directory is per-key granularity
+/// in practice: the cache holds one file per `(npub, slug)` and production uses one directory.
+///
+/// ⚠ **Never nest.** std's `Mutex` is not reentrant, so no code path may take a directory lock
+/// while already holding one. The shapes here are flat — `put` runs its migration BEFORE
+/// acquiring — keep any new call site flat too.
+static DIR_WRITE_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
+
+/// This directory's write lock, cloned out under a brief hold of the registry lock (so the
+/// registry itself is never held across a cache write).
+fn dir_write_lock(dir: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    let registry = DIR_WRITE_LOCKS.get_or_init(Default::default);
+    let mut map = registry.lock().unwrap_or_else(|p| p.into_inner());
+    map.entry(dir.to_path_buf()).or_default().clone()
+}
+
+/// Serial for unique staged-file names. Module-scope for the same hoisting rule as
+/// [`DIR_WRITE_LOCKS`]: every writer on every thread draws from ONE sequence.
+static TMP_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The sibling temp path an atomic write stages into: `<name>.json.tmp.<pid>.<seq>` — the same
+/// shape as `store.rs`'s `tmp_path`. The per-call sequence keeps concurrent same-key writers from
+/// sharing a stage file: `std::fs::write` truncates, so two writers in ONE shared `.tmp` name can
+/// interleave into a corrupt entry that `scan` then silently skips (QURATOR-274); the pid
+/// isolates processes. A staged name never ends `.json`, so `scan` stays blind to it.
+fn fresh_tmp_path(final_path: &Path) -> PathBuf {
+    let seq = TMP_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = final_path.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
+    name.push(format!(".tmp.{}.{seq}", std::process::id()));
+    final_path.with_file_name(name)
+}
+
 /// Cache a manifest envelope under `(npub, slug, fingerprint)`, then enforce the byte cap by evicting
 /// least-recently-used entries. Best-effort: a write or eviction I/O error is returned but never
 /// corrupts the store (each entry is an independent file). `now` is the write's access time.
@@ -188,11 +226,21 @@ pub fn put(
     // Replace ATOMICALLY. This file is the only offline copy, and `put` now overwrites an existing
     // one — a crash midway through a plain write would destroy the old copy without landing the new,
     // leaving the user with neither. Write beside it, then rename (atomic within a filesystem). The
-    // temp name ends `.tmp`, which `scan` skips, so a stranded temp is never mistaken for an entry.
+    // staged name is UNIQUE per call (`.tmp.<pid>.<seq>`, never ending `.json`), so `scan` stays
+    // blind to it and two concurrent same-key writers never truncate each other's staged bytes
+    // (QURATOR-274).
     let final_path = dir.join(entry_filename(npub, slug));
-    let tmp_path = final_path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &bytes)?;
-    std::fs::rename(&tmp_path, &final_path)?;
+    let tmp_path = fresh_tmp_path(&final_path);
+    // Hold the directory's write lock across stage+rename so the swap is serialized against a
+    // concurrent `get`'s recency write-back and the legacy migration's rename — without it, that
+    // write-back can land AFTER this rename and revert the cache to its pre-read bytes
+    // (QURATOR-262). (`migrate_legacy_entries` above ran BEFORE this acquisition — no nesting.)
+    {
+        let lock = dir_write_lock(dir);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        std::fs::write(&tmp_path, &bytes)?;
+        std::fs::rename(&tmp_path, &final_path)?;
+    }
 
     // Only walk the directory when a caller actually asked for a ceiling. `scan` READS EVERY CACHED
     // MANIFEST to build its plan, so running it at the unbounded default would make each write cost
@@ -242,6 +290,12 @@ fn get_inner(
     fingerprint: Option<&str>,
     now: u64,
 ) -> Option<String> {
+    // Hold the directory's write lock across the WHOLE read-modify-write (QURATOR-262). The
+    // recency bump below rewrites the entire entry file; without the lock, a `put` landing
+    // between this read and that write-back would be clobbered by the stale pre-read bytes,
+    // silently reverting the cache to a superseded snapshot.
+    let lock = dir_write_lock(dir);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
     let path = dir.join(entry_filename(npub, slug));
     let bytes = std::fs::read(&path).ok()?;
     let mut entry: CacheEntry = serde_json::from_slice(&bytes).ok()?;
@@ -253,10 +307,14 @@ fn get_inner(
         return None;
     }
     let envelope = entry.envelope.clone();
-    // Bump recency (best-effort — a failed touch doesn't fail the read).
+    // Bump recency (best-effort — a failed touch doesn't fail the read), with `put`'s own
+    // discipline: stage beside and rename ATOMICALLY, never truncate the live entry in place —
+    // a torn in-place write would destroy the only offline copy (INV-8).
     entry.last_access = now;
     if let Ok(updated) = serde_json::to_vec(&entry) {
-        let _ = std::fs::write(&path, &updated);
+        let tmp_path = fresh_tmp_path(&path);
+        let _ =
+            std::fs::write(&tmp_path, &updated).and_then(|()| std::fs::rename(&tmp_path, &path));
     }
     Some(envelope)
 }
@@ -370,7 +428,8 @@ const MIGRATION_MARKER: &str = ".hb-migrated-v1";
 /// Best-effort, matching `put`: a single failed rename or unlink skips that entry and carries on;
 /// nothing is propagated as a hard error that could break browsing. Runs once per process per
 /// directory (see [`MIGRATED`]), invoked from [`put`]. The work itself lives in
-/// [`migrate_legacy_dir`], unguarded, so the tests can run it twice for idempotency.
+/// [`migrate_legacy_dir`], free of the single-flight guard (so the tests can run it twice for
+/// idempotency) but serialized against cache writers by the directory write lock.
 fn migrate_legacy_entries(dir: &Path) {
     // Marker first: once a directory has completed a pass, the sentinel alone short-circuits, so
     // steady state is one `exists()` per process — not a full `scan` on every first launch.
@@ -394,7 +453,9 @@ fn migrate_legacy_entries(dir: &Path) {
     let _ = std::fs::write(dir.join(MIGRATION_MARKER), b"");
 }
 
-/// The migration work, unguarded — see [`migrate_legacy_entries`] for the rationale and posture.
+/// The migration work — outside the single-flight guard (so the tests can run it twice for
+/// idempotency) but under the directory write lock for its canonical-slot claim. See
+/// [`migrate_legacy_entries`] for the rationale and posture.
 fn migrate_legacy_dir(dir: &Path) {
     // Group legacy files by the key they themselves claim. A malformed/unreadable file never
     // reaches here (scan skips it) and is therefore left alone — it is indistinguishable from a
@@ -406,6 +467,12 @@ fn migrate_legacy_dir(dir: &Path) {
             by_key.entry((npub, slug)).or_default().push((name, last_access));
         }
     }
+    // Claim the canonical slot under the directory write lock (QURATOR-273): the exists-check and
+    // the rename below must be indivisible w.r.t. `put`, or a fresh entry landing between them is
+    // overwritten by the legacy copy. (`put` calls its migration BEFORE taking this lock — no
+    // nesting.)
+    let lock = dir_write_lock(dir);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
     for ((npub, slug), mut group) in by_key {
         let canonical = entry_filename(&npub, &slug);
         // The survivor, if a rename is needed: the NEWEST legacy copy by `last_access`. The rename
@@ -681,8 +748,10 @@ mod tests {
         assert_eq!(get(dir.path(), "npubA", "films", "fp2", 50).as_deref(), Some("NEW"));
     }
 
-    /// No `.tmp` file survives a successful write — a stranded temp would be invisible to `scan`
-    /// (wrong extension) and so would leak silently.
+    /// No staged `.tmp` file survives a successful write — a stranded temp would be invisible to
+    /// `scan` (wrong extension) and so would leak silently. Matched on the name CONTAINING
+    /// `.tmp.` (the `store.rs` predicate), not the extension: staged names are
+    /// `<hash>.json.tmp.<pid>.<seq>`, whose extension is the trailing sequence number.
     ///
     /// MUTATION (P-10): replace the write+rename pair in `put` with a direct
     /// `std::fs::write(&final_path, &bytes)?` and delete the rename — this test still passes, so it
@@ -695,7 +764,12 @@ mod tests {
         let strays: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .flatten()
-            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("tmp"))
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(".tmp."))
+            })
             .collect();
         assert!(strays.is_empty(), "a stranded .tmp is invisible to scan and leaks silently");
     }
@@ -967,6 +1041,143 @@ mod tests {
         migrate_legacy_entries(dir.path());
         assert!(planted.exists(), "the marker must suppress the pass — no rename happened");
         assert!(get(dir.path(), "npubB", "music", "fp2", 250).is_none(), "no canonical file was created");
+    }
+
+    // ── QURATOR-262/273/274: write atomicity under concurrency ────────────────────────────
+    //
+    // CLAUDE.md §5 scoping: same as the migration section above — a local on-disk cache touches
+    // no relay/transport/presence/DM/discovery/crypto trigger, so these unit tests are the gate.
+    //
+    // The two lock tests hold the SAME per-directory lock production takes (via the private
+    // `dir_write_lock`), which is the one seam that makes a race test deterministic: they assert
+    // the production call BLOCKS while the lock is held, instead of trying to win a scheduling
+    // race. The 100 ms `recv_timeout` window is not the measurement — it only bounds how long the
+    // test waits for a signal that must never arrive while the fix is in place.
+
+    /// QURATOR-274: every staged write must draw a UNIQUE temp path. `std::fs::write` truncates,
+    /// so two concurrent same-key `put`s sharing one stage file can interleave into a corrupt
+    /// entry that `scan` then silently skips — the collection vanishes from `list()` with no
+    /// error anywhere.
+    ///
+    /// MUTATION (P-10) — resolved by containing item: in `fresh_tmp_path`, delete the `seq` use
+    /// and push a FIXED suffix instead — `name.push(format!(".tmp.{}.fixed", std::process::id()))`
+    /// (the pid alone does not distinguish same-process writers, which is exactly the
+    /// QURATOR-274 shape; reverting `put` to `with_extension("json.tmp")` is the same mutation).
+    /// Two successive calls then return the SAME path and `assert_ne!` reds. The scan-blindness
+    /// assertions stay green under it — uniqueness is the control.
+    #[test]
+    fn staged_temp_paths_are_unique_per_write() {
+        let final_path = PathBuf::from("/cache/0123abcd.json");
+        let a = fresh_tmp_path(&final_path);
+        let b = fresh_tmp_path(&final_path);
+        assert_ne!(a, b, "two staged writes must never share one temp file");
+        // Both stage BESIDE the target (same directory — the rename never crosses a filesystem)...
+        assert_eq!(a.parent(), final_path.parent());
+        assert_eq!(b.parent(), final_path.parent());
+        // ...and both are invisible to `scan`, which admits only `.json` names: a staged file
+        // must never be mistaken for an entry.
+        assert_ne!(a.extension().and_then(|e| e.to_str()), Some("json"));
+        assert_ne!(b.extension().and_then(|e| e.to_str()), Some("json"));
+    }
+
+    /// QURATOR-262: `get_inner`'s recency bump is a read-modify-write of the WHOLE entry file,
+    /// and must hold the directory write lock across the read-to-write-back span — otherwise a
+    /// `put` landing inside that window is clobbered by the pre-read bytes and the cache silently
+    /// reverts to a superseded snapshot. The write-back must also be a stage+rename, never a
+    /// truncating in-place write of the only offline copy (INV-8).
+    ///
+    /// MUTATION (P-10) — resolved by containing item, anchor by POSITION not text (the same
+    /// `lock.lock()` line appears in `put` and `migrate_legacy_dir`, and quoting it here would
+    /// make a blind text-replace hit this comment): in `get_inner`, delete the two-line
+    /// acquisition that is the FIRST statement of the body (`let lock = dir_write_lock(dir);`
+    /// then the `let _guard = lock.lock()...` line). The spawned `get` then no longer blocks on
+    /// the lock this test holds — it finishes a one-file, ~100-byte entry in well under the
+    /// 100 ms window — so `recv_timeout` returns `Ok` and the `is_err()` assertion reds. The
+    /// post-release assertions can stay green under it; the blocking witness is the control.
+    #[test]
+    fn the_recency_bump_is_serialized_against_concurrent_puts() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "npubA", "films", "fp1", "ENV", 10, DEFAULT_MANIFEST_CACHE_BYTES).unwrap();
+
+        // The test owns the directory write lock — exactly the state an in-flight `put`'s
+        // critical section leaves the cache in.
+        let lock = dir_write_lock(dir.path());
+        let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cache_dir = dir.path().to_path_buf();
+        let reader = std::thread::spawn(move || {
+            let got = get(&cache_dir, "npubA", "films", "fp1", 200);
+            let _ = tx.send(());
+            got
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
+            "get must hold the directory write lock across its read-modify-write — it may not complete while another writer holds it"
+        );
+        drop(guard);
+        let got = reader.join().unwrap();
+        assert_eq!(got.as_deref(), Some("ENV"));
+
+        // The bumped entry is healthy on disk afterwards: still readable, and the write-back
+        // overwrote in place rather than accumulating a second file.
+        assert_eq!(get(dir.path(), "npubA", "films", "fp1", 300).as_deref(), Some("ENV"));
+        assert_eq!(entry_snapshot(dir.path()).len(), 1, "the bump must overwrite in place");
+    }
+
+    /// QURATOR-273: the migration's exists-then-rename claims the canonical slot, and must do so
+    /// under the directory write lock — otherwise a `put` landing between the `exists()` check
+    /// and the rename is overwritten by the legacy copy (a just-accepted manifest silently
+    /// discarded from the cache).
+    ///
+    /// MUTATION (P-10) — resolved by containing item, anchor by POSITION not text: in
+    /// `migrate_legacy_dir`, delete the two-line acquisition immediately AFTER the grouping loop
+    /// and BEFORE the `for ((npub, slug), mut group) in by_key` loop (`let lock =
+    /// dir_write_lock(dir);` then the `let _guard = lock.lock()...` line). The spawned migration
+    /// then runs unguarded over a one-file directory and completes in well under the 100 ms
+    /// window, so `recv_timeout` returns `Ok` and the `is_err()` assertion reds. (Under that
+    /// mutation the outcome assertions below can still pass — the test's canonical write lands
+    /// after either ordering — the blocking witness is the control.)
+    #[test]
+    fn the_migration_rename_is_serialized_against_concurrent_puts() {
+        let dir = tempfile::tempdir().unwrap();
+        plant_legacy(dir.path(), "npubA", "films", "fp1", "ENV-LEGACY", 100);
+
+        let lock = dir_write_lock(dir.path());
+        let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cache_dir = dir.path().to_path_buf();
+        let migrator = std::thread::spawn(move || {
+            migrate_legacy_dir(&cache_dir);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
+            "the migration's canonical-slot claim must hold the directory write lock"
+        );
+        // While it waits, a canonical file for the same key appears — the exact interleaving
+        // QURATOR-273 describes (a concurrent `put` landing inside the exists-to-rename window).
+        // Written directly with `write_entry` because `put` itself would block on the very lock
+        // the test holds.
+        write_entry(
+            dir.path(),
+            &entry_filename("npubA", "films"),
+            "npubA",
+            "films",
+            "fp2",
+            "ENV-FRESH",
+            300,
+        );
+        drop(guard);
+        migrator.join().unwrap();
+
+        // The released migration sees the canonical file and must NOT rename the legacy copy
+        // over it; the legacy straggler is deleted either way.
+        assert_eq!(
+            get_latest(dir.path(), "npubA", "films", 400).as_deref(),
+            Some("ENV-FRESH"),
+            "the migration must not clobber a canonical file that appeared while it waited"
+        );
+        assert_eq!(entry_snapshot(dir.path()).len(), 1, "exactly the canonical file remains");
     }
 
     // QURATOR-176 — the global, all-or-nothing clear.
