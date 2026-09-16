@@ -23,7 +23,7 @@ use hb_core::topic::{
     Announcement, ChannelItem, NonceSet, Post, TopicKey, TopicMeta, KIND_TOPIC_ANNOUNCE,
     KIND_TOPIC_MEMBER, KIND_TOPIC_POST,
 };
-use hb_core::Identity;
+use hb_core::{FUTURE_SKEW_SECS, Identity};
 use nostr::nips::nip09::EventDeletionRequest;
 use nostr::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -323,8 +323,16 @@ fn event_identifier(ev: &Event) -> Option<&str> {
 /// `expected_topic_id`: a validly-signed announce whose payload names a different topic than the one
 /// being looked up must never satisfy the lookup, however recent it is — otherwise a relay (malicious,
 /// buggy, or merely returning a broader result than the filter asked for) could make an unrelated,
-/// attacker-controlled announce shadow the real one for a queried `topic_id`.
-fn newest_announce(events: Vec<Event>, expected_topic_id: &str) -> Option<TopicMeta> {
+/// attacker-controlled announce shadow the real one for a queried `topic_id`. **Or** if its
+/// `created_at` lies beyond `now + FUTURE_SKEW_SECS` (QURATOR-246): ranked purely by `created_at`,
+/// one far-future-dated announce — validly signed by any key, announces being unpermissioned —
+/// would permanently win the "newest" ranking and shadow every legitimate metadata update for that
+/// `topic_id`, indefinitely. Dropped, not clamped, matching the admission posture of
+/// `hb_core::binding` (reject past the skew) and `hb_core::count` (drop past the skew); a clamp to
+/// the ceiling would still rank the attacker's announce above every legitimate one (all ≤ now),
+/// i.e. would not fix the shadowing. The tolerance itself is the single shared definition imported
+/// from `hb_core`, never re-declared here.
+fn newest_announce(events: Vec<Event>, expected_topic_id: &str, now: u64) -> Option<TopicMeta> {
     let mut best: Option<(u64, TopicMeta)> = None;
     for ev in events {
         if let Ok(meta) = parse_announce(&ev) {
@@ -332,6 +340,11 @@ fn newest_announce(events: Vec<Event>, expected_topic_id: &str) -> Option<TopicM
                 continue;
             }
             let ts = ev.created_at.as_secs();
+            // Future-skew gate (QURATOR-246): never trust the relay's/event's clock past the shared
+            // tolerance — `binding`/`count` already judge presence this way.
+            if ts > now.saturating_add(FUTURE_SKEW_SECS) {
+                continue;
+            }
             match &best {
                 Some((prev, _)) if *prev >= ts => {}
                 _ => best = Some((ts, meta)),
@@ -345,7 +358,8 @@ fn newest_announce(events: Vec<Event>, expected_topic_id: &str) -> Option<TopicM
 /// so a caller can check "does this public name already have a room?" **before** minting a new Topic
 /// — otherwise two people who independently pick the same name fork into two cryptographically
 /// distinct rooms (same `topic_id`, different `topic_key`, Decision C). `None` means no announce was
-/// found (the name is free), never an error.
+/// found (the name is free) — including when every candidate announce was dropped by the future-skew
+/// gate in [`newest_announce`] — never an error.
 pub async fn fetch_announce(
     client: &RelayClient,
     topic_id: &str,
@@ -353,7 +367,10 @@ pub async fn fetch_announce(
 ) -> Result<Option<TopicMeta>, NetError> {
     let filter = Filter::new().kind(Kind::from_u16(KIND_TOPIC_ANNOUNCE)).identifier(topic_id.to_string());
     let events = client.fetch(filter, timeout).await?;
-    Ok(newest_announce(events, topic_id))
+    // The skew gate is judged against OUR clock, read once at ranking time (same "never trust the
+    // relay's clock" posture as `hb_core::count::fresh_presence`); `now` stays injectable in the pure
+    // half so tests pin it instead of the wall.
+    Ok(newest_announce(events, topic_id, Timestamp::now().as_secs()))
 }
 
 /// The **best-effort, spoofable** pre-join member count = the number of distinct `KIND_TOPIC_MEMBER`
@@ -789,7 +806,8 @@ mod tests {
 
     #[test]
     fn newest_announce_is_none_for_an_empty_batch() {
-        assert_eq!(newest_announce(vec![], "some-topic-id"), None);
+        let now = 1_700_000_000u64;
+        assert_eq!(newest_announce(vec![], "some-topic-id", now), None);
     }
 
     #[test]
@@ -797,11 +815,13 @@ mod tests {
         use hb_core::topic::build_announce;
         let (meta, _key) = new_topic("video/hbnet-lookup-test", "old desc", vec![], false).unwrap();
         let author = Identity::generate();
-        let old = build_announce(&author, &meta, 1_700_000_000).unwrap();
+        // Fixture stamps are pinned to the test's own `now`, never the wall clock.
+        let now = 1_700_000_100u64;
+        let old = build_announce(&author, &meta, now - 100).unwrap();
         let mut newer_meta = meta.clone();
         newer_meta.description = "new desc".into();
-        let new = build_announce(&author, &newer_meta, 1_700_000_100).unwrap();
-        let picked = newest_announce(vec![old, new], &meta.topic_id).unwrap();
+        let new = build_announce(&author, &newer_meta, now).unwrap();
+        let picked = newest_announce(vec![old, new], &meta.topic_id, now).unwrap();
         assert_eq!(picked.description, "new desc", "the newest (by created_at) announce wins");
         assert_eq!(picked.topic_id, meta.topic_id);
     }
@@ -811,7 +831,10 @@ mod tests {
         use hb_core::topic::build_announce;
         let (meta, _key) = new_topic("video/hbnet-lookup-junk", "", vec![], false).unwrap();
         let author = Identity::generate();
-        let good = build_announce(&author, &meta, 1_700_000_000).unwrap();
+        // The junk event never reaches the skew gate (it fails `parse_announce` on kind first), so
+        // whatever `build_teaser` stamps is irrelevant; the good announce is pinned to the test's now.
+        let now = 1_700_000_000u64;
+        let good = build_announce(&author, &meta, now).unwrap();
         // A foreign teaser event (wrong kind) mixed into the batch must be silently skipped, not error.
         let junk = hb_core::event::build_teaser(
             &author,
@@ -825,7 +848,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let picked = newest_announce(vec![junk, good], &meta.topic_id).unwrap();
+        let picked = newest_announce(vec![junk, good], &meta.topic_id, now).unwrap();
         assert_eq!(picked.topic_id, meta.topic_id);
     }
 
@@ -867,10 +890,10 @@ mod tests {
         let (attacker_meta, _key2) =
             new_topic("video/hbnet-mismatch-attacker", "unrelated metadata", vec![], false).unwrap();
         let author = Identity::generate();
+        let now = 1_700_000_000u64;
         // `d` = the victim's topic_id, but the signed payload names the attacker's own, unrelated topic.
-        let mismatched =
-            build_mismatched_announce(&author, &victim_meta.topic_id, &attacker_meta, 1_700_000_000);
-        let picked = newest_announce(vec![mismatched], &victim_meta.topic_id);
+        let mismatched = build_mismatched_announce(&author, &victim_meta.topic_id, &attacker_meta, now);
+        let picked = newest_announce(vec![mismatched], &victim_meta.topic_id, now);
         assert_eq!(picked, None, "a d-tag/payload topic_id mismatch must never satisfy the lookup");
     }
 
@@ -881,13 +904,70 @@ mod tests {
         let (attacker_meta, _key2) =
             new_topic("video/hbnet-mismatch-both-attacker", "unrelated", vec![], false).unwrap();
         let author = Identity::generate();
-        let genuine = build_announce(&author, &victim_meta, 1_700_000_000).unwrap();
+        let now = 1_700_000_999u64;
+        let genuine = build_announce(&author, &victim_meta, now - 999).unwrap();
         // Newer (by created_at) than the genuine one, but a mismatch — must still lose.
-        let mismatched =
-            build_mismatched_announce(&author, &victim_meta.topic_id, &attacker_meta, 1_700_000_999);
-        let picked = newest_announce(vec![mismatched, genuine], &victim_meta.topic_id).unwrap();
+        let mismatched = build_mismatched_announce(&author, &victim_meta.topic_id, &attacker_meta, now);
+        let picked = newest_announce(vec![mismatched, genuine], &victim_meta.topic_id, now).unwrap();
         assert_eq!(picked.topic_id, victim_meta.topic_id);
         assert_eq!(picked.description, "real", "only the matching candidate wins, regardless of recency");
+    }
+
+    // ───────────────────── QURATOR-246: a future-dated announce must not shadow metadata ──────────
+    //
+    // The defect: `newest_announce` ranked purely by `created_at`, so ONE far-future-dated announce
+    // (validly signed by any key — announces are unpermissioned) permanently won the "newest"
+    // ranking and shadowed every legitimate metadata update for that `topic_id`, indefinitely. The
+    // fix follows the established admission posture (`hb_core::binding` REJECTS past the skew,
+    // `hb_core::count` DROPS past the skew): an announce dated beyond `now + FUTURE_SKEW_SECS` is
+    // dropped from candidacy, not clamped — clamping to the ceiling would still rank it above every
+    // legitimate announce (all ≤ now), i.e. would not fix the shadowing at all.
+    //
+    // P-10 mutation (stated, NOT run — the orchestrator applies it on the settled tree): inside
+    // `fn newest_announce`, in the loop body, delete the future-skew guard statement — the `if` whose
+    // condition is `ts > now.saturating_add(FUTURE_SKEW_SECS)` together with its `continue`. That
+    // edit must red `newest_announce_drops_a_future_dated_announce_beyond_the_shared_skew` (the
+    // far-future announce would win with "shadow desc", and the future-only batch would stop
+    // yielding `None`), while every other test in this section stays green.
+
+    #[test]
+    fn newest_announce_drops_a_future_dated_announce_beyond_the_shared_skew() {
+        use hb_core::topic::build_announce;
+        let (meta, _key) = new_topic("video/hbnet-future-skew", "real desc", vec![], false).unwrap();
+        let author = Identity::generate();
+        let now = 1_700_000_000u64;
+        // A legitimate, recent announce (60 s old) against an attacker's far-future one (a day
+        // ahead — far past the ±300 s tolerance) carrying different metadata.
+        let legit = build_announce(&author, &meta, now - 60).unwrap();
+        let mut shadow_meta = meta.clone();
+        shadow_meta.description = "shadow desc".into();
+        let shadow = build_announce(&author, &shadow_meta, now + 86_400).unwrap();
+        let picked = newest_announce(vec![shadow.clone(), legit], &meta.topic_id, now).unwrap();
+        assert_eq!(picked.description, "real desc", "a future-dated announce must not outrank a recent one");
+        // And when the future-dated announce is the ONLY candidate it is dropped outright — the
+        // lookup reads "not found" instead of being shadowed by attacker metadata.
+        assert_eq!(newest_announce(vec![shadow], &meta.topic_id, now), None);
+    }
+
+    #[test]
+    fn newest_announce_admits_an_announce_inside_the_future_skew_tolerance() {
+        use hb_core::topic::build_announce;
+        let (meta, _key) = new_topic("video/hbnet-future-skew-edge", "older", vec![], false).unwrap();
+        let author = Identity::generate();
+        let now = 1_700_000_000u64;
+        let recent = build_announce(&author, &meta, now - 10).unwrap();
+        // Exactly at the tolerance boundary (`now + FUTURE_SKEW_SECS`), inclusive — matching
+        // `binding.rs`'s `created > now + skew` rejection shape, so the boundary itself is admitted.
+        // This pins that the gate is a BOUND, not a blanket refusal of anything ahead of our clock
+        // (a slightly-fast author clock must still be readable).
+        let mut edge_meta = meta.clone();
+        edge_meta.description = "at the edge".into();
+        let edge = build_announce(&author, &edge_meta, now + FUTURE_SKEW_SECS).unwrap();
+        let picked = newest_announce(vec![recent, edge], &meta.topic_id, now).unwrap();
+        assert_eq!(
+            picked.description, "at the edge",
+            "an announce within the skew tolerance still wins by recency"
+        );
     }
 
     // ───────────────────────── QURATOR-82: bounded-concurrency scoring (pure helper) ───────────────
