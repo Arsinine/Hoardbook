@@ -399,6 +399,22 @@ pub(crate) const DM_INBOX_FETCH_LIMIT: usize = 1000;
 /// boundary — losing it across a restart merely re-attempts a wrap once, never loses a message.
 const MAX_FAILED_WRAPS: usize = 4_096;
 
+/// (QURATOR-244) Local, OURS defense-in-depth cap on a single decrypted DM's content, in BYTES,
+/// checked before anything is persisted to the sealed cache or the Q7 quarantine. Anchored to
+/// NIP-44's own plaintext ceiling (nostr 0.44.8, `nip44::v2`: `MAX_SUPPORTED_PLAINTEXT_SIZE =
+/// 65_536 − 128`): the DM's seal is NIP-44 ciphertext and `content` is a strict substring of the
+/// rumor JSON that ciphertext carries, so a CONFORMING sender cannot produce a message AT — let
+/// alone over — this size; nothing legitimate is ever dropped by this cap. The nostr decrypt side
+/// additionally refuses a seal whose ciphertext exceeds its own derived payload ceiling, which
+/// today already bounds decoded content below this number — this check is the explicit, local,
+/// dependency-independent backstop for the day that changes (a dependency bump relaxing the
+/// ceiling, a hand-rolled non-conforming seal, or a bug elsewhere). Over-cap content is DROPPED,
+/// never truncated (silently altering a sender's words is worse than skipping them), logged at
+/// `warn` (wrap id + content LENGTH only, never the plaintext — QURATOR-66), and the wrap is still
+/// recorded in `seen_wraps` (record-but-skip, cf. the QURATOR-187 non-chat handling) so it is
+/// never re-decrypted and the QURATOR-231 cursor still commits past it.
+const MAX_DM_CONTENT_BYTES: usize = 65_408;
+
 /// Bounded, FIFO negative cache of gift-wrap ids that failed to unwrap (`set` for O(1) membership,
 /// `order` for oldest-first eviction).
 struct FailedWrapCache {
@@ -482,8 +498,9 @@ pub(crate) fn dm_inbox_filter(me: PublicKey, newest_seen_outer: u64) -> Filter {
 /// Incremental decode + cache merge (devtest v0.12.4 #2). For each fetched wrap NOT already in the
 /// cache's seen-ledger it unwraps (Schnorr-verified seal), records its id, and routes it via
 /// [`route_dm`] — a contact/self message is appended to the cache; a stranger's is returned for the
-/// caller to merge into the Q7 quarantine. A wrap that fails to unwrap is skipped with a log, never a
-/// panic. **Already-seen wraps are never re-unwrapped** — the whole point of the cache.
+/// caller to merge into the Q7 quarantine. Content over [`MAX_DM_CONTENT_BYTES`] is dropped the
+/// same way (recorded-but-skipped, so never re-decoded — QURATOR-244). A wrap that fails to unwrap
+/// is skipped with a log, never a panic. **Already-seen wraps are never re-unwrapped** — the whole point of the cache.
 ///
 /// `now` (unix secs) is the wall clock, passed in for testability. The cursor advance is **clamped to
 /// `now`** and any persisted future cursor is healed down to `now` — so a foreign wrap bearing an
@@ -594,21 +611,22 @@ pub(crate) async fn merge_wraps_into_cache(
                     continue;
                 }
 
-                let from = npub_of(&dm.sender);
-                let sent_at = rfc3339_of(dm.created_at);
-                match route_dm(&from, own_npub, ctx) {
-                    DmRoute::Drop => {}
-                    DmRoute::Inbox => cache.messages.push(CachedDm {
-                        wrap_id,
-                        from,
-                        to: own_npub.to_string(),
+                // QURATOR-244: route + persist under the local content cap (see
+                // [`route_and_persist_chat_dm`]). The wrap id was committed to the success ledger
+                // above and the watermark at the top of this arm, so the persist verdict — kept,
+                // dropped-by-route, or dropped-by-cap — can never stall the QURATOR-231 cursor.
+                route_and_persist_chat_dm(
+                    DecodedDm {
+                        from: npub_of(&dm.sender),
                         content: dm.content,
-                        sent_at,
-                    }),
-                    DmRoute::Request => {
-                        requests.push((from, RequestMessage { wrap_id, content: dm.content, sent_at }));
-                    }
-                }
+                        sent_at: rfc3339_of(dm.created_at),
+                        wrap_id,
+                    },
+                    own_npub,
+                    ctx,
+                    cache,
+                    &mut requests,
+                );
             }
             Err(e) => {
                 // audit #11: remember the failed id so the ~15 s poll doesn't re-run the full unwrap
@@ -638,6 +656,62 @@ pub(crate) async fn merge_wraps_into_cache(
         changed = true;
     }
     (requests, changed)
+}
+
+/// One unwrapped chat DM's owned fields, grouped so [`route_and_persist_chat_dm`] takes the
+/// message as one argument rather than four loose `String`s (clippy's `too_many_arguments` fires
+/// at 8, and four of them were this). They travel together and are consumed together.
+struct DecodedDm {
+    from: String,
+    content: String,
+    sent_at: String,
+    wrap_id: String,
+}
+
+/// (QURATOR-244) Route and persist ONE decoded chat DM under [`MAX_DM_CONTENT_BYTES`]: a
+/// contact/self message is appended to the cache, a stranger's is pushed onto `requests` for the
+/// caller to merge into the Q7 quarantine, a blocked/declined sender is dropped. Content over the
+/// cap is dropped BEFORE any persist — never truncated — and logged (wrap id + content LENGTH
+/// only, never the plaintext, QURATOR-66). Returns whether the DM was kept (persisted or
+/// quarantined); `false` means dropped, by route or by cap.
+///
+/// Extracted from `merge_wraps_into_cache`'s `Ok(dm)` arm as the test seam for the cap: an
+/// over-cap wrap cannot be driven through a real seal (the NIP-44 layer refuses to encrypt one,
+/// and its decrypt-side payload ceiling keeps even hand-rolled seals below the cap), so the
+/// verdict is pinned here, at the persist boundary where the decision actually lives.
+fn route_and_persist_chat_dm(
+    dm: DecodedDm,
+    own_npub: &str,
+    ctx: &DmClassifyCtx<'_>,
+    cache: &mut DmCache,
+    requests: &mut Vec<(String, RequestMessage)>,
+) -> bool {
+    let DecodedDm { from, content, sent_at, wrap_id } = dm;
+    if content.len() > MAX_DM_CONTENT_BYTES {
+        tracing::warn!(
+            wrap_id = %wrap_id,
+            content_len = content.len(),
+            "dm inbox: decoded DM over the local content cap (QURATOR-244) — dropped, never persisted"
+        );
+        return false;
+    }
+    match route_dm(&from, own_npub, ctx) {
+        DmRoute::Drop => false,
+        DmRoute::Inbox => {
+            cache.messages.push(CachedDm {
+                wrap_id,
+                from,
+                to: own_npub.to_string(),
+                content,
+                sent_at,
+            });
+            true
+        }
+        DmRoute::Request => {
+            requests.push((from, RequestMessage { wrap_id, content, sent_at }));
+            true
+        }
+    }
 }
 
 /// The received-contact inbox, re-derived from the cache under the CURRENT contacts/blocked sets
@@ -2765,6 +2839,162 @@ mod tests {
         assert_eq!(
             cache.newest_seen_outer, now,
             "a future-stamped already-seen wrap clamps the cursor to now, never past it"
+        );
+    }
+
+    #[test]
+    fn over_cap_dm_content_is_dropped_never_persisted() {
+        // QURATOR-244 — the cap itself. An over-cap DM is DROPPED, never truncated: silently
+        // altering a sender's words is worse than skipping them, and nothing legitimate can be
+        // lost — the cap sits AT NIP-44's own plaintext ceiling (65_536 − 128), so a conforming
+        // sender cannot produce content this large in the first place (see MAX_DM_CONTENT_BYTES).
+        //
+        // Driven at the `route_and_persist_chat_dm` seam, NOT through `merge_wraps_into_cache`:
+        // an over-cap wrap cannot be built through the real seal (nostr's NIP-44 `pad` refuses a
+        // rumor this large, and its decrypt-side payload ceiling keeps even hand-rolled seals
+        // below the cap) — the branch is defense-in-depth against a dependency change, so the
+        // verdict is pinned where the decision lives: the persist boundary. The sender is a
+        // CONTACT, so any drop observed here can only be the cap, never the route.
+        //
+        // MUTATION (P-10, orchestrator applies; line numbers are PRODUCTION lines in this file):
+        // delete the cap block in `route_and_persist_chat_dm` — production lines 680-687 as of
+        // this commit, the `if content.len() > MAX_DM_CONTENT_BYTES { … return false; }` — this
+        // test must then FAIL on every assert (the DM would be persisted to the cache).
+        //
+        // FAILED_WRAPS hygiene: never touches the ledger — this is the pure persist seam, no
+        // unwrap, no wrap id keying.
+        let contact = Identity::generate();
+        let me = Identity::generate();
+        let contacts: HashSet<String> = [contact.npub()].into_iter().collect();
+        let empty: HashSet<String> = HashSet::new();
+        let ctxv = ctx(&contacts, &empty, &empty, true);
+        let mut cache = DmCache::default();
+        let mut requests: Vec<(String, RequestMessage)> = Vec::new();
+        let kept = route_and_persist_chat_dm(
+            DecodedDm {
+                from: contact.npub(),
+                content: "x".repeat(MAX_DM_CONTENT_BYTES + 1),
+                sent_at: rfc3339_of(1_700_000_000),
+                wrap_id: "over-cap-wrap".into(),
+            },
+            &me.npub(),
+            &ctxv,
+            &mut cache,
+            &mut requests,
+        );
+        assert!(!kept, "an over-cap DM is dropped, not kept");
+        assert!(cache.messages.is_empty(), "an over-cap DM is never persisted to the sealed cache");
+        assert!(requests.is_empty(), "nor quarantined into the Q7 request bucket");
+    }
+
+    #[test]
+    fn at_cap_dm_content_is_kept_untouched() {
+        // QURATOR-244 — the boundary. A DM exactly AT the cap is legitimate and must survive the
+        // check byte-for-byte: an off-by-one that rejects legal messages is worse than the defect
+        // the cap defends against. Same seam (and for the same reason) as the over-cap test.
+        //
+        // MUTATION (P-10): on production line 680 as of this commit, change
+        // `if content.len() > MAX_DM_CONTENT_BYTES {` to `>=` — this test must then FAIL (the
+        // at-cap DM would be dropped).
+        let contact = Identity::generate();
+        let me = Identity::generate();
+        let contacts: HashSet<String> = [contact.npub()].into_iter().collect();
+        let empty: HashSet<String> = HashSet::new();
+        let ctxv = ctx(&contacts, &empty, &empty, true);
+        let mut cache = DmCache::default();
+        let mut requests: Vec<(String, RequestMessage)> = Vec::new();
+        let kept = route_and_persist_chat_dm(
+            DecodedDm {
+                from: contact.npub(),
+                content: "x".repeat(MAX_DM_CONTENT_BYTES),
+                sent_at: rfc3339_of(1_700_000_000),
+                wrap_id: "at-cap-wrap".into(),
+            },
+            &me.npub(),
+            &ctxv,
+            &mut cache,
+            &mut requests,
+        );
+        assert!(kept, "a DM exactly at the cap is kept");
+        assert_eq!(cache.messages.len(), 1, "…and persisted exactly once");
+        let m = &cache.messages[0];
+        assert_eq!(m.content.len(), MAX_DM_CONTENT_BYTES, "content is byte-exact, never truncated");
+        assert!(m.content.chars().all(|c| c == 'x'), "content is unaltered");
+        assert_eq!(m.wrap_id, "at-cap-wrap");
+        assert!(requests.is_empty(), "a contact DM routes to the inbox, not the request bucket");
+    }
+
+    #[tokio::test]
+    async fn dropped_dm_still_advances_the_cursor_and_is_never_re_decoded() {
+        // QURATOR-244 — the cursor interaction, the property that must not break QURATOR-231's
+        // watermark. An over-cap DM falls into QURATOR-231 outcome 3 (unwrap Ok — DEFINITIVE on
+        // the observing poll) and outcome 1 (already-seen) on every later poll, because the wrap
+        // id is recorded into `seen_wraps` BEFORE the persist verdict is ever consulted — the
+        // same RECORD-BUT-SKIP shape QURATOR-187 established for non-chat kinds. It is NOT the
+        // failed-wrap ledger (that is for unwrap failures; this wrap unwrapped fine) and NOT
+        // outcome 4 (no stall: the watermark bump at the top of the Ok arm is independent of the
+        // persist verdict).
+        //
+        // HONEST LIMIT: the over-cap branch itself cannot be driven through a real seal (nostr's
+        // NIP-44 layer refuses both to encrypt and to decrypt a payload this large), so this test
+        // pins the invariant through the reachable twin of that shape: a DM whose persist verdict
+        // is DROP for a different reason (blocked sender route) — unwrap Ok, recorded, watermark
+        // advanced, NOTHING persisted — with a large-but-legal 64,000-byte body so the real
+        // decode of big content is exercised too. Whatever drops the content (route today, cap
+        // tomorrow), the recording and watermark above it are identical, which is exactly the
+        // property that keeps the cursor from stalling.
+        //
+        // MUTATION (P-10): delete the two unconditional recording lines at the top of the Ok arm
+        // (production lines 587-588 as of this commit, `seen.insert(wrap_id.clone());` and
+        // `cache.seen_wraps.push(wrap_id.clone());`) — this test must then FAIL on the
+        // `seen_wraps.contains` assert (and the re-poll would re-decode, flipping `changed2`).
+        //
+        // FAILED_WRAPS hygiene: `me` is a fresh identity, so this test's ledger slice starts
+        // empty regardless of sibling tests — the ledger is keyed (identity npub, wrap id).
+        let me = Identity::generate();
+        let blocked_peer = Identity::generate();
+        // A large-but-LEGAL body. ⚠ The headroom is far smaller than the 65,408-byte plaintext cap
+        // suggests, because NIP-59 applies NIP-44 **twice**: the rumor is sealed (layer 1), and the
+        // seal's own JSON — base64 ciphertext, ~1.33× the plaintext plus padding to a bucket — is
+        // then gift-wrapped (layer 2). So the outer plaintext is roughly 4/3 of the inner one, and
+        // a 64,000-byte body overflows layer 2 with `Client("message too long")` even though it
+        // clears layer 1. 32,000 bytes keeps both layers legal while still exercising a real
+        // multi-kilobyte seal, so everything below runs the production crypto rather than a mock.
+        let big = build_dm(&blocked_peer, &me.public_key(), &"x".repeat(32_000))
+            .await
+            .unwrap();
+        let big_ts = big.created_at.as_secs(); // the fixture's REAL outer stamp drives every clock below
+        let now = big_ts + 3_600;
+
+        let empty: HashSet<String> = HashSet::new();
+        let blocked: HashSet<String> = [blocked_peer.npub()].into_iter().collect();
+        let ctxv = ctx(&empty, &blocked, &empty, true);
+        let mut cache = DmCache::default();
+
+        // Poll 1: unwrap Ok (QURATOR-231 outcome 3) — but the persist verdict is DROP.
+        let (requests, changed) =
+            merge_wraps_into_cache(&me, &me.npub(), vec![big.clone()], &ctxv, &mut cache, now).await;
+        assert!(requests.is_empty(), "a blocked sender yields no request");
+        assert!(cache.messages.is_empty(), "the dropped DM is not persisted");
+        assert!(
+            cache.seen_wraps.contains(&big.id.to_hex()),
+            "…but its wrap id IS in the success ledger (record-but-skip, never re-decoded)"
+        );
+        assert!(changed, "the recording + cursor advance are real cache mutations (persisted)");
+        assert_eq!(
+            cache.newest_seen_outer, big_ts,
+            "a DM whose content is NOT persisted still commits the cursor past itself"
+        );
+
+        // Poll 2: the same wrap is re-fetched (nothing moved the window) — now outcome 1
+        // (already-seen): no re-decode, no re-drop, no stall, cursor holds at the stamp.
+        let (requests2, changed2) =
+            merge_wraps_into_cache(&me, &me.npub(), vec![big], &ctxv, &mut cache, now + 15).await;
+        assert!(requests2.is_empty() && cache.messages.is_empty(), "the re-poll persists nothing");
+        assert!(!changed2, "an all-seen re-poll is a no-op — the ledger short-circuits the unwrap");
+        assert_eq!(
+            cache.newest_seen_outer, big_ts,
+            "the cursor holds at the stamp: never stalled below a definitively-processed wrap"
         );
     }
 
