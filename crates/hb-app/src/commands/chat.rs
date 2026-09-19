@@ -3250,15 +3250,25 @@ mod tests {
     /// test pins the BYTES both crates compose it from, which the behaviour tests are blind to).
     /// `failed_open_key` is `pub(crate)`, so this crate cannot link it — the hb-net half is pinned
     /// the `suite_cap.rs` way (hb-it/src/suite_cap.rs:49 pins hb-app's source because hb-it cannot
-    /// depend on hb-app): hb-net's SOURCE is compiled in with `include_str!`, so a hardening there
-    /// reds here instead of passing silently. Resolving a red here means hardening BOTH
-    /// constructions in the same commit — never one.
+    /// depend on hb-app): hb-net's source is compiled in with `include_str!`, so a hardening of
+    /// THAT EXACT `format!` LINE reds here instead of passing silently. Resolving a red here means
+    /// hardening BOTH constructions in the same commit — never one.
+    ///
+    /// ⚠ Scope, stated precisely rather than as "a hardening there" (review, 2026-09-20): the pin
+    /// observes ONE line, not hb-net's key construction as a whole. A hardening implemented as
+    /// post-processing AFTER that `format!`, or as a second composer used by new callers, leaves
+    /// the count at 1 and this guard green while the composed bytes have drifted. That is a
+    /// narrower promise than "the two cannot diverge", and the narrower one is what is true.
     ///
     /// MUTATION (P-10, for the orchestrator to apply, resolve by LINE NUMBER, never by grep — the
     /// side-A anchor text also occurs, escaped, in the `JOIN` const below, by design):
-    ///  A. hb-net side: `crates/hb-net/src/failed_wrap_cache.rs` line 122, the line
-    ///     `format!("{me_npub}\u{0}{scope}\u{0}{wrap_id}")` — change both `\u{0}` escapes to
-    ///     `\u{1}`. This test reds on the `SRC` pin (the count drops to 0).
+    ///  A. hb-net side: `crates/hb-net/src/failed_wrap_cache.rs` line 127 — the CODE line
+    ///     `format!("{me_npub}\u{0}{scope}\u{0}{wrap_id}")` inside `failed_open_key`'s body, NOT
+    ///     line 122, which is hb-net's own mutation doc comment quoting the scope-less variant.
+    ///     Change both `\u{0}` escapes to `\u{1}`; this test reds on the `SRC` pin (count → 0).
+    ///     (Confirmed RED by the orchestrator 2026-09-20. The off-by-five was caught in review:
+    ///     an anchor that misdirects its own proof onto a comment manufactures a phantom GREEN
+    ///     reading as "the guard is vacuous" — the trap this very comment warns about, one line up.)
     ///  B. hb-app side: this file line 458, the line `format!("{identity_npub}\u{0}{wrap_id}")` —
     ///     change `\u{0}` to `\u{1}`. This test reds on the golden-value assert.
     /// Both behaviour tests above stay GREEN under either single-sided mutation — they pin
