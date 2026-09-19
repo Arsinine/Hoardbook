@@ -999,7 +999,10 @@ pub fn redeem_invite(
 /// the property a negative cache keys on (hb-net's `TOPIC_FAILED_OPENS`): the 1059 kind pin, the
 /// outer signature verify (before any ECDH work, chorus-1 R-2), the wrap NIP-44 decrypt, the seal
 /// parse + `Kind::Seal` pin + `seal.verify()`, the rumor decrypt + inner-kind pin (31_119), the
-/// schema/crypto tags, the `InvitePayload` parse and the payload/tag version consistency. Returns
+/// schema/crypto tags, the `InvitePayload` parse, the payload/tag version consistency, and the
+/// 32-byte `topic_key` decode/length gate (moved here from the policy half by QURATOR-301 — it is
+/// pure over the payload bytes, so a wrap with honest crypto and a garbage key now fails the OPEN
+/// and is negatively cached instead of re-paying the crypto once per poll forever). Returns
 /// the VERIFIED seal signer (the issuer — recovered from the seal AFTER `seal.verify()`, never
 /// self-declared) and the parsed payload, ready for [`redeem_opened_invite`].
 pub fn open_invite(me: &Identity, invite: &Event) -> Result<(PublicKey, InvitePayload), HbError> {
@@ -1038,6 +1041,17 @@ pub fn open_invite(me: &Identity, invite: &Event) -> Result<(PublicKey, InvitePa
     if payload.schema_v != inner_schema || payload.crypto_v != inner_crypto {
         return Err(HbError::InvalidEvent("version mismatch between the invite payload and its signed tags".into()));
     }
+    // QURATOR-301: the 32-byte `topic_key` decode/length gate — a pure function of the payload
+    // bytes — belongs in this DETERMINISTIC half, so a wrap with honest crypto, valid tags and
+    // parseable JSON but a garbage `topic_key` fails HERE (the verdict hb-net's TOPIC_FAILED_OPENS
+    // keys on) instead of re-paying 2× ECDH + 2× Schnorr once per poll for the process lifetime.
+    // The gate must run BEFORE the replay-nonce insert in `redeem_opened_invite`, and does so BY
+    // CONSTRUCTION: the insert exists only in that policy half, which no caller reaches unless
+    // this function has already returned `Ok`, and this gate sits on the path to `Ok` — so a
+    // malformed key can never burn the single-use seen-key. The policy half keeps its own call to
+    // the same shared gate (it must decode anyway to build the `TopicKey` it returns), pinning the
+    // decode-before-insert order there too, for payloads that did not arrive through here.
+    decode_topic_key(&payload)?;
     Ok((issuer, payload))
 }
 
@@ -1089,11 +1103,12 @@ pub fn redeem_opened_invite(
     // Decode + length-validate the 32-byte `topic_key` BEFORE the replay-nonce insert — a hand-crafted
     // invite carrying a malformed key must fail here, not after burning the single-use seen-key (which
     // would permanently poison the (topic_id, invitee) slot and reject the genuine invite). Mirrors the
-    // topic-mismatch check above, ordered the same way for the same reason.
-    let key_bytes: [u8; 32] = hex::decode(&payload.topic_key)
-        .map_err(|_| HbError::InvalidEncryptedMessage)?
-        .try_into()
-        .map_err(|_| HbError::InvalidEncryptedMessage)?;
+    // topic-mismatch check above, ordered the same way for the same reason. QURATOR-301: this gate is
+    // shared with `open_invite` (which runs before this half in every composition, so a malformed key
+    // normally never reaches this line); this call produces the key bytes below AND keeps the
+    // decode-before-insert order pinned WITHIN the policy half — pinned by
+    // `redeem_opened_invite_decodes_before_burning_the_seen_key`, which drives this half directly.
+    let key_bytes: [u8; 32] = decode_topic_key(&payload)?;
     // Replay protection is keyed on the EXPLICIT `reusable` flag, not on `expires_at`. A single-use
     // invite (every private invite) is atomically checked-and-inserted (closing the caller TOCTOU); the
     // reusable public-join credential is exempt (every joiner derives the same name-scoped invitee, so a
@@ -1156,6 +1171,20 @@ fn crypto_v_of(event: &Event) -> Result<u8, HbError> {
 /// Read a custom named tag from a rumor's `Tags` as a `u8` (the rumor is an `UnsignedEvent`).
 fn tag_u8_from(tags: &Tags, name: &str) -> Option<u8> {
     tags.find(TagKind::custom(name)).and_then(|t| t.content()).and_then(|s| s.parse::<u8>().ok())
+}
+
+/// Decode + length-validate an invite payload's 32-byte `topic_key` hex string (QURATOR-301). A
+/// pure function of the payload bytes — no `now`, no `seen`, no caller expectations — so its
+/// verdict is negatively cacheable, which is why the gate is invoked from BOTH halves: from
+/// [`open_invite`] (making a garbage key part of the deterministic, cacheable open verdict) and
+/// from [`redeem_opened_invite`] (which must decode anyway to build the [`TopicKey`] it returns,
+/// and where the gate keeps decode-before-replay-insert pinned). One shared body, so the two call
+/// sites cannot drift apart.
+fn decode_topic_key(payload: &InvitePayload) -> Result<[u8; 32], HbError> {
+    hex::decode(&payload.topic_key)
+        .map_err(|_| HbError::InvalidEncryptedMessage)?
+        .try_into()
+        .map_err(|_| HbError::InvalidEncryptedMessage)
 }
 
 /// The `d`-tag (topic_id) a membership/post event claims. Both membership (`seal_membership`) **and**
@@ -1815,6 +1844,99 @@ mod tests {
         assert!(
             redeem_invite(&invitee, &good, &mut seen, NOW, None, None).is_ok(),
             "the genuine invite redeems because the malformed one never claimed the seen-key"
+        );
+    }
+
+    /// QURATOR-301 — the DETERMINISTIC-side gate. `open_invite` is the half whose verdict hb-net's
+    /// `TOPIC_FAILED_OPENS` negatively caches (the poller records every open refusal and skips the
+    /// wrap on every later poll), so the decode/length gate must fail HERE for a garbage-key wrap
+    /// to be remembered after poll 1. Without this pin, deleting the open-side gate would leave
+    /// every other test green — the policy half's own call still refuses the key, and the composed
+    /// `malformed_topic_key_does_not_burn_the_single_use_seen_key` above stays green too — while
+    /// the cache coverage silently regresses to re-paying the crypto once per poll forever. `"zz"`
+    /// exercises the hex-decode arm of the shared gate; the existing test's `"deadbeef"` (valid
+    /// hex, wrong length) exercises the length arm through the same body.
+    ///
+    /// MUTATION (P-10, resolve by LINE NUMBER — this anchor text is NOT unique in production, it
+    /// names two call sites of the shared gate): in `open_invite`, DELETE the entire line 1054,
+    /// `    decode_topic_key(&payload)?;` — the standalone gate line in `open_invite`'s tail (the
+    /// FIRST occurrence, NOT the `let key_bytes: [u8; 32] = decode_topic_key(&payload)?;` line in
+    /// `redeem_opened_invite`). This test reds: the open now succeeds for the `"zz"` wrap, so the
+    /// `matches!(… Err(…))` assert fails.
+    #[test]
+    fn a_garbage_topic_key_fails_the_deterministic_open() {
+        let issuer = Identity::generate();
+        let invitee = Identity::generate();
+        let (meta, _key) = private_topic();
+        let bad = mint_invite_with_raw_key(
+            &issuer,
+            &invitee.public_key(),
+            &meta,
+            "zz", // not hex at all — fails hex::decode before the length gate
+            "n301",
+            Some(NOW + 100),
+            NOW,
+        )
+        .unwrap();
+        assert!(
+            matches!(open_invite(&invitee, &bad), Err(HbError::InvalidEncryptedMessage)),
+            "a garbage topic_key is refused by the deterministic open itself, so the poller's negative cache remembers the wrap"
+        );
+    }
+
+    /// QURATOR-301 — the policy-half ordering, pinned WHERE IT LIVES. With the gate now also in
+    /// `open_invite`, the composed test above is shielded by the open-side gate (a malformed key
+    /// never reaches the policy half through `redeem_invite`), so only a DIRECT call of
+    /// `redeem_opened_invite` can still observe the decode-before-insert order inside the policy
+    /// half — and in-module construction is the only surface that can get a payload here without
+    /// passing the open gate (the `InvitePayload` fields are module-private and there is no public
+    /// constructor). Unlike the composed test, both payloads use the SAME nonce: the genuine one
+    /// claims the exact `(issuer, topic_id, invitee, nonce)` slot the malformed one tried for.
+    ///
+    /// MUTATION (P-10, resolve by LINE NUMBER): in `redeem_opened_invite`, MOVE line 1111,
+    /// `    let key_bytes: [u8; 32] = decode_topic_key(&payload)?;` (the occurrence inside
+    /// `redeem_opened_invite`) to immediately AFTER the closing brace of the
+    /// `if !payload.reusable { … }` block that starts at line 1116. The malformed payload now
+    /// inserts its seen-key and only THEN fails the decode: `seen.is_empty()` reds, and the
+    /// genuine payload is refused as a replay, redding the final assert too. (Deleting the
+    /// open-side gate at line 1054 alone does NOT red this test — that mutation belongs to
+    /// `a_garbage_topic_key_fails_the_deterministic_open` above.)
+    #[test]
+    fn redeem_opened_invite_decodes_before_burning_the_seen_key() {
+        let issuer = Identity::generate();
+        let me = Identity::generate();
+        let (meta, key) = private_topic();
+        let malformed = InvitePayload {
+            meta: meta.clone(),
+            topic_key: "zz".into(),
+            nonce: "n301".into(),
+            expires_at: Some(NOW + 100),
+            reusable: false,
+            schema_v: SCHEMA_V,
+            crypto_v: CRYPTO_V,
+        };
+        let mut seen = NonceSet::new();
+        assert!(
+            matches!(
+                redeem_opened_invite(&me, issuer.public_key(), malformed, &mut seen, NOW, None, None),
+                Err(HbError::InvalidEncryptedMessage)
+            ),
+            "the policy half still refuses a malformed topic_key at its own gate"
+        );
+        assert!(seen.is_empty(), "a malformed-key payload must not burn the seen-key inside the policy half");
+        // The genuine payload for the SAME (issuer, topic_id, invitee, nonce) slot still redeems.
+        let genuine = InvitePayload {
+            meta,
+            topic_key: hex::encode(key.0),
+            nonce: "n301".into(),
+            expires_at: Some(NOW + 100),
+            reusable: false,
+            schema_v: SCHEMA_V,
+            crypto_v: CRYPTO_V,
+        };
+        assert!(
+            redeem_opened_invite(&me, issuer.public_key(), genuine, &mut seen, NOW, None, None).is_ok(),
+            "the genuine payload redeems because the malformed one never claimed the seen-key"
         );
     }
 

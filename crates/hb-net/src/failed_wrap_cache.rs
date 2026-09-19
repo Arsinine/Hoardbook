@@ -37,13 +37,18 @@
 //! does not transfer for free.
 //!
 //! ⚠ **Scope of "the whole of `open_invite`", stated precisely** (updated 2026-09-19 after a review
-//! caught this paragraph still describing the pre-QURATOR-298 surface). Before 298 the invite scope
-//! cached only the unwrap + inner-kind prefix; the schema/crypto tags, `InvitePayload` parse and
-//! version-consistency checks sat past the gate inside the old monolith and were never cached. They
-//! are cached now. **The one deterministic check still NOT cached** is the 32-byte `topic_key` hex
-//! decode, which stays in the policy half so it runs before the replay-nonce insert — see the
-//! residual note on `topic.rs`'s `TOPIC_FAILED_OPENS`. Keep this paragraph exact: the ⚠ above says
-//! a posture sentence here is what the next audit trusts, and an understated one stops it looking.
+//! caught this paragraph still describing the pre-QURATOR-298 surface; updated again 2026-09-20 by
+//! QURATOR-301). Before 298 the invite scope cached only the unwrap + inner-kind prefix; the
+//! schema/crypto tags, `InvitePayload` parse and version-consistency checks sat past the gate
+//! inside the old monolith and were never cached. They are cached now. **The 32-byte `topic_key`
+//! hex decode — the one deterministic check this paragraph still named as NOT cached on 2026-09-19
+//! — is cached since QURATOR-301 too**: the gate moved into `open_invite` itself, and the
+//! decode-before-replay-insert ordering that had kept it in the policy half survives by
+//! construction (the insert lives only in the policy half, which runs strictly after a successful
+//! open) and is pinned by `hb_core::topic` tests — see the residual note on `topic.rs`'s
+//! `TOPIC_FAILED_OPENS`. Keep this paragraph exact: the ⚠ above says a posture sentence here is
+//! what the next audit trusts, and an overstated one stops it looking just as surely as an
+//! understated one.
 //!
 //! In-memory only, never persisted: it is a CPU-DoS backstop, not a correctness boundary — losing
 //! it across a restart merely re-attempts each remembered wrap once, never loses a message.

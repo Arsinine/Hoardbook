@@ -766,20 +766,23 @@ const INVITE_OPEN_SCOPE: &str = "topic-invite";
 /// output without re-decrypting), because that verdict is mutable in caller context (`now`, `seen`,
 /// expectations) and caching it would hide a valid invite until restart. The deterministic checks
 /// that used to sit past the gate inside the monolith (schema/crypto tags, payload parse, version
-/// consistency) are now COVERED by this cache: they are pure functions of (identity, wrap bytes),
-/// the exact class this cache is sound for.
+/// consistency, and — since QURATOR-301 — the 32-byte `topic_key` decode/length gate) are now
+/// COVERED by this cache: they are pure functions of (identity, wrap bytes), the exact class this
+/// cache is sound for.
 ///
-/// ⚠ **One deterministic check is NOT covered, and it is named here rather than left implied**
-/// (review finding, 2026-09-19): the 32-byte `topic_key` hex decode in
-/// `hb_core::topic::redeem_opened_invite` is pure over the payload bytes, but it lives in the
-/// POLICY half — deliberately, because it must run BEFORE the replay-nonce insert so a malformed
-/// key never burns the single-use seen-key. So a wrap with honest crypto, valid tags, parseable
-/// JSON and a garbage `topic_key` re-opens once per poll forever instead of being remembered.
-/// Cost is bounded and strictly better than before QURATOR-298 (which paid 2× per poll for the
-/// same wrap, also uncached); moving the decode into `open_invite` would close it — open runs
-/// before policy, so the ordering guarantee survives — but that is a deliberate follow-up, not an
-/// oversight. **Do not let the sentence above be read as an exhaustive list of the deterministic
-/// checks: this one is the exception.**
+/// ✅ **The one deterministic check this block used to name as NOT covered is covered since
+/// QURATOR-301** (review finding 2026-09-19, closed 2026-09-20): the 32-byte `topic_key` hex
+/// decode — pure over the payload bytes — moved from the policy half into `open_invite`, so a wrap
+/// with honest crypto, valid tags, parseable JSON and a garbage `topic_key` is refused by the OPEN
+/// itself and remembered here after its first poll. The ordering that had kept it on the policy
+/// side (decode BEFORE the replay-nonce insert, so a malformed key never burns the single-use
+/// seen-key) survives by construction — the insert lives only in the policy half, which no caller
+/// reaches unless `open_invite` already returned `Ok` — and is pinned by tests in
+/// `hb_core::topic`: `malformed_topic_key_does_not_burn_the_single_use_seen_key` (composed path)
+/// and `redeem_opened_invite_decodes_before_burning_the_seen_key` (policy half driven directly).
+/// **The residual above is now POLICY-only; every deterministic check on the open path is
+/// cache-covered. Any NEW deterministic check must land in `open_invite` (or be named here as a
+/// fresh exception) — do not read this paragraph as an exhaustive list of the checks forever.**
 static TOPIC_FAILED_OPENS: LazyLock<Mutex<FailedWrapCache>> =
     LazyLock::new(|| Mutex::new(FailedWrapCache::new()));
 
