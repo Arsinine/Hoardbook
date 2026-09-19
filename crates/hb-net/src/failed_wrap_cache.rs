@@ -2,9 +2,9 @@
 //!
 //! **One TYPE, deliberately many INSTANCES.** This is the shared *mechanism* — the hard cap +
 //! oldest-first eviction an attacker-fed id set must not be allowed to drift between consumers —
-//! lifted here from hb-app's DM poller (`commands/chat.rs`, audit #11) so that every consumer of
-//! the multiplexed kind-1059 inbox (`{kinds:[1059], #p:[me]}` — DMs, join requests, invites, key
-//! grants and private listings all land on one stream) uses the same bounding discipline. What is
+//! lifted here from hb-app's DM poller (`commands/chat.rs`, audit #11) so that a consumer of the
+//! multiplexed kind-1059 inbox (`{kinds:[1059], #p:[me]}` — DMs, join requests, invites, key
+//! grants and private listings all land on one stream) has one bounding discipline to adopt. What is
 //! deliberately NOT shared is the cache *contents*: each consumer composes its own keys and holds
 //! its own static, because their failure verdicts are not interchangeable — a valid chat DM fails
 //! `open_private_listing`'s inner-kind pin, a valid private listing fails `open_key_grant`'s, so a
@@ -13,6 +13,16 @@
 //! `kind_pin_failures_do_not_cross_the_inner_kind_scopes`). Key-agnostic on purpose: callers own
 //! key composition, so the discipline that must not drift (the bound) is shared and the verdicts
 //! that must not leak (the entries) cannot.
+//!
+//! ⚠ **NOT every consumer of that inbox is cached today — do not read the above as coverage.**
+//! An earlier draft of this doc claimed every consumer used this discipline; that was FALSE when
+//! written (caught by review, 2026-09-19). Cached: this crate's `priv_browse` opens (both scopes)
+//! and hb-app's `merge_wraps_into_cache` / `decode_dms`. **UNCACHED: `topic.rs`'s
+//! `fetch_join_requests` / `fetch_invite`** — same stream, same flood surface, tracked as
+//! QURATOR-294. Whoever closes it: give it its OWN scope tag, and first re-establish that its
+//! open verdict is deterministic over (identity keys, wrap bytes) — that property is what makes a
+//! negative cache safe, and it does not transfer for free to a path that consults roster or
+//! membership state.
 //!
 //! In-memory only, never persisted: it is a CPU-DoS backstop, not a correctness boundary — losing
 //! it across a restart merely re-attempts each remembered wrap once, never loses a message.

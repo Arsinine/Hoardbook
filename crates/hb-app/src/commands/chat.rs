@@ -248,6 +248,20 @@ pub(crate) async fn decode_dms(
         if !seen.insert(wrap.id) {
             continue;
         }
+        // (QURATOR-247 follow-up) The SAME negative cache `merge_wraps_into_cache` uses, and the
+        // same key, because this path calls the SAME verdict function: `unwrap_dm`. That is what
+        // makes sharing ENTRIES correct here and wrong across the hb-net scopes — there, each core
+        // pins a different inner kind, so one core's routine refusal is another's good wrap; here
+        // both paths ask the identical deterministic question of the identical bytes.
+        //
+        // Without this, an attacker who floods the shared kind-1059 inbox forced a full NIP-44
+        // decrypt + Schnorr verify per junk wrap on EVERY poll of this path — and the
+        // `auto_approve` loop polls every 5s (`AUTO_APPROVE_POLL_INTERVAL`) against a 48h `since`
+        // margin, a worse cadence than the 15s chat poll audit #11 originally fixed.
+        let wrap_id = wrap.id.to_hex();
+        if failed_wrap_seen(own_npub, &wrap_id) {
+            continue;
+        }
         match unwrap_dm(identity, &wrap).await {
             Ok(dm) => {
                 let from = npub_of(&dm.sender);
@@ -261,10 +275,18 @@ pub(crate) async fn decode_dms(
                     sent_at: rfc3339_of(dm.created_at),
                 });
             }
-            Err(e) => tracing::debug!(
-                wrap_id = %wrap.id.to_hex(),
-                "dm inbox: skipping undecryptable/foreign gift wrap: {e}"
-            ),
+            Err(e) => {
+                // Remembered, so the next poll skips it above. `unwrap_dm` is deterministic over
+                // (this identity's keys, these wrap bytes), so a wrap that failed cannot later
+                // succeed — nothing decodable is ever blacklisted. The contact filter above is
+                // deliberately NOT a reason to record: it is mutable state that can grow to
+                // include this sender later, and it runs only on a SUCCESSFUL unwrap.
+                record_failed_wrap(own_npub, wrap_id);
+                tracing::debug!(
+                    wrap_id = %wrap.id.to_hex(),
+                    "dm inbox: skipping undecryptable/foreign gift wrap: {e}"
+                );
+            }
         }
     }
     out.sort_by(|a, b| a.sent_at.cmp(&b.sent_at));
@@ -3030,6 +3052,63 @@ mod tests {
         assert!(cache.messages.is_empty(), "a negative-cached wrap is not re-unwrapped");
         assert!(requests.is_empty(), "…and produces no request");
         assert!(cache.seen_wraps.is_empty(), "…and is never recorded as a success");
+    }
+
+    /// **QURATOR-247 follow-up (glm-5.3 review, 2026-09-19) — `decode_dms` shares the DM poller's
+    /// negative cache.**
+    ///
+    /// `merge_wraps_into_cache` was cached by audit #11; `decode_dms` — the OTHER consumer of the
+    /// same `unwrap_dm` verdict — was not, and it is driven by the `auto_approve` loop every **5s**
+    /// (`AUTO_APPROVE_POLL_INTERVAL`) against the 48h `DM_FETCH_MARGIN_SECS` window, a worse cadence
+    /// than the ~15s chat poll audit #11 fixed. So an attacker flooding the shared kind-1059 inbox
+    /// still forced a full NIP-44 decrypt + Schnorr verify per junk wrap per tick.
+    ///
+    /// Sharing ENTRIES is correct here (and wrong across hb-net's scopes) for one reason: both
+    /// paths call the SAME `unwrap_dm` on the same bytes under the same identity, so the verdicts
+    /// are interchangeable by construction. In hb-net each core pins a different inner kind, so
+    /// one core's routine refusal is another's good wrap.
+    ///
+    /// MUTATION (P-10, orchestrator applies and must see this red): in `decode_dms`, delete the
+    /// `record_failed_wrap(own_npub, wrap_id);` line from the `Err` arm (the one whose comment
+    /// begins "Remembered, so the next poll skips it above") — the junk wrap is then never
+    /// remembered and the final assertion reds.
+    #[tokio::test]
+    async fn decode_dms_remembers_a_failed_unwrap_for_the_next_poll() {
+        let me = Identity::generate();
+        let attacker = Identity::generate();
+        let garbage = attacker.sign(EventBuilder::new(Kind::GiftWrap, "junk")).unwrap();
+        let garbage_id = garbage.id.to_hex();
+
+        let out = decode_dms(&me.npub(), &me, vec![garbage], None).await;
+
+        assert!(out.is_empty(), "a wrap that cannot be unwrapped yields no message");
+        assert!(
+            failed_wrap_seen(&me.npub(), &garbage_id),
+            "…and IS remembered, so the 5s auto-approve poll does not re-decrypt it forever"
+        );
+    }
+
+    /// **QURATOR-247 follow-up — and the skip actually short-circuits the crypto.**
+    ///
+    /// Seeds the cache with the id of a wrap that WOULD decode, so the absence of the decoded
+    /// message proves `unwrap_dm` never ran (the same discipline as
+    /// `negative_cached_wrap_is_skipped_before_unwrap` one seam over). Identity scoping is already
+    /// pinned for this shared cache by `negative_cache_does_not_cross_identity_boundaries`.
+    ///
+    /// MUTATION (P-10, orchestrator applies and must see this red): in `decode_dms`, delete the
+    /// `if failed_wrap_seen(own_npub, &wrap_id) { continue; }` guard (immediately after the
+    /// `seen.insert` dedup) — the seeded wrap is then re-unwrapped, decodes, and the emptiness
+    /// assertion reds.
+    #[tokio::test]
+    async fn decode_dms_skips_a_negative_cached_wrap_before_unwrapping() {
+        let me = Identity::generate();
+        let contact = Identity::generate();
+        let wrap = build_dm(&contact, &me.public_key(), "would decode").await.unwrap();
+        record_failed_wrap(&me.npub(), wrap.id.to_hex());
+
+        let out = decode_dms(&me.npub(), &me, vec![wrap], None).await;
+
+        assert!(out.is_empty(), "a negative-cached wrap is not re-unwrapped by decode_dms");
     }
 
     #[tokio::test]
