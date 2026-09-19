@@ -3,10 +3,11 @@
 //! `fetch_private_listings` (a trusted recipient opens; a non-trusted / browse-key holder finds
 //! nothing). The crypto negatives live at L1 (hb-core `priv_listing`); this suite proves the
 //! relay round-trip + the **observable** invariants: the inner-author allowlist is enforced
-//! post-decrypt, retries dedup, revoke kills the republish, and a private collection is invisible
-//! to a tag search.
+//! post-decrypt, retries dedup, revoke kills the republish, a private collection is invisible
+//! to a tag search, and junk in the shared 1059 inbox is expected traffic across repeated polls
+//! (QURATOR-247).
 
-use anyhow::{ensure, Result};
+use anyhow::{anyhow, ensure, Result};
 use hb_core::{seal_private_listing, Identity};
 use hb_net::{fetch_private_listings, publish_private_listing, search_teasers};
 use nostr::prelude::*;
@@ -27,6 +28,7 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
         result("PRIV5 non-trusted peer finds no private listing (no hint)", priv5(ctx).await),
         result("PRIV6 revoke-on-republish: removed recipient can't read the new event", priv6(ctx).await),
         result("PRIV7 private tags never appear in a tag search (DISC1)", priv7(ctx).await),
+        result("PRIV8 junk wrap in the shared inbox: both polls return the real listing (QURATOR-247)", priv8(ctx).await),
     ]
 }
 
@@ -235,6 +237,87 @@ async fn priv7(ctx: &Ctx) -> Result<()> {
     ensure!(
         hits.iter().all(|h| h.npub != author.npub()),
         "a private-collection tag must never be discoverable via a public tag search"
+    );
+    Ok(())
+}
+
+/// PRIV8 (QURATOR-247): a JUNK kind-1059 wrap p-tagged to the recipient (garbage content from a
+/// random sender — exactly the QURATOR-291 flood surface the failed-open negative cache exists
+/// for) sits in the same `{kinds:[1059], #p:[me]}` inbox as the real private listing, and two
+/// consecutive `fetch_private_listings` polls BOTH return the real listing, unchanged, with no
+/// error. A wrap that fails to open is *expected traffic* — a relay mixes everyone's 1059s in
+/// this inbox — so junk must never surface as a fetch failure, and the second poll (which
+/// answers the junk id from `FAILED_OPENS` in the current build) must be output-identical to
+/// the first.
+///
+/// ⚠ What this row can and cannot prove, said plainly: the cache SKIP itself is not observable
+/// through `fetch_private_listings`' public surface — a junk wrap is skipped silently whether it
+/// fails a fresh open (no cache) or is answered from the negative cache (cache hit), so the
+/// poll assertions below would pass with the cache deleted. The observable teeth are (a) junk in
+/// the polled inbox breaks nothing and errors nowhere, pinned over BOTH polls so the cache-hit
+/// path of whatever build is under test cannot regress it, and (b) non-vacuousness — the raw
+/// inbox is checked to hold the junk wrap BY ID, so both polls demonstrably ran past it. The
+/// skip/record behaviour is pinned where it is observable, in hb-net `priv_browse`'s unit tests
+/// (`failed_listing_open_is_remembered_for_the_next_poll_qurator_247` and siblings).
+///
+/// MUTATION (P-10, for the orchestrator to apply): in `open_private_listing_wraps`
+/// (hb-net `priv_browse.rs`), change the `if let Some(o) = open_cached(me, &me_npub, w,
+/// LISTING_OPEN_SCOPE, open_private_listing) { … }` loop body to abort on a skipped wrap —
+/// `let Some(o) = open_cached(..) else { return Vec::new(); };` — one junk wrap in the inbox now
+/// starves the WHOLE fetch, poll 1 returns 0 listings, and this row reds on `got1.len() == 1`.
+/// Every other PRIV row's inbox holds exclusively openable wraps (PRIV3's spoofed wrap OPENS
+/// and dies at the allowlist, not in `open_cached`), so this mutation reds only PRIV8 — which is
+/// precisely the point: this is the one row whose inbox contains a wrap that fails to open.
+async fn priv8(ctx: &Ctx) -> Result<()> {
+    let author = Identity::generate();
+    let r = Identity::generate();
+    let spammer = Identity::generate();
+    let wraps = seal_private_listing(&author, &[r.public_key()], LISTING, now())?;
+
+    // The junk wrap: a real, relay-acceptable kind-1059 event p-tagged to r whose content is not
+    // a NIP-44 ciphertext under any key r holds — it fails `open_private_listing` at decrypt.
+    // The spammer publishes it directly: a flood wrap never came from the listing publisher.
+    let junk = spammer
+        .sign(
+            EventBuilder::new(Kind::GiftWrap, "not-a-real-nip44-ciphertext")
+                .tags([Tag::public_key(r.public_key())])
+                .custom_created_at(Timestamp::from(now())),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+    let junk_id = junk.id;
+
+    let ac = ctx.connect(&author).await?;
+    publish_private_listing(&ac, &wraps).await?;
+    ac.disconnect().await;
+    let sc = ctx.connect(&spammer).await?;
+    sc.publish(&junk).await?;
+    sc.disconnect().await;
+    settle().await;
+
+    let rc = ctx.connect(&r).await?;
+    // Non-vacuousness: the inbox r is about to poll holds BOTH the real wrap and the junk one —
+    // without this, a silently-rejected junk publish would make both polls below pass for nothing.
+    let raw =
+        rc.fetch(Filter::new().kind(Kind::GiftWrap).pubkey(r.public_key()), FETCH_TIMEOUT).await?;
+    ensure!(raw.len() >= 2, "expected the real wrap AND the junk wrap in r's inbox, got {}", raw.len());
+    ensure!(raw.iter().any(|e| e.id == junk_id), "the junk wrap is in the very inbox the polls read");
+
+    // Poll 1: the junk wrap fails to open, is skipped + remembered; the real listing still arrives.
+    let got1 = fetch_private_listings(&rc, &r, &[author.public_key()], FETCH_TIMEOUT).await?;
+    ensure!(
+        got1.len() == 1 && got1[0].listing_json == LISTING
+            && got1[0].inner_author == author.public_key(),
+        "poll 1: the junk wrap must neither hide nor corrupt the real listing, got {} listing(s)",
+        got1.len()
+    );
+    // Poll 2 — the cache-hit path in the current build: same inbox, same identity, output-identical.
+    let got2 = fetch_private_listings(&rc, &r, &[author.public_key()], FETCH_TIMEOUT).await?;
+    rc.disconnect().await;
+    ensure!(
+        got2.len() == 1 && got2[0].listing_json == LISTING
+            && got2[0].inner_author == author.public_key(),
+        "poll 2: a remembered junk wrap never swallows the real listing, got {} listing(s)",
+        got2.len()
     );
     Ok(())
 }
