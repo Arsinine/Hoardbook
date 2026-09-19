@@ -51,6 +51,14 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
             "TOPIC14 QURATOR-227: issuer-bound redeem skips the attacker's first-served wrap; the genuine issuer AND key win",
             topic14(ctx).await,
         ),
+        result(
+            "TOPIC15 QURATOR-294: junk in the shared join-request inbox breaks no poll (both polls)",
+            topic15(ctx).await,
+        ),
+        result(
+            "TOPIC16 QURATOR-294: an invite refused for the WRONG topic still redeems for the RIGHT one on the next poll",
+            topic16(ctx).await,
+        ),
     ]
 }
 
@@ -714,6 +722,207 @@ async fn topic14(ctx: &Ctx) -> Result<()> {
             .ok_or_else(|| anyhow!("the unbound control found no invite at all"))?;
     ensure!(cissuer == attacker.public_key(), "the unbound control redeemed the wrong issuer — is the pinned order still attacker-first?");
     ensure!(ckey.as_bytes() == attack_key.as_bytes(), "the unbound control did not return the attacker's key — the race this row exists for");
+    ic.disconnect().await;
+    Ok(())
+}
+
+// ── TOPIC15 (QURATOR-294: join-request negative cache over a real relay) ─────────────────────────
+
+/// TOPIC15 (QURATOR-294, hb-it half): the join-request scope of the failed-open negative cache,
+/// over a real relay. A junk kind-1059 wrap `#p`-tagged to the creator (a real, relay-acceptable
+/// event whose content is not a NIP-44 ciphertext under any key the creator holds — anyone who
+/// knows the pubkey can put it there, since the shared `{kinds:[1059], #p:[me]}` inbox is
+/// world-writable) sits alongside a genuine production `request_join` wrap, and two consecutive
+/// `fetch_join_requests` polls BOTH return the real request, unchanged, with no error. The
+/// join-request scope caches the FULL verdict (unwrap + parse), so the junk is remembered after
+/// poll 1 and answered from the cache on poll 2 — which must be output-identical to poll 1.
+///
+/// ⚠ What this row can and cannot prove, said plainly: the cache SKIP itself is not observable
+/// through `fetch_join_requests`' public surface — a junk wrap is skipped silently whether it
+/// fails a fresh open (cache deleted) or is answered from the negative cache (cache hit), so the
+/// poll assertions below would pass with the cache deleted. The observable teeth are (a) junk in
+/// the polled inbox breaks nothing and errors nowhere, pinned over BOTH polls so the cache-hit
+/// path of whatever build is under test cannot regress it, and (b) non-vacuousness — the raw inbox
+/// is checked to hold the junk wrap BY ID, so both polls demonstrably ran past it. The skip/record
+/// behaviour is pinned where it is observable, in hb-net `topic`'s unit tests
+/// (`join_request_open_failures_are_negatively_cached_per_identity` and siblings).
+///
+/// MUTATION (P-10, for the orchestrator to apply): in `open_join_request_wraps` (hb-net
+/// `crates/hb-net/src/topic.rs`), the line
+///     `            continue; // failed under THIS identity + scope on a prior poll — deterministic, skip`
+/// (the skip branch inside the `JOIN_REQUEST_OPEN_SCOPE` `failed_open_seen` check — line 826 when
+/// this row was written, line 800 after a sibling lane's in-flight `failed_wrap_cache` refactor;
+/// re-locate by the quoted text on the settled tree) — replace `continue;` with
+/// `return Vec::new();` so one remembered junk wrap starves the WHOLE fetch. Poll 1 is unaffected
+/// (first sight of the junk id: it attempts the open, fails, is recorded), but poll 2 hits the
+/// cache, aborts, and returns 0 requests — this row reds on `got2.len() == 1`. The same edit
+/// leaves TOPIC16 green (different scope, `INVITE_OPEN_SCOPE`) and every other TOPIC row green
+/// (their inboxes hold no junk).
+async fn topic15(ctx: &Ctx) -> Result<()> {
+    let creator = Identity::generate();
+    let requester = Identity::generate();
+    let spammer = Identity::generate();
+    let (meta, _key) = mk_private(ctx, "jr15");
+
+    // The genuine traffic: a production `request_join` DM — the exact producer whose output
+    // `fetch_join_requests` exists to parse (the harness never re-implements its body).
+    let qc = ctx.connect(&requester).await?;
+    request_join(&qc, &requester, &creator.public_key(), &meta.topic_id, &meta.name).await?;
+    qc.disconnect().await;
+
+    // The junk wrap: a real, relay-acceptable kind-1059 event p-tagged to the creator whose
+    // content is not a NIP-44 ciphertext under any key the creator holds — it fails `unwrap_dm`
+    // at decrypt. The spammer publishes it directly: a flood wrap never came from the requester.
+    let junk = spammer
+        .sign(
+            EventBuilder::new(Kind::GiftWrap, "not-a-real-nip44-ciphertext")
+                .tags([Tag::public_key(creator.public_key())])
+                .custom_created_at(Timestamp::from(now())),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+    let junk_id = junk.id;
+    let sc = ctx.connect(&spammer).await?;
+    publish_topic(&sc, std::slice::from_ref(&junk)).await?;
+    sc.disconnect().await;
+    settle().await;
+
+    let cc = ctx.connect(&creator).await?;
+    // Non-vacuousness: the inbox the creator is about to poll holds BOTH the real request wrap and
+    // the junk one — without this, a silently-rejected junk publish would make both polls below
+    // pass for nothing.
+    let raw =
+        cc.fetch(Filter::new().kind(Kind::GiftWrap).pubkey(creator.public_key()), FETCH_TIMEOUT).await?;
+    ensure!(raw.len() >= 2, "expected the request wrap AND the junk wrap in the creator's inbox, got {}", raw.len());
+    ensure!(raw.iter().any(|e| e.id == junk_id), "the junk wrap is in the very inbox the polls read");
+
+    // Poll 1: the junk wrap fails unwrap + parse, is skipped + remembered; the real request arrives.
+    let got1 = fetch_join_requests(&cc, &creator, FETCH_TIMEOUT).await?;
+    ensure!(
+        got1.len() == 1 && got1[0].0 == requester.public_key() && got1[0].1.topic_id == meta.topic_id,
+        "poll 1: the junk wrap must neither hide nor corrupt the real join request, got {} request(s)",
+        got1.len()
+    );
+    // Poll 2 — the cache-hit path in the current build: same inbox, same identity, output-identical.
+    let got2 = fetch_join_requests(&cc, &creator, FETCH_TIMEOUT).await?;
+    cc.disconnect().await;
+    ensure!(
+        got2.len() == 1 && got2[0].0 == requester.public_key() && got2[0].1.topic_id == meta.topic_id,
+        "poll 2: a remembered junk wrap never swallows the real join request, got {} request(s)",
+        got2.len()
+    );
+    Ok(())
+}
+
+// ── TOPIC16 (QURATOR-294: the invite scope's policy-refusal boundary over a real relay) ──────────
+
+/// TOPIC16 (QURATOR-294, hb-it half): the invite scope's correctness boundary, over a real relay.
+/// The invite scope deliberately caches ONLY the deterministic open verdict (`hb_core`'s
+/// `open_invite` — crypto, inner-kind pin, tags, payload parse and version consistency since
+/// QURATOR-298; it was just unwrap + the kind pin when this row was written), never the full redeem
+/// verdict, because the policy half consults CALLER context — a fresh
+/// `seen`, a caller `now`, and this caller's `expected_topic_id`/`expected_issuer`. The boundary:
+/// one and the same wrap, p-tagged to one invitee, is refused on poll 1 because the caller expects
+/// a DIFFERENT topic, and must still redeem on poll 2 when the caller expects the topic it
+/// actually names. A naive full-verdict cache (record the refusal like the gate failure) breaks
+/// exactly this — the wrap would be skipped on poll 2 and the join for the RIGHT topic silently
+/// denied. Junk sits in the same inbox and is served FIRST (pinned below), so the row also
+/// carries the PRIV8 shape for this scope: the cache-hit skip of the junk must not starve the
+/// redeem queued behind it.
+///
+/// ⚠ What this row can and cannot prove, said plainly: it proves the OBSERVABLE semantic boundary
+/// — a policy-refused wrap stays redeemable — which is precisely the property a naive cache
+/// regression destroys, and the reason the two scopes have different semantics at all. It cannot
+/// observe the junk wrap's cache HIT as such (skipped-on-cache and re-decrypted-and-failed look
+/// identical through `fetch_invite`'s public surface), so the skip/record behaviour itself is
+/// pinned in hb-net `topic`'s unit tests (`invite_policy_refusals_are_not_negatively_cached`,
+/// `a_production_invite_passes_the_gate_and_is_never_negatively_cached`), not here.
+/// Non-vacuousness is by-ID: the raw inbox is checked to hold BOTH the invite wrap and the junk
+/// wrap before either poll, and their order is pinned (junk first) so "junk does not starve the
+/// redeem" is deterministic rather than a coin flip of NIP-59 wrap timestamps.
+///
+/// MUTATION (P-10, for the orchestrator to apply): in `redeem_first_invite` (hb-net
+/// `crates/hb-net/src/topic.rs`), the line
+///     `        // Refused on POLICY grounds — NOT recorded (see this fn's doc).`
+/// (the refusal tail after `redeem_invite`'s failed `if let` — line 918 when this row was
+/// written, line 892 after a sibling lane's in-flight `failed_wrap_cache` refactor; re-locate by
+/// the quoted text on the settled tree) — insert
+/// `record_failed_open(&TOPIC_FAILED_OPENS, &me_npub, INVITE_OPEN_SCOPE, id);` beside that
+/// comment (the naive full-verdict cache; pass the cache handle the surrounding code uses after
+/// the refactor). Poll 1 then remembers the invite wrap under the invite scope, poll 2's
+/// `failed_open_seen` skip check (the `INVITE_OPEN_SCOPE` branch at the top of the same loop)
+/// skips it, `fetch_invite` returns `None`, and this row reds on the `ok_or_else`. Expect
+/// TOPIC14's unbound control to redden under the SAME edit (its issuer-refused attacker wrap
+/// would be skipped on the second redeem) — corroboration, not a problem. TOPIC15 stays green
+/// under this edit (different scope).
+async fn topic16(ctx: &Ctx) -> Result<()> {
+    let issuer = Identity::generate();
+    let invitee = Identity::generate();
+    let spammer = Identity::generate();
+    let (meta, key) = mk_private(ctx, "inv16a"); // the topic the invite names (the RIGHT one)
+    let (other, _okey) = mk_private(ctx, "inv16b"); // a different private topic (the WRONG expectation)
+
+    let minted = mint_invite(
+        &issuer, &invitee.public_key(), &meta, &key, "n295",
+        Some(now() + INVITE_TTL_SECS), now(),
+    )?;
+    // Pinned wrap timestamp 60s in the past (never future-dated — strfry rejects future events at
+    // the write boundary) so the junk wrap, stamped now(), is served FIRST (nostr's `Events`
+    // iterates `created_at` DESCENDING): the adversarial order for "a cached skip must not starve
+    // the redeem behind it".
+    let wrap = rewrap_invite(&invitee, &minted, now() - 60)?;
+
+    let junk = spammer
+        .sign(
+            EventBuilder::new(Kind::GiftWrap, "not-a-real-nip44-ciphertext")
+                .tags([Tag::public_key(invitee.public_key())])
+                .custom_created_at(Timestamp::from(now())),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+    let junk_id = junk.id;
+
+    let sc = ctx.connect(&spammer).await?;
+    publish_topic(&sc, std::slice::from_ref(&junk)).await?;
+    sc.disconnect().await;
+    let gc = ctx.connect(&issuer).await?;
+    publish_topic(&gc, std::slice::from_ref(&wrap)).await?;
+    gc.disconnect().await;
+    settle().await;
+
+    let ic = ctx.connect(&invitee).await?;
+    // Non-vacuousness + ordering: the inbox holds BOTH wraps BY ID, junk FIRST.
+    let inbox = ic
+        .fetch(Filter::new().kind(Kind::GiftWrap).pubkey(invitee.public_key()), FETCH_TIMEOUT)
+        .await?;
+    let pos = |id: EventId| inbox.iter().position(|e| e.id == id);
+    let pj = pos(junk_id).ok_or_else(|| anyhow!("the junk wrap is not in the inbox"))?;
+    let pw = pos(wrap.id).ok_or_else(|| anyhow!("the invite wrap is not in the very inbox the polls read"))?;
+    ensure!(
+        pj < pw,
+        "ordering precondition unmet: junk at {pj}, invite at {pw} — this run cannot prove a cached skip spares the redeem behind it"
+    );
+
+    // Poll 1 — bound to the WRONG topic (and the RIGHT issuer, so the topic expectation is the
+    // only differing variable): the invite passes the deterministic gate, is refused on POLICY
+    // grounds, and that refusal must NOT be remembered. A fresh `NonceSet` per poll keeps the
+    // polls independent of single-use burn bookkeeping.
+    let refused = fetch_invite(
+        &ic, &invitee, &mut NonceSet::new(), now(), FETCH_TIMEOUT,
+        Some(&other.topic_id), Some(&issuer.public_key()),
+    )
+    .await?;
+    ensure!(refused.is_none(), "an invite naming topic A redeemed while topic B was expected");
+
+    // Poll 2 — SAME wrap, SAME identity, fresh NonceSet, bound to the RIGHT topic: it must still
+    // redeem, past the junk the cache now answers for.
+    let (bmeta, bkey, bissuer) = fetch_invite(
+        &ic, &invitee, &mut NonceSet::new(), now(), FETCH_TIMEOUT,
+        Some(&meta.topic_id), Some(&issuer.public_key()),
+    )
+    .await?
+    .ok_or_else(|| anyhow!("the wrap refused for topic B no longer redeems for topic A — the policy refusal WAS cached (the exact QURATOR-294 boundary)"))?;
+    ensure!(bissuer == issuer.public_key(), "the right-topic redeem returned the wrong issuer");
+    ensure!(bkey.as_bytes() == key.as_bytes(), "the right-topic redeem returned the wrong topic KEY");
+    ensure!(bmeta.topic_id == meta.topic_id, "the right-topic redeem returned a different topic");
     ic.disconnect().await;
     Ok(())
 }
