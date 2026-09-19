@@ -475,21 +475,55 @@ fn record_failed_wrap(identity_npub: &str, id: String) {
         .insert(failed_wrap_key(identity_npub, &id));
 }
 
+/// (QURATOR-297) The ONE construction of the kind-1059 personal-inbox fetch filter. Every consumer
+/// of the shared gift-wrap inbox in this crate — the chat poll here, `auto_approve`'s request
+/// inbox, `fetch_driver`'s ticket-redemption poll — builds its filter through this fn, so the
+/// fetch budget and the window convention are STRUCTURAL, not a prose claim that three
+/// hand-copies agree. hb-net's `topic_inbox_filter` is the same discipline one crate over.
+///
+/// `since` is **PRE-MARGINED**: the caller applies its wobble allowance BEFORE calling
+/// (`dm_inbox_filter` subtracts `DM_FETCH_MARGIN_SECS` in its wrapper; `auto_approve` and
+/// `fetch_driver` subtract it at their call sites), and `since == 0` means "no window" — the
+/// cold, full initial pull. The margin is deliberately NOT subtracted in here: this fn must
+/// never apply it, or `dm_inbox_filter` applies it twice — pinned by
+/// `dm_inbox_filter_applies_the_margin_exactly_once` and
+/// `giftwrap_inbox_filter_passes_the_pre_margined_since_through`.
+///
+// MUTATION (P-10, for the orchestrator to apply): delete the `.limit(DM_INBOX_FETCH_LIMIT)`
+// call on the `let f = …` line directly below — chat.rs:503, the line reading
+// `    let f = Filter::new().kind(Kind::GiftWrap).pubkey(me).limit(DM_INBOX_FETCH_LIMIT);`.
+// That ONE edit must red the budget pin of EVERY consumer:
+//   - chat.rs      `dm_inbox_filter_declares_an_explicit_limit`
+//   - auto_approve `auto_approve_inbox_filter_declares_a_fetch_budget`
+//   - fetch_driver `ticket_inbox_filter_declares_budget_and_window`
+// plus the builder's own `giftwrap_inbox_filter_passes_the_pre_margined_since_through` (its
+// limit assert). One mutation, three consumer pins — that cross-consumer red is the point of
+// QURATOR-297.
+pub(crate) fn giftwrap_inbox_filter(me: PublicKey, since: u64) -> Filter {
+    let f = Filter::new().kind(Kind::GiftWrap).pubkey(me).limit(DM_INBOX_FETCH_LIMIT);
+    if since > 0 {
+        f.since(Timestamp::from(since))
+    } else {
+        f
+    }
+}
+
 /// The inbox fetch filter: kind-1059 wraps addressed to us, bounded by `since = cursor − margin` once
 /// the cache has a cursor (an incremental read — most polls then return ~nothing), or unbounded on a
 /// cold cache (the one full initial pull). `since` is **bandwidth-only** — dedup + security are by
 /// wrap id and the persisted block/decline sets, never this attacker-fuzzable timestamp.
 ///
+/// Thin wrapper (QURATOR-297): applies THIS consumer's `DM_FETCH_MARGIN_SECS` exactly once, then
+/// delegates to [`giftwrap_inbox_filter`]. Footnote on an unreachable edge: a cursor in
+/// `(0, margin]` used to surface as `since = Some(0)`; it now omits the window instead —
+/// relay-equivalent (a `since ≥ 0` matches every event) and unreachable, since a warm cursor is
+/// always a real wrap stamp.
+///
 /// `pub(crate)` so the `hb-wan-it` WAN-C suite can drive the exact cursor/fetch path `get_messages`
 /// uses (the future-poison clamp + restart round-trip is a WAN-C row). No full `pub` — this is an
 /// internal seam, not a stable API.
 pub(crate) fn dm_inbox_filter(me: PublicKey, newest_seen_outer: u64) -> Filter {
-    let f = Filter::new().kind(Kind::GiftWrap).pubkey(me).limit(DM_INBOX_FETCH_LIMIT);
-    if newest_seen_outer > 0 {
-        f.since(Timestamp::from(newest_seen_outer.saturating_sub(DM_FETCH_MARGIN_SECS)))
-    } else {
-        f
-    }
+    giftwrap_inbox_filter(me, newest_seen_outer.saturating_sub(DM_FETCH_MARGIN_SECS))
 }
 
 /// Incremental decode + cache merge (devtest v0.12.4 #2). For each fetched wrap NOT already in the
@@ -3007,6 +3041,49 @@ mod tests {
         assert_eq!(cold.limit, Some(DM_INBOX_FETCH_LIMIT), "the cold-cache filter declares a budget");
         let incremental = dm_inbox_filter(me.public_key(), now_secs());
         assert_eq!(incremental.limit, Some(DM_INBOX_FETCH_LIMIT), "the incremental filter too");
+    }
+
+    #[test]
+    fn giftwrap_inbox_filter_passes_the_pre_margined_since_through() {
+        // QURATOR-297 builder contract: `since` lands VERBATIM — the builder must never subtract
+        // a margin of its own (every consumer margins BEFORE calling), and 0 stays "no window".
+        // Part of the ONE cross-consumer mutation recorded beside `giftwrap_inbox_filter`.
+        let me = Identity::generate();
+        let margined = 1_788_220_800;
+        let warm = giftwrap_inbox_filter(me.public_key(), margined);
+        assert_eq!(
+            warm.limit,
+            Some(DM_INBOX_FETCH_LIMIT),
+            "the shared builder declares the budget every consumer inherits"
+        );
+        assert_eq!(
+            warm.since.map(|s| s.as_secs()),
+            Some(margined),
+            "a PRE-margined since passes through verbatim — the builder never subtracts"
+        );
+        let cold = giftwrap_inbox_filter(me.public_key(), 0);
+        assert!(cold.since.is_none(), "since == 0 is the cold, full initial pull");
+    }
+
+    #[test]
+    fn dm_inbox_filter_applies_the_margin_exactly_once() {
+        // QURATOR-297 — the double-apply guard. `dm_inbox_filter` is the ONE consumer that
+        // margins inside its own wrapper; the shared builder must not margin again. A second
+        // application silently shrinks chat's window by 48 h — the exact regression this
+        // extraction could have introduced, pinned here.
+        // MUTATION (P-10): make `giftwrap_inbox_filter`'s since arm subtract
+        // `DM_FETCH_MARGIN_SECS` (chat.rs, `f.since(Timestamp::from(since))`) and this reds
+        // (`Some(t − 2×margin) != Some(t − margin)`).
+        let me = Identity::generate();
+        let cursor = 1_788_220_800;
+        let f = dm_inbox_filter(me.public_key(), cursor);
+        assert_eq!(
+            f.since.map(|s| s.as_secs()),
+            Some(cursor - DM_FETCH_MARGIN_SECS),
+            "chat's effective since is cursor − margin, applied EXACTLY once"
+        );
+        let cold = dm_inbox_filter(me.public_key(), 0);
+        assert!(cold.since.is_none(), "a cold cursor (0) carries no since");
     }
 
     #[tokio::test]

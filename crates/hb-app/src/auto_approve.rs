@@ -118,7 +118,7 @@ use std::time::Duration;
 
 use nostr::prelude::*;
 
-use crate::commands::chat::{decode_dms, DM_FETCH_MARGIN_SECS, DM_INBOX_FETCH_LIMIT};
+use crate::commands::chat::{decode_dms, giftwrap_inbox_filter, DM_FETCH_MARGIN_SECS};
 use crate::commands::fulfil::{send_cached_manifest_inner, send_full_list_inner};
 use crate::identity_state::SharedIdentity;
 use crate::net::{self, SharedRelay};
@@ -531,19 +531,18 @@ pub(crate) fn approval_body_for(body: &ManifestRequestBody) -> ApprovalBody {
     }
 }
 
-/// QURATOR-197 — this loop's gift-wrap inbox filter: the SAME hardening `dm_inbox_filter`
-/// (`commands/chat.rs`) gives the chat inbox, so the background poll is not the unhardened sibling
-/// of the pair. The explicit `.limit()` keeps the fetch budget ours — without it the 5 s poll
+/// QURATOR-197 / QURATOR-297 — this loop's gift-wrap inbox filter: a thin delegate to the ONE
+/// shared builder (`commands::chat::giftwrap_inbox_filter`), so the request inbox carries
+/// STRUCTURALLY the same hardening as the chat inbox (`dm_inbox_filter`) and the ticket poll
+/// (`ticket_inbox_filter`) — the budget and window convention can no longer drift between
+/// hand-copies. The explicit `.limit()` keeps the fetch budget ours — without it the 5 s poll
 /// leaves the response size to the relay's own default (strfry's `maxFilterLimit`; CWE-400) and
-/// re-decrypts whatever comes back, every tick. `since == 0` (cold cursor) omits the window, so
-/// the first poll stays the one full initial pull.
+/// re-decrypts whatever comes back, every tick. The `since` handed in is ALREADY margined by the
+/// caller (the `saturating_sub(DM_FETCH_MARGIN_SECS)` at the call site) — the shared builder
+/// never subtracts it. `since == 0` (cold cursor) omits the window, so the first poll stays the
+/// one full initial pull.
 fn auto_approve_inbox_filter(me: PublicKey, since: u64) -> Filter {
-    let f = Filter::new().kind(Kind::GiftWrap).pubkey(me).limit(DM_INBOX_FETCH_LIMIT);
-    if since > 0 {
-        f.since(Timestamp::from(since))
-    } else {
-        f
-    }
+    giftwrap_inbox_filter(me, since)
 }
 
 /// The loop itself. Runs forever; every decision is logged (info for approvals, debug/warn for the
@@ -897,6 +896,11 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only (QURATOR-297): production's inbox filter now goes through
+    // `giftwrap_inbox_filter`, so the budget const is no longer used by this file's non-test
+    // code — importing it at module scope would be an `unused_imports` warning (a `-D warnings`
+    // build failure) in the non-test compilation unit.
+    use crate::commands::chat::DM_INBOX_FETCH_LIMIT;
     use hb_core::Identity;
     use nostr::prelude::ToBech32;
     use std::collections::HashMap;
@@ -905,9 +909,11 @@ mod tests {
     /// `dm_inbox_filter`'s pin (audit #11, CWE-400): without `.limit()` the 5 s poll leaves the
     /// response size to the relay's own default and re-decrypts whatever comes back, every tick.
     ///
-    /// MUTATION (P-10) — remove `.limit(DM_INBOX_FETCH_LIMIT)` from `auto_approve_inbox_filter`
-    /// and the first two asserts red (`None != Some(1000)`); remove the `since` arm and the
-    /// third reds.
+    /// MUTATION (P-10, re-pointed QURATOR-297) — remove `.limit(DM_INBOX_FETCH_LIMIT)` from the
+    /// shared builder `giftwrap_inbox_filter` (`commands/chat.rs`; `auto_approve_inbox_filter`
+    /// no longer carries the construction itself) and the first two asserts red
+    /// (`None != Some(1000)`); remove the `since` arm there and the third reds. This is this
+    /// consumer's share of the ONE cross-consumer mutation recorded beside the builder.
     #[test]
     fn auto_approve_inbox_filter_declares_a_fetch_budget() {
         let me = Identity::generate();

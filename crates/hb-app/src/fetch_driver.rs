@@ -48,8 +48,8 @@ use tokio::time::Instant;
 
 use crate::commands::browse::{contact_share_code, resolve_peer};
 use crate::commands::chat::{
-    decode_dms, request_manifest_from_inner, request_manifest_inner, DM_FETCH_MARGIN_SECS,
-    DM_INBOX_FETCH_LIMIT,
+    decode_dms, giftwrap_inbox_filter, request_manifest_from_inner, request_manifest_inner,
+    DM_FETCH_MARGIN_SECS,
 };
 use crate::commands::fulfil::redeem_manifest_ticket_inner;
 use crate::identity_state::SharedIdentity;
@@ -222,18 +222,15 @@ fn ticket_inbox_since(asks: &HashMap<String, ManifestAsk>, now: u64) -> u64 {
         .unwrap_or(0)
 }
 
-/// QURATOR-197 — the redemption poll's inbox filter: BOTH bounds the chat inbox's
-/// `dm_inbox_filter` (`commands/chat.rs`) already carries. The `.limit()` keeps the fetch budget
-/// ours (CWE-400 — otherwise the relay's own default decides how much the 300 s poll
-/// re-decrypts); the `since` window (from [`ticket_inbox_since`]) stops the poll from
-/// re-fetching all-time history. `since == 0` omits the window — the cold/fail-open anchor.
+/// QURATOR-197 / QURATOR-297 — the redemption poll's inbox filter: a thin delegate to the ONE
+/// shared builder (`commands::chat::giftwrap_inbox_filter`), so it carries STRUCTURALLY both
+/// bounds the chat inbox's `dm_inbox_filter` has — the `.limit()` keeps the fetch budget ours
+/// (CWE-400 — otherwise the relay's own default decides how much the 300 s poll re-decrypts)
+/// and the `since` window stops the poll from re-fetching all-time history. The `since` (from
+/// [`ticket_inbox_since`]) arrives ALREADY margined — the shared builder never subtracts.
+/// `since == 0` omits the window — the cold/fail-open anchor.
 fn ticket_inbox_filter(me: PublicKey, since: u64) -> Filter {
-    let f = Filter::new().kind(Kind::GiftWrap).pubkey(me).limit(DM_INBOX_FETCH_LIMIT);
-    if since > 0 {
-        f.since(Timestamp::from(since))
-    } else {
-        f
-    }
+    giftwrap_inbox_filter(me, since)
 }
 
 /// QURATOR-197 (F19) — pure core: the re-dial wait after `attempts` failed dials of one ask.
@@ -745,6 +742,11 @@ fn truncate(npub: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only (QURATOR-297): production's inbox filters now go through
+    // `giftwrap_inbox_filter`, so the budget const is no longer used by this file's non-test
+    // code — importing it at module scope would be an `unused_imports` warning (a `-D warnings`
+    // build failure) in the non-test compilation unit.
+    use crate::commands::chat::DM_INBOX_FETCH_LIMIT;
 
     fn held(npub: &str, slug: &str, fp: &str) -> CachedKey {
         CachedKey { npub: npub.into(), slug: slug.into(), fingerprint: fp.into() }
@@ -1163,8 +1165,11 @@ mod tests {
     /// decides how much the 300 s poll re-decrypts) and a `since` window (otherwise it re-fetches
     /// all-time history every poll).
     ///
-    /// MUTATION (P-10) — remove `.limit(DM_INBOX_FETCH_LIMIT)` from `ticket_inbox_filter` and the
-    /// first two asserts red; remove the `since` arm and the third reds.
+    /// MUTATION (P-10, re-pointed QURATOR-297) — remove `.limit(DM_INBOX_FETCH_LIMIT)` from the
+    /// shared builder `giftwrap_inbox_filter` (`commands/chat.rs`; `ticket_inbox_filter` no
+    /// longer carries the construction itself) and the first two asserts red; remove the `since`
+    /// arm there and the third reds. This is this consumer's share of the ONE cross-consumer
+    /// mutation recorded beside the builder.
     #[test]
     fn ticket_inbox_filter_declares_budget_and_window() {
         let me = hb_core::Identity::generate();
