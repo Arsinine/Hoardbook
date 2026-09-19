@@ -559,6 +559,29 @@ impl ManifestPlane {
         // Peek the request before claiming, because the claim is keyed by request_id. Re-framing the
         // already-read bytes back into `serve_manifest_stream` keeps that function the single
         // implementation of the protocol rather than duplicating the gate here.
+        //
+        // **QURATOR-243 — the claim is decided from the WHOLE request, not just its id.** Until
+        // this, the claim was taken from the peeked `request_id` alone (a frame that did not parse
+        // as a `FetchRequest` claimed the EMPTY STRING as its key), and it was taken BEFORE the
+        // gate ran inside `serve_manifest_stream` — so any request, however invalid, held its
+        // claim slot for the full refusal window: the refusal write carries `SEND_DEADLINE`
+        // (120s), and a stream of garbage borrowing a legitimate `request_id` could park that
+        // slot for 120s per probe while being refused, denying the honest holder's concurrent
+        // redemption as "already being redeemed". Now a request only claims if it would pass the
+        // gate: parsed as a `FetchRequest`, and through `validate_redemption` — the SAME
+        // shape + request-binding correctness check `serve_manifest_stream` runs below (and runs
+        // again; it is pure and cheap). A request that cannot pass never enters the set;
+        // `serve_manifest_stream` still refuses it exactly as before, so we skip the claim, not
+        // the refusal, and no gate or refusal wording is duplicated here.
+        //
+        // This is a *reordering of an existing shape check*, not a new permission (owner ruling
+        // 2026-09-03, QURATOR-177 Option E): nothing here consults state about WHO is asking, and
+        // the in-flight set stays what it was built to be — concurrency control for connections
+        // that will actually serve. A gate-passing request is claimed and served exactly as
+        // before. (Known bound, accepted with this fix: a ticket that passes `validate_redemption`
+        // but is refused later, at payload resolution, still claims for its refusal window —
+        // tickets are unsigned address delivery, so that shape is forgeable; if that window ever
+        // needs bounding too, the lever is a refusal-specific WRITE deadline, not more gate.)
         let frame = with_deadline(
             HANDSHAKE_DEADLINE,
             "the asker never finished sending its request",
@@ -566,19 +589,25 @@ impl ManifestPlane {
         )
         .await??;
 
-        let claim_key = serde_json::from_slice::<FetchRequest>(&frame)
-            .map(|r| r.request_id)
-            .unwrap_or_default();
-        let _guard = match self.claim(&claim_key) {
-            Some(g) => g,
-            None => {
-                let mut send = send;
-                // Concurrent redemption of the same ticket: refuse the second, do not serve it.
-                refuse(&mut send, "this ticket is already being redeemed on another connection")
-                    .await?;
-                drain_refusal(&conn).await;
-                return Ok(());
-            }
+        let claimable = serde_json::from_slice::<FetchRequest>(&frame)
+            .ok()
+            .filter(|req| validate_redemption(&req.ticket, &req.request_id).is_ok());
+        let _guard = match &claimable {
+            Some(req) => match self.claim(&req.request_id) {
+                Some(g) => Some(g),
+                None => {
+                    let mut send = send;
+                    // Concurrent redemption of the same ticket: refuse the second, do not serve it.
+                    refuse(&mut send, "this ticket is already being redeemed on another connection")
+                        .await?;
+                    drain_refusal(&conn).await;
+                    return Ok(());
+                }
+            },
+            // Not claimable: no slot is taken at all. `serve_manifest_stream` below produces the
+            // refusal (it remains the single implementation of the gate and its wording), while
+            // this connection holds nothing a concurrent honest redemption could collide with.
+            None => None,
         };
 
         let replayed = Framed::new(frame, recv);
@@ -2017,6 +2046,145 @@ pub(crate) mod tests {
             fetch_manifest(&client, &ticket, |_| Ok(()))
                 .await
                 .expect("the claim was released by the short drain, so the honest redemption succeeds");
+
+            client.close().await;
+            server.close().await;
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// **QURATOR-243 — a request that cannot pass the gate never takes an in-flight claim.**
+    ///
+    /// The claim used to be taken from the peeked `request_id` alone, BEFORE the gate ran: any
+    /// request, however invalid, held its claim slot for the full refusal window (the refusal
+    /// write inside `serve_manifest_stream` carries `SEND_DEADLINE`, 120s) while it was being
+    /// refused. The attack the ticket names, driven here by hand in the
+    /// `a_refused_connection_releases_its_claim_...` style: a raw client sends a request
+    /// borrowing the LEGITIMATE request id but carrying a ticket bound to a DIFFERENT request —
+    /// the frame parses, so the old peek found the id, but `validate_redemption`'s request-binding
+    /// arm fails it. The connection reads its refusal and stays open, so on the old ordering the
+    /// claim on that id is still held in the refusal drain — and the honest redemption of the
+    /// same request id, sent with NO window waited out, must SUCCEED anyway. On the old ordering
+    /// that honest fetch lands inside the garbage's claim and is refused as "already being
+    /// redeemed" for up to 120s per probe.
+    ///
+    /// MUTATION (P-10, orchestrator applies and must see this red): in `ManifestPlane::serve`,
+    /// at the `let claimable = serde_json::from_slice::<FetchRequest>(&frame)` initializer
+    /// (transport.rs, the QURATOR-243 block), delete the
+    /// `.filter(|req| validate_redemption(&req.ticket, &req.request_id).is_ok())` line so the
+    /// initializer ends at `.ok();` — every parseable frame is claimable again, the garbage
+    /// request re-claims `req-1` for its refusal window, the honest fetch inside that window is
+    /// refused as "already being redeemed", and this test's final `expect` reds.
+    #[tokio::test]
+    async fn a_request_that_cannot_pass_the_gate_never_takes_the_in_flight_claim() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let (server, _source, ticket) = spawn_plane(50, "small").await;
+            let client = bind_local_endpoint(&rand::random(), vec![]).await;
+
+            // Borrow the LEGITIMATE request id, but bind the ticket to a different request: the
+            // frame parses, so the old peek extracted the id, while `validate_redemption` fails
+            // the request-binding arm and `serve_manifest_stream` refuses it.
+            let mismatched = TransportTicket::issue(
+                "someone-elses-request",
+                "small",
+                &ticket.node_addr,
+                1_700_000_000,
+                Some("nonce-1"),
+            );
+            let conn = client
+                .connect(parse_node_addr(&ticket.node_addr).unwrap(), MANIFEST_ALPN)
+                .await
+                .expect("dial");
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            let req = FetchRequest { request_id: ticket.request_id.clone(), ticket: mismatched };
+            write_framed(&mut send, &serde_json::to_vec(&req).unwrap()).await.unwrap();
+            assert_eq!(
+                recv.read_u8().await.unwrap(),
+                STATUS_REFUSED,
+                "the gate still refuses the request — skipping the claim skips nothing else"
+            );
+            let reason = read_framed(&mut recv, REFUSAL_MAX_FRAME).await.unwrap();
+            assert_eq!(
+                reason,
+                REFUSAL_NO_MATCH.as_bytes(),
+                "the refusal is the gate's, not the in-flight set's"
+            );
+            // `conn`, `send`, `recv` stay in scope and open: on the OLD ordering the claim on
+            // `req-1` would still be held here, in the refusal drain.
+
+            // No window is waited out. The honest redemption of the same request id must succeed
+            // immediately — nothing it could collide with was ever claimed.
+            fetch_manifest(&client, &ticket, |_| Ok(()))
+                .await
+                .expect("an unclaimable request holds no slot, so the honest redemption succeeds");
+
+            client.close().await;
+            server.close().await;
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// **QURATOR-243 — a malformed frame claims nothing, not even the empty string.**
+    ///
+    /// The old peek extracted only `request_id` with `.unwrap_or_default()`, so a frame that did
+    /// not parse as a `FetchRequest` at all claimed the EMPTY STRING as its key: every malformed
+    /// frame collided on one slot, and a second malformed frame inside the first's refusal window
+    /// was refused as "already being redeemed" — a claim the request had no business taking, held
+    /// for a peer-controlled window. Reading on that shape: the collision was mostly benign in
+    /// OUTCOME (a malformed frame is refused either way; only the refusal's wording was wrong),
+    /// but it was the ticket's slot-parking problem in miniature — the `""` slot held per
+    /// malformed frame, for nothing. With the whole-request peek a malformed frame is simply not
+    /// claimable, and `serve_manifest_stream` answers each one with the same "malformed fetch
+    /// request" refusal, independently.
+    ///
+    /// MUTATION (P-10, orchestrator applies and must see this red): in `ManifestPlane::serve`,
+    /// in the QURATOR-243 `let _guard = match &claimable { ... }` block (transport.rs), change
+    /// the final `None => None,` arm (the one whose comment says "Not claimable: no slot is
+    /// taken at all") to `None => self.claim(""),` — unparseable frames then collide on the
+    /// empty-string key again, the second malformed frame below is refused as "already being
+    /// redeemed", and this test's final assertion reds. (Equivalently: revert the whole
+    /// QURATOR-243 hunk to the old `claim_key`/`unwrap_or_default` shape.)
+    #[tokio::test]
+    async fn a_malformed_frame_claims_nothing_not_even_the_empty_string() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let (server, _source, ticket) = spawn_plane(50, "small").await;
+            let client = bind_local_endpoint(&rand::random(), vec![]).await;
+
+            // First malformed frame: not JSON at all. On the old ordering this claims "" for the
+            // refusal window; either way it is refused as malformed.
+            let garbage: &[u8] = b"not json at all";
+            let conn1 = client
+                .connect(parse_node_addr(&ticket.node_addr).unwrap(), MANIFEST_ALPN)
+                .await
+                .expect("dial");
+            let (mut send1, mut recv1) = conn1.open_bi().await.unwrap();
+            write_framed(&mut send1, garbage).await.unwrap();
+            assert_eq!(recv1.read_u8().await.unwrap(), STATUS_REFUSED);
+            let reason1 = read_framed(&mut recv1, REFUSAL_MAX_FRAME).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&reason1).contains("malformed fetch request"),
+                "the first malformed frame is refused as malformed, got: {}",
+                String::from_utf8_lossy(&reason1)
+            );
+
+            // Second malformed frame, sent while the first's refusal is still draining (`conn1`
+            // stays open): it must get the SAME malformed refusal, not "already being redeemed".
+            let conn2 = client
+                .connect(parse_node_addr(&ticket.node_addr).unwrap(), MANIFEST_ALPN)
+                .await
+                .expect("dial");
+            let (mut send2, mut recv2) = conn2.open_bi().await.unwrap();
+            write_framed(&mut send2, garbage).await.unwrap();
+            assert_eq!(recv2.read_u8().await.unwrap(), STATUS_REFUSED);
+            let reason2 = read_framed(&mut recv2, REFUSAL_MAX_FRAME).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&reason2).contains("malformed fetch request"),
+                "the second malformed frame must be refused AS MALFORMED, not as a duplicate \
+                 redemption — it never had a claim to collide with, got: {}",
+                String::from_utf8_lossy(&reason2)
+            );
 
             client.close().await;
             server.close().await;
