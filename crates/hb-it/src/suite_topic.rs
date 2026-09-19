@@ -4,20 +4,22 @@
 //! only; a joiner obtains the key and reads/writes), the **member-pubkey-is-a-pseudonym** raw-query
 //! (no real npub leaks, m6), the **spoofable** member count, **private** invite + request→approve
 //! admission (a non-member finds nothing), **M3** any-member-may-invite, **leave→shrink +
-//! auto-dissolve**, the **24h** channel filter, and **F14** multi-relay fetch-from-each.
+//! auto-dissolve**, the **24h** channel filter, **F14** multi-relay fetch-from-each, and
+//! **QURATOR-227** issuer-bound invite redeem (an attacker's first-served wrap naming the same
+//! topic_id is skipped; the genuine key wins).
 
 use anyhow::{anyhow, ensure, Result};
 use hb_core::topic::{
-    build_announce, build_public_join, normalized_public_name, roster, seal_membership,
-    topic_id_for_name, NonceSet, TopicKey, TopicMeta, KIND_TOPIC_MEMBER, KIND_TOPIC_POST,
-    POST_TTL_SECS,
+    build_announce, build_public_join, mint_invite, normalized_public_name, roster,
+    seal_membership, topic_id_for_name, NonceSet, TopicKey, TopicMeta, KIND_TOPIC_MEMBER,
+    KIND_TOPIC_POST, POST_TTL_SECS,
 };
 use hb_core::{new_topic, Identity};
 use hb_net::{
     announce_to_topic, approve_join, discover_public_topics, fetch_announce, fetch_channel,
     fetch_channel_full, fetch_invite, fetch_join_requests, fetch_membership_events, fetch_roster,
     join_public, join_topic, leave_topic, member_count, post_to_channel, publish_topic,
-    request_join,
+    request_join, INVITE_TTL_SECS,
 };
 use nostr::prelude::*;
 
@@ -44,6 +46,10 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
         result(
             "TOPIC13 same-name create is join-first: B lands in A's roster (devtest #11)",
             topic13(ctx).await,
+        ),
+        result(
+            "TOPIC14 QURATOR-227: issuer-bound redeem skips the attacker's first-served wrap; the genuine issuer AND key win",
+            topic14(ctx).await,
         ),
     ]
 }
@@ -586,5 +592,128 @@ async fn topic13(ctx: &Ctx) -> Result<()> {
     let chan = fetch_channel(&bc, &meta_a.topic_id, &jkey, now(), FETCH_TIMEOUT).await?;
     bc.disconnect().await;
     ensure!(chan.iter().any(|p| p.body == "welcome to anime classics"), "B reads A's channel post under the shared key");
+    Ok(())
+}
+
+// ── TOPIC14 (QURATOR-227: issuer substitution — the attacker's first-served wrap is skipped) ────
+
+/// TOPIC14 (QURATOR-227): two valid single-use invites to the SAME invitee naming the SAME
+/// `topic_id` sit in one inbox — the genuine issuer's and an attacker's (both the `topic_id` and
+/// the invitee npub are public, so a decryptable forged wrap is fully constructible; it carries
+/// the ATTACKER's own key). Both wraps are then RE-SEALED with pinned `created_at`s — the
+/// attacker's NEWER, so the fetched vector serves it FIRST (nostr's `Events` collection iterates
+/// `created_at` descending) — because a run served the genuine wrap first would pass even under
+/// the regression this row exists to catch (an abort-on-mismatch `fetch_invite` loop would never
+/// see the attacker's wrap), and `mint_invite` alone cannot control that order: NIP-59 stamps
+/// every gift wrap `now − random(0..2 days)`, so two production-minted wraps race on a coin
+/// flip. The issuer-BOUND redeem (`Some(topic_id), Some(genuine_pk)`) must
+/// SKIP the attacker's wrap and return the genuine issuer AND the genuine topic key — the KEY is
+/// the actual harm, not just a wrong issuer label. The unbound control (`None, None`, fresh nonce
+/// set) demonstrates the race the binding closes: over the same attacker-first inbox it returns
+/// the ATTACKER's key (assertable precisely because the wrap order is pinned by construction,
+/// not left to the relay). This is the row hb-core's
+/// `issuer_bound_redeem_picks_the_genuine_wrap_regardless_of_order` defers to: that
+/// test pins `redeem_invite` over both orders in isolation; this row pins the SKIP-ON-MISMATCH
+/// loop (`fetch_invite`) over a live relay.
+/// MUTATION (P-10) that reds this row: hb-net's `fetch_invite` loop —
+/// `crates/hb-net/src/topic.rs:776`, the `if let Ok((meta, key, issuer)) = redeem_invite(..)`
+/// iteration — changed from skip-on-error to abort-on-error (return `Ok(None)` on the FIRST
+/// redeem error instead of continuing). With the attacker's wrap served first, the bound redeem
+/// returns None and this row fails; every other row's inbox holds exactly one invite, so only
+/// this row reds.
+/// Re-wrap a production-minted invite's seal in a fresh kind-1059 gift wrap stamped with a
+/// CHOSEN `created_at`. Needed because NIP-59 stamps every wrap `now − random(0..2 days)`
+/// (`RANGE_RANDOM_TIMESTAMP_TWEAK`), so the inbox order of two production-minted wraps is a coin
+/// flip this row cannot leave to chance — it must know which wrap `fetch_invite`'s loop sees
+/// FIRST or it cannot prove skip-on-mismatch. The outer wrap is the UNAUTHENTICATED transport
+/// layer — an ephemeral key by design; `redeem_invite` verifies its signature and then looks
+/// THROUGH it to the seal — so re-wrapping touches none of the credentials under test: the
+/// seal, rumor and payload stay byte-identical to what `mint_invite` produced (the invitee-side
+/// unwrap here is exactly what `redeem_invite` itself does, just re-encrypted under a fresh
+/// ephemeral key the row controls).
+fn rewrap_invite(invitee: &Identity, invite: &Event, created_at: u64) -> Result<Event> {
+    let seal_json = nip44::decrypt(invitee.keys().secret_key(), &invite.pubkey, &invite.content)
+        .map_err(|e| anyhow!("rewrap: could not unwrap the minted invite: {e}"))?;
+    let ek = Keys::generate();
+    let content = nip44::encrypt(ek.secret_key(), &invitee.public_key(), &seal_json, nip44::Version::V2)
+        .map_err(|e| anyhow!("rewrap: could not re-encrypt the seal: {e}"))?;
+    EventBuilder::new(Kind::GiftWrap, content)
+        .tags([Tag::public_key(invitee.public_key())])
+        .custom_created_at(Timestamp::from(created_at))
+        .sign_with_keys(&ek)
+        .map_err(|e| anyhow!("rewrap: could not sign the fresh wrap: {e}"))
+}
+
+async fn topic14(ctx: &Ctx) -> Result<()> {
+    let genuine = Identity::generate();
+    let attacker = Identity::generate();
+    let invitee = Identity::generate();
+    let (meta, key) = mk_private(ctx, "iss");
+
+    // Both mint a valid single-use invite to the SAME invitee naming the SAME topic_id. The
+    // attacker's forged-but-VALID wrap carries the GENUINE `meta` (topic_id is public by the
+    // time a preview names it) with the ATTACKER's own key, single-use + unexpired — so every
+    // `redeem_invite` check except the issuer binding passes for it.
+    let attack_key = TopicKey::generate();
+    let attack_minted = mint_invite(
+        &attacker, &invitee.public_key(), &meta, &attack_key, "a227",
+        Some(now() + INVITE_TTL_SECS), now(),
+    )?;
+    let genuine_minted = mint_invite(
+        &genuine, &invitee.public_key(), &meta, &key, "g227",
+        Some(now() + INVITE_TTL_SECS), now(),
+    )?;
+
+    // Re-seal both with pinned wrap timestamps: the attacker's NEWER (60s), so the fetched
+    // vector — nostr's `Events` collection iterates `created_at` DESCENDING — serves the
+    // attacker's wrap FIRST. Neither is future-dated (strfry rejects future events at write).
+    let attack_wrap = rewrap_invite(&invitee, &attack_minted, now())?;
+    let genuine_wrap = rewrap_invite(&invitee, &genuine_minted, now() - 60)?;
+
+    let ac = ctx.connect(&attacker).await?;
+    publish_topic(&ac, std::slice::from_ref(&attack_wrap)).await?;
+    ac.disconnect().await;
+    let gc = ctx.connect(&genuine).await?;
+    publish_topic(&gc, std::slice::from_ref(&genuine_wrap)).await?;
+    gc.disconnect().await;
+    settle().await;
+
+    // The invitee reads its inbox RAW (the same `{kinds:[1059], #p:[me]}` shape `fetch_invite`
+    // filters on; the invitee identity is fresh, so the inbox holds exactly these two wraps) to
+    // pin the ordering precondition: the attacker's wrap is served FIRST. Without this check a
+    // client-side ordering change would silently hollow the row out — it would pass even under
+    // an abort-on-mismatch loop that never reached the genuine wrap.
+    let ic = ctx.connect(&invitee).await?;
+    let inbox = ic
+        .fetch(Filter::new().kind(Kind::GiftWrap).pubkey(invitee.public_key()), FETCH_TIMEOUT)
+        .await?;
+    let pos = |id: EventId| inbox.iter().position(|e| e.id == id);
+    let pa = pos(attack_wrap.id).ok_or_else(|| anyhow!("the attacker's wrap is not in the inbox"))?;
+    let pg = pos(genuine_wrap.id).ok_or_else(|| anyhow!("the genuine wrap is not in the inbox"))?;
+    ensure!(
+        pa < pg,
+        "ordering precondition unmet: the fetch served the genuine wrap first (attacker at {pa}, genuine at {pg}) — this run cannot prove skip-on-mismatch"
+    );
+
+    // The issuer-BOUND redeem (the QURATOR-227 preview→redeem shape): skips the attacker's wrap,
+    // finds the genuine one behind it. Assert the returned KEY, not just the issuer.
+    let (bmeta, bkey, issuer) =
+        fetch_invite(&ic, &invitee, &mut NonceSet::new(), now(), FETCH_TIMEOUT, Some(&meta.topic_id), Some(&genuine.public_key()))
+            .await?
+            .ok_or_else(|| anyhow!("the issuer-bound redeem found no invite — did it abort on the attacker's wrap?"))?;
+    ensure!(issuer == genuine.public_key(), "the bound redeem returned the ATTACKER's issuer");
+    ensure!(bkey.as_bytes() == key.as_bytes(), "the bound redeem returned the attacker's topic KEY — issuer substitution succeeded");
+    ensure!(bmeta.topic_id == meta.topic_id, "the bound redeem returned a different topic");
+
+    // The unbound control over the SAME inbox: without the binding, the first wrap wins — and
+    // the first wrap is the ATTACKER's, so the unbound redeem hands over the attacker's key.
+    // Which-wrap is assertable here only because the wrap order is pinned by construction.
+    let (_cmeta, ckey, cissuer) =
+        fetch_invite(&ic, &invitee, &mut NonceSet::new(), now(), FETCH_TIMEOUT, None, None)
+            .await?
+            .ok_or_else(|| anyhow!("the unbound control found no invite at all"))?;
+    ensure!(cissuer == attacker.public_key(), "the unbound control redeemed the wrong issuer — is the pinned order still attacker-first?");
+    ensure!(ckey.as_bytes() == attack_key.as_bytes(), "the unbound control did not return the attacker's key — the race this row exists for");
+    ic.disconnect().await;
     Ok(())
 }
