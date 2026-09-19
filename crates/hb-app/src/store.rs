@@ -1414,6 +1414,38 @@ impl DataStore {
         Ok(removed)
     }
 
+    /// QURATOR-293 — LIVENESS eviction: drop this author's ask-trace entries whose slug the
+    /// CURRENT listing (`listed`) no longer carries, returning how many went. The companion of
+    /// [`evict_expired_manifest_asks`]: the 30-day window only bounds slugs the peer REMOVED (and
+    /// ex-contacts), eventually — this makes the removal take effect on the next discovery poll,
+    /// so a rotating malicious listing cannot hold a 30-day tail of dead `peer|author|slug` rows.
+    ///
+    /// ⚠ The caller must pass a listing that actually ARRIVED, never one a failed or undecryptable
+    /// enumeration reconciled out of the cache — the pure core
+    /// ([`manifest_ask_is_unlisted`]) cannot see that, and evicting on a hollow listing deletes
+    /// LIVE asks. `discover_unheld` gates on `ListingsStatus::Fetched` for exactly that reason.
+    ///
+    /// Same forget-never-refuse contract as the retention sweep: eviction only shortens the trace;
+    /// a fresh ask records and claims identically with the dead entries gone. Under
+    /// [`MANIFEST_ASKS_LOCK`] like every load-modify-save of this map, and saves only when
+    /// something was actually evicted.
+    pub fn evict_unlisted_manifest_asks(
+        &self,
+        author: &str,
+        listed: &std::collections::HashSet<String>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize> {
+        let _guard = MANIFEST_ASKS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut m = self.load_manifest_asks()?;
+        let before = m.len();
+        m.retain(|k, ask| !manifest_ask_is_unlisted(k, ask, author, listed, now));
+        let removed = before - m.len();
+        if removed > 0 {
+            self.save_manifest_asks(&m)?;
+        }
+        Ok(removed)
+    }
+
     // ── Issued transport tickets (M18 W4) — DELETED 2026-09-03, QURATOR-177 Option E (owner
     //    ruling: authorization is the standing grant checked at ASK time; the ticket is address
     //    delivery). This section was `issued_tickets_path`/`load_issued_tickets`/
@@ -1577,6 +1609,63 @@ pub(crate) fn manifest_ask_is_expired(
     match parse_watermark_ts(&ask.sent_at) {
         Some(sent) => {
             now.timestamp().saturating_sub(sent.timestamp()) >= MANIFEST_ASK_RETENTION_SECS as i64
+        }
+        None => false,
+    }
+}
+
+/// QURATOR-293 — how long an ask-trace entry is immune to LIVENESS eviction after it was sent:
+/// 1 hour.
+///
+/// An ask sent a moment ago may simply not have been answered yet — the peer answers in seconds
+/// but our redeem poll only reads the inbox every 300 s — and a poll that races it must not
+/// delete the authorization the reply will need (a manual ask loses its auto-dial otherwise).
+/// One hour is two orders of magnitude past that ask→answer→redeem cycle, mirroring how the
+/// 30-day window was sized against the dial machinery it authorises. The grace only DELAYS the
+/// eviction of dead entries; it never rescues one, because a listed slug's entry keeps being
+/// re-stamped by the re-ask and an unlisted one stops being asked the moment it drops out.
+pub(crate) const MANIFEST_ASK_LIVENESS_GRACE_SECS: u64 = 60 * 60;
+
+/// QURATOR-293 — pure core of liveness eviction: is this ask-trace entry dead because `author`'s
+/// CURRENT listing no longer carries its slug?
+///
+/// Attribution is by the key's AUTHOR segment — `{npub}|{author}|{slug}`, so one author's poll
+/// touches exactly that author's entries (self-asks `author == npub` AND Carrier-4 asks a third
+/// peer was asked about this author's collection): a slug-name collision with another author
+/// ("films") must never evict the other author's entry. A key that does not split into exactly
+/// three segments is not ours to interpret and is kept (the undateable-stamp discipline).
+///
+/// Two in-flight protections, both DELAY-shaped:
+/// - an UNSPENT entry a ticket has CLAIMED may still be inside the QURATOR-197 dial backoff
+///   (terminal ~70 min after the claim); it is exempt here but NOT from the 30-day window, so
+///   the exemption cannot make an entry immortal. A SPENT entry is terminal — it awaits nothing.
+/// - an entry inside [`MANIFEST_ASK_LIVENESS_GRACE_SECS`] of its `sent_at` may still be awaiting
+///   its first answer. An undateable `sent_at` is kept, for the same reason as in
+///   [`manifest_ask_is_expired`].
+///
+/// Like the retention sweep this forgets bookkeeping and refuses nothing: a very-late ticket
+/// answering a forgotten entry meets the same `Unsolicited` a spent or expired ask already met.
+pub(crate) fn manifest_ask_is_unlisted(
+    key: &str,
+    ask: &ManifestAsk,
+    author: &str,
+    listed: &std::collections::HashSet<String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let segments: Vec<&str> = key.split('|').collect();
+    if segments.len() != 3 || segments[1] != author {
+        return false;
+    }
+    let slug = segments[2];
+    if listed.contains(slug) {
+        return false;
+    }
+    if !ask.spent && ask.claimed_by.is_some() {
+        return false;
+    }
+    match parse_watermark_ts(&ask.sent_at) {
+        Some(sent) => {
+            now.timestamp().saturating_sub(sent.timestamp()) >= MANIFEST_ASK_LIVENESS_GRACE_SECS as i64
         }
         None => false,
     }
@@ -2894,6 +2983,149 @@ pub(crate) mod tests {
              within the retention window — a peer with fresh nonces cannot grow it forever"
         );
         assert!(left.keys().all(|k| k.contains("|cur-")), "only the within-window entries remain");
+    }
+
+    // ── QURATOR-293 — ask-trace LIVENESS eviction (composes with the 30-day window, never a cap) ──
+    // The retention sweep above only bounds slugs the peer REMOVED, eventually: a rotating listing
+    // holds a 30-day tail of dead rows. Eviction on the next discovery poll makes the removal take
+    // effect immediately — and, like retention, it forgets entries without ever refusing an ask.
+
+    /// QURATOR-293 — the core attribution: one author's poll evicts exactly that author's
+    /// unlisted entries (self-ask AND Carrier-4 spellings), never another author's same-named
+    /// slug, never a malformed key.
+    ///
+    /// MUTATION (P-10) — production anchor: `manifest_ask_is_unlisted` in store.rs, the
+    /// `if listed.contains(slug) { return false; }` guard. Change `listed.contains(slug)` to
+    /// `!listed.contains(slug)` → the LISTED entry is evicted and every unlisted one retained;
+    /// this test reds on `removed == 1` (expected 2) and on `left.len() == 4` (expected 3).
+    /// (Independent second mutation, run separately: delete the `|| segments[1] != author`
+    /// conjunct from the 3-segment check → the foreign `npub1b` entry is evicted too and both
+    /// asserts red the other way, `removed == 3` / `left.len() == 2`.)
+    #[test]
+    fn unlisted_ask_traces_are_evicted_and_listed_and_foreign_ones_retained() {
+        let (_dir, store) = test_store();
+        let now = retention_now();
+        // 24 h old — past the 1 h liveness grace, so nothing here is protected by freshness; the
+        // grace itself is pinned by the neighbouring test below.
+        let aged = "2026-05-31T00:00:00Z";
+        let mut m = std::collections::HashMap::new();
+        // The author's CURRENT listing carries "films": its trace is live, kept.
+        m.insert(manifest_ask_key("npub1a", "npub1a", "films"), ask_sent_at(aged));
+        // The author removed "rotated-out": dead bookkeeping, evicted.
+        m.insert(manifest_ask_key("npub1a", "npub1a", "rotated-out"), ask_sent_at(aged));
+        // ANOTHER author's entry for the REMOVED slug name — only the author-segment check keeps
+        // it alive when npub1a's poll sees "rotated-out" gone (slug collision, other direction).
+        m.insert(manifest_ask_key("npub1b", "npub1b", "rotated-out"), ask_sent_at(aged));
+        // A Carrier-4 ask ABOUT npub1a's removed slug, asked of a third peer: keyed by the AUTHOR
+        // being polled, it dies with the listing too.
+        m.insert(manifest_ask_key("npub1c", "npub1a", "rotated-out"), ask_sent_at(aged));
+        // A malformed key (4 segments — the legacy widener only maps 2→3 and leaves this alone):
+        // not attributable to any author, kept.
+        m.insert("npub1d|npub1d|films|extra".to_string(), ask_sent_at(aged));
+        store.save_manifest_asks(&m).unwrap();
+
+        let listed: std::collections::HashSet<String> =
+            ["films"].into_iter().map(String::from).collect();
+        let removed = store.evict_unlisted_manifest_asks("npub1a", &listed, now).unwrap();
+        assert_eq!(removed, 2, "the removed slug's self-ask AND carrier-ask traces die");
+        let left = store.load_manifest_asks().unwrap();
+        assert_eq!(left.len(), 3, "listed, foreign-author, and malformed keys survive");
+        assert!(left.contains_key(&manifest_ask_key("npub1a", "npub1a", "films")));
+        assert!(left.contains_key(&manifest_ask_key("npub1b", "npub1b", "rotated-out")));
+        assert!(!left.contains_key(&manifest_ask_key("npub1a", "npub1a", "rotated-out")));
+        assert!(!left.contains_key(&manifest_ask_key("npub1c", "npub1a", "rotated-out")));
+    }
+
+    /// QURATOR-293 — the two in-flight protections: an unspent CLAIMED entry may still be inside
+    /// the QURATOR-197 dial backoff, and a fresh ask may still be awaiting its first answer. A
+    /// SPENT entry is terminal and dies with the listing.
+    ///
+    /// MUTATION (P-10) — production anchor: `manifest_ask_is_unlisted` in store.rs, the
+    /// `if !ask.spent && ask.claimed_by.is_some() { return false; }` guard. Change
+    /// `ask.claimed_by.is_some()` to `false` → the claimed entry is evicted and this reds on
+    /// `removed == 3`. (Independent second mutation, run separately: change
+    /// `MANIFEST_ASK_LIVENESS_GRACE_SECS` from `60 * 60` to `0` → the awaiting-reply entry is
+    /// evicted and the same assert reds.)
+    #[test]
+    fn liveness_eviction_spares_a_claimed_ask_and_one_inside_its_grace() {
+        let (_dir, store) = test_store();
+        let now = retention_now();
+        let mut m = std::collections::HashMap::new();
+        // Unlisted, but a ticket CLAIMED it — the dial backoff may still be running.
+        let mut claimed = ask_sent_at("2026-05-01T00:00:00Z");
+        claimed.claimed_by = Some("req-1".into());
+        m.insert(manifest_ask_key("npub1a", "npub1a", "claimed"), claimed);
+        // Unlisted, asked 30 s ago — the reply may simply not have arrived yet.
+        m.insert(
+            manifest_ask_key("npub1a", "npub1a", "awaiting-reply"),
+            ask_sent_at("2026-05-31T23:59:30Z"),
+        );
+        // Unlisted, spent AND still carrying its claim — terminal: awaits nothing, dies.
+        let mut spent = ask_sent_at("2026-05-01T00:00:00Z");
+        spent.spent = true;
+        spent.claimed_by = Some("req-2".into());
+        m.insert(manifest_ask_key("npub1a", "npub1a", "answered"), spent);
+        // Unlisted, old, unclaimed — the eviction's actual target.
+        m.insert(manifest_ask_key("npub1a", "npub1a", "dead"), ask_sent_at("2026-05-01T00:00:00Z"));
+        store.save_manifest_asks(&m).unwrap();
+
+        let listed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert_eq!(store.evict_unlisted_manifest_asks("npub1a", &listed, now).unwrap(), 2);
+        let left = store.load_manifest_asks().unwrap();
+        assert!(left.contains_key(&manifest_ask_key("npub1a", "npub1a", "claimed")));
+        assert!(left.contains_key(&manifest_ask_key("npub1a", "npub1a", "awaiting-reply")));
+        assert!(!left.contains_key(&manifest_ask_key("npub1a", "npub1a", "answered")));
+        assert!(!left.contains_key(&manifest_ask_key("npub1a", "npub1a", "dead")));
+    }
+
+    /// QURATOR-293 — forget-never-refuse, and composition: eviction shortens the trace only, and
+    /// an author that produces NO listing at all (ex-contact, never polled) is still the 30-day
+    /// window's alone — the two sweeps are independent, so liveness eviction cannot strand an
+    /// entry the window would have taken.
+    ///
+    /// MUTATION (P-10) — production anchor: `evict_unlisted_manifest_asks`'s `m.retain` closure in
+    /// store.rs. Change `!manifest_ask_is_unlisted(k, ask, author, listed, now)` to `false`
+    /// (clear the whole map) → the LISTED "films" ask dies with the dead one, `removed` reports 2,
+    /// and this test reds on the very next assert (the FORGET half is pinned by the two tests
+    /// above; this one pins the refuse half and the composition).
+    #[test]
+    fn liveness_eviction_never_refuses_a_fresh_ask_and_composes_with_retention() {
+        let (_dir, store) = test_store();
+        let now = retention_now();
+        store
+            .record_manifest_ask("npub1a", "npub1a", "gone", "fp", "2026-05-01T00:00:00Z", "n-old")
+            .unwrap();
+        store
+            .record_manifest_ask("npub1a", "npub1a", "films", "fp", "2026-06-01T00:00:00Z", "n-new")
+            .unwrap();
+        let listed: std::collections::HashSet<String> =
+            ["films"].into_iter().map(String::from).collect();
+        assert_eq!(
+            store.evict_unlisted_manifest_asks("npub1a", &listed, now).unwrap(),
+            1,
+            "only the unlisted trace dies; the listed one is live"
+        );
+
+        // The ask loop that follows the sweep in the same discovery poll records and claims
+        // identically with the dead entry gone — eviction must never refuse an ask.
+        assert_eq!(
+            store.claim_manifest_ask("npub1a", "npub1a", "films", "n-new", "req-A").unwrap(),
+            crate::store::AskClaim::Granted,
+            "a fresh ask is always granted — liveness eviction forgets, never refuses"
+        );
+
+        // An author no poll ever sees again: liveness eviction cannot touch it, the window must.
+        store
+            .record_manifest_ask("npub1z", "npub1z", "orphan", "fp", "2026-05-01T00:00:00Z", "n-z")
+            .unwrap();
+        assert_eq!(
+            store.evict_expired_manifest_asks(now).unwrap(),
+            1,
+            "the ex-contact's orphan dies by retention, not liveness"
+        );
+        let left = store.load_manifest_asks().unwrap();
+        assert!(left.contains_key(&manifest_ask_key("npub1a", "npub1a", "films")));
+        assert!(!left.contains_key(&manifest_ask_key("npub1z", "npub1z", "orphan")));
     }
 
     /// **Carrier 4 lenient load (QURATOR-79)** — an ask map written by an older build carries

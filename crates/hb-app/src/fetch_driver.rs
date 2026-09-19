@@ -451,13 +451,22 @@ async fn discover_unheld(
             continue;
         }
         let Ok(share_code) = contact_share_code(contact) else { continue };
-        let published: Vec<(String, Option<String>)> =
+        // QURATOR-293 — carry the listing read's tri-state out of the match. Liveness eviction
+        // below must key off a listing that actually ARRIVED (`Fetched`): a successful resolve can
+        // still yield an empty (or cache-reconciled) collection list for reasons other than "the
+        // author published nothing" — a failed enumeration (`FetchFailed`) reconciled to a possibly
+        // empty cache, an undecryptable one (`Sealed`), or the keyless arm — and evicting on those
+        // deletes LIVE asks, the silent drop the no-caps ruling forbids. An offline author never
+        // reaches any of this: the `Err` arm `continue`s below.
+        let (published, listings_fetched): (Vec<(String, Option<String>)>, bool) =
             match resolve_peer(&share_code, identity, store, relay).await {
-                Ok(peer) => peer
-                    .collections
-                    .into_iter()
-                    .map(|c| (c.collection.slug, c.snapshot_fingerprint))
-                    .collect(),
+                Ok(peer) => (
+                    peer.collections
+                        .into_iter()
+                        .map(|c| (c.collection.slug, c.snapshot_fingerprint))
+                        .collect(),
+                    matches!(peer.listings_state, crate::store::ListingsStatus::Fetched),
+                ),
                 Err(e) => {
                     tracing::debug!(
                         author = %truncate(&contact.npub),
@@ -467,6 +476,28 @@ async fn discover_unheld(
                     continue;
                 }
             };
+
+        // QURATOR-293 — liveness eviction: an ask-trace entry for a slug this listing no longer
+        // carries is dead bookkeeping (the 30-day window bounds it only eventually, and a rotating
+        // listing keeps re-stamping the survivors). Runs BEFORE the ask loop, so nothing it keeps
+        // is re-minted underneath it; forgets entries only — it never refuses, skips, or bounds an
+        // ask (the 2026-09-02 no-caps ruling), which is what makes eviction lawful here at all.
+        if listings_fetched {
+            let listed: HashSet<String> = published.iter().map(|(slug, _)| slug.clone()).collect();
+            match store.evict_unlisted_manifest_asks(&contact.npub, &listed, chrono::Utc::now()) {
+                Ok(removed) if removed > 0 => tracing::info!(
+                    author = %truncate(&contact.npub),
+                    removed,
+                    "fetch driver: forgot ask traces for slugs the listing no longer carries"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::debug!(
+                    author = %truncate(&contact.npub),
+                    error = %e,
+                    "fetch driver: ask-trace liveness eviction skipped"
+                ),
+            }
+        }
 
         for (slug, fingerprint) in unheld_collections(held, &contact.npub, &published) {
             // ⚠ THE SHAPE OF THE ASK MUST MATCH WHO IS BEING ASKED — same rule as the refresh
@@ -1586,6 +1617,66 @@ mod tests {
         assert!(
             guard_at < discover_at,
             "the discovery call must live past the holdings guard, not before it"
+        );
+    }
+
+    /// QURATOR-293 — the liveness sweep must actually run inside the discovery pass, keyed off a
+    /// listing that ARRIVED. The pure core (`manifest_ask_is_unlisted`) is pinned in store.rs; a
+    /// helper nothing calls is the inert-fix shape (2026-09-16 receipt), and `discover_unheld`
+    /// cannot be driven in a unit test (it resolves a real peer over a relay) — so this pins the
+    /// glue by structure, the same contract `discovery_asks_the_author_authorlessly` holds.
+    ///
+    /// MUTATION (P-10) — production anchor: the `if listings_fetched {` block inside
+    /// `discover_unheld` (the block whose body calls `evict_unlisted_manifest_asks`). Delete the
+    /// whole block → the count assert below reds with 0 (the sweep never runs — the inert-fix
+    /// shape). Independent second mutation, run separately: replace
+    /// `matches!(peer.listings_state, crate::store::ListingsStatus::Fetched)` with `true` → the
+    /// `peer.listings_state` expect below panics (eviction would then key off failed/sealed
+    /// empties, deleting LIVE asks).
+    #[test]
+    fn liveness_eviction_runs_in_the_discovery_pass_on_an_arrived_listing_only() {
+        let src = include_str!("fetch_driver.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("async fn discover_unheld(")
+            .expect("the discovery helper must exist");
+        let end = code[at..]
+            .find("pub(crate) async fn run_fetch_driver_loop(")
+            .expect("the loop must follow the discovery helper")
+            + at;
+        let region = &code[at..end];
+        // Call forms, never bare names (CLAUDE.md §9).
+        assert_eq!(
+            region.matches("evict_unlisted_manifest_asks(").count(),
+            1,
+            "exactly one liveness sweep per author listing, called from the discovery pass"
+        );
+        // The gate is the listing read's TRI-STATE, read in the Ok arm — an offline author takes
+        // the Err arm's `continue` and evicts nothing, and a failed/sealed enumeration (whose
+        // collections reconcile out of a possibly-empty cache) is not `Fetched`.
+        let ok_at = region.find("Ok(peer) =>").expect("the Ok arm must exist");
+        let state_at = region
+            .find("peer.listings_state")
+            .expect("the listing tri-state must be read by the discovery pass");
+        let err_at = region.find("Err(e) =>").expect("the Err arm must exist");
+        assert!(
+            ok_at < state_at && state_at < err_at,
+            "the tri-state is read in the Ok arm only — a failed resolve cannot evict"
+        );
+        assert!(
+            region.contains("crate::store::ListingsStatus::Fetched"),
+            "the gate is the honest-empty state, never a bare emptiness check"
+        );
+        let evict_at = region
+            .find("evict_unlisted_manifest_asks(")
+            .expect("the liveness sweep must be called from the discovery pass");
+        assert!(
+            state_at < evict_at,
+            "eviction follows the successful listing read, not the other way round"
         );
     }
 
