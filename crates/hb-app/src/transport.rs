@@ -164,6 +164,33 @@ const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 /// that delivered the request.
 const REFUSAL_DRAIN: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long the owner's side waits to *write* a refusal — status byte, one ≤`REFUSAL_MAX_FRAME`
+/// framed reason, FIN — before treating the peer as never going to read it. The write-side sibling
+/// of `REFUSAL_DRAIN`: the drain argument (QURATOR-110) is that a refused connection is owed only
+/// a trickle, and the same holds for the write that precedes it. `SEND_DEADLINE` (120s) is sized
+/// for a 16 MiB manifest on a slow link; a ~4 KiB refusal has no legitimate need for it.
+/// What the 120s bound was costing (QURATOR-299): tickets are unsigned address delivery (owner
+/// ruling 2026-09-03, QURATOR-177 Option E), so any peer can mint a shape-valid ticket answering
+/// its own request — it clears `validate_redemption`, takes the in-flight claim in
+/// `ManifestPlane::serve` (and one of the three redemption permits), and only then dies at payload
+/// resolution, the first check that consults this node's state. A peer that simply stops reading
+/// parked all of that for the refusal write's full deadline, per probe.
+///
+/// 5s, reasoned against the drain rather than picked: 10× the 500ms that already declares "any
+/// link that delivered the request can flush a frame this size", i.e. ~15 RTTs on a lossy 300ms
+/// path — generous for an honest peer, whose flow-control credit for the stream was granted at
+/// handshake, before the request was even sent. And it stays far under the asker's own read bound
+/// (`HANDSHAKE_DEADLINE`, 30s), so an honest high-latency peer still reads the refusal AS a
+/// refusal — "no match" stays distinguishable from a network fault — while the refusal WRITE's
+/// contribution to the parkable window drops from 120s to 5s per probe.
+///
+/// ⚠ **5s is this deadline, NOT the worst-case claim hold — do not size a retry off it**
+/// (review finding, 2026-09-19). When the write genuinely stalls, `refuse()` errors at 5s and
+/// `serve`'s `Err` arm holds `_guard` through `drain_connection`, a SECOND 5s bound
+/// (`conn.rs`), so the claim releases at **~10s**, not 5. The win is still ~12× (was
+/// 120s + drain); the number to plan against is 10s.
+const REFUSAL_SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Apply a deadline to one step, turning a stall into a stated error instead of a wedged task.
 async fn with_deadline<T>(
     limit: std::time::Duration,
@@ -321,7 +348,7 @@ async fn write_framed(mut send: impl tokio::io::AsyncWrite + Unpin, bytes: &[u8]
 
 async fn refuse(mut send: impl tokio::io::AsyncWrite + Unpin, reason: &str) -> Result<()> {
     with_deadline(
-        SEND_DEADLINE,
+        REFUSAL_SEND_DEADLINE,
         "the peer stopped reading the refusal response",
         async {
             send.write_u8(STATUS_REFUSED).await.context("write refused status")?;
@@ -564,8 +591,9 @@ impl ManifestPlane {
         // this, the claim was taken from the peeked `request_id` alone (a frame that did not parse
         // as a `FetchRequest` claimed the EMPTY STRING as its key), and it was taken BEFORE the
         // gate ran inside `serve_manifest_stream` — so any request, however invalid, held its
-        // claim slot for the full refusal window: the refusal write carries `SEND_DEADLINE`
-        // (120s), and a stream of garbage borrowing a legitimate `request_id` could park that
+        // claim slot for the full refusal window: the refusal write carried `SEND_DEADLINE`
+        // (120s, at the time — since QURATOR-299, `REFUSAL_SEND_DEADLINE`), and a stream of
+        // garbage borrowing a legitimate `request_id` could park that
         // slot for 120s per probe while being refused, denying the honest holder's concurrent
         // redemption as "already being redeemed". Now a request only claims if it would pass the
         // gate: parsed as a `FetchRequest`, and through `validate_redemption` — the SAME
@@ -578,10 +606,11 @@ impl ManifestPlane {
         // 2026-09-03, QURATOR-177 Option E): nothing here consults state about WHO is asking, and
         // the in-flight set stays what it was built to be — concurrency control for connections
         // that will actually serve. A gate-passing request is claimed and served exactly as
-        // before. (Known bound, accepted with this fix: a ticket that passes `validate_redemption`
-        // but is refused later, at payload resolution, still claims for its refusal window —
-        // tickets are unsigned address delivery, so that shape is forgeable; if that window ever
-        // needs bounding too, the lever is a refusal-specific WRITE deadline, not more gate.)
+        // before. (A ticket that passes `validate_redemption` but is refused later, at payload
+        // resolution, still claims for its refusal window — tickets are unsigned address delivery,
+        // so that shape is forgeable. That window is bounded since QURATOR-299 by
+        // `REFUSAL_SEND_DEADLINE`, the refusal-specific WRITE deadline this note flagged as the
+        // lever, so the claim parks for seconds, not 120s, per probe.)
         let frame = with_deadline(
             HANDSHAKE_DEADLINE,
             "the asker never finished sending its request",
@@ -2058,7 +2087,8 @@ pub(crate) mod tests {
     ///
     /// The claim used to be taken from the peeked `request_id` alone, BEFORE the gate ran: any
     /// request, however invalid, held its claim slot for the full refusal window (the refusal
-    /// write inside `serve_manifest_stream` carries `SEND_DEADLINE`, 120s) while it was being
+    /// write inside `serve_manifest_stream` carried `SEND_DEADLINE`, 120s — since QURATOR-299,
+    /// `REFUSAL_SEND_DEADLINE`) while it was being
     /// refused. The attack the ticket names, driven here by hand in the
     /// `a_refused_connection_releases_its_claim_...` style: a raw client sends a request
     /// borrowing the LEGITIMATE request id but carrying a ticket bound to a DIFFERENT request —
@@ -2436,6 +2466,234 @@ pub(crate) mod tests {
         );
 
         ep.close().await;
+    }
+
+    /// A writer that never accepts a byte — the "peer stopped reading / zero flow-control window"
+    /// stance of QURATOR-299, as a writer whose `poll_write` simply never resolves. Unlike
+    /// `FailingWriter` (a hard error, driving the same `?` path without the wait), the only thing
+    /// that can end a write against this writer is the deadline wrapping it — which is exactly
+    /// what the test below needs to measure.
+    struct StallingWriter;
+
+    impl tokio::io::AsyncWrite for StallingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// **QURATOR-299 — a forged ticket that passes the gate is refused within the short refusal
+    /// WRITE deadline, not the manifest-sized 120s one.**
+    ///
+    /// Tickets are unsigned address delivery (owner ruling 2026-09-03, QURATOR-177 Option E), so
+    /// any peer can mint a shape-valid `TransportTicket` answering its own request: it clears
+    /// `validate_redemption` — shape plus request binding, a correctness check and deliberately
+    /// not an authorization — takes the in-flight claim in `ManifestPlane::serve` (and one of the
+    /// three redemption permits), and only then dies at payload resolution, the first check that
+    /// consults this node's actual state. Until QURATOR-299 that post-claim refusal was written
+    /// under `SEND_DEADLINE` (120s, sized for a 16 MiB manifest), so a peer that simply stopped
+    /// reading parked the claim for up to 120s per probe; the write is now bounded by
+    /// `REFUSAL_SEND_DEADLINE`, the write-side sibling of `REFUSAL_DRAIN` (QURATOR-110 bounded
+    /// the drain; this bounds the write that precedes it).
+    ///
+    /// The attacking ticket is the `post_resolution_refusals_are_byte_identical_on_the_wire`
+    /// arm-A fixture: minted for a request the source does not know, presented under its own
+    /// request id. Two halves, same path:
+    /// - an HONEST peer, simulated by a plain `Vec<u8>` writer: the refusal must arrive as
+    ///   readable BYTES — refused status byte, the shared `REFUSAL_NO_MATCH` reason — not merely
+    ///   quickly;
+    /// - the ATTACKING peer, simulated by `StallingWriter` (never accepts a byte): the deadline
+    ///   is the only thing that can end the refusal, so the elapsed time pins the constant.
+    ///
+    /// MUTATION (P-10, orchestrator applies and must see this red): in `refuse`
+    /// (crates/hb-app/src/transport.rs), at transport.rs:345 — the line reading
+    /// `        REFUSAL_SEND_DEADLINE,` (first argument of the `with_deadline(` call inside
+    /// `refuse`, the deadline wrapping `send.write_u8(STATUS_REFUSED)`) — restore
+    /// `        SEND_DEADLINE,`. The stalling half then hangs for the full 120s, this test's
+    /// `TEST_TIMEOUT` (30s) fires on the `tokio::time::timeout` wrapper, and the `expect` after
+    /// it reds. Resolve the anchor by line number, not text: `SEND_DEADLINE` also appears at the
+    /// manifest write and twice on the fetch side, so a bare-text anchor is ambiguous.
+    #[tokio::test]
+    async fn a_gate_passing_forged_ticket_is_refused_within_the_short_refusal_write() {
+        let ep = bind_local_endpoint(&rand::random(), vec![]).await;
+        // The source resolves only "req-299-known"; the forged ticket is minted for
+        // "req-299-forged" and names a plausible slug. Shape-valid, answering its own request —
+        // so it passes the pre-claim gate — and unknown to the source, so it dies at payload
+        // resolution, after the claim.
+        let known =
+            issue_ticket(&ep, "req-299-known", "small", 1_700_000_000, Some("nonce-a")).unwrap();
+        let forged =
+            issue_ticket(&ep, "req-299-forged", "films", 1_700_000_000, Some("nonce-b")).unwrap();
+        let source = TestSource::new(known, real_payload_for("small", 3));
+        assert!(
+            validate_redemption(&forged, &forged.request_id).is_ok(),
+            "fixture check: the forged ticket must pass the gate, so the refusal below is the \
+             post-claim one this test exists to bound"
+        );
+
+        let req = FetchRequest { request_id: forged.request_id.clone(), ticket: forged };
+        let mut frame = Vec::new();
+        write_framed(&mut frame, &serde_json::to_vec(&req).unwrap()).await.unwrap();
+
+        // The honest half: a peer that reads gets readable refusal bytes on the same path.
+        let mut response = Vec::new();
+        let served_honest =
+            serve_manifest_stream(&mut response, std::io::Cursor::new(frame.clone()), source.as_ref())
+                .await
+                .expect("a refusal is Ok(None), not an error");
+        assert!(served_honest.is_none(), "a ticket the source cannot resolve must not be served");
+        let mut reader = std::io::Cursor::new(response);
+        assert_eq!(
+            reader.read_u8().await.unwrap(),
+            STATUS_REFUSED,
+            "an honest peer reads a refused status byte, not a connection error"
+        );
+        let reason = read_framed(&mut reader, REFUSAL_MAX_FRAME).await.unwrap();
+        assert_eq!(
+            reason,
+            REFUSAL_NO_MATCH.as_bytes(),
+            "the post-claim refusal is the shared constant — shortening the write deadline a \
+             gate-passing ticket is held for changes the timing, never the wording"
+        );
+
+        // The attacking half: a peer that never reads. The deadline is the only way out.
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            TEST_TIMEOUT,
+            serve_manifest_stream(StallingWriter, std::io::Cursor::new(frame), source.as_ref()),
+        )
+        .await
+        .expect(
+            "test timed out — the refusal write outlasted TEST_TIMEOUT, i.e. it is still bounded \
+             by a manifest-sized deadline (this is the mutation this test exists to catch)",
+        )
+        .expect_err("a never-reading peer must end in the refusal write's deadline, not be served");
+        let elapsed = started.elapsed();
+        assert!(
+            err.to_string().contains("the peer stopped reading the refusal response"),
+            "the error must be the refusal write deadline, got: {err}"
+        );
+        assert!(
+            elapsed >= REFUSAL_SEND_DEADLINE,
+            "the write waited its full short deadline ({elapsed:?}) — an instant failure here \
+             would mean the fixture is not driving the deadline at all"
+        );
+        assert!(
+            elapsed < SEND_DEADLINE,
+            "a refusal must not be bounded by the 120s manifest write deadline; took {elapsed:?}"
+        );
+
+        ep.close().await;
+    }
+
+    /// **QURATOR-299 — the same attack against the live plane: a gate-passing forged ticket from
+    /// a peer that never reads releases its claim in seconds, not the 120s write window.**
+    ///
+    /// Modeled on `a_refused_connection_releases_its_claim_within_the_short_drain` (QURATOR-110),
+    /// with the one difference the QURATOR-299 ticket names: there the attacker READ the refusal
+    /// and never closed, so only the 500ms drain was parking the claim; here the attacker never
+    /// reads at all — the stance whose only bound used to be `refuse()`'s `SEND_DEADLINE` (120s),
+    /// because the forged ticket passes `validate_redemption` and so TAKES the claim in
+    /// `ManifestPlane::serve` before payload resolution refuses it. The forged ticket carries the
+    /// honest request id and a plausible slug of its own: shape-valid, request-bound, resolvable
+    /// to a manifest describing another slug — so the post-claim byte/slug binding refuses it.
+    /// Anyone can mint that shape; tickets are unsigned address delivery.
+    ///
+    /// The attacker sends its forged request, then neither reads nor closes anything. Once the
+    /// short refusal write deadline plus the drain has passed — still far inside the old 120s
+    /// window — the legitimate holder's redemption of the SAME request id must succeed: the
+    /// deadlines released the claim, not the peer's goodwill.
+    ///
+    /// MUTATION (P-10): shared with
+    /// `a_gate_passing_forged_ticket_is_refused_within_the_short_refusal_write` above — that test
+    /// is the deterministic red for restoring `SEND_DEADLINE` at the `refuse()` call site
+    /// (transport.rs:345); this one adds the end-to-end outcome on the live plane (and reds too
+    /// whenever the attacking connection's refusal write genuinely stalls on flow control,
+    /// parking the claim past the window slept below).
+    #[tokio::test]
+    async fn a_gate_passing_forged_ticket_releases_its_claim_within_the_short_refusal_window() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let (server, _source, ticket) = spawn_plane(50, "small").await;
+            let client = bind_local_endpoint(&rand::random(), vec![]).await;
+
+            // Forged: the honest request id (so the claim collides with the honest redemption), a
+            // plausible slug of the attacker's choosing. Passes the gate; refused post-claim.
+            let forged = TransportTicket::issue(
+                &ticket.request_id,
+                "a-plausible-slug",
+                &ticket.node_addr,
+                1_700_000_000,
+                Some("nonce-299"),
+            );
+            let conn = client
+                .connect(parse_node_addr(&ticket.node_addr).unwrap(), MANIFEST_ALPN)
+                .await
+                .expect("dial");
+            let (mut send, recv) = conn.open_bi().await.unwrap();
+            let req = FetchRequest { request_id: ticket.request_id.clone(), ticket: forged };
+            write_framed(&mut send, &serde_json::to_vec(&req).unwrap()).await.unwrap();
+            // Nothing is read, nothing is closed — the connection and both stream halves stay
+            // alive through the sleep and the honest fetch below, exactly the "peer that simply
+            // stopped reading" stance. (Dropping `recv` would send STOP_SENDING and ERROR the
+            // owner's write instead of stalling it — a different failure than the one under
+            // test, so it stays held.)
+            let _attacker_holds_everything_open = (conn, send, recv);
+
+            // Past BOTH unwind paths, with margin — and still far inside the old 120s write window.
+            //
+            // ⚠ The budget must cover the Err path, not just the Ok one (review finding,
+            // 2026-09-19). Ok path: `refuse()` completes (this refusal is ~55 bytes — status byte +
+            // u32 prefix + the 47-byte REFUSAL_NO_MATCH — so it fits any initial QUIC stream credit
+            // and buffers instantly even against a peer that never reads), then `Ok(None)` →
+            // `drain_refusal`, releasing at ~0.5s. Err path: the write genuinely stalls, `refuse()`
+            // errors at REFUSAL_SEND_DEADLINE, and `serve`'s Err arm holds `_guard` through
+            // `drain_connection` — a SECOND 5s bound — releasing at ~10s. Sleeping only
+            // `REFUSAL_SEND_DEADLINE + REFUSAL_DRAIN + 1s` (6.5s) would false-RED against correct
+            // code the moment the rig ever lands on the Err path.
+            //
+            // This row therefore pins CLAIM RELEASE, not the 5s constant: in the ordinary regime it
+            // releases at ~0.5s and stays green under the SEND_DEADLINE mutation. The constant's
+            // discriminator is its `StallingWriter` sibling
+            // (`a_gate_passing_forged_ticket_is_refused_within_the_short_refusal_write`), which is
+            // where the P-10 anchor lives.
+            const DRAIN_CONNECTION_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+            tokio::time::sleep(
+                REFUSAL_SEND_DEADLINE
+                    + DRAIN_CONNECTION_BOUND
+                    + REFUSAL_DRAIN
+                    + std::time::Duration::from_millis(1_000),
+            )
+            .await;
+
+            // The honest holder redeems the same request id: the claim was released by the
+            // deadlines, not held for the peer's read window.
+            fetch_manifest(&client, &ticket, |_| Ok(()))
+                .await
+                .expect(
+                    "the claim was released within the short refusal window, so the honest \
+                     redemption succeeds",
+                );
+
+            client.close().await;
+            server.close().await;
+        })
+        .await
+        .expect("test timed out");
     }
 }
 
