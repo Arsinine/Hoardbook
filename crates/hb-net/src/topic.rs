@@ -19,10 +19,10 @@ use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
 use hb_core::topic::{
-    member_sign_keys, mint_invite, open_channel_item, open_post, parse_announce,
-    public_join_identity, redeem_invite, roster, seal_announce, seal_membership, seal_post,
+    member_sign_keys, mint_invite, open_channel_item, open_invite, open_post, parse_announce,
+    public_join_identity, redeem_opened_invite, roster, seal_announce, seal_membership, seal_post,
     Announcement, ChannelItem, NonceSet, Post, TopicKey, TopicMeta, KIND_TOPIC_ANNOUNCE,
-    KIND_TOPIC_INVITE, KIND_TOPIC_MEMBER, KIND_TOPIC_POST,
+    KIND_TOPIC_MEMBER, KIND_TOPIC_POST,
 };
 use hb_core::{FUTURE_SKEW_SECS, Identity};
 use nostr::nips::nip09::EventDeletionRequest;
@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use crate::client::RelayClient;
 use crate::dm::{unwrap_dm, wrap_dm};
 use crate::error::NetError;
-use crate::failed_wrap_cache::FailedWrapCache;
+use crate::failed_wrap_cache::{failed_open_seen, record_failed_open, FailedWrapCache};
 
 /// Publish a batch of pre-signed topic events (announce / membership / post / invite) to **all**
 /// relays (F14 — every Hoardbook event is multi-published). Errors only if an event was accepted by
@@ -760,39 +760,28 @@ const INVITE_OPEN_SCOPE: &str = "topic-invite";
 /// re-attempts each remembered wrap exactly once and never loses a request or invite.
 ///
 /// Residual, deliberately uncovered (same class as `priv_browse`'s untrusted-but-openable residual):
-/// an invite-SHAPED wrap (valid crypto, inner kind 31_119) that fails only `redeem_invite`'s later
-/// checks — expiry, replay, expected-topic/issuer, version tags, payload shape — re-opens on every
-/// poll, at 2× per poll (the gate's open + `redeem_invite`'s own), because its verdict is mutable.
-/// Collapsing that needs an open-only seam inside `hb_core::topic` (`redeem_invite` is monolithic);
-/// out of scope here, which may not edit hb-core.
+/// an invite-SHAPED wrap that opens cleanly but fails only the POLICY checks — expiry, replay,
+/// expected-topic/issuer — re-opens on every poll, ONCE per poll since QURATOR-298 (the poller's
+/// single `open_invite` is now the full deterministic verdict, and the policy half consumes its
+/// output without re-decrypting), because that verdict is mutable in caller context (`now`, `seen`,
+/// expectations) and caching it would hide a valid invite until restart. The deterministic checks
+/// that used to sit past the gate inside the monolith (schema/crypto tags, payload parse, version
+/// consistency) are now COVERED by this cache: they are pure functions of (identity, wrap bytes),
+/// the exact class this cache is sound for.
+///
+/// ⚠ **One deterministic check is NOT covered, and it is named here rather than left implied**
+/// (review finding, 2026-09-19): the 32-byte `topic_key` hex decode in
+/// `hb_core::topic::redeem_opened_invite` is pure over the payload bytes, but it lives in the
+/// POLICY half — deliberately, because it must run BEFORE the replay-nonce insert so a malformed
+/// key never burns the single-use seen-key. So a wrap with honest crypto, valid tags, parseable
+/// JSON and a garbage `topic_key` re-opens once per poll forever instead of being remembered.
+/// Cost is bounded and strictly better than before QURATOR-298 (which paid 2× per poll for the
+/// same wrap, also uncached); moving the decode into `open_invite` would close it — open runs
+/// before policy, so the ordering guarantee survives — but that is a deliberate follow-up, not an
+/// oversight. **Do not let the sentence above be read as an exhaustive list of the deterministic
+/// checks: this one is the exception.**
 static TOPIC_FAILED_OPENS: LazyLock<Mutex<FailedWrapCache>> =
     LazyLock::new(|| Mutex::new(FailedWrapCache::new()));
-
-/// Compose the negative-cache key: (identity npub, scope, wrap id). `\x00` appears in none of
-/// bech32 (npub), the scope tags, or hex (wrap id), so the join is collision-free. The composition
-/// twin of `priv_browse::failed_open_key` — duplicated per-consumer ON PURPOSE (each consumer owns
-/// its key space; see `failed_wrap_cache`'s module doc).
-fn failed_open_key(me_npub: &str, scope: &str, wrap_id: &str) -> String {
-    format!("{me_npub}\u{0}{scope}\u{0}{wrap_id}")
-}
-
-/// O(1) "already deterministically failed under THIS identity and scope?" — checked before the open
-/// so a previously-failed wrap is not re-decrypted on every poll.
-fn failed_open_seen(me_npub: &str, scope: &str, id: &str) -> bool {
-    TOPIC_FAILED_OPENS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .contains(&failed_open_key(me_npub, scope, id))
-}
-
-/// Record a (identity, scope, wrap id) that deterministically failed (bounded, FIFO-evicted). Only a
-/// deterministic open verdict is ever recorded here — never a policy refusal.
-fn record_failed_open(me_npub: &str, scope: &str, id: String) {
-    TOPIC_FAILED_OPENS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(failed_open_key(me_npub, scope, &id));
-}
 
 /// Fetch + parse the join requests addressed to `me` (DMs whose body is a `JoinRequest`), returning
 /// `(requester, request)` pairs. Mirrors the M10 post-decrypt allowlist shape: the outer wrap author is
@@ -822,7 +811,7 @@ pub(crate) async fn open_join_request_wraps(
     let mut out = Vec::new();
     for w in wraps {
         let id = w.id.to_hex();
-        if failed_open_seen(&me_npub, JOIN_REQUEST_OPEN_SCOPE, &id) {
+        if failed_open_seen(&TOPIC_FAILED_OPENS, &me_npub, JOIN_REQUEST_OPEN_SCOPE, &id) {
             continue; // failed under THIS identity + scope on a prior poll — deterministic, skip
         }
         let opened = unwrap_dm(me, w).await.ok().and_then(|dm| {
@@ -830,7 +819,7 @@ pub(crate) async fn open_join_request_wraps(
         });
         match opened {
             Some(pair) => out.push(pair),
-            None => record_failed_open(&me_npub, JOIN_REQUEST_OPEN_SCOPE, id),
+            None => record_failed_open(&TOPIC_FAILED_OPENS, &me_npub, JOIN_REQUEST_OPEN_SCOPE, id),
         }
     }
     out
@@ -880,16 +869,19 @@ pub async fn fetch_invite(
     Ok(redeem_first_invite(me, &wraps, seen, now, expected_topic_id, expected_issuer).await)
 }
 
-/// The gate + redeem core of [`fetch_invite`] — everything after the relay fetch (QURATOR-294). Each
-/// wrap passes a DETERMINISTIC gate before the (crypto-heavy) `redeem_invite` is attempted: the same
-/// production [`unwrap_dm`] the join-request core uses, plus the invite inner-kind pin (31_119). A
-/// wrap failing the gate can never satisfy `redeem_invite` — whose own prefix is those same checks —
-/// so its id is remembered in [`TOPIC_FAILED_OPENS`] and never re-decrypted. A wrap PASSING the gate
-/// still goes to `redeem_invite` for the full policy verdict, and a policy refusal (expiry, replay,
-/// expected-topic/issuer mismatch, version tags, payload shape) is deliberately NOT recorded: those
-/// verdicts consult `now`, `seen` and the CALLER's expectations, none of which are (identity keys,
-/// wrap bytes) — a wrap refused for the wrong expected topic on this join must still redeem on the
-/// right one. That residual re-opens per poll and is documented on [`TOPIC_FAILED_OPENS`].
+/// The open + redeem core of [`fetch_invite`] — everything after the relay fetch (QURATOR-294;
+/// single-open since QURATOR-298). Each wrap is opened EXACTLY ONCE per poll by
+/// `hb_core::topic::open_invite` — the deterministic half of the old monolithic `redeem_invite`
+/// (unwrap + inner-kind pin + payload parse + version tags) — so a wrap failing it can never
+/// satisfy the policy half, and its id is remembered in [`TOPIC_FAILED_OPENS`] and never
+/// re-decrypted. A wrap that opens goes to `hb_core::topic::redeem_opened_invite` with the
+/// PRE-OPENED `(issuer, payload)` — no re-verify, no re-decrypt (the pre-QURATOR-298 shape paid
+/// the gate's open PLUS `redeem_invite`'s own: 2× per wrap per poll, unbounded on a floodable
+/// inbox). A policy refusal (expiry, replay, expected-topic/issuer mismatch) is deliberately NOT
+/// recorded: those verdicts consult `now`, `seen` and the CALLER's expectations, none of which are
+/// (identity keys, wrap bytes) — a wrap refused for the wrong expected topic on this join must
+/// still redeem on the right one. That residual re-opens (once) per poll and is documented on
+/// [`TOPIC_FAILED_OPENS`].
 pub(crate) async fn redeem_first_invite(
     me: &Identity,
     wraps: &[Event],
@@ -901,19 +893,23 @@ pub(crate) async fn redeem_first_invite(
     let me_npub = me.npub();
     for w in wraps {
         let id = w.id.to_hex();
-        if failed_open_seen(&me_npub, INVITE_OPEN_SCOPE, &id) {
+        if failed_open_seen(&TOPIC_FAILED_OPENS, &me_npub, INVITE_OPEN_SCOPE, &id) {
             continue; // deterministically not an invite under THIS identity — skip the crypto
         }
-        let invite_shaped =
-            matches!(unwrap_dm(me, w).await, Ok(dm) if dm.kind == Kind::from_u16(KIND_TOPIC_INVITE));
-        if !invite_shaped {
-            record_failed_open(&me_npub, INVITE_OPEN_SCOPE, id);
+        // ONE open per wrap per poll (QURATOR-298): `open_invite` is the deterministic half of the
+        // old monolith, so its verdict is COMPLETE for (identity, wrap bytes) and the cache below
+        // is sound for all of it.
+        let Ok((issuer, payload)) = open_invite(me, w) else {
+            record_failed_open(&TOPIC_FAILED_OPENS, &me_npub, INVITE_OPEN_SCOPE, id);
             continue;
-        }
-        // `redeem_invite` atomically records a single-use invite's seen-nonce into `seen` on success
-        // (the public-join credential is exempt); the caller persists `seen` after this returns.
-        if let Ok((meta, key, issuer)) = redeem_invite(me, w, seen, now, expected_topic_id, expected_issuer) {
-            return Some((meta, key, issuer));
+        };
+        // The POLICY half consumes the pre-opened (issuer, payload) — no re-verify, no re-decrypt.
+        // It atomically records a single-use invite's seen-nonce into `seen` on success (the
+        // public-join credential is exempt); the caller persists `seen` after this returns.
+        if let Ok((meta, key, verified_issuer)) =
+            redeem_opened_invite(me, issuer, payload, seen, now, expected_topic_id, expected_issuer)
+        {
+            return Some((meta, key, verified_issuer));
         }
         // Refused on POLICY grounds — NOT recorded (see this fn's doc).
     }
@@ -953,6 +949,11 @@ pub async fn join_public(
 mod tests {
     use super::*;
     use hb_core::new_topic;
+    // Test-only since QURATOR-298: the invite loop's inner-kind pin moved into hb-core's
+    // `open_invite`, so production no longer names this constant — only the tests that hand-build
+    // an invite-shaped wrap do. A module-scope import unused in the NON-test compilation unit is
+    // an `unused_imports` warning, i.e. a build FAILURE under `clippy -D warnings` (§7/P-1).
+    use hb_core::topic::KIND_TOPIC_INVITE;
     use std::time::Instant;
 
     #[test]
@@ -1078,8 +1079,8 @@ mod tests {
     /// one attempt and skipped thereafter, keyed by identity.
     ///
     /// MUTATION (P-10): in `open_join_request_wraps`, change the match arm
-    /// `None => record_failed_open(&me_npub, JOIN_REQUEST_OPEN_SCOPE, id),` to `None => {}` —
-    /// nothing is remembered and the `failed_open_seen` assert reds.
+    /// `None => record_failed_open(&TOPIC_FAILED_OPENS, &me_npub, JOIN_REQUEST_OPEN_SCOPE, id),`
+    /// to `None => {}` — nothing is remembered and the `failed_open_seen` assert reds.
     #[tokio::test]
     async fn join_request_open_failures_are_negatively_cached_per_identity() {
         let me = Identity::generate();
@@ -1092,14 +1093,14 @@ mod tests {
         // First poll: the open is attempted and fails — the wrap yields no join request.
         assert!(open_join_request_wraps(&me, std::slice::from_ref(&foreign)).await.is_empty());
         assert!(
-            failed_open_seen(&me.npub(), JOIN_REQUEST_OPEN_SCOPE, &foreign_id),
+            failed_open_seen(&TOPIC_FAILED_OPENS, &me.npub(), JOIN_REQUEST_OPEN_SCOPE, &foreign_id),
             "the failed open is remembered after one attempt"
         );
         // Second poll of the same inbox: the remembered id is skipped — still empty, no re-record.
         assert!(open_join_request_wraps(&me, std::slice::from_ref(&foreign)).await.is_empty());
         // The entry is keyed by IDENTITY: another node polling the same wrap starts clean (a wrap
         // that fails under `me` may simply be addressed to them).
-        assert!(!failed_open_seen(&third.npub(), JOIN_REQUEST_OPEN_SCOPE, &foreign_id));
+        assert!(!failed_open_seen(&TOPIC_FAILED_OPENS, &third.npub(), JOIN_REQUEST_OPEN_SCOPE, &foreign_id));
     }
 
     /// A valid JOIN REQUEST opens + parses and is never remembered in its own scope — but it FAILS
@@ -1109,9 +1110,9 @@ mod tests {
     /// for its listing/grant scopes.
     ///
     /// MUTATION (P-10): in `redeem_first_invite`, change the gate's
-    /// `record_failed_open(&me_npub, INVITE_OPEN_SCOPE, id);` to pass `JOIN_REQUEST_OPEN_SCOPE`
-    /// instead — the invite failure lands in the WRONG scope and the final "not remembered under the
-    /// join-request scope" assert reds.
+    /// `record_failed_open(&TOPIC_FAILED_OPENS, &me_npub, INVITE_OPEN_SCOPE, id);` to pass
+    /// `JOIN_REQUEST_OPEN_SCOPE` instead — the invite failure lands in the WRONG scope and the
+    /// final "not remembered under the join-request scope" assert reds.
     #[tokio::test]
     async fn invite_gate_failures_do_not_cross_into_the_join_request_scope() {
         let me = Identity::generate();
@@ -1124,24 +1125,27 @@ mod tests {
         let out = open_join_request_wraps(&me, std::slice::from_ref(&jr)).await;
         assert_eq!(out.len(), 1, "the genuine join request survives its own consumer");
         assert_eq!(out[0].1.topic_id, "tid-a");
-        assert!(!failed_open_seen(&me.npub(), JOIN_REQUEST_OPEN_SCOPE, &jr_id));
+        assert!(!failed_open_seen(&TOPIC_FAILED_OPENS, &me.npub(), JOIN_REQUEST_OPEN_SCOPE, &jr_id));
         // The invite consumer deterministically refuses it (kind 14 ≠ 31_119) — remembered THERE.
         assert!(redeem_first_invite(&me, std::slice::from_ref(&jr), &mut NonceSet::new(), 1_700_000_000, None, None).await.is_none());
-        assert!(failed_open_seen(&me.npub(), INVITE_OPEN_SCOPE, &jr_id), "recorded under the invite scope");
+        assert!(failed_open_seen(&TOPIC_FAILED_OPENS, &me.npub(), INVITE_OPEN_SCOPE, &jr_id), "recorded under the invite scope");
         assert!(
-            !failed_open_seen(&me.npub(), JOIN_REQUEST_OPEN_SCOPE, &jr_id),
+            !failed_open_seen(&TOPIC_FAILED_OPENS, &me.npub(), JOIN_REQUEST_OPEN_SCOPE, &jr_id),
             "…but never under the join-request scope"
         );
     }
 
-    /// A production-minted invite (hb-core `mint_invite` → `gift_wrap_from_seal`) passes the
-    /// [`unwrap_dm`] gate and redeems — pinning the equivalence the gate's safety rests on: anything
-    /// production code mints MUST open under `nip59::extract_rumor`, or the gate would skip a
-    /// legitimate invite. It is never remembered.
+    /// A production-minted invite (hb-core `mint_invite` → `gift_wrap_from_seal`) opens under
+    /// [`open_invite`] and redeems — pinning the equivalence the skip's safety rests on: anything
+    /// production code mints MUST open, or a legitimate invite would be remembered as a failure and
+    /// skipped on every later poll. It is never remembered.
     ///
-    /// MUTATION (P-10): in `redeem_first_invite`'s gate, change
-    /// `Kind::from_u16(KIND_TOPIC_INVITE)` to `Kind::from_u16(KIND_TOPIC_POST)` — the genuine
-    /// invite now fails the gate, is remembered, and the `expect` reds (the redeem returns `None`).
+    /// MUTATION (P-10, re-pointed by the orchestrator for QURATOR-298 — the old anchor named
+    /// `redeem_first_invite`'s `unwrap_dm` gate, which that ticket DELETED; the inner-kind pin now
+    /// lives one crate over): in `open_invite` (hb-core `crates/hb-core/src/topic.rs:1022`), the
+    /// line `    if rumor.kind != Kind::from_u16(KIND_TOPIC_INVITE) {` — change `KIND_TOPIC_INVITE`
+    /// to `KIND_TOPIC_POST`. The genuine invite now fails the open, is remembered, and the `expect`
+    /// reds (the redeem returns `None`).
     #[tokio::test]
     async fn a_production_invite_passes_the_gate_and_is_never_negatively_cached() {
         let me = Identity::generate();
@@ -1156,7 +1160,7 @@ mod tests {
             .expect("a production-minted invite redeems through the gate");
         assert_eq!(rmeta.topic_id, meta.topic_id);
         assert_eq!(risser, issuer.public_key(), "the issuer is the verified seal signer");
-        assert!(!failed_open_seen(&me.npub(), INVITE_OPEN_SCOPE, &inv_id), "an invite that redeems is never remembered");
+        assert!(!failed_open_seen(&TOPIC_FAILED_OPENS, &me.npub(), INVITE_OPEN_SCOPE, &inv_id), "an invite that redeems is never remembered");
     }
 
     /// The W4 topic binding is CALLER CONTEXT, not (identity keys, wrap bytes): the same wrap must
@@ -1167,8 +1171,9 @@ mod tests {
     ///
     /// MUTATION (P-10): in `redeem_first_invite`, immediately after the `if let Ok((meta, key,
     /// issuer)) = redeem_invite(...)` block (the one that RETURNS on success), add
-    /// `record_failed_open(&me_npub, INVITE_OPEN_SCOPE, id);` so policy refusals are recorded too —
-    /// the second call skips the remembered id and the final `is_some()` assert reds.
+    /// `record_failed_open(&TOPIC_FAILED_OPENS, &me_npub, INVITE_OPEN_SCOPE, id);` so policy
+    /// refusals are recorded too — the second call skips the remembered id and the final
+    /// `is_some()` assert reds.
     #[tokio::test]
     async fn invite_policy_refusals_are_not_negatively_cached() {
         let me = Identity::generate();
@@ -1182,7 +1187,7 @@ mod tests {
         assert!(redeem_first_invite(&me, std::slice::from_ref(&inv), &mut NonceSet::new(), now, Some("a-different-topic-id"), None)
             .await
             .is_none());
-        assert!(!failed_open_seen(&me.npub(), INVITE_OPEN_SCOPE, &inv_id), "a policy refusal is never remembered");
+        assert!(!failed_open_seen(&TOPIC_FAILED_OPENS, &me.npub(), INVITE_OPEN_SCOPE, &inv_id), "a policy refusal is never remembered");
         // The later join for the RIGHT topic still redeems the SAME wrap.
         assert!(
             redeem_first_invite(&me, std::slice::from_ref(&inv), &mut NonceSet::new(), now, Some(&meta.topic_id), None)
@@ -1190,6 +1195,63 @@ mod tests {
                 .is_some(),
             "the same wrap redeems once the expectation matches"
         );
+    }
+
+    /// QURATOR-298 — the open is ONCE per wrap per poll and its verdict is COMPLETE. This wrap is
+    /// invite-SHAPED (valid NIP-59 crypto, rumor kind 31_119): it PASSED the entire pre-QURATOR-298
+    /// gate (`unwrap_dm` + kind pin) but is not a valid invite payload — a deterministic failure
+    /// that lived only inside the monolithic `redeem_invite`'s own prefix, invisible to the gate,
+    /// never recorded, and re-decrypted TWICE on EVERY poll forever. Now the single `open_invite`
+    /// refusal IS the full deterministic verdict: opened once, remembered, and the second poll
+    /// skips it without touching any crypto.
+    ///
+    /// MUTATION (P-10, resolve by line number — anchors in this file are non-unique by text): in
+    /// `redeem_first_invite`, restore the double open: replace the line-890
+    /// `let Ok((issuer, payload)) = open_invite(me, w) else {` binding + else arm with the old
+    /// two-step shape — a gate
+    /// `matches!(unwrap_dm(me, w).await, Ok(dm) if dm.kind == Kind::from_u16(KIND_TOPIC_INVITE))`
+    /// whose failure records + continues, then
+    /// `if let Ok((meta, key, issuer)) = redeem_invite(me, w, seen, now, expected_topic_id, expected_issuer)`.
+    /// Under that shape this wrap PASSES the gate, fails only inside the monolith's own parse, is
+    /// never recorded — and the `failed_open_seen` assert below reds.
+    #[tokio::test]
+    async fn an_invite_shaped_wrap_with_a_bad_payload_is_opened_once_and_remembered() {
+        let me = Identity::generate();
+        let issuer = Identity::generate();
+        let bogus = invite_shaped_wrap_with_bad_payload(&issuer, &me);
+        let id = bogus.id.to_hex();
+        // First poll: opened ONCE — deterministically refused at the schema-tag/payload checks.
+        assert!(redeem_first_invite(&me, std::slice::from_ref(&bogus), &mut NonceSet::new(), 1_700_000_000, None, None).await.is_none());
+        assert!(
+            failed_open_seen(&TOPIC_FAILED_OPENS, &me.npub(), INVITE_OPEN_SCOPE, &id),
+            "opened once; the deterministic verdict is complete, so it is remembered"
+        );
+        // Second poll of the same inbox: remembered → skipped, still no invite.
+        assert!(redeem_first_invite(&me, std::slice::from_ref(&bogus), &mut NonceSet::new(), 1_700_000_000, None, None).await.is_none());
+    }
+
+    /// Hand-build a wrap that is invite-SHAPED but carries garbage where the `InvitePayload` must
+    /// be: a real NIP-59 seal (signed by `issuer`, addressed to `to`) over a rumor of kind 31_119
+    /// with no schema/crypto tags and non-JSON content. It passes `unwrap_dm` and the inner-kind
+    /// pin — the entire pre-QURATOR-298 gate — and fails only the deterministic checks beyond it.
+    fn invite_shaped_wrap_with_bad_payload(issuer: &Identity, to: &Identity) -> Event {
+        use nostr::nips::nip44;
+        let ts = Timestamp::from(1_700_000_000u64);
+        let rumor: UnsignedEvent = EventBuilder::new(Kind::from_u16(KIND_TOPIC_INVITE), "not-an-invite-payload")
+            .custom_created_at(ts)
+            .build(issuer.public_key());
+        let seal_content = nip44::encrypt(
+            issuer.keys().secret_key(),
+            &to.public_key(),
+            rumor.as_json(),
+            nip44::Version::V2,
+        )
+        .unwrap();
+        let seal = EventBuilder::new(Kind::Seal, seal_content)
+            .custom_created_at(ts)
+            .sign_with_keys(issuer.keys())
+            .unwrap();
+        EventBuilder::gift_wrap_from_seal(&to.public_key(), &seal, []).unwrap()
     }
 
     // ───────────────────────── M13 Part A: channel partition (pure, no relay) ─────────────────────

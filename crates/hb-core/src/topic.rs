@@ -281,8 +281,11 @@ struct AnnounceMsgPayload {
     proof: String,
 }
 
+/// QURATOR-298: `pub` (fields stay private) so [`open_invite`] can hand the parsed payload across
+/// the crate boundary — hb-net's poller holds it OPAQUELY and feeds it straight back into
+/// [`redeem_opened_invite`]; nothing outside this module reads a field.
 #[derive(Serialize, Deserialize)]
-struct InvitePayload {
+pub struct InvitePayload {
     meta: TopicMeta,
     /// hex of the 32-byte topic key.
     topic_key: String,
@@ -971,6 +974,13 @@ fn mint_invite_with_policy(
 /// — it is exempt from the seen-set (every joiner derives the same name-scoped invitee, so a shared
 /// key would collide). The caller persists `seen` after a successful redeem. **Honest limit:** `seen`
 /// is device-local — a restore-to-new-device user could re-redeem an unexpired old single-use invite.
+///
+/// **QURATOR-298 — composition, not monolith:** this is now [`open_invite`] (the DETERMINISTIC open:
+/// everything a pure function of `(me, wrap bytes)` — kind pins, both signature verifies, both
+/// NIP-44 decrypts, payload parse) followed by [`redeem_opened_invite`] (the POLICY verdict:
+/// everything consulting `now`, `seen` or the caller's expectations). The split lets a poller open
+/// a wrap ONCE and then try the policy without re-paying the crypto; this single-event entry point
+/// keeps its original signature for existing callers.
 pub fn redeem_invite(
     me: &Identity,
     invite: &Event,
@@ -979,6 +989,20 @@ pub fn redeem_invite(
     expected_topic_id: Option<&str>,
     expected_issuer: Option<&PublicKey>,
 ) -> Result<(TopicMeta, TopicKey, PublicKey), HbError> {
+    let (issuer, payload) = open_invite(me, invite)?;
+    redeem_opened_invite(me, issuer, payload, seen, now, expected_topic_id, expected_issuer)
+}
+
+/// The DETERMINISTIC half of [`redeem_invite`] (QURATOR-298): open an invite-shaped NIP-59 gift
+/// wrap addressed to `me` and parse it, doing NO policy work. Everything here is a pure function
+/// of `(me`'s keys, wrap bytes)` — the same wrap always yields the same verdict — which is exactly
+/// the property a negative cache keys on (hb-net's `TOPIC_FAILED_OPENS`): the 1059 kind pin, the
+/// outer signature verify (before any ECDH work, chorus-1 R-2), the wrap NIP-44 decrypt, the seal
+/// parse + `Kind::Seal` pin + `seal.verify()`, the rumor decrypt + inner-kind pin (31_119), the
+/// schema/crypto tags, the `InvitePayload` parse and the payload/tag version consistency. Returns
+/// the VERIFIED seal signer (the issuer — recovered from the seal AFTER `seal.verify()`, never
+/// self-declared) and the parsed payload, ready for [`redeem_opened_invite`].
+pub fn open_invite(me: &Identity, invite: &Event) -> Result<(PublicKey, InvitePayload), HbError> {
     if invite.kind != Kind::GiftWrap {
         return Err(HbError::InvalidEvent("not a NIP-59 gift wrap (kind 1059)".into()));
     }
@@ -1014,6 +1038,26 @@ pub fn redeem_invite(
     if payload.schema_v != inner_schema || payload.crypto_v != inner_crypto {
         return Err(HbError::InvalidEvent("version mismatch between the invite payload and its signed tags".into()));
     }
+    Ok((issuer, payload))
+}
+
+/// The POLICY half of [`redeem_invite`] (QURATOR-298): the verdict over a wrap [`open_invite`]
+/// already opened — takes the pre-opened `(issuer, payload)` so the caller pays the crypto ONCE
+/// and may try this half against many caller contexts. Every check that is NOT a pure function of
+/// (identity, wrap bytes) lives here because it consults the caller's `expected_topic_id` /
+/// `expected_issuer` (W4 / QURATOR-227), the caller's `now` (expiry) or the mutable `seen` replay
+/// set — so its verdict is deliberately NEVER negatively cacheable: the same wrap refused on a
+/// join for topic B must still redeem for topic A. Takes the payload BY VALUE (the success path
+/// moves `meta` out of it). Ordering inside is unchanged from the pre-split monolith.
+pub fn redeem_opened_invite(
+    me: &Identity,
+    issuer: PublicKey,
+    payload: InvitePayload,
+    seen: &mut NonceSet,
+    now: u64,
+    expected_topic_id: Option<&str>,
+    expected_issuer: Option<&PublicKey>,
+) -> Result<(TopicMeta, TopicKey, PublicKey), HbError> {
     // W4: when the caller is joining a KNOWN topic, the payload's `topic_id` must match it — a
     // validly-signed invite naming a different topic must never satisfy a join for another topic
     // (else a lying relay could shadow the real credential). Checked BEFORE the replay-nonce insert
@@ -1550,6 +1594,70 @@ mod tests {
         let (rmeta, rkey, _issuer) = redeem_invite(&invitee, &inv, &mut NonceSet::new(), NOW, None, None).unwrap();
         assert_eq!(rmeta, meta, "the meta round-trips");
         assert_eq!(rkey.0, key.0, "the topic key round-trips");
+    }
+
+    #[test]
+    fn redeem_invite_composes_open_then_policy_qurator_298() {
+        // QURATOR-298: `redeem_invite` is EXACTLY [`open_invite`] followed by
+        // [`redeem_opened_invite`] — the decomposition hb-net's poller relies on to open a wrap
+        // ONCE. The composed pair must yield the identical (meta, key, issuer) as the monolithic
+        // entry point, and `open_invite` alone must return the VERIFIED seal signer.
+        //
+        // MUTATION (P-10, resolve by line number): at line 1019, the line
+        // `    let issuer = seal.pubkey;` in `open_invite` — change it to
+        // `let issuer = me.public_key();`. The FIRST assert below (open_invite returns the VERIFIED
+        // seal signer) reds. Confirmed RED by the orchestrator 2026-09-19.
+        //
+        // ⚠ The originally-written anchor for this test was WRONG and is recorded here so it is not
+        // re-tried: mutating `redeem_opened_invite`'s final line (`Ok((payload.meta,
+        // TopicKey(key_bytes), issuer))` → `me.public_key()`) leaves this test GREEN. The three
+        // asserts after the first compare COMPOSED against MONOLITHIC, and since the shim calls the
+        // very same tail, that edit moves both sides of every equality identically — an equivalence
+        // test is structurally blind to a change in the code both its sides share. Pick a mutation
+        // in the half only ONE side reaches (as above), or the proof is vacuous.
+        let issuer = Identity::generate();
+        let invitee = Identity::generate();
+        let (meta, key) = private_topic();
+        let inv = mint_invite(&issuer, &invitee.public_key(), &meta, &key, "n-298a", Some(NOW + 100), NOW).unwrap();
+        let (opened_issuer, payload) = open_invite(&invitee, &inv).unwrap();
+        assert_eq!(opened_issuer, issuer.public_key(), "open_invite returns the VERIFIED seal signer");
+        let composed =
+            redeem_opened_invite(&invitee, opened_issuer, payload, &mut NonceSet::new(), NOW, None, None).unwrap();
+        let monolithic = redeem_invite(&invitee, &inv, &mut NonceSet::new(), NOW, None, None).unwrap();
+        assert_eq!(composed.0, monolithic.0, "composed and monolithic agree on the meta");
+        assert_eq!(composed.1 .0, monolithic.1 .0, "composed and monolithic agree on the key");
+        assert_eq!(composed.2, monolithic.2, "composed and monolithic agree on the issuer");
+    }
+
+    #[test]
+    fn redeem_opened_invite_enforces_policy_on_the_pre_opened_pair_qurator_298() {
+        // The POLICY half runs on the pre-opened (issuer, payload) alone — no `Event` in sight, so
+        // no second open is even POSSIBLE. The W4 topic binding must fire identically here: the
+        // same opened pair refused for topic B, redeemed for its own topic A.
+        //
+        // MUTATION (P-10, for the orchestrator to apply, resolve by line number): at line 1066
+        // (`            if payload.meta.topic_id != expected {` — the W4 check inside
+        // `redeem_opened_invite`), change the condition to `if false` — the (a) assert below reds
+        // (a topic-B join is then satisfied by a topic-A invite).
+        let issuer = Identity::generate();
+        let invitee = Identity::generate();
+        let (meta, key) = private_topic();
+        let inv = mint_invite(&issuer, &invitee.public_key(), &meta, &key, "n-298b", Some(NOW + 100), NOW).unwrap();
+        let inv2 = mint_invite(&issuer, &invitee.public_key(), &meta, &key, "n-298c", Some(NOW + 100), NOW).unwrap();
+        let (opened_issuer, payload) = open_invite(&invitee, &inv).unwrap();
+        let (opened_issuer2, payload2) = open_invite(&invitee, &inv2).unwrap();
+        // (a) expected = a different topic id B → refused, on the pre-opened pair alone.
+        assert!(
+            redeem_opened_invite(&invitee, opened_issuer, payload, &mut NonceSet::new(), NOW, Some("a-different-topic-id-b"), None).is_err(),
+            "the W4 topic binding lives in the policy half"
+        );
+        // (b) expected = A (the matching id) → redeems, and the issuer is the seal signer.
+        let (rmeta, rkey, risser) =
+            redeem_opened_invite(&invitee, opened_issuer2, payload2, &mut NonceSet::new(), NOW, Some(&meta.topic_id), None)
+                .unwrap();
+        assert_eq!(rmeta.topic_id, meta.topic_id);
+        assert_eq!(rkey.0, key.0);
+        assert_eq!(risser, issuer.public_key());
     }
 
     #[test]
