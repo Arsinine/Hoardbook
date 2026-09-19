@@ -20,7 +20,7 @@ use nostr::prelude::*;
 
 use crate::client::RelayClient;
 use crate::error::NetError;
-use crate::failed_wrap_cache::FailedWrapCache;
+use crate::failed_wrap_cache::{failed_open_seen, record_failed_open, FailedWrapCache};
 
 /// Relay-fetch budget for `me`'s personal gift-wrap inbox (QURATOR-291), shared by
 /// [`fetch_private_listings`] and [`fetch_key_grants`] — both build the identical
@@ -136,30 +136,6 @@ const GRANT_OPEN_SCOPE: &str = "key-grant";
 static FAILED_OPENS: LazyLock<Mutex<FailedWrapCache>> =
     LazyLock::new(|| Mutex::new(FailedWrapCache::new()));
 
-/// Compose the negative-cache key: (identity npub, scope, wrap id). `\x00` appears in none of
-/// bech32 (npub), the scope tags, or hex (wrap id), so the join is collision-free.
-fn failed_open_key(me_npub: &str, scope: &str, wrap_id: &str) -> String {
-    format!("{me_npub}\u{0}{scope}\u{0}{wrap_id}")
-}
-
-/// O(1) "already failed to open under THIS identity and inner kind?" — checked before the open so
-/// a previously-failed wrap is not re-decrypted on every poll.
-fn failed_open_seen(me_npub: &str, scope: &str, id: &str) -> bool {
-    FAILED_OPENS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .contains(&failed_open_key(me_npub, scope, id))
-}
-
-/// Record a (identity, scope, wrap id) that failed to open (bounded, FIFO-evicted). Only the
-/// deterministic open verdict is ever recorded here — never an allowlist rejection.
-fn record_failed_open(me_npub: &str, scope: &str, id: String) {
-    FAILED_OPENS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(failed_open_key(me_npub, scope, &id));
-}
-
 /// Open one wrap through the negative cache — the shared per-wrap core of BOTH inbox consumers:
 /// a remembered id is skipped without attempting the open; a failed open is remembered; an opened
 /// wrap is returned for the CALLER's trust decision, which stays outside this fn on purpose (see
@@ -172,13 +148,13 @@ fn open_cached<T>(
     open: fn(&Identity, &Event) -> Result<T, HbError>,
 ) -> Option<T> {
     let id = wrap.id.to_hex();
-    if failed_open_seen(me_npub, scope, &id) {
+    if failed_open_seen(&FAILED_OPENS, me_npub, scope, &id) {
         return None; // failed under THIS identity + inner kind before — deterministic, skip the re-open
     }
     match open(me, wrap) {
         Ok(t) => Some(t),
         Err(_) => {
-            record_failed_open(me_npub, scope, id);
+            record_failed_open(&FAILED_OPENS, me_npub, scope, id);
             None
         }
     }
@@ -479,9 +455,9 @@ mod tests {
     /// `cached_failure_skips_the_open_entirely_qurator_247`.
     ///
     /// MUTATION (P-10, for the orchestrator to apply): in `open_cached` (priv_browse.rs, the
-    /// `match open(me, wrap)` block), delete the `Err(_)` arm's `record_failed_open(me_npub,
-    /// scope, id);` — the junk wrap is no longer remembered and the `failed_open_seen` assert
-    /// reds.
+    /// `match open(me, wrap)` block), delete the `Err(_)` arm's
+    /// `record_failed_open(&FAILED_OPENS, me_npub, scope, id);` — the junk wrap is no longer
+    /// remembered and the `failed_open_seen` assert reds.
     #[test]
     fn failed_listing_open_is_remembered_for_the_next_poll_qurator_247() {
         use hb_core::seal_private_listing;
@@ -502,7 +478,7 @@ mod tests {
         assert_eq!(got.len(), 1, "the junk wrap is skipped silently — expected foreign traffic");
         assert_eq!(got[0].inner_author, author.public_key(), "the surviving listing is the trusted author's");
         assert!(
-            failed_open_seen(&me.npub(), LISTING_OPEN_SCOPE, &junk_id),
+            failed_open_seen(&FAILED_OPENS, &me.npub(), LISTING_OPEN_SCOPE, &junk_id),
             "the unopenable wrap is remembered in the negative cache"
         );
         // The next poll of the same inbox: same output.
@@ -514,9 +490,9 @@ mod tests {
     /// manual `record_failed_open` simulates a prior poll's failure for an otherwise fully valid,
     /// trusted wrap — which is exactly what production state looks like to the second poll.
     ///
-    /// MUTATION (P-10): in `open_cached`, delete the `if failed_open_seen(me_npub, scope, &id)
-    /// { return None; }` guard — the cached wrap is re-opened (it is genuinely valid), comes
-    /// back, and the `is_empty` assert reds.
+    /// MUTATION (P-10): in `open_cached`, delete the `if failed_open_seen(&FAILED_OPENS,
+    /// me_npub, scope, &id) { return None; }` guard — the cached wrap is re-opened (it is
+    /// genuinely valid), comes back, and the `is_empty` assert reds.
     #[test]
     fn cached_failure_skips_the_open_entirely_qurator_247() {
         use hb_core::seal_private_listing;
@@ -526,7 +502,7 @@ mod tests {
         let wraps =
             seal_private_listing(&author, &[me.public_key()], r#"{"slug":"vault"}"#, 100).unwrap();
         // Simulate a prior poll that failed to open this wrap under THIS identity.
-        record_failed_open(&me.npub(), LISTING_OPEN_SCOPE, wraps[0].id.to_hex());
+        record_failed_open(&FAILED_OPENS, &me.npub(), LISTING_OPEN_SCOPE, wraps[0].id.to_hex());
 
         let got = open_private_listing_wraps(&me, &wraps, &[author.public_key()]);
         assert!(
@@ -540,9 +516,10 @@ mod tests {
     /// blacklisting another's valid listing (wipe/restore, or a relay feeding B's wrap while A
     /// polls). Mirrors chat.rs's `negative_cache_does_not_cross_identity_boundaries`.
     ///
-    /// MUTATION (P-10): in `failed_open_key`, drop the identity segment — change the format! to
-    /// `format!("{scope}\u{0}{wrap_id}")` — B now sees A's entry, the listing is skipped, and the
-    /// final assert reds.
+    /// MUTATION (P-10): in `failed_open_key` (failed_wrap_cache.rs since QURATOR-296 — the ONE
+    /// shared construction, so this reds topic.rs's key tests too), drop the identity segment —
+    /// change the format! to `format!("{scope}\u{0}{wrap_id}")` — B now sees A's entry, the
+    /// listing is skipped, and the final assert reds.
     #[test]
     fn failure_cache_does_not_cross_identity_boundaries() {
         use hb_core::seal_private_listing;
@@ -555,7 +532,7 @@ mod tests {
 
         let got_a = open_private_listing_wraps(&a, &wraps, &[author.public_key()]);
         assert!(got_a.is_empty(), "A cannot open a wrap sealed to B — expected, not an error");
-        assert!(failed_open_seen(&a.npub(), LISTING_OPEN_SCOPE, &id), "…remembered under A");
+        assert!(failed_open_seen(&FAILED_OPENS, &a.npub(), LISTING_OPEN_SCOPE, &id), "…remembered under A");
 
         let got_b = open_private_listing_wraps(&b, &wraps, &[author.public_key()]);
         assert_eq!(got_b.len(), 1, "B's genuinely valid listing is NOT poisoned by A's failure");
@@ -566,9 +543,10 @@ mod tests {
     /// GRANT scope only, and the listing core must still open it. Without the scope segment in
     /// the key, whichever core polled first would blacklist the other's perfectly good wrap.
     ///
-    /// MUTATION (P-10): in `failed_open_key`, drop the scope segment — change the format! to
-    /// `format!("{me_npub}\u{0}{wrap_id}")` — the grant core's refusal now poisons the listing
-    /// open and the final assert reds.
+    /// MUTATION (P-10): in `failed_open_key` (failed_wrap_cache.rs since QURATOR-296 — the ONE
+    /// shared construction, so this reds topic.rs's scope tests too), drop the scope segment —
+    /// change the format! to `format!("{me_npub}\u{0}{wrap_id}")` — the grant core's refusal now
+    /// poisons the listing open and the final assert reds.
     #[test]
     fn kind_pin_failures_do_not_cross_the_inner_kind_scopes() {
         use hb_core::seal_private_listing;
@@ -581,11 +559,11 @@ mod tests {
         let grants = open_key_grant_wraps(&me, &wraps, &[author.public_key()]);
         assert!(grants.is_empty(), "a listing is not a grant — refused by the kind pin");
         assert!(
-            failed_open_seen(&me.npub(), GRANT_OPEN_SCOPE, &id),
+            failed_open_seen(&FAILED_OPENS, &me.npub(), GRANT_OPEN_SCOPE, &id),
             "the kind-pin refusal is remembered under the GRANT scope"
         );
         assert!(
-            !failed_open_seen(&me.npub(), LISTING_OPEN_SCOPE, &id),
+            !failed_open_seen(&FAILED_OPENS, &me.npub(), LISTING_OPEN_SCOPE, &id),
             "…and NOT under the listing scope"
         );
         let got = open_private_listing_wraps(&me, &wraps, &[author.public_key()]);
@@ -598,9 +576,10 @@ mod tests {
     /// surface on the very next poll, which a cached skip would hide until restart.
     ///
     /// MUTATION (P-10): in `open_private_listing_wraps`, add an `else { record_failed_open(
-    /// &me.npub(), LISTING_OPEN_SCOPE, w.id.to_hex()); }` to the `if allowlist.contains(
-    /// &o.inner_author)` — poll 1 now caches the stranger's wrap and poll 2 (allowlist grown)
-    /// returns empty, redding the final assert (and the `!failed_open_seen` assert before it).
+    /// &FAILED_OPENS, &me.npub(), LISTING_OPEN_SCOPE, w.id.to_hex()); }` to the
+    /// `if allowlist.contains(&o.inner_author)` — poll 1 now caches the stranger's wrap and
+    /// poll 2 (allowlist grown) returns empty, redding the final assert (and the
+    /// `!failed_open_seen` assert before it).
     #[test]
     fn untrusted_but_openable_listing_is_not_negatively_cached() {
         use hb_core::seal_private_listing;
@@ -614,7 +593,7 @@ mod tests {
         let got = open_private_listing_wraps(&me, &wraps, &[]);
         assert!(got.is_empty(), "an untrusted author is dropped by the trust check");
         assert!(
-            !failed_open_seen(&me.npub(), LISTING_OPEN_SCOPE, &id),
+            !failed_open_seen(&FAILED_OPENS, &me.npub(), LISTING_OPEN_SCOPE, &id),
             "an OPENED wrap is never recorded: the allowlist can grow to include the author"
         );
 
@@ -649,7 +628,7 @@ mod tests {
         let got = open_key_grant_wraps(&me, &wraps, &[granter.public_key()]);
         assert_eq!(got.len(), 1, "only the real grant survives — the junk wrap skipped silently");
         assert!(
-            failed_open_seen(&me.npub(), GRANT_OPEN_SCOPE, &junk_id),
+            failed_open_seen(&FAILED_OPENS, &me.npub(), GRANT_OPEN_SCOPE, &junk_id),
             "the unopenable grant wrap is remembered under the grant scope"
         );
     }
