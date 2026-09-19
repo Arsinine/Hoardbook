@@ -538,11 +538,33 @@ pub(crate) fn approval_body_for(body: &ManifestRequestBody) -> ApprovalBody {
 /// hand-copies. The explicit `.limit()` keeps the fetch budget ours — without it the 5 s poll
 /// leaves the response size to the relay's own default (strfry's `maxFilterLimit`; CWE-400) and
 /// re-decrypts whatever comes back, every tick. The `since` handed in is ALREADY margined by the
-/// caller (the `saturating_sub(DM_FETCH_MARGIN_SECS)` at the call site) — the shared builder
+/// caller (`auto_approve_inbox_since` applies it) — the shared builder
 /// never subtracts it. `since == 0` (cold cursor) omits the window, so the first poll stays the
 /// one full initial pull.
 fn auto_approve_inbox_filter(me: PublicKey, since: u64) -> Filter {
     giftwrap_inbox_filter(me, since)
+}
+
+/// QURATOR-303 — the caller-side margin for this loop's fetch window: the arithmetic
+/// `auto_approve_inbox_filter` deliberately leaves to its caller (the shared builder never
+/// subtracts a margin — pinned by `auto_approve_inbox_filter_declares_a_fetch_budget`). The
+/// payload is `ticket_inbox_since`'s window line (`fetch_driver.rs`): the shared
+/// `DM_FETCH_MARGIN_SECS` wobble allowance for relay-side `since` boundary conditions, then the
+/// clamp-to-now discipline. A cold cursor (`0`) stays `0` — the saturating floor is what keeps
+/// the first poll the one full initial pull.
+fn auto_approve_inbox_since(newest_seen_outer: u64, now: u64) -> u64 {
+    newest_seen_outer.saturating_sub(DM_FETCH_MARGIN_SECS).min(now)
+}
+
+/// QURATOR-303 — the inbox cursor's advance after a fetched batch. `batch_newest` is
+/// attacker-controlled — it is the max outer `created_at` of relay-fetched gift-wraps (NIP-59's
+/// outer stamp is arbitrary), and the loop computes it BEFORE `decode_dms`, so even an
+/// undecodable junk wrap sets it. The clamp to `now` is the load-bearing half: without it one
+/// wrap stamped in the far future pushes `since` permanently past the present and blinds the
+/// 5 s serve loop for the life of the process. The outer `.max` keeps the cursor monotonic —
+/// never backwards.
+fn advance_inbox_cursor(newest_seen_outer: u64, batch_newest: u64, now: u64) -> u64 {
+    newest_seen_outer.max(batch_newest.min(now))
 }
 
 /// The loop itself. Runs forever; every decision is logged (info for approvals, debug/warn for the
@@ -658,9 +680,7 @@ pub(crate) async fn run_auto_approve_loop(
         // Bandwidth-only cursor (see the declaration above); the 48 h margin is `get_messages`'s
         // own `DM_FETCH_MARGIN_SECS` allowance for relay-side `since` boundary wobble — the shared
         // const, not a copy of its value, so the two windows can't drift (QURATOR-197).
-        let since = newest_seen_outer
-            .saturating_sub(DM_FETCH_MARGIN_SECS)
-            .min(now_outer);
+        let since = auto_approve_inbox_since(newest_seen_outer, now_outer);
         let filter = auto_approve_inbox_filter(identity.public_key(), since);
         let wraps = match RelayClient::connect(&identity, &relays, AUTO_APPROVE_FETCH_TIMEOUT).await {
             Ok(client) => {
@@ -689,7 +709,7 @@ pub(crate) async fn run_auto_approve_loop(
         // every wrap below fails to decode, they have been fetched and are covered by the dedup
         // set, so the next poll must not re-download them.
         let batch_newest = wraps.iter().map(|w| w.created_at.as_secs()).max().unwrap_or(0);
-        newest_seen_outer = newest_seen_outer.max(batch_newest.min(now_outer));
+        newest_seen_outer = advance_inbox_cursor(newest_seen_outer, batch_newest, now_outer);
 
         // Decode with no contact filter — there is no filter left to apply. A wrap not addressed to
         // us is skipped inside `decode_dms` (NIP-17 seal verification), so a stranger's gift-wrap
@@ -935,6 +955,86 @@ mod tests {
             "a warm cursor bounds the fetch window"
         );
         assert!(cold.since.is_none(), "a cold cursor keeps the one full initial pull");
+    }
+
+    /// QURATOR-303 — THE pin for the cursor advance. `batch_newest` is the max outer `created_at`
+    /// of relay-fetched gift-wraps — attacker-chosen (NIP-59's outer stamp is arbitrary) and set
+    /// even by an undecodable junk wrap, because the loop computes it BEFORE `decode_dms` runs.
+    /// Without the clamp-to-now inside `advance_inbox_cursor`, one wrap stamped in the far future
+    /// pushes `since` permanently past the present and the 5 s serve loop never sees another ask
+    /// for the life of the process.
+    ///
+    /// MUTATION (P-10, for the orchestrator to apply — resolve by LINE NUMBER, not text, since
+    /// these fragments also appear in this comment): auto_approve.rs:567, the body of
+    /// `advance_inbox_cursor` — delete the inner `.min(now)` call so the advance takes
+    /// `batch_newest` raw, and the first assert reds (the 2099 stamp wins, cursor > now); change
+    /// the outer `.max(` to `.min(` on the same line and the never-backwards assert reds (a
+    /// stale batch drags the cursor down to 50).
+    #[test]
+    fn a_future_dated_wrap_cannot_poison_the_inbox_cursor() {
+        let now = 1_800_000_000u64; // ≈ 2027-01-15, comfortably before the 2099 stamp below
+        assert_eq!(
+            advance_inbox_cursor(100, 4_070_908_800, now),
+            now,
+            "one wrap stamped 2099-01-01 clamps the advance to now, never past it"
+        );
+        assert_eq!(
+            advance_inbox_cursor(1_700_000_000, 50, now),
+            1_700_000_000,
+            "a batch of stale wraps never drags the cursor backwards"
+        );
+        assert_eq!(
+            advance_inbox_cursor(100, now - 10, now),
+            now - 10,
+            "an honest recent batch advances the cursor to itself"
+        );
+    }
+
+    /// QURATOR-303 — the margin application, previously the only one of the three (chat's
+    /// `dm_inbox_filter` call site, `ticket_inbox_since`, this one) with no pin: exactly ONE
+    /// `DM_FETCH_MARGIN_SECS` subtraction on a warm cursor, and a cold `0` cursor stays `0` —
+    /// the saturating floor, no underflow, so the first poll keeps its one full initial pull.
+    ///
+    /// MUTATION (P-10, resolve by LINE NUMBER): auto_approve.rs:556, the body of
+    /// `auto_approve_inbox_since` — delete the `saturating_sub` term and the first assert reds
+    /// (margin never applied); change `saturating_sub` to `wrapping_sub` on the same line and
+    /// the cold-cursor assert reds (0 − margin wraps to a huge u64, not 0).
+    #[test]
+    fn auto_approve_inbox_since_applies_the_margin_exactly_once() {
+        let now = 1_800_000_000u64;
+        assert_eq!(
+            auto_approve_inbox_since(now, now),
+            now - DM_FETCH_MARGIN_SECS,
+            "warm cursor: the wobble allowance is subtracted exactly once"
+        );
+        assert_eq!(
+            auto_approve_inbox_since(0, now),
+            0,
+            "cold cursor: saturating floor, no underflow"
+        );
+        assert_eq!(
+            auto_approve_inbox_since(DM_FETCH_MARGIN_SECS / 2, now),
+            0,
+            "a cursor younger than the margin floors at 0 too"
+        );
+    }
+
+    /// QURATOR-303 — the clamp half of the window arithmetic: a cursor already past `now` (a
+    /// hostile future stamp that predates the advance clamp, or a local clock that stepped back)
+    /// must clamp down to `now`, so the fetch window can never open in the future. The cursor
+    /// input is `now + margin + 100`, so the margin subtraction cannot mask the clamp.
+    ///
+    /// MUTATION (P-10, resolve by LINE NUMBER): auto_approve.rs:556, the body of
+    /// `auto_approve_inbox_since` — delete the trailing `.min(now)` call and this reds (the
+    /// assert wants `now`, gets `now + 100`).
+    #[test]
+    fn auto_approve_inbox_since_clamps_to_now() {
+        let now = 1_800_000_000u64;
+        assert_eq!(
+            auto_approve_inbox_since(now + DM_FETCH_MARGIN_SECS + 100, now),
+            now,
+            "a cursor past now clamps down to now"
+        );
     }
 
     fn npub_of(id: &Identity) -> String {
