@@ -489,7 +489,11 @@ pub(crate) fn dm_inbox_filter(me: PublicKey, newest_seen_outer: u64) -> Filter {
 /// `now`** and any persisted future cursor is healed down to `now` — so a foreign wrap bearing an
 /// attacker-chosen future `created_at` (NIP-59's outer stamp is arbitrary) can never push `since` past
 /// the present and silently stop all future DM delivery (the codebase's future-date discipline, cf.
-/// M9's count cap). Uses a `HashSet` for the seen lookup (O(1), not the old O(n) scan). Returns the
+/// M9's count cap). QURATOR-231: the cursor is additionally a **watermark over definitively-processed
+/// wraps only** (already-seen, failed-ledger hit, or unwrap-Ok), applied once after the loop — a wrap
+/// whose unwrap fails on the poll that first observes the failure does NOT advance it (see the loop
+/// for the per-outcome reasoning and the one-poll anti-wedge escape). Uses a `HashSet` for the seen
+/// lookup (O(1), not the old O(n) scan). Returns the
 /// stranger requests plus a `changed` flag: `true` iff it mutated the cache (so the caller persists a
 /// balanced push+prune the length tuple would miss).
 pub(crate) async fn merge_wraps_into_cache(
@@ -512,21 +516,53 @@ pub(crate) async fn merge_wraps_into_cache(
     // O(1) "already decoded?" lookups (was an O(n) linear scan → O(n²)/poll). The persisted `seen_wraps`
     // Vec stays the source of truth; this set mirrors it plus this batch's ids.
     let mut seen: HashSet<String> = cache.seen_wraps.iter().cloned().collect();
+    // QURATOR-231 — the cursor is a WATERMARK over definitively-processed wraps only, applied once
+    // after the loop. It used to advance unconditionally at the top of each iteration, before the
+    // seen/failed-ledger checks and the unwrap ran, so a wrap that failed to process still moved
+    // `since = cursor − 48 h` past itself — and any genuine older DM that had not yet been fetched
+    // was stranded outside the poll window forever (a silently dropped message). "Definitively
+    // processed", per outcome, and why each is safe to commit the cursor past:
+    //   • already in `seen`      — decoded on a prior poll; the message IS in the cache. Counting
+    //     these is also the anti-stall guard: a fully caught-up mailbox still advances its cursor.
+    //   • hit in `FAILED_WRAPS`  — failed under THIS identity before. `unwrap_dm` is deterministic
+    //     over (identity, wrap), so the verdict cannot change while the identity holds. The ledger
+    //     is in-memory, so after a restart the wrap is re-attempted exactly once more (the documented
+    //     negative-cache semantics: "re-attempts a wrap once, never loses a message").
+    //   • unwrap Ok this poll    — recorded in `seen_wraps`; the classic definitive outcome.
+    //   • unwrap Err THIS poll   — deliberately NOT counted on the poll that first observes the
+    //     failure: the cursor never commits past a wrap in the same breath as learning it failed.
+    //     `record_failed_wrap` in the Err arm turns it into the ledger-hit case on the next poll,
+    //     which is the anti-wedge escape: a permanently-undecodable foreign wrap (routine in this
+    //     shared `{kinds:[1059], #p:[me]}` inbox) stalls the cursor for exactly one ~15 s poll,
+    //     never forever. Invariant: the cursor never advances past a wrap that might still be
+    //     decodable, and never stalls on one that never will be. A stall-low cursor is benign by
+    //     construction — it only widens the fetch window (bandwidth), never loses a message.
+    let mut watermark = cache.newest_seen_outer;
     for wrap in wraps {
         let outer = wrap.created_at.as_secs().min(now); // clamp: a future-dated wrap can't poison the cursor
-        if outer > cache.newest_seen_outer {
-            cache.newest_seen_outer = outer;
-            changed = true;
-        }
         let wrap_id = wrap.id.to_hex();
         if seen.contains(&wrap_id) {
-            continue; // already decoded (a prior poll, or the same wrap from two relays)
+            // already decoded (a prior poll, or the same wrap from two relays) — definitive
+            if outer > watermark {
+                watermark = outer;
+            }
+            continue;
         }
         if failed_wrap_seen(own_npub, &wrap_id) {
-            continue; // already failed to unwrap under THIS identity on a prior poll — skip the redundant re-decrypt
+            // already failed to unwrap under THIS identity on a prior poll — skip the redundant
+            // re-decrypt. Definitive (deterministic unwrap), so it commits the cursor past it;
+            // this case is also what un-wedges the fresh-failure case one poll later
+            if outer > watermark {
+                watermark = outer;
+            }
+            continue;
         }
         match unwrap_dm(identity, &wrap).await {
             Ok(dm) => {
+                // Definitively processed (QURATOR-231) — commit the cursor past it, still clamped to now.
+                if outer > watermark {
+                    watermark = outer;
+                }
                 // Record the id only after a successful unwrap — an undecodable/foreign wrap is never
                 // remembered in the success ledger (it may be re-tried next poll, bounded by the
                 // 48 h window); instead it lands in the bounded negative cache, so the poll does not
@@ -580,6 +616,11 @@ pub(crate) async fn merge_wraps_into_cache(
                 // memory DoS; unwrap is deterministic for a given identity+wrap, so a failure here is
                 // permanent for this identity and the cache never blacklists a message that could
                 // later succeed.
+                //
+                // QURATOR-231: this wrap does NOT raise the watermark on the poll that first observed
+                // the failure (see the watermark declaration above) — the record below is what makes
+                // it a definitive ledger-hit on the NEXT poll, which is the bounded, one-poll escape
+                // that keeps a permanently-undecodable wrap from wedging the cursor.
                 record_failed_wrap(own_npub, wrap_id.clone());
                 tracing::debug!(
                     wrap_id = %wrap.id.to_hex(),
@@ -587,6 +628,14 @@ pub(crate) async fn merge_wraps_into_cache(
                 );
             }
         }
+    }
+    // Apply the watermark once, after the loop (QURATOR-231): the cursor only ever moves forward,
+    // and only over wraps that ended this poll with a definitive verdict. A held-back watermark
+    // (fresh-failure batch) leaves `changed` untouched unless the heal above fired — there is
+    // nothing to persist for a wrap whose only outcome was an in-memory ledger entry.
+    if watermark > cache.newest_seen_outer {
+        cache.newest_seen_outer = watermark;
+        changed = true;
     }
     (requests, changed)
 }
@@ -2524,6 +2573,199 @@ mod tests {
         let (_, changed) = merge_wraps_into_cache(&me, &me.npub(), vec![], &ctxv, &mut cache, now).await;
         assert!(changed, "healing the cursor marks the cache dirty (so it is persisted)");
         assert_eq!(cache.newest_seen_outer, now, "a persisted future cursor heals down to now");
+    }
+
+    #[tokio::test]
+    async fn failed_wrap_does_not_advance_the_cursor_past_an_unfetched_older_dm() {
+        // QURATOR-231 — the ticket's regression. The cursor used to advance unconditionally at the
+        // TOP of the loop, before the seen/failed-ledger checks and the unwrap ran, so a wrap that
+        // failed to process still moved `since = cursor − 48 h` past itself. Here the failed wrap is
+        // stamped 48 h + 10 min NEWER than a genuine DM that has not been fetched yet: with the old
+        // advance, `since` lands 10 min AFTER the DM's outer stamp, stranding it outside the poll
+        // window forever — a silently dropped message. With the watermark it stays inside the window
+        // and is delivered by the later poll that fetches it.
+        //
+        // MUTATION (P-10, orchestrator applies; resolve the LINE NUMBERS in production first — this
+        // comment names the same symbols, so a text search mutates the comment, not production): in
+        // `merge_wraps_into_cache`, restore the unconditional advance — re-insert
+        //   if outer > cache.newest_seen_outer { cache.newest_seen_outer = outer; changed = true; }
+        // immediately after the `let outer = … .min(now);` line inside the `for wrap in wraps` loop
+        // (production line ~542 as of this commit), and delete the post-loop apply block
+        //   if watermark > cache.newest_seen_outer { … }
+        // (production lines ~636-639). That is exactly today's (pre-fix) code; BOTH cursor asserts
+        // below must then FAIL: the first sees cursor == failed_ts, the second sees the filter's
+        // `since` land past the DM's stamp.
+        //
+        // FAILED_WRAPS hygiene: `me` is a fresh identity, so this test's ledger slice starts empty
+        // regardless of sibling tests — the cache is keyed (identity npub, wrap id).
+        let me = Identity::generate();
+        let contact = Identity::generate();
+        let attacker = Identity::generate();
+
+        // The genuine older DM, built with the production wrapper; its OUTER stamp is read back from
+        // the fixture (never assumed) and every other timestamp is derived from it — no wall-clock
+        // reads at assert time (the 2026-09-01 incident: a wall-clock-signed fixture dodged the
+        // exact gate under test).
+        let older = build_dm(&contact, &me.public_key(), "the stranded message").await.unwrap();
+        let dm_ts = older.created_at.as_secs();
+        // A foreign, permanently-undecodable wrap (junk content, wrong keys — the poison-wrap shape
+        // from the future-poison test above) stamped more than the 48 h margin NEWER than the DM.
+        let failed_ts = dm_ts + DM_FETCH_MARGIN_SECS + 600;
+        let now = failed_ts + 3_600; // this poll's wall clock: comfortably after both stamps
+        let poison = attacker
+            .sign(
+                EventBuilder::new(Kind::GiftWrap, "junk")
+                    .custom_created_at(Timestamp::from(failed_ts)),
+            )
+            .unwrap();
+
+        let contacts: HashSet<String> = [contact.npub()].into_iter().collect();
+        let empty: HashSet<String> = HashSet::new();
+        let ctxv = ctx(&contacts, &empty, &empty, true);
+        let mut cache = DmCache::default();
+
+        // Poll 1: only the failing wrap arrives. The cursor must NOT commit past it.
+        let (requests, _) =
+            merge_wraps_into_cache(&me, &me.npub(), vec![poison], &ctxv, &mut cache, now).await;
+        assert!(requests.is_empty(), "a foreign wrap creates no request");
+        assert!(
+            cache.newest_seen_outer < failed_ts,
+            "a wrap that failed to unwrap must not advance the cursor past itself \
+             (cursor {} vs failed stamp {failed_ts})",
+            cache.newest_seen_outer
+        );
+        // …and the older DM is still inside the NEXT poll's fetch window: `since` (when the filter
+        // carries one at all) must not exceed the DM's outer stamp. This is the stranding itself,
+        // pinned at the filter `dm_inbox_filter` builds from the cursor.
+        let filter = dm_inbox_filter(me.public_key(), cache.newest_seen_outer);
+        let since = filter.since.map(|t| t.as_secs()).unwrap_or(0);
+        assert!(
+            since <= dm_ts,
+            "the unfetched older DM fell outside the poll window (since {since} > dm stamp {dm_ts})"
+        );
+
+        // Poll 2: the older DM is fetched (it never left the window) and delivered.
+        let (requests2, _) =
+            merge_wraps_into_cache(&me, &me.npub(), vec![older], &ctxv, &mut cache, now).await;
+        assert!(requests2.is_empty(), "a contact's DM routes to the inbox, not a request");
+        assert_eq!(cache.messages.len(), 1, "the older DM is delivered on the later poll, not stranded");
+        assert_eq!(cache.messages[0].content, "the stranded message");
+    }
+
+    #[tokio::test]
+    async fn permanently_failed_wrap_stalls_the_cursor_for_one_poll_only() {
+        // QURATOR-231 anti-wedge: the naive fix ("never advance past a failed wrap") would let a
+        // permanently-undecodable foreign wrap — routine in this shared `{kinds:[1059], #p:[me]}`
+        // inbox — hold the cursor below itself FOREVER, wedging the inbox. The escape is the
+        // failed-wrap ledger: the poll that first observes a failure holds the cursor back, but the
+        // record makes the NEXT poll's ledger-hit a definitive verdict, which commits the cursor
+        // past it. Stall = exactly one poll, and the advance is persisted (`changed`).
+        //
+        // MUTATION (P-10): in `merge_wraps_into_cache`'s Err arm (production line ~624 as of this
+        // commit, the arm calling `record_failed_wrap`), add `if outer > watermark { watermark =
+        // outer; }` above the record — a fresh failure immediately counting. The FIRST assert below
+        // must then FAIL (poll 1 already advanced the cursor). This mutation is exactly why the
+        // fresh-Err case must not count: if it did, the fix would be a no-op against today's code.
+        let me = Identity::generate();
+        let attacker = Identity::generate();
+        let contact = Identity::generate();
+
+        // A later genuine DM (fixture's real outer stamp drives every other timestamp).
+        let newer = build_dm(&contact, &me.public_key(), "a later genuine DM").await.unwrap();
+        let dm_ts = newer.created_at.as_secs();
+        let failed_ts = dm_ts - 600;
+        let now = dm_ts + 3_600;
+        let poison = attacker
+            .sign(
+                EventBuilder::new(Kind::GiftWrap, "junk")
+                    .custom_created_at(Timestamp::from(failed_ts)),
+            )
+            .unwrap();
+
+        let contacts: HashSet<String> = [contact.npub()].into_iter().collect();
+        let empty: HashSet<String> = HashSet::new();
+        let ctxv = ctx(&contacts, &empty, &empty, true);
+        let mut cache = DmCache::default();
+
+        // Poll 1 (t = now): the failing wrap is observed for the first time — cursor held back.
+        let (_, _) = merge_wraps_into_cache(&me, &me.npub(), vec![poison.clone()], &ctxv, &mut cache, now).await;
+        assert!(
+            cache.newest_seen_outer < failed_ts,
+            "the first poll that observes a failure holds the cursor below the failed wrap"
+        );
+
+        // Poll 2 (t = now + 15 s): the SAME wrap is re-fetched (it never left the window — the
+        // cursor is still below it) and hits the failed-wrap ledger: definitive, cursor commits.
+        let (requests2, changed2) =
+            merge_wraps_into_cache(&me, &me.npub(), vec![poison], &ctxv, &mut cache, now + 15).await;
+        assert!(requests2.is_empty(), "the ledger hit yields no request");
+        assert!(changed2, "the one-poll-later advance is a real cache mutation (persisted)");
+        assert_eq!(
+            cache.newest_seen_outer, failed_ts,
+            "the ledger-hit verdict un-wedges the cursor after exactly one poll"
+        );
+
+        // Poll 3: a genuine DM newer than the failed wrap keeps the inbox moving past it entirely.
+        let (requests3, _) =
+            merge_wraps_into_cache(&me, &me.npub(), vec![newer], &ctxv, &mut cache, now + 30).await;
+        assert!(requests3.is_empty());
+        assert_eq!(cache.messages.len(), 1, "the genuine DM is delivered");
+        assert_eq!(cache.newest_seen_outer, dm_ts, "the cursor keeps advancing past the failed wrap");
+    }
+
+    #[tokio::test]
+    async fn already_seen_wrap_still_advances_the_cursor() {
+        // QURATOR-231 case-1 stall guard: "definitively processed" INCLUDES already-seen wraps — a
+        // mailbox whose newest arrivals were all decoded on a prior poll must still move its cursor
+        // forward, or every later poll re-fetches the whole 48 h window forever. The second phase
+        // re-pins the `.min(now)` clamp on the COUNTED path (a future-stamped already-seen wrap may
+        // raise the watermark only to `now`), which matters now that fresh failures no longer
+        // advance the cursor at all. The heal/clamp for the FETCH path stays pinned by
+        // `future_dated_foreign_wrap_cannot_poison_the_since_cursor` above.
+        //
+        // MUTATION (P-10) A: delete the `if outer > watermark { watermark = outer; }` inside the
+        // `seen.contains(&wrap_id)` continue arm (production line ~546 as of this commit) — an
+        // all-seen mailbox never advances; the first assert below must FAIL (cursor stays 0).
+        // MUTATION (P-10) B: change `let outer = wrap.created_at.as_secs().min(now);` (production
+        // line ~542) to drop the `.min(now)` — the second phase must FAIL (cursor lands past now).
+        let me = Identity::generate();
+        let contact = Identity::generate();
+        let dm = build_dm(&contact, &me.public_key(), "seen last poll").await.unwrap();
+        let dm_ts = dm.created_at.as_secs();
+        let now = dm_ts + 3_600;
+        let mut cache = DmCache::default();
+        cache.seen_wraps.push(dm.id.to_hex()); // decoded on a PRIOR poll
+
+        let contacts: HashSet<String> = [contact.npub()].into_iter().collect();
+        let empty: HashSet<String> = HashSet::new();
+        let ctxv = ctx(&contacts, &empty, &empty, true);
+        let (requests, changed) =
+            merge_wraps_into_cache(&me, &me.npub(), vec![dm.clone()], &ctxv, &mut cache, now).await;
+        assert!(requests.is_empty(), "an already-seen wrap yields no request");
+        assert!(cache.messages.is_empty(), "…and is not re-decoded into a message");
+        assert!(changed, "the cursor advance is a cache mutation (persisted)");
+        assert_eq!(
+            cache.newest_seen_outer, dm_ts,
+            "an already-seen wrap still commits the cursor to its outer stamp (the case-1 stall guard)"
+        );
+
+        // Same ledger, but the already-seen wrap now bears an attacker-chosen FUTURE stamp: the
+        // watermark may rise only to `now`.
+        let attacker = Identity::generate();
+        let future_seen = attacker
+            .sign(
+                EventBuilder::new(Kind::GiftWrap, "junk")
+                    .custom_created_at(Timestamp::from(now + 10 * 24 * 60 * 60)),
+            )
+            .unwrap();
+        cache.seen_wraps.push(future_seen.id.to_hex());
+        let (_, changed2) =
+            merge_wraps_into_cache(&me, &me.npub(), vec![future_seen], &ctxv, &mut cache, now).await;
+        assert!(changed2, "the clamped advance is a cache mutation");
+        assert_eq!(
+            cache.newest_seen_outer, now,
+            "a future-stamped already-seen wrap clamps the cursor to now, never past it"
+        );
     }
 
     #[test]
