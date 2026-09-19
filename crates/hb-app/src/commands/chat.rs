@@ -3238,6 +3238,61 @@ mod tests {
         assert!(c.contains("overflow"), "the newest entry is retained");
     }
 
+    /// (QURATOR-302) **Drift guard for the one construction QURATOR-296 could not share into this
+    /// crate.** hb-net's `failed_open_key` (`failed_wrap_cache.rs`) composes the shared
+    /// negative-cache key as (identity npub, scope, wrap id); `failed_wrap_key` above composes
+    /// this file's DM key as (identity npub, wrap id). TWO segments is CORRECT here — the DM
+    /// poller has exactly one inner-kind scope, so a scope segment would be a constant, and a
+    /// scope-less twin of the shared helper would recreate the drift 296 deleted. What must never
+    /// drift is the shared substance: both join with `\u{0}` and put the identity npub FIRST,
+    /// because the identity segment is what stops one node's failure verdict poisoning another's
+    /// cache (`negative_cache_does_not_cross_identity_boundaries` above pins that behaviour; this
+    /// test pins the BYTES both crates compose it from, which the behaviour tests are blind to).
+    /// `failed_open_key` is `pub(crate)`, so this crate cannot link it — the hb-net half is pinned
+    /// the `suite_cap.rs` way (hb-it/src/suite_cap.rs:49 pins hb-app's source because hb-it cannot
+    /// depend on hb-app): hb-net's SOURCE is compiled in with `include_str!`, so a hardening there
+    /// reds here instead of passing silently. Resolving a red here means hardening BOTH
+    /// constructions in the same commit — never one.
+    ///
+    /// MUTATION (P-10, for the orchestrator to apply, resolve by LINE NUMBER, never by grep — the
+    /// side-A anchor text also occurs, escaped, in the `JOIN` const below, by design):
+    ///  A. hb-net side: `crates/hb-net/src/failed_wrap_cache.rs` line 122, the line
+    ///     `format!("{me_npub}\u{0}{scope}\u{0}{wrap_id}")` — change both `\u{0}` escapes to
+    ///     `\u{1}`. This test reds on the `SRC` pin (the count drops to 0).
+    ///  B. hb-app side: this file line 458, the line `format!("{identity_npub}\u{0}{wrap_id}")` —
+    ///     change `\u{0}` to `\u{1}`. This test reds on the golden-value assert.
+    /// Both behaviour tests above stay GREEN under either single-sided mutation — they pin
+    /// separation, not bytes — which is the gap this guard closes.
+    #[test]
+    fn failed_wrap_key_composition_is_pinned_to_hb_nets_shared_construction() {
+        // Side 1 — THIS crate's real construction, driven as a golden value: the expected bytes
+        // are hand-written, never rebuilt by the code under test, so `failed_wrap_key` cannot pass
+        // by re-emitting its own output (a guard that does is decorative — P-6).
+        assert_eq!(
+            failed_wrap_key("npub1recipient", "abc123"),
+            "npub1recipient\u{0}abc123",
+            "chat.rs's negative-cache key composition changed. It must stay: identity npub first, \
+             one \\u{{0}} join, wrap id last — in lockstep with hb-net's failed_open_key, pinned \
+             below (QURATOR-302)"
+        );
+
+        // Side 2 — hb-net's real construction, OBSERVED rather than restated: its source is
+        // compiled in here, so the pin breaks the moment the shared `format!` is hardened. Exactly
+        // once: a second occurrence would be a dead twin left behind by the hardening — the
+        // hardened/unhardened-sibling drift shape this repo keeps re-finding.
+        const SRC: &str = include_str!("../../../hb-net/src/failed_wrap_cache.rs");
+        const JOIN: &str = "format!(\"{me_npub}\\u{0}{scope}\\u{0}{wrap_id}\")";
+        assert_eq!(
+            SRC.matches(JOIN).count(),
+            1,
+            "hb-net's failed_open_key no longer composes exactly the pinned construction (or now \
+             composes it twice). QURATOR-302's guard has drifted from hb-net source: update this \
+             pin AND harden chat.rs's failed_wrap_key in the same commit — one side without the \
+             other is the drift this test exists to catch. Do not resolve it by adding a \
+             scope-less twin of the shared helper (recreates QURATOR-296's drift)"
+        );
+    }
+
     #[test]
     fn cached_inbox_reclassifies_under_current_contacts_and_block() {
         let own = "npub1me";
