@@ -1517,8 +1517,13 @@ fn code_span_escape(s: &str) -> String {
 /// Path-traversal characters (`/`, `.`, `\`, `:`, `%`, NUL, whitespace) are
 /// not alphanumeric in any Unicode category and are therefore rejected here,
 /// preventing path traversal attacks (e.g., "../identity/keypair").
+///
+/// Canonical implementation: `hb_core::ticket::is_valid_slug` (QURATOR-259) — the SAME charset
+/// `verify_shape` enforces on wire tickets, so a slug the wire accepts is never something this
+/// node would refuse to create locally, and vice versa. This local gate delegates rather than
+/// re-implementing (the `validate_relay_url` pattern: one implementation, every path).
 pub(crate) fn is_valid_slug(slug: &str) -> bool {
-    !slug.is_empty() && slug.chars().all(|c| c.is_alphanumeric() || c == '-')
+    hb_core::ticket::is_valid_slug(slug)
 }
 
 /// Fixed keys sharing the flat `published/<key>.json` marker namespace (`DataStore::published_path`)
@@ -2538,6 +2543,35 @@ mod tests {
         assert!(is_valid_slug("映画コレクション"));
         assert!(is_valid_slug("фильмы-2023"));
         assert!(is_valid_slug("韓国ドラマ-collection"));
+    }
+
+    /// QURATOR-259 — the charset is single-sourced: `is_valid_slug` here is a pure delegate to
+    /// `hb_core::ticket::is_valid_slug`, where `verify_shape` enforces the same predicate on wire
+    /// tickets. Pin the DELEGATION, not just the behaviour: if this ever becomes a second, local
+    /// implementation that has drifted (e.g. one that admits `_` or `|`), local creation and the
+    /// wire boundary disagree — a peer's ticket could then name a slug this node would refuse to
+    /// create, or a wire alias (`"X|Y"` re-spelling the re-serve key for author X, slug Y) could
+    /// point at a slug the creation gate would never mint. The behaviour tests above stay green
+    /// through such a drift; only this equality catches it.
+    ///
+    /// MUTATION (P-10): replace the delegated body (crates/hb-app/src/commands/collection.rs,
+    /// `pub(crate) fn is_valid_slug`, the `hb_core::ticket::is_valid_slug(slug)` line) with a local
+    /// re-implementation that also allows `_` — `!slug.is_empty() && slug.chars().all(|c|
+    /// c.is_alphanumeric() || c == '-' || c == '_')` — the `under_score` probe reds while every
+    /// behaviour test above stays green. (Line-number anchor beats text: the mutation text appears
+    /// in this comment too.)
+    #[test]
+    fn local_slug_charset_is_exactly_the_core_wire_charset() {
+        for probe in [
+            "ok-slug", "films-2026", "a", "映画コレクション", "фильмы-2023",
+            "under_score", "a|b", "a/b", "a.b", "a b", "", "a%b", "a:b",
+        ] {
+            assert_eq!(
+                is_valid_slug(probe),
+                hb_core::ticket::is_valid_slug(probe),
+                "the local creation gate and the wire gate must be ONE charset; they disagree on {probe:?}"
+            );
+        }
     }
 
     /// QURATOR-249: the fixed marker keys that share the flat `published/` namespace with

@@ -47,13 +47,27 @@ export interface TransportTicket {
  *  asker→owner and asks for something; a ticket is owner→asker and grants it. */
 export const TICKET_TAG = 'transport_ticket';
 
+/** QURATOR-259 — the slug charset, mirroring `hb_core::ticket::is_valid_slug` (which
+ *  `verify_shape` enforces on every backend path, and hb-app's local creation gate delegates to).
+ *  Non-empty, Unicode letters/numbers and `-` only. Rust's `char::is_alphanumeric` is the
+ *  `Alphabetic` property plus Nd/Nl/No; `\p{Alphabetic}` + `\p{N}` is the same set in JS. A slug
+ *  outside it cannot be one this node would create, and — the reason this guard exists — a slug
+ *  containing `|` re-spells another `(author, slug)` pair's ask-trace key (see `askTraceKeys`). */
+const SLUG_CHARSET_RE = /^[\p{Alphabetic}\p{N}-]+$/u;
+function isValidSlug(slug: string): boolean {
+	return slug !== '' && SLUG_CHARSET_RE.test(slug);
+}
+
 /** Detect the `{hb:"transport_ticket",…}` JSON an owner DMs after clicking "Send the full list".
  *  Returns the parsed ticket, or null for any other message. Pure — no network, no invoke.
  *
  *  Deliberately strict about the discriminator AND the bindings: a body missing `request_id` or
  *  `slug` is not a ticket that merely lacks detail, it is something else. The backend re-checks all
  *  of this (`verify_shape`), so this is recognition, not validation — but recognising loosely here
- *  would render a card for a message that can only ever fail. */
+ *  would render a card for a message that can only ever fail. The slug charset check (QURATOR-259)
+ *  is the same doctrine: a `|`-slug ticket can only ever fail at the backend, AND its key spelling
+ *  aliases another ask's trace before it ever gets there — so recognition refuses it here, where
+ *  the empty-binding checks already mirror `verify_shape`. */
 export function parseTransportTicket(content: string): TransportTicket | null {
 	let v: unknown;
 	try {
@@ -65,7 +79,7 @@ export function parseTransportTicket(content: string): TransportTicket | null {
 	const o = v as Record<string, unknown>;
 	if (o.hb !== TICKET_TAG) return null;
 	if (typeof o.request_id !== 'string' || o.request_id === '') return null;
-	if (typeof o.slug !== 'string' || o.slug === '') return null;
+	if (typeof o.slug !== 'string' || !isValidSlug(o.slug)) return null;
 	return {
 		requestId: o.request_id,
 		slug: o.slug,
@@ -87,7 +101,15 @@ export function transportTicketHint(content: string): string | null {
  *  the on-disk identity from `responder|slug` to `responder|author|slug`; pre-widening records
  *  still resolve on the owner path). `ticketAuthor` absent means the issuer's own collection
  *  (author === responder) — the lenient legacy reading. Mirrors `manifestAskLookupKeys`
- *  (manifest-ask.ts) — keep the two in step. */
+ *  (manifest-ask.ts) — keep the two in step.
+ *
+ *  ⚠ QURATOR-259 — the hand-interpolated legacy spelling below is only unambiguous because the
+ *  slug is CHARSET-GATED upstream: `parseTransportTicket` (here) and `verify_shape` (backend) both
+ *  refuse a slug containing `|`. Without that gate, an authorless ticket from P with slug "X|Y"
+ *  makes the first spelling literally `"P|X|Y"` — byte-identical to `manifestAskKey(P, X, 'Y')`,
+ *  the re-serve key for author X, slug Y — reintroducing through the delimiter exactly the
+ *  cross-tenant collision the re-serve branch refuses to fall back into. Do not call this with a
+ *  slug that has not passed the charset gate. */
 function askTraceKeys(npub: string, slug: string, ticketAuthor?: string): string[] {
 	const author = ticketAuthor && ticketAuthor !== '' ? ticketAuthor : npub;
 	return author === npub

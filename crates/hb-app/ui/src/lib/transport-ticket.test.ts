@@ -9,6 +9,7 @@ import {
 	REDEEM_FAILED_LINE,
 } from './transport-ticket.js';
 import { parseManifestRequest } from './request-inbox.js';
+import { manifestAskKey } from './manifest-ask.js';
 
 const ticketBody = (over: Record<string, unknown> = {}) =>
 	JSON.stringify({
@@ -72,6 +73,21 @@ describe('parseTransportTicket', () => {
 		expect(parseTransportTicket(ticketBody({ request_id: '' }))).toBeNull();
 		expect(parseTransportTicket(ticketBody({ slug: undefined }))).toBeNull();
 		expect(parseTransportTicket(ticketBody({ slug: '' }))).toBeNull();
+	});
+
+	/** QURATOR-259 — the slug charset, mirrored from `hb_core::ticket::is_valid_slug` (which
+	 *  `verify_shape` enforces on every backend path, and where hb-app's local creation gate
+	 *  delegates). Two reasons recognition refuses a bad slug here, same doctrine as the binding
+	 *  checks above: a card rendered for it can only ever fail at the backend, and — the security
+	 *  reason — a `|`-slug's trace spelling ALIASES another ask's key before the backend ever sees
+	 *  it (demonstrated in the dial-gate block below). */
+	it('refuses a ticket whose slug is outside the slug charset (QURATOR-259)', () => {
+		for (const slug of ['X|Y', 'a/b', 'a.b', 'a\\b', 'a:b', 'a%b', 'a b', 'a\0b']) {
+			expect(parseTransportTicket(ticketBody({ slug }))).toBeNull();
+		}
+		// Positive control: hyphen is the one separator the charset allows, Unicode included.
+		expect(parseTransportTicket(ticketBody({ slug: 'films-2026' }))?.slug).toBe('films-2026');
+		expect(parseTransportTicket(ticketBody({ slug: 'фильмы-2023' }))?.slug).toBe('фильмы-2023');
 	});
 
 	it('renders a human hint instead of raw JSON', () => {
@@ -187,6 +203,26 @@ describe('ticketAnswersOurAsk — the unsolicited-dial gate', () => {
 	it('refuses the wrong collection and the wrong peer', () => {
 		expect(ticketAnswersOurAsk(asks, 'npub1owner', 'other', 'n-abc')).toBe(false);
 		expect(ticketAnswersOurAsk(asks, 'npub1stranger', 'criterion', 'n-abc')).toBe(false);
+	});
+
+	/** **QURATOR-259 — the delimiter collision, demonstrated where the keys live.** The legacy
+	 *  owner-path spelling `askTraceKeys` interpolates for an authorless ticket is
+	 *  `` `${npub}|${slug}` ``. Give peer C a wire slug of `"npub1A|Y"` and that spelling is
+	 *  literally `"npub1C|npub1A|Y"` — byte-identical to `manifestAskKey(npub1C, npub1A, 'Y')`,
+	 *  the re-serve trace for author npub1A's "Y". C is the party we SENT that ask (and its
+	 *  nonce) to, so the nonce gate does not bar C: the first assert below is the collision
+	 *  firing — the ticket "answers" an ask about a DIFFERENT author's collection. The second
+	 *  assert is the guard that bars it: such a ticket never parses, so it can never reach this
+	 *  gate (and `verify_shape` refuses it backend-side too). Note what this does NOT claim: even
+	 *  pre-fix, the backend's claim key was author-scoped `manifestAskKey(C, C, 'npub1A|Y')`, so
+	 *  the dial itself was refused — this pin exists so the spelling's safety never silently
+	 *  rests on the backend's key format staying 3-segment. */
+	it('QURATOR-259: a pipe-slug ticket cannot reach the gate its spelling would alias', () => {
+		const aliased = { [manifestAskKey('npub1C', 'npub1A', 'Y')]: { nonce: 'n-rs' } };
+		expect(ticketAnswersOurAsk(aliased, 'npub1C', 'npub1A|Y', 'n-rs')).toBe(true);
+		expect(
+			parseTransportTicket(ticketBody({ slug: 'npub1A|Y', ask_nonce: 'n-rs' })),
+		).toBeNull();
 	});
 
 	/** Fails closed on every ambiguity. The cost of failing closed is one re-ask; the cost of failing

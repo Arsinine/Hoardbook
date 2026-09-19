@@ -146,6 +146,24 @@ pub struct TransportTicket {
     pub author_npub: Option<String>,
 }
 
+/// A valid slug: non-empty, Unicode alphanumerics and `-` only. **The canonical charset, shared by
+/// the creation gate and the wire gate** (QURATOR-259) — hb-app's local `is_valid_slug`
+/// (`commands/collection.rs`) delegates here rather than re-implementing, the `validate_relay_url`
+/// pattern: ONE implementation guards every path, so a slug the wire accepts is never something
+/// this node would refuse to create locally, and vice versa.
+///
+/// Why the charset is a security property, not formatting. Ask-trace keys are pipe-delimited
+/// (hb-app's `manifest_ask_key`: `"{npub}|{author}|{slug}"`), whose doc long claimed "the pipe is
+/// unambiguous because npubs and slugs never contain `|`". The npub half is true (bech32); the slug
+/// half was enforced only at LOCAL creation — until QURATOR-259, `verify_shape` checked merely that
+/// a wire slug was non-empty, so a peer could send `slug: "X|Y"` and re-spell a different
+/// `(author, slug)` pair's key. [`TransportTicket::verify_shape`] now rejects that at the trust
+/// boundary instead of escaping in two languages — hardened-path/unhardened-sibling drift is this
+/// repo's recurring fault shape, and an escape would be two of them.
+pub fn is_valid_slug(slug: &str) -> bool {
+    !slug.is_empty() && slug.chars().all(|c| c.is_alphanumeric() || c == '-')
+}
+
 impl TransportTicket {
     /// Mint a ticket for one request. `node_addr` is passed through untouched.
     pub fn issue(
@@ -183,6 +201,18 @@ impl TransportTicket {
         }
         if self.request_id.is_empty() || self.slug.is_empty() || self.node_addr.is_empty() {
             return Err(HbError::InvalidTicket("ticket is missing a required binding".into()));
+        }
+        // QURATOR-259 — the slug's CHARSET is a binding, not formatting. Ask-trace keys are
+        // pipe-delimited (`manifest_ask_key`, hb-app: `"{npub}|{author}|{slug}"`), and a wire slug
+        // containing `|` re-spells a different (author, slug) pair's key: an authorless ticket from
+        // peer P with slug `"X|Y"` yields the legacy 2-segment spelling `"P|X|Y"` — byte-identical
+        // to the re-serve key for author X, slug Y. Production never mints such a slug (every local
+        // creation site runs `is_valid_slug`), so this refuses only values no honest peer's ticket
+        // carries — `TICKET_V` stays 1, the same no-honest-traffic-changes reasoning as the
+        // blank-field checks above. A serde derive is an unvalidated public constructor; the slug's
+        // contents now meet the same gate as its emptiness.
+        if !is_valid_slug(&self.slug) {
+            return Err(HbError::InvalidTicket("ticket slug is not a valid slug".into()));
         }
         // Present-but-blank is a malformed ticket, not an old one. Absent is the only legal way to
         // say "no nonce", so the asker's gate can treat `None` as one unambiguous case.
@@ -477,6 +507,64 @@ mod tests {
                 "a ticket with an empty {blank} is refused"
             );
         }
+    }
+
+    /// **QURATOR-259 — the delimiter collision, at the gate that closes it.** Ask-trace keys are
+    /// pipe-delimited (`manifest_ask_key`, hb-app: `"{npub}|{author}|{slug}"`), so an authorless
+    /// ticket from peer P carrying `slug: "X|Y"` re-spells the legacy 2-segment trace spelling
+    /// `"P|X|Y"` — byte-identical to the re-serve key for author X, slug Y, exactly the
+    /// cross-tenant collision `askTraceKeys`' re-serve branch says must never happen. The keys
+    /// live in hb-app/TS (unreachable from this test module), so what is pinned HERE is the thing
+    /// that makes the collision unconstructable: the wire ticket that would carry the aliasing slug
+    /// never survives `verify_shape`. The byte-identity itself is demonstrated in the TS suite
+    /// (`transport-ticket.test.ts`, beside `manifestAskKey`'s mirror) — the two spellings are built
+    /// where they live.
+    ///
+    /// MUTATION (P-10, applied by the orchestrator — this lane compiles nothing): at
+    /// crates/hb-core/src/ticket.rs line 214, delete the three lines of the
+    /// `if !is_valid_slug(&self.slug) { … }` block (the `if` line, the `return Err(
+    /// HbError::InvalidTicket("ticket slug is not a valid slug".into()));` arm, and its closing
+    /// brace) — this test reds on the `.is_err()` assertion while still compiling. (Anchor is a
+    /// LINE NUMBER because this comment quotes the code it names; a text anchor would match the
+    /// comment first.)
+    #[test]
+    fn a_wire_slug_containing_the_ask_key_delimiter_is_refused() {
+        let json = r#"{"hb":"transport_ticket","ticket_v":1,"request_id":"r","slug":"X|Y",
+                       "node_addr":"a","issued_at":1}"#;
+        let t: TransportTicket = serde_json::from_str(json).unwrap();
+        assert!(t.verify_shape().is_err(), "a slug that re-spells another ask's key is malformed");
+        assert!(
+            matches!(t.verify_shape(), Err(HbError::InvalidTicket(_))),
+            "the refusal names the ticket malformed, not a version problem"
+        );
+        // Positive control — the same ticket with a slug production actually mints passes.
+        let mut ok = t;
+        ok.slug = "films-2026".to_string();
+        ok.verify_shape().expect("an alphanumeric/hyphen slug is the charset every local creation site enforces");
+    }
+
+    /// **QURATOR-259, battery half.** `is_valid_slug`'s creation-side doc says path-traversal
+    /// characters are excluded "because they are not alphanumeric" — true at creation, but until
+    /// this check a wire slug had NO charset gate at all, so each of these was acceptable off the
+    /// wire. Pin a couple per family the creation tests already pin
+    /// (`slug_rejects_special_characters`, hb-app), plus the delimiter itself.
+    ///
+    /// MUTATION (P-10): the same deletion as the test above (ticket.rs:214) reds every refusal
+    /// assertion here; the positive control reds if the check is instead made unconditional
+    /// (`is_valid_slug` replaced by `false` at its own line 163).
+    #[test]
+    fn wire_slugs_with_delimiter_or_path_characters_are_refused() {
+        for bad in ["a|b", "a/b", "a.b", "a\\b", "a:b", "a%b", "a b", "a\u{0}b"] {
+            let mut t = ticket();
+            t.slug = bad.to_string();
+            assert!(
+                matches!(t.verify_shape(), Err(HbError::InvalidTicket(_))),
+                "a wire slug {bad:?} must be refused before any key is built from it"
+            );
+        }
+        let mut t = ticket();
+        t.slug = "a-b".to_string();
+        t.verify_shape().expect("hyphen is the one separator the charset allows");
     }
 
     // DELETED 2026-09-03, QURATOR-177 Option E (owner ruling: authorization is at ASK time via the

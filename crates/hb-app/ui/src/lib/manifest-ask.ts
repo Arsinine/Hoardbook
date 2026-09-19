@@ -91,9 +91,14 @@ export function deriveManifestAskState(
 }
 
 /** The on-disk key for an ask trace, widened to carry the author (Carrier 4). Mirrors the Rust
- *  `manifest_ask_key` (store.rs). The pipe is unambiguous because npubs (bech32) and slugs (URL-safe
- *  charset) never contain `|`. An unknown author fails closed: the empty string never appears as a
- *  stored key segment, so the lookup misses rather than widening. */
+ *  `manifest_ask_key` (store.rs). The pipe is unambiguous only because the slug is CHARSET-GATED
+ *  (QURATOR-259): npubs are bech32 and never contain `|`, and a slug off a transport ticket is
+ *  refused by `parseTransportTicket`/`verify_shape` (mirroring `hb_core::ticket::is_valid_slug`)
+ *  before it can reach a key — a `|`-slug would re-spell another `(author, slug)` pair's key, the
+ *  exact cross-tenant collision the re-serve lookup refuses to fall back into. ⚠ Slugs sourced
+ *  from a TEASER (not a ticket) have no such wire gate; this lookup trusts them — see the QURATOR-259
+ *  notes on the row. An unknown author fails closed: the empty string never appears as a stored key
+ *  segment, so the lookup misses rather than widening. */
 export function manifestAskKey(npub: string, author: string, slug: string): string {
 	return `${npub}|${author}|${slug}`;
 }
