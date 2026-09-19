@@ -709,12 +709,65 @@ pub enum ListingsState {
 /// rendered families: one fetch, grouped once, classified once. [`browse_peer_listings`] is the
 /// lenient projection of this (collections only, `FetchFailed` folded to empty) so existing
 /// callers are unchanged; the classification logic lives HERE and nowhere else.
+///
+/// QURATOR-300: this is now itself the lenient projection of [`browse_peer_listings_covered`] —
+/// same fetch, same grouping, same tri-state, with the scoped-leg coverage flag dropped. Every
+/// existing caller (both of `resolve_peer`'s arms included) must keep ignoring coverage:
+/// folding a partial read into the browse page's failed-enum derivation would make a transient
+/// outbox outage render as a FAILED browse and preserve the cached list — a deliberate policy
+/// decision, never a silent fallout of a signal threading past gates that don't need it.
 pub async fn browse_peer_listings_state(
     client: &RelayClient,
     peer: &PublicKey,
     browse_key: &BrowseKey,
     timeout: Duration,
 ) -> Result<(Vec<(String, RenderedListing, Option<String>)>, ListingsState), NetError> {
+    // QURATOR-300: delegating rather than duplicating the fetch legs keeps the projection and
+    // the coverage-carrying read from drifting — the discipline `browse_peer_listings` already
+    // applies to this function.
+    let (families, state, _covered) =
+        browse_peer_listings_covered(client, peer, browse_key, timeout).await?;
+    Ok((families, state))
+}
+
+/// QURATOR-300 — [`browse_peer_listings_state`] plus the one thing the tri-state cannot express:
+/// whether the read was COMPLETE. `ListingsState::Fetched` means only "the shared-pool fetch
+/// returned Ok" — it carries no notion of relay coverage, and the scoped outbox leg below used
+/// to swallow its own failures (`if let Ok`, no `else`), so a slug carried ONLY by the peer's
+/// NIP-65 outbox relay could be silently absent from an otherwise-`Fetched` read. The third
+/// element is `true` only when every relay LEG the read needed was driven without error
+/// ([`scoped_leg_covered`]).
+///
+/// ⚠⚠ **LEG granularity, NOT relay granularity — read this before consuming the flag** (review,
+/// 2026-09-20). `covered == true` does NOT mean every individual relay answered. `RelayClient::
+/// connect` is first-success by design (`client.rs` — "first relay connected, proceeding
+/// (stragglers keep connecting)") and returns `Err` only when NO relay handshakes. So if a peer's
+/// outbox advertises `[A, B]`, A wins the race and B black-holes, this flag still reads `true`
+/// while a slug carried ONLY by B is absent — the very harm the flag exists to detect, one level
+/// down. Closing that needs an all-relays-`Connected` check, deliberately not built here.
+/// **A consumer that gates eviction on this is buying "the leg did not error", never "the read
+/// was complete".** Stated narrowly on purpose: an overstated coverage posture stops the next
+/// audit looking just as surely as an understated one.
+///
+/// ⚠ THE HONEST BOUND — do not oversell downstream: a partial read destroys nothing by itself.
+/// The eviction consumer keeps foreign-author keys, listed slugs, unspent-but-claimed asks and
+/// anything inside the liveness grace of `sent_at`, and the discovery pass re-asks every unheld
+/// slug each poll, so a trace a partial read evicted is re-minted by the next complete one. The
+/// real window is an UNCLAIMED ask older than the grace whose slug one partial read omitted: it
+/// loses its auto-dial authorization until the re-ask lands — self-healing and bounded, which
+/// is why this rides as a `bool` beside the state rather than as a new `ListingsState` variant
+/// (that fork is a deliberate 7-file change and a different ticket).
+///
+/// As of this change the flag is computed but consumed by NOBODY: threading it through
+/// `resolve_peer` (hb-app `commands/browse.rs`) to the fetch driver's eviction gate — the one
+/// consumer that needs it — is the decomposed follow-up half of QURATOR-300. Not re-exported
+/// from lib.rs until that consumer exists.
+pub async fn browse_peer_listings_covered(
+    client: &RelayClient,
+    peer: &PublicKey,
+    browse_key: &BrowseKey,
+    timeout: Duration,
+) -> Result<(Vec<(String, RenderedListing, Option<String>)>, ListingsState, bool), NetError> {
     // QURATOR-196: the enumeration read is scoped exactly like `browse_share_code`'s — the peer's
     // advertised NIP-65 outbox relays not already in the shared pool are read through a dedicated
     // ephemeral client, merged into this author-wide fetch (deduped by id), then disconnected.
@@ -727,11 +780,22 @@ pub async fn browse_peer_listings_state(
     let listing_filter = Filter::new().author(*peer).kind(Kind::from_u16(KIND_LISTING));
     let resolved = resolve_peer_relays(client, peer, &[], &[], timeout).await;
     let scoped = scope_peer_relays(client.relays(), &resolved);
+    // QURATOR-300 — coverage capture, leg 1: the scoped leg is only "not needed" when it does
+    // not exist; once scoped relays exist, BOTH their connect and their fetch must succeed or
+    // the enumeration is PARTIAL whatever the shared pool returned. ⚠ "connect succeeded" is
+    // first-success across the scoped set, not all-of-them — see the leg-granularity warning on
+    // `browse_peer_listings_covered`; this stamp cannot see a relay that lost the race and then
+    // never answered.
+    let scoped_needed = !scoped.is_empty();
+    let mut scoped_connected = false;
     let scoped_client = if scoped.is_empty() {
         None
     } else {
         match RelayClient::connect(&Identity::generate(), &scoped, timeout).await {
-            Ok(c) => Some(c),
+            Ok(c) => {
+                scoped_connected = true;
+                Some(c)
+            }
             Err(e) => {
                 tracing::debug!(
                     relays = ?scoped,
@@ -745,14 +809,32 @@ pub async fn browse_peer_listings_state(
     let mut events = match client.fetch(listing_filter.clone(), timeout).await {
         Ok(events) => events,
         // The fetch itself failed — propagate the state, never fold it into "empty" (a confident
-        // negative on data that never arrived is the QURATOR-67/68/83/134 fault shape).
-        Err(e) => return Ok((Vec::new(), ListingsState::FetchFailed(e.to_string()))),
+        // negative on data that never arrived is the QURATOR-67/68/83/134 fault shape). Coverage
+        // is trivially false here: no leg was read at all.
+        Err(e) => return Ok((Vec::new(), ListingsState::FetchFailed(e.to_string()), false)),
     };
+    // QURATOR-300 — coverage capture, leg 2: the scoped fetch's failure was previously swallowed
+    // by `if let Ok` with no `else` — the exact fault shape the pool leg's `Err` arm just above
+    // names and refuses. A slug the outbox uniquely carries may be missing from `events`; carry
+    // that fact out instead of discarding it. (An Ok-but-empty outbox IS a genuine read of the
+    // leg — the same reading client.rs gives a connected relay returning nothing — so coverage
+    // keys on the read, never on the payload size.)
+    let mut scoped_fetched = false;
     if let Some(sc) = scoped_client.as_ref() {
-        if let Ok(extra) = sc.fetch(listing_filter, timeout).await {
-            events.extend(extra);
+        match sc.fetch(listing_filter, timeout).await {
+            Ok(extra) => {
+                scoped_fetched = true;
+                events.extend(extra);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "listings: peer outbox read failed; enumeration is PARTIAL, not complete"
+                );
+            }
         }
     }
+    let covered = scoped_leg_covered(scoped_needed, scoped_connected, scoped_fetched);
     let events = dedup_by_id(events);
     if let Some(sc) = scoped_client {
         sc.disconnect().await;
@@ -760,8 +842,9 @@ pub async fn browse_peer_listings_state(
 
     let pinned = authored_by(events, peer);
     if pinned.is_empty() {
-        // Nothing this peer authored exists on any relay we can read — an honest empty.
-        return Ok((Vec::new(), ListingsState::Fetched));
+        // Nothing this peer authored exists on any relay we can read — an honest empty. Coverage
+        // still reports whether "every relay we can read" was in fact all of them.
+        return Ok((Vec::new(), ListingsState::Fetched, covered));
     }
 
     let mut families: BTreeMap<String, HashMap<String, Vec<Event>>> = BTreeMap::new();
@@ -777,7 +860,17 @@ pub async fn browse_peer_listings_state(
 
     let out = enumerate_families(families, browse_key);
     let state = classify_listings(&pinned, &out);
-    Ok((out, state))
+    Ok((out, state, covered))
+}
+
+/// QURATOR-300 — the coverage half of the enumeration as ONE pure function, extracted for the
+/// same reason `classify_listings` was (QURATOR-134): the semantics are unit-testable without a
+/// relay, and the async wiring above is not. "Complete" means every relay leg the read NEEDED
+/// was actually read — a scoped leg that exists but could not be connected, or connected but
+/// could not be read, leaves the enumeration PARTIAL (the outbox may uniquely carry a slug); no
+/// scoped leg at all means the pool-only read already covered everything there was to read.
+fn scoped_leg_covered(scoped_needed: bool, connected: bool, fetched: bool) -> bool {
+    !scoped_needed || (connected && fetched)
 }
 
 /// Group + render every family, shared by [`browse_peer_listings_state`] (extracted QURATOR-134 so
@@ -1101,6 +1194,81 @@ mod tests {
         assert_ne!(ListingsState::FetchFailed("x".into()), ListingsState::Sealed);
         assert_ne!(ListingsState::Fetched, ListingsState::Sealed);
     }
+
+    // ── QURATOR-300: scoped-leg coverage — the tri-state's blind side ───────────────────────────
+    //
+    // `ListingsState::Fetched` says only "the shared-pool fetch returned Ok"; it cannot say
+    // whether the peer's NIP-65 outbox leg was read. `scoped_leg_covered` is the pure half of
+    // that answer; the WIRING (that `browse_peer_listings_covered` stamps the true operand for
+    // each leg) needs a live relay, so it is pinned by structure in the source-scan test below,
+    // the same contract the fetch driver's QURATOR-293 pin holds.
+
+    #[test]
+    fn q300_coverage_requires_every_needed_relay_leg_to_be_read() {
+        // No outbox relays beyond the shared pool → the pool-only read is COMPLETE.
+        assert!(
+            scoped_leg_covered(false, false, false),
+            "a read that needed no scoped leg is complete"
+        );
+        // Scoped relays existed, connected, and were read (an empty payload is still a read) →
+        // COMPLETE.
+        assert!(
+            scoped_leg_covered(true, true, true),
+            "a scoped leg that connected and fetched is complete"
+        );
+        // Scoped relays existed but the ephemeral connect failed (the old debug!-only hole) →
+        // PARTIAL, whatever the pool returned.
+        assert!(
+            !scoped_leg_covered(true, false, false),
+            "an unconnectable outbox leaves the read partial"
+        );
+        // Connected, but the scoped FETCH errored — the old `if let Ok` swallow → PARTIAL.
+        assert!(
+            !scoped_leg_covered(true, true, false),
+            "an unreadable outbox leaves the read partial"
+        );
+    }
+    // MUTATION (P-10, for the orchestrator to apply, resolve by LINE NUMBER in
+    // crates/hb-net/src/browse.rs): the single-line body of `scoped_leg_covered`, quoted
+    // verbatim at its production line — `!scoped_needed || (connected && fetched)` — replaced
+    // by `true` reds `q300_coverage_requires_every_needed_relay_leg_to_be_read` (both
+    // `assert!(!..)` arms flip). Do NOT neutralise with `if false` — this is a call, deleting
+    // or rewriting the return expression is the mutation.
+
+    /// Source-scan pin (CLAUDE.md §9 — a signal not wired into production is decoration): the
+    /// coverage operands must actually be STAMPED by the async legs, and the decision must
+    /// consume all three (call form, never a bare name). The offline suite cannot drive a
+    /// relay, so the wiring is pinned at the source, production half only, with the scanned
+    /// length printed so "not found" is distinguishable from "nothing scanned".
+    #[test]
+    fn q300_coverage_operands_are_stamped_by_both_scoped_legs() {
+        let src = include_str!("browse.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(!prod.is_empty(), "source-scan guard is scanning nothing — include_str! broke");
+        let scanned = prod.lines().count();
+        assert!(
+            prod.contains("scoped_leg_covered(scoped_needed, scoped_connected, scoped_fetched)"),
+            "coverage must be decided from the three stamped operands at its call site, not \
+             derived somewhere downstream. Scanned {scanned} lines"
+        );
+        assert_eq!(
+            prod.matches("scoped_connected = true;").count(),
+            1,
+            "the connect Ok arm must stamp the connect operand exactly once. Scanned {scanned} lines"
+        );
+        assert_eq!(
+            prod.matches("scoped_fetched = true;").count(),
+            1,
+            "the scoped fetch Ok arm must stamp the fetch operand exactly once. Scanned {scanned} lines"
+        );
+    }
+    // MUTATION (P-10, source-scan — mutate by DELETING, never by neutralising): delete the one
+    // statement `scoped_connected = true;` inside `browse_peer_listings_covered`'s connect Ok
+    // arm (production half, resolve by LINE NUMBER in crates/hb-net/src/browse.rs) →
+    // `q300_coverage_operands_are_stamped_by_both_scoped_legs` reds at its count==1 assert.
+    // Deleting `scoped_fetched = true;` likewise reds the other count assert. (Deleting the
+    // whole `let covered = …` call reds the contains assert — but that also reds nothing in
+    // the pure test, which is why each mutation is run separately.)
 
     /// Group author-pinned events into the root-slug family map `browse_peer_listings_state`
     /// builds — extracted to the same shape so the tests exercise the real grouping, not a

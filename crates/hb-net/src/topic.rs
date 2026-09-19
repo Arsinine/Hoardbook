@@ -875,7 +875,8 @@ pub async fn fetch_invite(
 /// The open + redeem core of [`fetch_invite`] — everything after the relay fetch (QURATOR-294;
 /// single-open since QURATOR-298). Each wrap is opened EXACTLY ONCE per poll by
 /// `hb_core::topic::open_invite` — the deterministic half of the old monolithic `redeem_invite`
-/// (unwrap + inner-kind pin + payload parse + version tags) — so a wrap failing it can never
+/// (unwrap + inner-kind pin + payload parse + version tags + the topic_key decode, QURATOR-301)
+/// — so a wrap failing it can never
 /// satisfy the policy half, and its id is remembered in [`TOPIC_FAILED_OPENS`] and never
 /// re-decrypted. A wrap that opens goes to `hb_core::topic::redeem_opened_invite` with the
 /// PRE-OPENED `(issuer, payload)` — no re-verify, no re-decrypt (the pre-QURATOR-298 shape paid

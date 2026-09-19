@@ -455,6 +455,15 @@ async fn discover_unheld(
         // empty cache, an undecryptable one (`Sealed`), or the keyless arm — and evicting on those
         // deletes LIVE asks, the silent drop the no-caps ruling forbids. An offline author never
         // reaches any of this: the `Err` arm `continue`s below.
+        //
+        // QURATOR-300 (OPEN, decomposed out of this lane): `Fetched` still means only "the
+        // shared-pool fetch returned Ok" — it cannot say the peer's NIP-65 outbox leg was read,
+        // so a slug carried ONLY by an outbox relay that errored can vanish from `published` on
+        // a partial read and evict a live trace here. hb-net now computes the coverage flag
+        // (`browse_peer_listings_covered`); threading it into this gate needs `resolve_peer`
+        // (commands/browse.rs) to carry it out, which is outside this lane's files. The honest
+        // bound until then — grace window + per-poll re-ask re-mints the trace — is documented
+        // at the flag's definition in hb-net/src/browse.rs.
         let (published, listings_fetched): (Vec<(String, Option<String>)>, bool) =
             match resolve_peer(&share_code, identity, store, relay).await {
                 Ok(peer) => (

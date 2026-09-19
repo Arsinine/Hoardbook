@@ -818,7 +818,8 @@ async fn topic15(ctx: &Ctx) -> Result<()> {
 /// TOPIC16 (QURATOR-294, hb-it half): the invite scope's correctness boundary, over a real relay.
 /// The invite scope deliberately caches ONLY the deterministic open verdict (`hb_core`'s
 /// `open_invite` — crypto, inner-kind pin, tags, payload parse and version consistency since
-/// QURATOR-298; it was just unwrap + the kind pin when this row was written), never the full redeem
+/// QURATOR-298, plus the 32-byte topic_key decode since QURATOR-301; it was just unwrap + the kind
+/// pin when this row was written), never the full redeem
 /// verdict, because the policy half consults CALLER context — a fresh
 /// `seen`, a caller `now`, and this caller's `expected_topic_id`/`expected_issuer`. The boundary:
 /// one and the same wrap, p-tagged to one invitee, is refused on poll 1 because the caller expects
