@@ -3,7 +3,7 @@ use globset::{Glob, GlobSetBuilder};
 use hb_core::types::{Collection, DirectoryItem, ItemType, Visibility};
 use hb_core::{BrowseKey, Identity};
 use hb_net::{publish_listing_capped, publish_listing_to, split_listing};
-use nostr::{Filter, Kind};
+use nostr::{Event, Filter, Kind};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -698,19 +698,61 @@ fn revoked_during_publish(slug: &str) -> String {
 /// [`publish_private_collection_inner`] (private path) — the CWE-367 guarded save. The relay write
 /// happens before the marker save, so an Unpublish issued mid-publish would otherwise be silently
 /// undone by the save re-creating the marker. Extracted so the pinning test ends where production
-/// ends (P-6): on [`PublishedSave::Revoked`] it reports the revocation instead of succeeding
-/// (INV-8: a deliberately-skipped save, reported — never a silent success).
+/// ends (P-6). QURATOR-251: the outcome is surfaced to the caller — on [`PublishedSave::Revoked`]
+/// the marker was deliberately NOT written (INV-8: a deliberately-skipped save, reported — never a
+/// silent success) and each tier's save site adds its own tail: the PUBLIC path retracts the
+/// listing it already pushed ([`save_public_marker_or_retract`]); the PRIVATE path only reports,
+/// because its gift-wrapped events are authored by per-recipient ephemeral keys this identity
+/// cannot NIP-09 (see `unpublish_collection_inner`'s doc — an honest limit, not a bug).
 fn save_collection_marker_guarded(
     store: &DataStore,
     slug: &str,
     marker: &str,
     gen_at_start: u64,
-) -> Result<(), String> {
-    if store
+) -> Result<PublishedSave, String> {
+    store
         .save_published_guarded(slug, marker, gen_at_start)
-        .map_err(cmd_err)?
+        .map_err(cmd_err)
+}
+
+/// QURATOR-251 — the PUBLIC path's guarded-save tail: the store guard above, plus the retraction
+/// its `Revoked` outcome now owes. The listing events this publish pushed (teaser + any big-relay
+/// family) are already live on relays when the guard reports an Unpublish/Delete landed mid-flight;
+/// skipping only the marker save left a state mismatch — local "not published", relay-visible
+/// content. The Revoked branch therefore runs the SAME best-effort retraction Unpublish itself runs
+/// ([`retract_public_listing`]: NIP-09 by `d`-tag + the QURATOR-138 tombstone, shared pool + big
+/// relay) for exactly this slug, then reports the race. Honest limits, by ruling and by mechanism:
+/// (1) NIP-09 is a REQUEST a relay may ignore (N5 — best-effort like all deletion here); the
+/// tombstone replaces only on conforming relays. This closes the intent gap; it cannot promise the
+/// bytes are unreadable anywhere — a public listing's browse key is a forwardable string, so
+/// retraction here is a courtesy with no security value (CLAUDE.md revocation semantics).
+/// (2) The marker this publish would have saved was never written, so `retract_public_listing`'s
+/// big-relay half cannot read the family's target from it and falls back to the current setting —
+/// bounded noise when the setting changed mid-race, same posture as a pre-marker-era unpublish.
+/// (3) The retraction serves the UNPUBLISH's intent (the newest generation-moving event); a publish
+/// of the same slug that STARTED after that unpublish and saved its own marker first would have
+/// its listing superseded by this tombstone — a publish/unpublish/publish triple-race transient,
+/// healed by the next fingerprint-change republish, and strictly better than the pre-251 state
+/// where the losing publish's events stayed live with nothing pointing at them.
+async fn save_public_marker_or_retract(
+    slug: &str,
+    store: &DataStore,
+    identity: &Identity,
+    browse_key: &BrowseKey,
+    relay: &SharedRelay,
+    marker: &str,
+    gen_at_start: u64,
+) -> Result<(), String> {
+    if save_collection_marker_guarded(store, slug, marker, gen_at_start)?
         == PublishedSave::Revoked
     {
+        // Best-effort, exactly like every other retraction call site: a failure to retract must
+        // not mask the revocation report, which is the fact the user needs.
+        if let Err(e) = retract_public_listing(slug, store, identity, browse_key, relay).await {
+            tracing::warn!(
+                "post-revocation retraction for '{slug}' failed ({e}); its listing may stay live on relays"
+            );
+        }
         return Err(revoked_during_publish(slug));
     }
     Ok(())
@@ -915,7 +957,8 @@ pub(crate) async fn publish_collection_inner(
         "big_relay_url": big_target.as_deref().unwrap_or(""),
     })
     .to_string();
-    save_collection_marker_guarded(store, slug, &marker, gen_at_start)?;
+    save_public_marker_or_retract(slug, store, identity, browse_key, relay, &marker, gen_at_start)
+        .await?;
 
     // M9: record the snapshot fingerprint of what we just published, so a later watch re-scan that
     // hashes equal is a no-op (the republish-storm guard) and a real change re-publishes exactly once.
@@ -994,7 +1037,15 @@ async fn publish_private_collection_inner(
     // Local published marker — records the *private* tier + the recipient count (the N× multiplier
     // INV-8 calls out), distinct from the public path's `parts`.
     let marker = serde_json::json!({ "private": true, "recipients": recipients.len() }).to_string();
-    save_collection_marker_guarded(store, slug, &marker, gen_at_start)?;
+    // QURATOR-251: same CWE-367 race as the public path, but the private tier CANNOT retract —
+    // the wraps were just published under per-recipient ephemeral keys (M10), and a NIP-09
+    // deletion must be signed by the target event's own author. The save is skipped and the race
+    // reported; exclusion-going-forward is the per-recipient CEK wrap's job (CLAUDE.md: revocation
+    // is meaningful only for private collections, enforced by construction).
+    if save_collection_marker_guarded(store, slug, &marker, gen_at_start)? == PublishedSave::Revoked
+    {
+        return Err(revoked_during_publish(slug));
+    }
 
     // M9 storm-guard fingerprint, same as the public path.
     if let Ok(Some(col)) = store.load_collection_draft(slug) {
@@ -1133,6 +1184,25 @@ fn listing_dtag_belongs_to_slug(d: &str, slug: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// The fetched listing events a retraction must NIP-09-delete for `slug` — its `d`-tag family
+/// (the index + `slug#part{i}` split parts), and NOTHING else: another collection's events that
+/// came back under the same author+kind filter must never be swept into a deletion (INV-8:
+/// durable deletion is deliberate, never accidental — a revocation of "films", mid-publish or not,
+/// has no business deleting "music"). Extracted from the two identical selection loops in
+/// [`retract_public_listing`] (shared pool + big relay) — and reached by the QURATOR-251
+/// revoked-during-publish retraction through that same function — so the no-over-delete property
+/// is pinnable at the Event level without a live relay (P-6).
+fn retraction_targets<'a>(
+    events: &'a [Event],
+    slug: &'a str,
+) -> impl Iterator<Item = &'a Event> + 'a {
+    events.iter().filter(move |ev| {
+        ev.tags
+            .identifier()
+            .is_some_and(|d| listing_dtag_belongs_to_slug(d, slug))
+    })
+}
+
 /// The tier a collection's published marker records (QURATOR-200 / F10): the AUTHORITATIVE record
 /// of what is actually live on relays, written at publish time — the public shape by
 /// [`publish_collection_inner`] (`{"parts":…}`), the private shape by
@@ -1196,16 +1266,9 @@ async fn retract_public_listing(
         let filter =
             Filter::new().author(identity.public_key()).kind(Kind::from_u16(hb_core::event::KIND_LISTING));
         if let Ok(events) = client.fetch(filter, net::RELAY_TIMEOUT).await {
-            for ev in events {
-                let belongs = ev
-                    .tags
-                    .identifier()
-                    .map(|d| listing_dtag_belongs_to_slug(d, safe_slug))
-                    .unwrap_or(false);
-                if belongs {
-                    if let Ok(deletion) = hb_net::build_deletion(identity, &ev) {
-                        let _ = client.publish(&deletion).await;
-                    }
+            for ev in retraction_targets(&events, safe_slug) {
+                if let Ok(deletion) = hb_net::build_deletion(identity, ev) {
+                    let _ = client.publish(&deletion).await;
                 }
             }
         }
@@ -1259,16 +1322,9 @@ async fn retract_public_listing(
                 .author(identity.public_key())
                 .kind(Kind::from_u16(hb_core::event::KIND_LISTING));
             if let Ok(events) = big_client.fetch_from(&relays, filter, net::RELAY_TIMEOUT).await {
-                for ev in events {
-                    let belongs = ev
-                        .tags
-                        .identifier()
-                        .map(|d| listing_dtag_belongs_to_slug(d, safe_slug))
-                        .unwrap_or(false);
-                    if belongs {
-                        if let Ok(deletion) = hb_net::build_deletion(identity, &ev) {
-                            let _ = big_client.publish_to(&deletion, &relays).await;
-                        }
+                for ev in retraction_targets(&events, safe_slug) {
+                    if let Ok(deletion) = hb_net::build_deletion(identity, ev) {
+                        let _ = big_client.publish_to(&deletion, &relays).await;
                     }
                 }
             }
@@ -2475,16 +2531,20 @@ mod collection_command_guards_a {
         );
     }
 
-    /// `save_collection_marker_guarded` reports `Revoked` (as its own `Err`, line 597) instead of
-    /// re-creating a marker for a collection that was unpublished while the publish was in flight —
-    /// simulated here by bumping the revocation generation (via `delete_published`, which bumps
+    /// `save_collection_marker_guarded` surfaces `Ok(PublishedSave::Revoked)` — never re-creating
+    /// a marker for a collection that was unpublished while the publish was in flight — simulated
+    /// here by bumping the revocation generation (via `delete_published`, which bumps
     /// unconditionally even when nothing was ever published) past the `gen_at_start` the caller
-    /// still holds.
+    /// still holds. QURATOR-251 moved the Revoked→error mapping out to the two tier save sites
+    /// (the PUBLIC site also retracts, the PRIVATE site cannot — ephemeral authors), so the
+    /// OUTCOME, not an `Err`, is this seam's contract; the exact message both sites map `Revoked`
+    /// to is pinned alongside.
     ///
-    /// Mutation to redden: change `if ... == PublishedSave::Revoked { return Err(revoked_during_publish(slug)); }`
-    /// so the condition is always false (e.g. compare against a variant that can never be produced).
+    /// Mutation to redden: in `save_collection_marker_guarded`'s return expression (the
+    /// `.map_err(cmd_err)` tail, line 715), append `.map(|_| PublishedSave::Saved)` — the outcome
+    /// assert reds while the store still refuses the write.
     #[test]
-    fn save_collection_marker_guarded_reports_revocation_instead_of_re_creating_the_marker() {
+    fn save_collection_marker_guarded_surfaces_revocation_instead_of_re_creating_the_marker() {
         let (_dir, store) = test_store();
         let slug = "in-flight-slug";
         // Bump the revocation generation from 0 to 1, so the caller's stale `gen_at_start` of 0 no
@@ -2492,13 +2552,18 @@ mod collection_command_guards_a {
         store.delete_published(slug).unwrap();
         assert_eq!(store.published_generation(slug), 1);
 
-        let err = save_collection_marker_guarded(&store, slug, "{}", 0).unwrap_err();
+        let outcome = save_collection_marker_guarded(&store, slug, "{}", 0);
+        assert!(
+            matches!(outcome, Ok(PublishedSave::Revoked)),
+            "a mid-write unpublish must surface Revoked"
+        );
+        assert!(!store.is_published(slug), "a revoked save must not have written the marker");
+        // The message both tier save sites map `Revoked` to (production form, pinned verbatim).
         assert_eq!(
-            err,
+            revoked_during_publish(slug),
             "collection 'in-flight-slug' was unpublished while its publish was in flight; not \
              re-creating the published marker"
         );
-        assert!(!store.is_published(slug), "a revoked save must not have written the marker");
     }
 }
 
@@ -3863,8 +3928,8 @@ mod tests {
         // re-create the marker.
         let outcome = save_collection_marker_guarded(&store, "films", marker, gen_at_start);
         assert!(
-            outcome.is_err(),
-            "a mid-write unpublish must report revocation, not silently re-save"
+            matches!(outcome, Ok(PublishedSave::Revoked)),
+            "a mid-write unpublish must surface Revoked, not silently re-save"
         );
         assert!(!store.is_published("films"), "the revoked marker must NOT be resurrected");
     }
@@ -3878,8 +3943,100 @@ mod tests {
         let marker = r#"{"parts":1}"#;
         let gen_at_start = store.published_generation("films");
         assert_eq!(gen_at_start, 0, "a missing generation file reads as 0");
-        save_collection_marker_guarded(&store, "films", marker, gen_at_start).unwrap();
+        assert!(matches!(
+            save_collection_marker_guarded(&store, "films", marker, gen_at_start),
+            Ok(PublishedSave::Saved)
+        ));
         assert!(store.is_published("films"), "an un-bumped generation must save the marker");
+    }
+
+    // ── QURATOR-251: the Revoked branch retracts what the publish already wrote ─────
+
+    /// INV-8 (no over-delete) at the Event level: the retraction selector must keep exactly the
+    /// revoked slug's `d`-tag family (the index + `slug#part{i}` split parts) and nothing else —
+    /// a revocation of "films" landing mid-publish must never sweep another collection's events
+    /// ("music") or a prefix-sibling ("films-extra") into its NIP-09 deletions. Drives the SAME
+    /// selector both loops of `retract_public_listing` (shared pool + big relay) run — and
+    /// therefore the QURATOR-251 revoked-during-publish retraction through it (P-6: the test ends
+    /// where production ends). The events are real signed kind-31111 listing events, so the
+    /// `d`-tag shape is production-true.
+    ///
+    /// Mutation to redden: in `retraction_targets`' filter arm (the
+    /// `is_some_and(|d| listing_dtag_belongs_to_slug(d, slug))` predicate, line 1199), replace the
+    /// predicate with `true` — "music" and "films-extra" then survive selection and the
+    /// `assert_eq!` reds.
+    #[test]
+    fn retraction_targets_selects_exactly_the_revoked_slugs_family() {
+        let identity = Identity::generate();
+        let bk: BrowseKey = rand::random();
+        let listing =
+            |d: &str| hb_core::event::build_listing_event(&identity, d, &bk, "{}").unwrap();
+        let events = vec![
+            listing("films"),
+            listing("films#part0"),
+            listing("films#part12"),
+            // Everything below must NEVER be selected for "films".
+            listing("films-extra"),
+            listing("music"),
+            listing("films#partition"),
+        ];
+        let selected: Vec<&str> = retraction_targets(&events, "films")
+            .filter_map(|ev| ev.tags.identifier())
+            .collect();
+        assert_eq!(selected, vec!["films", "films#part0", "films#part12"]);
+    }
+
+    /// QURATOR-251 — the PUBLIC path's Revoked tail, driven at its extracted seam
+    /// (`save_public_marker_or_retract`, the exact function `publish_collection_inner` runs at its
+    /// save site; the full publish needs a live relay — the documented limit above this block).
+    /// What a unit test can prove is the tail's LOCAL contract: on a mid-write revocation the
+    /// marker is never saved, the retraction is attempted through an unroutable relay (fails fast,
+    /// touches no real relay), and the race is reported as the exact revocation error. Whether a
+    /// retraction was actually ISSUED — and honoured — is observable only against a live relay:
+    /// that is the WAN-E2E escalation row (a publish revoked mid-flight leaves no readable listing
+    /// on the relay set), owner-gated, because `hb-it` cannot link `hb-app` (§5 step 2, verified:
+    /// hb-it's Cargo.toml declares exactly hb-core + hb-net).
+    ///
+    /// Mutation to redden: in `save_public_marker_or_retract`'s Revoked arm (line 756), change the
+    /// `return Err(revoked_during_publish(slug));` to `return Ok(());` — the `unwrap_err()` reds.
+    /// (Removing the `retract_public_listing` call does NOT red this test — that half is the WAN
+    /// row's to prove, which is said here plainly rather than pretended into the assert.)
+    #[tokio::test]
+    async fn public_revoked_tail_reports_the_race_and_never_saves_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        // Unroutable local relay — the same posture as the unpublish tests below: the best-effort
+        // retraction attempt fails fast without ever touching a real relay.
+        store
+            .save_settings(&crate::store::Settings {
+                relay_urls: vec!["ws://127.0.0.1:1".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let identity = Identity::generate();
+        let bk: BrowseKey = rand::random();
+        let relay = crate::net::new_shared();
+
+        // The mid-write revocation: `delete_published` removes the marker and bumps the generation
+        // past the `gen_at_start` of 0 the in-flight "publish" still holds.
+        store.delete_published("films").unwrap();
+
+        let err = save_public_marker_or_retract(
+            "films",
+            &store,
+            &identity,
+            &bk,
+            &relay,
+            r#"{"parts":1}"#,
+            0,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, revoked_during_publish("films"));
+        assert!(
+            !store.is_published("films"),
+            "the revoked tail must not save the marker"
+        );
     }
 
     // ── M13 W5 item 1: unpublish_collection ───────────────────────────────────────
