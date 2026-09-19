@@ -198,11 +198,23 @@ impl AutoApproveCaps {
 /// [`hb_core::TransportTicket::author_npub`] already gives `None`.
 ///
 /// `Clone` because the auto-approve loop's hold queue owns a paced request across polls.
+///
+/// `fingerprint_seen` is DELIBERATELY not retained (QURATOR-245, resolved 2026-09-19). The wire
+/// field is the ASKER's observation — what their copy of the author's public teaser showed THEM —
+/// and it is consumed on the asker's side (their redeem path's snapshot-change detection), never
+/// on ours: a re-serve serves the NEWEST cached copy for the ask's `(author, slug)` (QURATOR-177
+/// Option E), and "do we hold this collection at all" is enforced where it belongs — inside the
+/// serve body itself, by the `newest_cached_for` lookup `send_cached_manifest_inner` refuses
+/// without (`commands/fulfil.rs`). A held-fingerprint pre-check here would refuse an asker whose
+/// teaser lags our cached snapshot; that refusal can never resolve into a serve, so it is a drop
+/// of public bytes — and a silence-unless-willing mechanism the 2026-09-04 probe ruling
+/// ("C answers asks normally — no silence-unless-willing mechanism") explicitly rules out. Bodies
+/// carrying the field still parse (pinned by `a_body_with_fingerprint_seen_still_parses`): the
+/// TS parser and the wire shape are untouched, the field is simply ignored like any unretained
+/// one.
 #[derive(Clone)]
 pub(crate) struct ManifestRequestBody {
     pub(crate) slug: String,
-    #[allow(dead_code)] // parsed for wire-shape parity with the TS parser; this loop has no use
-    fingerprint_seen: Option<String>,
     pub(crate) ask_nonce: Option<String>,
     author_npub: Option<String>,
 }
@@ -235,7 +247,6 @@ impl ManifestRequestBody {
         };
         Some(Self {
             slug,
-            fingerprint_seen: str_field("fingerprint_seen"),
             ask_nonce: str_field("ask_nonce"),
             author_npub: str_field("author_npub"),
         })
@@ -741,7 +752,6 @@ mod tests {
     fn body(slug: &str, author_npub: Option<&str>) -> ManifestRequestBody {
         ManifestRequestBody {
             slug: slug.to_string(),
-            fingerprint_seen: None,
             ask_nonce: Some("n1".to_string()),
             author_npub: author_npub.map(|a| a.to_string()),
         }
@@ -840,6 +850,53 @@ mod tests {
             pace_key("npub1peer", None, "vault"),
             "blank and absent must share one rate budget, not split it"
         );
+    }
+
+    /// QURATOR-245 — `fingerprint_seen` is accepted on the wire and DELIBERATELY not retained by
+    /// this parser. It is the ASKER's observation (what their teaser showed them), consumed on
+    /// the asker's side; a re-serve serves the NEWEST cached copy for the ask's `(author, slug)`
+    /// (QURATOR-177 Option E), and "do we hold this collection" is enforced inside the serve
+    /// body (`send_cached_manifest_inner`'s `newest_cached_for` lookup, `commands/fulfil.rs`).
+    /// Wiring the field into the approval would refuse an asker whose teaser lags our cached
+    /// snapshot — a refusal that can never resolve into a serve, i.e. a drop of public bytes,
+    /// and a silence-unless-willing mechanism the 2026-09-04 probe ruling rules out. This test
+    /// pins the other half of the removal: the field's PRESENCE must never make a body fatal. A
+    /// removal that accidentally rejected bodies carrying it would break every asker still
+    /// sending it — the TS builder does, and that wire shape is frozen.
+    ///
+    /// MUTATION (P-10) — resolved by containing function: in `ManifestRequestBody::parse`,
+    /// immediately after the `slug` extraction (production line `let slug =
+    /// v.get("slug").and_then(|s| s.as_str())?.to_string();`, line 240 on the post-QURATOR-245
+    /// tree), insert `if v.get("fingerprint_seen").is_some() { return None; }` → the present and
+    /// blank arms red (those bodies stop parsing); the absent arm stays green, proving the arms
+    /// are genuinely distinguished. The same red fires under the subtler drift this guards
+    /// against: switching the parser to strict typed deserialization with
+    /// `#[serde(deny_unknown_fields)]`.
+    #[test]
+    fn a_body_with_fingerprint_seen_still_parses() {
+        let present = ManifestRequestBody::parse(
+            r#"{"hb":"manifest_request","slug":"films","fingerprint_seen":"fp-1"}"#,
+        )
+        .expect("a body carrying fingerprint_seen must parse — the wire shape is frozen");
+        assert_eq!(present.slug, "films");
+        let blank = ManifestRequestBody::parse(
+            r#"{"hb":"manifest_request","slug":"films","fingerprint_seen":""}"#,
+        )
+        .expect("a blank fingerprint_seen is legal on the wire and must parse");
+        assert_eq!(blank.slug, "films");
+        let absent = ManifestRequestBody::parse(r#"{"hb":"manifest_request","slug":"films"}"#)
+            .expect("an absent fingerprint_seen must parse");
+        assert_eq!(absent.slug, "films");
+        // The asker's fingerprint plays no role in the serve decision: all three wire shapes
+        // route identically, because the type cannot carry the field at all. (Re-adding the
+        // field also breaks this module at the `body()` helper's struct literal — compile-pinned.)
+        for b in [&present, &blank, &absent] {
+            assert_eq!(
+                approval_body_for(b).log_name(),
+                "send_full_list_inner",
+                "the fingerprint an asker happened to see must not change the serve routing"
+            );
+        }
     }
 
     /// The wire discriminator: a JSON DM that is NOT a manifest request (wrong or missing `hb`
