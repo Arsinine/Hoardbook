@@ -14,15 +14,22 @@
 //! key composition, so the discipline that must not drift (the bound) is shared and the verdicts
 //! that must not leak (the entries) cannot.
 //!
-//! ⚠ **NOT every consumer of that inbox is cached today — do not read the above as coverage.**
-//! An earlier draft of this doc claimed every consumer used this discipline; that was FALSE when
-//! written (caught by review, 2026-09-19). Cached: this crate's `priv_browse` opens (both scopes)
-//! and hb-app's `merge_wraps_into_cache` / `decode_dms`. **UNCACHED: `topic.rs`'s
-//! `fetch_join_requests` / `fetch_invite`** — same stream, same flood surface, tracked as
-//! QURATOR-294. Whoever closes it: give it its OWN scope tag, and first re-establish that its
-//! open verdict is deterministic over (identity keys, wrap bytes) — that property is what makes a
-//! negative cache safe, and it does not transfer for free to a path that consults roster or
-//! membership state.
+//! ⚠ **Coverage is NAMED here, never quantified — do not write "every consumer" again.** An
+//! earlier draft of this doc said every consumer used this discipline; that was FALSE when written
+//! and a review caught it (2026-09-19). A sentence like that states a security posture, so the
+//! next audit reads it, believes the surface is closed, and stops looking.
+//!
+//! **Cached today:** this crate's `priv_browse` opens (both inner-kind scopes); `topic.rs`'s
+//! join-request opens and the *deterministic prefix* of its invite opens (QURATOR-294); hb-app's
+//! `merge_wraps_into_cache` and `decode_dms`.
+//!
+//! ⚠ **One deliberate exclusion, and the reason generalises:** an invite's FULL verdict is NOT
+//! cacheable, because `hb_core::topic::redeem_invite` consults `expected_topic_id`,
+//! `expected_issuer`, the caller's `now` and a mutable replay set — all caller context. The same
+//! wrap legitimately fails a join for topic B and must still redeem for topic A. So `topic.rs`
+//! caches only the open/kind-pin prefix and **never records a policy refusal**. Before adding any
+//! consumer here, establish that ITS verdict is deterministic over (identity keys, wrap bytes)
+//! alone; that property is what makes a negative cache safe, and it does not transfer for free.
 //!
 //! In-memory only, never persisted: it is a CPU-DoS backstop, not a correctness boundary — losing
 //! it across a restart merely re-attempts each remembered wrap once, never loses a message.
