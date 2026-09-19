@@ -138,6 +138,18 @@ const ACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 /// grant is dropped and the ticket stays unspent.
 const SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How long the asker's side waits for the dial itself — address resolution, the QUIC handshake,
+/// whatever hole-punching iroh needs — before treating the ticket's address as dead. The asker's
+/// counterpart to the three owner-side deadlines above, and the tightest of the four: the failure
+/// it bounds is not slowness but *silence*. A blackholed or hostile address produces no signal at
+/// any layer, and iroh retries hole punches and relay lookups against internal timeouts measured
+/// in minutes (what the WAN-M dead-endpoint row observed on an unroutable IP), while an honest
+/// dial — loopback, direct, or via relay rendezvous — completes the handshake in single-digit
+/// seconds. 20s is several times that, as retransmission headroom for a lossy link, while staying
+/// under `HANDSHAKE_DEADLINE` (30s): the one step that has proved nothing about the peer should
+/// not be able to out-wait the steps granted to a peer that has already connected.
+const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// How long a *refused* connection is held open for its small response to flush. Deliberately far
 /// shorter than the 5s `drain_connection` window: a refusal is a status byte plus a short framed
 /// reason, and holding a redemption permit (or an in-flight claim) for a peer-controlled 5s on a
@@ -654,13 +666,35 @@ pub async fn fetch_manifest_with_progress(
     accept: impl FnOnce(&ManifestPayload) -> Result<()>,
     progress: Option<ProgressSink<'_>>,
 ) -> Result<ManifestPayload> {
+    fetch_manifest_with_progress_inner(endpoint, ticket, accept, progress, DIAL_DEADLINE).await
+}
+
+/// [`fetch_manifest_with_progress`] with the dial deadline injectable, so the loopback harness can
+/// prove the bound fires without sitting through the full `DIAL_DEADLINE`. The public function is
+/// the shim that pins the production constant — the same `*_inner` shape the command layer uses;
+/// no caller outside this module supplies the duration.
+async fn fetch_manifest_with_progress_inner(
+    endpoint: &iroh::Endpoint,
+    ticket: &TransportTicket,
+    accept: impl FnOnce(&ManifestPayload) -> Result<()>,
+    progress: Option<ProgressSink<'_>>,
+    dial_deadline: std::time::Duration,
+) -> Result<ManifestPayload> {
     ticket.verify_shape().map_err(|e| anyhow!("ticket refused before dialling: {e}"))?;
     let addr = parse_node_addr(&ticket.node_addr)?;
     tracing::debug!(slug = %ticket.slug, "iroh: dialing the manifest plane");
-    let conn = endpoint
-        .connect(addr, MANIFEST_ALPN)
-        .await
-        .with_context(|| format!("dial the manifest plane for {}", ticket.slug))?;
+    // The context wraps the WHOLE dial, timeout included: `with_deadline` returns the timeout as its
+    // own `Err`, so attaching the context to only the inner `Result` would let a timed-out dial
+    // escape without naming the slug — the one identifier that makes the log actionable. Flattened
+    // so both arms (deadline elapsed, iroh refused) carry it, and only the cause distinguishes them.
+    let conn = with_deadline(
+        dial_deadline,
+        "the ticket's address never answered the dial",
+        endpoint.connect(addr, MANIFEST_ALPN),
+    )
+    .await
+    .and_then(|r| r.map_err(Into::into))
+    .with_context(|| format!("dial the manifest plane for {}", ticket.slug))?;
     tracing::debug!(slug = %ticket.slug, "iroh: connected — fetching manifest");
     let result = fetch_over_connection(&conn, ticket, accept, progress).await;
     conn.close(0u32.into(), b"");
@@ -1315,6 +1349,86 @@ pub(crate) mod tests {
 
             client.close().await;
             server.close().await;
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// **A ticket address that answers nothing is bounded at the dial** (QURATOR-257). The
+    /// blackhole is a `UdpSocket` bound on loopback and never read: bound-but-silent means the
+    /// kernel buffers (then drops) every QUIC Initial into that socket's receive queue — **no
+    /// ICMP port-unreachable is generated, because the port is open**. That is the distinction
+    /// this test turns on: a *refused* dial (nothing bound at the port) can fail in milliseconds
+    /// off an OS signal, which would make any "it returned quickly" assertion decorative; a
+    /// *silent* address produces no OS-level signal at all, so the only thing that can return
+    /// this call in bounded time is our own dial deadline. The 2s deadline is injected through the
+    /// `_inner` seam; the assertion is on the error naming the DIAL step specifically, under the
+    /// same `dial the manifest plane` context a refused dial would carry — the "(waited 2s)"
+    /// deadline message is what distinguishes a timeout from a refusal, which would surface
+    /// iroh's own connect error under that context instead.
+    ///
+    /// MUTATION (P-10) — the orchestrator applies this and must see this test red: in
+    /// `fetch_manifest_with_progress_inner` (this file, production line 687 — the `dial_deadline`
+    /// first argument of the `with_deadline(` wrapping `endpoint.connect(addr, MANIFEST_ALPN)`),
+    /// change `dial_deadline` to `std::time::Duration::from_secs(600)`. The 2s this test passes
+    /// in is then ignored, the silent dial blackholes past the outer `TEST_TIMEOUT`, and the
+    /// `.expect` on the bounded return reds. (Anchored to the production call, not this comment.)
+    #[tokio::test]
+    async fn a_silent_ticket_address_is_bounded_by_the_dial_deadline() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            // Held alive for the whole test: dropping the socket would close the port and invite
+            // the ICMP-driven fast refusal this test deliberately is not about.
+            let blackhole = std::net::UdpSocket::bind(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+            ))
+            .expect("bind the silent address");
+            let port = blackhole.local_addr().expect("read the silent port").port();
+
+            // A well-formed ticket whose only defect is where it points — same shape
+            // `spawn_plane_inner` mints, at a node id that never existed and our silent port.
+            let addr = iroh::EndpointAddr::from_parts(
+                iroh::SecretKey::generate().public(),
+                [iroh::TransportAddr::Ip(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    port,
+                ))],
+            );
+            let addr_json = serde_json::to_string(&addr).expect("EndpointAddr serializes");
+            let ticket =
+                TransportTicket::issue("req-dial", "small", &addr_json, 1_700_000_000, Some("nonce-1"));
+
+            let client = bind_local_endpoint(&rand::random(), vec![]).await;
+            let started = std::time::Instant::now();
+            let err = fetch_manifest_with_progress_inner(
+                &client,
+                &ticket,
+                |_| Ok(()),
+                None,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect_err("a silent address must fail, never deliver");
+            let elapsed = started.elapsed();
+
+            let chained = format!("{err:#}");
+            assert!(
+                chained.contains("dial the manifest plane for small"),
+                "the dial's context survives the deadline wrapper — timeout or not, the caller \
+                 still learns which slug's dial failed: {chained}"
+            );
+            assert!(
+                chained.contains("never answered the dial"),
+                "the error names the DIAL deadline specifically — the string that distinguishes \
+                 our bound from an OS-level refusal (iroh's connect error under the same context, \
+                 with no '(waited 2s)' tail): {chained}"
+            );
+            assert!(
+                elapsed < TEST_TIMEOUT,
+                "the dial deadline fired first, not the test's outer bound ({elapsed:.1?})"
+            );
+
+            client.close().await;
         })
         .await
         .expect("test timed out");
