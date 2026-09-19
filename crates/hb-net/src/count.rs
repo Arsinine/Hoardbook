@@ -11,7 +11,7 @@
 //! excludes `hb-canary` in SQL); the client uses this accurate fetch+distinct path so the in-app
 //! chip and the canary-no-pollution guarantee hold end-to-end.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use hb_core::binding::KIND_PRESENCE;
@@ -146,29 +146,42 @@ pub fn presence_authors_filter_since(
         .limit(authors.len().max(1))
 }
 
-/// Tally last-seen for a set of authors from raw presence events, judged over a LONG window
-/// (Topic aliveness, QURATOR-148). This is NOT [`hb_core::fresh_presence`]: that tally runs
+/// Tally last-seen for a KNOWN ROSTER from raw presence events, judged over a LONG window (Topic
+/// aliveness, QURATOR-148). This is NOT [`hb_core::fresh_presence`]: that tally runs
 /// `verify_binding(ev, pk, now)`, whose expiry gate refuses any beacon whose `expires_at` tag is in
 /// the past — and `MAX_BINDING_TTL_SECS` is 24 h, so a beacon published 29 days ago can never pass
 /// it. Aliveness is instead judged **as of the beacon's own publication**: the binding is verified
 /// against `created_at` (it was live when minted) and the member counts as alive iff `created_at`
-/// is within `window_secs` of `now`. Same admission rules otherwise — kind pin, canary exclusion,
-/// foreign-protocol exclusion (the schema/expiry tags), author pin — so nothing new is admitted.
+/// is within `window_secs` of `now`. Same admission rules otherwise — kind pin, roster pin, canary
+/// exclusion, foreign-protocol exclusion (the schema/expiry tags) — so nothing new is admitted.
+///
+/// The roster pin (QURATOR-266) is **local admission, not a wire concern**: `roster` is the same
+/// author set the caller already put in the relay-side filter, but a relay is not trusted to
+/// honour any filter (the kind pin below is that same principle applied to kind), so `ev.pubkey`
+/// must itself be a roster member before its beacon can count. A non-member's otherwise-valid
+/// beacon — right kind, genuinely signed, inside the window — is dropped: it can never inflate the
+/// tally. An empty roster admits nothing.
 ///
 /// Returns `author → newest accepted created_at` (clamped to `now`, newest wins), i.e. WHO is alive
 /// and WHEN they were last seen. A member who never published a beacon simply does not appear —
 /// absence reads as not-alive, by design (no fallback treats absence as alive).
 pub fn last_seen_within(
     events: &[Event],
+    roster: &[PublicKey],
     now: u64,
     window_secs: u64,
 ) -> HashMap<PublicKey, u64> {
     let floor = now.saturating_sub(window_secs);
     let ceiling = now.saturating_add(hb_core::FUTURE_SKEW_SECS);
+    // HashSet, not a linear scan: a Topic roster can be large and the check runs per event.
+    let roster_set: HashSet<PublicKey> = roster.iter().copied().collect();
     let mut seen: HashMap<PublicKey, u64> = HashMap::new();
     for ev in events {
         if ev.kind.as_u16() != KIND_PRESENCE {
             continue; // a relay is not trusted to honour the filter — pin the kind locally
+        }
+        if !roster_set.contains(&ev.pubkey) {
+            continue; // QURATOR-266: a relay is not trusted to honour the author filter — pin the roster locally
         }
         if hb_core::is_canary(ev) {
             continue; // F-canary: synthetic presence never counts as aliveness
@@ -190,7 +203,9 @@ pub fn last_seen_within(
 
 /// The relay read behind Topic aliveness (QURATOR-148): last-seen for a KNOWN roster, within the
 /// aliveness window. Same author-bounded shape as [`fetch_presence_for_authors`] (no global
-/// unbounded kind-11111 query — the 2026-08-01 launch-gate defect class). An empty author set
+/// unbounded kind-11111 query — the 2026-08-01 launch-gate defect class). The roster also gates
+/// LOCAL admission — `last_seen_within` re-pins `ev.pubkey` against `authors` (QURATOR-266), so the
+/// relay's author filter shapes the query but never decides what counts. An empty author set
 /// short-circuits: no query, no alive members.
 pub async fn fetch_last_seen_for_authors(
     client: &RelayClient,
@@ -205,7 +220,7 @@ pub async fn fetch_last_seen_for_authors(
     let events = client
         .fetch(presence_authors_filter_since(authors, now, window_secs), timeout)
         .await?;
-    Ok((last_seen_within(&events, now, window_secs), now))
+    Ok((last_seen_within(&events, authors, now, window_secs), now))
 }
 
 /// The userbase filter for a SPECIFIC set of authors (COUNT2/COUNT3 determinism, 2026-08-10). The
@@ -383,7 +398,13 @@ mod tests {
         // refuse BOTH beacons here and read the Topic dead.
         let alive_ev = build_binding(&hb_core::Identity::from_keys(alive_keys), now - 29 * 86_400, 1_800).unwrap();
         let dead_ev = build_binding(&hb_core::Identity::from_keys(dead_keys), now - 31 * 86_400, 1_800).unwrap();
-        let seen = last_seen_within(&[alive_ev, dead_ev], now, TOPIC_ALIVE_WINDOW_SECS);
+        // All three are ROSTER MEMBERS — the window is the discriminator here, not the roster pin.
+        let seen = last_seen_within(
+            &[alive_ev, dead_ev],
+            &[alive_pk, dead_pk, never_pk],
+            now,
+            TOPIC_ALIVE_WINDOW_SECS,
+        );
         assert_eq!(
             seen.len(),
             1,
@@ -420,7 +441,79 @@ mod tests {
                     .custom_created_at(Timestamp::from(now - 100)),
             )
             .unwrap();
-        let seen = last_seen_within(&[ev], now, TOPIC_ALIVE_WINDOW_SECS);
+        // ⚠ The roster INCLUDES the foreign author (QURATOR-266): an empty roster would exclude
+        // this event for the WRONG reason (the roster pin, not the binding gate), leaving the
+        // binding gate this test exists to pin untested. With the author rostered, the exclusion
+        // below is provably `verify_binding`'s doing.
+        let seen = last_seen_within(&[ev], &[foreign.public_key()], now, TOPIC_ALIVE_WINDOW_SECS);
         assert!(seen.is_empty(), "an unbound kind-11111 event is not evidence of a Hoardbook ping");
+    }
+
+    // ── QURATOR-266 — the roster pin: local admission must not trust the relay's author filter ──
+    //
+    // `fetch_last_seen_for_authors` bounds the WIRE query by `.authors(...)`, but a relay that
+    // ignores the filter could return non-members' beacons; before QURATOR-266 nothing local
+    // rejected them and the aliveness tally inherited the relay's word. The pin below is the same
+    // "a relay is not trusted to honour the filter" principle the kind pin already encodes.
+
+    #[test]
+    fn a_valid_non_member_beacon_never_inflates_the_tally() {
+        // P-10 MUTATION (orchestrator): in `last_seen_within`'s loop, at the production roster arm
+        // — `if !roster_set.contains(&ev.pubkey) { continue; }`, the line carrying the
+        // "pin the roster locally" comment (resolve its LINE NUMBER in the production loop; this
+        // comment quotes the same text and an unqualified anchor would match the comment) — delete
+        // that arm. The non-member's beacon then passes every remaining gate (kind ✓, canary ✓,
+        // window ✓, genuine signature ✓) and `seen.len()` becomes 2: the `== 1` assertion and the
+        // `!seen.contains_key(&non_member_pk)` assertion both RED. NOT YET PROVEN (no-compile
+        // lane): orchestrator applies it once, on the settled tree.
+        // The non-member's beacon is otherwise FULLY valid on purpose — if it failed any other
+        // gate this test would pass for the wrong reason and pin nothing about the roster.
+        // created_at is pinned to the test's own `now`, never the wall clock: a wall-clock-signed
+        // fixture once dodged the exact gate under test (2026-09-01).
+        use hb_core::binding::build_binding;
+        let now = 1_800_000_000u64;
+        let member_keys = nostr::Keys::generate();
+        let non_member_keys = nostr::Keys::generate();
+        let member_pk = member_keys.public_key();
+        let non_member_pk = non_member_keys.public_key();
+        let member_ev =
+            build_binding(&hb_core::Identity::from_keys(member_keys), now - 29 * 86_400, 1_800).unwrap();
+        let non_member_ev =
+            build_binding(&hb_core::Identity::from_keys(non_member_keys), now - 29 * 86_400, 1_800).unwrap();
+        let seen = last_seen_within(
+            &[member_ev, non_member_ev],
+            &[member_pk], // the roster: the member only — the non-member is not on it
+            now,
+            TOPIC_ALIVE_WINDOW_SECS,
+        );
+        assert_eq!(
+            seen.len(),
+            1,
+            "exactly one alive member — a non-member's beacon cannot inflate the tally"
+        );
+        assert!(
+            seen.contains_key(&member_pk),
+            "positive control: the roster member's valid beacon still counts"
+        );
+        assert!(
+            !seen.contains_key(&non_member_pk),
+            "a valid beacon from a non-member is not aliveness for this Topic"
+        );
+    }
+
+    #[test]
+    fn an_empty_roster_admits_nothing() {
+        // P-10 MUTATION (orchestrator): same production anchor as the sibling above (the
+        // `roster_set.contains` arm in `last_seen_within`'s loop) — delete the arm and this test
+        // REDS: the member's fully-valid beacon is admitted into an empty-roster tally.
+        use hb_core::binding::build_binding;
+        let now = 1_800_000_000u64;
+        let keys = nostr::Keys::generate();
+        let ev = build_binding(&hb_core::Identity::from_keys(keys), now - 100_000, 1_800).unwrap();
+        let seen = last_seen_within(&[ev], &[], now, TOPIC_ALIVE_WINDOW_SECS);
+        assert!(
+            seen.is_empty(),
+            "an empty roster admits nothing — no beacon, however valid, counts"
+        );
     }
 }
