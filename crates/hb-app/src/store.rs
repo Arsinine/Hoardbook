@@ -1331,6 +1331,31 @@ impl DataStore {
         self.save_manifest_asks(&m)
     }
 
+    /// QURATOR-250 — drop ask-trace entries past [`MANIFEST_ASK_RETENTION_SECS`], returning how
+    /// many went. Runs once per fetch-driver poll, under [`MANIFEST_ASKS_LOCK`] like every
+    /// load-modify-save of this map.
+    ///
+    /// **Eviction forgets bookkeeping; it refuses nothing.** A fresh ask records and claims
+    /// identically with the dead entries gone (pinned by `eviction_never_refuses_a_fresh_ask`),
+    /// and a ticket answering an expired ask meets the same `Unsolicited` refusal a spent or
+    /// superseded-nonce ask already met — the redeem allow-list is a security boundary, and an
+    /// entry the retention policy has declared dead no longer vouches for a dial.
+    ///
+    /// Saves only when something was actually evicted, so a quiet map is not rewritten every
+    /// 300 s; a failed load surfaces as an error the caller logs, never a failed poll (the next
+    /// tick retries).
+    pub fn evict_expired_manifest_asks(&self, now: chrono::DateTime<chrono::Utc>) -> Result<usize> {
+        let _guard = MANIFEST_ASKS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut m = self.load_manifest_asks()?;
+        let before = m.len();
+        m.retain(|_, ask| !manifest_ask_is_expired(ask, now));
+        let removed = before - m.len();
+        if removed > 0 {
+            self.save_manifest_asks(&m)?;
+        }
+        Ok(removed)
+    }
+
     // ── Issued transport tickets (M18 W4) — DELETED 2026-09-03, QURATOR-177 Option E (owner
     //    ruling: authorization is the standing grant checked at ASK time; the ticket is address
     //    delivery). This section was `issued_tickets_path`/`load_issued_tickets`/
@@ -1460,6 +1485,43 @@ pub fn manifest_ask_key(npub: &str, author: &str, slug: &str) -> String {
 fn widen_legacy_ask_key(key: &str) -> Option<String> {
     let parts: Vec<&str> = key.split('|').collect();
     (parts.len() == 2).then(|| format!("{}|{}|{}", parts[0], parts[0], parts[1]))
+}
+
+/// QURATOR-250 — how long an ask-trace entry stays authoritative: 30 days.
+///
+/// Sized against what the entry still does for the machine. A ticket answering an ask lands in
+/// the redeem poll (300 s cadence), and the dial machinery an entry authorises is terminal
+/// within hours — the 3-dial cap's exponential backoff from a 600 s base exhausts itself in
+/// roughly 70 minutes (QURATOR-197). A month is two orders of magnitude beyond that, so nothing
+/// the loops still rely on is inside the cut, while the Browse UI's "Asked" trace keeps a
+/// readable age. The other half of the sizing: every re-ask OVERWRITES the entry
+/// (`record_manifest_ask` resets `sent_at`), and both driver tiers re-ask for as long as their
+/// condition holds — so an entry the loops still want never ages past the window; only an ask
+/// NOTHING has re-sent for a whole month expires.
+///
+/// ⚠ This is eviction, never a throughput cap (2026-09-02 owner ruling: prefetch takes no caps).
+/// Forgetting an expired entry can refuse ONE very-late ticket (`Unsolicited`) and cost a
+/// re-ask, both bounded and delay-shaped — it never skips an ask, drops a listing, or limits how
+/// many asks a poll may process.
+pub(crate) const MANIFEST_ASK_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// QURATOR-250 — pure core: is this ask-trace entry past retention at `now`?
+///
+/// An undateable `sent_at` is NOT expired, deliberately. The stamp is minted by THIS node at
+/// record time (`chrono::Utc::now().to_rfc3339()` at every producer), never peer-supplied, so a
+/// stamp that will not parse is disk corruption rather than an attack — and deleting state we
+/// cannot date is the wrong side to fail on. Such an entry costs one row until the next re-ask
+/// overwrites it with a fresh stamp.
+pub(crate) fn manifest_ask_is_expired(
+    ask: &ManifestAsk,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    match parse_watermark_ts(&ask.sent_at) {
+        Some(sent) => {
+            now.timestamp().saturating_sub(sent.timestamp()) >= MANIFEST_ASK_RETENTION_SECS as i64
+        }
+        None => false,
+    }
 }
 
 impl DataStore {
@@ -2574,6 +2636,157 @@ pub(crate) mod tests {
         let entry = &m[&manifest_ask_key("npub1a", "npub1a", "criterion")];
         assert_eq!(entry.fingerprint_seen, "fp-new");
         assert_eq!(entry.sent_at, "2026-01-09T00:00:00Z");
+    }
+
+    // ── QURATOR-250 — ask-trace retention (eviction, never a processing cap) ────────────────
+    // The persisted set is attacker-growable (a malicious listing with N fake slugs mints N
+    // `peer|author|slug` keys); before this ticket nothing ever removed one. The retention sweep
+    // forgets dead entries; it must never refuse a fresh ask — the same forget-never-refuse
+    // shape `auto_approve::remember_answered` established for the answered-ask memory.
+
+    /// A `ManifestAsk` as `record_manifest_ask` would have written it, with the given `sent_at`.
+    fn ask_sent_at(sent_at: &str) -> ManifestAsk {
+        ManifestAsk {
+            fingerprint_seen: "fp".into(),
+            sent_at: sent_at.into(),
+            nonce: "nonce".into(),
+            claimed_by: None,
+            spent: false,
+            dial_attempts: 0,
+            dial_last_fail_unix: 0,
+        }
+    }
+
+    /// QURATOR-250 — the pinned clock every retention test drives time through. Never wall time:
+    /// a wall-clock fixture dodged the very gate under test once already (2026-09-01 incident).
+    fn retention_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// MUTATION (P-10) — production anchor: `manifest_ask_is_expired` in store.rs, the `Some(sent)`
+    /// arm's comparison at store.rs:1521 (`now.timestamp().saturating_sub(sent.timestamp()) >=
+    /// MANIFEST_ASK_RETENTION_SECS as i64`). Change `>=` to `>` → the exactly-30-day-old spent
+    /// entry below flips to retained and this test reds on `removed == 2`. (Inverting the `!` in
+    /// `evict_expired_manifest_asks`'s `retain` closure at store.rs:1351 also reds it: the LIVE
+    /// entries would be the ones evicted.)
+    #[test]
+    fn expired_manifest_asks_are_evicted_and_live_ones_retained() {
+        let (_dir, store) = test_store();
+        let now = retention_now();
+        let mut m = std::collections::HashMap::new();
+        // 31 days old — past the 30-day window.
+        m.insert(manifest_ask_key("npub1a", "npub1a", "ancient"), ask_sent_at("2026-05-01T00:00:00Z"));
+        // 29 days old — inside it.
+        m.insert(manifest_ask_key("npub1a", "npub1a", "recent"), ask_sent_at("2026-05-03T00:00:00Z"));
+        // Asked "now" — live by any reading.
+        m.insert(manifest_ask_key("npub1b", "npub1b", "fresh"), ask_sent_at("2026-06-01T00:00:00Z"));
+        // A spent entry is still a trace the UI reads; it keeps the same window as the rest.
+        let mut spent = ask_sent_at("2026-05-02T00:00:00Z");
+        spent.spent = true;
+        m.insert(manifest_ask_key("npub1c", "npub1c", "answered-old"), spent);
+        store.save_manifest_asks(&m).unwrap();
+
+        let removed = store.evict_expired_manifest_asks(now).unwrap();
+        assert_eq!(removed, 2, "the 31-day and 30-day-old-spent entries are past retention");
+        let left = store.load_manifest_asks().unwrap();
+        assert_eq!(left.len(), 2, "only the entries inside the window survive");
+        assert!(left.contains_key(&manifest_ask_key("npub1a", "npub1a", "recent")));
+        assert!(left.contains_key(&manifest_ask_key("npub1b", "npub1b", "fresh")));
+        assert!(
+            !left.contains_key(&manifest_ask_key("npub1a", "npub1a", "ancient")),
+            "an ask nothing has re-sent for a whole month is dead bookkeeping"
+        );
+    }
+
+    /// MUTATION (P-10) — the REFUSE half is what this test pins: in `record_manifest_ask`
+    /// (store.rs:1211, the `m.insert(` block), make the function return `Ok(())` before the
+    /// insert → the fresh ask leaves no trace, `claim_manifest_ask` answers `Unsolicited`, and
+    /// this test reds. The FORGET half (the eviction count) is pinned by the neighbouring
+    /// `expired_manifest_asks_are_evicted_and_live_ones_retained` instead — a one-entry map
+    /// cannot distinguish "evicted" from "cleared" here.
+    #[test]
+    fn eviction_never_refuses_a_fresh_ask() {
+        let (_dir, store) = test_store();
+        let now = retention_now();
+        // A dead entry: past the window, evicted.
+        store
+            .record_manifest_ask("npub1a", "npub1a", "ancient", "fp", "2026-01-01T00:00:00Z", "n-old")
+            .unwrap();
+        assert_eq!(store.evict_expired_manifest_asks(now).unwrap(), 1);
+        assert!(store.load_manifest_asks().unwrap().is_empty(), "the dead entry is forgotten");
+
+        // A fresh ask after eviction must proceed exactly as before — the retention cut must
+        // never REFUSE, only forget (`remember_answered`'s semantics, mirrored).
+        store
+            .record_manifest_ask("npub1a", "npub1a", "criterion", "fp", "2026-06-01T00:00:00Z", "n-new")
+            .unwrap();
+        assert_eq!(
+            store.claim_manifest_ask("npub1a", "npub1a", "criterion", "n-new", "req-A").unwrap(),
+            crate::store::AskClaim::Granted,
+            "a fresh ask is always granted — the retention cut must never REFUSE, only forget"
+        );
+        store.spend_manifest_ask("npub1a", "npub1a", "criterion", "n-new").unwrap();
+        assert_eq!(store.load_manifest_asks().unwrap().len(), 1, "the fresh ask's trace persists");
+    }
+
+    /// MUTATION (P-10) — production anchor: `manifest_ask_is_expired` in store.rs, the
+    /// `None => false` arm at store.rs:1523. Change it to `None => true` → the undateable entry
+    /// below is evicted and this test reds.
+    #[test]
+    fn an_undated_manifest_ask_is_retained_and_keeps_its_neighbours() {
+        let (_dir, store) = test_store();
+        let now = retention_now();
+        let mut m = std::collections::HashMap::new();
+        // A corrupt stamp (`sent_at` is minted locally, never peer-supplied, so this is disk
+        // corruption, not an attack): kept, and the load path must neither panic nor discard
+        // the rest of the set around it.
+        m.insert(manifest_ask_key("npub1a", "npub1a", "corrupt"), ask_sent_at("not-a-timestamp"));
+        m.insert(manifest_ask_key("npub1b", "npub1b", "live"), ask_sent_at("2026-05-30T00:00:00Z"));
+        store.save_manifest_asks(&m).unwrap();
+
+        assert_eq!(store.evict_expired_manifest_asks(now).unwrap(), 0, "nothing dateable expired");
+        let left = store.load_manifest_asks().unwrap();
+        assert_eq!(left.len(), 2, "undateable is retained; its live neighbour is untouched");
+        assert!(left.contains_key(&manifest_ask_key("npub1a", "npub1a", "corrupt")));
+        assert!(left.contains_key(&manifest_ask_key("npub1b", "npub1b", "live")));
+    }
+
+    /// MUTATION (P-10) — production anchor: `MANIFEST_ASK_RETENTION_SECS` in store.rs, the const
+    /// at store.rs:1506. Change `30 * 24 * 60 * 60` to `365 * 24 * 60 * 60` → the "last month's
+    /// rotation" entries below flip to retained and this test reds on `left.len() == 40` (the
+    /// set would grow without bound across rotations).
+    #[test]
+    fn manifest_asks_stay_bounded_under_sustained_pressure() {
+        let (_dir, store) = test_store();
+        let now = retention_now();
+        let mut m = std::collections::HashMap::new();
+        // The malicious-listing shape: one peer whose listing keeps rotating fake slugs. Last
+        // month's 200 entries are past the window; this month's 40 are inside it.
+        for i in 0..200 {
+            m.insert(
+                manifest_ask_key("npub1evil", "npub1evil", &format!("rot-{i}")),
+                ask_sent_at("2026-04-01T00:00:00Z"),
+            );
+        }
+        for i in 0..40 {
+            m.insert(
+                manifest_ask_key("npub1evil", "npub1evil", &format!("cur-{i}")),
+                ask_sent_at("2026-05-20T00:00:00Z"),
+            );
+        }
+        store.save_manifest_asks(&m).unwrap();
+
+        assert_eq!(store.evict_expired_manifest_asks(now).unwrap(), 200);
+        let left = store.load_manifest_asks().unwrap();
+        assert_eq!(
+            left.len(),
+            40,
+            "the persisted set is bounded by the distinct (peer, author, slug) triples asked \
+             within the retention window — a peer with fresh nonces cannot grow it forever"
+        );
+        assert!(left.keys().all(|k| k.contains("|cur-")), "only the within-window entries remain");
     }
 
     /// **Carrier 4 lenient load (QURATOR-79)** — an ask map written by an older build carries

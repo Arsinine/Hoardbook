@@ -517,6 +517,20 @@ pub(crate) async fn poll_once(
         (id.identity.clone(), id.npub())
     };
 
+    // QURATOR-250 — expire stale ask-trace entries before the redeem drain reads the same map:
+    // an entry past retention must not authorise a dial or hold the ticket-inbox window open
+    // (`ticket_inbox_since` anchors on the OLDEST entry) in the same tick it dies. Ahead of the
+    // holdings/discovery early returns below on purpose — a node that holds nothing with
+    // discovery off must still stop carrying entries the retention policy has declared dead.
+    // A failure here is hygiene-level: log it and let the poll proceed (the next tick retries).
+    match store.evict_expired_manifest_asks(chrono::Utc::now()) {
+        Ok(removed) if removed > 0 => {
+            tracing::info!(evicted = removed, "fetch driver: expired stale manifest asks");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::debug!(error = %e, "fetch driver: manifest-ask eviction skipped"),
+    }
+
     // Redeem BEFORE checking staleness — see `redeem_pending_tickets`' doc.
     outcome.redeemed =
         redeem_pending_tickets(store, &identity, &own_npub, live_npub, endpoint).await;
@@ -1382,6 +1396,47 @@ mod tests {
         assert!(
             guard_at < discover_at,
             "the discovery call must live past the holdings guard, not before it"
+        );
+    }
+
+    /// QURATOR-250 — the ask-trace retention sweep must run inside the poll, AHEAD of the redeem
+    /// drain that reads the same map (an expired entry must not authorise a dial or hold
+    /// `ticket_inbox_since`'s window open in the tick it dies) and ahead of the
+    /// holdings/discovery early returns (a node that holds nothing with discovery off must still
+    /// stop carrying dead entries). Before this ticket nothing ever removed an entry, so one
+    /// malicious listing minted `peer|author|slug` rows that lived forever.
+    ///
+    /// MUTATION (P-10) — in `poll_once`, delete the whole
+    /// `match store.evict_expired_manifest_asks(...)` statement at fetch_driver.rs:526 → this
+    /// test reds (the sweep never runs and the persisted set grows unbounded).
+    #[test]
+    fn stale_asks_are_expired_inside_the_poll_before_the_redeem_drain() {
+        let src = include_str!("fetch_driver.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code.find("pub(crate) async fn poll_once(").expect("poll_once must exist");
+        let end = code[at..].find("fn truncate(").expect("truncate must follow") + at;
+        let region = &code[at..end];
+        // Call forms, never bare names (CLAUDE.md §9): this test's own prose names the sweep.
+        let evict_at = region
+            .find("evict_expired_manifest_asks(")
+            .expect("the retention sweep must be called from the poll");
+        let drain_at = region
+            .find("redeem_pending_tickets(")
+            .expect("the redeem drain must exist");
+        assert!(
+            evict_at < drain_at,
+            "eviction must precede the redeem drain, or a dead entry authorises one last dial"
+        );
+        let early_at = region
+            .find("held.is_empty()")
+            .expect("the holdings early return must exist");
+        assert!(
+            evict_at < early_at,
+            "eviction must precede the early returns, or an idle node carries dead entries forever"
         );
     }
 
