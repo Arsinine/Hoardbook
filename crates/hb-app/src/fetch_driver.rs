@@ -261,6 +261,36 @@ fn redeem_dial_ready(attempts: u32, last_fail_unix: u64, now_unix: u64) -> bool 
         && now_unix.saturating_sub(last_fail_unix) >= redeem_backoff_for(attempts)
 }
 
+/// QURATOR-258 — fold ONE store-persisted dial failure back into the redeem poll's in-memory
+/// ask snapshot, so the NEXT message of the SAME poll reads post-failure state.
+///
+/// The poll loads the ask map once at entry and derives `since`/`now`/`allow` from that
+/// entry-time view (one poll, one clock read — recomputing any of them mid-loop would move
+/// the fetch window or the allow-list under the iteration). But the relay replays a wrap
+/// every poll, so one fetch can return SEVERAL messages answering the SAME ask, and every
+/// message after the first must see the failure the first one just recorded — or the re-dial
+/// gate is defeated inside the very poll it guards.
+///
+/// ⚠ The refresh is READ back from the store, never re-derived here. `note_failed_dial`
+/// declines silently (missing ask, spent, or the claim held by another `request_id`) and the
+/// caller cannot tell a declined note from a counted one, so the only faithful local update
+/// is to copy what the store actually persisted: a declined note mirrors as a no-op, and the
+/// `dial_last_fail_unix` stamp keeps the store's single implementation of the rule. This
+/// costs one bounded map read per FAILED dial — never per message — beside the disk write
+/// that just happened. Unlocked like every other read in this loop: `write_json` is atomic
+/// (stage + rename), so a reader sees the old or the new map, never a torn one.
+fn mirror_noted_dial(store: &DataStore, asks: &mut HashMap<String, ManifestAsk>, key: &str) {
+    let Ok(fresh) = store.load_manifest_asks() else { return };
+    match fresh.get(key) {
+        Some(ask) => {
+            asks.insert(key.to_string(), ask.clone());
+        }
+        None => {
+            asks.remove(key);
+        }
+    }
+}
+
 /// Drain tickets that answer asks THIS node sent, redeeming each through the production body.
 ///
 /// Runs at the START of a poll, before the staleness check, so a ticket that arrived since the last
@@ -280,7 +310,10 @@ async fn redeem_pending_tickets(
     endpoint: &SharedEndpoint,
 ) -> Vec<String> {
     let mut redeemed = Vec::new();
-    let Ok(asks) = store.load_manifest_asks() else { return redeemed };
+    // QURATOR-258 — `mut`: the loop folds each noted dial failure back into this snapshot
+    // (`mirror_noted_dial`), so later messages of the SAME poll read post-failure state. The
+    // DERIVATIONS from it (`allow`, `since`) are still taken once, here at entry, on purpose.
+    let Ok(mut asks) = store.load_manifest_asks() else { return redeemed };
     if asks.is_empty() {
         return redeemed;
     }
@@ -318,7 +351,8 @@ async fn redeem_pending_tickets(
         // than None. An authorless ticket is the peer serving their own collection, so the author
         // key is the sender.
         let author = ticket.author_npub.clone().unwrap_or_else(|| msg.from.clone());
-        let entry = asks.get(&manifest_ask_key(&msg.from, &author, &ticket.slug));
+        let key = manifest_ask_key(&msg.from, &author, &ticket.slug);
+        let entry = asks.get(&key);
         let want = entry.map(|a| a.fingerprint_seen.clone());
 
         // QURATOR-197 (F19) — the re-dial gate. A wrap that answered one of our asks stays on the
@@ -376,6 +410,13 @@ async fn redeem_pending_tickets(
                         "fetch driver: could not record the failed dial; its backoff is lost"
                     );
                 }
+                // QURATOR-258 — the relay replays the wrap every poll, so one fetch can hold
+                // SEVERAL messages answering this same ask; fold the failure the store just
+                // persisted back into the entry-time snapshot so the gate above bites for the
+                // NEXT message of THIS poll too. One entry only, read back from the store's
+                // own view — `since`/`now`/`allow` stay anchored to the entry-time snapshot
+                // by design (one poll, one clock read; see the comment above the loop).
+                mirror_noted_dial(store, &mut asks, &key);
             }
         }
     }
@@ -934,6 +975,155 @@ mod tests {
         assert!(
             region.contains("note_failed_dial("),
             "a failed redeem must be recorded, or the gate has nothing to read next poll"
+        );
+    }
+
+    /// QURATOR-258 — the regression: the relay replays a wrap every poll, so ONE fetch can
+    /// return two messages answering the SAME ask. The first dial fails and is noted; the
+    /// second message must read the POST-failure snapshot and be gated, inside the same poll
+    /// — the pre-fix loop read the entry-time snapshot for every message, so both dialled.
+    ///
+    /// ⚠ Seam disclosure (CLAUDE.md honesty rule): the loop itself is network-bound, so this
+    /// test drives the loop's exact PER-MESSAGE SEQUENCE against a REAL store — load once at
+    /// entry, one clock read, note + mirror in the Err arm, gate read for the next message —
+    /// not `redeem_pending_tickets` end to end. What it does NOT cover is the loop WIRING
+    /// (that the mirror call sits in the Err arm at all): that is pinned by the source-scan
+    /// guard below, and the live path is the WAN row FD2/FD3 (§5 step 3 on the ticket).
+    ///
+    /// MUTATION (P-10) — in `mirror_noted_dial`, delete the insert line at
+    /// fetch_driver.rs:286 (`asks.insert(key.to_string(), ask.clone());`, inside the `Some`
+    /// arm) → the first assert reds (the snapshot would still show `dial_attempts: 0`) and
+    /// the second reds with it (a never-failed ask is always dial-ready).
+    #[test]
+    fn a_failed_dial_gates_the_second_message_of_the_same_poll() {
+        let (_dir, store) = test_store();
+        let (peer, author, slug, nonce) = ("npub1peer", "npub1author", "vault", "nonce-1");
+        store
+            .record_manifest_ask(peer, author, slug, "fp", "2026-01-01T00:00:00Z", nonce)
+            .unwrap();
+        // The claim is what makes a later failure a DIAL failure — same setup as
+        // `failed_dials_accumulate_on_the_ask_across_reloads` above.
+        store.claim_manifest_ask(peer, author, slug, nonce, "req-A").unwrap();
+
+        // What `redeem_pending_tickets` binds at function entry, and its ONE clock read —
+        // taken before the failure, exactly as the loop orders them.
+        let mut asks = store.load_manifest_asks().unwrap();
+        let now = now_secs();
+        let key = manifest_ask_key(peer, author, slug);
+
+        // Message 1: the redeem body fails after its claim — the Err arm's two steps.
+        store.note_failed_dial(peer, author, slug, "req-A").unwrap();
+        mirror_noted_dial(&store, &mut asks, &key);
+
+        // Message 2: same ask, SAME poll. The gate reads the snapshot the loop now holds.
+        let second = asks.get(&key).expect("the mirrored entry must still be there");
+        assert_eq!(
+            second.dial_attempts, 1,
+            "the snapshot the gate reads is the post-failure one, not the entry-time one"
+        );
+        assert!(
+            !redeem_dial_ready(second.dial_attempts, second.dial_last_fail_unix, now),
+            "the second message of the same poll is gated: the 600 s backoff starts at the \
+             store's failure stamp, which sits at most a second from this poll's single clock \
+             read, so the margin is ~599 s — deterministic, not a race"
+        );
+    }
+
+    /// QURATOR-258 — the no-op pin: when `note_failed_dial` DECLINES (the claim is held by
+    /// another `request_id`, or the ask is spent — the failure never reached a dial), the
+    /// in-memory snapshot must not be mutated either. Mirroring a declined note as a change
+    /// would make the local state WRONG rather than stale — it would gag the ask without a
+    /// dial ever happening, exactly what the store-side test
+    /// `a_refusal_that_never_dialled_does_not_burn_the_dial_budget` pins. This is also the
+    /// drift discriminator: it is what
+    /// separates the read-back mirror from a hand-rolled counter (CLAUDE.md §9 — two
+    /// implementations of one rule).
+    ///
+    /// MUTATION (P-10) — in `mirror_noted_dial` (fetch_driver.rs:282-292), replace the whole
+    /// `match fresh.get(key) { ... }` with a hand-rolled local bump:
+    /// `if let Some(a) = asks.get_mut(key) { a.dial_attempts += 1; a.dial_last_fail_unix =
+    /// now_secs(); }` → the first two asserts red (the store declined; the snapshot did not).
+    #[test]
+    fn a_declined_note_mirrors_as_a_no_op_not_a_change() {
+        let (_dir, store) = test_store();
+        let (peer, author, slug, nonce) = ("npub1peer", "npub1author", "vault", "nonce-1");
+        store
+            .record_manifest_ask(peer, author, slug, "fp", "2026-01-01T00:00:00Z", nonce)
+            .unwrap();
+        // The claim is held by req-A, so req-B's failing wrap is a ClaimedByAnother refusal —
+        // no dial happened, nothing may be counted.
+        store.claim_manifest_ask(peer, author, slug, nonce, "req-A").unwrap();
+
+        let mut asks = store.load_manifest_asks().unwrap();
+        let key = manifest_ask_key(peer, author, slug);
+        store.note_failed_dial(peer, author, slug, "req-B").unwrap();
+        mirror_noted_dial(&store, &mut asks, &key);
+        let entry = asks.get(&key).unwrap();
+        assert_eq!(entry.dial_attempts, 0, "a declined note mirrors as a no-op (attempts)");
+        assert_eq!(entry.dial_last_fail_unix, 0, "a declined note mirrors as a no-op (stamp)");
+
+        // And the SPENT decline: the ask was served, the wrap keeps replaying off the relay.
+        store.spend_manifest_ask(peer, author, slug, nonce).unwrap();
+        store.note_failed_dial(peer, author, slug, "req-A").unwrap();
+        mirror_noted_dial(&store, &mut asks, &key);
+        let spent = asks.get(&key).unwrap();
+        assert_eq!(spent.dial_attempts, 0, "a spent ask's replay mirrors as a no-op too");
+        assert!(
+            spent.spent,
+            "the mirrored entry is the store's own view — `spent` arrives with it, not re-derived"
+        );
+    }
+
+    /// QURATOR-258 — the fix must not fix the gate by destabilising the window: `since`,
+    /// `now` and `allow` are derived ONCE at function entry, and the per-message refresh
+    /// touches ONE map entry only. Hard to assert on the bindings directly, so pinned on the
+    /// observable consequence, same register as the wiring guards above: a mid-loop recompute
+    /// would need a SECOND call to one of the three call forms inside the function's source.
+    ///
+    /// MUTATION (P-10) — delete the `mirror_noted_dial(store, &mut asks, &key);` call at
+    /// fetch_driver.rs:419 (inside the loop's Err arm) → the fourth assert reds (count 0).
+    /// Adding a second window/allow-list/clock derivation inside the loop — e.g. a
+    /// `let since2 = ticket_inbox_since(&asks, now);` after the mirror call — reds the
+    /// matching count assert (it becomes 2).
+    #[test]
+    fn the_snapshot_refresh_never_recomputes_since_now_or_allow() {
+        let src = include_str!("fetch_driver.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("async fn redeem_pending_tickets(")
+            .expect("the redeem helper must exist");
+        let end = code[at..]
+            .find("pub(crate) async fn run_fetch_driver_loop(")
+            .expect("the loop must follow the redeem helper")
+            + at;
+        let region = &code[at..end];
+        // Call forms, never bare names (CLAUDE.md §9) — and counted over the FUNCTION region
+        // only, so this test's own prose cannot satisfy them.
+        assert_eq!(
+            region.matches("ticket_inbox_since(").count(),
+            1,
+            "the fetch window is derived once at entry — a mid-loop recompute moves it under \
+             the iteration"
+        );
+        assert_eq!(
+            region.matches("now_secs()").count(),
+            1,
+            "one poll, one clock read — the window and the re-dial gate must agree on 'now'"
+        );
+        assert_eq!(
+            region.matches("asked_peers(").count(),
+            1,
+            "the allow-list is the entry-time security boundary; re-deriving it mid-loop would \
+             admit or drop messages depending on processing order"
+        );
+        assert_eq!(
+            region.matches("mirror_noted_dial(").count(),
+            1,
+            "the snapshot refresh itself must stay wired into the loop's Err arm"
         );
     }
 
