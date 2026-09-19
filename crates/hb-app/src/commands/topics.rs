@@ -680,23 +680,31 @@ pub async fn topic_join_public(
 /// Join a private Topic by redeeming an invite addressed to me (admission path 1, redeem side). The
 /// `expected_topic_id` binds the redeem to the topic the user consented to in the W8 preview
 /// (`topic_preview_invite`): a relay that swaps in a different valid invite at redeem is rejected by
-/// `fetch_invite`'s existing topic_id check (reusing the public-join W4 substitution guard).
+/// `fetch_invite`'s existing topic_id check (reusing the public-join W4 substitution guard). The
+/// `expected_issuer_npub` (the preview's `issuer_npub`, sent back by the UI) binds it to the ISSUER
+/// the user consented to as well (QURATOR-227): a forged wrap naming the same topic_id no longer wins
+/// the first-valid-decrypt race.
 #[tauri::command]
 pub async fn topic_redeem_invite(
     expected_topic_id: String,
+    expected_issuer_npub: String,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
     relay: State<'_, SharedRelay>,
 ) -> CmdResult<Option<TopicView>> {
     let me = me(&identity).await?;
+    // The symmetric parse of `topic_preview_invite`'s `issuer.to_bech32()` — the value the UI echoes
+    // back from the preview.
+    let expected_issuer = hb_core::identity::parse_npub(&expected_issuer_npub).map_err(cmd_err)?;
     let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
     // `&mut seen`: redeem_invite atomically records a single-use invite's nonce on success (Decision E);
     // we persist the set afterward so a restart can't re-accept it.
     let mut seen = store.load_topic_nonces().map_err(cmd_err)?;
     let t = now();
-    let redeemed = fetch_invite(&client, &me, &mut seen, t, net::RELAY_TIMEOUT, Some(&expected_topic_id))
-        .await
-        .map_err(cmd_err)?;
+    let redeemed =
+        fetch_invite(&client, &me, &mut seen, t, net::RELAY_TIMEOUT, Some(&expected_topic_id), Some(&expected_issuer))
+            .await
+            .map_err(cmd_err)?;
     let (meta, key, _) = match redeemed {
         Some(v) => v,
         None => {
@@ -730,7 +738,9 @@ pub async fn topic_preview_invite(
     // follow-up redeem would be rejected as a replay. Never persisted.
     let mut seen = store.load_topic_nonces().map_err(cmd_err)?;
     let t = now();
-    let redeemed = fetch_invite(&client, &me, &mut seen, t, net::RELAY_TIMEOUT, None)
+    // expected_topic_id/issuer = None: the preview is the DISCOVERY step — it has nothing to expect
+    // yet; whatever valid invite it finds is what the user then consents to (issuer included).
+    let redeemed = fetch_invite(&client, &me, &mut seen, t, net::RELAY_TIMEOUT, None, None)
         .await
         .map_err(cmd_err)?;
     match redeemed {

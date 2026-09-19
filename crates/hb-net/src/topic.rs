@@ -757,7 +757,9 @@ pub async fn approve_join(
 /// expired/replayed wrap is skipped. Returns the redeemed `(meta, key, issuer)` and the invite event id
 /// (so the caller can persist the seen-nonce), or `None` if no valid invite is found. When
 /// `expected_topic_id` is `Some`, an invite whose payload names a different topic is skipped (W4 — see
-/// [`redeem_invite`]'s topic_id binding).
+/// [`redeem_invite`]'s topic_id binding); when `expected_issuer` is `Some`, a wrap whose verified seal
+/// signer is not that issuer is skipped (QURATOR-227 — the preview→redeem binding, so a forged wrap
+/// naming the same topic_id cannot be the one redeemed).
 pub async fn fetch_invite(
     client: &RelayClient,
     me: &Identity,
@@ -765,12 +767,13 @@ pub async fn fetch_invite(
     now: u64,
     timeout: Duration,
     expected_topic_id: Option<&str>,
+    expected_issuer: Option<&PublicKey>,
 ) -> Result<Option<(TopicMeta, TopicKey, PublicKey)>, NetError> {
     let wraps = client.fetch(topic_inbox_filter(me), timeout).await?;
     for w in wraps {
         // `redeem_invite` atomically records a single-use invite's seen-nonce into `seen` on success
         // (the public-join credential is exempt); the caller persists `seen` after this returns.
-        if let Ok((meta, key, issuer)) = redeem_invite(me, &w, seen, now, expected_topic_id) {
+        if let Ok((meta, key, issuer)) = redeem_invite(me, &w, seen, now, expected_topic_id, expected_issuer) {
             return Ok(Some((meta, key, issuer)));
         }
     }
@@ -799,7 +802,11 @@ pub async fn join_public(
 ) -> Result<Option<(TopicMeta, TopicKey, PublicKey)>, NetError> {
     let pj = public_join_identity(name)?;
     let expected = hb_core::topic::topic_id_for_name(&hb_core::topic::normalized_public_name(name)?);
-    fetch_invite(client, &pj, seen, now, timeout, Some(&expected)).await
+    // expected_issuer = None BY DESIGN (QURATOR-227): a public-join credential is deliberately
+    // issuer-agnostic — the joiner consents to the NAME, not to whoever's credential the relays
+    // serve, and binding it to one issuer would break a re-published credential. Do not "fix" this
+    // to Some(...): the issuer binding is for the private preview→redeem path only.
+    fetch_invite(client, &pj, seen, now, timeout, Some(&expected), None).await
 }
 
 #[cfg(test)]

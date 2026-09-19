@@ -439,7 +439,7 @@ async fn t3_private_invite(probe: &ProbeInput) -> Result<(), String> {
         .await
         .map_err(|e| format!("T3 invitee connect: {e}"))?;
     let mut preview_seen = NonceSet::new();
-    let previewed = fetch_invite(&ic, &invitee, &mut preview_seen, t, RELAY_TIMEOUT, None)
+    let previewed = fetch_invite(&ic, &invitee, &mut preview_seen, t, RELAY_TIMEOUT, None, None)
         .await
         .map_err(|e| format!("T3 preview fetch_invite: {e}"))?;
     let (pmeta, _pkey, pissuer) = previewed.ok_or_else(|| "T3 invitee found no invite to preview".to_string())?;
@@ -472,6 +472,7 @@ async fn t3_private_invite(probe: &ProbeInput) -> Result<(), String> {
         t,
         RELAY_TIMEOUT,
         Some(&pmeta.topic_id),
+        None,
     )
     .await
     .map_err(|e| format!("T3 redeem fetch_invite (expected_topic_id): {e}"))?;

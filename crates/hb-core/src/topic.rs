@@ -956,11 +956,14 @@ fn mint_invite_with_policy(
 /// ISSUER's [`PublicKey`] (the seal signer — surfaced so a caller can run a consent gate on who is
 /// vouching for the join). Rejects (clean `Err`, never a panic): not a gift-wrap, a forged **outer**
 /// wrap signature, not sealed to me (ECDH mismatch), a forged **seal** signature, the wrong inner
-/// kind, a future/zero version, **expired**, **replayed**, or — when `expected_topic_id` is `Some` —
-/// an invite for a different topic than the one being joined: a validly-signed invite whose payload
+/// kind, a future/zero version, **expired**, **replayed**, when `expected_topic_id` is `Some` — an
+/// invite for a different topic than the one being joined (a validly-signed invite whose payload
 /// names a different topic must never satisfy a join for another topic, else a lying relay could
-/// shadow the real credential with an attacker-controlled one (mirrors [`newest_announce`]'s
-/// `topic_id` binding).
+/// shadow the real credential with an attacker-controlled one; mirrors [`newest_announce`]'s
+/// `topic_id` binding) — or, when `expected_issuer` is `Some`, an invite whose VERIFIED seal signer
+/// is not that issuer (QURATOR-227: the preview→redeem substitution — the user consented to a
+/// specific issuer's npub in the W8 preview, so a forged wrap naming the same topic_id must not
+/// satisfy the redeem).
 ///
 /// **Single-use is enforced here, atomically (chorus-1):** for a **single-use** invite (`expires_at =
 /// Some`), the `(issuer, topic_id, invitee, nonce)` key is checked-and-inserted into `seen` in one step, closing the
@@ -974,6 +977,7 @@ pub fn redeem_invite(
     seen: &mut NonceSet,
     now: u64,
     expected_topic_id: Option<&str>,
+    expected_issuer: Option<&PublicKey>,
 ) -> Result<(TopicMeta, TopicKey, PublicKey), HbError> {
     if invite.kind != Kind::GiftWrap {
         return Err(HbError::InvalidEvent("not a NIP-59 gift wrap (kind 1059)".into()));
@@ -1017,6 +1021,18 @@ pub fn redeem_invite(
     if let Some(expected) = expected_topic_id {
         if payload.meta.topic_id != expected {
             return Err(HbError::InvalidEvent("invite is for a different topic than the one being joined".into()));
+        }
+    }
+    // W-issuer (QURATOR-227): when the caller consented to a KNOWN issuer — the preview→redeem path
+    // surfaces the seal signer's npub and the user acks it (W8) — the VERIFIED seal signer must be
+    // that issuer. A racing attacker's forged wrap validly names the same topic_id (the W4 check
+    // above cannot distinguish it), so accepting on first successful decrypt alone would redeem
+    // whichever wrap the relay served first while the user consented to a different issuer. Checked
+    // BEFORE the replay-nonce insert, next to and for the same reason as the topic-mismatch check
+    // above: a mismatched invite must never burn a single-use invite's seen-key.
+    if let Some(expected) = expected_issuer {
+        if issuer != *expected {
+            return Err(HbError::InvalidEvent("invite issuer is not the issuer the user consented to".into()));
         }
     }
     // Expiry is checked INDEPENDENTLY of the replay policy (chorus-2): a reusable credential may still
@@ -1485,18 +1501,18 @@ mod tests {
 
         // (a) not sealed to me.
         let inv = mint_invite(&issuer, &invitee.public_key(), &meta, &key, "n1", Some(NOW + 100), NOW).unwrap();
-        assert!(redeem_invite(&stranger, &inv, &mut NonceSet::new(), NOW, None).is_err(), "a stranger cannot redeem");
+        assert!(redeem_invite(&stranger, &inv, &mut NonceSet::new(), NOW, None, None).is_err(), "a stranger cannot redeem");
 
         // (b) expired.
         let expired = mint_invite(&issuer, &invitee.public_key(), &meta, &key, "n2", Some(NOW - 1), NOW).unwrap();
-        assert!(redeem_invite(&invitee, &expired, &mut NonceSet::new(), NOW, None).is_err(), "an expired invite is refused");
+        assert!(redeem_invite(&invitee, &expired, &mut NonceSet::new(), NOW, None, None).is_err(), "an expired invite is refused");
 
         // (c) replayed: the FIRST redeem atomically records the (issuer, topic_id, invitee, nonce)
         // seen-key, so the SECOND is rejected — single-use is enforced inside redeem_invite (no
         // caller TOCTOU).
         let mut seen = NonceSet::new();
-        let _ = redeem_invite(&invitee, &inv, &mut seen, NOW, None).unwrap();
-        assert!(redeem_invite(&invitee, &inv, &mut seen, NOW, None).is_err(), "a redeemed invite cannot be replayed");
+        let _ = redeem_invite(&invitee, &inv, &mut seen, NOW, None, None).unwrap();
+        assert!(redeem_invite(&invitee, &inv, &mut seen, NOW, None, None).is_err(), "a redeemed invite cannot be replayed");
     }
 
     // ───────────────────────── round-trips ─────────────────────────
@@ -1531,7 +1547,7 @@ mod tests {
         let invitee = Identity::generate();
         let (meta, key) = private_topic();
         let inv = mint_invite(&issuer, &invitee.public_key(), &meta, &key, "n", Some(NOW + 100), NOW).unwrap();
-        let (rmeta, rkey, _issuer) = redeem_invite(&invitee, &inv, &mut NonceSet::new(), NOW, None).unwrap();
+        let (rmeta, rkey, _issuer) = redeem_invite(&invitee, &inv, &mut NonceSet::new(), NOW, None, None).unwrap();
         assert_eq!(rmeta, meta, "the meta round-trips");
         assert_eq!(rkey.0, key.0, "the topic key round-trips");
     }
@@ -1551,7 +1567,7 @@ mod tests {
 
         // (a) expected = a different topic id B → attacker wins without the W4 check.
         assert!(
-            redeem_invite(&invitee, &inv, &mut NonceSet::new(), NOW, Some("a-different-topic-id-b")).is_err(),
+            redeem_invite(&invitee, &inv, &mut NonceSet::new(), NOW, Some("a-different-topic-id-b"), None).is_err(),
             "an invite for topic A must not satisfy a join for topic B"
         );
         // The mismatch is rejected BEFORE the replay-nonce insert, so a fresh seen-set still redeems it.
@@ -1560,12 +1576,96 @@ mod tests {
 
         // (b) expected = A (the matching id) → Ok, and the returned issuer == the minting issuer.
         let (_meta_r, _key_r, issuer_r) =
-            redeem_invite(&invitee, &inv, &mut seen, NOW, Some(&meta.topic_id)).unwrap();
+            redeem_invite(&invitee, &inv, &mut seen, NOW, Some(&meta.topic_id), None).unwrap();
         assert_eq!(issuer_r, issuer.public_key(), "the returned issuer is the invite's seal signer");
 
         // (c) expected = None (the blind private-redeem path) → Ok with a fresh seen-set.
         let inv2 = mint_invite(&issuer, &invitee.public_key(), &meta, &key, "n2", Some(NOW + 100), NOW).unwrap();
-        assert!(redeem_invite(&invitee, &inv2, &mut NonceSet::new(), NOW, None).is_ok(), "blind redeem is unaffected");
+        assert!(redeem_invite(&invitee, &inv2, &mut NonceSet::new(), NOW, None, None).is_ok(), "blind redeem is unaffected");
+    }
+
+    #[test]
+    fn redeem_invite_rejects_an_invite_from_a_different_issuer() {
+        // QURATOR-227 — the issuer twin of the W4 topic_id test above. A validly-signed invite whose
+        // VERIFIED seal signer is a DIFFERENT identity than the one the user consented to (the W8
+        // preview surfaces the issuer's npub; the redeem binds to it) must never satisfy the redeem —
+        // else a racing attacker's forged wrap naming the same topic_id wins by being served first.
+        // MUTATION that reds this: in redeem_invite's W-issuer block, change `if issuer != *expected`
+        // to `if false` — (a)'s refusal then accepts Mallory and the assert fires.
+        let genuine = Identity::generate();
+        let mallory = Identity::generate();
+        let invitee = Identity::generate();
+        let (meta, key) = private_topic();
+        let inv = mint_invite(&genuine, &invitee.public_key(), &meta, &key, "n", Some(NOW + 100), NOW).unwrap();
+
+        // (a) expected issuer = Mallory → the genuine issuer's invite must be refused.
+        let mut seen = NonceSet::new();
+        assert!(
+            redeem_invite(&invitee, &inv, &mut seen, NOW, Some(&meta.topic_id), Some(&mallory.public_key())).is_err(),
+            "an invite from the genuine issuer must not satisfy a redeem consented to Mallory"
+        );
+        // The mismatch is rejected BEFORE the replay-nonce insert: the SAME seen-set (not a fresh
+        // one) still redeems it afterwards — the rejected attempt burned no seen-key.
+        let (_meta_r, key_r, issuer_r) =
+            redeem_invite(&invitee, &inv, &mut seen, NOW, Some(&meta.topic_id), Some(&genuine.public_key())).unwrap();
+        assert_eq!(key_r.0, key.0, "the genuine topic key is returned");
+        assert_eq!(issuer_r, genuine.public_key(), "the returned issuer is the invite's seal signer");
+
+        // (c) expected_issuer = None (the preview/public-join discovery path has nothing to expect
+        // yet) → the blind redeem is unaffected.
+        let inv2 = mint_invite(&genuine, &invitee.public_key(), &meta, &key, "n2", Some(NOW + 100), NOW).unwrap();
+        assert!(
+            redeem_invite(&invitee, &inv2, &mut NonceSet::new(), NOW, None, None).is_ok(),
+            "a blind redeem (no expected issuer) is unaffected"
+        );
+    }
+
+    #[test]
+    fn issuer_bound_redeem_picks_the_genuine_wrap_regardless_of_order() {
+        // QURATOR-227 — THE ATTACK. Two valid wraps to the same invitee naming the SAME topic_id: one
+        // from the genuine issuer, one from an attacker (any party who can construct a decryptable
+        // wrap addressed to the target can do this). `fetch_invite` (hb-net) redeems the FIRST wrap
+        // that decrypts, so without the issuer binding whichever the relay serves first wins even
+        // though the user consented to the genuine issuer's npub in the preview. hb-core cannot drive
+        // `fetch_invite` (it needs a live relay), so this exercises `redeem_invite` over both wraps
+        // in BOTH orders with expected_issuer = Some(genuine): the attacker is refused and the
+        // genuine wrap redeemed whichever position it occupies. The ordering-independence of
+        // `fetch_invite`'s first-valid loop itself is what the hb-it suite_topic row must cover.
+        // MUTATION that reds this: in redeem_invite's W-issuer block, change `if issuer != *expected`
+        // to `if false` — the attacker wrap then redeems in both orders and the key asserts fire.
+        let genuine = Identity::generate();
+        let attacker = Identity::generate();
+        let invitee = Identity::generate();
+        let (meta, key) = private_topic();
+        let attack_key = TopicKey::generate();
+        let g = mint_invite(&genuine, &invitee.public_key(), &meta, &key, "g", Some(NOW + 100), NOW).unwrap();
+        let a = mint_invite(&attacker, &invitee.public_key(), &meta, &attack_key, "a", Some(NOW + 100), NOW).unwrap();
+
+        // Genuine-first order.
+        let mut seen = NonceSet::new();
+        let (m1, k1, i1) =
+            redeem_invite(&invitee, &g, &mut seen, NOW, Some(&meta.topic_id), Some(&genuine.public_key())).unwrap();
+        assert_eq!(i1, genuine.public_key(), "genuine-first: the genuine issuer is returned");
+        assert_eq!(k1.0, key.0, "genuine-first: the genuine topic key is returned");
+        assert_eq!(m1.topic_id, meta.topic_id, "the genuine wrap names the genuine topic");
+        assert!(
+            redeem_invite(&invitee, &a, &mut seen, NOW, Some(&meta.topic_id), Some(&genuine.public_key())).is_err(),
+            "genuine-first: the attacker's wrap is refused even though it names the same topic_id"
+        );
+
+        // Attacker-first order — the race the ticket describes: the forged wrap occupies the first
+        // slot of the fetched vector, which is exactly what a relay serving the attacker's event
+        // first produces.
+        let mut seen2 = NonceSet::new();
+        assert!(
+            redeem_invite(&invitee, &a, &mut seen2, NOW, Some(&meta.topic_id), Some(&genuine.public_key())).is_err(),
+            "attacker-first: the forged wrap is refused, not redeemed on first valid decrypt"
+        );
+        let (m2, k2, i2) =
+            redeem_invite(&invitee, &g, &mut seen2, NOW, Some(&meta.topic_id), Some(&genuine.public_key())).unwrap();
+        assert_eq!(i2, genuine.public_key(), "attacker-first: the genuine issuer is returned");
+        assert_eq!(k2.0, key.0, "attacker-first: the genuine topic key is returned");
+        assert_eq!(m2.topic_id, meta.topic_id, "the genuine wrap names the genuine topic");
     }
 
     #[test]
@@ -1595,7 +1695,7 @@ mod tests {
         let mut seen = NonceSet::new();
         assert!(
             matches!(
-                redeem_invite(&invitee, &bad, &mut seen, NOW, None),
+                redeem_invite(&invitee, &bad, &mut seen, NOW, None, None),
                 Err(HbError::InvalidEncryptedMessage)
             ),
             "a malformed topic_key is rejected at the decode/length gate"
@@ -1605,7 +1705,7 @@ mod tests {
         // The genuine invite for the SAME (topic_id, invitee) slot still redeems — the slot was not poisoned.
         let good = mint_invite(&issuer, &invitee.public_key(), &meta, &key, "n2", Some(NOW + 100), NOW).unwrap();
         assert!(
-            redeem_invite(&invitee, &good, &mut seen, NOW, None).is_ok(),
+            redeem_invite(&invitee, &good, &mut seen, NOW, None, None).is_ok(),
             "the genuine invite redeems because the malformed one never claimed the seen-key"
         );
     }
@@ -1643,14 +1743,14 @@ mod tests {
         // is returned, so the caller can refuse whose key it got; only Mallory's own seen slot is
         // claimed.
         let mut seen = NonceSet::new();
-        let (h_meta, h_key, h_issuer) = redeem_invite(&invitee, &hostile, &mut seen, NOW, None).unwrap();
+        let (h_meta, h_key, h_issuer) = redeem_invite(&invitee, &hostile, &mut seen, NOW, None, None).unwrap();
         assert_eq!(h_issuer, mallory.public_key(), "the hostile wrap's issuer is surfaced as Mallory");
         assert_ne!(h_key.0, key.0, "the hostile wrap carries Mallory's key, not the genuine one");
         assert_eq!(h_meta.topic_id, meta.topic_id, "the hostile wrap did declare the genuine topic_id");
 
         // THE PIN: the genuine invite still redeems afterwards — the hostile wrap could not burn
         // its slot — and returns the genuine issuer and genuine key.
-        let (g_meta, g_key, g_issuer) = redeem_invite(&invitee, &genuine, &mut seen, NOW, None).unwrap();
+        let (g_meta, g_key, g_issuer) = redeem_invite(&invitee, &genuine, &mut seen, NOW, None, None).unwrap();
         assert_eq!(g_issuer, genuine_issuer.public_key(), "the genuine issuer is recovered from the seal");
         assert_eq!(g_key.0, key.0, "the genuine topic key is returned");
         assert_eq!(g_meta.topic_id, meta.topic_id);
@@ -1658,11 +1758,11 @@ mod tests {
         // Single-use still holds PER INVITE: replaying the genuine event (same issuer + nonce ⇒
         // same seen-key) is refused, and so is replaying the hostile one.
         assert!(
-            redeem_invite(&invitee, &genuine, &mut seen, NOW, None).is_err(),
+            redeem_invite(&invitee, &genuine, &mut seen, NOW, None, None).is_err(),
             "a genuine invite still cannot be replayed"
         );
         assert!(
-            redeem_invite(&invitee, &hostile, &mut seen, NOW, None).is_err(),
+            redeem_invite(&invitee, &hostile, &mut seen, NOW, None, None).is_err(),
             "the hostile invite is itself single-use too"
         );
     }
@@ -1677,7 +1777,7 @@ mod tests {
 
         // A joiner who knows only the name reconstructs the public-join identity and redeems.
         let joiner_view = public_join_identity(&meta.name).unwrap();
-        let (rmeta, rkey, _issuer) = redeem_invite(&joiner_view, &cred, &mut NonceSet::new(), NOW, None).unwrap();
+        let (rmeta, rkey, _issuer) = redeem_invite(&joiner_view, &cred, &mut NonceSet::new(), NOW, None, None).unwrap();
         assert_eq!(rmeta.topic_id, meta.topic_id);
         assert_eq!(rkey.0, key.0, "any joiner obtains the topic key from the name-derived credential");
     }
@@ -1885,7 +1985,7 @@ mod tests {
     fn redeem_rejects_non_gift_wrap_and_foreign_inner_kind() {
         let me = Identity::generate();
         let note = me.sign(EventBuilder::new(Kind::TextNote, "hi")).unwrap();
-        assert!(matches!(redeem_invite(&me, &note, &mut NonceSet::new(), NOW, None), Err(HbError::InvalidEvent(_))));
+        assert!(matches!(redeem_invite(&me, &note, &mut NonceSet::new(), NOW, None, None), Err(HbError::InvalidEvent(_))));
     }
 
     // ───────────────────── chorus-1: insider forgery + reusable public-join + future ts ─────────────────────
@@ -1993,8 +2093,8 @@ mod tests {
         let cred = build_public_join(&creator, &meta, &key, NOW).unwrap();
         let joiner = public_join_identity(&meta.name).unwrap();
         let mut seen = NonceSet::new();
-        assert!(redeem_invite(&joiner, &cred, &mut seen, NOW, None).is_ok(), "first public-join redeem ok");
-        assert!(redeem_invite(&joiner, &cred, &mut seen, NOW, None).is_ok(), "public-join is reusable (not consumed)");
+        assert!(redeem_invite(&joiner, &cred, &mut seen, NOW, None, None).is_ok(), "first public-join redeem ok");
+        assert!(redeem_invite(&joiner, &cred, &mut seen, NOW, None, None).is_ok(), "public-join is reusable (not consumed)");
         assert!(seen.is_empty(), "a reusable public-join credential records no seen-nonce");
     }
 
@@ -2033,9 +2133,9 @@ mod tests {
         let (meta, key) = private_topic();
         let inv = mint_invite(&issuer, &invitee.public_key(), &meta, &key, "n", None, NOW).unwrap();
         let mut seen = NonceSet::new();
-        assert!(redeem_invite(&invitee, &inv, &mut seen, NOW, None).is_ok(), "first redeem ok");
+        assert!(redeem_invite(&invitee, &inv, &mut seen, NOW, None, None).is_ok(), "first redeem ok");
         assert!(
-            redeem_invite(&invitee, &inv, &mut seen, NOW, None).is_err(),
+            redeem_invite(&invitee, &inv, &mut seen, NOW, None, None).is_err(),
             "a no-expiry private invite is still single-use (reusable=false)"
         );
     }
@@ -2061,7 +2161,7 @@ mod tests {
         let mut inv = mint_invite(&issuer, &invitee.public_key(), &meta, &key, "n", Some(NOW + 100), NOW).unwrap();
         // Tamper the outer content after signing → the outer id/sig no longer matches.
         inv.content.push('A');
-        assert!(matches!(redeem_invite(&invitee, &inv, &mut NonceSet::new(), NOW, None), Err(HbError::InvalidSignature)));
+        assert!(matches!(redeem_invite(&invitee, &inv, &mut NonceSet::new(), NOW, None, None), Err(HbError::InvalidSignature)));
     }
 
     #[test]

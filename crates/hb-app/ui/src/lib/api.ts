@@ -654,11 +654,12 @@ export const topicLookup = (name: string) => invoke<TopicLookup>('topic_lookup',
 export const topicJoinPublic = (name: string) =>
 	invoke<TopicView>('topic_join_public', { name });
 
-/** Redeem a private-Topic invite addressed to me, bound to the topic_id the user previewed/consented
- *  to (W8 substitution guard — a relay swapping in a different valid invite is rejected). Returns the
- *  joined Topic, or null if none found. */
-export const topicRedeemInvite = (expectedTopicId: string) =>
-	invoke<TopicView | null>('topic_redeem_invite', { expectedTopicId });
+/** Redeem a private-Topic invite addressed to me, bound to the topic_id AND the issuer npub the user
+ *  previewed/consented to (W8 substitution guards — a relay swapping in a different valid invite, or
+ *  a forged wrap from another issuer naming the same topic_id, is rejected). Returns the joined
+ *  Topic, or null if none found. */
+export const topicRedeemInvite = (expectedTopicId: string, expectedIssuerNpub: string) =>
+	invoke<TopicView | null>('topic_redeem_invite', { expectedTopicId, expectedIssuerNpub });
 
 /** Preview a pending private-Topic invite WITHOUT committing (W8 consent gate): reveals the topic
  *  name/description + the invite issuer's npub so the UI can ask for explicit acknowledgment first.

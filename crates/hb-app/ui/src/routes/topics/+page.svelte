@@ -611,7 +611,9 @@
 		if (pendingJoin.mode !== 'redeem') return;
 		busy = true;
 		try {
-			const joined = await topicRedeemInvite(pendingJoin.topicId);
+			// The issuer npub from the SAME preview is forwarded so the backend binds the redeem to
+			// the issuer the user consented to (QURATOR-227) — not just the topic_id.
+			const joined = await topicRedeemInvite(pendingJoin.topicId, pendingJoin.issuerNpub);
 			if (joined) {
 				pendingJoin = null;
 				await loadMine();

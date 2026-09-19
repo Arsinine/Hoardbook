@@ -231,7 +231,7 @@ async fn topic5(ctx: &Ctx) -> Result<()> {
 
     // The invitee redeems the invite, joins, and reads the roster.
     let ic = ctx.connect(&invitee).await?;
-    let (imeta, ikey, _issuer) = fetch_invite(&ic, &invitee, &mut NonceSet::new(), now(), FETCH_TIMEOUT, None)
+    let (imeta, ikey, _issuer) = fetch_invite(&ic, &invitee, &mut NonceSet::new(), now(), FETCH_TIMEOUT, None, None)
         .await?
         .ok_or_else(|| anyhow!("the invitee found no invite"))?;
     ensure!(ikey.as_bytes() == key.as_bytes(), "the invite carries the real topic key");
@@ -278,7 +278,7 @@ async fn topic6(ctx: &Ctx) -> Result<()> {
 
     // The requester redeems the approval + joins.
     let rc = ctx.connect(&requester).await?;
-    let (imeta, ikey, _issuer) = fetch_invite(&rc, &requester, &mut NonceSet::new(), now(), FETCH_TIMEOUT, None)
+    let (imeta, ikey, _issuer) = fetch_invite(&rc, &requester, &mut NonceSet::new(), now(), FETCH_TIMEOUT, None, None)
         .await?
         .ok_or_else(|| anyhow!("the requester found no approval invite"))?;
     join_topic(&rc, &ikey, &imeta.topic_id, &requester, now()).await?;
@@ -310,7 +310,7 @@ async fn topic7(ctx: &Ctx) -> Result<()> {
 
     // member_a redeems, joins, then — as a non-creator member — invites the newcomer (M3).
     let ac = ctx.connect(&member_a).await?;
-    let (ameta, akey, _issuer) = fetch_invite(&ac, &member_a, &mut NonceSet::new(), now(), FETCH_TIMEOUT, None)
+    let (ameta, akey, _issuer) = fetch_invite(&ac, &member_a, &mut NonceSet::new(), now(), FETCH_TIMEOUT, None, None)
         .await?
         .ok_or_else(|| anyhow!("member_a found no invite"))?;
     join_topic(&ac, &akey, &ameta.topic_id, &member_a, now()).await?;
@@ -320,7 +320,7 @@ async fn topic7(ctx: &Ctx) -> Result<()> {
 
     // The newcomer redeems member_a's invite + joins.
     let nc = ctx.connect(&newcomer).await?;
-    let (nmeta, nkey, _issuer) = fetch_invite(&nc, &newcomer, &mut NonceSet::new(), now(), FETCH_TIMEOUT, None)
+    let (nmeta, nkey, _issuer) = fetch_invite(&nc, &newcomer, &mut NonceSet::new(), now(), FETCH_TIMEOUT, None, None)
         .await?
         .ok_or_else(|| anyhow!("the newcomer found no invite from member_a"))?;
     join_topic(&nc, &nkey, &nmeta.topic_id, &newcomer, now()).await?;
