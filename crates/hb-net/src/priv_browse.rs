@@ -8,15 +8,19 @@
 //!
 //! QURATOR-160 receive side adds the same fetch/open/trust shape one inner kind over:
 //! [`fetch_key_grants`] reads browse-key grants (inner kind 31_114) from the SAME kind-1059 inbox.
+//! QURATOR-247 adds a bounded negative cache ([`FAILED_OPENS`]) shared by both fetchers: a wrap
+//! that fails to open once is not re-decrypted on the next poll of that shared inbox.
 
 use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use hb_core::{open_key_grant, open_private_listing, Identity, OpenedKeyGrant, OpenedPrivate};
+use hb_core::{open_key_grant, open_private_listing, HbError, Identity, OpenedKeyGrant, OpenedPrivate};
 use nostr::prelude::*;
 
 use crate::client::RelayClient;
 use crate::error::NetError;
+use crate::failed_wrap_cache::FailedWrapCache;
 
 /// Relay-fetch budget for `me`'s personal gift-wrap inbox (QURATOR-291), shared by
 /// [`fetch_private_listings`] and [`fetch_key_grants`] — both build the identical
@@ -48,8 +52,10 @@ pub async fn publish_private_listing(
 /// filter is `{kinds:[1059], #p:[me]}`; the author check is **post-decrypt** (open each wrap, keep it
 /// iff its inner author ∈ `allowlist`). A wrap not addressed to us, from an untrusted author, or
 /// malformed is silently skipped — a relay mixes everyone's 1059s in this inbox, so a foreign or
-/// junk wrap is *expected*, not an error. A non-recipient calling this gets an empty result: there
-/// is no "this is private" hint to find. Retried publishes collapse via [`dedup_newest`].
+/// junk wrap is *expected*, not an error — and, since QURATOR-247, an unopenable one is remembered
+/// in [`FAILED_OPENS`] so the next poll does not re-decrypt it. A non-recipient calling this gets
+/// an empty result: there is no "this is private" hint to find. Retried publishes collapse via
+/// [`dedup_newest`].
 pub async fn fetch_private_listings(
     client: &RelayClient,
     me: &Identity,
@@ -57,15 +63,7 @@ pub async fn fetch_private_listings(
     timeout: Duration,
 ) -> Result<Vec<OpenedPrivate>, NetError> {
     let wraps = client.fetch(priv_inbox_filter(me), timeout).await?;
-    let mut opened: Vec<OpenedPrivate> = Vec::new();
-    for w in wraps {
-        if let Ok(o) = open_private_listing(me, &w) {
-            if allowlist.contains(&o.inner_author) {
-                opened.push(o);
-            }
-        }
-    }
-    Ok(dedup_newest(opened))
+    Ok(open_private_listing_wraps(me, &wraps, allowlist))
 }
 
 /// Fetch browse-key grants (QURATOR-160 receive side) addressed to `me`, keeping only those from a
@@ -99,23 +97,141 @@ pub(crate) fn priv_inbox_filter(me: &Identity) -> Filter {
     Filter::new().kind(Kind::GiftWrap).pubkey(me.public_key()).limit(PRIV_INBOX_FETCH_LIMIT)
 }
 
+/// Negative-cache scope tag for private-listing opens (inner kind 31_113). Scopes exist because
+/// the two consumers of this inbox have NON-interchangeable failure verdicts: a valid private
+/// listing fails `open_key_grant`'s inner-kind pin (31_114) and a valid grant fails
+/// `open_private_listing`'s — one undiscriminated key space would let whichever core polled first
+/// blacklist the other's perfectly good wrap. Pinned by
+/// `kind_pin_failures_do_not_cross_the_inner_kind_scopes`.
+const LISTING_OPEN_SCOPE: &str = "priv-listing";
+/// Negative-cache scope tag for key-grant opens (inner kind 31_114). See [`LISTING_OPEN_SCOPE`].
+const GRANT_OPEN_SCOPE: &str = "key-grant";
+
+/// The private-inbox failed-open negative cache (QURATOR-247): gift-wrap ids that failed
+/// `open_private_listing`/`open_key_grant`, so a repeated poll of the shared `{kinds:[1059],
+/// #p:[me]}` inbox (QURATOR-291's flood surface) does not re-run NIP-44 decrypt + Schnorr verify
+/// on attacker junk forever — bounded only by [`PRIV_INBOX_FETCH_LIMIT`] before this cache. One
+/// bounded [`FailedWrapCache`] — the TYPE shared with hb-app's DM poller (see
+/// `failed_wrap_cache`'s module doc for why the type is shared but entries never are) — keyed
+/// (identity npub, inner-kind scope, wrap id). Module-scope static (house rule: never a
+/// per-function static); `std::sync::Mutex`, not tokio — the check and the record are separate
+/// synchronous spans, so the lock is never held across the fetch `.await`.
+///
+/// **"Failed to open" is a stable property per (identity, wrap)** — that is what makes a negative
+/// cache safe here, and the question QURATOR-247 asks to answer explicitly. `open_private_listing`
+/// / `open_key_grant` are offline-pure over `(me's keys, wrap bytes)`: NIP-44 decrypt
+/// (ECDH + AES-GCM), Schnorr verify, the inner-kind pin and the JSON parse are all deterministic
+/// — no clock, RNG or network enters the verdict — so there is NO transient failure to blacklist:
+/// a wrap that failed cannot later succeed under the same keys. The two inputs that CAN change
+/// are excluded by construction, each pinned by a test: the IDENTITY (keyed by npub — a wrap that
+/// fails under A may simply be addressed to B; `failure_cache_does_not_cross_identity_boundaries`)
+/// and the ALLOWLIST (trust is filtered AFTER the cache layer and never recorded — contacts can be
+/// added later; `untrusted_but_openable_listing_is_not_negatively_cached`). In-memory only, never
+/// persisted: a restart re-attempts each remembered wrap exactly once and never loses a listing.
+///
+/// Residual, deliberately uncovered: a well-formed wrap from an untrusted author re-opens on
+/// every poll (it never enters this cache — see the allowlist note). That is the price of the
+/// allowlist being mutable, unchanged from before this cache, and outside QURATOR-247's named
+/// threat (junk wraps that fail to open).
+static FAILED_OPENS: LazyLock<Mutex<FailedWrapCache>> =
+    LazyLock::new(|| Mutex::new(FailedWrapCache::new()));
+
+/// Compose the negative-cache key: (identity npub, scope, wrap id). `\x00` appears in none of
+/// bech32 (npub), the scope tags, or hex (wrap id), so the join is collision-free.
+fn failed_open_key(me_npub: &str, scope: &str, wrap_id: &str) -> String {
+    format!("{me_npub}\u{0}{scope}\u{0}{wrap_id}")
+}
+
+/// O(1) "already failed to open under THIS identity and inner kind?" — checked before the open so
+/// a previously-failed wrap is not re-decrypted on every poll.
+fn failed_open_seen(me_npub: &str, scope: &str, id: &str) -> bool {
+    FAILED_OPENS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&failed_open_key(me_npub, scope, id))
+}
+
+/// Record a (identity, scope, wrap id) that failed to open (bounded, FIFO-evicted). Only the
+/// deterministic open verdict is ever recorded here — never an allowlist rejection.
+fn record_failed_open(me_npub: &str, scope: &str, id: String) {
+    FAILED_OPENS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(failed_open_key(me_npub, scope, &id));
+}
+
+/// Open one wrap through the negative cache — the shared per-wrap core of BOTH inbox consumers:
+/// a remembered id is skipped without attempting the open; a failed open is remembered; an opened
+/// wrap is returned for the CALLER's trust decision, which stays outside this fn on purpose (see
+/// [`FAILED_OPENS`]'s allowlist note).
+fn open_cached<T>(
+    me: &Identity,
+    me_npub: &str,
+    wrap: &Event,
+    scope: &str,
+    open: fn(&Identity, &Event) -> Result<T, HbError>,
+) -> Option<T> {
+    let id = wrap.id.to_hex();
+    if failed_open_seen(me_npub, scope, &id) {
+        return None; // failed under THIS identity + inner kind before — deterministic, skip the re-open
+    }
+    match open(me, wrap) {
+        Ok(t) => Some(t),
+        Err(_) => {
+            record_failed_open(me_npub, scope, id);
+            None
+        }
+    }
+}
+
+/// The pure open/trust/dedup core of [`fetch_private_listings`] — everything after the relay
+/// fetch, the exact sibling of [`open_key_grant_wraps`] (QURATOR-247 extracted it so both inbox
+/// consumers are open/trust/dedup cores over the same [`open_cached`] seam, testable identically
+/// without a relay).
+pub(crate) fn open_private_listing_wraps(
+    me: &Identity,
+    wraps: &[Event],
+    allowlist: &[PublicKey],
+) -> Vec<OpenedPrivate> {
+    let me_npub = me.npub();
+    let mut trusted: Vec<OpenedPrivate> = Vec::new();
+    for w in wraps {
+        // None = cached skip (failed under this identity + scope on a prior poll).
+        if let Some(o) = open_cached(me, &me_npub, w, LISTING_OPEN_SCOPE, open_private_listing) {
+            if allowlist.contains(&o.inner_author) {
+                trusted.push(o);
+            }
+            // Deliberately NOT recorded when merely untrusted: the open SUCCEEDED (the
+            // deterministic verdict is "openable") and the allowlist is mutable state that can
+            // grow to include this author later — a cached skip would then hide their listing
+            // until restart. Pinned by `untrusted_but_openable_listing_is_not_negatively_cached`.
+        }
+    }
+    dedup_newest(trusted)
+}
+
 /// The pure open/trust/dedup core of [`fetch_key_grants`] — everything after the relay fetch, so a
 /// real `seal_key_grant`-produced wrap round-trips through production code without a relay (the
 /// same discipline that makes [`dedup_newest`] the tested half of `fetch_private_listings`).
+/// Shares [`open_cached`] with [`open_private_listing_wraps`] so the negative-cache skip/record
+/// behaviour cannot drift between the two consumers of this inbox (QURATOR-247).
 pub(crate) fn open_key_grant_wraps(
     me: &Identity,
     wraps: &[Event],
     allowlist: &[PublicKey],
 ) -> Vec<OpenedKeyGrant> {
-    let mut opened: Vec<OpenedKeyGrant> = Vec::new();
+    let me_npub = me.npub();
+    let mut trusted: Vec<OpenedKeyGrant> = Vec::new();
     for w in wraps {
-        if let Ok(g) = open_key_grant(me, w) {
+        if let Some(g) = open_cached(me, &me_npub, w, GRANT_OPEN_SCOPE, open_key_grant) {
             if allowlist.contains(&g.inner_author) {
-                opened.push(g);
+                trusted.push(g);
             }
+            // Not recorded when merely untrusted — same allowlist-mutability reason as
+            // [`open_private_listing_wraps`].
         }
     }
-    dedup_grants_newest(opened)
+    dedup_grants_newest(trusted)
 }
 
 /// Collapse retried/duplicate grants: keep the **newest** (by inner `created_at`) opened grant per
@@ -347,6 +463,194 @@ mod tests {
         assert!(
             got.iter().any(|g| g.inner_author == b.public_key()),
             "a second granter is not collapsed away"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // QURATOR-247 — the failed-open negative cache. Every test generates a FRESH `me`, so its
+    // (npub, scope, id) slice of `FAILED_OPENS` starts empty — the same hygiene note chat.rs's
+    // FAILED_WRAPS tests carry. All of these call the production cores (`open_private_listing_wraps`
+    // / `open_key_grant_wraps`) and the production cache accessors, never a rebuilt copy.
+    // -----------------------------------------------------------------------
+
+    /// A junk wrap (sealed to someone else — `me` cannot decrypt it) is skipped silently AND
+    /// remembered, so the next poll of the same inbox does not re-run the open. This is the
+    /// record half of acceptance #1; the skip half is
+    /// `cached_failure_skips_the_open_entirely_qurator_247`.
+    ///
+    /// MUTATION (P-10, for the orchestrator to apply): in `open_cached` (priv_browse.rs, the
+    /// `match open(me, wrap)` block), delete the `Err(_)` arm's `record_failed_open(me_npub,
+    /// scope, id);` — the junk wrap is no longer remembered and the `failed_open_seen` assert
+    /// reds.
+    #[test]
+    fn failed_listing_open_is_remembered_for_the_next_poll_qurator_247() {
+        use hb_core::seal_private_listing;
+
+        let me = Identity::generate();
+        let author = Identity::generate();
+        let someone_else = Identity::generate();
+
+        let mut wraps =
+            seal_private_listing(&author, &[me.public_key()], r#"{"slug":"vault"}"#, 100).unwrap();
+        let junk =
+            seal_private_listing(&author, &[someone_else.public_key()], r#"{"slug":"not-for-me"}"#, 100)
+                .unwrap();
+        let junk_id = junk[0].id.to_hex();
+        wraps.extend(junk);
+
+        let got = open_private_listing_wraps(&me, &wraps, &[author.public_key()]);
+        assert_eq!(got.len(), 1, "the junk wrap is skipped silently — expected foreign traffic");
+        assert_eq!(got[0].inner_author, author.public_key(), "the surviving listing is the trusted author's");
+        assert!(
+            failed_open_seen(&me.npub(), LISTING_OPEN_SCOPE, &junk_id),
+            "the unopenable wrap is remembered in the negative cache"
+        );
+        // The next poll of the same inbox: same output.
+        let got2 = open_private_listing_wraps(&me, &wraps, &[author.public_key()]);
+        assert_eq!(got2.len(), 1, "poll 2 is output-identical (the junk wrap now a cache hit)");
+    }
+
+    /// The skip half of acceptance #1: a wrap remembered as failed is not opened at all. The
+    /// manual `record_failed_open` simulates a prior poll's failure for an otherwise fully valid,
+    /// trusted wrap — which is exactly what production state looks like to the second poll.
+    ///
+    /// MUTATION (P-10): in `open_cached`, delete the `if failed_open_seen(me_npub, scope, &id)
+    /// { return None; }` guard — the cached wrap is re-opened (it is genuinely valid), comes
+    /// back, and the `is_empty` assert reds.
+    #[test]
+    fn cached_failure_skips_the_open_entirely_qurator_247() {
+        use hb_core::seal_private_listing;
+
+        let me = Identity::generate();
+        let author = Identity::generate();
+        let wraps =
+            seal_private_listing(&author, &[me.public_key()], r#"{"slug":"vault"}"#, 100).unwrap();
+        // Simulate a prior poll that failed to open this wrap under THIS identity.
+        record_failed_open(&me.npub(), LISTING_OPEN_SCOPE, wraps[0].id.to_hex());
+
+        let got = open_private_listing_wraps(&me, &wraps, &[author.public_key()]);
+        assert!(
+            got.is_empty(),
+            "a cached failure is skipped without attempting the open — cache gates BEFORE decrypt"
+        );
+    }
+
+    /// A wrap sealed to B fails under A (foreign traffic, remembered under A) but must still open
+    /// under B — the cache key's identity segment is what keeps one identity's failure from
+    /// blacklisting another's valid listing (wipe/restore, or a relay feeding B's wrap while A
+    /// polls). Mirrors chat.rs's `negative_cache_does_not_cross_identity_boundaries`.
+    ///
+    /// MUTATION (P-10): in `failed_open_key`, drop the identity segment — change the format! to
+    /// `format!("{scope}\u{0}{wrap_id}")` — B now sees A's entry, the listing is skipped, and the
+    /// final assert reds.
+    #[test]
+    fn failure_cache_does_not_cross_identity_boundaries() {
+        use hb_core::seal_private_listing;
+
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let author = Identity::generate();
+        let wraps = seal_private_listing(&author, &[b.public_key()], r#"{"slug":"for-b"}"#, 100).unwrap();
+        let id = wraps[0].id.to_hex();
+
+        let got_a = open_private_listing_wraps(&a, &wraps, &[author.public_key()]);
+        assert!(got_a.is_empty(), "A cannot open a wrap sealed to B — expected, not an error");
+        assert!(failed_open_seen(&a.npub(), LISTING_OPEN_SCOPE, &id), "…remembered under A");
+
+        let got_b = open_private_listing_wraps(&b, &wraps, &[author.public_key()]);
+        assert_eq!(got_b.len(), 1, "B's genuinely valid listing is NOT poisoned by A's failure");
+    }
+
+    /// The two inner kinds share one inbox but must not share one failure entry: a valid private
+    /// listing fails `open_key_grant`'s kind pin (31_114) — that refusal is remembered under the
+    /// GRANT scope only, and the listing core must still open it. Without the scope segment in
+    /// the key, whichever core polled first would blacklist the other's perfectly good wrap.
+    ///
+    /// MUTATION (P-10): in `failed_open_key`, drop the scope segment — change the format! to
+    /// `format!("{me_npub}\u{0}{wrap_id}")` — the grant core's refusal now poisons the listing
+    /// open and the final assert reds.
+    #[test]
+    fn kind_pin_failures_do_not_cross_the_inner_kind_scopes() {
+        use hb_core::seal_private_listing;
+
+        let me = Identity::generate();
+        let author = Identity::generate();
+        let wraps = seal_private_listing(&author, &[me.public_key()], r#"{"slug":"vault"}"#, 100).unwrap();
+        let id = wraps[0].id.to_hex();
+
+        let grants = open_key_grant_wraps(&me, &wraps, &[author.public_key()]);
+        assert!(grants.is_empty(), "a listing is not a grant — refused by the kind pin");
+        assert!(
+            failed_open_seen(&me.npub(), GRANT_OPEN_SCOPE, &id),
+            "the kind-pin refusal is remembered under the GRANT scope"
+        );
+        assert!(
+            !failed_open_seen(&me.npub(), LISTING_OPEN_SCOPE, &id),
+            "…and NOT under the listing scope"
+        );
+        let got = open_private_listing_wraps(&me, &wraps, &[author.public_key()]);
+        assert_eq!(got.len(), 1, "the grant core's kind-pin refusal does not poison the listing core");
+    }
+
+    /// A wrap that OPENS but whose author is untrusted is dropped by the trust check WITHOUT being
+    /// negatively cached: the open's verdict ("openable") is the only deterministic, cacheable
+    /// fact, while the allowlist is mutable — add the author as a contact and their listing must
+    /// surface on the very next poll, which a cached skip would hide until restart.
+    ///
+    /// MUTATION (P-10): in `open_private_listing_wraps`, add an `else { record_failed_open(
+    /// &me.npub(), LISTING_OPEN_SCOPE, w.id.to_hex()); }` to the `if allowlist.contains(
+    /// &o.inner_author)` — poll 1 now caches the stranger's wrap and poll 2 (allowlist grown)
+    /// returns empty, redding the final assert (and the `!failed_open_seen` assert before it).
+    #[test]
+    fn untrusted_but_openable_listing_is_not_negatively_cached() {
+        use hb_core::seal_private_listing;
+
+        let me = Identity::generate();
+        let stranger = Identity::generate();
+        let wraps = seal_private_listing(&stranger, &[me.public_key()], r#"{"slug":"theirs"}"#, 100).unwrap();
+        let id = wraps[0].id.to_hex();
+
+        // Poll 1: nobody trusted — the stranger's wrap opens fine, then fails the trust check.
+        let got = open_private_listing_wraps(&me, &wraps, &[]);
+        assert!(got.is_empty(), "an untrusted author is dropped by the trust check");
+        assert!(
+            !failed_open_seen(&me.npub(), LISTING_OPEN_SCOPE, &id),
+            "an OPENED wrap is never recorded: the allowlist can grow to include the author"
+        );
+
+        // Poll 2: the allowlist grew — the listing now arrives, impossible had poll 1 cached it.
+        let got2 = open_private_listing_wraps(&me, &wraps, &[stranger.public_key()]);
+        assert_eq!(
+            got2.len(),
+            1,
+            "adding the author to the allowlist surfaces their listing on the next poll"
+        );
+    }
+
+    /// The grant core remembers its own junk symmetrically with the listing core (acceptance #2:
+    /// both fetchers share the inbox, so both must carry the cache).
+    ///
+    /// MUTATION (P-10): in `open_key_grant_wraps`, change the `open_cached(...)` call's
+    /// `GRANT_OPEN_SCOPE` argument to `LISTING_OPEN_SCOPE` — the record lands in the wrong scope
+    /// and the `failed_open_seen(... GRANT_OPEN_SCOPE ...)` assert reds.
+    #[test]
+    fn failed_grant_open_is_remembered_qurator_247() {
+        use hb_core::seal_key_grant;
+
+        let me = Identity::generate();
+        let granter = Identity::generate();
+        let someone_else = Identity::generate();
+
+        let mut wraps = seal_key_grant(&granter, &[me.public_key()], &[0x5Au8; 32], 100).unwrap();
+        let junk = seal_key_grant(&granter, &[someone_else.public_key()], &[0x11; 32], 100).unwrap();
+        let junk_id = junk[0].id.to_hex();
+        wraps.extend(junk);
+
+        let got = open_key_grant_wraps(&me, &wraps, &[granter.public_key()]);
+        assert_eq!(got.len(), 1, "only the real grant survives — the junk wrap skipped silently");
+        assert!(
+            failed_open_seen(&me.npub(), GRANT_OPEN_SCOPE, &junk_id),
+            "the unopenable grant wrap is remembered under the grant scope"
         );
     }
 }

@@ -22,14 +22,14 @@
 //! `merge_wraps_into_cache`; the returned inbox is reclassified from the cache under the current
 //! contacts/blocked sets, so blocking/removing a contact still hides their cached messages.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 
 use chrono::{TimeZone, Utc};
 use nostr::prelude::*;
 use serde::Serialize;
 use tauri::State;
 
-use hb_net::{scope_peer_relays, unwrap_dm, wrap_dm, RelayClient};
+use hb_net::{scope_peer_relays, unwrap_dm, wrap_dm, FailedWrapCache, RelayClient};
 
 use crate::{
     dm_cache_store::{CachedDm, DmCache},
@@ -390,14 +390,10 @@ pub(crate) const DM_FETCH_MARGIN_SECS: u64 = 48 * 60 * 60;
 /// (QURATOR-197) — one number, so the budgets can't drift.
 pub(crate) const DM_INBOX_FETCH_LIMIT: usize = 1000;
 
-/// Cap on remembered failed-unwrap wrap ids (the negative cache). A wrap that fails to unwrap is
-/// remembered here so the ~15 s poll doesn't re-run the full unwrap (schnorr + ECDH + AES-GCM) on it
-/// for up to 48 h — one cheap signed event would otherwise buy ~57,600 redundant decryptions. Bounded
-/// and FIFO-evicted because it is fed by attacker-controlled ids; 4,096 ids ≈ 256 KiB, and a flood
-/// beyond that is bounded by the 48 h fetch window + relay bandwidth rather than our CPU. In-memory
-/// only (not persisted, not part of [`DmCache`]): it is a CPU-DoS backstop, not a correctness
-/// boundary — losing it across a restart merely re-attempts a wrap once, never loses a message.
-const MAX_FAILED_WRAPS: usize = 4_096;
+// (QURATOR-247) `MAX_FAILED_WRAPS` and the `FailedWrapCache` struct moved to
+// `hb_net::failed_wrap_cache`, imported above — every consumer of the shared kind-1059 inbox now
+// uses one bounded-FIFO negative-cache implementation. The DM-specific sizing rationale lived with
+// the const; see the hb-net module doc for the shared version.
 
 /// (QURATOR-244) Local, OURS defense-in-depth cap on a single decrypted DM's content, in BYTES,
 /// checked before anything is persisted to the sealed cache or the Q7 quarantine. Anchored to
@@ -415,31 +411,10 @@ const MAX_FAILED_WRAPS: usize = 4_096;
 /// never re-decrypted and the QURATOR-231 cursor still commits past it.
 const MAX_DM_CONTENT_BYTES: usize = 65_408;
 
-/// Bounded, FIFO negative cache of gift-wrap ids that failed to unwrap (`set` for O(1) membership,
-/// `order` for oldest-first eviction).
-struct FailedWrapCache {
-    order: VecDeque<String>,
-    set: HashSet<String>,
-}
-
-impl FailedWrapCache {
-    fn new() -> Self {
-        FailedWrapCache { order: VecDeque::new(), set: HashSet::new() }
-    }
-    fn contains(&self, id: &str) -> bool {
-        self.set.contains(id)
-    }
-    fn insert(&mut self, id: String) {
-        if self.set.insert(id.clone()) {
-            self.order.push_back(id);
-            if self.order.len() > MAX_FAILED_WRAPS {
-                if let Some(evicted) = self.order.pop_front() {
-                    self.set.remove(&evicted);
-                }
-            }
-        }
-    }
-}
+// (QURATOR-247) `FailedWrapCache` (the struct + its FIFO `insert`) moved to
+// `hb_net::failed_wrap_cache`; this file imports it. The static and key helpers below stay here
+// on purpose: `unwrap_dm`'s failure verdicts are the DM path's own and must never share entries
+// with hb-net's private-listing/key-grant scopes (a valid DM fails those cores' inner-kind pins).
 
 /// The failed-unwrap negative cache. Module-scope static (house rule: never a per-function static).
 /// `std::sync::Mutex`, not `tokio` — the check and the record are separate synchronous spans, so the
@@ -1840,6 +1815,9 @@ mod tests {
     use super::*;
     use crate::dm_quarantine::DmRequestBucket;
     use hb_core::Identity;
+    // (QURATOR-247) The cap moved to `hb_net::failed_wrap_cache` with the struct; only the
+    // bounded-FIFO test reads it, so it is imported here rather than at module scope.
+    use hb_net::MAX_FAILED_WRAPS;
 
     /// **The `ManifestRequest` half of the M18 wire contract, pinned here** because `wire_freeze`
     /// lives in hb-core and cannot see this type. Without it the ticket half was frozen and this half
@@ -3088,15 +3066,18 @@ mod tests {
     #[test]
     fn failed_wrap_cache_is_bounded_and_fifo_evicts() {
         // audit #11: the negative cache is fed by attacker-controlled ids, so it must be a hard bound
-        // (an unbounded one just moves the DoS to memory). FIFO: oldest evicted first.
+        // (an unbounded one just moves the DoS to memory). FIFO: oldest evicted first. Since
+        // QURATOR-247 this drives the shared `hb_net::failed_wrap_cache::FailedWrapCache` (the
+        // struct moved there; this file's static keeps its own entries) — same behaviour, one
+        // implementation for every kind-1059 inbox consumer.
         let mut c = FailedWrapCache::new();
         for i in 0..MAX_FAILED_WRAPS {
             c.insert(format!("id{i}"));
         }
-        assert_eq!(c.set.len(), MAX_FAILED_WRAPS, "the cache holds exactly the cap");
+        assert_eq!(c.len(), MAX_FAILED_WRAPS, "the cache holds exactly the cap");
         assert!(c.contains("id0"), "the first-inserted id survives at exactly the cap");
         c.insert("overflow".into());
-        assert_eq!(c.set.len(), MAX_FAILED_WRAPS, "the cap is a hard bound, never exceeded");
+        assert_eq!(c.len(), MAX_FAILED_WRAPS, "the cap is a hard bound, never exceeded");
         assert!(!c.contains("id0"), "FIFO: the oldest entry is evicted first");
         assert!(c.contains("overflow"), "the newest entry is retained");
     }

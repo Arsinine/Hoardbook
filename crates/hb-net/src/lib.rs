@@ -21,6 +21,7 @@ pub mod count;
 pub mod discover;
 pub mod dm;
 pub mod error;
+pub mod failed_wrap_cache;
 pub mod nip09;
 pub mod nip65;
 pub mod pow;
@@ -52,6 +53,7 @@ pub use discover::{
 };
 pub use dm::{unwrap_dm, wrap_dm, DirectMessage};
 pub use error::NetError;
+pub use failed_wrap_cache::{FailedWrapCache, MAX_FAILED_WRAPS};
 pub use nip09::build_deletion;
 pub use nip65::{bootstrap_order, build_relay_list, inbox_order, parse_relay_list, RelayList};
 pub use priv_browse::{dedup_newest, fetch_key_grants, fetch_private_listings, publish_private_listing};
