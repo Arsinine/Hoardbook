@@ -117,6 +117,13 @@ const REFUSAL_MAX_FRAME: usize = 4 * 1024;
 /// indistinguishable pair is *a malformed ticket and a wrong-request ticket* — the issued-record
 /// lookup whose absence used to be the other half of the pair is deleted with the ledger; the
 /// constant itself and the indistinguishability property stay.)
+///
+/// QURATOR-242 widened the class: every refusal a request can reach AFTER the request-binding
+/// gate — payload-resolution failure, slug mismatch, unreadable declared slug — is this same
+/// constant, so a forged-ticket prober cannot distinguish "no such collection in this node's
+/// cache" from "cached, but the binding refused" (the old mismatch text even NAMED the cached
+/// slug). The distinct reasons live in `tracing` only. This is an information-disclosure closure,
+/// not an authorization check: nothing new is consulted before serving (INV-9 / Option E).
 const REFUSAL_NO_MATCH: &str = "no approved manifest request matches this ticket";
 
 /// How long the owner's side waits for a peer to open a stream and finish its request frame.
@@ -358,7 +365,9 @@ async fn drain_refusal(conn: &iroh::endpoint::Connection) {
 /// deliberately so, giving up durable replay protection and the audit trail. What remains is
 /// parsing, the request-binding check (`validate_redemption`: shape + the ticket answers THIS
 /// request) — a correctness check, not authorization — the payload resolution, and the byte/slug
-/// binding.
+/// binding. **Every refusal past the parse is the same wire string, `REFUSAL_NO_MATCH`**
+/// (QURATOR-242): pre-resolution and post-resolution arms alike, so a refusal's wording leaks
+/// nothing about what this node holds — the distinct reason goes to `tracing` only.
 pub(crate) async fn serve_manifest_stream(
     mut send: impl tokio::io::AsyncWrite + Unpin,
     mut recv: impl tokio::io::AsyncRead + Unpin,
@@ -391,9 +400,19 @@ pub(crate) async fn serve_manifest_stream(
     let payload = match source.payload(&req.ticket) {
         Ok(p) => p,
         Err(e) => {
-            // A payload-resolution failure costs nothing: the asker can retry once the owner's
-            // side is healthy.
-            refuse(&mut send, &format!("could not produce the manifest: {e}")).await?;
+            // **QURATOR-242 — `REFUSAL_NO_MATCH`, same as the gate above.** The text used to embed
+            // `{e}`, which made "no such collection in this node's cache" distinguishable from
+            // "cached, but the slug binding refused" — a slug-existence oracle for a peer holding
+            // a shape-valid forged ticket and no authorization to ask (the payload stays
+            // ciphertext either way; this closes a metadata channel, it adds no check). The
+            // reason stays in the local log; the wire gets the one string. A payload-resolution
+            // failure still costs nothing: the asker can retry once the owner's side is healthy.
+            tracing::debug!(
+                slug = %req.ticket.slug,
+                error = %e,
+                "serve refusal: payload resolution failed"
+            );
+            refuse(&mut send, REFUSAL_NO_MATCH).await?;
             return Ok(None);
         }
     };
@@ -407,19 +426,26 @@ pub(crate) async fn serve_manifest_stream(
     match payload.declared_slug() {
         Ok(declared) if declared == req.ticket.slug => {}
         Ok(declared) => {
-            refuse(
-                &mut send,
-                &format!(
-                    "refusing to serve: the manifest describes '{declared}' but this ticket is for \
-                     '{}'",
-                    req.ticket.slug
-                ),
-            )
-            .await?;
+            // **QURATOR-242 — `REFUSAL_NO_MATCH`, same as every other refusal past the parse.**
+            // The old text NAMED the cached collection's slug ("the manifest describes
+            // '{declared}' ..."), which is a strictly stronger oracle than existence: it told a
+            // forged-ticket prober exactly what this node holds. Both slugs stay in the local
+            // log; the wire gets the one string.
+            tracing::warn!(
+                ticket_slug = %req.ticket.slug,
+                declared_slug = %declared,
+                "serve refusal: the resolved manifest's slug does not match the ticket"
+            );
+            refuse(&mut send, REFUSAL_NO_MATCH).await?;
             return Ok(None);
         }
         Err(e) => {
-            refuse(&mut send, &format!("could not read the manifest's own slug: {e}")).await?;
+            tracing::warn!(
+                ticket_slug = %req.ticket.slug,
+                error = %e,
+                "serve refusal: the resolved manifest's own slug was unreadable"
+            );
+            refuse(&mut send, REFUSAL_NO_MATCH).await?;
             return Ok(None);
         }
     }
@@ -1669,8 +1695,9 @@ pub(crate) mod tests {
     ///
     /// A source that answers with the wrong collection is the realistic bug here (a slug lookup that
     /// falls through to a default, say), and the wrong manifest is perfectly *self-consistent*, so
-    /// nothing downstream would notice. Both sides check; this exercises the owner's side, and the
-    /// refusal names both slugs so the operator can see what happened.
+    /// nothing downstream would notice. Both sides check; this exercises the owner's side. Since
+    /// QURATOR-242 the wire refusal is the uniform `REFUSAL_NO_MATCH`; the two slugs live in the
+    /// local `tracing::warn!` where the operator can see what happened.
     #[tokio::test]
     async fn a_manifest_for_the_wrong_collection_is_refused_and_costs_nothing() {
         tokio::time::timeout(TEST_TIMEOUT, async {
@@ -1685,15 +1712,13 @@ pub(crate) mod tests {
             let msg = err.to_string();
             // **Asserting the OWNER's wording, not just "some refusal".** Both sides check, so a test
             // that accepted either message would stay green with the owner's check deleted — the
-            // asker's would catch it and the test could not tell the difference. "refusing to serve"
-            // is only ever the owner's.
+            // asker's would catch it and the test could not tell the difference. Since QURATOR-242
+            // the owner's refusal is the uniform `REFUSAL_NO_MATCH`; the asker's own wrong-collection
+            // message ("refusing the peer's manifest: ...") is different text, so this still pins
+            // WHICH side refused. The two slugs are in the owner's `tracing::warn!`, not on the wire.
             assert!(
-                msg.contains("refusing to serve"),
+                msg.contains(REFUSAL_NO_MATCH),
                 "the OWNER must refuse before sending, got: {msg}"
-            );
-            assert!(
-                msg.contains("big") && msg.contains("small"),
-                "the refusal must name both the manifest's slug and the ticket's, got: {msg}"
             );
             client.close().await;
             server.close().await;
@@ -2065,11 +2090,18 @@ pub(crate) mod tests {
     /// ticket's own so this test cannot accidentally be satisfied by the binding arm above — it is
     /// isolated to the shape check.
     ///
-    /// MUTATION (P-10, orchestrator applies and must see this red): in `validate_redemption`
-    /// (crates/hb-core/src/ticket.rs), delete the leading `ticket.verify_shape()?;` line — the
-    /// blank slug then sails past authorization into `source.payload`/the slug-binding check below
-    /// it in `serve_manifest_stream`, which refuses for a DIFFERENT reason (the declared slug not
-    /// matching a blank ticket slug), so this test's `REFUSAL_NO_MATCH` equality assertion reds.
+    /// MUTATION (P-10, orchestrator applies and must see this red): at the `validate_redemption`
+    /// call site in `serve_manifest_stream`, give this arm a bespoke refusal string — replace the
+    /// `refuse(&mut send, REFUSAL_NO_MATCH)` inside the `if validate_redemption(...).is_err()` arm
+    /// with e.g. `refuse(&mut send, "malformed or mismatched ticket")` — and this test's
+    /// `REFUSAL_NO_MATCH` equality assertion reds.
+    ///
+    /// ⚠ The PREVIOUS mutation for this test (delete the leading `ticket.verify_shape()?;` line in
+    /// hb-core's `validate_redemption`) NO LONGER reds it since QURATOR-242: the blank slug then
+    /// falls through to the slug-binding check, which now refuses with the SAME constant, so the
+    /// wire bytes stay green with the shape gate deleted. The shape gate itself is pinned where it
+    /// lives, in hb-core's `malformed_and_unknown_version_tickets_are_refused`; this test remains
+    /// wire-text coverage for the arm, not the shape gate's mutation proof.
     #[tokio::test]
     async fn a_structurally_malformed_ticket_is_refused_the_same_way() {
         let ep = bind_local_endpoint(&rand::random(), vec![]).await;
@@ -2146,6 +2178,93 @@ pub(crate) mod tests {
         assert_eq!(
             response_a, response_b,
             "a malformed ticket and a wrong-request ticket must be indistinguishable on the wire"
+        );
+
+        ep.close().await;
+    }
+
+    /// **QURATOR-242 — the anti-probing invariant, post-resolution half: a payload-resolution
+    /// failure and a slug-binding failure are byte-identical on the wire.**
+    ///
+    /// Before QURATOR-242 the two post-resolution arms answered with bespoke text — the resolution
+    /// arm embedded the lookup error, the slug-mismatch arm NAMED the cached collection's slug —
+    /// so a peer holding a shape-valid forged ticket could distinguish "no such collection in
+    /// this node's cache" from "cached, but the binding refused", and in the latter case learned
+    /// the cached slug itself. An existence/metadata oracle, not a plaintext leak: the payload
+    /// stays ciphertext either way. Both arms now refuse with `REFUSAL_NO_MATCH` — the same
+    /// constant the pre-resolution gate above uses — and the distinct reason lives in the local
+    /// `tracing` log only.
+    ///
+    /// Both conditions are driven GENUINELY and independently, through different arms:
+    /// - arm A: the ticket is shape-valid and answers the request it is presented under (it was
+    ///   issued for that very request), so `validate_redemption` passes — but it names a request
+    ///   the source cannot resolve, so `source.payload` errs. The stand-in for "not cached
+    ///   here": production resolves by the ticket's `(author_npub,) slug` and misses the same
+    ///   way;
+    /// - arm B: the source resolves the ticket's own request successfully, but is rigged
+    ///   (`serve_instead`) to answer with a manifest describing a different slug, so resolution
+    ///   SUCCEEDS and the byte/slug binding refuses.
+    ///
+    /// MUTATION (P-10, orchestrator applies and must see this red): restore a distinct string on
+    /// ONE arm only. In `serve_manifest_stream`, in the `Ok(declared) =>` arm of the
+    /// `payload.declared_slug()` match (the slug-mismatch arm — the one whose `tracing::warn!`
+    /// names the field `declared_slug`), replace its `refuse(&mut send, REFUSAL_NO_MATCH)` with
+    /// the old bespoke `refuse(&mut send, &format!("refusing to serve: {declared}")).await?;`.
+    /// Resolve the line by that arm's position, not by text: this comment quotes the old string,
+    /// so a text anchor is non-unique. The byte comparison below reds — arm A's response and arm
+    /// B's response differ again, exactly the oracle the ticket describes.
+    #[tokio::test]
+    async fn post_resolution_refusals_are_byte_identical_on_the_wire() {
+        let ep = bind_local_endpoint(&rand::random(), vec![]).await;
+
+        // Arm A — payload resolution FAILS. The source knows request "req-242-a"; the ticket was
+        // minted for "req-242-b" and is presented under its own request id, so it clears
+        // `validate_redemption` and dies inside `source.payload`.
+        let known =
+            issue_ticket(&ep, "req-242-a", "small", 1_700_000_000, Some("nonce-a")).unwrap();
+        let unheld =
+            issue_ticket(&ep, "req-242-b", "small", 1_700_000_000, Some("nonce-b")).unwrap();
+        let source = TestSource::new(known.clone(), real_payload_for("small", 3));
+        let req_a = FetchRequest { request_id: unheld.request_id.clone(), ticket: unheld };
+        let mut frame_a = Vec::new();
+        write_framed(&mut frame_a, &serde_json::to_vec(&req_a).unwrap()).await.unwrap();
+        let mut response_a = Vec::new();
+        let served_a =
+            serve_manifest_stream(&mut response_a, std::io::Cursor::new(frame_a), source.as_ref())
+                .await
+                .expect("a refusal is Ok(None), not an error");
+        assert!(served_a.is_none(), "a ticket the source cannot resolve must not be served");
+
+        // Arm B — payload resolution SUCCEEDS, the slug binding refuses. Same source, its OWN
+        // request, rigged to answer with a manifest that describes another collection.
+        *source.serve_instead.lock().unwrap() = Some(real_payload_for("big", 3));
+        let req_b = FetchRequest { request_id: known.request_id.clone(), ticket: known.clone() };
+        let mut frame_b = Vec::new();
+        write_framed(&mut frame_b, &serde_json::to_vec(&req_b).unwrap()).await.unwrap();
+        let mut response_b = Vec::new();
+        let served_b =
+            serve_manifest_stream(&mut response_b, std::io::Cursor::new(frame_b), source.as_ref())
+                .await
+                .expect("a refusal is Ok(None), not an error");
+        assert!(served_b.is_none(), "a manifest for another collection must not be served");
+
+        // The oracle closure: full response bytes — status byte, length prefix, and message —
+        // must be identical across the two conditions.
+        assert_eq!(
+            response_a, response_b,
+            "a resolution failure and a slug-binding failure must be indistinguishable on the wire"
+        );
+        let mut reader = std::io::Cursor::new(response_a);
+        assert_eq!(
+            reader.read_u8().await.unwrap(),
+            STATUS_REFUSED,
+            "both post-resolution refusals carry the refused status byte"
+        );
+        let reason = read_framed(&mut reader, REFUSAL_MAX_FRAME).await.unwrap();
+        assert_eq!(
+            reason,
+            REFUSAL_NO_MATCH.as_bytes(),
+            "both post-resolution refusals use the shared constant, not a bespoke message"
         );
 
         ep.close().await;

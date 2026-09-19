@@ -80,8 +80,12 @@ mod tests {
                     .await
                     .expect_err("a ticket bound to a different request must be refused");
                 let msg = err.to_string().to_lowercase();
+                // QURATOR-242 collapsed every POST-resolution refusal to `REFUSAL_NO_MATCH` so a
+                // prober cannot tell "not cached here" from "cached, wrong slug" by the wire text.
+                // This test is unaffected in intent — it pins the DRAIN, that a refusal survives an
+                // immediate close — so it now matches the uniform string the payload arm emits.
                 assert!(
-                    msg.contains("could not produce the manifest"),
+                    msg.contains("no approved manifest request matches this ticket"),
                     "round {round}: the refusal must arrive intact, got: {msg}"
                 );
             }
