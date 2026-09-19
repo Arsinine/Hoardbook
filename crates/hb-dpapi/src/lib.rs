@@ -32,6 +32,32 @@ pub fn decrypt(_data: &[u8]) -> Result<Vec<u8>> {
 // Windows implementation
 // ---------------------------------------------------------------------------
 
+/// Restrict `path` to an owner-only DACL (QURATOR-234).
+///
+/// `hb-app` carries `#![forbid(unsafe_code)]`, which is why this crate exists: it is the one place
+/// Windows FFI lives. The plaintext identity export (nsec + browse-key) must not inherit its parent
+/// directory's typically-broad ACL, and there are no Unix mode bits to fall back on.
+///
+/// **Call this on an EMPTY file, before the secret bytes are written** — the same ordering the Unix
+/// arm gets from `.mode(0o600)`-on-open. Applying it after writing leaves a window in which the
+/// plaintext key sits on disk world-readable, which is the exposure this exists to close.
+///
+/// **What it protects against:** another local, non-elevated account reading the export via the
+/// filesystem — the DACL grants access to the owner alone.
+/// **What it does NOT:** an administrator or SYSTEM (which can take ownership), physical/full-disk
+/// access, malware running as the same user, or backup/shadow-copy paths that read beneath the ACL
+/// layer. It is not a substitute for encrypting the export.
+#[cfg(target_os = "windows")]
+pub fn restrict_to_owner(path: &str) -> Result<()> {
+    win::restrict_to_owner(path)
+}
+
+/// Non-Windows: there is nothing to do — callers use Unix mode bits instead.
+#[cfg(not(target_os = "windows"))]
+pub fn restrict_to_owner(_path: &str) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(target_os = "windows")]
 mod win {
     use anyhow::{anyhow, Result};
@@ -173,4 +199,76 @@ mod tests {
             "decrypting non-DPAPI garbage must return Err, not panic"
         );
     }
+
+    /// Owner-only, protected DACL via `SetNamedSecurityInfoW`. "D:" opens a DACL, "P" marks it
+    /// protected (so inherited ACEs cannot re-add broader access), and the single ACE grants Full
+    /// Access to the owner ("OW" = Owner Rights, S-1-3-4).
+    pub fn restrict_to_owner(path: &str) -> Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+            SDDL_REVISION_1, SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::{
+            GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        };
+        use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+
+        const OWNER_ONLY_SDDL: &str = "D:P(A;;FA;;;OW)\0";
+        let sddl_wide: Vec<u16> = OWNER_ONLY_SDDL.encode_utf16().collect();
+        let path_wide: Vec<u16> = {
+            let mut v: Vec<u16> = std::ffi::OsStr::new(path).encode_wide().collect();
+            v.push(0);
+            v
+        };
+
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let mut sd_size: u32 = 0;
+        // SAFETY: `sddl_wide` is a NUL-terminated UTF-16 string alive for the call; `sd`/`sd_size`
+        // are out-params written only on a nonzero return.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl_wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                &mut sd_size,
+            )
+        };
+        if ok == 0 {
+            return Err(anyhow!("building the owner-only security descriptor failed"));
+        }
+
+        let mut dacl_present = 0;
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut dacl_defaulted = 0;
+        // SAFETY: `sd` was just produced above and is freed via `LocalFree` on every path out.
+        let got = unsafe {
+            GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut dacl, &mut dacl_defaulted)
+        };
+        if got == 0 {
+            unsafe { LocalFree(sd as HLOCAL) };
+            return Err(anyhow!("reading the DACL out of the security descriptor failed"));
+        }
+
+        // SAFETY: `path_wide` is NUL-terminated and outlives the call; `dacl` points into `sd`,
+        // still alive here. Null owner/group/sacl leave those unchanged.
+        let set = unsafe {
+            SetNamedSecurityInfoW(
+                path_wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl as *const ACL,
+                std::ptr::null(),
+            )
+        };
+        unsafe { LocalFree(sd as HLOCAL) };
+        if set != ERROR_SUCCESS {
+            return Err(anyhow!("applying the owner-only DACL failed (win32 error {set})"));
+        }
+        Ok(())
+    }
 }
+

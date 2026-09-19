@@ -218,97 +218,25 @@ fn write_backup_file(path: &str, archive: &[u8]) -> std::io::Result<()> {
 // restriction does and does not protect against — it applies equally to this arm.
 #[cfg(windows)]
 fn write_backup_file(path: &str, archive: &[u8]) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{
-        SE_FILE_OBJECT, SetNamedSecurityInfoW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SDDL_REVISION_1,
-    };
-    use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    };
-
     // ORDER IS LOAD-BEARING, and it is the whole point of the Unix arm's `.mode(0o600)`-on-open:
     // the restriction must be in place BEFORE the secret bytes land, never after. Writing first and
     // re-ACLing second leaves a window in which the plaintext nsec sits on disk under the parent
-    // directory's inherited (typically broad) ACL — precisely the exposure QURATOR-234 is about,
-    // merely narrowed to a race. So: create the file EMPTY, lock it down, then write into it.
+    // directory's inherited (typically broad) ACL — the exposure QURATOR-234 is about, merely
+    // narrowed to a race. So: create the file EMPTY, lock it down, then write into it.
     //
     // `create(true).truncate(true)` also handles the overwrite case — a pre-existing, more
     // permissive file is truncated to empty and re-ACL'd before any secret byte is written, so a
     // reused NTFS file object cannot retain its old DACL while holding new secret content.
+    //
+    // The Win32 calls live in `hb-dpapi` because this crate is `#![forbid(unsafe_code)]` — that
+    // crate exists precisely to be the one place platform FFI is allowed. See
+    // `hb_dpapi::restrict_to_owner` for what the DACL does and does not protect against.
     {
         use std::fs::OpenOptions;
         OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
     }
-
-    // Owner-only, protected (non-inheriting) DACL. "D:" starts a DACL, "P" marks it protected
-    // (blocks inherited ACEs from re-adding broader access), and the single ACE grants Full
-    // Access ("FA") to the file's OWNER.
-    //
-    // ⚠ The SID is "OW" = Owner Rights (S-1-3-4), NOT "CO"/Creator Owner: on a file object "OW"
-    // resolves to the current owner, which is what we want. If a Windows build shows the export
-    // still readable by others, this SDDL string is the first thing to re-check — an ACE that
-    // resolves to nothing would yield an empty DACL, which denies everyone (fail-closed, and
-    // therefore loud) rather than silently granting access.
-    const OWNER_ONLY_SDDL: &str = "D:P(A;;FA;;;OW)\0";
-    let sddl_wide: Vec<u16> = OWNER_ONLY_SDDL.encode_utf16().collect();
-
-    let path_wide: Vec<u16> = {
-        let mut v: Vec<u16> = std::ffi::OsStr::new(path).encode_wide().collect();
-        v.push(0);
-        v
-    };
-
-    // SAFETY: `sddl_wide` is a valid NUL-terminated UTF-16 string for the lifetime of this call.
-    // `sd` and `sd_size` are out-params written only on success (nonzero return).
-    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    let mut sd_size: u32 = 0;
-    let ok = unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl_wide.as_ptr(),
-            SDDL_REVISION_1 as u32,
-            &mut sd,
-            &mut sd_size,
-        )
-    };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    // SAFETY: `sd` was just produced by the call above and is freed via `LocalFree` below on
-    // every path out of this block.
-    let mut dacl_present = 0;
-    let mut dacl: *mut ACL = std::ptr::null_mut();
-    let mut dacl_defaulted = 0;
-    let got_dacl = unsafe { GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut dacl, &mut dacl_defaulted) };
-    if got_dacl == 0 {
-        let err = std::io::Error::last_os_error();
-        unsafe { LocalFree(sd as _) };
-        return Err(err);
-    }
-
-    // SAFETY: `path_wide` is NUL-terminated and outlives this call; `dacl` points into `sd`,
-    // which is still alive here. Passing null for owner/group/sacl leaves them unchanged.
-    let set_result = unsafe {
-        SetNamedSecurityInfoW(
-            path_wide.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            dacl as *const ACL,
-            std::ptr::null_mut(),
-        )
-    };
-
-    unsafe { LocalFree(sd as _) };
-
-    if set_result != ERROR_SUCCESS {
-        return Err(std::io::Error::from_raw_os_error(set_result as i32));
-    }
-
+    hb_dpapi::restrict_to_owner(path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
     // Only now, with the owner-only DACL in place on an empty file, do the secret bytes land.
     std::fs::write(path, archive)
 }

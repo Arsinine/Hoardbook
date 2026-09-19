@@ -104,17 +104,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 hb-dpapi = { path = "../hb-dpapi" }
-# QURATOR-234: the plaintext identity export needs an owner-only NTFS DACL applied before the
-# secret bytes land (`write_backup_file`'s `#[cfg(windows)]` arm in commands/identity.rs).
-# `Win32_Security_Authorization` carries SetNamedSecurityInfoW / the SDDL converter / SE_FILE_OBJECT;
-# `Win32_Security` carries GetSecurityDescriptorDacl, ACL, PSECURITY_DESCRIPTOR and the
-# DACL_/PROTECTED_DACL_ information flags; `Win32_Foundation` carries LocalFree and ERROR_SUCCESS.
-# Same major version as hb-dpapi's own windows-sys dep, so the two share one build.
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-] }
 
 # Single-instance enforcement (M8) — desktop-only; the plugin (and the concern) does not exist on
 # mobile, so gate the dependency itself off the mobile targets, not just its usage.

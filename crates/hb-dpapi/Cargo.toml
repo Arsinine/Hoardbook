@@ -7,7 +7,12 @@ edition = "2021"
 anyhow = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# QURATOR-234 adds the ACL surface alongside DPAPI: `Win32_Security_Authorization` carries
+# SetNamedSecurityInfoW / the SDDL converter / SE_FILE_OBJECT, and `Win32_Security` carries
+# GetSecurityDescriptorDacl, ACL and the DACL_/PROTECTED_DACL_ information flags.
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
 ] }
