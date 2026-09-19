@@ -133,72 +133,6 @@ mod win {
         unsafe { LocalFree(dst.pb as HLOCAL) };
         Ok(out)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(all(test, target_os = "windows"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dpapi_encrypt_decrypt_roundtrip() {
-        let plaintext = b"hb1_test_private_key_hex_here_1234567890abcdef";
-        let ciphertext = encrypt(plaintext).unwrap();
-        assert_ne!(ciphertext, plaintext, "ciphertext must differ from plaintext");
-        let recovered = decrypt(&ciphertext).unwrap();
-        assert_eq!(recovered, plaintext);
-    }
-
-    #[test]
-    fn dpapi_tampered_ciphertext_fails() {
-        let plaintext = b"secret";
-        let mut ciphertext = encrypt(plaintext).unwrap();
-        // Flip a byte in the middle.
-        let mid = ciphertext.len() / 2;
-        ciphertext[mid] ^= 0xff;
-        assert!(decrypt(&ciphertext).is_err(), "tampered ciphertext must not decrypt");
-    }
-
-    // HANDOVER scenario 1: the `0x8` (CRED_SYNC) flag returned TRUE without
-    // encrypting and left pDataOut null, so `encrypt` produced an EMPTY blob.
-    // The roundtrip test above could not catch that on its own (empty != plaintext
-    // still holds), so assert the ciphertext is actually present.
-    #[test]
-    fn dpapi_ciphertext_is_nonempty_and_differs() {
-        let plaintext = b"hb1_test_private_key_hex_here_1234567890abcdef";
-        let ciphertext = encrypt(plaintext).unwrap();
-        assert!(
-            !ciphertext.is_empty(),
-            "DPAPI ciphertext must be non-empty (CRED_SYNC 0x8 returned an empty blob)"
-        );
-        assert_ne!(
-            ciphertext.as_slice(),
-            plaintext.as_slice(),
-            "ciphertext must differ from plaintext"
-        );
-    }
-
-    // HANDOVER scenario 1: a 0-byte keypair.bin (the symptom on disk) must fail
-    // cleanly, never panic. decrypt(&[]) exercises the empty-input path.
-    #[test]
-    fn dpapi_decrypt_rejects_empty_blob() {
-        assert!(
-            decrypt(&[]).is_err(),
-            "decrypting an empty blob must return Err, not panic or succeed"
-        );
-    }
-
-    // HANDOVER scenario 1: arbitrary non-DPAPI bytes must be rejected, never UB.
-    #[test]
-    fn dpapi_decrypt_rejects_garbage() {
-        assert!(
-            decrypt(b"\x00\x01\x02").is_err(),
-            "decrypting non-DPAPI garbage must return Err, not panic"
-        );
-    }
 
     /// Owner-only, protected DACL via `SetNamedSecurityInfoW`. "D:" opens a DACL, "P" marks it
     /// protected (so inherited ACEs cannot re-add broader access), and the single ACE grants Full
@@ -270,5 +204,72 @@ mod tests {
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dpapi_encrypt_decrypt_roundtrip() {
+        let plaintext = b"hb1_test_private_key_hex_here_1234567890abcdef";
+        let ciphertext = encrypt(plaintext).unwrap();
+        assert_ne!(ciphertext, plaintext, "ciphertext must differ from plaintext");
+        let recovered = decrypt(&ciphertext).unwrap();
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn dpapi_tampered_ciphertext_fails() {
+        let plaintext = b"secret";
+        let mut ciphertext = encrypt(plaintext).unwrap();
+        // Flip a byte in the middle.
+        let mid = ciphertext.len() / 2;
+        ciphertext[mid] ^= 0xff;
+        assert!(decrypt(&ciphertext).is_err(), "tampered ciphertext must not decrypt");
+    }
+
+    // HANDOVER scenario 1: the `0x8` (CRED_SYNC) flag returned TRUE without
+    // encrypting and left pDataOut null, so `encrypt` produced an EMPTY blob.
+    // The roundtrip test above could not catch that on its own (empty != plaintext
+    // still holds), so assert the ciphertext is actually present.
+    #[test]
+    fn dpapi_ciphertext_is_nonempty_and_differs() {
+        let plaintext = b"hb1_test_private_key_hex_here_1234567890abcdef";
+        let ciphertext = encrypt(plaintext).unwrap();
+        assert!(
+            !ciphertext.is_empty(),
+            "DPAPI ciphertext must be non-empty (CRED_SYNC 0x8 returned an empty blob)"
+        );
+        assert_ne!(
+            ciphertext.as_slice(),
+            plaintext.as_slice(),
+            "ciphertext must differ from plaintext"
+        );
+    }
+
+    // HANDOVER scenario 1: a 0-byte keypair.bin (the symptom on disk) must fail
+    // cleanly, never panic. decrypt(&[]) exercises the empty-input path.
+    #[test]
+    fn dpapi_decrypt_rejects_empty_blob() {
+        assert!(
+            decrypt(&[]).is_err(),
+            "decrypting an empty blob must return Err, not panic or succeed"
+        );
+    }
+
+    // HANDOVER scenario 1: arbitrary non-DPAPI bytes must be rejected, never UB.
+    #[test]
+    fn dpapi_decrypt_rejects_garbage() {
+        assert!(
+            decrypt(b"\x00\x01\x02").is_err(),
+            "decrypting non-DPAPI garbage must return Err, not panic"
+        );
+    }
+
 }
 
