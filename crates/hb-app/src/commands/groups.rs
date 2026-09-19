@@ -17,14 +17,16 @@ pub async fn groups_create(
     color: Option<String>,
     store: State<'_, DataStore>,
 ) -> CmdResult<Group> {
-    let mut groups = store.load_groups().map_err(cmd_err)?;
-    if groups.iter().any(|g| g.name == name) {
-        return Err(format!("Group '{name}' already exists"));
-    }
-    let group = Group { name, pubkeys: vec![], modified_at: Utc::now(), color };
-    groups.push(group.clone());
-    store.save_groups(&groups).map_err(cmd_err)?;
-    Ok(group)
+    store
+        .mutate_groups(|groups| {
+            if groups.iter().any(|g| g.name == name) {
+                return Err(format!("Group '{name}' already exists"));
+            }
+            let group = Group { name, pubkeys: vec![], modified_at: Utc::now(), color };
+            groups.push(group.clone());
+            Ok(group)
+        })
+        .map_err(cmd_err)
 }
 
 /// Create a group pre-populated with members in a single `save_groups` write (M22 W1).
@@ -39,19 +41,21 @@ pub async fn groups_create_with_members(
     color: Option<String>,
     store: State<'_, DataStore>,
 ) -> CmdResult<Group> {
-    let mut groups = store.load_groups().map_err(cmd_err)?;
-    if groups.iter().any(|g| g.name == name) {
-        return Err(format!("Group '{name}' already exists"));
-    }
-    let mut seen = std::collections::HashSet::new();
-    let pubkeys: Vec<String> = npubs
-        .into_iter()
-        .filter(|n| seen.insert(n.clone()))
-        .collect();
-    let group = Group { name, pubkeys, modified_at: Utc::now(), color };
-    groups.push(group.clone());
-    store.save_groups(&groups).map_err(cmd_err)?;
-    Ok(group)
+    store
+        .mutate_groups(|groups| {
+            if groups.iter().any(|g| g.name == name) {
+                return Err(format!("Group '{name}' already exists"));
+            }
+            let mut seen = std::collections::HashSet::new();
+            let pubkeys: Vec<String> = npubs
+                .into_iter()
+                .filter(|n| seen.insert(n.clone()))
+                .collect();
+            let group = Group { name, pubkeys, modified_at: Utc::now(), color };
+            groups.push(group.clone());
+            Ok(group)
+        })
+        .map_err(cmd_err)
 }
 
 #[tauri::command]
@@ -60,21 +64,27 @@ pub async fn groups_rename(
     new_name: String,
     store: State<'_, DataStore>,
 ) -> CmdResult<()> {
-    let mut groups = store.load_groups().map_err(cmd_err)?;
-    let group = groups
-        .iter_mut()
-        .find(|g| g.name == old_name)
-        .ok_or_else(|| format!("Group '{old_name}' not found"))?;
-    group.name = new_name;
-    group.modified_at = Utc::now();
-    store.save_groups(&groups).map_err(cmd_err)
+    store
+        .mutate_groups(|groups| {
+            let group = groups
+                .iter_mut()
+                .find(|g| g.name == old_name)
+                .ok_or_else(|| format!("Group '{old_name}' not found"))?;
+            group.name = new_name;
+            group.modified_at = Utc::now();
+            Ok(())
+        })
+        .map_err(cmd_err)
 }
 
 #[tauri::command]
 pub async fn groups_delete(name: String, store: State<'_, DataStore>) -> CmdResult<()> {
-    let mut groups = store.load_groups().map_err(cmd_err)?;
-    groups.retain(|g| g.name != name);
-    store.save_groups(&groups).map_err(cmd_err)
+    store
+        .mutate_groups(|groups| {
+            groups.retain(|g| g.name != name);
+            Ok(())
+        })
+        .map_err(cmd_err)
 }
 
 #[tauri::command]
@@ -83,16 +93,19 @@ pub async fn groups_assign(
     group_name: String,
     store: State<'_, DataStore>,
 ) -> CmdResult<()> {
-    let mut groups = store.load_groups().map_err(cmd_err)?;
-    let group = groups
-        .iter_mut()
-        .find(|g| g.name == group_name)
-        .ok_or_else(|| format!("Group '{group_name}' not found"))?;
-    if !group.pubkeys.contains(&npub) {
-        group.pubkeys.push(npub);
-        group.modified_at = Utc::now();
-    }
-    store.save_groups(&groups).map_err(cmd_err)
+    store
+        .mutate_groups(|groups| {
+            let group = groups
+                .iter_mut()
+                .find(|g| g.name == group_name)
+                .ok_or_else(|| format!("Group '{group_name}' not found"))?;
+            if !group.pubkeys.contains(&npub) {
+                group.pubkeys.push(npub);
+                group.modified_at = Utc::now();
+            }
+            Ok(())
+        })
+        .map_err(cmd_err)
 }
 
 #[tauri::command]
@@ -101,17 +114,20 @@ pub async fn groups_unassign(
     group_name: String,
     store: State<'_, DataStore>,
 ) -> CmdResult<()> {
-    let mut groups = store.load_groups().map_err(cmd_err)?;
-    let group = groups
-        .iter_mut()
-        .find(|g| g.name == group_name)
-        .ok_or_else(|| format!("Group '{group_name}' not found"))?;
-    let before = group.pubkeys.len();
-    group.pubkeys.retain(|id| id != &npub);
-    if group.pubkeys.len() != before {
-        group.modified_at = Utc::now();
-    }
-    store.save_groups(&groups).map_err(cmd_err)
+    store
+        .mutate_groups(|groups| {
+            let group = groups
+                .iter_mut()
+                .find(|g| g.name == group_name)
+                .ok_or_else(|| format!("Group '{group_name}' not found"))?;
+            let before = group.pubkeys.len();
+            group.pubkeys.retain(|id| id != &npub);
+            if group.pubkeys.len() != before {
+                group.modified_at = Utc::now();
+            }
+            Ok(())
+        })
+        .map_err(cmd_err)
 }
 
 /// List the npubs in the Private-collection audience (M21 W5). Each listed npub receives a
@@ -125,21 +141,15 @@ pub async fn private_audience_list(store: State<'_, DataStore>) -> CmdResult<Vec
 /// Add or remove a single npub from the Private-collection audience (M21 W5). Idempotent in both
 /// directions. Removing a recipient revokes them on the *next* republish only — it cannot recall
 /// an already-fetched copy (the honest "not DRM" caveat, surfaced in the UI). Local-only.
+/// QURATOR-252: the whole load→mutate→save runs under `PRIVATE_AUDIENCE_LOCK` inside the store
+/// method, so a revocation racing a concurrent enrolment can no longer be clobbered.
 #[tauri::command]
 pub async fn private_audience_set(
     npub: String,
     receives: bool,
     store: State<'_, DataStore>,
 ) -> CmdResult<()> {
-    let mut audience = store.load_private_audience().map_err(cmd_err)?;
-    if receives {
-        if !audience.contains(&npub) {
-            audience.push(npub);
-        }
-    } else {
-        audience.retain(|n| n != &npub);
-    }
-    store.save_private_audience(&audience).map_err(cmd_err)
+    store.set_private_audience_member(&npub, receives).map_err(cmd_err)
 }
 
 /// Atomically replace a contact's group memberships with a new set.
@@ -151,23 +161,26 @@ pub async fn contact_update_groups(
     group_names: Vec<String>,
     store: State<'_, DataStore>,
 ) -> CmdResult<()> {
-    let mut groups = store.load_groups().map_err(cmd_err)?;
-    let now = Utc::now();
+    store
+        .mutate_groups(|groups| {
+            let now = Utc::now();
 
-    for group in &mut groups {
-        let was_member = group.pubkeys.contains(&npub);
-        let should_be_member = group_names.contains(&group.name);
+            for group in groups.iter_mut() {
+                let was_member = group.pubkeys.contains(&npub);
+                let should_be_member = group_names.contains(&group.name);
 
-        if was_member && !should_be_member {
-            group.pubkeys.retain(|id| id != &npub);
-            group.modified_at = now;
-        } else if !was_member && should_be_member {
-            group.pubkeys.push(npub.clone());
-            group.modified_at = now;
-        }
-    }
+                if was_member && !should_be_member {
+                    group.pubkeys.retain(|id| id != &npub);
+                    group.modified_at = now;
+                } else if !was_member && should_be_member {
+                    group.pubkeys.push(npub.clone());
+                    group.modified_at = now;
+                }
+            }
 
-    store.save_groups(&groups).map_err(cmd_err)
+            Ok(())
+        })
+        .map_err(cmd_err)
 }
 
 // ---------------------------------------------------------------------------
@@ -469,6 +482,102 @@ mod tests {
         assert!(audience.is_empty(), "the audience file is independent of groups");
     }
 
+    // ── QURATOR-252 — serialised audience/groups write races ────────────────────────────────
+    //
+    // The store now runs each whole load→mutate→save under a module-scope lock
+    // (`PRIVATE_AUDIENCE_LOCK` / `GROUPS_LOCK`, store.rs), so two concurrent mutations of the
+    // same file serialize instead of clobbering. These tests race two real OS threads against
+    // ONE DataStore and assert BOTH effects land. Honest limit, stated plainly: a single round
+    // is a scheduling coin-flip, so 200 rounds make an unlocked regression near-certain to
+    // interleave — they are best-effort *detectors*, not proofs. The deterministic proof that
+    // the mutation path takes the lock is
+    // `set_private_audience_member_blocks_while_the_lock_is_held` in store.rs's test module.
+
+    /// The ticket's named impact: a revocation racing a concurrent enrolment. Every round must
+    /// end with BOTH effects on disk — `npub_rev` gone AND `npub_add` present, exactly
+    /// `[npub_add]`. Before the fix, both threads ran their own unlocked load→mutate→save and
+    /// whichever saved second erased the other's change entirely.
+    /// P-10 (probabilistic half): in store.rs `set_private_audience_member` (guard at the
+    /// production line `let _guard = PRIVATE_AUDIENCE_LOCK.lock()...`, store.rs:1020 at the time
+    /// of writing), delete that guard line — at least one of the 200 rounds must observe a
+    /// clobbered audience. The deterministic red for the same mutation is the store.rs
+    /// mechanism pin named above.
+    #[test]
+    fn private_audience_revocation_survives_a_concurrent_enrolment() {
+        let (_dir, store) = make_store();
+        for round in 0..200 {
+            store.save_private_audience(&["npub_rev".into()]).unwrap();
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|s| {
+                let a = s.spawn(|| {
+                    barrier.wait();
+                    store.set_private_audience_member("npub_add", true).unwrap();
+                });
+                let b = s.spawn(|| {
+                    barrier.wait();
+                    store.set_private_audience_member("npub_rev", false).unwrap();
+                });
+                a.join().unwrap();
+                b.join().unwrap();
+            });
+            assert_eq!(
+                store.load_private_audience().unwrap(),
+                vec!["npub_add".to_string()],
+                "round {round}: both the enrolment and the revocation must survive the race"
+            );
+        }
+    }
+
+    /// The groups.json half of the ticket: two concurrent group creates must BOTH land. Before
+    /// the lock, whichever `save_groups` ran second erased the other's freshly created group.
+    /// P-10 (probabilistic half): in store.rs `mutate_groups` (guard at the production line
+    /// `let _guard = GROUPS_LOCK.lock()...`, store.rs:1006 at the time of writing), delete that
+    /// guard line — at least one of the 200 rounds must lose a group.
+    #[test]
+    fn concurrent_group_creates_both_land() {
+        let (_dir, store) = make_store();
+        for round in 0..200 {
+            store.save_groups(&[]).unwrap();
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|s| {
+                let a = s.spawn(|| {
+                    barrier.wait();
+                    create_group(&store, "A").unwrap();
+                });
+                let b = s.spawn(|| {
+                    barrier.wait();
+                    create_group(&store, "B").unwrap();
+                });
+                a.join().unwrap();
+                b.join().unwrap();
+            });
+            let names: Vec<String> =
+                store.load_groups().unwrap().into_iter().map(|g| g.name).collect();
+            assert!(
+                names.contains(&"A".to_string()) && names.contains(&"B".to_string()),
+                "round {round}: both concurrent creates must survive, got {names:?}"
+            );
+        }
+    }
+
+    /// The exact create mutation `groups_create` performs, via the store's locked RMW — shared
+    /// by the race test above so it exercises the same path the command walks.
+    fn create_group(store: &DataStore, name: &str) -> Result<Group, String> {
+        store.mutate_groups(|groups| {
+            if groups.iter().any(|g| g.name == name) {
+                return Err(format!("Group '{name}' already exists"));
+            }
+            let group = Group {
+                name: name.into(),
+                pubkeys: vec![],
+                modified_at: chrono::Utc::now(),
+                color: None,
+            };
+            groups.push(group.clone());
+            Ok(group)
+        })
+    }
+
     // ── M22 W1: `groups_create_with_members` ───────────────────────────────────
     //
     // Tauri's `State<'_, DataStore>` cannot be built in a plain unit test, so — like the
@@ -478,26 +587,28 @@ mod tests {
     // save → error-text path the real command walks.
 
     /// Mirror of the `groups_create_with_members` command body, minus the `State` wrapper, so the
-    /// mutation under test is identical to what the `#[tauri::command]` runs in production.
+    /// mutation under test is identical to what the `#[tauri::command]` runs in production (both
+    /// now route through the store's locked `mutate_groups` RMW, QURATOR-252).
     fn create_with_members(
         store: &DataStore,
         name: &str,
         npubs: Vec<String>,
         color: Option<String>,
     ) -> Result<Group, String> {
-        let mut groups = store.load_groups().map_err(|e| e.to_string())?;
-        if groups.iter().any(|g| g.name == name) {
-            return Err(format!("Group '{name}' already exists"));
-        }
-        let mut seen = std::collections::HashSet::new();
-        let pubkeys: Vec<String> = npubs
-            .into_iter()
-            .filter(|n| seen.insert(n.clone()))
-            .collect();
-        let group = Group { name: name.into(), pubkeys, modified_at: chrono::Utc::now(), color };
-        groups.push(group.clone());
-        store.save_groups(&groups).map_err(|e| e.to_string())?;
-        Ok(group)
+        store.mutate_groups(|groups| {
+            if groups.iter().any(|g| g.name == name) {
+                return Err(format!("Group '{name}' already exists"));
+            }
+            let mut seen = std::collections::HashSet::new();
+            let pubkeys: Vec<String> = npubs
+                .into_iter()
+                .filter(|n| seen.insert(n.clone()))
+                .collect();
+            let group =
+                Group { name: name.into(), pubkeys, modified_at: chrono::Utc::now(), color };
+            groups.push(group.clone());
+            Ok(group)
+        })
     }
 
     /// Criterion 1: the group and its members land together in exactly ONE `save_groups` write.
@@ -925,8 +1036,9 @@ mod tests {
             );
         }
 
-        /// P-10: in `private_audience_set`, change `if receives {` to `if !receives {` — enrol
-        /// becomes revoke, so the first equality assert must go red.
+        /// P-10: in store.rs `set_private_audience_member` (the command's body since QURATOR-252),
+        /// change `if receives {` to `if !receives {` (store.rs:1022 at the time of writing) —
+        /// enrol becomes revoke, so the first equality assert must go red.
         #[test]
         fn private_audience_set_command_enrols_and_revokes_idempotently() {
             let app = dispatch_app();

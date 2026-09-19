@@ -936,6 +936,28 @@ pub struct Group {
     pub color: Option<String>,
 }
 
+/// Serializes every load-modify-save of `groups.json` (QURATOR-252).
+///
+/// **One shared static, not one per function** — the M19 W9 lesson [`MANIFEST_ASKS_LOCK`]
+/// documents. Eight production call sites mutate this file (`groups_create`,
+/// `groups_create_with_members`, `groups_rename`, `groups_delete`, `groups_assign`,
+/// `groups_unassign`, `contact_update_groups`, and browse.rs's follow-into-group helper), so a
+/// function-local static would mint one lock per function and the race would survive. Every
+/// mutator must route through [`DataStore::mutate_groups`], which holds this lock across the
+/// WHOLE load→mutate→save sequence — locking `load_groups`/`save_groups` individually fixes
+/// nothing, because the race is the sequence, not either call. `std::sync::Mutex` is not
+/// reentrant: nothing inside this critical section may call back into `mutate_groups`.
+static GROUPS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serializes every load-modify-save of `private_audience.json` (QURATOR-252). Same shape and
+/// same one-shared-static reasoning as [`GROUPS_LOCK`]; the lock is taken for the whole
+/// load→mutate→save inside [`DataStore::set_private_audience_member`] so a revocation racing a
+/// concurrent enrolment can no longer be clobbered. Deliberately a SEPARATE lock from
+/// [`GROUPS_LOCK`]: the audience is explicit and never group-derived (owner ruling 2026-08-04,
+/// pinned by `group_mutations_do_not_touch_private_audience`), so a group mutation must never
+/// share a critical section with an audience write.
+static PRIVATE_AUDIENCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl DataStore {
     pub fn groups_path(&self) -> PathBuf {
         self.base.join("groups.json")
@@ -969,6 +991,42 @@ impl DataStore {
 
     pub fn save_private_audience(&self, audience: &[String]) -> Result<()> {
         write_json(&self.private_audience_path(), audience).context("saving private_audience")
+    }
+
+    /// QURATOR-252 — one atomic load→mutate→save of `groups.json` under [`GROUPS_LOCK`], the
+    /// group-mutating twin of `note_failed_dial`'s locked read-modify-write. The mutation runs
+    /// only if the load succeeded, and the file is saved only when the closure returned `Ok` — a
+    /// refused mutation ("group not found", "already exists") writes NOTHING, preserving the
+    /// byte-identical refusal behaviour the command tests pin. `f` must not call back into this
+    /// method: `std::sync::Mutex` is not reentrant.
+    pub fn mutate_groups<T>(
+        &self,
+        f: impl FnOnce(&mut Vec<Group>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _guard = GROUPS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut groups = self.load_groups().map_err(|e| e.to_string())?;
+        let out = f(&mut groups)?;
+        self.save_groups(&groups).map_err(|e| e.to_string())?;
+        Ok(out)
+    }
+
+    /// QURATOR-252 — enrol or revoke one npub in the Private-collection audience as a single
+    /// load→mutate→save under [`PRIVATE_AUDIENCE_LOCK`]. Idempotent in both directions (the
+    /// command's documented contract). Locking the whole sequence is what fixes the ticket's
+    /// race: before, a revocation racing a concurrent enrolment interleaved two unlocked
+    /// load→mutate→save cycles and whichever saved second erased the other's change. The command
+    /// layer (`private_audience_set`) is a thin shim over this.
+    pub fn set_private_audience_member(&self, npub: &str, receives: bool) -> Result<()> {
+        let _guard = PRIVATE_AUDIENCE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut audience = self.load_private_audience()?;
+        if receives {
+            if !audience.iter().any(|n| n == npub) {
+                audience.push(npub.to_string());
+            }
+        } else {
+            audience.retain(|n| n != npub);
+        }
+        self.save_private_audience(&audience)
     }
 }
 
@@ -1652,6 +1710,55 @@ pub(crate) mod tests {
         let (dir, store) = test_store();
         pin_unroutable_relays(&store);
         (dir, store)
+    }
+
+    /// QURATOR-252 mechanism pin — the private-audience read-modify-write runs under
+    /// [`PRIVATE_AUDIENCE_LOCK`] (one shared module-scope static, the M19 W9 lesson
+    /// [`MANIFEST_ASKS_LOCK`] documents; exactly one mutator path today — the
+    /// `private_audience_set` command — but the lock guards the store method, so every current
+    /// or future caller is covered by construction). This is the DETERMINISTIC half of the race
+    /// proof: with the lock held by this thread, a `set_private_audience_member` — even on a
+    /// different `DataStore`, the lock is module-scope and shared across instances — must not
+    /// complete until the lock is released; then it must complete and land. The behavioural
+    /// twin (real threads racing enrol vs revoke) is
+    /// `private_audience_revocation_survives_a_concurrent_enrolment` in commands/groups.rs.
+    /// Honest limit: the "blocked" half observes a 50 ms window — a worker thread not yet
+    /// scheduled inside it could let the first assert pass vacuously; the release half
+    /// (completes + lands) pins the method's correctness regardless.
+    /// P-10: in `set_private_audience_member`, delete the guard line
+    /// `let _guard = PRIVATE_AUDIENCE_LOCK.lock().unwrap_or_else(|p| p.into_inner());`
+    /// (store.rs:1020 at the time of writing) — the `!completed` assert must go red because the
+    /// write lands while the lock is held.
+    #[test]
+    fn set_private_audience_member_blocks_while_the_lock_is_held() {
+        let (dir, store) = test_store();
+        let _keep = dir;
+        let store = std::sync::Arc::new(store);
+        let worker_store = store.clone();
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_completed = completed.clone();
+
+        let hold = PRIVATE_AUDIENCE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let worker = std::thread::spawn(move || {
+            worker_store.set_private_audience_member("npub_x", true).unwrap();
+            worker_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !completed.load(std::sync::atomic::Ordering::SeqCst),
+            "the audience write must not complete while PRIVATE_AUDIENCE_LOCK is held elsewhere"
+        );
+        drop(hold);
+        worker.join().unwrap();
+        assert!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            "the write completes once the lock is released"
+        );
+        assert_eq!(
+            store.load_private_audience().unwrap(),
+            vec!["npub_x".to_string()],
+            "the blocked write landed after release"
+        );
     }
 
     fn sample_identity() -> StoredIdentity {

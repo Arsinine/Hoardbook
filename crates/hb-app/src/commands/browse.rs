@@ -603,14 +603,28 @@ pub(crate) fn save_followed_peer(
     store.save_contact(&CachedPeer::pubkey_hash(&npub), &peer).map_err(cmd_err)?;
 
     if let Some(gname) = group_name {
-        let mut groups = store.load_groups().map_err(cmd_err)?;
-        if let Some(group) = groups.iter_mut().find(|g| g.name == gname) {
-            if !group.pubkeys.contains(&npub) {
-                group.pubkeys.push(npub);
-                group.modified_at = Utc::now();
+        // QURATOR-252 — the NINTH groups.json mutator, found by the lane that locked the other
+        // eight. Routed through `mutate_groups` so this follow-into-group shares the one
+        // `GROUPS_LOCK` critical section: an unlocked load→mutate→save here could still clobber a
+        // concurrent rename/assign, which is the whole race the ticket closes.
+        //
+        // ⚠ A missing group stays a SILENT SKIP, deliberately. `mutate_groups` saves only when the
+        // closure returns `Ok`, so returning `Err` here would be the tidier-looking choice — but it
+        // would change this function's contract, and the contact above is ALREADY SAVED by this
+        // point, so erroring would report failure after a partial success. It would also break
+        // `save_followed_peer`'s callers: the WAN-U suite drives this fn directly (see the doc
+        // above), and `follow` treats an `Err` as a failed follow. Skipping the group write while
+        // keeping the contact is the pre-252 behaviour and the right one; 252 only makes the write
+        // that DOES happen share the lock.
+        store.mutate_groups(|groups| -> Result<(), String> {
+            if let Some(group) = groups.iter_mut().find(|g| g.name == gname) {
+                if !group.pubkeys.contains(&npub) {
+                    group.pubkeys.push(npub);
+                    group.modified_at = Utc::now();
+                }
             }
-            store.save_groups(&groups).map_err(cmd_err)?;
-        }
+            Ok(())
+        })?;
     }
     Ok(())
 }
