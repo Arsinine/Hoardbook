@@ -1221,10 +1221,20 @@ mod tests {
     ///
     /// MUTATION (P-10) — production anchors inside `resolve_peer_covered`; resolve by production
     /// line number at apply time, never by text (a text anchor matches this comment and no-ops).
-    ///   1. In the KEYED arm (under `Some(bk) =>`), replace `listings_covered = covered;` with
-    ///      `listings_covered = false;` → the count assert below reds with 1.
-    ///   2. Independent second mutation, run separately: the same replacement in the KEYLESS arm
+    ///   1. In the KEYED arm (under `Some(bk) =>`), revert the CALL — swap
+    ///      `browse_peer_listings_covered(` for `hb_net::browse::browse_peer_listings_state(`,
+    ///      binding `let covered = true;` beside it and dropping the `false` from the
+    ///      `unwrap_or` tuple → the count assert below reds with 1.
+    ///   2. Independent second mutation, run separately: the same CALL revert in the KEYLESS arm
     ///      (under `None =>`) → also reds with 1.
+    ///
+    /// ⚠ Mutate the CALL, never the assignment. An earlier version of this comment said to swap
+    /// `listings_covered = covered;` for `listings_covered = false;`. That CANNOT red this test:
+    /// the assert counts the call form `browse_peer_listings_covered(`, which an assignment swap
+    /// leaves untouched, so the count stays 2 and the run reads as a phantom GREEN — i.e. as
+    /// "this control is vacuous" when it is not. Verified by running it: both greens were the
+    /// mutation's fault, and the CALL revert above reds correctly (CLAUDE.md §9 — a source-scan
+    /// guard is mutated by deleting or replacing the SCANNED TEXT itself).
     #[test]
     fn resolve_peer_covered_reads_coverage_in_both_arms() {
         let src = include_str!("browse.rs");

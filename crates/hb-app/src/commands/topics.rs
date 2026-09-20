@@ -804,7 +804,22 @@ pub async fn topic_leave(
     if let Some(json) = &stored.membership_json {
         let membership = Event::from_json(json).map_err(cmd_err)?;
         let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
-        leave_topic(&client, &stored.key, &me, &membership).await.map_err(cmd_err)?;
+        // QURATOR-292 review: the retraction is BEST-EFFORT and must never hold the local removal
+        // hostage. It was `?` until a pre-migration membership made that fatal: a topic joined
+        // before the pseudonym swap has a v1 `membership_json`, whose author is the old HMAC
+        // pseudonym, so `membership_deletion` correctly REFUSES to sign a deletion it cannot
+        // author — and the `?` aborted before the store filter below, leaving the member stuck in
+        // the topic locally AND absent from every roster remotely, with no way out. Leaving is a
+        // LOCAL act; NIP-09 retraction is best-effort by nature (a non-compliant relay may ignore
+        // it regardless, N5), so a failed publish is logged and the local drop proceeds.
+        if let Err(e) = leave_topic(&client, &stored.key, &me, &membership).await {
+            tracing::warn!(
+                topic = %topic_id,
+                error = %e,
+                "topic_leave: retraction not published (pre-v2 membership, or relay refused); \
+                 dropping the local record anyway — leaving must not depend on the publish"
+            );
+        }
     }
     let topics: Vec<StoredTopic> =
         store.load_topics().map_err(cmd_err)?.into_iter().filter(|t| t.meta.topic_id != topic_id).collect();
@@ -1252,6 +1267,49 @@ mod tests {
         let mut reloaded = restarted.load_announce_times().unwrap();
         let err = burn_announce_cooldown(&mut reloaded, "films", t0 + 60).unwrap_err();
         assert!(err.contains("60 min"), "the cooldown survives a restart, got: {err}");
+    }
+
+    /// QURATOR-292 review (high finding): the local removal must NOT be gated on the retraction
+    /// publishing. A topic joined before the pseudonym swap stores a v1 `membership_json` whose
+    /// author is the old HMAC pseudonym, so `membership_deletion` rightly refuses to sign a
+    /// deletion it cannot author — and while `leave_topic` carried a `?`, that refusal aborted
+    /// `topic_leave` BEFORE the store filter, leaving the member stuck in the topic locally and
+    /// absent from every roster remotely, with no way out. NIP-09 retraction is best-effort (N5)
+    /// regardless of migration state, so the publish may always fail and leaving must still work.
+    ///
+    /// `topic_leave` needs a live relay client to drive end-to-end, so this pins the CONTROL FLOW
+    /// structurally: the body must not apply `?` to `leave_topic`, and the store tail must follow
+    /// it unconditionally. ⚠ Honest limit, stated rather than implied: this proves the shape of
+    /// the code, NOT that a real refusal is survived — that belongs to the hb-it row owed on
+    /// QURATOR-305. The scan strips `//` lines first, so this comment cannot satisfy it.
+    ///
+    /// MUTATION (P-10) — resolve by production line number at apply time, never by text:
+    ///   restore the `?` form at the `leave_topic(` call inside `topic_leave` (i.e.
+    ///   `leave_topic(&client, &stored.key, &me, &membership).await.map_err(cmd_err)?;`,
+    ///   dropping the `if let Err(e)` wrapper) → the `is_err_wrapped` assert below reds.
+    #[test]
+    fn leaving_a_topic_does_not_depend_on_the_retraction_publishing() {
+        let src = include_str!("topics.rs");
+        let code: String =
+            src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let at = code.find("pub async fn topic_leave(").expect("topic_leave must exist");
+        let end = code[at..].find("\n}\n").expect("topic_leave must end") + at;
+        let body = &code[at..end];
+
+        assert!(
+            body.contains("if let Err(e) = leave_topic("),
+            "the retraction must be best-effort: a failed publish is logged, never propagated"
+        );
+        assert!(
+            !body.contains("leave_topic(&client, &stored.key, &me, &membership).await.map_err(cmd_err)?"),
+            "`?` on leave_topic strands a pre-migration member — they can neither retract nor leave"
+        );
+        let publish_at = body.find("leave_topic(").expect("the retraction call must exist");
+        let drop_at = body.find("store.save_topics(").expect("the local drop must exist");
+        assert!(
+            publish_at < drop_at,
+            "the local drop must follow the retraction attempt, and must run whether or not it failed"
+        );
     }
 
     #[test]
