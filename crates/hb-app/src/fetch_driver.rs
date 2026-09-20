@@ -46,7 +46,7 @@ use hb_net::RelayClient;
 use nostr::prelude::*;
 use tokio::time::Instant;
 
-use crate::commands::browse::{contact_share_code, resolve_peer};
+use crate::commands::browse::{contact_share_code, resolve_peer, resolve_peer_covered};
 use crate::commands::chat::{
     decode_dms, giftwrap_inbox_filter, request_manifest_from_inner, request_manifest_inner,
     DM_FETCH_MARGIN_SECS,
@@ -456,22 +456,31 @@ async fn discover_unheld(
         // deletes LIVE asks, the silent drop the no-caps ruling forbids. An offline author never
         // reaches any of this: the `Err` arm `continue`s below.
         //
-        // QURATOR-300 (OPEN, decomposed out of this lane): `Fetched` still means only "the
-        // shared-pool fetch returned Ok" — it cannot say the peer's NIP-65 outbox leg was read,
-        // so a slug carried ONLY by an outbox relay that errored can vanish from `published` on
-        // a partial read and evict a live trace here. hb-net now computes the coverage flag
-        // (`browse_peer_listings_covered`); threading it into this gate needs `resolve_peer`
-        // (commands/browse.rs) to carry it out, which is outside this lane's files. The honest
-        // bound until then — grace window + per-poll re-ask re-mints the trace — is documented
-        // at the flag's definition in hb-net/src/browse.rs.
-        let (published, listings_fetched): (Vec<(String, Option<String>)>, bool) =
-            match resolve_peer(&share_code, identity, store, relay).await {
-                Ok(peer) => (
+        // QURATOR-300 — `Fetched` alone still means only "the shared-pool fetch returned Ok": it
+        // cannot say the peer's NIP-65 outbox leg was read, so a slug carried ONLY by an outbox
+        // relay that errored could vanish from `published` on a PARTIAL read and evict a live
+        // trace here. The gate is therefore the CONJUNCTION of the tri-state (`Fetched`) and
+        // hb-net's coverage flag (`browse_peer_listings_covered`, threaded through
+        // `resolve_peer_covered`): every relay LEG the read needed ran without error.
+        //
+        // Honest bound, do not oversell: coverage is LEG granularity, not relay granularity —
+        // `RelayClient::connect` is first-success, so an outbox relay that lost the connect race
+        // and then black-holed is invisible to the flag (see the warning on
+        // `browse_peer_listings_covered`). This gate buys "the leg did not error", never "the
+        // read was complete". And the harm stays bounded even at that: eviction keeps
+        // foreign-author keys, listed slugs, unspent-but-claimed asks and anything inside the
+        // liveness grace of `sent_at`, and this pass re-asks every unheld slug each poll — so
+        // the real window is an UNCLAIMED ask older than the grace whose slug one partial read
+        // omitted: it loses its auto-dial authorization until the re-ask lands. Self-healing.
+        let (published, listings_complete): (Vec<(String, Option<String>)>, bool) =
+            match resolve_peer_covered(&share_code, identity, store, relay).await {
+                Ok((peer, listings_covered)) => (
                     peer.collections
                         .into_iter()
                         .map(|c| (c.collection.slug, c.snapshot_fingerprint))
                         .collect(),
-                    matches!(peer.listings_state, crate::store::ListingsStatus::Fetched),
+                    matches!(peer.listings_state, crate::store::ListingsStatus::Fetched)
+                        && listings_covered,
                 ),
                 Err(e) => {
                     tracing::debug!(
@@ -488,7 +497,7 @@ async fn discover_unheld(
         // listing keeps re-stamping the survivors). Runs BEFORE the ask loop, so nothing it keeps
         // is re-minted underneath it; forgets entries only — it never refuses, skips, or bounds an
         // ask (the 2026-09-02 no-caps ruling), which is what makes eviction lawful here at all.
-        if listings_fetched {
+        if listings_complete {
             let listed: HashSet<String> = published.iter().map(|(slug, _)| slug.clone()).collect();
             match store.evict_unlisted_manifest_asks(&contact.npub, &listed, chrono::Utc::now()) {
                 Ok(removed) if removed > 0 => tracing::info!(
@@ -1634,19 +1643,29 @@ mod tests {
         );
     }
 
-    /// QURATOR-293 — the liveness sweep must actually run inside the discovery pass, keyed off a
-    /// listing that ARRIVED. The pure core (`manifest_ask_is_unlisted`) is pinned in store.rs; a
-    /// helper nothing calls is the inert-fix shape (2026-09-16 receipt), and `discover_unheld`
+    /// QURATOR-293 + QURATOR-300 — the liveness sweep must actually run inside the discovery
+    /// pass, keyed off a listing read that both ARRIVED (`Fetched`) and was COMPLETE (every
+    /// relay leg the read needed ran without error — hb-net's coverage flag, threaded through
+    /// `resolve_peer_covered`). The pure core (`manifest_ask_is_unlisted`) is pinned in store.rs;
+    /// a helper nothing calls is the inert-fix shape (2026-09-16 receipt), and `discover_unheld`
     /// cannot be driven in a unit test (it resolves a real peer over a relay) — so this pins the
     /// glue by structure, the same contract `discovery_asks_the_author_authorlessly` holds.
     ///
-    /// MUTATION (P-10) — production anchor: the `if listings_fetched {` block inside
-    /// `discover_unheld` (the block whose body calls `evict_unlisted_manifest_asks`). Delete the
-    /// whole block → the count assert below reds with 0 (the sweep never runs — the inert-fix
-    /// shape). Independent second mutation, run separately: replace
-    /// `matches!(peer.listings_state, crate::store::ListingsStatus::Fetched)` with `true` → the
-    /// `peer.listings_state` expect below panics (eviction would then key off failed/sealed
-    /// empties, deleting LIVE asks).
+    /// MUTATIONS (P-10) — production anchors inside `discover_unheld`; resolve each by production
+    /// line number at apply time, never by text (a text anchor matches this comment and no-ops).
+    /// Run each independently and revert before the next:
+    ///   1. Delete the whole `if listings_complete {` block (the one whose body calls
+    ///      `evict_unlisted_manifest_asks(`) → the count assert below reds with 0 (the sweep
+    ///      never runs — the inert-fix shape).
+    ///   2. Replace `matches!(peer.listings_state, crate::store::ListingsStatus::Fetched)` with
+    ///      `true` → the `peer.listings_state` expect below panics (eviction would then key off
+    ///      failed/sealed empties, deleting LIVE asks).
+    ///   3. Delete the `&& listings_covered` conjunct from the same expression → the
+    ///      `listings_covered` count assert below reds with 1 (a PARTIAL read — a scoped-outbox
+    ///      leg that errored — would evict a live trace again; QURATOR-300 acceptance 1).
+    ///   4. Re-point the call `resolve_peer_covered(` back to `resolve_peer(` (and destructure
+    ///      `Ok(peer)` accordingly) → the `resolve_peer_covered(` expect below panics (the flag
+    ///      never reaches the gate — the un-threaded shape part 2 exists to close).
     #[test]
     fn liveness_eviction_runs_in_the_discovery_pass_on_an_arrived_listing_only() {
         let src = include_str!("fetch_driver.rs");
@@ -1669,10 +1688,18 @@ mod tests {
             1,
             "exactly one liveness sweep per author listing, called from the discovery pass"
         );
-        // The gate is the listing read's TRI-STATE, read in the Ok arm — an offline author takes
-        // the Err arm's `continue` and evicts nothing, and a failed/sealed enumeration (whose
-        // collections reconcile out of a possibly-empty cache) is not `Fetched`.
-        let ok_at = region.find("Ok(peer) =>").expect("the Ok arm must exist");
+        // The resolve feeding the gate is the COVERAGE-carrying one — `resolve_peer` folds the
+        // flag away, which is exactly the un-threaded shape QURATOR-300 part 2 closes.
+        let resolve_at = region
+            .find("resolve_peer_covered(")
+            .expect("the discovery pass must resolve through the covered form");
+        // The gate is the listing read's TRI-STATE **and** its coverage, both read in the Ok arm
+        // — an offline author takes the Err arm's `continue` and evicts nothing, a failed/sealed
+        // enumeration (whose collections reconcile out of a possibly-empty cache) is not
+        // `Fetched`, and a partial read (a scoped-outbox leg that errored) is not covered.
+        let ok_at = region
+            .find("Ok((peer, listings_covered)) =>")
+            .expect("the Ok arm must destructure the coverage flag");
         let state_at = region
             .find("peer.listings_state")
             .expect("the listing tri-state must be read by the discovery pass");
@@ -1682,8 +1709,21 @@ mod tests {
             "the tri-state is read in the Ok arm only — a failed resolve cannot evict"
         );
         assert!(
+            resolve_at < ok_at,
+            "the covered resolve feeds the gate, not the other way round"
+        );
+        assert!(
             region.contains("crate::store::ListingsStatus::Fetched"),
             "the gate is the honest-empty state, never a bare emptiness check"
+        );
+        // `listings_covered` exactly twice in the region: once bound by the Ok-arm destructure,
+        // once CONSUMED as the `&& listings_covered` conjunct. Fewer means the conjunct was
+        // dropped (partial reads evict again); more would mean a stray copy drifting in.
+        assert_eq!(
+            region.matches("listings_covered").count(),
+            2,
+            "coverage is bound by the destructure AND consumed as the eviction conjunct — \
+             dropping the conjunct reopens eviction on a partial read"
         );
         let evict_at = region
             .find("evict_unlisted_manifest_asks(")

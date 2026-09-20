@@ -758,10 +758,10 @@ pub async fn browse_peer_listings_state(
 /// is why this rides as a `bool` beside the state rather than as a new `ListingsState` variant
 /// (that fork is a deliberate 7-file change and a different ticket).
 ///
-/// As of this change the flag is computed but consumed by NOBODY: threading it through
-/// `resolve_peer` (hb-app `commands/browse.rs`) to the fetch driver's eviction gate — the one
-/// consumer that needs it — is the decomposed follow-up half of QURATOR-300. Not re-exported
-/// from lib.rs until that consumer exists.
+/// The consumer now exists (QURATOR-300 part 2): hb-app's `resolve_peer_covered`
+/// (`commands/browse.rs`) carries the flag out, and the fetch driver's liveness-eviction gate
+/// (`fetch_driver::discover_unheld`) requires it — eviction runs only on a read that was both
+/// `Fetched` AND covered. Reached via `pub mod browse`, so no lib.rs re-export is needed.
 pub async fn browse_peer_listings_covered(
     client: &RelayClient,
     peer: &PublicKey,

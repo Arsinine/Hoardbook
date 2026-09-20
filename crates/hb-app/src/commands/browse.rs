@@ -14,8 +14,12 @@ use hb_core::event::Teaser;
 use hb_core::fingerprint::Fingerprint;
 use hb_core::types::Collection;
 use hb_core::{ShareCode, Identity};
+// QURATOR-300: `browse_peer_listings_covered` is deliberately NOT in hb-net's lib.rs re-export
+// list (see its doc there) — it is reached through the public `browse` module, the one consumer
+// being `resolve_peer_covered` below.
+use hb_net::browse::browse_peer_listings_covered;
 use hb_net::{
-    browse_peer_listings_state, browse_share_code,
+    browse_share_code,
     fetch_full_listing_if_current, listing_snapshot_fingerprint, search_teasers_capped,
     ListingsState, RelayClient, RenderedListing, SearchHit,
 };
@@ -271,12 +275,48 @@ async fn resolve_full_if_truncated(
 /// drives this fn directly to exercise the production add-contact funnel over a live relay — the
 /// same path `paste_key` calls. Promoted from private to `pub(crate)` so the in-crate harness can
 /// reach it without widening to full `pub`; no new external surface is exposed.
+///
+/// QURATOR-300: this is now the lenient projection of [`resolve_peer_covered`] — same resolve,
+/// coverage flag dropped. Every existing caller (the UI commands below, the fetch driver's refresh
+/// tier, the WAN-U funnel) must keep ignoring coverage: folding a partial read into the browse
+/// page's failed-enum derivation would make a transient outbox outage render as a FAILED browse
+/// and preserve the cached list. The one consumer that needs the flag is the fetch driver's
+/// liveness-eviction gate, which calls the covered variant directly.
 pub(crate) async fn resolve_peer(
     share_code: &ShareCode,
     me: &Identity,
     store: &DataStore,
     relay: &SharedRelay,
 ) -> Result<CachedPeer, String> {
+    resolve_peer_covered(share_code, me, store, relay)
+        .await
+        .map(|(peer, _)| peer)
+}
+
+/// QURATOR-300 — [`resolve_peer`] plus the one thing it folds away: whether the enumeration read
+/// was COMPLETE, in hb-net's narrow sense (`browse_peer_listings_covered` — every relay LEG the
+/// read needed was driven without error; leg granularity, NOT relay granularity, see the warning
+/// on that fn). Consumed by the fetch driver's liveness-eviction gate
+/// (`fetch_driver::discover_unheld`), which must not delete ask traces off a PARTIAL read.
+///
+/// Honest bound, do not oversell: a partial read destroys nothing by itself — the gate keeps
+/// foreign-author keys, listed slugs, unspent-but-claimed asks and anything inside the liveness
+/// grace of `sent_at`, and the discovery pass re-asks every unheld slug each poll, so a trace a
+/// partial read evicts is re-minted by the next complete one. The real window is an UNCLAIMED ask
+/// older than the grace whose slug one partial read omitted: it loses its auto-dial authorization
+/// until the re-ask lands. Self-healing and bounded, which is why this rides as a `bool` beside
+/// the resolve rather than as a new `ListingsStatus` variant (that fork is a deliberate 7-file
+/// change and a different ticket).
+///
+/// Not driven by unit tests (it dials a relay, same limit `resolve_peer`'s QURATOR-267 tests
+/// document) — the threading is pinned structurally in this file's test module; the WAN-U funnel
+/// exercises the resolve itself over a live relay.
+pub(crate) async fn resolve_peer_covered(
+    share_code: &ShareCode,
+    me: &Identity,
+    store: &DataStore,
+    relay: &SharedRelay,
+) -> Result<(CachedPeer, bool), String> {
     let peer = share_code.pubkey();
     let npub = peer.to_bech32().map_err(cmd_err)?;
     let seed = net::relay_urls(store);
@@ -321,6 +361,13 @@ pub(crate) async fn resolve_peer(
     // shape in `listings_failed` until the reconcile after the match decides, instead of folding
     // it away with `.unwrap_or_default()` where the two cases are indistinguishable downstream.
     let mut listings_failed = false;
+    // QURATOR-300: coverage of the SAME read, threaded out for the fetch driver's eviction gate.
+    // Deliberately NOT folded into `listings_failed` above — a partial read is not a failed one
+    // for the browse page (see the projection note on `resolve_peer`); only the eviction consumer
+    // treats it as "not safe to delete from". Deferred initialisation (like `listings_state`
+    // above): BOTH arms of the match below must assign, so an arm that stops reading coverage
+    // fails to COMPILE rather than silently threading `false`.
+    let listings_covered;
     let collections = match share_code.browse_key() {
         Some(bk) => {
             // The browser's OWN big relay (option a) — tried before the peer's advertised one (b).
@@ -339,17 +386,24 @@ pub(crate) async fn resolve_peer(
             //                 confident "no collections" for a peer who has plenty, and would
             //                 durably destroy the cached list on every later auto-refresh.
             // Only `Fetched` + empty is a genuine unpublish-everything, and that still clears.
-            let (families, listings_read) = browse_peer_listings_state(
+            // QURATOR-300: read the COVERAGE-carrying form (same fetch, same grouping, same
+            // tri-state as `browse_peer_listings_state`, which is itself this fn's lenient
+            // projection) so the eviction gate can refuse a PARTIAL read. Both arms of this
+            // match must stay on the covered form — an arm reverted to the state-only read
+            // would thread a hardcoded `false` and silently disarm the gate (nothing would ever
+            // evict), which is pinned structurally in the test module below.
+            let (families, listings_read, covered) = browse_peer_listings_covered(
                 &client,
                 &peer,
                 &bk,
                 net::RELAY_TIMEOUT,
             )
             .await
-            .unwrap_or((Vec::new(), ListingsState::FetchFailed(String::new())));
+            .unwrap_or((Vec::new(), ListingsState::FetchFailed(String::new()), false));
             // Unreadable listings must never fail the whole resolve (BR1, unchanged).
             listings_failed = !matches!(listings_read, ListingsState::Fetched);
             listings_state = listings_read.into();
+            listings_covered = covered;
             let cache_dir = store.manifest_cache_dir();
             let now = now_secs();
             let mut out = Vec::with_capacity(families.len());
@@ -374,15 +428,20 @@ pub(crate) async fn resolve_peer(
             // peer's own KIND_LISTING events (author-pinned) and classifies them; the throwaway
             // zero key decrypts nothing, so `Sealed` is reported for any existing family, which
             // is exactly the keyless reading. Never fails the resolve (BR1).
-            let (_, state) = browse_peer_listings_state(
+            // QURATOR-300: the covered form here too — a keyless contact CAN reach the fetch
+            // driver's eviction gate (`contact_share_code` answers `FollowOnly`, not an error),
+            // so this arm's read must report its coverage as honestly as the keyed arm's. The
+            // throwaway key changes what decrypts, not which relay legs the read needed.
+            let (_, state, covered) = browse_peer_listings_covered(
                 &client,
                 &peer,
                 &[0u8; 32], // throwaway key — decrypts nothing; the read is for the tri-state
                 net::RELAY_TIMEOUT,
             )
             .await
-            .unwrap_or((Vec::new(), ListingsState::FetchFailed(String::new())));
+            .unwrap_or((Vec::new(), ListingsState::FetchFailed(String::new()), false));
             listings_state = state.into();
+            listings_covered = covered;
             vec![]
         }
     };
@@ -418,26 +477,29 @@ pub(crate) async fn resolve_peer(
             // teaser flaked (same devtest-#3 reasoning — a keyless empty must not cache as
             // `Sealed` forever just because a later refresh's teaser fetch hiccuped).
             stale.listings_state = listings_state;
-            return Ok(stale);
+            return Ok((stale, listings_covered));
         }
     }
 
-    Ok(CachedPeer {
-        npub,
-        source: crate::store::ContactSource::Manual,
-        browse_key_hex: share_code.browse_key().map(hex::encode),
-        petname: profile.as_ref().map(|p| p.display_name.clone()),
-        profile,
-        collections,
-        listings_state,
-        online,
-        last_fetched: Utc::now(),
-        // W5.2: presence age is stamped by the online poll, not by a browse (which proves nothing
-        // about whether they are around).
-        last_presence: None,
-        local_tags: vec![],
-        fingerprint,
-    })
+    Ok((
+        CachedPeer {
+            npub,
+            source: crate::store::ContactSource::Manual,
+            browse_key_hex: share_code.browse_key().map(hex::encode),
+            petname: profile.as_ref().map(|p| p.display_name.clone()),
+            profile,
+            collections,
+            listings_state,
+            online,
+            last_fetched: Utc::now(),
+            // W5.2: presence age is stamped by the online poll, not by a browse (which proves
+            // nothing about whether they are around).
+            last_presence: None,
+            local_tags: vec![],
+            fingerprint,
+        },
+        listings_covered,
+    ))
 }
 
 /// Snapshot the loaded identity (cloned) or error if none.
@@ -1146,6 +1208,59 @@ pub async fn discover_observed_tags(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// QURATOR-300 — the coverage threading, pinned structurally. `resolve_peer_covered` dials a
+    /// relay so no unit test can drive it (the same limit the QURATOR-267 `listings_failed` tests
+    /// document); the hazard this pins is silent DISARMING: an arm of the keyed/keyless match
+    /// that stops reading coverage would thread a constant `false`, and the fetch driver's
+    /// eviction gate — which ANDs coverage in — would never open again. Nothing behavioural reds
+    /// in that world (eviction simply stops happening), so only structure can catch it. The
+    /// deferred initialisation makes the plain revert (dropping the arm's assignment) a COMPILE
+    /// error; the shape that still compiles — assigning a literal `false`, or calling the
+    /// state-only read and binding its result to `covered`-by-name — is what this pin reds on.
+    ///
+    /// MUTATION (P-10) — production anchors inside `resolve_peer_covered`; resolve by production
+    /// line number at apply time, never by text (a text anchor matches this comment and no-ops).
+    ///   1. In the KEYED arm (under `Some(bk) =>`), replace `listings_covered = covered;` with
+    ///      `listings_covered = false;` → the count assert below reds with 1.
+    ///   2. Independent second mutation, run separately: the same replacement in the KEYLESS arm
+    ///      (under `None =>`) → also reds with 1.
+    #[test]
+    fn resolve_peer_covered_reads_coverage_in_both_arms() {
+        let src = include_str!("browse.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("pub(crate) async fn resolve_peer_covered(")
+            .expect("the covered resolve must exist");
+        let end = code[at..]
+            .find("fn identity_clone(")
+            .expect("identity_clone must follow the covered resolve")
+            + at;
+        let region = &code[at..end];
+        assert_eq!(
+            region.matches("browse_peer_listings_covered(").count(),
+            2,
+            "BOTH arms of the keyed/keyless match must read the covered form — one reverted arm \
+             threads a hardcoded false and silently disarms the fetch driver's eviction gate"
+        );
+        // And `resolve_peer` stays the lenient projection: it lives before the covered resolve
+        // and delegates to it, dropping the bool.
+        let proj_at = code
+            .find("pub(crate) async fn resolve_peer(")
+            .expect("the lenient projection must exist");
+        let covered_at = code
+            .find("pub(crate) async fn resolve_peer_covered(")
+            .expect("the covered resolve must exist");
+        assert!(proj_at < covered_at, "resolve_peer precedes resolve_peer_covered");
+        assert!(
+            code[proj_at..covered_at].contains("resolve_peer_covered("),
+            "the lenient projection delegates to the covered resolve"
+        );
+    }
 
     #[test]
     fn search_requires_at_least_one_filter() {
