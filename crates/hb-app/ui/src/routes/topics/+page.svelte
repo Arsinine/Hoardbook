@@ -20,7 +20,7 @@
 		topicAnnounce,
 		topicAnnounceStatus,
 	} from '$lib/api.js';
-	import type { TopicView, DiscoveredTopic, TopicLookup, CachedPeer } from '$lib/types.js';
+	import type { TopicView, DiscoveredTopic, TopicLookup, CachedPeer, RosterMemberView } from '$lib/types.js';
 	import {
 		rosterLabel,
 		unseenTopicAnnouncements,
@@ -108,7 +108,7 @@
 	// Open Topic (roster + invite). The 24h channel now lives in Chat (a persistent channel entry per
 	// joined Topic); posting moved there, so this panel keeps only membership management.
 	let openTopic: TopicView | null = $state(null);
-	let roster: string[] = $state([]);
+	let roster: RosterMemberView[] = $state([]);
 	// Finding #36 (CWE-362): request-generation guard for the open-Topic panel, same shape as
 	// `lookupGeneration`/`discoverGeneration` below. Clicking Topic A then Topic B leaves A's async
 	// roster (and announce status) in flight; without a guard the later resolve binds A's roster to
@@ -658,6 +658,8 @@
 		openGeneration += 1;
 		const generation = openGeneration;
 		try {
+			// QURATOR-304: `topic_roster` answers with `RosterMemberView[]` (npub + dormant
+			// tri-state), which is what `lib/api.ts` declares — no cast needed.
 			const fetched = await topicRoster(t.topic_id);
 			if (generation === openGeneration) roster = fetched;
 		} catch (e) {
@@ -769,6 +771,22 @@
 	function rosterChatLocked(npub: string): boolean {
 		return rosterChatUnlocked[npub] !== true;
 	}
+
+	// ── QURATOR-304 — the roster's liveness fold ───────────────────────────────────────────
+	// A 30-day presence window governs membership on every surface EXCEPT this panel (owner
+	// 2026-09-20: "topics are only considered alive if a user subscribed to that topic has been
+	// online in the past 30 days"). The row is KEPT — a member knows who is in their own room, and
+	// an absent member is not a departed one (no leave affordance exists) — so dormancy DIMS the
+	// row (`.roster-row.dormant` + the "silent 30d+" cue) instead of dropping it, and the header
+	// states the split so the panel AGREES with the alive count the directory shows rather than
+	// silently disagreeing. `dormant === null` (the presence read failed) is UNKNOWN, never a
+	// verdict: such a row renders normally and the header falls back to the plain total.
+	const rosterRecent = $derived(roster.filter((m) => m.dormant === false).length);
+	const rosterHeaderSuffix = $derived(
+		roster.length > 0 && roster.every((m) => m.dormant !== null) && rosterRecent < roster.length
+			? ` · ${rosterRecent} recent`
+			: ''
+	);
 
 	async function rosterBioOnHover(npub: string) {
 		rosterHover = npub;
@@ -1131,16 +1149,20 @@
 					</div>
 
 					<div class="detail-section">
-						<div class="section-label">Roster ({roster.length})</div>
+						<!-- QURATOR-304: with any dormant member the header STATES the split (N · M recent)
+						     — the same 30-day fold the directory's alive count applies — instead of
+						     silently disagreeing with it. -->
+						<div class="section-label">Roster ({roster.length}{rosterHeaderSuffix})</div>
 						<!-- QURATOR-146: each row is a real <button> (keyboard-reachable; Enter fires the
 						     same navigation as double-click) wrapped in the hover region. The bio rides the
 						     same hover as the chat hand-off so the row explains itself once. -->
 						<ul class="roster">
-							{#each roster as npub (npub)}
-								{@const row = rosterRowProps(npub)}
-								{@const bio = rosterHover === npub ? rosterBios[npub] : undefined}
+							{#each roster as m (m.npub)}
+								{@const row = rosterRowProps(m.npub)}
+								{@const dormant = !row.isSelf && m.dormant === true}
+								{@const bio = rosterHover === m.npub ? rosterBios[m.npub] : undefined}
 								<li class="roster-item">
-									{#if row.isSelf || rosterChatLocked(npub)}
+									{#if row.isSelf || rosterChatLocked(m.npub)}
 										<!-- The self row keeps r1's plain non-interactive form — there is no "talk to
 										     yourself" hand-off to offer. QURATOR-142: an opted-out member (and, fail
 										     closed, any member whose opt-out state is not yet RESOLVED to "not
@@ -1153,30 +1175,37 @@
 										     Tab still fetches the bio, but carries NO keydown handler — Enter is inert
 										     (the QURATOR-142 opt-out is navigation-only; the bio feature is unaffected). -->
 										<!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_static_element_interactions -->
+										<!-- QURATOR-304: `class:dormant` rides BOTH row forms — the opt-out state and the
+										     liveness state are ORTHOGONAL and must compose: a dormant opted-out member is
+										     dimmed AND still a non-clickable div; dormancy never re-enables the hand-off. -->
 										<div
 											class="roster-row self"
+											class:dormant={dormant}
 											tabindex={row.isSelf ? -1 : 0}
-											onfocus={() => { if (!row.isSelf) rosterBioOnHover(npub); }}
-											onblur={() => { if (!row.isSelf) rosterHover = rosterHover === npub ? null : rosterHover; }}
-											onmouseenter={() => { if (!row.isSelf) rosterBioOnHover(npub); }}
-											onmouseleave={() => { if (!row.isSelf) rosterHover = rosterHover === npub ? null : rosterHover; }}
+											onfocus={() => { if (!row.isSelf) rosterBioOnHover(m.npub); }}
+											onblur={() => { if (!row.isSelf) rosterHover = rosterHover === m.npub ? null : rosterHover; }}
+											onmouseenter={() => { if (!row.isSelf) rosterBioOnHover(m.npub); }}
+											onmouseleave={() => { if (!row.isSelf) rosterHover = rosterHover === m.npub ? null : rosterHover; }}
 										>
 											<PersonRow name={row.name} letter={row.letter} picture={row.picture} fingerprint={row.fingerprint} online={row.online} />
+											{#if dormant}<span class="roster-dormant-cue">silent 30d+</span>{/if}
 										</div>
 									{:else}
 										<button
 											type="button"
 											class="roster-row"
+											class:dormant={dormant}
 											title="Double-click or press Enter to open a chat with this member"
-											onfocus={() => rosterBioOnHover(npub)}
-											onblur={() => (rosterHover = rosterHover === npub ? null : rosterHover)}
-											onmouseenter={() => rosterBioOnHover(npub)}
-											onmouseleave={() => (rosterHover = rosterHover === npub ? null : rosterHover)}
-											ondblclick={() => openRosterChat(npub)}
-											onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); openRosterChat(npub); } }}
+											onfocus={() => rosterBioOnHover(m.npub)}
+											onblur={() => (rosterHover = rosterHover === m.npub ? null : rosterHover)}
+											onmouseenter={() => rosterBioOnHover(m.npub)}
+											onmouseleave={() => (rosterHover = rosterHover === m.npub ? null : rosterHover)}
+											ondblclick={() => openRosterChat(m.npub)}
+											onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); openRosterChat(m.npub); } }}
 										>
 											<PersonRow name={row.name} letter={row.letter} picture={row.picture} fingerprint={row.fingerprint} online={row.online} />
 											<span class="roster-cue" aria-hidden="true">chat ⏎</span>
+											{#if dormant}<span class="roster-dormant-cue">silent 30d+</span>{/if}
 										</button>
 									{/if}
 									{#if !row.isSelf && bio !== undefined && bio !== 'retry'}
@@ -1444,6 +1473,13 @@
 	.roster-row:hover, .roster-row:focus-visible { background: var(--bg-elev2); cursor: pointer; }
 	.roster-row:focus { outline: none; } /* :focus-visible carries the ring; a pointer click stays quiet */
 	.roster-row.self { cursor: default; } /* no hand-off for the self row — nothing to talk to */
+	/* QURATOR-304 — a dormant member (no presence beacon in the 30-day aliveness window) keeps
+	   their row but renders dimmed, with the "silent 30d+" cue stated in TEXT so the state is
+	   readable without a tooltip and survives grayscale/high-contrast modes (and jsdom); never
+	   hidden (owner 2026-09-20). The dim applies to BOTH row forms — dormant composes with the
+	   QURATOR-142 opt-out, it never overrides it. */
+	.roster-row.dormant { opacity: 0.55; }
+	.roster-dormant-cue { font-size: 10.5px; color: var(--fg-dim); white-space: nowrap; margin-left: 6px; }
 	.roster-cue { visibility: hidden; font-size: 10.5px; color: var(--fg-dim); white-space: nowrap; }
 	.roster-row:hover .roster-cue, .roster-row:focus-visible .roster-cue { visibility: visible; }
 	/* The bio surfaces under the row on hover/focus — inline expansion, NOT a floating hovercard

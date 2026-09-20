@@ -32,6 +32,8 @@ vi.mock('$lib/api.js', () => ({
 
 import { topicRoster, topicList } from '$lib/api.js';
 const rosterMock = topicRoster as unknown as ReturnType<typeof vi.fn>;
+// QURATOR-304: `topic_roster` answers RosterMemberView[] (npub + dormant tri-state), not bare npubs.
+const rosterMembers = (npubs: string[]) => npubs.map((npub) => ({ npub, dormant: false }));
 const listMock = topicList as unknown as ReturnType<typeof vi.fn>;
 
 const NPUB_A = 'npub1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -63,7 +65,7 @@ describe('finding #36 — open() roster fetch is generation-guarded', () => {
 		// Topic A's roster hangs until we release it; Topic B's resolves immediately (2 members).
 		let releaseA: (v: unknown) => void = () => {};
 		const inFlightA = new Promise((r) => { releaseA = r; });
-		rosterMock.mockReturnValueOnce(inFlightA).mockResolvedValue([NPUB_B1, NPUB_B2]);
+		rosterMock.mockReturnValueOnce(inFlightA).mockResolvedValue(rosterMembers([NPUB_B1, NPUB_B2]));
 
 		listMock.mockResolvedValue([
 			{ topic_id: 'topic-A', name: 'video/anime', description: '', tags: [], private: false, joined_at: 0 },

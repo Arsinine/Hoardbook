@@ -57,6 +57,8 @@ vi.mock('$lib/api.js', () => ({
 
 import { topicRoster, topicList, pasteKey } from '$lib/api.js';
 const rosterMock = topicRoster as unknown as ReturnType<typeof vi.fn>;
+// QURATOR-304: `topic_roster` answers RosterMemberView[] (npub + dormant tri-state), not bare npubs.
+const rosterMembers = (npubs: string[]) => npubs.map((npub) => ({ npub, dormant: false }));
 const listMock = topicList as unknown as ReturnType<typeof vi.fn>;
 const pasteKeyMock = pasteKey as unknown as ReturnType<typeof vi.fn>;
 
@@ -114,7 +116,7 @@ function resolvedPeer(hideInRosters: boolean) {
 describe('QURATOR-146 — roster row hands off to chat', () => {
 	it('double-click navigates to /chat?peer=<npub> for a NON-contact member', async () => {
 		seedSelf();
-		rosterMock.mockResolvedValue([STRANGER_NPUB]);
+		rosterMock.mockResolvedValue(rosterMembers([STRANGER_NPUB]));
 		listMock.mockResolvedValue(ONE_TOPIC);
 		// QURATOR-142: rows are fail-closed — the hand-off only exists once the hover resolve has
 		// explicitly said `hide_in_rosters: false`, so seed that resolve and let it land first.
@@ -131,7 +133,7 @@ describe('QURATOR-146 — roster row hands off to chat', () => {
 
 	it('Enter on the focused row does exactly what double-click does', async () => {
 		seedSelf();
-		rosterMock.mockResolvedValue([STRANGER_NPUB]);
+		rosterMock.mockResolvedValue(rosterMembers([STRANGER_NPUB]));
 		listMock.mockResolvedValue(ONE_TOPIC);
 		pasteKeyMock.mockResolvedValue(resolvedPeer(false));
 		const { container } = render(TopicsPage);
@@ -147,7 +149,7 @@ describe('QURATOR-146 — roster row hands off to chat', () => {
 
 	it('the self row offers no hand-off (you cannot DM yourself)', async () => {
 		seedSelf();
-		rosterMock.mockResolvedValue([SELF_NPUB]);
+		rosterMock.mockResolvedValue(rosterMembers([SELF_NPUB]));
 		listMock.mockResolvedValue(ONE_TOPIC);
 		const { container } = render(TopicsPage);
 		await openFirstTopic(container);
@@ -159,7 +161,7 @@ describe('QURATOR-146 — roster row hands off to chat', () => {
 
 	it('hovers render the bio — ONE lazy pasteKey per person, cached across re-hovers', async () => {
 		seedSelf();
-		rosterMock.mockResolvedValue([STRANGER_NPUB]);
+		rosterMock.mockResolvedValue(rosterMembers([STRANGER_NPUB]));
 		listMock.mockResolvedValue(ONE_TOPIC);
 		pasteKeyMock.mockResolvedValue({
 			npub: STRANGER_NPUB,
@@ -184,7 +186,7 @@ describe('QURATOR-146 — roster row hands off to chat', () => {
 
 	it('an absent profile renders the honest "No published profile" line — never blank, never an empty card', async () => {
 		seedSelf();
-		rosterMock.mockResolvedValue([STRANGER_NPUB]);
+		rosterMock.mockResolvedValue(rosterMembers([STRANGER_NPUB]));
 		listMock.mockResolvedValue(ONE_TOPIC);
 		// pasteKey resolves a peer whose profile carries no bio — "asked and there is none".
 		pasteKeyMock.mockResolvedValue({
@@ -204,7 +206,7 @@ describe('QURATOR-146 — roster row hands off to chat', () => {
 
 	it('a pasteKey REJECTION renders no bio line and a later hover retries (GLM review: a reject is not "asked and there is none")', async () => {
 		seedSelf();
-		rosterMock.mockResolvedValue([STRANGER_NPUB]);
+		rosterMock.mockResolvedValue(rosterMembers([STRANGER_NPUB]));
 		listMock.mockResolvedValue(ONE_TOPIC);
 		pasteKeyMock.mockRejectedValueOnce(new Error('relay unreachable')).mockResolvedValue({
 			npub: STRANGER_NPUB,
@@ -262,7 +264,7 @@ describe('QURATOR-146 — roster row hands off to chat', () => {
 describe('QURATOR-142 — roster opt-out: fail-closed, never rendered, count unchanged', () => {
 	it('an UNRESOLVED member renders non-interactive (fail-closed) — never an opted-in button', async () => {
 		seedSelf();
-		rosterMock.mockResolvedValue([STRANGER_NPUB]);
+		rosterMock.mockResolvedValue(rosterMembers([STRANGER_NPUB]));
 		listMock.mockResolvedValue(ONE_TOPIC);
 		// pasteKey never resolves this hover — the opt-out state stays unknown.
 		pasteKeyMock.mockReturnValue(new Promise(() => {}));
@@ -279,7 +281,7 @@ describe('QURATOR-142 — roster opt-out: fail-closed, never rendered, count unc
 
 	it('a REJECTED resolve keeps the row locked (the catch path records no unlock)', async () => {
 		seedSelf();
-		rosterMock.mockResolvedValue([STRANGER_NPUB]);
+		rosterMock.mockResolvedValue(rosterMembers([STRANGER_NPUB]));
 		listMock.mockResolvedValue(ONE_TOPIC);
 		pasteKeyMock.mockRejectedValue(new Error('relay unreachable'));
 		const { container } = render(TopicsPage);
@@ -293,7 +295,7 @@ describe('QURATOR-142 — roster opt-out: fail-closed, never rendered, count unc
 
 	it('a resolved hide_in_rosters:true member stays non-interactive — no dblclick, no Enter', async () => {
 		seedSelf();
-		rosterMock.mockResolvedValue([STRANGER_NPUB]);
+		rosterMock.mockResolvedValue(rosterMembers([STRANGER_NPUB]));
 		listMock.mockResolvedValue(ONE_TOPIC);
 		pasteKeyMock.mockResolvedValue(resolvedPeer(true));
 		const { container } = render(TopicsPage);
@@ -311,7 +313,7 @@ describe('QURATOR-142 — roster opt-out: fail-closed, never rendered, count unc
 
 	it('an opted-out member still counts in the Roster (N) label', async () => {
 		seedSelf();
-		rosterMock.mockResolvedValue([SELF_NPUB, STRANGER_NPUB]);
+		rosterMock.mockResolvedValue(rosterMembers([SELF_NPUB, STRANGER_NPUB]));
 		listMock.mockResolvedValue(ONE_TOPIC);
 		pasteKeyMock.mockResolvedValue(resolvedPeer(true));
 		const { container } = render(TopicsPage);

@@ -45,6 +45,8 @@ vi.mock('$lib/api.js', () => ({
 import { topicDiscoverPaint, topicRoster, topicList } from '$lib/api.js';
 const paintMock = topicDiscoverPaint as unknown as ReturnType<typeof vi.fn>;
 const rosterMock = topicRoster as unknown as ReturnType<typeof vi.fn>;
+// QURATOR-304: `topic_roster` answers RosterMemberView[] (npub + dormant tri-state), not bare npubs.
+const rosterMembers = (npubs: string[]) => npubs.map((npub) => ({ npub, dormant: false }));
 const listMock = topicList as unknown as ReturnType<typeof vi.fn>;
 
 const SELF_NPUB = 'npub1selfselfselfselfselfselfselfselfselfselfselfse';
@@ -101,7 +103,7 @@ describe('Hoardbook Topics draft r1 — roster rows (PersonRow)', () => {
 			key_storage: 'plain-file',
 		});
 		profile.set({ display_name: 'Me', bio: undefined, tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '' });
-		rosterMock.mockResolvedValue([CONTACT_NPUB]);
+		rosterMock.mockResolvedValue(rosterMembers([CONTACT_NPUB]));
 		listMock.mockResolvedValue([{ topic_id: 't1', name: 'video/anime', description: '', tags: [], private: false, joined_at: 0 }]);
 		const { container, getByText, findByText } = render(TopicsPage);
 
@@ -122,7 +124,7 @@ describe('Hoardbook Topics draft r1 — roster rows (PersonRow)', () => {
 			key_storage: 'plain-file',
 		});
 		profile.set({ display_name: 'Me', bio: undefined, tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '' });
-		rosterMock.mockResolvedValue([SELF_NPUB]);
+		rosterMock.mockResolvedValue(rosterMembers([SELF_NPUB]));
 		listMock.mockResolvedValue([{ topic_id: 't1', name: 'video/anime', description: '', tags: [], private: false, joined_at: 0 }]);
 		const { container, findByText } = render(TopicsPage);
 
@@ -135,7 +137,7 @@ describe('Hoardbook Topics draft r1 — roster rows (PersonRow)', () => {
 	});
 
 	it('renders a non-contact roster member with name only — no fingerprint, no presence dot', async () => {
-		rosterMock.mockResolvedValue([STRANGER_NPUB]);
+		rosterMock.mockResolvedValue(rosterMembers([STRANGER_NPUB]));
 		listMock.mockResolvedValue([{ topic_id: 't1', name: 'video/anime', description: '', tags: [], private: false, joined_at: 0 }]);
 		const { container, findByText } = render(TopicsPage);
 
@@ -150,7 +152,7 @@ describe('Hoardbook Topics draft r1 — roster rows (PersonRow)', () => {
 
 	it('omits the fingerprint for a contact whose fingerprint is not yet resolved', async () => {
 		contacts.set([makeContact({ fingerprint: undefined, online: false })]);
-		rosterMock.mockResolvedValue([CONTACT_NPUB]);
+		rosterMock.mockResolvedValue(rosterMembers([CONTACT_NPUB]));
 		listMock.mockResolvedValue([{ topic_id: 't1', name: 'video/anime', description: '', tags: [], private: false, joined_at: 0 }]);
 		const { container, findByText } = render(TopicsPage);
 
@@ -291,7 +293,7 @@ describe('Hoardbook Topics draft r1 — announce terms visible without hovering'
 	// property still holds; it's just carried by the input now, not a sibling div. The HintMarker
 	// "?" affordance still carries the same ANNOUNCE_EXPLAINER constant for anyone who does hover.
 	it('states the terms in the composer placeholder, visible with no hover and nothing typed', async () => {
-		rosterMock.mockResolvedValue([]);
+		rosterMock.mockResolvedValue(rosterMembers([]));
 		listMock.mockResolvedValue([{ topic_id: 't1', name: 'video/anime', description: '', tags: [], private: false, joined_at: 0 }]);
 		const { container } = render(TopicsPage);
 		await openFirstTopic(container);

@@ -30,6 +30,7 @@ import type {
 	ChannelView,
 	TopicAnnounceSummary,
 	DmRequestView,
+	RosterMemberView,
 } from './types.js';
 
 // ── Identity ─────────────────────────────────────────────────────────────────
@@ -675,7 +676,8 @@ export const topicInvite = (topicId: string, inviteeNpub: string) =>
 
 export const topicLeave = (topicId: string) => invoke<void>('topic_leave', { topicId });
 
-export const topicRoster = (topicId: string) => invoke<string[]>('topic_roster', { topicId });
+export const topicRoster = (topicId: string) =>
+	invoke<RosterMemberView[]>('topic_roster', { topicId });
 
 /** The 24h channel: posts + announcements, both newest-first (M13 Part A app wiring). */
 export const topicChannel = (topicId: string) =>

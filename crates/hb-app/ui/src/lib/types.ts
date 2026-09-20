@@ -262,6 +262,18 @@ export interface TopicRank {
 	alive_count: number | null;
 }
 
+/** One roster row from `topic_roster` (QURATOR-304): the member's npub plus their liveness over
+ *  the SAME 30-day Topic aliveness window `TopicRank.alive_count` folds. `dormant` is a
+ *  tri-state: `false` = pinged within the window (a normal row); `true` = no beacon in the window
+ *  (dormant) — the row is KEPT and rendered dimmed with a stated cue, never dropped, because a
+ *  member knows who is in their own room and an absent member is not a departed one (owner
+ *  2026-09-20, shown-dormant over hidden); `null` = the presence read FAILED — unknown, never a
+ *  verdict, so the row renders normally. */
+export interface RosterMemberView {
+	npub: string;
+	dormant: boolean | null;
+}
+
 /** The join-first lookup result (devtest #11) — does this public Topic name already have a room? */
 export interface TopicLookup {
 	topic_id: string;

@@ -60,6 +60,8 @@ const paintMock = topicDiscoverPaint as unknown as ReturnType<typeof vi.fn>;
 const rankMock = topicRank as unknown as ReturnType<typeof vi.fn>;
 const joinMock = topicJoinPublic as unknown as ReturnType<typeof vi.fn>;
 const rosterMock = topicRoster as unknown as ReturnType<typeof vi.fn>;
+// QURATOR-304: `topic_roster` answers RosterMemberView[] (npub + dormant tri-state), not bare npubs.
+const rosterMembers = (npubs: string[]) => npubs.map((npub) => ({ npub, dormant: false }));
 const pasteKeyMock = pasteKey as unknown as ReturnType<typeof vi.fn>;
 
 const SELF_NPUB = 'npub1selfselfselfselfselfselfselfselfselfselfselfse';
@@ -153,7 +155,7 @@ describe('review 3 — after a successful join the detail pane shows the JOINED 
 		listMock.mockResolvedValueOnce([]).mockResolvedValue([mine('d1', 'video/retro')]);
 		paintMock.mockResolvedValue([disc('d1', 'video/retro', 'a blurb')]);
 		joinMock.mockResolvedValue(undefined);
-		rosterMock.mockResolvedValue([]);
+		rosterMock.mockResolvedValue(rosterMembers([]));
 
 		const { container } = render(TopicsPage);
 		// video is pure discovery (nothing joined yet) — open it, select the unjoined row.
@@ -321,7 +323,7 @@ describe('review 4 — the paint-time rank pass skips collapsed groups; expand r
 describe('review 5 — focusing a roster row fetches the bio', () => {
 	it('Tab-focus (no mouse) fires pasteKey and renders the bio', async () => {
 		await seedSelf();
-		rosterMock.mockResolvedValue([STRANGER_NPUB]);
+		rosterMock.mockResolvedValue(rosterMembers([STRANGER_NPUB]));
 		listMock.mockResolvedValue([mine('t1', 'video/anime')]);
 		pasteKeyMock.mockResolvedValue({
 			npub: STRANGER_NPUB,
@@ -350,7 +352,7 @@ describe('review 5 — focusing a roster row fetches the bio', () => {
 describe('review 6 — a rejected bio fetch does not poison the cache', () => {
 	it('a REJECTED resolve does NOT render the absent line; a later hover RETRIES (second pasteKey)', async () => {
 		await seedSelf();
-		rosterMock.mockResolvedValue([STRANGER_NPUB]);
+		rosterMock.mockResolvedValue(rosterMembers([STRANGER_NPUB]));
 		listMock.mockResolvedValue([mine('t1', 'video/anime')]);
 		pasteKeyMock.mockRejectedValueOnce(new Error('relay unreachable')).mockResolvedValue({
 			npub: STRANGER_NPUB,
@@ -383,7 +385,7 @@ describe('review 6 — a rejected bio fetch does not poison the cache', () => {
 
 	it('a resolved empty-string bio is a real bio, never the "No published profile" line', async () => {
 		await seedSelf();
-		rosterMock.mockResolvedValue([STRANGER_NPUB]);
+		rosterMock.mockResolvedValue(rosterMembers([STRANGER_NPUB]));
 		listMock.mockResolvedValue([mine('t1', 'video/anime')]);
 		pasteKeyMock.mockResolvedValue({
 			npub: STRANGER_NPUB,
