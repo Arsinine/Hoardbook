@@ -10,9 +10,9 @@
 
 use anyhow::{anyhow, ensure, Result};
 use hb_core::topic::{
-    build_announce, build_public_join, mint_invite, normalized_public_name, roster,
-    seal_membership, topic_id_for_name, NonceSet, TopicKey, TopicMeta, KIND_TOPIC_MEMBER,
-    KIND_TOPIC_POST, POST_TTL_SECS,
+    build_announce, build_public_join, member_sign_keys, membership_sign_keys, mint_invite,
+    normalized_public_name, roster, seal_membership, topic_id_for_name, NonceSet, TopicKey,
+    TopicMeta, KIND_TOPIC_MEMBER, KIND_TOPIC_POST, POST_TTL_SECS,
 };
 use hb_core::{new_topic, Identity};
 use hb_net::{
@@ -21,6 +21,7 @@ use hb_net::{
     join_public, join_topic, leave_topic, member_count, post_to_channel, publish_topic,
     request_join, INVITE_TTL_SECS,
 };
+use nostr::nips::nip09::EventDeletionRequest;
 use nostr::prelude::*;
 
 use crate::harness::{now, result, settle, Ctx, FETCH_TIMEOUT};
@@ -58,6 +59,10 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
         result(
             "TOPIC16 QURATOR-294: an invite refused for the WRONG topic still redeems for the RIGHT one on the next poll",
             topic16(ctx).await,
+        ),
+        result(
+            "TOPIC17 QURATOR-292: a key-holding insider cannot evict another member (forged NIP-09 retraction AND addressable supersession both fail; own-coordinate supersession + the victim's own leave both work)",
+            topic17(ctx).await,
         ),
     ]
 }
@@ -926,4 +931,202 @@ async fn topic16(ctx: &Ctx) -> Result<()> {
     ensure!(bmeta.topic_id == meta.topic_id, "the right-topic redeem returned a different topic");
     ic.disconnect().await;
     Ok(())
+}
+
+// ── TOPIC17 (QURATOR-292/305: insider eviction is impossible, over a real relay) ─────────────────
+
+/// TOPIC17 (QURATOR-292 §5 row, owed by QURATOR-305): a topic-key-holding insider cannot evict
+/// ANOTHER member from the roster over a live relay, by either of the two closed vectors:
+/// 1. **NIP-09 forged retraction** — derive a signing key from the victim's PUBLIC npub
+///    (`member_sign_keys`, still exported) and kind-5-delete their membership event, exactly as
+///    the pre-292 attack did.
+/// 2. **Addressable supersession** — `KIND_TOPIC_MEMBER = 31_118` is parameterized-replaceable, so
+///    junk at the victim's `(pubkey, 31_118, topic_id)` coordinate with a later `created_at`
+///    replaces their membership on every NIP-01-conformant relay (core semantics, not an optional
+///    NIP — "the relay may ignore deletions" is no mitigation here).
+///
+/// Since slice A the membership pseudonym is `membership_sign_keys` (HKDF over the member's own
+/// SECRET), so the insider's derivations land at coordinates nobody honours.
+///
+/// Cast: creator + victim join genuinely; the attacker ALSO joins — the strongest insider, a
+/// fellow member holding the topic key by right.
+///
+/// Non-vacuousness (by ID everywhere — every "still there"/"gone" assertion is against the raw
+/// fetched event set, and every attack artifact is fetched back by id before any success claim):
+/// - the forged deletion and both junk events are confirmed ON the relay first, so a publish the
+///   relay silently refused cannot masquerade as a defended attack;
+/// - vector 2's MECHANISM is proven live in the same row: the attacker supersesses their OWN
+///   membership with junk at their own coordinate and it demonstrably REPLACES (their real
+///   membership id vanishes, the junk id survives) — so the victim's survival is a signature
+///   failure, never "this relay ignores replacement";
+/// - vector 1's mechanism contrast is the closing positive control: the victim's own `leave_topic`
+///   (an author-signed NIP-09 deletion of the very event id the forgery named) DOES shrink the
+///   roster — same relay, same mechanism, same target event.
+///
+/// ⚠ What this row does NOT prove, said plainly:
+/// - it cannot prove a NON-COMPLIANT relay is harmless: a relay honouring non-author deletions
+///   would evict the victim — this row reds there, which is a finding about that relay, not a
+///   defence to rely on;
+/// - the forged-deletion half rests on the relay declining a kind-5 whose signer did not author
+///   the named event (NIP-09); the relay's internal decision is unobservable — only its behaviour
+///   (the target event surviving) is, and the author-signed contrast is what makes that
+///   non-vacuous;
+/// - it does NOT prove the insider cannot derive `member_sign_keys` (they can — it is exported and
+///   this row drives it); it proves that derivation now names a coordinate that is neither the
+///   membership author a deletion must be signed by, nor the coordinate replaceable semantics
+///   evict, so neither vector reaches the victim.
+///
+/// MUTATION (P-10, for the orchestrator to apply): in hb-core `seal_membership`
+/// (`crates/hb-core/src/topic.rs`), replace the signer line
+/// `let signer = membership_sign_keys(key, topic_id, member)?;` with
+/// `let signer = member_sign_keys(key, &member.public_key())?;` (the pre-292 derivation). The
+/// victim's membership is then authored at the very coordinate the attacker derives, so this row
+/// reds at the `QURATOR-292 regressed` ensure immediately — and would go on to red at both vector
+/// assertions (the forged deletion becomes author-signed; the 2a junk lands at the victim's
+/// coordinate and replaces the membership) if the divergence check were deleted too. Revert the
+/// hb-core line afterwards; nothing in this file changes for the mutation.
+async fn topic17(ctx: &Ctx) -> Result<()> {
+    let creator = Identity::generate();
+    let victim = Identity::generate();
+    let attacker = Identity::generate();
+    let (meta, key) = mk_public(ctx, "evict17");
+    create_public(ctx, &creator, &meta, &key).await?;
+
+    // Victim and attacker both join genuinely — the attacker is a fellow member (topic key by
+    // right), the strongest insider the threat model names.
+    let vc = ctx.connect(&victim).await?;
+    let vm = join_topic(&vc, &key, &meta.topic_id, &victim, now()).await?;
+    vc.disconnect().await;
+    let ac = ctx.connect(&attacker).await?;
+    let am = join_topic(&ac, &key, &meta.topic_id, &attacker, now()).await?;
+    ac.disconnect().await;
+    settle().await;
+    let pc = ctx.connect(&creator).await?;
+    let baseline = fetch_roster(&pc, &meta.topic_id, &key, FETCH_TIMEOUT).await?;
+    pc.disconnect().await;
+    ensure!(baseline.len() == 3, "three members joined, got {baseline:?}");
+
+    // ── Vector 1: forged NIP-09 retraction under the public-npub derivation ────────────────────
+    let old_keys = member_sign_keys(&key, &victim.public_key())?;
+    // The cleanest statement of the fix: the pre-292 derivation no longer names the coordinate the
+    // real membership occupies. If this ever fails again, the 292 regression is back.
+    ensure!(
+        old_keys.public_key() != vm.pubkey,
+        "member_sign_keys(victim npub) still yields the membership author — QURATOR-292 regressed"
+    );
+    let forged = EventBuilder::delete(EventDeletionRequest::new().id(vm.id))
+        .custom_created_at(Timestamp::from(now()))
+        .sign_with_keys(&old_keys)
+        .map_err(|e| anyhow!("{e}"))?;
+    let forged_id = forged.id;
+    let ac = ctx.connect(&attacker).await?;
+    publish_topic(&ac, &[forged]).await?;
+    ac.disconnect().await;
+    settle().await;
+    let ac = ctx.connect(&attacker).await?;
+    ensure!(
+        !ac.fetch(Filter::new().id(forged_id), FETCH_TIMEOUT).await?.is_empty(),
+        "vector 1 non-vacuousness: the forged deletion never reached the relay — this run proves nothing"
+    );
+    let raw = fetch_membership_events(&ac, &meta.topic_id, FETCH_TIMEOUT).await?;
+    let after1 = fetch_roster(&ac, &meta.topic_id, &key, FETCH_TIMEOUT).await?;
+    ac.disconnect().await;
+    ensure!(raw.iter().any(|e| e.id == vm.id), "vector 1: the victim's membership vanished under a forged retraction");
+    ensure!(after1.len() == 3, "vector 1: roster changed under a forged retraction: {after1:?}");
+
+    // ── Vector 2: addressable supersession at the victim's coordinate ──────────────────────────
+    // The junk must be strictly newer than the real memberships AND not future-dated (strfry
+    // rejects future events at the write boundary), so wait out `now()`'s second resolution.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let later = now();
+    ensure!(
+        later > vm.created_at.as_secs() && later > am.created_at.as_secs(),
+        "timing precondition: junk not strictly newer than the real memberships"
+    );
+    // 2a — the pre-292 attempt re-driven: junk at a later created_at signed by the public-npub
+    // derivation. Post-292 that key is not the membership author, so the junk lands at a DIFFERENT
+    // (pubkey, kind, d) coordinate and replaces nothing of the victim's.
+    let old_junk = EventBuilder::new(Kind::from_u16(KIND_TOPIC_MEMBER), "junk-from-old-derivation")
+        .tags([Tag::identifier(meta.topic_id.clone())])
+        .custom_created_at(Timestamp::from(later))
+        .sign_with_keys(&old_keys)
+        .map_err(|e| anyhow!("{e}"))?;
+    let old_junk_id = old_junk.id;
+    // 2b — the mechanism control: the SAME junk shape at the ATTACKER'S OWN coordinate, under
+    // their own membership pseudonym (legitimately derivable — it is their own nsec). If the relay
+    // honours NIP-01 parameterized-replaceable semantics this REPLACES their real membership: live
+    // proof the mechanism vector 2 relies on works on this relay.
+    let attacker_pseudonym = membership_sign_keys(&key, &meta.topic_id, &attacker)?;
+    ensure!(
+        attacker_pseudonym.public_key() == am.pubkey,
+        "test construction broken: the attacker's own derivation does not reproduce their membership author"
+    );
+    let own_junk = EventBuilder::new(Kind::from_u16(KIND_TOPIC_MEMBER), "junk-at-own-coordinate")
+        .tags([Tag::identifier(meta.topic_id.clone())])
+        .custom_created_at(Timestamp::from(later))
+        .sign_with_keys(&attacker_pseudonym)
+        .map_err(|e| anyhow!("{e}"))?;
+    let own_junk_id = own_junk.id;
+    let ac = ctx.connect(&attacker).await?;
+    publish_topic(&ac, &[old_junk, own_junk]).await?;
+    ac.disconnect().await;
+    settle().await;
+    let ac = ctx.connect(&attacker).await?;
+    let raw = fetch_membership_events(&ac, &meta.topic_id, FETCH_TIMEOUT).await?;
+    ac.disconnect().await;
+    ensure!(raw.iter().any(|e| e.id == old_junk_id), "vector 2a non-vacuousness: the old-derivation junk never reached the relay");
+    ensure!(raw.iter().any(|e| e.id == own_junk_id), "vector 2b non-vacuousness: the attacker's own-coordinate junk never reached the relay");
+    ensure!(
+        !raw.iter().any(|e| e.id == am.id),
+        "vector 2b: the attacker's own membership was NOT replaced — this relay ignores addressable \
+         replacement, so this run cannot distinguish 'defended' from 'unattempted'"
+    );
+    ensure!(raw.iter().any(|e| e.id == vm.id), "vector 2: the victim's membership was superseded at their own coordinate");
+    // The roster after the attacks: creator + victim. The attacker evicted THEMSELVES with their
+    // own junk — the honest consequence of the mechanism control, and further proof the junk is
+    // live relay state, not a discarded publish.
+    let pc = ctx.connect(&creator).await?;
+    let after2 = fetch_roster(&pc, &meta.topic_id, &key, FETCH_TIMEOUT).await?;
+    pc.disconnect().await;
+    ensure!(
+        after2.len() == 2 && after2.contains(&victim.public_key()) && after2.contains(&creator.public_key()),
+        "vector 2: the roster moved under supersession junk (expected creator+victim): {after2:?}"
+    );
+
+    // ── Positive control: the victim leaves via the production path — an author-signed NIP-09
+    // deletion of the very same event id the forgery named, from the identity that joined.
+    let vc = ctx.connect(&victim).await?;
+    leave_topic(&vc, &key, &victim, &vm).await?;
+    vc.disconnect().await;
+    settle().await;
+    let pc = ctx.connect(&creator).await?;
+    let final_roster = fetch_roster(&pc, &meta.topic_id, &key, FETCH_TIMEOUT).await?;
+    pc.disconnect().await;
+    ensure!(
+        final_roster == vec![creator.public_key()],
+        "positive control: the victim's own leave did not shrink the roster to the creator: {final_roster:?}"
+    );
+    Ok(())
+}
+
+/// Single-row runner for TOPIC17. The hb-it binary has no per-row filter (`parse_args` accepts only
+/// relay/pow/survey/canary/same-nat), and running the whole L2 suite to exercise one row is both
+/// slow and hard on the shared relays — so this row is executable alone via
+/// `cargo test -p hb-it --bin hb-it topic17_eviction_row -- --ignored --nocapture` with
+/// `HB_IT_TOPIC17_RELAY=ws://…` naming the live relay. `#[ignore]`d so the CI `cargo test
+/// --workspace` leg (which has no relay) lists it as ignored instead of failing; the row itself is
+/// registered in `run()` above for full-suite runs (CI's ephemeral-relay integration leg included).
+#[cfg(test)]
+mod topic17_runner {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "needs a live relay: HB_IT_TOPIC17_RELAY=ws://… "]
+    async fn topic17_eviction_row() {
+        let relay = std::env::var("HB_IT_TOPIC17_RELAY")
+            .expect("set HB_IT_TOPIC17_RELAY=ws://… — the live relay this row runs against");
+        let run_id = Identity::generate().public_key().to_hex()[..16].to_string();
+        let ctx = Ctx { relays: vec![relay], pow: 0, run_id, survey: false, canary: false, interval: None, same_nat: false };
+        topic17(&ctx).await.expect("TOPIC17 row failed");
+    }
 }
