@@ -578,7 +578,7 @@ async fn t4_leave_retract(probe: &ProbeInput) -> Result<(), String> {
     let jc = connect(&joiner, &probe.relays)
         .await
         .map_err(|e| format!("T4 joiner re-connect for leave: {e}"))?;
-    leave_topic(&jc, &jkey, &joiner.public_key(), &jm, t)
+    leave_topic(&jc, &jkey, &joiner, &jm)
         .await
         .map_err(|e| format!("T4 leave_topic (the production contract): {e}"))?;
     jc.disconnect().await;

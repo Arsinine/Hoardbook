@@ -804,27 +804,71 @@ pub async fn topic_leave(
     if let Some(json) = &stored.membership_json {
         let membership = Event::from_json(json).map_err(cmd_err)?;
         let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
-        leave_topic(&client, &stored.key, &me.public_key(), &membership, now()).await.map_err(cmd_err)?;
+        leave_topic(&client, &stored.key, &me, &membership).await.map_err(cmd_err)?;
     }
     let topics: Vec<StoredTopic> =
         store.load_topics().map_err(cmd_err)?.into_iter().filter(|t| t.meta.topic_id != topic_id).collect();
     store.save_topics(&topics).map_err(cmd_err)
 }
 
-/// Fetch a Topic's roster (members-only) and refresh the auto-added topic contacts.
+/// One roster row for the UI (QURATOR-304): the member's npub plus their **Topic aliveness**
+/// state over the same 30-day window the discovery counts fold
+/// ([`hb_net::count::TOPIC_ALIVE_WINDOW_SECS`]).
+///
+/// `dormant` is a TRI-STATE, and the `None` half is fail-open on purpose:
+/// - `Some(false)` — pinged within the window (alive): a normal row.
+/// - `Some(true)` — NO beacon within the window (dormant). The row is KEPT, never dropped: a
+///   member knows who is in their own room, and an absent member is not a departed one (there is
+///   no leave affordance to point at) — owner ruling 2026-09-20, shown-dormant over hidden. The
+///   UI dims the row and states the cue instead.
+/// - `None` — the presence read FAILED (relay/connect error): unknown, never a verdict. A failed
+///   read is not a negative claim about a person, so the UI renders a normal row.
+///
+/// This is the panel-side twin of `topic_rank`'s `alive_count`: same roster, same
+/// [`hb_net::count::fetch_last_seen_for_authors`] read, same window — so the roster panel and the
+/// alive count can only disagree by display, never by definition.
+#[derive(Debug, Clone, Serialize)]
+pub struct RosterMemberView {
+    pub npub: String,
+    pub dormant: Option<bool>,
+}
+
+/// Fetch a Topic's roster (members-only) and refresh the auto-added topic contacts. Each row
+/// carries its aliveness state (QURATOR-304) — see [`RosterMemberView`].
 #[tauri::command]
 pub async fn topic_roster(
     topic_id: String,
     identity: State<'_, SharedIdentity>,
     store: State<'_, DataStore>,
     relay: State<'_, SharedRelay>,
-) -> CmdResult<Vec<String>> {
+) -> CmdResult<Vec<RosterMemberView>> {
     let me = me(&identity).await?;
     let stored = load_stored(&store, &topic_id)?;
     let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
     let roster = fetch_roster(&client, &topic_id, &stored.key, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
     auto_add_roster(&store, &roster, &me.public_key())?;
-    roster.iter().map(|p| p.to_bech32().map_err(cmd_err)).collect()
+    // QURATOR-304: the SAME author-bounded presence read the aliveness count folds
+    // (`alive_member_count` → `fetch_last_seen_for_authors`), over the SAME roster and window —
+    // one extra relay read per roster open, never a global unbounded kind-11111 query (the
+    // 2026-08-01 launch-gate defect class). A member absent from the answer has no beacon inside
+    // the window ⇒ dormant; an Err'd read is UNKNOWN (every row `dormant: None`), never dormant.
+    let last_seen = hb_net::count::fetch_last_seen_for_authors(
+        &client,
+        &roster,
+        hb_net::count::TOPIC_ALIVE_WINDOW_SECS,
+        net::RELAY_TIMEOUT,
+    )
+    .await
+    .ok();
+    roster
+        .iter()
+        .map(|p| {
+            Ok(RosterMemberView {
+                npub: p.to_bech32().map_err(cmd_err)?,
+                dormant: last_seen.as_ref().map(|(seen, _)| !seen.contains_key(p)),
+            })
+        })
+        .collect()
 }
 
 /// A decrypted channel post for the UI.

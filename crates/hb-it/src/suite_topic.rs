@@ -368,7 +368,7 @@ async fn topic8(ctx: &Ctx) -> Result<()> {
 
     // The creator leaves (retracts) → roster shrinks to the joiner.
     let cc = ctx.connect(&creator).await?;
-    leave_topic(&cc, &key, &creator.public_key(), &cm, now()).await?;
+    leave_topic(&cc, &key, &creator, &cm).await?;
     cc.disconnect().await;
     settle().await;
     let vc = ctx.connect(&creator).await?;
@@ -378,7 +378,7 @@ async fn topic8(ctx: &Ctx) -> Result<()> {
 
     // The joiner leaves too → empty roster ⇒ dissolved (derived).
     let jc = ctx.connect(&joiner).await?;
-    leave_topic(&jc, &key, &joiner.public_key(), &jm, now()).await?;
+    leave_topic(&jc, &key, &joiner, &jm).await?;
     jc.disconnect().await;
     settle().await;
     let vc = ctx.connect(&creator).await?;

@@ -19,12 +19,12 @@ use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
 use hb_core::topic::{
-    member_sign_keys, mint_invite, open_channel_item, open_invite, open_post, parse_announce,
+    membership_sign_keys, mint_invite, open_channel_item, open_invite, open_post, parse_announce,
     public_join_identity, redeem_opened_invite, roster, seal_announce, seal_membership, seal_post,
     Announcement, ChannelItem, NonceSet, Post, TopicKey, TopicMeta, KIND_TOPIC_ANNOUNCE,
     KIND_TOPIC_MEMBER, KIND_TOPIC_POST,
 };
-use hb_core::{FUTURE_SKEW_SECS, Identity};
+use hb_core::{FUTURE_SKEW_SECS, HbError, Identity};
 use nostr::nips::nip09::EventDeletionRequest;
 use nostr::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -524,21 +524,50 @@ pub async fn join_topic(
     Ok(ev)
 }
 
-/// Leave a Topic: NIP-09-retract the membership event, **signed under the same derived pseudonym key**
-/// that authored it (so a compliant relay honours the deletion). Best-effort like all NIP-09 deletion
-/// (N5). Dissolution is the derived state where no membership remains.
+/// Build the NIP-09 deletion that retracts `member`'s own membership event, signed under the
+/// **membership pseudonym** that authored it (QURATOR-292 slice B). Pure — [`leave_topic`] just
+/// publishes what this builds.
+///
+/// The signer is derived from the member's SECRET via `membership_sign_keys` (hb-core), scoped to
+/// the topic_id the membership event itself claims (`d` tag — the same string that keyed the
+/// derivation when `seal_membership` authored the event, so the two can never disagree here). The
+/// build is REFUSED unless the derived pseudonym is the event's author: until QURATOR-292 this took
+/// a bare `&PublicKey` and derived the signer from it (`member_sign_keys`), so ANY topic-key holder
+/// could retract another member's membership — and since slice A that derivation signs nothing a
+/// compliant relay honours, turning every leave into a silently-ignored publish. A mismatch now
+/// fails loud (wrong identity, or a pre-v2 membership event) instead of publishing a dead letter.
+fn membership_deletion(key: &TopicKey, member: &Identity, membership: &Event) -> Result<Event, NetError> {
+    let topic_id = membership.tags.identifier().ok_or_else(|| {
+        NetError::Core(HbError::InvalidEvent("membership event missing d=topic_id".into()))
+    })?;
+    let signer = membership_sign_keys(key, topic_id, member)?;
+    if signer.public_key() != membership.pubkey {
+        return Err(NetError::Core(HbError::InvalidEvent(format!(
+            "refusing to retract a membership authored by another pseudonym ({} != {}): a \
+             deletion not signed by the author is ignored by compliant relays",
+            signer.public_key().to_hex(),
+            membership.pubkey.to_hex()
+        ))));
+    }
+    let req = EventDeletionRequest::new().id(membership.id);
+    EventBuilder::delete(req)
+        .sign_with_keys(&signer)
+        .map_err(|e| NetError::Client(e.to_string()))
+}
+
+/// Leave a Topic: NIP-09-retract the membership event, **signed under the same derived pseudonym
+/// key that authored it** (so a compliant relay honours the deletion). Takes the member's own
+/// `Identity` — you only leave as yourself: the pre-QURATOR-292 signature took a bare `&PublicKey`
+/// and derived the signer from it, which is exactly what let any topic-key holder forge a
+/// retraction for any member. Best-effort like all NIP-09 deletion (N5). Dissolution is the
+/// derived state where no membership remains.
 pub async fn leave_topic(
     client: &RelayClient,
     key: &TopicKey,
-    member: &PublicKey,
+    member: &Identity,
     membership: &Event,
-    _now: u64,
 ) -> Result<(), NetError> {
-    let signer = member_sign_keys(key, member)?;
-    let req = EventDeletionRequest::new().id(membership.id);
-    let deletion = EventBuilder::delete(req)
-        .sign_with_keys(&signer)
-        .map_err(|e| NetError::Client(e.to_string()))?;
+    let deletion = membership_deletion(key, member, membership)?;
     client.publish(&deletion).await?;
     Ok(())
 }
@@ -972,6 +1001,97 @@ mod tests {
     fn a_plain_dm_is_not_a_join_request() {
         assert!(parse_join_request("hey, want to trade?").is_none());
         assert!(parse_join_request(r#"{"something_else":1}"#).is_none());
+    }
+
+    // ─────────── QURATOR-292 slice B: the leave retraction is signed by its AUTHOR ───────────
+    //
+    // Slice A moved membership authorship to the secret-keyed pseudonym (`membership_sign_keys`),
+    // which silently broke `leave_topic`: it still derived the OLD public-tweak key
+    // (`member_sign_keys`) from the member's public npub, so every deletion was signed by a key
+    // that never authored the event it referenced — a compliant relay ignores it, and it still
+    // compiled. Slice B re-signs the leave under the author. These tests pin the pure builder
+    // (`membership_deletion`); the publish half of `leave_topic` is WAN suite T4's row.
+
+    /// Test-only since QURATOR-292 slice B: production no longer derives the public-tweak pseudonym
+    /// in this crate (leave re-signs under `membership_sign_keys`); only the old-attack assertions
+    /// below name it. Same unused_imports rationale as `KIND_TOPIC_INVITE` above.
+    use hb_core::topic::member_sign_keys;
+
+    #[test]
+    fn a_member_can_still_leave_the_deletion_is_signed_by_the_author() {
+        // P-10 anchor (orchestrator runs it, worker does not): hb-net/src/topic.rs line 543 —
+        // `let signer = membership_sign_keys(key, topic_id, member)?;` → revert to the slice-A-era
+        // `let signer = member_sign_keys(key, &member.public_key())?;` (and pass `&member`'s
+        // pubkey form the old signature used). This test REDS on the `del.pubkey == ev.pubkey`
+        // assert: under slice A the membership is authored by the secret-keyed pseudonym, so the
+        // public-tweak derivation is no longer the author.
+        let member = Identity::generate();
+        let (meta, key) =
+            new_topic("video/80s-anime", "VHS rips & fansubs", vec!["anime".into(), "vhs".into()], false).unwrap();
+        let ev = seal_membership(&key, &meta.topic_id, &member, 1_000).unwrap();
+        let del = membership_deletion(&key, &member, &ev).unwrap();
+        assert_eq!(del.kind, Kind::EventDeletion);
+        assert_eq!(del.pubkey, ev.pubkey, "the retraction must be signed by the membership's author");
+        assert!(del.verify().is_ok(), "deletion must be a validly signed event");
+        let target = ev.id.to_hex();
+        assert!(
+            del.tags.iter().any(|t| t.content() == Some(target.as_str())),
+            "deletion must reference the membership event id"
+        );
+    }
+
+    #[test]
+    fn a_key_holder_cannot_forge_a_retraction_for_another_member() {
+        // The OLD attack (pre-292): any topic-key holder derived the victim's pseudonym from their
+        // PUBLIC npub (`member_sign_keys`) and retracted the victim's membership with it. The
+        // signature change makes the forge type-impossible — `leave_topic`/`membership_deletion`
+        // take the member's `&Identity`, and you cannot construct an `&Identity` for someone whose
+        // secret you do not hold. The runtime twin pinned here is the remaining shape: the
+        // attacker's OWN identity against the victim's event must be REFUSED loud, never published.
+        //
+        // P-10 anchor (orchestrator runs it): hb-net/src/topic.rs lines 544-553 — delete the
+        // `if signer.public_key() != membership.pubkey { return Err(...); }` refusal block. This
+        // test REDS: `membership_deletion(&key, &attacker, &ev)` would then return Ok.
+        let victim = Identity::generate();
+        let attacker = Identity::generate();
+        let (meta, key) =
+            new_topic("video/80s-anime", "VHS rips & fansubs", vec!["anime".into(), "vhs".into()], false).unwrap();
+        let ev = seal_membership(&key, &meta.topic_id, &victim, 1_000).unwrap();
+        // (a) the old attack key is no longer the author under v2 — a deletion so signed is a dead
+        //     letter no compliant relay honours; (b) the attacker's own identity is refused.
+        let old_attack_signer = member_sign_keys(&key, &victim.public_key()).unwrap();
+        assert_ne!(old_attack_signer.public_key(), ev.pubkey);
+        assert!(
+            membership_deletion(&key, &attacker, &ev).is_err(),
+            "an identity that did not author the event must not be able to retract it"
+        );
+    }
+
+    #[test]
+    fn the_leave_signer_is_scoped_to_the_topic_the_event_names() {
+        // topic_id is derived from the membership event's own `d` tag — the same string that keyed
+        // the seal-time derivation — never a caller-supplied parameter that could disagree with
+        // the event. A wrong scope mints a pseudonym that is not the author, so the refusal fires.
+        //
+        // P-10 anchor (orchestrator runs it): hb-net/src/topic.rs line 540 — replace the
+        // `let topic_id = membership.tags.identifier().ok_or_else(...)` extraction with
+        // `let topic_id: &str = "deadbeef";`. This test REDS on BOTH asserts below: the sealed
+        // event then derives a mismatched pseudonym (refusal, not the expected Ok), and the
+        // tag-less event fails with the mismatch message instead of "missing d=topic_id".
+        let member = Identity::generate();
+        let (meta, key) =
+            new_topic("video/80s-anime", "VHS rips & fansubs", vec!["anime".into(), "vhs".into()], false).unwrap();
+        let ev = seal_membership(&key, &meta.topic_id, &member, 1_000).unwrap();
+        assert!(membership_deletion(&key, &member, &ev).is_ok());
+        // An event with no `d` tag is refused with the named error — not a panic, not a wrong-scope key.
+        let tagless = EventBuilder::new(Kind::from_u16(KIND_TOPIC_MEMBER), "not a sealed membership")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let err = membership_deletion(&key, &member, &tagless).unwrap_err();
+        assert!(
+            err.to_string().contains("missing d=topic_id"),
+            "expected the missing-d refusal, got: {err}"
+        );
     }
 
     // ─────────────────── H3 (QURATOR-80): topic-discovery filter fetch budget ────────────────────
