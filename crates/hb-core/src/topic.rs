@@ -17,21 +17,27 @@
 //!   MEMBERSHIP (KIND_TOPIC_MEMBER, replaceable per (topic_id, member), encrypted under topic_key):
 //!       content = TOPIC_ENC(topic_key, 0x01 ‖ {member_npub, joined_at, proof})  // 0x01 = domain byte (F17)
 //!       *** B2 — SIGNED under a per-member DERIVED key, NOT the real npub ***
-//!         member_sign_key = HMAC-SHA256(topic_key, "member" ‖ member_xonly) → secp256k1 sk
-//!       so the Nostr `pubkey` field is a topic-scoped pseudonym (stable per member, replaceable/
-//!       retract still work), UN-linkable to the real npub WITHOUT the topic_key. The real npub lives
-//!       ONLY inside the topic_key-encrypted content. `d`-tag = topic_id (roster is queryable).
-//!       *** chorus-1 fix — PROOF OF PARTICIPATION (real-key authorization) ***
-//!         The `member_sign_key` is DERIVABLE BY ANY TOPIC-KEY HOLDER from the (public) target npub, so
-//!         the pseudonym-binding check alone repels only NON-members. To stop an insider from enrolling
-//!         a person who never joined, the encrypted content also carries `proof` = a NIP-01 event
-//!         **signed by the member's REAL key** binding `join:{topic_id}` at `joined_at`; `open_membership`
-//!         verifies it against the claimed npub. A key-holder cannot forge it (no real secret key).
-//!         **Honest residual:** a key-holder CAN replay a member's *own* old proof to re-add a member who
-//!         previously, voluntarily joined *this* topic (resurrect-after-leave) — but cannot fabricate
-//!         membership for a never-joiner. The roster is sound against "who never joined", not against a
-//!         malicious insider resurrecting a past member. The proof is domain-separated (`hbm:join:…`,
-//!         chorus-2) so it can't be a cross-protocol replay of a `KIND_TOPIC_PROOF` event signed elsewhere.
+//!         membership sk = HKDF-SHA256(salt="hoardbook/topic-member", ikm=member_SECRET)
+//!                           .expand("member/v2" ‖ topic_key ‖ topic_id)        (QURATOR-292)
+//!       so the Nostr `pubkey` field is a topic-scoped pseudonym computable ONLY by the member
+//!       (posts/announces/channel keep the older HMAC(topic_key, npub) pseudonym — they are 24h-
+//!       ephemeral and their integrity rests on the real-key proof, not on pseudonym secrecy).
+//!       QURATOR-292 closed the two eviction vectors the OLD public-tweak derivation allowed: any
+//!       key-holder could derive a member's pseudonym from the (public) npub and (1) sign a NIP-09
+//!       retraction of their membership with it, or (2) — worse — publish junk at the addressable
+//!       (pseudonym, 31118, topic_id) coordinate with a later `created_at`, which every NIP-01
+//!       relay honours as a supersession, no deletion compliance needed. A secret-keyed derivation
+//!       makes both unconstructible, and being a pure function of (nsec, topic_key, topic_id) it
+//!       re-derives after a reinstall from a restored nsec + re-obtained topic key.
+//!       *** B2 binding (v2) — the proof commits to the pseudonym ***
+//!         A verifier holds only the topic key, so it can NO LONGER re-derive the pseudonym to check
+//!         `event.pubkey`. Instead the encrypted content carries `proof` = a NIP-01 event **signed by
+//!         the member's REAL key** binding `hbm:join2:{topic_id}:{pseudonym_pubkey}` at `joined_at` —
+//!         the real key authorizes the EXACT pseudonym that signed the outer event. The distinct
+//!         `join2` prefix (vs the v1 `hbm:join:…`, which names no pseudonym) is the DOWNGRADE GUARD:
+//!         a v1 proof must not be wrappable in an event signed by an attacker's pseudonym. The
+//!         reader is v2-ONLY (owner ruling 2026-09-20: republish-on-next-launch, no dual-read), so
+//!         pre-migration events fail `open_membership` until the member republishes.
 //!         **Transferable-attestation tradeoff (chorus-2 disclosure):** the proof is a real-key signature
 //!         over a meaningful statement, so it is **non-repudiable, transferable evidence** that the member
 //!         signed "joined this topic" — a fellow key-holder could show it to an outsider to prove your
@@ -149,6 +155,12 @@ const MAX_FUTURE_SKEW_SECS: u64 = 60 * 60;
 
 const HKDF_SALT_TOPIC: &[u8] = b"hoardbook/topic-key";
 const HKDF_SALT_PUBLIC_JOIN: &[u8] = b"hoardbook/topic-public-join";
+/// QURATOR-292 — domain-separates the membership pseudonym from every other derivation in the crate
+/// (the topic conversation key above, the public-join keys, the DM-cache key). **A launch-frozen wire
+/// discriminant**: changing it silently changes every member's membership pseudonym, which — because
+/// kind 31118 is addressable — would strand every membership event already on a relay at a coordinate
+/// the member no longer signs at. Pinned in `wire_freeze`.
+pub(crate) const HKDF_SALT_TOPIC_MEMBER: &[u8] = b"hoardbook/topic-member";
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 // ── Types ────────────────────────────────────────────────────────────────────────────────────────
@@ -481,12 +493,45 @@ pub fn member_sign_keys(key: &TopicKey, member: &PublicKey) -> Result<Keys, HbEr
     Ok(Keys::new(sk))
 }
 
+/// QURATOR-292 — the MEMBERSHIP pseudonym: derived from the member's **secret**, so only the member
+/// can produce it (any topic-key holder could derive the old `member_sign_keys` from the public npub
+/// and evict them — NIP-09 retraction, or junk at the addressable `(P_victim, 31118, topic_id)`
+/// coordinate that every NIP-01 relay honours as a supersession). `topic_key` stays in the HKDF info
+/// so a key rotation yields a fresh pseudonym, as before; `topic_id` scopes it so a pseudonym learned
+/// in one topic is useless in another. A pure function of (nsec, topic_key, topic_id), so a reinstall
+/// recovers it from a restored nsec + re-obtained topic key. MEMBERSHIP only — posts/announces/channel
+/// keep [`member_sign_keys`]; nothing compares the two pseudonyms, so they diverge alone.
+pub fn membership_sign_keys(key: &TopicKey, topic_id: &str, member: &Identity) -> Result<Keys, HbError> {
+    let ikm = member.keys().secret_key().secret_bytes();
+    let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT_TOPIC_MEMBER), &ikm);
+    let mut info = b"member/v2".to_vec();
+    info.extend_from_slice(&key.0);
+    info.extend_from_slice(topic_id.as_bytes());
+    let mut out = [0u8; 32];
+    hk.expand(&info, &mut out).expect("32 is a valid HKDF-SHA256 output length");
+    // A uniform 32-byte HKDF output is a valid secp256k1 scalar with overwhelming probability; the
+    // ~2^-128 out-of-range case surfaces as a clean Err (never a panic), as in member_sign_keys.
+    let sk = SecretKey::from_slice(&out).map_err(|e| HbError::Nostr(e.to_string()))?;
+    Ok(Keys::new(sk))
+}
+
 // ── proof-of-participation (chorus-1: real-key authorization, carried in ciphertext) ─────────────
 
 /// The `hbm:` proof domain prefixes — **launch-frozen wire discriminants** (they live inside signed
 /// proof events that persist in members' rosters), extracted as consts so the wire-freeze test can
 /// pin them (INVARIANT_AUDIT.md I-3).
+/// The v1 join prefix. Superseded by `PROOF_JOIN2_PREFIX` (QURATOR-292) — no production path builds
+/// a v1 statement any more, but the string is kept and frozen: v1 proofs still live inside sealed
+/// roster events on relays, and the freeze records what the v2-only reader must keep NOT accepting.
+#[allow(dead_code)] // referenced only by cfg(test) code (wire_freeze + the v1-rejection tests)
 pub(crate) const PROOF_JOIN_PREFIX: &str = "hbm:join:";
+/// QURATOR-292 — the v2 membership proof prefix. DISTINCT from `PROOF_JOIN_PREFIX`, and not merely a
+/// different literal: the v2 statement also names the pseudonym pubkey that signed the OUTER
+/// membership event. If the reader accepted the old `hbm:join:{topic_id}` shape (which names no
+/// pseudonym), an attacker could wrap a victim's old v1 proof in an event signed by the ATTACKER's
+/// own pseudonym and enrol the victim at a coordinate the attacker controls. The distinct prefix is
+/// a downgrade guard, not cosmetics. **Launch-frozen** in `wire_freeze`.
+pub(crate) const PROOF_JOIN2_PREFIX: &str = "hbm:join2:";
 pub(crate) const PROOF_POST_PREFIX: &str = "hbm:post:";
 /// M13 Part A — the broadcast-announce proof prefix. MANDATORY and distinct from `PROOF_POST_PREFIX`:
 /// without its own prefix, a topic-key holder could decrypt a member's ordinary post (proof binds
@@ -496,12 +541,13 @@ pub(crate) const PROOF_POST_PREFIX: &str = "hbm:post:";
 /// `verify_proof` reject that promotion (see `a_posts_proof_cannot_be_promoted_to_an_announce`).
 pub(crate) const PROOF_ANNOUNCE_PREFIX: &str = "hbm:announce:";
 
-/// The canonical statement a member's REAL key signs to authorize joining `topic_id`. The `hbm:`
-/// prefix is a **Hoardbook-specific domain separator** (chorus-2): without it, a `KIND_TOPIC_PROOF`
-/// event Alice ever signs for *any other* app with content `join:x` could be replayed as a Hoardbook
-/// membership proof. The prefix binds the proof to this protocol.
-fn membership_statement(topic_id: &str) -> String {
-    format!("{PROOF_JOIN_PREFIX}{topic_id}")
+/// The canonical v2 statement a member's REAL key signs to authorize joining `topic_id` **under the
+/// pseudonym `pseudonym`** — the pseudonym pubkey that signs the outer membership event. This IS the
+/// B2 binding since QURATOR-292: the verifier cannot re-derive a secret-keyed pseudonym, so instead
+/// the real key must have committed to the exact `event.pubkey` it authorizes. Domain-separated by
+/// the `hbm:` prefix (chorus-2) and by `join2` vs the v1 shape (the downgrade guard above).
+fn membership_statement_v2(topic_id: &str, pseudonym: &PublicKey) -> String {
+    format!("{PROOF_JOIN2_PREFIX}{topic_id}:{}", pseudonym.to_hex())
 }
 
 /// The canonical statement an author's REAL key signs to authorize a post (binds the body so a
@@ -615,14 +661,17 @@ pub fn parse_announce(event: &Event) -> Result<TopicMeta, HbError> {
 
 // ── MEMBERSHIP (durable roster) ──────────────────────────────────────────────────────────────────
 
-/// Seal a membership event for `member` (their own `Identity`, so it can sign the real-key proof) in
-/// the Topic — encrypted under the topic key (domain 0x01), signed on the wire by the **derived
-/// pseudonym** (B2), `d` = topic_id (replaceable per member). The real npub + the proof live only
-/// inside the ciphertext. You only ever seal your **own** membership (you join).
+/// Seal a membership event for `member` (their own `Identity`, so it can sign the real-key proof and
+/// derive the secret-keyed pseudonym) in the Topic — encrypted under the topic key (domain 0x01),
+/// signed on the wire by the **membership pseudonym** [`membership_sign_keys`] (QURATOR-292: derived
+/// from the member's SECRET, so no key-holder can produce it), `d` = topic_id (replaceable per
+/// member). The real npub + the proof live only inside the ciphertext; the proof's statement names
+/// this pseudonym, which is what binds `event.pubkey` to the member on the reader side. You only
+/// ever seal your **own** membership (you join).
 pub fn seal_membership(key: &TopicKey, topic_id: &str, member: &Identity, now: u64) -> Result<Event, HbError> {
     let member_pk = member.public_key();
-    let signer = member_sign_keys(key, &member_pk)?;
-    let proof = build_proof(member, &membership_statement(topic_id), now)?;
+    let signer = membership_sign_keys(key, topic_id, member)?;
+    let proof = build_proof(member, &membership_statement_v2(topic_id, &signer.public_key()), now)?;
     let payload = serde_json::to_string(&MemberPayload {
         member_npub: member_pk.to_bech32().map_err(|e| HbError::Nostr(e.to_string()))?,
         joined_at: now,
@@ -641,9 +690,14 @@ pub fn seal_membership(key: &TopicKey, topic_id: &str, member: &Identity, now: u
 }
 
 /// Open a membership event with the topic key → the real member + join time. Enforces: the event
-/// kind, a valid signature (the pseudonym did sign it), the 0x01 domain byte, **and the B2 binding** —
-/// `event.pubkey` must equal the pseudonym re-derived from the decrypted npub, so a key-holder cannot
-/// forge a roster entry under another member's npub. A non-member (no key) gets `Err` (no decrypt).
+/// kind, a valid signature (the pseudonym did sign it), the 0x01 domain byte, **and the B2 binding
+/// (v2)** — the real-key proof must state `hbm:join2:{topic_id}:{event.pubkey}`, i.e. the member's
+/// real key authorized the EXACT pseudonym that signed this event. The verifier cannot re-derive the
+/// secret-keyed pseudonym (QURATOR-292), so the commitment rides the proof instead: a key-holder can
+/// sign with their own pseudonym and claim any npub in the ciphertext, but then the statement names
+/// THEIR pubkey and the claimed member's key never signed it. The v1 statement (`hbm:join:…`, no
+/// pseudonym) is rejected by the distinct prefix — the downgrade guard. v2-ONLY by owner ruling
+/// (republish-on-next-launch, no dual-read). A non-member (no key) gets `Err` (no decrypt).
 pub fn open_membership(key: &TopicKey, event: &Event) -> Result<Membership, HbError> {
     if event.kind != Kind::from_u16(KIND_TOPIC_MEMBER) {
         return Err(HbError::InvalidEvent("not a topic membership event".into()));
@@ -653,16 +707,15 @@ pub fn open_membership(key: &TopicKey, event: &Event) -> Result<Membership, HbEr
     let plain = topic_decrypt(key, MEMBERSHIP_DOMAIN, crypto_v, &event.content)?;
     let payload: MemberPayload = serde_json::from_slice(&plain)?;
     let member = parse_npub(&payload.member_npub)?;
-    // B2 binding: the signing pseudonym must be the one derived from this member under this key.
-    let expected = member_sign_keys(key, &member)?.public_key();
-    if event.pubkey != expected {
-        return Err(HbError::InvalidEvent(
-            "membership pubkey does not bind to the claimed member (B2 forgery guard)".into(),
-        ));
-    }
-    // chorus-1: the real-key proof of participation — only the member's own key could have signed
-    // `join:{topic_id}` at `joined_at`, so a key-holder cannot enrol a never-joiner.
-    verify_proof(&payload.proof, &member, &membership_statement(&topic_id_of(event)?), payload.joined_at)?;
+    // B2 binding (v2) + chorus-1 in one check: only the member's own real key could have signed
+    // `join2:{topic_id}:{this event's pubkey}` at `joined_at` — so a key-holder can neither enrol a
+    // never-joiner nor rebind a member to a coordinate (pseudonym) of the key-holder's choosing.
+    verify_proof(
+        &payload.proof,
+        &member,
+        &membership_statement_v2(&topic_id_of(event)?, &event.pubkey),
+        payload.joined_at,
+    )?;
     Ok(Membership { member, joined_at: payload.joined_at })
 }
 
@@ -1492,20 +1545,60 @@ mod tests {
 
     #[test]
     fn membership_pubkey_is_the_derived_pseudonym_not_the_real_npub() {
-        // B2: the Nostr `pubkey` field is the topic-scoped pseudonym; the real npub is ONLY inside the
-        // topic_key-encrypted content. A holder of neither key reads no npub from the raw event.
+        // B2 (QURATOR-292): the Nostr `pubkey` field is the topic-scoped MEMBERSHIP pseudonym derived
+        // from the member's SECRET; the real npub is ONLY inside the topic_key-encrypted content. A
+        // holder of neither key reads no npub from the raw event.
         let (meta, key) = public_topic();
         let member = Identity::generate();
         let ev = seal_membership(&key, &meta.topic_id, &member, NOW).unwrap();
 
-        let expected_pseudonym = member_sign_keys(&key, &member.public_key()).unwrap().public_key();
+        // Call the production derivation — the expected value is NOT rebuilt by hand here.
+        let expected_pseudonym = membership_sign_keys(&key, &meta.topic_id, &member).unwrap().public_key();
         assert_eq!(ev.pubkey, expected_pseudonym, "event.pubkey is the derived pseudonym");
         assert_ne!(ev.pubkey, member.public_key(), "event.pubkey is NOT the real npub");
+        // QURATOR-292: the OLD public tweak (HMAC over the public npub, derivable by any key-holder)
+        // must NO LONGER yield the membership pseudonym — that derivability was the eviction hole.
+        let old_public_tweak = member_sign_keys(&key, &member.public_key()).unwrap().public_key();
+        assert_ne!(ev.pubkey, old_public_tweak, "the public npub no longer derives the membership pseudonym");
 
         // The real npub (hex AND bech32) must not appear anywhere in the raw event (it is in ciphertext).
         let json = ev.as_json();
         assert!(!json.contains(&member.public_key().to_hex()), "real npub hex must not leak in the raw event");
         assert!(!json.contains(&member.npub()), "real npub bech32 must not leak in the raw event");
+    }
+
+    /// Acceptance 4 (QURATOR-292): the pseudonym is a pure function of (member secret, topic_key,
+    /// topic_id) — a reinstall with a restored nsec + re-obtained topic key re-derives the SAME
+    /// pseudonym, and both rotation inputs (key, topic) yield fresh pseudonyms as before.
+    ///
+    /// P-10 mutation anchors (orchestrator runs these — production edits, by line):
+    /// - topic.rs line 508 (`info.extend_from_slice(&key.0);` in `membership_sign_keys`) → deleting
+    ///   that line makes the "a different topic key yields a different pseudonym" assert RED.
+    /// - topic.rs line 509 (`info.extend_from_slice(topic_id.as_bytes());`) → deleting it makes the
+    ///   "a different topic_id yields a different pseudonym" assert RED.
+    ///
+    /// Line numbers verified against the tree that ships this test; re-verify before mutating.
+    #[test]
+    fn membership_pseudonym_rederives_after_reinstall() {
+        let (meta, key) = public_topic();
+        let member = Identity::generate();
+
+        let a = membership_sign_keys(&key, &meta.topic_id, &member).unwrap().public_key();
+        // Re-derive from the SAME inputs (the reinstall: restored nsec, re-obtained key) → identical.
+        let b = membership_sign_keys(&key, &meta.topic_id, &member).unwrap().public_key();
+        assert_eq!(a, b, "a reinstall re-derives the same membership pseudonym");
+        assert_ne!(a, member.public_key(), "the pseudonym is still not the real npub (unlinkability)");
+
+        // Rotation freshness: new topic key, or the same member in another topic → new pseudonym.
+        let (_other_meta, other_key) = new_topic("other", "", vec![], false).unwrap();
+        let c = membership_sign_keys(&other_key, &meta.topic_id, &member).unwrap().public_key();
+        assert_ne!(a, c, "a different topic key yields a different pseudonym");
+        let d = membership_sign_keys(&key, "deadbeef", &member).unwrap().public_key();
+        assert_ne!(a, d, "a different topic_id yields a different pseudonym");
+
+        // And it round-trips on the wire: the re-derived pseudonym is the one the sealed event carries.
+        let ev = seal_membership(&key, &meta.topic_id, &member, NOW).unwrap();
+        assert_eq!(ev.pubkey, a, "the re-derived pseudonym signs the membership event");
     }
 
     #[test]
@@ -2182,33 +2275,64 @@ mod tests {
 
     #[test]
     fn b2_forged_npub_binding_is_rejected() {
-        // A key-holder seals a membership but lies about whose npub it is: encrypt a DIFFERENT npub in
-        // the content while signing with a pseudonym derived from yet another — open_membership re-derives
-        // and rejects the mismatch (roster-integrity guard).
+        // QURATOR-292 rewrite: the verifier can no longer re-derive the secret-keyed pseudonym, so the
+        // npub↔pubkey binding now rides the v2 proof — the member's real key must have signed
+        // `hbm:join2:{topic_id}:{event.pubkey}`. An insider can still sign with a pseudonym of their
+        // OWN (member_sign_keys on their own npub — that derivation survives for posts), but it binds
+        // nothing: every way of claiming the victim's npub under the attacker's pubkey is rejected.
         let (meta, key) = public_topic();
-        let real = Identity::generate();
         let victim = Identity::generate();
-        // Sign with the pseudonym for `real`, but claim to be `victim` in the ciphertext.
-        let signer = member_sign_keys(&key, &real.public_key()).unwrap();
-        let payload = serde_json::to_string(&MemberPayload {
-            member_npub: victim.npub(),
-            joined_at: NOW,
-            proof: String::new(), // rejected on the B2 pseudonym binding before the proof is even checked
-        })
-        .unwrap();
-        let content = topic_encrypt(&key, MEMBERSHIP_DOMAIN, &payload).unwrap();
-        let forged = EventBuilder::new(Kind::from_u16(KIND_TOPIC_MEMBER), content)
-            .tags([
-                Tag::identifier(meta.topic_id.clone()),
-                Tag::custom(TagKind::custom(TAG_CRYPTO), [CRYPTO_V.to_string()]),
-            ])
-            .custom_created_at(Timestamp::from(NOW))
-            .sign_with_keys(&signer)
+        let attacker = Identity::generate();
+        // A pseudonym the insider CAN produce: the old public tweak over their OWN npub.
+        let attacker_signer = member_sign_keys(&key, &attacker.public_key()).unwrap();
+
+        let forge = |proof: String, signer: &Keys| {
+            let payload = serde_json::to_string(&MemberPayload {
+                member_npub: victim.npub(),
+                joined_at: NOW,
+                proof,
+            })
             .unwrap();
+            EventBuilder::new(Kind::from_u16(KIND_TOPIC_MEMBER), topic_encrypt(&key, MEMBERSHIP_DOMAIN, &payload).unwrap())
+                .tags([Tag::identifier(meta.topic_id.clone()), Tag::custom(TagKind::custom(TAG_CRYPTO), [CRYPTO_V.to_string()])])
+                .custom_created_at(Timestamp::from(NOW))
+                .sign_with_keys(signer)
+                .unwrap()
+        };
+
+        // (a) Claim the victim's npub under the attacker's pseudonym, no proof → rejected (the proof
+        // must be a real-key signature naming the ATTACKER's pubkey — the victim never made one).
         assert!(
-            matches!(open_membership(&key, &forged), Err(HbError::InvalidEvent(_))),
-            "a membership whose pubkey doesn't bind to its claimed npub is rejected"
+            open_membership(&key, &forge(String::new(), &attacker_signer)).is_err(),
+            "claiming the victim's npub under the attacker's own pseudonym is rejected"
         );
+
+        // (b) Steal the victim's GENUINE v2 proof and re-wrap it in an event signed by the attacker's
+        // pseudonym → rejected: the genuine proof names the VICTIM's pseudonym, the statement the
+        // reader rebuilds names the attacker's (event.pubkey), so the commitment does not match.
+        let genuine = seal_membership(&key, &meta.topic_id, &victim, NOW).unwrap();
+        let plain = topic_decrypt(&key, MEMBERSHIP_DOMAIN, CRYPTO_V, &genuine.content).unwrap();
+        let genuine_payload: MemberPayload = serde_json::from_slice(&plain).unwrap();
+        assert!(
+            open_membership(&key, &forge(genuine_payload.proof, &attacker_signer)).is_err(),
+            "a genuine proof re-wrapped under the attacker's pseudonym is rejected (it names the victim's pseudonym)"
+        );
+
+        // (c) DOWNGRADE GUARD: a v1-shape proof (`hbm:join:{topic_id}`, names NO pseudonym) genuinely
+        // signed by the victim's real key at the right time — if the reader ever rebuilt the v1
+        // statement instead of the v2 one, this would OPEN and enrol the victim at the attacker's
+        // coordinate. The distinct `join2` prefix is what rejects it.
+        let v1_proof = build_proof(&victim, &format!("{PROOF_JOIN_PREFIX}{}", meta.topic_id), NOW).unwrap();
+        assert!(
+            open_membership(&key, &forge(v1_proof.as_json(), &attacker_signer)).is_err(),
+            "a v1 statement (no pseudonym commitment) must be rejected by the v2-only reader"
+        );
+
+        // P-10 mutation anchor (orchestrator runs it): topic.rs line 716 — the
+        // `&membership_statement_v2(&topic_id_of(event)?, &event.pubkey),` argument in
+        // `open_membership`. Revert it to the v1 shape (drop the `&event.pubkey` commitment / use
+        // PROOF_JOIN_PREFIX) and sub-case (c) turns GREEN-where-it-must-be-RED, failing this test.
+        // Sub-cases (a)/(b) stay red under that mutation, so (c) is the discriminator.
     }
 
     #[test]
@@ -2222,15 +2346,20 @@ mod tests {
 
     #[test]
     fn insider_cannot_forge_membership_for_a_never_joiner() {
-        // THE chorus-1 CRITICAL: a topic-key holder can derive ANY member's pseudonym signing key, so
-        // the B2 pubkey-binding alone does not stop an insider from enrolling someone who never joined.
-        // The real-key proof-of-participation does: the insider has no valid proof signed by the victim,
-        // and cannot forge one. open_membership rejects.
+        // QURATOR-292 rewrite. The OLD attack, replayed exactly: a topic-key holder derives the
+        // victim's pseudonym from the PUBLIC npub via the old HMAC tweak and (a) enrols a never-joiner
+        // or (b) — worse, since kind 31118 is ADDRESSABLE — publishes junk at
+        // `(P_victim, 31118, topic_id)` with a later `created_at`, which every NIP-01 relay honours
+        // as a supersession. The new derivation is over the member's SECRET, so the old attack's key
+        // no longer reaches the victim's coordinate at all — and the event it does produce is
+        // rejected on the v2 proof. (Vector 1, NIP-09 retraction, needs the same pseudonym key and
+        // dies with it: an insider holding (topic_key, victim npub) can no longer sign AS the victim.)
         let (meta, key) = public_topic();
         let victim = Identity::generate(); // never joined; the insider knows only the public npub
-        let insider_signer = member_sign_keys(&key, &victim.public_key()).unwrap(); // derivable by any keyholder
+        let insider = Identity::generate();
+        let old_attack_key = member_sign_keys(&key, &victim.public_key()).unwrap(); // derivable by any keyholder — the OLD hole
 
-        // (a) No proof at all → reject.
+        // (a) The old attack, no proof at all → reject.
         let no_proof = serde_json::to_string(&MemberPayload {
             member_npub: victim.npub(),
             joined_at: NOW,
@@ -2239,15 +2368,14 @@ mod tests {
         .unwrap();
         let forged = EventBuilder::new(Kind::from_u16(KIND_TOPIC_MEMBER), topic_encrypt(&key, MEMBERSHIP_DOMAIN, &no_proof).unwrap())
             .tags([Tag::identifier(meta.topic_id.clone()), Tag::custom(TagKind::custom(TAG_CRYPTO), [CRYPTO_V.to_string()])])
-            .custom_created_at(Timestamp::from(NOW))
-            .sign_with_keys(&insider_signer)
+            .custom_created_at(Timestamp::from(NOW + 1)) // later created_at: the supersession shape
+            .sign_with_keys(&old_attack_key)
             .unwrap();
         assert!(open_membership(&key, &forged).is_err(), "an insider with no real-key proof cannot enrol the victim");
 
         // (b) A proof the INSIDER signs (with their own key, claiming to be the victim) → reject: the
         // proof is not signed by the victim's real key.
-        let insider = Identity::generate();
-        let bogus_proof = build_proof(&insider, &membership_statement(&meta.topic_id), NOW).unwrap();
+        let bogus_proof = build_proof(&insider, &membership_statement_v2(&meta.topic_id, &forged.pubkey), NOW).unwrap();
         let with_bogus = serde_json::to_string(&MemberPayload {
             member_npub: victim.npub(),
             joined_at: NOW,
@@ -2256,14 +2384,77 @@ mod tests {
         .unwrap();
         let forged2 = EventBuilder::new(Kind::from_u16(KIND_TOPIC_MEMBER), topic_encrypt(&key, MEMBERSHIP_DOMAIN, &with_bogus).unwrap())
             .tags([Tag::identifier(meta.topic_id.clone()), Tag::custom(TagKind::custom(TAG_CRYPTO), [CRYPTO_V.to_string()])])
-            .custom_created_at(Timestamp::from(NOW))
-            .sign_with_keys(&insider_signer)
+            .custom_created_at(Timestamp::from(NOW + 1))
+            .sign_with_keys(&old_attack_key)
             .unwrap();
         assert!(open_membership(&key, &forged2).is_err(), "a proof not signed by the victim's real key is rejected");
 
+        // (c) THE VECTOR-2 DISCRIMINATOR: the coordinate the old attack reaches is NOT the coordinate
+        // the member's real membership lives at. Under the old derivation these were EQUAL — that is
+        // what made the addressable-kind supersession (and the NIP-09 retraction) constructible. If
+        // this ever regresses to equality, the eviction hole is back regardless of the proof checks.
+        let genuine = seal_membership(&key, &meta.topic_id, &victim, NOW).unwrap();
+        assert_ne!(
+            forged.pubkey, genuine.pubkey,
+            "the publicly-derivable key must not reach the member's membership coordinate"
+        );
+        assert_ne!(
+            member_sign_keys(&key, &victim.public_key()).unwrap().public_key(),
+            genuine.pubkey,
+            "no (topic_key, npub)-derived value equals the secret-keyed membership pseudonym"
+        );
+
         // And the victim's OWN membership opens fine (positive control).
-        let real = seal_membership(&key, &meta.topic_id, &victim, NOW).unwrap();
-        assert_eq!(open_membership(&key, &real).unwrap().member, victim.public_key());
+        assert_eq!(open_membership(&key, &genuine).unwrap().member, victim.public_key());
+
+        // P-10 mutation anchor (orchestrator runs it): topic.rs line 673 —
+        // `let signer = membership_sign_keys(key, topic_id, member)?;` in `seal_membership`. Revert
+        // it to `member_sign_keys(key, &member_pk)?` and sub-case (c)'s `assert_ne!` pair turns RED
+        // (the forged coordinate becomes the genuine one, i.e. the supersession is constructible
+        // again), while the proof-based asserts in (a)/(b) would stay green, so (c) is the
+        // discriminator for the derivation swap itself.
+    }
+
+    /// QURATOR-292 migration ruling: the reader verifies v2 ONLY — republish-on-next-launch, NO
+    /// dual-read, because accepting v1 anywhere re-opens the exact hole this closes (a v1 proof
+    /// names no pseudonym, so it is wrappable in an attacker-signed event). This test rebuilds,
+    /// byte-faithfully, what the pre-QURATOR-292 `seal_membership` put on relays — the old
+    /// HMAC pseudonym as `event.pubkey` + the member's own genuine `hbm:join:{topic_id}` proof —
+    /// and pins that the v2-only reader drops it until the member republishes.
+    ///
+    /// P-10 mutation anchor (orchestrator runs it): topic.rs line 716 — the
+    /// `&membership_statement_v2(&topic_id_of(event)?, &event.pubkey),` argument in
+    /// `open_membership`. Make it fall back to the v1 shape (accept v2 OR
+    /// `format!("{PROOF_JOIN_PREFIX}{topic_id}")`) — a dual-read. This test turns RED (the v1
+    /// event opens), which is precisely the regression the ruling forbids.
+    #[test]
+    fn v1_membership_events_are_rejected_by_the_v2_only_reader() {
+        let (meta, key) = public_topic();
+        let member = Identity::generate();
+
+        // The pre-QURATOR-292 shape: old public-tweak pseudonym, old statement (no pseudonym in it).
+        let v1_signer = member_sign_keys(&key, &member.public_key()).unwrap();
+        let v1_proof = build_proof(&member, &format!("{PROOF_JOIN_PREFIX}{}", meta.topic_id), NOW).unwrap();
+        let v1_payload = serde_json::to_string(&MemberPayload {
+            member_npub: member.npub(),
+            joined_at: NOW,
+            proof: v1_proof.as_json(),
+        })
+        .unwrap();
+        let v1_event = EventBuilder::new(Kind::from_u16(KIND_TOPIC_MEMBER), topic_encrypt(&key, MEMBERSHIP_DOMAIN, &v1_payload).unwrap())
+            .tags([Tag::identifier(meta.topic_id.clone()), Tag::custom(TagKind::custom(TAG_CRYPTO), [CRYPTO_V.to_string()])])
+            .custom_created_at(Timestamp::from(NOW))
+            .sign_with_keys(&v1_signer)
+            .unwrap();
+
+        assert!(
+            open_membership(&key, &v1_event).is_err(),
+            "the v2-only reader rejects pre-migration membership events (republish-on-next-launch, no dual-read)"
+        );
+
+        // The member republishes through the current production path → accepted again.
+        let republished = seal_membership(&key, &meta.topic_id, &member, NOW).unwrap();
+        assert_eq!(open_membership(&key, &republished).unwrap().member, member.public_key());
     }
 
     #[test]

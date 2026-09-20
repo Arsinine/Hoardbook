@@ -185,6 +185,14 @@ fn tag_names_are_frozen_and_all_duplicates_agree() {
 fn hkdf_salts_are_frozen() {
     assert_eq!(HKDF_SALT, b"hoardbook/browse-key".as_slice(), "listing::HKDF_SALT — {FREEZE}");
     assert_eq!(HKDF_SALT_CEK, b"hoardbook/cek".as_slice(), "listing::HKDF_SALT_CEK — {FREEZE}");
+    // QURATOR-292 (ADD-only): the membership-pseudonym salt. Changing it re-keys every member's
+    // membership pseudonym, stranding every sealed roster event already on a relay at a coordinate
+    // the member no longer signs at (kind 31118 is addressable — the supersession hole).
+    assert_eq!(
+        topic::HKDF_SALT_TOPIC_MEMBER,
+        b"hoardbook/topic-member".as_slice(),
+        "topic::HKDF_SALT_TOPIC_MEMBER — {FREEZE}"
+    );
 }
 
 /// The `hbm:` proof-statement domain prefixes (chorus-2 domain separation). A change invalidates
@@ -194,6 +202,10 @@ fn proof_domain_prefixes_are_frozen() {
     assert_eq!(topic::PROOF_JOIN_PREFIX, "hbm:join:", "topic::PROOF_JOIN_PREFIX — {FREEZE}");
     assert_eq!(topic::PROOF_POST_PREFIX, "hbm:post:", "topic::PROOF_POST_PREFIX — {FREEZE}");
     assert_eq!(topic::PROOF_ANNOUNCE_PREFIX, "hbm:announce:", "topic::PROOF_ANNOUNCE_PREFIX — {FREEZE}");
+    // QURATOR-292 (ADD-only): the v2 membership proof prefix. The DISTINCT prefix vs the v1
+    // `hbm:join:` above is the downgrade guard — the v2-only reader must keep refusing proofs that
+    // name no pseudonym, or a victim's old v1 proof becomes wrappable in an attacker-signed event.
+    assert_eq!(topic::PROOF_JOIN2_PREFIX, "hbm:join2:", "topic::PROOF_JOIN2_PREFIX — {FREEZE}");
 }
 
 /// The topic ciphertext DOMAIN BYTES (F17) — the first plaintext byte inside every topic_key

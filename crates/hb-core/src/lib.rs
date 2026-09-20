@@ -69,7 +69,8 @@ pub use transport_payload::{
 };
 pub use sharecode::ShareCode;
 pub use topic::{
-    announce_cooldown_remaining, build_announce, build_public_join, member_sign_keys, mint_invite,
+    announce_cooldown_remaining, build_announce, build_public_join, member_sign_keys,
+    membership_sign_keys, mint_invite,
     new_topic, open_announce, open_channel_item, open_membership, open_post, parse_announce,
     public_join_identity, public_join_keys, redeem_invite, roster, seal_announce, seal_membership,
     seal_post, topic_id_for_name, topic_root, validate_public_name, Announcement, ChannelItem,
