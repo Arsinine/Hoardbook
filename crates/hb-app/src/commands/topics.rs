@@ -900,8 +900,11 @@ fn membership_vintage(
     let Some(json) = membership_json else { return MembershipVintage::Absent };
     let Ok(ev) = Event::from_json(json) else { return MembershipVintage::Unreadable };
     // The v2 fast path: authored by the member-secret pseudonym for THIS (key, topic_id) ⇒ already
-    // current, never touched. (A derivation Err is the ~2^-128 scalar-out-of-range case; falling
-    // through to the Foreign tail — never republished — is the safe direction.)
+    // current, never touched. (A derivation Err is the ~2^-128 scalar-out-of-range case. It skips
+    // only THIS arm — a genuine v1 record still classifies MyV1 and attempts the republish, where
+    // `seal_membership` hits the same Err and returns before publishing: a warn per open, zero
+    // relay traffic, no store write. Safe, but by failing inside `join_topic` rather than by
+    // falling to the Foreign tail, which an earlier version of this comment claimed.)
     let v2_author = membership_sign_keys(key, topic_id, me).ok().map(|k| k.public_key());
     if v2_author.as_ref() == Some(&ev.pubkey) {
         return MembershipVintage::V2;
@@ -926,15 +929,26 @@ fn store_republished_membership(
     stored: &StoredTopic,
     ev: &Event,
 ) -> Result<(), String> {
-    store_topic(
-        store,
-        StoredTopic {
-            meta: stored.meta.clone(),
-            key: stored.key.clone(),
-            joined_at: stored.joined_at,
-            membership_json: Some(ev.as_json()),
-        },
-    )
+    // ⚠ UPDATE-ONLY — deliberately NOT `store_topic`, whose push-if-absent arm is correct for a
+    // JOIN and is a resurrection vector here (QURATOR-292 review, F1). `join_topic` above is
+    // awaited, so a concurrent `topic_leave` can drop this row while the publish is in flight
+    // (Tauri commands run concurrently). Pushing the row back then un-leaves the member: enrolled
+    // on the relay AND the topic restored to their store, with no affordance saying so. The
+    // migration heals a membership the member already has; it must never CREATE one. A row that
+    // vanished mid-flight means the member left, and the relay-side re-enrolment is corrected by
+    // their next leave — which now works, because the republished record is v2 and
+    // `membership_deletion` accepts an author-signed retraction.
+    let mut topics = store.load_topics().map_err(cmd_err)?;
+    let Some(row) = topics.iter_mut().find(|x| x.meta.topic_id == stored.meta.topic_id) else {
+        tracing::info!(
+            topic = %stored.meta.topic_id,
+            "membership republished but the topic was left while the publish was in flight; not \
+             restoring the row (the leave wins)"
+        );
+        return Ok(());
+    };
+    row.membership_json = Some(ev.as_json());
+    store.save_topics(&topics).map_err(cmd_err)
 }
 
 /// The migration trigger, run on every roster open. Best-effort BY CONSTRUCTION: it returns `()`
@@ -1627,10 +1641,14 @@ mod tests {
     /// no `PartialEq`, so key preservation is proven functionally, not by field compare), and an
     /// unrelated sibling topic in the same store is untouched.
     ///
-    /// MUTATION (P-10): at topics.rs line 929 — the `store_topic(` call inside
-    /// `store_republished_membership` — replace the whole call expression with `Ok(())` (delete
-    /// the write) → this test reds (the reloaded record still holds the v1 JSON, so both the json
-    /// and the v2-classification asserts fail).
+    /// MUTATION (P-10) — resolve by production line number at apply time, never by text:
+    ///   `store_republished_membership`'s write, `store.save_topics(&topics)` (topics.rs:951 at
+    ///   time of writing) — replace it with `Ok(())`, deleting the write → this test reds (the
+    ///   reloaded record still holds the v1 JSON, so both the json and v2-classification asserts
+    ///   fail).
+    /// ⚠ This anchor previously cited line 929 and the `store_topic(` call; the QURATOR-292 review
+    /// (F1) replaced that call with an update-only body, so both the line and the symbol moved.
+    /// Re-read the line you are about to mutate — an anchor is a recipe a future reader follows.
     #[test]
     fn republish_overwrites_only_the_membership_record() {
         let dir = tempfile::tempdir().unwrap();
@@ -1684,6 +1702,49 @@ mod tests {
         assert_eq!(sibling.membership_json, None, "an unrelated topic's record is untouched");
         assert_eq!(sibling.joined_at, 7, "an unrelated topic's join time is untouched");
     }
+
+    /// QURATOR-292 review, F1: the migration must never RESURRECT a topic the member left while
+    /// its publish was in flight. `join_topic` is awaited and Tauri commands run concurrently, so
+    /// a `topic_leave` can drop the row mid-publish; if the store write then used `store_topic`,
+    /// its push-if-absent arm (correct for a JOIN) would put the row back and the member would be
+    /// un-left — enrolled on the relay AND the topic restored locally, with nothing saying so.
+    /// The migration heals a membership the member already has; it must never create one.
+    ///
+    /// MUTATION (P-10) — resolve by production line number at apply time, never by text:
+    ///   in `store_republished_membership`, replace the update-only body with the old
+    ///   `store_topic(store, StoredTopic { .. })` call → the absent row is pushed back and the
+    ///   `is_none()` assert below reds.
+    #[test]
+    fn a_topic_left_mid_publish_is_not_resurrected_by_the_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let (meta, key) = new_topic("video/films", "", vec![], true).unwrap();
+        let me = Identity::generate();
+        let stored = StoredTopic { meta: meta.clone(), key, joined_at: 42, membership_json: None };
+
+        // The leave already won the race: the row is gone from the store, but the migration still
+        // holds the `stored` snapshot it loaded before the publish.
+        let (other_meta, other_key) = new_topic("video/animes", "", vec![], true).unwrap();
+        store
+            .save_topics(&[StoredTopic {
+                meta: other_meta.clone(),
+                key: other_key,
+                joined_at: 7,
+                membership_json: None,
+            }])
+            .unwrap();
+
+        let fresh = seal_membership(&stored.key, &meta.topic_id, &me, 9_999).unwrap();
+        store_republished_membership(&store, &stored, &fresh).expect("a lost race is not an error");
+
+        let back = store.load_topics().unwrap();
+        assert!(
+            back.iter().find(|t| t.meta.topic_id == meta.topic_id).is_none(),
+            "the left topic must NOT be restored by the in-flight migration — the leave wins"
+        );
+        assert_eq!(back.len(), 1, "the sibling topic is untouched: {back:?}");
+    }
+
 
     /// The wiring, pinned structurally (same convention as the `topic_leave` scan above): the
     /// roster open must run the migration BEFORE the roster fetch, and the migration helper must
@@ -2329,8 +2390,10 @@ mod tests {
 
         /// Seed one stored Topic (APPENDING — `save_topics` replaces the whole list, so two
         /// single-element saves would erase each other) and return its `topic_id`.
-        /// `membership_json: None` keeps every seeded topic off the wire (only `topic_leave` reads
-        /// it, and that path is relay-bound).
+        /// `membership_json: None` keeps every seeded topic off the wire — its two readers,
+        /// `topic_leave` and the QURATOR-305 migration, are both relay-bound and both treat
+        /// `None` as nothing-to-do (the migration classifies it `Absent` ⇒ no publish, pinned by
+        /// `missing_or_unparseable_records_are_no_action`).
         fn seed_topic(store: &DataStore, name: &str, description: &str, private: bool) -> String {
             let (meta, key) = new_topic(name, description, vec![], private).unwrap();
             let id = meta.topic_id.clone();
