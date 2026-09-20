@@ -17,14 +17,15 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use hb_core::topic::{
-    build_announce, build_public_join, new_topic, normalized_public_name, seal_membership,
-    topic_id_for_name, TopicMeta,
+    build_announce, build_public_join, member_sign_keys, membership_sign_keys, new_topic,
+    normalized_public_name, seal_membership, topic_id_for_name, TopicKey, TopicMeta,
+    KIND_TOPIC_MEMBER,
 };
 use hb_core::{announce_cooldown_remaining, Identity};
 use hb_net::{
     announce_to_topic, approve_join, discover_public_topics, discover_public_topics_paint,
     fetch_announce, fetch_channel_full, fetch_invite, fetch_roster, join_public, join_topic,
-    leave_topic, member_count, post_to_channel, publish_topic, rank_discovered_topics,
+    leave_topic, member_count, post_to_channel, publish_topic, rank_discovered_topics, RelayClient,
     request_join, TopicDiscoveries,
 };
 
@@ -848,6 +849,143 @@ pub struct RosterMemberView {
     pub dormant: Option<bool>,
 }
 
+// ── QURATOR-305: the v1→v2 membership migration (republish-on-next-launch) ───────────────────────
+//
+// QURATOR-292 moved the membership pseudonym to `membership_sign_keys` (HKDF over the member's own
+// SECRET). The reader is v2-ONLY by owner ruling — NO dual-read, because dual-verify would keep the
+// FORGEABLE v1 derivation accepted for the whole transition release, leaving both insider
+// roster-eviction vectors live for as long as the migration runs. The cost of that ruling: every
+// membership stored before the swap fails `open_membership`, so a member's own row falls off their
+// roster (empty ⇒ the derived DISSOLUTION signal) and the topic drops out of discovery entirely —
+// and "just re-join" cannot recover a PRIVATE topic without a fresh invite, which a member cannot
+// request from a topic that is invisible to them. The heal is republish-on-next-launch: on the
+// roster open, re-seal under the new derivation, publish, and overwrite the stored copy. One
+// round-trip, self-healing, retried on every open until it lands.
+
+/// What the stored `membership_json` is, relative to THIS member — the migration's decision,
+/// split out pure so the classification is unit-testable without a relay.
+enum MembershipVintage {
+    /// Already sealed under the current (QURATOR-292, member-secret) derivation — the silent
+    /// no-op arm. This is what makes the migration IDEMPOTENT: opening a v2 topic must not
+    /// publish, so the second open costs nothing.
+    V2,
+    /// Sealed under the pre-292 publicly-derivable derivation, and provably THIS member's — the
+    /// one arm that republishes.
+    MyV1,
+    /// Authored by NEITHER of this member's pseudonyms, or claims another topic: NOT this
+    /// member's membership. Republishing it would assert a membership that was never theirs, so
+    /// it is never touched.
+    Foreign,
+    /// A record exists but is not a parseable event — it cannot be positively identified, so it
+    /// is left untouched (and logged: silently skipping forever would hide the corruption).
+    Unreadable,
+    /// No stored `membership_json` (topics seeded before the record existed) — nothing to do.
+    Absent,
+}
+
+/// Classify the stored membership record. ⚠ POSITIVE identification, never mere negation: "not my
+/// v2 pseudonym" is NOT enough to republish, because the v1 derivation was PUBLICLY computable —
+/// any topic-key holder could author an event at any coordinate under it. `MyV1` therefore requires
+/// ALL of: the membership kind, the `d` tag claiming THIS topic (the join that wrote the record
+/// sealed this topic_id; a mismatch means the record was misfiled or tampered, not migrated), and
+/// the author being the OLD derivation's pseudonym for THIS member (`member_sign_keys`, which
+/// still signs posts — so the kind check is load-bearing: without it a misfiled POST, authored by
+/// that same still-current pseudonym, would classify as a membership).
+fn membership_vintage(
+    key: &TopicKey,
+    topic_id: &str,
+    me: &Identity,
+    membership_json: Option<&str>,
+) -> MembershipVintage {
+    let Some(json) = membership_json else { return MembershipVintage::Absent };
+    let Ok(ev) = Event::from_json(json) else { return MembershipVintage::Unreadable };
+    // The v2 fast path: authored by the member-secret pseudonym for THIS (key, topic_id) ⇒ already
+    // current, never touched. (A derivation Err is the ~2^-128 scalar-out-of-range case; falling
+    // through to the Foreign tail — never republished — is the safe direction.)
+    let v2_author = membership_sign_keys(key, topic_id, me).ok().map(|k| k.public_key());
+    if v2_author.as_ref() == Some(&ev.pubkey) {
+        return MembershipVintage::V2;
+    }
+    if ev.kind == Kind::from_u16(KIND_TOPIC_MEMBER) && ev.tags.identifier() == Some(topic_id) {
+        let v1_author = member_sign_keys(key, &me.public_key()).ok().map(|k| k.public_key());
+        if v1_author.as_ref() == Some(&ev.pubkey) {
+            return MembershipVintage::MyV1;
+        }
+    }
+    MembershipVintage::Foreign
+}
+
+/// Overwrite the stored `membership_json` with the republished event — the LAST step of the
+/// migration, and deliberately so: writing before the publish succeeds would flip the record to
+/// v2 while the wire still holds the stale v1 event, and the v2 fast path would then never retry
+/// (a one-shot migration with a poisoned flag). Everything else is preserved: meta, key, and the
+/// HISTORICAL `joined_at` (the republish re-seals NOW; the join happened when it happened). Split
+/// out so the store effect is testable without a relay.
+fn store_republished_membership(
+    store: &DataStore,
+    stored: &StoredTopic,
+    ev: &Event,
+) -> Result<(), String> {
+    store_topic(
+        store,
+        StoredTopic {
+            meta: stored.meta.clone(),
+            key: stored.key.clone(),
+            joined_at: stored.joined_at,
+            membership_json: Some(ev.as_json()),
+        },
+    )
+}
+
+/// The migration trigger, run on every roster open. Best-effort BY CONSTRUCTION: it returns `()`
+/// and cannot fail the roster read — the same lesson `topic_leave` learned the hard way (a `?` on
+/// a publish inside a read strands the user; see the comment there). A failed publish logs and the
+/// record stays v1, so the NEXT open retries; only a successful publish followed by a successful
+/// store write completes the migration.
+async fn republish_pre_v2_membership(
+    store: &DataStore,
+    stored: &StoredTopic,
+    me: &Identity,
+    client: &RelayClient,
+) {
+    match membership_vintage(&stored.key, &stored.meta.topic_id, me, stored.membership_json.as_deref()) {
+        MembershipVintage::V2 | MembershipVintage::Absent => {}
+        MembershipVintage::Unreadable => tracing::warn!(
+            topic = %stored.meta.topic_id,
+            "stored membership record is not a parseable event; leaving it untouched (it cannot be \
+             positively identified as this member's membership)"
+        ),
+        MembershipVintage::Foreign => tracing::warn!(
+            topic = %stored.meta.topic_id,
+            "stored membership record is authored by neither of this member's pseudonyms; NOT \
+             republishing — that would assert a membership that was never this member's"
+        ),
+        MembershipVintage::MyV1 => {
+            // `join_topic` IS the republish primitive — `seal_membership` under the v2 derivation
+            // + publish. Re-implementing the publish is how the WAN harness drifted from
+            // production before; reuse the production path.
+            match join_topic(client, &stored.key, &stored.meta.topic_id, me, now()).await {
+                Ok(ev) => {
+                    if let Err(e) = store_republished_membership(store, stored, &ev) {
+                        tracing::warn!(
+                            topic = %stored.meta.topic_id,
+                            error = %e,
+                            "membership republished but the local record overwrite failed; the \
+                             stored copy stays pre-v2 and the migration retries on the next open"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    topic = %stored.meta.topic_id,
+                    error = %e,
+                    "pre-v2 membership republish not published (relay refused or offline); the \
+                     roster read continues and the migration retries on the next open"
+                ),
+            }
+        }
+    }
+}
+
 /// Fetch a Topic's roster (members-only) and refresh the auto-added topic contacts. Each row
 /// carries its aliveness state (QURATOR-304) — see [`RosterMemberView`].
 #[tauri::command]
@@ -860,6 +998,15 @@ pub async fn topic_roster(
     let me = me(&identity).await?;
     let stored = load_stored(&store, &topic_id)?;
     let client = net::client(&me, &store, &relay).await.map_err(cmd_err)?;
+    // QURATOR-305 (republish-on-next-launch): a membership stored before the QURATOR-292 pseudonym
+    // swap is sealed under the old publicly-derivable derivation, so the v2-only reader drops it —
+    // this member's own row falls off the roster, an empty roster is the derived DISSOLUTION
+    // signal, and the topic drops out of discovery entirely. Re-seal, publish, overwrite —
+    // best-effort, BEFORE the roster read, so this open (or the next) sees the member back. This
+    // is the ONLY hook: `topic_list` is a store-only read with no identity and no relay client,
+    // and the member's own topic stays listed there (the store record is intact), so the roster
+    // open remains reachable for exactly the members who need the heal.
+    republish_pre_v2_membership(&store, &stored, &me, &client).await;
     let roster = fetch_roster(&client, &topic_id, &stored.key, net::RELAY_TIMEOUT).await.map_err(cmd_err)?;
     auto_add_roster(&store, &roster, &me.public_key())?;
     // QURATOR-304: the SAME author-bounded presence read the aliveness count folds
@@ -1309,6 +1456,300 @@ mod tests {
         assert!(
             publish_at < drop_at,
             "the local drop must follow the retraction attempt, and must run whether or not it failed"
+        );
+    }
+
+    // ── QURATOR-305: republish-on-next-launch (pre-v2 membership migration) ────────────────────────
+    //
+    // ⚠ Honest scope of everything below: the roster read needs a live relay, so NO test here
+    // drives `topic_roster` end-to-end — that proof belongs to the hb-it row owed on QURATOR-305.
+    // What IS proved, with real keys: the classification decision the migration acts on, and the
+    // store effect of a completed republish. The wiring is pinned structurally (same convention as
+    // `leaving_a_topic_does_not_depend_on_the_retraction_publishing` above).
+
+    /// The v2 fast path: a membership sealed under the CURRENT (member-secret) derivation must
+    /// classify `V2` — the silent no-op arm that makes the migration IDEMPOTENT (opening a topic
+    /// twice must not publish twice). Real crypto: `seal_membership` is the same production path
+    /// `join_topic` seals with.
+    ///
+    /// MUTATION (P-10) — resolve by production line number at apply time, never by text: at
+    /// topics.rs line 906 (`if v2_author.as_ref() == Some(&ev.pubkey) {`, inside
+    /// `membership_vintage`), prefix the condition with `false &&` → this test reds (the v2 event
+    /// falls through to `Foreign`).
+    #[test]
+    fn a_v2_membership_classifies_as_v2_the_idempotent_no_op() {
+        let (meta, key) = new_topic("video/films", "criterion", vec![], false).unwrap();
+        let me = Identity::generate();
+        let v2 = seal_membership(&key, &meta.topic_id, &me, 1_000).unwrap();
+        assert!(
+            matches!(
+                membership_vintage(&key, &meta.topic_id, &me, Some(&v2.as_json())),
+                MembershipVintage::V2
+            ),
+            "a membership sealed under the current derivation must be the silent no-op"
+        );
+    }
+
+    /// POSITIVE v1 identification: a membership authored by the OLD publicly-derivable pseudonym
+    /// for THIS member, claiming THIS topic, classifies `MyV1` — the one arm that republishes.
+    /// Built the way the pre-292 code sealed it (`member_sign_keys` signer, membership kind,
+    /// `d`=topic_id). The classifier never opens the event, so the (pub(crate)-gated) v1 proof
+    /// payload is not reproduced here — hb-core's own
+    /// `v1_membership_events_are_rejected_by_the_v2_only_reader` test owns that half; this pins
+    /// the DECISION the migration acts on: author + kind + topic claim.
+    ///
+    /// MUTATION (P-10): at topics.rs line 911 (`if v1_author.as_ref() == Some(&ev.pubkey) {`,
+    /// inside `membership_vintage`), prefix the condition with `false &&` → reds (falls through
+    /// to `Foreign`).
+    #[test]
+    fn my_pre_292_membership_classifies_for_republish() {
+        let (meta, key) = new_topic("video/films", "", vec![], true).unwrap();
+        let me = Identity::generate();
+        let v1_signer = member_sign_keys(&key, &me.public_key()).unwrap();
+        let v1 = EventBuilder::new(Kind::from_u16(KIND_TOPIC_MEMBER), "pre-292 membership")
+            .tags([Tag::identifier(meta.topic_id.clone())])
+            .custom_created_at(Timestamp::from(1_000u64))
+            .sign_with_keys(&v1_signer)
+            .unwrap();
+        assert!(
+            matches!(
+                membership_vintage(&key, &meta.topic_id, &me, Some(&v1.as_json())),
+                MembershipVintage::MyV1
+            ),
+            "the member's own pre-292 membership is the one record that republishes"
+        );
+    }
+
+    /// Acceptance #4 — an event that is NOT this member's membership is never republished. Four
+    /// shapes, each of which a "not v2 ⇒ republish" shortcut would get wrong: (a) another
+    /// member's CURRENT v2 membership; (b) another member's v1-shaped event; (c) THIS member's
+    /// v1 pseudonym but claiming a DIFFERENT topic (misfiled or forged — the old derivation was
+    /// publicly computable, so anyone could author at that coordinate); (d) THIS member's
+    /// still-current POST pseudonym (`member_sign_keys` still signs posts) on a non-membership
+    /// kind — the kind check is what keeps a misfiled post out of the republish arm.
+    ///
+    /// MUTATION (P-10), three independent anchors:
+    ///   (i) topics.rs line 915 (`MembershipVintage::Foreign`, the tail return of
+    ///       `membership_vintage`) → change to `MembershipVintage::MyV1` → all four asserts red;
+    ///   (ii) on topics.rs line 909, the `ev.tags.identifier() == Some(topic_id)` conjunct →
+    ///        `false &&` it (or delete it) → sub-case (c) alone reds;
+    ///   (iii) on topics.rs line 909, the `ev.kind == Kind::from_u16(KIND_TOPIC_MEMBER)` conjunct
+    ///        → `false &&` it (or delete it) → sub-case (d) alone reds.
+    #[test]
+    fn a_foreign_membership_is_never_mine_to_republish() {
+        let (meta, key) = new_topic("video/films", "", vec![], true).unwrap();
+        let me = Identity::generate();
+        let other = Identity::generate();
+
+        let theirs_v2 = seal_membership(&key, &meta.topic_id, &other, 1_000).unwrap();
+        assert!(
+            matches!(
+                membership_vintage(&key, &meta.topic_id, &me, Some(&theirs_v2.as_json())),
+                MembershipVintage::Foreign
+            ),
+            "another member's current membership is not mine to republish"
+        );
+
+        let their_v1_signer = member_sign_keys(&key, &other.public_key()).unwrap();
+        let theirs_v1 =
+            EventBuilder::new(Kind::from_u16(KIND_TOPIC_MEMBER), "their legacy membership")
+                .tags([Tag::identifier(meta.topic_id.clone())])
+                .custom_created_at(Timestamp::from(1_000u64))
+                .sign_with_keys(&their_v1_signer)
+                .unwrap();
+        assert!(
+            matches!(
+                membership_vintage(&key, &meta.topic_id, &me, Some(&theirs_v1.as_json())),
+                MembershipVintage::Foreign
+            ),
+            "another member's pre-292 event is not mine to republish"
+        );
+
+        let my_signer = member_sign_keys(&key, &me.public_key()).unwrap();
+        let wrong_topic = EventBuilder::new(Kind::from_u16(KIND_TOPIC_MEMBER), "misfiled")
+            .tags([Tag::identifier("video/elsewhere".to_string())])
+            .custom_created_at(Timestamp::from(1_000u64))
+            .sign_with_keys(&my_signer)
+            .unwrap();
+        assert!(
+            matches!(
+                membership_vintage(&key, &meta.topic_id, &me, Some(&wrong_topic.as_json())),
+                MembershipVintage::Foreign
+            ),
+            "my own pseudonym claiming ANOTHER topic is a misfile, not this topic's membership"
+        );
+
+        // kind 1 — any non-membership kind stands in for a channel post.
+        let my_post = EventBuilder::new(Kind::Custom(1), "a channel post, not a membership")
+            .tags([Tag::identifier(meta.topic_id.clone())])
+            .custom_created_at(Timestamp::from(1_000u64))
+            .sign_with_keys(&my_signer)
+            .unwrap();
+        assert!(
+            matches!(
+                membership_vintage(&key, &meta.topic_id, &me, Some(&my_post.as_json())),
+                MembershipVintage::Foreign
+            ),
+            "a misfiled POST (same still-current pseudonym, wrong kind) must not republish"
+        );
+    }
+
+    /// No-action records: `None` (topics seeded before the record existed — this file's own
+    /// fixtures) and an unparseable record (corrupt or tampered — it cannot be positively
+    /// identified, so never republished, and the helper logs rather than skipping silently
+    /// forever).
+    ///
+    /// MUTATION (P-10): topics.rs line 900 (`let Some(json) = membership_json else { return
+    /// MembershipVintage::Absent };` in `membership_vintage`) → change the returned variant to
+    /// `MyV1` → the Absent assert reds; topics.rs line 901 (the `Unreadable` arm) likewise reds
+    /// the Unreadable assert.
+    #[test]
+    fn missing_or_unparseable_records_are_no_action() {
+        let (meta, key) = new_topic("video/films", "", vec![], true).unwrap();
+        let me = Identity::generate();
+        assert!(
+            matches!(membership_vintage(&key, &meta.topic_id, &me, None), MembershipVintage::Absent),
+            "no stored record ⇒ nothing to migrate (and nothing logged)"
+        );
+        assert!(
+            matches!(
+                membership_vintage(&key, &meta.topic_id, &me, Some("{not an event")),
+                MembershipVintage::Unreadable
+            ),
+            "an unparseable record is left untouched, never blindly republished"
+        );
+    }
+
+    /// The migration's store effect, without a relay: a completed republish OVERWRITES
+    /// `membership_json` and nothing else — the HISTORICAL `joined_at` is preserved (the
+    /// republish re-seals now; the join happened when it happened), the reloaded record
+    /// classifies `V2` under the STORED key (meta + key survived the overwrite — `TopicKey` has
+    /// no `PartialEq`, so key preservation is proven functionally, not by field compare), and an
+    /// unrelated sibling topic in the same store is untouched.
+    ///
+    /// MUTATION (P-10): at topics.rs line 929 — the `store_topic(` call inside
+    /// `store_republished_membership` — replace the whole call expression with `Ok(())` (delete
+    /// the write) → this test reds (the reloaded record still holds the v1 JSON, so both the json
+    /// and the v2-classification asserts fail).
+    #[test]
+    fn republish_overwrites_only_the_membership_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let (meta, key) = new_topic("video/films", "", vec![], true).unwrap();
+        let me = Identity::generate();
+        let v1_signer = member_sign_keys(&key, &me.public_key()).unwrap();
+        let v1 = EventBuilder::new(Kind::from_u16(KIND_TOPIC_MEMBER), "pre-292 membership")
+            .tags([Tag::identifier(meta.topic_id.clone())])
+            .custom_created_at(Timestamp::from(1_000u64))
+            .sign_with_keys(&v1_signer)
+            .unwrap();
+        let stored = StoredTopic {
+            meta: meta.clone(),
+            key,
+            joined_at: 42,
+            membership_json: Some(v1.as_json()),
+        };
+        let (other_meta, other_key) = new_topic("video/animes", "", vec![], true).unwrap();
+        store
+            .save_topics(&[
+                stored.clone(),
+                StoredTopic {
+                    meta: other_meta.clone(),
+                    key: other_key,
+                    joined_at: 7,
+                    membership_json: None,
+                },
+            ])
+            .unwrap();
+
+        let fresh = seal_membership(&stored.key, &meta.topic_id, &me, 9_999).unwrap();
+        store_republished_membership(&store, &stored, &fresh).unwrap();
+
+        let back = store.load_topics().unwrap();
+        let mine = back.iter().find(|t| t.meta.topic_id == meta.topic_id).unwrap();
+        assert_eq!(
+            mine.membership_json,
+            Some(fresh.as_json()),
+            "the republished event overwrites the stored copy"
+        );
+        assert_eq!(mine.joined_at, 42, "the HISTORICAL join time is preserved, not reset to the republish time");
+        assert!(
+            matches!(
+                membership_vintage(&mine.key, &meta.topic_id, &me, mine.membership_json.as_deref()),
+                MembershipVintage::V2
+            ),
+            "the reloaded record classifies v2 under the STORED key — meta and key survived the overwrite"
+        );
+        let sibling = back.iter().find(|t| t.meta.topic_id == other_meta.topic_id).unwrap();
+        assert_eq!(sibling.membership_json, None, "an unrelated topic's record is untouched");
+        assert_eq!(sibling.joined_at, 7, "an unrelated topic's join time is untouched");
+    }
+
+    /// The wiring, pinned structurally (same convention as the `topic_leave` scan above): the
+    /// roster open must run the migration BEFORE the roster fetch, and the migration helper must
+    /// (i) REUSE `join_topic` — the production seal+publish — never a re-implemented publish,
+    /// and (ii) write the store ONLY after the publish succeeded (write-first would flip the
+    /// record to v2 while the wire still holds the stale v1 event, and the v2 fast path would
+    /// then never retry — a one-shot migration with a poisoned flag). The helper returns `()`, so
+    /// a `?` on its publish cannot even compile; this pins the shape that keeps it that way.
+    ///
+    /// ⚠ Honest limit, stated rather than implied: this proves the SHAPE of the code, NOT that a
+    /// real relay refusal is survived end-to-end, nor publish-once idempotency across two real
+    /// opens — both belong to the hb-it row owed on QURATOR-305.
+    ///
+    /// MUTATION (P-10), three independent anchors, each a deletion/replacement of the scanned
+    /// text itself:
+    ///   (1) delete topics.rs line 1009 — the
+    ///       `republish_pre_v2_membership(&store, &stored, &me, &client).await;` statement inside
+    ///       `topic_roster` → the first expect reds;
+    ///   (2) topics.rs line 967 — replace the `match join_topic(` form inside
+    ///       `republish_pre_v2_membership` with any propagate-style form (e.g.
+    ///       `let Ok(ev) = join_topic(..).await else { .. };`) → the `match join_topic(` expect
+    ///       reds;
+    ///   (3) topics.rs line 969 — move the `store_republished_membership(store, stored, &ev)`
+    ///       call above the `join_topic(` call (line 967), or delete it → the ordering expect
+    ///       reds;
+    ///   (4) topics.rs line 978 — replace the `Err(e) => tracing::warn!` arm of the
+    ///       `match join_topic(` with `Err(e) => panic!("{e}")` → the no-fatal-form assert reds.
+    #[test]
+    fn the_roster_open_runs_the_migration_best_effort_before_the_roster_read() {
+        let src = include_str!("topics.rs");
+        let code: String =
+            src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+
+        let at = code.find("pub async fn topic_roster(").expect("topic_roster must exist");
+        let end = code[at..].find("\n}\n").expect("topic_roster must end") + at;
+        let roster_body = &code[at..end];
+        let migrate_at = roster_body
+            .find("republish_pre_v2_membership(&store, &stored, &me, &client).await;")
+            .expect("topic_roster must run the QURATOR-305 migration (republish-on-next-launch)");
+        let fetch_at = roster_body.find("fetch_roster(").expect("the roster fetch must exist");
+        assert!(
+            migrate_at < fetch_at,
+            "the republish must run BEFORE the roster read — the heal should land on this open, not the next"
+        );
+
+        let at = code.find("async fn republish_pre_v2_membership(").expect("the migration helper must exist");
+        let end = code[at..].find("\n}\n").expect("the migration helper must end") + at;
+        let helper_body = &code[at..end];
+        assert!(
+            helper_body.contains("match join_topic("),
+            "the republish must REUSE join_topic (the production seal+publish), never a re-implemented publish"
+        );
+        let publish_at = helper_body.find("join_topic(").expect("the publish call must exist");
+        let write_at = helper_body
+            .find("store_republished_membership(store, stored, &ev)")
+            .expect("the store overwrite must exist");
+        assert!(
+            publish_at < write_at,
+            "the store overwrite must follow a successful publish — write-first poisons the retry (the v2 fast path would never re-run)"
+        );
+        // A failed publish (or a failed store write) must be logged and swallowed, never fatal to
+        // the roster read — so the helper body may not contain any fatal form at all.
+        assert!(
+            !helper_body.contains("unwrap()") && !helper_body.contains("panic!")
+                && !helper_body.contains(".expect("),
+            "a failed republish must never break the roster read — log and continue (QURATOR-305 acceptance #3)"
         );
     }
 
