@@ -239,24 +239,19 @@ async fn publish_tree(
     )
     .map_err(|e| format!("seed collection: {e:#}"))?;
 
-    use crate::commands::collection::{prepare_listing, LISTING_MAX_BYTES};
-    use hb_net::publish_listing_capped;
-    let listing_json =
-        prepare_listing(FETCH_SLUG, &input.store).map_err(|e| format!("prepare listing: {e}"))?;
-    let shared_relay = crate::net::new_shared();
-    let client = crate::net::client(&input.app_id.identity, &input.store, &shared_relay)
-        .await
-        .map_err(|e| format!("connect for publish: {e:#}"))?;
-    let published = publish_listing_capped(
-        &client,
+    // QURATOR-137: publish through the ONE shared harness path (`publish_teaser_for` →
+    // `stamped_listing_for` → `stamp_for_teaser`), never a re-composed
+    // prepare_listing + publish_listing_capped pair — the un-stamped re-composition derives a
+    // different `snapshot_fingerprint` than the manifest minted from the same unchanged tree
+    // (this site only passed because its 24-file seed tree never truncated; the drift was latent).
+    let published = super::publish_teaser_for(
+        &input.store,
         &input.app_id.identity,
+        &input.app_id.browse_key,
         FETCH_SLUG,
-        input.app_id.browse_key.bytes(),
-        &listing_json,
-        LISTING_MAX_BYTES,
     )
     .await
-    .map_err(|e| format!("publish fetch teaser: {e}"))?;
+    .map_err(|e| format!("publish fetch teaser: {e:#}"))?;
     eprintln!(
         "   {row} '{FETCH_SLUG}' seeded from {seed_dir} ({files} files) and published: {} part(s), truncated={}",
         published.parts, published.truncated

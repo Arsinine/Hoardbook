@@ -370,34 +370,26 @@ async fn run_role_a(input: &CarryInput) -> Result<(), String> {
     .map_err(|e| format!("seed collection: {e:#}"))?;
     eprintln!("   CA1 collection '{CARRY_SLUG}' seeded from {seed_dir}");
 
-    // (2) Publish the teaser — the same production composition `publish_e2e_teaser` performs
-    // (prepare_listing + publish_listing_capped), re-composed here only because that helper
-    // hardcodes E2E_SLUG. The functions called are production.
-    {
-        use crate::commands::collection::{prepare_listing, LISTING_MAX_BYTES};
-        use hb_net::publish_listing_capped;
-        let listing_json = prepare_listing(CARRY_SLUG, &input.store).map_err(|e| format!("prepare listing: {e}"))?;
-        let shared_relay = crate::net::new_shared();
-        let client = crate::net::client(&input.app_id.identity, &input.store, &shared_relay)
-            .await
-            .map_err(|e| format!("connect for publish: {e:#}"))?;
-        let published = publish_listing_capped(
-            &client,
-            &input.app_id.identity,
-            CARRY_SLUG,
-            input.app_id.browse_key.bytes(),
-            &listing_json,
-            LISTING_MAX_BYTES,
-        )
-        .await
-        .map_err(|e| format!("publish carry teaser: {e}"))?;
-        eprintln!(
-            "   CA1 teaser published: {} part(s), truncated={}, to {} relay(s)",
-            published.parts,
-            published.truncated,
-            input.relays.len()
-        );
-    }
+    // (2) Publish the teaser through the ONE shared harness path (`publish_teaser_for` →
+    // `stamped_listing_for` → `stamp_for_teaser`, QURATOR-137). This site used to re-compose
+    // prepare_listing + publish_listing_capped by hand — only because the E2E helper hardcoded its
+    // slug — and the hand-copy dropped the stamp step, so the teaser's `snapshot_fingerprint`
+    // drifted from the manifest's on the SAME unchanged tree (latent here: the 24-file seed never
+    // truncated; the shared helper takes the slug, so the re-composition has no reason to exist).
+    let published = super::publish_teaser_for(
+        &input.store,
+        &input.app_id.identity,
+        &input.app_id.browse_key,
+        CARRY_SLUG,
+    )
+    .await
+    .map_err(|e| format!("publish carry teaser: {e:#}"))?;
+    eprintln!(
+        "   CA1 teaser published: {} part(s), truncated={}, to {} relay(s)",
+        published.parts,
+        published.truncated,
+        input.relays.len()
+    );
 
     // (3) Print the identity facts the operator needs to configure roles C and D (A's npub and
     // full share code). The listening manifest endpoint itself is bound inside `approve_request`

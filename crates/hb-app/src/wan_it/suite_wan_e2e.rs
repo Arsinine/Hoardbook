@@ -64,7 +64,12 @@ const SETTLE: Duration = Duration::from_secs(3);
 
 /// DM-poll legs retry this many times before recording a failure (flake policy). Each attempt connects,
 /// fetches the inbox, and checks for the message we expect.
-const DM_POLL_RETRIES: u32 = 6;
+///
+/// 20 × 3 s ≈ a full minute, deliberately more patient than the 6 this used to be (2026-09-21,
+/// QURATOR-137 / QURATOR-306): WAN-E2E is sequenced BY HAND across two hosts, so the window has to
+/// be wide enough for the operator to start the serve after the probe is already polling — the same
+/// reasoning as suite_wan_fetch.rs:65-68, where the fetch suite widened 6 → 20 for exactly this.
+const DM_POLL_RETRIES: u32 = 20;
 
 /// The dial+fetch deadline for the live redeem (same as WAN-M's `LIVE_REDEEM_TIMEOUT`). Generous: hole
 /// punching through n0 relays can take tens of seconds on a cold path.
@@ -471,10 +476,78 @@ async fn send_request_dm(probe: &ProbeInput, fingerprint_seen: &Option<String>) 
     Ok(ask_nonce)
 }
 
+/// What one selection pass over a poll attempt's decoded DMs found. Pure data: the live poll prints
+/// it, the unit test asserts it — same function, so the test ends where production ends.
+struct TicketDmPick {
+    /// The NEWEST DM that parsed as a shape-valid ticket carrying this ask's nonce, with its
+    /// `sent_at` (RFC3339, from the inner rumor — the real send time).
+    newest: Option<(TransportTicket, String)>,
+    /// Nonces of ticket-DMs that parsed and passed `verify_shape` but carried a DIFFERENT nonce —
+    /// the stale-inbox evidence (absent nonces record as `"(none)"`). Empty when every ticket-DM
+    /// matched, or none of the DMs was a ticket at all.
+    stale_nonces: Vec<String>,
+}
+
+/// Select the ticket-DM to redeem from ONE poll attempt's decoded DMs: the **NEWEST** one carrying
+/// this ask's nonce, never the first match.
+///
+/// ⚠ **Relay state outlives a run, and taking the first match is not idempotent** — the same race
+/// `suite_wan_fetch`'s `poll_dms_newest` was fixed for on 2026-09-06, observed live in WAN-E2E on
+/// 2026-09-21 (QURATOR-137): a failed or repeated phase leaves earlier asks and tickets on the
+/// relay, addressed to the same npubs and still perfectly decodable, and the serve's auto-approve
+/// can re-answer a superseded ask — so the inbox can hold SEVERAL tickets echoing OUR nonce (one
+/// per re-answer), where first-match hands a later poll an earlier ask's ticket. Selection is on
+/// the DM's `sent_at` timestamp, and the nonce predicate stays: "newest DM" without it would be a
+/// different bug (an unrelated newer DM is not our ticket).
+///
+/// Pure by design — no network, no relay, no clock — so the selection the live poll makes is
+/// exactly the selection a unit test can pin (a guard that rebuilds what it checks is decorative).
+fn select_ticket_dm_newest(
+    msgs: &[crate::commands::chat::ReceivedMessage],
+    expected_nonce: &str,
+) -> TicketDmPick {
+    let mut pick = TicketDmPick {
+        newest: None,
+        stale_nonces: Vec::new(),
+    };
+    for msg in msgs {
+        // Try to parse the DM content as a transport ticket. The serve's auto-approve sends the
+        // ticket JSON as the DM body (same as send_full_list). Non-ticket DMs are not ours.
+        let trimmed = msg.content.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(ticket) = serde_json::from_str::<TransportTicket>(trimmed) else {
+            continue;
+        };
+        if ticket.verify_shape().is_err() {
+            continue;
+        }
+        // The ticket must carry OUR ask nonce (the serve echoed it from the request-DM). A
+        // different nonce means a PRIOR ask's ticket — stale relay history: evidence, not a match.
+        if ticket.ask_nonce.as_deref() != Some(expected_nonce) {
+            pick.stale_nonces
+                .push(ticket.ask_nonce.clone().unwrap_or_else(|| "(none)".to_string()));
+            continue;
+        }
+        // Newest by the DM's own send time (RFC3339 sorts lexicographically = chronologically, the
+        // same comparison `poll_dms_newest` makes): replace the incumbent only when strictly later.
+        let is_newer = pick
+            .newest
+            .as_ref()
+            .is_none_or(|(_, sent_at)| msg.sent_at > *sent_at);
+        if is_newer {
+            pick.newest = Some((ticket, msg.sent_at.clone()));
+        }
+    }
+    pick
+}
+
 /// Poll the probe's DM inbox for a ticket-DM from the serve. The serve's auto-approve loop answers the
 /// request-DM with a ticket (serialized as JSON) wrapped in a NIP-17 gift-wrap DM. This leg unwraps
-/// incoming DMs (via `decode_dms`, the production NIP-17 unwrap path) and looks for one whose content
-/// parses as a `TransportTicket` carrying our ask nonce.
+/// incoming DMs (via `decode_dms`, the production NIP-17 unwrap path) and takes the **NEWEST** DM
+/// whose content parses as a `TransportTicket` carrying our ask nonce — never the first match (relay
+/// state outlives a run; see [`select_ticket_dm_newest`]).
 ///
 /// Retries ×`DM_POLL_RETRIES` with a settle between attempts (DM propagation over a live relay is the
 /// slow leg). Every attempt's evidence is dumped to stderr.
@@ -534,29 +607,25 @@ async fn poll_for_ticket_dm(probe: &ProbeInput, expected_nonce: &str) -> Result<
             msgs.len()
         );
 
-        for msg in &msgs {
-            // Try to parse the DM content as a transport ticket. The serve's auto-approve sends the
-            // ticket JSON as the DM body (same as send_full_list).
-            let trimmed = msg.content.trim();
-            if !trimmed.starts_with('{') {
-                continue;
-            }
-            let ticket: TransportTicket = match serde_json::from_str(trimmed) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            if ticket.verify_shape().is_err() {
-                continue;
-            }
-            // The ticket must carry OUR ask nonce (the serve echoed it from the request-DM).
-            if ticket.ask_nonce.as_deref() != Some(expected_nonce) {
-                eprintln!(
-                    "   E1/E2 ticket-DM: found a ticket but nonce mismatch (got {:?}, expected {expected_nonce}) — stale DM from a prior ask?",
-                    ticket.ask_nonce
-                );
-                continue;
-            }
+        // NEWEST nonce-match, never the first — a superseded ticket-DM from an earlier ask must not
+        // satisfy this poll (select_ticket_dm_newest carries the full why).
+        let pick = select_ticket_dm_newest(&msgs, expected_nonce);
+        if let Some((ticket, sent_at)) = pick.newest {
+            eprintln!(
+                "   E1/E2 ticket-DM poll: taking the NEWEST nonce-matching DM (sent_at={sent_at})"
+            );
             return Ok(ticket);
+        }
+        // Stale-inbox evidence: ticket-DMs arrived but carried a PRIOR ask's nonce. The 2026-09-21
+        // live failure showed exactly this inbox (E1's old ticket re-read on every attempt while
+        // E2's fresh ticket never landed) — naming the nonces lets an operator tell "the serve
+        // answered an OLD ask" from "nothing arrived at all".
+        if !pick.stale_nonces.is_empty() {
+            eprintln!(
+                "   E1/E2 ticket-DM poll attempt {attempt}: {} stale ticket-DM(s) with other nonce(s) {:?} — skipped (relay history from a prior ask)",
+                pick.stale_nonces.len(),
+                pick.stale_nonces
+            );
         }
 
         last_err = format!(
@@ -864,5 +933,79 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(contact.browse_key_hex, Some(hex::encode(serve_browse_key)));
+    }
+
+    /// A decoded DM carrying a shape-valid transport ticket, as the serve's auto-approve sends it
+    /// (ticket JSON as the DM body, `ask_nonce` echoed). `sent_at` is the inner rumor's RFC3339
+    /// send time — the field the newest-match selection keys on.
+    fn ticket_dm(request_id: &str, nonce: &str, sent_at: &str) -> crate::commands::chat::ReceivedMessage {
+        let ticket = TransportTicket {
+            hb: hb_core::ticket::TICKET_TAG.to_string(),
+            ticket_v: hb_core::TICKET_V,
+            request_id: request_id.to_string(),
+            slug: SEED_SLUG.to_string(),
+            node_addr: "n0-addr".to_string(),
+            issued_at: 1_700_000_000,
+            ask_nonce: Some(nonce.to_string()),
+            author_npub: None,
+        };
+        crate::commands::chat::ReceivedMessage {
+            from: "npub1serve".to_string(),
+            to: "npub1probe".to_string(),
+            content: serde_json::to_string(&ticket).expect("serialize ticket"),
+            sent_at: sent_at.to_string(),
+        }
+    }
+
+    /// The ticket-DM selection must take the NEWEST nonce-matching DM, never the first (QURATOR-137,
+    /// live 2026-09-21; the same race `suite_wan_fetch`'s `poll_dms_newest` was fixed for on
+    /// 2026-09-06). Relay state outlives a run and the serve can re-answer a superseded ask, so the
+    /// inbox can hold SEVERAL tickets echoing OUR nonce — first-match hands a later poll an earlier
+    /// ask's ticket. Both inbox orders must agree: newest wins regardless of iteration order.
+    ///
+    /// P-10 (the orchestrator applies this; a worker does not run it): in
+    /// `select_ticket_dm_newest` (suite_wan_e2e.rs, line 538), change the newest-match selection
+    /// back to first-match — in the `is_newer` guard's `is_none_or` closure, replace
+    /// `msg.sent_at > *sent_at` with `false`, so only the FIRST hit is ever kept. The older-first
+    /// order below must then fail on `assert_eq!(ticket.request_id, "req-newer")` (it returns
+    /// `req-older`).
+    #[test]
+    fn ticket_dm_selection_takes_the_newest_nonce_match() {
+        let nonce = "b3dd103136ff2d01357cc60e0a613644";
+        let older = ticket_dm("req-older", nonce, "2026-09-21T00:00:00Z");
+        let newer = ticket_dm("req-newer", nonce, "2026-09-21T00:01:00Z");
+
+        // Both inbox orders: the NEWER DM wins (first-match returns req-older in the first order).
+        for order in [vec![older.clone(), newer.clone()], vec![newer.clone(), older.clone()]] {
+            let pick = select_ticket_dm_newest(&order, nonce);
+            let (ticket, sent_at) = pick.newest.expect("a nonce-matching ticket exists");
+            assert_eq!(ticket.request_id, "req-newer", "the NEWEST nonce-match must win");
+            assert_eq!(sent_at, "2026-09-21T00:01:00Z");
+            assert!(pick.stale_nonces.is_empty(), "same-nonce DMs are matches, not stale");
+        }
+
+        // The nonce predicate still gates: a PRIOR ask's ticket (different nonce) is never a match,
+        // however new it is — "newest DM" without the predicate would be a different bug. It lands
+        // in the stale evidence instead.
+        let stale = ticket_dm(
+            "req-prior-ask",
+            "397f16b561cebf918f74b3552e77a660",
+            "2026-09-21T09:00:00Z",
+        );
+        let pick = select_ticket_dm_newest(std::slice::from_ref(&stale), nonce);
+        assert!(pick.newest.is_none(), "a different-nonce ticket must not match");
+        assert_eq!(
+            pick.stale_nonces,
+            vec!["397f16b561cebf918f74b3552e77a660".to_string()]
+        );
+
+        // The live 2026-09-21 inbox shape: a stale prior-ask ticket sitting BESIDE our matches —
+        // the newest match still wins, the stale one is only evidence.
+        let pick = select_ticket_dm_newest(&[stale, older, newer], nonce);
+        assert_eq!(
+            pick.newest.expect("match beside the stale DM").0.request_id,
+            "req-newer"
+        );
+        assert_eq!(pick.stale_nonces.len(), 1);
     }
 }

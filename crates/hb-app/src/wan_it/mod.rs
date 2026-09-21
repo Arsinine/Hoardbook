@@ -373,34 +373,73 @@ async fn setup_e2e_serve(
     Ok(())
 }
 
-/// Publish (or re-publish) the E2E teaser via the production path. This is the same sequence
-/// `commands::collection::publish_collection` drives: prepare the listing JSON (which stamps the
-/// snapshot fingerprint), and call `publish_listing_capped` (which truncates if over budget).
-async fn publish_e2e_teaser(
+/// The one derivation every WAN-harness teaser publish must feed `publish_listing_capped` with
+/// (QURATOR-137, found live 2026-09-21). Production's `publish_collection_inner` does NOT publish
+/// raw `prepare_listing` bytes: it first stamps them via `stamp_for_teaser` — the big-relay URL
+/// when one is configured, then `teaser_fingerprint` — and THAT stamped JSON is what
+/// `truncate_listing` carves the visible entries out of, so it is also what the teaser's
+/// `snapshot_fingerprint` digests. The mint path (`build_slug_manifest`) stamps the same bytes for
+/// the same reason (QURATOR-205). A teaser published from UNSTAMPED bytes therefore carries a
+/// different digest than the manifest minted alongside it, and the browse side correctly refuses
+/// it: `E1 manifest is stale against the teaser it was browsed from` — which is exactly how the
+/// live WAN-E2E run failed on a collection that had never changed. This helper is the harness-side
+/// twin of collection.rs's both-paths-call-`stamp_for_teaser` rule: ONE function, every site, so
+/// the drift cannot return as a fourth hand-copy. Note the stamp still shifts bytes when NO big
+/// relay is configured (`stamp_teaser_fingerprint` alone inserts a key), which is why a site that
+/// skips it drifts even on default settings.
+///
+/// Pure (no relay) — the parity with `build_slug_manifest` is unit-testable against a temp store
+/// (`harness_teaser_matches_the_manifest_digest`).
+fn stamped_listing_for(store: &DataStore, slug: &str) -> Result<String> {
+    use crate::commands::collection::{prepare_listing, stamp_for_teaser};
+    let listing_json = prepare_listing(slug, store).map_err(|e| anyhow!(e))?;
+    // Same source as `publish_collection_inner`: the big relay out of Settings (empty = off).
+    // `stamp_for_teaser` is byte-identical on a listing that fits whole — which is why the
+    // un-stamped fetch/carry sites passed on their small seed trees, and why they must route here
+    // anyway: their latent drift is one bigger tree away.
+    let big_relay_url = store.load_settings()?.unwrap_or_default().big_relay_url;
+    stamp_for_teaser(&listing_json, &big_relay_url).map_err(|e| anyhow!(e))
+}
+
+/// Publish (or re-publish) a collection teaser via the production path — the ONE shared publish
+/// site of the WAN harness (E2E's `publish_e2e_teaser`, wan-fetch's `publish_tree`, wan-carry's
+/// role A). Same sequence `commands::collection::publish_collection` drives:
+/// `stamped_listing_for` (prepare + stamp) then `publish_listing_capped` (truncate if over the
+/// 40 KB budget, single teaser event). The slug is a parameter because the E2E helper used to
+/// hardcode `E2E_SLUG` — that hardcoding is what forced fetch/carry to re-compose the sequence
+/// by hand, and the re-composition is what dropped the stamp step (QURATOR-137).
+pub(super) async fn publish_teaser_for(
     store: &DataStore,
     identity: &hb_core::Identity,
     browse_key: &crate::identity_state::SessionBrowseKey,
-) -> Result<()> {
-    use crate::commands::collection::{prepare_listing, LISTING_MAX_BYTES};
-    use hb_net::publish_listing_capped;
+    slug: &str,
+) -> Result<hb_net::PublishedListing> {
+    use crate::commands::collection::LISTING_MAX_BYTES;
 
-    // Build the listing JSON with the snapshot fingerprint stamped (the production path).
-    let listing_json = prepare_listing(E2E_SLUG, store).map_err(|e| anyhow!(e))?;
-    // Publish the teaser via the production path. publish_listing_capped truncates if the listing
-    // exceeds LISTING_MAX_BYTES (40 KB), producing a single paywall-teaser event tagged `truncated`.
+    let listing_json = stamped_listing_for(store, slug)?;
     let shared_relay = net::new_shared();
     let client = net::client(identity, store, &shared_relay).await?;
-    let relays = net::relay_urls(store);
-    let published = publish_listing_capped(
+    let published = hb_net::publish_listing_capped(
         &client,
         identity,
-        E2E_SLUG,
+        slug,
         browse_key.bytes(),
         &listing_json,
         LISTING_MAX_BYTES,
     )
     .await
-    .map_err(|e| anyhow!("publish E2E teaser: {e}"))?;
+    .map_err(|e| anyhow!("publish teaser for '{slug}': {e}"))?;
+    Ok(published)
+}
+
+/// Publish (or re-publish) the E2E teaser via the shared production-composed path above.
+async fn publish_e2e_teaser(
+    store: &DataStore,
+    identity: &hb_core::Identity,
+    browse_key: &crate::identity_state::SessionBrowseKey,
+) -> Result<()> {
+    let published = publish_teaser_for(store, identity, browse_key, E2E_SLUG).await?;
+    let relays = net::relay_urls(store);
     eprintln!(
         "[serve] E2E teaser published: {} part(s), truncated={}, to {} relay(s)",
         published.parts,
@@ -1728,5 +1767,128 @@ mod tests {
              copy makes a green WAN-E2E prove the approval body while proving nothing about the \
              loop that decides to call it (the 189-shaped gap)."
         );
+    }
+
+    /// QURATOR-137, the harness half of the QURATOR-205 invariant (found by the live WAN-E2E run
+    /// 2026-09-21): a teaser the WAN harness publishes must carry the SAME `snapshot_fingerprint`
+    /// the mint path (`build_slug_manifest`) derives, for the SAME unchanged collection, once the
+    /// tree is big enough to TRUNCATE. Before the shared helper, the harness published raw
+    /// `prepare_listing` bytes — unstamped — so `truncate_listing` kept a different visible-entry
+    /// set than the mint path (which stamps via `stamp_for_teaser` before truncating, because a
+    /// big-relay URL + `teaser_fingerprint` shift the entries budget), and E1 fired: "manifest is
+    /// stale against the teaser it was browsed from" on a collection that had never changed. The
+    /// production pair is pinned by `build_slug_manifest_matches_the_publish_digest_when_a_big_relay_is_configured`
+    /// (commands/collection.rs); this pins the HARNESS derivation against the same mint.
+    ///
+    /// MUTATION (P-10, must red this test): in `wan_it/mod.rs`, in `stamped_listing_for`, delete
+    /// the `stamp_for_teaser(&listing_json, &big_relay_url)` call — return the raw
+    /// `prepare_listing` output instead (`Ok(listing_json)`), i.e. exactly what the pre-fix
+    /// harness published. The final `assert_eq!` must then fail: with the big relay configured
+    /// below, the unstamped bytes truncate to a different visible-entry digest than the stamped
+    /// mint derives.
+    #[test]
+    fn harness_teaser_matches_the_manifest_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        // A configured big relay is the bigger of the two stamp-induced budget shifts (the
+        // `teaser_fingerprint` key alone is the smaller one — the drift bites even with an empty
+        // URL, which is why the fixture pins the stamped path, not merely the URL). Nothing here
+        // connects; the sentinel pool relays keep the settings honest anyway (same shape as the
+        // collection.rs pinning test).
+        store
+            .save_settings(&Settings {
+                relay_urls: vec!["wss://hoardbook-test-sentinel.invalid".into()],
+                big_relay_url: "wss://big.example:7777".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // A real seed tree + the harness's own seeding helper — the exact fixture the E2E serve
+        // publishes (E2E_SEED_FILE_COUNT was chosen to exceed the 40 KB teaser budget).
+        let app = AppIdentity::generate();
+        let seed_dir = dir.path().join("seed");
+        generate_seed_tree(&seed_dir, E2E_SEED_FILE_COUNT, 0).unwrap();
+        seed_collection(
+            &store,
+            &app.identity,
+            &app.browse_key,
+            seed_dir.to_str().unwrap(),
+            "wan-it-parity",
+        )
+        .unwrap();
+
+        // The harness publish derivation: the stamped bytes `publish_teaser_for` feeds
+        // `publish_listing_capped`, truncated the same way, digest read back out of the artifact
+        // (never re-derived here — the same discipline the mint path's pinning test uses).
+        let stamped = stamped_listing_for(&store, "wan-it-parity").unwrap();
+        let teaser =
+            hb_net::truncate_listing(&stamped, crate::commands::collection::LISTING_MAX_BYTES)
+                .unwrap();
+        assert!(
+            teaser.truncated,
+            "the fixture must truncate — a whole listing stamps to itself and the parity is trivial"
+        );
+        let harness_fp = serde_json::from_str::<serde_json::Value>(&teaser.json)
+            .unwrap()
+            .get("snapshot_fingerprint")
+            .and_then(|v| v.as_str())
+            .expect("the truncated teaser carries a snapshot_fingerprint")
+            .to_string();
+
+        // The production mint path, over the SAME draft in the SAME store.
+        let env =
+            build_slug_manifest("wan-it-parity", &store, &app.identity, app.browse_key.bytes())
+                .unwrap();
+
+        assert_eq!(
+            env.snapshot_fingerprint, harness_fp,
+            "the harness teaser and the minted manifest must agree on the digest of the SAME \
+             unchanged collection — QURATOR-137's E1 fired on exactly this drift"
+        );
+    }
+
+    /// The routing half of QURATOR-137: every harness teaser publish goes through
+    /// `publish_teaser_for` (and therefore `stamped_listing_for`), so the raw-listing prepare call
+    /// form exists ONLY inside the shared helper in mod.rs — fetch and carry must show ZERO
+    /// (they call `super::publish_teaser_for`). All three sites once hand-composed the publish
+    /// sequence (fetch/carry only because the E2E helper hardcoded its slug), and a hand
+    /// composition is one pasted-away stamp step from the E1 drift again. §9 discipline: an
+    /// allowlist with per-file counts, counting the syntactic CALL FORM (prose cannot satisfy
+    /// it), slicing each file at its `#[cfg(test)]` so this guard cannot count itself.
+    ///
+    /// MUTATION (P-10, must red this test): in `suite_wan_carry.rs`, in `run_role_a`, replace the
+    /// `super::publish_teaser_for(` call with the old hand-composed pair — a direct raw-listing
+    /// prepare call on CARRY_SLUG plus a direct `hb_net::publish_listing_capped(` — and this scan
+    /// reds on suite_wan_carry.rs's count (0 → 1).
+    #[test]
+    fn the_raw_listing_prepare_call_exists_only_inside_the_shared_teaser_helper() {
+        fn code_before_tests(src: &str) -> String {
+            let production = match src.find("#[cfg(test)]") {
+                Some(at) => &src[..at],
+                None => src,
+            };
+            production
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        // (file, expected count): the shared helper's ONE call in mod.rs, ZERO anywhere else —
+        // the per-file allowlist §9 asks for, so a re-composition in any one file is named.
+        for (file, src, expected) in [
+            ("wan_it/mod.rs", include_str!("mod.rs"), 1),
+            ("wan_it/suite_wan_fetch.rs", include_str!("suite_wan_fetch.rs"), 0),
+            ("wan_it/suite_wan_carry.rs", include_str!("suite_wan_carry.rs"), 0),
+        ] {
+            let code = code_before_tests(src);
+            let hits = code.matches("prepare_listing(").count();
+            assert_eq!(
+                hits, expected,
+                "{file}: the raw-listing prepare call form must appear exactly {expected} time(s) \
+                 — inside stamped_listing_for only. A hand-re-composed teaser publish is how \
+                 QURATOR-137 dropped the stamp step; route it through publish_teaser_for"
+            );
+        }
     }
 }
