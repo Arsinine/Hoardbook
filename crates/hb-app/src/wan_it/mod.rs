@@ -1380,6 +1380,21 @@ async fn run_probe_wan_carry(args: &[String]) -> Result<ExitCode> {
 
     println!("# CARRY probe — role {role}");
     println!("# relay set: {}", relays.join(", "));
+    // Printed HERE — before any role dispatch or flag validation — because the bootstrap is
+    // circular across THREE parties: A needs C's npub for --asker-npub, C needs A's for
+    // --author-npub, and C's phase 2 needs D's for --asker-npub, so whichever role you start
+    // first MUST be able to tell you who it is while still failing its own flag checks.
+    // Printing this inside a role, after its `?` guards, makes the first run unrunnable in every
+    // direction (found live 2026-09-21: the operator had to run the FETCH suite against carry's
+    // own --data-dir just to read the identity out). Same fix `run_probe_wan_fetch` already got;
+    // upper-cased to match how the roles are named everywhere else — an operator grepping for
+    // `# carry-A npub:` must find it.
+    let role_label = role.to_uppercase();
+    println!("# carry-{role_label} npub:  {}", app_id.npub());
+    match app_id.share_code() {
+        Ok(sc) => println!("# carry-{role_label} share: {sc}"),
+        Err(e) => println!("# carry-{role_label} share: <unavailable: {e}>"),
+    }
 
     let input = suite_wan_carry::CarryInput {
         app_id,
@@ -1880,6 +1895,7 @@ mod tests {
             ("wan_it/mod.rs", include_str!("mod.rs"), 1),
             ("wan_it/suite_wan_fetch.rs", include_str!("suite_wan_fetch.rs"), 0),
             ("wan_it/suite_wan_carry.rs", include_str!("suite_wan_carry.rs"), 0),
+            ("wan_it/suite_wan_e2e.rs", include_str!("suite_wan_e2e.rs"), 0),
         ] {
             let code = code_before_tests(src);
             let hits = code.matches("prepare_listing(").count();

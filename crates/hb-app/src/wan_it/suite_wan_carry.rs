@@ -66,7 +66,13 @@ pub(crate) const CARRY_SLUG: &str = "wan-carry";
 
 const RELAY_TIMEOUT: Duration = Duration::from_secs(15);
 const SETTLE: Duration = Duration::from_secs(3);
-const DM_POLL_RETRIES: usize = 6;
+/// DM poll attempts (× [`SETTLE`] = the wait-for-DM window). 20 x 3s = a full minute — the same
+/// patience `suite_wan_fetch`'s `DM_RETRIES` set the precedent for, for the reason its comment
+/// names: the phases are sequenced BY HAND, here across THREE terminals on three hosts (fetch has
+/// two), and the window must be wide enough for the operator to start the next role after this
+/// one is already polling. At 6 attempts (~18s) role A polled out before C could even be started
+/// on the other host (found live 2026-09-21, setting up the QURATOR-178 run).
+const DM_POLL_RETRIES: usize = 20;
 const REDEEM_TIMEOUT: Duration = Duration::from_secs(120);
 const REDEEM_RETRIES: usize = 3;
 
@@ -200,9 +206,60 @@ pub(super) async fn send_request_dm_to(
     Ok(())
 }
 
+/// What one selection pass over a poll attempt's decoded DMs found. Pure data: the live poll acts
+/// on it, the unit test asserts it — same function, so the test ends where production ends.
+struct NewestDmMatch<T> {
+    /// The NEWEST DM `inspect` matched, with its `sent_at` (RFC3339, from the inner rumor — the
+    /// real send time).
+    newest: Option<(T, String)>,
+    /// How many DMs matched this attempt — printed by the live poll when > 1, so an operator can
+    /// see several matches being OUTRANKED rather than never counted.
+    matched: usize,
+}
+
+/// Select the DM to act on from ONE poll attempt's decoded DMs: the **NEWEST** one `inspect`
+/// matches, never the first.
+///
+/// ⚠ **Relay state outlives a run, and taking the first match is not idempotent** — the same race
+/// `suite_wan_fetch`'s `poll_dms_newest` was fixed for on 2026-09-06 and WAN-E2E's
+/// `select_ticket_dm_newest` for on 2026-09-21 (QURATOR-137): a failed or repeated phase leaves
+/// earlier asks and tickets on the relay, addressed to the same npubs and still perfectly
+/// decodable, so first-match hands a later poll a SUPERSEDED ask or ticket. Selection is on the
+/// DM's `sent_at` (RFC3339 sorts lexicographically = chronologically, the same comparison
+/// `poll_dms_newest` makes).
+///
+/// Generic on purpose, unlike E2E's ticket-specific version: carry's poll sites match three
+/// different shapes (A a request-DM, C phase 2 an author-ask, C phase 1 and D a ticket), and
+/// "newest match" is well-defined for all three — `sent_at` is the rumor's own send time, present
+/// on every decoded DM. Pure by design — no network, no relay, no clock — so the selection the
+/// live poll makes is exactly the selection a unit test can pin (a guard that rebuilds what it
+/// checks is decorative).
+fn select_dm_newest<T>(
+    msgs: &[crate::commands::chat::ReceivedMessage],
+    mut inspect: impl FnMut(&crate::commands::chat::ReceivedMessage) -> Option<T>,
+) -> NewestDmMatch<T> {
+    let mut pick = NewestDmMatch { newest: None, matched: 0 };
+    for msg in msgs {
+        // Not the shape this poll site wants — skipped entirely, never counted.
+        let Some(found) = inspect(msg) else { continue };
+        pick.matched += 1;
+        // Newest by the DM's own send time: replace the incumbent only when strictly later, so
+        // both inbox orders agree (the same guard E2E's selection makes).
+        let is_newer = pick
+            .newest
+            .as_ref()
+            .is_none_or(|(_, sent_at)| msg.sent_at > *sent_at);
+        if is_newer {
+            pick.newest = Some((found, msg.sent_at.clone()));
+        }
+    }
+    pick
+}
+
 /// Poll this party's DM inbox via the production unwrap path (`decode_dms`) and hand every decoded
-/// message from `expected_sender` to `inspect`. Retries with a settle sleep; `inspect` returns
-/// `Some(T)` when it has found what it wants (a ticket, a request).
+/// message from `expected_sender` to `inspect`; act on the **NEWEST** match ([`select_dm_newest`]),
+/// never the first. Retries with a settle sleep; `inspect` returns `Some(T)` when a DM is the
+/// shape this poll site wants (a ticket, a request).
 pub(super) async fn poll_dms<T>(
     input: &CarryInput,
     expected_sender: &str,
@@ -250,10 +307,18 @@ pub(super) async fn poll_dms<T>(
         let msgs = decode_dms(&own_npub, &input.app_id.identity, wraps, Some(&allow)).await;
         decoded_seen = decoded_seen.max(msgs.len());
         eprintln!("   carry DM poll (for {what}) attempt {attempt}: {} decoded DM(s) from sender", msgs.len());
-        for msg in &msgs {
-            if let Some(found) = inspect(msg) {
-                return Ok(found);
+        // NEWEST match, never the first — relay state outlives a run, so a superseded ask or
+        // ticket still sitting on the relay must not satisfy this poll (`select_dm_newest`
+        // carries the full why).
+        let pick = select_dm_newest(&msgs, |m| inspect(m));
+        if let Some((found, sent_at)) = pick.newest {
+            if pick.matched > 1 {
+                eprintln!(
+                    "   carry DM poll (for {what}) attempt {attempt}: {} match(es) — taking the NEWEST (sent_at={sent_at})",
+                    pick.matched
+                );
             }
+            return Ok(found);
         }
         tokio::time::sleep(SETTLE).await;
         last_err = format!("attempt {attempt}: no {what} DM yet");
@@ -391,16 +456,11 @@ async fn run_role_a(input: &CarryInput) -> Result<(), String> {
         input.relays.len()
     );
 
-    // (3) Print the identity facts the operator needs to configure roles C and D (A's npub and
-    // full share code). The listening manifest endpoint itself is bound inside `approve_request`
-    // below; its accept loop holds its own endpoint handle once spawned.
-    let own_npub = input.app_id.npub();
-    let share_code = input
-        .app_id
-        .share_code()
-        .map_err(|e| format!("share code: {e}"))?;
-    println!("# carry-A npub:  {own_npub}");
-    println!("# carry-A share: {share_code}");
+    // (3) The identity facts the operator needs for roles C and D (A's npub + full share code)
+    // are printed by the probe entry before role dispatch, so they are available even on a run
+    // that fails its flag checks — carry's bootstrap is circular across all three roles (the
+    // fetch-suite precedent, ported 2026-09-21). The listening manifest endpoint itself is bound
+    // inside `approve_request` below; its accept loop holds its own endpoint handle once spawned.
 
     // (4) Wait for C's ordinary ask and answer it through the production approval body.
     // `approve_request` drives `send_full_list_inner` — the real mint + DM path.
@@ -815,6 +875,8 @@ pub(super) fn verify_cached_under(input: &CarryInput, npub: &str, slug: &str) ->
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// CARRY's ask-key discipline, pinned against the PRODUCTION source (the `suite_cap.rs`
     /// precedent): `redeem_manifest_ticket_with_progress` must resolve the claim's author from
     /// `ticket.author_npub`, falling back to the DM sender only when the field is absent. Keying
@@ -966,6 +1028,98 @@ mod tests {
             code.contains("redeem_manifest_ticket_inner("),
             "C must cache by redeeming through the production path, which is what writes the \
              cache entry via accept_manifest_bytes"
+        );
+    }
+
+    /// A decoded DM, minimal: the newest-selection keys on `sent_at` and reaches `content` only
+    /// through the caller's `inspect` closure.
+    fn dm(content: String, sent_at: &str) -> crate::commands::chat::ReceivedMessage {
+        crate::commands::chat::ReceivedMessage {
+            from: "npub1peer".to_string(),
+            to: "npub1self".to_string(),
+            content,
+            sent_at: sent_at.to_string(),
+        }
+    }
+
+    /// The DM selection must take the NEWEST match, never the first — QURATOR-306, the third site
+    /// of the race `suite_wan_fetch`'s `poll_dms_newest` was fixed for on 2026-09-06 and WAN-E2E's
+    /// `select_ticket_dm_newest` for on 2026-09-21 (QURATOR-137). Relay state outlives a run, so
+    /// a superseded ask or ticket still on the relay must not satisfy a later poll. Pinned for
+    /// BOTH closure shapes carry polls with — a ticket (roles C·1 and D) and a request-DM parsed
+    /// by PRODUCTION's parser (roles A and C·2) — and for both inbox orders: newest wins
+    /// regardless of iteration order.
+    ///
+    /// P-10 MUTATION (the orchestrator applies this; a worker does not run it): in
+    /// `select_dm_newest` (this file, the `is_newer` guard's `is_none_or` closure), replace
+    /// `msg.sent_at > *sent_at` with `false`, so only the FIRST hit is ever kept — the
+    /// older-first arms below must then fail (they return the older match).
+    #[test]
+    fn dm_selection_takes_the_newest_match_for_both_carry_shapes() {
+        // Shape 1 — the ticket poll (roles C·1 and D): the same inspect closure those sites pass.
+        let ticket_json = |request_id: &str| {
+            let ticket = TransportTicket {
+                hb: hb_core::ticket::TICKET_TAG.to_string(),
+                ticket_v: hb_core::TICKET_V,
+                request_id: request_id.to_string(),
+                slug: CARRY_SLUG.to_string(),
+                node_addr: "n0-addr".to_string(),
+                issued_at: 1_700_000_000,
+                ask_nonce: Some("n".to_string()),
+                author_npub: None,
+            };
+            serde_json::to_string(&ticket).expect("serialize ticket")
+        };
+        let ticket_inspect =
+            |msg: &crate::commands::chat::ReceivedMessage| -> Option<TransportTicket> {
+                let trimmed = msg.content.trim();
+                if !trimmed.starts_with('{') {
+                    return None;
+                }
+                let t: TransportTicket = serde_json::from_str(trimmed).ok()?;
+                t.verify_shape().ok()?;
+                Some(t)
+            };
+        let older = dm(ticket_json("req-older"), "2026-09-21T00:00:00Z");
+        let newer = dm(ticket_json("req-newer"), "2026-09-21T00:01:00Z");
+        // Both inbox orders: the NEWER DM wins (first-match returns req-older in the first order).
+        for order in [vec![older.clone(), newer.clone()], vec![newer.clone(), older.clone()]] {
+            let pick = select_dm_newest(&order, ticket_inspect);
+            let (ticket, sent_at) = pick.newest.expect("a ticket match exists");
+            assert_eq!(ticket.request_id, "req-newer", "the NEWEST match must win");
+            assert_eq!(sent_at, "2026-09-21T00:01:00Z");
+            assert_eq!(pick.matched, 2, "both DMs matched — one was outranked, not ignored");
+        }
+
+        // Shape 2 — the request-DM poll (roles A and C·2): production's builder and parser, never
+        // a hand-rolled wire copy (the QURATOR-183 discipline this file already pins). A
+        // NEWER non-matching DM beside the matches must not win — "newest DM" without the
+        // predicate would be a different bug.
+        let ask_json = |nonce: &str| {
+            crate::commands::chat::build_manifest_request(
+                CARRY_SLUG,
+                "",
+                None,
+                None,
+                Some(nonce.to_string()),
+            )
+            .expect("build manifest request")
+        };
+        let ask_inspect = |msg: &crate::commands::chat::ReceivedMessage| -> Option<String> {
+            let body = crate::auto_approve::ManifestRequestBody::parse(&msg.content)?;
+            Some(body.ask_nonce.clone().unwrap_or_default())
+        };
+        let ask_old = dm(ask_json("nonce-old"), "2026-09-21T00:00:00Z");
+        let ask_new = dm(ask_json("nonce-new"), "2026-09-21T00:02:00Z");
+        let chatter = dm("not a request".to_string(), "2026-09-21T00:03:00Z");
+        let pick = select_dm_newest(&[chatter, ask_old, ask_new], ask_inspect);
+        assert_eq!(
+            pick.matched, 2,
+            "the chatter DM must not count as a match, however new it is"
+        );
+        assert_eq!(
+            pick.newest.expect("newest ask").0, "nonce-new",
+            "the NEWEST ask must win even with a newer non-matching DM beside it"
         );
     }
 }

@@ -62,18 +62,22 @@ const DRIVER_POLLS: usize = 8;
 const POLL_SETTLE: Duration = Duration::from_secs(5);
 /// DM poll attempts and the wait between them, for [`poll_dms_newest`].
 ///
-/// 20 x 3s = a full minute, deliberately more patient than carry's 6 attempts. The phases here are
+/// 20 x 3s = a full minute. The phases here are
 /// sequenced BY HAND across two terminals, and the window has to be wide enough for the operator to
 /// start the second role after the first is already polling. Too short a window is what makes the
 /// stale-ask race likely: A gives up, or settles on an OLD ask, before D's new one arrives.
+/// (Carry's `DM_POLL_RETRIES` sat at 6 — the less-patient sibling this comment used to name —
+/// until 2026-09-21, when QURATOR-306 raised it to this same 20: carry is hand-sequenced across
+/// THREE terminals, so it needed at least this patience, not a third of it.)
 const DM_RETRIES: usize = 20;
 const DM_SETTLE: Duration = Duration::from_secs(3);
 const DM_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Poll for DMs from `expected_sender` and return the **NEWEST** match by `sent_at`, not the first.
 ///
-/// ⚠ **This exists because RELAY STATE OUTLIVES A RUN, and carry's `poll_dms` returns the FIRST
-/// match it decodes.** A failed or repeated phase leaves earlier asks and tickets on the relay,
+/// ⚠ **This exists because RELAY STATE OUTLIVES A RUN, and carry's `poll_dms` returned the FIRST
+/// match it decoded until QURATOR-306 (2026-09-21) gave it the same newest-match selection.**
+/// A failed or repeated phase leaves earlier asks and tickets on the relay,
 /// addressed to the same npubs and still perfectly decodable. On 2026-09-06 that made role A answer
 /// a SUPERSEDED ask: the ticket it minted echoed a stale `ask_nonce`, and D's production claim gate
 /// refused it as `Unsolicited` — the gate working exactly as designed, reported as a harness
