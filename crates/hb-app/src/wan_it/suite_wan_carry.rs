@@ -341,6 +341,48 @@ pub(super) async fn poll_dms<T>(
     Err(format!("never received {what} from {expected_sender}: {last_err}"))
 }
 
+/// The ticket-poll predicate both carry roles share: a DM body that decodes as a `TransportTicket`
+/// which is BOTH shape-valid AND an answer to THIS run's ask — the ticket must echo the
+/// `ask_nonce` the role minted.
+///
+/// The echo check is the load-bearing half (fetch's FD1 predicate, observed live 2026-09-06;
+/// QURATOR-308): relay state outlives a run, so a stale-but-NEWEST ticket from an earlier ask
+/// still decodes and still passes `verify_shape` — newest-match (QURATOR-306) narrows that window
+/// but cannot close it, because a prior ticket can postdate a superseded ask. Accepting one hands
+/// production's claim gate a ticket it is RIGHT to refuse as `Unsolicited`, which reads as a
+/// product failure and is not one.
+///
+/// `issue_ticket` normalises an empty nonce to `None` (`ticket.rs`), so `Some("")` never appears
+/// on the wire: a ticket answering a nonce-less ask carries `None` and correctly fails here.
+/// Both carry roles always mint a non-empty nonce (`mint_ask_nonce`), so that is right, not a gap.
+///
+/// Extracted rather than inlined at each poll so the unit test drives the SAME predicate the live
+/// polls use — a hand-rolled copy in the test would be decorative (the QURATOR-183 discipline
+/// this file already pins).
+fn ticket_answering_ask(
+    msg: &crate::commands::chat::ReceivedMessage,
+    nonce: &str,
+) -> Option<TransportTicket> {
+    let trimmed = msg.content.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let t: TransportTicket = serde_json::from_str(trimmed).ok()?;
+    t.verify_shape().ok()?;
+    if t.ask_nonce.as_deref() != Some(nonce) {
+        // Named so a live red distinguishes a NONCE mismatch (this line, with both values) from a
+        // sender mismatch (nothing decodes from that npub; `poll_dms`'s tail error says which).
+        // Without it, a rejected stale ticket reads as "no DM yet" — the confusing red this row
+        // exists to remove, one level down.
+        eprintln!(
+            "   carry ticket poll: rejected a shape-valid ticket echoing nonce={:?} — this run minted {nonce:?}",
+            t.ask_nonce.as_deref().unwrap_or("<none>")
+        );
+        return None;
+    }
+    Some(t)
+}
+
 /// Redeem a ticket through the FULL production redeem body — claim gate, dial-only endpoint,
 /// fetch, `accept_manifest_bytes` (which writes the cache that is this row's subject), and the
 /// spend — with a bounded retry. A failed attempt leaves the ask retryable (the claim is keyed to
@@ -538,19 +580,12 @@ async fn run_role_c_phase1(input: &CarryInput) -> Result<(), String> {
     eprintln!("   CC1 sent the ordinary ask to the author (nonce={nonce})");
 
     // Await A's ticket. A's ticket has author_npub == None (own-collection serve) — asserted, so
-    // this leg really is the ordinary carrier before Carrier 4 enters.
+    // this leg really is the ordinary carrier before Carrier 4 enters. It must echo THIS run's
+    // nonce (`ticket_answering_ask` carries the why).
     let ticket = poll_dms(
         input,
         &author_npub,
-        |msg| {
-            let trimmed = msg.content.trim();
-            if !trimmed.starts_with('{') {
-                return None;
-            }
-            let t: TransportTicket = serde_json::from_str(trimmed).ok()?;
-            t.verify_shape().ok()?;
-            Some(t)
-        },
+        |msg| ticket_answering_ask(msg, &nonce),
         "ticket from the author",
     )
     .await?;
@@ -741,19 +776,13 @@ async fn run_role_d(input: &CarryInput) -> Result<(), String> {
     eprintln!("   CD1 sent the author-ask to the cacher (nonce={nonce})");
 
     // Await C's ticket — it MUST name A (`author_npub == Some(A)`): that field is what makes the
-    // redeem pin the manifest to A and the cache land under A's key.
+    // redeem pin the manifest to A and the cache land under A's key. It must also echo THIS run's
+    // nonce (`ticket_answering_ask` carries the why) — a Carrier-4 re-serve answers the ask it was
+    // HANDED, and D's claim gate keys on the nonce just as it keys on the author.
     let ticket = poll_dms(
         input,
         &carrier_npub,
-        |msg| {
-            let trimmed = msg.content.trim();
-            if !trimmed.starts_with('{') {
-                return None;
-            }
-            let t: TransportTicket = serde_json::from_str(trimmed).ok()?;
-            t.verify_shape().ok()?;
-            Some(t)
-        },
+        |msg| ticket_answering_ask(msg, &nonce),
         "ticket from the cacher",
     )
     .await?;
@@ -1056,7 +1085,9 @@ mod tests {
     /// older-first arms below must then fail (they return the older match).
     #[test]
     fn dm_selection_takes_the_newest_match_for_both_carry_shapes() {
-        // Shape 1 — the ticket poll (roles C·1 and D): the same inspect closure those sites pass.
+        // Shape 1 — the ticket poll (roles C·1 and D): the SAME extracted predicate those sites
+        // pass (`ticket_answering_ask`), never a hand-rolled copy — both tickets below echo the
+        // nonce "n" this arm polls for, so the newest-selection this pins is the live one's.
         let ticket_json = |request_id: &str| {
             let ticket = TransportTicket {
                 hb: hb_core::ticket::TICKET_TAG.to_string(),
@@ -1071,15 +1102,7 @@ mod tests {
             serde_json::to_string(&ticket).expect("serialize ticket")
         };
         let ticket_inspect =
-            |msg: &crate::commands::chat::ReceivedMessage| -> Option<TransportTicket> {
-                let trimmed = msg.content.trim();
-                if !trimmed.starts_with('{') {
-                    return None;
-                }
-                let t: TransportTicket = serde_json::from_str(trimmed).ok()?;
-                t.verify_shape().ok()?;
-                Some(t)
-            };
+            |msg: &crate::commands::chat::ReceivedMessage| ticket_answering_ask(msg, "n");
         let older = dm(ticket_json("req-older"), "2026-09-21T00:00:00Z");
         let newer = dm(ticket_json("req-newer"), "2026-09-21T00:01:00Z");
         // Both inbox orders: the NEWER DM wins (first-match returns req-older in the first order).
@@ -1120,6 +1143,71 @@ mod tests {
         assert_eq!(
             pick.newest.expect("newest ask").0, "nonce-new",
             "the NEWEST ask must win even with a newer non-matching DM beside it"
+        );
+    }
+
+    /// The ticket polls (roles C·1 and D) must reject a ticket that does not echo THIS run's
+    /// `ask_nonce` — QURATOR-308, the carry twin of fetch's FD1 predicate (observed live
+    /// 2026-09-06). Relay state outlives a run, so a stale-but-newest ticket from an earlier ask
+    /// still decodes and still passes `verify_shape`; accepting it hands production's claim gate a
+    /// ticket it rightly refuses as `Unsolicited` — a confusing red that indicts production.
+    /// Newest-match (QURATOR-306) narrows that window; this predicate closes it. Drives the
+    /// EXTRACTED predicate both live polls pass — not a copy of it.
+    ///
+    /// P-10 MUTATION (the orchestrator applies this; a worker does not run it): in
+    /// `ticket_answering_ask` (this file), replace the echo-check line
+    /// `if t.ask_nonce.as_deref() != Some(nonce) {` with `if false {` — the stale-nonce and
+    /// nonce-less arms below must then fail (they return a ticket). Re-read the line number
+    /// immediately before applying; the numbers below were re-read at hand-off.
+    ///   · `ticket_answering_ask` fn:              line 362
+    ///   · the `if t.ask_nonce.as_deref() …` line: line 372
+    #[test]
+    fn ticket_poll_rejects_a_ticket_that_does_not_echo_this_runs_nonce() {
+        let ticket_json = |request_id: &str, nonce: Option<&str>| {
+            let ticket = TransportTicket {
+                hb: hb_core::ticket::TICKET_TAG.to_string(),
+                ticket_v: hb_core::TICKET_V,
+                request_id: request_id.to_string(),
+                slug: CARRY_SLUG.to_string(),
+                node_addr: "n0-addr".to_string(),
+                issued_at: 1_700_000_000,
+                ask_nonce: nonce.map(str::to_string),
+                author_npub: None,
+            };
+            serde_json::to_string(&ticket).expect("serialize ticket")
+        };
+        let this_run = "nonce-now";
+        // The matching-nonce ticket IS taken — the predicate must not become a total rejector.
+        assert!(
+            ticket_answering_ask(&dm(ticket_json("req-fresh", Some(this_run)), "2026-09-21T00:01:00Z"), this_run)
+                .is_some(),
+            "a ticket echoing THIS run's nonce must be selected"
+        );
+        // A stale-nonce ticket answering an EARLIER ask is rejected — even though it is NEWER on
+        // the wire, i.e. exactly the stale-but-newest shape QURATOR-308 names.
+        assert!(
+            ticket_answering_ask(&dm(ticket_json("req-stale", Some("nonce-old")), "2026-09-21T00:09:00Z"), this_run)
+                .is_none(),
+            "a stale-nonce ticket must be rejected however new it is"
+        );
+        // A nonce-less ticket (a ticket answering a nonce-less ask — `issue_ticket` normalises
+        // empty to None, so Some(\"\") never appears on the wire) is rejected too: both carry
+        // roles always mint a nonce.
+        assert!(
+            ticket_answering_ask(&dm(ticket_json("req-bare", None), "2026-09-21T00:09:00Z"), this_run)
+                .is_none(),
+            "a nonce-less ticket must be rejected — both carry roles mint a nonce"
+        );
+        // Composed with the selection layer: a stale-but-newer ticket beside the matching one
+        // must not count as a match at all, let alone win as the newest.
+        let stale = dm(ticket_json("req-stale", Some("nonce-old")), "2026-09-21T00:09:00Z");
+        let fresh = dm(ticket_json("req-fresh", Some(this_run)), "2026-09-21T00:01:00Z");
+        let pick = select_dm_newest(&[stale, fresh], |m| ticket_answering_ask(m, this_run));
+        assert_eq!(pick.matched, 1, "the stale ticket must not count as a match");
+        assert_eq!(
+            pick.newest.expect("the matching ticket").0.request_id,
+            "req-fresh",
+            "the selection must land on the ticket answering THIS run's ask"
         );
     }
 }
