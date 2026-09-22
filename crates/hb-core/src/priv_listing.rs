@@ -525,10 +525,59 @@ mod tests {
         // The observable wrap looks like any NIP-59 gift-wrap: kind 1059, a single `p` tag, and an
         // ephemeral author. No `hb-v`/`hb-cv`/listing marker leaks in the clear (those live inside
         // the encrypted seal). An observer can't tell it is a Hoardbook collection at all.
+        //
+        // QURATOR-307: the all-digit kind "31113" must NOT be string-scanned over the whole
+        // document — the wrap JSON is full of random hex (ephemeral pubkey, event id, signature)
+        // and a 5-digit decimal run collides with it by chance (flaked once 2026-09-21). It is
+        // checked structurally instead: the wire `kind` must be 1059, and no TAG NAME may carry a
+        // marker — tag names are code-chosen, never random, so scanning them for the digit needle
+        // is exact. The remaining needles contain non-hex characters and cannot collide with hex,
+        // so the whole-document scan keeps them (it also still covers the content field).
+        //
+        // P-10 mutations — all three RUN AND VERIFIED 2026-09-22, at priv_listing.rs:186 (the
+        // gift-wrap line in production `seal_wrapped`, shared by the listing and grant seal paths).
+        // ⚠ APPLY BY LINE NUMBER: this comment quotes that line's text, so a text-search anchor
+        // would be ambiguous — the real one stands at 186, the quote below is the decoy.
+        // ⚠ Line 186 is a STATEMENT SPANNING 186-187 (the call, then its `.map_err(...)?;`). A
+        //   replacement must consume BOTH lines, or it leaves a duplicated `.map_err` and the run
+        //   is a COMPILE ERROR — which is a hard error, never a mutation verdict. Hit live here.
+        // Current lines 186-187:
+        //     let wrap = EventBuilder::gift_wrap_from_seal(r, &seal, [])
+        //         .map_err(|e| HbError::Nostr(e.to_string()))?;
+        // KIND vector — replace lines 186-187 with:
+        //     let wrap = EventBuilder::new(Kind::from_u16(kind), seal.as_json())
+        //         .custom_created_at(Timestamp::from(now))
+        //         .sign_with_keys(author.keys())
+        //         .map_err(|e| HbError::Nostr(e.to_string()))?;
+        //   ⇒ VERIFIED RED in BOTH tests, on the `wire kind must be 1059` assert specifically
+        //     (panicked at the run's :563 / :897 — the new asserts, not the pre-existing scans; those
+        //     line numbers are the RUN's, before this block grew, so re-locate by assert TEXT)
+        //     is attributable). The hex-safe whole-doc scans stay green.
+        // TAG vector — replace line 186 only (keep 187) with:
+        //     let wrap = EventBuilder::gift_wrap_from_seal(r, &seal, [Tag::custom(TagKind::custom("31113"), ["leak".to_string()])])
+        //   ⇒ VERIFIED RED on the tag-name loop below (run's :569, needle named in the message).
+        // ⚠ CORRECTION to this block's first draft: the TAG vector above reds THIS test ONLY —
+        //   the key-grant test stayed GREEN under it, and correctly so, since "31113" is not in
+        //   that test's needle list. Proving the grant test's tag loop needs its OWN needle:
+        //     …[Tag::custom(TagKind::custom("31114"), ["leak".to_string()])]
+        //   ⇒ VERIFIED RED ("grant wrap tag name leaked a Hoardbook marker: 31114"),
+        //     with THIS test green. One mutation per test — a single tag vector cannot red both.
         let (_author, r, wrap) = seal_one();
         let json = wrap.as_json();
-        for forbidden in ["hb-v", "hb-cv", "hoardbook", "KIND_PRIV", "31113"] {
+        for forbidden in ["hb-v", "hb-cv", "hoardbook", "KIND_PRIV"] {
             assert!(!json.contains(forbidden), "wrap leaked a Hoardbook marker in the clear: {forbidden}");
+        }
+        let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            wire["kind"].as_u64(),
+            Some(1059),
+            "outer kind must be the 1059 gift-wrap, never the inner KIND_PRIV_LISTING (31113)"
+        );
+        for tag in wire["tags"].as_array().expect("wire tags are an array") {
+            let name = tag[0].as_str().unwrap_or_default();
+            for forbidden in ["hb-v", "hb-cv", "hoardbook", "KIND_PRIV", "31113"] {
+                assert!(!name.contains(forbidden), "wrap tag name leaked a Hoardbook marker: {forbidden}");
+            }
         }
         // The only tag a 1059 carries is the recipient `p` tag.
         let p_tags: Vec<_> = wrap.tags.public_keys().collect();
@@ -835,10 +884,37 @@ mod tests {
         // INV-2's enumeration corollary: the observable wrap looks like any NIP-59 gift-wrap — no
         // `hb-v`/`hb-cv`/kind marker in the clear, and (the whole point) no fragment of the granted
         // browse key in any of the encodings inv2_sweep sweeps.
+        //
+        // QURATOR-307: the all-digit kind "31114" must NOT be string-scanned over the whole
+        // document — random hex collides with a 5-digit decimal run by chance (the 2026-09-21
+        // flake's sibling). Checked structurally instead: the wire `kind` must be 1059 and no TAG
+        // NAME may carry a marker (tag names are code-chosen, never random). The granted-key hex
+        // asserts below are exact-value checks and cannot collide by chance — they stay.
+        //
+        // P-10 mutations — RUN AND VERIFIED 2026-09-22. The production edits are written in full
+        // (current line text + replacements) in the P-10 block beside
+        // `wrap_exposes_no_hoardbook_tag_in_the_clear` — one site serves both tests:
+        // priv_listing.rs:186 in `seal_wrapped`, the shared seal path.
+        // KIND vector ⇒ VERIFIED RED here, at the `wire kind must be 1059` assert below.
+        // TAG vector ⇒ the sibling's "31113" needle does NOT red this test, and must not: it is
+        //   absent from this test's needle list. This loop is proven by its OWN needle —
+        //   `TagKind::custom("31114")` ⇒ VERIFIED RED on that loop. One mutation per test.
         let (_author, r, wrap, key) = grant_one();
         let json = wrap.as_json();
-        for forbidden in ["hb-v", "hb-cv", "hoardbook", "KIND_KEY", "31114", "key_grant"] {
+        for forbidden in ["hb-v", "hb-cv", "hoardbook", "KIND_KEY", "key_grant"] {
             assert!(!json.contains(forbidden), "grant wrap leaked a marker in the clear: {forbidden}");
+        }
+        let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            wire["kind"].as_u64(),
+            Some(1059),
+            "outer kind must be the 1059 gift-wrap, never the inner KIND_KEY_GRANT (31114)"
+        );
+        for tag in wire["tags"].as_array().expect("wire tags are an array") {
+            let name = tag[0].as_str().unwrap_or_default();
+            for forbidden in ["hb-v", "hb-cv", "hoardbook", "KIND_KEY", "31114", "key_grant"] {
+                assert!(!name.contains(forbidden), "grant wrap tag name leaked a Hoardbook marker: {forbidden}");
+            }
         }
         assert!(!json.contains(&hex::encode(key)), "hex of the granted key must not appear");
         assert!(!json.contains(&hex::encode(key).to_uppercase()), "…in upper-hex either");
