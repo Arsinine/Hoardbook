@@ -320,14 +320,42 @@ async fn d2_nip65_resolution(probe: &ProbeInput) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // D3 — search-eviction measurement (W3's discriminator, VPS strfry ONLY)
 //
-// W3 shipped (`de3df5d`: `TEASER_SEARCH_FETCH_LIMIT` 1000 + `rank_hits`). This row MEASURES it against
-// a live capped relay: publish N loose-match teasers (single-tag, matching the OR-union but NOT the
-// AND) from throwaway keys, then publish ONE strict-AND-match teaser OLDER than the flood, and assert
-// the strict match still surfaces via the production `search_teasers` path.
+// QURATOR-310 shipped (`fd65e7a2`: `TEASER_SEARCH_FETCH_LIMIT` lowered 1000 -> 500, the grantable
+// page size, PLUS `fetch_teasers_paged` — backwards paging with `until`). This row MEASURES that
+// against a live capped relay: publish N loose-match teasers (single-tag, matching the OR-union but
+// NOT the AND) from throwaway keys, then publish ONE strict-AND-match teaser OLDER than the flood,
+// and assert the strict match still surfaces via the production `search_teasers` path.
+//
+// ⚠ THE FLOOD MUST EXCEED THE RELAY'S GRANTED WINDOW OR THIS ROW MEASURES NOTHING. strfry grants 500
+// by default (measured 2026-09-22: nos.lol and relay.primal.net both cap there, as do the VPS pair),
+// so a flood at or below 500 leaves the strict match inside page one — `until` is never set, the
+// pager never pages, and the row is GREEN against the pre-fix code as well as the post-fix code.
+// `FLOOD_COUNT_FLOOR` below refuses that case rather than passing meaninglessly. Receipt: the
+// 2026-09-22 run that first found the defect red was armed at 600; the row's own default was 60, so
+// the gate as documented would have proved nothing (QURATOR-310, review correction).
+//
+// ⚠ This row is ALSO the only thing that pins QURATOR-310's WIRING. `browse.rs`'s one line routing
+// `search_teasers_capped` through `fetch_teasers_paged` is revertible with the whole unit suite
+// green — every unit test and mutation targets the pager itself, never the call site. Only a live
+// search through the production path can tell a wired fix from an inert one, so a vacuous green here
+// costs more than this row alone (CLAUDE.md §9 / ORCHESTRATOR.md: ask what pins the GLUE).
 //
 // Relay citizenship: flood-shaped rows NEVER run against public relays. The flood guard requires every
 // read relay to be in the --flood-relay allowlist.
 // ---------------------------------------------------------------------------
+
+/// The smallest flood that can actually displace the strict match, and therefore the smallest one
+/// this row will run. The flood must EXCEED the relay's granted response window or the strict teaser
+/// stays inside page one, `until` is never set, the pager never pages, and the row passes identically
+/// against fixed and unfixed code. `TEASER_SEARCH_FETCH_LIMIT` IS that window (QURATOR-310 lowered it
+/// to exactly what strfry grants), so the floor tracks it rather than restating 500 — if the page size
+/// ever changes, this floor follows it instead of silently going stale.
+///
+/// ⚠ A run below this floor is REFUSED, not skipped and not passed. Passing would issue a receipt for
+/// a measurement that did not happen, which is worse than having no gate at all: it closes §5's
+/// integration obligation while proving nothing. The row's default was 60 against a 500-event window
+/// until 2026-09-22 — green either way, for as long as nobody checked the arithmetic.
+const FLOOD_COUNT_FLOOR: u32 = hb_net::TEASER_SEARCH_FETCH_LIMIT as u32 + 1;
 
 /// Takes the ARMED context — the not-armed case never reaches this function; `run` renders it as
 /// an explicit `Tap::skip` row instead, so no wording-sniffing path exists here.
@@ -339,6 +367,21 @@ async fn d3_search_eviction(ctx: &FloodCtx) -> Result<(), String> {
             "D3 REFUSED (relay citizenship): these --relay URLs are not in the --flood-relay allowlist: {}. \
              Flood-shaped rows run only against explicitly-passed VPS strfry relays.",
             violations.join(", ")
+        ));
+    }
+
+    // Arming is not enough — the arming must be BIG ENOUGH. See `FLOOD_COUNT_FLOOR`.
+    if ctx.flood_count < FLOOD_COUNT_FLOOR {
+        return Err(format!(
+            "D3 REFUSED (flood too small to measure anything): --flood-count {} does not exceed the \
+             relay's granted window ({}), so the older strict-AND teaser stays inside page one, \
+             `until` is never set, and this row would pass identically with or without \
+             QURATOR-310's paging. Re-run with --flood-count {} or more (600 is what first surfaced \
+             the defect). Refusing rather than passing: a green here would close §5's integration \
+             obligation while measuring nothing.",
+            ctx.flood_count,
+            hb_net::TEASER_SEARCH_FETCH_LIMIT,
+            FLOOD_COUNT_FLOOR
         ));
     }
 
@@ -398,10 +441,13 @@ async fn d3_search_eviction(ctx: &FloodCtx) -> Result<(), String> {
     }
     settle().await;
 
-    // (3) The production search path: `search_teasers` (the function `search_peers` wraps). It builds
-    //     `teaser_search_filter` (with the W3 `.limit(1000)`), fetches, then ingests (AND-filter +
-    //     dedup + rank). The strict-AND teaser MUST surface — if W3's `.limit()` were absent, the
-    //     flood would evict it before the client filter saw it.
+    // (3) The production search path: `search_teasers` (the function `search_peers` wraps). It pages
+    //     backwards through `fetch_teasers_paged` — page one at `.limit(TEASER_SEARCH_FETCH_LIMIT)`
+    //     (500, what the relay actually grants), then `until = oldest - 1` for the next page — and
+    //     ingests (AND-filter + dedup + rank). The strict-AND teaser MUST surface: it sits OLDER than
+    //     the >500-event flood, so page one cannot contain it and only the second page reaches it.
+    //     Pre-QURATOR-310 this was a single `.limit(1000)` request that the relay silently truncated
+    //     to its newest 500, and the strict match was evicted before the client filter ever saw it.
     let reader = connect(&Identity::generate(), &ctx.read_relays)
         .await
         .map_err(|e| format!("D3 post-flood connect: {e}"))?;
@@ -427,12 +473,21 @@ async fn d3_search_eviction(ctx: &FloodCtx) -> Result<(), String> {
     if !found_strict {
         return Err(format!(
             "D3 search-eviction FAILED: the strict-AND teaser (author {strict_npub}) did NOT surface \
-             after {} loose-match teasers. search_teasers returned {} hits. This is the W3 symptom — \
-             the relay's cap evicted the older strict match before the client AND-filter saw it. W3's \
-             TEASER_SEARCH_FETCH_LIMIT=1000 + rank_hits should prevent this; if it recurs, the relay's \
-             own cap is below the declared fetch budget.",
+             after {} loose-match teasers. search_teasers returned {} hits. The older strict match was \
+             evicted before the client AND-filter saw it — it sits past the relay's granted window \
+             (strfry: 500), so ONLY the second page can reach it. QURATOR-310 shipped \
+             `fetch_teasers_paged` (limit={} per page, then `until = oldest - 1`) precisely for this. \
+             A red here means the paging did not happen. Check, in this order: (1) is \
+             `search_teasers_capped` still ROUTED through `fetch_teasers_paged`? That one line is \
+             revertible with the entire unit suite green, and this row is the only thing that pins it; \
+             (2) did the second page get requested — is `until` being set at all; (3) did this relay \
+             grant fewer than {} on page one, so a full page read as exhaustion and stopped the loop. \
+             ⚠ Do NOT 'fix' a red by lowering --flood-count: below the relay's window the flood cannot \
+             displace anything and this row silently stops measuring.",
             ctx.flood_count,
-            hits.len()
+            hits.len(),
+            hb_net::TEASER_SEARCH_FETCH_LIMIT,
+            hb_net::TEASER_SEARCH_FETCH_LIMIT
         ));
     }
     Ok(())
@@ -920,6 +975,59 @@ fn now_secs() -> Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D3's floor must EXCEED the relay's granted window, not merely equal it. At exactly the window
+    /// the flood fills page one without displacing the older strict match, `until` is never set, and
+    /// the row passes with or without QURATOR-310's paging — the vacuous-green shape that made the
+    /// 60-default worthless. Ties the floor to the live page size rather than a restated 500, so a
+    /// future change to `TEASER_SEARCH_FETCH_LIMIT` carries the floor with it instead of stranding it.
+    ///
+    /// MUTATION (P-10) — locate by LINE NUMBER, not text search (this comment names the constant it
+    /// tests). In `FLOOD_COUNT_FLOOR`'s definition, drop the `+ 1` so the floor equals the page size:
+    /// the strict-greater assert reds.
+    #[test]
+    fn d3_flood_floor_exceeds_the_relays_granted_window() {
+        assert!(
+            FLOOD_COUNT_FLOOR > hb_net::TEASER_SEARCH_FETCH_LIMIT as u32,
+            "a flood equal to the page size cannot displace anything — the floor must exceed it \
+             (floor={FLOOD_COUNT_FLOOR}, page={})",
+            hb_net::TEASER_SEARCH_FETCH_LIMIT
+        );
+    }
+
+    /// The shipped default must itself clear the floor, or the documented invocation
+    /// (`--suite wan-d --flood-relay <VPS>`, no `--flood-count`) REFUSES instead of running. Default
+    /// and floor are two mechanisms for one property; this is the test that keeps them in step, and
+    /// it is the one that would have caught the 60-vs-500 gap before an owner spent a live run on it.
+    ///
+    /// ⚠ Reads the default out of `mod.rs`'s source rather than duplicating the literal — asserting
+    /// `600 > 501` against a copy would pass while the real default sat at 60 (§9: a test that
+    /// rebuilds the thing it checks is decorative).
+    ///
+    /// MUTATION (P-10) — locate by LINE NUMBER, not text search. In `mod.rs`'s D3 arming block,
+    /// change `.unwrap_or(600)` back to `.unwrap_or(60)`: the parsed default drops below the floor
+    /// and this test reds.
+    #[test]
+    fn the_shipped_d3_flood_default_clears_the_floor() {
+        let code = include_str!("mod.rs");
+        let at = code
+            .find("// D3 arming:")
+            .expect("the D3 arming block must exist — this test reads the default from it");
+        let tail = &code[at..];
+        let key = ".unwrap_or(";
+        let start = tail.find(key).expect("the D3 arming block must set a --flood-count default") + key.len();
+        let end = start + tail[start..].find(')').expect("unterminated unwrap_or in the D3 arming block");
+        let default: u32 = tail[start..end]
+            .trim()
+            .parse()
+            .expect("the D3 --flood-count default must be a plain integer literal");
+        assert!(
+            default >= FLOOD_COUNT_FLOOR,
+            "the shipped --flood-count default ({default}) is below D3's floor ({FLOOD_COUNT_FLOOR}), \
+             so the documented invocation would be refused — or, before the floor existed, would have \
+             run and measured nothing"
+        );
+    }
 
     #[test]
     fn full_listing_carries_the_fingerprint_and_entries() {

@@ -1293,10 +1293,18 @@ async fn run_probe_wan_d(args: &[String]) -> Result<ExitCode> {
     }
 
     // D3 arming: --flood-relay (and optionally --flood-count). Absent ⇒ D3 is skipped-with-diagnostic.
+    //
+    // ⚠ The default MUST exceed the relay's granted response window (strfry: 500) or D3 measures
+    // nothing — the strict match stays inside page one and the row passes with or without
+    // QURATOR-310's paging. It was 60 until 2026-09-22, i.e. vacuous by default for as long as
+    // nobody checked it against the cap. 600 is the value that first surfaced the defect, and it
+    // matches WAN-P's default, which never had this problem. `suite_wan_d::FLOOD_COUNT_FLOOR`
+    // refuses anything smaller rather than passing meaninglessly, so this default and that floor
+    // are two mechanisms for one property — keep both.
     let flood_relays = args::collect_flood_relays(args);
     let flood_count = args::flag_value(args, "--flood-count")
         .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(60);
+        .unwrap_or(600);
     let flood_ctx = if flood_relays.is_empty() {
         None
     } else {
