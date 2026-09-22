@@ -46,9 +46,9 @@ fn unix_now() -> u64 {
 
 /// Run the WAN-P suite against a live `serve` peer. `peer_npub` is the served identity's public key
 /// (parsed from its printed npub/share-code); `relays` is the relay set both sides use. P3 is
-/// opt-in: it runs only when `flood_ctx` is `Some` (the probe was passed `--flood-relay` URLs that
-/// satisfy the flood guard), and is skipped (with an explicit diagnostic, NOT a green skip) when the
-/// relay-citizenship guard is not satisfied.
+/// opt-in: when `flood_ctx` is `None` (the probe was not passed `--flood-relay` URLs) the row is a
+/// deliberate `Tap::skip` and the run stays green; when `Some`, it runs and a relay-citizenship
+/// guard violation still fails the row (`not ok`).
 pub async fn run(
     tap: &mut Tap,
     peer_npub: &PublicKey,
@@ -67,11 +67,16 @@ pub async fn run(
         p2_per_relay_acceptance(relays).await,
     );
 
-    // P3 — cap-displacement (VPS strfry only). Refuses to run unless the flood guard is satisfied.
-    tap.check(
-        "P3: cap-displacement — contact presence still resolves after N>cap foreign beacons (VPS strfry only)",
-        p3_cap_displacement(peer_npub, relays, flood_ctx).await,
-    );
+    // P3 — cap-displacement (VPS strfry only). Not armed (--flood-relay absent) is a deliberate
+    // skip, constructed here as an explicit `Tap::skip` — relay citizenship forbids flood-shaped
+    // rows against the public defaults, so an unarmed run skips rather than defects. The
+    // citizenship REFUSAL (a read relay outside the --flood-relay allowlist) stays inside
+    // `p3_cap_displacement`'s `Err` and travels `check`: it renders `not ok` and fails the run.
+    let p3_name = "P3: cap-displacement — contact presence still resolves after N>cap foreign beacons (VPS strfry only)";
+    match flood_ctx {
+        None => p3_skip_if_unarmed(tap, p3_name),
+        Some(ctx) => tap.check(p3_name, p3_cap_displacement(peer_npub, relays, ctx).await),
+    }
 
     // P4 — retry regression. W1 shipped the retry: a failed cycle backs off inside the 480s window.
     tap.check(
@@ -83,6 +88,18 @@ pub async fn run(
     tap.check(
         "P5: same-NAT — two identities from one IP each resolve via the author-filtered read",
         p5_same_nat_plus_two(relays).await,
+    );
+}
+
+/// P3's not-armed branch, pulled out of `run`'s call site so it is reachable from a test without
+/// driving the full async `run` (which does real network I/O for P1/P2/P4/P5). A deliberate
+/// `Tap::skip` — relay citizenship forbids flood-shaped rows against the public defaults, so an
+/// unarmed run skips rather than defects.
+fn p3_skip_if_unarmed(tap: &mut Tap, name: &str) {
+    tap.skip(
+        name,
+        "P3 SKIPPED (not armed): pass --flood-relay <url>... (VPS strfry only) to run the cap-displacement row. \
+         It is skipped here rather than run against a public relay — relay citizenship forbids flood-shaped rows on the public defaults.",
     );
 }
 
@@ -228,16 +245,8 @@ pub struct FloodCtx {
 async fn p3_cap_displacement(
     peer_npub: &PublicKey,
     relays: &[String],
-    flood_ctx: Option<&FloodCtx>,
+    ctx: &FloodCtx,
 ) -> Result<(), String> {
-    let Some(ctx) = flood_ctx else {
-        return Err(
-            "P3 SKIPPED (not armed): pass --flood-relay <url>... (VPS strfry only) to run the cap-displacement row. \
-             It is skipped here rather than run against a public relay — relay citizenship forbids flood-shaped rows on the public defaults."
-                .to_string(),
-        );
-    };
-
     // The guard: every read relay must be a flood relay (so the operator explicitly named each target).
     let violations = super::args::flood_guard_violations(&ctx.read_relays, &ctx.flood_relays);
     if !violations.is_empty() {
@@ -487,4 +496,62 @@ async fn verify_peer_online(client: &RelayClient, peer: &Identity) -> Result<(),
 /// row). Returns Ok when at least one relay accepted, Err with per-relay evidence otherwise.
 pub async fn canary_beacon_acceptance(relays: &[String]) -> Result<(), String> {
     p2_per_relay_acceptance(relays).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P3 not armed ⇒ a deliberate `Tap::skip`, and the run stays green. Drives the real
+    /// `p3_skip_if_unarmed` helper — the same one `run`'s call site invokes on `None` — rather
+    /// than reimplementing the skip, so this pins what production actually does.
+    ///
+    /// MUTATION (P-10) — locate by LINE NUMBER, not text search (this comment quotes the code it
+    /// tests). In `p3_skip_if_unarmed`, replace the `tap.skip(name, "...")` call with
+    /// `tap.check(name, Err("not armed".to_string()))` — the row then fails instead of skipping,
+    /// and this test's `ExitCode::SUCCESS` assert reds.
+    #[test]
+    fn p3_unarmed_skip_keeps_the_run_green() {
+        let mut tap = Tap::new();
+        tap.check("an ordinary pass", Ok(()));
+        p3_skip_if_unarmed(&mut tap, "P3: cap-displacement");
+        assert_eq!(tap.finish(), std::process::ExitCode::SUCCESS);
+    }
+
+    /// P3 citizenship refusal ⇒ still an `Err` that fails the run — the not-armed fix must not
+    /// also soften this half. Drives the real `p3_cap_displacement`, which calls the real
+    /// `super::args::flood_guard_violations`, with a `FloodCtx` whose `read_relays` are absent
+    /// from `flood_relays`.
+    ///
+    /// ⚠ It asserts on the REFUSAL MESSAGE, not merely on `ExitCode::FAILURE`. Asserting only on
+    /// the exit code was decorative and a mutation proved it: with the guard neutralised the row
+    /// still failed, but on `post-flood connect: no relay connected: no relays configured` — the
+    /// empty `relays` argument, an unrelated error. The test passed for a reason it does not name,
+    /// so deleting the guard outright would have left it green (§9 P-6).
+    ///
+    /// MUTATION (P-10) — locate by LINE NUMBER, not text search (this comment quotes the code it
+    /// tests). In `p3_cap_displacement`, change the guard's `if !violations.is_empty() {` to
+    /// `if false {` — the guard never fires, the refusal string is never produced, and this test's
+    /// `contains` assert reds. (Verified RED 2026-09-22; the exit-code-only form did NOT.)
+    #[tokio::test]
+    async fn p3_citizenship_refusal_still_fails_the_run() {
+        let peer = Identity::generate().public_key();
+        let ctx = FloodCtx {
+            flood_relays: vec!["ws://141.98.199.138:7777".to_string()],
+            read_relays: vec!["wss://relay.primal.net".to_string()],
+            flood_count: 1,
+        };
+        let refusal = p3_cap_displacement(&peer, &[], &ctx)
+            .await
+            .expect_err("a read relay outside the --flood-relay allowlist must refuse");
+        assert!(
+            refusal.contains("P3 REFUSED (relay citizenship)")
+                && refusal.contains("wss://relay.primal.net"),
+            "the refusal must name the citizenship guard and the offending relay, not some other \
+             failure that happens to be an Err: {refusal}"
+        );
+        let mut tap = Tap::new();
+        tap.check("P3: cap-displacement", Err(refusal));
+        assert_eq!(tap.finish(), std::process::ExitCode::FAILURE);
+    }
 }
