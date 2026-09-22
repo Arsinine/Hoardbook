@@ -43,7 +43,7 @@ use nostr::prelude::ToBech32;
 // hand, that silently omitted one step.
 use crate::identity_state::{AppIdentity, SharedIdentity};
 use crate::store::DataStore;
-use crate::transport::{fetch_manifest, parse_node_addr};
+use crate::transport::{fetch_manifest, parse_node_addr, sanitize_node_addr};
 use crate::transport_state::{ensure_endpoint, new_shared_endpoint, Role};
 use crate::wan_it::tap::Tap;
 
@@ -269,6 +269,19 @@ async fn m1_live_redeem(probe: &ProbeInput) -> Result<(), String> {
             Ok(Err(e)) => {
                 last_err = format!("attempt {attempt}: redeem_manifest_ticket_inner failed: {e}");
                 eprintln!("   M1-live attempt {attempt} failed: {e}");
+                // QURATOR-313: name the address that was actually dialled. The failure message above
+                // only names the slug (already known); it cannot distinguish "the ticket carried a
+                // relay fallback and n0 itself failed" (serious) from "the ticket only ever had
+                // NAT'd Ip addrs, or its relay got stripped" (a cheaper, unsurprising bug). Sanitized,
+                // not raw: sanitized is what the production dial actually used. Not a leak — this is
+                // the asker's own ticket, arrived over their own NIP-17 DM; printing it to their own
+                // stderr discloses nothing a world-readable relay event would (unlike
+                // `presence_carries_no_address_or_node_key`, which is about publishing an address to
+                // everyone, not showing an asker the address they already hold).
+                eprintln!(
+                    "   M1-live attempt {attempt} sanitized dial target: {}",
+                    describe_sanitized_dial_target(&probe.live_ticket.node_addr)
+                );
                 // The claim is durable and bound to this request id, so a retry re-claims Granted.
                 // An `Unsolicited`/`ClaimedByAnother` error here is a real finding, not a flake —
                 // report it verbatim rather than retrying into a misleading timeout.
@@ -282,6 +295,10 @@ async fn m1_live_redeem(probe: &ProbeInput) -> Result<(), String> {
                     "attempt {attempt}: redeem did not complete within {LIVE_REDEEM_TIMEOUT:?}"
                 );
                 eprintln!("   M1-live attempt {attempt} timed out");
+                eprintln!(
+                    "   M1-live attempt {attempt} sanitized dial target: {}",
+                    describe_sanitized_dial_target(&probe.live_ticket.node_addr)
+                );
             }
         }
         if attempt < LIVE_REDEEM_RETRIES {
@@ -289,6 +306,35 @@ async fn m1_live_redeem(probe: &ProbeInput) -> Result<(), String> {
         }
     }
     Err(last_err)
+}
+
+/// QURATOR-313: render the SANITIZED form of a ticket's `node_addr` — the one production actually
+/// dials, post-`sanitize_node_addr` (the SSRF guard `redeem_manifest_ticket_with_progress` applies
+/// before handing the ticket to the transport layer) — as a compact `Ip(...)`/`Relay(...)` list, so
+/// M1-live's failure output can distinguish "carried a relay fallback and it still failed" from
+/// "only ever had non-global/NAT'd addrs, or a relay got stripped" at a glance. Mirrors the M4 row's
+/// offered-addr formatting (below) rather than inventing a second idiom for the same shape.
+fn describe_sanitized_dial_target(raw_node_addr: &str) -> String {
+    let sanitized = match sanitize_node_addr(raw_node_addr) {
+        Ok(s) => s,
+        Err(e) => return format!("could not sanitize the ticket's node_addr to check: {e}"),
+    };
+    let Ok(addr) = parse_node_addr(&sanitized) else {
+        return "could not re-parse the sanitized node_addr to check".to_string();
+    };
+    if addr.addrs.is_empty() {
+        return "no transport addr survived sanitization (empty after the SSRF filter)".to_string();
+    }
+    let rendered: Vec<String> = addr
+        .addrs
+        .iter()
+        .map(|a| match a {
+            iroh::TransportAddr::Ip(sock) => format!("Ip({sock})"),
+            iroh::TransportAddr::Relay(url) => format!("Relay({url})"),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    format!("[{}]", rendered.join(", "))
 }
 
 /// QURATOR-45/74: log whether the just-completed redeem actually hole-punched (a direct IP path is
@@ -873,5 +919,79 @@ mod tests {
         };
         let err = assert_probe_ask_unspent(&input, &input.live_ticket).unwrap_err();
         assert!(err.contains("spent"), "the assertion names the spent ask, got: {err}");
+    }
+
+    /// QURATOR-313: `describe_sanitized_dial_target` names BOTH transport-addr shapes at a glance —
+    /// the operator needs to tell "the ticket carried a relay fallback and n0 itself failed" apart
+    /// from "the ticket only ever had NAT'd/Ip addrs". Calls the real production helper (the one
+    /// `m1_live_redeem`'s failure arms call), not a re-implementation of its formatting.
+    ///
+    /// Mutation proof: in `describe_sanitized_dial_target` (starts at production line 317), change
+    /// its `Ip(sock) => format!("Ip({sock})")` arm — production line 332 as this file currently
+    /// stands — to `Ip(sock) => format!("IP-ADDR({sock})")`. NOTE: that exact arm text is NOT unique
+    /// in the file (an identical line exists at line ~707, inside the unrelated M4-row formatter,
+    /// `log_redeem_connection_type`'s sibling) — anchor the edit by LINE NUMBER (332, inside
+    /// `describe_sanitized_dial_target`'s body) rather than by text search. After the edit, the
+    /// `contains("Ip(8.8.8.8:9999)")` assertion below reds, because the rendered string now contains
+    /// `"IP-ADDR(8.8.8.8:9999)"` instead, which does not contain the literal `"Ip("`-prefixed form
+    /// the test looks for.
+    #[test]
+    fn describe_sanitized_dial_target_names_relay_and_ip() {
+        let id = iroh::SecretKey::generate().public();
+        let addrs: std::collections::BTreeSet<iroh::TransportAddr> = [
+            // Globally routable — survives sanitizing.
+            iroh::TransportAddr::Ip(std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+                9999,
+            )),
+            iroh::TransportAddr::Relay("https://relay.example.com".parse().unwrap()),
+        ]
+        .into_iter()
+        .collect();
+        let addr = iroh::EndpointAddr::from_parts(id, addrs);
+        let raw = serde_json::to_string(&addr).unwrap();
+
+        let described = describe_sanitized_dial_target(&raw);
+        assert!(
+            described.contains("Ip(8.8.8.8:9999)"),
+            "names the global Ip addr so it reads at a glance, got: {described}"
+        );
+        assert!(
+            described.contains("Relay(") && described.contains("relay.example.com"),
+            "names the relay addr so it reads at a glance, got: {described}"
+        );
+    }
+
+    /// QURATOR-313: the printed target must be the SANITIZED address (what production actually
+    /// dials), never the raw pre-sanitize one — a loopback-only ticket sanitizes to nothing dialable,
+    /// and the helper must say so rather than echoing the raw loopback addr back.
+    ///
+    /// Mutation proof: anchor by LINE NUMBER, not text (the target string is quoted verbatim in this
+    /// very comment, so a text search would also match here). At production line 326, inside
+    /// `describe_sanitized_dial_target`'s empty-`addrs` branch, change the returned string from
+    /// "no transport addr survived sanitization (empty after the SSRF filter)" to "nothing left to
+    /// dial" — the `contains("no transport addr survived sanitization")` assertion below then reds,
+    /// because that literal substring is gone from the helper's output.
+    #[test]
+    fn describe_sanitized_dial_target_reflects_sanitizing_not_the_raw_ticket() {
+        let id = iroh::SecretKey::generate().public();
+        let addr = iroh::EndpointAddr::from_parts(
+            id,
+            [iroh::TransportAddr::Ip(std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                9999,
+            ))],
+        );
+        let raw = serde_json::to_string(&addr).unwrap();
+
+        let described = describe_sanitized_dial_target(&raw);
+        assert!(
+            described.contains("no transport addr survived sanitization"),
+            "a loopback-only ticket sanitizes to empty, got: {described}"
+        );
+        assert!(
+            !described.contains("127.0.0.1"),
+            "must never print the RAW pre-sanitize addr, got: {described}"
+        );
     }
 }
