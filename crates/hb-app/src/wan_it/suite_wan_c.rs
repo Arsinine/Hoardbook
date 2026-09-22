@@ -525,7 +525,7 @@ async fn c4_cursor_discipline(probe: &ProbeInput) -> Result<(), String> {
     probe
         .store
         .save_dm_cache(&bob, &cache)
-        .map_err(|e| format!("C4 save_dm_cache: {e}"))?;
+        .map_err(|e| format!("C4 save_dm_cache: {e:#}"))?;
 
     // (3) Simulated restart: re-load the cache from disk, re-poll the live relay. No message lost
     //     (the real DM is still in the cache) and no message re-shown (the real wrap's id is in
@@ -535,7 +535,7 @@ async fn c4_cursor_discipline(probe: &ProbeInput) -> Result<(), String> {
     let reloaded = probe
         .store
         .load_dm_cache(&bob)
-        .map_err(|e| format!("C4 reload dm_cache: {e}"))?;
+        .map_err(|e| format!("C4 reload dm_cache: {e:#}"))?;
     if reloaded.newest_seen_outer > now {
         return Err(format!(
             "C4 reload: persisted cursor {} > now {now} — the on-load heal failed",
@@ -764,5 +764,44 @@ mod tests {
     #[test]
     fn poll_cadence_is_3s() {
         assert_eq!(POLL_CADENCE, Duration::from_secs(3), "the production get_messages cadence is 3s");
+    }
+
+    // QURATOR-312 sibling sweep: pins the reasoning behind the `{e}` -> `{e:#}` fix at this file's
+    // `save_dm_cache`/`load_dm_cache` sites (lines ~528, ~538) — those call genuinely-anyhow,
+    // genuinely-context-chained production functions, so the alternate Display is not vacuous there
+    // (unlike most other sites in this file, which are plain-String or thiserror `NetError` and get
+    // NO benefit from `{:#}`). Calls the real production path (`DataStore::save_dm_cache`), not a
+    // decorative rebuild.
+    //
+    // Mutation proof (not run here — see report): remove the `.context("saving DM cache")` call at
+    // `crates/hb-app/src/dm_cache_store.rs:97` (i.e. change
+    // `write_json(&self.dm_cache_path(), &sealed).context("saving DM cache")` to
+    // `write_json(&self.dm_cache_path(), &sealed)`). That deletes the save path's only added context
+    // layer, so the anyhow error carries a single level and `{:#}` renders byte-identical to `{}` —
+    // both assertions below red.
+    #[test]
+    fn dm_cache_save_error_chain_is_visible_only_with_alternate_display() {
+        let dir = tempfile::tempdir().unwrap();
+        // `base` exists as a plain file, not a directory, so `write_atomic`'s `create_dir_all(parent)`
+        // fails and the failure propagates through `write_json` into `save_dm_cache`'s
+        // `.context("saving DM cache")` — a genuine one-layer anyhow chain from real production code.
+        let base = dir.path().join("not_a_dir");
+        std::fs::write(&base, b"i am a file, not a directory").unwrap();
+        let store = DataStore::new(base);
+        let me = Identity::generate();
+        let err = store.save_dm_cache(&me, &DmCache::default()).unwrap_err();
+
+        let plain = format!("{err}");
+        let chained = format!("{err:#}");
+        assert!(
+            chained.contains("saving DM cache"),
+            "the alternate rendering must surface the added context layer, got {chained:?}"
+        );
+        assert!(
+            chained.len() > plain.len(),
+            "the alternate (chained) rendering must be strictly longer than the bare one, proving \
+             `.context()` layers are invisible under `{{}}` and only surface under `{{:#}}`: \
+             plain={plain:?} chained={chained:?}"
+        );
     }
 }

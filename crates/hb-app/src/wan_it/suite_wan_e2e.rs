@@ -308,7 +308,7 @@ async fn browse_truncated_teaser(probe: &ProbeInput) -> Result<BrowsedTeaser, St
     let relays = probe
         .store
         .load_settings()
-        .map_err(|e| format!("load settings: {e}"))?
+        .map_err(|e| format!("load settings: {e:#}"))?
         .map(|s| s.relay_urls)
         .unwrap_or_default();
     if relays.is_empty() {
@@ -432,7 +432,7 @@ async fn send_request_dm(probe: &ProbeInput, fingerprint_seen: &Option<String>) 
     let relays = probe
         .store
         .load_settings()
-        .map_err(|e| format!("load settings: {e}"))?
+        .map_err(|e| format!("load settings: {e:#}"))?
         .map(|s| s.relay_urls)
         .unwrap_or_default();
     if relays.is_empty() {
@@ -471,7 +471,7 @@ async fn send_request_dm(probe: &ProbeInput, fingerprint_seen: &Option<String>) 
             &sent_at,
             &ask_nonce,
         )
-        .map_err(|e| format!("record_manifest_ask: {e}"))?;
+        .map_err(|e| format!("record_manifest_ask: {e:#}"))?;
 
     Ok(ask_nonce)
 }
@@ -559,7 +559,7 @@ async fn poll_for_ticket_dm(probe: &ProbeInput, expected_nonce: &str) -> Result<
     let relays = probe
         .store
         .load_settings()
-        .map_err(|e| format!("load settings: {e}"))?
+        .map_err(|e| format!("load settings: {e:#}"))?
         .map(|s| s.relay_urls)
         .unwrap_or_default();
 
@@ -709,8 +709,8 @@ async fn redeem_ticket(
                 return Ok(imported);
             }
             Ok(Err(e)) => {
-                last_err = format!("attempt {attempt}: fetch_manifest failed: {e}");
-                eprintln!("   E1/E2 attempt {attempt} failed: {e}");
+                last_err = format!("attempt {attempt}: fetch_manifest failed: {e:#}");
+                eprintln!("   E1/E2 attempt {attempt} failed: {e:#}");
             }
             Err(_) => {
                 last_err =
@@ -770,7 +770,7 @@ async fn claim_for_probe(probe: &ProbeInput, ticket: &TransportTicket) -> Result
             ticket.ask_nonce.as_deref().unwrap_or_default(),
             &ticket.request_id,
         )
-        .map_err(|e| format!("claim_manifest_ask: {e}"))?;
+        .map_err(|e| format!("claim_manifest_ask: {e:#}"))?;
     match claim {
         AskClaim::Granted => Ok(()),
         AskClaim::Spent => Err(
