@@ -10,7 +10,7 @@
 //! the listing: a follow-only share code (bare `npub`) yields the teaser only; a wrong browse-key
 //! yields the teaser with the listing locked (decrypt fails cleanly, not a hard browse error).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use hb_core::event::{
@@ -20,7 +20,10 @@ use hb_core::listing::BrowseKey;
 use hb_core::{Identity, ShareCode};
 use nostr::prelude::*;
 
-use crate::client::{dedup_by_id, teaser_search_filter, validate_relay_url, RelayClient};
+use crate::client::{
+    dedup_by_id, teaser_search_filter, validate_relay_url, RelayClient, TEASER_SEARCH_FETCH_LIMIT,
+    TEASER_SEARCH_MAX_PAGES, TEASER_SEARCH_TOTAL_LIMIT,
+};
 use crate::discover::{ingest_teasers_capped, select_newest_by_created_at, SearchHit};
 use crate::error::NetError;
 use crate::nip65::{bootstrap_order, inbox_order, parse_relay_list};
@@ -991,10 +994,72 @@ pub async fn search_teasers(
     Ok(search_teasers_capped(client, tags, content_types, cap, timeout).await?.0)
 }
 
+/// Backwards pager over the teaser search (QURATOR-310). One request returns at most
+/// [`TEASER_SEARCH_FETCH_LIMIT`] events — on a strfry relay (500 `maxFilterLimit`, truncation
+/// silent) that is the newest 500 — so a strict-AND teaser older than the window was evicted
+/// before the client filter ever saw it and the user got a confident "no results". Each further
+/// page re-asks with `until` set below the oldest event seen so far, until the total budget
+/// ([`TEASER_SEARCH_TOTAL_LIMIT`]) is reached, a page comes back short (the relay has no more),
+/// or the hard page ceiling ([`TEASER_SEARCH_MAX_PAGES`]) stops a relay that ignores `until`.
+///
+/// **`until` boundary:** NIP-01 makes `until` *inclusive* (`created_at <= until`), so paging from
+/// `oldest_seen` itself would re-fetch that event — and every same-second sibling — every page.
+/// We set `until = oldest_seen - 1` instead: the bound strictly decreases per request, so the
+/// pager makes forward progress even against a relay answering overlapping windows, and any
+/// stragglers collapse into the id-set below. The accepted cost is skipping events that share the
+/// boundary event's `created_at` second but sit after it in the relay's order — a one-second slice
+/// at one page edge, bounded and small next to the whole-window eviction it replaces. (The
+/// alternative — `until = oldest_seen` + dedup alone — makes no progress guarantee between
+/// ceiling stops on a relay that replays one busy second.)
+///
+/// Dedup across pages is by event id, first-seen order preserved — the same invariant
+/// `dedup_by_id` enforces across relays, applied across pages. Ranking/AND-filtering stays
+/// downstream in `ingest_teasers_capped`: this widens the input window, nothing else. A failed
+/// page fetch errs the whole search (the outage-vs-empty discipline: a network failure is never
+/// silently reshaped into a short result).
+///
+/// The page fetch is injected so the pager is unit-testable without a relay: production passes a
+/// closure over `RelayClient::fetch`; `search_teasers_capped` is the only caller.
+async fn fetch_teasers_paged<F, Fut>(
+    tags: &[String],
+    content_types: &[String],
+    mut fetch_page: F,
+) -> Result<Vec<Event>, NetError>
+where
+    F: FnMut(Filter) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<Event>, NetError>>,
+{
+    let mut collected: Vec<Event> = Vec::new();
+    let mut seen: HashSet<EventId> = HashSet::new();
+    let mut oldest_seen: Option<u64> = None;
+    for _page in 0..TEASER_SEARCH_MAX_PAGES {
+        let mut filter = teaser_search_filter(tags, content_types)?;
+        if let Some(oldest) = oldest_seen {
+            filter = filter.until(Timestamp::from(oldest.saturating_sub(1)));
+        }
+        let page = fetch_page(filter).await?;
+        let page_len = page.len();
+        for event in page {
+            let secs = event.created_at.as_secs();
+            if oldest_seen.is_none_or(|o| secs < o) {
+                oldest_seen = Some(secs);
+            }
+            if seen.insert(event.id) {
+                collected.push(event);
+            }
+        }
+        if collected.len() >= TEASER_SEARCH_TOTAL_LIMIT || page_len < TEASER_SEARCH_FETCH_LIMIT {
+            break;
+        }
+    }
+    Ok(collected)
+}
+
 /// Same as [`search_teasers`] but also returns whether the cap truncated the ranked set (M20 W3 —
 /// the Discover UI surfaces a "showing first N" affordance when `capped` is `true`). The truncation
 /// signal is authoritative: it comes from [`ingest_teasers_capped`], the only layer that sees both
-/// the full deduped set and the cap.
+/// the full deduped set and the cap. The fetch side pages backwards past a relay's silent response
+/// cap (QURATOR-310, `fetch_teasers_paged`).
 pub async fn search_teasers_capped(
     client: &RelayClient,
     tags: &[String],
@@ -1002,8 +1067,8 @@ pub async fn search_teasers_capped(
     cap: usize,
     timeout: Duration,
 ) -> Result<(Vec<SearchHit>, bool), NetError> {
-    let filter = teaser_search_filter(tags, content_types)?;
-    let events = client.fetch(filter, timeout).await?;
+    let events = fetch_teasers_paged(tags, content_types, |filter| client.fetch(filter, timeout))
+        .await?;
     Ok(ingest_teasers_capped(events, tags, content_types, cap))
 }
 
@@ -2115,5 +2180,190 @@ mod tests {
             "foreign-author teaser must be dropped before selection; got {:?}",
             selected.display_name
         );
+    }
+
+    // ── QURATOR-310: the backwards pager (`fetch_teasers_paged`) ──────────────────────────────
+    //
+    // A teaser event at a chosen created_at, mirroring discover.rs's `ev_at` helper so the pager
+    // tests control the timestamp axis the `until` bound derives from. Content varies with ts so a
+    // single author still yields distinct event ids.
+    fn teaser_ev_at(id: &Identity, ts: u64) -> Event {
+        let t = Teaser {
+            display_name: format!("peer-{ts}"),
+            bio: String::new(),
+            tags: vec!["anime".into()],
+            content_types: vec!["video".into()],
+            picture: None, hide_in_rosters: false,
+        };
+        let base = build_teaser(id, &t, true).unwrap();
+        let tags: Vec<Tag> = base.tags.iter().cloned().collect();
+        id.sign(
+            EventBuilder::new(base.kind, base.content)
+                .tags(tags)
+                .custom_created_at(Timestamp::from(ts)),
+        )
+        .unwrap()
+    }
+
+    // The injected page fetch every pager test stands in for: an always-succeeding relay page.
+    async fn ok_page(events: Vec<Event>) -> Result<Vec<Event>, NetError> {
+        Ok(events)
+    }
+
+    #[tokio::test]
+    async fn search_pages_backwards_until_the_budget_is_reached_q310() {
+        // THE fix (QURATOR-310): a 500-capping strfry relay returns only the newest 500 in page 1,
+        // silently. The pager must re-ask with `until` one second below page 1's oldest event and
+        // merge the pages, deduped by id, into the ~1000-event total budget.
+        // Mutation A: in `fetch_teasers_paged` (browse.rs), delete the line that reassigns the
+        //   filter with the `until` bound inside the loop — the second captured filter then has no
+        //   until at all and the `Some(9_500)` assert reds.
+        // Mutation B: in `fetch_teasers_paged`, delete the `TEASER_SEARCH_MAX_PAGES` loop bound's
+        //   second iteration (run the range over one page) — the two-call and merged-size asserts
+        //   red.
+        let id = Identity::generate();
+        // Page 1: the newest 500 the relay grants (ts 10_000 down to 9_501).
+        let page1: Vec<Event> = (0..TEASER_SEARCH_FETCH_LIMIT as u64)
+            .map(|i| teaser_ev_at(&id, 10_000 - i))
+            .collect();
+        // Page 2: the next 500 older ones (ts 9_500 down to 8_501).
+        let page2: Vec<Event> = (0..TEASER_SEARCH_FETCH_LIMIT as u64)
+            .map(|i| teaser_ev_at(&id, 9_500 - i))
+            .collect();
+        let pages = [page1.clone(), page2];
+        let mut calls: Vec<Filter> = Vec::new();
+        let mut next = 0usize;
+        let merged = fetch_teasers_paged(
+            &["anime".into()],
+            &["video".into()],
+            |filter: Filter| {
+                calls.push(filter.clone());
+                let page = pages[next].clone();
+                next += 1;
+                ok_page(page)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            calls.len(),
+            2,
+            "a full first page against a 500-capping relay must trigger exactly one backwards page"
+        );
+        assert!(calls[0].until.is_none(), "the first page carries no until bound");
+        assert_eq!(
+            calls[1].until.map(|t| t.as_secs()),
+            Some(9_500),
+            "page 2 asks from one second below page 1's oldest event (9_501): until is inclusive, \
+             so oldest-1 both excludes the boundary event and guarantees progress"
+        );
+        assert_eq!(
+            merged.len(),
+            TEASER_SEARCH_TOTAL_LIMIT,
+            "two full pages merge to the total budget"
+        );
+        assert_eq!(merged[0].id, page1[0].id, "first-seen order survives the merge");
+    }
+
+    #[tokio::test]
+    async fn search_short_page_terminates_the_loop_q310() {
+        // Exhaustion: a page shorter than the declared page size means the relay has no more —
+        // the loop must stop rather than issue a further request (QURATOR-310 termination rule).
+        // Mutation: in `fetch_teasers_paged` (browse.rs), edit the single-line break condition in
+        //   the loop so it no longer tests the returned page length against the page-size constant
+        //   (keep only the total-budget half) — the relay here answers a second (empty) page, the
+        //   call count doubles, and the one-call assert reds.
+        let id = Identity::generate();
+        let only: Vec<Event> = (0..37u64).map(|i| teaser_ev_at(&id, 5_000 - i)).collect();
+        let mut calls: Vec<Filter> = Vec::new();
+        let mut next = 0usize;
+        let merged = fetch_teasers_paged(
+            &["anime".into()],
+            &[],
+            |filter: Filter| {
+                calls.push(filter.clone());
+                // Past the scripted short page the relay answers empty — visible as call count 2.
+                let page = if next == 0 { only.clone() } else { Vec::new() };
+                next += 1;
+                ok_page(page)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(merged.len(), 37, "the short page's events are handed downstream");
+        assert_eq!(calls.len(), 1, "a short page means exhausted — no second request");
+    }
+
+    #[tokio::test]
+    async fn search_ceiling_stops_a_replaying_relay_q310() {
+        // The pathological relay: it ignores `until` and answers the SAME full page forever. The
+        // page ceiling must bound the requests, and the replay must dedup back to one page by id.
+        // Mutation A (ceiling): raise the page-ceiling const in client.rs (or widen the loop range
+        //   it feeds) — the fake panics on the page after the ceiling and the test reds.
+        // Mutation B (dedup): in `fetch_teasers_paged` (browse.rs), make the loop push every event
+        //   unconditionally instead of only when new by id — the replayed page doubles and the
+        //   merged-size assert reds.
+        let id = Identity::generate();
+        let replay: Vec<Event> = (0..TEASER_SEARCH_FETCH_LIMIT as u64)
+            .map(|i| teaser_ev_at(&id, 7_000 - i))
+            .collect();
+        let mut calls = 0usize;
+        let merged = fetch_teasers_paged(
+            &["anime".into()],
+            &[],
+            |_filter: Filter| {
+                calls += 1;
+                if calls > TEASER_SEARCH_MAX_PAGES {
+                    panic!("a replaying relay drove the pager past the page ceiling");
+                }
+                ok_page(replay.clone())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            calls,
+            TEASER_SEARCH_MAX_PAGES,
+            "the page ceiling bounds even a relay that replays the same full page forever"
+        );
+        assert_eq!(
+            merged.len(),
+            replay.len(),
+            "the replayed page dedups back to itself — no duplicate ids cross pages"
+        );
+        assert_eq!(merged[0].id, replay[0].id, "first-seen order survives the replay");
+    }
+
+    #[tokio::test]
+    async fn search_overlong_page_stops_at_the_total_budget_q310() {
+        // Budget-reached termination, pinned independently of the ceiling: a relay that ignores
+        // the page limit and returns a full budget in one page must not be asked for more.
+        // Mutation: in `fetch_teasers_paged` (browse.rs), edit the single-line break condition in
+        //   the loop so it no longer tests the collected size against the total-budget constant
+        //   (keep only the short-page half) — the fake panics on a second call and the test reds.
+        let id = Identity::generate();
+        let overlong: Vec<Event> = (0..TEASER_SEARCH_TOTAL_LIMIT as u64)
+            .map(|i| teaser_ev_at(&id, 10_000 - i))
+            .collect();
+        let mut calls = 0usize;
+        let merged = fetch_teasers_paged(
+            &["anime".into()],
+            &[],
+            |_filter: Filter| {
+                calls += 1;
+                if calls > 2 {
+                    panic!("the pager kept going after the total budget was already in hand");
+                }
+                ok_page(overlong.clone())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            merged.len(),
+            TEASER_SEARCH_TOTAL_LIMIT,
+            "the full budget is handed downstream, deduped"
+        );
+        assert_eq!(calls, 1, "budget reached on page 1 — no second request");
     }
 }
