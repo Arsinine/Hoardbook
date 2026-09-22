@@ -666,7 +666,16 @@ pub(crate) async fn redeem_manifest_ticket_with_progress(
         Ok(())
     }, progress_sink.as_ref().map(|f| f as crate::transport::ProgressSink))
     .await
-    .map_err(cmd_err)?;
+    // QURATOR-312 — keep the cause chain, not just its outermost link. `fetch_manifest_with_progress`
+    // fails with an anyhow chain whose CAUSE is the only thing distinguishing a dial timeout ("the
+    // ticket's address never answered the dial") from a dial refusal (iroh's connect error) — both
+    // arms carry the same slug context (the `with_context` over `with_deadline` in transport.rs).
+    // `cmd_err` is Display-only, so it kept the context and silently dropped the cause, printing
+    // both arms identically — to the UI user (this is the `redeem_manifest_ticket` command's
+    // failure string) and to the WAN harness. `{e:#}` flattens the whole chain into the `CmdResult`
+    // string. The file's other `map_err(cmd_err)` sites wrap thiserror/serde/store leaves whose
+    // "chain" is one layer of parser noise; they stay Display-only on purpose.
+    .map_err(|e| format!("{e:#}"))?;
     let mut imported =
         imported.ok_or_else(|| "The manifest was acknowledged but never accepted.".to_string())?;
     // Carrier 4 provenance: name the peer that actually served the copy when this was a re-serve
@@ -1090,6 +1099,53 @@ mod tests {
             assert_ne!(
                 retry_err, "Another link is already answering that request, so nothing was fetched.",
                 "a same-ticket retry is re-granted, not refused as ClaimedByAnother"
+            );
+        }
+
+        /// QURATOR-312 — the boundary `transport.rs`'s `a_silent_ticket_address_is_bounded_by_the_
+        /// dial_deadline` cannot reach: that test proves the anyhow chain is intact BELOW this
+        /// command (it enters at `fetch_manifest_with_progress_inner`), but the chain then crosses
+        /// the `map_err` that closes the fetch inside `redeem_manifest_ticket_with_progress`, and
+        /// nothing pinned that crossing. Both dial arms — timeout and refusal — arrive under the
+        /// SAME outer context ("dial the manifest plane for {slug}"), so only the surviving cause
+        /// separates them. This drives the REFUSAL arm through the real command boundary: a ticket
+        /// whose every address the SSRF sanitize strips, so `connect` refuses with iroh's own error
+        /// quickly instead of sitting out the 20 s dial deadline (a hermetic timeout arm is not
+        /// reachable from this layer — every reserved-but-silent range the model test uses is
+        /// dropped by `sanitize_node_addr` before the dial; the deadline arm stays pinned by the
+        /// transport-layer test plus the WAN-M dead-endpoint run).
+        ///
+        /// Mutation (P-10), by production line number: in `redeem_manifest_ticket_with_progress`,
+        /// on the line that closes the `fetch_manifest_with_progress(...)` call, revert the chain-
+        /// preserving map_err back to the Display-only one (`cmd_err`). The string this test reads
+        /// then collapses to the bare slug context with nothing after it, and the `starts_with`
+        /// assert reds.
+        #[tokio::test]
+        async fn redeem_reports_the_dial_cause_not_just_its_context() {
+            let (_dir, store, identity, endpoint) = fixture();
+            let npub = "npub1peer";
+            let slug = "vault";
+            store
+                .record_manifest_ask(npub, npub, slug, "fp", "2026-01-01T00:00:00Z", "nonce-1")
+                .unwrap();
+            let err = redeem(
+                npub,
+                undialable_ticket("req-q312", slug, Some("nonce-1")),
+                &identity,
+                &store,
+                &endpoint,
+            )
+            .await
+            .expect_err("an undialable address can never deliver a manifest");
+            let context = format!("dial the manifest plane for {slug}");
+            let cause = err
+                .strip_prefix(&context)
+                .unwrap_or_else(|| panic!("the slug's dial context must lead the message: {err}"));
+            assert!(
+                cause.starts_with(": "),
+                "the anyhow CAUSE must survive into the CmdResult string — it is the only thing \
+                 that separates a dial refusal from a dial timeout for whoever reads this (the UI \
+                 user on the redeem command, or the WAN harness): {err}"
             );
         }
 
