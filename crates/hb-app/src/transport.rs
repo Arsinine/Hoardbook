@@ -977,6 +977,41 @@ pub(crate) fn sanitize_node_addr(raw: &str) -> Result<String> {
     serde_json::to_string(&addr).context("re-serialize the sanitized endpoint address")
 }
 
+/// How long a serve path waits, after the endpoint binds, for the home relay to connect before
+/// minting the ticket (QURATOR-314).
+///
+/// **Why 10 s:** iroh's own `Endpoint::online` docs recommend wrapping it in a timeout "close to
+/// `NET_REPORT_TIMEOUT`" — 10 s in iroh 1.0.3 — so at least one net report has been attempted.
+/// The live measurement behind this fix (2026-09-23, two NAT'd machines) had the home relay
+/// arriving ~3.06 s after bind, so 10 s is ~3x the observed worst case. It bites only on the FIRST
+/// mint after a cold bind: an already-online endpoint's `online()` resolves on the first poll and
+/// returns immediately, so later serves on the same plane pay nothing.
+pub const HOME_RELAY_MINT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait, bounded, for the endpoint to have its home relay connected — the precondition the
+/// ticket's address depends on (QURATOR-314).
+///
+/// iroh's `bind()` returns BEFORE a relay is picked, and [`ticket_node_addr`] snapshots
+/// `endpoint.addr()`, so a ticket minted straight after the bind carries no
+/// `TransportAddr::Relay`; on a NAT'd box with no global IP the SSRF sanitize
+/// ([`sanitize_node_addr`]) then leaves the ticket EMPTY, and the asker's dial degrades to
+/// discovery or times out. **This never refuses anything:** on timeout it returns `false` and the
+/// caller STILL mints, so offline/relay-less use keeps working exactly as before — the wait can
+/// only improve the address, never block the approval.
+pub async fn await_home_relay(endpoint: &iroh::Endpoint, wait: std::time::Duration) -> bool {
+    match tokio::time::timeout(wait, endpoint.online()).await {
+        Ok(()) => true,
+        Err(_elapsed) => {
+            tracing::warn!(
+                ?wait,
+                "transport: no home relay connected within the mint wait — minting anyway; the \
+                 asker's dial falls back to discovery exactly as before (QURATOR-314)"
+            );
+            false
+        }
+    }
+}
+
 /// Mint a ticket for one approved request, addressed at this endpoint.
 ///
 /// Thin by design: the lifecycle rules live in `hb_core::ticket`, and this only supplies the address
@@ -1946,6 +1981,31 @@ pub(crate) mod tests {
         let parsed = parse_node_addr(&ticket.node_addr).expect("the ticket address parses back");
         assert_eq!(parsed.id, ep.id(), "the address names this endpoint");
         assert_eq!(parsed, ep.addr(), "the round trip is lossless");
+        ep.close().await;
+    }
+
+    /// QURATOR-314 — the home-relay wait is BOUNDED. iroh's own `Endpoint::online` docs: "If no
+    /// relays are configured, this will pend forever", and `bind_local_endpoint`'s
+    /// `presets::Minimal` configures none — so this endpoint can never go online, and the helper
+    /// must still return `false` within its injected wait rather than hang. The wait is injected
+    /// precisely so this test costs 300 ms, not the production 10 s.
+    ///
+    /// P-10 mutation: in `await_home_relay`, replace the whole
+    /// `match tokio::time::timeout(wait, endpoint.online()).await { … }` body with a bare
+    /// `endpoint.online().await; true` — the relay-less `online()` then pends forever, and the
+    /// OUTER `tokio::time::timeout(5 s, …)` below turns that hang into this test's `.expect`
+    /// failing (a failure, not a hang).
+    #[tokio::test]
+    async fn await_home_relay_is_bounded_on_a_relayless_endpoint() {
+        let ep = bind_local_endpoint(&rand::random(), vec![]).await;
+        // The outer timeout is what makes the mutation a FAILURE rather than a hung test.
+        let verdict = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            await_home_relay(&ep, std::time::Duration::from_millis(300)),
+        )
+        .await
+        .expect("the helper must return within its injected wait — a hang is a finding");
+        assert!(!verdict, "a relay-less endpoint never goes online");
         ep.close().await;
     }
 

@@ -27,7 +27,10 @@ use crate::identity_state::SharedIdentity;
 use crate::manifest_source::StoreManifestSource;
 use crate::net::SharedRelay;
 use crate::store::DataStore;
-use crate::transport::{fetch_manifest_with_progress, issue_ticket, sanitize_node_addr};
+use crate::transport::{
+    await_home_relay, fetch_manifest_with_progress, issue_ticket, sanitize_node_addr,
+    HOME_RELAY_MINT_WAIT,
+};
 use crate::transport_state::{ensure_endpoint, Role, SharedEndpoint};
 
 fn cmd_err<E: std::fmt::Display>(e: E) -> String {
@@ -165,6 +168,12 @@ pub(crate) async fn send_full_list_inner(
         role = "listen",
         "fulfil: transport endpoint bound — minting the ticket"
     );
+    // QURATOR-314: iroh's bind returns BEFORE a home relay is picked, and the mint snapshots
+    // `endpoint.addr()` — on a NAT'd box the sanitized ticket came out EMPTY (2026-09-23, two
+    // live machines) and the dial only survived via discovery. Bounded wait for the relay (the
+    // helper warns on timeout); a timeout STILL mints — never refuse the approval — degrading to
+    // discovery exactly as before.
+    await_home_relay(&ep, HOME_RELAY_MINT_WAIT).await;
 
     let request_id = new_request_id();
     let ticket =
@@ -307,6 +316,9 @@ pub(crate) async fn send_cached_manifest_inner(
         .map_err(|e| {
             format!("Could not start the transport ({e}). Export the list instead: Home → ⋯ → Export.")
         })?;
+    // QURATOR-314: the same bounded home-relay wait as `send_full_list_inner` — a carrier's
+    // ticket needs the relay just as much, and a timeout still mints.
+    await_home_relay(&ep, HOME_RELAY_MINT_WAIT).await;
 
     let request_id = new_request_id();
     let mut ticket =
@@ -1378,6 +1390,94 @@ mod tests {
                  discriminator — an inline re-derivation or a dropped assignment is the P-6 \
                  lookalike shape this field was decorative under"
             );
+        }
+
+        /// **QURATOR-314 — a ticket is never minted before the endpoint has its home relay.**
+        ///
+        /// iroh's `bind()` returns BEFORE a relay is picked and the mint snapshots
+        /// `endpoint.addr()`, so a serve that mints straight after the bind ships a ticket whose
+        /// address — after the SSRF sanitize — is EMPTY on a NAT'd box (live evidence
+        /// 2026-09-23: dials then only survived via discovery, and the previous day all four
+        /// timed out at 20 s each). Both serve bodies must take the bounded wait between the
+        /// endpoint bind and the mint; a timeout still mints, so the guard pins ORDER, not
+        /// success.
+        ///
+        /// Comment-stripping, containing-function region resolution, and a whole-file fence
+        /// asserted on the PRODUCTION slice only (everything before `#[cfg(test)]`) — this file's
+        /// comments and this test's own literals both name the needles, so an unbounded scan
+        /// would be satisfied by its own copy (the P-6 shape).
+        ///
+        /// P-10 mutation: in `commands/fulfil.rs`, any ONE of
+        /// 1. delete the `await_home_relay(&ep, HOME_RELAY_MINT_WAIT).await;` statement inside
+        ///    `send_full_list_inner` (or `send_cached_manifest_inner`) → that region's wait-count
+        ///    assert reds (0 ≠ 1);
+        /// 2. move that statement to AFTER the mint in the same function → that region's
+        ///    order assert reds;
+        /// 3. add a third bare mint call in this file's production half → the whole-file fence
+        ///    reds (3 ≠ 2), forcing the new site through the same wait.
+        #[test]
+        fn every_mint_waits_for_the_home_relay_first() {
+            let src = include_str!("fulfil.rs");
+            // Comments stripped, so documenting the rule cannot satisfy it.
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // The production half only: this test's own needles live past this bound.
+            let production =
+                &code[..code.find("#[cfg(test)]").expect("the test module must follow production")];
+            assert_eq!(
+                production.matches("issue_ticket(").count(),
+                2,
+                "a third mint site appeared in this file's production half — it must take the \
+                 home-relay wait too; give it a row in this guard"
+            );
+            for sig in [
+                "async fn send_full_list_inner(",
+                "async fn send_cached_manifest_inner(",
+            ] {
+                let region = fn_region(production, sig);
+                assert_eq!(
+                    region.matches("await_home_relay(").count(),
+                    1,
+                    "{sig}: the mint must be preceded by exactly one bounded home-relay wait"
+                );
+                assert_eq!(
+                    region.matches("issue_ticket(").count(),
+                    1,
+                    "{sig}: exactly one mint — a second needs its own wait and its own row here"
+                );
+                let wait = region.find("await_home_relay(").expect("counted above");
+                let mint = region.find("issue_ticket(").expect("counted above");
+                assert!(
+                    wait < mint,
+                    "{sig}: the home-relay wait must precede the mint — a ticket minted before \
+                     the relay arrives ships an empty sanitized address on a NAT'd box"
+                );
+            }
+        }
+
+        /// Slice `code` from the (first, i.e. production) occurrence of `sig` to the next
+        /// line-start function signature — the containing-function resolution the P-10 anchor
+        /// rule requires (`ask_throttle`'s `fn_region`, local because test mods are private).
+        fn fn_region<'a>(code: &'a str, sig: &str) -> &'a str {
+            let start = code
+                .find(sig)
+                .unwrap_or_else(|| panic!("signature {sig} must exist"));
+            let rest = &code[start..];
+            let end = [
+                "\npub async fn ",
+                "\npub(crate) async fn ",
+                "\nasync fn ",
+                "\npub fn ",
+                "\nfn ",
+            ]
+            .iter()
+            .filter_map(|m| rest.find(*m))
+            .min()
+            .unwrap_or(rest.len());
+            &rest[..end]
         }
 
         // ── send_full_list — the owner side's early guards ──────────────────────────────────────
