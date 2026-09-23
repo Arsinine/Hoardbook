@@ -261,6 +261,14 @@ async fn m1_live_redeem(probe: &ProbeInput) -> Result<(), String> {
         match result {
             Ok(Ok(_imported)) => {
                 eprintln!("   M1-live redeem succeeded on attempt {attempt} (via the production command body)");
+                // QURATOR-314: print the ticket's sanitized dial target on SUCCESS too. A pass alone
+                // cannot show whether the serve minted after its home relay arrived — before the fix
+                // a relay-less ticket also passed, rescued by n0 discovery — so the evidence that the
+                // fix landed is this line reading `Relay(...)` rather than "no transport addr".
+                eprintln!(
+                    "   M1-live ticket's sanitized dial target: {}",
+                    describe_sanitized_dial_target(&probe.live_ticket.node_addr)
+                );
                 // The endpoint the command bound, for the hole-punch diagnostic. Re-reading it through
                 // `ensure_endpoint` returns the same binding rather than making a second one.
                 if let Ok(ep) = ensure_endpoint(
