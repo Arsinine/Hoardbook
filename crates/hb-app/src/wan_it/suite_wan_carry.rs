@@ -7,6 +7,13 @@
 //! * **C — the cacher** (a NAS-attached AU host): phase 1 asks A and caches A's manifest; phase 2
 //!   answers D's AUTHOR-ask by re-serving that cached copy while A is offline.
 //! * **D — the asker** (the dev AU host): asks C for **A's** collection and redeems C's cached copy.
+//! * **the decoy (QURATOR-178 assertion #3, opt-in)**: with `--decoy-seed-dir <dir>` on role C's
+//!   PHASE 1, C ALSO seeds its OWN collection at the SAME slug (`wan-carry`, 7 files vs A's 24), so
+//!   phase 2's re-serve runs with a genuine same-slug collision armed: the Carrier-4 resolution must
+//!   key on (author_npub, slug) from C's manifest CACHE — the no-fallback fence in
+//!   `manifest_source.rs`'s `payload()` — and never fall through to C's own same-slug draft. D is
+//!   told the decoy is in play with the bare `--decoy-armed` flag, which renames the row (see
+//!   `decoy_status_suffix`); the tree check itself runs armed or not.
 //! * relays: the SG strfry relay (one `--relay` set shared by every invocation).
 //!
 //! The row proves Carrier 4 end to end: D imports A's manifest from C's cache while A is down, the
@@ -23,6 +30,7 @@
 //! | A | seed the collection | `wan_it::seed_collection` → `crate::commands::collection::scan_selective` + `DataStore::save_collection_draft` |
 //! | A | publish the teaser | `commands::collection::prepare_listing` + `hb_net::publish_listing_capped` (the `publish_e2e_teaser` composition, re-composed here because that helper hardcodes its slug) |
 //! | A | answer C's ask | `wan_it::approve_request` → `commands::fulfil::send_full_list_inner` |
+//! | C·1 | seed the decoy (opt-in `--decoy-seed-dir`) | `wan_it::seed_collection` — the SAME production add-collection path role A seeds through |
 //! | C·1 | send the ask DM | `commands::chat::build_manifest_request` + `commands::chat::send_dm_inner` + `DataStore::record_manifest_ask` |
 //! | C·1 | receive A's ticket | `commands::chat::decode_dms` + `hb_core::TransportTicket::verify_shape` |
 //! | C·1 | redeem + cache | `commands::fulfil::redeem_manifest_ticket_inner` (claim + `ensure_endpoint` DialOnly + `fetch_manifest` + `commands::browse::accept_manifest_bytes` + spend) |
@@ -64,6 +72,22 @@ use crate::wan_it::tap::Tap;
 /// the row measures the re-serve, not split mechanics.
 pub(crate) const CARRY_SLUG: &str = "wan-carry";
 
+/// The AUTHOR's seed shape (role A's tree): 24 files at offset 0 — `file-0000.bin`…`file-0023.bin`,
+/// exactly what `super::generate_seed_tree(dir, AUTHOR_SEED_FILES, AUTHOR_SEED_OFFSET)` writes.
+/// Hoisted out of role A's call site (which passed the literals `24, 0` until QURATOR-178 #3) so
+/// role D's colliding-slug check compares against the ONE source of that shape — and so
+/// `the_decoy_discriminator_tells_the_authors_tree_from_the_cachers_own` can pin these consts to
+/// independent literals (if the const feeds both sides of a check, no mutation of it can red).
+const AUTHOR_SEED_FILES: usize = 24;
+const AUTHOR_SEED_OFFSET: usize = 0;
+
+/// The DECOY's seed shape (role C's OWN same-slug collection): 7 files at offset 1000 —
+/// `file-1000.bin`…`file-1006.bin`. Deliberately a different COUNT *and* a disjoint NAME WINDOW
+/// from the author's, so the count check and the name check discriminate independently: either
+/// alone catches a decoy serve, and together they name an unexpected third tree as neither.
+const DECOY_SEED_FILES: usize = 7;
+const DECOY_SEED_OFFSET: usize = 1000;
+
 const RELAY_TIMEOUT: Duration = Duration::from_secs(15);
 const SETTLE: Duration = Duration::from_secs(3);
 /// DM poll attempts (× [`SETTLE`] = the wait-for-DM window). 20 x 3s = a full minute — the same
@@ -91,6 +115,12 @@ impl CarryInput {
         super::args::flag_value(&self.args, name)
     }
 
+    /// Presence check for a BARE flag (one that carries no value). `flag` cannot express this: it
+    /// returns whatever token FOLLOWS the name, which for a valueless flag is the next argument.
+    pub(super) fn flag_present(&self, name: &str) -> bool {
+        self.args.iter().any(|a| a == name)
+    }
+
     pub(super) fn live_identity(&self) -> SharedIdentity {
         Arc::new(tokio::sync::RwLock::new(Some(
             AppIdentity {
@@ -116,7 +146,10 @@ pub async fn run(tap: &mut Tap, role: &str, input: &CarryInput) {
             let phase = input.flag("--phase").unwrap_or("1").to_string();
             if phase == "1" {
                 tap.check(
-                    "CC1: cacher asks the author and caches A's manifest (ordinary redeem)",
+                    format!(
+                        "CC1: cacher asks the author and caches A's manifest (ordinary redeem){}",
+                        decoy_status_suffix(input.flag("--decoy-seed-dir").is_some())
+                    ),
                     run_role_c_phase1(input).await,
                 );
             } else {
@@ -128,7 +161,11 @@ pub async fn run(tap: &mut Tap, role: &str, input: &CarryInput) {
         }
         "d" => {
             tap.check(
-                "CD1: asker asks the cacher for the AUTHOR's collection and redeems the cached copy",
+                format!(
+                    "CD1: asker asks the cacher for the AUTHOR's collection and redeems the cached \
+                     copy{}",
+                    decoy_status_suffix(input.flag_present("--decoy-armed"))
+                ),
                 run_role_d(input).await,
             );
         }
@@ -465,7 +502,10 @@ async fn run_role_a(input: &CarryInput) -> Result<(), String> {
         .to_string();
 
     // (1) Seed the collection — production scan + draft save (via the shared WAN-M seeding helper).
-    super::generate_seed_tree(std::path::Path::new(&seed_dir), 24, 0)
+    // The shape is the AUTHOR_SEED_* consts, single-sourced: role D's colliding-slug check (its
+    // step (5)) compares the imported tree against these, so A's shape and D's expectation cannot
+    // drift apart (until QURATOR-178 #3 this site passed the literals `24, 0`).
+    super::generate_seed_tree(std::path::Path::new(&seed_dir), AUTHOR_SEED_FILES, AUTHOR_SEED_OFFSET)
         .map_err(|e| format!("generate seed tree: {e:#}"))?;
     super::seed_collection(
         &input.store,
@@ -552,7 +592,9 @@ async fn run_role_a(input: &CarryInput) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// CC1: ordinary own-collection ask → A's ticket → production redeem (which writes the cache via
-/// `accept_manifest_bytes`). Flags: `--phase 1 --author-npub <A npub> --author-share-code <hbk…>`.
+/// `accept_manifest_bytes`). Flags: `--phase 1 --author-npub <A npub> --author-share-code <hbk…>`,
+/// plus the OPTIONAL `--decoy-seed-dir <dir>` (QURATOR-178 assertion #3 — see the decoy block at
+/// the end of this fn for what it arms and why it is opt-in).
 async fn run_role_c_phase1(input: &CarryInput) -> Result<(), String> {
     let author_npub = input
         .flag("--author-npub")
@@ -616,6 +658,51 @@ async fn run_role_c_phase1(input: &CarryInput) -> Result<(), String> {
     // under A's key (this is the exact read `send_cached_manifest_inner` will do in phase 2).
     verify_cached_under(input, &author_npub, CARRY_SLUG)?;
     println!("# carry-C cache primed for author {author_npub} / slug {CARRY_SLUG}");
+
+    // QURATOR-178 assertion #3 — the colliding-slug DECOY (opt-in via `--decoy-seed-dir`). When
+    // given, C ALSO holds its OWN collection at the SAME slug `wan-carry`, seeded through the
+    // PRODUCTION add-collection path (`seed_collection` → `scan_selective` +
+    // `save_collection_draft`) — the same path role A seeds through, never a manifest-cache write:
+    // C's cache is written only by the redeem above, and the direct-write shortcut is forbidden by
+    // `the_carry_suite_caches_by_redeeming_and_never_writes_the_cache_directly`. Seeding a DRAFT is
+    // what makes the decoy GENUINE: `build_slug_manifest` serves from `load_collection_draft`, so a
+    // broken no-fallback fence in `StoreManifestSource::payload` (manifest_source.rs ~line 90: a
+    // cache MISS on a re-serve must ERROR, never fall through to the cacher's own same-slug draft)
+    // would find and serve exactly this tree — the mis-route the negative exists to catch. The
+    // decoy draft persists in C's data-dir into phase 2 (the same dir the cache lives in), so
+    // arming here arms the phase-2 re-serve. No teaser is published for it, so discovery and
+    // presence stay clean. The trees are distinguishable BY CONSTRUCTION: 7 files at offset 1000
+    // vs A's 24 at offset 0 (the DECOY_SEED_* consts).
+    //
+    // OPT-IN, not default: the 2026-09-23 positive-only run must stay reproducible unchanged — an
+    // unconditional decoy would alter C's store shape and the row names on every future run, and
+    // the unarmed choreography is the documented operator baseline. The armed run is a deliberate
+    // second configuration, and the row NAME records which one ran (`decoy_status_suffix` in the
+    // dispatcher) so an unarmed negative can never read as an exercised one.
+    if let Some(decoy_dir) = input.flag("--decoy-seed-dir") {
+        super::generate_seed_tree(
+            std::path::Path::new(decoy_dir),
+            DECOY_SEED_FILES,
+            DECOY_SEED_OFFSET,
+        )
+        .map_err(|e| format!("generate decoy seed tree: {e:#}"))?;
+        super::seed_collection(
+            &input.store,
+            &input.app_id.identity,
+            &input.app_id.browse_key,
+            decoy_dir,
+            CARRY_SLUG,
+        )
+        .map_err(|e| format!("seed decoy collection: {e:#}"))?;
+        // Report the entry count actually on disk (read back), not the const — a leftover file in
+        // the operator's decoy dir would otherwise make both prints state a number the scan never
+        // saw (`generate_seed_tree` does not clean its dir).
+        let n = std::fs::read_dir(decoy_dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).count())
+            .unwrap_or(DECOY_SEED_FILES);
+        eprintln!("   CC1 decoy armed: C's OWN '{CARRY_SLUG}' collection seeded ({n} entries)");
+        println!("# carry-C decoy: own '{CARRY_SLUG}' collection seeded ({n} entries)");
+    }
     Ok(())
 }
 
@@ -726,8 +813,12 @@ async fn run_role_c_phase2(input: &CarryInput) -> Result<(), String> {
 /// CD1: ask C for **A's** collection (the production author-ask builder), redeem C's ticket, and
 /// prove the Carrier-4 properties: ticket names A; the imported copy is served_by == Some(C); D's
 /// own cache (written by `accept_manifest_bytes` inside the redeem) verifies under A's x-only key
-/// and NOT under C's. Flags: `--carrier-npub <C npub> --carrier-share-code <hbk…> --author-npub <A
-/// npub>`.
+/// and NOT under C's; and (step 5, QURATOR-178 #3) the imported TREE is A's seed shape, never the
+/// cacher's own same-slug decoy. Flags: `--carrier-npub <C npub> --carrier-share-code <hbk…>
+/// --author-npub <A npub> --author-share-code <hbk…>`, plus the OPTIONAL bare `--decoy-armed` —
+/// passed when C's phase 1 ran with `--decoy-seed-dir`. The flag only RENAMES the row (an armed
+/// negative must not read as an unarmed one, nor the reverse); the step-5 tree check itself runs
+/// armed or not, because A's seed shape is a suite invariant either way.
 async fn run_role_d(input: &CarryInput) -> Result<(), String> {
     let carrier_npub = input
         .flag("--carrier-npub")
@@ -839,6 +930,37 @@ async fn run_role_d(input: &CarryInput) -> Result<(), String> {
     }
     eprintln!("   CD1 cache copy verifies under the AUTHOR's key and refuses the carrier's");
 
+    // (5) QURATOR-178 #3 — the colliding-slug discriminator: the imported tree must be A's SEED
+    // SHAPE (24 entries, `file-0000…0023.bin`), never the cacher's decoy at the same slug (7
+    // entries, `file-1000…1006.bin`). Runs UNCONDITIONALLY (armed or not): A's shape is a suite
+    // invariant, so an armed decoy is caught with no extra flag — the flag only renames the row.
+    //
+    // WHY this check when (4) already pins the signature — the (a)-vs-(b) reasoning the row owes:
+    // (a) — the signature checks — catches every mis-route REACHABLE in this topology that yields
+    // a C-signed envelope. The only competing tree C can serve at this slug is its OWN decoy,
+    // authored and signed by C, so a fallback serve is C-signed and step (4) reds on it; nothing
+    // re-signs C's tree under A's key (that would need A's private key). For THAT class, (4) alone
+    // is sufficient and this check is redundant.
+    // But (a) is COARSER than the behaviour this row names — "D receives A's wan-carry TREE", not
+    // "D receives some A-signed envelope" (CLAUDE.md §9: compare the assertion's cardinality to
+    // the behaviour it names). A defect that hands D an A-signed envelope for the WRONG tree
+    // passes (4) untouched: a wrong-slot cache read on D's side (`read_cached`'s npub/slug are
+    // parameters — the 2026-09-06 hardcoding incident in this very file), or a future serve path
+    // resolving (author, slug) to a different A collection. (5) pins the exact tree — right key
+    // AND right bytes — so it discriminates a failure class (4) cannot see. Not decorative; kept.
+    let names: Vec<String> = imported
+        .collection
+        .collection
+        .listing
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    imported_tree_is_the_authors(&names)?;
+    eprintln!(
+        "   CD1 tree is the AUTHOR's seed shape ({} entries, A's name window — not the decoy's)",
+        names.len()
+    );
+
     println!("# carry-D imported author {author_npub} / slug {CARRY_SLUG} via carrier {carrier_npub}");
     Ok(())
 }
@@ -896,6 +1018,63 @@ pub(super) fn verify_cached_under(input: &CarryInput, npub: &str, slug: &str) ->
     envelope
         .verify_author(&pk)
         .map_err(|e| format!("cached copy does not verify under {npub}: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// QURATOR-178 assertion #3 — colliding-slug decoy helpers (pure; unit-tested below)
+// ---------------------------------------------------------------------------
+
+/// The file names `super::generate_seed_tree(dir, count, offset)` writes — the SAME format string
+/// (`file-{:04}.bin`), re-derived here for the EXPECTED side of the comparison only.
+/// `the_decoy_discriminator_tells_the_authors_tree_from_the_cachers_own` seeds REAL trees through
+/// `generate_seed_tree` and feeds the read-back names to [`imported_tree_is_the_authors`], so a
+/// drift in either format string reds that test — this expectation cannot silently diverge from
+/// what the seeder writes.
+fn expected_seed_names(count: usize, offset: usize) -> HashSet<String> {
+    (0..count).map(|i| format!("file-{:04}.bin", offset + i)).collect()
+}
+
+/// Is `names` — the top-level entry names of an imported tree — the AUTHOR's seed shape, never the
+/// cacher's decoy at the same slug? Compares as a SET: scan/relay order is not load-bearing here
+/// (the snapshot fingerprint is what canonicalises order on the wire). Three-way verdict so the
+/// red NAMES the side it matched — the decoy (the mis-route this row exists to catch) or neither
+/// (an unexpected tree: a polluted seed dir is a red, never a pass — `generate_seed_tree` does not
+/// clean its dir, so operator leftovers must surface, not satisfy).
+fn imported_tree_is_the_authors(names: &[String]) -> Result<(), String> {
+    let got: HashSet<String> = names.iter().cloned().collect();
+    let author = expected_seed_names(AUTHOR_SEED_FILES, AUTHOR_SEED_OFFSET);
+    let decoy = expected_seed_names(DECOY_SEED_FILES, DECOY_SEED_OFFSET);
+    if got == author {
+        return Ok(());
+    }
+    if got == decoy {
+        return Err(format!(
+            "the imported tree IS the cacher's own same-slug collection ({DECOY_SEED_FILES} \
+             entries, file-{DECOY_SEED_OFFSET:04}….bin) — the re-serve resolved by (C, slug) \
+             instead of (author_npub, slug): the no-fallback fence in manifest_source.rs's \
+             payload() is broken"
+        ));
+    }
+    Err(format!(
+        "the imported tree ({n} entries) matches NEITHER the author's seed shape \
+         ({AUTHOR_SEED_FILES} x file-{AUTHOR_SEED_OFFSET:04}….bin) nor the cacher's decoy \
+         ({DECOY_SEED_FILES} x file-{DECOY_SEED_OFFSET:04}….bin) — an unexpected tree; check the \
+         seed dirs for leftovers",
+        n = names.len()
+    ))
+}
+
+/// The TAP row suffix that keeps an ARMED negative distinguishable from an unarmed one — a skipped
+/// negative must never read as a passed one (CLAUDE.md memory: "a skipped row is not a passing
+/// row"). Exact strings, asserted by EQUALITY in the test: "NOT armed" contains "armed", so a
+/// substring assert could not tell the two branches apart (§9: an assertion coarser than the
+/// behaviour it names).
+fn decoy_status_suffix(decoy_armed: bool) -> &'static str {
+    if decoy_armed {
+        " [decoy armed: C holds its own 'wan-carry']"
+    } else {
+        " [decoy NOT armed: the colliding-slug negative was NOT exercised this run]"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1208,6 +1387,80 @@ mod tests {
             pick.newest.expect("the matching ticket").0.request_id,
             "req-fresh",
             "the selection must land on the ticket answering THIS run's ask"
+        );
+    }
+
+    /// QURATOR-178 assertion #3 — the colliding-slug discriminator must tell A's tree from C's OWN
+    /// same-slug decoy, and must NAME the side it matched. Seeds REAL trees through the production
+    /// seeder (`crate::wan_it::generate_seed_tree`) with the literal shapes 24@0 / 7@1000 —
+    /// literals, NOT the consts, so this test also reds if the consts ever drift from what role A
+    /// actually seeds (the consts feed both role A's call and the expected side of the helper; only
+    /// an independent literal can pin them) — reads the names back, and drives the PRODUCTION
+    /// helper `imported_tree_is_the_authors`, never a copy of it. Seeding through the real seeder
+    /// is also what pins `expected_seed_names` to `generate_seed_tree`'s format string: a drift in
+    /// either reds here.
+    ///
+    /// P-10 MUTATIONS (the orchestrator applies these; a worker does not run them). Resolve by
+    /// containing function (`imported_tree_is_the_authors`, in this file just above the
+    /// `#[cfg(test)]` line — re-read the line numbers immediately before applying; they were
+    /// ~955/~958 when written):
+    ///   · swap the first arm's comparand — change `if got == author {` to `if got == decoy {` —
+    ///     the 24-file author arm below errs, reddening the first `expect`.
+    ///   · neutralise the decoy arm — change `} else if got == decoy {` to `} else if false {` —
+    ///     the decoy tree falls through to the NEITHER branch, whose message lacks "cacher's own",
+    ///     reddening the message assert.
+    #[test]
+    fn the_decoy_discriminator_tells_the_authors_tree_from_the_cachers_own() {
+        let names = |count: usize, offset: usize| -> Vec<String> {
+            let dir = tempfile::tempdir().expect("tempdir");
+            crate::wan_it::generate_seed_tree(dir.path(), count, offset)
+                .expect("generate_seed_tree");
+            std::fs::read_dir(dir.path())
+                .expect("read seed dir")
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        };
+        // The author's real shape passes.
+        imported_tree_is_the_authors(&names(24, 0)).expect("the author's seed shape must pass");
+        // The decoy's real shape FAILS, naming the decoy side — the row's evidence must say WHICH
+        // wrong tree arrived, not merely that something did.
+        let err = imported_tree_is_the_authors(&names(7, 1000))
+            .expect_err("the cacher's own same-slug decoy must fail");
+        assert!(
+            err.contains("cacher's own"),
+            "the refusal must name the decoy side, got: {err}"
+        );
+        // A tree that is NEITHER shape (one author file swapped for a decoy file) fails on the
+        // unexpected branch — a polluted seed dir must be a red, not a pass.
+        let mut mixed = names(24, 0);
+        mixed.pop();
+        mixed.push("file-1000.bin".to_string());
+        let err = imported_tree_is_the_authors(&mixed)
+            .expect_err("a tree matching neither shape must fail");
+        assert!(
+            err.contains("NEITHER"),
+            "the refusal must say the tree matches neither shape, got: {err}"
+        );
+    }
+
+    /// A skipped negative must not read as a passed one: the CC1/CD1 row names must distinguish an
+    /// ARMED decoy run from an unarmed one, by EXACT string — "NOT armed" contains "armed", so a
+    /// substring assert would be satisfiable by the wrong branch (§9: an assertion coarser than
+    /// the behaviour it names).
+    ///
+    /// P-10 MUTATION (the orchestrator applies this): in `decoy_status_suffix` (this file, just
+    /// above the `#[cfg(test)]` line), swap the two string literals — the `if` arm returns the
+    /// NOT-armed text and the `else` arm the armed text — both asserts below red.
+    #[test]
+    fn an_unarmed_decoy_row_must_not_read_as_an_armed_one() {
+        assert_eq!(
+            decoy_status_suffix(true),
+            " [decoy armed: C holds its own 'wan-carry']"
+        );
+        assert_eq!(
+            decoy_status_suffix(false),
+            " [decoy NOT armed: the colliding-slug negative was NOT exercised this run]"
         );
     }
 }
