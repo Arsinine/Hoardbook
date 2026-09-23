@@ -688,9 +688,18 @@ pub async fn m4_n0_canary() -> Result<(), String> {
     });
 
     let client_secret: [u8; 32] = rand::random();
-    let client = bind_client_endpoint(&client_secret)
-        .await
-        .map_err(|e| format!("M4 bind_client_endpoint (dial-only) failed: {e}"))?;
+    let client = match bind_client_endpoint(&client_secret).await {
+        Ok(c) => c,
+        Err(e) => {
+            // QURATOR-318: every exit path closes BOTH endpoints so the iroh relay-keepalive
+            // tasks end and the harness process can exit normally (the scheduled Windows canary
+            // piled up hung processes). `Endpoint::close(&self)` is idempotent and covers every
+            // clone, so closing `server` also retires the accept task's clone.
+            accept_task.abort();
+            server.close().await;
+            return Err(format!("M4 bind_client_endpoint (dial-only) failed: {e}"));
+        }
+    };
 
     // RELAY-ONLY dial target. Both endpoints are in-process on ONE host, so iroh will hole-punch a
     // direct local path in milliseconds and never touch n0 — measured: direct=true relay=false, a
@@ -704,8 +713,8 @@ pub async fn m4_n0_canary() -> Result<(), String> {
     target.addrs.retain(|a| a.is_relay());
     if target.addrs.is_empty() {
         accept_task.abort();
-        drop(server);
-        drop(client);
+        server.close().await;
+        client.close().await;
         return Err(
             "M4 the listener's addr carried NO relay transport after filtering — there is no relay \
              path to test, so a dial here could only ever prove local connectivity."
@@ -773,12 +782,14 @@ pub async fn m4_n0_canary() -> Result<(), String> {
             conn
         }
         Ok(Err(e)) => {
-            // Bounded close: iroh's close().await can hang on a wedged relay path. Drop the endpoints
-            // (background cleanup) rather than awaiting close — the canary force-exits via
-            // std::process::exit in --once mode, and the OS reclaims sockets on exit.
+            // QURATOR-318: close both endpoints here (not just drop) — an awaited close is what
+            // ends iroh's relay-keepalive tasks, which is what kept the process alive after the
+            // summary printed. The old comment justified bare drops via --once's force-exit; the
+            // force-exit is gone (it hung native Windows) and the bin wrapper's bounded
+            // Runtime::shutdown_timeout is the fallback, so the close must happen here.
             accept_task.abort();
-            drop(server);
-            drop(client);
+            server.close().await;
+            client.close().await;
             return Err(format!(
                 "M4 the dial through the home relay FAILED after {:.2}s (bind {:.2}s): iroh/quinn \
                  returned {e:?}. OUR OWN {M4_DIAL_TIMEOUT:?} M4_DIAL_TIMEOUT did NOT fire, so this \
@@ -791,9 +802,10 @@ pub async fn m4_n0_canary() -> Result<(), String> {
             ));
         }
         Err(_) => {
+            // QURATOR-318: same every-path close as the dial-failure arm above.
             accept_task.abort();
-            drop(server);
-            drop(client);
+            server.close().await;
+            client.close().await;
             return Err(format!(
                 "M4 the dial exceeded OUR OWN {M4_DIAL_TIMEOUT:?} M4_DIAL_TIMEOUT (bind {:.2}s). That \
                  outran every iroh deadline beneath it (relay-path idle 30s, direct-path idle 15s), \
@@ -805,9 +817,11 @@ pub async fn m4_n0_canary() -> Result<(), String> {
 
     // A clean close proves the connection was real (not a half-open that the runtime tear-down masks).
     conn.close(0u32.into(), b"M4 canary complete");
+    // QURATOR-318: the success path closes both endpoints too — a green run used to be the worst
+    // offender for a hung process, since nothing else in the pass would have failed first.
     accept_task.abort();
-    drop(server);
-    drop(client);
+    server.close().await;
+    client.close().await;
     Ok(())
 }
 // ---------------------------------------------------------------------------

@@ -1380,6 +1380,29 @@ async fn run_probe_wan_m4(_args: &[String]) -> Result<ExitCode> {
 /// The default canary interval (the §W6 recommended cadence, ~10 min).
 const CANARY_DEFAULT_INTERVAL: Duration = Duration::from_secs(600);
 
+/// The M4 row's outer timeout in seconds — the row's inner budget is HOME_RELAY_WAIT (60s) +
+/// M4_DIAL_TIMEOUT (90s) = 150s, so 200s is the headroom above it. Single-sourced (QURATOR-318):
+/// BOTH the `tokio::time::timeout` deadline and the failure message are derived from this const,
+/// so they cannot drift (the message used to hardcode "150s" while the deadline was 200s).
+const CANARY_M4_OUTER_TIMEOUT_SECS: u64 = 200;
+
+/// The message a canary row reports when its outer timeout fires. Takes the row's timeout in
+/// seconds so the message can never name a number other than the deadline that actually fired.
+fn canary_timeout_message(secs: u64) -> String {
+    format!("timed out at {secs}s")
+}
+
+/// Pure mapping from a canary pass outcome to the `--once` exit status. Returns the raw `u8` so
+/// it is unit-testable — `ExitCode` has neither `PartialEq` nor a stable conversion back to an
+/// integer. `run_canary` wraps it with `ExitCode::from`.
+fn canary_exit_code(failed: bool) -> u8 {
+    if failed {
+        1
+    } else {
+        0
+    }
+}
+
 async fn run_canary(args: &[String]) -> Result<ExitCode> {
     let once = args::flag_value(args, "--once").is_some();
     let interval = args::flag_value(args, "--interval")
@@ -1388,11 +1411,17 @@ async fn run_canary(args: &[String]) -> Result<ExitCode> {
         .unwrap_or(CANARY_DEFAULT_INTERVAL);
 
     if once {
+        // QURATOR-318: --once RETURNS the exit code through main instead of std::process::exit.
+        // The hang this force-exit papered over is fixed at the source: m4_n0_canary now closes
+        // both iroh endpoints (listener + dialer) on EVERY exit path, which ends the relay-
+        // keepalive tasks that kept the runtime alive. Two bounded fallbacks remain so the Linux
+        // keepalive case cannot regress into a hang: (a) the bin wrapper (bin/hb-wan-it.rs) tears
+        // the runtime down with `Runtime::shutdown_timeout`, which abandons any still-running work
+        // after 5s instead of blocking forever, and (b) if m4_n0_canary itself wedges, the 200s
+        // outer timeout (CANARY_M4_OUTER_TIMEOUT_SECS) fires and the pass still returns. Loop mode
+        // runs until killed (SIGTERM handles it).
         let failed = canary_pass().await;
-        // Force-exit: the iroh endpoints spawned by M4 leave background tasks (relay keepalives)
-        // that keep the tokio runtime alive after the summary prints. --once is the smoke form; a
-        // prompt process exit is the contract. Loop mode runs until killed (SIGTERM handles it).
-        std::process::exit(if failed { 1 } else { 0 });
+        return Ok(ExitCode::from(canary_exit_code(failed)));
     }
 
     // Loop mode: run forever, sleep `interval` between passes. Each pass prints a timestamped
@@ -1414,10 +1443,15 @@ async fn canary_pass() -> bool {
     // M4 — n0 canary core. The first row because it is the one that catches an n0 fleet outage
     // (production's silent dependency). A long-ish timeout is built into the row (HOME_RELAY_WAIT +
     // M4_DIAL_TIMEOUT = 60 + 90 = 150s); the outer 200s has headroom.
-    match tokio::time::timeout(Duration::from_secs(200), suite_wan_m::m4_n0_canary()).await {
+    match tokio::time::timeout(
+        Duration::from_secs(CANARY_M4_OUTER_TIMEOUT_SECS),
+        suite_wan_m::m4_n0_canary(),
+    )
+    .await
+    {
         Ok(Ok(())) => {}
         Ok(Err(e)) => failures.push(("M4", e)),
-        Err(_) => failures.push(("M4", "timed out at 150s".to_string())),
+        Err(_) => failures.push(("M4", canary_timeout_message(CANARY_M4_OUTER_TIMEOUT_SECS))),
     }
 
     // R2 — default-relay policy watch. The evidence table is printed to stderr by the row; the row
@@ -1507,6 +1541,39 @@ fn canary_beacon_relays() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// --once must report FAILURE (exit 1) when any row failed.
+    /// MUTATION (orchestrator): in `canary_exit_code` (wan_it/mod.rs), swap the two arms
+    /// (`if failed` → `if !failed`). This test reds
+    /// (u8 becomes 0); its sibling below reds symmetrically.
+    #[test]
+    fn canary_once_exit_code_is_failure_when_a_row_failed() {
+        assert_eq!(canary_exit_code(true), 1);
+    }
+
+    /// --once must report SUCCESS (exit 0) when no row failed — a scheduled canary that exits
+    /// nonzero on green would page forever.
+    /// MUTATION (orchestrator): same edit as above (swap the arms in `canary_exit_code`); this is
+    /// the sibling that reds on the swapped-arms half specifically.
+    #[test]
+    fn canary_once_exit_code_is_success_when_no_row_failed() {
+        assert_eq!(canary_exit_code(false), 0);
+    }
+
+    /// The M4 outer-timeout const and the message built from it must agree (QURATOR-318: the
+    /// message hardcoded "150s" while the deadline was 200s — they had drifted). Pins BOTH the
+    /// const's value and that the formatter renders THAT const, so neither half can drift again.
+    /// MUTATION (orchestrator): (a) change `CANARY_M4_OUTER_TIMEOUT_SECS = 200` (wan_it/mod.rs:1387)
+    /// to any other number — the first assert reds; or (b) in `canary_timeout_message` (mod.rs:1391)
+    /// hardcode the stale number, `format!("timed out at 150s")` — the second assert reds.
+    #[test]
+    fn canary_m4_outer_timeout_const_and_message_agree() {
+        assert_eq!(CANARY_M4_OUTER_TIMEOUT_SECS, 200);
+        assert_eq!(
+            canary_timeout_message(CANARY_M4_OUTER_TIMEOUT_SECS),
+            "timed out at 200s"
+        );
+    }
 
     #[test]
     fn parse_peer_accepts_a_bare_npub() {
