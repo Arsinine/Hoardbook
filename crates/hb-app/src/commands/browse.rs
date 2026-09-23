@@ -2598,6 +2598,237 @@ mod tests {
         }
     }
 
+    // ── QURATOR-162 lane A (D2) — contact-ADD paths must not enrol in the Private audience ─────
+    //
+    // The Private-collection audience is EXPLICIT (M21 W5 owner ruling) and has exactly ONE
+    // production writer, `DataStore::set_private_audience_member` (store.rs), reached only via
+    // the `private_audience_set` command. These tests pin that no contact-CREATING production
+    // path routes through it:
+    //   • `follow` command, keyed arm — a full `hbk…` code (carries a browse-key). The AddContact
+    //     funnel is `paste_key` (lookup) → `follow` (commit); `paste_key` itself performs ZERO
+    //     store writes (parse → self-guard → `resolve_peer` → `reject_profileless` → return), so
+    //     there is no enrolment edit that could live there — the keyed contact is persisted only
+    //     when its lookup result reaches `follow`'s `save_followed_peer`.
+    //   • `follow` command, keyless arm — a bare `npub1…` code parses as `ShareCode::FollowOnly`.
+    //   • `save_followed_peer`'s follow-into-group branch (the group add rides the same tail).
+    //   • Chat Request accept (`chat::dm_request_accept_inner`) — a Manual, keyless stub contact.
+    // The Topic-join creator is pinned by its sibling
+    // `joining_a_topic_does_not_enrol_anyone_in_the_private_audience` (topics.rs tests) and the
+    // group stores themselves by `group_mutations_do_not_touch_private_audience` (groups.rs).
+    // NOT add paths, verified against source: `import_manifest`/`accept_manifest_bytes` (refuses
+    // without an existing contact, never saves one), `save_refreshed_contact` (updates an
+    // existing row), `persist_presence` (online.rs — skips absent contacts), `apply_grant_to_
+    // contact` (private.rs — refuses when absent: "nothing created").
+    //
+    // Hermeticity: the `Some(pre)` arm of `follow` reads neither identity nor relay (see
+    // `follow_command_guards` above); the chat accept is locks + store + local crypto only.
+    //
+    // P-10 mutation recipes — one per site (one mutation cannot red disjoint paths):
+    //   1. `save_followed_peer` (this file), immediately AFTER
+    //      `store.save_contact(&CachedPeer::pubkey_hash(&npub), &peer).map_err(cmd_err)?;`
+    //      (browse.rs:665 at time of writing), insert
+    //      `store.set_private_audience_member(&npub, true).map_err(|e| e.to_string())?;`
+    //      → the test must RED at the keyed phase, the FIRST add. The keyed arm, keyless arm and
+    //      group branch converge on this one site, so the single edit reds all three phases.
+    //   2. `chat::dm_request_accept_inner`, immediately AFTER
+    //      `store.save_contact(&hash, &peer).map_err(cmd_err)?;` (chat.rs:890 at time of
+    //      writing), insert
+    //      `store.set_private_audience_member(&npub, true).map_err(|e| e.to_string())?;`
+    //      → the test must RED at the chat-accept phase only.
+    mod contact_add_audience_guard {
+        use super::*;
+        use crate::identity_state::AppIdentity;
+        use tauri::Manager;
+
+        fn guard_app() -> tauri::App<tauri::test::MockRuntime> {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let store = DataStore::new(dir);
+            // Managed so `follow`'s signature is satisfied; the pre-resolved arm reads neither.
+            let identity: SharedIdentity = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+            app.manage(identity);
+            app.manage(store);
+            app.manage(net::new_shared());
+            app
+        }
+
+        async fn follow_via_command(
+            app: &tauri::App<tauri::test::MockRuntime>,
+            code: &str,
+            resolved_peer: CachedPeer,
+            group_name: Option<String>,
+        ) -> CmdResult<()> {
+            follow(
+                code.to_string(),
+                group_name,
+                None,
+                Some(resolved_peer),
+                app.state::<SharedIdentity>(),
+                app.state::<DataStore>(),
+                app.state::<SharedRelay>(),
+            )
+            .await
+        }
+
+        /// The audience must be exactly the seeded `[kept]`, byte-for-byte, with no newcomer.
+        fn assert_audience_untouched(
+            app: &tauri::App<tauri::test::MockRuntime>,
+            snapshot: &[u8],
+            kept: &str,
+            newcomers: &[String],
+            phase: &str,
+        ) {
+            let store = app.state::<DataStore>();
+            let after = std::fs::read(store.private_audience_path())
+                .expect("private_audience.json exists after the seed");
+            assert_eq!(after, snapshot, "{phase}: private_audience.json was rewritten");
+            let audience = store.load_private_audience().unwrap();
+            assert_eq!(
+                audience,
+                vec![kept.to_string()],
+                "{phase}: the audience must be exactly the seeded member"
+            );
+            for n in newcomers {
+                assert!(
+                    !audience.contains(n),
+                    "{phase}: adding a contact must NOT enrol {n} as a Private recipient"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn adding_a_contact_does_not_enrol_them_in_the_private_audience() {
+            let app = guard_app();
+            let store = app.state::<DataStore>();
+
+            // Seed the audience with ONE member — a valid npub, so the file holds real data.
+            let kept_npub = AppIdentity::generate().npub();
+            store.save_private_audience(std::slice::from_ref(&kept_npub)).unwrap();
+            let snapshot = std::fs::read(store.private_audience_path()).unwrap();
+
+            // Phase 1 — KEYED add: a full `hbk…` code whose pre-resolved peer carries the
+            // browse-key (the AddContact funnel: `paste_key` resolved, `follow` commits).
+            let keyed_owner = AppIdentity::generate();
+            let keyed_code = keyed_owner.share_code().expect("encode the full share code");
+            let mut keyed_peer = stub_peer_with_profile(&keyed_owner.npub(), "KeyedPeer");
+            keyed_peer.browse_key_hex = Some(hex::encode([7u8; 32]));
+            follow_via_command(&app, &keyed_code, keyed_peer, None).await.unwrap();
+            assert!(
+                store
+                    .load_contact(&CachedPeer::pubkey_hash(&keyed_owner.npub()))
+                    .unwrap()
+                    .is_some(),
+                "the keyed contact must be persisted for this pin to mean anything"
+            );
+            assert_audience_untouched(&app, &snapshot, &kept_npub, &[keyed_owner.npub()], "keyed follow");
+
+            // Phase 2 — KEYLESS add: a bare `npub1…` code (FollowOnly), no browse-key.
+            let keyless_owner = AppIdentity::generate();
+            let keyless_peer = stub_peer_with_profile(&keyless_owner.npub(), "KeylessPeer");
+            follow_via_command(&app, &keyless_owner.npub(), keyless_peer, None).await.unwrap();
+            assert!(
+                store
+                    .load_contact(&CachedPeer::pubkey_hash(&keyless_owner.npub()))
+                    .unwrap()
+                    .is_some(),
+                "the keyless contact must be persisted for this pin to mean anything"
+            );
+            assert_audience_untouched(
+                &app,
+                &snapshot,
+                &kept_npub,
+                &[keyed_owner.npub(), keyless_owner.npub()],
+                "keyless follow",
+            );
+
+            // Phase 3 — follow-INTO-GROUP: rides `save_followed_peer`'s group branch. That write
+            // must also leave the audience file alone (groups are a filing shorthand, never a
+            // grant — M21 W5).
+            let grouped_owner = AppIdentity::generate();
+            store
+                .save_groups(&[crate::store::Group {
+                    name: "Pals".into(),
+                    pubkeys: vec![],
+                    modified_at: Utc::now(),
+                    color: None,
+                }])
+                .unwrap();
+            follow_via_command(
+                &app,
+                &grouped_owner.npub(),
+                stub_peer_with_profile(&grouped_owner.npub(), "GroupedPeer"),
+                Some("Pals".into()),
+            )
+            .await
+            .unwrap();
+            assert!(
+                store
+                    .load_groups()
+                    .unwrap()
+                    .iter()
+                    .any(|g| g.name == "Pals" && g.pubkeys.contains(&grouped_owner.npub())),
+                "the follow-into-group branch must have run for this pin to mean anything"
+            );
+            assert_audience_untouched(&app, &snapshot, &kept_npub, &[grouped_owner.npub()], "grouped follow");
+
+            // Phase 4 — chat Request accept: a Manual, keyless stub contact, built locally.
+            let me = Identity::generate();
+            let chat_owner = AppIdentity::generate();
+            crate::commands::chat::dm_request_accept_inner(&store, &me, &me.npub(), chat_owner.npub(), None)
+                .await
+                .expect("chat accept persists the stub contact");
+            let accepted = store
+                .load_contact(&CachedPeer::pubkey_hash(&chat_owner.npub()))
+                .unwrap()
+                .expect("the accepted chat contact must be persisted for this pin to mean anything");
+            assert_eq!(accepted.source, crate::store::ContactSource::Manual);
+            assert!(accepted.browse_key_hex.is_none(), "an accepted chat stub is keyless");
+            assert_audience_untouched(
+                &app,
+                &snapshot,
+                &kept_npub,
+                &[
+                    keyed_owner.npub(),
+                    keyless_owner.npub(),
+                    grouped_owner.npub(),
+                    chat_owner.npub(),
+                ],
+                "chat accept",
+            );
+        }
+
+        /// QURATOR-162 lane A, requirement 3 — the visibility half of the keyless contract: a
+        /// keyless (FollowOnly) contact holds NO browse-key, and the manifest-open gate is the
+        /// offline-reachable proof that keyless ≠ can-open-private — `accept_manifest_bytes`
+        /// refuses before parsing ANY bytes. (The enumeration half is pinned in hb-net:
+        /// `q134_no_authored_events_is_fetched_not_sealed` — an honest public empty is Fetched,
+        /// never 🔒 — and `q134_authored_but_undecryptable_is_sealed` — families exist but none
+        /// decrypt ⇒ Sealed, the keyless reading. The Private RECEIVE gate is pinned by
+        /// `browse_private_collections_command_returns_empty_without_a_manual_contact`.)
+        /// P-10: in `accept_manifest_bytes` (this file), delete or invert the
+        /// `.ok_or("This contact has no browse key — re-add them with a full share code.")?`
+        /// arm at browse.rs:993 — the test must RED. (Fixture note: the contact row is
+        /// seeded through `store.save_contact` the same way every sibling test seeds fixtures;
+        /// the behaviour under test is the manifest-open gate, not the add.)
+        #[test]
+        fn keyless_contact_cannot_open_a_private_manifest() {
+            let (_dir, store) = test_store();
+            let npub = AppIdentity::generate().npub();
+            // A Manual contact added KEYLESSLY — browse_key_hex: None (the FollowOnly shape).
+            let peer = stub_peer_with_profile(&npub, "Keyless");
+            store
+                .save_contact(&CachedPeer::pubkey_hash(&npub), &peer)
+                .unwrap();
+
+            let err = accept_manifest_bytes(&npub, None, "not even json", None, &store, false)
+                .unwrap_err();
+            assert_eq!(
+                err,
+                "This contact has no browse key — re-add them with a full share code."
+            );
+        }
+    }
+
     // ── Command-dispatch coverage (QURATOR-182) — the four browse commands that had no test ────
     // driving them through their real `#[tauri::command]` signatures: get_contacts,
     // unfollow_contact, discover_observed_tags, search_peers.
