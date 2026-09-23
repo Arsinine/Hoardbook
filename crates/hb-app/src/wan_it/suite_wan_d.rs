@@ -104,10 +104,24 @@ pub async fn build_probe_input(relays: Vec<String>, flood_ctx: Option<FloodCtx>)
 /// Ok ⇒ pass, Err(detail) ⇒ fail with a `# diagnostic` block — with ONE deliberate exception:
 /// D3 not armed is an explicit `Tap::skip` row (below), never an `Err`.
 pub async fn run(tap: &mut Tap, probe: &ProbeInput) {
-    tap.check(
-        "D1: teaser published via the production fan-out is served by EACH relay of the set individually",
-        d1_cross_region_visibility(probe).await,
-    );
+    // D1 and D4 both need >=2 relays, and a one-relay run is a LEGITIMATE invocation — D2 and D3
+    // exercise fully against a single relay, and D3 is QURATOR-310's discriminator. Rendering the
+    // unmet precondition as `not ok` exited 1 on that honest run, which trains the reader to
+    // ignore red and stops "exit 1" distinguishing a real cross-region regression from "you passed
+    // one URL" (QURATOR-316). Constructed HERE as an explicit `Tap::skip`, exactly as D3's arming
+    // branch below is — the threshold is checked at the call site and nowhere else, so the row fns
+    // cannot drift from it.
+    //
+    // ⚠ Only the PRECONDITION skips. A genuine failure inside either row — a relay that does not
+    // hold the teaser, an INV-5 leak, a stale snapshot that is not gated — stays an `Err` and
+    // travels `check` to render `not ok` and fail the run. D4 asserts INV-5 no-leak; that must
+    // keep failing loudly. The skip is never sniffed out of error text (see D3's comment).
+    let d1_name =
+        "D1: teaser published via the production fan-out is served by EACH relay of the set individually";
+    match cross_region_skip_reason(probe, "D1", "to assert cross-region visibility") {
+        Some(reason) => tap.skip(d1_name, reason),
+        None => tap.check(d1_name, d1_cross_region_visibility(probe).await),
+    }
 
     tap.check(
         "D2: NIP-65 resolution end-to-end — peer's advertised relays lead the bootstrap order, teaser found there",
@@ -133,10 +147,30 @@ pub async fn run(tap: &mut Tap, probe: &ProbeInput) {
         Some(ctx) => tap.check(d3_name, d3_search_eviction(ctx).await),
     }
 
-    tap.check(
-        "D4: BIGRELAY — full family on the big relay only, INV-5 no public leak, stale snapshot gated",
-        d4_bigrelay_cross_region(probe).await,
-    );
+    let d4_name =
+        "D4: BIGRELAY — full family on the big relay only, INV-5 no public leak, stale snapshot gated";
+    match cross_region_skip_reason(probe, "D4", "(a big relay + a normal set)") {
+        Some(reason) => tap.skip(d4_name, reason),
+        None => tap.check(d4_name, d4_bigrelay_cross_region(probe).await),
+    }
+}
+
+/// The relay-count precondition shared by D1 and D4: `Some(reason)` when the topology cannot
+/// support the row, `None` when it can. The ONE place the threshold lives — both call sites read
+/// it from here, so neither can drift, and the row fns carry no guard of their own.
+///
+/// ⚠ Returns a SKIP REASON, never an `Err`. An unmet precondition is the operator's topology
+/// choice, not a defect; a genuine failure inside the row is what `check` is for.
+fn cross_region_skip_reason(probe: &ProbeInput, row: &str, needs: &str) -> Option<String> {
+    if probe.relays.len() >= 2 {
+        return None;
+    }
+    Some(format!(
+        "not applicable to this topology: {row} needs >=2 relays {needs}, got {}. Pass both VPS \
+         strfry URLs to run it. Skipped rather than failed — a one-relay run is a legitimate \
+         invocation (D2 and D3 exercise fully against a single relay), so it must not exit 1.",
+        probe.relays.len()
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -174,13 +208,10 @@ async fn settle() {
 // relay INDIVIDUALLY — proving each relay holds the event because the publish wrote to it.
 // ---------------------------------------------------------------------------
 
+/// ⚠ Takes a >=2-relay topology as a PRECONDITION — `run` checks it via
+/// `cross_region_skip_reason` and renders a `Tap::skip` instead of calling this. No guard here:
+/// a threshold checked in two places drifts (QURATOR-316).
 async fn d1_cross_region_visibility(probe: &ProbeInput) -> Result<(), String> {
-    if probe.relays.len() < 2 {
-        return Err(format!(
-            "D1 needs >=2 relays to assert cross-region visibility (got {}); pass both VPS strfry URLs",
-            probe.relays.len()
-        ));
-    }
     let author = Identity::generate();
     let slug = format!("wan-d-d1-{}", token());
     // A small listing that publishes whole (not truncated) — the focus is the fan-out, not truncation.
@@ -502,13 +533,9 @@ async fn d3_search_eviction(ctx: &FloodCtx) -> Result<(), String> {
 // snapshot does not supersede the teaser.
 // ---------------------------------------------------------------------------
 
+/// ⚠ Takes a >=2-relay topology as a PRECONDITION — see `d1_cross_region_visibility`'s note and
+/// `cross_region_skip_reason`. The indexing below relies on it.
 async fn d4_bigrelay_cross_region(probe: &ProbeInput) -> Result<(), String> {
-    if probe.relays.len() < 2 {
-        return Err(format!(
-            "D4 needs >=2 relays (a big relay + a normal set); got {}",
-            probe.relays.len()
-        ));
-    }
     // relay[0] = the normal/public set; relay[1] = the big relay.
     let normal = &probe.relays[0];
     let big = &probe.relays[1];
@@ -975,6 +1002,91 @@ fn now_secs() -> Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-relay topology is a LEGITIMATE invocation, so D1 and D4 must SKIP rather than fail.
+    ///
+    /// ⚠ It asserts on the RENDERED ROW — name, `skipped` flag, and a reason that says why — not on
+    /// `finish()`'s `ExitCode`. An exit code is 2-valued and therefore satisfiable by a different
+    /// path: `SUCCESS` alone cannot tell a correct skip from a call site that dropped the row
+    /// entirely, which is precisely the residual still open on WAN-P's
+    /// `p3_unarmed_skip_keeps_the_run_green` (CLAUDE.md §9 — an assertion coarser than the
+    /// behaviour it names). Asserting the row EXISTS is what closes that hole here.
+    ///
+    /// MUTATION (P-10) — locate by LINE NUMBER, not text search (this comment quotes what it tests).
+    /// In `cross_region_skip_reason`, change `if probe.relays.len() >= 2` to `if true`: both
+    /// preconditions then report "applicable", `run` calls the row fns instead of skipping, and the
+    /// `skipped` assert reds. (Dropping the rows entirely reds the length assert instead — that is
+    /// the second hole this test closes.)
+    #[tokio::test]
+    async fn a_one_relay_topology_skips_d1_and_d4_rather_than_failing_them() {
+        let mut tap = Tap::new();
+        let probe = ProbeInput { relays: vec!["ws://127.0.0.1:1".to_string()], flood_ctx: None };
+        run(&mut tap, &probe).await;
+
+        let rows = tap.rows();
+        assert_eq!(rows.len(), 4, "every row must still be REPORTED, never silently dropped");
+
+        for (i, label) in [(0usize, "D1"), (3usize, "D4")] {
+            let r = &rows[i];
+            assert!(r.name.starts_with(label), "row {i} should be {label}, got {:?}", r.name);
+            assert!(r.skipped, "{label} must SKIP on a 1-relay topology, not fail: {:?}", r.detail);
+            assert!(r.passed, "a skip carries passed:true so it cannot fail the run ({label})");
+            let reason = r.detail.as_deref().unwrap_or_default();
+            assert!(
+                reason.contains("needs >=2 relays") && reason.contains("legitimate invocation"),
+                "{label}'s skip must say what topology it needs AND why that is not a defect: \
+                 {reason}"
+            );
+        }
+        assert!(rows[2].skipped, "D3 unarmed still skips — this change must not disturb it");
+
+        // ⚠ Deliberately NOT asserting `finish() == SUCCESS`. D2 carries no precondition, so in a
+        // hermetic test it fails honestly against an unreachable relay and the run exits 1 for a
+        // reason that has nothing to do with this ticket. Asserting the exit code here would
+        // conflate D2's environmental failure with D1/D4's skip — the very coarseness this test
+        // exists to avoid, and it is how the first draft of this test failed. The precise claim is
+        // per-row: D1 and D4 contribute no FAILURE.
+        assert!(
+            rows[0].passed && rows[3].passed,
+            "neither D1 nor D4 may contribute a failing row on a 1-relay topology"
+        );
+    }
+
+    /// The other half: the precondition is the ONLY thing that skips. With the topology satisfied,
+    /// `cross_region_skip_reason` must step aside so a genuine row failure travels `check` and
+    /// renders `not ok`. ⚠ Proving only the skip would let the real-failure path regress silently —
+    /// D4 asserts INV-5 no-leak and must keep failing loudly.
+    ///
+    /// Drives the real `cross_region_skip_reason` (the production decision both call sites read),
+    /// rather than re-implementing the threshold here.
+    ///
+    /// MUTATION (P-10) — locate by LINE NUMBER, not text search. In `cross_region_skip_reason`,
+    /// change `if probe.relays.len() >= 2` to `if probe.relays.len() >= 3`: a 2-relay topology then
+    /// reports a skip reason and the `is_none` assert reds.
+    #[test]
+    fn a_two_relay_topology_does_not_skip_so_a_genuine_failure_can_still_fail_the_run() {
+        let two = ProbeInput {
+            relays: vec!["ws://a.invalid".to_string(), "ws://b.invalid".to_string()],
+            flood_ctx: None,
+        };
+        assert!(
+            cross_region_skip_reason(&two, "D1", "to assert cross-region visibility").is_none(),
+            "with 2 relays the precondition is met — the row must RUN, so its Err can render not ok"
+        );
+        assert!(cross_region_skip_reason(&two, "D4", "(a big relay + a normal set)").is_none());
+
+        let one = ProbeInput { relays: vec!["ws://a.invalid".to_string()], flood_ctx: None };
+        assert!(
+            cross_region_skip_reason(&one, "D1", "to assert cross-region visibility").is_some(),
+            "with 1 relay the precondition is unmet — the row must SKIP"
+        );
+
+        // A skip is unreachable from `check`, so a row failure cannot disguise itself as one.
+        let mut tap = Tap::new();
+        tap.check("D4: a genuine INV-5 leak", Err("the normal relay holds the full family".into()));
+        assert!(!tap.rows()[0].skipped, "an Err must never render as a skip");
+        assert_eq!(tap.finish(), std::process::ExitCode::FAILURE);
+    }
 
     /// D3's floor must EXCEED the relay's granted window, not merely equal it. At exactly the window
     /// the flood fills page one without displacing the older strict match, `until` is never set, and

@@ -61,6 +61,24 @@ impl Tap {
         self.rows.push(TestResult::skip(name, reason));
     }
 
+    /// The rows recorded so far, in emission order.
+    ///
+    /// ⚠ This exists so a test can assert on the ROW a call site produced — its name, its
+    /// `skipped` flag, its reason — rather than on `finish()`'s 2-valued `ExitCode`. That
+    /// distinction is load-bearing, not stylistic: an exit code is satisfiable by any path
+    /// reaching the same coarse outcome, so `ExitCode::SUCCESS` alone cannot tell a correct
+    /// skip from a call site that dropped the row entirely, and `ExitCode::FAILURE` alone
+    /// cannot tell an intended refusal from an unrelated error (CLAUDE.md §9 — an assertion
+    /// coarser than the behaviour it names; receipt: QURATOR-311, where neutralising a guard
+    /// left its exit-code-only test GREEN).
+    /// ⚠ `cfg(test)`: the shipped harness has no reason to read its own rows back — it emits them
+    /// via `finish()`. Gating it keeps the binary honest (clippy's `-D warnings` correctly calls an
+    /// ungated accessor dead code) while still giving tests the fine-grained view they need.
+    #[cfg(test)]
+    pub fn rows(&self) -> &[TestResult] {
+        &self.rows
+    }
+
     /// Print the TAP stream and return the process exit code (0 = all pass, 1 = any fail).
     /// Skipped rows do not fail the run — a skip carries `passed: true`.
     pub fn finish(self) -> std::process::ExitCode {
