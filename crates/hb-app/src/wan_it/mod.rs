@@ -144,8 +144,9 @@ fn usage() -> &'static str {
             offline catch-up, disjoint relay sets, cursor discipline, blocked drop).\n\
             --suite wan-t runs the WAN-T rows (T1–T5): topics between real clients (public join,\n\
             channel pseudonymity, private invite, leave retract, announce + local filter).\n\
-            --suite wan-d runs the WAN-D rows (D1–D4): discovery against real relays (cross-region\n\
-            visibility, NIP-65, search-eviction VPS-only, BIGRELAY). --flood-relay arms D3.\n\
+            --suite wan-d runs the WAN-D rows (D1–D5): discovery against real relays (cross-region\n\
+            visibility, NIP-65, search-eviction VPS-only, BIGRELAY, topic-starvation).\n\
+            --flood-relay arms D3 and D5.\n\
             --suite wan-r runs the WAN-R rows (R1–R2): relay-set resilience + the default-relay\n\
             policy watch (the canary row). R2 touches the public defaults — that is its job.\n\
             --suite carry runs the CARRY rows (CA-CD): the 4-party Carrier-4 re-serve over real\n\
@@ -1280,19 +1281,24 @@ async fn run_probe_wan_t(args: &[String]) -> Result<ExitCode> {
 }
 
 // ---------------------------------------------------------------------------
-// probe — WAN-D (D1–D4 — discovery against real relays)
+// probe — WAN-D (D1–D5 — discovery against real relays)
 // ---------------------------------------------------------------------------
 
 /// Run the WAN-D rows against the live relay set. Probe-plays-both: every row constructs its own
-/// throwaway identities against the live relays. D3 is opt-in via --flood-relay (relay citizenship:
-/// flood-shaped rows never run against public relays).
+/// throwaway identities against the live relays. D3 and D5 are opt-in via --flood-relay (relay
+/// citizenship: flood-shaped rows never run against public relays).
+///
+/// ⚠ D5 REUSES D3's `FloodCtx` and its `--flood-count` default verbatim — one flood mechanism, not
+/// two. D5's own floor (`suite_wan_d::D5_FLOOD_COUNT_FLOOR`, the discovery budget + 1) is checked
+/// INSIDE the row, so an arming that satisfies D3's floor but not D5's is refused by D5 rather than
+/// silently measuring nothing.
 async fn run_probe_wan_d(args: &[String]) -> Result<ExitCode> {
     let relays = args::collect_relays(args);
     if relays.is_empty() {
         bail!("probe requires at least one --relay");
     }
 
-    // D3 arming: --flood-relay (and optionally --flood-count). Absent ⇒ D3 is skipped-with-diagnostic.
+    // D3/D5 arming: --flood-relay (and optionally --flood-count). Absent ⇒ both are skipped-with-diagnostic.
     //
     // ⚠ The default MUST exceed the relay's granted response window (strfry: 500) or D3 measures
     // nothing — the strict match stays inside page one and the row passes with or without
@@ -1320,7 +1326,7 @@ async fn run_probe_wan_d(args: &[String]) -> Result<ExitCode> {
     println!("# WAN-D probe (probe-plays-both against the live relay set)");
     println!("# relay set: {}", relays.join(", "));
     if input.flood_ctx.is_some() {
-        println!("# D3 armed (flood-count={flood_count})");
+        println!("# D3/D5 armed (flood-count={flood_count})");
     }
 
     let mut tap = tap::Tap::new();

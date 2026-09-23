@@ -48,16 +48,26 @@ pub async fn publish_topic(client: &RelayClient, events: &[Event]) -> Result<(),
 /// cap, so a flood of junk paths can't make discovery or the client-side tree unbounded.
 pub const TOPIC_DISCOVERY_CAP: usize = 100;
 
-/// Relay-fetch headroom over the ranked [`TOPIC_DISCOVERY_CAP`] — the topic-discovery twin of
-/// [`crate::client::TEASER_SEARCH_FETCH_LIMIT`] (the hardened sibling; CLAUDE.md §9 — one call site
-/// got the fix, its twin didn't). Same lesson, same shape: the relay `#t` filter is an OR over the
-/// tag set, and without an explicit `.limit()` the relay's own internal cap (strfry
-/// `maxFilterLimit` defaults to 500) silently decided which announces came back. A Topic whose
-/// announce was older than 500 loose `#t`-matches was **evicted before the activity-rank ever saw
-/// it** — it reads as "not found" forever (H3, QURATOR-80). Sized at 10× the ranked cap so the
-/// member-count rank sees comfortably more than the visible window; a relay that clamps below this
-/// simply returns fewer.
-pub const TOPIC_DISCOVERY_FETCH_LIMIT: usize = 1000;
+/// The topic-discovery twin of [`crate::client::TEASER_SEARCH_FETCH_LIMIT`] — sized at exactly what
+/// strfry's default `maxFilterLimit` grants (**500**), so `hit_limit` can actually observe
+/// truncation instead of comparing against a ceiling the relay never reaches.
+///
+/// ⚠ This constant is the one that DRIFTED, not the hardened one. The comment here used to claim it
+/// was the twin that had already been fixed and that a clamping relay "simply returns fewer" — both
+/// false, and the second is the load-bearing error. Measured (QURATOR-310's live probes, 2026-09-22,
+/// against our own shipped defaults): strfry serves the **NEWEST** fewer with EOSE and no NOTICE or
+/// CLOSED, so an older match past the window is **EVICTED, not merely delayed** — it reads as "not
+/// found" forever (H3, QURATOR-80). At `1000` against a 500-granting relay, `events.len()` could
+/// never reach the budget, so the `hit_limit` gate below was **never true** and the starved-root
+/// escalation — correct, unit-covered, and reachable only through that gate — never fired at all.
+/// Lowering it to the granted window is what re-aligns this site with its hardened twin and lets the
+/// escalation see the truncation it was built to detect.
+///
+/// The relay `#t` filter is an OR over the tag set, and without an explicit `.limit()` the relay's
+/// own internal cap silently decided which announces came back; the budget must be ours, explicitly
+/// (see [`topic_discover_filter`]). This remains headroom over the ranked [`TOPIC_DISCOVERY_CAP`],
+/// just no longer 10× it: the member-count rank still sees several times the visible window.
+pub const TOPIC_DISCOVERY_FETCH_LIMIT: usize = 500;
 
 /// Build the topic-discovery relay filter — pure (no I/O), so the fetch-budget `.limit()` is
 /// unit-testable without a relay (the same testability split as [`teaser_search_filter`]). Refused
@@ -135,9 +145,11 @@ pub struct TopicDiscoveries {
     /// shared-`limit` response was allocated into. Roots that matched nothing are absent (0 == absent:
     /// the escalation only cares about "did this root get ANY slot").
     pub root_event_counts: BTreeMap<String, usize>,
-    /// True iff the primary response came back with exactly [`TOPIC_DISCOVERY_FETCH_LIMIT`] events —
-    /// the honest "the response hit its limit" signal the escalation is gated on. A relay that clamps
-    /// below the limit reports a smaller page and `hit_limit` is false (nothing was evicted *by us*).
+    /// True iff the primary response came back with at least [`TOPIC_DISCOVERY_FETCH_LIMIT`] events —
+    /// the honest "the response hit its limit" signal the escalation is gated on. A relay that grants
+    /// less than the budget reports a smaller page and `hit_limit` is false (nothing was evicted *by
+    /// us*); that is exactly why the budget must not exceed what the relay actually grants, or this
+    /// flag can never be true at all (QURATOR-315).
     pub hit_limit: bool,
 }
 
@@ -1802,7 +1814,11 @@ mod tests {
         // `hit_limit` is computed by the CALLER (it knows the page size); `dedupe_announces` defaults
         // it to false and `discover_public_topics_paint` sets it from the fetched length. Pin the
         // decision rule itself against the constant: exactly-at-limit is a hit, one-under is not.
-        assert_eq!(TOPIC_DISCOVERY_FETCH_LIMIT, 1000);
+        //
+        // ⚠ The pinned VALUE is load-bearing, not bookkeeping — it must stay at or below what the
+        // relay actually grants (strfry default 500). At 1000 against a 500-granting relay the gate
+        // was unreachable and the escalation it gates was dead code in production (QURATOR-315).
+        assert_eq!(TOPIC_DISCOVERY_FETCH_LIMIT, 500);
         // (The >= rule lives inline in discover_public_topics_paint; this pins the ceiling it is
         // compared against so the escalation gate cannot silently drift with the budget.)
     }

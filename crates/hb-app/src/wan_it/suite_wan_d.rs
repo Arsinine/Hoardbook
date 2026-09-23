@@ -1,4 +1,4 @@
-//! WAN-D — discovery against real relays (M20 W6 §W6). Four rows that are the **live twins of the
+//! WAN-D — discovery against real relays (M20 W6 §W6). Five rows that are the **live twins of the
 //! `hb-it` L2 discovery / big-relay suites**, pointed at real infrastructure instead of ephemeral CI
 //! strfry:
 //!
@@ -14,6 +14,10 @@
 //!   `--flood-relay` VPS only.
 //! - **D4** — BIGRELAY (BIG1/BIG2) cross-region: full family on the big relay only, INV-5 no-leak,
 //!   stale-snapshot gate — adapts `hb-it/suite_bigrelay` against real infrastructure.
+//! - **D5** — topic-discovery starvation escalation (QURATOR-315): a flood under one category root
+//!   must not hide another root's topic from discovery. The shared `#t` OR-page is newest-first, so
+//!   the flood fills it entirely; the topic must still surface via the starved-root escalation.
+//!   Flood-guarded (relay citizenship) to `--flood-relay` VPS only, sharing D3's arming.
 //!
 //! **Shape: probe-plays-both (all rows).** Per the §W6 task instruction, every row uses two in-process
 //! identities against the live relay set — the same shape `hb-it` L2 bodies already use. This keeps
@@ -39,10 +43,11 @@ use anyhow::Result;
 use hb_core::event::{
     build_listing_event, build_teaser, parse_listing_event, KIND_LISTING, KIND_TEASER, Teaser,
 };
-use hb_core::Identity;
+use hb_core::{build_announce, new_topic, Identity};
 use hb_net::{
-    bootstrap_order, build_relay_list, fetch_full_listing_from, fetch_full_listing_if_current,
-    parse_relay_list, publish_listing_capped, publish_listing_to, search_teasers, RelayClient,
+    bootstrap_order, build_relay_list, discover_public_topics_paint, fetch_full_listing_from,
+    fetch_full_listing_if_current, parse_relay_list, publish_listing_capped, publish_listing_to,
+    publish_topic, search_teasers, RelayClient,
 };
 use nostr::prelude::*;
 use serde_json::Value;
@@ -100,9 +105,9 @@ pub async fn build_probe_input(relays: Vec<String>, flood_ctx: Option<FloodCtx>)
     Ok(ProbeInput { relays, flood_ctx })
 }
 
-/// Run the WAN-D rows (D1–D4) against the live relay set. Each row is an honest TAP check:
+/// Run the WAN-D rows (D1–D5) against the live relay set. Each row is an honest TAP check:
 /// Ok ⇒ pass, Err(detail) ⇒ fail with a `# diagnostic` block — with ONE deliberate exception:
-/// D3 not armed is an explicit `Tap::skip` row (below), never an `Err`.
+/// D3 and D5 not armed are explicit `Tap::skip` rows (below), never an `Err`.
 pub async fn run(tap: &mut Tap, probe: &ProbeInput) {
     // D1 and D4 both need >=2 relays, and a one-relay run is a LEGITIMATE invocation — D2 and D3
     // exercise fully against a single relay, and D3 is QURATOR-310's discriminator. Rendering the
@@ -145,6 +150,24 @@ pub async fn run(tap: &mut Tap, probe: &ProbeInput) {
              citizenship forbids flood-shaped rows on the public defaults.",
         ),
         Some(ctx) => tap.check(d3_name, d3_search_eviction(ctx).await),
+    }
+
+    // D5 shares D3's arming (`--flood-relay` / `--flood-count`) — the SAME flood machinery and the
+    // SAME citizenship rule, deliberately no second CLI mechanism. Same two-non-pass-paths shape as
+    // D3: unarmed is a skip constructed HERE as an explicit `Tap::skip`; the two refusals inside
+    // (citizenship violation, flood armed but too small) stay `Err` and travel `check`, so they
+    // render `not ok` and fail the run. See D3's comment above for why the skip is never sniffed
+    // out of error text.
+    let d5_name =
+        "D5: topic-discovery starvation escalation — a root evicted by a sibling's flood is recovered (QURATOR-315)";
+    match &probe.flood_ctx {
+        None => tap.skip(
+            d5_name,
+            "not armed: pass --flood-relay <url>... (VPS strfry only) to run the topic-starvation \
+             measurement. It is skipped here rather than run against a public relay — relay \
+             citizenship forbids flood-shaped rows on the public defaults.",
+        ),
+        Some(ctx) => tap.check(d5_name, d5_topic_starvation_escalation(ctx).await),
     }
 
     let d4_name =
@@ -519,6 +542,221 @@ async fn d3_search_eviction(ctx: &FloodCtx) -> Result<(), String> {
             hits.len(),
             hb_net::TEASER_SEARCH_FETCH_LIMIT,
             hb_net::TEASER_SEARCH_FETCH_LIMIT
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// D5 — topic-discovery starvation escalation (QURATOR-315)
+//
+// The twin of D3, on the TOPIC path, and the only live proof that the starved-root escalation in
+// `discover_public_topics_paint` ever fires.
+//
+// The defect 315 fixed: `TOPIC_DISCOVERY_FETCH_LIMIT` was 1000 while strfry grants 500, so the gate
+// `hit_limit = events.len() >= TOPIC_DISCOVERY_FETCH_LIMIT` could never be true against a real relay.
+// The escalation that gate guards — a per-root re-query for every root the shared `#t` OR-page left
+// EMPTY — was therefore DEAD in production, while its own unit coverage stayed green: those tests
+// drive the pure selection rule (`starved_roots`) with fabricated data and never touch the gate that
+// reaches it. A root evicted by a flood under a sibling root read as "not found" forever.
+//
+// ⚠ THE FLOOD MUST EXCEED THE RELAY'S GRANTED WINDOW OR THIS ROW MEASURES NOTHING — the identical
+// arithmetic D3 documents above, against the identical 500-event window. `D5_FLOOD_COUNT_FLOOR`
+// refuses that case rather than passing meaninglessly, for the identical reason: a green below the
+// floor is a receipt for a measurement that did not happen.
+//
+// ⚠ This row is ALSO the only thing that pins the `>=` in that gate. At exactly a full page the `>=`
+// must read as a hit; mutating it to `>` leaves the escalation dead at precisely the boundary it
+// exists for, and NO unit test reds on that — the unit test
+// `paint_reports_hit_limit_only_at_the_fetch_ceiling` pins the constant's VALUE, never the
+// comparison. Only a live full page can tell the two apart.
+//
+// ⚠ Deliberately NOT QURATOR-310's backwards paging. Discovery is a many-root OR and the eviction it
+// suffers is per-ROOT, so re-asking each starved root alone is the cheaper, bounded answer (one extra
+// read per starved root, only ever paid under a flood). `until`-paging here would re-fetch the same
+// flooded window and pay for it repeatedly. Do not "unify" the two mechanisms.
+//
+// Relay citizenship: flood-shaped, so NEVER against public relays — the flood guard requires every
+// read relay to be in the --flood-relay allowlist, exactly as D3.
+// ---------------------------------------------------------------------------
+
+/// The smallest flood that can actually starve a sibling root, and therefore the smallest one this
+/// row will run. The flood must EXCEED the discovery fetch budget or the starved root's announce
+/// stays inside the shared page, `hit_limit` is false, the escalation never fires, and the row passes
+/// identically against 315's broken and fixed code. `TOPIC_DISCOVERY_FETCH_LIMIT` IS that budget
+/// (315 aligned it to what strfry grants), so the floor tracks it rather than restating 500 — if the
+/// budget ever moves, this floor follows it instead of silently going stale.
+///
+/// ⚠ A run below this floor is REFUSED, not skipped and not passed — passing would issue a receipt
+/// for a measurement that did not happen, closing §5's integration obligation while proving nothing.
+/// Same reasoning, same shape as D3's `FLOOD_COUNT_FLOOR`.
+const D5_FLOOD_COUNT_FLOOR: u32 = hb_net::topic::TOPIC_DISCOVERY_FETCH_LIMIT as u32 + 1;
+
+/// Takes the ARMED context — the not-armed case never reaches this function; `run` renders it as an
+/// explicit `Tap::skip` row instead, so no wording-sniffing path exists here.
+async fn d5_topic_starvation_escalation(ctx: &FloodCtx) -> Result<(), String> {
+    // The guard: every read relay must be a flood relay (relay citizenship).
+    let violations = args::flood_guard_violations(&ctx.read_relays, &ctx.flood_relays);
+    if !violations.is_empty() {
+        return Err(format!(
+            "D5 REFUSED (relay citizenship): these --relay URLs are not in the --flood-relay allowlist: {}. \
+             Flood-shaped rows run only against explicitly-passed VPS strfry relays.",
+            violations.join(", ")
+        ));
+    }
+
+    // Arming is not enough — the arming must be BIG ENOUGH. See `D5_FLOOD_COUNT_FLOOR`.
+    if ctx.flood_count < D5_FLOOD_COUNT_FLOOR {
+        return Err(format!(
+            "D5 REFUSED (flood too small to measure anything): --flood-count {} does not exceed the \
+             discovery fetch budget ({}), so the shared `#t` page still reaches the sibling root's \
+             announce, `hit_limit` stays false and the escalation is never asked to run — the row \
+             would then pass with or without QURATOR-315's fix. Re-run with --flood-count {} or more. \
+             Refusing rather than passing: a green here would close §5's integration obligation while \
+             measuring nothing.",
+            ctx.flood_count,
+            hb_net::topic::TOPIC_DISCOVERY_FETCH_LIMIT,
+            D5_FLOOD_COUNT_FLOOR
+        ));
+    }
+
+    // Two DISTINCT real category roots. A root is NOT a free-form throwaway tag: the discovery query
+    // is a `#t` OR over roots, and `parse_announce` DERIVES each announce's root from its NAME
+    // (`topic_root`), refusing one hashtag-rooted under a different root (QURATOR-133). So the
+    // fixtures must be named `<root>/...` AND carry that root as their `#t` — which is exactly what
+    // production does: `commands::topics::topic_create` stamps the root as the announce's SOLE
+    // discovery tag (`discovery_tags`, devtest v0.12.1 #6/#7). An announce with no `#t` matches no
+    // root and is invisible to this row, so a fixture that skips the tag models nothing at all.
+    let tk = token();
+    let flood_root = "software";
+    let starved_root = "text";
+
+    // (1) Publish the STARVED root's genuine announce FIRST, so it is OLDER than the flood — the
+    //     eviction symptom is an older sibling displaced by newer events under another root. It is
+    //     tagged `starved_root` only, so it consumes no slot of the flood root's window.
+    let starved_name = format!("{starved_root}/d5-starved-{tk}");
+    let (starved_meta, _skey) = new_topic(&starved_name, "", vec![starved_root.to_string()], false)
+        .map_err(|e| format!("D5 new_topic(starved): {e}"))?;
+    let starved_author = Identity::generate();
+    let starved_ev = build_announce(&starved_author, &starved_meta, Timestamp::now().as_secs())
+        .map_err(|e| format!("D5 build starved announce: {e}"))?;
+    let sc = connect(&starved_author, &ctx.flood_relays)
+        .await
+        .map_err(|e| format!("D5 starved connect: {e}"))?;
+    publish_topic(&sc, std::slice::from_ref(&starved_ev))
+        .await
+        .map_err(|e| format!("D5 starved publish: {e}"))?;
+    sc.disconnect().await;
+    eprintln!("   D5 starved announce '{starved_name}' published (older than the flood)");
+
+    // (2) Flood the OTHER root ALONE. Each announce gets its own throwaway npub AND its own name, so
+    //     the relay's replaceable-event dedup (per `(kind, pubkey, d)`) keeps every one of them: the
+    //     flood must occupy `flood_count` distinct slots, not collapse into one.
+    eprintln!(
+        "   D5 flooding {} announces under '{flood_root}' across {} relay(s)",
+        ctx.flood_count,
+        ctx.flood_relays.len()
+    );
+    for i in 0..ctx.flood_count {
+        let foreign = Identity::generate();
+        let (meta, _key) = match new_topic(
+            &format!("{flood_root}/d5-flood-{tk}-{i}"),
+            "",
+            vec![flood_root.to_string()],
+            false,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("   D5   flood announce {i}: new_topic failed: {e}");
+                continue;
+            }
+        };
+        let ev = match build_announce(&foreign, &meta, Timestamp::now().as_secs()) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("   D5   flood announce {i}: build failed: {e}");
+                continue;
+            }
+        };
+        let client = match RelayClient::connect(&foreign, &ctx.flood_relays, RELAY_TIMEOUT).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("   D5   flood announce {i}: connect failed: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = client.publish(&ev).await {
+            eprintln!("   D5   flood announce {i}: publish rejected: {e}");
+        }
+        client.disconnect().await;
+    }
+    settle().await;
+
+    // (3) The production discovery path, over BOTH roots in ONE shared `#t` OR-page. Page one is
+    //     entirely the newer flood under `flood_root`, so `starved_root` gets ZERO slots; this row
+    //     passes only if the escalation re-queries `starved_root` alone and merges what it finds.
+    let reader = connect(&Identity::generate(), &ctx.read_relays)
+        .await
+        .map_err(|e| format!("D5 post-flood connect: {e}"))?;
+    let found = discover_public_topics_paint(
+        &reader,
+        &[flood_root.to_string(), starved_root.to_string()],
+        RELAY_TIMEOUT,
+    )
+    .await
+    .map_err(|e| format!("D5 discover_public_topics_paint: {e}"))?;
+    reader.disconnect().await;
+
+    let starved_slots = found.root_event_counts.get(starved_root).copied().unwrap_or(0);
+    let has_starved = found.topics.iter().any(|m| m.topic_id == starved_meta.topic_id);
+    eprintln!(
+        "   D5 shared page: hit_limit={}, {flood_root} slots={}, {starved_root} page-one slots={}, \
+         {} topic(s) after merge; starved topic surfaced: {has_starved}",
+        found.hit_limit,
+        found.root_event_counts.get(flood_root).copied().unwrap_or(0),
+        starved_slots,
+        found.topics.len()
+    );
+
+    // (b) FIRST assert the GATE was observed, before the product. Without this ordering a run where
+    //     the relay granted the whole flood in one page would leave the escalation untaken, and the
+    //     topic would still be present — found by the SHARED query rather than by escalating — so
+    //     the row would report a pass for a mechanism it never exercised.
+    if !found.hit_limit {
+        return Err(format!(
+            "D5 GATE NOT OBSERVED: discover_public_topics_paint reported hit_limit=false after a \
+             {}-event flood, so the shared page did not fill and the starved-root escalation was \
+             never asked to run. Nothing here measures QURATOR-315. Check, in this order: (1) did \
+             this relay grant fewer than the {} events the budget asks for — a relay granting MORE \
+             than {} leaves the page unfilled at this flood size, so raise --flood-count above its \
+             real grant and re-run (memlay is the known case: relay.snort.social grants 5000); \
+             (2) is `TOPIC_DISCOVERY_FETCH_LIMIT` still at or below the relay's grant, i.e. is the \
+             `>=` in `discover_public_topics_paint` reachable at all.",
+            ctx.flood_count,
+            hb_net::topic::TOPIC_DISCOVERY_FETCH_LIMIT,
+            hb_net::topic::TOPIC_DISCOVERY_FETCH_LIMIT
+        ));
+    }
+
+    // (a) The escalation's product. A red here is the defect 315 existed to remove.
+    if !has_starved {
+        return Err(format!(
+            "D5 topic-discovery starvation FAILED: the '{starved_root}' topic (id {}, published \
+             BEFORE the flood) did NOT surface from discovery after a {}-event flood under \
+             '{flood_root}'. The shared `#t` OR-page is newest-first, so it is entirely flood and \
+             '{starved_root}' got {starved_slots} slot(s) in it. QURATOR-315 aligned \
+             TOPIC_DISCOVERY_FETCH_LIMIT to the relay's granted window precisely so that this case \
+             is DETECTED and escalated. A red here means the escalation did not fire or did not \
+             merge. Check, in this order: (1) the gate — is `hit_limit` still computed as \
+             `events.len() >= TOPIC_DISCOVERY_FETCH_LIMIT`? A `>` there is dead at exactly a full \
+             page, and no unit test reds on that mutation; (2) `starved_roots` — is \
+             '{starved_root}' absent from `root_event_counts`, i.e. did it truly get zero slots (a \
+             nonzero count is NOT starved by design and must not escalate); (3) the escalation loop \
+             in `discover_public_topics_paint` — is the per-root solo fetch still issued AND merged \
+             via `out.merge(...)`. \
+             ⚠ Do NOT 'fix' a red by lowering --flood-count: below the relay's window the flood \
+             cannot starve anything and this row silently stops measuring.",
+            starved_meta.topic_id, ctx.flood_count
         ));
     }
     Ok(())
@@ -1024,9 +1262,10 @@ mod tests {
         run(&mut tap, &probe).await;
 
         let rows = tap.rows();
-        assert_eq!(rows.len(), 4, "every row must still be REPORTED, never silently dropped");
+        // Row order is D1, D2, D3, D5, D4 (QURATOR-315 inserted D5 between D3 and D4 in `run`).
+        assert_eq!(rows.len(), 5, "every row must still be REPORTED, never silently dropped");
 
-        for (i, label) in [(0usize, "D1"), (3usize, "D4")] {
+        for (i, label) in [(0usize, "D1"), (4usize, "D4")] {
             let r = &rows[i];
             assert!(r.name.starts_with(label), "row {i} should be {label}, got {:?}", r.name);
             assert!(r.skipped, "{label} must SKIP on a 1-relay topology, not fail: {:?}", r.detail);
@@ -1039,6 +1278,7 @@ mod tests {
             );
         }
         assert!(rows[2].skipped, "D3 unarmed still skips — this change must not disturb it");
+        assert!(rows[3].skipped, "D5 unarmed still skips — it shares D3's arming, not a topology precondition");
 
         // ⚠ Deliberately NOT asserting `finish() == SUCCESS`. D2 carries no precondition, so in a
         // hermetic test it fails honestly against an unreachable relay and the run exits 1 for a
@@ -1047,7 +1287,7 @@ mod tests {
         // exists to avoid, and it is how the first draft of this test failed. The precise claim is
         // per-row: D1 and D4 contribute no FAILURE.
         assert!(
-            rows[0].passed && rows[3].passed,
+            rows[0].passed && rows[4].passed,
             "neither D1 nor D4 may contribute a failing row on a 1-relay topology"
         );
     }
@@ -1116,28 +1356,37 @@ mod tests {
     /// `600 > 501` against a copy would pass while the real default sat at 60 (§9: a test that
     /// rebuilds the thing it checks is decorative).
     ///
-    /// MUTATION (P-10) — locate by LINE NUMBER, not text search. In `mod.rs`'s D3 arming block,
+    /// Since QURATOR-315, D5 shares this exact default and its own floor (`D5_FLOOD_COUNT_FLOOR`) is
+    /// the same 501 as D3's — both fetch budgets it floors on are 500. One default block, two floors
+    /// to clear; assert against both so a future change to either floor alone still catches the drift.
+    ///
+    /// MUTATION (P-10) — locate by LINE NUMBER, not text search. In `mod.rs`'s D3/D5 arming block,
     /// change `.unwrap_or(600)` back to `.unwrap_or(60)`: the parsed default drops below the floor
     /// and this test reds.
     #[test]
     fn the_shipped_d3_flood_default_clears_the_floor() {
         let code = include_str!("mod.rs");
         let at = code
-            .find("// D3 arming:")
-            .expect("the D3 arming block must exist — this test reads the default from it");
+            .find("// D3/D5 arming:")
+            .expect("the D3/D5 arming block must exist — this test reads the default from it");
         let tail = &code[at..];
         let key = ".unwrap_or(";
-        let start = tail.find(key).expect("the D3 arming block must set a --flood-count default") + key.len();
-        let end = start + tail[start..].find(')').expect("unterminated unwrap_or in the D3 arming block");
+        let start = tail.find(key).expect("the D3/D5 arming block must set a --flood-count default") + key.len();
+        let end = start + tail[start..].find(')').expect("unterminated unwrap_or in the D3/D5 arming block");
         let default: u32 = tail[start..end]
             .trim()
             .parse()
-            .expect("the D3 --flood-count default must be a plain integer literal");
+            .expect("the D3/D5 --flood-count default must be a plain integer literal");
         assert!(
             default >= FLOOD_COUNT_FLOOR,
             "the shipped --flood-count default ({default}) is below D3's floor ({FLOOD_COUNT_FLOOR}), \
              so the documented invocation would be refused — or, before the floor existed, would have \
              run and measured nothing"
+        );
+        assert!(
+            default >= D5_FLOOD_COUNT_FLOOR,
+            "the shipped --flood-count default ({default}) is below D5's floor ({D5_FLOOD_COUNT_FLOOR}), \
+             so the same documented invocation would refuse D5 even while clearing D3's floor"
         );
     }
 

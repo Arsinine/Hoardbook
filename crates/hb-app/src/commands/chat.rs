@@ -404,9 +404,15 @@ pub(crate) const DM_FETCH_MARGIN_SECS: u64 = 48 * 60 * 60;
 
 /// Fetch budget for the inbox poll. Without an explicit `.limit()` the client leaves the response
 /// size to the relay's own default (strfry's `maxFilterLimit`) — a hostile or misconfigured relay
-/// could return an unbounded batch (CWE-400). 1000 is far above realistic DM volume in a 48 h window
-/// and matches the other fetch-budget constants (`TEASER_SEARCH_FETCH_LIMIT`,
-/// `TOPIC_DISCOVERY_FETCH_LIMIT`).
+/// could return an unbounded batch (CWE-400). 1000 is far above realistic DM volume in a 48 h window.
+///
+/// ⚠ Deliberately NOT the same number as the other fetch-budget constants
+/// (`TEASER_SEARCH_FETCH_LIMIT`, `TOPIC_DISCOVERY_FETCH_LIMIT`, both 500 since QURATOR-310/315).
+/// Those two are sized at exactly what a strfry relay will GRANT, because each compares its result
+/// against the budget to detect truncation — a budget above the grant would make that comparison
+/// unreachable (that WAS QURATOR-315). This one is an upper bound against an unbounded batch, never
+/// compared against anything, so exceeding the grant costs nothing here: a relay serving its newest
+/// 500 still covers any realistic 48 h DM volume.
 ///
 /// `pub(crate)`: also the fetch budget for the two background poll loops' inbox filters
 /// (QURATOR-197) — one number, so the budgets can't drift.
