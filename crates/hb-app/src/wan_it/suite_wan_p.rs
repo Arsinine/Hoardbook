@@ -506,15 +506,40 @@ mod tests {
     /// `p3_skip_if_unarmed` helper — the same one `run`'s call site invokes on `None` — rather
     /// than reimplementing the skip, so this pins what production actually does.
     ///
+    /// ⚠ It asserts the ROW EXISTS and is a skip, not merely that the run exits 0. Those are
+    /// different claims: a helper that did NOTHING would drop P3 from the TAP stream entirely and
+    /// still exit 0, because nothing failed — and a vanished row is indistinguishable from a
+    /// passing one if you only read the exit code. That is the whole risk here. A future reader
+    /// would see a clean green and believe five rows ran when four did, with the cap-displacement
+    /// row silently absent (CLAUDE.md §9 — an assertion coarser than the behaviour it names).
+    /// The same hole was found and closed in WAN-D's D1/D4 under QURATOR-316; this is its twin.
+    ///
     /// MUTATION (P-10) — locate by LINE NUMBER, not text search (this comment quotes the code it
-    /// tests). In `p3_skip_if_unarmed`, replace the `tap.skip(name, "...")` call with
-    /// `tap.check(name, Err("not armed".to_string()))` — the row then fails instead of skipping,
-    /// and this test's `ExitCode::SUCCESS` assert reds.
+    /// tests). TWO independent mutations, and the row-existence assert is why the second one is
+    /// catchable at all:
+    ///   1. In `p3_skip_if_unarmed`, replace the `tap.skip(name, "...")` call with
+    ///      `tap.check(name, Err("not armed".to_string()))` — the row fails instead of skipping,
+    ///      and the `skipped`/`SUCCESS` asserts red.
+    ///   2. Empty `p3_skip_if_unarmed`'s body entirely (`fn p3_skip_if_unarmed(..) {}`) — the run
+    ///      still exits 0, so the exit-code assert alone stays GREEN; only the row-count assert
+    ///      reds. Verified 2026-09-22.
     #[test]
     fn p3_unarmed_skip_keeps_the_run_green() {
         let mut tap = Tap::new();
         tap.check("an ordinary pass", Ok(()));
         p3_skip_if_unarmed(&mut tap, "P3: cap-displacement");
+
+        let rows = tap.rows();
+        assert_eq!(rows.len(), 2, "P3's row must be REPORTED, never silently dropped");
+        let p3 = &rows[1];
+        assert!(p3.name.starts_with("P3"), "row 1 should be P3, got {:?}", p3.name);
+        assert!(p3.skipped, "not-armed must render as a SKIP, not a pass or a failure");
+        assert!(p3.passed, "a skip carries passed:true so it cannot fail the run");
+        assert!(
+            p3.detail.as_deref().unwrap_or_default().contains("--flood-relay"),
+            "the skip must tell the operator how to ARM the row, not just that it was skipped"
+        );
+
         assert_eq!(tap.finish(), std::process::ExitCode::SUCCESS);
     }
 
