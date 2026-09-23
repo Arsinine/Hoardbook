@@ -174,10 +174,7 @@ async fn m9_dead_endpoint_fails_bounded(probe: &ProbeInput) -> Result<(), String
     match result {
         Ok(Err(e)) => {
             // The dial failed cleanly before the deadline (the fast-fail path). Record the evidence.
-            eprintln!(
-                "   M9-dead redeem failed in {:.1}s (expected — node_addr is unroutable): {e}",
-                elapsed.as_secs_f64()
-            );
+            eprintln!("{}", describe_dead_redeem_failure(elapsed.as_secs_f64(), &e));
             // Assert the ticket stayed unspent on the probe side: the claim is still Granted for this
             // request id, not Spent (a failed dial does not spend the ask — the production property).
             assert_probe_ask_unspent(probe, &probe.dead_ticket)?;
@@ -202,6 +199,20 @@ async fn m9_dead_endpoint_fails_bounded(probe: &ProbeInput) -> Result<(), String
             Ok(())
         }
     }
+}
+
+/// QURATOR-312 (owed observation): render the M9-dead row's failure with the FULL anyhow chain
+/// (`{e:#}`), never Display-only (`{e}` renders just the outermost context and drops the cause). The
+/// dead row dials `transport::fetch_manifest` DIRECTLY — not `redeem_manifest_ticket_with_progress`,
+/// whose post-312 chain-preserving fix is therefore never on this row's path — so the chain lives or
+/// dies HERE, in the harness's own rendering. The chain is the evidence: the context ("dial the
+/// manifest plane for wan-it") and the cause under it ("the ticket's address never answered the
+/// dial") are what let a live run tell a dial TIMEOUT from a dial REFUSAL apart. A pure fn so the
+/// rendering is pinnable by a unit test (a bare `eprintln!` is not).
+fn describe_dead_redeem_failure(elapsed_secs: f64, e: &anyhow::Error) -> String {
+    format!(
+        "   M9-dead redeem failed in {elapsed_secs:.1}s (expected — node_addr is unroutable): {e:#}"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -317,7 +328,7 @@ async fn m1_live_redeem(probe: &ProbeInput) -> Result<(), String> {
 fn describe_sanitized_dial_target(raw_node_addr: &str) -> String {
     let sanitized = match sanitize_node_addr(raw_node_addr) {
         Ok(s) => s,
-        Err(e) => return format!("could not sanitize the ticket's node_addr to check: {e}"),
+        Err(e) => return format!("could not sanitize the ticket's node_addr to check: {e:#}"),
     };
     let Ok(addr) = parse_node_addr(&sanitized) else {
         return "could not re-parse the sanitized node_addr to check".to_string();
@@ -992,6 +1003,38 @@ mod tests {
         assert!(
             !described.contains("127.0.0.1"),
             "must never print the RAW pre-sanitize addr, got: {described}"
+        );
+    }
+
+    /// QURATOR-312's owed observation: the M9-dead row owns its own error rendering (it dials
+    /// `fetch_manifest` directly, bypassing the command whose chain 312 fixed), so the dial's CAUSE
+    /// survives only if `describe_dead_redeem_failure` renders the full chain. Builds a chain shaped
+    /// like the real one — a dial cause under the transport context — and asserts BOTH layers appear.
+    /// Calls the production fn the row calls; does not rebuild the string here (§9 P-6: a test that
+    /// re-emits the line it checks is decorative).
+    // P-10 mutation: change `{e:#}` back to `{e}` on the `format!` line inside
+    // `describe_dead_redeem_failure` (production line 214 as this file currently stands —
+    // anchor by LINE NUMBER, not text: both `{e:#}` and `{e}` appear quoted in this comment, so a
+    // text search cannot land the edit uniquely). The `contains("never answered the dial")`
+    // assertion reds, because Display renders only the outermost context ("dial the manifest plane
+    // for wan-it") and drops the cause.
+    #[test]
+    fn describe_dead_redeem_failure_keeps_the_dial_cause_chain() {
+        let e = anyhow!("the ticket's address never answered the dial")
+            .context("dial the manifest plane for wan-it");
+        let line = describe_dead_redeem_failure(20.0, &e);
+        assert!(
+            line.contains("dial the manifest plane for wan-it"),
+            "the outer context survives, got: {line}"
+        );
+        assert!(
+            line.contains("never answered the dial"),
+            "the CAUSE survives — this is the layer that distinguishes a dial timeout from a \
+             refusal, and Display-only formatting drops it, got: {line}"
+        );
+        assert!(
+            line.contains("in 20.0s"),
+            "the elapsed bound survives the extraction into the pure fn, got: {line}"
         );
     }
 }
