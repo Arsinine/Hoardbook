@@ -240,13 +240,15 @@ async fn run_serve(args: &[String]) -> Result<()> {
             republish_e2e_seed(&store, &live_npub, &dir).await?;
         }
         // Spawn the PRODUCTION auto-approve loop — `auto_approve::run_auto_approve_loop`, the exact
-        // task `lib.rs` spawns at startup — NOT the harness copy below. This is what makes a green
-        // WAN-E2E discharge QURATOR-137's §5 gate: the gate is the SHIPPED background decider
-        // answering an unattended request-DM over a real relay, and only the production loop is that
-        // decider. The harness copy proves the approval BODY (`send_full_list_inner`); it does not
-        // prove the loop that decides to call it. (The relay set is read by the production loop from
-        // the store via `net::relay_urls`, and `run_serve` persisted it into Settings above, so the
-        // loop uses THIS run's relays, never the public fallback.)
+        // task `lib.rs` spawns at startup — never a harness copy. (A harness copy lived here until
+        // 2026-09-23; its IN-MEMORY dedup set made a restarted serve re-answer the relay's whole
+        // backlog — found live in the FETCH suite's Tier 3 run, and the reason the copy is deleted.)
+        // This is what makes a green WAN-E2E discharge QURATOR-137's §5 gate: the gate is the
+        // SHIPPED background decider answering an unattended request-DM over a real relay, and only
+        // the production loop is that decider — a harness copy proves the approval BODY
+        // (`send_full_list_inner`), not the loop that decides to call it. (The relay set is read by
+        // the production loop from the store via `net::relay_urls`, and `run_serve` persisted it
+        // into Settings above, so the loop uses THIS run's relays, never the public fallback.)
         //
         // The endpoint is a fresh `new_shared_endpoint()` (the carry suite's precedent): this loop
         // is the SOLE binder of the manifest plane in the serve process — the foreground beacon loop
@@ -498,129 +500,6 @@ fn generate_seed_tree(dir: &Path, count: usize, offset: usize) -> Result<()> {
         std::fs::write(&path, b"x").map_err(|e| anyhow!("write seed file {path:?}: {e}"))?;
     }
     Ok(())
-}
-
-/// The auto-approve loop: poll the DM inbox for request-DMs, and for each one drive the production
-/// approval body (`send_full_list_inner`, the fn the "Send the full list" click drives). Runs forever;
-/// every approval is logged to stderr.
-///
-/// The loop is the serve side of WAN-E2E: it replaces the human "Send the full list" click with a
-/// harness policy (auto-approve every request-DM from any asker). This is the ONLY deviation from the
-/// production path, and it exists because a headless harness cannot click a button — the approval
-/// itself IS the production code, called directly.
-async fn run_auto_approve_loop(
-    store: &DataStore,
-    live_npub: &crate::identity_state::SharedIdentity,
-    shared_relay: &net::SharedRelay,
-    relays: &[String],
-) -> Result<()> {
-    use crate::commands::chat::decode_dms;
-    use hb_net::RelayClient;
-    use std::collections::HashSet;
-    use std::time::Duration;
-
-    let poll_interval = Duration::from_secs(5);
-    let timeout = Duration::from_secs(15);
-    let mut seen_request_ids: HashSet<String> = HashSet::new();
-
-    // The identity fields the inbox poll needs (snapshot once under the lock; AppIdentity is not
-    // Clone). Only `identity` + `own_npub` now: the approval itself reads the session secrets from the
-    // live `SharedIdentity` inside `send_full_list_inner`, so the loop no longer holds a second copy
-    // of them (same reasoning as `setup_manifest_plane`'s snapshot note).
-    let (identity, own_npub) = {
-        let guard = live_npub.read().await;
-        let id = guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("no identity loaded for the auto-approve loop"))?;
-        (id.identity.clone(), id.npub())
-    };
-
-    eprintln!("[serve] auto-approve loop started (polling DM inbox every {poll_interval:?})");
-    loop {
-        // Fetch gift-wrap events addressed to us (kind 1059, pubkey = ours).
-        let client = match RelayClient::connect(&identity, relays, timeout).await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[serve] auto-approve connect failed: {e}");
-                tokio::time::sleep(poll_interval).await;
-                continue;
-            }
-        };
-        let wraps = match client
-            .fetch(
-                Filter::new().kind(Kind::GiftWrap).pubkey(identity.public_key()),
-                timeout,
-            )
-            .await
-        {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("[serve] auto-approve fetch failed: {e}");
-                client.disconnect().await;
-                tokio::time::sleep(poll_interval).await;
-                continue;
-            }
-        };
-        client.disconnect().await;
-
-        if wraps.is_empty() {
-            tokio::time::sleep(poll_interval).await;
-            continue;
-        }
-
-        // Decode all gift-wraps (no contact filter — the harness auto-approves anyone). decode_dms
-        // recovers the real sender from the NIP-17 seal.
-        let msgs = decode_dms(&own_npub, &identity, wraps, None).await;
-        for msg in msgs {
-            // Parse with PRODUCTION's parser (QURATOR-183) — never a harness copy. A hand-rolled
-            // field read here silently lost the blank-string-to-`None` normalisation that decides
-            // whether an ask is Carrier-4, and that is the discriminator the routing below turns on.
-            let Some(body) = crate::auto_approve::ManifestRequestBody::parse(&msg.content) else {
-                continue; // an ordinary chat DM — not ours
-            };
-            // Route by PRODUCTION's discriminator, and REFUSE what this loop cannot serve. This
-            // loop's only body is `approve_request` → `send_full_list_inner`, which builds THIS
-            // node's collection by slug. Handing it an author-bearing (Carrier-4 re-serve) ask
-            // would serve the WRONG collection whenever the slugs collide — "films" and "music"
-            // collide constantly — which is precisely the mis-route `should_auto_approve`'s
-            // deleted step (0) used to prevent. `--suite carry` owns the re-serve path and drives
-            // `send_cached_manifest_inner` itself; this loop must say so out loud rather than
-            // quietly answer with the wrong bytes.
-            if let crate::auto_approve::ApprovalBody::CachedManifest { author } =
-                crate::auto_approve::approval_body_for(&body)
-            {
-                eprintln!(
-                    "[serve] REFUSED a Carrier-4 re-serve ask from {} for '{}' by author {author}: \
-                     this loop only serves its OWN collections (send_full_list_inner). Use \
-                     --suite carry, which drives send_cached_manifest_inner.",
-                    msg.from, body.slug
-                );
-                continue;
-            }
-            let slug = body.slug.as_str();
-            let ask_nonce = body.ask_nonce.as_deref();
-            // Dedup by (sender, slug, nonce) so a re-delivered request-DM doesn't trigger a second
-            // approval (the production inbox would show it once).
-            let dedup_key = format!("{}|{slug}|{}", msg.from, ask_nonce.unwrap_or(""));
-            if !seen_request_ids.insert(dedup_key) {
-                continue;
-            }
-            eprintln!(
-                "[serve] auto-approve: request-DM from {} for slug '{slug}' (nonce={:?})",
-                msg.from,
-                ask_nonce
-            );
-
-            // Drive the production approval body (send_full_list_inner). If it fails, log and
-            // continue — the loop stays alive for the next request.
-            if let Err(e) =
-                approve_request(store, live_npub, shared_relay, &msg.from, slug, ask_nonce).await
-            {
-                eprintln!("[serve] auto-approve failed for {slug}: {e:#}");
-            }
-        }
-        tokio::time::sleep(poll_interval).await;
-    }
 }
 
 /// Drive the production approval body for one request-DM: `send_full_list_inner` IS the body of the
@@ -1650,66 +1529,6 @@ mod tests {
         assert!(parse_peer("not-a-code").is_err());
     }
 
-    /// The other half of `fulfil_commands_stay_thin_so_the_harness_keeps_covering_them`.
-    ///
-    /// That guard pins the `#[tauri::command]` bodies as thin shims over `*_inner`, and its whole
-    /// rationale is the sentence "the WAN harness calls the inner fn, so anything here is untested".
-    /// Nothing verified that sentence. It was false: `approve_request` re-implemented the approval
-    /// step by step, so WAN-E2E ran green while never executing `send_full_list_inner` — and
-    /// therefore never writing the QURATOR-137 standing grant (`fulfil.rs`, `record_standing_grant`).
-    /// A green WAN-E2E could not discharge §5 for any grant-related change, and nothing said so.
-    ///
-    /// This is the same failure shape as the `sanitize_node_addr` defect (2026-08-27): a harness that
-    /// copies a body instead of calling it covers the copy, not the code that ships. A drift guard,
-    /// not integration coverage — the `suite_cap.rs` precedent — but it fails loudly on re-divergence,
-    /// which is the part no one was getting.
-    ///
-    /// MUTATION (P-10, resolve by containing function): in `approve_request`, replace the
-    /// `send_full_list_inner(` call with any hand-rolled step — e.g. re-add `issue_ticket(` — and
-    /// this test reds. Comments are stripped first, so restating the rule in prose cannot satisfy it.
-    /// The serve loop must parse with PRODUCTION's parser and route by PRODUCTION's
-    /// discriminator — QURATOR-183, the same fix `suite_wan_carry.rs` took. Two things are pinned,
-    /// and the second is a real trap rather than tidiness:
-    ///
-    /// 1. No hand-rolled request-DM tag check. A copy loses the blank-string-to-`None`
-    ///    normalisation that decides whether an ask is Carrier-4.
-    /// 2. An author-bearing ask is REFUSED, not served. This loop's only body is
-    ///    `send_full_list_inner`, which builds THIS node's collection by slug — serving a
-    ///    Carrier-4 re-serve ask through it returns the wrong collection on a slug collision,
-    ///    which is exactly what `should_auto_approve`'s deleted step (0) used to prevent.
-    ///
-    /// MUTATION (P-10) — resolved by containing function: in `run_auto_approve_loop`, delete the
-    /// `ApprovalBody::CachedManifest` refusal arm → the routing assert reds; or restore a
-    /// `serde_json::from_str` + `v.get("hb")` parse → the tag-literal assert reds.
-    #[test]
-    fn the_serve_loop_parses_via_production_and_refuses_carrier4_asks() {
-        let src = include_str!("mod.rs");
-        // Comments stripped: documenting the rule must not satisfy it. The test half below quotes
-        // the literals this scans for, so slice the production half only.
-        let production = &src[..src.find("#[cfg(test)]").expect("test module must exist")];
-        let code: String = production
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(
-            !code.contains("\"manifest_request\""),
-            "the serve loop must not re-implement the request-DM tag check — that literal belongs \
-             to ManifestRequestBody::parse, and a copy covers the copy, not what ships"
-        );
-        assert!(
-            code.contains("ManifestRequestBody::parse"),
-            "the serve loop must parse request-DMs with production's parser"
-        );
-        assert!(
-            code.contains("ApprovalBody::CachedManifest"),
-            "the serve loop must consult production's routing discriminator and REFUSE an \
-             author-bearing ask — its only body is send_full_list_inner, which would serve THIS \
-             node's same-named collection instead of the author's"
-        );
-    }
-
     #[test]
     fn the_harness_approves_through_send_full_list_inner_and_never_rebuilds_it() {
         let src = include_str!("mod.rs");
@@ -1752,22 +1571,28 @@ mod tests {
     }
 
     /// QURATOR-137 §5 discharge contract: the `--auto-approve` serve spawns PRODUCTION's
-    /// auto-approve loop, never the harness copy. The gate is the SHIPPED background decider
+    /// auto-approve loop, never a harness copy. The gate is the SHIPPED background decider
     /// (`auto_approve::run_auto_approve_loop`, the task `lib.rs` spawns) answering an unattended
-    /// request-DM over a real relay; the harness loop below (`fn run_auto_approve_loop`) proves the
-    /// approval body, not the decider. Repoint the serve spawn back at the harness copy and a green
-    /// WAN-E2E would once again prove nothing about the shipped loop — exactly the 189-shaped
-    /// right-suite-wrong-mechanism gap this guard exists to catch.
+    /// request-DM over a real relay. The harness loop this guard was written against is DELETED
+    /// (2026-09-23, with the FETCH suite's repointing: its in-memory dedup set made a restarted
+    /// serve re-answer the relay's backlog, found live in the Tier 3 run). Repoint the serve spawn
+    /// at any local copy and a green WAN-E2E would once again prove nothing about the shipped
+    /// loop — exactly the 189-shaped right-suite-wrong-mechanism gap this guard exists to catch.
+    /// (The FETCH suite's `serve_asks` takes the same shape and has its own guard:
+    /// `serve_asks_answers_through_productions_auto_approve_loop`.)
     ///
-    /// Scoped to the `if auto_approve {` region (not the whole file), because the harness loop's own
-    /// DEFINITION contains `fn run_auto_approve_loop` and its FETCH caller writes `super::` — a
-    /// whole-file scan would be satisfied by those and prove nothing. The needle is the CALL FORM
-    /// `auto_approve::run_auto_approve_loop(` (a call, not the bare name), so this test's own prose
-    /// mentioning the symbol cannot supply the hit (the string-literal-in-a-scan-guard trap).
+    /// Scoped to the `if auto_approve {` region so the guard pins the SERVE SPAWN itself, not any
+    /// incidental mention elsewhere. Both anchors are CODE, not comments: the pre-2026-09-23 end
+    /// anchor was a comment line, which comment-stripping removes, so the region silently ran on
+    /// into this test module until the marker's own STRING LITERAL supplied an end — a region wide
+    /// enough that a later test's needle could have satisfied this one. The needle itself is the
+    /// CALL FORM `crate::auto_approve::run_auto_approve_loop(` (a call, not the bare name), so
+    /// this test's own prose mentioning the symbol cannot supply the hit (the
+    /// string-literal-in-a-scan-guard trap).
     ///
     /// P-10 MUTATION (must red this test): in `run_serve`'s `if auto_approve {` block, change the
-    /// spawn from `crate::auto_approve::run_auto_approve_loop(` back to the harness `run_auto_approve_loop(` —
-    /// the call form vanishes from the region and this test reds.
+    /// spawn from `crate::auto_approve::run_auto_approve_loop(` to any local helper call — or
+    /// delete it — and the call form vanishes from the region; this test reds.
     #[test]
     fn the_e2e_serve_spawns_production_auto_approve_not_the_harness_copy() {
         let src = include_str!("mod.rs");
@@ -1777,24 +1602,71 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Slice the --auto-approve serve region: from `if auto_approve {` to the beacon comment
-        // that closes it ("The beacon loop continues in the foreground").
+        // Slice the --auto-approve serve region: from `if auto_approve {` to the beacon-loop
+        // setup that follows it. Code anchors only — see the doc above for why a comment anchor
+        // is a trap here.
         let at = code
             .find("if auto_approve {")
             .expect("the --auto-approve serve block must exist");
         let end = code[at..]
-            .find("The beacon loop continues in the foreground")
-            .expect("the auto-approve block's closing beacon comment must exist")
+            .find("let shared_relay = net::new_shared();")
+            .expect("the beacon-loop setup after the auto-approve block must exist")
             + at;
         let region = &code[at..end];
 
         assert!(
             region.contains("crate::auto_approve::run_auto_approve_loop("),
             "the --auto-approve serve must spawn PRODUCTION's auto_approve::run_auto_approve_loop, \
-             not the harness copy — QURATOR-137's §5 gate is the shipped decider answering over a \
-             real relay, and only the production loop is that decider. Repointing at the harness \
-             copy makes a green WAN-E2E prove the approval body while proving nothing about the \
+             never a harness copy — QURATOR-137's §5 gate is the shipped decider answering over a \
+             real relay, and only the production loop is that decider. Repointing at a local copy \
+             makes a green WAN-E2E prove the approval body while proving nothing about the \
              loop that decides to call it (the 189-shaped gap)."
+        );
+    }
+
+    /// The FETCH suite's role A answers asks through PRODUCTION's auto-approve loop, never a
+    /// harness copy — the FETCH half of the e2e serve's precedent above. Live evidence
+    /// (2026-09-23 Tier 3 run): role A, restarted on the same data-dir, re-answered D's phase-1
+    /// ask still sitting on the relay, because the old harness loop kept its dedup set in an
+    /// in-memory HashSet keyed `sender|slug|nonce`; production PERSISTS it
+    /// (`store.load_answered_asks()`, owner ruling 2026-09-06), keys it
+    /// `sender|author|slug|nonce`, paces asks, and routes Carrier-4 re-serves. A harness copy of
+    /// the decider proves nothing about the shipped decider — that copy is deleted, and this
+    /// guard keeps any successor honest: `serve_asks` must hand the ask-answering to production's
+    /// loop, not grow a local one.
+    ///
+    /// Comments are stripped and the needle is the CALL FORM
+    /// `crate::auto_approve::run_auto_approve_loop(` (a call, not the bare name), so neither this
+    /// test's prose nor `serve_asks`'s own doc can satisfy it (the
+    /// string-literal-in-a-scan-guard trap).
+    ///
+    /// P-10 MUTATION (must red this test): in `suite_wan_fetch.rs`'s `serve_asks`, delete the
+    /// `crate::auto_approve::run_auto_approve_loop(` call — or repoint it at any local helper —
+    /// and the call form vanishes from the fn's body; this test reds.
+    #[test]
+    fn serve_asks_answers_through_productions_auto_approve_loop() {
+        let src = include_str!("suite_wan_fetch.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Slice serve_asks's body: from its signature to the first column-0 `}` after it (every
+        // inner brace in the fn is indented). Code anchors only, as above.
+        let sig = "async fn serve_asks(";
+        let at = code
+            .find(sig)
+            .expect("serve_asks must exist in suite_wan_fetch.rs");
+        let end = code[at..].find("\n}").expect("serve_asks must terminate") + at;
+        let body = &code[at..end];
+
+        assert!(
+            body.contains("crate::auto_approve::run_auto_approve_loop("),
+            "serve_asks must answer asks by handing them to PRODUCTION's \
+             auto_approve::run_auto_approve_loop — a harness copy of the decider proved nothing \
+             about the shipped decider (the restarted-role-A re-answer, 2026-09-23). Repointing \
+             at a local loop re-creates exactly that gap."
         );
     }
 

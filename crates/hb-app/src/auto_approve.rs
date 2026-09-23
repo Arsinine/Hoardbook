@@ -570,8 +570,9 @@ fn advance_inbox_cursor(newest_seen_outer: u64, batch_newest: u64, now: u64) -> 
 /// The loop itself. Runs forever; every decision is logged (info for approvals, debug/warn for the
 /// human-fallback cases) so a real run produces evidence without spamming idle polls.
 ///
-/// Modelled on the WAN harness's `run_auto_approve_loop` (`wan_it/mod.rs`), with the one deviation
-/// that matters removed: the harness approves *any* asker because it has no human; this loop gates
+/// Originally modelled on the WAN harness's own auto-approve loop (deleted 2026-09-23 — the WAN
+/// suites now drive THIS loop), with the one deviation that mattered removed: that copy approved
+/// *any* asker because it had no human; this loop gates
 /// an own-collection ask on a standing grant within cap budget, paces an author-bearing (Carrier-4
 /// re-serve) ask on the caps alone (owner ruling 2026-09-04), and creates no contacts.
 pub(crate) async fn run_auto_approve_loop(

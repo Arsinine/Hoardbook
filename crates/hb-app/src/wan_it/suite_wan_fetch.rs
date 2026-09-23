@@ -26,7 +26,7 @@
 //! | A | seed the collection | `wan_it::seed_collection` → `commands::collection::scan_selective` + `DataStore::save_collection_draft` |
 //! | A | publish the teaser | `commands::collection::prepare_listing` + `hb_net::publish_listing_capped` |
 //! | A | REPUBLISH (new fingerprint) | the same two, over a regenerated seed tree — the fingerprint moves because the TREE moved, never because the harness wrote one |
-//! | A | answer asks (continuously) | `wan_it::run_auto_approve_loop` → `commands::fulfil::send_full_list_inner` |
+//! | A | answer asks (continuously) | `crate::auto_approve::run_auto_approve_loop` (PRODUCTION's loop) → `commands::fulfil::send_full_list_inner` |
 //! | D·1 | ask + cache | `commands::chat::build_manifest_request` + `send_dm_inner`, then `commands::fulfil::redeem_manifest_ticket_inner` |
 //! | D·2 | **notice, ask, redeem** | `fetch_driver::poll_once` — the whole row. It reads `manifest_cache::list`, resolves A's listing via `commands::browse::resolve_peer`, decides with `peer_wave::next_action`, asks via `commands::chat::request_manifest_from_inner`, and redeems via `commands::fulfil::redeem_manifest_ticket_inner` |
 //! | D·2 | verify under A | `manifest_cache::get_latest` + `hb_core::ManifestEnvelope::verify_author` |
@@ -44,6 +44,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::fetch_driver::{poll_once, AskState};
+use crate::transport_state::new_shared_endpoint;
 use crate::wan_it::suite_wan_carry::{
     redeem_via_production, save_peer_contact, send_request_dm_to, verify_cached_under,
     CarryInput,
@@ -263,7 +264,7 @@ async fn publish_tree(
     Ok(())
 }
 
-/// Answer asks CONTINUOUSLY, through the production auto-approve loop, until the operator kills
+/// Answer asks CONTINUOUSLY, through PRODUCTION's auto-approve loop, until the operator kills
 /// this process.
 ///
 /// ⚠ **It must not answer one ask and stop.** An earlier cut did, and it made the choreography
@@ -273,20 +274,32 @@ async fn publish_tree(
 /// listening (observed live, 2026-09-06). Production has never behaved that way: `auto_approve`
 /// answers every request-DM it sees, for as long as the app runs.
 ///
-/// This is `wan_it::run_auto_approve_loop`, the same helper the `--auto-approve` serve drives, so
-/// every approval still goes through `send_full_list_inner`. It also keeps this process up for the
-/// asker's dial, which is what the old explicit hold was for.
+/// This is `crate::auto_approve::run_auto_approve_loop` — the exact task `lib.rs` spawns at
+/// startup, per the `--auto-approve` serve's precedent (`run_serve`, mod.rs) — never a harness
+/// copy. Live evidence (2026-09-23 Tier 3 run): a restarted role A re-answered D's phase-1 ask,
+/// still on the relay, because the old harness loop kept its dedup set in an in-memory HashSet
+/// keyed `sender|slug|nonce`; production PERSISTS it (`store.load_answered_asks()`, owner ruling
+/// 2026-09-06), keys it `sender|author|slug|nonce`, paces asks, and routes Carrier-4 re-serves.
+/// A harness copy of the decider proves nothing about the shipped decider. The production loop
+/// reads its relay set from the store (`net::relay_urls`), and `run_probe_wan_fetch` persisted
+/// this run's `--relay` set into Settings BEFORE role dispatch, so the loop uses THIS run's
+/// relays. The loop returns `()` and never exits — which also keeps this process up for the
+/// asker's dial, what the old explicit hold was for.
 async fn serve_asks(input: &CarryInput, row: &str) -> Result<(), String> {
     eprintln!("   {row} serving asks continuously (production auto-approve loop) — kill this process when the row reports done");
     let shared_relay = crate::net::new_shared();
-    super::run_auto_approve_loop(
-        &input.store,
-        &input.live_identity(),
-        &shared_relay,
-        &input.relays,
+    let endpoint = new_shared_endpoint();
+    // P-10 mutation: delete this call, or repoint it at any local helper — the guard
+    // `serve_asks_answers_through_productions_auto_approve_loop` (mod.rs tests) reds, because the
+    // call form below is exactly what it slices for.
+    crate::auto_approve::run_auto_approve_loop(
+        input.store.clone(),
+        input.live_identity(),
+        shared_relay,
+        endpoint,
     )
-    .await
-    .map_err(|e| format!("auto-approve loop: {e:#}"))
+    .await;
+    Ok(())
 }
 
 /// FD1: an ordinary ask + redeem, so the driver node holds the collection at the OLD fingerprint.
