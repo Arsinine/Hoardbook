@@ -45,6 +45,10 @@ vi.mock('$lib/api.js', () => ({
 	groupsUnassign: vi.fn(),
 	contactUpdateGroups: vi.fn(),
 	browsePrivateCollections: vi.fn().mockResolvedValue([]),
+	// The page pulls pending browse-key grants on mount (QURATOR-188) and re-reads contacts only
+	// when one applied — q134's mock predated both; without them the mount TypeError-swallowed.
+	getContacts: vi.fn().mockResolvedValue([]),
+	applyKeyGrants: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }));
@@ -62,8 +66,12 @@ vi.mock('$app/stores', () => stubPage);
 // npub in the stubbed $page URL — peerFromQuery matches on the full string.
 const PEER_NPUB = 'npub1q134q134q134q134q134q134q134q134q134q134q134q134q134';
 
+// A SECOND keyless peer — NOT the deep-linked one, so selecting it takes a real People-row
+// click (state 4b). bech32-safe charset (no 1/b/i/o) after the separator.
+const PEER_B_NPUB = 'npub1q134ctcq134ctcq134ctcq134ctcq134ctcq134ctcq134ctcq134ctc';
+
 /** A KEYLESS contact (no browse_key_hex — the owner's exact scenario). */
-function keylessPeer(listings_state: 'Fetched' | 'Sealed' | 'FetchFailed'): ContactSummary {
+function keylessPeer(listings_state: 'Fetched' | 'Sealed' | 'FetchFailed' | 'Pending'): ContactSummary {
 	return {
 		npub: PEER_NPUB,
 		// deliberately NO browse_key_hex — keyless
@@ -74,7 +82,7 @@ function keylessPeer(listings_state: 'Fetched' | 'Sealed' | 'FetchFailed'): Cont
 		local_tags: [],
 		listings_state,
 		profile: { display_name: 'Bare Peer', tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '2026-08-01T00:00:00Z' },
-	} as ContactSummary & { listings_state: 'Fetched' | 'Sealed' | 'FetchFailed' };
+	} as ContactSummary & { listings_state: 'Fetched' | 'Sealed' | 'FetchFailed' | 'Pending' };
 }
 
 afterEach(() => {
@@ -127,5 +135,52 @@ describe('QURATOR-134 — zero published ≠ locked ≠ failed', () => {
 		await fireEvent.click(retry);
 		await waitFor(() => expect(refreshMock).toHaveBeenCalledTimes(1));
 		expect(refreshMock).toHaveBeenCalledWith(PEER_NPUB);
+	});
+
+	// QURATOR-332 — the fourth state, and the keyless skip it retires. 'Pending' = this
+	// contact's listings have never been enumerated; a background queue or a click classifies
+	// it. Owner ruling 2026-09-24: never render it as a confident negative.
+	it('state 4: keyless contact never enumerated (Pending) -> "Not checked yet" + Check now, never a confident negative / 🔒 / error', async () => {
+		refreshMock.mockResolvedValue(keylessPeer('Pending'));
+		contacts.set([keylessPeer('Pending')]);
+		const { getByRole } = render(BrowsePage);
+		await tick();
+
+		await waitFor(() => expect(document.body.textContent).toContain('Not checked yet'));
+		// Pending is NOT a classification — none of the three resolved renderings may appear.
+		expect(document.body.textContent).not.toContain('No public collections');
+		expect(document.body.textContent).not.toContain('Listings locked');
+		expect(document.body.textContent).not.toContain("Couldn't load");
+		// The affordance is present (same refresh selectPeer/selectPeerRefresh run).
+		expect(getByRole('button', { name: 'Check now' })).toBeTruthy();
+	});
+
+	it('state 4b: CLICKING a keyless contact now refreshes it — refreshContact fires and the classified result renders', async () => {
+		// Two keyless contacts: A is auto-selected by the ?peer= deep-link; B is CLICKED in the
+		// People list. selectPeer used to early-return on keyless, so a click never refreshed —
+		// this pins that it now does, and that the mock's classification renders.
+		const peerA = keylessPeer('Fetched');
+		const peerB = {
+			...keylessPeer('Sealed'),
+			npub: PEER_B_NPUB,
+			profile: { display_name: 'Bare Two', tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '2026-08-01T00:00:00Z' },
+		} as ContactSummary & { listings_state: 'Sealed' };
+		refreshMock.mockImplementation(async (npub: string) => (npub === PEER_B_NPUB ? peerB : peerA));
+		contacts.set([peerA, peerB]);
+		render(BrowsePage);
+		await tick();
+
+		// A's classification (via the deep-link select) renders — the live refresh is armed.
+		await waitFor(() => expect(document.body.textContent).toContain('No public collections'));
+
+		refreshMock.mockClear();
+		const row = [...document.querySelectorAll<HTMLElement>('.contact-row')].find(
+			(r) => (r.textContent ?? '').includes('Bare Two'),
+		);
+		expect(row, 'peer B must render in the People list').toBeTruthy();
+		await fireEvent.click(row!);
+		await waitFor(() => expect(refreshMock).toHaveBeenCalledWith(PEER_B_NPUB));
+		// The classified result renders: B came back Sealed → 🔒, not a confident negative.
+		await waitFor(() => expect(document.body.textContent).toContain('Listings locked'));
 	});
 });

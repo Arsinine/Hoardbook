@@ -13,6 +13,10 @@ mod conn;
 mod dm_cache_store;
 mod dm_quarantine;
 mod error;
+// QURATOR-332 slice A — the background enumeration queue (owner ruling 2026-09-24):
+// never-enumerated contacts are Pending, classified one per spacing tick in the background,
+// never a burst; relay-side READ only, not gated by the discovery-auto-fetch opt-in.
+mod enumeration_queue;
 // QURATOR-164 item 3 — the background fetch driver (owner ruling 2026-09-04, option (b)):
 // refetch on fingerprint change, carriers before the author.
 mod fetch_driver;
@@ -217,6 +221,17 @@ fn spawn_background_tasks(
         Arc::clone(&identity),
         Arc::clone(&relay),
         endpoint,
+    ));
+
+    // QURATOR-332 slice A (owner ruling 2026-09-24): contacts added but never enumerated ride a
+    // background queue — one resolve per ENUMERATION_SPACING, dragged out over hours, never a
+    // burst — classifying each through the SAME production path a refresh click uses. Relay-side
+    // READ only (no publish, no DM, no ask to the peer); NOT gated by the discovery-auto-fetch
+    // opt-in, which is a separate ruling about a different behavior.
+    tauri::async_runtime::spawn(enumeration_queue::run_enumeration_queue_loop(
+        store.clone(),
+        Arc::clone(&identity),
+        Arc::clone(&relay),
     ));
 
     // The wakeup counter is the L4 idle-guard hook; in prod it is written-and-ignored.

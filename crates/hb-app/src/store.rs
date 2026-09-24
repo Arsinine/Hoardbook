@@ -825,8 +825,11 @@ pub enum ContactSource {
 
 /// QURATOR-134 — the UI-facing projection of `hb_net::ListingsState`, carried on
 /// [`CachedPeer::listings_state`]. Serialized as its bare variant name (`"Fetched"` /
-/// `"Sealed"` / `"FetchFailed"`); `FetchFailed`'s diagnostic reason is dropped at this boundary
-/// (the UI only needs to know the load failed, not why — it renders error + Retry).
+/// `"Sealed"` / `"FetchFailed"` / `"Pending"`); `FetchFailed`'s diagnostic reason is dropped at
+/// this boundary (the UI only needs to know the load failed, not why — it renders error + Retry).
+///
+/// Four states, not three: `Pending` (QURATOR-332 slice A) is a locally-added state with no
+/// `hb_net` counterpart — `From<hb_net::ListingsState>` never produces it.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ListingsStatus {
     /// The enumeration completed and the peer authored no listing events — an honest empty.
@@ -837,6 +840,10 @@ pub enum ListingsStatus {
     /// The author-wide listing enumeration itself failed — error + Retry, never a confident
     /// negative on data that never arrived.
     FetchFailed,
+    /// QURATOR-332 slice A — never enumerated yet; the background queue or a click will classify
+    /// it — never a confident negative. Stamped only by the add-time stub paths (topic join,
+    /// request accept) and the one-time heal; `From<hb_net::ListingsState>` never produces it.
+    Pending,
 }
 
 impl From<hb_net::ListingsState> for ListingsStatus {

@@ -163,6 +163,10 @@ describe('QURATOR-188 — Browse applies pending key grants on mount', () => {
 		grantsMock.mockRejectedValue(new Error('relays unreachable'));
 		// Keyless + Fetched (nothing published) — q134 state 1: renders "No public collections".
 		contacts.set([{ ...keylessSealedPeer(), listings_state: 'Fetched' } as ContactSummary]);
+		// QURATOR-332: selecting a KEYLESS peer now live-refreshes it too, so pin what the refresh
+		// returns (the same Fetched row) — `vi.clearAllMocks` keeps the previous test's
+		// implementation, which would otherwise hand back that test's KEYED peer.
+		refreshMock.mockResolvedValue({ ...keylessSealedPeer(), listings_state: 'Fetched' } as ContactSummary);
 		render(BrowsePage);
 		await tick();
 

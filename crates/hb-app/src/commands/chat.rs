@@ -37,7 +37,7 @@ use crate::{
     error::{cmd_err, CmdResult},
     identity_state::SharedIdentity,
     net::{self, SharedRelay},
-    store::{CachedPeer, ContactSource, DataStore},
+    store::{CachedPeer, ContactSource, DataStore, ListingsStatus},
 };
 
 fn now_secs() -> u64 {
@@ -849,7 +849,10 @@ pub(crate) async fn dm_request_accept_inner(
         petname,
         profile: None,
         collections: vec![],
-        listings_state: Default::default(), // QURATOR-134 tri-state (not classified on this stub path)
+        // QURATOR-332 slice A (owner ruling 2026-09-24): this stub path enumerated NOTHING, so it
+        // must claim nothing — `Pending` (never-enumerated), never the `Fetched` honest-empty the
+        // old default asserted. The background enumeration queue classifies it (read-only) later.
+        listings_state: ListingsStatus::Pending,
         online: false,
         last_fetched: chrono::Utc::now(),
         last_presence: None, // W5.2: stamped by the online poll only
@@ -866,11 +869,12 @@ pub(crate) async fn dm_request_accept_inner(
         peer.profile = existing.profile;
         peer.source = existing.source;
         peer.petname = peer.petname.or(existing.petname);
-        // QURATOR-134 tri-state: the stub defaults to `Fetched`, which asserts "enumeration
-        // completed and they published nothing" — a CONFIDENT NEGATIVE. Accepting a request is
-        // deliberately network-free, so this path enumerated nothing and has no standing to make
-        // that claim; overwriting a stored `Sealed` (locked) or `FetchFailed` (error + Retry) with
-        // it would re-introduce the exact empty-vs-locked misread QURATOR-134 fixed.
+        // QURATOR-134 / QURATOR-332 slice A: the stub stamps `Pending` (never-enumerated — this
+        // network-free path enumerated nothing and claims nothing), but an ALREADY-classified
+        // contact keeps its stored state: overwriting a stored `Fetched` (an honest empty EARNED
+        // by a real enumeration), `Sealed` (locked) or `FetchFailed` (error + Retry) with
+        // `Pending` would discard a classification we did pay for — the exact empty-vs-locked
+        // misread QURATOR-134 fixed, in a new coat.
         peer.listings_state = existing.listings_state;
         // `last_fetched` means "when WE last polled this peer from the relays" (store.rs's own
         // doc: as opposed to `last_presence`, which is when we last saw THEIR beacon). Accepting a
@@ -3630,6 +3634,39 @@ mod tests {
         assert_eq!(contact.source, ContactSource::Manual);
         assert!(contact.collections.is_empty());
         assert!(contact.browse_key_hex.is_none());
+    }
+
+    /// QURATOR-332 slice A (owner ruling 2026-09-24): a brand-new accept stub is never-enumerated
+    /// — `Pending`, never the `Fetched` honest-empty the old `Default::default()` asserted (this
+    /// network-free path enumerated nothing and must claim nothing). Browse then renders "not yet
+    /// checked" until the background enumeration queue (or a click) classifies it, instead of a
+    /// false "No public collections". An EXISTING contact's earned classification survives accept
+    /// untouched — that is the separate merge test above (Sealed stays Sealed).
+    // P-10 mutation: in `dm_request_accept_inner` (crates/hb-app/src/commands/chat.rs), change
+    // `listings_state: ListingsStatus::Pending` back to `listings_state: Default::default()` —
+    // this test reds (the stub regresses to the confident empty).
+    #[tokio::test]
+    async fn accepting_a_request_stubs_pending_not_fetched() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let me = Identity::generate();
+        let npub = "npub1q332stranger".to_string();
+        assert!(store.load_contact(&CachedPeer::pubkey_hash(&npub)).unwrap().is_none(), "sanity: not yet a contact");
+
+        store
+            .save_dm_requests(&me, &[DmRequestBucket { npub: npub.clone(), first_seen: 1, last_message_at: 1, messages: vec![] }])
+            .unwrap();
+
+        dm_request_accept_inner(&store, &me, "npub1me", npub.clone(), None).await.unwrap();
+
+        let contact = store.load_contact(&CachedPeer::pubkey_hash(&npub)).unwrap().unwrap();
+        assert_eq!(
+            contact.listings_state,
+            ListingsStatus::Pending,
+            "a brand-new accept stub is never-enumerated (Pending), never a confident Fetched empty"
+        );
+        assert_eq!(contact.source, ContactSource::Manual);
+        assert!(contact.browse_key_hex.is_none(), "INV-2: an accept stub stays keyless");
     }
 
     #[test]

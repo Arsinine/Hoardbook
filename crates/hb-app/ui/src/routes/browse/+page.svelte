@@ -88,10 +88,11 @@
 		selectedCollection = null;
 		folderStack = [];
 		resetFileFilters();
-		// devtest #3/#4: for a keyed contact, re-fetch listings live so a browse-key that arrived
-		// after (or a listing fetch that hiccuped at) add-time actually surfaces their collections.
-		// Bare (keyless) contacts have nothing to fetch — skip. Cached view stays if the fetch fails.
-		if (!peer.has_browse_key) return;
+		// devtest #3/#4: re-fetch listings live so a browse-key that arrived after add-time (or a
+		// listing fetch that hiccuped) actually surfaces their collections. QURATOR-332: this runs
+		// for KEYLESS contacts too — the backend's refresh_contact handles them (a FollowOnly
+		// resolve classifies Fetched/Sealed/FetchFailed, and classifies a 'Pending' contact on
+		// click). Cached view stays if the fetch fails.
 		loadingListings = true;
 		try {
 			const updated = await refreshContact(peer.npub);
@@ -282,6 +283,10 @@
 	// The enumeration itself failed — genuinely distinct from both empty and locked (the
 	// QURATOR-67/68/93 rule: never render a confident negative on data that never arrived).
 	let listingsLoadFailed = $derived(!!selectedPeer && !selectedPeer.has_browse_key && selectedPeer.listings_state === 'FetchFailed');
+	// QURATOR-332 — 'Pending': this contact's listings have NEVER been enumerated yet; the
+	// backend classifies it (a background queue, or the click that opens the peer — selectPeer
+	// refreshes every peer now). Neutral by ruling 2026-09-24: never a confident negative.
+	let listingsPending = $derived(!!selectedPeer && !selectedPeer.has_browse_key && selectedPeer.listings_state === 'Pending');
 
 	// M22 W3 — drag-to-group gesture on the People list. Same shared primitives as Contacts;
 	// create is ALWAYS ADDITIVE. Esc cancels. The naming popover is a simple inline panel here
@@ -1015,6 +1020,17 @@
 						     guarded because the listingsLocked derivation's non-null narrowing doesn't reach
 						     this closure. -->
 						<button class="btn-default btn-sm ask-access-btn" onclick={() => { const p = selectedPeer; if (!p) return; goto('/chat?peer=' + p.npub + '&intent=ask-access' + (p.petname ? '&petname=' + encodeURIComponent(p.petname) : '')); }}>Ask for access</button>
+					</div>
+				{:else if listingsPending}
+					<!-- QURATOR-332 state 4: 'Pending' — this contact's listings have never been
+					     enumerated, so NOTHING is known yet. Neutral by ruling 2026-09-24: never a
+					     confident negative, never 🔒. The click that opens the peer classifies it
+					     (selectPeer refreshes every peer); this button re-runs that same refresh. -->
+					{@const p = selectedPeer}
+					<div class="empty-state">
+						<div class="empty-icon">{@html icons.folder}</div>
+						<div class="empty-label">Not checked yet</div>
+						<button class="btn-default btn-sm" onclick={() => { const t = p; if (!t) return; selectPeerRefresh(t); }}>Check now</button>
 					</div>
 				{:else if selectedPeer.collections.length === 0}
 					{@const p = selectedPeer}

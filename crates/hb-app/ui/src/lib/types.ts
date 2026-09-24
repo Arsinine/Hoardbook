@@ -117,10 +117,13 @@ export interface PrivatePeerCollections {
  *  §11 Topic (a distinct badge). Absent ⇒ `Manual` (a pre-M11 contact). */
 export type ContactSource = 'Manual' | 'Topic';
 
-/** QURATOR-134 — the tri-state a keyless contact's listings resolve to (see
+/** QURATOR-134/332 — the four states a keyless contact's listings resolve to (see
  *  `CachedPeer.listings_state`). Mirrors hb-app's `store::ListingsStatus`, which mirrors
- *  hb-net's `ListingsState` — the one implementation; the UI renders, never re-derives. */
-export type ListingsStatus = 'Fetched' | 'Sealed' | 'FetchFailed';
+ *  hb-net's `ListingsState` — the one implementation; the UI renders, never re-derives.
+ *  'Pending' (QURATOR-332) = never enumerated yet: a background queue or the click that
+ *  opens the peer classifies it, and the UI must never render it as a confident negative
+ *  (owner ruling 2026-09-24). */
+export type ListingsStatus = 'Fetched' | 'Sealed' | 'FetchFailed' | 'Pending';
 
 export interface CachedPeer {
 	/** The peer's Nostr identity (bech32 npub) — the stable contact key. */
@@ -138,8 +141,10 @@ export interface CachedPeer {
 	 *  `collections.length === 0`, which cannot tell "published nothing" from "sealed"):
 	 *  'Fetched' = enumeration completed, peer authored no listing events (honest empty);
 	 *  'Sealed' = listings exist but none decryptable (the genuine 🔒 locked case);
-	 *  'FetchFailed' = the enumeration itself failed (error + Retry). Absent ⇒ 'Fetched'
-	 *  (a pre-QURATOR-134 cached contact; the least-wrong reading). */
+	 *  'FetchFailed' = the enumeration itself failed (error + Retry); 'Pending' = never
+	 *  enumerated yet (QURATOR-332) — classified by a background queue or the click that
+	 *  opens the peer; render neutral, never as a confident negative (ruling 2026-09-24).
+	 *  Absent ⇒ 'Fetched' (a pre-QURATOR-134 cached contact; the least-wrong reading). */
 	listings_state?: ListingsStatus;
 	online: boolean;
 	/** When WE last polled — our cache age. Rendered as "checked {t}", never "seen {t}" (M17 W5.1:

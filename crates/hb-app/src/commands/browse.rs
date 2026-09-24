@@ -817,15 +817,37 @@ pub async fn refresh_contact(
     store: State<'_, DataStore>,
     relay: State<'_, SharedRelay>,
 ) -> CmdResult<ContactSummary> {
-    let hash = CachedPeer::pubkey_hash(&npub);
+    // QURATOR-332 slice A: the resolve+save body moved to [`refresh_contact_inner`] so the
+    // background enumeration queue drives the SAME production path — never a duplicated
+    // sequence (the hardened-path/unhardened-sibling drift §9 warns about; pinned by the
+    // structural guard in enumeration_queue.rs).
+    let me = identity_clone(&identity).await?;
+    refresh_contact_inner(&npub, &me, &store, &relay)
+        .await
+        .map(ContactSummary::from)
+}
+
+/// The shared resolve+save body of [`refresh_contact`] (QURATOR-332 slice A), extracted so the
+/// background enumeration queue (enumeration_queue.rs) classifies never-enumerated contacts by
+/// driving the SAME production path the click does — [`resolve_peer`], then
+/// [`save_refreshed_contact`] — never a duplicated sequence. Returns the persisted
+/// [`CachedPeer`], whose `listings_state` is the classification earned by the read. The identity
+/// is read by the CALLER (the command via [`identity_clone`], the queue per-iteration — a fresh
+/// install has none at startup). Dials a relay; not unit-tested without one.
+pub(crate) async fn refresh_contact_inner(
+    npub: &str,
+    me: &Identity,
+    store: &DataStore,
+    relay: &SharedRelay,
+) -> Result<CachedPeer, String> {
+    let hash = CachedPeer::pubkey_hash(npub);
     let existing = store
         .load_contact(&hash)
         .map_err(cmd_err)?
         .ok_or_else(|| format!("Contact {npub} not found"))?;
     let share_code = contact_share_code(&existing)?;
-    let me = identity_clone(&identity).await?;
-    let updated = resolve_peer(&share_code, &me, &store, &relay).await?;
-    save_refreshed_contact(&store, &hash, &existing, updated).map(ContactSummary::from)
+    let updated = resolve_peer(&share_code, me, store, relay).await?;
+    save_refreshed_contact(store, &hash, &existing, updated)
 }
 
 /// QURATOR-267: reconcile the keyed listing-enumeration's outcome against the previously cached

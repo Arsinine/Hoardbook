@@ -33,7 +33,7 @@ use crate::{
     error::{cmd_err, CmdResult},
     identity_state::SharedIdentity,
     net::{self, SharedRelay},
-    store::{CachedPeer, ContactSource, DataStore, StoredTopic},
+    store::{CachedPeer, ContactSource, DataStore, ListingsStatus, StoredTopic},
 };
 
 /// A Topic I'm in, for the UI.
@@ -189,7 +189,10 @@ pub(crate) fn upsert_topic_contact(store: &DataStore, npub: &str) -> Result<(), 
         petname: None,
         profile: None,
         collections: vec![],
-        listings_state: Default::default(), // QURATOR-134 tri-state (not classified on this stub path)
+        // QURATOR-332 slice A (owner ruling 2026-09-24): this stub path enumerated NOTHING, so it
+        // must claim nothing — `Pending` (never-enumerated), never the `Fetched` honest-empty the
+        // old default asserted. The background enumeration queue classifies it (read-only) later.
+        listings_state: ListingsStatus::Pending,
         online: false,
         last_fetched: chrono::Utc::now(),
         last_presence: None, // W5.2: stamped by the online poll only
@@ -1901,6 +1904,34 @@ mod tests {
             "joining a topic must never enrol anyone as a Private recipient (M21 W5)"
         );
         assert!(audience.is_empty(), "the audience file is untouched by the topic-join path");
+    }
+
+    /// QURATOR-332 slice A (owner ruling 2026-09-24): a topic-added contact has NEVER had its
+    /// listings enumerated, so its stub must say `Pending` — never the `Fetched` honest-empty the
+    /// old `Default::default()` asserted, which made Browse render a false "No public
+    /// collections" for everyone auto-added by a roster until a manual refresh classified them.
+    /// The background enumeration queue (enumeration_queue.rs) classifies the stub later.
+    // P-10 mutation: in `upsert_topic_contact` (crates/hb-app/src/commands/topics.rs), change
+    // `listings_state: ListingsStatus::Pending` back to `listings_state: Default::default()` —
+    // this test reds (the stub regresses to the confident empty).
+    #[test]
+    fn topic_stub_is_pending_not_fetched() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let member = Identity::generate();
+        let npub = npub_of(&member);
+        upsert_topic_contact(&store, &npub).unwrap();
+        let c = store
+            .load_contact(&CachedPeer::pubkey_hash(&npub))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            c.listings_state,
+            ListingsStatus::Pending,
+            "a topic stub is never-enumerated (Pending), never a confident Fetched empty"
+        );
+        assert_eq!(c.source, ContactSource::Topic);
+        assert!(c.browse_key_hex.is_none(), "INV-2: a topic stub stays keyless");
     }
 
     // ── QURATOR-161 slice 5 — `topic_create` + `topic_join_public` driven through the commands ───
