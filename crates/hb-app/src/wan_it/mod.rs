@@ -223,7 +223,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
     // publish the teaser, and run the auto-approve loop (poll the DM inbox for request-DMs and answer
     // each by driving the production approval body). The loop runs concurrently with the beacon below
     // via tokio::select!.
-    let auto_approve = args::flag_value(args, "--auto-approve").is_some();
+    let auto_approve = args::has_flag(args, "--auto-approve");
     let e2e_seed_dir = args::flag_value(args, "--e2e-seed-dir").map(String::from);
     if auto_approve {
         let dir = e2e_seed_dir
@@ -235,7 +235,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
         setup_e2e_serve(&store, &live_npub, &dir).await?;
         // If --republish was passed, rewrite the seed tree NOW (before the loop starts) so E2's
         // changed-fingerprint leg is primed. The probe re-browses after this and sees the new fp.
-        if args::flag_value(args, "--republish").is_some() {
+        if args::has_flag(args, "--republish") {
             eprintln!("[serve] --republish: rewriting the seed tree for E2 (fingerprint will change)");
             republish_e2e_seed(&store, &live_npub, &dir).await?;
         }
@@ -1404,7 +1404,7 @@ fn canary_exit_code(failed: bool) -> u8 {
 }
 
 async fn run_canary(args: &[String]) -> Result<ExitCode> {
-    let once = args::flag_value(args, "--once").is_some();
+    let once = args::has_flag(args, "--once");
     let interval = args::flag_value(args, "--interval")
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs)
@@ -1412,14 +1412,12 @@ async fn run_canary(args: &[String]) -> Result<ExitCode> {
 
     if once {
         // QURATOR-318: --once RETURNS the exit code through main instead of std::process::exit.
-        // The hang this force-exit papered over is fixed at the source: m4_n0_canary now closes
-        // both iroh endpoints (listener + dialer) on EVERY exit path, which ends the relay-
-        // keepalive tasks that kept the runtime alive. Two bounded fallbacks remain so the Linux
-        // keepalive case cannot regress into a hang: (a) the bin wrapper (bin/hb-wan-it.rs) tears
-        // the runtime down with `Runtime::shutdown_timeout`, which abandons any still-running work
-        // after 5s instead of blocking forever, and (b) if m4_n0_canary itself wedges, the 200s
-        // outer timeout (CANARY_M4_OUTER_TIMEOUT_SECS) fires and the pass still returns. Loop mode
-        // runs until killed (SIGTERM handles it).
+        // ⚠ ROOT CAUSE (found 2026-09-24): the "hang" was never an exit hang. `--once` was parsed
+        // with `flag_value(..).is_some()`, which needs a token AFTER the flag, so `canary --once`
+        // (the flag passed last) read as NOT once and ran the 600 s loop — the canary.out.log from
+        // the owner's run showed a SECOND pass 10 min after the first. `args::has_flag` fixes it.
+        // The endpoint closes in m4_n0_canary and the bin wrapper's bounded
+        // `Runtime::shutdown_timeout` stay as hygiene, but neither was the fix.
         let failed = canary_pass().await;
         return Ok(ExitCode::from(canary_exit_code(failed)));
     }

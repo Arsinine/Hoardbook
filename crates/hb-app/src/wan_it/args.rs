@@ -13,6 +13,14 @@ pub fn flag_value<'a>(args: &'a [String], name: &'a str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
 }
 
+/// Whether a VALUELESS switch (`--once`, `--auto-approve`, `--republish`) is present. Never use
+/// `flag_value(..).is_some()` for these: it asks for the token AFTER the flag, so a switch passed
+/// last on the command line reads as absent (QURATOR-318 — `canary --once` silently ran the
+/// 600 s loop, which looked like a process-exit hang on Windows).
+pub fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
+}
+
 /// Every value following a repeated `--relay` flag (trimmed of trailing slashes). Mirrors the retired
 /// harness's helper; the harness passes its relay set explicitly rather than reading Settings.
 pub fn collect_relays(args: &[String]) -> Vec<String> {
@@ -82,6 +90,16 @@ mod tests {
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// P-10 mutation: in `has_flag`, replace the body with the old
+    /// `flag_value(args, name).is_some()` — the switch-passed-LAST assert reds.
+    #[test]
+    fn has_flag_sees_a_switch_passed_last() {
+        assert!(has_flag(&args(&["canary", "--once"]), "--once"));
+        assert!(has_flag(&args(&["serve", "--auto-approve", "--e2e-seed-dir", "/x", "--republish"]), "--republish"));
+        assert!(has_flag(&args(&["canary", "--once", "--interval", "5"]), "--once"));
+        assert!(!has_flag(&args(&["canary", "--interval", "5"]), "--once"));
     }
 
     #[test]
