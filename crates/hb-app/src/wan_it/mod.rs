@@ -138,7 +138,7 @@ fn usage() -> &'static str {
             DM'd (§W6's --ticket-json remains for targeted iroh isolation runs;\n\
             the E2E suite rides the full DM leg).\n\
             --suite wan-e2e runs the WAN-E2E rows (E1 + E2): the full DM-coordinated pipeline.\n\
-            --suite wan-u runs the WAN-U rows (U1–U7): the user-surface live twins (profile,\n\
+            --suite wan-u runs the WAN-U rows (U1–U9): the user-surface live twins (profile,\n\
             collections, add-contact, re-key, private). Probe-plays-both — no serve needed.\n\
             --suite wan-c runs the WAN-C rows (C1–C5): chat over real relays (delivery latency,\n\
             offline catch-up, disjoint relay sets, cursor discipline, blocked drop).\n\
@@ -769,7 +769,7 @@ fn parse_peer(peer: &str) -> Result<nostr::PublicKey> {
 async fn run_probe(args: &[String]) -> Result<ExitCode> {
     // Suite selection: --suite wan-m runs the WAN-M rows (M1 + M9) against --ticket-json; --suite
     // wan-e2e runs the WAN-E2E rows (E1 + E2, the full DM-coordinated pipeline); --suite wan-u runs
-    // the WAN-U rows (U1–U7, the user-surface live twins of the hb-it L2 browse/publish/private
+    // the WAN-U rows (U1–U9, the user-surface live twins of the hb-it L2 browse/publish/private
     // suites); the default is WAN-P (the presence suite W6.1 shipped). §W6 authorizes --ticket-json
     // for targeted iroh isolation runs (the E2E suite rides the full DM leg).
     let suite = args::flag_value(args, "--suite").unwrap_or("wan-p");
@@ -1059,7 +1059,7 @@ async fn run_probe_wan_e2e(args: &[String], peer_str: &str) -> Result<ExitCode> 
 }
 
 // ---------------------------------------------------------------------------
-// probe — WAN-U (U1–U7 — the user-surface live twins)
+// probe — WAN-U (U1–U9 — the user-surface live twins)
 // ---------------------------------------------------------------------------
 
 /// Run the WAN-U rows against the live relay set. Probe-plays-both: every row constructs two

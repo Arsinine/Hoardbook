@@ -1,4 +1,4 @@
-//! WAN-U — user surface: profile, collections, add-contact (M20 W6 §W6). Seven rows that are the
+//! WAN-U — user surface: profile, collections, add-contact (M20 W6 §W6). Nine rows that are the
 //! **live twins of the `hb-it` L2 browse/publish/discovery/private suites**, pointed at real
 //! infrastructure instead of ephemeral CI strfry. Per the §W6 sequencing note ("live twins of the L2
 //! suites, mostly reusing `hb-it` bodies"), the assertion bodies for U2/U3/U6 adapt `hb-it/suite_browse`
@@ -23,7 +23,15 @@
 //!
 //! **Flake policy (P3b precedent):** long-haul rows retry ×3; every failure is a recorded data
 //! point, never discarded.
+//!
+//! **U8/U9 (QURATOR-332 slice C, §5 integration half):** the live glue of the background
+//! enumeration queue. U8 drives `enumerate_next_pending` (the queue's step fn) against real
+//! relays — a Topic stub over a publishing peer classifies `Sealed`, one over a silent peer
+//! classifies `Fetched`, and each step's `(npub, status)` must match the persisted record. U9
+//! pins the failed-resolve Err arm against a real refused dial (`ws://127.0.0.1:1`): the contact
+//! stays `Pending`, deferred (not hot-looped) via `mark_failed_retry`.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -35,11 +43,14 @@ use hb_net::{
 };
 use nostr::prelude::*;
 use serde_json::Value;
+use tokio::sync::RwLock;
 
 use crate::commands::browse::{resolve_peer, save_followed_peer};
-use crate::identity_state::AppIdentity;
+use crate::commands::topics::upsert_topic_contact;
+use crate::enumeration_queue::enumerate_next_pending;
+use crate::identity_state::{AppIdentity, SharedIdentity};
 use crate::net::{self, SharedRelay};
-use crate::store::DataStore;
+use crate::store::{CachedPeer, DataStore, ListingsStatus, Settings};
 use crate::wan_it::tap::Tap;
 
 // ---------------------------------------------------------------------------
@@ -91,7 +102,7 @@ pub async fn build_probe_input(
     })
 }
 
-/// Run the WAN-U rows (U1–U7) against the live relay set. Each row is an honest TAP check:
+/// Run the WAN-U rows (U1–U9) against the live relay set. Each row is an honest TAP check:
 /// Ok ⇒ pass, Err(detail) ⇒ fail with a `# diagnostic` block.
 pub async fn run(tap: &mut Tap, probe: &ProbeInput) {
     let wall = Instant::now();
@@ -131,9 +142,19 @@ pub async fn run(tap: &mut Tap, probe: &ProbeInput) {
         u7_private_collection(probe).await,
     );
 
-    // The wall-clock diagnostic: total time for all 7 rows. §W6/W2 want latency to trend visibly.
+    tap.check(
+        "U8: enumeration queue classifies a Pending contact from real relays (Sealed over a publisher, Fetched over a silent peer)",
+        u8_enumeration_queue_classifies(probe).await,
+    );
+
+    tap.check(
+        "U9: a failed resolve is deferred, never hot-looped (Pending kept, last_fetched moved forward)",
+        u9_failed_resolve_defers(probe).await,
+    );
+
+    // The wall-clock diagnostic: total time for all 9 rows. §W6/W2 want latency to trend visibly.
     eprintln!(
-        "   WAN-U total wall-clock for 7 rows: {:.2}s",
+        "   WAN-U total wall-clock for 9 rows: {:.2}s",
         wall.elapsed().as_secs_f64()
     );
 }
@@ -797,6 +818,258 @@ async fn u7_private_collection(probe: &ProbeInput) -> Result<(), String> {
         return Err("U7 no gift-wrap should be addressed to a non-recipient — no enumeration hint".to_string());
     }
     eprintln!("   U7 non-recipient OK: no private listing, no gift-wrap in their inbox");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// U8 — the enumeration queue classifies a Pending contact from real relays
+// (QURATOR-332 slice C, §5 integration half)
+//
+// Live glue of `enumeration_queue::enumerate_next_pending` (slice A): the unit tests pin the
+// pure decisions (heal / pick / mark_failed_retry) and a structural pin keeps the resolve/save
+// sequence from forking, but nothing drives the REAL resolve against real relays. This row does,
+// probe-plays-both: publisher P publishes a teaser + a public listing family (encrypted under
+// P's own browse key — the production publish path), publisher Q publishes NOTHING, and reader
+// R (a throwaway `AppIdentity` over the probe's relay-persisted store) creates both as Topic
+// stubs via the production `upsert_topic_contact`, then calls `enumerate_next_pending`
+// step-by-step (the cadence is the loop's, not under test — no 30 s sleeps) until both are
+// classified, within a bounded step budget.
+//
+// Asserted:
+//   * each stub loads as `Pending` BEFORE the queue runs (the slice-A stamp is real);
+//   * P ends `Sealed` — the keyless arm fetches P's author-pinned kind-LISTING events and the
+//     throwaway zero key decrypts nothing, the genuine 🔒;
+//   * Q ends `Fetched` — an honest empty: Q authored no listing events at all;
+//   * neither is still `Pending`; and
+//   * every step's returned `(npub, status)` matches the persisted contact exactly.
+//
+// **P-10 mutation recipe (orchestrator):** in `enumerate_next_pending`
+// (crates/hb-app/src/enumeration_queue.rs:112), DELETE the line
+// `let npub = pick_next_pending(&contacts)?.npub.clone();` — the row must go RED (the loop
+// exhausts its step budget with both stubs still Pending, because the queue never returns
+// `Some(..)` again).
+// ---------------------------------------------------------------------------
+
+async fn u8_enumeration_queue_classifies(probe: &ProbeInput) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 1..=LONG_HAUL_RETRIES {
+        // Fresh publishers every attempt: a classified stub stays classified in the probe's
+        // persistent store, so a retry must be against NEW npubs, never a re-run of the same
+        // queue (whose stubs would no longer be Pending).
+        match u8_attempt(probe).await {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = e,
+        }
+        if attempt < LONG_HAUL_RETRIES {
+            settle().await;
+        }
+    }
+    Err(format!("U8 failed ×{LONG_HAUL_RETRIES} attempts: {last_err}"))
+}
+
+async fn u8_attempt(probe: &ProbeInput) -> Result<(), String> {
+    // (1) Publisher P: teaser + listing family, the exact production publish shapes U1/U2 use.
+    //     Publisher Q: connects nowhere, publishes nothing — the honest-empty subject.
+    let p = Identity::generate();
+    let key = bk(8);
+    let slug = "wan-u-u8";
+    let pc = connect(&p, &probe.relays).await.map_err(|e| format!("U8 P connect: {e}"))?;
+    pc.publish(
+        &build_teaser(&p, &teaser("U8Sealed", vec!["wan-u".into()]), true)
+            .map_err(|e| format!("U8 build_teaser: {e}"))?,
+    )
+    .await
+    .map_err(|e| format!("U8 teaser publish: {e}"))?;
+    publish_listing(&pc, &p, slug, &key, &listing(slug, 3), LISTING_MAX_BYTES)
+        .await
+        .map_err(|e| format!("U8 listing publish: {e}"))?;
+    pc.disconnect().await;
+    settle().await;
+
+    let q = Identity::generate();
+    let p_npub = p.npub();
+    let q_npub = q.npub();
+
+    // (2) Reader R: both publishers become Topic stubs via the PRODUCTION upsert path, and each
+    //     must load back as `Pending` before any resolve runs.
+    for (name, npub) in [("P", p_npub.as_str()), ("Q", q_npub.as_str())] {
+        upsert_topic_contact(&probe.store, npub).map_err(|e| format!("U8 upsert {name}: {e}"))?;
+        let loaded = probe
+            .store
+            .load_contact(&CachedPeer::pubkey_hash(npub))
+            .map_err(|e| format!("U8 load {name}: {e}"))?
+            .ok_or_else(|| format!("U8 stub {name} not persisted"))?;
+        if loaded.listings_state != ListingsStatus::Pending {
+            return Err(format!(
+                "U8 stub {name} must be Pending before the queue runs, got {:?}",
+                loaded.listings_state
+            ));
+        }
+    }
+    eprintln!("   U8 both stubs Pending (P + Q via upsert_topic_contact)");
+
+    // (3) The queue: one step per `enumerate_next_pending` call. R is a throwaway reader
+    //     identity in the production `SharedIdentity` slot; the step fn reads it per-iteration
+    //     exactly as the driver loop does.
+    let identity: SharedIdentity = Arc::new(RwLock::new(Some(AppIdentity::generate())));
+    let relay = shared_relay();
+    let mut classified: Vec<(String, ListingsStatus)> = Vec::new();
+    let mut steps = 0;
+    while classified.len() < 2 && steps < 8 {
+        steps += 1;
+        if let Some((npub, status)) = enumerate_next_pending(&probe.store, &identity, &relay).await {
+            // The step's verdict must MATCH the persisted record — the glue's whole point.
+            let stored = probe
+                .store
+                .load_contact(&CachedPeer::pubkey_hash(&npub))
+                .map_err(|e| format!("U8 load after step {steps}: {e}"))?
+                .ok_or_else(|| format!("U8 step {steps}: {npub} missing from the store"))?;
+            if stored.listings_state != status {
+                return Err(format!(
+                    "U8 step {steps}: returned {status:?} for {npub} but the store holds {:?}",
+                    stored.listings_state
+                ));
+            }
+            classified.push((npub, status));
+        }
+        // A `None` step (transient resolve error → deferred via mark_failed_retry) is allowed;
+        // the step budget absorbs it, and a persistent failure shows up as an unclassified stub.
+    }
+    if classified.len() < 2 {
+        let still = [
+            ("P", p_npub.as_str()),
+            ("Q", q_npub.as_str()),
+        ]
+        .into_iter()
+        .filter_map(|(name, npub)| {
+            probe
+                .store
+                .load_contact(&CachedPeer::pubkey_hash(npub))
+                .ok()
+                .flatten()
+                .map(|c| format!("{name}={:?} after {steps} steps", c.listings_state))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+        return Err(format!(
+            "U8 the queue classified {}/2 stubs in {steps} steps ({still})",
+            classified.len()
+        ));
+    }
+
+    // (4) Final classification: P is Sealed (listings exist, none decrypt keyless), Q is Fetched
+    //     (an honest empty). Neither may still be Pending.
+    for (name, npub, want) in
+        [("P", p_npub.as_str(), ListingsStatus::Sealed), ("Q", q_npub.as_str(), ListingsStatus::Fetched)]
+    {
+        let stored = probe
+            .store
+            .load_contact(&CachedPeer::pubkey_hash(npub))
+            .map_err(|e| format!("U8 final load {name}: {e}"))?
+            .ok_or_else(|| format!("U8 final: stub {name} missing"))?;
+        if stored.listings_state != want {
+            return Err(format!(
+                "U8 {name} must end {want:?}, got {:?}",
+                stored.listings_state
+            ));
+        }
+    }
+    eprintln!(
+        "   U8 OK: P=Sealed, Q=Fetched, neither Pending — queue classified both in {steps} steps"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// U9 — a failed resolve is DEFERRED, never hot-looped (QURATOR-332 slice C)
+//
+// Pins the Err arm of `enumerate_next_pending`'s glue, which the unit tests cannot reach: when
+// the resolve ERRORS (here `net::client` cannot connect to ANY relay, because the store's
+// configured set — honoured verbatim by `relay_urls` when non-empty — is a refused loopback
+// port), the step must return `None`, leave the contact `Pending` (nothing was classified), and
+// bump its `last_fetched` via `mark_failed_retry`, moving it to the BACK of the oldest-first
+// queue — one read per spacing tick, never a hot loop.
+//
+// Honest placement note: this row needs NO relay participation — the failure is a REAL
+// production dial refusal (`ws://127.0.0.1:1` refuses on loopback in milliseconds, Linux and
+// Windows alike), exercising the same production `RelayClient::connect` failure path as a
+// live-relay outage. It stays a WAN row (rather than a `#[tokio::test]` in
+// enumeration_queue.rs's unit module) because it pins live glue against a real socket failure,
+// not a stub, and the WAN harness is the only harness that reaches this crate-internal fn
+// (CLAUDE.md §5).
+//
+// The row back-dates the stub's `last_fetched` by an hour BEFORE the call (simulating an old
+// stub without sleeping — the queue only reads `last_fetched`, it does not interpret it), so the
+// "moved forward" assertion cannot flake on clock granularity: after the failed resolve the
+// stamp must sit near `now`, strictly hours past the back-dated value.
+//
+// **P-10 mutation recipe (orchestrator):** in the Err arm of `enumerate_next_pending`
+// (crates/hb-app/src/enumeration_queue.rs:120), DELETE `mark_failed_retry(&mut peer);` — the
+// row must go RED (the stored `last_fetched` still reads the back-dated stamp).
+// ---------------------------------------------------------------------------
+
+async fn u9_failed_resolve_defers(_probe: &ProbeInput) -> Result<(), String> {
+    // A throwaway store whose relay set is a refused loopback port. `relay_urls()` honours a
+    // non-empty configured set verbatim (net.rs), so `net::client` dials ONLY this and fails.
+    let dir = std::env::temp_dir().join(format!(
+        "hb-wan-u9-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let store = DataStore::new(dir.clone());
+    store
+        .save_settings(&Settings {
+            relay_urls: vec!["ws://127.0.0.1:1".to_string()],
+            ..Default::default()
+        })
+        .map_err(|e| format!("U9 save_settings: {e}"))?;
+
+    let stub_npub = Identity::generate().npub();
+    upsert_topic_contact(&store, &stub_npub).map_err(|e| format!("U9 upsert: {e}"))?;
+    let hash = CachedPeer::pubkey_hash(&stub_npub);
+    // Back-date the stub an hour: makes "last_fetched moved forward" strict and flake-free, and
+    // is exactly the state of a real stub that has been sitting unclassified.
+    let backdated = chrono::Utc::now() - chrono::Duration::hours(1);
+    let mut stub = store
+        .load_contact(&hash)
+        .map_err(|e| format!("U9 load stub: {e}"))?
+        .ok_or_else(|| "U9 stub missing after upsert".to_string())?;
+    stub.last_fetched = backdated;
+    store.save_contact(&hash, &stub).map_err(|e| format!("U9 back-date: {e}"))?;
+
+    let identity: SharedIdentity = Arc::new(RwLock::new(Some(AppIdentity::generate())));
+    let relay = shared_relay();
+    let outcome = enumerate_next_pending(&store, &identity, &relay).await;
+    if outcome.is_some() {
+        return Err(format!(
+            "U9 the step must return None when the resolve errors, got {outcome:?}"
+        ));
+    }
+
+    let after = store
+        .load_contact(&hash)
+        .map_err(|e| format!("U9 load after: {e}"))?
+        .ok_or_else(|| "U9 stub missing after the failed resolve".to_string())?;
+    if after.listings_state != ListingsStatus::Pending {
+        return Err(format!(
+            "U9 a failed resolve must leave the contact Pending, got {:?}",
+            after.listings_state
+        ));
+    }
+    if after.last_fetched <= backdated {
+        return Err(format!(
+            "U9 the failed resolve must move last_fetched forward (mark_failed_retry), got {:?} <= back-dated {:?}",
+            after.last_fetched, backdated
+        ));
+    }
+    eprintln!(
+        "   U9 OK: resolve errored → step returned None, contact still Pending, last_fetched deferred to the back of the queue"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
 
