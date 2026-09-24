@@ -140,13 +140,19 @@ jobs:
       # uploaded unsigned; the post-build step below signs the updater artifacts
       # with the integrity-pinned CLI — the shape QURATOR-107 established for the
       # portable exe.
+      #
+      # ⚠ The unsigned build MUST also turn off createUpdaterArtifacts: with it on and
+      # the pubkey in tauri.conf.json, `tauri build` refuses to run without the private
+      # key ("A public key has been found, but no private key") — which is how v0.22.0's
+      # first release run failed on both legs. The overlay only affects this build; the
+      # step below signs the very same installers the updater downloads.
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           releaseId: ${{ needs.create-release.outputs.release-id }}
           projectPath: crates/hb-app
-          args: ${{ matrix.args }}
+          args: ${{ matrix.args }} --config ${{ github.workspace }}/crates/hb-app/tauri.unsigned-build.conf.json
 
       - name: Sign + publish the bundle updater artifacts (post-build)
         shell: bash
