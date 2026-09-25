@@ -224,16 +224,25 @@ describe('paywallTeaser (M16 W3 — resolves to full tree when upgraded)', () =>
 		expect(paywallTeaser(col)).toEqual({ shown: 2, hidden: 99_998, total: 100_000, oversized: true });
 	});
 
-	// mutation: revert `oversized: col.oversized === true` to `oversized: false` in
-	// `paywallTeaser` (browse-view.ts) and the assertion above fails on the `oversized` field while
-	// the truncated case above stays green.
+	// The live regression (FD5, 2026-09-25): the BFS preview of a 150,001-file tree still needed
+	// trimming, so `truncate_listing` stamped `total_items` = the PREVIEW's node count (416) over the
+	// owner's lower bound. The bound rides in `item_count`; the teaser must print that.
+	// mutation: in `paywallTeaser` (browse-view.ts), change `Math.max(col.item_count ?? 0,` to
+	// `Math.max(0,` → this reds (it prints 416+, the preview's size, as the collection's).
+	it('an oversized teaser prints the item_count lower bound, never the preview count', () => {
+		const col = { oversized: true, truncated: true, item_count: 150_001, total_items: 416, listing: [{ name: 'a' }] };
+		expect(paywallTeaser(col)?.total).toBe(150_001);
+	});
+
+	// mutation: in `paywallTeaser` (browse-view.ts), change `oversized: false }` (the truncated
+	// branch's return) to `oversized: true }` → this reds while the oversized cases stay green.
 	it('a plain truncated collection is NOT oversized', () => {
 		const col = { truncated: true, total_items: 100, listing: [{ name: 'a' }] };
 		expect(paywallTeaser(col)?.oversized).toBe(false);
 	});
 
-	// mutation: drop `&& !col?.oversized` from `paywallTeaser`'s guard in browse-view.ts and this
-	// returns null, failing the assertion.
+	// mutation: in `paywallTeaser` (browse-view.ts), delete the `if (col.oversized) { … }` block →
+	// this returns null (no `truncated`), failing the assertion.
 	it('an oversized collection with no `truncated` flag still gets a teaser', () => {
 		expect(paywallTeaser({ oversized: true, total_items: 50, listing: [{ name: 'a' }] })?.total).toBe(50);
 	});

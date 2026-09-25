@@ -169,6 +169,18 @@ async fn poll_dms_newest<T>(
 pub async fn run(tap: &mut Tap, role: &str, input: &CarryInput) {
     let phase = input.flag("--phase").unwrap_or("1").to_string();
     match role {
+        "a" if phase == "3" => {
+            tap.check(
+                "FA3: author publishes an OVERSIZED collection (past the estimate threshold)",
+                run_role_a_phase3(input).await,
+            );
+        }
+        "d" if phase == "3" => {
+            tap.check(
+                "FD5: the driver sees the oversized marker and NEVER asks for that full list",
+                run_role_d_phase3(input).await,
+            );
+        }
         "a" => {
             if phase == "1" {
                 tap.check(
@@ -515,3 +527,127 @@ fn held_fingerprint(input: &CarryInput, author_npub: &str) -> Result<String, Str
         .map(|k| k.fingerprint)
         .ok_or_else(|| format!("nothing cached for ({author_npub}, {FETCH_SLUG})"))
 }
+
+/// QURATOR-336 — the slug phase 3 publishes. Its own slug, so the oversized collection never
+/// collides with phase 1/2's `wan-fetch` cache entry.
+const OVERSIZED_SLUG: &str = "wan-fetch-huge";
+
+/// FA3 — publish an oversized collection through the production scan + publish path. The seed is
+/// a flat tree of `--oversized-files` empty files (default 150,001 — one past the threshold);
+/// only the entry COUNT matters, and the estimator stops at the threshold so the scan is quick.
+/// ⚠ `--seed-dir` is scanned and published as a PUBLIC teaser: point it at a scratch directory.
+async fn run_role_a_phase3(input: &CarryInput) -> Result<(), String> {
+    let seed_dir = input
+        .flag("--seed-dir")
+        .ok_or_else(|| "role a phase 3 requires --seed-dir <dir>".to_string())?
+        .to_string();
+    let files: usize = input
+        .flag("--oversized-files")
+        .map(|v| v.parse().map_err(|_| format!("--oversized-files {v} is not a number")))
+        .transpose()?
+        .unwrap_or(crate::commands::collection::OVERSIZED_ITEM_THRESHOLD as usize + 1);
+    let existing = std::fs::read_dir(&seed_dir).map(|d| d.count()).unwrap_or(0);
+    if existing < files {
+        eprintln!("   FA3 generating {files} seed files in {seed_dir} (first run only)…");
+        super::generate_seed_tree(std::path::Path::new(&seed_dir), files, 0)
+            .map_err(|e| format!("generate seed tree: {e:#}"))?;
+    }
+    let started = std::time::Instant::now();
+    super::seed_collection(
+        &input.store,
+        &input.app_id.identity,
+        &input.app_id.browse_key,
+        &seed_dir,
+        OVERSIZED_SLUG,
+    )
+    .map_err(|e| format!("seed collection: {e:#}"))?;
+    let draft = input
+        .store
+        .load_collection_draft(OVERSIZED_SLUG)
+        .map_err(|e| e.to_string())?
+        .ok_or("the seed wrote no draft")?;
+    if draft.item_count <= crate::commands::collection::OVERSIZED_ITEM_THRESHOLD {
+        return Err(format!(
+            "the seed scanned as {} items — not past the {} threshold, so this row proves nothing",
+            draft.item_count,
+            crate::commands::collection::OVERSIZED_ITEM_THRESHOLD
+        ));
+    }
+    eprintln!(
+        "   FA3 scanned in {:.1}s: item_count={} (lower bound), preview entries={}",
+        started.elapsed().as_secs_f64(),
+        draft.item_count,
+        crate::commands::collection::count_items(&draft.listing)
+    );
+    super::publish_teaser_for(&input.store, &input.app_id.identity, &input.app_id.browse_key, OVERSIZED_SLUG)
+        .await
+        .map_err(|e| format!("publish oversized teaser: {e:#}"))?;
+    eprintln!("   FA3 published '{OVERSIZED_SLUG}' — keep this process running while D phase 3 polls");
+    serve_asks(input, "FA3").await
+}
+
+/// FD5 — the §5 integration half of QURATOR-336's peer side. D resolves A's REAL published listing
+/// over the relay and must (1) read the marker, and (2) never ask for that collection — through
+/// the production `poll_once` with the discovery tier ON, the path that would otherwise ask for a
+/// collection this node has never held.
+async fn run_role_d_phase3(input: &CarryInput) -> Result<(), String> {
+    let author_npub = input
+        .flag("--author-npub")
+        .ok_or_else(|| "role d phase 3 requires --author-npub <A npub>".to_string())?
+        .to_string();
+    let author_share_code = input
+        .flag("--author-share-code")
+        .ok_or_else(|| "role d phase 3 requires --author-share-code <hbk…>".to_string())?
+        .to_string();
+    save_peer_contact(input, &author_npub, &author_share_code)?;
+
+    // (1) The marker survives the real publish → relay → browse round trip.
+    let share = hb_core::ShareCode::parse(&author_share_code)
+        .map_err(|e| format!("--author-share-code is not a share code: {e}"))?;
+    let shared_relay = crate::net::new_shared();
+    let peer = crate::commands::browse::resolve_peer(&share, &input.app_id.identity, &input.store, &shared_relay)
+        .await
+        .map_err(|e| format!("resolve A's listing: {e}"))?;
+    let huge = peer
+        .collections
+        .iter()
+        .find(|c| c.collection.slug == OVERSIZED_SLUG)
+        .ok_or_else(|| format!("A's listing has no '{OVERSIZED_SLUG}' — run A phase 3 first"))?;
+    if huge.oversized != Some(true) {
+        return Err(format!("the browsed collection's marker is {:?}, not Some(true)", huge.oversized));
+    }
+    eprintln!(
+        "   FD5 browsed '{OVERSIZED_SLUG}': oversized=true, total_items={:?}, preview entries={}",
+        huge.total_items,
+        crate::commands::collection::count_items(&huge.collection.listing)
+    );
+
+    // (2) The driver never asks for it. Discovery ON: a never-held collection is exactly what that
+    // tier asks for, so this is the tier the marker must stop.
+    let mut settings = input.store.load_settings().map_err(|e| e.to_string())?.unwrap_or_default();
+    settings.swarm_caching = true;
+    input.store.save_settings(&settings).map_err(|e| e.to_string())?;
+    let live = input.live_identity();
+    let endpoint = crate::transport_state::new_shared_endpoint();
+    let mut states: HashMap<(String, String), AskState> = HashMap::new();
+    for attempt in 1..=FD5_POLLS {
+        let outcome = poll_once(&input.store, &live, &shared_relay, &endpoint, &mut states, None).await;
+        eprintln!("   FD5 poll {attempt}: asked={:?} discovered={:?}", outcome.asked, outcome.discovered);
+        let key = format!("{author_npub}|{OVERSIZED_SLUG}");
+        if outcome.discovered.iter().any(|d| d == &key)
+            || outcome.stale.iter().any(|s| s.slug == OVERSIZED_SLUG)
+        {
+            return Err(format!("poll {attempt} asked for the oversized collection '{OVERSIZED_SLUG}'"));
+        }
+        tokio::time::sleep(POLL_SETTLE).await;
+    }
+    let asks = input.store.load_manifest_asks().map_err(|e| e.to_string())?;
+    if asks.keys().any(|k| k.ends_with(&format!("|{OVERSIZED_SLUG}"))) {
+        return Err("an ask for the oversized collection was recorded".to_string());
+    }
+    eprintln!("   FD5 {FD5_POLLS} polls, discovery on: the oversized collection was never asked for");
+    Ok(())
+}
+
+/// FD5: polls given the driver to (wrongly) ask. Two is enough — discovery asks on the FIRST poll.
+const FD5_POLLS: usize = 2;

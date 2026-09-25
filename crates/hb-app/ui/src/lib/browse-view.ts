@@ -142,12 +142,21 @@ export function countListingItems(items: readonly unknown[]): number {
  * `oversized` collection is a preview whether or not the backend also set `truncated`.
  */
 export function paywallTeaser(
-	col: { truncated?: boolean; oversized?: boolean; total_items?: number; listing?: readonly unknown[] } | null | undefined,
+	col: { truncated?: boolean; oversized?: boolean; total_items?: number; item_count?: number; listing?: readonly unknown[] } | null | undefined,
 ): { shown: number; hidden: number; total: number; oversized: boolean } | null {
-	if ((!col?.truncated && !col?.oversized) || !col.total_items) return null;
+	if (!col) return null;
 	const shown = countListingItems(col.listing ?? []);
+	// QURATOR-336 — an oversized collection's lower bound is `item_count` (the owner's estimator
+	// stopped there). NOT `total_items`: when the BFS preview still needs trimming, `truncate_listing`
+	// overwrites that with the PREVIEW's own node count (observed live, 2026-09-25: 416 for a
+	// 150,001-file tree) — a figure that would read as the collection's size.
+	if (col.oversized) {
+		const total = Math.max(col.item_count ?? 0, col.total_items ?? 0, shown);
+		return total > 0 ? { shown, hidden: Math.max(0, total - shown), total, oversized: true } : null;
+	}
+	if (!col.truncated || !col.total_items) return null;
 	const hidden = Math.max(0, col.total_items - shown);
-	return hidden > 0 ? { shown, hidden, total: col.total_items, oversized: col.oversized === true } : null;
+	return hidden > 0 ? { shown, hidden, total: col.total_items, oversized: false } : null;
 }
 
 /** M16 W4 — the "Full manifest imported · <date>" tag shown once the user has imported the full-listing

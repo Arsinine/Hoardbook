@@ -47,7 +47,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Result};
 use nostr::prelude::*;
 
-use crate::commands::collection::{build_slug_manifest, count_items, is_valid_slug, scan_selective};
+use crate::commands::collection::{build_slug_manifest, count_items, is_valid_slug};
 use crate::identity_state::AppIdentity;
 use crate::commands::fulfil::send_full_list_inner;
 use hb_core::ticket::TransportTicket;
@@ -693,9 +693,14 @@ fn seed_collection(
         .collect();
     let include = crate::commands::collection::IncludeSet::new(top_level_dirs);
     let globs = globset::GlobSet::empty();
-    let (listing, total_bytes) = scan_selective(root, &include, &globs)
+    // QURATOR-336: the SIZED scan — the production add path's entry point — so a seed past the
+    // oversized threshold takes the same estimate + BFS-preview path a real 40M-file tree does, and
+    // its `item_count` is the same lower bound that marks it oversized.
+    let scanned = crate::commands::collection::scan_selective_sized(root, &include, &globs)
         .map_err(|e| anyhow!("scan {seed_dir}: {e}"))?;
-    let item_count = count_items(&listing);
+    let oversized = scanned.oversized;
+    let (listing, total_bytes) = (scanned.items, scanned.total_bytes);
+    let item_count = oversized.unwrap_or_else(|| count_items(&listing));
     // est_size is display-only metadata; format_size is a private helper, so compute a plain bytes
     // string here rather than widening the helper's visibility for a cosmetic field.
     let est_size = if total_bytes > 0 { Some(format!("{total_bytes} bytes")) } else { None };
@@ -722,6 +727,14 @@ fn seed_collection(
     // Timed (QURATOR-333): this is a COLD build + seal, the cost the serve used to pay on every
     // accepted connection before the status byte. A large-collection run only means something when
     // this exceeds the asker's 30 s handshake deadline, so the operator needs to see it.
+    // QURATOR-336: an oversized seed has NO full manifest by design — `build_slug_manifest` refuses
+    // it, which is the behaviour under test, not a seeding failure. Report and stop here.
+    if oversized.is_some() {
+        eprintln!(
+            "[serve] seeded '{slug}': oversized ({item_count}+ items, lower bound) — no full manifest by design"
+        );
+        return Ok(());
+    }
     let started = std::time::Instant::now();
     let envelope = build_slug_manifest(slug, store, identity, browse_key.bytes())
         .map_err(|e| anyhow!("build manifest for '{slug}': {e}"))?;

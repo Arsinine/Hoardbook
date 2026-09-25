@@ -1828,9 +1828,10 @@ pub(crate) struct SelectiveScan {
 /// is built instead. If it is not (the count came back at or under the threshold), the rest of this
 /// function is today's path byte for byte, including the [`MAX_COLLECTION_ITEMS`] refusal.
 ///
-/// Signature-preserving wrapper over [`scan_selective_sized`] for the callers that do not consume
-/// the oversized bit (the watcher's test, the WAN harness's seed). Production callers use the
-/// sized form.
+/// Signature-preserving wrapper over [`scan_selective_sized`] for the tests that do not consume the
+/// oversized bit. Every production caller (add, rescan, the WAN harness's seed) uses the sized form,
+/// so this is test-only: a production caller here would silently drop the oversized bit.
+#[cfg(test)]
 pub(crate) fn scan_selective(
     root: &Path,
     include: &IncludeSet,
