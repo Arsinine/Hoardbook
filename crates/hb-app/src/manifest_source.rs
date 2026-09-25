@@ -17,6 +17,8 @@
 //! implementation could not answer with a collection file even if a future edit tried to — INV-4′
 //! mechanism 1 reaching one layer up from the newtype into the seam.
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -34,6 +36,163 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// QURATOR-333 — the owner path's shared sealed-payload cache
+// ---------------------------------------------------------------------------
+
+/// Why an owner-path payload could not be produced. The two arms are separate because the fulfil
+/// caller surfaces them differently: a build failure carries its own message, while a seal failure
+/// is the collection being over the transport ceiling — "too large to send", plus the export
+/// advice — and that distinction is existing behaviour, not a new one.
+#[derive(Debug)]
+pub(crate) enum OwnerPayloadError {
+    Build(String),
+    Seal(String),
+}
+
+impl std::fmt::Display for OwnerPayloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Build(m) | Self::Seal(m) => f.write_str(m),
+        }
+    }
+}
+
+/// `(len, mtime secs, mtime nanos)`, or `None` when the file is not there. `None` is a marker
+/// value in its own right: "no `settings.json` at all" and "a `settings.json` naming a big relay"
+/// must not compare equal, because the two make `build_slug_manifest` stamp different digests.
+type FileStamp = Option<(u64, u64, u32)>;
+
+/// What makes a sealed payload stale — the inputs the signed digest depends on. See
+/// [`change_marker`].
+type ChangeMarker = (FileStamp, FileStamp);
+
+/// The cache key: the data directory and owner identity the payload was authored for, plus the
+/// slug. `DataStore` is handed around as clones of one instance, so the directory is the identity
+/// they share; the identity is in the key so a restored directory serving a different npub cannot
+/// read the previous owner's entry.
+type CacheKey = (std::path::PathBuf, nostr::PublicKey, String);
+
+/// One cached sealed payload, the browse-key digest it was sealed under, and the marker it was
+/// built at.
+struct CachedSealed {
+    /// A digest of the browse key — **not the key**. The envelope is encrypted under the session's
+    /// browse key, so a browse key that changed while the draft stood still would otherwise serve
+    /// bytes the asker's freshly-fetched teaser cannot open. Hashing keeps that comparison honest
+    /// without parking a second copy of INV-2's key material in a process-lifetime static.
+    browse_key: [u8; 32],
+    marker: ChangeMarker,
+    payload: Arc<ManifestPayload>,
+}
+
+/// **Module scope on purpose.** `StoreManifestSource` is built per fulfil and the endpoint keeps
+/// the FIRST source it was bound with, so a cache living on the source instance would never be
+/// read by a later fulfil — and the whole point here is that the fulfil's build is the one the
+/// serve reuses. §9: a per-function static is never shared across callers; these two callers are
+/// not even in one function (or one module).
+static SEALED_OWNER_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<CacheKey, CachedSealed>>> =
+    std::sync::OnceLock::new();
+
+fn sealed_owner_cache() -> &'static std::sync::Mutex<HashMap<CacheKey, CachedSealed>> {
+    SEALED_OWNER_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// `(len, mtime)` of one file, or `None` if it is absent or its mtime is unreadable.
+fn file_stamp(path: &Path) -> FileStamp {
+    let meta = std::fs::metadata(path).ok()?;
+    let since_epoch = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some((meta.len(), since_epoch.as_secs(), since_epoch.subsec_nanos()))
+}
+
+/// The change marker for `(store, slug)`: `(len, mtime)` of the two files whose content
+/// `build_slug_manifest` stamps into the signed digest — the draft itself, and `settings.json`,
+/// whose `big_relay_url` rides into the listing meta before truncation (QURATOR-205).
+///
+/// **A stat, not a fingerprint, and that is the deliberate trade.** Rebuilding the digest would
+/// cost the very thing this cache exists to avoid. What it buys back is owner ruling ②: an edited
+/// draft moves the marker and the payload is **rebuilt**, so a serve still delivers the collection
+/// as it is NOW rather than as it was when somebody last asked.
+///
+/// ⚠ Retained residual, stated so it is not mistaken for a proof: a rewrite that leaves the file
+/// the SAME LENGTH and lands inside one mtime tick is invisible here. `<slug>.draft.json` is a
+/// whole-file rewrite whose length moves whenever the scan adds or drops a single entry, and
+/// mtime carries nanoseconds on the filesystems this runs on, so the window is a same-length edit
+/// inside one tick — it would serve the previous envelope until the next edit moved the marker.
+fn change_marker(store: &DataStore, slug: &str) -> ChangeMarker {
+    (
+        file_stamp(&store.collection_draft_path(slug)),
+        file_stamp(&store.settings_path()),
+    )
+}
+
+/// The cache's view of which browse key a payload belongs to.
+fn browse_key_digest(browse_key: &[u8; 32]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(browse_key).into()
+}
+
+/// The cached payload for this key, **only** if it was built at this exact marker and under this
+/// exact browse key. The lock is taken for the lookup and released before the caller does anything
+/// else — a ~50 s build must never run under it.
+fn cache_get(
+    key: &CacheKey,
+    browse_key: [u8; 32],
+    marker: ChangeMarker,
+) -> Option<Arc<ManifestPayload>> {
+    let guard = sealed_owner_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = guard.get(key)?;
+    (entry.browse_key == browse_key && entry.marker == marker).then(|| entry.payload.clone())
+}
+
+/// Insert (or replace) this slug's entry. One entry per key — newest wins — so the cache is
+/// bounded by the number of slugs the node owns rather than by how often they are asked for.
+fn cache_put(key: CacheKey, entry: CachedSealed) {
+    let mut guard = sealed_owner_cache().lock().unwrap_or_else(|e| e.into_inner());
+    guard.insert(key, entry);
+}
+
+/// **The owner path's ONE build sequence**: the cached sealed payload on a marker hit, otherwise
+/// `build_slug_manifest` + `ManifestPayload::seal`, cached and returned.
+///
+/// Both the fulfil/ask path (`commands::fulfil::send_full_list_inner`, which used to build this and
+/// throw the result away) and the serve path (`StoreManifestSource::payload`) resolve through here.
+/// Two copies of the sequence is the drift pair §9 warns about; there is one, and the bytes warmed
+/// at ask time are the bytes served.
+///
+/// **Why this exists at all** (QURATOR-333): the build is ~50 s for a 71,547-item collection
+/// (11.2 MB sealed) and the asker abandons a serve that has not written its status byte within
+/// `HANDSHAKE_DEADLINE` (30 s). A serve that builds on every ask therefore never completes, and the
+/// retry hits the same wall — deterministic, not a flake.
+///
+/// **Costly by design.** Callers MUST run it on `spawn_blocking`; called directly it occupies a
+/// runtime worker for the length of the build.
+pub(crate) fn sealed_owner_payload(
+    slug: &str,
+    store: &DataStore,
+    identity: &Identity,
+    browse_key: &[u8; 32],
+) -> Result<Arc<ManifestPayload>, OwnerPayloadError> {
+    let key: CacheKey = (store.base_dir().to_path_buf(), identity.public_key(), slug.to_string());
+    let key_digest = browse_key_digest(browse_key);
+    let marker = change_marker(store, slug);
+    if let Some(hit) = cache_get(&key, key_digest, marker) {
+        return Ok(hit);
+    }
+
+    // The miss path. Deliberately outside the lock: two concurrent misses both build (the second
+    // insert wins), which is exactly today's behaviour rather than a new serialisation point.
+    let envelope = build_slug_manifest(slug, store, identity, browse_key)
+        .map_err(OwnerPayloadError::Build)?;
+    let payload = Arc::new(
+        ManifestPayload::seal(&envelope).map_err(|e| OwnerPayloadError::Seal(e.to_string()))?,
+    );
+    cache_put(
+        key,
+        CachedSealed { browse_key: key_digest, marker, payload: payload.clone() },
+    );
+    Ok(payload)
 }
 
 // `contact_standing(store, npub) -> ContactStanding` (strictest-wins: blocked → declined →
@@ -129,15 +288,14 @@ impl ManifestSource for StoreManifestSource {
         }
 
         // The owner-issued path, byte-for-byte what it always did: rebuild from the collection as
-        // it is NOW (owner ruling ②).
-        let envelope = build_slug_manifest(
-            &ticket.slug,
-            &self.store,
-            &self.identity,
-            self.browse_key.bytes(),
-        )
-        .map_err(|e| anyhow!("{e}"))?;
-        ManifestPayload::seal(&envelope).map_err(|e| anyhow!("{e}"))
+        // it is NOW (owner ruling ②) — resolved through the shared cache, so the build the
+        // fulfil/ask path already paid for is the one this serve reuses instead of paying ~50 s
+        // for it a second time (QURATOR-333). On a marker miss the build happens HERE, so the
+        // caller must have this on the blocking pool (serve_manifest_stream does).
+        let sealed =
+            sealed_owner_payload(&ticket.slug, &self.store, &self.identity, self.browse_key.bytes())
+                .map_err(|e| anyhow!("{e}"))?;
+        Ok(sealed.as_ref().clone())
     }
 
 }
@@ -779,6 +937,213 @@ mod tests {
         assert!(
             err.contains("failed verification"),
             "a cached envelope with a broken signature must be refused, got: {err}"
+        );
+    }
+
+    // -- QURATOR-333: the owner path's sealed-payload cache -----------------------------------
+
+    /// A minimal public draft with `entries` listing items, so a rebuild is observable in the
+    /// envelope's own plaintext rather than only in the marker.
+    fn a_draft(slug: &str, entries: u64) -> Collection {
+        Collection {
+            slug: slug.into(),
+            path_alias: slug.into(),
+            description: None,
+            item_count: entries,
+            est_size: None,
+            content_types: vec!["video".into()],
+            tags: vec![],
+            languages: vec![],
+            visibility: Visibility::Public,
+            sorted: false,
+            last_updated: chrono::Utc::now(),
+            listing: (0..entries)
+                .map(|i| DirectoryItem {
+                    name: format!("item-{i}"),
+                    item_type: ItemType::File,
+                    size: None,
+                    format: None,
+                    year: None,
+                    tags: vec![],
+                    note: None,
+                    children: vec![],
+                })
+                .collect(),
+        }
+    }
+
+    /// An owner-issued ticket — `author_npub: None`, the ordinary serve.
+    fn an_owner_ticket(slug: &str) -> TransportTicket {
+        TransportTicket::issue("req-owner", slug, "addr", 1_700_000_000, None)
+    }
+
+    /// The envelope's decrypted parts, through the production open path. Used to assert WHAT was
+    /// served rather than merely that something was.
+    fn served_parts(
+        payload: &ManifestPayload,
+        browse_key: &[u8; 32],
+        identity: &Identity,
+    ) -> Vec<String> {
+        let json = std::str::from_utf8(payload.as_bytes()).expect("a payload is UTF-8 JSON");
+        hb_core::manifest::ManifestEnvelope::from_json(json)
+            .unwrap()
+            .open(browse_key, &identity.public_key())
+            .unwrap()
+    }
+
+    /// **QURATOR-333 — a warm owner payload must not be rebuilt.**
+    ///
+    /// This is the defect the ticket is about: `build_slug_manifest` + `ManifestPayload::seal` cost
+    /// ~50 s on a 71,547-item collection, the asker gives up at 30 s, and both the fulfil and the
+    /// serve path paid that cost separately — so the collection could never be fetched at all.
+    ///
+    /// `Arc::ptr_eq` is the assertion because it is the only one a rebuild cannot satisfy:
+    /// identical bytes can come out of a second build too (the marker is a stat, so a rebuild of an
+    /// unchanged draft is byte-identical), which is precisely the behaviour being removed.
+    ///
+    /// MUTATION (P-10, orchestrator applies and must see this red): in `sealed_owner_payload`
+    /// (crates/hb-app/src/manifest_source.rs), make the cache never hit — change
+    /// `if let Some(hit) = cache_get(&key, key_digest, marker) {` to
+    /// `if let Some(hit) = (false).then(|| cache_get(&key, key_digest, marker)).flatten() {`
+    /// (or simply delete the early `return Ok(hit);` and the `if let` block). The second call then
+    /// builds a second payload and `Arc::ptr_eq` fails.
+    #[test]
+    fn a_warm_owner_payload_is_served_without_rebuilding() {
+        let (_dir, store) = store();
+        let identity = Identity::generate();
+        let key = [7u8; 32];
+        store.save_collection_draft(&a_draft("vault", 3)).unwrap();
+
+        let first = sealed_owner_payload("vault", &store, &identity, &key).unwrap();
+        let second = sealed_owner_payload("vault", &store, &identity, &key).unwrap();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a second resolution of an unchanged collection must reuse the sealed payload, not rebuild it"
+        );
+    }
+
+    /// **QURATOR-333 — a changed draft invalidates, and the NEW collection is what gets served.**
+    ///
+    /// Owner ruling ② ("serve the collection as it is NOW") is the constraint the cache must not
+    /// quietly break: the marker is a stat, and this is the test that the stat is actually read.
+    /// The second half matters as much as the first — a rebuild that served the OLD bytes would
+    /// pass a pointer check and fail the user.
+    ///
+    /// MUTATION (P-10, orchestrator applies and must see this red): in `change_marker`
+    /// (crates/hb-app/src/manifest_source.rs), drop the draft from the marker — change
+    /// `(file_stamp(&store.collection_draft_path(slug)), file_stamp(&store.settings_path()))` to
+    /// `(None, file_stamp(&store.settings_path()))`. The edited draft then matches the cached
+    /// entry, the old payload is returned, and BOTH assertions below red.
+    #[test]
+    fn a_changed_draft_invalidates_the_cached_payload_and_serves_the_new_collection() {
+        let (_dir, store) = store();
+        let identity = Identity::generate();
+        let key = [7u8; 32];
+        store.save_collection_draft(&a_draft("vault", 3)).unwrap();
+        let before = sealed_owner_payload("vault", &store, &identity, &key).unwrap();
+
+        // The user rescans and the collection gains an entry. The file is a whole-file rewrite, so
+        // it changes length as well as mtime — the marker moves for both reasons.
+        store.save_collection_draft(&a_draft("vault", 4)).unwrap();
+        let after = sealed_owner_payload("vault", &store, &identity, &key).unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "an edited draft must invalidate the cached payload"
+        );
+        let parts = served_parts(&after, &key, &identity).join("");
+        assert!(
+            parts.contains("item-3"),
+            "the rebuilt manifest must be the collection as it is NOW — the new entry is missing: {parts}"
+        );
+        let old_parts = served_parts(&before, &key, &identity).join("");
+        assert!(
+            !old_parts.contains("item-3"),
+            "the pre-edit payload must not have contained the new entry (otherwise this test proves nothing)"
+        );
+    }
+
+    /// The same draft, with its last listing entry renamed to a SAME-LENGTH different name — the
+    /// exact shape the marker's documented residual cannot see (same file length, same mtime tick).
+    ///
+    /// Cloned from the draft already saved rather than rebuilt, so `last_updated` and everything
+    /// else are byte-identical between the two and the length equality the caller asserts holds by
+    /// construction instead of by luck.
+    fn a_renamed_draft(from: &Collection) -> Collection {
+        let mut draft = from.clone();
+        let last = draft.listing.len() - 1;
+        // "item-N" and "ITEM-X" are both six bytes, so the file's length is unchanged.
+        draft.listing[last].name = "ITEM-X".into();
+        draft
+    }
+
+    /// **QURATOR-333 — the SERVE path shares that cache; it does not build its own.**
+    ///
+    /// The cache is worth nothing unless `StoreManifestSource::payload` — the seam the transport
+    /// actually calls — reads it, and the way to show that without a test-only counter is to make
+    /// a rebuild *observable*: warm the cache, then rewrite the draft to a same-length name and put
+    /// the mtime back, so the marker still matches while the content differs. A serve that reads the
+    /// cache then delivers the OLD listing; a serve that rebuilds delivers `ITEM-X`.
+    ///
+    /// That input is the documented residual of a stat-based marker, driven deliberately: this test
+    /// pins the residual as well as the sharing, and the precondition assertions below say so out
+    /// loud rather than letting an mtime that failed to move red the test for the wrong reason.
+    ///
+    /// MUTATION (P-10, orchestrator applies and must see this red): in
+    /// `StoreManifestSource::payload` (crates/hb-app/src/manifest_source.rs), replace the
+    /// `sealed_owner_payload(...)` call with the pre-QURATOR-333 inline pair —
+    /// `let envelope = build_slug_manifest(&ticket.slug, &self.store, &self.identity,
+    /// self.browse_key.bytes()).map_err(|e| anyhow!("{e}"))?;
+    /// Ok(ManifestPayload::seal(&envelope).map_err(|e| anyhow!("{e}"))?)` — the serve rebuilds,
+    /// serves `ITEM-X`, and `parts.contains("item-2")` fails.
+    #[test]
+    fn the_serve_path_serves_the_payload_the_builder_cached() {
+        let (_dir, store) = store();
+        let identity = Identity::generate();
+        let key = [7u8; 32];
+        let draft = a_draft("vault", 3);
+        store.save_collection_draft(&draft).unwrap();
+        let source =
+            StoreManifestSource::new(store.clone(), identity.clone(), SessionBrowseKey::new(key));
+
+        // Warm exactly as `send_full_list_inner` does.
+        let warmed = sealed_owner_payload("vault", &store, &identity, &key).unwrap();
+        let draft_path = store.collection_draft_path("vault");
+        let before = std::fs::metadata(&draft_path).unwrap();
+        let mtime = before.modified().unwrap();
+
+        store.save_collection_draft(&a_renamed_draft(&draft)).unwrap();
+        let renamed = std::fs::metadata(&draft_path).unwrap();
+        assert_eq!(
+            renamed.len(),
+            before.len(),
+            "the fixture must not change the draft's length, or the marker moves for a reason this \
+             test is not about"
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(&draft_path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&draft_path).unwrap().modified().unwrap(),
+            mtime,
+            "the fixture must put the mtime back — otherwise this test is a different one"
+        );
+
+        let served = source.payload(&an_owner_ticket("vault")).unwrap();
+        assert_eq!(served.declared_slug().unwrap(), "vault");
+        let parts = served_parts(&served, &key, &identity).join("");
+        assert!(
+            parts.contains("item-2") && !parts.contains("ITEM-X"),
+            "the serve must deliver the payload the builder cached, not rebuild one: {parts}"
+        );
+        assert_eq!(
+            warmed.as_bytes(),
+            served.as_bytes(),
+            "and it must be that same payload, not another build of the same draft"
         );
     }
 }

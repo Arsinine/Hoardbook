@@ -17,11 +17,10 @@
 
 use std::sync::Arc;
 
-use hb_core::{ManifestPayload, TransportTicket};
+use hb_core::TransportTicket;
 use tauri::{Emitter, State};
 
 use crate::commands::browse::accept_manifest_bytes;
-use crate::commands::collection::build_slug_manifest;
 use crate::error::CmdResult;
 use crate::identity_state::SharedIdentity;
 use crate::manifest_source::StoreManifestSource;
@@ -130,12 +129,36 @@ pub(crate) async fn send_full_list_inner(
     );
 
     // (1) Prove the manifest exists and fits, before anything is promised. `seal` is the ceiling.
-    let envelope = build_slug_manifest(&slug, store, &id_clone, browse_key.bytes())?;
-    let sealed = ManifestPayload::seal(&envelope).map_err(|e| {
-        format!(
-            "This collection's full list is too large to send over the connection ({e}). \
-             Export it instead: Home → ⋯ → Export, then hand the file over."
+    //
+    // **QURATOR-333 — this build IS the warming step for the serve that follows.** It used to build
+    // and then throw the result away, so the serve path paid the same ~50 s again — and the asker
+    // abandons a serve that has not seen a status byte within `HANDSHAKE_DEADLINE` (30 s), which is
+    // what made a large collection unfetchable in the first place. `sealed_owner_payload` is the ONE
+    // build sequence both paths call, so the bytes warmed here are the bytes served, and an edited
+    // draft still moves the marker and rebuilds (owner ruling ②, "as it is NOW").
+    //
+    // On the blocking pool: for a large collection this is the better part of a minute of blocking
+    // work, and holding a runtime worker for it stalls every other task on that worker. The owned
+    // clones are what a `spawn_blocking` task needs to outlive this scope.
+    let (store_for_build, identity_for_build, key_for_build) =
+        (store.clone(), id_clone.clone(), browse_key.clone());
+    let slug_for_build = slug.clone();
+    let sealed = tokio::task::spawn_blocking(move || {
+        crate::manifest_source::sealed_owner_payload(
+            &slug_for_build,
+            &store_for_build,
+            &identity_for_build,
+            key_for_build.bytes(),
         )
+    })
+    .await
+    .map_err(|e| format!("Building this collection's full list was interrupted ({e})."))?
+    .map_err(|e| match e {
+        crate::manifest_source::OwnerPayloadError::Build(m) => m,
+        crate::manifest_source::OwnerPayloadError::Seal(m) => format!(
+            "This collection's full list is too large to send over the connection ({m}). \
+             Export it instead: Home → ⋯ → Export, then hand the file over."
+        ),
     })?;
     tracing::debug!(
         recipient = %crate::logging::trunc_npub(&recipient_npub),

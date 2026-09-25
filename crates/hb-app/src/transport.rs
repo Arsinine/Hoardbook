@@ -398,7 +398,7 @@ async fn drain_refusal(conn: &iroh::endpoint::Connection) {
 pub(crate) async fn serve_manifest_stream(
     mut send: impl tokio::io::AsyncWrite + Unpin,
     mut recv: impl tokio::io::AsyncRead + Unpin,
-    source: &dyn ManifestSource,
+    source: Arc<dyn ManifestSource>,
 ) -> Result<Option<ManifestPayload>> {
     let frame = with_deadline(
         HANDSHAKE_DEADLINE,
@@ -424,7 +424,20 @@ pub(crate) async fn serve_manifest_stream(
         return Ok(None);
     }
 
-    let payload = match source.payload(&req.ticket) {
+    // **QURATOR-333 — the resolution runs on the BLOCKING pool, and that is load-bearing.**
+    // `ManifestSource::payload` is a sync trait fn, and the owner implementation seals the whole
+    // collection inside it (~50 s / 11.2 MB for a real large collection). Called directly it holds
+    // a runtime worker for the length of the build; the plane's own tests run on a current-thread
+    // runtime, where that is the ONLY worker and a concurrent serve cannot even be polled. Waiting
+    // on the join keeps this function's other awaits responsive — it does NOT shorten the wait
+    // before `STATUS_OK` on a cold cache, which stays bounded by the asker's own
+    // `HANDSHAKE_DEADLINE` (QURATOR-333 residual, see the ticket).
+    let resolve_source = source.clone();
+    let resolve_ticket = req.ticket.clone();
+    let resolved = tokio::task::spawn_blocking(move || resolve_source.payload(&resolve_ticket))
+        .await
+        .context("joining the payload-resolution task")?;
+    let payload = match resolved {
         Ok(p) => p,
         Err(e) => {
             // **QURATOR-242 — `REFUSAL_NO_MATCH`, same as the gate above.** The text used to embed
@@ -640,7 +653,7 @@ impl ManifestPlane {
         };
 
         let replayed = Framed::new(frame, recv);
-        let served = serve_manifest_stream(send, replayed, self.source.as_ref()).await;
+        let served = serve_manifest_stream(send, replayed, self.source.clone()).await;
 
         // **Which side closes, and why the drain is only on one path.**
         //
@@ -1228,6 +1241,94 @@ pub(crate) mod tests {
             }
             Ok(self.payload.clone())
         }
+    }
+
+    /// **QURATOR-333 — a slow payload resolution must not occupy the runtime worker.**
+    ///
+    /// `ManifestSource::payload` is a sync trait fn, and the owner implementation seals the whole
+    /// collection inside it (~50 s for a real large one). `serve_manifest_stream` therefore resolves
+    /// it through `tokio::task::spawn_blocking`; with that offload removed the resolution runs on
+    /// the caller's thread, and on the current-thread runtime these tests run on, a concurrent serve
+    /// cannot even be polled until the first build finishes.
+    ///
+    /// Two assertions on purpose. The thread id is the deterministic one (a timing bound alone would
+    /// be the weaker claim on a loaded machine); the elapsed bound is what ties the offload to the
+    /// property the ticket is about — concurrent serves must not queue behind each other.
+    ///
+    /// MUTATION (P-10, orchestrator applies and must see this red): in `serve_manifest_stream`
+    /// (crates/hb-app/src/transport.rs), replace the `tokio::task::spawn_blocking(...)` resolution
+    /// with a direct call — delete the two `resolve_*` bindings and the
+    /// `.await.context("joining the payload-resolution task")?`, leaving
+    /// `let resolved = source.payload(&req.ticket);` — and BOTH assertions below red.
+    struct SlowSource {
+        payload: ManifestPayload,
+        delay: std::time::Duration,
+        /// The thread ids `payload` was resolved on, one per call.
+        resolved_on: Mutex<Vec<std::thread::ThreadId>>,
+    }
+
+    impl SlowSource {
+        fn new(payload: ManifestPayload, delay: std::time::Duration) -> Arc<Self> {
+            Arc::new(Self { payload, delay, resolved_on: Mutex::new(Vec::new()) })
+        }
+    }
+
+    impl ManifestSource for SlowSource {
+        fn payload(&self, _ticket: &TransportTicket) -> Result<ManifestPayload> {
+            self.resolved_on.lock().unwrap().push(std::thread::current().id());
+            // A REAL blocking sleep, never `tokio::time::sleep`: an async yield would let the other
+            // tasks run, the test would pass with the offload removed, and the mutation would not
+            // red — which is what P-10 forbids.
+            std::thread::sleep(self.delay);
+            Ok(self.payload.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_payload_resolution_does_not_hold_the_runtime_worker() {
+        let ep = bind_local_endpoint(&rand::random(), vec![]).await;
+        let ticket = issue_ticket(&ep, "req-slow", "small", 1_700_000_000, Some("nonce-1")).unwrap();
+        let delay = std::time::Duration::from_millis(500);
+        let source = SlowSource::new(real_payload_for("small", 10), delay);
+        let req = FetchRequest { request_id: ticket.request_id.clone(), ticket: ticket.clone() };
+
+        let caller_thread = std::thread::current().id();
+        let started = std::time::Instant::now();
+        let mut serves = Vec::new();
+        for _ in 0..3 {
+            let mut frame = Vec::new();
+            write_framed(&mut frame, &serde_json::to_vec(&req).unwrap()).await.unwrap();
+            frame.push(STATUS_OK); // the acknowledgement that follows the manifest
+            let src: Arc<dyn ManifestSource> = source.clone();
+            serves.push(tokio::spawn(serve_manifest_stream(
+                tokio::io::sink(),
+                std::io::Cursor::new(frame),
+                src,
+            )));
+        }
+        for serve in serves {
+            let served = serve
+                .await
+                .expect("no serve task may panic")
+                .expect("a valid ticket on a healthy writer is served, not refused");
+            assert!(served.is_some(), "the payload is written and acknowledged");
+        }
+        let elapsed = started.elapsed();
+
+        let threads = source.resolved_on.lock().unwrap().clone();
+        assert_eq!(threads.len(), 3, "each serve resolves the payload exactly once");
+        assert!(
+            !threads.contains(&caller_thread),
+            "the payload resolution ran on the runtime's own thread — it must be offloaded to the \
+             blocking pool, or a ~50 s build stalls every other task on that worker"
+        );
+        assert!(
+            elapsed < delay * 2,
+            "three concurrent serves took {elapsed:?} against a {delay:?} resolution — they ran one \
+             after another, so the resolution is on the runtime worker"
+        );
+
+        ep.close().await;
     }
 
     // TestSource's `consumed`/`fail_receipt` rigs and the `Rendezvous` — DELETED 2026-09-03,
@@ -2035,7 +2136,7 @@ pub(crate) mod tests {
 
         // The reader yields a valid request; the writer fails on the very first payload byte — the
         // "peer vanished mid-manifest" shape, which a bounded write must treat as undelivered.
-        let err = serve_manifest_stream(FailingWriter, std::io::Cursor::new(frame), source.as_ref())
+        let err = serve_manifest_stream(FailingWriter, std::io::Cursor::new(frame), source.clone())
             .await
             .expect_err("a failed payload write must fail the redemption, never read as delivered");
         assert!(
@@ -2050,7 +2151,7 @@ pub(crate) mod tests {
         let served = serve_manifest_stream(
             tokio::io::sink(),
             std::io::Cursor::new(retry),
-            source.as_ref(),
+            source.clone(),
         )
         .await
         .expect("a healthy retry of the unspent ticket succeeds");
@@ -2317,7 +2418,7 @@ pub(crate) mod tests {
 
         let mut response = Vec::new();
         let served =
-            serve_manifest_stream(&mut response, std::io::Cursor::new(frame), source.as_ref())
+            serve_manifest_stream(&mut response, std::io::Cursor::new(frame), source.clone())
                 .await
                 .expect("a refusal is Ok(None), not an error — the transport call itself succeeds");
         assert!(served.is_none(), "a ticket redeemed under a different request id must not be served");
@@ -2374,7 +2475,7 @@ pub(crate) mod tests {
 
         let mut response = Vec::new();
         let served =
-            serve_manifest_stream(&mut response, std::io::Cursor::new(frame), source.as_ref())
+            serve_manifest_stream(&mut response, std::io::Cursor::new(frame), source.clone())
                 .await
                 .expect("a refusal is Ok(None), not an error");
         assert!(served.is_none(), "a structurally invalid ticket must not be served");
@@ -2416,7 +2517,7 @@ pub(crate) mod tests {
         let mut frame_a = Vec::new();
         write_framed(&mut frame_a, &serde_json::to_vec(&req_a).unwrap()).await.unwrap();
         let mut response_a = Vec::new();
-        serve_manifest_stream(&mut response_a, std::io::Cursor::new(frame_a), source_a.as_ref())
+        serve_manifest_stream(&mut response_a, std::io::Cursor::new(frame_a), source_a.clone())
             .await
             .unwrap();
 
@@ -2429,7 +2530,7 @@ pub(crate) mod tests {
         let mut frame_b = Vec::new();
         write_framed(&mut frame_b, &serde_json::to_vec(&req_b).unwrap()).await.unwrap();
         let mut response_b = Vec::new();
-        serve_manifest_stream(&mut response_b, std::io::Cursor::new(frame_b), source_b.as_ref())
+        serve_manifest_stream(&mut response_b, std::io::Cursor::new(frame_b), source_b.clone())
             .await
             .unwrap();
 
@@ -2488,7 +2589,7 @@ pub(crate) mod tests {
         write_framed(&mut frame_a, &serde_json::to_vec(&req_a).unwrap()).await.unwrap();
         let mut response_a = Vec::new();
         let served_a =
-            serve_manifest_stream(&mut response_a, std::io::Cursor::new(frame_a), source.as_ref())
+            serve_manifest_stream(&mut response_a, std::io::Cursor::new(frame_a), source.clone())
                 .await
                 .expect("a refusal is Ok(None), not an error");
         assert!(served_a.is_none(), "a ticket the source cannot resolve must not be served");
@@ -2501,7 +2602,7 @@ pub(crate) mod tests {
         write_framed(&mut frame_b, &serde_json::to_vec(&req_b).unwrap()).await.unwrap();
         let mut response_b = Vec::new();
         let served_b =
-            serve_manifest_stream(&mut response_b, std::io::Cursor::new(frame_b), source.as_ref())
+            serve_manifest_stream(&mut response_b, std::io::Cursor::new(frame_b), source.clone())
                 .await
                 .expect("a refusal is Ok(None), not an error");
         assert!(served_b.is_none(), "a manifest for another collection must not be served");
@@ -2613,7 +2714,7 @@ pub(crate) mod tests {
         // The honest half: a peer that reads gets readable refusal bytes on the same path.
         let mut response = Vec::new();
         let served_honest =
-            serve_manifest_stream(&mut response, std::io::Cursor::new(frame.clone()), source.as_ref())
+            serve_manifest_stream(&mut response, std::io::Cursor::new(frame.clone()), source.clone())
                 .await
                 .expect("a refusal is Ok(None), not an error");
         assert!(served_honest.is_none(), "a ticket the source cannot resolve must not be served");
@@ -2635,7 +2736,7 @@ pub(crate) mod tests {
         let started = std::time::Instant::now();
         let err = tokio::time::timeout(
             TEST_TIMEOUT,
-            serve_manifest_stream(StallingWriter, std::io::Cursor::new(frame), source.as_ref()),
+            serve_manifest_stream(StallingWriter, std::io::Cursor::new(frame), source.clone()),
         )
         .await
         .expect(
