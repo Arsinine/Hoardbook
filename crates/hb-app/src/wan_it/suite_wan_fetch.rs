@@ -60,7 +60,16 @@ const FETCH_SLUG: &str = "wan-fetch";
 const DRIVER_POLLS: usize = 8;
 /// Between polls. The production loop waits 5 minutes; the row does not, because the cadence is
 /// pinned by a unit test and re-proving it here would only cost wall clock.
-const POLL_SETTLE: Duration = Duration::from_secs(5);
+///
+/// ⚠ **But it must stay LONGER than the author's answer latency** (found live 2026-09-25). Every
+/// ask records a FRESH nonce over the last one, and a ticket is claimable only under the nonce it
+/// echoes. Production's ordering keeps that safe — redeem runs before the staleness check, and 300 s
+/// dwarfs A's few-second answer (its 5 s auto-approve poll + bind + home-relay wait + DM) — so the
+/// ticket always lands before any re-ask. At 5 s the harness re-asked faster than A could answer:
+/// each ticket arrived echoing a nonce one re-ask stale, was refused `Unsolicited`, and the row
+/// failed "asked but never redeemed" while the 2026-09-23 pass had only won the race. 30 s restores
+/// production's ordering without its wall clock.
+const POLL_SETTLE: Duration = Duration::from_secs(30);
 /// FD4 (QURATOR-334): polls allowed, after the successful redeem, for the driver to re-read the
 /// answered ticket and skip it as spent.
 const FD4_POLLS: usize = 3;
