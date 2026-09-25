@@ -134,7 +134,7 @@
 		finally { pictureBusy = false; }
 	}
 
-	// ── Publish-button dirty tracking ───────────────────────────────────────────
+	// ── Publish-state tracking (drives the title-bar status line) ────────────────
 	// Snapshot of the profile as it was last published (null = never published).
 	let publishedSnapshot: string | null = $state(null);
 	// QURATOR-95: the published-check and the profile store hydrate on parallel chains, so the old
@@ -184,7 +184,6 @@
 	let editTarget: Collection | null = $state(null);
 	let editInitialPath = $state('');
 	let saving = $state(false);
-	let publishing = $state(false);
 	let langInput = $state('');
 	let tagInput = $state('');
 	let willingInput = '';
@@ -319,29 +318,6 @@
 	// all (typing then tabbing/clicking away must not wait out the debounce).
 	// Flush-on-navigate/destroy: onDestroy below.
 	onDestroy(() => { void autopublish.destroy(); });
-
-	async function handlePublish() {
-		if (!form.display_name.trim()) {
-			toast('Enter a display name before publishing.', 'error');
-			return;
-		}
-		publishing = true;
-		try {
-			// Reuse the canonical save shape (trimmed, stamped, sized) — as a SNAPSHOT, not a
-			// reassignment: `form = …` would re-run the homeDraft effect and arm a second,
-			// redundant debounced publish on top of this explicit one.
-			const p = formForSave();
-			await saveProfile(p);
-			profile.set({ ...p });
-			await publishProfile();
-			publishedSnapshot = stableProfileJson(p);
-			toast('Profile published to relay');
-		} catch (e) {
-			toast(String(e), 'error');
-		} finally {
-			publishing = false;
-		}
-	}
 
 	async function handlePublishCollection(slug: string) {
 		try {
@@ -702,18 +678,13 @@
 			<div class="topbar-title">My Profile</div>
 			<div class="topbar-sub">
 				{#if neverPublished}
-					<span class="pub-status pub-warn">● Not published yet. Others can't find you in search.</span>
+					<span class="pub-status pub-warn">● Not published yet. Others can't find you until you add a display name, then it publishes automatically.</span>
 				{:else if profileDirty}
-					<span class="pub-status pub-warn">● Unpublished changes. Publish again to update your public listing.</span>
+					<span class="pub-status pub-warn">● Unpublished changes. They publish automatically.</span>
 				{:else}
 					<span class="pub-status pub-ok">● Published. You're discoverable in search.</span>
 				{/if}
 			</div>
-		</div>
-		<div class="topbar-actions">
-			<button class="btn-primary btn-sm" class:publish-pulse={neverPublished && !publishing} onclick={handlePublish} disabled={publishing || !profileDirty || !form.display_name.trim()} title={!form.display_name.trim() ? 'Enter a display name before publishing' : !profileDirty ? 'No changes since last publish' : undefined}>
-				{publishing ? 'Publishing…' : profileDirty ? 'Publish profile' : 'Published ✓'}
-			</button>
 		</div>
 	</div>
 
@@ -1140,21 +1111,12 @@
 
 	.topbar-title { font-size: 17px; font-weight: 600; color: var(--fg); letter-spacing: -0.3px; }
 	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
-	.topbar-actions { display: flex; gap: 8px; align-items: center; }
 
-	/* Publish-state hint + attention pulse — make "unpublished = not searchable" obvious. */
+	/* Publish-state hint — make "unpublished = not searchable" obvious. */
 	.pub-status { font-size: 12px; }
 	.pub-warn { color: var(--accent); }
 	.pub-ok { color: var(--fg-dim); }
 
-	.publish-pulse { animation: publish-pulse 1.8s ease-out infinite; }
-	/* M15 W7: pulse uses the amber accent, not a stray blue. */
-	@keyframes publish-pulse {
-		0%   { box-shadow: 0 0 0 0 oklch(0.78 0.14 70 / 0.55); }
-		70%  { box-shadow: 0 0 0 7px oklch(0.78 0.14 70 / 0); }
-		100% { box-shadow: 0 0 0 0 oklch(0.78 0.14 70 / 0); }
-	}
-	@media (prefers-reduced-motion: reduce) { .publish-pulse { animation: none; } }
 
 	/* Body layout */
 	.body {

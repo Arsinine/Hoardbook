@@ -32,12 +32,13 @@ vi.mock('$lib/api.js', async (importOriginal) => {
 		...actual,
 		saveProfile: vi.fn().mockResolvedValue(undefined),
 		publishProfile: vi.fn().mockResolvedValue(undefined),
+		generateKeypair: vi.fn(),
 		hasPublishedProfile: vi.fn().mockResolvedValue(true),
 		collectionSourceAccessible: vi.fn().mockResolvedValue(true),
 	};
 });
 
-import { saveProfile, publishProfile } from '$lib/api.js';
+import { saveProfile, publishProfile, generateKeypair } from '$lib/api.js';
 const saveMock = saveProfile as unknown as ReturnType<typeof vi.fn>;
 const publishMock = publishProfile as unknown as ReturnType<typeof vi.fn>;
 
@@ -103,13 +104,42 @@ describe('QURATOR-138 — My Profile publishes by default', () => {
 		expect(publishMock).not.toHaveBeenCalled();
 	}, 15000);
 
-	it('the Save draft button is GONE from the title bar', async () => {
+	// Owner 2026-09-25: with the Publish button gone, auto-publish is the ONLY way a profile
+	// reaches relays. A brand-new user who names themselves in onboarding and never edits again
+	// must still end up published (searchable). It does: the form is seeded at mount, so the
+	// onboarding name input is an edit like any other and arms the debounced publish.
+	//
+	// MUTATION (P-10): in the homeDraft `$effect` (routes/+page.svelte), change
+	// `if (autopublishArmed && !syncingFromStore) profileEdited();` to `if (false) profileEdited();`
+	// → this test reds (nothing publishes after onboarding).
+	it('onboarding: naming yourself publishes the profile (no button to do it any more)', async () => {
+		const gen = vi.mocked(generateKeypair);
+		gen.mockResolvedValue(IDENT);
+		identity.set(null);
+		profile.set(null);
+		collections.set([]);
+		homeDraft.set(null);
+		identityLoadError.set(null);
+		appReady.set(true);
+		const { getByRole, getByPlaceholderText } = render(HomePage);
+		await fireEvent.click(getByRole('button', { name: /generate my hoardbook identity/i }));
+		await waitFor(() => expect(getByRole('button', { name: /i'll do it later/i })).toBeTruthy());
+		await fireEvent.click(getByRole('button', { name: /i'll do it later/i }));
+		const name = getByPlaceholderText(/DataHoarder_42/i) as HTMLInputElement;
+		await fireEvent.input(name, { target: { value: 'Brand New' } });
+		const before = publishMock.mock.calls.length;
+		await fireEvent.click(getByRole('button', { name: /continue/i }));
+		await waitFor(() => expect(publishMock.mock.calls.length).toBeGreaterThan(before), { timeout: 2000 });
+	});
+
+	it('the Save draft AND Publish buttons are GONE from the title bar', async () => {
 		prime();
-		const { queryByRole, getByRole } = render(HomePage);
+		const { queryByRole } = render(HomePage);
 		await tick();
 		expect(queryByRole('button', { name: /save draft/i })).toBeNull();
-		// The Publish affordance survives — publishing is still an explicit, name-gated action.
-		expect(getByRole('button', { name: /publish/i })).toBeTruthy();
+		// Owner 2026-09-25: auto-publish is the default, so the title-bar Publish button went too.
+		// (Collection rows keep their own Publish; this scopes to the PROFILE's.)
+		expect(queryByRole('button', { name: /publish profile|published ✓/i })).toBeNull();
 	});
 
 	it('an edit saves LOCALLY immediately and publishes after the debounce', async () => {

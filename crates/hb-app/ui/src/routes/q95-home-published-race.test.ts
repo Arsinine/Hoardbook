@@ -97,25 +97,24 @@ describe('QURATOR-95 — a published profile is never reported as "Not published
 		// THE ASSERTION: an already-published profile must show the Published state.
 		expect(queryByText(/Not published yet/i)).toBeNull();
 		expect(await findByText(/discoverable in search/i)).toBeTruthy();
-		// The pulse is the second live symptom (Publish pulsing on a published profile).
-		expect(container.querySelector('.publish-pulse')).toBeNull();
+		// (The second live symptom, the Publish button pulsing, went with the button: the title-bar
+		// Publish button was removed once auto-publish became the default.)
+		expect(container.querySelector('.pub-warn')).toBeNull();
 	});
 
 	// Counterpart: the fix must not flip genuinely-never-published profiles to "Published".
-	it('published-check resolves false → "Not published yet" still shows and the button still pulses', async () => {
+	it('published-check resolves false → "Not published yet" still shows', async () => {
 		hasPubMock.mockResolvedValue(false);
 		homeDraft.set({ ...PROF });
 		profile.set({ ...PROF });
 		identity.set(IDENT);
 		appReady.set(true);
 
-		const { container, getByText, getByRole } = render(HomePage);
+		const { getByText } = render(HomePage);
 		await waitFor(() => expect(hasPubMock).toHaveBeenCalledTimes(1));
 		await new Promise((r) => setTimeout(r, 20));
 
 		expect(getByText(/Not published yet/i)).toBeTruthy();
-		const pubBtn = getByRole('button', { name: /publish profile/i });
-		expect(pubBtn.classList.contains('publish-pulse')).toBe(true);
 	});
 
 	// The opposite order (profile first, check later) worked even on the broken code — the onMount
