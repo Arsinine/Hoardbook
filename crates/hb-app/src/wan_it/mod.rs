@@ -891,6 +891,7 @@ async fn await_ticket_dm(
     app_id: &AppIdentity,
     store: &DataStore,
     relays: &[String],
+    serve_npub: &str,
 ) -> Result<String> {
     let shared_relay = net::new_shared();
     let client = net::client(&app_id.identity, store, &shared_relay).await?;
@@ -913,18 +914,16 @@ async fn await_ticket_dm(
                 // not from an address book.
                 let msgs =
                     crate::commands::chat::decode_dms(&own_npub, &app_id.identity, wraps, None).await;
-                for m in &msgs {
-                    if let Ok(t) = serde_json::from_str::<TransportTicket>(&m.content) {
-                        if t.verify_shape().is_ok() {
-                            eprintln!(
-                                "[probe] ticket DM received after {polls} poll(s): request_id={} slug={}",
-                                t.request_id, t.slug
-                            );
-                            return Ok(m.content.clone());
-                        }
-                    }
+                if let Some((content, t)) = select_serve_ticket_dm(&msgs, serve_npub) {
+                    eprintln!(
+                        "[probe] ticket DM received after {polls} poll(s): request_id={} slug={}",
+                        t.request_id, t.slug
+                    );
+                    return Ok(content);
                 }
-                last_err = format!("{n} wrap(s) in the inbox, none carried a valid ticket");
+                last_err = format!(
+                    "{n} wrap(s) in the inbox, none carried a valid ticket from {serve_npub}"
+                );
             }
             Err(e) => last_err = format!("inbox fetch failed: {e}"),
         }
@@ -932,10 +931,38 @@ async fn await_ticket_dm(
     }
     Err(anyhow!(
         "no transport ticket arrived by DM within {}s ({last_err}). The serve must be running with \
-         --seed-dir + --asker-npub set to THIS probe's npub ({own_npub}), and both sides must share \
-         at least one relay: {relays:?}",
+         --seed-dir + --asker-npub set to THIS probe's npub ({own_npub}), --peer must be THAT \
+         serve's share code ({serve_npub}), and both sides must share at least one relay: \
+         {relays:?}",
         TICKET_DM_WAIT.as_secs()
     ))
+}
+
+/// Pick the ticket to redeem: the NEWEST shape-valid ticket DM whose sender is `serve_npub`.
+///
+/// **Both filters are load-bearing, and both were missing** (found live 2026-09-25): a probe
+/// data-dir reused against a SECOND serve still held the FIRST serve's ticket in its inbox — relay
+/// state outlives a run — and first-match redeemed it, dialling a serve that had been stopped. It
+/// read exactly like a cross-NAT dial failure. The sender is `decode_dms`' seal-verified `from`,
+/// never the wrap's author; newest is by the rumor's `sent_at` (RFC3339 sorts chronologically),
+/// the same selection `suite_wan_e2e::select_ticket_dm_newest` makes.
+///
+/// Pure — no network — so the selection the live poll makes is the one the unit test pins.
+fn select_serve_ticket_dm(
+    msgs: &[crate::commands::chat::ReceivedMessage],
+    serve_npub: &str,
+) -> Option<(String, TransportTicket)> {
+    let mut newest: Option<(&crate::commands::chat::ReceivedMessage, TransportTicket)> = None;
+    for m in msgs.iter().filter(|m| m.from == serve_npub) {
+        let Ok(t) = serde_json::from_str::<TransportTicket>(m.content.trim()) else { continue };
+        if t.verify_shape().is_err() {
+            continue;
+        }
+        if newest.as_ref().is_none_or(|(best, _)| m.sent_at > best.sent_at) {
+            newest = Some((m, t));
+        }
+    }
+    newest.map(|(m, t)| (m.content.clone(), t))
 }
 
 /// Run the WAN-M rows against a live serve. Requires the serve's FULL share code (--peer hbk…) — the
@@ -968,7 +995,14 @@ async fn run_probe_wan_m(args: &[String], peer_str: &str) -> Result<ExitCode> {
                  production handoff, not a harness side-channel",
                 TICKET_DM_WAIT.as_secs()
             );
-            await_ticket_dm(&app_id, &store, &relays).await?
+            // The serve this run targets — only ITS ticket may be redeemed (see
+            // `select_serve_ticket_dm`).
+            let serve_npub = hb_core::ShareCode::parse(peer_str)
+                .map_err(|e| anyhow!("invalid --peer code: {e}"))?
+                .pubkey()
+                .to_bech32()
+                .map_err(|e| anyhow!("encode serve npub: {e}"))?;
+            await_ticket_dm(&app_id, &store, &relays, &serve_npub).await?
         }
     };
 
@@ -1548,6 +1582,39 @@ fn canary_beacon_relays() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ticket_dm(from: &str, request_id: &str, sent_at: &str) -> crate::commands::chat::ReceivedMessage {
+        let t = TransportTicket::issue(request_id, "wan-it", "addr", 1_700_000_000, Some("wan-it-nonce"));
+        crate::commands::chat::ReceivedMessage {
+            from: from.to_string(),
+            to: "npub1probe".to_string(),
+            content: serde_json::to_string(&t).unwrap(),
+            sent_at: sent_at.to_string(),
+        }
+    }
+
+    /// The live failure, 2026-09-25: a reused probe inbox held an EARLIER serve's ticket, and the
+    /// first-match wait redeemed it against a serve that had been stopped. Only the `--peer` serve's
+    /// ticket may be picked, and of those the newest.
+    ///
+    /// MUTATION (orchestrator): in `select_serve_ticket_dm` (wan_it/mod.rs), delete the
+    /// `.filter(|m| m.from == serve_npub)` → the stale serve's newer ticket wins and this reds.
+    /// Separately, change `m.sent_at > best.sent_at` to `m.sent_at < best.sent_at` → the older
+    /// ticket from the right serve wins and this reds.
+    #[test]
+    fn the_ticket_wait_takes_only_the_peer_serves_newest_ticket() {
+        let msgs = vec![
+            ticket_dm("npub1old", "req-old-serve", "2026-09-25T06:30:00Z"),
+            ticket_dm("npub1devtest", "req-dev-first", "2026-09-25T06:00:00Z"),
+            ticket_dm("npub1devtest", "req-dev-second", "2026-09-25T06:10:00Z"),
+        ];
+        let (_, picked) = select_serve_ticket_dm(&msgs, "npub1devtest").expect("the serve sent one");
+        assert_eq!(picked.request_id, "req-dev-second");
+        assert!(
+            select_serve_ticket_dm(&msgs, "npub1nobody").is_none(),
+            "a ticket from any other sender must never be redeemed"
+        );
+    }
 
     /// --once must report FAILURE (exit 1) when any row failed.
     /// MUTATION (orchestrator): in `canary_exit_code` (wan_it/mod.rs), swap the two arms
