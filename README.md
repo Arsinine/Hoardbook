@@ -63,13 +63,14 @@ no peer addresses.**
 
 ## Relays
 
-Discovery rides on public Nostr relays. Hoardbook ships with four defaults spread across
+Discovery rides on public Nostr relays. Hoardbook ships with five defaults spread across
 independent providers, so no single relay is a point of failure:
 
 - `wss://nos.lol`
 - `wss://relay.primal.net`
 - `wss://relay.snort.social`
-- `wss://offchain.pub`
+- `wss://relay.damus.io`
+- `wss://nostr.mom`
 
 Replace or extend them in Settings; Hoardbook reads from all configured relays.
 

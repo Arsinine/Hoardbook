@@ -6,7 +6,7 @@
 //!   Adapts `hb-it/suite_relay::relay1` to the live VPS backbone.
 //! - **R2** — **default-relay policy watch** (the canary row, LIGHT-TOUCH): for each public default
 //!   (the current `DEFAULT_RELAYS` set — nos.lol / relay.primal.net / relay.snort.social /
-//!   offchain.pub), publish ONE event of each our-kinds class (teaser / kind-11111
+//!   relay.damus.io / nostr.mom), publish ONE event of each our-kinds class (teaser / kind-11111
 //!   presence / a gift-wrap 1059 / a 1117 announce) from a throwaway identity and record accept/reject
 //!   PER RELAY PER KIND as the evidence table. This is the early-warning row for policy changes that
 //!   would otherwise present as Hoardbook bugs. Low-rate: one event per kind per relay per run, no

@@ -487,12 +487,12 @@ mod tests {
     fn reconcile_never_resurrects_a_default_the_user_removed() {
         // QURATOR-208 acceptance 2 — the ruling the ticket exists to enforce: additive sync means
         // a relay the user DELETED stays deleted across upgrades. The watermark covers the current
-        // 4 (they were offered them); the persisted set is those 4 minus offchain.pub (removed);
-        // the NEXT release ships one genuinely-new default. Only the new one may be added.
+        // defaults (they were offered them); the persisted set is those minus the last one
+        // (removed); the NEXT release ships one genuinely-new default. Only the new one may be added.
         //
         // MUTATION (P-10): in `merge_default_relays`, change the loop guard
         // `if !offered && !present` to `if !present` — the watermark no longer suppresses
-        // anything, offchain.pub is re-added, and the `!merged.contains(&removed)` assert reds.
+        // anything, the removed default is re-added, and the `!merged.contains(&removed)` assert reds.
         let removed = DEFAULT_RELAYS.last().unwrap().clone();
         let kept: Vec<String> = DEFAULT_RELAYS.iter().filter(|r| *r != &removed).cloned().collect();
         let mut next_release = DEFAULT_RELAYS.clone();
@@ -575,17 +575,23 @@ mod tests {
     }
 
     #[test]
-    fn default_relays_do_not_include_damus() {
-        // Owner ruling 2026-08-08: damus (`relay.damus.io`) was removed from the default set for
-        // unreliability — three timeout/503 incidents in one night (2026-08-01 devtest) and it was
-        // the first relay in the launch flap that fed the v0.12.11 rustls investigation. Keep this
-        // assertion: the relay is fine as a user-added choice, just not a shipped default.
-        for r in DEFAULT_RELAYS.iter() {
-            assert!(
-                !r.contains("relay.damus.io"),
-                "damus must not be a shipped default (owner ruling 2026-08-08): found {r}"
-            );
-        }
+    fn default_relays_are_the_owner_ruled_set() {
+        // Owner ruling 2026-09-25: relay.damus.io and nostr.mom are defaults again (replacing
+        // offchain.pub, which refuses TCP 443). This SUPERSEDES the 2026-08-08 ruling that dropped
+        // damus for unreliability — the owner reversed it knowingly, after being shown that ruling.
+        // Pinning the exact set keeps an accidental edit of default_relays.json loud.
+        let expected = [
+            "wss://nos.lol",
+            "wss://relay.primal.net",
+            "wss://relay.snort.social",
+            "wss://relay.damus.io",
+            "wss://nostr.mom",
+        ];
+        assert_eq!(*DEFAULT_RELAYS, expected, "default relay set drifted from the owner ruling");
+        assert!(
+            !DEFAULT_RELAYS.iter().any(|r| r.contains("offchain.pub")),
+            "offchain.pub refuses connections and must not ship as a default"
+        );
     }
 
     #[test]
