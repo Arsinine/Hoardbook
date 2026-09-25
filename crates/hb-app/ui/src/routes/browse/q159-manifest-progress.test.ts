@@ -28,6 +28,7 @@ import { tick } from 'svelte';
 import BrowsePage from './+page.svelte';
 import { contacts } from '$lib/stores.js';
 import type { ContactSummary, Collection } from '$lib/types.js';
+import { getManifestAsks } from '$lib/api.js';
 
 vi.mock('$lib/api.js', () => ({
 	refreshContact: vi.fn(),
@@ -257,5 +258,43 @@ describe('QURATOR-159 — the manifest-fetch progress bar (paywall block)', () =
 		// have been invoked on destroy — a leaked listener keeps a dead page updating state.
 		expect(unlisteners.length).toBeGreaterThan(0);
 		for (const off of unlisteners) expect(off).toHaveBeenCalled();
+	});
+});
+
+// QURATOR-335 — the footer status (approved design): bottom-right of the "Metadata only" row, driven
+// by the SAME `manifest-progress` event plus the ask trace. Green while bytes move; amber while the
+// owner has not answered.
+describe('QURATOR-335 — the full-list status in the collection footer', () => {
+	function footerStatus(): HTMLElement | null {
+		return document.querySelector('.no-download-note .fetch-status');
+	}
+
+	// mutation: in routes/browse/+page.svelte, change `progress: manifestProgress[col.slug],` (the
+	// fetchStatus derivation) to `progress: undefined,` → this reds (no receiving state, no bar).
+	it('a progress event paints a GREEN bar in the footer row, beside the metadata note', async () => {
+		await driveToPaywall('archive');
+		emitProgress({ request_id: 'r1', slug: 'archive', received: 2_621_440, total: 10_485_760 });
+		await tick();
+		const st = footerStatus();
+		expect(st, 'the status must live in the metadata-only footer row').toBeTruthy();
+		expect(st!.classList.contains('tone-ok')).toBe(true);
+		expect(st!.textContent).toContain('Receiving the full list');
+		expect(st!.textContent).toContain('2.5 MB of 10.0 MB · 25%');
+		expect(st!.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('25');
+		expect(document.querySelector('.no-download-note')!.textContent).toContain('Metadata only. Hoardbook moves no files.');
+	});
+
+	// mutation: in routes/browse/+page.svelte, change `void loadManifestAsks();` inside onMount to
+	// nothing (delete the line) → this reds (the ask trace is never read, so nothing is shown).
+	it('an ask the owner has not answered reads amber "Asked for the full list", with no bar', async () => {
+		vi.mocked(getManifestAsks).mockResolvedValue({
+			[`${AUTHOR_NPUB}|${AUTHOR_NPUB}|archive`]: { fingerprint_seen: 'aaaa', sent_at: '2026-09-25T13:53:00Z', nonce: 'n' },
+		});
+		await driveToPaywall('archive');
+		await waitFor(() => expect(footerStatus()).toBeTruthy());
+		const st = footerStatus()!;
+		expect(st.classList.contains('tone-waiting')).toBe(true);
+		expect(st.textContent).toContain('Asked for the full list');
+		expect(st.querySelector('[role="progressbar"]')).toBeNull();
 	});
 });

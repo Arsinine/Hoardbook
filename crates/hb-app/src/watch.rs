@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result as AnyResult};
 use tokio::sync::{mpsc, watch};
 
-use crate::commands::collection::{count_items, publish_collection_inner, rescan_listing};
+use crate::commands::collection::{publish_collection_inner, rescan_listing};
 use crate::identity_state::SharedIdentity;
 use crate::net::SharedRelay;
 use crate::store::{read_json_lenient, write_json, DataStore};
@@ -317,7 +317,9 @@ impl PublishSink for RelayPublishSink {
                 // Update the draft's tree (item_count + last_updated) before publishing; the publish
                 // path then encrypts/signs/publishes it and saves the new fingerprint.
                 if let Some(mut col) = self.store.load_collection_draft(slug)? {
-                    col.item_count = count_items(&new_listing);
+                    // QURATOR-336: `item_count` is set by `rescan_listing` (the real count, or an
+                    // oversized collection's LOWER BOUND). Recounting `new_listing` here would count
+                    // the capped preview and silently un-mark an oversized collection.
                     col.listing = new_listing;
                     col.last_updated = chrono::Utc::now();
                     self.store.save_collection_draft(&col)?;

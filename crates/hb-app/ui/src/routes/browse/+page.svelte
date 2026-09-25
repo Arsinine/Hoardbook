@@ -4,7 +4,7 @@
 	import { listen } from '@tauri-apps/api/event';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import { sizeTier, sizeTierTooltip, rowIcon } from '$lib/collection-row-view.js';
-	import { refreshContact, getContacts, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, browsePrivateCollections, applyKeyGrants } from '$lib/api.js';
+	import { refreshContact, getContacts, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, browsePrivateCollections, applyKeyGrants, getManifestAsks, type ManifestAsk } from '$lib/api.js';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
 	import Avatar from '$lib/components/Avatar.svelte';
@@ -16,6 +16,7 @@
 	// QURATOR-98 — the shared dialog shell (backdrop, Escape, Tab trap, focus restore).
 	import Modal from '$lib/components/Modal.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
+	import { deriveFetchStatus } from '$lib/fetch-status.js';
 	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote, arrangeItems, fileTypesPresent, fmtLargestUnit, type BrowseViewMode, type BrowseSortKey, type BrowseSortDir } from '$lib/browse-view.js';
 	import type { Collection, ContactSummary, DirectoryItem, Group } from '$lib/types.js';
 	import { groupByGroups, matchesQuery } from '$lib/contacts-view.js';
@@ -159,16 +160,28 @@
 		} catch { /* non-fatal — retried on the next load */ }
 	}
 
+	// QURATOR-335: the ask trace (manifest_asks.json, incl. the dial budget) the footer status reads.
+	// Re-read on a slow tick — the background fetch driver moves it every 300 s, so a minute is
+	// plenty — and whenever a progress run finishes (the redeem just spent the ask).
+	let manifestAsks = $state<Record<string, ManifestAsk>>({});
+	let statusNow = $state(new Date());
+	async function loadManifestAsks() {
+		try { manifestAsks = await getManifestAsks(); } catch { /* keep the last read */ }
+	}
+
 	onMount(() => {
 		// QURATOR-188: fire-and-forget — onMount must stay synchronous or it loses the cleanup
 		// return below (same pattern as `void loadPrivateInto()`).
 		void loadKeyGrants();
+		void loadManifestAsks();
+		const askTick = setInterval(() => { statusNow = new Date(); void loadManifestAsks(); }, 60_000);
 		listen<{ request_id: string; slug: string; received: number; total: number }>('manifest-progress', (event) => {
 			const p = event.payload;
 			if (!p || typeof p.slug !== 'string') return;
 			manifestProgress[p.slug] = { received: p.received, total: p.total };
+			if (p.total > 0 && p.received >= p.total) void loadManifestAsks();
 		}).then(fn => { manifestProgressUnlisten = fn; }).catch(() => { });
-		return () => { manifestProgressUnlisten?.(); };
+		return () => { clearInterval(askTick); manifestProgressUnlisten?.(); };
 	});
 
 	// The selected collection's in-flight run only. Complete runs (received === total) and
@@ -267,6 +280,23 @@
 	// a collection the browser upgraded to the full tree from a big relay has `truncated` cleared, so
 	// `paywallTeaser` returns null and the full tree renders (no fade).
 	let paywall = $derived(folderStack.length > 0 ? null : paywallTeaser(selectedCollection));
+	// QURATOR-335 — the footer's full-list status for the selected collection. The ask is keyed by
+	// who we asked + whose collection it is; Browse only ever asks the author (carriers are the
+	// background driver's business, and its asks are keyed the same way when it asks the author).
+	let fetchStatus = $derived.by(() => {
+		const col = selectedCollection;
+		if (!col) return null;
+		const npub = selectedPeer?.npub;
+		const ask = npub
+			? manifestAsks[`${npub}|${npub}|${col.slug}`] ?? manifestAsks[`${npub}|${col.slug}`]
+			: undefined;
+		return deriveFetchStatus({
+			oversized: col.oversized,
+			ask,
+			progress: manifestProgress[col.slug],
+			now: statusNow,
+		});
+	});
 	let breadcrumbs = $derived<BcItem[]>([
 		...(selectedPeer ? [{ label: peerName(selectedPeer), kind: 'contact' as const }] : []),
 		...(selectedCollection ? [{ label: selectedCollection.path_alias, kind: 'collection' as const }] : []),
@@ -1205,8 +1235,16 @@
 							<div class="paywall-note">
 								<span class="paywall-lock">🔒</span>
 								<div>
-									<div class="paywall-title">{paywall.hidden.toLocaleString()} more item{paywall.hidden !== 1 ? 's' : ''} hidden</div>
-									<div class="paywall-sub">Showing {paywall.shown.toLocaleString()} of {paywall.total.toLocaleString()}. The collection is too large to publish in full.</div>
+									{#if paywall.oversized}
+										<!-- QURATOR-336: an oversized collection is over the 16 MB transfer limit, so its
+										     full list can never be fetched and `total` is a LOWER BOUND. There is no honest
+										     "N more hidden" figure to print, so the count reads "100,000+ items" instead. -->
+										<div class="paywall-title">Preview of a very large collection</div>
+										<div class="paywall-sub">{paywall.total.toLocaleString()}+ items</div>
+									{:else}
+										<div class="paywall-title">{paywall.hidden.toLocaleString()} more item{paywall.hidden !== 1 ? 's' : ''} hidden</div>
+										<div class="paywall-sub">Showing {paywall.shown.toLocaleString()} of {paywall.total.toLocaleString()}. The collection is too large to publish in full.</div>
+									{/if}
 									{#if paywallProgress}
 										<!-- QURATOR-159: an in-flight manifest fetch. Owner-signed copy, exact: "Fetching the
 										     full list" + byte progress. SOURCE-AGNOSTIC by owner ruling D6: no peer name, npub,
@@ -1234,10 +1272,32 @@
 							<FeatureTooltip key="k-of-n-folders" />
 						</div>
 					{/if}
-					<!-- The listing is metadata only — Hoardbook moves no files (H4/INV-4). -->
+					<!-- The listing is metadata only — Hoardbook moves no files (H4/INV-4). QURATOR-336: an
+					     oversized collection's full list is over the 16 MB transfer limit and can never be sent,
+					     so this row also carries the bottom-right status. No progress bar: nothing is in flight,
+					     and nothing ever will be. -->
 					<div class="no-download-note">
-						<span>Metadata only. Hoardbook moves no files.</span>
-						<FeatureTooltip key="no-download" />
+						<span class="nd-left">
+							<span>Metadata only. Hoardbook moves no files.</span>
+							<FeatureTooltip key="no-download" />
+						</span>
+						{#if fetchStatus}
+							<!-- QURATOR-335 — one status block for every state (approved design states 1–7).
+							     The oversized state keeps its QURATOR-336 classes: it is the same block. -->
+							<div class="fetch-status tone-{fetchStatus.tone}" class:oversized-status={selectedCollection?.oversized} role="status">
+								<span class="fetch-dot" class:oversized-dot={selectedCollection?.oversized}></span>
+								<div class="fetch-text">
+									<div class="fetch-title" class:oversized-title={selectedCollection?.oversized}>{fetchStatus.title}</div>
+									<div class="fetch-sub" class:oversized-sub={selectedCollection?.oversized}>{fetchStatus.sub}</div>
+								</div>
+								{#if fetchStatus.pct !== null}
+									<div class="fetch-track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={fetchStatus.pct} aria-label={fetchStatus.title}>
+										<div class="fetch-fill" style:flex-grow={fetchStatus.pct}></div>
+										<div style:flex-grow={100 - fetchStatus.pct}></div>
+									</div>
+								{/if}
+							</div>
+						{/if}
 					</div>
 				</div>
 			{/if}
@@ -1620,10 +1680,12 @@
 		color: var(--online);
 	}
 
-	/* No-download footer note */
+	/* No-download footer note. QURATOR-336: space-between keeps the note left and parks the
+	   oversized status bottom-right; `.nd-left` holds the note + its tooltip as one group. */
 	.no-download-note {
 		display: flex;
 		align-items: center;
+		justify-content: space-between;
 		gap: 2px;
 		padding: 10px 16px;
 		margin-top: auto;
@@ -1632,6 +1694,34 @@
 		color: var(--fg-dim);
 		flex-shrink: 0;
 	}
+	.nd-left { display: flex; align-items: center; gap: 2px; }
+
+	/* QURATOR-335/336: the full-list status — dot + two lines + (while moving) a bar. Owner rule:
+	   green while progressing, red when obstructed or failing, amber while waiting on the owner. */
+	.fetch-status { display: flex; align-items: center; gap: 8px; text-align: right; }
+	.fetch-text { display: flex; flex-direction: column; align-items: flex-end; }
+	.fetch-dot {
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		flex-shrink: 0;
+		background: var(--accent);
+	}
+	.fetch-title { color: var(--fg); }
+	.fetch-sub { color: var(--fg-dim); margin-top: 1px; }
+	.fetch-track {
+		display: flex;
+		width: 120px;
+		height: 6px;
+		flex-shrink: 0;
+		border-radius: 3px;
+		background: var(--bg-elev2);
+		overflow: hidden;
+	}
+	.fetch-fill { background: var(--online); }
+	.tone-ok .fetch-dot { background: var(--online); }
+	.tone-bad .fetch-dot, .tone-bad .fetch-fill { background: var(--error); }
+	.tone-bad .fetch-title { color: var(--error); }
 
 	/* Breadcrumb */
 

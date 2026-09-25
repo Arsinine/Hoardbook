@@ -153,6 +153,14 @@ pub struct PeerCollection {
     pub truncated: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_items: Option<usize>,
+    /// QURATOR-336 — true when the author marked this collection as too large to ever cross the
+    /// 16 MiB manifest transfer. Such an owner can NEVER serve a full list, so an ask is pure waste
+    /// and wedges the asker in "waiting for owner" forever; the fetch driver reads this marker to
+    /// skip the collection in both ask tiers. `None` when the marker is absent — and absent is
+    /// treated exactly like `false`, which is what makes the marker an optional addition rather
+    /// than a downgrade (a pre-QURATOR-336 listing is asked for precisely as it always was).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oversized: Option<bool>,
     /// M16 W4 — the full-tree snapshot fingerprint carried in the listing meta (both the teaser and
     /// the full manifest carry the same value). Surfaced as a browse-time signal so the import path
     /// can gate a manifest for staleness against the teaser the browser is currently showing. `None`
@@ -181,6 +189,10 @@ pub(crate) fn rendered_to_peer_collection(r: &RenderedListing) -> Option<PeerCol
     // (which has no such fields) — they become PeerCollection browse-time signals, like the K-of-N counts.
     let truncated = map.remove("truncated").and_then(|v| v.as_bool());
     let total_items = map.remove("total_items").and_then(|v| v.as_u64()).map(|n| n as usize);
+    // QURATOR-336: the too-large-to-serve marker, pulled out of the meta like the markers above
+    // (it is not a `Collection` field, so leaving it in would make a stricter `Collection` reject
+    // the unknown key).
+    let oversized = map.remove("oversized").and_then(|v| v.as_bool());
     // M16 W4: the full-tree fingerprint rides in the meta (W3) — pull it out as a browse-time signal
     // (like the K-of-N counts) so the import path can gate staleness against the teaser being shown.
     let snapshot_fingerprint =
@@ -193,6 +205,7 @@ pub(crate) fn rendered_to_peer_collection(r: &RenderedListing) -> Option<PeerCol
         parts_present: Some(r.parts_present),
         truncated,
         total_items,
+        oversized,
         snapshot_fingerprint,
         manifest_imported_at: None,
         // Set by `resolve_peer` (which holds the fetched event ids); a bare render carries none.
@@ -1439,6 +1452,43 @@ mod tests {
         assert_eq!(peer_col.collection.slug, "bigvault");
     }
 
+    /// QURATOR-336 — the `oversized` marker rides in the listing meta exactly like `truncated`
+    /// does, and BOTH shapes are pinned. The absent shape is the load-bearing one: a listing
+    /// without the marker must map to `None` (asked for normally), never to `Some(false)`, which
+    /// would put a marker on the wire the author never published.
+    ///
+    /// MUTATION (P-10) — in `rendered_to_peer_collection`, replace
+    /// `let oversized = map.remove("oversized").and_then(|v| v.as_bool());` with
+    /// `let oversized = Some(false);` → the `Some(true)` assert reds. Then replace it with
+    /// `let oversized = Some(map.remove("oversized").is_some());` → the absent-shape assert reds
+    /// (a markerless listing would come out `Some(false)`).
+    #[test]
+    fn rendered_listing_carries_the_oversized_marker_in_both_shapes() {
+        let mut meta = valid_meta("bigvault");
+        meta.insert("oversized".into(), serde_json::json!(true));
+        let rendered = RenderedListing {
+            meta,
+            entries: vec![],
+            parts_total: 1,
+            parts_present: 1,
+            missing: vec![],
+        };
+        let peer_col = rendered_to_peer_collection(&rendered).expect("the marker must not break the decode");
+        assert_eq!(peer_col.oversized, Some(true));
+        assert_eq!(peer_col.collection.slug, "bigvault");
+
+        // Absent → `None` (not `false`): a pre-QURATOR-336 listing is asked for as it always was.
+        let plain = RenderedListing {
+            meta: valid_meta("films"),
+            entries: vec![],
+            parts_total: 1,
+            parts_present: 1,
+            missing: vec![],
+        };
+        let plain_col = rendered_to_peer_collection(&plain).expect("a markerless listing must convert");
+        assert_eq!(plain_col.oversized, None, "an absent marker is `None`, never `Some(false)`");
+    }
+
     // ── M16 W4: manifest import (verify → decrypt → merge) ─────────────────────────
     // `open_manifest` is the pure core the `import_manifest` command wraps around a contact lookup;
     // the wire (relay) is untouched — an imported manifest is a local file consume.
@@ -2269,6 +2319,7 @@ mod tests {
             parts_present: None,
             truncated: None,
             total_items: None,
+            oversized: None,
             snapshot_fingerprint: None,
             manifest_imported_at: None,
             teaser_event_id: None,

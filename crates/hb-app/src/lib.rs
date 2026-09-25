@@ -216,11 +216,31 @@ fn spawn_background_tasks(
     // Nobody clicks — it notices a held collection's fingerprint has moved and re-asks, carriers
     // before the author. Spawned alongside the auto-approve loop because the two are the serve and
     // fetch halves of the same background infrastructure; neither has a UI surface.
+    // QURATOR-335: the driver's redeems report byte progress on the SAME `manifest-progress` event
+    // the Browse manual redeem emits, so the per-collection bar moves for unattended fetches too.
+    // The channel crosses into the driver, never the AppHandle (the WAN harness passes `None`).
+    let (fetch_prog_tx, mut fetch_prog_rx) =
+        tokio::sync::mpsc::unbounded_channel::<transport::ManifestProgress>();
+    let progress_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(p) = fetch_prog_rx.recv().await {
+            let _ = progress_app.emit(
+                "manifest-progress",
+                serde_json::json!({
+                    "request_id": p.request_id,
+                    "slug": p.slug,
+                    "received": p.received,
+                    "total": p.total,
+                }),
+            );
+        }
+    });
     tauri::async_runtime::spawn(fetch_driver::run_fetch_driver_loop(
         store.clone(),
         Arc::clone(&identity),
         Arc::clone(&relay),
         endpoint,
+        Some(fetch_prog_tx),
     ));
 
     // QURATOR-332 slice A (owner ruling 2026-09-24): contacts added but never enumerated ride a

@@ -228,6 +228,7 @@ mod tests {
             parts_present: None,
             truncated: None,
             total_items: None,
+            oversized: None,
             snapshot_fingerprint: None,
             manifest_imported_at: None,
             teaser_event_id: None,

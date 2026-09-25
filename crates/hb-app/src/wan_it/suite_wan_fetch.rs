@@ -406,7 +406,7 @@ async fn run_role_d_phase2(input: &CarryInput) -> Result<(), String> {
     let mut redeemed = false;
     let mut saw_stale = false;
     for attempt in 1..=DRIVER_POLLS {
-        let outcome = poll_once(&input.store, &live, &shared_relay, &endpoint, &mut states).await;
+        let outcome = poll_once(&input.store, &live, &shared_relay, &endpoint, &mut states, None).await;
         eprintln!(
             "   FD2 poll {attempt}: stale={} asked={:?} redeemed={:?}",
             outcome.stale.len(),
@@ -479,7 +479,7 @@ async fn run_role_d_phase2(input: &CarryInput) -> Result<(), String> {
     let mut skipped = false;
     for attempt in 1..=FD4_POLLS {
         tokio::time::sleep(POLL_SETTLE).await;
-        let outcome = poll_once(&input.store, &live, &shared_relay, &endpoint, &mut states).await;
+        let outcome = poll_once(&input.store, &live, &shared_relay, &endpoint, &mut states, None).await;
         eprintln!(
             "   FD4 poll {attempt} after the redeem: redeemed={:?} skipped_spent={:?}",
             outcome.redeemed, outcome.skipped_spent

@@ -484,6 +484,13 @@ export interface ManifestAsk {
 	 *  exact value. Empty for a trace written before the ruling — and an empty nonce never matches,
 	 *  so those asks simply stop auto-dialling until the user asks again. */
 	nonce?: string;
+	/** QURATOR-197 — failed redemption dials recorded against this ask (the background fetch stops
+	 *  after 3). Read by the QURATOR-335 status line to say "retrying" vs "gave up". */
+	dial_attempts?: number;
+	/** Unix seconds of the most recent failed dial; `0` = never. */
+	dial_last_fail_unix?: number;
+	/** Answered — the full list arrived. */
+	spent?: boolean;
 }
 export const getManifestAsks = () =>
 	invoke<Record<string, ManifestAsk>>('get_manifest_asks');

@@ -208,7 +208,34 @@ describe('countListingItems (devtest #7 paywall)', () => {
 describe('paywallTeaser (M16 W3 — resolves to full tree when upgraded)', () => {
 	it('shows the teaser for a truncated collection with hidden items', () => {
 		const col = { truncated: true, total_items: 100, listing: [{ name: 'a' }, { name: 'b' }] };
-		expect(paywallTeaser(col)).toEqual({ shown: 2, hidden: 98, total: 100 });
+		expect(paywallTeaser(col)).toEqual({ shown: 2, hidden: 98, total: 100, oversized: false });
+	});
+
+	// QURATOR-336. `hidden` is not an honest figure for an oversized collection — its `total_items`
+	// is a LOWER BOUND — so the teaser carries the flag through and the renderer prints the bound.
+	// `oversized: true` with NO `truncated` must still produce a teaser: the field is optional and
+	// the preview is not the less-true reading of the listing.
+	it('teases an oversized collection, carrying the flag and the lower bound through', () => {
+		const col = {
+			oversized: true,
+			total_items: 100_000,
+			listing: [{ name: 'a' }, { name: 'b' }],
+		};
+		expect(paywallTeaser(col)).toEqual({ shown: 2, hidden: 99_998, total: 100_000, oversized: true });
+	});
+
+	// mutation: revert `oversized: col.oversized === true` to `oversized: false` in
+	// `paywallTeaser` (browse-view.ts) and the assertion above fails on the `oversized` field while
+	// the truncated case above stays green.
+	it('a plain truncated collection is NOT oversized', () => {
+		const col = { truncated: true, total_items: 100, listing: [{ name: 'a' }] };
+		expect(paywallTeaser(col)?.oversized).toBe(false);
+	});
+
+	// mutation: drop `&& !col?.oversized` from `paywallTeaser`'s guard in browse-view.ts and this
+	// returns null, failing the assertion.
+	it('an oversized collection with no `truncated` flag still gets a teaser', () => {
+		expect(paywallTeaser({ oversized: true, total_items: 50, listing: [{ name: 'a' }] })?.total).toBe(50);
 	});
 
 	it('returns null for a non-truncated collection so the FULL tree renders', () => {

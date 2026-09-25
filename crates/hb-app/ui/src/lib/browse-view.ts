@@ -135,14 +135,19 @@ export function countListingItems(items: readonly unknown[]): number {
  * on a successful upgrade); either way the full tree renders with no fade. Also `null` when nothing
  * is actually hidden (`shown >= total`). Pure — the Svelte component ANDs the top-level-view guard
  * (no paywall while drilled into a subfolder, where the dropped tail wouldn't make the fade honest).
+ *
+ * QURATOR-336: `oversized` carries through from the collection (an over-16-MB listing the owner
+ * previewed only — the full list can never be fetched). The teaser is still shown, but `hidden` is
+ * NOT an honest figure there, so the renderer prints `total` as a lower bound instead. An
+ * `oversized` collection is a preview whether or not the backend also set `truncated`.
  */
 export function paywallTeaser(
-	col: { truncated?: boolean; total_items?: number; listing?: readonly unknown[] } | null | undefined,
-): { shown: number; hidden: number; total: number } | null {
-	if (!col?.truncated || !col.total_items) return null;
+	col: { truncated?: boolean; oversized?: boolean; total_items?: number; listing?: readonly unknown[] } | null | undefined,
+): { shown: number; hidden: number; total: number; oversized: boolean } | null {
+	if ((!col?.truncated && !col?.oversized) || !col.total_items) return null;
 	const shown = countListingItems(col.listing ?? []);
 	const hidden = Math.max(0, col.total_items - shown);
-	return hidden > 0 ? { shown, hidden, total: col.total_items } : null;
+	return hidden > 0 ? { shown, hidden, total: col.total_items, oversized: col.oversized === true } : null;
 }
 
 /** M16 W4 — the "Full manifest imported · <date>" tag shown once the user has imported the full-listing

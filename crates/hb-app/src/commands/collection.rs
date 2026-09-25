@@ -47,6 +47,18 @@ pub(crate) const MANIFEST_SPLIT_MAX_BYTES: usize = 65_408;
 /// silent partial listing.
 pub(crate) const MAX_COLLECTION_ITEMS: u64 = 100_000;
 
+/// Item count past which a collection is **OVERSIZED** (owner ruling 2026-09-25, QURATOR-336): it
+/// cannot possibly be sent in full, so the scan stops early and its listing becomes a bounded
+/// breadth-first teaser instead of a whole tree (and [`build_slug_manifest`] refuses it outright).
+/// A lower-bound count at or under this line takes *today's* path unchanged — including the
+/// [`MAX_COLLECTION_ITEMS`] refusal, which is strictly tighter.
+///
+/// Where the number comes from: the measured worst case is a game library of 71,547 items sealing
+/// to 11.2 MB — ≈157 B/item against `hb_core::MANIFEST_MAX_TRANSPORT_BYTES`'s 16 MiB ceiling — which
+/// bounds a full manifest at ≈107,000 items. 150,000 is that bound rounded up with headroom, so
+/// anything past it *obviously* cannot fit and there is no reason to walk the tree to find out.
+pub(crate) const OVERSIZED_ITEM_THRESHOLD: u64 = 150_000;
+
 /// The result of publishing a Public collection (devtest #7) — whether it was truncated to a paywall
 /// teaser, and how many item nodes browsers can see vs how many the full collection holds. The
 /// frontend uses this to tell the user their large collection is showing a preview.
@@ -315,11 +327,11 @@ async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult
     // IPC response is never sent and the dialog hangs on "Scanning…" forever.
     // Tauri's own `spawn_blocking` plus a std `recv_timeout` deadline has no such
     // hidden runtime dependency.
-    let scan = move || -> anyhow::Result<(Vec<DirectoryItem>, u64)> {
+    let scan = move || -> anyhow::Result<SelectiveScan> {
         anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
-        scan_selective(&root, &include, &globs)
+        scan_selective_sized(&root, &include, &globs)
     };
-    let (listing, total_bytes) = match tauri::async_runtime::spawn_blocking(move || {
+    let SelectiveScan { items: listing, total_bytes, oversized } = match tauri::async_runtime::spawn_blocking(move || {
         run_blocking_with_deadline(scan, std::time::Duration::from_secs(30)).map_err(|e| {
             // Preserve the prior caller-facing timeout copy.
             if e == DEADLINE_EXCEEDED {
@@ -335,7 +347,15 @@ async fn scan_directory_inner(opts: ScanOptions, store: &DataStore) -> CmdResult
         Ok(inner) => inner?,
         Err(e) => return Err(format!("Scan task failed: {e}")),
     };
-    let item_count = count_items(&listing);
+    // QURATOR-336: an oversized scan hands back the count the estimator had reached when it crossed
+    // `OVERSIZED_ITEM_THRESHOLD` — a **LOWER BOUND**, which is what the UI renders as "n+ items" —
+    // rather than `count_items` of the teaser (that would be the teaser's count, not the
+    // collection's). Persisting this onto `Collection::item_count` is also how the oversized bit
+    // reaches the published listing: `collection_is_oversized` reads it back at publish time.
+    let item_count = match oversized {
+        Some(lower_bound) => lower_bound,
+        None => count_items(&listing),
+    };
     let est_size = if total_bytes > 0 { Some(format_size(total_bytes)) } else { None };
 
     let mut collection = Collection {
@@ -403,11 +423,11 @@ pub(crate) fn rescan_listing(slug: &str, store: &DataStore) -> Result<Option<Vec
     let root = std::path::PathBuf::from(&spec.root);
     let globs = build_glob_set(&spec.exclude)?;
     let include = IncludeSet::new(spec.include.clone());
-    let scan = move || -> anyhow::Result<(Vec<DirectoryItem>, u64)> {
+    let scan = move || -> anyhow::Result<SelectiveScan> {
         anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
-        scan_selective(&root, &include, &globs)
+        scan_selective_sized(&root, &include, &globs)
     };
-    let (mut listing, _bytes) =
+    let SelectiveScan { items: mut listing, oversized, .. } =
         run_blocking_with_deadline(scan, std::time::Duration::from_secs(30)).map_err(|e| {
             if e == DEADLINE_EXCEEDED {
                 format!("re-scan of '{slug}' timed out after 30 seconds")
@@ -419,6 +439,20 @@ pub(crate) fn rescan_listing(slug: &str, store: &DataStore) -> Result<Option<Vec
     if let Ok(Some(prev)) = store.load_collection_draft(slug) {
         let notes = collect_notes(&prev.listing, "");
         listing = apply_notes(listing, &notes, "");
+    }
+    // QURATOR-336: a re-scan owns the draft's `item_count`, in BOTH directions. Oversized ⇒ the
+    // estimator's **lower bound**, which is both what the UI renders as "n+ items" and what carries
+    // the oversized bit into the published listing (`collection_is_oversized` derives from it).
+    // Not oversized ⇒ the real count — which is what UN-marks a collection that shrank back under
+    // the threshold. `RelayPublishSink::republish` (watch.rs) therefore no longer recounts: a
+    // recount of the capped preview would drop an oversized collection below the threshold and
+    // silently un-mark it.
+    let item_count = oversized.unwrap_or_else(|| count_items(&listing));
+    if let Ok(Some(mut draft)) = store.load_collection_draft(slug) {
+        if draft.item_count != item_count {
+            draft.item_count = item_count;
+            store.save_collection_draft(&draft).map_err(cmd_err)?;
+        }
     }
     Ok(Some(listing))
 }
@@ -588,6 +622,30 @@ pub async fn update_collection_meta(
     store.save_collection_draft(&col).map_err(cmd_err)
 }
 
+/// Whether a draft is one the scan marked **oversized** (QURATOR-336): too big to ever be sent in
+/// full, so it is published as a bounded breadth-first teaser.
+///
+/// ⚠ CARRIER (QURATOR-336 slice A). The owner's design puts `oversized: bool` on
+/// `hb_core::Collection` with `#[serde(default, skip_serializing_if = "std::ops::Not::not")]`. That
+/// field is OWED, not built here: adding a field to `Collection` is not a local edit — Rust has no
+/// defaulted struct-literal field, so every `Collection { … }` literal in the workspace (~30 across
+/// a dozen modules, several of them files another lane holds, `browse.rs` included) would have to
+/// grow an initialiser in the same commit. Slice A therefore derives the bit from the count the
+/// scan already persists, and the migration is one line: this body becomes `col.oversized`, and the
+/// injection in `collection_to_listing_json` goes away.
+///
+/// The derivation is unambiguous because the scan writes the estimator's **lower bound** into
+/// `item_count` for an oversized tree (always `> OVERSIZED_ITEM_THRESHOLD`), while the full-scan
+/// path refuses anything past [`MAX_COLLECTION_ITEMS`] = 100,000 — so no collection that fits can
+/// ever be mistaken for one that does not.
+///
+/// Wire rule (CLAUDE.md §6): `oversized` is a new OPTIONAL listing field, and absent means today's
+/// behaviour — peers may still ask, and the owner's own seal refuses anything past the 16 MiB
+/// ceiling — so there is no weaker path to fall into and no discriminant bump.
+fn collection_is_oversized(col: &Collection) -> bool {
+    col.item_count > OVERSIZED_ITEM_THRESHOLD
+}
+
 /// Map a `Collection` draft to the render-model listing JSON: the directory tree moves from
 /// `listing` to `entries` (what `hb-net::render_listing` consumes), the rest stays as metadata.
 /// Pure — unit-tested without a relay.
@@ -600,6 +658,21 @@ pub(crate) fn collection_to_listing_json(mut col: Collection) -> Result<String, 
     if let serde_json::Value::Object(ref mut map) = v {
         if let Some(listing) = map.remove("listing") {
             map.insert("entries".into(), listing);
+        }
+        // QURATOR-336: the oversized bit rides in the listing metadata — extra meta keys are the
+        // established shape here (`snapshot_fingerprint` below is one), `truncate_listing` clones
+        // the object minus `entries` so it preserves them, and `split_listing` carries them into
+        // every part's meta too. Inserted only when true, the `skip_serializing_if` half of the
+        // owed field: a listing that is not oversized keeps exactly the shape it had before this
+        // change, so nothing downstream has to learn a new key to keep working.
+        if collection_is_oversized(&col) {
+            map.insert("oversized".into(), serde_json::Value::Bool(true));
+            // The Browse teaser reads `total_items` for its "N+ items" lower bound. The BFS preview
+            // is built to fit the teaser budget, so `truncate_listing` usually never truncates it and
+            // never stamps a count — stamp the estimator's lower bound here instead. If truncation
+            // does fire it overwrites this with the preview's own node count, which is why the UI
+            // treats the figure as a lower bound in every case.
+            map.insert("total_items".into(), serde_json::Value::from(col.item_count));
         }
         // M16 W3: stamp the full-tree snapshot fingerprint into the listing metadata so it rides —
         // through `truncate_listing` (the paywall teaser) and `split_listing` (the big-relay full
@@ -857,11 +930,14 @@ pub(crate) async fn publish_collection_inner(
     // QURATOR-200: no fail-open here — `prepare_listing` above already proved the draft exists, so
     // a missing draft at this point means it was deleted mid-publish, and defaulting that to
     // Public would publish a public event for a collection that no longer exists.
-    let visibility = store
+    let draft = store
         .load_collection_draft(slug)
         .map_err(cmd_err)?
-        .map(|c| c.visibility)
         .ok_or_else(|| format!("No draft found for collection '{slug}'"))?;
+    let visibility = draft.visibility;
+    // QURATOR-336: an oversized draft's `listing` is the bounded breadth-first teaser, so there is
+    // no complete listing to publish anywhere — see the big-relay gate below.
+    let oversized = collection_is_oversized(&draft);
     if visibility == Visibility::Private {
         // QURATOR-200 (F10's sibling): republishing as Private must retract the PUBLIC listing the
         // previous publish left live. Without this the marker is overwritten with the private
@@ -907,7 +983,12 @@ pub(crate) async fn publish_collection_inner(
     // not fail the whole publish; the browse side falls back to the teaser and the owner can re-publish.
     // The big relay actually targeted (trimmed), captured so it can be recorded in the marker below —
     // unpublish deletes from the relay the family WENT to, not merely the then-current setting.
-    let big_target = big_relay_target(published.truncated, &big_relay_url).map(str::to_string);
+    // QURATOR-336: an oversized collection publishes NO full family, so the classifier is fed a
+    // `truncated` of `false` for it. Its draft listing is already the bounded teaser, and the family
+    // carrier is read brows-side as the COMPLETE listing — publishing the teaser through it would
+    // claim completeness for a tree nobody has the bytes for (and the teaser is untruncated, so it
+    // carries no `truncated`/`total_items` markers to say otherwise).
+    let big_target = big_relay_target(published.truncated && !oversized, &big_relay_url).map(str::to_string);
     let big_relay_parts = match big_target.as_deref() {
         Some(big) => {
             let relays = [big.to_string()];
@@ -1099,6 +1180,17 @@ pub(crate) fn build_slug_manifest(
         return Err("Private collections are sealed per recipient, not exported as a shared manifest — \
                     trusted contacts already receive the whole listing."
             .into());
+    }
+    // QURATOR-336: an oversized collection has no full listing to send — its draft holds the
+    // bounded breadth-first teaser precisely because the whole tree cannot fit. Building the
+    // envelope anyway would serialize and seal minutes of parts to produce something the 16 MiB
+    // transport ceiling then refuses, so the owner is told up front instead of paying for it.
+    if collection_is_oversized(&col) {
+        return Err(format!(
+            "'{safe_slug}' is too large to send in full (more than {OVERSIZED_ITEM_THRESHOLD} \
+             items) — it is published as a preview, and no full manifest can fit the transport \
+             ceiling. Split it into smaller collections to export one."
+        ));
     }
     if col.content_types.is_empty() {
         return Err(
@@ -1650,6 +1742,34 @@ impl IncludeSet {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The selection rules, as three pure predicates
+// ---------------------------------------------------------------------------
+//
+// These are the *whole* of the selection logic `scan_selective_walk` applies, lifted out so the
+// walk and the oversized estimator (QURATOR-336) cannot drift: two traversals that must agree on
+// what a tree contains are one traversal too many when the rules are copied. Each is a one-line
+// composition of the [`IncludeSet`] methods, so the rules still live in one place.
+
+/// Whether loose files in the directory at `rel_prefix` are listed: the collection root and any
+/// included directory list them; an ancestor-only directory withholds them (its files are reached
+/// only by being checked individually).
+fn lists_loose_files(rel_prefix: &str, include: &IncludeSet) -> bool {
+    rel_prefix.is_empty() || include.is_included(rel_prefix)
+}
+
+/// Whether the traversal descends into the directory at `rel_path`: it is selected (whole subtree)
+/// or is an ancestor of a selection (descend only to reach the checked descendant).
+fn dir_is_descended(rel_path: &str, include: &IncludeSet) -> bool {
+    include.is_included(rel_path) || include.has_descendant_under(rel_path)
+}
+
+/// Whether a FILE entry at `rel_path` is listed: it lives in a directory that lists loose files
+/// (`loose`), or it is itself checked (devtest #10).
+fn file_is_listed(rel_path: &str, loose: bool, include: &IncludeSet) -> bool {
+    loose || include.is_included(rel_path)
+}
+
 /// F1 (privacy boundary): reject an `include` entry that is absolute or contains `..`, then
 /// `canonicalize()` the resolved sub-path and assert it still lives under the canonicalized
 /// collection root. A crafted `include` (e.g. `../../etc`, an absolute path, or a symlink that
@@ -1680,18 +1800,73 @@ pub(crate) fn contained_under_root(root: &Path, rel: &str) -> Result<std::path::
     Ok(resolved)
 }
 
+/// What a selection-aware scan produced, plus whether the tree turned out to be **oversized**
+/// (QURATOR-336). `oversized` is `None` for the ordinary case — the listing is the whole tree and
+/// `total_bytes` is its real size — and `Some(lower_bound)` for an oversized one, where `items` is
+/// the breadth-first teaser instead (see [`scan_selective_bfs_teaser`]) and `lower_bound` is the
+/// count the estimator had reached when it crossed [`OVERSIZED_ITEM_THRESHOLD`].
+#[derive(Debug)]
+pub(crate) struct SelectiveScan {
+    pub items: Vec<DirectoryItem>,
+    pub total_bytes: u64,
+    /// `Some(n)` ⇒ oversized; `n` is a **LOWER BOUND** on the collection's item count (the
+    /// estimator stopped counting the moment it crossed the threshold), so it is what a browser
+    /// should render as "n+ items".
+    pub oversized: Option<u64>,
+}
+
 /// Selection-aware directory walk (replaces the depth-limited `scan_recursive`). Always lists
 /// root-level loose files; fully recurses a subdir iff it (or an ancestor) is checked; for a dir
 /// that is only an *ancestor* of a selection, traverses it but withholds its own loose files;
 /// otherwise skips it. Validates every `include` entry against the root (F1) before any walk.
+///
+/// **Oversized collections (QURATOR-336)** take a different shape, and it is decided up front: a
+/// cheap breadth-first COUNT pass runs first ([`estimate_item_count`]) and stops the instant the
+/// tree is provably past [`OVERSIZED_ITEM_THRESHOLD`]. If it is, the full walk below — which
+/// materializes one `DirectoryItem` per file and is exactly the minutes-long pass a 40-million-file
+/// collection cannot afford — never runs; a breadth-first teaser bounded by [`LISTING_MAX_BYTES`]
+/// is built instead. If it is not (the count came back at or under the threshold), the rest of this
+/// function is today's path byte for byte, including the [`MAX_COLLECTION_ITEMS`] refusal.
+///
+/// Signature-preserving wrapper over [`scan_selective_sized`] for the callers that do not consume
+/// the oversized bit (the watcher's test, the WAN harness's seed). Production callers use the
+/// sized form.
 pub(crate) fn scan_selective(
     root: &Path,
     include: &IncludeSet,
     exclude: &globset::GlobSet,
 ) -> anyhow::Result<(Vec<DirectoryItem>, u64)> {
+    let scan = scan_selective_sized(root, include, exclude)?;
+    Ok((scan.items, scan.total_bytes))
+}
+
+/// [`scan_selective`] with the oversized bit — the real entry point.
+pub(crate) fn scan_selective_sized(
+    root: &Path,
+    include: &IncludeSet,
+    exclude: &globset::GlobSet,
+) -> anyhow::Result<SelectiveScan> {
+    scan_selective_sized_with_threshold(root, include, exclude, OVERSIZED_ITEM_THRESHOLD)
+}
+
+/// The threshold is a parameter (not baked in) so the oversized branch is reachable from a test
+/// with a handful of real files instead of 150,000 — the same reason [`enforce_item_cap`] is a
+/// pure predicate.
+fn scan_selective_sized_with_threshold(
+    root: &Path,
+    include: &IncludeSet,
+    exclude: &globset::GlobSet,
+    threshold: u64,
+) -> anyhow::Result<SelectiveScan> {
     // F1: containment check on every checked path BEFORE walking anything.
     for c in &include.checked {
         contained_under_root(root, c).map_err(|e| anyhow::anyhow!(e))?;
+    }
+    if let Some(lower_bound) = estimate_item_count(root, include, exclude, threshold)?
+        .into_oversized()
+    {
+        let (items, total_bytes) = scan_selective_bfs_teaser(root, include, exclude, LISTING_MAX_BYTES)?;
+        return Ok(SelectiveScan { items, total_bytes, oversized: Some(lower_bound) });
     }
     let (items, total_bytes) = scan_selective_walk(root, include, exclude)?;
     // MAX_COLLECTION_ITEMS: enforced DURING the walk (the walker aborts the moment its running
@@ -1699,7 +1874,237 @@ pub(crate) fn scan_selective(
     // just to be rejected) and again here, on the final assembled tree — the single chokepoint
     // every scan caller goes through, so no entry point can bypass it.
     enforce_item_cap(count_items(&items)).map_err(|e| anyhow::anyhow!(e))?;
-    Ok((items, total_bytes))
+    Ok(SelectiveScan { items, total_bytes, oversized: None })
+}
+
+/// What the estimator found. `count` is the exact item count when `complete`, and a **LOWER BOUND**
+/// on it when not — the pass stopped the moment it crossed the threshold, so the tree's real total
+/// was never established. `count > threshold` whenever `complete` is false, by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Estimate {
+    count: u64,
+    complete: bool,
+}
+
+impl Estimate {
+    /// `Some(lower_bound)` when the pass stopped at the threshold — the collection is oversized —
+    /// and `None` when the whole tree was counted and fits.
+    fn into_oversized(self) -> Option<u64> {
+        (!self.complete).then_some(self.count)
+    }
+}
+
+/// Cheap breadth-first **count** pass over the same selection the real walk uses — the "can this
+/// collection possibly be sent?" probe that runs before [`scan_selective_walk`] (QURATOR-336). It
+/// builds no `DirectoryItem`, keeps no bytes, and stops the instant its running count passes
+/// `threshold`, so the cost is proportional to how big the tree *has* to be before the answer is
+/// already known — never to how big it is.
+///
+/// The selection rules are the same predicates the walk calls ([`lists_loose_files`],
+/// [`dir_is_descended`], [`file_is_listed`]) over the same `exclude` globset, and the depth bound is
+/// the same [`MAX_SCAN_DEPTH`] with the same message — so the count can never describe a different
+/// tree than the walk (or the teaser) would produce.
+///
+/// The threshold is a parameter (not baked in) so the early stop is reachable from a test with a
+/// handful of real files instead of 150,000 — the same reason [`enforce_item_cap`] is a pure
+/// predicate.
+fn estimate_item_count(
+    root: &Path,
+    include: &IncludeSet,
+    exclude: &globset::GlobSet,
+    threshold: u64,
+) -> anyhow::Result<Estimate> {
+    // (absolute path, relative prefix, depth), FIFO — breadth-first, so the early stop fires as
+    // shallow as the tree allows.
+    let mut queue: std::collections::VecDeque<(std::path::PathBuf, String, usize)> =
+        std::collections::VecDeque::new();
+    queue.push_back((root.to_path_buf(), String::new(), 0));
+    // Files and folders both count, matching `count_items`'s definition of an item (and therefore
+    // the units [`MAX_COLLECTION_ITEMS`] / [`OVERSIZED_ITEM_THRESHOLD`] are stated in).
+    let mut count: u64 = 0;
+    while let Some((dir, rel_prefix, depth)) = queue.pop_front() {
+        let loose = lists_loose_files(&rel_prefix, include);
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel_path =
+                if rel_prefix.is_empty() { name.clone() } else { format!("{rel_prefix}/{name}") };
+            if exclude.is_match(&rel_path) {
+                continue;
+            }
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                if !dir_is_descended(&rel_path, include) {
+                    continue;
+                }
+                // Same bound, same message, same point in the descent as the walk's (the parent
+                // refuses before descending).
+                if depth >= MAX_SCAN_DEPTH {
+                    return Err(anyhow::anyhow!(
+                        "directory tree exceeds the {MAX_SCAN_DEPTH}-level depth limit at \
+                         '{rel_path}'; refusing to scan deeper (possible hostile nesting)"
+                    ));
+                }
+                count += 1;
+                if count > threshold {
+                    return Ok(Estimate { count, complete: false });
+                }
+                queue.push_back((entry.path(), rel_path, depth + 1));
+            } else if meta.is_file() && file_is_listed(&rel_path, loose, include) {
+                count += 1;
+                if count > threshold {
+                    return Ok(Estimate { count, complete: false });
+                }
+            }
+        }
+    }
+    Ok(Estimate { count, complete: true })
+}
+
+/// Breadth-first listing builder for an **oversized** collection (QURATOR-336): every entry at
+/// depth 1 is placed before any entry at depth 2, and so on, so the published preview shows the
+/// collection's top-level shape rather than one arbitrarily deep branch of it. The walk stops once
+/// the listing would pass `budget_bytes`, and whatever was reached is a valid `Vec<DirectoryItem>`
+/// tree — folders hold whatever children were reached before the stop.
+///
+/// **The byte measure** is [`teaser_item_bytes`] summed over the items placed, started at 2 for the
+/// array's two brackets. That is the SAME serialization the publish uses (`serde_json` over
+/// `DirectoryItem`, the type `collection_to_listing_json` writes into `entries`), and per item it
+/// accounts one byte more than the separator that item will need — so the running total is a
+/// *lower* bound on the real `entries` bytes at any prefix, and the builder can never overfill the
+/// budget. Two consequences worth stating plainly: the envelope's metadata (alias, description,
+/// markers) sits *outside* `entries`, so `truncate_listing` may still trim a few entries off the
+/// tail — bounded by that metadata (a few hundred bytes), never by the tree — and the scan still
+/// never walked the millions of entries it stopped in.
+fn scan_selective_bfs_teaser(
+    root: &Path,
+    include: &IncludeSet,
+    exclude: &globset::GlobSet,
+    budget_bytes: usize,
+) -> anyhow::Result<(Vec<DirectoryItem>, u64)> {
+    let mut roots: Vec<DirectoryItem> = vec![];
+    let mut total_bytes: u64 = 0;
+    // The two brackets `entries` will be wrapped in. Reserving them here keeps the accounting an
+    // over-estimate (never an under-estimate) of the array's real serialized size.
+    let mut entry_bytes: usize = 2;
+    // (absolute path, relative prefix, index path of the folder to expand, its depth). The index
+    // path is how a child reaches the folder that owns it without holding a live borrow of the tree.
+    let mut queue: std::collections::VecDeque<(std::path::PathBuf, String, Vec<usize>, usize)> =
+        std::collections::VecDeque::new();
+    queue.push_back((root.to_path_buf(), String::new(), vec![], 0));
+    while let Some((dir, rel_prefix, idx_path, depth)) = queue.pop_front() {
+        let loose = lists_loose_files(&rel_prefix, include);
+        // (relative path, absolute path, metadata, display name), then sorted exactly as each walk
+        // frame sorts: folders first, then names, case-insensitively.
+        let mut entries: Vec<(String, std::path::PathBuf, std::fs::Metadata, String)> = vec![];
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel_path =
+                if rel_prefix.is_empty() { name.clone() } else { format!("{rel_prefix}/{name}") };
+            if exclude.is_match(&rel_path) {
+                continue;
+            }
+            let meta = entry.metadata()?;
+            // Anything that is neither a plain directory nor a file (sockets, fifos, …) is not an
+            // item anywhere in this module.
+            if !meta.is_dir() && !meta.is_file() {
+                continue;
+            }
+            entries.push((rel_path, entry.path(), meta, name));
+        }
+        entries.sort_by(|a, b| match (a.2.is_dir(), b.2.is_dir()) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+        });
+        let mut stop = false;
+        for (rel_path, path, meta, name) in entries {
+            let item = if meta.is_dir() {
+                if !dir_is_descended(&rel_path, include) {
+                    continue;
+                }
+                if depth >= MAX_SCAN_DEPTH {
+                    return Err(anyhow::anyhow!(
+                        "directory tree exceeds the {MAX_SCAN_DEPTH}-level depth limit at \
+                         '{rel_path}'; refusing to scan deeper (possible hostile nesting)"
+                    ));
+                }
+                DirectoryItem {
+                    name: name.clone(),
+                    item_type: ItemType::Folder,
+                    size: None,
+                    format: None,
+                    year: None,
+                    tags: vec![],
+                    note: None,
+                    children: vec![],
+                }
+            } else {
+                if !file_is_listed(&rel_path, loose, include) {
+                    continue;
+                }
+                total_bytes += meta.len();
+                DirectoryItem {
+                    name: name.clone(),
+                    item_type: ItemType::File,
+                    size: Some(format_size(meta.len())),
+                    format: path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_uppercase()),
+                    year: None,
+                    tags: vec![],
+                    note: None,
+                    children: vec![],
+                }
+            };
+            let cost = teaser_item_bytes(&item);
+            if entry_bytes + cost > budget_bytes {
+                // The budget is spent: stop the whole breadth-first pass, leaving every folder
+                // already placed holding the children that were reached.
+                stop = true;
+                break;
+            }
+            entry_bytes += cost;
+            let is_dir = item.item_type == ItemType::Folder;
+            let children = listing_node_mut(&mut roots, &idx_path);
+            let child_index = children.len();
+            children.push(item);
+            if is_dir {
+                let mut child_path = idx_path.clone();
+                child_path.push(child_index);
+                queue.push_back((path, rel_path, child_path, depth + 1));
+            }
+        }
+        if stop {
+            break;
+        }
+    }
+    Ok((roots, total_bytes))
+}
+
+/// Mutable access to the children vector of the item at `idx_path` inside a listing under
+/// construction — an empty path is the listing itself. How the breadth-first builder hands a child
+/// to the folder that owns it while the tree is walked without recursion.
+fn listing_node_mut<'a>(
+    roots: &'a mut Vec<DirectoryItem>,
+    idx_path: &[usize],
+) -> &'a mut Vec<DirectoryItem> {
+    match idx_path.split_first() {
+        None => roots,
+        Some((head, rest)) => listing_node_mut(&mut roots[*head].children, rest),
+    }
+}
+
+/// What one item costs the teaser budget: its serialized length under the SAME `serde_json`
+/// serialization the publish path uses, plus one byte for the array separator it will need. Summed
+/// over the items actually placed, that is at least the real serialized size of those items — the
+/// direction that cannot overfill the budget (see [`scan_selective_bfs_teaser`]). Failing to
+/// serialize (it cannot: `DirectoryItem` has no non-string keys and no floats) reads as "infinitely
+/// large", which stops the walk rather than filling it with something unmeasurable.
+fn teaser_item_bytes(item: &DirectoryItem) -> usize {
+    serde_json::to_string(item).map(|s| s.len() + 1).unwrap_or(usize::MAX)
 }
 
 /// Pure predicate behind the [`MAX_COLLECTION_ITEMS`] guard — no filesystem, so it's testable
@@ -1763,8 +2168,9 @@ impl WalkFrame {
     ) -> anyhow::Result<WalkFrame> {
         let is_root = rel_prefix.is_empty();
         // Loose files are listed at the root and inside any included directory; an ancestor-only
-        // directory withholds them.
-        let list_loose_files = is_root || include.is_included(rel_prefix);
+        // directory withholds them. The predicate is shared with the oversized estimator so the two
+        // traversals cannot disagree about what this tree contains.
+        let list_loose_files = lists_loose_files(rel_prefix, include);
 
         let mut frame =
             WalkFrame { name, depth, items: vec![], total_bytes: 0, pending: vec![] };
@@ -1778,10 +2184,9 @@ impl WalkFrame {
             let meta = entry.metadata()?;
             let path = entry.path();
             if meta.is_dir() {
-                let included = include.is_included(&rel_path);
                 // Descend into a directory that is selected (full subtree) OR only an ancestor of
                 // a selection (to reach the checked descendant). Skip everything else entirely.
-                if !included && !include.has_descendant_under(&rel_path) {
+                if !dir_is_descended(&rel_path, include) {
                     continue;
                 }
                 // Depth bound (audit #9): a pathologically nested tree (hostile archive / synced
@@ -1796,7 +2201,7 @@ impl WalkFrame {
                     ));
                 }
                 frame.pending.push((path, rel_path, name));
-            } else if meta.is_file() && (list_loose_files || include.is_included(&rel_path)) {
+            } else if meta.is_file() && file_is_listed(&rel_path, list_loose_files, include) {
                 // devtest #10: a file is included when it lives in the root/an included directory
                 // (the existing folder rule) OR when it is *itself* checked — so the user can pick
                 // individual files inside a directory they did not select wholesale.
@@ -2773,6 +3178,264 @@ mod tests {
         assert!(!json.contains("x_loose.txt"));
         assert!(items.iter().all(|i| i.item_type == ItemType::File),
             "with no selection, only loose root files appear (no folders)");
+    }
+
+    // ── QURATOR-336: oversized collections (estimate → BFS teaser → oversized bit) ────────────
+
+    /// QURATOR-336 (1): the oversized probe must decide from a PREFIX of the tree, not from a full
+    /// count — the entire point of the estimator is that a 40-million-file collection costs a
+    /// handful of `read_dir`s to classify. The threshold is a parameter precisely so this test can
+    /// use four real files instead of 150,000.
+    ///
+    /// Mutation to redden: in `estimate_item_count` (collection.rs:1905), move the early return out of the loop — e.g.
+    /// change the file arm's `return Ok(Estimate { count, complete: false });` to a no-op so the
+    /// pass finishes and falls through to `Ok(Estimate { count, complete: true })` — the count then
+    /// comes back at the tree's real total (60, `complete: true`) and the first assert reds.
+    /// Equally, returning `Estimate { count: threshold, complete: false }` where collection.rs:1950
+    /// returns `count` reds it, since the value is pinned.
+    #[test]
+    fn oversized_estimator_stops_at_the_threshold_without_walking_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        // 60 root files, all listed (root loose files are always items). Threshold 3.
+        for i in 0..60 {
+            std::fs::write(dir.path().join(format!("f{i:02}.txt")), b"x").unwrap();
+        }
+        let stopped = estimate_item_count(dir.path(), &include(&[]), &empty_globs(), 3).unwrap();
+        assert_eq!(
+            stopped,
+            Estimate { count: 4, complete: false },
+            "the probe stops on the 4th item it sees, not the 60th"
+        );
+
+        // …and a tree at or under the threshold is counted in FULL (`complete`), so the caller
+        // takes today's path.
+        let small = tempfile::tempdir().unwrap();
+        std::fs::write(small.path().join("only.txt"), b"x").unwrap();
+        assert_eq!(
+            estimate_item_count(small.path(), &include(&[]), &empty_globs(), 3).unwrap(),
+            Estimate { count: 1, complete: true }
+        );
+    }
+
+    /// QURATOR-336 (1) cont'd: the estimator is a *second traversal* of the same selection rules,
+    /// which is exactly the thing that can silently drift from the walk. This pins the two against
+    /// each other on the shared fixture — with the threshold out of reach the estimator's count must
+    /// equal `count_items` of the very tree `scan_selective_walk` builds, for every selection shape
+    /// and under an exclusion globset too.
+    ///
+    /// Mutation to redden: in `estimate_item_count` (collection.rs:1947), replace the file arm's
+    /// `file_is_listed(&rel_path, loose, include)` with `true` — the ancestor-only case then counts
+    /// `a`'s withheld loose files, the estimator's count exceeds the walk's, and the `assert_eq!`
+    /// reds. (Equally: drop the `dir_is_descended` guard at collection.rs:1931 — every unselected
+    /// subtree is then counted.)
+    #[test]
+    fn oversized_estimator_counts_the_same_tree_the_walk_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        make_selective_tree(dir.path());
+        let exclusions = [empty_globs(), build_glob_set(&["root.txt".to_string()]).unwrap()];
+        for exclude in &exclusions {
+            for inc in
+                [include(&[]), include(&["a"]), include(&["a/b"]), include(&["x", "a/b"])]
+            {
+                let est = estimate_item_count(dir.path(), &inc, exclude, u64::MAX).unwrap();
+                assert!(est.complete, "threshold MAX cannot stop early");
+                let (walked, _) = scan_selective_walk(dir.path(), &inc, exclude).unwrap();
+                assert_eq!(
+                    est.count,
+                    count_items(&walked),
+                    "the estimator and the walk must agree on what this selection contains"
+                );
+            }
+        }
+    }
+
+    /// QURATOR-336 (3): the teaser is built **breadth-first** — every depth-1 entry before any
+    /// depth-2 entry — and stops on the byte budget. Fixture: three folders (`d1`…`d3`, each holding
+    /// three equal-length file names) plus one root file; folders sort before files at each level, as
+    /// the walk orders them. The budget is calibrated to fit the whole of depth 1 plus exactly ONE
+    /// depth-2 file, so the folder that ends up holding a child is the discriminator: breadth-first
+    /// fills `d1` (its children were queued first), a LIFO/depth-first builder fills `d3`, and a
+    /// recursive depth-first one never reaches `d2`/`d3` at all.
+    ///
+    /// Mutation to redden: in `scan_selective_bfs_teaser`, make the queue LIFO — `queue.pop_front()` (collection.rs:1989)
+    /// → `queue.pop_back()` (or push_front instead of push_back) — `d3` then holds the single
+    /// child and the `d1`/`d2`/`d3` child-count asserts red.
+    #[test]
+    fn oversized_teaser_is_breadth_first_and_never_overfills_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        for d in ["d1", "d2", "d3"] {
+            let sub = dir.path().join(d);
+            std::fs::create_dir(&sub).unwrap();
+            for f in ["x1", "x2", "x3"] {
+                std::fs::write(sub.join(format!("{f}.txt")), b"x").unwrap();
+            }
+        }
+        std::fs::write(dir.path().join("root.txt"), b"x").unwrap();
+
+        // Calibrate against the production measure, over items of exactly the shapes the scan will
+        // build (equal-length names, one-byte files, `.txt`). Files are written as b"x", so the
+        // production `format_size(1)`/`"TXT"` pair is what these stand in for.
+        let folder_cost = teaser_item_bytes(&DirectoryItem {
+            name: "d1".into(),
+            item_type: ItemType::Folder,
+            size: None,
+            format: None,
+            year: None,
+            tags: vec![],
+            note: None,
+            children: vec![],
+        });
+        let child_cost = teaser_item_bytes(&DirectoryItem {
+            name: "x1.txt".into(),
+            item_type: ItemType::File,
+            size: Some(format_size(1)),
+            format: Some("TXT".into()),
+            year: None,
+            tags: vec![],
+            note: None,
+            children: vec![],
+        });
+        let root_file_cost = teaser_item_bytes(&DirectoryItem {
+            name: "root.txt".into(),
+            item_type: ItemType::File,
+            size: Some(format_size(1)),
+            format: Some("TXT".into()),
+            year: None,
+            tags: vec![],
+            note: None,
+            children: vec![],
+        });
+        // 2 (the array's brackets) + the three folders + the root file + one depth-2 file.
+        let budget = 2 + 3 * folder_cost + root_file_cost + child_cost;
+        let inc = include(&["d1", "d2", "d3"]);
+
+        let (tea, _) =
+            scan_selective_bfs_teaser(dir.path(), &inc, &empty_globs(), budget).unwrap();
+
+        // Depth 1 is complete (folders first, then the loose root file) BEFORE any depth-2 entry.
+        let top: Vec<&str> = tea.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(top, ["d1", "d2", "d3", "root.txt"], "every depth-1 entry is present, in order");
+        let d1 = &tea[0];
+        assert_eq!(d1.children.len(), 1, "d1 was queued first, so it takes the one spare slot");
+        assert_eq!(d1.children[0].name, "x1.txt");
+        assert!(tea[1].children.is_empty(), "d2 is reached but the budget is spent");
+        assert!(tea[2].children.is_empty(), "d3 is reached but the budget is spent");
+        // The budget holds: the builder can only under-fill it (its per-item accounting is an
+        // over-estimate of the serialized array).
+        let serialized = serde_json::to_string(&tea).unwrap().len();
+        assert!(serialized <= budget, "{serialized} bytes serialized into a {budget}-byte budget");
+    }
+
+    /// QURATOR-336 (2)+(3): which path a scan takes is decided by the estimator alone, and the
+    /// ordinary path is untouched. Under the threshold: the full selection walk, `oversized` absent,
+    /// real byte total. Past it: the teaser branch, with the crossing count reported (the
+    /// threshold-crossing LOWER BOUND the UI renders as "n+ items").
+    ///
+    /// Mutation to redden: in `scan_selective_sized_with_threshold`, change collection.rs:1859's
+    /// `if let Some(lower_bound) = …into_oversized()` to `if false` — the second half's
+    /// `assert_eq!(big.oversized, Some(1))` reds (the tree would go through the walk and, at 0, hit
+    /// the item cap instead). Also: `OVERSIZED_ITEM_THRESHOLD` → `MAX_COLLECTION_ITEMS` would red the
+    /// first half only if the fixture were over 100k items, so it does *not* — the threshold's value
+    /// is pinned by `oversized_flag_rides_in_the_listing_and_is_absent_when_not_oversized` instead.
+    #[test]
+    fn oversized_branch_replaces_the_plain_scan_only_past_the_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        make_selective_tree(dir.path());
+        let inc = include(&["a"]);
+
+        let scan =
+            scan_selective_sized_with_threshold(dir.path(), &inc, &empty_globs(), 10).unwrap();
+        assert_eq!(scan.oversized, None, "a tree under the threshold is not oversized");
+        let json = serde_json::to_string(&scan.items).unwrap();
+        assert!(json.contains("c_file.txt"), "the ordinary path still recurses the selection");
+        assert!(!json.contains("x_loose.txt"), "the ordinary path still skips unselected dirs");
+        assert_eq!(scan.total_bytes, 4, "a_loose + b_file + c_file + root.txt, one byte each");
+
+        // Threshold 0 ⇒ the very first counted item crosses it.
+        let big =
+            scan_selective_sized_with_threshold(dir.path(), &inc, &empty_globs(), 0).unwrap();
+        assert_eq!(big.oversized, Some(1), "the estimator's crossing count is what is reported");
+    }
+
+    /// QURATOR-336 wire rule (CLAUDE.md §6): `oversized` is a new OPTIONAL listing field. Present ⇒
+    /// the browse side can render "n+ items"; absent ⇒ exactly the listing shape that existed before
+    /// this change, which any reader (old or new) parses unchanged. So there is no weaker path to
+    /// fall into, and no `parts_v` / discriminant bump. Both shapes are pinned here, and the field is
+    /// pinned against `OVERSIZED_ITEM_THRESHOLD` itself (the boundary: at the threshold, nothing).
+    ///
+    /// Mutation to redden: in `collection_to_listing_json` (collection.rs:668), delete the `map.insert("oversized"…)`
+    /// block — the first assert reds. Change `collection_is_oversized`'s `>` to `>=` (collection.rs:646) — the
+    /// at-the-threshold case then carries the key and the third assert reds.
+    #[test]
+    fn oversized_flag_rides_in_the_listing_and_is_absent_when_not_oversized() {
+        let mut big = a_big_collection("big");
+        big.item_count = OVERSIZED_ITEM_THRESHOLD + 1;
+        big.content_types = vec!["Games".into()];
+        let big_json = collection_to_listing_json(big).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&big_json).unwrap()["oversized"],
+            serde_json::Value::Bool(true),
+            "an oversized draft stamps the bit into the listing meta"
+        );
+
+        // …and it survives the teaser path, which rebuilds the envelope from its metadata (the same
+        // place `snapshot_fingerprint` is re-stamped), so a browser sees it on the truncated listing
+        // too.
+        let teaser = hb_net::truncate_listing(&big_json, 120).unwrap();
+        assert!(teaser.truncated, "precondition: this listing is cut down to a teaser");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&teaser.json).unwrap()["oversized"],
+            serde_json::Value::Bool(true),
+            "truncate_listing preserves unknown meta keys"
+        );
+
+        // At the threshold: absent — the key only ever marks a collection that CANNOT be sent whole.
+        let mut plain = a_big_collection("plain");
+        plain.item_count = OVERSIZED_ITEM_THRESHOLD;
+        plain.content_types = vec!["Games".into()];
+        let plain_json = collection_to_listing_json(plain).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&plain_json).unwrap();
+        assert!(parsed.get("oversized").is_none(), "absent when not oversized: {plain_json}");
+
+        // A listing published before this change carries no key at all and still reads as an
+        // ordinary Collection — the "old reader / old listing" half of the wire pin.
+        let legacy = r#"{"slug":"old","path_alias":"Old","item_count":3,
+            "last_updated":"2026-04-01T00:00:00Z","listing":[]}"#;
+        let old: Collection = serde_json::from_str(legacy).unwrap();
+        assert!(!collection_is_oversized(&old), "an old listing reads as not oversized");
+    }
+
+    /// QURATOR-336 (6): an oversized collection must never be walked into a full manifest — the
+    /// envelope would serialize and seal minutes of parts to produce something the 16 MiB transport
+    /// ceiling then refuses. The refusal names the reason, and the boundary is exact: a draft at the
+    /// threshold still exports.
+    ///
+    /// Mutation to redden: in `build_slug_manifest` (collection.rs:1182), delete the `if collection_is_oversized(&col)`
+    /// block — the first assert reds (the call then proceeds past it and returns `Ok`, so
+    /// `unwrap_err` panics).
+    #[test]
+    fn build_slug_manifest_refuses_an_oversized_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        let identity = Identity::generate();
+
+        let mut huge = a_big_collection("huge");
+        huge.item_count = OVERSIZED_ITEM_THRESHOLD + 1;
+        huge.content_types = vec!["Games".into()];
+        store.save_collection_draft(&huge).unwrap();
+        let err = build_slug_manifest("huge", &store, &identity, &[7u8; 32]).unwrap_err();
+        assert!(err.contains("too large to send in full"), "got: {err}");
+
+        // One item under the line is not oversized — the guard must not fire early and refuse a
+        // collection that fits.
+        let mut fits = a_big_collection("fits");
+        fits.item_count = OVERSIZED_ITEM_THRESHOLD;
+        fits.content_types = vec!["Games".into()];
+        store.save_collection_draft(&fits).unwrap();
+        assert!(
+            build_slug_manifest("fits", &store, &identity, &[7u8; 32]).is_ok(),
+            "at the threshold the manifest still builds"
+        );
     }
 
     /// QURATOR-253: the item cap must fire DURING the walk, not after it. A flat directory of

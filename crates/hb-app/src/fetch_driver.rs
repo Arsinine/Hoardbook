@@ -46,12 +46,15 @@ use hb_net::RelayClient;
 use nostr::prelude::*;
 use tokio::time::Instant;
 
-use crate::commands::browse::{contact_share_code, resolve_peer, resolve_peer_covered};
+use crate::commands::browse::{
+    contact_share_code, resolve_peer, resolve_peer_covered, PeerCollection,
+};
 use crate::commands::chat::{
     decode_dms, giftwrap_inbox_filter, request_manifest_from_inner, request_manifest_inner,
     DM_FETCH_MARGIN_SECS,
 };
-use crate::commands::fulfil::redeem_manifest_ticket_inner;
+use crate::commands::fulfil::redeem_manifest_ticket_with_progress;
+use crate::transport::ManifestProgress;
 use crate::identity_state::SharedIdentity;
 use crate::manifest_cache::CachedKey;
 use crate::net::SharedRelay;
@@ -65,6 +68,12 @@ use crate::transport_state::SharedEndpoint;
 /// one listing resolve per author held. The ask throttle paces what this produces, but the cheapest
 /// relay traffic is the request never made.
 const POLL_INTERVAL: Duration = Duration::from_secs(300);
+
+/// QURATOR-335 — where the background fetch reports byte progress: the same channel shape the
+/// Browse manual redeem feeds (`redeem_manifest_ticket_emitting`), drained into the
+/// `manifest-progress` event by `lib.rs`. An `mpsc` sender, never an `AppHandle`, so the WAN harness
+/// keeps calling [`poll_once`] with `None` and stays Tauri-free.
+pub(crate) type ProgressTx = tokio::sync::mpsc::UnboundedSender<ManifestProgress>;
 
 /// QURATOR-197 (F19) — failed DIALS against one ask before the redeem poll stops dialling it,
 /// mirroring `peer_wave`'s ruled convention (owner 2026-09-04: *"3 attempts against the same peer
@@ -126,6 +135,36 @@ pub(crate) fn unheld_collections(
         .iter()
         .filter(|(slug, _)| !held.iter().any(|k| k.npub == author && k.slug == *slug))
         .filter_map(|(slug, fp)| Some((slug.clone(), fp.as_ref()?.clone())))
+        .collect()
+}
+
+/// The `(slug, fingerprint)` listing shape both ask tiers compare against, built from one author's
+/// browsed collections.
+///
+/// **Exactly ONE definition, called by both [`poll_once`]'s refresh tier and [`discover_unheld`].**
+/// Two copies of this filter is the hardened-path/unhardened-sibling drift pair (CLAUDE.md §9): the
+/// tiers would then disagree about the same collection, and only one of them would be the one a
+/// future change gets applied to.
+///
+/// **An `oversized` collection is dropped** (QURATOR-336 — the owner's listing-meta marker for a
+/// collection too large to ever cross the 16 MiB manifest transfer). Such an owner can never serve
+/// a full list, so an ask is pure waste: it burns a throttle slot and a wave, and it wedges this
+/// node in "waiting for owner" forever. `None`/absent is NOT oversized — a pre-QURATOR-336 listing
+/// is asked for exactly as before, which is what keeps the marker an optional addition rather than
+/// a downgrade.
+///
+/// ⚠ `discover_unheld` also derives its liveness-eviction `listed` set from this list, so an
+/// oversized slug's stale ask trace is forgotten here too. That is correct and self-healing: while
+/// the marker stands no ask is ever minted to re-stamp it, eviction only ever forgets bookkeeping
+/// (it never refuses or drops an ask), and if the owner lifts the marker the next poll re-asks and
+/// re-mints the trace.
+pub(crate) fn published_from_collections(
+    collections: &[PeerCollection],
+) -> Vec<(String, Option<String>)> {
+    collections
+        .iter()
+        .filter(|c| c.oversized != Some(true))
+        .map(|c| (c.collection.slug.clone(), c.snapshot_fingerprint.clone()))
         .collect()
 }
 
@@ -333,6 +372,7 @@ async fn redeem_pending_tickets(
     own_npub: &str,
     live: &SharedIdentity,
     endpoint: &SharedEndpoint,
+    progress: Option<&ProgressTx>,
 ) -> (Vec<String>, Vec<String>) {
     let mut redeemed = Vec::new();
     let mut skipped_spent = Vec::new();
@@ -414,13 +454,18 @@ async fn redeem_pending_tickets(
             continue;
         }
 
-        match redeem_manifest_ticket_inner(
+        // QURATOR-335 — the background fetch reports byte progress through the SAME channel the
+        // Browse manual redeem uses (`redeem_manifest_ticket_with_progress`), so the per-collection
+        // bar moves for the fetches that actually happen now: unattended ones. `None` (the WAN
+        // harness) is the old progress-less behaviour, byte for byte.
+        match redeem_manifest_ticket_with_progress(
             msg.from.clone(),
             trimmed.to_string(),
             want,
             live,
             store,
             endpoint,
+            progress,
         )
         .await
         {
@@ -519,10 +564,7 @@ async fn discover_unheld(
         let (published, listings_complete): (Vec<(String, Option<String>)>, bool) =
             match resolve_peer_covered(&share_code, identity, store, relay).await {
                 Ok((peer, listings_covered)) => (
-                    peer.collections
-                        .into_iter()
-                        .map(|c| (c.collection.slug, c.snapshot_fingerprint))
-                        .collect(),
+                    published_from_collections(&peer.collections),
                     matches!(peer.listings_state, crate::store::ListingsStatus::Fetched)
                         && listings_covered,
                 ),
@@ -606,6 +648,7 @@ pub(crate) async fn run_fetch_driver_loop(
     live_npub: SharedIdentity,
     relay: SharedRelay,
     endpoint: SharedEndpoint,
+    progress: Option<ProgressTx>,
 ) {
     // Keyed (author_npub, slug). In memory, like the auto-approve loop's caps: a restart re-reads
     // fingerprints and starts its attempt counting over, which is correct — a fresh process has no
@@ -619,7 +662,7 @@ pub(crate) async fn run_fetch_driver_loop(
 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
-        poll_once(&store, &live_npub, &relay, &endpoint, &mut states).await;
+        poll_once(&store, &live_npub, &relay, &endpoint, &mut states, progress.as_ref()).await;
     }
 }
 
@@ -636,6 +679,7 @@ pub(crate) async fn poll_once(
     relay: &SharedRelay,
     endpoint: &SharedEndpoint,
     states: &mut HashMap<(String, String), AskState>,
+    progress: Option<&ProgressTx>,
 ) -> PollOutcome {
     let mut outcome = PollOutcome::default();
 
@@ -664,7 +708,7 @@ pub(crate) async fn poll_once(
 
     // Redeem BEFORE checking staleness — see `redeem_pending_tickets`' doc.
     (outcome.redeemed, outcome.skipped_spent) =
-        redeem_pending_tickets(store, &identity, &own_npub, live_npub, endpoint).await;
+        redeem_pending_tickets(store, &identity, &own_npub, live_npub, endpoint, progress).await;
 
     let held = crate::manifest_cache::list(&store.manifest_cache_dir());
     // QURATOR-189 — the discovery tier's gate, read the way `resolve_peer` reads `big_relay_url`:
@@ -702,11 +746,7 @@ pub(crate) async fn poll_once(
         let Ok(share_code) = contact_share_code(contact) else { continue };
         let published: Vec<(String, Option<String>)> =
             match resolve_peer(&share_code, &identity, store, relay).await {
-                Ok(peer) => peer
-                    .collections
-                    .into_iter()
-                    .map(|c| (c.collection.slug, c.snapshot_fingerprint))
-                    .collect(),
+                Ok(peer) => published_from_collections(&peer.collections),
                 Err(e) => {
                     tracing::debug!(
                         author = %truncate(&author_npub),
@@ -812,6 +852,84 @@ mod tests {
 
     fn held(npub: &str, slug: &str, fp: &str) -> CachedKey {
         CachedKey { npub: npub.into(), slug: slug.into(), fingerprint: fp.into() }
+    }
+
+    /// QURATOR-336 — one browsed collection in the shape `resolve_peer` hands the ask tiers
+    /// (`PeerCollection`, carrying the listing-meta signals the tiers read).
+    fn peer_collection(slug: &str, fingerprint: Option<&str>, oversized: Option<bool>) -> PeerCollection {
+        PeerCollection {
+            collection: hb_core::types::Collection {
+                slug: slug.into(),
+                path_alias: slug.into(),
+                description: None,
+                item_count: 1,
+                est_size: None,
+                content_types: vec![],
+                tags: vec![],
+                languages: vec![],
+                visibility: hb_core::types::Visibility::Public,
+                sorted: false,
+                last_updated: chrono::Utc::now(),
+                listing: vec![],
+            },
+            parts_total: None,
+            parts_present: None,
+            truncated: None,
+            total_items: None,
+            oversized,
+            snapshot_fingerprint: fingerprint.map(String::from),
+            manifest_imported_at: None,
+            teaser_event_id: None,
+        }
+    }
+
+    /// QURATOR-336 — a collection the owner has marked `oversized` can never be served as a full
+    /// list (it cannot cross the 16 MiB manifest transfer), so NEITHER ask tier may ask for it,
+    /// while a normal sibling collection is still asked.
+    ///
+    /// Both tiers are driven through the SAME production helper the two tiers call
+    /// (`published_from_collections`) — the test never rebuilds the filtered list itself, or it
+    /// would be asserting against a lookalike it controls (CLAUDE.md §9).
+    ///
+    /// The third shape — an ABSENT marker asked for normally — is the downgrade-safety condition:
+    /// a pre-QURATOR-336 listing must behave exactly as it does today.
+    ///
+    /// MUTATION (P-10) — in `published_from_collections`, replace the filter predicate
+    /// `.filter(|c| c.oversized != Some(true))` with `.filter(|_| true)` → `films` reappears and
+    /// both tier asserts below red. Then replace it with `.filter(|c| c.oversized != None)` → the
+    /// `music` sibling (marker absent) disappears and the markerless case reds.
+    #[test]
+    fn an_oversized_collection_is_never_asked_for_in_either_tier() {
+        let collections = vec![
+            peer_collection("films", Some("fp-films"), Some(true)),
+            peer_collection("music", Some("fp-music"), None),
+        ];
+        let published = published_from_collections(&collections);
+        assert_eq!(
+            published,
+            vec![("music".to_string(), Some("fp-music".to_string()))],
+            "the oversized collection is dropped; its markerless sibling survives"
+        );
+
+        // Refresh tier: `films` is held at an older fingerprint, so were it not oversized it would
+        // be asked for on this poll.
+        let h = vec![held("npubA", "films", "fp-old"), held("npubA", "music", "fp-old")];
+        assert_eq!(
+            stale_holdings(&h, &published).into_iter().map(|s| s.slug).collect::<Vec<_>>(),
+            vec!["music".to_string()],
+            "the refresh tier must not ask for an oversized collection"
+        );
+
+        // Discovery tier: nothing held at all — the fresh-node case that would otherwise ask for
+        // everything the author published.
+        assert_eq!(
+            unheld_collections(&[], "npubA", &published)
+                .into_iter()
+                .map(|(slug, _)| slug)
+                .collect::<Vec<_>>(),
+            vec!["music".to_string()],
+            "the discovery tier must not ask for an oversized collection"
+        );
     }
 
     fn ask(sent_at: &str) -> ManifestAsk {
@@ -1038,7 +1156,7 @@ mod tests {
     ///
     /// MUTATION (P-10) — in `redeem_pending_tickets`, delete the gate block that consults
     /// `redeem_dial_ready` (the `if !entry ... { ...; continue; }` immediately before the
-    /// `match redeem_manifest_ticket_inner(...)`) → the first assert reds; delete the
+    /// `match redeem_manifest_ticket_with_progress(...)`) → the first assert reds; delete the
     /// `store.note_failed_dial(...)` call inside the `Err` arm → the second reds.
     #[test]
     fn the_redeem_poll_consults_the_gate_and_notes_failures() {
@@ -1061,7 +1179,7 @@ mod tests {
             .find("redeem_dial_ready(")
             .expect("the poll must consult the re-dial gate");
         let body_at = region
-            .find("redeem_manifest_ticket_inner(")
+            .find("redeem_manifest_ticket_with_progress(")
             .expect("the poll must call the production redeem body");
         assert!(
             gate_at < body_at,
@@ -1070,6 +1188,47 @@ mod tests {
         assert!(
             region.contains("note_failed_dial("),
             "a failed redeem must be recorded, or the gate has nothing to read next poll"
+        );
+    }
+
+    /// QURATOR-335 — the background fetch must hand its progress channel to the redeem body. Before
+    /// this the driver called the progress-less `_inner` wrapper (which hard-codes `None`), so the
+    /// per-collection bar never moved for an unattended fetch — the main fetch path since the driver
+    /// shipped. The channel is threaded loop → poll → redeem; a guard on one hop alone would miss
+    /// a `None` re-introduced at another, so all three are pinned.
+    ///
+    /// MUTATION (P-10) — in `redeem_pending_tickets`, change the `progress,` argument of
+    /// `redeem_manifest_ticket_with_progress(...)` to `None,` → the first assert reds; in `poll_once`,
+    /// change `endpoint, progress).await;` to `endpoint, None).await;` → the second reds.
+    #[test]
+    fn the_background_fetch_threads_its_progress_channel_to_the_redeem_body() {
+        let src = include_str!("fetch_driver.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code.find("async fn redeem_pending_tickets(").expect("the redeem helper must exist");
+        let end = code[at..].find("pub(crate) async fn run_fetch_driver_loop(").expect("the loop follows") + at;
+        let redeem = &code[at..end];
+        let call = redeem
+            .find("redeem_manifest_ticket_with_progress(")
+            .expect("the poll must call the progress-carrying redeem body");
+        let args = &redeem[call..call + redeem[call..].find(".await").expect("the call is awaited")];
+        assert!(
+            args.contains("progress,") && !args.contains("None"),
+            "the redeem call must forward the driver's progress channel, never None"
+        );
+        let pat = code.find("pub(crate) async fn poll_once(").expect("poll_once must exist");
+        let pend = code[pat..].find("fn truncate(").expect("truncate follows") + pat;
+        assert!(
+            code[pat..pend].contains("endpoint, progress).await;"),
+            "poll_once must hand its progress channel to redeem_pending_tickets"
+        );
+        let lat = code.find("pub(crate) async fn run_fetch_driver_loop(").expect("the loop must exist");
+        assert!(
+            code[lat..pat].contains("progress.as_ref()).await;"),
+            "the loop must hand its progress channel to poll_once"
         );
     }
 
@@ -1171,7 +1330,7 @@ mod tests {
             "exactly one spent-ask gate: a second would mean one of them is dead code"
         );
         let body_at = region
-            .find("redeem_manifest_ticket_inner(")
+            .find("redeem_manifest_ticket_with_progress(")
             .expect("the poll must call the production redeem body");
         assert!(
             complete_at < body_at,

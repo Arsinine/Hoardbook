@@ -96,6 +96,10 @@ export interface Collection {
 	 *  count, so the browser shows the shown items behind a "N more hidden" fade. Absent when whole. */
 	truncated?: boolean;
 	total_items?: number;
+	/** QURATOR-336 — set when the collection's FULL list is over the 16 MB transfer limit: the owner
+	 *  published only a breadth-first preview, the full list can never be fetched, and `total_items`
+	 *  is a LOWER BOUND (the true count is unknown above it). Rides with `truncated`/`total_items`. */
+	oversized?: boolean;
 	/** M16 W4 — the full-tree snapshot fingerprint (both the teaser and the full manifest carry it);
 	 *  passed to `import_manifest` to gate an imported manifest for staleness. Absent when unmarked. */
 	snapshot_fingerprint?: string;
