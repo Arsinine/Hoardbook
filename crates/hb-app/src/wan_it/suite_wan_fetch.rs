@@ -61,6 +61,9 @@ const DRIVER_POLLS: usize = 8;
 /// Between polls. The production loop waits 5 minutes; the row does not, because the cadence is
 /// pinned by a unit test and re-proving it here would only cost wall clock.
 const POLL_SETTLE: Duration = Duration::from_secs(5);
+/// FD4 (QURATOR-334): polls allowed, after the successful redeem, for the driver to re-read the
+/// answered ticket and skip it as spent.
+const FD4_POLLS: usize = 3;
 /// DM poll attempts and the wait between them, for [`poll_dms_newest`].
 ///
 /// 20 x 3s = a full minute. The phases here are
@@ -178,7 +181,7 @@ pub async fn run(tap: &mut Tap, role: &str, input: &CarryInput) {
                 );
             } else {
                 tap.check(
-                    "FD2/FD3: poll_once notices the change, asks UNATTENDED, and redeems UNATTENDED",
+                    "FD2/FD3/FD4: poll_once notices the change, asks + redeems UNATTENDED, then skips the spent replay",
                     run_role_d_phase2(input).await,
                 );
             }
@@ -456,6 +459,42 @@ async fn run_role_d_phase2(input: &CarryInput) -> Result<(), String> {
     // The re-served envelope must still verify under A's key, not whoever handed it over.
     verify_cached_under(input, &author_npub, FETCH_SLUG)?;
     eprintln!("   FD3 the cached envelope verifies under the AUTHOR's key");
+
+    // FD4 (QURATOR-334) — the poll AFTER the success. The ticket wrap stays on the relay and is
+    // re-read every poll; before the fix the driver re-redeemed it, the claim refused it as spent
+    // before any dial, the refusal was never counted, and it looped forever ("You've already
+    // received this list." twice per 5-minute poll on Devtest1). The row: the replay must be
+    // recognised as DONE — `skipped_spent` names the slug — and must never reach the redeem body a
+    // second time. A poll whose relay fetch came back empty proves nothing either way, so a few
+    // polls are allowed; any re-redeem is an immediate failure.
+    let mut skipped = false;
+    for attempt in 1..=FD4_POLLS {
+        tokio::time::sleep(POLL_SETTLE).await;
+        let outcome = poll_once(&input.store, &live, &shared_relay, &endpoint, &mut states).await;
+        eprintln!(
+            "   FD4 poll {attempt} after the redeem: redeemed={:?} skipped_spent={:?}",
+            outcome.redeemed, outcome.skipped_spent
+        );
+        if outcome.redeemed.iter().any(|s| s == FETCH_SLUG) {
+            return Err(
+                "FD4: the answered ticket was redeemed AGAIN on a later poll — a spent ask must be \
+                 skipped, not re-redeemed"
+                    .to_string(),
+            );
+        }
+        if outcome.skipped_spent.iter().any(|s| s == FETCH_SLUG) {
+            skipped = true;
+            break;
+        }
+    }
+    if !skipped {
+        return Err(format!(
+            "FD4: across {FD4_POLLS} polls after the redeem the driver never re-read the answered \
+             ticket and skipped it as spent — either the relay stopped returning the wrap (check \
+             the relay) or the spent-ask gate is not consulted"
+        ));
+    }
+    eprintln!("   FD4 the replayed ticket was skipped as already answered — no re-redeem, no retry loop");
     Ok(())
 }
 

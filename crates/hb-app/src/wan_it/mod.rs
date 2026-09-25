@@ -719,10 +719,19 @@ fn seed_collection(
     // Prove the manifest is producible and within the ceiling — the same check send_full_list runs
     // before promising anything (build_slug_manifest + ManifestPayload::seal). A failure here means
     // the seed is too large or empty, and the harness should stop before minting a ticket.
+    // Timed (QURATOR-333): this is a COLD build + seal, the cost the serve used to pay on every
+    // accepted connection before the status byte. A large-collection run only means something when
+    // this exceeds the asker's 30 s handshake deadline, so the operator needs to see it.
+    let started = std::time::Instant::now();
     let envelope = build_slug_manifest(slug, store, identity, browse_key.bytes())
         .map_err(|e| anyhow!("build manifest for '{slug}': {e}"))?;
-    hb_core::ManifestPayload::seal(&envelope)
+    let sealed = hb_core::ManifestPayload::seal(&envelope)
         .map_err(|e| anyhow!("the seeded collection's manifest is over the transport ceiling: {e}"))?;
+    eprintln!(
+        "[serve] seeded '{slug}': {item_count} items, cold build+seal {:.1}s, {} sealed bytes",
+        started.elapsed().as_secs_f64(),
+        sealed.as_bytes().len()
+    );
     Ok(())
 }
 

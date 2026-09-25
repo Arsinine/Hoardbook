@@ -176,6 +176,10 @@ pub(crate) struct PollOutcome {
     /// the switch is off. Like `asked`, this records asks SENT, not manifests received: the reply
     /// lands in a later poll's `redeemed`.
     pub discovered: Vec<String>,
+    /// Slugs whose ticket this poll re-read but SKIPPED because the ask it answers is already
+    /// spent (QURATOR-334). The relay replays an answered wrap every poll; this is the observable
+    /// that the replay was recognised as done rather than re-redeemed.
+    pub skipped_spent: Vec<String>,
 }
 
 /// The peers this node has actually asked — the allow-list for [`redeem_pending_tickets`].
@@ -329,14 +333,15 @@ async fn redeem_pending_tickets(
     own_npub: &str,
     live: &SharedIdentity,
     endpoint: &SharedEndpoint,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
     let mut redeemed = Vec::new();
+    let mut skipped_spent = Vec::new();
     // QURATOR-258 — `mut`: the loop folds each noted dial failure back into this snapshot
     // (`mirror_noted_dial`), so later messages of the SAME poll read post-failure state. The
     // DERIVATIONS from it (`allow`, `since`) are still taken once, here at entry, on purpose.
-    let Ok(mut asks) = store.load_manifest_asks() else { return redeemed };
+    let Ok(mut asks) = store.load_manifest_asks() else { return (redeemed, skipped_spent) };
     if asks.is_empty() {
-        return redeemed;
+        return (redeemed, skipped_spent);
     }
     let allow = asked_peers(&asks);
 
@@ -351,7 +356,7 @@ async fn redeem_pending_tickets(
     // belongs to the command surface and must not be held across this loop's sleeps.
     let relays = crate::net::relay_urls(store);
     let Ok(client) = RelayClient::connect(identity, &relays, crate::net::RELAY_TIMEOUT).await else {
-        return redeemed;
+        return (redeemed, skipped_spent);
     };
     let wraps = client
         .fetch(
@@ -360,7 +365,7 @@ async fn redeem_pending_tickets(
         )
         .await;
     client.disconnect().await;
-    let Ok(wraps) = wraps else { return redeemed };
+    let Ok(wraps) = wraps else { return (redeemed, skipped_spent) };
 
     for msg in decode_dms(own_npub, identity, wraps, Some(&allow)).await {
         let trimmed = msg.content.trim();
@@ -387,6 +392,7 @@ async fn redeem_pending_tickets(
                 slug = %ticket.slug,
                 "fetch driver: ask already answered — a spent ask is not re-redeemed"
             );
+            skipped_spent.push(ticket.slug.clone());
             continue;
         }
 
@@ -455,7 +461,7 @@ async fn redeem_pending_tickets(
             }
         }
     }
-    redeemed
+    (redeemed, skipped_spent)
 }
 
 /// QURATOR-189 — the `swarm_caching` discovery tier's network half.
@@ -657,7 +663,7 @@ pub(crate) async fn poll_once(
     }
 
     // Redeem BEFORE checking staleness — see `redeem_pending_tickets`' doc.
-    outcome.redeemed =
+    (outcome.redeemed, outcome.skipped_spent) =
         redeem_pending_tickets(store, &identity, &own_npub, live_npub, endpoint).await;
 
     let held = crate::manifest_cache::list(&store.manifest_cache_dir());
@@ -1504,8 +1510,8 @@ mod tests {
     /// burning a wave slot, a throttle slot, and one of the three attempts, every poll.
     ///
     /// MUTATION (P-10) — in `poll_once`, replace the
-    /// `outcome.redeemed = redeem_pending_tickets(...).await;` statement with
-    /// `outcome.redeemed = Vec::new();` → this test reds.
+    /// `(outcome.redeemed, outcome.skipped_spent) = redeem_pending_tickets(...).await;` statement
+    /// with `(outcome.redeemed, outcome.skipped_spent) = (Vec::new(), Vec::new());` → this test reds.
     #[test]
     fn poll_once_redeems_before_it_checks_staleness() {
         let src = include_str!("fetch_driver.rs");
