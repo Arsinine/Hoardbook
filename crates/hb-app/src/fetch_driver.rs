@@ -258,6 +258,30 @@ fn redeem_dial_ready(attempts: u32, last_fail_unix: u64, now_unix: u64) -> bool 
         && now_unix.saturating_sub(last_fail_unix) >= redeem_backoff_for(attempts)
 }
 
+/// QURATOR-334 — pure core: **is this ask already COMPLETE?**
+///
+/// [`redeem_dial_ready`]'s sibling, and a separate predicate rather than a third argument to it,
+/// because the two answer different questions: the backoff gate asks *may we retry yet?*, this one
+/// asks *is there anything left to retry?* — and only this one is terminal.
+///
+/// A spent ask has been HONOURED, and the two facts that make it a storm are both downstream of
+/// that: `claim_manifest_ask` answers `Spent` for every wrap answering it, so the redeem body
+/// refuses **before any dial**; and `note_failed_dial` declines that refusal, because it counts
+/// DIALS and there was none. So `dial_attempts` never grows, [`redeem_dial_ready`] never closes,
+/// and the poll re-enters the redeem body every 300 s forever — logging "redeem failed" for an ask
+/// that had already succeeded (Devtest1 2026-09-25: twice per poll for ~1 h).
+///
+/// **Not a starvation risk.** `spent` is set only by a redemption that SUCCEEDED
+/// (`spend_manifest_ask`), and a collection that changes afterwards is a NEW ask: the ask path
+/// (`commands::chat::request_manifest_from_inner`) calls `record_manifest_ask`, which writes a
+/// fresh entry under the same key — `spent: false`, new nonce, claim cleared, dial budget
+/// re-armed. Skipping a spent entry can therefore only stop a **replay** of an ask with nothing
+/// left to deliver; it cannot suppress a refetch. Pinned by
+/// `a_spent_ask_is_complete_and_a_refetch_is_a_fresh_ask`.
+fn redeem_ask_complete(ask: &ManifestAsk) -> bool {
+    ask.spent
+}
+
 /// QURATOR-258 — fold ONE store-persisted dial failure back into the redeem poll's in-memory
 /// ask snapshot, so the NEXT message of the SAME poll reads post-failure state.
 ///
@@ -351,6 +375,20 @@ async fn redeem_pending_tickets(
         let key = manifest_ask_key(&msg.from, &author, &ticket.slug);
         let entry = asks.get(&key);
         let want = entry.map(|a| a.fingerprint_seen.clone());
+
+        // QURATOR-334 — a SPENT ask is COMPLETE, not failing. Reaching the body below would buy a
+        // guaranteed refusal at its claim (before any dial) whose failure the store then DECLINES
+        // to count, so the backoff gate under this one could never close and the replay would be
+        // re-redeemed every poll forever. Terminal, so it is checked outright rather than
+        // budgeted — see `redeem_ask_complete`.
+        if entry.is_some_and(redeem_ask_complete) {
+            tracing::debug!(
+                from = %truncate(&msg.from),
+                slug = %ticket.slug,
+                "fetch driver: ask already answered — a spent ask is not re-redeemed"
+            );
+            continue;
+        }
 
         // QURATOR-197 (F19) — the re-dial gate. A wrap that answered one of our asks stays on the
         // relay until it expires, so this loop re-reads it EVERY poll; without this check a
@@ -1026,6 +1064,112 @@ mod tests {
         assert!(
             region.contains("note_failed_dial("),
             "a failed redeem must be recorded, or the gate has nothing to read next poll"
+        );
+    }
+
+    /// QURATOR-334 — the regression, at the store's own state machine: `fetch driver: redeem failed
+    /// … You've already received this list.` twice every ~5 min, forever, for one peer's collection
+    /// (Devtest1 log, 2026-09-25 02:49 → 03:52). The claim refuses a spent ask as `Spent` before any
+    /// dial, and `note_failed_dial` declines that refusal — so the dial budget never grows and
+    /// [`redeem_dial_ready`] stays open for a replay that can never succeed. This pins both ends of
+    /// the missing terminal check: the served ask is COMPLETE, and the refetch after a changed
+    /// collection is a FRESH ask that is not.
+    ///
+    /// Seam disclosure (CLAUDE.md honesty rule): `redeem_pending_tickets` is network-bound
+    /// (`RelayClient::connect` + a relay fetch), so it cannot be driven end to end from a unit test.
+    /// This drives the store states at the exact sequence production produces them (record → claim →
+    /// spend, fulfil.rs:601-720), which is what the predicate is asked about. What it does NOT cover
+    /// is the loop WIRING — that the poll consults the predicate at all — which is pinned by the
+    /// source-scan guard below. ⚠ The live half is OWED, not covered: `suite_wan_fetch`'s FD2/FD3
+    /// assert that the driver asks and redeems unattended, which is the poll BEFORE the success —
+    /// neither of them polls again after a spent ask, so neither would catch this storm. The §5 row
+    /// for it is a follow-on: drive one more poll after FD3's successful redeem and assert the
+    /// replay is skipped (no second dial, no "redeem failed").
+    ///
+    /// MUTATION (P-10) — in `redeem_ask_complete` (the pure fn directly after `redeem_dial_ready`),
+    /// change `ask.spent` to `false` → the second and third `redeem_ask_complete` asserts red.
+    #[test]
+    fn a_spent_ask_is_complete_and_a_refetch_is_a_fresh_ask() {
+        let (_dir, store) = test_store();
+        let (npub, slug, nonce) = ("npub1peer", "vault", "nonce-1");
+        store
+            .record_manifest_ask(npub, npub, slug, "fp", "2026-01-01T00:00:00Z", nonce)
+            .unwrap();
+        let key = manifest_ask_key(npub, npub, slug);
+        let ask = || store.load_manifest_asks().unwrap().get(&key).unwrap().clone();
+
+        assert!(!redeem_ask_complete(&ask()), "an ask still owed its dial is not complete");
+
+        // The success path exactly as production sequences it: claim, dial, spend.
+        store.claim_manifest_ask(npub, npub, slug, nonce, "req-A").unwrap();
+        store.spend_manifest_ask(npub, npub, slug, nonce).unwrap();
+        let served = ask();
+        assert!(redeem_ask_complete(&served), "an answered ask is complete — its replay must not dial");
+        assert!(
+            redeem_dial_ready(served.dial_attempts, served.dial_last_fail_unix, 2_000_000_000),
+            "…and the pre-existing gate says DIAL: `spent` and `dial_attempts` are independent, so \
+             the backoff can never see a spent ask — that independence IS the storm"
+        );
+
+        // The wrap keeps replaying every poll. Its refusal is pre-claim, so the store declines it
+        // and the budget the backoff reads stays at zero — forever, without the gate above.
+        store.note_failed_dial(npub, npub, slug, "req-A").unwrap();
+        let replayed = ask();
+        assert_eq!(replayed.dial_attempts, 0, "the refusal is declined: nothing dialled, nothing counted");
+        assert!(redeem_ask_complete(&replayed), "and the ask stays complete across the replay");
+
+        // A re-ask — the collection changed and the driver asked again — writes a FRESH entry under
+        // the same key, so skipping spent entries cannot starve a legitimate refetch.
+        store
+            .record_manifest_ask(npub, npub, slug, "fp2", "2026-02-01T00:00:00Z", "nonce-2")
+            .unwrap();
+        let fresh = ask();
+        assert!(!fresh.spent, "a re-ask is a fresh authorization");
+        assert!(!redeem_ask_complete(&fresh), "so the refetch's wrap is redeemed normally");
+    }
+
+    /// QURATOR-334 — the predicate above must actually be CONSULTED by the redeem poll, before the
+    /// redeem body. The shape this guards is the inert fix: `redeem_ask_complete` added and unit-
+    /// tested green but never wired in, leaving the storm exactly as it was — a green suite plus a
+    /// red unit mutation cannot see that, which is why the call site is pinned here, in the same
+    /// register as the QURATOR-197 wiring guard above.
+    ///
+    /// MUTATION (P-10) — in `redeem_pending_tickets`, delete the gate block that consults
+    /// `redeem_ask_complete` (the `if entry.is_some_and(redeem_ask_complete) { ...; continue; }`
+    /// immediately before the `redeem_dial_ready` gate) → the `find` below panics: the poll no
+    /// longer skips a spent ask.
+    #[test]
+    fn the_redeem_poll_skips_a_spent_ask_before_the_redeem_body() {
+        let src = include_str!("fetch_driver.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("async fn redeem_pending_tickets(")
+            .expect("the redeem helper must exist");
+        let end = code[at..]
+            .find("pub(crate) async fn run_fetch_driver_loop(")
+            .expect("the loop must follow the redeem helper")
+            + at;
+        let region = &code[at..end];
+        // Call form of the GATE, never a bare name (CLAUDE.md §9) — and counted over the FUNCTION
+        // region only, so this test's own prose cannot satisfy it.
+        let complete_at = region
+            .find("is_some_and(redeem_ask_complete)")
+            .expect("the poll must skip a spent ask before redeeming it");
+        assert_eq!(
+            region.matches("is_some_and(redeem_ask_complete)").count(),
+            1,
+            "exactly one spent-ask gate: a second would mean one of them is dead code"
+        );
+        let body_at = region
+            .find("redeem_manifest_ticket_inner(")
+            .expect("the poll must call the production redeem body");
+        assert!(
+            complete_at < body_at,
+            "the spent check must run BEFORE the redeem body, or a spent ask still re-redeems"
         );
     }
 
