@@ -121,12 +121,13 @@ describe('QURATOR-164 — the swarm-caching opt-in switch and its reciprocity co
 		primeIdentity();
 		const r = renderSettings();
 		await waitFor(() => expect(r.getByText('Fetch new collections automatically')).toBeTruthy());
+		// Owner ruling 2026-09-26: shortened to "You'll hold more; other people will request
+		// collections from you too." — still both halves, still in plain view, just terser.
 		// MUTATION (P-10): in +page.svelte, in the swarm-caching toggle-row's `<div class="toggle-sub">`
-		// region, delete the sentence "It works both ways: you'll hold a lot more, and other people
-		// will request collections from you too." — this test reds on getByText below.
+		// region, delete that sentence — this test reds on getByText below.
 		expect(r.getByText(/other people will request collections from you too/i)).toBeTruthy();
-		// And it is not softened away: the same sub-label also names the "you'll hold a lot more" half.
-		expect(r.getByText(/you'll hold a lot more/i)).toBeTruthy();
+		// And it is not softened away: the same sub-label also names the "you'll hold more" half.
+		expect(r.getByText(/you'll hold more/i)).toBeTruthy();
 	});
 
 	it('the toggle is disabled until the settings load succeeds (QURATOR-93 twin)', async () => {

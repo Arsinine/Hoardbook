@@ -65,11 +65,15 @@ function primeIdentity() {
 	profile.set({ display_name: 'Me', tags: [], languages: [], social_links: [], willing_to: [], content_types: [], updated: '2026-08-01T00:00:00Z' });
 }
 
+// Anchored (^…$): each of these toggles now carries a <FeatureTooltip>, whose own info-trigger
+// button has an aria-label of "More information: <title>" — an UNANCHORED regex here would also
+// match that second button (its name contains this string as a substring) and getByRole would
+// throw "multiple elements found". Anchoring keeps each regex matching only the toggle switch.
 const TOGGLE_LABELS = [
-	/allow incoming messages from anyone/i,
-	/auto-update snapshots on change/i,
-	/reconcile poll for remotely-edited collections/i,
-	/show up in discover hoarders/i,
+	/^allow incoming messages from anyone$/i,
+	/^auto-update snapshots on change$/i,
+	/^periodically re-check published collections$/i,
+	/^show up in discover hoarders$/i,
 ];
 
 const OK_SETTINGS = {

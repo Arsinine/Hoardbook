@@ -57,10 +57,15 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub show_online_count: bool,
     /// devtest #5: opt into tag/content-type discoverability — when true, the published teaser's
-    /// `tags`/`content_types` also surface as `t` hashtags (relay-searchable). **Default false**: a
-    /// pre-existing `settings.json` with no such key loads as `false` (bool serde default), which is
-    /// the intended silent de-list — no migration. npub lookup and share-code browse are unaffected
-    /// either way (they read the teaser body, not the hashtags).
+    /// `tags`/`content_types` also surface as `t` hashtags (relay-searchable).
+    ///
+    /// Owner ruling 2026-09-26: fresh installs now start opted IN (see `Settings::default()`) — a
+    /// new user shows up in Discover by default. **The wire default stays `false`** (`#[serde(default)]`,
+    /// plain `bool::default()`), so this is a `Settings::default()`-only change: a pre-existing
+    /// `settings.json` missing the key still loads as `false` (the original devtest #5 silent
+    /// de-list, no migration — an existing install must never be silently re-enrolled into public
+    /// discoverability by an upgrade). npub lookup and share-code browse are unaffected either way
+    /// (they read the teaser body, not the hashtags).
     #[serde(default)]
     pub discoverable: bool,
     /// M16 W3 — the owner's dedicated **big relay** for the full-manifest (Layer 3) path. When a
@@ -115,7 +120,8 @@ impl Default for Settings {
             snapshot_auto_update: true,
             snapshot_reconcile_poll: false,
             show_online_count: true,
-            discoverable: false,
+            // Owner ruling 2026-09-26: fresh installs start discoverable — see the field doc above.
+            discoverable: true,
             big_relay_url: String::new(),
             swarm_caching: false,
             serving_notice_acknowledged: false,
@@ -2143,10 +2149,29 @@ pub(crate) mod tests {
         // assert reds (an old file would then load the switch as ON, silently opting every
         // existing user into the heavier tier).
         assert!(!s.swarm_caching, "swarm_caching defaults OFF on an old file (opt-in only)");
+        // QURATOR — owner ruling 2026-09-26: only `Settings::default()` (a truly fresh install with
+        // no settings.json at all) starts discoverable ON. An EXISTING file — even one predating
+        // this field, as parsed here via serde — must load OFF; an upgrade must never silently
+        // re-enrol an existing user into public discoverability.
         assert!(
             !s.serving_notice_acknowledged,
             "serving_notice_acknowledged defaults OFF on an old file (notice still owed)"
         );
+    }
+
+    #[test]
+    fn a_fresh_install_starts_discoverable_but_an_old_file_does_not() {
+        // Owner ruling 2026-09-26: `Settings::default()` (no settings.json — a genuinely fresh
+        // install) starts opted IN to Discover Hoarders. MUTATION (P-10): change
+        // `discoverable: true,` in `impl Default for Settings` to `false` — this assert reds.
+        assert!(Settings::default().discoverable, "a fresh install defaults discoverable ON");
+
+        // The wire default is unchanged (`#[serde(default)]` = plain `bool::default()`): an
+        // existing settings.json that predates this field, or one that explicitly opted out, must
+        // never be silently flipped ON by an upgrade.
+        let old = r#"{"relay_urls":[]}"#;
+        let s: Settings = serde_json::from_str(old).expect("old settings must still deserialize");
+        assert!(!s.discoverable, "an existing file with no `discoverable` key stays OFF");
     }
 
     #[test]

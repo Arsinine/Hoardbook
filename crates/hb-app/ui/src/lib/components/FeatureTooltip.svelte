@@ -107,6 +107,10 @@
 		box-shadow: 0 8px 24px oklch(0 0 0 / 0.4);
 		opacity: 1;
 		transition: opacity 0.12s ease;
+		/* A trigger can sit inside an uppercase heading (e.g. Settings' .section-label), and
+		   text-transform inherits — reset it here so the popup always renders normal case
+		   regardless of what ancestor it's opened from. */
+		text-transform: none;
 	}
 
 	.ft-tip[hidden] { display: none; }

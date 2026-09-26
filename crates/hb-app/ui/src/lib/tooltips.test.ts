@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { TOOLTIPS, TOOLTIP_KEYS, type TooltipKey } from './tooltips.js';
 
 describe('tooltips — feature-help registry (HOARDBOOK_SPEC §8)', () => {
-	it('has exactly the seven spec-anchored keys, no more, no less (drift guard)', () => {
+	it('has exactly the eleven anchored keys, no more, no less (drift guard)', () => {
 		const expected: TooltipKey[] = [
 			'no-download',
 			'willing-to',
@@ -12,10 +12,15 @@ describe('tooltips — feature-help registry (HOARDBOOK_SPEC §8)', () => {
 			'custom-relays',
 			// QURATOR — owner 2026-08-27: the NAT/CGNAT pill needed to say what it costs the user.
 			'network-type',
+			// Owner ruling 2026-09-26: the Settings Preferences toggles' long sub-copy moved here.
+			'allow-dms',
+			'auto-update-snapshots',
+			'reconcile-poll',
+			'discoverable',
 		];
 		expect(new Set(TOOLTIP_KEYS)).toEqual(new Set(expected));
 		expect(Object.keys(TOOLTIPS).sort()).toEqual([...expected].sort());
-		expect(TOOLTIP_KEYS).toHaveLength(7);
+		expect(TOOLTIP_KEYS).toHaveLength(11);
 	});
 
 	it('every key resolves to a non-empty { title, body }', () => {

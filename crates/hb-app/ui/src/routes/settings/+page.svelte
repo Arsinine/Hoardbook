@@ -6,7 +6,7 @@
 	import { shortNpub } from '$lib/contact-display.js';
 	import { passphraseStrength, backupModeOptions, type BackupMode } from '$lib/backup-export.js';
 	import { updateNoticeVM } from '$lib/update-ux.js';
-	import { beaconLine, loopLine } from '$lib/beacon-view.js';
+	import { beaconLine } from '$lib/beacon-view.js';
 	import { effectiveRelays, validateRelayUrl } from '$lib/relays.js';
 	import { relaunch } from '@tauri-apps/plugin-process';
 	import { open as openFileDialog, save as saveFileDialog, confirm } from '@tauri-apps/plugin-dialog';
@@ -266,7 +266,7 @@
 	function natLabelFor(c: NatClassification): string {
 		switch (c) {
 			case 'cgnat': return 'CGNAT (carrier-grade NAT) detected';
-			case 'nat': return 'Behind NAT';
+			case 'nat': return 'NAT';
 			case 'no-nat': return 'No NAT';
 			case 'unknown': return 'Unknown';
 			default: return 'Not yet determined';
@@ -845,10 +845,6 @@
 				<button class="icon-btn" onclick={() => removeRelay(url)}>{@html icons.close}</button>
 			</div>
 		{/each}
-		<!-- v0.12.10 diagnostic: loop-liveness breadcrumb (rendered once, not per-relay) — the
-		     shipped Windows build has no log subscriber, so this line is the on-screen evidence the
-		     presence task is being polled at all. -->
-		<div class="relay-loop-line">{loopLine(beaconReport)}</div>
 		<!-- Add relay row -->
 		<div class="relay-add-row">
 			<input
@@ -906,8 +902,7 @@
 	<div class="surface">
 		<div class="toggle-row">
 			<div class="toggle-text">
-				<div class="toggle-label">Allow incoming messages from anyone</div>
-				<div class="toggle-sub">Off means only your contacts can DM you</div>
+				<div class="toggle-label">Allow incoming messages from anyone<FeatureTooltip key="allow-dms" /></div>
 			</div>
 			<button class="toggle" class:toggle-on={allowDms} onclick={toggleAllowDms} disabled={!settingsLoaded} aria-label="Allow incoming messages from anyone">
 				<span class="toggle-thumb"></span>
@@ -916,48 +911,42 @@
 
 		<div class="toggle-row">
 			<div class="toggle-text">
-				<div class="toggle-label">Auto-update snapshots on change</div>
-				<div class="toggle-sub">
-					Re-publish a published collection when its folder changes. When off, only a manual rescan
-					updates it. Changes made from another computer on a network share are picked up at launch.
-				</div>
+				<div class="toggle-label">Auto-update snapshots on change<FeatureTooltip key="auto-update-snapshots" /></div>
 			</div>
 			<button class="toggle" class:toggle-on={snapshotAutoUpdate} onclick={() => toggleSetting('snapshot_auto_update')} disabled={!settingsLoaded} aria-label="Auto-update snapshots on change">
 				<span class="toggle-thumb"></span>
 			</button>
 		</div>
 
+		<!-- Owner ruling 2026-09-26: rewritten so the label alone says what this does — a periodic
+		     re-check, on top of the file watcher — instead of naming its SMB audience first. The
+		     "why you'd want this" detail moved into the tooltip. -->
 		<div class="toggle-row">
 			<div class="toggle-text">
-				<div class="toggle-label">Reconcile poll for remotely-edited collections</div>
-				<div class="toggle-sub">Low-frequency re-check for collections you edit from another host (SMB). Off by default.</div>
+				<div class="toggle-label">Periodically re-check published collections<FeatureTooltip key="reconcile-poll" /></div>
 			</div>
-			<button class="toggle" class:toggle-on={snapshotReconcilePoll} onclick={() => toggleSetting('snapshot_reconcile_poll')} disabled={!settingsLoaded} aria-label="Reconcile poll for remotely-edited collections">
+			<button class="toggle" class:toggle-on={snapshotReconcilePoll} onclick={() => toggleSetting('snapshot_reconcile_poll')} disabled={!settingsLoaded} aria-label="Periodically re-check published collections">
 				<span class="toggle-thumb"></span>
 			</button>
 		</div>
 
 		<div class="toggle-row">
 			<div class="toggle-text">
-				<div class="toggle-label">Show up in Discover Hoarders</div>
-				<div class="toggle-sub">
-					Off means people can't find you by tag or content-type search. They can still reach you
-					with your npub or share code, and your contacts are unaffected.
-				</div>
+				<div class="toggle-label">Show up in Discover Hoarders<FeatureTooltip key="discoverable" /></div>
 			</div>
 			<button class="toggle" class:toggle-on={settings.discoverable} onclick={toggleDiscoverable} disabled={!settingsLoaded} aria-label="Show up in Discover Hoarders">
 				<span class="toggle-thumb"></span>
 			</button>
 		</div>
 
+		<!-- QURATOR-164 owner ruling: the reciprocity disclosure ("other people will request from you
+		     too") must stay in plain view, not behind a hover — shortened here, not hidden. -->
 		<div class="toggle-row">
 			<div class="toggle-text">
 				<div class="toggle-label">Fetch new collections automatically</div>
 				<div class="toggle-sub">
-					When someone new shows up in Discover, fetch every public collection they've published,
-					and keep copies of collections you've passed along to other people. This is one
-					switch for both. It works both ways: you'll hold a lot more, and other people will
-					request collections from you too. Off means you fetch only what you ask for.
+					Auto-fetches new hoarders' public collections and keeps copies you've relayed. You'll
+					hold more; other people will request collections from you too.
 				</div>
 			</div>
 			<button class="toggle" class:toggle-on={settings.swarm_caching} onclick={toggleSwarmCaching} disabled={!settingsLoaded} aria-label="Fetch new collections automatically">
@@ -1319,15 +1308,7 @@
 		line-height: 1.4;
 	}
 
-	/* v0.12.10 diagnostic: the loop-liveness breadcrumb, once under the relay rows. */
-	.relay-loop-line {
-		padding: 0 16px 8px;
-		font-size: 11px;
-		color: var(--fg-muted);
-		font-family: var(--mono, monospace);
-	}
-
-	/* M20 W4: input contract is global in app.css. Only the flex-grow LAYOUT stays, scoped to the
+/* M20 W4: input contract is global in app.css. Only the flex-grow LAYOUT stays, scoped to the
 	   two row containers where the input must grow — never re-declaring .hb-input itself. */
 	.relay-add-row > .hb-input,
 	.blocked-add-row > .hb-input,
@@ -1370,9 +1351,12 @@
 		white-space: nowrap;
 	}
 	.nat-pill.nat-cgnat {
-		color: var(--accent);
-		border-color: color-mix(in oklch, var(--accent) 45%, transparent);
-		background: color-mix(in oklch, var(--accent) 12%, transparent);
+		/* Amber, not the neutral accent tone — a warning that this network shape may need a relay
+		   or block a direct transfer (matches the amber convention used elsewhere: the online-chip
+		   dot and the cold-cache control, both at this hue). */
+		color: oklch(0.78 0.15 75);
+		border-color: oklch(0.5 0.15 75 / 0.4);
+		background: oklch(0.28 0.08 75 / 0.5);
 	}
 	.nat-pill.nat-nat {
 		color: var(--fg);
