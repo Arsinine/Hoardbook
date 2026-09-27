@@ -22,6 +22,7 @@
 		dmRequestAccept,
 		dmRequestDecline,
 		dmBlock,
+		unfollowContact,
 		groupsGet,
 		groupsCreate,
 		contactUpdateGroups,
@@ -375,6 +376,50 @@
 		} catch (e) {
 			toast(String(e), 'error');
 		}
+	}
+
+	// QURATOR-339: Block for an OPEN conversation (the pane header) — the request screen already had
+	// one (QURATOR-94), but an accepted/ongoing chat had no affordance, so the only route to
+	// dm_block was leaving Chat to paste the npub into Settings. Same two-step ConfirmButton
+	// pattern. When the peer is ALSO a contact, blocking additionally offers — as a choice, never a
+	// silent bundle (owner design direction 2026-09-26) — to remove them from Contacts. Blocking
+	// itself gates chat/DM only; nothing here revokes any other access (CLAUDE.md §6).
+	let blockDelistPrompt = $state(false);
+
+	async function handleBlockPeer() {
+		if (!selectedPeer) return;
+		const npub = selectedPeer.npub;
+		try {
+			await dmBlock(npub);
+			toast('Blocked', 'success');
+			// Only a peer who is actually a contact gets the delist ask: a deep-linked stranger
+			// (QURATOR-146) has no Contacts entry to remove, so no prompt and no unfollowContact.
+			if (selectedIsContact) blockDelistPrompt = true;
+		} catch (e) {
+			toast(String(e), 'error');
+		}
+	}
+
+	async function handleBlockDelist() {
+		if (!selectedPeer) return;
+		const npub = selectedPeer.npub;
+		blockDelistPrompt = false;
+		try {
+			await unfollowContact(npub);
+			await loadContactsInto(getContacts); // refresh so the sidebar drops them immediately
+			// The conversation list is contacts-only — a delisted peer leaves it, so close the pane
+			// rather than leave a header for someone who is no longer in Contacts. (Keeping the pane
+			// open when the contact is KEPT is deliberate: the block gates messages only, and the
+			// existing history stays readable.)
+			selectedPeer = null;
+			toast('Removed from contacts', 'success');
+		} catch (e) {
+			toast(String(e), 'error');
+		}
+	}
+
+	function handleBlockKeep() {
+		blockDelistPrompt = false; // contact kept — the conversation stays open
 	}
 
 	// ── M17 W3: received-share-code card (consume leg) ──────────────────────────────────────────
@@ -823,6 +868,9 @@
 		selectedTopic = null;
 		viewingRequests = false;
 		selectedRequest = null;
+		// QURATOR-339: a delist prompt left standing belongs to the PREVIOUS selection — never
+		// answerable about a different peer.
+		blockDelistPrompt = false;
 		// QURATOR-263: leaving the channel pane is a selection change too — a channel load still in
 		// flight must not land (posts, error flag, or watermark) over a peer conversation.
 		channelGeneration += 1;
@@ -1524,7 +1572,28 @@
 					     the empty-thread note; the offline/not-a-contact banners stay (contextual). -->
 					<span class="e2e-shield" title="End-to-end encrypted — relays see only that someone messaged this person, never the content or the sender.">{@html icons.shield}</span>
 					<button class="btn-ghost btn-sm" onclick={() => { if (selectedPeer) viewProfile(selectedPeer); }}>View profile</button>
+					<!-- QURATOR-339: Block lives in the open-conversation header, alongside View profile.
+					     Same two-step ConfirmButton as the request screen (QURATOR-94): blocking is
+					     irreversible + silent to the peer, so a stray first click reveals the consequence
+					     instead of firing dm_block. The copy names only message gating + the Settings
+					     unblock path — never a broader access revocation (CLAUDE.md §6). -->
+					<ConfirmButton
+						label="Block"
+						confirmText="Block this person? They can't message you and you won't see future requests. You can unblock in Settings."
+						onconfirm={() => handleBlockPeer()}
+					/>
 				</div>
+
+				{#if blockDelistPrompt}
+					<!-- QURATOR-339: the post-block delist ask — offered together with blocking, but as a
+					     CHOICE (owner design direction): yes delists, no keeps the contact and the pane.
+					     Neither button promises any access change (§6). -->
+					<div class="block-delist-banner">
+						<span>Blocked. Also remove this person from Contacts?</span>
+						<button class="btn-primary btn-sm" onclick={handleBlockDelist}>Remove from Contacts</button>
+						<button class="btn-ghost btn-sm" onclick={handleBlockKeep}>Keep contact</button>
+					</div>
+				{/if}
 
 				<!-- Offline notice (not shown while presence is still unknown — QURATOR-135). -->
 				{#if !selectedPeer.online && selectedPeer.last_presence}
@@ -1994,6 +2063,19 @@
 	.offline-dot {
 		width: 7px; height: 7px; border-radius: 50%;
 		background: var(--fg-dim); flex-shrink: 0;
+	}
+
+	/* QURATOR-339: post-block delist ask — sits under the pane header like the offline banner,
+	 * same visual register, with the two choice buttons inline. */
+	.block-delist-banner {
+		padding: 7px 18px;
+		background: color-mix(in oklch, var(--fg-dim) 8%, transparent);
+		border-bottom: 1px solid var(--border);
+		font-size: 11.5px;
+		color: var(--fg-muted);
+		display: flex;
+		gap: 8px;
+		align-items: center;
 	}
 
 	.request-banner {
