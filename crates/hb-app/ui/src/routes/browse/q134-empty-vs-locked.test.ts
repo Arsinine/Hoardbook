@@ -18,10 +18,12 @@
 //     (the old `listingsLocked` shows 🔒 for EVERY keyless empty peer).
 //   • state 3 (fetch failed -> error + Retry)                 — RED on the broken code
 //     (no error branch existed; a failed enumeration read as 🔒).
-//   • state 2 (sealed -> 🔒 Listings locked)                  — GREEN on the broken code
-//     *for the wrong reason* (the old derivation shows 🔒 regardless of what the peer
-//     published). Its guard value is against regression: revert the fix and test 1 reds;
-//     break the Sealed mapping alone and THIS test reds while test 1 stays green.
+//   • state 2 (sealed -> the unreadable-peer TEASER)          — GREEN on the broken code
+//     *for the wrong reason* (the old derivation routed every keyless peer to 🔒 regardless of
+//     what the peer published). QURATOR-342 retired the 🔒 lock screen + ask ramp (ruling
+//     2026-09-27): state 2 now pins the TEASER. Its guard value is unchanged: revert the fix
+//     and test 1 reds; break the Sealed mapping alone and THIS test reds while test 1 stays
+//     green.
 //
 // Per CLAUDE.md §9, a green test proves nothing until seen red. The pre-fix RED run and the
 // post-fix mutation probes are documented in the task report.
@@ -104,17 +106,22 @@ describe('QURATOR-134 — zero published ≠ locked ≠ failed', () => {
 		await waitFor(() => expect(document.body.textContent).toContain('No public collections'));
 		// The lock must NOT render — that is the owner's bug.
 		expect(document.body.textContent).not.toContain('Listings locked');
+		// QURATOR-342 — and the retired ask CTA must not render either (ruling 2026-09-27).
+		expect(document.body.textContent).not.toContain('Ask for access');
 	});
 
-	it('state 2: keyless contact, listing events EXIST but none decryptable -> 🔒 Listings locked + Ask for access', async () => {
+	it('state 2: keyless contact, listing events EXIST but none decryptable -> the unreadable-peer TEASER, never 🔒 / ask', async () => {
 		refreshMock.mockResolvedValue(keylessPeer('Sealed'));
 		contacts.set([keylessPeer('Sealed')]);
-		const { getByText, getByRole } = render(BrowsePage);
+		const { getByText } = render(BrowsePage);
 		await tick();
 
-		await waitFor(() => expect(getByText('🔒 Listings locked')).toBeTruthy());
-		// The ask-access ramp (M17 W2) rides the genuine locked case.
-		expect(getByRole('button', { name: /ask for access/i })).toBeTruthy();
+		// QURATOR-342 (ruling 2026-09-27): the 🔒 lock screen and its M17 ask ramp are RETIRED —
+		// a sealed peer is an unreadable peer and gets the teaser. This minimal fixture carries
+		// no size signals at all, so the honest generic line renders (never a fabricated number).
+		await waitFor(() => expect(getByText("Their collections aren't readable yet.")).toBeTruthy());
+		expect(document.body.textContent).not.toContain('Ask for access');
+		expect(document.body.textContent).not.toContain('Listings locked');
 		// …and the confident negative must NOT render.
 		expect(document.body.textContent).not.toContain('No public collections');
 	});
@@ -180,7 +187,8 @@ describe('QURATOR-134 — zero published ≠ locked ≠ failed', () => {
 		expect(row, 'peer B must render in the People list').toBeTruthy();
 		await fireEvent.click(row!);
 		await waitFor(() => expect(refreshMock).toHaveBeenCalledWith(PEER_B_NPUB));
-		// The classified result renders: B came back Sealed → 🔒, not a confident negative.
-		await waitFor(() => expect(document.body.textContent).toContain('Listings locked'));
+		// The classified result renders: B came back Sealed → the unreadable-peer teaser
+		// (QURATOR-342), not a confident negative and never the retired 🔒 screen.
+		await waitFor(() => expect(document.body.textContent).toContain("Their collections aren't readable yet."));
 	});
 });

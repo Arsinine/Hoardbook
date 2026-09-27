@@ -38,6 +38,11 @@ vi.mock('$lib/api.js', () => ({
 	getContacts: vi.fn(),
 	privateAudienceList: vi.fn().mockResolvedValue([]),
 	privateAudienceSet: vi.fn().mockResolvedValue(undefined),
+	// QURATOR-342 lane B: the page now mounts the self-fetching People-like-you panel, so its two
+	// api reads need stubs too — else the panel's own error EmptyState (a second alert + Retry
+	// button) collides with this file's single-alert/single-Retry assertions.
+	similarPeople: vi.fn().mockResolvedValue({ people: [], cold_start: false }),
+	topicDiscoverPaint: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock('$app/navigation', () => ({ goto: vi.fn() }));

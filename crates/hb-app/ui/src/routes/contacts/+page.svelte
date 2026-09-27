@@ -14,7 +14,7 @@
 	import AddContactDialog from '$lib/components/AddContactDialog.svelte';
 	import AddContactPanel from '$lib/components/AddContactPanel.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
-	import AZRail from '$lib/components/AZRail.svelte';
+	import PeopleLikeYou from '$lib/components/PeopleLikeYou.svelte';
 	import type { CachedPeer, Collection, ContactSummary, Group, Profile } from '$lib/types.js';
 	import { contactDisplayName, shortNpub } from '$lib/contact-display.js';
 	import { NOT_DRM_NOTE, receivesPrivate } from '$lib/private-collections-view.js';
@@ -32,7 +32,7 @@
 	import { PRESENCE_TICK_MS, PRESENCE_WINDOW_MS, checkedLabel, freshIndex, newestSeen, presenceView, type PresenceView } from '$lib/presence-view.js';
 	import { relayWhyHint } from '$lib/relay-health.js';
 	import { ONLINE_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
-	import { ALPHABET, groupByLetter, groupByGroups, onlineBucket, matchesQuery, presentSectionKeys } from '$lib/contacts-view.js';
+	import { groupByGroups, onlineBucket, matchesQuery } from '$lib/contacts-view.js';
 	// M22 W3 — drag-to-group gesture primitives (shared with Browse). Create is ALWAYS ADDITIVE
 	// (Reading B): both peers keep every group they were already in and both gain the new one.
 	// M22 W4 — drop onto an existing group: plain drop MOVES, Shift-drop ADDS (owner ruling
@@ -1070,10 +1070,9 @@
 		} catch (e) { toast(String(e), 'error'); }
 	}
 
-	// Filter by tag — demoted to a collapsible row (default collapsed), applied in both views.
-	let filterTag = $state('');
-	let tagFilterOpen = $state(false);
-	let allTags = $derived([...new Set($contacts.flatMap(c => c.local_tags ?? []))].sort());
+	// QURATOR-342 lane B — the collapsible "Filter by tag" row is GONE. Tag search is covered by the
+	// free-text search (matchesQuery already reads local_tags + published tags); a tag-scoped filter
+	// was a second control over the same roster and a whole subheader row of screen space.
 
 	// ── Phonebook redesign (devtest #17/#18): sticky free-text search + Name|Groups view toggle +
 	//    a pinned "Online now" bucket (additive — an online peer also still appears in its section). ──
@@ -1086,15 +1085,41 @@
 	let presenced = $derived($contacts.map(withPresence));
 	let onlineTotal = $derived(presenced.filter(c => c.online).length);
 	let visible = $derived(
-		presenced.filter(c => matchesQuery(c, searchQuery)).filter(c => !filterTag || (c.local_tags ?? []).includes(filterTag))
+		presenced.filter(c => matchesQuery(c, searchQuery))
 	);
 	// #1: an online peer moves OUT of its A-Z section INTO the pinned "Online now" bucket (never both),
 	//     and moves back when it goes offline. #8: the Groups view is for organizing, so it has no
 	//     Online-now bucket and every group lists all its members (online included).
 	let online = $derived(view === 'name' ? onlineBucket(visible) : []);
-	let sections = $derived(
-		view === 'name' ? groupByLetter(visible.filter((c) => !c.online)) : groupByGroups(visible, groups)
-	);
+	// QURATOR-342 lane B — the Name view collapses its A-Z sections into ONE "Everyone else"
+	// section (the A-Z rail and per-letter jumps went with it); the Groups view is untouched, so
+	// drag-to-group, the Ungrouped target and the group strip keep their drop surfaces.
+	// QURATOR-342 review — a double-click's FIRST click also fires `click`. Navigating at once
+	// unmounted the page before `dblclick` (→ Chat) could land, so the row's double-click-to-message
+	// path was dead. The single-click Browse is held for the double-click window and cancelled by a
+	// double-click (Chat still wins a double-click, as before 342).
+	const ROW_CLICK_DELAY_MS = 250;
+	let rowBrowseTimer: ReturnType<typeof setTimeout> | undefined;
+	function cancelRowBrowse() {
+		if (rowBrowseTimer !== undefined) clearTimeout(rowBrowseTimer);
+		rowBrowseTimer = undefined;
+	}
+	function scheduleRowBrowse(npub: string) {
+		cancelRowBrowse();
+		rowBrowseTimer = setTimeout(() => {
+			rowBrowseTimer = undefined;
+			goto('/browse?peer=' + encodeURIComponent(npub));
+		}, ROW_CLICK_DELAY_MS);
+	}
+	onDestroy(cancelRowBrowse);
+
+	let sections = $derived.by(() => {
+		if (view === 'groups') return groupByGroups(visible, groups);
+		const rest = visible.filter((c) => !c.online);
+		return rest.length > 0
+			? [{ key: 'everyone', label: 'Everyone else', anchorId: 'sec-everyone', peers: rest }]
+			: [];
+	});
 	// M22 W5 — the rendered contact order across all visible sections, so applyClickToSelection
 	// can compute the contiguous Shift range. Includes the online bucket in name view.
 	let contactOrder = $derived(
@@ -1109,9 +1134,6 @@
 		for (const sec of sections) { out.push(n); n += sec.peers.length; }
 		return out;
 	})());
-	let railTargets = $derived(
-		ALPHABET.map(l => ({ label: l, anchorId: l === '#' ? 'sec-hash' : `sec-${l}`, enabled: presentSectionKeys(sections).has(l) }))
-	);
 </script>
 
 <!-- M22 W5 — Esc clears the multi-selection when the naming popover is not open. -->
@@ -1145,9 +1167,14 @@
 			<span class="online-why" title={whyHint}>({whyHint})</span>
 		{/if}
 	{/if}
+	<button type="button" class="btn-primary btn-sm topbar-add" onclick={() => (addContactPanelOpen = true)}>+ Add contact</button>
 </div>
 
-<!-- Sticky sub-header: free-text search, Name|Groups view toggle, "+ Add contact" -->
+<div class="contacts-body">
+<div class="contacts-col">
+
+<!-- List-column sub-header: free-text search + Name|Groups view toggle. "+ Add contact" moved to
+     the topbar (QURATOR-342 lane B) to keep the 300px column to search + toggle. -->
 <div class="subheader">
 	<div class="hb-input subheader-search">
 		<span class="search-icon">{@html icons.search}</span>
@@ -1157,24 +1184,7 @@
 		<button type="button" aria-pressed={view === 'name'} onclick={() => (view = 'name')}>Name</button>
 		<button type="button" aria-pressed={view === 'groups'} onclick={() => (view = 'groups')}>Groups</button>
 	</div>
-	<button type="button" class="btn-primary btn-sm" onclick={() => (addContactPanelOpen = true)}>+ Add contact</button>
 </div>
-
-{#if allTags.length > 0}
-	<div class="tagfilter-row">
-		<button type="button" class="tagfilter-toggle" onclick={() => (tagFilterOpen = !tagFilterOpen)} aria-expanded={tagFilterOpen}>
-			Filter by tag <span class="tagfilter-chevron" class:open={tagFilterOpen}>{@html icons.chevronDown}</span>
-		</button>
-		{#if tagFilterOpen}
-			<div class="tag-filter-row">
-				<button class="filter-tag" class:filter-tag-active={!filterTag} onclick={() => filterTag = ''}>All</button>
-				{#each allTags as tag}
-					<button class="filter-tag" class:filter-tag-active={filterTag === tag} onclick={() => filterTag = filterTag === tag ? '' : tag}>{tag}</button>
-				{/each}
-			</div>
-		{/if}
-	</div>
-{/if}
 
 {#snippet contactRow(peer: ContactSummary, renderIdx: number)}
 	{@const name = contactDisplayName(peer)}
@@ -1230,7 +1240,15 @@
 			ondragleave={(e) => onDragLeave(e, peer.npub)}
 			ondrop={(e) => onDrop(e, peer.npub)}
 			ondragend={onDragEnd}
-			ondblclick={(e) => { if ((e.target as HTMLElement).closest('button, a')) return; goto('/chat?peer=' + peer.npub); }}
+			ondblclick={(e) => { if ((e.target as HTMLElement).closest('button, a')) return; cancelRowBrowse(); goto('/chat?peer=' + peer.npub); }}
+			onclick={(e) => {
+				// QURATOR-342 lane B — a PLAIN click on the row opens the person in Browse (owner
+				// ruling: row click opens Browse; no detail pane). Modifier-clicks keep selection
+				// semantics; clicks on an inner control keep that control's own action.
+				if (e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;
+				if ((e.target as HTMLElement).closest('button, a, input')) return;
+				scheduleRowBrowse(peer.npub);
+			}}
 			title="Double-click to message in Chat"
 		>
 			<!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -1271,11 +1289,10 @@
 						{/if}
 					{/if}
 					<div style="flex:1"></div>
-					{#if badge.locked}
-						<button class="btn-default btn-sm ask-access-btn" onclick={() => goto('/chat?peer=' + peer.npub + '&intent=ask-access' + (peer.petname ? '&petname=' + encodeURIComponent(peer.petname) : ''))}>Ask for access</button>
-					{:else}
-						<a class="btn-default btn-xs" href="/browse?peer={peer.npub}">Browse</a>
+					{#if pubCount > 0}
+						<span class="row-count" title="{pubCount} public collection{pubCount !== 1 ? 's' : ''}">{pubCount}</span>
 					{/if}
+					<a class="btn-default btn-xs" href="/browse?peer={peer.npub}">Browse</a>
 					<button class="btn-default btn-xs" onclick={() => goto('/chat?peer=' + peer.npub)}>Message</button>
 					<button
 						class="row-menu-btn"
@@ -1624,8 +1641,6 @@
 			{#if sections.length === 0 && online.length === 0}
 				{#if searchQuery.trim()}
 					<div class="empty">No contacts match "{searchQuery}".</div>
-				{:else if filterTag}
-					<div class="empty">No contacts with tag "{filterTag}".</div>
 				{/if}
 			{:else}
 				{#if online.length > 0}
@@ -1691,9 +1706,11 @@
 			{/if}
 		{/if}
 	</div>
-	{#if view === 'name'}
-		<AZRail targets={railTargets} />
-	{/if}
+</div>
+	</div>
+	<!-- QURATOR-342 lane B — the right pane: lane C's People-like-you panel (no props,
+	     self-fetches similarPeople() and reads the contacts store). -->
+	<div class="people-pane"><PeopleLikeYou /></div>
 </div>
 </div>
 </div>
@@ -1788,6 +1805,20 @@
 		overflow: hidden;
 		min-width: 0;
 	}
+	/* QURATOR-342 lane B — two-pane layout: a ~300px compact contact-list column and the
+	   People-like-you pane. The list column owns the sub-header; the pane scrolls independently. */
+	.contacts-body { display: flex; flex: 1; min-height: 0; min-width: 0; }
+	.contacts-col {
+		width: 300px;
+		min-width: 300px;
+		display: flex;
+		flex-direction: column;
+		border-right: 1px solid var(--border);
+		min-height: 0;
+		background: var(--bg);
+	}
+	.people-pane { flex: 1; min-width: 0; overflow-y: auto; padding: 16px 20px 24px; }
+	.topbar-add { flex-shrink: 0; }
 
 	.topbar {
 		padding: 16px 24px;
@@ -1861,17 +1892,7 @@
 	}
 	.view-toggle button[aria-pressed='true'] { background: var(--accent-soft); color: var(--accent); }
 
-	/* Tag filter — collapsible, under the search bar, applied in both views. */
-	.tagfilter-row { padding: 8px 24px 0; flex-shrink: 0; }
-	.tagfilter-toggle {
-		background: transparent; border: none; cursor: pointer;
-		color: var(--fg-dim); font-size: 11px; font-weight: 500;
-		display: inline-flex; align-items: center; gap: 4px;
-		font-family: var(--font-ui); padding: 2px 0;
-	}
-	.tagfilter-toggle:hover { color: var(--fg-muted); }
-	.tagfilter-chevron { display: flex; transition: transform 0.15s; }
-	.tagfilter-chevron.open { transform: rotate(180deg); }
+	/* QURATOR-342 lane B — the tag-filter row's CSS went with the control (search covers tags). */
 
 	.section-label {
 		font-size: 10.5px; color: var(--fg-dim);
@@ -1909,9 +1930,9 @@
 	}
 	.not-drm-note { margin: 2px 0 0; font-size: 11px; line-height: 1.4; color: var(--fg-dim); }
 
-	/* Phonebook: scrollable section list + a fixed A-Z rail sibling. */
-	.phonebook { display: flex; min-height: 0; flex: 1; max-width: 760px; }
-	.phonebook-scroll { flex: 1; overflow-y: auto; padding: 16px 24px 24px; min-width: 0; }
+	/* QURATOR-342 lane B — the phonebook is the list column's scroll area (the A-Z rail is gone). */
+	.phonebook { display: flex; min-height: 0; flex: 1; }
+	.phonebook-scroll { flex: 1; overflow-y: auto; padding: 12px 14px 24px; min-width: 0; }
 
 	.phonebook-section { margin-bottom: 4px; }
 	.section-header {
@@ -1927,7 +1948,7 @@
 	/* Contacts list */
 	.empty { color: var(--fg-dim); font-size: 13px; padding: 16px 0; }
 
-	.contact-list { display: flex; flex-direction: column; gap: 12px; padding-bottom: 16px; }
+	.contact-list { display: flex; flex-direction: column; gap: 4px; padding-bottom: 16px; }
 
 	.contact-block { display: flex; flex-direction: column; gap: 8px; scroll-margin-top: 34px; }
 	/* devtest v0.12.4 #6: an expanded row reads as ONE connected card — the detail continues the card
@@ -1996,9 +2017,32 @@
 		background: var(--bg-elev1);
 		box-shadow: 0 0 0 1px var(--border);
 	}
-	/* M17 W2: the locked contact card's "Ask for access" affordance turns the dead-end hint into a
-	   next step → the chat ask-access deep-link (no wire change, just a prefilled draft). */
-	.ask-access-btn { flex-shrink: 0; }
+	/* QURATOR-342 lane B — COMPACT rows: at rest a row shows only line 1 (avatar · name ·
+	   collection count) and the fingerprint line. The bio, group chips, collections popover, size
+	   summary, cold-cache marker and the row controls reveal on hover/focus — every affordance
+	   stays reachable; nothing was removed. The Ask-for-access button was removed BY RULING (an
+	   unreadable person shows the reason in Browse), so its rule went with it. */
+	.contact-card { padding: 8px 10px; gap: 8px; align-items: center; }
+	.contact-card:not(:hover):not(:focus-within) .bio-row,
+	.contact-card:not(:hover):not(:focus-within) .contact-sub-row { display: none; }
+	.contact-card .chevron-btn,
+	.contact-card .row-menu-btn,
+	.contact-card .name-row .btn-default { opacity: 0; pointer-events: none; transition: opacity 0.12s; }
+	.contact-card:hover .chevron-btn,
+	.contact-card:hover .row-menu-btn,
+	.contact-card:hover .name-row .btn-default,
+	.contact-card:focus-within .chevron-btn,
+	.contact-card:focus-within .row-menu-btn,
+	.contact-card:focus-within .name-row .btn-default { opacity: 1; pointer-events: auto; }
+	/* An expanded row (chevron) shows everything without needing hover. */
+	.contact-block.open .bio-row,
+	.contact-block.open .contact-sub-row { display: flex; }
+	.row-count {
+		font-size: 11px;
+		color: var(--fg-dim);
+		font-variant-numeric: tabular-nums;
+		flex-shrink: 0;
+	}
 
 	/* Contact-card bio (devtest #7) — render-only, clamped to 2 lines. */
 	.card-bio {
@@ -2075,16 +2119,7 @@
 
 	/* M15 W7: removed the dead .modal-* block (unreferenced — grep-confirmed). */
 
-	/* Tag filter bar */
-	.tag-filter-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; padding: 0 24px; }
-	.filter-tag {
-		padding: 3px 10px; font-size: 11px; font-weight: 500;
-		border: 1px solid transparent; border-radius: 999px;
-		background: transparent; color: var(--fg-muted); cursor: pointer;
-		font-family: var(--font-ui);
-	}
-	.filter-tag:hover { color: var(--accent); }
-	.filter-tag-active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+	/* Tag filter bar — removed with the control (QURATOR-342 lane B). */
 
 	/* Local tags on contact cards */
 	.tag-row { display: flex; flex-wrap: wrap; gap: 4px; margin: 5px 0 2px; align-items: center; min-height: 22px; }
@@ -2347,6 +2382,6 @@
 
 	/* M22 W7 — respect prefers-reduced-motion: disable the drag/chevron transitions. */
 	@media (prefers-reduced-motion: reduce) {
-		.chevron, .tagfilter-chevron { transition: none; }
+		.chevron { transition: none; }
 	}
 </style>

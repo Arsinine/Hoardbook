@@ -42,7 +42,21 @@ export interface Profile {
 	 *  OPPOSITE direction from the Rust serde default (`false` = not hidden); see rosterChatLocked
 	 *  in routes/topics/+page.svelte. */
 	hide_in_rosters?: boolean;
+	/** QURATOR-342 (owner 2026-09-28: "The collection name is the teaser") — a PEER's published
+	 *  PUBLIC collections as carried in their public teaser: name + publish-computed size. Shown to
+	 *  anyone who cannot read them. Absent on old teasers and on the user's own profile. */
+	teaser_collections?: TeaserCollection[];
+	/** v5 (QURATOR-345) — a PEER's publish-computed total from their public teaser (Rust
+	 *  `Profile::total_bytes`, serde-default 0). Absent/0 on the user's own profile. */
+	total_bytes?: number;
 	updated: string; // ISO datetime
+}
+
+/** One entry of a teaser's public collection list — `name` is the collection's `path_alias`,
+ *  `bytes` its publish-computed size (never user-typed). */
+export interface TeaserCollection {
+	name: string;
+	bytes: number;
 }
 
 export interface ReceivedMessage {

@@ -16,8 +16,11 @@
 	// QURATOR-98 — the shared dialog shell (backdrop, Escape, Tab trap, focus restore).
 	import Modal from '$lib/components/Modal.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
+	// QURATOR-342 D2 — the title-search strip (lane D1's component) mounts at the top of the right
+	// pane; onbrowse routes into this page's own peer-selection path (see onTitleBrowse).
+	import TitleSearch from '$lib/components/TitleSearch.svelte';
 	import { deriveFetchStatus } from '$lib/fetch-status.js';
-	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote, arrangeItems, fileTypesPresent, fmtLargestUnit, type BrowseViewMode, type BrowseSortKey, type BrowseSortDir } from '$lib/browse-view.js';
+	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote, arrangeItems, fileTypesPresent, fmtLargestUnit, parseEstSize, type BrowseViewMode, type BrowseSortKey, type BrowseSortDir } from '$lib/browse-view.js';
 	import type { Collection, ContactSummary, DirectoryItem, Group } from '$lib/types.js';
 	import { groupByGroups, matchesQuery } from '$lib/contacts-view.js';
 	// M22 W3 — drag-to-group gesture primitives (shared with Contacts). Create is ALWAYS ADDITIVE.
@@ -121,6 +124,20 @@
 			selectPeer(peer);
 		}
 	});
+
+	// QURATOR-342 D2 — the title-search strip's selection ramp. A contact is selected through the
+	// page's OWN path (selectPeer's keyed live-refetch fires by construction); a non-contact
+	// (a title holder the user hasn't added) deep-links `/browse?peer=` — the exact param the
+	// existing deep-link effect above resolves (Contacts' row-click ramp uses the same route),
+	// so there is no second resolution path to keep in step.
+	async function onTitleBrowse(npub: string) {
+		const peer = $contacts.find((c) => c.npub === npub);
+		if (peer) {
+			await selectPeer(peer);
+			return;
+		}
+		await goto('/browse?peer=' + npub);
+	}
 
 	function selectCollection(col: Collection) {
 		selectedCollection = col;
@@ -317,6 +334,43 @@
 	// backend classifies it (a background queue, or the click that opens the peer — selectPeer
 	// refreshes every peer now). Neutral by ruling 2026-09-24: never a confident negative.
 	let listingsPending = $derived(!!selectedPeer && !selectedPeer.has_browse_key && selectedPeer.listings_state === 'Pending');
+
+	// QURATOR-342 — the unreadable-peer TEASER (owner 2026-09-27: "if you cant [read] you get a
+	// teaser with the reason why"). Locked now covers BOTH signals: the classic sealed-listings
+	// state AND the v5 size rule (`read_state.kind === 'locked'` — which can key on a peer you
+	// hold a key for; their hoard outgrew yours). One rendering, both halves.
+	let peerUnreadable = $derived(
+		!!selectedPeer && (listingsLocked || selectedPeer.read_state?.kind === 'locked'),
+	);
+	// The unreadable peer itself, for the branch's closures (the derivation's narrowing does not
+	// reach the template).
+	let lockedPeer = $derived(peerUnreadable ? selectedPeer : null);
+	// QURATOR-342 — THEIR total, for the teaser header line and the reason-line fallback.
+	// PREMISE GAP (reported to the orchestrator): `Profile` carries no `total_bytes` — the
+	// publish-computed number available to the UI is the `teaser_collections` sum, with the
+	// profile's own `est_size` ("~12 TB", parsed) as fallback. null = nothing known → the generic
+	// reason line. NEVER a fabricated number.
+	let lockedPeerTotal = $derived.by(() => {
+		const p = lockedPeer;
+		if (!p) return null;
+		// The publish-computed total from their teaser is authoritative when present.
+		if (p.profile?.total_bytes) return p.profile.total_bytes;
+		const teasers = p.profile?.teaser_collections ?? [];
+		if (teasers.length > 0) return teasers.reduce((sum, t) => sum + t.bytes, 0);
+		return parseEstSize(p.profile?.est_size) || null;
+	});
+	// The ONE reason line (exact ruling copy: "Readable once your hoard reaches X", X = THEIR
+	// total from `read_state.need_bytes`, falling back to the computed total above; when neither
+	// is known, the honest generic line — never a fake number).
+	let lockReasonLine = $derived.by(() => {
+		const p = lockedPeer;
+		if (!p) return null;
+		const rb = p.read_state?.kind === 'locked' ? p.read_state.need_bytes : null;
+		const bytes = rb ?? lockedPeerTotal;
+		return bytes != null
+			? `Readable once your hoard reaches ${fmtLargestUnit(bytes)}`
+			: "Their collections aren't readable yet.";
+	});
 
 	// M22 W3 — drag-to-group gesture on the People list. Same shared primitives as Contacts;
 	// create is ALWAYS ADDITIVE. Esc cancels. The naming popover is a simple inline panel here
@@ -984,6 +1038,12 @@
 
 	<!-- Right: browser -->
 	<div class="right-panel">
+		<!-- QURATOR-342 D2 — the title-search strip (lane D1's TitleSearch) sits at the TOP of the
+		     right pane in EVERY state: searching drives peer selection, it is not a per-peer tool.
+		     Selection routes through onTitleBrowse → selectPeer / the /browse?peer= deep-link. -->
+		<div class="title-search-strip">
+			<TitleSearch onbrowse={onTitleBrowse} />
+		</div>
 		{#if !selectedPeer}
 			<!-- Browse = view a contact's collections. Finding/adding people (lookup + Discover
 			     hoarders) now lives on Contacts (devtest 2026-06-25 #6). -->
@@ -1039,17 +1099,28 @@
 						message="Couldn't load collections."
 						onretry={() => { const t = p; if (!t) return; selectPeerRefresh(t); }}
 					/>
-				{:else if listingsLocked}
-					<div class="empty-state">
-						<div class="empty-icon">{@html icons.folder}</div>
-						<div class="empty-label">
-							🔒 Listings locked<FeatureTooltip key="listings-locked" />
-						</div>
-						<!-- M17 W2: turn the locked dead-end into a next step → ask-access deep-link (a
-						     prefilled DM draft, no wire change). selectedPeer is a ContactSummary (has petname);
-						     guarded because the listingsLocked derivation's non-null narrowing doesn't reach
-						     this closure. -->
-						<button class="btn-default btn-sm ask-access-btn" onclick={() => { const p = selectedPeer; if (!p) return; goto('/chat?peer=' + p.npub + '&intent=ask-access' + (p.petname ? '&petname=' + encodeURIComponent(p.petname) : '')); }}>Ask for access</button>
+				{:else if lockedPeer}
+					<!-- QURATOR-342 — the unreadable-peer TEASER replaces the 🔒 lock screen: a header
+					     line with THEIR total, ONE reason line (exact ruling copy), and a dimmed,
+					     NON-clickable grid of their published collection names + sizes (owner: "the
+					     collection name is the teaser"). No ask affordance — the ask ramp is retired
+					     by ruling 2026-09-27; when nothing is known, the reason line says so honestly
+					     and never invents a number. -->
+					<div class="empty-state teaser-state">
+						{#if lockedPeerTotal !== null}
+							<div class="teaser-head">their hoard {fmtLargestUnit(lockedPeerTotal)}</div>
+						{/if}
+						<div class="teaser-reason">{lockReasonLine}</div>
+						{#if (lockedPeer?.profile?.teaser_collections ?? []).length > 0}
+							<div class="teaser-grid">
+								{#each lockedPeer?.profile?.teaser_collections ?? [] as tc}
+									<div class="teaser-card">
+										<div class="teaser-name">{tc.name}</div>
+										<div class="teaser-bytes">{fmtLargestUnit(tc.bytes)}</div>
+									</div>
+								{/each}
+							</div>
+						{/if}
 					</div>
 				{:else if listingsPending}
 					<!-- QURATOR-332 state 4: 'Pending' — this contact's listings have never been
@@ -1063,12 +1134,12 @@
 						<button class="btn-default btn-sm" onclick={() => { const t = p; if (!t) return; selectPeerRefresh(t); }}>Check now</button>
 					</div>
 				{:else if selectedPeer.collections.length === 0}
-					{@const p = selectedPeer}
+					<!-- QURATOR-342 — the ask-access CTA is RETIRED (ruling 2026-09-27: no ask on an
+					     unreadable peer, and "No public collections" is not a locked state). -->
 					<EmptyState
 						centered
 						icon={icons.folder}
 						message="No public collections"
-						cta={{ label: 'Ask for access →', href: '/chat?peer=' + p.npub + '&intent=ask-access' + (p.petname ? '&petname=' + encodeURIComponent(p.petname) : '') }}
 					/>
 				{:else}
 					<div class="col-grid">
@@ -1570,6 +1641,14 @@
 		min-width: 0;
 	}
 
+	/* QURATOR-342 D2 — the title-search strip at the top of the right pane, present in every
+	   state: search drives peer selection, it is not a per-peer tool. */
+	.title-search-strip {
+		flex-shrink: 0;
+		padding: 10px 16px;
+		border-bottom: 1px solid var(--divider);
+	}
+
 	.empty-state {
 		flex: 1;
 		display: flex;
@@ -1841,6 +1920,51 @@
 		font-size: 10.5px;
 		color: var(--fg-dim);
 		margin-top: 2px;
+	}
+
+	/* QURATOR-342 — the unreadable-peer teaser: THEIR total, one reason line, then a DIMMED,
+	   NON-clickable grid of their published collection names + sizes (the grid sizing mirrors
+	   .col-grid; the cards mirror .col-card minus the hover/cursor — a teaser is never a
+	   click target). */
+	.teaser-state { text-align: center; }
+	.teaser-head {
+		font-size: 12px;
+		font-weight: 600;
+		color: var(--fg-muted);
+	}
+	.teaser-reason {
+		font-size: 12px;
+		color: var(--fg-dim);
+	}
+	.teaser-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
+		gap: 10px;
+		padding: 0 16px;
+		width: 100%;
+		max-width: 640px;
+	}
+	.teaser-card {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		padding: 12px;
+		background: var(--bg-elev1);
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		opacity: 0.55;
+		text-align: left;
+		pointer-events: none;
+	}
+	.teaser-name {
+		font-size: 12.5px;
+		font-weight: 600;
+		color: var(--fg);
+		word-break: break-word;
+	}
+	.teaser-bytes {
+		font-size: 10.5px;
+		color: var(--fg-dim);
 	}
 
 	/* devtest item 6 — size tiers, same values as CollectionRow/CollectionPanel (a peer's over-cap

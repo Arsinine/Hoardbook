@@ -1,40 +1,34 @@
-// M17 W2 — "Ask for access" ramp on Browse's `🔒 Listings locked` empty state. Source-scan guard
-// following the repo's route-page idiom (mas-inv5-no-download.test.ts, contacts-w1.test.ts).
-//
-// The locked-listings empty state gains exactly one "Ask for access" button that routes to
-// `/chat?peer=<npub>&intent=ask-access`. Browse's selectedPeer is a CachedPeer (has petname), so
-// the petname is carried via `&petname=` for a natural draft.
+// M17 W2 → QURATOR-342 — INVERTED. This file used to pin the "Ask for access" ramp on Browse's
+// `🔒 Listings locked` empty state (one button → `/chat?peer=<npub>&intent=ask-access`). Owner
+// ruling 2026-09-27/28 retired it: NO Ask-for-access affordance anywhere on Browse, on an
+// unreadable peer or anywhere else; an unreadable peer gets the TEASER (QURATOR-342 D2), and
+// "No public collections" lost its CTA too. The file now pins the RETIREMENT, so re-introducing
+// the ramp — the regression the ruling forbids — reds it. The M17-era mount-level absence pins
+// live in q342-browse-teaser.test.ts and q102-browse-empty-cta.test.ts; this source-scan guard
+// complements them by covering EVERY branch in one sweep (a mount test can only exercise one
+// state per run — note what each cannot see, per the repo's mount-first rule, P-4).
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { extractUserFacingSegments } from '$lib/copy-audit.js';
 
 const browseSrc = () => readFileSync(new URL('./+page.svelte', import.meta.url), 'utf8');
 
-describe('Browse page — M17 W2 ask-access ramp on Listings locked', () => {
-	it('Listings locked empty state exposes exactly one Ask-for-access affordance', () => {
-		const src = browseSrc();
-		const askButtons = src.match(/>Ask for access</g) ?? [];
-		expect(askButtons.length).toBe(1);
+describe('QURATOR-342 — the ask ramp is retired on Browse', () => {
+	it('no "Ask for access" affordance exists anywhere in the Browse page source', () => {
+		// MUTATION (seen red): re-adding the M17-era locked-state button
+		// (`<button ...>Ask for access</button>`) made this hit 1.
+		const askButtons = browseSrc().match(/>Ask for access</g) ?? [];
+		expect(askButtons.length).toBe(0);
 	});
 
-	it('ask-access button sits inside the Listings locked empty state', () => {
-		// The button lives in the `listingsLocked` branch. The paywall block's manifest-ask
-		// affordances (QURATOR-203: round-trip buttons removed) no longer exist to bound against.
-		const src = browseSrc();
-		const lockIdx = src.indexOf('🔒 Listings locked');
-		expect(lockIdx).toBeGreaterThan(-1);
-		const askIdx = src.indexOf('>Ask for access<');
-		expect(askIdx).toBeGreaterThan(lockIdx);
-	});
-
-	it('ask-access button routes to the chat peer deep-link with the ask-access intent', () => {
-		const src = browseSrc();
-		expect(src).toMatch(/intent=ask-access/);
-		expect(src).toMatch(/petname=/);
+	it('no ask-access deep-link route remains (no `intent=ask-access` from this page)', () => {
+		// MUTATION (seen red): restoring the `/chat?peer=…&intent=ask-access` href — with or
+		// without a visible button — made this match.
+		expect(browseSrc()).not.toMatch(/intent=ask-access/);
 	});
 
 	it('no new user-facing copy contains the forbidden word "Download" (MAS-INV-5)', () => {
-		// The MAS-INV-5 sweep must stay green — the ask-access copy must not introduce "Download".
+		// The MAS-INV-5 sweep must stay green — the teaser copy must not introduce "Download".
 		const offenders = extractUserFacingSegments(browseSrc())
 			.map((seg) => seg.replace(/\bno[\s-]?download\b/gi, ''))
 			.filter((seg) => /download/i.test(seg));

@@ -777,7 +777,7 @@
 				</div>
 
 				<div class="field">
-					<label class="field-label">Contact hint<HintMarker label="Contact hint" text="How people reach you outside Hoardbook, like a Discord or Matrix handle or an email. It's shown on your public profile, so use a channel that isn't linked to your real name, or accept that it is. If you ever lose your key, it's how your contacts find you again." /></label>
+					<label class="field-label">Contact hint<span class="hb-tag">Public</span><HintMarker label="Contact hint" text="How people reach you outside Hoardbook, like a Discord or Matrix handle or an email. It's shown on your public profile, so use a channel that isn't linked to your real name, or accept that it is. If you ever lose your key, it's how your contacts find you again." /></label>
 					<input class="hb-input hb-input-mono" type="text" placeholder="you@example.com · @you:matrix.org" bind:value={form.contact_hint} />
 				</div>
 
@@ -822,7 +822,11 @@
 				</div>
 
 				<div class="field">
-					<label class="field-label">Tags</label>
+					<!-- QURATOR-342 E: "Tags" → "Interests" — the label names what the field DECIDES
+					     (the "People like you" ranking on Contacts is built from these). Data stays
+					     `form.tags`; only the copy changed. -->
+					<label class="field-label">Interests</label>
+					<div class="field-hint">This decides who and what gets recommended — People like you on Contacts is ranked from these.</div>
 					<div class="tag-wrap">
 						{#each form.tags as tag, i (tag)}
 							<span class="lang-tag">{tag}<button class="lang-x" onclick={() => removeTag(i)} title="Remove">×</button></span>
@@ -869,6 +873,10 @@
 					<span>{@html icons.plus}</span>Add collection
 				</button>
 			</div>
+
+			<!-- QURATOR-342 (owner ruling 2026-09-28): collection names + sizes now ride the PUBLIC
+			     teaser, so say so once, next to the control that publishes them — never per row. -->
+			<div class="coll-disclosure">Published collection names and sizes are public — anyone can see them, even people who can't read your files.</div>
 
 			<!-- Stat strip -->
 			<div class="stats">
@@ -1216,6 +1224,9 @@
 
 	.coll-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
 
+	/* QURATOR-342 E: the public-collections disclosure — one quiet line under the pane header. */
+	.coll-disclosure { font-size: 11px; color: var(--fg-dim); margin: 2px 0 8px; }
+
 	.field-readonly {
 		height: 34px;
 		display: flex;
@@ -1284,6 +1295,10 @@
 		font-weight: 500;
 		letter-spacing: 0.1px;
 	}
+
+	/* QURATOR-342 E: the "Public" chip on the Contact-hint label — global .hb-tag badge (app.css),
+	     breathing room from the label text only. */
+	.field-label .hb-tag { margin-left: 6px; vertical-align: 1px; }
 
 	.accent-dot { color: var(--accent); margin-left: 3px; }
 
