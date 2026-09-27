@@ -31,6 +31,9 @@ import type {
 	TopicAnnounceSummary,
 	DmRequestView,
 	RosterMemberView,
+	TitleHolder,
+	TitleHit,
+	TitleSearchResult,
 } from './types.js';
 
 // ── Identity ─────────────────────────────────────────────────────────────────
@@ -712,3 +715,12 @@ export const topicAnnounceSeen = () =>
 /** devtest #2 — mark a Topic's announcements read up to `ts` (advances the watermark, never rewinds). */
 export const topicAnnounceMarkSeen = (topicId: string, ts: number) =>
 	invoke<void>('topic_announce_mark_seen', { topicId, ts });
+
+// ── QURATOR-347 slice A — title search over the in-memory title index ─────────
+
+/** Search every listing this client can read (in-memory index, rebuilt at launch from the
+ *  on-disk cache, updated on every successful save). The query is normalised with the one
+ *  `normalize_title`. Caps: 50 titles, 20 holders each; `truncated` reports more matches.
+ *  ⚠ UI copy must state the honest limit: holder counts cover only people you can read. */
+export const searchTitles = (query: string, limit?: number) =>
+	invoke<TitleSearchResult>('search_titles', { query, limit });

@@ -752,17 +752,35 @@ impl DataStore {
             if let Ok(Some(prev)) = read_json::<CachedPeer>(&path) {
                 if prev.last_presence.is_some() {
                     let merged = CachedPeer { last_presence: prev.last_presence, ..peer.clone() };
-                    return write_json(&path, &merged).context("saving contact");
+                    let res = write_json(&path, &merged).context("saving contact");
+                    // QURATOR-347 slice A: the title index rides THE write chokepoint — every
+                    // decrypted listing reaches disk through here (refresh, browse, the
+                    // enumeration scheduler), so the index stays current with no second
+                    // background loop (QURATOR-332, "never a burst"). Indexed as written.
+                    if res.is_ok() {
+                        crate::title_index::contact_saved(&merged);
+                    }
+                    return res;
                 }
             }
         }
-        write_json(&path, peer).context("saving contact")
+        let res = write_json(&path, peer).context("saving contact");
+        if res.is_ok() {
+            crate::title_index::contact_saved(peer);
+        }
+        res
     }
 
     pub fn delete_contact(&self, npub_hash: &str) -> Result<()> {
         let path = self.contact_path(npub_hash);
         if path.exists() {
+            // QURATOR-347: the title index is keyed by npub, the file by its hash — read the npub
+            // before the file goes, so an unfollowed contact stops counting as a holder.
+            let npub = read_json::<CachedPeer>(&path).ok().flatten().map(|p| p.npub);
             std::fs::remove_file(&path)?;
+            if let Some(npub) = npub {
+                crate::title_index::remove_author(&npub);
+            }
         }
         Ok(())
     }

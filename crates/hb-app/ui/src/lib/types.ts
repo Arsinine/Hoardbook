@@ -345,3 +345,30 @@ export interface DmRequestView {
 
 // (DownloadItem removed in v0.9.6. Still gone after M18: the transport plane carries manifests, not
 // collection files (INV-4′), so there is no download item to model.)
+
+// ── QURATOR-347 slice A — title search over the in-memory title index ─────────
+
+/** One holder of a title: a distinct contact, with a representative (slug, path) into their
+ *  cached collection. Honest limit the UI must state: holder counts cover only people you can
+ *  read (the index is fed from contacts' listings, nothing more). */
+export interface TitleHolder {
+	npub: string;
+	display_name?: string;
+	slug: string;
+	path: string;
+}
+
+/** One normalised-title hit: a representative display name, the normalised key, the DISTINCT
+ *  author count (computed before the holder cap) and the capped holder rows. */
+export interface TitleHit {
+	title: string;
+	name_norm: string;
+	holder_count: number;
+	holders: TitleHolder[];
+}
+
+export interface TitleSearchResult {
+	hits: TitleHit[];
+	/** True when more matching titles existed than the 50-title cap returned. */
+	truncated: boolean;
+}

@@ -35,6 +35,7 @@ mod portable_update_logic;
 mod presence;
 mod single_instance;
 mod store;
+mod title_index;
 // M18 W1 — the manifest plane (INV-4′: a transport exists, structurally limited to manifests).
 mod transport;
 // M18 W4 — the plane's session lifecycle: one endpoint, one bounded accept loop, bound lazily.
@@ -503,6 +504,21 @@ pub fn run() {
             }
             tracing::info!("startup: diagnostics header written");
 
+            // QURATOR-347 slice A: the in-memory title index. `restore_identity` ran above, so
+            // the self-npub guard can be stamped now, and the index is rebuilt ONCE from the
+            // on-disk listing cache. From here it stays current through `save_contact` — the
+            // one write chokepoint — so background harvest rides the enumeration scheduler's
+            // own saves; there is NO second loop (QURATOR-332, "never a burst").
+            title_index::set_self_npub(identity.blocking_read().as_ref().map(|id| id.npub()));
+            {
+                let store = store.clone();
+                // Blocking pool: the rebuild reads every contact file from disk.
+                tauri::async_runtime::spawn_blocking(move || {
+                    let titles = title_index::rebuild_from_store(&store);
+                    tracing::info!(titles, "startup: title index rebuilt from listing cache");
+                });
+            }
+
             // M18 W4: a ticket is valid until redeemed, so an approval given last session must still
             // be dialable this one. `restore_identity` populates synchronously above, so the transport
             // key is available here. Binds ONLY if this node has ever issued an approval (QURATOR-177
@@ -650,6 +666,8 @@ pub fn run() {
             commands::browse::set_contact_tags,
             commands::browse::set_contact_petname,
             commands::browse::search_peers,
+            // QURATOR-347 slice A — title search over the in-memory title index.
+            commands::titles::search_titles,
             commands::browse::discover_observed_tags,
             commands::settings::get_settings,
             commands::settings::save_settings,
