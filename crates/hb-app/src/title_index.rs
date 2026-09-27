@@ -20,13 +20,14 @@
 //! collections are indexed (the safe default for counts shown elsewhere; a private listing we
 //! can read stays out of the index).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, RwLock};
 
 use hb_core::title_norm::normalize_title;
 use hb_core::types::{DirectoryItem, ItemType, Visibility};
 use serde::Serialize;
 
+use crate::similarity::SimilarityInputs;
 use crate::store::{CachedPeer, DataStore};
 
 /// Hard caps, documented for the UI copy: at most 50 titles and 20 holders per title per query.
@@ -63,9 +64,11 @@ struct Row {
 #[derive(Debug, Clone, Default)]
 struct AuthorMeta {
     display_name: Option<String>,
-    /// v5 (QURATOR-345) — the peer's teaser-computed total. Placeholder holder-sort signal
-    /// until P3b replaces it with similarity.
-    total_bytes: u64,
+    /// QURATOR-347 slice B — the peer's combined (interests ∪ collection) normalised tag set,
+    /// one input to the similarity holder sort. Built by the SAME
+    /// `commands::people::peer_tag_inputs` the `similar_people` command scores with, so the
+    /// two consumers can never disagree about a peer's tags.
+    tags: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
@@ -111,8 +114,7 @@ pub(crate) fn contact_saved(peer: &CachedPeer) {
         .as_ref()
         .map(|p| p.display_name.clone())
         .or_else(|| peer.petname.clone());
-    let total_bytes = peer.profile.as_ref().map(|p| p.total_bytes).unwrap_or(0);
-    note_author(&peer.npub, display, total_bytes);
+    note_author(&peer.npub, display, crate::commands::people::peer_tag_inputs(peer));
     for pc in &peer.collections {
         match pc.collection.visibility {
             Visibility::Public => upsert_listing(
@@ -128,13 +130,13 @@ pub(crate) fn contact_saved(peer: &CachedPeer) {
     }
 }
 
-/// Record a contact's display metadata (display name, v5 total_bytes for the placeholder
+/// Record a contact's display metadata (display name, slice-B tag inputs for the similarity
 /// holder sort). Called only from [`contact_saved`].
-fn note_author(npub: &str, display_name: Option<String>, total_bytes: u64) {
+fn note_author(npub: &str, display_name: Option<String>, tags: HashSet<String>) {
     let mut idx = INDEX.write().expect("title index lock poisoned");
     idx.authors.insert(
         npub.to_string(),
-        AuthorMeta { display_name, total_bytes },
+        AuthorMeta { display_name, tags },
     );
 }
 
@@ -235,6 +237,29 @@ pub(crate) fn rebuild_from_store(store: &DataStore) -> usize {
     INDEX.read().expect("title index lock poisoned").by_title.len()
 }
 
+/// A peer's distinct normalised title keys — the peer-side titles input to the similarity
+/// scorer (QURATOR-347 slice B: the `similar_people` command and the `search_titles` holder
+/// sort). Read-only. A Locked stranger (teaser-only, nothing indexed) has none and scores on
+/// tags alone.
+pub(crate) fn titles_of(npub: &str) -> HashSet<String> {
+    let idx = INDEX.read().expect("title index lock poisoned");
+    titles_of_locked(&idx, npub)
+}
+
+/// Caller holds the lock — the holder sort scores every holder under `search_titles`'s
+/// existing read guard instead of re-locking per holder.
+fn titles_of_locked(idx: &Index, npub: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for rows in idx.owned.values() {
+        for row in rows {
+            if row.author_npub == npub {
+                out.insert(row.name_norm.clone());
+            }
+        }
+    }
+    out
+}
+
 /// Drop every row of one author — the unfollow affordance, called from `DataStore::delete_contact`
 /// (the delete twin of the `save_contact` hook), so an unfollowed contact stops counting as a
 /// holder immediately.
@@ -282,8 +307,14 @@ pub struct TitleSearchResult {
 
 /// Search the index. The query goes through the SAME `normalize_title` as the rows; matching
 /// is the exact key first, then substring matches on keys. Sorted: exact hit first, then
-/// holder_count descending, then key ascending (deterministic — never HashMap order).
-pub(crate) fn search_titles(query: &str, limit: Option<usize>) -> TitleSearchResult {
+/// holder_count descending, then key ascending (deterministic — never HashMap order). Within
+/// each hit, holders are ranked by SIMILARITY to `my` inputs (score desc, then npub — see
+/// [`build_hit`]); `my` is my published titles + tags, built once per query by the caller.
+pub(crate) fn search_titles(
+    query: &str,
+    limit: Option<usize>,
+    my: &SimilarityInputs,
+) -> TitleSearchResult {
     let norm = normalize_title(query);
     if norm.is_empty() {
         return TitleSearchResult { hits: vec![], truncated: false };
@@ -309,7 +340,7 @@ pub(crate) fn search_titles(query: &str, limit: Option<usize>) -> TitleSearchRes
     let hits = candidates
         .into_iter()
         .take(cap)
-        .map(|(key, count)| build_hit(&idx, key, count))
+        .map(|(key, count)| build_hit(&idx, key, count, my))
         .collect();
     TitleSearchResult { hits, truncated }
 }
@@ -322,7 +353,7 @@ fn distinct_authors(rows: &[Arc<Row>]) -> usize {
     seen.len()
 }
 
-fn build_hit(idx: &Index, key: String, count: usize) -> TitleHit {
+fn build_hit(idx: &Index, key: String, count: usize, my: &SimilarityInputs) -> TitleHit {
     let rows = &idx.by_title[&key];
     let title = rows[0].name.clone();
     // Holder = DISTINCT author; the representative (slug, path) is the first row seen for
@@ -346,11 +377,32 @@ fn build_hit(idx: &Index, key: String, count: usize) -> TitleHit {
             }
         })
         .collect();
-    // P3b: replace with similarity. Placeholder holder order: the peer's v5 total_bytes
-    // descending (bigger hoard first), then npub ascending for determinism.
+    // QURATOR-347 slice B: holders ranked by SIMILARITY to me (score desc), then npub
+    // ascending for determinism — never prominence (owner 2026-09-26: "most semantically
+    // similar in terms of interests"). Scores computed ONCE per holder, under the existing
+    // read lock. The author's combined tags sit in `interest_tags`: the scorer unions
+    // interest+collection tags, so the combined placement scores identically.
+    let scores: HashMap<String, f32> = holders
+        .iter()
+        .map(|h| {
+            let peer = SimilarityInputs {
+                titles: titles_of_locked(idx, &h.npub),
+                interest_tags: idx
+                    .authors
+                    .get(&h.npub)
+                    .map(|m| m.tags.clone())
+                    .unwrap_or_default(),
+                collection_tags: HashSet::new(),
+            };
+            (h.npub.clone(), crate::similarity::similarity(my, &peer).score)
+        })
+        .collect();
     holders.sort_by(|a, b| {
-        let tb = |np: &str| idx.authors.get(np).map(|m| m.total_bytes).unwrap_or(0);
-        tb(&b.npub).cmp(&tb(&a.npub)).then(a.npub.cmp(&b.npub))
+        let sa = scores.get(&a.npub).copied().unwrap_or(0.0);
+        let sb = scores.get(&b.npub).copied().unwrap_or(0.0);
+        sb.partial_cmp(&sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.npub.cmp(&b.npub))
     });
     holders.truncate(MAX_HOLDERS);
     TitleHit { title, name_norm: key, holder_count: count, holders }
@@ -359,6 +411,17 @@ fn build_hit(idx: &Index, key: String, count: usize) -> TitleHit {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Test-isolation gate for the PROCESS-GLOBAL index — the ONE mutex every index-touching
+/// test holds, here and in sibling modules (`commands::people` saves contacts through
+/// `DataStore::save_contact`, which feeds this index; the 2026-09-27 flake shape: a
+/// concurrent `clear_for_tests` wiped a parallel test's rows). Module-level (not inside
+/// `mod tests`) so cross-module tests can share the same static.
+#[cfg(test)]
+pub(crate) fn test_gate() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TEST_GATE.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[cfg(test)]
 mod tests {
@@ -371,9 +434,8 @@ mod tests {
     /// which touch GLOBAL state mid-run while sibling tests hold rows in the index — the
     /// 2026-09-27 flake this gate fixes (the rebuild test wiped a parallel test's rows).
     /// Every index-touching test holds the gate for its whole body.
-    static TEST_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn gate() -> std::sync::MutexGuard<'static, ()> {
-        TEST_GATE.lock().unwrap_or_else(|e| e.into_inner())
+        super::test_gate()
     }
 
     fn item(name: &str, kind: ItemType) -> DirectoryItem {
@@ -447,7 +509,14 @@ mod tests {
     }
 
     fn hit_count(query: &str) -> usize {
-        search_titles(query, None).hits.len()
+        search(query).hits.len()
+    }
+
+    /// Slice-B entry point: search with EMPTY my-inputs. Empty inputs score 0.0 for every
+    /// holder, so holder order falls to the npub tiebreak — deterministic for every test that
+    /// doesn't care about order. The order test below passes real inputs.
+    fn search(query: &str) -> TitleSearchResult {
+        search_titles(query, None, &SimilarityInputs::default())
     }
 
     /// P-10 mutation: in `contact_saved` (crates/hb-app/src/title_index.rs), change the
@@ -492,7 +561,7 @@ mod tests {
             Visibility::Public,
             vec![item("Replacement Beta", ItemType::Folder)],
         ));
-        let res = search_titles("replacement", None);
+        let res = search("replacement");
         assert_eq!(res.hits.len(), 1, "one key survives the replace: {res:?}");
         assert_eq!(res.hits[0].name_norm, "replacement beta");
         assert_eq!(res.hits[0].holder_count, 1);
@@ -516,7 +585,7 @@ mod tests {
             Visibility::Public,
             vec![item("shared shelf specimen", ItemType::Folder)],
         ));
-        let res = search_titles("shared shelf specimen", None);
+        let res = search("shared shelf specimen");
         assert_eq!(res.hits.len(), 1, "normalised key merges the authors: {res:?}");
         assert_eq!(res.hits[0].holder_count, 2);
         assert_eq!(res.hits[0].holders.len(), 2);
@@ -544,7 +613,7 @@ mod tests {
             Visibility::Public,
             vec![item("dune.1984", ItemType::Folder)],
         ));
-        let merged = search_titles("dune 1984", None);
+        let merged = search("dune 1984");
         assert_eq!(merged.hits.len(), 1, "both spellings are one normalised key: {merged:?}");
         assert_eq!(merged.hits[0].holder_count, 2);
 
@@ -555,7 +624,7 @@ mod tests {
             Visibility::Public,
             vec![item("Dune (2021)", ItemType::Folder)],
         ));
-        let all = search_titles("dune", None);
+        let all = search("dune");
         let norms: Vec<&str> = all.hits.iter().map(|h| h.name_norm.as_str()).collect();
         assert!(norms.contains(&"dune 1984") && norms.contains(&"dune 2021"), "years must not merge: {norms:?}");
         let y1984 = all.hits.iter().find(|h| h.name_norm == "dune 1984").unwrap();
@@ -599,7 +668,7 @@ mod tests {
         clear_for_tests();
         let titles = rebuild_from_store(&store);
         assert!(titles >= 1, "rebuild must index the cached listing");
-        let res = search_titles("rebuild from disk evidence", None);
+        let res = search("rebuild from disk evidence");
         assert_eq!(res.hits.len(), 1, "rebuild restores rows from the on-disk cache: {res:?}");
         assert_eq!(res.hits[0].holders[0].slug, "ti-rb-films");
         // ...and the fingerprint rides the row via PeerCollection.snapshot_fingerprint.
@@ -625,9 +694,9 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(search_titles("unfollow evidence title", None).hits[0].holder_count, 2);
+        assert_eq!(search("unfollow evidence title").hits[0].holder_count, 2);
         store.delete_contact(&CachedPeer::pubkey_hash("hb_ti_unf_a")).unwrap();
-        let res = search_titles("unfollow evidence title", None);
+        let res = search("unfollow evidence title");
         assert_eq!(res.hits[0].holder_count, 1, "the unfollowed author no longer counts: {res:?}");
         assert_eq!(res.hits[0].holders[0].npub, "hb_ti_unf_b");
     }
@@ -655,28 +724,43 @@ mod tests {
                 vec![item("Cap Holder Specimen", ItemType::Folder)],
             ));
         }
-        let res = search_titles("cap title specimen", None);
+        let res = search("cap title specimen");
         assert_eq!(res.hits.len(), MAX_TITLES, "title cap: {}", res.hits.len());
         assert!(res.truncated, "55 matches > 50 cap must report truncated");
-        let holders = search_titles("cap holder specimen", None);
+        let holders = search("cap holder specimen");
         assert_eq!(holders.hits.len(), 1);
         assert_eq!(holders.hits[0].holder_count, 25, "count is the true total");
         assert_eq!(holders.hits[0].holders.len(), MAX_HOLDERS, "holders capped");
     }
 
     /// P-10 mutation: in `contact_saved` (crates/hb-app/src/title_index.rs), change
-    /// `note_author(&peer.npub, display, total_bytes);` to `note_author(&peer.npub, display, 0);`
-    /// — this test reds (the placeholder sort no longer orders by total_bytes).
+    /// `note_author(&peer.npub, display, crate::commands::people::peer_tag_inputs(peer));` to
+    /// `note_author(&peer.npub, display, Default::default());` — this test reds (holder tags
+    /// are empty, so the similarity winner ties with the rest and npub order takes over).
     #[test]
-    fn holder_order_is_placeholder_total_bytes_then_npub() {
+    fn holder_order_is_similarity_then_npub() {
         let _g = gate();
-        for (i, npub) in ["hb_ti_ord_a", "hb_ti_ord_b"].iter().enumerate() {
+        // All four hold the same title; only b shares my interest — b must rank FIRST despite
+        // having the LARGER npub (the npub tiebreak must not mask the score).
+        for npub in ["hb_ti_ord_a", "hb_ti_ord_b", "hb_ti_ord_c", "hb_ti_ord_d"] {
             let mut p = peer_with(npub, "ti-ord-films", Visibility::Public, vec![item("Order Specimen", ItemType::Folder)]);
-            p.profile.as_mut().unwrap().total_bytes = if i == 0 { 100 } else { 900 };
+            if npub == "hb_ti_ord_b" {
+                p.profile.as_mut().unwrap().tags = vec!["sci-fi".to_string()];
+            }
             contact_saved(&p);
         }
-        let res = search_titles("order specimen", None);
-        assert_eq!(res.hits[0].holders[0].npub, "hb_ti_ord_b", "bigger total_bytes first (P3b placeholder)");
+        let my = SimilarityInputs {
+            titles: HashSet::new(),
+            interest_tags: ["sci-fi".to_string()].into_iter().collect(),
+            collection_tags: HashSet::new(),
+        };
+        let res = search_titles("order specimen", None, &my);
+        let order: Vec<&str> = res.hits[0].holders.iter().map(|h| h.npub.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["hb_ti_ord_b", "hb_ti_ord_a", "hb_ti_ord_c", "hb_ti_ord_d"],
+            "similar first, then npub-ascending among the zero-scored: {order:?}"
+        );
         assert_eq!(res.hits[0].holders[0].display_name.as_deref(), Some("disp-hb_ti_ord_b"));
     }
 

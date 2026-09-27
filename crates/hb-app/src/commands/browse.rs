@@ -838,6 +838,12 @@ pub struct ContactSummary {
     pub last_presence: Option<chrono::DateTime<Utc>>,
     pub local_tags: Vec<String>,
     pub fingerprint: Option<Fingerprint>,
+    /// QURATOR-347 slice B — similarity to me (score + shared titles/interests + the named
+    /// reason), when the store-aware constructor had inputs to score with. `None` from the
+    /// raw `From<CachedPeer>` seam (no store ⇒ no inputs — under-claims, same posture as its
+    /// read_state 0). New OPTIONAL field: §6 needs no discriminant bump — this is a Tauri IPC
+    /// projection, and absence only hides a display value, it cannot enable any weaker path.
+    pub similarity: Option<crate::similarity::Similarity>,
 }
 
 impl From<CachedPeer> for ContactSummary {
@@ -861,6 +867,7 @@ impl From<CachedPeer> for ContactSummary {
             last_presence: peer.last_presence,
             local_tags: peer.local_tags,
             fingerprint: peer.fingerprint,
+            similarity: None,
         }
     }
 }
@@ -871,11 +878,19 @@ impl From<CachedPeer> for ContactSummary {
 /// MY published total plus the persisted auto-ask trace. The trace read failing ⇒ empty — it is
 /// a de-dup memory; losing it costs one redundant (throttled) ask, never correctness, and it
 /// must never fail the contact list.
-fn contact_summary_for(peer: CachedPeer, store: &DataStore) -> ContactSummary {
+fn contact_summary_for(
+    peer: CachedPeer,
+    store: &DataStore,
+    my_sim: &crate::similarity::SimilarityInputs,
+) -> ContactSummary {
     let my_total = crate::commands::profile::total_published_public_bytes(store);
     let asked = store.load_auto_asks().unwrap_or_default();
     ContactSummary {
         read_state: read_state_for(&peer, my_total, asked.contains(&peer.npub)),
+        similarity: Some(crate::similarity::similarity(
+            my_sim,
+            &crate::commands::people::peer_similarity_inputs(&peer),
+        )),
         ..ContactSummary::from(peer)
     }
 }
@@ -883,7 +898,10 @@ fn contact_summary_for(peer: CachedPeer, store: &DataStore) -> ContactSummary {
 #[tauri::command]
 pub async fn get_contacts(store: State<'_, DataStore>) -> CmdResult<Vec<ContactSummary>> {
     let peers = store.list_contacts().map_err(cmd_err)?;
-    Ok(peers.into_iter().map(|p| contact_summary_for(p, &store)).collect())
+    // Slice B: MY similarity inputs are computed ONCE per call and shared by every contact —
+    // never per contact (my titles walk + tag union are the expensive half).
+    let my_sim = crate::commands::people::my_similarity_inputs(&store);
+    Ok(peers.into_iter().map(|p| contact_summary_for(p, &store, &my_sim)).collect())
 }
 
 #[tauri::command]
@@ -937,7 +955,7 @@ pub async fn refresh_contact(
             "auto access-ask failed; retried on the next open"
         );
     }
-    Ok(contact_summary_for(peer, &store))
+    Ok(contact_summary_for(peer, &store, &crate::commands::people::my_similarity_inputs(&store)))
 }
 
 /// The shared resolve+save body of [`refresh_contact`] (QURATOR-332 slice A), extracted so the

@@ -35,6 +35,8 @@ mod portable_update_logic;
 mod presence;
 mod single_instance;
 mod store;
+// QURATOR-347 slice B — the ONE pure similarity scorer (people like you).
+mod similarity;
 mod title_index;
 // M18 W1 — the manifest plane (INV-4′: a transport exists, structurally limited to manifests).
 mod transport;
@@ -668,6 +670,8 @@ pub fn run() {
             commands::browse::search_peers,
             // QURATOR-347 slice A — title search over the in-memory title index.
             commands::titles::search_titles,
+            // QURATOR-347 slice B — contacts ranked by similarity (UI is a later lane).
+            commands::people::similar_people,
             commands::browse::discover_observed_tags,
             commands::settings::get_settings,
             commands::settings::save_settings,

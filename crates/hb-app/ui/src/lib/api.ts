@@ -34,6 +34,7 @@ import type {
 	TitleHolder,
 	TitleHit,
 	TitleSearchResult,
+	PeopleResult,
 } from './types.js';
 
 // ── Identity ─────────────────────────────────────────────────────────────────
@@ -724,3 +725,11 @@ export const topicAnnounceMarkSeen = (topicId: string, ts: number) =>
  *  ⚠ UI copy must state the honest limit: holder counts cover only people you can read. */
 export const searchTitles = (query: string, limit?: number) =>
 	invoke<TitleSearchResult>('search_titles', { query, limit });
+
+// ── QURATOR-347 slice B — people like you (similarity-ranked contacts) ─────────
+
+/** Contacts ranked by similarity of Interests + collection tags + normalised titles — never
+ *  prominence (owner 2026-09-26). Zero-score contacts are dropped; `cold_start` asks the UI
+ *  for the "pick your Interests, add a collection" state. Cap 50 unless `limit` lowers it. */
+export const similarPeople = (limit?: number) =>
+	invoke<PeopleResult>('similar_people', { limit });

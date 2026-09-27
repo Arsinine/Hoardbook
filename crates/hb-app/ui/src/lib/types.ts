@@ -190,6 +190,9 @@ export interface ContactSummary {
 	 *  optional here only because the UI also builds placeholder summaries (e.g. a deep-linked
 	 *  stranger in Chat) that have no rule inputs. No UI renders it yet — P4 (QURATOR-342) will. */
 	read_state?: ReadState;
+	/** QURATOR-347 slice B — similarity to me, when the backend had store inputs to score with
+	 *  (store-aware construction). Optional: placeholder summaries built without a store omit it. */
+	similarity?: Similarity;
 	petname?: string;
 	profile?: Profile;
 	collections: Collection[];
@@ -386,4 +389,40 @@ export interface TitleSearchResult {
 	hits: TitleHit[];
 	/** True when more matching titles existed than the 50-title cap returned. */
 	truncated: boolean;
+}
+
+// ── QURATOR-347 slice B — similarity: people like you ─────────
+
+/** The NAMED reason a peer ranked — drives the one-line overlap explanation and the
+ *  cold-start state ("pick your Interests, add a collection"). */
+export type SimilarityReason = 'titles_in_common' | 'interests_only' | 'cold_start_no_interests';
+
+/** One scored comparison: overlap of Interests + collection tags + normalised titles.
+ *  Weights: tags carry the whole score until my first published title, then 0.8 titles /
+ *  0.2 tags. `shared_interests` shows normalised (lowercased) spellings, capped at 5. */
+export interface Similarity {
+	score: number;
+	shared_titles: number;
+	shared_interests: string[];
+	reason: SimilarityReason;
+}
+
+/** One ranked contact from `similar_people`. Ranked by similarity of interests, never
+ *  prominence (owner 2026-09-26). A Locked stranger keeps their Add button (owner 2026-09-27). */
+export interface SimilarPerson {
+	npub: string;
+	display_name?: string;
+	fingerprint?: { words: string[]; colorHex: string };
+	score: number;
+	shared_titles: number;
+	shared_interests: string[];
+	reason: SimilarityReason;
+	read_state?: ReadState;
+}
+
+/** `similar_people` wrapper: `cold_start` = I have no titles AND no interests and no
+ *  collection tags — show the "pick your Interests, add a collection" state, not an empty list. */
+export interface PeopleResult {
+	people: SimilarPerson[];
+	cold_start: boolean;
 }
