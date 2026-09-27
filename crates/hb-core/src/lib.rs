@@ -25,6 +25,7 @@ pub mod ratelimit;
 pub mod sharecode;
 pub mod snapshot;
 pub mod ticket;
+pub mod title_norm;
 pub mod transport_payload;
 mod tag_util;
 pub mod topic;
