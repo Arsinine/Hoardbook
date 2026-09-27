@@ -32,6 +32,7 @@ mod suite_wan_carry;
 mod suite_wan_d;
 mod suite_wan_e2e;
 mod suite_wan_fetch;
+mod suite_wan_g;
 mod suite_wan_m;
 mod suite_wan_p;
 mod suite_wan_r;
@@ -855,6 +856,11 @@ async fn run_probe(args: &[String]) -> Result<ExitCode> {
     if suite == "fetch" {
         return run_probe_wan_fetch(args).await;
     }
+    // GRANT (QURATOR-346) is probe-plays-a-role too: OWNER and ASKER each run one process with
+    // their own --data-dir, so no --peer.
+    if suite == "wan-g" {
+        return run_probe_wan_g(args).await;
+    }
 
     let peer_str = args::flag_value(args, "--peer")
         .ok_or_else(|| anyhow!("probe requires --peer <npub or hbk… share-code>"))?;
@@ -1424,6 +1430,42 @@ async fn run_probe_wan_fetch(args: &[String]) -> Result<ExitCode> {
 
     let mut tap = tap::Tap::new();
     suite_wan_fetch::run(&mut tap, &role, &input).await;
+    Ok(tap.finish())
+}
+
+/// GRANT (QURATOR-346): the two-role v5 auto-grant probe — `--role owner|asker`, each process
+/// with its own `--data-dir`. Same bootstrap as FETCH: the npub + share code are printed BEFORE
+/// any flag validation, because the roles' bootstrap is circular in time (the asker needs the
+/// owner's npub, and whichever you start first must be able to tell you who it is).
+async fn run_probe_wan_g(args: &[String]) -> Result<ExitCode> {
+    let role = args::flag_value(args, "--role")
+        .ok_or_else(|| anyhow!("probe --suite wan-g requires --role owner|asker"))?
+        .to_string();
+
+    let data_dir = PathBuf::from(
+        args::flag_value(args, "--data-dir").unwrap_or("./hb-wan-it-probe-data").to_string(),
+    );
+    let store = DataStore::new(data_dir.clone());
+    let relays = args::collect_relays(args);
+    if relays.is_empty() {
+        bail!("probe requires at least one --relay");
+    }
+    store.save_settings(&Settings { relay_urls: relays.clone(), ..Default::default() })?;
+    let app_id = load_or_create_identity(&store)?;
+
+    println!("# GRANT probe — role {role}");
+    println!("# relay set: {}", relays.join(", "));
+    let role_label = role.to_uppercase();
+    println!("# wan-g-{role_label} npub:  {}", app_id.npub());
+    match app_id.share_code() {
+        Ok(sc) => println!("# wan-g-{role_label} share: {sc}"),
+        Err(e) => println!("# wan-g-{role_label} share: <unavailable: {e}>"),
+    }
+
+    let input = suite_wan_carry::CarryInput { app_id, store, relays, args: args.to_vec() };
+
+    let mut tap = tap::Tap::new();
+    suite_wan_g::run(&mut tap, &role, &input).await;
     Ok(tap.finish())
 }
 
