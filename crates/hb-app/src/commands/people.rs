@@ -233,6 +233,7 @@ mod tests {
 
     fn profile(npub: &str, tags: &[&str]) -> Profile {
         Profile {
+            teaser_collections: Vec::new(),
             display_name: format!("disp-{npub}"),
             bio: None,
             tags: tags.iter().map(|t| t.to_string()).collect(),

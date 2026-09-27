@@ -55,6 +55,20 @@ pub(crate) fn teaser_from_profile(store: &DataStore, profile: &Profile) -> Tease
         // never user-typed, so the number cannot drift from the listing (one function, called
         // here). Private collections never count.
         total_bytes: total_published_public_bytes(store),
+        // v5 (QURATOR-342, owner ruling 2026-09-28): the teaser now CARRIES the names + sizes
+        // of the published public collections — "The collection name is the teaser." Same
+        // enumeration as total_bytes (the helper above), so the list and the total can never
+        // drift; sorted bytes desc then name so the biggest collection is the first thing a
+        // browser sees. build_teaser re-truncates to the wire bounds before signing.
+        collections: {
+            let mut cols: Vec<hb_core::event::TeaserCollection> =
+                published_public_collections(store)
+                    .into_iter()
+                    .map(|(name, bytes)| hb_core::event::TeaserCollection { name, bytes })
+                    .collect();
+            cols.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
+            cols
+        },
         // v5 (QURATOR-344): the hint rides the public teaser now (owner ruling rounds 10–11 —
         // the linked-handle risk is answered by the UI's copy, not crypto).
         contact_hint: profile.contact_hint.clone(),
@@ -64,22 +78,39 @@ pub(crate) fn teaser_from_profile(store: &DataStore, profile: &Profile) -> Tease
     }
 }
 
-/// v5 (QURATOR-344): the teaser's `total_bytes` — the sum of file-leaf sizes over every
-/// **published PUBLIC** collection's listing. Same enumeration pattern as
-/// [`compute_content_types`]: published (`is_published`) public (`Visibility::Public`) drafts.
-/// Private collections never count, so the teaser leaks nothing about private holdings.
-pub(crate) fn total_published_public_bytes(store: &DataStore) -> u64 {
-    let mut total = 0u64;
+/// v5 (QURATOR-342): the one enumeration behind BOTH public teaser numbers —
+/// [`total_published_public_bytes`] (the sum it reports) and `Teaser::collections`
+/// (`teaser_from_profile`'s name+bytes list). Published (`is_published`) public
+/// (`Visibility::Public`) drafts only, the same pattern as [`compute_content_types`]: private
+/// collections never appear (the M10/F25 privacy pin — the teaser leaks nothing about private
+/// holdings), unpublished drafts never appear. Each entry is `(path_alias,
+/// sum_listing_bytes)`.
+fn published_public_collections(store: &DataStore) -> Vec<(String, u64)> {
+    let mut out: Vec<(String, u64)> = Vec::new();
     for slug in store.list_collection_slugs().unwrap_or_default() {
         if store.is_published(&slug) {
             if let Ok(Some(col)) = store.load_collection_draft(&slug) {
                 if col.visibility == hb_core::Visibility::Public {
-                    total += hb_core::listing_size::sum_listing_bytes(&col.listing);
+                    out.push((
+                        col.path_alias.clone(),
+                        hb_core::listing_size::sum_listing_bytes(&col.listing),
+                    ));
                 }
             }
         }
     }
-    total
+    out
+}
+
+/// v5 (QURATOR-344): the teaser's `total_bytes` — the sum of file-leaf sizes over every
+/// **published PUBLIC** collection's listing. Same enumeration as
+/// [`published_public_collections`]. Private collections never count, so the teaser leaks
+/// nothing about private holdings.
+pub(crate) fn total_published_public_bytes(store: &DataStore) -> u64 {
+    published_public_collections(store)
+        .iter()
+        .map(|(_, bytes)| bytes)
+        .sum()
 }
 
 #[tauri::command]
@@ -226,6 +257,7 @@ mod tests {
 
     fn make_profile(name: &str, content_types: Vec<String>) -> Profile {
         Profile {
+            teaser_collections: Vec::new(),
             display_name: name.into(),
             bio: Some("90s anime".into()),
             tags: vec!["anime".into()],
@@ -374,6 +406,122 @@ mod tests {
         let teaser = teaser_from_profile(&store, &profile);
         assert_eq!(teaser.total_bytes, 1536 + 1023, "public only, file leaves only");
         assert_eq!(teaser.contact_hint.as_deref(), Some("hint rides public (v5)"));
+    }
+
+    #[test]
+    fn teaser_collections_list_published_public_only_sorted_by_bytes_desc() {
+        // v5 (QURATOR-342, owner ruling 2026-09-28): the teaser's `collections` list mirrors
+        // total_published_public_bytes' enumeration EXACTLY (one helper, both callers):
+        // published PUBLIC collections only — a PRIVATE collection never appears (M10/F25
+        // privacy pin), an UNPUBLISHED draft never appears — each entry is
+        // (path_alias, sum_listing_bytes), sorted bytes desc then name so the biggest
+        // collection is the first thing a browser sees.
+        //
+        // P-10 mutations (orchestrator applies; each must red, revert after):
+        //   (a) in published_public_collections, drop the
+        //       `col.visibility == Visibility::Public` check — the Private fixture must then
+        //       APPEAR in the list;
+        //   (b) in published_public_collections, drop the `store.is_published(&slug)` check —
+        //       the unpublished draft must then appear;
+        //   (c) in teaser_from_profile, remove the `cols.sort_by(...)` — the order assert
+        //       must RED.
+        let (_dir, store) = test_store();
+        let col = |slug: &str, visibility: Visibility, listing: Vec<hb_core::DirectoryItem>| Collection {
+            slug: slug.into(),
+            path_alias: slug.into(),
+            description: None,
+            item_count: 0,
+            est_size: None,
+            content_types: vec![],
+            tags: vec![],
+            languages: vec![],
+            visibility,
+            sorted: false,
+            last_updated: chrono::Utc::now(),
+            listing,
+        };
+        let file = |name: &str, size: &str| hb_core::DirectoryItem {
+            name: name.into(),
+            item_type: hb_core::ItemType::File,
+            size: Some(size.into()),
+            format: None,
+            year: None,
+            tags: vec![],
+            note: None,
+            children: vec![],
+        };
+        // Published PUBLIC "games": 2.0 MB — the biggest entry, sorts first.
+        store
+            .save_collection_draft(&col(
+                "games",
+                Visibility::Public,
+                vec![file("g.mkv", "2.0 MB")],
+            ))
+            .unwrap();
+        store.save_published("games", "{}").unwrap();
+        // Published PUBLIC "films": 1.5 KB + a nested 1023 B leaf (the folder's own size is
+        // ignored) — smaller, sorts second.
+        store
+            .save_collection_draft(&col(
+                "films",
+                Visibility::Public,
+                vec![
+                    file("a.txt", "1.5 KB"),
+                    hb_core::DirectoryItem {
+                        name: "movies".into(),
+                        item_type: hb_core::ItemType::Folder,
+                        size: Some("9 GB".into()),
+                        format: None,
+                        year: None,
+                        tags: vec![],
+                        note: None,
+                        children: vec![file("b.mkv", "1023 B")],
+                    },
+                ],
+            ))
+            .unwrap();
+        store.save_published("films", "{}").unwrap();
+        // Published PUBLIC "alpha": 1.0 MB — the MIDDLE entry. It exists so that neither name
+        // order (alpha, films, games / games, films, alpha) nor any readdir order that happens to
+        // list games first can satisfy the bytes-desc assert: a 2-entry fixture left the sort
+        // mutation GREEN because readdir already returned games before films (orchestrator
+        // P-10 run, 2026-09-28).
+        store
+            .save_collection_draft(&col(
+                "alpha",
+                Visibility::Public,
+                vec![file("m.flac", "1.0 MB")],
+            ))
+            .unwrap();
+        store.save_published("alpha", "{}").unwrap();
+        // Published PRIVATE — must NEVER appear.
+        store
+            .save_collection_draft(&col(
+                "secret-stash",
+                Visibility::Private,
+                vec![file("x", "9.0 GB")],
+            ))
+            .unwrap();
+        store.save_published("secret-stash", "{}").unwrap();
+        // Public UNPUBLISHED draft — must NEVER appear.
+        store
+            .save_collection_draft(&col(
+                "drafts",
+                Visibility::Public,
+                vec![file("y", "9.0 GB")],
+            ))
+            .unwrap();
+
+        let teaser = teaser_from_profile(&store, &make_profile("Tester", vec![]));
+        let got: Vec<(&str, u64)> =
+            teaser.collections.iter().map(|c| (c.name.as_str(), c.bytes)).collect();
+        assert_eq!(
+            got,
+            vec![("games", 2_097_152), ("alpha", 1_048_576), ("films", 1536 + 1023)],
+            "published PUBLIC only, (path_alias, sum_listing_bytes), bytes desc"
+        );
+        // And the list agrees with the total it was derived alongside (one enumeration).
+        assert_eq!(teaser.total_bytes, 2_097_152 + 1_048_576 + 1536 + 1023);
     }
 
     #[test]

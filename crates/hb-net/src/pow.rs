@@ -62,6 +62,7 @@ mod tests {
     fn teaser_event() -> (Identity, Event) {
         let id = Identity::generate();
         let teaser = Teaser {
+            collections: Vec::new(),
             total_bytes: 0,
             contact_hint: None,
             display_name: "miner".into(),

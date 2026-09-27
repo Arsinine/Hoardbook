@@ -398,6 +398,7 @@ mod tests {
 
     fn teaser_with(tags: &[&str], cts: &[&str]) -> Teaser {
         Teaser {
+            collections: Vec::new(),
             total_bytes: 0,
             contact_hint: None,
             display_name: "archivebox".into(),
@@ -755,6 +756,7 @@ mod tests {
         let mk = |name: &str, bio: &str, ts: u64| SearchHit {
             npub: format!("npub-{name}"),
             teaser: Teaser {
+                collections: Vec::new(),
                 total_bytes: 0,
                 contact_hint: None,
                 display_name: name.into(),
@@ -779,6 +781,7 @@ mod tests {
         SearchHit {
             npub: format!("npub1{name}"),
             teaser: Teaser {
+                collections: Vec::new(),
                 total_bytes: 0,
                 contact_hint: None,
                 display_name: name.into(),
@@ -1024,6 +1027,7 @@ mod tests {
         SearchHit {
             npub: format!("npub1{name}"),
             teaser: Teaser {
+                collections: Vec::new(),
                 total_bytes: 0,
                 contact_hint: None,
                 display_name: name.into(),

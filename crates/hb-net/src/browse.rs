@@ -2183,6 +2183,7 @@ mod tests {
         let peer = victim.public_key();
 
         let victim_teaser = Teaser {
+            collections: Vec::new(),
             total_bytes: 0,
             contact_hint: None,
             display_name: "victim".into(),
@@ -2192,6 +2193,7 @@ mod tests {
             picture: None, hide_in_rosters: false,
         };
         let attacker_teaser = Teaser {
+            collections: Vec::new(),
             total_bytes: 0,
             contact_hint: None,
             display_name: "SPOOFED".into(),
@@ -2232,6 +2234,7 @@ mod tests {
     // single author still yields distinct event ids.
     fn teaser_ev_at(id: &Identity, ts: u64) -> Event {
         let t = Teaser {
+            collections: Vec::new(),
             total_bytes: 0,
             contact_hint: None,
             display_name: format!("peer-{ts}"),

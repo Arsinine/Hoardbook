@@ -458,6 +458,7 @@ mod tests {
             browse_key_hex: None,
             petname: None,
             profile: Some(Profile {
+                teaser_collections: Vec::new(),
                 display_name: format!("disp-{npub}"),
                 bio: None,
                 tags: vec![],

@@ -73,6 +73,15 @@ pub struct Profile {
     /// wrongly LOCKED; the answerer re-checks the asker's live teaser regardless.
     #[serde(default)]
     pub total_bytes: u64,
+    /// v5 (QURATOR-342, owner ruling 2026-09-28) — a PEER's `Teaser::collections` (the names +
+    /// sizes of their published public collections), threaded teaser → profile by
+    /// `hb_app::commands::browse::teaser_to_profile` so the browse UI can act on "The
+    /// collection name is the teaser." Never set on the user's OWN profile (their own list is
+    /// computed at publish, `teaser_from_profile`). Optional with default-empty — absence is
+    /// "no list shown", which gates nothing (the v5 size rule reads `total_bytes`, never this
+    /// list), so no downgrade to exploit and no SCHEMA_V bump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub teaser_collections: Vec<crate::event::TeaserCollection>,
     pub updated: DateTime<Utc>,
 }
 
@@ -340,6 +349,7 @@ mod tests {
             content_types: vec![],
             picture: None,
             hide_in_rosters: false, total_bytes: 0,
+            teaser_collections: Vec::new(),
             updated: chrono::Utc::now(),
         };
         let json = serde_json::to_string(&profile).unwrap();

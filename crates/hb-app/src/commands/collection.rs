@@ -4966,6 +4966,7 @@ mod tests {
 
         // A published profile teaser + two published public collections.
         let profile = hb_core::types::Profile {
+            teaser_collections: Vec::new(),
             display_name: "Me".into(),
             bio: None,
             tags: vec![],

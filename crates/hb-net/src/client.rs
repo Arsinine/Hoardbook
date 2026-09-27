@@ -766,6 +766,7 @@ mod tests {
         build_teaser(
             &id,
             &Teaser {
+                collections: Vec::new(),
                 total_bytes: 0,
                 contact_hint: None,
                 display_name: name.into(),

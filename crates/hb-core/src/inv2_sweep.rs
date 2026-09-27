@@ -53,6 +53,7 @@ fn no_public_event_broadcasts_the_browse_key_in_any_encoding() {
 
     // Public teaser (spec §The Profile) — plaintext discovery metadata.
     let teaser = Teaser {
+        collections: Vec::new(),
         total_bytes: 0,
         contact_hint: None,
         display_name: "archivebox_prime".into(),

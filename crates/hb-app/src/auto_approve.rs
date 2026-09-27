@@ -1831,6 +1831,7 @@ mod tests {
 
     fn teaser_with_total(total: u64) -> Teaser {
         Teaser {
+            collections: Vec::new(),
             display_name: "asker".into(),
             bio: String::new(),
             tags: vec![],

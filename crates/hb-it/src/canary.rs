@@ -125,6 +125,7 @@ pub fn build_canary_events(id: &Identity, bk: &BrowseKey, run_tag: &str) -> Resu
     let teaser = build_teaser(
         id,
         &Teaser {
+            collections: Vec::new(),
             total_bytes: 0,
             contact_hint: None,
             display_name: "hb-canary".into(),

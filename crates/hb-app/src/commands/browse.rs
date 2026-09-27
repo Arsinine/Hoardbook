@@ -121,6 +121,10 @@ fn teaser_to_profile(t: Teaser) -> hb_core::types::Profile {
         hide_in_rosters: t.hide_in_rosters,
         // v5 (QURATOR-345): the peer's publish-computed total, for the size rule.
         total_bytes: t.total_bytes,
+        // v5 (QURATOR-342, owner ruling 2026-09-28): the peer's public collection names +
+        // sizes, for "The collection name is the teaser" browse UI. Absent ⇒ empty vec (the
+        // serde default) — absence shows no list and gates nothing.
+        teaser_collections: t.collections,
         since: None,
         est_size: None,
         languages: vec![],
@@ -1469,6 +1473,7 @@ mod tests {
         let hit = SearchHit {
             npub: id.npub(),
             teaser: Teaser {
+                collections: Vec::new(),
                 total_bytes: 0,
                 contact_hint: None,
                 display_name: "archivebox".into(),
@@ -1494,16 +1499,45 @@ mod tests {
         let id = Identity::generate();
         let hit = SearchHit {
             npub: id.npub(),
-            teaser: Teaser { total_bytes: 0, contact_hint: None, display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None, hide_in_rosters: false },
+            teaser: Teaser { total_bytes: 0, contact_hint: None, display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None, hide_in_rosters: false, collections: Vec::new() },
             created_at: nostr::Timestamp::from(0),
         };
         assert_eq!(hit_to_card(hit).bio, None, "a blank bio renders as None, not an empty string");
     }
 
+    #[test]
+    fn teaser_to_profile_carries_peer_collections() {
+        // v5 (QURATOR-342, owner ruling 2026-09-28): the PEER's public collection names +
+        // sizes thread teaser → profile so the browse UI can act on "The collection name is
+        // the teaser." Absent ⇒ empty vec (the serde default), never an error.
+        //
+        // P-10 mutation (orchestrator applies): in teaser_to_profile, change
+        // `teaser_collections: t.collections` to `teaser_collections: Vec::new()` — must RED.
+        let t = Teaser {
+            total_bytes: 12_884_901_888,
+            contact_hint: None,
+            display_name: "archivebox_prime".into(),
+            bio: String::new(),
+            tags: vec![],
+            content_types: vec![],
+            picture: None,
+            hide_in_rosters: false,
+            collections: vec![
+                hb_core::event::TeaserCollection { name: "films".into(), bytes: 2_097_152 },
+                hb_core::event::TeaserCollection { name: "vhs rips".into(), bytes: 1536 },
+            ],
+        };
+        let p = teaser_to_profile(t);
+        assert_eq!(p.teaser_collections.len(), 2, "the peer's list threads through");
+        assert_eq!(p.teaser_collections[0].name, "films");
+        assert_eq!(p.teaser_collections[0].bytes, 2_097_152);
+        assert_eq!(p.teaser_collections[1].name, "vhs rips");
+    }
+
     fn hit_for(npub: String) -> SearchHit {
         SearchHit {
             npub,
-            teaser: Teaser { total_bytes: 0, contact_hint: None, display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None, hide_in_rosters: false },
+            teaser: Teaser { total_bytes: 0, contact_hint: None, display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None, hide_in_rosters: false, collections: Vec::new() },
             created_at: nostr::Timestamp::from(0),
         }
     }
@@ -1986,6 +2020,7 @@ mod tests {
             tags: vec![],
             content_types: vec![],
             picture: None, hide_in_rosters: false,
+            collections: Vec::new(),
         }));
         assert!(reject_profileless(&peer).is_ok());
     }
@@ -2172,6 +2207,7 @@ mod tests {
             tags: vec![],
             content_types: vec![],
             picture: None, hide_in_rosters: false,
+            collections: Vec::new(),
         }));
         peer
     }
@@ -3108,6 +3144,7 @@ mod tests {
 
         fn profile_with_tags(tags: &[&str]) -> hb_core::types::Profile {
             hb_core::types::Profile {
+                teaser_collections: Vec::new(),
                 display_name: "Tagged".into(),
                 bio: None,
                 tags: tags.iter().map(|t| t.to_string()).collect(),

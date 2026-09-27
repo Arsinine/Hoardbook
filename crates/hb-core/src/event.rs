@@ -9,6 +9,7 @@ use crate::error::HbError;
 use crate::identity::{verify_event, Identity};
 use crate::listing::{decrypt_listing, encrypt_listing, BrowseKey};
 use crate::tag_util::{tag_u8, tag_val, TagU8};
+use crate::types::truncate_alias;
 use crate::version::{check_schema, CRYPTO_V, SCHEMA_V};
 
 /// Public teaser kind — parameterized-replaceable (30xxx).
@@ -66,6 +67,47 @@ pub struct Teaser {
     /// `email`/`location` stay profile-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact_hint: Option<String>,
+    /// v5 (QURATOR-342, owner ruling 2026-09-28) — the NAMES + SIZES of the publisher's
+    /// published **public** collections. "The collection name is the teaser. If you're
+    /// interested, you'll want to engage more with this person. If you're not, then you skip on
+    /// by." Filled at publish by `hb_app::commands::profile::teaser_from_profile` from the same
+    /// enumeration `total_published_public_bytes` sums — private and
+    /// unpublished collections NEVER appear (the M10/F25 privacy pin). A hostile/oversize body
+    /// is TRUNCATED to the bounds, never rejected (the picture-sanitizer posture).
+    ///
+    /// §6 optional-field rule (the `total_bytes` precedent below): absence means "no list
+    /// shown" and gates nothing — the v5 size rule (`hb_core::size_rule`) reads `total_bytes`,
+    /// NEVER this list — so absence is not exploitable as a downgrade and there is no
+    /// `SCHEMA_V` bump. BOTH wire shapes (present + absent) are pinned in the tests below.
+    ///
+    /// Ingest-bound arithmetic (enforced at BOTH ends; see [`MAX_TEASER_COLLECTIONS`]): the
+    /// hostile worst-case entry serializes as `{"name":"…","bytes":<20 digits>}` with the name
+    /// truncated at `MAX_PATH_ALIAS_CHARS` = 128 chars; the JSON-escape worst case is 6
+    /// bytes/char (a control char → `\u00XX`), so an entry ≤ 9 + 6·128 + 10 + 20 + 1 = 808
+    /// bytes (809 with its trailing `,`) and the whole hostile list ≤ 10 × 809 = 8,090 ≤
+    /// 8,192 = `hb_net::discover::MAX_TEASER_BYTES` (the AB3 ingest bound) — the list alone can
+    /// never trip the bound. (Pre-existing, outside this fence: the REST of a teaser can still
+    /// exceed the bound — e.g. the picture, capped at 16 KB — and is dropped at ingest exactly
+    /// as before; `MAX_TEASER_BYTES` itself is unchanged.)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collections: Vec<TeaserCollection>,
+}
+
+/// Hard cap on `Teaser::collections` entries (QURATOR-342). 10 IS the ingest-bound arithmetic:
+/// 10 × (name-worst-case 6 bytes/char × 128 chars = 768, + 41 bytes JSON overhead) = 8,090 ≤
+/// `MAX_TEASER_BYTES` (8192, `hb_net::discover.rs` AB3). See `Teaser::collections` for the
+/// derivation. The per-name cap is [`crate::types::MAX_PATH_ALIAS_CHARS`], shared with the
+/// collection alias itself so the teaser can never name something the store would not.
+pub const MAX_TEASER_COLLECTIONS: usize = 10;
+
+/// One published PUBLIC collection surfaced in the public teaser (QURATOR-342, owner ruling
+/// 2026-09-28). `name` mirrors the collection's `path_alias` (capped at
+/// `crate::types::MAX_PATH_ALIAS_CHARS`); `bytes` mirrors
+/// `hb_core::listing_size::sum_listing_bytes` over its listing.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TeaserCollection {
+    pub name: String,
+    pub bytes: u64,
 }
 
 /// Hard cap on [`Teaser::picture`]'s encoded size (the whole `data:` URI string, in bytes) — keeps
@@ -118,6 +160,14 @@ pub fn build_teaser(identity: &Identity, teaser: &Teaser, discoverable: bool) ->
     // them), derived here from the same `discoverable` param both publish call sites already pass.
     let mut inner = teaser.clone();
     inner.hide_in_rosters = !discoverable;
+    // QURATOR-342: bound the public list BEFORE signing — a serde derive is an unvalidated
+    // public constructor (§9), and the teaser must stay inside the ingest bound (the arithmetic
+    // on `Teaser::collections`). Truncate, never reject the whole teaser: the list is
+    // derived data, and a peer with more than the cap still deserves a teaser.
+    inner.collections.truncate(MAX_TEASER_COLLECTIONS);
+    for c in &mut inner.collections {
+        c.name = truncate_alias(&c.name);
+    }
     let content = serde_json::to_string(&Versioned { v: SCHEMA_V, inner })?;
     let mut tags = vec![
         Tag::identifier(TEASER_D),
@@ -152,6 +202,13 @@ pub fn parse_teaser(event: &Event) -> Result<Teaser, HbError> {
         if validate_picture(pic).is_err() {
             teaser.picture = None;
         }
+    }
+    // QURATOR-342: a hostile/oversize list is TRUNCATED, never rejected — the rest of the
+    // teaser is still good data (the picture sanitizer's posture; a serde derive is an
+    // unvalidated public constructor, §9). Same bounds as build_teaser signs under.
+    teaser.collections.truncate(MAX_TEASER_COLLECTIONS);
+    for c in &mut teaser.collections {
+        c.name = truncate_alias(&c.name);
     }
     Ok(teaser)
 }
@@ -252,6 +309,7 @@ mod tests {
             hide_in_rosters: false,
             total_bytes: 0,
             contact_hint: None,
+            collections: Vec::new(),
         }
     }
 
@@ -357,6 +415,91 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.total_bytes, 0, "absent total_bytes ⇒ 0 — absence grants nothing");
         assert_eq!(legacy.contact_hint, None, "absent contact_hint ⇒ None");
+    }
+
+    #[test]
+    fn teaser_wire_pins_collections_both_shapes() {
+        // §6 wire rule, the `total_bytes` test's twin: `collections` is an OPTIONAL field.
+        // Absence means "no list shown" and gates nothing — the v5 size rule reads
+        // `total_bytes`, NEVER this list — so absence is not exploitable as a downgrade and
+        // there is no SCHEMA_V bump. BOTH shapes pinned (present + absent).
+        //
+        // P-10 mutations (orchestrator applies; each must red, revert after):
+        //   (a) remove `#[serde(default, skip_serializing_if = "Vec::is_empty")]` from
+        //       `Teaser::collections` — the absent-shape half below must RED (missing-field
+        //       error, the unwrap panics);
+        //   (b) in parse_teaser, add `teaser.collections = Vec::new();` beside the picture
+        //       sanitizer — the present-shape round-trip assert must RED.
+        let id = Identity::generate();
+        let mut t = teaser();
+        t.collections = vec![
+            TeaserCollection { name: "films".into(), bytes: 12_884_901_888 },
+            TeaserCollection { name: "vhs rips".into(), bytes: 4_096 },
+        ];
+        let ev = build_teaser(&id, &t, true).unwrap();
+        assert!(
+            ev.content.contains("\"collections\":"),
+            "present shape is on the wire"
+        );
+        assert_eq!(parse_teaser(&ev).unwrap(), t, "present shape round-trips");
+
+        // Absent shape: a body from BEFORE the field existed (or stripped in transit) still
+        // parses — collections serde-defaults to an empty vec.
+        let legacy: Teaser = serde_json::from_str(
+            r#"{"display_name":"old","bio":"","tags":[],"content_types":[]}"#,
+        )
+        .unwrap();
+        assert!(
+            legacy.collections.is_empty(),
+            "absent collections ⇒ empty — absence shows no list and grants nothing"
+        );
+    }
+
+    #[test]
+    fn parse_teaser_truncates_hostile_collections() {
+        // A serde derive is an unvalidated public constructor (§9): a hostile relay copy with
+        // an over-cap list/name is TRUNCATED to the bounds, never rejected — the rest of the
+        // teaser is still good data (the picture sanitizer's posture).
+        //
+        // P-10 mutations (orchestrator applies; each must red, revert after):
+        //   (a) delete the `teaser.collections.truncate(MAX_TEASER_COLLECTIONS);` line in
+        //       parse_teaser — the length assert must RED;
+        //   (b) delete the `c.name = truncate_alias(&c.name);` loop body in parse_teaser —
+        //       the per-name length assert must RED.
+        let id = Identity::generate();
+        // build_teaser truncates at build, so the hostile body is signed by hand — exactly
+        // build_teaser's own construction — with an over-cap list: 12 entries (cap 10) whose
+        // names are 200 multi-byte chars (cap 128).
+        let long_name = "é".repeat(200);
+        let inner = Teaser {
+            collections: (0..12)
+                .map(|i| TeaserCollection { name: format!("{long_name}{i}"), bytes: i })
+                .collect(),
+            ..teaser()
+        };
+        let content = serde_json::to_string(&Versioned { v: SCHEMA_V, inner }).unwrap();
+        let ev = id
+            .sign(
+                EventBuilder::new(Kind::from_u16(KIND_TEASER), content).tags([
+                    Tag::identifier(TEASER_D),
+                    Tag::custom(TagKind::custom(TAG_SCHEMA), [SCHEMA_V.to_string()]),
+                ]),
+            )
+            .unwrap();
+        let parsed = parse_teaser(&ev).unwrap();
+        assert_eq!(
+            parsed.collections.len(),
+            MAX_TEASER_COLLECTIONS,
+            "hostile list truncated to the cap"
+        );
+        for (i, c) in parsed.collections.iter().enumerate() {
+            assert_eq!(
+                c.name.chars().count(),
+                crate::types::MAX_PATH_ALIAS_CHARS,
+                "each name truncated to the alias cap"
+            );
+            assert_eq!(c.bytes, i as u64, "bytes untouched by the sanitize");
+        }
     }
 
     #[test]

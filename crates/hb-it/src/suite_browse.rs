@@ -49,6 +49,7 @@ fn bk(seed: u8) -> [u8; 32] {
 
 fn teaser(name: &str, tags: Vec<String>) -> Teaser {
     Teaser {
+        collections: Vec::new(),
         total_bytes: 0,
         contact_hint: None,
         display_name: name.into(),

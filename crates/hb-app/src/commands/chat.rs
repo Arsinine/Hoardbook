@@ -3522,6 +3522,7 @@ mod tests {
             browse_key_hex: Some("deadbeef".into()),
             petname: Some("Old Pal".into()),
             profile: Some(Profile {
+                teaser_collections: Vec::new(),
                 display_name: "Existing Peer".into(),
                 bio: None,
                 tags: vec![],

@@ -31,6 +31,7 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
 
 fn teaser(name: &str, tags: &[String]) -> Teaser {
     Teaser {
+        collections: Vec::new(),
         total_bytes: 0,
         contact_hint: None,
         display_name: name.into(),

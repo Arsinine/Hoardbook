@@ -34,6 +34,12 @@
 //!     asker is then "granted" against a zero-size owner, and V4 reds.
 //!   * V5 — in `hb_net::publish_listing`, skip publishing the FINAL part event: the family
 //!     browses back incomplete and the entry-for-entry equality reds.
+//!   * V7 — in `hb_core::event::parse_teaser`, add `teaser.collections = Vec::new();` before
+//!     `Ok(teaser)`: the list no longer survives the relay round-trip and V7's names/sizes
+//!     assertion reds. Deleting the `teaser.collections.truncate(MAX_TEASER_COLLECTIONS);` line in
+//!     `build_teaser` (the SENDER half) reds V7's cap assertion — the receiver's own truncate
+//!     would hide that, so V7 publishes a hand-signed oversize body only for the RECEIVER half and
+//!     goes through `build_teaser` for the sender half.
 //!   * V6 — raise the cap comparison in `hb_core::listing::decompress_body`
 //!     (`out.len() as u64 > MAX_DECOMPRESSED_LISTING_BYTES`) to `u64::MAX`: the bomb decompresses
 //!     and V6's names-the-cap refusal assertion reds.
@@ -67,6 +73,10 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
             "V6 a crafted high-ratio payload is refused at the decompression cap (refusal names it)",
             v6(ctx).await,
         ),
+        result(
+            "V7 the public teaser carries collection names + sizes across the relay, capped",
+            v7(ctx).await,
+        ),
     ]
 }
 
@@ -80,6 +90,7 @@ fn bk(seed: u8) -> [u8; 32] {
 /// production-shaped (`hb_core::event::build_teaser`, the same fn `commands::profile` drives).
 fn teaser_event(id: &Identity, name: &str, total: u64) -> Result<Event> {
     let t = Teaser {
+        collections: Vec::new(),
         display_name: name.to_string(),
         bio: String::new(),
         tags: vec![],
@@ -351,6 +362,80 @@ async fn v4(ctx: &Ctx) -> Result<()> {
         "an absent teaser (⇒ total 0) must grant nothing — not even against a zero-size owner"
     );
     refused_and_locked(ctx, &owner, &asker, &slug, &key, 0).await
+}
+
+/// V7 (QURATOR-342, owner ruling 2026-09-28 "The collection name is the teaser"): a teaser's
+/// public collection list — name + publish-computed size — survives publish → relay → the
+/// production `fetch_peer_teaser` byte-exact, and the MAX_TEASER_COLLECTIONS cap holds on BOTH
+/// halves: `build_teaser` truncates what it signs, and `parse_teaser` truncates a hostile body.
+async fn v7(ctx: &Ctx) -> Result<()> {
+    use hb_core::event::{TeaserCollection, KIND_TEASER, MAX_TEASER_COLLECTIONS};
+    let reader = Identity::generate();
+
+    // Sender half: an honest client with MORE collections than the cap, built by build_teaser.
+    let owner = Identity::generate();
+    let many: Vec<TeaserCollection> = (0..MAX_TEASER_COLLECTIONS + 3)
+        .map(|i| TeaserCollection { name: format!("v7 col {i:02}"), bytes: 1_000_000 - i as u64 })
+        .collect();
+    let t = Teaser { collections: many.clone(), ..teaser_fields("v5-v7-owner", 5_000_000) };
+    let oc = ctx.connect(&owner).await?;
+    oc.publish(&build_teaser(&owner, &t, false)?).await?;
+    oc.disconnect().await;
+
+    // Receiver half: a hostile body signed by hand (bypassing build_teaser), over the cap.
+    let hostile = Identity::generate();
+    let ht = Teaser { collections: many.clone(), ..teaser_fields("v5-v7-hostile", 5_000_000) };
+    // The wire shape `build_teaser` emits: `{"v": SCHEMA_V, ..teaser}` (flattened) plus the `d`
+    // and `hb-v` tags. Those literals are hb-core-private, so they are restated here and pinned by
+    // the parse succeeding (a wrong shape fails parse and V7 reds as "not found", never green).
+    let mut body = serde_json::to_value(&ht)?;
+    body["v"] = json!(hb_core::SCHEMA_V);
+    let hev = hostile.sign(
+        EventBuilder::new(Kind::from_u16(KIND_TEASER), body.to_string()).tags([
+            Tag::identifier("hoardbook-teaser"),
+            Tag::custom(TagKind::custom("hb-v"), [hb_core::SCHEMA_V.to_string()]),
+        ]),
+    )?;
+    let hc = ctx.connect(&hostile).await?;
+    hc.publish(&hev).await?;
+    hc.disconnect().await;
+    settle().await;
+
+    let rc = ctx.connect(&reader).await?;
+    let got = fetch_peer_teaser(&rc, &owner.public_key(), FETCH_TIMEOUT).await?;
+    let got_h = fetch_peer_teaser(&rc, &hostile.public_key(), FETCH_TIMEOUT).await?;
+    rc.disconnect().await;
+
+    let got = got.ok_or_else(|| anyhow::anyhow!("owner teaser not found on the relay"))?;
+    ensure!(
+        got.collections == many[..MAX_TEASER_COLLECTIONS],
+        "the collection list must cross the relay byte-exact and capped at {MAX_TEASER_COLLECTIONS} \
+         (got {} entries: {:?})",
+        got.collections.len(),
+        got.collections.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+    let got_h = got_h.ok_or_else(|| anyhow::anyhow!("hostile teaser not found on the relay"))?;
+    ensure!(
+        got_h.collections.len() == MAX_TEASER_COLLECTIONS,
+        "a hostile over-cap body must be truncated on parse (got {})",
+        got_h.collections.len()
+    );
+    Ok(())
+}
+
+/// The non-collection teaser fields, shared by V7's two publishers.
+fn teaser_fields(name: &str, total: u64) -> Teaser {
+    Teaser {
+        collections: Vec::new(),
+        display_name: name.to_string(),
+        bio: String::new(),
+        tags: vec![],
+        content_types: vec![],
+        picture: None,
+        hide_in_rosters: false,
+        total_bytes: total,
+        contact_hint: None,
+    }
 }
 
 /// V5 (R5): a compressed listing survives the full carrier chain — publish → split → relay →

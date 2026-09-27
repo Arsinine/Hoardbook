@@ -358,6 +358,7 @@ async fn publish_own_teaser(input: &CarryInput) -> Result<(), String> {
     use hb_core::types::Profile;
 
     let profile = Profile {
+        teaser_collections: Vec::new(),
         display_name: "wan-g node".to_string(),
         bio: None,
         tags: vec![],
