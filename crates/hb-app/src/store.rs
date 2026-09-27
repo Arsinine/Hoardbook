@@ -1254,6 +1254,32 @@ impl DataStore {
         write_json(&self.answered_asks_path(), seen).context("saving answered asks")
     }
 
+    // ── Auto access-ask trace (QURATOR-345, v5 asker half) — the set of npubs we have sent an
+    //    AUTOMATIC access request to. Once per peer, ever; written only after the send returned
+    //    Ok (browse.rs), so a failed send is retried on the next open/refresh rather than
+    //    remembered. Bounded by construction: one entry per contact npub we chose to ask — never
+    //    attacker-controlled input (contrast `answered_asks` above, whose doc warns about
+    //    nonce-driven growth).
+    pub fn auto_asks_path(&self) -> PathBuf {
+        self.base.join("auto_access_asks.json")
+    }
+
+    /// Load the auto-ask dedup set.
+    ///
+    /// Missing or unreadable ⇒ empty, never an error: like `answered_asks`, losing it costs one
+    /// redundant (throttled) ask, never correctness — the answerer re-checks the rule and dedups
+    /// on its own side.
+    pub fn load_auto_asks(&self) -> Result<std::collections::HashSet<String>> {
+        Ok(read_json_lenient::<std::collections::HashSet<String>>(&self.auto_asks_path())
+            .context("loading auto asks")?
+            .unwrap_or_default())
+    }
+
+    /// Persist the auto-ask dedup set (one entry per contact npub — bounded by construction).
+    pub fn save_auto_asks(&self, asked: &std::collections::HashSet<String>) -> Result<()> {
+        write_json(&self.auto_asks_path(), asked).context("saving auto asks")
+    }
+
     pub fn load_manifest_asks(&self) -> Result<std::collections::HashMap<String, ManifestAsk>> {
         let mut m = read_json_lenient::<std::collections::HashMap<String, ManifestAsk>>(
             &self.manifest_asks_path(),
@@ -3210,6 +3236,34 @@ pub(crate) mod tests {
             reopened.load_answered_asks().unwrap(),
             seen,
             "the memory must outlive the process, or the backlog is re-answered on every start"
+        );
+    }
+
+    /// The v5 auto-ask trace (QURATOR-345) survives a restart — the once-per-peer promise is
+    /// only as durable as this file.
+    ///
+    /// MUTATION (P-10) — in `save_auto_asks`, write an empty set instead of `asked`
+    /// (`write_json(&self.auto_asks_path(), &std::collections::HashSet::<String>::new())`) →
+    /// the reload assert reds.
+    #[test]
+    fn the_auto_ask_memory_survives_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataStore::new(dir.path().to_path_buf());
+        assert!(
+            store.load_auto_asks().unwrap().is_empty(),
+            "a node that has never auto-asked anyone remembers nothing"
+        );
+
+        let mut asked = std::collections::HashSet::new();
+        asked.insert("npub1peer".to_string());
+        store.save_auto_asks(&asked).unwrap();
+
+        // A fresh handle on the same directory — the restart this exists to survive.
+        let reopened = DataStore::new(dir.path().to_path_buf());
+        assert_eq!(
+            reopened.load_auto_asks().unwrap(),
+            asked,
+            "the once-per-peer memory must outlive the process"
         );
     }
 

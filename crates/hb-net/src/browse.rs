@@ -466,6 +466,22 @@ fn select_newest_teaser(events: Vec<Event>, peer: &PublicKey) -> Option<Teaser> 
     select_newest_by_created_at(authored_by(events, peer)).and_then(|e| parse_teaser(&e).ok())
 }
 
+/// QURATOR-345 — fetch ONE peer's newest public teaser. The answerer half of the v5 size rule
+/// (hb-app's `auto_approve.rs` access-request step) reads the ASKER's current `total_bytes`
+/// through this before minting a key grant. The author pin is [`authored_by`] + newest-by-
+/// `created_at` via [`select_newest_teaser`] — the ONE selection the rest of browse uses, never
+/// a second author-pin implementation. `None` (the peer has never published a teaser) is a
+/// normal answer, not an error; the caller treats it as `total_bytes` 0 and fails closed.
+pub async fn fetch_peer_teaser(
+    client: &RelayClient,
+    peer: &PublicKey,
+    timeout: Duration,
+) -> Result<Option<Teaser>, NetError> {
+    let filter = Filter::new().author(*peer).kind(Kind::from_u16(KIND_TEASER));
+    let events = client.fetch(filter, timeout).await?;
+    Ok(select_newest_teaser(dedup_by_id(events), peer))
+}
+
 /// The accrue-or-refuse decision behind [`render_slug_family`]'s decrypted-byte bound (Residual A,
 /// QURATOR-114's byte dimension). Extracted as a **pure** function precisely so the byte bound is
 /// testable at its real 64 MiB numbers — reaching the cap on the wire would take >1000 real NIP-44

@@ -118,12 +118,19 @@ use std::time::Duration;
 
 use nostr::prelude::*;
 
-use crate::commands::chat::{decode_dms, giftwrap_inbox_filter, DM_FETCH_MARGIN_SECS};
+use crate::commands::chat::{
+    decode_dms, giftwrap_inbox_filter, grant_browse_access_inner, parse_recipient,
+    DM_FETCH_MARGIN_SECS,
+};
 use crate::commands::fulfil::{send_cached_manifest_inner, send_full_list_inner};
+use crate::commands::profile::total_published_public_bytes;
 use crate::identity_state::SharedIdentity;
 use crate::net::{self, SharedRelay};
 use crate::store::DataStore;
 use crate::transport_state::SharedEndpoint;
+use hb_core::access_request::AccessRequest;
+use hb_core::event::Teaser;
+use hb_net::fetch_peer_teaser;
 
 /// One auto-approval per `(peer, author, slug)` per this many seconds (owner-ruled).
 ///
@@ -531,6 +538,35 @@ pub(crate) fn approval_body_for(body: &ManifestRequestBody) -> ApprovalBody {
     }
 }
 
+/// QURATOR-345 — the v5 size rule, ANSWERER half, extracted pure so it is testable without a
+/// relay (the `pace_request` precedent). Spec: `spec/reading.md` v5 — *"You can read anybody who
+/// has less data than you. Everyone else you get a teaser."* Ties read; zero reads nothing.
+///
+/// An access request (`{"hb":"access_request"}`) is auto-answered with a key grant only when the
+/// asker's CURRENT teaser `total_bytes` ≥ mine:
+/// - **absent teaser ⇒ 0 ⇒ no grant** (fail closed — the request stays in the inbox for the
+///   human, as today; same for an unfetchable teaser: `None` either way).
+/// - **blocked asker ⇒ no grant, no error — silence** (this loop decodes the inbox with no
+///   contact filter, so the `route_dm` drop the ordinary inbox applies is THIS loop's own job).
+///   They are also never remembered as answered — blocking is a silence, not an answer.
+/// - a REFUSED (smaller) asker is **not** remembered as answered: they may grow later, and their
+///   re-ask should then succeed.
+fn access_grant_decision(asker_teaser: Option<&Teaser>, my_total: u64, blocked: bool) -> bool {
+    if blocked {
+        return false;
+    }
+    let asker_total = asker_teaser.map(|t| t.total_bytes).unwrap_or(0);
+    hb_core::size_rule::may_read(asker_total, my_total)
+}
+
+/// QURATOR-345 — the dedup key for one access request, single-sourced like [`dedup_key_of`] so
+/// the consult and the post-grant remember cannot disagree on what "this ask" is. The
+/// `access_request` tag occupies a middle slot and the key has ONE FEWER component than a
+/// manifest key (`from|author|slug|nonce`), so no manifest ask can produce an equal key.
+fn access_dedup_key(asker_npub: &str, nonce: &str) -> String {
+    format!("{asker_npub}|access_request|{nonce}")
+}
+
 /// QURATOR-197 / QURATOR-297 — this loop's gift-wrap inbox filter: a thin delegate to the ONE
 /// shared builder (`commands::chat::giftwrap_inbox_filter`), so the request inbox carries
 /// STRUCTURALLY the same hardening as the chat inbox (`dm_inbox_filter`) and the ticket poll
@@ -660,7 +696,7 @@ pub(crate) async fn run_auto_approve_loop(
     );
     loop {
         // The identity snapshot for THIS poll (see the note above on why per-poll, not once).
-        let (identity, own_npub) = {
+        let (identity, own_npub, own_browse_key) = {
             let guard = live_npub.read().await;
             let Some(id) = guard.as_ref() else {
                 // No identity yet (fresh install, before the wizard) or mid-wipe. Sleep and retry —
@@ -669,7 +705,7 @@ pub(crate) async fn run_auto_approve_loop(
                 tokio::time::sleep(AUTO_APPROVE_POLL_INTERVAL).await;
                 continue;
             };
-            (id.identity.clone(), id.npub())
+            (id.identity.clone(), id.npub(), *id.browse_key.bytes())
         };
 
         // One short-lived client per poll, as the WAN harness loop does: the persistent shared
@@ -716,6 +752,150 @@ pub(crate) async fn run_auto_approve_loop(
         // us is skipped inside `decode_dms` (NIP-17 seal verification), so a stranger's gift-wrap
         // cannot forge a sender, and a stranger asking for public bytes is served like anyone else.
         let msgs = decode_dms(&own_npub, &identity, wraps, None).await;
+
+        // QURATOR-345 — v5 size rule, ANSWERER half: an access request (`{"hb":"access_request"}`)
+        // is auto-answered with a key grant IFF the asker's CURRENT teaser `total_bytes` ≥ mine.
+        // The answer is the PRODUCTION grant body — `grant_browse_access_inner`, the same call
+        // the UI click makes (seals + publishes the key grant, ask throttle inside, delay never
+        // drop); there is deliberately no second implementation to fall into (pinned by
+        // `the_access_pass_calls_the_production_grant_body_exactly_once`).
+        //
+        // Fail closed: an absent or unfetchable asker teaser is `total_bytes` 0 ⇒ no grant, and
+        // the request stays in the inbox for the human, as today. Blocked askers get SILENCE —
+        // the ordinary inbox drops a blocked peer inside `route_dm`, but this loop decodes with
+        // no contact filter, so the drop is this loop's own job (`load_dm_blocked`), and it
+        // short-circuits before any teaser fetch.
+        //
+        // Dedup + permanence: an ANSWERED access request is remembered in the same bounded
+        // answered-ask memory the manifest asks use (`apply_serve_outcome` — written only after
+        // the outcome, so a failed grant stays unremembered and its relay re-delivery retries it,
+        // QURATOR-264). A REFUSED asker is never remembered — they may grow later and their
+        // re-ask must then succeed — so a refused wrap IS re-checked once per poll for as long
+        // as it re-delivers: the documented cost is one author-pinned teaser fetch per refused
+        // outstanding ask per poll. Relays keep re-delivering inside the fetch margin, so this
+        // is steady-state, never a burst; the teaser filter is a single author+kind read.
+        let blocked_set: HashSet<String> =
+            store.load_dm_blocked().unwrap_or_default().into_iter().collect();
+        // One lazily-connected client serves every teaser fetch this poll (never one connect per
+        // ask); the inbox client above is already disconnected by the time we get here.
+        let mut teaser_client: Option<RelayClient> = None;
+        for msg in &msgs {
+            let Some(req) = AccessRequest::parse(&msg.content) else {
+                continue; // not an access request — an ordinary chat DM or a manifest ask
+            };
+            // The NIP-17 seal is the authoritative attribution (`access_request.rs`): a body
+            // whose `asker_npub` disagrees with the seal-verified sender is malformed — left
+            // for the human, as today.
+            if req.asker_npub != msg.from {
+                tracing::debug!(
+                    sender = %crate::logging::trunc_npub(&msg.from),
+                    "auto-approve: access request body disagrees with its seal sender — left \
+                     for the human"
+                );
+                continue;
+            }
+            // Blocked asker: silence — no grant, no error, and not even a teaser fetch.
+            if blocked_set.contains(&msg.from) {
+                tracing::debug!(
+                    sender = %crate::logging::trunc_npub(&msg.from),
+                    "auto-approve: access request from a blocked asker — silence"
+                );
+                continue;
+            }
+            // Consult-only, exactly like the manifest path: a granted ask is never re-checked.
+            let dedup_key = access_dedup_key(&msg.from, &req.nonce);
+            if !may_process(&seen_request_ids, &dedup_key, false) {
+                continue;
+            }
+            let asker_pk = match parse_recipient(&msg.from) {
+                Ok(pk) => pk,
+                Err(e) => {
+                    tracing::debug!(
+                        sender = %crate::logging::trunc_npub(&msg.from),
+                        "auto-approve: access request sender unparsable: {e} — left for the human"
+                    );
+                    continue;
+                }
+            };
+            if teaser_client.is_none() {
+                teaser_client =
+                    match RelayClient::connect(&identity, &relays, AUTO_APPROVE_FETCH_TIMEOUT).await
+                    {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            tracing::debug!(
+                                "auto-approve: teaser fetch connect failed: {e} — the ask stays \
+                                 unremembered, retried on the next poll"
+                            );
+                            break;
+                        }
+                    };
+            }
+            let Some(client) = teaser_client.as_ref() else {
+                continue;
+            };
+            // Fresh teaser, author-pinned — never a cached copy: the answerer re-checks the
+            // CURRENT size, and the asker may have grown since they asked.
+            let asker_teaser =
+                match fetch_peer_teaser(client, &asker_pk, AUTO_APPROVE_FETCH_TIMEOUT).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::debug!(
+                            sender = %crate::logging::trunc_npub(&msg.from),
+                            "auto-approve: asker teaser unfetchable: {e} — no grant (fail \
+                             closed), the ask stays unremembered and is retried next poll"
+                        );
+                        continue;
+                    }
+                };
+            // MY total — the same fn the teaser builder uses, so the two sides of the rule
+            // cannot disagree on what "mine" is.
+            let my_total = total_published_public_bytes(&store);
+            if !access_grant_decision(asker_teaser.as_ref(), my_total, false) {
+                tracing::debug!(
+                    sender = %crate::logging::trunc_npub(&msg.from),
+                    asker_total = asker_teaser.as_ref().map(|t| t.total_bytes).unwrap_or(0),
+                    my_total,
+                    "auto-approve: access request refused by the v5 size rule — no grant, not \
+                     remembered; the request stays in the inbox for the human"
+                );
+                continue;
+            }
+            let outcome = match grant_browse_access_inner(
+                &msg.from,
+                &identity,
+                &own_browse_key,
+                &store,
+                &relay,
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        sender = %crate::logging::trunc_npub(&msg.from),
+                        "auto-approve: access granted — browse key sealed and DM'd (v5 size rule)"
+                    );
+                    ServeOutcome::Served
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        sender = %crate::logging::trunc_npub(&msg.from),
+                        "auto-approve: access-request grant failed: {e} — the ask stays \
+                         unremembered and is retried on a later poll"
+                    );
+                    ServeOutcome::Failed
+                }
+            };
+            // The same serve-outcome memory the manifest asks use: `Served` remembers now;
+            // `Failed` counts attempts and remembers at the give-up bound (QURATOR-264).
+            if apply_serve_outcome(&mut seen_request_ids, &mut serve_attempts, &dedup_key, outcome)
+            {
+                seen_dirty = true;
+            }
+        }
+        if let Some(client) = teaser_client {
+            client.disconnect().await;
+        }
 
         // Anything the caps held on an earlier poll goes FIRST — oldest first, so a paced request
         // cannot be starved by a steady arrival of new ones.
@@ -1645,6 +1825,156 @@ mod tests {
             dedup_key_of("npub1other", &ask("n1", "films", Some("npub1authorA"))),
             "different askers are different asks"
         );
+    }
+
+    // ── QURATOR-345 — the v5 size rule, ANSWERER half (access requests) ────────────────────────
+
+    fn teaser_with_total(total: u64) -> Teaser {
+        Teaser {
+            display_name: "asker".into(),
+            bio: String::new(),
+            tags: vec![],
+            content_types: vec![],
+            picture: None,
+            hide_in_rosters: false,
+            total_bytes: total,
+            contact_hint: None,
+        }
+    }
+
+    /// Equal sizes grant (ties read); a bigger asker grants too — the happy path of *"You can
+    /// read anybody who has less data than you."*
+    ///
+    /// MUTATION (P-10) — in `access_grant_decision`, replace
+    /// `hb_core::size_rule::may_read(asker_total, my_total)` with `true`: THIS test still passes,
+    /// so the pair below is what reds on that edit.
+    #[test]
+    fn an_equal_or_bigger_asker_is_granted() {
+        assert!(
+            access_grant_decision(Some(&teaser_with_total(500)), 500, false),
+            "ties read"
+        );
+        assert!(access_grant_decision(Some(&teaser_with_total(900)), 500, false));
+    }
+
+    /// A smaller asker is not granted: *"Everyone else you get a teaser."*
+    ///
+    /// MUTATION (P-10) — in `access_grant_decision`, replace
+    /// `hb_core::size_rule::may_read(asker_total, my_total)` with `true` (or delete the
+    /// `let asker_total = ...` line and call `may_read(0, my_total)`) — this test reds.
+    #[test]
+    fn a_smaller_asker_is_not_granted() {
+        assert!(!access_grant_decision(Some(&teaser_with_total(499)), 500, false));
+    }
+
+    /// Absent/unfetchable teaser ⇒ 0 ⇒ no grant (fail closed) — even against my own 0. A teaser
+    /// PRESENT with `total_bytes` 0 refuses the same way: zero reads nothing, even zero-to-zero.
+    ///
+    /// MUTATION (P-10) — in `access_grant_decision`, change
+    /// `asker_teaser.map(|t| t.total_bytes).unwrap_or(0)` to `...unwrap_or(u64::MAX)` — the two
+    /// `None` asserts red (an absent teaser would then grant everything).
+    #[test]
+    fn an_absent_or_zero_total_teaser_grants_nothing() {
+        assert!(!access_grant_decision(None, 500, false), "absent teaser fails closed");
+        assert!(!access_grant_decision(None, 0, false), "absent vs my 0: zero reads nothing");
+        assert!(
+            !access_grant_decision(Some(&teaser_with_total(0)), 0, false),
+            "my_total=0 with asker 0 refused — the first collection is what unlocks"
+        );
+    }
+
+    /// A blocked asker is never granted, whatever they hold — blocking is silence, not an
+    /// answer, and they are never remembered as answered either.
+    ///
+    /// MUTATION (P-10) — in `access_grant_decision`, delete the `if blocked { return false; }`
+    /// block (both lines) — this test reds.
+    #[test]
+    fn a_blocked_asker_is_never_granted() {
+        assert!(!access_grant_decision(Some(&teaser_with_total(9_999)), 1, true));
+    }
+
+    /// The access ask's remembered identity: same `(asker, nonce)` is the same ask; a fresh
+    /// nonce or a different asker is a different ask; and no manifest ask can collide with an
+    /// access key — the 4-part manifest shape (`from|author|slug|nonce`) cannot equal the
+    /// 3-part access shape even when the manifest's author IS the tag text.
+    ///
+    /// What actually prevents the collision is the COMPONENT COUNT (3 vs 4), not the tag: the
+    /// `access_request` text is a label for a human reading the persisted memory. Deleting the
+    /// tag leaves a 2-part key that still collides with nothing (verified by mutation, 2026-09-27
+    /// — that edit stays GREEN, which is why it is not the recipe here). Both components are the
+    /// seal-verified sender's own, so even a `|` smuggled into a nonce can only collide the
+    /// sender's own asks with each other.
+    ///
+    /// MUTATION (P-10) — in `access_dedup_key`, give the key the manifest's 4-part shape:
+    /// `format!("{asker_npub}|access_request|{nonce}|{nonce}")` — the anti-collision assert
+    /// reds (it now equals the manifest key for author `access_request`, slug `n1`).
+    #[test]
+    fn the_access_dedup_key_separates_asks_and_never_collides_with_a_manifest_key() {
+        assert_eq!(
+            access_dedup_key("npub1peer", "n1"),
+            access_dedup_key("npub1peer", "n1"),
+            "the same ask is always the same key"
+        );
+        assert_ne!(
+            access_dedup_key("npub1peer", "n1"),
+            access_dedup_key("npub1peer", "n2"),
+            "a fresh nonce is a different ask"
+        );
+        assert_ne!(
+            access_dedup_key("npub1peer", "n1"),
+            access_dedup_key("npub1other", "n1"),
+            "different askers are different asks"
+        );
+        assert_ne!(
+            access_dedup_key("npub1peer", "n1"),
+            dedup_key_of("npub1peer", &body("n1", Some("access_request"))),
+            "a manifest ask whose author IS the tag text still cannot collide"
+        );
+    }
+
+    /// QURATOR-345 — THE one-source guard: the access pass answers with the PRODUCTION grant
+    /// body, exactly once, and never inlines a copy of it — `build_key_grant` and
+    /// `publish_private_listing` (the body's own two steps) must not appear in this file at all.
+    /// Also pins the wiring: the loop PARSES access requests, fetches the asker's teaser FRESH
+    /// through `fetch_peer_teaser`, and decides through the pure fn. Needles are counted in
+    /// CALL FORM over comment-stripped source (§9, P-12 — a comment or prose mentioning the
+    /// name cannot satisfy the count), and the needle strings here are assembled through the
+    /// `call` helper so the test's own literals can never match themselves.
+    ///
+    /// MUTATION (P-10) — in the access pass, replace the
+    /// `let outcome = match grant_browse_access_inner(` … `};` statement (its first line is the
+    /// unique anchor) with `let outcome = ServeOutcome::Served;` — the call-form count drops to
+    /// 0 and this test reds. Inlining `build_key_grant` + `publish_private_listing` instead
+    /// reds on the two absence asserts.
+    #[test]
+    fn the_access_pass_calls_the_production_grant_body_exactly_once() {
+        // Strip `//` line comments so the guard cannot count its own prose. Assumption: no
+        // `//` inside a string literal in this file (relay URLs live in the store, never here);
+        // if one is ever added, this guard's strip must become literal-aware before its counts
+        // mean anything.
+        let call = |name: &str| format!("{name}(");
+        let source: String = include_str!("auto_approve.rs")
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            source.matches(&call("grant_browse_access_inner")).count(),
+            1,
+            "the access pass answers with the production grant body, exactly once"
+        );
+        for copy in ["build_key_grant", "publish_private_listing"] {
+            assert!(
+                !source.contains(&call(copy)),
+                "the grant body's own steps must never be inlined into this loop (`{copy}`)"
+            );
+        }
+        for wiring in ["AccessRequest::parse", "fetch_peer_teaser", "access_grant_decision"] {
+            assert!(
+                source.contains(&call(wiring)),
+                "the access pass wiring is missing (`{wiring}`)"
+            );
+        }
     }
 
 }

@@ -170,11 +170,26 @@ export interface CachedPeer {
  *  `has_browse_key` carries the same yes/no signal `browse_key_hex` was used for. Every other
  *  command that still needs the real key (`pasteKey`, `follow`, `refreshContact`) keeps returning
  *  `CachedPeer` unchanged — this type is `get_contacts`-only. */
+/** v5 (QURATOR-345) — the size-rule read state for a contact ("You can read anybody who has less
+ *  data than you. Everyone else you get a teaser."): `readable` = we hold their browse key;
+ *  `asked` = the rule passed so the automatic access request went (or goes) out on the next
+ *  open/refresh, once per peer; `locked` = their total published bytes exceed ours (or ours is 0)
+ *  — `need_bytes` is THEIR total, the X in "readable once your hoard reaches X". Serde is
+ *  internally tagged (`{"kind":"locked","need_bytes":…}`). */
+export type ReadState =
+	| { kind: "readable" }
+	| { kind: "asked" }
+	| { kind: "locked"; need_bytes: number };
+
 export interface ContactSummary {
 	npub: string;
 	source?: ContactSource;
 	/** True when this contact has a cached browse-key — never the key itself. */
 	has_browse_key: boolean;
+	/** v5 (QURATOR-345) — the size-rule read state (see `ReadState`). The backend always sends it;
+	 *  optional here only because the UI also builds placeholder summaries (e.g. a deep-linked
+	 *  stranger in Chat) that have no rule inputs. No UI renders it yet — P4 (QURATOR-342) will. */
+	read_state?: ReadState;
 	petname?: string;
 	profile?: Profile;
 	collections: Collection[];

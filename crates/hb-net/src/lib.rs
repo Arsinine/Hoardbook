@@ -32,7 +32,8 @@ pub mod topic;
 
 pub use browse::{
     browse_peer_listings, browse_peer_listings_state, browse_share_code,
-    family_teaser_fingerprint, fetch_full_listing_from, fetch_full_listing_if_current,
+    family_teaser_fingerprint, fetch_peer_teaser, fetch_full_listing_from,
+    fetch_full_listing_if_current,
     listing_snapshot_fingerprint, parse_share_code, publish_listing, publish_listing_capped,
     publish_listing_to, resolve_peer_relays, resolve_recipient_relays, scope_peer_relays,
     search_teasers, search_teasers_capped, BrowseResult, ListingsState, PublishedListing,

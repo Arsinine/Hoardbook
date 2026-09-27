@@ -1498,17 +1498,21 @@ pub(crate) fn build_access_request_content(
 /// identity — the seal signer is the authoritative attribution, the field is convenience (the
 /// `author_npub` rationale on `TransportTicket`).
 ///
-/// **The answer is deliberately NOT automated here.** The owner ruling (auto-grant the browse key
-/// to anyone who asks, except a blocked npub) has no issuance path to reuse yet: `seal_key_grant`
-/// has no hb-app caller, and the standing-grant map it might have fed was deleted (QURATOR-177/164,
-/// 2026-09-03/04). Building new crypto-sensitive grant-minting logic under this slice was ruled out
-/// of scope — the receive/auto-answer half is decomposed and owed separately. What exists today:
-/// the issuer's inbox recognises the body (UI hint) and the human answers with "Share my code", as
-/// before. Note blocking already gates the whole DM: `route_dm` drops a blocked peer's message
-/// before any body parsing runs, so a blocked asker's request never reaches the inbox at all.
+/// **The answer is NOT automated here — and since v5 (QURATOR-345) the send is no longer only
+/// manual either.** The auto-answer lives in `auto_approve.rs`: it re-checks the asker's live
+/// teaser via `hb_core::size_rule::may_read` and, when the rule passes, mints the key grant
+/// through [`grant_browse_access_inner`] — the same body the manual click uses. What this body owns
+/// is unchanged: the nonce, the is-self-send refusal, the QURATOR-164 ask throttle, the NIP-17
+/// send — and it is now ALSO the body the asker half drives automatically (browse.rs
+/// `maybe_auto_ask_access`, once per peer, when the size rule says we may read them). Blocking
+/// already gates the whole DM: `route_dm` drops a blocked peer's message before any body parsing
+/// runs, so a blocked asker's request never reaches the inbox at all.
 ///
-/// No local ask trace yet — the manifest asks persist `manifest_asks.json` so the paywall can show
-/// "Asked"; an access-ask trace/cooldown is a follow-up if the affordance needs the same feedback.
+/// v5 — the ask trace exists for the AUTOMATIC asks: the auto-ask site in browse.rs persists the
+/// peer into `auto_access_asks.json` (`store.save_auto_asks`) only after this body returns Ok, so
+/// its once-per-peer promise holds. This manual command deliberately writes nothing — a prior
+/// manual ask may therefore cost one more automatic ask; accepted (the answerer re-checks and
+/// dedups on its own side, and the throttle delays, never drops).
 #[tauri::command]
 pub async fn send_access_request(
     npub: String,

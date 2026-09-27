@@ -758,6 +758,67 @@ pub async fn follow(
 /// [`refresh_contact`] returns this projection too — every call site only ever spread its result
 /// straight into the same `contacts` store. `paste_key` and `follow` still need the real key (a
 /// share-code paste, or the peer handed to `follow`) and keep returning `CachedPeer` unchanged.
+/// v5 (QURATOR-345) — the size-rule read state a contact presents ("You can read anybody who has
+/// less data than you. Everyone else you get a teaser."): a cached browse-key ⇒ [`ReadState::Readable`]
+/// (a manual grant reads at any size); the rule passes but no key yet ⇒ [`ReadState::Asked`] — the
+/// automatic access request went, or goes, out on the next open/refresh (once per peer); their
+/// total exceeds mine, or mine is 0 ⇒ [`ReadState::Locked`] with THEIR total as `need_bytes` (the
+/// X in "readable once your hoard reaches X"). Serde is internally tagged so the TS side switches
+/// on `kind`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReadState {
+    Readable,
+    Asked,
+    Locked { need_bytes: u64 },
+}
+
+/// The ONE v5 read-state computation for a [`CachedPeer`] — the display state and the auto-ask
+/// decision ([`should_auto_ask`]) both derive from [`hb_core::size_rule::may_read`] so the two
+/// sides can never disagree about the rule. Ordered, documented:
+///
+/// 1. A cached browse-key ⇒ `Readable`, always. A manual grant (share code) reads at any size,
+///    and neither a size lock nor the asked trace can downgrade it.
+/// 2. An `asked` trace entry OR a passing `may_read` ⇒ `Asked`. The trace gates the SEND;
+///    the display funnels "ask sent" and "ask due" into the same state — the ticket's three
+///    states have no fourth slot, and "due" is transient (the ask fires on the open/refresh
+///    that surfaces the peer; only a failed send lingers, and it is retried, so the trace and
+///    the state re-converge).
+/// 3. Otherwise `Locked { need_bytes: their total }` — their total > mine, or mine is 0 (zero
+///    reads nothing; spec: "yours = 0 ⇒ teasers only"). `need_bytes` is THEIR total, the X in
+///    "readable once your hoard reaches X"; a zero-me lock renders need_bytes 0, i.e. "publish
+///    something first".
+///
+/// A missing `Profile` ⇒ their total 0 (the `Profile::total_bytes` doc: an unknown total reads
+/// as the smallest possible author, never wrongly LOCKED). The asker side is NOT the fail-closed
+/// side — the answerer re-checks the asker's live teaser and counts an unfetchable one as 0
+/// (spec: "An unfetchable teaser counts as 0 — fail closed"), so a stray ask lands in their
+/// inbox exactly as a human ask does today; it grants nothing on its own.
+pub(crate) fn read_state_for(peer: &CachedPeer, my_total: u64, asked: bool) -> ReadState {
+    if peer.browse_key_hex.is_some() {
+        return ReadState::Readable;
+    }
+    let their_total = peer.profile.as_ref().map(|p| p.total_bytes).unwrap_or(0);
+    if asked || hb_core::size_rule::may_read(my_total, their_total) {
+        return ReadState::Asked;
+    }
+    ReadState::Locked {
+        need_bytes: their_total,
+    }
+}
+
+/// The v5 auto-ask decision: send the automatic access request iff the peer has no key, the
+/// persisted once-per-peer trace does not already have them, and `may_read` passes. The display
+/// state ([`read_state_for`]) and this share `may_read`, so they cannot disagree.
+pub(crate) fn should_auto_ask(peer: &CachedPeer, my_total: u64, already_asked: bool) -> bool {
+    peer.browse_key_hex.is_none()
+        && !already_asked
+        && hb_core::size_rule::may_read(
+            my_total,
+            peer.profile.as_ref().map(|p| p.total_bytes).unwrap_or(0),
+        )
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ContactSummary {
     pub npub: String,
@@ -765,6 +826,8 @@ pub struct ContactSummary {
     pub source: crate::store::ContactSource,
     /// True when this contact has a cached browse-key — never the key itself.
     pub has_browse_key: bool,
+    /// v5 (QURATOR-345) — the size-rule read state (see [`ReadState`]); always present.
+    pub read_state: ReadState,
     pub petname: Option<String>,
     pub profile: Option<hb_core::types::Profile>,
     pub collections: Vec<PeerCollection>,
@@ -779,10 +842,16 @@ pub struct ContactSummary {
 
 impl From<CachedPeer> for ContactSummary {
     fn from(peer: CachedPeer) -> Self {
+        // v5 (QURATOR-345): this seam has no store access, so `my_total` is unknown — `0` is the
+        // conservative under-claim (never Readable without a key, never Asked without a trace;
+        // keyed contacts still read Readable). The store-aware construction sites refine it via
+        // [`contact_summary_for`].
+        let read_state = read_state_for(&peer, 0, false);
         ContactSummary {
             npub: peer.npub,
             source: peer.source,
             has_browse_key: peer.browse_key_hex.is_some(),
+            read_state,
             petname: peer.petname,
             profile: peer.profile,
             collections: peer.collections,
@@ -796,10 +865,25 @@ impl From<CachedPeer> for ContactSummary {
     }
 }
 
+/// The store-aware summary constructor both production summary sites use ([`get_contacts`] and
+/// [`refresh_contact`]): [`From<CachedPeer>`] alone has no store, so it under-claims (my total
+/// unknown ⇒ 0 — see the `From` impl), and this refines the read state with the real v5 inputs:
+/// MY published total plus the persisted auto-ask trace. The trace read failing ⇒ empty — it is
+/// a de-dup memory; losing it costs one redundant (throttled) ask, never correctness, and it
+/// must never fail the contact list.
+fn contact_summary_for(peer: CachedPeer, store: &DataStore) -> ContactSummary {
+    let my_total = crate::commands::profile::total_published_public_bytes(store);
+    let asked = store.load_auto_asks().unwrap_or_default();
+    ContactSummary {
+        read_state: read_state_for(&peer, my_total, asked.contains(&peer.npub)),
+        ..ContactSummary::from(peer)
+    }
+}
+
 #[tauri::command]
 pub async fn get_contacts(store: State<'_, DataStore>) -> CmdResult<Vec<ContactSummary>> {
     let peers = store.list_contacts().map_err(cmd_err)?;
-    Ok(peers.into_iter().map(ContactSummary::from).collect())
+    Ok(peers.into_iter().map(|p| contact_summary_for(p, &store)).collect())
 }
 
 #[tauri::command]
@@ -838,9 +922,22 @@ pub async fn refresh_contact(
     // sequence (the hardened-path/unhardened-sibling drift §9 warns about; pinned by the
     // structural guard in enumeration_queue.rs).
     let me = identity_clone(&identity).await?;
-    refresh_contact_inner(&npub, &me, &store, &relay)
-        .await
-        .map(ContactSummary::from)
+    let peer = refresh_contact_inner(&npub, &me, &store, &relay).await?;
+    // v5 (QURATOR-345) — the asker half fires HERE, on the user opening the contact (the ticket's
+    // seam), and deliberately NOT inside `refresh_contact_inner`: the background enumeration
+    // queue drives that body too, and its relay-side read is exempt from the discovery opt-in
+    // precisely because NOTHING is sent to the peer (owner ruling 2026-09-24, see
+    // enumeration_queue.rs). An automatic DM from the queue would break that premise. A failed
+    // ask must not fail the refresh that already succeeded; it is retried on the next open (no
+    // trace was written).
+    if let Err(e) = maybe_auto_ask_access(&peer, &me, &store, &relay).await {
+        tracing::warn!(
+            npub = %crate::logging::trunc_npub(&peer.npub),
+            error = %e,
+            "auto access-ask failed; retried on the next open"
+        );
+    }
+    Ok(contact_summary_for(peer, &store))
 }
 
 /// The shared resolve+save body of [`refresh_contact`] (QURATOR-332 slice A), extracted so the
@@ -864,6 +961,31 @@ pub(crate) async fn refresh_contact_inner(
     let share_code = contact_share_code(&existing)?;
     let updated = resolve_peer(&share_code, me, store, relay).await?;
     save_refreshed_contact(store, &hash, &existing, updated)
+}
+
+/// The v5 asker half (QURATOR-345): ONE automatic access request per peer, ever, sent through
+/// the production ask body ([`crate::commands::chat::send_access_request_inner`], which owns the
+/// is-self-send refusal, the QURATOR-164 ask throttle — delays, never drops — and the NIP-17
+/// send). The decision is the pure [`should_auto_ask`]; the persisted trace
+/// ([`DataStore::save_auto_asks`]) is written ONLY after the send returned `Ok`, so a failed
+/// send leaves no trace and is retried on the next open/refresh. The answerer half (their
+/// re-check + key grant) is in `auto_approve.rs`.
+pub(crate) async fn maybe_auto_ask_access(
+    peer: &CachedPeer,
+    me: &Identity,
+    store: &DataStore,
+    relay: &SharedRelay,
+) -> Result<(), String> {
+    let asked_set = store.load_auto_asks().unwrap_or_default();
+    let my_total = crate::commands::profile::total_published_public_bytes(store);
+    if !should_auto_ask(peer, my_total, asked_set.contains(&peer.npub)) {
+        return Ok(());
+    }
+    crate::commands::chat::send_access_request_inner(&peer.npub, me, store, relay).await?;
+    // Only after the send returned Ok — a failed send must be retried, never remembered.
+    let mut asked_set = asked_set;
+    asked_set.insert(peer.npub.clone());
+    store.save_auto_asks(&asked_set).map_err(cmd_err)
 }
 
 /// QURATOR-267: reconcile the keyed listing-enumeration's outcome against the previously cached
@@ -3040,6 +3162,158 @@ mod tests {
             let keyless = stub_peer("npub1keyless", Some("Keyless"));
             let keyless_summary = ContactSummary::from(keyless);
             assert!(!keyless_summary.has_browse_key, "a keyless contact reports false");
+        }
+
+        /// v5 (QURATOR-345) fixture: a profiled stub whose profile carries the given published
+        /// total (the `Teaser::total_bytes` a peer's teaser threads into `Profile`).
+        fn peer_with_total(npub: &str, total: u64) -> CachedPeer {
+            let mut peer = stub_peer_with_profile(npub, "Peer");
+            if let Some(profile) = peer.profile.as_mut() {
+                profile.total_bytes = total;
+            }
+            peer
+        }
+
+        /// P-10: in `read_state_for`, flip `peer.browse_key_hex.is_some()` to `.is_none()` —
+        /// both Readable asserts red (the keyless one to Locked, the asked one to Locked too).
+        #[test]
+        fn read_state_for_keyed_contact_reads_readable_at_any_size() {
+            let keyed = {
+                let mut peer = peer_with_total("npub1keyed", 500);
+                peer.browse_key_hex = Some(hex::encode([7u8; 32]));
+                peer
+            };
+            assert_eq!(
+                read_state_for(&keyed, 1, false),
+                ReadState::Readable,
+                "a manual grant reads at any size — the key trumps the rule"
+            );
+            assert_eq!(
+                read_state_for(&keyed, 1, true),
+                ReadState::Readable,
+                "neither a size lock nor the asked trace can downgrade a held key"
+            );
+        }
+
+        /// The v5 read-state table (QURATOR-345): tie ⇒ Asked + the auto-ask agrees; their total
+        /// above mine ⇒ Locked with THEIR total, never a send; zero-me ⇒ Locked, never a send;
+        /// missing profile ⇒ their total 0 (nonzero me ⇒ ask due; zero me ⇒ Locked{0}).
+        ///
+        /// P-10: in `read_state_for`, delete `|| hb_core::size_rule::may_read(my_total, their_total)`
+        /// — the tie (asked=false) assert reds: the tie falls through to `Locked`.
+        #[test]
+        fn read_state_for_table_matches_the_v5_rule() {
+            // Tie ⇒ Asked (ask sent or due), and should_auto_ask agrees ⇒ send.
+            let tie = peer_with_total("npub1tie", 100);
+            assert_eq!(read_state_for(&tie, 100, false), ReadState::Asked, "a tie reads");
+            assert!(should_auto_ask(&tie, 100, false), "a tie sends the automatic ask");
+            // Missing profile ⇒ their total 0 (the Profile::total_bytes doc): nonzero me ⇒ due.
+            let bare = stub_peer("npub1bare", None);
+            assert_eq!(read_state_for(&bare, 100, false), ReadState::Asked);
+            assert!(should_auto_ask(&bare, 100, false));
+            // Zero-me, missing profile ⇒ Locked{0} — "publish something first".
+            assert_eq!(
+                read_state_for(&bare, 0, false),
+                ReadState::Locked { need_bytes: 0 }
+            );
+        }
+
+        /// P-10: in `read_state_for`, delete `asked || ` — the assert below reds: a peer we
+        /// already asked falls through to `Locked` when the rule later stops passing.
+        #[test]
+        fn read_state_for_the_asked_trace_cannot_be_downgraded_by_a_later_size_change() {
+            let bigger = peer_with_total("npub1big", 500);
+            assert_eq!(
+                read_state_for(&bigger, 100, true),
+                ReadState::Asked,
+                "asked once ⇒ Asked — the trace is not re-litigated by size drift"
+            );
+        }
+
+        /// P-10: in `should_auto_ask`, delete the `!` before `already_asked` — the "already
+        /// asked ⇒ no second ask" assert reds (and the not-yet-asked tie flips too).
+        #[test]
+        fn should_auto_ask_refuses_a_second_ask_and_respects_the_lock() {
+            let tie = peer_with_total("npub1tie2", 100);
+            assert!(
+                !should_auto_ask(&tie, 100, true),
+                "once per peer, persisted — no second automatic ask"
+            );
+            // Their total above mine ⇒ no send (Locked{their total} on the display side).
+            let bigger = peer_with_total("npub1big2", 500);
+            assert!(!should_auto_ask(&bigger, 100, false));
+            // Zero-me ⇒ no send (spec: yours = 0 ⇒ teasers only).
+            assert!(!should_auto_ask(&bigger, 0, false));
+            // A held key ⇒ never asked (they granted by hand).
+            let keyed = {
+                let mut peer = peer_with_total("npub1keyed2", 500);
+                peer.browse_key_hex = Some(hex::encode([7u8; 32]));
+                peer
+            };
+            assert!(!should_auto_ask(&keyed, 1000, false));
+        }
+
+        /// P-10 (structure): delete the `maybe_auto_ask_access(&peer, &me, &store, &relay)`
+        /// call from `refresh_contact` — the call-site assert reds with 0 occurrences. Moving it
+        /// back into `refresh_contact_inner` (the queue's path) reds the queue-exclusion assert.
+        /// P-10 (order): swap the send line and the `store.save_auto_asks(&asked_set)` line in
+        /// `maybe_auto_ask_access` — the order assert reds (save before send).
+        #[test]
+        fn auto_ask_fires_on_open_only_through_the_production_body_and_traces_after_ok() {
+            let strip = |s: &str| -> String {
+                s.lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let src = std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/commands/browse.rs"
+            ))
+            .unwrap();
+            // Non-test source only, so this guard's own needle strings can never satisfy a
+            // scan (P-12), and comment-stripped so a doc mention never counts.
+            let code = strip(&src).split("#[cfg(test)]").next().unwrap().to_string();
+            let ask_start = code
+                .find("pub(crate) async fn maybe_auto_ask_access(")
+                .expect("the auto-ask body must exist beside the refresh path");
+            let body = &code[ask_start..];
+            assert_eq!(
+                body.matches("send_access_request_inner(").count(),
+                1,
+                "the auto-ask fires through the ONE production ask body — never a re-implementation"
+            );
+            // The trace is written only AFTER the send returned Ok.
+            let send = body.find("send_access_request_inner(").unwrap();
+            let save = body.find("save_auto_asks(").unwrap();
+            assert!(
+                save > send,
+                "the once-per-peer trace must be written only after the send succeeded"
+            );
+            // The ONE call site is the user-facing open (`refresh_contact`), and NEVER the shared
+            // body the background enumeration queue also drives — the queue sends nothing to a
+            // peer (owner ruling 2026-09-24).
+            let cmd_start = code
+                .find("pub async fn refresh_contact(")
+                .expect("refresh_contact must exist");
+            let inner_start = code
+                .find("pub(crate) async fn refresh_contact_inner(")
+                .expect("refresh_contact_inner must exist");
+            assert_eq!(
+                code[cmd_start..inner_start].matches("maybe_auto_ask_access(").count(),
+                1,
+                "the ONE auto-ask call site is the user opening the contact"
+            );
+            assert_eq!(
+                code[inner_start..ask_start].matches("maybe_auto_ask_access(").count(),
+                0,
+                "the queue-driven refresh body must never send an automatic ask"
+            );
+            assert_eq!(
+                code.matches("maybe_auto_ask_access(").count(),
+                2,
+                "exactly one call plus the definition — no other caller"
+            );
         }
 
         /// P-10: in `unfollow_contact`, replace the body
