@@ -1183,13 +1183,23 @@ pub(crate) mod tests {
     /// dropped `mod transport`'s `#[allow(dead_code)]` — the allow was the only thing making an
     /// uncalled helper look used.)
     pub(crate) fn real_payload_for(slug: &str, entries: usize) -> ManifestPayload {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
         let id = Identity::generate();
         let items: Vec<String> = (0..entries)
             .map(|i| {
+                // QURATOR-344: the body is zstd-compressed before the seal, and these near-identical
+                // entries compress ~25× — the 10k fixture fell from ~2.4 MB to ~98 KB of envelope and
+                // stopped being multi-MB. A deterministic, incompressible `note` (256 hashed bytes,
+                // base64) keeps the sealed size where the transport tests need it.
+                let noise: Vec<u8> = (0u8..8)
+                    .flat_map(|k| Sha256::digest([&(i as u64).to_le_bytes()[..], &[k]].concat()))
+                    .collect();
                 format!(
-                    r#"{{"name":"a-file-with-a-realistically-long-name-{i:07}.mkv","path":"season-{}/a-file-with-a-realistically-long-name-{i:07}.mkv","item_type":"file","size":{},"children":[]}}"#,
+                    r#"{{"name":"a-file-with-a-realistically-long-name-{i:07}.mkv","path":"season-{}/a-file-with-a-realistically-long-name-{i:07}.mkv","item_type":"file","size":{},"note":"{}","children":[]}}"#,
                     i % 40,
-                    1_000_000 + i
+                    1_000_000 + i,
+                    base64::engine::general_purpose::STANDARD.encode(noise)
                 )
             })
             .collect();
@@ -1410,17 +1420,15 @@ pub(crate) mod tests {
     // settling now just run to the fetch's own completion.
 
     /// **The acceptance test: a multi-MB manifest crosses a real connection.** 10,000 entries of
-    /// realistic long filenames through the real splitter — ~60 parts and ~2.4 MB of sealed
-    /// envelope, which is many QUIC frames rather than the single-datagram case a small fixture
-    /// would test.
+    /// realistic long filenames through the real splitter, each carrying an incompressible `note`
+    /// (see `real_payload_for`) so the zstd-compressed, sealed envelope is still several MB — many
+    /// QUIC frames rather than the single-datagram case a small fixture would test.
     ///
     /// 10,000 is not arbitrary: it is the owner's stated human browse limit, the number MECH-2's
-    /// ceiling was derived from. **Measured here, that shape is ~245 bytes of sealed envelope per
-    /// entry, not the ~70 MECH-2 assumed** — realistic nested paths and long names cost more than
-    /// bare filenames. So the 16 MiB ceiling carries ~68k such entries, well short of what the
-    /// ~70-byte assumption implied. The ceiling still sits
-    /// comfortably above the browseable band, which is what it was pinned to; the headroom is just
-    /// smaller than the derivation's arithmetic implied.
+    /// ceiling was derived from. *(Historical, pre-QURATOR-344: uncompressed, that shape measured
+    /// ~245 bytes of sealed envelope per entry, putting ~68k entries under the 16 MiB ceiling. zstd
+    /// before the seal now shrinks a real listing ~25–100×, so the ceiling's headroom over the
+    /// browseable band is far larger than that measurement implied.)*
     #[tokio::test]
     async fn a_multi_megabyte_manifest_crosses_a_real_connection() {
         tokio::time::timeout(MULTI_MB_TIMEOUT, async {

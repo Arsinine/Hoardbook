@@ -57,7 +57,10 @@ pub use count::{
 pub use dm_cache::{open_dm_cache, seal_dm_cache};
 pub use fingerprint::{fingerprint, Fingerprint};
 pub use identity::Identity;
-pub use listing::{decrypt_listing, encrypt_listing, BrowseKey, ContentKey};
+pub use listing::{
+    decrypt_listing, encrypt_listing, BrowseKey, ContentKey, LISTING_PAYLOAD_V,
+    MAX_DECOMPRESSED_LISTING_BYTES,
+};
 pub use manifest::{build_manifest_envelope, ManifestEnvelope, MANIFEST_V};
 pub use priv_listing::{
     open_key_grant, open_private_listing, seal_key_grant, seal_private_listing, seal_wrapped,

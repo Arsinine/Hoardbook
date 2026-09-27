@@ -8,7 +8,7 @@ use crate::access_request;
 use crate::backup::BACKUP_FORMAT_VER;
 use crate::binding;
 use crate::event;
-use crate::listing::{HKDF_SALT, HKDF_SALT_CEK};
+use crate::listing::{HKDF_SALT, HKDF_SALT_CEK, LISTING_PAYLOAD_V, MAX_DECOMPRESSED_LISTING_BYTES};
 use crate::manifest::{MANIFEST_V, SIG_DOMAIN};
 use crate::transport_payload::{MANIFEST_MAX_TRANSPORT_BYTES, MANIFEST_MAX_TRANSPORT_PARTS};
 use crate::priv_listing;
@@ -48,7 +48,29 @@ fn version_discriminants_are_frozen() {
     // MANIFEST_V bumped 1→2 (M16 W4 residual): v1 was the pre-release single-`ciphertext` shape,
     // superseded before any producer shipped (export landed at v2 — the chunked `ciphertexts` body).
     // v2 is the frozen launch value; a v1 envelope no longer even deserializes (its field is gone).
-    assert_eq!(MANIFEST_V, 2, "MANIFEST_V (M16 manifest envelope, chunked v2) — {FREEZE}");
+    //
+    // MANIFEST_V bumped 2→3 (QURATOR-344 slice B): v3 seals a **zstd-compressed** body — each
+    // ciphertext is `[LISTING_PAYLOAD_V] ++ zstd(part)` inside the NIP-44 envelope — where v2
+    // sealed raw JSON parts. No v2 envelope shipped to a user at the bump, so v2 is recognised
+    // and refused at the body version check, never dual-read.
+    assert_eq!(MANIFEST_V, 3, "MANIFEST_V (QURATOR-344 manifest envelope, zstd-before-seal v3) — {FREEZE}");
+}
+
+/// The listing/manifest BODY payload version and its decompression ceiling (QURATOR-344 slice B).
+/// The frame byte is the first plaintext byte INSIDE the NIP-44 envelope — the narrowest
+/// listing-body discriminant that exists: bumping it moves the sealed bytes' meaning without
+/// re-keying `CRYPTO_V` (share-code framing, on-disk DM caches) or re-versioning `SCHEMA_V`
+/// (teasers, bindings, topics). The ceiling is the zip-bomb guard, frozen like the transport
+/// ceiling because two peers that disagree about it would disagree about whether a transfer is
+/// refused or runs away.
+#[test]
+fn listing_body_payload_version_and_decompression_cap_are_frozen() {
+    assert_eq!(LISTING_PAYLOAD_V, 2, "listing::LISTING_PAYLOAD_V (zstd-before-seal body v2) — {FREEZE}");
+    assert_eq!(
+        MAX_DECOMPRESSED_LISTING_BYTES,
+        64 * 1024 * 1024,
+        "listing::MAX_DECOMPRESSED_LISTING_BYTES (zip-bomb guard) — {FREEZE}"
+    );
 }
 
 /// **INV-4′ mechanism 2 — the manifest transport ceiling (M18).** Frozen because it is a

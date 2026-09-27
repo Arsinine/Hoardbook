@@ -8,6 +8,21 @@
 //! version is carried in the listing event's **signed tag** and checked on decrypt, so an
 //! unknown version is *recognised and refused*, never mis-decrypted. The ciphertext is
 //! **base64** (the NIP-44 standard content encoding), ready to drop into a Nostr event.
+//!
+//! ## zstd before the seal (QURATOR-344 slice B)
+//!
+//! The body is compressed **before** it is ever a ciphertext: `encrypt_listing` frames
+//! `[LISTING_PAYLOAD_V] ++ zstd(json)` and seals that, so the relay-hosted bytes are the
+//! compressed shape (measured: 10k-file deep chain 948 KB → 9 KB; 2000-film library 732 KB →
+//! 23 KB). Decrypting inverts it under a **hard decompressed-byte cap**
+//! ([`MAX_DECOMPRESSED_LISTING_BYTES`]) — a `Read::take(cap + 1)` bound refuses a crafted
+//! high-ratio frame (a "zip bomb") at the ceiling instead of materializing it. The frame byte is
+//! the payload discriminant living INSIDE the signed ciphertext: it moves without touching
+//! `CRYPTO_V`/`SCHEMA_V` (whose bumps re-key the share-code framing, the DM cache, and every
+//! other kind), and the pre-bump v1 body (raw JSON, no frame byte) is *recognised and refused*,
+//! never dual-read — there were no readers in the wild when it shipped.
+
+use std::io::{Cursor, Read};
 
 use base64::Engine as _;
 use hkdf::Hkdf;
@@ -31,6 +46,22 @@ pub(crate) const HKDF_SALT: &[u8] = b"hoardbook/browse-key";
 pub(crate) const HKDF_SALT_CEK: &[u8] = b"hoardbook/cek";
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
+/// Wire-format version of the listing/manifest **body payload** — the first plaintext byte
+/// inside the NIP-44 envelope, after the HKDF→NIP-44 layer (value pinned in `wire_freeze`).
+/// **v2** seals `zstd(json)` behind the frame byte; **v1** was the pre-QURATOR-344 raw-JSON
+/// body, which carried no framing byte at all (every v1 body begins `{`) and is refused on
+/// decrypt.
+pub const LISTING_PAYLOAD_V: u8 = 2;
+
+/// Hard ceiling on the **decompressed** listing/manifest body (QURATOR-344 slice B, the
+/// zip-bomb guard). Derivation: the largest body the app can legitimately build is
+/// `MAX_COLLECTION_ITEMS` = 100 000 items (hb-app `scan_selective`) at an upper bound of ~640
+/// bytes/item (255-char description + path + name + tags), ≈ 64 MiB — every legitimate body
+/// fits, so anything larger is a hostile or broken peer. Frozen in `wire_freeze` like the
+/// transport ceiling: two peers that disagree about it would disagree about whether a transfer
+/// is refused or runs away.
+pub const MAX_DECOMPRESSED_LISTING_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Derive the NIP-44 conversation key from the browse-key for a given crypto version.
 /// The HKDF `info` is a labelled, version-bearing context string (RFC 5869 domain
 /// separation, matching the labelled convention in `crypto.rs`), so each crypto version
@@ -45,12 +76,57 @@ fn conversation_key(browse_key: &BrowseKey, crypto_v: u8) -> ConversationKey {
     ConversationKey::new(ck)
 }
 
-/// Encrypt a listing under the browse-key at the current crypto version. Returns the base64
-/// content for the listing event; the caller records [`CRYPTO_V`] in the event's signed tag.
+/// Frame + compress the listing body: `[LISTING_PAYLOAD_V] ++ zstd(plain)`. The frame byte is the
+/// payload version INSIDE the envelope — it discriminates the sealed bytes' meaning without
+/// touching `CRYPTO_V` (a bump there re-keys the share-code framing and the on-disk DM cache).
+/// Level 0 = zstd's own default.
+fn compress_body(plain: &[u8]) -> Result<Vec<u8>, HbError> {
+    let compressed =
+        zstd::stream::encode_all(plain, 0).map_err(|_| HbError::EncryptionFailed)?;
+    let mut framed = Vec::with_capacity(compressed.len() + 1);
+    framed.push(LISTING_PAYLOAD_V);
+    framed.extend_from_slice(&compressed);
+    Ok(framed)
+}
+
+/// Inverse of [`compress_body`]: check the frame byte, then decompress under the hard
+/// [`MAX_DECOMPRESSED_LISTING_BYTES`] ceiling — `Read::take(cap + 1)` stops the decoder at the
+/// cap, so a bomb is refused without ever materializing its full output. An unknown frame byte
+/// (including the v1 raw-JSON body, which begins `{`) is [`HbError::UnsupportedVersion`] carrying
+/// that byte — recognised and refused after the NIP-44 MAC, never mis-decoded, never dual-read. A
+/// DISTINCT error from a corrupt zstd stream's `InvalidEncryptedMessage`, so the version refusal is
+/// observable on its own (without it, raw JSON reaching the decoder fails anyway and hides a
+/// deleted version check).
+fn decompress_body(framed: &[u8]) -> Result<Vec<u8>, HbError> {
+    match framed.first() {
+        Some(&LISTING_PAYLOAD_V) => {}
+        Some(&other) => return Err(HbError::UnsupportedVersion(other)),
+        None => return Err(HbError::InvalidEncryptedMessage),
+    }
+    let decoder = zstd::stream::Decoder::new(Cursor::new(&framed[1..]))
+        .map_err(|_| HbError::InvalidEncryptedMessage)?;
+    let mut capped = decoder.take(MAX_DECOMPRESSED_LISTING_BYTES + 1);
+    let mut out = Vec::new();
+    capped
+        .read_to_end(&mut out)
+        .map_err(|_| HbError::InvalidEncryptedMessage)?;
+    if out.len() as u64 > MAX_DECOMPRESSED_LISTING_BYTES {
+        return Err(HbError::InvalidManifest(format!(
+            "listing body decompressed past the {}-byte decompression cap ({} bytes and counting) — refused as a hostile or broken peer",
+            MAX_DECOMPRESSED_LISTING_BYTES, out.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// Encrypt a listing under the browse-key at the current crypto version. The body is
+/// zstd-compressed and framed with [`LISTING_PAYLOAD_V`] *before* the seal ([`compress_body`]),
+/// so the relay-hosted ciphertext is the compressed shape. Returns the base64 content for the
+/// listing event; the caller records [`CRYPTO_V`] in the event's signed tag.
 pub fn encrypt_listing(browse_key: &BrowseKey, listing_json: &str) -> Result<String, HbError> {
     let ck = conversation_key(browse_key, CRYPTO_V);
-    let bytes =
-        encrypt_to_bytes(&ck, listing_json.as_bytes()).map_err(|e| HbError::Nostr(e.to_string()))?;
+    let framed = compress_body(listing_json.as_bytes())?;
+    let bytes = encrypt_to_bytes(&ck, &framed).map_err(|e| HbError::Nostr(e.to_string()))?;
     Ok(B64.encode(bytes))
 }
 
@@ -99,7 +175,10 @@ pub fn decrypt_with_cek(
 }
 
 /// Decrypt a listing. `crypto_v` is the version read from the listing event's signed tag; an
-/// unknown version is refused before any decryption is attempted.
+/// unknown version is refused before any decryption is attempted. Inside the envelope the body
+/// carries its own [`LISTING_PAYLOAD_V`] frame byte — checked after the NIP-44 MAC, so an
+/// authenticated payload in an unknown format is *recognised and refused*, never mis-decoded —
+/// and must decompress within [`MAX_DECOMPRESSED_LISTING_BYTES`].
 pub fn decrypt_listing(
     browse_key: &BrowseKey,
     crypto_v: u8,
@@ -111,7 +190,17 @@ pub fn decrypt_listing(
         .decode(content_b64.as_bytes())
         .map_err(|_| HbError::InvalidEncryptedMessage)?;
     let plain = decrypt_to_bytes(&ck, &bytes).map_err(|_| HbError::DecryptionFailed)?;
-    String::from_utf8(plain).map_err(|_| HbError::DecryptionFailed)
+    let json = decompress_body(&plain)?;
+    String::from_utf8(json).map_err(|_| HbError::DecryptionFailed)
+}
+
+/// Test-only: seal a body the PRE-bump v1 way (raw JSON behind NIP-44, no frame byte), so the
+/// old-format refusal stays exercisable now that v2 is the only producer shape.
+#[cfg(test)]
+pub(crate) fn seal_v1_raw(browse_key: &BrowseKey, listing_json: &str) -> String {
+    let ck = conversation_key(browse_key, CRYPTO_V);
+    let bytes = encrypt_to_bytes(&ck, listing_json.as_bytes()).expect("a v1 body seals");
+    B64.encode(bytes)
 }
 
 #[cfg(test)]
@@ -229,5 +318,115 @@ mod tests {
         let ct = encrypt_to_bytes(&v1, b"listing").unwrap();
         assert!(decrypt_to_bytes(&v2, &ct).is_err(), "a KDF version bump must domain-separate");
         assert_eq!(decrypt_to_bytes(&v1, &ct).unwrap(), b"listing");
+    }
+
+    // ---------- QURATOR-344 slice B: zstd before the seal ----------
+
+    /// Craft a raw zstd frame that regenerates 513 RLE blocks of 131,071 bytes — 67,239,423
+    /// bytes, ~130 KB over [`MAX_DECOMPRESSED_LISTING_BYTES`] (64 MiB) — from 2,058 bytes
+    /// (~32,000:1). Hand-built from spec RLE blocks (magic, an FHD with no Frame_Content_Size,
+    /// a 128 KiB window descriptor, then RLE block headers carrying Regenerated_Size directly)
+    /// so the bomb is deterministic regardless of compressor versions AND fits the 65,408-byte
+    /// NIP-44 plaintext ceiling: a conforming decoder streams it from a 128 KiB window, so the
+    /// only thing that can stop it is OUR cap. (Frame validated against the reference zstd
+    /// binary: decodes to exactly 67,239,423 bytes.)
+    fn crafted_rle_bomb() -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&0xFD2FB528_u32.to_le_bytes()); // magic
+        f.push(0x00); // FHD: no FCS, not single-segment, no checksum, no dict
+        f.push(0x38); // window descriptor: 1 << (10 + 7) = 128 KiB
+        for i in 0..513 {
+            let last = u32::from(i == 512);
+            // Block header (3 bytes LE): bit0 Last_Block | bits1-2 Type (1 = RLE) | bits3+ Size-1.
+            let header = ((131_072_u32 - 1) << 3) | (1 << 1) | last;
+            f.extend_from_slice(&header.to_le_bytes()[..3]);
+            f.push(0x41); // the one byte each RLE block repeats
+        }
+        f
+    }
+
+    /// Seal arbitrary inner payload bytes exactly the way `encrypt_listing` does, so tests can
+    /// feed hand-crafted (not compressor-produced) bodies through the real decrypt path.
+    fn seal_inner(browse_key: &BrowseKey, framed: &[u8]) -> String {
+        let ck = conversation_key(browse_key, CRYPTO_V);
+        B64.encode(encrypt_to_bytes(&ck, framed).expect("a test body seals"))
+    }
+
+    #[test]
+    fn decompression_bomb_is_refused_at_the_cap() {
+        // P-10 mutation: raise the cap comparison in `decompress_body`
+        // (`out.len() as u64 > MAX_DECOMPRESSED_LISTING_BYTES`) to `u64::MAX` — must red this test.
+        let bk: BrowseKey = rand::random();
+        // The bomb goes behind the real frame byte, exactly as `compress_body` would frame it —
+        // without it the frame check refuses first and the cap is never reached.
+        let mut framed = vec![LISTING_PAYLOAD_V];
+        framed.extend_from_slice(&crafted_rle_bomb());
+        let ct = seal_inner(&bk, &framed);
+        match decrypt_listing(&bk, CRYPTO_V, &ct) {
+            Err(HbError::InvalidManifest(msg)) => {
+                assert!(
+                    msg.contains("decompression cap"),
+                    "refusal must name the cap, not just fail: {msg}"
+                );
+            }
+            other => panic!("expected InvalidManifest at the cap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn precompression_v1_body_is_refused_not_dual_read() {
+        // P-10 mutation: replace `Some(&other) => return Err(HbError::UnsupportedVersion(other)),`
+        // in `decompress_body` with `Some(_) => {}` — must red this test (the raw JSON then reaches
+        // the zstd decoder and fails as InvalidEncryptedMessage, not as the version refusal).
+        let bk: BrowseKey = rand::random();
+        let old = seal_v1_raw(&bk, LISTING); // v1 shape: raw JSON, no frame byte
+        match decrypt_listing(&bk, CRYPTO_V, &old) {
+            // `{` — the first byte of every v1 raw-JSON body — named as the refused version.
+            Err(HbError::UnsupportedVersion(b'{')) => {}
+            other => panic!("expected the v1 body refused by the version check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compressed_body_shrinks_the_wire_payload() {
+        // P-10 mutation: make `encrypt_listing` seal `listing_json.as_bytes()` directly,
+        // bypassing `compress_body` — must red this test (with NIP-44 padding + base64 overhead
+        // the uncompressed body lands WIDER than the plaintext, not narrower).
+        let bk: BrowseKey = rand::random();
+        // 800 near-identical entries ≈ 44 KB — under the 65,408-byte NIP-44 plaintext ceiling.
+        let json = format!(
+            r#"{{"slug":"library","entries":[{}]}}"#,
+            (0..800)
+                .map(|i| {
+                    let d = i % 7;
+                    format!(r#"{{"name":"item {i}","path":"dir{d}/file{i}.mp4"}}"#)
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let ct = encrypt_listing(&bk, &json).unwrap();
+        assert!(
+            ct.len() * 4 < json.len(),
+            "compressed+base64 body must be under a quarter of the plaintext ({} vs {})",
+            ct.len(),
+            json.len()
+        );
+    }
+
+    #[test]
+    fn payload_version_byte_lives_inside_the_envelope() {
+        // The frame byte is the FIRST plaintext byte AFTER the NIP-44 layer — the outer payload
+        // still begins with NIP-44 v2's own version byte. This pins WHERE the discriminant lives,
+        // not just its value (the value is pinned in wire_freeze).
+        // P-10 mutation: move `framed.push(LISTING_PAYLOAD_V)` to AFTER the zstd stream is
+        // appended in `compress_body` — must red this test (the zstd magic, not the frame byte,
+        // would then lead the plaintext).
+        let bk: BrowseKey = rand::random();
+        let ct = encrypt_listing(&bk, LISTING).unwrap();
+        let raw = B64.decode(ct.as_bytes()).expect("valid base64");
+        let inner = decrypt_to_bytes(&conversation_key(&bk, CRYPTO_V), &raw)
+            .expect("the outer envelope is intact");
+        assert_eq!(raw[0], 2, "outer envelope is NIP-44 v2");
+        assert_eq!(inner[0], LISTING_PAYLOAD_V, "the body frame byte precedes the zstd stream");
     }
 }

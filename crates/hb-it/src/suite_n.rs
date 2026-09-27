@@ -118,8 +118,9 @@ async fn n4(ctx: &Ctx) -> Result<()> {
     let id = Identity::generate();
     let key = bk(4);
     let slug = "huge";
-    // A tree whose single encrypted event (~76 KiB) exceeds strfry's 64 KiB cap, but whose
-    // ~57 KiB plaintext still fits NIP-44's 65408-byte limit — so the *relay* cap is what bites.
+    // A tree too large for one event even after zstd (its entries carry incompressible notes —
+    // see `big_listing`): either the relay's 64 KiB cap or NIP-44's 65408-byte plaintext limit
+    // refuses it, and the assert below is robust to whichever binds.
     let big = big_listing(950);
 
     let client = ctx.connect(&id).await?;
@@ -224,11 +225,33 @@ async fn n6(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// A listing payload with `n` padded folder entries — at n=950 the plaintext is ≈54 KiB (within
-/// NIP-44's 65408-byte cap) but its encrypted event is ≈72 KiB, over strfry's 64 KiB event cap.
+/// A listing payload with `n` padded folder entries, each with an incompressible note — at n=950
+/// it cannot be sealed into one event even after zstd, so N4 must split it.
 fn big_listing(n: usize) -> String {
+    // QURATOR-344: listings are zstd-compressed before the seal, so a repetitive fixture now fits
+    // ONE event and N4's "the unsplit listing is unpublishable" premise would be false by design.
+    // Each entry carries a deterministic, incompressible `note` (xorshift over a 64-char alphabet)
+    // so the compressed body still exceeds the relay cap and the split is still what makes it fit.
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut noise = |len: usize| -> String {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ALPHABET[(state & 63) as usize] as char
+            })
+            .collect()
+    };
     let entries: Vec<serde_json::Value> = (0..n)
-        .map(|i| serde_json::json!({ "name": format!("folder-{i:05}-padding-padding-xx"), "size": 1_000_000 + i }))
+        .map(|i| {
+            serde_json::json!({
+                "name": format!("folder-{i:05}-padding-padding-xx"),
+                "size": 1_000_000 + i,
+                "note": noise(96),
+            })
+        })
         .collect();
     serde_json::json!({ "slug": "huge", "content_types": ["video"], "entries": entries }).to_string()
 }

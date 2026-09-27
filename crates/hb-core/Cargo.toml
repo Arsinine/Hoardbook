@@ -42,5 +42,12 @@ chacha20poly1305  = "0.10"
 hkdf              = "0.12"
 base64            = "0.22"
 
+# --- QURATOR-344 slice B (P1 of QURATOR-341): zstd BEFORE the NIP-44 seal, so the relay-hosted
+#     listing/manifest body is the compressed shape (measured: 948 KB → 9 KB on a 10k-file chain).
+#     default-features off: the `zstd::stream` encode/decode surface needs no feature, and the C
+#     backend builds on Windows via zstd-sys/cc — the same cc path secp256k1-sys already proves
+#     out. (ruzstd was rejected: decode-only, and this crate must compress too.) ---
+zstd              = { version = "0.14", default-features = false }
+
 [dev-dependencies]
 tokio = { workspace = true }

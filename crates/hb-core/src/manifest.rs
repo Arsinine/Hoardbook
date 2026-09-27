@@ -49,10 +49,14 @@ use crate::version::{check_crypto, CRYPTO_V};
 
 /// Manifest-envelope schema version. Frozen at launch (see `wire_freeze`): an unknown value is
 /// *recognised and refused*, never mis-decoded — the same forward-compat contract `SCHEMA_V` /
-/// `CRYPTO_V` uphold. **v2** (M16 W4 residual) carries a *chunked* body (`ciphertexts`, split at the
-/// per-part budget) so a `.hbmanifest` can hold a listing larger than one NIP-44 event; **v1** was the
-/// pre-release single-`ciphertext` shape, superseded before any producer shipped (export landed at v2).
-pub const MANIFEST_V: u8 = 2;
+/// `CRYPTO_V` uphold. **v3** (QURATOR-344 slice B) seals a **zstd-compressed** body: each
+/// `ciphertexts` element is `[LISTING_PAYLOAD_V] ++ zstd(part)` inside the NIP-44 envelope (see
+/// `listing::LISTING_PAYLOAD_V`), so the transport-hosted bytes are the compressed shape. **v2**
+/// (M16 W4 residual) was the same *chunked* body (`ciphertexts`, split at the per-part budget)
+/// with **raw** JSON parts; **v1** was the pre-release single-`ciphertext` shape, superseded
+/// before any producer shipped (export landed at v2). No v2 envelope shipped to a user at the
+/// bump, so a v2 is not dual-read — its parts die at the body version check on decrypt.
+pub const MANIFEST_V: u8 = 3;
 
 /// The domain tag prefixed onto the `author_sig` pre-image. The BIP-340 message is the SHA-256 of
 /// `SIG_DOMAIN ‖ manifest_v ‖ created_at(8 LE) ‖ len(slug)‖slug ‖ len(fp)‖fp ‖ len(sha)‖sha` — a
@@ -379,6 +383,27 @@ mod tests {
         env.manifest_v = MANIFEST_V + 1;
         assert!(matches!(env.verify_integrity(), Err(HbError::UnsupportedVersion(v)) if v == MANIFEST_V + 1));
         assert!(matches!(env.verify_author(&id.public_key()), Err(HbError::UnsupportedVersion(_))));
+    }
+
+    #[test]
+    fn v2_envelope_parts_are_refused_at_the_body_check_not_dual_read() {
+        // P-10 mutation: replace `Some(&other) => return Err(HbError::UnsupportedVersion(other)),`
+        // in `listing::decompress_body` with `Some(_) => {}` — must red this test (the pre-zstd
+        // part then reaches the zstd decoder and fails as garbage, not as the version refusal).
+        let (_id, bk, mut env) = built();
+        // Rewrite as a pre-bump v2 envelope: the same field set, but the part sealed the v1 way
+        // (raw JSON behind NIP-44, no frame byte). Integrity still passes — its forward-compat
+        // contract refuses only 0 / future versions — so the BODY version check is what
+        // recognises and refuses v2, at decrypt.
+        env.manifest_v = 2;
+        env.ciphertexts =
+            vec![crate::listing::seal_v1_raw(&bk, r#"{"slug":"criterion","entries":[]}"#)];
+        env.manifest_sha256 = sha256_parts(&env.ciphertexts);
+        assert!(
+            env.verify_integrity().is_ok(),
+            "a v2 envelope passes integrity by the documented forward-compat contract"
+        );
+        assert!(matches!(env.decrypt(&bk), Err(HbError::UnsupportedVersion(b'{'))));
     }
 
     #[test]
