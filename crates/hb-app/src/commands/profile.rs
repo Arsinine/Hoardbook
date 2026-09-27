@@ -68,7 +68,7 @@ pub(crate) fn teaser_from_profile(store: &DataStore, profile: &Profile) -> Tease
 /// **published PUBLIC** collection's listing. Same enumeration pattern as
 /// [`compute_content_types`]: published (`is_published`) public (`Visibility::Public`) drafts.
 /// Private collections never count, so the teaser leaks nothing about private holdings.
-fn total_published_public_bytes(store: &DataStore) -> u64 {
+pub(crate) fn total_published_public_bytes(store: &DataStore) -> u64 {
     let mut total = 0u64;
     for slug in store.list_collection_slugs().unwrap_or_default() {
         if store.is_published(&slug) {
@@ -238,7 +238,7 @@ mod tests {
             social_links: vec![],
             willing_to: vec![],
             content_types,
-            picture: None, hide_in_rosters: false,
+            picture: None, hide_in_rosters: false, total_bytes: 0,
             updated: chrono::Utc::now(),
         }
     }

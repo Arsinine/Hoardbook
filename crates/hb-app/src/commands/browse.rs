@@ -119,6 +119,8 @@ fn teaser_to_profile(t: Teaser) -> hb_core::types::Profile {
         // QURATOR-142 — the roster opt-out survives teaser → profile → CachedPeer.profile; the
         // Topics roster reads it to drop the chat hand-off (internal-use-only, never rendered).
         hide_in_rosters: t.hide_in_rosters,
+        // v5 (QURATOR-345): the peer's publish-computed total, for the size rule.
+        total_bytes: t.total_bytes,
         since: None,
         est_size: None,
         languages: vec![],
@@ -2973,7 +2975,7 @@ mod tests {
                 social_links: vec![],
                 willing_to: vec![],
                 content_types: vec![],
-                picture: None, hide_in_rosters: false,
+                picture: None, hide_in_rosters: false, total_bytes: 0,
                 updated: chrono::Utc::now(),
             }
         }

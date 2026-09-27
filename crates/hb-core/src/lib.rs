@@ -24,6 +24,7 @@ pub mod manifest;
 pub mod priv_listing;
 pub mod ratelimit;
 pub mod sharecode;
+pub mod size_rule;
 pub mod snapshot;
 pub mod ticket;
 pub mod title_norm;

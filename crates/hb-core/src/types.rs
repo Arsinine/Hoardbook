@@ -65,6 +65,14 @@ pub struct Profile {
     /// instead (fail-closed, the opposite direction); see the roster read in `topics/+page.svelte`.
     #[serde(default)]
     pub hide_in_rosters: bool,
+    /// v5 (QURATOR-345) — a PEER's `Teaser::total_bytes`, threaded teaser → profile by
+    /// `hb_app::commands::browse::teaser_to_profile` so the size rule (`hb_core::size_rule`) can
+    /// compare against it. Never set on the user's OWN profile (their own total is computed at
+    /// publish, `teaser_from_profile`). Serde-defaults to 0 — an unknown total reads as 0, which
+    /// the size rule treats as the smallest possible author, so a stale cached peer is never
+    /// wrongly LOCKED; the answerer re-checks the asker's live teaser regardless.
+    #[serde(default)]
+    pub total_bytes: u64,
     pub updated: DateTime<Utc>,
 }
 
@@ -331,7 +339,7 @@ mod tests {
             willing_to: vec![],
             content_types: vec![],
             picture: None,
-            hide_in_rosters: false,
+            hide_in_rosters: false, total_bytes: 0,
             updated: chrono::Utc::now(),
         };
         let json = serde_json::to_string(&profile).unwrap();

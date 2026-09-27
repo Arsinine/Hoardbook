@@ -3531,7 +3531,7 @@ mod tests {
                 willing_to: vec![],
                 content_types: vec![],
                 picture: None,
-                hide_in_rosters: false,
+                hide_in_rosters: false, total_bytes: 0,
                 updated: chrono::Utc::now(),
             }),
             collections: vec![PeerCollection {
