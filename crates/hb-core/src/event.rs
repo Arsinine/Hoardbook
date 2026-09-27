@@ -20,9 +20,11 @@ pub(crate) const TAG_SCHEMA: &str = "hb-v";
 pub(crate) const TAG_CRYPTO: &str = "hb-cv";
 const TEASER_D: &str = "hoardbook-teaser";
 
-/// The public teaser — pseudonymous profile fields. There is **no `contact_hint`**: that
-/// field re-links the `npub` to a real handle, so it is encrypted and share-code-gated,
-/// never placed in this public event (spec §The Profile).
+/// The public teaser — pseudonymous profile fields. v5 (QURATOR-344): `contact_hint` now rides
+/// it deliberately (owner ruling rounds 10–11 — the linked-handle risk is answered by copy, not
+/// crypto; spec §The Profile), and `total_bytes` carries the publish-computed size of the
+/// published **public** collections for the v5 size-gated read rule. `email`/`location` are
+/// still never published.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Teaser {
     pub display_name: String,
@@ -49,6 +51,21 @@ pub struct Teaser {
     /// read in `topics/+page.svelte`. Internal-use-only: never rendered anywhere.
     #[serde(default)]
     pub hide_in_rosters: bool,
+    /// v5 (QURATOR-344) — computed at publish as the sum of file-leaf sizes over the publisher's
+    /// published **public** collections' listings (private collections never count; see
+    /// `hb_core::listing_size`), NEVER user-typed — so the number and the listing cannot drift.
+    /// Optional on the wire with `#[serde(default)]`: **absent means 0**, and under the v5 size
+    /// rule a 0 total can read only zero-size peers — absence grants nothing, so there is no
+    /// downgrade to exploit and no `SCHEMA_V` bump (the §6 additive-optional-field rule; both
+    /// wire shapes — present and absent — are pinned in the tests below).
+    #[serde(default)]
+    pub total_bytes: u64,
+    /// v5 (QURATOR-344, owner ruling rounds 10–11) — the contact hint rides the public teaser.
+    /// REVERSES the old N1/AB10 rule this struct's docs used to state; the linked-handle risk is
+    /// answered by copy (the profile UI's hint text carries the owner's reminder), not crypto.
+    /// `email`/`location` stay profile-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_hint: Option<String>,
 }
 
 /// Hard cap on [`Teaser::picture`]'s encoded size (the whole `data:` URI string, in bytes) — keeps
@@ -233,6 +250,8 @@ mod tests {
             content_types: vec!["video".into()],
             picture: None,
             hide_in_rosters: false,
+            total_bytes: 0,
+            contact_hint: None,
         }
     }
 
@@ -293,13 +312,51 @@ mod tests {
     }
 
     #[test]
-    fn teaser_omits_contact_hint() {
-        // The public teaser event must never carry the deanonymizing contact_hint (N1/AB10).
+    fn teaser_carries_contact_hint() {
+        // v5 (QURATOR-344): the contact hint rides the public teaser (owner ruling rounds 10–11;
+        // the linked-handle risk is answered by COPY, not crypto). Replaces the old
+        // `teaser_omits_contact_hint` (N1/AB10) — pin that it IS carried, on the wire and through
+        // the round-trip. `email`/`location` remain absent by construction: the Teaser struct has
+        // no such fields.
+        //
+        // P-10 mutation: in parse_teaser, add `teaser.contact_hint = None;` beside the picture
+        // sanitize — the round-trip assert below must RED (parsed None ≠ sent Some).
         let id = Identity::generate();
-        let ev = build_teaser(&id, &teaser(), true).unwrap();
-        assert!(!ev.content.contains("contact_hint"));
-        // And the struct has no such field to leak through.
-        assert!(!serde_json::to_string(&teaser()).unwrap().contains("contact_hint"));
+        let mut t = teaser();
+        t.contact_hint = Some("u/archivebox_prime on Reddit".into());
+        let ev = build_teaser(&id, &t, true).unwrap();
+        assert!(ev.content.contains("contact_hint"), "the hint rides the signed body");
+        assert!(ev.content.contains("u/archivebox_prime on Reddit"));
+        assert_eq!(parse_teaser(&ev).unwrap(), t);
+    }
+
+    #[test]
+    fn teaser_wire_pins_total_bytes_both_shapes() {
+        // §6 wire rule (QURATOR-344): `total_bytes` is an OPTIONAL field, so its absence must not
+        // be exploitable as a downgrade. Absent ⇒ serde-default 0, and a 0 total can read only
+        // zero-size peers under the v5 size rule — a stripped/old teaser gains nothing by
+        // omitting it, so no SCHEMA_V bump. BOTH shapes pinned (present + absent).
+        //
+        // P-10 mutations (orchestrator applies; each must red, revert after):
+        //   (a) remove `#[serde(default)]` from `Teaser::total_bytes` — the absent-shape half
+        //       below must RED (missing-field error, unwrap panics);
+        //   (b) in parse_teaser, add `teaser.total_bytes = 0;` — the round-trip assert must RED.
+        let id = Identity::generate();
+        let mut t = teaser();
+        t.total_bytes = 12_884_901_888; // the spec's own example magnitude (≈ 1.2 × 1024³ GB)
+        t.contact_hint = Some("u/archivebox_prime on Reddit".into());
+        let ev = build_teaser(&id, &t, true).unwrap();
+        assert!(ev.content.contains("total_bytes"), "present shape is on the wire");
+        assert_eq!(parse_teaser(&ev).unwrap(), t, "present shape round-trips");
+
+        // Absent shape: a body from BEFORE the field existed (or stripped in transit) still
+        // parses — total_bytes serde-defaults to 0, contact_hint to None.
+        let legacy: Teaser = serde_json::from_str(
+            r#"{"display_name":"old","bio":"","tags":[],"content_types":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.total_bytes, 0, "absent total_bytes ⇒ 0 — absence grants nothing");
+        assert_eq!(legacy.contact_hint, None, "absent contact_hint ⇒ None");
     }
 
     #[test]

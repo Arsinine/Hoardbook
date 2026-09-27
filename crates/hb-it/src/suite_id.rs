@@ -21,6 +21,8 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
 
 fn teaser() -> Teaser {
     Teaser {
+        total_bytes: 0,
+        contact_hint: None,
         display_name: "signer".into(),
         bio: String::new(),
         tags: vec!["hbid".into()],

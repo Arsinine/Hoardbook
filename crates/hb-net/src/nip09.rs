@@ -28,6 +28,8 @@ mod tests {
         let teaser = build_teaser(
             &id,
             &Teaser {
+                total_bytes: 0,
+                contact_hint: None,
                 display_name: "x".into(),
                 bio: String::new(),
                 tags: vec![],

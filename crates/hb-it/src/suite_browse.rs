@@ -49,6 +49,8 @@ fn bk(seed: u8) -> [u8; 32] {
 
 fn teaser(name: &str, tags: Vec<String>) -> Teaser {
     Teaser {
+        total_bytes: 0,
+        contact_hint: None,
         display_name: name.into(),
         bio: "hoards".into(),
         tags,

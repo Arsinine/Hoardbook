@@ -1465,6 +1465,8 @@ mod tests {
         let junk = hb_core::event::build_teaser(
             &author,
             &hb_core::event::Teaser {
+                total_bytes: 0,
+                contact_hint: None,
                 display_name: "junk".into(),
                 bio: String::new(),
                 tags: vec![],

@@ -29,6 +29,8 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
 
 fn teaser() -> Teaser {
     Teaser {
+        total_bytes: 0,
+        contact_hint: None,
         display_name: "archivebox_prime".into(),
         bio: "90s anime, VHS rips".into(),
         tags: vec!["anime".into(), "vhs".into()],

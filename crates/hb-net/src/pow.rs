@@ -62,6 +62,8 @@ mod tests {
     fn teaser_event() -> (Identity, Event) {
         let id = Identity::generate();
         let teaser = Teaser {
+            total_bytes: 0,
+            contact_hint: None,
             display_name: "miner".into(),
             bio: String::new(),
             tags: vec!["anime".into()],

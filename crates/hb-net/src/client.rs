@@ -766,6 +766,8 @@ mod tests {
         build_teaser(
             &id,
             &Teaser {
+                total_bytes: 0,
+                contact_hint: None,
                 display_name: name.into(),
                 bio: String::new(),
                 tags: vec!["anime".into()],

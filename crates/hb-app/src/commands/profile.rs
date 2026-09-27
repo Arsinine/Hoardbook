@@ -1,6 +1,7 @@
 //! Profile: a local draft (`Profile`) whose **public** fields are published as a NIP-01 **teaser**
-//! (`hb-core::event::build_teaser`) to the relays. The teaser deliberately omits `contact_hint`
-//! and other private fields — only `display_name` / `bio` / `tags` / `content_types` are public.
+//! (`hb-core::event::build_teaser`) to the relays. v5 (QURATOR-344): the teaser carries
+//! `contact_hint` and a publish-computed `total_bytes`; `email`/`location` and the other private
+//! fields stay out.
 
 use hb_core::event::{build_teaser, Teaser};
 use hb_core::types::Profile;
@@ -50,10 +51,35 @@ pub(crate) fn teaser_from_profile(store: &DataStore, profile: &Profile) -> Tease
         tags,
         content_types: profile.content_types.clone(),
         picture: profile.picture.clone(),
+        // v5 (QURATOR-344): COMPUTED at publish from the published public collections' listings —
+        // never user-typed, so the number cannot drift from the listing (one function, called
+        // here). Private collections never count.
+        total_bytes: total_published_public_bytes(store),
+        // v5 (QURATOR-344): the hint rides the public teaser now (owner ruling rounds 10–11 —
+        // the linked-handle risk is answered by the UI's copy, not crypto).
+        contact_hint: profile.contact_hint.clone(),
         // QURATOR-142: input value is always OVERWRITTEN by build_teaser (derived there from the
         // `discoverable` param — the single source of truth); set for literal completeness only.
         hide_in_rosters: false,
     }
+}
+
+/// v5 (QURATOR-344): the teaser's `total_bytes` — the sum of file-leaf sizes over every
+/// **published PUBLIC** collection's listing. Same enumeration pattern as
+/// [`compute_content_types`]: published (`is_published`) public (`Visibility::Public`) drafts.
+/// Private collections never count, so the teaser leaks nothing about private holdings.
+fn total_published_public_bytes(store: &DataStore) -> u64 {
+    let mut total = 0u64;
+    for slug in store.list_collection_slugs().unwrap_or_default() {
+        if store.is_published(&slug) {
+            if let Ok(Some(col)) = store.load_collection_draft(&slug) {
+                if col.visibility == hb_core::Visibility::Public {
+                    total += hb_core::listing_size::sum_listing_bytes(&col.listing);
+                }
+            }
+        }
+    }
+    total
 }
 
 #[tauri::command]
@@ -246,30 +272,108 @@ mod tests {
     }
 
     #[test]
-    fn teaser_omits_private_fields() {
-        // The published teaser must never carry contact_hint / email / location.
+    fn teaser_carries_contact_hint_but_not_email_or_location() {
+        // v5 (QURATOR-344): contact_hint rides the teaser now (owner ruling rounds 10–11 — copy,
+        // not crypto). email/location are still private: the Teaser struct has no such fields.
         let (_dir, store) = test_store();
         let profile = make_profile("Tester", vec!["video".into()]);
         let teaser = teaser_from_profile(&store, &profile);
         let json = serde_json::to_string(&teaser).unwrap();
-        assert!(!json.contains("contact_hint"), "teaser must not leak contact_hint");
-        assert!(!json.contains("secret@example.com"));
+        assert!(json.contains("contact_hint"), "teaser now carries contact_hint (v5)");
+        assert!(json.contains("secret@example.com"));
+        assert!(!json.contains("email"), "email stays out");
+        assert!(!json.contains("location"), "location stays out");
         assert_eq!(teaser.display_name, "Tester");
         assert_eq!(teaser.tags, vec!["anime".to_string()]);
+        // No collections in the store ⇒ the computed total is 0.
+        assert_eq!(teaser.total_bytes, 0);
     }
 
     #[test]
-    fn teaser_from_profile_not_discoverable_emits_no_hashtags_and_still_omits_private_fields() {
-        // devtest #5: build_teaser(.., false) at the teaser_from_profile seam — no `t` hashtags, and
-        // the private-field omission (contact_hint / email / location) still holds regardless.
+    fn teaser_from_profile_not_discoverable_still_carries_contact_hint_no_email_location() {
+        // devtest #5: build_teaser(.., false) at the teaser_from_profile seam — no `t` hashtags,
+        // regardless. v5 (QURATOR-344): contact_hint rides the SIGNED BODY even when not
+        // discoverable (npub lookup + share-code browse read the body); email/location stay out.
         let (_dir, store) = test_store();
         let profile = make_profile("Tester", vec!["video".into()]);
         let teaser = teaser_from_profile(&store, &profile);
         let id = hb_core::Identity::generate();
         let event = build_teaser(&id, &teaser, false).unwrap();
         assert_eq!(event.tags.hashtags().count(), 0, "no hashtags when not discoverable");
-        assert!(!event.content.contains("contact_hint"));
-        assert!(!event.content.contains("secret@example.com"));
+        assert!(event.content.contains("contact_hint"), "v5: the hint rides the body");
+        assert!(event.content.contains("secret@example.com"));
+        assert!(!event.content.contains("location"), "location stays out");
+    }
+
+    #[test]
+    fn teaser_from_profile_total_bytes_sums_published_public_listings_only() {
+        // v5 (QURATOR-344): total_bytes is COMPUTED at publish from the published PUBLIC
+        // collections' listings — never user-typed, so the number and the listing cannot drift.
+        // A published PRIVATE collection contributes nothing (the teaser leaks nothing about
+        // private holdings), and a folder's own size is ignored (file leaves only).
+        //
+        // P-10 mutations (orchestrator applies; each must red this test, revert after):
+        //   (a) in teaser_from_profile, replace `total_published_public_bytes(store)` with `0`;
+        //   (b) in total_published_public_bytes, drop the `col.visibility == Visibility::Public`
+        //       check (accept every collection) — the Private fixture must then inflate the total.
+        let (_dir, store) = test_store();
+        let mut profile = make_profile("Tester", vec!["video".into()]);
+        profile.contact_hint = Some("hint rides public (v5)".into());
+
+        let col = |slug: &str, visibility: Visibility, listing: Vec<hb_core::DirectoryItem>| Collection {
+            slug: slug.into(),
+            path_alias: slug.into(),
+            description: None,
+            item_count: 0,
+            est_size: None,
+            content_types: vec![],
+            tags: vec![],
+            languages: vec![],
+            visibility,
+            sorted: false,
+            last_updated: chrono::Utc::now(),
+            listing,
+        };
+        let file = |name: &str, size: &str| hb_core::DirectoryItem {
+            name: name.into(),
+            item_type: hb_core::ItemType::File,
+            size: Some(size.into()),
+            format: None,
+            year: None,
+            tags: vec![],
+            note: None,
+            children: vec![],
+        };
+        // Public: 1.5 KB + 1023 B nested under a folder (the folder's own "9 GB" is ignored).
+        store
+            .save_collection_draft(&col(
+                "pub",
+                Visibility::Public,
+                vec![
+                    file("a.txt", "1.5 KB"),
+                    hb_core::DirectoryItem {
+                        name: "movies".into(),
+                        item_type: hb_core::ItemType::Folder,
+                        size: Some("9 GB".into()),
+                        format: None,
+                        year: None,
+                        tags: vec![],
+                        note: None,
+                        children: vec![file("b.mkv", "1023 B")],
+                    },
+                ],
+            ))
+            .unwrap();
+        store.save_published("pub", "{}").unwrap();
+        // Private and published — must NOT count.
+        store
+            .save_collection_draft(&col("priv", Visibility::Private, vec![file("x", "2.0 GB")]))
+            .unwrap();
+        store.save_published("priv", "{}").unwrap();
+
+        let teaser = teaser_from_profile(&store, &profile);
+        assert_eq!(teaser.total_bytes, 1536 + 1023, "public only, file leaves only");
+        assert_eq!(teaser.contact_hint.as_deref(), Some("hint rides public (v5)"));
     }
 
     #[test]

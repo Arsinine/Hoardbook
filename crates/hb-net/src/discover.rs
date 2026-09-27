@@ -398,6 +398,8 @@ mod tests {
 
     fn teaser_with(tags: &[&str], cts: &[&str]) -> Teaser {
         Teaser {
+            total_bytes: 0,
+            contact_hint: None,
             display_name: "archivebox".into(),
             bio: "hoards".into(),
             tags: tags.iter().map(|s| s.to_string()).collect(),
@@ -753,6 +755,8 @@ mod tests {
         let mk = |name: &str, bio: &str, ts: u64| SearchHit {
             npub: format!("npub-{name}"),
             teaser: Teaser {
+                total_bytes: 0,
+                contact_hint: None,
                 display_name: name.into(),
                 bio: bio.into(),
                 tags: vec!["anime".into()],
@@ -775,6 +779,8 @@ mod tests {
         SearchHit {
             npub: format!("npub1{name}"),
             teaser: Teaser {
+                total_bytes: 0,
+                contact_hint: None,
                 display_name: name.into(),
                 bio: bio.into(),
                 tags: vec![],
@@ -1018,6 +1024,8 @@ mod tests {
         SearchHit {
             npub: format!("npub1{name}"),
             teaser: Teaser {
+                total_bytes: 0,
+                contact_hint: None,
                 display_name: name.into(),
                 bio: String::new(),
                 tags: tags.iter().map(|t| t.to_string()).collect(),

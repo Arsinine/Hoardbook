@@ -19,6 +19,7 @@ pub mod event;
 pub mod fingerprint;
 pub mod identity;
 pub mod listing;
+pub mod listing_size;
 pub mod manifest;
 pub mod priv_listing;
 pub mod ratelimit;

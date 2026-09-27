@@ -187,6 +187,8 @@ fn big_listing(slug: &str, n: usize) -> String {
 /// A teaser with a display name + tags (matches `hb-it/suite_browse::teaser`).
 fn teaser(name: &str, tags: Vec<String>) -> Teaser {
     Teaser {
+        total_bytes: 0,
+        contact_hint: None,
         display_name: name.into(),
         bio: "hoards".into(),
         tags,

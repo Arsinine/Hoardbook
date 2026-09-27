@@ -122,7 +122,8 @@ fn teaser_to_profile(t: Teaser) -> hb_core::types::Profile {
         since: None,
         est_size: None,
         languages: vec![],
-        contact_hint: None,
+        // v5 (QURATOR-344): the hint rides the public teaser now — map it through.
+        contact_hint: t.contact_hint,
         email: None,
         location: None,
         social_links: vec![],
@@ -1326,6 +1327,8 @@ mod tests {
         let hit = SearchHit {
             npub: id.npub(),
             teaser: Teaser {
+                total_bytes: 0,
+                contact_hint: None,
                 display_name: "archivebox".into(),
                 bio: "90s anime".into(),
                 tags: vec!["anime".into()],
@@ -1349,7 +1352,7 @@ mod tests {
         let id = Identity::generate();
         let hit = SearchHit {
             npub: id.npub(),
-            teaser: Teaser { display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None, hide_in_rosters: false },
+            teaser: Teaser { total_bytes: 0, contact_hint: None, display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None, hide_in_rosters: false },
             created_at: nostr::Timestamp::from(0),
         };
         assert_eq!(hit_to_card(hit).bio, None, "a blank bio renders as None, not an empty string");
@@ -1358,7 +1361,7 @@ mod tests {
     fn hit_for(npub: String) -> SearchHit {
         SearchHit {
             npub,
-            teaser: Teaser { display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None, hide_in_rosters: false },
+            teaser: Teaser { total_bytes: 0, contact_hint: None, display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None, hide_in_rosters: false },
             created_at: nostr::Timestamp::from(0),
         }
     }
@@ -1829,6 +1832,8 @@ mod tests {
     fn reject_profileless_ok_when_peer_has_profile() {
         let mut peer = stub_peer("hb1_test", None);
         peer.profile = Some(teaser_to_profile(Teaser {
+            total_bytes: 0,
+            contact_hint: None,
             display_name: "archivebox".into(),
             bio: String::new(),
             tags: vec![],
@@ -2013,6 +2018,8 @@ mod tests {
     fn stub_peer_with_profile(npub: &str, display_name: &str) -> CachedPeer {
         let mut peer = stub_peer(npub, Some(display_name));
         peer.profile = Some(teaser_to_profile(Teaser {
+            total_bytes: 0,
+            contact_hint: None,
             display_name: display_name.into(),
             bio: String::new(),
             tags: vec![],

@@ -777,7 +777,7 @@
 				</div>
 
 				<div class="field">
-					<label class="field-label">Contact hint<HintMarker label="Contact hint" text="How people reach you outside Hoardbook, like a Discord or Matrix handle or an email. It stays out of your public profile. If you ever lose your key, it's how your contacts find you again." /></label>
+					<label class="field-label">Contact hint<HintMarker label="Contact hint" text="How people reach you outside Hoardbook, like a Discord or Matrix handle or an email. It's shown on your public profile, so use a channel that isn't linked to your real name, or accept that it is. If you ever lose your key, it's how your contacts find you again." /></label>
 					<input class="hb-input hb-input-mono" type="text" placeholder="you@example.com · @you:matrix.org" bind:value={form.contact_hint} />
 				</div>
 
