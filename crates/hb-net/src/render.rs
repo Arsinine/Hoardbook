@@ -294,9 +294,29 @@ mod tests {
     use super::*;
     use crate::split::{restitch_listing, split_listing};
 
+    /// Deterministic per-index noise over a 64-char alphabet. Listings are zstd-compressed before
+    /// the seal and split budgets now measure the SEALED size (QURATOR-344), so a repetitive
+    /// fixture would compress under these tiny budgets and never split. The noise keeps each
+    /// entry's sealed cost close to its plaintext cost; deterministic so restitch stays byte-exact.
+    fn noise_for(i: usize) -> String {
+        const ALPHABET: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15 ^ (i as u64 + 1).wrapping_mul(0x2545_F491_4F6C_DD1D);
+        (0..40)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ALPHABET[(state & 63) as usize] as char
+            })
+            .collect()
+    }
+
     fn listing(n: usize) -> String {
         let entries: Vec<Value> = (0..n)
-            .map(|i| serde_json::json!({ "name": format!("folder-{i:03}"), "size": 1000 + i }))
+            .map(|i| {
+                serde_json::json!({ "name": format!("folder-{i:03}-{}", noise_for(i)), "size": 1000 + i })
+            })
             .collect();
         serde_json::json!({ "slug": "criterion", "content_types": ["video"], "entries": entries })
             .to_string()
@@ -309,11 +329,14 @@ mod tests {
     // NOTE (M13): the split budgets below were bumped from the v1-era 256/200 — the v2 index
     // carries a per-part sha256 slot table, so at those budgets the index itself no longer fits
     // the budget at all. Per the tiny-budget rule: adjust the TEST budget, never the protocol.
-    // 500 still forces listing(30) into ≥3 content parts (the withheld-middle case needs that).
+    // 500 still forced listing(30) into ≥3 content parts (the withheld-middle case needs that).
+    // QURATOR-344: budgets now measure the SEALED (compressed + NIP-44 + base64) size, whose
+    // floor is higher — the bare index alone seals to ~516 bytes — so the budget is 900, and
+    // `listing` entries carry per-index noise so they don't compress away.
 
     #[test]
     fn full_listing_renders_complete_tree() {
-        let parts = split_listing("criterion", &listing(30), 500).unwrap();
+        let parts = split_listing("criterion", &listing(30), 900).unwrap();
         let r = render_listing(&payloads(&parts)).unwrap();
         assert!(r.complete(), "all parts present → complete");
         assert_eq!(r.entries.len(), 30, "every folder present");
@@ -323,7 +346,7 @@ mod tests {
 
     #[test]
     fn missing_parts_render_k_of_n_available() {
-        let parts = split_listing("criterion", &listing(30), 500).unwrap();
+        let parts = split_listing("criterion", &listing(30), 900).unwrap();
         let mut p = payloads(&parts);
         p.pop(); // withhold the last content part
         let r = render_listing(&p).unwrap();
@@ -337,7 +360,7 @@ mod tests {
     fn withheld_folder_is_marked_unavailable_not_dropped() {
         // Drop a *middle* part — its index must appear in `missing` (so the UI can name it),
         // and the surrounding parts must still render.
-        let parts = split_listing("criterion", &listing(30), 500).unwrap();
+        let parts = split_listing("criterion", &listing(30), 900).unwrap();
         let content_count = parts.len() - 1; // minus the index
         assert!(content_count >= 3, "need several parts for a meaningful middle drop");
         let mut p = payloads(&parts);
@@ -358,7 +381,7 @@ mod tests {
 
     #[test]
     fn duplicate_part_rejected() {
-        let parts = split_listing("criterion", &listing(30), 500).unwrap();
+        let parts = split_listing("criterion", &listing(30), 900).unwrap();
         let mut p = payloads(&parts);
         let last = p.len() - 1;
         p[last] = p[1].clone(); // duplicate part 0, drop the real last
@@ -473,7 +496,7 @@ mod tests {
     /// unchanged in `v1_foreign_part_rejected_with_reason` below.
     #[test]
     fn unreferenced_part_ignored_never_grafted() {
-        let parts = split_listing("criterion", &listing(30), 500).unwrap();
+        let parts = split_listing("criterion", &listing(30), 900).unwrap();
         let mut p = payloads(&parts);
         p.push(serde_json::json!({ "entries": [], "mount": [], "part": 999, "parts_v": 2 }).to_string());
         let r = render_listing(&p).unwrap();
@@ -567,8 +590,9 @@ mod tests {
     /// rule": every part grafted under it must also read as unavailable, not silently vanish from
     /// the count.
     fn deep_listing(n: usize) -> String {
-        let children: Vec<Value> =
-            (0..n).map(|i| serde_json::json!({ "name": format!("file-{i:03}") })).collect();
+        let children: Vec<Value> = (0..n)
+            .map(|i| serde_json::json!({ "name": format!("file-{i:03}-{}", noise_for(1000 + i)) }))
+            .collect();
         serde_json::json!({
             "slug": "deep", "content_types": ["video"],
             "entries": [ { "name": "Movies", "children": children } ],

@@ -845,9 +845,11 @@ pub async fn build_probe_input(
 mod tests {
     use super::*;
 
-    /// The truncation threshold is a BYTE budget (40 KB), not an entry count. A listing whose JSON
-    /// exceeds it truncates; one under it does not. This is the property E1's seed collection relies on:
-    /// generate enough small files that the serialized listing exceeds 40 KB.
+    /// The truncation threshold is a BYTE budget (40 KB), not an entry count — and it measures
+    /// the SEALED, base64 NIP-44 event content (QURATOR-CMP lane), not the plaintext JSON. The
+    /// NIP-44 path zstd-compresses before sealing, so a compressible listing (repetitive names,
+    /// no notes) seals well under the cap no matter how many entries it has. The seed collection
+    /// must carry incompressible per-file noise (or enough files) for truncation to engage.
     #[test]
     fn truncation_threshold_is_a_byte_budget_not_an_entry_count() {
         // A listing just under the budget does NOT truncate.
@@ -856,10 +858,23 @@ mod tests {
         let t = hb_net::truncate_listing(small, LISTING_MAX_BYTES).unwrap();
         assert!(!t.truncated, "a listing under the byte budget does not truncate");
 
-        // A listing OVER the budget DOES truncate. Generate ~600 entries to exceed 40 KB.
+        // A listing OVER the (sealed) budget DOES truncate. ~600 entries of 96-char incompressible
+        // noise notes — compressible names alone compress to a few hundred sealed bytes and would
+        // never truncate.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        const NOISE_ALPHABET: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let entries: Vec<serde_json::Value> = (0..600)
             .map(|i| {
-                serde_json::json!({"name": format!("file-{i:04}.bin"), "item_type": "File", "tags": [], "children": []})
+                let note: String = (0..96)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        NOISE_ALPHABET[(state & 63) as usize] as char
+                    })
+                    .collect();
+                serde_json::json!({"name": format!("file-{i:04}.bin"), "item_type": "File", "note": note, "tags": [], "children": []})
             })
             .collect();
         let big = serde_json::json!({
@@ -872,10 +887,10 @@ mod tests {
         })
         .to_string();
         assert!(
-            big.len() > LISTING_MAX_BYTES,
-            "the seed listing ({} bytes) must exceed the {} byte budget to truncate",
-            big.len(),
-            LISTING_MAX_BYTES
+            hb_core::sealed_listing_len(&big) > LISTING_MAX_BYTES,
+            "the seed listing must exceed the {} byte SEALED budget to truncate (sealed {})",
+            LISTING_MAX_BYTES,
+            hb_core::sealed_listing_len(&big)
         );
         let t = hb_net::truncate_listing(&big, LISTING_MAX_BYTES).unwrap();
         assert!(t.truncated, "a listing over the byte budget truncates");

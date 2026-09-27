@@ -44,14 +44,21 @@ fn bk(seed: u8) -> [u8; 32] {
     [seed; 32]
 }
 
-/// A full listing of `n` padded entries carrying `snapshot_fingerprint = fp` — big enough to split
-/// into an index + several content parts under the 40 KiB per-part budget. Post audit #25
-/// (QURATOR-123) the full family additionally carries `teaser_fingerprint = tf` — the digest the
-/// truncated teaser of the same publish carries (visible entries + elided count) — which is the
-/// value the browse-side gate compares.
+/// A full listing of `n` entries carrying `snapshot_fingerprint = fp` — big enough to split into
+/// an index + several content parts under the 40 KiB per-part budget. Each entry carries a 96-char
+/// noise `note` (suite_cap's `noise`, the `big_listing` pattern): the publish budgets measure the
+/// SEALED body, so repetitive names alone seal to a few KB and the family no longer splits. Post
+/// audit #25 (QURATOR-123) the full family additionally carries `teaser_fingerprint = tf` — the
+/// digest the truncated teaser of the same publish carries (visible entries + elided count) —
+/// which is the value the browse-side gate compares.
 fn full_listing(slug: &str, n: usize, fp: &str, tf: &str) -> String {
     let entries: Vec<Value> = (0..n)
-        .map(|i| serde_json::json!({ "name": format!("title-{i:05}-padding-padding-padding-xx") }))
+        .map(|i| {
+            serde_json::json!({
+                "name": format!("title-{i:05}-padding-padding-padding-xx"),
+                "note": crate::suite_cap::noise(i as u64 ^ 0x6A6A_6A6A_6A6A_6A6A, 96),
+            })
+        })
         .collect();
     serde_json::json!({
         "slug": slug, "content_types": ["video"],

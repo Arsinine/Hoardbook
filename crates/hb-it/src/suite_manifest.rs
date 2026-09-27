@@ -49,8 +49,8 @@ use hb_core::{
     snapshot_fingerprint, Collection, DirectoryItem, Identity, ItemType, ShareCode, Visibility,
 };
 use hb_net::{
-    browse_share_code, publish_listing_capped, render_listing, split_listing, truncate_listing,
-    RenderedListing,
+    browse_share_code, publish_listing_capped, render_listing, split_listing_for_manifest,
+    truncate_listing, RenderedListing,
 };
 use serde_json::Value;
 
@@ -107,6 +107,10 @@ fn bk(seed: u8) -> [u8; 32] {
 /// fields impossible to omit** — a hand-written fixture can always drift from the struct; a
 /// constructed one cannot compile if it does.
 fn collection(slug: &str, n: usize, label: &str) -> Collection {
+    // Each item carries a 96-char noise `note` (suite_cap's `noise`, the `big_listing` pattern):
+    // the publish/split budgets measure the SEALED body, so repetitive names alone seal to a few
+    // KB — the teaser never truncates and the manifest never splits, and MAN1-MAN3's premises all
+    // quietly die ("the fixture must truncate — a manifest only has a job behind a paywall").
     let listing: Vec<DirectoryItem> = (0..n)
         .map(|i| DirectoryItem {
             name: format!("{label}-{i:05}-padding-padding-padding-xx.mkv"),
@@ -115,7 +119,7 @@ fn collection(slug: &str, n: usize, label: &str) -> Collection {
             format: None,
             year: None,
             tags: Vec::new(),
-            note: None,
+            note: Some(crate::suite_cap::noise(i as u64 ^ 0x4D4D_4D4D_4D4D_4D4D, 96)),
             children: Vec::new(),
         })
         .collect();
@@ -197,21 +201,27 @@ fn rendered_to_collection(r: &RenderedListing) -> Result<Collection> {
 
 /// The export half of `hb-app::build_slug_manifest`, minus the store and visibility checks: derive
 /// the listing JSON exactly as production does, split it at the production budget, then seal + sign
-/// the ordered parts. Routed through the real `split_listing` — hand-written parts are the blind spot
-/// this suite exists to close.
+/// the ordered parts. Routed through the real `split_listing_for_manifest` — hand-written parts are
+/// the blind spot this suite exists to close, and since QURATOR-344 the manifest split is the
+/// PLAINTEXT-measured variant (`build_slug_manifest` calls `split_listing_for_manifest`, not the
+/// relay path's sealed `split_listing`).
 fn export_envelope(owner: &Identity, slug: &str, key: &[u8; 32], col: &Collection) -> Result<ManifestEnvelope> {
     let json = listing_json(col)?;
     // Audit #25 / QURATOR-123: the envelope's digest is the TEASER digest (visible entries + elided
     // count), derived exactly as `build_slug_manifest` now derives it — through the production
-    // truncation on the same bytes, read back off the artifact.
+    // truncation on the same bytes, read back off the artifact. `truncate_listing` stays on the
+    // relay's SEALED measure: that is what the teaser publish itself uses, and the digest must be
+    // derived from the teaser the browser actually sees.
     let t = truncate_listing(&json, LISTING_MAX_BYTES)?;
     let fp = serde_json::from_str::<Value>(&t.json)?
         .get("snapshot_fingerprint")
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| snapshot_fingerprint(&col.listing).0);
-    let parts: Vec<String> =
-        split_listing(slug, &json, LISTING_MAX_BYTES)?.into_iter().map(|p| p.json).collect();
+    let parts: Vec<String> = split_listing_for_manifest(slug, &json, MANIFEST_SPLIT_MAX_BYTES)?
+        .into_iter()
+        .map(|p| p.json)
+        .collect();
     Ok(build_manifest_envelope(owner, slug, key, &fp, now(), &parts)?)
 }
 
@@ -424,8 +434,12 @@ async fn man3(ctx: &Ctx) -> Result<()> {
     let col = collection(&slug, ENTRIES, "title");
     let fp = snapshot_fingerprint(&col.listing).0;
 
-    let parts: Vec<String> =
-        split_listing(&slug, &listing_json(&col)?, LISTING_MAX_BYTES)?.into_iter().map(|p| p.json).collect();
+    // Split through the manifest carrier's own split (plaintext-measured, what
+    // `build_slug_manifest` calls) at the manifest budget.
+    let parts: Vec<String> = split_listing_for_manifest(&slug, &listing_json(&col)?, MANIFEST_SPLIT_MAX_BYTES)?
+        .into_iter()
+        .map(|p| p.json)
+        .collect();
     ensure!(parts.len() > 2, "fixture must split into an index plus content parts, got {}", parts.len());
 
     // Keep the index, drop every content part, and re-sign — a valid manifest describing N parts
@@ -459,35 +473,52 @@ async fn man3(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// MAN4 — QURATOR-106: a large collection whose split INDEX lands between the relay budget (40 KB)
-/// and the manifest budget (NIP-44's 65,408-byte plaintext cap). The owner-reported failure was an
-/// index of 66,615 bytes — well under the iroh 16 MB transport ceiling, but over the 40 KB budget
-/// the manifest path was wrongly sharing with the relay anti-ban path. `split_listing` HARD-ERRORS
-/// on an over-budget index (split.rs:327, the exact "the listing index itself is N bytes" message
-/// the owner hit), so this row is a red/green pin in one body:
+/// MAN4 — QURATOR-106: a large collection the manifest carrier can serve but the relay path cannot.
+/// The owner-reported failure was a split INDEX of 66,615 bytes — well under the iroh 16 MB
+/// transport ceiling, but over the 40 KB budget the manifest path was wrongly sharing with the
+/// relay anti-ban path. Since QURATOR-344 the two carriers split on DIFFERENT measures — the relay
+/// split ([`hb_net::split_listing`]) budgets each part's SEALED size (zstd + NIP-44 + base64), the
+/// manifest split ([`hb_net::split_listing_for_manifest`], what production's `build_slug_manifest`
+/// calls) budgets the PLAINTEXT part JSON — so from one fixture the row pins both halves:
 ///
-///   * at `LISTING_MAX_BYTES` (40 KB, the pre-fix budget) the split MUST error — reproducing the bug;
-///   * at `MANIFEST_SPLIT_MAX_BYTES` (65,408, the fix) the split MUST succeed, and the index part
-///     MUST fall in the (40 KB, 65 KB] window — proving the fix operates on exactly the case that failed.
+///   * the relay split at `LISTING_MAX_BYTES` (40 KB sealed) MUST hard-error on its index. With
+///     incompressible content each sealed-40 KB part carries only ~28 KB of plaintext, so the same
+///     tree cuts into ~730 SMALLER parts and the sealed sha256-row index overflows first. Measured
+///     2026-09-27: "the listing index itself is 43,780 sealed bytes" — ~9% over.
+///   * the manifest split at `MANIFEST_SPLIT_MAX_BYTES` (65,408 plaintext) MUST succeed, with its
+///     own fewer-part index inside the (40 KB, 65 KB] PLAINTEXT window — measured ~430 parts,
+///     index ≈ 54 KB — proving the fix operates on exactly the case that failed.
 ///
 /// The window assertion is load-bearing: an index that fit 40 KB would pass the success arm even
-/// against the old budget, so the row would prove nothing. The relay round-trip is kept (teaser
-/// published + browsed back) so this stays a live integration row exercising the cross-crate seam,
-/// not a unit test relocated — the hb-app unit `build_slug_manifest_accepts_an_index_over_40k_...`
-/// already covers the pure-function side; §5's integration half is what this adds.
+/// against the old budget, so the row would prove nothing. The row stays in this suite rather than
+/// as a unit test because it pins the LIVE two-measure seam (sealed relay split vs plaintext
+/// manifest split of the same bytes) across the hb-net/hb-core boundary — the hb-app unit
+/// `build_slug_manifest_accepts_an_index_over_40k_...` covers the pure-function side; the wire
+/// costs live here. (The row itself needs no relay — MAN3's cheapness, MAN4's arms are pure split
+/// math plus the file round-trip.)
 ///
-/// The fixture mirrors the hb-app unit test's shape: a ~160-char slug inflates each index descriptor
-/// row (`slug#part{i}` + sha256) to ~250 B, so the 40 KB+ index is reached with a manageable part
-/// count, and a ~4 KB note per leaf drives the content size without an enormous entry count.
+/// Fixture sizing is the load-bearing arithmetic, and it is two-sided: the noise notes (3,000
+/// leaves × 8,300 chars ≈ 25.3 MB incompressible plaintext) sit at the one value where BOTH arms
+/// hold at once. Shorter notes and the relay split's sealed index stays under 40 KB — no bug arm.
+/// Longer, and the manifest split's plaintext index passes 65,408 — no window. Both numbers are
+/// deterministic (xorshift noise, fixed sizes), so the margins are stable run to run. The slug is
+/// the plain `ctx.tag` (26 chars, fixed-width run_id): the plaintext index scales with the slug
+/// (one `slug#part{i}` descriptor per part), and 26 chars keeps ~11 KB of headroom under the cap.
 async fn man4(ctx: &Ctx) -> Result<()> {
     ensure_budget_matches_hb_app()?;
     ensure_manifest_budget_matches_hb_app()?;
     let owner = Identity::generate();
     let key = bk(44);
-    // The long slug is the lever on index size; keep it a valid-ish tag but long. ctx.tag keeps runs
-    // from colliding on the relay.
-    let slug = format!("{}-{}", ctx.tag("man4"), "x".repeat(140));
-    let note = "n".repeat(4000);
+    // The slug stays the plain ctx.tag (26 chars — run_id is a fixed 16 hex): the window arms
+    // measure the PLAINTEXT index, whose size scales with the slug via one `slug#part{i}`
+    // descriptor per part, so keep it short and fixed. The note LENGTH is the size lever.
+    let slug = ctx.tag("man4");
+    // Per-index noise notes (suite_cap's `noise`): 8,300 chars × 3,000 leaves ≈ 25.3 MB of
+    // incompressible plaintext — the value where the relay split's sealed index overflows 40 KB
+    // while the manifest split's plaintext index stays in the (40 KB, 65 KB] window. Repetitive
+    // notes ("n".repeat(4000)) are exactly what QURATOR-344's sealed measure made vacuous: zstd
+    // shrank the whole listing to a few KB sealed, one part, no overflow, no premise.
+    let noise_note = |i: usize| crate::suite_cap::noise(i as u64 ^ 0x3434_3434_3434_3434, 8_300);
     let listing: Vec<DirectoryItem> = (0..3000)
         .map(|i| DirectoryItem {
             name: format!("file-{i:05}-padding-padding-padding.mkv"),
@@ -496,7 +527,7 @@ async fn man4(ctx: &Ctx) -> Result<()> {
             format: Some("MKV".into()),
             year: Some(1985),
             tags: Vec::new(),
-            note: Some(note.clone()),
+            note: Some(noise_note(i)),
             children: Vec::new(),
         })
         .collect();
@@ -516,10 +547,13 @@ async fn man4(ctx: &Ctx) -> Result<()> {
     };
     let json = listing_json(&col)?;
 
-    // (1) The bug arm: at the relay budget the index overflows and the split hard-errors — the exact
-    // failure the owner reported. If this does NOT error, the fixture is too small to reach the
-    // window and the row would be vacuous, so a missing error is itself a failure.
-    let at_relay_budget = split_listing(&slug, &json, LISTING_MAX_BYTES);
+    // (1) The bug arm: at the relay budget (SEALED measure) the index overflows and the split
+    // hard-errors — the failure class the owner reported. Post-QURATOR-344 it takes incompressible
+    // content to reach: each sealed-40 KB part carries only ~28 KB of plaintext, so the tree cuts
+    // into ~730 parts and the sealed sha256-row index passes 40 KB (measured 43,780). If this does
+    // NOT error, the fixture is too small to reach the window and the row would be vacuous, so a
+    // missing error is itself a failure. Mutation to redden: shorten the per-item note length.
+    let at_relay_budget = hb_net::split_listing(&slug, &json, LISTING_MAX_BYTES);
     ensure!(
         at_relay_budget.is_err(),
         "the fixture's index did NOT overflow the 40 KB relay budget — MAN4 must reach the \
@@ -531,8 +565,9 @@ async fn man4(ctx: &Ctx) -> Result<()> {
         "expected the index-overflow error, got a different split failure: {msg}"
     );
 
-    // (2) The fix arm: at the manifest budget the split succeeds.
-    let parts: Vec<String> = split_listing(&slug, &json, MANIFEST_SPLIT_MAX_BYTES)?
+    // (2) The fix arm: at the manifest budget the split succeeds — through the PLAINTEXT-measured
+    // `split_listing_for_manifest`, what production's `build_slug_manifest` now calls.
+    let parts: Vec<String> = split_listing_for_manifest(&slug, &json, MANIFEST_SPLIT_MAX_BYTES)?
         .into_iter()
         .map(|p| p.json)
         .collect();

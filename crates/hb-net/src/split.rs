@@ -266,19 +266,74 @@ fn bad_mount(part_idx: usize) -> NetError {
 
 // ── split (write side) ────────────────────────────────────────────────────────────────────────
 
-/// Split a listing payload into publishable parts under a `max_bytes` budget on each part's JSON.
+/// What a `max_bytes` budget measures — what the per-part limit is a limit ON.
+///
+/// The budget must apply to **what actually goes on the wire**, and the two carriers put different
+/// things on their wires: a relay listing event's content is the SEALED, base64 ciphertext
+/// ([`hb_core::sealed_listing_len`]), while a manifest part's real ceiling is the NIP-44 seal's
+/// 65,408-byte plaintext ACCEPTANCE cap — the seal refuses longer plaintext, and the manifest
+/// envelope carries the sealed parts inline with no relay event cap at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BudgetMeasure {
+    /// The budget measures the sealed, base64 event-content length — the relay listing path.
+    SealedEvent,
+    /// The budget measures the plaintext part JSON length — the iroh/`.hbmanifest` carrier.
+    PlainPart,
+}
+
+impl BudgetMeasure {
+    /// Does one part (its JSON) fit the budget under this measure?
+    fn fits(self, part_json: &str, max_bytes: usize) -> bool {
+        match self {
+            BudgetMeasure::SealedEvent => hb_core::sealed_listing_len(part_json) <= max_bytes,
+            BudgetMeasure::PlainPart => part_json.len() <= max_bytes,
+        }
+    }
+}
+
+/// Split a listing payload into publishable parts under a `max_bytes` budget on each part's
+/// **sealed** size — the base64 event content a relay stores and serves
+/// ([`hb_core::sealed_listing_len`]), never the plaintext. QURATOR-344 sealed the compressed body,
+/// so a 10k-file listing (948 KB of JSON, ~9 KB sealed) now takes ONE part where plaintext sizing
+/// cut it into dozens.
 ///
 /// A payload that fits returns a single part under `d = slug` (unchanged fast path). An oversize
 /// payload is packed depth-recursively ([`pack_tree`]) into an index part (`d = slug`, recording
 /// `split: true` + `parts_v: 2` + `part_count: N` + a per-part `sha256` table + the preserved
 /// metadata) plus N content parts (`d = slug#partI`), each carrying a `mount` path.
+///
+/// The part JSON SHAPE is unchanged (`parts_v: 2`); only how many parts are cut changes.
 pub fn split_listing(
     slug: &str,
     listing_json: &str,
     max_bytes: usize,
 ) -> Result<Vec<ListingPart>, NetError> {
+    split_with_measure(slug, listing_json, max_bytes, BudgetMeasure::SealedEvent)
+}
+
+/// The manifest-carrier half of [`split_listing`]: identical part shape, restitch contract, and
+/// error texts, but the budget measures the **plaintext** part JSON — the NIP-44 seal's
+/// 65,408-byte acceptance cap. PLAINTEXT-MEASURED BY DESIGN: the iroh/`.hbmanifest` envelope
+/// carries every sealed part inline (ceiling [`hb_core::MANIFEST_MAX_TRANSPORT_BYTES`], 16 MiB)
+/// and publishes no per-part relay events, so there is no sealed-size limit to enforce — a sealed
+/// measure here would only shrink parts ~25% below what the seal accepts, growing the part count
+/// and the index for no constraint. Do not "fix" this to sealed.
+pub fn split_listing_for_manifest(
+    slug: &str,
+    listing_json: &str,
+    max_bytes: usize,
+) -> Result<Vec<ListingPart>, NetError> {
+    split_with_measure(slug, listing_json, max_bytes, BudgetMeasure::PlainPart)
+}
+
+fn split_with_measure(
+    slug: &str,
+    listing_json: &str,
+    max_bytes: usize,
+    measure: BudgetMeasure,
+) -> Result<Vec<ListingPart>, NetError> {
     let normalized = normalize(listing_json)?;
-    if normalized.len() <= max_bytes {
+    if measure.fits(&normalized, max_bytes) {
         return Ok(vec![ListingPart { d_tag: slug.to_string(), json: normalized }]);
     }
 
@@ -297,7 +352,7 @@ pub fn split_listing(
     let mut meta: Map<String, Value> = obj.clone();
     meta.remove("entries");
 
-    let chunks = pack_tree(entries, max_bytes)?;
+    let chunks = pack_tree(entries, max_bytes, measure)?;
     let n = chunks.len();
     if n > MAX_LISTING_PARTS {
         return Err(NetError::Split(format!(
@@ -324,12 +379,19 @@ pub fn split_listing(
     index.insert("parts".into(), Value::Array(slot_descriptors));
     let index_json =
         serde_json::to_string(&Value::Object(index)).map_err(|e| NetError::Split(e.to_string()))?;
-    if index_json.len() > max_bytes {
+    if !measure.fits(&index_json, max_bytes) {
+        let size = match measure {
+            BudgetMeasure::SealedEvent => hb_core::sealed_listing_len(&index_json),
+            BudgetMeasure::PlainPart => index_json.len(),
+        };
+        let unit = match measure {
+            BudgetMeasure::SealedEvent => "sealed bytes",
+            BudgetMeasure::PlainPart => "bytes",
+        };
         return Err(NetError::Split(format!(
-            "the listing index itself is {} bytes, over the {max_bytes}-byte per-listing limit even \
-             with `entries` moved out — its metadata (or part count) is too large. Shorten its \
-             fields or publish fewer parts.",
-            index_json.len()
+            "the listing index itself is {size} {unit}, over the {max_bytes}-byte per-listing limit \
+             even with `entries` moved out — its metadata (or part count) is too large. Shorten its \
+             fields or publish fewer parts."
         )));
     }
 
@@ -624,55 +686,77 @@ pub fn truncate_listing(listing_json: &str, max_bytes: usize) -> Result<Truncate
     let entries = obj.get("entries").and_then(Value::as_array).cloned().unwrap_or_default();
     let total_items = count_nodes(&entries);
 
-    if normalized.len() <= max_bytes {
+    // The budget applies to what the relay stores: the SEALED size of the event content. A
+    // compressible listing over the plaintext budget is NOT truncated — QURATOR-344's compression
+    // already made it fit one event.
+    if hb_core::sealed_listing_len(&normalized) <= max_bytes {
         return Ok(TruncatedListing { json: normalized, truncated: false, shown_items: total_items, total_items });
     }
 
     let mut meta: Map<String, Value> = obj.clone();
     meta.remove("entries");
     // Measure the fixed overhead: the metadata + the markers we add + an empty `entries` array. The
-    // entries themselves then get whatever budget is left.
+    // entries themselves then get whatever budget is left (a PLAINTEXT budget — `truncate_tree`
+    // does its own byte accounting on serialized entries — corrected downward below until the
+    // finished teaser's SEALED length actually fits).
     let mut probe = meta.clone();
     probe.insert("truncated".into(), Value::Bool(true));
     probe.insert("total_items".into(), Value::from(total_items as u64));
     probe.insert("entries".into(), Value::Array(Vec::new()));
     let overhead = serde_json::to_string(&Value::Object(probe)).map(|s| s.len()).unwrap_or(max_bytes);
-    let entries_budget = max_bytes.saturating_sub(overhead);
+    let mut entries_budget = max_bytes.saturating_sub(overhead);
 
-    let (kept, shown_items) = truncate_tree(&entries, entries_budget);
+    loop {
+        let (kept, shown_items) = truncate_tree(&entries, entries_budget);
 
-    let mut out = meta;
-    out.insert("truncated".into(), Value::Bool(true));
-    out.insert("total_items".into(), Value::from(total_items as u64));
-    out.insert("entries".into(), Value::Array(kept.clone()));
-    // Audit #25 / QURATOR-123 (owner ruling 2026-08-25): replace the preserved full-tree digest with
-    // one over the visible entries + elided count. See the function docs.
-    if let Some(Value::String(prev)) = out.get("snapshot_fingerprint") {
-        let prev = prev.clone();
-        match serde_json::from_value::<Vec<hb_core::types::DirectoryItem>>(Value::Array(kept)) {
-            Ok(visible) => {
-                let elided = total_items.saturating_sub(shown_items) as u64;
-                out.insert(
-                    "snapshot_fingerprint".into(),
-                    Value::String(hb_core::teaser_fingerprint(&visible, elided).0),
-                );
-            }
-            // The kept entries did not decode as the tree this app publishes (a foreign fixture).
-            // Dropping the stale full-tree digest fails closed: the browse-side staleness gates read
-            // `None` and keep the teaser rather than trusting a digest of content that is not present.
-            // No clamp, no partial digest — never a value an identifier is derived from.
-            Err(_) => {
-                out.remove("snapshot_fingerprint");
-                tracing::debug!(
-                    "truncated listing carried a snapshot_fingerprint ({prev}) but its kept entries \
-                     did not decode as a DirectoryItem tree; dropping the digest rather than \
-                     publishing a hash of the hidden content"
-                );
+        let mut out = meta.clone();
+        out.insert("truncated".into(), Value::Bool(true));
+        out.insert("total_items".into(), Value::from(total_items as u64));
+        out.insert("entries".into(), Value::Array(kept.clone()));
+        // Audit #25 / QURATOR-123 (owner ruling 2026-08-25): replace the preserved full-tree digest
+        // with one over the visible entries + elided count. Recomputed every round — the kept set
+        // shrinks as the budget does, and the digest must describe what THIS teaser shows.
+        if let Some(Value::String(prev)) = out.get("snapshot_fingerprint") {
+            let prev = prev.clone();
+            match serde_json::from_value::<Vec<hb_core::types::DirectoryItem>>(Value::Array(kept)) {
+                Ok(visible) => {
+                    let elided = total_items.saturating_sub(shown_items) as u64;
+                    out.insert(
+                        "snapshot_fingerprint".into(),
+                        Value::String(hb_core::teaser_fingerprint(&visible, elided).0),
+                    );
+                }
+                // The kept entries did not decode as the tree this app publishes (a foreign
+                // fixture). Dropping the stale full-tree digest fails closed: the browse-side
+                // staleness gates read `None` and keep the teaser rather than trusting a digest of
+                // content that is not present. No clamp, no partial digest — never a value an
+                // identifier is derived from.
+                Err(_) => {
+                    out.remove("snapshot_fingerprint");
+                    tracing::debug!(
+                        "truncated listing carried a snapshot_fingerprint ({prev}) but its kept entries \
+                         did not decode as a DirectoryItem tree; dropping the digest rather than \
+                         publishing a hash of the hidden content"
+                    );
+                }
             }
         }
+        let json =
+            serde_json::to_string(&Value::Object(out)).map_err(|e| NetError::Split(e.to_string()))?;
+
+        // Verify against the real measure. Fitting ⇒ done; otherwise shrink the plaintext budget
+        // geometrically (×3/4, so progress is guaranteed down to 0 = metadata-only teaser) and
+        // re-truncate. Worst case O(tree × log(max_bytes)) truncate passes; typically one.
+        let sealed = hb_core::sealed_listing_len(&json);
+        if sealed <= max_bytes || entries_budget == 0 {
+            // `entries_budget == 0` with a still-over-budget sealed length is the metadata-envelope
+            // case the function docs describe: unreachable from the app (`clamp_metadata` caps every
+            // field; ~8.5 KB plaintext seals to ~11.3 KB), caller-owned if a caller builds its own
+            // envelope.
+            return Ok(TruncatedListing { json, truncated: true, shown_items, total_items });
+        }
+        entries_budget = entries_budget * 3 / 4;
     }
-    let json = serde_json::to_string(&Value::Object(out)).map_err(|e| NetError::Split(e.to_string()))?;
-    Ok(TruncatedListing { json, truncated: true, shown_items, total_items })
 }
 
 /// Build one v2 content part's JSON: `entries` + `mount` + `part` + `parts_v`. Used both for the
@@ -695,19 +779,76 @@ struct Chunk {
     entries: Vec<Value>,
 }
 
-/// Pack a listing's `entries` tree into publishable chunks under `max_bytes`: depth-first,
-/// order-preserving, greedy first-fit (M13 depth-recursive split — see module docs for the v2 wire
-/// shape). Chunks come back in DFS emission order; the caller assigns each one's final part index
-/// by its position in the returned `Vec` (part 0 = the top-level run, `mount == []`).
-fn pack_tree(entries: &[Value], max_bytes: usize) -> Result<Vec<Chunk>, NetError> {
-    let mut chunks = Vec::new();
-    pack_siblings(entries, &[], max_bytes, &mut chunks)?;
-    Ok(chunks)
+/// Pack a listing's `entries` tree into publishable chunks under `max_bytes` per part, measured by
+/// `measure`: depth-first, order-preserving, greedy first-fit (M13 depth-recursive split — see the
+/// module docs for the v2 wire shape). Chunks come back in DFS emission order; the caller assigns
+/// each one's final part index by its position in the returned `Vec` (part 0 = the top-level run,
+/// `mount == []`).
+///
+/// **Bounded packing.** For [`BudgetMeasure::SealedEvent`] the fit test is a compression, so
+/// running it per candidate append would be O(n²) zstd on a big tree. Instead the greedy loop runs
+/// on a PLAINTEXT budget (an upper-bound proxy — the sealed size of a part is derived from its
+/// compressed length, which is ≤ its plaintext), each finished chunk is VERIFIED once with the real
+/// measure, and an over-budget chunk is re-packed with its plaintext budget scaled by
+/// `max_bytes / measured × ¾` — geometric progress, so the loop terminates. Worst case
+/// O(total_plaintext × log₄⁄₃(max_bytes)) compression work (each round re-packs only the failing
+/// chunks); typically one pack + one verification pass.
+fn pack_tree(
+    entries: &[Value],
+    max_bytes: usize,
+    measure: BudgetMeasure,
+) -> Result<Vec<Chunk>, NetError> {
+    // Optimistic start: the plaintext budget equals the wire budget. For PlainPart this IS the
+    // measure (no correction needed); for SealedEvent the verification loop below corrects it.
+    let mut chunks: Vec<Chunk> = Vec::new();
+    pack_siblings(entries, &[], max_bytes, measure, max_bytes, &mut chunks)?;
+    // Verify-and-repack loop. Each round re-packs only the chunks whose SEALED length busts the
+    // budget, at a plaintext budget scaled to the failing chunk's OWN plaintext (× max/measured ×
+    // ¾ ⇒ strictly below the chunk's plaintext), so every round makes geometric progress and the
+    // loop provably terminates: a re-pack's total plaintext is strictly smaller than the chunk it
+    // replaced, and at the 1-byte floor every entry either ships alone (its single-entry part fits
+    // the real measure — `pack_siblings`' alone-test) or is refused as unsplittable. Capped at 64
+    // rounds as a belt-and-braces bound on a path that cannot practically reach it.
+    for _ in 0..64 {
+        let mut rebuilt: Vec<Chunk> = Vec::with_capacity(chunks.len());
+        let mut repacked = false;
+        for chunk in std::mem::take(&mut chunks) {
+            let json = content_part_v2_json(&chunk.entries, &chunk.mount, usize::MAX)?;
+            if measure.fits(&json, max_bytes) {
+                rebuilt.push(chunk);
+                continue;
+            }
+            let measured = match measure {
+                BudgetMeasure::SealedEvent => hb_core::sealed_listing_len(&json),
+                BudgetMeasure::PlainPart => json.len(),
+            };
+            // Scale the FAILING CHUNK's own plaintext (its serialized part JSON), not a global
+            // budget — the chunk's plaintext is what must come down for its sealed size to follow.
+            let scale = max_bytes as f64 / measured as f64;
+            let shrunk = (((json.len() as f64) * scale * 0.75).floor() as usize).max(1);
+            let mut sub: Vec<Chunk> = Vec::new();
+            pack_siblings(&chunk.entries, &chunk.mount, shrunk, measure, max_bytes, &mut sub)?;
+            rebuilt.append(&mut sub);
+            repacked = true;
+        }
+        chunks = rebuilt;
+        if !repacked {
+            return Ok(chunks);
+        }
+    }
+    // Unreachable in practice (the ×¾ shrink reaches the 1-byte budget floor in ~25 rounds, where
+    // `pack_siblings` can only emit measure-fitting singletons or error). Fail loudly rather than
+    // emit an over-budget part — correctness requirement: EVERY emitted part fits, always.
+    Err(NetError::Split(format!(
+        "packing could not bring every part under the {max_bytes}-byte budget in 64 rounds"
+    )))
 }
 
 fn pack_siblings(
     entries: &[Value],
     mount: &[usize],
+    budget: usize,
+    measure: BudgetMeasure,
     max_bytes: usize,
     chunks: &mut Vec<Chunk>,
 ) -> Result<(), NetError> {
@@ -717,7 +858,7 @@ fn pack_siblings(
         let entry = &entries[i];
         let mut candidate = current.clone();
         candidate.push(entry.clone());
-        if content_part_v2_json(&candidate, mount, usize::MAX)?.len() <= max_bytes {
+        if content_part_v2_json(&candidate, mount, usize::MAX)?.len() <= budget {
             current = candidate;
             i += 1;
             continue;
@@ -727,7 +868,16 @@ fn pack_siblings(
             chunks.push(Chunk { mount: mount.to_vec(), entries: std::mem::take(&mut current) });
             continue;
         }
-        // Doesn't fit even alone. A folder with children can shed weight: emit its SHELL (the
+        // Entry `i` alone busts the plaintext budget. Under a shrunk sealed budget it may still
+        // ship ALONE (its single-entry part fits the real measure even though its plaintext busts
+        // the proxy budget) — emit it and move on rather than refusing a shippable entry.
+        let single = content_part_v2_json(std::slice::from_ref(entry), mount, usize::MAX)?;
+        if measure.fits(&single, max_bytes) {
+            chunks.push(Chunk { mount: mount.to_vec(), entries: vec![entry.clone()] });
+            i += 1;
+            continue;
+        }
+        // Cannot ship even alone. A folder with children can shed weight: emit its SHELL (the
         // node with `children` emptied — the key stays present so restitch is byte-exact) into
         // this fresh part, then recurse into its children at `mount + [i]`.
         if let Some(obj) = entry.as_object() {
@@ -736,14 +886,14 @@ fn pack_siblings(
                     let mut shell = obj.clone();
                     shell.insert("children".into(), Value::Array(Vec::new()));
                     let shell_entries = vec![Value::Object(shell)];
-                    let shell_len = content_part_v2_json(&shell_entries, mount, usize::MAX)?.len();
-                    if shell_len > max_bytes {
-                        return Err(oversized_entry_error(shell_len, max_bytes));
+                    let shell_json = content_part_v2_json(&shell_entries, mount, usize::MAX)?;
+                    if !measure.fits(&shell_json, max_bytes) {
+                        return Err(oversized_entry_error(shell_json, measure, max_bytes));
                     }
                     chunks.push(Chunk { mount: mount.to_vec(), entries: shell_entries });
                     let mut child_mount = mount.to_vec();
                     child_mount.push(i);
-                    pack_siblings(kids, &child_mount, max_bytes, chunks)?;
+                    pack_siblings(kids, &child_mount, budget, measure, max_bytes, chunks)?;
                     i += 1;
                     continue;
                 }
@@ -751,8 +901,7 @@ fn pack_siblings(
         }
         // A leaf file, a childless folder, or a non-object entry that still doesn't fit alone
         // cannot be split any further at any depth.
-        let entry_len = content_part_v2_json(std::slice::from_ref(entry), mount, usize::MAX)?.len();
-        return Err(oversized_entry_error(entry_len, max_bytes));
+        return Err(oversized_entry_error(single, measure, max_bytes));
     }
     if !current.is_empty() {
         chunks.push(Chunk { mount: mount.to_vec(), entries: current });
@@ -760,9 +909,20 @@ fn pack_siblings(
     Ok(())
 }
 
-fn oversized_entry_error(bytes: usize, max_bytes: usize) -> NetError {
+/// The unsplittable-entry refusal. `part_json` is the single entry's (or shell's) part JSON; the
+/// reported size is measured the way the budget measures it — plaintext bytes for
+/// [`BudgetMeasure::PlainPart`], sealed event content for [`BudgetMeasure::SealedEvent`].
+fn oversized_entry_error(
+    part_json: String,
+    measure: BudgetMeasure,
+    max_bytes: usize,
+) -> NetError {
+    let (size, unit) = match measure {
+        BudgetMeasure::PlainPart => (part_json.len(), "bytes"),
+        BudgetMeasure::SealedEvent => (hb_core::sealed_listing_len(&part_json), "sealed bytes"),
+    };
     NetError::Split(format!(
-        "this collection is too large to publish: a single item's metadata is {bytes} bytes, over \
+        "this collection is too large to publish: a single item's metadata is {size} {unit}, over \
          the {max_bytes}-byte per-listing limit and cannot be split further. Shorten its name/note \
          or exclude it."
     ))
@@ -934,10 +1094,73 @@ fn restitch_v2(parts: &[String]) -> Result<String, NetError> {
 mod tests {
     use super::*;
 
+    /// Length-parameterized deterministic xorshift noise over a 64-char alphabet — the
+    /// QURATOR-344-proof pattern from `hb-it`'s suite_n `big_listing`: zstd cannot compress it,
+    /// so a fixture's SEALED length tracks its plaintext length.
+    fn noise(len: usize) -> String {
+        const ALPHABET: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ALPHABET[(state & 63) as usize] as char
+            })
+            .collect()
+    }
+
+    /// Per-index noise so two builders can construct the SAME tree independently (the paired
+    /// `fp_listing_with_real_tree` / `decodable_tree` fixtures must stay byte-consistent).
+    /// Deterministic xorshift noise over a 64-char alphabet — the QURATOR-344-proof pattern from
+    /// `hb-it`'s suite_n `big_listing`: zstd cannot compress it, so a fixture's SEALED length
+    /// tracks its plaintext length. Budget tests need this wherever the premise is "over budget".
+    fn noise_for(i: usize) -> String {
+        const ALPHABET: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15 ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (0..96)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ALPHABET[(state & 63) as usize] as char
+        })
+        .collect()
+    }
+
+    /// DENSER noise than [`noise_for`]: 93 printable ASCII characters (everything but `"` and `\`,
+    /// so nothing escapes), ~6.5 bits/char. zstd barely shrinks it and base64 then inflates by
+    /// 4/3, so a part's SEALED size is LARGER than its plaintext. That is the only shape that makes
+    /// the sealed-budget verification loops in `pack_tree` and `truncate_listing` actually act: with
+    /// the 64-char alphabet a part packed to the plaintext budget already seals under it, so a test
+    /// built on it cannot tell whether the verification ran.
+    fn dense_noise_for(i: usize, len: usize) -> String {
+        let alphabet: Vec<u8> = (0x21u8..=0x7e).filter(|c| *c != b'"' && *c != b'\\').collect();
+        let mut state: u64 = 0xA076_1D64_78BD_642F ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                alphabet[(state % alphabet.len() as u64) as usize] as char
+            })
+            .collect()
+    }
+
     // A listing with `n` folder entries, each padded so the whole payload is comfortably large.
+    // The `note` is xorshift noise (incompressible): post-QURATOR-344 the budgets measure the
+    // SEALED body, and a compressible fixture would no longer be over budget.
     fn listing(n: usize) -> String {
         let entries: Vec<Value> = (0..n)
-            .map(|i| serde_json::json!({ "name": format!("folder-{i:03}"), "size": 1_000_000 + i }))
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("folder-{i:03}"),
+                    "size": 1_000_000 + i,
+                    "note": noise_for(i),
+                })
+            })
             .collect();
         serde_json::json!({
             "slug": "criterion",
@@ -983,6 +1206,86 @@ mod tests {
         assert_eq!(restitched, normalize(&original).unwrap(), "restitch must reproduce the full tree");
     }
 
+    #[test]
+    fn ten_thousand_compressed_entries_take_one_part_under_40k() {
+        // The point of the sealed measure (lane CMP): ~10k repetitive titles ≈ 950 KB of JSON but
+        // only a few KB sealed. The plaintext rule cut this into dozens of parts (or truncated it
+        // to a teaser); the sealed rule ships it whole.
+        let entries: Vec<Value> = (0..10_000)
+            .map(|i| {
+                serde_json::json!({ "name": format!("title-{i:05}-padding-padding-padding-xx") })
+            })
+            .collect();
+        let json =
+            serde_json::json!({ "slug": "big", "content_types": ["video"], "entries": entries })
+                .to_string();
+        let normalized_len = normalize(&json).unwrap().len();
+        assert!(
+            normalized_len > 40_000,
+            "fixture sanity: {normalized_len} bytes of plaintext must be over the 40_000 budget"
+        );
+        // P-10 mutation: revert `split_with_measure`'s fast path to
+        // `if normalized.len() <= max_bytes` (the old plaintext measure) — must red this test
+        // (the listing would then split into multiple parts).
+        let parts = split_listing("big", &json, 40_000).unwrap();
+        assert_eq!(
+            parts.len(),
+            1,
+            "a compressible 10k listing must ship as ONE part, got {}",
+            parts.len()
+        );
+        assert!(
+            hb_core::sealed_listing_len(&parts[0].json) <= 40_000,
+            "the single part's sealed length must be within budget"
+        );
+        assert_eq!(
+            restitch_listing(&payloads(&parts)).unwrap(),
+            normalize(&json).unwrap(),
+            "the single part must restitch to the full listing"
+        );
+    }
+
+    #[test]
+    fn incompressible_listing_splits_with_every_part_within_the_sealed_budget() {
+        // 3000 noise-noted entries ≈ 470 KB of INCOMPRESSIBLE JSON — genuinely over the 40 KB
+        // sealed budget — so it must still split, every part must fit AS SEALED, and the parts
+        // must restitch byte-exact. This is the correctness half: the sealed budget is never
+        // exceeded by an emitted part.
+        // 400-char dense notes: with shorter ones the repeated JSON keys compress enough that a
+        // 40 KB-plaintext part still seals under 40 KB, and the verification loop never acts.
+        let entries: Vec<Value> = (0..3000)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("file-{i:05}.bin"), "size": 1_000_000 + i, "note": dense_noise_for(i, 400),
+                })
+            })
+            .collect();
+        let json =
+            serde_json::json!({ "slug": "huge", "content_types": ["video"], "entries": entries })
+                .to_string();
+        // Precondition: this fixture seals LARGER than its plaintext, so a part packed to the
+        // plaintext budget busts the sealed budget and the verification loop must re-pack it. If
+        // this ever stops holding, the mutation below goes green and the test proves nothing.
+        assert!(
+            hb_core::sealed_listing_len(&json) > json.len(),
+            "fixture sanity: the dense noise must seal larger than its plaintext"
+        );
+        // P-10 mutation: in `pack_tree`'s verify loop, replace
+        // `if measure.fits(&json, max_bytes) {` with `if true {` — must red this test
+        // (an over-budget part is emitted without ever being measured).
+        let parts = split_listing("huge", &json, 40_000).unwrap();
+        assert!(parts.len() > 2, "an incompressible listing must still split, got {}", parts.len());
+        for p in &parts[1..] {
+            let sealed = hb_core::sealed_listing_len(&p.json);
+            assert!(sealed <= 40_000, "part {} sealed to {sealed}, over the 40_000 budget", p.d_tag);
+        }
+        assert_eq!(
+            restitch_listing(&payloads(&parts)).unwrap(),
+            normalize(&json).unwrap(),
+            "parts must restitch byte-exact"
+        );
+    }
+
     // ── devtest #7: truncate_listing (paywall teaser instead of split) ────────────────────────────
 
     #[test]
@@ -998,6 +1301,71 @@ mod tests {
         assert_eq!(t.json, normalize(&listing(2)).unwrap());
     }
 
+    #[test]
+    fn compressible_listing_over_plaintext_budget_is_not_truncated() {
+        // QURATOR-344 + lane CMP: the budgets measure the SEALED body. ~1300 repetitive titles are
+        // ~86 KB of plaintext — over the old plaintext budget — but seal to a few KB, so the
+        // paywall teaser must NOT engage and the listing must survive byte-identical.
+        let entries: Vec<Value> = (0..1300)
+            .map(|i| {
+                serde_json::json!({ "name": format!("title-{i:05}-padding-padding-padding-xx") })
+            })
+            .collect();
+        let json =
+            serde_json::json!({ "slug": "vault", "content_types": ["video"], "entries": entries })
+                .to_string();
+        assert!(json.len() > 40_000, "fixture sanity: over the PLAINTEXT budget");
+        // P-10 mutation: in `truncate_listing`, revert the not-truncated fast-path check to
+        // `if normalized.len() <= max_bytes` — must red this test (the listing would truncate).
+        let t = truncate_listing(&json, 40_000).unwrap();
+        assert!(!t.truncated, "a listing that seals under budget must NOT be truncated");
+        assert_eq!(t.shown_items, t.total_items, "nothing is hidden");
+        assert_eq!(t.json, normalize(&json).unwrap(), "an untruncated listing is byte-identical");
+    }
+
+    #[test]
+    fn incompressible_listing_truncates_within_the_sealed_budget() {
+        // fp_listing_with_real_tree carries per-entry noise notes, so ~1300 entries are genuinely
+        // over the 40 KB sealed budget: the teaser must engage and the KEPT teaser must fit the
+        // budget AS SEALED (not merely in plaintext).
+        // Few entries with long dense notes: the repeated JSON keys of many short entries compress
+        // enough that a 40 KB-plaintext teaser still seals under 40 KB and the verification loop
+        // never acts. With 4,000-char notes the first plaintext-budgeted cut seals to ~44 KB, so the
+        // loop must shrink it (measured 2026-09-27: it settles at 7 of 40 entries).
+        let entries: Vec<Value> = (0..40)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("title-{i:05}"), "item_type": "File", "tags": [],
+                    "children": [], "note": dense_noise_for(i, 4000),
+                })
+            })
+            .collect();
+        let json = serde_json::json!({
+            "slug": "vault", "content_types": ["video"], "snapshot_fingerprint": "0".repeat(64),
+            "entries": entries,
+        })
+        .to_string();
+        // Precondition (see `dense_noise_for`): the first, plaintext-budgeted teaser must seal
+        // over the budget, or the verification loop never has to act.
+        assert!(
+            hb_core::sealed_listing_len(&json) > json.len(),
+            "fixture sanity: the dense noise must seal larger than its plaintext"
+        );
+        let t = truncate_listing(&json, 40_000).unwrap();
+        assert!(t.truncated, "an incompressible over-budget listing must truncate");
+        // P-10 mutation: in `truncate_listing`'s verify loop, replace
+        // `if sealed <= max_bytes || entries_budget == 0 {` with `if true {` — must red this test
+        // (the first, plaintext-budgeted teaser is returned without ever measuring its seal).
+        let sealed = hb_core::sealed_listing_len(&t.json);
+        assert!(sealed <= 40_000, "the kept teaser sealed to {sealed}, over the 40_000 budget");
+        assert!(
+            t.shown_items > 0 && t.shown_items < t.total_items,
+            "a bounded selection is kept, got {}/{}",
+            t.shown_items,
+            t.total_items
+        );
+    }
+
     // ── audit #25 / QURATOR-123: the truncated teaser must not carry the full-tree digest ────────
 
     /// A listing whose `entries` decode as real `DirectoryItem`s — the shape
@@ -1010,6 +1378,7 @@ mod tests {
                     "name": format!("title-{i:05}-padding-padding-padding-xx"),
                     "item_type": "File",
                     "tags": [],
+                    "note": noise_for(i),
                     "children": [],
                 })
             })
@@ -1111,7 +1480,13 @@ mod tests {
         // `None` and keep the teaser. A foreign fixture (no `item_type`, extra keys on entries) is
         // the shape that fails the decode.
         let entries: Vec<Value> = (0..40)
-            .map(|i| serde_json::json!({ "name": format!("title-{i:05}-padding-padding-padding-xx"), "size": 1_000_000 + i }))
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("title-{i:05}-padding-padding-padding-xx"),
+                    "size": 1_000_000 + i,
+                    "note": noise_for(i),
+                })
+            })
             .collect();
         let json = serde_json::json!({
             "slug": "vault", "content_types": ["video"],
@@ -1136,7 +1511,7 @@ mod tests {
                 format: Some(format!("MKV{}", i % 10)),
                 year: None,
                 tags: vec![],
-                note: None,
+                note: Some(noise_for(i)),
                 children: vec![],
             })
             .collect()
@@ -1171,7 +1546,13 @@ mod tests {
         let entries: Vec<Value> = (0..20)
             .map(|i| {
                 let children: Vec<Value> = (0..50)
-                    .map(|j| serde_json::json!({ "name": format!("file-{i:02}-{j:03}.mkv"), "size": 1_000_000 + j }))
+                    .map(|j| {
+                        serde_json::json!({
+                            "name": format!("file-{i:02}-{j:03}.mkv"),
+                            "size": 1_000_000 + j,
+                            "note": noise_for(i * 50 + j),
+                        })
+                    })
                     .collect();
                 serde_json::json!({ "name": format!("folder-{i:02}"), "children": children })
             })
@@ -1219,7 +1600,11 @@ mod tests {
         // folder skeleton survives (pass 1 always emits a folder that fits) and SOME children are
         // shown — the directory shape is visible even when the budget can't hold everything.
         let children: Vec<Value> = (0..60)
-            .map(|i| serde_json::json!({ "name": format!("file-{i:03}.mkv"), "size": 1_000_000 + i }))
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("file-{i:03}.mkv"), "size": 1_000_000 + i, "note": noise_for(i),
+                })
+            })
             .collect();
         let json = serde_json::json!({
             "slug": "vault",
@@ -1265,6 +1650,11 @@ mod tests {
                 t.json.len(),
                 LISTING_MAX_BYTES
             );
+            // The budget's real measure: the SEALED teaser, not just its plaintext.
+            assert!(
+                hb_core::sealed_listing_len(&t.json) <= LISTING_MAX_BYTES,
+                "seed {seed}: sealed teaser exceeds the budget"
+            );
             // shown_items must equal count_nodes of the kept tree.
             let v: Value = serde_json::from_str(&t.json).unwrap();
             let kept_entries = v.get("entries").and_then(Value::as_array).unwrap();
@@ -1280,7 +1670,13 @@ mod tests {
         // skeletons — so pass 2 (round-robin) alone must populate top-level leaves. Without this
         // path the browser would render an empty teaser.
         let entries: Vec<Value> = (0..200)
-            .map(|i| serde_json::json!({ "name": format!("flat-file-{i:03}.mkv"), "size": 1_000_000 + i }))
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("flat-file-{i:03}.mkv"),
+                    "size": 1_000_000 + i,
+                    "note": noise_for(i),
+                })
+            })
             .collect();
         let json = serde_json::json!({ "slug": "flat", "content_types": ["video"], "entries": entries }).to_string();
         let t = truncate_listing(&json, 2_000).unwrap();
@@ -1307,10 +1703,13 @@ mod tests {
         for i in (0..30).rev() {
             leaf = serde_json::json!({ "name": format!("lvl-{i:02}"), "children": [leaf] });
         }
-        // Pad with many leaves so the listing clearly exceeds budget.
+        // Pad with many leaves so the listing clearly exceeds budget (noise notes: the budgets
+        // measure the sealed body, so padding must be incompressible to stay over it).
         let mut entries: Vec<Value> = vec![leaf];
         for i in 0..400 {
-            entries.push(serde_json::json!({ "name": format!("sibling-{i:03}.bin"), "size": 1 }));
+            entries.push(serde_json::json!({
+                "name": format!("sibling-{i:03}.bin"), "size": 1, "note": noise_for(i),
+            }));
         }
         let json = serde_json::json!({ "slug": "chain", "entries": entries }).to_string();
         let t = truncate_listing(&json, 1_500).unwrap();
@@ -1343,7 +1742,10 @@ mod tests {
         // Force the truncation path by setting a budget below the payload but above the empty
         // entries array — both entries survive, and the distinction must remain.
         let full = serde_json::json!({ "slug": "mix", "entries": entries }).to_string();
-        let small_budget = serde_json::to_string(&serde_json::from_str::<Value>(&full).unwrap()).unwrap().len() + 10;
+        // "Just over budget" is measured on the budget's real measure — the sealed body.
+        let small_budget = hb_core::sealed_listing_len(
+            &serde_json::to_string(&serde_json::from_str::<Value>(&full).unwrap()).unwrap(),
+        ) + 10;
         let t = truncate_listing(&full, small_budget).unwrap();
         // Under budget → not truncated, byte-identical.
         assert!(!t.truncated);
@@ -1361,9 +1763,12 @@ mod tests {
                 { "name": "child-2.bin", "size": 1 },
             ] }),
         ];
-        // Lots of top-level leaves to force the budget to engage meaningfully.
+        // Lots of top-level leaves to force the budget to engage meaningfully (noise notes keep
+        // the listing over the SEALED budget — the budgets no longer measure plaintext).
         for i in 0..100 {
-            mixed.push(serde_json::json!({ "name": format!("top-leaf-{i:03}.bin"), "size": 1 }));
+            mixed.push(serde_json::json!({
+                "name": format!("top-leaf-{i:03}.bin"), "size": 1, "note": noise_for(i),
+            }));
         }
         let full = serde_json::json!({ "slug": "mix2", "entries": mixed }).to_string();
         let t = truncate_listing(&full, 1_200).unwrap();
@@ -1414,10 +1819,18 @@ mod tests {
         // OLD depth-first packer filled the deep one and starved the shallow one. Breadth-first
         // round-robin must give BOTH at least one leaf before either gets a second.
         let deep_children: Vec<Value> = (0..40)
-            .map(|j| serde_json::json!({ "name": format!("deep-{j:02}.bin"), "size": 1 }))
+            .map(|j| {
+                serde_json::json!({
+                    "name": format!("deep-{j:02}.bin"), "size": 1, "note": noise_for(j),
+                })
+            })
             .collect();
         let shallow_children: Vec<Value> = (0..5)
-            .map(|j| serde_json::json!({ "name": format!("shallow-{j}.bin"), "size": 1 }))
+            .map(|j| {
+                serde_json::json!({
+                    "name": format!("shallow-{j}.bin"), "size": 1, "note": noise_for(100 + j),
+                })
+            })
             .collect();
         let json = serde_json::json!({
             "slug": "rr",
@@ -1427,8 +1840,9 @@ mod tests {
             ],
         })
         .to_string();
-        // Budget tight enough that not all leaves fit.
-        let t = truncate_listing(&json, 800).unwrap();
+        // Budget tight enough that not all leaves fit (the noise-noted leaves are ~150 B each, so
+        // 2 000 sealed keeps shallow's full set placeable while starving deep's tail).
+        let t = truncate_listing(&json, 2_000).unwrap();
         let v: Value = serde_json::from_str(&t.json).unwrap();
         let top = v.get("entries").and_then(Value::as_array).unwrap();
         assert_eq!(top.len(), 2, "both folder skeletons survive pass 1");
@@ -1506,9 +1920,14 @@ mod tests {
         obj.insert("name".into(), Value::String(format!("{name}-{id}")));
         obj.insert("size".into(), Value::from(rng.next_u32()));
         // A `note` field on ~half the nodes — the bytes that make a real listing exceed 40 KB.
+        // Random letters, not `"x".repeat`: the budgets measure the SEALED body, and a run of one
+        // byte zstd-crushes to nothing, which would leave the fixture under budget by design.
+        // Notes are sized so even the structurally smallest tree seals over the budget.
         if rng.next_range(2) == 0 {
-            let note_len = 20 + rng.next_range(120) as usize;
-            obj.insert("note".into(), Value::String("x".repeat(note_len)));
+            let note_len = 200 + rng.next_range(800) as usize;
+            let note: String =
+                (0..note_len).map(|_| (b'a' + rng.next_range(26) as u8) as char).collect();
+            obj.insert("note".into(), Value::String(note));
         }
         let is_folder = depth < 4 && rng.next_range(2) != 0;
         let child_count = if is_folder { 3 + rng.next_range(10) as usize } else { 0 };
@@ -1554,7 +1973,11 @@ mod tests {
     /// shape (e.g. 113k items under one root) the breadth-only v1 chunker cannot split (devtest #3).
     fn single_huge_entry() -> String {
         let children: Vec<Value> = (0..200)
-            .map(|i| serde_json::json!({ "name": format!("file-{i:05}.bin"), "size": 1234 }))
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("file-{i:05}.bin"), "size": 1234, "note": noise_for(i),
+                })
+            })
             .collect();
         serde_json::json!({
             "slug": "hoard",
@@ -1786,8 +2209,9 @@ mod tests {
     fn unsplittable_leaf_errors_clearly() {
         // A single file two levels deep whose own metadata alone exceeds the budget — no
         // shell/recurse can help (it's a leaf), so this must surface the same clear "too large"
-        // error a top-level oversize leaf would, not an opaque relay rejection downstream.
-        let huge_note = "x".repeat(2000);
+        // error a top-level oversize leaf would, not an opaque relay rejection downstream. The
+        // note is noise: under the sealed budgets a compressible "huge" note isn't huge.
+        let huge_note = noise(2000);
         let tree = serde_json::json!({
             "slug": "hoard2",
             "entries": [
@@ -1808,25 +2232,34 @@ mod tests {
     #[test]
     fn part_count_over_cap_and_index_over_budget_error_at_write_time() {
         // (a) Forcing more chunks than MAX_LISTING_PARTS must be refused before publishing that
-        // many events — a write-side DoS/cost guard.
-        let entries: Vec<Value> = (0..(MAX_LISTING_PARTS + 200))
+        // many events — a write-side DoS/cost guard. Packing runs on the PLAINTEXT budget
+        // (max_bytes, as a conservative estimate) and the count check fires only after every
+        // chunk has verified within the SEALED budget — so the forced count must clear
+        // MAX_LISTING_PARTS (4096) chunks of ~16 tiny entries each. MAX_LISTING_PARTS * 21
+        // entries guarantees it regardless of exact chunk fill.
+        let entries: Vec<Value> = (0..(MAX_LISTING_PARTS * 21 + 500))
             .map(|i| serde_json::json!({ "name": format!("f{i}") }))
             .collect();
         let tree = serde_json::json!({ "slug": "manyparts", "entries": entries }).to_string();
-        match split_listing("manyparts", &tree, 90) {
+        match split_listing("manyparts", &tree, 300) {
             Err(NetError::Split(m)) => assert!(m.contains("cap"), "got: {m}"),
             other => panic!("expected a part-count-cap rejection, got {other:?}"),
         }
 
-        // (b) Metadata alone (no entries) too large to fit the index even after moving entries out.
-        let padding = "y".repeat(2000);
+        // (b) Metadata alone (no entries) too large to fit the index even after moving entries
+        // out. Sealed budgets put a ~220-byte floor under the smallest shippable part, so the
+        // budget must clear that floor or the per-entry alone-test refuses the entries BEFORE the
+        // index check can fire (that exact wrong-error bug is why the budget is 1000, not 100).
+        // The padding is noise: a "y".repeat run compresses under NIP-44's zstd framing and the
+        // index would fit.
+        let padding = noise(2000);
         let tree2 = serde_json::json!({
             "slug": "bigmeta",
             "padding": padding,
             "entries": [ {"name": "a"}, {"name": "b"} ],
         })
         .to_string();
-        match split_listing("bigmeta", &tree2, 100) {
+        match split_listing("bigmeta", &tree2, 1000) {
             Err(NetError::Split(m)) => assert!(m.contains("index"), "got: {m}"),
             other => panic!("expected an index-over-budget rejection, got {other:?}"),
         }
@@ -2014,11 +2447,27 @@ mod tests {
     // one heavy folder the whole budget. These tests pin the production shape specifically.
 
     /// A file exactly as `DirectoryItem` serializes one: `item_type` present, `children` an empty
-    /// array (NOT an absent key).
+    /// array (NOT an absent key). A `note_len > 0` note is deterministic xorshift noise seeded
+    /// from the name (the budgets measure the SEALED body — a run of one byte would compress to
+    /// nothing and silently put the fixture back under budget).
     fn prod_file(name: &str, note_len: usize) -> Value {
         let mut o = serde_json::json!({ "name": name, "item_type": "File", "size": "1.0 GB", "children": [] });
         if note_len > 0 {
-            o.as_object_mut().unwrap().insert("note".into(), Value::String("x".repeat(note_len)));
+            const ALPHABET: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut state: u64 = 0x9E37_79B9_7F4A_7C15
+                ^ name.bytes().fold(0xcbf2_9ce4_8422_3255u64, |acc, b| {
+                    (acc ^ (b as u64)).wrapping_mul(0x100_0000_01B3)
+                });
+            let note: String = (0..note_len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    ALPHABET[(state & 63) as usize] as char
+                })
+                .collect();
+            o.as_object_mut().unwrap().insert("note".into(), Value::String(note));
         }
         o
     }
@@ -2045,7 +2494,7 @@ mod tests {
     fn heavy_first_folder_does_not_starve_siblings_in_production_shape() {
         // The headline W7.2 shape, rebuilt with production serialization: folder-00 is heavy
         // enough to swallow the budget on its own; 19 modest siblings follow.
-        let heavy: Vec<Value> = (0..80).map(|j| prod_file(&format!("big-{j:04}.bin"), 400)).collect();
+        let heavy: Vec<Value> = (0..80).map(|j| prod_file(&format!("big-{j:04}.bin"), 700)).collect();
         let mut entries = vec![prod_folder("folder-00", heavy)];
         for i in 1..20 {
             let kids: Vec<Value> =
@@ -2082,8 +2531,10 @@ mod tests {
     fn production_shape_round_robins_leaves_across_siblings() {
         // Sibling fairness, production shape: a deep folder and a shallow one, budget too small for
         // both in full. Neither may be starved to zero.
-        let deep: Vec<Value> = (0..40).map(|j| prod_file(&format!("deep-{j:02}.bin"), 0)).collect();
-        let shallow: Vec<Value> = (0..5).map(|j| prod_file(&format!("shallow-{j}.bin"), 0)).collect();
+        let deep: Vec<Value> =
+            (0..40).map(|j| prod_file(&format!("deep-{j:02}.bin"), 300)).collect();
+        let shallow: Vec<Value> =
+            (0..5).map(|j| prod_file(&format!("shallow-{j}.bin"), 300)).collect();
         let payload = serde_json::json!({
             "slug": "rr",
             "entries": [prod_folder("deep", deep), prod_folder("shallow", shallow)],

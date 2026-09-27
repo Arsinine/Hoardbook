@@ -2,7 +2,7 @@ use std::path::Path;
 use globset::{Glob, GlobSetBuilder};
 use hb_core::types::{Collection, DirectoryItem, ItemType, Visibility};
 use hb_core::{BrowseKey, Identity};
-use hb_net::{publish_listing_capped, publish_listing_to, split_listing};
+use hb_net::{publish_listing_capped, publish_listing_to};
 use nostr::{Event, Filter, Kind};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -15,8 +15,14 @@ use crate::{
     SharedIdentity,
 };
 
-/// NIP-44 listing split budget (NIP-44 caps plaintext, the relay caps the event ~64 KiB; ≤40 KB
-/// keeps a single part well under both). Larger listings split per-folder (hb-net::split_listing).
+/// Relay listing-event budget, measured on the **sealed** event content — the base64 NIP-44
+/// ciphertext `hb_core::encrypt_listing` produces (`hb_core::sealed_listing_len`), which is what a
+/// relay actually stores and serves — never on the plaintext JSON. QURATOR-344 sealed the
+/// zstd-compressed body, so a 10k-file listing (~948 KB of JSON) seals to ~9 KB and ships as ONE
+/// part. The 40 KB cap STAYS (the relay rejects an event around 64 KiB and this is the anti-ban
+/// budget beneath it); only the measure changed. Larger listings split per-folder
+/// (`hb_net::split_listing`, sealed measure) or truncate to a paywall teaser
+/// (`hb_net::truncate_listing`, same sealed measure).
 ///
 /// `pub(crate)` so the WAN-E2E harness (`crate::wan_it`) can use the exact production truncation
 /// threshold — a harness-private copy could drift from the real budget and make the truncating-seed
@@ -27,6 +33,10 @@ pub(crate) const LISTING_MAX_BYTES: usize = 40_000;
 /// Nothing here publishes per-part to a relay — one signed envelope carries every part inline as a
 /// single framed iroh stream or one `.hbmanifest` file — so the anti-ban budget is irrelevant and
 /// the real ceiling is NIP-44's 65_408-byte plaintext cap (the value `hb-net`'s split tests pin).
+/// PLAINTEXT-MEASURED BY DESIGN and consumed through `hb_net::split_listing_for_manifest`: the
+/// manifest carrier emits no per-part relay events, so its budget is the seal's plaintext
+/// ACCEPTANCE cap, not the sealed event-content size the relay path measures. Do not switch it to
+/// sealed — that would shrink parts ~25% below what the seal accepts for no constraint.
 pub(crate) const MANIFEST_SPLIT_MAX_BYTES: usize = 65_408;
 
 /// Hard cap on items (files + folders, [`count_items`]'s definition) per collection — owner
@@ -1221,11 +1231,14 @@ pub(crate) fn build_slug_manifest(
     // `.hbmanifest` can hold a collection of ANY size (the envelope stores the encrypted parts inline,
     // bounded by part count, not by one event's plaintext cap). A listing that fits one event yields a
     // single part (the small-collection case, unchanged).
-    let parts: Vec<String> = split_listing(safe_slug, &plaintext, MANIFEST_SPLIT_MAX_BYTES)
-        .map_err(cmd_err)?
-        .into_iter()
-        .map(|part| part.json)
-        .collect();
+    // The manifest carrier's budget measures the PLAINTEXT part (the seal's acceptance cap) —
+    // `split_listing_for_manifest`, not the relay path's sealed measure.
+    let parts: Vec<String> =
+        hb_net::split_listing_for_manifest(safe_slug, &plaintext, MANIFEST_SPLIT_MAX_BYTES)
+            .map_err(cmd_err)?
+            .into_iter()
+            .map(|part| part.json)
+            .collect();
     hb_core::manifest::build_manifest_envelope(
         identity,
         safe_slug,
@@ -4092,18 +4105,34 @@ mod tests {
 
     // ── audit #25 / QURATOR-123: the truncated teaser's digest + the carriers' teaser digest ────
 
-    /// A collection big enough to truncate at the real `LISTING_MAX_BYTES` (40 KB).
+    /// A collection big enough to truncate at the real `LISTING_MAX_BYTES` (40 KB). The per-entry
+    /// `note` is deterministic xorshift noise (the suite_n `big_listing` pattern): the budgets
+    /// measure the SEALED body, and a compressible fixture would no longer be over budget.
     fn a_big_collection(slug: &str) -> Collection {
+        const ALPHABET: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let listing: Vec<DirectoryItem> = (0..1300)
-            .map(|i| DirectoryItem {
-                name: format!("title-{i:05}-padding-padding-padding-xx.mkv"),
-                item_type: ItemType::File,
-                size: None,
-                format: None,
-                year: None,
-                tags: vec![],
-                note: None,
-                children: vec![],
+            .map(|i| {
+                let mut state: u64 =
+                    0x9E37_79B9_7F4A_7C15 ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let note: String = (0..96)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        ALPHABET[(state & 63) as usize] as char
+                    })
+                    .collect();
+                DirectoryItem {
+                    name: format!("title-{i:05}-padding-padding-padding-xx.mkv"),
+                    item_type: ItemType::File,
+                    size: None,
+                    format: None,
+                    year: None,
+                    tags: vec![],
+                    note: Some(note),
+                    children: vec![],
+                }
             })
             .collect();
         Collection {
@@ -4171,7 +4200,12 @@ mod tests {
         let env = build_slug_manifest("vault", &store, &identity, &browse_key).unwrap();
         // The teaser the same publish produces, derived through the production truncation.
         let full = collection_to_listing_json(col).unwrap();
-        let t = hb_net::truncate_listing(&full, LISTING_MAX_BYTES).unwrap();
+        // The publish path truncates the STAMPED bytes (`stamp_for_teaser` adds `teaser_fingerprint`
+        // to the meta), so the teaser this test compares against must be derived from them too.
+        // Under the sealed-size budget (QURATOR-344) those extra meta bytes move the cut by an
+        // entry, so a teaser derived from the unstamped bytes is not the one the relay carries.
+        let stamped = stamp_for_teaser(&full, "").unwrap();
+        let t = hb_net::truncate_listing(&stamped, LISTING_MAX_BYTES).unwrap();
         assert!(t.truncated);
         let teaser_fp = serde_json::from_str::<serde_json::Value>(&t.json)
             .unwrap()

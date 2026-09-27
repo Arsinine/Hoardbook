@@ -49,10 +49,12 @@ pub struct PublishedListing {
     pub total_items: usize,
 }
 
-/// Publish a collection listing: encrypt under `browse_key`, split per-folder when it exceeds
-/// `max_bytes`, and publish the index + every content part as parameterized-replaceable events
-/// (re-publishing the same slug supersedes the prior listing — N3). Re-keying is just supplying a
-/// fresh `browse_key` here (the per-collection symmetric key, not the `npub` identity).
+/// Publish a collection listing: encrypt under `browse_key`, split per-folder when its **sealed**
+/// event content exceeds `max_bytes` (`hb_core::sealed_listing_len` — the measure is what the relay
+/// stores and serves, never the plaintext), and publish the index + every content part as
+/// parameterized-replaceable events (re-publishing the same slug supersedes the prior listing —
+/// N3). Re-keying is just supplying a fresh `browse_key` here (the per-collection symmetric key,
+/// not the `npub` identity).
 pub async fn publish_listing(
     client: &RelayClient,
     identity: &Identity,
@@ -69,8 +71,9 @@ pub async fn publish_listing(
     Ok(PublishedListing { parts: parts.len(), truncated: false, shown_items: 0, total_items: 0 })
 }
 
-/// Publish a collection listing as a SINGLE event, truncating it (paywall-style) to `max_bytes`
-/// instead of splitting an oversize listing across many part events (devtest #7). A listing that fits
+/// Publish a collection listing as a SINGLE event, truncating it (paywall-style) when its **sealed**
+/// event content exceeds `max_bytes` (same sealed measure as [`publish_listing`]) instead of
+/// splitting an oversize listing across many part events (devtest #7). A listing that fits
 /// publishes whole; an oversize one publishes a byte-bounded prefix of its tree tagged `truncated` +
 /// `total_items` so a browser renders the kept items behind a "N more hidden" fade. One write, so the
 /// relay-write rate limiter never sees a part flood — the whole reason the owner chose truncation
@@ -1380,11 +1383,17 @@ mod tests {
         // A real split under a small budget, so the part count comes from the production packer.
         let json = serde_json::json!({
             "slug": "vault",
-            "entries": (0..80).map(|i| serde_json::json!({ "name": format!("f{i}-pad-pad-pad-pad") }))
+            // Distinct per-entry hex (a hash of the index): repetitive names would compress under
+            // the sealed budget (QURATOR-344) and never split.
+            "entries": (0..80)
+                .map(|i| {
+                    let h = format!("{:016x}", (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                    serde_json::json!({ "name": format!("f{i}-{h}") })
+                })
                 .collect::<Vec<_>>(),
         })
         .to_string();
-        let parts = split_listing("vault", &json, 2_000).unwrap();
+        let parts = split_listing("vault", &json, 1_200).unwrap();
         assert!(parts.len() > 2, "the listing must actually split");
         let n = parts.len() - 1; // split_listing ships index + n content parts
 
@@ -1840,11 +1849,25 @@ mod tests {
     /// truncated output's digest re-derivation (audit #25) has a decodable `DirectoryItem` tree to
     /// hash — a fixture without them would take the "drop the fingerprint" path instead.
     fn big_listing_with_fp(slug: &str, n: usize, fp: &str) -> String {
+        // Per-entry noise notes (the suite_n pattern): the publish budgets measure the SEALED
+        // body, so a compressible fixture would no longer be over budget.
+        const ALPHABET: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let entries: Vec<serde_json::Value> = (0..n)
             .map(|i| {
+                let mut state: u64 =
+                    0x9E37_79B9_7F4A_7C15 ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let note: String = (0..96)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        ALPHABET[(state & 63) as usize] as char
+                    })
+                    .collect();
                 serde_json::json!({
                     "name": format!("title-{i:05}-padding-padding-padding-xx"),
-                    "item_type": "File", "tags": [], "children": [],
+                    "item_type": "File", "tags": [], "note": note, "children": [],
                 })
             })
             .collect();

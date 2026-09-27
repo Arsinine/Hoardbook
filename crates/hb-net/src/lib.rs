@@ -60,7 +60,10 @@ pub use nip65::{bootstrap_order, build_relay_list, inbox_order, parse_relay_list
 pub use priv_browse::{dedup_newest, fetch_key_grants, fetch_private_listings, publish_private_listing};
 pub use pow::{leading_zero_bits, mine_pow, pow_difficulty};
 pub use render::{render_listing, RenderedListing, MAX_LISTING_PARTS};
-pub use split::{restitch_listing, split_listing, truncate_listing, ListingPart, TruncatedListing};
+pub use split::{
+    restitch_listing, split_listing, split_listing_for_manifest, truncate_listing, ListingPart,
+    TruncatedListing,
+};
 pub use topic::{
     announce_to_topic, approve_join, discover_public_topics, discover_public_topics_paint,
     fetch_announce, fetch_channel, fetch_channel_full, fetch_invite, fetch_join_requests,

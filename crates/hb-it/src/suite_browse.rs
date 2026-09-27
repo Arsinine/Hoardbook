@@ -66,20 +66,52 @@ fn listing(slug: &str, n: usize) -> String {
     serde_json::json!({ "slug": slug, "content_types": ["video"], "entries": entries }).to_string()
 }
 
-/// A listing big enough to force a split under a 40 KiB part budget (≈70 KiB normalized at
-/// n=1300, so the greedy chunker yields an index + ≥2 content parts).
+/// A listing big enough to force a split under a 40 KB part budget. The per-entry `note` is
+/// deterministic xorshift noise (the suite_n `big_listing` pattern): the publish budgets measure
+/// the SEALED body, so repetitive padding would seal to a few KB and no longer split.
 fn big_listing(slug: &str, n: usize) -> String {
+    const ALPHABET: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let entries: Vec<Value> = (0..n)
-        .map(|i| serde_json::json!({ "name": format!("title-{i:05}-padding-padding-padding-xx") }))
+        .map(|i| {
+            let mut state: u64 = 0x9E37_79B9_7F4A_7C15 ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let note: String = (0..96)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    ALPHABET[(state & 63) as usize] as char
+                })
+                .collect();
+            serde_json::json!({
+                "name": format!("title-{i:05}-padding-padding-padding-xx"), "note": note,
+            })
+        })
         .collect();
     serde_json::json!({ "slug": slug, "content_types": ["video"], "entries": entries }).to_string()
 }
 
 /// The real hoard shape (devtest #3 / M13): ONE root folder with `n` padded leaf files under it —
-/// v1's breadth-only chunker could never split this; the depth-recursive v2 packer must.
+/// v1's breadth-only chunker could never split this; the depth-recursive v2 packer must. Leaves
+/// carry per-index noise notes (see `big_listing`): the budgets measure the SEALED body.
 fn deep_listing(slug: &str, n: usize) -> String {
+    const ALPHABET: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let children: Vec<Value> = (0..n)
-        .map(|i| serde_json::json!({ "name": format!("file-{i:05}-padding-padding-padding-xx.bin") }))
+        .map(|i| {
+            let mut state: u64 = 0x9E37_79B9_7F4A_7C15 ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let note: String = (0..96)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    ALPHABET[(state & 63) as usize] as char
+                })
+                .collect();
+            serde_json::json!({
+                "name": format!("file-{i:05}-padding-padding-padding-xx.bin"), "note": note,
+            })
+        })
         .collect();
     serde_json::json!({
         "slug": slug, "content_types": ["video"],

@@ -130,6 +130,56 @@ pub fn encrypt_listing(browse_key: &BrowseKey, listing_json: &str) -> Result<Str
     Ok(B64.encode(bytes))
 }
 
+/// The sealed length of `framed` bytes under NIP-44 v2 **plus base64**, exactly as
+/// [`encrypt_listing`] produces it: `1` version byte `+ 32` nonce `+ (2 + padding)` length-prefixed
+/// padded plaintext `+ 32` HMAC, base64'd at 4 chars per 3 bytes. The padding schedule
+/// ([`nip44_calc_padding`]) is nostr's, reproduced verbatim so the count is exact.
+const fn sealed_bytes_len(framed_len: usize) -> usize {
+    let padded = nip44_calc_padding(framed_len);
+    let payload = 1 + 32 + (2 + padded) + 32;
+    payload.div_ceil(3) * 4
+}
+
+/// NIP-44 v2's padding schedule (nostr 0.44 `calc_padding`, reproduced verbatim): ≤32 rounds up to
+/// 32; above that the next power of two sets a chunk size (`32` up to 256, else `power/8`) and the
+/// length rounds up to the next multiple of that chunk. Reproduced here — not called — because the
+/// padded length is a pure function of plaintext length and the budget checks must not pay for a
+/// key, a nonce, or a compression of anything but the body being measured.
+const fn nip44_calc_padding(len: usize) -> usize {
+    if len <= 32 {
+        return 32;
+    }
+    let log2_floor = (usize::BITS - 1) - (len - 1).leading_zeros();
+    let nextpower = 1usize << (log2_floor + 1);
+    let chunk = if nextpower <= 256 { 32 } else { nextpower / 8 };
+    chunk * (((len - 1) / chunk) + 1)
+}
+
+/// NIP-44 v2's largest sealable plaintext (nostr `MAX_SUPPORTED_PLAINTEXT_SIZE` = 65_536 − 128).
+pub const MAX_SEAL_PLAINTEXT: usize = 65_408;
+
+/// The byte length of the base64 event content [`encrypt_listing`] would produce for
+/// `listing_json` — the SEALED size, what the relay actually stores and serves. NIP-44 v2's
+/// ciphertext length is deterministic in the plaintext length (the nonce is a fixed 32 bytes in the
+/// payload; only its content is random), so this is an **exact** measure, not an estimate. Cost: one
+/// zstd default-level compression pass over the JSON, no key material, no nonce — cheap enough to
+/// call per part during split/truncate budgeting.
+///
+/// Returns `usize::MAX` when the framed body would exceed [`MAX_SEAL_PLAINTEXT`] (or zstd fails) —
+/// a length no listing can be sealed at, which every `<= budget` comparison reads as over-budget.
+pub fn sealed_listing_len(listing_json: &str) -> usize {
+    let compressed = match zstd::stream::encode_all(listing_json.as_bytes(), 0) {
+        Ok(c) => c,
+        Err(_) => return usize::MAX,
+    };
+    // compress_body frames `[LISTING_PAYLOAD_V] ++ zstd(plain)` — one byte before the stream.
+    let framed_len = 1 + compressed.len();
+    if framed_len > MAX_SEAL_PLAINTEXT {
+        return usize::MAX;
+    }
+    sealed_bytes_len(framed_len)
+}
+
 /// Derive the NIP-44 conversation key from a **content-encryption key** for a given crypto
 /// version. Same labelled-HKDF construction as [`conversation_key`] (RFC 5869 domain separation),
 /// but with a **distinct salt** (`hoardbook/cek`) and `info` (`hoardbook/cek/v…`), so a CEK and a
@@ -224,6 +274,59 @@ mod tests {
         // Valid base64 whose bytes are a NIP-44 v2 payload (version byte 0x02 first).
         let raw = B64.decode(ct.as_bytes()).expect("content must be base64");
         assert_eq!(raw[0], 2, "NIP-44 v2 payload begins with version byte 2");
+    }
+
+    #[test]
+    fn sealed_len_matches_the_real_seal_at_every_bucket() {
+        // The budget checks measure with `sealed_listing_len` and never with the plaintext, so the
+        // formula must be byte-exact against the real seal — including at the padding bucket edges
+        // (32 / 33 / 64 / 65 / 4096 / 4097) and the top of the sealable range (65,408, where the
+        // payload is at MAX_PAYLOAD_SIZE). `incompressible` uses xorshift noise so the compressed
+        // length tracks the requested plaintext length instead of collapsing.
+        let bk: BrowseKey = [9u8; 32];
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut noise = |len: usize| -> String {
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    ALPHABET[(state & 63) as usize] as char
+                })
+                .collect()
+        };
+        let mut sizes: Vec<usize> = vec![0, 1, 31, 32, 33, 63, 64, 65, 100, 1000, 4096, 4097];
+        sizes.extend([30_000, 65_407, 65_408]);
+        for &size in &sizes {
+            let json = if size == 0 {
+                String::new()
+            } else {
+                noise(size)
+            };
+            assert_eq!(
+                sealed_listing_len(&json),
+                encrypt_listing(&bk, &json).unwrap().len(),
+                "sealed length must be exact at plaintext size {size}"
+            );
+        }
+        // Past the cap the seal would fail — the measure reads over-budget instead. The cap bites
+        // on the COMPRESSED framing (1 frame byte + zstd stream), so plain 65,409 noise bytes
+        // compress to ~57 KB and still seal — the fixture must be big enough that its compressed
+        // size clears the cap too.
+        let over = noise(100_000);
+        // P-10 mutation: in `sealed_bytes_len`, change the trailing `+ 32` (HMAC) to `+ 31` —
+        // must red this test (the measure under-reads every real seal by 1 base64 byte).
+        assert_eq!(
+            sealed_listing_len(&over),
+            usize::MAX,
+            "a body whose compressed framing exceeds the NIP-44 plaintext cap must measure unsealable"
+        );
+        // And MAX must mean exactly "the real seal refuses": pin the correspondence.
+        assert!(
+            encrypt_listing(&bk, &over).is_err(),
+            "usize::MAX must correspond to a seal that actually fails"
+        );
     }
 
     #[test]

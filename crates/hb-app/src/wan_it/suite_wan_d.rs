@@ -1022,10 +1022,19 @@ fn full_listing(slug: &str, n: usize, fp: &str) -> String {
         // `stamp_teaser_fingerprint` takes its documented "underivable" branch and returns the
         // listing UNCHANGED — silently. That is exactly how D4 kept failing with `teaser_fp=<none>`
         // after the stamp call was added (QURATOR-169, second pass).
-        .map(|i| serde_json::json!({
-            "name": format!("title-{i:05}-padding-padding-padding-xx"),
-            "item_type": "File",
-        }))
+        // Per-entry hex (a hash of the index): the budget measures the SEALED size since
+        // QURATOR-344, and repetitive names would compress under it and never truncate.
+        .map(|i| {
+            let h = (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            serde_json::json!({
+                "name": format!(
+                    "title-{i:05}-{h:016x}{:016x}{:016x}",
+                    h.rotate_left(31) ^ 0xD1B5_4A32_D192_ED03,
+                    h.rotate_left(47).wrapping_mul(0x2545_F491_4F6C_DD1D)
+                ),
+                "item_type": "File",
+            })
+        })
         .collect();
     serde_json::json!({
         "slug": slug, "content_types": ["video"], "snapshot_fingerprint": fp, "entries": entries,

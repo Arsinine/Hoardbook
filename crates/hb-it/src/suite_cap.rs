@@ -26,6 +26,15 @@
 //! is therefore narrow — roughly 40,000-42,000 bytes of metadata — and its exact edge moves with
 //! NIP-44's padding steps. CAP2 consequently scales the BUDGET down rather than the metadata up:
 //! same code path, same semantics, no dependence on where a padding bucket happens to land.
+//!
+//! RE-MEASURED, 2026-09-27 (QURATOR-344 fallout): the publish budgets now measure the **SEALED**
+//! size (`hb_core::sealed_listing_len`: zstd, then NIP-44, then base64), so a repetitive fixture
+//! that padded in *plaintext* now seals to a few KB and exercises nothing. The size-driving bytes
+//! in every fixture here are therefore deterministic per-index xorshift noise (6 bits/char, so
+//! zstd cannot shrink them), while the metadata fields stay at their ceilings with the worst-case
+//! escape character. CAP2's lesson sharpens under compression: *compressible* metadata can no
+//! longer starve the tree at any realistic size — the hazard needs incompressible metadata, which
+//! is exactly what the fixture now uses.
 
 use anyhow::{ensure, Result};
 use hb_core::{Identity, ShareCode};
@@ -66,6 +75,25 @@ fn bk(seed: u8) -> [u8; 32] {
     [seed; 32]
 }
 
+/// Deterministic incompressible padding — a per-seed xorshift64 stream over a 64-char alphabet (6
+/// bits/char, so zstd cannot shrink it). The budgets measure the SEALED body, so repetitive
+/// padding is vacuous; this keeps the fixture byte-identical across runs (round-trip assertions
+/// stay exact) while making the SPLIT, not the compressor, decide the sizes. The same pattern as
+/// suite_n/suite_browse's `big_listing` and suite_v5's `pseudo_hex`.
+pub(crate) fn noise(seed: u64, len: usize) -> String {
+    const ALPHABET: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15 ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut out = String::with_capacity(len);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.push(ALPHABET[(state & 63) as usize] as char);
+    }
+    out
+}
+
 /// The most expensive character JSON can carry: serde escapes U+0001 to the six bytes `\u0001`,
 /// which costs more than a 4-byte emoji. Using it makes the fixture an upper bound rather than a
 /// typical case — the same choice hb-app's `envelope_at_caps_leaves_the_tree_its_budget` makes.
@@ -77,10 +105,15 @@ fn entries(n: usize) -> Vec<Value> {
     // `DirectoryItem` tree to hash — without them the teaser takes the "drop the digest" path and
     // the fixture stops exercising the production shape. Cheap (~30 bytes/entry) relative to the
     // padding that drives the budget.
+    // Each entry also carries a 96-char noise `note` (see [`noise`]): under the sealed measure a
+    // repetitive entry list seals to a few KB and the teaser never truncates, so CAP1's premise
+    // ("far past the budget") and CAP2's ok-leg contrast both depend on the entries themselves
+    // being size-real. ~80 B sealed per entry.
     (0..n)
         .map(|i| {
             serde_json::json!({
                 "name": format!("title-{i:05}-padding-padding-padding-xx"),
+                "note": noise(i as u64 ^ 0x5A5A_5A5A_5A5A_5A5A, 96),
                 "item_type": "File", "tags": [], "children": [],
             })
         })
@@ -114,13 +147,15 @@ fn max_metadata_listing(slug: &str, n: usize) -> String {
     .to_string()
 }
 
-/// A minimal envelope whose size is dialled purely by `desc_chars` (plain ASCII, so bytes track
-/// characters). CAP2 needs to cross a budget predictably, not to be maximal.
+/// A minimal envelope whose size is dialled purely by `desc_chars`. The description is noise (see
+/// [`noise`]), not `"d".repeat` — under the sealed measure a repetitive description compresses to
+/// ~nothing and the starved leg no longer starves. CAP2 needs to cross a budget predictably, not
+/// to be maximal, and incompressible is the worst case the sealed measure actually enforces.
 fn padded_listing(slug: &str, desc_chars: usize, n: usize) -> String {
     serde_json::json!({
         "slug": slug,
         "path_alias": "Vault",
-        "description": "d".repeat(desc_chars),
+        "description": noise(7, desc_chars),
         "item_count": n,
         "content_types": ["video"],
         "snapshot_fingerprint": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
@@ -160,8 +195,9 @@ async fn cap1(ctx: &Ctx) -> Result<()> {
     let key = bk(31);
     ensure_budget_matches_hb_app()?;
     let slug = ctx.tag("cap1");
-    // 1300 entries is far past the budget, so the teaser MUST truncate — truncation is where a fat
-    // envelope silently eats the whole allowance.
+    // 1300 noise-note entries seal far past the 40 KB budget (measured ~250 KB sealed), so the
+    // teaser MUST truncate — truncation is where a fat envelope silently eats the whole allowance.
+    // Measured 2026-09-27: ~198 entries survive into the teaser.
     let listing = max_metadata_listing(&slug, 1300);
 
     let (shown, entries) =
@@ -193,7 +229,11 @@ async fn cap2(ctx: &Ctx) -> Result<()> {
     let key = bk(32);
     const TIGHT_BUDGET: usize = 4_000;
 
-    // Envelope alone past the budget ⇒ `entries_budget` saturates to 0 ⇒ nothing is packed.
+    // Envelope alone past the budget ⇒ `entries_budget` saturates to 0 ⇒ nothing is packed. Under
+    // the sealed measure the envelope must be INCOMPRESSIBLE for this to happen at all (measured
+    // 2026-09-27: a 6,000-char noise description seals to ~8 KB > the 4,000 budget; the same text
+    // as `"d".repeat` seals to ~150 B and starves nothing). Compressible metadata is effectively
+    // harmless — see the module note for what that means for the hazard.
     let slug = ctx.tag("cap2");
     let starved = padded_listing(&slug, 6_000, 1300);
     let (shown, entries) =

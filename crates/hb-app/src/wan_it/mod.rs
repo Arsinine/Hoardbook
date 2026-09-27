@@ -317,11 +317,11 @@ fn unix_now() -> u64 {
 /// The fixed slug the E2E serve seeds (matches the probe's `SEED_SLUG`).
 const E2E_SLUG: &str = "wan-e2e";
 
-/// How many small files to generate for the truncating seed tree. Each file entry serializes to ~120
-/// bytes of JSON (`{"name":"file-NNNN.bin","item_type":"File","tags":[],"children":[]}`), so 600 files
-/// is ~72 KB of entries alone — comfortably over the 40 KB truncation budget. The harness generates
-/// these into a temp dir at serve startup.
-const E2E_SEED_FILE_COUNT: usize = 600;
+/// How many small files to generate for the truncating seed tree. The 40 KB budget measures the
+/// SEALED (compressed) size since QURATOR-344, so the count only works together with
+/// `generate_truncating_seed_tree`'s per-file hex tags, which keep the names from compressing away. The
+/// harness generates these into a temp dir at serve startup.
+const E2E_SEED_FILE_COUNT: usize = 1500;
 
 /// Seed a truncating collection from `e2e_seed_dir`, generate enough small files to exceed the 40 KB
 /// teaser budget, and publish the teaser via the production path (`publish_listing_capped`). Then bind
@@ -333,7 +333,7 @@ async fn setup_e2e_serve(
 ) -> Result<()> {
     // (1) Generate the seed tree into e2e_seed_dir. If the dir already has the files (a prior run),
     // leave them — the scan reads whatever is there. The --republish flag rewrites them.
-    generate_seed_tree(Path::new(e2e_seed_dir), E2E_SEED_FILE_COUNT, 0)?;
+    generate_truncating_seed_tree(Path::new(e2e_seed_dir), E2E_SEED_FILE_COUNT, 0)?;
     eprintln!(
         "[serve] E2E seed tree: {} files in {e2e_seed_dir}",
         E2E_SEED_FILE_COUNT
@@ -463,7 +463,7 @@ async fn republish_e2e_seed(
     // Generate a DIFFERENT number of files than the original (E2E_SEED_FILE_COUNT + 200). This changes
     // the listing → changes the snapshot fingerprint → the probe's staleness gate fires.
     let new_count = E2E_SEED_FILE_COUNT + 200;
-    generate_seed_tree(Path::new(e2e_seed_dir), new_count, 1)?;
+    generate_truncating_seed_tree(Path::new(e2e_seed_dir), new_count, 1)?;
     eprintln!("[serve] E2E republish: rewrote seed tree to {new_count} files");
 
     let (identity, browse_key, _transport_key, _own_npub) = {
@@ -490,6 +490,26 @@ async fn republish_e2e_seed(
 /// numbered from `offset` so a republish produces a distinct tree (different names → different
 /// fingerprint). The files are tiny (a few bytes each) — only the ENTRY COUNT matters for exceeding
 /// the truncation budget, not the file sizes.
+/// The E2E seed tree, which must TRUNCATE at the 40 KB budget. Listings are zstd-compressed before
+/// sealing and the budget measures the SEALED size since QURATOR-344, so sequential names like
+/// `file-0001.bin` compress under it. Each name here carries a hex tag (a hash of its index), which
+/// keeps it from compressing away. Deterministic, so reruns build the same tree. Other suites keep
+/// [`generate_seed_tree`]'s plain names, which some of them assert on (suite_wan_carry's decoy check).
+fn generate_truncating_seed_tree(dir: &Path, count: usize, offset: usize) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| anyhow!("create seed dir {dir:?}: {e}"))?;
+    for i in 0..count {
+        let tag = ((offset + i) as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let name = format!(
+            "file-{:04}-{tag:016x}{:016x}.bin",
+            offset + i,
+            tag.rotate_left(29) ^ 0xD1B5_4A32_D192_ED03
+        );
+        let path = dir.join(&name);
+        std::fs::write(&path, b"x").map_err(|e| anyhow!("write seed file {path:?}: {e}"))?;
+    }
+    Ok(())
+}
+
 fn generate_seed_tree(dir: &Path, count: usize, offset: usize) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| anyhow!("create seed dir {dir:?}: {e}"))?;
     for i in 0..count {
@@ -1863,7 +1883,7 @@ mod tests {
         // publishes (E2E_SEED_FILE_COUNT was chosen to exceed the 40 KB teaser budget).
         let app = AppIdentity::generate();
         let seed_dir = dir.path().join("seed");
-        generate_seed_tree(&seed_dir, E2E_SEED_FILE_COUNT, 0).unwrap();
+        generate_truncating_seed_tree(&seed_dir, E2E_SEED_FILE_COUNT, 0).unwrap();
         seed_collection(
             &store,
             &app.identity,

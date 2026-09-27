@@ -175,11 +175,28 @@ fn listing(slug: &str, n: usize) -> String {
     serde_json::json!({ "slug": slug, "content_types": ["video"], "entries": entries }).to_string()
 }
 
-/// A listing big enough to force a split under a 40 KiB part budget (matches
-/// `hb-it/suite_browse::big_listing`).
+/// A listing big enough to force a split under a 40 KB part budget (matches
+/// `hb-it/suite_browse::big_listing`). Per-entry `note` = deterministic xorshift noise (the
+/// suite_n pattern): the publish budgets measure the SEALED body, so repetitive padding would
+/// seal to a few KB and no longer split.
 fn big_listing(slug: &str, n: usize) -> String {
+    const ALPHABET: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let entries: Vec<Value> = (0..n)
-        .map(|i| serde_json::json!({ "name": format!("title-{i:05}-padding-padding-padding-xx") }))
+        .map(|i| {
+            let mut state: u64 = 0x9E37_79B9_7F4A_7C15 ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let note: String = (0..96)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    ALPHABET[(state & 63) as usize] as char
+                })
+                .collect();
+            serde_json::json!({
+                "name": format!("title-{i:05}-padding-padding-padding-xx"), "note": note,
+            })
+        })
         .collect();
     serde_json::json!({ "slug": slug, "content_types": ["video"], "entries": entries }).to_string()
 }
@@ -1095,11 +1112,12 @@ mod tests {
     #[test]
     fn big_listing_is_oversize_for_40k_budget() {
         let json = big_listing("big", 1300);
-        // The serialized JSON must exceed the 40 KB budget to force a split (the PUB2/U3 discriminator).
+        // The SEALED body must exceed the 40 KB budget to force a split (the PUB2/U3
+        // discriminator) — the budgets measure what the relay stores, never the plaintext.
         assert!(
-            json.len() > LISTING_MAX_BYTES,
-            "big_listing(1300) = {} bytes, must exceed {} to force a split",
-            json.len(),
+            hb_core::sealed_listing_len(&json) > LISTING_MAX_BYTES,
+            "big_listing(1300) sealed to {} bytes, must exceed {} to force a split",
+            hb_core::sealed_listing_len(&json),
             LISTING_MAX_BYTES
         );
     }

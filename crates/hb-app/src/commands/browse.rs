@@ -1826,7 +1826,12 @@ mod tests {
         let id = Identity::generate();
         let bk: [u8; 32] = [9u8; 32];
         let entries: Vec<serde_json::Value> = (0..2000)
-            .map(|i| serde_json::json!({"name": format!("file-{i:05}.mkv"), "item_type": "File", "tags": [], "children": []}))
+            // Per-entry hex: the relay budget measures the SEALED size since QURATOR-344, so
+            // repetitive names would compress into one part and the family would never split.
+            .map(|i| {
+                let h = (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                serde_json::json!({"name": format!("file-{i:05}-{h:016x}{:016x}.mkv", h.rotate_left(31) ^ 0xD1B5_4A32_D192_ED03), "item_type": "File", "tags": [], "children": []})
+            })
             .collect();
         let listing_json = serde_json::json!({
             "slug": "vault", "path_alias": "vault", "item_count": entries.len(),
