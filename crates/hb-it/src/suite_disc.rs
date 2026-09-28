@@ -24,6 +24,7 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
         result("DISC3 teaser-only", disc3(ctx).await),
         result("DISC4 invalid filter rejected", disc4().await),
         result("DISC6 search_peers orchestration (dedup/cap/teaser-only)", disc6(ctx).await),
+        result("DISC7 a maximal honest teaser (16 KB picture + full collection list) is searchable", disc7(ctx).await),
         disc5(ctx).await,
     ]
 }
@@ -175,6 +176,38 @@ async fn disc3(ctx: &Ctx) -> Result<()> {
 async fn disc4() -> Result<()> {
     // Empty tags AND empty content-types is refused before any relay query.
     ensure!(teaser_search_filter(&[], &[]).is_err(), "empty discovery filter was not rejected");
+    Ok(())
+}
+
+/// DISC7 (QURATOR-355): a teaser at every cap `build_teaser` allows — picture at
+/// TEASER_PICTURE_MAX_BYTES, the full collection list, a long bio — crosses the relay and surfaces
+/// through the production `search_teasers` (which applies the AB3 `MAX_TEASER_BYTES` ingest bound).
+/// Before the fix the 16 KB avatar alone exceeded the old 8 KB bound and the author vanished.
+/// P-10 mutation: set `hb_net::discover::MAX_TEASER_BYTES` back to 8192 — DISC7 REDS (0 hits).
+async fn disc7(ctx: &Ctx) -> Result<()> {
+    use hb_core::event::{TeaserCollection, MAX_TEASER_COLLECTIONS, TEASER_PICTURE_MAX_BYTES};
+    let want = ctx.tag("q355max");
+    let p = Identity::generate();
+    let mut t = teaser("maximal", vec![want.clone()], vec![ctx.tag("video")]);
+    let prefix = "data:image/webp;base64,";
+    t.picture = Some(format!("{prefix}{}", "A".repeat(TEASER_PICTURE_MAX_BYTES - prefix.len())));
+    t.collections = (0..MAX_TEASER_COLLECTIONS)
+        .map(|i| TeaserCollection { name: format!("{i:02} {}", "é".repeat(120)), bytes: u64::MAX - i as u64 })
+        .collect();
+    t.bio = "b".repeat(2_000);
+    let ev = build_teaser(&p, &t, true)?;
+    ensure!(ev.content.len() > 8192, "fixture must exceed the OLD 8 KB bound (got {})", ev.content.len());
+
+    let client = ctx.connect(&p).await?;
+    client.publish(&ev).await?;
+    settle().await;
+    let hits = search_teasers(&client, std::slice::from_ref(&want), &[], 100, FETCH_TIMEOUT).await?;
+    client.disconnect().await;
+    ensure!(hits.len() == 1, "the maximal teaser must surface in tag search, got {} hits", hits.len());
+    ensure!(
+        hits[0].teaser.collections.len() == MAX_TEASER_COLLECTIONS,
+        "the collection list must survive the round-trip"
+    );
     Ok(())
 }
 

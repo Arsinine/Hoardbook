@@ -84,19 +84,17 @@ pub struct Teaser {
     /// hostile worst-case entry serializes as `{"name":"…","bytes":<20 digits>}` with the name
     /// truncated at `MAX_PATH_ALIAS_CHARS` = 128 chars; the JSON-escape worst case is 6
     /// bytes/char (a control char → `\u00XX`), so an entry ≤ 9 + 6·128 + 10 + 20 + 1 = 808
-    /// bytes (809 with its trailing `,`) and the whole hostile list ≤ 10 × 809 = 8,090 ≤
-    /// 8,192 = `hb_net::discover::MAX_TEASER_BYTES` (the AB3 ingest bound) — the list alone can
-    /// never trip the bound. (Pre-existing, outside this fence: the REST of a teaser can still
-    /// exceed the bound — e.g. the picture, capped at 16 KB — and is dropped at ingest exactly
-    /// as before; `MAX_TEASER_BYTES` itself is unchanged.)
+    /// bytes (809 with its trailing `,`) and the whole hostile list ≤ 10 × 809 = 8,090 bytes.
+    /// With the 16 KB picture and the other fields this stays well inside
+    /// `hb_net::discover::MAX_TEASER_BYTES` (40 KB since QURATOR-355; a hb-net test pins that a
+    /// maximal honest teaser is never dropped on ingest).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collections: Vec<TeaserCollection>,
 }
 
-/// Hard cap on `Teaser::collections` entries (QURATOR-342). 10 IS the ingest-bound arithmetic:
-/// 10 × (name-worst-case 6 bytes/char × 128 chars = 768, + 41 bytes JSON overhead) = 8,090 ≤
-/// `MAX_TEASER_BYTES` (8192, `hb_net::discover.rs` AB3). See `Teaser::collections` for the
-/// derivation. The per-name cap is [`crate::types::MAX_PATH_ALIAS_CHARS`], shared with the
+/// Hard cap on `Teaser::collections` entries (QURATOR-342): 10 × (name-worst-case 6 bytes/char ×
+/// 128 chars = 768, + 41 bytes JSON overhead) = 8,090 bytes, a fixed slice of the teaser's
+/// `MAX_TEASER_BYTES` ingest budget (hb_net::discover.rs AB3). See `Teaser::collections`. The per-name cap is [`crate::types::MAX_PATH_ALIAS_CHARS`], shared with the
 /// collection alias itself so the teaser can never name something the store would not.
 pub const MAX_TEASER_COLLECTIONS: usize = 10;
 

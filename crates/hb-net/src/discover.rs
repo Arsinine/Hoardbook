@@ -12,8 +12,14 @@ use hb_core::event::{parse_teaser, Teaser};
 use nostr::prelude::*;
 
 /// Per-teaser content-size bound applied on ingest, before parse — a hostile relay flooding huge
-/// teaser bodies can't exhaust memory. (Generous vs a real teaser; teasers are name+bio+tags.)
-pub const MAX_TEASER_BYTES: usize = 8192;
+/// teaser bodies can't exhaust memory (AB3).
+///
+/// 40 KB by owner ruling 2026-09-28 (QURATOR-355, "lets do 40kb just to be safe"). It was 8 KB
+/// from M3, when a teaser was name+bio+tags; the M13 picture (16 KB cap) and the QURATOR-342
+/// collection list (≈8 KB worst case) each outgrew it, so an honest teaser with a large avatar
+/// silently vanished from tag search. The bound must stay ABOVE the largest body an honest
+/// client can build — `a_maximal_honest_teaser_is_never_dropped_on_ingest` pins that.
+pub const MAX_TEASER_BYTES: usize = 40 * 1024;
 
 /// A trustworthy discovery hit: a verified teaser, the `npub` that signed it, and the teaser's
 /// `created_at` (for the recency tiebreak in [`rank_hits`]). This is an **internal** type — it never
@@ -495,6 +501,33 @@ mod tests {
         let hits = ingest_teasers(vec![canary_ev, real_ev.clone()], &["anime".into()], &[], 100);
         assert_eq!(hits.len(), 1, "only the real teaser surfaces");
         assert_eq!(hits[0].npub, real_ev.pubkey.to_bech32().unwrap(), "the canary teaser is excluded");
+    }
+
+    #[test]
+    fn a_maximal_honest_teaser_is_never_dropped_on_ingest() {
+        // QURATOR-355 regression: every field at the cap `build_teaser` allows — a picture at
+        // TEASER_PICTURE_MAX_BYTES, the full collection list with 128-char names that JSON-escape
+        // at 6 bytes/char, a long bio and contact hint — must still surface in tag search. Before
+        // the fix a 16 KB avatar alone put the body past the old 8 KB bound and the author
+        // vanished from discovery with no error anywhere.
+        // P-10 mutation: set MAX_TEASER_BYTES back to 8192 — this test REDS (0 hits).
+        use hb_core::event::{TeaserCollection, MAX_TEASER_COLLECTIONS, TEASER_PICTURE_MAX_BYTES};
+        let id = Identity::generate();
+        let mut t = teaser_with(&["anime"], &["video"]);
+        let prefix = "data:image/webp;base64,";
+        t.picture = Some(format!("{prefix}{}", "A".repeat(TEASER_PICTURE_MAX_BYTES - prefix.len())));
+        t.collections = (0..MAX_TEASER_COLLECTIONS)
+            .map(|_| TeaserCollection {
+                name: "\u{1}".repeat(hb_core::MAX_PATH_ALIAS_CHARS),
+                bytes: u64::MAX,
+            })
+            .collect();
+        t.bio = "b".repeat(2_000);
+        t.contact_hint = Some("c".repeat(256));
+        let e = ev(&id, &t);
+        assert!(e.content.len() > 8192, "fixture must exceed the OLD bound to prove anything");
+        let hits = ingest_teasers(vec![e], &["anime".into()], &[], 100);
+        assert_eq!(hits.len(), 1, "an honest maximal teaser must surface in tag search");
     }
 
     #[test]
