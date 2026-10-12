@@ -1,3 +1,4 @@
+pub mod appearance;
 pub mod browse;
 pub mod chat;
 pub mod collection;

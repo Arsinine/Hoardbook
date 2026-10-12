@@ -50,7 +50,9 @@ describe('QURATOR-81 — window chrome in the layout shell', () => {
 			const src = readFileSync(new URL(file, import.meta.url), 'utf8');
 			// Slice the OPENING TAG, not the file: a match anywhere else (a comment, the 8px strip)
 			// must not satisfy this. Same lesson as the W4 missing-import that passed a file-wide scan.
-			const tag = src.match(/<div class="topbar"[^>]*>/);
+			// `topbar` must be the FIRST class (QURATOR-352 adds `hb-pane` after it), so `[^"]*` sits
+			// after the name, never before: `.topbar-x` or a class list that merely contains it still fails.
+			const tag = src.match(/<div class="topbar(?: [^"]*)?"[^>]*>/);
 			expect(tag, `${route} has no .topbar opening tag`).not.toBeNull();
 			expect(tag![0]).toContain('data-tauri-drag-region');
 		},

@@ -3,7 +3,8 @@
 	import { onMount } from 'svelte';
 	import { get } from 'svelte/store';
 	import { page } from '$app/stores';
-	import { getIdentity, getProfile, getCollections, getContacts, getMessages, getReadState, topicAnnouncements, topicAnnounceSeen, openRepoPage } from '$lib/api.js';
+	import { getIdentity, getProfile, getCollections, getContacts, getMessages, getReadState, topicAnnouncements, topicAnnounceSeen, openRepoPage, windowMaterialSupported, getSettings } from '$lib/api.js';
+	import { DEFAULT_THEME, type ThemeId } from '$lib/themes/themes.js';
 	import { identity, profile, inboxMessages, readWatermarks, toastMessage, appReady, toast, dismissToast, isStickyToast, identityLoadError, topicAnnounceSummaries, announceSeen, seedSentFromFeed, loadCollectionsInto, loadContactsInto } from '$lib/stores.js';
 	import { isOurDrag } from '$lib/drag-group.js';
 	import { totalUnread, unreadByPeer } from '$lib/unread-view.js';
@@ -15,6 +16,9 @@
 	import { getVersion } from '@tauri-apps/api/app';
 	import { NAV_POLL_VISIBLE_MS, ANNOUNCE_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
 	import { showServingNoticeOnce } from '$lib/serving-notice.js';
+	// QURATOR-352 — the layout applies the persisted appearance once Settings resolve; the boot
+	// script (static/theme-boot.js) paints the mirror before this module ever loads.
+	import { applyAppearance, readMirroredAppearance } from '$lib/themes/apply.js';
 	interface Props {
 		children?: import('svelte').Snippet;
 	}
@@ -44,6 +48,20 @@
 			// below, OFF the critical path — each store updates the UI reactively as it resolves, so the
 			// collections / contacts / inbox "fill in" once their (possibly slow) source responds.
 			appReady.set(true);
+
+			// QURATOR-352 — apply the persisted appearance once Settings resolve. The boot script
+			// already painted the localStorage mirror, so this is the Settings-as-source-of-truth
+			// pass: it re-asserts (or corrects) the boot attributes. applyAppearance validates the
+			// theme id. Broken settings I/O must not block startup — fall back to the boot mirror.
+			try {
+				const s = await getSettings();
+				// See-through only where the OS material exists (Windows 11). Elsewhere a stray
+				// see_through:true would turn the page transparent over an opaque window.
+				const mica = s.see_through ? await windowMaterialSupported().catch(() => false) : false;
+				applyAppearance({ theme: (s.theme ?? DEFAULT_THEME) as ThemeId, glass: s.glass ?? true, seeThrough: (s.see_through ?? false) && mica });
+			} catch {
+				applyAppearance(readMirroredAppearance());
+			}
 
 			// QURATOR-93: these two used to `.catch(() => {})` silently, so a FAILED load left the
 			// store empty and Home/Contacts rendered their confident "No … yet" empty states on data
@@ -191,7 +209,7 @@
 
 <div class="frame">
 	<!-- Sidebar -->
-	<div class="sidebar">
+	<div class="sidebar hb-pane">
 		<!-- Brand. QURATOR-139: the whole block (not just the 15x20 mark) is the click target —
 		     a bare-div onclick would be unreachable by keyboard. Opens OUTSIDE the app, in the
 		     system browser, via a Rust command with the URL hard-coded server-side. -->
@@ -258,7 +276,7 @@
 <!-- Toast (M22 W6: the Undo button renders only when an action is present — conditional, never unconditional) -->
 {#if $toastMessage}
 	<div
-		class="toast"
+		class="toast hb-raised"
 		class:toast-error={$toastMessage.kind === 'error'}
 		class:toast-sticky={isStickyToast($toastMessage.kind)}
 		role={$toastMessage.kind === 'error' ? 'alert' : 'status'}
@@ -280,7 +298,11 @@
 		display: flex;
 		width: 100vw;
 		height: 100vh;
-		background: var(--bg);
+		/* QURATOR-352 — the backdrop paints once here, behind every pane. In hoard --backdrop is
+		   var(--bg) and --panel-gap is 0px, so this block is identical to the old flat paint. */
+		background: var(--backdrop);
+		gap: var(--panel-gap);
+		padding: var(--panel-gap);
 		font-family: var(--font-ui);
 		color: var(--fg);
 		font-size: 13px;
@@ -290,12 +312,19 @@
 	.sidebar {
 		width: 192px;
 		flex-shrink: 0;
-		background: var(--bg);
+		/* QURATOR-352 — the pane surface comes from .hb-pane (var(--glass) = var(--bg) in hoard);
+		   the literal was removed so glass themes pick up the pane token. */
 		border-right: 1px solid var(--border);
 		display: flex;
 		flex-direction: column;
 		padding: 18px 12px;
 		gap: 2px;
+	}
+
+	/* QURATOR-352 — floating mode: .hb-pane draws the full rim, so the flush-mode border-right
+	   must go or it doubles the right edge. hoard never sets data-glass-float. */
+	:global(:root[data-glass-float]) :global(.sidebar) {
+		border-right: 0;
 	}
 
 	.brand {
@@ -428,6 +457,8 @@
 		flex: 1;
 		display: flex;
 		flex-direction: column;
+		/* QURATOR-352 — pane separation in floating themes (0px in hoard, layout-inert). */
+		gap: var(--panel-gap);
 		overflow: hidden;
 		min-width: 0;
 		/* QURATOR-81 — the custom window controls (minimize/maximize/close) are absolute-positioned
@@ -498,7 +529,8 @@
 		background: var(--bg-elev3);
 		color: var(--fg);
 		border: 1px solid var(--border-strong);
-		box-shadow: 0 8px 24px oklch(0 0 0 / 0.4);
+		/* QURATOR-352 — was `0 8px 24px oklch(0 0 0 / 0.4)`, tokenised for the themes fan-out. */
+		box-shadow: var(--shadow-pop);
 		/* Devtest item 7: errors are multi-sentence (the manifest one names a byte count and a menu
 		   path). Without a ceiling the toast stretched to the window width and read as one long line;
 		   cap it and let the text wrap. flex-start keeps the buttons on the FIRST line of wrapped text. */
@@ -551,5 +583,39 @@
 		background: transparent;
 		color: var(--accent);
 		cursor: pointer;
+	}
+
+	/* QURATOR-352 — see-through window: data-see-through only exists for non-hoard glass themes
+	   (applyAppearance guards it), so none of this fires in hoard. The OS material (Mica on
+	   Windows 11) shows through an 85 % backdrop veil painted by .frame::before; html and body
+	   paint var(--bg) from app.css, which would cover the OS material — clear those. */
+	:global(:root[data-see-through]) :global(.frame) {
+		background: transparent;
+	}
+	:global(:root[data-see-through]) :global(.frame::before) {
+		/* inset:0 resolves against the viewport here — .frame is exactly full-viewport
+		   (100vw × 100vh, body margin 0), so this is the same rectangle as .frame itself. */
+		content: '';
+		position: absolute;
+		inset: 0;
+		z-index: 0;
+		background: var(--backdrop);
+		opacity: 0.85;
+		pointer-events: none;
+	}
+	:global(:root[data-see-through]) :global(.sidebar),
+	:global(:root[data-see-through]) :global(.main) {
+		position: relative;
+		z-index: 1;
+	}
+	:global(:root[data-see-through]), :global(:root[data-see-through] body) {
+		background: transparent;
+	}
+	/* The OS "reduce transparency" preference also switches the see-through window off: the page
+	   paints opaque again, like the glass panes do under the same preference in app.css. */
+	@media (prefers-reduced-transparency: reduce) {
+		:global(:root[data-see-through]), :global(:root[data-see-through] body) { background: var(--bg); }
+		:global(:root[data-see-through]) :global(.frame) { background: var(--backdrop); }
+		:global(:root[data-see-through]) :global(.frame::before) { display: none; }
 	}
 </style>

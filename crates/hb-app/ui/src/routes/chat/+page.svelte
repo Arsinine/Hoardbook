@@ -1195,7 +1195,7 @@
      every other route carries — it inherits the layout's :global(.topbar) 120px right reservation
      and reads as existing chrome, not a new bar (owner ruling: consistent with Home and Contacts,
      must not stand out). The .pane-headers keep their own drag regions; this is the guaranteed one. -->
-<div class="topbar" data-tauri-drag-region>
+<div class="topbar hb-pane" data-tauri-drag-region>
 	<div>
 		<div class="topbar-title">Chat</div>
 		<div class="topbar-sub">Direct messages and topic channels</div>
@@ -1210,7 +1210,7 @@
 {:else}
 	<div class="chat-frame">
 		<!-- Conversation list -->
-		<div class="convo-sidebar">
+		<div class="convo-sidebar hb-pane">
 			<div class="convo-header">
 				<span class="convo-title">Conversations</span>
 				<div class="header-icons">
@@ -1327,7 +1327,7 @@
 		</div>
 
 		<!-- Conversation pane -->
-		<div class="convo-pane">
+		<div class="convo-pane hb-pane">
 			{#if selectedTopic}
 				<!-- Topic channel: a persistent entry (your durable membership, §11) whose posts are
 				     24h-ephemeral (server NIP-40 + the local filter in topic_channel). -->
@@ -1842,9 +1842,11 @@
 		justify-content: space-between;
 		align-items: center;
 		gap: 16px;
-		background: var(--bg);
 		flex-shrink: 0;
 	}
+	/* QURATOR-352 — the divider between panes disappears when panes float (hb-pane supplies the
+	   glass rim instead). In hoard (no data-glass-float) it stays. */
+	:global(:root[data-glass-float]) .topbar { border-bottom: 0; }
 	.topbar-title { font-size: 17px; font-weight: 600; color: var(--fg); letter-spacing: -0.3px; }
 	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
 
@@ -1861,7 +1863,7 @@
 		color: var(--fg-muted);
 	}
 
-	.chat-frame { display: flex; flex: 1; min-height: 0; overflow: hidden; }
+	.chat-frame { display: flex; flex: 1; min-height: 0; gap: var(--panel-gap); overflow: hidden; } /* QURATOR-352 — pane separation in floating themes (0px in hoard). */
 
 	/* Conversation list sidebar */
 	.convo-sidebar {
@@ -1870,8 +1872,10 @@
 		border-right: 1px solid var(--border);
 		display: flex;
 		flex-direction: column;
-		background: var(--bg);
 	}
+	/* QURATOR-352 — the divider between panes disappears when panes float (hb-pane supplies the
+	   glass rim instead). In hoard (no data-glass-float) it stays. */
+	:global(:root[data-glass-float]) .convo-sidebar { border-right: 0; }
 
 	.convo-header {
 		padding: 16px 16px 10px;
@@ -2010,6 +2014,9 @@
 		overflow: hidden;
 		background: var(--bg-elev1);
 	}
+	/* QURATOR-352: in a glass theme the conversation pane is glass like every other pane. Its own
+	   `--bg-elev1` fill outranks `.hb-pane`, so it is cleared here; hoard keeps the raised fill. */
+	:global(:root[data-glass-float]) .convo-pane { background: transparent; }
 
 	.convo-empty-state {
 		flex: 1;
@@ -2083,7 +2090,7 @@
 		background: oklch(0.22 0.06 60 / 0.6);
 		border-bottom: 1px solid oklch(0.45 0.12 60 / 0.3);
 		font-size: 11.5px;
-		color: oklch(0.82 0.12 60);
+		color: var(--warn-strong);
 	}
 
 	.thread {

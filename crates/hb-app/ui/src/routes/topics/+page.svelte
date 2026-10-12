@@ -974,7 +974,7 @@
 <!-- TopBar — the shared app shell (see routes/+page.svelte, contacts, settings). -->
 <!-- QURATOR-81 follow-up — see contacts/+page.svelte: the topbar is the drag handle. The attribute
      does not inherit, so the tabs and "+ New Topic" inside keep their clicks. -->
-<div class="topbar" data-tauri-drag-region>
+<div class="topbar hb-pane" data-tauri-drag-region>
 	<div>
 		<div class="topbar-title">Topics</div>
 		<div class="topbar-sub">
@@ -994,7 +994,7 @@
 		<!-- Left: the merged directory tree (QURATOR-144 W2). Joined rows in white with the admin
 		     meta line; unjoined rows muted with their blurb + Join. Colour is never the only tell —
 		     the two states differ STRUCTURALLY (meta line + unread pill vs blurb + Join). -->
-		<div class="list-pane">
+		<div class="list-pane hb-pane">
 			<!-- QURATOR-144 W2: path-only filter over the whole merged tree; matching groups are
 			     force-opened by `isCollapsed`. -->
 			<div class="discover-search">
@@ -1126,7 +1126,7 @@
 			<!-- Right: detail (roster + invite + chat deep-link for a joined Topic; the honest
 			     non-member view — blurb + claimed count + Join — for an unjoined one. A grey row is
 			     never disabled: selecting it shows what a non-member can honestly be shown.) -->
-			<div class="detail-pane">
+			<div class="detail-pane hb-pane">
 				{#if openTopic}
 					<div class="detail-head">
 						<div class="grow">
@@ -1347,9 +1347,11 @@
 		justify-content: space-between;
 		align-items: center;
 		gap: 16px;
-		background: var(--bg);
 		flex-shrink: 0;
 	}
+	/* QURATOR-352 — the divider between panes disappears when panes float (hb-pane supplies the
+	   glass rim instead). In hoard (no data-glass-float) it stays. */
+	:global(:root[data-glass-float]) .topbar { border-bottom: 0; }
 	.topbar-title { font-size: 17px; font-weight: 600; color: var(--fg); letter-spacing: -0.3px; }
 	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
 	.topbar-actions { display: flex; gap: 8px; align-items: center; }
@@ -1371,10 +1373,16 @@
 	   Topics the only master-detail page boxed like Settings/Contacts instead of flat like its
 	   actual layout siblings — stripped 2026-08-15.) */
 	.master-detail { display: flex; gap: 0; align-items: stretch; flex: 1; min-height: 0; }
+	/* QURATOR-352 — .master-detail's base rule pins `gap: 0` (topics-w9 pins the flat hoard look),
+	   so the pane separation is added ONLY under data-glass-float, as a separate rule. */
+	:global(:root[data-glass-float]) .master-detail { gap: var(--panel-gap); }
 	.list-pane {
 		width: 280px; flex-shrink: 0; overflow-y: auto; padding: 6px;
 		border-right: 1px solid var(--border);
 	}
+	/* QURATOR-352 — the divider between panes disappears when panes float (hb-pane supplies the
+	   glass rim instead). In hoard (no data-glass-float) it stays. */
+	:global(:root[data-glass-float]) .list-pane { border-right: 0; }
 	/* QURATOR-193 — the cold-paint hold: the tree occupies its space but paints nothing until the
 	   drawn rows' ranks have folded in, so a cold open never visibly re-orders the directory.
 	   `visibility` (not `display: none`) keeps the layout stable across the reveal and keeps the

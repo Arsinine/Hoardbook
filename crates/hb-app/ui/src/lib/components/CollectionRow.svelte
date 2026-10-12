@@ -169,8 +169,8 @@
 	   so it inherits .row-meta's colour and no rule fires. Amber matches .row-badge-offline's hue;
 	   the over-cap red is DESATURATED from --error (0.18 -> 0.09 chroma) because the owner asked for
 	   "faint red" — a full-strength error red on a count that is merely large reads as a failure. */
-	.size-warn { color: oklch(0.78 0.13 60); }
-	.size-over { color: oklch(0.70 0.09 25); }
+	.size-warn { color: var(--warn); }
+	.size-over { color: var(--size-over); }
 
 	.row-badges { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; margin-left: auto; }
 
@@ -188,9 +188,9 @@
 	}
 	.row-badge-private { color: var(--accent); border-color: color-mix(in oklch, var(--accent) 30%, transparent); }
 	.row-badge-offline {
-		color: oklch(0.78 0.13 60);
-		background: oklch(0.28 0.06 60 / 0.5);
-		border-color: oklch(0.5 0.1 60 / 0.4);
+		color: var(--warn);
+		background: var(--warn-soft);
+		border-color: var(--warn-border);
 	}
 
 	.chip-status {

@@ -1,3 +1,6 @@
+/* QURATOR-352 — theme token overrides, one file per theme (lib/themes/). Must precede all rules. */
+@import './lib/themes/index.css';
+
 /* ── Self-hosted fonts (QURATOR-52) ───────────────────────────────── */
 /* Inter + JetBrains Mono, vendored as variable woff2 into static/fonts so the app never makes a
    third-party font request at launch (privacy) and keeps its typography offline. Each family is one
@@ -87,6 +90,99 @@
   --z-modal:         3000;
   --z-modal-stacked: 3100;
   --z-toast:         4000;
+
+  /* ── QURATOR-352 theming ─────────────────────────────────────────── */
+  /* Every token below has a value that reproduces the original (pre-theming) look exactly, so the
+     default `hoard` theme is pixel-identical to the app before theming. A theme lives in
+     src/lib/themes/<id>.css as `:root[data-theme="<id>"] { … }` and overrides tokens only — never
+     component CSS. The registry is src/lib/themes/themes.ts. */
+
+  /* Semantic states that used to be literals in component <style> blocks. */
+  --warn:          oklch(0.78 0.13 60);
+  --warn-strong:   oklch(0.82 0.12 60);
+  --warn-soft:     oklch(0.28 0.06 60 / 0.5);
+  --warn-border:   oklch(0.5 0.1 60 / 0.4);
+  --danger-text:   oklch(0.75 0.12 25);
+  --danger-soft:   oklch(0.20 0.04 25 / 0.5);
+  --danger-border: oklch(0.45 0.12 25 / 0.3);
+  --size-over:     oklch(0.70 0.09 25);
+  --on-avatar:     oklch(0.98 0 0);
+  --hairline:      oklch(1 0 0 / 0.08);
+  --scrim:         oklch(0.10 0.005 260 / 0.7);
+  --shadow-pop:    0 8px 24px oklch(0 0 0 / 0.4);
+  --shadow-modal:  0 30px 80px -20px oklch(0 0 0 / 0.7), 0 0 0 1px oklch(1 0 0 / 0.06);
+  --selection:     oklch(0.78 0.14 70 / 0.3);
+  --primary-fill:  var(--accent);   /* a theme may set a gradient here; --accent stays a colour */
+
+  /* Glass. In `hoard` every glass token resolves to the solid fill the surface had before, the gap
+     is 0 and the radius is 0, so panes sit edge to edge exactly as they always did. */
+  --backdrop:      var(--bg);       /* painted once, behind every pane, by +layout.svelte */
+  --glass:         var(--bg);       /* sidebar, topbars, list and detail panes */
+  --glass-raised:  var(--bg-elev1); /* menus, popovers, toasts, modals */
+  --glass-blur:    0px;
+  --glass-rim:     var(--border);
+  --glass-bevel:   none;
+  --glass-veil:    transparent;     /* extra pane tint used only in see-through mode */
+  --glass-solid:   var(--bg);       /* fallback when glass is off (reduced transparency etc.) */
+  --panel-gap:     0px;
+  --r-panel:       0px;
+  --r-control:     7px;
+}
+
+/* ── Glass behaviour (QURATOR-352) ─────────────────────────────────── */
+/* A surface opts in with class `hb-pane` (large panes) or `hb-raised` (floating menus/popovers).
+   Background, blur and rim come from tokens, so `hoard` renders them as plain solid surfaces.
+
+   ⚠ Panes NEVER take `backdrop-filter` on themselves. Any backdrop-filter (even blur(0px)) makes
+   the element the containing block for `position: fixed` descendants, and the pages mount their
+   modals and overflow menus INSIDE these panes — a fixed modal would be clipped to its pane. So a
+   pane paints its glass on a `::before` layer behind its content: the pseudo-element is a sibling
+   of the content, not an ancestor, so fixed children still position against the window. Floating
+   surfaces (`hb-raised`) are leaves and may filter themselves, but only in a glass theme. */
+.hb-pane { background: var(--glass); border-radius: var(--r-panel); box-shadow: var(--glass-bevel); }
+.hb-raised { background: var(--glass-raised); }
+:root[data-glass-float] .hb-pane {
+  position: relative; isolation: isolate; background: transparent;
+  border: 1px solid var(--glass-rim);
+}
+:root[data-glass-float] .hb-pane::before {
+  content: ""; position: absolute; inset: 0; z-index: -1; border-radius: inherit;
+  background: var(--glass); pointer-events: none;
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.35);
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.35);
+}
+/* Menus, tooltips and modal cards set their own `background` in Svelte-scoped CSS (one class plus
+   a hash class), which outranks `.hb-raised`. In a glass theme the glass must win, so this rule
+   carries the root attribute for extra weight. `hoard` never sets data-glass-float, so its menus
+   keep their own fills — and get no filter at all — exactly as before. The glass-off rules below
+   come later in the file with equal weight, so they still win when glass is turned off. */
+:root[data-glass-float] .hb-raised.hb-raised {
+  background: var(--glass-raised); border-color: var(--glass-rim);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.35);
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.35);
+}
+/* See-through window (Windows 11 Mica): the OS paints behind a transparent window, the theme
+   backdrop drops to 85 %, and panes take an extra veil so text keeps AA contrast. */
+:root[data-see-through] .hb-pane::before {
+  background: linear-gradient(var(--glass-veil), var(--glass-veil)), var(--glass);
+}
+/* Glass off: no blur anywhere, surfaces become the theme's computed solid colour. Triggered by the
+   Settings switch (data-glass-off — which also clears data-glass-float, so the float rules above
+   do not apply), the OS reduced-transparency preference, or an engine without backdrop-filter. */
+:root[data-glass-off] .hb-pane.hb-pane { background: var(--glass-solid); }
+/* "Solid panels" means the flush, square layout too, not floating opaque cards. */
+:root[data-glass-off] { --panel-gap: 0px; --r-panel: 0px; }
+:root[data-glass-off][data-theme] .hb-raised.hb-raised { background: var(--glass-solid); }
+@media (prefers-reduced-transparency: reduce) {
+  :root[data-glass-float] .hb-pane.hb-pane { background: var(--glass-solid); }
+  :root[data-glass-float] .hb-pane.hb-pane::before { display: none; }
+  :root[data-glass-float] .hb-raised.hb-raised {
+    background: var(--glass-solid); -webkit-backdrop-filter: none; backdrop-filter: none;
+  }
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  :root[data-glass-float] .hb-pane.hb-pane::before { background: var(--glass-solid); }
+  :root[data-glass-float] .hb-raised.hb-raised { background: var(--glass-solid); }
 }
 
 html, body {
@@ -136,7 +232,7 @@ h1, h2, h3, h4, h5, h6 {
   font-weight: inherit;
 }
 
-::selection { background: oklch(0.78 0.14 70 / 0.3); }
+::selection { background: var(--selection); }
 
 /* ── Keyboard focus (M15 W1) ──────────────────────────────────────── */
 /* Visible only for keyboard/AT users; mouse users see no change. Was absent app-wide. */
@@ -177,7 +273,7 @@ h1, h2, h3, h4, h5, h6 {
   opacity: 0.5;
   cursor: not-allowed;
 }
-.btn-primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+.btn-primary { background: var(--primary-fill); color: var(--accent-text); border-color: var(--accent); }
 .btn-ghost   { background: transparent; color: var(--fg-muted); }
 .btn-ghost:hover:not(:disabled) { background: var(--bg-elev2); }
 .btn-default { background: var(--bg-elev2); color: var(--fg); border-color: var(--border-strong); }

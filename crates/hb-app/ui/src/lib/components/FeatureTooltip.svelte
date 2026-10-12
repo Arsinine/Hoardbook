@@ -49,7 +49,7 @@
 	>
 		{#if children}{@render children()}{:else}<span class="ft-icon" aria-hidden="true">ⓘ</span>{/if}
 	</button>
-	<span class="ft-tip" id={tipId} role="tooltip" hidden={!expanded}>
+	<span class="ft-tip hb-raised" id={tipId} role="tooltip" hidden={!expanded}>
 		<span class="ft-tip-title">{content.title}</span>
 		<span class="ft-tip-body">{content.body}</span>
 	</span>
@@ -104,7 +104,7 @@
 		background: var(--bg-elev3);
 		border: 1px solid var(--border-strong);
 		border-radius: 7px;
-		box-shadow: 0 8px 24px oklch(0 0 0 / 0.4);
+		box-shadow: var(--shadow-pop);
 		opacity: 1;
 		transition: opacity 0.12s ease;
 		/* A trigger can sit inside an uppercase heading (e.g. Settings' .section-label), and

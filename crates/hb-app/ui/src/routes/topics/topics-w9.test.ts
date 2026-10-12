@@ -18,7 +18,9 @@ describe('Topics page — M17 W9 shared shell', () => {
 	// exact-string assertion cannot survive any attribute. `class="topbar"` is still required
 	// verbatim, so a rename to `.topbar-x` or a bespoke header still fails — the guarantee this test
 	// exists for is unchanged.
-	const TOPBAR_OPEN = /<div class="topbar"[^>]*>/;
+	// QURATOR-352 adds glass classes after `topbar` (`class="topbar hb-pane"`). `topbar` must still
+	// be the first class, a whole word, so `.topbar-x` still fails.
+	const TOPBAR_OPEN = /<div class="topbar(?: [^"]*)?"[^>]*>/;
 
 	it('opens_with_the_shared_topbar_not_a_bespoke_header', () => {
 		const src = topicsSrc();

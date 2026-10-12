@@ -230,9 +230,25 @@ export interface Settings {
 	/** QURATOR-164: the one-time baseline startup notice ("you pass along collections you have
 	 *  browsed, in the background") has been shown. A notice, not consent — nothing is gated. */
 	serving_notice_acknowledged: boolean;
+	/** QURATOR-352: the active theme id (lib/themes/themes.ts). Optional on the TS side only so
+	 *  partial test fixtures stay valid; Rust always sends it (serde default "vault"). */
+	theme?: string;
+	/** QURATOR-352: glass panes on. Rust serde default true. */
+	glass?: boolean;
+	/** QURATOR-352: see-through window (Mica, Windows 11 only). Rust serde default false. */
+	see_through?: boolean;
 }
 
 export const getSettings = () => invoke<Settings>('get_settings');
+
+/** QURATOR-352: true only on Windows 11, where the see-through window (Mica) exists. */
+export const windowMaterialSupported = () => invoke<boolean>('window_material_supported');
+
+/** QURATOR-352: bring the Mica see-through window in line with the current appearance. Rust
+ *  decides on/off from all three (see-through, glass, theme) so the rule lives in one place.
+ *  A no-op where Mica is unsupported. */
+export const setWindowMaterial = (a: { seeThrough: boolean; glass: boolean; theme: string }) =>
+	invoke<void>('set_window_material', { seeThrough: a.seeThrough, glass: a.glass, theme: a.theme });
 
 export const saveSettings = (settings: Settings) => invoke<void>('save_settings', { settings });
 

@@ -914,7 +914,7 @@
      stand out). It is unconditional — outside every {#if} — which is the point: .panel-top below is
      inside the left panel and Chat's .pane-header is thread-dependent, so neither is a guaranteed
      handle. -->
-<div class="topbar" data-tauri-drag-region>
+<div class="topbar hb-pane" data-tauri-drag-region>
 	<div>
 		<div class="topbar-title">Browse</div>
 		<div class="topbar-sub">Collections your contacts have published</div>
@@ -928,7 +928,7 @@
 
 <div class="browse-shell">
 	<!-- Left: contact list -->
-	<div class="left-panel">
+	<div class="left-panel hb-pane">
 		<!-- QURATOR-81: Browse has no unconditional right-panel header (its content is
 		     peer-selection-dependent), so panel-top is the one always-present bar that can carry a
 		     drag region. Left panel, clear of the window controls in the top-right — no padding
@@ -1037,7 +1037,7 @@
 	</div>
 
 	<!-- Right: browser -->
-	<div class="right-panel">
+	<div class="right-panel hb-pane">
 		<!-- QURATOR-342 D2 — the title-search strip (lane D1's TitleSearch) sits at the TOP of the
 		     right pane in EVERY state: searching drives peer selection, it is not a per-peer tool.
 		     Selection routes through onTitleBrowse → selectPeer / the /browse?peer= deep-link. -->
@@ -1461,9 +1461,11 @@
 		justify-content: space-between;
 		align-items: center;
 		gap: 16px;
-		background: var(--bg);
 		flex-shrink: 0;
 	}
+	/* QURATOR-352 — the divider between panes disappears when panes float (hb-pane supplies the
+	   glass rim instead). In hoard (no data-glass-float) it stays. */
+	:global(:root[data-glass-float]) .topbar { border-bottom: 0; }
 	.topbar-title { font-size: 17px; font-weight: 600; color: var(--fg); letter-spacing: -0.3px; }
 	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
 	/* Same rule Topics' topbar carries — kept identical so the two pages read as one chrome set. */
@@ -1485,6 +1487,7 @@
 		   height. flex:1 lets it take whatever is left, whatever the bar ends up measuring. */
 		flex: 1;
 		min-height: 0;
+		gap: var(--panel-gap); /* QURATOR-352 — pane separation in floating themes (0px in hoard). */
 		overflow: hidden;
 	}
 
@@ -1498,6 +1501,9 @@
 		flex-direction: column;
 		overflow: hidden;
 	}
+	/* QURATOR-352 — the divider between panes disappears when panes float (hb-pane supplies the
+	   glass rim instead). In hoard (no data-glass-float) it stays. */
+	:global(:root[data-glass-float]) .left-panel { border-right: 0; }
 
 	.panel-top {
 		display: flex;
@@ -1969,8 +1975,8 @@
 
 	/* devtest item 6 — size tiers, same values as CollectionRow/CollectionPanel (a peer's over-cap
 	   collection is just as unshareable as your own). `normal` has no rule: it stays as is. */
-	.size-warn { color: oklch(0.78 0.13 60); }
-	.size-over { color: oklch(0.70 0.09 25); }
+	.size-warn { color: var(--warn); }
+	.size-over { color: var(--size-over); }
 
 	.col-tags {
 		display: flex;

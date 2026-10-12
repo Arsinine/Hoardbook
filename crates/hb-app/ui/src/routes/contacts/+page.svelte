@@ -1154,7 +1154,7 @@
      resize hotspot — which left almost nothing to grab and read as "dragging doesn't work" (owner,
      2026-08-13). `data-tauri-drag-region` does NOT inherit to children, so every button and input
      inside this bar keeps its clicks; only the bar's own background drags. -->
-<div class="topbar" data-tauri-drag-region>
+<div class="topbar hb-pane" data-tauri-drag-region>
 	<div>
 		<div class="topbar-title">Contacts</div>
 		<div class="topbar-sub">
@@ -1171,7 +1171,7 @@
 </div>
 
 <div class="contacts-body">
-<div class="contacts-col">
+<div class="contacts-col hb-pane">
 
 <!-- List-column sub-header: free-text search + Name|Groups view toggle. "+ Add contact" moved to
      the topbar (QURATOR-342 lane B) to keep the 300px column to search + toggle. -->
@@ -1710,7 +1710,7 @@
 	</div>
 	<!-- QURATOR-342 lane B — the right pane: lane C's People-like-you panel (no props,
 	     self-fetches similarPeople() and reads the contacts store). -->
-	<div class="people-pane"><PeopleLikeYou /></div>
+	<div class="people-pane hb-pane"><PeopleLikeYou /></div>
 </div>
 </div>
 </div>
@@ -1807,7 +1807,7 @@
 	}
 	/* QURATOR-342 lane B — two-pane layout: a ~300px compact contact-list column and the
 	   People-like-you pane. The list column owns the sub-header; the pane scrolls independently. */
-	.contacts-body { display: flex; flex: 1; min-height: 0; min-width: 0; }
+	.contacts-body { display: flex; flex: 1; min-height: 0; min-width: 0; gap: var(--panel-gap); } /* QURATOR-352 — pane separation in floating themes (0px in hoard). */
 	.contacts-col {
 		width: 300px;
 		min-width: 300px;
@@ -1815,8 +1815,10 @@
 		flex-direction: column;
 		border-right: 1px solid var(--border);
 		min-height: 0;
-		background: var(--bg);
 	}
+	/* QURATOR-352 — the divider between panes disappears when panes float (hb-pane supplies the
+	   glass rim instead). In hoard (no data-glass-float) it stays. */
+	:global(:root[data-glass-float]) .contacts-col { border-right: 0; }
 	.people-pane { flex: 1; min-width: 0; overflow-y: auto; padding: 16px 20px 24px; }
 	.topbar-add { flex-shrink: 0; }
 
@@ -1826,9 +1828,11 @@
 		display: flex;
 		justify-content: space-between;
 		align-items: center;
-		background: var(--bg);
 		flex-shrink: 0;
 	}
+	/* QURATOR-352 — the divider between panes disappears when panes float (hb-pane supplies the
+	   glass rim instead). In hoard (no data-glass-float) it stays. */
+	:global(:root[data-glass-float]) .topbar { border-bottom: 0; }
 	.topbar-title { font-size: 17px; font-weight: 600; letter-spacing: -0.3px; }
 	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
 	.online-chip {

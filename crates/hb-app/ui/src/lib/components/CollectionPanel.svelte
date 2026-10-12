@@ -141,8 +141,8 @@
 	   so it inherits .row-meta's colour and no rule fires. Amber matches .row-badge-offline's hue;
 	   the over-cap red is DESATURATED from --error (0.18 -> 0.09 chroma) because the owner asked for
 	   "faint red" — a full-strength error red on a count that is merely large reads as a failure. */
-	.size-warn { color: oklch(0.78 0.13 60); }
-	.size-over { color: oklch(0.70 0.09 25); }
+	.size-warn { color: var(--warn); }
+	.size-over { color: var(--size-over); }
 
 	.mono-sm { font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); }
 

@@ -1,0 +1,36 @@
+/* Violet Drive — from design system /38 (luxury-car landing). Dark. The backdrop follows /38's own
+   scrim (#0F0424 → violet). Primary buttons use the front-card gradient (white → lilac #D1ABFF)
+   with the pill ink #121212; link text is the paler #E4CFFF to clear AA over the brightest violet.
+   Magenta #D44EB5 fails as text on this glass, so it stays in the backdrop only. */
+:root[data-theme="violet-drive"] {
+  color-scheme: dark;
+  --bg:            #0f0424;
+  --bg-elev1:      rgb(216 189 255 / .07);
+  --bg-elev2:      rgb(216 189 255 / .13);
+  --bg-elev3:      rgb(216 189 255 / .20);
+  --bg-input:      rgb(216 189 255 / .09);
+  --fg:            #ffffff;
+  --fg-muted:      rgb(255 255 255 / .80);
+  --fg-dim:        rgb(255 255 255 / .70);
+  --border:        rgb(216 189 255 / .14);
+  --border-strong: rgb(216 189 255 / .24);
+  --divider:       rgb(216 189 255 / .10);
+  --online:        #6fe3a4;
+  --accent:        #e4cfff;
+  --accent-soft:   rgb(209 171 255 / .15);
+  --accent-text:   #121212;
+  --primary-fill:  linear-gradient(136deg, #ffffff 25%, #d1abff 100%);
+  --error:         #ff8fa3;
+  --selection:     rgb(209 171 255 / .3);
+  --backdrop: radial-gradient(circle at 72% 62%, #5c2598 0 18%, transparent 18.4%), radial-gradient(circle at 18% 80%, rgb(212 78 181 / .8) 0 4.5%, transparent 4.8%), radial-gradient(ellipse 55% 50% at 86% 14%, rgb(149 63 175 / .75), transparent 70%), radial-gradient(ellipse 40% 40% at 98% 98%, rgb(190 102 198 / .6), transparent 70%), linear-gradient(115deg, #0f0424 2%, #210952 50%, #4d137f 100%);
+  --glass:         rgb(216 189 255 / .07);
+  --glass-raised:  rgb(22 8 46 / .64);
+  --glass-blur:    20px;
+  --glass-rim:     rgb(216 189 255 / .20);
+  --glass-bevel:   inset 0 1px 0 rgb(255 255 255 / .10);
+  --glass-veil:    rgb(0 0 0 / .16);
+  --glass-solid:   #1d1133;
+  --panel-gap:     10px;
+  --r-panel:       16px;
+  --r-control:     999px;
+}

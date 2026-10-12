@@ -114,7 +114,7 @@
 	<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
 	<div class="modal-backdrop" style="z-index:{zIndex}" onclick={onBackdrop} onkeydown={onKey} role="presentation">
 		<div
-			class="modal-card"
+			class="modal-card hb-raised"
 			bind:this={cardEl}
 			style="width:{width}; padding:{padding}"
 			role="dialog"
@@ -140,7 +140,7 @@
 	.modal-backdrop {
 		position: fixed;
 		inset: 0;
-		background: oklch(0.10 0.005 260 / 0.7);
+		background: var(--scrim);
 		backdrop-filter: blur(4px);
 		display: flex;
 		align-items: center;
@@ -155,7 +155,7 @@
 		background: var(--bg-elev2);
 		border: 1px solid var(--border);
 		border-radius: 10px;
-		box-shadow: 0 30px 80px -20px oklch(0 0 0 / 0.7), 0 0 0 1px oklch(1 0 0 / 0.06);
+		box-shadow: var(--shadow-modal);
 		/* padding comes from the inline `padding` prop (default 18px) */
 	}
 	.modal-card:focus-visible { outline: none; } /* the card is only a focus fallback, not a target */

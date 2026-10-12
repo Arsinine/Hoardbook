@@ -58,6 +58,23 @@ pub fn restrict_to_owner(_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// QURATOR-352 — the OS build number on Windows (`None` on every other OS).
+///
+/// Mica (the see-through window material) exists only on Windows 11 and up, i.e. build >= 22000;
+/// callers probe this instead of trusting the webview. Read via `RtlGetVersion` from ntdll —
+/// NOT `GetVersionEx(W)`, which lies on Windows 10+ unless the binary carries an OS-compatibility
+/// manifest (it reports 6.2 without one). `RtlGetVersion` reports the true values manifest-free.
+#[cfg(target_os = "windows")]
+pub fn windows_build() -> Option<u32> {
+    win::windows_build()
+}
+
+/// Non-Windows: no Windows build number exists — see-through support probes must fail closed.
+#[cfg(not(target_os = "windows"))]
+pub fn windows_build() -> Option<u32> {
+    None
+}
+
 #[cfg(target_os = "windows")]
 mod win {
     use anyhow::{anyhow, Result};
@@ -203,6 +220,27 @@ mod win {
             return Err(anyhow!("applying the owner-only DACL failed (win32 error {set})"));
         }
         Ok(())
+    }
+
+    /// QURATOR-352 — the OS build number via `RtlGetVersion` (ntdll). `STATUS_SUCCESS` is 0; any
+    /// other value leaves nothing trustworthy to report, so this is `None` and the caller fails
+    /// closed (no see-through window).
+    pub fn windows_build() -> Option<u32> {
+        use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+        use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+        // SAFETY: `vi` is fully zeroed, then correctly sized — the API contract is that the caller
+        // sets `dwOSVersionInfoSize` before the call; all-zero is a valid bit pattern for every
+        // field of OSVERSIONINFOW, so there is no invalid state for the call to misread.
+        let mut vi: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
+        vi.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
+        // SAFETY: `vi` is a valid, correctly-sized OSVERSIONINFOW out-param, alive for the call;
+        // on success (STATUS_SUCCESS == 0) the kernel fills `dwBuildNumber` and friends.
+        let status = unsafe { RtlGetVersion(&mut vi) };
+        if status != 0 {
+            return None;
+        }
+        Some(vi.dwBuildNumber)
     }
 }
 

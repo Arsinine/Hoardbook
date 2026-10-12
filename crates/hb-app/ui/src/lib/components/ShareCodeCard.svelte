@@ -179,7 +179,7 @@
 	}
 
 	.share-card-done {
-		color: var(--online, oklch(0.7 0.15 145));
+		color: var(--online);
 		font-weight: 500;
 	}
 

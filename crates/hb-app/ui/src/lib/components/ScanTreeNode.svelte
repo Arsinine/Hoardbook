@@ -161,5 +161,5 @@
 
 	.node-hint { font-size: 11.5px; color: var(--fg-dim); padding-top: 2px; padding-bottom: 2px; }
 
-	.node-error { color: var(--danger, #e5484d); }
+	.node-error { color: var(--error); }
 </style>

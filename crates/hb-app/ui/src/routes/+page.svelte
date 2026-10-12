@@ -673,7 +673,7 @@
 	<!-- TopBar -->
 	<!-- QURATOR-81: data-tauri-drag-region matches Contacts/Topics/Settings — Home was the one
 	     .topbar missing it. Does not inherit to children, so the Save/Publish buttons stay clickable. -->
-	<div class="topbar" data-tauri-drag-region>
+	<div class="topbar hb-pane" data-tauri-drag-region>
 		<div>
 			<div class="topbar-title">My Profile</div>
 			<div class="topbar-sub">
@@ -690,7 +690,7 @@
 
 	<div class="body">
 		<!-- Left: Profile editor -->
-		<div class="profile-pane">
+		<div class="profile-pane hb-pane">
 			<div class="profile-header">
 				<button
 					type="button"
@@ -863,7 +863,7 @@
 		</div>
 
 		<!-- Right: Collections -->
-		<div class="collections-pane">
+		<div class="collections-pane hb-pane">
 			<div class="coll-head">
 				<div>
 					<div class="coll-title">Collections</div>
@@ -966,9 +966,9 @@
 	.id-error-detail {
 		font-family: var(--font-mono);
 		font-size: 10.5px;
-		color: oklch(0.75 0.12 25);
-		background: oklch(0.20 0.04 25 / 0.5);
-		border: 1px solid oklch(0.45 0.12 25 / 0.3);
+		color: var(--danger-text);
+		background: var(--danger-soft);
+		border: 1px solid var(--danger-border);
 		border-radius: 6px;
 		padding: 8px 10px;
 		word-break: break-word;
@@ -1113,9 +1113,11 @@
 		justify-content: space-between;
 		align-items: center;
 		gap: 16px;
-		background: var(--bg);
 		flex-shrink: 0;
 	}
+	/* QURATOR-352 — the divider between panes disappears when panes float (hb-pane supplies the
+	   glass rim instead). In hoard (no data-glass-float) it stays. */
+	:global(:root[data-glass-float]) .topbar { border-bottom: 0; }
 
 	.topbar-title { font-size: 17px; font-weight: 600; color: var(--fg); letter-spacing: -0.3px; }
 	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
@@ -1130,6 +1132,7 @@
 	.body {
 		display: flex;
 		flex: 1;
+		gap: var(--panel-gap); /* QURATOR-352 — pane separation in floating themes (0px in hoard). */
 		overflow: hidden;
 	}
 
@@ -1140,8 +1143,10 @@
 		border-right: 1px solid var(--border);
 		padding: 20px;
 		overflow-y: auto;
-		background: var(--bg);
 	}
+	/* QURATOR-352 — the divider between panes disappears when panes float (hb-pane supplies the
+	   glass rim instead). In hoard (no data-glass-float) it stays. */
+	:global(:root[data-glass-float]) .profile-pane { border-right: 0; }
 
 	.profile-header {
 		display: flex;

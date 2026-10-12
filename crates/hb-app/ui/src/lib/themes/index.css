@@ -1,0 +1,11 @@
+/* QURATOR-352 — every theme file, imported once from app.css. Each file is a single
+   `:root[data-theme="<id>"] { … }` block that overrides tokens only. `hoard` has no file: it is the
+   bare `:root` in app.css. To add a theme: add a file here, import it below, and add a row to
+   themes.ts. Never touch component CSS to add a theme. */
+@import './oxblood-steel.css';
+@import './lime-ledger.css';
+@import './clinic-teal.css';
+@import './violet-drive.css';
+@import './vault.css';
+@import './pale-pulse.css';
+@import './sky-slate.css';

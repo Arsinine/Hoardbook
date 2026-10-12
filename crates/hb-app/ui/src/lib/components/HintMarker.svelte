@@ -49,7 +49,7 @@
 	>
 		<span class="hint-icon" aria-hidden="true">?</span>
 	</button>
-	<span class="hint-tip" id={tipId} role="tooltip" hidden={!expanded}>{text}</span>
+	<span class="hint-tip hb-raised" id={tipId} role="tooltip" hidden={!expanded}>{text}</span>
 </span>
 
 <style>
@@ -101,7 +101,7 @@
 		background: var(--bg-elev3);
 		border: 1px solid var(--border-strong);
 		border-radius: 7px;
-		box-shadow: 0 8px 24px oklch(0 0 0 / 0.4);
+		box-shadow: var(--shadow-pop);
 	}
 
 	.hint-tip[hidden] {

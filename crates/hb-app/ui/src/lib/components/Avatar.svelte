@@ -28,7 +28,7 @@
 		height={size}
 		style="
 			border-radius:{br}; flex-shrink:0; object-fit:cover;
-			box-shadow:inset 0 0 0 1px oklch(1 0 0 / 0.08);
+			box-shadow:inset 0 0 0 1px var(--hairline);
 		"
 	/>
 {:else}
@@ -36,10 +36,10 @@
 		width:{size}px; height:{size}px;
 		border-radius:{br};
 		background:{grad};
-		color:oklch(0.98 0 0);
+		color:var(--on-avatar);
 		display:flex; align-items:center; justify-content:center;
 		font-weight:700; font-family:var(--font-ui);
 		font-size:{fs}; flex-shrink:0; letter-spacing:-0.5px;
-		box-shadow:inset 0 0 0 1px oklch(1 0 0 / 0.08);
+		box-shadow:inset 0 0 0 1px var(--hairline);
 	">{letter.toUpperCase()}</div>
 {/if}

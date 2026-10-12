@@ -1,0 +1,34 @@
+/* Clinic Teal — from design system /31 (medical-device landing). Dark. /31's refracted glass is
+   Chromium-only, so its own frost fallback is used (black 22 %, 16 px). The cyan / peach / pink
+   glows are /31's effect colours at their specified 20 %. Pill controls, as in /31. */
+:root[data-theme="clinic-teal"] {
+  color-scheme: dark;
+  --bg:            #122832;
+  --bg-elev1:      rgb(255 255 255 / .05);
+  --bg-elev2:      rgb(255 255 255 / .08);
+  --bg-elev3:      rgb(255 255 255 / .14);
+  --bg-input:      rgb(255 255 255 / .07);
+  --fg:            #ffffff;
+  --fg-muted:      rgb(255 255 255 / .76);
+  --fg-dim:        rgb(255 255 255 / .62);
+  --border:        rgb(255 255 255 / .10);
+  --border-strong: rgb(255 255 255 / .18);
+  --divider:       rgb(255 255 255 / .08);
+  --online:        #31c7ed;
+  --accent:        #d6f5a9;
+  --accent-soft:   rgb(214 245 169 / .13);
+  --accent-text:   #122832;
+  --error:         #ff8a7a;
+  --selection:     rgb(214 245 169 / .28);
+  --backdrop: radial-gradient(circle at 70% 64%, #1f465d 0 17%, transparent 17.4%), radial-gradient(circle at 28% 76%, #6e9bb8 0 4%, transparent 4.3%), radial-gradient(ellipse 45% 45% at 18% 12%, rgb(115 209 239 / .22), transparent 70%), radial-gradient(ellipse 45% 45% at 92% 88%, rgb(232 203 182 / .2), transparent 70%), radial-gradient(ellipse 40% 40% at 6% 96%, rgb(255 157 230 / .16), transparent 70%), radial-gradient(ellipse 60% 55% at 88% 10%, rgb(42 89 118 / .9), transparent 70%), linear-gradient(160deg, #163244, #122635 60%, #1a3649);
+  --glass:         rgb(0 0 0 / .22);
+  --glass-raised:  rgb(8 22 28 / .62);
+  --glass-blur:    16px;
+  --glass-rim:     rgb(255 255 255 / .14);
+  --glass-bevel:   inset 0 1px 0 rgb(255 255 255 / .08);
+  --glass-veil:    rgb(0 0 0 / .14);
+  --glass-solid:   #112735;
+  --panel-gap:     10px;
+  --r-panel:       20px;
+  --r-control:     999px;
+}

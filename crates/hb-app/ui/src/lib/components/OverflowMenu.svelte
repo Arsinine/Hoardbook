@@ -56,7 +56,7 @@
 {#if open}
 	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
 	<div class="menu-backdrop" onclick={onclose}></div>
-	<div class="overflow-menu" role="menu" bind:this={menuEl} style="top:{pos.top}px; left:{pos.left}px; min-width:{minWidth}">
+	<div class="overflow-menu hb-raised" role="menu" bind:this={menuEl} style="top:{pos.top}px; left:{pos.left}px; min-width:{minWidth}">
 		{@render children()}
 	</div>
 {/if}

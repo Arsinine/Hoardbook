@@ -16,6 +16,10 @@
 	import Avatar from '$lib/components/Avatar.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
+	// QURATOR-352 Appearance: the theme registry and the root-attribute applier.
+	import { windowMaterialSupported as probeWindowMaterial, setWindowMaterial as applyWindowMaterial } from '$lib/api.js';
+	import { THEMES, DEFAULT_THEME, BASE_THEME, isThemeId, type ThemeId, type ThemeInfo } from '$lib/themes/themes.js';
+	import { applyAppearance } from '$lib/themes/apply.js';
 
 	let generating = $state(false);
 	let copied = $state(false);
@@ -23,7 +27,16 @@
 
 	// Full settings object, preserved so saving one field never resets the others (the M5 fields
 	// privacy_notice_acknowledged / last_seen_version + the M9 snapshot/online toggles live here too).
-	let settings: Settings = $state({
+	// QURATOR-352: the appearance fields are optional (older settings files lack them; Rust serde
+	// defaults fill them — lane D). The Settings interface in lib/api.ts does not carry them yet
+	// (the order placed it in types.ts, where no Settings interface exists — reported): this local
+	// intersection keeps the page compiling today and is a no-op once the fields land in api.ts.
+	type SettingsWithAppearance = Settings & {
+		theme?: string;
+		glass?: boolean;
+		see_through?: boolean;
+	};
+	let settings: SettingsWithAppearance = $state({
 		relay_urls: [], allow_dms: true, privacy_notice_acknowledged: false,
 		last_seen_version: '',
 		snapshot_auto_update: true, snapshot_reconcile_poll: false, show_online_count: true,
@@ -31,6 +44,33 @@
 		big_relay_url: '',
 		swarm_caching: false, serving_notice_acknowledged: false,
 	});
+
+	// ── QURATOR-352: Appearance section state ────────────────────────────────────
+	let materialSupported = $state(false);
+	let themeId = $derived(isThemeId(settings.theme) ? settings.theme : DEFAULT_THEME);
+	let glassOn = $derived(settings.glass ?? true);
+	let seeThroughOn = $derived(settings.see_through ?? false);
+	// The row is gated on the material probe; the applied value is gated again inside apply.ts
+	// (see-through is hoard-inert and glass-inert) so a stale see_through=true on Linux or with
+	// glass off cannot light the veil up.
+	let effectiveSeeThrough = $derived(seeThroughOn && materialSupported);
+	// Disabled reason, in the order the user meets them: Hoard (the original palette) has no glass
+	// to see through; a glass theme with glass off has nothing either. The Hoard gate compares
+	// BASE_THEME, never DEFAULT_THEME (2026-10-12 ruling: Vault is the default, Hoard stays
+	// selectable as the original palette).
+	let seeThroughSub = $derived(
+		themeId === BASE_THEME ? 'Needs a glass theme.'
+		: !glassOn ? 'Needs glass effects on.'
+		: 'Lets your desktop wallpaper show softly through Hoardbook. Windows 11 only.'
+	);
+	// Card subtitle per the 2026-10-12 ruling: the default theme (Vault) is labelled "Default"
+	// beside its source ("/40 · Default"); Hoard — the original palette, no longer the default —
+	// is labelled "Original"; every other theme shows its source ("/08" etc.). Derived from
+	// DEFAULT_THEME / BASE_THEME, never hard-coded.
+	function themeSubtitle(t: ThemeInfo): string {
+		if (t.id === DEFAULT_THEME) return t.source ? `${t.source} · Default` : 'Default';
+		return t.source ?? (t.id === BASE_THEME ? 'Original' : '');
+	}
 
 	// ── 3-key identity view ───────────────────────────────────────────────────────
 	let kv = $derived($identity ? keyView($identity) : null);
@@ -476,6 +516,10 @@
 		// leaves the explicit "Not yet determined" state, never a confident negative. Re-checked
 		// after a short delay so a slow probe (cold relay discovery) still surfaces a real reading.
 		try { natClass = await natClassification(); } catch { natClass = 'undetermined'; }
+		// QURATOR-352: probe whether the OS window-material commands are available (Mica on Win11,
+		// vibrancy on macOS). Best-effort: failure leaves the see-through row hidden
+		// (Linux / Win10), never an offered toggle that cannot work.
+		windowMaterialSupported().then((ok) => (materialSupported = ok));
 		loadBlocked();
 		if (natClass === 'undetermined') {
 			setTimeout(async () => {
@@ -601,6 +645,96 @@
 		}
 	}
 
+	// ── QURATOR-352: Appearance handlers ─────────────────────────────────────────
+
+	/** QURATOR-352: best-effort wrappers over api.ts's window-material commands. api.ts rejects
+	 *  outside Tauri; here a failure simply means "no see-through", never an error. */
+	async function windowMaterialSupported(): Promise<boolean> {
+		try {
+			return await probeWindowMaterial();
+		} catch {
+			// Best-effort: a failed probe hides the see-through row (Linux, Win10), never an offered
+			// toggle that cannot work.
+			return false;
+		}
+	}
+
+	/** Best-effort: the OS material is a visual-only concern; a failed call must never block the
+	 *  save or the apply. */
+	async function setWindowMaterial(): Promise<void> {
+		try {
+			await applyWindowMaterial({ seeThrough: seeThroughOn, glass: glassOn, theme: themeId });
+		} catch { /* visual-only concern — the setting is already saved and applied */ }
+	}
+
+	/** Pick a theme card: apply at once, then save. QURATOR-93 twin (M1): never save from the
+	 *  fallback object — the in-handler settingsLoaded guard stands even if the DOM gate is
+	 *  bypassed, exactly like every other mutator on this page. */
+	async function selectTheme(id: ThemeId) {
+		if (!settingsLoaded) return;
+		if (id === themeId) return; // picking the already-selected card is a no-op (no save, no toast)
+		settings.theme = id; // Svelte : mutate the $state proxy in place (never reassign from await)
+		applyAppearanceNow();
+		void setWindowMaterial(); // switching to hoard must also turn Mica off
+		try {
+			await saveSettings(fullSettings());
+		} catch (e) {
+			toast(String(e), 'error');
+		}
+	}
+
+	/** Apply the current appearance to the document root at once. apply.ts re-gates see-through
+	 *  against hoard/glass; the page additionally gates it on the material probe so an unsupported
+	 *  platform never lights the veil up. */
+	function applyAppearanceNow() {
+		applyAppearance({ theme: themeId, glass: glassOn, seeThrough: effectiveSeeThrough });
+	}
+
+	/** Glass effects (default on): apply at once + persist, like every other toggle on this page. */
+	async function toggleGlass() {
+		// QURATOR-93 twin (M1): see toggleAllowDms.
+		if (!settingsLoaded) return;
+		settings.glass = !glassOn;
+		applyAppearanceNow();
+		void setWindowMaterial(); // glass off must also turn Mica off
+		try {
+			await saveSettings(fullSettings());
+		} catch (e) {
+			toast(String(e), 'error');
+		}
+	}
+
+	/** See-through window (default off): persist, apply, and drive the OS window material —
+	 *  best-effort, after the state change, never blocking the save. */
+	async function toggleSeeThrough() {
+		// QURATOR-93 twin (M1): see toggleAllowDms.
+		if (!settingsLoaded) return;
+		settings.see_through = !seeThroughOn;
+		applyAppearanceNow();
+		void setWindowMaterial();
+		try {
+			await saveSettings(fullSettings());
+		} catch (e) {
+			toast(String(e), 'error');
+		}
+	}
+
+	function onThemeGridKeydown(e: KeyboardEvent) {
+		const keys = ['ArrowRight', 'ArrowDown', 'ArrowLeft', 'ArrowUp', 'Home', 'End'];
+		if (!keys.includes(e.key)) return;
+		e.preventDefault();
+		const group = e.currentTarget as HTMLElement;
+		const cards = Array.from(group.querySelectorAll<HTMLElement>('[role="radio"]'));
+		const active = document.activeElement;
+		let i = active ? cards.indexOf(active as HTMLElement) : -1;
+		if (i < 0) i = THEMES.findIndex((t) => t.id === themeId);
+		if (i < 0) return;
+		const dir = (e.key === 'ArrowRight' || e.key === 'ArrowDown') ? 1 : -1;
+		const next = e.key === 'Home' ? 0 : e.key === 'End' ? THEMES.length - 1 : (i + dir + THEMES.length) % THEMES.length;
+		cards[next].focus();
+		selectTheme(THEMES[next].id);
+	}
+
 	async function handleWipe() {
 		wiping = true;
 		try {
@@ -679,14 +813,57 @@
 <!-- TopBar -->
 <!-- QURATOR-81 follow-up — see contacts/+page.svelte: the topbar is the drag handle. The attribute
      does not inherit, so the controls inside keep their clicks. -->
-<div class="topbar" data-tauri-drag-region>
+<div class="topbar hb-pane" data-tauri-drag-region>
 	<div>
 		<div class="topbar-title">Settings</div>
 		<div class="topbar-sub">Identity, relays, and preferences</div>
 	</div>
 </div>
 
-<div class="body">
+<div class="body hb-pane">
+	<!-- QURATOR-352: Appearance, FIRST among the sections. -->
+	<div class="section-label">Appearance</div>
+	<div class="surface">
+		<!-- A radio group takes no tabindex itself: focus sits on the checked radio (roving tabindex
+		     below), and this keydown only catches arrow keys bubbling up from it. -->
+		<!-- svelte-ignore a11y_interactive_supports_focus -->
+		<div class="theme-grid" role="radiogroup" aria-label="Theme" onkeydown={onThemeGridKeydown}>
+			{#each THEMES as t (t.id)}
+				<button type="button" class="theme-card" role="radio" aria-checked={t.id === themeId} tabindex={t.id === themeId ? 0 : -1} onclick={() => selectTheme(t.id)} disabled={!settingsLoaded}>
+					<span class="theme-swatch" aria-hidden="true">
+						<span class="theme-stripe" style="background: {t.swatch[0]}"></span>
+						<span class="theme-stripe stripe-mid" style="background: {t.swatch[1]}"></span>
+						<span class="theme-stripe" style="background: {t.swatch[2]}"></span>
+					</span>
+					<span class="theme-name">{t.name}</span>
+					<span class="theme-meta"><span class="theme-source">{themeSubtitle(t)}</span>{#if t.mode === 'light'}<span class="theme-mode">Light</span>{/if}</span>
+				</button>
+			{/each}
+		</div>
+
+		<div class="toggle-row">
+			<div class="toggle-text">
+				<div class="toggle-label">Glass effects</div>
+				<div class="toggle-sub">Turn off to use solid panels. Windows also turns glass off when you switch off transparency effects or use Battery Saver.</div>
+			</div>
+			<button class="toggle" class:toggle-on={glassOn} onclick={toggleGlass} disabled={!settingsLoaded} aria-label="Glass effects">
+				<span class="toggle-thumb"></span>
+			</button>
+		</div>
+
+		{#if materialSupported}
+			<div class="toggle-row">
+				<div class="toggle-text">
+					<div class="toggle-label">See-through window</div>
+					<div class="toggle-sub">{seeThroughSub}</div>
+				</div>
+				<button class="toggle" class:toggle-on={seeThroughOn} onclick={toggleSeeThrough} disabled={!settingsLoaded || !glassOn || themeId === BASE_THEME} aria-label="See-through window">
+					<span class="toggle-thumb"></span>
+				</button>
+			</div>
+		{/if}
+	</div>
+
 	<!-- Identity -->
 	<div class="section-label">Identity</div>
 
@@ -1149,9 +1326,11 @@
 		display: flex;
 		justify-content: space-between;
 		align-items: center;
-		background: var(--bg);
 		flex-shrink: 0;
 	}
+	/* QURATOR-352 — the divider between panes disappears when panes float (hb-pane supplies the
+	   glass rim instead). In hoard (no data-glass-float) it stays. */
+	:global(:root[data-glass-float]) .topbar { border-bottom: 0; }
 	.topbar-title { font-size: 17px; font-weight: 600; letter-spacing: -0.3px; }
 	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
 
@@ -1501,4 +1680,35 @@
 		display: flex; gap: 8px; align-items: flex-start;
 	}
 	.ack-row { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--fg-muted); }
+
+	/* ── QURATOR-352 Appearance ────────────────────────────────────────────── */
+	.theme-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+		gap: 8px;
+		margin-bottom: 12px;
+	}
+	.theme-card {
+		display: flex; flex-direction: column; align-items: stretch; gap: 6px;
+		padding: 10px; text-align: left; cursor: pointer; font: inherit;
+		border: 1px solid var(--border); border-radius: 8px;
+		background: var(--bg-elev1); color: var(--fg);
+	}
+	.theme-card[aria-checked="true"] {
+		border-color: var(--accent);
+		background: color-mix(in oklch, var(--accent) 7%, transparent);
+	}
+	.theme-card:disabled { opacity: 0.6; cursor: default; }
+	.theme-swatch {
+		display: flex; width: 100%; height: 28px;
+		border-radius: 5px; overflow: hidden;
+		border: 1px solid var(--border);
+	}
+	.theme-stripe { flex: 1; }
+	.theme-name { font-size: 12.5px; font-weight: 500; color: var(--fg); }
+	.theme-meta { display: flex; gap: 6px; align-items: center; font-size: 11px; color: var(--fg-muted); }
+	.theme-mode {
+		border: 1px solid var(--border); border-radius: 99px; padding: 0 6px;
+		color: var(--fg-dim);
+	}
 </style>
