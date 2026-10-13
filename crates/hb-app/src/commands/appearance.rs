@@ -54,23 +54,36 @@ fn apply_window_material(window: &tauri::WebviewWindow, on: bool) -> Result<(), 
         return Ok(());
     }
     if on {
-        // Mica FIRST, then transparency: if the background call fails, Mica sits behind an
-        // opaque webview (harmless); the other order could leave a transparent window with no
-        // material, showing the raw desktop unblurred.
+        // Mica FIRST, then transparency: if a background call fails, Mica sits behind an opaque
+        // layer (harmless); the other order could leave a see-through window with no material.
         window
             .set_effects(EffectsBuilder::new().effect(Effect::Mica).build())
             .map_err(cmd_err)?;
-        window
-            .set_background_color(Some(Color(0, 0, 0, 0)))
-            .map_err(cmd_err)?;
+        // ⚠ The two layers are set SEPARATELY because no single value works for both (found
+        // 2026-10-13, owner: "it does absolutely nothing"):
+        //  - native window (tao): `None` = paint no brush, so the DWM backdrop shows. `Some(c)`
+        //    paints a SOLID brush with the alpha IGNORED — `Color(0,0,0,0)` painted opaque black
+        //    over Mica, which is why v0.23.1 showed nothing.
+        //  - webview (wry): alpha 0 is passed through as transparent on Windows 8+; `None` is
+        //    turned into opaque WHITE by tauri-runtime-wry.
+        // The window must also have been CREATED transparent (tauri.windows.conf.json): tao only
+        // enables DWM blur-behind at creation, and nothing re-runs it later.
+        let webview: &tauri::Webview = window.as_ref();
+        webview.window().set_background_color(None).map_err(cmd_err)?;
+        webview.set_background_color(Some(Color(0, 0, 0, 0))).map_err(cmd_err)?;
     } else {
-        // Clear the material first, then restore the opaque background.
+        // Clear the material first, then paint both layers opaque again.
         window.set_effects(None).map_err(cmd_err)?;
-        window
-            .set_background_color(Some(OPAQUE_BG))
-            .map_err(cmd_err)?;
+        paint_opaque(window)?;
     }
     Ok(())
+}
+
+/// Paint both the native window and the webview with the opaque app background. On Windows the
+/// main window is CREATED transparent (tauri.windows.conf.json) so Mica can show through later;
+/// until see-through is actually on, this keeps it looking exactly like an opaque window.
+fn paint_opaque(window: &tauri::WebviewWindow) -> Result<(), String> {
+    window.set_background_color(Some(OPAQUE_BG)).map_err(cmd_err)
 }
 
 /// Is the see-through window material (Mica) supported here? Windows 11+ only — `false` on
@@ -91,11 +104,17 @@ pub fn set_window_material(window: tauri::WebviewWindow, see_through: bool, glas
 }
 
 /// The startup half: re-apply the persisted see-through choice BEFORE the user sees the window.
-/// Fires only for `see_through && glass` (see `see_through_effective`). Errors are swallowed: a
-/// failed Mica application must never block startup, the user simply gets the opaque window.
+/// Applies Mica only where it is supported and `see_through && glass` (see `see_through_effective`);
+/// in every other case it paints the window opaque, because on Windows the window is created
+/// transparent. Errors are swallowed: a failed Mica application must never block startup.
 pub(crate) fn startup_see_through(settings: &Settings, window: &tauri::WebviewWindow) {
-    if see_through_effective(settings.see_through, settings.glass) {
+    if material_supported() && see_through_effective(settings.see_through, settings.glass) {
         let _ = apply_window_material(window, true);
+    } else {
+        // Everywhere else (Windows 10, see-through off, glass off) the transparent-created window
+        // must not show the desktop: paint it opaque before the user sees it. On Linux and macOS
+        // the window is created opaque, so this is a harmless repaint with the same colour.
+        let _ = paint_opaque(window);
     }
 }
 
@@ -110,5 +129,30 @@ mod tests {
         assert!(see_through_effective(true, true), "asked for, glass on");
         assert!(!see_through_effective(true, false), "never with glass off");
         assert!(!see_through_effective(false, true), "never unless asked for");
+    }
+
+    /// The Windows overlay must be the base main-window entry plus `transparent: true` and
+    /// NOTHING else. Tauri merges platform configs with JSON Merge Patch, which replaces arrays
+    /// whole, so the overlay carries a full copy of the window entry; this pins the copy to the
+    /// base so a change to one (size, title, drag-drop) cannot silently miss the other.
+    /// MUTATION (P-10): change `"minWidth": 800` to 900 in tauri.windows.conf.json — this reds.
+    /// Delete the `"transparent": true` line there — this reds too.
+    #[test]
+    fn windows_overlay_is_the_base_window_plus_transparent() {
+        let base: serde_json::Value =
+            serde_json::from_str(include_str!("../../tauri.conf.json")).expect("base config");
+        let win: serde_json::Value =
+            serde_json::from_str(include_str!("../../tauri.windows.conf.json")).expect("windows config");
+        let mut expected = base["app"]["windows"][0].clone();
+        expected["transparent"] = serde_json::Value::Bool(true);
+        assert_eq!(
+            win["app"]["windows"][0], expected,
+            "tauri.windows.conf.json's window must equal tauri.conf.json's plus transparent: true"
+        );
+        assert_eq!(win["app"]["windows"].as_array().map(Vec::len), Some(1), "exactly one window");
+        assert!(
+            base["app"]["windows"][0].get("transparent").is_none(),
+            "the BASE window must stay opaque: Linux and macOS must never be created transparent"
+        );
     }
 }
