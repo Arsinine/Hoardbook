@@ -207,6 +207,7 @@ mod tests {
                 collections: Vec::new(),
                 total_bytes: 0,
                 contact_hint: None,
+                looking_for: None,
                 display_name: "bob".into(),
                 bio: String::new(),
                 tags: vec![],
@@ -343,7 +344,7 @@ mod tests {
         let b = Identity::generate();
         let teaser = build_teaser(
             &a,
-            &Teaser { total_bytes: 0, contact_hint: None, display_name: "a".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None, hide_in_rosters: false, collections: Vec::new() },
+            &Teaser { total_bytes: 0, contact_hint: None, looking_for: None, display_name: "a".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None, hide_in_rosters: false, collections: Vec::new() },
             true,
         )
         .unwrap();

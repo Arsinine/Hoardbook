@@ -72,6 +72,9 @@ pub(crate) fn teaser_from_profile(store: &DataStore, profile: &Profile) -> Tease
         // v5 (QURATOR-344): the hint rides the public teaser now (owner ruling rounds 10–11 —
         // the linked-handle risk is answered by the UI's copy, not crypto).
         contact_hint: profile.contact_hint.clone(),
+        // QURATOR-351: the "Looking for" line rides the teaser the same way; build_teaser
+        // bounds it before signing.
+        looking_for: profile.looking_for.clone(),
         // QURATOR-142: input value is always OVERWRITTEN by build_teaser (derived there from the
         // `discoverable` param — the single source of truth); set for literal completeness only.
         hide_in_rosters: false,
@@ -265,6 +268,7 @@ mod tests {
             est_size: None,
             languages: vec![],
             contact_hint: Some("secret@example.com".into()),
+            looking_for: None,
             email: None,
             location: None,
             social_links: vec![],
@@ -335,6 +339,32 @@ mod tests {
         assert!(event.content.contains("contact_hint"), "v5: the hint rides the body");
         assert!(event.content.contains("secret@example.com"));
         assert!(!event.content.contains("location"), "location stays out");
+    }
+
+    #[test]
+    fn teaser_from_profile_carries_looking_for() {
+        // QURATOR-351: the "Looking for" line rides the teaser like the hint — copied
+        // verbatim here, bounded later by build_teaser (see the hb-core tests). Absent on the
+        // profile ⇒ absent on the teaser.
+        //
+        // P-10 mutation (orchestrator applies; must red, revert after): in teaser_from_profile,
+        // delete the line `looking_for: profile.looking_for.clone(),` — the present-shape
+        // assert below must RED (the teaser's looking_for would fall back to None).
+        let (_dir, store) = test_store();
+        let mut profile = make_profile("Tester", vec!["video".into()]);
+        profile.looking_for = Some("looking for laserdiscs".into());
+        let teaser = teaser_from_profile(&store, &profile);
+        assert_eq!(
+            teaser.looking_for.as_deref(),
+            Some("looking for laserdiscs"),
+            "the line is carried Profile → Teaser verbatim"
+        );
+        profile.looking_for = None;
+        assert_eq!(
+            teaser_from_profile(&store, &profile).looking_for,
+            None,
+            "absent on the profile ⇒ absent on the teaser"
+        );
     }
 
     #[test]

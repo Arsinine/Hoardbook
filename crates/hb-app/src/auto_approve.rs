@@ -1840,6 +1840,7 @@ mod tests {
             hide_in_rosters: false,
             total_bytes: total,
             contact_hint: None,
+            looking_for: None,
         }
     }
 

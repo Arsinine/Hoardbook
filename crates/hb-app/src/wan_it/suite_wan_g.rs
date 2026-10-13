@@ -366,6 +366,7 @@ async fn publish_own_teaser(input: &CarryInput) -> Result<(), String> {
         est_size: None,
         languages: vec![],
         contact_hint: None,
+        looking_for: None,
         email: None,
         location: None,
         social_links: vec![],

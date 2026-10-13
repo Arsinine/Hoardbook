@@ -24,6 +24,7 @@ fn teaser() -> Teaser {
         collections: Vec::new(),
         total_bytes: 0,
         contact_hint: None,
+        looking_for: None,
         display_name: "signer".into(),
         bio: String::new(),
         tags: vec!["hbid".into()],

@@ -32,6 +32,7 @@ fn teaser() -> Teaser {
         collections: Vec::new(),
         total_bytes: 0,
         contact_hint: None,
+        looking_for: None,
         display_name: "archivebox_prime".into(),
         bio: "90s anime, VHS rips".into(),
         tags: vec!["anime".into(), "vhs".into()],

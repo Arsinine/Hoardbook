@@ -128,6 +128,7 @@ pub fn build_canary_events(id: &Identity, bk: &BrowseKey, run_tag: &str) -> Resu
             collections: Vec::new(),
             total_bytes: 0,
             contact_hint: None,
+            looking_for: None,
             display_name: "hb-canary".into(),
             bio: "synthetic backbone probe".into(),
             tags: vec![run_tag.to_string()],

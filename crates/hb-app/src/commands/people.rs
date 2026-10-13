@@ -241,6 +241,7 @@ mod tests {
             est_size: None,
             languages: vec![],
             contact_hint: None,
+            looking_for: None,
             email: None,
             location: None,
             social_links: vec![],

@@ -236,6 +236,7 @@
 		est_size: undefined,
 		languages: [],
 		contact_hint: undefined,
+		looking_for: undefined,
 		email: undefined,
 		location: undefined,
 		social_links: [],
@@ -282,6 +283,9 @@
 		return {
 			...form,
 			display_name: form.display_name.trim(),
+			// QURATOR-351 e: trim on save; empty becomes absent so a cleared line disappears
+			// from the teaser instead of persisting as "".
+			looking_for: form.looking_for?.trim() || undefined,
 			updated: new Date().toISOString(),
 			est_size: totalBytes > 0 ? diskSize : undefined,
 		};
@@ -832,6 +836,17 @@
 						<input class="lang-input" type="text" placeholder="anime, scifi, docs…"
 							bind:value={tagInput} onkeydown={handleTagKey} />
 					</div>
+				</div>
+
+				<div class="field">
+					<!-- QURATOR-351 state e: the Looking-for line, written on Home where this app
+					     keeps the profile editor (the mock parked it under Settings). Owner-approved
+					     copy from hoardbook-drafts/351-r5/phonebook.html. No straight apostrophes in
+					     this block: the W8 copy scanner treats them as string delimiters. -->
+					<label class="field-label">Looking for<span class="hb-tag">Public</span></label>
+					<input class="hb-input" type="text" maxlength="255" placeholder="Kurosawa 70mm scans; Balkan field recordings pre-1970" bind:value={form.looking_for} />
+					<div class="field-count">{form.looking_for?.length ?? 0} / 255</div>
+					<div class="field-hint">Public, like your collection names. It leaves with your teaser on the relays you use and is capped at 255 characters. Leave it empty and your entry simply has no “Looking for” line.</div>
 				</div>
 
 				<div class="field">
@@ -1415,6 +1430,7 @@
 	}
 
 	.field-hint { font-size: 11px; color: var(--fg-dim); margin-top: 4px; }
+	.field-count { font: 10.5px var(--font-mono); color: var(--fg-dim); align-self: flex-end; text-align: right; margin-top: 2px; font-variant-numeric: tabular-nums; }
 
 	/* Add collection button — dedicated class to avoid global style interference */
 	.btn-add {

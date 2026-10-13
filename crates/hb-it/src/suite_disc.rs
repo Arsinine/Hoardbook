@@ -30,7 +30,7 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
 }
 
 fn teaser(name: &str, tags: Vec<String>, cts: Vec<String>) -> Teaser {
-    Teaser { total_bytes: 0, contact_hint: None, display_name: name.into(), bio: String::new(), tags, content_types: cts, picture: None, hide_in_rosters: false, collections: Vec::new() }
+    Teaser { total_bytes: 0, contact_hint: None, looking_for: None, display_name: name.into(), bio: String::new(), tags, content_types: cts, picture: None, hide_in_rosters: false, collections: Vec::new() }
 }
 
 /// Fetch + verify teasers matching a tag-search filter, returning (author, parsed teaser).

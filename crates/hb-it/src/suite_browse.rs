@@ -52,6 +52,7 @@ fn teaser(name: &str, tags: Vec<String>) -> Teaser {
         collections: Vec::new(),
         total_bytes: 0,
         contact_hint: None,
+        looking_for: None,
         display_name: name.into(),
         bio: "hoards".into(),
         tags,

@@ -99,6 +99,7 @@ fn teaser_event(id: &Identity, name: &str, total: u64) -> Result<Event> {
         hide_in_rosters: false,
         total_bytes: total,
         contact_hint: None,
+        looking_for: None,
     };
     Ok(build_teaser(id, &t, false)?)
 }
@@ -435,6 +436,7 @@ fn teaser_fields(name: &str, total: u64) -> Teaser {
         hide_in_rosters: false,
         total_bytes: total,
         contact_hint: None,
+        looking_for: None,
     }
 }
 

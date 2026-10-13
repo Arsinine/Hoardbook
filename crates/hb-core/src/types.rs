@@ -32,6 +32,11 @@ pub struct Profile {
     /// Freeform contact hint (legacy field, prefer email / social_links).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contact_hint: Option<String>,
+    /// QURATOR-351 — the user's free-text "Looking for" line (the demand side of the phonebook
+    /// entry), published on the public teaser next to `contact_hint`. Bounded to
+    /// `MAX_DESCRIPTION_CHARS` at teaser build time (see `hb_core::event::build_teaser`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub looking_for: Option<String>,
     /// Publicly visible email address — user opts in by setting this field.
     // Approved extension: not in base spec
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -176,7 +181,7 @@ pub const MAX_EST_SIZE_CHARS: usize = 32;
 
 /// Truncate to at most `max` characters, always on a character boundary (slicing a `str` at an
 /// arbitrary byte index panics mid-codepoint).
-fn truncate_chars(s: &str, max: usize) -> String {
+pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((byte_idx, _)) => s[..byte_idx].to_string(),
         None => s.to_string(),
@@ -342,6 +347,7 @@ mod tests {
             est_size: None,
             languages: vec![],
             contact_hint: None,
+            looking_for: None,
             email: None,
             location: None,
             social_links: vec![],

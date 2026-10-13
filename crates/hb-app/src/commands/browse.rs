@@ -130,6 +130,8 @@ fn teaser_to_profile(t: Teaser) -> hb_core::types::Profile {
         languages: vec![],
         // v5 (QURATOR-344): the hint rides the public teaser now — map it through.
         contact_hint: t.contact_hint,
+        // QURATOR-351: the peer's "Looking for" line maps through like the hint.
+        looking_for: t.looking_for,
         email: None,
         location: None,
         social_links: vec![],
@@ -1476,6 +1478,7 @@ mod tests {
                 collections: Vec::new(),
                 total_bytes: 0,
                 contact_hint: None,
+                looking_for: None,
                 display_name: "archivebox".into(),
                 bio: "90s anime".into(),
                 tags: vec!["anime".into()],
@@ -1499,7 +1502,7 @@ mod tests {
         let id = Identity::generate();
         let hit = SearchHit {
             npub: id.npub(),
-            teaser: Teaser { total_bytes: 0, contact_hint: None, display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None, hide_in_rosters: false, collections: Vec::new() },
+            teaser: Teaser { total_bytes: 0, contact_hint: None, looking_for: None, display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None, hide_in_rosters: false, collections: Vec::new() },
             created_at: nostr::Timestamp::from(0),
         };
         assert_eq!(hit_to_card(hit).bio, None, "a blank bio renders as None, not an empty string");
@@ -1516,6 +1519,7 @@ mod tests {
         let t = Teaser {
             total_bytes: 12_884_901_888,
             contact_hint: None,
+            looking_for: None,
             display_name: "archivebox_prime".into(),
             bio: String::new(),
             tags: vec![],
@@ -1537,7 +1541,7 @@ mod tests {
     fn hit_for(npub: String) -> SearchHit {
         SearchHit {
             npub,
-            teaser: Teaser { total_bytes: 0, contact_hint: None, display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None, hide_in_rosters: false, collections: Vec::new() },
+            teaser: Teaser { total_bytes: 0, contact_hint: None, looking_for: None, display_name: "x".into(), bio: String::new(), tags: vec![], content_types: vec![], picture: None, hide_in_rosters: false, collections: Vec::new() },
             created_at: nostr::Timestamp::from(0),
         }
     }
@@ -2015,6 +2019,7 @@ mod tests {
         peer.profile = Some(teaser_to_profile(Teaser {
             total_bytes: 0,
             contact_hint: None,
+            looking_for: None,
             display_name: "archivebox".into(),
             bio: String::new(),
             tags: vec![],
@@ -2202,6 +2207,7 @@ mod tests {
         peer.profile = Some(teaser_to_profile(Teaser {
             total_bytes: 0,
             contact_hint: None,
+            looking_for: None,
             display_name: display_name.into(),
             bio: String::new(),
             tags: vec![],
@@ -3152,6 +3158,7 @@ mod tests {
                 est_size: None,
                 languages: vec![],
                 contact_hint: None,
+                looking_for: None,
                 email: None,
                 location: None,
                 social_links: vec![],

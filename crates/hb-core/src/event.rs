@@ -67,6 +67,18 @@ pub struct Teaser {
     /// `email`/`location` stay profile-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact_hint: Option<String>,
+    /// QURATOR-351 (owner 2026-10-13) — the demand side of the phonebook entry: the publisher's
+    /// free-text "Looking for" line, capped at `crate::types::MAX_DESCRIPTION_CHARS` = 255 chars
+    /// (the same ceiling as a collection description). TRUNCATED at BOTH ends — build and parse,
+    /// the `collections` posture: a hostile/oversize body is shortened, never rejected.
+    ///
+    /// §6 optional-field rule (the `total_bytes`/`collections` precedent): absence means "no
+    /// Looking-for line shown" and gates NOTHING — nothing reads it for any decision (the v5
+    /// size rule reads `total_bytes`, never this line) — so absence is not exploitable as a
+    /// downgrade and there is no `SCHEMA_V` bump. BOTH wire shapes (present + absent) are
+    /// pinned in the tests below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub looking_for: Option<String>,
     /// v5 (QURATOR-342, owner ruling 2026-09-28) — the NAMES + SIZES of the publisher's
     /// published **public** collections. "The collection name is the teaser. If you're
     /// interested, you'll want to engage more with this person. If you're not, then you skip on
@@ -138,6 +150,14 @@ struct Versioned<T> {
     inner: T,
 }
 
+/// QURATOR-351 — bound the "Looking for" line to the description cap and drop a blank one.
+/// Shared by [`build_teaser`] (sign-side) and [`parse_teaser`] (ingest-side): a hostile or
+/// oversize body is TRUNCATED, never rejected, and a whitespace-only line shows nothing.
+fn sanitize_looking_for(v: Option<String>) -> Option<String> {
+    v.map(|s| crate::types::truncate_chars(s.trim(), crate::types::MAX_DESCRIPTION_CHARS))
+        .filter(|s| !s.is_empty())
+}
+
 /// Build a signed public teaser. When `discoverable` is true, `tags` + `content_types` are also
 /// emitted as `t` hashtags so the teaser is discoverable by tag search; when false, no hashtags are
 /// emitted at all (devtest #5 — the opt-out de-lists from tag/content-type search while npub lookup
@@ -158,6 +178,9 @@ pub fn build_teaser(identity: &Identity, teaser: &Teaser, discoverable: bool) ->
     // them), derived here from the same `discoverable` param both publish call sites already pass.
     let mut inner = teaser.clone();
     inner.hide_in_rosters = !discoverable;
+    // QURATOR-351: the "Looking for" line is bounded BEFORE signing — truncate, never reject
+    // (the collections posture), and a blank line is simply absent.
+    inner.looking_for = sanitize_looking_for(inner.looking_for.take());
     // QURATOR-342: bound the public list BEFORE signing — a serde derive is an unvalidated
     // public constructor (§9), and the teaser must stay inside the ingest bound (the arithmetic
     // on `Teaser::collections`). Truncate, never reject the whole teaser: the list is
@@ -208,6 +231,10 @@ pub fn parse_teaser(event: &Event) -> Result<Teaser, HbError> {
     for c in &mut teaser.collections {
         c.name = truncate_alias(&c.name);
     }
+    // QURATOR-351: the same ingest posture for the "Looking for" line — a hostile/oversize
+    // body is TRUNCATED, never rejected (a serde derive is an unvalidated public constructor,
+    // §9). Same bounds build_teaser signs under.
+    teaser.looking_for = sanitize_looking_for(teaser.looking_for.take());
     Ok(teaser)
 }
 
@@ -307,6 +334,7 @@ mod tests {
             hide_in_rosters: false,
             total_bytes: 0,
             contact_hint: None,
+            looking_for: None,
             collections: Vec::new(),
         }
     }
@@ -498,6 +526,120 @@ mod tests {
             );
             assert_eq!(c.bytes, i as u64, "bytes untouched by the sanitize");
         }
+    }
+
+    #[test]
+    fn teaser_wire_pins_looking_for_both_shapes() {
+        // §6 wire rule, the `collections` test's twin: `looking_for` is an OPTIONAL field.
+        // Absence means "no Looking-for line shown" and gates NOTHING — nothing reads it for
+        // any decision (the v5 size rule reads `total_bytes`, never this line) — so absence
+        // is not exploitable as a downgrade and there is no SCHEMA_V bump. BOTH shapes pinned
+        // (present + absent), plus the empty-string wire shape.
+        //
+        // P-10 mutations (orchestrator applies; each must red, revert after):
+        //   (a) remove the `#[serde(default, skip_serializing_if = "Option::is_none")]`
+        //       attribute on `pub looking_for: Option<String>,` in `pub struct Teaser` — the
+        //       absent-shape assert below must RED (missing-field error, the unwrap panics);
+        //   (b) in build_teaser, insert `inner.looking_for = None;` immediately after
+        //           `inner.looking_for = sanitize_looking_for(inner.looking_for.take());`
+        //       — the present-shape round-trip assert must RED.
+        let id = Identity::generate();
+        let mut t = teaser();
+        t.looking_for = Some("looking for 8in laserdiscs".into());
+        let ev = build_teaser(&id, &t, true).unwrap();
+        assert!(
+            ev.content.contains("\"looking_for\":"),
+            "present shape is on the wire"
+        );
+        assert_eq!(parse_teaser(&ev).unwrap(), t, "present shape round-trips");
+
+        // Absent shape: a body from BEFORE the field existed (or stripped in transit) still
+        // parses — looking_for serde-defaults to None.
+        let legacy: Teaser = serde_json::from_str(
+            r#"{"display_name":"old","bio":"","tags":[],"content_types":[]}"#,
+        )
+        .unwrap();
+        assert!(
+            legacy.looking_for.is_none(),
+            "absent looking_for ⇒ None — absence shows no line and gates nothing"
+        );
+
+        // Empty string ON THE WIRE parses to None — the parse-side sanitize trims it away.
+        let inner = Teaser { looking_for: Some("   ".into()), ..teaser() };
+        let content = serde_json::to_string(&Versioned { v: SCHEMA_V, inner }).unwrap();
+        let ev = id
+            .sign(
+                EventBuilder::new(Kind::from_u16(KIND_TEASER), content).tags([
+                    Tag::identifier(TEASER_D),
+                    Tag::custom(TagKind::custom(TAG_SCHEMA), [SCHEMA_V.to_string()]),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(
+            parse_teaser(&ev).unwrap().looking_for,
+            None,
+            "wire empty/whitespace string ⇒ None"
+        );
+
+        // Build side: a blank value is simply absent from the signed body.
+        let mut blank = teaser();
+        blank.looking_for = Some("  ".into());
+        let ev = build_teaser(&id, &blank, true).unwrap();
+        assert!(
+            !ev.content.contains("looking_for"),
+            "a whitespace-only line is not signed at all"
+        );
+    }
+
+    #[test]
+    fn parse_teaser_truncates_hostile_looking_for() {
+        // A serde derive is an unvalidated public constructor (§9): a hostile relay copy with
+        // an over-cap "Looking for" line is TRUNCATED to MAX_DESCRIPTION_CHARS (255, chars
+        // not bytes — multibyte input throughout), never rejected — and build_teaser signs an
+        // already-bounded value.
+        //
+        // P-10 mutations (orchestrator applies; each must red, revert after):
+        //   (a) delete the line
+        //           teaser.looking_for = sanitize_looking_for(teaser.looking_for.take());
+        //       in parse_teaser (the `teaser.` one, not the `inner.` one in build_teaser) —
+        //       the 255-char parse assert must RED;
+        //   (b) delete the line
+        //           inner.looking_for = sanitize_looking_for(inner.looking_for.take());
+        //       in build_teaser (the `inner.` one, not the `teaser.` one in parse_teaser) —
+        //       the build-side 255-char assert must RED.
+        let id = Identity::generate();
+
+        // Parse side: build_teaser truncates first, so the hostile body is hand-signed —
+        // exactly build_teaser's own construction — with 300 multibyte chars (cap 255).
+        let hostile = "é".repeat(300);
+        let inner = Teaser { looking_for: Some(hostile.clone()), ..teaser() };
+        let content = serde_json::to_string(&Versioned { v: SCHEMA_V, inner }).unwrap();
+        let ev = id
+            .sign(
+                EventBuilder::new(Kind::from_u16(KIND_TEASER), content).tags([
+                    Tag::identifier(TEASER_D),
+                    Tag::custom(TagKind::custom(TAG_SCHEMA), [SCHEMA_V.to_string()]),
+                ]),
+            )
+            .unwrap();
+        let parsed = parse_teaser(&ev).unwrap().looking_for.unwrap();
+        assert_eq!(
+            parsed.chars().count(),
+            crate::types::MAX_DESCRIPTION_CHARS,
+            "hostile line truncated to the description cap (chars, not bytes)"
+        );
+
+        // Build side: a 300-char input signs a value already at the cap.
+        let mut t = teaser();
+        t.looking_for = Some(hostile);
+        let ev = build_teaser(&id, &t, true).unwrap();
+        let rebuilt = parse_teaser(&ev).unwrap().looking_for.unwrap();
+        assert_eq!(
+            rebuilt.chars().count(),
+            crate::types::MAX_DESCRIPTION_CHARS,
+            "build_teaser signs a value already at the cap"
+        );
+        assert_eq!(rebuilt, "é".repeat(255), "build + parse truncate identically");
     }
 
     #[test]

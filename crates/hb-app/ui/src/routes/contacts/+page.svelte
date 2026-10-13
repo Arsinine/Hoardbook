@@ -956,6 +956,16 @@
 		} catch (e) { toast(String(e), 'error'); }
 	}
 
+	// QURATOR-351 (state d): the peer's PUBLISHED total on the row face. Mirrors Browse's
+	// fmtBytes exactly (same units, same rounding) so a size reads the same on both views —
+	// the two incumbent formatters (browse, CollectionRow) are component-local, nothing to import.
+	function fmtBytes(bytes: number): string {
+		if (bytes > 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
+		if (bytes > 1e6) return (bytes / 1e6).toFixed(1) + ' MB';
+		if (bytes > 1e3) return (bytes / 1e3).toFixed(0) + ' KB';
+		return bytes + ' B';
+	}
+
 	// True when the peer published at least one fact the CARD FACE has no room for. Deliberately does
 	// NOT count bio (face row 3), tags/content_types (their own block) or est_size (face row 4): if it
 	// already renders on the face, it must not make the panel claim to hold "the rest".
@@ -1200,6 +1210,8 @@
 	{@const publicCollections = peer.collections.filter(c => c.visibility !== 'Private')}
 	{@const pubCount = publicCollections.length}
 	{@const sizeSummary = !badge.locked ? summarizeCollectionsSize(publicCollections) : null}
+	{@const profileTotal = peer.profile?.total_bytes}
+	{@const lookingFor = peer.profile?.looking_for}
 	<!-- M21 W4 behaviour 5: the petnameFor collision warning goes on the card face. The fingerprint is
 	     a 67-bit grind, so this red-outlined badge is the actual security control. -->
 	{@const contactsForLabel = $contacts.map(c => ({ npub: c.npub, petname: c.petname ?? c.profile?.display_name ?? '' }))}
@@ -1287,6 +1299,12 @@
 						{/if}
 					{/if}
 					<div style="flex:1"></div>
+					{#if profileTotal}
+						<!-- QURATOR-351 state d: THEIR published total, right-aligned on the name row.
+						     No profile total, or 0 -> no span (never a fabricated "0 B"). -->
+						<span class="row-size">{fmtBytes(profileTotal)}</span>
+					{/if}
+
 					{#if pubCount > 0}
 						<span class="row-count" title="{pubCount} public collection{pubCount !== 1 ? 's' : ''}">{pubCount}</span>
 					{/if}
@@ -1408,6 +1426,15 @@
 				     Seven Profile fields (location, languages, willing_to, contact_hint, email,
 				     social_links, since) crossed the Tauri boundary on every contact and were rendered
 				     NOWHERE before this. -->
+				<!-- QURATOR-351 state d (r5 ruling): the demand side comes FIRST — what they are looking
+				     for leads the detail, ahead of what they publish. Only when they published one. -->
+				{#if lookingFor}
+					<div class="detail-block detail-theirs">
+						<div class="block-head">Looking for</div>
+						<p class="looking-for">{lookingFor}</p>
+					</div>
+				{/if}
+
 				<div class="detail-block detail-theirs">
 					<div class="block-head">Profile <em>published by them</em></div>
 					{#if hasProfileFacts(peer.profile)}
@@ -2025,6 +2052,9 @@
 
 	.name-row { display: flex; gap: 8px; align-items: center; margin-bottom: 3px; flex-wrap: wrap; }
 	.peer-name { font-weight: 600; font-size: 15px; letter-spacing: -0.2px; }
+	/* QURATOR-351 state d: their published total, right-aligned on the name row. tabular-nums
+	   so digit columns align down the roster; dim so it never competes with the name. */
+	.row-size { color: var(--fg-dim); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 	.last-seen { font-size: 10.5px; color: var(--fg-dim); }
 
@@ -2210,6 +2240,8 @@
 	}
 	.block-head em { font-style: normal; font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--fg-dim); }
 	.detail-empty { font-size: 11.5px; color: var(--fg-dim); }
+	/* QURATOR-351 state d: the demand side, verbatim as published. */
+	.looking-for { font-size: 14px; color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; max-width: 65ch; margin: 0; }
 
 	/* Label/value grid. The label column is fixed so the values line up down the panel; it wraps to
 	   a single column below 380px, where a 92px gutter would leave nothing for a URL-ish handle. */

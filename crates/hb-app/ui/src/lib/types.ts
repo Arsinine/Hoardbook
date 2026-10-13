@@ -23,6 +23,8 @@ export interface Profile {
 	est_size?: string;
 	languages: string[];
 	contact_hint?: string;
+	/** Public “Looking for” line — rides the teaser, capped at 255 chars. */
+	looking_for?: string;
 	/** Publicly visible — user explicitly opts in by filling this field. */
 	email?: string;
 	/** City or region, e.g. "Tokyo" or "EU/Germany". */
