@@ -66,9 +66,18 @@ describe('W8.2 — the contact hint no longer suggests Reddit', () => {
 	it('the hint still names concrete alternatives (the field stays self-explanatory)', () => {
 		// Removing the example must not leave the field meaningless — the point of the hint is to
 		// show what shape of thing belongs here.
-		const copy = extractUserFacingSegments(homeSrc()).join('\n');
-		expect(copy).toContain('a Discord or Matrix handle or an email');
-		expect(copy).toContain('you@example.com');
+		// Scoped to the contact-hint FIELD like the test above, NOT a page-wide
+		// extractUserFacingSegments() sweep: that extractor is a regex scanner and treats every
+		// apostrophe in markup text ("can't", "It's") as a string delimiter, so the parity of
+		// apostrophes ABOVE this field decides whether the placeholder's "…" literal is seen at all.
+		// Dropping the "You're discoverable" status line (2026-10-13) flipped that parity and this
+		// assertion went red with the field untouched.
+		const src = homeSrc();
+		const start = src.indexOf('Contact hint');
+		expect(start).toBeGreaterThan(-1);
+		const field = src.slice(start, src.indexOf('</div>', start));
+		expect(field).toContain('a Discord or Matrix handle or an email');
+		expect(field).toContain('you@example.com');
 	});
 
 	it('the `reddit` SOCIAL_PLATFORMS entry is deliberately KEPT (copy-only decision)', () => {
