@@ -40,7 +40,7 @@ fn now_secs() -> u64 {
 
 /// Discovery result cap — mirrors the teaser/discovery cap; a flood of teasers can't make the result
 /// set unbounded.
-const SEARCH_CAP: usize = 100;
+pub(crate) const SEARCH_CAP: usize = 100; // QURATOR-351 slice 4: shared with commands::phonebook
 
 /// A §6 Discovery teaser card (M12 W3). Carries **only** the opt-in public teaser — name/bio/tags/
 /// content-types + the §7 fingerprint (the impersonation distinguisher for a stranger). It carries
@@ -525,7 +525,7 @@ pub(crate) async fn resolve_peer_covered(
 }
 
 /// Snapshot the loaded identity (cloned) or error if none.
-async fn identity_clone(identity: &SharedIdentity) -> Result<Identity, String> {
+pub(crate) async fn identity_clone(identity: &SharedIdentity) -> Result<Identity, String> {
     identity
         .read()
         .await

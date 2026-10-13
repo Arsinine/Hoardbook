@@ -70,11 +70,18 @@ pub fn teaser_matches(teaser: &Teaser, tags: &[String], content_types: &[String]
     tags_ok && ct_ok
 }
 
-/// Case-insensitive substring test over the teaser's published text fields (display_name + bio +
-/// tags + content_types). This is exactly the haystack `rank_hits` already scores over, so the
-/// filter and the ranker agree on what fields are searchable. Does NOT touch collection names,
-/// descriptions, or file/folder names — those stay browse-key-sealed behind `scan_selective`
-/// (owner ruling 2026-08-10: a searchable index IS a disclosure).
+/// Case-insensitive substring test over the teaser's published text fields: display_name + bio +
+/// tags + content_types, and — since QURATOR-351 slice 4 (2026-10-13) — the teaser's public
+/// collection NAMES and the Looking-for line. Those two became published teaser fields in the
+/// owner's 2026-09-28 ruling (QURATOR-342, "The collection name is the teaser"; the Looking-for
+/// line landed with QURATOR-351), so they are already world-readable on every relay and a
+/// substring match over them discloses nothing new. This supersedes the 2026-08-10
+/// no-searchable-index ruling FOR THOSE TWO FIELDS ONLY. The rest of that ruling stands
+/// untouched: titles, descriptions, and file/folder names stay browse-key-sealed behind
+/// `scan_selective` and are never matched here. (The single-term RANKER `rank_hits` still scores
+/// its trigrams over the four original fields only; a collection-name/Looking-for hit passes
+/// this filter and orders by recency — widening the ranker is a ranking-quality follow-up,
+/// not a disclosure question.)
 fn substring_in_teaser(needle: &str, teaser: &Teaser) -> bool {
     let needle = needle.to_lowercase();
     if needle.is_empty() {
@@ -84,7 +91,12 @@ fn substring_in_teaser(needle: &str, teaser: &Teaser) -> bool {
     let bio_hit = teaser.bio.to_lowercase().contains(&needle);
     let tag_hit = teaser.tags.iter().any(|t| t.to_lowercase().contains(&needle));
     let ct_hit = teaser.content_types.iter().any(|c| c.to_lowercase().contains(&needle));
-    name_hit || bio_hit || tag_hit || ct_hit
+    let col_hit = teaser.collections.iter().any(|c| c.name.to_lowercase().contains(&needle));
+    let lf_hit = teaser
+        .looking_for
+        .as_deref()
+        .is_some_and(|l| l.to_lowercase().contains(&needle));
+    name_hit || bio_hit || tag_hit || ct_hit || col_hit || lf_hit
 }
 
 /// Turn raw fetched teaser events into ranked, trustworthy hits:
@@ -887,6 +899,39 @@ mod tests {
     //   3. No exact-tag-only mode (no `tag:` prefix, no toggle). Fuzzy only.
     //
     // Each test names the mutation probe that must red it.
+
+    /// QURATOR-351 slice 4: a SINGLE-term query also matches a teaser whose only mention of the
+    /// term is a public collection NAME or the Looking-for line. Both are published teaser
+    /// fields since the owner's 2026-09-28 ruling (QURATOR-342) — already world-readable on
+    /// relays, so matching them discloses nothing new. The MULTI-term contract is unchanged:
+    /// strict AND-on-exact-tags; a Looking-for mention must NOT satisfy a second term.
+    /// P-10 mutation: in `substring_in_teaser`, delete the two clauses this test exercises —
+    /// the any() over the teaser's collection entries' names, and the looking_for arm — from
+    /// the final disjunction. The first two asserts then red; the multi-term assert stays green.
+    #[test]
+    fn single_term_matches_collection_name_and_looking_for_multi_term_stays_exact() {
+        let mut t = teaser_with(&["hoarding"], &["video"]);
+        t.collections = vec![hb_core::event::TeaserCollection {
+            name: "Berserk Volumes".into(),
+            bytes: 1,
+        }];
+        t.bio = "just a hoarder".into(); // "berserk" is in a COLLECTION NAME, not bio/tags
+        assert!(
+            teaser_matches(&t, &["berserk".into()], &[]),
+            "single-term 'berserk' must match a published collection name even with no 'berserk' tag"
+        );
+
+        let mut t2 = teaser_with(&["hoarding"], &["video"]);
+        t2.looking_for = Some("after vinyl records".into()); // "vinyl" is ONLY in the Looking-for line
+        assert!(
+            teaser_matches(&t2, &["vinyl".into()], &[]),
+            "single-term 'vinyl' must match the Looking-for line"
+        );
+        assert!(
+            !teaser_matches(&t2, &["vinyl".into(), "want2".into()], &[]),
+            "a TWO-term query still requires BOTH as exact tags; a Looking-for mention must NOT satisfy it"
+        );
+    }
 
     /// QURATOR-70 ruling 2: a SINGLE-term query matches a teaser whose BIO mentions the term even
     /// when the teaser carries no such tag. Mutation probe: revert `teaser_matches` to

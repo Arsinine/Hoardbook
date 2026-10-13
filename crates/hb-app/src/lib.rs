@@ -683,6 +683,8 @@ pub fn run() {
             commands::titles::search_titles,
             // QURATOR-347 slice B — contacts ranked by similarity (UI is a later lane).
             commands::people::similar_people,
+            // QURATOR-351 slice 4 — the phonebook: contacts + strangers from public teasers.
+            commands::phonebook::discover_people,
             commands::browse::discover_observed_tags,
             commands::settings::get_settings,
             commands::settings::save_settings,

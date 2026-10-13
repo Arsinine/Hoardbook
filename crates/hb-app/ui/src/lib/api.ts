@@ -6,7 +6,7 @@ function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 	if (!isTauri) return Promise.reject(new Error(`Tauri not available (cmd: ${cmd})`));
 	return _invoke<T>(cmd, args);
 }
-import type {
+import type { PhonebookResult,
 	CachedPeer,
 	Collection,
 	ContactSummary,
@@ -749,3 +749,13 @@ export const searchTitles = (query: string, limit?: number) =>
  *  for the "pick your Interests, add a collection" state. Cap 50 unless `limit` lowers it. */
 export const similarPeople = (limit?: number) =>
 	invoke<PeopleResult>('similar_people', { limit });
+
+// ── QURATOR-351 slice 5 — the phonebook (Discover view) ─────────────────────────────
+
+/** The Discover book: contacts ∪ relay teasers. With `query` (the ONE front door: title / tag /
+ *  name → people) it returns entries carrying `matched` kinds for the Has-it / Looking-for-it
+ *  groups; without, the whole book size-first. `capped` mirrors PeerSearchResult; `cold_start`
+ *  mirrors PeopleResult. The command is built by the parallel Rust lane. */
+export const discoverPeople = (query?: string) =>
+	invoke<PhonebookResult>('discover_people', { query: query ?? null });
+

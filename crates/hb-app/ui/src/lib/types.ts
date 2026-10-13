@@ -442,3 +442,36 @@ export interface PeopleResult {
 	people: SimilarPerson[];
 	cold_start: boolean;
 }
+
+// ── QURATOR-351 slice 5 — the phonebook (Discover view) ─────────────────────────────
+
+/** What a search hit matched — `title` reaches only cached listings (draft r5, data-gap 4). */
+export type MatchKind = 'name' | 'collection' | 'tag' | 'looking_for' | 'title';
+
+/** One row of the Discover book: a contact or a stranger seen via their public teaser. */
+export interface PhonebookEntry {
+	npub: string;
+	display_name: string;
+	picture?: string;
+	/** The §7 fingerprint — the same shape PeerSearchHit (api.ts) carries. */
+	fingerprint: { words: string[]; colorHex: string } | null;
+	is_contact: boolean;
+	/** Publish-computed total from their teaser (never user-typed). */
+	total_bytes: number;
+	collections: TeaserCollection[];
+	/** The optional free-text "Looking for" line (r5: 255-char cap, teaser-carried). */
+	looking_for?: string;
+	tags: string[];
+	/** Similarity % (same Jaccard similar_people runs). Absent = no score — the UI shows NO
+	 *  percentage at all, never "0%". */
+	likeness?: number;
+	matched: MatchKind[];
+}
+
+/** `discover_people` wrapper. */
+export interface PhonebookResult {
+	entries: PhonebookEntry[];
+	capped: boolean;
+	cold_start: boolean;
+}
+

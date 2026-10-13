@@ -15,6 +15,7 @@
 	import AddContactPanel from '$lib/components/AddContactPanel.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import PeopleLikeYou from '$lib/components/PeopleLikeYou.svelte';
+	import DiscoverBook from '$lib/components/DiscoverBook.svelte';
 	import type { CachedPeer, Collection, ContactSummary, Group, Profile } from '$lib/types.js';
 	import { contactDisplayName, shortNpub } from '$lib/contact-display.js';
 	import { NOT_DRM_NOTE, receivesPrivate } from '$lib/private-collections-view.js';
@@ -28,6 +29,7 @@
 	// M23 W6 — pure overflow predicate for the bio `more ⌄` control (the DOM read lives in the
 	// `bioMeasure` action below; this seam is what the unit test pins).
 	import { bioOverflows } from '$lib/bio-overflow.js';
+	import { fmtBytes } from '$lib/discover-book.js';
 	// M17 W5 — presence honesty: "checked {t}" (our cache) vs "Last seen {t}" (their beacon).
 	import { PRESENCE_TICK_MS, PRESENCE_WINDOW_MS, checkedLabel, freshIndex, newestSeen, presenceView, type PresenceView } from '$lib/presence-view.js';
 	import { relayWhyHint } from '$lib/relay-health.js';
@@ -956,15 +958,9 @@
 		} catch (e) { toast(String(e), 'error'); }
 	}
 
-	// QURATOR-351 (state d): the peer's PUBLISHED total on the row face. Mirrors Browse's
-	// fmtBytes exactly (same units, same rounding) so a size reads the same on both views —
-	// the two incumbent formatters (browse, CollectionRow) are component-local, nothing to import.
-	function fmtBytes(bytes: number): string {
-		if (bytes > 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
-		if (bytes > 1e6) return (bytes / 1e6).toFixed(1) + ' MB';
-		if (bytes > 1e3) return (bytes / 1e3).toFixed(0) + ' KB';
-		return bytes + ' B';
-	}
+	// QURATOR-351 (state d): the peer's PUBLISHED total on the row face. fmtBytes moved to
+	// $lib/discover-book.ts (slice 5) so DiscoverBook shares the ONE implementation; output is
+	// byte-identical to the old local copy (the q351 contacts test pins "1.5 GB" / "880.0 MB").
 
 	// True when the peer published at least one fact the CARD FACE has no room for. Deliberately does
 	// NOT count bio (face row 3), tags/content_types (their own block) or est_size (face row 4): if it
@@ -1087,7 +1083,7 @@
 	// ── Phonebook redesign (devtest #17/#18): sticky free-text search + Name|Groups view toggle +
 	//    a pinned "Online now" bucket (additive — an online peer also still appears in its section). ──
 	let searchQuery = $state('');
-	let view: 'name' | 'groups' = $state('name');
+	let view: 'name' | 'groups' | 'discover' = $state('name');
 
 	// Presence is applied ONCE, to the whole roster, before any filtering — so the header count, the
 	// "Online now" bucket and each row's pill are all reading the same adjusted list (W5 review: the
@@ -1191,6 +1187,7 @@
 	<div class="view-toggle" role="group" aria-label="View">
 		<button type="button" aria-pressed={view === 'name'} onclick={() => (view = 'name')}>Name</button>
 		<button type="button" aria-pressed={view === 'groups'} onclick={() => (view = 'groups')}>Groups</button>
+		<button type="button" aria-pressed={view === 'discover'} onclick={() => (view = 'discover')}>Discover</button>
 	</div>
 </div>
 
@@ -1627,6 +1624,10 @@
 
 <div class="phonebook" bind:this={listContainer}>
 	<div class="phonebook-scroll">
+		{#if view === 'discover'}
+			<!-- QURATOR-351: PeopleLikeYou + AddContactPanel Discover fold into DiscoverBook in a follow-up -->
+			<DiscoverBook />
+		{:else}
 		{#if $contactsLoadError}
 			<!-- QURATOR-93: a FAILED contacts load must not render as the confident "No contacts yet"
 			     negative — that string is indistinguishable from a genuine empty. -->
@@ -1729,6 +1730,7 @@
 					{/if}
 				</div>
 			{/if}
+		{/if}
 		{/if}
 	</div>
 </div>

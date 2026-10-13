@@ -8,6 +8,7 @@ pub mod groups;
 pub mod identity;
 pub mod online;
 pub mod people;
+pub mod phonebook;
 pub mod portable_update;
 pub mod private;
 pub mod profile;
