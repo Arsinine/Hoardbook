@@ -1,4 +1,4 @@
-/* Lime Ledger — from design system /17 (digital-banking landing). Dark. The stat-card glass
+/* Lime Ledger — digital-banking-landing palette. Dark. The stat-card glass
    (white 30 % → black 6 %) is softened to white 8 % → black 22 % so muted text holds AA across a
    full-height pane. Lime #D9FD18 is the system's only accent, used as-is with black ink. */
 :root[data-theme="lime-ledger"] {

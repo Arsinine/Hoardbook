@@ -1,5 +1,5 @@
-/* Sky Slate — from design system /12 (cybersecurity / AI landing). LIGHT. The ground gradient ends
-   at #6F97AB rather than #467389 so dark ink holds AA down a full pane. /12's glass (white 20 % →
+/* Sky Slate — cybersecurity / AI-landing palette. LIGHT. The ground gradient ends
+   at #6F97AB rather than #467389 so dark ink holds AA down a full pane. the source's glass (white 20 % →
    #81A3B4 20 %) is replaced by white 66 % → ice #DBE8EE 66 %: the contrast gate checks every
    gradient stop, and any slate-tinted far stop fails AA over the slate orb. The accent gradient #0172F8 → #019DCF is darkened ~10 % so white button
    text reaches 4.5 : 1; link text uses #004A9F. Semantic colours re-tuned for a light ground. */

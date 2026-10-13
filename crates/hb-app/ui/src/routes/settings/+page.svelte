@@ -60,13 +60,13 @@
 		!glassOn ? 'Needs glass effects on.'
 		: 'Lets your desktop wallpaper show softly through Hoardbook. Windows 11 only.'
 	);
-	// Card subtitle per the 2026-10-12 ruling: the default theme (Vault) is labelled "Default"
-	// beside its source ("/40 · Default"); Hoard — the original palette, no longer the default —
-	// is labelled "Original"; every other theme shows its source ("/08" etc.). Derived from
-	// DEFAULT_THEME / BASE_THEME, never hard-coded.
+	// Card subtitle: the default theme (Vault) is labelled "Default"; Hoard — the original palette,
+	// no longer the default — is labelled "Original"; every other theme has none. Derived from
+	// DEFAULT_THEME / BASE_THEME, never hard-coded. (The design-system numbers the themes were
+	// mapped from were dropped 2026-10-13, owner: "These dont mean anything anymore.")
 	function themeSubtitle(t: ThemeInfo): string {
-		if (t.id === DEFAULT_THEME) return t.source ? `${t.source} · Default` : 'Default';
-		return t.source ?? (t.id === BASE_THEME ? 'Original' : '');
+		if (t.id === DEFAULT_THEME) return 'Default';
+		return t.id === BASE_THEME ? 'Original' : '';
 	}
 
 	// ── 3-key identity view ───────────────────────────────────────────────────────

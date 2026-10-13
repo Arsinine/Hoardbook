@@ -1,5 +1,5 @@
-/* Pale Pulse — from design system /07 (cognitive-fitness landing). LIGHT. /07's glass is meant for
-   white text over video; here panes carry ink #273C59, so the glass is white 50 % with /07's
+/* Pale Pulse — cognitive-fitness-landing palette. LIGHT. The source's glass is meant for
+   white text over video; here panes carry ink #273C59, so the glass is white 50 % with the source's
    lit-and-shaded bevel. Mint #AAFFC6 and ring #8AA3C9 fail as text on pale glass, so the accent is
    the ring hue darkened to #34558A and the mint survives as a backdrop orb. Semantic colours are
    re-tuned dark, because app.css's warn/danger values are tuned for dark grounds. */

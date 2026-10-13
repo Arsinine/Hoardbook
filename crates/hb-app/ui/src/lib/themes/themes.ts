@@ -20,9 +20,6 @@ export type ThemeId =
 export interface ThemeInfo {
 	id: ThemeId;
 	name: string;
-	/** The supplied design system this theme was mapped from (`/08` etc.), or null for `hoard`
-	 *  (the original palette). Whether a theme is the default comes from DEFAULT_THEME, not here. */
-	source: string | null;
 	mode: 'dark' | 'light';
 	/** Swatch colours for the picker card: backdrop, glass, accent. */
 	swatch: [string, string, string];
@@ -37,14 +34,14 @@ export const BASE_THEME: ThemeId = 'hoard';
 export const DEFAULT_THEME: ThemeId = 'vault';
 
 export const THEMES: readonly ThemeInfo[] = [
-	{ id: 'hoard', name: 'Hoard', source: null, mode: 'dark', swatch: ['#0e0f11', '#1e2023', '#eba443'], float: true },
-	{ id: 'oxblood-steel', name: 'Oxblood Steel', source: '/08', mode: 'dark', swatch: ['#0f0b11', '#4e0613', '#f4bcc1'], float: true },
-	{ id: 'lime-ledger', name: 'Lime Ledger', source: '/17', mode: 'dark', swatch: ['#050c0a', '#2b3d12', '#d9fd18'], float: true },
-	{ id: 'clinic-teal', name: 'Clinic Teal', source: '/31', mode: 'dark', swatch: ['#122832', '#1f465d', '#d6f5a9'], float: true },
-	{ id: 'violet-drive', name: 'Violet Drive', source: '/38', mode: 'dark', swatch: ['#0f0424', '#5c2598', '#e4cfff'], float: true },
-	{ id: 'vault', name: 'Vault', source: '/40', mode: 'dark', swatch: ['#07070a', '#3a3036', '#b2f0c7'], float: true },
-	{ id: 'pale-pulse', name: 'Pale Pulse', source: '/07', mode: 'light', swatch: ['#b3c8e2', '#8aa3c9', '#34558a'], float: true },
-	{ id: 'sky-slate', name: 'Sky Slate', source: '/12', mode: 'light', swatch: ['#c5dce4', '#60899c', '#004a9f'], float: true },
+	{ id: 'hoard', name: 'Hoard', mode: 'dark', swatch: ['#0e0f11', '#1e2023', '#eba443'], float: true },
+	{ id: 'oxblood-steel', name: 'Oxblood Steel', mode: 'dark', swatch: ['#0f0b11', '#4e0613', '#f4bcc1'], float: true },
+	{ id: 'lime-ledger', name: 'Lime Ledger', mode: 'dark', swatch: ['#050c0a', '#2b3d12', '#d9fd18'], float: true },
+	{ id: 'clinic-teal', name: 'Clinic Teal', mode: 'dark', swatch: ['#122832', '#1f465d', '#d6f5a9'], float: true },
+	{ id: 'violet-drive', name: 'Violet Drive', mode: 'dark', swatch: ['#0f0424', '#5c2598', '#e4cfff'], float: true },
+	{ id: 'vault', name: 'Vault', mode: 'dark', swatch: ['#07070a', '#3a3036', '#b2f0c7'], float: true },
+	{ id: 'pale-pulse', name: 'Pale Pulse', mode: 'light', swatch: ['#b3c8e2', '#8aa3c9', '#34558a'], float: true },
+	{ id: 'sky-slate', name: 'Sky Slate', mode: 'light', swatch: ['#c5dce4', '#60899c', '#004a9f'], float: true },
 ];
 
 export function isThemeId(v: unknown): v is ThemeId {

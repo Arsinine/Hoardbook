@@ -1,6 +1,6 @@
-/* Clinic Teal — from design system /31 (medical-device landing). Dark. /31's refracted glass is
+/* Clinic Teal — medical-device-landing palette. Dark. The source's refracted glass is
    Chromium-only, so its own frost fallback is used (black 22 %, 16 px). The cyan / peach / pink
-   glows are /31's effect colours at their specified 20 %. Pill controls, as in /31. */
+   glows are the source's effect colours at their specified 20 %. Pill controls, as in the source. */
 :root[data-theme="clinic-teal"] {
   color-scheme: dark;
   --bg:            #122832;

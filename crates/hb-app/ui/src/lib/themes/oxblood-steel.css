@@ -1,5 +1,5 @@
-/* Oxblood Steel — from design system /08 (cybersecurity landing). Dark. Square corners throughout,
-   as /08 specifies. /08 has no UI accent; its oxblood lives in imagery, so the accent is #811B1C
+/* Oxblood Steel — cybersecurity-landing palette. Dark. Square corners throughout, as the source
+   specifies. The source has no UI accent; its oxblood lives in imagery, so the accent is #811B1C
    lifted to #F4BCC1 until it reads as text over the oxblood orb. */
 :root[data-theme="oxblood-steel"] {
   color-scheme: dark;

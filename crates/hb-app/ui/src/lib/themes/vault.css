@@ -1,4 +1,4 @@
-/* Vault — from design system /40 (dark jewelry landing, vault reveal). Dark. Pane glass is the hero
+/* Vault — dark jewelry-landing palette (vault reveal). Dark. Pane glass is the hero
    card: navy #171F2E, 80 % → 42 %, 20 px blur; its 28 % ring is cut to 16 % so pane edges do not
    read as outlines. Venom mint #B2F0C7 is the accent; glow green #3DD95C the online dot. */
 :root[data-theme="vault"] {
