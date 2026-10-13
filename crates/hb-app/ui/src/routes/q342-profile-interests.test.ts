@@ -107,13 +107,16 @@ describe('QURATOR-342 Lane E — My Profile copy', () => {
 	});
 
 	// RED BY (P-10): deleting `<span class="hb-tag">Public</span>` from the Contact-hint label
-	// made this test fail — no element whose text is exactly "Public" rendered.
+	// made this test fail — no Public chip inside a label whose text names Contact hint.
+	// 2026-10-13: QURATOR-351 added a second Public chip (the Looking-for label), so a bare
+	// findByText('Public') now throws on multiplicity; the query is scoped to the chip ON the
+	// Contact-hint label, which was always the assertion's meaning.
 	it('contact_hint_label_carries_a_visible_public_chip', async () => {
 		resetStores();
-		const { findByText } = render(HomePage);
-		const chip = await findByText('Public');
-		// The chip must sit ON the Contact-hint label, not float anywhere on the page.
-		expect(chip.closest('label')?.textContent).toMatch(/Contact hint/);
+		const { findAllByText } = render(HomePage);
+		const chips = await findAllByText('Public');
+		const onContactHint = chips.filter((c) => /Contact hint/.test(c.closest('label')?.textContent ?? ''));
+		expect(onContactHint).toHaveLength(1);
 	});
 
 	// RED BY (P-10): deleting the `coll-disclosure` div under the collections-pane header made
