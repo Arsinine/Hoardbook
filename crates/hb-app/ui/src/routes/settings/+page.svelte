@@ -817,6 +817,7 @@
 </div>
 
 <div class="body hb-pane">
+<div class="body-scroll">
 	<!-- Identity -->
 	<div class="section-label">Identity</div>
 
@@ -1314,6 +1315,7 @@
 		</div>
 	</div>
 </div>
+</div>
 
 <style>
 	.topbar {
@@ -1330,11 +1332,17 @@
 	.topbar-title { font-size: 17px; font-weight: 600; letter-spacing: -0.3px; }
 	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
 
-	.body { padding: 24px; overflow-y: auto; flex: 1; max-width: 720px; display: flex; flex-direction: column; gap: 8px; }
+	/* The pane itself never scrolls: the glass paints on .hb-pane::before (app.css), an absolute
+	   layer inset to the pane's visible box — inside a scroll container that is one screenful, so
+	   the glass cut off at the first scroll boundary (owner, 2026-10-13). .body is a fixed flex
+	   column; .body-scroll carries the overflow and the padding. */
+	.body { flex: 1; max-width: 720px; overflow: hidden; display: flex; flex-direction: column; }
+	.body-scroll { flex: 1; min-width: 0; padding: 24px; overflow-y: auto; max-width: 720px; display: flex; flex-direction: column; gap: 8px; }
 	/* QURATOR-352 — as a floating glass pane the 720px cap made the pane stop short of the topbar
 	   above it. Floating, the pane fills the width and the right padding keeps the content column
 	   at 720px (24px left padding + 672px content + the rest as right padding). */
-	:global(:root[data-glass-float]) .body { max-width: none; padding-right: max(24px, calc(100% - 696px)); }
+	:global(:root[data-glass-float]) .body { max-width: none; }
+	:global(:root[data-glass-float]) .body-scroll { max-width: none; padding-right: max(24px, calc(100% - 696px)); }
 
 	.section-label {
 		font-size: 10.5px;
