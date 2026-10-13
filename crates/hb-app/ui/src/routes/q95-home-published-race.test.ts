@@ -83,7 +83,7 @@ describe('QURATOR-95 — a published profile is never reported as "Not published
 		identity.set(IDENT);
 		appReady.set(true); // profile store is STILL null — getProfile() is in flight
 
-		const { container, queryByText, findByText } = render(HomePage);
+		const { container, queryByText } = render(HomePage);
 
 		// Let the published-check fire AND resolve, while $profile is still null.
 		await waitFor(() => expect(hasPubMock).toHaveBeenCalledTimes(1));
@@ -94,9 +94,11 @@ describe('QURATOR-95 — a published profile is never reported as "Not published
 		await tick();
 		await new Promise((r) => setTimeout(r, 20));
 
-		// THE ASSERTION: an already-published profile must show the Published state.
-		expect(queryByText(/Not published yet/i)).toBeNull();
-		expect(await findByText(/discoverable in search/i)).toBeTruthy();
+		// THE ASSERTION: an already-published profile must show the Published state. Since 2026-10-13
+		// (owner: remove the "Published. You're discoverable in search" line) the published state
+		// renders NO status span at all, so it is pinned by the absence of every .pub-status.
+		await waitFor(() => expect(queryByText(/Not published yet/i)).toBeNull());
+		expect(container.querySelector('.pub-status')).toBeNull();
 		// (The second live symptom, the Publish button pulsing, went with the button: the title-bar
 		// Publish button was removed once auto-publish became the default.)
 		expect(container.querySelector('.pub-warn')).toBeNull();
@@ -126,12 +128,12 @@ describe('QURATOR-95 — a published profile is never reported as "Not published
 		identity.set(IDENT);
 		appReady.set(true);
 
-		const { queryByText, findByText } = render(HomePage);
+		const { container, queryByText } = render(HomePage);
 		await waitFor(() => expect(hasPubMock).toHaveBeenCalledTimes(1));
 		await new Promise((r) => setTimeout(r, 20));
 		await tick();
 
 		expect(queryByText(/Not published yet/i)).toBeNull();
-		expect(await findByText(/discoverable in search/i)).toBeTruthy();
+		expect(container.querySelector('.pub-status')).toBeNull();
 	});
 });

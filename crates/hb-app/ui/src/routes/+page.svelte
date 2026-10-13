@@ -681,8 +681,6 @@
 					<span class="pub-status pub-warn">● Not published yet. Others can't find you until you add a display name, then it publishes automatically.</span>
 				{:else if profileDirty}
 					<span class="pub-status pub-warn">● Unpublished changes. They publish automatically.</span>
-				{:else}
-					<span class="pub-status pub-ok">● Published. You're discoverable in search.</span>
 				{/if}
 			</div>
 		</div>
@@ -1125,7 +1123,6 @@
 	/* Publish-state hint — make "unpublished = not searchable" obvious. */
 	.pub-status { font-size: 12px; }
 	.pub-warn { color: var(--accent); }
-	.pub-ok { color: var(--fg-dim); }
 
 
 	/* Body layout */
