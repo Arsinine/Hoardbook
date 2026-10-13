@@ -34,11 +34,12 @@ fn material_supported() -> bool {
     }
 }
 
-/// The ONE rule for whether the see-through window is on: the user asked for it, glass is on,
-/// and the theme is a glass theme (not "hoard", the base palette). Startup and the command both
-/// go through it, so the window can never be see-through under hoard or with glass off.
-pub(crate) fn see_through_effective(see_through: bool, glass: bool, theme: &str) -> bool {
-    see_through && glass && theme != "hoard"
+/// The ONE rule for whether the see-through window is on: the user asked for it and glass is on.
+/// Every theme is a glass theme (owner, 2026-10-13: hoard joined the shared glass design), so the
+/// theme no longer matters. Startup and the command both go through it, so the window can never
+/// be see-through with glass off.
+pub(crate) fn see_through_effective(see_through: bool, glass: bool) -> bool {
+    see_through && glass
 }
 
 /// The one body both the command and the startup hook call.
@@ -80,27 +81,20 @@ pub fn window_material_supported() -> bool {
 }
 
 /// Bring the see-through window (Mica, Windows 11 only) in line with the appearance the UI just
-/// applied. The UI sends the three settings, not an on/off flag, so the decision is made here by
-/// `see_through_effective` — the same rule startup uses. The UI calls this whenever the theme,
-/// glass or see-through setting changes, so switching to hoard or turning glass off also turns
-/// Mica off. A silent no-op on every OS without Mica.
+/// applied. The UI sends the settings, not an on/off flag, so the decision is made here by
+/// `see_through_effective` — the same rule startup uses. The UI calls this whenever the glass or
+/// see-through setting changes, so turning glass off also turns Mica off. A silent no-op on every
+/// OS without Mica.
 #[tauri::command]
-pub fn set_window_material(
-    window: tauri::WebviewWindow,
-    see_through: bool,
-    glass: bool,
-    theme: String,
-) -> CmdResult<()> {
-    apply_window_material(&window, see_through_effective(see_through, glass, &theme))
+pub fn set_window_material(window: tauri::WebviewWindow, see_through: bool, glass: bool) -> CmdResult<()> {
+    apply_window_material(&window, see_through_effective(see_through, glass))
 }
 
 /// The startup half: re-apply the persisted see-through choice BEFORE the user sees the window.
-/// Fires only for `see_through && glass && theme != "hoard"` — the see-through window is a
-/// themed-glass extra, never part of the default hoard look (the hoard theme must stay
-/// pixel-identical to today). Errors are swallowed: a failed Mica application must never block
-/// startup, the user simply gets the opaque window.
+/// Fires only for `see_through && glass` (see `see_through_effective`). Errors are swallowed: a
+/// failed Mica application must never block startup, the user simply gets the opaque window.
 pub(crate) fn startup_see_through(settings: &Settings, window: &tauri::WebviewWindow) {
-    if see_through_effective(settings.see_through, settings.glass, &settings.theme) {
+    if see_through_effective(settings.see_through, settings.glass) {
         let _ = apply_window_material(window, true);
     }
 }
@@ -110,12 +104,11 @@ mod tests {
     use super::see_through_effective;
 
     #[test]
-    fn see_through_is_on_only_for_a_glass_theme_with_glass_on() {
-        // MUTATION (P-10): in `see_through_effective`, delete `&& theme != "hoard"` — the hoard
-        // row reds. Delete `&& glass` — the glass-off row reds.
-        assert!(see_through_effective(true, true, "vault"), "a glass theme with glass on");
-        assert!(!see_through_effective(true, true, "hoard"), "never under the base palette");
-        assert!(!see_through_effective(true, false, "vault"), "never with glass off");
-        assert!(!see_through_effective(false, true, "vault"), "never unless asked for");
+    fn see_through_is_on_only_when_asked_for_with_glass_on() {
+        // MUTATION (P-10): in `see_through_effective`, delete `&& glass` — the glass-off row reds.
+        // Replace the body with `glass` — the not-asked-for row reds.
+        assert!(see_through_effective(true, true), "asked for, glass on");
+        assert!(!see_through_effective(true, false), "never with glass off");
+        assert!(!see_through_effective(false, true), "never unless asked for");
     }
 }

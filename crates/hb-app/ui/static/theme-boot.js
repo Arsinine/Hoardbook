@@ -18,7 +18,7 @@
 	// Keep in step with THEMES in src/lib/themes/themes.ts (pinned by apply.test.ts).
 	var THEMES = ['hoard', 'oxblood-steel', 'lime-ledger', 'clinic-teal', 'violet-drive', 'vault', 'pale-pulse', 'sky-slate'];
 	// Which of those float (panes over a backdrop with a gap) — mirrors `float: true` rows.
-	var FLOATING = ['oxblood-steel', 'lime-ledger', 'clinic-teal', 'violet-drive', 'vault', 'pale-pulse', 'sky-slate'];
+	var FLOATING = ['hoard', 'oxblood-steel', 'lime-ledger', 'clinic-teal', 'violet-drive', 'vault', 'pale-pulse', 'sky-slate'];
 	var KEY = 'hb-appearance';
 	var root = document.documentElement;
 	function setOrRemove(name, present) {
@@ -32,7 +32,7 @@
 		else root.removeAttribute('data-theme');
 		setOrRemove('data-glass-float', FLOATING.indexOf(theme) !== -1 && glass);
 		setOrRemove('data-glass-off', !glass);
-		setOrRemove('data-see-through', seeThrough && glass && theme !== BASE_THEME);
+		setOrRemove('data-see-through', seeThrough && glass);
 	}
 	try {
 		var raw = localStorage.getItem(KEY);

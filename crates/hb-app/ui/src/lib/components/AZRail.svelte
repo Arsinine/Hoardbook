@@ -53,7 +53,7 @@
 		font-family: var(--font-ui);
 		line-height: 1;
 		padding: 2px 3px;
-		border-radius: 3px;
+		border-radius: var(--r-chip, 3px);
 	}
 	.az-rail-btn:hover:not(:disabled) { background: var(--bg-elev2); color: var(--accent); }
 	.az-rail-btn:disabled { color: var(--fg-dim); opacity: 0.35; cursor: default; }

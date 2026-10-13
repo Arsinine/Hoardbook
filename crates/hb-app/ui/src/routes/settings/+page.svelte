@@ -54,13 +54,10 @@
 	// (see-through is hoard-inert and glass-inert) so a stale see_through=true on Linux or with
 	// glass off cannot light the veil up.
 	let effectiveSeeThrough = $derived(seeThroughOn && materialSupported);
-	// Disabled reason, in the order the user meets them: Hoard (the original palette) has no glass
-	// to see through; a glass theme with glass off has nothing either. The Hoard gate compares
-	// BASE_THEME, never DEFAULT_THEME (2026-10-12 ruling: Vault is the default, Hoard stays
-	// selectable as the original palette).
+	// Disabled reason: with glass off there is nothing to see through. Every theme, Hoard included,
+	// is a glass theme (owner, 2026-10-13), so the theme never disables it.
 	let seeThroughSub = $derived(
-		themeId === BASE_THEME ? 'Needs a glass theme.'
-		: !glassOn ? 'Needs glass effects on.'
+		!glassOn ? 'Needs glass effects on.'
 		: 'Lets your desktop wallpaper show softly through Hoardbook. Windows 11 only.'
 	);
 	// Card subtitle per the 2026-10-12 ruling: the default theme (Vault) is labelled "Default"
@@ -663,7 +660,7 @@
 	 *  save or the apply. */
 	async function setWindowMaterial(): Promise<void> {
 		try {
-			await applyWindowMaterial({ seeThrough: seeThroughOn, glass: glassOn, theme: themeId });
+			await applyWindowMaterial({ seeThrough: seeThroughOn, glass: glassOn });
 		} catch { /* visual-only concern — the setting is already saved and applied */ }
 	}
 
@@ -675,7 +672,6 @@
 		if (id === themeId) return; // picking the already-selected card is a no-op (no save, no toast)
 		settings.theme = id; // Svelte : mutate the $state proxy in place (never reassign from await)
 		applyAppearanceNow();
-		void setWindowMaterial(); // switching to hoard must also turn Mica off
 		try {
 			await saveSettings(fullSettings());
 		} catch (e) {
@@ -821,49 +817,6 @@
 </div>
 
 <div class="body hb-pane">
-	<!-- QURATOR-352: Appearance, FIRST among the sections. -->
-	<div class="section-label">Appearance</div>
-	<div class="surface">
-		<!-- A radio group takes no tabindex itself: focus sits on the checked radio (roving tabindex
-		     below), and this keydown only catches arrow keys bubbling up from it. -->
-		<!-- svelte-ignore a11y_interactive_supports_focus -->
-		<div class="theme-grid" role="radiogroup" aria-label="Theme" onkeydown={onThemeGridKeydown}>
-			{#each THEMES as t (t.id)}
-				<button type="button" class="theme-card" role="radio" aria-checked={t.id === themeId} tabindex={t.id === themeId ? 0 : -1} onclick={() => selectTheme(t.id)} disabled={!settingsLoaded}>
-					<span class="theme-swatch" aria-hidden="true">
-						<span class="theme-stripe" style="background: {t.swatch[0]}"></span>
-						<span class="theme-stripe stripe-mid" style="background: {t.swatch[1]}"></span>
-						<span class="theme-stripe" style="background: {t.swatch[2]}"></span>
-					</span>
-					<span class="theme-name">{t.name}</span>
-					<span class="theme-meta"><span class="theme-source">{themeSubtitle(t)}</span>{#if t.mode === 'light'}<span class="theme-mode">Light</span>{/if}</span>
-				</button>
-			{/each}
-		</div>
-
-		<div class="toggle-row">
-			<div class="toggle-text">
-				<div class="toggle-label">Glass effects</div>
-				<div class="toggle-sub">Turn off to use solid panels. Windows also turns glass off when you switch off transparency effects or use Battery Saver.</div>
-			</div>
-			<button class="toggle" class:toggle-on={glassOn} onclick={toggleGlass} disabled={!settingsLoaded} aria-label="Glass effects">
-				<span class="toggle-thumb"></span>
-			</button>
-		</div>
-
-		{#if materialSupported}
-			<div class="toggle-row">
-				<div class="toggle-text">
-					<div class="toggle-label">See-through window</div>
-					<div class="toggle-sub">{seeThroughSub}</div>
-				</div>
-				<button class="toggle" class:toggle-on={seeThroughOn} onclick={toggleSeeThrough} disabled={!settingsLoaded || !glassOn || themeId === BASE_THEME} aria-label="See-through window">
-					<span class="toggle-thumb"></span>
-				</button>
-			</div>
-		{/if}
-	</div>
-
 	<!-- Identity -->
 	<div class="section-label">Identity</div>
 
@@ -1295,6 +1248,49 @@
 	     but no UI ever creates a watch — the save-search affordance in Discover was never built, so
 	     the section was a permanently-empty list. Restore it when Discover grows "save this search". -->
 
+	<!-- QURATOR-352: Appearance, after Diagnostics and before the Danger zone (owner, 2026-10-13). -->
+	<div class="section-label">Appearance</div>
+	<div class="surface">
+		<!-- A radio group takes no tabindex itself: focus sits on the checked radio (roving tabindex
+		     below), and this keydown only catches arrow keys bubbling up from it. -->
+		<!-- svelte-ignore a11y_interactive_supports_focus -->
+		<div class="theme-grid" role="radiogroup" aria-label="Theme" onkeydown={onThemeGridKeydown}>
+			{#each THEMES as t (t.id)}
+				<button type="button" class="theme-card" role="radio" aria-checked={t.id === themeId} tabindex={t.id === themeId ? 0 : -1} onclick={() => selectTheme(t.id)} disabled={!settingsLoaded}>
+					<span class="theme-swatch" aria-hidden="true">
+						<span class="theme-stripe" style="background: {t.swatch[0]}"></span>
+						<span class="theme-stripe stripe-mid" style="background: {t.swatch[1]}"></span>
+						<span class="theme-stripe" style="background: {t.swatch[2]}"></span>
+					</span>
+					<span class="theme-name">{t.name}</span>
+					<span class="theme-meta"><span class="theme-source">{themeSubtitle(t)}</span>{#if t.mode === 'light'}<span class="theme-mode">Light</span>{/if}</span>
+				</button>
+			{/each}
+		</div>
+
+		<div class="toggle-row">
+			<div class="toggle-text">
+				<div class="toggle-label">Glass effects</div>
+				<div class="toggle-sub">Turn off to use solid panels. Windows also turns glass off when you switch off transparency effects or use Battery Saver.</div>
+			</div>
+			<button class="toggle" class:toggle-on={glassOn} onclick={toggleGlass} disabled={!settingsLoaded} aria-label="Glass effects">
+				<span class="toggle-thumb"></span>
+			</button>
+		</div>
+
+		{#if materialSupported}
+			<div class="toggle-row">
+				<div class="toggle-text">
+					<div class="toggle-label">See-through window</div>
+					<div class="toggle-sub">{seeThroughSub}</div>
+				</div>
+				<button class="toggle" class:toggle-on={seeThroughOn} onclick={toggleSeeThrough} disabled={!settingsLoaded || !glassOn} aria-label="See-through window">
+					<span class="toggle-thumb"></span>
+				</button>
+			</div>
+		{/if}
+	</div>
+
 	<!-- Danger Zone -->
 	<div class="section-label danger-label">Danger zone</div>
 
@@ -1335,6 +1331,10 @@
 	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
 
 	.body { padding: 24px; overflow-y: auto; flex: 1; max-width: 720px; display: flex; flex-direction: column; gap: 8px; }
+	/* QURATOR-352 — as a floating glass pane the 720px cap made the pane stop short of the topbar
+	   above it. Floating, the pane fills the width and the right padding keeps the content column
+	   at 720px (24px left padding + 672px content + the rest as right padding). */
+	:global(:root[data-glass-float]) .body { max-width: none; padding-right: max(24px, calc(100% - 696px)); }
 
 	.section-label {
 		font-size: 10.5px;
@@ -1352,7 +1352,7 @@
 	.surface {
 		background: var(--bg-elev1);
 		border: 1px solid var(--border);
-		border-radius: 10px;
+		border-radius: var(--r-card, 10px);
 		padding: 18px;
 		display: flex;
 		flex-direction: column;
@@ -1374,7 +1374,7 @@
 		padding: 10px 12px;
 		border: 1px solid color-mix(in oklch, var(--accent) 35%, transparent);
 		background: color-mix(in oklch, var(--accent) 8%, transparent);
-		border-radius: 7px;
+		border-radius: var(--r-control, 7px);
 		font-size: 12px;
 		color: var(--fg-muted);
 		display: flex;
@@ -1386,7 +1386,7 @@
 	.id-display {
 		background: var(--bg);
 		border: 1px solid var(--border);
-		border-radius: 7px;
+		border-radius: var(--r-control, 7px);
 		padding: 10px 12px;
 		font-family: var(--font-mono);
 		font-size: 12px;
@@ -1650,10 +1650,10 @@
 	.key-secret {
 		font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.5px;
 		color: var(--error); border: 1px solid color-mix(in oklch, var(--error) 30%, transparent);
-		border-radius: 4px; padding: 0 5px; margin-left: 4px;
+		border-radius: var(--r-chip, 4px); padding: 0 5px; margin-left: 4px;
 	}
 	.no-recovery {
-		margin-top: 4px; padding: 10px 12px; border-radius: 7px;
+		margin-top: 4px; padding: 10px 12px; border-radius: var(--r-control, 7px);
 		border: 1px solid color-mix(in oklch, var(--error) 25%, transparent);
 		background: color-mix(in oklch, var(--error) 7%, transparent);
 		font-size: 11.5px; color: var(--fg-muted); line-height: 1.5;
@@ -1662,7 +1662,7 @@
 	.backup-modes { display: flex; flex-direction: column; gap: 8px; }
 	.backup-mode {
 		display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px;
-		border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+		border: 1px solid var(--border); border-radius: var(--r-card, 8px); cursor: pointer;
 	}
 	.backup-mode-on { border-color: var(--accent); background: color-mix(in oklch, var(--accent) 7%, transparent); }
 	.backup-mode-label { font-size: 12.5px; font-weight: 500; color: var(--fg); }
@@ -1673,7 +1673,7 @@
 	.strength-label { font-size: 11px; color: var(--fg-dim); white-space: nowrap; }
 	.restore-pass { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
 	.link-warn {
-		padding: 10px 12px; border-radius: 7px;
+		padding: 10px 12px; border-radius: var(--r-control, 7px);
 		border: 1px solid color-mix(in oklch, var(--accent) 35%, transparent);
 		background: color-mix(in oklch, var(--accent) 8%, transparent);
 		font-size: 11.5px; color: var(--fg-muted); line-height: 1.5;
@@ -1691,7 +1691,7 @@
 	.theme-card {
 		display: flex; flex-direction: column; align-items: stretch; gap: 6px;
 		padding: 10px; text-align: left; cursor: pointer; font: inherit;
-		border: 1px solid var(--border); border-radius: 8px;
+		border: 1px solid var(--border); border-radius: var(--r-card, 8px);
 		background: var(--bg-elev1); color: var(--fg);
 	}
 	.theme-card[aria-checked="true"] {

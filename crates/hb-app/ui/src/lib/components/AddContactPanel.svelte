@@ -537,7 +537,7 @@
 	.profile-card {
 		background: var(--bg-elev1);
 		border: 1px solid var(--border);
-		border-radius: 10px;
+		border-radius: var(--r-card, 10px);
 		overflow: hidden;
 	}
 
@@ -616,7 +616,7 @@
 	/* ── §6 Discover hoarders ───────────────────────────────────────────────────────────────── */
 	.discover-section {
 		border: 1px solid var(--border);
-		border-radius: 9px;
+		border-radius: var(--r-card, 9px);
 		background: var(--bg-elev1);
 		overflow: hidden;
 	}
@@ -679,14 +679,14 @@
 	.disc-autocomplete {
 		position: absolute; top: 100%; left: 0; right: 0; z-index: 10;
 		margin: 2px 0 0; padding: 3px; list-style: none;
-		background: var(--bg-elev2); border: 1px solid var(--border); border-radius: 7px;
+		background: var(--bg-elev2); border: 1px solid var(--border); border-radius: var(--r-control, 7px);
 		box-shadow: 0 4px 14px rgba(0,0,0,0.25);
 		max-height: 220px; overflow-y: auto;
 	}
 	.disc-ac-item {
 		display: flex; align-items: center; width: 100%; text-align: left;
 		padding: 5px 8px; border: none; background: transparent; cursor: pointer;
-		font-size: 12px; color: var(--fg); border-radius: 5px; font-family: var(--font-ui);
+		font-size: 12px; color: var(--fg); border-radius: var(--r-control, 5px); font-family: var(--font-ui);
 	}
 	.disc-ac-item:hover { background: var(--bg-elev3); }
 	.disc-ac-hash { color: var(--accent); margin-right: 2px; font-weight: 600; }
@@ -702,7 +702,7 @@
 		padding: 10px 0 2px;
 	}
 	.pager-btn {
-		padding: 3px 12px; border-radius: 6px; font-size: 11.5px; font-weight: 600;
+		padding: 3px 12px; border-radius: var(--r-control, 6px); font-size: 11.5px; font-weight: 600;
 		background: var(--bg-elev2); color: var(--fg-muted);
 		border: 1px solid var(--border); cursor: pointer; font-family: var(--font-ui);
 	}
@@ -712,7 +712,7 @@
 	.discover-empty { text-align: center; color: var(--fg-dim); font-size: 12.5px; padding: 18px 0; }
 	.hit-card {
 		display: flex; flex-direction: column; gap: 7px; padding: 13px;
-		background: var(--bg-elev2); border: 1px solid var(--border); border-radius: 9px;
+		background: var(--bg-elev2); border: 1px solid var(--border); border-radius: var(--r-card, 9px);
 	}
 	.hit-top { display: flex; align-items: center; gap: 9px; }
 	.hit-id { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 1px; }

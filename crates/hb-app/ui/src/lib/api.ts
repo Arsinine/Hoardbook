@@ -247,8 +247,8 @@ export const windowMaterialSupported = () => invoke<boolean>('window_material_su
 /** QURATOR-352: bring the Mica see-through window in line with the current appearance. Rust
  *  decides on/off from all three (see-through, glass, theme) so the rule lives in one place.
  *  A no-op where Mica is unsupported. */
-export const setWindowMaterial = (a: { seeThrough: boolean; glass: boolean; theme: string }) =>
-	invoke<void>('set_window_material', { seeThrough: a.seeThrough, glass: a.glass, theme: a.theme });
+export const setWindowMaterial = (a: { seeThrough: boolean; glass: boolean }) =>
+	invoke<void>('set_window_material', { seeThrough: a.seeThrough, glass: a.glass });
 
 export const saveSettings = (settings: Settings) => invoke<void>('save_settings', { settings });
 

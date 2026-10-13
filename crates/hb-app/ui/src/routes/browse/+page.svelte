@@ -1548,6 +1548,18 @@
 		overflow-y: auto;
 		flex: 1;
 	}
+	/* QURATOR-352 — floating panes: rows inset from the rounded rim, and the section dividers become
+	   inset hairlines instead of lines cut edge to edge through the glass. */
+	:global(:root[data-glass-float]) .contact-list { padding-inline: 6px; }
+	:global(:root[data-glass-float]) .panel-top,
+	:global(:root[data-glass-float]) .title-search-strip,
+	:global(:root[data-glass-float]) .breadcrumb,
+	:global(:root[data-glass-float]) .willing-bar {
+		border-bottom: 0;
+		box-shadow: inset 0 -1px 0 var(--divider);
+		margin-inline: 10px;
+		padding-inline: 6px;
+	}
 
 	/* M21 W5b: People panel grouped by the user's groups (mirrors Contacts' Groups view). */
 	.people-section { display: flex; flex-direction: column; }
@@ -1576,7 +1588,7 @@
 		align-items: center;
 		gap: 8px;
 		padding: 5px 4px;
-		border-radius: 5px;
+		border-radius: var(--r-control, 5px);
 		font-size: 12px;
 		background: transparent;
 		border: none;
@@ -1750,7 +1762,7 @@
 		width: 160px;
 		height: 6px;
 		flex-shrink: 0;
-		border-radius: 3px;
+		border-radius: var(--r-chip, 3px);
 		background: var(--bg-elev2);
 		overflow: hidden;
 	}
@@ -1799,7 +1811,7 @@
 		width: 120px;
 		height: 6px;
 		flex-shrink: 0;
-		border-radius: 3px;
+		border-radius: var(--r-chip, 3px);
 		background: var(--bg-elev2);
 		overflow: hidden;
 	}
@@ -1829,7 +1841,7 @@
 		font-weight: 500;
 		color: var(--fg-muted);
 		padding: 2px 5px;
-		border-radius: 4px;
+		border-radius: var(--r-chip, 4px);
 		font-family: var(--font-ui);
 		transition: background 0.1s, color 0.1s;
 	}
@@ -1889,7 +1901,7 @@
 		padding: 12px;
 		background: var(--bg-elev1);
 		border: 1px solid var(--border);
-		border-radius: 8px;
+		border-radius: var(--r-card, 8px);
 		cursor: pointer;
 		text-align: left;
 		transition: background 0.1s, border-color 0.1s;
@@ -1957,7 +1969,7 @@
 		padding: 12px;
 		background: var(--bg-elev1);
 		border: 1px solid var(--border);
-		border-radius: 8px;
+		border-radius: var(--r-card, 8px);
 		opacity: 0.55;
 		text-align: left;
 		pointer-events: none;
@@ -2025,7 +2037,7 @@
 	.view-toggle {
 		display: flex;
 		border: 1px solid var(--border);
-		border-radius: 7px;
+		border-radius: var(--r-control, 7px);
 		overflow: hidden;
 		flex-shrink: 0;
 	}
@@ -2047,7 +2059,7 @@
 	.sort-dir {
 		width: 28px; height: 28px; flex-shrink: 0;
 		display: flex; align-items: center; justify-content: center;
-		background: var(--bg-input); border: 1px solid var(--border); border-radius: 6px;
+		background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--r-control, 6px);
 		color: var(--fg-muted); cursor: pointer; font-size: 13px; line-height: 1;
 	}
 	.sort-dir:hover { color: var(--fg); border-color: var(--border-strong); }
@@ -2088,7 +2100,7 @@
 	.item-tile {
 		display: flex; flex-direction: column; align-items: center; gap: 4px;
 		padding: 14px 10px;
-		background: var(--bg-elev1); border: 1px solid var(--border); border-radius: 8px;
+		background: var(--bg-elev1); border: 1px solid var(--border); border-radius: var(--r-card, 8px);
 		text-align: center; color: inherit; font-family: inherit;
 		cursor: default; min-width: 0;
 	}

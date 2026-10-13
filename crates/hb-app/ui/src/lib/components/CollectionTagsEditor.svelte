@@ -82,7 +82,7 @@
 		gap: 3px;
 		background: var(--bg-elev2);
 		border: 1px solid var(--border);
-		border-radius: 4px;
+		border-radius: var(--r-chip, 4px);
 		padding: 1px 5px 1px 7px;
 		font-size: 11.5px;
 		color: var(--fg);

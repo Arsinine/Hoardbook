@@ -2,11 +2,11 @@
 // role over its glass, in BOTH modes:
 //   normal      — text over (glass over each backdrop sample);
 //   see-through — text over (veil over glass over (sample at 85 % over WHITE)) and over
-//                 (… over BLACK). `hoard` has no veil (its --glass-veil is transparent) and is
-//                 skipped here by design.
+//                 (… over BLACK). Every theme, hoard included.
 //   plus        — --accent-text over every --primary-fill stop.
-// This parses the REAL CSS, not a copy: `hoard` is the bare `:root` block of src/app.css, every
-// other theme is its own `<id>.css` beside this test. Gradients (--glass, --primary-fill) are
+// This parses the REAL CSS, not a copy: `hoard` is the bare `:root` of src/app.css with its glass
+// block layered on top (as the browser cascades them), every other theme is its own `<id>.css`
+// beside this test. Gradients (--glass, --primary-fill) are
 // checked at EVERY colour stop, not just the first. A missing/misformatted token throws — the
 // parser must never silently skip a role, or a deleted token would read as a pass.
 //
@@ -158,11 +158,19 @@ function resolveVar(value: string, toks: Map<string, string>, where: string, dep
 	return resolveVar(next, toks, where, depth + 1);
 }
 
-/** A theme's token map, read from the real CSS. `hoard` = the bare `:root` of app.css;
- *  every other theme = its own `:root[data-theme="<id>"]` block. */
+/** A theme's token map, read from the real CSS. `hoard` = the bare `:root` of app.css with its
+ *  glass block (`:root[data-glass-float]:not([data-theme])`) layered on top, exactly as the
+ *  browser cascades them when glass is on (owner, 2026-10-13: hoard joined the glass design).
+ *  Every other theme = its own `:root[data-theme="<id>"]` block. */
 function themeTokens(id: ThemeId): Map<string, string> {
 	if (id === 'hoard') {
-		return declarations(cssBlock(readFileSync(APP_CSS, 'utf8'), /(?:^|\n)\s*:root\s*\{/, 'hoard (:root in app.css)'));
+		const css = readFileSync(APP_CSS, 'utf8');
+		const base = declarations(cssBlock(css, /(?:^|\n)\s*:root\s*\{/, 'hoard (:root in app.css)'));
+		const glass = declarations(
+			cssBlock(css, /(?:^|\n)\s*:root\[data-glass-float\]:not\(\[data-theme\]\)\s*\{/, 'hoard glass block in app.css')
+		);
+		for (const [k, v] of glass) base.set(k, v);
+		return base;
 	}
 	const path = join(THEMES_DIR, `${id}.css`);
 	return declarations(cssBlock(readFileSync(path, 'utf8'), new RegExp(`(?:^|\\n)\\s*:root\\[data-theme="${id}"\\]\\s*\\{`), id));
@@ -183,7 +191,8 @@ function colourStops(value: string, where: string): RGBA[] {
    backdrop regions. ADD A ROW FOR EVERY NEW THEME — the `SAMPLES mirror THEMES` test fails
    loudly on a missing or extra id. ── */
 const SAMPLES: Record<ThemeId, string[]> = {
-	hoard: ['#0e0f11'],
+	// hoard: dark base, the oklch(0.20) orb, and the 5 % amber glow over the 0.16 base (sRGB).
+	hoard: ['#060709', '#13161c', '#171513'],
 	'oxblood-steel': ['#0f0b11', '#4e0613', '#54424a'],
 	'lime-ledger': ['#050c0a', '#2b3d12', '#3a4f1c'],
 	'clinic-teal': ['#163244', '#1f465d', '#2a5976'],
@@ -196,7 +205,7 @@ const SAMPLES: Record<ThemeId, string[]> = {
 /** The draft's VEIL: the least extra tint (black on dark themes, white on light) that keeps every
  *  role at AA with a white or black desktop showing through at 15 %. */
 const VEIL: Record<ThemeId, number> = {
-	hoard: 0,
+	hoard: 0.4,
 	'oxblood-steel': 0.22,
 	'lime-ledger': 0.24,
 	'clinic-teal': 0.14,
@@ -263,8 +272,8 @@ function auditTheme(id: ThemeId): Row[] {
 		}
 	}
 
-	// See-through mode (hoard skipped: its veil is transparent and panes stay opaque).
-	if (id !== 'hoard') {
+	// See-through mode — every theme, hoard included (owner, 2026-10-13).
+	{
 		for (const [gi, g] of glassStops.entries()) {
 			for (const [si, s] of samples.entries()) {
 				for (const desk of DESKS) {
@@ -303,15 +312,13 @@ describe('themes-contrast (QURATOR-352)', () => {
 		expect(Object.keys(SAMPLES).sort(), 'SAMPLES table ids must equal THEMES ids').toEqual(ids);
 		expect(Object.keys(VEIL).sort(), 'VEIL table ids must equal THEMES ids').toEqual(ids);
 		// Drift pin: each theme's real --glass-veil token must equal the draft-mirrored VEIL alpha
-		// (hoard stays transparent — its panes never go see-through). If a theme re-tunes its veil,
+		// (hoard included). If a theme re-tunes its veil,
 		// this names the theme and both values so the mirror is updated deliberately, never rots.
 		for (const t of THEMES) {
 			const toks = themeTokens(t.id);
 			const where = `theme ${t.id}`;
 			const raw = resolveVar(toks.get('glass-veil')!, toks, where);
-			if (t.id === 'hoard') {
-				expect(raw, 'hoard --glass-veil must stay transparent').toMatch(/^transparent$/i);
-			} else {
+			{
 				const a = parseColour(raw, `${where} --glass-veil`)[3];
 				expect(
 					a,

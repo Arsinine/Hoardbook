@@ -297,7 +297,7 @@
 		flex-direction: column;
 		gap: 6px;
 		padding: 10px;
-		border-radius: 8px;
+		border-radius: var(--r-card, 8px);
 		background: var(--bg-elev1);
 		border: 1px solid oklch(1 0 0 / 0.06);
 		cursor: default;
@@ -324,7 +324,7 @@
 		z-index: 30;
 		width: 260px;
 		padding: 10px;
-		border-radius: 8px;
+		border-radius: var(--r-card, 8px);
 		background: var(--bg-elev2);
 		border: 1px solid oklch(1 0 0 / 0.12);
 		box-shadow: 0 8px 24px oklch(0 0 0 / 0.35);

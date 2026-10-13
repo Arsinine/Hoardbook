@@ -80,7 +80,7 @@
 		margin-top: 6px;
 		background: var(--bg-elev2);
 		border: 1px solid var(--border);
-		border-radius: 9px;
+		border-radius: var(--r-card, 9px);
 		font-size: 12px;
 	}
 

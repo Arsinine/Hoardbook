@@ -129,7 +129,7 @@
 	.row {
 		background: var(--bg-elev1);
 		border: 1px solid var(--border);
-		border-radius: 10px;
+		border-radius: var(--r-card, 10px);
 		overflow: hidden;
 		transition: opacity 0.2s;
 	}
@@ -151,7 +151,7 @@
 
 	.row-icon {
 		width: 30px; height: 30px;
-		border-radius: 7px;
+		border-radius: var(--r-control, 7px);
 		background: var(--bg-elev3);
 		color: var(--fg-muted);
 		display: flex; align-items: center; justify-content: center;
@@ -201,7 +201,7 @@
 		color: oklch(0.75 0.14 60);
 		background: oklch(0.25 0.06 60);
 		border: 1px solid oklch(0.45 0.10 60 / 0.4);
-		border-radius: 4px;
+		border-radius: var(--r-chip, 4px);
 		padding: 1px 6px;
 		flex-shrink: 0;
 	}
@@ -218,7 +218,7 @@
 		display: flex; align-items: center; justify-content: center;
 		background: transparent;
 		border: 1px solid transparent;
-		border-radius: 6px;
+		border-radius: var(--r-control, 6px);
 		color: var(--fg-muted);
 		font-size: 15px;
 		line-height: 1;
@@ -241,7 +241,7 @@
 		color: var(--fg);
 		background: transparent;
 		border: none;
-		border-radius: 5px;
+		border-radius: var(--r-control, 5px);
 		cursor: pointer;
 	}
 	.menu-item:hover { background: var(--bg-elev3); }

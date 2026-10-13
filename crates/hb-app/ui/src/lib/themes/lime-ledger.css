@@ -30,5 +30,7 @@
   --glass-solid:   #050b09;
   --panel-gap:     10px;
   --r-panel:       14px;
-  --r-control:     10px;
+  --r-card:        12px;
+  --r-control:     9px;
+  --r-chip:        5px;
 }

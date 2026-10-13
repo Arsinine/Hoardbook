@@ -29,14 +29,11 @@
 		advanceReadWatermark,
 		topicAnnounceMarkSeen,
 		getShareCode,
-		relayStatus,
-		type RelayHealth,
 		getCollections,
 		redeemManifestTicket,
 		getManifestAsks,
 		getSettings,
 	} from '$lib/api.js';
-	import { relayWhyHint } from '$lib/relay-health.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import AddContactDialog from '$lib/components/AddContactDialog.svelte';
@@ -48,7 +45,7 @@
 	// the FeatureTooltip registry is drift-guarded to exactly five keys, so a sixth is not the tool).
 	import HintMarker from '$lib/components/HintMarker.svelte';
 	import ConfirmButton from '$lib/components/ConfirmButton.svelte';
-	import { DM_POLL_VISIBLE_MS, CHANNEL_REFRESH_EVERY_TICKS, RELAY_HEALTH_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
+	import { DM_POLL_VISIBLE_MS, CHANNEL_REFRESH_EVERY_TICKS } from '$lib/poll-lifecycle.js';
 	import { renderFingerprint } from '$lib/identity-display.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
 	import { importToast } from '$lib/manifest-provenance.js';
@@ -110,8 +107,6 @@
 	// M17 W5.3: relay reachability, read from the same store the Contacts topbar uses. Drives ONE
 	// muted line — the DM poll swallows its own errors, so this is the only place the user can learn
 	// that a quiet inbox is actually an unreachable one.
-	let relayHealth: RelayHealth[] = $state([]);
-	let relayHint = $derived(relayWhyHint(relayHealth));
 	let sharedCodeInDraft: { npub: string; code: string } | null = $state(null);
 	let threadEl: HTMLElement | undefined = $state();
 	// M17 W2: the ask-access intent focuses the composer (spec: an existing draft is not clobbered —
@@ -826,17 +821,10 @@
 			loadRequests();
 		}, DM_POLL_VISIBLE_MS);
 
-		// W5.3: relay health on the slow tick (not the 3s DM cadence — reachability changes slowly
-		// and this must not add churn against the relays).
-		const readRelayHealth = async () => {
-			try { relayHealth = await relayStatus(); } catch { /* keep last health */ }
-		};
-		readRelayHealth();
-		const healthPoll = setInterval(() => { if (!document.hidden) readRelayHealth(); }, RELAY_HEALTH_POLL_VISIBLE_MS);
-
+		// The W5.3 relay-health line in the conversation list, and the 60 s poll that fed it,
+		// were removed by the owner, 2026-10-13. Relay state lives in Settings → Relays.
 		return () => {
 			clearInterval(fastPoll);
-			clearInterval(healthPoll);
 		};
 	});
 
@@ -1225,9 +1213,6 @@
 			<!-- W5.3: the DM poll's `catch {}` used to eat every relay failure, so a silently stale
 			     inbox looked exactly like a quiet one. One muted line, same relay-health store the
 			     Contacts topbar reads. No toast — this is chrome, not an event. -->
-			{#if relayHint}
-				<div class="relay-hint" title="Messages may be stale until a relay is reachable.">{relayHint} — inbox may be stale</div>
-			{/if}
 			<div class="convo-search">
 				<div class="hb-input search-wrap">
 					<span class="search-icon-sm">{@html icons.search}</span>
@@ -1901,13 +1886,6 @@
 
 	.convo-search { padding: 10px 12px; border-bottom: 1px solid var(--divider); }
 
-	/* W5.3 — muted chrome, not an alert: it states a fact about the relays, and gets out of the way. */
-	.relay-hint {
-		padding: 6px 12px;
-		font-size: 11px;
-		color: var(--fg-dim);
-		border-bottom: 1px solid var(--divider);
-	}
 
 	/* QURATOR-101 — on the .hb-input contract; only the icon-prefix gap is local. */
 	.search-wrap { gap: 6px; }
@@ -1948,7 +1926,7 @@
 		padding: 10px;
 		background: transparent;
 		border: none;
-		border-radius: 7px;
+		border-radius: var(--r-control, 7px);
 		cursor: pointer;
 		color: inherit;
 		font-family: inherit;
@@ -1980,7 +1958,7 @@
 	.channel-hash {
 		width: 34px; height: 34px; flex-shrink: 0;
 		display: flex; align-items: center; justify-content: center;
-		border-radius: 8px;
+		border-radius: var(--r-card, 8px);
 		background: var(--bg-elev2);
 		color: var(--fg-muted);
 		font-size: 17px; font-weight: 700;
@@ -2141,6 +2119,25 @@
 		border-top: 1px solid var(--border);
 		background: var(--bg);
 	}
+	/* QURATOR-352 — floating panes: the conversation header and composer stop painting a solid strip
+	   across the glass, and every section divider becomes an inset hairline that stops short of the
+	   rounded rim instead of a line cut edge to edge. */
+	:global(:root[data-glass-float]) .pane-header,
+	:global(:root[data-glass-float]) .composer { background: transparent; }
+	:global(:root[data-glass-float]) .convo-header,
+	:global(:root[data-glass-float]) .convo-search,
+	:global(:root[data-glass-float]) .pane-header {
+		border-bottom: 0;
+		box-shadow: inset 0 -1px 0 var(--divider);
+		margin-inline: 10px;
+		padding-inline: 6px;
+	}
+	:global(:root[data-glass-float]) .composer {
+		border-top: 0;
+		box-shadow: inset 0 1px 0 var(--divider);
+		margin-inline: 10px;
+		padding-inline: 4px;
+	}
 
 	/* QURATOR-101 — the boxed look moves onto the textarea itself (.hb-input contract); the box
 	   here is now a bare stacking layout for the textarea + the footer row below it. */
@@ -2169,7 +2166,7 @@
 		padding: 6px 14px;
 		font-family: var(--font-ui); font-size: 12px; font-weight: 600;
 		color: var(--accent-text); background: var(--accent);
-		border: 1px solid var(--accent); border-radius: 7px;
+		border: 1px solid var(--accent); border-radius: var(--r-control, 7px);
 		cursor: pointer; white-space: nowrap; user-select: none; line-height: 1;
 		min-width: 68px;
 	}
@@ -2212,7 +2209,7 @@
 		margin-bottom: 10px;
 		background: var(--accent-soft);
 		border: 1px solid var(--border);
-		border-radius: 9px;
+		border-radius: var(--r-card, 9px);
 	}
 	.announce-icon { font-size: 15px; line-height: 1; }
 	.announce-body { flex: 1; min-width: 0; }
@@ -2237,7 +2234,7 @@
 		background: transparent;
 		border: none;
 		border-bottom: 1px solid var(--divider);
-		border-radius: 7px;
+		border-radius: var(--r-control, 7px);
 		cursor: pointer;
 		color: inherit;
 		font-family: inherit;

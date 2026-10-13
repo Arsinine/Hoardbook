@@ -82,7 +82,7 @@
 	.panel {
 		background: var(--bg-elev1);
 		border: 1px solid var(--border);
-		border-radius: 10px;
+		border-radius: var(--r-card, 10px);
 		overflow: hidden;
 	}
 
@@ -112,7 +112,7 @@
 
 	.folder-icon {
 		width: 32px; height: 32px;
-		border-radius: 7px;
+		border-radius: var(--r-control, 7px);
 		background: var(--bg-elev3);
 		color: var(--fg-muted);
 		display: flex; align-items: center; justify-content: center;

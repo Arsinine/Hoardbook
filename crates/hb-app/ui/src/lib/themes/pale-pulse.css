@@ -44,5 +44,7 @@
   --glass-solid:   #d9e4f1;
   --panel-gap:     12px;
   --r-panel:       20px;
+  --r-card:        14px;
   --r-control:     999px;
+  --r-chip:        999px;
 }

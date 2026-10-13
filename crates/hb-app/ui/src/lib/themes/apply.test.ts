@@ -50,7 +50,10 @@ describe('applyAppearance — root attribute rules', () => {
 		expect(has('data-glass-float')).toBe(true);
 		applyAppearance({ theme: 'vault', glass: false, seeThrough: false });
 		expect(has('data-glass-float')).toBe(false);
+		// Every theme floats, hoard included (owner, 2026-10-13).
 		applyAppearance({ theme: 'hoard', glass: true, seeThrough: false });
+		expect(has('data-glass-float')).toBe(true);
+		applyAppearance({ theme: 'hoard', glass: false, seeThrough: false });
 		expect(has('data-glass-float')).toBe(false);
 		applyAppearance({ theme: 'pale-pulse', glass: true, seeThrough: false });
 		expect(has('data-glass-float')).toBe(true);
@@ -63,13 +66,13 @@ describe('applyAppearance — root attribute rules', () => {
 		expect(has('data-glass-off')).toBe(false);
 	});
 
-	it('data-see-through iff seeThrough AND glass AND theme is not hoard', () => {
+	it('data-see-through iff seeThrough AND glass (any theme, hoard included)', () => {
 		applyAppearance({ theme: 'vault', glass: true, seeThrough: true });
 		expect(has('data-see-through')).toBe(true);
 		applyAppearance({ theme: 'vault', glass: false, seeThrough: true });
 		expect(has('data-see-through')).toBe(false);
 		applyAppearance({ theme: 'hoard', glass: true, seeThrough: true });
-		expect(has('data-see-through')).toBe(false);
+		expect(has('data-see-through')).toBe(true);
 		applyAppearance({ theme: 'sky-slate', glass: true, seeThrough: true });
 		expect(has('data-see-through')).toBe(true);
 	});

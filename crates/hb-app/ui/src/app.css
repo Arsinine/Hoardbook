@@ -114,8 +114,10 @@
   --selection:     oklch(0.78 0.14 70 / 0.3);
   --primary-fill:  var(--accent);   /* a theme may set a gradient here; --accent stays a colour */
 
-  /* Glass. In `hoard` every glass token resolves to the solid fill the surface had before, the gap
-     is 0 and the radius is 0, so panes sit edge to edge exactly as they always did. */
+  /* Glass, base values. With glass OFF these reproduce the original flush layout exactly: solid
+     fill, no gap, square panes. With glass ON, `hoard` floats like every other theme — see the
+     `:root[data-glass-float]:not([data-theme])` block below (owner, 2026-10-13: "Hoard Original
+     now differs from the other 7 in terms of design system"). */
   --backdrop:      var(--bg);       /* painted once, behind every pane, by +layout.svelte */
   --glass:         var(--bg);       /* sidebar, topbars, list and detail panes */
   --glass-raised:  var(--bg-elev1); /* menus, popovers, toasts, modals */
@@ -125,8 +127,33 @@
   --glass-veil:    transparent;     /* extra pane tint used only in see-through mode */
   --glass-solid:   var(--bg);       /* fallback when glass is off (reduced transparency etc.) */
   --panel-gap:     0px;
-  --r-panel:       0px;
-  --r-control:     7px;
+
+  /* Corner radii by role. These four are the ONLY radius values components use (pills and
+     circles excepted), so a theme sets its whole shape language in four lines. The base values
+     are the app's original radii; each theme scales them to its design system. */
+  --r-panel:       0px;   /* sidebar, topbars, list/detail panes */
+  --r-card:        10px;  /* cards, surfaces, popovers inside a pane */
+  --r-control:     7px;   /* buttons, inputs, rows, toggles */
+  --r-chip:        4px;   /* tags, badges, small chips */
+}
+
+/* `hoard` with glass on: the original palette in the shared glass design — floating frosted panes
+   over a dark backdrop with a faint amber glow, rims and rounded panes. Only the glass tokens
+   change; every colour token keeps its original value. Glass off removes data-glass-float, so
+   the base values above (the original flush layout) apply again. */
+:root[data-glass-float]:not([data-theme]) {
+  /* Kept faint on purpose: hoard's --fg-dim sits at ~4.8 : 1 on its own flat ground, so any lift
+     behind a pane pushes it under AA. Values are the minimum the contrast gate passes with. */
+  --backdrop: radial-gradient(ellipse 55% 50% at 86% 10%, oklch(0.78 0.14 70 / 0.05), transparent 70%), radial-gradient(ellipse 60% 55% at 10% 96%, oklch(0.55 0.10 60 / 0.05), transparent 72%), radial-gradient(circle at 74% 70%, oklch(0.20 0.012 260) 0 15%, transparent 15.4%), linear-gradient(160deg, oklch(0.13 0.005 260), oklch(0.16 0.006 260) 60%, oklch(0.14 0.005 260));
+  --glass:         oklch(0.20 0.006 260 / 0.70);
+  --glass-raised:  oklch(0.20 0.006 260 / 0.86);
+  --glass-blur:    18px;
+  --glass-rim:     oklch(1 0 0 / 0.09);
+  --glass-bevel:   inset 0 1px 0 oklch(1 0 0 / 0.04);
+  --glass-veil:    oklch(0 0 0 / 0.40);
+  --glass-solid:   oklch(0.19 0.006 260);
+  --panel-gap:     10px;
+  --r-panel:       14px;
 }
 
 /* ── Glass behaviour (QURATOR-352) ─────────────────────────────────── */
@@ -255,7 +282,7 @@ h1, h2, h3, h4, h5, h6 {
   gap: 6px;
   height: 30px;
   padding: 0 12px;
-  border-radius: 7px;
+  border-radius: var(--r-control, 7px);
   font: inherit;
   font-size: 12.5px;
   font-weight: 600;
@@ -299,7 +326,7 @@ h1, h2, h3, h4, h5, h6 {
 	padding: 0 11px;
 	background: var(--bg-input);
 	border: 1px solid var(--border);
-	border-radius: 7px;
+	border-radius: var(--r-control, 7px);
 	font-family: var(--font-ui);
 	font-size: 13px;
 	color: var(--fg);
@@ -478,7 +505,7 @@ select.hb-input { display: inline-block; }
   font-size: 10px;
   color: var(--accent);
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--r-chip, 4px);
   padding: 0 4px;
   line-height: 1.5;
   flex-shrink: 0;

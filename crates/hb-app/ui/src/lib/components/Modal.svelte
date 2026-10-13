@@ -154,7 +154,7 @@
 		overflow: auto;
 		background: var(--bg-elev2);
 		border: 1px solid var(--border);
-		border-radius: 10px;
+		border-radius: var(--r-card, 10px);
 		box-shadow: var(--shadow-modal);
 		/* padding comes from the inline `padding` prop (default 18px) */
 	}

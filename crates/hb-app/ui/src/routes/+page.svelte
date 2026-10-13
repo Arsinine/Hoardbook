@@ -955,7 +955,7 @@
 		width: 380px;
 		background: var(--bg-elev1);
 		border: 1px solid oklch(0.65 0.18 25 / 0.35);
-		border-radius: 10px;
+		border-radius: var(--r-card, 10px);
 		padding: 22px;
 		display: flex;
 		flex-direction: column;
@@ -969,7 +969,7 @@
 		color: var(--danger-text);
 		background: var(--danger-soft);
 		border: 1px solid var(--danger-border);
-		border-radius: 6px;
+		border-radius: var(--r-control, 6px);
 		padding: 8px 10px;
 		word-break: break-word;
 	}
@@ -1008,7 +1008,7 @@
 		width: 400px;
 		background: var(--bg-elev1);
 		border: 1px solid var(--border);
-		border-radius: 10px;
+		border-radius: var(--r-card, 10px);
 		padding: 22px;
 	}
 
@@ -1031,7 +1031,7 @@
 		gap: 8px;
 		background: var(--bg-elev2);
 		border: 1px solid var(--border);
-		border-radius: 7px;
+		border-radius: var(--r-control, 7px);
 		padding: 8px 10px;
 		margin-bottom: 12px;
 	}
@@ -1056,7 +1056,7 @@
 		position: relative;
 		display: flex; align-items: center; justify-content: center;
 		width: 38px; height: 28px;
-		border-radius: 6px;
+		border-radius: var(--r-control, 6px);
 		background: var(--bg-elev2); border: 1px solid var(--border);
 		cursor: pointer; font-family: var(--font-mono); color: var(--fg-muted);
 		font-size: 10px; font-weight: 600; letter-spacing: -0.3px;
@@ -1093,7 +1093,7 @@
 	.ob-notice {
 		background: var(--bg-elev2);
 		border: 1px solid var(--border);
-		border-radius: 8px;
+		border-radius: var(--r-card, 8px);
 		padding: 12px;
 		margin-bottom: 16px;
 		display: flex;
@@ -1239,7 +1239,7 @@
 		padding: 0 11px;
 		background: var(--bg-elev2);
 		border: 1px solid var(--border);
-		border-radius: 7px;
+		border-radius: var(--r-control, 7px);
 		font-size: 13px;
 		color: var(--fg-muted);
 		font-feature-settings: 'tnum';
@@ -1256,7 +1256,7 @@
 	.stat {
 		background: var(--bg-elev1);
 		border: 1px solid var(--border);
-		border-radius: 8px;
+		border-radius: var(--r-card, 8px);
 		padding: 10px 12px;
 	}
 
@@ -1319,7 +1319,7 @@
 		padding: 5px 8px;
 		background: var(--bg-input);
 		border: 1px solid var(--border);
-		border-radius: 7px;
+		border-radius: var(--r-control, 7px);
 		align-items: center;
 		cursor: text;
 		transition: border-color 0.1s;
@@ -1331,7 +1331,7 @@
 		gap: 3px;
 		background: var(--bg-elev2);
 		border: 1px solid var(--border);
-		border-radius: 4px;
+		border-radius: var(--r-chip, 4px);
 		padding: 1px 5px 1px 7px;
 		font-size: 11.5px;
 		color: var(--fg);
@@ -1370,7 +1370,7 @@
 		left: 0; right: 0;
 		background: var(--bg-elev2);
 		border: 1px solid var(--border);
-		border-radius: 7px;
+		border-radius: var(--r-control, 7px);
 		overflow: hidden;
 		z-index: 10;
 		box-shadow: 0 8px 24px oklch(0 0 0 / 0.25);
@@ -1388,7 +1388,7 @@
 	.willing-btn {
 		font-size: 11.5px;
 		padding: 4px 10px;
-		border-radius: 5px;
+		border-radius: var(--r-control, 5px);
 		border: 1px solid var(--border);
 		background: var(--bg-elev2);
 		color: var(--fg-muted);
@@ -1410,7 +1410,7 @@
 	.ct-badge {
 		font-size: 11px;
 		padding: 2px 8px;
-		border-radius: 4px;
+		border-radius: var(--r-chip, 4px);
 		background: color-mix(in oklch, var(--accent) 10%, transparent);
 		color: var(--accent);
 		border: 1px solid color-mix(in oklch, var(--accent) 20%, transparent);
@@ -1433,7 +1433,7 @@
 		color: var(--accent-text);
 		background: var(--accent);
 		border: 1px solid var(--accent);
-		border-radius: 7px;
+		border-radius: var(--r-control, 7px);
 		cursor: pointer;
 		white-space: nowrap;
 		line-height: 1;

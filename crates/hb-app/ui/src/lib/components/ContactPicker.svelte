@@ -150,7 +150,7 @@
 	}
 	.contact-row {
 		display: flex; align-items: center; gap: 9px; width: 100%;
-		padding: 6px 8px; border: 1px solid transparent; border-radius: 7px;
+		padding: 6px 8px; border: 1px solid transparent; border-radius: var(--r-control, 7px);
 		background: transparent; cursor: pointer; text-align: left;
 		color: var(--fg); font: inherit; font-size: 12.5px;
 	}

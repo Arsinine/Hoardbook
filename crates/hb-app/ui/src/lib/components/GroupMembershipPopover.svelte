@@ -157,7 +157,7 @@
 	.gmp-list { display: flex; flex-direction: column; gap: 1px; }
 	.gmp-row {
 		display: inline-flex; align-items: center; gap: 6px;
-		font-size: 12px; color: var(--fg); cursor: pointer; padding: 4px 8px; border-radius: 5px;
+		font-size: 12px; color: var(--fg); cursor: pointer; padding: 4px 8px; border-radius: var(--r-control, 5px);
 	}
 	.gmp-row:hover { background: var(--bg-elev3); }
 	.gmp-row input { margin: 0; cursor: pointer; }
@@ -166,7 +166,7 @@
 	.gmp-new {
 		text-align: left; background: transparent; border: none; cursor: pointer;
 		font-family: var(--font-ui); font-size: 11.5px; color: var(--fg-dim);
-		padding: 5px 8px; border-radius: 5px; margin-top: 2px;
+		padding: 5px 8px; border-radius: var(--r-control, 5px); margin-top: 2px;
 	}
 	.gmp-new:hover { background: var(--bg-elev3); color: var(--fg-muted); }
 	.gmp-footer { display: flex; justify-content: flex-end; gap: 6px; padding: 6px 8px 2px; border-top: 1px solid var(--divider); margin-top: 4px; }

@@ -13,7 +13,7 @@
 //     mocked saveSettings with theme:'<id>' — the full-object save path every other toggle uses;
 //   - arrow keys move focus and select the neighbour (native radio-group semantics);
 //   - the see-through row exists ONLY when window_material_supported passes;
-//   - glass-off / Hoard disable see-through with their reason as the help text;
+//   - glass off disables see-through with its reason; Hoard allows it (every theme is glass);
 //   - the QURATOR-93 belt-and-suspenders gate: a failed settings load disables the new controls
 //     and the in-handler guards alone still block the save.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -212,23 +212,22 @@ describe('QURATOR-352 — Appearance section in Settings', () => {
 		await fireEvent.click(seeThrough);
 		await tick();
 		expect(saveSettingsMock).toHaveBeenCalledWith(expect.objectContaining({ see_through: true }));
-		expect(setMaterialMock).toHaveBeenLastCalledWith({ seeThrough: true, glass: true, theme: 'vault' });
+		expect(setMaterialMock).toHaveBeenLastCalledWith({ seeThrough: true, glass: true });
 	});
 
-	it('switching to Hoard with see-through on re-syncs the OS material, so Mica turns off', async () => {
-		// GLM review 2026-10-12: changing theme or glass used to leave Mica on behind an opaque
-		// window until restart. Every appearance change now re-sends the full state; Rust's
-		// see_through_effective turns it off for hoard.
-		// MUTATION (P-10): delete the `void setWindowMaterial();` line in selectTheme — this reds.
+	it('turning glass off with see-through on re-syncs the OS material, so Mica turns off', async () => {
+		// GLM review 2026-10-12: changing glass used to leave Mica on behind solid panes until
+		// restart. A glass change now re-sends the state; Rust's see_through_effective turns it off.
+		// MUTATION (P-10): delete the `void setWindowMaterial();` line in toggleGlass — this reds.
 		probeMock.mockResolvedValue(true);
 		getSettingsMock.mockResolvedValue({ ...OK_SETTINGS, see_through: true });
 		primeIdentity();
 		const { getByRole } = render(SettingsPage);
-		await waitFor(() => expect((getByRole('radio', { name: /^Hoard/ }) as HTMLButtonElement).disabled).toBe(false));
+		await waitFor(() => expect((getByRole('button', { name: /glass effects/i }) as HTMLButtonElement).disabled).toBe(false));
 		setMaterialMock.mockClear();
-		await fireEvent.click(getByRole('radio', { name: /^Hoard/ }));
+		await fireEvent.click(getByRole('button', { name: /glass effects/i }));
 		await tick();
-		expect(setMaterialMock).toHaveBeenLastCalledWith({ seeThrough: true, glass: true, theme: 'hoard' });
+		expect(setMaterialMock).toHaveBeenLastCalledWith({ seeThrough: true, glass: false });
 	});
 
 	it('glass effects toggle applies at once and saves glass:false', async () => {
@@ -240,7 +239,7 @@ describe('QURATOR-352 — Appearance section in Settings', () => {
 		expect(saveSettingsMock).toHaveBeenCalledWith(expect.objectContaining({ glass: false }));
 	});
 
-	it('glass off disables see-through with its reason; Hoard disables it with "Needs a glass theme."', async () => {
+	it('glass off disables see-through with its reason; Hoard allows it, like every glass theme', async () => {
 		probeMock.mockResolvedValue(true);
 		getSettingsMock.mockResolvedValue({ ...OK_SETTINGS, glass: false });
 		primeIdentity();
@@ -255,16 +254,16 @@ describe('QURATOR-352 — Appearance section in Settings', () => {
 		expect(utils.getByText('Needs glass effects on.')).toBeTruthy();
 		void seeThrough;
 
-		// Hoard is the one theme with no glass, regardless of glass being on. Unmount the first page
-		// before mounting the second, or both pages' help texts sit in the document at once.
+		// Hoard joined the shared glass design (owner, 2026-10-13), so see-through is ENABLED there.
+		// Unmount the first page first, or both pages' help texts sit in the document at once.
 		cleanup();
 		getSettingsMock.mockResolvedValue({ ...OK_SETTINGS, theme: 'hoard' });
 		const utils2 = render(SettingsPage);
 		await waitFor(() => {
 			const b = utils2.getByRole('button', { name: /see-through window/i }) as HTMLButtonElement;
-			expect(b.disabled).toBe(true);
+			expect(b.disabled).toBe(false);
 		});
-		expect(utils2.getByText('Needs a glass theme.')).toBeTruthy();
+		expect(utils2.queryByText('Needs a glass theme.')).toBeNull();
 	});
 
 	it('QURATOR-93 twin: a failed settings load disables the new controls, and the in-handler guards alone block saves', async () => {

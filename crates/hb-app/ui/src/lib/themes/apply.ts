@@ -41,9 +41,9 @@ export function applyAppearance(input: Appearance): void {
 	if (!a.glass) root.setAttribute('data-glass-off', '');
 	else root.removeAttribute('data-glass-off');
 
-	// See-through is hoard-inert (hoard paints --backdrop = --bg fully opaque) and glass-inert
-	// (nothing to see through without blur). app.css/layout paint the OS material under it.
-	if (a.seeThrough && a.glass && a.theme !== BASE_THEME) root.setAttribute('data-see-through', '');
+	// See-through needs glass on (nothing to see through without it); every theme, hoard included,
+	// is a glass theme. app.css/layout paint the OS material under it.
+	if (a.seeThrough && a.glass) root.setAttribute('data-see-through', '');
 	else root.removeAttribute('data-see-through');
 
 	// Best-effort mirror for the boot script. try/catch: disabled/private-mode storage must never

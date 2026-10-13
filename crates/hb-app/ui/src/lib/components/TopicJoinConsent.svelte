@@ -105,7 +105,7 @@
 
 	.actions button {
 		padding: 5px 12px;
-		border-radius: 6px;
+		border-radius: var(--r-control, 6px);
 		border: 1px solid var(--border);
 		font: inherit;
 		cursor: pointer;

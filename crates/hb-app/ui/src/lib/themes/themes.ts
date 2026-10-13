@@ -37,7 +37,7 @@ export const BASE_THEME: ThemeId = 'hoard';
 export const DEFAULT_THEME: ThemeId = 'vault';
 
 export const THEMES: readonly ThemeInfo[] = [
-	{ id: 'hoard', name: 'Hoard', source: null, mode: 'dark', swatch: ['#0e0f11', '#1e2023', '#eba443'], float: false },
+	{ id: 'hoard', name: 'Hoard', source: null, mode: 'dark', swatch: ['#0e0f11', '#1e2023', '#eba443'], float: true },
 	{ id: 'oxblood-steel', name: 'Oxblood Steel', source: '/08', mode: 'dark', swatch: ['#0f0b11', '#4e0613', '#f4bcc1'], float: true },
 	{ id: 'lime-ledger', name: 'Lime Ledger', source: '/17', mode: 'dark', swatch: ['#050c0a', '#2b3d12', '#d9fd18'], float: true },
 	{ id: 'clinic-teal', name: 'Clinic Teal', source: '/31', mode: 'dark', swatch: ['#122832', '#1f465d', '#d6f5a9'], float: true },

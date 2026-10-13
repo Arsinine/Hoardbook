@@ -103,7 +103,7 @@
 		padding: 8px 10px;
 		background: var(--bg-elev3);
 		border: 1px solid var(--border-strong);
-		border-radius: 7px;
+		border-radius: var(--r-control, 7px);
 		box-shadow: var(--shadow-pop);
 		opacity: 1;
 		transition: opacity 0.12s ease;

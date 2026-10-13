@@ -68,7 +68,7 @@
 		z-index: var(--z-menu);
 		background: var(--bg-elev2);
 		border: 1px solid var(--border);
-		border-radius: 8px;
+		border-radius: var(--r-card, 8px);
 		padding: 4px;
 		box-shadow: 0 8px 24px oklch(0 0 0 / 0.3);
 	}

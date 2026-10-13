@@ -1376,6 +1376,11 @@
 	/* QURATOR-352 — .master-detail's base rule pins `gap: 0` (topics-w9 pins the flat hoard look),
 	   so the pane separation is added ONLY under data-glass-float, as a separate rule. */
 	:global(:root[data-glass-float]) .master-detail { gap: var(--panel-gap); }
+	/* Owner, 2026-10-13: "the panels in topics seem to be somewhat detached". .body's 18px/22px
+	   padding (from the flat layout) stacked on top of the shared --panel-gap, so these panes sat
+	   28px under the topbar and 22px in from the edges where every other page uses 10px. Floating,
+	   the panes take the shared gap alone. */
+	:global(:root[data-glass-float]) .body { padding: 0; }
 	.list-pane {
 		width: 280px; flex-shrink: 0; overflow-y: auto; padding: 6px;
 		border-right: 1px solid var(--border);
@@ -1391,7 +1396,7 @@
 	.directory-tree.cold-hold { visibility: hidden; }
 	.topic-row {
 		display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
-		padding: 9px 10px; background: transparent; border: none; border-radius: 7px; cursor: pointer; color: inherit;
+		padding: 9px 10px; background: transparent; border: none; border-radius: var(--r-control, 7px); cursor: pointer; color: inherit;
 	}
 	.topic-row:hover { background: var(--bg-elev2); }
 	.topic-selected { background: var(--bg-elev3); }
@@ -1428,7 +1433,7 @@
 	/* Unjoined rows: --fg-muted, NOT --fg-dim — dim fails contrast on --bg-raised, and a whole
 	   directory under 4.5:1 is a defect, not a state. The row stays interactive (never disabled). */
 	.unjoined { color: var(--fg-muted); cursor: pointer; }
-	.unjoined:hover { background: var(--bg-elev2); border-radius: 7px; color: var(--fg); }
+	.unjoined:hover { background: var(--bg-elev2); border-radius: var(--r-control, 7px); color: var(--fg); }
 	.unjoined .blurb { font-size: 11.5px; color: var(--fg-muted); }
 
 	/* Shared controls — M20 W4: inputs use the global .hb-input contract (app.css); the bare
@@ -1472,7 +1477,7 @@
 		padding: 3px 4px;
 		background: transparent;
 		border: none;
-		border-radius: 5px;
+		border-radius: var(--r-control, 5px);
 		color: inherit;
 		font: inherit;
 		text-align: left;
@@ -1502,7 +1507,7 @@
 		color: var(--fg-muted);
 		background: var(--bg-elev1);
 		border-left: 2px solid var(--accent);
-		border-radius: 4px;
+		border-radius: var(--r-chip, 4px);
 		white-space: pre-wrap;
 		overflow-wrap: anywhere;
 	}

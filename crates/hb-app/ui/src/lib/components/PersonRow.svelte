@@ -64,7 +64,7 @@
 		align-items: center;
 		gap: 8px;
 		padding: 5px 4px;
-		border-radius: 5px;
+		border-radius: var(--r-control, 5px);
 		font-size: 12px;
 	}
 	.avatar-wrap { position: relative; flex-shrink: 0; }

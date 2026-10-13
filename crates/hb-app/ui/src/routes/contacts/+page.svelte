@@ -1157,16 +1157,14 @@
 <div class="topbar hb-pane" data-tauri-drag-region>
 	<div>
 		<div class="topbar-title">Contacts</div>
+		<!-- Owner, 2026-10-13: the network chip used to sit alone in the middle of the topbar with
+		     the relay reason beside it. It now joins the subtitle as one quiet status line, and the
+		     relay reason ("No relays configured" etc.) is dropped here — it stays in the chip's
+		     tooltip, and Settings → Relays is where relays are fixed. -->
 		<div class="topbar-sub">
-			{$contacts.length} contact{$contacts.length !== 1 ? 's' : ''} · {onlineTotal} online
+			{$contacts.length} contact{$contacts.length !== 1 ? 's' : ''} · {onlineTotal} online{#if chip.show}<span class="sub-sep" aria-hidden="true">·</span><span class="online-chip online-chip-{chip.state}" class:online-chip-muted={chip.unknown} title={whyHint ? `Hoarders online now — ${whyHint}` : 'Hoarders online now'}><span class="online-dot"></span>{chip.label}</span>{/if}
 		</div>
 	</div>
-	{#if chip.show}
-		<span class="online-chip online-chip-{chip.state}" class:online-chip-muted={chip.unknown} title={whyHint ? `Hoarders online now — ${whyHint}` : 'Hoarders online now'}><span class="online-dot"></span>{chip.label}</span>
-		{#if whyHint}
-			<span class="online-why" title={whyHint}>({whyHint})</span>
-		{/if}
-	{/if}
 	<button type="button" class="btn-primary btn-sm topbar-add" onclick={() => (addContactPanelOpen = true)}>+ Add contact</button>
 </div>
 
@@ -1804,6 +1802,7 @@
 		flex-direction: column;
 		overflow: hidden;
 		min-width: 0;
+		gap: var(--panel-gap); /* QURATOR-352 — topbar/body separation in floating themes (0 otherwise). */
 	}
 	/* QURATOR-342 lane B — two-pane layout: a ~300px compact contact-list column and the
 	   People-like-you pane. The list column owns the sub-header; the pane scrolls independently. */
@@ -1844,11 +1843,15 @@
 	.online-chip-amber .online-dot { background: oklch(0.78 0.15 75); }
 	.online-chip-green .online-dot { background: var(--online); }
 	.online-chip-muted { opacity: 0.55; }
-	.online-why { font-size: 10.5px; color: var(--fg-dim); opacity: 0.7; white-space: nowrap; }
+	.sub-sep { margin: 0 6px; }
+	.topbar-sub .online-chip { font-size: inherit; font-weight: 500; vertical-align: baseline; }
 
 	/* Sticky sub-header: search + view toggle + add-contact — outside the scroll container. */
+	/* The column is 300px: search on its own row, the view toggle under it. On one row the search
+	   pushed the toggle ~94px past the column edge (cut off under the next pane) in every theme. */
 	.subheader {
 		display: flex;
+		flex-wrap: wrap;
 		align-items: center;
 		gap: 10px;
 		padding: 12px 24px;
@@ -1856,11 +1859,22 @@
 		background: var(--bg);
 		flex-shrink: 0;
 	}
+	/* QURATOR-352 — inside a floating glass pane the toolbar is part of the pane, not a solid strip
+	   across it: no fill and an inset divider instead of a full-width line. */
+	:global(:root[data-glass-float]) .subheader {
+		background: transparent;
+		padding: 12px 12px 10px;
+		border-bottom: 0;
+		box-shadow: inset 0 -1px 0 var(--divider);
+		margin: 0 8px;
+	}
+	:global(:root[data-glass-float]) .subheader-search { max-width: none; }
+	:global(:root[data-glass-float]) .phonebook-scroll { padding-inline: 8px; }
 	/* QURATOR-52 §5 — on the .hb-input contract; only the search-specific layout (icon gap,
 	   max-width, padding for the icon prefix) is local. The inner input is transparent/borderless
 	   so the wrapper reads as one search field. */
 	.subheader-search {
-		flex: 1;
+		flex: 1 1 100%;
 		max-width: 380px;
 		gap: 8px;
 		padding: 0 11px;
@@ -1880,7 +1894,7 @@
 	.view-toggle {
 		display: flex;
 		border: 1px solid var(--border);
-		border-radius: 7px;
+		border-radius: var(--r-control, 7px);
 		overflow: hidden;
 		flex-shrink: 0;
 	}
@@ -1948,6 +1962,16 @@
 		scroll-margin-top: 0;
 	}
 	#sec-online.section-header { color: var(--online); }
+	/* QURATOR-352 — in a glass theme the pane behind is translucent, so a solid --bg strip shows as
+	   a dark band. Use the raised glass with its blur so a sticky header still hides the rows it
+	   scrolls over. Hoard with glass off keeps the original solid strip. */
+	:global(:root[data-glass-float]) .section-header {
+		background: var(--glass-raised);
+		-webkit-backdrop-filter: blur(var(--glass-blur));
+		backdrop-filter: blur(var(--glass-blur));
+		border-radius: var(--r-chip, 4px);
+		padding-inline: 6px;
+	}
 
 	/* Contacts list */
 	.empty { color: var(--fg-dim); font-size: 13px; padding: 16px 0; }
@@ -1967,7 +1991,7 @@
 	.contact-card {
 		background: var(--bg-elev1);
 		border: 1px solid var(--border);
-		border-radius: 10px;
+		border-radius: var(--r-card, 10px);
 		padding: 10px 12px;
 		display: flex;
 		gap: 10px;
@@ -1984,14 +2008,14 @@
 	.row-menu-btn {
 		width: 26px; height: 26px; flex-shrink: 0;
 		display: flex; align-items: center; justify-content: center;
-		background: transparent; border: 1px solid transparent; border-radius: 6px;
+		background: transparent; border: 1px solid transparent; border-radius: var(--r-control, 6px);
 		color: var(--fg-muted); font-size: 15px; line-height: 1; cursor: pointer;
 	}
 	.row-menu-btn:hover { background: var(--bg-elev3); color: var(--fg); }
 	.menu-item {
 		display: flex; align-items: center; width: 100%; text-align: left;
 		padding: 7px 10px; font-family: var(--font-ui); font-size: 12.5px; color: var(--fg);
-		background: transparent; border: none; border-radius: 5px; cursor: pointer;
+		background: transparent; border: none; border-radius: var(--r-control, 5px); cursor: pointer;
 	}
 	.menu-item:hover:not(:disabled) { background: var(--bg-elev3); }
 	.menu-item:disabled { opacity: 0.6; cursor: default; }
@@ -2013,7 +2037,9 @@
 
 	/* Browse-key access (devtest #1/#6) — a 🔒 overlay on the avatar for a keyless (locked) contact
 	   replaces the old inline "key needed"/"browseable" text badge; keyed contacts get no marker. */
-	.avatar-wrap { position: relative; flex-shrink: 0; margin-top: 2px; }
+	/* border-radius matches Avatar's own 34px-size corner, so the fingerprint ring (a box-shadow on
+	   this wrapper) follows the avatar's rounded shape instead of drawing a square around it. */
+	.avatar-wrap { position: relative; flex-shrink: 0; margin-top: 2px; border-radius: 8px; }
 	.lock-overlay {
 		position: absolute; right: -4px; bottom: -4px;
 		font-size: 10px; line-height: 1;
@@ -2062,7 +2088,7 @@
 	.fp-word { font-family: var(--font-mono); font-size: 11px; font-weight: 600; }
 	.fp-sep { color: var(--fg-dim); font-size: 11px; }
 	.collision-badge {
-		font-size: 10px; padding: 1px 6px; border-radius: 4px;
+		font-size: 10px; padding: 1px 6px; border-radius: var(--r-chip, 4px);
 		border: 1px solid color-mix(in oklch, var(--error) 60%, transparent);
 		color: var(--error); font-weight: 500;
 	}
@@ -2085,12 +2111,12 @@
 	.collections-popover {
 		display: none; position: absolute; top: 100%; left: 0; z-index: var(--z-menu);
 		min-width: 220px; margin-top: 6px;
-		background: var(--bg-elev2); border: 1px solid var(--border); border-radius: 8px;
+		background: var(--bg-elev2); border: 1px solid var(--border); border-radius: var(--r-card, 8px);
 		padding: 6px; box-shadow: 0 8px 24px oklch(0 0 0 / 0.3);
 	}
 	.collections-popover-wrap:hover .collections-popover,
 	.collections-popover-wrap:focus-within .collections-popover { display: block; }
-	.cpop-row { display: flex; flex-direction: column; gap: 1px; padding: 4px 6px; border-radius: 5px; }
+	.cpop-row { display: flex; flex-direction: column; gap: 1px; padding: 4px 6px; border-radius: var(--r-control, 5px); }
 	.cpop-row:hover { background: var(--bg-elev3); }
 	.cpop-alias { font-size: 12px; font-weight: 500; color: var(--fg); }
 	.cpop-size { font-size: 10.5px; color: var(--fg-muted); font-feature-settings: 'tnum'; }
@@ -2129,7 +2155,7 @@
 	.tag-row { display: flex; flex-wrap: wrap; gap: 4px; margin: 5px 0 2px; align-items: center; min-height: 22px; }
 	.local-tag {
 		display: inline-flex; align-items: center; gap: 3px;
-		padding: 1px 6px 1px 8px; border-radius: 4px; font-size: 11px; font-weight: 500;
+		padding: 1px 6px 1px 8px; border-radius: var(--r-chip, 4px); font-size: 11px; font-weight: 500;
 		background: var(--bg-elev2); color: var(--fg-muted);
 	}
 	.tag-x {
@@ -2139,14 +2165,14 @@
 	.tag-x:hover { color: var(--fg); }
 	.tag-add-btn {
 		font-size: 11px; color: var(--fg-dim); background: transparent; border: 1px dashed var(--border);
-		border-radius: 4px; padding: 1px 7px; cursor: pointer; font-family: var(--font-ui);
+		border-radius: var(--r-chip, 4px); padding: 1px 7px; cursor: pointer; font-family: var(--font-ui);
 	}
 	.tag-add-btn:hover { border-color: var(--accent); color: var(--accent); }
 	/* QURATOR-52 §5 — on the .hb-input contract; only the active-edit overrides are local
 	   (accent border to mark editing, smaller font/radius for the inline tag slot). */
 	.tag-input {
 		font-size: 11px; border-color: var(--accent);
-		border-radius: 4px; padding: 1px 7px; min-width: 60px;
+		border-radius: var(--r-chip, 4px); padding: 1px 7px; min-width: 60px;
 	}
 
 	.contact-detail {
@@ -2166,7 +2192,7 @@
 	   distinction reads as grouping rather than as two different kinds of importance. */
 	.detail-block {
 		background: var(--bg-elev2);
-		border-radius: 8px;
+		border-radius: var(--r-card, 8px);
 		border-left: 2px solid transparent;
 		padding: 8px 12px;
 		display: flex;
@@ -2206,7 +2232,7 @@
 	.copy-btn {
 		flex-shrink: 0;
 		font-size: 10.5px; line-height: 1; color: var(--fg-dim); background: transparent;
-		border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; cursor: pointer;
+		border: 1px solid var(--border); border-radius: var(--r-chip, 4px); padding: 2px 6px; cursor: pointer;
 		font-family: var(--font-ui);
 	}
 	.copy-btn:hover { border-color: var(--accent); color: var(--accent); }
@@ -2243,7 +2269,7 @@
 	   item 3 — the face's row is .contact-sub-row and was never styled by it.) */
 	.group-pill {
 		display: inline-flex; align-items: center; gap: 4px;
-		padding: 1px 8px; border-radius: 4px; font-size: 11px; font-weight: 500;
+		padding: 1px 8px; border-radius: var(--r-chip, 4px); font-size: 11px; font-weight: 500;
 		background: color-mix(in oklch, var(--accent) 10%, transparent);
 		color: var(--accent);
 	}
@@ -2253,7 +2279,7 @@
 	   face's group affordance reads as the same kind of control. */
 	.group-add-btn {
 		font-size: 11px; line-height: 1; color: var(--fg-dim); background: transparent;
-		border: 1px dashed var(--border); border-radius: 4px; padding: 0 5px; cursor: pointer;
+		border: 1px dashed var(--border); border-radius: var(--r-chip, 4px); padding: 0 5px; cursor: pointer;
 		font-family: var(--font-ui); display: inline-flex; align-items: center;
 	}
 	.group-add-btn:hover { border-color: var(--accent); color: var(--accent); }
@@ -2292,7 +2318,7 @@
 		margin: 4px 16px 24px;
 		padding: 16px;
 		border: 1px dashed var(--border-strong);
-		border-radius: 10px;
+		border-radius: var(--r-card, 10px);
 		background: transparent;
 		color: var(--fg-dim);
 		display: flex;

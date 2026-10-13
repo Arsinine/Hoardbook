@@ -67,7 +67,7 @@
 		color: var(--fg-muted);
 		background: transparent;
 		border: 1px solid transparent;
-		border-radius: 7px;
+		border-radius: var(--r-control, 7px);
 		cursor: pointer;
 		white-space: nowrap;
 		line-height: 1;
@@ -96,7 +96,7 @@
 		font-family: var(--font-ui);
 		font-size: 12px;
 		font-weight: 600;
-		border-radius: 6px;
+		border-radius: var(--r-control, 6px);
 		cursor: pointer;
 		white-space: nowrap;
 		line-height: 1;

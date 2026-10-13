@@ -118,7 +118,7 @@
 		justify-content: center;
 		width: 30px;
 		height: 28px;
-		border-radius: 6px;
+		border-radius: var(--r-control, 6px);
 		color: var(--fg-muted);
 		cursor: pointer;
 		transition: background 0.1s, color 0.1s;

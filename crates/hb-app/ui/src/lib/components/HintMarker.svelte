@@ -100,7 +100,7 @@
 		color: var(--fg-muted);
 		background: var(--bg-elev3);
 		border: 1px solid var(--border-strong);
-		border-radius: 7px;
+		border-radius: var(--r-control, 7px);
 		box-shadow: var(--shadow-pop);
 	}
 

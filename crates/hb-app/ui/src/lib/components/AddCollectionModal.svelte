@@ -479,7 +479,7 @@
 <style>
 	/* M15 W2: backdrop/card come from Modal.svelte (padding=0); this frame keeps the header/
 	   columns/footer chrome with the rounded, clipped corners the header border relies on. */
-	.screen-frame { border-radius: 10px; overflow: hidden; }
+	.screen-frame { border-radius: var(--r-card, 10px); overflow: hidden; }
 
 	.modal-header {
 		padding: 16px 20px;
@@ -616,7 +616,7 @@
 		padding: 8px;
 		background: var(--bg-input);
 		border: 1px solid var(--border);
-		border-radius: 7px;
+		border-radius: var(--r-control, 7px);
 	}
 
 	.tree-hint { font-size: 12px; color: var(--fg-dim); padding: 4px 2px; }
@@ -642,7 +642,7 @@
 	.ct-toggle {
 		font-size: 11.5px;
 		padding: 4px 10px;
-		border-radius: 5px;
+		border-radius: var(--r-control, 5px);
 		border: 1px solid var(--border);
 		background: var(--bg-elev2);
 		color: var(--fg-muted);
@@ -673,7 +673,7 @@
 		gap: 3px;
 		background: var(--bg-elev2);
 		border: 1px solid var(--border);
-		border-radius: 4px;
+		border-radius: var(--r-chip, 4px);
 		padding: 1px 5px 1px 7px;
 		font-size: 11.5px;
 		color: var(--fg);
