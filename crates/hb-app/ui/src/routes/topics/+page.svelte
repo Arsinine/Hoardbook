@@ -995,6 +995,7 @@
 		     meta line; unjoined rows muted with their blurb + Join. Colour is never the only tell —
 		     the two states differ STRUCTURALLY (meta line + unread pill vs blurb + Join). -->
 		<div class="list-pane hb-pane">
+			<div class="list-pane-scroll">
 			<!-- QURATOR-144 W2: path-only filter over the whole merged tree; matching groups are
 			     force-opened by `isCollapsed`. -->
 			<div class="discover-search">
@@ -1121,12 +1122,14 @@
 			{#if hasPendingInvite}
 				<button class="link" disabled={busy} onclick={redeemInvite}>Redeem a private Topic invite</button>
 			{/if}
-		</div>
+				</div>
+</div>
 
 			<!-- Right: detail (roster + invite + chat deep-link for a joined Topic; the honest
 			     non-member view — blurb + claimed count + Join — for an unjoined one. A grey row is
 			     never disabled: selecting it shows what a non-member can honestly be shown.) -->
 			<div class="detail-pane hb-pane">
+				<div class="detail-pane-scroll">
 				{#if openTopic}
 					<div class="detail-head">
 						<div class="grow">
@@ -1285,6 +1288,7 @@
 				{:else}
 					<div class="detail-empty">Select a Topic to see its roster, invite members, and open its chat channel.</div>
 				{/if}
+				</div>
 			</div>
 		</section>
 </div>
@@ -1382,9 +1386,11 @@
 	   the panes take the shared gap alone. */
 	:global(:root[data-glass-float]) .body { padding: 0; }
 	.list-pane {
-		width: 280px; flex-shrink: 0; overflow-y: auto; padding: 6px;
+		width: 280px; flex-shrink: 0;
 		border-right: 1px solid var(--border);
+		overflow: hidden; display: flex; flex-direction: column;
 	}
+	.list-pane-scroll { flex: 1; min-width: 0; overflow-y: auto; padding: 6px; }
 	/* QURATOR-352 — the divider between panes disappears when panes float (hb-pane supplies the
 	   glass rim instead). In hoard (no data-glass-float) it stays. */
 	:global(:root[data-glass-float]) .list-pane { border-right: 0; }
@@ -1401,9 +1407,10 @@
 	.topic-row:hover { background: var(--bg-elev2); }
 	.topic-selected { background: var(--bg-elev3); }
 	.detail-pane {
-		flex: 1; min-width: 0; overflow-y: auto; padding: 16px;
-		display: flex; flex-direction: column; gap: 12px;
+		flex: 1; min-width: 0;
+		overflow: hidden; display: flex; flex-direction: column;
 	}
+	.detail-pane-scroll { flex: 1; min-width: 0; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
 	.detail-head { display: flex; align-items: flex-start; gap: 8px; }
 	.detail-title { font-size: 15px; font-weight: 700; }
 	.detail-section { display: flex; flex-direction: column; gap: 4px; }

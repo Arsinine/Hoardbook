@@ -693,6 +693,7 @@
 	<div class="body">
 		<!-- Left: Profile editor -->
 		<div class="profile-pane hb-pane">
+			<div class="profile-pane-scroll">
 			<div class="profile-header">
 				<button
 					type="button"
@@ -873,10 +874,12 @@
 					</div>
 				{/if}
 			</div>
-		</div>
+				</div>
+</div>
 
 		<!-- Right: Collections -->
 		<div class="collections-pane hb-pane">
+			<div class="collections-pane-scroll">
 			<div class="coll-head">
 				<div>
 					<div class="coll-title">Collections</div>
@@ -931,6 +934,7 @@
 					{/each}
 				{/if}
 			</div>
+		</div>
 		</div>
 	</div>
 
@@ -1149,13 +1153,19 @@
 	}
 
 	/* Profile pane */
+	/* The pane itself never scrolls: the glass paints on .hb-pane::before (app.css), an absolute
+	   layer inset to the pane's visible box — inside a scroll container it is one screenful and
+	   scrolls away (owner, 2026-10-13; same shape as Settings, 0e013161). The pane is a fixed flex
+	   column; the -scroll wrapper carries the overflow and the padding. */
 	.profile-pane {
 		width: 320px;
 		flex-shrink: 0;
 		border-right: 1px solid var(--border);
-		padding: 20px;
-		overflow-y: auto;
+		overflow: hidden;
+		display: flex;
+		flex-direction: column;
 	}
+	.profile-pane-scroll { flex: 1; min-width: 0; padding: 20px; overflow-y: auto; }
 	/* QURATOR-352 — the divider between panes disappears when panes float (hb-pane supplies the
 	   glass rim instead). In hoard (no data-glass-float) it stays. */
 	:global(:root[data-glass-float]) .profile-pane { border-right: 0; }
@@ -1223,11 +1233,11 @@
 	/* Collections pane */
 	.collections-pane {
 		flex: 1;
-		padding: 20px;
-		overflow-y: auto;
+		overflow: hidden;
 		display: flex;
 		flex-direction: column;
 	}
+	.collections-pane-scroll { flex: 1; min-width: 0; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; }
 
 	.coll-head {
 		display: flex;
