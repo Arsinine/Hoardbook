@@ -4,6 +4,9 @@
 	import { listen } from '@tauri-apps/api/event';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import { sizeTier, sizeTierTooltip, rowIcon } from '$lib/collection-row-view.js';
+	// QURATOR-374 — the ONE decimal byte formatter (shared with Contacts/Discover); the local
+	// GB-topping copy is deleted. A peer's >1e12 total now reads "4.2 TB" here too.
+	import { fmtBytes } from '$lib/discover-book.js';
 	import { refreshContact, getContacts, groupsGet, groupsCreate, groupsCreateWithMembers, groupsAssign, groupsDelete, groupsUnassign, contactUpdateGroups, browsePrivateCollections, applyKeyGrants, getManifestAsks, type ManifestAsk } from '$lib/api.js';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
@@ -226,13 +229,6 @@
 			folderStack = folderStack.slice(0, bc.index + 1);
 		}
 		resetFileFilters();
-	}
-
-	function fmtBytes(bytes: number): string {
-		if (bytes > 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
-		if (bytes > 1e6) return (bytes / 1e6).toFixed(1) + ' MB';
-		if (bytes > 1e3) return (bytes / 1e3).toFixed(0) + ' KB';
-		return bytes + ' B';
 	}
 
 	// Build the relative path for a file within the collection.

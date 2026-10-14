@@ -73,6 +73,31 @@ describe('CollectionRow', () => {
 		expect(queryByRole('menuitem', { name: /manifest/i })).toBeNull();
 	});
 
+	it('q374_tb_band_binary_units', async () => {
+		// QURATOR-374: Home's own-collection rows gain a TB band in the SAME binary units — the
+		// local formatter stays deliberately 1024-based (swapping for the shared decimal one
+		// would change every number the owner sees for their own collections). GB is untouched.
+		// P-10 MUTATION: in CollectionRow.svelte change the TB threshold `1099511627776` to
+		// `10995116277760` → REDS (5 TB falls through to the GB branch, "5120.0 GB").
+		const tib = 1099511627776;
+		const { getByText } = render(CollectionRow, {
+			props: { collection: makeCollection({ total_bytes: 5 * tib }) },
+		});
+		expect(getByText('5.0 TB')).toBeTruthy();
+
+		// One byte under the TB threshold stays GB (1024 GiB, not "1.0 TB").
+		const { getByText: getUnder } = render(CollectionRow, {
+			props: { collection: makeCollection({ total_bytes: tib - 1 }) },
+		});
+		expect(getUnder('1024.0 GB')).toBeTruthy();
+
+		// An existing GB value is unchanged by the new band.
+		const { getByText: getGb } = render(CollectionRow, {
+			props: { collection: makeCollection({ total_bytes: 1.5 * 1073741824 }) },
+		});
+		expect(getGb('1.5 GB')).toBeTruthy();
+	});
+
 	it('q202_remove_fires_in_one_click_with_no_confirm_step', async () => {
 		// QURATOR-202 (owner ruling): "Get rid of the two step and red text." One click on Remove
 		// must call onremove immediately — no confirm prompt, no second click.

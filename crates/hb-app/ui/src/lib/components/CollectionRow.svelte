@@ -33,7 +33,10 @@
 	let icon = $derived(icons[rowIcon(collection)]);
 
 	function fmtBytes(b: number): string {
-		const GB = 1073741824, MB = 1048576, KB = 1024;
+		// Deliberately BINARY (1024-based), not the shared decimal $lib/discover-book fmtBytes —
+		// swapping would change every number the owner sees for their OWN collections.
+		const TB = 1099511627776, GB = 1073741824, MB = 1048576, KB = 1024;
+		if (b >= TB) return (b / TB).toFixed(1) + ' TB';
 		if (b >= GB) return (b / GB).toFixed(1) + ' GB';
 		if (b >= MB) return (b / MB).toFixed(1) + ' MB';
 		if (b >= KB) return (b / KB).toFixed(1) + ' KB';
