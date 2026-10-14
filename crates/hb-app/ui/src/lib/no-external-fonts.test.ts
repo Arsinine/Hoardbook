@@ -71,23 +71,23 @@ describe('QURATOR-52 — no external font origin (self-hosted fonts)', () => {
 
 	it('both families referenced by the design tokens have at least one local face', () => {
 		const srcs = fontFaceSrcs(css).join(' ');
-		expect(srcs).toContain('/fonts/host-grotesk-latin.woff2');
+		expect(srcs).toContain('/fonts/inter-latin.woff2');
 		expect(srcs).toContain('/fonts/jetbrains-mono-latin.woff2');
 	});
 
-	// QURATOR-366 — Host Grotesk is the one UI face; the token must name it and a local face must exist.
-	// Mutation proof (P-10), done by LINE: sed -i "54s/'Host Grotesk', system-ui/'Inter', system-ui/" src/app.css
-	// → this test REDs: "--font-ui must name Host Grotesk (QURATOR-366)": Expected "Host Grotesk",
-	// Received "Inter". Restore src/app.css from backup + touch → GREEN. (The existing srcs-based its
-	// stay green under that mutation because they do not read the token.)
-	it('the --font-ui token names Host Grotesk and a local face for it exists', () => {
+	// QURATOR-366 reverted (owner, 2026-10-14: "change it back from grotesk 400 to inter. We couldnt
+	// recreate the effect the draft did in production") — Inter is the one UI face again. Kept from
+	// 366: the token must NAME the face and a local face for it must exist, so a future swap of the
+	// UI face cannot land without this pin moving with it.
+	// P-10 MUTATION (by LINE): change --font-ui's 'Inter' to 'Host Grotesk' in src/app.css → REDS.
+	it('the --font-ui token names Inter and a local face for it exists', () => {
 		const live = stripComments(readFileSync(APP_CSS, 'utf8'));
 		const token = live.match(/--font-ui:\s*'([^']+)'/);
 		expect(token, '--font-ui must exist in app.css').toBeTruthy();
-		expect(token![1], '--font-ui must name Host Grotesk (QURATOR-366)').toBe('Host Grotesk');
+		expect(token![1], '--font-ui must name Inter (QURATOR-366 reverted)').toBe('Inter');
 		const face = [...live.matchAll(/@font-face\s*{[^}]*?src:\s*url\('?([^')]+)'?\)/g)]
-			.find((m) => m[0].includes("'Host Grotesk'"));
-		expect(face, "an @font-face declaring 'Host Grotesk' must exist").toBeTruthy();
+			.find((m) => m[0].includes("'Inter'"));
+		expect(face, "an @font-face declaring 'Inter' must exist").toBeTruthy();
 		const src = face![1];
 		const file = fileURLToPath(new URL(`../../static${src}`, import.meta.url));
 		expect(() => readFileSync(file), `font file ${src} must exist and be non-empty`).not.toThrow();
