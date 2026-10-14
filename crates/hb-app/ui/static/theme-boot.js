@@ -30,7 +30,8 @@
 		// set with the theme id, never presence-style; the two flags below are presence-style.
 		if (theme !== BASE_THEME) root.setAttribute('data-theme', theme);
 		else root.removeAttribute('data-theme');
-		setOrRemove('data-glass-float', FLOATING.indexOf(theme) !== -1 && glass);
+		// Floating layout whatever the glass switch says: glass changes materials only (apply.ts).
+		setOrRemove('data-glass-float', FLOATING.indexOf(theme) !== -1);
 		setOrRemove('data-glass-off', !glass);
 		// see-through window removed 2026-10-14: scrub a stale attribute an older build may
 		// have left on the root. removeAttribute is a no-op when the attribute is absent.

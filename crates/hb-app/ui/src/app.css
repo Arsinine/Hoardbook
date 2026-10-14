@@ -114,10 +114,10 @@
   --selection:     oklch(0.78 0.14 70 / 0.3);
   --primary-fill:  var(--accent);   /* a theme may set a gradient here; --accent stays a colour */
 
-  /* Glass, base values. With glass OFF these reproduce the original flush layout exactly: solid
-     fill, no gap, square panes. With glass ON, `hoard` floats like every other theme — see the
-     `:root[data-glass-float]:not([data-theme])` block below (owner, 2026-10-13: "Hoard Original
-     now differs from the other 7 in terms of design system"). */
+  /* Glass, base values: solid fill, no gap, square panes. Every theme sets data-glass-float, so
+     `hoard` floats like every other theme — see the `:root[data-glass-float]:not([data-theme])`
+     block below (owner, 2026-10-13: "Hoard Original now differs from the other 7 in terms of
+     design system"). These base values are what a non-floating theme would get. */
   --backdrop:      var(--bg);       /* painted once, behind every pane, by +layout.svelte */
   --glass:         var(--bg);       /* sidebar, topbars, list and detail panes */
   --glass-raised:  var(--bg-elev1); /* menus, popovers, toasts, modals */
@@ -136,10 +136,10 @@
   --r-chip:        4px;   /* tags, badges, small chips */
 }
 
-/* `hoard` with glass on: the original palette in the shared glass design — floating frosted panes
-   over a dark backdrop with a faint amber glow, rims and rounded panes. Only the glass tokens
-   change; every colour token keeps its original value. Glass off removes data-glass-float, so
-   the base values above (the original flush layout) apply again. */
+/* `hoard` in the shared glass design: the original palette as floating frosted panes over a dark
+   backdrop with a faint amber glow, rims and rounded panes. Only the glass tokens change; every
+   colour token keeps its original value. Glass off keeps this layout and swaps only the materials
+   (owner, v0.24.0 devtest: the switch must not turn the floating layout back into a flush grid). */
 :root[data-glass-float]:not([data-theme]) {
   /* Kept faint on purpose: hoard's --fg-dim sits at ~4.8 : 1 on its own flat ground, so any lift
      behind a pane pushes it under AA. Values are the minimum the contrast gate passes with. */
@@ -186,13 +186,20 @@
   -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.35);
   backdrop-filter: blur(var(--glass-blur)) saturate(1.35);
 }
-/* Glass off: no blur anywhere, surfaces become the theme's computed solid colour. Triggered by the
-   Settings switch (data-glass-off — which also clears data-glass-float, so the float rules above
-   do not apply), the OS reduced-transparency preference, or an engine without backdrop-filter. */
-:root[data-glass-off] .hb-pane.hb-pane { background: var(--glass-solid); }
-/* "Solid panels" means the flush, square layout too, not floating opaque cards. */
-:root[data-glass-off] { --panel-gap: 0px; --r-panel: 0px; }
-:root[data-glass-off][data-theme] .hb-raised.hb-raised { background: var(--glass-solid); }
+/* Glass off: MATERIALS ONLY. No blur anywhere and surfaces become the theme's computed solid colour,
+   but the layout — gaps, rims, rounded panes — stays exactly as with glass on (owner, v0.24.0
+   devtest: "Enabling/Disabling Glass effects does not only change materials but the overall
+   layout from grids to bubbles"). data-glass-float is set whatever the switch says, so the float
+   rules above still apply; the pane's solid fill goes on the same ::before layer the glass uses
+   (a page may clear a pane's own background in floating mode, e.g. chat's .convo-pane). Also
+   triggered, below, by the OS reduced-transparency preference or an engine without
+   backdrop-filter. */
+:root[data-glass-off] .hb-pane.hb-pane::before {
+  background: var(--glass-solid); -webkit-backdrop-filter: none; backdrop-filter: none;
+}
+:root[data-glass-off] .hb-raised.hb-raised {
+  background: var(--glass-solid); -webkit-backdrop-filter: none; backdrop-filter: none;
+}
 @media (prefers-reduced-transparency: reduce) {
   :root[data-glass-float] .hb-pane.hb-pane { background: var(--glass-solid); }
   :root[data-glass-float] .hb-pane.hb-pane::before { display: none; }

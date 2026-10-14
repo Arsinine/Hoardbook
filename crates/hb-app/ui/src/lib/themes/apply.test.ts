@@ -5,8 +5,9 @@
 // apply.ts plus a list-level drift guard against themes.ts.
 //
 // Mutation proofs (run, then revert): (1) making applyAppearance set data-theme="hoard" instead
-// of removing it reds "hoard removes data-theme"; (2) dropping "&& glass" from the float rule
-// reds "data-glass-float iff theme floats and glass is on"; (3) in static/theme-boot.js, changing
+// of removing it reds "hoard removes data-theme"; (2) the float rule's "&& glass" term
+// was the v0.24.0 rule; since the v0.24.0 devtest (glass changes materials only) RE-ADDING
+// "&& glass" reds "data-glass-float iff the theme floats — the glass switch never changes it"; (3) in static/theme-boot.js, changing
 // `var DEFAULT_THEME = 'vault';` back to 'hoard' reds "a first launch (no mirror) paints Vault".
 //
 // Owner ruling 2026-10-12: Vault is the DEFAULT theme. Hoard is the BASE theme (the bare :root, no
@@ -45,16 +46,19 @@ describe('applyAppearance — root attribute rules', () => {
 		expect(root().getAttribute('data-theme')).toBe('vault');
 	});
 
-	it('data-glass-float iff the theme floats AND glass is on', () => {
+	it('data-glass-float iff the theme floats — the glass switch never changes it', () => {
+		// Owner, v0.24.0 devtest: "Enabling/Disabling Glass effects does not only change materials but
+		// the overall layout from grids to bubbles." Glass off keeps the floating layout; only
+		// data-glass-off (materials) changes.
 		applyAppearance({ theme: 'vault', glass: true });
 		expect(has('data-glass-float')).toBe(true);
 		applyAppearance({ theme: 'vault', glass: false });
-		expect(has('data-glass-float')).toBe(false);
-		// Every theme floats, hoard included (owner, 2026-10-13).
+		expect(has('data-glass-float'), 'glass off keeps the floating layout').toBe(true);
+		// Every theme floats, hoard included (owner, 2026-10-13), and keeps floating with glass off.
 		applyAppearance({ theme: 'hoard', glass: true });
 		expect(has('data-glass-float')).toBe(true);
 		applyAppearance({ theme: 'hoard', glass: false });
-		expect(has('data-glass-float')).toBe(false);
+		expect(has('data-glass-float'), 'hoard with glass off keeps the floating layout').toBe(true);
 		applyAppearance({ theme: 'pale-pulse', glass: true });
 		expect(has('data-glass-float')).toBe(true);
 	});

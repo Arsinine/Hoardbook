@@ -32,8 +32,9 @@ export function applyAppearance(input: Appearance): void {
 	if (a.theme === BASE_THEME) root.removeAttribute('data-theme');
 	else root.setAttribute('data-theme', a.theme);
 
-	// Panes float (gap + rim, hb-pane) only when the theme is a glass theme AND glass is on.
-	if (themeInfo(a.theme).float && a.glass) root.setAttribute('data-glass-float', '');
+	// Panes float (gap + rim, hb-pane) whenever the theme floats — glass on OR off. The glass switch
+	// changes materials only, never the layout (owner, v0.24.0 devtest).
+	if (themeInfo(a.theme).float) root.setAttribute('data-glass-float', '');
 	else root.removeAttribute('data-glass-float');
 
 	// Glass off: .hb-pane/.hb-raised fall back to opaque surfaces (app.css handles the visuals).

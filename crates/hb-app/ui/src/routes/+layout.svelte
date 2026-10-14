@@ -56,8 +56,13 @@
 			// already painted the localStorage mirror, so this is the Settings-as-source-of-truth
 			// pass: it re-asserts (or corrects) the boot attributes. applyAppearance validates the
 			// theme id. Broken settings I/O must not block startup — fall back to the boot mirror.
+			// ⚠ v0.24.0 shipped this block with the applyAppearance call DELETED (it went out with the
+			// see-through arguments in 8bc4f2f4), so Settings were never applied at launch and the app
+			// ran on whatever the boot mirror held — the owner's "corners disappeared after v0.23.2".
+			// Pinned by layout-applies-settings-appearance.test.ts.
 			try {
 				const s = await getSettings();
+				applyAppearance({ theme: (s.theme ?? DEFAULT_THEME) as ThemeId, glass: s.glass ?? true });
 			} catch {
 				applyAppearance(readMirroredAppearance());
 			}
