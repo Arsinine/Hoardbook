@@ -7,7 +7,8 @@
 //
 // MUTATION PROOFS (§9 / P-10) — every test below was SEEN RED against the exact production edit
 // named in its comment, with the file restored (cp backup + `touch`) between proofs:
-//  • row-click navigation   ← `/browse?peer=` mutated to `/chat?peer=` in the card onclick → REDS.
+//  • click-select / dblclick-Browse / has-collection gate / Enter / hover — the five proofs named
+//    beside the QURATOR-368b tests themselves (mutations a–e in this file's first describe).
 //  • rail/tag-filter absence ← the removed "Filter by tag" row + `allTags` state restored VERBATIM → REDS.
 //  • right pane              ← F1 fold: re-adding the old likes panel → REDS (absence pin).
 //  • ask-access absence     ← the removed "Ask for access" button restored VERBATIM → REDS this test
@@ -21,9 +22,9 @@ import { goto } from '$app/navigation';
 import { contacts } from '$lib/stores.js';
 import type { ContactSummary, Collection, Profile } from '$lib/types.js';
 
-// jsdom has no ResizeObserver, and `bioMeasure` (the M23 W6 bio-overflow action) constructs one the
-// moment a contact HAS a bio (same stub as contacts-chevron-item3.test.ts — a jsdom gap, not a
-// production defect; jsdom computes no layout so `measure()` reads 0/0 and no clamp control shows).
+// jsdom has no ResizeObserver. The page's M23 W6 `bioMeasure` action used to construct one the
+// moment a contact HAD a bio (a jsdom gap, not a production defect) — QURATOR-368c deleted that
+// action with the face bio, so the stub below is belt-and-braces for any component that grows one.
 class StubResizeObserver {
 	observe() {}
 	unobserve() {}
@@ -99,17 +100,24 @@ function pubCollection(slug: string): Collection {
 	};
 }
 
+// QURATOR-368b — NPUB_B under its own name, so "the pane shows THAT contact" is assertable by
+// .pane-name text alone (the shared BASE_PROFILE name would otherwise match row 0 too).
+const BEE_NAME = 'Bee Browse';
+function peerB(overrides: Partial<ContactSummary> = {}): ContactSummary {
+	return peer({ npub: NPUB_B, profile: { ...BASE_PROFILE, display_name: BEE_NAME }, ...overrides });
+}
+
 afterEach(() => {
 	cleanup();
 	vi.clearAllMocks();
 	contacts.set([]);
 });
 
-describe('QURATOR-342 lane B — row click opens Browse', () => {
-	it('a plain click on the row navigates to /browse?peer=<npub>; inner controls and modifier clicks do not', async () => {
+describe('QURATOR-368 slice b — row click selects; double-click Browses (only with a collection)', () => {
+	it('a plain click selects the row into the right pane and does NOT navigate (i)', async () => {
 		contacts.set([
 			peer({ npub: NPUB_A, online: true }),
-			peer({ npub: NPUB_B }),
+			peerB(),
 		]);
 		const { container } = render(ContactsPage);
 		const rows = await waitFor(() => {
@@ -117,25 +125,26 @@ describe('QURATOR-342 lane B — row click opens Browse', () => {
 			expect(found.length).toBe(2);
 			return found;
 		});
+		vi.mocked(goto).mockClear();
 		// Online bucket renders first, so rows[1] is the offline peer NPUB_B in "Everyone else".
-		// The pin: the plain click carries the npub to Browse, encodeURIComponent'd.
+		// The pin: the plain click carries the npub into the PANE (the held 250 ms select lands),
+		// and nothing navigates.
 		fireEvent.click(rows[1]);
-		await waitFor(() => expect(vi.mocked(goto)).toHaveBeenCalledWith('/browse?peer=' + NPUB_B));
-		// A click on an inner control (⋯) keeps that control's own action — no navigation.
-		fireEvent.click(rows[1].querySelector('.row-menu-btn')!);
-		// A MODIFIER click keeps selection semantics — no navigation.
-		await fireEvent.click(rows[1], { shiftKey: true });
-		expect(vi.mocked(goto)).toHaveBeenCalledTimes(1);
+		await waitFor(() => expect(container.querySelector('.detail-pane .pane-name')?.textContent).toBe(BEE_NAME));
+		// No navigation of any kind — Browse is double-click's job now.
+		expect(vi.mocked(goto)).not.toHaveBeenCalled();
+		// Re-clicking the open row keeps it selected (never toggles closed — the click is the only
+		// way to open now).
+		fireEvent.click(rows[1]);
+		await new Promise((r) => setTimeout(r, 400));
+		expect(container.querySelector('.detail-pane .pane-name')?.textContent).toBe(BEE_NAME);
 	});
-	// MUTATION PROOF: with `/browse?peer=` mutated to `/chat?peer=` in the card onclick this test
-	// REDS (goto called with '/chat?peer=…' instead of '/browse?peer=…'); restored + touch → green.
+	// P-10 MUTATION (a): in +page.svelte's card onclick replace `scheduleRowSelect(peer.npub);`
+	// with `goto('/browse?peer=' + encodeURIComponent(peer.npub));` → this test REDS (goto is
+	// called with /browse; pane-name never becomes BEE_NAME). Restored + touch → green.
 
-	it('a double-click still opens Chat — the single-click Browse must not pre-empt it', async () => {
-		// Review finding (orchestrator, 2026-09-28): the first click of a double-click fires `click`
-		// too, so an immediate goto('/browse…') navigated away before `dblclick` → Chat could land.
-		// P-10 MUTATION: in +page.svelte delete `cancelRowBrowse(); ` from the card's ondblclick —
-		// the held Browse then fires after the Chat goto and this test REDS on the /browse call.
-		contacts.set([peer({ npub: NPUB_B })]);
+	it('a double-click on a row WITH a collection goes to Browse once; the pane never flashes that row in (ii)', async () => {
+		contacts.set([peerB({ collections: [pubCollection('films')] })]);
 		const { container } = render(ContactsPage);
 		const row = await waitFor(() => {
 			const r = container.querySelector('.contact-card');
@@ -143,12 +152,104 @@ describe('QURATOR-342 lane B — row click opens Browse', () => {
 			return r!;
 		});
 		vi.mocked(goto).mockClear();
+		// The first click of a double-click fires `click` too — the held select must NOT land.
+		fireEvent.click(row);
+		fireEvent.dblClick(row);
+		await waitFor(() => expect(vi.mocked(goto)).toHaveBeenCalledWith('/browse?peer=' + NPUB_B));
+		expect(vi.mocked(goto)).toHaveBeenCalledTimes(1);
+		// No selection flash: the held select was cancelled, so the pane never shows this row.
+		await new Promise((r) => setTimeout(r, 400));
+		expect(container.querySelector('.detail-pane .pane-name')).toBeNull();
+	});
+	// P-10 MUTATION (b): delete `cancelRowSelect();` from the card's ondblclick → the held select
+	// fires after the Browse goto, so goto is called TWICE and the pane opens — this test REDS on
+	// toHaveBeenCalledTimes(1) (and on pane-name null). Restored + touch → green.
+
+	it('a double-click on a row with NO collection does not navigate — the held select still lands (iii)', async () => {
+		contacts.set([peerB()]);
+		const { container } = render(ContactsPage);
+		const row = await waitFor(() => {
+			const r = container.querySelector('.contact-card');
+			expect(r).toBeTruthy();
+			return r!;
+		});
 		fireEvent.click(row);
 		fireEvent.dblClick(row);
 		await new Promise((r) => setTimeout(r, 400));
-		expect(vi.mocked(goto)).toHaveBeenCalledWith('/chat?peer=' + NPUB_B);
-		expect(vi.mocked(goto)).not.toHaveBeenCalledWith('/browse?peer=' + NPUB_B);
+		// Nothing to browse, so no navigation — and the first click's select is NOT discarded.
+		expect(vi.mocked(goto)).not.toHaveBeenCalled();
+		expect(container.querySelector('.detail-pane .pane-name')?.textContent).toBe(BEE_NAME);
 	});
+	// P-10 MUTATION (c): delete `if (!hasCollections) return;` from the card's ondblclick → the
+	// collection-less double-click now navigates and this test REDS on not.toHaveBeenCalled().
+	// Restored + touch → green.
+
+	it('modifier clicks never select or navigate (iv)', async () => {
+		contacts.set([
+			peer({ npub: NPUB_A, online: true }),
+			peerB({ collections: [pubCollection('films')] }),
+		]);
+		const { container } = render(ContactsPage);
+		const rows = await waitFor(() => {
+			const found = container.querySelectorAll('.contact-card');
+			expect(found.length).toBe(2);
+			return found;
+		});
+		vi.mocked(goto).mockClear();
+		// QURATOR-368c RE-POINT: this test also drove the row's ⋯ menu (click + dblclick) to prove
+		// the inner-control guard (`closest('button, a, input')`) — but slice c removed ALL controls
+		// from the at-rest row (Browse / Message / ⋯ live in the pane now), so there is no row
+		// control left to drive in jsdom. The guard stays in the click/dblclick/keydown handlers as
+		// DEFENSIVE code for any control re-added to a row; the modifier-click half remains mounted
+		// and drivable, and is what this test pins.
+		await fireEvent.click(rows[1], { shiftKey: true });
+		await new Promise((r) => setTimeout(r, 400));
+		expect(vi.mocked(goto)).not.toHaveBeenCalled();
+		expect(container.querySelector('.detail-pane .pane-name')).toBeNull();
+	});
+	// P-10 MUTATION (SEEN RED under QURATOR-368b, when the row still carried the ⋯): delete
+	// `if ((e.target as HTMLElement).closest('button, a, input')) return;` from the card's onclick
+	// → the ⋯ click scheduled a select and this test RED on pane-name null. Restored + touch →
+	// green. Since 368c the ⋯ driver no longer exists (the row renders no controls); the guard is
+	// no longer jsdom-drivable and this comment is the receipt, not a live proof.
+
+	it('hovering a row never changes the right pane — only click does (v)', async () => {
+		contacts.set([
+			peer({ npub: NPUB_A, online: true }),
+			peerB(),
+		]);
+		const { container } = render(ContactsPage);
+		const rows = await waitFor(() => {
+			const found = container.querySelectorAll('.contact-card');
+			expect(found.length).toBe(2);
+			return found;
+		});
+		// Select the online row first so the pane has something to be WRONG about.
+		fireEvent.click(rows[0]);
+		await waitFor(() => expect(container.querySelector('.detail-pane .pane-name')?.textContent).toBe('Somebody Hoardish'));
+		fireEvent.mouseEnter(rows[1]);
+		fireEvent.mouseOver(rows[1]);
+		await new Promise((r) => setTimeout(r, 400));
+		expect(container.querySelector('.detail-pane .pane-name')?.textContent).toBe('Somebody Hoardish');
+		expect(vi.mocked(goto)).not.toHaveBeenCalled();
+	});
+	// P-10 MUTATION (e): add `onmouseover={() => selectContact(peer.npub)}` to the card's
+	// attributes → this test REDS (the hover moves the pane). Restored + touch → green.
+
+	it('Enter on a focused row selects it, same as click', async () => {
+		contacts.set([peerB()]);
+		const { container } = render(ContactsPage);
+		const row = await waitFor(() => {
+			const r = container.querySelector('.contact-card');
+			expect(r).toBeTruthy();
+			return r!;
+		});
+		fireEvent.keyDown(row, { key: 'Enter' });
+		await waitFor(() => expect(container.querySelector('.detail-pane .pane-name')?.textContent).toBe(BEE_NAME));
+		expect(vi.mocked(goto)).not.toHaveBeenCalled();
+	});
+	// P-10 MUTATION (d): in the card's onkeydown delete `scheduleRowSelect(peer.npub);` → Enter
+	// does nothing and this test REDS. Restored + touch → green.
 });
 
 describe('QURATOR-342 lane B — the removed controls stay removed', () => {
@@ -177,8 +278,9 @@ describe('QURATOR-360 F1 — the likes panel is folded into Discover; the right 
 		const src = readFileSync(resolve(process.cwd(), 'src/routes/contacts/+page.svelte'), 'utf8');
 		expect(src.includes(gone)).toBe(false);
 		expect(container.querySelector('.people-pane')).toBeNull();
-		// The chevron still selects; the PANE (not the row) now renders .contact-detail.
-		fireEvent.click(container.querySelector('.chevron-btn')!);
+		// The row click still selects (QURATOR-368b: held 250 ms, then lands); the PANE (not the
+		// row) renders .contact-detail.
+		fireEvent.click(container.querySelector('.contact-card')!);
 		await waitFor(() => expect(container.querySelector('.detail-pane .contact-detail')).not.toBeNull());
 		// …and the detail is OUT of the row: .contact-block must not contain it.
 		const blk = container.querySelector('.contact-block');

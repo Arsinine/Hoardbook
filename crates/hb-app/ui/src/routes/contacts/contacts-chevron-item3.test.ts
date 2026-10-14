@@ -121,16 +121,23 @@ afterEach(() => {
 	contacts.set([]);
 });
 
-/** Mount, wait for the page's own load to settle, then open the one card's chevron. */
+/** Mount, wait for the page's own load to settle, then SELECT the one card (QURATOR-368b: the
+ *  chevron is gone — a row CLICK selects into the pane; the click is held 250 ms against a
+ *  possible double-click, then the pane renders). */
 async function openPanel(peer: ContactSummary): Promise<HTMLElement> {
 	contacts.set([peer]);
-	const { getByRole } = render(ContactsPage);
+	render(ContactsPage);
 	await waitFor(() => expect(groupsGetMock).toHaveBeenCalled());
 	await tick();
-	await fireEvent.click(getByRole('button', { name: 'Toggle details' }));
+	const card = document.querySelector<HTMLElement>('.contact-card');
+	expect(card, 'the contact row rendered').not.toBeNull();
+	fireEvent.click(card!);
+	const panel = await waitFor(() => {
+		const found = document.querySelector<HTMLElement>('.contact-detail');
+		expect(found, 'the row click did not select the contact into the pane').not.toBeNull();
+		return found!;
+	});
 	await tick();
-	const panel = document.querySelector<HTMLElement>('.contact-detail');
-	expect(panel, 'the chevron did not open a .contact-detail panel').not.toBeNull();
 	return panel!;
 }
 
@@ -156,14 +163,16 @@ describe('devtest item 3 — the chevron panel is the REST of the profile', () =
 	it('repeats nothing the card face already shows — that was the actual complaint', async () => {
 		const panel = await openPanel(FULL);
 		const card = panel.closest('.contact-card') ?? document.body;
-		// The bio renders on the face (row 3, clamped). Exactly once in the whole card.
+		// QURATOR-368c: the bio renders exactly ONCE — it moved into the pane (unclamped); the face
+		// carries none. (The old copy of this comment said "on the face, row 3, clamped".)
 		const occurrences = (card.textContent ?? '').split(BIO).length - 1;
 		expect(occurrences, 'the bio appears more than once in the card').toBe(1);
-		// est_size is on the face too, so it is deliberately NOT in the facts list.
+		// est_size renders in the pane HEADER meta (outside .contact-detail), so the facts list
+		// still does not repeat it. (The old copy said "est_size is on the face too".)
 		expect(panel.textContent ?? '', 'est_size duplicated into the panel').not.toContain('4 TB');
 	});
 
-	it('the panel holds no second group editor (ruling 01)', async () => {
+	it('the panel carries the ONE group chip row, and no checkbox editor (ruling 01 + QURATOR-368c)', async () => {
 		// Two groups exist and the peer is in one, so a surviving editor would have something to draw.
 		groupsGetMock.mockResolvedValue([
 			{ name: 'Film', pubkeys: [NPUB] },
@@ -171,15 +180,19 @@ describe('devtest item 3 — the chevron panel is the REST of the profile', () =
 		]);
 		const panel = await openPanel(FULL);
 		expect(panel.querySelector('.group-edit-list'), 'the checkbox editor survived').toBeNull();
-		expect(panel.querySelector('.group-pill'), 'the read-only chip row survived').toBeNull();
+		// QURATOR-368c RE-POINT (premise inverted): this test pinned `.group-pill` as ABSENT from the
+		// panel — the face was the only chip row. Slice c moved the chips INTO the pane, so the
+		// property that survives ruling 01 is: the chips render here EXACTLY ONCE (a second chip row
+		// anywhere is the duplication regression this file guards), and they are not form controls.
+		expect(panel.querySelectorAll('.group-pill').length, 'a second chip row appeared').toBe(1);
 		// The real invariant behind both: no checkbox in this panel is a group toggle. The audience
 		// checkbox IS expected here, so count group-named ones rather than checkboxes outright.
 		const labels = [...panel.querySelectorAll('label')].map((l) => l.textContent ?? '');
 		expect(labels.some((t) => t.includes('Film') || t.includes('Music'))).toBe(false);
-		// …while the face's `+` — the ONE surviving editor's entry point — is still there.
+		// The `+` — the ONE editor's entry point — moved here with the chips.
 		expect(
-			document.querySelector('.group-add-btn'),
-			'deleting the panel editor also took the popover trigger',
+			panel.querySelector('.group-add-btn'),
+			'the popover trigger did not move with the chips',
 		).not.toBeNull();
 	});
 

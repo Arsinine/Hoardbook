@@ -969,9 +969,13 @@ describe('M22 W4 — contacts page wiring (source-scan, no behavioural equivalen
 		expect(s).toMatch(/section\.key === 'ungrouped' \? UNGROUPED_TARGET : section\.key/);
 	});
 
-	it('group chips on the card face are ALSO drop targets with stopPropagation', () => {
+	// QURATOR-368c RE-POINT: the chip row moved off the card into the pane's `.pane-groups` block.
+	// The chips remain drop targets (M22 W4's "nearer than the section heading" now means nearer in
+	// the pane); the section headings and the card-on-card drag surfaces are untouched and pinned
+	// in the tests around this one.
+	it('group chips in the pane are ALSO drop targets with stopPropagation', () => {
 		const s = contactsSrc();
-		const sub = s.slice(s.indexOf('class="contact-sub-row"'), s.indexOf('group-add-btn'));
+		const sub = s.slice(s.indexOf('class="pane-groups"'), s.indexOf('group-add-btn'));
 		expect(sub).toMatch(/ondragover=\{\(e\) => \{ e\.stopPropagation\(\); onGroupDragOver\(e, gname\); \}\}/);
 		expect(sub).toMatch(/ondrop=\{\(e\) => \{ e\.stopPropagation\(\); onGroupDrop\(e, gname\); \}\}/);
 		expect(sub).toMatch(/ondragleave=\{\(e\) => \{ e\.stopPropagation\(\); onGroupDragLeave\(e, gname\); \}\}/);
@@ -1711,8 +1715,24 @@ describe('M22 W7 — contacts page keyboard wiring (source-scan)', () => {
 		expect(s).toMatch(/\{#if dropOverTarget && dropOutcome\}/);
 	});
 
-	it('prefers-reduced-motion media query exists', () => {
-		expect(contactsSrc()).toMatch(/prefers-reduced-motion: reduce/);
+	// QURATOR-368d FLIP-BACK (as the 368b re-point asked): slice b deleted the chevron and its
+	// reduced-motion block; slice d brought a transition back — the column's hover-to-expand
+	// `flex-basis` animation — together with its guard. What must hold: every element with a
+	// `transition:` in this page's styles is switched to `transition: none` under
+	// prefers-reduced-motion, and the JS path settles instantly (pinned in
+	// contacts-q368-hover-expand.test.ts). P-10 MUTATION (orchestrator): delete the
+	// `@media (prefers-reduced-motion: reduce) { .contacts-col { transition: none; } }` line → REDS.
+	it('every row/column transition has its prefers-reduced-motion guard', () => {
+		const s = contactsSrc();
+		const styles = s.slice(s.indexOf('<style>')).replace(/\/\*[\s\S]*?\*\//g, '');
+		const guard = styles.match(/@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{([^}]*)\}/);
+		expect(guard, 'a prefers-reduced-motion block exists').not.toBeNull();
+		const guarded = (guard as RegExpMatchArray)[1];
+		expect(guarded).toMatch(/transition:\s*none/);
+		// Every selector that declares a transition must appear in the guard block.
+		const withTransition = [...styles.matchAll(/\n\s*([.#][^{\n]+?)\s*\{[^}]*transition:\s*(?!none)[^;]+;/g)].map((m) => m[1].trim());
+		expect(withTransition.length, 'the page declares at least the column transition').toBeGreaterThan(0);
+		for (const sel of withTransition) expect(guarded, `${sel} is reduced-motion guarded`).toContain(sel);
 	});
 
 	it('closeDragPopover restores focus to the row that opened the namer', () => {

@@ -2,6 +2,7 @@
 	import { discoverPeople, follow, refreshContact, unfollowContact, setContactTags, groupsGet, groupsCreate, groupsDelete, groupsAssign, groupsUnassign, groupsCreateWithMembers, contactUpdateGroups, browsePrivateCollections, applyKeyGrants, onlineCount, relayStatus, getContacts, privateAudienceList, privateAudienceSet, type OnlineCount, type RelayHealth } from '$lib/api.js';
 	import { contacts, toast, toastWithAction, contactsLoadError, loadContactsInto } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
+	import { expandedColumnWidth } from '$lib/contacts-expand.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
 	import OverflowMenu from '$lib/components/OverflowMenu.svelte';
 	// M22 W8 — ONE shared group-membership editor (extracted from the W5b inline popover) used by
@@ -25,9 +26,6 @@
 	import { petnameFor } from '$lib/identity-display.js';
 	// M21 W4 — fixed word→hue table for the coloured fingerprint (rendering-only; Rust picks the word).
 	import { fingerprintWordColor } from '$lib/fingerprint-colors.js';
-	// M23 W6 — pure overflow predicate for the bio `more ⌄` control (the DOM read lives in the
-	// `bioMeasure` action below; this seam is what the unit test pins).
-	import { bioOverflows } from '$lib/bio-overflow.js';
 	import { fmtBytes } from '$lib/discover-book.js';
 	// M17 W5 — presence honesty: "checked {t}" (our cache) vs "Last seen {t}" (their beacon).
 	import { PRESENCE_TICK_MS, PRESENCE_WINDOW_MS, checkedLabel, freshIndex, newestSeen, presenceView, type PresenceView } from '$lib/presence-view.js';
@@ -188,7 +186,7 @@
 	// so the selection is updated BEFORE dragstart fires — dragstart reads the current selection to
 	// decide whether to carry the whole set or just the dragged row.
 	function onContactMouseDown(e: MouseEvent, npub: string) {
-		// Ignore clicks on an inner control (chevron, Browse, Message, ⋯) so they keep their own
+		// Ignore clicks on an inner control (Browse, Message, ⋯) so they keep their own
 		// action instead of also toggling the selection.
 		if ((e.target as HTMLElement).closest('button, a')) return;
 		const r = applyClickToSelection(selectedNpubs, selectionAnchor, contactOrder, npub, e.shiftKey, e.metaKey || e.ctrlKey);
@@ -885,11 +883,12 @@
 	// points call back through `openAddContact`, same funnel as before.
 	let addContactPanelOpen = $state(false);
 
-	// Contacts list state (M15 W5: chevron toggles the light-detail area; browsing a peer's
-	// collections moved to the Browse tab via the `/browse?peer=` deep-link — no inline expansion).
+	// Contacts list state (QURATOR-368 slice b: a row CLICK selects the contact into the right
+	// pane; browsing a peer's collections moved to the Browse tab via the `/browse?peer=`
+	// deep-link, reached by DOUBLE-click — but only when the row has a collection).
 	let detailExpanded: string | null = $state(null);
 	// QURATOR-360 F1: the right pane shows the OPEN contact (r5 state d), keyed on the same
-	// detailExpanded the chevron writes; the row keeps its own open styling via isOpen.
+	// detailExpanded the row click writes; the row keeps its own open styling via isOpen.
 	const openPeer = $derived($contacts.find((c) => c.npub === detailExpanded) ?? null);
 	// "N% like you" for the pane header: read from the ONE source (discover_people, the command
 	// DiscoverBook uses), cached so one fetch serves every selection; unknown -> the line is absent.
@@ -911,46 +910,14 @@
 	let refreshing: string | null = $state(null);
 	let menuOpenFor: string | null = $state(null);
 	let menuAnchor: HTMLElement | undefined = $state();
-	// M21 W4 — bio "more ⌄" expansion on the card face. Per-npub so each card expands independently.
-	// Cleared when the card is opened via `›` (the detail's full bio replaces the clamp; two controls
-	// revealing the same text would be redundant).
-	let bioExpanded: Record<string, boolean> = $state({});
-
-	function toggleBio(npub: string) {
-		bioExpanded[npub] = !bioExpanded[npub];
-		bioExpanded = { ...bioExpanded };
-	}
-
-	function toggleDetail(npub: string) {
-		const opening = detailExpanded !== npub;
-		detailExpanded = opening ? npub : null;
-			if (opening) void loadLikeness();
-		// M21 W4 — opening the detail reveals the full bio there, so the face's `more ⌄` control
-		// must collapse (the two controls would otherwise reveal the same text). Reset only on open;
-		// closing the detail leaves the bio as-is.
-		if (opening && bioExpanded[npub]) {
-			bioExpanded[npub] = false;
-			bioExpanded = { ...bioExpanded };
-		}
-	}
-
-	// M23 W6 — bio "more ⌄" overflow detection. The clamp is 2 VISUAL lines; whether a string wraps
-	// depends on card width, font and zoom, so this is a MEASUREMENT (scrollHeight > clientHeight on
-	// the clamped `.card-bio`), not a character count. Re-evaluated on resize via ResizeObserver so a
-	// window-width change that un-wraps the bio drops the control. Per CLAUDE.md §7, mutate
-	// bioOverflowMap[npub] directly rather than reassigning a spread object (concurrent updates from
-	// multiple cards would otherwise lose entries).
-	let bioOverflowMap: Record<string, boolean> = $state({});
-	function bioMeasure(row: HTMLElement, npub: string) {
-		const bio = row.querySelector<HTMLElement>('.card-bio');
-		const measure = () => {
-			if (!bio) return;
-			bioOverflowMap[npub] = bioOverflows(bio.scrollHeight, bio.clientHeight);
-		};
-		measure();
-		const ro = new ResizeObserver(measure);
-		if (bio) ro.observe(bio);
-		return { destroy: () => ro.disconnect() };
+	function selectContact(npub: string) {
+		// QURATOR-368 slice b — a click SELECTS; it never toggles closed (the click is the only way
+		// to open a contact now). Re-clicking the open row keeps it selected.
+		const changed = detailExpanded !== npub;
+		detailExpanded = npub;
+		if (changed) void loadLikeness();
+		// QURATOR-368 slice c — the face bio and its clamp control are gone (the pane shows the
+		// full bio), so there is no face clamp state left to reset on selection.
 	}
 
 	// M21 W4 — the npub came off the card face (behaviour 1); "Copy npub" is its surviving home.
@@ -1113,24 +1080,131 @@
 	// QURATOR-342 lane B — the Name view collapses its A-Z sections into ONE "Everyone else"
 	// section (the A-Z rail and per-letter jumps went with it); the Groups view is untouched, so
 	// drag-to-group, the Ungrouped target and the group strip keep their drop surfaces.
-	// QURATOR-342 review — a double-click's FIRST click also fires `click`. Navigating at once
-	// unmounted the page before `dblclick` (→ Chat) could land, so the row's double-click-to-message
-	// path was dead. The single-click Browse is held for the double-click window and cancelled by a
-	// double-click (Chat still wins a double-click, as before 342).
+	// QURATOR-368 slice b — a double-click's FIRST click also fires `click`. Navigating at once
+	// unmounted the page before `dblclick` could land, so the single-click SELECT is held for the
+	// double-click window; a double-click cancels it ONLY when the row can actually Browse (it
+	// navigates instead). With no collection the second click is a no-op and the held select still
+	// lands — never discarded.
 	const ROW_CLICK_DELAY_MS = 250;
-	let rowBrowseTimer: ReturnType<typeof setTimeout> | undefined;
-	function cancelRowBrowse() {
-		if (rowBrowseTimer !== undefined) clearTimeout(rowBrowseTimer);
-		rowBrowseTimer = undefined;
+	let rowSelectTimer: ReturnType<typeof setTimeout> | undefined;
+	function cancelRowSelect() {
+		if (rowSelectTimer !== undefined) clearTimeout(rowSelectTimer);
+		rowSelectTimer = undefined;
 	}
-	function scheduleRowBrowse(npub: string) {
-		cancelRowBrowse();
-		rowBrowseTimer = setTimeout(() => {
-			rowBrowseTimer = undefined;
-			goto('/browse?peer=' + encodeURIComponent(npub));
+	function scheduleRowSelect(npub: string) {
+		cancelRowSelect();
+		rowSelectTimer = setTimeout(() => {
+			rowSelectTimer = undefined;
+			selectContact(npub);
 		}, ROW_CLICK_DELAY_MS);
 	}
-	onDestroy(cancelRowBrowse);
+	onDestroy(collapseHover);
+	onDestroy(cancelRowSelect);
+
+	// QURATOR-368 slice d — hover-to-expand. Hover (or keyboard focus) on a card animates the
+	// column to a FIXED expanded width (rest 300 → 540); the right pane shrinks by the same
+	// amount and never grows past its rest width — its content keeps the REST width and is
+	// CLIPPED, not dimmed and not reflowed. Hover NEVER selects; only click does (slice b).
+	// Owner rulings, 2026-10-14. The right pane has a 320px floor: the expansion is capped to
+	// what fits above it (lib/contacts-expand.ts), and when nothing fits there is no expansion.
+	const HOVER_INTENT_MS = 120; // short hover-intent delay
+	const HOVER_CLOSE_MS = 160;  // leave the column → collapse after this delay
+	let columnEl: HTMLElement | undefined = $state();
+	let hotNpub: string | null = $state(null);         // the card under the pointer / focus
+	let colExpanded = $state(false);                   // the column is expanded (basis > rest)
+	let colSettled = $state(false);                    // flex-basis transition finished → inline actions render
+	let colExpandWidth = $state<number | null>(null);  // capped expanded basis in px (floor-respecting)
+	let paneRestW = $state<number | null>(null);       // right pane's measured rest width, for the clip
+	let hoverOpenT: ReturnType<typeof setTimeout> | undefined;
+	let hoverCloseT: ReturnType<typeof setTimeout> | undefined;
+	let expandMq: MediaQueryList | undefined = typeof matchMedia === "function" ? matchMedia("(prefers-reduced-motion: reduce)") : undefined;
+
+	function paneRestWidth(): number {
+		// Measured only while AT REST (before expanding): body width − gap − column width.
+		const body = columnEl?.parentElement;
+		if (!columnEl || !body) return 0;
+		const gap = parseFloat(getComputedStyle(body).columnGap) || 0;
+		return Math.max(0, body.clientWidth - gap - columnEl.clientWidth);
+	}
+
+	function beginHoverIntent(npub: string) {
+		if (view === 'discover') return;
+		if (hoverCloseT !== undefined) {
+			clearTimeout(hoverCloseT);
+			hoverCloseT = undefined;
+		}
+		hotNpub = npub;
+		if (colExpanded) return; // moving between cards keeps the column open (owner ruling)
+		if (hoverOpenT !== undefined) clearTimeout(hoverOpenT);
+		hoverOpenT = setTimeout(() => {
+			hoverOpenT = undefined;
+			openHoverNow();
+		}, HOVER_INTENT_MS);
+	}
+
+	function openHoverNow() {
+		if (view === 'discover') return;
+		const w = expandedColumnWidth(paneRestWidth());
+		if (w === null) return; // the pane's 320px floor would be violated → do not expand
+		paneRestW = paneRestWidth();
+		colExpandWidth = w;
+		colExpanded = true;
+		// prefers-reduced-motion → no animation, settle immediately.
+		if (expandMq?.matches) colSettled = true;
+	}
+
+	function endHover() {
+		if (hoverOpenT !== undefined) {
+			clearTimeout(hoverOpenT);
+			hoverOpenT = undefined;
+		}
+		if (hoverCloseT !== undefined) clearTimeout(hoverCloseT);
+		hoverCloseT = setTimeout(() => {
+			colExpanded = false;
+			colSettled = false;
+			hotNpub = null;
+			colExpandWidth = null;
+			paneRestW = null;
+		}, HOVER_CLOSE_MS);
+	}
+
+	function collapseHover() {
+		if (hoverOpenT !== undefined) clearTimeout(hoverOpenT);
+		if (hoverCloseT !== undefined) clearTimeout(hoverCloseT);
+		hoverOpenT = undefined;
+		hoverCloseT = undefined;
+		colExpanded = false;
+		colSettled = false;
+		hotNpub = null;
+		colExpandWidth = null;
+		paneRestW = null;
+	}
+
+	// Entering the Discover view removes the rows and the right pane outright — collapse there.
+	$effect(() => {
+		if (view === 'discover') collapseHover();
+	});
+
+	function onColumnPointerOver(e: PointerEvent) {
+		const card = (e.target as HTMLElement).closest('.contact-card');
+		if (card instanceof HTMLElement && card.dataset.npub) beginHoverIntent(card.dataset.npub);
+	}
+	function onColumnPointerLeave() {
+		endHover();
+	}
+	function onColumnFocusIn(e: FocusEvent) {
+		const card = (e.target as HTMLElement).closest('.contact-card');
+		if (card instanceof HTMLElement && card.dataset.npub) beginHoverIntent(card.dataset.npub);
+	}
+	function onColumnFocusOut(e: FocusEvent) {
+		if (!columnEl?.contains(e.relatedTarget as Node)) endHover();
+	}
+	function onColExpandTransitionEnd(e: TransitionEvent) {
+		// Inline actions render only after the widening has SETTLED (draft: no mid-animation
+		// reflow). Guard like the draft: the column's own flex-basis transition, while expanded.
+		if (e.target !== columnEl || e.propertyName !== 'flex-basis' || !colExpanded) return;
+		colSettled = true;
+	}
 
 	let sections = $derived.by(() => {
 		if (view === 'groups') return groupByGroups(visible, groups);
@@ -1188,7 +1262,19 @@
 </div>
 
 <div class="contacts-body">
-<div class="contacts-col hb-pane" class:col-toggle-only={view === 'discover'}>
+<div
+	class="contacts-col hb-pane"
+	class:col-toggle-only={view === 'discover'}
+	class:col-expanded={colExpanded}
+	class:col-settled={colSettled}
+	bind:this={columnEl}
+	style:flex-basis={colExpanded && colExpandWidth !== null ? `${colExpandWidth}px` : undefined}
+	onpointerover={onColumnPointerOver}
+	onpointerleave={onColumnPointerLeave}
+	onfocusin={onColumnFocusIn}
+	onfocusout={onColumnFocusOut}
+	ontransitionend={onColExpandTransitionEnd}
+>
 
 <!-- List-column sub-header: free-text search + Name|Groups view toggle. "+ Add contact" moved to
      the topbar (QURATOR-342 lane B) to keep the 300px column to search + toggle. -->
@@ -1214,37 +1300,41 @@
 	{@const badge = peerAccessBadge(peer)}
 	{@const fp = peer.fingerprint}
 	<!-- M21 W4 behaviour 2: presence + cache-age are INDEPENDENT. The pill always answers "are they
-	     online" (Stale no longer replaces Offline — it stops reporting presence). The cold-cache marker
-	     (isStale && !online) renders in the meta line as an amber "checked {t} ↻" control, not a verdict. -->
-	{@const coldCache = isStale(peer) && !peer.online}
-	<!-- M21 W4 behaviour 6: public collections only — the popover list AND the face count read the same
-	     filtered set so the number and the list can never disagree (a disclosure boundary, not cosmetic). -->
+	     online" (Stale no longer replaces Offline — it stops reporting presence). The cold-cache
+	     "checked {t} ↻" refresh control moved to the right pane in QURATOR-368 slice c. -->
+	<!-- M21 W4 behaviour 6: public collections only — the face count AND the pane's plain list read
+	     the same filtered set so the number and the list can never disagree (a disclosure boundary,
+	     not cosmetic). -->
 	{@const publicCollections = peer.collections.filter(c => c.visibility !== 'Private')}
 	{@const pubCount = publicCollections.length}
-	{@const sizeSummary = !badge.locked ? summarizeCollectionsSize(publicCollections) : null}
 	{@const profileTotal = peer.profile?.total_bytes}
 	{@const lookingFor = peer.profile?.looking_for}
 	<!-- M21 W4 behaviour 5: the petnameFor collision warning goes on the card face. The fingerprint is
 	     a 67-bit grind, so this red-outlined badge is the actual security control. -->
 	{@const contactsForLabel = $contacts.map(c => ({ npub: c.npub, petname: c.petname ?? c.profile?.display_name ?? '' }))}
 	{@const collision = petnameFor(peer.npub, name, contactsForLabel).warning}
-	{@const bio = peer.profile?.bio?.trim()}
-	{@const bioOpen = bioExpanded[peer.npub] ?? false}
 	{@const isOpen = detailExpanded === peer.npub}
+	<!-- QURATOR-368 slice b — "has a collection" = what the row can actually Browse: public
+	     collections PLUS private ones shared with you. Never the size total alone. -->
+	{@const hasCollections = pubCount > 0 || (privateByAuthor[peer.npub] ?? []).length > 0}
 	<div class="contact-block" class:open={isOpen}>
-		<!-- devtest v0.12.1 #4: double-click a contact to open the conversation in Chat. The chevron,
-		     Browse, and ⋯ controls keep their own single-click actions. -->
+		<!-- QURATOR-368 slice b: single-click SELECTS the contact into the right pane; double-click
+		     Browses, but ONLY when the row has a collection. The first click of a double-click also
+		     fires `click`, so the select is held 250 ms and cancelled by a collection-bearing
+		     double-click — no selection flash on Browse. -->
 		<!-- M22 W3: the contact-card is also a drag source AND a drop target for drag-to-group.
 		     dragstart writes the source npub; dragover lights the target + states the outcome;
 		     drop opens the naming popover. -->
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
-		<!-- Ignore double-clicks that land on an inner control (chevron, Browse, ⋯ menu) so they keep
-		     their own single-click action instead of also navigating to Chat (codex review). -->
+		<!-- Ignore clicks and double-clicks that land on an inner control (⋯ menu, row buttons) so
+		     they keep their own single-click action instead of also selecting or Browse-navigating. -->
 		<!-- M22 W7 — role/aria + roving tabindex: one row in the list owns tabindex=0 (the focused
 		     one, or the first when none is focused yet); the rest carry -1 so arrow keys move a
 		     single tab stop through the list rather than tabbing through every row. -->
 		<div
 			class="contact-card"
+			data-npub={peer.npub}
+			class:hot={hotNpub === peer.npub}
 			class:contact-selected={selectedNpubSet.has(peer.npub)}
 			class:drag-source={dragSourceNpub === peer.npub}
 			class:drag-target={dragSourceNpub !== null && dragOverNpub === peer.npub && dragSourceNpub !== peer.npub}
@@ -1262,21 +1352,35 @@
 			ondragleave={(e) => onDragLeave(e, peer.npub)}
 			ondrop={(e) => onDrop(e, peer.npub)}
 			ondragend={onDragEnd}
-			ondblclick={(e) => { if ((e.target as HTMLElement).closest('button, a')) return; cancelRowBrowse(); goto('/chat?peer=' + peer.npub); }}
-			onclick={(e) => {
-				// QURATOR-342 lane B — a PLAIN click on the row opens the person in Browse (owner
-				// ruling: row click opens Browse; no detail pane). Modifier-clicks keep selection
-				// semantics; clicks on an inner control keep that control's own action.
+			ondblclick={(e) => {
+				// QURATOR-368 slice b — double-click = Browse, but ONLY when the row has something
+				// to browse (public + private-shared collections; never the size total alone).
+				// Inner controls and modifier-clicks keep their own semantics. With no collection
+				// the double-click does nothing extra: the held select still lands — do NOT cancel
+				// it here, a silently discarded first click would leave the pane closed.
 				if (e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;
 				if ((e.target as HTMLElement).closest('button, a, input')) return;
-				scheduleRowBrowse(peer.npub);
+				if (!hasCollections) return;
+				cancelRowSelect();
+				goto('/browse?peer=' + encodeURIComponent(peer.npub));
 			}}
-			title="Double-click to message in Chat"
+			onclick={(e) => {
+				// QURATOR-368 slice b — a PLAIN click on the row SELECTS the person into the right
+				// pane (owner ruling: click selects; hover NEVER does). Modifier-clicks keep
+				// selection semantics; clicks on an inner control keep that control's own action.
+				if (e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;
+				if ((e.target as HTMLElement).closest('button, a, input')) return;
+				scheduleRowSelect(peer.npub);
+			}}
+			onkeydown={(e) => {
+				// Keyboard parity — Enter selects the focused row, same as click.
+				if (e.key !== 'Enter' || e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;
+				if ((e.target as HTMLElement).closest('button, a, input')) return;
+				e.preventDefault();
+				scheduleRowSelect(peer.npub);
+			}}
+			title={hasCollections ? 'Double-click to browse' : undefined}
 		>
-			<!-- svelte-ignore a11y_click_events_have_key_events -->
-			<button class="chevron-btn" onclick={() => toggleDetail(peer.npub)} aria-expanded={isOpen} aria-label="Toggle details">
-				<span class="chevron" class:chevron-open={isOpen}>{@html icons.chevronDown}</span>
-			</button>
 			<div class="avatar-wrap" style={fp ? `box-shadow: 0 0 0 2px var(--bg-elev1), 0 0 0 4px ${fp.colorHex}` : undefined}>
 				<Avatar letter={initial} size={34} {hue} picture={peer.profile?.picture} />
 				{#if badge.locked}
@@ -1284,51 +1388,40 @@
 				{/if}
 			</div>
 			<div class="contact-info">
-				<!-- Row 1: name · presence pill · (offline) seen · spacer · actions.
-				     M21 W4 behaviour 1: the npub is OFF the face (the pill takes its slot). The npub
-				     survives in the ⋯ menu ("Copy npub") and in the expanded detail. -->
+				<!-- QURATOR-368 slice c — the row at rest is EXACTLY TWO lines and never wraps.
+				     Line 1: name (ellipsises) · collision badge · presence pill · size (right-aligned).
+				     M21 W4 behaviour 1 still holds: the npub is OFF the face (it lives in the pane's
+				     Identity block and the ⋯ menu, now on the pane). -->
 				<div class="name-row">
 					<span class="peer-name">{name}</span>
 					{#if collision}
 						<span class="collision-badge" title={collision}>⚠ {collision}</span>
 					{/if}
-					{#if true}
-						<!-- QURATOR-135: `presence.online === null` means the presence query has not ANSWERED yet — the
-						     row must say what is true ("Checking…"), never assert "Offline" on absence-of-data.
-							     QURATOR-216: once the query HAS answered, a beacon-less contact
-							     is a real Offline. -->
-						{@const presence = presenceOf(peer)}
-						{#if peer.online}
-							<span class="pill pill-online"><span class="pill-dot"></span></span>
-						{:else if presence.online === null}
-							<span class="pill pill-unknown" title="The presence query hasn't answered yet — checking.">Checking…</span>
-						{:else}
-							<span class="pill pill-offline">Offline</span>
-						{/if}
-						<!-- W5: THEIR presence (only when offline — the pill already says "online"). -->
-						{#if !peer.online && presence.online !== null}
-							<span class="last-seen">{presence.lastSeen}</span>
-						{/if}
+					<!-- QURATOR-368 (owner ruling, draft): line 1 carries the ONLINE pill only. Offline and
+					     "Checking…" are said once, as text on line 2 — never as a second pill here. -->
+					{#if peer.online}
+						<span class="pill pill-online"><span class="pill-dot"></span></span>
 					{/if}
-					<div style="flex:1"></div>
 					{#if profileTotal}
 						<!-- QURATOR-351 state d: THEIR published total, right-aligned on the name row.
 						     No profile total, or 0 -> no span (never a fabricated "0 B"). -->
 						<span class="row-size">{fmtBytes(profileTotal)}</span>
 					{/if}
-
-					{#if pubCount > 0}
-						<span class="row-count" title="{pubCount} public collection{pubCount !== 1 ? 's' : ''}">{pubCount}</span>
+					<!-- QURATOR-368d — the inline row actions (Browse · Message · ⋯) sit at the END OF LINE 1 (draft
+					     `.l1 … .acts-in`; owner: "the row no longer grows on hover") and render ONLY in the
+					     settled state, after the flex-basis transitionend, so nothing reflows
+					     mid-animation. Browse appears only when the row has something to browse (the
+					     same hasCollections predicate slice b's double-click uses). The ⋯ reuses the
+					     row's own OverflowMenu (menuOpenFor + menuAnchor) — not a second menu. -->
+					{#if colSettled && hotNpub === peer.npub}
+						<div class="row-acts">
+							{#if hasCollections}
+								<button class="row-act" onclick={() => goto('/browse?peer=' + encodeURIComponent(peer.npub))}>Browse</button>
+							{/if}
+							<button class="row-act" onclick={() => goto('/chat?peer=' + peer.npub)}>Message</button>
+							<button class="row-act row-more" aria-label="Contact actions" aria-haspopup="true" aria-expanded={menuOpenFor === peer.npub} onclick={(e) => openRowMenu(peer.npub, e.currentTarget)}>⋯</button>
+						</div>
 					{/if}
-					<a class="btn-default btn-xs" href="/browse?peer={peer.npub}">Browse</a>
-					<button class="btn-default btn-xs" onclick={() => goto('/chat?peer=' + peer.npub)}>Message</button>
-					<button
-						class="row-menu-btn"
-						aria-label="Contact actions"
-						aria-haspopup="true"
-						aria-expanded={menuOpenFor === peer.npub}
-						onclick={(e) => openRowMenu(peer.npub, e.currentTarget)}
-					>⋯</button>
 				</div>
 				<!-- M22 W3 — the Aim moment: when this row is the active drop target, state the outcome in
 				     words (not an icon). Other rows recede (handled by .drag-recede on the card). -->
@@ -1337,93 +1430,49 @@
 					     drag, "group N contacts" for a multi-select drag of N (including the target). -->
 					<div class="drag-outcome">{dragCount > 0 ? `group ${dragCount + 1} contacts` : 'group these two'}</div>
 				{/if}
-				<!-- Row 2: coloured fingerprint (behaviour 3). Absent for a pre-fingerprint stored
-				     contact (behaviour 4: no ring, no word row, card otherwise unchanged). -->
-				{#if fp}
-					<div class="fp-row">
+				<!-- QURATOR-368 slice c — Line 2: fingerprint words · "N collections" (labelled text,
+				     replacing the bare count; the hoverable popover is GONE — the list is a plain block
+				     in the right pane now) · presence text. The bio, the group chips (+ their drag-to-group
+				     drop targets) and the cold-cache refresh control moved to the pane with it. -->
+				<div class="meta-row">
+					{#if fp}
+						<!-- Coloured fingerprint (M21 W4 behaviour 3). Absent for a pre-fingerprint stored
+						     contact (behaviour 4: no ring, no words, card otherwise unchanged). -->
 						{#each fp.words as w, i}
 							{#if i > 0}<span class="fp-sep">·</span>{/if}
 							<span class="fp-word" style={fingerprintWordColor(w) ? `color:${fingerprintWordColor(w)}` : undefined}>{w}</span>
 						{/each}
-					</div>
-				{/if}
-				<!-- Row 3: bio, clamped to 2 lines with a `more ⌄` control (behaviour 7: the detail's
-				     duplicate bio paragraph is gone, so this clamp is the only place the bio previews). -->
-				{#if bio}
-					<div class="bio-row" class:bio-expanded={bioOpen || isOpen} use:bioMeasure={peer.npub}>
-						<p class="card-bio">{bio}</p>
-						{#if !bioOpen && !isOpen && bioOverflowMap[peer.npub]}
-							<button class="bio-more" onclick={() => toggleBio(peer.npub)}>more ⌄</button>
-						{/if}
-					</div>
-				{:else}
-					<div class="bio-row bio-empty"><span class="no-bio">No bio published.</span></div>
-				{/if}
-				<!-- Row 4: group chips · N collections (hoverable, public only) · size · cold-cache.
-				     M22 W4: each chip is ALSO a drop target (nearer than the section heading).
-				     stopPropagation on dragover/drop so the card's W3 create-gesture doesn't also fire. -->
-				<div class="contact-sub-row">
-					{#each peerGroups as gname (gname)}
-						{@const gcolor = groupColor(gname)}
-						<span
-							class="group-pill"
-							class:group-drop-active={dropOverTarget === gname && dropOutcome && dropOutcome.kind !== 'refused' && dropOutcome.kind !== 'noop'}
-							class:group-drop-refused={dropOverTarget === gname && dropOutcome && (dropOutcome.kind === 'refused' || dropOutcome.kind === 'noop')}
-							ondragover={(e) => { e.stopPropagation(); onGroupDragOver(e, gname); }}
-							ondragleave={(e) => { e.stopPropagation(); onGroupDragLeave(e, gname); }}
-							ondrop={(e) => { e.stopPropagation(); onGroupDrop(e, gname); }}
-						>
-							{#if gcolor}<span class="group-dot" style={`background:${gcolor}`}></span>{/if}
-							{gname}
-						</span>
-					{/each}
-					<!-- M21 W5b: `+` opens a membership popover anchored to this row. Since devtest item 3
-					     ruling 01 it is the ONLY group editor on this page. Full-set Apply. -->
-					{#if groups.length > 0}
-						<button
-							class="group-add-btn"
-							aria-label="Edit {name}'s groups"
-							aria-haspopup="true"
-							aria-expanded={groupPopoverFor === peer.npub}
-							onclick={(e) => openGroupPopover(peer.npub, e.currentTarget)}
-						>+</button>
+						<span class="sub-dot">·</span>
 					{/if}
-					{#if peerGroups.length > 0 || groups.length > 0}<span class="sub-dot">·</span>{/if}
+					<!-- M21 W4 behaviour 6 disclosure boundary kept: PUBLIC collections only — the pane's
+					     list reads the same filtered set, so the count and the list can never disagree. -->
 					{#if pubCount > 0}
-						<span class="sub-dot">·</span>
-						<!-- M21 W4 behaviour 6: `▼` caret signals hoverable; :focus-within makes it
-						     keyboard-reachable too; public collections ONLY (private ones live in the
-						     detail, never in this popover or this count). -->
-						<span class="collections-popover-wrap" tabindex="0" role="button" aria-label="Show public collections">
-							<span class="sub-meta collections-trigger">{pubCount} collection{pubCount !== 1 ? 's' : ''} ▼</span>
-							<div class="collections-popover" role="dialog">
-								{#each publicCollections as col (col.slug)}
-									<div class="cpop-row" title={col.description ?? ''}>
-										<span class="cpop-alias">{col.path_alias}</span>
-										<span class="cpop-size">{col.est_size ?? '—'}</span>
-										<span class="cpop-desc">{col.description ?? 'No description'}</span>
-									</div>
-								{/each}
-								<div class="cpop-footer">Public collections only. Private ones show in the expanded card.</div>
-							</div>
-						</span>
+						<span class="sub-meta">{pubCount} collection{pubCount !== 1 ? 's' : ''}</span>
+					{:else}
+						<span class="sub-meta">No public collections</span>
 					{/if}
-					{#if !badge.locked}
-						{#if sizeSummary}<span class="sub-dot">·</span><span class="sub-meta">{sizeSummary}</span>
-						{:else if peer.profile?.est_size}<span class="sub-dot">·</span><span class="sub-meta">~{peer.profile.est_size}</span>{/if}
-					{/if}
-					<!-- Cold cache: an amber "checked {t} ↻" CONTROL (clickable to refresh), only when
-					     isStale && !online. When the cache is warm this element is absent from the card. -->
-					{#if coldCache}
+					<!-- QURATOR-135: `presence.online === null` means the presence query has not ANSWERED yet — the
+					     row must say what is true ("Checking…"), never assert "Offline" on absence-of-data.
+					     QURATOR-216: once the query HAS answered, a beacon-less contact is a real Offline.
+					     The state classes (pill-offline / pill-unknown) ride on this text, which is the ONE
+					     place the row says it (QURATOR-368: no second pill on line 1). -->
+					{#if !peer.online}
+						{@const presence = presenceOf(peer)}
 						<span class="sub-dot">·</span>
-						<button class="cold-cache" onclick={() => handleRefresh(peer.npub)} disabled={refreshing === peer.npub} title="Refetch this contact">{checkedLabel(peer.last_fetched, nowMs)} ↻</button>
+						{#if presence.online !== null && presence.lastSeen && presence.lastSeen !== 'Last seen: unknown'}
+							<span class="last-seen pill-offline">Offline · {presence.lastSeen}</span>
+						{:else if presence.online === null}
+							<span class="last-seen pill-unknown" title="The presence query hasn't answered yet — checking."><i>Checking…</i></span>
+						{:else}
+							<span class="last-seen pill-offline">Offline</span>
+						{/if}
 					{/if}
 				</div>
 			</div>
 		</div>
 
-		<!-- QURATOR-360 F1: the inline detail moved to the right pane (r5 state d) — the chevron
-		     (toggleDetail) still selects; the pane renders .contact-detail for detailExpanded. -->
+		<!-- QURATOR-360 F1 + QURATOR-368 slice b: the inline detail moved to the right pane (r5
+		     state d) — the row CLICK selects; the pane renders .contact-detail for detailExpanded. -->
 	</div>
 
 	<!-- M15 W5: per-row overflow menu (only one open at a time via menuOpenFor). -->
@@ -1443,25 +1492,11 @@
 		</div>
 	</OverflowMenu>
 
-	<!-- M21 W5b / M22 W8: group-membership popover anchored to the face chip row. The editor is the
-	     ONE GroupMembershipPopover component (used by Browse too) — OverflowMenu positioning +
-	     Escape, seeded draft, full-set Apply via contactUpdateGroups, "+ New group…", and focus-return
-	     to the invoking row all live there. This page supplies only the anchor + callbacks. -->
-	<GroupMembershipPopover
-		open={groupPopoverFor === peer.npub}
-		anchor={groupPopoverAnchor}
-		contactName={name}
-		groups={groups}
-		memberships={contactGroups(peer.npub)}
-		ready={groupsLoaded}
-		onapply={(names) => applyGroupPopover(peer.npub, names)}
-		onclose={() => (groupPopoverFor = null)}
-		onnewgroup={() => (createGroupOpen = true)}
-		returnFocusTo={() => {
-			const el = document.getElementById(rowId(ROW_ID_PREFIX, peer.npub));
-			return el?.isConnected ? el : undefined;
-		}}
-	/>
+	<!-- M21 W5b / M22 W8 / QURATOR-368 slice c: the group-membership popover moved WITH the chips
+	     into the right pane (its `+` and the ⋯ "Edit groups…" trigger both live there now). The
+	     editor is still the ONE GroupMembershipPopover component (used by Browse too) — OverflowMenu
+	     positioning + Escape, seeded draft, full-set Apply via contactUpdateGroups, "+ New group…",
+	     and focus-return to the invoking row all live there; this page supplies anchor + callbacks. -->
 {/snippet}
 
 {#if view !== 'discover'}
@@ -1575,10 +1610,10 @@
 {/if}
 	</div>
 	<!-- QURATOR-360 F1 (r5 state d): the right pane is the OPEN CONTACT's detail — the old
-	     lane-C likes panel is deleted; its likeness readout lives on in DiscoverBook. The pane
-	     reuses the row's own actions (Browse / Message / ⋯ via openRowMenu), then the
-	     .contact-detail content moved out of the row. Glass rule: hb-pane never scrolls itself
-	     — .detail-scroll is the inner scroller (settings-page pattern, 0e013161). -->
+	     lane-C likes panel is deleted; its likeness readout lives on in DiscoverBook. Since
+	     QURATOR-368 slice c the pane carries the row's actions (Browse / Message / ⋯ via
+	     openRowMenu) outright — the row renders no controls. Glass rule: hb-pane never scrolls
+	     itself — .detail-scroll is the inner scroller (settings-page pattern, 0e013161). -->
 	{#if view === 'discover'}
 	<div class="discover-pane hb-pane">
 		<div class="detail-scroll">
@@ -1586,7 +1621,8 @@
 		</div>
 	</div>
 {:else}
-<div class="detail-pane hb-pane">
+<div class="detail-pane hb-pane" class:pane-clipping={colExpanded}>
+	<div class="detail-clip" style:width={paneRestW !== null ? `${paneRestW}px` : undefined}>
 	{#if openPeer}
 		{@const peer = openPeer}
 		{@const lookingFor = peer.profile?.looking_for}
@@ -1594,8 +1630,16 @@
 		{@const hue = avatarHue(initial)}
 		{@const fp = peer.fingerprint}
 		{@const profTotal = peer.profile?.total_bytes}
-		{@const paneSize = profTotal ? fmtBytes(profTotal) : summarizeCollectionsSize(peer.collections.filter((c) => c.visibility !== 'Private'))}
+		<!-- QURATOR-368 slice c: the same filtered public set the row's count reads — one disclosure
+		     boundary, so the count and this list can never disagree. -->
+		{@const publicCollections = peer.collections.filter((c) => c.visibility !== 'Private')}
+		{@const paneSize = profTotal ? fmtBytes(profTotal) : summarizeCollectionsSize(publicCollections)}
 		{@const paneLike = openLikeness[peer.npub]}
+		{@const paneName = contactDisplayName(peer)}
+		{@const paneBio = peer.profile?.bio?.trim()}
+		{@const paneBadge = peerAccessBadge(peer)}
+		{@const paneGroups = contactGroups(peer.npub)}
+		{@const paneColdCache = isStale(peer) && !peer.online}
 		<div class="pane-head">
 			<div class="avatar-wrap" style={fp ? `box-shadow: 0 0 0 2px var(--bg-elev1), 0 0 0 4px ${fp.colorHex}` : undefined}>
 				<Avatar letter={initial} size={48} {hue} picture={peer.profile?.picture} />
@@ -1610,9 +1654,12 @@
 						{/each}
 					</div>
 				{/if}
-				{#if paneSize || paneLike != null}
+				{#if paneSize || paneLike != null || (!paneBadge.locked && peer.profile?.est_size)}
 					<div class="pane-meta">
 						{#if paneSize}<span>{paneSize}</span>{/if}
+						<!-- QURATOR-368 slice c: the row's sizeSummary / published est_size meta moved here —
+						     shown only when no computed size exists (never a fabricated duplicate). -->
+						{#if !paneSize && !paneBadge.locked && peer.profile?.est_size}<span>~{peer.profile.est_size}</span>{/if}
 						{#if paneLike != null}<span>{paneLike}% like you</span>{/if}
 					</div>
 				{/if}
@@ -1628,6 +1675,11 @@
 				aria-expanded={menuOpenFor === peer.npub}
 				onclick={(e) => openRowMenu(peer.npub, e.currentTarget)}
 			>⋯</button>
+			<!-- Cold cache: an amber "checked {t} ↻" CONTROL (clickable to refresh), only when
+			     isStale && !online — moved off the row in QURATOR-368 slice c. Warm cache: absent. -->
+			{#if paneColdCache}
+				<button class="cold-cache" onclick={() => handleRefresh(peer.npub)} disabled={refreshing === peer.npub} title="Refetch this contact">{checkedLabel(peer.last_fetched, nowMs)} ↻</button>
+			{/if}
 		</div>
 		<div class="detail-scroll">
 			<div class="contact-detail">
@@ -1635,12 +1687,12 @@
 				     should contain the rest of the bio stuff that the base card didnt have room for like
 				     region, contact, other socials if any, willing to etc"), artifact greenlit.
 
-				     The panel is now THE REST OF THE PROFILE — only facts the face has no room for —
-				     followed by your own local notes. Nothing the face already renders is repeated: the bio
-				     (face row 3), the fingerprint words (row 2), the group pills and est. size (row 4) are
-				     all absent here on purpose. Blocks are grouped by WHO OWNS THE DATA, which is a real
-				     distinction in a phonebook: `detail-theirs` is what they published and you cannot
-				     change, `detail-yours` is stored only on this machine.
+				     QURATOR-368 slice c: the face's bio, group chips and collections popover MOVED here
+				     (the row at rest is two lines now), so the panel is the rest of the profile PLUS the
+				     face's overflow facts. Still grouped by WHO OWNS THE DATA: `detail-theirs` is what
+				     they published and you cannot change, `detail-yours` is stored only on this machine.
+				     Still NOT repeated: the fingerprint words (line 2 of the row) and the computed size
+				     (pane header).
 
 				     Seven Profile fields (location, languages, willing_to, contact_hint, email,
 				     social_links, since) crossed the Tauri boundary on every contact and were rendered
@@ -1653,6 +1705,73 @@
 						<p class="looking-for">{lookingFor}</p>
 					</div>
 				{/if}
+
+				<!-- QURATOR-368 slice c: the face bio moved here, FULL — no clamp, no expand control (the
+				     clamp and its measured-overflow control were deleted with the face bio). -->
+				{#if paneBio}
+					<div class="detail-block detail-theirs">
+						<div class="block-head">Bio <em>published by them</em></div>
+						<p class="pane-bio">{paneBio}</p>
+					</div>
+				{:else}
+					<div class="detail-block detail-theirs">
+						<div class="block-head">Bio</div>
+						<div class="detail-empty">No bio published.</div>
+					</div>
+				{/if}
+
+				<!-- QURATOR-368 slice c: the hoverable collections popover became this plain list. Same
+				     public-only set the row's count reads (the disclosure boundary), same per-row facts. -->
+				{#if publicCollections.length > 0}
+					<div class="detail-block detail-theirs">
+						<div class="block-head">Public collections</div>
+						<div class="pane-cols">
+							{#each publicCollections as col (col.slug)}
+								<div class="cpop-row" title={col.description ?? ''}>
+									<span class="cpop-alias">{col.path_alias}</span>
+									<span class="cpop-size">{col.est_size ?? '—'}</span>
+									<span class="cpop-desc">{col.description ?? 'No description'}</span>
+								</div>
+							{/each}
+							<div class="cpop-footer">Public collections only. Private ones sealed to you are listed separately.</div>
+						</div>
+					</div>
+				{/if}
+
+				<!-- QURATOR-368 slice c: the face's group chips + `+` moved here. M22 W4 still holds —
+				     each chip is a drag-to-group DROP TARGET (the row no longer carries chips; the
+				     section headings and card-on-card drag are untouched). stopPropagation so a drop on a
+				     chip never also fires a card-level gesture. -->
+				<div class="detail-block detail-yours">
+					<div class="block-head">Groups <em>local to this machine</em></div>
+					<div class="pane-groups">
+						{#each paneGroups as gname (gname)}
+							{@const gcolor = groupColor(gname)}
+							<span
+								class="group-pill"
+								class:group-drop-active={dropOverTarget === gname && dropOutcome && dropOutcome.kind !== 'refused' && dropOutcome.kind !== 'noop'}
+								class:group-drop-refused={dropOverTarget === gname && dropOutcome && (dropOutcome.kind === 'refused' || dropOutcome.kind === 'noop')}
+								ondragover={(e) => { e.stopPropagation(); onGroupDragOver(e, gname); }}
+								ondragleave={(e) => { e.stopPropagation(); onGroupDragLeave(e, gname); }}
+								ondrop={(e) => { e.stopPropagation(); onGroupDrop(e, gname); }}
+							>
+								{#if gcolor}<span class="group-dot" style={`background:${gcolor}`}></span>{/if}
+								{gname}
+							</span>
+						{/each}
+						<!-- M21 W5b: `+` opens the ONE membership popover (now anchored here, beside the
+						     ⋯ menu that also reaches it via "Edit groups…"). Full-set Apply. -->
+						{#if groups.length > 0}
+							<button
+								class="group-add-btn"
+								aria-label="Edit {paneName}'s groups"
+								aria-haspopup="true"
+								aria-expanded={groupPopoverFor === peer.npub}
+								onclick={(e) => openGroupPopover(peer.npub, e.currentTarget)}
+							>+</button>
+						{/if}
+					</div>
+				</div>
 
 				<div class="detail-block detail-theirs">
 					<div class="block-head">Profile <em>published by them</em></div>
@@ -1804,9 +1923,28 @@
 				{/if}
 			</div>
 		</div>
+		<!-- M21 W5b / M22 W8 / QURATOR-368 slice c: the group-membership popover instance moved
+		     here with the chips — the row renders no editor and no anchor anymore. Both pane
+		     triggers (the `+`, and the ⋯ menu's "Edit groups…" anchored to the pane ⋯) open it. -->
+		<GroupMembershipPopover
+			open={groupPopoverFor === peer.npub}
+			anchor={groupPopoverAnchor}
+			contactName={paneName}
+			groups={groups}
+			memberships={contactGroups(peer.npub)}
+			ready={groupsLoaded}
+			onapply={(names) => applyGroupPopover(peer.npub, names)}
+			onclose={() => (groupPopoverFor = null)}
+			onnewgroup={() => (createGroupOpen = true)}
+			returnFocusTo={() => {
+				const el = document.getElementById(rowId(ROW_ID_PREFIX, peer.npub));
+				return el?.isConnected ? el : undefined;
+			}}
+		/>
 	{:else}
 		<EmptyState message="Select a contact" />
 	{/if}
+	</div>
 </div>
 {/if}
 </div>
@@ -1907,8 +2045,14 @@
 	   People-like-you pane. The list column owns the sub-header; the pane scrolls independently. */
 	.contacts-body { display: flex; flex: 1; min-height: 0; min-width: 0; gap: var(--panel-gap); } /* QURATOR-352 — pane separation in floating themes (0px in hoard). */
 	.contacts-col {
-		width: 300px;
-		min-width: 300px;
+		flex: 0 0 300px;
+		/* QURATOR-368d review: a flex item's min-width defaults to `auto` (its min-content), so a
+		   long contact name inflated the column past 300px at rest and past the capped basis on
+		   hover (measured 486 / 664px). min-width: 0 lets the basis win and the name ellipsise. */
+		min-width: 0;
+		/* QURATOR-368d — hover-to-expand: the column animates its flex-basis (260ms, draft ease);
+		   the rest basis is 300px, expanded basis arrives as an inline style (floor-capped). */
+		transition: flex-basis 260ms cubic-bezier(.2, .7, .2, 1);
 		display: flex;
 		flex-direction: column;
 		border-right: 1px solid var(--border);
@@ -1919,12 +2063,16 @@
 	:global(:root[data-glass-float]) .contacts-col { border-right: 0; }
 	/* QURATOR-360 F1: right pane = the open contact's detail. Glass rule: hb-pane must not
 	   scroll itself — the inner .detail-scroll is the scroller (settings-page pattern). */
-	.detail-pane { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; padding: 16px 20px 24px; }
+	.detail-pane { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; padding: 16px 20px 24px; overflow: hidden; }
+	/* QURATOR-368d — while the column is expanded the pane shrinks; the content keeps its REST
+	   width and is clipped, never reflowed and never dimmed ("No dimming"). */
+	.detail-clip { min-width: 0; }
+	.detail-pane.pane-clipping { padding-right: 20px; }
 	.detail-scroll { flex: 1; min-height: 0; overflow-y: auto; }
 	.discover-pane { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 	.discover-pane .detail-scroll { padding: 12px 16px 20px; }
 	/* QURATOR-360 F1: in the Discover view the list column collapses to the toggle row only. */
-	.contacts-col.col-toggle-only { width: auto; min-width: 0; border-right: 0; }
+	.contacts-col.col-toggle-only { flex-basis: auto; width: auto; min-width: 0; border-right: 0; }
 	/* The pane header (state d) and the moved detail as a standalone card in the pane. */
 	.pane-head { display: flex; gap: 12px; align-items: flex-start; }
 	.pane-id { min-width: 0; }
@@ -2063,7 +2211,7 @@
 	.not-drm-note { margin: 2px 0 0; font-size: 11px; line-height: 1.4; color: var(--fg-dim); }
 
 	/* QURATOR-342 lane B — the phonebook is the list column's scroll area (the A-Z rail is gone). */
-	.phonebook { display: flex; min-height: 0; flex: 1; }
+	.phonebook { display: flex; min-height: 0; min-width: 0; flex: 1; } /* min-width: QURATOR-368d review, see .contacts-col */
 	.phonebook-scroll { flex: 1; overflow-y: auto; padding: 12px 14px 24px; min-width: 0; }
 
 	.phonebook-section { margin-bottom: 4px; }
@@ -2102,6 +2250,8 @@
 		border-bottom-color: transparent;
 	}
 
+	/* QURATOR-368d — the hovered card reads as the one driving the expansion. */
+	.contact-card.hot { border-color: color-mix(in oklch, var(--accent) 45%, var(--border)); }
 	.contact-card {
 		background: var(--bg-elev1);
 		border: 1px solid var(--border);
@@ -2112,13 +2262,7 @@
 		align-items: flex-start;
 	}
 
-	/* M15 W5: chevron toggles the light-detail area; ⋯ opens the row menu. */
-	.chevron-btn {
-		background: transparent; border: none; cursor: pointer; padding: 2px;
-		display: flex; align-items: center; color: var(--fg-muted); flex-shrink: 0; margin-top: 5px;
-	}
-	.chevron { display: flex; transition: transform 0.15s; }
-	.chevron-open { transform: rotate(180deg); }
+	/* ⋯ opens the row menu. */
 	.row-menu-btn {
 		width: 26px; height: 26px; flex-shrink: 0;
 		display: flex; align-items: center; justify-content: center;
@@ -2137,18 +2281,27 @@
 
 	.contact-info { flex: 1; min-width: 0; }
 
-	.name-row { display: flex; gap: 8px; align-items: center; margin-bottom: 3px; flex-wrap: wrap; }
-	.peer-name { font-weight: 600; font-size: 15px; letter-spacing: -0.2px; }
+	/* QURATOR-368 slice c — line 1: name (ellipsises, min-width 0 so it CAN) · collision badge ·
+	   presence pill · size pushed right. NEVER wraps: the long-name pressure lands on the name. */
+	.name-row { display: flex; gap: 8px; align-items: center; min-width: 0; }
+	.peer-name {
+		font-weight: 600; font-size: 15px; letter-spacing: -0.2px;
+		flex: 0 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+	}
 	/* QURATOR-351 state d: their published total, right-aligned on the name row. tabular-nums
 	   so digit columns align down the roster; dim so it never competes with the name. */
-	.row-size { color: var(--fg-dim); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+	.row-size { margin-left: auto; color: var(--fg-dim); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
-	.last-seen { font-size: 10.5px; color: var(--fg-dim); }
-
-	.contact-sub-row {
-		display: flex; align-items: center; gap: 5px;
-		margin-top: 6px; font-size: 11px; color: var(--fg-muted);
+	/* QURATOR-368 slice c — line 2: fingerprint words · "N collections" · presence text. */
+	.meta-row {
+		display: flex; align-items: baseline; gap: 5px;
+		margin-top: 3px; font-size: 11px; color: var(--fg-muted);
+		min-width: 0; white-space: nowrap; overflow: hidden;
 	}
+	.last-seen { font-size: 10.5px; color: var(--fg-dim); }
+	/* QURATOR-368: the presence state classes ride on line 2's TEXT — no pill fill, border or padding. */
+	.last-seen.pill-offline, .last-seen.pill-unknown { background: none; border: 0; padding: 0; color: var(--fg-dim); }
+
 	.sub-dot { color: var(--fg-dim); }
 	.sub-meta { color: var(--fg-muted); font-feature-settings: 'tnum'; }
 
@@ -2164,43 +2317,28 @@
 		background: var(--bg-elev1);
 		box-shadow: 0 0 0 1px var(--border);
 	}
-	/* QURATOR-342 lane B — COMPACT rows: at rest a row shows only line 1 (avatar · name ·
-	   collection count) and the fingerprint line. The bio, group chips, collections popover, size
-	   summary, cold-cache marker and the row controls reveal on hover/focus — every affordance
-	   stays reachable; nothing was removed. The Ask-for-access button was removed BY RULING (an
-	   unreadable person shows the reason in Browse), so its rule went with it. */
-	.contact-card { padding: 8px 10px; gap: 8px; align-items: center; }
-	.contact-card:not(:hover):not(:focus-within) .bio-row,
-	.contact-card:not(:hover):not(:focus-within) .contact-sub-row { display: none; }
-	.contact-card .chevron-btn,
-	.contact-card .row-menu-btn,
-	.contact-card .name-row .btn-default { opacity: 0; pointer-events: none; transition: opacity 0.12s; }
-	.contact-card:hover .chevron-btn,
-	.contact-card:hover .row-menu-btn,
-	.contact-card:hover .name-row .btn-default,
-	.contact-card:focus-within .chevron-btn,
-	.contact-card:focus-within .row-menu-btn,
-	.contact-card:focus-within .name-row .btn-default { opacity: 1; pointer-events: auto; }
-	/* An expanded row (chevron) shows everything without needing hover. */
-	.contact-block.open .bio-row,
-	.contact-block.open .contact-sub-row { display: flex; }
-	.row-count {
-		font-size: 11px;
-		color: var(--fg-dim);
-		font-variant-numeric: tabular-nums;
-		flex-shrink: 0;
-	}
+	/* QURATOR-368 slice c — the row at rest is TWO lines and NEVER grows: the bio, group chips,
+	   collections popover, size summary, cold-cache control and the row buttons (Browse / Message /
+	   ⋯) all moved to the right pane — no opacity:0 placeholders taking width, which is what used
+	   to wrap size+count onto a second line and the invisible buttons onto a third. The avatar pins
+	   to the top instead of centring against a wrapped stack. The Ask-for-access button was removed
+	   BY RULING (an unreadable person shows the reason in Browse), so its rule went with it. */
+	.contact-card { padding: 8px 10px; gap: 8px; align-items: flex-start; }
 
-	/* Contact-card bio (devtest #7) — render-only, clamped to 2 lines. */
-	.card-bio {
-		font-size: 12px; color: var(--fg-muted); line-height: 1.5;
-		margin: 4px 0 0;
-		overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical;
+	/* QURATOR-368d — inline row actions (Browse · Message · ⋯), rendered only in the settled
+	   state, at the END OF LINE 1 after the size (draft `.acts-in`) — the row never gains a third
+	   line on hover (owner: "the row no longer grows on hover"). */
+	.row-acts { display: flex; gap: 4px; flex: none; margin-left: 4px; }
+	.row-act {
+		font-size: 11px; padding: 2px 10px; border-radius: var(--r-chip, 999px);
+		border: 1px solid var(--border); background: var(--bg-elev2); color: var(--fg);
+		cursor: pointer;
 	}
+	.row-act:hover { border-color: color-mix(in oklch, var(--accent) 45%, var(--border)); }
 
-	/* M21 W4 — fingerprint word row + collision badge + bio clamp control + collections popover.
-	   The .card-bio above keeps its 2-line clamp; `.bio-expanded .card-bio` lifts the clamp so the
-	   `more ⌄` control reveals the full text in place. */
+	@media (prefers-reduced-motion: reduce) { .contacts-col { transition: none; } }
+
+	/* M21 W4 — fingerprint words (row line 2) + the pane header's fp-row + collision badge. */
 	.fp-row { display: flex; gap: 4px; align-items: baseline; margin-top: 2px; flex-wrap: wrap; }
 	.fp-word { font-family: var(--font-mono); font-size: 11px; font-weight: 600; }
 	.fp-sep { color: var(--fg-dim); font-size: 11px; }
@@ -2209,30 +2347,10 @@
 		border: 1px solid color-mix(in oklch, var(--error) 60%, transparent);
 		color: var(--error); font-weight: 500;
 	}
-	.bio-row { display: flex; gap: 6px; align-items: flex-end; margin-top: 2px; }
-	.bio-row .card-bio { margin: 0; }
-	.bio-expanded .card-bio { -webkit-line-clamp: unset; line-clamp: unset; overflow: visible; }
-	.bio-more {
-		background: transparent; border: none; cursor: pointer; flex-shrink: 0;
-		font-size: 10.5px; color: var(--fg-dim); padding: 0 0 2px 0; font-family: var(--font-ui);
-		white-space: nowrap;
-	}
-	.bio-more:hover { color: var(--fg-muted); }
-	.bio-empty { font-size: 12px; }
-	.no-bio { color: var(--fg-dim); font-style: italic; font-size: 11.5px; }
 
-	/* M21 W4 behaviour 6 — `N collections` hoverable. ▼ caret signals it; :focus-within makes it
-	   keyboard-reachable. Public collections ONLY (disclosure boundary). */
-	.collections-popover-wrap { position: relative; display: inline-flex; }
-	.collections-trigger { cursor: default; }
-	.collections-popover {
-		display: none; position: absolute; top: 100%; left: 0; z-index: var(--z-menu);
-		min-width: 220px; margin-top: 6px;
-		background: var(--bg-elev2); border: 1px solid var(--border); border-radius: var(--r-card, 8px);
-		padding: 6px; box-shadow: 0 8px 24px oklch(0 0 0 / 0.3);
-	}
-	.collections-popover-wrap:hover .collections-popover,
-	.collections-popover-wrap:focus-within .collections-popover { display: block; }
+	/* M21 W4 behaviour 6 — the collections list, now a PLAIN pane block (QURATOR-368 slice c).
+	   Public collections ONLY (disclosure boundary). */
+	.pane-cols { display: flex; flex-direction: column; gap: 2px; }
 	.cpop-row { display: flex; flex-direction: column; gap: 1px; padding: 4px 6px; border-radius: var(--r-control, 5px); }
 	.cpop-row:hover { background: var(--bg-elev3); }
 	.cpop-alias { font-size: 12px; font-weight: 500; color: var(--fg); }
@@ -2240,6 +2358,10 @@
 	.cpop-desc { font-size: 11px; color: var(--fg-muted); }
 	.cpop-row:hover .cpop-desc { color: var(--fg); }
 	.cpop-footer { font-size: 10px; color: var(--fg-dim); padding: 4px 6px 2px; border-top: 1px solid var(--divider); margin-top: 4px; }
+
+	/* QURATOR-368 slice c — the pane's full bio (no clamp) and the moved chip row. */
+	.pane-bio { margin: 0; font-size: 12.5px; line-height: 1.55; color: var(--fg); white-space: pre-wrap; }
+	.pane-groups { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
 
 	/* M21 W4 behaviour 2 — cold-cache amber control (clickable to refresh, not a verdict pill). */
 	.cold-cache {
@@ -2384,8 +2506,8 @@
 		font-style: italic;
 	}
 
-	/* Group chips on contact cards. (.group-row went with the detail panel's own chip row in devtest
-	   item 3 — the face's row is .contact-sub-row and was never styled by it.) */
+	/* Group chips. (.group-row went with the detail panel's own chip row in devtest item 3; the
+	   face's chip row moved to the pane in QURATOR-368 slice c — the pane block is .pane-groups.) */
 	.group-pill {
 		display: inline-flex; align-items: center; gap: 4px;
 		padding: 1px 8px; border-radius: var(--r-chip, 4px); font-size: 11px; font-weight: 500;
@@ -2529,8 +2651,6 @@
 		overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
 	}
 
-	/* M22 W7 — respect prefers-reduced-motion: disable the drag/chevron transitions. */
-	@media (prefers-reduced-motion: reduce) {
-		.chevron { transition: none; }
-	}
+	/* M22 W7's reduced-motion rule used to cover the (now deleted) chevron transform. The page's one
+	   transition is now the column's hover-to-expand flex-basis, guarded beside .row-acts above. */
 </style>

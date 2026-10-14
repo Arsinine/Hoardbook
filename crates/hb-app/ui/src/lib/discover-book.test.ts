@@ -32,6 +32,15 @@ describe('fmtBytes (the ONE phonebook formatter, moved from the contacts page)',
 		expect(fmtBytes(5_000)).toBe('5 KB');
 		expect(fmtBytes(512)).toBe('512 B');
 	});
+
+	it('adds the TB band above GB (QURATOR-368a); exactly 1e12 stays GB', () => {
+		// P-10 mutation: in lib/discover-book.ts change the TB band `(bytes / 1e12).toFixed(1)` to
+		// `.toFixed(2)` → fmtBytes(4.2e12) becomes "4.20 TB" → this test reds. SEEN RED.
+		expect(fmtBytes(4.2e12)).toBe('4.2 TB');
+		// Boundary: the GB band is `> 1e9`, so exactly 1e12 (1000 GB) still formats as GB.
+		expect(fmtBytes(1e12)).toBe('1000.0 GB');
+		expect(fmtBytes(1e12 + 1)).toBe('1.0 TB');
+	});
 });
 
 describe('sortEntries', () => {

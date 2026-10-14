@@ -29,41 +29,44 @@ describe('M21 W5b behaviour 1 — group chips carry their colour dot', () => {
 		expect(s).toMatch(/groups\.find\(g => g\.name === name\)\?\.color/);
 	});
 
-	it('the face chip renders a dot when the group has a colour', () => {
+	// QURATOR-368c RE-POINT: the chip row moved off the face into the pane's `.pane-groups` block —
+	// the dot logic is unchanged, so the slice follows it there.
+	it('the chip renders a dot when the group has a colour', () => {
 		const s = contactsSrc();
-		// Inside the contact-sub-row chip loop: a `.group-dot` whose background is the looked-up color.
-		const subRowIdx = s.indexOf('class="contact-sub-row"');
-		const detailIdx = s.indexOf('class="contact-detail"');
-		const faceRegion = s.slice(subRowIdx, detailIdx);
-		expect(faceRegion).toMatch(/groupColor\(gname\)/);
-		expect(faceRegion).toMatch(/class="group-dot"/);
-		expect(faceRegion).toMatch(/background:\$\{gcolor\}/);
+		// Inside the pane-groups chip loop: a `.group-dot` whose background is the looked-up color.
+		const groupsIdx = s.indexOf('class="pane-groups"');
+		const regionEnd = s.indexOf('class="detail-block', groupsIdx);
+		const chipRegion = s.slice(groupsIdx, regionEnd);
+		expect(chipRegion).toMatch(/groupColor\(gname\)/);
+		expect(chipRegion).toMatch(/class="group-dot"/);
+		expect(chipRegion).toMatch(/background:\$\{gcolor\}/);
 	});
 
-	// INVERTED by devtest 2026-08-26 item 3, ruling 01. This test was 'the detail chip renders the
-	// same dot (face and detail agree)'. Two chip rows agreeing was the DUPLICATION the owner
-	// reported ("right now its showing duplicated information") — the detail row is deleted and the
-	// face row is now the only one, so "they agree" is no longer a property that can hold or fail.
-	// What replaces it is the property that actually needs guarding: exactly ONE chip row exists.
-	// A future change that re-adds chips to the panel reds here, which is the regression this file
-	// should catch now.
-	it('the chip row lives on the face ONLY — the detail panel carries no second copy', () => {
+	// INVERTED twice. This test was 'the detail chip renders the same dot (face and detail agree)';
+	// devtest 2026-08-26 item 3 ruling 01 deleted the DETAIL row ("showing duplicated information")
+	// and made the face the only one; QURATOR-368c moved the row back into the pane. The property
+	// that has needed guarding through both flips: exactly ONE chip row exists — the face carries
+	// none, the pane carries one. A second chip row anywhere reds here.
+	it('the chip row lives in the pane ONLY — the face carries no second copy', () => {
 		const s = contactsSrc();
-		const detailStart = s.indexOf('class="contact-detail"');
+		const detailStart = s.indexOf('class="detail-pane');
 		expect(detailStart).toBeGreaterThan(-1);
-		const detailEnd = s.indexOf('OverflowMenu', detailStart);
-		const detail = s
-			.slice(detailStart, detailEnd)
-			// Comments only: the deletion left a tombstone naming what moved and why (CLAUDE.md §9 —
-			// what must not appear is the affordance, not the word).
+		const face = s
+			.slice(s.indexOf('class="contact-card"'), detailStart)
+			// Comments only: a tombstone naming what moved may survive (CLAUDE.md §9 — what must not
+			// appear is the affordance, not the word).
 			.replace(/<!--[\s\S]*?-->/g, '')
 			.replace(/^\s*\/\/.*$/gm, '');
-		expect(detail).not.toMatch(/groupColor\(gname\)/);
-		expect(detail).not.toMatch(/class="group-dot"/);
-		// …and the face still has it, so this cannot pass by the chips having vanished entirely.
-		const faceRegion = s.slice(s.indexOf('class="contact-sub-row"'), detailStart);
-		expect(faceRegion).toMatch(/groupColor\(gname\)/);
-		expect(faceRegion).toMatch(/class="group-dot"/);
+		expect(face).not.toMatch(/groupColor\(gname\)/);
+		expect(face).not.toMatch(/class="group-dot"/);
+		// …and the pane has it, so this cannot pass by the chips having vanished entirely.
+		const groupsIdx = s.indexOf('class="pane-groups"');
+		const regionEnd = s.indexOf('class="detail-block', groupsIdx);
+		const paneGroups = s.slice(groupsIdx, regionEnd);
+		expect(paneGroups).toMatch(/groupColor\(gname\)/);
+		expect(paneGroups).toMatch(/class="group-dot"/);
+		// Exactly one chip row in the whole template.
+		expect((s.match(/class="group-pill"/g) ?? []).length).toBe(1);
 	});
 
 	it('a group with no colour renders the chip with NO dot (guarded by {#if gcolor})', () => {
@@ -80,14 +83,14 @@ describe('M21 W5b behaviour 1 — group chips carry their colour dot', () => {
 	});
 });
 
-describe('M21 W5b behaviour 2 — `+` opens a membership popover on the collapsed card', () => {
-	it('the face renders a `+` control beside the chip row', () => {
+describe('M21 W5b behaviour 2 — `+` opens the membership popover (QURATOR-368c: from the pane)', () => {
+	it('the pane renders a `+` control beside the chip row', () => {
 		const s = contactsSrc();
-		const subRowIdx = s.indexOf('class="contact-sub-row"');
-		const detailIdx = s.indexOf('class="contact-detail"');
-		const faceRegion = s.slice(subRowIdx, detailIdx);
-		expect(faceRegion).toMatch(/class="group-add-btn"/);
-		expect(faceRegion).toMatch(/>\+</);
+		const groupsIdx = s.indexOf('class="pane-groups"');
+		const regionEnd = s.indexOf('class="detail-block', groupsIdx);
+		const chipRegion = s.slice(groupsIdx, regionEnd);
+		expect(chipRegion).toMatch(/class="group-add-btn"/);
+		expect(chipRegion).toMatch(/>\+</);
 	});
 
 	it('the `+` opens the popover via openGroupPopover (anchored, aria-haspopup)', () => {

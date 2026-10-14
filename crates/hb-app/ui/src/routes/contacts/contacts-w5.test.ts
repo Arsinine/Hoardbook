@@ -29,7 +29,7 @@ describe('contacts W5 — the row stops calling our poll time "seen"', () => {
 		expect(idx).toBeGreaterThan(-1);
 		expect(s.slice(idx - 160, idx)).toContain('{#if !peer.online');
 		// QURATOR-135: the age line also requires a KNOWN verdict — an unknown row shows only the
-		// "Checking…" pill, never an age line either.
+		// "Checking…" text, never an age line either.
 		expect(s.slice(idx - 160, idx)).toContain('presence.online !== null');
 	});
 

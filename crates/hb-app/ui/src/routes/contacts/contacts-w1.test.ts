@@ -41,13 +41,9 @@ describe('Contacts page — M17 W1 Message affordances', () => {
 		expect(menuBlock).toMatch(/menuOpenFor\s*=\s*null/);
 	});
 
-	it('dblclick_guard_still_ignores_inner_controls_including_the_new_Message_affordance', () => {
-		// The codex LOW from v0.12.2: dblclick on the contact-card must ignore clicks on inner controls
-		// (chevron/Browse/⋯) so they keep their own single-click action. The guard is a single
-		// `closest('button, a')` check — it covers ANY button/anchor descendant, including the new
-		// Message button, by construction. Pin the guard's selector so a regression that narrowed it
-		// (e.g. to specific classes) is caught.
-		const src = contactsSrc();
-		expect(src).toMatch(/ondblclick=\{\(e\)\s*=>\s*\{[^}]*\.closest\('button,\s*a'\)/);
-	});
+	// QURATOR-368b: the former `dblclick_guard_still_ignores_inner_controls_including_the_new_
+	// Message_affordance` source-scan (pinning `closest('button, a')` in ondblclick) was replaced
+	// by its MOUNTED equivalent — contacts-q342-compact-list.test.ts, 'inner controls and modifier
+	// clicks never select or navigate (iv)', which drives BOTH click and dblclick through the real
+	// ⋯ control against the rendered page. Coverage moved, not deleted.
 });

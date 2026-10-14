@@ -5,8 +5,9 @@ import type { PhonebookEntry, MatchKind } from './types.js';
 /** The ONE byte formatter for the phonebook surfaces. Moved VERBATIM from
  *  routes/contacts/+page.svelte (which now imports this — same output, the q351 contacts test
  *  pins "1.5 GB" / "880.0 MB"). Browse and CollectionRow keep their own component-local copies;
- *  consolidating those was explicitly out of scope. */
+ *  consolidating those was explicitly out of scope. Goes up to TB (QURATOR-368 slice a). */
 export function fmtBytes(bytes: number): string {
+	if (bytes > 1e12) return (bytes / 1e12).toFixed(1) + ' TB';
 	if (bytes > 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
 	if (bytes > 1e6) return (bytes / 1e6).toFixed(1) + ' MB';
 	if (bytes > 1e3) return (bytes / 1e3).toFixed(0) + ' KB';

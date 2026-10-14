@@ -123,9 +123,8 @@ describe('QURATOR-351 state d — size on the row, Looking-for on the detail', (
 			peer('npub1q351dana' + 'd'.repeat(42), prof({ display_name: 'Dana', looking_for: 'Kurosawa box sets' })),
 		]);
 
-		const chevron = container.querySelector('.chevron-btn');
-		expect(chevron).not.toBeNull();
-		fireEvent.click(chevron!);
+		// QURATOR-368b: the chevron is gone — a row click selects into the pane (held 250 ms).
+		fireEvent.click(container.querySelector('.contact-card')!);
 		await waitFor(() => expect(container.querySelectorAll('.looking-for').length).toBe(1));
 		expect(container.querySelector('.looking-for')!.textContent).toBe('Kurosawa box sets');
 
@@ -139,7 +138,8 @@ describe('QURATOR-351 state d — size on the row, Looking-for on the detail', (
 			peer('npub1q351evan' + 'e'.repeat(42), prof({ display_name: 'Evan' })),
 		]);
 
-		fireEvent.click(container.querySelector('.chevron-btn')!);
+		// QURATOR-368b: row click selects into the pane (held 250 ms).
+		fireEvent.click(container.querySelector('.contact-card')!);
 		// The detail still opens (the Profile block appears), but no Looking-for anywhere.
 		await waitFor(() => expect(container.querySelectorAll('.detail-block.detail-theirs').length).toBeGreaterThan(0));
 		expect(container.querySelector('.looking-for')).toBeNull();

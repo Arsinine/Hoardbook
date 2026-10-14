@@ -48,7 +48,8 @@ const ALLOWED: Record<string, string[]> = {
 	'routes/contacts/+page.svelte': [
 		'oklch(0.55 0.15 var(--dg-hue))',
 		'oklch(0.78 0.15 75)',
-		'0 8px 24px oklch(0 0 0 / 0.3)',
+		// '0 8px 24px oklch(0 0 0 / 0.3)' left with the row's .collections-popover (QURATOR-368c:
+		// the collections list is a plain block in the right pane now).
 		'oklch(0.75 0.12 60)',
 		'oklch(0.82 0.14 60)',
 	],
