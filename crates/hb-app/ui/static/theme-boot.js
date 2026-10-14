@@ -25,14 +25,16 @@
 		if (present) root.setAttribute(name, '');
 		else root.removeAttribute(name);
 	}
-	function paint(theme, glass, seeThrough) {
+	function paint(theme, glass) {
 		// ⚠ data-theme is a VALUED attribute (the CSS keys on :root[data-theme="<id>"]), so it is
-		// set with the theme id, never presence-style; the three flags below are presence-style.
+		// set with the theme id, never presence-style; the two flags below are presence-style.
 		if (theme !== BASE_THEME) root.setAttribute('data-theme', theme);
 		else root.removeAttribute('data-theme');
 		setOrRemove('data-glass-float', FLOATING.indexOf(theme) !== -1 && glass);
 		setOrRemove('data-glass-off', !glass);
-		setOrRemove('data-see-through', seeThrough && glass);
+		// see-through window removed 2026-10-14: scrub a stale attribute an older build may
+		// have left on the root. removeAttribute is a no-op when the attribute is absent.
+		root.removeAttribute('data-see-through');
 	}
 	try {
 		var raw = localStorage.getItem(KEY);
@@ -42,12 +44,11 @@
 		if (typeof a !== 'object' || a === null) a = {};
 		var theme = typeof a.theme === 'string' && THEMES.indexOf(a.theme) !== -1 ? a.theme : DEFAULT_THEME;
 		var glass = a.glass === false ? false : true;
-		var seeThrough = a.seeThrough === true;
-		// Same semantics as applyAppearance — per-field fallback slices of the default triple.
-		paint(theme, glass, seeThrough);
+			// Same semantics as applyAppearance — per-field fallback slices of the default triple.
+		paint(theme, glass);
 	} catch (e) {
 		// Never throw at boot. A broken mirror (JSON.parse threw) paints the default, the same
 		// fallback readMirroredAppearance uses, so the first frame is never the base palette.
-		try { paint(DEFAULT_THEME, true, false); } catch (e2) { /* nothing more to try */ }
+		try { paint(DEFAULT_THEME, true); } catch (e2) { /* nothing more to try */ }
 	}
 })();

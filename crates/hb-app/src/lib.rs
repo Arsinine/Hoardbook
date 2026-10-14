@@ -590,10 +590,6 @@ pub fn run() {
                 Arc::clone(&manifest_endpoint),
             );
 
-            // QURATOR-352 — read the appearance settings now: `store` moves into the watch task
-            // just below, and the see-through window is applied after the decorations block.
-            let appearance_settings = store.load_settings().ok().flatten().unwrap_or_default();
-
             // M9: the snapshot-watch sibling task (single watcher per app — single-instance, M8).
             if let Some(watcher) =
                 spawn_watch_task(store, Arc::clone(&identity), Arc::clone(&relay), watch_cancel_rx, app_handle)
@@ -612,13 +608,6 @@ pub fn run() {
             #[cfg(not(target_os = "macos"))]
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.set_decorations(false);
-            }
-
-            // QURATOR-352 — apply the persisted see-through window (Mica) BEFORE the user sees
-            // the window. Gated inside on see_through && glass && theme != "hoard" (the base palette); a silent
-            // no-op on every OS without Mica (Windows 10, Linux, macOS).
-            if let Some(win) = app.get_webview_window("main") {
-                commands::appearance::startup_see_through(&appearance_settings, &win);
             }
 
             Ok(())
@@ -703,9 +692,6 @@ pub fn run() {
             commands::settings::beacon_status,
             commands::settings::acknowledge_privacy_notice,
             commands::settings::clear_manifest_cache,
-            // QURATOR-352 — appearance: the Mica support probe + the see-through window switch.
-            commands::appearance::window_material_supported,
-            commands::appearance::set_window_material,
             commands::online::online_count,
             // QURATOR-340 — taskbar attention (red-dot badge + ONE Informational flash) while the
             // window is unfocused/minimized/hidden. Done in RUST so no new window capability is

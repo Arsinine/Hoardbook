@@ -235,20 +235,9 @@ export interface Settings {
 	theme?: string;
 	/** QURATOR-352: glass panes on. Rust serde default true. */
 	glass?: boolean;
-	/** QURATOR-352: see-through window (Mica, Windows 11 only). Rust serde default false. */
-	see_through?: boolean;
 }
 
 export const getSettings = () => invoke<Settings>('get_settings');
-
-/** QURATOR-352: true only on Windows 11, where the see-through window (Mica) exists. */
-export const windowMaterialSupported = () => invoke<boolean>('window_material_supported');
-
-/** QURATOR-352: bring the Mica see-through window in line with the current appearance. Rust
- *  decides on/off from all three (see-through, glass, theme) so the rule lives in one place.
- *  A no-op where Mica is unsupported. */
-export const setWindowMaterial = (a: { seeThrough: boolean; glass: boolean }) =>
-	invoke<void>('set_window_material', { seeThrough: a.seeThrough, glass: a.glass });
 
 export const saveSettings = (settings: Settings) => invoke<void>('save_settings', { settings });
 

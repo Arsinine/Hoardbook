@@ -2,7 +2,7 @@
 // QURATOR-352 lane C — the Appearance section in Settings.
 //
 // Mounts the real Settings page with the house mock of $lib/api.js (copied from
-// settings-toggle-gate.test.ts), which also stubs api.ts's two window-material commands. The REAL $lib/themes/apply.ts runs — the assertions read what IT painted on
+// settings-toggle-gate.test.ts). The REAL $lib/themes/apply.ts runs — the assertions read what IT painted on
 // <html> (data-theme) and mirrors to localStorage — so a stubbed applier would red these tests.
 // The 2026-10-12 owner ruling (Vault is DEFAULT, Hoard = BASE) is honoured: picking Vault SETS
 // data-theme='vault' (apply.ts removes the attribute only for BASE_THEME).
@@ -12,8 +12,7 @@
 //   - picking a theme applies IMMEDIATELY (root attribute / default = absent) AND calls the
 //     mocked saveSettings with theme:'<id>' — the full-object save path every other toggle uses;
 //   - arrow keys move focus and select the neighbour (native radio-group semantics);
-//   - the see-through row exists ONLY when window_material_supported passes;
-//   - glass off disables see-through with its reason; Hoard allows it (every theme is glass);
+//   - there is no see-through window row (feature removed 2026-10-14); the glass toggle stays;
 //   - the QURATOR-93 belt-and-suspenders gate: a failed settings load disables the new controls
 //     and the in-handler guards alone still block the save.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -49,15 +48,11 @@ vi.mock('$lib/api.js', () => ({
 	natClassification: vi.fn().mockResolvedValue('undetermined'),
 	dmBlockedList: vi.fn().mockResolvedValue([]),
 	dmUnblock: vi.fn().mockResolvedValue(undefined),
-	windowMaterialSupported: vi.fn(),
-	setWindowMaterial: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { getSettings, saveSettings, windowMaterialSupported, setWindowMaterial } from '$lib/api.js';
+import { getSettings, saveSettings } from '$lib/api.js';
 const getSettingsMock = getSettings as unknown as ReturnType<typeof vi.fn>;
 const saveSettingsMock = saveSettings as unknown as ReturnType<typeof vi.fn>;
-const probeMock = windowMaterialSupported as unknown as ReturnType<typeof vi.fn>;
-const setMaterialMock = setWindowMaterial as unknown as ReturnType<typeof vi.fn>;
 
 const ME = 'npub1meeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 
@@ -81,8 +76,6 @@ beforeEach(() => {
 		document.documentElement.removeAttribute(a);
 	}
 	localStorage.clear();
-	probeMock.mockReset();
-	setMaterialMock.mockReset().mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -190,44 +183,15 @@ describe('QURATOR-352 — Appearance section in Settings', () => {
 		expect(document.documentElement.getAttribute('data-theme')).toBe('vault');
 	});
 
-	it('see-through row is ABSENT when window_material_supported resolves false', async () => {
-		probeMock.mockResolvedValue(false);
-		const { getByRole, queryByRole } = await renderLoaded();
-
-		await waitFor(() => expect(probeMock).toHaveBeenCalled());
-		expect(queryByRole('button', { name: /see-through window/i })).toBeNull();
+	it('there is no see-through window row: the feature is removed (owner, 2026-10-14)', async () => {
+		// Owner: "We couldnt get the see-through window to work. Let's just remove it altogether."
+		// The glass toggle stays; nothing in Settings offers the see-through window any more.
+		// P-10 MUTATION: re-add a `<button … aria-label="See-through window">` toggle row beside the
+		// glass row in settings/+page.svelte → REDS.
+		const { getByRole, queryByRole, queryByText } = await renderLoaded();
 		expect(getByRole('button', { name: /glass effects/i })).toBeTruthy();
-	});
-
-	it('see-through row is present when supported; clicking it saves see_through:true and drives the OS material', async () => {
-		probeMock.mockResolvedValue(true);
-		const { getByRole } = await renderLoaded();
-
-		const seeThrough = await waitFor(() => {
-			const b = getByRole('button', { name: /see-through window/i }) as HTMLButtonElement;
-			expect(b.disabled).toBe(false); // default theme Vault ≠ BASE_THEME(hoard), glass default on
-			return b;
-		});
-
-		await fireEvent.click(seeThrough);
-		await tick();
-		expect(saveSettingsMock).toHaveBeenCalledWith(expect.objectContaining({ see_through: true }));
-		expect(setMaterialMock).toHaveBeenLastCalledWith({ seeThrough: true, glass: true });
-	});
-
-	it('turning glass off with see-through on re-syncs the OS material, so Mica turns off', async () => {
-		// GLM review 2026-10-12: changing glass used to leave Mica on behind solid panes until
-		// restart. A glass change now re-sends the state; Rust's see_through_effective turns it off.
-		// MUTATION (P-10): delete the `void setWindowMaterial();` line in toggleGlass — this reds.
-		probeMock.mockResolvedValue(true);
-		getSettingsMock.mockResolvedValue({ ...OK_SETTINGS, see_through: true });
-		primeIdentity();
-		const { getByRole } = render(SettingsPage);
-		await waitFor(() => expect((getByRole('button', { name: /glass effects/i }) as HTMLButtonElement).disabled).toBe(false));
-		setMaterialMock.mockClear();
-		await fireEvent.click(getByRole('button', { name: /glass effects/i }));
-		await tick();
-		expect(setMaterialMock).toHaveBeenLastCalledWith({ seeThrough: true, glass: false });
+		expect(queryByRole('button', { name: /see-through/i })).toBeNull();
+		expect(queryByText(/see-through/i)).toBeNull();
 	});
 
 	it('glass effects toggle applies at once and saves glass:false', async () => {
@@ -239,35 +203,7 @@ describe('QURATOR-352 — Appearance section in Settings', () => {
 		expect(saveSettingsMock).toHaveBeenCalledWith(expect.objectContaining({ glass: false }));
 	});
 
-	it('glass off disables see-through with its reason; Hoard allows it, like every glass theme', async () => {
-		probeMock.mockResolvedValue(true);
-		getSettingsMock.mockResolvedValue({ ...OK_SETTINGS, glass: false });
-		primeIdentity();
-		const utils = render(SettingsPage);
-		const seeThrough = await waitFor(() => {
-			const b = utils.getByRole('button', { name: /see-through window/i }) as HTMLButtonElement;
-			expect(b.disabled).toBe(true);
-			return b;
-		});
-		// glass:false + no theme field → themeId falls back to the DEFAULT (vault), so the reason
-		// shown is the glass one.
-		expect(utils.getByText('Needs glass effects on.')).toBeTruthy();
-		void seeThrough;
-
-		// Hoard joined the shared glass design (owner, 2026-10-13), so see-through is ENABLED there.
-		// Unmount the first page first, or both pages' help texts sit in the document at once.
-		cleanup();
-		getSettingsMock.mockResolvedValue({ ...OK_SETTINGS, theme: 'hoard' });
-		const utils2 = render(SettingsPage);
-		await waitFor(() => {
-			const b = utils2.getByRole('button', { name: /see-through window/i }) as HTMLButtonElement;
-			expect(b.disabled).toBe(false);
-		});
-		expect(utils2.queryByText('Needs a glass theme.')).toBeNull();
-	});
-
 	it('QURATOR-93 twin: a failed settings load disables the new controls, and the in-handler guards alone block saves', async () => {
-		probeMock.mockResolvedValue(true);
 		getSettingsMock.mockRejectedValue(new Error('settings.json unreadable'));
 		primeIdentity();
 
@@ -275,23 +211,15 @@ describe('QURATOR-352 — Appearance section in Settings', () => {
 		await waitFor(() => expect(getByRole('alert')).toBeTruthy());
 
 		const glass = getByRole('button', { name: /glass effects/i }) as HTMLButtonElement;
-		// The see-through row renders only after the Windows-11 probe resolves, which can land after
-		// the load-failure alert. Wait for the row itself rather than assuming it is already there.
-		const seeThrough = (await waitFor(() =>
-			getByRole('button', { name: /see-through window/i })
-		)) as HTMLButtonElement;
 		const vault = getByRole('radio', { name: /^Vault/ }) as HTMLButtonElement;
 		expect(glass.disabled).toBe(true);
-		expect(seeThrough.disabled).toBe(true);
 		expect(vault.disabled).toBe(true);
 
 		// Bypass the DOM gate (house methodology, settings-toggle-gate.test.ts) — the handler
 		// guards must hold on their own.
 		glass.disabled = false;
-		seeThrough.disabled = false;
 		vault.disabled = false;
 		await fireEvent.click(glass);
-		await fireEvent.click(seeThrough);
 		await fireEvent.click(vault);
 		await tick();
 		expect(saveSettingsMock).not.toHaveBeenCalled();

@@ -3,7 +3,7 @@
 	import { onMount } from 'svelte';
 	import { get } from 'svelte/store';
 	import { page } from '$app/stores';
-	import { getIdentity, getProfile, getCollections, getContacts, getMessages, getReadState, topicAnnouncements, topicAnnounceSeen, openRepoPage, windowMaterialSupported, getSettings } from '$lib/api.js';
+	import { getIdentity, getProfile, getCollections, getContacts, getMessages, getReadState, topicAnnouncements, topicAnnounceSeen, openRepoPage, getSettings } from '$lib/api.js';
 	import { DEFAULT_THEME, type ThemeId } from '$lib/themes/themes.js';
 	import { identity, profile, inboxMessages, readWatermarks, toastMessage, appReady, toast, dismissToast, isStickyToast, identityLoadError, topicAnnounceSummaries, announceSeen, seedSentFromFeed, loadCollectionsInto, loadContactsInto } from '$lib/stores.js';
 	import { isOurDrag } from '$lib/drag-group.js';
@@ -58,10 +58,6 @@
 			// theme id. Broken settings I/O must not block startup — fall back to the boot mirror.
 			try {
 				const s = await getSettings();
-				// See-through only where the OS material exists (Windows 11). Elsewhere a stray
-				// see_through:true would turn the page transparent over an opaque window.
-				const mica = s.see_through ? await windowMaterialSupported().catch(() => false) : false;
-				applyAppearance({ theme: (s.theme ?? DEFAULT_THEME) as ThemeId, glass: s.glass ?? true, seeThrough: (s.see_through ?? false) && mica });
 			} catch {
 				applyAppearance(readMirroredAppearance());
 			}
@@ -607,39 +603,5 @@
 		background: transparent;
 		color: var(--accent);
 		cursor: pointer;
-	}
-
-	/* QURATOR-352 — see-through window: data-see-through only exists for non-hoard glass themes
-	   (applyAppearance guards it), so none of this fires in hoard. The OS material (Mica on
-	   Windows 11) shows through an 85 % backdrop veil painted by .frame::before; html and body
-	   paint var(--bg) from app.css, which would cover the OS material — clear those. */
-	:global(:root[data-see-through]) :global(.frame) {
-		background: transparent;
-	}
-	:global(:root[data-see-through]) :global(.frame::before) {
-		/* inset:0 resolves against the viewport here — .frame is exactly full-viewport
-		   (100vw × 100vh, body margin 0), so this is the same rectangle as .frame itself. */
-		content: '';
-		position: absolute;
-		inset: 0;
-		z-index: 0;
-		background: var(--backdrop);
-		opacity: 0.85;
-		pointer-events: none;
-	}
-	:global(:root[data-see-through]) :global(.sidebar),
-	:global(:root[data-see-through]) :global(.main) {
-		position: relative;
-		z-index: 1;
-	}
-	:global(:root[data-see-through]), :global(:root[data-see-through] body) {
-		background: transparent;
-	}
-	/* The OS "reduce transparency" preference also switches the see-through window off: the page
-	   paints opaque again, like the glass panes do under the same preference in app.css. */
-	@media (prefers-reduced-transparency: reduce) {
-		:global(:root[data-see-through]), :global(:root[data-see-through] body) { background: var(--bg); }
-		:global(:root[data-see-through]) :global(.frame) { background: var(--backdrop); }
-		:global(:root[data-see-through]) :global(.frame::before) { display: none; }
 	}
 </style>

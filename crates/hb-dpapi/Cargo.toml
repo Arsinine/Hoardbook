@@ -15,9 +15,4 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
-    # QURATOR-352 — windows_build(): RtlGetVersion lives in the Wdk_System_SystemServices module
-    # and takes an OSVERSIONINFOW out-param from Win32_System_SystemInformation (both features
-    # needed — the link! is in the Wdk module, the struct in the SystemInformation module).
-    "Wdk_System_SystemServices",
-    "Win32_System_SystemInformation",
 ] }

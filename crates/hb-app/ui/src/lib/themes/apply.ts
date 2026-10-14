@@ -1,4 +1,4 @@
-// QURATOR-352 — apply the appearance (theme / glass / root see-through) as root attributes on
+// QURATOR-352 — apply the appearance (theme / glass) as root attributes on
 // <html>, and mirror it to localStorage so the theme-boot script can paint before Svelte loads.
 // Settings is the source of truth; the mirror is a production paint-before-JS snapshot, never read
 // back into Settings.
@@ -12,13 +12,12 @@ import { BASE_THEME, DEFAULT_THEME, isThemeId, themeInfo, type ThemeId } from '.
 export interface Appearance {
 	theme: ThemeId;
 	glass: boolean;
-	seeThrough: boolean;
 }
 
 export const APPEARANCE_KEY = 'hb-appearance';
 
 /** The appearance an invalid mirror falls back to (each field's fallback is this triple's slice). */
-export const DEFAULT_APPEARANCE: Appearance = { theme: DEFAULT_THEME, glass: true, seeThrough: false };
+export const DEFAULT_APPEARANCE: Appearance = { theme: DEFAULT_THEME, glass: true };
 
 export function applyAppearance(input: Appearance): void {
 	const root = document.documentElement;
@@ -41,15 +40,15 @@ export function applyAppearance(input: Appearance): void {
 	if (!a.glass) root.setAttribute('data-glass-off', '');
 	else root.removeAttribute('data-glass-off');
 
-	// See-through needs glass on (nothing to see through without it); every theme, hoard included,
-	// is a glass theme. app.css/layout paint the OS material under it.
-	if (a.seeThrough && a.glass) root.setAttribute('data-see-through', '');
-	else root.removeAttribute('data-see-through');
+		// The see-through window was removed 2026-10-14 (owner: we could not get it to work).
+		// data-see-through is gone; scrub any stale attribute an older build may have left -
+		// removeAttribute is a no-op when the attribute is absent.
+		root.removeAttribute('data-see-through');
 
 	// Best-effort mirror for the boot script. try/catch: disabled/private-mode storage must never
 	// break applying the appearance itself.
 	try {
-		localStorage.setItem(APPEARANCE_KEY, JSON.stringify({ theme: a.theme, glass: a.glass, seeThrough: a.seeThrough }));
+		localStorage.setItem(APPEARANCE_KEY, JSON.stringify({ theme: a.theme, glass: a.glass }));
 	} catch {
 		// Storage write failed — the mirror is best-effort by design; the attributes are already set.
 	}
@@ -61,7 +60,7 @@ export function readMirroredAppearance(): Appearance {
 		if (raw === null) return { ...DEFAULT_APPEARANCE };
 		const v: unknown = raw === '' ? null : JSON.parse(raw);
 		if (typeof v !== 'object' || v === null) return { ...DEFAULT_APPEARANCE };
-		const o = v as { theme?: object; glass?: unknown; seeThrough?: unknown };
+		const o = v as { theme?: object; glass?: unknown };
 		// Per-field validation: each invalid field takes its slice of DEFAULT_APPEARANCE (so a
 		// mirror invalid only in theme still falls back to the exact triple the order names).
 		// The theme field is the one pinned to isThemeId; booleans must be actual booleans so a
@@ -69,7 +68,6 @@ export function readMirroredAppearance(): Appearance {
 		return {
 			theme: isThemeId(o.theme) ? o.theme : DEFAULT_THEME,
 			glass: typeof o.glass === 'boolean' ? o.glass : true,
-			seeThrough: typeof o.seeThrough === 'boolean' ? o.seeThrough : false,
 		};
 	} catch {
 		return { ...DEFAULT_APPEARANCE };

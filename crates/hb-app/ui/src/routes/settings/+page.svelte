@@ -17,7 +17,6 @@
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
 	// QURATOR-352 Appearance: the theme registry and the root-attribute applier.
-	import { windowMaterialSupported as probeWindowMaterial, setWindowMaterial as applyWindowMaterial } from '$lib/api.js';
 	import { THEMES, DEFAULT_THEME, BASE_THEME, isThemeId, type ThemeId, type ThemeInfo } from '$lib/themes/themes.js';
 	import { applyAppearance } from '$lib/themes/apply.js';
 
@@ -34,7 +33,6 @@
 	type SettingsWithAppearance = Settings & {
 		theme?: string;
 		glass?: boolean;
-		see_through?: boolean;
 	};
 	let settings: SettingsWithAppearance = $state({
 		relay_urls: [], allow_dms: true, privacy_notice_acknowledged: false,
@@ -46,20 +44,8 @@
 	});
 
 	// ── QURATOR-352: Appearance section state ────────────────────────────────────
-	let materialSupported = $state(false);
 	let themeId = $derived(isThemeId(settings.theme) ? settings.theme : DEFAULT_THEME);
 	let glassOn = $derived(settings.glass ?? true);
-	let seeThroughOn = $derived(settings.see_through ?? false);
-	// The row is gated on the material probe; the applied value is gated again inside apply.ts
-	// (see-through is hoard-inert and glass-inert) so a stale see_through=true on Linux or with
-	// glass off cannot light the veil up.
-	let effectiveSeeThrough = $derived(seeThroughOn && materialSupported);
-	// Disabled reason: with glass off there is nothing to see through. Every theme, Hoard included,
-	// is a glass theme (owner, 2026-10-13), so the theme never disables it.
-	let seeThroughSub = $derived(
-		!glassOn ? 'Needs glass effects on.'
-		: 'Lets your desktop wallpaper show softly through Hoardbook. Windows 11 only.'
-	);
 	// Card subtitle: the default theme (Vault) is labelled "Default"; Hoard — the original palette,
 	// no longer the default — is labelled "Original"; every other theme has none. Derived from
 	// DEFAULT_THEME / BASE_THEME, never hard-coded. (The design-system numbers the themes were
@@ -513,10 +499,6 @@
 		// leaves the explicit "Not yet determined" state, never a confident negative. Re-checked
 		// after a short delay so a slow probe (cold relay discovery) still surfaces a real reading.
 		try { natClass = await natClassification(); } catch { natClass = 'undetermined'; }
-		// QURATOR-352: probe whether the OS window-material commands are available (Mica on Win11,
-		// vibrancy on macOS). Best-effort: failure leaves the see-through row hidden
-		// (Linux / Win10), never an offered toggle that cannot work.
-		windowMaterialSupported().then((ok) => (materialSupported = ok));
 		loadBlocked();
 		if (natClass === 'undetermined') {
 			setTimeout(async () => {
@@ -644,25 +626,6 @@
 
 	// ── QURATOR-352: Appearance handlers ─────────────────────────────────────────
 
-	/** QURATOR-352: best-effort wrappers over api.ts's window-material commands. api.ts rejects
-	 *  outside Tauri; here a failure simply means "no see-through", never an error. */
-	async function windowMaterialSupported(): Promise<boolean> {
-		try {
-			return await probeWindowMaterial();
-		} catch {
-			// Best-effort: a failed probe hides the see-through row (Linux, Win10), never an offered
-			// toggle that cannot work.
-			return false;
-		}
-	}
-
-	/** Best-effort: the OS material is a visual-only concern; a failed call must never block the
-	 *  save or the apply. */
-	async function setWindowMaterial(): Promise<void> {
-		try {
-			await applyWindowMaterial({ seeThrough: seeThroughOn, glass: glassOn });
-		} catch { /* visual-only concern — the setting is already saved and applied */ }
-	}
 
 	/** Pick a theme card: apply at once, then save. QURATOR-93 twin (M1): never save from the
 	 *  fallback object — the in-handler settingsLoaded guard stands even if the DOM gate is
@@ -679,11 +642,9 @@
 		}
 	}
 
-	/** Apply the current appearance to the document root at once. apply.ts re-gates see-through
-	 *  against hoard/glass; the page additionally gates it on the material probe so an unsupported
-	 *  platform never lights the veil up. */
+	/** Apply the current appearance to the document root at once. */
 	function applyAppearanceNow() {
-		applyAppearance({ theme: themeId, glass: glassOn, seeThrough: effectiveSeeThrough });
+		applyAppearance({ theme: themeId, glass: glassOn });
 	}
 
 	/** Glass effects (default on): apply at once + persist, like every other toggle on this page. */
@@ -692,7 +653,6 @@
 		if (!settingsLoaded) return;
 		settings.glass = !glassOn;
 		applyAppearanceNow();
-		void setWindowMaterial(); // glass off must also turn Mica off
 		try {
 			await saveSettings(fullSettings());
 		} catch (e) {
@@ -700,20 +660,6 @@
 		}
 	}
 
-	/** See-through window (default off): persist, apply, and drive the OS window material —
-	 *  best-effort, after the state change, never blocking the save. */
-	async function toggleSeeThrough() {
-		// QURATOR-93 twin (M1): see toggleAllowDms.
-		if (!settingsLoaded) return;
-		settings.see_through = !seeThroughOn;
-		applyAppearanceNow();
-		void setWindowMaterial();
-		try {
-			await saveSettings(fullSettings());
-		} catch (e) {
-			toast(String(e), 'error');
-		}
-	}
 
 	function onThemeGridKeydown(e: KeyboardEvent) {
 		const keys = ['ArrowRight', 'ArrowDown', 'ArrowLeft', 'ArrowUp', 'Home', 'End'];
@@ -1279,17 +1225,6 @@
 			</button>
 		</div>
 
-		{#if materialSupported}
-			<div class="toggle-row">
-				<div class="toggle-text">
-					<div class="toggle-label">See-through window</div>
-					<div class="toggle-sub">{seeThroughSub}</div>
-				</div>
-				<button class="toggle" class:toggle-on={seeThroughOn} onclick={toggleSeeThrough} disabled={!settingsLoaded || !glassOn} aria-label="See-through window">
-					<span class="toggle-thumb"></span>
-				</button>
-			</div>
-		{/if}
 	</div>
 
 	<!-- Danger Zone -->

@@ -1,18 +1,17 @@
 // QURATOR-352 — the theme contrast gate. Every theme must hold WCAG AA (4.5:1) for every text
-// role over its glass, in BOTH modes:
+// role over its glass:
 //   normal      — text over (glass over each backdrop sample);
-//   see-through — text over (veil over glass over (sample at 85 % over WHITE)) and over
-//                 (… over BLACK). Every theme, hoard included.
 //   plus        — --accent-text over every --primary-fill stop.
+// (The see-through mode and its --glass-veil were removed with the see-through window,
+// 2026-10-14 — owner: "We couldnt get the see-through window to work.")
 // This parses the REAL CSS, not a copy: `hoard` is the bare `:root` of src/app.css with its glass
 // block layered on top (as the browser cascades them), every other theme is its own `<id>.css`
 // beside this test. Gradients (--glass, --primary-fill) are
 // checked at EVERY colour stop, not just the first. A missing/misformatted token throws — the
 // parser must never silently skip a role, or a deleted token would read as a pass.
 //
-// The backdrop samples and the veil alphas are the draft's own validated numbers, mirrored here
-// in the SAMPLES / VEIL tables below (draft: /home/zephyrus/hoardbook-drafts/352-r2/index.html,
-// `const T[].samples` and `const VEIL`). The `SAMPLES mirror THEMES` test fails loudly when a new
+// The backdrop samples are the draft's own validated numbers, mirrored here in the SAMPLES table
+// below (draft: /home/zephyrus/hoardbook-drafts/352-r2/index.html, `const T[].samples`). The `SAMPLES mirror THEMES` test fails loudly when a new
 // theme is added without a row, so the table can never go stale silently.
 //
 // The oklch→sRGB converter is COPIED from src/lib/contrast.test.ts (it is not exported there,
@@ -21,8 +20,7 @@
 //
 // P-10 mutation ledger (each proven red against this gate, then reverted byte-for-byte):
 //   1. vault.css --fg-dim → rgb(255 255 255 / .30)          → vault rows red;
-//   2. sky-slate.css --glass-veil → transparent              → sky-slate see-through rows red;
-//   3. lime-ledger.css --accent line deleted                  → parser throws loudly (red).
+//   2. lime-ledger.css --accent line deleted                  → parser throws loudly (red).
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -186,8 +184,8 @@ function colourStops(value: string, where: string): RGBA[] {
 	return [parseColour(value, where)];
 }
 
-/* ── backdrop samples + veils, mirrored from the draft (/home/zephyrus/hoardbook-drafts/352-r2/
-   index.html `const T[].samples` and `const VEIL`). Each list is the theme's darkest/brightest
+/* ── backdrop samples, mirrored from the draft (/home/zephyrus/hoardbook-drafts/352-r2/
+   index.html `const T[].samples`). Each list is the theme's darkest/brightest
    backdrop regions. ADD A ROW FOR EVERY NEW THEME — the `SAMPLES mirror THEMES` test fails
    loudly on a missing or extra id. ── */
 const SAMPLES: Record<ThemeId, string[]> = {
@@ -202,24 +200,6 @@ const SAMPLES: Record<ThemeId, string[]> = {
 	'sky-slate': ['#c5dce4', '#60899c', '#7fa3b6'],
 };
 
-/** The draft's VEIL: the least extra tint (black on dark themes, white on light) that keeps every
- *  role at AA with a white or black desktop showing through at 15 %. */
-const VEIL: Record<ThemeId, number> = {
-	hoard: 0.4,
-	'oxblood-steel': 0.22,
-	'lime-ledger': 0.24,
-	'clinic-teal': 0.14,
-	'violet-drive': 0.16,
-	vault: 0.05,
-	'pale-pulse': 0.18,
-	'sky-slate': 0.12,
-};
-
-const DESKS: { label: string; c: RGBA }[] = [
-	{ label: 'WHITE', c: [255, 255, 255, 1] },
-	{ label: 'BLACK', c: [0, 0, 0, 1] },
-];
-
 interface Row {
 	theme: string;
 	role: string;
@@ -232,7 +212,7 @@ interface Row {
 function auditTheme(id: ThemeId): Row[] {
 	const where = `theme ${id}`;
 	const toks = themeTokens(id);
-	for (const name of ['fg', 'fg-muted', 'fg-dim', 'accent', 'accent-text', 'glass', 'glass-veil', 'bg']) {
+	for (const name of ['fg', 'fg-muted', 'fg-dim', 'accent', 'accent-text', 'glass', 'bg']) {
 		if (!toks.has(name)) {
 			throw new Error(`${where}: --${name} is missing from its CSS block — failing loudly, not silently skipping`);
 		}
@@ -253,11 +233,6 @@ function auditTheme(id: ThemeId): Row[] {
 	// --primary-fill falls back to --accent (hoard sets it to var(--accent); most themes inherit).
 	const primaryStops = colourStops(colour('primary-fill', 'accent'), `${where} --primary-fill`);
 	const samples = SAMPLES[id].map((s) => parseColour(s, `SAMPLES[${id}]`));
-	// The veil is the theme's REAL --glass-veil token, not the VEIL table — the table exists only
-	// as a drift pin (see the mirror test). The M2 mutation (sky-slate --glass-veil → transparent)
-	// only bites when the CSS value is what the maths consumes.
-	const veil = parseColour(resolveVar(toks.get('glass-veil')!, toks, where), `${where} --glass-veil`);
-
 	const rows: Row[] = [];
 	const check = (role: string, text: RGBA, pane: RGBA, paneDesc: string, modeLabel: string) => {
 		rows.push({ theme: id, role, mode: modeLabel, ratio: ratio(over(text, pane), pane), pane: paneDesc });
@@ -269,20 +244,6 @@ function auditTheme(id: ThemeId): Row[] {
 			const pane = over(g, s);
 			const desc = `glass stop ${gi + 1}/${glassStops.length} x sample ${si + 1}/${samples.length}`;
 			for (const [role, text] of roles) check(role, text, pane, desc, 'normal');
-		}
-	}
-
-	// See-through mode — every theme, hoard included (owner, 2026-10-13).
-	{
-		for (const [gi, g] of glassStops.entries()) {
-			for (const [si, s] of samples.entries()) {
-				for (const desk of DESKS) {
-					const ground = over([s[0], s[1], s[2], 0.85], desk.c);
-					const pane = over(veil, over(g, ground));
-					const desc = `glass stop ${gi + 1}/${glassStops.length} x sample ${si + 1}/${samples.length} over ${desk.label} desk`;
-					for (const [role, text] of roles) check(role, text, pane, desc, `see-through(${desk.label})`);
-				}
-			}
 		}
 	}
 
@@ -307,29 +268,13 @@ function renderTable(rows: Row[]): string {
 }
 
 describe('themes-contrast (QURATOR-352)', () => {
-	it('SAMPLES and VEIL mirror exactly the ids in THEMES (a new theme without rows fails here)', () => {
+	it('SAMPLES mirrors exactly the ids in THEMES (a new theme without rows fails here)', () => {
 		const ids = THEMES.map((t) => t.id).sort();
 		expect(Object.keys(SAMPLES).sort(), 'SAMPLES table ids must equal THEMES ids').toEqual(ids);
-		expect(Object.keys(VEIL).sort(), 'VEIL table ids must equal THEMES ids').toEqual(ids);
-		// Drift pin: each theme's real --glass-veil token must equal the draft-mirrored VEIL alpha
-		// (hoard included). If a theme re-tunes its veil,
-		// this names the theme and both values so the mirror is updated deliberately, never rots.
-		for (const t of THEMES) {
-			const toks = themeTokens(t.id);
-			const where = `theme ${t.id}`;
-			const raw = resolveVar(toks.get('glass-veil')!, toks, where);
-			{
-				const a = parseColour(raw, `${where} --glass-veil`)[3];
-				expect(
-					a,
-					`theme ${t.id}: --glass-veil alpha ${a} must equal the draft-mirrored VEIL value ${VEIL[t.id]} — update both together`
-				).toBeCloseTo(VEIL[t.id], 5);
-			}
-		}
 	});
 
 	for (const t of THEMES) {
-		it(`${t.id}: every text role clears 4.5:1 (normal + see-through + primary-fill ink)`, () => {
+		it(`${t.id}: every text role clears 4.5:1 (normal + primary-fill ink)`, () => {
 			const rows = auditTheme(t.id);
 			expect(rows.length, `${t.id}: no contrast checks ran — parser produced nothing`).toBeGreaterThan(0);
 			const failing = rows.filter((r) => r.ratio < MIN_RATIO);

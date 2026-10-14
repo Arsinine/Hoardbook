@@ -4,7 +4,7 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<!-- Fonts are self-hosted (static/fonts + @font-face in app.css) — no Google Fonts CDN request. -->
-		<!-- QURATOR-352: paint the persisted theme/glass/see-through attributes before Svelte loads
+		<!-- QURATOR-352: paint the persisted theme/glass attributes before Svelte loads
 		     (no flash of the default theme at launch). A static file, not an INLINE script: Tauri's
 		     CSP is `script-src 'self'` (no 'unsafe-inline'), which BLOCKS an inline script; a
 		     same-origin static file is 'self' and runs. Semantics pinned against apply.ts by

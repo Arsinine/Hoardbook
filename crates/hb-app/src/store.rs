@@ -125,11 +125,6 @@ pub struct Settings {
     /// keeps the glass look the theme ships with.
     #[serde(default = "default_true")]
     pub glass: bool,
-    /// QURATOR-352 — appearance. The optional see-through window (Mica on Windows 11 only; every
-    /// other OS stays opaque regardless of this flag — `set_window_material` no-ops there). Local
-    /// UI preference, never on the wire. Serde default `false` — off until explicitly opted in.
-    #[serde(default)]
-    pub see_through: bool,
 }
 
 impl Default for Settings {
@@ -151,7 +146,6 @@ impl Default for Settings {
             // QURATOR-352 appearance fields: a fresh install matches the serde (old-file) defaults.
             theme: default_theme(),
             glass: true,
-            see_through: false,
         }
     }
 }
@@ -2264,7 +2258,6 @@ pub(crate) mod tests {
             known_default_relays: vec!["wss://offered.example".into()],
             theme: "midnight".into(),
             glass: false,
-            see_through: true,
         };
         store.save_settings(&s).unwrap();
         let r = store.load_settings().unwrap().unwrap();
@@ -2291,19 +2284,17 @@ pub(crate) mod tests {
             vec!["wss://offered.example".to_string()],
             "the QURATOR-208 known-defaults watermark round-trips (a dropped field would reset it)"
         );
-        // QURATOR-352: the three appearance fields round-trip too (this exhaustive literal is
+        // QURATOR-352: the two appearance fields round-trip too (this exhaustive literal is
         // itself part of the guard — a new field that forgets this test breaks the compile).
         assert_eq!(r.theme, "midnight", "theme preserved");
         assert!(!r.glass, "glass=false preserved");
-        assert!(r.see_through, "see_through=true preserved");
     }
 
     #[test]
     fn appearance_fields_load_with_the_right_defaults_and_round_trip() {
-        // QURATOR-352 — the three appearance fields. An old settings.json without any of them
+        // QURATOR-352 — the two appearance fields. An old settings.json without any of them
         // must deserialize with the wire defaults: the default "vault" theme (owner ruling
-        // 2026-10-12 — an upgrade lands on the default like a fresh install), glass ON,
-        // see_through OFF.
+        // 2026-10-12 — an upgrade lands on the default like a fresh install) and glass ON.
         let old = r#"{"relay_urls":["wss://r.example"],"allow_dms":true}"#;
         let s: Settings = serde_json::from_str(old).expect("old settings must still deserialize");
         // MUTATION (P-10): on the `pub theme: String,` field, change
@@ -2315,10 +2306,6 @@ pub(crate) mod tests {
         // `#[serde(default = "default_true")]` to `#[serde(default)]` — this assert reds (an old
         // file would then load glass as OFF, losing the look the theme ships with).
         assert!(s.glass, "glass defaults ON on an old file");
-        // MUTATION (P-10): on the `pub see_through: bool,` field, change `#[serde(default)]` to
-        // `#[serde(default = "default_true")]` — this assert reds (an old file would then load
-        // see_through as ON, silently opting every existing user into the see-through window).
-        assert!(!s.see_through, "see_through defaults OFF on an old file");
 
         // A fresh install (`Settings::default()`) agrees with the wire defaults.
         // MUTATION (P-10): in `impl Default for Settings`, change `theme: default_theme(),` to
@@ -2337,14 +2324,33 @@ pub(crate) mod tests {
         let s = Settings {
             theme: "midnight".into(),
             glass: false,
-            see_through: true,
             ..Default::default()
         };
         store.save_settings(&s).unwrap();
         let r = store.load_settings().unwrap().unwrap();
         assert_eq!(r.theme, "midnight", "theme round-trips");
         assert!(!r.glass, "glass=false round-trips");
-        assert!(r.see_through, "see_through=true round-trips");
+    }
+
+    #[test]
+    fn a_settings_file_from_a_build_with_the_see_through_window_still_loads() {
+        // The see-through window (Mica) was removed 2026-10-14 (owner: "we couldnt get the
+        // see-through window to work"). Every settings.json written by v0.23.x carries a
+        // `see_through` key; it must keep loading — the unknown key is ignored, nothing else
+        // changes — and a save after load must drop it rather than fail.
+        // MUTATION (P-10): add `#[serde(deny_unknown_fields)]` to the `Settings` derive above —
+        // `from_str` then rejects the old file and this test reds.
+        let old = r#"{"relay_urls":["wss://r.example"],"allow_dms":true,"theme":"sky-slate","glass":true,"see_through":true}"#;
+        let s: Settings = serde_json::from_str(old).expect("a v0.23.x settings file with see_through must still load");
+        assert_eq!(s.theme, "sky-slate", "the fields around the stale key are read normally");
+        assert!(s.glass);
+        let (dir, store) = test_store();
+        store.save_settings(&s).unwrap();
+        let back = std::fs::read_to_string(dir.path().join("settings.json"))
+            .expect("save_settings writes settings.json in the store dir");
+        assert!(!back.contains("see_through"), "a save after load drops the stale key");
+        let r = store.load_settings().unwrap().unwrap();
+        assert_eq!(r.theme, "sky-slate", "round-trips after the stale key is dropped");
     }
 
     #[test]

@@ -124,7 +124,6 @@
   --glass-blur:    0px;
   --glass-rim:     var(--border);
   --glass-bevel:   none;
-  --glass-veil:    transparent;     /* extra pane tint used only in see-through mode */
   --glass-solid:   var(--bg);       /* fallback when glass is off (reduced transparency etc.) */
   --panel-gap:     0px;
 
@@ -150,7 +149,6 @@
   --glass-blur:    18px;
   --glass-rim:     oklch(1 0 0 / 0.09);
   --glass-bevel:   inset 0 1px 0 oklch(1 0 0 / 0.04);
-  --glass-veil:    oklch(0 0 0 / 0.40);
   --glass-solid:   oklch(0.19 0.006 260);
   --panel-gap:     10px;
   --r-panel:       14px;
@@ -187,11 +185,6 @@
   background: var(--glass-raised); border-color: var(--glass-rim);
   -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.35);
   backdrop-filter: blur(var(--glass-blur)) saturate(1.35);
-}
-/* See-through window (Windows 11 Mica): the OS paints behind a transparent window, the theme
-   backdrop drops to 85 %, and panes take an extra veil so text keeps AA contrast. */
-:root[data-see-through] .hb-pane::before {
-  background: linear-gradient(var(--glass-veil), var(--glass-veil)), var(--glass);
 }
 /* Glass off: no blur anywhere, surfaces become the theme's computed solid colour. Triggered by the
    Settings switch (data-glass-off — which also clears data-glass-float, so the float rules above
