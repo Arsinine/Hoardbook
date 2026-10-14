@@ -4,8 +4,8 @@
 //
 // This file drives the REAL mounted Settings page through the real DOM — not a source scan
 // (CLAUDE.md §7: source-scans are the documented origin of vacuous controls here). Two pins:
-//   1. the switch exists, states the reciprocity plainly ("other people will request
-//      collections from you too" — the honesty IS the design, not a footnote), and
+//   1. the switch exists, states the reciprocity ("other people will request collections from
+//      you too" — behind the row's (i) since the owner's 2026-10-14 devtest), and
 //      toggling it actually reaches saveSettings with swarm_caching: true on the WHOLE object;
 //   2. the toggle is disabled until the settings load succeeds — the QURATOR-93 defaults-editor
 //      hazard, same guard every other toggle row carries.
@@ -116,18 +116,22 @@ describe('QURATOR-164 — the swarm-caching opt-in switch and its reciprocity co
 		expect(saved.big_relay_url).toBe('');
 	});
 
-	it('the reciprocity copy states plainly that other people will request from you too', async () => {
+	it('the reciprocity copy lives behind the (i), and still states that other people will request from you too', async () => {
+		// Owner devtest 2026-10-14 reversed QURATOR-164's "stays in plain view": the copy moved behind
+		// the row's FeatureTooltip like the other Preferences rows. The disclosure itself is unchanged.
+		// P-10 MUTATION (orchestrator): delete `<FeatureTooltip key="swarm-caching" />` from the
+		// swarm-caching toggle-label → REDS (no trigger in the row).
 		getSettingsMock.mockResolvedValue({ ...OK_SETTINGS });
 		primeIdentity();
 		const r = renderSettings();
-		await waitFor(() => expect(r.getByText('Fetch new collections automatically')).toBeTruthy());
-		// Owner ruling 2026-09-26: shortened to "You'll hold more; other people will request
-		// collections from you too." — still both halves, still in plain view, just terser.
-		// MUTATION (P-10): in +page.svelte, in the swarm-caching toggle-row's `<div class="toggle-sub">`
-		// region, delete that sentence — this test reds on getByText below.
-		expect(r.getByText(/other people will request collections from you too/i)).toBeTruthy();
-		// And it is not softened away: the same sub-label also names the "you'll hold more" half.
-		expect(r.getByText(/you'll hold more/i)).toBeTruthy();
+		const label = await waitFor(() => r.getByText('Fetch new collections automatically', { selector: '.toggle-label' }));
+		const row = label.closest('.toggle-row') as HTMLElement;
+		expect(row.querySelector('.toggle-sub'), 'the sub-label is back on the page').toBeNull();
+		const trigger = row.querySelector('.ft-trigger') as HTMLButtonElement;
+		expect(trigger).not.toBeNull();
+		const tip = document.getElementById(trigger.getAttribute('aria-describedby')!)!;
+		expect(tip.textContent).toMatch(/other people will request collections from you too/i);
+		expect(tip.textContent).toMatch(/you’ll hold more/i);
 	});
 
 	it('the toggle is disabled until the settings load succeeds (QURATOR-93 twin)', async () => {

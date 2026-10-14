@@ -1016,15 +1016,11 @@
 			</button>
 		</div>
 
-		<!-- QURATOR-164 owner ruling: the reciprocity disclosure ("other people will request from you
-		     too") must stay in plain view, not behind a hover — shortened here, not hidden. -->
+		<!-- Owner devtest of v0.25.0 (2026-10-14): the reciprocity disclosure moves behind the (i) like
+		     the other Preferences rows — this reverses QURATOR-164's "stays in plain view" ruling. -->
 		<div class="toggle-row">
 			<div class="toggle-text">
-				<div class="toggle-label">Fetch new collections automatically</div>
-				<div class="toggle-sub">
-					Auto-fetches new hoarders' public collections and keeps copies you've relayed. You'll
-					hold more; other people will request collections from you too.
-				</div>
+				<div class="toggle-label">Fetch new collections automatically<FeatureTooltip key="swarm-caching" /></div>
 			</div>
 			<button class="toggle" class:toggle-on={settings.swarm_caching} onclick={toggleSwarmCaching} disabled={!settingsLoaded} aria-label="Fetch new collections automatically">
 				<span class="toggle-thumb"></span>
@@ -1218,7 +1214,6 @@
 		<div class="toggle-row">
 			<div class="toggle-text">
 				<div class="toggle-label">Glass effects</div>
-				<div class="toggle-sub">Turn off to use solid panels. Windows also turns glass off when you switch off transparency effects or use Battery Saver.</div>
 			</div>
 			<button class="toggle" class:toggle-on={glassOn} onclick={toggleGlass} disabled={!settingsLoaded} aria-label="Glass effects">
 				<span class="toggle-thumb"></span>

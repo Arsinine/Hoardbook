@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { TOOLTIPS, TOOLTIP_KEYS, type TooltipKey } from './tooltips.js';
 
 describe('tooltips — feature-help registry (HOARDBOOK_SPEC §8)', () => {
-	it('has exactly the eleven anchored keys, no more, no less (drift guard)', () => {
+	it('has exactly the twelve anchored keys, no more, no less (drift guard)', () => {
 		const expected: TooltipKey[] = [
 			'no-download',
 			'willing-to',
@@ -17,10 +17,12 @@ describe('tooltips — feature-help registry (HOARDBOOK_SPEC §8)', () => {
 			'auto-update-snapshots',
 			'reconcile-poll',
 			'discoverable',
+			// Owner devtest 2026-10-14: the swarm-caching reciprocity copy moved behind the (i) too.
+			'swarm-caching',
 		];
 		expect(new Set(TOOLTIP_KEYS)).toEqual(new Set(expected));
 		expect(Object.keys(TOOLTIPS).sort()).toEqual([...expected].sort());
-		expect(TOOLTIP_KEYS).toHaveLength(11);
+		expect(TOOLTIP_KEYS).toHaveLength(12);
 	});
 
 	it('every key resolves to a non-empty { title, body }', () => {

@@ -1752,6 +1752,7 @@
 							type="text"
 							placeholder="tag…"
 							bind:value={tagInput}
+							{@attach (el) => el.focus()}
 							onkeydown={(e) => {
 								if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); handleAddTag(peer.npub, myTags); }
 								if (e.key === 'Escape') { editingTagsFor = null; tagInput = ''; }
@@ -1870,7 +1871,6 @@
 					/>
 					Receives my Private collections
 				</label>
-				<span class="mine-note">sealed to them on next publish</span>
 			</div>
 
 			<!-- Private collections sealed to me (M10). QURATOR-92: Browse now serves them in a
@@ -2034,7 +2034,7 @@
 	   width and is clipped, never reflowed and never dimmed ("No dimming"). */
 	.detail-clip { min-width: 0; }
 	.detail-pane.pane-clipping { padding-right: 20px; }
-	.detail-scroll { flex: 1; min-height: 0; overflow-y: auto; }
+	.detail-scroll { flex: 1; min-height: 0; overflow-x: hidden; overflow-y: auto; }
 	.detail-pane .detail-scroll { margin-top: 14px; border-top: 1px solid var(--border); padding-bottom: 4px; }
 	.discover-pane { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 	.discover-pane .detail-scroll { padding: 12px 16px 20px; }
@@ -2367,7 +2367,6 @@
 		border: 1px solid color-mix(in oklch, var(--accent) 22%, transparent);
 		display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
 	}
-	.mine-note { font-size: 10.5px; color: var(--fg-dim); }
 
 	/* M21 W4 behaviour 2 — cold-cache amber control (clickable to refresh, not a verdict pill). */
 	.cold-cache {

@@ -91,6 +91,26 @@ describe('QURATOR-378 rev b — the contact pane in four tiers', () => {
 		expect(dts[dts.length - 1]).toBe('Identity');
 	});
 
+	it('"+ tag" opens the tag input with the caret already in it (owner devtest 2026-10-14)', async () => {
+		// Owner: "when creating a new tag, the cursor doesnt appear straight away meaning trying to
+		// type anything fails." The input mounts on the click, so it must take focus itself.
+		// P-10 MUTATION (orchestrator): delete `{@attach (el) => el.focus()}` from the tag-input → REDS.
+		const pane = await open(peer(1));
+		await fireEvent.click(pane.querySelector('.tag-add-btn')!);
+		const input = await waitFor(() => {
+			const el = pane.querySelector('.about .tags input.tag-input');
+			expect(el).not.toBeNull();
+			return el as HTMLInputElement;
+		});
+		expect(document.activeElement).toBe(input);
+	});
+
+	it('the Private box carries no "sealed to them on next publish" note (owner devtest 2026-10-14)', async () => {
+		// P-10 MUTATION (orchestrator): restore the `<span class="mine-note">…</span>` line → REDS.
+		const pane = await open(peer(1));
+		expect(pane.querySelector('.mine')!.textContent).not.toMatch(/sealed to them/i);
+	});
+
 	it('5 or fewer collections show all of them and no Show-more link', async () => {
 		const pane = await open(peer(5));
 		expect(pane.querySelectorAll('.cpop-row').length).toBe(5);

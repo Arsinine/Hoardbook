@@ -7,10 +7,9 @@
 // Owner ruling 2026-09-26: the Settings "Preferences" toggles' long explanatory sub-copy moved
 // here (allow-dms, auto-update-snapshots, reconcile-poll, discoverable) — each toggle keeps a
 // short one-line label/sub-label on the page and the fuller explanation lives behind its (i).
-// "Fetch new collections automatically" (swarm-caching) is the deliberate exception: its
-// reciprocity disclosure stays visible on the page (owner ruling, QURATOR-164) — shortened, not
-// hidden — because hiding "other people will request from you too" behind a hover would soften a
-// consent-relevant fact the owner ruled must be stated plainly.
+// "Fetch new collections automatically" (swarm-caching) was the exception until 2026-10-14: its
+// reciprocity disclosure stayed visible on the page (QURATOR-164). The owner's v0.25.0 devtest moved
+// it behind the (i) like the others ("hide the additional copy in a tooltip like the others").
 
 export type TooltipKey =
 	| 'no-download'
@@ -23,7 +22,8 @@ export type TooltipKey =
 	| 'allow-dms'
 	| 'auto-update-snapshots'
 	| 'reconcile-poll'
-	| 'discoverable';
+	| 'discoverable'
+	| 'swarm-caching';
 
 /** The canonical key list — single source of truth for iteration + the registry-completeness test. */
 export const TOOLTIP_KEYS: TooltipKey[] = [
@@ -38,6 +38,7 @@ export const TOOLTIP_KEYS: TooltipKey[] = [
 	'auto-update-snapshots',
 	'reconcile-poll',
 	'discoverable',
+	'swarm-caching',
 ];
 
 export interface TooltipContent {
@@ -103,5 +104,10 @@ export const TOOLTIPS: Record<TooltipKey, TooltipContent> = {
 	'discoverable': {
 		title: 'Show up in Discover Hoarders',
 		body: 'Off means people can’t find you by tag or content-type search. They can still reach you with your npub or share code, and your contacts are unaffected.',
+	},
+	// Verbatim from the toggle's former sub-label (QURATOR-164 reciprocity disclosure).
+	'swarm-caching': {
+		title: 'Fetch new collections automatically',
+		body: 'Auto-fetches new hoarders’ public collections and keeps copies you’ve relayed. You’ll hold more; other people will request collections from you too.',
 	},
 };
