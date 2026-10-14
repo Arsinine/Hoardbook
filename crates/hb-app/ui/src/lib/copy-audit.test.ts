@@ -50,6 +50,42 @@ describe('copy-audit engine — Q4/Q6: "Contact" replaces follow*, "share" reser
 		expect(segments.some((s) => s.includes('Hello') && s.includes('welcome'))).toBe(true);
 		expect(segments.every((s) => s.trim().length > 0)).toBe(true);
 	});
+
+	it('markup apostrophes never open a bogus literal (QURATOR-365)', () => {
+		// Pre-fix, STRING_LITERAL_RE ran over the WHOLE comment-stripped source, markup included: the
+		// apostrophe in "You're" opened a "literal" that swallowed text up to the NEXT apostrophe
+		// anywhere later in the file (here yielding the bogus segment "re here. Don"), and one more
+		// apostrophe anywhere later flipped the pairing (the 2026-10-13 Home regression, 0b808c9b).
+		// MUTATION that reds this and the parity test below: in src/lib/copy-audit.ts, replace the
+		// three literal-collection passes in extractUserFacingSegments (script blocks + {…}
+		// expressions + double-quoted attributes) with a single whole-source pass
+		// `while ((m = STRING_LITERAL_RE.exec(stripped))) { const val = …; if (val) segments.push(val); }`
+		// — this fixture's no-bogus-segment assertion and the parity test's second expect red. Then
+		// restore the file, `touch` it, and both go green again.
+		const fixture = `<script>\n\tconst m = 'ok';\n</script>\n<p>You're here. Don't follow anyone.</p><span>followers</span>`;
+		const hits = findForbiddenCopy(fixture);
+		expect(hits).toEqual([
+			{ rule: 'follow', segment: "You're here. Don't follow anyone." },
+			{ rule: 'follow', segment: 'followers' },
+		]);
+		// The bogus standalone segment must not exist. (A substring check is vacuous here: the intact
+		// text node "You're here. Don't follow anyone." itself contains "re here. Don".)
+		expect(extractUserFacingSegments(fixture)).not.toContain('re here. Don');
+	});
+
+	it('apostrophe parity cannot flip the report — one more apostrophe, the same two hits', () => {
+		// Same fixture with one more `'` added in a later text node. Pre-fix the pairing changed:
+		// the apostrophe in "don't" then paired with the one in "It's", sweeping
+		// "followers</span>" up into the bogus literal — fixture B reported a THIRD hit.
+		const plain = `<script>\n\tconst m = 'ok';\n</script><p>We just follow people, don't we.</p><span>followers</span>`;
+		const shifted = `<script>\n\tconst m = 'ok';\n</script><p>We just follow people, don't we.</p><span>followers</span><p>It's late.</p>`;
+		const expected = [
+			{ rule: 'follow', segment: "We just follow people, don't we." },
+			{ rule: 'follow', segment: 'followers' },
+		];
+		expect(findForbiddenCopy(plain)).toEqual(expected);
+		expect(findForbiddenCopy(shifted)).toEqual(expected);
+	});
 });
 
 // ── Repo-wide sweep — MUST be green once the Q4/Q6 copy migration is complete. ─────────────────────
@@ -87,6 +123,16 @@ describe('copy-audit — repo-wide sweep (Q4/Q6 migration)', () => {
 	}
 
 	const files = scanSet();
+
+	// QURATOR-365 follow-up (orchestrator): a markup-free .ts source is ALL code, so its literals
+	// are still collected — without this the three view-models in the sweep pass vacuously.
+	// MUTATION: delete the `if (scriptBlocks.length === 0 && …) { collectLiterals(stripped); return
+	// segments; }` block in extractUserFacingSegments → this test reds (zero hits).
+	it('a plain .ts source with no <script> and no markup still has its literals audited', () => {
+		const src = "export const COPY = { a: 'follow them', b: \"shared listing\" };\n";
+		expect(extractUserFacingSegments(src)).toEqual(['follow them', 'shared listing']);
+		expect(findForbiddenCopy(src).map((h) => h.rule)).toEqual(['follow', 'share-wrong-sense']);
+	});
 
 	it('scans a non-trivial set of files', () => {
 		expect(files.length).toBeGreaterThan(10);

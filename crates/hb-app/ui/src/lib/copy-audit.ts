@@ -48,23 +48,57 @@ function stripNonCopy(source: string): string {
 }
 
 const STRING_LITERAL_RE = /'([^'\\]*(?:\\.[^'\\]*)*)'|"([^"\\]*(?:\\.[^"\\]*)*)"|`([^`\\]*(?:\\.[^`\\]*)*)`/g;
+// In markup, only double-quoted ATTRIBUTE values are user-facing copy; a single quote or backtick
+// there is an apostrophe or prose, never a string literal. QURATOR-365: the old whole-source
+// literal pass took a contraction's apostrophe (`You're`) as an opening quote that swallowed text
+// up to the NEXT apostrophe anywhere later in the file, so the parity of apostrophes in a page
+// decided what was reported. `{…}` expressions and `<script>` blocks are code — all three quote
+// kinds are literals there, and a `'` inside a double-quoted attribute stays inside the value.
+const MARKUP_EXPR_RE = /\{[^{}]*\}/g;
+const MARKUP_DQ_RE = /"([^"\\]*(?:\\.[^"\\]*)*)"/g;
 const MARKUP_TEXT_RE = />([^<>]+)</g;
 
-/** Collect every quoted string literal ('…' "…" `…`) and markup text node (`>text<`, `{expr}`
- *  segments stripped), trimmed, non-empty. Markup text is scanned outside any `<script>` block only —
- *  TS generics/comparisons (`Array<string>`, `a > b`) would otherwise produce noise `>…<` spans. */
+/** Collect string literals from CODE regions — `<script>` blocks and `{expr}` markup expressions,
+ *  all three quote kinds — plus double-quoted attribute values in markup, and every markup text
+ *  node (`>text<`, `{expr}` segments stripped), trimmed, non-empty. Markup text is scanned outside
+ *  any `<script>` block only — TS generics/comparisons (`Array<string>`, `a > b`) would otherwise
+ *  produce noise `>…<` spans. */
 export function extractUserFacingSegments(source: string): string[] {
 	const stripped = stripNonCopy(source);
 	const segments: string[] = [];
 
+	const collectLiterals = (text: string) => {
+		STRING_LITERAL_RE.lastIndex = 0;
+		let lm: RegExpExecArray | null;
+		while ((lm = STRING_LITERAL_RE.exec(text))) {
+			const val = (lm[1] ?? lm[2] ?? lm[3] ?? '').trim();
+			if (val) segments.push(val);
+		}
+	};
+
 	let m: RegExpExecArray | null;
-	STRING_LITERAL_RE.lastIndex = 0;
-	while ((m = STRING_LITERAL_RE.exec(stripped))) {
-		const val = (m[1] ?? m[2] ?? m[3] ?? '').trim();
+
+	// Quoted literals are CODE — they are collected only inside `<script>` blocks. A plain `.ts`
+	// view-model (tooltips.ts & co) has no `<script>` block and no markup: the WHOLE file is code,
+	// so it takes the full literal pass — otherwise the sweep would pass it vacuously (zero segments).
+	const scriptBlocks = stripped.match(/<script[\s\S]*?<\/script>/gi) ?? [];
+	if (scriptBlocks.length === 0 && !/<[a-zA-Z]/.test(stripped)) {
+		collectLiterals(stripped);
+		return segments;
+	}
+	for (const block of scriptBlocks) collectLiterals(block);
+
+	const markupOnly = stripped.replace(/<script[\s\S]*?<\/script>/gi, '');
+
+	MARKUP_EXPR_RE.lastIndex = 0;
+	while ((m = MARKUP_EXPR_RE.exec(markupOnly))) collectLiterals(m[0]);
+
+	MARKUP_DQ_RE.lastIndex = 0;
+	while ((m = MARKUP_DQ_RE.exec(markupOnly))) {
+		const val = m[1].trim();
 		if (val) segments.push(val);
 	}
 
-	const markupOnly = stripped.replace(/<script[\s\S]*?<\/script>/gi, '');
 	MARKUP_TEXT_RE.lastIndex = 0;
 	while ((m = MARKUP_TEXT_RE.exec(markupOnly))) {
 		const text = m[1].replace(/\{[^}]*\}/g, ' ').trim();
