@@ -5,7 +5,7 @@
 	// entry can be in both); state c = the person panel, with Looking for FIRST (the demand side
 	// is why you opened the entry). Message is NEVER gated on being a contact (owner ruling);
 	// an added stranger flips to Contact AT ONCE (owner ruling).
-	// QURATOR-351: PeopleLikeYou + AddContactPanel Discover fold into DiscoverBook in a follow-up.
+	// QURATOR-360 F1: the likes panel folded into this view (the old lane-C component deleted).
 	import { goto } from '$app/navigation';
 	import { discoverPeople, follow } from '$lib/api.js';
 	import type { PhonebookEntry } from '$lib/types.js';
@@ -110,9 +110,12 @@
 		}
 	}
 
-	function message(npub: string) {
-		// Same compose route AddContactPanel uses for its discovery hit-cards (works for strangers).
-		void goto('/chat?compose=' + encodeURIComponent(npub));
+	function message(e: PhonebookEntry) {
+		// The compose route the old discovery hit-cards used (works for strangers). M17 W2: a
+		// discovery hit is keyless by design, so a STRANGER's Message always carries the ask-access
+		// prefill; a contact gets the plain compose box.
+		const intent = isContact(e) ? '' : '&intent=ask-access';
+		void goto('/chat?compose=' + encodeURIComponent(e.npub) + intent);
 	}
 
 	const onlyTitleMatch = (e: PhonebookEntry) => e.matched.length === 1 && e.matched[0] === 'title';
@@ -161,7 +164,7 @@
 						onclick={() => addPerson(e.npub)}>+</button
 					>
 				{/if}
-				<button type="button" class="btn-ghost btn-xs" onclick={() => message(e.npub)}>Message</button>
+				<button type="button" class="btn-ghost btn-xs" onclick={() => message(e)}>Message</button>
 			</div>
 		</div>
 		{#if e.collections.length > 0}
@@ -284,11 +287,12 @@
 					onclick={() => addPerson(panelEntry.npub)}>+ Add</button
 				>
 			{/if}
-			<button type="button" class="btn-default" onclick={() => message(panelEntry.npub)}>Message</button>
+			<button type="button" class="btn-default" onclick={() => message(panelEntry)}>Message</button>
 		</div>
-		<!-- Order is the ruling: Looking for FIRST, then Public collections, Interests. Topics and
-		     the Contact hint are SKIPPED — the phonebook entry carries neither yet; both fold in
-		     when the teaser carries them. -->
+		<!-- Order is the ruling: Looking for FIRST, then Public collections, Interests, Contact
+		     (LAST, only when the entry carries a hint). Topics is NOT sourceable — topic
+		     membership is members-only/encrypted (hb-net/src/topic.rs), the teaser never
+		     carries it. -->
 		{#if panelEntry.looking_for}
 			<div class="d-sec">Looking for</div>
 			<p class="d-wants">{panelEntry.looking_for}</p>
@@ -314,6 +318,10 @@
 			<div class="chips">
 				{#each panelEntry.tags as tag (tag)}<span class="chip">{tag}</span>{/each}
 			</div>
+		{/if}
+		{#if panelEntry.contact_hint}
+			<div class="d-sec">Contact</div>
+			<p class="d-wants">{panelEntry.contact_hint}</p>
 		{/if}
 	{/if}
 </Modal>

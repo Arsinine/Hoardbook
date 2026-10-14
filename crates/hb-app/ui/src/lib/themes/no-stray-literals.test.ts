@@ -74,17 +74,9 @@ const ALLOWED: Record<string, string[]> = {
 		'oklch(0.78 0.14 35)',
 	],
 	'lib/components/PersonRow.svelte': ['inset 0 0 0 1px oklch(1 0 0 / 0.12)'],
-	'lib/components/PeopleLikeYou.svelte': [
-		'1px solid oklch(1 0 0 / 0.06)',
-		'1px solid oklch(1 0 0 / 0.12)',
-		'0 8px 24px oklch(0 0 0 / 0.35)',
-	],
 	// hue gradients + one-off shadows/tints with no exact token
 	'lib/components/AddContactPanel.svelte': [
 		'linear-gradient(135deg, oklch(0.30 0.10 280) 0%, oklch(0.25 0.12 320) 100%)',
-		'0 4px 14px rgba(0,0,0,0.25)',
-		'oklch(0.75 0.15 25)',
-		'oklch(0.72 0.13 70)',
 	],
 	// close-button hover on red — deliberate literal (order: leave)
 	'lib/components/WindowControls.svelte': ['#fff'],

@@ -21,14 +21,16 @@ describe('Contacts page — M17 W2 ask-access ramps', () => {
 		expect(src).not.toMatch(/ask-access-btn/);
 	});
 
-	it('the W1 discovery messagePeer callback now uses the compose deep-link with ask-access intent', () => {
-		// Ramp (c): discovery hits are keyless by design, so the W1 Message callback routes to
-		// `/chat?compose=<npub>&intent=ask-access` (always — no petname, the stranger case).
-		const src = contactsSrc();
-		// The messagePeer function (W1) now includes the intent param on its compose deep-link.
-		const fnOpen = src.indexOf('function messagePeer');
+	it('the discovery Message action (now in DiscoverBook) keeps the compose deep-link with ask-access intent for a stranger', () => {
+		// Ramp (c): discovery hits are keyless by design, so a stranger's Message routes to
+		// `/chat?compose=<npub>&intent=ask-access`. QURATOR-360/361: the W1 hit-cards and the page's
+		// messagePeer are gone; the one discovery surface is DiscoverBook, so the pin moved there.
+		// MUTATION (seen red 2026-10-14): in DiscoverBook.svelte replace the `'&intent=ask-access'`
+		// branch of `const intent = …` with `''` → reds.
+		const src = readFileSync(new URL('../../lib/components/DiscoverBook.svelte', import.meta.url), 'utf8');
+		const fnOpen = src.indexOf('function message(');
 		expect(fnOpen).toBeGreaterThan(-1);
-		const fnClose = src.indexOf('}', fnOpen);
+		const fnClose = src.indexOf('\n\t}', fnOpen);
 		const fnBody = src.slice(fnOpen, fnClose);
 		expect(fnBody).toMatch(/compose=/);
 		expect(fnBody).toMatch(/intent=ask-access/);

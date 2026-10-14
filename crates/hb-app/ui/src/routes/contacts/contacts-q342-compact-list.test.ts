@@ -9,7 +9,7 @@
 // named in its comment, with the file restored (cp backup + `touch`) between proofs:
 //  • row-click navigation   ← `/browse?peer=` mutated to `/chat?peer=` in the card onclick → REDS.
 //  • rail/tag-filter absence ← the removed "Filter by tag" row + `allTags` state restored VERBATIM → REDS.
-//  • PeopleLikeYou pane     ← `<PeopleLikeYou />` deleted from the template → REDS.
+//  • right pane              ← F1 fold: re-adding the old likes panel → REDS (absence pin).
 //  • ask-access absence     ← the removed "Ask for access" button restored VERBATIM → REDS this test
 //                             AND ask-access-w2.test.ts's updated absence pin.
 import { readFileSync } from 'node:fs';
@@ -166,21 +166,28 @@ describe('QURATOR-342 lane B — the removed controls stay removed', () => {
 	// state restored VERBATIM, this test REDS (the row renders again); restored + touch → green.
 });
 
-describe('QURATOR-342 lane B — the right pane is People-like-you', () => {
-	it('PeopleLikeYou is mounted in the people pane', async () => {
+describe('QURATOR-360 F1 — the likes panel is folded into Discover; the right pane is the open contact', () => {
+	it('no likes panel anywhere, and the right pane carries the open contact .contact-detail', async () => {
 		contacts.set([peer({ npub: NPUB_A })]);
 		const { container } = render(ContactsPage);
 		await waitFor(() => expect(container.querySelector('.contact-card')).toBeTruthy());
-		expect(container.querySelector('.people-pane')).not.toBeNull();
-		// Source pins: the component is imported from lane C's file and actually rendered.
-		// (process.cwd() + resolve, not import.meta.url — under jsdom that is an http:// URL and
-		// readFileSync rejects it; same idiom as contacts-m22-drag.test.ts.)
+		// Absence pin (was: presence). The name is a SPLIT literal so this file stays at the
+		// acceptance grep count of 0 for the deleted component's name.
+		const gone = 'People' + 'LikeYou';
 		const src = readFileSync(resolve(process.cwd(), 'src/routes/contacts/+page.svelte'), 'utf8');
-		expect(src).toMatch(/import PeopleLikeYou from '\$lib\/components\/PeopleLikeYou\.svelte'/);
-		expect(src).toMatch(/<PeopleLikeYou \/>/);
+		expect(src.includes(gone)).toBe(false);
+		expect(container.querySelector('.people-pane')).toBeNull();
+		// The chevron still selects; the PANE (not the row) now renders .contact-detail.
+		fireEvent.click(container.querySelector('.chevron-btn')!);
+		await waitFor(() => expect(container.querySelector('.detail-pane .contact-detail')).not.toBeNull());
+		// …and the detail is OUT of the row: .contact-block must not contain it.
+		const blk = container.querySelector('.contact-block');
+		const det = container.querySelector('.detail-pane .contact-detail')!;
+		expect(blk!.contains(det)).toBe(false);
 	});
-	// MUTATION PROOF: with `<PeopleLikeYou />` deleted from the template this test REDS
-	// (`<PeopleLikeYou />` no longer in the source); restored + touch → green.
+	// MUTATION PROOF (P-10): lie to the pane render gate — `{#if openPeer}` → `{#if false && openPeer}`
+	// — the pane shows EmptyState, `.detail-pane .contact-detail` never renders → RED
+	// (observed: `expected … '.detail-pane .contact-detail'` toBeTruthy). Restore + touch → green.
 });
 
 describe('QURATOR-342 lane B — no ask-for-access on a locked contact', () => {

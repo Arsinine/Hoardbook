@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { follow, refreshContact, unfollowContact, setContactTags, groupsGet, groupsCreate, groupsDelete, groupsAssign, groupsUnassign, groupsCreateWithMembers, contactUpdateGroups, browsePrivateCollections, applyKeyGrants, onlineCount, relayStatus, getContacts, privateAudienceList, privateAudienceSet, type OnlineCount, type RelayHealth } from '$lib/api.js';
+	import { discoverPeople, follow, refreshContact, unfollowContact, setContactTags, groupsGet, groupsCreate, groupsDelete, groupsAssign, groupsUnassign, groupsCreateWithMembers, contactUpdateGroups, browsePrivateCollections, applyKeyGrants, onlineCount, relayStatus, getContacts, privateAudienceList, privateAudienceSet, type OnlineCount, type RelayHealth } from '$lib/api.js';
 	import { contacts, toast, toastWithAction, contactsLoadError, loadContactsInto } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import CollectionPanel from '$lib/components/CollectionPanel.svelte';
@@ -14,7 +14,6 @@
 	import AddContactDialog from '$lib/components/AddContactDialog.svelte';
 	import AddContactPanel from '$lib/components/AddContactPanel.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
-	import PeopleLikeYou from '$lib/components/PeopleLikeYou.svelte';
 	import DiscoverBook from '$lib/components/DiscoverBook.svelte';
 	import type { CachedPeer, Collection, ContactSummary, Group, Profile } from '$lib/types.js';
 	import { contactDisplayName, shortNpub } from '$lib/contact-display.js';
@@ -851,13 +850,6 @@
 		}
 	}
 
-	// M17 W1: "Message" on a discovery hit-card (non-contact) → compose deep-link (chat ?compose=).
-	// M17 W2: discovery hits are keyless by design, so the Message action always carries the
-	// ask-access intent — first contact starts with the right words already in the box.
-	function messagePeer(npub: string) {
-		goto('/chat?compose=' + npub + '&intent=ask-access');
-	}
-
 	// QURATOR-93: the Retry on the contacts load-error state. Re-runs the layout's exact fetch
 	// through the same flag-setting helper (success fills the list AND clears the error).
 	async function retryContactsLoad() {
@@ -896,6 +888,26 @@
 	// Contacts list state (M15 W5: chevron toggles the light-detail area; browsing a peer's
 	// collections moved to the Browse tab via the `/browse?peer=` deep-link — no inline expansion).
 	let detailExpanded: string | null = $state(null);
+	// QURATOR-360 F1: the right pane shows the OPEN contact (r5 state d), keyed on the same
+	// detailExpanded the chevron writes; the row keeps its own open styling via isOpen.
+	const openPeer = $derived($contacts.find((c) => c.npub === detailExpanded) ?? null);
+	// "N% like you" for the pane header: read from the ONE source (discover_people, the command
+	// DiscoverBook uses), cached so one fetch serves every selection; unknown -> the line is absent.
+	let openLikeness = $state<Record<string, number>>({});
+	let likenessTried = false;
+	async function loadLikeness() {
+		if (likenessTried) return;
+		likenessTried = true;
+		try {
+			const res = await discoverPeople();
+			const m: Record<string, number> = {};
+			for (const e of res.entries) { if (e.likeness != null) m[e.npub] = e.likeness; }
+			openLikeness = m;
+		} catch {
+			// Unknown stays unknown ("if known"); retry on the next open.
+			likenessTried = false;
+		}
+	}
 	let refreshing: string | null = $state(null);
 	let menuOpenFor: string | null = $state(null);
 	let menuAnchor: HTMLElement | undefined = $state();
@@ -912,6 +924,7 @@
 	function toggleDetail(npub: string) {
 		const opening = detailExpanded !== npub;
 		detailExpanded = opening ? npub : null;
+			if (opening) void loadLikeness();
 		// M21 W4 — opening the detail reveals the full bio there, so the face's `more ⌄` control
 		// must collapse (the two controls would otherwise reveal the same text). Reset only on open;
 		// closing the detail leaves the bio as-is.
@@ -1175,15 +1188,17 @@
 </div>
 
 <div class="contacts-body">
-<div class="contacts-col hb-pane">
+<div class="contacts-col hb-pane" class:col-toggle-only={view === 'discover'}>
 
 <!-- List-column sub-header: free-text search + Name|Groups view toggle. "+ Add contact" moved to
      the topbar (QURATOR-342 lane B) to keep the 300px column to search + toggle. -->
 <div class="subheader">
+	{#if view !== 'discover'}
 	<div class="hb-input subheader-search">
 		<span class="search-icon">{@html icons.search}</span>
 		<input type="text" placeholder="Search name, bio, tags, profile, collections…" bind:value={searchQuery} />
 	</div>
+	{/if}
 	<div class="view-toggle" role="group" aria-label="View">
 		<button type="button" aria-pressed={view === 'name'} onclick={() => (view = 'name')}>Name</button>
 		<button type="button" aria-pressed={view === 'groups'} onclick={() => (view = 'groups')}>Groups</button>
@@ -1407,7 +1422,214 @@
 			</div>
 		</div>
 
-		{#if isOpen}
+		<!-- QURATOR-360 F1: the inline detail moved to the right pane (r5 state d) — the chevron
+		     (toggleDetail) still selects; the pane renders .contact-detail for detailExpanded. -->
+	</div>
+
+	<!-- M15 W5: per-row overflow menu (only one open at a time via menuOpenFor). -->
+	<OverflowMenu open={menuOpenFor === peer.npub} anchor={menuAnchor} onclose={() => (menuOpenFor = null)}>
+		<button class="menu-item" onclick={() => { goto('/chat?peer=' + peer.npub); menuOpenFor = null; }}>Message</button>
+		<button class="menu-item" onclick={() => { copyNpub(peer.npub); menuOpenFor = null; }}>Copy npub</button>
+		<button class="menu-item" onclick={() => { handleRefresh(peer.npub); menuOpenFor = null; }} disabled={refreshing === peer.npub}>
+			{refreshing === peer.npub ? 'Refreshing…' : 'Refresh'}
+		</button>
+		<!-- Devtest item 3 / ruling 01: was `detailExpanded = …; beginGroupEdit(…)`, which expanded the
+		     panel to reach its own checkbox editor. That editor is gone; this opens the shared popover,
+		     anchored to the ⋯ button that is still on screen. -->
+		<button class="menu-item" onclick={() => { if (menuAnchor) openGroupPopover(peer.npub, menuAnchor); menuOpenFor = null; }}>Edit groups…</button>
+		<button class="menu-item" onclick={() => { detailExpanded = peer.npub; editingTagsFor = peer.npub; tagInput = ''; menuOpenFor = null; }}>Edit tags…</button>
+		<div class="menu-item menu-item-confirm">
+			<ConfirmButton label="Remove contact" confirmText="Remove this contact?" onconfirm={() => { handleUnfollow(peer.npub); menuOpenFor = null; }} />
+		</div>
+	</OverflowMenu>
+
+	<!-- M21 W5b / M22 W8: group-membership popover anchored to the face chip row. The editor is the
+	     ONE GroupMembershipPopover component (used by Browse too) — OverflowMenu positioning +
+	     Escape, seeded draft, full-set Apply via contactUpdateGroups, "+ New group…", and focus-return
+	     to the invoking row all live there. This page supplies only the anchor + callbacks. -->
+	<GroupMembershipPopover
+		open={groupPopoverFor === peer.npub}
+		anchor={groupPopoverAnchor}
+		contactName={name}
+		groups={groups}
+		memberships={contactGroups(peer.npub)}
+		ready={groupsLoaded}
+		onapply={(names) => applyGroupPopover(peer.npub, names)}
+		onclose={() => (groupPopoverFor = null)}
+		onnewgroup={() => (createGroupOpen = true)}
+		returnFocusTo={() => {
+			const el = document.getElementById(rowId(ROW_ID_PREFIX, peer.npub));
+			return el?.isConnected ? el : undefined;
+		}}
+	/>
+{/snippet}
+
+{#if view !== 'discover'}
+<div class="phonebook" bind:this={listContainer}>
+	<div class="phonebook-scroll">
+		{#if $contactsLoadError}
+			<!-- QURATOR-93: a FAILED contacts load must not render as the confident "No contacts yet"
+			     negative — that string is indistinguishable from a genuine empty. -->
+			<EmptyState
+				error
+				message="Couldn't load contacts — the peer cache didn't answer."
+				onretry={retryContactsLoad}
+			/>
+		{:else if $contacts.length === 0}
+			<EmptyState message="No contacts yet. Use “+ Add contact” to find someone by ID or discover hoarders." />
+		{:else}
+			{#if view === 'groups'}
+				<!-- Groups-view management strip (M21 W5): organisational only — colour is the sole
+				     marker, no trust checkbox (decoupled from Private collections by owner ruling
+				     2026-08-04). Delete moves members to Ungrouped; "+ New group" stays reachable
+				     here so the groups view is self-sufficient, not just from a contact's picker. -->
+				<div class="group-strip">
+					<div class="group-strip-label">Groups</div>
+					<div class="group-strip-chips">
+						{#each groups as g (g.name)}
+							<span class="group-chip-wrap">
+								<span class="group-chip" style={g.color ? `border-color:${g.color}; color:${g.color}` : ''}>
+									{g.name}
+								</span>
+								<ConfirmButton
+									label="×"
+									confirmText={`Delete "${g.name}"? Members fall back to Ungrouped.`}
+									onconfirm={() => handleDeleteGroup(g)}
+								/>
+							</span>
+						{/each}
+						<button type="button" class="group-chip group-chip-add" onclick={() => (createGroupOpen = true)}>+ New group</button>
+					</div>
+				</div>
+			{/if}
+
+			{#if sections.length === 0 && online.length === 0}
+				{#if searchQuery.trim()}
+					<div class="empty">No contacts match "{searchQuery}".</div>
+				{/if}
+			{:else}
+				{#if online.length > 0}
+					<div class="phonebook-section">
+						<div id="sec-online" class="section-header">● Online now</div>
+						<div class="contact-list">
+							{#each online as peer, i (peer.npub)}
+								{@render contactRow(peer, i)}
+							{/each}
+						</div>
+					</div>
+				{/if}
+				{#each sections as section, secIdx (section.key)}
+					{@const dropTargetName = section.key === 'ungrouped' ? UNGROUPED_TARGET : section.key}
+					<div class="phonebook-section">
+						<div
+							id={section.anchorId}
+							class="section-header"
+							class:group-drop-active={dropOverTarget === dropTargetName && dropOutcome && dropOutcome.kind !== 'refused' && dropOutcome.kind !== 'noop'}
+							class:group-drop-refused={dropOverTarget === dropTargetName && dropOutcome && (dropOutcome.kind === 'refused' || dropOutcome.kind === 'noop')}
+							ondragover={(e) => onGroupDragOver(e, dropTargetName)}
+							ondragleave={(e) => onGroupDragLeave(e, dropTargetName)}
+							ondrop={(e) => onGroupDrop(e, dropTargetName)}
+							role={view === 'groups' ? 'group' : undefined}
+							aria-label={view === 'groups' ? section.label : undefined}
+							aria-disabled={dropOverTarget === dropTargetName && dropOutcome !== null && (dropOutcome.kind === 'refused' || dropOutcome.kind === 'noop')}
+						>
+							{section.label}
+							{#if view === 'groups' && dropOverTarget === dropTargetName && dropOutcome}
+								<span class="drop-hint">{#if dropOutcome.kind === 'refused'}{dropOutcome.reason}{:else if dropOutcome.kind === 'noop'}already ungrouped{:else if dropOutcome.kind === 'add'}add to {section.label}{:else if dropOutcome.kind === 'move'}move to {section.label}{:else}remove all groups{/if}</span>
+							{/if}
+						</div>
+						<div class="contact-list">
+							{#each section.peers as peer, i (peer.npub)}
+								{@render contactRow(peer, sectionStart[secIdx] + i)}
+							{/each}
+						</div>
+					</div>
+				{/each}
+				<!-- Owner feedback #3/#4 — the drop-to-create zone, in the normal flow below the last
+				     group section (NOT fixed to the viewport — a floating bar would cover contacts on
+				     a short window). Its resting copy IS the "you can drag these cards" copy (#4). -->
+				<div
+					class="create-dropzone"
+					class:dz-armed={dragSourceNpub !== null && !zoneHovered}
+					class:dz-hovered={dragSourceNpub !== null && zoneHovered}
+					ondragover={onZoneDragOver}
+					ondragleave={onZoneDragLeave}
+					ondrop={onZoneDrop}
+					data-testid="create-dropzone"
+				>
+					<span class="dz-plus" aria-hidden="true">+</span>
+					{#if dragSourceNpub !== null && zoneHovered}
+						{#if dragCount > 1}
+							{dropzoneHoverCopy(dragCount)}
+						{:else}
+							Release to put <strong class="dz-name">{zoneHoverName()}</strong> in a new group
+						{/if}
+					{:else}
+						Drag a contact here to start a group
+					{/if}
+				</div>
+			{/if}
+		{/if}
+	</div>
+</div>
+{/if}
+	</div>
+	<!-- QURATOR-360 F1 (r5 state d): the right pane is the OPEN CONTACT's detail — the old
+	     lane-C likes panel is deleted; its likeness readout lives on in DiscoverBook. The pane
+	     reuses the row's own actions (Browse / Message / ⋯ via openRowMenu), then the
+	     .contact-detail content moved out of the row. Glass rule: hb-pane never scrolls itself
+	     — .detail-scroll is the inner scroller (settings-page pattern, 0e013161). -->
+	{#if view === 'discover'}
+	<div class="discover-pane hb-pane">
+		<div class="detail-scroll">
+			<DiscoverBook />
+		</div>
+	</div>
+{:else}
+<div class="detail-pane hb-pane">
+	{#if openPeer}
+		{@const peer = openPeer}
+		{@const lookingFor = peer.profile?.looking_for}
+		{@const initial = contactDisplayName(peer)[0]?.toUpperCase() ?? '?'}
+		{@const hue = avatarHue(initial)}
+		{@const fp = peer.fingerprint}
+		{@const profTotal = peer.profile?.total_bytes}
+		{@const paneSize = profTotal ? fmtBytes(profTotal) : summarizeCollectionsSize(peer.collections.filter((c) => c.visibility !== 'Private'))}
+		{@const paneLike = openLikeness[peer.npub]}
+		<div class="pane-head">
+			<div class="avatar-wrap" style={fp ? `box-shadow: 0 0 0 2px var(--bg-elev1), 0 0 0 4px ${fp.colorHex}` : undefined}>
+				<Avatar letter={initial} size={48} {hue} picture={peer.profile?.picture} />
+			</div>
+			<div class="pane-id">
+				<div class="pane-name">{contactDisplayName(peer)}</div>
+				{#if fp}
+					<div class="fp-row pane-fp">
+						{#each fp.words as w, i}
+							{#if i > 0}<span class="fp-sep">·</span>{/if}
+							<span class="fp-word" style={fingerprintWordColor(w) ? `color:${fingerprintWordColor(w)}` : undefined}>{w}</span>
+						{/each}
+					</div>
+				{/if}
+				{#if paneSize || paneLike != null}
+					<div class="pane-meta">
+						{#if paneSize}<span>{paneSize}</span>{/if}
+						{#if paneLike != null}<span>{paneLike}% like you</span>{/if}
+					</div>
+				{/if}
+			</div>
+		</div>
+		<div class="pane-actions">
+			<a class="btn-default btn-xs" href="/browse?peer={peer.npub}">Browse</a>
+			<button class="btn-default btn-xs" onclick={() => goto('/chat?peer=' + peer.npub)}>Message</button>
+			<button
+				class="row-menu-btn"
+				aria-label="Contact actions"
+				aria-haspopup="true"
+				aria-expanded={menuOpenFor === peer.npub}
+				onclick={(e) => openRowMenu(peer.npub, e.currentTarget)}
+			>⋯</button>
+		</div>
+		<div class="detail-scroll">
 			<div class="contact-detail">
 				<!-- Devtest 2026-08-26 item 3 (owner: "right now its showing duplicated information. It
 				     should contain the rest of the bio stuff that the base card didnt have room for like
@@ -1581,163 +1803,12 @@
 					</div>
 				{/if}
 			</div>
-		{/if}
-	</div>
-
-	<!-- M15 W5: per-row overflow menu (only one open at a time via menuOpenFor). -->
-	<OverflowMenu open={menuOpenFor === peer.npub} anchor={menuAnchor} onclose={() => (menuOpenFor = null)}>
-		<button class="menu-item" onclick={() => { goto('/chat?peer=' + peer.npub); menuOpenFor = null; }}>Message</button>
-		<button class="menu-item" onclick={() => { copyNpub(peer.npub); menuOpenFor = null; }}>Copy npub</button>
-		<button class="menu-item" onclick={() => { handleRefresh(peer.npub); menuOpenFor = null; }} disabled={refreshing === peer.npub}>
-			{refreshing === peer.npub ? 'Refreshing…' : 'Refresh'}
-		</button>
-		<!-- Devtest item 3 / ruling 01: was `detailExpanded = …; beginGroupEdit(…)`, which expanded the
-		     panel to reach its own checkbox editor. That editor is gone; this opens the shared popover,
-		     anchored to the ⋯ button that is still on screen. -->
-		<button class="menu-item" onclick={() => { if (menuAnchor) openGroupPopover(peer.npub, menuAnchor); menuOpenFor = null; }}>Edit groups…</button>
-		<button class="menu-item" onclick={() => { detailExpanded = peer.npub; editingTagsFor = peer.npub; tagInput = ''; menuOpenFor = null; }}>Edit tags…</button>
-		<div class="menu-item menu-item-confirm">
-			<ConfirmButton label="Remove contact" confirmText="Remove this contact?" onconfirm={() => { handleUnfollow(peer.npub); menuOpenFor = null; }} />
 		</div>
-	</OverflowMenu>
-
-	<!-- M21 W5b / M22 W8: group-membership popover anchored to the face chip row. The editor is the
-	     ONE GroupMembershipPopover component (used by Browse too) — OverflowMenu positioning +
-	     Escape, seeded draft, full-set Apply via contactUpdateGroups, "+ New group…", and focus-return
-	     to the invoking row all live there. This page supplies only the anchor + callbacks. -->
-	<GroupMembershipPopover
-		open={groupPopoverFor === peer.npub}
-		anchor={groupPopoverAnchor}
-		contactName={name}
-		groups={groups}
-		memberships={contactGroups(peer.npub)}
-		ready={groupsLoaded}
-		onapply={(names) => applyGroupPopover(peer.npub, names)}
-		onclose={() => (groupPopoverFor = null)}
-		onnewgroup={() => (createGroupOpen = true)}
-		returnFocusTo={() => {
-			const el = document.getElementById(rowId(ROW_ID_PREFIX, peer.npub));
-			return el?.isConnected ? el : undefined;
-		}}
-	/>
-{/snippet}
-
-<div class="phonebook" bind:this={listContainer}>
-	<div class="phonebook-scroll">
-		{#if view === 'discover'}
-			<!-- QURATOR-351: PeopleLikeYou + AddContactPanel Discover fold into DiscoverBook in a follow-up -->
-			<DiscoverBook />
-		{:else}
-		{#if $contactsLoadError}
-			<!-- QURATOR-93: a FAILED contacts load must not render as the confident "No contacts yet"
-			     negative — that string is indistinguishable from a genuine empty. -->
-			<EmptyState
-				error
-				message="Couldn't load contacts — the peer cache didn't answer."
-				onretry={retryContactsLoad}
-			/>
-		{:else if $contacts.length === 0}
-			<EmptyState message="No contacts yet. Use “+ Add contact” to find someone by ID or discover hoarders." />
-		{:else}
-			{#if view === 'groups'}
-				<!-- Groups-view management strip (M21 W5): organisational only — colour is the sole
-				     marker, no trust checkbox (decoupled from Private collections by owner ruling
-				     2026-08-04). Delete moves members to Ungrouped; "+ New group" stays reachable
-				     here so the groups view is self-sufficient, not just from a contact's picker. -->
-				<div class="group-strip">
-					<div class="group-strip-label">Groups</div>
-					<div class="group-strip-chips">
-						{#each groups as g (g.name)}
-							<span class="group-chip-wrap">
-								<span class="group-chip" style={g.color ? `border-color:${g.color}; color:${g.color}` : ''}>
-									{g.name}
-								</span>
-								<ConfirmButton
-									label="×"
-									confirmText={`Delete "${g.name}"? Members fall back to Ungrouped.`}
-									onconfirm={() => handleDeleteGroup(g)}
-								/>
-							</span>
-						{/each}
-						<button type="button" class="group-chip group-chip-add" onclick={() => (createGroupOpen = true)}>+ New group</button>
-					</div>
-				</div>
-			{/if}
-
-			{#if sections.length === 0 && online.length === 0}
-				{#if searchQuery.trim()}
-					<div class="empty">No contacts match "{searchQuery}".</div>
-				{/if}
-			{:else}
-				{#if online.length > 0}
-					<div class="phonebook-section">
-						<div id="sec-online" class="section-header">● Online now</div>
-						<div class="contact-list">
-							{#each online as peer, i (peer.npub)}
-								{@render contactRow(peer, i)}
-							{/each}
-						</div>
-					</div>
-				{/if}
-				{#each sections as section, secIdx (section.key)}
-					{@const dropTargetName = section.key === 'ungrouped' ? UNGROUPED_TARGET : section.key}
-					<div class="phonebook-section">
-						<div
-							id={section.anchorId}
-							class="section-header"
-							class:group-drop-active={dropOverTarget === dropTargetName && dropOutcome && dropOutcome.kind !== 'refused' && dropOutcome.kind !== 'noop'}
-							class:group-drop-refused={dropOverTarget === dropTargetName && dropOutcome && (dropOutcome.kind === 'refused' || dropOutcome.kind === 'noop')}
-							ondragover={(e) => onGroupDragOver(e, dropTargetName)}
-							ondragleave={(e) => onGroupDragLeave(e, dropTargetName)}
-							ondrop={(e) => onGroupDrop(e, dropTargetName)}
-							role={view === 'groups' ? 'group' : undefined}
-							aria-label={view === 'groups' ? section.label : undefined}
-							aria-disabled={dropOverTarget === dropTargetName && dropOutcome !== null && (dropOutcome.kind === 'refused' || dropOutcome.kind === 'noop')}
-						>
-							{section.label}
-							{#if view === 'groups' && dropOverTarget === dropTargetName && dropOutcome}
-								<span class="drop-hint">{#if dropOutcome.kind === 'refused'}{dropOutcome.reason}{:else if dropOutcome.kind === 'noop'}already ungrouped{:else if dropOutcome.kind === 'add'}add to {section.label}{:else if dropOutcome.kind === 'move'}move to {section.label}{:else}remove all groups{/if}</span>
-							{/if}
-						</div>
-						<div class="contact-list">
-							{#each section.peers as peer, i (peer.npub)}
-								{@render contactRow(peer, sectionStart[secIdx] + i)}
-							{/each}
-						</div>
-					</div>
-				{/each}
-				<!-- Owner feedback #3/#4 — the drop-to-create zone, in the normal flow below the last
-				     group section (NOT fixed to the viewport — a floating bar would cover contacts on
-				     a short window). Its resting copy IS the "you can drag these cards" copy (#4). -->
-				<div
-					class="create-dropzone"
-					class:dz-armed={dragSourceNpub !== null && !zoneHovered}
-					class:dz-hovered={dragSourceNpub !== null && zoneHovered}
-					ondragover={onZoneDragOver}
-					ondragleave={onZoneDragLeave}
-					ondrop={onZoneDrop}
-					data-testid="create-dropzone"
-				>
-					<span class="dz-plus" aria-hidden="true">+</span>
-					{#if dragSourceNpub !== null && zoneHovered}
-						{#if dragCount > 1}
-							{dropzoneHoverCopy(dragCount)}
-						{:else}
-							Release to put <strong class="dz-name">{zoneHoverName()}</strong> in a new group
-						{/if}
-					{:else}
-						Drag a contact here to start a group
-					{/if}
-				</div>
-			{/if}
-		{/if}
-		{/if}
-	</div>
+	{:else}
+		<EmptyState message="Select a contact" />
+	{/if}
 </div>
-	</div>
-	<!-- QURATOR-342 lane B — the right pane: lane C's People-like-you panel (no props,
-	     self-fetches similarPeople() and reads the contacts store). -->
-	<div class="people-pane hb-pane"><PeopleLikeYou /></div>
+{/if}
 </div>
 </div>
 </div>
@@ -1746,7 +1817,6 @@
 <AddContactPanel
 	open={addContactPanelOpen}
 	onadd={openAddContact}
-	onmessage={messagePeer}
 	onclose={() => (addContactPanelOpen = false)}
 />
 <AddContactDialog
@@ -1847,7 +1917,22 @@
 	/* QURATOR-352 — the divider between panes disappears when panes float (hb-pane supplies the
 	   glass rim instead). In hoard (no data-glass-float) it stays. */
 	:global(:root[data-glass-float]) .contacts-col { border-right: 0; }
-	.people-pane { flex: 1; min-width: 0; overflow-y: auto; padding: 16px 20px 24px; }
+	/* QURATOR-360 F1: right pane = the open contact's detail. Glass rule: hb-pane must not
+	   scroll itself — the inner .detail-scroll is the scroller (settings-page pattern). */
+	.detail-pane { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; padding: 16px 20px 24px; }
+	.detail-scroll { flex: 1; min-height: 0; overflow-y: auto; }
+	.discover-pane { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+	.discover-pane .detail-scroll { padding: 12px 16px 20px; }
+	/* QURATOR-360 F1: in the Discover view the list column collapses to the toggle row only. */
+	.contacts-col.col-toggle-only { width: auto; min-width: 0; border-right: 0; }
+	/* The pane header (state d) and the moved detail as a standalone card in the pane. */
+	.pane-head { display: flex; gap: 12px; align-items: flex-start; }
+	.pane-id { min-width: 0; }
+	.pane-name { font-size: 15px; font-weight: 600; }
+	.pane-fp { margin-top: 2px; }
+	.pane-meta { margin-top: 2px; font-size: 11.5px; color: var(--fg-muted); }
+	.pane-actions { margin: 10px 0 12px; display: flex; gap: 8px; align-items: center; }
+	.detail-pane .contact-detail { border-top: 1px solid var(--border); border-radius: var(--r-card, 10px); padding: 10px 14px; }
 	.topbar-add { flex-shrink: 0; }
 
 	.topbar {

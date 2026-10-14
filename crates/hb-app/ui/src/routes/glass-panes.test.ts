@@ -11,12 +11,12 @@ type Page = { route: string; file: string; columns: string[] };
 
 // The columns are each page's TOP-LEVEL column containers (read from the markup, not guessed):
 // home .body > .profile-pane + .collections-pane; browse .browse-shell > .left-panel + .right-panel;
-// contacts .contacts-body > .contacts-col + .people-pane; chat .chat-frame > .convo-sidebar +
+// contacts .contacts-body > .contacts-col + .detail-pane | .discover-pane (QURATOR-360); chat .chat-frame > .convo-sidebar +
 // .convo-pane; topics .master-detail > .list-pane + .detail-pane; settings .main > .body (single).
 const PAGES: Page[] = [
 	{ route: 'home', file: './+page.svelte', columns: ['profile-pane', 'collections-pane'] },
 	{ route: 'browse', file: './browse/+page.svelte', columns: ['left-panel', 'right-panel'] },
-	{ route: 'contacts', file: './contacts/+page.svelte', columns: ['contacts-col', 'people-pane'] },
+	{ route: 'contacts', file: './contacts/+page.svelte', columns: ['contacts-col', 'detail-pane', 'discover-pane'] },
 	{ route: 'chat', file: './chat/+page.svelte', columns: ['convo-sidebar', 'convo-pane'] },
 	{ route: 'topics', file: './topics/+page.svelte', columns: ['list-pane', 'detail-pane'] },
 	{ route: 'settings', file: './settings/+page.svelte', columns: ['body'] },
