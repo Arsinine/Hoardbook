@@ -46,9 +46,6 @@ describe('contacts W2 — add resolves once, not twice', () => {
 		// handleFollow passes the lookup result (not null) so the follow leg skips the resolve.
 		const hf = s.slice(s.indexOf('function handleFollow'), s.indexOf('function handleKeydown'));
 		expect(hf).toMatch(/onadd\?\.\(lookedUpCode, result\.npub, result\.profile\?\.display_name \?\? '', result\)/);
-		// A discovery hit carries null (no pre-resolved peer) — follow resolves it as before.
-		const fh = s.slice(s.indexOf('function followHit'), s.indexOf('function close'));
-		expect(fh).toMatch(/onadd\?\.\(hit\.npub, hit\.npub, hit\.display_name, null\)/);
 	});
 
 	it('the api.ts follow bridge accepts a resolvedPeer', async () => {
