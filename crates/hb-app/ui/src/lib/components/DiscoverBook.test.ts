@@ -191,4 +191,37 @@ describe('DiscoverBook', () => {
 		expect(text).toContain('Readable once your hoard reaches 21.0 GB'); // v5 size rule line
 		expect(text).toContain('clean 35mm scans of Ran');
 	});
+
+	it('shows the Contact section only when the entry carries a hint', async () => {
+		// P-10 mutations, both SEEN RED (mutate by LINE NUMBER in DiscoverBook.svelte, never a
+		// grep anchor):
+		//  (a) delete the `{#if panelEntry.contact_hint}` line AND its matching `{/if}` line
+		//      (the section then renders unconditionally) → the WITHOUT-hint assert reds.
+		//  (b) delete the whole 4-line `{#if panelEntry.contact_hint} … {/if}` section
+		//      (guard + heading + text + {/if}) → the WITH-hint asserts red.
+		discoverPeople.mockResolvedValue({
+			entries: [
+				entry({
+					npub: 'npubhint',
+					display_name: 'Nia Okafor',
+					total_bytes: 5e9,
+					contact_hint: 'signal first, then email',
+				}),
+				entry({ npub: 'npubnohint', display_name: 'Rex Bello', total_bytes: 5e9 }),
+			],
+			capped: false,
+			cold_start: false,
+		});
+		const { container } = render(DiscoverBook);
+		await waitFor(() => expect(screen.getByText('Nia Okafor')).toBeTruthy());
+		fireEvent.click(container.querySelector('article[data-npub="npubhint"]') as HTMLElement);
+		await waitFor(() => expect(container.querySelector('.modal-card')).toBeTruthy());
+		const panelText = () =>
+			(container.querySelector('.modal-card') as HTMLElement).textContent ?? '';
+		expect(panelText().indexOf('Contact')).toBeGreaterThanOrEqual(0);
+		expect(panelText()).toContain('signal first, then email');
+		fireEvent.click(container.querySelector('article[data-npub="npubnohint"]') as HTMLElement);
+		await waitFor(() => expect(panelText()).toContain('Rex Bello'));
+		expect(panelText()).not.toContain('Contact');
+	});
 });

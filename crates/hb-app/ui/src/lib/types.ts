@@ -459,6 +459,9 @@ export interface PhonebookEntry {
 	/** Publish-computed total from their teaser (never user-typed). */
 	total_bytes: number;
 	collections: TeaserCollection[];
+	/** v5 (QURATOR-344): the contact hint rides the public teaser (strangers) and the cached
+	 *  Profile (contacts). Absent = none — the panel shows no Contact section. */
+	contact_hint?: string;
 	/** The optional free-text "Looking for" line (r5: 255-char cap, teaser-carried). */
 	looking_for?: string;
 	tags: string[];

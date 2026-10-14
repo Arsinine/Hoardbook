@@ -46,6 +46,11 @@ pub struct PhonebookEntry {
     pub total_bytes: u64,
     /// Names + sizes from the teaser (`hb_core::event::TeaserCollection`).
     pub collections: Vec<TeaserCollection>,
+    /// v5 (QURATOR-344) — the contact hint rides the public teaser (strangers) and the cached
+    /// Profile (contacts). §6 additive-optional rule: absence means "no Contact section" and
+    /// gates nothing, so NO discriminant bump — both wire shapes pinned in the tests below.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact_hint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub looking_for: Option<String>,
     /// Merged Interests + collection tags, as the teaser carries them.
@@ -230,6 +235,7 @@ fn contact_entry(
         is_contact: true,
         total_bytes: profile.map(|p| p.total_bytes).unwrap_or(0),
         collections,
+        contact_hint: profile.and_then(|p| p.contact_hint.clone()),
         looking_for: profile.and_then(|p| p.looking_for.clone()),
         tags,
         likeness: likeness_of(mine, &inputs),
@@ -260,6 +266,7 @@ fn stranger_entry(
         is_contact: false,
         total_bytes: t.total_bytes,
         collections: t.collections.clone(),
+        contact_hint: t.contact_hint.clone(),
         looking_for: t.looking_for.clone(),
         tags: t.tags.clone(),
         likeness: likeness_of(mine, &inputs),
@@ -414,6 +421,67 @@ mod tests {
         assert_eq!(res.entries.len(), 1, "one npub, one row: {res:?}");
         assert!(res.entries[0].is_contact, "the contact wins over its own teaser hit");
         assert!(res.cold_start, "an empty me is cold start");
+    }
+
+    /// §6 wire shape for the optional field: the `contact_hint` key is PRESENT with the value
+    /// when the teaser/profile carries one and ABSENT (never null) when it does not — both
+    /// shapes built through the real builders (`assemble` → `contact_entry`/`stranger_entry`).
+    /// P-10 mutation: in `stranger_entry` replace `contact_hint: t.contact_hint.clone(),`
+    /// with `contact_hint: None,` → the stranger's present-key assert reds; in `contact_entry`
+    /// replace `contact_hint: profile.and_then(|p| p.contact_hint.clone()),` with
+    /// `contact_hint: None,` → the contact's present-key assert reds. Both seen red 2026-10-14
+    /// (orchestrator; mutate by LINE — the anchor text also appears in this comment).
+    #[test]
+    fn discover_people_contact_hint_wire_shape() {
+        let mine = SimilarityInputs::default();
+        let mut hinted_contact = contact("hb_pb_hint_c", "Hinted Contact", 500, &["sci-fi"], None);
+        hinted_contact.profile.as_mut().unwrap().contact_hint = Some("DM my alt acct".to_string());
+        let mut hinted_stranger =
+            stranger("hb_pb_hint_s", "Hinted Stranger", 500, &["sci-fi"], None);
+        hinted_stranger.teaser.contact_hint = Some("signal first, then email".to_string());
+        let plain = stranger("hb_pb_hint_p", "Plain Stranger", 500, &["sci-fi"], None);
+        let res = assemble(
+            &[],
+            "me",
+            &mine,
+            &HashSet::new(),
+            &[hinted_contact],
+            &[hinted_stranger, plain],
+            false,
+        );
+        let by_npub = |npub: &str| {
+            res.entries
+                .iter()
+                .find(|e| e.npub == npub)
+                .unwrap_or_else(|| panic!("no entry for {npub}"))
+        };
+        // Present (stranger, teaser-carried): key present with the value.
+        let hinted = by_npub("hb_pb_hint_s");
+        assert_eq!(
+            hinted.contact_hint.as_deref(),
+            Some("signal first, then email")
+        );
+        let j = serde_json::to_string(hinted).unwrap();
+        assert!(
+            j.contains(r#""contact_hint":"signal first, then email""#),
+            "hinted stranger wire shape: {j}"
+        );
+        // Present (contact, cached-Profile-carried): same key, same rule.
+        let hinted_c = by_npub("hb_pb_hint_c");
+        assert_eq!(hinted_c.contact_hint.as_deref(), Some("DM my alt acct"));
+        let jc = serde_json::to_string(hinted_c).unwrap();
+        assert!(
+            jc.contains(r#""contact_hint":"DM my alt acct""#),
+            "hinted contact wire shape: {jc}"
+        );
+        // Absent: the key is OMITTED, never null (skip_serializing_if).
+        let plain_e = by_npub("hb_pb_hint_p");
+        assert_eq!(plain_e.contact_hint, None);
+        let jp = serde_json::to_string(plain_e).unwrap();
+        assert!(
+            !jp.contains("contact_hint"),
+            "plain wire must omit the key entirely: {jp}"
+        );
     }
 
     /// P-10 mutation: in `assemble`'s sort, reverse the FIRST key — the total-bytes
