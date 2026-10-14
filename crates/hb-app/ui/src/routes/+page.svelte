@@ -1169,7 +1169,10 @@
 	:global(:root[data-glass-float]) .topbar { border-bottom: 0; }
 
 	.topbar-title { font-size: 17px; font-weight: 600; color: var(--fg); letter-spacing: -0.3px; }
-	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
+	/* v0.24.0 devtest: the subtitle is EMPTY once the profile is published and saved (the
+	   "Published…" line was removed 2026-10-13), which left My Profile's bar 18px shorter than every
+	   other page's (60 vs 77px, measured). The line keeps its height whether or not it has text. */
+	.topbar-sub { font-size: 12px; color: var(--fg-muted); margin-top: 2px; min-height: 1lh; }
 
 	/* Publish-state hint — make "unpublished = not searchable" obvious. */
 	.pub-status { font-size: 12px; }

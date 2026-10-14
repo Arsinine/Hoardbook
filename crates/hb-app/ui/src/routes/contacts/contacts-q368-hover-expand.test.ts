@@ -211,6 +211,38 @@ describe('QURATOR-368d — hover-to-expand column', () => {
 		expect(col.style.flexBasis, 'inline basis removed on collapse').toBe('');
 	});
 
+	it('moving off every card while still inside the column collapses it (v0.24.0 devtest item 4)', async () => {
+		// Owner, v0.24.0: "When hovering over a contact, the card expands however when you move the
+		// mouse away from the card but remain inside the left panel - the right panel does not
+		// resize back." Collapse used to fire only on pointerleave of the WHOLE column.
+		const { container, col } = await setup(1110);
+		vi.useFakeTimers();
+		await hoverA(container);
+		expect(col.classList.contains('col-expanded')).toBe(true);
+
+		// Off the card, onto the column's own search bar — still inside the column, no pointerleave.
+		fireEvent.pointerOver(col.querySelector('.subheader') as HTMLElement);
+		await vi.advanceTimersByTimeAsync(160);
+		await tick();
+		// P-10 MUTATION (orchestrator): in +page.svelte onColumnPointerOver delete the
+		// `if (colExpanded || hoverOpenT !== undefined) endHover();` line → REDS (stays expanded).
+		expect(col.classList.contains('col-expanded'), 'collapsed off the cards, inside the column').toBe(false);
+		expect(col.style.flexBasis, 'inline basis removed').toBe('');
+	});
+
+	it('crossing the gap between two cards does not collapse the column', async () => {
+		const { container, col } = await setup(1110);
+		vi.useFakeTimers();
+		await hoverA(container);
+		// The list gap between two rows is a non-card target; the next card arrives well inside 160 ms.
+		fireEvent.pointerOver(col.querySelector('.contact-list') as HTMLElement);
+		await vi.advanceTimersByTimeAsync(40);
+		fireEvent.pointerOver(cardOf(container, B_NPUB));
+		await vi.advanceTimersByTimeAsync(400);
+		await tick();
+		expect(col.classList.contains('col-expanded'), 'still expanded on the second card').toBe(true);
+	});
+
 	it('keyboard focus (focusin) on a card expands too', async () => {
 		const { container } = await setup(1110);
 		vi.useFakeTimers();

@@ -888,7 +888,7 @@
 	// deep-link, reached by DOUBLE-click — but only when the row has a collection).
 	let detailExpanded: string | null = $state(null);
 	// QURATOR-360 F1: the right pane shows the OPEN contact (r5 state d), keyed on the same
-	// detailExpanded the row click writes; the row keeps its own open styling via isOpen.
+	// detailExpanded the row click writes; the row marks itself with .contact-selected.
 	const openPeer = $derived($contacts.find((c) => c.npub === detailExpanded) ?? null);
 	// "N% like you" for the pane header: read from the ONE source (discover_people, the command
 	// DiscoverBook uses), cached so one fetch serves every selection; unknown -> the line is absent.
@@ -1186,8 +1186,20 @@
 	});
 
 	function onColumnPointerOver(e: PointerEvent) {
-		const card = (e.target as HTMLElement).closest('.contact-card');
-		if (card instanceof HTMLElement && card.dataset.npub) beginHoverIntent(card.dataset.npub);
+		const target = e.target as HTMLElement;
+		const card = target.closest('.contact-card');
+		if (card instanceof HTMLElement && card.dataset.npub) {
+			beginHoverIntent(card.dataset.npub);
+			return;
+		}
+		// v0.24.0 devtest: the expansion belongs to the CARDS, not the column. Moving off every card
+		// (onto the search bar, a section header, the drop zone or empty list space) starts the
+		// same 160 ms collapse as leaving the column, so the right pane grows back. The gap between
+		// two cards is crossed well inside that delay, and reaching the next card cancels it.
+		// A row menu (OverflowMenu mounts its fixed backdrop inside the column) holds the column
+		// open, so the row it was opened from does not slide out from under it.
+		if (target.closest('.menu-backdrop, .overflow-menu')) return;
+		if (colExpanded || hoverOpenT !== undefined) endHover();
 	}
 	function onColumnPointerLeave() {
 		endHover();
@@ -1313,11 +1325,10 @@
 	     a 67-bit grind, so this red-outlined badge is the actual security control. -->
 	{@const contactsForLabel = $contacts.map(c => ({ npub: c.npub, petname: c.petname ?? c.profile?.display_name ?? '' }))}
 	{@const collision = petnameFor(peer.npub, name, contactsForLabel).warning}
-	{@const isOpen = detailExpanded === peer.npub}
 	<!-- QURATOR-368 slice b — "has a collection" = what the row can actually Browse: public
 	     collections PLUS private ones shared with you. Never the size total alone. -->
 	{@const hasCollections = pubCount > 0 || (privateByAuthor[peer.npub] ?? []).length > 0}
-	<div class="contact-block" class:open={isOpen}>
+	<div class="contact-block">
 		<!-- QURATOR-368 slice b: single-click SELECTS the contact into the right pane; double-click
 		     Browses, but ONLY when the row has a collection. The first click of a double-click also
 		     fires `click`, so the select is held 250 ms and cancelled by a collection-bearing
@@ -2248,15 +2259,11 @@
 
 	.contact-list { display: flex; flex-direction: column; gap: 4px; padding-bottom: 16px; }
 
+	/* v0.24.0 devtest: the `.contact-block.open` rule that squared the card's bottom corners (devtest
+	   v0.12.4 #6, so an inline detail could continue the card) is gone. The detail lives in the right
+	   pane since QURATOR-360, so the squared seam joined nothing — it only made the selected card's
+	   bottom corners snap square when the 250 ms held select landed. */
 	.contact-block { display: flex; flex-direction: column; gap: 8px; scroll-margin-top: 34px; }
-	/* devtest v0.12.4 #6: an expanded row reads as ONE connected card — the detail continues the card
-	   body (shared surface + border, squared seam) instead of floating as an unstyled block below it. */
-	.contact-block.open { gap: 0; }
-	.contact-block.open .contact-card {
-		border-bottom-left-radius: 0;
-		border-bottom-right-radius: 0;
-		border-bottom-color: transparent;
-	}
 
 	/* QURATOR-368d — the hovered card reads as the one driving the expansion. */
 	.contact-card.hot { border-color: color-mix(in oklch, var(--accent) 45%, var(--border)); }
