@@ -310,10 +310,16 @@ pub struct TitleSearchResult {
 /// holder_count descending, then key ascending (deterministic — never HashMap order). Within
 /// each hit, holders are ranked by SIMILARITY to `my` inputs (score desc, then npub — see
 /// [`build_hit`]); `my` is my published titles + tags, built once per query by the caller.
+///
+/// `authors` scopes the search (owner, v0.24.0 devtest: Browse searches the selected contact,
+/// or the selected group's members): `Some(set)` counts and lists ONLY rows by those authors,
+/// so a title no in-scope author holds is not a hit at all and `holder_count` is the in-scope
+/// count. `None` is every author — the phonebook's title match and the unscoped Browse search.
 pub(crate) fn search_titles(
     query: &str,
     limit: Option<usize>,
     my: &SimilarityInputs,
+    authors: Option<&HashSet<String>>,
 ) -> TitleSearchResult {
     let norm = normalize_title(query);
     if norm.is_empty() {
@@ -322,16 +328,21 @@ pub(crate) fn search_titles(
     let cap = limit.unwrap_or(MAX_TITLES).clamp(1, MAX_TITLES);
     let idx = INDEX.read().expect("title index lock poisoned");
 
-    // (key, holder_count) for the exact key first, then every substring key.
+    // (key, holder_count) for the exact key first, then every substring key. A key with no
+    // in-scope holder is dropped here, BEFORE the cap, so out-of-scope titles never take a slot.
     let mut candidates: Vec<(String, usize)> = Vec::new();
     if let Some(rows) = idx.by_title.get(&norm) {
-        candidates.push((norm.clone(), distinct_authors(rows)));
+        let n = distinct_authors(rows, authors);
+        if n > 0 {
+            candidates.push((norm.clone(), n));
+        }
     }
     let mut subs: Vec<(String, usize)> = idx
         .by_title
         .iter()
         .filter(|(k, _)| k.contains(&norm) && *k != &norm)
-        .map(|(k, rows)| (k.clone(), distinct_authors(rows)))
+        .map(|(k, rows)| (k.clone(), distinct_authors(rows, authors)))
+        .filter(|(_, n)| *n > 0)
         .collect();
     subs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     candidates.extend(subs);
@@ -340,27 +351,46 @@ pub(crate) fn search_titles(
     let hits = candidates
         .into_iter()
         .take(cap)
-        .map(|(key, count)| build_hit(&idx, key, count, my))
+        .map(|(key, count)| build_hit(&idx, key, count, my, authors))
         .collect();
     TitleSearchResult { hits, truncated }
 }
 
-fn distinct_authors(rows: &[Arc<Row>]) -> usize {
+/// Is this row's author inside the search scope? `None` = no scope, every author is.
+fn in_scope(row: &Row, authors: Option<&HashSet<String>>) -> bool {
+    authors.is_none_or(|set| set.contains(&row.author_npub))
+}
+
+fn distinct_authors(rows: &[Arc<Row>], authors: Option<&HashSet<String>>) -> usize {
     let mut seen = std::collections::HashSet::new();
-    rows.iter().for_each(|r| {
+    rows.iter().filter(|r| in_scope(r, authors)).for_each(|r| {
         seen.insert(r.author_npub.as_str());
     });
     seen.len()
 }
 
-fn build_hit(idx: &Index, key: String, count: usize, my: &SimilarityInputs) -> TitleHit {
+fn build_hit(
+    idx: &Index,
+    key: String,
+    count: usize,
+    my: &SimilarityInputs,
+    authors: Option<&HashSet<String>>,
+) -> TitleHit {
     let rows = &idx.by_title[&key];
-    let title = rows[0].name.clone();
+    // The display name comes from an IN-SCOPE row (candidates guarantee one exists), so a scoped
+    // search never shows an out-of-scope author's spelling of the title.
+    let title = rows
+        .iter()
+        .find(|r| in_scope(r, authors))
+        .unwrap_or(&rows[0])
+        .name
+        .clone();
     // Holder = DISTINCT author; the representative (slug, path) is the first row seen for
     // that author under this key.
     let mut seen = std::collections::HashSet::new();
     let mut holders: Vec<TitleHolder> = rows
         .iter()
+        .filter(|r| in_scope(r, authors))
         .filter_map(|r| {
             if seen.insert(r.author_npub.as_str()) {
                 Some(TitleHolder {
@@ -518,7 +548,7 @@ mod tests {
     /// holder, so holder order falls to the npub tiebreak — deterministic for every test that
     /// doesn't care about order. The order test below passes real inputs.
     fn search(query: &str) -> TitleSearchResult {
-        search_titles(query, None, &SimilarityInputs::default())
+        search_titles(query, None, &SimilarityInputs::default(), None)
     }
 
     /// P-10 mutation: in `contact_saved` (crates/hb-app/src/title_index.rs), change the
@@ -756,7 +786,7 @@ mod tests {
             interest_tags: ["sci-fi".to_string()].into_iter().collect(),
             collection_tags: HashSet::new(),
         };
-        let res = search_titles("order specimen", None, &my);
+        let res = search_titles("order specimen", None, &my, None);
         let order: Vec<&str> = res.hits[0].holders.iter().map(|h| h.npub.as_str()).collect();
         assert_eq!(
             order,
@@ -764,6 +794,43 @@ mod tests {
             "similar first, then npub-ascending among the zero-scored: {order:?}"
         );
         assert_eq!(res.hits[0].holders[0].display_name.as_deref(), Some("disp-hb_ti_ord_b"));
+    }
+
+    /// v0.24.0 devtest item 7: Browse searches the selected contact, or the selected group's
+    /// members — never every contact. A scoped search lists and COUNTS only in-scope authors,
+    /// and a title no in-scope author holds is not a hit.
+    /// P-10 mutation: in `in_scope` (crates/hb-app/src/title_index.rs) replace the body with
+    /// `true` — this test reds (out-of-scope holders and the out-of-scope-only title come back).
+    #[test]
+    fn a_scoped_search_counts_and_lists_only_in_scope_authors() {
+        let _g = gate();
+        for npub in ["hb_ti_scope_a", "hb_ti_scope_b", "hb_ti_scope_c"] {
+            contact_saved(&peer_with(npub, "ti-scope-films", Visibility::Public, vec![item("Scope Specimen", ItemType::Folder)]));
+        }
+        contact_saved(&peer_with("hb_ti_scope_c", "ti-scope-other", Visibility::Public, vec![item("Scope Outsider Only", ItemType::Folder)]));
+        let my = SimilarityInputs::default();
+
+        let all = search_titles("scope", None, &my, None);
+        let shared = all.hits.iter().find(|h| h.name_norm == normalize_title("Scope Specimen")).expect("unscoped hit");
+        assert_eq!(shared.holder_count, 3, "unscoped counts everyone");
+        assert!(all.hits.iter().any(|h| h.name_norm == normalize_title("Scope Outsider Only")));
+
+        let group: HashSet<String> = ["hb_ti_scope_a", "hb_ti_scope_b"].iter().map(|s| s.to_string()).collect();
+        let scoped = search_titles("scope", None, &my, Some(&group));
+        assert_eq!(scoped.hits.len(), 1, "only the title an in-scope author holds: {:?}", scoped.hits.iter().map(|h| &h.title).collect::<Vec<_>>());
+        assert_eq!(scoped.hits[0].holder_count, 2, "the count is the in-scope count");
+        let holders: Vec<&str> = scoped.hits[0].holders.iter().map(|h| h.npub.as_str()).collect();
+        assert_eq!(holders, vec!["hb_ti_scope_a", "hb_ti_scope_b"]);
+
+        // One contact selected: that contact alone.
+        let one: HashSet<String> = ["hb_ti_scope_c".to_string()].into_iter().collect();
+        let solo = search_titles("scope", None, &my, Some(&one));
+        assert_eq!(solo.hits.len(), 2);
+        assert!(solo.hits.iter().all(|h| h.holder_count == 1 && h.holders[0].npub == "hb_ti_scope_c"));
+
+        // An empty scope (a group with no indexed member) finds nothing — never everyone.
+        let none: HashSet<String> = HashSet::new();
+        assert!(search_titles("scope", None, &my, Some(&none)).hits.is_empty());
     }
 
     /// The one-site guard: `upsert_listing(` (call form) appears EXACTLY ONCE in production

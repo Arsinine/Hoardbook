@@ -728,8 +728,10 @@ export const topicAnnounceMarkSeen = (topicId: string, ts: number) =>
  *  on-disk cache, updated on every successful save). The query is normalised with the one
  *  `normalize_title`. Caps: 50 titles, 20 holders each; `truncated` reports more matches.
  *  ⚠ UI copy must state the honest limit: holder counts cover only people you can read. */
-export const searchTitles = (query: string, limit?: number) =>
-	invoke<TitleSearchResult>('search_titles', { query, limit });
+/** `authors` scopes the search to those npubs (v0.24.0 devtest: Browse searches the selected
+ *  contact or group). Omitted = every contact. */
+export const searchTitles = (query: string, limit?: number, authors?: string[]) =>
+	invoke<TitleSearchResult>('search_titles', authors ? { query, limit, authors } : { query, limit });
 
 // ── QURATOR-347 slice B — people like you (similarity-ranked contacts) ─────────
 

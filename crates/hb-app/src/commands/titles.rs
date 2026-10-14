@@ -1,6 +1,8 @@
 //! QURATOR-347 slice A — the `search_titles` Tauri command: a thin synchronous read over the
 //! in-memory title index ([`crate::title_index`]). No network, no crypto — §5 does not fire.
 
+use std::collections::HashSet;
+
 use tauri::State;
 
 use crate::store::DataStore;
@@ -17,12 +19,18 @@ use crate::title_index::{self, TitleSearchResult};
 ///
 /// Slice B: holders are ranked by similarity to MY inputs — built here, ONCE per query, from
 /// the store (my published public titles + my interests/collection tags), never per holder.
+///
+/// `authors` scopes the search to those npubs (owner, v0.24.0 devtest: Browse searches the
+/// selected contact, or the selected group's members). Absent = every contact. An optional
+/// argument, so an older UI that never sends it keeps the unscoped search.
 #[tauri::command]
 pub fn search_titles(
     query: String,
     limit: Option<usize>,
+    authors: Option<Vec<String>>,
     store: State<'_, DataStore>,
 ) -> Result<TitleSearchResult, String> {
     let my = crate::commands::people::my_similarity_inputs(&store);
-    Ok(title_index::search_titles(&query, limit, &my))
+    let scope: Option<HashSet<String>> = authors.map(|a| a.into_iter().collect());
+    Ok(title_index::search_titles(&query, limit, &my, scope.as_ref()))
 }

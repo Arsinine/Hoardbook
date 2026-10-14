@@ -1,3 +1,14 @@
+<script module lang="ts">
+	/** v0.24.0 devtest item 7 — what the search covers. Absent = every contact. Browse passes the
+	 *  selected contact, or the selected group's members (owner: "searching in browse searches
+	 *  across all contacts instead of the selected contact. You should be able to search across
+	 *  grouped contacts as well"). */
+	export interface SearchScope {
+		label: string;
+		npubs: string[];
+	}
+</script>
+
 <script lang="ts">
 	// QURATOR-342 D1 — the title-search strip for the top of Browse (lane D2 mounts it as
 	// `<TitleSearch onbrowse={(npub) => …} />`). Self-fetches `searchTitles`, debounced 250 ms.
@@ -18,8 +29,11 @@
 
 	interface Props {
 		onbrowse: (npub: string) => void;
+		scope?: SearchScope | null;
+		/** "All contacts" — the caller drops its selection-derived scope. */
+		onclearscope?: () => void;
 	}
-	let { onbrowse }: Props = $props();
+	let { onbrowse, scope = null, onclearscope }: Props = $props();
 
 	/** Owner ruling: at most 50 titles / 20 holders per answer — the backend enforces the caps, the
 	 *  foot lines disclose them. `limit` here only pins the title cap explicitly. */
@@ -61,7 +75,7 @@
 		const seq = ++searchSeq;
 		status = 'loading';
 		try {
-			const res = await searchTitles(q, TITLE_LIMIT);
+			const res = scope ? await searchTitles(q, TITLE_LIMIT, scope.npubs) : await searchTitles(q, TITLE_LIMIT);
 			if (seq !== searchSeq) return; // superseded by a newer keystroke/retry — discard
 			hits = res.hits;
 			truncated = res.truncated;
@@ -108,6 +122,25 @@
 	$effect(() => () => {
 		if (timer) clearTimeout(timer); // unmount — never fire after the strip is gone
 	});
+
+	// A scope change re-runs the CURRENT query at once (no debounce: nothing is being typed), so the
+	// results on screen always belong to the scope the line names. Keyed on the npub list, not the
+	// object, so an identical scope re-derived by the parent does not re-fire.
+	let scopeKey = $derived(scope ? scope.npubs.join(',') : '*');
+	let lastScopeKey: string | undefined;
+	$effect(() => {
+		const key = scopeKey;
+		if (lastScopeKey === undefined) {
+			lastScopeKey = key;
+			return;
+		}
+		if (key === lastScopeKey) return;
+		lastScopeKey = key;
+		const q = query.trim();
+		if (!q) return;
+		if (timer) clearTimeout(timer);
+		void runSearch(q);
+	});
 </script>
 
 <div class="ts-strip">
@@ -120,6 +153,12 @@
 		oninput={onInput}
 	/>
 	<p class="ts-hint">Counts cover only people you can read.</p>
+	{#if scope}
+		<p class="ts-scope">
+			Searching in <span class="ts-scope-name">{scope.label}</span>
+			{#if onclearscope}<span aria-hidden="true">·</span> <button class="ts-scope-all" type="button" onclick={onclearscope}>All contacts</button>{/if}
+		</p>
+	{/if}
 
 	{#if status === 'loading' && !hits.length}
 		<p class="ts-line">Searching…</p>
@@ -194,6 +233,31 @@
 		font-size: 12px;
 	 color: var(--fg-dim);
 	}
+	.ts-scope {
+		margin: 0;
+		font-size: 12px;
+		color: var(--fg-muted);
+		display: flex;
+		align-items: baseline;
+		gap: 5px;
+		min-width: 0;
+	}
+	.ts-scope-name {
+		color: var(--fg);
+		font-weight: 600;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.ts-scope-all {
+		background: none;
+		border: 0;
+		padding: 0;
+		font: inherit;
+		color: var(--accent);
+		cursor: pointer;
+	}
+	.ts-scope-all:hover { text-decoration: underline; }
 	.ts-line {
 		margin: 2px 0;
 		font-size: 13px;

@@ -131,7 +131,7 @@ pub async fn discover_people(
     // reaches only cached listings — contacts — which the DRAFT already states; holders of a
     // matching title get `MatchKind::Title`.
     let title_npubs: HashSet<String> = match query.as_deref() {
-        Some(q) if !q.trim().is_empty() => crate::title_index::search_titles(q, None, &mine)
+        Some(q) if !q.trim().is_empty() => crate::title_index::search_titles(q, None, &mine, None)
             .hits
             .into_iter()
             .flat_map(|h| h.holders.into_iter().map(|holder| holder.npub))

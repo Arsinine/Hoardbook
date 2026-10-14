@@ -211,3 +211,57 @@ describe('TitleSearch', () => {
 		expect(text).not.toMatch(/download/i);
 	});
 });
+
+// v0.24.0 devtest item 7 — the search follows the Browse selection (owner, 2026-10-14: "searching in
+// browse searches across all contacts instead of the selected contact. You should be able to search
+// across grouped contacts as well"; ruling: follow the selection).
+describe('TitleSearch — scope (v0.24.0 item 7)', () => {
+	it('a scope sends ONLY its npubs, and the strip names what it is searching', async () => {
+		// P-10 MUTATION (orchestrator): in TitleSearch.svelte runSearch, call
+		// `searchTitles(q, TITLE_LIMIT)` unconditionally → REDS (no authors argument).
+		searchMock.mockResolvedValue(hitsResult([]));
+		vi.useFakeTimers();
+		render(TitleSearch, { props: { onbrowse: vi.fn(), scope: { label: 'Film club', npubs: [MARA.npub, JONAS.npub] } } });
+		expect(screen.getByText('Film club')).toBeTruthy();
+		expect(screen.getByText(/Searching in/)).toBeTruthy();
+		await type('ghibli');
+		await vi.advanceTimersByTimeAsync(300);
+		expect(searchMock).toHaveBeenCalledWith('ghibli', 50, [MARA.npub, JONAS.npub]);
+	});
+
+	it('no scope searches every contact (no authors argument) and shows no scope line', async () => {
+		searchMock.mockResolvedValue(hitsResult([]));
+		vi.useFakeTimers();
+		render(TitleSearch, { props: { onbrowse: vi.fn() } });
+		await type('ghibli');
+		await vi.advanceTimersByTimeAsync(300);
+		expect(searchMock).toHaveBeenCalledWith('ghibli', 50);
+		expect(screen.queryByText(/Searching in/)).toBeNull();
+	});
+
+	it('changing the scope re-runs the current query at once, under the new scope', async () => {
+		// P-10 MUTATION (orchestrator): in TitleSearch.svelte delete `void runSearch(q);` from the
+		// scope-change $effect → REDS (only the first, typed search is ever sent).
+		searchMock.mockResolvedValue(hitsResult([]));
+		vi.useFakeTimers();
+		const r = render(TitleSearch, { props: { onbrowse: vi.fn(), scope: { label: 'Mara Vela', npubs: [MARA.npub] } } });
+		await type('ghibli');
+		await vi.advanceTimersByTimeAsync(300);
+		expect(searchMock).toHaveBeenCalledTimes(1);
+		await r.rerender({ onbrowse: vi.fn(), scope: { label: 'Film club', npubs: [MARA.npub, JONAS.npub] } });
+		await tick();
+		expect(searchMock).toHaveBeenCalledTimes(2);
+		expect(searchMock).toHaveBeenLastCalledWith('ghibli', 50, [MARA.npub, JONAS.npub]);
+		// An identical scope re-derived by the parent does not fire again.
+		await r.rerender({ onbrowse: vi.fn(), scope: { label: 'Film club', npubs: [MARA.npub, JONAS.npub] } });
+		await tick();
+		expect(searchMock).toHaveBeenCalledTimes(2);
+	});
+
+	it('"All contacts" asks the parent to drop the scope', async () => {
+		const onclearscope = vi.fn();
+		render(TitleSearch, { props: { onbrowse: vi.fn(), scope: { label: 'Mara Vela', npubs: [MARA.npub] }, onclearscope } });
+		await fireEvent.click(screen.getByRole('button', { name: 'All contacts' }));
+		expect(onclearscope).toHaveBeenCalledTimes(1);
+	});
+});

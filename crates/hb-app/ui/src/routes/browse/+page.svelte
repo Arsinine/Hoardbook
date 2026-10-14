@@ -21,7 +21,7 @@
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	// QURATOR-342 D2 — the title-search strip (lane D1's component) mounts at the top of the right
 	// pane; onbrowse routes into this page's own peer-selection path (see onTitleBrowse).
-	import TitleSearch from '$lib/components/TitleSearch.svelte';
+	import TitleSearch, { type SearchScope } from '$lib/components/TitleSearch.svelte';
 	import { deriveFetchStatus } from '$lib/fetch-status.js';
 	import { collectionAvailability, peerAccessBadge, peerFromQuery, paywallTeaser, importedManifestNote, arrangeItems, fileTypesPresent, fmtLargestUnit, parseEstSize, type BrowseViewMode, type BrowseSortKey, type BrowseSortDir } from '$lib/browse-view.js';
 	import type { Collection, ContactSummary, DirectoryItem, Group } from '$lib/types.js';
@@ -92,6 +92,9 @@
 
 	async function selectPeer(peer: ContactSummary) {
 		selectedPeer = peer;
+		// v0.24.0 item 7 — picking a contact makes IT the title-search scope (a selected group yields).
+		selectedGroup = null;
+		scopeAll = false;
 		selectedCollection = null;
 		folderStack = [];
 		resetFileFilters();
@@ -243,6 +246,28 @@
 	// trailing section, never a bucket that hides anyone. The text filter now matches petname too
 	// (it previously matched only display_name + npub — Contacts already matched petname).
 	let groups: Group[] = $state([]);
+
+	// v0.24.0 devtest item 7 — the title search follows the selection (owner: "searching in browse
+	// searches across all contacts instead of the selected contact. You should be able to search
+	// across grouped contacts as well"; scope ruling 2026-10-14: follow the selection). Clicking a
+	// group header selects the GROUP as the scope (the right pane is untouched — a group has no
+	// collections of its own); picking a contact selects that contact; "All contacts" in the strip
+	// widens back to everyone without leaving the contact you are browsing.
+	let selectedGroup = $state<string | null>(null);
+	let scopeAll = $state(false);
+	function selectGroupScope(name: string) {
+		selectedGroup = selectedGroup === name ? null : name; // a second click releases the group
+		scopeAll = false;
+	}
+	let searchScope = $derived.by((): SearchScope | null => {
+		if (scopeAll) return null;
+		if (selectedGroup) {
+			const g = groups.find((x) => x.name === selectedGroup);
+			if (g) return { label: g.name, npubs: [...g.pubkeys] };
+		}
+		if (selectedPeer) return { label: peerName(selectedPeer), npubs: [selectedPeer.npub] };
+		return null;
+	});
 	// Has the FIRST groupsGet() resolved? The membership editor must not commit a full-set replace
 	// derived from an empty `groups` array — that would wipe the contact's memberships (Codex review
 	// 2026-08-11). Passed to GroupMembershipPopover as `ready`.
@@ -971,7 +996,20 @@
 							{#if secGroup?.color}
 								<span class="people-group-dot" style={`background:${secGroup.color}`}></span>
 							{/if}
-							<span class="people-section-title">{section.label}</span>
+							<!-- v0.24.0 item 7: a real group's title selects it as the title-search scope.
+							     Ungrouped is not a stored group, so it stays plain text. -->
+							{#if secGroup}
+								<button
+									type="button"
+									class="people-section-title group-scope-btn"
+									class:group-scoped={selectedGroup === secGroup.name && !scopeAll}
+									aria-pressed={selectedGroup === secGroup.name && !scopeAll}
+									title="Search titles in {section.label}"
+									onclick={() => selectGroupScope(secGroup.name)}
+								>{section.label}</button>
+							{:else}
+								<span class="people-section-title">{section.label}</span>
+							{/if}
 							<span class="people-section-count">{section.peers.length}</span>
 							{#if dropOverTarget === dropTargetName && dropOutcome}
 								<span class="drop-hint-browse">{#if dropOutcome.kind === 'refused'}{dropOutcome.reason}{:else if dropOutcome.kind === 'noop'}already ungrouped{:else if dropOutcome.kind === 'add'}⇧ add{:else if dropOutcome.kind === 'move'}move{:else}clear all{/if}</span>
@@ -1038,7 +1076,7 @@
 		     right pane in EVERY state: searching drives peer selection, it is not a per-peer tool.
 		     Selection routes through onTitleBrowse → selectPeer / the /browse?peer= deep-link. -->
 		<div class="title-search-strip">
-			<TitleSearch onbrowse={onTitleBrowse} />
+			<TitleSearch onbrowse={onTitleBrowse} scope={searchScope} onclearscope={() => { scopeAll = true; selectedGroup = null; }} />
 		</div>
 		{#if !selectedPeer}
 			<!-- Browse = view a contact's collections. Finding/adding people (lookup + Discover
@@ -1567,6 +1605,13 @@
 		font-size: 9.5px; font-weight: 700; letter-spacing: 0.6px; text-transform: uppercase;
 		color: var(--fg-dim);
 	}
+	/* v0.24.0 item 7 — a group title is the button that scopes the title search to that group. */
+	.group-scope-btn {
+		background: none; border: 0; padding: 1px 4px; margin: -1px -4px;
+		border-radius: var(--r-chip, 4px); cursor: pointer; font-family: inherit;
+	}
+	.group-scope-btn:hover { color: var(--fg); }
+	.group-scope-btn.group-scoped { color: var(--accent); background: color-mix(in oklch, var(--accent) 14%, transparent); }
 	.people-section-count {
 		font-size: 9.5px; color: var(--fg-dim); font-feature-settings: 'tnum';
 	}
