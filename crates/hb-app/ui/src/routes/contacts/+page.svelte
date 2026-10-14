@@ -1397,10 +1397,18 @@
 					{#if collision}
 						<span class="collision-badge" title={collision}>⚠ {collision}</span>
 					{/if}
-					<!-- QURATOR-368 (owner ruling, draft): line 1 carries the ONLINE pill only. Offline and
-					     "Checking…" are said once, as text on line 2 — never as a second pill here. -->
+					<!-- QURATOR-368 (owner ruling, draft): "Offline" and "Checking…" are SAID once, as text on
+					     line 2 — never as a second worded pill here. But the presence SLOT is always
+					     rendered (owner, 2026-10-14: an offline row had no mark, then the dot "magically
+					     pops up" and shoves the size over): a dot-only mark in every state — green online,
+					     grey offline, hollow while the query has not answered. Same box in all three, so a
+					     state change never reflows the row. -->
 					{#if peer.online}
-						<span class="pill pill-online"><span class="pill-dot"></span></span>
+						<span class="pill pill-online" title="Online"><span class="pill-dot"></span></span>
+					{:else if presenceOf(peer).online === null}
+						<span class="pill pill-dot-unknown" title="Checking presence…"><span class="pill-dot"></span></span>
+					{:else}
+						<span class="pill pill-dot-offline" title="Offline"><span class="pill-dot"></span></span>
 					{/if}
 					{#if profileTotal}
 						<!-- QURATOR-351 state d: THEIR published total, right-aligned on the name row.
@@ -2493,6 +2501,10 @@
 		background: color-mix(in oklch, var(--online) 12%, transparent);
 	}
 	.pill-online .pill-dot { background: var(--online); }
+	/* The row's dot-only presence slot when NOT online — same box as .pill-online (padding from .pill),
+	   no fill, so flipping state changes the dot's colour and nothing else on line 1. */
+	.pill-dot-offline .pill-dot { background: var(--fg-dim); }
+	.pill-dot-unknown .pill-dot { background: transparent; box-shadow: inset 0 0 0 1px var(--fg-dim); }
 	.pill-offline {
 		color: var(--fg-muted);
 		background: color-mix(in oklch, var(--fg-muted) 12%, transparent);

@@ -125,6 +125,45 @@ describe('QURATOR-135 — unknown presence is not Offline', () => {
 	});
 });
 
+// Owner defect 2026-10-14 (v0.24.0): an OFFLINE row rendered NO presence mark on line 1, so the
+// dot "magically popped up" when the contact came online and shoved the size along. QURATOR-368
+// had made line 1 online-only to stop "Offline" being said twice; the slot must still be there in
+// every state — dot-only, so the word stays on line 2 alone. Three states, one slot each.
+describe('the line-1 presence slot is ALWAYS rendered (owner defect 2026-10-14)', () => {
+	const slot = (container: HTMLElement) => container.querySelector('.contact-card .name-row .pill');
+
+	it('not yet answered → a hollow dot in the slot, no word', async () => {
+		contacts.set([peer({ last_presence: undefined })]);
+		const { container } = render(ContactsPage);
+		await waitFor(() => expect(container.querySelector('.contact-card')).not.toBeNull());
+		// P-10 MUTATION: in +page.svelte delete the `{:else if presenceOf(peer).online === null}`
+		// branch's <span class="pill pill-dot-unknown"> (or restore `{#if peer.online}…{/if}` alone)
+		// → REDS (slot is null, or it is the offline dot).
+		expect(slot(container), 'slot rendered while checking').not.toBeNull();
+		expect(slot(container)!.classList.contains('pill-dot-unknown')).toBe(true);
+		expect((slot(container)!.textContent ?? '').trim(), 'dot-only').toBe('');
+	});
+
+	it('answered, offline → a grey dot in the slot; "Offline" is still said once', async () => {
+		contacts.set([peer({ last_presence: new Date(Date.now() - 3_600_000).toISOString() })]);
+		const { container } = render(ContactsPage);
+		await waitFor(() => expect(container.querySelector('.contact-card .pill-offline')).not.toBeNull());
+		// P-10 MUTATION: restore line 1 to `{#if peer.online}<span class="pill pill-online">…{/if}`
+		// alone (the shipped v0.24.0 shape) → REDS (no slot for an offline contact).
+		expect(slot(container), 'slot rendered while offline').not.toBeNull();
+		expect(slot(container)!.classList.contains('pill-dot-offline')).toBe(true);
+		expect((slot(container)!.textContent ?? '').trim(), 'dot-only').toBe('');
+		const row = container.querySelector('.contact-card') as HTMLElement;
+		expect((row.textContent ?? '').match(/Offline/g)?.length, 'Offline is said once').toBe(1);
+	});
+
+	it('online → the green dot, in the same slot', async () => {
+		contacts.set([peer({ last_presence: new Date().toISOString() })]);
+		const { container } = render(ContactsPage);
+		await waitFor(() => expect(slot(container)?.classList.contains('pill-online')).toBe(true));
+	});
+});
+
 // QURATOR-135, the OWED second half — "first poll fires on mount, not on the first
 // REFRESH_INTERVAL/ONLINE_POLL_VISIBLE_MS tick."
 //
