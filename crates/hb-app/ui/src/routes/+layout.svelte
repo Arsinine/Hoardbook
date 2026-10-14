@@ -8,6 +8,9 @@
 	import { identity, profile, inboxMessages, readWatermarks, toastMessage, appReady, toast, dismissToast, isStickyToast, identityLoadError, topicAnnounceSummaries, announceSeen, seedSentFromFeed, loadCollectionsInto, loadContactsInto } from '$lib/stores.js';
 	import { isOurDrag } from '$lib/drag-group.js';
 	import { totalUnread, unreadByPeer } from '$lib/unread-view.js';
+	// QURATOR-340 — OS-level taskbar attention for unread chat (deliberately NOT on $lib/api.js:
+	// six tests vi.mock('$lib/api.js') with fixed factories; see lib/unread-attention.ts).
+	import { attentionArgs, setUnreadAttention } from '$lib/unread-attention.js';
 	import { unseenAnnouncementCount, newlyArrivedAnnouncements, announcementBaseline } from '$lib/topics-view.js';
 	import { listen } from '@tauri-apps/api/event';
 	import { navIcons, avatarHue } from '$lib/icons.js';
@@ -172,6 +175,27 @@
 	// count folds into the Chat nav badge (unread DMs + unseen announcements) — the Topics item no
 	// longer badges. Opening a topic channel advances its seen watermark, clearing its share here.
 	let navChatCount = $derived(navUnreadCount + navAnnounceCount);
+
+	// QURATOR-340 — ONE invoke per navChatCount change; Rust owns the focus gate (owner ruling
+	// 2026-10-14, verbatim at commands/window.rs: fire ONLY while the window is NOT focused — a
+	// message landing while focused does nothing at the OS level; ONE Informational flash per new
+	// message, never Critical; the badge clears when the window gains focus, which the Rust
+	// `WindowEvent::Focused` arm does without waiting for this poll).
+	// `prevChatCount` starts undefined: the COLD-LOAD run only records the baseline and must never
+	// flash (a rehydrated unread pile is not a new arrival). The rejection is swallowed for the
+	// same reason the two listen() chains catch — outside Tauri the promise always rejects, and an
+	// unhandled rejection fails the whole vitest run even with every test green.
+	let prevChatCount: number | undefined;
+
+	$effect(() => {
+		if (prevChatCount === undefined) {
+			prevChatCount = navChatCount;
+			return;
+		}
+		const { unread, newArrival } = attentionArgs(prevChatCount, navChatCount);
+		prevChatCount = navChatCount;
+		setUnreadAttention(unread, newArrival).catch(() => { });
+	});
 
 	// ── Foreign-drag guard (devtest 2026-08-26 item 2, chorus finding 1) ──────────────────────────
 	// `dragDropEnabled: false` in tauri.conf.json is what un-breaks contact drag: WebView2's native

@@ -625,9 +625,19 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             // Closing hides to tray; "Quit" from the tray calls app.exit(0) instead.
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+                // QURATOR-340 — focus CLEARS the unread badge without waiting for the next poll
+                // (owner ruling: "The persistent red-dot badge shows while unfocused/minimized/
+                // hidden and clears when the window gains focus."). The overlay effect is
+                // cfg-gated in commands::window (the API only exists on Windows).
+                tauri::WindowEvent::Focused(true) => {
+                    commands::window::clear_overlay_on_window(window);
+                }
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -697,6 +707,10 @@ pub fn run() {
             commands::appearance::window_material_supported,
             commands::appearance::set_window_material,
             commands::online::online_count,
+            // QURATOR-340 — taskbar attention (red-dot badge + ONE Informational flash) while the
+            // window is unfocused/minimized/hidden. Done in RUST so no new window capability is
+            // needed and no JS window API exists to call.
+            commands::window::set_unread_attention,
             commands::chat::send_message,
             commands::chat::request_manifest,
             commands::chat::request_manifest_from,

@@ -18,3 +18,4 @@ pub mod titles;
 pub mod topics;
 pub mod update;
 pub mod watches;
+pub mod window;
