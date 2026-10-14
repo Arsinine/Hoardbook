@@ -268,7 +268,7 @@ describe('QURATOR-342 lane B — the removed controls stay removed', () => {
 });
 
 describe('QURATOR-360 F1 — the likes panel is folded into Discover; the right pane is the open contact', () => {
-	it('no likes panel anywhere, and the right pane carries the open contact .contact-detail', async () => {
+	it('no likes panel anywhere, and the right pane carries the open contact detail', async () => {
 		contacts.set([peer({ npub: NPUB_A })]);
 		const { container } = render(ContactsPage);
 		await waitFor(() => expect(container.querySelector('.contact-card')).toBeTruthy());
@@ -279,17 +279,17 @@ describe('QURATOR-360 F1 — the likes panel is folded into Discover; the right 
 		expect(src.includes(gone)).toBe(false);
 		expect(container.querySelector('.people-pane')).toBeNull();
 		// The row click still selects (QURATOR-368b: held 250 ms, then lands); the PANE (not the
-		// row) renders .contact-detail.
+		// row) renders the detail (.detail-scroll; the .contact-detail wrapper went in QURATOR-378 rev b).
 		fireEvent.click(container.querySelector('.contact-card')!);
-		await waitFor(() => expect(container.querySelector('.detail-pane .contact-detail')).not.toBeNull());
+		await waitFor(() => expect(container.querySelector('.detail-pane .pane-bio')).not.toBeNull());
 		// …and the detail is OUT of the row: .contact-block must not contain it.
 		const blk = container.querySelector('.contact-block');
-		const det = container.querySelector('.detail-pane .contact-detail')!;
+		const det = container.querySelector('.detail-pane .pane-bio')!;
 		expect(blk!.contains(det)).toBe(false);
 	});
 	// MUTATION PROOF (P-10): lie to the pane render gate — `{#if openPeer}` → `{#if false && openPeer}`
-	// — the pane shows EmptyState, `.detail-pane .contact-detail` never renders → RED
-	// (observed: `expected … '.detail-pane .contact-detail'` toBeTruthy). Restore + touch → green.
+	// — the pane shows EmptyState, `.detail-pane .pane-bio` never renders → RED
+	// (observed: `expected … '.detail-pane .pane-bio'` toBeTruthy). Restore + touch → green.
 });
 
 describe('QURATOR-342 lane B — no ask-for-access on a locked contact', () => {

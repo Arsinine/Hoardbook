@@ -969,17 +969,10 @@ describe('M22 W4 — contacts page wiring (source-scan, no behavioural equivalen
 		expect(s).toMatch(/section\.key === 'ungrouped' \? UNGROUPED_TARGET : section\.key/);
 	});
 
-	// QURATOR-368c RE-POINT: the chip row moved off the card into the pane's `.pane-groups` block.
-	// The chips remain drop targets (M22 W4's "nearer than the section heading" now means nearer in
-	// the pane); the section headings and the card-on-card drag surfaces are untouched and pinned
-	// in the tests around this one.
-	it('group chips in the pane are ALSO drop targets with stopPropagation', () => {
-		const s = contactsSrc();
-		const sub = s.slice(s.indexOf('class="pane-groups"'), s.indexOf('group-add-btn'));
-		expect(sub).toMatch(/ondragover=\{\(e\) => \{ e\.stopPropagation\(\); onGroupDragOver\(e, gname\); \}\}/);
-		expect(sub).toMatch(/ondrop=\{\(e\) => \{ e\.stopPropagation\(\); onGroupDrop\(e, gname\); \}\}/);
-		expect(sub).toMatch(/ondragleave=\{\(e\) => \{ e\.stopPropagation\(\); onGroupDragLeave\(e, gname\); \}\}/);
-	});
+	// QURATOR-368c moved the drop-target group chips into the pane; QURATOR-378 rev b (owner: "drop
+	// groups") removed them. The section headings and the card-on-card drag surfaces remain the
+	// drop targets, pinned in the tests around this one. The pane carrying no chips is pinned in
+	// contacts-w5b and contacts-chevron-item3.
 
 	it('the refuse state is computed on dragover (dropOutcome set before drop)', () => {
 		const s = contactsSrc();
@@ -1800,16 +1793,18 @@ describe('M22 W7 acceptance — every drop kind has a keyboard route (table-driv
 	// add/move/ungrouped → the W5b group popover (contactUpdateGroups with the full desired set)
 	// refused/noop → nothing to route (no write happens).
 	// M22 W8 — add/move/ungrouped route through the ONE shared GroupMembershipPopover component
-	// (extracted from the W5b inline popover). On Contacts the route is the `+` click opening the
-	// popover (E is Browse's keyboard route; Contacts' W5b surface is the click). The route column
+	// (extracted from the W5b inline popover). On Contacts the route is the ⋯ menu's "Edit groups…"
+	// opening the popover (the pane `+` until QURATOR-378 rev b) (E is Browse's keyboard route; Contacts' W5b surface is the click). The route column
 	// names the real handler in the page source; the "probe" column is what must RED if the route is
 	// severed (mutation-tested below).
 	const cases: { kind: string; route: string; probe: string }[] = [
 		{ kind: 'create (W3 pair)',   route: 'G → namer',                 probe: 'dragPopoverFor = [...selectedNpubs]' },
 		{ kind: 'create (W5 multi)',  route: 'G → namer',                 probe: 'dragPopoverFor = [...selectedNpubs]' },
-		{ kind: 'add',                route: '+ → group popover',         probe: 'openGroupPopover(peer.npub, e.currentTarget)' },
-		{ kind: 'move',               route: '+ → group popover',         probe: 'openGroupPopover(peer.npub, e.currentTarget)' },
-		{ kind: 'ungrouped',          route: '+ → group popover',         probe: 'openGroupPopover(peer.npub, e.currentTarget)' },
+		// QURATOR-378 rev b: the pane's `+` is gone with the group chips ("drop groups"); the ⋯ menu's
+		// "Edit groups…" is the route now — a focusable button opening the same popover.
+		{ kind: 'add',                route: '⋯ → Edit groups… → popover', probe: 'openGroupPopover(peer.npub, menuAnchor)' },
+		{ kind: 'move',               route: '⋯ → Edit groups… → popover', probe: 'openGroupPopover(peer.npub, menuAnchor)' },
+		{ kind: 'ungrouped',          route: '⋯ → Edit groups… → popover', probe: 'openGroupPopover(peer.npub, menuAnchor)' },
 		{ kind: 'refused',            route: 'nothing (no write)',        probe: '' },
 		{ kind: 'noop',               route: 'nothing (no write)',        probe: '' },
 	];

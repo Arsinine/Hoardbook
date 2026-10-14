@@ -133,7 +133,8 @@ async function openPanel(peer: ContactSummary): Promise<HTMLElement> {
 	expect(card, 'the contact row rendered').not.toBeNull();
 	fireEvent.click(card!);
 	const panel = await waitFor(() => {
-		const found = document.querySelector<HTMLElement>('.contact-detail');
+		// QURATOR-378 rev b: the `.contact-detail` wrapper card is gone; the pane's scroller is the panel.
+		const found = document.querySelector<HTMLElement>('.detail-pane .detail-scroll');
 		expect(found, 'the row click did not select the contact into the pane').not.toBeNull();
 		return found!;
 	});
@@ -167,33 +168,30 @@ describe('devtest item 3 — the chevron panel is the REST of the profile', () =
 		// carries none. (The old copy of this comment said "on the face, row 3, clamped".)
 		const occurrences = (card.textContent ?? '').split(BIO).length - 1;
 		expect(occurrences, 'the bio appears more than once in the card').toBe(1);
-		// est_size renders in the pane HEADER meta (outside .contact-detail), so the facts list
+		// est_size renders in the pane HEADER meta (outside .detail-scroll), so the facts list
 		// still does not repeat it. (The old copy said "est_size is on the face too".)
 		expect(panel.textContent ?? '', 'est_size duplicated into the panel').not.toContain('4 TB');
 	});
 
-	it('the panel carries the ONE group chip row, and no checkbox editor (ruling 01 + QURATOR-368c)', async () => {
-		// Two groups exist and the peer is in one, so a surviving editor would have something to draw.
+	it('the panel carries NO group chips and no checkbox editor (ruling 01 + QURATOR-378 rev b)', async () => {
+		// Two groups exist and the peer is in one, so a surviving chip row or editor would have
+		// something to draw.
 		groupsGetMock.mockResolvedValue([
 			{ name: 'Film', pubkeys: [NPUB] },
 			{ name: 'Music', pubkeys: [] },
 		]);
 		const panel = await openPanel(FULL);
 		expect(panel.querySelector('.group-edit-list'), 'the checkbox editor survived').toBeNull();
-		// QURATOR-368c RE-POINT (premise inverted): this test pinned `.group-pill` as ABSENT from the
-		// panel — the face was the only chip row. Slice c moved the chips INTO the pane, so the
-		// property that survives ruling 01 is: the chips render here EXACTLY ONCE (a second chip row
-		// anywhere is the duplication regression this file guards), and they are not form controls.
-		expect(panel.querySelectorAll('.group-pill').length, 'a second chip row appeared').toBe(1);
-		// The real invariant behind both: no checkbox in this panel is a group toggle. The audience
-		// checkbox IS expected here, so count group-named ones rather than checkboxes outright.
+		// Inverted a third time. QURATOR-368c moved the chip row INTO the pane; QURATOR-378 rev b
+		// (owner: "drop groups") took it out again. The ⋯ menu's "Edit groups…" is the editor's one
+		// entry point now, so neither the chips nor their `+` render here.
+		// P-10 MUTATION: re-add a `<span class="group-pill">` row to the pane → REDS.
+		expect(panel.querySelectorAll('.group-pill').length, 'the pane grew a group chip row again').toBe(0);
+		expect(panel.querySelector('.group-add-btn'), 'the pane `+` came back').toBeNull();
+		expect(panel.textContent ?? '', 'a group name rendered in the pane').not.toContain('Film');
+		// No checkbox in this panel is a group toggle (the audience checkbox IS expected).
 		const labels = [...panel.querySelectorAll('label')].map((l) => l.textContent ?? '');
 		expect(labels.some((t) => t.includes('Film') || t.includes('Music'))).toBe(false);
-		// The `+` — the ONE editor's entry point — moved here with the chips.
-		expect(
-			panel.querySelector('.group-add-btn'),
-			'the popover trigger did not move with the chips',
-		).not.toBeNull();
 	});
 
 	it('peer-published strings are inert, never links (ruling 02)', async () => {
@@ -216,10 +214,16 @@ describe('devtest item 3 — the chevron panel is the REST of the profile', () =
 		expect(panel.textContent ?? '').toContain('No profile details published.');
 	});
 
-	it('your own local notes stay reachable and stay marked as local', async () => {
-		const panel = await openPanel(FULL);
+	it('your own tags stay reachable and stay marked as yours', async () => {
+		const panel = await openPanel({ ...FULL, local_tags: ['met at con'] });
 		const text = panel.textContent ?? '';
-		expect(text).toContain('local to this machine');
+		// QURATOR-378 rev b: the "local to this machine" label is gone — the owner's ruling is that your
+		// tags GLOW ("User added tags glow green"), so the ownership mark is the `.local-tag` class the
+		// glow is drawn on, distinct from their published `.peer-tag` chips.
+		const mine = panel.querySelector('.local-tag');
+		expect(mine?.textContent, 'your tag is not drawn as yours').toContain('met at con');
+		expect(mine?.classList.contains('peer-tag'), 'your tag drawn as theirs').toBe(false);
+		expect(panel.querySelector('.tag-add-btn'), '+ tag is gone').not.toBeNull();
 		// M21 W5: the Private audience toggle is per-contact and explicitly NOT group-derived. It
 		// lives with the local notes, and moving the group editor out must not have taken it along.
 		expect(text).toContain('Receives my Private collections');

@@ -3,8 +3,9 @@
 // design the owner accepted and adds exactly two things —
 //   1. the peer's PUBLISHED total (`Profile::total_bytes`) on every contact row, right-aligned on
 //      the name row (`row-size`); no total, or 0, renders NO span (never a fabricated "0 B").
-//   2. a "Looking for" block on the contact detail, FIRST among the `detail-theirs` blocks (the
-//      r5 ruling: the demand side comes first), rendered only when they published one.
+//   2. a "Looking for" line on the contact detail, FIRST in the pane (the r5 ruling: the demand
+//      side comes first), rendered only when they published one. QURATOR-378 rev b: it is the
+//      first element of tier 1 (`.about`), ahead of the bio, instead of the first `detail-theirs` card.
 // Nothing else: no bands, no gold, no counts on the toggle, no "new people" anywhere.
 //
 // BEHAVIOURAL mount tests (not a source-scan — source-scans are the documented origin of vacuous
@@ -116,9 +117,9 @@ describe('QURATOR-351 state d — size on the row, Looking-for on the detail', (
 	});
 
 	// M2 reds this: delete the `{#if lookingFor}` block in the detail column.
-	// M3 reds this: move that block below "Profile published by them" — the FIRST-block assertion
-	// fails while mere existence stays green, which is why the test pins order.
-	it("a published looking_for renders the Looking-for block FIRST among the detail-theirs blocks", async () => {
+	// M3 reds this: move that block below the bio — the FIRST-element assertion fails while mere
+	// existence stays green, which is why the test pins order.
+	it("a published looking_for renders the Looking-for line FIRST in the pane", async () => {
 		const { container } = await renderRoster([
 			peer('npub1q351dana' + 'd'.repeat(42), prof({ display_name: 'Dana', looking_for: 'Kurosawa box sets' })),
 		]);
@@ -126,11 +127,14 @@ describe('QURATOR-351 state d — size on the row, Looking-for on the detail', (
 		// QURATOR-368b: the chevron is gone — a row click selects into the pane (held 250 ms).
 		fireEvent.click(container.querySelector('.contact-card')!);
 		await waitFor(() => expect(container.querySelectorAll('.looking-for').length).toBe(1));
-		expect(container.querySelector('.looking-for')!.textContent).toBe('Kurosawa box sets');
+		// The eyebrow label is part of the line; the published text follows it.
+		const lf = container.querySelector('.looking-for')!;
+		expect(lf.querySelector('.lf-eyebrow')!.textContent).toBe('Looking for');
+		expect(lf.textContent).toBe('Looking forKurosawa box sets');
 
-		const theirs = container.querySelectorAll('.detail-block.detail-theirs');
-		expect(theirs.length).toBeGreaterThan(1);
-		expect(theirs[0].querySelector('.block-head')!.textContent).toBe('Looking for');
+		// First tier, first element: the demand side leads, ahead of the bio.
+		const about = container.querySelector('.detail-pane .about')!;
+		expect(about.firstElementChild).toBe(lf);
 	});
 
 	it('a contact who published no looking_for renders no Looking-for block at all', async () => {
@@ -140,11 +144,11 @@ describe('QURATOR-351 state d — size on the row, Looking-for on the detail', (
 
 		// QURATOR-368b: row click selects into the pane (held 250 ms).
 		fireEvent.click(container.querySelector('.contact-card')!);
-		// The detail still opens (the Profile block appears), but no Looking-for anywhere.
-		await waitFor(() => expect(container.querySelectorAll('.detail-block.detail-theirs').length).toBeGreaterThan(0));
+		// The detail still opens (the bio line appears), but no Looking-for anywhere.
+		await waitFor(() => expect(container.querySelector('.detail-pane .pane-bio')).not.toBeNull());
 		expect(container.querySelector('.looking-for')).toBeNull();
-		const heads = [...container.querySelectorAll('.detail-block.detail-theirs .block-head')].map((h) => h.textContent);
-		expect(heads).not.toContain('Looking for');
+		expect(container.querySelector('.lf-eyebrow')).toBeNull();
+		expect(container.querySelector('.detail-pane .about')!.firstElementChild!.classList.contains('pane-bio')).toBe(true);
 	});
 
 	// M1 also reds this (the span is gone entirely). Structural one-line proxy only — see the P-13

@@ -135,7 +135,8 @@ describe('M21 W4 behaviour 6 — N collections hoverable, public ONLY', () => {
 		const s = contactsSrc();
 		// Both the count and the {#each} read `publicCollections` — the same derived value.
 		expect(s).toMatch(/\{@const publicCollections/);
-		expect(s).toMatch(/{#each publicCollections as col/);
+		// QURATOR-378 rev b: the each caps the SAME derived value at PANE_COLS_SHOWN behind Show-more.
+		expect(s).toMatch(/\{#each colsCapped \? publicCollections\.slice\(0, PANE_COLS_SHOWN\) : publicCollections as col/);
 	});
 
 	it('the list carries path_alias + est_size per row, and a "public collections only" footer', () => {
@@ -154,7 +155,8 @@ describe('M21 W4 behaviour 6 — N collections hoverable, public ONLY', () => {
 	it('the collections list is a plain pane block — no hover popover chrome survived', () => {
 		const s = contactsSrc();
 		expect(s).toMatch(/class="pane-cols"/);
-		expect(s).toMatch(/\{#each publicCollections as col/);
+		// QURATOR-378 rev b: the list caps at PANE_COLS_SHOWN rows behind "Show N more".
+		expect(s).toMatch(/\{#each colsCapped \? publicCollections\.slice\(0, PANE_COLS_SHOWN\) : publicCollections as col/);
 		// The old affordance is gone outright (P-12: the affordance must not appear, prose aside).
 		expect(s).not.toMatch(/collections-popover/);
 		expect(s).not.toMatch(/collections-trigger/);
@@ -162,12 +164,12 @@ describe('M21 W4 behaviour 6 — N collections hoverable, public ONLY', () => {
 });
 
 describe('QURATOR-368c — the bio lives in the pane, full; the face carries none', () => {
-	// The detail region is `.contact-detail` (from its opening div to the OverflowMenu that follows
-	// the contact-block). Slicing on `{/if}` is wrong — the detail has nested {#if}s, so the first
-	// `{/if}` closes a nested branch, not the detail. Slice on the next structural landmark instead.
+	// The detail region is the pane's `.detail-scroll` (QURATOR-378 rev b deleted the `.contact-detail`
+	// wrapper card) up to the GroupMembershipPopover that follows it. Slicing on `{/if}` is wrong — the
+	// detail has nested {#if}s. Slice on the next structural landmark instead.
 	function detailRegion(s: string): string {
-		const start = s.indexOf('class="contact-detail"');
-		const end = s.indexOf('OverflowMenu', start);
+		const start = s.indexOf('<div class="detail-scroll">', s.indexOf('class="detail-pane'));
+		const end = s.indexOf('<GroupMembershipPopover', start);
 		return s.slice(start, end);
 	}
 
@@ -230,9 +232,11 @@ describe('M21 W4 — no bio duplication, no npub on the face', () => {
 		expect(face).not.toMatch(/card-bio/);
 		expect(face).not.toMatch(/No bio published/);
 		// …and the pane still has it, so this cannot pass by the bio having vanished entirely.
-		const start = s.indexOf('class="contact-detail"');
-		const end = s.indexOf('OverflowMenu', start);
+		const start = s.indexOf('<div class="detail-scroll">', s.indexOf('class="detail-pane'));
+		const end = s.indexOf('<GroupMembershipPopover', start);
 		const detail = s.slice(start, end);
+		// One bio paragraph: the published bio, or the stated empty (QURATOR-378 rev b renders the
+		// empty as `pane-bio pane-bio-empty`, so exact-class `pane-bio` counts the published one).
 		expect(detail.match(/class="pane-bio"/g)?.length).toBe(1);
 	});
 

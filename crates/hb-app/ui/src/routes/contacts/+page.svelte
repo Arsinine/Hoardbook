@@ -635,7 +635,7 @@
 
 	function onGroupDragLeave(e: DragEvent, targetName: string) {
 		// Same child-crossing guard as onDragLeave: the section header renders its own .drop-hint
-		// span while hovered (and a group pill contains its .group-dot), so an unguarded leave
+		// span while hovered, so an unguarded leave
 		// clears the very state that draws the element the cursor just entered.
 		const to = e.relatedTarget as Node | null;
 		if (to && (e.currentTarget as HTMLElement).contains(to)) return;
@@ -738,12 +738,6 @@
 	// Which groups a contact belongs to (derived from groups[].pubkeys).
 	function contactGroups(hb_id: string): string[] {
 		return groups.filter(g => g.pubkeys.includes(hb_id)).map(g => g.name);
-	}
-
-	// M21 W5b: a group's colour, looked up by name. Returns undefined for a group with no colour (or
-	// an unknown name) — the chip renders with no dot in that case, never a broken/invisible chip.
-	function groupColor(name: string): string | undefined {
-		return groups.find(g => g.name === name)?.color;
 	}
 
 	// M20 W5 (data-loss half) used to live here as a SECOND checkbox editor inside the expanded
@@ -910,11 +904,16 @@
 	let refreshing: string | null = $state(null);
 	let menuOpenFor: string | null = $state(null);
 	let menuAnchor: HTMLElement | undefined = $state();
+	// QURATOR-378 rev b — the pane lists this many public collections, then "Show N more".
+	const PANE_COLS_SHOWN = 5;
+	let showAllCols = $state(false);
 	function selectContact(npub: string) {
 		// QURATOR-368 slice b — a click SELECTS; it never toggles closed (the click is the only way
 		// to open a contact now). Re-clicking the open row keeps it selected.
 		const changed = detailExpanded !== npub;
 		detailExpanded = npub;
+		// A newly opened contact starts with its collection list capped again.
+		if (changed) showAllCols = false;
 		if (changed) void loadLikeness();
 		// QURATOR-368 slice c — the face bio and its clamp control are gone (the pane shows the
 		// full bio), so there is no face clamp state left to reset on selection.
@@ -1491,7 +1490,7 @@
 		</div>
 
 		<!-- QURATOR-360 F1 + QURATOR-368 slice b: the inline detail moved to the right pane (r5
-		     state d) — the row CLICK selects; the pane renders .contact-detail for detailExpanded. -->
+		     state d) — the row CLICK selects; the pane renders the open contact for detailExpanded. -->
 	</div>
 
 	<!-- M15 W5: per-row overflow menu (only one open at a time via menuOpenFor). -->
@@ -1503,8 +1502,10 @@
 		</button>
 		<!-- Devtest item 3 / ruling 01: was `detailExpanded = …; beginGroupEdit(…)`, which expanded the
 		     panel to reach its own checkbox editor. That editor is gone; this opens the shared popover,
-		     anchored to the ⋯ button that is still on screen. -->
-		<button class="menu-item" onclick={() => { if (menuAnchor) openGroupPopover(peer.npub, menuAnchor); menuOpenFor = null; }}>Edit groups…</button>
+		     anchored to the ⋯ button that is still on screen. QURATOR-378 rev b: this is now the pane's
+		     ONLY group trigger, and the popover is mounted in the pane for the OPEN contact — so a row's
+		     inline ⋯ selects that contact too, or the popover would have no instance to render in. -->
+		<button class="menu-item" onclick={() => { selectContact(peer.npub); if (menuAnchor) openGroupPopover(peer.npub, menuAnchor); menuOpenFor = null; }}>Edit groups…</button>
 		<button class="menu-item" onclick={() => { detailExpanded = peer.npub; editingTagsFor = peer.npub; tagInput = ''; menuOpenFor = null; }}>Edit tags…</button>
 		<div class="menu-item menu-item-confirm">
 			<ConfirmButton label="Remove contact" confirmText="Remove this contact?" onconfirm={() => { handleUnfollow(peer.npub); menuOpenFor = null; }} />
@@ -1512,7 +1513,7 @@
 	</OverflowMenu>
 
 	<!-- M21 W5b / M22 W8 / QURATOR-368 slice c: the group-membership popover moved WITH the chips
-	     into the right pane (its `+` and the ⋯ "Edit groups…" trigger both live there now). The
+	     into the right pane; since QURATOR-378 rev b the ⋯ "Edit groups…" is its only trigger. The
 	     editor is still the ONE GroupMembershipPopover component (used by Browse too) — OverflowMenu
 	     positioning + Escape, seeded draft, full-set Apply via contactUpdateGroups, "+ New group…",
 	     and focus-return to the invoking row all live there; this page supplies anchor + callbacks. -->
@@ -1541,12 +1542,15 @@
 					<div class="group-strip-label">Groups</div>
 					<div class="group-strip-chips">
 						{#each groups as g (g.name)}
-							<span class="group-chip-wrap">
-								<span class="group-chip" style={g.color ? `border-color:${g.color}; color:${g.color}` : ''}>
-									{g.name}
-								</span>
+							<!-- v0.24.0 devtest: the delete × sat OUTSIDE the bubble ("looks very bad") — the
+							     border was on the name span only. The bubble is now the wrapper, so the name
+							     and its × share one outline; the two-step confirm is unchanged. -->
+							<span class="group-chip group-chip-wrap" style={g.color ? `border-color:${g.color}; color:${g.color}` : ''}>
+								<span class="group-chip-name">{g.name}</span>
 								<ConfirmButton
+									class="group-chip-x"
 									label="×"
+									aria-label={`Delete group ${g.name}`}
 									confirmText={`Delete "${g.name}"? Members fall back to Ungrouped.`}
 									onconfirm={() => handleDeleteGroup(g)}
 								/>
@@ -1657,7 +1661,6 @@
 		{@const paneName = contactDisplayName(peer)}
 		{@const paneBio = peer.profile?.bio?.trim()}
 		{@const paneBadge = peerAccessBadge(peer)}
-		{@const paneGroups = contactGroups(peer.npub)}
 		{@const paneColdCache = isStale(peer) && !peer.online}
 		<div class="pane-head">
 			<div class="avatar-wrap" style={fp ? `box-shadow: 0 0 0 2px var(--bg-elev1), 0 0 0 4px ${fp.colorHex}` : undefined}>
@@ -1700,251 +1703,195 @@
 				<button class="cold-cache" onclick={() => handleRefresh(peer.npub)} disabled={refreshing === peer.npub} title="Refetch this contact">{checkedLabel(peer.last_fetched, nowMs)} ↻</button>
 			{/if}
 		</div>
+		<!-- QURATOR-378 rev b (owner-signed draft, 2026-10-14): NO CARDS. Draft 1 gave seven equal
+		     sections; the owner called it "a dump of info" with no sense of what matters. The pane now
+		     reads in four tiers, and hierarchy comes from type size and colour, not chrome:
+		       1 `.about`      who they are (Looking for, bio, Tags) — no heading, the content is it;
+		       2 `.shares`     public collections — the ONE strong heading on the pane, with a count;
+		       3 `.facts-sec`  quiet reference grid, Identity as its last row;
+		       4 `.mine`       one tinted box: the Private-collections toggle.
+		     Owner rev b: "drop groups. replace Collects with Tags. User added tags glow green like the
+		     current draft. Keep private toggle in the box." Groups left the pane — the ⋯ menu's
+		     "Edit groups…" (which opens the popover mounted below) and drag-to-group on the list are
+		     the group affordances. Your tags are told apart by their accent glow, so no "local to this
+		     machine" label is needed. Still NOT repeated here: the fingerprint words and the computed
+		     size (pane header). -->
+		{@const pubTypes = peer.profile?.content_types ?? []}
+		{@const pubTags = peer.profile?.tags ?? []}
+		{@const myTags = peer.local_tags ?? []}
+		{@const colsCapped = publicCollections.length > PANE_COLS_SHOWN && !showAllCols}
 		<div class="detail-scroll">
-			<div class="contact-detail">
-				<!-- Devtest 2026-08-26 item 3 (owner: "right now its showing duplicated information. It
-				     should contain the rest of the bio stuff that the base card didnt have room for like
-				     region, contact, other socials if any, willing to etc"), artifact greenlit.
-
-				     QURATOR-368 slice c: the face's bio, group chips and collections popover MOVED here
-				     (the row at rest is two lines now), so the panel is the rest of the profile PLUS the
-				     face's overflow facts. Still grouped by WHO OWNS THE DATA: `detail-theirs` is what
-				     they published and you cannot change, `detail-yours` is stored only on this machine.
-				     Still NOT repeated: the fingerprint words (line 2 of the row) and the computed size
-				     (pane header).
-
-				     Seven Profile fields (location, languages, willing_to, contact_hint, email,
-				     social_links, since) crossed the Tauri boundary on every contact and were rendered
-				     NOWHERE before this. -->
-				<!-- QURATOR-351 state d (r5 ruling): the demand side comes FIRST — what they are looking
-				     for leads the detail, ahead of what they publish. Only when they published one. -->
+			<!-- Tier 1. QURATOR-351 state d (r5 ruling): the demand side comes FIRST — what they are
+			     looking for leads, ahead of what they publish. Only when they published one. -->
+			<section class="about">
 				{#if lookingFor}
-					<div class="detail-block detail-theirs">
-						<div class="block-head">Looking for</div>
-						<p class="looking-for">{lookingFor}</p>
-					</div>
+					<p class="looking-for"><span class="lf-eyebrow">Looking for</span>{lookingFor}</p>
 				{/if}
-
-				<!-- QURATOR-368 slice c: the face bio moved here, FULL — no clamp, no expand control (the
-				     clamp and its measured-overflow control were deleted with the face bio). -->
+				<!-- QURATOR-368 slice c: the face bio, FULL — no clamp, no expand control. Ruling 03:
+				     an empty bio is STATED, never hidden (the QURATOR-93 confident-empty shape). -->
 				{#if paneBio}
-					<div class="detail-block detail-theirs">
-						<div class="block-head">Bio <em>published by them</em></div>
-						<p class="pane-bio">{paneBio}</p>
-					</div>
+					<p class="pane-bio">{paneBio}</p>
 				{:else}
-					<div class="detail-block detail-theirs">
-						<div class="block-head">Bio</div>
-						<div class="detail-empty">No bio published.</div>
-					</div>
+					<p class="pane-bio pane-bio-empty">No bio published.</p>
 				{/if}
-
-				<!-- QURATOR-368 slice c: the hoverable collections popover became this plain list. Same
-				     public-only set the row's count reads (the disclosure boundary), same per-row facts. -->
-				{#if publicCollections.length > 0}
-					<div class="detail-block detail-theirs">
-						<div class="block-head">Public collections</div>
-						<div class="pane-cols">
-							{#each publicCollections as col (col.slug)}
-								<div class="cpop-row" title={col.description ?? ''}>
-									<span class="cpop-alias">{col.path_alias}</span>
-									<span class="cpop-size">{col.est_size ?? '—'}</span>
-									<span class="cpop-desc">{col.description ?? 'No description'}</span>
-								</div>
-							{/each}
-							<div class="cpop-footer">Public collections only. Private ones sealed to you are listed separately.</div>
-						</div>
-					</div>
-				{/if}
-
-				<!-- QURATOR-368 slice c: the face's group chips + `+` moved here. M22 W4 still holds —
-				     each chip is a drag-to-group DROP TARGET (the row no longer carries chips; the
-				     section headings and card-on-card drag are untouched). stopPropagation so a drop on a
-				     chip never also fires a card-level gesture. -->
-				<div class="detail-block detail-yours">
-					<div class="block-head">Groups <em>local to this machine</em></div>
-					<div class="pane-groups">
-						{#each paneGroups as gname (gname)}
-							{@const gcolor = groupColor(gname)}
-							<span
-								class="group-pill"
-								class:group-drop-active={dropOverTarget === gname && dropOutcome && dropOutcome.kind !== 'refused' && dropOutcome.kind !== 'noop'}
-								class:group-drop-refused={dropOverTarget === gname && dropOutcome && (dropOutcome.kind === 'refused' || dropOutcome.kind === 'noop')}
-								ondragover={(e) => { e.stopPropagation(); onGroupDragOver(e, gname); }}
-								ondragleave={(e) => { e.stopPropagation(); onGroupDragLeave(e, gname); }}
-								ondrop={(e) => { e.stopPropagation(); onGroupDrop(e, gname); }}
-							>
-								{#if gcolor}<span class="group-dot" style={`background:${gcolor}`}></span>{/if}
-								{gname}
-							</span>
-						{/each}
-						<!-- M21 W5b: `+` opens the ONE membership popover (now anchored here, beside the
-						     ⋯ menu that also reaches it via "Edit groups…"). Full-set Apply. -->
-						{#if groups.length > 0}
-							<button
-								class="group-add-btn"
-								aria-label="Edit {paneName}'s groups"
-								aria-haspopup="true"
-								aria-expanded={groupPopoverFor === peer.npub}
-								onclick={(e) => openGroupPopover(peer.npub, e.currentTarget)}
-							>+</button>
-						{/if}
-					</div>
-				</div>
-
-				<div class="detail-block detail-theirs">
-					<div class="block-head">Profile <em>published by them</em></div>
-					{#if hasProfileFacts(peer.profile)}
-						{@const p = peer.profile!}
-						<dl class="facts">
-							{#if p.location}
-								<dt>Region</dt><dd>{p.location}</dd>
-							{/if}
-							{#if (p.languages?.length ?? 0) > 0}
-								<dt>Languages</dt><dd>{p.languages.join(' · ')}</dd>
-							{/if}
-							{#if (p.willing_to?.length ?? 0) > 0}
-								<dt>Willing to</dt>
-								<dd class="fact-chips">
-									{#each p.willing_to as w (w)}<span class="fact-chip">{w}</span>{/each}
-								</dd>
-							{/if}
-							<!-- Ruling 02: contact_hint, email and social handles are PEER-CONTROLLED STRINGS.
-							     They render inert + mono with a copy button — never mailto:/https:// links, so a
-							     click on a contact card can't open a mail client or a browser on a string
-							     somebody else wrote. Same treatment the npub gets below. -->
-							{#if p.contact_hint}
-								<dt>Contact</dt>
-								<dd class="fact-copyable">
-									<span class="fact-mono">{p.contact_hint}</span>
-									<button class="copy-btn" onclick={() => copyText(p.contact_hint ?? '', 'Contact copied')}>copy</button>
-								</dd>
-							{/if}
-							{#if p.email}
-								<dt>Email</dt>
-								<dd class="fact-copyable">
-									<span class="fact-mono">{p.email}</span>
-									<button class="copy-btn" onclick={() => copyText(p.email ?? '', 'Email copied')}>copy</button>
-								</dd>
-							{/if}
-							{#if (p.social_links?.length ?? 0) > 0}
-								<dt>Socials</dt>
-								<dd class="fact-socials">
-									{#each p.social_links as sl (sl.platform + sl.handle)}
-										<span class="fact-social">
-											<span class="social-plat">{sl.platform}</span>
-											<span class="fact-mono">{sl.handle}</span>
-											<button class="copy-btn" onclick={() => copyText(sl.handle, 'Handle copied')}>copy</button>
-										</span>
-									{/each}
-								</dd>
-							{/if}
-							{#if p.since}
-								<dt>Hoarding since</dt><dd>{p.since}</dd>
-							{/if}
-						</dl>
+				<!-- Their published content types and tags (grey, inert) beside YOUR tags (accent glow,
+				     removable). The glow is the ownership signal. -->
+				<div class="tags" aria-label="Tags">
+					<span class="tags-label">Tags</span>
+					{#each pubTypes as ct (ct)}<span class="peer-tag">{ct}</span>{/each}
+					{#each pubTags as tag (tag)}<span class="peer-tag">{tag}</span>{/each}
+					{#each myTags as tag (tag)}
+						<span class="local-tag">
+							{tag}
+							<button class="tag-x" aria-label="Remove tag {tag}" onclick={() => handleRemoveTag(peer.npub, myTags, tag)}>×</button>
+						</span>
+					{/each}
+					{#if editingTagsFor === peer.npub}
+						<input
+							class="hb-input tag-input"
+							type="text"
+							placeholder="tag…"
+							bind:value={tagInput}
+							onkeydown={(e) => {
+								if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); handleAddTag(peer.npub, myTags); }
+								if (e.key === 'Escape') { editingTagsFor = null; tagInput = ''; }
+							}}
+							onblur={() => { editingTagsFor = null; tagInput = ''; }}
+						/>
 					{:else}
-						<!-- Ruling 03: hiding the block would make "they published nothing" indistinguishable
-						     from "the panel is broken" — the QURATOR-93 confident-empty shape. State it. -->
-						<div class="detail-empty">No profile details published.</div>
+						<button class="tag-add-btn" onclick={() => { editingTagsFor = peer.npub; tagInput = ''; }}>+ tag</button>
 					{/if}
 				</div>
+			</section>
 
-				{#if (peer.profile?.content_types?.length ?? 0) > 0 || (peer.profile?.tags?.length ?? 0) > 0}
-					<div class="detail-block detail-theirs">
-						<div class="block-head">Collects</div>
-						{#if (peer.profile?.content_types?.length ?? 0) > 0}
-							<div class="badge-row-sm">
-								{#each peer.profile?.content_types ?? [] as ct (ct)}
-									<span class="ct-badge">{ct}</span>
-								{/each}
+			<!-- Tier 2. QURATOR-368 slice c: the same public-only set the row's count reads (the
+			     disclosure boundary), same per-row facts. Rev b: past PANE_COLS_SHOWN rows the list
+			     stops and a text link expands it IN PLACE — not a chevron on the heading, which would
+			     leave the heading's count unbacked by any visible row. -->
+			{#if publicCollections.length > 0}
+				<section class="shares">
+					<div class="sec-head"><h3>Public collections</h3><span class="sec-count">{publicCollections.length}</span></div>
+					<div class="pane-cols">
+						{#each colsCapped ? publicCollections.slice(0, PANE_COLS_SHOWN) : publicCollections as col (col.slug)}
+							<div class="cpop-row" title={col.description ?? ''}>
+								<span class="cpop-alias">{col.path_alias}</span>
+								<span class="cpop-size">{col.est_size ?? '—'}</span>
+								<span class="cpop-desc">{col.description ?? 'No description'}</span>
 							</div>
-						{/if}
-						{#if (peer.profile?.tags?.length ?? 0) > 0}
-							<div class="peer-tags">
-								{#each peer.profile?.tags ?? [] as tag (tag)}
-									<span class="peer-tag">{tag}</span>
-								{/each}
-							</div>
-						{/if}
+						{/each}
 					</div>
-				{/if}
+					{#if publicCollections.length > PANE_COLS_SHOWN}
+						<button class="show-more" onclick={() => (showAllCols = !showAllCols)}>
+							{colsCapped ? `Show ${publicCollections.length - PANE_COLS_SHOWN} more` : 'Show fewer'}
+						</button>
+					{/if}
+					<div class="cpop-footer">Public collections only. Private ones sealed to you are listed separately.</div>
+				</section>
+			{/if}
 
-				<!-- The npub came off the card face in M21 W4 behaviour 1, and the old panel comment claimed
-				     it "survives in the expanded detail" — it did not. This is that claim made true. -->
-				<div class="detail-block detail-theirs">
-					<div class="block-head">Identity</div>
-					<div class="fact-copyable">
+			<!-- Tier 3. Devtest 2026-08-26 item 3: the rest of the profile the row has no room for.
+			     Seven Profile fields (location, languages, willing_to, contact_hint, email,
+			     social_links, since) crossed the Tauri boundary on every contact and were rendered
+			     NOWHERE before that. -->
+			<section class="facts-sec">
+				<div class="sec-head sec-head-quiet"><h3>Details</h3></div>
+				<dl class="facts">
+					{#if hasProfileFacts(peer.profile)}
+						{@const p = peer.profile!}
+						{#if p.location}
+							<dt>Region</dt><dd>{p.location}</dd>
+						{/if}
+						{#if (p.languages?.length ?? 0) > 0}
+							<dt>Languages</dt><dd>{p.languages.join(' · ')}</dd>
+						{/if}
+						{#if (p.willing_to?.length ?? 0) > 0}
+							<dt>Willing to</dt>
+							<dd class="fact-chips">
+								{#each p.willing_to as w (w)}<span class="fact-chip">{w}</span>{/each}
+							</dd>
+						{/if}
+						<!-- Ruling 02: contact_hint, email and social handles are PEER-CONTROLLED STRINGS.
+						     They render inert + mono with a copy button — never mailto:/https:// links, so a
+						     click on a contact card can't open a mail client or a browser on a string
+						     somebody else wrote. Same treatment the npub gets below. -->
+						{#if p.contact_hint}
+							<dt>Contact</dt>
+							<dd class="fact-copyable">
+								<span class="fact-mono">{p.contact_hint}</span>
+								<button class="copy-btn" onclick={() => copyText(p.contact_hint ?? '', 'Contact copied')}>copy</button>
+							</dd>
+						{/if}
+						{#if p.email}
+							<dt>Email</dt>
+							<dd class="fact-copyable">
+								<span class="fact-mono">{p.email}</span>
+								<button class="copy-btn" onclick={() => copyText(p.email ?? '', 'Email copied')}>copy</button>
+							</dd>
+						{/if}
+						{#if (p.social_links?.length ?? 0) > 0}
+							<dt>Socials</dt>
+							<dd class="fact-socials">
+								{#each p.social_links as sl (sl.platform + sl.handle)}
+									<span class="fact-social">
+										<span class="social-plat">{sl.platform}</span>
+										<span class="fact-mono">{sl.handle}</span>
+										<button class="copy-btn" onclick={() => copyText(sl.handle, 'Handle copied')}>copy</button>
+									</span>
+								{/each}
+							</dd>
+						{/if}
+						{#if p.since}
+							<dt>Hoarding since</dt><dd>{p.since}</dd>
+						{/if}
+					{:else}
+						<!-- Ruling 03: hiding the facts would make "they published nothing" indistinguishable
+						     from "the panel is broken" — the QURATOR-93 confident-empty shape. State it. -->
+						<dt>Profile</dt><dd class="detail-empty">No profile details published.</dd>
+					{/if}
+					<!-- The npub came off the card face in M21 W4 behaviour 1; it survives here, as the
+					     last reference row. -->
+					<dt>Identity</dt>
+					<dd class="fact-copyable">
 						<span class="fact-mono fact-npub">{peer.npub}</span>
 						<button class="copy-btn" onclick={() => copyNpub(peer.npub)}>copy</button>
-					</div>
-				</div>
+					</dd>
+				</dl>
+			</section>
 
-				<!-- Ruling 01: the panel's checkbox group editor is GONE. The face's `+` opens the shared
-				     GroupMembershipPopover (the same component Browse uses) and the pills there are also the
-				     drag-to-group drop targets, so a second editor here was a second implementation of one
-				     operation — and its read-only pill row duplicated the face's row outright. ONE editor.
-				     The ⋯ menu's "Edit groups…" now opens that popover instead of expanding this panel. -->
-				<div class="detail-block detail-yours">
-					<div class="block-head">Your notes <em>local to this machine</em></div>
-					<div class="tag-row">
-						{#each (peer.local_tags ?? []) as tag}
-							<span class="local-tag">
-								{tag}
-								<button class="tag-x" onclick={() => handleRemoveTag(peer.npub, peer.local_tags ?? [], tag)}>×</button>
-							</span>
-						{/each}
-						{#if editingTagsFor === peer.npub}
-							<input
-								class="hb-input tag-input"
-								type="text"
-								placeholder="tag…"
-								bind:value={tagInput}
-								onkeydown={(e) => {
-									if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); handleAddTag(peer.npub, peer.local_tags ?? []); }
-									if (e.key === 'Escape') { editingTagsFor = null; tagInput = ''; }
-								}}
-								onblur={() => { editingTagsFor = null; tagInput = ''; }}
-							/>
-						{:else}
-							<button class="tag-add-btn" onclick={() => { editingTagsFor = peer.npub; tagInput = ''; }}>+ tag</button>
-						{/if}
-					</div>
-
-					<!-- M21 W5: the Private-collection audience is a per-contact toggle, decoupled from
-					     groups (owner ruling 2026-08-04). Ticking it seals every Private collection to
-					     this contact on the next publish; unticking revokes on the next republish only. -->
-					<label class="audience-check">
-						<input
-							type="checkbox"
-							checked={receivesPrivate(peer.npub, privateAudience)}
-							onchange={() => toggleReceivesPrivate(peer.npub)}
-						/>
-						Receives my Private collections
-					</label>
-				</div>
-
-				<!-- Private collections sealed to me (M10). QURATOR-92: Browse now serves them in a
-				     badged Private section via the same `?peer=` deep-link the row's Browse button
-				     uses, so the label is a real link; the detail panels stay here. Absent (not
-				     "locked") for a non-trusted viewer. -->
-				{#if (privateByAuthor[peer.npub] ?? []).length > 0}
-					<div class="private-section">
-						<div class="section-label">
-							<a class="private-link" href="/browse?peer={peer.npub}">Private collections</a>
-							<span class="private-badge">trusted</span>
-						</div>
-						{#each privateByAuthor[peer.npub] as col}
-							<CollectionPanel collection={col} />
-						{/each}
-						<p class="not-drm-note">{NOT_DRM_NOTE}</p>
-					</div>
-				{/if}
+			<!-- Tier 4. M21 W5: the Private-collection audience is a per-contact toggle, decoupled from
+			     groups (owner ruling 2026-08-04). Ticking it seals every Private collection to this
+			     contact on the next publish; unticking revokes on the next republish only. -->
+			<div class="mine">
+				<label class="audience-check">
+					<input
+						type="checkbox"
+						checked={receivesPrivate(peer.npub, privateAudience)}
+						onchange={() => toggleReceivesPrivate(peer.npub)}
+					/>
+					Receives my Private collections
+				</label>
+				<span class="mine-note">sealed to them on next publish</span>
 			</div>
+
+			<!-- Private collections sealed to me (M10). QURATOR-92: Browse now serves them in a
+			     badged Private section via the same `?peer=` deep-link the row's Browse button
+			     uses, so the label is a real link; the detail panels stay here. Absent (not
+			     "locked") for a non-trusted viewer. -->
+			{#if (privateByAuthor[peer.npub] ?? []).length > 0}
+				<div class="private-section">
+					<div class="section-label">
+						<a class="private-link" href="/browse?peer={peer.npub}">Private collections</a>
+						<span class="private-badge">trusted</span>
+					</div>
+					{#each privateByAuthor[peer.npub] as col}
+						<CollectionPanel collection={col} />
+					{/each}
+					<p class="not-drm-note">{NOT_DRM_NOTE}</p>
+				</div>
+			{/if}
 		</div>
-		<!-- M21 W5b / M22 W8 / QURATOR-368 slice c: the group-membership popover instance moved
-		     here with the chips — the row renders no editor and no anchor anymore. Both pane
-		     triggers (the `+`, and the ⋯ menu's "Edit groups…" anchored to the pane ⋯) open it. -->
+		<!-- M21 W5b / M22 W8 / QURATOR-368 slice c: the group-membership popover instance lives in the
+		     pane. Since QURATOR-378 rev b its one trigger is the ⋯ menu's "Edit groups…". -->
 		<GroupMembershipPopover
 			open={groupPopoverFor === peer.npub}
 			anchor={groupPopoverAnchor}
@@ -2088,6 +2035,7 @@
 	.detail-clip { min-width: 0; }
 	.detail-pane.pane-clipping { padding-right: 20px; }
 	.detail-scroll { flex: 1; min-height: 0; overflow-y: auto; }
+	.detail-pane .detail-scroll { margin-top: 14px; border-top: 1px solid var(--border); padding-bottom: 4px; }
 	.discover-pane { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 	.discover-pane .detail-scroll { padding: 12px 16px 20px; }
 	/* QURATOR-360 F1: in the Discover view the list column collapses to the toggle row only. */
@@ -2098,8 +2046,7 @@
 	.pane-name { font-size: 15px; font-weight: 600; }
 	.pane-fp { margin-top: 2px; }
 	.pane-meta { margin-top: 2px; font-size: 11.5px; color: var(--fg-muted); }
-	.pane-actions { margin: 10px 0 12px; display: flex; gap: 8px; align-items: center; }
-	.detail-pane .contact-detail { border-top: 1px solid var(--border); border-radius: var(--r-card, 10px); padding: 10px 14px; }
+	.pane-actions { margin: 10px 0 0; display: flex; gap: 8px; align-items: center; }
 	.topbar-add { flex-shrink: 0; }
 
 	.topbar {
@@ -2204,12 +2151,18 @@
 	.group-strip { padding: 8px 0 16px; display: flex; flex-direction: column; gap: 6px; }
 	.group-strip-label { font-size: 11.5px; font-weight: 600; color: var(--fg-muted); }
 	.group-strip-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-	.group-chip-wrap { display: inline-flex; align-items: center; gap: 2px; }
 	.group-chip {
 		display: inline-flex; align-items: center; gap: 5px;
 		padding: 3px 9px; border: 1px solid transparent; border-radius: 999px;
 		font-size: 12px; color: var(--fg-muted);
 	}
+	/* The name + its delete × in ONE bubble: the × sits inside the outline, at its right edge. */
+	.group-chip-wrap { gap: 2px; padding-right: 3px; }
+	.group-chip-wrap :global(.group-chip-x) {
+		padding: 0; width: 16px; height: 16px; border-radius: 50%;
+		font-size: 13px; line-height: 1; color: inherit; opacity: 0.6;
+	}
+	.group-chip-wrap :global(.group-chip-x:hover) { opacity: 1; background: color-mix(in oklch, currentColor 18%, transparent); }
 	.group-chip-add {
 		background: transparent; border-style: dashed; cursor: pointer;
 		font-family: var(--font-ui); color: var(--fg-dim);
@@ -2363,20 +2316,58 @@
 		color: var(--error); font-weight: 500;
 	}
 
-	/* M21 W4 behaviour 6 — the collections list, now a PLAIN pane block (QURATOR-368 slice c).
-	   Public collections ONLY (disclosure boundary). */
-	.pane-cols { display: flex; flex-direction: column; gap: 2px; }
-	.cpop-row { display: flex; flex-direction: column; gap: 1px; padding: 4px 6px; border-radius: var(--r-control, 5px); }
-	.cpop-row:hover { background: var(--bg-elev3); }
-	.cpop-alias { font-size: 12px; font-weight: 500; color: var(--fg); }
-	.cpop-size { font-size: 10.5px; color: var(--fg-muted); font-feature-settings: 'tnum'; }
-	.cpop-desc { font-size: 11px; color: var(--fg-muted); }
-	.cpop-row:hover .cpop-desc { color: var(--fg); }
-	.cpop-footer { font-size: 10px; color: var(--fg-dim); padding: 4px 6px 2px; border-top: 1px solid var(--divider); margin-top: 4px; }
+	/* QURATOR-378 rev b — the pane's four tiers, no cards. Hierarchy is type size and colour, and the
+	   one ownership boundary is the accent: your tags glow, your Private toggle sits in the tinted box.
+	   Tier 1 — who they are. No heading: the content IS the heading. */
+	.about { padding: 14px 2px; display: flex; flex-direction: column; gap: 8px; }
+	.looking-for {
+		margin: 0; font-size: 15px; font-weight: 500; line-height: 1.4; color: var(--fg);
+		white-space: pre-wrap; overflow-wrap: anywhere; max-width: 60ch; text-wrap: pretty;
+	}
+	.lf-eyebrow {
+		display: block; font-size: 10.5px; font-weight: 600; letter-spacing: 0.4px; text-transform: uppercase;
+		color: var(--accent); margin-bottom: 3px; white-space: normal;
+	}
+	/* QURATOR-368 slice c — the full bio (no clamp). */
+	.pane-bio { margin: 0; font-size: 12.5px; line-height: 1.55; color: var(--fg-muted); white-space: pre-wrap; max-width: 65ch; }
+	.pane-bio-empty { color: var(--fg-dim); font-style: italic; }
+	.tags { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+	.tags-label { font-size: 11px; color: var(--fg-dim); margin-right: 2px; }
 
-	/* QURATOR-368 slice c — the pane's full bio (no clamp) and the moved chip row. */
-	.pane-bio { margin: 0; font-size: 12.5px; line-height: 1.55; color: var(--fg); white-space: pre-wrap; }
-	.pane-groups { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+	/* Tier 2 — what they share: the only strong heading on the pane, with a count. M21 W4 behaviour 6:
+	   public collections ONLY (disclosure boundary). */
+	.shares { padding: 12px 2px; border-top: 1px solid var(--divider); display: flex; flex-direction: column; }
+	.sec-head { display: flex; align-items: baseline; gap: 6px; margin-bottom: 6px; }
+	.sec-head h3 { margin: 0; font-size: 12.5px; font-weight: 600; color: var(--fg); letter-spacing: -0.1px; }
+	.sec-count { font-size: 11px; color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+	.pane-cols { display: flex; flex-direction: column; gap: 1px; }
+	.cpop-row {
+		display: grid; grid-template-columns: 1fr auto; column-gap: 10px;
+		padding: 5px 6px; margin: 0 -6px; border-radius: var(--r-control, 6px);
+	}
+	.cpop-row:hover { background: var(--bg-elev2); }
+	.cpop-alias { font-size: 12.5px; font-weight: 500; color: var(--fg); min-width: 0; overflow-wrap: anywhere; }
+	.cpop-size { font-size: 11px; color: var(--fg-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+	.cpop-desc { grid-column: 1 / -1; font-size: 11px; color: var(--fg-dim); }
+	.show-more {
+		align-self: flex-start; margin: 4px 0 0 -6px; padding: 2px 6px; font-size: 11px; color: var(--accent);
+		background: none; border: none; border-radius: var(--r-control, 6px); cursor: pointer; font-family: var(--font-ui);
+	}
+	.show-more:hover { background: var(--bg-elev2); }
+	.cpop-footer { font-size: 10.5px; color: var(--fg-dim); margin-top: 6px; }
+
+	/* Tier 3 — quiet reference facts; Identity is the last row. */
+	.facts-sec { padding: 12px 2px 14px; border-top: 1px solid var(--divider); }
+	.sec-head-quiet h3 { font-size: 11px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.4px; }
+
+	/* Tier 4 — the tinted box: the one control here that changes what YOU publish. */
+	.mine {
+		padding: 9px 12px; border-radius: var(--r-card, 10px);
+		background: var(--accent-soft, color-mix(in oklch, var(--accent) 12%, transparent));
+		border: 1px solid color-mix(in oklch, var(--accent) 22%, transparent);
+		display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
+	}
+	.mine-note { font-size: 10.5px; color: var(--fg-dim); }
 
 	/* M21 W4 behaviour 2 — cold-cache amber control (clickable to refresh, not a verdict pill). */
 	.cold-cache {
@@ -2389,37 +2380,33 @@
 
 
 	/* Content-type badges + profile tags */
-	.badge-row-sm { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
-	.ct-badge {
-		font-size: 10.5px; padding: 2px 8px; border-radius: 999px;
-		background: var(--bg-elev3); color: var(--fg-muted);
-	}
-	.peer-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+	/* Their published content types + tags: grey and inert. */
 	.peer-tag {
 		font-size: 10.5px; padding: 2px 8px; border-radius: 999px;
-		color: var(--accent);
-		background: color-mix(in oklch, var(--accent) 12%, transparent);
+		background: var(--bg-elev3); color: var(--fg-muted);
 	}
 
 	/* M15 W7: removed the dead .modal-* block (unreferenced — grep-confirmed). */
 
 	/* Tag filter bar — removed with the control (QURATOR-342 lane B). */
 
-	/* Local tags on contact cards */
-	.tag-row { display: flex; flex-wrap: wrap; gap: 4px; margin: 5px 0 2px; align-items: center; min-height: 22px; }
+	/* YOUR tags (QURATOR-378 rev b): an accent glow beside their grey chips — the glow IS the
+	   ownership signal ("User added tags glow green"), so no "local to this machine" label. */
 	.local-tag {
 		display: inline-flex; align-items: center; gap: 3px;
-		padding: 1px 6px 1px 8px; border-radius: var(--r-chip, 4px); font-size: 11px; font-weight: 500;
-		background: var(--bg-elev2); color: var(--fg-muted);
+		padding: 2px 6px 2px 8px; border-radius: 999px; font-size: 10.5px; font-weight: 500;
+		color: var(--accent);
+		background: var(--accent-soft, color-mix(in oklch, var(--accent) 12%, transparent));
+		box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 35%, transparent), 0 0 8px color-mix(in oklch, var(--accent) 30%, transparent);
 	}
 	.tag-x {
-		background: none; border: none; cursor: pointer; color: var(--fg-dim);
-		font-size: 13px; line-height: 1; padding: 0; display: flex; align-items: center;
+		background: none; border: none; cursor: pointer; color: var(--accent); opacity: 0.7;
+		font-size: 12px; line-height: 1; padding: 0; display: flex; align-items: center;
 	}
-	.tag-x:hover { color: var(--fg); }
+	.tag-x:hover { opacity: 1; }
 	.tag-add-btn {
-		font-size: 11px; color: var(--fg-dim); background: transparent; border: 1px dashed var(--border);
-		border-radius: var(--r-chip, 4px); padding: 1px 7px; cursor: pointer; font-family: var(--font-ui);
+		font-size: 10.5px; line-height: 1; color: var(--fg-dim); background: transparent; border: 1px dashed var(--border-strong);
+		border-radius: 999px; padding: 2px 7px; cursor: pointer; font-family: var(--font-ui); display: inline-flex; align-items: center;
 	}
 	.tag-add-btn:hover { border-color: var(--accent); color: var(--accent); }
 	/* QURATOR-52 §5 — on the .hb-input contract; only the active-edit overrides are local
@@ -2429,49 +2416,12 @@
 		border-radius: var(--r-chip, 4px); padding: 1px 7px; min-width: 60px;
 	}
 
-	.contact-detail {
-		background: var(--bg-elev1);
-		border: 1px solid var(--border);
-		border-top: none;
-		border-radius: 0 0 10px 10px;
-		padding: 4px 14px 12px 56px;
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-	}
-
-	/* Devtest item 3 — the expanded panel's blocks. The visual split is the ONLY thing carrying
-	   "who owns this data", so it has to be legible at a glance without being loud: `detail-theirs`
-	   gets a warm left rule, `detail-yours` the accent. Both sit on the same elev2 ground, so the
-	   distinction reads as grouping rather than as two different kinds of importance. */
-	.detail-block {
-		background: var(--bg-elev2);
-		border-radius: var(--r-card, 8px);
-		border-left: 2px solid transparent;
-		padding: 8px 12px;
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-	}
-	/* Neutral, not amber: item 6 gave amber a meaning in this app (a collection nearing the
-	   100k item cap), and a second amber here would read as a warning about the contact.
-	   The distinction that matters is which block you can act on — that one gets the accent. */
-	.detail-theirs { border-left-color: var(--border-strong); }
-	.detail-yours { border-left-color: color-mix(in oklch, var(--accent) 55%, transparent); }
-	.block-head {
-		font-size: 10.5px; font-weight: 600; letter-spacing: 0.4px; text-transform: uppercase;
-		color: var(--fg-muted); margin-bottom: 4px;
-	}
-	.block-head em { font-style: normal; font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--fg-dim); }
-	.detail-empty { font-size: 11.5px; color: var(--fg-dim); }
-	/* QURATOR-351 state d: the demand side, verbatim as published. */
-	.looking-for { font-size: 14px; color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; max-width: 65ch; margin: 0; }
-
+	.detail-empty { font-size: 11.5px; color: var(--fg-dim); font-style: italic; }
 	/* Label/value grid. The label column is fixed so the values line up down the panel; it wraps to
 	   a single column below 380px, where a 92px gutter would leave nothing for a URL-ish handle. */
-	.facts { display: grid; grid-template-columns: 92px 1fr; gap: 4px 10px; margin: 0; }
+	.facts { display: grid; grid-template-columns: 92px 1fr; gap: 5px 10px; margin: 0; }
 	.facts dt { font-size: 11.5px; color: var(--fg-dim); }
-	.facts dd { font-size: 12px; color: var(--fg); margin: 0; min-width: 0; overflow-wrap: anywhere; }
+	.facts dd { font-size: 12px; color: var(--fg-muted); margin: 0; min-width: 0; overflow-wrap: anywhere; }
 	@media (max-width: 380px) {
 		.facts { grid-template-columns: 1fr; gap: 1px 0; }
 		.facts dd { margin-bottom: 5px; }
@@ -2525,24 +2475,8 @@
 		font-style: italic;
 	}
 
-	/* Group chips. (.group-row went with the detail panel's own chip row in devtest item 3; the
-	   face's chip row moved to the pane in QURATOR-368 slice c — the pane block is .pane-groups.) */
-	.group-pill {
-		display: inline-flex; align-items: center; gap: 4px;
-		padding: 1px 8px; border-radius: var(--r-chip, 4px); font-size: 11px; font-weight: 500;
-		background: color-mix(in oklch, var(--accent) 10%, transparent);
-		color: var(--accent);
-	}
-	/* M21 W5b: the group's colour dot inside a chip/editor row. Absent for a group with no colour. */
-	.group-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; display: inline-block; }
-	/* M21 W5b: `+` beside the chip row opens the membership popover. Styled like .tag-add-btn so the
-	   face's group affordance reads as the same kind of control. */
-	.group-add-btn {
-		font-size: 11px; line-height: 1; color: var(--fg-dim); background: transparent;
-		border: 1px dashed var(--border); border-radius: var(--r-chip, 4px); padding: 0 5px; cursor: pointer;
-		font-family: var(--font-ui); display: inline-flex; align-items: center;
-	}
-	.group-add-btn:hover { border-color: var(--accent); color: var(--accent); }
+	/* Group chips (.group-pill / .group-add-btn / .group-dot) left with the pane's Groups block in
+	   QURATOR-378 rev b: the ⋯ menu's "Edit groups…" and drag-to-group on the list remain. */
 	/* M20 W5's inline checkbox editor was styled here (.group-edit-list / .group-check /
 	   .group-edit-empty). Deleted with the editor in devtest item 3 ruling 01 — the surviving editor
 	   is GroupMembershipPopover, which carries its own styles. */
@@ -2653,11 +2587,6 @@
 		background: color-mix(in oklch, var(--accent) 6%, var(--bg));
 	}
 	.section-header.group-drop-refused { opacity: 0.5; }
-	.group-pill.group-drop-active {
-		border: 1px solid var(--accent);
-		background: color-mix(in oklch, var(--accent) 14%, transparent);
-	}
-	.group-pill.group-drop-refused { opacity: 0.45; }
 	.drop-hint {
 		margin-left: 6px; font-size: 10px; font-weight: 500; color: var(--accent);
 		text-transform: none; letter-spacing: 0;

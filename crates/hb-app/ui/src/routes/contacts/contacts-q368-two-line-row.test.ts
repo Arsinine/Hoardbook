@@ -129,7 +129,7 @@ describe('QURATOR-368c — the at-rest row is exactly two lines', () => {
 		const { container } = render(ContactsPage);
 		const row = await waitFor(() => container.querySelector('.contact-card')!);
 		expect(row.querySelector('.bio-row'), 'the face bio is gone (it is in the pane)').toBeNull();
-		expect(row.querySelector('.group-pill'), 'the face chips are gone (they are in the pane)').toBeNull();
+		expect(row.querySelector('.group-pill'), 'the face chips are gone').toBeNull();
 		expect(row.querySelector('.row-menu-btn'), 'the ⋯ trigger is gone from the row (pane has it)').toBeNull();
 		// No interactive controls at all in the row: nothing may take width while invisible.
 		expect(row.querySelectorAll('button, a').length, 'no buttons or links in the at-rest row').toBe(0);
@@ -142,15 +142,16 @@ describe('QURATOR-368c — the at-rest row is exactly two lines', () => {
 });
 
 describe('QURATOR-368c — the moved facts render in the right pane', () => {
-	it('selecting the contact shows the full bio, the group chips + `+`, and the collections list in .detail-pane', async () => {
+	it('selecting the contact shows the full bio and the collections list in .detail-pane', async () => {
 		contacts.set([peer()]);
 		const { container } = render(ContactsPage);
 		const row = await waitFor(() => container.querySelector('.contact-card')!);
 		fireEvent.click(row);
 		// .detail-pane always exists (EmptyState before a selection) — wait for the select to land
-		// (the 250 ms double-click hold) by waiting for .contact-detail itself.
+		// (the 250 ms double-click hold) by waiting for the pane's bio (QURATOR-378 rev b removed the
+		// `.contact-detail` wrapper card).
 		const detail = await waitFor(() => {
-			const found = container.querySelector('.detail-pane .contact-detail');
+			const found = container.querySelector('.detail-pane .pane-bio');
 			expect(found, 'the row click selected the contact into the pane').not.toBeNull();
 			return found!;
 		});
@@ -168,27 +169,22 @@ describe('QURATOR-368c — the moved facts render in the right pane', () => {
 });
 
 // The chips' fixture needs a group for the peer; groupsGet is mocked at the top with [] — this
-// second render seeds one so the chips + `+` assertions have something to draw.
+// second render seeds one so a surviving chip row would have something to draw.
 import { groupsGet } from '$lib/api.js';
 const groupsGetMock = groupsGet as unknown as ReturnType<typeof vi.fn>;
 
-describe('QURATOR-368c — group chips + `+` live in the pane', () => {
-	it('the pane renders the chip row with a dot, and the `+` trigger beside it', async () => {
+// QURATOR-378 rev b (owner, 2026-10-14: "drop groups"): the chips QURATOR-368c moved into the pane
+// left it again. The ⋯ menu's "Edit groups…" and drag-to-group on the list are the group affordances.
+describe('QURATOR-378 rev b — no group chips in the pane or the row', () => {
+	it('a grouped, coloured contact renders no chip, dot or `+` anywhere', async () => {
 		groupsGetMock.mockResolvedValue([{ name: 'Film', pubkeys: [NPUB], color: '#ff0000' }]);
 		contacts.set([peer()]);
 		const { container } = render(ContactsPage);
 		const row = await waitFor(() => container.querySelector('.contact-card')!);
 		fireEvent.click(row);
-		const pane = await waitFor(() => container.querySelector('.detail-pane')!);
-		const chip = await waitFor(() => {
-			const found = pane.querySelector('.group-pill');
-			expect(found, 'the chip row moved into the pane').not.toBeNull();
-			return found!;
-		});
-		expect(chip.textContent).toContain('Film');
-		expect(pane.querySelector('.group-dot'), 'the chip carries its colour dot').not.toBeNull();
-		expect(pane.querySelector('.group-add-btn'), 'the `+` trigger moved with the chips').not.toBeNull();
-		// …and the row still renders none of it.
+		await waitFor(() => expect(container.querySelector('.detail-pane .pane-bio')).not.toBeNull());
+		const pane = container.querySelector('.detail-pane')!;
+		expect(pane.querySelectorAll('.group-pill, .group-dot, .group-add-btn').length).toBe(0);
 		expect(container.querySelector('.contact-card')!.querySelectorAll('.group-pill, .group-add-btn').length).toBe(0);
 	});
 });
@@ -199,6 +195,6 @@ describe('QURATOR-368c — group chips + `+` live in the pane', () => {
 //   B. nothing-left-in-the-row family — re-insert a `<div class="bio-row"><p>{BIO}</p></div>` into
 //      .contact-info in the ROW → test 2 REDS on `.bio-row` null; adding a Message button reds the
 //      `button, a` count.
-//   C. pane family — delete the `.pane-cols` public-collections block (or the Groups block) from
-//      .detail-pane → the pane tests RED on .cpop-row / .group-pill.
+//   C. pane family — delete the `.pane-cols` public-collections block from .detail-pane → the pane
+//      test REDS on .cpop-row. (The Groups block left the pane in QURATOR-378 rev b.)
 // P-10 MUTATION: drop the " collections" label (mutation A above) → REDS /2 collections/.
