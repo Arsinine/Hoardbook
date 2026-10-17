@@ -1,30 +1,35 @@
-// The one-time pre-first-download IP-exposure notice (spec §Onboarding / §Privacy Model). Browsing
-// is relay-private; a download is the one direct, IP-exposing moment — so the notice is a *gate*
-// shown before the first download, acknowledged once, and recorded in settings.json.
+// The one-time direct-connection notice (spec §Onboarding / §Privacy Model). Browsing and chat are
+// relay-private; fetching a full list over a ticket DIALS the sender, so both sides see each
+// other's IP. That is the one moment this notice is for: shown before the first such fetch,
+// acknowledged once, recorded in settings.json.
 //
-// The pure gate logic (block-until-acknowledged) is unit-tested in `onboarding.ts::attemptDownload`;
-// this is the runtime wiring over the real settings + dialog.
+// History: this was the pre-first-DOWNLOAD notice, and lost its only caller when v0.9.6 removed
+// file transfer (0905b9df). The ticket fetch (redeem_manifest_ticket) reintroduced the same IP
+// exposure without it. It is now OK-only (`message`, no decline), like serving-notice.ts: the
+// fetch answers an ask the user already sent, and the owner ruling is that neither side clicks to
+// approve a manifest exchange — so this informs, it never gates.
 
-import { confirm } from '@tauri-apps/plugin-dialog';
+import { message } from '@tauri-apps/plugin-dialog';
 import { acknowledgePrivacyNotice, getSettings } from './api.js';
+import { shouldShowPrivacyNotice } from './onboarding.js';
 
-const NOTICE =
-	'Browsing goes through relays, so the hoarders you browse do NOT see your IP.\n\n' +
-	'The one exception is downloading an actual file: that connects you directly to that peer, ' +
-	'who will see your IP (and you theirs), like BitTorrent.\n\n' +
-	"Browse freely. If a direct download isn't acceptable on this network, just don't download here.";
+export const DIRECT_FETCH_NOTICE =
+	"Browsing and chat go through relays, so other hoarders don't see your IP address.\n\n" +
+	"The one exception is a collection too big to send over relays. Hoardbook fetches its full list " +
+	'by connecting straight to whoever sends it, so they see your IP, and you see theirs.\n\n' +
+	"If that isn't acceptable on this network, don't ask for full lists here.";
 
-/** Returns true if a download may proceed: already acknowledged, or acknowledged just now. The
- *  notice is shown at most once (recorded in settings.json). */
-export async function ensureDownloadPrivacyAck(): Promise<boolean> {
-	const s = await getSettings().catch(() => null);
-	if (s?.privacy_notice_acknowledged) return true;
-	const ok = await confirm(NOTICE, {
-		title: 'How Hoardbook connects',
-		kind: 'info',
-		okLabel: 'I understand',
-	});
-	if (!ok) return false;
-	await acknowledgePrivacyNotice().catch(() => {});
-	return true;
+/** Show the notice at most once, before the first direct fetch. Resolves once dismissed (or at
+ *  once if already acknowledged) so the caller can sequence the dial after it. Never throws: an
+ *  unreadable settings file must not block a fetch the user asked for, and the notice simply shows
+ *  again next time. */
+export async function showDirectFetchNoticeOnce(): Promise<void> {
+	try {
+		const s = await getSettings();
+		if (!shouldShowPrivacyNotice(s)) return;
+		await message(DIRECT_FETCH_NOTICE, { title: 'How Hoardbook connects', kind: 'info' });
+		await acknowledgePrivacyNotice();
+	} catch {
+		// Swallowed by design — see doc comment.
+	}
 }

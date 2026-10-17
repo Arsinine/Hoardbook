@@ -34,6 +34,7 @@
 		getManifestAsks,
 		getSettings,
 	} from '$lib/api.js';
+	import { showDirectFetchNoticeOnce } from '$lib/privacy-gate.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import AddContactDialog from '$lib/components/AddContactDialog.svelte';
@@ -555,6 +556,8 @@
 		newestFingerprint?: string,
 	) {
 		try {
+			// The dial below hands this peer our IP — say so once, before the first one.
+			await showDirectFetchNoticeOnce();
 			// QURATOR-171: the asker's newest-known fingerprint rides along so the backend's staleness
 			// gate has something to compare against. Sourced from the ask record via
 			// askFingerprintSeen — never the served envelope's own fingerprint, which would compare a

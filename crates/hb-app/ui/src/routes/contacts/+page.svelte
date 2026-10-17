@@ -2343,14 +2343,17 @@
 	.pane-cols { display: flex; flex-direction: column; gap: 1px; }
 	.cpop-row {
 		display: grid; grid-template-columns: 1fr auto; column-gap: 10px;
-		padding: 5px 6px; margin: 0 -6px; border-radius: var(--r-control, 6px);
+		/* The hover fill bleeds past the text by exactly .shares' 2px side padding, no further: a
+		   wider bleed (it was -6px) overhangs .detail-scroll by 4px a side, which was the pane's
+		   horizontal scroll — overflow-x: hidden only clipped it. */
+		padding: 5px 2px; margin: 0 -2px; border-radius: var(--r-control, 6px);
 	}
 	.cpop-row:hover { background: var(--bg-elev2); }
 	.cpop-alias { font-size: 12.5px; font-weight: 500; color: var(--fg); min-width: 0; overflow-wrap: anywhere; }
 	.cpop-size { font-size: 11px; color: var(--fg-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 	.cpop-desc { grid-column: 1 / -1; font-size: 11px; color: var(--fg-dim); }
 	.show-more {
-		align-self: flex-start; margin: 4px 0 0 -6px; padding: 2px 6px; font-size: 11px; color: var(--accent);
+		align-self: flex-start; margin: 4px 0 0 -2px; padding: 2px 2px; font-size: 11px; color: var(--accent);
 		background: none; border: none; border-radius: var(--r-control, 6px); cursor: pointer; font-family: var(--font-ui);
 	}
 	.show-more:hover { background: var(--bg-elev2); }
