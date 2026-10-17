@@ -3,68 +3,57 @@
 [![CI](https://github.com/Arsinine/Hoardbook/actions/workflows/ci.yml/badge.svg)](https://github.com/Arsinine/Hoardbook/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Arsinine/Hoardbook)](https://github.com/Arsinine/Hoardbook/releases)
 
-Hoardbook is a desktop directory for media hoards. Point it at your disks, publish an
-encrypted catalog, and other collectors can find out *that* you have something and *who*
-you are — without you exposing a server, an IP address, or the files themselves. Find who
-has what, verify who they are, then talk to them and arrange the trade however you like.
+A phonebook for people with big media collections.
 
-It is a phonebook, not a courier: Hoardbook moves no collection files. Even its built-in
-peer transport is structurally limited to manifest payloads (the list of what you offered),
-never your media.
+Point Hoardbook at your drives and it builds a catalog of what you have. Publish it, and other
+collectors can see what you hold, find people with similar collections, and message you. How you
+trade is up to the two of you. Hoardbook never sends anyone your files, only the list of them.
+
+It runs on [Nostr](https://github.com/nostr-protocol/nostr), so there's no Hoardbook server and
+no account to sign up for.
 
 ## Screenshots
 
-| Home — your published profile | Browse — a peer's catalog |
+| Home | Contacts |
 |:---:|:---:|
-| ![Home](docs/img/home.png) | ![Browse](docs/img/browse.png) |
+| ![Home: your profile and collections](docs/img/home.png) | ![Contacts: a contact's profile and collections](docs/img/contacts.png) |
 
-| Contacts — fingerprints & presence | Topics — public & private channels |
+| Browse | Topics |
 |:---:|:---:|
-| ![Contacts](docs/img/contacts.png) | ![Topics](docs/img/topics.png) |
+| ![Browse: walking a contact's collection](docs/img/browse.png) | ![Topics: a topic's members](docs/img/topics.png) |
 
-| Chat — sealed direct messages |
+| Chat |
 |:---:|
-| ![Chat](docs/img/chat.png) |
+| ![Chat: a direct message thread](docs/img/chat.png) |
 
-## How it works
+## What it does
 
-For a technical reader, in one line: **Hoardbook is a Nostr client — your identity is a
-Nostr keypair, your catalog is an encrypted event published to public relays, and direct
-messages are NIP-17 sealed DMs, so discovery needs none of your own servers and exposes
-no peer addresses.**
+- **Catalogs your collections.** Add a folder, choose which parts to include, and Hoardbook
+  indexes it locally. Only what you include gets published.
+- **Lets people read each other's catalogs.** You can read anyone whose collection is smaller
+  than or equal to yours; access is granted automatically. Bigger collections show you a
+  preview (collection names and sizes) until yours catches up. You can always hand your key to
+  someone directly.
+- **Private collections** go only to the people you pick.
+- **Finds people.** Search by name, tag, or title, see who's like you, and join Topics to meet
+  people around a shared interest.
+- **Chat.** End-to-end encrypted direct messages, plus a channel for each Topic.
+- **Tells contacts apart.** Every contact has three coloured words derived from their key. If
+  the name matches but the words don't, it isn't them.
 
-- **Identity is a key, not an account.** First run generates your Nostr key (your `npub`).
-  No email, no sign-up, nothing to delete.
-- **Catalogs are sealed.** Each collection's directory tree is encrypted before it leaves
-  your machine. The decryption key (your *browse-key*) never leaves the device unsealed —
-  it travels only inside an `hbk…` share code you hand to a specific person.
-- **Browsing is relay-read + local-decrypt.** You pull encrypted events from relays and
-  open them locally. Peers never learn your address, and you never learn theirs.
-- **Fingerprints beat impersonation.** Every contact carries a word + colour fingerprint
-  derived from their key, rendered identically on both ends. A lookalike name with a
-  different fingerprint is not them.
-- **Private collections have an explicit audience.** Who can see a private collection is
-  a list you control — never inferred from groups or topic membership.
-- **Trades happen out of band.** Hoardbook brokers the introduction and the catalog;
-  how bytes move between two collectors is up to them.
+## Getting started
 
-## Quick start
+1. Download the Windows installer or Linux package from
+   [Releases](https://github.com/Arsinine/Hoardbook/releases). macOS isn't supported.
+2. On first launch Hoardbook creates your key. Back it up: there's no password reset.
+3. Fill in your profile and add a collection on the Home page, then publish.
+4. Add people from Contacts, using their `npub` or the `hbk…` share code they give you.
 
-1. **Install.** Grab the Windows installer or Linux package from
-   [Releases](https://github.com/Arsinine/Hoardbook/releases). macOS is not supported.
-2. **Generate your identity.** The first-run wizard creates your Nostr key and shows you
-   your `npub` — that string *is* your address. Back it up; there is no reset.
-3. **Add a contact.** In Contacts, paste their `npub`, or import their `hbk…` share code
-   (an `npub` plus the browse-key that unlocks their catalog for you).
-4. **Scan your hoard.** Add a collection and point it at a directory. Hoardbook indexes
-   the tree locally; you choose what to publish and to whom.
-5. **Browse and talk.** The Browse tab lists catalogs you hold keys for — open one to walk
-   its tree. Chat opens a sealed, end-to-end encrypted thread with that collector.
+Updates install from inside the app.
 
 ## Relays
 
-Discovery rides on public Nostr relays. Hoardbook ships with five defaults spread across
-independent providers, so no single relay is a point of failure:
+Hoardbook connects to five public Nostr relays by default:
 
 - `wss://nos.lol`
 - `wss://relay.primal.net`
@@ -72,7 +61,21 @@ independent providers, so no single relay is a point of failure:
 - `wss://relay.damus.io`
 - `wss://nostr.mom`
 
-Replace or extend them in Settings; Hoardbook reads from all configured relays.
+You can change them in Settings.
+
+## Privacy
+
+- Your catalog is encrypted before it leaves your machine. Relays can't read it.
+- Browsing and chat go through relays, so other users don't see your IP address. The exception
+  is a catalog too big to send over relays: fetching the full list connects you directly to
+  whoever sends it, and they see your IP (you see theirs too).
+- The relays you use can see your IP, as with any Nostr app.
+- What you've browsed stays on your machine. Hoardbook never publishes what you hold of other
+  people's catalogs.
+- Removing a collection removes its catalog. Your files are never touched.
+
+Public collection names and sizes are visible to anyone, even people who can't read the
+catalog itself.
 
 ## Build from source
 
@@ -82,30 +85,16 @@ Requires [Rust](https://rustup.rs) and Node.js.
 git clone https://github.com/Arsinine/Hoardbook.git
 cd Hoardbook/crates/hb-app/ui
 npm install
-cd ../..
+cd ../../..
 cargo tauri dev --manifest-path crates/hb-app/Cargo.toml
 ```
 
-Build an installer:
+To build an installer:
 
 ```sh
 cargo tauri build --manifest-path crates/hb-app/Cargo.toml
 ```
 
-## Privacy model
-
-The guarantees above are not aspirations — they are pinned by tests in this repository:
-
-- The browse-key never leaves the device unsealed (INV-2).
-- Presence and browsing carry no addresses or node keys — the historical IP-harvest hole
-  is closed and stays closed.
-- Durable deletion is deliberate: removing a collection removes its catalog, never your
-  files (INV-8).
-- Every plaintext-transport sweep and wire-format change is guarded in CI.
-
-These invariants are stated and enforced as first-class rules in this repository's
-development documentation and test suite.
-
 ## License
 
-MIT.
+MIT
