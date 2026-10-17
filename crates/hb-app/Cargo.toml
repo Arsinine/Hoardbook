@@ -61,7 +61,10 @@ tauri               = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 sha2    = "0.10"
 tauri-plugin-process = "2"
-tauri-plugin-updater = "2"
+# No `zip` feature: it only unpacks v1-style zipped update bundles, and `createUpdaterArtifacts: true`
+# publishes the raw setup.exe / AppImage / deb (see latest.json). Dropping it removes zip 4.x, which
+# carries RUSTSEC-2026-0367/0368/0369 with no fix on the 4.x line the plugin pins.
+tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls"] }
 # Portable self-updater (Windows): fetch the signed portable binary and swap the running exe in place.
 # Verification reuses the SAME minisign key + `minisign-verify` crate as the NSIS updater (byte-identical
 # to tauri-plugin-updater's `verify_signature`), so no new trust root. `reqwest`/`semver`/`minisign-verify`
