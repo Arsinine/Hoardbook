@@ -16,7 +16,6 @@
 	import AddCollectionModal from '$lib/components/AddCollectionModal.svelte';
 	import CollectionRow from '$lib/components/CollectionRow.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
-	import { fmtBytes } from '$lib/discover-book.js';
 	import HintMarker from '$lib/components/HintMarker.svelte';
 	import Modal from '$lib/components/Modal.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
@@ -40,7 +39,7 @@
 	// 0=loading, 1=keypair, 2=name, 3=sharing, 4=collection (skippable), 5=done
 	let obStep = $state(0);
 	let obGenerating = $state(false);
-	let obKeypairRevealed = $state(false); // true after generation: show npub + share code + backup prompt
+	let obKeypairRevealed = $state(false); // true after generation: show npub + backup prompt
 	let importOverlayOpen = $state(false); // linking-warning overlay before importing an existing nsec
 	let obImportNsec = $state('');
 	let obImportPassword = $state('');     // only for a NIP-49 ncryptsec key
@@ -55,7 +54,7 @@
 		try {
 			const info = await generateKeypair();
 			identity.set(info);
-			obKeypairRevealed = true; // stay on step 1 to show the share code + backup prompt
+			obKeypairRevealed = true; // stay on step 1 to show the npub + backup prompt
 		} catch (e) { toast(String(e), 'error'); }
 		finally { obGenerating = false; }
 	}
@@ -502,15 +501,6 @@
 	});
 	let nameInitial = $derived(form.display_name?.[0]?.toUpperCase() ?? 'Y');
 	let nameHue = $derived(avatarHue(nameInitial));
-	// QURATOR-364: the "How you appear" live preview — the exact Discover entry (DiscoverBook
-	// entryCard order: avatar+name, size · N collections, the published names, Looking-for),
-	// derived from `form` + `$collections` so it updates WITHOUT a save. Only PUBLISHED
-	// collections count; `path_alias` is the public name (types.ts: the teaser carries it).
-	let publishedCols = $derived($collections.filter((c) => c.published));
-	let publishedTotal = $derived(publishedCols.reduce((s, c) => s + (c.total_bytes ?? 0), 0));
-	let appearMeta = $derived(fmtBytes(publishedTotal) + (publishedCols.length > 0 ? ` · ${publishedCols.length} collection${publishedCols.length === 1 ? '' : 's'}` : ''));
-	let appearNames = $derived(publishedCols.map((c) => c.path_alias).join(' · '));
-	let appearLookingFor = $derived((form.looking_for ?? '').trim());
 	let totalItems = $derived($collections.reduce((s, c) => s + c.item_count, 0));
 
 	// ── Collection source-accessibility (greyed → fills in) ──────────────────────────────────────
@@ -621,19 +611,24 @@
 					</button>
 				{:else}
 					<div class="ob-card-title">Your identity is ready</div>
-					<div class="ob-card-sub">This is your <strong>share code</strong>. Anyone holding it can decrypt and browse your listings. Give it only to people you trust with that.</div>
+					<div class="ob-card-sub">This is your <strong>npub</strong>. Post it so people can find you.</div>
 					<div class="ob-hbid-row">
-						<span class="ob-hbid mono">{$identity?.share_code ?? ''}</span>
-						<button class="btn-ghost btn-sm" onclick={() => { navigator.clipboard.writeText($identity?.share_code ?? ''); toast('Copied', 'success'); }}>Copy</button>
+						<span class="ob-hbid mono">{$identity?.npub ?? ''}</span>
+						<button class="ob-copy-btn" title="Copy npub" aria-label="Copy npub" onclick={() => { navigator.clipboard.writeText($identity?.npub ?? ''); toast('Copied', 'success'); }}>{@html icons.copy}</button>
 					</div>
 					<div class="ob-notice" style="margin-top:12px">
 						<span class="ob-notice-icon">{@html icons.shield}</span>
-						<div class="ob-notice-text">Export a backup now and store it somewhere safe. <strong>A lost key cannot be recovered.</strong></div>
+						<div class="ob-notice-text">Export a backup now. <strong>A lost key can’t be recovered.</strong></div>
 					</div>
-					<input class="hb-input" style="margin-top:10px" type="password" placeholder="Backup passphrase (min 12 characters)" bind:value={obBackupPass} />
-					{#if obBackupPass && !obBackupStrength.acceptable}
-						<div class="ob-card-sub" style="margin-top:4px">{obBackupStrength.reason ?? 'Choose a stronger passphrase.'}</div>
-					{/if}
+					<div class="field" style="margin-top:10px">
+						<label class="field-label" for="ob-backup-pass">Backup passphrase</label>
+						<input id="ob-backup-pass" class="hb-input" type="password" bind:value={obBackupPass} />
+						{#if obBackupPass && !obBackupStrength.acceptable}
+							<div class="ob-card-sub" style="margin-top:4px">{obBackupStrength.reason ?? 'Choose a stronger passphrase.'}</div>
+						{:else}
+							<div class="ob-card-sub" style="margin-top:4px">At least 12 characters.</div>
+						{/if}
+					</div>
 					<button class="btn-primary btn-full" style="margin-top:10px" onclick={obExportBackup} disabled={obBackingUp || !obBackupStrength.acceptable}>
 						{obBackingUp ? 'Exporting…' : 'Export backup file'}
 					</button>
@@ -870,35 +865,12 @@
 
 				<div class="field">
 					<!-- QURATOR-351 state e: the Looking-for line, written on Home where this app
-					     keeps the profile editor (the mock parked it under Settings). Owner-approved
-					     copy from hoardbook-drafts/351-r5/phonebook.html. No straight apostrophes in
-					     this block: the W8 copy scanner treats them as string delimiters. -->
+					     keeps the profile editor (the mock parked it under Settings). No straight
+					     apostrophes in this block: the W8 copy scanner treats them as string
+					     delimiters. -->
 					<label class="field-label">Looking for<span class="hb-tag">Public</span></label>
 					<input class="hb-input" type="text" maxlength="255" placeholder="Kurosawa 70mm scans; Balkan field recordings pre-1970" bind:value={form.looking_for} />
 					<div class="field-count">{form.looking_for?.length ?? 0} / 255</div>
-					<div class="field-hint">Public, like your collection names. It leaves with your teaser on the relays you use and is capped at 255 characters. Leave it empty and your entry simply has no “Looking for” line.</div>
-					<div class="appear">
-						<!-- QURATOR-364: the "How you appear" live preview — the entry other people see
-						     in Discover (DiscoverBook entryCard order: avatar+name, size · N
-						     collections, the published names, the Looking-for line). Live from
-						     `form`, no save needed; `path_alias` is the public collection name. -->
-						<div class="field-label">How you appear</div>
-						<div class="appear-card">
-							<div class="appear-top">
-								<Avatar letter={nameInitial} size={36} hue={nameHue} picture={form.picture} />
-								<div class="appear-id">
-									<div class="appear-name">{form.display_name.trim() || 'You'}</div>
-									<div class="appear-meta">{appearMeta}</div>
-								</div>
-							</div>
-							{#if appearNames}
-								<div class="appear-names">{appearNames}</div>
-							{/if}
-							{#if appearLookingFor}
-								<div class="appear-wants"><span class="appear-wants-label">Looking for </span>{appearLookingFor}</div>
-							{/if}
-						</div>
-					</div>
 				</div>
 
 				<div class="field">
@@ -1092,7 +1064,7 @@
 	.ob-dot-active { background: var(--accent); border-color: var(--accent); }
 	.ob-dot-done { background: color-mix(in oklch, var(--accent) 40%, transparent); border-color: var(--accent); }
 
-	/* HB-ID display row in step 1 post-generate */
+	/* npub display row in step 1 post-generate */
 	.ob-hbid-row {
 		display: flex;
 		align-items: center;
@@ -1106,12 +1078,25 @@
 
 	.ob-hbid {
 		flex: 1;
+		min-width: 0;
 		font-family: var(--font-mono);
 		font-size: 11px;
 		color: var(--fg);
-		word-break: break-all;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
 		line-height: 1.5;
 	}
+
+	.ob-copy-btn {
+		background: transparent;
+		border: none;
+		cursor: pointer;
+		color: var(--fg-dim);
+		display: flex;
+		padding: 2px;
+	}
+	.ob-copy-btn:hover { color: var(--fg); }
 
 	/* M15 W2: Qurator import overlay now uses Modal.svelte; body is a plain content column. */
 	.ob-import-body { display: flex; flex-direction: column; }
@@ -1495,20 +1480,6 @@
 
 	.field-hint { font-size: 11px; color: var(--fg-dim); margin-top: 4px; }
 	.field-count { font: 10.5px var(--font-mono); color: var(--fg-dim); align-self: flex-end; text-align: right; margin-top: 2px; font-variant-numeric: tabular-nums; }
-	/* QURATOR-364: the "How you appear" live preview. Quiet: tokens only (the
-	   no-stray-literals test sweeps this file), 12px meta in --fg-muted, --border frame. */
-	.appear { margin-top: 12px; }
-	.appear-card {
-		margin-top: 6px; padding: 10px 12px;
-		border: 1px solid var(--border);
-		border-radius: var(--r-card, 10px);
-	}
-	.appear-top { display: flex; align-items: center; gap: 10px; }
-	.appear-name { font-size: 13px; font-weight: 600; color: var(--fg); }
-	.appear-meta { font-size: 12px; color: var(--fg-muted); }
-	.appear-names { font-size: 12px; color: var(--fg-muted); margin-top: 6px; }
-	.appear-wants { font-size: 12px; color: var(--fg-muted); margin-top: 6px; }
-	.appear-wants-label { color: var(--fg-dim); }
 
 	/* Add collection button — dedicated class to avoid global style interference */
 	.btn-add {

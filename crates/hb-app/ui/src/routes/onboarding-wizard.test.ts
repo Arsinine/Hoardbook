@@ -95,7 +95,7 @@ describe('onboarding wizard', () => {
 		await r.findByText('Add your first collection');
 	});
 
-	it('step 1: "Use my Nostr key" imports behind the linking warning and lands on the share-code screen', async () => {
+	it('step 1: "Use my Nostr key" imports behind the linking warning and lands on the npub + backup screen', async () => {
 		importNsecMock.mockResolvedValue(IDENT);
 		identity.set(null);
 		appReady.set(true);
@@ -117,7 +117,10 @@ describe('onboarding wizard', () => {
 		expect(r.queryByLabelText('Key password')).toBeNull();
 		await waitFor(() => expect(importNsecMock).toHaveBeenCalledWith('nsec1abc', ''));
 		await r.findByText('Your identity is ready');
-		expect(r.getByText(IDENT.share_code)).toBeTruthy();
+		// QURATOR-379: the ready screen shows the NPUB (one line, truncated in CSS but complete in
+		// the DOM); the share code never appears — it stays reachable through Chat only.
+		expect(r.getByText(IDENT.npub)).toBeTruthy();
+		expect(r.queryByText(IDENT.share_code)).toBeNull();
 	});
 
 	it('step 1: an ncryptsec key asks for its password and passes it to the import', async () => {
@@ -162,7 +165,7 @@ describe('onboarding wizard', () => {
 		await fireEvent.click(r.getByText('← Back'));
 		await r.findByText('Name yourself');
 		await fireEvent.click(r.getByText('← Back'));
-		// Step 1 revisited after the key exists: the share code and backup, not a second "create".
+		// Step 1 revisited after the key exists: the npub and backup, not a second "create".
 		await r.findByText('Your identity is ready');
 		expect(r.queryByText('Create a new key')).toBeNull();
 	});

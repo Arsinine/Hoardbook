@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import fs from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, it, expect, afterEach } from 'vitest';
 import { render, fireEvent, cleanup } from '@testing-library/svelte';
 import FeatureTooltip from './FeatureTooltip.svelte';
@@ -103,6 +105,27 @@ describe('FeatureTooltip — accessible hover/focus help (HOARDBOOK_SPEC §8)', 
 
 	// F4 — content (per-item note) vs feature-help must not bleed: a plain note element does NOT
 	// acquire the FeatureTooltip ⓘ / aria-describedby / role=tooltip affordance.
+	// MUTATION (P-10): restore the bare `border-radius: var(--r-control, 7px);` in .ft-tip —
+	// this test reds on the not-bare-r-control assertion. Seen red.
+	it('.ft-tip takes the multi-line radius (min of control and card), not the pill radius', () => {
+		// DECLARED-CSS check, not a rendered one: jsdom computes no layout, so nothing here proves
+		// how the tip draws; it pins the rule the component ships. The owner report was
+		// "tooltips are rounded to the point where the text leaves the bubble" — five themes set
+		// --r-control: 999px, and a wrapping box needs the .hb-textarea precedent (app.css).
+		const src = fs.readFileSync(resolve(process.cwd(), 'src/lib/components/FeatureTooltip.svelte'), 'utf8');
+		// Strip comments before asserting (P-12), then slice the .ft-tip { … } block and anchor on
+		// the declaration itself, not a bare identifier.
+		const stripped = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+		const block = stripped.match(/\.ft-tip\s*\{([\s\S]*?)\n\t\}/);
+		expect(block, '.ft-tip block must exist').toBeTruthy();
+		const decl = (block![1].match(/border-radius:\s*([^;]+);/) ?? [])[1];
+		expect(decl, 'a border-radius declaration must exist in .ft-tip').toBeTruthy();
+		expect(decl).toContain('min(');
+		expect(decl).toContain('--r-card');
+		// A bare var(--r-control…) (no min()) is exactly the bug: the stadium radius.
+		expect(decl).not.toMatch(/var\(--r-control[^)]*\)\s*$/);
+	});
+
 	it('(F4) a per-item note element carries no FeatureTooltip affordance', () => {
 		const { getByRole } = render(FeatureTooltip, { props: { key: 'no-download' } });
 		// The feature-help trigger HAS the affordance:

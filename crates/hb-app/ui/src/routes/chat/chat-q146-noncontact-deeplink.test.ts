@@ -22,7 +22,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, cleanup, waitFor, fireEvent } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import ChatPage from './+page.svelte';
-import { identity, contacts, toastMessage } from '$lib/stores.js';
+import { identity, contacts, toastMessage, errorToasts, dismissError } from '$lib/stores.js';
 import { get } from 'svelte/store';
 
 const ME = 'npub1meeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
@@ -83,6 +83,8 @@ afterEach(() => {
 	identity.set(null);
 	contacts.set([]);
 	toastMessage.set(null);
+	// The error stack (QURATOR-379) is module state with 15s timers — clear it between tests.
+	for (const e of get(errorToasts)) dismissError(e.id);
 	window.history.replaceState({}, '', '/chat');
 });
 
@@ -159,9 +161,9 @@ describe('QURATOR-146 — `?peer=` opens a NON-contact (Topic roster hand-off)',
 		await waitFor(() => expect(pasteKeyMock).toHaveBeenCalled());
 		await tick();
 
-		// No conversation pane opened for the failed resolve, and the rejection reached the toast
-		// (the toast itself renders in +layout, so assert on the store it writes).
+		// No conversation pane opened for the failed resolve, and the rejection reached the error
+		// stack (QURATOR-379) — the layout renders from those stores, so assert on them.
 		expect(queryByText(/may not have added you back/i)).toBeNull();
-		await waitFor(() => expect(get(toastMessage)?.text).toMatch(/hasn't published a profile/i));
+		await waitFor(() => expect(get(errorToasts).some((e) => /hasn't published a profile/i.test(e.text))).toBe(true));
 	});
 });

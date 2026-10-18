@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { generateKeypair, getSettings, saveSettings, importNsec, isEncryptedKey, backupData, peekBackup, restoreData, validateBackup, wipeData, clearManifestCache, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, hasPublishedProfile, publishProfile, copyDiagnostics, revealLogFolder, natClassification, dmBlockedList, dmUnblock, dmBlock, validateShareCode, shareCodeInfo } from '$lib/api.js';
+	import { generateKeypair, getSettings, saveSettings, backupData, peekBackup, restoreData, validateBackup, wipeData, clearManifestCache, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, hasPublishedProfile, publishProfile, copyDiagnostics, revealLogFolder, natClassification, dmBlockedList, dmUnblock, dmBlock, validateShareCode, shareCodeInfo } from '$lib/api.js';
 	import type { Settings, UpdateInfo, PortableUpdateInfo, BeaconReport, NatClassification } from '$lib/api.js';
 	import { keyView } from '$lib/key-view.js';
 	import { shortNpub } from '$lib/contact-display.js';
@@ -9,13 +9,17 @@
 	import { beaconLine } from '$lib/beacon-view.js';
 	import { effectiveRelays, validateRelayUrl } from '$lib/relays.js';
 	import { relaunch } from '@tauri-apps/plugin-process';
-	import { open as openFileDialog, save as saveFileDialog, confirm } from '@tauri-apps/plugin-dialog';
+	// QURATOR-379: `confirm` is gone from this import — the page asks through the in-app Modal
+	// (askInApp below), never a native OS dialog (owner ruling: native popups read as an app
+	// fault). `open`/`save` stay: the native file pickers are correct.
+	import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 	import { getVersion } from '@tauri-apps/api/app';
 	import { identity, profile, toast } from '$lib/stores.js';
 	import { icons, avatarHue } from '$lib/icons.js';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import FeatureTooltip from '$lib/components/FeatureTooltip.svelte';
+	import Modal from '$lib/components/Modal.svelte';
 	// QURATOR-352 Appearance: the theme registry and the root-attribute applier.
 	import { THEMES, DEFAULT_THEME, BASE_THEME, isThemeId, type ThemeId, type ThemeInfo } from '$lib/themes/themes.js';
 	import { applyAppearance } from '$lib/themes/apply.js';
@@ -23,6 +27,25 @@
 	let generating = $state(false);
 	let copied = $state(false);
 	let appVersion = $state('');
+
+	// ── QURATOR-379: in-app confirm ──────────────────────────────────────────────
+	// The owner ruled notices must never be unprompted native popups (they read as an app fault),
+	// and the plugin's `confirm` is exactly that. The page asks through Modal.svelte instead:
+	// `askInApp` parks a promise the rendered modal settles. Esc and a backdrop click run Modal's
+	// `onclose`, which resolves false — same answer shape the native dialog gave.
+	let confirmState = $state<{ title: string; body: string; okLabel: string; danger: boolean } | null>(null);
+	let confirmResolve: ((ok: boolean) => void) | null = null;
+	function askInApp(title: string, body: string, okLabel: string, danger = true): Promise<boolean> {
+		return new Promise((resolve) => {
+			confirmState = { title, body, okLabel, danger };
+			confirmResolve = resolve;
+		});
+	}
+	function settleConfirm(ok: boolean) {
+		confirmState = null;
+		confirmResolve?.(ok);
+		confirmResolve = null;
+	}
 
 	// Full settings object, preserved so saving one field never resets the others (the M5 fields
 	// privacy_notice_acknowledged / last_seen_version + the M9 snapshot/online toggles live here too).
@@ -76,9 +99,10 @@
 		});
 		if (!path) return;
 		if (backupMode === 'plaintext') {
-			const ok = await confirm(
-				'This backup is unencrypted. The file is your identity, and anyone who has it becomes you. Store it like a master key. Continue?',
-				{ title: 'Plaintext backup', kind: 'warning' },
+			const ok = await askInApp(
+				'Plaintext backup',
+				'This file is your identity, unencrypted. Anyone who has it can act as you.',
+				'Export',
 			);
 			if (!ok) return;
 		}
@@ -116,9 +140,10 @@
 			// is the legitimate plaintext combination, so nothing errors). Informed consent, not a
 			// credential: a genuine plaintext backup — which Hoardbook itself produces — stays
 			// restorable, it just has to be confirmed, like plaintext export is on the way out.
-			const ok = await confirm(
-				'This backup is not encrypted. It was saved without a passphrase, and anyone with the file could have read or changed it — if you saved yours with a passphrase, this is not your file. Restore it anyway?',
-				{ title: 'Unencrypted backup', kind: 'warning' },
+			const ok = await askInApp(
+				'Unencrypted backup',
+				'This backup has no passphrase. Anyone with the file could have read or changed it. Restore it anyway?',
+				'Restore anyway',
 			);
 			if (!ok) { restorePath = null; return; }
 			doRestore();
@@ -139,9 +164,10 @@
 		const pass = restoreNeedsPass ? restorePass : null;
 		const path = restorePath;
 		restoring = true;
-		const ok = await confirm(
-			'Restoring REPLACES all current data on this device with the backup, then restarts. Continue?',
-			{ title: 'Restore from backup', kind: 'warning' },
+		const ok = await askInApp(
+			'Restore from backup',
+			'This replaces all data on this device with the backup, then restarts.',
+			'Restore',
 		);
 		if (!ok) { restoring = false; return; }
 		try {
@@ -158,23 +184,9 @@
 		} catch (e) { toast(String(e), 'error'); restoring = false; }
 	}
 
-	// ── Import a different Nostr key (always warns about linking) ─────────────────
-	let importOpen = $state(false);
-	let importNsecValue = $state('');
-	let importPassword = $state('');   // only for a NIP-49 ncryptsec key
-	let importWarnAck = $state(false);
-	let importingNsec = $state(false);
-
-	async function handleImportNsec() {
-		importingNsec = true;
-		try {
-			const info = await importNsec(importNsecValue.trim(), importPassword);
-			identity.set(info);
-			importOpen = false; importNsecValue = ''; importPassword = ''; importWarnAck = false;
-			toast('Nostr key imported');
-		} catch (e) { toast(String(e), 'error'); }
-		finally { importingNsec = false; }
-	}
+	// QURATOR-379 (owner, Option A): the Settings Nostr-key import is DELETED. Switching keys is
+	// Danger zone → Wipe data → the onboarding wizard's "Use my Nostr key", which already works.
+	// The command (`import_nsec`) and the wizard path are unchanged.
 
 	// ── Updates (Obsidian deferred-install) ──────────────────────────────────────
 	let updateChecking = $state(false);
@@ -736,6 +748,9 @@
 	let idName = $derived($profile?.display_name ?? 'You');
 	let idInitial = $derived(idName[0]?.toUpperCase() ?? 'Y');
 	let idHue = $derived(avatarHue(idInitial));
+	// QURATOR-379: the card's one key line — the truncated npub; the copy button takes the FULL one.
+	let idNpubShort = $derived($identity?.npub_short ?? '');
+	let idNpub = $derived($identity?.npub ?? '');
 
 	// Profile picture changing lives on Home (devtest #5) — Settings only displays the avatar.
 
@@ -774,37 +789,30 @@
 				<Avatar letter={idInitial} size={56} hue={idHue} picture={$profile?.picture} />
 				<div class="identity-info">
 					<div class="identity-name">{idName}</div>
+					<!-- QURATOR-379: the share-code and npub rows are gone — the card keeps the npub
+					     (truncated, copies the FULL value) as its one line. The share code stays
+					     reachable through Chat's "Share my code". -->
+					<div class="identity-npub">
+						<span class="identity-npub-text">{idNpubShort}</span>
+						<button class="icon-btn" title="Copy npub" aria-label="Copy npub" onclick={() => handleCopy(idNpub)}>{@html icons.copy}</button>
+					</div>
 				</div>
-				</div>
-
-			<!-- The three keys: npub (irreplaceable), iroh node key (public), share code (carries the browse-key). -->
-			{#each kv.rows as row (row.label)}
-				<div class="field-label" style="margin-bottom:4px">{row.label}{#if row.sensitive} <span class="key-secret">secret</span>{/if}</div>
-				<div class="id-display">
-					<span class="id-text">{row.value}</span>
-					<button class="icon-btn" onclick={() => handleCopy(row.value)} title={row.label === 'Share code' ? 'Copy share code' : 'Copy npub'}>{@html icons.copy}</button>
-				</div>
-				{#if row.hint}<div class="id-hint" style="margin-bottom:12px">{row.hint}</div>{/if}
-			{/each}
-
-			{#if copied}
-				<div class="id-actions"><span class="id-hint">Copied!</span></div>
-			{/if}
-
-			<div class="no-recovery">{@html icons.key} {kv.noRecoveryNotice}</div>
+			</div>
 
 			{#if kv.showStorageWarning}
 				<div class="key-storage-warn">
-					{@html icons.key} Your key is stored as a protected file, not in an OS keyring on this
-					platform. Anyone with access to your user account can read it, so keep this device secure.
+					{@html icons.key} Your key is stored as a protected file, not in an OS keyring. Anyone with access to your user account can read it.
 				</div>
 			{/if}
 		</div>
 
-		<!-- Backup / restore -->
+		<!-- Backup / restore — QURATOR-379: ONE surface. Export half on top, a divider, then the
+		     replace half. The Nostr-key import is deleted (owner, Option A): switching keys is
+		     Danger zone → Wipe data → the wizard's "Use my Nostr key". -->
 		<div class="section-label">Backup &amp; restore</div>
 		<div class="surface">
-			<div class="field-label">Export a portable backup of everything: your keys, collections, contacts, and settings. Store it somewhere safe. It is your only protection against losing your identity.</div>
+			<div class="toggle-label">Export backup</div>
+			<div class="toggle-sub">Keys, collections, contacts and settings. A lost identity can’t be recovered without one.</div>
 			<div class="backup-modes">
 				{#each backupModes as opt (opt.mode)}
 					<label class="backup-mode" class:backup-mode-on={backupMode === opt.mode}>
@@ -817,19 +825,31 @@
 				{/each}
 			</div>
 			{#if backupMode === 'passphrase'}
-				<input class="hb-input" type="password" placeholder="Backup passphrase (min 12 characters)" bind:value={backupPass} />
-				{#if backupPass}
-					<div class="strength-row">
-						<div class="strength-bar"><div class="strength-fill" style="width:{backupStrength.score * 25}%" class:strength-bad={!backupStrength.acceptable}></div></div>
-						<span class="strength-label">{backupStrength.label}</span>
-					</div>
-					{#if backupStrength.reason}<div class="toggle-sub">{backupStrength.reason}</div>{/if}
-				{/if}
+				<div class="br-pass">
+					<label class="field-label" for="backup-pass">Backup passphrase</label>
+					<input id="backup-pass" class="hb-input" type="password" bind:value={backupPass} />
+					{#if backupPass}
+						<div class="strength-row">
+							<div class="strength-bar"><div class="strength-fill" style="width:{backupStrength.score * 25}%" class:strength-bad={!backupStrength.acceptable}></div></div>
+							<span class="strength-label">{backupStrength.label}</span>
+						</div>
+						{#if backupStrength.reason}<div class="toggle-sub">{backupStrength.reason}</div>{/if}
+					{:else}
+						<div class="toggle-sub">At least 12 characters.</div>
+					{/if}
+				</div>
 			{/if}
 			<div style="display:flex; gap:8px; flex-wrap:wrap;">
 				<button class="btn-primary btn-sm" onclick={handleBackup} disabled={backingUp || (backupMode === 'passphrase' && !backupStrength.acceptable)}>
 					{backingUp ? 'Exporting…' : 'Export backup'}
 				</button>
+			</div>
+
+			<div class="br-divider"></div>
+
+			<div class="toggle-label">Replace this identity</div>
+			<div class="toggle-sub">Replaces all data on this device, then restarts.</div>
+			<div style="display:flex; gap:8px; flex-wrap:wrap;">
 				<button class="btn-default btn-sm" onclick={pickRestore} disabled={restoring}>
 					{@html icons.key} {restoring ? 'Restoring…' : 'Restore from backup'}
 				</button>
@@ -843,35 +863,8 @@
 			{/if}
 		</div>
 
-		<!-- Import a different key -->
-		<div class="section-label">Use a different Nostr key</div>
-		<div class="surface">
-			{#if !importOpen}
-				<div class="toggle-row">
-					<div class="toggle-text">
-						<div class="toggle-label">Import an existing Nostr key</div>
-						<div class="toggle-sub">Replaces this identity. Wipe data first if you already have one.</div>
-					</div>
-					<button class="btn-default btn-sm" onclick={() => (importOpen = true)}>Import key</button>
-				</div>
-			{:else}
-				<div class="link-warn">
-					{@html icons.key} <strong>Your Nostr profile will be linked to your Hoardbook activity.</strong>
-					Anyone who knows your npub can see both.
-				</div>
-				<label class="ack-row"><input type="checkbox" bind:checked={importWarnAck} /> I understand.</label>
-				<input class="hb-input hb-mono" type="password" placeholder="nsec1… or ncryptsec1…" aria-label="Nostr key" bind:value={importNsecValue} />
-				{#if isEncryptedKey(importNsecValue)}
-					<input class="hb-input" type="password" placeholder="Key password" aria-label="Key password" bind:value={importPassword} />
-				{/if}
-				<div style="display:flex; gap:8px;">
-					<button class="btn-primary btn-sm" onclick={handleImportNsec} disabled={!importWarnAck || !importNsecValue.trim() || (isEncryptedKey(importNsecValue) && !importPassword) || importingNsec}>
-						{importingNsec ? 'Importing…' : 'Import key'}
-					</button>
-					<button class="btn-ghost btn-sm" onclick={() => { importOpen = false; importNsecValue = ''; importPassword = ''; importWarnAck = false; }}>Cancel</button>
-				</div>
-			{/if}
-		</div>
+		<!-- QURATOR-379 (owner, Option A): the "Use a different Nostr key" import section is gone.
+		     Switching keys: Danger zone → Wipe data → the wizard's "Use my Nostr key". -->
 	{:else}
 		<div class="surface">
 			<p class="no-id-text">No identity yet. Generate one, or restore from a backup.</p>
@@ -1250,7 +1243,22 @@
 </div>
 </div>
 
+<!-- QURATOR-379: the one in-app confirm. Driven by `askInApp` above; the plugin's native
+     `confirm` is deleted from this page (owner ruling: native popups read as an app fault).
+     Esc/backdrop run Modal's onclose → settleConfirm(false). -->
+{#if confirmState}
+	{@const cs = confirmState}
+	<Modal open={true} title={cs.title} onclose={() => settleConfirm(false)} width="420px">
+		<p class="confirm-body">{cs.body}</p>
+		{#snippet actions()}
+			<button class="btn-ghost btn-sm" onclick={() => settleConfirm(false)}>Cancel</button>
+			<button class={cs.danger ? 'btn-danger' : 'btn-primary'} onclick={() => settleConfirm(true)}>{cs.okLabel}</button>
+		{/snippet}
+	</Modal>
+{/if}
+
 <style>
+	.confirm-body { font-size: 13px; color: var(--fg-muted); line-height: 1.5; margin: 0; }
 	.topbar {
 		padding: 16px 24px;
 		border-bottom: 1px solid var(--border);
@@ -1308,9 +1316,21 @@
 
 	.identity-top { display: flex; gap: 16px; align-items: center; }
 
-	.identity-info { flex: 1; }
+	.identity-info { flex: 1; min-width: 0; }
 
 	.identity-name { font-size: 14px; font-weight: 600; }
+
+	/* QURATOR-379 — the card's one key line: truncated npub, mono, muted, copies the full value. */
+	.identity-npub { display: flex; align-items: center; gap: 6px; margin-top: 2px; min-width: 0; }
+	.identity-npub-text {
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--fg-muted);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		min-width: 0;
+	}
 
 	.key-storage-warn {
 		margin-top: 12px;
@@ -1325,31 +1345,6 @@
 		align-items: flex-start;
 		line-height: 1.5;
 	}
-
-	.id-display {
-		background: var(--bg);
-		border: 1px solid var(--border);
-		border-radius: var(--r-control, 7px);
-		padding: 10px 12px;
-		font-family: var(--font-mono);
-		font-size: 12px;
-		color: var(--fg);
-		display: flex;
-		align-items: center;
-		gap: 10px;
-		word-break: break-all;
-	}
-
-	.id-text { flex: 1; }
-
-	.id-actions {
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-		gap: 12px;
-	}
-
-	.id-hint { font-size: 11.5px; color: var(--fg-dim); }
 
 	.no-id-text { font-size: 13px; color: var(--fg-muted); }
 
@@ -1589,19 +1584,9 @@
 	/* M15 W1: buttons unified on the app.css .btn system (local copies removed). */
 	.btn-default { flex-shrink: 0; min-width: max-content; } /* keep settings-row layout guards only */
 
-	/* M5: 3-key view, backup/restore, import-nsec, share QR */
-	.key-secret {
-		font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.5px;
-		color: var(--error); border: 1px solid color-mix(in oklch, var(--error) 30%, transparent);
-		border-radius: var(--r-chip, 4px); padding: 0 5px; margin-left: 4px;
-	}
-	.no-recovery {
-		margin-top: 4px; padding: 10px 12px; border-radius: var(--r-control, 7px);
-		border: 1px solid color-mix(in oklch, var(--error) 25%, transparent);
-		background: color-mix(in oklch, var(--error) 7%, transparent);
-		font-size: 11.5px; color: var(--fg-muted); line-height: 1.5;
-		display: flex; gap: 8px; align-items: flex-start;
-	}
+	/* QURATOR-379 — Backup & restore: one surface, two halves. */
+	.br-divider { height: 1px; background: var(--border); flex-shrink: 0; }
+	.br-pass { display: flex; flex-direction: column; align-items: stretch; gap: 4px; }
 	.backup-modes { display: flex; flex-direction: column; gap: 8px; }
 	.backup-mode {
 		display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px;
@@ -1615,14 +1600,6 @@
 	.strength-fill.strength-bad { background: var(--error); }
 	.strength-label { font-size: 11px; color: var(--fg-dim); white-space: nowrap; }
 	.restore-pass { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
-	.link-warn {
-		padding: 10px 12px; border-radius: var(--r-control, 7px);
-		border: 1px solid color-mix(in oklch, var(--accent) 35%, transparent);
-		background: color-mix(in oklch, var(--accent) 8%, transparent);
-		font-size: 11.5px; color: var(--fg-muted); line-height: 1.5;
-		display: flex; gap: 8px; align-items: flex-start;
-	}
-	.ack-row { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--fg-muted); }
 
 	/* ── QURATOR-352 Appearance ────────────────────────────────────────────── */
 	.theme-grid {

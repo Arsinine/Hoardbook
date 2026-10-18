@@ -17,7 +17,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, fireEvent, cleanup, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import HomePage from './+page.svelte';
-import { identity, profile, collections, appReady, homeDraft, identityLoadError, toastMessage } from '$lib/stores.js';
+import { identity, profile, collections, appReady, homeDraft, identityLoadError, toastMessage, errorToasts, dismissError } from '$lib/stores.js';
 import { get } from 'svelte/store';
 import type { IdentityInfo, Profile } from '$lib/types.js';
 
@@ -73,6 +73,9 @@ function resetStores() {
 	homeDraft.set(null);
 	identityLoadError.set(null);
 	toastMessage.set(null);
+	// The error stack (QURATOR-379) is module state with 15s timers — a leaked entry from one
+	// test would false-red the next file-internal "no error" case, so it resets too.
+	for (const e of get(errorToasts)) dismissError(e.id);
 }
 
 afterEach(() => {
@@ -111,10 +114,9 @@ describe('QURATOR-100 — picture apply/remove failures reach the user', () => {
 
 		// THE ASSERTION: the user sees the error, not a silent unhandled rejection. The toast DOM is
 		// rendered by +layout.svelte (which a page-only mount doesn't include), so assert on the
-		// toastMessage store — the single source of truth the layout renders from.
+		// stores — the error stack (QURATOR-379) is the source of truth the layout renders from.
 		await waitFor(() => {
-			expect(get(toastMessage)?.kind).toBe('error');
-			expect(get(toastMessage)?.text).toContain('picture pipeline exploded');
+			expect(get(errorToasts).some((e) => e.text.includes('picture pipeline exploded'))).toBe(true);
 		});
 		// pictureBusy must still have been released by the finally.
 		const picker = container.querySelector('.avatar-picker') as HTMLButtonElement;
@@ -141,8 +143,7 @@ describe('QURATOR-100 — picture apply/remove failures reach the user', () => {
 		await fireEvent.click(rm);
 
 		await waitFor(() => {
-			expect(get(toastMessage)?.kind).toBe('error');
-			expect(get(toastMessage)?.text).toContain('remove failed hard');
+			expect(get(errorToasts).some((e) => e.text.includes('remove failed hard'))).toBe(true);
 		});
 		const picker = container.querySelector('.avatar-picker') as HTMLButtonElement;
 		expect(picker.disabled).toBe(false);
@@ -164,6 +165,8 @@ describe('QURATOR-100 — picture apply/remove failures reach the user', () => {
 
 		await waitFor(() => expect(applyMock).toHaveBeenCalledTimes(1));
 		await new Promise((r) => setTimeout(r, 20));
+		// No error on either surface — the stack (QURATOR-379) or the single slot.
+		expect(get(errorToasts).length).toBe(0);
 		expect(get(toastMessage)?.kind ?? null).not.toBe('error');
 	});
 });

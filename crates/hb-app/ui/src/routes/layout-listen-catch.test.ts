@@ -27,7 +27,7 @@ vi.mock('$app/navigation', () => ({ goto: vi.fn() }));
 vi.mock('@tauri-apps/api/app', () => ({ getVersion: vi.fn(async () => '0.17.0') }));
 // The layout mounts WindowControls, whose onMount calls getCurrentWindow() — that dereferences
 // window.__TAURI_INTERNALS__.metadata, which jsdom has not got. Stub the module (same note as
-// error-toast-sticky.test.ts).
+// toast-stack.test.ts).
 vi.mock('@tauri-apps/api/window', () => ({
 	getCurrentWindow: () => ({
 		isMaximized: async () => false,

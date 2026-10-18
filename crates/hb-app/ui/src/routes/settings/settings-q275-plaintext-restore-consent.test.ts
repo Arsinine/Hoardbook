@@ -8,21 +8,21 @@
 // QURATOR-228 hard error in backup.rs — plaintext header + supplied passphrase — never fires on
 // this path, because the skipped prompt means null is supplied.)
 //
-// Fix: informed consent, NOT a credential. When the header declares plaintext, the user sees an
-// unencrypted-file warning (native confirm, the same channel handleBackup() uses for plaintext
-// export) and must accept it before doRestore() runs. A genuine plaintext backup — a supported
-// shape Hoardbook itself produces — stays restorable after that confirmation, and the encrypted
-// flow is untouched: passphrase form, no new dialog.
+// Fix: informed consent, NOT a credential. When the header declares plaintext, the user sees the
+// in-app "Unencrypted backup" modal (QURATOR-379 — askInApp, no native OS dialog) and must accept
+// it before doRestore() runs. A genuine plaintext backup — a supported shape Hoardbook itself
+// produces — stays restorable after that confirmation, and the encrypted flow is untouched:
+// passphrase form, no dialog until doRestore's own consent modal.
 //
-// MUTATION THAT MUST RED tests 1 and 2 (do NOT run it — the orchestrator applies and reverts):
+// MUTATION THAT MUST RED tests 1–3 (do NOT run it — the orchestrator applies and reverts):
 // in ./+page.svelte, inside `async function pickRestore()`, collapse the `if (!restoreNeedsPass)`
 // branch (the block starting at the `if (!restoreNeedsPass) {` line that immediately follows
-// `restorePass = '';`, ~line 88) back to the pre-fix single statement — delete the `const ok =
-// await confirm(` … `if (!ok) { restorePath = null; return; }` lines so the branch body is just
-// `doRestore();`. Then the FIRST confirm the flow reaches is doRestore()'s generic
-// "Restoring REPLACES all current data…" copy, which does not match /not encrypted/i, and both
-// first-confirm-message assertions below go red while everything else stays plausible — proving
-// the tests pin the warning's presence, not merely that some dialog appeared.
+// `restorePass = '';`) back to the pre-fix single statement — delete the `const ok = await
+// askInApp(` … `if (!ok) { restorePath = null; return; }` lines so the branch body is just
+// `doRestore();`. Then the FIRST dialog the plaintext flow reaches is doRestore()'s generic
+// "Restore from backup / replaces all data…" modal, whose copy does not match /no passphrase/i —
+// tests 1 and 2 red on the dialog-copy assertions; test 3 reds because a dialog now appears where
+// the encrypted flow pins NONE before the passphrase form.
 //
 // The mocks intercept every destructive edge (wipeData, restoreData, relaunch), so nothing here
 // can touch a real store. Drive the real mounted page through the real DOM (pick file → consent),
@@ -31,7 +31,8 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, fireEvent, cleanup, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import SettingsPage from './+page.svelte';
-import { identity, profile, toastMessage } from '$lib/stores.js';
+import { identity, profile, toastMessage, errorToasts, dismissError } from '$lib/stores.js';
+import { get } from 'svelte/store';
 
 const ME = 'npub1meeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 const BACKUP_PATH = '/mnt/backups/hoardbook-2026-09-15.hbk';
@@ -69,16 +70,17 @@ vi.mock('$lib/api.js', () => ({
 	shareCodeInfo: vi.fn(),
 }));
 
+// NO `confirm` export — a production regression to the native dialog hits `undefined` and reds
+// loudly here instead of being silently granted (same fail-closed wiring as q126).
 vi.mock('@tauri-apps/plugin-dialog', () => ({
 	open: vi.fn(),
 	save: vi.fn(),
-	confirm: vi.fn(),
 }));
 vi.mock('@tauri-apps/plugin-process', () => ({ relaunch: vi.fn().mockResolvedValue(undefined) }));
 vi.mock('@tauri-apps/api/app', () => ({ getVersion: vi.fn().mockResolvedValue('0.0.0') }));
 
 import { getSettings, peekBackup, restoreData, validateBackup, wipeData } from '$lib/api.js';
-import { open as openFileDialog, confirm as confirmDialog } from '@tauri-apps/plugin-dialog';
+import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 
 const getSettingsMock = getSettings as unknown as ReturnType<typeof vi.fn>;
 const peekBackupMock = peekBackup as unknown as ReturnType<typeof vi.fn>;
@@ -86,7 +88,6 @@ const restoreDataMock = restoreData as unknown as ReturnType<typeof vi.fn>;
 const validateBackupMock = validateBackup as unknown as ReturnType<typeof vi.fn>;
 const wipeDataMock = wipeData as unknown as ReturnType<typeof vi.fn>;
 const openMock = openFileDialog as unknown as ReturnType<typeof vi.fn>;
-const confirmMock = confirmDialog as unknown as ReturnType<typeof vi.fn>;
 
 const OK_SETTINGS = {
 	relay_urls: ['wss://relay.example.com'],
@@ -105,9 +106,10 @@ afterEach(() => {
 	vi.clearAllMocks();
 	identity.set(null);
 	profile.set(null);
-	// A sticky ERROR toast from a previous test otherwise blocks every later success toast
-	// (blockedByStickyError), making an unrelated test fail on store leakage (per q176).
+	// Reset both toast surfaces: a leaked SUCCESS toast could satisfy a later findByText, and a
+	// leaked ERROR (15s timer, QURATOR-379 stack) could satisfy a later error wait.
 	toastMessage.set(null);
+	for (const e of get(errorToasts)) dismissError(e.id);
 });
 
 function primeIdentity() {
@@ -120,8 +122,22 @@ function primeIdentity() {
 const renderSettings = () => render(SettingsPage);
 type Rendered = ReturnType<typeof renderSettings>;
 
-/** Drive the real page to a picked archive whose header declares plaintext. `confirm`'s verdict is
- *  deliberately NOT set here — each test owns it, so a staging done before render survives. */
+/** The consent dialog is the page's IN-APP Modal (role=dialog) — scope to it so the page's own
+ *  buttons underneath can never match. */
+async function theDialog(): Promise<HTMLElement> {
+	await waitFor(() => expect(document.querySelector('[role="dialog"]')).toBeTruthy());
+	return document.querySelector<HTMLElement>('[role="dialog"]')!;
+}
+
+async function modalButton(name: RegExp): Promise<HTMLButtonElement> {
+	const dialog = await theDialog();
+	const btn = [...dialog.querySelectorAll('button')].find((b) => name.test((b.textContent ?? '').trim()));
+	expect(btn, `modal button matching ${name} should exist`).toBeTruthy();
+	return btn as HTMLButtonElement;
+}
+
+/** Drive the real page to a picked archive whose header declares plaintext. Consent is NOT granted
+ *  here — each test owns the modal click. */
 async function pickPlaintextBackup(r: Rendered) {
 	getSettingsMock.mockResolvedValue(OK_SETTINGS);
 	peekBackupMock.mockResolvedValue(false);
@@ -136,39 +152,48 @@ async function pickPlaintextBackup(r: Rendered) {
 	await tick();
 }
 
-/** The message of the FIRST confirm the flow reached — the page's only channel to the user for
- *  this warning is the native dialog, so "the warning was shown" is pinned on its copy. */
-function firstConfirmMessage(): string {
-	return String(confirmMock.mock.calls[0]?.[0] ?? '');
-}
-
 describe('QURATOR-275 — plaintext header ⇒ unencrypted-file warning + explicit consent', () => {
-	it('declining the unencrypted-file warning stops the restore: nothing validates, wipes or commits', async () => {
-		confirmMock.mockResolvedValue(false);
+	it('declining the unencrypted-file modal stops the restore: nothing validates, wipes or commits', async () => {
 		const r = renderSettings();
 		await pickPlaintextBackup(r);
 
-		await waitFor(() => expect(confirmMock).toHaveBeenCalledTimes(1));
-		// The dialog the user just declined is the UNENCRYPTED-FILE warning — not doRestore()'s
-		// generic "replaces all current data" confirm. Under the pre-fix code no first dialog
+		// The dialog the user sees is the UNENCRYPTED-FILE warning — title and body, not
+		// doRestore()'s generic "replaces all data" modal. Under the pre-fix code no first dialog
 		// exists at all, so this is the assertion the mutation reds.
-		expect(firstConfirmMessage()).toMatch(/not encrypted/i);
-		// The restore never started: no validation, no wipe, no commit, no second dialog.
+		const dialog = await theDialog();
+		expect(dialog.querySelector('.modal-title')?.textContent).toMatch(/unencrypted backup/i);
+		expect(dialog.textContent).toMatch(/no passphrase/i);
+		// Decline it.
+		await fireEvent.click(await modalButton(/^cancel$/i));
+		await tick();
+
+		// The restore never started: no validation, no wipe, no commit.
 		expect(validateBackupMock).not.toHaveBeenCalled();
 		expect(wipeDataMock).not.toHaveBeenCalled();
 		expect(restoreDataMock).not.toHaveBeenCalled();
-		expect(confirmMock).toHaveBeenCalledTimes(1);
+		// The modal is gone and nothing re-armed it.
+		await waitFor(() => expect(document.querySelector('[role="dialog"]')).toBeNull());
+		expect((r.getByRole('button', { name: /restore from backup/i }) as HTMLButtonElement).disabled).toBe(false);
 	});
 
 	it('a genuine plaintext backup stays restorable — after confirmation, with null (no passphrase demanded)', async () => {
-		confirmMock.mockResolvedValue(true);
 		const r = renderSettings();
 		await pickPlaintextBackup(r);
 
+		// Consent is the unencrypted-file modal first (title "Unencrypted backup", body names the
+		// missing passphrase); grant it via "Restore anyway".
+		const dialog = await theDialog();
+		expect(dialog.querySelector('.modal-title')?.textContent).toMatch(/unencrypted backup/i);
+		expect(dialog.textContent).toMatch(/no passphrase/i);
+		await fireEvent.click(await modalButton(/^restore anyway$/i));
+		await tick();
+		// …then doRestore's own replace-all consent modal (two consents, exactly like the old
+		// native flow). Grant it too.
+		const dialog2 = await theDialog();
+		expect(dialog2.textContent).toMatch(/replaces all data on this device/i);
+		await fireEvent.click(await modalButton(/^restore$/i));
+
 		await waitFor(() => expect(wipeDataMock).toHaveBeenCalledTimes(1), { timeout: 4000 });
-		// Consent was the unencrypted-file warning first; the generic replace-all confirm second.
-		expect(firstConfirmMessage()).toMatch(/not encrypted/i);
-		expect(confirmMock).toHaveBeenCalledTimes(2);
 		// Informed consent, not a credential: the restore proceeds with null — a plaintext archive
 		// must not be asked for a passphrase it cannot check (QURATOR-228 made that an error).
 		expect(validateBackupMock).toHaveBeenCalledWith(null, BACKUP_PATH);
@@ -181,14 +206,13 @@ describe('QURATOR-275 — plaintext header ⇒ unencrypted-file warning + explic
 		expect(restoreAt).toBeGreaterThan(wipeAt);
 	});
 
-	it('an encrypted archive is untouched: the passphrase form appears directly, with no new dialog interposed', async () => {
+	it('an encrypted archive is untouched: the passphrase form appears directly, with no dialog before the consent modal', async () => {
 		getSettingsMock.mockResolvedValue(OK_SETTINGS);
 		peekBackupMock.mockResolvedValue(true);
 		validateBackupMock.mockResolvedValue(undefined);
 		wipeDataMock.mockResolvedValue(undefined);
 		restoreDataMock.mockResolvedValue({ npub: 'npub1restored', npub_short: 'npub1res…', share_code: 'hbk1y', key_storage: 'plain-file' });
 		openMock.mockResolvedValue(BACKUP_PATH);
-		confirmMock.mockResolvedValue(true);
 		primeIdentity();
 		const r = renderSettings();
 
@@ -197,19 +221,23 @@ describe('QURATOR-275 — plaintext header ⇒ unencrypted-file warning + explic
 		await tick();
 
 		// The existing encrypted flow: passphrase form shown (peekBackup said encrypted), and
-		// pickRestore itself asked NOTHING — the only confirm so far is doRestore()'s own.
+		// pickRestore itself asked NOTHING — no dialog yet.
 		const passInput = document.querySelector<HTMLInputElement>('input[placeholder="Backup passphrase"]');
 		if (!passInput) throw new Error('restore passphrase input should be visible');
-		expect(confirmMock).not.toHaveBeenCalled();
+		expect(document.querySelector('[role="dialog"]')).toBeNull();
 
 		await fireEvent.input(passInput, { target: { value: 'correct-horse-battery' } });
 		await tick();
 		await fireEvent.click(r.getByRole('button', { name: /^restore$/i }));
 		await tick();
 
+		// doRestore's consent modal — its copy is the "replaces all data" body, not the plaintext
+		// warning (that modal only belongs to the plaintext path).
+		const dialog = await theDialog();
+		expect(dialog.textContent).toMatch(/replaces all data on this device/i);
+		await fireEvent.click(await modalButton(/^restore$/i));
+
 		await waitFor(() => expect(validateBackupMock).toHaveBeenCalledTimes(1), { timeout: 4000 });
 		expect(validateBackupMock).toHaveBeenCalledWith('correct-horse-battery', BACKUP_PATH);
-		expect(firstConfirmMessage()).toMatch(/replaces all current data/i);
-		expect(confirmMock).toHaveBeenCalledTimes(1);
 	});
 });

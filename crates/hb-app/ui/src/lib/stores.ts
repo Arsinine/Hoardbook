@@ -105,6 +105,121 @@ export function seedSentFromFeed(feed: readonly ReceivedMessage[], myNpub: strin
 
 export const toastMessage = writable<{ text: string; kind: 'success' | 'error'; action?: ToastAction } | null>(null);
 
+// ── QURATOR-379 — error toasts ──────────────────────────────────────────────────────
+// Errors no longer share the single slot with success/Undo. They stack: one bottom-anchored
+// column, oldest at the bottom, each new one directly above the newest existing one. Each error
+// keeps its OWN 15s timer (from when IT appeared — a newer error never resets an older one's) and
+// its own ✕. This reverses the devtest 2026-08-26 item-7 "errors are sticky" ruling, while
+// keeping its reason: a short timeout was unreadable, and 15s answers that.
+export const errorToasts = writable<{ id: number; text: string }[]>([]);
+let errorSeq = 0;
+// Per-id timers at module scope (a single shared timer would expire the wrong toast).
+const errorTimers = new Map<number, ReturnType<typeof setTimeout>>();
+
+/** The error lifetime. 15s: the owner's call — errors must be readable, and the old 3.5s was
+ *  why they went sticky in the first place. */
+export const TOAST_ERROR_MS = 15000;
+
+/** How many errors the stack holds. When a 6th arrives the oldest is dropped. (Lane default, not
+ *  the owner's number — picked so a burst cannot fill the window.) */
+const ERROR_STACK_MAX = 5;
+
+function scheduleError(id: number) {
+	const prev = errorTimers.get(id);
+	if (prev) clearTimeout(prev);
+	errorTimers.set(id, setTimeout(() => removeError(id), TOAST_ERROR_MS));
+}
+
+function removeError(id: number) {
+	const t = errorTimers.get(id);
+	if (t) { clearTimeout(t); errorTimers.delete(id); }
+	errorToasts.update((list) => list.filter((e) => e.id !== id));
+}
+
+/** Dismiss one error from the stack (its ✕). Safe to call with an unknown id. */
+export function dismissError(id: number) {
+	removeError(id);
+}
+
+function pushError(text: string) {
+	// Same text already on screen: collapse — restart THAT toast's 15s and move it to the top.
+	const dup = get(errorToasts).find((e) => e.text === text);
+	if (dup) {
+		errorToasts.update((list) => [...list.filter((e) => e.id !== dup.id), dup]);
+		scheduleError(dup.id);
+		return;
+	}
+	const id = ++errorSeq;
+	errorToasts.update((list) => {
+		// Cap: a 6th error evicts the oldest (and clears its timer, so it cannot fire later).
+		if (list.length >= ERROR_STACK_MAX) {
+			const oldest = list[0]!;
+			const t = errorTimers.get(oldest.id);
+			if (t) { clearTimeout(t); errorTimers.delete(oldest.id); }
+			list = list.slice(1);
+		}
+		return [...list, { id, text }];
+	});
+	scheduleError(id);
+}
+
+// M22 W6: the toast timer is tracked so a second toast REPLACES the live one (chosen over queueing —
+// a queue risks undoing the wrong operation, and a stale handler firing against changed state is the
+// exact failure the tracker rules out). A replace clears the first toast's timer so it can't kill the
+// second early. This is the single source of truth: both toast() and toastWithAction() route through it.
+let toastTimer: ReturnType<typeof setTimeout> | undefined;
+// Devtest 2026-08-26 item 7: success durations DOUBLED — 3500 and 6000 were too short to finish
+// reading. Errors no longer use these at all — they live in the errorToasts stack (above) with
+// their own TOAST_ERROR_MS lifetime.
+const TOAST_MS = 7000;
+const TOAST_ACTION_MS = 12000; // undo needs more time to be usable
+
+function clearToastTimer() {
+	if (toastTimer) { clearTimeout(toastTimer); toastTimer = undefined; }
+}
+
+/** Dismiss the single-slot toast (the ✕ on an error-kind action toast). Safe to call when nothing
+ *  is showing. */
+export function dismissToast() {
+	clearToastTimer();
+	toastMessage.set(null);
+}
+
+export function toast(text: string, kind: 'success' | 'error' = 'success') {
+	if (kind === 'error') {
+		pushError(text);
+		return;
+	}
+	clearToastTimer();
+	toastMessage.set({ text, kind });
+	toastTimer = setTimeout(() => { toastMessage.set(null); toastTimer = undefined; }, TOAST_MS);
+}
+
+/** Toast with an optional action button (M22 W6 undo). When the action fires, the toast clears
+ *  immediately and the timer is cancelled so the handler can't fire twice. When the toast expires,
+ *  the action is discarded — no stale handler survives against changed state. A second toast (with or
+ *  without action) REPLACES the live one rather than queueing. Errors with actions stay on the
+ *  single slot (no production caller emits one today — kept for type parity, and an Undo-shaped
+ *  escape hatch must always render). */
+export function toastWithAction(
+	text: string,
+	action: { label: string; run: () => void },
+	kind: 'success' | 'error' = 'success',
+) {
+	// An Undo always renders on the single slot — the error stack never displaces it.
+	clearToastTimer();
+	toastMessage.set({ text, kind, action: { label: action.label, run: () => {
+		clearToastTimer();
+		toastMessage.set(null);
+		action.run();
+	} } });
+	if (kind === 'error') {
+		toastTimer = setTimeout(() => { toastMessage.set(null); toastTimer = undefined; }, TOAST_ERROR_MS);
+		return;
+	}
+	toastTimer = setTimeout(() => { toastMessage.set(null); toastTimer = undefined; }, TOAST_ACTION_MS);
+}
+
 /** True once the layout's initial data fetch has completed. */
 export const appReady = writable(false);
 
@@ -136,79 +251,6 @@ export const announceSeen = writable<Record<string, number>>({});
  *  half: a FAILED fetch leaves whatever is on screen alone — never blank, never a confident
  *  "no Topics" over data we already had. */
 export const topicDirectoryCache = writable<DiscoveredTopic[]>([]);
-
-// M22 W6: the toast timer is tracked so a second toast REPLACES the live one (chosen over queueing —
-// a queue risks undoing the wrong operation, and a stale handler firing against changed state is the
-// exact failure the tracker rules out). A replace clears the first toast's timer so it can't kill the
-// second early. This is the single source of truth: both toast() and toastWithAction() route through it.
-let toastTimer: ReturnType<typeof setTimeout> | undefined;
-// Devtest 2026-08-26 item 7 (owner follow-up): both success durations DOUBLED — 3500 and 6000 were
-// too short to finish reading. Errors don't use these at all any more; they are sticky.
-const TOAST_MS = 7000;
-const TOAST_ACTION_MS = 12000; // undo needs more time to be usable
-
-function clearToastTimer() {
-	if (toastTimer) { clearTimeout(toastTimer); toastTimer = undefined; }
-}
-
-/** Devtest 2026-08-26 item 7 — an ERROR toast never auto-expires. Errors are the messages the user
- *  has to READ (the manifest-too-big one is three sentences and names a byte count and a menu path),
- *  and 3.5s is not enough to read them; the owner reported the text "disappears too quickly to be
- *  read". A sticky toast is dismissed by the ✕ the layout renders for it, via dismissToast(). Success
- *  toasts are unchanged: still TOAST_MS. */
-export function isStickyToast(kind: 'success' | 'error'): boolean {
-	return kind === 'error';
-}
-
-/** Dismiss the live toast (the ✕ on a sticky error). Safe to call when nothing is showing. */
-export function dismissToast() {
-	clearToastTimer();
-	toastMessage.set(null);
-}
-
-/** A PLAIN success toast must not silently replace a sticky error the user hasn't dismissed — that
- *  would reintroduce the exact "it vanished before I could read it" failure by another route. Errors
- *  still replace errors (newest wins), matching the replace-not-queue rule above.
- *
- *  ⚠ This is consulted by `toast()` ONLY, never by `toastWithAction()`, and the asymmetry is the
- *  whole point. An action-bearing toast is not feedback — it is the Undo affordance, and for a
- *  drag-to-group move it is the ONLY undo path there is (registerUndo, contacts/+page.svelte and
- *  browse/+page.svelte). Suppressing it would silently destroy the user's ability to reverse a
- *  write they just made, which is a strictly worse outcome than an error toast being replaced —
- *  they can re-trigger the failing action to see the error again, but they cannot re-summon an Undo
- *  that never rendered. Text feedback yields to an unread error; an escape hatch does not. */
-function blockedByStickyError(kind: 'success' | 'error'): boolean {
-	if (kind === 'error') return false;
-	return get(toastMessage)?.kind === 'error';
-}
-
-export function toast(text: string, kind: 'success' | 'error' = 'success') {
-	if (blockedByStickyError(kind)) return;
-	clearToastTimer();
-	toastMessage.set({ text, kind });
-	if (isStickyToast(kind)) return; // no timer — the ✕ is the only way out
-	toastTimer = setTimeout(() => { toastMessage.set(null); toastTimer = undefined; }, TOAST_MS);
-}
-
-/** Toast with an optional action button (M22 W6 undo). When the action fires, the toast clears
- *  immediately and the timer is cancelled so the handler can't fire twice. When the toast expires,
- *  the action is discarded — no stale handler survives against changed state. A second toast (with or
- *  without action) REPLACES the live one rather than queueing. */
-export function toastWithAction(
-	text: string,
-	action: { label: string; run: () => void },
-	kind: 'success' | 'error' = 'success',
-) {
-	// No blockedByStickyError() here — see the note on that function. An Undo always renders.
-	clearToastTimer();
-	toastMessage.set({ text, kind, action: { label: action.label, run: () => {
-		clearToastTimer();
-		toastMessage.set(null);
-		action.run();
-	} } });
-	if (isStickyToast(kind)) return; // sticky: the action stays live until the ✕ or the action itself
-	toastTimer = setTimeout(() => { toastMessage.set(null); toastTimer = undefined; }, TOAST_ACTION_MS);
-}
 
 // (The downloads store + applyDownloadEvent reducer were removed in v0.9.6 and did NOT come back with
 // M18's transport plane — that plane carries manifests only, INV-4′, so there is no download to track.)

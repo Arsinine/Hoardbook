@@ -100,7 +100,10 @@
 		color: var(--fg-muted);
 		background: var(--bg-elev3);
 		border: 1px solid var(--border-strong);
-		border-radius: var(--r-control, 7px);
+		/* Multi-line bubble — same precedent as .hb-textarea (app.css) and FeatureTooltip's .ft-tip:
+		   five themes set --r-control to 999px (pill controls), which turns a wrapping box into a
+		   stadium and clips its text. */
+		border-radius: min(var(--r-control, 7px), var(--r-card, 10px));
 		box-shadow: var(--shadow-pop);
 	}
 

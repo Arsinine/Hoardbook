@@ -15,7 +15,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, fireEvent, cleanup, waitFor } from '@testing-library/svelte';
 import SettingsPage from './+page.svelte';
-import { identity, profile, toastMessage } from '$lib/stores.js';
+import { identity, profile, toastMessage, errorToasts } from '$lib/stores.js';
 import { get } from 'svelte/store';
 
 const ME = 'npub1meeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
@@ -81,9 +81,8 @@ afterEach(() => {
 	vi.clearAllMocks();
 	identity.set(null);
 	profile.set(null);
-	// A sticky ERROR toast from a previous test otherwise blocks every later success toast
-	// (blockedByStickyError), making an unrelated test fail on store leakage, not on its own
-	// assertion.
+	// Errors no longer block success toasts (QURATOR-379 stack); the reset still matters so a
+	// leaked SUCCESS toast can't make an unrelated case's findByText match the previous toast.
 	toastMessage.set(null);
 });
 
@@ -137,7 +136,8 @@ describe('QURATOR-176 — one click clears the whole manifest cache', () => {
 		await waitFor(() => expect(btn.disabled).toBe(false));
 
 		await fireEvent.click(btn);
-		await waitFor(() => expect(get(toastMessage)?.kind).toBe('error'));
+		// Errors land in the errorToasts stack now (QURATOR-379), not the single slot.
+		await waitFor(() => expect(get(errorToasts).some((e) => /disk unavailable/.test(e.text))).toBe(true));
 
 		await waitFor(() => expect(btn.disabled).toBe(false));
 		expect(btn.textContent?.trim()).toBe('Clear cache');

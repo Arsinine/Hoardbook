@@ -14,12 +14,17 @@
 // wipeData was NEVER called" — proving an error merely *shown* would not. The mocks intercept
 // every destructive edge (wipeData, restoreData, relaunch), so nothing here can touch a real
 // store or a real ~/.hoardbook. Drive the real mounted page through the real DOM (pick file →
-// type passphrase → click Restore), not a source scan.
+// type passphrase → click Restore → consent in the IN-APP modal), not a source scan.
+//
+// QURATOR-379: consent is no longer the plugin's native confirm() — it is the page's in-app Modal
+// (askInApp). The plugin-dialog mock below carries NO `confirm` export: if production ever
+// regresses to the native dialog, the call hits `undefined` and this file reds loudly (fail-closed,
+// not a silent mockResolvedValue(true) that would grant a regression).
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, fireEvent, cleanup, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import SettingsPage from './+page.svelte';
-import { identity, profile, toastMessage } from '$lib/stores.js';
+import { identity, profile, toastMessage, errorToasts, dismissError } from '$lib/stores.js';
 import { get } from 'svelte/store';
 
 const ME = 'npub1meeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
@@ -54,18 +59,17 @@ vi.mock('$lib/api.js', () => ({
 	dmUnblock: vi.fn().mockResolvedValue(undefined),
 }));
 
+// NO `confirm` export — see the header note: a production regression to the native dialog fails
+// LOUDLY here instead of being silently granted.
 vi.mock('@tauri-apps/plugin-dialog', () => ({
 	open: vi.fn(),
 	save: vi.fn(),
-	// The confirm dialog is the explicit "this replaces all current data" consent step; the test
-	// grants it so the flow reaches the code under test rather than bailing at the prompt.
-	confirm: vi.fn().mockResolvedValue(true),
 }));
 vi.mock('@tauri-apps/plugin-process', () => ({ relaunch: vi.fn().mockResolvedValue(undefined) }));
 vi.mock('@tauri-apps/api/app', () => ({ getVersion: vi.fn().mockResolvedValue('0.0.0') }));
 
 import { getSettings, peekBackup, restoreData, validateBackup, wipeData } from '$lib/api.js';
-import { open as openFileDialog, confirm as confirmDialog } from '@tauri-apps/plugin-dialog';
+import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { relaunch } from '@tauri-apps/plugin-process';
 
 const getSettingsMock = getSettings as unknown as ReturnType<typeof vi.fn>;
@@ -75,7 +79,6 @@ const validateBackupMock = validateBackup as unknown as ReturnType<typeof vi.fn>
 const wipeDataMock = wipeData as unknown as ReturnType<typeof vi.fn>;
 const relaunchMock = relaunch as unknown as ReturnType<typeof vi.fn>;
 const openMock = openFileDialog as unknown as ReturnType<typeof vi.fn>;
-const confirmMock = confirmDialog as unknown as ReturnType<typeof vi.fn>;
 
 const OK_SETTINGS = {
 	relay_urls: ['wss://relay.example.com'],
@@ -94,6 +97,9 @@ afterEach(() => {
 	vi.clearAllMocks();
 	identity.set(null);
 	profile.set(null);
+	toastMessage.set(null);
+	// The error stack (QURATOR-379) is module state with 15s timers — clear it between tests.
+	for (const e of get(errorToasts)) dismissError(e.id);
 });
 
 function primeIdentity() {
@@ -110,13 +116,22 @@ function primeIdentity() {
 type Rendered = ReturnType<typeof renderSettings>;
 const renderSettings = () => render(SettingsPage);
 
+/** The consent dialog is the page's IN-APP Modal (role=dialog). Scope to it so the page's own
+ *  Restore/Cancel buttons underneath can never match. */
+async function modalButton(name: RegExp): Promise<HTMLButtonElement> {
+	await waitFor(() => expect(document.querySelector('[role="dialog"]')).toBeTruthy());
+	const dialog = document.querySelector('[role="dialog"]')!;
+	const btn = [...dialog.querySelectorAll('button')].find((b) => name.test((b.textContent ?? '').trim()));
+	expect(btn, `modal button matching ${name} should exist`).toBeTruthy();
+	return btn as HTMLButtonElement;
+}
+
 async function driveToRestoreForm(r: Rendered) {
 	getSettingsMock.mockResolvedValue(OK_SETTINGS);
 	peekBackupMock.mockResolvedValue(true);
 	wipeDataMock.mockResolvedValue(undefined);
 	restoreDataMock.mockResolvedValue({ npub: 'npub1restored', npub_short: 'npub1res…', share_code: 'hbk1y', key_storage: 'plain-file' });
 	openMock.mockResolvedValue(BACKUP_PATH);
-	confirmMock.mockResolvedValue(true);
 	relaunchMock.mockResolvedValue(undefined);
 	primeIdentity();
 
@@ -140,6 +155,10 @@ async function driveRestore(r: Rendered) {
 	await driveToRestoreForm(r);
 	await fireEvent.click(r.getByRole('button', { name: /^restore$/i }));
 	await tick();
+	// QURATOR-379: grant consent in the IN-APP modal (the OK button reads "Restore"; the
+	// page's own "Restore from backup" button lives outside the dialog and can't match).
+	await fireEvent.click(await modalButton(/^restore$/i));
+	await tick();
 }
 
 describe('QURATOR-126 — validate the backup BEFORE wiping (INV-8)', () => {
@@ -158,13 +177,10 @@ describe('QURATOR-126 — validate the backup BEFORE wiping (INV-8)', () => {
 		// validating a DIFFERENT archive than the one you then wipe for would be a lookalike guard.
 		expect(validateBackupMock).toHaveBeenCalledWith('correct-horse-battery', BACKUP_PATH);
 
-		// The user is told why, via the page's existing toast(String(e), 'error') pattern.
-		// Read the store with `get`, as q100-picture-error-toast.test.ts does — a manual
-		// subscribe/unsub leaves TS narrowing `msg` to `null` (the callback write is invisible
-		// to control-flow analysis), which vitest runs happily and svelte-check rejects.
+		// The user is told why, via the page's existing toast(String(e), 'error') pattern — the
+		// QURATOR-379 error stack now.
 		await waitFor(() => {
-			expect(get(toastMessage)?.text).toContain('wrong passphrase');
-			expect(get(toastMessage)?.kind).toBe('error');
+			expect(get(errorToasts).some((e) => e.text.includes('wrong passphrase'))).toBe(true);
 		});
 
 		// `restoring` went back to false: the button reads "Restore from backup", not "Restoring…".
@@ -206,6 +222,9 @@ describe('QURATOR-126 — validate the backup BEFORE wiping (INV-8)', () => {
 
 		await fireEvent.click(r.getByRole('button', { name: /^restore$/i }));
 		await tick();
+		// Grant consent (in-app modal) to reach the validate-pending state.
+		await fireEvent.click(await modalButton(/^restore$/i));
+		await tick();
 		await waitFor(() => expect(validateBackupMock).toHaveBeenCalledTimes(1));
 
 		// Mid-flight edit: the input is still mounted, the user retypes the passphrase.
@@ -230,10 +249,14 @@ describe('QURATOR-126 — validate the backup BEFORE wiping (INV-8)', () => {
 
 		await fireEvent.click(r.getByRole('button', { name: /^restore$/i }));
 		await tick();
+		// Grant consent (in-app modal) to reach the validate-pending state.
+		await fireEvent.click(await modalButton(/^restore$/i));
+		await tick();
 		await waitFor(() => expect(validateBackupMock).toHaveBeenCalledTimes(1));
 
-		// Cancel mid-validation. The old handler nulled `restorePath`; the restore half then ran
-		// `restoreData(pass, null)` after the wipe.
+		// Cancel mid-validation (the page's form Cancel, under the modal — jsdom clicks land on
+		// the node regardless of overlay). The old handler nulled `restorePath`; the restore half
+		// then ran `restoreData(pass, null)` after the wipe.
 		await fireEvent.click(r.getByRole('button', { name: /^cancel$/i }));
 		await tick();
 		releaseValidate(undefined);
@@ -244,40 +267,43 @@ describe('QURATOR-126 — validate the backup BEFORE wiping (INV-8)', () => {
 		expect(restoreDataMock).toHaveBeenCalledWith('correct-horse-battery', BACKUP_PATH);
 	});
 
-	it('two rapid clicks produce exactly ONE wipeData — `restoring` is a re-entry guard, not a label (two overlapping confirms = two destructive flows)', async () => {
+	it('two rapid clicks produce exactly ONE wipeData — `restoring` is a re-entry guard, not a label (two overlapping consents = two destructive flows)', async () => {
 		validateBackupMock.mockResolvedValue(undefined);
 		const r = render(SettingsPage);
 		await driveToRestoreForm(r);
 
 		const restoreBtn = r.getByRole('button', { name: /^restore$/i }) as HTMLButtonElement;
-		// Both clicks land while `confirm` is still pending — i.e. before either invocation could
-		// have set `restoring` under the old ordering. mockResolvedValue defers the resolution to
-		// a microtask, so the two synchronous clicks genuinely overlap the dialog await.
+		// Both clicks land before the first one can have opened the consent modal and set
+		// `restoring`: `restoring = true` runs synchronously BEFORE the askInApp await, so the
+		// guard rejects the second click outright — exactly one dialog, one grant, one flow.
 		await fireEvent.click(restoreBtn);
 		await fireEvent.click(restoreBtn);
 		await tick();
+		await fireEvent.click(await modalButton(/^restore$/i));
+		await tick();
 
 		await waitFor(() => expect(wipeDataMock).toHaveBeenCalledTimes(1), { timeout: 4000 });
-		// Exactly one destructive flow: one confirm-consented wipe, one restore.
+		// Exactly one destructive flow: one consented wipe, one restore.
 		expect(wipeDataMock).toHaveBeenCalledTimes(1);
 		expect(restoreDataMock).toHaveBeenCalledTimes(1);
 		expect(validateBackupMock).toHaveBeenCalledTimes(1);
 	});
 
-	it('declining the confirm dialog leaves the UI usable — `restoring` resets, so the Restore button is not permanently locked', async () => {
+	it('declining the IN-APP consent modal leaves the UI usable — `restoring` resets, so the Restore button is not permanently locked', async () => {
 		validateBackupMock.mockResolvedValue(undefined);
 		const r = render(SettingsPage);
 		await driveToRestoreForm(r);
-		// Stage AFTER driveToRestoreForm — it sets confirmMock to `true` itself and would silently
-		// overwrite a decline staged before render (same trap the header comment pins for validate).
-		confirmMock.mockResolvedValue(false);
 		await fireEvent.click(r.getByRole('button', { name: /^restore$/i }));
 		await tick();
+		// Decline on the modal itself — its Cancel, scoped to the dialog.
+		await fireEvent.click(await modalButton(/^cancel$/i));
+		await tick();
 
-		await waitFor(() => expect(confirmMock).toHaveBeenCalledTimes(1));
 		expect(wipeDataMock).not.toHaveBeenCalled();
 		expect(validateBackupMock).not.toHaveBeenCalled();
 		// `restoring` went back to false on the decline path: the Restore button re-enables.
-		await waitFor(() => expect((r.getByRole('button', { name: /^restore$/i }) as HTMLButtonElement).disabled).toBe(false));
+		await waitFor(() => expect((r.getByRole('button', { name: /^restore from backup$/i }) as HTMLButtonElement).disabled).toBe(false));
+		// The modal is gone.
+		expect(document.querySelector('[role="dialog"]')).toBeNull();
 	});
 });

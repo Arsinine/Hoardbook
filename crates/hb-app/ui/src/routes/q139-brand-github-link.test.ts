@@ -35,7 +35,7 @@ vi.mock('$app/stores', () => stubPage);
 vi.mock('$app/navigation', () => ({ goto: vi.fn() }));
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }));
 // The layout's own Tauri-module touchpoints, stubbed so nothing dereferences
-// window.__TAURI_INTERNALS__ (absent in jsdom) — the same set error-toast-sticky.test.ts stubs,
+// window.__TAURI_INTERNALS__ (absent in jsdom) — the same set toast-stack.test.ts stubs,
 // which is the repo's established pattern for mounting the layout shell.
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock('@tauri-apps/api/app', () => ({ getVersion: vi.fn(async () => '0.18.0') }));

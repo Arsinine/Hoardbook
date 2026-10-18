@@ -22,7 +22,7 @@ import { render, cleanup, fireEvent, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { get } from 'svelte/store';
 import HomePage from './+page.svelte';
-import { identity, profile, collections, appReady, homeDraft, identityLoadError, toastMessage } from '$lib/stores.js';
+import { identity, profile, collections, appReady, homeDraft, identityLoadError, toastMessage, errorToasts } from '$lib/stores.js';
 import { setAutopublishDebounceForTests } from '$lib/profile-autopublish.js';
 import type { IdentityInfo, Profile } from '$lib/types.js';
 
@@ -209,10 +209,9 @@ describe('QURATOR-138 — My Profile publishes by default', () => {
 		await tick();
 
 		await waitFor(() => expect(publishMock).toHaveBeenCalled(), { timeout: 2000 });
+		// Errors land in the errorToasts stack now (QURATOR-379), not the single slot.
 		await waitFor(() => {
-			const t = get(toastMessage);
-			expect(t?.kind).toBe('error');
-			expect(t?.text).toMatch(/all relays unreachable/);
+			expect(get(errorToasts).some((e) => /all relays unreachable/.test(e.text))).toBe(true);
 		}, { timeout: 2000 });
 		// The edit was NOT lost with the publish: the local save ran (immediately + in the publish
 		// path), and the profile store holds the edited value.
@@ -232,8 +231,10 @@ describe('QURATOR-138 — My Profile publishes by default', () => {
 		await tick();
 		await waitFor(() => expect(publishMock).toHaveBeenCalled(), { timeout: 2000 });
 		await wait(60);
-		const t = get(toastMessage);
-		expect(t?.kind).toBe('error'); // error, never a success toast for a failed publish
+		// Errors land in the errorToasts stack now (QURATOR-379); a failed publish is never a
+		// success toast on the single slot.
+		expect(get(toastMessage)?.kind).not.toBe('success');
+		expect(get(errorToasts).some((e) => /relay rejected/.test(e.text))).toBe(true);
 	}, 15000);
 });
 

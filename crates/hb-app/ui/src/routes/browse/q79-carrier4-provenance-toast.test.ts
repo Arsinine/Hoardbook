@@ -126,8 +126,9 @@ afterEach(() => {
 	cleanup();
 	vi.clearAllMocks();
 	contacts.set([]);
-	// A sticky ERROR toast would block later SUCCESS toasts (stores.ts: blockedByStickyError),
-	// so the store must be reset between cases or test order changes the outcome.
+	// Errors live in the errorToasts stack now (QURATOR-379) and no longer block success toasts;
+	// the reset still matters so a leaked SUCCESS toast can't make an unrelated case's findByText
+	// match the previous test's toast.
 	toastMessage.set(null);
 });
 

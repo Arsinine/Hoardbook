@@ -1,11 +1,12 @@
 <script lang="ts">
 	import '../app.css';
 	import { onMount } from 'svelte';
+	import { flip } from 'svelte/animate';
 	import { get } from 'svelte/store';
 	import { page } from '$app/stores';
 	import { getIdentity, getProfile, getCollections, getContacts, getMessages, getReadState, topicAnnouncements, topicAnnounceSeen, openRepoPage, getSettings } from '$lib/api.js';
 	import { DEFAULT_THEME, type ThemeId } from '$lib/themes/themes.js';
-	import { identity, profile, inboxMessages, readWatermarks, toastMessage, appReady, toast, dismissToast, isStickyToast, identityLoadError, topicAnnounceSummaries, announceSeen, seedSentFromFeed, loadCollectionsInto, loadContactsInto } from '$lib/stores.js';
+	import { identity, profile, inboxMessages, readWatermarks, toastMessage, errorToasts, appReady, toast, dismissToast, dismissError, identityLoadError, topicAnnounceSummaries, announceSeen, seedSentFromFeed, loadCollectionsInto, loadContactsInto } from '$lib/stores.js';
 	import { isOurDrag } from '$lib/drag-group.js';
 	import { totalUnread, unreadByPeer } from '$lib/unread-view.js';
 	// QURATOR-340 — OS-level taskbar attention for unread chat (deliberately NOT on $lib/api.js:
@@ -28,6 +29,11 @@
 	let { children }: Props = $props();
 
 	let appVersion = $state('');
+
+	// QURATOR-379 — prefers-reduced-motion: `animate:flip` is JS-driven, so the media query moves
+	// into JS (FeatureTooltip's equivalent is a CSS transition). 0ms under reduce, 200ms otherwise.
+	const reduceMotion =
+		typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 	onMount(() => {
 		// Async init (IIFE so onMount can return a sync cleanup function).
@@ -293,23 +299,35 @@
 	</div>
 </div>
 
-<!-- Toast (M22 W6: the Undo button renders only when an action is present — conditional, never unconditional) -->
-{#if $toastMessage}
-	<div
-		class="toast hb-raised"
-		class:toast-error={$toastMessage.kind === 'error'}
-		class:toast-sticky={isStickyToast($toastMessage.kind)}
-		role={$toastMessage.kind === 'error' ? 'alert' : 'status'}
-	>
-		<span class="toast-text">{$toastMessage.text}</span>
-		{#if $toastMessage.action}
-			<button type="button" class="toast-action" onclick={$toastMessage.action.run}>{$toastMessage.action.label}</button>
+<!-- Toasts — QURATOR-379: errors stack in one bottom-anchored column (oldest at the bottom, each
+     new one above the last, each with its own 15s timer and ✕; removal slides the rest down via
+     animate:flip). Success/Undo keep the single replace-not-queue slot and render at the bottom of
+     the same column, under the error stack. (M22 W6: the Undo button renders only when an action
+     is present — conditional, never unconditional.) -->
+{#if $errorToasts.length > 0 || $toastMessage}
+	<div class="toast-stack">
+		{#if $toastMessage}
+			<div
+				class="toast hb-raised"
+				class:toast-error={$toastMessage.kind === 'error'}
+				role={$toastMessage.kind === 'error' ? 'alert' : 'status'}
+			>
+				<span class="toast-text">{$toastMessage.text}</span>
+				{#if $toastMessage.action}
+					<button type="button" class="toast-action" onclick={$toastMessage.action.run}>{$toastMessage.action.label}</button>
+				{/if}
+				{#if $toastMessage.kind === 'error'}
+					<!-- An error-kind toast still has its 15s timer; the ✕ is the early way out. -->
+					<button type="button" class="toast-dismiss" aria-label="Dismiss" onclick={dismissToast}>&#10005;</button>
+				{/if}
+			</div>
 		{/if}
-		{#if isStickyToast($toastMessage.kind)}
-			<!-- Devtest item 7: a sticky error has no timer, so this X is the ONLY way to close it. It
-			     renders for EVERY error toast, never conditionally on the message text. -->
-			<button type="button" class="toast-dismiss" aria-label="Dismiss" onclick={dismissToast}>&#10005;</button>
-		{/if}
+		{#each $errorToasts as err (err.id)}
+			<div class="toast toast-error hb-raised" role="alert" animate:flip={{ duration: reduceMotion ? 0 : 200 }}>
+				<span class="toast-text">{err.text}</span>
+				<button type="button" class="toast-dismiss" aria-label="Dismiss" onclick={() => dismissError(err.id)}>&#10005;</button>
+			</div>
+		{/each}
 	</div>
 {/if}
 
@@ -537,11 +555,25 @@
 		padding-right: 120px;
 	}
 
-	.toast {
+	/* QURATOR-379 — one bottom-anchored column for every toast. Errors stack above the
+	   success/Undo slot, newest visually on top (the DOM holds arrival order; column-reverse
+	   puts the FIRST child at the bottom). The container owns position; toasts are ordinary
+	   flex children so animate:flip can move them when one leaves the middle of the stack. */
+	.toast-stack {
 		position: fixed;
 		bottom: 16px;
 		right: 16px;
 		z-index: var(--z-toast);
+		display: flex;
+		flex-direction: column-reverse;
+		align-items: flex-end;
+		gap: 8px;
+		max-width: min(420px, calc(100vw - 32px));
+		/* The column itself never catches clicks — only its toasts do. */
+		pointer-events: none;
+	}
+
+	.toast {
 		padding: 8px 14px;
 		border-radius: var(--r-card, 8px);
 		font-size: 12.5px;
@@ -551,23 +583,19 @@
 		border: 1px solid var(--border-strong);
 		/* QURATOR-352 — was `0 8px 24px oklch(0 0 0 / 0.4)`, tokenised for the themes fan-out. */
 		box-shadow: var(--shadow-pop);
-		/* Devtest item 7: errors are multi-sentence (the manifest one names a byte count and a menu
-		   path). Without a ceiling the toast stretched to the window width and read as one long line;
-		   cap it and let the text wrap. flex-start keeps the buttons on the FIRST line of wrapped text. */
+		/* Errors are multi-sentence (the manifest one names a byte count and a menu path). The
+		   stack's max-width caps them; flex-start keeps the buttons on the FIRST line of wrapped
+		   text. */
 		display: flex;
 		align-items: flex-start;
 		gap: 10px;
-		max-width: min(420px, calc(100vw - 32px));
+		max-width: 100%;
+		pointer-events: auto;
 	}
 
 	.toast-text {
 		line-height: 1.45;
 		min-width: 0;
-	}
-
-	/* A sticky toast waits for the X, so it can be read at leisure — give it a little more room. */
-	.toast-sticky {
-		padding: 10px 12px 10px 14px;
 	}
 
 	.toast-dismiss {

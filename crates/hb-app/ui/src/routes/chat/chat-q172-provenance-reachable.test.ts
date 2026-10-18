@@ -33,7 +33,7 @@ import { render, cleanup, waitFor, fireEvent } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import ChatPage from './+page.svelte';
 import { get } from 'svelte/store';
-import { identity, contacts, inboxMessages, sentMessages, readWatermarks, toastMessage } from '$lib/stores.js';
+import { identity, contacts, inboxMessages, sentMessages, readWatermarks, toastMessage, errorToasts, dismissError } from '$lib/stores.js';
 
 const { ME, PEER, SERVER } = vi.hoisted(() => ({
 	ME: 'npub1meeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
@@ -92,6 +92,9 @@ afterEach(() => {
 	sentMessages.set([]);
 	readWatermarks.set({});
 	toastMessage.set(null);
+	// The error stack (QURATOR-379) is module state with 15s timers — clear it so one test's
+	// error can't satisfy the next test's toast wait.
+	for (const e of get(errorToasts)) dismissError(e.id);
 });
 
 const TICKET_JSON = JSON.stringify({
@@ -134,8 +137,16 @@ async function redeemThroughThePage(
 	await fireEvent.click(getByText(PREVIEW_TEXT));
 	await tick();
 	await waitFor(() => expect(redeemMock).toHaveBeenCalled());
-	await waitFor(() => expect(get(toastMessage)).not.toBeNull());
-	return get(toastMessage);
+	// The redeem toast may be SUCCESS (single slot) or ERROR (the QURATOR-379 stack) — the stale
+	// case below is an error. Read whichever surface fired; callers assert on text and kind.
+	await waitFor(() => {
+		const e = get(errorToasts)[0];
+		expect(get(toastMessage) ?? (e ? { text: e.text, kind: 'error' } : null)).not.toBeNull();
+	});
+	const t = get(toastMessage);
+	if (t) return t;
+	const e = get(errorToasts)[0]!;
+	return { text: e.text, kind: 'error' as const };
 }
 
 describe('QURATOR-172 #1 — provenance from the redeem path actually reaches a toast', () => {

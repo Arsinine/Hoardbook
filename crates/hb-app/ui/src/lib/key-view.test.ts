@@ -14,17 +14,14 @@ function id(storage: 'os-encrypted' | 'plain-file'): IdentityInfo {
 	};
 }
 
-describe('settings key-view', () => {
-	it('key_view_renders_npub_share_code_and_storage_status', () => {
+describe('settings key-view (QURATOR-379 shape)', () => {
+	// MUTATION (P-10): in key-view.ts, change the return to
+	// `{ showStorageWarning: !plainFile }` (invert) — the first test reds on the false branch,
+	// the second on the true branch.
+	it('key_view_reports_only_the_storage_status', () => {
 		const v = keyView(id('os-encrypted'));
-		const labels = v.rows.map((r) => r.label);
-		expect(labels).toContain('Your npub');
-		expect(labels).toContain('Share code');
-		// The browse-key is never a standalone row — only inside the (sensitive) share code.
-		expect(labels).not.toContain('Browse key');
-		expect(v.rows.find((r) => r.label === 'Share code')?.sensitive).toBe(true);
-		expect(v.storageLabel).toBe('Encrypted by your OS');
-		expect(v.noRecoveryNotice).toMatch(/no reset if you lose it/i);
+		// The rows/noRecoveryNotice surface is gone with the share-code row (QURATOR-379).
+		expect(v).toEqual({ showStorageWarning: false });
 	});
 
 	it('linux_storage_warning_shown_when_plain_file', () => {
