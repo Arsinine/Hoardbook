@@ -655,7 +655,7 @@
 				</button>
 				<button class="btn-ghost btn-full ob-skip" onclick={() => obStep = 1}>← Back</button>
 			{:else if obStep === 3}
-				<div class="ob-card-title">How sharing works</div>
+				<div class="ob-card-title">Passing it on</div>
 				<div class="ob-card-sub">Collections you browse are kept on this device. When someone else asks for one, Hoardbook sends them your copy in the background. This can't be turned off.</div>
 				<div class="ob-notice">
 					<span class="ob-notice-icon">{@html icons.shield}</span>

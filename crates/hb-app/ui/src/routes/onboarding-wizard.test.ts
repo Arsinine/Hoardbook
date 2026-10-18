@@ -65,7 +65,7 @@ describe('onboarding wizard', () => {
 		await fireEvent.click(await r.findByText("I'll do it later"));
 		await fireEvent.click(await r.findByText('Skip'));
 
-		await r.findByText('How sharing works');
+		await r.findByText('Passing it on');
 		expect(r.getByText('Step 3 of 4')).toBeTruthy();
 		expect(r.getByText(/sends them your copy in the background/)).toBeTruthy();
 		expect(saveSettingsMock).not.toHaveBeenCalled();
@@ -158,7 +158,7 @@ describe('onboarding wizard', () => {
 		await r.findByText('Add your first collection');
 
 		await fireEvent.click(r.getByText('← Back'));
-		await r.findByText('How sharing works');
+		await r.findByText('Passing it on');
 		await fireEvent.click(r.getByText('← Back'));
 		await r.findByText('Name yourself');
 		await fireEvent.click(r.getByText('← Back'));

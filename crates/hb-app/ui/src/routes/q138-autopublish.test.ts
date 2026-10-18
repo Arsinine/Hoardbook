@@ -122,7 +122,7 @@ describe('QURATOR-138 — My Profile publishes by default', () => {
 		identityLoadError.set(null);
 		appReady.set(true);
 		const { getByRole, getByPlaceholderText } = render(HomePage);
-		await fireEvent.click(getByRole('button', { name: /generate my hoardbook identity/i }));
+		await fireEvent.click(getByRole('button', { name: /create a new key/i }));
 		await waitFor(() => expect(getByRole('button', { name: /i'll do it later/i })).toBeTruthy());
 		await fireEvent.click(getByRole('button', { name: /i'll do it later/i }));
 		const name = getByPlaceholderText(/DataHoarder_42/i) as HTMLInputElement;
