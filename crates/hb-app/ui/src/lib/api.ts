@@ -65,7 +65,12 @@ export const shareCodeInfo = (code: string) =>
 
 /** Import an existing Nostr secret key (`nsec`/hex). The UI must show the linking-privacy warning
  *  first (there is no offline oracle to detect a public/Qurator npub). */
-export const importNsec = (nsec: string) => invoke<IdentityInfo>('import_nsec', { nsec });
+/** `password` is required for a NIP-49 `ncryptsec1…` key and ignored otherwise. */
+export const importNsec = (nsec: string, password?: string) =>
+	invoke<IdentityInfo>('import_nsec', { nsec, password: password || null });
+
+/** A pasted key is NIP-49 password-protected and needs its password to import. */
+export const isEncryptedKey = (key: string) => key.trim().startsWith('ncryptsec1');
 
 /** Export a portable whole-`~/.hoardbook` backup to `path`. `passphrase = null` is the plaintext
  *  export (behind a blunt warning); a passphrase encrypts with Argon2id → XChaCha20-Poly1305. */

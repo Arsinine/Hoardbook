@@ -9,13 +9,13 @@ import {
 } from './onboarding.js';
 
 describe('onboarding wizard — step resolution (ported to npub)', () => {
-	it('wizard_not_shown_if_identity_exists: identity present → step 4', () => {
-		expect(resolveInitialStep({ npub: 'npub1abc' }).obStep).toBe(4);
+	it('wizard_not_shown_if_identity_exists: identity present → step 5', () => {
+		expect(resolveInitialStep({ npub: 'npub1abc' }).obStep).toBe(5);
 	});
 
-	it('wizard_not_shown_if_identity_exists: identity with no profile also → step 4', () => {
+	it('wizard_not_shown_if_identity_exists: identity with no profile also → step 5', () => {
 		// Skipped step 2 on first launch; relaunch must not re-show the wizard.
-		expect(resolveInitialStep({ npub: 'npub1xyz' }).obStep).toBe(4);
+		expect(resolveInitialStep({ npub: 'npub1xyz' }).obStep).toBe(5);
 	});
 
 	it('no identity → step 1 (wizard shown)', () => {

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { generateKeypair, getSettings, saveSettings, importNsec, backupData, peekBackup, restoreData, validateBackup, wipeData, clearManifestCache, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, hasPublishedProfile, publishProfile, copyDiagnostics, revealLogFolder, natClassification, dmBlockedList, dmUnblock, dmBlock, validateShareCode, shareCodeInfo } from '$lib/api.js';
+	import { generateKeypair, getSettings, saveSettings, importNsec, isEncryptedKey, backupData, peekBackup, restoreData, validateBackup, wipeData, clearManifestCache, checkRelay, relayStatus, beaconStatus, checkUpdate, downloadUpdate, applyStagedUpdate, takeUpdateNotice, updaterIsPortable, checkPortableUpdate, applyPortableUpdate, hasPublishedProfile, publishProfile, copyDiagnostics, revealLogFolder, natClassification, dmBlockedList, dmUnblock, dmBlock, validateShareCode, shareCodeInfo } from '$lib/api.js';
 	import type { Settings, UpdateInfo, PortableUpdateInfo, BeaconReport, NatClassification } from '$lib/api.js';
 	import { keyView } from '$lib/key-view.js';
 	import { shortNpub } from '$lib/contact-display.js';
@@ -161,15 +161,16 @@
 	// ── Import a different Nostr key (always warns about linking) ─────────────────
 	let importOpen = $state(false);
 	let importNsecValue = $state('');
+	let importPassword = $state('');   // only for a NIP-49 ncryptsec key
 	let importWarnAck = $state(false);
 	let importingNsec = $state(false);
 
 	async function handleImportNsec() {
 		importingNsec = true;
 		try {
-			const info = await importNsec(importNsecValue.trim());
+			const info = await importNsec(importNsecValue.trim(), importPassword);
 			identity.set(info);
-			importOpen = false; importNsecValue = ''; importWarnAck = false;
+			importOpen = false; importNsecValue = ''; importPassword = ''; importWarnAck = false;
 			toast('Nostr key imported');
 		} catch (e) { toast(String(e), 'error'); }
 		finally { importingNsec = false; }
@@ -851,21 +852,23 @@
 						<div class="toggle-label">Import an existing Nostr key</div>
 						<div class="toggle-sub">Replaces this identity. Wipe data first if you already have one.</div>
 					</div>
-					<button class="btn-default btn-sm" onclick={() => (importOpen = true)}>Import nsec</button>
+					<button class="btn-default btn-sm" onclick={() => (importOpen = true)}>Import key</button>
 				</div>
 			{:else}
 				<div class="link-warn">
-					{@html icons.key} <strong>Linking warning:</strong> importing a key you use publicly, in
-					Qurator, or anywhere else ties that identity to your Hoardbook activity. Anyone who knows
-					the key will know this is you.
+					{@html icons.key} <strong>Your Nostr profile will be linked to your Hoardbook activity.</strong>
+					Anyone who knows your npub can see both.
 				</div>
 				<label class="ack-row"><input type="checkbox" bind:checked={importWarnAck} /> I understand.</label>
-				<input class="hb-input hb-mono" type="password" placeholder="nsec1…" bind:value={importNsecValue} />
+				<input class="hb-input hb-mono" type="password" placeholder="nsec1… or ncryptsec1…" aria-label="Nostr key" bind:value={importNsecValue} />
+				{#if isEncryptedKey(importNsecValue)}
+					<input class="hb-input" type="password" placeholder="Key password" aria-label="Key password" bind:value={importPassword} />
+				{/if}
 				<div style="display:flex; gap:8px;">
-					<button class="btn-primary btn-sm" onclick={handleImportNsec} disabled={!importWarnAck || !importNsecValue.trim() || importingNsec}>
+					<button class="btn-primary btn-sm" onclick={handleImportNsec} disabled={!importWarnAck || !importNsecValue.trim() || (isEncryptedKey(importNsecValue) && !importPassword) || importingNsec}>
 						{importingNsec ? 'Importing…' : 'Import key'}
 					</button>
-					<button class="btn-ghost btn-sm" onclick={() => { importOpen = false; importNsecValue = ''; importWarnAck = false; }}>Cancel</button>
+					<button class="btn-ghost btn-sm" onclick={() => { importOpen = false; importNsecValue = ''; importPassword = ''; importWarnAck = false; }}>Cancel</button>
 				</div>
 			{/if}
 		</div>

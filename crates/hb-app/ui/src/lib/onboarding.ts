@@ -6,7 +6,7 @@ import type { IdentityInfo } from './types.js';
 /** Wizard step resolution. Identity existence alone suppresses the wizard ("absent on all
  *  subsequent launches"); now keyed on `npub`, not the retired `hb_id`. */
 export function resolveInitialStep(identity: Pick<IdentityInfo, 'npub'> | null): { obStep: number } {
-	if (identity) return { obStep: 4 };
+	if (identity) return { obStep: 5 };
 	return { obStep: 1 };
 }
 

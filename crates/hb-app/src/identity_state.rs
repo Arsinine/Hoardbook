@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use hb_core::{Identity, ShareCode};
 use nostr::prelude::ToBech32;
 use nostr::PublicKey;
@@ -86,15 +86,39 @@ impl AppIdentity {
     /// a **fresh** account browse-key + transport secret are minted (both are regenerable and need
     /// not — must not — be carried in from elsewhere). Distinct from the whole-directory restore
     /// path. A malformed key is a reasoned `Err`, never a panic.
+    ///
+    /// The error is the user-facing message itself (the command shows only the outermost one), so
+    /// it says what to paste instead of echoing the parser's bech32/hex detail.
     pub fn from_nsec(nsec: &str) -> Result<Self> {
-        let identity = Identity::from_secret(nsec)
-            .map_err(|e| anyhow!(e.to_string()))
-            .context("parsing the imported Nostr secret key")?;
-        Ok(Self {
+        let nsec = nsec.trim();
+        if nsec.is_empty() {
+            bail!("Paste your Nostr secret key.");
+        }
+        if nsec.starts_with("npub1") {
+            bail!("That's your public key (npub). Paste your secret key: nsec1… or ncryptsec1….");
+        }
+        let identity = Identity::from_secret(nsec).map_err(|_| {
+            anyhow!("Not a valid Nostr secret key. It should start with nsec1 or ncryptsec1.")
+        })?;
+        Ok(Self::from_imported(identity))
+    }
+
+    /// Import a NIP-49 password-protected key (`ncryptsec1…`). Same fresh-key minting as
+    /// [`Self::from_nsec`]; only the parse differs. Slow (scrypt) — call off the async runtime.
+    pub fn from_ncryptsec(ncryptsec: &str, password: &str) -> Result<Self> {
+        // No `.context()`: the command surfaces only the outermost message, and the user needs
+        // the reason ("wrong password…"), not a generic wrapper.
+        let identity =
+            Identity::from_encrypted_secret(ncryptsec, password).map_err(|e| anyhow!(e.to_string()))?;
+        Ok(Self::from_imported(identity))
+    }
+
+    fn from_imported(identity: Identity) -> Self {
+        Self {
             identity,
             browse_key: SessionBrowseKey::new(rand::random()),
             transport_key: SessionTransportKey::new(rand::random()),
-        })
+        }
     }
 
     /// Reconstruct from the on-disk record.

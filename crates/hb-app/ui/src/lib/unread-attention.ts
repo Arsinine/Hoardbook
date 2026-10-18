@@ -2,7 +2,7 @@
 //
 // This lives OUTSIDE lib/api.ts deliberately: six existing tests mount +layout.svelte with a fixed
 // vi.mock('$lib/api.js') factory (layout-listen-catch, error-toast-sticky, q81-window-chrome,
-// q139-brand-github-link, layout-serving-notice, q100-picture-error-toast). A new export on
+// q139-brand-github-link, layout-no-startup-dialog, q100-picture-error-toast). A new export on
 // $lib/api.js would be `undefined` under those mocks, and the layout's new $effect would call
 // undefined() inside its effect — crashing every one of those mounts. A separate module keeps their
 // mocks untouched: under them the REAL module loads, its isTauri guard rejects outside Tauri, and

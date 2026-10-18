@@ -29,6 +29,17 @@ impl Identity {
         Ok(Self { keys: Keys::parse(secret).map_err(nostr_err)? })
     }
 
+    /// Load an identity from a NIP-49 password-protected key (`ncryptsec1…`). The scrypt cost is
+    /// capped at nostr's `MAX_LOG_N` (~256 MiB), so a hostile paste cannot demand unbounded memory.
+    /// Slow by design (scrypt): callers on an async runtime should run it on a blocking thread.
+    pub fn from_encrypted_secret(ncryptsec: &str, password: &str) -> Result<Self, HbError> {
+        let encrypted = EncryptedSecretKey::from_bech32(ncryptsec).map_err(nostr_err)?;
+        let secret = encrypted.decrypt(password).map_err(|_| {
+            HbError::Nostr("wrong password, or the ncryptsec key is damaged".into())
+        })?;
+        Ok(Self { keys: Keys::new(secret) })
+    }
+
     /// Wrap a raw `Keys` as an identity. Used by the §11 Topics public-join path, where the
     /// "redeemer" of a public-join credential is a **deterministic keypair derived from the topic
     /// name** (any joiner derives the same keys), not a real person — so the seal-opening machinery
@@ -124,6 +135,31 @@ mod tests {
         let mut event = a.sign(EventBuilder::new(Kind::TextNote, "x")).unwrap();
         event.pubkey = b.public_key();
         assert!(verify_event(&event).is_err());
+    }
+
+    /// The NIP-49 spec vector (also nostr 0.44.8's own): password "nostr" decrypts to this key.
+    const NIP49_VECTOR: &str = "ncryptsec1qgg9947rlpvqu76pj5ecreduf9jxhselq2nae2kghhvd5g7dgjtcxfqtd67p9m0w57lspw8gsq6yphnm8623nsl8xn9j4jdzz84zm3frztj3z7s35vpzmqf6ksu8r89qk5z2zxfmu5gv8th8wclt0h4p";
+    const NIP49_SECRET_HEX: &str = "3501454135014541350145413501453fefb02227e449e57cf4d3a3ce05378683";
+
+    #[test]
+    fn from_encrypted_secret_decrypts_the_nip49_vector() {
+        // MUTATION (P-10): in `from_encrypted_secret`, replace `Keys::new(secret)` with
+        // `Keys::generate()` — this test reds (the npub no longer matches the vector's key).
+        let id = Identity::from_encrypted_secret(NIP49_VECTOR, "nostr").unwrap();
+        let expected = Identity::from_secret(NIP49_SECRET_HEX).unwrap();
+        assert_eq!(id.public_key(), expected.public_key());
+    }
+
+    #[test]
+    fn from_encrypted_secret_wrong_password_is_a_reasoned_error() {
+        let err = Identity::from_encrypted_secret(NIP49_VECTOR, "not-the-password").err().unwrap();
+        assert!(err.to_string().contains("wrong password"), "got {err}");
+    }
+
+    #[test]
+    fn from_encrypted_secret_rejects_a_plain_nsec() {
+        let nsec = Identity::generate().keys().secret_key().to_bech32().unwrap();
+        assert!(Identity::from_encrypted_secret(&nsec, "x").is_err());
     }
 
     #[test]

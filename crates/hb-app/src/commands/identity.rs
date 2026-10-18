@@ -78,9 +78,10 @@ pub async fn generate_keypair(
     Ok(info)
 }
 
-/// Import an existing Nostr secret key (`nsec`/hex): validate it, derive the matching `npub`, and
-/// mint a fresh iroh key + browse-key. Refuses if an identity already exists (wipe-first). The
-/// `nsec` is held in a zeroize-on-drop buffer for the call.
+/// Import an existing Nostr secret key (`nsec`/hex, or a NIP-49 `ncryptsec` with its `password`):
+/// validate it, derive the matching `npub`, and mint a fresh iroh key + browse-key. Refuses if an
+/// identity already exists (wipe-first). The key and password are held in zeroize-on-drop buffers
+/// for the call.
 ///
 /// The UI must surface the de-pseudonymization implication of linking a public/Qurator `npub`
 /// **before** invoking this — there is no offline oracle to detect a "public" key, so the UI
@@ -88,11 +89,27 @@ pub async fn generate_keypair(
 #[tauri::command]
 pub async fn import_nsec(
     nsec: String,
+    password: Option<String>,
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
 ) -> CmdResult<IdentityInfo> {
     let nsec = Zeroizing::new(nsec);
-    let app_id = import_nsec_inner(&store, &nsec).map_err(cmd_err)?;
+    let password = password.map(Zeroizing::new);
+    // Refuse an occupied profile before paying for an ncryptsec's scrypt; `import_inner` re-checks.
+    if store.load_identity().map_err(cmd_err)?.is_some() {
+        return Err("An identity already exists. Wipe data first to import a different key.".into());
+    }
+    let parsed = if nsec.trim_start().starts_with("ncryptsec1") {
+        let pw = password.ok_or_else(|| "This key is password-protected. Enter its password.".to_string())?;
+        // scrypt is deliberately slow (up to ~256 MiB, ~1 s); keep it off the async worker.
+        tokio::task::spawn_blocking(move || AppIdentity::from_ncryptsec(nsec.trim(), &pw))
+            .await
+            .map_err(cmd_err)?
+            .map_err(|_| anyhow::anyhow!("Wrong password, or the key is damaged."))
+    } else {
+        AppIdentity::from_nsec(&nsec)
+    };
+    let app_id = import_inner(&store, parsed.map_err(cmd_err)?).map_err(cmd_err)?;
     let info = IdentityInfo::from_identity(&app_id).map_err(cmd_err)?;
 
     *identity.write().await = Some(app_id);
@@ -101,11 +118,16 @@ pub async fn import_nsec(
 
 /// Tauri-free import seam: validate the nsec, mint fresh transport/browse keys, persist (re-wrap at
 /// rest). Refuses when an identity already exists. Drives the L1 tests.
+#[cfg(test)]
 pub fn import_nsec_inner(store: &DataStore, nsec: &str) -> anyhow::Result<AppIdentity> {
+    import_inner(store, AppIdentity::from_nsec(nsec)?)
+}
+
+/// Persist an already-parsed imported identity. Refuses when an identity already exists.
+fn import_inner(store: &DataStore, app_id: AppIdentity) -> anyhow::Result<AppIdentity> {
     if store.load_identity()?.is_some() {
         anyhow::bail!("An identity already exists. Wipe data first to import a different key.");
     }
-    let app_id = AppIdentity::from_nsec(nsec)?;
     store.save_identity(&app_id.to_stored()?)?;
     Ok(app_id)
 }
@@ -421,9 +443,36 @@ mod tests {
     fn import_malformed_nsec_rejected_with_reason() {
         let (_dir, store) = test_store();
         // AppIdentity holds secrets and is intentionally not Debug, so inspect the Err side directly.
+        // The outermost message is all the user sees, so it must say what to paste — not the old
+        // bare "parsing the imported Nostr secret key" wrapper.
+        // MUTATION (P-10): in identity_state.rs `from_nsec`, put back
+        // `.map_err(|e| anyhow!(e.to_string())).context("parsing the imported Nostr secret key")?`
+        // in place of the `map_err(|_| anyhow!("Not a valid…"))?` — this test reds.
         let err = import_nsec_inner(&store, "not-a-valid-nsec").err().expect("malformed key is refused");
-        assert!(!err.to_string().is_empty(), "rejection carries a reason");
+        assert_eq!(
+            err.to_string(),
+            "Not a valid Nostr secret key. It should start with nsec1 or ncryptsec1."
+        );
         assert!(store.load_identity().unwrap().is_none(), "nothing persisted on a bad key");
+    }
+
+    #[test]
+    fn import_npub_instead_of_nsec_says_so() {
+        let (_dir, store) = test_store();
+        let npub = AppIdentity::generate().npub();
+        let err = import_nsec_inner(&store, &npub).err().expect("an npub is not a secret key");
+        assert!(err.to_string().starts_with("That's your public key (npub)."), "got {err}");
+        let err = import_nsec_inner(&store, "   ").err().expect("blank is refused");
+        assert_eq!(err.to_string(), "Paste your Nostr secret key.");
+        assert!(store.load_identity().unwrap().is_none());
+    }
+
+    #[test]
+    fn import_nsec_tolerates_surrounding_whitespace() {
+        let (_dir, store) = test_store();
+        let source = AppIdentity::generate();
+        let imported = import_nsec_inner(&store, &format!("\n {} \n", nsec_of(&source))).unwrap();
+        assert_eq!(imported.npub(), source.npub());
     }
 
     #[test]
@@ -627,6 +676,7 @@ mod tests {
             let incumbent = app.state::<DataStore>().load_identity().unwrap().unwrap();
             let err = import_nsec(
                 nsec_of(&AppIdentity::generate()),
+                None,
                 app.state::<DataStore>(),
                 app.state::<SharedIdentity>(),
             )
@@ -644,6 +694,67 @@ mod tests {
             assert_eq!(
                 after.browse_key_hex, incumbent.browse_key_hex,
                 "nor its browse-key"
+            );
+        }
+
+        // -- import_nsec: NIP-49 `ncryptsec` keys ----------------------------------------------
+
+        /// The NIP-49 spec vector: password "nostr" decrypts to `NIP49_SECRET_HEX`.
+        const NIP49_VECTOR: &str = "ncryptsec1qgg9947rlpvqu76pj5ecreduf9jxhselq2nae2kghhvd5g7dgjtcxfqtd67p9m0w57lspw8gsq6yphnm8623nsl8xn9j4jdzz84zm3frztj3z7s35vpzmqf6ksu8r89qk5z2zxfmu5gv8th8wclt0h4p";
+        const NIP49_SECRET_HEX: &str = "3501454135014541350145413501453fefb02227e449e57cf4d3a3ce05378683";
+
+        /// A password-protected key imports through the command: decrypted, persisted, and the
+        /// shared identity populated with the key's own npub.
+        #[tokio::test]
+        async fn import_nsec_command_accepts_an_ncryptsec_with_its_password() {
+            // MUTATION (P-10): in `import_nsec`, change the `starts_with("ncryptsec1")` test to
+            // `starts_with("ncryptsec2")` — this test reds (the ncryptsec falls through to the
+            // plain-nsec parser and is refused).
+            let app = guard_app(false);
+            let info = import_nsec(
+                format!("  {NIP49_VECTOR}  "),
+                Some("nostr".into()),
+                app.state::<DataStore>(),
+                app.state::<SharedIdentity>(),
+            )
+            .await
+            .expect("a correct password must import");
+            let expected = AppIdentity::from_nsec(NIP49_SECRET_HEX).unwrap().npub();
+            assert_eq!(info.npub, expected);
+            let stored = AppIdentity::from_stored(
+                &app.state::<DataStore>().load_identity().unwrap().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(stored.npub(), expected, "persisted, and reloads to the same npub");
+            assert!(app.state::<SharedIdentity>().read().await.is_some());
+        }
+
+        /// No password, or the wrong one: refused with a reason, and nothing is written.
+        #[tokio::test]
+        async fn import_nsec_command_refuses_an_ncryptsec_without_the_right_password() {
+            let app = guard_app(false);
+            let missing = import_nsec(
+                NIP49_VECTOR.into(),
+                None,
+                app.state::<DataStore>(),
+                app.state::<SharedIdentity>(),
+            )
+            .await
+            .unwrap_err();
+            assert!(missing.contains("password-protected"), "got {missing}");
+
+            let wrong = import_nsec(
+                NIP49_VECTOR.into(),
+                Some("not-the-password".into()),
+                app.state::<DataStore>(),
+                app.state::<SharedIdentity>(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(wrong, "Wrong password, or the key is damaged.");
+            assert!(
+                app.state::<DataStore>().load_identity().unwrap().is_none(),
+                "a refused import persists nothing"
             );
         }
 

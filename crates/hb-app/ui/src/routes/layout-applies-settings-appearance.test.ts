@@ -6,7 +6,7 @@
 // whatever the boot script painted from the localStorage mirror, and a stale glass:false mirror
 // meant the flush, square glass-off layout no matter what Settings said.
 //
-// Mounted layout (same shell as layout-serving-notice.test.ts). The mirror is seeded with the
+// Mounted layout (same shell as layout-no-startup-dialog.test.ts). The mirror is seeded with the
 // OPPOSITE of Settings, so only the Settings pass can produce the asserted attributes.
 // P-10 MUTATION (orchestrator): in +layout.svelte delete the line
 // `applyAppearance({ theme: (s.theme ?? DEFAULT_THEME) as ThemeId, glass: s.glass ?? true });` → REDS.

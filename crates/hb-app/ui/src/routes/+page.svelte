@@ -1,8 +1,9 @@
 <script lang="ts">
-	import { saveProfile, publishProfile, publishCollection, deleteCollection, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec, collectionSourceAccessible, getCollections } from '$lib/api.js';
+	import { saveProfile, publishProfile, publishCollection, deleteCollection, getShareSettings, generateKeypair, hasPublishedProfile, backupData, importNsec, isEncryptedKey, collectionSourceAccessible, getCollections } from '$lib/api.js';
 	// M18 W5 note (QURATOR-138): Home's export entry point is deleted; MANIFEST_EXPORTED_TOAST
 	// stays in $lib/manifest-fulfil.js, still used by Chat's fulfil path.
 	import { passphraseStrength } from '$lib/backup-export.js';
+	import { acknowledgeServingNotice } from '$lib/serving-notice.js';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { profile, collections, identity, toast, appReady, homeDraft, identityLoadError, collectionsLoadError, loadCollectionsInto } from '$lib/stores.js';
 	import { onMount, onDestroy } from 'svelte';
@@ -36,12 +37,13 @@
 
 
 	// ── Onboarding state ────────────────────────────────────────────────────────
-	// 0=loading, 1=keypair, 2=name, 3=collection (skippable), 4=done
+	// 0=loading, 1=keypair, 2=name, 3=sharing, 4=collection (skippable), 5=done
 	let obStep = $state(0);
 	let obGenerating = $state(false);
 	let obKeypairRevealed = $state(false); // true after generation: show npub + share code + backup prompt
 	let importOverlayOpen = $state(false); // linking-warning overlay before importing an existing nsec
 	let obImportNsec = $state('');
+	let obImportPassword = $state('');     // only for a NIP-49 ncryptsec key
 	let obImportWarnAck = $state(false);
 	let obImporting = $state(false);
 	let obBackupPass = $state('');        // passphrase for the post-generate portable backup
@@ -88,14 +90,22 @@
 	async function obImportExistingKey() {
 		obImporting = true;
 		try {
-			const info = await importNsec(obImportNsec.trim());
+			const info = await importNsec(obImportNsec.trim(), obImportPassword);
 			identity.set(info);
 			importOverlayOpen = false;
 			obImportNsec = '';
+			obImportPassword = '';
 			obImportWarnAck = false;
 			obKeypairRevealed = true;
 		} catch (e) { toast(String(e), 'error'); }
 		finally { obImporting = false; }
+	}
+
+	// QURATOR-164 baseline disclosure, shown as a wizard step instead of a startup dialog. Never
+	// blocks: the step advances even if the settings write fails.
+	function obAckSharing() {
+		obStep = 4;
+		acknowledgeServingNotice().catch(() => { });
 	}
 
 	async function obSaveName() {
@@ -455,7 +465,7 @@
 	let obBackupStrength = $derived(passphraseStrength(obBackupPass));
 	$effect(() => {
 		if ($appReady && obStep === 0) {
-			if ($identity) obStep = 4;
+			if ($identity) obStep = 5;
 			else if (!$identityLoadError) obStep = 1;
 			// identityLoadError set: stay at 0; the error screen is shown in the template.
 		}
@@ -571,7 +581,7 @@
 			</div>
 		</div>
 	{/if}
-{:else if obStep < 4}
+{:else if obStep < 5}
 	<!-- Onboarding flow -->
 	<div class="onboarding">
 		<div class="ob-logo">
@@ -586,27 +596,28 @@
 		</div>
 		<div class="ob-card">
 			<div class="ob-card-head">
-				<span class="sect-label">Step {obStep} of 3</span>
+				<span class="sect-label">Step {obStep} of 4</span>
 				<div class="ob-dots">
 					<div class="ob-dot" class:ob-dot-active={obStep === 1} class:ob-dot-done={obStep > 1}></div>
 					<div class="ob-dot" class:ob-dot-active={obStep === 2} class:ob-dot-done={obStep > 2}></div>
 					<div class="ob-dot" class:ob-dot-active={obStep === 3} class:ob-dot-done={obStep > 3}></div>
+					<div class="ob-dot" class:ob-dot-active={obStep === 4} class:ob-dot-done={obStep > 4}></div>
 				</div>
 			</div>
 
 			{#if obStep === 1}
 				{#if !obKeypairRevealed}
-					<div class="ob-card-title">Create your identity</div>
-					<div class="ob-card-sub">Hoardbook uses a Nostr key (your <span class="mono">npub</span>) as your identity. No email, no server account. It is stored encrypted on this device and never sent to a server.</div>
+					<div class="ob-card-title">Your identity</div>
+					<div class="ob-card-sub">Hoardbook identifies you by a Nostr key. Create a new one, or use the one you already have.</div>
 					<div class="ob-notice">
 						<span class="ob-notice-icon">{@html icons.shield}</span>
-						<div class="ob-notice-text">Your key is stored locally and never transmitted. It can't be recovered if lost, so back it up in the next step.</div>
+						<div class="ob-notice-text">Your key is stored encrypted on this device. It can't be recovered if lost.</div>
 					</div>
 					<button class="btn-primary btn-full" onclick={obGenerateKeypair} disabled={obGenerating}>
-						{obGenerating ? 'Generating…' : 'Generate my Hoardbook identity'}
+						{obGenerating ? 'Creating…' : 'Create a new key'}
 					</button>
-					<button class="btn-ghost btn-full ob-skip" style="margin-top:8px" onclick={() => { importOverlayOpen = true; }}>
-						Already have a Nostr key? Import
+					<button class="btn-default btn-full" style="margin-top:8px" onclick={() => { importOverlayOpen = true; }}>
+						Use my Nostr key
 					</button>
 				{:else}
 					<div class="ob-card-title">Your identity is ready</div>
@@ -642,42 +653,50 @@
 				<button class="btn-primary btn-full" onclick={obSaveName} disabled={saving}>
 					{saving ? 'Saving…' : form.display_name.trim() ? 'Continue →' : 'Skip'}
 				</button>
-				<button class="btn-ghost btn-full ob-skip" onclick={() => obStep = 3}>
-					Skip
-				</button>
+				<button class="btn-ghost btn-full ob-skip" onclick={() => obStep = 1}>← Back</button>
 			{:else if obStep === 3}
+				<div class="ob-card-title">How sharing works</div>
+				<div class="ob-card-sub">Collections you browse are kept on this device. When someone else asks for one, Hoardbook sends them your copy in the background. This can't be turned off.</div>
+				<div class="ob-notice">
+					<span class="ob-notice-icon">{@html icons.shield}</span>
+					<div class="ob-notice-text">To fetch and share more, turn on Settings → Fetch new collections automatically.</div>
+				</div>
+				<button class="btn-primary btn-full" onclick={obAckSharing}>Continue →</button>
+				<button class="btn-ghost btn-full ob-skip" onclick={() => obStep = 2}>← Back</button>
+			{:else if obStep === 4}
 				<div class="ob-card-title">Add your first collection</div>
 				<div class="ob-card-sub">Point Hoardbook at a folder to catalog what you keep. You can scan more folders later from the home screen.</div>
-				<button class="btn-primary btn-full" onclick={() => { openAddModal(); obStep = 4; }}>
+				<button class="btn-primary btn-full" onclick={() => { openAddModal(); obStep = 5; }}>
 					{@html icons.folder} Scan a folder
 				</button>
-				<button class="btn-ghost btn-full ob-skip" onclick={() => obStep = 4}>
+				<button class="btn-ghost btn-full ob-skip" onclick={() => obStep = 5}>
 					Skip for now
 				</button>
+				<button class="btn-ghost btn-full ob-skip" onclick={() => obStep = 3}>← Back</button>
 			{/if}
 		</div>
 	</div>
 
 	{#if importOverlayOpen}
-		<Modal open={true} title="Import an existing Nostr key" onclose={() => { importOverlayOpen = false; }}>
+		<Modal open={true} title="Use my Nostr key" onclose={() => { importOverlayOpen = false; }}>
 			<div class="ob-import-body">
 				<div class="ob-card-sub" style="margin-bottom:16px">
-					Paste your <span class="mono">nsec</span>. Hoardbook keeps the matching <span class="mono">npub</span>
-					as your identity and mints a fresh transport key + browse-key. Your secret key is stored
-					encrypted on this device and never sent to a server.
+					Paste your <span class="mono">nsec</span> or <span class="mono">ncryptsec</span>. It's stored encrypted on this device and never sent anywhere.
 				</div>
 				<div class="ob-notice">
 					<span class="ob-notice-icon">{@html icons.shield}</span>
-					<div class="ob-notice-text"><strong>Linking warning:</strong> importing a key you use publicly, in
-						Qurator, or anywhere else ties that identity to your Hoardbook activity. Anyone who knows
-						the key will know this is you.</div>
+					<div class="ob-notice-text"><strong>Your Nostr profile will be linked to your Hoardbook activity.</strong>
+						Anyone who knows your <span class="mono">npub</span> can see both.</div>
 				</div>
 				<label class="ob-ack"><input type="checkbox" bind:checked={obImportWarnAck} /> I understand.</label>
-				<input class="hb-input mono" style="margin-top:10px" type="password" placeholder="nsec1…" bind:value={obImportNsec} />
-				<button class="btn-primary btn-full" style="margin-top:10px" onclick={obImportExistingKey} disabled={!obImportWarnAck || !obImportNsec.trim() || obImporting}>
+				<input class="hb-input mono" style="margin-top:10px" type="password" placeholder="nsec1… or ncryptsec1…" aria-label="Nostr key" bind:value={obImportNsec} />
+				{#if isEncryptedKey(obImportNsec)}
+					<input class="hb-input" style="margin-top:8px" type="password" placeholder="Key password" aria-label="Key password" bind:value={obImportPassword} />
+				{/if}
+				<button class="btn-primary btn-full" style="margin-top:10px" onclick={obImportExistingKey} disabled={!obImportWarnAck || !obImportNsec.trim() || (isEncryptedKey(obImportNsec) && !obImportPassword) || obImporting}>
 					{obImporting ? 'Importing…' : 'Import key'}
 				</button>
-				<button class="btn-ghost btn-full ob-skip" onclick={() => { importOverlayOpen = false; obImportNsec = ''; obImportWarnAck = false; }}>
+				<button class="btn-ghost btn-full ob-skip" onclick={() => { importOverlayOpen = false; obImportNsec = ''; obImportPassword = ''; obImportWarnAck = false; }}>
 					Cancel
 				</button>
 			</div>

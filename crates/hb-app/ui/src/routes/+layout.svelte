@@ -18,7 +18,6 @@
 	import WindowControls from '$lib/components/WindowControls.svelte';
 	import { getVersion } from '@tauri-apps/api/app';
 	import { NAV_POLL_VISIBLE_MS, ANNOUNCE_POLL_VISIBLE_MS } from '$lib/poll-lifecycle.js';
-	import { showServingNoticeOnce } from '$lib/serving-notice.js';
 	// QURATOR-352 — the layout applies the persisted appearance once Settings resolve; the boot
 	// script (static/theme-boot.js) paints the mirror before this module ever loads.
 	import { applyAppearance, readMirroredAppearance } from '$lib/themes/apply.js';
@@ -83,10 +82,6 @@
 				.finally(() => { getMessages().then((m) => { inboxMessages.set(m); seedSentFromFeed(m, get(identity)?.npub ?? ''); }).catch(() => { }); });
 			// devtest #2: the announce-seen watermarks (local) — baselines the first alert poll.
 			topicAnnounceSeen().then((s) => announceSeen.set(s)).catch(() => { });
-			// QURATOR-164: the one-time baseline serving notice — informs, gates nothing. Every
-			// failure is swallowed by showServingNoticeOnce itself, so a broken settings read can
-			// never block startup; an unshown notice simply shows on the next launch.
-			showServingNoticeOnce().catch(() => { });
 		})();
 
 		// Update-available event from the backend background check.

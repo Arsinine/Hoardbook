@@ -16,8 +16,13 @@ pub async fn run(ctx: &Ctx) -> Vec<TestResult> {
         result("ID2 mangled npub/share-code rejected by codec", id2().await),
         result("ID3 forged binding rejected", id3(ctx).await),
         id4(ctx).await,
+        result("ID5 imported ncryptsec key signs as its own npub on a relay", id5(ctx).await),
     ]
 }
+
+/// The NIP-49 spec vector: password "nostr" decrypts to `NIP49_SECRET_HEX`.
+const NIP49_VECTOR: &str = "ncryptsec1qgg9947rlpvqu76pj5ecreduf9jxhselq2nae2kghhvd5g7dgjtcxfqtd67p9m0w57lspw8gsq6yphnm8623nsl8xn9j4jdzz84zm3frztj3z7s35vpzmqf6ksu8r89qk5z2zxfmu5gv8th8wclt0h4p";
+const NIP49_SECRET_HEX: &str = "3501454135014541350145413501453fefb02227e449e57cf4d3a3ce05378683";
 
 fn teaser() -> Teaser {
     Teaser {
@@ -74,6 +79,34 @@ async fn id2() -> Result<()> {
     for s in ["", "npub1", "hbk1", "not a code", "::::"] {
         ensure!(ShareCode::parse(s).is_err(), "{s:?} parsed as a share code");
     }
+    Ok(())
+}
+
+/// A key imported from a password-protected `ncryptsec` (how most Nostr clients export one) is the
+/// SAME identity on the wire: an event it signs round-trips through a real relay, verifies, and is
+/// found by an author filter on the vector's own pubkey. The relay is fed a fresh event per run,
+/// so the author filter is narrowed to it by content to stay independent of earlier runs.
+async fn id5(ctx: &Ctx) -> Result<()> {
+    let imported = Identity::from_encrypted_secret(NIP49_VECTOR, "nostr")?;
+    let expected = Identity::from_secret(NIP49_SECRET_HEX)?.public_key();
+    ensure!(imported.public_key() == expected, "ncryptsec decrypted to the wrong key");
+
+    let marker = format!("id5-{}", now());
+    let mut t = teaser();
+    t.bio = marker.clone();
+    let ev = build_teaser(&imported, &t, true)?;
+    let client = ctx.connect(&imported).await?;
+    client.publish(&ev).await?;
+    settle().await;
+    let got = client
+        .fetch(Filter::new().author(expected).kind(Kind::from_u16(KIND_TEASER)), FETCH_TIMEOUT)
+        .await?;
+    client.disconnect().await;
+
+    let mine: Vec<_> = got.iter().filter(|e| e.id == ev.id).collect();
+    ensure!(mine.len() == 1, "the imported key's event did not come back under its npub");
+    verify_event(mine[0])?;
+    ensure!(parse_teaser(mine[0])?.bio == marker, "teaser content changed in transit");
     Ok(())
 }
 

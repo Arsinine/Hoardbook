@@ -1,10 +1,8 @@
 // @vitest-environment jsdom
-// QURATOR-164 build item 4 — the BASELINE startup disclosure wiring. The pure predicate is unit-
-// tested in src/lib/serving-notice.test.ts; this file pins the RUNTIME half: on app start, when
-// the notice is unacknowledged, the real mounted layout shows it (via the OK-only `message`
-// dialog — a notice, not consent) and persists `serving_notice_acknowledged: true` through the
-// generic save_settings path with every other settings field intact. And when it IS already
-// acknowledged, no dialog and no save fire — "disclosed once", not every launch.
+// QURATOR-164 baseline disclosure: it used to be an OK-only dialog fired by the layout at app
+// start. Owner, 2026-10-18: a popup at launch reads as an error, so it moved into the onboarding
+// wizard (routes/onboarding-sharing-step.test.ts). This file pins the removal: an unacknowledged
+// user launching the app gets NO dialog from the layout.
 //
 // Mounting follows layout-listen-catch.test.ts / q139-brand-github-link.test.ts (the repo's
 // established layout-shell pattern: $app/stores + Tauri modules stubbed so nothing dereferences
@@ -77,33 +75,14 @@ afterEach(() => {
 	vi.clearAllMocks();
 });
 
-describe('QURATOR-164 — baseline serving notice fires once at app start', () => {
-	it('unacknowledged → the notice dialog shows and the flag persists with the whole settings object', async () => {
+describe('QURATOR-164 — no startup dialog', () => {
+	it('unacknowledged → the layout shows no dialog and writes no settings', async () => {
 		getSettingsMock.mockResolvedValue({ ...SETTINGS });
 		render(Layout, { children: emptyChildren });
 		await tick();
-
-		await vi.waitFor(() => expect(messageMock).toHaveBeenCalledTimes(1));
-		// The notice is the tier description, not a consent ask — assert it names what's happening.
-		expect(String(messageMock.mock.calls[0]![0])).toContain('pass things on');
-		// MUTATION (P-10): in src/lib/serving-notice.ts, in the `showServingNoticeOnce` function
-		// body, change `await saveSettings({ ...s, serving_notice_acknowledged: true });` to
-		// `await saveSettings({ ...s });` — this test reds on the flag assert below.
-		await vi.waitFor(() => expect(saveSettingsMock).toHaveBeenCalledTimes(1));
-		const saved = saveSettingsMock.mock.calls[0]![0];
-		expect(saved.serving_notice_acknowledged).toBe(true);
-		// The whole object rides along — the acknowledge write must not clobber any other field.
-		expect(saved.relay_urls).toEqual(['wss://relay.example.com']);
-		expect(saved.swarm_caching).toBe(false);
-	});
-
-	it('already acknowledged → no dialog, no save (disclosed once, not every launch)', async () => {
-		getSettingsMock.mockResolvedValue({ ...SETTINGS, serving_notice_acknowledged: true });
-		render(Layout, { children: emptyChildren });
-		await tick();
-		// MUTATION (P-10): in src/lib/serving-notice.ts, in the `showServingNoticeOnce` function
-		// body, delete the `if (!shouldShowServingNotice(s)) return;` early-out — this test reds:
-		// the dialog fires again on a user who already saw it.
+		// MUTATION (P-10): in routes/+layout.svelte, restore the startup call
+		// `message('x', { title: 'x' }).catch(() => { });` inside the onMount IIFE (import
+		// `message` from '@tauri-apps/plugin-dialog') — this test reds.
 		await new Promise((r) => setTimeout(r, 25));
 		expect(messageMock).not.toHaveBeenCalled();
 		expect(saveSettingsMock).not.toHaveBeenCalled();
