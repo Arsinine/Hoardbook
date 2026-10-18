@@ -46,6 +46,9 @@
 	// the FeatureTooltip registry is drift-guarded to exactly five keys, so a sixth is not the tool).
 	import HintMarker from '$lib/components/HintMarker.svelte';
 	import ConfirmButton from '$lib/components/ConfirmButton.svelte';
+	// QURATOR-381 — the conversation-row context menu reuses the ONE overflow-menu shell (same
+	// Escape + backdrop behaviour, same placement seam the ⋯ menus use).
+	import OverflowMenu from '$lib/components/OverflowMenu.svelte';
 	import { DM_POLL_VISIBLE_MS, CHANNEL_REFRESH_EVERY_TICKS } from '$lib/poll-lifecycle.js';
 	import { renderFingerprint } from '$lib/identity-display.js';
 	import { contactDisplayName } from '$lib/contact-display.js';
@@ -1023,6 +1026,20 @@
 		goto('/contacts');
 	}
 
+	// QURATOR-381 — the conversation-row CONTEXT menu (right-click, or Shift+F10 / the ContextMenu
+	// key on a focused row). Peer rows only: topic rows and the Requests row have no peer actions
+	// on this page to mirror (topic management lives on the Topics page), so they get none. Opening
+	// it SELECTS the conversation first — the same effect as clicking the row — because Block is
+	// wired through handleBlockPeer(), which reads the open selection. `at` is set only on the
+	// right-click path; the keyboard path anchors to the row instead. The peer is looked up from
+	// $contacts at render time so the menu never draws a stale roster snapshot.
+	let ctxMenu: { npub: string; at?: { x: number; y: number }; anchor: HTMLElement } | null = $state(null);
+
+	function openConvoCtxMenu(peer: CachedPeer | ContactSummary, at: { x: number; y: number } | undefined, anchor: HTMLElement) {
+		void selectPeer(peer);
+		ctxMenu = { npub: peer.npub, at, anchor };
+	}
+
 	let sortedRequests = $derived(sortRequests($dmRequests));
 	let requestCount = $derived(requestBadge($dmRequests));
 	let myId = $derived($identity?.npub ?? '');
@@ -1294,7 +1311,26 @@
 						{@const unread = unreadCounts[peer.npub] ?? 0}
 						{@const active = selectedPeer?.npub === peer.npub}
 						{@const preview = peerPreview($inboxMessages, $sentMessages, peer.npub)}
-						<button class="convo-item" class:convo-active={active} onclick={() => selectPeer(peer)}>
+						<button
+							class="convo-item"
+							class:convo-active={active}
+							onclick={() => selectPeer(peer)}
+							oncontextmenu={(e) => {
+								// QURATOR-381 — right-click opens the row's context menu at the cursor;
+								// preventDefault (row handler runs before +layout.svelte's document-level
+								// suppressor) keeps the native webview fallback dead while ours opens.
+								e.preventDefault();
+								openConvoCtxMenu(peer, { x: e.clientX, y: e.clientY }, e.currentTarget);
+							}}
+							onkeydown={(e) => {
+								// QURATOR-381 — Shift+F10 / the ContextMenu key: the keyboard twin of the
+								// right-click path, anchored to the row.
+								if ((e.key === 'F10' && e.shiftKey) || e.key === 'ContextMenu') {
+									e.preventDefault();
+									openConvoCtxMenu(peer, undefined, e.currentTarget);
+								}
+							}}
+						>
 							<Avatar letter={initial} size={34} {hue} picture={peer.profile?.picture} />
 							<div class="convo-info">
 								<div class="convo-row">
@@ -1819,6 +1855,32 @@
 	onclose={() => (composePickerOpen = false)}
 />
 
+<!-- QURATOR-381 — the conversation-row CONTEXT menu (right-click / Shift+F10 / ContextMenu key),
+     mounted once at page level: only one can be open. Items call the SAME handlers the existing
+     surfaces call — View profile is the pane header's viewProfile (→ /contacts), Browse is the
+     Contacts deep-link (gated on public collections, the half of the Contacts row gate this page
+     has data for), Block is the pane header's handleBlockPeer() through the same two-step
+     ConfirmButton (it reads the open selection, which openConvoCtxMenu just set). -->
+{#if ctxMenu}
+	{@const ctxNpub = ctxMenu.npub}
+	{@const ctxPeer = $contacts.find((c) => c.npub === ctxNpub)}
+	{#if ctxPeer}
+		<OverflowMenu open={ctxMenu !== null} anchor={ctxMenu.anchor} at={ctxMenu.at} onclose={() => (ctxMenu = null)}>
+			<button class="menu-item" onclick={() => { viewProfile(ctxPeer); ctxMenu = null; }}>View profile</button>
+			{#if ctxPeer.collections.filter((c) => c.visibility !== 'Private').length > 0}
+				<button class="menu-item" onclick={() => { goto('/browse?peer=' + encodeURIComponent(ctxPeer.npub)); ctxMenu = null; }}>Browse</button>
+			{/if}
+			<div class="menu-item-confirm">
+				<ConfirmButton
+					label="Block"
+					confirmText="Block this person? They can't message you and you won't see future requests. You can unblock in Settings."
+					onconfirm={() => { handleBlockPeer(); ctxMenu = null; }}
+				/>
+			</div>
+		</OverflowMenu>
+	{/if}
+{/if}
+
 <style>
 	/* Devtest item 5 — copied verbatim from Contacts/Home so the bar is indistinguishable from
 	   theirs. Svelte styles are component-scoped, so this cannot be shared; the 120px right
@@ -1929,7 +1991,9 @@
 		padding: 10px;
 		background: transparent;
 		border: none;
-		border-radius: var(--r-control, 7px);
+		/* Radius caps at the card radius: five themes set --r-control to 999px (pill CONTROLS), which
+		   turned this full-width LIST ROW into a stadium. Same fix as app.css .hb-textarea. */
+		border-radius: min(var(--r-control, 7px), var(--r-card, 10px));
 		cursor: pointer;
 		color: inherit;
 		font-family: inherit;
@@ -1938,6 +2002,17 @@
 	}
 	.convo-item:hover { background: var(--bg-elev1); }
 	.convo-active { background: var(--bg-elev2); }
+
+	/* QURATOR-381 — the conversation-row context menu's items (same look as the Contacts row menus;
+	   chat had no menu of its own before). */
+	.menu-item {
+		display: flex; align-items: center; width: 100%; text-align: left;
+		padding: 7px 10px; font-family: var(--font-ui); font-size: 12.5px; color: var(--fg);
+		background: transparent; border: none; border-radius: var(--r-control, 5px); cursor: pointer;
+	}
+	.menu-item:hover:not(:disabled) { background: var(--bg-elev3); }
+	.menu-item:disabled { opacity: 0.6; cursor: default; }
+	.menu-item-confirm { padding: 3px 6px; }
 
 	.convo-info { flex: 1; min-width: 0; }
 
@@ -2237,7 +2312,9 @@
 		background: transparent;
 		border: none;
 		border-bottom: 1px solid var(--divider);
-		border-radius: var(--r-control, 7px);
+		/* Radius caps at the card radius: five themes set --r-control to 999px (pill CONTROLS), which
+		   turned this full-width LIST ROW into a stadium. Same fix as app.css .hb-textarea. */
+		border-radius: min(var(--r-control, 7px), var(--r-card, 10px));
 		cursor: pointer;
 		color: inherit;
 		font-family: inherit;

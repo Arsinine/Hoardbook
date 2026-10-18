@@ -962,6 +962,23 @@
 		menuOpenFor = npub;
 	}
 
+	// QURATOR-381 — the row CONTEXT menu (right-click, or Shift+F10 / the ContextMenu key on a
+	// focused row). One menu at a time: opening it closes any ⋯ menu. It selects the contact first
+	// (the pane must hold the open instance — "Edit groups…" anchors its popover from it), keeps the
+	// row element as `anchor` for exactly that popover, and carries `at` only when opened at the
+	// cursor; the keyboard path leaves `at` undefined so the menu anchors to the row instead.
+	let ctxMenuFor: string | null = $state(null);
+	let ctxMenuAt: { x: number; y: number } | undefined = $state();
+	let ctxMenuAnchor: HTMLElement | undefined = $state();
+
+	function openCtxMenu(npub: string, at: { x: number; y: number } | undefined, anchor: HTMLElement) {
+		selectContact(npub);
+		if (menuOpenFor !== null) menuOpenFor = null;
+		ctxMenuAnchor = anchor;
+		ctxMenuAt = at;
+		ctxMenuFor = npub;
+	}
+
 	async function handleRefresh(hb_id: string) {
 		refreshing = hb_id;
 		try {
@@ -1383,11 +1400,26 @@
 				scheduleRowSelect(peer.npub);
 			}}
 			onkeydown={(e) => {
+				// QURATOR-381 — Shift+F10 / the ContextMenu key open the row's context menu, anchored
+				// to the row (the keyboard twin of the right-click path).
+				if ((e.key === 'F10' && e.shiftKey) || e.key === 'ContextMenu') {
+					e.preventDefault();
+					openCtxMenu(peer.npub, undefined, e.currentTarget);
+					return;
+				}
 				// Keyboard parity — Enter selects the focused row, same as click.
 				if (e.key !== 'Enter' || e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;
 				if ((e.target as HTMLElement).closest('button, a, input')) return;
 				e.preventDefault();
 				scheduleRowSelect(peer.npub);
+			}}
+			oncontextmenu={(e) => {
+				// QURATOR-381 — right-click opens the row's context menu at the cursor. preventDefault
+				// here (the row's bubble-phase handler runs before +layout.svelte's document-level
+				// suppressor, which only kills the NATIVE menu) keeps the webview fallback dead while
+				// our menu opens.
+				e.preventDefault();
+				openCtxMenu(peer.npub, { x: e.clientX, y: e.clientY }, e.currentTarget);
 			}}
 			title={hasCollections ? 'Double-click to browse' : undefined}
 		>
@@ -1933,6 +1965,37 @@
 	oncancel={() => { addContactOpen = false; addContactTarget = null; addContactResolved = null; }}
 />
 
+<!-- QURATOR-381 — the row CONTEXT menu (right-click / Shift+F10 / ContextMenu key), mounted once at
+     page level: only one can be open, so the per-row snippet renders none of it. Items call the SAME
+     handlers the inline buttons and the ⋯ menu call (goto, copyNpub, handleRefresh, openGroupPopover
+     — no re-implementations). Browse appears only when the row would render its inline Browse (the
+     same hasCollections predicate: public + private-shared). "Edit groups…" anchors the group
+     popover to the ctxMenuAnchor, which openCtxMenu set to the ROW element on the right-click path. -->
+{#if ctxMenuFor}
+	{@const ctxPeer = $contacts.find((c) => c.npub === ctxMenuFor)}
+	{#if ctxPeer}
+		{@const ctxHasCollections =
+			ctxPeer.collections.filter((c) => c.visibility !== 'Private').length > 0 ||
+			(privateByAuthor[ctxPeer.npub] ?? []).length > 0}
+		<OverflowMenu open={ctxMenuFor !== null} anchor={ctxMenuAnchor} at={ctxMenuAt} onclose={() => (ctxMenuFor = null)}>
+			{#if ctxHasCollections}
+				<button class="menu-item" onclick={() => { goto('/browse?peer=' + encodeURIComponent(ctxPeer.npub)); ctxMenuFor = null; }}>Browse</button>
+			{/if}
+			<button class="menu-item" onclick={() => { goto('/chat?peer=' + ctxPeer.npub); ctxMenuFor = null; }}>Message</button>
+			<div class="menu-item-sep" role="separator"></div>
+			<button class="menu-item" onclick={() => { copyNpub(ctxPeer.npub); ctxMenuFor = null; }}>Copy npub</button>
+			<button class="menu-item" onclick={() => { handleRefresh(ctxPeer.npub); ctxMenuFor = null; }} disabled={refreshing === ctxPeer.npub}>
+				{refreshing === ctxPeer.npub ? 'Refreshing…' : 'Refresh'}
+			</button>
+			<button class="menu-item" onclick={() => { selectContact(ctxPeer.npub); if (ctxMenuAnchor) openGroupPopover(ctxPeer.npub, ctxMenuAnchor); ctxMenuFor = null; }}>Edit groups…</button>
+			<button class="menu-item" onclick={() => { detailExpanded = ctxPeer.npub; editingTagsFor = ctxPeer.npub; tagInput = ''; ctxMenuFor = null; }}>Edit tags…</button>
+			<div class="menu-item-confirm">
+				<ConfirmButton label="Remove contact" confirmText="Remove this contact?" onconfirm={() => { handleUnfollow(ctxPeer.npub); ctxMenuFor = null; }} />
+			</div>
+		</OverflowMenu>
+	{/if}
+{/if}
+
 <!-- M22 W3 — the Name moment: a popover anchored at the drop point with the two avatars
      overlapping, a focused text field ("Name this group"), and up to 3 suggestion chips.
      Esc cancels the whole gesture (no group created). Enter commits (additive — both peers
@@ -2246,6 +2309,9 @@
 	.menu-item:hover:not(:disabled) { background: var(--bg-elev3); }
 	.menu-item:disabled { opacity: 0.6; cursor: default; }
 	.menu-item-confirm { padding: 3px 6px; }
+	/* QURATOR-381 — the context menu's divider between the primary pair (Browse · Message) and the
+	   ⋯ items. */
+	.menu-item-sep { height: 1px; background: var(--divider); margin: 4px 6px; }
 
 	.contact-info { flex: 1; min-width: 0; }
 
@@ -2346,7 +2412,10 @@
 		/* The hover fill bleeds past the text by exactly .shares' 2px side padding, no further: a
 		   wider bleed (it was -6px) overhangs .detail-scroll by 4px a side, which was the pane's
 		   horizontal scroll — overflow-x: hidden only clipped it. */
-		padding: 5px 2px; margin: 0 -2px; border-radius: var(--r-control, 6px);
+		padding: 5px 2px; margin: 0 -2px;
+		/* Radius caps at the card radius: five themes set --r-control to 999px (pill CONTROLS), which
+		   turned this hover-filled LIST ROW into a stadium. Same fix as app.css .hb-textarea. */
+		border-radius: min(var(--r-control, 6px), var(--r-card, 10px));
 	}
 	.cpop-row:hover { background: var(--bg-elev2); }
 	.cpop-alias { font-size: 12.5px; font-weight: 500; color: var(--fg); min-width: 0; overflow-wrap: anywhere; }

@@ -112,3 +112,76 @@ describe('QURATOR-209 — OverflowMenu placement wiring', () => {
 		}
 	});
 });
+
+// QURATOR-381 — the `at` prop: right-click menus open at a CURSOR POINT. The point is reshaped
+// into the AnchorRect menuPosition understands, so the flip-and-clamp arithmetic is the SAME one
+// the anchor path uses. jsdom computes no layout (P-13), so both stubs here prove the WIRING
+// (point → style.left/top), not on-screen placement — that needs the Playwright recipe.
+describe('QURATOR-381 — OverflowMenu `at` point placement', () => {
+	// Stub the viewport + the rendered menu's size; the anchor's rect is irrelevant in `at` mode
+	// (the point replaces it), so one stub covers both cases.
+	function stubMenuSize(width: number, height: number) {
+		const origW = Object.getOwnPropertyDescriptor(window, 'innerWidth');
+		const origH = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+		Object.defineProperty(window, 'innerWidth', { value: 1200, configurable: true });
+		Object.defineProperty(window, 'innerHeight', { value: 800, configurable: true });
+		const orig = HTMLElement.prototype.getBoundingClientRect;
+		HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+			return { top: 0, left: 0, right: width, bottom: height, width, height } as unknown as DOMRect;
+		};
+		return () => {
+			HTMLElement.prototype.getBoundingClientRect = orig;
+			if (origW) Object.defineProperty(window, 'innerWidth', origW);
+			if (origH) Object.defineProperty(window, 'innerHeight', origH);
+		};
+	}
+
+	it('with `at` (and an anchor for the caller), the menu lands with its top-left at the point', async () => {
+		const restore = stubMenuSize(240, 120);
+		try {
+			const anchor = document.createElement('button');
+			const { container } = render(OverflowMenu, {
+				props: { open: true, anchor, at: { x: 100, y: 200 }, onclose: () => {}, children: items },
+			});
+			await tick();
+			await new Promise((r) => setTimeout(r, 0));
+			const el = container.querySelector('.overflow-menu') as HTMLElement;
+			expect(el.style.left).toBe('100px'); // right(100+240) - width(240)
+			expect(el.style.top).toBe('200px');  // below(200-4)+4 — room below, no flip
+		} finally {
+			restore();
+		}
+	});
+
+	it('with `at` and NO anchor, the point alone drives placement', async () => {
+		const restore = stubMenuSize(240, 120);
+		try {
+			const { container } = render(OverflowMenu, {
+				props: { open: true, at: { x: 100, y: 200 }, onclose: () => {}, children: items },
+			});
+			await tick();
+			await new Promise((r) => setTimeout(r, 0));
+			const el = container.querySelector('.overflow-menu') as HTMLElement;
+			expect(el.style.left).toBe('100px');
+			expect(el.style.top).toBe('200px');
+		} finally {
+			restore();
+		}
+	});
+
+	it('a low cursor flips the menu ABOVE the point (same floor-flip as the anchor path)', async () => {
+		const restore = stubMenuSize(240, 120);
+		try {
+			const anchor = document.createElement('button');
+			const { container } = render(OverflowMenu, {
+				props: { open: true, anchor, at: { x: 100, y: 760 }, onclose: () => {}, children: items },
+			});
+			await tick();
+			await new Promise((r) => setTimeout(r, 0));
+			const el = container.querySelector('.overflow-menu') as HTMLElement;
+			expect(el.style.top).toBe('636px'); // 760 - 4 - 120 — bottom parks 4px above the cursor
+		} finally {
+			restore();
+		}
+	});
+});

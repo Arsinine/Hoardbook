@@ -9,12 +9,16 @@
 	interface Props {
 		open: boolean;
 		anchor?: HTMLElement;   // the trigger element the menu positions under
+		// QURATOR-381 — right-click menus: open at a CURSOR POINT instead of under an element. When
+		// set it replaces the anchor rect for placement (same flip-and-clamp); `anchor`, when also
+		// given, still serves callers that need an element for their own follow-on anchoring.
+		at?: { x: number; y: number };
 		onclose: () => void;
 		minWidth?: string;      // default 190px
 		children: import('svelte').Snippet;
 	}
 
-	let { open, anchor, onclose, minWidth = '190px', children }: Props = $props();
+	let { open, anchor, at, onclose, minWidth = '190px', children }: Props = $props();
 
 	let pos = $state({ top: 0, left: 0 });
 	let menuEl = $state<HTMLDivElement | undefined>(undefined); // set by bind:this while the {#if open} branch renders
@@ -24,18 +28,33 @@
 	// reading menuEl's rect — a same-tick read returns all zeros and the edge flip would never
 	// fire. If it closed again before the tick landed, menuEl is undefined — guard, don't assume.
 	$effect(() => {
-		if (!open || !anchor) return;
+		if (!open || (!anchor && !at)) return;
+		const p = at;
 		const a = anchor;
 		void (async () => {
 			await tick();
 			if (!menuEl) return;
-			const r = a.getBoundingClientRect();
 			const m = menuEl.getBoundingClientRect();
-			pos = menuPosition(
-				{ top: r.top, right: r.right, bottom: r.bottom },
-				{ width: m.width, height: m.height },
-				{ width: window.innerWidth, height: window.innerHeight },
-			);
+			const vp = { width: window.innerWidth, height: window.innerHeight };
+			// QURATOR-381 — `at` REPLACES the anchor rect for placement. The point is reshaped into
+			// the AnchorRect menuPosition already understands, so the SAME flip-and-clamp arithmetic
+			// applies: `right = x + menu width` left-aligns the menu at the cursor (menuPosition
+			// right-aligns to anchor.right), and `bottom = y - 4` reads "below" from just above the
+			// point, so the floor-flip parks the menu's bottom 4px above the cursor, not under it.
+			if (p) {
+				pos = menuPosition(
+					{ top: p.y, right: p.x + m.width, bottom: p.y - 4 },
+					{ width: m.width, height: m.height },
+					vp,
+				);
+			} else if (a) {
+				const r = a.getBoundingClientRect();
+				pos = menuPosition(
+					{ top: r.top, right: r.right, bottom: r.bottom },
+					{ width: m.width, height: m.height },
+					vp,
+				);
+			}
 		})();
 	});
 
