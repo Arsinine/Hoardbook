@@ -2266,7 +2266,8 @@
 		background: var(--glass-raised);
 		-webkit-backdrop-filter: blur(var(--glass-blur));
 		backdrop-filter: blur(var(--glass-blur));
-		border-radius: var(--r-chip, 4px);
+		/* QURATOR-382: a sticky header strip is not a control — cap at the card radius so 999px themes don't make a stadium. */
+		border-radius: min(var(--r-chip, 4px), var(--r-card, 10px));
 		padding-inline: 6px;
 	}
 

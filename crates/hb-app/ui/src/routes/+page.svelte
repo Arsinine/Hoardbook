@@ -1009,7 +1009,8 @@
 		color: var(--danger-text);
 		background: var(--danger-soft);
 		border: 1px solid var(--danger-border);
-		border-radius: var(--r-control, 6px);
+		/* QURATOR-382: not a control — cap at the card radius so 999px themes don't make a stadium. */
+		border-radius: min(var(--r-control, 6px), var(--r-card, 10px));
 		padding: 8px 10px;
 		word-break: break-word;
 	}
@@ -1071,7 +1072,8 @@
 		gap: 8px;
 		background: var(--bg-elev2);
 		border: 1px solid var(--border);
-		border-radius: var(--r-control, 7px);
+		/* QURATOR-382: not a control — cap at the card radius so 999px themes don't make a stadium. */
+		border-radius: min(var(--r-control, 7px), var(--r-card, 10px));
 		padding: 8px 10px;
 		margin-bottom: 12px;
 	}
@@ -1300,7 +1302,8 @@
 		padding: 0 11px;
 		background: var(--bg-elev2);
 		border: 1px solid var(--border);
-		border-radius: var(--r-control, 7px);
+		/* QURATOR-382: not a control — cap at the card radius so 999px themes don't make a stadium. */
+		border-radius: min(var(--r-control, 7px), var(--r-card, 10px));
 		font-size: 13px;
 		color: var(--fg-muted);
 		font-feature-settings: 'tnum';
@@ -1380,7 +1383,8 @@
 		padding: 5px 8px;
 		background: var(--bg-input);
 		border: 1px solid var(--border);
-		border-radius: var(--r-control, 7px);
+		/* QURATOR-382: not a control — cap at the card radius so 999px themes don't make a stadium. */
+		border-radius: min(var(--r-control, 7px), var(--r-card, 10px));
 		align-items: center;
 		cursor: text;
 		transition: border-color 0.1s;
@@ -1431,7 +1435,8 @@
 		left: 0; right: 0;
 		background: var(--bg-elev2);
 		border: 1px solid var(--border);
-		border-radius: var(--r-control, 7px);
+		/* QURATOR-382: not a control — cap at the card radius so 999px themes don't make a stadium. */
+		border-radius: min(var(--r-control, 7px), var(--r-card, 10px));
 		overflow: hidden;
 		z-index: 10;
 		box-shadow: 0 8px 24px oklch(0 0 0 / 0.25);

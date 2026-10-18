@@ -1520,7 +1520,8 @@
 		color: var(--fg-muted);
 		background: var(--bg-elev1);
 		border-left: 2px solid var(--accent);
-		border-radius: var(--r-chip, 4px);
+		/* QURATOR-382: a multi-line bio box is not a control — cap at the card radius so 999px themes don't make a stadium. */
+		border-radius: min(var(--r-chip, 4px), var(--r-card, 10px));
 		white-space: pre-wrap;
 		overflow-wrap: anywhere;
 	}

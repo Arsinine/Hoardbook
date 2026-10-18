@@ -414,7 +414,8 @@
 		font-weight: 500;
 		color: var(--fg-muted);
 		background: transparent;
-		border-radius: var(--r-control, 7px);
+		/* QURATOR-382: not a control — cap at the card radius so 999px themes don't make a stadium. */
+		border-radius: min(var(--r-control, 7px), var(--r-card, 10px));
 		text-decoration: none;
 		cursor: pointer;
 		transition: background 0.1s, color 0.1s;

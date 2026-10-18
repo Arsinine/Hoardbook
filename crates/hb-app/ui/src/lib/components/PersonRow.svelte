@@ -64,7 +64,8 @@
 		align-items: center;
 		gap: 8px;
 		padding: 5px 4px;
-		border-radius: var(--r-control, 5px);
+		/* QURATOR-382: not a control — cap at the card radius so 999px themes don't make a stadium. */
+		border-radius: min(var(--r-control, 5px), var(--r-card, 10px));
 		font-size: 12px;
 	}
 	.avatar-wrap { position: relative; flex-shrink: 0; }

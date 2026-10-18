@@ -112,7 +112,8 @@
 
 	.folder-icon {
 		width: 32px; height: 32px;
-		border-radius: var(--r-control, 7px);
+		/* QURATOR-382: an icon tile is not a control — cap at the card radius so 999px themes don't make a circle. */
+		border-radius: min(var(--r-control, 7px), var(--r-card, 10px));
 		background: var(--bg-elev3);
 		color: var(--fg-muted);
 		display: flex; align-items: center; justify-content: center;

@@ -73,6 +73,9 @@
 		min-height: 34px;
 		padding: 5px 8px;
 		cursor: text;
+		/* QURATOR-382: not a control — cap at the card radius so 999px themes don't make a stadium.
+		   (Otherwise it inherits .hb-input's bare control radius and becomes a stadium once tags wrap.) */
+		border-radius: min(var(--r-control, 7px), var(--r-card, 10px));
 	}
 	.tag-wrap:focus-within { border-color: var(--accent); }
 

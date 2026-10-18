@@ -1629,7 +1629,8 @@
 		align-items: center;
 		gap: 8px;
 		padding: 5px 4px;
-		border-radius: var(--r-control, 5px);
+		/* QURATOR-382: a full-width list row is not a control — cap at the card radius so 999px themes don't make a stadium. */
+		border-radius: min(var(--r-control, 5px), var(--r-card, 10px));
 		font-size: 12px;
 		background: transparent;
 		border: none;

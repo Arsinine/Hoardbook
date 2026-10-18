@@ -37,6 +37,9 @@ function radiusDecl(block: string): string {
 
 const CAP = (fallback: string) => `border-radius: min(var(--r-control, ${fallback}), var(--r-card, 10px))`;
 
+/** QURATOR-382 chip variant: same cap shape for sites whose bare token is --r-chip. */
+const CHIP_CAP = (fallback: string) => `border-radius: min(var(--r-chip, ${fallback}), var(--r-card, 10px))`;
+
 describe('QURATOR-381 — list-row radius caps at --r-card (declared CSS, not rendered)', () => {
 	it('topics: .topic-row, .unjoined:hover and .roster-row cap at the card radius', () => {
 		const s = src('./+page.svelte');
@@ -54,5 +57,43 @@ describe('QURATOR-381 — list-row radius caps at --r-card (declared CSS, not re
 	it('contacts: .cpop-row caps at the card radius', () => {
 		const s = src('../contacts/+page.svelte');
 		expect(radiusDecl(ruleBlock(s, '.cpop-row {'))).toBe(CAP('6px'));
+	});
+});
+
+// QURATOR-382 — five MORE non-control sites went stadium/circle on the 999px pill themes
+// (vault, clinic-teal, pale-pulse, sky-slate, violet-drive): a full-width sticky header strip,
+// a full-width list row, a multi-line bio box, and two square icon tiles. Same fix and same
+// limits as QURATOR-381 above: DECLARED-CSS pins only (P-13 — jsdom computes no layout, so
+// nothing here proves how anything RENDERS; rendered-shape proof is the Playwright before/after
+// shots on `vault`). Comments stripped first (P-12); needle includes the ` {` brace so
+// `.contact-row {` never matches the `.contact-row { transition: none; }` media-query block.
+// MUTATION (P-10): each of the five declarations below was reverted in place to its bare
+// `var(--r-control, …)` / `var(--r-chip, …)` form (all five at once) and this file was re-run:
+// exactly the five QURATOR-382 tests RED and the QURATOR-381 tests stayed green. Seen red.
+// Restored and re-read: all five capped declarations back in place, suite green.
+describe('QURATOR-382 — non-control radius caps at --r-card (declared CSS, not rendered)', () => {
+	it('contacts: the glass-float .section-header strip caps at the card radius', () => {
+		const s = src('../contacts/+page.svelte');
+		expect(radiusDecl(ruleBlock(s, ':global(:root[data-glass-float]) .section-header {'))).toBe(CHIP_CAP('4px'));
+	});
+
+	it('browse: .contact-row caps at the card radius', () => {
+		const s = src('../browse/+page.svelte');
+		expect(radiusDecl(ruleBlock(s, '.contact-row {'))).toBe(CAP('5px'));
+	});
+
+	it('topics: .roster-bio caps at the card radius', () => {
+		const s = src('./+page.svelte');
+		expect(radiusDecl(ruleBlock(s, '.roster-bio {'))).toBe(CHIP_CAP('4px'));
+	});
+
+	it('CollectionRow: .row-icon caps at the card radius', () => {
+		const s = src('../../lib/components/CollectionRow.svelte');
+		expect(radiusDecl(ruleBlock(s, '.row-icon {'))).toBe(CAP('7px'));
+	});
+
+	it('CollectionPanel: .folder-icon caps at the card radius', () => {
+		const s = src('../../lib/components/CollectionPanel.svelte');
+		expect(radiusDecl(ruleBlock(s, '.folder-icon {'))).toBe(CAP('7px'));
 	});
 });

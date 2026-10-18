@@ -1337,7 +1337,8 @@
 		padding: 10px 12px;
 		border: 1px solid color-mix(in oklch, var(--accent) 35%, transparent);
 		background: color-mix(in oklch, var(--accent) 8%, transparent);
-		border-radius: var(--r-control, 7px);
+		/* QURATOR-382: not a control — cap at the card radius so 999px themes don't make a stadium. */
+		border-radius: min(var(--r-control, 7px), var(--r-card, 10px));
 		font-size: 12px;
 		color: var(--fg-muted);
 		display: flex;

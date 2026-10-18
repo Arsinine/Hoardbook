@@ -616,7 +616,8 @@
 		padding: 8px;
 		background: var(--bg-input);
 		border: 1px solid var(--border);
-		border-radius: var(--r-control, 7px);
+		/* QURATOR-382: not a control — cap at the card radius so 999px themes don't make a stadium. */
+		border-radius: min(var(--r-control, 7px), var(--r-card, 10px));
 	}
 
 	.tree-hint { font-size: 12px; color: var(--fg-dim); padding: 4px 2px; }
@@ -665,6 +666,9 @@
 		height: auto;
 		min-height: 34px;
 		padding: 5px 8px;
+		/* QURATOR-382: not a control — cap at the card radius so 999px themes don't make a stadium.
+		   (Otherwise it inherits .hb-input's bare control radius and becomes a stadium once chips wrap.) */
+		border-radius: min(var(--r-control, 7px), var(--r-card, 10px));
 	}
 	.lang-wrap:focus-within { border-color: var(--accent); }
 	.chip {

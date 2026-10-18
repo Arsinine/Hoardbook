@@ -150,7 +150,8 @@
 	}
 	.contact-row {
 		display: flex; align-items: center; gap: 9px; width: 100%;
-		padding: 6px 8px; border: 1px solid transparent; border-radius: var(--r-control, 7px);
+		/* QURATOR-382: not a control — cap at the card radius so 999px themes don't make a stadium. */
+		padding: 6px 8px; border: 1px solid transparent; border-radius: min(var(--r-control, 7px), var(--r-card, 10px));
 		background: transparent; cursor: pointer; text-align: left;
 		color: var(--fg); font: inherit; font-size: 12.5px;
 	}
