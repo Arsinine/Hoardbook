@@ -62,8 +62,9 @@ const ALLOWED: Record<string, string[]> = {
 	'lib/components/CollectionTagsEditor.svelte': ['.chip'],
 	// ConfirmButton — trigger and its inline yes/no confirm buttons
 	'lib/components/ConfirmButton.svelte': ['.cb-trigger', '.cb-yes, .cb-no'],
-	// DiscoverBook — pills by design (their own fallback is already 999px)
-	'lib/components/DiscoverBook.svelte': ['.title-chip', '.chip'],
+	// DiscoverBook — pills by design (their own fallback is already 999px); .sort-btn joins
+	// them: a single-line sort-toggle button control
+	'lib/components/DiscoverBook.svelte': ['.title-chip', '.chip', '.sort-btn'],
 	// TopicJoinConsent — action buttons
 	'lib/components/TopicJoinConsent.svelte': ['.actions button'],
 	// WindowControls — window chrome buttons

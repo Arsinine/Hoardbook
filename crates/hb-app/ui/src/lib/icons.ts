@@ -31,6 +31,9 @@ export const icons = {
 	download: `<svg class="hb-icon-download" width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M6 2v6M3.5 6L6 8.5 8.5 6M2 10h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
 	key:      `<svg class="hb-icon-key" width="13" height="13" viewBox="0 0 14 14" fill="none"><circle cx="5.5" cy="6" r="2.5" stroke="currentColor" stroke-width="1.3"/><path d="M7.5 7.5L12 12M10 9.5l1 1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>`,
 	trash:    `<svg class="hb-icon-trash" width="13" height="13" viewBox="0 0 14 14" fill="none"><path d="M2 4h10M5 4V2.5h4V4M12 4l-.7 7.5a1 1 0 01-1 .9H3.7a1 1 0 01-1-.9L2 4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+	// itshover.com chart-bar-icon / user-check-icon (Apache-2.0) — DiscoverBook sort toggle
+	sortSize:     `<svg class="hb-icon-sortsize" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 13a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v6a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1z"/><path d="M9 5a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v14a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1z"/><path d="M15 9a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v10a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1z"/><path d="M4 20h14"/></svg>`,
+	sortLikeness: `<svg class="hb-icon-sortlike" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 7a4 4 0 1 0 8 0a4 4 0 0 0 -8 0"/><path d="M6 21v-2a4 4 0 0 1 4 -4h4"/><path d="M15 19l2 2l4 -4"/></svg>`,
 };
 
 // Simple Icons brand paths (simpleicons.org) — viewBox 0 0 24 24, fill="currentColor"

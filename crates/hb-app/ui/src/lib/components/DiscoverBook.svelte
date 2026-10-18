@@ -14,6 +14,7 @@
 	import EmptyState from './EmptyState.svelte';
 	import Modal from './Modal.svelte';
 	import { fmtBytes, sortEntries, splitResults, highlight } from '$lib/discover-book.js';
+import { icons } from '$lib/icons.js';
 
 	let entries = $state<PhonebookEntry[]>([]);
 	let capped = $state(false);
@@ -22,8 +23,8 @@
 	let error = $state(false);
 	let query = $state('');
 	let debounced = $state('');
-	// Native <select> bind gives a string; keep the state a string and derive the union below
-	// (svelte-check would flag assigning a raw string to a 'size' | 'likeness' state).
+	// Sort state stays a plain string (the toggle buttons assign literals); derive the union
+	// below rather than typing the state, so the <select>-era narrowing comment lives on.
 	let sortSel = $state('size');
 	let interest = $state('All');
 	let openNpub = $state<string | null>(null);
@@ -194,11 +195,28 @@
 			</span>
 			<button type="button" class="btn-ghost btn-xs" onclick={() => (query = '')}>Clear ✕</button>
 		{:else}
-			<span class="quiet">Everyone on your relays, biggest hoard first.</span>
-			<select class="hb-input tool-select" bind:value={sortSel} aria-label="Sort">
-				<option value="size">Sort · Size</option>
-				<option value="likeness">Sort · Likeness</option>
-			</select>
+			<div class="sort-toggle" role="group" aria-label="Sort">
+				<button
+					type="button"
+					class="sort-btn"
+					aria-pressed={sortSel === 'size'}
+					aria-label="Sort by size"
+					title="Sort by size"
+					onclick={() => (sortSel = 'size')}
+				>
+					{@html icons.sortSize}
+				</button>
+				<button
+					type="button"
+					class="sort-btn"
+					aria-pressed={sortSel === 'likeness'}
+					aria-label="Sort by likeness"
+					title="Sort by likeness"
+					onclick={() => (sortSel = 'likeness')}
+				>
+					{@html icons.sortLikeness}
+				</button>
+			</div>
 			<select class="hb-input tool-select" bind:value={interest} aria-label="Interest">
 				<option value="All">Interest · All</option>
 				{#each allTags as tag (tag)}
@@ -347,6 +365,32 @@
 		height: 28px;
 		font-size: 12px;
 		width: auto;
+	}
+	.sort-toggle {
+		display: flex;
+		gap: 4px;
+	}
+	/* Single-line pill controls — allowlisted bare in no-bare-pill-radius.test.ts */
+	.sort-btn {
+		height: 28px;
+		width: 28px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		border: 1px solid var(--border, transparent);
+		background: transparent;
+		color: var(--fg-muted, inherit);
+		border-radius: var(--r-control, 7px);
+		cursor: pointer;
+		padding: 0;
+	}
+	.sort-btn[aria-pressed='true'] {
+		border-color: var(--accent, currentColor);
+		color: var(--accent, currentColor);
+		background: color-mix(in srgb, var(--accent, currentColor) 12%, transparent);
+	}
+	.sort-btn:hover {
+		color: var(--fg, inherit);
 	}
 	.quiet {
 		color: var(--fg-dim, var(--fg-muted, inherit));

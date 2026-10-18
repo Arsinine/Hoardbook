@@ -81,6 +81,35 @@ describe('DiscoverBook', () => {
 		expect(cy?.textContent).toContain('40% like you');
 	});
 
+	it('drops the hoard line and swaps the Sort select for a two-button icon toggle', async () => {
+		// MUTATION (P-10): change the likeness button's onclick to set 'size' → the press state
+		// never flips and the ORDER never changes (Ben stays first) → the npubcy-first
+		// assertion reds. Seen red (q384-mut.log, exit=1); restored → green.
+		const { container } = render(DiscoverBook);
+		await waitFor(() => expect(screen.getByText('Ben Alvarez')).toBeTruthy());
+		// (a) the removed sentence is gone
+		expect(container.textContent).not.toContain('biggest hoard first');
+		// (b) no combobox named Sort; two pressed-state icon buttons instead
+		expect(document.querySelectorAll('select[aria-label="Sort"]').length).toBe(0);
+		const sizeBtn = screen.getByRole('button', { name: 'Sort by size' });
+		const likeBtn = screen.getByRole('button', { name: 'Sort by likeness' });
+		expect(sizeBtn.getAttribute('aria-pressed')).toBe('true');
+		expect(likeBtn.getAttribute('aria-pressed')).toBe('false');
+		expect(sizeBtn.querySelector('svg')).toBeTruthy();
+		expect(likeBtn.querySelector('svg')).toBeTruthy();
+		// (c) clicking likeness re-orders: size order Ben → Cy → Ana; likeness order puts
+		// Cy (the only scored entry) first, null-likeness entries last.
+		const cards = () =>
+			[...container.querySelectorAll('article[data-npub]')].map((el) =>
+				el.getAttribute('data-npub'),
+			);
+		expect(cards()[0]).toBe('npubben');
+		fireEvent.click(likeBtn);
+		expect(likeBtn.getAttribute('aria-pressed')).toBe('true');
+		expect(sizeBtn.getAttribute('aria-pressed')).toBe('false');
+		expect(cards()[0]).toBe('npubcy');
+	});
+
 	it('debounces the query, calls discoverPeople with it, and renders both groups', async () => {
 		// P-10 mutation: in DiscoverBook.svelte change the fetch call
 		// `discoverPeople(q ?? undefined)` to `discoverPeople()` → the query never reaches the
