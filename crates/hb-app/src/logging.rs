@@ -10,7 +10,8 @@
 //! log subscriber is strictly better than a dead app, and the beacon-panel breadcrumbs
 //! (`BeaconReport::stage`) are the primary instrument, not these logs.
 //!
-//! Default filter `hb_app=debug,hb_net=debug,info` is overridable via the `HB_LOG` env var.
+//! Default filter `hb_app=debug,hb_net=debug,nostr_relay_pool=warn,iroh::net_report=error,info`
+//! (see [`DEFAULT_LOG_FILTER`]) is overridable via the `HB_LOG` env var.
 //! **No secret material is logged at the default level** (secrets audit 2026-08-03 — see the
 //! presence.rs / chat.rs / client.rs `tracing::debug!` sites: every one logs an error message,
 //! a relay URL, or a sleep duration, never an nsec / DM plaintext / sealed payload).
@@ -128,10 +129,17 @@ where
 /// WARN keeps a genuine relay failure visible (a real disconnect still logs) while dropping the
 /// per-retry chatter. `HB_LOG` still overrides this wholesale for a deep-dive session.
 ///
+/// **`iroh::net_report` is pinned to ERROR deliberately** (QURATOR-380). Its `IPv4 address
+/// detected by QAD varies by destination` WARN fired ×3 per net_report — 9,942 of the owner's
+/// 129,060 lines on 2026-10-17 — and adds nothing: `nat.rs` already reads
+/// `mapping_varies_by_dest_ipv4` from the SAME report through the iroh API (the code consumes
+/// the data, not the log line). Other iroh targets stay at the global `info`.
+///
 /// ⚠ This demotes VOLUME, not content. Relay URLs stay loggable — they are user-configured public
 /// infrastructure. Peer/node addresses are the H4/MT2 harvest shape and are never logged at any
 /// level.
-pub(crate) const DEFAULT_LOG_FILTER: &str = "hb_app=debug,hb_net=debug,nostr_relay_pool=warn,info";
+pub(crate) const DEFAULT_LOG_FILTER: &str =
+    "hb_app=debug,hb_net=debug,nostr_relay_pool=warn,iroh::net_report=error,info";
 
 /// failure returns silently (stderr gets a best-effort line) so the app starts regardless.
 pub(crate) fn install(data_dir: &Path) {
@@ -296,14 +304,23 @@ mod tests {
     }
 
     /// M23 W2 Part B — the default filter must DEMOTE the third-party relay pool without silencing
-    /// it, and without touching our own crates' levels.
+    /// it, and without touching our own crates' levels. Extended for QURATOR-380: the iroh
+    /// net_report QAD WARN (9,942 lines in the owner's 2026-10-17 log, ×3 per report, a value the
+    /// code already reads through the API) is dropped, while our own `hb_net` INFO survives.
     ///
     /// Asserted behaviourally, by emitting at explicit targets through a subscriber built from
     /// [`DEFAULT_LOG_FILTER`] and reading back what survived — NOT by string-matching the filter,
-    /// which would pass for a directive that parses and does nothing. The three cases are the whole
+    /// which would pass for a directive that parses and does nothing. The five cases are the whole
     /// ruling: a relay ERROR still lands (a genuine failure stays visible), a relay INFO does not
-    /// (the 68-line retry chatter is what drowned the user's log), and `hb_app` DEBUG still lands
-    /// (demoting the noise must not cost us our own breadcrumbs).
+    /// (the 68-line retry chatter is what drowned the user's log), an `iroh::net_report` WARN does
+    /// not (QURATOR-380), `hb_net` INFO still lands (the demotion is scoped to the one noisy
+    /// target), and `hb_app` DEBUG still lands (demoting the noise must not cost us our own
+    /// breadcrumbs).
+    ///
+    /// MUTATION (P-10, QURATOR-380) — remove the `iroh::net_report=error` directive from
+    /// `DEFAULT_LOG_FILTER` (leave everything else) → the IROH_QAD_WARN_MARKER assert reds (the
+    /// global `info` then admits the WARN again). The other four asserts staying green under
+    /// that mutation proves the new directive is what does the demotion.
     #[test]
     fn default_filter_demotes_the_relay_pool_but_keeps_our_own_debug() {
         use tracing_subscriber::fmt::MakeWriter;
@@ -334,7 +351,10 @@ mod tests {
             // The shape that flooded the devtest log: a per-retry INFO/ERROR pair from the pool.
             tracing::error!(target: "nostr_relay_pool::relay::inner", "RELAY_ERROR_MARKER");
             tracing::info!(target: "nostr_relay_pool::pool", "RELAY_INFO_MARKER");
-            // Our own breadcrumb — the thing the noise was burying.
+            // The QURATOR-380 shape: iroh's QAD warning, ×3 per net_report.
+            tracing::warn!(target: "iroh::net_report::report", "IROH_QAD_WARN_MARKER");
+            // Our own breadcrumbs — the things the noise was burying.
+            tracing::info!(target: "hb_net::client", "HB_NET_INFO_MARKER");
             tracing::debug!(target: "hb_app::presence", "OUR_DEBUG_MARKER");
         }
 
@@ -347,6 +367,16 @@ mod tests {
             !out.contains("RELAY_INFO_MARKER"),
             "relay-pool INFO must be filtered out; this is the 68-line retry chatter that drowned \
              the user's diagnostics:\n{out}"
+        );
+        assert!(
+            !out.contains("IROH_QAD_WARN_MARKER"),
+            "iroh net_report WARN must be filtered out — the code reads mapping_varies_by_dest \
+             through the API, so the line carries no signal (9,942 lines on 2026-10-17):\n{out}"
+        );
+        assert!(
+            out.contains("HB_NET_INFO_MARKER"),
+            "hb_net INFO must survive — the iroh demotion is scoped to iroh::net_report, not our \
+             own relay work:\n{out}"
         );
         assert!(
             out.contains("OUR_DEBUG_MARKER"),

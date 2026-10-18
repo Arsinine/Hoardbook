@@ -103,9 +103,10 @@
 //!
 //! This loop binds an endpoint and sends DMs, so it must never run inside a critical section that
 //! forbids relay I/O. It takes no `DM_CACHE_LOCK` and no `DM_REQUESTS_LOCK`; it does not touch the
-//! DM cache at all — it fetches gift-wraps on its own short-lived client (the WAN harness loop's
-//! shape), decodes them with `decode_dms`, and never persists a DM-side effect. The relay fetch,
-//! endpoint bind, and ticket DM all happen at this loop's own top level, outside any lock.
+//! DM cache at all — it fetches gift-wraps on its OWN client (held OPEN across polls since
+//! QURATOR-380, keyed by identity + relay set; never the shared command-surface client
+//! `net::client`), decodes them with `decode_dms`, and never persists a DM-side effect. The relay
+//! fetch, endpoint bind, and ticket DM all happen at this loop's own top level, outside any lock.
 //!
 //! ## Why a background task
 //!
@@ -130,7 +131,7 @@ use crate::store::DataStore;
 use crate::transport_state::SharedEndpoint;
 use hb_core::access_request::AccessRequest;
 use hb_core::event::Teaser;
-use hb_net::fetch_peer_teaser;
+use hb_net::{NetError, RelayClient, fetch_peer_teaser};
 
 /// One auto-approval per `(peer, author, slug)` per this many seconds (owner-ruled).
 ///
@@ -603,6 +604,125 @@ fn advance_inbox_cursor(newest_seen_outer: u64, batch_newest: u64, now: u64) -> 
     newest_seen_outer.max(batch_newest.min(now))
 }
 
+/// QURATOR-380 — the reuse key for the auto-approve loop's held relay client: the identity npub
+/// plus the relay list, canonicalised (trimmed, lowercased, trailing slash stripped — the same
+/// shape `hb_net::client::canonical_relay_url` logs) and SORTED before comparison (§9: a
+/// snapshot that must survive `readdir`/config-order reorder canonicalizes by sorting before
+/// hashing/comparing). A reorder of the same relay set is therefore NOT a change, and must not
+/// churn a healthy client.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct ClientKey {
+    npub: String,
+    /// Canonicalised and sorted.
+    relays: Vec<String>,
+}
+
+impl ClientKey {
+    fn new(npub: &str, relays: &[String]) -> Self {
+        let mut relays: Vec<String> = relays
+            .iter()
+            .map(|r| r.trim().to_ascii_lowercase().trim_end_matches('/').to_string())
+            .collect();
+        relays.sort();
+        relays.dedup();
+        Self { npub: npub.to_string(), relays }
+    }
+}
+
+/// QURATOR-380 — the pure reuse decision, extracted so it is testable without a relay (the
+/// `pace_request` precedent). True means the held client must be DISCONNECTED and a fresh one
+/// connected: nothing is held, or the held pool is dead (`is_live` false — every relay
+/// Terminated/Banned, the state nostr-sdk will never retry out of), or the identity changed
+/// (a wipe/import — NIP-42 AUTH must answer with the CURRENT identity npub, CLAUDE.md §6), or
+/// the relay set changed (the user edited relays). Otherwise the client is REUSED: a REQ over an
+/// open socket is cheap; a connect + TLS + AUTH to six relays per 5 s poll is what produced
+/// ≈9,600 six-relay sessions/day (QURATOR-380).
+///
+/// MUTATION anchors (P-10, applied by the orchestrator to this fn's body only):
+/// - replace the whole body with `true` → `a_live_client_with_the_same_key_is_reused` reds;
+/// - drop the npub from the comparison (`self`-less compare of `relays` only) →
+///   `an_identity_change_forces_a_reconnect` reds;
+/// - drop the sort in `ClientKey::new` → `a_relay_set_reorder_is_not_a_change` reds.
+fn client_needs_reconnect(held: Option<&ClientKey>, live: bool, want: &ClientKey) -> bool {
+    match held {
+        None => true,
+        Some(held_key) => !live || held_key != want,
+    }
+}
+
+/// QURATOR-380 — the loop's OWN long-lived relay client, held across polls. Never the shared
+/// command-surface client (`net::client`): the loop must not hold THAT across its sleeps, and
+/// the command surface must not see its reconnects. Rebuilt only when
+/// [`client_needs_reconnect`] says so; every rebuild disconnects the old client first.
+#[derive(Default)]
+struct ClientPool {
+    held: Option<(ClientKey, RelayClient)>,
+}
+
+impl ClientPool {
+    /// Acquire the client for `(npub, relays)`, reusing the held one when the pure decision
+    /// allows. Production's thin wrapper over [`Self::acquire_with`] with the real connector —
+    /// identity and relays are cloned into the boxed future so the connector owns its inputs
+    /// (an owned-args connector needs no lifetime coupling, and the boxed future keeps `F` a
+    /// single type). `Send` because the loop task is spawned (`tauri::async_runtime::spawn`).
+    async fn acquire(
+        &mut self,
+        npub: &str,
+        identity: &hb_core::Identity,
+        relays: &[String],
+        timeout: Duration,
+    ) -> Result<&RelayClient, NetError> {
+        self.acquire_with(npub, identity, relays, timeout, |identity, relays, timeout| {
+            Box::pin(async move { RelayClient::connect(&identity, &relays, timeout).await })
+        })
+        .await
+    }
+
+    /// The same, with the connector INJECTED — the seam that lets the reuse behaviour be
+    /// driven without a relay (`several_iterations_against_a_live_client_connect_exactly_once`).
+    /// The connector takes OWNED inputs (it may consume them inside its future) and returns a
+    /// boxed future; nothing it borrows from the caller crosses the await.
+    async fn acquire_with<C>(
+        &mut self,
+        npub: &str,
+        identity: &hb_core::Identity,
+        relays: &[String],
+        timeout: Duration,
+        connect: C,
+    ) -> Result<&RelayClient, NetError>
+    where
+        C: FnOnce(
+            hb_core::Identity,
+            Vec<String>,
+            Duration,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<RelayClient, NetError>> + Send>,
+        >,
+    {
+        let want = ClientKey::new(npub, relays);
+        let live = match self.held.as_ref() {
+            Some((_, client)) => client.is_live().await,
+            None => false,
+        };
+        if client_needs_reconnect(self.held.as_ref().map(|(k, _)| k), live, &want) {
+            // Disconnect the old client BEFORE dialing the new one — never two live sessions
+            // for the same (identity, relays) at once.
+            self.drop_client().await;
+            let client = connect(identity.clone(), relays.to_vec(), timeout).await?;
+            self.held = Some((want, client));
+        }
+        Ok(&self.held.as_ref().expect("held after acquire").1)
+    }
+
+    /// Drop and disconnect the held client, if any. Called on the no-identity branch (a client
+    /// must never outlive the identity it authenticates as) and before every rebuild.
+    async fn drop_client(&mut self) {
+        if let Some((_, old)) = self.held.take() {
+            old.disconnect().await;
+        }
+    }
+}
+
 /// The loop itself. Runs forever; every decision is logged (info for approvals, debug/warn for the
 /// human-fallback cases) so a real run produces evidence without spamming idle polls.
 ///
@@ -617,7 +737,11 @@ pub(crate) async fn run_auto_approve_loop(
     relay: SharedRelay,
     endpoint: SharedEndpoint,
 ) {
-    use hb_net::RelayClient;
+    // QURATOR-380 — the loop's own long-lived client (see `ClientPool`). Held ACROSS polls; one
+    // session for the app's lifetime instead of ≈9,600/day. It is NOT the shared command-surface
+    // client (`net::client`), which belongs to the command surface and is never held across this
+    // loop's sleeps.
+    let mut pool = ClientPool::default();
 
     // The identity is re-read EVERY poll rather than snapshotted once at spawn. Two reasons, both
     // production-only (the WAN harness snapshots once because it is single-identity by
@@ -702,16 +826,24 @@ pub(crate) async fn run_auto_approve_loop(
                 // No identity yet (fresh install, before the wizard) or mid-wipe. Sleep and retry —
                 // the wizard can generate one at any moment, and returning here would disable the
                 // loop for the rest of the process.
+                //
+                // QURATOR-380: a held client must NOT survive this branch. The client
+                // authenticates (NIP-42) as the identity that built it; mid-wipe/import that
+                // identity is being replaced, and keeping the socket would answer the NEW
+                // identity's relay challenges with the OLD npub. Drop and disconnect it.
+                pool.drop_client().await;
                 tokio::time::sleep(AUTO_APPROVE_POLL_INTERVAL).await;
                 continue;
             };
             (id.identity.clone(), id.npub(), *id.browse_key.bytes())
         };
 
-        // One short-lived client per poll, as the WAN harness loop does: the persistent shared
-        // client (`net::client`) belongs to the command surface, and this loop must not hold it
-        // across its sleeps. Every failure below logs and retries on the next tick — an
-        // unreachable relay is a transient condition, not a reason to stop serving a granted peer.
+        // QURATOR-380 — ONE long-lived client, held across polls (was: a fresh connect to every
+        // relay per 5 s poll — ≈9,600 six-relay sessions/day on the owner's machine, the bulk of
+        // a 17.5 MB daily log). Rebuilt only when the pure decision says so: pool dead, identity
+        // changed (NIP-42 AUTH must answer as the CURRENT identity), or relay set changed. The
+        // 5 s cadence for the inbox FETCH is unchanged — a REQ over an open socket is cheap; a
+        // full connect + AUTH + TLS handshake to six relays is not.
         let relays = net::relay_urls(&store);
         let now_outer = now_secs();
         // Bandwidth-only cursor (see the declaration above); the 48 h margin is `get_messages`'s
@@ -719,21 +851,19 @@ pub(crate) async fn run_auto_approve_loop(
         // const, not a copy of its value, so the two windows can't drift (QURATOR-197).
         let since = auto_approve_inbox_since(newest_seen_outer, now_outer);
         let filter = auto_approve_inbox_filter(identity.public_key(), since);
-        let wraps = match RelayClient::connect(&identity, &relays, AUTO_APPROVE_FETCH_TIMEOUT).await {
-            Ok(client) => {
-                let fetched = client.fetch(filter, AUTO_APPROVE_FETCH_TIMEOUT).await;
-                client.disconnect().await;
-                match fetched {
-                    Ok(w) => w,
-                    Err(e) => {
-                        tracing::debug!("auto-approve: inbox fetch failed: {e}");
-                        tokio::time::sleep(AUTO_APPROVE_POLL_INTERVAL).await;
-                        continue;
-                    }
-                }
-            }
+        let client = match pool.acquire(&own_npub, &identity, &relays, AUTO_APPROVE_FETCH_TIMEOUT).await
+        {
+            Ok(client) => client,
             Err(e) => {
                 tracing::debug!("auto-approve: relay connect failed: {e}");
+                tokio::time::sleep(AUTO_APPROVE_POLL_INTERVAL).await;
+                continue;
+            }
+        };
+        let wraps = match client.fetch(filter, AUTO_APPROVE_FETCH_TIMEOUT).await {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::debug!("auto-approve: inbox fetch failed: {e}");
                 tokio::time::sleep(AUTO_APPROVE_POLL_INTERVAL).await;
                 continue;
             }
@@ -776,9 +906,10 @@ pub(crate) async fn run_auto_approve_loop(
         // is steady-state, never a burst; the teaser filter is a single author+kind read.
         let blocked_set: HashSet<String> =
             store.load_dm_blocked().unwrap_or_default().into_iter().collect();
-        // One lazily-connected client serves every teaser fetch this poll (never one connect per
-        // ask); the inbox client above is already disconnected by the time we get here.
-        let mut teaser_client: Option<RelayClient> = None;
+        // QURATOR-380 — the teaser fetch reuses the HELD client (`client`, acquired above):
+        // same `RelayClient`, same relay set, `fetch` works on a warm client. (Was: a SECOND
+        // client per poll whenever an access request needed a teaser — another six-relay
+        // session per such tick.)
         for msg in &msgs {
             let Some(req) = AccessRequest::parse(&msg.content) else {
                 continue; // not an access request — an ordinary chat DM or a manifest ask
@@ -816,23 +947,6 @@ pub(crate) async fn run_auto_approve_loop(
                     );
                     continue;
                 }
-            };
-            if teaser_client.is_none() {
-                teaser_client =
-                    match RelayClient::connect(&identity, &relays, AUTO_APPROVE_FETCH_TIMEOUT).await
-                    {
-                        Ok(c) => Some(c),
-                        Err(e) => {
-                            tracing::debug!(
-                                "auto-approve: teaser fetch connect failed: {e} — the ask stays \
-                                 unremembered, retried on the next poll"
-                            );
-                            break;
-                        }
-                    };
-            }
-            let Some(client) = teaser_client.as_ref() else {
-                continue;
             };
             // Fresh teaser, author-pinned — never a cached copy: the answerer re-checks the
             // CURRENT size, and the asker may have grown since they asked.
@@ -892,9 +1006,6 @@ pub(crate) async fn run_auto_approve_loop(
             {
                 seen_dirty = true;
             }
-        }
-        if let Some(client) = teaser_client {
-            client.disconnect().await;
         }
 
         // Anything the caps held on an earlier poll goes FIRST — oldest first, so a paced request
@@ -1977,6 +2088,231 @@ mod tests {
                 "the access pass wiring is missing (`{wiring}`)"
             );
         }
+    }
+
+    // ── QURATOR-380 — the held-client reuse decision (relay-churn fix) ────────────────────────
+
+    /// The happy path: a live client held under the SAME (npub, relay set) is REUSED — this is
+    /// the whole fix; per-tick reconnects are what produced ≈9,600 sessions/day. Also pins the
+    /// nothing-held arm: with no client held, a connect is required whatever `live` says.
+    ///
+    /// MUTATION (P-10) — in `client_needs_reconnect`, replace the whole body with `true` → the
+    /// first assert reds (a live same-key client would be needlessly rebuilt every poll). The
+    /// `None` asserts staying green under that mutation proves the arms are distinguished.
+    #[test]
+    fn a_live_client_with_the_same_key_is_reused() {
+        let npub = npub_of(&Identity::generate());
+        let relays = vec!["wss://a.example".into(), "wss://b.example".into()];
+        let key = ClientKey::new(&npub, &relays);
+        assert!(
+            !client_needs_reconnect(Some(&key), true, &key),
+            "a live client under the same (npub, relays) must be REUSED, never rebuilt"
+        );
+        assert!(
+            client_needs_reconnect(None, true, &key),
+            "nothing held ⇒ must connect, whatever `live` was passed"
+        );
+        assert!(
+            client_needs_reconnect(None, false, &key),
+            "nothing held and nothing live ⇒ must connect"
+        );
+    }
+
+    /// A dead pool (`is_live` false — every relay Terminated/Banned, the state nostr-sdk never
+    /// retries out of) forces a rebuild even under the same key.
+    ///
+    /// MUTATION (P-10) — in `client_needs_reconnect`, delete the `!live ||` term → this test
+    /// reds (a corpse is returned to the loop and every fetch against it fails).
+    #[test]
+    fn a_dead_pool_forces_a_reconnect() {
+        let npub = npub_of(&Identity::generate());
+        let relays = vec!["wss://a.example".into()];
+        let key = ClientKey::new(&npub, &relays);
+        assert!(
+            client_needs_reconnect(Some(&key), false, &key),
+            "a dead pool must be rebuilt even under an otherwise-equal key"
+        );
+    }
+
+    /// An identity change (wipe or import) forces a rebuild even when the relay set is
+    /// unchanged: NIP-42 AUTH on the held socket would keep answering with the OLD npub.
+    /// CLAUDE.md §6 — "NIP-42 answers with the identity npub, never the browse-key", and the
+    /// identity it answers AS must be the CURRENT one.
+    ///
+    /// MUTATION (P-10) — in `client_needs_reconnect`, compare only the relay lists (replace
+    /// `!live || held_key != want` with `!live || held_key.relays != want.relays`) → this test
+    /// reds (a wiped-then-regenerated identity would keep serving on the old socket).
+    #[test]
+    fn an_identity_change_forces_a_reconnect() {
+        let relays = vec!["wss://a.example".into()];
+        let old = ClientKey::new(&npub_of(&Identity::generate()), &relays);
+        let new = ClientKey::new(&npub_of(&Identity::generate()), &relays);
+        assert_ne!(old, new, "precondition: the two keys differ only in npub");
+        assert!(
+            client_needs_reconnect(Some(&old), true, &new),
+            "an identity change must force a reconnect — AUTH must answer as the CURRENT npub"
+        );
+    }
+
+    /// A relay-set change (the user edited relays) forces a rebuild even when live and same npub.
+    ///
+    /// MUTATION (P-10) — in `client_needs_reconnect`, compare only the npubs (`held_key.npub !=
+    /// want.npub`) → this test reds (a relay the user removed would stay in the serving set).
+    #[test]
+    fn a_relay_set_change_forces_a_reconnect() {
+        let npub = npub_of(&Identity::generate());
+        let old = ClientKey::new(&npub, &["wss://a.example".into()]);
+        let new = ClientKey::new(&npub, &["wss://a.example".into(), "wss://b.example".into()]);
+        assert!(
+            client_needs_reconnect(Some(&old), true, &new),
+            "a changed relay set must force a reconnect"
+        );
+    }
+
+    /// A REORDER of the same relay set is NOT a change: canonicalise (trim, lowercase, strip the
+    /// trailing slash), sort, dedup — then compare (§9: canonicalize against config-order
+    /// reorder by sorting before comparing). Case, whitespace and trailing-slash spelling
+    /// differences are not changes either.
+    ///
+    /// MUTATION (P-10) — in `ClientKey::new`, delete the `relays.sort();` line (the dedup may
+    /// stay) → this test reds: the reordered key no longer compares equal and the live
+    /// same-set client would be rebuilt on every relays-order wobble.
+    #[test]
+    fn a_relay_set_reorder_is_not_a_change() {
+        let npub = npub_of(&Identity::generate());
+        let a = ClientKey::new(&npub, &["wss://a.example".into(), "wss://b.example".into()]);
+        let b = ClientKey::new(&npub, &["wss://b.example".into(), "wss://a.example".into()]);
+        assert_eq!(a, b, "a reorder of the same set canonicalises to one key");
+        assert!(
+            !client_needs_reconnect(Some(&a), true, &b),
+            "a reorder must not churn a healthy client"
+        );
+        // Same set, different spelling: trailing slash, case, surrounding whitespace.
+        let c = ClientKey::new(&npub, &[" WSS://A.example/ ".into(), "wss://b.example".into()]);
+        assert_eq!(a, c, "spelling differences of the same URLs canonicalise away");
+        // A duplicate entry collapses.
+        let d = ClientKey::new(&npub, &["wss://a.example".into(), "wss://a.example".into(), "wss://b.example".into()]);
+        assert_eq!(a, d, "a duplicate relay entry is not a change either");
+    }
+
+    /// THE reuse proof (order item 5): several acquire iterations against a LIVE client cause
+    /// exactly ONE connect. The connector is injected (`acquire_with`) and counts; the "live"
+    /// client it returns is `RelayClient::undialed` — registered in the pool but never dialed,
+    /// whose status (`Initialized`) `pool_is_live` treats as live — so the reuse branch really
+    /// runs `is_live()` against a real client. This is the seam: no fake relay server, and the
+    /// production wrapper `acquire` still passes the real `RelayClient::connect`.
+    ///
+    /// MUTATION (P-10) — in `ClientPool::acquire_with`, replace the
+    /// `if client_needs_reconnect(...) {` gate with an unconditional
+    /// `self.drop_client().await; let client = connect(identity, relays, timeout).await?;
+    /// self.held = Some((want, client));` — i.e. move the connect back inside the per-tick body
+    /// → this test reds (`connects == 5`, not 1).
+    #[tokio::test]
+    async fn several_iterations_against_a_live_client_connect_exactly_once() {
+        let identity = Identity::generate();
+        let npub = npub_of(&identity);
+        let relays = vec!["ws://127.0.0.1:1".to_string()]; // never dialed by the injected connector
+        let mut pool = ClientPool::default();
+        let mut connects = 0u32;
+        for _ in 0..5 {
+            pool.acquire_with(&npub, &identity, &relays, Duration::from_secs(1), |identity, relays, _| {
+                connects += 1;
+                Box::pin(async move { Ok(RelayClient::undialed(&identity, &relays).await) })
+            })
+            .await
+            .expect("the injected connector always succeeds");
+        }
+        assert_eq!(
+            connects, 1,
+            "five ticks against one live client must dial exactly once — the 2nd..5th acquire \
+             calls must REUSE the held client (QURATOR-380)"
+        );
+        // And the held client is the one returned, keyed to what was wanted.
+        let held_key = pool.held.as_ref().expect("a client is held").0.clone();
+        assert_eq!(held_key, ClientKey::new(&npub, &relays), "held under the wanted key");
+    }
+
+    /// `drop_client` really clears the hold — the no-identity branch and every rebuild depend
+    /// on the NEXT acquire dialing fresh afterwards. Driven through the injected connector (no
+    /// relay); the close frame itself is WAN-GRANT's evidence.
+    ///
+    /// MUTATION (P-10) — in `ClientPool::drop_client`, replace the body with `{}` (a no-op that
+    /// keeps the client held) → both asserts red (the hold survives the drop, and the next
+    /// acquire dials nothing).
+    #[tokio::test]
+    async fn drop_client_clears_the_hold() {
+        let identity = Identity::generate();
+        let npub = npub_of(&identity);
+        let relays = vec!["ws://127.0.0.1:1".to_string()];
+        let mut pool = ClientPool::default();
+        pool.acquire_with(&npub, &identity, &relays, Duration::from_secs(1), |identity, relays, _| {
+            Box::pin(async move { Ok(RelayClient::undialed(&identity, &relays).await) })
+        })
+        .await
+        .expect("the injected connector always succeeds");
+        assert!(pool.held.is_some(), "precondition: a client is held");
+        pool.drop_client().await;
+        assert!(pool.held.is_none(), "drop_client clears the hold");
+        let mut connects = 0u32;
+        pool.acquire_with(&npub, &identity, &relays, Duration::from_secs(1), |identity, relays, _| {
+            connects += 1;
+            Box::pin(async move { Ok(RelayClient::undialed(&identity, &relays).await) })
+        })
+        .await
+        .expect("the injected connector always succeeds");
+        assert_eq!(
+            connects, 1,
+            "after a drop the next acquire dials FRESH — nothing held, so nothing to reuse"
+        );
+    }
+
+    /// The loop-reachability pin for the no-identity branch and the rebuild path: both must
+    /// drop the held client, and the loop must never dial directly or run a per-tick second
+    /// client. Counted in CALL FORM over comment-stripped source (P-12); every needle here is
+    /// built at runtime (the `call` helper or a local binding) so this test's own literals can
+    /// never match themselves.
+    ///
+    /// MUTATION (P-10) — delete the `pool.drop_client().await;` line from the no-identity
+    /// branch of `run_auto_approve_loop` → the first assert reds (count 0).
+    #[test]
+    fn the_no_identity_branch_drops_the_client() {
+        let call = |name: &str| format!("{name}(");
+        // Production half only: this test module's own `pool.drop_client()` (in
+        // `drop_client_clears_the_hold`) would otherwise be counted.
+        let whole = include_str!("auto_approve.rs");
+        let marker = format!("{}{}", "mod ", "tests {");
+        let production = &whole[..whole.find(&marker).expect("test module marker")];
+        let source: String = production
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            source.matches(&call("pool.drop_client")).count(),
+            1,
+            "the no-identity branch must drop the held client — it must never outlive the \
+             identity it authenticates as"
+        );
+        assert_eq!(
+            source.matches(&call("self.drop_client")).count(),
+            1,
+            "the rebuild path must disconnect the OLD client before dialing the new one"
+        );
+        let gone = String::from("teaser_client");
+        assert!(
+            !source.contains(&gone),
+            "the per-tick second client is gone — every fetch rides the held client"
+        );
+        // Scoped to the loop body: `ClientPool::acquire`'s connector is the one legitimate dial.
+        let loop_start = source
+            .find(&format!("{}{}", "async fn run_auto_approve_loop", "("))
+            .expect("loop fn present");
+        let loop_body = &source[loop_start..];
+        let direct_dial = format!("{}{}", "RelayClient::connect", "(");
+        assert!(
+            !loop_body.contains(&direct_dial),
+            "the loop must never dial directly — connects go through ClientPool::acquire only"
+        );
     }
 
 }

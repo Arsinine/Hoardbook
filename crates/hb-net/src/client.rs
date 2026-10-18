@@ -314,8 +314,14 @@ impl RelayClient {
             // `===` comparison on relay URLs (trailing slash, etc.) that made two "same" relays
             // compare unequal, and the diagnostics panel could not show it. Logging both makes a
             // URL-normalization mismatch visible in the log a user pastes.
+            //
+            // QURATOR-380: TRACE, not debug. This line fires SIX TIMES per connect; before the
+            // long-lived auto-approve client it fired ≈57,600 times/day (57,576 measured on the
+            // owner's 2026-10-17 log) — pure per-session plumbing with no signal per line. The
+            // connect/disconnect lines (info) stay rare now that sessions are long-lived and
+            // remain the useful reconnect evidence.
             let canon = canonical_relay_url(r);
-            tracing::debug!(raw_url = %r, canonical_url = %canon, "relay client: add_relay");
+            tracing::trace!(raw_url = %r, canonical_url = %canon, "relay client: add_relay");
             client
                 .add_relay(r.as_str())
                 .await
