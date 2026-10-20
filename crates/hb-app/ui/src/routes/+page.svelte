@@ -654,7 +654,9 @@
 				<div class="ob-card-sub">Collections you browse are kept on this device. When someone else asks for one, Hoardbook sends them your copy in the background. This can't be turned off.</div>
 				<div class="ob-notice">
 					<span class="ob-notice-icon">{@html icons.shield}</span>
-					<div class="ob-notice-text">To fetch and share more, turn on Settings → Fetch new collections automatically.</div>
+					<!-- QURATOR-388, owner devtest 2026-10-20: swarm_caching is now ON by default, so the
+				     step says it is on, keeps the reciprocity disclosure, and names the off switch. -->
+				<div class="ob-notice-text">Fetching new collections automatically is on. People will request collections from you too. Turn it off in Settings → Preferences → Fetch new collections automatically.</div>
 				</div>
 				<button class="btn-primary btn-full" onclick={obAckSharing}>Continue →</button>
 				<button class="btn-ghost btn-full ob-skip" onclick={() => obStep = 2}>← Back</button>
@@ -852,8 +854,9 @@
 					<!-- QURATOR-342 E: "Tags" → "Interests" — the label names what the field DECIDES
 					     (the "People like you" ranking on Contacts is built from these). Data stays
 					     `form.tags`; only the copy changed. -->
-					<label class="field-label">Interests</label>
-					<div class="field-hint">This decides who and what gets recommended — People like you on Contacts is ranked from these.</div>
+					<!-- QURATOR-388, owner devtest 2026-10-20: the field-hint line moved into a
+					     HintMarker tooltip on the label; the text is the QURATOR-342 copy, verbatim. -->
+					<label class="field-label">Interests<HintMarker label="Interests" text="This decides who and what gets recommended — People like you on Contacts is ranked from these." /></label>
 					<div class="tag-wrap">
 						{#each form.tags as tag, i (tag)}
 							<span class="lang-tag">{tag}<button class="lang-x" onclick={() => removeTag(i)} title="Remove">×</button></span>

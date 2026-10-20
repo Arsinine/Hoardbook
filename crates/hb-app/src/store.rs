@@ -54,8 +54,11 @@ pub struct Settings {
     /// default; off = today's manual-only "Regenerate" behaviour (Decision #17).
     #[serde(default = "default_true")]
     pub snapshot_auto_update: bool,
-    /// M9: an opt-in low-frequency reconcile poll for users who edit their shares from another host
-    /// (SMB server-side edits a local watch can't see). Off by default — most users don't need it.
+    /// M9: a low-frequency reconcile poll for users who edit their shares from another host
+    /// (SMB server-side edits a local watch can't see). QURATOR-388, owner devtest 2026-10-20:
+    /// fresh installs start ON; **the serde (old-file) default stays `false`** — a pre-existing
+    /// `settings.json` missing the key still loads OFF, the `discoverable` precedent (existing
+    /// users are never silently flipped by an upgrade).
     #[serde(default)]
     pub snapshot_reconcile_poll: bool,
     /// M9: show the optional "🟢 N online" indicator (relay-derived; no telemetry). On by default;
@@ -82,14 +85,17 @@ pub struct Settings {
     /// no migration.
     #[serde(default)]
     pub big_relay_url: String,
-    /// QURATOR-164 — the ONE opt-in switch for the swarm-caching tier. Covers two things at once
+    /// QURATOR-164 — the ONE switch for the swarm-caching tier. Covers two things at once
     /// (owner ruling 2026-09-04, "relay-caching is the same switch"): discovery-triggered
     /// auto-fetch of every public collection of a newly-surfaced peer, AND relay-caching
-    /// (retaining data that passed through this node to a recipient). Opting in means holding far
-    /// more and therefore being asked far more — the Settings copy must say so plainly. This is
+    /// (retaining data that passed through this node to a recipient). Holding far more means
+    /// being asked far more — the Settings copy must say so plainly. This is
     /// the switch tier only; the always-on baseline (serving what this node itself browsed) has
-    /// NO switch. **Default false**: a pre-existing `settings.json` with no such key loads as
-    /// `false` (bool serde default) — the intended silent opt-out, no migration.
+    /// NO switch. QURATOR-388, owner devtest 2026-10-20 (reversing the 2026-09-04 opt-in
+    /// ruling): **fresh installs start ON** (`Settings::default()`), while **the serde (old-file)
+    /// default stays `false`** — a pre-existing `settings.json` with no such key still loads as
+    /// `false` (bool serde default), no migration: an existing user's saved settings are never
+    /// silently flipped by an upgrade (the `discoverable` precedent, owner ruling 2026-09-26).
     #[serde(default)]
     pub swarm_caching: bool,
     /// QURATOR-164 — the one-time baseline startup notice ("you pass along collections you have
@@ -135,12 +141,15 @@ impl Default for Settings {
             privacy_notice_acknowledged: false,
             last_seen_version: String::new(),
             snapshot_auto_update: true,
-            snapshot_reconcile_poll: false,
+            // QURATOR-388, owner devtest 2026-10-20: all five Preferences toggles start ON on a
+            // fresh install. The serde (old-file) defaults below stay as they were — an existing
+            // user's saved settings are never silently flipped, the `discoverable` precedent.
+            snapshot_reconcile_poll: true,
             show_online_count: true,
             // Owner ruling 2026-09-26: fresh installs start discoverable — see the field doc above.
             discoverable: true,
             big_relay_url: String::new(),
-            swarm_caching: false,
+            swarm_caching: true,
             serving_notice_acknowledged: false,
             known_default_relays: Vec::new(),
             // QURATOR-352 appearance fields: a fresh install matches the serde (old-file) defaults.
@@ -2197,8 +2206,14 @@ pub(crate) mod tests {
         assert!(!s.privacy_notice_acknowledged, "defaults to not-acknowledged");
         assert_eq!(s.last_seen_version, "", "defaults to empty (fresh install)");
         // M9 fields default sensibly on an old file: auto-update + online-count ON, reconcile OFF.
+        // QURATOR-388, owner devtest 2026-10-20: the FRESH-install default is now ON
+        // (`Settings::default()`); only the old-file (serde) default stays OFF — existing users
+        // are never silently flipped.
         assert!(s.snapshot_auto_update, "snapshot auto-update defaults ON");
-        assert!(!s.snapshot_reconcile_poll, "reconcile poll defaults OFF");
+        // MUTATION (P-10): on the `pub snapshot_reconcile_poll: bool,` field, change
+        // `#[serde(default)]` to `#[serde(default = "default_true")]` — this assert reds (an old
+        // file would then load the poll ON, silently flipping existing users).
+        assert!(!s.snapshot_reconcile_poll, "reconcile poll defaults OFF on an old file (a fresh install starts ON — QURATOR-388)");
         assert!(s.show_online_count, "online-count chip defaults ON");
         // devtest #5: a pre-existing settings.json with no `discoverable` key loads as false — the
         // intended silent de-list, no migration.
@@ -2207,12 +2222,13 @@ pub(crate) mod tests {
         // off until the owner configures a big relay.
         assert_eq!(s.big_relay_url, "", "big_relay_url defaults empty (feature off) on an old file");
         // QURATOR-164: a pre-QURATOR-164 file with neither new key loads both as false — the
-        // switch tier off, and the baseline startup notice still owed.
+        // baseline startup notice still owed, and (QURATOR-388) the switch stays OFF on an old
+        // file even though a fresh install now starts ON.
         // MUTATION (P-10): on the `pub swarm_caching: bool,` field in the `Settings` struct
         // above, change `#[serde(default)]` to `#[serde(default = "default_true")]` — this
-        // assert reds (an old file would then load the switch as ON, silently opting every
+        // assert reds (an old file would then load the switch as ON, silently flipping every
         // existing user into the heavier tier).
-        assert!(!s.swarm_caching, "swarm_caching defaults OFF on an old file (opt-in only)");
+        assert!(!s.swarm_caching, "swarm_caching defaults OFF on an old file (a fresh install starts ON — QURATOR-388)");
         // QURATOR — owner ruling 2026-09-26: only `Settings::default()` (a truly fresh install with
         // no settings.json at all) starts discoverable ON. An EXISTING file — even one predating
         // this field, as parsed here via serde — must load OFF; an upgrade must never silently
@@ -2236,6 +2252,31 @@ pub(crate) mod tests {
         let old = r#"{"relay_urls":[]}"#;
         let s: Settings = serde_json::from_str(old).expect("old settings must still deserialize");
         assert!(!s.discoverable, "an existing file with no `discoverable` key stays OFF");
+    }
+
+    #[test]
+    fn a_fresh_install_starts_all_five_preferences_on() {
+        // QURATOR-388, owner devtest 2026-10-20: "For preferences enable all 5 of them by
+        // default" — allow_dms, snapshot_auto_update, snapshot_reconcile_poll, discoverable and
+        // swarm_caching are all TRUE in `Settings::default()` (a genuinely fresh install with no
+        // settings.json at all). The serde old-file defaults are unchanged: an existing user's
+        // saved settings are never silently flipped by an upgrade (the `discoverable` precedent,
+        // owner ruling 2026-09-26).
+        // MUTATION (P-10): in `impl Default for Settings`, change `snapshot_reconcile_poll: true,`
+        // to `false` — this assert reds.
+        assert!(
+            Settings::default().snapshot_reconcile_poll,
+            "a fresh install starts the reconcile poll ON"
+        );
+        // MUTATION (P-10): in `impl Default for Settings`, change `swarm_caching: true,` to
+        // `false` — this assert reds.
+        assert!(Settings::default().swarm_caching, "a fresh install starts swarm_caching ON");
+        assert!(Settings::default().allow_dms, "allow_dms stays ON");
+        assert!(Settings::default().snapshot_auto_update, "snapshot_auto_update stays ON");
+        assert!(
+            Settings::default().discoverable,
+            "discoverable stays ON (owner ruling 2026-09-26)"
+        );
     }
 
     #[test]

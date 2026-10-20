@@ -144,6 +144,18 @@ describe('minor-4 — a failed DM-history load is not a confident "No conversati
 		await waitFor(() => expect(getByText(/no conversations yet/i)).toBeTruthy());
 		expect(queryByText(/couldn.t load your conversations/i)).toBeNull();
 	});
+
+	it('the genuine empty offers [Find hoarders] → /contacts (QURATOR-390)', async () => {
+		getMessagesMock.mockResolvedValue([]);
+		primeIdentity();
+		contacts.set([]);
+
+		const { findByRole } = render(ChatPage);
+		// The zero-state action is an anchor to Contacts. Exact name — the shield notice's
+		// "Find hoarders in Contacts →" must not satisfy this query.
+		const link = await findByRole('link', { name: 'Find hoarders' });
+		expect(link.getAttribute('href')).toBe('/contacts');
+	});
 });
 
 describe('minor-4 — a failed message-requests load is not a confident "No message requests."', () => {

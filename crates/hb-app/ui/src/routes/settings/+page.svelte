@@ -60,10 +60,13 @@
 	let settings: SettingsWithAppearance = $state({
 		relay_urls: [], allow_dms: true, privacy_notice_acknowledged: false,
 		last_seen_version: '',
-		snapshot_auto_update: true, snapshot_reconcile_poll: false, show_online_count: true,
-		discoverable: false,
+		// QURATOR-388, owner devtest 2026-10-20: this pre-load stub mirrors the fresh-install
+		// defaults (store.rs `Settings::default()`) so nothing presents the new ON defaults as OFF;
+		// real settings replace it the moment they load.
+		snapshot_auto_update: true, snapshot_reconcile_poll: true, show_online_count: true,
+		discoverable: true,
 		big_relay_url: '',
-		swarm_caching: false, serving_notice_acknowledged: false,
+		swarm_caching: true, serving_notice_acknowledged: false,
 	});
 
 	// ── QURATOR-352: Appearance section state ────────────────────────────────────
@@ -608,7 +611,8 @@
 		}
 	}
 
-	// QURATOR-164: the one opt-in switch (discovery auto-fetch + relay-caching together). Same
+	// QURATOR-164: the swarm-caching switch (discovery auto-fetch + relay-caching together); ON by
+	// default on a fresh install since QURATOR-388 (owner devtest 2026-10-20). Same
 	// flip-and-persist shape as the others — no side effects yet, the behaviour is a later build
 	// item that reads this flag.
 	async function toggleSwarmCaching() {
@@ -975,7 +979,9 @@
 	<div class="surface">
 		<div class="toggle-row">
 			<div class="toggle-text">
-				<div class="toggle-label">Allow incoming messages from anyone<FeatureTooltip key="allow-dms" /></div>
+				<!-- QURATOR-388, owner devtest 2026-10-20: the allow-DMs tooltip was removed — the
+				     label is self-explanatory. -->
+				<div class="toggle-label">Allow incoming messages from anyone</div>
 			</div>
 			<button class="toggle" class:toggle-on={allowDms} onclick={toggleAllowDms} disabled={!settingsLoaded} aria-label="Allow incoming messages from anyone">
 				<span class="toggle-thumb"></span>

@@ -68,6 +68,18 @@ async function mounted() {
 }
 
 describe('QURATOR-148 — aliveness gates the discovery sidebar', () => {
+	it('the genuine empty carries a Create Topic action that opens the create modal (QURATOR-390)', async () => {
+		paintMock.mockResolvedValue([]);
+		rankMock.mockResolvedValue([]);
+		const { container, getByRole } = await mounted();
+
+		await waitFor(() => expect(container.textContent).toContain('No Topics yet'));
+		// Exact accessible name — the toolbar's "+ New Topic" must not satisfy this.
+		await fireEvent.click(getByRole('button', { name: 'Create Topic' }));
+		// The create modal is UP (a closed modal renders no dialog role).
+		await waitFor(() => expect(getByRole('dialog')).toBeTruthy());
+	});
+
 	it('a Topic with a member alive in 30 days stays; one with none drops out of the directory', async () => {
 		listMock.mockResolvedValue([]);
 		paintMock.mockResolvedValue([disc('live', 'video/live-room'), disc('dead', 'video/dead-room')]);
@@ -142,8 +154,8 @@ describe('QURATOR-148 — aliveness gates the discovery sidebar', () => {
 		// quiet — distinct copy from the confident "Nothing here yet" negative (the QURATOR-80/93
 		// rule at Topic scale).
 		await waitFor(() =>
-			expect(container.textContent).toContain('No live Topics right now'),
+			expect(container.textContent).toContain('No active Topics'),
 		);
-		expect(container.textContent).not.toContain('Nothing here yet');
+		expect(container.textContent).not.toContain('No Topics yet');
 	});
 });

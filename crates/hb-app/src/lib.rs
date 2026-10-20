@@ -566,15 +566,15 @@ pub fn run() {
                     .await;
                     tracing::info!("startup: manifest-plane rebind check complete");
 
-                    // QURATOR-68: NAT classification probe. If the manifest plane already bound an
-                    // endpoint (outstanding ticket ⇒ Listen, or any future always-bind path), reuse
-                    // its handle rather than binding a second one — the ruling-compliant reuse path.
-                    // Otherwise bind a fresh dial-only endpoint with the session's transport key,
-                    // classify, log, store, and close it.
-                    let existing = endpoint.read().await.bound.as_ref().map(|b| b.endpoint.clone());
-                    tracing::info!("startup: NAT classification probe spawning");
-                    nat::probe_and_close(transport_key.bytes(), &nat_slot, existing).await;
-                    tracing::info!("startup: NAT classification probe complete");
+                    // QURATOR-68 + QURATOR-389: NAT classification probe, through the SAME
+                    // single-flight helper the post-identity path uses (one helper, both paths —
+                    // the guard and single-flight logic cannot drift between them). If the manifest
+                    // plane already bound an endpoint, the helper reuses its handle instead of
+                    // binding a second one; otherwise it binds a fresh dial-only endpoint,
+                    // classifies, logs, stores, and closes it. When no identity existed at startup
+                    // (fresh install — the QURATOR-389 case), the task above early-returns and the
+                    // probe instead fires from the identity commands via the same helper.
+                    nat::probe_after_identity(transport_key.bytes(), &nat_slot, &endpoint).await;
                 });
             }
             tracing::info!("startup: presence loop + update check spawning");

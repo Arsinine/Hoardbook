@@ -1030,9 +1030,9 @@
 				     fold drops. Painted-but-dropped is a DIFFERENT honest state from never-painted:
 				     it says the directory was read and nothing in it is worth joining. -->
 				{#if painted && directory.length === 0 && deadDropped > 0}
-					<EmptyState message="No live Topics right now — every public Topic in the directory went quiet over 30 days ago. Create one, or check back later." />
+					<EmptyState message="No active Topics" actions={[{ label: 'Create Topic', onclick: () => (createOpen = true) }]} />
 				{:else}
-					<EmptyState message="Nothing here yet. Create a Topic, or join one from the directory." />
+					<EmptyState message="No Topics yet" actions={[{ label: 'Create Topic', onclick: () => (createOpen = true) }]} />
 				{/if}
 			{:else}
 				<!-- QURATOR-193 — the cold-paint hold rides HERE, not on .list-pane: the empty and

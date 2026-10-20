@@ -125,4 +125,17 @@ describe('QURATOR-93 — Contacts load failure is not a confident empty', () => 
 		expect(await findByText(EMPTY_STRING)).toBeTruthy();
 		expect(queryByRole('alert')).toBeNull();
 	});
+
+	it('the genuine empty offers [Add contact]; clicking opens the add-contact panel (QURATOR-390)', async () => {
+		getContactsMock.mockResolvedValue([]);
+		const { loadContactsInto } = await import('$lib/stores.js');
+		await loadContactsInto(getContacts);
+
+		const { getByRole, findByRole } = render(ContactsPage);
+		// Exact accessible name — the topbar "+ Add contact" must not satisfy this query.
+		const zero = await findByRole('button', { name: 'Add contact' });
+		await fireEvent.click(zero);
+		// The SAME panel the topbar opens is now up (its <h2>Add contact</h2>).
+		await findByRole('heading', { name: 'Add contact' });
+	});
 });

@@ -2,11 +2,14 @@
 	// QURATOR-102 — the shared empty state. Four dialects existed across the routes (Home's `.empty`
 	// line, Contacts' `.empty`, Chat's `.convo-empty`/`.thread-empty`, Browse's `.empty-state` card,
 	// Topics' `.empty`), differing in size (12–13px), tone and structure. One component now owns the
-	// shape; each site passes its EXISTING message text (no copy change) plus optional affordances:
+	// shape; each site passes its message text plus optional affordances:
 	//
 	//   - `icon`    — an SVG string from lib/icons.ts (never emoji), rendered dim + scaled like
 	//                 Browse's empty-icon.
 	//   - `cta`     — { label, href } renders a link (e.g. Chat's dead-end pane → /contacts).
+	//   - `actions` — QURATOR-390 zero-state actions: { label, onclick?, href? }[] rendered as real
+	//                 <button>s — first one btn-primary, the rest btn-default — or <a>s when href is
+	//                 set (owner devtest 2026-10-20, "Noun + action button" zero-states).
 	//   - `error`   — true renders the message on the --error ramp with a working Retry button.
 	//                 This is the QURATOR-93 surface: a FAILED load must never read as a confident
 	//                 negative. `onretry` re-runs the fetch; the caller clears the flag on success
@@ -18,6 +21,8 @@
 		message: string;
 		icon?: string;
 		cta?: { label: string; href: string };
+		/** QURATOR-390 zero-state actions: real buttons (first btn-primary, rest btn-default); href renders an anchor. */
+		actions?: { label: string; onclick?: () => void; href?: string }[];
 		/** Error variant (QURATOR-93): distinct colour + a Retry affordance. */
 		error?: boolean;
 		onretry?: () => void;
@@ -25,7 +30,7 @@
 		centered?: boolean;
 	}
 
-	let { message, icon, cta, error = false, onretry, centered = false }: Props = $props();
+	let { message, icon, cta, actions, error = false, onretry, centered = false }: Props = $props();
 </script>
 
 <div class="hb-empty" class:hb-empty-centered={centered} class:hb-empty-error={error} role={error ? 'alert' : undefined}>
@@ -33,6 +38,17 @@
 		<div class="hb-empty-icon">{@html icon}</div>
 	{/if}
 	<div class="hb-empty-label">{message}</div>
+	{#if actions && actions.length > 0}
+		<div class="hb-empty-actions">
+			{#each actions as a, i (a.label)}
+				{#if a.href}
+					<a class={i === 0 ? 'btn-primary btn-sm' : 'btn-default btn-sm'} href={a.href}>{a.label}</a>
+				{:else}
+					<button type="button" class={i === 0 ? 'btn-primary btn-sm' : 'btn-default btn-sm'} onclick={a.onclick}>{a.label}</button>
+				{/if}
+			{/each}
+		</div>
+	{/if}
 	{#if error && onretry}
 		<button type="button" class="btn-default btn-sm" onclick={onretry}>Retry</button>
 	{/if}
@@ -74,6 +90,14 @@
 	}
 
 	.hb-empty-label { line-height: 1.45; }
+
+	/* QURATOR-390: the action row rides the shared .btn system — no local button styling. */
+	.hb-empty-actions {
+		display: flex;
+		gap: 8px;
+		margin-top: 4px;
+		flex-wrap: wrap;
+	}
 
 	.hb-empty-cta {
 		font-size: 12px;

@@ -291,7 +291,14 @@
 		     only empty padding and never swallows a click on a route action. It gives the user an
 		     obvious grab point to drag the window. Route topbars reserve right-space for the controls
 		     via the :global(.topbar) padding rule below. -->
-		<div class="win-drag-top" data-tauri-drag-region aria-hidden="true"></div>
+		<!-- QURATOR-391 (devtest item 1) — on first run there is no identity, so no route .topbar
+		     renders and the only drag handle was the 8px strip — the window could not be drag-moved.
+		     The onboarding screen is vertically centered in .main, so its top band is empty space:
+		     when !$identity the same strip grows to 52px (a title-only route .topbar is ~52px:
+		     16px + 17px title + 16px padding; bars with a subtitle measure 77px, see
+		     home-topbar-height.test.ts). It stays inside .main, clear of the sidebar's brand button
+		     (a control — the strip must never cover one, QURATOR-81). -->
+		<div class="win-drag-top" class:win-drag-first-run={!$identity} data-tauri-drag-region aria-hidden="true"></div>
 		<div class="win-controls-host" data-tauri-drag-region>
 			<WindowControls />
 		</div>
@@ -525,6 +532,14 @@
 		height: 8px;
 		z-index: 5;
 		app-region: drag;
+	}
+
+	/* QURATOR-391 (devtest item 1) — first run has no route topbar, so the drag strip grows to a
+	   usable bar-height band. 52px matches a title-only .topbar (16px padding + ~20px title);
+	   it stays well clear of the onboarding card's controls, which are vertically centered and
+	   begin ~180px down even at a 600px-tall window (the strip covers only empty top space). */
+	.win-drag-top.win-drag-first-run {
+		height: 52px;
 	}
 
 	/* QURATOR-81 — the three controls (minimize / maximize-restore / close), absolute top-right.

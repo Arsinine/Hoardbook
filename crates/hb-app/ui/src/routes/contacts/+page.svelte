@@ -53,6 +53,26 @@
 	// M12 W1 Decision D: when the chip can't show a number, say *why* (which relays are unreachable).
 	let whyHint = $derived(chip.unknown ? relayWhyHint(relayHealth) : '');
 	let onlinePollTimer: ReturnType<typeof setInterval> | undefined;
+	// QURATOR-391 (devtest item 5) — the first open could show a stale "– on network" (red dot)
+	// for up to the whole 20s interval: the mount poll fires while the backend/relays are still
+	// coming up, the catch keeps the old value, and `setInterval` schedules nothing sooner.
+	// Switching tabs "fixed" it only because leaving Contacts unmounted the page and coming back
+	// re-polled on mount. Fix: a SHORT retry chain — armed only while the chip is still unknown,
+	// capped at 3 per mount — instead of waiting out the interval.
+	let onlineRetryTimer: ReturnType<typeof setTimeout> | undefined;
+	let onlineRetriesUsed = 0;
+	const ONLINE_RETRY_MS = 2_000;
+	const ONLINE_RETRY_MAX = 3;
+
+	function scheduleOnlineRetry() {
+		if (onlineRetryTimer || onlineRetriesUsed >= ONLINE_RETRY_MAX) return;
+		onlineRetriesUsed += 1;
+		onlineRetryTimer = setTimeout(() => {
+			onlineRetryTimer = undefined;
+			refreshOnline();
+		}, ONLINE_RETRY_MS);
+	}
+
 	async function refreshOnline() {
 		// Decision B: don't poll the relays while the window is hidden (tray/minimized).
 		if (document.hidden) return;
@@ -66,6 +86,11 @@
 		if (chip.unknown) {
 			try { relayHealth = await relayStatus(); } catch { /* leave last health */ }
 		}
+		// QURATOR-391: while the chip is STILL unknown after a poll, arm a short retry (2s apart,
+		// at most 3 per mount) instead of waiting out the 20s interval. Once the chip knows its
+		// answer the chain never arms — and a genuinely-down backend exhausts the 3-retry budget
+		// once per mount and falls back to the normal tick, so steady-state poll load is unchanged.
+		if (chip.unknown) scheduleOnlineRetry();
 	}
 	// W5 review: the age needs its OWN reactive clock. Reading Date.now() inside a template helper
 	// makes the render depend on the online poll assigning `onlineData` — so a rejected poll, or a tab
@@ -77,6 +102,7 @@
 	const clockTimer = setInterval(() => { nowMs = Date.now(); }, PRESENCE_TICK_MS);
 	onDestroy(() => {
 		if (onlinePollTimer) clearInterval(onlinePollTimer);
+		if (onlineRetryTimer) clearTimeout(onlineRetryTimer);
 		clearInterval(clockTimer);
 	});
 
@@ -1563,7 +1589,7 @@
 				onretry={retryContactsLoad}
 			/>
 		{:else if $contacts.length === 0}
-			<EmptyState message="No contacts yet. Use “+ Add contact” to find someone by ID or discover hoarders." />
+			<EmptyState message="No contacts yet" actions={[{ label: 'Add contact', onclick: () => (addContactPanelOpen = true) }]} />
 		{:else}
 			{#if view === 'groups'}
 				<!-- Groups-view management strip (M21 W5): organisational only — colour is the sole

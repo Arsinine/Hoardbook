@@ -108,7 +108,7 @@ describe('review 1 — paint failure with joined rows still surfaces a retryable
 		expect(await findByText('video/anime')).toBeTruthy();
 		// ...and the failure says so, retryably — not silence, and not the confident negative.
 		await waitFor(() => expect(getByRole('alert')).toBeTruthy());
-		expect(container.textContent).not.toContain('Nothing here yet');
+		expect(container.textContent).not.toContain('No Topics yet');
 
 		await fireEvent.click(getByRole('button', { name: /retry/i }));
 		await tick();

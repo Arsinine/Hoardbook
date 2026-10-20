@@ -5,8 +5,9 @@
 // content, not feature help.
 //
 // Owner ruling 2026-09-26: the Settings "Preferences" toggles' long explanatory sub-copy moved
-// here (allow-dms, auto-update-snapshots, reconcile-poll, discoverable) — each toggle keeps a
+// here (auto-update-snapshots, reconcile-poll, discoverable) — each toggle keeps a
 // short one-line label/sub-label on the page and the fuller explanation lives behind its (i).
+// allow-dms was removed QURATOR-388 (owner devtest 2026-10-20: the label is self-explanatory).
 // "Fetch new collections automatically" (swarm-caching) was the exception until 2026-10-14: its
 // reciprocity disclosure stayed visible on the page (QURATOR-164). The owner's v0.25.0 devtest moved
 // it behind the (i) like the others ("hide the additional copy in a tooltip like the others").
@@ -19,7 +20,6 @@ export type TooltipKey =
 	| 'fingerprint'
 	| 'custom-relays'
 	| 'network-type'
-	| 'allow-dms'
 	| 'auto-update-snapshots'
 	| 'reconcile-poll'
 	| 'discoverable'
@@ -34,7 +34,6 @@ export const TOOLTIP_KEYS: TooltipKey[] = [
 	'fingerprint',
 	'custom-relays',
 	'network-type',
-	'allow-dms',
 	'auto-update-snapshots',
 	'reconcile-poll',
 	'discoverable',
@@ -86,20 +85,19 @@ export const TOOLTIPS: Record<TooltipKey, TooltipContent> = {
 		title: 'Network type',
 		body: 'How your connection sits behind your router. NAT is normal. CGNAT means your provider funnels many customers through one address, so sending someone a full collection list may need a relay, or fail if neither side is reachable. Browsing, chat, Topics, and presence work the same either way.',
 	},
-	'allow-dms': {
-		title: 'Allow incoming messages from anyone',
-		body: 'Off means only your contacts can DM you. Strangers can still ask, but their message waits as a Request until you accept, decline, or block.',
-	},
+	// QURATOR-388, owner devtest 2026-10-20: the allow-dms entry was removed — the toggle label is
+	// self-explanatory. The auto-update-snapshots body was shortened to end at "updates it." (the
+	// owner asked to cut everything after "Either way").
 	'auto-update-snapshots': {
 		title: 'Auto-update snapshots on change',
-		body: 'Re-publishes a collection automatically when its folder changes. Off means only a manual rescan updates it. Either way, edits made from another computer on a network share are picked up at launch.',
+		body: 'Re-publishes a collection automatically when its folder changes. Off means only a manual rescan updates it.',
 	},
 	// Owner ruling 2026-09-26: rewritten to say what it DOES at a glance, not what it's for. The
 	// old copy ("Low-frequency re-check for collections you edit from another host (SMB)") named
 	// the audience before the mechanism; this leads with the verb.
 	'reconcile-poll': {
 		title: 'Reconcile poll',
-		body: 'Periodically re-checks your published collections for changes, on top of the normal file watcher. Turn this on only if you edit them from another computer over a network share (SMB) — the local watcher alone won’t see those edits.',
+		body: 'Periodically re-checks your published collections for changes, on top of the normal file watcher. Catches edits made from another computer over a network share (SMB), which the local watcher alone won’t see.',
 	},
 	'discoverable': {
 		title: 'Show up in Discover Hoarders',

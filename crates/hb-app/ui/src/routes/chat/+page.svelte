@@ -1297,8 +1297,8 @@
 						/>
 					{:else if allConversationPeers.length === 0}
 						<EmptyState
-							message="No conversations yet — add someone in Contacts to start one."
-							cta={{ label: 'Find hoarders in Contacts →', href: '/contacts' }}
+							message="No conversations yet"
+							actions={[{ label: 'Find hoarders', href: '/contacts' }]}
 						/>
 					{:else}
 						<div class="convo-empty">No matches.</div>
@@ -1566,8 +1566,12 @@
 							cta={{ label: 'Find hoarders in Contacts →', href: '/contacts' }}
 						/>
 					{/if}
+					<!-- QURATOR-391 (devtest item 4) — the icon gets its own element so the note can be a
+					     flex row; the shield no longer rides the text baseline (the misalignment).
+					     Mirrors routes/+page.svelte's .ob-notice pattern (icon span + text, flex-start). -->
 					<p class="privacy-note">
-						{@html icons.shield} Messages are end-to-end encrypted — relays never see who sent them or what they say.
+						<span class="privacy-note-icon" aria-hidden="true">{@html icons.shield}</span>
+						<span class="privacy-note-text">Messages are end-to-end encrypted — relays never see who sent them or what they say.</span>
 					</p>
 				</div>
 			{:else}
@@ -2085,7 +2089,23 @@
 		color: var(--fg-muted);
 	}
 
-	.privacy-note { font-size: 12px; color: var(--fg-dim); text-align: center; max-width: 320px; }
+	/* QURATOR-391 (devtest item 4) — icon+text are one flex row, aligned to the FIRST LINE:
+	   the note's 320px max-width wraps the sentence to two lines at every normal width, so
+	   `align-items: center` would drop the shield to the middle of the block. This matches the
+	   onboarding .ob-notice pattern (align-items: flex-start, small top offset on the icon).
+	   The parent .convo-empty-state is a column flex with align-items: center, which keeps the
+	   note itself horizontally centered — the old text-align: center is not needed for that. */
+	.privacy-note {
+		display: flex;
+		align-items: flex-start;
+		justify-content: center;
+		gap: 6px;
+		font-size: 12px;
+		color: var(--fg-dim);
+		max-width: 320px;
+	}
+	.privacy-note-icon { display: inline-flex; flex-shrink: 0; margin-top: 2px; }
+	.privacy-note-text { text-align: left; line-height: 1.5; }
 
 	/* QURATOR-81 + devtest item 5: pane-header used to reserve 120px on its right because the window
 	   controls (absolute, top-right of .main) overlaid it. They now overlay the .topbar added above

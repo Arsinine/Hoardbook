@@ -68,6 +68,11 @@ describe('onboarding wizard', () => {
 		await r.findByText('Passing it on');
 		expect(r.getByText('Step 3 of 4')).toBeTruthy();
 		expect(r.getByText(/sends them your copy in the background/)).toBeTruthy();
+		// QURATOR-388, owner devtest 2026-10-20: the switch is ON by default now, so the step says
+		// so, keeps the reciprocity disclosure, and names where to turn it off.
+		expect(r.getByText(/Fetching new collections automatically is on/)).toBeTruthy();
+		expect(r.getByText(/People will request collections from you too/)).toBeTruthy();
+		expect(r.getByText(/Settings → Preferences → Fetch new collections automatically/)).toBeTruthy();
 		expect(saveSettingsMock).not.toHaveBeenCalled();
 
 		// MUTATION (P-10): in routes/+page.svelte, in `obAckSharing`, delete the line

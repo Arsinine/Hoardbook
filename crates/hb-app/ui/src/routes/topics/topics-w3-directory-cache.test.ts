@@ -166,6 +166,6 @@ describe('QURATOR-145 (W3) — the cross-mount directory cache', () => {
 		const alert = b.queryByRole('alert');
 		expect(alert).not.toBeNull(); // the banner rides WITH the rows...
 		expect(alert!.textContent).toContain('stale'); // ...saying the directory may be stale
-		expect(b.queryByText(/Nothing here yet/i)).toBeNull(); // never the confident negative
+		expect(b.queryByText(/No Topics yet/i)).toBeNull(); // never the confident negative
 	});
 });

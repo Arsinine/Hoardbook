@@ -95,15 +95,27 @@ afterEach(() => {
 });
 
 describe('QURATOR-342 Lane E — My Profile copy', () => {
-	// RED BY (P-10): reverting the field to `<label class="field-label">Tags</label>` and deleting
-	// the `field-hint` line — the exact pre-Q342 markup — made this test fail on both assertions.
+	// RED BY (P-10): reverting to the pre-QURATOR-388 markup — bare `<label>Interests</label>` plus
+	// the always-visible `.field-hint` div, no HintMarker — reds this at the trigger query (no
+	// "More information: Interests" button) and at the visible-hint absence assert.
 	it('interests_label_and_help_line_replace_tags', async () => {
+		// QURATOR-388, owner devtest 2026-10-20: the help line moved off the page into a HintMarker
+		// tooltip on the Interests label (text verbatim), asserted through the real trigger/tip
+		// pair — not raw page text, which a hidden tooltip span would still satisfy.
 		resetStores();
-		const { findByText, getByText } = render(HomePage);
+		const { findByText, getByRole } = render(HomePage);
 		expect(await findByText('Interests')).toBeTruthy();
-		expect(getByText(HELP_TEXT)).toBeTruthy();
+		const trigger = getByRole('button', { name: 'More information: Interests' });
+		const id = trigger.getAttribute('aria-describedby');
+		expect(id, 'the Interests marker must carry aria-describedby').toBeTruthy();
+		const tip = document.getElementById(id!);
+		expect(tip?.textContent).toMatch(HELP_TEXT);
 		// The second half names the thing the ranking feeds ("People like you" on Contacts).
-		expect(getByText(/People like you on Contacts is ranked from these/i)).toBeTruthy();
+		expect(tip?.textContent).toMatch(/People like you on Contacts is ranked from these/i);
+		// And the old always-visible hint line is gone from the page proper (the tooltip span is
+		// .hint-tip, never .field-hint).
+		const visibleHints = Array.from(document.querySelectorAll('.field-hint'));
+		expect(visibleHints.some((el) => HELP_TEXT.test(el.textContent ?? ''))).toBe(false);
 	});
 
 	// RED BY (P-10): deleting `<span class="hb-tag">Public</span>` from the Contact-hint label

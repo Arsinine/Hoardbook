@@ -57,12 +57,16 @@ use crate::net::NatClassification;
 /// designed to give a useful answer from a partial report (RFC 1918 private local alone ⇒ BehindNat;
 /// a cold/offline start ⇒ Unknown, never a confident negative). The UI surfaces the latest reading on
 /// demand, and a user can re-probe by reloading Settings.
+// QURATOR-389: in test builds the live probe body is neutered (see probe_and_close), which leaves
+// the live-only chain below unreferenced — hence the test-only dead_code allowance on each.
+#[cfg_attr(test, allow(dead_code))]
 pub const NET_REPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The target `connect()` uses to let the OS pick a source interface. Any routable public address
 /// works — the socket never sends, and the port is irrelevant. `1.1.1.1:80` is the conventionally
 /// used target (Cloudflare DNS) in STUN-style local-address probes. No packet leaves the machine:
 /// `connect` on a UDP socket only populates the kernel routing decision.
+#[cfg_attr(test, allow(dead_code))]
 const LOCAL_ADDR_PROBE_TARGET: std::net::SocketAddr = std::net::SocketAddr::new(
     std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
     80,
@@ -85,6 +89,7 @@ pub fn new_shared_classification() -> SharedNatClassification {
 /// Returns the first non-loopback, non-unspecified IPv4 the OS offers. On a host with no routable
 /// default (air-gapped / DNS-only), returns `None` — and `classify_nat` then yields `Unknown` from
 /// that (or `BehindNat` if a private local is observed some other way), never a confident negative.
+#[cfg_attr(test, allow(dead_code))]
 fn lan_source_addr() -> Option<IpAddr> {
     let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     // Ignore failure: on a host with no default route this returns Err, and we fall through to None.
@@ -105,6 +110,7 @@ fn lan_source_addr() -> Option<IpAddr> {
 /// Pull the relay-observed mapped address out of iroh's net_report. Prefers IPv4 (the CGNAT/RFC 1918
 /// signals are IPv4-only), falls back to IPv6. Returns `None` if the report has not yet populated a
 /// global address — which is a genuinely undecided case, NOT a confident negative.
+#[cfg_attr(test, allow(dead_code))]
 fn mapped_addr_from_report(report: &iroh::unstable_net_report::NetReport) -> Option<IpAddr> {
     if let Some(global_v4) = report.global_v4 {
         return Some(IpAddr::V4(*global_v4.ip()));
@@ -154,6 +160,7 @@ pub(crate) fn emit_classification_log(class: NatClassification, varies: Option<b
 /// Errors are logged and returned but never panic — a classification failure leaves the slot at its
 /// prior value (likely `None` ⇒ Unknown on the first run), which is the correct "not yet
 /// determined" surface.
+#[cfg_attr(test, allow(dead_code))]
 pub async fn classify_and_log(
     endpoint: &Endpoint,
     shared: &SharedNatClassification,
@@ -211,38 +218,291 @@ pub async fn probe_and_close(
     shared: &SharedNatClassification,
     existing: Option<Endpoint>,
 ) {
-    // Reuse path: the manifest plane (or a prior probe) already bound a dial-only endpoint. Cloning
-    // an `Endpoint` is cheap (it's a handle to a shared inner state), and we do NOT close a reused
-    // endpoint — the manifest plane owns its lifecycle.
-    //
-    // We split the borrow from the close: the classify call borrows the endpoint immutably, and
-    // only an endpoint we bound (not a reused one) is closed afterwards.
-    if let Some(endpoint) = existing.as_ref() {
-        if let Err(e) = classify_and_log(endpoint, shared).await {
-            tracing::warn!("NAT: classification failed: {e}");
-        }
-        // Reused endpoint — do NOT close. The manifest plane owns its lifecycle.
-        return;
+    // QURATOR-389: the live probe binds a real iroh endpoint and contacts relays (network I/O);
+    // hb-app unit tests must never do that. This is the EXACT network seam, so the post-identity
+    // tests observe INVOCATION here — under cfg(test) the body neuters to a counter increment
+    // instead of a live bind. `let _ =` discards the parameters only the live body uses, keeping
+    // the test build warning-free under `-D warnings`. Production runs the block below unchanged.
+    #[cfg(test)]
+    {
+        let _ = (transport_key, existing);
+        tests::record_probe_body_run(shared);
     }
 
-    // Bind a fresh dial-only endpoint with the session transport key (owner ruling ③).
-    let endpoint = match crate::transport::bind_client_endpoint(transport_key).await {
-        Ok(ep) => ep,
-        Err(e) => {
-            tracing::warn!("NAT: could not bind a dial-only endpoint to classify: {e}");
+    #[cfg(not(test))]
+    {
+        // Reuse path: the manifest plane (or a prior probe) already bound a dial-only endpoint. Cloning
+        // an `Endpoint` is cheap (it's a handle to a shared inner state), and we do NOT close a reused
+        // endpoint — the manifest plane owns its lifecycle.
+        //
+        // We split the borrow from the close: the classify call borrows the endpoint immutably, and
+        // only an endpoint we bound (not a reused one) is closed afterwards.
+        if let Some(endpoint) = existing.as_ref() {
+            if let Err(e) = classify_and_log(endpoint, shared).await {
+                tracing::warn!("NAT: classification failed: {e}");
+            }
+            // Reused endpoint — do NOT close. The manifest plane owns its lifecycle.
             return;
         }
-    };
-    if let Err(e) = classify_and_log(&endpoint, shared).await {
-        tracing::warn!("NAT: classification failed: {e}");
+
+        // Bind a fresh dial-only endpoint with the session transport key (owner ruling ③).
+        let endpoint = match crate::transport::bind_client_endpoint(transport_key).await {
+            Ok(ep) => ep,
+            Err(e) => {
+                tracing::warn!("NAT: could not bind a dial-only endpoint to classify: {e}");
+                return;
+            }
+        };
+        if let Err(e) = classify_and_log(&endpoint, shared).await {
+            tracing::warn!("NAT: classification failed: {e}");
+        }
+        endpoint.close().await;
     }
-    endpoint.close().await;
 }
 
+// ---------------------------------------------------------------------------
+// QURATOR-389 — schedule the probe when an identity appears mid-session
+// ---------------------------------------------------------------------------
+
+/// Single-flight flag for the NAT probe (QURATOR-389). Both entry points — the startup task in
+/// `lib.rs` and the post-identity path — route through [`probe_after_identity`], and the
+/// check-and-insert under one lock in `claim_probe` is what makes two overlapping attempts resolve to at most ONE
+/// running probe. Released by the spawned body when the probe finishes, so a probe that failed to
+/// classify (slot still empty) can be retried by a later identity event; a probe that DID classify
+/// is held off by the slot check instead.
+///
+/// Keyed by the slot (its `Arc` address), not one process-wide flag: production manages exactly ONE
+/// slot, so this is still "one probe per process", while each test's own slot is its own world and
+/// concurrent tests can no longer refuse each other's probe through a shared flag.
+static NAT_PROBE_IN_FLIGHT: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// The single-flight key of a slot: its shared allocation's address, stable for the slot's life.
+fn slot_key(slot: &SharedNatClassification) -> usize {
+    Arc::as_ptr(slot) as usize
+}
+
+fn probe_in_flight(key: usize) -> bool {
+    NAT_PROBE_IN_FLIGHT.lock().unwrap_or_else(|p| p.into_inner()).contains(&key)
+}
+
+/// The pure go/no-go decision for scheduling a NAT probe (QURATOR-389). Probe only when the slot
+/// holds no classification yet AND no probe is in flight. An already-classified slot means the
+/// reading exists — re-probing on every identity command would re-bind a dial-only endpoint (and
+/// contact relays) on every generate/import/restore. An in-flight probe means a reading is on its
+/// way — racing a second one buys nothing but a second dial-only bind.
+pub(crate) fn should_probe(slot_filled: bool, in_flight: bool) -> bool {
+    !slot_filled && !in_flight
+}
+
+/// Atomic claim of the single-flight slot. `false` ⇒ another caller holds it; do not probe. The
+/// check and the insert under ONE lock hold (not load-then-store) is the load-bearing part: two tasks racing through
+/// [`should_probe`] at the same instant must not BOTH win.
+fn claim_probe(key: usize) -> bool {
+    let mut held = NAT_PROBE_IN_FLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+    if held.contains(&key) {
+        return false;
+    }
+    held.push(key);
+    true
+}
+
+/// Release the single-flight slot — called by the spawned probe body, on every path.
+fn release_probe(key: usize) {
+    NAT_PROBE_IN_FLIGHT.lock().unwrap_or_else(|p| p.into_inner()).retain(|k| *k != key);
+}
+
+/// QURATOR-389 (owner devtest 2026-10-20: "A new user cannot determine its Network type") —
+/// schedule the NAT probe once an identity becomes available mid-session.
+///
+/// The startup task (lib.rs) reads the identity once at spawn and early-returns when there is
+/// none, so on a fresh install the Settings → Diagnostics "Network type" stayed "undetermined"
+/// until restart. The identity commands (generate / import / restore, and get_identity's
+/// load-from-disk branch) call this after `*identity.write().await = Some(..)`, and the startup
+/// path calls it too — ONE helper, both paths, so the guard and single-flight logic cannot drift
+/// between them (CLAUDE.md §9: hardened-path/unhardened-sibling drift is this repo's recurring
+/// fault shape).
+///
+/// - Guard: [`should_probe`] — skip when the slot already holds a classification.
+/// - Single-flight: `claim_probe` — never two probes concurrently, even when two identity
+///   commands race; the loser drops, and a later identity event retries after the winner
+///   releases.
+/// - Reuse: reads the manifest plane's bound endpoint exactly as the startup path did, so an
+///   already-bound endpoint is reused instead of a second dial-only bind.
+/// - Fire-and-forget: the probe runs on a spawned task and never blocks the identity command's
+///   return. Returns whether a probe was scheduled (tests observe this; commands ignore it).
+pub async fn probe_after_identity(
+    transport_key: &[u8; 32],
+    nat_slot: &SharedNatClassification,
+    endpoint: &crate::transport_state::SharedEndpoint,
+) -> bool {
+    let key = slot_key(nat_slot);
+    let slot_filled = nat_slot.read().await.is_some();
+    if !should_probe(slot_filled, probe_in_flight(key)) {
+        return false;
+    }
+    if !claim_probe(key) {
+        return false;
+    }
+    // Same reuse logic as the startup path: a manifest plane that already bound an endpoint
+    // (outstanding ticket ⇒ Listen, or any future always-bind path) lends its handle instead of
+    // taking a second dial-only bind.
+    let existing = endpoint.read().await.bound.as_ref().map(|b| b.endpoint.clone());
+    tracing::info!("NAT: probe scheduled after an identity became available");
+    let transport_key = *transport_key;
+    let slot = Arc::clone(nat_slot);
+    tokio::spawn(async move {
+        probe_and_close(&transport_key, &slot, existing).await;
+        release_probe(key);
+    });
+    true
+}
+
+// pub(crate) under cfg(test) so the identity.rs command tests can observe the probe scheduler's
+// per-slot test hooks (`record_probe_body_run` / `probe_body_runs`) across the crate.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::logging;
+
+    // ── QURATOR-389 — the post-identity probe scheduler ────────────────────────────────────────
+
+    /// Test-only invocation counter for the probe body (see the cfg(test) neuter in
+    /// `probe_and_close`). pub(crate) so the identity.rs command tests can observe that the
+    /// command actually scheduled the probe without performing any network I/O.
+    ///
+    /// Counted PER SLOT (keyed like the single-flight set), so a test observes only the probes
+    /// scheduled against the slot it built — a concurrent identity test cannot move its count.
+    #[cfg(test)]
+    static TEST_PROBE_BODY_RUNS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+    #[cfg(test)]
+    pub(crate) fn record_probe_body_run(slot: &SharedNatClassification) {
+        TEST_PROBE_BODY_RUNS.lock().unwrap_or_else(|p| p.into_inner()).push(slot_key(slot));
+    }
+
+    /// How many neutered probe bodies have run against `slot`.
+    #[cfg(test)]
+    pub(crate) fn probe_body_runs(slot: &SharedNatClassification) -> usize {
+        let key = slot_key(slot);
+        TEST_PROBE_BODY_RUNS.lock().unwrap_or_else(|p| p.into_inner()).iter().filter(|k| **k == key).count()
+    }
+
+
+    /// QURATOR-389 regression pin: both inputs of the go/no-go decision are load-bearing. An
+    /// already-classified slot means the reading exists (re-probing re-binds a dial-only endpoint
+    /// for nothing); an in-flight probe means a reading is on its way (never two probes
+    /// concurrently).
+    // MUTATION (P-10): in `should_probe`, delete `!slot_filled && ` (leaving `!in_flight`) — this
+    // test reds on the two slot-filled rows. The companion mutation deleting `&& !in_flight` reds
+    // `probe_after_identity_is_single_flight..` below.
+    #[test]
+    fn should_probe_decision_table_pins_both_conditions() {
+        let cases: [(bool, bool, bool, &str); 4] = [
+            (
+                false, false, true,
+                "empty slot, idle — the fresh-install case this ticket fixes",
+            ),
+            (
+                true, false, false,
+                "slot already classified — the reading exists, a re-probe is a wasted dial-only bind",
+            ),
+            (
+                false, true, false,
+                "a probe is in flight — never two probes concurrently",
+            ),
+            (
+                true, true, false,
+                "both — classified wins, nothing to do",
+            ),
+        ];
+        for (slot_filled, in_flight, want, why) in cases {
+            assert_eq!(should_probe(slot_filled, in_flight), want, "case: {why}");
+        }
+    }
+
+    /// QURATOR-389: the guard must reject BEFORE anything is claimed or spawned when the slot
+    /// already holds a classification — otherwise every generate/import/restore would re-bind a
+    /// dial-only endpoint and re-contact relays for a reading the app already has.
+    // MUTATION (P-10): in `should_probe`, delete `!slot_filled && ` (leaving `!in_flight`) — this
+    // test reds: the helper then claims and schedules a probe (the slot's probe-body count increments)
+    // despite the filled slot.
+    #[tokio::test]
+    async fn probe_after_identity_skips_when_the_slot_already_holds_a_classification() {
+        let slot = new_shared_classification();
+        *slot.write().await = Some(NatClassification::Unknown);
+        let endpoint = crate::transport_state::new_shared_endpoint();
+        let before = probe_body_runs(&slot);
+
+        let spawned = probe_after_identity(&[7u8; 32], &slot, &endpoint).await;
+
+        assert!(!spawned, "a classified slot must not schedule another probe");
+        assert_eq!(
+            probe_body_runs(&slot),
+            before,
+            "no probe body may run for an already-classified slot"
+        );
+        assert!(
+            !super::probe_in_flight(super::slot_key(&slot)),
+            "the guard must reject before the single-flight claim is even taken"
+        );
+    }
+
+    /// QURATOR-389: two overlapping schedule attempts must resolve to ONE probe. Under the
+    /// current-thread test runtime the first call wins the claim and its spawned body has not run
+    /// yet, so the second call must be refused while the claim is held; once the body releases the
+    /// claim, the next identity event may retry (that retry path is what lets a FAILED
+    /// classification — slot still empty — be re-attempted instead of wedging the scheduler).
+    // MUTATION (P-10) — the in-flight guard is TWO checks (`should_probe`'s `!in_flight` and
+    // `claim_probe`'s `held.contains`), so mutating either ALONE stays GREEN (seen 2026-10-20).
+    // Mutate BOTH — `!slot_filled && !in_flight` → `!slot_filled` AND `if held.contains(&key)` →
+    // `if false` — and this test reds at the second-attempt assertion (seen red 2026-10-20).
+    #[tokio::test]
+    async fn probe_after_identity_is_single_flight_two_overlapping_attempts_yield_one_probe() {
+        let slot = new_shared_classification();
+        let endpoint = crate::transport_state::new_shared_endpoint();
+
+        assert!(
+            probe_after_identity(&[7u8; 32], &slot, &endpoint).await,
+            "the first attempt claims and schedules"
+        );
+        assert!(
+            !probe_after_identity(&[7u8; 32], &slot, &endpoint).await,
+            "the second overlapping attempt must be refused while the first holds the claim"
+        );
+
+        // Let the neutered (cfg(test)) body run and release the claim.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while probe_body_runs(&slot) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the scheduled probe body never ran"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        while super::probe_in_flight(super::slot_key(&slot)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the probe body never released the single-flight claim"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // Released claim + still-empty slot (the neutered body does not classify) ⇒ a retry is
+        // allowed. This is the failed-classification retry path.
+        assert!(
+            probe_after_identity(&[7u8; 32], &slot, &endpoint).await,
+            "after the claim releases, the next identity event may retry"
+        );
+
+        // Cleanup: let the retry's neutered body run and release this slot's claim.
+        while super::probe_in_flight(super::slot_key(&slot)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the retry's probe body never released the single-flight claim"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
 
     /// Build a test subscriber writing to `log_path`, returning a guard and a shared file handle.
     /// Mirrors `logging::tests::install_test_subscriber` but lives here so this module's privacy

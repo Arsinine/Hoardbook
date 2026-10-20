@@ -94,11 +94,11 @@ describe('QURATOR-93 — Topics mine load failure is not a confident empty', () 
 	it('a SUCCESSFUL empty load renders no error — the directory half carries the pane', async () => {
 		// QURATOR-144 W2: an empty `mine` is no longer a whole-pane state (the merged tree also
 		// holds the announced public Topics), so the confident negative is gone entirely; only a
-		// totally empty tree renders the honest "nothing here yet" line.
+		// totally empty tree renders the honest "No Topics yet" line (QURATOR-390 copy).
 		topicListMock.mockResolvedValue([]);
 
 		const { queryByRole, findByText } = render(TopicsPage);
-		expect(await findByText(/nothing here yet/i)).toBeTruthy();
+		expect(await findByText(/no topics yet/i)).toBeTruthy();
 		expect(queryByRole('alert')).toBeNull();
 	});
 });

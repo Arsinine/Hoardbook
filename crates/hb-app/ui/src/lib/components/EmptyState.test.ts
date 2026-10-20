@@ -64,3 +64,40 @@ describe('EmptyState — variants (QURATOR-102)', () => {
 		expect(queryByRole('alert')).toBeNull();
 	});
 });
+
+describe('EmptyState — actions (QURATOR-390, owner devtest 2026-10-20 "Noun + action button")', () => {
+	it('actions render as real buttons with accessible names; the first is btn-primary', () => {
+		const { getByRole } = render(EmptyState, {
+			props: { message: 'No contacts yet', actions: [{ label: 'Add contact', onclick: () => {} }] },
+		});
+		const btn = getByRole('button', { name: 'Add contact' });
+		expect(btn.classList.contains('btn-primary')).toBe(true);
+	});
+
+	it('clicking an action calls ONLY its own onclick; rest actions are btn-default', async () => {
+		const first = vi.fn();
+		const second = vi.fn();
+		const { getByRole } = render(EmptyState, {
+			props: {
+				message: 'No Topics yet',
+				actions: [
+					{ label: 'Create Topic', onclick: first },
+					{ label: 'Browse directory', onclick: second },
+				],
+			},
+		});
+		await fireEvent.click(getByRole('button', { name: 'Create Topic' }));
+		expect(first).toHaveBeenCalledTimes(1);
+		expect(second).not.toHaveBeenCalled();
+		expect(getByRole('button', { name: 'Browse directory' }).classList.contains('btn-default')).toBe(true);
+	});
+
+	it('an action with href renders an anchor (not a button) carrying that href', () => {
+		const { getByRole, queryByRole } = render(EmptyState, {
+			props: { message: 'No conversations yet', actions: [{ label: 'Find hoarders', href: '/contacts' }] },
+		});
+		const link = getByRole('link', { name: 'Find hoarders' });
+		expect((link as HTMLAnchorElement).getAttribute('href')).toBe('/contacts');
+		expect(queryByRole('button', { name: 'Find hoarders' })).toBeNull();
+	});
+});

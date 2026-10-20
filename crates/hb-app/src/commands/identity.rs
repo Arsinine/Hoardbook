@@ -54,6 +54,8 @@ fn shorten(id: &str) -> String {
 pub async fn generate_keypair(
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
+    nat_slot: State<'_, crate::nat::SharedNatClassification>,
+    endpoint: State<'_, crate::transport_state::SharedEndpoint>,
 ) -> CmdResult<IdentityInfo> {
     match store.load_identity() {
         Ok(Some(_)) => return Err("An identity already exists. Wipe data first to generate a new one.".into()),
@@ -74,7 +76,13 @@ pub async fn generate_keypair(
     store.save_identity(&stored).map_err(cmd_err)?;
     let info = IdentityInfo::from_identity(&app_id).map_err(cmd_err)?;
 
+    // QURATOR-389 (owner devtest 2026-10-20: "A new user cannot determine its Network type"): the
+    // startup probe task early-returns when no identity exists, so a fresh install never probed
+    // until restart. Fire the same single-flight helper the startup path uses so the Settings →
+    // Diagnostics reading lands in-session. Fire-and-forget; never blocks this command's return.
+    let transport_key = *app_id.transport_key.bytes();
     *identity.write().await = Some(app_id);
+    crate::nat::probe_after_identity(&transport_key, nat_slot.inner(), endpoint.inner()).await;
     Ok(info)
 }
 
@@ -92,6 +100,8 @@ pub async fn import_nsec(
     password: Option<String>,
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
+    nat_slot: State<'_, crate::nat::SharedNatClassification>,
+    endpoint: State<'_, crate::transport_state::SharedEndpoint>,
 ) -> CmdResult<IdentityInfo> {
     let nsec = Zeroizing::new(nsec);
     let password = password.map(Zeroizing::new);
@@ -112,7 +122,11 @@ pub async fn import_nsec(
     let app_id = import_inner(&store, parsed.map_err(cmd_err)?).map_err(cmd_err)?;
     let info = IdentityInfo::from_identity(&app_id).map_err(cmd_err)?;
 
+    // QURATOR-389: same post-identity probe scheduling as generate_keypair — one helper, both
+    // paths, never blocks this command's return.
+    let transport_key = *app_id.transport_key.bytes();
     *identity.write().await = Some(app_id);
+    crate::nat::probe_after_identity(&transport_key, nat_slot.inner(), endpoint.inner()).await;
     Ok(info)
 }
 
@@ -137,6 +151,8 @@ fn import_inner(store: &DataStore, app_id: AppIdentity) -> anyhow::Result<AppIde
 pub async fn get_identity(
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
+    nat_slot: State<'_, crate::nat::SharedNatClassification>,
+    endpoint: State<'_, crate::transport_state::SharedEndpoint>,
 ) -> CmdResult<Option<IdentityInfo>> {
     if let Some(ref id) = *identity.read().await {
         return Ok(Some(IdentityInfo::from_identity(id).map_err(cmd_err)?));
@@ -149,7 +165,11 @@ pub async fn get_identity(
     let app_id = AppIdentity::from_stored(&stored)
         .map_err(|e| format!("Stored identity is corrupted: {e}"))?;
     let info = IdentityInfo::from_identity(&app_id).map_err(cmd_err)?;
+    // QURATOR-389: a cold in-memory state over an on-disk identity is the same
+    // "identity appeared mid-session" event — schedule the probe through the shared helper.
+    let transport_key = *app_id.transport_key.bytes();
     *identity.write().await = Some(app_id);
+    crate::nat::probe_after_identity(&transport_key, nat_slot.inner(), endpoint.inner()).await;
     Ok(Some(info))
 }
 
@@ -343,6 +363,8 @@ pub async fn restore_data(
     path: String,
     store: State<'_, DataStore>,
     identity: State<'_, SharedIdentity>,
+    nat_slot: State<'_, crate::nat::SharedNatClassification>,
+    endpoint: State<'_, crate::transport_state::SharedEndpoint>,
 ) -> CmdResult<IdentityInfo> {
     let archive = read_backup_file(&path)?;
     let pass = passphrase.map(Zeroizing::new);
@@ -356,7 +378,11 @@ pub async fn restore_data(
     let app_id = AppIdentity::from_stored(&stored).map_err(cmd_err)?;
     let info = IdentityInfo::from_identity(&app_id).map_err(cmd_err)?;
 
+    // QURATOR-389: a backup restore is the most common "identity appeared mid-session" path after
+    // a fresh install — schedule the probe through the shared helper.
+    let transport_key = *app_id.transport_key.bytes();
     *identity.write().await = Some(app_id);
+    crate::nat::probe_after_identity(&transport_key, nat_slot.inner(), endpoint.inner()).await;
     Ok(info)
 }
 
@@ -574,11 +600,57 @@ mod tests {
             app.manage(identity);
             app.manage(store);
             app.manage(new_shared_endpoint());
+            // QURATOR-389: the identity commands now take the NAT slot + manifest-plane states,
+            // so the mock app must manage both for the real command shim to inject them.
+            app.manage(crate::nat::new_shared_classification());
             app
         }
 
         async fn generate(app: &tauri::App<tauri::test::MockRuntime>) -> CmdResult<super::super::IdentityInfo> {
-            generate_keypair(app.state::<DataStore>(), app.state::<SharedIdentity>()).await
+            generate_keypair(
+                app.state::<DataStore>(),
+                app.state::<SharedIdentity>(),
+                app.state::<crate::nat::SharedNatClassification>(),
+                app.state::<SharedEndpoint>(),
+            )
+            .await
+        }
+
+        // -- generate_keypair: the post-identity NAT probe (QURATOR-389) ---------------------------
+
+        /// QURATOR-389 (owner devtest 2026-10-20: "A new user cannot determine its Network type"):
+        /// after a fresh generate, the post-identity probe is scheduled through the SAME
+        /// single-flight helper the startup path uses (`nat::probe_after_identity`), so the
+        /// Settings → Diagnostics "Network type" lands in-session instead of waiting for a
+        /// restart. The live probe binds a real iroh endpoint, which unit tests must never do —
+        /// under cfg(test) `probe_and_close` neuters at that exact network seam and increments
+        /// the slot's probe-body count instead, so this test observes INVOCATION (not a network
+        /// round-trip) and pins that the test path performs no classification.
+        // MUTATION (P-10): in `generate_keypair`, delete the
+        // `crate::nat::probe_after_identity(..)` call after the
+        // `*identity.write().await = Some(app_id);` line — this test reds (the slot's probe-body count
+        // never increments within the deadline).
+        #[tokio::test]
+        async fn generate_keypair_schedules_the_nat_probe_after_the_identity_lands() {
+            let app = guard_app(false);
+            let slot = app.state::<crate::nat::SharedNatClassification>();
+            let before = crate::nat::tests::probe_body_runs(&slot);
+
+            generate(&app).await.expect("a fresh generate succeeds");
+
+            // Fire-and-forget: wait (bounded) for the neutered cfg(test) probe body to run.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while crate::nat::tests::probe_body_runs(&slot) == before {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the post-identity probe body never ran — the command did not schedule it"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(
+                slot.read().await.is_none(),
+                "the cfg(test) neuter must not classify — a classification here would mean the test path did network I/O"
+            );
         }
 
         // -- generate_keypair: three guards, one match ---------------------------------------------
@@ -679,6 +751,8 @@ mod tests {
                 None,
                 app.state::<DataStore>(),
                 app.state::<SharedIdentity>(),
+                app.state::<crate::nat::SharedNatClassification>(),
+                app.state::<SharedEndpoint>(),
             )
             .await
             .unwrap_err();
@@ -716,6 +790,8 @@ mod tests {
                 Some("nostr".into()),
                 app.state::<DataStore>(),
                 app.state::<SharedIdentity>(),
+                app.state::<crate::nat::SharedNatClassification>(),
+                app.state::<SharedEndpoint>(),
             )
             .await
             .expect("a correct password must import");
@@ -738,6 +814,8 @@ mod tests {
                 None,
                 app.state::<DataStore>(),
                 app.state::<SharedIdentity>(),
+                app.state::<crate::nat::SharedNatClassification>(),
+                app.state::<SharedEndpoint>(),
             )
             .await
             .unwrap_err();
@@ -748,6 +826,8 @@ mod tests {
                 Some("not-the-password".into()),
                 app.state::<DataStore>(),
                 app.state::<SharedIdentity>(),
+                app.state::<crate::nat::SharedNatClassification>(),
+                app.state::<SharedEndpoint>(),
             )
             .await
             .unwrap_err();
@@ -790,7 +870,7 @@ mod tests {
                 })
                 .expect("planting a corrupted identity must itself succeed");
 
-            let err = get_identity(app.state::<DataStore>(), app.state::<SharedIdentity>())
+            let err = get_identity(app.state::<DataStore>(), app.state::<SharedIdentity>(), app.state::<crate::nat::SharedNatClassification>(), app.state::<SharedEndpoint>())
                 .await
                 .unwrap_err();
             assert!(
@@ -805,7 +885,7 @@ mod tests {
         async fn get_identity_loads_and_caches_a_healthy_stored_identity() {
             let app = guard_app(true);
             let expected = app.state::<DataStore>().load_identity().unwrap().unwrap();
-            let info = get_identity(app.state::<DataStore>(), app.state::<SharedIdentity>())
+            let info = get_identity(app.state::<DataStore>(), app.state::<SharedIdentity>(), app.state::<crate::nat::SharedNatClassification>(), app.state::<SharedEndpoint>())
                 .await
                 .expect("a healthy on-disk identity must load")
                 .expect("Some(info) — the file exists");
@@ -822,7 +902,7 @@ mod tests {
         #[tokio::test]
         async fn get_identity_returns_none_on_an_empty_profile() {
             let app = guard_app(false);
-            let out = get_identity(app.state::<DataStore>(), app.state::<SharedIdentity>())
+            let out = get_identity(app.state::<DataStore>(), app.state::<SharedIdentity>(), app.state::<crate::nat::SharedNatClassification>(), app.state::<SharedEndpoint>())
                 .await
                 .expect("an empty profile is Ok(None), never an error");
             assert!(out.is_none());
@@ -943,6 +1023,8 @@ mod tests {
                 missing,
                 app.state::<DataStore>(),
                 app.state::<SharedIdentity>(),
+                app.state::<crate::nat::SharedNatClassification>(),
+                app.state::<SharedEndpoint>(),
             )
             .await
             .unwrap_err();
@@ -984,6 +1066,8 @@ mod tests {
                 path,
                 app.state::<DataStore>(),
                 app.state::<SharedIdentity>(),
+                app.state::<crate::nat::SharedNatClassification>(),
+                app.state::<SharedEndpoint>(),
             )
             .await
             .unwrap_err();
@@ -1093,6 +1177,8 @@ mod tests {
                 path.to_str().unwrap().to_string(),
                 target.state::<DataStore>(),
                 target.state::<SharedIdentity>(),
+                target.state::<crate::nat::SharedNatClassification>(),
+                target.state::<SharedEndpoint>(),
             )
             .await
             .expect("a real archive restores into an empty profile");
@@ -1195,6 +1281,9 @@ mod tests {
             app.manage(identity);
             app.manage(store);
             app.manage(new_shared_endpoint());
+            // QURATOR-389: the identity commands now take the NAT slot + manifest-plane states,
+            // so the mock app must manage both for the real command shim to inject them.
+            app.manage(crate::nat::new_shared_classification());
             app
         }
 
@@ -1241,6 +1330,8 @@ mod tests {
                 path.to_str().unwrap().to_string(),
                 target.state::<DataStore>(),
                 target.state::<SharedIdentity>(),
+                target.state::<crate::nat::SharedNatClassification>(),
+                target.state::<SharedEndpoint>(),
             )
             .await
             .expect("a passphrase-seeded profile restores through the command");
@@ -1324,6 +1415,8 @@ mod tests {
                 path.to_str().unwrap().to_string(),
                 target.state::<DataStore>(),
                 target.state::<SharedIdentity>(),
+                target.state::<crate::nat::SharedNatClassification>(),
+                target.state::<SharedEndpoint>(),
             )
             .await
             .unwrap_err();
